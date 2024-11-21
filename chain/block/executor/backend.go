@@ -1,14 +1,18 @@
 package executor
 
 import (
+	"errors"
 	"time"
 
 	"github.com/MetalBlockchain/metalgo/ids"
 	"github.com/MetalBlockchain/metalgo/snow"
+	"github.com/MetalBlockchain/metalgo/utils/set"
 	"github.com/MetalBlockchain/pulsevm/chain/block"
 	"github.com/MetalBlockchain/pulsevm/chain/txs/mempool"
 	"github.com/MetalBlockchain/pulsevm/state"
 )
+
+var errConflictingParentTxs = errors.New("block contains a transaction that conflicts with a transaction in a parent block")
 
 type backend struct {
 	mempool.Mempool
@@ -70,4 +74,29 @@ func (b *backend) getTimestamp(blkID ids.ID) time.Time {
 	// block is the only accepted block that must return a correct timestamp,
 	// so we just return the chain time.
 	return b.state.GetTimestamp()
+}
+
+// verifyUniqueInputs returns nil iff no blocks in the inclusive
+// ancestry of [blkID] consume an input in [inputs].
+func (b *backend) verifyUniqueInputs(blkID ids.ID, inputs set.Set[ids.ID]) error {
+	if inputs.Len() == 0 {
+		return nil
+	}
+
+	// Check for conflicts in ancestors.
+	for {
+		state, ok := b.blkIDToState[blkID]
+		if !ok {
+			// The parent state isn't pinned in memory.
+			// This means the parent must be accepted already.
+			return nil
+		}
+
+		if state.inputs.Overlaps(inputs) {
+			return errConflictingParentTxs
+		}
+
+		blk := state.statelessBlock
+		blkID = blk.Parent()
+	}
 }

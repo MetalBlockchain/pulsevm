@@ -5,6 +5,7 @@ import (
 
 	"github.com/MetalBlockchain/metalgo/ids"
 	"github.com/MetalBlockchain/metalgo/snow/consensus/snowman"
+	"github.com/MetalBlockchain/metalgo/utils/set"
 	"github.com/MetalBlockchain/pulsevm/chain/block"
 	"github.com/MetalBlockchain/pulsevm/chain/txs/executor"
 	"github.com/MetalBlockchain/pulsevm/chain/txs/mempool"
@@ -20,12 +21,19 @@ var (
 type Manager interface {
 	state.Versions
 
+	// Returns the ID of the most recently accepted block.
+	LastAccepted() ids.ID
+
 	SetPreference(blkID ids.ID) (updated bool)
 	Preferred() ids.ID
 
 	GetBlock(blkID ids.ID) (snowman.Block, error)
 	GetStatelessBlock(blkID ids.ID) (block.Block, error)
 	NewBlock(block.Block) snowman.Block
+
+	// VerifyUniqueInputs verifies that the inputs are not duplicated in the
+	// provided blk or any of its ancestors pinned in memory.
+	VerifyUniqueInputs(blkID ids.ID, inputs set.Set[ids.ID]) error
 }
 
 type manager struct {
@@ -85,4 +93,8 @@ func (m *manager) SetPreference(blkID ids.ID) bool {
 
 func (m *manager) Preferred() ids.ID {
 	return m.preferred
+}
+
+func (m *manager) VerifyUniqueInputs(blkID ids.ID, inputs set.Set[ids.ID]) error {
+	return m.backend.verifyUniqueInputs(blkID, inputs)
 }

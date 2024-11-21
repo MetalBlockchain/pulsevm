@@ -3,16 +3,19 @@ package executor
 import (
 	"errors"
 
+	"github.com/MetalBlockchain/metalgo/ids"
 	"github.com/MetalBlockchain/metalgo/utils/set"
 	"github.com/MetalBlockchain/pulsevm/chain/block"
 	"github.com/MetalBlockchain/pulsevm/chain/txs"
 	"github.com/MetalBlockchain/pulsevm/chain/txs/executor"
 	"github.com/MetalBlockchain/pulsevm/state"
+	"github.com/MetalBlockchain/pulsevm/status"
 )
 
 var (
 	_ block.Visitor = (*verifier)(nil)
 
+	errConflictingBlockTxs         = errors.New("block contains conflicting transactions")
 	errStandardBlockWithoutChanges = errors.New("StandardBlock performs no state changes")
 )
 
@@ -71,4 +74,55 @@ func (v *verifier) standardBlock(
 		verifiedHeights: set.Of(v.pChainHeight),
 	}
 	return nil
+}
+
+func (v *verifier) processStandardTxs(txs []*txs.Tx, diff state.Diff, parentID ids.ID) (
+	set.Set[ids.ID],
+	func(),
+	error,
+) {
+	var (
+		onAcceptFunc func()
+		inputs       set.Set[ids.ID]
+		funcs        = make([]func(), 0, len(txs))
+	)
+	for _, tx := range txs {
+		txInputs, onAccept, err := executor.StandardTx(
+			v.txExecutorBackend,
+			tx,
+			diff,
+		)
+		if err != nil {
+			txID := tx.ID()
+			v.MarkDropped(txID, err) // cache tx as dropped
+			return nil, nil, err
+		}
+		// ensure it doesn't overlap with current input batch
+		if inputs.Overlaps(txInputs) {
+			return nil, nil, errConflictingBlockTxs
+		}
+		// Add UTXOs to batch
+		inputs.Union(txInputs)
+
+		diff.AddTx(tx, status.Committed)
+		if onAccept != nil {
+			funcs = append(funcs, onAccept)
+		}
+	}
+
+	if err := v.verifyUniqueInputs(parentID, inputs); err != nil {
+		return nil, nil, err
+	}
+
+	if numFuncs := len(funcs); numFuncs == 1 {
+		onAcceptFunc = funcs[0]
+	} else if numFuncs > 1 {
+		onAcceptFunc = func() {
+			for _, f := range funcs {
+				f()
+			}
+		}
+	}
+
+	return inputs, onAcceptFunc, nil
 }

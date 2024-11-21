@@ -28,9 +28,12 @@ type State interface {
 	SetLastAccepted(blkID ids.ID)
 
 	GetStatelessBlock(blockID ids.ID) (block.Block, error)
+	GetBlockIDAtHeight(height uint64) (ids.ID, error)
 
 	// Commit changes to the base database.
 	Commit() error
+
+	Close() error
 }
 
 type txBytesAndStatus struct {
@@ -124,6 +127,33 @@ func (s *state) GetStatelessBlock(blockID ids.ID) (block.Block, error) {
 	return blk, nil
 }
 
+func (s *state) GetBlockIDAtHeight(height uint64) (ids.ID, error) {
+	if blkID, exists := s.addedBlockIDs[height]; exists {
+		return blkID, nil
+	}
+	if blkID, cached := s.blockIDCache.Get(height); cached {
+		if blkID == ids.Empty {
+			return ids.Empty, database.ErrNotFound
+		}
+
+		return blkID, nil
+	}
+
+	heightKey := database.PackUInt64(height)
+
+	blkID, err := database.GetID(s.blockIDDB, heightKey)
+	if err == database.ErrNotFound {
+		s.blockIDCache.Put(height, ids.Empty)
+		return ids.Empty, database.ErrNotFound
+	}
+	if err != nil {
+		return ids.Empty, err
+	}
+
+	s.blockIDCache.Put(height, blkID)
+	return blkID, nil
+}
+
 type stateBlk struct {
 	Bytes  []byte         `serialize:"true"`
 	Status choices.Status `serialize:"true"`
@@ -212,6 +242,14 @@ func (s *state) CommitBatch() (database.Batch, error) {
 		return nil, err
 	}
 	return s.baseDB.CommitBatch()
+}
+
+func (s *state) Close() error {
+	return errors.Join(
+		s.txDB.Close(),
+		s.blockDB.Close(),
+		s.blockIDDB.Close(),
+	)
 }
 
 func (s *state) write(height uint64) error {

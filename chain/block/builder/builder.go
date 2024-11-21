@@ -7,26 +7,49 @@ import (
 	"sync"
 	"time"
 
+	"github.com/MetalBlockchain/metalgo/ids"
 	"github.com/MetalBlockchain/metalgo/snow/consensus/snowman"
 	smblock "github.com/MetalBlockchain/metalgo/snow/engine/snowman/block"
+	"github.com/MetalBlockchain/metalgo/utils/set"
+	"github.com/MetalBlockchain/metalgo/utils/units"
+	"github.com/MetalBlockchain/pulsevm/chain/block"
+	"github.com/MetalBlockchain/pulsevm/chain/txs"
 	"github.com/MetalBlockchain/pulsevm/chain/txs/mempool"
 	"github.com/MetalBlockchain/pulsevm/state"
+	"github.com/MetalBlockchain/pulsevm/status"
 	"go.uber.org/zap"
 
 	blockexecutor "github.com/MetalBlockchain/pulsevm/chain/block/executor"
 	txexecutor "github.com/MetalBlockchain/pulsevm/chain/txs/executor"
 )
 
+const (
+	// targetBlockSize is maximum number of transaction bytes to place into a
+	// StandardBlock
+	targetBlockSize = 128 * units.KiB
+)
+
 var (
 	_ Builder = (*builder)(nil)
 
 	errMissingPreferredState = errors.New("missing preferred block state")
+	errNoPendingBlocks       = errors.New("no pending blocks")
 )
 
 type Builder interface {
 	// StartBlockTimer starts to issue block creation requests to advance the
 	// chain timestamp.
 	StartBlockTimer()
+
+	// ResetBlockTimer forces the block timer to recalculate when it should
+	// advance the chain timestamp.
+	ResetBlockTimer()
+
+	// ShutdownBlockTimer stops block creation requests to advance the chain
+	// timestamp.
+	//
+	// Invariant: Assumes the context lock is held when calling.
+	ShutdownBlockTimer()
 
 	// BuildBlock can be called to attempt to create a new block
 	BuildBlock(context.Context) (snowman.Block, error)
@@ -48,11 +71,15 @@ type builder struct {
 
 func New(
 	mempool mempool.Mempool,
+	txExecutorBackend *txexecutor.Backend,
+	blkManager blockexecutor.Manager,
 ) Builder {
 	return &builder{
-		Mempool:    mempool,
-		resetTimer: make(chan struct{}, 1),
-		closed:     make(chan struct{}),
+		Mempool:           mempool,
+		txExecutorBackend: txExecutorBackend,
+		blkManager:        blkManager,
+		resetTimer:        make(chan struct{}, 1),
+		closed:            make(chan struct{}),
 	}
 }
 
@@ -178,22 +205,13 @@ func (b *builder) BuildBlockWithContext(
 		return nil, fmt.Errorf("%w: %s", state.ErrMissingParentState, preferredID)
 	}
 
-	timestamp, timeWasCapped, err := state.NextBlockTime(
-		b.txExecutorBackend.Config.ValidatorFeeConfig,
-		preferredState,
-		b.txExecutorBackend.Clk,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("could not calculate next staker change time: %w", err)
-	}
-
+	timestamp := time.Now()
 	statelessBlk, err := buildBlock(
 		ctx,
 		b,
 		preferredID,
 		nextHeight,
 		timestamp,
-		timeWasCapped,
 		preferredState,
 		blockContext.PChainHeight,
 	)
@@ -202,4 +220,147 @@ func (b *builder) BuildBlockWithContext(
 	}
 
 	return b.blkManager.NewBlock(statelessBlk), nil
+}
+
+// [timestamp] is min(max(now, parent timestamp), next staker change time)
+func buildBlock(
+	ctx context.Context,
+	builder *builder,
+	parentID ids.ID,
+	height uint64,
+	timestamp time.Time,
+	parentState state.Chain,
+	pChainHeight uint64,
+) (block.Block, error) {
+	var (
+		blockTxs []*txs.Tx
+		err      error
+	)
+	blockTxs, err = packBlockTxs(
+		ctx,
+		parentID,
+		parentState,
+		builder.Mempool,
+		builder.txExecutorBackend,
+		builder.blkManager,
+		timestamp,
+		pChainHeight,
+		targetBlockSize,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to pack block txs: %w", err)
+	}
+
+	// If there is no reason to build a block, don't.
+	if len(blockTxs) == 0 {
+		builder.txExecutorBackend.Ctx.Log.Debug("no pending txs to issue into a block")
+		return nil, errNoPendingBlocks
+	}
+
+	// Issue a block with as many transactions as possible.
+	return block.NewStandardBlock(
+		timestamp,
+		parentID,
+		height,
+		blockTxs,
+	)
+}
+
+func packBlockTxs(
+	ctx context.Context,
+	parentID ids.ID,
+	parentState state.Chain,
+	mempool mempool.Mempool,
+	backend *txexecutor.Backend,
+	manager blockexecutor.Manager,
+	timestamp time.Time,
+	pChainHeight uint64,
+	remainingSize int,
+) ([]*txs.Tx, error) {
+	stateDiff, err := state.NewDiffOn(parentState)
+	if err != nil {
+		return nil, err
+	}
+
+	var (
+		blockTxs []*txs.Tx
+		inputs   set.Set[ids.ID]
+	)
+	for {
+		tx, exists := mempool.Peek()
+		if !exists {
+			break
+		}
+		txSize := len(tx.Bytes())
+		if txSize > remainingSize {
+			break
+		}
+
+		shouldAdd, err := executeTx(
+			ctx,
+			parentID,
+			stateDiff,
+			mempool,
+			backend,
+			manager,
+			pChainHeight,
+			&inputs,
+			tx,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if !shouldAdd {
+			continue
+		}
+
+		remainingSize -= txSize
+		blockTxs = append(blockTxs, tx)
+	}
+
+	return blockTxs, nil
+}
+
+func executeTx(
+	ctx context.Context,
+	parentID ids.ID,
+	stateDiff state.Diff,
+	mempool mempool.Mempool,
+	backend *txexecutor.Backend,
+	manager blockexecutor.Manager,
+	pChainHeight uint64,
+	inputs *set.Set[ids.ID],
+	tx *txs.Tx,
+) (bool, error) {
+	mempool.Remove(tx)
+	txDiff, err := state.NewDiffOn(stateDiff)
+	if err != nil {
+		return false, err
+	}
+
+	txInputs, _, err := txexecutor.StandardTx(
+		backend,
+		tx,
+		txDiff,
+	)
+	if err != nil {
+		txID := tx.ID()
+		mempool.MarkDropped(txID, err)
+		return false, nil
+	}
+
+	if inputs.Overlaps(txInputs) {
+		txID := tx.ID()
+		mempool.MarkDropped(txID, blockexecutor.ErrConflictingBlockTxs)
+		return false, nil
+	}
+	if err := manager.VerifyUniqueInputs(parentID, txInputs); err != nil {
+		txID := tx.ID()
+		mempool.MarkDropped(txID, err)
+		return false, nil
+	}
+	inputs.Union(txInputs)
+
+	txDiff.AddTx(tx, status.Committed)
+	return true, txDiff.Apply(stateDiff)
 }

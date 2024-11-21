@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/MetalBlockchain/metalgo/ids"
 	"github.com/MetalBlockchain/metalgo/snow"
 	"github.com/MetalBlockchain/pulsevm/chain/txs"
 )
@@ -44,4 +45,21 @@ func (b *StandardBlock) Txs() []*txs.Tx {
 
 func (b *StandardBlock) Visit(v Visitor) error {
 	return v.StandardBlock(b)
+}
+
+func NewStandardBlock(
+	timestamp time.Time,
+	parentID ids.ID,
+	height uint64,
+	txs []*txs.Tx,
+) (*StandardBlock, error) {
+	blk := &StandardBlock{
+		Time: uint64(timestamp.Unix()),
+		CommonBlock: CommonBlock{
+			PrntID: parentID,
+			Hght:   height,
+		},
+		Transactions: txs,
+	}
+	return blk, initialize(blk, &blk.CommonBlock)
 }

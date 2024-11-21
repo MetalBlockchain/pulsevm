@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/MetalBlockchain/metalgo/snow/consensus/snowman"
@@ -11,6 +12,8 @@ import (
 
 var (
 	_ snowman.Block = (*Block)(nil)
+
+	ErrConflictingBlockTxs = errors.New("block contains conflicting transactions")
 )
 
 type Block struct {

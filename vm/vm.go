@@ -2,25 +2,44 @@ package vm
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net/http"
 	"time"
 
+	"github.com/MetalBlockchain/metalgo/api/metrics"
 	"github.com/MetalBlockchain/metalgo/database"
 	"github.com/MetalBlockchain/metalgo/ids"
 	"github.com/MetalBlockchain/metalgo/snow"
 	"github.com/MetalBlockchain/metalgo/snow/consensus/snowman"
 	"github.com/MetalBlockchain/metalgo/snow/engine/common"
-	"github.com/MetalBlockchain/metalgo/snow/engine/snowman/block"
 	"github.com/MetalBlockchain/metalgo/utils"
+	"github.com/MetalBlockchain/metalgo/utils/timer/mockable"
 	"github.com/MetalBlockchain/metalgo/version"
+	"github.com/MetalBlockchain/pulsevm/chain/block"
+	txexecutor "github.com/MetalBlockchain/pulsevm/chain/txs/executor"
+	ourmetrics "github.com/MetalBlockchain/pulsevm/metrics"
 	"github.com/MetalBlockchain/pulsevm/state"
+
+	blockbuilder "github.com/MetalBlockchain/pulsevm/chain/block/builder"
+	blockexecutor "github.com/MetalBlockchain/pulsevm/chain/block/executor"
+	"github.com/MetalBlockchain/pulsevm/chain/txs/mempool"
+
+	snowmanblock "github.com/MetalBlockchain/metalgo/snow/engine/snowman/block"
 )
 
-var _ block.ChainVM = &VM{}
-var _ block.BatchedChainVM = &VM{}
+var _ snowmanblock.ChainVM = &VM{}
+var _ snowmanblock.BatchedChainVM = &VM{}
 
 type VM struct {
-	chainCtx     *snow.Context
+	blockbuilder.Builder
+
+	metrics ourmetrics.Metrics
+
+	// Used to get time. Useful for faking time during tests.
+	clock mockable.Clock
+
+	ctx          *snow.Context
 	genesisBytes []byte
 	toEngine     chan<- common.Message
 	db           database.Database
@@ -29,6 +48,8 @@ type VM struct {
 
 	// Bootstrapped remembers if this chain has finished bootstrapping or not
 	bootstrapped utils.Atomic[bool]
+
+	manager blockexecutor.Manager
 }
 
 func (vm *VM) Initialize(
@@ -42,7 +63,20 @@ func (vm *VM) Initialize(
 	fxs []*common.Fx,
 	appSender common.AppSender,
 ) error {
-	vm.chainCtx = chainCtx
+	chainCtx.Log.Verbo("initializing pulsevm")
+
+	registerer, err := metrics.MakeAndRegister(chainCtx.Metrics, "")
+	if err != nil {
+		return err
+	}
+
+	// Initialize metrics as soon as possible
+	vm.metrics, err = ourmetrics.New(registerer)
+	if err != nil {
+		return fmt.Errorf("failed to initialize metrics: %w", err)
+	}
+
+	vm.ctx = chainCtx
 	vm.genesisBytes = genesisBytes
 	vm.toEngine = toEngine
 	vm.db = db
@@ -54,6 +88,29 @@ func (vm *VM) Initialize(
 	} else {
 		vm.state = state
 	}
+
+	txExecutorBackend := &txexecutor.Backend{
+		Ctx:          vm.ctx,
+		Clk:          &vm.clock,
+		Bootstrapped: &vm.bootstrapped,
+	}
+
+	mempool, err := mempool.New("mempool", registerer, toEngine)
+	if err != nil {
+		return fmt.Errorf("failed to create mempool: %w", err)
+	}
+
+	vm.manager = blockexecutor.NewManager(
+		mempool,
+		vm.state,
+		txExecutorBackend,
+	)
+
+	vm.Builder = blockbuilder.New(
+		mempool,
+		txExecutorBackend,
+		vm.manager,
+	)
 
 	return nil
 }
@@ -70,7 +127,16 @@ func (vm *VM) SetState(ctx context.Context, state snow.State) error {
 }
 
 func (vm *VM) Shutdown(context.Context) error {
-	return nil
+	if vm.db == nil {
+		return nil
+	}
+
+	vm.Builder.ShutdownBlockTimer()
+
+	return errors.Join(
+		vm.state.Close(),
+		vm.db.Close(),
+	)
 }
 
 func (vm *VM) Version(context.Context) (string, error) {
@@ -85,28 +151,33 @@ func (vm *VM) HealthCheck(context.Context) (interface{}, error) {
 	return nil, nil
 }
 
-func (vm *VM) BuildBlock(context.Context) (snowman.Block, error) {
-	return nil, nil
-}
-
 func (vm *VM) SetPreference(ctx context.Context, blkID ids.ID) error {
+	if vm.manager.SetPreference(blkID) {
+		vm.Builder.ResetBlockTimer()
+	}
 	return nil
 }
 
 func (vm *VM) LastAccepted(context.Context) (ids.ID, error) {
-	return ids.Empty, nil
+	return vm.manager.LastAccepted(), nil
 }
 
 func (vm *VM) GetBlockIDAtHeight(ctx context.Context, height uint64) (ids.ID, error) {
-	return ids.Empty, nil
+	return vm.state.GetBlockIDAtHeight(height)
 }
 
 func (vm *VM) GetBlock(ctx context.Context, blkID ids.ID) (snowman.Block, error) {
-	return nil, nil
+	return vm.manager.GetBlock(blkID)
 }
 
 func (vm *VM) ParseBlock(ctx context.Context, blockBytes []byte) (snowman.Block, error) {
-	return nil, nil
+	// Note: blocks to be parsed are not verified, so we must used blocks.Codec
+	// rather than blocks.GenesisCodec
+	statelessBlk, err := block.Parse(block.Codec, blockBytes)
+	if err != nil {
+		return nil, err
+	}
+	return vm.manager.NewBlock(statelessBlk), nil
 }
 
 func (vm *VM) GetAncestors(
