@@ -110,10 +110,6 @@ func (v *verifier) processStandardTxs(txs []*txs.Tx, diff state.Diff, parentID i
 		}
 	}
 
-	if err := v.verifyUniqueInputs(parentID, inputs); err != nil {
-		return nil, nil, err
-	}
-
 	if numFuncs := len(funcs); numFuncs == 1 {
 		onAcceptFunc = funcs[0]
 	} else if numFuncs > 1 {

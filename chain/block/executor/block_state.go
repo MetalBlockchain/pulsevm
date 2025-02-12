@@ -12,16 +12,9 @@ import (
 	"github.com/MetalBlockchain/pulsevm/state"
 )
 
-type proposalBlockState struct {
-	onDecisionState state.Diff
-	onCommitState   state.Diff
-	onAbortState    state.Diff
-}
-
 // The state of a block.
 // Note that not all fields will be set for a given block.
 type blockState struct {
-	proposalBlockState
 	statelessBlock block.Block
 
 	onAcceptState state.Diff

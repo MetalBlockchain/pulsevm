@@ -14,22 +14,28 @@ import (
 	"github.com/MetalBlockchain/metalgo/snow/consensus/snowman"
 	"github.com/MetalBlockchain/metalgo/snow/engine/common"
 	"github.com/MetalBlockchain/metalgo/utils"
+	"github.com/MetalBlockchain/metalgo/utils/json"
 	"github.com/MetalBlockchain/metalgo/utils/timer/mockable"
 	"github.com/MetalBlockchain/metalgo/version"
 	"github.com/MetalBlockchain/pulsevm/chain/block"
+	"github.com/MetalBlockchain/pulsevm/chain/config"
 	txexecutor "github.com/MetalBlockchain/pulsevm/chain/txs/executor"
 	ourmetrics "github.com/MetalBlockchain/pulsevm/metrics"
 	"github.com/MetalBlockchain/pulsevm/state"
+	"go.uber.org/zap"
 
 	blockbuilder "github.com/MetalBlockchain/pulsevm/chain/block/builder"
 	blockexecutor "github.com/MetalBlockchain/pulsevm/chain/block/executor"
 	"github.com/MetalBlockchain/pulsevm/chain/txs/mempool"
 
 	snowmanblock "github.com/MetalBlockchain/metalgo/snow/engine/snowman/block"
+
+	"github.com/gorilla/rpc/v2"
 )
 
 var _ snowmanblock.ChainVM = &VM{}
-var _ snowmanblock.BatchedChainVM = &VM{}
+
+//var _ snowmanblock.BatchedChainVM = &VM{}
 
 type VM struct {
 	blockbuilder.Builder
@@ -65,6 +71,12 @@ func (vm *VM) Initialize(
 ) error {
 	chainCtx.Log.Verbo("initializing pulsevm")
 
+	execConfig, err := config.GetConfig(configBytes)
+	if err != nil {
+		return err
+	}
+	chainCtx.Log.Info("using VM execution config", zap.Reflect("config", execConfig))
+
 	registerer, err := metrics.MakeAndRegister(chainCtx.Metrics, "")
 	if err != nil {
 		return err
@@ -83,6 +95,9 @@ func (vm *VM) Initialize(
 
 	if state, err := state.New(
 		vm.db,
+		genesisBytes,
+		registerer,
+		execConfig,
 	); err != nil {
 		return err
 	} else {
@@ -144,7 +159,17 @@ func (vm *VM) Version(context.Context) (string, error) {
 }
 
 func (vm *VM) CreateHandlers(context.Context) (map[string]http.Handler, error) {
-	return nil, nil
+	server := rpc.NewServer()
+	server.RegisterCodec(json.NewCodec(), "application/json")
+	server.RegisterCodec(json.NewCodec(), "application/json;charset=UTF-8")
+	service := &Service{
+		vm: vm,
+	}
+
+	err := server.RegisterService(service, "pulsevm")
+	return map[string]http.Handler{
+		"/rpc": server,
+	}, err
 }
 
 func (vm *VM) HealthCheck(context.Context) (interface{}, error) {

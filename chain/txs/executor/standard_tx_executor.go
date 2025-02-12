@@ -55,7 +55,7 @@ func (s *standardTxExecutor) BaseTransaction(*txs.BaseTx) error {
 }
 
 func (s *standardTxExecutor) CreateAccountTx(*txs.CreateAccountTx) error {
-	panic("unimplemented")
+	return nil
 }
 
 func (s *standardTxExecutor) CreateAssetTx(*txs.CreateAssetTx) error {

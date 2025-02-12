@@ -348,17 +348,6 @@ func executeTx(
 		mempool.MarkDropped(txID, err)
 		return false, nil
 	}
-
-	if inputs.Overlaps(txInputs) {
-		txID := tx.ID()
-		mempool.MarkDropped(txID, blockexecutor.ErrConflictingBlockTxs)
-		return false, nil
-	}
-	if err := manager.VerifyUniqueInputs(parentID, txInputs); err != nil {
-		txID := tx.ID()
-		mempool.MarkDropped(txID, err)
-		return false, nil
-	}
 	inputs.Union(txInputs)
 
 	txDiff.AddTx(tx, status.Committed)
