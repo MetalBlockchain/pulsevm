@@ -4,8 +4,9 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/MetalBlockchain/metalgo/codec"
 	"github.com/MetalBlockchain/metalgo/ids"
-	"github.com/MetalBlockchain/metalgo/snow"
+	"github.com/MetalBlockchain/metalgo/utils/hashing"
 	"github.com/MetalBlockchain/pulsevm/chain/txs"
 )
 
@@ -14,52 +15,78 @@ var (
 )
 
 type StandardBlock struct {
-	CommonBlock  `serialize:"true"`
+	BlockID      ids.ID    `json:"id"`
+	PrntID       ids.ID    `serialize:"true" json:"parentID"`
+	Hght         uint64    `serialize:"true" json:"height"`
 	Time         uint64    `serialize:"true" json:"time"`
+	Root         ids.ID    `serialize:"true" json:"merkleRoot"`
 	Transactions []*txs.Tx `serialize:"true" json:"txs"`
+
+	bytes []byte
 }
 
-func (b *StandardBlock) Timestamp() time.Time {
-	return time.Unix(int64(b.Time), 0)
-}
-
-func (b *StandardBlock) initialize(bytes []byte) error {
-	b.CommonBlock.initialize(bytes)
+func (b *StandardBlock) initialize(bytes []byte, cm codec.Manager) error {
+	b.BlockID = hashing.ComputeHash256Array(bytes)
+	b.bytes = bytes
 	for _, tx := range b.Transactions {
-		if err := tx.Initialize(txs.Codec); err != nil {
+		if err := tx.Initialize(cm); err != nil {
 			return fmt.Errorf("failed to initialize tx: %w", err)
 		}
 	}
 	return nil
 }
 
-func (b *StandardBlock) InitCtx(ctx *snow.Context) {
-	for _, tx := range b.Transactions {
-		tx.Unsigned.InitCtx(ctx)
-	}
+func (b *StandardBlock) ID() ids.ID {
+	return b.BlockID
+}
+
+func (b *StandardBlock) Parent() ids.ID {
+	return b.PrntID
+}
+
+func (b *StandardBlock) Height() uint64 {
+	return b.Hght
+}
+
+func (b *StandardBlock) Timestamp() time.Time {
+	return time.Unix(int64(b.Time), 0)
+}
+
+func (b *StandardBlock) MerkleRoot() ids.ID {
+	return b.Root
 }
 
 func (b *StandardBlock) Txs() []*txs.Tx {
 	return b.Transactions
 }
 
-func (b *StandardBlock) Visit(v Visitor) error {
-	return v.StandardBlock(b)
+func (b *StandardBlock) Bytes() []byte {
+	return b.bytes
 }
 
 func NewStandardBlock(
-	timestamp time.Time,
 	parentID ids.ID,
 	height uint64,
+	timestamp time.Time,
 	txs []*txs.Tx,
+	cm codec.Manager,
 ) (*StandardBlock, error) {
 	blk := &StandardBlock{
-		Time: uint64(timestamp.Unix()),
-		CommonBlock: CommonBlock{
-			PrntID: parentID,
-			Hght:   height,
-		},
+		PrntID:       parentID,
+		Hght:         height,
+		Time:         uint64(timestamp.Unix()),
 		Transactions: txs,
 	}
-	return blk, initialize(blk, &blk.CommonBlock)
+
+	// We serialize this block as a pointer so that it can be deserialized into
+	// a Block
+	var blkIntf Block = blk
+	bytes, err := cm.Marshal(CodecVersion, &blkIntf)
+	if err != nil {
+		return nil, fmt.Errorf("couldn't marshal block: %w", err)
+	}
+
+	blk.BlockID = hashing.ComputeHash256Array(bytes)
+	blk.bytes = bytes
+	return blk, nil
 }

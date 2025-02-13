@@ -11,15 +11,17 @@ import (
 	"github.com/MetalBlockchain/metalgo/database/prefixdb"
 	"github.com/MetalBlockchain/metalgo/database/versiondb"
 	"github.com/MetalBlockchain/metalgo/ids"
-	"github.com/MetalBlockchain/metalgo/snow/choices"
-	"github.com/MetalBlockchain/metalgo/utils/constants"
-	"github.com/MetalBlockchain/metalgo/utils/wrappers"
 	"github.com/MetalBlockchain/pulsevm/chain/block"
 	"github.com/MetalBlockchain/pulsevm/chain/config"
-	"github.com/MetalBlockchain/pulsevm/chain/genesis"
 	"github.com/MetalBlockchain/pulsevm/chain/txs"
 	"github.com/MetalBlockchain/pulsevm/status"
 	"github.com/prometheus/client_golang/prometheus"
+)
+
+const (
+	txCacheSize      = 8192
+	blockIDCacheSize = 8192
+	blockCacheSize   = 2048
 )
 
 var (
@@ -32,21 +34,36 @@ var (
 	BlockPrefix     = []byte("block")
 	TxPrefix        = []byte("tx")
 
-	InitializedKey  = []byte("initialized")
-	TimestampKey    = []byte("timestamp")
-	LastAcceptedKey = []byte("last accepted")
+	isInitializedKey = []byte{0x00}
+	timestampKey     = []byte{0x01}
+	lastAcceptedKey  = []byte{0x02}
 )
+
+type ReadOnlyChain interface {
+	GetTx(txID ids.ID) (*txs.Tx, error)
+	GetBlockIDAtHeight(height uint64) (ids.ID, error)
+	GetBlock(blkID ids.ID) (block.Block, error)
+	GetLastAccepted() ids.ID
+	GetTimestamp() time.Time
+}
+
+type Chain interface {
+	ReadOnlyChain
+
+	AddTx(tx *txs.Tx)
+	AddBlock(block block.Block)
+	SetLastAccepted(blkID ids.ID)
+	SetTimestamp(t time.Time)
+}
 
 type State interface {
 	Chain
 
-	GetLastAccepted() ids.ID
-	SetLastAccepted(blkID ids.ID)
+	IsInitialized() (bool, error)
+	SetInitialized() error
 
-	// Invariant: [block] is an accepted block.
-	AddStatelessBlock(block block.Block)
-	GetStatelessBlock(blockID ids.ID) (block.Block, error)
-	GetBlockIDAtHeight(height uint64) (ids.ID, error)
+	// Discard uncommitted changes to the database.
+	Abort()
 
 	// Commit changes to the base database.
 	Commit() error
@@ -65,7 +82,8 @@ type txAndStatus struct {
 }
 
 type state struct {
-	baseDB *versiondb.Database
+	parser block.Parser
+	db     *versiondb.Database
 
 	// [lastAccepted] is the most recently accepted block.
 	lastAccepted, persistedLastAccepted ids.ID
@@ -80,8 +98,8 @@ type state struct {
 	blockIDCache  cache.Cacher[uint64, ids.ID] // cache of height -> blockID; if the entry is ids.Empty, it is not in the database
 	blockIDDB     database.Database
 
-	addedTxs map[ids.ID]*txAndStatus            // map of txID -> {*txs.Tx, Status}
-	txCache  cache.Cacher[ids.ID, *txAndStatus] // txID -> {*txs.Tx, Status}; if the entry is nil, it is not in the database
+	addedTxs map[ids.ID]*txs.Tx            // map of txID -> *txs.Tx
+	txCache  cache.Cacher[ids.ID, *txs.Tx] // cache of txID -> *txs.Tx. If the entry is nil, it is not in the database
 	txDB     database.Database
 
 	singletonDB database.Database
@@ -89,30 +107,17 @@ type state struct {
 	timestamp, persistedTimestamp time.Time
 }
 
-func blockSize(_ ids.ID, blk block.Block) int {
-	if blk == nil {
-		return ids.IDLen + constants.PointerOverhead
-	}
-	return ids.IDLen + len(blk.Bytes()) + constants.PointerOverhead
-}
-
-func txAndStatusSize(_ ids.ID, t *txAndStatus) int {
-	if t == nil {
-		return ids.IDLen + constants.PointerOverhead
-	}
-	return ids.IDLen + len(t.tx.Bytes()) + wrappers.IntLen + 2*constants.PointerOverhead
-}
-
 func New(
-	db database.Database,
+	db *versiondb.Database,
+	parser block.Parser,
 	genesisBytes []byte,
-	metricsReg prometheus.Registerer,
+	metrics prometheus.Registerer,
 	execCfg *config.Config,
 ) (State, error) {
 	blockIDCache, err := metercacher.New[uint64, ids.ID](
 		"block_id_cache",
-		metricsReg,
-		&cache.LRU[uint64, ids.ID]{Size: execCfg.BlockIDCacheSize},
+		metrics,
+		&cache.LRU[uint64, ids.ID]{Size: blockIDCacheSize},
 	)
 	if err != nil {
 		return nil, err
@@ -120,150 +125,50 @@ func New(
 
 	blockCache, err := metercacher.New[ids.ID, block.Block](
 		"block_cache",
-		metricsReg,
-		cache.NewSizedLRU[ids.ID, block.Block](execCfg.BlockCacheSize, blockSize),
+		metrics,
+		&cache.LRU[ids.ID, block.Block]{Size: blockCacheSize},
 	)
 	if err != nil {
 		return nil, err
 	}
 
-	txCache, err := metercacher.New(
+	txCache, err := metercacher.New[ids.ID, *txs.Tx](
 		"tx_cache",
-		metricsReg,
-		cache.NewSizedLRU[ids.ID, *txAndStatus](execCfg.TxCacheSize, txAndStatusSize),
+		metrics,
+		&cache.LRU[ids.ID, *txs.Tx]{Size: txCacheSize},
 	)
 	if err != nil {
 		return nil, err
 	}
-
-	baseDB := versiondb.New(db)
 
 	s := &state{
-		baseDB: baseDB,
+		parser: parser,
+		db:     db,
 
 		addedBlockIDs: make(map[uint64]ids.ID),
 		blockIDCache:  blockIDCache,
-		blockIDDB:     prefixdb.New(BlockIDPrefix, baseDB),
+		blockIDDB:     prefixdb.New(BlockIDPrefix, db),
 
 		addedBlocks: make(map[ids.ID]block.Block),
 		blockCache:  blockCache,
-		blockDB:     prefixdb.New(BlockPrefix, baseDB),
+		blockDB:     prefixdb.New(BlockPrefix, db),
 
-		addedTxs: make(map[ids.ID]*txAndStatus),
-		txDB:     prefixdb.New(TxPrefix, baseDB),
+		addedTxs: make(map[ids.ID]*txs.Tx),
+		txDB:     prefixdb.New(TxPrefix, db),
 		txCache:  txCache,
 
-		singletonDB: prefixdb.New(SingletonPrefix, baseDB),
-	}
-
-	if err := s.sync(genesisBytes); err != nil {
-		return nil, errors.Join(
-			err,
-			s.Close(),
-		)
+		singletonDB: prefixdb.New(SingletonPrefix, db),
 	}
 
 	return s, nil
 }
 
-func (s *state) sync(genesis []byte) error {
-	wasInitialized, err := isInitialized(s.singletonDB)
-	if err != nil {
-		return fmt.Errorf(
-			"failed to check if the database is initialized: %w",
-			err,
-		)
-	}
-
-	if !wasInitialized {
-		if err := s.init(genesis); err != nil {
-			return fmt.Errorf(
-				"failed to initialize the database: %w",
-				err,
-			)
-		}
-	}
-
-	if err := s.load(); err != nil {
-		return fmt.Errorf(
-			"failed to load the database state: %w",
-			err,
-		)
-	}
-
-	return nil
+func (s *state) IsInitialized() (bool, error) {
+	return s.singletonDB.Has(isInitializedKey)
 }
 
-func (s *state) init(genesisBytes []byte) error {
-	genesis, err := genesis.Parse(genesisBytes)
-	if err != nil {
-		return err
-	}
-
-	genesisBlock, err := block.NewStandardBlock(genesis.Timestamp, ids.Empty, 0, nil)
-	if err != nil {
-		return err
-	}
-
-	if err := s.syncGenesis(genesisBlock, genesis); err != nil {
-		return err
-	}
-
-	if err := markInitialized(s.singletonDB); err != nil {
-		return err
-	}
-
-	return s.Commit()
-}
-
-func (s *state) syncGenesis(genesisBlk block.Block, genesis *genesis.Genesis) error {
-	genesisBlkID := genesisBlk.ID()
-	s.SetLastAccepted(genesisBlkID)
-	s.SetTimestamp(genesis.Timestamp)
-	s.AddStatelessBlock(genesisBlk)
-
-	return s.write(0)
-}
-
-// Load pulls data previously stored on disk that is expected to be in memory.
-func (s *state) load() error {
-	return errors.Join(
-		s.loadMetadata(),
-	)
-}
-
-func (s *state) loadMetadata() error {
-	timestamp, err := database.GetTimestamp(s.singletonDB, TimestampKey)
-	if err != nil {
-		return err
-	}
-	s.persistedTimestamp = timestamp
-	s.SetTimestamp(timestamp)
-
-	lastAccepted, err := database.GetID(s.singletonDB, LastAcceptedKey)
-	if err != nil {
-		return err
-	}
-	s.persistedLastAccepted = lastAccepted
-	s.lastAccepted = lastAccepted
-
-	return nil
-}
-
-func markInitialized(db database.KeyValueWriter) error {
-	return db.Put(InitializedKey, nil)
-}
-
-func isInitialized(db database.KeyValueReader) (bool, error) {
-	return db.Has(InitializedKey)
-}
-
-func (s *state) GetTimestamp() time.Time {
-	return s.timestamp
-}
-
-func (s *state) SetTimestamp(tm time.Time) {
-	s.timestamp = tm
+func (s *state) SetInitialized() error {
+	return s.singletonDB.Put(isInitializedKey, nil)
 }
 
 func (s *state) GetLastAccepted() ids.ID {
@@ -274,40 +179,18 @@ func (s *state) SetLastAccepted(lastAccepted ids.ID) {
 	s.lastAccepted = lastAccepted
 }
 
-func (s *state) AddStatelessBlock(block block.Block) {
+func (s *state) GetTimestamp() time.Time {
+	return s.timestamp
+}
+
+func (s *state) SetTimestamp(t time.Time) {
+	s.timestamp = t
+}
+
+func (s *state) AddBlock(block block.Block) {
 	blkID := block.ID()
 	s.addedBlockIDs[block.Height()] = blkID
 	s.addedBlocks[blkID] = block
-}
-
-func (s *state) GetStatelessBlock(blockID ids.ID) (block.Block, error) {
-	if blk, exists := s.addedBlocks[blockID]; exists {
-		return blk, nil
-	}
-	if blk, cached := s.blockCache.Get(blockID); cached {
-		if blk == nil {
-			return nil, database.ErrNotFound
-		}
-
-		return blk, nil
-	}
-
-	blkBytes, err := s.blockDB.Get(blockID[:])
-	if err == database.ErrNotFound {
-		s.blockCache.Put(blockID, nil)
-		return nil, database.ErrNotFound
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	blk, _, err := parseStoredBlock(blkBytes)
-	if err != nil {
-		return nil, err
-	}
-
-	s.blockCache.Put(blockID, blk)
-	return blk, nil
 }
 
 func (s *state) GetBlockIDAtHeight(height uint64) (ids.ID, error) {
@@ -337,78 +220,73 @@ func (s *state) GetBlockIDAtHeight(height uint64) (ids.ID, error) {
 	return blkID, nil
 }
 
-type stateBlk struct {
-	Bytes  []byte         `serialize:"true"`
-	Status choices.Status `serialize:"true"`
-}
-
-// Returns the block and whether it is a [stateBlk].
-// Invariant: blkBytes is safe to parse with blocks.GenesisCodec
-//
-// TODO: Remove after v1.12.x is activated
-func parseStoredBlock(blkBytes []byte) (block.Block, bool, error) {
-	// Attempt to parse as blocks.Block
-	blk, err := block.Parse(block.Codec, blkBytes)
-	if err == nil {
-		return blk, false, nil
+func (s *state) GetBlock(blkID ids.ID) (block.Block, error) {
+	if blk, exists := s.addedBlocks[blkID]; exists {
+		return blk, nil
 	}
-
-	// Fallback to [stateBlk]
-	blkState := stateBlk{}
-	if _, err := block.Codec.Unmarshal(blkBytes, &blkState); err != nil {
-		return nil, false, err
-	}
-
-	blk, err = block.Parse(block.Codec, blkState.Bytes)
-	return blk, true, err
-}
-
-func (s *state) GetTx(txID ids.ID) (*txs.Tx, status.Status, error) {
-	if tx, exists := s.addedTxs[txID]; exists {
-		return tx.tx, tx.status, nil
-	}
-	if tx, cached := s.txCache.Get(txID); cached {
-		if tx == nil {
-			return nil, status.Unknown, database.ErrNotFound
+	if blk, cached := s.blockCache.Get(blkID); cached {
+		if blk == nil {
+			return nil, database.ErrNotFound
 		}
-		return tx.tx, tx.status, nil
+
+		return blk, nil
 	}
+
+	blkBytes, err := s.blockDB.Get(blkID[:])
+	if err == database.ErrNotFound {
+		s.blockCache.Put(blkID, nil)
+		return nil, database.ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	blk, err := s.parser.ParseBlock(blkBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	s.blockCache.Put(blkID, blk)
+	return blk, nil
+}
+
+func (s *state) AddTx(tx *txs.Tx) {
+	txID := tx.ID()
+	s.addedTxs[txID] = tx
+}
+
+func (s *state) GetTx(txID ids.ID) (*txs.Tx, error) {
+	if tx, exists := s.addedTxs[txID]; exists {
+		return tx, nil
+	}
+	if tx, exists := s.txCache.Get(txID); exists {
+		if tx == nil {
+			return nil, database.ErrNotFound
+		}
+		return tx, nil
+	}
+
 	txBytes, err := s.txDB.Get(txID[:])
 	if err == database.ErrNotFound {
 		s.txCache.Put(txID, nil)
-		return nil, status.Unknown, database.ErrNotFound
-	} else if err != nil {
-		return nil, status.Unknown, err
+		return nil, database.ErrNotFound
 	}
-
-	stx := txBytesAndStatus{}
-	if _, err := txs.Codec.Unmarshal(txBytes, &stx); err != nil {
-		return nil, status.Unknown, err
-	}
-
-	tx, err := txs.Parse(txs.Codec, stx.Tx)
 	if err != nil {
-		return nil, status.Unknown, err
+		return nil, err
 	}
 
-	ptx := &txAndStatus{
-		tx:     tx,
-		status: stx.Status,
+	// The key was in the database
+	tx, err := s.parser.ParseGenesisTx(txBytes)
+	if err != nil {
+		return nil, err
 	}
 
-	s.txCache.Put(txID, ptx)
-	return ptx.tx, ptx.status, nil
-}
-
-func (s *state) AddTx(tx *txs.Tx, status status.Status) {
-	s.addedTxs[tx.ID()] = &txAndStatus{
-		tx:     tx,
-		status: status,
-	}
+	s.txCache.Put(txID, tx)
+	return tx, nil
 }
 
 func (s *state) Abort() {
-	s.baseDB.Abort()
+	s.db.Abort()
 }
 
 func (s *state) Commit() error {
@@ -421,72 +299,38 @@ func (s *state) Commit() error {
 }
 
 func (s *state) CommitBatch() (database.Batch, error) {
-	if err := s.write(s.currentHeight); err != nil {
+	if err := s.write(); err != nil {
 		return nil, err
 	}
-	return s.baseDB.CommitBatch()
+	return s.db.CommitBatch()
 }
 
 func (s *state) Close() error {
 	return errors.Join(
 		s.txDB.Close(),
-		s.blockDB.Close(),
 		s.blockIDDB.Close(),
+		s.blockDB.Close(),
+		s.singletonDB.Close(),
+		s.db.Close(),
 	)
 }
 
-func (s *state) write(height uint64) error {
+func (s *state) write() error {
 	return errors.Join(
+		s.writeTxs(),
+		s.writeBlockIDs(),
 		s.writeBlocks(),
-		s.writeTXs(),
-		s.writeMetadata(height),
+		s.writeMetadata(),
 	)
 }
 
-func (s *state) writeBlocks() error {
-	for blkID, blk := range s.addedBlocks {
-		blkID := blkID
-		blkBytes := blk.Bytes()
-		blkHeight := blk.Height()
-		heightKey := database.PackUInt64(blkHeight)
-
-		delete(s.addedBlockIDs, blkHeight)
-		s.blockIDCache.Put(blkHeight, blkID)
-		if err := database.PutID(s.blockIDDB, heightKey, blkID); err != nil {
-			return fmt.Errorf("failed to add blockID: %w", err)
-		}
-
-		delete(s.addedBlocks, blkID)
-		// Note: Evict is used rather than Put here because blk may end up
-		// referencing additional data (because of shared byte slices) that
-		// would not be properly accounted for in the cache sizing.
-		s.blockCache.Evict(blkID)
-		if err := s.blockDB.Put(blkID[:], blkBytes); err != nil {
-			return fmt.Errorf("failed to write block %s: %w", blkID, err)
-		}
-	}
-	return nil
-}
-
-func (s *state) writeTXs() error {
-	for txID, txStatus := range s.addedTxs {
+func (s *state) writeTxs() error {
+	for txID, tx := range s.addedTxs {
 		txID := txID
-
-		stx := txBytesAndStatus{
-			Tx:     txStatus.tx.Bytes(),
-			Status: txStatus.status,
-		}
-
-		txBytes, err := txs.Codec.Marshal(txs.CodecVersion, &stx)
-		if err != nil {
-			return fmt.Errorf("failed to serialize tx: %w", err)
-		}
+		txBytes := tx.Bytes()
 
 		delete(s.addedTxs, txID)
-		// Note: Evict is used rather than Put here because stx may end up
-		// referencing additional data (because of shared byte slices) that
-		// would not be properly accounted for in the cache sizing.
-		s.txCache.Evict(txID)
+		s.txCache.Put(txID, tx)
 		if err := s.txDB.Put(txID[:], txBytes); err != nil {
 			return fmt.Errorf("failed to add tx: %w", err)
 		}
@@ -494,20 +338,45 @@ func (s *state) writeTXs() error {
 	return nil
 }
 
-func (s *state) writeMetadata(height uint64) error {
+func (s *state) writeBlockIDs() error {
+	for height, blkID := range s.addedBlockIDs {
+		heightKey := database.PackUInt64(height)
+
+		delete(s.addedBlockIDs, height)
+		s.blockIDCache.Put(height, blkID)
+		if err := database.PutID(s.blockIDDB, heightKey, blkID); err != nil {
+			return fmt.Errorf("failed to add blockID: %w", err)
+		}
+	}
+	return nil
+}
+
+func (s *state) writeBlocks() error {
+	for blkID, blk := range s.addedBlocks {
+		blkID := blkID
+		blkBytes := blk.Bytes()
+
+		delete(s.addedBlocks, blkID)
+		s.blockCache.Put(blkID, blk)
+		if err := s.blockDB.Put(blkID[:], blkBytes); err != nil {
+			return fmt.Errorf("failed to add block: %w", err)
+		}
+	}
+	return nil
+}
+
+func (s *state) writeMetadata() error {
 	if !s.persistedTimestamp.Equal(s.timestamp) {
-		if err := database.PutTimestamp(s.singletonDB, TimestampKey, s.timestamp); err != nil {
+		if err := database.PutTimestamp(s.singletonDB, timestampKey, s.timestamp); err != nil {
 			return fmt.Errorf("failed to write timestamp: %w", err)
 		}
 		s.persistedTimestamp = s.timestamp
 	}
-
 	if s.persistedLastAccepted != s.lastAccepted {
-		if err := database.PutID(s.singletonDB, LastAcceptedKey, s.lastAccepted); err != nil {
+		if err := database.PutID(s.singletonDB, lastAcceptedKey, s.lastAccepted); err != nil {
 			return fmt.Errorf("failed to write last accepted: %w", err)
 		}
 		s.persistedLastAccepted = s.lastAccepted
 	}
-
 	return nil
 }

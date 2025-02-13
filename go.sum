@@ -48,8 +48,6 @@ github.com/DataDog/zstd v1.5.2/go.mod h1:g4AWEaM3yOg3HYfnJ3YIawPnVdXJh9QME85blwS
 github.com/Joker/hpp v1.0.0/go.mod h1:8x5n+M1Hp5hC0g8okX3sR3vFQwynaX/UgSOM9MeBKzY=
 github.com/MetalBlockchain/coreth v0.13.9-rc.1 h1:ejGD36P7jUYTJ5pwOLfOe6gPG1OGdbb06GrcaxHR3SQ=
 github.com/MetalBlockchain/coreth v0.13.9-rc.1/go.mod h1:KioRlZMTeA6QYw29LwH8x9SlhD/lqifzaQMwJ84Mjk4=
-github.com/MetalBlockchain/metalgo v1.11.13-rc.2 h1:wnFmpbAJbEsAh2mvpcvI8SsplBuieF5G7mhkXPTcnAo=
-github.com/MetalBlockchain/metalgo v1.11.13-rc.2/go.mod h1:4HRnHwLbIn0b9UTVI/Dm9OvqXhBzaS7j729oRyRcAd0=
 github.com/MetalBlockchain/metalgo v1.12.0 h1:OXdGFtJDF+4u7CnVnNNaMf2lCx6RHYjSgJfZXrI3nBY=
 github.com/MetalBlockchain/metalgo v1.12.0/go.mod h1:4HRnHwLbIn0b9UTVI/Dm9OvqXhBzaS7j729oRyRcAd0=
 github.com/NYTimes/gziphandler v1.1.1 h1:ZUDjpQae29j0ryrS0u/B8HZfJBtBQHjqw2rQ2cqUQ3I=

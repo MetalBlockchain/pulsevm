@@ -45,7 +45,7 @@ func (tx *BaseTx) SyntacticVerify(ctx *snow.Context) error {
 }
 
 func (tx *BaseTx) Visit(visitor Visitor) error {
-	return visitor.BaseTransaction(tx)
+	return visitor.BaseTx(tx)
 }
 
 func (tx *BaseTx) InitCtx(ctx *snow.Context) {

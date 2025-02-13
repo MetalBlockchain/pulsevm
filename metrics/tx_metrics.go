@@ -36,17 +36,3 @@ func (m *txMetrics) BaseTransaction(*txs.BaseTx) error {
 	}).Inc()
 	return nil
 }
-
-func (m *txMetrics) CreateAccountTx(*txs.CreateAccountTx) error {
-	m.numTxs.With(prometheus.Labels{
-		txLabel: "create_account",
-	}).Inc()
-	return nil
-}
-
-func (m *txMetrics) CreateAssetTx(*txs.CreateAssetTx) error {
-	m.numTxs.With(prometheus.Labels{
-		txLabel: "create_asset",
-	}).Inc()
-	return nil
-}

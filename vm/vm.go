@@ -19,6 +19,7 @@ import (
 	"github.com/MetalBlockchain/metalgo/version"
 	"github.com/MetalBlockchain/pulsevm/chain/block"
 	"github.com/MetalBlockchain/pulsevm/chain/config"
+	"github.com/MetalBlockchain/pulsevm/chain/txs"
 	txexecutor "github.com/MetalBlockchain/pulsevm/chain/txs/executor"
 	ourmetrics "github.com/MetalBlockchain/pulsevm/metrics"
 	"github.com/MetalBlockchain/pulsevm/state"
@@ -314,5 +315,18 @@ func (vm *VM) onNormalOperationsStarted() error {
 
 	// Start the block builder
 	vm.Builder.StartBlockTimer()
+	return nil
+}
+
+func (vm *VM) issueTxFromRPC(tx *txs.Tx) error {
+	err := vm.Network.IssueTxFromRPC(tx)
+	if err != nil && !errors.Is(err, mempool.ErrDuplicateTx) {
+		vm.ctx.Log.Debug("failed to add tx to mempool",
+			zap.Stringer("txID", tx.ID()),
+			zap.Error(err),
+		)
+		return err
+	}
+
 	return nil
 }
