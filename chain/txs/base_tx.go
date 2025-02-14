@@ -3,9 +3,8 @@ package txs
 import (
 	"errors"
 
+	"github.com/MetalBlockchain/metalgo/ids"
 	"github.com/MetalBlockchain/metalgo/snow"
-	"github.com/MetalBlockchain/metalgo/vms/components/avax"
-	"github.com/MetalBlockchain/metalgo/vms/secp256k1fx"
 )
 
 var (
@@ -17,7 +16,8 @@ var (
 // BaseTx contains fields common to many transaction types. It should be
 // embedded in transaction implementations.
 type BaseTx struct {
-	avax.BaseTx `serialize:"true"`
+	NetworkID    uint32 `serialize:"true" json:"networkID"`    // ID of the network this chain lives on
+	BlockchainID ids.ID `serialize:"true" json:"blockchainID"` // ID of the chain on which this transaction exists (prevents replay attacks)
 
 	// true iff this transaction has already passed syntactic verification
 	SyntacticallyVerified bool `json:"-"`
@@ -49,11 +49,5 @@ func (tx *BaseTx) Visit(visitor Visitor) error {
 }
 
 func (tx *BaseTx) InitCtx(ctx *snow.Context) {
-	for _, in := range tx.BaseTx.Ins {
-		in.FxID = secp256k1fx.ID
-	}
-	for _, out := range tx.BaseTx.Outs {
-		out.FxID = secp256k1fx.ID
-		out.InitCtx(ctx)
-	}
+
 }

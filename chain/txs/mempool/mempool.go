@@ -7,15 +7,14 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
+var _ Mempool = (*mempool)(nil)
+
 type Mempool interface {
 	txmempool.Mempool[*txs.Tx]
 
 	// RequestBuildBlock notifies the consensus engine that a block should be
-	// built. If [emptyBlockPermitted] is true, the notification will be sent
-	// regardless of whether there are no transactions in the mempool. If not,
-	// a notification will only be sent if there is at least one transaction in
-	// the mempool.
-	RequestBuildBlock(emptyBlockPermitted bool)
+	// built if there is at least one transaction in the mempool.
+	RequestBuildBlock()
 }
 
 type mempool struct {
@@ -33,19 +32,17 @@ func New(
 	if err != nil {
 		return nil, err
 	}
-	pool := txmempool.New[*txs.Tx](metrics)
+	pool := txmempool.New[*txs.Tx](
+		metrics,
+	)
 	return &mempool{
 		Mempool:  pool,
 		toEngine: toEngine,
 	}, nil
 }
 
-func (m *mempool) Add(tx *txs.Tx) error {
-	return m.Mempool.Add(tx)
-}
-
-func (m *mempool) RequestBuildBlock(emptyBlockPermitted bool) {
-	if !emptyBlockPermitted && m.Len() == 0 {
+func (m *mempool) RequestBuildBlock() {
+	if m.Len() == 0 {
 		return
 	}
 

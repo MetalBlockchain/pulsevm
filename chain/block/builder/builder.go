@@ -4,9 +4,7 @@ import (
 	"context"
 	"errors"
 
-	"github.com/MetalBlockchain/metalgo/ids"
 	"github.com/MetalBlockchain/metalgo/snow/consensus/snowman"
-	"github.com/MetalBlockchain/metalgo/utils/set"
 	"github.com/MetalBlockchain/metalgo/utils/timer/mockable"
 	"github.com/MetalBlockchain/metalgo/utils/units"
 	"github.com/MetalBlockchain/pulsevm/chain/block"
@@ -84,7 +82,6 @@ func (b *builder) BuildBlock(context.Context) (snowman.Block, error) {
 
 	var (
 		blockTxs      []*txs.Tx
-		inputs        set.Set[ids.ID]
 		remainingSize = targetBlockSize
 	)
 	for {

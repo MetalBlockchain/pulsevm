@@ -4,6 +4,7 @@ import (
 	"context"
 	_ "embed"
 	"flag"
+	"fmt"
 	"testing"
 	"time"
 
@@ -11,7 +12,10 @@ import (
 	"github.com/MetalBlockchain/metalgo/ids"
 	"github.com/MetalBlockchain/metalgo/tests"
 	"github.com/MetalBlockchain/metalgo/tests/fixture/tmpnet"
+	"github.com/MetalBlockchain/metalgo/utils/formatting"
+	"github.com/MetalBlockchain/pulsevm/api"
 	"github.com/MetalBlockchain/pulsevm/chain/constants"
+	"github.com/MetalBlockchain/pulsevm/chain/txs"
 	"github.com/MetalBlockchain/pulsevm/client"
 	ginkgo "github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
@@ -90,7 +94,7 @@ var _ = ginkgo.BeforeSuite(func() {
 		ctx,                        // Context used to limit duration of waiting for network health
 		tests.NewDefaultLogger(""), // Writer to report progress of initialization
 		network,
-		"",          // Empty string uses the default network path (~/tmpnet/networks)
+		"./tmpnet",  // Empty string uses the default network path (~/tmpnet/networks)
 		metalGoPath, // The path to the binary that nodes will execute
 		pluginPath,  // The path nodes will use for plugin binaries (suggested value ~/.avalanchego/plugins)
 	)
@@ -118,6 +122,34 @@ var _ = ginkgo.Describe("[Ping]", func() {
 			ok, err := cli.Ping(context.Background())
 			gomega.Ω(ok).Should(gomega.BeTrue())
 			gomega.Ω(err).Should(gomega.BeNil())
+		}
+	})
+})
+
+var _ = ginkgo.Describe("[Transaction]", func() {
+	parser, err := txs.NewParser()
+	gomega.Ω(err).Should(gomega.BeNil())
+	tx := txs.Tx{
+		Unsigned: &txs.BaseTx{
+			NetworkID:    1,
+			BlockchainID: ids.Empty,
+		},
+		Signatures: make([][65]byte, 0),
+	}
+	err = tx.Initialize(parser.Codec())
+	gomega.Ω(err).Should(gomega.BeNil())
+	txHex, err := formatting.Encode(formatting.Hex, tx.Bytes())
+	fmt.Println(txHex)
+	gomega.Ω(err).Should(gomega.BeNil())
+	ginkgo.It("can issue a transaction", func() {
+		for _, uri := range network.GetNodeURIs() {
+			cli := client.New(getEndpointURI(uri.URI, chainID), requestTimeout)
+			txID, err := cli.IssueTx(context.Background(), api.FormattedTx{
+				Encoding: formatting.Hex,
+				Tx:       txHex,
+			})
+			gomega.Ω(err).Should(gomega.BeNil())
+			gomega.Ω(txID.String()).Should(gomega.Equal("2mkJGAU9LBA4W4ovY7RyjZe2A5paQHNHuEp87NAHUXJRg4Gwne"))
 		}
 	})
 })

@@ -5,13 +5,17 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/MetalBlockchain/metalgo/ids"
 	"github.com/MetalBlockchain/metalgo/utils/rpc"
+	"github.com/MetalBlockchain/pulsevm/api"
 	"github.com/MetalBlockchain/pulsevm/vm"
 )
 
 type Client interface {
 	// Pings the VM.
 	Ping(ctx context.Context) (bool, error)
+	// Submits a transaction to the consensus engine
+	IssueTx(ctx context.Context, tx api.FormattedTx) (ids.ID, error)
 }
 
 // New creates a new client object.
@@ -27,7 +31,7 @@ type client struct {
 }
 
 func (cli *client) Ping(ctx context.Context) (bool, error) {
-	resp := new(vm.PingReply)
+	resp := new(api.PingReply)
 	err := cli.req.SendRequest(ctx,
 		"pulsevm.ping",
 		nil,
@@ -39,15 +43,15 @@ func (cli *client) Ping(ctx context.Context) (bool, error) {
 	return resp.Success, nil
 }
 
-func (cli *client) Info(ctx context.Context) (bool, error) {
-	resp := new(vm.PingReply)
+func (cli *client) IssueTx(ctx context.Context, tx api.FormattedTx) (ids.ID, error) {
+	resp := new(api.IssueTxReply)
 	err := cli.req.SendRequest(ctx,
-		"pulsevm.ping",
-		nil,
+		"pulsevm.issueTx",
+		tx,
 		resp,
 	)
 	if err != nil {
-		return false, err
+		return ids.Empty, err
 	}
-	return resp.Success, nil
+	return resp.TxID, nil
 }

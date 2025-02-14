@@ -18,13 +18,15 @@ go install -v github.com/onsi/ginkgo/v2/ginkgo@v2.0.0-rc2
 echo "building pulsevm"
 ./scripts/build.sh
 
+rm -Rf "$PULSEVM_PATH/tests/integration/tmpnet"
+
 # run with 3 embedded VMs
 ACK_GINKGO_RC=true ginkgo \
 run \
 -v \
 ./tests/integration \
 -- \
---vms 3 \
+--vms 5 \
 --metalgo-path /Users/glennmarien/Documents/MetalBlockchain/metalgo/build/metalgo \
 --plugin-path "$PULSEVM_PATH/build"
 

@@ -59,6 +59,7 @@ type Chain interface {
 type State interface {
 	Chain
 
+	Initialize(genesisTimestamp time.Time) error
 	IsInitialized() (bool, error)
 	SetInitialized() error
 
@@ -161,6 +162,39 @@ func New(
 	}
 
 	return s, nil
+}
+
+func (s *state) Initialize(genesisTimestamp time.Time) error {
+	lastAccepted, err := database.GetID(s.singletonDB, lastAcceptedKey)
+	if err == database.ErrNotFound {
+		return s.initializeChainState(genesisTimestamp)
+	} else if err != nil {
+		return err
+	}
+
+	s.lastAccepted = lastAccepted
+	s.persistedLastAccepted = lastAccepted
+	s.timestamp, err = database.GetTimestamp(s.singletonDB, timestampKey)
+	s.persistedTimestamp = s.timestamp
+	return err
+}
+
+func (s *state) initializeChainState(genesisTimestamp time.Time) error {
+	genesis, err := block.NewStandardBlock(
+		ids.Empty,
+		0,
+		genesisTimestamp,
+		nil,
+		s.parser.Codec(),
+	)
+	if err != nil {
+		return err
+	}
+
+	s.SetLastAccepted(genesis.ID())
+	s.SetTimestamp(genesis.Timestamp())
+	s.AddBlock(genesis)
+	return s.Commit()
 }
 
 func (s *state) IsInitialized() (bool, error) {
