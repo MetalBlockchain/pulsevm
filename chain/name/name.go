@@ -1,6 +1,9 @@
 package name
 
-import "strings"
+import (
+	"encoding/binary"
+	"strings"
+)
 
 var charmap = ".12345abcdefghijklmnopqrstuvwxyz"
 
@@ -8,6 +11,12 @@ type Name uint64
 
 func (n Name) String() string {
 	return nameToString(uint64(n))
+}
+
+func (n Name) Bytes() []byte {
+	buf := make([]byte, 8)
+	binary.BigEndian.PutUint64(buf, uint64(n))
+	return buf
 }
 
 func NewNameFromString(str string) Name {

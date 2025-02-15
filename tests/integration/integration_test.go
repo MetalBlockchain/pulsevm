@@ -12,11 +12,16 @@ import (
 	"github.com/MetalBlockchain/metalgo/ids"
 	"github.com/MetalBlockchain/metalgo/tests"
 	"github.com/MetalBlockchain/metalgo/tests/fixture/tmpnet"
+	"github.com/MetalBlockchain/metalgo/utils/crypto/secp256k1"
 	"github.com/MetalBlockchain/metalgo/utils/formatting"
 	"github.com/MetalBlockchain/pulsevm/api"
+	"github.com/MetalBlockchain/pulsevm/chain/action"
+	"github.com/MetalBlockchain/pulsevm/chain/authority"
 	"github.com/MetalBlockchain/pulsevm/chain/constants"
+	"github.com/MetalBlockchain/pulsevm/chain/name"
 	"github.com/MetalBlockchain/pulsevm/chain/txs"
 	"github.com/MetalBlockchain/pulsevm/client"
+	"github.com/MetalBlockchain/pulsevm/engine"
 	ginkgo "github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
 )
@@ -127,12 +132,47 @@ var _ = ginkgo.Describe("[Ping]", func() {
 })
 
 var _ = ginkgo.Describe("[Transaction]", func() {
+	randomKey, _ := secp256k1.NewPrivateKey()
+	newAccount := engine.NewAccount{
+		Creator: name.NewNameFromString("glenn"),
+		Name:    name.NewNameFromString("marshall"),
+		Owner: authority.Authority{
+			Threshold: 1,
+			Keys: []authority.KeyWeight{
+				authority.KeyWeight{
+					Key:    *randomKey.PublicKey(),
+					Weight: 1,
+				},
+			},
+		},
+		Active: authority.Authority{
+			Threshold: 1,
+			Keys: []authority.KeyWeight{
+				authority.KeyWeight{
+					Key:    *randomKey.PublicKey(),
+					Weight: 1,
+				},
+			},
+		},
+	}
 	parser, err := txs.NewParser()
+	gomega.Ω(err).Should(gomega.BeNil())
+	actionDataBytes, err := parser.Codec().Marshal(txs.CodecVersion, newAccount)
 	gomega.Ω(err).Should(gomega.BeNil())
 	tx := txs.Tx{
 		Unsigned: &txs.BaseTx{
 			NetworkID:    1,
 			BlockchainID: ids.Empty,
+			Actions: []action.Action{
+				action.Action{
+					Account: name.NewNameFromString("pulse"),
+					Name:    name.NewNameFromString("newaccount"),
+					Authorization: []authority.PermissionLevel{
+						authority.PermissionLevel{Actor: name.NewNameFromString("pulse"), Permission: name.NewNameFromString("active")},
+					},
+					Data: actionDataBytes,
+				},
+			},
 		},
 		Signatures: make([][65]byte, 0),
 	}

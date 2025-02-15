@@ -5,7 +5,9 @@ import (
 	"time"
 
 	"github.com/MetalBlockchain/metalgo/ids"
+	"github.com/MetalBlockchain/pulsevm/chain/account"
 	"github.com/MetalBlockchain/pulsevm/chain/block"
+	"github.com/MetalBlockchain/pulsevm/chain/name"
 	"github.com/MetalBlockchain/pulsevm/chain/txs"
 )
 
@@ -24,9 +26,10 @@ type diff struct {
 	parentID      ids.ID
 	stateVersions Versions
 
-	addedTxs      map[ids.ID]*txs.Tx     // map of txID -> tx
-	addedBlockIDs map[uint64]ids.ID      // map of height -> blockID
-	addedBlocks   map[ids.ID]block.Block // map of blockID -> block
+	addedTxs      map[ids.ID]*txs.Tx             // map of txID -> tx
+	addedBlockIDs map[uint64]ids.ID              // map of height -> blockID
+	addedBlocks   map[ids.ID]block.Block         // map of blockID -> block
+	addedAccounts map[name.Name]*account.Account // map of name -> account
 
 	lastAccepted ids.ID
 	timestamp    time.Time
@@ -81,6 +84,22 @@ func (d *diff) GetTx(txID ids.ID) (*txs.Tx, error) {
 
 func (d *diff) AddTx(tx *txs.Tx) {
 	d.addedTxs[tx.ID()] = tx
+}
+
+func (d *diff) GetAccount(name name.Name) (*account.Account, error) {
+	if tx, exists := d.addedAccounts[name]; exists {
+		return tx, nil
+	}
+
+	parentState, ok := d.stateVersions.GetState(d.parentID)
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrMissingParentState, d.parentID)
+	}
+	return parentState.GetAccount(name)
+}
+
+func (d *diff) AddAccount(account *account.Account) {
+	d.addedAccounts[account.Name] = account
 }
 
 func (d *diff) GetBlockIDAtHeight(height uint64) (ids.ID, error) {

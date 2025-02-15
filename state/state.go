@@ -11,8 +11,11 @@ import (
 	"github.com/MetalBlockchain/metalgo/database/prefixdb"
 	"github.com/MetalBlockchain/metalgo/database/versiondb"
 	"github.com/MetalBlockchain/metalgo/ids"
+	"github.com/MetalBlockchain/pulsevm/chain/account"
+	"github.com/MetalBlockchain/pulsevm/chain/authority"
 	"github.com/MetalBlockchain/pulsevm/chain/block"
 	"github.com/MetalBlockchain/pulsevm/chain/config"
+	"github.com/MetalBlockchain/pulsevm/chain/name"
 	"github.com/MetalBlockchain/pulsevm/chain/txs"
 	"github.com/MetalBlockchain/pulsevm/status"
 	"github.com/prometheus/client_golang/prometheus"
@@ -22,6 +25,7 @@ const (
 	txCacheSize      = 8192
 	blockIDCacheSize = 8192
 	blockCacheSize   = 2048
+	accountCacheSize = 8192
 )
 
 var (
@@ -29,10 +33,12 @@ var (
 
 	ErrMissingParentState = errors.New("missing parent state")
 
-	SingletonPrefix = []byte("singleton")
-	BlockIDPrefix   = []byte("blockID")
-	BlockPrefix     = []byte("block")
-	TxPrefix        = []byte("tx")
+	SingletonPrefix  = []byte("singleton")
+	BlockIDPrefix    = []byte("blockID")
+	BlockPrefix      = []byte("block")
+	TxPrefix         = []byte("tx")
+	AccountPrefix    = []byte("account")
+	PermissionPrefix = []byte("permission")
 
 	isInitializedKey = []byte{0x00}
 	timestampKey     = []byte{0x01}
@@ -45,6 +51,8 @@ type ReadOnlyChain interface {
 	GetBlock(blkID ids.ID) (block.Block, error)
 	GetLastAccepted() ids.ID
 	GetTimestamp() time.Time
+	GetAccount(name name.Name) (*account.Account, error)
+	GetPermission(owner name.Name, name name.Name) (*authority.Permission, error)
 }
 
 type Chain interface {
@@ -52,6 +60,8 @@ type Chain interface {
 
 	AddTx(tx *txs.Tx)
 	AddBlock(block block.Block)
+	AddAccount(account *account.Account)
+	AddPermission(permission *authority.Permission)
 	SetLastAccepted(blkID ids.ID)
 	SetTimestamp(t time.Time)
 }
@@ -103,6 +113,14 @@ type state struct {
 	txCache  cache.Cacher[ids.ID, *txs.Tx] // cache of txID -> *txs.Tx. If the entry is nil, it is not in the database
 	txDB     database.Database
 
+	addedAccounts map[name.Name]*account.Account
+	accountCache  cache.Cacher[name.Name, *account.Account]
+	accountDB     database.Database
+
+	modifiedPermissions map[ids.ID]*authority.Permission
+	permissionCache     cache.Cacher[ids.ID, *authority.Permission]
+	permissionDB        database.Database
+
 	singletonDB database.Database
 
 	timestamp, persistedTimestamp time.Time
@@ -142,6 +160,24 @@ func New(
 		return nil, err
 	}
 
+	accountCache, err := metercacher.New[name.Name, *account.Account](
+		"account_cache",
+		metrics,
+		&cache.LRU[name.Name, *account.Account]{Size: accountCacheSize},
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	permissionCache, err := metercacher.New[ids.ID, *authority.Permission](
+		"permission_cache",
+		metrics,
+		&cache.LRU[ids.ID, *authority.Permission]{Size: accountCacheSize}, // TODO: Change this
+	)
+	if err != nil {
+		return nil, err
+	}
+
 	s := &state{
 		parser: parser,
 		db:     db,
@@ -157,6 +193,14 @@ func New(
 		addedTxs: make(map[ids.ID]*txs.Tx),
 		txDB:     prefixdb.New(TxPrefix, db),
 		txCache:  txCache,
+
+		addedAccounts: make(map[name.Name]*account.Account),
+		accountCache:  accountCache,
+		accountDB:     prefixdb.New(AccountPrefix, db),
+
+		modifiedPermissions: make(map[ids.ID]*authority.Permission),
+		permissionCache:     permissionCache,
+		permissionDB:        prefixdb.New(PermissionPrefix, db),
 
 		singletonDB: prefixdb.New(SingletonPrefix, db),
 	}
@@ -319,6 +363,47 @@ func (s *state) GetTx(txID ids.ID) (*txs.Tx, error) {
 	return tx, nil
 }
 
+func (s *state) AddAccount(account *account.Account) {
+	s.addedAccounts[account.Name] = account
+}
+
+func (s *state) GetAccount(name name.Name) (*account.Account, error) {
+	if acc, exists := s.addedAccounts[name]; exists {
+		return acc, nil
+	}
+	if acc, exists := s.accountCache.Get(name); exists {
+		return acc, nil
+	}
+
+	accBytes, err := s.accountDB.Get(name.Bytes())
+	if err == database.ErrNotFound {
+		s.accountCache.Put(name, nil)
+		return nil, database.ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	// The key was in the database
+	acc, err := s.parser.ParseAccount(accBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	s.accountCache.Put(name, acc)
+	return acc, nil
+}
+
+func (s *state) AddPermission(permission *authority.Permission) {
+	s.modifiedPermissions[permission.ID] = permission
+}
+
+func (s *state) GetPermission(owner name.Name, name name.Name) (*authority.Permission, error) {
+	if perm, exists := s.modifiedPermissions[name]; exists {
+		return acc, nil
+	}
+}
+
 func (s *state) Abort() {
 	s.db.Abort()
 }
@@ -354,6 +439,7 @@ func (s *state) write() error {
 		s.writeTxs(),
 		s.writeBlockIDs(),
 		s.writeBlocks(),
+		s.writeAccounts(),
 		s.writeMetadata(),
 	)
 }
@@ -394,6 +480,21 @@ func (s *state) writeBlocks() error {
 		s.blockCache.Put(blkID, blk)
 		if err := s.blockDB.Put(blkID[:], blkBytes); err != nil {
 			return fmt.Errorf("failed to add block: %w", err)
+		}
+	}
+	return nil
+}
+
+func (s *state) writeAccounts() error {
+	for name, account := range s.addedAccounts {
+		delete(s.addedAccounts, name)
+		s.accountCache.Put(name, account)
+		accountBytes, err := account.Marshal()
+		if err != nil {
+			return err
+		}
+		if err := s.accountDB.Put(name.Bytes(), accountBytes); err != nil {
+			return fmt.Errorf("failed to add account: %w", err)
 		}
 	}
 	return nil

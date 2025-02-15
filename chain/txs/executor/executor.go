@@ -3,6 +3,7 @@ package executor
 import (
 	"github.com/MetalBlockchain/metalgo/codec"
 	"github.com/MetalBlockchain/pulsevm/chain/txs"
+	"github.com/MetalBlockchain/pulsevm/engine"
 	"github.com/MetalBlockchain/pulsevm/state"
 )
 
@@ -17,5 +18,10 @@ type Executor struct {
 }
 
 func (e *Executor) BaseTx(tx *txs.BaseTx) error {
-	return nil
+	txContext, err := engine.NewTransactionContext(tx, e.Codec)
+	if err != nil {
+		return err
+	}
+
+	return txContext.Execute()
 }

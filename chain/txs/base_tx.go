@@ -5,6 +5,7 @@ import (
 
 	"github.com/MetalBlockchain/metalgo/ids"
 	"github.com/MetalBlockchain/metalgo/snow"
+	"github.com/MetalBlockchain/pulsevm/chain/action"
 )
 
 var (
@@ -13,11 +14,10 @@ var (
 	ErrNilTx = errors.New("tx is nil")
 )
 
-// BaseTx contains fields common to many transaction types. It should be
-// embedded in transaction implementations.
 type BaseTx struct {
-	NetworkID    uint32 `serialize:"true" json:"networkID"`    // ID of the network this chain lives on
-	BlockchainID ids.ID `serialize:"true" json:"blockchainID"` // ID of the chain on which this transaction exists (prevents replay attacks)
+	NetworkID    uint32          `serialize:"true" json:"networkID"`    // ID of the network this chain lives on
+	BlockchainID ids.ID          `serialize:"true" json:"blockchainID"` // ID of the chain on which this transaction exists (prevents replay attacks)
+	Actions      []action.Action `serialize:"true" json:"actions"`      // Actions this transaction will execute
 
 	// true iff this transaction has already passed syntactic verification
 	SyntacticallyVerified bool `json:"-"`
