@@ -3,6 +3,7 @@ package e2e
 import (
 	"context"
 	_ "embed"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"testing"
@@ -132,7 +133,10 @@ var _ = ginkgo.Describe("[Ping]", func() {
 })
 
 var _ = ginkgo.Describe("[Transaction]", func() {
-	randomKey, _ := secp256k1.NewPrivateKey()
+	keyBytes, _ := hex.DecodeString("d3d137d219791b54bcbce7ab148871223585a2a181bc8a6d8820580f018e807f")
+	key, err := secp256k1.ToPrivateKey(keyBytes)
+	fmt.Printf("key.PublicKey().Address(): %v\n", key.PublicKey().Address())
+	gomega.Ω(err).Should(gomega.BeNil())
 	newAccount := engine.NewAccount{
 		Creator: name.NewNameFromString("glenn"),
 		Name:    name.NewNameFromString("marshall"),
@@ -140,7 +144,7 @@ var _ = ginkgo.Describe("[Transaction]", func() {
 			Threshold: 1,
 			Keys: []authority.KeyWeight{
 				authority.KeyWeight{
-					Key:    *randomKey.PublicKey(),
+					Key:    *key.PublicKey(),
 					Weight: 1,
 				},
 			},
@@ -149,7 +153,7 @@ var _ = ginkgo.Describe("[Transaction]", func() {
 			Threshold: 1,
 			Keys: []authority.KeyWeight{
 				authority.KeyWeight{
-					Key:    *randomKey.PublicKey(),
+					Key:    *key.PublicKey(),
 					Weight: 1,
 				},
 			},
@@ -174,9 +178,10 @@ var _ = ginkgo.Describe("[Transaction]", func() {
 				},
 			},
 		},
-		Signatures: make([][65]byte, 0),
 	}
 	err = tx.Initialize(parser.Codec())
+	gomega.Ω(err).Should(gomega.BeNil())
+	err = tx.Sign(*key)
 	gomega.Ω(err).Should(gomega.BeNil())
 	txHex, err := formatting.Encode(formatting.Hex, tx.Bytes())
 	fmt.Println(txHex)

@@ -2,31 +2,36 @@ package engine
 
 import (
 	"errors"
+	"fmt"
 
-	"github.com/MetalBlockchain/metalgo/codec"
-	"github.com/MetalBlockchain/metalgo/utils/crypto/secp256k1"
 	"github.com/MetalBlockchain/pulsevm/chain/action"
 	"github.com/MetalBlockchain/pulsevm/chain/name"
 	"github.com/MetalBlockchain/pulsevm/chain/txs"
+	"github.com/MetalBlockchain/pulsevm/state"
 )
 
 var (
-	ErrNoAuthorizer = errors.New("transaction has no authorizers")
+	errNoAuthorizer = errors.New("transaction has no authorizers")
 )
 
 type TransactionContext struct {
 	transaction      *txs.BaseTx
+	signatures       [][]byte
 	resourceTracker  *ResourceTracker
-	codec            codec.Manager
 	authorityChecker *AuthorityChecker
 }
 
-func NewTransactionContext(transaction *txs.BaseTx, codec codec.Manager) (*TransactionContext, error) {
+func NewTransactionContext(tx *txs.BaseTx, signatures [][]byte, state state.Chain) (*TransactionContext, error) {
+	authorityChecker, err := NewAuthorityChecker(tx.Bytes(), signatures, state)
+	if err != nil {
+		return nil, err
+	}
+
 	return &TransactionContext{
-		transaction:      transaction,
+		transaction:      tx,
+		signatures:       signatures,
 		resourceTracker:  NewResourceTracker(),
-		codec:            codec,
-		authorityChecker: NewAuthorityChecker(make([]secp256k1.PublicKey, 0)),
+		authorityChecker: authorityChecker,
 	}, nil
 }
 
@@ -35,7 +40,7 @@ func (tc *TransactionContext) CheckAuthorization() error {
 	for _, action := range tc.transaction.Actions {
 		for _, level := range action.Authorization {
 			if err := tc.authorityChecker.SatisfiesPermissionLevel(level); err != nil {
-				return err
+				return fmt.Errorf("authorization failed: %w", err)
 			}
 		}
 	}
@@ -44,6 +49,10 @@ func (tc *TransactionContext) CheckAuthorization() error {
 }
 
 func (tc *TransactionContext) Execute() error {
+	if err := tc.CheckAuthorization(); err != nil {
+		return err
+	}
+
 	firstAuthorizer, err := tc.FirstAuthorizer()
 	if err != nil {
 		return err
@@ -74,7 +83,7 @@ func (tc *TransactionContext) FirstAuthorizer() (name.Name, error) {
 		}
 	}
 
-	return 0, ErrNoAuthorizer
+	return 0, errNoAuthorizer
 }
 
 func (tc *TransactionContext) FindNativeActionHandler(account name.Name, action name.Name) nativeActionHandler {

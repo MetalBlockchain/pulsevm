@@ -1,6 +1,7 @@
 package state
 
 import (
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/MetalBlockchain/metalgo/database/prefixdb"
 	"github.com/MetalBlockchain/metalgo/database/versiondb"
 	"github.com/MetalBlockchain/metalgo/ids"
+	"github.com/MetalBlockchain/metalgo/utils/crypto/secp256k1"
 	"github.com/MetalBlockchain/pulsevm/chain/account"
 	"github.com/MetalBlockchain/pulsevm/chain/authority"
 	"github.com/MetalBlockchain/pulsevm/chain/block"
@@ -235,6 +237,29 @@ func (s *state) initializeChainState(genesisTimestamp time.Time) error {
 		return err
 	}
 
+	activePermissionID, err := authority.GetPermissionID(name.NewNameFromString("pulse"), name.NewNameFromString("active"))
+	if err != nil {
+		return err
+	}
+
+	keyBytes, _ := hex.DecodeString("d3d137d219791b54bcbce7ab148871223585a2a181bc8a6d8820580f018e807f")
+	key, _ := secp256k1.ToPrivateKey(keyBytes)
+
+	s.AddPermission(&authority.Permission{
+		ID:     activePermissionID,
+		Parent: ids.Empty,
+		Owner:  name.NewNameFromString("pulse"),
+		Name:   name.NewNameFromString("active"),
+		Auth: authority.Authority{
+			Threshold: 1,
+			Keys: []authority.KeyWeight{
+				{
+					Key:    *key.PublicKey(),
+					Weight: 1,
+				},
+			},
+		},
+	})
 	s.SetLastAccepted(genesis.ID())
 	s.SetTimestamp(genesis.Timestamp())
 	s.AddBlock(genesis)
@@ -399,9 +424,36 @@ func (s *state) AddPermission(permission *authority.Permission) {
 }
 
 func (s *state) GetPermission(owner name.Name, name name.Name) (*authority.Permission, error) {
-	if perm, exists := s.modifiedPermissions[name]; exists {
-		return acc, nil
+	id, err := authority.GetPermissionID(owner, name)
+	if err != nil {
+		return nil, err
 	}
+
+	if perm, exists := s.modifiedPermissions[id]; exists {
+		return perm, nil
+	}
+	if perm, exists := s.permissionCache.Get(id); exists {
+		return perm, nil
+	}
+
+	permBytes, err := s.permissionDB.Get(id[:])
+	if err == database.ErrNotFound {
+		s.permissionCache.Put(id, nil)
+		return nil, database.ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	// The key was in the database
+	var perm authority.Permission
+	err = perm.Unmarshal(permBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	s.permissionCache.Put(id, &perm)
+	return &perm, nil
 }
 
 func (s *state) Abort() {
@@ -430,6 +482,8 @@ func (s *state) Close() error {
 		s.blockIDDB.Close(),
 		s.blockDB.Close(),
 		s.singletonDB.Close(),
+		s.accountDB.Close(),
+		s.permissionDB.Close(),
 		s.db.Close(),
 	)
 }
@@ -441,6 +495,7 @@ func (s *state) write() error {
 		s.writeBlocks(),
 		s.writeAccounts(),
 		s.writeMetadata(),
+		s.writePermissions(),
 	)
 }
 
@@ -495,6 +550,21 @@ func (s *state) writeAccounts() error {
 		}
 		if err := s.accountDB.Put(name.Bytes(), accountBytes); err != nil {
 			return fmt.Errorf("failed to add account: %w", err)
+		}
+	}
+	return nil
+}
+
+func (s *state) writePermissions() error {
+	for id, perm := range s.modifiedPermissions {
+		delete(s.modifiedPermissions, id)
+		s.permissionCache.Put(id, perm)
+		permBytes, err := perm.Marshal()
+		if err != nil {
+			return err
+		}
+		if err := s.permissionDB.Put(id[:], permBytes); err != nil {
+			return fmt.Errorf("failed to add permission: %w", err)
 		}
 	}
 	return nil

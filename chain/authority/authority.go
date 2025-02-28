@@ -204,8 +204,8 @@ func (p *Permission) Unmarshal(data []byte) error {
 		MaxSize: 128 * units.KiB,
 		Bytes:   data,
 	}
-	p.ID = ids.ID(pk.UnpackFixedBytes(32))
-	p.Parent = ids.ID(pk.UnpackFixedBytes(32))
+	p.ID = ids.ID(pk.UnpackBytes())
+	p.Parent = ids.ID(pk.UnpackBytes())
 	p.Owner = name.Name(pk.UnpackLong())
 	p.Name = name.Name(pk.UnpackLong())
 	p.LastUpdated = common.Timestamp(pk.UnpackInt())
@@ -217,8 +217,7 @@ func (p *Permission) Unmarshal(data []byte) error {
 }
 
 func NewPermission(parent ids.ID, owner name.Name, name name.Name, auth *Authority) (*Permission, error) {
-	// ID is calculated as SHA256(owner + name)
-	id, err := ids.ToID(hashing.ComputeHash256(append(owner.Bytes(), name.Bytes()...)))
+	id, err := GetPermissionID(owner, name)
 	if err != nil {
 		return nil, err
 	}
@@ -232,4 +231,13 @@ func NewPermission(parent ids.ID, owner name.Name, name name.Name, auth *Authori
 		LastUsed:    0,
 		Auth:        *auth,
 	}, nil
+}
+
+func GetPermissionID(owner name.Name, name name.Name) (ids.ID, error) {
+	// ID is calculated as SHA256(owner + name)
+	id, err := ids.ToID(hashing.ComputeHash256(append(owner.Bytes(), name.Bytes()...)))
+	if err != nil {
+		return ids.Empty, err
+	}
+	return id, nil
 }

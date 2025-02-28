@@ -18,7 +18,7 @@ type Executor struct {
 }
 
 func (e *Executor) BaseTx(tx *txs.BaseTx) error {
-	txContext, err := engine.NewTransactionContext(tx, e.Codec)
+	txContext, err := engine.NewTransactionContext(tx, e.Tx.Signatures, e.State)
 	if err != nil {
 		return err
 	}

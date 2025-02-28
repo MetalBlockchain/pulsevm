@@ -1,8 +1,6 @@
 package engine
 
 import (
-	"errors"
-
 	"github.com/MetalBlockchain/pulsevm/chain/name"
 )
 
@@ -18,10 +16,10 @@ func init() {
 }
 
 func handleNewAccount(actionContext *ActionContext) error {
-	var actionData NewAccount
+	/*var actionData NewAccount
 	if _, err := actionContext.transactionContext.codec.Unmarshal(actionContext.action.Data, &actionData); err != nil {
 		return errors.New("failed to decode action data")
-	}
+	}*/
 
 	return nil
 }

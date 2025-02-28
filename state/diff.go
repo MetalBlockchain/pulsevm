@@ -6,6 +6,7 @@ import (
 
 	"github.com/MetalBlockchain/metalgo/ids"
 	"github.com/MetalBlockchain/pulsevm/chain/account"
+	"github.com/MetalBlockchain/pulsevm/chain/authority"
 	"github.com/MetalBlockchain/pulsevm/chain/block"
 	"github.com/MetalBlockchain/pulsevm/chain/name"
 	"github.com/MetalBlockchain/pulsevm/chain/txs"
@@ -26,10 +27,11 @@ type diff struct {
 	parentID      ids.ID
 	stateVersions Versions
 
-	addedTxs      map[ids.ID]*txs.Tx             // map of txID -> tx
-	addedBlockIDs map[uint64]ids.ID              // map of height -> blockID
-	addedBlocks   map[ids.ID]block.Block         // map of blockID -> block
-	addedAccounts map[name.Name]*account.Account // map of name -> account
+	addedTxs            map[ids.ID]*txs.Tx               // map of txID -> tx
+	addedBlockIDs       map[uint64]ids.ID                // map of height -> blockID
+	addedBlocks         map[ids.ID]block.Block           // map of blockID -> block
+	addedAccounts       map[name.Name]*account.Account   // map of name -> account
+	modifiedPermissions map[ids.ID]*authority.Permission // map of ID -> permission
 
 	lastAccepted ids.ID
 	timestamp    time.Time
@@ -47,9 +49,10 @@ func NewDiff(
 		parentID:      parentID,
 		stateVersions: stateVersions,
 
-		addedTxs:      make(map[ids.ID]*txs.Tx),
-		addedBlockIDs: make(map[uint64]ids.ID),
-		addedBlocks:   make(map[ids.ID]block.Block),
+		addedTxs:            make(map[ids.ID]*txs.Tx),
+		addedBlockIDs:       make(map[uint64]ids.ID),
+		addedBlocks:         make(map[ids.ID]block.Block),
+		modifiedPermissions: make(map[ids.ID]*authority.Permission),
 
 		lastAccepted: parentState.GetLastAccepted(),
 		timestamp:    parentState.GetTimestamp(),
@@ -100,6 +103,27 @@ func (d *diff) GetAccount(name name.Name) (*account.Account, error) {
 
 func (d *diff) AddAccount(account *account.Account) {
 	d.addedAccounts[account.Name] = account
+}
+
+func (d *diff) AddPermission(permission *authority.Permission) {
+	d.modifiedPermissions[permission.ID] = permission
+}
+
+func (d *diff) GetPermission(owner name.Name, name name.Name) (*authority.Permission, error) {
+	id, err := authority.GetPermissionID(owner, name)
+	if err != nil {
+		return nil, err
+	}
+
+	if perm, exists := d.modifiedPermissions[id]; exists {
+		return perm, nil
+	}
+
+	parentState, ok := d.stateVersions.GetState(d.parentID)
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrMissingParentState, d.parentID)
+	}
+	return parentState.GetPermission(owner, name)
 }
 
 func (d *diff) GetBlockIDAtHeight(height uint64) (ids.ID, error) {

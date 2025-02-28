@@ -17,11 +17,12 @@ var (
 // Tx is a signed transaction
 type Tx struct {
 	// The body of this transaction
-	Unsigned   UnsignedTx                     `serialize:"true" json:"unsignedTx"`
-	TxID       ids.ID                         `json:"id"`
-	Signatures [][secp256k1.SignatureLen]byte `serialize:"true" json:"signatures"`
+	Unsigned   UnsignedTx `serialize:"true" json:"unsignedTx"`
+	TxID       ids.ID     `json:"id"`
+	Signatures [][]byte   `serialize:"true" json:"signatures"`
 
 	bytes []byte
+	codec codec.Manager
 }
 
 func (tx *Tx) SetBytes(unsignedBytes, signedBytes []byte) {
@@ -47,6 +48,7 @@ func (tx *Tx) GossipID() ids.ID {
 }
 
 func (tx *Tx) Initialize(c codec.Manager) error {
+	tx.codec = c
 	signedBytes, err := c.Marshal(CodecVersion, tx)
 	if err != nil {
 		return fmt.Errorf("problem creating transaction: %w", err)
@@ -59,5 +61,19 @@ func (tx *Tx) Initialize(c codec.Manager) error {
 
 	unsignedBytes := signedBytes[:unsignedBytesLen]
 	tx.SetBytes(unsignedBytes, signedBytes)
+	return nil
+}
+
+func (tx *Tx) Sign(privateKey secp256k1.PrivateKey) error {
+	sig, err := privateKey.Sign(tx.Unsigned.Bytes())
+	if err != nil {
+		return fmt.Errorf("problem signing transaction: %w", err)
+	}
+	tx.Signatures = append(tx.Signatures, sig)
+	signedBytes, err := tx.codec.Marshal(CodecVersion, tx)
+	if err != nil {
+		return fmt.Errorf("problem creating transaction: %w", err)
+	}
+	tx.bytes = signedBytes
 	return nil
 }
