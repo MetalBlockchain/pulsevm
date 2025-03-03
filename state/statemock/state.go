@@ -12,6 +12,7 @@ import (
 	account "github.com/MetalBlockchain/pulsevm/chain/account"
 	authority "github.com/MetalBlockchain/pulsevm/chain/authority"
 	block "github.com/MetalBlockchain/pulsevm/chain/block"
+	contract "github.com/MetalBlockchain/pulsevm/chain/contract"
 	name "github.com/MetalBlockchain/pulsevm/chain/name"
 	txs "github.com/MetalBlockchain/pulsevm/chain/txs"
 	gomock "github.com/golang/mock/gomock"
@@ -83,6 +84,21 @@ func (m *MockReadOnlyChain) GetBlockIDAtHeight(height uint64) (ids.ID, error) {
 func (mr *MockReadOnlyChainMockRecorder) GetBlockIDAtHeight(height interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetBlockIDAtHeight", reflect.TypeOf((*MockReadOnlyChain)(nil).GetBlockIDAtHeight), height)
+}
+
+// GetCode mocks base method.
+func (m *MockReadOnlyChain) GetCode(codeHash ids.ID) (*contract.Code, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetCode", codeHash)
+	ret0, _ := ret[0].(*contract.Code)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// GetCode indicates an expected call of GetCode.
+func (mr *MockReadOnlyChainMockRecorder) GetCode(codeHash interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetCode", reflect.TypeOf((*MockReadOnlyChain)(nil).GetCode), codeHash)
 }
 
 // GetLastAccepted mocks base method.
@@ -166,18 +182,6 @@ func (m *MockChain) EXPECT() *MockChainMockRecorder {
 	return m.recorder
 }
 
-// AddAccount mocks base method.
-func (m *MockChain) AddAccount(account *account.Account) {
-	m.ctrl.T.Helper()
-	m.ctrl.Call(m, "AddAccount", account)
-}
-
-// AddAccount indicates an expected call of AddAccount.
-func (mr *MockChainMockRecorder) AddAccount(account interface{}) *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "AddAccount", reflect.TypeOf((*MockChain)(nil).AddAccount), account)
-}
-
 // AddBlock mocks base method.
 func (m *MockChain) AddBlock(block block.Block) {
 	m.ctrl.T.Helper()
@@ -259,6 +263,21 @@ func (mr *MockChainMockRecorder) GetBlockIDAtHeight(height interface{}) *gomock.
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetBlockIDAtHeight", reflect.TypeOf((*MockChain)(nil).GetBlockIDAtHeight), height)
 }
 
+// GetCode mocks base method.
+func (m *MockChain) GetCode(codeHash ids.ID) (*contract.Code, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetCode", codeHash)
+	ret0, _ := ret[0].(*contract.Code)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// GetCode indicates an expected call of GetCode.
+func (mr *MockChainMockRecorder) GetCode(codeHash interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetCode", reflect.TypeOf((*MockChain)(nil).GetCode), codeHash)
+}
+
 // GetLastAccepted mocks base method.
 func (m *MockChain) GetLastAccepted() ids.ID {
 	m.ctrl.T.Helper()
@@ -315,6 +334,30 @@ func (m *MockChain) GetTx(txID ids.ID) (*txs.Tx, error) {
 func (mr *MockChainMockRecorder) GetTx(txID interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetTx", reflect.TypeOf((*MockChain)(nil).GetTx), txID)
+}
+
+// ModifyAccount mocks base method.
+func (m *MockChain) ModifyAccount(account *account.Account) {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "ModifyAccount", account)
+}
+
+// ModifyAccount indicates an expected call of ModifyAccount.
+func (mr *MockChainMockRecorder) ModifyAccount(account interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ModifyAccount", reflect.TypeOf((*MockChain)(nil).ModifyAccount), account)
+}
+
+// ModifyCode mocks base method.
+func (m *MockChain) ModifyCode(code *contract.Code) {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "ModifyCode", code)
+}
+
+// ModifyCode indicates an expected call of ModifyCode.
+func (mr *MockChainMockRecorder) ModifyCode(code interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ModifyCode", reflect.TypeOf((*MockChain)(nil).ModifyCode), code)
 }
 
 // SetLastAccepted mocks base method.
@@ -374,18 +417,6 @@ func (m *MockState) Abort() {
 func (mr *MockStateMockRecorder) Abort() *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Abort", reflect.TypeOf((*MockState)(nil).Abort))
-}
-
-// AddAccount mocks base method.
-func (m *MockState) AddAccount(account *account.Account) {
-	m.ctrl.T.Helper()
-	m.ctrl.Call(m, "AddAccount", account)
-}
-
-// AddAccount indicates an expected call of AddAccount.
-func (mr *MockStateMockRecorder) AddAccount(account interface{}) *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "AddAccount", reflect.TypeOf((*MockState)(nil).AddAccount), account)
 }
 
 // AddBlock mocks base method.
@@ -497,6 +528,21 @@ func (mr *MockStateMockRecorder) GetBlockIDAtHeight(height interface{}) *gomock.
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetBlockIDAtHeight", reflect.TypeOf((*MockState)(nil).GetBlockIDAtHeight), height)
 }
 
+// GetCode mocks base method.
+func (m *MockState) GetCode(codeHash ids.ID) (*contract.Code, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetCode", codeHash)
+	ret0, _ := ret[0].(*contract.Code)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// GetCode indicates an expected call of GetCode.
+func (mr *MockStateMockRecorder) GetCode(codeHash interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetCode", reflect.TypeOf((*MockState)(nil).GetCode), codeHash)
+}
+
 // GetLastAccepted mocks base method.
 func (m *MockState) GetLastAccepted() ids.ID {
 	m.ctrl.T.Helper()
@@ -582,6 +628,30 @@ func (m *MockState) IsInitialized() (bool, error) {
 func (mr *MockStateMockRecorder) IsInitialized() *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "IsInitialized", reflect.TypeOf((*MockState)(nil).IsInitialized))
+}
+
+// ModifyAccount mocks base method.
+func (m *MockState) ModifyAccount(account *account.Account) {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "ModifyAccount", account)
+}
+
+// ModifyAccount indicates an expected call of ModifyAccount.
+func (mr *MockStateMockRecorder) ModifyAccount(account interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ModifyAccount", reflect.TypeOf((*MockState)(nil).ModifyAccount), account)
+}
+
+// ModifyCode mocks base method.
+func (m *MockState) ModifyCode(code *contract.Code) {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "ModifyCode", code)
+}
+
+// ModifyCode indicates an expected call of ModifyCode.
+func (mr *MockStateMockRecorder) ModifyCode(code interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ModifyCode", reflect.TypeOf((*MockState)(nil).ModifyCode), code)
 }
 
 // SetInitialized mocks base method.

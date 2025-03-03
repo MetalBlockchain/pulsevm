@@ -7,8 +7,10 @@ import (
 
 	"github.com/MetalBlockchain/metalgo/database"
 	"github.com/MetalBlockchain/metalgo/ids"
+	"github.com/MetalBlockchain/metalgo/utils/hashing"
 	"github.com/MetalBlockchain/pulsevm/chain/account"
 	"github.com/MetalBlockchain/pulsevm/chain/authority"
+	"github.com/MetalBlockchain/pulsevm/chain/contract"
 	"github.com/MetalBlockchain/pulsevm/chain/name"
 )
 
@@ -23,6 +25,7 @@ var (
 
 func init() {
 	SystemContractActionHandlers[name.NewNameFromString("newaccount")] = handleNewAccount
+	SystemContractActionHandlers[name.NewNameFromString("setcode")] = handleSetCode
 }
 
 // pulse.newaccount handles the creation of a new account
@@ -66,7 +69,7 @@ func handleNewAccount(actionContext *ActionContext) error {
 		Priviliged: false,
 	}
 	// Add account to state
-	actionContext.state.AddAccount(newAccount)
+	actionContext.state.ModifyAccount(newAccount)
 
 	// Add owner and active permissions
 	ownerPermissionID, err := authority.GetPermissionID(actionData.Name, name.NewNameFromString("owner"))
@@ -110,6 +113,80 @@ func handleNewAccount(actionContext *ActionContext) error {
 	}
 
 	actionContext.AddRamUsage(actionData.Creator, ramDelta)
+
+	return nil
+}
+
+func handleSetCode(actionContext *ActionContext) error {
+	var actionData SetCode
+	if err := actionData.Unmarshal(actionContext.GetAction().Data); err != nil {
+		return errDecodeActionData
+	}
+	if err := actionContext.RequireAuthorization(actionData.Account); err != nil {
+		return err
+	}
+	account, err := actionContext.GetAccount(actionData.Account)
+	if err != nil {
+		return err
+	}
+
+	// Previous contract size, for RAM purposes
+	oldSize := 0
+	newSize := len(actionData.Code)
+
+	if account.CodeHash != ids.Empty {
+		oldCode, err := actionContext.GetCode(account.CodeHash)
+		if err != nil {
+			return err
+		}
+		oldSize = len(oldCode.Code)
+		if oldCode.RefCount == 1 {
+			// TODO: Remove contract when no longer referenced
+		} else {
+			oldCode.RefCount--
+			actionContext.state.ModifyCode(oldCode)
+		}
+	}
+
+	if len(actionData.Code) > 0 {
+		codeHash, err := ids.ToID(hashing.ComputeHash256(actionData.Code))
+		if err != nil {
+			return err
+		}
+
+		if account.CodeHash == codeHash {
+			return errors.New("account is already running this version of the contract")
+		} else {
+			account.CodeHash = codeHash
+			account.CodeSequence++
+		}
+
+		existingCode, err := actionContext.GetCode(codeHash)
+		if err != nil && err != database.ErrNotFound {
+			return err
+		}
+
+		if existingCode == nil {
+			newCode := &contract.Code{
+				Hash:     codeHash,
+				Code:     actionData.Code,
+				RefCount: 1,
+			}
+			actionContext.state.ModifyCode(newCode)
+		} else {
+			existingCode.RefCount++
+			actionContext.state.ModifyCode(existingCode)
+		}
+	} else {
+		account.CodeHash = ids.Empty
+		account.CodeSequence++
+	}
+
+	actionContext.state.ModifyAccount(account)
+
+	if oldSize != newSize {
+		actionContext.AddRamUsage(actionData.Account, newSize-oldSize)
+	}
 
 	return nil
 }

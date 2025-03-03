@@ -3,8 +3,10 @@ package engine
 import (
 	"fmt"
 
+	"github.com/MetalBlockchain/metalgo/ids"
 	"github.com/MetalBlockchain/pulsevm/chain/account"
 	"github.com/MetalBlockchain/pulsevm/chain/action"
+	"github.com/MetalBlockchain/pulsevm/chain/contract"
 	"github.com/MetalBlockchain/pulsevm/chain/name"
 	"github.com/MetalBlockchain/pulsevm/state"
 )
@@ -56,4 +58,8 @@ func (a *ActionContext) GetAccount(accountName name.Name) (*account.Account, err
 
 func (a *ActionContext) AddRamUsage(account name.Name, delta int) {
 	a.transactionContext.resourceTracker.AddRamUsage(account, delta)
+}
+
+func (a *ActionContext) GetCode(codeHash ids.ID) (*contract.Code, error) {
+	return a.state.GetCode(codeHash)
 }

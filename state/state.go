@@ -17,6 +17,7 @@ import (
 	"github.com/MetalBlockchain/pulsevm/chain/authority"
 	"github.com/MetalBlockchain/pulsevm/chain/block"
 	"github.com/MetalBlockchain/pulsevm/chain/config"
+	"github.com/MetalBlockchain/pulsevm/chain/contract"
 	"github.com/MetalBlockchain/pulsevm/chain/name"
 	"github.com/MetalBlockchain/pulsevm/chain/txs"
 	"github.com/MetalBlockchain/pulsevm/status"
@@ -41,6 +42,7 @@ var (
 	TxPrefix         = []byte("tx")
 	AccountPrefix    = []byte("account")
 	PermissionPrefix = []byte("permission")
+	CodePrefix       = []byte("code")
 
 	isInitializedKey = []byte{0x00}
 	timestampKey     = []byte{0x01}
@@ -55,6 +57,7 @@ type ReadOnlyChain interface {
 	GetTimestamp() time.Time
 	GetAccount(name name.Name) (*account.Account, error)
 	GetPermission(owner name.Name, name name.Name) (*authority.Permission, error)
+	GetCode(codeHash ids.ID) (*contract.Code, error)
 }
 
 type Chain interface {
@@ -62,10 +65,11 @@ type Chain interface {
 
 	AddTx(tx *txs.Tx)
 	AddBlock(block block.Block)
-	AddAccount(account *account.Account)
+	ModifyAccount(account *account.Account)
 	AddPermission(permission *authority.Permission)
 	SetLastAccepted(blkID ids.ID)
 	SetTimestamp(t time.Time)
+	ModifyCode(code *contract.Code)
 }
 
 type State interface {
@@ -115,13 +119,17 @@ type state struct {
 	txCache  cache.Cacher[ids.ID, *txs.Tx] // cache of txID -> *txs.Tx. If the entry is nil, it is not in the database
 	txDB     database.Database
 
-	addedAccounts map[name.Name]*account.Account
-	accountCache  cache.Cacher[name.Name, *account.Account]
-	accountDB     database.Database
+	modifiedAccounts map[name.Name]*account.Account
+	accountCache     cache.Cacher[name.Name, *account.Account]
+	accountDB        database.Database
 
 	modifiedPermissions map[ids.ID]*authority.Permission
 	permissionCache     cache.Cacher[ids.ID, *authority.Permission]
 	permissionDB        database.Database
+
+	modifiedCodes map[ids.ID]*contract.Code
+	codeCache     cache.Cacher[ids.ID, *contract.Code]
+	codeDB        database.Database
 
 	singletonDB database.Database
 
@@ -180,6 +188,15 @@ func New(
 		return nil, err
 	}
 
+	codeCache, err := metercacher.New[ids.ID, *contract.Code](
+		"code_cache",
+		metrics,
+		&cache.LRU[ids.ID, *contract.Code]{Size: accountCacheSize}, // TODO: Change this
+	)
+	if err != nil {
+		return nil, err
+	}
+
 	s := &state{
 		parser: parser,
 		db:     db,
@@ -196,13 +213,17 @@ func New(
 		txDB:     prefixdb.New(TxPrefix, db),
 		txCache:  txCache,
 
-		addedAccounts: make(map[name.Name]*account.Account),
-		accountCache:  accountCache,
-		accountDB:     prefixdb.New(AccountPrefix, db),
+		modifiedAccounts: make(map[name.Name]*account.Account),
+		accountCache:     accountCache,
+		accountDB:        prefixdb.New(AccountPrefix, db),
 
 		modifiedPermissions: make(map[ids.ID]*authority.Permission),
 		permissionCache:     permissionCache,
 		permissionDB:        prefixdb.New(PermissionPrefix, db),
+
+		modifiedCodes: make(map[ids.ID]*contract.Code),
+		codeCache:     codeCache,
+		codeDB:        prefixdb.New(CodePrefix, db),
 
 		singletonDB: prefixdb.New(SingletonPrefix, db),
 	}
@@ -244,7 +265,7 @@ func (s *state) initializeChainState(genesisTimestamp time.Time) error {
 
 	keyBytes, _ := hex.DecodeString("d3d137d219791b54bcbce7ab148871223585a2a181bc8a6d8820580f018e807f")
 	key, _ := secp256k1.ToPrivateKey(keyBytes)
-	s.AddAccount(&account.Account{
+	s.ModifyAccount(&account.Account{
 		Name:       name.NewNameFromString("pulse"),
 		Priviliged: true,
 	})
@@ -391,12 +412,12 @@ func (s *state) GetTx(txID ids.ID) (*txs.Tx, error) {
 	return tx, nil
 }
 
-func (s *state) AddAccount(account *account.Account) {
-	s.addedAccounts[account.Name] = account
+func (s *state) ModifyAccount(account *account.Account) {
+	s.modifiedAccounts[account.Name] = account
 }
 
 func (s *state) GetAccount(name name.Name) (*account.Account, error) {
-	if acc, exists := s.addedAccounts[name]; exists {
+	if acc, exists := s.modifiedAccounts[name]; exists {
 		return acc, nil
 	}
 	if acc, exists := s.accountCache.Get(name); exists {
@@ -459,6 +480,38 @@ func (s *state) GetPermission(owner name.Name, name name.Name) (*authority.Permi
 	return &perm, nil
 }
 
+func (s *state) GetCode(codeHash ids.ID) (*contract.Code, error) {
+	if code, exists := s.modifiedCodes[codeHash]; exists {
+		return code, nil
+	}
+	if code, exists := s.codeCache.Get(codeHash); exists {
+		return code, nil
+	}
+
+	codeBytes, err := s.codeDB.Get(codeHash[:])
+	if err == database.ErrNotFound {
+		s.codeCache.Put(codeHash, nil)
+		return nil, database.ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	// The key was in the database
+	var code contract.Code
+	err = code.Unmarshal(codeBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	s.codeCache.Put(codeHash, &code)
+	return &code, nil
+}
+
+func (s *state) ModifyCode(code *contract.Code) {
+	s.modifiedCodes[code.Hash] = code
+}
+
 func (s *state) Abort() {
 	s.db.Abort()
 }
@@ -487,6 +540,7 @@ func (s *state) Close() error {
 		s.singletonDB.Close(),
 		s.accountDB.Close(),
 		s.permissionDB.Close(),
+		s.codeDB.Close(),
 		s.db.Close(),
 	)
 }
@@ -499,6 +553,7 @@ func (s *state) write() error {
 		s.writeAccounts(),
 		s.writeMetadata(),
 		s.writePermissions(),
+		s.writeCodes(),
 	)
 }
 
@@ -544,8 +599,8 @@ func (s *state) writeBlocks() error {
 }
 
 func (s *state) writeAccounts() error {
-	for name, account := range s.addedAccounts {
-		delete(s.addedAccounts, name)
+	for name, account := range s.modifiedAccounts {
+		delete(s.modifiedAccounts, name)
 		s.accountCache.Put(name, account)
 		accountBytes, err := account.Marshal()
 		if err != nil {
@@ -568,6 +623,21 @@ func (s *state) writePermissions() error {
 		}
 		if err := s.permissionDB.Put(id[:], permBytes); err != nil {
 			return fmt.Errorf("failed to add permission: %w", err)
+		}
+	}
+	return nil
+}
+
+func (s *state) writeCodes() error {
+	for id, code := range s.modifiedCodes {
+		delete(s.modifiedCodes, id)
+		s.codeCache.Put(id, code)
+		codeBytes, err := code.Marshal()
+		if err != nil {
+			return err
+		}
+		if err := s.codeDB.Put(id[:], codeBytes); err != nil {
+			return fmt.Errorf("failed to add code: %w", err)
 		}
 	}
 	return nil

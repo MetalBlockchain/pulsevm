@@ -8,6 +8,7 @@ import (
 	"github.com/MetalBlockchain/pulsevm/chain/account"
 	"github.com/MetalBlockchain/pulsevm/chain/authority"
 	"github.com/MetalBlockchain/pulsevm/chain/block"
+	"github.com/MetalBlockchain/pulsevm/chain/contract"
 	"github.com/MetalBlockchain/pulsevm/chain/name"
 	"github.com/MetalBlockchain/pulsevm/chain/txs"
 )
@@ -30,8 +31,9 @@ type diff struct {
 	addedTxs            map[ids.ID]*txs.Tx               // map of txID -> tx
 	addedBlockIDs       map[uint64]ids.ID                // map of height -> blockID
 	addedBlocks         map[ids.ID]block.Block           // map of blockID -> block
-	addedAccounts       map[name.Name]*account.Account   // map of name -> account
+	modifiedAccounts    map[name.Name]*account.Account   // map of name -> account
 	modifiedPermissions map[ids.ID]*authority.Permission // map of ID -> permission
+	modifiedCodes       map[ids.ID]*contract.Code        // map of ID -> code
 
 	lastAccepted ids.ID
 	timestamp    time.Time
@@ -52,8 +54,9 @@ func NewDiff(
 		addedTxs:            make(map[ids.ID]*txs.Tx),
 		addedBlockIDs:       make(map[uint64]ids.ID),
 		addedBlocks:         make(map[ids.ID]block.Block),
-		addedAccounts:       make(map[name.Name]*account.Account),
+		modifiedAccounts:    make(map[name.Name]*account.Account),
 		modifiedPermissions: make(map[ids.ID]*authority.Permission),
+		modifiedCodes:       make(map[ids.ID]*contract.Code),
 
 		lastAccepted: parentState.GetLastAccepted(),
 		timestamp:    parentState.GetTimestamp(),
@@ -91,7 +94,7 @@ func (d *diff) AddTx(tx *txs.Tx) {
 }
 
 func (d *diff) GetAccount(name name.Name) (*account.Account, error) {
-	if account, exists := d.addedAccounts[name]; exists {
+	if account, exists := d.modifiedAccounts[name]; exists {
 		return account, nil
 	}
 
@@ -102,8 +105,8 @@ func (d *diff) GetAccount(name name.Name) (*account.Account, error) {
 	return parentState.GetAccount(name)
 }
 
-func (d *diff) AddAccount(account *account.Account) {
-	d.addedAccounts[account.Name] = account
+func (d *diff) ModifyAccount(account *account.Account) {
+	d.modifiedAccounts[account.Name] = account
 }
 
 func (d *diff) AddPermission(permission *authority.Permission) {
@@ -125,6 +128,22 @@ func (d *diff) GetPermission(owner name.Name, name name.Name) (*authority.Permis
 		return nil, fmt.Errorf("%w: %s", ErrMissingParentState, d.parentID)
 	}
 	return parentState.GetPermission(owner, name)
+}
+
+func (d *diff) GetCode(codeHash ids.ID) (*contract.Code, error) {
+	if code, exists := d.modifiedCodes[codeHash]; exists {
+		return code, nil
+	}
+
+	parentState, ok := d.stateVersions.GetState(d.parentID)
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrMissingParentState, d.parentID)
+	}
+	return parentState.GetCode(codeHash)
+}
+
+func (d *diff) ModifyCode(code *contract.Code) {
+	d.modifiedCodes[code.Hash] = code
 }
 
 func (d *diff) GetBlockIDAtHeight(height uint64) (ids.ID, error) {
