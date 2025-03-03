@@ -64,7 +64,7 @@ func (tx *Tx) Initialize(c codec.Manager) error {
 	return nil
 }
 
-func (tx *Tx) Sign(privateKey secp256k1.PrivateKey) error {
+func (tx *Tx) Sign(privateKey *secp256k1.PrivateKey) error {
 	sig, err := privateKey.Sign(tx.Unsigned.Bytes())
 	if err != nil {
 		return fmt.Errorf("problem signing transaction: %w", err)
