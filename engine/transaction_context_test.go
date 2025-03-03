@@ -168,3 +168,68 @@ func TestSetCode(t *testing.T) {
 	err = tc.Execute()
 	assert.NoError(t, err)
 }
+
+func TestSetAbi(t *testing.T) {
+	key, err := secp256k1.ToPrivateKey(testPrivateKeyBytes)
+	assert.NoError(t, err)
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	setAbi := &SetAbi{
+		Account: name.NewNameFromString("pulse"),
+		Abi:     []byte{0x01, 0x02, 0x03},
+	}
+	setAbiBytes, err := setAbi.Marshal()
+	assert.NoError(t, err)
+	baseTx := &txs.BaseTx{
+		NetworkID:    1,
+		BlockchainID: ids.Empty,
+		Actions: []action.Action{
+			action.Action{
+				Account: name.NewNameFromString("pulse"),
+				Name:    name.NewNameFromString("setabi"),
+				Authorization: []authority.PermissionLevel{
+					authority.PermissionLevel{Actor: name.NewNameFromString("pulse"), Permission: name.NewNameFromString("active")},
+				},
+				Data: setAbiBytes,
+			},
+		},
+	}
+	tx := txs.Tx{
+		Unsigned: baseTx,
+	}
+	parser, err := txs.NewParser()
+	assert.NoError(t, err)
+	err = tx.Initialize(parser.Codec())
+	assert.NoError(t, err)
+	err = tx.Sign(key)
+	assert.NoError(t, err)
+	// Setup mock
+	state := statemock.NewMockState(ctrl)
+	state.EXPECT().GetPermission(name.NewNameFromString("pulse"), name.NewNameFromString("active")).Return(&authority.Permission{
+		ID:     ids.Empty,
+		Parent: ids.Empty,
+		Owner:  name.NewNameFromString("pulse"),
+		Name:   name.NewNameFromString("active"),
+		Auth: authority.Authority{
+			Threshold: 1,
+			Keys: []authority.KeyWeight{
+				authority.KeyWeight{
+					Key:    *key.PublicKey(),
+					Weight: 1,
+				},
+			},
+		},
+	}, nil)
+	state.EXPECT().GetAccount(name.NewNameFromString("pulse")).Return(&account.Account{
+		Name:       name.NewNameFromString("pulse"),
+		Priviliged: true,
+		CodeHash:   ids.Empty,
+	}, nil)
+	state.EXPECT().ModifyAccount(gomock.Any())
+
+	// Test
+	tc, err := NewTransactionContext(baseTx, tx.Signatures, state)
+	assert.NoError(t, err)
+	err = tc.Execute()
+	assert.NoError(t, err)
+}

@@ -26,6 +26,7 @@ var (
 func init() {
 	SystemContractActionHandlers[name.NewNameFromString("newaccount")] = handleNewAccount
 	SystemContractActionHandlers[name.NewNameFromString("setcode")] = handleSetCode
+	SystemContractActionHandlers[name.NewNameFromString("setabi")] = handleSetAbi
 }
 
 // pulse.newaccount handles the creation of a new account
@@ -182,6 +183,34 @@ func handleSetCode(actionContext *ActionContext) error {
 		account.CodeSequence++
 	}
 
+	actionContext.state.ModifyAccount(account)
+
+	if oldSize != newSize {
+		actionContext.AddRamUsage(actionData.Account, newSize-oldSize)
+	}
+
+	return nil
+}
+
+func handleSetAbi(actionContext *ActionContext) error {
+	var actionData SetAbi
+	if err := actionData.Unmarshal(actionContext.GetAction().Data); err != nil {
+		return errDecodeActionData
+	}
+	if err := actionContext.RequireAuthorization(actionData.Account); err != nil {
+		return err
+	}
+	account, err := actionContext.GetAccount(actionData.Account)
+	if err != nil {
+		return err
+	}
+
+	// Previous ABI size, for RAM purposes
+	oldSize := 0
+	newSize := len(actionData.Abi)
+
+	account.Abi = actionData.Abi
+	account.AbiSequence++
 	actionContext.state.ModifyAccount(account)
 
 	if oldSize != newSize {

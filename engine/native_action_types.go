@@ -12,6 +12,7 @@ import (
 var (
 	_ common.Serializable = (*NewAccount)(nil)
 	_ common.Serializable = (*SetCode)(nil)
+	_ common.Serializable = (*SetAbi)(nil)
 )
 
 type NewAccount struct {
@@ -81,5 +82,30 @@ func (s *SetCode) Unmarshal(data []byte) error {
 	}
 	s.Account = name.Name(pk.UnpackLong())
 	s.Code = pk.UnpackBytes()
+	return pk.Err
+}
+
+type SetAbi struct {
+	Account name.Name           `serialize:"true"`
+	Abi     types.JSONByteSlice `serialize:"true"`
+}
+
+func (s *SetAbi) Marshal() ([]byte, error) {
+	pk := wrappers.Packer{
+		MaxSize: 128 * units.KiB,
+		Bytes:   make([]byte, 0, 128),
+	}
+	pk.PackLong(uint64(s.Account))
+	pk.PackBytes(s.Abi)
+	return pk.Bytes, pk.Err
+}
+
+func (s *SetAbi) Unmarshal(data []byte) error {
+	pk := wrappers.Packer{
+		MaxSize: 128 * units.KiB,
+		Bytes:   data,
+	}
+	s.Account = name.Name(pk.UnpackLong())
+	s.Abi = pk.UnpackBytes()
 	return pk.Err
 }
