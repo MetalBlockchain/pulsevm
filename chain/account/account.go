@@ -31,7 +31,7 @@ func (a *Account) Marshal() ([]byte, error) {
 func (a *Account) Unmarshal(data []byte) error {
 	p := wrappers.Packer{
 		MaxSize: 256 * units.KiB,
-		Bytes:   make([]byte, 0, 128),
+		Bytes:   data,
 	}
 	a.Name = name.Name(p.UnpackLong())
 	a.Created = common.Timestamp(p.UnpackInt())

@@ -7,7 +7,6 @@ import (
 
 	"github.com/MetalBlockchain/metalgo/codec"
 	"github.com/MetalBlockchain/metalgo/codec/linearcodec"
-	"github.com/MetalBlockchain/pulsevm/chain/account"
 )
 
 // CodecVersion is the current default codec version
@@ -24,7 +23,6 @@ type Parser interface {
 
 	ParseTx(bytes []byte) (*Tx, error)
 	ParseGenesisTx(bytes []byte) (*Tx, error)
-	ParseAccount(bytes []byte) (*account.Account, error)
 }
 
 type parser struct {
@@ -81,12 +79,6 @@ func (p *parser) ParseTx(bytes []byte) (*Tx, error) {
 
 func (p *parser) ParseGenesisTx(bytes []byte) (*Tx, error) {
 	return parse(p.gcm, bytes)
-}
-
-func (p *parser) ParseAccount(bytes []byte) (*account.Account, error) {
-	account := &account.Account{}
-	_, err := p.cm.Unmarshal(bytes, account)
-	return account, err
 }
 
 func parse(cm codec.Manager, signedBytes []byte) (*Tx, error) {

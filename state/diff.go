@@ -52,6 +52,7 @@ func NewDiff(
 		addedTxs:            make(map[ids.ID]*txs.Tx),
 		addedBlockIDs:       make(map[uint64]ids.ID),
 		addedBlocks:         make(map[ids.ID]block.Block),
+		addedAccounts:       make(map[name.Name]*account.Account),
 		modifiedPermissions: make(map[ids.ID]*authority.Permission),
 
 		lastAccepted: parentState.GetLastAccepted(),
@@ -90,8 +91,8 @@ func (d *diff) AddTx(tx *txs.Tx) {
 }
 
 func (d *diff) GetAccount(name name.Name) (*account.Account, error) {
-	if tx, exists := d.addedAccounts[name]; exists {
-		return tx, nil
+	if account, exists := d.addedAccounts[name]; exists {
+		return account, nil
 	}
 
 	parentState, ok := d.stateVersions.GetState(d.parentID)

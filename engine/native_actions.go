@@ -50,7 +50,7 @@ func handleNewAccount(actionContext *ActionContext) error {
 	}
 	creator, err := actionContext.GetAccount(actionData.Creator)
 	if err != nil {
-		return errors.New("creator account does not exist")
+		return fmt.Errorf("failed to get creator account: %w", err)
 	}
 	if strings.HasPrefix(nameString, "pulse.") && !creator.Priviliged {
 		return errors.New("only privileged accounts can have names that start with 'pulse.'")

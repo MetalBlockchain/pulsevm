@@ -135,11 +135,10 @@ var _ = ginkgo.Describe("[Ping]", func() {
 var _ = ginkgo.Describe("[Transaction]", func() {
 	keyBytes, _ := hex.DecodeString("d3d137d219791b54bcbce7ab148871223585a2a181bc8a6d8820580f018e807f")
 	key, err := secp256k1.ToPrivateKey(keyBytes)
-	fmt.Printf("key.PublicKey().Address(): %v\n", key.PublicKey().Address())
 	gomega.Ω(err).Should(gomega.BeNil())
 	newAccount := engine.NewAccount{
-		Creator: name.NewNameFromString("glenn"),
-		Name:    name.NewNameFromString("marshall"),
+		Creator: name.NewNameFromString("pulse"),
+		Name:    name.NewNameFromString("glenn"),
 		Owner: authority.Authority{
 			Threshold: 1,
 			Keys: []authority.KeyWeight{
@@ -161,7 +160,7 @@ var _ = ginkgo.Describe("[Transaction]", func() {
 	}
 	parser, err := txs.NewParser()
 	gomega.Ω(err).Should(gomega.BeNil())
-	actionDataBytes, err := parser.Codec().Marshal(txs.CodecVersion, newAccount)
+	actionDataBytes, err := newAccount.Marshal()
 	gomega.Ω(err).Should(gomega.BeNil())
 	tx := txs.Tx{
 		Unsigned: &txs.BaseTx{
@@ -181,7 +180,7 @@ var _ = ginkgo.Describe("[Transaction]", func() {
 	}
 	err = tx.Initialize(parser.Codec())
 	gomega.Ω(err).Should(gomega.BeNil())
-	err = tx.Sign(*key)
+	err = tx.Sign(key)
 	gomega.Ω(err).Should(gomega.BeNil())
 	txHex, err := formatting.Encode(formatting.Hex, tx.Bytes())
 	fmt.Println(txHex)

@@ -244,7 +244,10 @@ func (s *state) initializeChainState(genesisTimestamp time.Time) error {
 
 	keyBytes, _ := hex.DecodeString("d3d137d219791b54bcbce7ab148871223585a2a181bc8a6d8820580f018e807f")
 	key, _ := secp256k1.ToPrivateKey(keyBytes)
-
+	s.AddAccount(&account.Account{
+		Name:       name.NewNameFromString("pulse"),
+		Priviliged: true,
+	})
 	s.AddPermission(&authority.Permission{
 		ID:     activePermissionID,
 		Parent: ids.Empty,
@@ -410,13 +413,13 @@ func (s *state) GetAccount(name name.Name) (*account.Account, error) {
 	}
 
 	// The key was in the database
-	acc, err := s.parser.ParseAccount(accBytes)
-	if err != nil {
+	var acc account.Account
+	if err := acc.Unmarshal(accBytes); err != nil {
 		return nil, err
 	}
 
-	s.accountCache.Put(name, acc)
-	return acc, nil
+	s.accountCache.Put(name, &acc)
+	return &acc, nil
 }
 
 func (s *state) AddPermission(permission *authority.Permission) {
