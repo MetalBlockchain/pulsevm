@@ -9,9 +9,12 @@ import (
 
 var _ common.Serializable = (*Account)(nil)
 
+const AccountBillableSize = 13
+
 type Account struct {
-	Name    name.Name        `serialize:"true"`
-	Created common.Timestamp `serialize:"true"`
+	Name       name.Name        `serialize:"true"`
+	Created    common.Timestamp `serialize:"true"`
+	Priviliged bool             `serialize:"true"`
 }
 
 func (a *Account) Marshal() ([]byte, error) {
@@ -21,6 +24,7 @@ func (a *Account) Marshal() ([]byte, error) {
 	}
 	p.PackLong(uint64(a.Name))
 	p.PackInt(uint32(a.Created))
+	p.PackBool(a.Priviliged)
 	return p.Bytes, p.Err
 }
 
@@ -31,5 +35,6 @@ func (a *Account) Unmarshal(data []byte) error {
 	}
 	a.Name = name.Name(p.UnpackLong())
 	a.Created = common.Timestamp(p.UnpackInt())
+	a.Priviliged = p.UnpackBool()
 	return p.Err
 }

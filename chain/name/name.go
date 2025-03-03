@@ -9,6 +9,10 @@ var charmap = ".12345abcdefghijklmnopqrstuvwxyz"
 
 type Name uint64
 
+func (n Name) IsEmpty() bool {
+	return n == 0
+}
+
 func (n Name) String() string {
 	return nameToString(uint64(n))
 }

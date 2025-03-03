@@ -19,6 +19,7 @@ type TransactionContext struct {
 	signatures       [][]byte
 	resourceTracker  *ResourceTracker
 	authorityChecker *AuthorityChecker
+	state            state.Chain
 }
 
 func NewTransactionContext(tx *txs.BaseTx, signatures [][]byte, state state.Chain) (*TransactionContext, error) {
@@ -32,6 +33,7 @@ func NewTransactionContext(tx *txs.BaseTx, signatures [][]byte, state state.Chai
 		signatures:       signatures,
 		resourceTracker:  NewResourceTracker(),
 		authorityChecker: authorityChecker,
+		state:            state,
 	}, nil
 }
 
@@ -71,7 +73,7 @@ func (tc *TransactionContext) Execute() error {
 }
 
 func (tc *TransactionContext) ExecuteAction(action action.Action, ordinal int) error {
-	actionContext := NewActionContext(tc, &action)
+	actionContext := NewActionContext(tc, &action, tc.state)
 
 	return actionContext.Execute()
 }

@@ -1,6 +1,8 @@
 package authority
 
 import (
+	"errors"
+
 	"github.com/MetalBlockchain/metalgo/ids"
 	"github.com/MetalBlockchain/metalgo/utils/crypto/secp256k1"
 	"github.com/MetalBlockchain/metalgo/utils/hashing"
@@ -170,6 +172,31 @@ func (a *Authority) Unmarshal(data []byte) error {
 	return pk.Err
 }
 
+func (a *Authority) Validate() error {
+	if a.Threshold == 0 {
+		return errors.New("threshold must be greater than 0")
+	}
+
+	if len(a.Accounts)+len(a.Keys) == 0 {
+		return errors.New("authority must have at least one key or account")
+	}
+
+	var totalWeight uint16
+
+	for _, key := range a.Keys {
+		totalWeight += key.Weight
+	}
+	for _, account := range a.Accounts {
+		totalWeight += account.Weight
+	}
+
+	if totalWeight < uint16(a.Threshold) {
+		return errors.New("authority threshold greater than sum of weights")
+	}
+
+	return nil
+}
+
 type Permission struct {
 	ID          ids.ID           `serialize:"true"`
 	Parent      ids.ID           `serialize:"true"`
@@ -240,4 +267,12 @@ func GetPermissionID(owner name.Name, name name.Name) (ids.ID, error) {
 		return ids.Empty, err
 	}
 	return id, nil
+}
+
+func (p *Permission) GetBillableSize() (int, error) {
+	permissionBytes, err := p.Marshal()
+	if err != nil {
+		return 0, err
+	}
+	return len(permissionBytes), nil
 }
