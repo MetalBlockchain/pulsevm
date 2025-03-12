@@ -103,7 +103,6 @@ func (b *builder) BuildBlock(context.Context) (snowman.Block, error) {
 		}
 
 		executor := &txexecutor.Executor{
-			Codec: b.backend.Codec,
 			State: txDiff,
 			Tx:    tx,
 		}
@@ -130,7 +129,6 @@ func (b *builder) BuildBlock(context.Context) (snowman.Block, error) {
 		nextHeight,
 		nextTimestamp,
 		blockTxs,
-		b.backend.Codec,
 	)
 	if err != nil {
 		return nil, err

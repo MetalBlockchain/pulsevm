@@ -1,7 +1,6 @@
 package executor
 
 import (
-	"github.com/MetalBlockchain/metalgo/codec"
 	"github.com/MetalBlockchain/pulsevm/chain/txs"
 	"github.com/MetalBlockchain/pulsevm/engine"
 	"github.com/MetalBlockchain/pulsevm/state"
@@ -12,7 +11,6 @@ var (
 )
 
 type Executor struct {
-	Codec codec.Manager
 	State state.Chain // state will be modified
 	Tx    *txs.Tx
 }

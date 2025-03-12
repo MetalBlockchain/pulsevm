@@ -6,6 +6,8 @@ import (
 	"github.com/MetalBlockchain/metalgo/database"
 	"github.com/MetalBlockchain/metalgo/ids"
 	"github.com/MetalBlockchain/metalgo/utils/crypto/secp256k1"
+	"github.com/MetalBlockchain/metalgo/utils/units"
+	"github.com/MetalBlockchain/metalgo/utils/wrappers"
 	"github.com/MetalBlockchain/pulsevm/chain/account"
 	"github.com/MetalBlockchain/pulsevm/chain/action"
 	"github.com/MetalBlockchain/pulsevm/chain/authority"
@@ -43,10 +45,9 @@ func TestNewAccount(t *testing.T) {
 			},
 		},
 	}
-	newAccountBytes, err := newAccount.Marshal()
+	newAccountBytes, err := newAccount.Marshal(&wrappers.Packer{MaxSize: 256 * units.KiB})
 	assert.NoError(t, err)
 	baseTx := &txs.BaseTx{
-		NetworkID:    1,
 		BlockchainID: ids.Empty,
 		Actions: []action.Action{
 			action.Action{
@@ -62,9 +63,7 @@ func TestNewAccount(t *testing.T) {
 	tx := txs.Tx{
 		Unsigned: baseTx,
 	}
-	parser, err := txs.NewParser()
-	assert.NoError(t, err)
-	err = tx.Initialize(parser.Codec())
+	err = tx.Initialize()
 	assert.NoError(t, err)
 	err = tx.Sign(key)
 	assert.NoError(t, err)
@@ -109,12 +108,11 @@ func TestSetCode(t *testing.T) {
 		Account: name.NewNameFromString("pulse"),
 		Code:    []byte{0x01, 0x02, 0x03},
 	}
-	setCodeBytes, err := setCode.Marshal()
+	setCodeBytes, err := setCode.Marshal(&wrappers.Packer{MaxSize: 256 * units.KiB})
 	assert.NoError(t, err)
 	codeHash, err := ids.FromString("2a2xz3zWjg7iZeqbqJFtjhpBjVeBDY6UQKS9zHJ7Bnz9PNPoj")
 	assert.NoError(t, err)
 	baseTx := &txs.BaseTx{
-		NetworkID:    1,
 		BlockchainID: ids.Empty,
 		Actions: []action.Action{
 			action.Action{
@@ -130,9 +128,7 @@ func TestSetCode(t *testing.T) {
 	tx := txs.Tx{
 		Unsigned: baseTx,
 	}
-	parser, err := txs.NewParser()
-	assert.NoError(t, err)
-	err = tx.Initialize(parser.Codec())
+	err = tx.Initialize()
 	assert.NoError(t, err)
 	err = tx.Sign(key)
 	assert.NoError(t, err)
@@ -178,10 +174,9 @@ func TestSetAbi(t *testing.T) {
 		Account: name.NewNameFromString("pulse"),
 		Abi:     []byte{0x01, 0x02, 0x03},
 	}
-	setAbiBytes, err := setAbi.Marshal()
+	setAbiBytes, err := setAbi.Marshal(&wrappers.Packer{MaxSize: 256 * units.KiB})
 	assert.NoError(t, err)
 	baseTx := &txs.BaseTx{
-		NetworkID:    1,
 		BlockchainID: ids.Empty,
 		Actions: []action.Action{
 			action.Action{
@@ -197,9 +192,7 @@ func TestSetAbi(t *testing.T) {
 	tx := txs.Tx{
 		Unsigned: baseTx,
 	}
-	parser, err := txs.NewParser()
-	assert.NoError(t, err)
-	err = tx.Initialize(parser.Codec())
+	err = tx.Initialize()
 	assert.NoError(t, err)
 	err = tx.Sign(key)
 	assert.NoError(t, err)

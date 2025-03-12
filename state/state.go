@@ -13,6 +13,8 @@ import (
 	"github.com/MetalBlockchain/metalgo/database/versiondb"
 	"github.com/MetalBlockchain/metalgo/ids"
 	"github.com/MetalBlockchain/metalgo/utils/crypto/secp256k1"
+	"github.com/MetalBlockchain/metalgo/utils/units"
+	"github.com/MetalBlockchain/metalgo/utils/wrappers"
 	"github.com/MetalBlockchain/pulsevm/chain/account"
 	"github.com/MetalBlockchain/pulsevm/chain/authority"
 	"github.com/MetalBlockchain/pulsevm/chain/block"
@@ -252,7 +254,6 @@ func (s *state) initializeChainState(genesisTimestamp time.Time) error {
 		0,
 		genesisTimestamp,
 		nil,
-		s.parser.Codec(),
 	)
 	if err != nil {
 		return err
@@ -435,7 +436,9 @@ func (s *state) GetAccount(name name.Name) (*account.Account, error) {
 
 	// The key was in the database
 	var acc account.Account
-	if err := acc.Unmarshal(accBytes); err != nil {
+	if err := acc.Unmarshal(&wrappers.Packer{
+		Bytes: accBytes,
+	}); err != nil {
 		return nil, err
 	}
 
@@ -471,7 +474,9 @@ func (s *state) GetPermission(owner name.Name, name name.Name) (*authority.Permi
 
 	// The key was in the database
 	var perm authority.Permission
-	err = perm.Unmarshal(permBytes)
+	err = perm.Unmarshal(&wrappers.Packer{
+		Bytes: permBytes,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -499,7 +504,9 @@ func (s *state) GetCode(codeHash ids.ID) (*contract.Code, error) {
 
 	// The key was in the database
 	var code contract.Code
-	err = code.Unmarshal(codeBytes)
+	err = code.Unmarshal(&wrappers.Packer{
+		Bytes: codeBytes,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -602,7 +609,7 @@ func (s *state) writeAccounts() error {
 	for name, account := range s.modifiedAccounts {
 		delete(s.modifiedAccounts, name)
 		s.accountCache.Put(name, account)
-		accountBytes, err := account.Marshal()
+		accountBytes, err := account.Marshal(&wrappers.Packer{MaxSize: 256 * units.KiB})
 		if err != nil {
 			return err
 		}
@@ -617,7 +624,7 @@ func (s *state) writePermissions() error {
 	for id, perm := range s.modifiedPermissions {
 		delete(s.modifiedPermissions, id)
 		s.permissionCache.Put(id, perm)
-		permBytes, err := perm.Marshal()
+		permBytes, err := perm.Marshal(&wrappers.Packer{MaxSize: 256 * units.KiB})
 		if err != nil {
 			return err
 		}
@@ -632,7 +639,7 @@ func (s *state) writeCodes() error {
 	for id, code := range s.modifiedCodes {
 		delete(s.modifiedCodes, id)
 		s.codeCache.Put(id, code)
-		codeBytes, err := code.Marshal()
+		codeBytes, err := code.Marshal(&wrappers.Packer{MaxSize: 256 * units.KiB})
 		if err != nil {
 			return err
 		}

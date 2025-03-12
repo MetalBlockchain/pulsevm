@@ -5,6 +5,7 @@ import (
 
 	"github.com/MetalBlockchain/metalgo/ids"
 	"github.com/MetalBlockchain/metalgo/snow"
+	"github.com/MetalBlockchain/metalgo/utils/wrappers"
 	"github.com/MetalBlockchain/pulsevm/chain/action"
 )
 
@@ -15,7 +16,6 @@ var (
 )
 
 type BaseTx struct {
-	NetworkID    uint32          `serialize:"true" json:"networkID"`    // ID of the network this chain lives on
 	BlockchainID ids.ID          `serialize:"true" json:"blockchainID"` // ID of the chain on which this transaction exists (prevents replay attacks)
 	Actions      []action.Action `serialize:"true" json:"actions"`      // Actions this transaction will execute
 
@@ -23,6 +23,32 @@ type BaseTx struct {
 	SyntacticallyVerified bool `json:"-"`
 
 	unsignedBytes []byte // Unsigned byte representation of this data
+}
+
+func (tx *BaseTx) Marshal(p *wrappers.Packer) ([]byte, error) {
+	p.PackFixedBytes(tx.BlockchainID[:])
+	p.PackInt(uint32(len(tx.Actions)))
+	for _, action := range tx.Actions {
+		if _, err := action.Marshal(p); err != nil {
+			return nil, err
+		}
+	}
+	return p.Bytes, p.Err
+}
+
+// Unmarshal implements UnsignedTx.
+func (tx *BaseTx) Unmarshal(p *wrappers.Packer) error {
+	tx.BlockchainID = ids.ID(p.UnpackFixedBytes(ids.IDLen))
+	numActions := p.UnpackInt()
+	tx.Actions = make([]action.Action, numActions)
+	for i := range int(numActions) {
+		var action action.Action
+		if err := action.Unmarshal(p); err != nil {
+			return err
+		}
+		tx.Actions[i] = action
+	}
+	return p.Err
 }
 
 func (tx *BaseTx) SetBytes(unsignedBytes []byte) {

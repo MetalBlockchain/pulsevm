@@ -8,6 +8,7 @@ import (
 	"github.com/MetalBlockchain/metalgo/database"
 	"github.com/MetalBlockchain/metalgo/ids"
 	"github.com/MetalBlockchain/metalgo/utils/hashing"
+	"github.com/MetalBlockchain/metalgo/utils/wrappers"
 	"github.com/MetalBlockchain/pulsevm/chain/account"
 	"github.com/MetalBlockchain/pulsevm/chain/authority"
 	"github.com/MetalBlockchain/pulsevm/chain/contract"
@@ -32,7 +33,7 @@ func init() {
 // pulse.newaccount handles the creation of a new account
 func handleNewAccount(actionContext *ActionContext) error {
 	var actionData NewAccount
-	if err := actionData.Unmarshal(actionContext.GetAction().Data); err != nil {
+	if err := actionData.Unmarshal(&wrappers.Packer{Bytes: actionContext.GetAction().Data}); err != nil {
 		return errDecodeActionData
 	}
 	// Must have creator's authorization
@@ -120,7 +121,7 @@ func handleNewAccount(actionContext *ActionContext) error {
 
 func handleSetCode(actionContext *ActionContext) error {
 	var actionData SetCode
-	if err := actionData.Unmarshal(actionContext.GetAction().Data); err != nil {
+	if err := actionData.Unmarshal(&wrappers.Packer{Bytes: actionContext.GetAction().Data}); err != nil {
 		return errDecodeActionData
 	}
 	if err := actionContext.RequireAuthorization(actionData.Account); err != nil {
@@ -194,7 +195,7 @@ func handleSetCode(actionContext *ActionContext) error {
 
 func handleSetAbi(actionContext *ActionContext) error {
 	var actionData SetAbi
-	if err := actionData.Unmarshal(actionContext.GetAction().Data); err != nil {
+	if err := actionData.Unmarshal(&wrappers.Packer{Bytes: actionContext.GetAction().Data}); err != nil {
 		return errDecodeActionData
 	}
 	if err := actionContext.RequireAuthorization(actionData.Account); err != nil {

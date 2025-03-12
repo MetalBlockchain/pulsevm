@@ -8,10 +8,14 @@ import (
 	"github.com/MetalBlockchain/metalgo/network/p2p/gossip"
 	"github.com/MetalBlockchain/metalgo/utils/crypto/secp256k1"
 	"github.com/MetalBlockchain/metalgo/utils/hashing"
+	"github.com/MetalBlockchain/metalgo/utils/units"
+	"github.com/MetalBlockchain/metalgo/utils/wrappers"
+	"github.com/MetalBlockchain/pulsevm/chain/common"
 )
 
 var (
-	_ gossip.Gossipable = (*Tx)(nil)
+	_ gossip.Gossipable   = (*Tx)(nil)
+	_ common.Serializable = (*Tx)(nil)
 )
 
 // Tx is a signed transaction
@@ -23,6 +27,29 @@ type Tx struct {
 
 	bytes []byte
 	codec codec.Manager
+}
+
+func (tx *Tx) Marshal(p *wrappers.Packer) ([]byte, error) {
+	if _, err := tx.Unsigned.Marshal(p); err != nil {
+		return nil, err
+	}
+	p.PackInt(uint32(len(tx.Signatures)))
+	for _, sig := range tx.Signatures {
+		p.PackFixedBytes(sig)
+	}
+	return p.Bytes, p.Err
+}
+
+func (tx *Tx) Unmarshal(p *wrappers.Packer) error {
+	if err := tx.Unsigned.Unmarshal(p); err != nil {
+		return err
+	}
+	numSignatures := p.UnpackInt()
+	tx.Signatures = make([][]byte, numSignatures)
+	for i := range int(numSignatures) {
+		tx.Signatures[i] = p.UnpackFixedBytes(secp256k1.SignatureLen)
+	}
+	return p.Err
 }
 
 func (tx *Tx) SetBytes(unsignedBytes, signedBytes []byte) {
@@ -47,19 +74,17 @@ func (tx *Tx) GossipID() ids.ID {
 	return tx.TxID
 }
 
-func (tx *Tx) Initialize(c codec.Manager) error {
-	tx.codec = c
-	signedBytes, err := c.Marshal(CodecVersion, tx)
+func (tx *Tx) Initialize() error {
+	signedBytes, err := tx.Marshal(&wrappers.Packer{MaxSize: 256 * units.KiB})
 	if err != nil {
 		return fmt.Errorf("problem creating transaction: %w", err)
 	}
 
-	unsignedBytesLen, err := c.Size(CodecVersion, &tx.Unsigned)
+	unsignedBytes, err := tx.Unsigned.Marshal(&wrappers.Packer{MaxSize: 256 * units.KiB})
 	if err != nil {
 		return fmt.Errorf("couldn't calculate UnsignedTx marshal length: %w", err)
 	}
 
-	unsignedBytes := signedBytes[:unsignedBytesLen]
 	tx.SetBytes(unsignedBytes, signedBytes)
 	return nil
 }
@@ -70,7 +95,7 @@ func (tx *Tx) Sign(privateKey *secp256k1.PrivateKey) error {
 		return fmt.Errorf("problem signing transaction: %w", err)
 	}
 	tx.Signatures = append(tx.Signatures, sig)
-	signedBytes, err := tx.codec.Marshal(CodecVersion, tx)
+	signedBytes, err := tx.Marshal(&wrappers.Packer{MaxSize: 256 * units.KiB})
 	if err != nil {
 		return fmt.Errorf("problem creating transaction: %w", err)
 	}

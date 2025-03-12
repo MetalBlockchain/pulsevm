@@ -1,9 +1,7 @@
 package block
 
 import (
-	"errors"
-
-	"github.com/MetalBlockchain/metalgo/codec"
+	"github.com/MetalBlockchain/metalgo/utils/wrappers"
 	"github.com/MetalBlockchain/pulsevm/chain/txs"
 )
 
@@ -28,30 +26,25 @@ func NewParser() (Parser, error) {
 	if err != nil {
 		return nil, err
 	}
-	c := p.CodecRegistry()
-	gc := p.GenesisCodecRegistry()
-
-	err = errors.Join(
-		c.RegisterType(&StandardBlock{}),
-		gc.RegisterType(&StandardBlock{}),
-	)
 	return &parser{
 		Parser: p,
 	}, err
 }
 
 func (p *parser) ParseBlock(bytes []byte) (Block, error) {
-	return parse(p.Codec(), bytes)
+	return parse(bytes)
 }
 
 func (p *parser) ParseGenesisBlock(bytes []byte) (Block, error) {
-	return parse(p.GenesisCodec(), bytes)
+	return parse(bytes)
 }
 
-func parse(cm codec.Manager, bytes []byte) (Block, error) {
+func parse(bytes []byte) (Block, error) {
 	var blk Block
-	if _, err := cm.Unmarshal(bytes, &blk); err != nil {
+	if err := blk.Unmarshal(&wrappers.Packer{
+		Bytes: bytes,
+	}); err != nil {
 		return nil, err
 	}
-	return blk, blk.initialize(bytes, cm)
+	return blk, blk.initialize(bytes)
 }

@@ -135,7 +135,6 @@ func (vm *VM) Initialize(
 
 	vm.txBackend = &txexecutor.Backend{
 		Ctx:          vm.ctx,
-		Codec:        vm.parser.Codec(),
 		Bootstrapped: false,
 	}
 	vm.chainManager = blockexecutor.NewManager(

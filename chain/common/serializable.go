@@ -1,6 +1,8 @@
 package common
 
+import "github.com/MetalBlockchain/metalgo/utils/wrappers"
+
 type Serializable interface {
-	Marshal() ([]byte, error)
-	Unmarshal(data []byte) error
+	Marshal(*wrappers.Packer) ([]byte, error)
+	Unmarshal(*wrappers.Packer) error
 }

@@ -26,11 +26,8 @@ var (
 func TestKeyLevelWeight(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
-	parser, err := txs.NewParser()
-	assert.NoError(t, err)
 	tx := txs.Tx{
 		Unsigned: &txs.BaseTx{
-			NetworkID:    1,
 			BlockchainID: ids.Empty,
 			Actions: []action.Action{
 				action.Action{
@@ -44,7 +41,7 @@ func TestKeyLevelWeight(t *testing.T) {
 			},
 		},
 	}
-	err = tx.Initialize(parser.Codec())
+	err := tx.Initialize()
 	assert.NoError(t, err)
 	key, err := secp256k1.ToPrivateKey(testPrivateKeyBytes)
 	assert.NoError(t, err)
@@ -78,11 +75,8 @@ func TestKeyLevelWeight(t *testing.T) {
 func TestAccountLevelWeight(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
-	parser, err := txs.NewParser()
-	assert.NoError(t, err)
 	tx := txs.Tx{
 		Unsigned: &txs.BaseTx{
-			NetworkID:    1,
 			BlockchainID: ids.Empty,
 			Actions: []action.Action{
 				action.Action{
@@ -96,7 +90,7 @@ func TestAccountLevelWeight(t *testing.T) {
 			},
 		},
 	}
-	err = tx.Initialize(parser.Codec())
+	err := tx.Initialize()
 	assert.NoError(t, err)
 	key, err := secp256k1.ToPrivateKey(testPrivateKeyBytes)
 	assert.NoError(t, err)

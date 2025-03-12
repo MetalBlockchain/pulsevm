@@ -26,29 +26,21 @@ type KeyWeight struct {
 }
 
 // Marshal implements common.Serializable.
-func (k *KeyWeight) Marshal() ([]byte, error) {
-	pk := wrappers.Packer{
-		MaxSize: 128 * units.KiB,
-		Bytes:   make([]byte, 0, 128),
-	}
+func (k *KeyWeight) Marshal(pk *wrappers.Packer) ([]byte, error) {
 	pk.PackBytes(k.Key.Bytes())
 	pk.PackShort(k.Weight)
 	return pk.Bytes, pk.Err
 }
 
 // Unmarshal implements common.Serializable.
-func (k *KeyWeight) Unmarshal(data []byte) error {
-	pk := wrappers.Packer{
-		MaxSize: 128 * units.KiB,
-		Bytes:   data,
-	}
-	key, err := secp256k1.ToPublicKey(pk.UnpackBytes())
+func (k *KeyWeight) Unmarshal(p *wrappers.Packer) error {
+	key, err := secp256k1.ToPublicKey(p.UnpackBytes())
 	if err != nil {
 		return err
 	}
 	k.Key = *key
-	k.Weight = pk.UnpackShort()
-	return pk.Err
+	k.Weight = p.UnpackShort()
+	return p.Err
 }
 
 type PermissionLevel struct {
@@ -57,22 +49,14 @@ type PermissionLevel struct {
 }
 
 // Marshal implements common.Serializable.
-func (p *PermissionLevel) Marshal() ([]byte, error) {
-	pk := wrappers.Packer{
-		MaxSize: 128 * units.KiB,
-		Bytes:   make([]byte, 0, 128),
-	}
+func (p *PermissionLevel) Marshal(pk *wrappers.Packer) ([]byte, error) {
 	pk.PackLong(uint64(p.Actor))
 	pk.PackLong(uint64(p.Permission))
 	return pk.Bytes, pk.Err
 }
 
 // Unmarshal implements common.Serializable.
-func (p *PermissionLevel) Unmarshal(data []byte) error {
-	pk := wrappers.Packer{
-		MaxSize: 128 * units.KiB,
-		Bytes:   data,
-	}
+func (p *PermissionLevel) Unmarshal(pk *wrappers.Packer) error {
 	p.Actor = name.Name(pk.UnpackLong())
 	p.Permission = name.Name(pk.UnpackLong())
 	return pk.Err
@@ -84,28 +68,18 @@ type PermissionLevelWeight struct {
 }
 
 // Marshal implements common.Serializable.
-func (p *PermissionLevelWeight) Marshal() ([]byte, error) {
-	pk := wrappers.Packer{
-		MaxSize: 128 * units.KiB,
-		Bytes:   make([]byte, 0, 128),
-	}
-	permissionBytes, err := p.Permission.Marshal()
-	if err != nil {
+func (p *PermissionLevelWeight) Marshal(pk *wrappers.Packer) ([]byte, error) {
+	if _, err := p.Permission.Marshal(pk); err != nil {
 		return nil, err
 	}
-	pk.PackBytes(permissionBytes)
 	pk.PackShort(p.Weight)
 	return pk.Bytes, pk.Err
 }
 
 // Unmarshal implements common.Serializable.
-func (p *PermissionLevelWeight) Unmarshal(data []byte) error {
-	pk := wrappers.Packer{
-		MaxSize: 128 * units.KiB,
-		Bytes:   data,
-	}
+func (p *PermissionLevelWeight) Unmarshal(pk *wrappers.Packer) error {
 	var permissionLevel PermissionLevel
-	if err := permissionLevel.Unmarshal(pk.UnpackBytes()); err != nil {
+	if err := permissionLevel.Unmarshal(pk); err != nil {
 		return err
 	}
 	p.Weight = pk.UnpackShort()
@@ -119,43 +93,33 @@ type Authority struct {
 }
 
 // Marshal implements common.Serializable.
-func (a *Authority) Marshal() ([]byte, error) {
-	pk := wrappers.Packer{
-		MaxSize: 128 * units.KiB,
-		Bytes:   make([]byte, 0, 128),
-	}
+func (a *Authority) Marshal(pk *wrappers.Packer) ([]byte, error) {
 	pk.PackInt(a.Threshold)
 	pk.PackInt(uint32(len(a.Keys))) // length of keys
 	for _, key := range a.Keys {
-		keyBytes, err := key.Marshal()
+		_, err := key.Marshal(pk)
 		if err != nil {
 			return nil, err
 		}
-		pk.PackBytes(keyBytes)
 	}
 	pk.PackInt(uint32(len(a.Accounts))) // length of accounts
 	for _, account := range a.Accounts {
-		accountBytes, err := account.Marshal()
+		_, err := account.Marshal(pk)
 		if err != nil {
 			return nil, err
 		}
-		pk.PackBytes(accountBytes)
 	}
 	return pk.Bytes, pk.Err
 }
 
 // Unmarshal implements common.Serializable.
-func (a *Authority) Unmarshal(data []byte) error {
-	pk := wrappers.Packer{
-		MaxSize: 128 * units.KiB,
-		Bytes:   data,
-	}
+func (a *Authority) Unmarshal(pk *wrappers.Packer) error {
 	a.Threshold = pk.UnpackInt()
 	keyLength := pk.UnpackInt()
 	a.Keys = make([]KeyWeight, keyLength)
 	for i := 0; i < int(keyLength); i++ {
 		var keyWeight KeyWeight
-		if err := keyWeight.Unmarshal(pk.UnpackBytes()); err != nil {
+		if err := keyWeight.Unmarshal(pk); err != nil {
 			return err
 		}
 		a.Keys[i] = keyWeight
@@ -164,7 +128,7 @@ func (a *Authority) Unmarshal(data []byte) error {
 	a.Accounts = make([]PermissionLevelWeight, accountLength)
 	for i := 0; i < int(accountLength); i++ {
 		var permissionLevelWeight PermissionLevelWeight
-		if err := permissionLevelWeight.Unmarshal(pk.UnpackBytes()); err != nil {
+		if err := permissionLevelWeight.Unmarshal(pk); err != nil {
 			return err
 		}
 		a.Accounts[i] = permissionLevelWeight
@@ -207,37 +171,28 @@ type Permission struct {
 	Auth        Authority        `serialize:"true"`
 }
 
-func (p *Permission) Marshal() ([]byte, error) {
-	pk := wrappers.Packer{
-		MaxSize: 128 * units.KiB,
-		Bytes:   make([]byte, 0, 128),
-	}
-	pk.PackBytes(p.ID[:])     // 32 bytes
-	pk.PackBytes(p.Parent[:]) // 32 bytes
+func (p *Permission) Marshal(pk *wrappers.Packer) ([]byte, error) {
+	pk.PackFixedBytes(p.ID[:])     // 32 bytes
+	pk.PackFixedBytes(p.Parent[:]) // 32 bytes
 	pk.PackLong(uint64(p.Owner))
 	pk.PackLong(uint64(p.Name))
 	pk.PackInt(uint32(p.LastUpdated))
 	pk.PackInt(uint32(p.LastUsed))
-	authBytes, err := p.Auth.Marshal()
+	_, err := p.Auth.Marshal(pk)
 	if err != nil {
 		return nil, err
 	}
-	pk.PackBytes(authBytes)
 	return pk.Bytes, pk.Err
 }
 
-func (p *Permission) Unmarshal(data []byte) error {
-	pk := wrappers.Packer{
-		MaxSize: 128 * units.KiB,
-		Bytes:   data,
-	}
-	p.ID = ids.ID(pk.UnpackBytes())
-	p.Parent = ids.ID(pk.UnpackBytes())
+func (p *Permission) Unmarshal(pk *wrappers.Packer) error {
+	p.ID = ids.ID(pk.UnpackFixedBytes(ids.IDLen))
+	p.Parent = ids.ID(pk.UnpackFixedBytes(ids.IDLen))
 	p.Owner = name.Name(pk.UnpackLong())
 	p.Name = name.Name(pk.UnpackLong())
 	p.LastUpdated = common.Timestamp(pk.UnpackInt())
 	p.LastUsed = common.Timestamp(pk.UnpackInt())
-	if err := p.Auth.Unmarshal(pk.UnpackBytes()); err != nil {
+	if err := p.Auth.Unmarshal(pk); err != nil {
 		return err
 	}
 	return pk.Err
@@ -270,7 +225,7 @@ func GetPermissionID(owner name.Name, name name.Name) (ids.ID, error) {
 }
 
 func (p *Permission) GetBillableSize() (int, error) {
-	permissionBytes, err := p.Marshal()
+	permissionBytes, err := p.Marshal(&wrappers.Packer{MaxSize: 128 * units.KiB})
 	if err != nil {
 		return 0, err
 	}

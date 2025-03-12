@@ -15,6 +15,8 @@ import (
 	"github.com/MetalBlockchain/metalgo/tests/fixture/tmpnet"
 	"github.com/MetalBlockchain/metalgo/utils/crypto/secp256k1"
 	"github.com/MetalBlockchain/metalgo/utils/formatting"
+	"github.com/MetalBlockchain/metalgo/utils/units"
+	"github.com/MetalBlockchain/metalgo/utils/wrappers"
 	"github.com/MetalBlockchain/pulsevm/api"
 	"github.com/MetalBlockchain/pulsevm/chain/action"
 	"github.com/MetalBlockchain/pulsevm/chain/authority"
@@ -158,13 +160,10 @@ var _ = ginkgo.Describe("[Transaction]", func() {
 			},
 		},
 	}
-	parser, err := txs.NewParser()
-	gomega.Ω(err).Should(gomega.BeNil())
-	actionDataBytes, err := newAccount.Marshal()
+	actionDataBytes, err := newAccount.Marshal(&wrappers.Packer{MaxSize: 256 * units.KiB})
 	gomega.Ω(err).Should(gomega.BeNil())
 	tx := txs.Tx{
 		Unsigned: &txs.BaseTx{
-			NetworkID:    1,
 			BlockchainID: ids.Empty,
 			Actions: []action.Action{
 				action.Action{
@@ -178,7 +177,7 @@ var _ = ginkgo.Describe("[Transaction]", func() {
 			},
 		},
 	}
-	err = tx.Initialize(parser.Codec())
+	err = tx.Initialize()
 	gomega.Ω(err).Should(gomega.BeNil())
 	err = tx.Sign(key)
 	gomega.Ω(err).Should(gomega.BeNil())
