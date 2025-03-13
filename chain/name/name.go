@@ -2,12 +2,27 @@ package name
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"strings"
 )
 
 var charmap = ".12345abcdefghijklmnopqrstuvwxyz"
 
 type Name uint64
+
+func (n Name) MarshalJSON() ([]byte, error) {
+	return json.Marshal(nameToString(uint64(n)))
+}
+
+func (n *Name) UnmarshalJSON(data []byte) error {
+	var s string
+	err := json.Unmarshal(data, &s)
+	if err != nil {
+		return err
+	}
+	*n = NewNameFromString(s)
+	return nil
+}
 
 func (n Name) IsEmpty() bool {
 	return n == 0

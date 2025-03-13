@@ -87,6 +87,10 @@ type State interface {
 	// Commit changes to the base database.
 	Commit() error
 
+	// Returns a batch of unwritten changes that, when written, will commit all
+	// pending changes to the base database.
+	CommitBatch() (database.Batch, error)
+
 	Close() error
 }
 
@@ -264,7 +268,7 @@ func (s *state) initializeChainState(genesisTimestamp time.Time) error {
 		return err
 	}
 
-	keyBytes, _ := hex.DecodeString("d3d137d219791b54bcbce7ab148871223585a2a181bc8a6d8820580f018e807f")
+	keyBytes, _ := hex.DecodeString("583c0d52964a8faae88969c33e1cbc4a96f8ac9c5ca89e1e97aff3190d9b397d")
 	key, _ := secp256k1.ToPrivateKey(keyBytes)
 	s.ModifyAccount(&account.Account{
 		Name:       name.NewNameFromString("pulse"),

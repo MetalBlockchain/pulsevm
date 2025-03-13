@@ -40,8 +40,6 @@ import (
 
 var _ snowmanblock.ChainVM = &VM{}
 
-//var _ snowmanblock.BatchedChainVM = &VM{}
-
 type VM struct {
 	blockbuilder.Builder
 
@@ -241,25 +239,31 @@ func (vm *VM) HealthCheck(context.Context) (interface{}, error) {
 }
 
 func (vm *VM) SetPreference(_ context.Context, blkID ids.ID) error {
+	vm.ctx.Log.Info("setting preference to block", zap.Stringer("blkID", blkID))
 	vm.chainManager.SetPreference(blkID)
 	return nil
 }
 
 func (vm *VM) LastAccepted(context.Context) (ids.ID, error) {
+	vm.ctx.Log.Info("retrieving last accepted block")
 	return vm.chainManager.LastAccepted(), nil
 }
 
 func (vm *VM) GetBlockIDAtHeight(ctx context.Context, height uint64) (ids.ID, error) {
+	vm.ctx.Log.Info("retrieving block ID at height", zap.Uint64("height", height))
 	return vm.state.GetBlockIDAtHeight(height)
 }
 
 func (vm *VM) GetBlock(_ context.Context, blkID ids.ID) (snowman.Block, error) {
+	vm.ctx.Log.Info("retrieving block", zap.Stringer("blkID", blkID))
 	return vm.chainManager.GetBlock(blkID)
 }
 
 func (vm *VM) ParseBlock(_ context.Context, blkBytes []byte) (snowman.Block, error) {
+	vm.ctx.Log.Info("parsing block")
 	blk, err := vm.parser.ParseBlock(blkBytes)
 	if err != nil {
+		vm.ctx.Log.Info("failed to parse block", zap.Error(err))
 		return nil, err
 	}
 	return vm.chainManager.NewBlock(blk), nil
@@ -272,10 +276,12 @@ func (vm *VM) GetAncestors(
 	maxBlocksSize int, // max cumulated byte size of retrieved blocks
 	maxBlocksRetrivalTime time.Duration, // max duration of retrival operation
 ) ([][]byte, error) {
+	vm.ctx.Log.Info("retrieving ancestors")
 	return nil, nil
 }
 
 func (vm *VM) BatchedParseBlock(ctx context.Context, blks [][]byte) ([]snowman.Block, error) {
+	vm.ctx.Log.Info("batched parsing blocks")
 	return nil, nil
 }
 
@@ -295,6 +301,7 @@ func (vm *VM) AppResponse(
 	requestID uint32,
 	response []byte,
 ) error {
+	vm.ctx.Log.Info("responding to app request")
 	return nil
 }
 
@@ -312,6 +319,7 @@ func (vm *VM) AppGossip(
 	nodeID ids.NodeID,
 	msg []byte,
 ) error {
+	vm.ctx.Log.Info("gossiping app message")
 	return nil
 }
 

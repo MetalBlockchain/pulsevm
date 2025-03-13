@@ -143,6 +143,11 @@ func (m *manager) VerifyTx(tx *txs.Tx) error {
 	executor := &executor.Executor{
 		State: stateDiff,
 		Tx:    tx,
+		Ctx:   m.backend.Ctx,
 	}
 	return tx.Unsigned.Visit(executor)
+}
+
+func (m *manager) free(blkID ids.ID) {
+	delete(m.blkIDToState, blkID)
 }

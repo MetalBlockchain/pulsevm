@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/MetalBlockchain/metalgo/ids"
 	"github.com/MetalBlockchain/pulsevm/chain/action"
 	"github.com/MetalBlockchain/pulsevm/chain/name"
 	"github.com/MetalBlockchain/pulsevm/chain/txs"
@@ -11,7 +12,8 @@ import (
 )
 
 var (
-	errNoAuthorizer = errors.New("transaction has no authorizers")
+	errNoAuthorizer        = errors.New("transaction has no authorizers")
+	errIncorrectBlockchain = errors.New("transaction is not for this blockchain")
 )
 
 type TransactionContext struct {
@@ -20,9 +22,15 @@ type TransactionContext struct {
 	resourceTracker  *ResourceTracker
 	authorityChecker *AuthorityChecker
 	state            state.Chain
+	blockchainID     ids.ID
 }
 
-func NewTransactionContext(tx *txs.BaseTx, signatures [][]byte, state state.Chain) (*TransactionContext, error) {
+func NewTransactionContext(
+	tx *txs.BaseTx,
+	signatures [][]byte,
+	state state.Chain,
+	blockchainID ids.ID,
+) (*TransactionContext, error) {
 	authorityChecker, err := NewAuthorityChecker(tx.Bytes(), signatures, state)
 	if err != nil {
 		return nil, err
@@ -34,7 +42,16 @@ func NewTransactionContext(tx *txs.BaseTx, signatures [][]byte, state state.Chai
 		resourceTracker:  NewResourceTracker(),
 		authorityChecker: authorityChecker,
 		state:            state,
+		blockchainID:     blockchainID,
 	}, nil
+}
+
+func (tc *TransactionContext) ValidateTransaction() error {
+	if tc.transaction.BlockchainID.Compare(tc.blockchainID) != 0 {
+		return errIncorrectBlockchain
+	}
+
+	return nil
 }
 
 // This function goes through all of the transaction's specified permissions and checks them against the provided keys
@@ -51,10 +68,12 @@ func (tc *TransactionContext) CheckAuthorization() error {
 }
 
 func (tc *TransactionContext) Execute() error {
+	if err := tc.ValidateTransaction(); err != nil {
+		return err
+	}
 	if err := tc.CheckAuthorization(); err != nil {
 		return err
 	}
-
 	firstAuthorizer, err := tc.FirstAuthorizer()
 	if err != nil {
 		return err

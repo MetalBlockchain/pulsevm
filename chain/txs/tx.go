@@ -30,6 +30,7 @@ type Tx struct {
 }
 
 func (tx *Tx) Marshal(p *wrappers.Packer) ([]byte, error) {
+	p.PackShort(tx.Unsigned.GetType())
 	if _, err := tx.Unsigned.Marshal(p); err != nil {
 		return nil, err
 	}
@@ -41,15 +42,23 @@ func (tx *Tx) Marshal(p *wrappers.Packer) ([]byte, error) {
 }
 
 func (tx *Tx) Unmarshal(p *wrappers.Packer) error {
-	if err := tx.Unsigned.Unmarshal(p); err != nil {
-		return err
+	// Type ID
+	typeID := p.UnpackShort()
+	switch typeID {
+	case BASE_TX:
+		tx.Unsigned = &BaseTx{}
+		if err := tx.Unsigned.Unmarshal(p); err != nil {
+			return err
+		}
+		numSignatures := p.UnpackInt()
+		tx.Signatures = make([][]byte, numSignatures)
+		for i := range int(numSignatures) {
+			tx.Signatures[i] = p.UnpackFixedBytes(secp256k1.SignatureLen)
+		}
+		return p.Err
+	default:
+		return fmt.Errorf("unknown tx type: %d", typeID)
 	}
-	numSignatures := p.UnpackInt()
-	tx.Signatures = make([][]byte, numSignatures)
-	for i := range int(numSignatures) {
-		tx.Signatures[i] = p.UnpackFixedBytes(secp256k1.SignatureLen)
-	}
-	return p.Err
 }
 
 func (tx *Tx) SetBytes(unsignedBytes, signedBytes []byte) {

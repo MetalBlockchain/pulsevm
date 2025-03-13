@@ -14,4 +14,5 @@ type UnsignedTx interface {
 	SyntacticVerify(ctx *snow.Context) error
 	// Visit calls [visitor] with this transaction's concrete type
 	Visit(visitor Visitor) error
+	GetType() uint16
 }

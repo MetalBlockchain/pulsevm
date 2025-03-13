@@ -2,8 +2,8 @@ package mempool
 
 import (
 	"github.com/MetalBlockchain/metalgo/snow/engine/common"
-	txmempool "github.com/MetalBlockchain/metalgo/vms/txs/mempool"
 	"github.com/MetalBlockchain/pulsevm/chain/txs"
+	txmempool "github.com/MetalBlockchain/pulsevm/mempool"
 	"github.com/prometheus/client_golang/prometheus"
 )
 

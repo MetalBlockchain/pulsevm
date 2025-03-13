@@ -95,8 +95,6 @@ func (b *builder) BuildBlock(context.Context) (snowman.Block, error) {
 		}
 		b.mempool.Remove(tx)
 
-		// Invariant: [tx] has already been syntactically verified.
-
 		txDiff, err := state.NewDiffOn(stateDiff)
 		if err != nil {
 			return nil, err
@@ -105,6 +103,7 @@ func (b *builder) BuildBlock(context.Context) (snowman.Block, error) {
 		executor := &txexecutor.Executor{
 			State: txDiff,
 			Tx:    tx,
+			Ctx:   ctx,
 		}
 		err = tx.Unsigned.Visit(executor)
 		if err != nil {

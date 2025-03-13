@@ -93,7 +93,7 @@ func TestNewAccount(t *testing.T) {
 	state.EXPECT().AddPermission(gomock.Any()).Times(2)
 
 	// Test
-	tc, err := NewTransactionContext(baseTx, tx.Signatures, state)
+	tc, err := NewTransactionContext(baseTx, tx.Signatures, state, ids.Empty)
 	assert.NoError(t, err)
 	err = tc.Execute()
 	assert.NoError(t, err)
@@ -159,7 +159,7 @@ func TestSetCode(t *testing.T) {
 	state.EXPECT().ModifyAccount(gomock.Any())
 
 	// Test
-	tc, err := NewTransactionContext(baseTx, tx.Signatures, state)
+	tc, err := NewTransactionContext(baseTx, tx.Signatures, state, ids.Empty)
 	assert.NoError(t, err)
 	err = tc.Execute()
 	assert.NoError(t, err)
@@ -221,7 +221,7 @@ func TestSetAbi(t *testing.T) {
 	state.EXPECT().ModifyAccount(gomock.Any())
 
 	// Test
-	tc, err := NewTransactionContext(baseTx, tx.Signatures, state)
+	tc, err := NewTransactionContext(baseTx, tx.Signatures, state, ids.Empty)
 	assert.NoError(t, err)
 	err = tc.Execute()
 	assert.NoError(t, err)

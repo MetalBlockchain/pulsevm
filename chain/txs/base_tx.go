@@ -25,6 +25,11 @@ type BaseTx struct {
 	unsignedBytes []byte // Unsigned byte representation of this data
 }
 
+// GetType implements UnsignedTx.
+func (tx *BaseTx) GetType() uint16 {
+	return BASE_TX
+}
+
 func (tx *BaseTx) Marshal(p *wrappers.Packer) ([]byte, error) {
 	p.PackFixedBytes(tx.BlockchainID[:])
 	p.PackInt(uint32(len(tx.Actions)))

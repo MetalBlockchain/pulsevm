@@ -27,14 +27,14 @@ type KeyWeight struct {
 
 // Marshal implements common.Serializable.
 func (k *KeyWeight) Marshal(pk *wrappers.Packer) ([]byte, error) {
-	pk.PackBytes(k.Key.Bytes())
+	pk.PackFixedBytes(k.Key.Bytes())
 	pk.PackShort(k.Weight)
 	return pk.Bytes, pk.Err
 }
 
 // Unmarshal implements common.Serializable.
 func (k *KeyWeight) Unmarshal(p *wrappers.Packer) error {
-	key, err := secp256k1.ToPublicKey(p.UnpackBytes())
+	key, err := secp256k1.ToPublicKey(p.UnpackFixedBytes(secp256k1.PublicKeyLen))
 	if err != nil {
 		return err
 	}

@@ -40,11 +40,11 @@ func (p *parser) ParseGenesisBlock(bytes []byte) (Block, error) {
 }
 
 func parse(bytes []byte) (Block, error) {
-	var blk Block
+	var blk StandardBlock
 	if err := blk.Unmarshal(&wrappers.Packer{
 		Bytes: bytes,
 	}); err != nil {
 		return nil, err
 	}
-	return blk, blk.initialize(bytes)
+	return &blk, blk.initialize(bytes)
 }

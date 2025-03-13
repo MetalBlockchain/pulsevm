@@ -64,7 +64,7 @@ func handleNewAccount(actionContext *ActionContext) error {
 	if err != nil && err != database.ErrNotFound {
 		return err
 	} else if existingAccount != nil {
-		return errors.New("account already exists")
+		return fmt.Errorf("account '%s' already exists", nameString)
 	}
 	newAccount := &account.Account{
 		Name:       actionData.Name,

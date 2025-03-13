@@ -196,5 +196,19 @@ func (d *diff) Apply(baseState Chain) error {
 	for _, tx := range d.addedTxs {
 		baseState.AddTx(tx)
 	}
+	for _, account := range d.modifiedAccounts {
+		baseState.ModifyAccount(account)
+	}
+	for _, permission := range d.modifiedPermissions {
+		baseState.AddPermission(permission)
+	}
+	for _, code := range d.modifiedCodes {
+		baseState.ModifyCode(code)
+	}
+	for _, blk := range d.addedBlocks {
+		baseState.AddBlock(blk)
+	}
+	baseState.SetLastAccepted(d.lastAccepted)
+	baseState.SetTimestamp(d.timestamp)
 	return nil
 }
