@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 
@@ -48,5 +49,43 @@ func (svc *Service) IssueTx(_ *http.Request, args *api.FormattedTx, response *ap
 
 	response.TxID, err = svc.vm.issueTxFromRPC(tx)
 
+	return err
+}
+
+func (s *Service) GetBlockByHeight(_ *http.Request, args *api.GetBlockByHeightArgs, reply *api.GetBlockResponse) error {
+	s.vm.ctx.Log.Debug("API called",
+		zap.String("service", "pulsevm"),
+		zap.String("method", "getBlockByHeight"),
+		zap.Uint64("height", uint64(args.Height)),
+	)
+
+	s.vm.ctx.Lock.Lock()
+	defer s.vm.ctx.Lock.Unlock()
+
+	reply.Encoding = args.Encoding
+	blockID, err := s.vm.state.GetBlockIDAtHeight(uint64(args.Height))
+	if err != nil {
+		return fmt.Errorf("couldn't get block at height %d: %w", args.Height, err)
+	}
+	block, err := s.vm.chainManager.GetStatelessBlock(blockID)
+	if err != nil {
+		s.vm.ctx.Log.Error("couldn't get accepted block",
+			zap.Stringer("blkID", blockID),
+			zap.Error(err),
+		)
+		return fmt.Errorf("couldn't get block with id %s: %w", blockID, err)
+	}
+
+	var result any
+	if args.Encoding == formatting.JSON {
+		result = block
+	} else {
+		result, err = formatting.Encode(args.Encoding, block.Bytes())
+		if err != nil {
+			return fmt.Errorf("couldn't encode block %s as string: %w", blockID, err)
+		}
+	}
+
+	reply.Block, err = json.Marshal(result)
 	return err
 }
