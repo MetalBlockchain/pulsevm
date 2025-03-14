@@ -89,3 +89,26 @@ func (s *Service) GetBlockByHeight(_ *http.Request, args *api.GetBlockByHeightAr
 	reply.Block, err = json.Marshal(result)
 	return err
 }
+
+func (s *Service) GetAccount(_ *http.Request, args *api.GetAccountArgs, reply *api.GetAccountResponse) error {
+	s.vm.ctx.Log.Debug("API called",
+		zap.String("service", "pulsevm"),
+		zap.String("method", "getAccount"),
+		zap.Uint64("name", uint64(args.Account)),
+	)
+
+	s.vm.ctx.Lock.Lock()
+	defer s.vm.ctx.Lock.Unlock()
+
+	account, err := s.vm.state.GetAccount(args.Account)
+	if err != nil || account == nil {
+		return fmt.Errorf("couldn't get account with name %s: %w", args.Account.String(), err)
+	}
+
+	reply.Name = account.Name
+	reply.AbiSequence = account.AbiSequence
+	reply.CodeHash = account.CodeHash
+	reply.CodeSequence = account.CodeSequence
+	reply.Priviliged = account.Priviliged
+	return nil
+}

@@ -5,6 +5,7 @@ import (
 
 	"github.com/MetalBlockchain/metalgo/ids"
 	"github.com/MetalBlockchain/metalgo/utils/formatting"
+	"github.com/MetalBlockchain/pulsevm/chain/name"
 )
 
 type EmptyReply struct{}
@@ -24,4 +25,12 @@ type GetBlockResponse struct {
 	// If GetBlockResponse.Encoding is formatting.JSON, GetBlockResponse.Block
 	// is the actual block returned as a JSON.
 	Encoding formatting.Encoding `json:"encoding"`
+}
+
+type GetAccountResponse struct {
+	Name         name.Name `json:"name"`
+	Priviliged   bool      `json:"priviliged"`
+	CodeSequence uint32    `json:"codeSequence"`
+	CodeHash     ids.ID    `json:"codeHash"`
+	AbiSequence  uint32    `json:"abiSequence"`
 }

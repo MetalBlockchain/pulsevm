@@ -426,6 +426,9 @@ func (s *state) GetAccount(name name.Name) (*account.Account, error) {
 		return acc, nil
 	}
 	if acc, exists := s.accountCache.Get(name); exists {
+		if acc == nil {
+			return nil, database.ErrNotFound
+		}
 		return acc, nil
 	}
 
