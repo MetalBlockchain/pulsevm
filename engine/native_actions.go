@@ -129,14 +129,14 @@ func handleSetCode(actionContext *ActionContext) error {
 	}
 	account, err := actionContext.GetAccount(actionData.Account)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to get account: %w", err)
 	}
 
 	// Previous contract size, for RAM purposes
 	oldSize := 0
 	newSize := len(actionData.Code)
 
-	if account.CodeHash != ids.Empty {
+	if account.CodeHash.Compare(ids.Empty) != 0 {
 		oldCode, err := actionContext.GetCode(account.CodeHash)
 		if err != nil {
 			return err
@@ -156,7 +156,7 @@ func handleSetCode(actionContext *ActionContext) error {
 			return err
 		}
 
-		if account.CodeHash == codeHash {
+		if account.CodeHash.Compare(codeHash) == 0 {
 			return errors.New("account is already running this version of the contract")
 		} else {
 			account.CodeHash = codeHash
@@ -169,6 +169,11 @@ func handleSetCode(actionContext *ActionContext) error {
 		}
 
 		if existingCode == nil {
+			// Validate new WASM code
+			if err := ValidateWasm(actionData.Code); err != nil {
+				return err
+			}
+
 			newCode := &contract.Code{
 				Hash:     codeHash,
 				Code:     actionData.Code,
@@ -180,6 +185,10 @@ func handleSetCode(actionContext *ActionContext) error {
 			actionContext.state.ModifyCode(existingCode)
 		}
 	} else {
+		if account.CodeHash.Compare(ids.Empty) == 0 {
+			return errors.New("account is already running this version of the contract")
+		}
+
 		account.CodeHash = ids.Empty
 		account.CodeSequence++
 	}
