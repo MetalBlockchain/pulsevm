@@ -1,0 +1,8 @@
+[package]
+name = "pulsevm_chainbase"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+fjall = "2.8.0"
+pulsevm_serialization = { path = "../pulsevm_serialization" }

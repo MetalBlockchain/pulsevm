@@ -1,0 +1,5 @@
+[workspace]
+resolver = "2"
+members = [ "crates/pulsevm", "crates/pulsevm_chainbase",
+    "crates/pulsevm_grpc"
+, "crates/pulsevm_serialization", "crates/pulsevm_storage"]
