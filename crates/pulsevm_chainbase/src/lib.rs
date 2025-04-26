@@ -7,11 +7,16 @@ pub trait ChainbaseObject<'a>: Default + Serialize + Deserialize {
 
     fn primary_key(&self) -> Vec<u8>;
     fn primary_key_as_bytes(key: Self::PrimaryKey) -> Vec<u8>;
-    fn secondary_indexes(&self) -> Vec<impl SecondaryIndex<'a, Self>>;
-    fn table_name(&self) -> &'static str;
+    fn secondary_indexes(&self) -> Vec<SecondaryKey>;
+    fn table_name() -> &'static str;
 }
 
-pub trait SecondaryIndex<'a, C>: Default
+pub struct SecondaryKey {
+    pub key: Vec<u8>,
+    pub index_name: &'static str,
+}
+
+pub trait SecondaryIndex<'a, C>
 where
     C: ChainbaseObject<'a>,
 {
@@ -19,7 +24,7 @@ where
 
     fn secondary_key(&self, object: &C) -> Vec<u8>;
     fn secondary_key_as_bytes(key: Self::Key) -> Vec<u8>;
-    fn index_name(&self) -> &'static str;
+    fn index_name() -> &'static str;
 }
 
 enum ObjectChange
@@ -43,16 +48,14 @@ impl<'a> Database {
     }
 
     pub fn exists<T: ChainbaseObject<'a> + 'static>(&self, key: T::PrimaryKey) -> Result<bool, Box<dyn Error>> {
-        let default_obj = T::default();
-        let partition = self.keyspace.open_partition(default_obj.table_name(),  Default::default())?;
+        let partition = self.keyspace.open_partition(T::table_name(),  Default::default())?;
         let res = partition.contains_key(T::primary_key_as_bytes(key))?;
         Ok(res)
     }
 
     #[must_use]
     pub fn find_by_primary<T: ChainbaseObject<'a>>(&self, key: T::PrimaryKey) -> Result<Option<T>, Box<dyn Error>> {
-        let default_obj = T::default();
-        let partition = self.keyspace.open_partition(default_obj.table_name(),  Default::default())?;
+        let partition = self.keyspace.open_partition(T::table_name(),  Default::default())?;
         let serialized = partition.get(T::primary_key_as_bytes(key))?;
         if serialized.is_none() {
             return Ok(None);
@@ -64,12 +67,12 @@ impl<'a> Database {
 
     #[must_use]
     pub fn find_by_secondary<T: ChainbaseObject<'a>, S: SecondaryIndex<'a, T>>(&self, key: S::Key) -> Result<Option<T>, Box<dyn Error>> {
-        let partition = self.keyspace.open_partition(S::default().index_name(),  Default::default())?;
+        let partition = self.keyspace.open_partition(S::index_name(),  Default::default())?;
         let secondary_key = partition.get(S::secondary_key_as_bytes(key))?;
         if secondary_key.is_none() {
             return Ok(None);
         }
-        let partition = self.keyspace.open_partition(T::default().table_name(),  Default::default())?;
+        let partition = self.keyspace.open_partition(T::table_name(),  Default::default())?;
         let serialized = partition.get(secondary_key.unwrap())?;
         if serialized.is_none() {
             return Ok(None);
@@ -101,16 +104,14 @@ impl<'a> UndoSession<'a> {
 
     #[must_use]
     pub fn exists<T: ChainbaseObject<'a> + 'static>(&self, key: T::PrimaryKey) -> Result<bool, Box<dyn Error>> {
-        let default_obj = T::default();
-        let partition = self.keyspace.open_partition(default_obj.table_name(),  Default::default())?;
+        let partition = self.keyspace.open_partition(T::table_name(),  Default::default())?;
         let res = self.tx.contains_key(&partition, T::primary_key_as_bytes(key))?;
         Ok(res)
     }
 
     #[must_use]
     pub fn find_by_primary<T: ChainbaseObject<'a> + 'static>(&self, key: T::PrimaryKey) -> Result<Option<T>, Box<dyn Error>> {
-        let default_obj = T::default();
-        let partition = self.keyspace.open_partition(default_obj.table_name(),  Default::default())?;
+        let partition = self.keyspace.open_partition(T::table_name(),  Default::default())?;
         let serialized = self.tx.get(&partition, T::primary_key_as_bytes(key))?;
         if serialized.is_none() {
             return Ok(None);
@@ -123,7 +124,7 @@ impl<'a> UndoSession<'a> {
     pub fn insert<T: ChainbaseObject<'a>>(&mut self, object: &T) -> Result<(), Box<dyn Error>> {
         let key = object.primary_key();
         let serialized = serialize(object);
-        let partition = self.keyspace.open_partition(object.table_name(),  Default::default())?;
+        let partition = self.keyspace.open_partition(T::table_name(),  Default::default())?;
         let exists = self.tx.contains_key(&partition, &key)?;
         if exists {
             return Err("Object already exists".into());
@@ -131,9 +132,8 @@ impl<'a> UndoSession<'a> {
         self.changes.push_back(ObjectChange::New(key.to_owned()));
         self.tx.insert(&partition, &key, serialized);
         for index in object.secondary_indexes() {
-            let secondary_key = index.secondary_key(object);
-            let partition = self.keyspace.open_partition(index.index_name(),  Default::default())?;
-            self.tx.insert(&partition, &secondary_key, &key);
+            let partition = self.keyspace.open_partition(index.index_name,  Default::default())?;
+            self.tx.insert(&partition, &index.key, &key);
         }
         Ok(())
     }
@@ -144,7 +144,7 @@ impl<'a> UndoSession<'a> {
         F: FnOnce(&T) -> T,
     {
         let key = old.primary_key();
-        let partition = self.keyspace.open_partition(old.table_name(),  Default::default())?;
+        let partition = self.keyspace.open_partition(T::table_name(),  Default::default())?;
         let existing = self.tx.get(&partition, &key)?;
         if existing.is_none() {
             return Err("Object does not exist".into());
@@ -163,7 +163,7 @@ impl<'a> UndoSession<'a> {
 
     pub fn remove<T: ChainbaseObject<'a> + 'static>(&mut self, object: T) -> Result<(), Box<dyn Error>> {
         let key = object.primary_key();
-        let partition = self.keyspace.open_partition(object.table_name(),  Default::default())?;
+        let partition = self.keyspace.open_partition(T::table_name(),  Default::default())?;
         let old_value = self.tx.get(&partition, &key)?;
         if old_value.is_none() {
             return Err("Object does not exist".into());
@@ -171,9 +171,8 @@ impl<'a> UndoSession<'a> {
         self.changes.push_back(ObjectChange::Deleted(key.to_owned(), old_value.unwrap().to_vec()));
         self.tx.remove(&partition, &key);
         for index in object.secondary_indexes() {
-            let secondary_key = index.secondary_key(&object);
-            let partition = self.keyspace.open_partition(index.index_name(),  Default::default())?;
-            self.tx.remove(&partition, &secondary_key);
+            let partition = self.keyspace.open_partition(index.index_name,  Default::default())?;
+            self.tx.remove(&partition, &index.key);
         }
         Ok(())
     }

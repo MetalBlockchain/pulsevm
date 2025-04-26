@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use prost_types::Timestamp;
-use pulsevm_chainbase::{ChainbaseObject, SecondaryIndex};
+use pulsevm_chainbase::{ChainbaseObject, SecondaryIndex, SecondaryKey};
 use pulsevm_serialization::{serialize, Deserialize, Serialize};
 use sha2::Digest;
 
@@ -51,6 +51,25 @@ impl From<DateTime<Utc>> for BlockTimestamp {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct BlockByHeightIndex;
+
+impl<'a> SecondaryIndex<'a, Block> for BlockByHeightIndex {
+    type Key = u64;
+
+    fn secondary_key(&self, object: &Block) -> Vec<u8> {
+        object.height.to_be_bytes().to_vec()
+    }
+
+    fn secondary_key_as_bytes(key: Self::Key) -> Vec<u8> {
+        key.to_be_bytes().to_vec()
+    }
+
+    fn index_name() -> &'static str {
+        "blocks_by_height"
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct Block {
     pub parent_id: Id, // ID of the parent block
@@ -89,31 +108,17 @@ impl<'a> ChainbaseObject<'a> for Block {
         key.0.to_vec()
     }
 
-    fn table_name(&self) -> &'static str {
+    fn table_name() -> &'static str {
         "blocks"
     }
 
-    fn secondary_indexes(&self) -> Vec<impl SecondaryIndex<'a, Self>> {
-        vec![BlockByHeightIndex]
-    }
-}
-
-#[derive(Debug, Default)]
-pub struct BlockByHeightIndex;
-
-impl<'a> SecondaryIndex<'a, Block> for BlockByHeightIndex {
-    type Key = u64;
-
-    fn secondary_key(&self, object: &Block) -> Vec<u8> {
-        object.height.to_be_bytes().to_vec()
-    }
-
-    fn secondary_key_as_bytes(key: Self::Key) -> Vec<u8> {
-        key.to_be_bytes().to_vec()
-    }
-
-    fn index_name(&self) -> &'static str {
-        "blocks_by_height"
+    fn secondary_indexes(&self) -> Vec<SecondaryKey> {
+        vec![
+            SecondaryKey {
+                key: BlockByHeightIndex::secondary_key_as_bytes(self.height),
+                index_name: BlockByHeightIndex::index_name(),
+            },
+        ]
     }
 }
 

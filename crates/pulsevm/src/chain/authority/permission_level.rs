@@ -1,4 +1,4 @@
-use pulsevm_chainbase::{ChainbaseObject, SecondaryIndex};
+use pulsevm_chainbase::{ChainbaseObject, SecondaryKey};
 use pulsevm_serialization::{Deserialize, Serialize};
 
 use crate::chain::Name;
@@ -58,11 +58,11 @@ impl<'a> ChainbaseObject<'a> for PermissionLevel {
         key.primary_key()
     }
 
-    fn secondary_indexes(&self) -> Vec<impl SecondaryIndex<'a, Self>> {
-        
+    fn secondary_indexes(&self) -> Vec<SecondaryKey> {
+        vec![]
     }
 
-    fn table_name(&self) -> &'static str {
-        "permission_levels"
+    fn table_name() -> &'static str {
+        "permission_level"
     }
 }
