@@ -14,6 +14,26 @@ pub struct Permission {
     pub authority: Authority,
 }
 
+impl Permission {
+    pub fn new(
+        id: Id,
+        parent_id: Id,
+        owner: Name,
+        name: Name,
+        authority: Authority,
+    ) -> Self {
+        Permission { id, parent_id, owner, name, authority }
+    }
+
+    pub fn id(&self) -> &Id {
+        &self.id
+    }
+
+    pub fn parent_id(&self) -> &Id {
+        &self.parent_id
+    }
+}
+
 impl Serialize for Permission {
     fn serialize(
         &self,

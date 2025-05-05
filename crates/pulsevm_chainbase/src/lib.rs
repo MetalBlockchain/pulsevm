@@ -47,6 +47,12 @@ impl<'a> Database {
         })
     }
 
+    pub fn temporary(path: &Path) -> Result<Self, fjall::Error> {
+        let config = Config::new(path).temporary(true);
+        let keyspace = config.open_transactional()?;
+        Ok(Self { keyspace })
+    }
+
     pub fn exists<T: ChainbaseObject<'a> + 'static>(&self, key: T::PrimaryKey) -> Result<bool, Box<dyn Error>> {
         let partition = self.keyspace.open_partition(T::table_name(),  Default::default())?;
         let res = partition.contains_key(T::primary_key_as_bytes(key))?;

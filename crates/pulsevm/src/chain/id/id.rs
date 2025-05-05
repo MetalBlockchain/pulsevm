@@ -10,6 +10,10 @@ impl Id {
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
+
+    pub fn zero() -> Self {
+        Id([0u8; 32])
+    }
 }
 
 impl FromStr for Id {

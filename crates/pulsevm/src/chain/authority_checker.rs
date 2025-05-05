@@ -26,15 +26,15 @@ impl fmt::Debug for AuthorityError {
     }
 }
 
-pub struct AuthorityChecker {
-    db: Arc<Mutex<Database>>,
+pub struct AuthorityChecker<'a> {
+    db: &'a Database,
     satisfied_authorities: HashSet<PermissionLevel>,
     provided_keys: HashSet<PublicKey>,
     used_keys: HashSet<PublicKey>,
 }
 
-impl AuthorityChecker {
-    pub fn new(tx: &Transaction, db: Arc<Mutex<Database>>) -> Result<Self, AuthorityError> {
+impl<'a> AuthorityChecker<'a> {
+    pub fn new(tx: &Transaction, db: &'a Database) -> Result<Self, AuthorityError> {
         let mut provided_keys: HashSet<PublicKey> = HashSet::new();
         let mut tx_data: Vec<u8> = Vec::new();
         tx.unsigned_tx.serialize(&mut tx_data);
@@ -52,9 +52,8 @@ impl AuthorityChecker {
         if self.satisfied_authorities.contains(level) {
             return Ok(());
         }
-        let db_clone = self.db.clone();
-        let db = db_clone.blocking_lock();
-        let permission: Option<Permission> = db.find_by_primary((level.actor(), level.permission())).map_err(|_| AuthorityError::InternalError)?;
+        //let db_clone = self.db.clone();
+        let permission: Option<Permission> = self.db.find_by_primary((level.actor(), level.permission())).map_err(|_| AuthorityError::InternalError)?;
         if permission.is_none() {
             return Err(AuthorityError::PermissionNotFound(level.actor().clone(), level.permission().clone()));
         }
@@ -93,7 +92,7 @@ impl AuthorityChecker {
 mod tests {
     use std::path::Path;
 
-    use crate::chain::{name, Transaction};
+    use crate::chain::{name, Authority, Id, KeyWeight, Transaction};
 
     use super::*;
     use pulsevm_chainbase::Database;
@@ -104,13 +103,28 @@ mod tests {
     fn test_authority_checker() {
         // Create a mock database
         let path = Path::new("test.db");
-        let db = Arc::new(Mutex::new(Database::new(path).unwrap()));
+        let shared_db = Arc::new(Mutex::new(Database::temporary(path).unwrap()));
+        let our_db = shared_db.clone();
+        let db = our_db.try_lock().unwrap();
+        println!("Database created at: {:?}", path);
+        let mut undo_session = db.undo_session().unwrap();
+        let owner_permission = Permission::new(
+            Id::zero(),
+            Id::zero(),
+            name!("test").into(),
+            name!("test").into(),
+            Authority::new(1, vec![
+                KeyWeight::new(PublicKey::from_hex("027f4dbe05a88d4c3974cec8d03f192c96a9813ea4d60811c4e68a2d459842497c").unwrap(), 1),
+            ], vec![]),
+        );
+        undo_session.insert(&owner_permission).unwrap();
+        undo_session.commit();
         let data = "0000e19b30bc0bfabfab01c9260469fab7529ae88987b2eb337dac5650305226b38e00000001aea38500000000009ab864229a9e40000000006eaea385000000000064553988000000000000000100000001027f4dbe05a88d4c3974cec8d03f192c96a9813ea4d60811c4e68a2d459842497c0001000000000000000100000001027f4dbe05a88d4c3974cec8d03f192c96a9813ea4d60811c4e68a2d459842497c00010000000000000001aea38500000000003232eda80000000000000001ada3bd9c65952513b98753bcc582cf368fb8bf8432e3e0389498a248756b209a0eb4e0846a1f85cad63fd2203cb1577514a902a54ae718a33552bb782fe11c960178ed5cd2";
         let tx_data = hex::decode(data).unwrap();
         let tx = Transaction::deserialize(&tx_data, &mut 0).unwrap();
 
         // Create an AuthorityChecker instance
-        let mut checker = AuthorityChecker::new(&tx, db.clone()).unwrap();
+        let mut checker = AuthorityChecker::new(&tx, &db).unwrap();
 
         // Test satisfies_permission_level
         let level = PermissionLevel::new(name!("test").into(), name!("test").into());
