@@ -1,8 +1,8 @@
 mod authority;
 pub use authority::*;
 
-mod authority_manager;
-pub use authority_manager::AuthorityManager;
+mod authority_checker;
+pub use authority_checker::*;
 
 mod block;
 

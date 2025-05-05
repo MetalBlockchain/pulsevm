@@ -9,3 +9,6 @@ pub use permission_level::*;
 
 mod permission_level_weight;
 pub use permission_level_weight::*;
+
+mod permission;
+pub use permission::*;

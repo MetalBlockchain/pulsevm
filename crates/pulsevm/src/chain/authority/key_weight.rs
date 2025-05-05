@@ -2,6 +2,7 @@ use pulsevm_serialization::{Deserialize, Serialize};
 
 use crate::chain::PublicKey;
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct KeyWeight {
     key: PublicKey,
     weight: u16,

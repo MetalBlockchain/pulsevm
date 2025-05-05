@@ -45,17 +45,17 @@ impl Deserialize for PermissionLevel {
 }
 
 impl<'a> ChainbaseObject<'a> for PermissionLevel {
-    type PrimaryKey = PermissionLevel;
+    type PrimaryKey = (Name, Name);
     
     fn primary_key(&self) -> Vec<u8> {
-        let mut bytes: Vec<u8> = Vec::new();
-        self.actor.serialize(&mut bytes);
-        self.permission.serialize(&mut bytes);
-        bytes
+        PermissionLevel::primary_key_as_bytes((self.actor, self.permission))
     }
 
     fn primary_key_as_bytes(key: Self::PrimaryKey) -> Vec<u8> {
-        key.primary_key()
+        let mut bytes: Vec<u8> = Vec::new();
+        key.0.serialize(&mut bytes);
+        key.1.serialize(&mut bytes);
+        bytes
     }
 
     fn secondary_indexes(&self) -> Vec<SecondaryKey> {

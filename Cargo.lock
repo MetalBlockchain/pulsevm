@@ -1331,6 +1331,8 @@ dependencies = [
  "prost-types",
  "pulsevm_chainbase",
  "pulsevm_grpc",
+ "pulsevm_name",
+ "pulsevm_proc_macros",
  "pulsevm_serialization",
  "secp256k1",
  "serde",
@@ -1357,6 +1359,20 @@ dependencies = [
  "prost-types",
  "tonic",
  "tonic-build",
+]
+
+[[package]]
+name = "pulsevm_name"
+version = "0.1.0"
+
+[[package]]
+name = "pulsevm_proc_macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "pulsevm_name",
+ "quote",
+ "syn 1.0.109",
 ]
 
 [[package]]

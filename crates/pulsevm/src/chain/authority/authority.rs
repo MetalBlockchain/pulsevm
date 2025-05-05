@@ -2,6 +2,7 @@ use pulsevm_serialization::{Deserialize, Serialize};
 
 use super::{KeyWeight, PermissionLevelWeight};
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct Authority {
     threshold: u32,
     keys: Vec<KeyWeight>,

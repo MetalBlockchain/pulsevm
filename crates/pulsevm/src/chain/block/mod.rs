@@ -51,25 +51,6 @@ impl From<DateTime<Utc>> for BlockTimestamp {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct BlockByHeightIndex;
-
-impl<'a> SecondaryIndex<'a, Block> for BlockByHeightIndex {
-    type Key = u64;
-
-    fn secondary_key(&self, object: &Block) -> Vec<u8> {
-        object.height.to_be_bytes().to_vec()
-    }
-
-    fn secondary_key_as_bytes(key: Self::Key) -> Vec<u8> {
-        key.to_be_bytes().to_vec()
-    }
-
-    fn index_name() -> &'static str {
-        "blocks_by_height"
-    }
-}
-
 #[derive(Debug, Default, Clone)]
 pub struct Block {
     pub parent_id: Id, // ID of the parent block
@@ -109,7 +90,7 @@ impl<'a> ChainbaseObject<'a> for Block {
     }
 
     fn table_name() -> &'static str {
-        "blocks"
+        "block"
     }
 
     fn secondary_indexes(&self) -> Vec<SecondaryKey> {
@@ -144,5 +125,24 @@ impl Deserialize for Block {
         let height = u64::deserialize(data, pos)?;
         let transactions = Vec::<Transaction>::deserialize(data, pos)?;
         Ok(Block { parent_id, timestamp, height, transactions })
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct BlockByHeightIndex;
+
+impl<'a> SecondaryIndex<'a, Block> for BlockByHeightIndex {
+    type Key = u64;
+
+    fn secondary_key(&self, object: &Block) -> Vec<u8> {
+        object.height.to_be_bytes().to_vec()
+    }
+
+    fn secondary_key_as_bytes(key: Self::Key) -> Vec<u8> {
+        key.to_be_bytes().to_vec()
+    }
+
+    fn index_name() -> &'static str {
+        "block_by_height"
     }
 }

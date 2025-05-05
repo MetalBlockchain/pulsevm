@@ -8,8 +8,7 @@ use super::{Id, Signature};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transaction {
     pub tx_type: u16, // Type of transaction (e.g., transfer, contract call)
-    pub blockchain_id: Id, // ID of the chain on which this transaction exists (prevents replay attacks)
-    pub actions: Vec<Action>, // Actions to be executed in this transaction
+    pub unsigned_tx: UnsignedTransaction, // Unsigned transaction data
     pub signatures: Vec<Signature>, // Signatures of the transaction
 }
 
@@ -19,8 +18,7 @@ impl Serialize for Transaction {
         bytes: &mut Vec<u8>,
     ) {
         self.tx_type.serialize(bytes);
-        self.blockchain_id.serialize(bytes);
-        self.actions.serialize(bytes);
+        self.unsigned_tx.serialize(bytes);
         self.signatures.serialize(bytes);
     }
 }
@@ -31,10 +29,36 @@ impl Deserialize for Transaction {
         pos: &mut usize
     ) -> Result<Self, pulsevm_serialization::ReadError> {
         let tx_type = u16::deserialize(data, pos)?;
+        let unsigned_tx = UnsignedTransaction::deserialize(data, pos)?;
+        let signatures = Vec::<Signature>::deserialize(data, pos)?;
+        Ok(Transaction { tx_type, unsigned_tx, signatures })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsignedTransaction {
+    pub blockchain_id: Id, // ID of the chain on which this transaction exists (prevents replay attacks)
+    pub actions: Vec<Action>, // Actions to be executed in this transaction
+}
+
+impl Serialize for UnsignedTransaction {
+    fn serialize(
+        &self,
+        bytes: &mut Vec<u8>,
+    ) {
+        self.blockchain_id.serialize(bytes);
+        self.actions.serialize(bytes);
+    }
+}
+
+impl Deserialize for UnsignedTransaction {
+    fn deserialize(
+        data: &[u8],
+        pos: &mut usize
+    ) -> Result<Self, pulsevm_serialization::ReadError> {
         let blockchain_id = Id::deserialize(data, pos)?;
         let actions = Vec::<Action>::deserialize(data, pos)?;
-        let signatures = Vec::<Signature>::deserialize(data, pos)?;
-        Ok(Transaction { tx_type, blockchain_id, actions, signatures })
+        Ok(UnsignedTransaction { blockchain_id, actions })
     }
 }
 
@@ -47,12 +71,13 @@ pub fn encode_action_data(data: Vec<Box<dyn Serialize>>) -> Vec<u8> {
 }
 
 
+
 mod tests {
     use std::{str::FromStr, vec};
 
     use pulsevm_serialization::{Deserialize, Serialize};
 
-    use crate::chain::{transaction::encode_action_data, Authority, Id, KeyWeight, Name, PermissionLevel, PrivateKey, Signature};
+    use crate::chain::{transaction::{encode_action_data, UnsignedTransaction}, Authority, Id, KeyWeight, Name, PermissionLevel, PrivateKey, Signature};
 
     use super::{Action, Transaction};
 
@@ -68,43 +93,45 @@ mod tests {
         let private_key = PrivateKey::from_str("frqNAoTevNse58hUoJMDzPXDbfNicjCGjNz5VDgqqHJbhBBG9").unwrap();
         let tx = Transaction {
             tx_type: 0,
-            blockchain_id: Id::from_str("2iMormvesjkHEuF4toW2WGvvKsrrFkytLjTjRWCvis43pTC3AJ").unwrap(),
-            actions: vec![
-                Action::new(
-                    Name::from_str("pulse").unwrap(),
-                    Name::from_str("newaccount").unwrap(),
-                    encode_action_data(
-                        vec![
-                            Box::new(Name::from_str("pulse").unwrap()),
-                            Box::new(Name::from_str("glenn2").unwrap()),
-                            Box::new(Authority::new(
-                                1,
-                                vec![
-                                    KeyWeight::new(
-                                        private_key.public_key(),
-                                        1,
-                                    ),
-                                ],
-                                vec![],
-                            )),
-                            Box::new(Authority::new(
-                                1,
-                                vec![
-                                    KeyWeight::new(
-                                        private_key.public_key(),
-                                        1,
-                                    ),
-                                ],
-                                vec![],
-                            )),
-                        ],
-                    ),
-                    vec![PermissionLevel::new(
+            unsigned_tx: UnsignedTransaction{
+                blockchain_id: Id::from_str("2iMormvesjkHEuF4toW2WGvvKsrrFkytLjTjRWCvis43pTC3AJ").unwrap(),
+                actions: vec![
+                    Action::new(
                         Name::from_str("pulse").unwrap(),
-                        Name::from_str("active").unwrap(),
-                    )],
-                ),
-            ],
+                        Name::from_str("newaccount").unwrap(),
+                        encode_action_data(
+                            vec![
+                                Box::new(Name::from_str("pulse").unwrap()),
+                                Box::new(Name::from_str("glenn2").unwrap()),
+                                Box::new(Authority::new(
+                                    1,
+                                    vec![
+                                        KeyWeight::new(
+                                            private_key.public_key(),
+                                            1,
+                                        ),
+                                    ],
+                                    vec![],
+                                )),
+                                Box::new(Authority::new(
+                                    1,
+                                    vec![
+                                        KeyWeight::new(
+                                            private_key.public_key(),
+                                            1,
+                                        ),
+                                    ],
+                                    vec![],
+                                )),
+                            ],
+                        ),
+                        vec![PermissionLevel::new(
+                            Name::from_str("pulse").unwrap(),
+                            Name::from_str("active").unwrap(),
+                        )],
+                    ),
+                ]
+            },
             signatures: vec![
                 Signature::new([0u8; 65]),
             ],
