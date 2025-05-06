@@ -1,10 +1,10 @@
 use std::{collections::HashSet, fmt, sync::Arc};
 
-use pulsevm_chainbase::Database;
+use pulsevm_chainbase::{Database, UndoSession};
 use pulsevm_serialization::Serialize;
 use tokio::sync::Mutex;
 
-use super::{Name, Permission, PermissionLevel, PublicKey, Signature, Transaction};
+use super::{permission::Permission, permission_level::PermissionLevel, PublicKey, Name, Transaction};
 
 pub enum AuthorityError {
     PermissionNotFound(Name, Name),
@@ -27,14 +27,14 @@ impl fmt::Debug for AuthorityError {
 }
 
 pub struct AuthorityChecker<'a> {
-    db: &'a Database,
+    session: &'a UndoSession<'a>,
     satisfied_authorities: HashSet<PermissionLevel>,
     provided_keys: HashSet<PublicKey>,
     used_keys: HashSet<PublicKey>,
 }
 
 impl<'a> AuthorityChecker<'a> {
-    pub fn new(tx: &Transaction, db: &'a Database) -> Result<Self, AuthorityError> {
+    pub fn new(tx: &Transaction, session: &'a UndoSession) -> Result<Self, AuthorityError> {
         let mut provided_keys: HashSet<PublicKey> = HashSet::new();
         let mut tx_data: Vec<u8> = Vec::new();
         tx.unsigned_tx.serialize(&mut tx_data);
@@ -42,7 +42,7 @@ impl<'a> AuthorityChecker<'a> {
             let public_key = signature.recover_public_key(&tx_data).map_err(|e| AuthorityError::SignatureRecoverError(format!("{}", e)))?;
             provided_keys.insert(public_key);
         }
-        Ok(Self { db, satisfied_authorities: HashSet::new(), provided_keys, used_keys: HashSet::new() })
+        Ok(Self { session, satisfied_authorities: HashSet::new(), provided_keys, used_keys: HashSet::new() })
     }
 
     fn satisfies_permission_level(&mut self, level: &PermissionLevel, depth: u16) -> Result<(), AuthorityError> {
@@ -53,7 +53,7 @@ impl<'a> AuthorityChecker<'a> {
             return Ok(());
         }
         //let db_clone = self.db.clone();
-        let permission: Option<Permission> = self.db.find_by_primary((level.actor(), level.permission())).map_err(|_| AuthorityError::InternalError)?;
+        let permission: Option<Permission> = self.session.find_by_primary((level.actor(), level.permission())).map_err(|_| AuthorityError::InternalError)?;
         if permission.is_none() {
             return Err(AuthorityError::PermissionNotFound(level.actor().clone(), level.permission().clone()));
         }
@@ -92,7 +92,7 @@ impl<'a> AuthorityChecker<'a> {
 mod tests {
     use std::path::Path;
 
-    use crate::chain::{name, Authority, Id, KeyWeight, Transaction};
+    use crate::chain::{authority::authority::Authority, key_weight::KeyWeight, name, Id};
 
     use super::*;
     use pulsevm_chainbase::Database;
@@ -118,13 +118,12 @@ mod tests {
             ], vec![]),
         );
         undo_session.insert(&owner_permission).unwrap();
-        undo_session.commit();
         let data = "0000e19b30bc0bfabfab01c9260469fab7529ae88987b2eb337dac5650305226b38e00000001aea38500000000009ab864229a9e40000000006eaea385000000000064553988000000000000000100000001027f4dbe05a88d4c3974cec8d03f192c96a9813ea4d60811c4e68a2d459842497c0001000000000000000100000001027f4dbe05a88d4c3974cec8d03f192c96a9813ea4d60811c4e68a2d459842497c00010000000000000001aea38500000000003232eda80000000000000001ada3bd9c65952513b98753bcc582cf368fb8bf8432e3e0389498a248756b209a0eb4e0846a1f85cad63fd2203cb1577514a902a54ae718a33552bb782fe11c960178ed5cd2";
         let tx_data = hex::decode(data).unwrap();
         let tx = Transaction::deserialize(&tx_data, &mut 0).unwrap();
 
         // Create an AuthorityChecker instance
-        let mut checker = AuthorityChecker::new(&tx, &db).unwrap();
+        let mut checker = AuthorityChecker::new(&tx, &undo_session).unwrap();
 
         // Test satisfies_permission_level
         let level = PermissionLevel::new(name!("test").into(), name!("test").into());

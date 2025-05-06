@@ -1,8 +1,9 @@
+mod apply_context;
+
 mod authority;
 pub use authority::*;
 
 mod authority_checker;
-pub use authority_checker::*;
 
 mod block;
 
@@ -16,7 +17,7 @@ mod name;
 pub use name::Name;
 
 mod transaction;
-pub use transaction::Transaction;
+pub use transaction::*;
 
 mod controller;
 pub use controller::Controller;
@@ -29,3 +30,6 @@ pub use service::*;
 
 mod secp256k1;
 pub use secp256k1::*;
+
+mod transaction_context;
+pub use transaction_context::TransactionContext;

@@ -1,13 +1,13 @@
 mod chain;
 mod mempool;
 
-use std::{mem, net::{SocketAddr, TcpListener}, os::unix::net, process, sync::{Arc}};
-use chain::{Id, NodeId};
+use std::{net::{SocketAddr, TcpListener}, sync::Arc};
+use chain::{Controller, Id, NodeId};
 use jsonrpsee::server::middleware::rpc::{self, rpc_service};
 use pulsevm_grpc::{http::{self, http_server::{Http, HttpServer}, Element}, vm::{self, runtime::{runtime_client::RuntimeClient, InitializeRequest}, vm_server::{Vm, VmServer}, Handler, ParseBlockResponse}};
 use spdlog::info;
 use tonic::{transport::Server, Request, Response, Status};
-use tokio::{net::TcpListener as TokioTcpListener, signal, sync::Mutex};
+use tokio::{net::TcpListener as TokioTcpListener, signal, sync::{Mutex, RwLock}};
 use tonic::transport::server::TcpIncoming;
 
 const PLUGIN_VERSION: u32 = 38;
@@ -73,17 +73,17 @@ async fn start_runtime_service(incoming: TcpIncoming, server_addr: SocketAddr) -
 #[derive(Clone)]
 pub struct VirtualMachine {
     server_addr: SocketAddr,
-    controller: Arc<Mutex<chain::Controller>>,
+    controller: Arc<RwLock<Controller>>,
     mempool: Arc<Mutex<mempool::Mempool>>,
-    network_manager: Arc<Mutex<chain::NetworkManager>>,
+    network_manager: Arc<RwLock<chain::NetworkManager>>,
     rpc_service: chain::RpcService,
 }
 
 impl VirtualMachine {
     pub fn new(server_addr: SocketAddr) -> Result<Self, Box<dyn std::error::Error>> {
-        let controller = Arc::new(Mutex::new(chain::Controller::new()));
+        let controller = Arc::new(RwLock::new(Controller::new()));
         let mempool = Arc::new(Mutex::new(mempool::Mempool::new()));
-        let network_manager = Arc::new(Mutex::new(chain::NetworkManager::new()));
+        let network_manager = Arc::new(RwLock::new(chain::NetworkManager::new()));
         let rpc_service = chain::RpcService::new(mempool.clone());
 
         Ok(Self {
@@ -99,8 +99,8 @@ impl VirtualMachine {
 #[tonic::async_trait]
 impl Vm for VirtualMachine {
     async fn initialize(&self, request: Request<vm::InitializeRequest>) -> Result<tonic::Response<vm::InitializeResponse>, Status> {
-        let controller_clone = Arc::clone(&self.controller);
-        let mut controller = controller_clone.lock().await;
+        let controller = self.controller.clone();
+        let mut controller = controller.write().await;
 
         // Initialize the controller with the genesis bytes
         controller.initialize(&request.get_ref().genesis_bytes, request.get_ref().chain_data_dir.clone())
@@ -116,8 +116,8 @@ impl Vm for VirtualMachine {
     }
 
     async fn set_state(&self, _request: Request<vm::SetStateRequest>) -> Result<tonic::Response<vm::SetStateResponse>, Status> {
-        let controller_clone = Arc::clone(&self.controller);
-        let controller = controller_clone.lock().await;
+        let controller = self.controller.clone();
+        let controller = controller.read().await;
 
         return Ok(Response::new(vm::SetStateResponse{
             last_accepted_id: controller.last_accepted_block().id().as_bytes().to_vec(),
@@ -144,8 +144,8 @@ impl Vm for VirtualMachine {
     }
 
     async fn connected(&self, request: Request<vm::ConnectedRequest>) -> Result<tonic::Response<()>, Status> {
-        let network_manager_clone = Arc::clone(&self.network_manager);
-        let mut network_manager = network_manager_clone.lock().await;
+        let network_manager = Arc::clone(&self.network_manager);
+        let mut network_manager = network_manager.write().await;
         let node_id: NodeId = request.get_ref().node_id.clone().try_into()
             .map_err(|_| Status::invalid_argument("invalid node id"))?;
         network_manager.connected(node_id);
@@ -153,8 +153,8 @@ impl Vm for VirtualMachine {
     }
 
     async fn disconnected(&self, request: Request<vm::DisconnectedRequest>) -> Result<tonic::Response<()>, Status> {
-        let network_manager_clone = Arc::clone(&self.network_manager);
-        let mut network_manager = network_manager_clone.lock().await;
+        let network_manager = Arc::clone(&self.network_manager);
+        let mut network_manager = network_manager.write().await;
         let node_id: NodeId = request.get_ref().node_id.clone().try_into()
             .map_err(|_| Status::invalid_argument("invalid node id"))?;
         network_manager.disconnected(node_id);
@@ -167,8 +167,8 @@ impl Vm for VirtualMachine {
     }
 
     async fn parse_block(&self, request: Request<vm::ParseBlockRequest>) -> Result<tonic::Response<vm::ParseBlockResponse>, Status> {
-        let controller_clone = Arc::clone(&self.controller);
-        let controller = controller_clone.lock().await;
+        let controller = self.controller.clone();
+        let controller = controller.read().await;
         let block = controller.parse_block(&request.get_ref().bytes)
             .map_err(|_| Status::internal("could not parse block"))?;
         Ok(Response::new(vm::ParseBlockResponse{
@@ -181,8 +181,8 @@ impl Vm for VirtualMachine {
     }
 
     async fn get_block(&self, request: Request<vm::GetBlockRequest>) -> Result<tonic::Response<vm::GetBlockResponse>, Status> {
-        let controller_clone = Arc::clone(&self.controller);
-        let controller = controller_clone.lock().await;
+        let controller = self.controller.clone();
+        let controller = controller.read().await;
         let block_id: Id = request.get_ref().id.clone().try_into()
             .map_err(|_| Status::invalid_argument("invalid block id"))?;
         let block = controller.get_block(block_id)
@@ -212,8 +212,8 @@ impl Vm for VirtualMachine {
     }
 
     async fn set_preference(&self, request: Request<vm::SetPreferenceRequest>) -> Result<tonic::Response<()>, Status> {
-        let controller_clone = Arc::clone(&self.controller);
-        let mut controller = controller_clone.lock().await;
+        let controller = self.controller.clone();
+        let mut controller = controller.write().await;
         let preferred_id: Id = request.get_ref().id.clone().try_into()
             .map_err(|_| Status::invalid_argument("invalid block id"))?;
         controller.set_preferred_id(preferred_id);
@@ -261,8 +261,8 @@ impl Vm for VirtualMachine {
     }
 
     async fn batched_parse_block(&self, request: Request<vm::BatchedParseBlockRequest>) -> Result<tonic::Response<vm::BatchedParseBlockResponse>, Status> {
-        let controller_clone = Arc::clone(&self.controller);
-        let controller = controller_clone.lock().await;
+        let controller = self.controller.clone();
+        let controller = controller.read().await;
         let mut parsed_blocks: Vec<ParseBlockResponse> = Vec::new();
         for block in request.get_ref().request.iter() {
             let block = controller.parse_block(&block)
@@ -281,8 +281,8 @@ impl Vm for VirtualMachine {
     }
 
     async fn get_block_id_at_height(&self, request: Request<vm::GetBlockIdAtHeightRequest>) -> Result<tonic::Response<vm::GetBlockIdAtHeightResponse>, Status> {
-        let controller_clone = Arc::clone(&self.controller);
-        let controller = controller_clone.lock().await;
+        let controller = self.controller.clone();
+        let controller = controller.read().await;
         let block = controller.get_block_by_height(request.get_ref().height)
             .map_err(|_| Status::internal("could not get block by height"))?;
 

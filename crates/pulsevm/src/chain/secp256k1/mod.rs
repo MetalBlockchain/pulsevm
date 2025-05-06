@@ -1,8 +1,9 @@
 mod private_key;
-pub use private_key::PrivateKey;
-
 mod public_key;
-pub use public_key::PublicKey;
-
 mod signature;
-pub use signature::Signature;
+
+pub use {
+    private_key::PrivateKey,
+    public_key::PublicKey,
+    signature::{Signature, SignatureError},
+};

@@ -3,7 +3,7 @@ use std::path::Path;
 
 use pulsevm_chainbase::Database;
 use pulsevm_serialization::Deserialize;
-use super::{block::{Block, BlockByHeightIndex}, Genesis, Id, Transaction};
+use super::{block::{Block, BlockByHeightIndex}, transaction::Transaction, Genesis, Id, TransactionContext};
 
 pub struct Controller {
     last_accepted_block: Block,
@@ -63,7 +63,7 @@ impl Controller {
     }
 
     pub fn execute_transaction(&mut self, transaction: &Transaction) -> Result<(), ControllerError> {
-        // Verify authority
+        let trx_context = TransactionContext::new(transaction);
         Ok(())
     }
 

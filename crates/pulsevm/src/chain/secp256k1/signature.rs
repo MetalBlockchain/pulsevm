@@ -4,7 +4,7 @@ use pulsevm_serialization::{Deserialize, Serialize};
 use secp256k1::ecdsa::{RecoverableSignature, RecoveryId};
 use sha2::Digest;
 
-use super::PublicKey;
+use super::public_key::PublicKey;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SignatureError {

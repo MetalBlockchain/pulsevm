@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use super::PublicKey;
+use super::public_key::PublicKey;
 
 pub struct PrivateKey(secp256k1::SecretKey);
 

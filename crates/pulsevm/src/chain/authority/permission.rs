@@ -3,7 +3,7 @@ use pulsevm_serialization::{Deserialize, Serialize};
 
 use crate::chain::{Id, Name};
 
-use super::Authority;
+use super::authority::Authority;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct Permission {

@@ -1,6 +1,6 @@
 use pulsevm_serialization::{Deserialize, Serialize};
 
-use super::{KeyWeight, PermissionLevelWeight};
+use super::{key_weight::KeyWeight, permission_level_weight::PermissionLevelWeight};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct Authority {

@@ -1,6 +1,6 @@
 use pulsevm_serialization::{Deserialize, Serialize};
 
-use super::PermissionLevel;
+use super::permission_level::PermissionLevel;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct PermissionLevelWeight {
