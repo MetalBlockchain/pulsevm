@@ -1,7 +1,6 @@
 mod apply_context;
 
 mod authority;
-pub use authority::*;
 
 mod authority_checker;
 

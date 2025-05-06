@@ -84,7 +84,7 @@ impl VirtualMachine {
         let controller = Arc::new(RwLock::new(Controller::new()));
         let mempool = Arc::new(Mutex::new(mempool::Mempool::new()));
         let network_manager = Arc::new(RwLock::new(chain::NetworkManager::new()));
-        let rpc_service = chain::RpcService::new(mempool.clone());
+        let rpc_service = chain::RpcService::new(mempool.clone(), controller.clone());
 
         Ok(Self {
             server_addr,

@@ -1,6 +1,6 @@
 use pulsevm_serialization::{Deserialize, Serialize};
 
-use crate::chain::{permission_level::PermissionLevel, Name};
+use crate::chain::{authority::PermissionLevel, Name};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Action {

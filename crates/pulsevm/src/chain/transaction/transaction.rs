@@ -11,6 +11,14 @@ pub struct Transaction {
     pub signatures: Vec<Signature>, // Signatures of the transaction
 }
 
+impl Transaction {
+    pub fn id(&self) -> Id {
+        let mut bytes: Vec<u8> = Vec::new();
+        self.serialize(&mut bytes);
+        Id::from_sha256(&bytes)
+    }
+}
+
 impl Serialize for Transaction {
     fn serialize(
         &self,
@@ -76,7 +84,7 @@ mod tests {
 
     use pulsevm_serialization::{Deserialize, Serialize};
 
-    use crate::chain::{authority::authority::Authority, key_weight::KeyWeight, permission_level::PermissionLevel, PrivateKey, Signature, transaction::transaction::{encode_action_data, UnsignedTransaction}, Id, Name};
+    use crate::chain::{authority::Authority, authority::KeyWeight, authority::PermissionLevel, PrivateKey, Signature, transaction::transaction::{encode_action_data, UnsignedTransaction}, Id, Name};
 
     use super::{Action, Transaction};
 

@@ -66,9 +66,7 @@ impl Block {
 
     pub fn id(&self) -> Id {
         let serialized = serialize(self);
-        let mut buf = [0u8; 32];
-        buf.copy_from_slice(sha2::Sha256::digest(&serialized).as_slice());
-        Id(buf)
+        Id::from_sha256(&serialized)
     }
 
     pub fn bytes(&self) -> Vec<u8> {

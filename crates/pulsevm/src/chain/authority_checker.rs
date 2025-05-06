@@ -4,7 +4,7 @@ use pulsevm_chainbase::{Database, UndoSession};
 use pulsevm_serialization::Serialize;
 use tokio::sync::Mutex;
 
-use super::{permission::Permission, permission_level::PermissionLevel, PublicKey, Name, Transaction};
+use super::{authority::Permission, authority::PermissionLevel, PublicKey, Name, Transaction};
 
 pub enum AuthorityError {
     PermissionNotFound(Name, Name),
@@ -92,7 +92,7 @@ impl<'a> AuthorityChecker<'a> {
 mod tests {
     use std::path::Path;
 
-    use crate::chain::{authority::authority::Authority, key_weight::KeyWeight, name, Id};
+    use crate::chain::{authority::Authority, authority::KeyWeight, name, Id};
 
     use super::*;
     use pulsevm_chainbase::Database;

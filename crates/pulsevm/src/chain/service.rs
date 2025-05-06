@@ -2,28 +2,31 @@ use std::sync::Arc;
 
 use jsonrpsee::{proc_macros::rpc, server::{http::{self, call_with_service}, BatchRequestConfig}, types::{ErrorObjectOwned, Response, ResponseSuccess}, RpcModule};
 use pulsevm_serialization::Deserialize;
-use tokio::sync::Mutex;
+use serde::Serialize;
+use tokio::sync::{Mutex, RwLock};
 use tonic::async_trait;
 
 use crate::mempool::Mempool;
 
-use super::Transaction;
+use super::{Controller, Transaction};
 
 #[rpc(server)]
 pub trait Rpc {
 	#[method(name = "pulsevm.issueTx")]
-	async fn issue_tx(&self, tx: &str, encoding: &str) -> Result<String, ErrorObjectOwned>;
+	async fn issue_tx(&self, tx: &str, encoding: &str) -> Result<IssueTxResponse, ErrorObjectOwned>;
 }
 
 #[derive(Clone)]
 pub struct RpcService {
     mempool: Arc<Mutex<Mempool>>,
+    controller: Arc<RwLock<Controller>>,
 }
 
 impl RpcService {
-    pub fn new(mempool: Arc<Mutex<Mempool>>) -> Self {
+    pub fn new(mempool: Arc<Mutex<Mempool>>, controller: Arc<RwLock<Controller>>) -> Self {
         RpcService {
             mempool,
+            controller,
         }
     }
 
@@ -40,11 +43,16 @@ impl RpcService {
     }
 }
 
+#[derive(Serialize, Clone)]
+pub struct IssueTxResponse {
+    #[serde(rename(serialize = "txID"))]
+    pub tx_id: String,
+}
+
 #[async_trait]
 impl RpcServer for RpcService {
-    async fn issue_tx(&self, tx: &str, encoding: &str) -> Result<String, ErrorObjectOwned> {
-        let tx_hex = tx.clone();
-        let tx_bytes = hex::decode(tx.strip_prefix("0x").unwrap_or(tx)).map_err(|_| {
+    async fn issue_tx(&self, tx_hex: &str, encoding: &str) -> Result<IssueTxResponse, ErrorObjectOwned> {
+        let tx_bytes = hex::decode(tx_hex.strip_prefix("0x").unwrap_or(tx_hex)).map_err(|_| {
             ErrorObjectOwned::owned(
                 400,
                 "decode_error",
@@ -60,12 +68,25 @@ impl RpcServer for RpcService {
             )
         })?;
 
+        // Run transaction and revert it
+        let controller = self.controller.clone();
+        let mut controller = controller.write().await;
+        controller.execute_transaction(&tx).map_err(|_| {
+            ErrorObjectOwned::owned(
+                500,
+                "transaction_error",
+                Some("Transaction execution failed".to_string()),
+            )
+        })?;
+
         // Add to mempool
         let mempool_clone = self.mempool.clone();
         let mut mempool = mempool_clone.lock().await;
         mempool.add_transaction(tx.clone());
 
         // Return a simple response
-        Ok(tx_hex.to_string())
+        Ok(IssueTxResponse {
+            tx_id: tx.id().to_string(),
+        })
     }
 }
