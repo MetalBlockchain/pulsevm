@@ -1,7 +1,7 @@
 use core::{fmt, str};
 use std::str::FromStr;
 
-use pulsevm_name::{name_from_bytes, name_to_bytes, ParseNameError};
+use pulsevm_name::{ParseNameError, name_from_bytes, name_to_bytes};
 use pulsevm_serialization::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]

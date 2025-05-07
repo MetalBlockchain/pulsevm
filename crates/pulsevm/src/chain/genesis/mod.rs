@@ -1,8 +1,8 @@
-use core::str;
-use std::{error::Error, fmt};
 use chrono::{DateTime, Utc};
+use core::str;
 use secp256k1::PublicKey;
 use serde::{Deserialize, Serialize};
+use std::{error::Error, fmt};
 
 use super::block::BlockTimestamp;
 
@@ -30,8 +30,10 @@ impl fmt::Display for GenesisError {
 
 impl Genesis {
     pub fn parse(bytes: &Vec<u8>) -> Result<Self, GenesisError> {
-        let genesis = str::from_utf8(bytes).map_err(|_| GenesisError::InvalidFormat("Invalid UTF-8".to_string()))?;
-        let genesis: Genesis = serde_json::from_str(genesis).map_err(|_| GenesisError::InvalidFormat("Failed to parse JSON".to_string()))?;
+        let genesis = str::from_utf8(bytes)
+            .map_err(|_| GenesisError::InvalidFormat("Invalid UTF-8".to_string()))?;
+        let genesis: Genesis = serde_json::from_str(genesis)
+            .map_err(|_| GenesisError::InvalidFormat("Failed to parse JSON".to_string()))?;
         Ok(genesis)
     }
 
@@ -47,7 +49,9 @@ impl Genesis {
     }
 
     pub fn initial_timestamp(&self) -> Result<BlockTimestamp, GenesisError> {
-        let timestamp = self.initial_timestamp.parse::<DateTime<Utc>>()
+        let timestamp = self
+            .initial_timestamp
+            .parse::<DateTime<Utc>>()
             .map_err(|_| GenesisError::InvalidFormat("Invalid timestamp format".to_string()))?;
         Ok(timestamp.into())
     }

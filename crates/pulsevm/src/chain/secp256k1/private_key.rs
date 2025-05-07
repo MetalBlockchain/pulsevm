@@ -39,7 +39,10 @@ impl FromStr for PrivateKey {
     type Err = PrivateKeyError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let value = bs58::decode(s).as_cb58(None).into_vec().map_err(|_| PrivateKeyError::InvalidFormat)?;
+        let value = bs58::decode(s)
+            .as_cb58(None)
+            .into_vec()
+            .map_err(|_| PrivateKeyError::InvalidFormat)?;
         if value.len() != 32 {
             return Err(PrivateKeyError::InvalidLength);
         }

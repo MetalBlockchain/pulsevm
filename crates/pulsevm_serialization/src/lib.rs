@@ -17,68 +17,47 @@ pub trait Serialize {
 }
 
 impl Serialize for bool {
-    fn serialize(
-        &self,
-        bytes: &mut Vec<u8>,
-    ) {
+    fn serialize(&self, bytes: &mut Vec<u8>) {
         (*self as u8).serialize(bytes);
     }
 }
 
 impl Serialize for u8 {
-    fn serialize(
-        &self,
-        bytes: &mut Vec<u8>,
-    ) {
+    fn serialize(&self, bytes: &mut Vec<u8>) {
         let value = self.to_be_bytes();
         bytes.extend_from_slice(&value);
     }
 }
 
 impl Serialize for u16 {
-    fn serialize(
-        &self,
-        bytes: &mut Vec<u8>,
-    ) {
+    fn serialize(&self, bytes: &mut Vec<u8>) {
         let value = self.to_be_bytes();
         bytes.extend_from_slice(&value);
     }
 }
 
 impl Serialize for u32 {
-    fn serialize(
-        &self,
-        bytes: &mut Vec<u8>,
-    ) {
+    fn serialize(&self, bytes: &mut Vec<u8>) {
         let value = self.to_be_bytes();
         bytes.extend_from_slice(&value);
     }
 }
 
 impl Serialize for u64 {
-    fn serialize(
-        &self,
-        bytes: &mut Vec<u8>,
-    ) {
+    fn serialize(&self, bytes: &mut Vec<u8>) {
         let value = self.to_be_bytes();
         bytes.extend_from_slice(&value);
     }
 }
 
 impl Serialize for i64 {
-    fn serialize(
-        &self,
-        bytes: &mut Vec<u8>,
-    ) {
+    fn serialize(&self, bytes: &mut Vec<u8>) {
         (*self as u64).serialize(bytes)
     }
 }
 
 impl Serialize for String {
-    fn serialize(
-        &self,
-        bytes: &mut Vec<u8>,
-    ) {
+    fn serialize(&self, bytes: &mut Vec<u8>) {
         let len = self.len() as u16;
         len.serialize(bytes);
         bytes.extend_from_slice(self.as_bytes());
@@ -86,10 +65,7 @@ impl Serialize for String {
 }
 
 impl<T: Serialize> Serialize for Vec<T> {
-    fn serialize(
-        &self,
-        bytes: &mut Vec<u8>,
-    ) {
+    fn serialize(&self, bytes: &mut Vec<u8>) {
         let length = self.len() as u32;
         length.serialize(bytes);
         for item in self {
@@ -98,9 +74,7 @@ impl<T: Serialize> Serialize for Vec<T> {
     }
 }
 
-pub fn serialize(
-    value: &impl Serialize,
-) -> Vec<u8> {
+pub fn serialize(value: &impl Serialize) -> Vec<u8> {
     let mut bytes = Vec::new();
     value.serialize(&mut bytes);
     bytes
@@ -114,10 +88,7 @@ pub enum ReadError {
 }
 
 impl fmt::Display for ReadError {
-    fn fmt(
-        &self,
-        f: &mut fmt::Formatter<'_>,
-    ) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ReadError::NotEnoughBytes(len, size) => {
                 write!(f, "Not enough bytes, pos {}, need {}", len, size)
@@ -165,7 +136,8 @@ impl Deserialize for u32 {
         if *pos + 4 > data.len() {
             return Err(ReadError::NotEnoughBytes(*pos, 4));
         }
-        let value = u32::from_be_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]);
+        let value =
+            u32::from_be_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]);
         *pos += 4;
         Ok(value)
     }
@@ -201,14 +173,14 @@ impl Deserialize for String {
     fn deserialize(data: &[u8], pos: &mut usize) -> Result<Self, ReadError> {
         // Read 2-byte length prefix (big endian)
         let len = u16::deserialize(data, pos).unwrap() as usize;
-    
+
         if *pos + len > data.len() {
             return Err(ReadError::NotEnoughBytes(*pos, len));
         }
-    
+
         let str_bytes = &data[*pos..*pos + len];
         *pos += len;
-    
+
         match str::from_utf8(str_bytes) {
             Ok(s) => Ok(s.to_string()), // Into<String> in most contexts, still OK
             Err(_) => Err(ReadError::ParseError),

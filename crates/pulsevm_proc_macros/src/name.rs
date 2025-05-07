@@ -2,8 +2,8 @@ use proc_macro2::{Literal, TokenStream};
 use pulsevm_name::name_from_bytes;
 use quote::{ToTokens, TokenStreamExt};
 use syn::{
-    parse::{Parse, ParseStream, Result as ParseResult},
     LitStr,
+    parse::{Parse, ParseStream, Result as ParseResult},
 };
 
 pub struct PulseName(u64);

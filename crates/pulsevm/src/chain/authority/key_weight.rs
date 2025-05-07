@@ -23,20 +23,14 @@ impl KeyWeight {
 }
 
 impl Serialize for KeyWeight {
-    fn serialize(
-        &self,
-        bytes: &mut Vec<u8>,
-    ) {
+    fn serialize(&self, bytes: &mut Vec<u8>) {
         self.key.serialize(bytes);
         self.weight.serialize(bytes);
     }
 }
 
 impl Deserialize for KeyWeight {
-    fn deserialize(
-        data: &[u8],
-        pos: &mut usize
-    ) -> Result<Self, pulsevm_serialization::ReadError> {
+    fn deserialize(data: &[u8], pos: &mut usize) -> Result<Self, pulsevm_serialization::ReadError> {
         let key = PublicKey::deserialize(data, pos)?;
         let weight = u16::deserialize(data, pos)?;
         Ok(KeyWeight { key, weight })

@@ -4,7 +4,7 @@ pub struct ActionTrace {
     action_ordinal: u32,
     creator_action_ordinal: u32,
     receiver: Name,
-    action: Action
+    action: Action,
 }
 
 impl ActionTrace {

@@ -18,7 +18,8 @@ impl NetworkManager {
     }
 
     pub fn connected(&mut self, node_id: NodeId) {
-        self.connected_nodes.insert(node_id, ConnectedNode { id: node_id });
+        self.connected_nodes
+            .insert(node_id, ConnectedNode { id: node_id });
     }
 
     pub fn disconnected(&mut self, node_id: NodeId) {

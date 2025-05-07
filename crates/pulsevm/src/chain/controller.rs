@@ -1,14 +1,20 @@
 use core::fmt;
 use std::path::Path;
 
-use pulsevm_chainbase::Database;
+use super::{
+    Genesis, Id, TransactionContext,
+    apply_context::ApplyContextError,
+    authority_checker::{self, AuthorityChecker},
+    block::{Block, BlockByHeightIndex},
+    transaction::Transaction,
+};
+use pulsevm_chainbase::{Database, UndoSession};
 use pulsevm_serialization::Deserialize;
-use super::{apply_context::ApplyContextError, block::{Block, BlockByHeightIndex}, transaction::Transaction, Genesis, Id, TransactionContext};
 
 pub struct Controller {
     last_accepted_block: Block,
     preferred_id: Id,
-    db: Option<Database>,
+    db: Database,
 }
 
 #[derive(Debug)]
@@ -26,16 +32,24 @@ impl fmt::Display for ControllerError {
 
 impl Controller {
     pub fn new() -> Self {
+        // Create a temporary database
+        let db = Database::temporary(Path::new("temp")).unwrap();
+
         Controller {
             last_accepted_block: Block::default(),
             preferred_id: Id::default(),
-            db: None,
+            db: db,
         }
     }
 
-    pub fn initialize(&mut self, genesis_bytes: &Vec<u8>, db_path: String) -> Result<(), ControllerError> {
-        self.db = Some(Database::new(Path::new(&db_path))
-            .map_err(|e| ControllerError::GenesisError(format!("Failed to open database: {}", e)))?);
+    pub fn initialize(
+        &mut self,
+        genesis_bytes: &Vec<u8>,
+        db_path: String,
+    ) -> Result<(), ControllerError> {
+        self.db = Database::new(Path::new(&db_path)).map_err(|e| {
+            ControllerError::GenesisError(format!("Failed to open database: {}", e))
+        })?;
         // Parse genesis bytes
         let genesis = Genesis::parse(genesis_bytes)
             .map_err(|e| ControllerError::GenesisError(format!("Failed to parse genesis: {}", e)))?
@@ -43,27 +57,51 @@ impl Controller {
             .map_err(|e| ControllerError::GenesisError(format!("Invalid genesis: {}", e)))?;
 
         // Set our last accepted block to the genesis block
-        self.last_accepted_block = Block::new(Id::default(), genesis.initial_timestamp().unwrap(), 0, Vec::new());
+        self.last_accepted_block = Block::new(
+            Id::default(),
+            genesis.initial_timestamp().unwrap(),
+            0,
+            Vec::new(),
+        );
 
         // Do we have the genesis block in our DB?
-        let db = self.db.as_ref().unwrap();
-        let genesis_block = db.find_by_secondary::<Block, BlockByHeightIndex>(self.last_accepted_block.height)
-            .map_err(|e| ControllerError::GenesisError(format!("Failed to find genesis block: {}", e)))?;
+        let genesis_block = self
+            .db
+            .find_by_secondary::<Block, BlockByHeightIndex>(self.last_accepted_block.height)
+            .map_err(|e| {
+                ControllerError::GenesisError(format!("Failed to find genesis block: {}", e))
+            })?;
 
         if genesis_block.is_none() {
             // If not, insert it
-            let mut session = db.undo_session()
-                .map_err(|e| ControllerError::GenesisError(format!("Failed to create undo session: {}", e)))?;
-            session.insert(&self.last_accepted_block)
-                .map_err(|e| ControllerError::GenesisError(format!("Failed to insert genesis block: {}", e)))?;
+            let mut session = self.db.undo_session().map_err(|e| {
+                ControllerError::GenesisError(format!("Failed to create undo session: {}", e))
+            })?;
+            session.insert(&self.last_accepted_block).map_err(|e| {
+                ControllerError::GenesisError(format!("Failed to insert genesis block: {}", e))
+            })?;
             session.commit();
         }
 
         Ok(())
     }
 
-    pub fn execute_transaction(&mut self, transaction: &Transaction) -> Result<(), ApplyContextError> {
-        let mut trx_context = TransactionContext::new(transaction);
+    pub fn try_transaction(&self, transaction: &Transaction) -> Result<(), ApplyContextError> {
+        // Execute the transaction
+        let undo_session = self.db.undo_session().unwrap();
+        self.execute_transaction(&undo_session, transaction)
+    }
+
+    pub fn execute_transaction(
+        &self,
+        undo_session: &UndoSession,
+        transaction: &Transaction,
+    ) -> Result<(), ApplyContextError> {
+        // Verify authority
+        let authority_checker = AuthorityChecker::new(transaction, undo_session)
+            .map_err(|e| ApplyContextError::AuthenticationError(format!("{}", e)))?;
+
+        let mut trx_context = TransactionContext::new(transaction, undo_session);
         trx_context.exec()?;
         Ok(())
     }
@@ -78,19 +116,22 @@ impl Controller {
         }
 
         // Query DB
-        let db = self.db.as_ref().unwrap();
-        let block = db.find_by_secondary::<Block, BlockByHeightIndex>(height)
-            .map_err(|e| ControllerError::GenesisError(format!("Failed to find block by height: {}", e)))?;
-        
+        let block = self
+            .db
+            .find_by_secondary::<Block, BlockByHeightIndex>(height)
+            .map_err(|e| {
+                ControllerError::GenesisError(format!("Failed to find block by height: {}", e))
+            })?;
+
         Ok(block)
     }
 
     pub fn get_block(&self, id: Id) -> Result<Option<Block>, ControllerError> {
         // Query DB
-        let db = self.db.as_ref().unwrap();
-        let block = db.find_by_primary::<Block>(id)
-            .map_err(|e| ControllerError::GenesisError(format!("Failed to find block by ID: {}", e)))?;
-        
+        let block = self.db.find_by_primary::<Block>(id).map_err(|e| {
+            ControllerError::GenesisError(format!("Failed to find block by ID: {}", e))
+        })?;
+
         Ok(block)
     }
 
@@ -114,7 +155,9 @@ mod tests {
     fn test_initialize() {
         let mut controller = Controller::new();
         let genesis_bytes = b"{\"initial_timestamp\": \"2023-01-01T00:00:00Z\", \"initial_key\": \"02c66e7d8966b5c555af5805989da9fbf8db95e15631ce358c3a1710c962679063\"}".to_vec();
-        controller.initialize(&genesis_bytes, "database".to_owned()).unwrap();
+        controller
+            .initialize(&genesis_bytes, "database".to_owned())
+            .unwrap();
         assert_eq!(controller.last_accepted_block().height, 0);
     }
 }

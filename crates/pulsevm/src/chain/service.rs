@@ -1,6 +1,14 @@
 use std::sync::Arc;
 
-use jsonrpsee::{proc_macros::rpc, server::{http::{self, call_with_service}, BatchRequestConfig}, types::{ErrorObjectOwned, Response, ResponseSuccess}, RpcModule};
+use jsonrpsee::{
+    RpcModule,
+    proc_macros::rpc,
+    server::{
+        BatchRequestConfig,
+        http::{self, call_with_service},
+    },
+    types::{ErrorObjectOwned, Response, ResponseSuccess},
+};
 use pulsevm_serialization::Deserialize;
 use serde::Serialize;
 use tokio::sync::{Mutex, RwLock};
@@ -12,8 +20,9 @@ use super::{Controller, Transaction};
 
 #[rpc(server)]
 pub trait Rpc {
-	#[method(name = "pulsevm.issueTx")]
-	async fn issue_tx(&self, tx: &str, encoding: &str) -> Result<IssueTxResponse, ErrorObjectOwned>;
+    #[method(name = "pulsevm.issueTx")]
+    async fn issue_tx(&self, tx: &str, encoding: &str)
+    -> Result<IssueTxResponse, ErrorObjectOwned>;
 }
 
 #[derive(Clone)]
@@ -30,15 +39,18 @@ impl RpcService {
         }
     }
 
-    pub async fn handle_api_request(&self, request_body: &str) -> Result<String, serde_json::Error> {
+    pub async fn handle_api_request(
+        &self,
+        request_body: &str,
+    ) -> Result<String, serde_json::Error> {
         println!("Received request: {}", request_body);
         // Make sure `RpcService` implements your API trait
         let module = self.clone().into_rpc();
-    
+
         // Run the request and return the response
         let (resp, mut _stream) = module.raw_json_request(request_body, 1).await?;
         //let resp: ResponseSuccess<u64> = serde_json::from_str::<Response<u64>>(&resp).unwrap().try_into().unwrap();
-    
+
         Ok(resp)
     }
 }
@@ -51,7 +63,11 @@ pub struct IssueTxResponse {
 
 #[async_trait]
 impl RpcServer for RpcService {
-    async fn issue_tx(&self, tx_hex: &str, encoding: &str) -> Result<IssueTxResponse, ErrorObjectOwned> {
+    async fn issue_tx(
+        &self,
+        tx_hex: &str,
+        encoding: &str,
+    ) -> Result<IssueTxResponse, ErrorObjectOwned> {
         let tx_bytes = hex::decode(tx_hex.strip_prefix("0x").unwrap_or(tx_hex)).map_err(|_| {
             ErrorObjectOwned::owned(
                 400,
@@ -70,8 +86,8 @@ impl RpcServer for RpcService {
 
         // Run transaction and revert it
         let controller = self.controller.clone();
-        let mut controller = controller.write().await;
-        controller.execute_transaction(&tx).map_err(|_| {
+        let controller = controller.read().await;
+        controller.try_transaction(&tx).map_err(|_| {
             ErrorObjectOwned::owned(
                 500,
                 "transaction_error",

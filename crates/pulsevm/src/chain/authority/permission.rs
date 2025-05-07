@@ -15,14 +15,14 @@ pub struct Permission {
 }
 
 impl Permission {
-    pub fn new(
-        id: Id,
-        parent_id: Id,
-        owner: Name,
-        name: Name,
-        authority: Authority,
-    ) -> Self {
-        Permission { id, parent_id, owner, name, authority }
+    pub fn new(id: Id, parent_id: Id, owner: Name, name: Name, authority: Authority) -> Self {
+        Permission {
+            id,
+            parent_id,
+            owner,
+            name,
+            authority,
+        }
     }
 
     pub fn id(&self) -> &Id {
@@ -35,10 +35,7 @@ impl Permission {
 }
 
 impl Serialize for Permission {
-    fn serialize(
-        &self,
-        bytes: &mut Vec<u8>,
-    ) {
+    fn serialize(&self, bytes: &mut Vec<u8>) {
         self.id.serialize(bytes);
         self.parent_id.serialize(bytes);
         self.owner.serialize(bytes);
@@ -48,16 +45,19 @@ impl Serialize for Permission {
 }
 
 impl Deserialize for Permission {
-    fn deserialize(
-        data: &[u8],
-        pos: &mut usize
-    ) -> Result<Self, pulsevm_serialization::ReadError> {
+    fn deserialize(data: &[u8], pos: &mut usize) -> Result<Self, pulsevm_serialization::ReadError> {
         let id = Id::deserialize(data, pos)?;
         let parent_id = Id::deserialize(data, pos)?;
         let owner = Name::deserialize(data, pos)?;
         let name = Name::deserialize(data, pos)?;
         let authority = Authority::deserialize(data, pos)?;
-        Ok(Permission { id, parent_id, owner, name, authority })
+        Ok(Permission {
+            id,
+            parent_id,
+            owner,
+            name,
+            authority,
+        })
     }
 }
 

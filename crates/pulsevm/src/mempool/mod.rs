@@ -1,6 +1,6 @@
-use std::{collections::VecDeque};
+use std::collections::VecDeque;
 
-use tokio::sync::mpsc::{self, error::SendError, Receiver, Sender};
+use tokio::sync::mpsc::{self, Receiver, Sender, error::SendError};
 
 use crate::chain::Transaction;
 

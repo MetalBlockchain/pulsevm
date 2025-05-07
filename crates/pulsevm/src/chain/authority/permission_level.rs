@@ -24,20 +24,14 @@ impl PermissionLevel {
 }
 
 impl Serialize for PermissionLevel {
-    fn serialize(
-        &self,
-        bytes: &mut Vec<u8>,
-    ) {
+    fn serialize(&self, bytes: &mut Vec<u8>) {
         self.actor.serialize(bytes);
         self.permission.serialize(bytes);
     }
 }
 
 impl Deserialize for PermissionLevel {
-    fn deserialize(
-        data: &[u8],
-        pos: &mut usize
-    ) -> Result<Self, pulsevm_serialization::ReadError> {
+    fn deserialize(data: &[u8], pos: &mut usize) -> Result<Self, pulsevm_serialization::ReadError> {
         let actor = Name::deserialize(data, pos)?;
         let permission = Name::deserialize(data, pos)?;
         Ok(PermissionLevel { actor, permission })
@@ -46,7 +40,7 @@ impl Deserialize for PermissionLevel {
 
 impl<'a> ChainbaseObject<'a> for PermissionLevel {
     type PrimaryKey = (Name, Name);
-    
+
     fn primary_key(&self) -> Vec<u8> {
         PermissionLevel::primary_key_as_bytes((self.actor, self.permission))
     }

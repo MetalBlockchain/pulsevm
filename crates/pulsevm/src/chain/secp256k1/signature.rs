@@ -43,7 +43,8 @@ impl Signature {
         let rec_sig = RecoverableSignature::from_compact(&self.0[0..64], rec_id)
             .map_err(|e| SignatureError::InternalError(format!("{}", e)))?;
         let msg = secp256k1::Message::from_digest(digest_data);
-        let pub_key = rec_sig.recover(&msg)
+        let pub_key = rec_sig
+            .recover(&msg)
             .map_err(|_| SignatureError::InvalidSignature)?;
         println!("Recovered public key: {:?}", pub_key);
         Ok(PublicKey(pub_key))
@@ -51,19 +52,13 @@ impl Signature {
 }
 
 impl Serialize for Signature {
-    fn serialize(
-        &self,
-        bytes: &mut Vec<u8>,
-    ) {
+    fn serialize(&self, bytes: &mut Vec<u8>) {
         bytes.extend_from_slice(&self.0);
     }
 }
 
 impl Deserialize for Signature {
-    fn deserialize(
-        data: &[u8],
-        pos: &mut usize
-    ) -> Result<Self, pulsevm_serialization::ReadError> {
+    fn deserialize(data: &[u8], pos: &mut usize) -> Result<Self, pulsevm_serialization::ReadError> {
         if *pos + 65 > data.len() {
             return Err(pulsevm_serialization::ReadError::NotEnoughBytes(*pos, 65));
         }

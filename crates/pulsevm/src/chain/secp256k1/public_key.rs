@@ -19,19 +19,13 @@ impl PublicKey {
 }
 
 impl Serialize for PublicKey {
-    fn serialize(
-        &self,
-        bytes: &mut Vec<u8>,
-    ) {
+    fn serialize(&self, bytes: &mut Vec<u8>) {
         bytes.extend_from_slice(self.0.serialize().as_ref());
     }
 }
 
 impl Deserialize for PublicKey {
-    fn deserialize(
-        data: &[u8],
-        pos: &mut usize
-    ) -> Result<Self, pulsevm_serialization::ReadError> {
+    fn deserialize(data: &[u8], pos: &mut usize) -> Result<Self, pulsevm_serialization::ReadError> {
         if *pos + 33 > data.len() {
             return Err(pulsevm_serialization::ReadError::NotEnoughBytes(*pos, 33));
         }
@@ -47,7 +41,8 @@ impl Deserialize for PublicKey {
 impl Default for PublicKey {
     fn default() -> Self {
         let secp = Secp256k1::new();
-        let secret_key = SecretKey::from_byte_array(&[0xcd; 32]).expect("32 bytes, within curve order");
+        let secret_key =
+            SecretKey::from_byte_array(&[0xcd; 32]).expect("32 bytes, within curve order");
         let public_key = Secp256k1PublicKey::from_secret_key(&secp, &secret_key);
         PublicKey(public_key)
     }
