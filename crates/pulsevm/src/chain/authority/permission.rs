@@ -1,4 +1,4 @@
-use pulsevm_chainbase::{ChainbaseObject, SecondaryKey};
+use pulsevm_chainbase::{ChainbaseObject, SecondaryIndex, SecondaryKey, UndoSession};
 use pulsevm_serialization::{Deserialize, Serialize};
 
 use crate::chain::{Id, Name};
@@ -32,6 +32,37 @@ impl Permission {
     pub fn parent_id(&self) -> &Id {
         &self.parent_id
     }
+
+    pub fn satisfies(
+        &self,
+        other: &Permission,
+        session: &UndoSession,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        // If the owners are not the same, this permission cannot satisfy other
+        if self.owner != other.owner {
+            return Ok(false);
+        }
+
+        // If this permission matches other, or is the immediate parent of other, then this permission satisfies other
+        if self.id == other.id || self.id == other.parent_id {
+            return Ok(true);
+        }
+
+        // Walk up other's parent tree, seeing if we find this permission. If so, this permission satisfies other
+        let mut parent = session.find::<Permission>(other.parent_id)?;
+        while parent.is_some() {
+            let parent_obj = parent.unwrap();
+            if self.id == parent_obj.parent_id {
+                return Ok(true);
+            } else if parent_obj.id == Id::zero() {
+                return Ok(false);
+            }
+            parent = session.find::<Permission>(parent_obj.parent_id)?;
+        }
+
+        // This permission is not a parent of other, and so does not satisfy other
+        Ok(false)
+    }
 }
 
 impl Serialize for Permission {
@@ -62,17 +93,14 @@ impl Deserialize for Permission {
 }
 
 impl<'a> ChainbaseObject<'a> for Permission {
-    type PrimaryKey = (&'a Name, &'a Name);
+    type PrimaryKey = Id;
 
     fn primary_key(&self) -> Vec<u8> {
-        Permission::primary_key_as_bytes((&self.owner, &self.name))
+        Permission::primary_key_as_bytes(self.id)
     }
 
     fn primary_key_as_bytes(key: Self::PrimaryKey) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        key.0.serialize(&mut bytes);
-        key.1.serialize(&mut bytes);
-        bytes
+        key.0.to_vec()
     }
 
     fn table_name() -> &'static str {
@@ -80,6 +108,31 @@ impl<'a> ChainbaseObject<'a> for Permission {
     }
 
     fn secondary_indexes(&self) -> Vec<SecondaryKey> {
-        vec![]
+        vec![SecondaryKey {
+            key: PermissionByOwnerIndex::secondary_key_as_bytes((self.owner, self.name)),
+            index_name: PermissionByOwnerIndex::index_name(),
+        }]
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct PermissionByOwnerIndex;
+
+impl<'a> SecondaryIndex<'a, Permission> for PermissionByOwnerIndex {
+    type Key = (Name, Name);
+
+    fn secondary_key(&self, object: &Permission) -> Vec<u8> {
+        PermissionByOwnerIndex::secondary_key_as_bytes((object.owner, object.name))
+    }
+
+    fn secondary_key_as_bytes(key: Self::Key) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        key.0.serialize(&mut bytes);
+        key.1.serialize(&mut bytes);
+        bytes
+    }
+
+    fn index_name() -> &'static str {
+        "permission_by_owner"
     }
 }

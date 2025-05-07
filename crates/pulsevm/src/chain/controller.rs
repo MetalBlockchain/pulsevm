@@ -128,7 +128,7 @@ impl Controller {
 
     pub fn get_block(&self, id: Id) -> Result<Option<Block>, ControllerError> {
         // Query DB
-        let block = self.db.find_by_primary::<Block>(id).map_err(|e| {
+        let block = self.db.find::<Block>(id).map_err(|e| {
             ControllerError::GenesisError(format!("Failed to find block by ID: {}", e))
         })?;
 

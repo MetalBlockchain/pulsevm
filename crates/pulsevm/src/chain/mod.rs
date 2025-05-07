@@ -24,6 +24,9 @@ pub use controller::Controller;
 mod network;
 pub use network::NetworkManager;
 
+mod pulse_contract_types;
+pub use pulse_contract_types::*;
+
 mod service;
 pub use service::*;
 

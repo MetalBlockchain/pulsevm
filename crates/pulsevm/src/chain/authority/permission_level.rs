@@ -1,3 +1,5 @@
+use core::fmt;
+
 use pulsevm_chainbase::{ChainbaseObject, SecondaryKey};
 use pulsevm_serialization::{Deserialize, Serialize};
 
@@ -14,12 +16,18 @@ impl PermissionLevel {
         PermissionLevel { actor, permission }
     }
 
-    pub fn actor(&self) -> &Name {
-        &self.actor
+    pub fn actor(&self) -> Name {
+        self.actor
     }
 
-    pub fn permission(&self) -> &Name {
-        &self.permission
+    pub fn permission(&self) -> Name {
+        self.permission
+    }
+}
+
+impl fmt::Display for PermissionLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}@{}", self.actor, self.permission)
     }
 }
 

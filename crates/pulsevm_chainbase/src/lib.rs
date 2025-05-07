@@ -64,7 +64,7 @@ impl<'a> Database {
     }
 
     #[must_use]
-    pub fn find_by_primary<T: ChainbaseObject<'a>>(
+    pub fn find<T: ChainbaseObject<'a>>(
         &self,
         key: T::PrimaryKey,
     ) -> Result<Option<T>, Box<dyn Error>> {
@@ -141,7 +141,7 @@ impl<'a> UndoSession<'a> {
     }
 
     #[must_use]
-    pub fn find_by_primary<T: ChainbaseObject<'a> + 'static>(
+    pub fn find<T: ChainbaseObject<'a> + 'static>(
         &self,
         key: T::PrimaryKey,
     ) -> Result<Option<T>, Box<dyn Error>> {
@@ -149,6 +149,31 @@ impl<'a> UndoSession<'a> {
             .keyspace
             .open_partition(T::table_name(), Default::default())?;
         let serialized = self.tx.get(&partition, T::primary_key_as_bytes(key))?;
+        if serialized.is_none() {
+            return Ok(None);
+        }
+        let mut pos = 0 as usize;
+        let object: T =
+            T::deserialize(&serialized.unwrap(), &mut pos).expect("failed to deserialize object");
+        Ok(Some(object))
+    }
+
+    #[must_use]
+    pub fn find_by_secondary<T: ChainbaseObject<'a>, S: SecondaryIndex<'a, T>>(
+        &self,
+        key: S::Key,
+    ) -> Result<Option<T>, Box<dyn Error>> {
+        let partition = self
+            .keyspace
+            .open_partition(S::index_name(), Default::default())?;
+        let secondary_key = self.tx.get(&partition, S::secondary_key_as_bytes(key))?;
+        if secondary_key.is_none() {
+            return Ok(None);
+        }
+        let partition = self
+            .keyspace
+            .open_partition(T::table_name(), Default::default())?;
+        let serialized = self.tx.get(&partition, secondary_key.unwrap())?;
         if serialized.is_none() {
             return Ok(None);
         }

@@ -15,6 +15,10 @@ impl Name {
     pub const fn as_u64(&self) -> u64 {
         self.0
     }
+
+    pub const fn empty(&self) -> bool {
+        self.0 == 0
+    }
 }
 
 impl From<u64> for Name {

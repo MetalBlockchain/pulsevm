@@ -40,6 +40,11 @@ impl Action {
     pub fn authorization(&self) -> &[PermissionLevel] {
         &self.authorization
     }
+
+    pub fn data_as<T: Deserialize>(&self) -> Result<T, pulsevm_serialization::ReadError> {
+        let mut pos = 0;
+        T::deserialize(&self.data, &mut pos)
+    }
 }
 
 impl Serialize for Action {
