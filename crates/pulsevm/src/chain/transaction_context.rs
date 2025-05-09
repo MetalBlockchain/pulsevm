@@ -22,7 +22,7 @@ impl<'a> TransactionContext<'a> {
 
     pub fn exec(&mut self) -> Result<(), ApplyContextError> {
         for action in &self.transaction.unsigned_tx.actions {
-            self.schedule_action(action, action.account(), 0);
+            self.schedule_action(action, &action.account(), 0);
         }
 
         let num_original_actions_to_execute = self.action_traces.len();

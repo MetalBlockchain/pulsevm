@@ -7,15 +7,15 @@ use super::authority::Authority;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct Permission {
-    id: Id,
-    parent_id: Id,
+    id: u64,
+    parent_id: u64,
     pub owner: Name,
     pub name: Name,
     pub authority: Authority,
 }
 
 impl Permission {
-    pub fn new(id: Id, parent_id: Id, owner: Name, name: Name, authority: Authority) -> Self {
+    pub fn new(id: u64, parent_id: u64, owner: Name, name: Name, authority: Authority) -> Self {
         Permission {
             id,
             parent_id,
@@ -25,12 +25,12 @@ impl Permission {
         }
     }
 
-    pub fn id(&self) -> &Id {
-        &self.id
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
-    pub fn parent_id(&self) -> &Id {
-        &self.parent_id
+    pub fn parent_id(&self) -> u64 {
+        self.parent_id
     }
 
     pub fn satisfies(
@@ -54,7 +54,7 @@ impl Permission {
             let parent_obj = parent.unwrap();
             if self.id == parent_obj.parent_id {
                 return Ok(true);
-            } else if parent_obj.id == Id::zero() {
+            } else if parent_obj.id == 0 {
                 return Ok(false);
             }
             parent = session.find::<Permission>(parent_obj.parent_id)?;
@@ -77,8 +77,8 @@ impl Serialize for Permission {
 
 impl Deserialize for Permission {
     fn deserialize(data: &[u8], pos: &mut usize) -> Result<Self, pulsevm_serialization::ReadError> {
-        let id = Id::deserialize(data, pos)?;
-        let parent_id = Id::deserialize(data, pos)?;
+        let id = u64::deserialize(data, pos)?;
+        let parent_id = u64::deserialize(data, pos)?;
         let owner = Name::deserialize(data, pos)?;
         let name = Name::deserialize(data, pos)?;
         let authority = Authority::deserialize(data, pos)?;
@@ -93,14 +93,14 @@ impl Deserialize for Permission {
 }
 
 impl<'a> ChainbaseObject<'a> for Permission {
-    type PrimaryKey = Id;
+    type PrimaryKey = u64;
 
     fn primary_key(&self) -> Vec<u8> {
         Permission::primary_key_as_bytes(self.id)
     }
 
     fn primary_key_as_bytes(key: Self::PrimaryKey) -> Vec<u8> {
-        key.0.to_vec()
+        key.to_be_bytes().to_vec()
     }
 
     fn table_name() -> &'static str {

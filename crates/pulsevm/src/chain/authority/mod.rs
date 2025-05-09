@@ -12,3 +12,6 @@ pub use permission_level_weight::PermissionLevelWeight;
 
 mod permission;
 pub use permission::*;
+
+mod permission_link;
+pub use permission_link::*;

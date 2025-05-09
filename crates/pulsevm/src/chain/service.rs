@@ -87,11 +87,11 @@ impl RpcServer for RpcService {
         // Run transaction and revert it
         let controller = self.controller.clone();
         let controller = controller.read().await;
-        controller.try_transaction(&tx).map_err(|_| {
+        controller.push_transaction(&tx).map_err(|e| {
             ErrorObjectOwned::owned(
                 500,
                 "transaction_error",
-                Some("Transaction execution failed".to_string()),
+                Some(format!("Transaction failed: {}", e)),
             )
         })?;
 

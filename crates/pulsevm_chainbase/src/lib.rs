@@ -1,4 +1,4 @@
-use fjall::{Config, TransactionalKeyspace, WriteTransaction};
+use fjall::{Config, Slice, TransactionalKeyspace, WriteTransaction};
 use pulsevm_serialization::{Deserialize, Serialize, serialize};
 use std::{collections::VecDeque, error::Error, path::Path};
 
@@ -183,6 +183,27 @@ impl<'a> UndoSession<'a> {
         Ok(Some(object))
     }
 
+    pub fn generate_id<T: ChainbaseObject<'a>>(&mut self) -> Result<u64, Box<dyn Error>> {
+        let partition = self
+            .keyspace
+            .open_partition(T::table_name(), Default::default())?;
+        let mut new_id = 0u64;
+        // Do we have a sequence for this table?
+        self.tx.fetch_update(&partition, "id", |v| {
+            if v.is_none() {
+                return Some(Slice::new(&0u64.to_be_bytes()));
+            }
+            let id = v.unwrap();
+            let mut arr = [0u8; 8];
+            arr.copy_from_slice(&id);
+            let mut id = u64::from_be_bytes(arr);
+            id += 1;
+            new_id = id;
+            Some(Slice::new(&id.to_be_bytes()))
+        })?;
+        Ok(new_id)
+    }
+
     pub fn insert<T: ChainbaseObject<'a>>(&mut self, object: &T) -> Result<(), Box<dyn Error>> {
         let key = object.primary_key();
         let serialized = serialize(object);
@@ -261,5 +282,94 @@ impl<'a> UndoSession<'a> {
 
     pub fn rollback(self) {
         self.tx.rollback();
+    }
+}
+
+mod tests {
+    use super::*;
+    use pulsevm_serialization::ReadError;
+
+    #[derive(Debug, Default, Clone)]
+    struct TestObject {
+        id: u64,
+        name: String,
+    }
+
+    impl Serialize for TestObject {
+        fn serialize(&self, bytes: &mut Vec<u8>) {
+            self.id.serialize(bytes);
+            self.name.serialize(bytes);
+        }
+    }
+
+    impl Deserialize for TestObject {
+        fn deserialize(data: &[u8], pos: &mut usize) -> Result<Self, ReadError> {
+            let id = u64::deserialize(data, pos)?;
+            let name = String::deserialize(data, pos)?;
+            Ok(TestObject { id, name })
+        }
+    }
+
+    impl<'a> ChainbaseObject<'a> for TestObject {
+        type PrimaryKey = u64;
+
+        fn primary_key(&self) -> Vec<u8> {
+            TestObject::primary_key_as_bytes(self.id)
+        }
+        fn primary_key_as_bytes(key: Self::PrimaryKey) -> Vec<u8> {
+            key.to_be_bytes().to_vec()
+        }
+        fn secondary_indexes(&self) -> Vec<SecondaryKey> {
+            vec![SecondaryKey {
+                key: TestObjectByNameIndex::secondary_key_as_bytes(self.name.clone()),
+                index_name: TestObjectByNameIndex::index_name(),
+            }]
+        }
+        fn table_name() -> &'static str {
+            "test_object"
+        }
+    }
+
+    #[derive(Debug, Default)]
+    pub struct TestObjectByNameIndex;
+
+    impl<'a> SecondaryIndex<'a, TestObject> for TestObjectByNameIndex {
+        type Key = String;
+
+        fn secondary_key(&self, object: &TestObject) -> Vec<u8> {
+            TestObjectByNameIndex::secondary_key_as_bytes(object.name.clone())
+        }
+
+        fn secondary_key_as_bytes(key: Self::Key) -> Vec<u8> {
+            key.as_bytes().to_vec()
+        }
+
+        fn index_name() -> &'static str {
+            "test_object_by_name"
+        }
+    }
+
+    #[test]
+    fn test_database() {
+        let path = Path::new("test_db");
+        let db = Database::temporary(&path).expect("failed to create database");
+        let mut session = db.undo_session().expect("failed to create session");
+
+        let obj = TestObject {
+            id: 1,
+            name: "Test".to_string(),
+        };
+
+        session.insert(&obj).expect("failed to insert object");
+        let found = session
+            .find::<TestObject>(1)
+            .expect("failed to find object");
+        assert_eq!(found.unwrap().name, "Test");
+        let found = session
+            .find_by_secondary::<TestObject, TestObjectByNameIndex>("Test".to_string())
+            .expect("failed to find object by secondary index");
+        assert_eq!(found.unwrap().id, 1);
+
+        session.commit();
     }
 }

@@ -1,10 +1,9 @@
 use chrono::{DateTime, Utc};
 use core::str;
-use secp256k1::PublicKey;
 use serde::{Deserialize, Serialize};
 use std::{error::Error, fmt};
 
-use super::block::BlockTimestamp;
+use super::{PublicKey, block::BlockTimestamp};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Genesis {
@@ -57,10 +56,7 @@ impl Genesis {
     }
 
     pub fn initial_key(&self) -> Result<PublicKey, GenesisError> {
-        let hex_key = hex::decode(&self.initial_key)
-            .map_err(|_| GenesisError::InvalidFormat("Invalid hex key".to_string()))?;
-        let public_key = PublicKey::from_slice(&hex_key)
-            .map_err(|e| GenesisError::InvalidFormat(format!("invalid public key: {}", e)))?;
-        Ok(public_key)
+        PublicKey::from_hex(&self.initial_key)
+            .map_err(|_| GenesisError::InvalidFormat("Invalid public key format".to_string()))
     }
 }

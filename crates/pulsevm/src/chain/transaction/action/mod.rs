@@ -25,12 +25,12 @@ impl Action {
         }
     }
 
-    pub fn account(&self) -> &Name {
-        &self.account
+    pub fn account(&self) -> Name {
+        self.account
     }
 
-    pub fn name(&self) -> &Name {
-        &self.name
+    pub fn name(&self) -> Name {
+        self.name
     }
 
     pub fn data(&self) -> &[u8] {

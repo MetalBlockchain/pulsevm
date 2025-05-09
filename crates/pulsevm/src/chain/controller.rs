@@ -1,10 +1,12 @@
 use core::fmt;
-use std::path::Path;
+use std::{collections::HashSet, path::Path};
+
+use crate::chain::ACTIVE_NAME;
 
 use super::{
-    Genesis, Id, TransactionContext,
+    AuthorizationManager, Genesis, Id, OWNER_NAME, PULSE_NAME, TransactionContext,
     apply_context::ApplyContextError,
-    authority_checker::{self, AuthorityChecker},
+    authority::{Authority, KeyWeight},
     block::{Block, BlockByHeightIndex},
     transaction::Transaction,
 };
@@ -12,6 +14,8 @@ use pulsevm_chainbase::{Database, UndoSession};
 use pulsevm_serialization::Deserialize;
 
 pub struct Controller {
+    authorization_manager: AuthorizationManager,
+
     last_accepted_block: Block,
     preferred_id: Id,
     db: Database,
@@ -36,6 +40,8 @@ impl Controller {
         let db = Database::temporary(Path::new("temp")).unwrap();
 
         Controller {
+            authorization_manager: AuthorizationManager::new(),
+
             last_accepted_block: Block::default(),
             preferred_id: Id::default(),
             db: db,
@@ -80,13 +86,49 @@ impl Controller {
             session.insert(&self.last_accepted_block).map_err(|e| {
                 ControllerError::GenesisError(format!("Failed to insert genesis block: {}", e))
             })?;
+            let default_key = genesis.initial_key().map_err(|e| {
+                ControllerError::GenesisError(format!("Failed to get initial key: {}", e))
+            })?;
+            let default_authority = Authority::new(1, vec![KeyWeight::new(default_key, 1)], vec![]);
+            // Create the pulse@owner permission
+            let owner_permission = self
+                .authorization_manager
+                .create_permission(
+                    &mut session,
+                    PULSE_NAME,
+                    OWNER_NAME,
+                    0,
+                    default_authority.clone(),
+                )
+                .map_err(|e| {
+                    ControllerError::GenesisError(format!(
+                        "Failed to create pulse@owner permission: {}",
+                        e
+                    ))
+                })?;
+            // Create the pulse@active permission
+            self.authorization_manager
+                .create_permission(
+                    &mut session,
+                    PULSE_NAME,
+                    ACTIVE_NAME,
+                    owner_permission.id(),
+                    default_authority.clone(),
+                )
+                .map_err(|e| {
+                    ControllerError::GenesisError(format!(
+                        "Failed to create pulse@owner permission: {}",
+                        e
+                    ))
+                })?;
+            println!("Created pulse@active permission");
             session.commit();
         }
 
         Ok(())
     }
 
-    pub fn try_transaction(&self, transaction: &Transaction) -> Result<(), ApplyContextError> {
+    pub fn push_transaction(&self, transaction: &Transaction) -> Result<(), ApplyContextError> {
         // Execute the transaction
         let undo_session = self.db.undo_session().unwrap();
         self.execute_transaction(&undo_session, transaction)
@@ -98,8 +140,22 @@ impl Controller {
         transaction: &Transaction,
     ) -> Result<(), ApplyContextError> {
         // Verify authority
-        let authority_checker = AuthorityChecker::new(transaction, undo_session)
-            .map_err(|e| ApplyContextError::AuthenticationError(format!("{}", e)))?;
+        self.authorization_manager
+            .check_authorization(
+                undo_session,
+                &transaction.unsigned_tx.actions,
+                &transaction.recovered_keys().map_err(|e| {
+                    ApplyContextError::AuthenticationError(format!("Failed to recover keys: {}", e))
+                })?,
+                &HashSet::new(),
+                &HashSet::new(),
+            )
+            .map_err(|e| {
+                ApplyContextError::AuthenticationError(format!(
+                    "Failed to check authorization: {}",
+                    e
+                ))
+            })?;
 
         let mut trx_context = TransactionContext::new(transaction, undo_session);
         trx_context.exec()?;

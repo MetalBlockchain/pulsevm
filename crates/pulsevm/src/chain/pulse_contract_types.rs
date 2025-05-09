@@ -43,7 +43,7 @@ impl Deserialize for DeleteAuth {
 pub struct LinkAuth {
     pub account: Name,
     pub code: Name,
-    pub type_: Name,
+    pub message_type: Name,
     pub requirement: Name,
 }
 
@@ -51,13 +51,32 @@ impl Deserialize for LinkAuth {
     fn deserialize(data: &[u8], pos: &mut usize) -> Result<Self, pulsevm_serialization::ReadError> {
         let account = Name::deserialize(data, pos)?;
         let code = Name::deserialize(data, pos)?;
-        let type_ = Name::deserialize(data, pos)?;
+        let message_type = Name::deserialize(data, pos)?;
         let requirement = Name::deserialize(data, pos)?;
         Ok(LinkAuth {
             account,
             code,
-            type_,
+            message_type,
             requirement,
+        })
+    }
+}
+
+pub struct UnlinkAuth {
+    pub account: Name,
+    pub code: Name,
+    pub message_type: Name,
+}
+
+impl Deserialize for UnlinkAuth {
+    fn deserialize(data: &[u8], pos: &mut usize) -> Result<Self, pulsevm_serialization::ReadError> {
+        let account = Name::deserialize(data, pos)?;
+        let code = Name::deserialize(data, pos)?;
+        let message_type = Name::deserialize(data, pos)?;
+        Ok(UnlinkAuth {
+            account,
+            code,
+            message_type,
         })
     }
 }

@@ -71,3 +71,20 @@ impl Deserialize for Name {
         Ok(Name(value))
     }
 }
+
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_name() {
+        let name = Name::new(0x1234567890abcdef);
+        assert_eq!(name.as_u64(), 0x1234567890abcdef);
+        assert_eq!(name.to_string(), "1234567890abcdef");
+    }
+
+    #[test]
+    fn test_name_from_str() {
+        let name = Name::from_str("test").unwrap();
+        assert_eq!(name.as_u64(), 0x7465737400000000);
+    }
+}
