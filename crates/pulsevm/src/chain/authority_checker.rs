@@ -3,21 +3,17 @@ use std::collections::{HashMap, HashSet};
 use pulsevm_chainbase::UndoSession;
 
 use super::{
-    PublicKey,
     authority::{
         Authority, KeyWeight, Permission, PermissionByOwnerIndex, PermissionLevel,
         PermissionLevelWeight,
-    },
-    authorization_manager::AuthorityError,
+    }, error::ChainError, PublicKey
 };
 
 pub struct AuthorityChecker {
-    pub recursion_depth_limit: u16,
-    pub provided_keys: HashSet<PublicKey>,
-    pub used_keys: HashSet<PublicKey>,
-    pub provided_permissions: HashSet<PermissionLevel>,
-    pub cached_permissions: HashMap<PermissionLevel, PermissionCacheStatus>,
-    pub total_weight: u32,
+    recursion_depth_limit: u16,
+    provided_keys: HashSet<PublicKey>,
+    used_keys: HashSet<PublicKey>,
+    cached_permissions: HashMap<PermissionLevel, PermissionCacheStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -33,38 +29,48 @@ impl AuthorityChecker {
             recursion_depth_limit: 0,
             provided_keys: HashSet::new(),
             used_keys: HashSet::new(),
-            provided_permissions: HashSet::new(),
-            total_weight: 0,
             cached_permissions: HashMap::new(),
         }
+    }
+
+    pub fn all_keys_used(&self) -> bool {
+        if self.provided_keys.len() != self.used_keys.len() {
+            return false;
+        }
+
+        return self.provided_keys == self.used_keys;
     }
 
     pub fn satisfied(
         &mut self,
         session: &UndoSession,
         authority: &Authority,
-    ) -> Result<bool, AuthorityError> {
+        recursion_depth: u16,
+    ) -> Result<bool, ChainError> {
+        let mut total_weight = 0u32;
+
         for key in authority.keys() {
-            self.visit_key_weight(key)?;
+            total_weight += self.visit_key_weight(key)? as u32;
         }
 
-        if self.total_weight >= authority.threshold() {
+        if total_weight >= authority.threshold() {
             return Ok(true);
         }
 
         for permission in authority.accounts() {
-            self.visit_permission_level_weight(session, permission, 0)?;
+            total_weight +=
+                self.visit_permission_level_weight(session, permission, recursion_depth)? as u32;
         }
 
-        Ok(self.total_weight >= authority.threshold())
+        Ok(total_weight >= authority.threshold())
     }
 
-    pub fn visit_key_weight(&mut self, key: &KeyWeight) -> Result<(), AuthorityError> {
+    pub fn visit_key_weight(&mut self, key: &KeyWeight) -> Result<u16, ChainError> {
         if self.provided_keys.contains(key.key()) {
             self.used_keys.insert(key.key().clone());
-            self.total_weight += key.weight() as u32;
+            return Ok(key.weight());
         }
-        Ok(())
+        Ok(0)
     }
 
     pub fn visit_permission_level_weight(
@@ -72,9 +78,11 @@ impl AuthorityChecker {
         session: &UndoSession,
         permission: &PermissionLevelWeight,
         recursion_depth: u16,
-    ) -> Result<(), AuthorityError> {
+    ) -> Result<u16, ChainError> {
         if recursion_depth > self.recursion_depth_limit {
-            return Err(AuthorityError::RecursionDepthExceeded);
+            return Err(ChainError::AuthorizationError(
+                "recursion depth exceeded".to_string(),
+            ));
         }
         if !self
             .cached_permissions
@@ -85,24 +93,24 @@ impl AuthorityChecker {
                     permission.permission().actor(),
                     permission.permission().permission(),
                 ))
-                .map_err(|e| AuthorityError::InternalError)?;
+                .map_err(|e| ChainError::AuthorizationError(format!("{}", e)))?;
 
             if auth.is_none() {
-                return Ok(());
+                return Ok(0);
             }
             let auth = auth.unwrap();
             self.cached_permissions.insert(
                 permission.permission().clone(),
                 PermissionCacheStatus::BeingEvaluated,
             );
-            let satisfied = self.satisfied(session, &auth.authority)?;
+            let satisfied = self.satisfied(session, &auth.authority, recursion_depth + 1)?;
 
             if satisfied {
-                self.total_weight += permission.weight() as u32;
                 self.cached_permissions.insert(
                     permission.permission().clone(),
                     PermissionCacheStatus::PermissionSatisfied,
                 );
+                return Ok(permission.weight());
             } else {
                 self.cached_permissions.insert(
                     permission.permission().clone(),
@@ -115,9 +123,9 @@ impl AuthorityChecker {
             .unwrap()
             == &PermissionCacheStatus::PermissionSatisfied
         {
-            self.total_weight += permission.weight() as u32;
+            return Ok(permission.weight());
         }
 
-        Ok(())
+        Ok(0)
     }
 }

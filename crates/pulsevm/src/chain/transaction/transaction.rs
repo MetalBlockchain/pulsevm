@@ -2,7 +2,9 @@ use std::collections::HashSet;
 
 use pulsevm_serialization::{Deserialize, Serialize};
 
-use crate::chain::{Id, PublicKey, Signature, authorization_manager::AuthorityError};
+use crate::chain::{
+    Id, PublicKey, Signature, error::ChainError,
+};
 
 use super::action::Action;
 
@@ -21,14 +23,14 @@ impl Transaction {
     }
 
     #[must_use]
-    pub fn recovered_keys(&self) -> Result<HashSet<PublicKey>, AuthorityError> {
+    pub fn recovered_keys(&self) -> Result<HashSet<PublicKey>, ChainError> {
         let mut recovered_keys: HashSet<PublicKey> = HashSet::new();
         let mut tx_data: Vec<u8> = Vec::new();
         self.unsigned_tx.serialize(&mut tx_data);
         for signature in self.signatures.iter() {
             let public_key = signature
                 .recover_public_key(&tx_data)
-                .map_err(|e| AuthorityError::SignatureRecoverError(format!("{}", e)))?;
+                .map_err(|e| ChainError::SignatureRecoverError(format!("{}", e)))?;
             recovered_keys.insert(public_key);
         }
         Ok(recovered_keys)

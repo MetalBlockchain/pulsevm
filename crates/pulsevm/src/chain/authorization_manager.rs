@@ -1,60 +1,16 @@
-use std::{
-    collections::HashSet,
-    fmt::{self},
-    sync::Arc,
-};
-
-use pulsevm_chainbase::{Database, UndoSession};
-use pulsevm_proc_macros::name;
-use pulsevm_serialization::Serialize;
-use tokio::sync::Mutex;
+use std::collections::HashSet;
 
 use super::{
-    ACTIVE_NAME, ANY_NAME, Action, DeleteAuth, Id, LinkAuth, Name, PublicKey, Transaction,
-    UnlinkAuth, UpdateAuth,
+    ACTIVE_NAME, ANY_NAME, Action, DeleteAuth, LinkAuth, Name, PublicKey, UnlinkAuth, UpdateAuth,
     authority::{
-        self, Authority, Permission, PermissionByOwnerIndex, PermissionLevel, PermissionLink,
+        Authority, Permission, PermissionByOwnerIndex, PermissionLevel, PermissionLink,
         PermissionLinkByActionNameIndex,
     },
     authority_checker::AuthorityChecker,
+    error::ChainError,
 };
-
-#[derive(Debug, Clone)]
-pub enum AuthorityError {
-    PermissionNotFound(Name, Name),
-    RecursionDepthExceeded,
-    InternalError,
-    NotSatisfied,
-    SignatureRecoverError(String),
-    DataError(String),
-    InvalidPermission,
-    IrrelevantAuth(String),
-    AuthorizationError(String),
-}
-
-impl fmt::Display for AuthorityError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            AuthorityError::PermissionNotFound(actor, permission) => write!(
-                f,
-                "Permission not found for actor: {}, permission: {}",
-                actor, permission
-            ),
-            AuthorityError::RecursionDepthExceeded => write!(f, "Recursion depth exceeded"),
-            AuthorityError::InternalError => write!(f, "Internal error"),
-            AuthorityError::NotSatisfied => write!(f, "Authority not satisfied"),
-            AuthorityError::SignatureRecoverError(msg) => {
-                write!(f, "Signature recover error: {}", msg)
-            }
-            AuthorityError::DataError(msg) => write!(f, "Data error: {}", msg),
-            AuthorityError::InvalidPermission => write!(f, "Invalid permission"),
-            AuthorityError::IrrelevantAuth(msg) => write!(f, "Irrelevant auth: {}", msg),
-            AuthorityError::AuthorizationError(msg) => {
-                write!(f, "{}", msg)
-            }
-        }
-    }
-}
+use pulsevm_chainbase::UndoSession;
+use pulsevm_proc_macros::name;
 
 pub struct AuthorizationManager;
 
@@ -70,7 +26,7 @@ impl AuthorizationManager {
         provided_keys: &HashSet<PublicKey>,
         provided_permissions: &HashSet<PermissionLevel>,
         satisfied_authorizations: &HashSet<PermissionLevel>,
-    ) -> Result<(), AuthorityError> {
+    ) -> Result<(), ChainError> {
         let mut permissions_to_satisfy = HashSet::<PermissionLevel>::new();
 
         for act in actions.iter() {
@@ -106,7 +62,7 @@ impl AuthorizationManager {
                         self.get_permission(session, &declared_auth)?
                             .satisfies(&min_permission, session)
                             .map_err(|_| {
-                                AuthorityError::IrrelevantAuth(format!(
+                                ChainError::AuthorizationError(format!(
                                     "action declares irrelevant authority '{}'; minimum authority is {}",
                                     declared_auth,
                                     PermissionLevel::new(min_permission.owner, min_permission.name)
@@ -126,15 +82,22 @@ impl AuthorizationManager {
             for p in permissions_to_satisfy.iter() {
                 let permission = self
                     .get_permission(session, p)
-                    .map_err(|_| AuthorityError::InternalError)?;
-                let satisfied = authority_checker.satisfied(session, &permission.authority)?;
+                    .map_err(|e| ChainError::AuthorizationError(format!("{}", e)))?;
+                let satisfied = authority_checker.satisfied(session, &permission.authority, 0)?;
 
                 if !satisfied {
-                    return Err(AuthorityError::AuthorizationError(format!(
+                    return Err(ChainError::AuthorizationError(format!(
                         "transaction declares authority '{}' but does not have signatures for it",
                         p
                     )));
                 }
+            }
+
+            // Now verify that all the provided keys are used, otherwise we are wasting resources
+            if !authority_checker.all_keys_used() {
+                return Err(ChainError::AuthorizationError(
+                    "transaction bears irrelevant signatures".to_string(),
+                ));
             }
         }
         Ok(())
@@ -144,19 +107,19 @@ impl AuthorizationManager {
         &self,
         session: &UndoSession,
         action: &Action,
-    ) -> Result<(), AuthorityError> {
+    ) -> Result<(), ChainError> {
         let update = action
             .data_as::<UpdateAuth>()
-            .map_err(|e| AuthorityError::DataError(format!("{}", e)))?;
+            .map_err(|e| ChainError::AuthorizationError(format!("{}", e)))?;
 
         if action.authorization().len() != 1 {
-            return Err(AuthorityError::IrrelevantAuth(
+            return Err(ChainError::AuthorizationError(
                 "updateauth action should only have one declared authorization".to_string(),
             ));
         }
         let auth = action.authorization()[0];
         if auth.actor().as_u64() != update.account.as_u64() {
-            return Err(AuthorityError::IrrelevantAuth(
+            return Err(ChainError::AuthorizationError(
                 "the owner of the affected permission needs to be the actor of the declared authorization".to_string(),
             ));
         }
@@ -177,7 +140,7 @@ impl AuthorizationManager {
         self.get_permission(session, &auth)?
             .satisfies(&min_permission, session)
             .map_err(|_| {
-                AuthorityError::IrrelevantAuth(format!(
+                ChainError::AuthorizationError(format!(
                     "updateauth action declares irrelevant authority '{}'; minimum authority is {}",
                     auth,
                     PermissionLevel::new(update.account, min_permission.name)
@@ -191,19 +154,19 @@ impl AuthorizationManager {
         &self,
         session: &UndoSession,
         action: &Action,
-    ) -> Result<(), AuthorityError> {
+    ) -> Result<(), ChainError> {
         let del = action
             .data_as::<DeleteAuth>()
-            .map_err(|e| AuthorityError::DataError(format!("{}", e)))?;
+            .map_err(|e| ChainError::AuthorizationError(format!("{}", e)))?;
 
         if action.authorization().len() != 1 {
-            return Err(AuthorityError::IrrelevantAuth(
+            return Err(ChainError::AuthorizationError(
                 "deleteauth action should only have one declared authorization".to_string(),
             ));
         }
         let auth = action.authorization()[0];
         if auth.actor().as_u64() != del.account.as_u64() {
-            return Err(AuthorityError::IrrelevantAuth(
+            return Err(ChainError::AuthorizationError(
                 "the owner of the permission to delete needs to be the actor of the declared authorization".to_string(),
             ));
         }
@@ -212,7 +175,7 @@ impl AuthorizationManager {
         self.get_permission(session, &auth)?
             .satisfies(&min_permission, session)
             .map_err(|_| {
-                AuthorityError::IrrelevantAuth(format!(
+                ChainError::AuthorizationError(format!(
                     "deleteauth action declares irrelevant authority '{}'; minimum authority is {}",
                     auth,
                     PermissionLevel::new(min_permission.owner, min_permission.name)
@@ -225,40 +188,40 @@ impl AuthorizationManager {
         &self,
         session: &UndoSession,
         action: &Action,
-    ) -> Result<(), AuthorityError> {
+    ) -> Result<(), ChainError> {
         let link = action
             .data_as::<LinkAuth>()
-            .map_err(|e| AuthorityError::DataError(format!("{}", e)))?;
+            .map_err(|e| ChainError::AuthorizationError(format!("{}", e)))?;
         if action.authorization().len() != 1 {
-            return Err(AuthorityError::IrrelevantAuth(
+            return Err(ChainError::AuthorizationError(
                 "link action should only have one declared authorization".to_string(),
             ));
         }
         let auth = action.authorization()[0];
         if auth.actor().as_u64() != link.account.as_u64() {
-            return Err(AuthorityError::IrrelevantAuth(
+            return Err(ChainError::AuthorizationError(
                 "the owner of the linked permission needs to be the actor of the declared authorization".to_string(),
             ));
         }
         if link.code.as_u64() == name!("pulse") {
             match link.message_type.as_u64() {
                 name!("updateauth") => {
-                    return Err(AuthorityError::AuthorizationError(
+                    return Err(ChainError::AuthorizationError(
                         "cannot link pulse::updateauth to a minimum permission".to_string(),
                     ));
                 }
                 name!("deleteauth") => {
-                    return Err(AuthorityError::AuthorizationError(
+                    return Err(ChainError::AuthorizationError(
                         "cannot link pulse::deleteauth to a minimum permission".to_string(),
                     ));
                 }
                 name!("linkauth") => {
-                    return Err(AuthorityError::AuthorizationError(
+                    return Err(ChainError::AuthorizationError(
                         "cannot link pulse::linkauth to a minimum permission".to_string(),
                     ));
                 }
                 name!("unlinkauth") => {
-                    return Err(AuthorityError::AuthorizationError(
+                    return Err(ChainError::AuthorizationError(
                         "cannot link pulse::unlinkauth to a minimum permission".to_string(),
                     ));
                 }
@@ -278,7 +241,7 @@ impl AuthorizationManager {
         self.get_permission(session, &auth)?
             .satisfies(&min_permission, session)
             .map_err(|_| {
-                AuthorityError::IrrelevantAuth(format!(
+                ChainError::AuthorizationError(format!(
                     "link action declares irrelevant authority '{}'; minimum authority is {}",
                     auth,
                     PermissionLevel::new(link.account, linked_permission_name)
@@ -291,18 +254,18 @@ impl AuthorizationManager {
         &self,
         session: &UndoSession,
         action: &Action,
-    ) -> Result<(), AuthorityError> {
+    ) -> Result<(), ChainError> {
         let unlink = action
             .data_as::<UnlinkAuth>()
-            .map_err(|e| AuthorityError::DataError(format!("{}", e)))?;
+            .map_err(|e| ChainError::AuthorizationError(format!("{}", e)))?;
         if action.authorization().len() != 1 {
-            return Err(AuthorityError::IrrelevantAuth(
+            return Err(ChainError::AuthorizationError(
                 "unlink action should only have one declared authorization".to_string(),
             ));
         }
         let auth = action.authorization()[0];
         if auth.actor() != unlink.account {
-            return Err(AuthorityError::IrrelevantAuth(
+            return Err(ChainError::AuthorizationError(
                 "the owner of the linked permission needs to be the actor of the declared authorization".to_string(),
             ));
         }
@@ -313,7 +276,7 @@ impl AuthorizationManager {
             unlink.message_type,
         )?;
         if unlinked_permission_name.is_none() {
-            return Err(AuthorityError::IrrelevantAuth(format!(
+            return Err(ChainError::AuthorizationError(format!(
                 "cannot unlink non-existent permission link of account '{}' for actions matching '{}::{}'",
                 unlink.account, unlink.code, unlink.message_type
             )));
@@ -329,7 +292,7 @@ impl AuthorizationManager {
         self.get_permission(session, &auth)?
             .satisfies(&min_permission, session)
             .map_err(|_| {
-                AuthorityError::IrrelevantAuth(format!(
+                ChainError::AuthorizationError(format!(
                     "unlink action declares irrelevant authority '{}'; minimum authority is {}",
                     auth,
                     PermissionLevel::new(unlink.account, unlinked_permission_name)
@@ -342,16 +305,18 @@ impl AuthorizationManager {
         &self,
         session: &UndoSession,
         level: &PermissionLevel,
-    ) -> Result<Option<Permission>, AuthorityError> {
+    ) -> Result<Option<Permission>, ChainError> {
         if level.actor().empty() || level.permission().empty() {
-            return Err(AuthorityError::InvalidPermission);
+            return Err(ChainError::AuthorizationError(
+                "invalid permission".to_string(),
+            ));
         }
         let result = session
             .find_by_secondary::<Permission, PermissionByOwnerIndex>((
                 level.actor(),
                 level.permission(),
             ))
-            .map_err(|_| AuthorityError::InternalError)?;
+            .map_err(|e| ChainError::AuthorizationError(format!("{}", e)))?;
         if result.is_none() {
             return Ok(None);
         }
@@ -362,18 +327,20 @@ impl AuthorizationManager {
         &self,
         session: &UndoSession,
         level: &PermissionLevel,
-    ) -> Result<Permission, AuthorityError> {
+    ) -> Result<Permission, ChainError> {
         if level.actor().empty() || level.permission().empty() {
-            return Err(AuthorityError::InvalidPermission);
+            return Err(ChainError::AuthorizationError(
+                "invalid permission".to_string(),
+            ));
         }
         let result = session
             .find_by_secondary::<Permission, PermissionByOwnerIndex>((
                 level.actor(),
                 level.permission(),
             ))
-            .map_err(|_| AuthorityError::InternalError)?;
+            .map_err(|e| ChainError::AuthorizationError(format!("{}", e)))?;
         if result.is_none() {
-            return Err(AuthorityError::PermissionNotFound(
+            return Err(ChainError::PermissionNotFound(
                 level.actor().clone(),
                 level.permission().clone(),
             ));
@@ -387,14 +354,14 @@ impl AuthorizationManager {
         authorizer_account: Name,
         scope: Name,
         act_name: Name,
-    ) -> Result<Option<Name>, AuthorityError> {
+    ) -> Result<Option<Name>, ChainError> {
         if scope == name!("pulse") {
             if act_name == name!("updateauth")
                 || act_name == name!("deleteauth")
                 || act_name == name!("linkauth")
                 || act_name == name!("unlinkauth")
             {
-                return Err(AuthorityError::AuthorizationError(
+                return Err(ChainError::AuthorizationError(
                     "cannot call lookup_minimum_permission on native actions that are not allowed to be linked to minimum permissions".to_string(),
                 ));
             }
@@ -421,18 +388,18 @@ impl AuthorizationManager {
         authorizer_account: Name,
         scope: Name,
         act_name: Name,
-    ) -> Result<Option<Name>, AuthorityError> {
+    ) -> Result<Option<Name>, ChainError> {
         // First look up a specific link for this message act_name
         let mut key = (authorizer_account, scope, act_name);
         let mut link = session
             .find_by_secondary::<PermissionLink, PermissionLinkByActionNameIndex>(key)
-            .map_err(|_| AuthorityError::InternalError)?;
+            .map_err(|e| ChainError::AuthorizationError(format!("{}", e)))?;
         // If no specific link found, check for a contract-wide default
         if link.is_none() {
             key = (authorizer_account, scope, Name::default());
             link = session
                 .find_by_secondary::<PermissionLink, PermissionLinkByActionNameIndex>(key)
-                .map_err(|_| AuthorityError::InternalError)?;
+                .map_err(|e| ChainError::AuthorizationError(format!("{}", e)))?;
         }
 
         if link.is_some() {
@@ -449,13 +416,13 @@ impl AuthorizationManager {
         name: Name,
         parent: u64,
         auth: Authority,
-    ) -> Result<Permission, AuthorityError> {
+    ) -> Result<Permission, ChainError> {
         let id = session.generate_id::<Permission>().map_err(|e| {
-            AuthorityError::AuthorizationError(format!("Failed to generate permission ID: {}", e))
+            ChainError::AuthorizationError(format!("Failed to generate permission ID: {}", e))
         })?;
         let permission = Permission::new(id, parent, account, name, auth);
         session.insert(&permission).map_err(|e| {
-            AuthorityError::AuthorizationError(format!("Failed to create permission: {}", e))
+            ChainError::AuthorizationError(format!("Failed to create permission: {}", e))
         })?;
         Ok(permission)
     }
@@ -463,9 +430,9 @@ impl AuthorizationManager {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{path::Path, sync::{Arc, Mutex}};
 
-    use crate::chain::{Id, authority::Authority, authority::KeyWeight};
+    use crate::chain::{authority::{Authority, KeyWeight}, Id, Transaction};
 
     use super::*;
     use pulsevm_chainbase::Database;

@@ -31,6 +31,8 @@ pub use transaction::*;
 mod controller;
 pub use controller::Controller;
 
+mod error;
+
 mod network;
 pub use network::NetworkManager;
 
