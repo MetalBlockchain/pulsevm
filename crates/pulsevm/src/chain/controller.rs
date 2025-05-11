@@ -1,17 +1,26 @@
 use core::fmt;
-use std::{collections::HashSet, path::Path};
+use std::{
+    collections::{HashMap, HashSet},
+    iter::Map,
+    path::Path,
+    str::FromStr,
+};
 
 use crate::chain::ACTIVE_NAME;
 
 use super::{
-    AuthorizationManager, Genesis, Id, OWNER_NAME, PULSE_NAME, TransactionContext,
-    apply_context::ApplyContextError,
+    AuthorizationManager, Genesis, Id, Name, OWNER_NAME, PULSE_NAME, TransactionContext,
+    apply_context::ApplyContext,
     authority::{Authority, KeyWeight},
     block::{Block, BlockByHeightIndex},
+    error::ChainError,
+    pulse_contract::newaccount,
     transaction::Transaction,
 };
 use pulsevm_chainbase::{Database, UndoSession};
+use pulsevm_proc_macros::name;
 use pulsevm_serialization::Deserialize;
+use spdlog::info;
 
 pub struct Controller {
     authorization_manager: AuthorizationManager,
@@ -19,6 +28,8 @@ pub struct Controller {
     last_accepted_block: Block,
     preferred_id: Id,
     db: Database,
+    apply_handlers:
+        HashMap<Name, HashMap<(Name, Name), fn(&mut ApplyContext) -> Result<(), ChainError>>>,
 }
 
 #[derive(Debug)]
@@ -38,14 +49,23 @@ impl Controller {
     pub fn new() -> Self {
         // Create a temporary database
         let db = Database::temporary(Path::new("temp")).unwrap();
-
-        Controller {
+        let mut controller = Controller {
             authorization_manager: AuthorizationManager::new(),
 
             last_accepted_block: Block::default(),
             preferred_id: Id::default(),
             db: db,
-        }
+            apply_handlers: HashMap::new(),
+        };
+
+        controller.set_apply_handler(
+            PULSE_NAME,
+            PULSE_NAME,
+            Name::new(name!("newaccount")),
+            newaccount,
+        );
+
+        controller
     }
 
     pub fn initialize(
@@ -89,6 +109,10 @@ impl Controller {
             let default_key = genesis.initial_key().map_err(|e| {
                 ControllerError::GenesisError(format!("Failed to get initial key: {}", e))
             })?;
+            info!(
+                "initializing pulse account with default key: {}",
+                default_key.0
+            );
             let default_authority = Authority::new(1, vec![KeyWeight::new(default_key, 1)], vec![]);
             // Create the pulse@owner permission
             let owner_permission = self
@@ -121,14 +145,13 @@ impl Controller {
                         e
                     ))
                 })?;
-            println!("Created pulse@active permission");
             session.commit();
         }
 
         Ok(())
     }
 
-    pub fn push_transaction(&self, transaction: &Transaction) -> Result<(), ApplyContextError> {
+    pub fn push_transaction(&self, transaction: &Transaction) -> Result<(), ChainError> {
         // Execute the transaction
         let undo_session = self.db.undo_session().unwrap();
         self.execute_transaction(&undo_session, transaction)
@@ -138,26 +161,17 @@ impl Controller {
         &self,
         undo_session: &UndoSession,
         transaction: &Transaction,
-    ) -> Result<(), ApplyContextError> {
+    ) -> Result<(), ChainError> {
         // Verify authority
-        self.authorization_manager
-            .check_authorization(
-                undo_session,
-                &transaction.unsigned_tx.actions,
-                &transaction.recovered_keys().map_err(|e| {
-                    ApplyContextError::AuthenticationError(format!("Failed to recover keys: {}", e))
-                })?,
-                &HashSet::new(),
-                &HashSet::new(),
-            )
-            .map_err(|e| {
-                ApplyContextError::AuthenticationError(format!(
-                    "Failed to check authorization: {}",
-                    e
-                ))
-            })?;
+        self.authorization_manager.check_authorization(
+            undo_session,
+            &transaction.unsigned_tx.actions,
+            &transaction.recovered_keys()?,
+            &HashSet::new(),
+            &HashSet::new(),
+        )?;
 
-        let mut trx_context = TransactionContext::new(transaction, undo_session);
+        let mut trx_context = TransactionContext::new(self, transaction, undo_session);
         trx_context.exec()?;
         Ok(())
     }
@@ -200,6 +214,33 @@ impl Controller {
 
     pub fn set_preferred_id(&mut self, id: Id) {
         self.preferred_id = id;
+    }
+
+    pub fn set_apply_handler(
+        &mut self,
+        receiver: Name,
+        contract: Name,
+        action: Name,
+        apply_handler: fn(&mut ApplyContext) -> Result<(), ChainError>,
+    ) {
+        self.apply_handlers
+            .entry(receiver)
+            .or_insert_with(HashMap::new)
+            .insert((contract, action), apply_handler);
+    }
+
+    pub fn find_apply_handler(
+        &self,
+        receiver: Name,
+        scope: Name,
+        act: Name,
+    ) -> Option<fn(&mut ApplyContext) -> Result<(), ChainError>> {
+        if let Some(handlers) = self.apply_handlers.get(&receiver) {
+            if let Some(handler) = handlers.get(&(scope, act)) {
+                return Some(*handler);
+            }
+        }
+        None
     }
 }
 

@@ -1,32 +1,38 @@
 use pulsevm_chainbase::UndoSession;
 
 use super::{
-    Action, ActionTrace, Name, Transaction,
-    apply_context::{self, ApplyContext, ApplyContextError},
+    Action, ActionTrace, Controller, Name, Transaction, apply_context::ApplyContext,
+    error::ChainError,
 };
 
 pub struct TransactionContext<'a> {
+    controller: &'a Controller,
     transaction: &'a Transaction,
     undo_session: &'a UndoSession<'a>,
     action_traces: Vec<ActionTrace>,
 }
 
 impl<'a> TransactionContext<'a> {
-    pub fn new(transaction: &'a Transaction, undo_session: &'a UndoSession) -> Self {
+    pub fn new(
+        controller: &'a Controller,
+        transaction: &'a Transaction,
+        undo_session: &'a UndoSession,
+    ) -> Self {
         Self {
+            controller,
             transaction,
             undo_session,
             action_traces: Vec::new(),
         }
     }
 
-    pub fn exec(&mut self) -> Result<(), ApplyContextError> {
+    pub fn exec(&mut self) -> Result<(), ChainError> {
         for action in &self.transaction.unsigned_tx.actions {
             self.schedule_action(action, &action.account(), 0);
         }
 
         let num_original_actions_to_execute = self.action_traces.len();
-        for i in 1..num_original_actions_to_execute {
+        for i in 1..=num_original_actions_to_execute {
             self.execute_action(i as u32, 0)?;
         }
 
@@ -54,9 +60,10 @@ impl<'a> TransactionContext<'a> {
         &mut self,
         action_ordinal: u32,
         recurse_depth: u32,
-    ) -> Result<(), ApplyContextError> {
+    ) -> Result<(), ChainError> {
         // Execute the action
-        let mut apply_context = ApplyContext::new(self, action_ordinal, recurse_depth);
+        let mut apply_context =
+            ApplyContext::new(self.controller, self, action_ordinal, recurse_depth);
         apply_context.exec()?;
 
         // Action is executed

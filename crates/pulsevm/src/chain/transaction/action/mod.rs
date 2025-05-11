@@ -1,3 +1,5 @@
+use core::fmt;
+
 use pulsevm_serialization::{Deserialize, Serialize};
 
 use crate::chain::{Name, authority::PermissionLevel};
@@ -8,6 +10,16 @@ pub struct Action {
     name: Name,
     data: Vec<u8>,
     authorization: Vec<PermissionLevel>,
+}
+
+impl fmt::Display for Action {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "action {{ account: {}, name: {}, data: {:?}, authorization: {:?} }}",
+            self.account, self.name, self.data, self.authorization
+        )
+    }
 }
 
 impl Action {

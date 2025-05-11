@@ -88,11 +88,7 @@ impl RpcServer for RpcService {
         let controller = self.controller.clone();
         let controller = controller.read().await;
         controller.push_transaction(&tx).map_err(|e| {
-            ErrorObjectOwned::owned(
-                500,
-                "transaction_error",
-                Some(format!("Transaction failed: {}", e)),
-            )
+            ErrorObjectOwned::owned(500, "transaction_error", Some(format!("{}", e)))
         })?;
 
         // Add to mempool

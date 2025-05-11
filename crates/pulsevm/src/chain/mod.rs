@@ -39,6 +39,8 @@ pub use network::NetworkManager;
 mod pulse_contract_types;
 pub use pulse_contract_types::*;
 
+mod pulse_contract;
+
 mod service;
 pub use service::*;
 

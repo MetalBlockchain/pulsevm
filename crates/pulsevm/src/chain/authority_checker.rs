@@ -3,15 +3,17 @@ use std::collections::{HashMap, HashSet};
 use pulsevm_chainbase::UndoSession;
 
 use super::{
+    PublicKey,
     authority::{
         Authority, KeyWeight, Permission, PermissionByOwnerIndex, PermissionLevel,
         PermissionLevelWeight,
-    }, error::ChainError, PublicKey
+    },
+    error::ChainError,
 };
 
-pub struct AuthorityChecker {
+pub struct AuthorityChecker<'a> {
     recursion_depth_limit: u16,
-    provided_keys: HashSet<PublicKey>,
+    provided_keys: &'a HashSet<PublicKey>,
     used_keys: HashSet<PublicKey>,
     cached_permissions: HashMap<PermissionLevel, PermissionCacheStatus>,
 }
@@ -23,11 +25,11 @@ enum PermissionCacheStatus {
     PermissionSatisfied,
 }
 
-impl AuthorityChecker {
-    pub fn new() -> Self {
+impl<'a> AuthorityChecker<'a> {
+    pub fn new(provided_keys: &'a HashSet<PublicKey>) -> Self {
         Self {
             recursion_depth_limit: 0,
-            provided_keys: HashSet::new(),
+            provided_keys: provided_keys,
             used_keys: HashSet::new(),
             cached_permissions: HashMap::new(),
         }
@@ -38,7 +40,7 @@ impl AuthorityChecker {
             return false;
         }
 
-        return self.provided_keys == self.used_keys;
+        return *self.provided_keys == self.used_keys;
     }
 
     pub fn satisfied(

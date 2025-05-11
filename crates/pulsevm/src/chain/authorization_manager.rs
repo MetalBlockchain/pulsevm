@@ -76,7 +76,7 @@ impl AuthorizationManager {
                 }
             }
 
-            let mut authority_checker = AuthorityChecker::new();
+            let mut authority_checker = AuthorityChecker::new(provided_keys);
 
             // Now verify that all the declared authorizations are satisfied
             for p in permissions_to_satisfy.iter() {
@@ -430,9 +430,15 @@ impl AuthorizationManager {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::Path, sync::{Arc, Mutex}};
+    use std::{
+        path::Path,
+        sync::{Arc, Mutex},
+    };
 
-    use crate::chain::{authority::{Authority, KeyWeight}, Id, Transaction};
+    use crate::chain::{
+        Id, Transaction,
+        authority::{Authority, KeyWeight},
+    };
 
     use super::*;
     use pulsevm_chainbase::Database;

@@ -46,7 +46,6 @@ impl Signature {
         let pub_key = rec_sig
             .recover(&msg)
             .map_err(|_| SignatureError::InvalidSignature)?;
-        println!("Recovered public key: {:?}", pub_key);
         Ok(PublicKey(pub_key))
     }
 }

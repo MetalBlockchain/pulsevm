@@ -2,9 +2,7 @@ use std::collections::HashSet;
 
 use pulsevm_serialization::{Deserialize, Serialize};
 
-use crate::chain::{
-    Id, PublicKey, Signature, error::ChainError,
-};
+use crate::chain::{Id, PublicKey, Signature, error::ChainError};
 
 use super::action::Action;
 
