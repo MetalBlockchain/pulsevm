@@ -1,6 +1,6 @@
 use pulsevm_serialization::{Deserialize, Serialize};
 
-use crate::chain::PublicKey;
+use crate::chain::{PublicKey, config::BillableSize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct KeyWeight {
@@ -34,5 +34,11 @@ impl Deserialize for KeyWeight {
         let key = PublicKey::deserialize(data, pos)?;
         let weight = u16::deserialize(data, pos)?;
         Ok(KeyWeight { key, weight })
+    }
+}
+
+impl BillableSize for KeyWeight {
+    fn billable_size() -> u64 {
+        8
     }
 }

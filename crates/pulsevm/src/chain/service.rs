@@ -16,7 +16,7 @@ use tonic::async_trait;
 
 use crate::mempool::Mempool;
 
-use super::{Controller, Transaction};
+use super::{Controller, NetworkManager, Transaction};
 
 #[rpc(server)]
 pub trait Rpc {
@@ -27,15 +27,21 @@ pub trait Rpc {
 
 #[derive(Clone)]
 pub struct RpcService {
-    mempool: Arc<Mutex<Mempool>>,
+    mempool: Arc<RwLock<Mempool>>,
     controller: Arc<RwLock<Controller>>,
+    network_manager: Arc<RwLock<NetworkManager>>,
 }
 
 impl RpcService {
-    pub fn new(mempool: Arc<Mutex<Mempool>>, controller: Arc<RwLock<Controller>>) -> Self {
+    pub fn new(
+        mempool: Arc<RwLock<Mempool>>,
+        controller: Arc<RwLock<Controller>>,
+        network_manager: Arc<RwLock<NetworkManager>>,
+    ) -> Self {
         RpcService {
             mempool,
             controller,
+            network_manager,
         }
     }
 
@@ -93,8 +99,15 @@ impl RpcServer for RpcService {
 
         // Add to mempool
         let mempool_clone = self.mempool.clone();
-        let mut mempool = mempool_clone.lock().await;
+        let mut mempool = mempool_clone.write().await;
         mempool.add_transaction(tx.clone());
+
+        // Gossip
+        let nm_clone = self.network_manager.clone();
+        let nm = nm_clone.read().await;
+        nm.gossip(tx_bytes)
+            .await
+            .map_err(|e| ErrorObjectOwned::owned(500, "gossip_error", Some(format!("{}", e))))?;
 
         // Return a simple response
         Ok(IssueTxResponse {

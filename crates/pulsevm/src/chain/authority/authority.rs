@@ -1,5 +1,7 @@
 use pulsevm_serialization::{Deserialize, Serialize};
 
+use crate::chain::config::{self, BillableSize, FIXED_OVERHEAD_SHARED_VECTOR_RAM_BYTES};
+
 use super::{key_weight::KeyWeight, permission_level_weight::PermissionLevelWeight};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
@@ -29,6 +31,36 @@ impl Authority {
     pub fn accounts(&self) -> &Vec<PermissionLevelWeight> {
         &self.accounts
     }
+
+    pub fn validate(&self) -> bool {
+        if (self.keys.len() + self.accounts.len()) > (1 << 16) {
+            return false; // overflow protection (assumes weight_type is uint16_t and threshold is of type uint32_t)
+        }
+        if self.threshold == 0 {
+            return false;
+        }
+        let mut total_weight = 0u32;
+        for key in &self.keys {
+            total_weight += key.weight() as u32;
+        }
+        for account in &self.accounts {
+            total_weight += account.weight() as u32;
+        }
+        return total_weight >= self.threshold;
+    }
+
+    pub fn get_billable_size(&self) -> u64 {
+        let accounts_size =
+            self.accounts.len() as u64 * config::billable_size_v::<PermissionLevelWeight>();
+        let mut keys_size: u64 = 0;
+
+        for _ in &self.keys {
+            keys_size += config::billable_size_v::<KeyWeight>();
+            keys_size += 65; // 65 bytes for the public key
+        }
+
+        accounts_size + keys_size
+    }
 }
 
 impl Serialize for Authority {
@@ -49,5 +81,11 @@ impl Deserialize for Authority {
             keys,
             accounts,
         })
+    }
+}
+
+impl BillableSize for Authority {
+    fn billable_size() -> u64 {
+        return (3 * FIXED_OVERHEAD_SHARED_VECTOR_RAM_BYTES as u64) + 4;
     }
 }

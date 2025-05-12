@@ -6,7 +6,7 @@ use std::{
     str::FromStr,
 };
 
-use crate::chain::ACTIVE_NAME;
+use crate::chain::{ACTIVE_NAME, Account, AccountMetadata};
 
 use super::{
     AuthorizationManager, Genesis, Id, Name, OWNER_NAME, PULSE_NAME, TransactionContext,
@@ -15,6 +15,7 @@ use super::{
     block::{Block, BlockByHeightIndex},
     error::ChainError,
     pulse_contract::newaccount,
+    resource_limits::ResourceLimitsManager,
     transaction::Transaction,
 };
 use pulsevm_chainbase::{Database, UndoSession};
@@ -24,12 +25,15 @@ use spdlog::info;
 
 pub struct Controller {
     authorization_manager: AuthorizationManager,
+    resource_limits_manager: ResourceLimitsManager,
 
     last_accepted_block: Block,
     preferred_id: Id,
     db: Database,
-    apply_handlers:
-        HashMap<Name, HashMap<(Name, Name), fn(&mut ApplyContext) -> Result<(), ChainError>>>,
+    apply_handlers: HashMap<
+        Name,
+        HashMap<(Name, Name), fn(&mut ApplyContext, &mut UndoSession) -> Result<(), ChainError>>,
+    >,
 }
 
 #[derive(Debug)]
@@ -51,6 +55,7 @@ impl Controller {
         let db = Database::temporary(Path::new("temp")).unwrap();
         let mut controller = Controller {
             authorization_manager: AuthorizationManager::new(),
+            resource_limits_manager: ResourceLimitsManager::new(),
 
             last_accepted_block: Block::default(),
             preferred_id: Id::default(),
@@ -74,13 +79,13 @@ impl Controller {
         db_path: String,
     ) -> Result<(), ControllerError> {
         self.db = Database::new(Path::new(&db_path)).map_err(|e| {
-            ControllerError::GenesisError(format!("Failed to open database: {}", e))
+            ControllerError::GenesisError(format!("failed to open database: {}", e))
         })?;
         // Parse genesis bytes
         let genesis = Genesis::parse(genesis_bytes)
-            .map_err(|e| ControllerError::GenesisError(format!("Failed to parse genesis: {}", e)))?
+            .map_err(|e| ControllerError::GenesisError(format!("failed to parse genesis: {}", e)))?
             .validate()
-            .map_err(|e| ControllerError::GenesisError(format!("Invalid genesis: {}", e)))?;
+            .map_err(|e| ControllerError::GenesisError(format!("invalid genesis: {}", e)))?;
 
         // Set our last accepted block to the genesis block
         self.last_accepted_block = Block::new(
@@ -95,19 +100,19 @@ impl Controller {
             .db
             .find_by_secondary::<Block, BlockByHeightIndex>(self.last_accepted_block.height)
             .map_err(|e| {
-                ControllerError::GenesisError(format!("Failed to find genesis block: {}", e))
+                ControllerError::GenesisError(format!("failed to find genesis block: {}", e))
             })?;
 
         if genesis_block.is_none() {
             // If not, insert it
             let mut session = self.db.undo_session().map_err(|e| {
-                ControllerError::GenesisError(format!("Failed to create undo session: {}", e))
+                ControllerError::GenesisError(format!("failed to create undo session: {}", e))
             })?;
             session.insert(&self.last_accepted_block).map_err(|e| {
-                ControllerError::GenesisError(format!("Failed to insert genesis block: {}", e))
+                ControllerError::GenesisError(format!("failed to insert genesis block: {}", e))
             })?;
             let default_key = genesis.initial_key().map_err(|e| {
-                ControllerError::GenesisError(format!("Failed to get initial key: {}", e))
+                ControllerError::GenesisError(format!("failed to get initial key: {}", e))
             })?;
             info!(
                 "initializing pulse account with default key: {}",
@@ -126,7 +131,7 @@ impl Controller {
                 )
                 .map_err(|e| {
                     ControllerError::GenesisError(format!(
-                        "Failed to create pulse@owner permission: {}",
+                        "failed to create pulse@owner permission: {}",
                         e
                     ))
                 })?;
@@ -141,7 +146,20 @@ impl Controller {
                 )
                 .map_err(|e| {
                     ControllerError::GenesisError(format!(
-                        "Failed to create pulse@owner permission: {}",
+                        "failed to create pulse@owner permission: {}",
+                        e
+                    ))
+                })?;
+            session
+                .insert(&Account::new(PULSE_NAME, 0, vec![]))
+                .map_err(|e| {
+                    ControllerError::GenesisError(format!("failed to insert pulse account: {}", e))
+                })?;
+            session
+                .insert(&AccountMetadata::new(PULSE_NAME))
+                .map_err(|e| {
+                    ControllerError::GenesisError(format!(
+                        "failed to insert pulse account metadata: {}",
                         e
                     ))
                 })?;
@@ -151,15 +169,19 @@ impl Controller {
         Ok(())
     }
 
+    // This function will execute a transaction and roll it back instantly
+    // This is useful for checking if a transaction is valid
     pub fn push_transaction(&self, transaction: &Transaction) -> Result<(), ChainError> {
         // Execute the transaction
-        let undo_session = self.db.undo_session().unwrap();
-        self.execute_transaction(&undo_session, transaction)
+        let mut undo_session = self.db.undo_session().unwrap();
+        self.execute_transaction(&mut undo_session, transaction)
     }
 
+    // This function will execute a transaction and commit it to the database
+    // This is useful for applying a transaction to the blockchain
     pub fn execute_transaction(
         &self,
-        undo_session: &UndoSession,
+        undo_session: &mut UndoSession,
         transaction: &Transaction,
     ) -> Result<(), ChainError> {
         // Verify authority
@@ -171,8 +193,8 @@ impl Controller {
             &HashSet::new(),
         )?;
 
-        let mut trx_context = TransactionContext::new(self, transaction, undo_session);
-        trx_context.exec()?;
+        let mut trx_context = TransactionContext::new(self, transaction);
+        trx_context.exec(undo_session)?;
         Ok(())
     }
 
@@ -221,7 +243,7 @@ impl Controller {
         receiver: Name,
         contract: Name,
         action: Name,
-        apply_handler: fn(&mut ApplyContext) -> Result<(), ChainError>,
+        apply_handler: fn(&mut ApplyContext, &mut UndoSession) -> Result<(), ChainError>,
     ) {
         self.apply_handlers
             .entry(receiver)
@@ -234,13 +256,21 @@ impl Controller {
         receiver: Name,
         scope: Name,
         act: Name,
-    ) -> Option<fn(&mut ApplyContext) -> Result<(), ChainError>> {
+    ) -> Option<fn(&mut ApplyContext, &mut UndoSession) -> Result<(), ChainError>> {
         if let Some(handlers) = self.apply_handlers.get(&receiver) {
             if let Some(handler) = handlers.get(&(scope, act)) {
                 return Some(*handler);
             }
         }
         None
+    }
+
+    pub fn get_authorization_manager(&self) -> &AuthorizationManager {
+        &self.authorization_manager
+    }
+
+    pub fn get_resource_limits_manager(&self) -> &ResourceLimitsManager {
+        &self.resource_limits_manager
     }
 }
 

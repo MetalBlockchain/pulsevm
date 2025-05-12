@@ -9,6 +9,7 @@ pub enum ChainError {
     PermissionNotFound(Name, Name),
     SignatureRecoverError(String),
     TransactionError(String),
+    NetworkError(String),
 }
 
 impl fmt::Display for ChainError {
@@ -23,6 +24,7 @@ impl fmt::Display for ChainError {
                 write!(f, "signature recover error: {}", msg)
             }
             ChainError::TransactionError(msg) => write!(f, "transaction error: {}", msg),
+            ChainError::NetworkError(msg) => write!(f, "network error: {}", msg),
         }
     }
 }

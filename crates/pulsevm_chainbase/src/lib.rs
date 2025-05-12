@@ -159,6 +159,19 @@ impl<'a> UndoSession<'a> {
     }
 
     #[must_use]
+    pub fn get<T: ChainbaseObject<'a> + 'static>(
+        &self,
+        key: T::PrimaryKey,
+    ) -> Result<T, Box<dyn Error>> {
+        let found = self.find::<T>(key)?;
+        if found.is_none() {
+            return Err("Object not found".into());
+        }
+        let object = found.unwrap();
+        Ok(object)
+    }
+
+    #[must_use]
     pub fn find_by_secondary<T: ChainbaseObject<'a>, S: SecondaryIndex<'a, T>>(
         &self,
         key: S::Key,
@@ -225,10 +238,10 @@ impl<'a> UndoSession<'a> {
         Ok(())
     }
 
-    pub fn modify<T, F>(&mut self, old: &T, f: F) -> Result<(), Box<dyn Error>>
+    pub fn modify<T, F>(&mut self, old: &mut T, f: F) -> Result<(), Box<dyn Error>>
     where
         T: ChainbaseObject<'a> + 'static,
-        F: FnOnce(&T) -> T,
+        F: FnOnce(&mut T),
     {
         let key = old.primary_key();
         let partition = self
@@ -238,9 +251,9 @@ impl<'a> UndoSession<'a> {
         if existing.is_none() {
             return Err("Object does not exist".into());
         }
-        let new = f(&old);
+        f(old);
         let serialized_old = existing.unwrap().to_vec();
-        let serialized_new = serialize(&new);
+        let serialized_new = serialize(old);
         self.changes.push_back(ObjectChange::Modified(
             key.to_owned(),
             serialized_old,

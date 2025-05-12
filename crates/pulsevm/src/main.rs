@@ -3,6 +3,7 @@ mod mempool;
 
 use chain::{Controller, Id, NodeId};
 use jsonrpsee::server::middleware::rpc::{self, rpc_service};
+use mempool::build_block_timer;
 use pulsevm_grpc::{
     http::{
         self, Element,
@@ -21,8 +22,9 @@ use std::{
 };
 use tokio::{
     net::TcpListener as TokioTcpListener,
-    signal,
+    signal, spawn,
     sync::{Mutex, RwLock},
+    task::JoinHandle,
 };
 use tonic::transport::server::TcpIncoming;
 use tonic::{Request, Response, Status, transport::Server};
@@ -104,17 +106,19 @@ async fn start_runtime_service(
 pub struct VirtualMachine {
     server_addr: SocketAddr,
     controller: Arc<RwLock<Controller>>,
-    mempool: Arc<Mutex<mempool::Mempool>>,
+    mempool: Arc<RwLock<mempool::Mempool>>,
     network_manager: Arc<RwLock<chain::NetworkManager>>,
     rpc_service: chain::RpcService,
+    block_timer: Arc<RwLock<Option<JoinHandle<()>>>>,
 }
 
 impl VirtualMachine {
     pub fn new(server_addr: SocketAddr) -> Result<Self, Box<dyn std::error::Error>> {
         let controller = Arc::new(RwLock::new(Controller::new()));
-        let mempool = Arc::new(Mutex::new(mempool::Mempool::new()));
+        let mempool = Arc::new(RwLock::new(mempool::Mempool::new()));
         let network_manager = Arc::new(RwLock::new(chain::NetworkManager::new()));
-        let rpc_service = chain::RpcService::new(mempool.clone(), controller.clone());
+        let rpc_service =
+            chain::RpcService::new(mempool.clone(), controller.clone(), network_manager.clone());
 
         Ok(Self {
             server_addr,
@@ -122,6 +126,7 @@ impl VirtualMachine {
             mempool: mempool,
             network_manager: network_manager,
             rpc_service: rpc_service,
+            block_timer: Arc::new(RwLock::new(None)),
         })
     }
 }
@@ -134,6 +139,7 @@ impl Vm for VirtualMachine {
     ) -> Result<tonic::Response<vm::InitializeResponse>, Status> {
         let genesis_bytes = request.get_ref().genesis_bytes.clone();
         let db_path = request.get_ref().chain_data_dir.clone();
+        let server_addr = request.get_ref().server_addr.clone();
         let controller = self.controller.clone();
         let mut controller = controller.write().await;
 
@@ -141,6 +147,16 @@ impl Vm for VirtualMachine {
         controller
             .initialize(&genesis_bytes, db_path)
             .map_err(|e| Status::internal(format!("could not initialize controller: {}", e)))?;
+
+        let network_manager = Arc::clone(&self.network_manager);
+        let mut network_manager = network_manager.write().await;
+        network_manager.set_server_address(server_addr.clone());
+
+        let mempool = Arc::clone(&self.mempool);
+        let mut mempool = mempool.write().await;
+        mempool.set_server_address(server_addr.clone());
+
+        build_block_timer(self.mempool.clone());
 
         return Ok(Response::new(vm::InitializeResponse {
             last_accepted_id: controller.last_accepted_block().id().as_bytes().to_vec(),

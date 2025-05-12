@@ -1,5 +1,7 @@
 use pulsevm_serialization::{Deserialize, Serialize};
 
+use crate::chain::config::BillableSize;
+
 use super::permission_level::PermissionLevel;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
@@ -34,5 +36,11 @@ impl Deserialize for PermissionLevelWeight {
         let permission = PermissionLevel::deserialize(data, pos)?;
         let weight = u16::deserialize(data, pos)?;
         Ok(PermissionLevelWeight { permission, weight })
+    }
+}
+
+impl BillableSize for PermissionLevelWeight {
+    fn billable_size() -> u64 {
+        24
     }
 }

@@ -2,6 +2,28 @@ use pulsevm_serialization::Deserialize;
 
 use super::{Name, authority::Authority};
 
+pub struct NewAccount {
+    pub creator: Name,
+    pub name: Name,
+    pub owner: Authority,
+    pub active: Authority,
+}
+
+impl Deserialize for NewAccount {
+    fn deserialize(data: &[u8], pos: &mut usize) -> Result<Self, pulsevm_serialization::ReadError> {
+        let creator = Name::deserialize(data, pos)?;
+        let name = Name::deserialize(data, pos)?;
+        let owner = Authority::deserialize(data, pos)?;
+        let active = Authority::deserialize(data, pos)?;
+        Ok(NewAccount {
+            creator,
+            name,
+            owner,
+            active,
+        })
+    }
+}
+
 pub struct UpdateAuth {
     pub account: Name,
     pub permission: Name,

@@ -1,7 +1,10 @@
 use pulsevm_chainbase::{ChainbaseObject, SecondaryIndex, SecondaryKey, UndoSession};
 use pulsevm_serialization::{Deserialize, Serialize};
 
-use crate::chain::{Id, Name};
+use crate::chain::{
+    Id, Name,
+    config::{self, BillableSize, OVERHEAD_PER_ROW_PER_INDEX_RAM_BYTES},
+};
 
 use super::authority::Authority;
 
@@ -134,5 +137,13 @@ impl<'a> SecondaryIndex<'a, Permission> for PermissionByOwnerIndex {
 
     fn index_name() -> &'static str {
         "permission_by_owner"
+    }
+}
+
+impl BillableSize for Permission {
+    fn billable_size() -> u64 {
+        let overhead: u64 = 5 * OVERHEAD_PER_ROW_PER_INDEX_RAM_BYTES as u64;
+        let value = (config::billable_size_v::<Authority>() + 64) + overhead;
+        value
     }
 }
