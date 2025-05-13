@@ -243,7 +243,7 @@ impl Vm for VirtualMachine {
         &self,
         request: Request<vm::BuildBlockRequest>,
     ) -> Result<tonic::Response<vm::BuildBlockResponse>, Status> {
-        info!("received request: {:?}", request);
+        info!("building block");
         let controller = self.controller.clone();
         let controller = controller.write().await;
         let block = controller
@@ -492,7 +492,7 @@ impl Vm for VirtualMachine {
         &self,
         request: Request<vm::BlockVerifyRequest>,
     ) -> Result<tonic::Response<vm::BlockVerifyResponse>, Status> {
-        info!("received request: {:?}", request);
+        info!("verifying block");
         let controller = self.controller.clone();
         let mut controller = controller.write().await;
         let block = controller
@@ -514,7 +514,7 @@ impl Vm for VirtualMachine {
         &self,
         request: Request<vm::BlockAcceptRequest>,
     ) -> Result<tonic::Response<()>, Status> {
-        info!("received request: {:?}", request);
+        info!("accepting block");
         let controller = self.controller.clone();
         let mut controller = controller.write().await;
         let block_id: Id = request
@@ -526,7 +526,7 @@ impl Vm for VirtualMachine {
         controller
             .accept_block(&block_id)
             .await
-            .map_err(|_| Status::internal("could not accept block"))?;
+            .map_err(|e| Status::internal(format!("could not accept block: {}", e)))?;
 
         Ok(Response::new(()))
     }

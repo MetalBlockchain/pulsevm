@@ -245,6 +245,10 @@ impl Controller {
             self.execute_transaction(&mut session, transaction)?;
         }
 
+        session.insert(block).map_err(|e| {
+            ChainError::TransactionError(format!("failed to insert block: {}", e))
+        })?;
+
         session.commit();
 
         self.verified_blocks.insert(block.id(), block.clone());
