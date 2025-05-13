@@ -2,7 +2,6 @@ use chrono::{DateTime, Utc};
 use prost_types::Timestamp;
 use pulsevm_chainbase::{ChainbaseObject, SecondaryIndex, SecondaryKey};
 use pulsevm_serialization::{Deserialize, Serialize, serialize};
-use sha2::Digest;
 
 use super::{Id, Transaction};
 

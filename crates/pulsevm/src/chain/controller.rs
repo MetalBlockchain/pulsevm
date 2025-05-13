@@ -1,27 +1,36 @@
 use core::fmt;
 use std::{
     collections::{HashMap, HashSet},
+    f32::consts::E,
+    io::Chain,
     iter::Map,
+    mem,
     path::Path,
     str::FromStr,
+    sync::Arc,
 };
 
-use crate::chain::{ACTIVE_NAME, Account, AccountMetadata};
+use crate::{
+    chain::{ACTIVE_NAME, Account, AccountMetadata},
+    mempool::Mempool,
+};
 
 use super::{
     AuthorizationManager, Genesis, Id, Name, OWNER_NAME, PULSE_NAME, TransactionContext,
     apply_context::ApplyContext,
     authority::{Authority, KeyWeight},
-    block::{Block, BlockByHeightIndex},
+    block::{Block, BlockByHeightIndex, BlockTimestamp},
     error::ChainError,
     pulse_contract::newaccount,
     resource_limits::ResourceLimitsManager,
-    transaction::Transaction,
+    transaction::{self, Transaction},
 };
+use chrono::{DateTime, Utc};
 use pulsevm_chainbase::{Database, UndoSession};
 use pulsevm_proc_macros::name;
 use pulsevm_serialization::Deserialize;
 use spdlog::info;
+use tokio::sync::RwLock;
 
 pub struct Controller {
     authorization_manager: AuthorizationManager,
@@ -34,6 +43,7 @@ pub struct Controller {
         Name,
         HashMap<(Name, Name), fn(&mut ApplyContext, &mut UndoSession) -> Result<(), ChainError>>,
     >,
+    verified_blocks: HashMap<Id, Block>,
 }
 
 #[derive(Debug)]
@@ -61,6 +71,7 @@ impl Controller {
             preferred_id: Id::default(),
             db: db,
             apply_handlers: HashMap::new(),
+            verified_blocks: HashMap::new(),
         };
 
         controller.set_apply_handler(
@@ -165,6 +176,95 @@ impl Controller {
                 })?;
             session.commit();
         }
+
+        Ok(())
+    }
+
+    pub async fn build_block(&self, mempool: Arc<RwLock<Mempool>>) -> Result<Block, ChainError> {
+        let mempool = mempool.clone();
+        let mut mempool = mempool.write().await;
+        let mut undo_session = self.db.undo_session().unwrap();
+        let mut transactions: Vec<Transaction> = Vec::new();
+
+        // Get transactions from the mempool
+        loop {
+            let transaction = mempool.pop_transaction();
+
+            if transaction.is_none() {
+                break;
+            }
+            let transaction = transaction.unwrap();
+            let result = self.execute_transaction(&mut undo_session, &transaction);
+            // TODO: Handle rollback behavior
+            if result.is_err() {
+                return Err(ChainError::TransactionError(format!(
+                    "failed to execute transaction: {}",
+                    result.unwrap_err()
+                )));
+            }
+
+            // Add the transaction to the block
+            transactions.push(transaction.clone());
+        }
+
+        // Create a new block
+        let timestamp = BlockTimestamp::new(Utc::now());
+        let block = Block::new(
+            self.preferred_id,
+            timestamp,
+            self.last_accepted_block.height + 1,
+            transactions,
+        );
+        Ok(block)
+    }
+
+    pub async fn verify_block(&mut self, block: &Block) -> Result<(), ChainError> {
+        if self.verified_blocks.contains_key(&block.id()) {
+            return Ok(());
+        }
+
+        // Verify the block
+        let mut session = self.db.undo_session().map_err(|e| {
+            ChainError::TransactionError(format!("failed to create undo session: {}", e))
+        })?;
+
+        // Make sure we don't have the block already
+        let existing_block = self
+            .db
+            .find::<Block>(block.id())
+            .map_err(|e| ChainError::TransactionError(format!("failed to find block: {}", e)))?;
+
+        if existing_block.is_some() {
+            return Ok(());
+        }
+
+        for transaction in &block.transactions {
+            // Verify the transaction
+            self.execute_transaction(&mut session, transaction)?;
+        }
+
+        session.commit();
+
+        self.verified_blocks.insert(block.id(), block.clone());
+
+        Ok(())
+    }
+
+    pub async fn accept_block(&mut self, block_id: &Id) -> Result<(), ChainError> {
+        let existing_block = self
+            .db
+            .find::<Block>(block_id.clone())
+            .map_err(|e| ChainError::TransactionError(format!("failed to find block: {}", e)))?;
+
+        if existing_block.is_none() {
+            return Err(ChainError::TransactionError(format!(
+                "block not found in database: {}",
+                block_id
+            )));
+        }
+
+        self.verified_blocks.remove(block_id);
+        self.last_accepted_block = existing_block.unwrap();
 
         Ok(())
     }

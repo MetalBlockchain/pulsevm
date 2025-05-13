@@ -51,7 +51,7 @@ pub fn newaccount(context: &mut ApplyContext, session: &mut UndoSession) -> Resu
     assert_or_err(
         existing_account.is_none(),
         ChainError::TransactionError(format!(
-            "Cannot create account named {}, as that name is already taken",
+            "cannot create account named {}, as that name is already taken",
             create.name
         )),
     )?;

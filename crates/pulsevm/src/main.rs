@@ -244,7 +244,20 @@ impl Vm for VirtualMachine {
         request: Request<vm::BuildBlockRequest>,
     ) -> Result<tonic::Response<vm::BuildBlockResponse>, Status> {
         info!("received request: {:?}", request);
-        Ok(Response::new(vm::BuildBlockResponse::default()))
+        let controller = self.controller.clone();
+        let controller = controller.write().await;
+        let block = controller
+            .build_block(self.mempool.clone())
+            .await
+            .map_err(|_| Status::internal("could not build block"))?;
+        Ok(Response::new(vm::BuildBlockResponse {
+            id: block.id().into(),
+            parent_id: block.parent_id.into(),
+            height: block.height,
+            bytes: block.bytes(),
+            timestamp: Some(block.timestamp.into()),
+            verify_with_context: false,
+        }))
     }
 
     async fn parse_block(
@@ -480,7 +493,21 @@ impl Vm for VirtualMachine {
         request: Request<vm::BlockVerifyRequest>,
     ) -> Result<tonic::Response<vm::BlockVerifyResponse>, Status> {
         info!("received request: {:?}", request);
-        Ok(Response::new(vm::BlockVerifyResponse::default()))
+        let controller = self.controller.clone();
+        let mut controller = controller.write().await;
+        let block = controller
+            .parse_block(&request.get_ref().bytes)
+            .map_err(|_| Status::internal("could not parse block"))?;
+
+        // Verify the block
+        controller
+            .verify_block(&block)
+            .await
+            .map_err(|_| Status::internal("could not verify block"))?;
+
+        Ok(Response::new(vm::BlockVerifyResponse {
+            timestamp: Some(block.timestamp.into()),
+        }))
     }
 
     async fn block_accept(
@@ -488,6 +515,19 @@ impl Vm for VirtualMachine {
         request: Request<vm::BlockAcceptRequest>,
     ) -> Result<tonic::Response<()>, Status> {
         info!("received request: {:?}", request);
+        let controller = self.controller.clone();
+        let mut controller = controller.write().await;
+        let block_id: Id = request
+            .get_ref()
+            .id
+            .clone()
+            .try_into()
+            .map_err(|_| Status::invalid_argument("invalid block id"))?;
+        controller
+            .accept_block(&block_id)
+            .await
+            .map_err(|_| Status::internal("could not accept block"))?;
+
         Ok(Response::new(()))
     }
 
