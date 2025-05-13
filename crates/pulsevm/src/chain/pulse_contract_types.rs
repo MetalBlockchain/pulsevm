@@ -124,3 +124,16 @@ impl Deserialize for SetCode {
         })
     }
 }
+
+pub struct SetAbi {
+    pub account: Name,
+    pub abi: Vec<u8>,
+}
+
+impl Deserialize for SetAbi {
+    fn deserialize(data: &[u8], pos: &mut usize) -> Result<Self, pulsevm_serialization::ReadError> {
+        let account = Name::deserialize(data, pos)?;
+        let abi = Vec::<u8>::deserialize(data, pos)?;
+        Ok(SetAbi { account, abi })
+    }
+}

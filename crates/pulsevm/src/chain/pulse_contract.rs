@@ -6,7 +6,7 @@ use sha2::{
 
 use super::{
     ACTIVE_NAME, Account, AccountMetadata, CODE_NAME, CodeObject, Id, NewAccount, OWNER_NAME,
-    SetCode,
+    SetAbi, SetCode,
     apply_context::ApplyContext,
     authority::{Authority, Permission, PermissionByOwnerIndex},
     config,
@@ -201,6 +201,42 @@ pub fn setcode(context: &mut ApplyContext, session: &mut UndoSession) -> Result<
             // TODO: a.last_code_update = current_block_number;
         })
         .map_err(|_| ChainError::TransactionError(format!("failed to update account")))?;
+
+    if new_size != old_size {
+        context.add_ram_usage(act.account, new_size - old_size);
+    }
+
+    Ok(())
+}
+
+pub fn setabi(context: &mut ApplyContext, session: &mut UndoSession) -> Result<(), ChainError> {
+    let act = context
+        .get_action()
+        .data_as::<SetAbi>()
+        .map_err(|e| ChainError::TransactionError(format!("failed to deserialize data: {}", e)))?;
+    context.require_authorization(act.account)?;
+
+    let mut account = session
+        .get::<Account>(act.account)
+        .map_err(|_| ChainError::TransactionError(format!("failed to find account")))?;
+
+    let old_size: i64 = account.abi.len() as i64;
+    let new_size: i64 = act.abi.len() as i64;
+
+    session
+        .modify(&mut account, |a| {
+            a.abi = act.abi.clone();
+        })
+        .map_err(|_| ChainError::TransactionError(format!("failed to update account")))?;
+
+    let mut account_metadata = session
+        .get::<AccountMetadata>(act.account)
+        .map_err(|_| ChainError::TransactionError(format!("failed to find account")))?;
+    session
+        .modify(&mut account_metadata, |a| {
+            a.abi_sequence += 1;
+        })
+        .map_err(|_| ChainError::TransactionError(format!("failed to update account metadata")))?;
 
     if new_size != old_size {
         context.add_ram_usage(act.account, new_size - old_size);
