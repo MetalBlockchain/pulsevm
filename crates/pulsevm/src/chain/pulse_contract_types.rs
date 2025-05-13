@@ -1,4 +1,4 @@
-use pulsevm_serialization::Deserialize;
+use pulsevm_serialization::{Deserialize, Serialize};
 
 use super::{Name, authority::Authority};
 
@@ -99,6 +99,28 @@ impl Deserialize for UnlinkAuth {
             account,
             code,
             message_type,
+        })
+    }
+}
+
+pub struct SetCode {
+    pub account: Name,
+    pub vm_type: u8,
+    pub vm_version: u8,
+    pub code: Vec<u8>,
+}
+
+impl Deserialize for SetCode {
+    fn deserialize(data: &[u8], pos: &mut usize) -> Result<Self, pulsevm_serialization::ReadError> {
+        let account = Name::deserialize(data, pos)?;
+        let vm_type = u8::deserialize(data, pos)?;
+        let vm_version = u8::deserialize(data, pos)?;
+        let code = Vec::<u8>::deserialize(data, pos)?;
+        Ok(SetCode {
+            account,
+            vm_type,
+            vm_version,
+            code,
         })
     }
 }

@@ -1,6 +1,6 @@
 use pulsevm_chainbase::UndoSession;
 
-use super::{Name, ResourceLimits, ResourceUsage, assert_or_err, error::ChainError};
+use super::{Name, ResourceLimits, ResourceUsage, error::ChainError, pulse_assert};
 
 pub struct ResourceLimitsManager {}
 
@@ -44,7 +44,7 @@ impl ResourceLimitsManager {
             ))
         })?;
 
-        assert_or_err(
+        pulse_assert(
             usage.ram_usage.checked_add_signed(ram_delta).is_some(),
             ChainError::TransactionError(format!("ram usage delta would underflow or overflow")),
         )?;

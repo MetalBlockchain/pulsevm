@@ -1,7 +1,7 @@
 use pulsevm_chainbase::{ChainbaseObject, SecondaryKey};
 use pulsevm_serialization::{Deserialize, Serialize};
 
-use crate::chain::Name;
+use crate::chain::{Id, Name};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct AccountMetadata {
@@ -10,7 +10,7 @@ pub struct AccountMetadata {
     pub auth_sequence: u64,
     pub code_sequence: u64,
     pub abi_sequence: u64,
-    pub code_hash: Vec<u8>,
+    pub code_hash: Id,
     pub last_code_update: u64,
     pub priviliged: bool,
     pub vm_type: u8,
@@ -25,7 +25,7 @@ impl AccountMetadata {
             auth_sequence: 0,
             code_sequence: 0,
             abi_sequence: 0,
-            code_hash: vec![],
+            code_hash: Id::default(),
             last_code_update: 0,
             priviliged: false,
             vm_type: 0,
@@ -60,7 +60,7 @@ impl Deserialize for AccountMetadata {
         let auth_sequence = u64::deserialize(data, pos)?;
         let code_sequence = u64::deserialize(data, pos)?;
         let abi_sequence = u64::deserialize(data, pos)?;
-        let code_hash = Vec::<u8>::deserialize(data, pos)?;
+        let code_hash = Id::deserialize(data, pos)?;
         let last_code_update = u64::deserialize(data, pos)?;
         let priviliged = bool::deserialize(data, pos)?;
         let vm_type = u8::deserialize(data, pos)?;

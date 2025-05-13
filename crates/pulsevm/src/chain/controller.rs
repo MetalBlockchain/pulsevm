@@ -21,7 +21,7 @@ use super::{
     authority::{Authority, KeyWeight},
     block::{Block, BlockByHeightIndex, BlockTimestamp},
     error::ChainError,
-    pulse_contract::newaccount,
+    pulse_contract::{newaccount, setcode},
     resource_limits::ResourceLimitsManager,
     transaction::{self, Transaction},
 };
@@ -80,6 +80,7 @@ impl Controller {
             Name::new(name!("newaccount")),
             newaccount,
         );
+        controller.set_apply_handler(PULSE_NAME, PULSE_NAME, Name::new(name!("setcode")), setcode);
 
         controller
     }

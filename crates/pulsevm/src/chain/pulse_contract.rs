@@ -1,12 +1,17 @@
 use pulsevm_chainbase::UndoSession;
+use sha2::{
+    Digest, Sha256,
+    digest::{consts::U32, generic_array::GenericArray},
+};
 
 use super::{
-    ACTIVE_NAME, Account, AccountMetadata, CODE_NAME, NewAccount, OWNER_NAME,
+    ACTIVE_NAME, Account, AccountMetadata, CODE_NAME, CodeObject, Id, NewAccount, OWNER_NAME,
+    SetCode,
     apply_context::ApplyContext,
-    assert_or_err,
     authority::{Authority, Permission, PermissionByOwnerIndex},
     config,
     error::ChainError,
+    pulse_assert, zero_hash,
 };
 
 pub fn newaccount(context: &mut ApplyContext, session: &mut UndoSession) -> Result<(), ChainError> {
@@ -15,20 +20,20 @@ pub fn newaccount(context: &mut ApplyContext, session: &mut UndoSession) -> Resu
         .data_as::<NewAccount>()
         .map_err(|e| ChainError::TransactionError(format!("failed to deserialize data: {}", e)))?;
     context.require_authorization(create.creator)?;
-    assert_or_err(
+    pulse_assert(
         create.owner.validate(),
         ChainError::TransactionError("invalid owner authority".to_string()),
     )?;
-    assert_or_err(
+    pulse_assert(
         create.active.validate(),
         ChainError::TransactionError("invalid active authority".to_string()),
     )?;
     let name_str = create.name.to_string();
-    assert_or_err(
+    pulse_assert(
         !create.name.empty(),
         ChainError::TransactionError("account name cannot be empty".to_string()),
     )?;
-    assert_or_err(
+    pulse_assert(
         name_str.len() <= 12,
         ChainError::TransactionError("account names can only be 12 chars long".to_string()),
     )?;
@@ -38,7 +43,7 @@ pub fn newaccount(context: &mut ApplyContext, session: &mut UndoSession) -> Resu
         .get::<AccountMetadata>(create.creator)
         .map_err(|_| ChainError::TransactionError(format!("failed to find creator account")))?;
     if !creator.is_privileged() {
-        assert_or_err(
+        pulse_assert(
             !name_str.starts_with("pulse."),
             ChainError::TransactionError(
                 "only privileged accounts can have names that start with 'pulse.'".to_string(),
@@ -48,7 +53,7 @@ pub fn newaccount(context: &mut ApplyContext, session: &mut UndoSession) -> Resu
     let existing_account = session
         .find::<Account>(create.name)
         .map_err(|_| ChainError::TransactionError(format!("failed to find account")))?;
-    assert_or_err(
+    pulse_assert(
         existing_account.is_none(),
         ChainError::TransactionError(format!(
             "cannot create account named {}, as that name is already taken",
@@ -95,6 +100,115 @@ pub fn newaccount(context: &mut ApplyContext, session: &mut UndoSession) -> Resu
     Ok(())
 }
 
+pub fn setcode(context: &mut ApplyContext, session: &mut UndoSession) -> Result<(), ChainError> {
+    let act = context
+        .get_action()
+        .data_as::<SetCode>()
+        .map_err(|e| ChainError::TransactionError(format!("failed to deserialize data: {}", e)))?;
+    context.require_authorization(act.account)?;
+
+    pulse_assert(
+        act.vm_type == 0,
+        ChainError::TransactionError(format!("code should be 0")),
+    )?;
+    pulse_assert(
+        act.vm_version == 0,
+        ChainError::TransactionError(format!("version should be 0")),
+    )?;
+
+    let mut code_hash: Id = Id::default();
+    let code_size = act.code.len() as u64;
+
+    if code_size > 0 {
+        code_hash = Id::from_sha256(act.code.as_slice());
+        // TODO: validate wasm
+    }
+
+    let mut account = session
+        .get::<AccountMetadata>(act.account)
+        .map_err(|_| ChainError::TransactionError(format!("failed to find account")))?;
+    let existing_code = account.code_hash != Id::default();
+
+    pulse_assert(
+        code_size > 0 || existing_code,
+        ChainError::TransactionError(format!("contract is already cleared")),
+    )?;
+
+    let mut old_size = 0i64;
+    let new_size: i64 = code_size as i64 * config::SETCODE_RAM_BYTES_MULTIPLIER as i64;
+
+    if existing_code {
+        let mut old_code_entry = session
+            .get::<CodeObject>(account.code_hash.clone())
+            .map_err(|_| ChainError::TransactionError(format!("failed to find code")))?;
+        pulse_assert(
+            old_code_entry.code_hash != code_hash,
+            ChainError::TransactionError(format!(
+                "contract is already running this version of code"
+            )),
+        )?;
+
+        old_size = old_code_entry.code.len() as i64 * config::SETCODE_RAM_BYTES_MULTIPLIER as i64;
+
+        if old_code_entry.code_ref_count == 1 {
+            session
+                .remove::<CodeObject>(old_code_entry)
+                .map_err(|_| ChainError::TransactionError(format!("failed to remove code")))?;
+        } else {
+            session
+                .modify(&mut old_code_entry, |code| {
+                    code.code_ref_count -= 1;
+                })
+                .map_err(|_| ChainError::TransactionError(format!("failed to update code")))?;
+        }
+    }
+
+    if code_size > 0 {
+        let new_code_entry = session
+            .find::<CodeObject>(code_hash.clone())
+            .map_err(|_| ChainError::TransactionError(format!("failed to find code")))?;
+
+        if new_code_entry.is_some() {
+            let mut new_code_entry = new_code_entry.unwrap();
+            session
+                .modify(&mut new_code_entry, |code| {
+                    code.code_ref_count += 1;
+                })
+                .map_err(|_| {
+                    ChainError::TransactionError(format!("failed to update code reference count"))
+                })?;
+        } else {
+            let new_code_entry = CodeObject {
+                code_hash: code_hash.clone(),
+                code: act.code.clone(),
+                code_ref_count: 1,
+                first_block_used: 0, // TODO: set to current block number
+                vm_type: act.vm_type,
+                vm_version: act.vm_version,
+            };
+            session
+                .insert(&new_code_entry)
+                .map_err(|_| ChainError::TransactionError(format!("failed to insert code")))?;
+        }
+    }
+
+    session
+        .modify(&mut account, |a| {
+            a.code_sequence += 1;
+            a.code_hash = code_hash.clone();
+            a.vm_type = act.vm_type;
+            a.vm_version = act.vm_version;
+            // TODO: a.last_code_update = current_block_number;
+        })
+        .map_err(|_| ChainError::TransactionError(format!("failed to update account")))?;
+
+    if new_size != old_size {
+        context.add_ram_usage(act.account, new_size - old_size);
+    }
+
+    Ok(())
+}
+
 fn validate_authority_precondition(
     session: &mut UndoSession,
     auth: &Authority,
@@ -103,7 +217,7 @@ fn validate_authority_precondition(
         let account = session
             .find::<Account>(a.permission().actor())
             .map_err(|_| ChainError::TransactionError(format!("failed to query db",)))?;
-        assert_or_err(
+        pulse_assert(
             account.is_some(),
             ChainError::TransactionError(format!(
                 "account {} does not exist",
@@ -130,7 +244,7 @@ fn validate_authority_precondition(
                     a.permission().permission()
                 ))
             })?;
-        assert_or_err(
+        pulse_assert(
             permission.is_some(),
             ChainError::TransactionError(format!("permission {} does not exist", a.permission())),
         )?;
