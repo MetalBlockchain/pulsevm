@@ -175,4 +175,8 @@ impl<'a, 'b> ApplyContext<'a, 'b> {
             .map_err(|e| ChainError::TransactionError(format!("failed to find account: {}", e)))?;
         Ok(exists)
     }
+
+    pub fn get_receiver(&self) -> Name {
+        self.receiver
+    }
 }

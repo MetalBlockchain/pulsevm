@@ -7,7 +7,7 @@ use wasmtime::{
 use super::{
     apply_context::ApplyContext,
     error::ChainError,
-    webassembly::{has_auth, is_account, require_auth},
+    webassembly::{action_data_size, current_receiver, has_auth, is_account, require_auth},
 };
 
 pub struct WasmContext<'a, 'b> {
@@ -59,6 +59,10 @@ impl<'a, 'b> WasmRuntime<'a, 'b> {
 
         // Add host functions to the linker.
         let mut linker = Linker::<WasmContext>::new(&engine);
+        // Action functions
+        linker.func_wrap("env", "action_data_size", action_data_size());
+        linker.func_wrap("env", "current_receiver", current_receiver());
+        // Authorization functions
         linker.func_wrap("env", "require_auth", require_auth());
         linker.func_wrap("env", "has_auth", has_auth());
         linker.func_wrap("env", "require_auth2", require_auth());
