@@ -84,6 +84,14 @@ impl<'a, 'b> ApplyContext<'a, 'b> {
         Ok(())
     }
 
+    pub fn schedule_action(
+        &mut self,
+        ordinal_of_action_to_schedule: u32,
+        receiver: Name,
+    ) -> Result<(), ChainError> {
+        Ok(())
+    }
+
     pub fn get_action(&self) -> &Action {
         &self.action
     }
@@ -99,6 +107,51 @@ impl<'a, 'b> ApplyContext<'a, 'b> {
             "missing authority of {}",
             account
         )));
+    }
+
+    pub fn require_authorization_with_permission(
+        &self,
+        account: Name,
+        permission: Name,
+    ) -> Result<(), ChainError> {
+        for auth in self.action.authorization() {
+            if auth.actor() == account && auth.permission() == permission {
+                return Ok(());
+            }
+        }
+
+        return Err(ChainError::TransactionError(format!(
+            "missing authority of {}/{}",
+            account, permission
+        )));
+    }
+
+    pub fn has_recipient(&self, recipient: Name) -> bool {
+        for p in self.notified.iter() {
+            if p.0 == recipient {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    pub fn require_recipient(&mut self, recipient: Name) {
+        if !self.has_recipient(recipient) {
+            self.notified.push_back((recipient, self.action_ordinal));
+        }
+
+        
+    }
+
+    pub fn has_authorization(&self, account: Name) -> bool {
+        for auth in self.action.authorization() {
+            if auth.actor() == account {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     pub fn add_ram_usage(&mut self, account: Name, ram_delta: i64) {

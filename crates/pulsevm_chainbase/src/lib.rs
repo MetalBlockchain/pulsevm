@@ -1,12 +1,19 @@
+mod index;
+
 use fjall::{Config, Slice, TransactionalKeyspace, WriteTransaction};
 use pulsevm_serialization::{Deserialize, Serialize, serialize};
 use std::{collections::VecDeque, error::Error, path::Path};
 
 pub trait ChainbaseObject<'a>: Default + Serialize + Deserialize {
-    type PrimaryKey;
+    type PrimaryKey: Deserialize;
 
     fn primary_key(&self) -> Vec<u8>;
-    fn primary_key_as_bytes(key: Self::PrimaryKey) -> Vec<u8>;
+    fn primary_key_to_bytes(key: Self::PrimaryKey) -> Vec<u8>;
+    fn primary_key_from_bytes(key: &[u8]) -> Result<Self::PrimaryKey, Box<dyn Error>> {
+        let mut pos = 0;
+        Ok(Self::PrimaryKey::deserialize(key, &mut pos)
+            .map_err(|_| format!("failed to deserialize primary key from bytes"))?)
+    }
     fn secondary_indexes(&self) -> Vec<SecondaryKey>;
     fn table_name() -> &'static str;
 }
@@ -20,7 +27,7 @@ pub trait SecondaryIndex<'a, C>
 where
     C: ChainbaseObject<'a>,
 {
-    type Key;
+    type Key: AsRef<[u8]> + Clone;
 
     fn secondary_key(&self, object: &C) -> Vec<u8>;
     fn secondary_key_as_bytes(key: Self::Key) -> Vec<u8>;
@@ -59,7 +66,7 @@ impl<'a> Database {
         let partition = self
             .keyspace
             .open_partition(T::table_name(), Default::default())?;
-        let res = partition.contains_key(T::primary_key_as_bytes(key))?;
+        let res = partition.contains_key(T::primary_key_to_bytes(key))?;
         Ok(res)
     }
 
@@ -71,7 +78,7 @@ impl<'a> Database {
         let partition = self
             .keyspace
             .open_partition(T::table_name(), Default::default())?;
-        let serialized = partition.get(T::primary_key_as_bytes(key))?;
+        let serialized = partition.get(T::primary_key_to_bytes(key))?;
         if serialized.is_none() {
             return Ok(None);
         }
@@ -136,7 +143,7 @@ impl<'a> UndoSession<'a> {
             .open_partition(T::table_name(), Default::default())?;
         let res = self
             .tx
-            .contains_key(&partition, T::primary_key_as_bytes(key))?;
+            .contains_key(&partition, T::primary_key_to_bytes(key))?;
         Ok(res)
     }
 
@@ -148,7 +155,7 @@ impl<'a> UndoSession<'a> {
         let partition = self
             .keyspace
             .open_partition(T::table_name(), Default::default())?;
-        let serialized = self.tx.get(&partition, T::primary_key_as_bytes(key))?;
+        let serialized = self.tx.get(&partition, T::primary_key_to_bytes(key))?;
         if serialized.is_none() {
             return Ok(None);
         }
@@ -327,9 +334,9 @@ mod tests {
         type PrimaryKey = u64;
 
         fn primary_key(&self) -> Vec<u8> {
-            TestObject::primary_key_as_bytes(self.id)
+            TestObject::primary_key_to_bytes(self.id)
         }
-        fn primary_key_as_bytes(key: Self::PrimaryKey) -> Vec<u8> {
+        fn primary_key_to_bytes(key: Self::PrimaryKey) -> Vec<u8> {
             key.to_be_bytes().to_vec()
         }
         fn secondary_indexes(&self) -> Vec<SecondaryKey> {

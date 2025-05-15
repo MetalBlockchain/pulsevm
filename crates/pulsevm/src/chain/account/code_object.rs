@@ -48,10 +48,10 @@ impl<'a> ChainbaseObject<'a> for CodeObject {
     type PrimaryKey = Id;
 
     fn primary_key(&self) -> Vec<u8> {
-        CodeObject::primary_key_as_bytes(self.code_hash)
+        CodeObject::primary_key_to_bytes(self.code_hash)
     }
 
-    fn primary_key_as_bytes(key: Self::PrimaryKey) -> Vec<u8> {
+    fn primary_key_to_bytes(key: Self::PrimaryKey) -> Vec<u8> {
         key.as_bytes().to_vec()
     }
 

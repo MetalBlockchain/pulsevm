@@ -89,7 +89,7 @@ impl<'a> ChainbaseObject<'a> for Block {
         self.id().as_bytes().to_vec()
     }
 
-    fn primary_key_as_bytes(key: Self::PrimaryKey) -> Vec<u8> {
+    fn primary_key_to_bytes(key: Self::PrimaryKey) -> Vec<u8> {
         key.0.to_vec()
     }
 

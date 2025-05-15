@@ -1,3 +1,5 @@
+use std::fmt;
+
 use pulsevm_serialization::{Deserialize, Serialize};
 
 use crate::chain::config::{self, BillableSize, FIXED_OVERHEAD_SHARED_VECTOR_RAM_BYTES};
@@ -9,6 +11,16 @@ pub struct Authority {
     threshold: u32,
     keys: Vec<KeyWeight>,
     accounts: Vec<PermissionLevelWeight>,
+}
+
+impl fmt::Display for Authority {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "authority {{ threshold: {}, keys: {:?}, accounts: {:?} }}",
+            self.threshold, self.keys, self.accounts
+        )
+    }
 }
 
 impl Authority {

@@ -5,10 +5,10 @@ use sha2::{
 };
 
 use super::{
-    ACTIVE_NAME, Account, AccountMetadata, CODE_NAME, CodeObject, Id, NewAccount, OWNER_NAME,
-    SetAbi, SetCode,
+    ACTIVE_NAME, Account, AccountMetadata, CODE_NAME, CodeObject, DeleteAuth, Id, NewAccount,
+    OWNER_NAME, SetAbi, SetCode, UpdateAuth,
     apply_context::ApplyContext,
-    authority::{Authority, Permission, PermissionByOwnerIndex},
+    authority::{Authority, Permission, PermissionByOwnerIndex, PermissionLevel},
     config,
     error::ChainError,
     pulse_assert, zero_hash,
@@ -241,6 +241,139 @@ pub fn setabi(context: &mut ApplyContext, session: &mut UndoSession) -> Result<(
     if new_size != old_size {
         context.add_ram_usage(act.account, new_size - old_size);
     }
+
+    Ok(())
+}
+
+pub fn updateauth(context: &mut ApplyContext, session: &mut UndoSession) -> Result<(), ChainError> {
+    let update = context
+        .get_action()
+        .data_as::<UpdateAuth>()
+        .map_err(|e| ChainError::TransactionError(format!("failed to deserialize data: {}", e)))?;
+    context.require_authorization(update.account)?;
+
+    pulse_assert(
+        !update.permission.empty(),
+        ChainError::TransactionError(format!("cannot create authority with empty name")),
+    )?;
+    pulse_assert(
+        !update.permission.to_string().starts_with("pulse."),
+        ChainError::TransactionError(format!(
+            "permission names that start with 'pulse.' are reserved"
+        )),
+    )?;
+    pulse_assert(
+        update.permission != update.parent,
+        ChainError::TransactionError(format!("cannot set an authority as its own parent")),
+    )?;
+
+    session.get::<Account>(update.account).map_err(|_| {
+        ChainError::TransactionError(format!("failed to find account {}", update.account))
+    })?;
+
+    pulse_assert(
+        update.auth.validate(),
+        ChainError::TransactionError(format!("invalid authority: {}", update.auth)),
+    )?;
+
+    if update.permission == ACTIVE_NAME {
+        pulse_assert(
+            update.parent == OWNER_NAME,
+            ChainError::TransactionError(format!(
+                "cannot change active authority's parent from owner"
+            )),
+        )?;
+    } else if update.permission == OWNER_NAME {
+        pulse_assert(
+            update.parent.empty(),
+            ChainError::TransactionError(format!("cannot change owner authority's parent")),
+        )?;
+    } else {
+        pulse_assert(
+            !update.permission.empty(),
+            ChainError::TransactionError(format!("only owner permission can have empty parent")),
+        )?;
+    }
+
+    validate_authority_precondition(session, &update.auth)?;
+
+    let permission = context
+        .controller
+        .get_authorization_manager()
+        .find_permission(
+            session,
+            &PermissionLevel::new(update.account, update.permission),
+        )?;
+
+    let mut parent_id = 0u64;
+    if (update.permission != OWNER_NAME) {
+        let parent = context
+            .controller
+            .get_authorization_manager()
+            .get_permission(
+                session,
+                &PermissionLevel::new(update.account, update.parent),
+            )?;
+        parent_id = parent.id();
+    }
+
+    if permission.is_some() {
+        let mut permission = permission.unwrap();
+        pulse_assert(
+            parent_id == permission.parent_id(),
+            ChainError::TransactionError(format!(
+                "changing parent authority is not currently supported"
+            )),
+        )?;
+
+        let old_size: i64 = config::billable_size_v::<Permission>() as i64
+            + permission.authority.get_billable_size() as i64;
+        context
+            .controller
+            .get_authorization_manager()
+            .modify_permission(session, &mut permission, &update.auth)?;
+        let new_size: i64 = config::billable_size_v::<Permission>() as i64
+            + permission.authority.get_billable_size() as i64;
+
+        context.add_ram_usage(permission.owner, new_size - old_size);
+    } else {
+        let p = context
+            .controller
+            .get_authorization_manager()
+            .create_permission(
+                session,
+                update.account,
+                update.permission,
+                parent_id,
+                update.auth,
+            )?;
+
+        let new_size: i64 =
+            config::billable_size_v::<Permission>() as i64 + p.authority.get_billable_size() as i64;
+
+        context.add_ram_usage(update.account, new_size);
+    }
+
+    Ok(())
+}
+
+pub fn deleteauth(context: &mut ApplyContext, session: &mut UndoSession) -> Result<(), ChainError> {
+    let remove = context
+        .get_action()
+        .data_as::<DeleteAuth>()
+        .map_err(|e| ChainError::TransactionError(format!("failed to deserialize data: {}", e)))?;
+    context.require_authorization(remove.account)?;
+
+    pulse_assert(
+        remove.permission != ACTIVE_NAME,
+        ChainError::TransactionError(format!("cannot delete active authority")),
+    )?;
+    pulse_assert(
+        remove.permission != OWNER_NAME,
+        ChainError::TransactionError(format!("cannot delete owner authority")),
+    )?;
+
+    let authorization = context.controller.get_authorization_manager();
 
     Ok(())
 }

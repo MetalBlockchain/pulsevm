@@ -85,10 +85,10 @@ impl<'a> ChainbaseObject<'a> for AccountMetadata {
     type PrimaryKey = Name;
 
     fn primary_key(&self) -> Vec<u8> {
-        AccountMetadata::primary_key_as_bytes(self.name)
+        AccountMetadata::primary_key_to_bytes(self.name)
     }
 
-    fn primary_key_as_bytes(key: Self::PrimaryKey) -> Vec<u8> {
+    fn primary_key_to_bytes(key: Self::PrimaryKey) -> Vec<u8> {
         key.as_u64().to_be_bytes().to_vec()
     }
 

@@ -301,7 +301,7 @@ impl AuthorizationManager {
         Ok(())
     }
 
-    fn find_permission(
+    pub fn find_permission(
         &self,
         session: &UndoSession,
         level: &PermissionLevel,
@@ -323,7 +323,7 @@ impl AuthorizationManager {
         Ok(Some(result.unwrap()))
     }
 
-    fn get_permission(
+    pub fn get_permission(
         &self,
         session: &UndoSession,
         level: &PermissionLevel,
@@ -425,6 +425,22 @@ impl AuthorizationManager {
             ChainError::AuthorizationError(format!("Failed to create permission: {}", e))
         })?;
         Ok(permission)
+    }
+
+    pub fn modify_permission(
+        &self,
+        session: &mut UndoSession,
+        permission: &mut Permission,
+        auth: &Authority,
+    ) -> Result<(), ChainError> {
+        session
+            .modify(permission, |po| {
+                po.authority = auth.clone();
+            })
+            .map_err(|e| {
+                ChainError::AuthorizationError(format!("Failed to create permission: {}", e))
+            })?;
+        Ok(())
     }
 }
 

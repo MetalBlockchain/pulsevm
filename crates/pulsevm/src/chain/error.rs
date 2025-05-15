@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{error::Error, fmt};
 
 use super::Name;
 
@@ -10,6 +10,7 @@ pub enum ChainError {
     SignatureRecoverError(String),
     TransactionError(String),
     NetworkError(String),
+    WasmRuntimeError(String),
 }
 
 impl fmt::Display for ChainError {
@@ -25,6 +26,21 @@ impl fmt::Display for ChainError {
             }
             ChainError::TransactionError(msg) => write!(f, "transaction error: {}", msg),
             ChainError::NetworkError(msg) => write!(f, "network error: {}", msg),
+            ChainError::WasmRuntimeError(msg) => write!(f, "wasm runtime error: {}", msg),
+        }
+    }
+}
+
+impl Error for ChainError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            ChainError::InternalError() => None,
+            ChainError::AuthorizationError(_) => None,
+            ChainError::PermissionNotFound(_, _) => None,
+            ChainError::SignatureRecoverError(_) => None,
+            ChainError::TransactionError(_) => None,
+            ChainError::NetworkError(_) => None,
+            ChainError::WasmRuntimeError(_) => None,
         }
     }
 }

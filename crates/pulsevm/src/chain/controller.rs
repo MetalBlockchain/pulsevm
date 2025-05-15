@@ -21,7 +21,7 @@ use super::{
     authority::{Authority, KeyWeight},
     block::{Block, BlockByHeightIndex, BlockTimestamp},
     error::ChainError,
-    pulse_contract::{newaccount, setabi, setcode},
+    pulse_contract::{newaccount, setabi, setcode, updateauth},
     resource_limits::ResourceLimitsManager,
     transaction::{self, Transaction},
 };
@@ -82,6 +82,12 @@ impl Controller {
         );
         controller.set_apply_handler(PULSE_NAME, PULSE_NAME, Name::new(name!("setcode")), setcode);
         controller.set_apply_handler(PULSE_NAME, PULSE_NAME, Name::new(name!("setabi")), setabi);
+        controller.set_apply_handler(
+            PULSE_NAME,
+            PULSE_NAME,
+            Name::new(name!("updateauth")),
+            updateauth,
+        );
 
         controller
     }
@@ -245,9 +251,9 @@ impl Controller {
             self.execute_transaction(&mut session, transaction)?;
         }
 
-        session.insert(block).map_err(|e| {
-            ChainError::TransactionError(format!("failed to insert block: {}", e))
-        })?;
+        session
+            .insert(block)
+            .map_err(|e| ChainError::TransactionError(format!("failed to insert block: {}", e)))?;
 
         session.commit();
 

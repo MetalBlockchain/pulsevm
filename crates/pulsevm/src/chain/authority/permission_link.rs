@@ -88,10 +88,10 @@ impl<'a> ChainbaseObject<'a> for PermissionLink {
     type PrimaryKey = Id;
 
     fn primary_key(&self) -> Vec<u8> {
-        PermissionLink::primary_key_as_bytes(self.id)
+        PermissionLink::primary_key_to_bytes(self.id)
     }
 
-    fn primary_key_as_bytes(key: Self::PrimaryKey) -> Vec<u8> {
+    fn primary_key_to_bytes(key: Self::PrimaryKey) -> Vec<u8> {
         key.0.to_vec()
     }
 

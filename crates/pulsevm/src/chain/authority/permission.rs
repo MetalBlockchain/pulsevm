@@ -99,10 +99,10 @@ impl<'a> ChainbaseObject<'a> for Permission {
     type PrimaryKey = u64;
 
     fn primary_key(&self) -> Vec<u8> {
-        Permission::primary_key_as_bytes(self.id)
+        Permission::primary_key_to_bytes(self.id)
     }
 
-    fn primary_key_as_bytes(key: Self::PrimaryKey) -> Vec<u8> {
+    fn primary_key_to_bytes(key: Self::PrimaryKey) -> Vec<u8> {
         key.to_be_bytes().to_vec()
     }
 

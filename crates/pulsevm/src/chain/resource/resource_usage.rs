@@ -50,10 +50,10 @@ impl<'a> ChainbaseObject<'a> for ResourceUsage {
     type PrimaryKey = Name;
 
     fn primary_key(&self) -> Vec<u8> {
-        ResourceUsage::primary_key_as_bytes(self.owner)
+        ResourceUsage::primary_key_to_bytes(self.owner)
     }
 
-    fn primary_key_as_bytes(key: Self::PrimaryKey) -> Vec<u8> {
+    fn primary_key_to_bytes(key: Self::PrimaryKey) -> Vec<u8> {
         key.as_u64().to_be_bytes().to_vec()
     }
 
