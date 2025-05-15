@@ -10,7 +10,7 @@ use super::{
 };
 
 pub struct WasmContext<'a, 'b> {
-    pub context: &'a ApplyContext<'a, 'b>,
+    pub context: &'a mut ApplyContext<'a, 'b>,
 }
 
 pub struct WasmRuntime<'a, 'b> {
@@ -60,6 +60,7 @@ impl<'a, 'b> WasmRuntime<'a, 'b> {
         linker.func_wrap("env", "require_auth", require_auth());
         linker.func_wrap("env", "has_auth", has_auth());
         linker.func_wrap("env", "require_auth2", require_auth());
+        linker.func_wrap("env", "require_recipient", require_auth());
 
         Ok(Self {
             config: config.to_owned(),
@@ -68,8 +69,12 @@ impl<'a, 'b> WasmRuntime<'a, 'b> {
         })
     }
 
-    pub fn run(&self, context: &'a ApplyContext<'a, 'b>, bytes: Vec<u8>) -> Result<(), ChainError> {
-        let wasm_context = WasmContext { context: &context };
+    pub fn run(
+        &self,
+        context: &'a mut ApplyContext<'a, 'b>,
+        bytes: Vec<u8>,
+    ) -> Result<(), ChainError> {
+        let wasm_context = WasmContext { context: context };
         let mut store = Store::new(&self.engine, wasm_context);
         let module = Module::new(&self.engine, bytes)
             .map_err(|e| ChainError::WasmRuntimeError(e.to_string()))?;

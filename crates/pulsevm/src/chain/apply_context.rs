@@ -84,12 +84,17 @@ impl<'a, 'b> ApplyContext<'a, 'b> {
         Ok(())
     }
 
-    pub fn schedule_action(
+    pub fn schedule_action_from_ordinal(
         &mut self,
         ordinal_of_action_to_schedule: u32,
         receiver: Name,
-    ) -> Result<(), ChainError> {
-        Ok(())
+    ) -> Result<u32, ChainError> {
+        let scheduled_action_ordinal = self.transaction_context.schedule_action_from_ordinal(
+            ordinal_of_action_to_schedule,
+            receiver,
+            self.action_ordinal,
+        )?;
+        Ok(scheduled_action_ordinal)
     }
 
     pub fn get_action(&self) -> &Action {
@@ -136,12 +141,14 @@ impl<'a, 'b> ApplyContext<'a, 'b> {
         false
     }
 
-    pub fn require_recipient(&mut self, recipient: Name) {
+    pub fn require_recipient(&mut self, recipient: Name) -> Result<(), ChainError> {
         if !self.has_recipient(recipient) {
-            self.notified.push_back((recipient, self.action_ordinal));
+            let scheduled_ordinal =
+                self.schedule_action_from_ordinal(self.action_ordinal, recipient)?;
+            self.notified.push_back((recipient, scheduled_ordinal));
         }
 
-        
+        Ok(())
     }
 
     pub fn has_authorization(&self, account: Name) -> bool {

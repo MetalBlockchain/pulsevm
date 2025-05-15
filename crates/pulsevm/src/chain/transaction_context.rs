@@ -50,6 +50,26 @@ impl<'a> TransactionContext<'a> {
         new_action_ordinal
     }
 
+    pub fn schedule_action_from_ordinal(
+        &mut self,
+        action_ordinal: u32,
+        receiver: Name,
+        creator_action_ordinal: u32,
+    ) -> Result<u32, ChainError> {
+        let new_action_ordinal = (self.action_traces.len() as u32) + 1;
+        let provided_action = self
+            .get_action_trace(action_ordinal)
+            .ok_or(ChainError::TransactionError(format!("action not found")))?;
+        let action_trace = ActionTrace::new(
+            new_action_ordinal,
+            creator_action_ordinal,
+            receiver.clone(),
+            provided_action.action().clone(),
+        );
+        self.action_traces.push(action_trace);
+        Ok(new_action_ordinal)
+    }
+
     pub fn execute_action(
         &mut self,
         session: &mut UndoSession,

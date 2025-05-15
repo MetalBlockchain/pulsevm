@@ -41,3 +41,18 @@ pub fn require_auth2() -> impl Fn(Caller<'_, WasmContext>, u64, u64) -> Result<(
         }
     }
 }
+
+pub fn require_recipient() -> impl Fn(Caller<'_, WasmContext>, u64) -> Result<(), wasmtime::Error> {
+    |mut caller, recipient| {
+        if caller
+            .data_mut()
+            .context
+            .require_recipient(recipient.into())
+            .is_err()
+        {
+            bail!("failed to require recipient");
+        } else {
+            Ok(())
+        }
+    }
+}
