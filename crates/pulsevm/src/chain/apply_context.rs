@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 
 use pulsevm_chainbase::UndoSession;
 
-use super::{Action, Controller, Name, TransactionContext, error::ChainError};
+use super::{Account, Action, Controller, Name, TransactionContext, error::ChainError};
 
 pub struct ApplyContext<'a, 'b> {
     action: Action,     // The action being applied
@@ -166,5 +166,13 @@ impl<'a, 'b> ApplyContext<'a, 'b> {
             .entry(account)
             .and_modify(|d| *d += ram_delta)
             .or_insert(ram_delta);
+    }
+
+    pub fn is_account(&self, session: &UndoSession, account: Name) -> Result<bool, ChainError> {
+        let exists = session
+            .find::<Account>(account)
+            .map(|account| account.is_some())
+            .map_err(|e| ChainError::TransactionError(format!("failed to find account: {}", e)))?;
+        Ok(exists)
     }
 }

@@ -56,3 +56,16 @@ pub fn require_recipient() -> impl Fn(Caller<'_, WasmContext>, u64) -> Result<()
         }
     }
 }
+
+pub fn is_account() -> impl Fn(Caller<'_, WasmContext>, u64) -> Result<i32, wasmtime::Error> {
+    |caller, recipient| {
+        let data = caller.data();
+        let result = data.context.is_account(data.session, recipient.into());
+
+        if result.is_err() {
+            bail!("failed to check if account exists");
+        } else {
+            Ok(result.unwrap() as i32)
+        }
+    }
+}
