@@ -7,7 +7,10 @@ use wasmtime::{
 use super::{
     apply_context::ApplyContext,
     error::ChainError,
-    webassembly::{action_data_size, current_receiver, has_auth, is_account, require_auth},
+    webassembly::{
+        action_data_size, current_receiver, has_auth, is_account, memcmp, memcpy, memmove, memset,
+        require_auth, send_inline,
+    },
 };
 
 pub struct WasmContext<'a, 'b> {
@@ -68,6 +71,13 @@ impl<'a, 'b> WasmRuntime<'a, 'b> {
         linker.func_wrap("env", "require_auth2", require_auth());
         linker.func_wrap("env", "require_recipient", require_auth());
         linker.func_wrap("env", "is_account", is_account());
+        // Memory functions
+        linker.func_wrap("env", "memcpy", memcpy());
+        linker.func_wrap("env", "memmove", memmove());
+        linker.func_wrap("env", "memcmp", memcmp());
+        linker.func_wrap("env", "memset", memset());
+        // Transaction functions
+        linker.func_wrap("env", "send_inline", send_inline());
 
         Ok(Self {
             config: config.to_owned(),
