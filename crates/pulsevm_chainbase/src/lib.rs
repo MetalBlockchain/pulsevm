@@ -27,7 +27,7 @@ pub trait SecondaryIndex<'a, C>
 where
     C: ChainbaseObject<'a>,
 {
-    type Key: AsRef<[u8]> + Clone;
+    type Key: Clone;
 
     fn secondary_key(&self, object: &C) -> Vec<u8>;
     fn secondary_key_as_bytes(key: Self::Key) -> Vec<u8>;
@@ -121,7 +121,7 @@ impl<'a> Database {
 pub struct UndoSession<'a> {
     changes: VecDeque<ObjectChange>,
     tx: WriteTransaction<'a>,
-    keyspace: &'a TransactionalKeyspace,
+    keyspace: TransactionalKeyspace,
 }
 
 impl<'a> UndoSession<'a> {
@@ -129,7 +129,7 @@ impl<'a> UndoSession<'a> {
         Ok(Self {
             changes: VecDeque::new(),
             tx: keyspace.write_tx(),
-            keyspace: keyspace,
+            keyspace: keyspace.clone(),
         })
     }
 

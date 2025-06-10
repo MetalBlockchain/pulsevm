@@ -4,6 +4,8 @@ use sha2::{
     digest::{consts::U32, generic_array::GenericArray},
 };
 
+use crate::chain::Controller;
+
 use super::{
     ACTIVE_NAME, Account, AccountMetadata, CODE_NAME, CodeObject, DeleteAuth, Id, NewAccount,
     OWNER_NAME, SetAbi, SetCode, UpdateAuth,
@@ -14,7 +16,11 @@ use super::{
     pulse_assert, zero_hash,
 };
 
-pub fn newaccount(context: &mut ApplyContext, session: &mut UndoSession) -> Result<(), ChainError> {
+pub fn newaccount(
+    controller: &Controller,
+    context: &mut ApplyContext,
+    session: &mut UndoSession,
+) -> Result<(), ChainError> {
     let create = context
         .get_action()
         .data_as::<NewAccount>()
@@ -70,23 +76,22 @@ pub fn newaccount(context: &mut ApplyContext, session: &mut UndoSession) -> Resu
     validate_authority_precondition(session, &create.owner)?;
     validate_authority_precondition(session, &create.active)?;
 
-    let owner_permission = context
-        .controller
-        .get_authorization_manager()
-        .create_permission(session, create.name, OWNER_NAME, 0, create.owner)?;
-    let active_permission = context
-        .controller
-        .get_authorization_manager()
-        .create_permission(
-            session,
-            create.name,
-            ACTIVE_NAME,
-            owner_permission.id(),
-            create.active,
-        )?;
+    let owner_permission = controller.get_authorization_manager().create_permission(
+        session,
+        create.name,
+        OWNER_NAME,
+        0,
+        create.owner,
+    )?;
+    let active_permission = controller.get_authorization_manager().create_permission(
+        session,
+        create.name,
+        ACTIVE_NAME,
+        owner_permission.id(),
+        create.active,
+    )?;
 
-    context
-        .controller
+    controller
         .get_resource_limits_manager()
         .initialize_account(session, create.name)?;
 
@@ -100,7 +105,11 @@ pub fn newaccount(context: &mut ApplyContext, session: &mut UndoSession) -> Resu
     Ok(())
 }
 
-pub fn setcode(context: &mut ApplyContext, session: &mut UndoSession) -> Result<(), ChainError> {
+pub fn setcode(
+    controller: &Controller,
+    context: &mut ApplyContext,
+    session: &mut UndoSession,
+) -> Result<(), ChainError> {
     let act = context
         .get_action()
         .data_as::<SetCode>()
@@ -209,7 +218,11 @@ pub fn setcode(context: &mut ApplyContext, session: &mut UndoSession) -> Result<
     Ok(())
 }
 
-pub fn setabi(context: &mut ApplyContext, session: &mut UndoSession) -> Result<(), ChainError> {
+pub fn setabi(
+    controller: &Controller,
+    context: &mut ApplyContext,
+    session: &mut UndoSession,
+) -> Result<(), ChainError> {
     let act = context
         .get_action()
         .data_as::<SetAbi>()
@@ -245,7 +258,11 @@ pub fn setabi(context: &mut ApplyContext, session: &mut UndoSession) -> Result<(
     Ok(())
 }
 
-pub fn updateauth(context: &mut ApplyContext, session: &mut UndoSession) -> Result<(), ChainError> {
+pub fn updateauth(
+    controller: &Controller,
+    context: &mut ApplyContext,
+    session: &mut UndoSession,
+) -> Result<(), ChainError> {
     let update = context
         .get_action()
         .data_as::<UpdateAuth>()
@@ -297,23 +314,17 @@ pub fn updateauth(context: &mut ApplyContext, session: &mut UndoSession) -> Resu
 
     validate_authority_precondition(session, &update.auth)?;
 
-    let permission = context
-        .controller
-        .get_authorization_manager()
-        .find_permission(
-            session,
-            &PermissionLevel::new(update.account, update.permission),
-        )?;
+    let permission = controller.get_authorization_manager().find_permission(
+        session,
+        &PermissionLevel::new(update.account, update.permission),
+    )?;
 
     let mut parent_id = 0u64;
     if (update.permission != OWNER_NAME) {
-        let parent = context
-            .controller
-            .get_authorization_manager()
-            .get_permission(
-                session,
-                &PermissionLevel::new(update.account, update.parent),
-            )?;
+        let parent = controller.get_authorization_manager().get_permission(
+            session,
+            &PermissionLevel::new(update.account, update.parent),
+        )?;
         parent_id = parent.id();
     }
 
@@ -328,25 +339,23 @@ pub fn updateauth(context: &mut ApplyContext, session: &mut UndoSession) -> Resu
 
         let old_size: i64 = config::billable_size_v::<Permission>() as i64
             + permission.authority.get_billable_size() as i64;
-        context
-            .controller
-            .get_authorization_manager()
-            .modify_permission(session, &mut permission, &update.auth)?;
+        controller.get_authorization_manager().modify_permission(
+            session,
+            &mut permission,
+            &update.auth,
+        )?;
         let new_size: i64 = config::billable_size_v::<Permission>() as i64
             + permission.authority.get_billable_size() as i64;
 
         context.add_ram_usage(permission.owner, new_size - old_size);
     } else {
-        let p = context
-            .controller
-            .get_authorization_manager()
-            .create_permission(
-                session,
-                update.account,
-                update.permission,
-                parent_id,
-                update.auth,
-            )?;
+        let p = controller.get_authorization_manager().create_permission(
+            session,
+            update.account,
+            update.permission,
+            parent_id,
+            update.auth,
+        )?;
 
         let new_size: i64 =
             config::billable_size_v::<Permission>() as i64 + p.authority.get_billable_size() as i64;
@@ -357,7 +366,11 @@ pub fn updateauth(context: &mut ApplyContext, session: &mut UndoSession) -> Resu
     Ok(())
 }
 
-pub fn deleteauth(context: &mut ApplyContext, session: &mut UndoSession) -> Result<(), ChainError> {
+pub fn deleteauth(
+    controller: &Controller,
+    context: &mut ApplyContext,
+    session: &mut UndoSession,
+) -> Result<(), ChainError> {
     let remove = context
         .get_action()
         .data_as::<DeleteAuth>()
@@ -373,7 +386,7 @@ pub fn deleteauth(context: &mut ApplyContext, session: &mut UndoSession) -> Resu
         ChainError::TransactionError(format!("cannot delete owner authority")),
     )?;
 
-    let authorization = context.controller.get_authorization_manager();
+    let authorization = controller.get_authorization_manager();
 
     Ok(())
 }

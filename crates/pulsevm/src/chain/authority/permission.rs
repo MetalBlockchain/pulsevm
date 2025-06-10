@@ -2,7 +2,7 @@ use pulsevm_chainbase::{ChainbaseObject, SecondaryIndex, SecondaryKey, UndoSessi
 use pulsevm_serialization::{Deserialize, Serialize};
 
 use crate::chain::{
-    Id, Name,
+    Name,
     config::{self, BillableSize, OVERHEAD_PER_ROW_PER_INDEX_RAM_BYTES},
 };
 

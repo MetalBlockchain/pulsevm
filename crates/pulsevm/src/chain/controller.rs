@@ -24,6 +24,7 @@ use super::{
     pulse_contract::{newaccount, setabi, setcode, updateauth},
     resource_limits::ResourceLimitsManager,
     transaction::{self, Transaction},
+    wasm_runtime::WasmRuntime,
 };
 use chrono::{DateTime, Utc};
 use pulsevm_chainbase::{Database, UndoSession};
@@ -32,16 +33,20 @@ use pulsevm_serialization::Deserialize;
 use spdlog::info;
 use tokio::sync::RwLock;
 
-pub struct Controller {
+pub struct Controller<'a, 'b> {
     authorization_manager: AuthorizationManager,
     resource_limits_manager: ResourceLimitsManager,
+    wasm_runtime: WasmRuntime<'a, 'b>,
 
     last_accepted_block: Block,
     preferred_id: Id,
     db: Database,
     apply_handlers: HashMap<
         Name,
-        HashMap<(Name, Name), fn(&mut ApplyContext, &mut UndoSession) -> Result<(), ChainError>>,
+        HashMap<
+            (Name, Name),
+            fn(&Controller, &mut ApplyContext, &mut UndoSession) -> Result<(), ChainError>,
+        >,
     >,
     verified_blocks: HashMap<Id, Block>,
 }
@@ -59,13 +64,14 @@ impl fmt::Display for ControllerError {
     }
 }
 
-impl Controller {
+impl<'a, 'b> Controller<'a, 'b> {
     pub fn new() -> Self {
         // Create a temporary database
         let db = Database::temporary(Path::new("temp")).unwrap();
         let mut controller = Controller {
             authorization_manager: AuthorizationManager::new(),
             resource_limits_manager: ResourceLimitsManager::new(),
+            wasm_runtime: WasmRuntime::new().unwrap(), // TODO: Handle error properly
 
             last_accepted_block: Block::default(),
             preferred_id: Id::default(),
@@ -202,7 +208,9 @@ impl Controller {
                 break;
             }
             let transaction = transaction.unwrap();
-            let result = self.execute_transaction(&mut undo_session, &transaction);
+            let result = self
+                .execute_transaction(&mut undo_session, &transaction)
+                .await;
             // TODO: Handle rollback behavior
             if result.is_err() {
                 return Err(ChainError::TransactionError(format!(
@@ -248,7 +256,7 @@ impl Controller {
 
         for transaction in &block.transactions {
             // Verify the transaction
-            self.execute_transaction(&mut session, transaction)?;
+            self.execute_transaction(&mut session, transaction).await?;
         }
 
         session
@@ -283,17 +291,22 @@ impl Controller {
 
     // This function will execute a transaction and roll it back instantly
     // This is useful for checking if a transaction is valid
-    pub fn push_transaction(&self, transaction: &Transaction) -> Result<(), ChainError> {
-        // Execute the transaction
-        let mut undo_session = self.db.undo_session().unwrap();
-        self.execute_transaction(&mut undo_session, transaction)
+    pub async fn push_transaction(&self, transaction: &Transaction) -> Result<(), ChainError> {
+        let db = &self.db;
+        let mut undo_session = db.undo_session().map_err(|e| {
+            ChainError::TransactionError(format!("failed to create undo session: {}", e))
+        })?;
+
+        return self
+            .execute_transaction(&mut undo_session, transaction)
+            .await;
     }
 
     // This function will execute a transaction and commit it to the database
     // This is useful for applying a transaction to the blockchain
-    pub fn execute_transaction(
+    pub async fn execute_transaction<'c>(
         &self,
-        undo_session: &mut UndoSession,
+        undo_session: &'c mut UndoSession<'c>,
         transaction: &Transaction,
     ) -> Result<(), ChainError> {
         // Verify authority
@@ -305,9 +318,8 @@ impl Controller {
             &HashSet::new(),
         )?;
 
-        let mut trx_context = TransactionContext::new(self, transaction);
-        trx_context.exec(undo_session)?;
-        Ok(())
+        let mut trx_context = TransactionContext::new(self, undo_session);
+        return trx_context.exec(transaction).await;
     }
 
     pub fn last_accepted_block(&self) -> &Block {
@@ -355,7 +367,11 @@ impl Controller {
         receiver: Name,
         contract: Name,
         action: Name,
-        apply_handler: fn(&mut ApplyContext, &mut UndoSession) -> Result<(), ChainError>,
+        apply_handler: fn(
+            &Controller,
+            &mut ApplyContext,
+            &mut UndoSession,
+        ) -> Result<(), ChainError>,
     ) {
         self.apply_handlers
             .entry(receiver)
@@ -368,7 +384,8 @@ impl Controller {
         receiver: Name,
         scope: Name,
         act: Name,
-    ) -> Option<fn(&mut ApplyContext, &mut UndoSession) -> Result<(), ChainError>> {
+    ) -> Option<fn(&Controller, &mut ApplyContext, &mut UndoSession) -> Result<(), ChainError>>
+    {
         if let Some(handlers) = self.apply_handlers.get(&receiver) {
             if let Some(handler) = handlers.get(&(scope, act)) {
                 return Some(*handler);
@@ -383,6 +400,16 @@ impl Controller {
 
     pub fn get_resource_limits_manager(&self) -> &ResourceLimitsManager {
         &self.resource_limits_manager
+    }
+
+    pub fn get_wasm_runtime(&mut self) -> &mut WasmRuntime<'a, 'b> {
+        &mut self.wasm_runtime
+    }
+
+    pub fn create_undo_session(&mut self) -> Result<UndoSession, ChainError> {
+        self.db.undo_session().map_err(|e| {
+            ChainError::TransactionError(format!("failed to create undo session: {}", e))
+        })
     }
 }
 

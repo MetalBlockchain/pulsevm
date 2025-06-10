@@ -28,14 +28,14 @@ pub trait Rpc {
 #[derive(Clone)]
 pub struct RpcService {
     mempool: Arc<RwLock<Mempool>>,
-    controller: Arc<RwLock<Controller>>,
+    controller: Arc<RwLock<Controller<'static, 'static>>>,
     network_manager: Arc<RwLock<NetworkManager>>,
 }
 
 impl RpcService {
     pub fn new(
         mempool: Arc<RwLock<Mempool>>,
-        controller: Arc<RwLock<Controller>>,
+        controller: Arc<RwLock<Controller<'static, 'static>>>,
         network_manager: Arc<RwLock<NetworkManager>>,
     ) -> Self {
         RpcService {

@@ -1,10 +1,15 @@
+use std::{num::NonZeroUsize, sync::Arc};
+
+use lru::LruCache;
 use pulsevm_chainbase::UndoSession;
+use tokio::sync::RwLock;
 use wasmtime::{
     Config, Engine, InstanceAllocationStrategy, Linker, Module, PoolingAllocationConfig, Store,
     Strategy,
 };
 
 use super::{
+    CodeObject, Id,
     apply_context::ApplyContext,
     error::ChainError,
     webassembly::{
@@ -13,15 +18,19 @@ use super::{
     },
 };
 
-pub struct WasmContext<'a, 'b> {
-    pub context: &'a mut ApplyContext<'a, 'b>,
-    pub session: &'a UndoSession<'b>,
+pub struct WasmContext<'a, 'b>
+where
+    'b: 'a,
+{
+    pub context: &'a ApplyContext<'a, 'a, 'a>,
+    pub session: &'b UndoSession<'b>,
 }
 
 pub struct WasmRuntime<'a, 'b> {
     config: Config,
     engine: Engine,
     linker: Linker<WasmContext<'a, 'b>>,
+    code_cache: LruCache<Id, Module>,
 }
 
 impl<'a, 'b> WasmRuntime<'a, 'b> {
@@ -83,19 +92,30 @@ impl<'a, 'b> WasmRuntime<'a, 'b> {
             config: config.to_owned(),
             engine: engine,
             linker,
+            code_cache: LruCache::new(NonZeroUsize::new(1024).unwrap()),
         })
     }
 
-    pub fn run(
-        &self,
-        session: &'a UndoSession<'b>,
-        context: &'a mut ApplyContext<'a, 'b>,
-        bytes: Vec<u8>,
+    pub async fn run(
+        &mut self,
+        session: &'b UndoSession<'b>,
+        context: &'a ApplyContext<'a, 'a, 'a>,
+        code_hash: Id,
     ) -> Result<(), ChainError> {
+        if !self.code_cache.contains(&code_hash) {
+            let code_object = session.get::<CodeObject>(code_hash).map_err(|e| {
+                ChainError::WasmRuntimeError(format!("failed to get wasm code: {}", e))
+            })?;
+            let module = Module::new(&self.engine, code_object.code)
+                .map_err(|e| ChainError::WasmRuntimeError(e.to_string()))?;
+            self.code_cache.put(code_hash, module);
+        }
+
         let wasm_context = WasmContext { context, session };
         let mut store = Store::new(&self.engine, wasm_context);
-        let module = Module::new(&self.engine, bytes)
-            .map_err(|e| ChainError::WasmRuntimeError(e.to_string()))?;
+        let module = self.code_cache.get(&code_hash).ok_or_else(|| {
+            ChainError::WasmRuntimeError(format!("wasm module not found in cache: {}", code_hash))
+        })?;
         let instance = self
             .linker
             .instantiate(&mut store, &module)

@@ -72,10 +72,12 @@ where
 
     pub fn next(&'a mut self) -> Result<Option<C::PrimaryKey>, Box<dyn Error>> {
         if self.inner_iterator.is_none() {
-            let iter = self.session.tx.range(
-                &self.partition,
-                self.lower_bound.clone()..=self.upper_bound.clone(),
-            );
+            let lower_bound_bytes = S::secondary_key_as_bytes(self.lower_bound.clone());
+            let upper_bound_bytes = S::secondary_key_as_bytes(self.upper_bound.clone());
+            let iter = self
+                .session
+                .tx
+                .range(&self.partition, lower_bound_bytes..=upper_bound_bytes);
             self.inner_iterator = Some(Box::new(iter));
         }
 

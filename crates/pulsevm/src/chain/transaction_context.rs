@@ -5,29 +5,32 @@ use super::{
     error::ChainError,
 };
 
-pub struct TransactionContext<'a> {
-    pub controller: &'a Controller,
-    pub transaction: &'a Transaction,
+pub struct TransactionContext<'a, 'b> {
+    controller: &'a Controller<'a, 'a>,
+    undo_session: &'b mut UndoSession<'b>,
     action_traces: Vec<ActionTrace>,
 }
 
-impl<'a> TransactionContext<'a> {
-    pub fn new(controller: &'a Controller, transaction: &'a Transaction) -> Self {
+impl<'a, 'b> TransactionContext<'a, 'b>
+where
+    'a: 'b,
+{
+    pub fn new(controller: &'a Controller<'a, 'a>, undo_session: &'b mut UndoSession<'b>) -> Self {
         Self {
             controller,
-            transaction,
+            undo_session,
             action_traces: Vec::new(),
         }
     }
 
-    pub fn exec(&mut self, session: &mut UndoSession) -> Result<(), ChainError> {
-        for action in &self.transaction.unsigned_tx.actions {
+    pub async fn exec(&mut self, transaction: &Transaction) -> Result<(), ChainError> {
+        for action in transaction.unsigned_tx.actions.iter() {
             self.schedule_action(action, &action.account(), 0);
         }
 
         let num_original_actions_to_execute = self.action_traces.len();
         for i in 1..=num_original_actions_to_execute {
-            self.execute_action(session, i as u32, 0)?;
+            self.execute_action(i as u32, 0).await?;
         }
 
         Ok(())
@@ -70,19 +73,25 @@ impl<'a> TransactionContext<'a> {
         Ok(new_action_ordinal)
     }
 
-    pub fn execute_action(
+    pub async fn execute_action(
         &mut self,
-        session: &mut UndoSession,
         action_ordinal: u32,
         recurse_depth: u32,
     ) -> Result<(), ChainError> {
         // Execute the action
-        let mut apply_context =
-            ApplyContext::new(self.controller, self, action_ordinal, recurse_depth);
-        apply_context.exec(session)?;
+        let trace = self
+            .get_action_trace(action_ordinal)
+            .ok_or(ChainError::TransactionError(format!("action not found")))?;
 
-        // Action is executed
-        Ok(())
+        let mut apply_context = ApplyContext::new(
+            self.controller,
+            self.undo_session,
+            self,
+            action_ordinal,
+            trace,
+            recurse_depth,
+        );
+        return apply_context.exec().await;
     }
 
     pub fn get_action_trace(&self, action_ordinal: u32) -> Option<&ActionTrace> {

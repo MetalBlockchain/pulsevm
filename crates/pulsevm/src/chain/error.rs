@@ -11,6 +11,7 @@ pub enum ChainError {
     TransactionError(String),
     NetworkError(String),
     WasmRuntimeError(String),
+    LockError(String),
 }
 
 impl fmt::Display for ChainError {
@@ -27,6 +28,7 @@ impl fmt::Display for ChainError {
             ChainError::TransactionError(msg) => write!(f, "transaction error: {}", msg),
             ChainError::NetworkError(msg) => write!(f, "network error: {}", msg),
             ChainError::WasmRuntimeError(msg) => write!(f, "wasm runtime error: {}", msg),
+            ChainError::LockError(msg) => write!(f, "lock error: {}", msg),
         }
     }
 }
@@ -41,6 +43,7 @@ impl Error for ChainError {
             ChainError::TransactionError(_) => None,
             ChainError::NetworkError(_) => None,
             ChainError::WasmRuntimeError(_) => None,
+            ChainError::LockError(_) => None,
         }
     }
 }

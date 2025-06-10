@@ -12,7 +12,7 @@ pub struct AccountMetadata {
     pub abi_sequence: u64,
     pub code_hash: Id,
     pub last_code_update: u64,
-    pub priviliged: bool,
+    pub privileged: bool,
     pub vm_type: u8,
     pub vm_version: u8,
 }
@@ -27,14 +27,14 @@ impl AccountMetadata {
             abi_sequence: 0,
             code_hash: Id::default(),
             last_code_update: 0,
-            priviliged: false,
+            privileged: false,
             vm_type: 0,
             vm_version: 0,
         }
     }
 
     pub fn is_privileged(&self) -> bool {
-        self.priviliged
+        self.privileged
     }
 }
 
@@ -47,7 +47,7 @@ impl Serialize for AccountMetadata {
         self.abi_sequence.serialize(bytes);
         self.code_hash.serialize(bytes);
         self.last_code_update.serialize(bytes);
-        self.priviliged.serialize(bytes);
+        self.privileged.serialize(bytes);
         self.vm_type.serialize(bytes);
         self.vm_version.serialize(bytes);
     }
@@ -62,7 +62,7 @@ impl Deserialize for AccountMetadata {
         let abi_sequence = u64::deserialize(data, pos)?;
         let code_hash = Id::deserialize(data, pos)?;
         let last_code_update = u64::deserialize(data, pos)?;
-        let priviliged = bool::deserialize(data, pos)?;
+        let privileged = bool::deserialize(data, pos)?;
         let vm_type = u8::deserialize(data, pos)?;
         let vm_version = u8::deserialize(data, pos)?;
 
@@ -74,7 +74,7 @@ impl Deserialize for AccountMetadata {
             abi_sequence,
             code_hash,
             last_code_update,
-            priviliged,
+            privileged,
             vm_type,
             vm_version,
         })

@@ -20,6 +20,8 @@ pub fn send_inline() -> impl Fn(Caller<'_, WasmContext>, u32, u32) -> Result<(),
             bail!("failed to deserialize action: {:?}", action.err());
         }
 
+        // TODO: Implement the logic to send the inline action
+
         Ok(())
     }
 }

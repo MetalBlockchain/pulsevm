@@ -105,7 +105,7 @@ async fn start_runtime_service(
 #[derive(Clone)]
 pub struct VirtualMachine {
     server_addr: SocketAddr,
-    controller: Arc<RwLock<Controller>>,
+    controller: Arc<RwLock<Controller<'static, 'static>>>,
     mempool: Arc<RwLock<mempool::Mempool>>,
     network_manager: Arc<RwLock<chain::NetworkManager>>,
     rpc_service: chain::RpcService,

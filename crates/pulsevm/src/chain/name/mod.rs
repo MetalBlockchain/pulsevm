@@ -1,7 +1,7 @@
 use core::{fmt, str};
-use std::str::FromStr;
+use std::{ops::Deref, str::FromStr};
 
-use pulsevm_name::{ParseNameError, name_from_bytes, name_to_bytes};
+use pulsevm_name::{NAME_MAX_LEN, ParseNameError, name_from_bytes, name_to_bytes};
 use pulsevm_serialization::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
@@ -18,6 +18,10 @@ impl Name {
 
     pub const fn empty(&self) -> bool {
         self.0 == 0
+    }
+
+    pub fn as_bytes(&self) -> [u8; NAME_MAX_LEN] {
+        name_to_bytes(self.0)
     }
 }
 
@@ -45,7 +49,7 @@ impl FromStr for Name {
 impl fmt::Display for Name {
     #[inline]
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let bytes = name_to_bytes(self.0);
+        let bytes = self.as_bytes();
         let value = str::from_utf8(&bytes)
             .map(|s| s.trim_end_matches('.'))
             .map_err(|_| fmt::Error)?;
@@ -56,6 +60,12 @@ impl fmt::Display for Name {
 impl PartialEq<u64> for Name {
     fn eq(&self, other: &u64) -> bool {
         &self.0 == other
+    }
+}
+
+impl PartialEq<Name> for u64 {
+    fn eq(&self, other: &Name) -> bool {
+        self == &other.0
     }
 }
 
@@ -72,6 +82,15 @@ impl Deserialize for Name {
     }
 }
 
+impl Deref for Name {
+    type Target = u64;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
