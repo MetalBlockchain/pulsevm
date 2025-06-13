@@ -2,7 +2,6 @@ mod chain;
 mod mempool;
 
 use chain::{Controller, Id, NodeId};
-use jsonrpsee::server::middleware::rpc::{self, rpc_service};
 use mempool::build_block_timer;
 use pulsevm_grpc::{
     http::{
@@ -20,12 +19,7 @@ use std::{
     net::{SocketAddr, TcpListener},
     sync::Arc,
 };
-use tokio::{
-    net::TcpListener as TokioTcpListener,
-    signal, spawn,
-    sync::{Mutex, RwLock},
-    task::JoinHandle,
-};
+use tokio::{net::TcpListener as TokioTcpListener, signal, sync::RwLock, task::JoinHandle};
 use tonic::transport::server::TcpIncoming;
 use tonic::{Request, Response, Status, transport::Server};
 
@@ -103,16 +97,16 @@ async fn start_runtime_service(
 }
 
 #[derive(Clone)]
-pub struct VirtualMachine {
+pub struct VirtualMachine<'a> {
     server_addr: SocketAddr,
-    controller: Arc<RwLock<Controller<'static, 'static>>>,
+    controller: Arc<RwLock<Controller<'a>>>,
     mempool: Arc<RwLock<mempool::Mempool>>,
     network_manager: Arc<RwLock<chain::NetworkManager>>,
-    rpc_service: chain::RpcService,
+    rpc_service: chain::RpcService<'a>,
     block_timer: Arc<RwLock<Option<JoinHandle<()>>>>,
 }
 
-impl VirtualMachine {
+impl<'a> VirtualMachine<'a> {
     pub fn new(server_addr: SocketAddr) -> Result<Self, Box<dyn std::error::Error>> {
         let controller = Arc::new(RwLock::new(Controller::new()));
         let mempool = Arc::new(RwLock::new(mempool::Mempool::new()));
@@ -132,7 +126,7 @@ impl VirtualMachine {
 }
 
 #[tonic::async_trait]
-impl Vm for VirtualMachine {
+impl<'a> Vm for VirtualMachine<'static> {
     async fn initialize(
         &self,
         request: Request<vm::InitializeRequest>,
@@ -246,10 +240,11 @@ impl Vm for VirtualMachine {
         info!("building block");
         let controller = self.controller.clone();
         let controller = controller.write().await;
+        let mempool = self.mempool.clone();
         let block = controller
-            .build_block(self.mempool.clone())
+            .build_block(mempool)
             .await
-            .map_err(|_| Status::internal("could not build block"))?;
+            .map_err(|e| Status::internal(format!("could not build block: {}", e)))?;
         Ok(Response::new(vm::BuildBlockResponse {
             id: block.id().into(),
             parent_id: block.parent_id.into(),

@@ -1,24 +1,25 @@
 use std::{
+    cell::RefCell,
     collections::{HashMap, VecDeque},
-    sync::Arc,
+    rc::Rc,
+    sync::{Arc, RwLock},
 };
 
 use pulsevm_chainbase::UndoSession;
-use tokio::sync::RwLock;
+use wasmtime::Ref;
 
-use crate::chain::{ActionTrace, wasm_runtime::WasmRuntime};
+use crate::chain::{
+    ActionTrace, controller,
+    wasm_runtime::{self, WasmContext, WasmRuntime},
+};
 
 use super::{
     Account, AccountMetadata, Action, Controller, Id, Name, TransactionContext, error::ChainError,
 };
 
-pub struct ApplyContext<'a, 'b, 'c>
-where
-    'a: 'b,
-{
-    controller: &'a Controller<'a, 'a>,
-    undo_session: &'b mut UndoSession<'b>,
-    transaction_context: &'c mut TransactionContext<'a, 'b>,
+pub struct ApplyContext<'a> {
+    session: Rc<RefCell<UndoSession<'a>>>, // The undo session for this context
+    wasm_runtime: Arc<RwLock<WasmRuntime<'a>>>, // The Wasm runtime for executing actions
 
     action: Action,     // The action being applied
     receiver: Name,     // The account that is receiving the action
@@ -32,22 +33,18 @@ where
     account_ram_deltas: HashMap<Name, i64>, // RAM usage deltas for accounts
 }
 
-impl<'a, 'b, 'c> ApplyContext<'a, 'b, 'c> {
+impl<'a> ApplyContext<'a> {
     pub fn new(
-        controller: &'a Controller<'a, 'a>,
-        undo_session: &'b mut UndoSession<'b>,
-        transaction_context: &'c mut TransactionContext<'a, 'b>,
+        session: Rc<RefCell<UndoSession<'a>>>,
+        wasm_runtime: Arc<RwLock<WasmRuntime<'a>>>,
+        action: Action,
+        receiver: Name,
         action_ordinal: u32,
-        trace: &ActionTrace,
         depth: u32,
-    ) -> Self {
-        let action = trace.action();
-        let receiver = trace.receiver();
-
-        ApplyContext {
-            controller,
-            undo_session,
-            transaction_context,
+    ) -> Result<Self, ChainError> {
+        Ok(ApplyContext {
+            session,
+            wasm_runtime,
 
             action,
             receiver,
@@ -59,18 +56,18 @@ impl<'a, 'b, 'c> ApplyContext<'a, 'b, 'c> {
             notified: VecDeque::new(),
             inline_actions: Vec::new(),
             account_ram_deltas: HashMap::new(),
-        }
+        })
     }
 
-    pub async fn exec(&mut self) -> Result<(), ChainError> {
+    pub fn exec(&mut self) -> Result<(), ChainError> {
         self.notified
             .push_back((self.receiver.clone(), self.action_ordinal));
-        self.exec_one().await?;
+        self.exec_one()?;
         for i in 1..self.notified.len() {
             let (receiver, action_ordinal) = self.notified[i];
             self.receiver = receiver;
             self.action_ordinal = action_ordinal;
-            self.exec_one().await?;
+            self.exec_one()?;
         }
 
         if self.inline_actions.len() > 0 && self.recurse_depth >= 1024 {
@@ -79,39 +76,39 @@ impl<'a, 'b, 'c> ApplyContext<'a, 'b, 'c> {
             ));
         }
 
-        for ordinal in self.inline_actions.iter() {
-            self.transaction_context
-                .execute_action(*ordinal, self.recurse_depth + 1)
-                .await?;
-        }
+        // TODO: Handle inline actions
 
         Ok(())
     }
 
-    pub async fn exec_one(&mut self) -> Result<(), ChainError> {
+    pub fn exec_one(&mut self) -> Result<(), ChainError> {
         let mut code_hash = Id::zero();
 
         {
             let receiver_account = self
-                .undo_session
+                .session
+                .borrow()
                 .get::<AccountMetadata>(self.receiver.clone())
                 .map_err(|e| {
                     ChainError::TransactionError(format!("failed to get receiver account: {}", e))
                 })?;
             self.privileged = receiver_account.privileged;
-            let native = self.controller.find_apply_handler(
+            let native = Controller::find_apply_handler(
                 self.receiver,
                 self.action.account(),
                 self.action.name(),
             );
             if let Some(native) = native {
-                native(self.controller, self, self.undo_session)?;
+                native(self, self.session.clone())?;
             }
         }
         // Does the receiver account have a contract deployed?
         if code_hash != Id::zero() {
-            let runtime = self.controller.get_wasm_runtime();
-            runtime.run(self.undo_session, self, code_hash).await?;
+            let mut runtime = self.wasm_runtime.write().map_err(|e| {
+                ChainError::TransactionError(format!("failed to get mutable wasm runtime: {}", e))
+            })?;
+            let wasm_context = WasmContext::new(self.session.clone());
+            runtime.run(wasm_context, code_hash)?;
         }
         Ok(())
     }
@@ -121,12 +118,8 @@ impl<'a, 'b, 'c> ApplyContext<'a, 'b, 'c> {
         ordinal_of_action_to_schedule: u32,
         receiver: Name,
     ) -> Result<u32, ChainError> {
-        let scheduled_action_ordinal = self.transaction_context.schedule_action_from_ordinal(
-            ordinal_of_action_to_schedule,
-            receiver,
-            self.action_ordinal,
-        )?;
-        Ok(scheduled_action_ordinal)
+        // TODO: Implement scheduling logic
+        Ok(0)
     }
 
     pub fn get_action(&self) -> &Action {

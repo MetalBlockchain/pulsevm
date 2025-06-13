@@ -1,8 +1,11 @@
+use std::{cell::RefCell, rc::Rc};
+
 use pulsevm_chainbase::UndoSession;
 use sha2::{
     Digest, Sha256,
     digest::{consts::U32, generic_array::GenericArray},
 };
+use wasmtime::Ref;
 
 use crate::chain::Controller;
 
@@ -17,9 +20,8 @@ use super::{
 };
 
 pub fn newaccount(
-    controller: &Controller,
     context: &mut ApplyContext,
-    session: &mut UndoSession,
+    session: Rc<RefCell<UndoSession<'_>>>,
 ) -> Result<(), ChainError> {
     let create = context
         .get_action()
@@ -106,9 +108,8 @@ pub fn newaccount(
 }
 
 pub fn setcode(
-    controller: &Controller,
     context: &mut ApplyContext,
-    session: &mut UndoSession,
+    session: Rc<RefCell<UndoSession<'_>>>,
 ) -> Result<(), ChainError> {
     let act = context
         .get_action()
@@ -219,9 +220,8 @@ pub fn setcode(
 }
 
 pub fn setabi(
-    controller: &Controller,
     context: &mut ApplyContext,
-    session: &mut UndoSession,
+    session: Rc<RefCell<UndoSession<'_>>>,
 ) -> Result<(), ChainError> {
     let act = context
         .get_action()
@@ -259,9 +259,8 @@ pub fn setabi(
 }
 
 pub fn updateauth(
-    controller: &Controller,
     context: &mut ApplyContext,
-    session: &mut UndoSession,
+    session: Rc<RefCell<UndoSession<'_>>>,
 ) -> Result<(), ChainError> {
     let update = context
         .get_action()

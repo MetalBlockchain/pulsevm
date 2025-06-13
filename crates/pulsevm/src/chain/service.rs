@@ -11,7 +11,7 @@ use jsonrpsee::{
 };
 use pulsevm_serialization::Deserialize;
 use serde::Serialize;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 use tonic::async_trait;
 
 use crate::mempool::Mempool;
@@ -26,16 +26,16 @@ pub trait Rpc {
 }
 
 #[derive(Clone)]
-pub struct RpcService {
+pub struct RpcService<'a> {
     mempool: Arc<RwLock<Mempool>>,
-    controller: Arc<RwLock<Controller<'static, 'static>>>,
+    controller: Arc<RwLock<Controller<'a>>>,
     network_manager: Arc<RwLock<NetworkManager>>,
 }
 
-impl RpcService {
+impl<'a> RpcService<'a> {
     pub fn new(
         mempool: Arc<RwLock<Mempool>>,
-        controller: Arc<RwLock<Controller<'static, 'static>>>,
+        controller: Arc<RwLock<Controller<'a>>>,
         network_manager: Arc<RwLock<NetworkManager>>,
     ) -> Self {
         RpcService {
@@ -68,7 +68,7 @@ pub struct IssueTxResponse {
 }
 
 #[async_trait]
-impl RpcServer for RpcService {
+impl<'a> RpcServer for RpcService<'static> {
     async fn issue_tx(
         &self,
         tx_hex: &str,

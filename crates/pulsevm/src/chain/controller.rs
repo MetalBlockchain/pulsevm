@@ -1,13 +1,10 @@
 use core::fmt;
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet},
-    f32::consts::E,
-    io::Chain,
-    iter::Map,
-    mem,
     path::Path,
-    str::FromStr,
-    sync::Arc,
+    rc::Rc,
+    sync::{Arc, LazyLock, RwLock},
 };
 
 use crate::{
@@ -31,23 +28,41 @@ use pulsevm_chainbase::{Database, UndoSession};
 use pulsevm_proc_macros::name;
 use pulsevm_serialization::Deserialize;
 use spdlog::info;
-use tokio::sync::RwLock;
+use tokio::sync::RwLock as AsyncRwLock;
 
-pub struct Controller<'a, 'b> {
+pub type ApplyHandlerFn =
+    fn(&mut ApplyContext, Rc<RefCell<UndoSession<'_>>>) -> Result<(), ChainError>;
+pub type ApplyHandlerMap = HashMap<
+    (Name, Name, Name), // (receiver, contract, action)
+    ApplyHandlerFn,
+>;
+
+pub static APPLY_HANDLERS: LazyLock<ApplyHandlerMap> = LazyLock::new(|| {
+    let mut m: ApplyHandlerMap = HashMap::new();
+    m.insert(
+        (PULSE_NAME, PULSE_NAME, Name::new(name!("newaccount"))),
+        newaccount,
+    );
+    m.insert(
+        (PULSE_NAME, PULSE_NAME, Name::new(name!("setcode"))),
+        setcode,
+    );
+    m.insert((PULSE_NAME, PULSE_NAME, Name::new(name!("setabi"))), setabi);
+    m.insert(
+        (PULSE_NAME, PULSE_NAME, Name::new(name!("updateauth"))),
+        updateauth,
+    );
+    m
+});
+
+pub struct Controller<'a> {
     authorization_manager: AuthorizationManager,
     resource_limits_manager: ResourceLimitsManager,
-    wasm_runtime: WasmRuntime<'a, 'b>,
+    wasm_runtime: Arc<RwLock<WasmRuntime<'a>>>,
 
     last_accepted_block: Block,
     preferred_id: Id,
     db: Database,
-    apply_handlers: HashMap<
-        Name,
-        HashMap<
-            (Name, Name),
-            fn(&Controller, &mut ApplyContext, &mut UndoSession) -> Result<(), ChainError>,
-        >,
-    >,
     verified_blocks: HashMap<Id, Block>,
 }
 
@@ -64,36 +79,20 @@ impl fmt::Display for ControllerError {
     }
 }
 
-impl<'a, 'b> Controller<'a, 'b> {
+impl<'a> Controller<'a> {
     pub fn new() -> Self {
         // Create a temporary database
         let db = Database::temporary(Path::new("temp")).unwrap();
-        let mut controller = Controller {
+        let controller = Controller {
             authorization_manager: AuthorizationManager::new(),
             resource_limits_manager: ResourceLimitsManager::new(),
-            wasm_runtime: WasmRuntime::new().unwrap(), // TODO: Handle error properly
+            wasm_runtime: Arc::new(RwLock::new(WasmRuntime::new())), // TODO: Handle error properly
 
             last_accepted_block: Block::default(),
             preferred_id: Id::default(),
             db: db,
-            apply_handlers: HashMap::new(),
             verified_blocks: HashMap::new(),
         };
-
-        controller.set_apply_handler(
-            PULSE_NAME,
-            PULSE_NAME,
-            Name::new(name!("newaccount")),
-            newaccount,
-        );
-        controller.set_apply_handler(PULSE_NAME, PULSE_NAME, Name::new(name!("setcode")), setcode);
-        controller.set_apply_handler(PULSE_NAME, PULSE_NAME, Name::new(name!("setabi")), setabi);
-        controller.set_apply_handler(
-            PULSE_NAME,
-            PULSE_NAME,
-            Name::new(name!("updateauth")),
-            updateauth,
-        );
 
         controller
     }
@@ -130,12 +129,16 @@ impl<'a, 'b> Controller<'a, 'b> {
 
         if genesis_block.is_none() {
             // If not, insert it
-            let mut session = self.db.undo_session().map_err(|e| {
+            let session = self.db.undo_session().map_err(|e| {
                 ControllerError::GenesisError(format!("failed to create undo session: {}", e))
             })?;
-            session.insert(&self.last_accepted_block).map_err(|e| {
-                ControllerError::GenesisError(format!("failed to insert genesis block: {}", e))
-            })?;
+            let session = Rc::new(RefCell::new(session));
+            session
+                .borrow_mut()
+                .insert(&self.last_accepted_block)
+                .map_err(|e| {
+                    ControllerError::GenesisError(format!("failed to insert genesis block: {}", e))
+                })?;
             let default_key = genesis.initial_key().map_err(|e| {
                 ControllerError::GenesisError(format!("failed to get initial key: {}", e))
             })?;
@@ -148,7 +151,7 @@ impl<'a, 'b> Controller<'a, 'b> {
             let owner_permission = self
                 .authorization_manager
                 .create_permission(
-                    &mut session,
+                    session.clone(),
                     PULSE_NAME,
                     OWNER_NAME,
                     0,
@@ -163,7 +166,7 @@ impl<'a, 'b> Controller<'a, 'b> {
             // Create the pulse@active permission
             self.authorization_manager
                 .create_permission(
-                    &mut session,
+                    session.clone(),
                     PULSE_NAME,
                     ACTIVE_NAME,
                     owner_permission.id(),
@@ -176,11 +179,13 @@ impl<'a, 'b> Controller<'a, 'b> {
                     ))
                 })?;
             session
+                .borrow_mut()
                 .insert(&Account::new(PULSE_NAME, 0, vec![]))
                 .map_err(|e| {
                     ControllerError::GenesisError(format!("failed to insert pulse account: {}", e))
                 })?;
             session
+                .borrow_mut()
                 .insert(&AccountMetadata::new(PULSE_NAME))
                 .map_err(|e| {
                     ControllerError::GenesisError(format!(
@@ -188,16 +193,22 @@ impl<'a, 'b> Controller<'a, 'b> {
                         e
                     ))
                 })?;
-            session.commit();
+            Rc::try_unwrap(session)
+                .map_err(|_| ControllerError::GenesisError("failed to unwrap session".to_string()))?
+                .into_inner()
+                .commit();
         }
 
         Ok(())
     }
 
-    pub async fn build_block(&self, mempool: Arc<RwLock<Mempool>>) -> Result<Block, ChainError> {
+    pub async fn build_block(
+        &'a self,
+        mempool: Arc<AsyncRwLock<Mempool>>,
+    ) -> Result<Block, ChainError> {
         let mempool = mempool.clone();
         let mut mempool = mempool.write().await;
-        let mut undo_session = self.db.undo_session().unwrap();
+        let undo_session = Rc::new(RefCell::new(self.db.undo_session().unwrap()));
         let mut transactions: Vec<Transaction> = Vec::new();
 
         // Get transactions from the mempool
@@ -208,9 +219,7 @@ impl<'a, 'b> Controller<'a, 'b> {
                 break;
             }
             let transaction = transaction.unwrap();
-            let result = self
-                .execute_transaction(&mut undo_session, &transaction)
-                .await;
+            let result = self.execute_transaction(undo_session.clone(), &transaction);
             // TODO: Handle rollback behavior
             if result.is_err() {
                 return Err(ChainError::TransactionError(format!(
@@ -234,15 +243,16 @@ impl<'a, 'b> Controller<'a, 'b> {
         Ok(block)
     }
 
-    pub async fn verify_block(&mut self, block: &Block) -> Result<(), ChainError> {
+    pub async fn verify_block(&'a mut self, block: &Block) -> Result<(), ChainError> {
         if self.verified_blocks.contains_key(&block.id()) {
             return Ok(());
         }
 
         // Verify the block
-        let mut session = self.db.undo_session().map_err(|e| {
+        let session = self.db.undo_session().map_err(|e| {
             ChainError::TransactionError(format!("failed to create undo session: {}", e))
         })?;
+        let session = Rc::new(RefCell::new(session));
 
         // Make sure we don't have the block already
         let existing_block = self
@@ -256,14 +266,18 @@ impl<'a, 'b> Controller<'a, 'b> {
 
         for transaction in &block.transactions {
             // Verify the transaction
-            self.execute_transaction(&mut session, transaction).await?;
+            self.execute_transaction(session.clone(), transaction)?;
         }
 
         session
+            .borrow_mut()
             .insert(block)
             .map_err(|e| ChainError::TransactionError(format!("failed to insert block: {}", e)))?;
 
-        session.commit();
+        Rc::try_unwrap(session)
+            .map_err(|_| ChainError::TransactionError("failed to unwrap session".to_string()))?
+            .into_inner()
+            .commit();
 
         self.verified_blocks.insert(block.id(), block.clone());
 
@@ -291,35 +305,38 @@ impl<'a, 'b> Controller<'a, 'b> {
 
     // This function will execute a transaction and roll it back instantly
     // This is useful for checking if a transaction is valid
-    pub async fn push_transaction(&self, transaction: &Transaction) -> Result<(), ChainError> {
+    pub fn push_transaction(&'a self, transaction: &Transaction) -> Result<(), ChainError> {
         let db = &self.db;
-        let mut undo_session = db.undo_session().map_err(|e| {
+        let undo_session = db.undo_session().map_err(|e| {
             ChainError::TransactionError(format!("failed to create undo session: {}", e))
         })?;
+        let undo_session = Rc::new(RefCell::new(undo_session));
 
-        return self
-            .execute_transaction(&mut undo_session, transaction)
-            .await;
+        let result = self.execute_transaction(undo_session, transaction);
+
+        return result;
     }
 
     // This function will execute a transaction and commit it to the database
     // This is useful for applying a transaction to the blockchain
-    pub async fn execute_transaction<'c>(
+    pub fn execute_transaction(
         &self,
-        undo_session: &'c mut UndoSession<'c>,
+        undo_session: Rc<RefCell<UndoSession<'a>>>,
         transaction: &Transaction,
     ) -> Result<(), ChainError> {
         // Verify authority
         self.authorization_manager.check_authorization(
-            undo_session,
+            undo_session.clone(),
             &transaction.unsigned_tx.actions,
             &transaction.recovered_keys()?,
             &HashSet::new(),
             &HashSet::new(),
         )?;
 
-        let mut trx_context = TransactionContext::new(self, undo_session);
-        return trx_context.exec(transaction).await;
+        let mut trx_context =
+            TransactionContext::new(undo_session.clone(), self.wasm_runtime.clone());
+
+        return trx_context.exec(transaction);
     }
 
     pub fn last_accepted_block(&self) -> &Block {
@@ -362,34 +379,9 @@ impl<'a, 'b> Controller<'a, 'b> {
         self.preferred_id = id;
     }
 
-    pub fn set_apply_handler(
-        &mut self,
-        receiver: Name,
-        contract: Name,
-        action: Name,
-        apply_handler: fn(
-            &Controller,
-            &mut ApplyContext,
-            &mut UndoSession,
-        ) -> Result<(), ChainError>,
-    ) {
-        self.apply_handlers
-            .entry(receiver)
-            .or_insert_with(HashMap::new)
-            .insert((contract, action), apply_handler);
-    }
-
-    pub fn find_apply_handler(
-        &self,
-        receiver: Name,
-        scope: Name,
-        act: Name,
-    ) -> Option<fn(&Controller, &mut ApplyContext, &mut UndoSession) -> Result<(), ChainError>>
-    {
-        if let Some(handlers) = self.apply_handlers.get(&receiver) {
-            if let Some(handler) = handlers.get(&(scope, act)) {
-                return Some(*handler);
-            }
+    pub fn find_apply_handler(receiver: Name, scope: Name, act: Name) -> Option<ApplyHandlerFn> {
+        if let Some(handler) = APPLY_HANDLERS.get(&(receiver, scope, act)) {
+            return Some(*handler);
         }
         None
     }
@@ -400,10 +392,6 @@ impl<'a, 'b> Controller<'a, 'b> {
 
     pub fn get_resource_limits_manager(&self) -> &ResourceLimitsManager {
         &self.resource_limits_manager
-    }
-
-    pub fn get_wasm_runtime(&mut self) -> &mut WasmRuntime<'a, 'b> {
-        &mut self.wasm_runtime
     }
 
     pub fn create_undo_session(&mut self) -> Result<UndoSession, ChainError> {

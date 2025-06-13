@@ -1,36 +1,48 @@
-use pulsevm_chainbase::UndoSession;
-
-use super::{
-    Action, ActionTrace, Controller, Name, Transaction, apply_context::ApplyContext,
-    error::ChainError,
+use std::{
+    cell::{Ref, RefCell},
+    rc::Rc,
+    sync::{Arc, RwLock},
 };
 
-pub struct TransactionContext<'a, 'b> {
-    controller: &'a Controller<'a, 'a>,
-    undo_session: &'b mut UndoSession<'b>,
+use pulsevm_chainbase::UndoSession;
+
+use crate::chain::{
+    controller,
+    wasm_runtime::{self, WasmContext, WasmRuntime},
+};
+
+use super::{
+    Action, ActionTrace, Name, Transaction, apply_context::ApplyContext, error::ChainError,
+};
+
+pub struct TransactionContext<'a> {
+    session: Rc<RefCell<UndoSession<'a>>>,
+    wasm_runtime: Arc<RwLock<WasmRuntime<'a>>>,
+
     action_traces: Vec<ActionTrace>,
 }
 
-impl<'a, 'b> TransactionContext<'a, 'b>
-where
-    'a: 'b,
-{
-    pub fn new(controller: &'a Controller<'a, 'a>, undo_session: &'b mut UndoSession<'b>) -> Self {
+impl<'a> TransactionContext<'a> {
+    pub fn new(
+        session: Rc<RefCell<UndoSession<'a>>>,
+        wasm_runtime: Arc<RwLock<WasmRuntime<'a>>>,
+    ) -> Self {
         Self {
-            controller,
-            undo_session,
+            session,
+            wasm_runtime,
+
             action_traces: Vec::new(),
         }
     }
 
-    pub async fn exec(&mut self, transaction: &Transaction) -> Result<(), ChainError> {
+    pub fn exec(&mut self, transaction: &Transaction) -> Result<(), ChainError> {
         for action in transaction.unsigned_tx.actions.iter() {
             self.schedule_action(action, &action.account(), 0);
         }
 
         let num_original_actions_to_execute = self.action_traces.len();
         for i in 1..=num_original_actions_to_execute {
-            self.execute_action(i as u32, 0).await?;
+            self.execute_action(i as u32, 0)?;
         }
 
         Ok(())
@@ -73,25 +85,27 @@ where
         Ok(new_action_ordinal)
     }
 
-    pub async fn execute_action(
-        &mut self,
+    pub fn execute_action(
+        &self,
         action_ordinal: u32,
         recurse_depth: u32,
     ) -> Result<(), ChainError> {
-        // Execute the action
         let trace = self
             .get_action_trace(action_ordinal)
             .ok_or(ChainError::TransactionError(format!("action not found")))?;
-
-        let mut apply_context = ApplyContext::new(
-            self.controller,
-            self.undo_session,
-            self,
+        let action = trace.action();
+        let receiver = trace.receiver();
+        let apply_context = Rc::new(RefCell::new(ApplyContext::new(
+            self.session.clone(),
+            self.wasm_runtime.clone(),
+            action,
+            receiver,
             action_ordinal,
-            trace,
             recurse_depth,
-        );
-        return apply_context.exec().await;
+        )?));
+        let result = apply_context.borrow_mut().exec()?;
+
+        Ok(())
     }
 
     pub fn get_action_trace(&self, action_ordinal: u32) -> Option<&ActionTrace> {
