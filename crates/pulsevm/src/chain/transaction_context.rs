@@ -15,17 +15,17 @@ use super::{
     Action, ActionTrace, Name, Transaction, apply_context::ApplyContext, error::ChainError,
 };
 
-pub struct TransactionContext<'a> {
-    session: Rc<RefCell<UndoSession<'a>>>,
-    wasm_runtime: Arc<RwLock<WasmRuntime<'a>>>,
+pub struct TransactionContext {
+    session: Rc<RefCell<UndoSession>>,
+    wasm_runtime: Arc<RwLock<WasmRuntime>>,
 
     action_traces: Vec<ActionTrace>,
 }
 
-impl<'a> TransactionContext<'a> {
+impl TransactionContext {
     pub fn new(
-        session: Rc<RefCell<UndoSession<'a>>>,
-        wasm_runtime: Arc<RwLock<WasmRuntime<'a>>>,
+        session: Rc<RefCell<UndoSession>>,
+        wasm_runtime: Arc<RwLock<WasmRuntime>>,
     ) -> Self {
         Self {
             session,
@@ -95,15 +95,16 @@ impl<'a> TransactionContext<'a> {
             .ok_or(ChainError::TransactionError(format!("action not found")))?;
         let action = trace.action();
         let receiver = trace.receiver();
-        let apply_context = Rc::new(RefCell::new(ApplyContext::new(
+        let mut apply_context = ApplyContext::new(
             self.session.clone(),
-            self.wasm_runtime.clone(),
             action,
             receiver,
             action_ordinal,
             recurse_depth,
-        )?));
-        let result = apply_context.borrow_mut().exec()?;
+        )?;
+
+        // Initialize the apply context with the action trace.
+        apply_context.exec(self.wasm_runtime.clone())?;
 
         Ok(())
     }

@@ -7,6 +7,8 @@ use wasmtime::{
     Strategy,
 };
 
+use crate::chain::apply_context::{self, ApplyContext};
+
 use super::{
     CodeObject, Id,
     error::ChainError,
@@ -16,24 +18,24 @@ use super::{
     },
 };
 
-pub struct WasmContext<'a> {
-    session: Rc<RefCell<UndoSession<'a>>>,
+pub struct WasmContext {
+    context: Rc<RefCell<ApplyContext>>, // The apply context for this Wasm execution
 }
 
-impl<'a> WasmContext<'a> {
-    pub fn new(session: Rc<RefCell<UndoSession<'a>>>) -> Self {
-        WasmContext { session }
+impl WasmContext {
+    pub fn new(context: Rc<RefCell<ApplyContext>>) -> Self {
+        WasmContext { context }
     }
 }
 
-pub struct WasmRuntime<'a> {
+pub struct WasmRuntime {
     config: Config,
     engine: Engine,
-    linker: Linker<WasmContext<'a>>,
+    linker: Linker<WasmContext>,
     code_cache: LruCache<Id, Module>,
 }
 
-impl<'a> WasmRuntime<'a> {
+impl WasmRuntime {
     pub fn new() -> Self {
         let mut config = Config::default();
 
@@ -71,7 +73,7 @@ impl<'a> WasmRuntime<'a> {
             .unwrap();
 
         // Add host functions to the linker.
-        let mut linker = Linker::<WasmContext<'a>>::new(&engine);
+        let mut linker = Linker::<WasmContext>::new(&engine);
         // Action functions
         linker.func_wrap("env", "action_data_size", action_data_size());
         linker.func_wrap("env", "current_receiver", current_receiver());
@@ -97,11 +99,16 @@ impl<'a> WasmRuntime<'a> {
         }
     }
 
-    pub fn run(&mut self, context: WasmContext<'a>, code_hash: Id) -> Result<(), ChainError> {
+    pub fn run(
+        &mut self,
+        apply_context: Rc<RefCell<ApplyContext>>,
+        code_hash: Id,
+    ) -> Result<(), ChainError> {
         if !self.code_cache.contains(&code_hash) {
-            let code_object = context
+            let code_object = apply_context
+                .borrow_mut()
                 .session
-                .borrow()
+                .borrow_mut()
                 .get::<CodeObject>(code_hash)
                 .map_err(|e| {
                     ChainError::WasmRuntimeError(format!("failed to get wasm code: {}", e))
@@ -111,6 +118,7 @@ impl<'a> WasmRuntime<'a> {
             self.code_cache.put(code_hash, module);
         }
 
+        let context = WasmContext::new(apply_context.clone());
         let mut store = Store::new(&self.engine, context);
         let module = self.code_cache.get(&code_hash).ok_or_else(|| {
             ChainError::WasmRuntimeError(format!("wasm module not found in cache: {}", code_hash))

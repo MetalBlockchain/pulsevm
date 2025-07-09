@@ -21,7 +21,7 @@ impl AuthorizationManager {
 
     pub fn check_authorization(
         &self,
-        session: Rc<RefCell<UndoSession<'_>>>,
+        session: Rc<RefCell<UndoSession>>,
         actions: &Vec<Action>,
         provided_keys: &HashSet<PublicKey>,
         provided_permissions: &HashSet<PermissionLevel>,
@@ -112,7 +112,7 @@ impl AuthorizationManager {
 
     fn check_updateauth_authorization(
         &self,
-        session: Rc<RefCell<UndoSession<'_>>>,
+        session: Rc<RefCell<UndoSession>>,
         action: &Action,
     ) -> Result<(), ChainError> {
         let update = action
@@ -159,7 +159,7 @@ impl AuthorizationManager {
 
     fn check_deleteauth_authorization(
         &self,
-        session: Rc<RefCell<UndoSession<'_>>>,
+        session: Rc<RefCell<UndoSession>>,
         action: &Action,
     ) -> Result<(), ChainError> {
         let del = action
@@ -195,7 +195,7 @@ impl AuthorizationManager {
 
     fn check_linkauth_authorization(
         &self,
-        session: Rc<RefCell<UndoSession<'_>>>,
+        session: Rc<RefCell<UndoSession>>,
         action: &Action,
     ) -> Result<(), ChainError> {
         let link = action
@@ -265,7 +265,7 @@ impl AuthorizationManager {
 
     fn check_unlinkauth_authorization(
         &self,
-        session: Rc<RefCell<UndoSession<'_>>>,
+        session: Rc<RefCell<UndoSession>>,
         action: &Action,
     ) -> Result<(), ChainError> {
         let unlink = action
@@ -316,7 +316,7 @@ impl AuthorizationManager {
 
     pub fn find_permission(
         &self,
-        session: Rc<RefCell<UndoSession<'_>>>,
+        session: Rc<RefCell<UndoSession>>,
         level: &PermissionLevel,
     ) -> Result<Option<Permission>, ChainError> {
         if level.actor().empty() || level.permission().empty() {
@@ -325,7 +325,7 @@ impl AuthorizationManager {
             ));
         }
         let result = session
-            .borrow()
+            .borrow_mut()
             .find_by_secondary::<Permission, PermissionByOwnerIndex>((
                 level.actor(),
                 level.permission(),
@@ -339,7 +339,7 @@ impl AuthorizationManager {
 
     pub fn get_permission(
         &self,
-        session: Rc<RefCell<UndoSession<'_>>>,
+        session: Rc<RefCell<UndoSession>>,
         level: &PermissionLevel,
     ) -> Result<Permission, ChainError> {
         if level.actor().empty() || level.permission().empty() {
@@ -348,7 +348,7 @@ impl AuthorizationManager {
             ));
         }
         let result = session
-            .borrow()
+            .borrow_mut()
             .find_by_secondary::<Permission, PermissionByOwnerIndex>((
                 level.actor(),
                 level.permission(),
@@ -365,7 +365,7 @@ impl AuthorizationManager {
 
     fn lookup_minimum_permission(
         &self,
-        session: Rc<RefCell<UndoSession<'_>>>,
+        session: Rc<RefCell<UndoSession>>,
         authorizer_account: Name,
         scope: Name,
         act_name: Name,
@@ -399,7 +399,7 @@ impl AuthorizationManager {
 
     fn lookup_linked_permission(
         &self,
-        session: Rc<RefCell<UndoSession<'_>>>,
+        session: Rc<RefCell<UndoSession>>,
         authorizer_account: Name,
         scope: Name,
         act_name: Name,
@@ -407,14 +407,14 @@ impl AuthorizationManager {
         // First look up a specific link for this message act_name
         let mut key = (authorizer_account, scope, act_name);
         let mut link = session
-            .borrow()
+            .borrow_mut()
             .find_by_secondary::<PermissionLink, PermissionLinkByActionNameIndex>(key)
             .map_err(|e| ChainError::AuthorizationError(format!("{}", e)))?;
         // If no specific link found, check for a contract-wide default
         if link.is_none() {
             key = (authorizer_account, scope, Name::default());
             link = session
-                .borrow()
+                .borrow_mut()
                 .find_by_secondary::<PermissionLink, PermissionLinkByActionNameIndex>(key)
                 .map_err(|e| ChainError::AuthorizationError(format!("{}", e)))?;
         }
@@ -428,7 +428,7 @@ impl AuthorizationManager {
 
     pub fn create_permission(
         &self,
-        session: Rc<RefCell<UndoSession<'_>>>,
+        session: Rc<RefCell<UndoSession>>,
         account: Name,
         name: Name,
         parent: u64,
@@ -449,7 +449,7 @@ impl AuthorizationManager {
 
     pub fn modify_permission(
         &self,
-        session: Rc<RefCell<UndoSession<'_>>>,
+        session: Rc<RefCell<UndoSession>>,
         permission: &mut Permission,
         auth: &Authority,
     ) -> Result<(), ChainError> {

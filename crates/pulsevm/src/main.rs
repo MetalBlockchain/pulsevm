@@ -97,16 +97,16 @@ async fn start_runtime_service(
 }
 
 #[derive(Clone)]
-pub struct VirtualMachine<'a> {
+pub struct VirtualMachine {
     server_addr: SocketAddr,
-    controller: Arc<RwLock<Controller<'a>>>,
+    controller: Arc<RwLock<Controller>>,
     mempool: Arc<RwLock<mempool::Mempool>>,
     network_manager: Arc<RwLock<chain::NetworkManager>>,
-    rpc_service: chain::RpcService<'a>,
+    rpc_service: chain::RpcService,
     block_timer: Arc<RwLock<Option<JoinHandle<()>>>>,
 }
 
-impl<'a> VirtualMachine<'a> {
+impl VirtualMachine {
     pub fn new(server_addr: SocketAddr) -> Result<Self, Box<dyn std::error::Error>> {
         let controller = Arc::new(RwLock::new(Controller::new()));
         let mempool = Arc::new(RwLock::new(mempool::Mempool::new()));
@@ -126,7 +126,7 @@ impl<'a> VirtualMachine<'a> {
 }
 
 #[tonic::async_trait]
-impl<'a> Vm for VirtualMachine<'static> {
+impl Vm for VirtualMachine {
     async fn initialize(
         &self,
         request: Request<vm::InitializeRequest>,

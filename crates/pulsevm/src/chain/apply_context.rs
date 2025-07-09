@@ -17,9 +17,8 @@ use super::{
     Account, AccountMetadata, Action, Controller, Id, Name, TransactionContext, error::ChainError,
 };
 
-pub struct ApplyContext<'a> {
-    session: Rc<RefCell<UndoSession<'a>>>, // The undo session for this context
-    wasm_runtime: Arc<RwLock<WasmRuntime<'a>>>, // The Wasm runtime for executing actions
+pub struct ApplyContext {
+    pub session: Rc<RefCell<UndoSession>>, // The undo session for this context
 
     action: Action,     // The action being applied
     receiver: Name,     // The account that is receiving the action
@@ -33,10 +32,9 @@ pub struct ApplyContext<'a> {
     account_ram_deltas: HashMap<Name, i64>, // RAM usage deltas for accounts
 }
 
-impl<'a> ApplyContext<'a> {
+impl ApplyContext {
     pub fn new(
-        session: Rc<RefCell<UndoSession<'a>>>,
-        wasm_runtime: Arc<RwLock<WasmRuntime<'a>>>,
+        session: Rc<RefCell<UndoSession>>,
         action: Action,
         receiver: Name,
         action_ordinal: u32,
@@ -44,7 +42,6 @@ impl<'a> ApplyContext<'a> {
     ) -> Result<Self, ChainError> {
         Ok(ApplyContext {
             session,
-            wasm_runtime,
 
             action,
             receiver,
@@ -59,21 +56,15 @@ impl<'a> ApplyContext<'a> {
         })
     }
 
-    pub fn exec(&mut self) -> Result<(), ChainError> {
+    pub fn exec(&mut self, wasm_runtime: Arc<RwLock<WasmRuntime>>) -> Result<(), ChainError> {
         self.notified
             .push_back((self.receiver.clone(), self.action_ordinal));
-        self.exec_one()?;
+        self.exec_one(wasm_runtime.clone())?;
         for i in 1..self.notified.len() {
             let (receiver, action_ordinal) = self.notified[i];
             self.receiver = receiver;
             self.action_ordinal = action_ordinal;
-            self.exec_one()?;
-        }
-
-        if self.inline_actions.len() > 0 && self.recurse_depth >= 1024 {
-            return Err(ChainError::TransactionError(
-                "recursion depth exceeded".to_string(),
-            ));
+            self.exec_one(wasm_runtime.clone())?;
         }
 
         // TODO: Handle inline actions
@@ -81,34 +72,36 @@ impl<'a> ApplyContext<'a> {
         Ok(())
     }
 
-    pub fn exec_one(&mut self) -> Result<(), ChainError> {
+    pub fn exec_one(
+        &mut self,
+        wasm_runtime: Arc<RwLock<WasmRuntime>>,
+    ) -> Result<(), ChainError> {
         let mut code_hash = Id::zero();
 
-        {
-            let receiver_account = self
-                .session
-                .borrow()
-                .get::<AccountMetadata>(self.receiver.clone())
-                .map_err(|e| {
-                    ChainError::TransactionError(format!("failed to get receiver account: {}", e))
-                })?;
-            self.privileged = receiver_account.privileged;
-            let native = Controller::find_apply_handler(
-                self.receiver,
-                self.action.account(),
-                self.action.name(),
-            );
-            if let Some(native) = native {
-                native(self, self.session.clone())?;
-            }
+        let receiver_account = self
+            .session
+            .borrow()
+            .get::<AccountMetadata>(self.receiver.clone())
+            .map_err(|e| {
+                ChainError::TransactionError(format!("failed to get receiver account: {}", e))
+            })?;
+        self.privileged = receiver_account.privileged;
+        let native = Controller::find_apply_handler(
+            self.receiver,
+            self.action.account(),
+            self.action.name(),
+        );
+        if let Some(native) = native {
+            native(self)?;
         }
+
         // Does the receiver account have a contract deployed?
         if code_hash != Id::zero() {
-            let mut runtime = self.wasm_runtime.write().map_err(|e| {
+            let mut runtime = wasm_runtime.write().map_err(|e| {
                 ChainError::TransactionError(format!("failed to get mutable wasm runtime: {}", e))
             })?;
-            let wasm_context = WasmContext::new(self.session.clone());
-            runtime.run(wasm_context, code_hash)?;
+            //let wasm_context = WasmContext::new(self);
+            runtime.run(Rc::new(RefCell::new(self)), code_hash)?;
         }
         Ok(())
     }
@@ -187,8 +180,9 @@ impl<'a> ApplyContext<'a> {
             .or_insert(ram_delta);
     }
 
-    pub fn is_account(&self, session: &UndoSession, account: Name) -> Result<bool, ChainError> {
-        let exists = session
+    pub fn is_account(&self, account: Name) -> Result<bool, ChainError> {
+        let exists = self.session
+            .borrow_mut()
             .find::<Account>(account)
             .map(|account| account.is_some())
             .map_err(|e| ChainError::TransactionError(format!("failed to find account: {}", e)))?;

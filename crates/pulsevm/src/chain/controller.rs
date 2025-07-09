@@ -30,8 +30,7 @@ use pulsevm_serialization::Deserialize;
 use spdlog::info;
 use tokio::sync::RwLock as AsyncRwLock;
 
-pub type ApplyHandlerFn =
-    fn(&mut ApplyContext, Rc<RefCell<UndoSession<'_>>>) -> Result<(), ChainError>;
+pub type ApplyHandlerFn = fn(&mut ApplyContext) -> Result<(), ChainError>;
 pub type ApplyHandlerMap = HashMap<
     (Name, Name, Name), // (receiver, contract, action)
     ApplyHandlerFn,
@@ -55,10 +54,10 @@ pub static APPLY_HANDLERS: LazyLock<ApplyHandlerMap> = LazyLock::new(|| {
     m
 });
 
-pub struct Controller<'a> {
+pub struct Controller {
     authorization_manager: AuthorizationManager,
     resource_limits_manager: ResourceLimitsManager,
-    wasm_runtime: Arc<RwLock<WasmRuntime<'a>>>,
+    wasm_runtime: Arc<RwLock<WasmRuntime>>,
 
     last_accepted_block: Block,
     preferred_id: Id,
@@ -79,7 +78,7 @@ impl fmt::Display for ControllerError {
     }
 }
 
-impl<'a> Controller<'a> {
+impl Controller {
     pub fn new() -> Self {
         // Create a temporary database
         let db = Database::temporary(Path::new("temp")).unwrap();
@@ -203,7 +202,7 @@ impl<'a> Controller<'a> {
     }
 
     pub async fn build_block(
-        &'a self,
+        &self,
         mempool: Arc<AsyncRwLock<Mempool>>,
     ) -> Result<Block, ChainError> {
         let mempool = mempool.clone();
@@ -243,7 +242,7 @@ impl<'a> Controller<'a> {
         Ok(block)
     }
 
-    pub async fn verify_block(&'a mut self, block: &Block) -> Result<(), ChainError> {
+    pub async fn verify_block(&mut self, block: &Block) -> Result<(), ChainError> {
         if self.verified_blocks.contains_key(&block.id()) {
             return Ok(());
         }
@@ -305,7 +304,7 @@ impl<'a> Controller<'a> {
 
     // This function will execute a transaction and roll it back instantly
     // This is useful for checking if a transaction is valid
-    pub fn push_transaction(&'a self, transaction: &Transaction) -> Result<(), ChainError> {
+    pub fn push_transaction(&self, transaction: &Transaction) -> Result<(), ChainError> {
         let db = &self.db;
         let undo_session = db.undo_session().map_err(|e| {
             ChainError::TransactionError(format!("failed to create undo session: {}", e))
@@ -321,7 +320,7 @@ impl<'a> Controller<'a> {
     // This is useful for applying a transaction to the blockchain
     pub fn execute_transaction(
         &self,
-        undo_session: Rc<RefCell<UndoSession<'a>>>,
+        undo_session: Rc<RefCell<UndoSession>>,
         transaction: &Transaction,
     ) -> Result<(), ChainError> {
         // Verify authority

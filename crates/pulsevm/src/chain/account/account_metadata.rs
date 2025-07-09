@@ -81,7 +81,7 @@ impl Deserialize for AccountMetadata {
     }
 }
 
-impl<'a> ChainbaseObject<'a> for AccountMetadata {
+impl ChainbaseObject for AccountMetadata {
     type PrimaryKey = Name;
 
     fn primary_key(&self) -> Vec<u8> {

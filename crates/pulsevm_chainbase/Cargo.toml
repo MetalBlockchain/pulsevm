@@ -4,5 +4,5 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-fjall = "2.10.0"
+fjall = { version = "2.10.0", features = ["lz4", "ssi_tx"], default-features = false }
 pulsevm_serialization = { path = "../pulsevm_serialization" }

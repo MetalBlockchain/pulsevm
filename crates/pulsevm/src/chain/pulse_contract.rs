@@ -19,10 +19,7 @@ use super::{
     pulse_assert, zero_hash,
 };
 
-pub fn newaccount(
-    context: &mut ApplyContext,
-    session: Rc<RefCell<UndoSession<'_>>>,
-) -> Result<(), ChainError> {
+pub fn newaccount(context: &mut ApplyContext) -> Result<(), ChainError> {
     let create = context
         .get_action()
         .data_as::<NewAccount>()
@@ -47,7 +44,9 @@ pub fn newaccount(
     )?;
 
     // Check if the creator is privileged
-    let creator = session
+    let creator = context
+        .session
+        .borrow()
         .get::<AccountMetadata>(create.creator)
         .map_err(|_| ChainError::TransactionError(format!("failed to find creator account")))?;
     if !creator.is_privileged() {
@@ -58,7 +57,9 @@ pub fn newaccount(
             ),
         )?;
     }
-    let existing_account = session
+    let existing_account = context
+        .session
+        .borrow()
         .find::<Account>(create.name)
         .map_err(|_| ChainError::TransactionError(format!("failed to find account")))?;
     pulse_assert(
@@ -68,10 +69,14 @@ pub fn newaccount(
             create.name
         )),
     )?;
-    session
+    context
+        .session
+        .borrow_mut()
         .insert(&Account::new(create.name, 0, vec![]))
         .map_err(|_| ChainError::TransactionError(format!("failed to insert account")))?;
-    session
+    context
+        .session
+        .borrow_mut()
         .insert(&AccountMetadata::new(create.name))
         .map_err(|_| ChainError::TransactionError(format!("failed to insert account metadata")))?;
 
@@ -107,10 +112,7 @@ pub fn newaccount(
     Ok(())
 }
 
-pub fn setcode(
-    context: &mut ApplyContext,
-    session: Rc<RefCell<UndoSession<'_>>>,
-) -> Result<(), ChainError> {
+pub fn setcode(context: &mut ApplyContext) -> Result<(), ChainError> {
     let act = context
         .get_action()
         .data_as::<SetCode>()
@@ -219,10 +221,7 @@ pub fn setcode(
     Ok(())
 }
 
-pub fn setabi(
-    context: &mut ApplyContext,
-    session: Rc<RefCell<UndoSession<'_>>>,
-) -> Result<(), ChainError> {
+pub fn setabi(context: &mut ApplyContext) -> Result<(), ChainError> {
     let act = context
         .get_action()
         .data_as::<SetAbi>()
@@ -258,10 +257,7 @@ pub fn setabi(
     Ok(())
 }
 
-pub fn updateauth(
-    context: &mut ApplyContext,
-    session: Rc<RefCell<UndoSession<'_>>>,
-) -> Result<(), ChainError> {
+pub fn updateauth(context: &mut ApplyContext) -> Result<(), ChainError> {
     let update = context
         .get_action()
         .data_as::<UpdateAuth>()
@@ -365,11 +361,7 @@ pub fn updateauth(
     Ok(())
 }
 
-pub fn deleteauth(
-    controller: &Controller,
-    context: &mut ApplyContext,
-    session: &mut UndoSession,
-) -> Result<(), ChainError> {
+pub fn deleteauth(context: &mut ApplyContext) -> Result<(), ChainError> {
     let remove = context
         .get_action()
         .data_as::<DeleteAuth>()

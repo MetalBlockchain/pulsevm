@@ -2,9 +2,9 @@ mod index;
 
 use fjall::{Config, Slice, TransactionalKeyspace, WriteTransaction};
 use pulsevm_serialization::{Deserialize, Serialize, serialize};
-use std::{collections::VecDeque, error::Error, path::Path};
+use std::{collections::VecDeque, error::Error, path::Path, sync::Arc};
 
-pub trait ChainbaseObject<'a>: Default + Serialize + Deserialize {
+pub trait ChainbaseObject: Default + Serialize + Deserialize {
     type PrimaryKey: Deserialize;
 
     fn primary_key(&self) -> Vec<u8>;
@@ -23,9 +23,9 @@ pub struct SecondaryKey {
     pub index_name: &'static str,
 }
 
-pub trait SecondaryIndex<'a, C>
+pub trait SecondaryIndex<C>
 where
-    C: ChainbaseObject<'a>,
+    C: ChainbaseObject,
 {
     type Key: Clone;
 
@@ -42,27 +42,24 @@ enum ObjectChange {
 
 #[derive(Clone)]
 pub struct Database {
-    keyspace: TransactionalKeyspace,
+    keyspace: Arc<TransactionalKeyspace>,
 }
 
 impl<'a> Database {
     #[must_use]
     pub fn new(path: &Path) -> Result<Self, fjall::Error> {
         Ok(Self {
-            keyspace: Config::new(path).open_transactional()?,
+            keyspace: Arc::new(Config::new(path).open_transactional()?),
         })
     }
 
     pub fn temporary(path: &Path) -> Result<Self, fjall::Error> {
         let config = Config::new(path).temporary(true);
-        let keyspace = config.open_transactional()?;
+        let keyspace = Arc::new(config.open_transactional()?);
         Ok(Self { keyspace })
     }
 
-    pub fn exists<T: ChainbaseObject<'a> + 'static>(
-        &self,
-        key: T::PrimaryKey,
-    ) -> Result<bool, Box<dyn Error>> {
+    pub fn exists<T: ChainbaseObject>(&self, key: T::PrimaryKey) -> Result<bool, Box<dyn Error>> {
         let partition = self
             .keyspace
             .open_partition(T::table_name(), Default::default())?;
@@ -71,7 +68,7 @@ impl<'a> Database {
     }
 
     #[must_use]
-    pub fn find<T: ChainbaseObject<'a>>(
+    pub fn find<T: ChainbaseObject>(
         &self,
         key: T::PrimaryKey,
     ) -> Result<Option<T>, Box<dyn Error>> {
@@ -89,7 +86,7 @@ impl<'a> Database {
     }
 
     #[must_use]
-    pub fn find_by_secondary<T: ChainbaseObject<'a>, S: SecondaryIndex<'a, T>>(
+    pub fn find_by_secondary<T: ChainbaseObject, S: SecondaryIndex<T>>(
         &self,
         key: S::Key,
     ) -> Result<Option<T>, Box<dyn Error>> {
@@ -114,28 +111,28 @@ impl<'a> Database {
     }
 
     pub fn undo_session(&self) -> Result<UndoSession, Box<dyn Error>> {
-        UndoSession::new(&self.keyspace)
+        UndoSession::new(self.keyspace.clone())
     }
 }
 
-pub struct UndoSession<'a> {
+pub struct UndoSession {
     changes: VecDeque<ObjectChange>,
-    tx: WriteTransaction<'a>,
-    keyspace: TransactionalKeyspace,
+    tx: WriteTransaction,
+    keyspace: Arc<TransactionalKeyspace>,
 }
 
-impl<'a> UndoSession<'a> {
-    pub fn new(keyspace: &'a TransactionalKeyspace) -> Result<Self, Box<dyn Error>> {
+impl UndoSession {
+    pub fn new(keyspace: Arc<TransactionalKeyspace>) -> Result<Self, Box<dyn Error>> {
         Ok(Self {
             changes: VecDeque::new(),
-            tx: keyspace.write_tx(),
+            tx: keyspace.write_tx()?,
             keyspace: keyspace.clone(),
         })
     }
 
     #[must_use]
-    pub fn exists<T: ChainbaseObject<'a> + 'static>(
-        &self,
+    pub fn exists<T: ChainbaseObject>(
+        &mut self,
         key: T::PrimaryKey,
     ) -> Result<bool, Box<dyn Error>> {
         let partition = self
@@ -148,8 +145,8 @@ impl<'a> UndoSession<'a> {
     }
 
     #[must_use]
-    pub fn find<T: ChainbaseObject<'a> + 'static>(
-        &self,
+    pub fn find<T: ChainbaseObject>(
+        &mut self,
         key: T::PrimaryKey,
     ) -> Result<Option<T>, Box<dyn Error>> {
         let partition = self
@@ -166,10 +163,7 @@ impl<'a> UndoSession<'a> {
     }
 
     #[must_use]
-    pub fn get<T: ChainbaseObject<'a> + 'static>(
-        &self,
-        key: T::PrimaryKey,
-    ) -> Result<T, Box<dyn Error>> {
+    pub fn get<T: ChainbaseObject>(&mut self, key: T::PrimaryKey) -> Result<T, Box<dyn Error>> {
         let found = self.find::<T>(key)?;
         if found.is_none() {
             return Err("Object not found".into());
@@ -179,8 +173,8 @@ impl<'a> UndoSession<'a> {
     }
 
     #[must_use]
-    pub fn find_by_secondary<T: ChainbaseObject<'a>, S: SecondaryIndex<'a, T>>(
-        &self,
+    pub fn find_by_secondary<T: ChainbaseObject, S: SecondaryIndex<T>>(
+        &mut self,
         key: S::Key,
     ) -> Result<Option<T>, Box<dyn Error>> {
         let partition = self
@@ -203,7 +197,7 @@ impl<'a> UndoSession<'a> {
         Ok(Some(object))
     }
 
-    pub fn generate_id<T: ChainbaseObject<'a>>(&mut self) -> Result<u64, Box<dyn Error>> {
+    pub fn generate_id<T: ChainbaseObject>(&mut self) -> Result<u64, Box<dyn Error>> {
         let partition = self
             .keyspace
             .open_partition(T::table_name(), Default::default())?;
@@ -224,7 +218,7 @@ impl<'a> UndoSession<'a> {
         Ok(new_id)
     }
 
-    pub fn insert<T: ChainbaseObject<'a>>(&mut self, object: &T) -> Result<(), Box<dyn Error>> {
+    pub fn insert<T: ChainbaseObject>(&mut self, object: &T) -> Result<(), Box<dyn Error>> {
         let key = object.primary_key();
         let serialized = serialize(object);
         let partition = self
@@ -247,7 +241,7 @@ impl<'a> UndoSession<'a> {
 
     pub fn modify<T, F>(&mut self, old: &mut T, f: F) -> Result<(), Box<dyn Error>>
     where
-        T: ChainbaseObject<'a> + 'static,
+        T: ChainbaseObject,
         F: FnOnce(&mut T),
     {
         let key = old.primary_key();
@@ -270,10 +264,7 @@ impl<'a> UndoSession<'a> {
         Ok(())
     }
 
-    pub fn remove<T: ChainbaseObject<'a> + 'static>(
-        &mut self,
-        object: T,
-    ) -> Result<(), Box<dyn Error>> {
+    pub fn remove<T: ChainbaseObject>(&mut self, object: T) -> Result<(), Box<dyn Error>> {
         let key = object.primary_key();
         let partition = self
             .keyspace
@@ -330,7 +321,7 @@ mod tests {
         }
     }
 
-    impl<'a> ChainbaseObject<'a> for TestObject {
+    impl ChainbaseObject for TestObject {
         type PrimaryKey = u64;
 
         fn primary_key(&self) -> Vec<u8> {
@@ -353,7 +344,7 @@ mod tests {
     #[derive(Debug, Default)]
     pub struct TestObjectByNameIndex;
 
-    impl<'a> SecondaryIndex<'a, TestObject> for TestObjectByNameIndex {
+    impl SecondaryIndex<TestObject> for TestObjectByNameIndex {
         type Key = String;
 
         fn secondary_key(&self, object: &TestObject) -> Vec<u8> {

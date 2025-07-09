@@ -84,7 +84,7 @@ impl Deserialize for PermissionLink {
     }
 }
 
-impl<'a> ChainbaseObject<'a> for PermissionLink {
+impl ChainbaseObject for PermissionLink {
     type PrimaryKey = Id;
 
     fn primary_key(&self) -> Vec<u8> {
@@ -124,7 +124,7 @@ impl<'a> ChainbaseObject<'a> for PermissionLink {
 #[derive(Debug, Default)]
 pub struct PermissionLinkByActionNameIndex;
 
-impl<'a> SecondaryIndex<'a, PermissionLink> for PermissionLinkByActionNameIndex {
+impl SecondaryIndex<PermissionLink> for PermissionLinkByActionNameIndex {
     type Key = (Name, Name, Name);
 
     fn secondary_key(&self, object: &PermissionLink) -> Vec<u8> {
@@ -150,7 +150,7 @@ impl<'a> SecondaryIndex<'a, PermissionLink> for PermissionLinkByActionNameIndex 
 #[derive(Debug, Default)]
 pub struct PermissionLinkByPermissionNameIndex;
 
-impl<'a> SecondaryIndex<'a, PermissionLink> for PermissionLinkByPermissionNameIndex {
+impl SecondaryIndex<PermissionLink> for PermissionLinkByPermissionNameIndex {
     type Key = (Name, Name, Id);
 
     fn secondary_key(&self, object: &PermissionLink) -> Vec<u8> {

@@ -46,7 +46,7 @@ impl Deserialize for ResourceLimits {
     }
 }
 
-impl<'a> ChainbaseObject<'a> for ResourceLimits {
+impl ChainbaseObject for ResourceLimits {
     type PrimaryKey = Name;
 
     fn primary_key(&self) -> Vec<u8> {

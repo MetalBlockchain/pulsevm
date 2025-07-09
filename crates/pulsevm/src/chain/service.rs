@@ -26,16 +26,16 @@ pub trait Rpc {
 }
 
 #[derive(Clone)]
-pub struct RpcService<'a> {
+pub struct RpcService {
     mempool: Arc<RwLock<Mempool>>,
-    controller: Arc<RwLock<Controller<'a>>>,
+    controller: Arc<RwLock<Controller>>,
     network_manager: Arc<RwLock<NetworkManager>>,
 }
 
-impl<'a> RpcService<'a> {
+impl RpcService {
     pub fn new(
         mempool: Arc<RwLock<Mempool>>,
-        controller: Arc<RwLock<Controller<'a>>>,
+        controller: Arc<RwLock<Controller>>,
         network_manager: Arc<RwLock<NetworkManager>>,
     ) -> Self {
         RpcService {
@@ -68,7 +68,7 @@ pub struct IssueTxResponse {
 }
 
 #[async_trait]
-impl<'a> RpcServer for RpcService<'static> {
+impl RpcServer for RpcService {
     async fn issue_tx(
         &self,
         tx_hex: &str,

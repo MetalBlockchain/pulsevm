@@ -42,7 +42,7 @@ impl Deserialize for Account {
     }
 }
 
-impl<'a> ChainbaseObject<'a> for Account {
+impl ChainbaseObject for Account {
     type PrimaryKey = Name;
 
     fn primary_key(&self) -> Vec<u8> {

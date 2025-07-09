@@ -46,7 +46,7 @@ impl Deserialize for ResourceUsage {
     }
 }
 
-impl<'a> ChainbaseObject<'a> for ResourceUsage {
+impl ChainbaseObject for ResourceUsage {
     type PrimaryKey = Name;
 
     fn primary_key(&self) -> Vec<u8> {

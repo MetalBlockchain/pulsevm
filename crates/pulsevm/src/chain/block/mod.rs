@@ -82,7 +82,7 @@ impl Block {
     }
 }
 
-impl<'a> ChainbaseObject<'a> for Block {
+impl ChainbaseObject for Block {
     type PrimaryKey = Id;
 
     fn primary_key(&self) -> Vec<u8> {
@@ -132,7 +132,7 @@ impl Deserialize for Block {
 #[derive(Debug, Default)]
 pub struct BlockByHeightIndex;
 
-impl<'a> SecondaryIndex<'a, Block> for BlockByHeightIndex {
+impl SecondaryIndex<Block> for BlockByHeightIndex {
     type Key = u64;
 
     fn secondary_key(&self, object: &Block) -> Vec<u8> {

@@ -44,7 +44,7 @@ impl Deserialize for CodeObject {
     }
 }
 
-impl<'a> ChainbaseObject<'a> for CodeObject {
+impl ChainbaseObject for CodeObject {
     type PrimaryKey = Id;
 
     fn primary_key(&self) -> Vec<u8> {

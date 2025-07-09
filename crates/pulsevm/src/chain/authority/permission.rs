@@ -41,7 +41,7 @@ impl Permission {
     pub fn satisfies(
         &self,
         other: &Permission,
-        session: Rc<RefCell<UndoSession<'_>>>,
+        session: Rc<RefCell<UndoSession>>,
     ) -> Result<bool, Box<dyn std::error::Error>> {
         // If the owners are not the same, this permission cannot satisfy other
         if self.owner != other.owner {
@@ -54,7 +54,7 @@ impl Permission {
         }
 
         // Walk up other's parent tree, seeing if we find this permission. If so, this permission satisfies other
-        let mut parent = session.borrow().find::<Permission>(other.parent_id)?;
+        let mut parent = session.borrow_mut().find::<Permission>(other.parent_id)?;
         while parent.is_some() {
             let parent_obj = parent.unwrap();
             if self.id == parent_obj.parent_id {
@@ -62,7 +62,7 @@ impl Permission {
             } else if parent_obj.id == 0 {
                 return Ok(false);
             }
-            parent = session.borrow().find::<Permission>(parent_obj.parent_id)?;
+            parent = session.borrow_mut().find::<Permission>(parent_obj.parent_id)?;
         }
 
         // This permission is not a parent of other, and so does not satisfy other
@@ -97,7 +97,7 @@ impl Deserialize for Permission {
     }
 }
 
-impl<'a> ChainbaseObject<'a> for Permission {
+impl ChainbaseObject for Permission {
     type PrimaryKey = u64;
 
     fn primary_key(&self) -> Vec<u8> {
@@ -123,7 +123,7 @@ impl<'a> ChainbaseObject<'a> for Permission {
 #[derive(Debug, Default)]
 pub struct PermissionByOwnerIndex;
 
-impl<'a> SecondaryIndex<'a, Permission> for PermissionByOwnerIndex {
+impl SecondaryIndex<Permission> for PermissionByOwnerIndex {
     type Key = (Name, Name);
 
     fn secondary_key(&self, object: &Permission) -> Vec<u8> {
