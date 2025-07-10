@@ -6,7 +6,6 @@ use std::{
 };
 
 use pulsevm_chainbase::UndoSession;
-use wasmtime::Ref;
 
 use crate::chain::{
     ActionTrace, controller,
@@ -17,6 +16,7 @@ use super::{
     Account, AccountMetadata, Action, Controller, Id, Name, TransactionContext, error::ChainError,
 };
 
+#[derive(Clone)]
 pub struct ApplyContext {
     pub session: Rc<RefCell<UndoSession>>, // The undo session for this context
 
@@ -56,54 +56,59 @@ impl ApplyContext {
         })
     }
 
-    pub fn exec(&mut self, wasm_runtime: Arc<RwLock<WasmRuntime>>) -> Result<(), ChainError> {
+    pub fn exec(mut self, wasm_runtime: Arc<RwLock<WasmRuntime>>) -> Result<Self, ChainError> {
         self.notified
             .push_back((self.receiver.clone(), self.action_ordinal));
-        self.exec_one(wasm_runtime.clone())?;
-        for i in 1..self.notified.len() {
-            let (receiver, action_ordinal) = self.notified[i];
-            self.receiver = receiver;
-            self.action_ordinal = action_ordinal;
-            self.exec_one(wasm_runtime.clone())?;
+        let mut context = self.exec_one(wasm_runtime.clone())?;
+        for i in 1..context.notified.len() {
+            let (receiver, action_ordinal) = context.notified[i];
+            context.receiver = receiver;
+            context.action_ordinal = action_ordinal;
+            context = context.exec_one(wasm_runtime.clone())?;
         }
 
         // TODO: Handle inline actions
 
-        Ok(())
+        Ok(context)
     }
 
-    pub fn exec_one(
-        &mut self,
-        wasm_runtime: Arc<RwLock<WasmRuntime>>,
-    ) -> Result<(), ChainError> {
-        let mut code_hash = Id::zero();
-
+    pub fn exec_one(mut self, wasm_runtime: Arc<RwLock<WasmRuntime>>) -> Result<Self, ChainError> {
+        let code_hash = Id::zero();
         let receiver_account = self
             .session
-            .borrow()
+            .borrow_mut()
             .get::<AccountMetadata>(self.receiver.clone())
             .map_err(|e| {
                 ChainError::TransactionError(format!("failed to get receiver account: {}", e))
             })?;
+
         self.privileged = receiver_account.privileged;
+
         let native = Controller::find_apply_handler(
             self.receiver,
             self.action.account(),
             self.action.name(),
         );
         if let Some(native) = native {
-            native(self)?;
+            native(&mut self)?;
         }
 
         // Does the receiver account have a contract deployed?
         if code_hash != Id::zero() {
-            let mut runtime = wasm_runtime.write().map_err(|e| {
-                ChainError::TransactionError(format!("failed to get mutable wasm runtime: {}", e))
-            })?;
-            //let wasm_context = WasmContext::new(self);
-            runtime.run(Rc::new(RefCell::new(self)), code_hash)?;
+            let context = wasm_runtime
+                .write()
+                .map_err(|e| {
+                    ChainError::TransactionError(format!(
+                        "failed to get mutable wasm runtime: {}",
+                        e
+                    ))
+                })?
+                .run(self, code_hash)?;
+
+            return Ok(context);
         }
-        Ok(())
+
+        Ok(self)
     }
 
     pub fn schedule_action_from_ordinal(
@@ -181,7 +186,8 @@ impl ApplyContext {
     }
 
     pub fn is_account(&self, account: Name) -> Result<bool, ChainError> {
-        let exists = self.session
+        let exists = self
+            .session
             .borrow_mut()
             .find::<Account>(account)
             .map(|account| account.is_some())

@@ -1,11 +1,7 @@
 use std::{cell::RefCell, num::NonZeroUsize, rc::Rc};
 
 use lru::LruCache;
-use pulsevm_chainbase::UndoSession;
-use wasmtime::{
-    Config, Engine, InstanceAllocationStrategy, Linker, Module, PoolingAllocationConfig, Store,
-    Strategy,
-};
+use wasmtime::{Config, Engine, Linker, Module, Store, Strategy};
 
 use crate::chain::apply_context::{self, ApplyContext};
 
@@ -19,12 +15,20 @@ use super::{
 };
 
 pub struct WasmContext {
-    context: Rc<RefCell<ApplyContext>>, // The apply context for this Wasm execution
+    context: ApplyContext, // The apply context for this Wasm execution
 }
 
 impl WasmContext {
-    pub fn new(context: Rc<RefCell<ApplyContext>>) -> Self {
+    pub fn new(context: ApplyContext) -> Self {
         WasmContext { context }
+    }
+
+    pub fn apply_context(&self) -> &ApplyContext {
+        &self.context
+    }
+
+    pub fn mutable_apply_context(&mut self) -> &mut ApplyContext {
+        &mut self.context
     }
 }
 
@@ -53,14 +57,6 @@ impl WasmRuntime {
         // elided.
         config.memory_reservation(1 << 32);
         config.memory_guard_size(1 << 32);
-
-        let mut pool = PoolingAllocationConfig::new();
-        pool.total_memories(50);
-        pool.max_memory_size(1 << 31); // 2 GiB
-        pool.total_tables(50);
-        pool.table_elements(1000);
-        pool.total_core_instances(10);
-        config.allocation_strategy(InstanceAllocationStrategy::Pooling(pool));
 
         // Enable copy-on-write heap images.
         config.memory_init_cow(true);
@@ -101,12 +97,11 @@ impl WasmRuntime {
 
     pub fn run(
         &mut self,
-        apply_context: Rc<RefCell<ApplyContext>>,
+        apply_context: ApplyContext,
         code_hash: Id,
-    ) -> Result<(), ChainError> {
+    ) -> Result<ApplyContext, ChainError> {
         if !self.code_cache.contains(&code_hash) {
             let code_object = apply_context
-                .borrow_mut()
                 .session
                 .borrow_mut()
                 .get::<CodeObject>(code_hash)
@@ -118,7 +113,7 @@ impl WasmRuntime {
             self.code_cache.put(code_hash, module);
         }
 
-        let context = WasmContext::new(apply_context.clone());
+        let context = WasmContext::new(apply_context);
         let mut store = Store::new(&self.engine, context);
         let module = self.code_cache.get(&code_hash).ok_or_else(|| {
             ChainError::WasmRuntimeError(format!("wasm module not found in cache: {}", code_hash))
@@ -131,8 +126,8 @@ impl WasmRuntime {
             .get_typed_func::<(), ()>(&mut store, "run")
             .map_err(|e| ChainError::WasmRuntimeError(e.to_string()))?;
         apply_func
-            .call(store, ())
+            .call(&mut store, ())
             .map_err(|e| ChainError::WasmRuntimeError(format!("apply error: {}", e.to_string())))?;
-        Ok(())
+        Ok(store.into_data().context)
     }
 }

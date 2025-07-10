@@ -62,7 +62,9 @@ impl Permission {
             } else if parent_obj.id == 0 {
                 return Ok(false);
             }
-            parent = session.borrow_mut().find::<Permission>(parent_obj.parent_id)?;
+            parent = session
+                .borrow_mut()
+                .find::<Permission>(parent_obj.parent_id)?;
         }
 
         // This permission is not a parent of other, and so does not satisfy other

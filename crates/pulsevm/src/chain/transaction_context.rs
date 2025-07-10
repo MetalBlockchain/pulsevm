@@ -23,10 +23,7 @@ pub struct TransactionContext {
 }
 
 impl TransactionContext {
-    pub fn new(
-        session: Rc<RefCell<UndoSession>>,
-        wasm_runtime: Arc<RwLock<WasmRuntime>>,
-    ) -> Self {
+    pub fn new(session: Rc<RefCell<UndoSession>>, wasm_runtime: Arc<RwLock<WasmRuntime>>) -> Self {
         Self {
             session,
             wasm_runtime,
@@ -104,7 +101,7 @@ impl TransactionContext {
         )?;
 
         // Initialize the apply context with the action trace.
-        apply_context.exec(self.wasm_runtime.clone())?;
+        apply_context = apply_context.exec(self.wasm_runtime.clone())?;
 
         Ok(())
     }

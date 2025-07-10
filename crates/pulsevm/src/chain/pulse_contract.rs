@@ -5,7 +5,6 @@ use sha2::{
     Digest, Sha256,
     digest::{consts::U32, generic_array::GenericArray},
 };
-use wasmtime::Ref;
 
 use crate::chain::Controller;
 
