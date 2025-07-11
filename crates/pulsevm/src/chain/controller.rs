@@ -19,11 +19,10 @@ use super::{
     block::{Block, BlockByHeightIndex, BlockTimestamp},
     error::ChainError,
     pulse_contract::{newaccount, setabi, setcode, updateauth},
-    resource_limits::ResourceLimitsManager,
-    transaction::{self, Transaction},
+    transaction::Transaction,
     wasm_runtime::WasmRuntime,
 };
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use pulsevm_chainbase::{Database, UndoSession};
 use pulsevm_proc_macros::name;
 use pulsevm_serialization::Deserialize;
@@ -55,8 +54,6 @@ pub static APPLY_HANDLERS: LazyLock<ApplyHandlerMap> = LazyLock::new(|| {
 });
 
 pub struct Controller {
-    authorization_manager: AuthorizationManager,
-    resource_limits_manager: ResourceLimitsManager,
     wasm_runtime: Arc<RwLock<WasmRuntime>>,
 
     last_accepted_block: Block,
@@ -83,10 +80,7 @@ impl Controller {
         // Create a temporary database
         let db = Database::temporary(Path::new("temp")).unwrap();
         let controller = Controller {
-            authorization_manager: AuthorizationManager::new(),
-            resource_limits_manager: ResourceLimitsManager::new(),
             wasm_runtime: Arc::new(RwLock::new(WasmRuntime::new())), // TODO: Handle error properly
-
             last_accepted_block: Block::default(),
             preferred_id: Id::default(),
             db: db,
@@ -128,16 +122,12 @@ impl Controller {
 
         if genesis_block.is_none() {
             // If not, insert it
-            let session = self.db.undo_session().map_err(|e| {
+            let mut session = self.db.undo_session().map_err(|e| {
                 ControllerError::GenesisError(format!("failed to create undo session: {}", e))
             })?;
-            let session = Rc::new(RefCell::new(session));
-            session
-                .borrow_mut()
-                .insert(&self.last_accepted_block)
-                .map_err(|e| {
-                    ControllerError::GenesisError(format!("failed to insert genesis block: {}", e))
-                })?;
+            session.insert(&self.last_accepted_block).map_err(|e| {
+                ControllerError::GenesisError(format!("failed to insert genesis block: {}", e))
+            })?;
             let default_key = genesis.initial_key().map_err(|e| {
                 ControllerError::GenesisError(format!("failed to get initial key: {}", e))
             })?;
@@ -147,44 +137,39 @@ impl Controller {
             );
             let default_authority = Authority::new(1, vec![KeyWeight::new(default_key, 1)], vec![]);
             // Create the pulse@owner permission
-            let owner_permission = self
-                .authorization_manager
-                .create_permission(
-                    session.clone(),
-                    PULSE_NAME,
-                    OWNER_NAME,
-                    0,
-                    default_authority.clone(),
-                )
-                .map_err(|e| {
-                    ControllerError::GenesisError(format!(
-                        "failed to create pulse@owner permission: {}",
-                        e
-                    ))
-                })?;
+            let owner_permission = AuthorizationManager::create_permission(
+                &mut session,
+                PULSE_NAME,
+                OWNER_NAME,
+                0,
+                default_authority.clone(),
+            )
+            .map_err(|e| {
+                ControllerError::GenesisError(format!(
+                    "failed to create pulse@owner permission: {}",
+                    e
+                ))
+            })?;
             // Create the pulse@active permission
-            self.authorization_manager
-                .create_permission(
-                    session.clone(),
-                    PULSE_NAME,
-                    ACTIVE_NAME,
-                    owner_permission.id(),
-                    default_authority.clone(),
-                )
-                .map_err(|e| {
-                    ControllerError::GenesisError(format!(
-                        "failed to create pulse@owner permission: {}",
-                        e
-                    ))
-                })?;
+            AuthorizationManager::create_permission(
+                &mut session,
+                PULSE_NAME,
+                ACTIVE_NAME,
+                owner_permission.id(),
+                default_authority.clone(),
+            )
+            .map_err(|e| {
+                ControllerError::GenesisError(format!(
+                    "failed to create pulse@owner permission: {}",
+                    e
+                ))
+            })?;
             session
-                .borrow_mut()
                 .insert(&Account::new(PULSE_NAME, 0, vec![]))
                 .map_err(|e| {
                     ControllerError::GenesisError(format!("failed to insert pulse account: {}", e))
                 })?;
             session
-                .borrow_mut()
                 .insert(&AccountMetadata::new(PULSE_NAME))
                 .map_err(|e| {
                     ControllerError::GenesisError(format!(
@@ -192,10 +177,7 @@ impl Controller {
                         e
                     ))
                 })?;
-            Rc::try_unwrap(session)
-                .map_err(|_| ControllerError::GenesisError("failed to unwrap session".to_string()))?
-                .into_inner()
-                .commit();
+            session.commit();
         }
 
         Ok(())
@@ -323,14 +305,16 @@ impl Controller {
         undo_session: Rc<RefCell<UndoSession>>,
         transaction: &Transaction,
     ) -> Result<(), ChainError> {
-        // Verify authority
-        self.authorization_manager.check_authorization(
-            undo_session.clone(),
-            &transaction.unsigned_tx.actions,
-            &transaction.recovered_keys()?,
-            &HashSet::new(),
-            &HashSet::new(),
-        )?;
+        {
+            // Verify authority
+            AuthorizationManager::check_authorization(
+                &mut undo_session.borrow_mut(),
+                &transaction.unsigned_tx.actions,
+                &transaction.recovered_keys()?,
+                &HashSet::new(),
+                &HashSet::new(),
+            )?;
+        }
 
         let mut trx_context =
             TransactionContext::new(undo_session.clone(), self.wasm_runtime.clone());
@@ -385,18 +369,14 @@ impl Controller {
         None
     }
 
-    pub fn get_authorization_manager(&self) -> &AuthorizationManager {
-        &self.authorization_manager
-    }
-
-    pub fn get_resource_limits_manager(&self) -> &ResourceLimitsManager {
-        &self.resource_limits_manager
-    }
-
     pub fn create_undo_session(&mut self) -> Result<UndoSession, ChainError> {
         self.db.undo_session().map_err(|e| {
             ChainError::TransactionError(format!("failed to create undo session: {}", e))
         })
+    }
+
+    pub fn get_wasm_runtime(&self) -> Arc<RwLock<WasmRuntime>> {
+        self.wasm_runtime.clone()
     }
 }
 

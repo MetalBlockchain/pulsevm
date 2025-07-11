@@ -1,12 +1,12 @@
-use std::{cell::RefCell, rc::Rc};
-
-use pulsevm_chainbase::UndoSession;
-use sha2::{
-    Digest, Sha256,
-    digest::{consts::U32, generic_array::GenericArray},
+use std::{
+    cell::{RefCell, RefMut},
+    rc::Rc,
 };
 
-use crate::chain::Controller;
+use pulsevm_chainbase::UndoSession;
+use wasmtime::component::Resource;
+
+use crate::chain::{AuthorizationManager, resource_limits::ResourceLimitsManager};
 
 use super::{
     ACTIVE_NAME, Account, AccountMetadata, CODE_NAME, CodeObject, DeleteAuth, Id, NewAccount,
@@ -15,7 +15,7 @@ use super::{
     authority::{Authority, Permission, PermissionByOwnerIndex, PermissionLevel},
     config,
     error::ChainError,
-    pulse_assert, zero_hash,
+    pulse_assert,
 };
 
 pub fn newaccount(context: &mut ApplyContext) -> Result<(), ChainError> {
@@ -43,9 +43,9 @@ pub fn newaccount(context: &mut ApplyContext) -> Result<(), ChainError> {
     )?;
 
     // Check if the creator is privileged
-    let creator = context
-        .session
-        .borrow()
+    let session = context.undo_session();
+    let mut session = session.borrow_mut();
+    let creator = session
         .get::<AccountMetadata>(create.creator)
         .map_err(|_| ChainError::TransactionError(format!("failed to find creator account")))?;
     if !creator.is_privileged() {
@@ -56,9 +56,7 @@ pub fn newaccount(context: &mut ApplyContext) -> Result<(), ChainError> {
             ),
         )?;
     }
-    let existing_account = context
-        .session
-        .borrow()
+    let existing_account = session
         .find::<Account>(create.name)
         .map_err(|_| ChainError::TransactionError(format!("failed to find account")))?;
     pulse_assert(
@@ -68,38 +66,32 @@ pub fn newaccount(context: &mut ApplyContext) -> Result<(), ChainError> {
             create.name
         )),
     )?;
-    context
-        .session
-        .borrow_mut()
+    session
         .insert(&Account::new(create.name, 0, vec![]))
         .map_err(|_| ChainError::TransactionError(format!("failed to insert account")))?;
-    context
-        .session
-        .borrow_mut()
+    session
         .insert(&AccountMetadata::new(create.name))
         .map_err(|_| ChainError::TransactionError(format!("failed to insert account metadata")))?;
 
-    validate_authority_precondition(session, &create.owner)?;
-    validate_authority_precondition(session, &create.active)?;
+    validate_authority_precondition(&mut session, &create.owner)?;
+    validate_authority_precondition(&mut session, &create.active)?;
 
-    let owner_permission = controller.get_authorization_manager().create_permission(
-        session,
+    let owner_permission = AuthorizationManager::create_permission(
+        &mut session,
         create.name,
         OWNER_NAME,
         0,
         create.owner,
     )?;
-    let active_permission = controller.get_authorization_manager().create_permission(
-        session,
+    let active_permission = AuthorizationManager::create_permission(
+        &mut session,
         create.name,
         ACTIVE_NAME,
         owner_permission.id(),
         create.active,
     )?;
 
-    controller
-        .get_resource_limits_manager()
-        .initialize_account(session, create.name)?;
+    ResourceLimitsManager::initialize_account(&mut session, create.name)?;
 
     let mut ram_delta: i64 = config::OVERHEAD_PER_ACCOUNT_RAM_BYTES as i64;
     ram_delta += 2 * config::billable_size_v::<Permission>() as i64;
@@ -135,6 +127,8 @@ pub fn setcode(context: &mut ApplyContext) -> Result<(), ChainError> {
         // TODO: validate wasm
     }
 
+    let session = context.undo_session();
+    let mut session = session.borrow_mut();
     let mut account = session
         .get::<AccountMetadata>(act.account)
         .map_err(|_| ChainError::TransactionError(format!("failed to find account")))?;
@@ -221,6 +215,8 @@ pub fn setcode(context: &mut ApplyContext) -> Result<(), ChainError> {
 }
 
 pub fn setabi(context: &mut ApplyContext) -> Result<(), ChainError> {
+    let session = context.undo_session();
+    let mut session = session.borrow_mut();
     let act = context
         .get_action()
         .data_as::<SetAbi>()
@@ -250,7 +246,7 @@ pub fn setabi(context: &mut ApplyContext) -> Result<(), ChainError> {
         .map_err(|_| ChainError::TransactionError(format!("failed to update account metadata")))?;
 
     if new_size != old_size {
-        context.add_ram_usage(act.account, new_size - old_size);
+        //context.add_ram_usage(act.account, new_size - old_size);
     }
 
     Ok(())
@@ -277,6 +273,9 @@ pub fn updateauth(context: &mut ApplyContext) -> Result<(), ChainError> {
         update.permission != update.parent,
         ChainError::TransactionError(format!("cannot set an authority as its own parent")),
     )?;
+
+    let session = context.undo_session();
+    let mut session = session.borrow_mut();
 
     session.get::<Account>(update.account).map_err(|_| {
         ChainError::TransactionError(format!("failed to find account {}", update.account))
@@ -306,17 +305,17 @@ pub fn updateauth(context: &mut ApplyContext) -> Result<(), ChainError> {
         )?;
     }
 
-    validate_authority_precondition(session, &update.auth)?;
+    validate_authority_precondition(&mut session, &update.auth)?;
 
-    let permission = controller.get_authorization_manager().find_permission(
-        session,
+    let permission = AuthorizationManager::find_permission(
+        &mut session,
         &PermissionLevel::new(update.account, update.permission),
     )?;
 
     let mut parent_id = 0u64;
     if (update.permission != OWNER_NAME) {
-        let parent = controller.get_authorization_manager().get_permission(
-            session,
+        let parent = AuthorizationManager::get_permission(
+            &mut session,
             &PermissionLevel::new(update.account, update.parent),
         )?;
         parent_id = parent.id();
@@ -333,18 +332,14 @@ pub fn updateauth(context: &mut ApplyContext) -> Result<(), ChainError> {
 
         let old_size: i64 = config::billable_size_v::<Permission>() as i64
             + permission.authority.get_billable_size() as i64;
-        controller.get_authorization_manager().modify_permission(
-            session,
-            &mut permission,
-            &update.auth,
-        )?;
+        AuthorizationManager::modify_permission(&mut session, &mut permission, &update.auth)?;
         let new_size: i64 = config::billable_size_v::<Permission>() as i64
             + permission.authority.get_billable_size() as i64;
 
         context.add_ram_usage(permission.owner, new_size - old_size);
     } else {
-        let p = controller.get_authorization_manager().create_permission(
-            session,
+        let p = AuthorizationManager::create_permission(
+            &mut session,
             update.account,
             update.permission,
             parent_id,
@@ -376,7 +371,7 @@ pub fn deleteauth(context: &mut ApplyContext) -> Result<(), ChainError> {
         ChainError::TransactionError(format!("cannot delete owner authority")),
     )?;
 
-    let authorization = controller.get_authorization_manager();
+    //let authorization = controller.get_authorization_manager();
 
     Ok(())
 }

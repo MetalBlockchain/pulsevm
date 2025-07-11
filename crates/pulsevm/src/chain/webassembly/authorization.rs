@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail};
+use anyhow::bail;
 use wasmtime::Caller;
 
 use crate::chain::wasm_runtime::WasmContext;
@@ -42,7 +42,7 @@ pub fn require_auth2() -> impl Fn(Caller<'_, WasmContext>, u64, u64) -> Result<(
 
 pub fn require_recipient() -> impl Fn(Caller<'_, WasmContext>, u64) -> Result<(), wasmtime::Error> {
     |mut caller, recipient| {
-        let context = caller.data_mut().mutable_apply_context();
+        let context = caller.data_mut().apply_context_mut();
 
         if context.require_recipient(recipient.into()).is_err() {
             bail!("failed to require recipient");
@@ -53,8 +53,8 @@ pub fn require_recipient() -> impl Fn(Caller<'_, WasmContext>, u64) -> Result<()
 }
 
 pub fn is_account() -> impl Fn(Caller<'_, WasmContext>, u64) -> Result<i32, wasmtime::Error> {
-    |caller, recipient| {
-        let context = caller.data().apply_context();
+    |mut caller, recipient| {
+        let context = caller.data_mut().apply_context_mut();
         let result = context.is_account(recipient.into());
 
         if result.is_err() {

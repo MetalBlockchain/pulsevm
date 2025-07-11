@@ -15,13 +15,8 @@ use pulsevm_proc_macros::name;
 pub struct AuthorizationManager;
 
 impl AuthorizationManager {
-    pub fn new() -> Self {
-        Self {}
-    }
-
     pub fn check_authorization(
-        &self,
-        session: Rc<RefCell<UndoSession>>,
+        session: &mut UndoSession,
         actions: &Vec<Action>,
         provided_keys: &HashSet<PublicKey>,
         provided_permissions: &HashSet<PermissionLevel>,
@@ -36,24 +31,18 @@ impl AuthorizationManager {
                 special_case = true;
 
                 match act.name().as_u64() {
-                    name!("updateauth") => {
-                        self.check_updateauth_authorization(session.clone(), act)?
-                    }
-                    name!("deleteauth") => {
-                        self.check_deleteauth_authorization(session.clone(), act)?
-                    }
-                    name!("linkauth") => self.check_linkauth_authorization(session.clone(), act)?,
-                    name!("unlinkauth") => {
-                        self.check_unlinkauth_authorization(session.clone(), act)?
-                    }
+                    name!("updateauth") => Self::check_updateauth_authorization(session, act)?,
+                    name!("deleteauth") => Self::check_deleteauth_authorization(session, act)?,
+                    name!("linkauth") => Self::check_linkauth_authorization(session, act)?,
+                    name!("unlinkauth") => Self::check_unlinkauth_authorization(session, act)?,
                     _ => special_case = false,
                 }
             }
 
             for declared_auth in act.authorization() {
                 if !special_case {
-                    let min_permission_name = self.lookup_minimum_permission(
-                        session.clone(),
+                    let min_permission_name = Self::lookup_minimum_permission(
+                        session,
                         declared_auth.actor(),
                         act.account(),
                         act.name(),
@@ -61,12 +50,12 @@ impl AuthorizationManager {
                     if min_permission_name.is_some() {
                         // since special cases were already handled, it should only be false if the permission is pulse.any
                         let min_permission_name = min_permission_name.unwrap();
-                        let min_permission = self.get_permission(
-                            session.clone(),
+                        let min_permission = Self::get_permission(
+                            session,
                             &PermissionLevel::new(declared_auth.actor(), min_permission_name),
                         )?;
-                        self.get_permission(session.clone(), &declared_auth)?
-                            .satisfies(&min_permission, session.clone())
+                        Self::get_permission(session, &declared_auth)?
+                            .satisfies(&min_permission, session)
                             .map_err(|_| {
                                 ChainError::AuthorizationError(format!(
                                     "action declares irrelevant authority '{}'; minimum authority is {}",
@@ -86,11 +75,9 @@ impl AuthorizationManager {
 
             // Now verify that all the declared authorizations are satisfied
             for p in permissions_to_satisfy.iter() {
-                let permission = self
-                    .get_permission(session.clone(), p)
+                let permission = Self::get_permission(session, p)
                     .map_err(|e| ChainError::AuthorizationError(format!("{}", e)))?;
-                let satisfied =
-                    authority_checker.satisfied(session.clone(), &permission.authority, 0)?;
+                let satisfied = authority_checker.satisfied(session, &permission.authority, 0)?;
 
                 if !satisfied {
                     return Err(ChainError::AuthorizationError(format!(
@@ -111,8 +98,7 @@ impl AuthorizationManager {
     }
 
     fn check_updateauth_authorization(
-        &self,
-        session: Rc<RefCell<UndoSession>>,
+        session: &mut UndoSession,
         action: &Action,
     ) -> Result<(), ChainError> {
         let update = action
@@ -131,21 +117,21 @@ impl AuthorizationManager {
             ));
         }
 
-        let mut min_permission = self.find_permission(
-            session.clone(),
+        let mut min_permission = Self::find_permission(
+            session,
             &PermissionLevel::new(update.account, update.permission),
         )?;
         if min_permission.is_none() {
             // creating a new permission
-            min_permission = Some(self.get_permission(
-                session.clone(),
+            min_permission = Some(Self::get_permission(
+                session,
                 &PermissionLevel::new(update.account, update.parent),
             )?);
         }
         let min_permission = min_permission.unwrap();
 
-        self.get_permission(session.clone(), &auth)?
-            .satisfies(&min_permission, session.clone())
+        Self::get_permission(session, &auth)?
+            .satisfies(&min_permission, session)
             .map_err(|_| {
                 ChainError::AuthorizationError(format!(
                     "updateauth action declares irrelevant authority '{}'; minimum authority is {}",
@@ -158,8 +144,7 @@ impl AuthorizationManager {
     }
 
     fn check_deleteauth_authorization(
-        &self,
-        session: Rc<RefCell<UndoSession>>,
+        session: &mut UndoSession,
         action: &Action,
     ) -> Result<(), ChainError> {
         let del = action
@@ -177,12 +162,10 @@ impl AuthorizationManager {
                 "the owner of the permission to delete needs to be the actor of the declared authorization".to_string(),
             ));
         }
-        let min_permission = self.get_permission(
-            session.clone(),
-            &PermissionLevel::new(del.account, del.permission),
-        )?;
-        self.get_permission(session.clone(), &auth)?
-            .satisfies(&min_permission, session.clone())
+        let min_permission =
+            Self::get_permission(session, &PermissionLevel::new(del.account, del.permission))?;
+        Self::get_permission(session, &auth)?
+            .satisfies(&min_permission, session)
             .map_err(|_| {
                 ChainError::AuthorizationError(format!(
                     "deleteauth action declares irrelevant authority '{}'; minimum authority is {}",
@@ -194,8 +177,7 @@ impl AuthorizationManager {
     }
 
     fn check_linkauth_authorization(
-        &self,
-        session: Rc<RefCell<UndoSession>>,
+        session: &mut UndoSession,
         action: &Action,
     ) -> Result<(), ChainError> {
         let link = action
@@ -237,22 +219,18 @@ impl AuthorizationManager {
                 _ => {}
             }
         }
-        let linked_permission_name = self.lookup_minimum_permission(
-            session.clone(),
-            link.account,
-            link.code,
-            link.message_type,
-        )?;
+        let linked_permission_name =
+            Self::lookup_minimum_permission(session, link.account, link.code, link.message_type)?;
         if linked_permission_name.is_none() {
             return Ok(()); // if action is linked to pulse.any permission
         }
         let linked_permission_name = linked_permission_name.unwrap();
-        let min_permission = self.get_permission(
-            session.clone(),
+        let min_permission = Self::get_permission(
+            session,
             &PermissionLevel::new(link.account, linked_permission_name),
         )?;
-        self.get_permission(session.clone(), &auth)?
-            .satisfies(&min_permission, session.clone())
+        Self::get_permission(session, &auth)?
+            .satisfies(&min_permission, session)
             .map_err(|_| {
                 ChainError::AuthorizationError(format!(
                     "link action declares irrelevant authority '{}'; minimum authority is {}",
@@ -264,8 +242,7 @@ impl AuthorizationManager {
     }
 
     fn check_unlinkauth_authorization(
-        &self,
-        session: Rc<RefCell<UndoSession>>,
+        session: &mut UndoSession,
         action: &Action,
     ) -> Result<(), ChainError> {
         let unlink = action
@@ -282,8 +259,8 @@ impl AuthorizationManager {
                 "the owner of the linked permission needs to be the actor of the declared authorization".to_string(),
             ));
         }
-        let unlinked_permission_name = self.lookup_minimum_permission(
-            session.clone(),
+        let unlinked_permission_name = Self::lookup_minimum_permission(
+            session,
             unlink.account,
             unlink.code,
             unlink.message_type,
@@ -298,12 +275,12 @@ impl AuthorizationManager {
         if unlinked_permission_name == ANY_NAME {
             return Ok(());
         }
-        let min_permission = self.get_permission(
-            session.clone(),
+        let min_permission = Self::get_permission(
+            session,
             &PermissionLevel::new(unlink.account, unlinked_permission_name),
         )?;
-        self.get_permission(session.clone(), &auth)?
-            .satisfies(&min_permission, session.clone())
+        Self::get_permission(session, &auth)?
+            .satisfies(&min_permission, session)
             .map_err(|_| {
                 ChainError::AuthorizationError(format!(
                     "unlink action declares irrelevant authority '{}'; minimum authority is {}",
@@ -315,8 +292,7 @@ impl AuthorizationManager {
     }
 
     pub fn find_permission(
-        &self,
-        session: Rc<RefCell<UndoSession>>,
+        session: &mut UndoSession,
         level: &PermissionLevel,
     ) -> Result<Option<Permission>, ChainError> {
         if level.actor().empty() || level.permission().empty() {
@@ -325,7 +301,6 @@ impl AuthorizationManager {
             ));
         }
         let result = session
-            .borrow_mut()
             .find_by_secondary::<Permission, PermissionByOwnerIndex>((
                 level.actor(),
                 level.permission(),
@@ -338,8 +313,7 @@ impl AuthorizationManager {
     }
 
     pub fn get_permission(
-        &self,
-        session: Rc<RefCell<UndoSession>>,
+        session: &mut UndoSession,
         level: &PermissionLevel,
     ) -> Result<Permission, ChainError> {
         if level.actor().empty() || level.permission().empty() {
@@ -348,7 +322,6 @@ impl AuthorizationManager {
             ));
         }
         let result = session
-            .borrow_mut()
             .find_by_secondary::<Permission, PermissionByOwnerIndex>((
                 level.actor(),
                 level.permission(),
@@ -364,8 +337,7 @@ impl AuthorizationManager {
     }
 
     fn lookup_minimum_permission(
-        &self,
-        session: Rc<RefCell<UndoSession>>,
+        session: &mut UndoSession,
         authorizer_account: Name,
         scope: Name,
         act_name: Name,
@@ -383,7 +355,7 @@ impl AuthorizationManager {
         }
 
         let linked_permission =
-            self.lookup_linked_permission(session, authorizer_account, scope, act_name)?;
+            Self::lookup_linked_permission(session, authorizer_account, scope, act_name)?;
 
         if linked_permission.is_none() {
             return Ok(Some(ACTIVE_NAME));
@@ -398,8 +370,7 @@ impl AuthorizationManager {
     }
 
     fn lookup_linked_permission(
-        &self,
-        session: Rc<RefCell<UndoSession>>,
+        session: &mut UndoSession,
         authorizer_account: Name,
         scope: Name,
         act_name: Name,
@@ -407,14 +378,12 @@ impl AuthorizationManager {
         // First look up a specific link for this message act_name
         let mut key = (authorizer_account, scope, act_name);
         let mut link = session
-            .borrow_mut()
             .find_by_secondary::<PermissionLink, PermissionLinkByActionNameIndex>(key)
             .map_err(|e| ChainError::AuthorizationError(format!("{}", e)))?;
         // If no specific link found, check for a contract-wide default
         if link.is_none() {
             key = (authorizer_account, scope, Name::default());
             link = session
-                .borrow_mut()
                 .find_by_secondary::<PermissionLink, PermissionLinkByActionNameIndex>(key)
                 .map_err(|e| ChainError::AuthorizationError(format!("{}", e)))?;
         }
@@ -427,34 +396,28 @@ impl AuthorizationManager {
     }
 
     pub fn create_permission(
-        &self,
-        session: Rc<RefCell<UndoSession>>,
+        session: &mut UndoSession,
         account: Name,
         name: Name,
         parent: u64,
         auth: Authority,
     ) -> Result<Permission, ChainError> {
-        let id = session
-            .borrow_mut()
-            .generate_id::<Permission>()
-            .map_err(|e| {
-                ChainError::AuthorizationError(format!("Failed to generate permission ID: {}", e))
-            })?;
+        let id = session.generate_id::<Permission>().map_err(|e| {
+            ChainError::AuthorizationError(format!("Failed to generate permission ID: {}", e))
+        })?;
         let permission = Permission::new(id, parent, account, name, auth);
-        session.borrow_mut().insert(&permission).map_err(|e| {
+        session.insert(&permission).map_err(|e| {
             ChainError::AuthorizationError(format!("Failed to create permission: {}", e))
         })?;
         Ok(permission)
     }
 
     pub fn modify_permission(
-        &self,
-        session: Rc<RefCell<UndoSession>>,
+        session: &mut UndoSession,
         permission: &mut Permission,
         auth: &Authority,
     ) -> Result<(), ChainError> {
         session
-            .borrow_mut()
             .modify(permission, |po| {
                 po.authority = auth.clone();
             })
@@ -511,8 +474,5 @@ mod tests {
         let data = "0000e19b30bc0bfabfab01c9260469fab7529ae88987b2eb337dac5650305226b38e00000001aea38500000000009ab864229a9e40000000006eaea385000000000064553988000000000000000100000001027f4dbe05a88d4c3974cec8d03f192c96a9813ea4d60811c4e68a2d459842497c0001000000000000000100000001027f4dbe05a88d4c3974cec8d03f192c96a9813ea4d60811c4e68a2d459842497c00010000000000000001aea38500000000003232eda80000000000000001ada3bd9c65952513b98753bcc582cf368fb8bf8432e3e0389498a248756b209a0eb4e0846a1f85cad63fd2203cb1577514a902a54ae718a33552bb782fe11c960178ed5cd2";
         let tx_data = hex::decode(data).unwrap();
         let tx = Transaction::deserialize(&tx_data, &mut 0).unwrap();
-
-        // Create an AuthorityChecker instance
-        let mut checker = AuthorizationManager::new();
     }
 }

@@ -49,7 +49,7 @@ impl<'a> AuthorityChecker<'a> {
 
     pub fn satisfied(
         &mut self,
-        session: Rc<RefCell<UndoSession>>,
+        session: &mut UndoSession,
         authority: &Authority,
         recursion_depth: u16,
     ) -> Result<bool, ChainError> {
@@ -65,8 +65,7 @@ impl<'a> AuthorityChecker<'a> {
 
         for permission in authority.accounts() {
             total_weight +=
-                self.visit_permission_level_weight(session.clone(), permission, recursion_depth)?
-                    as u32;
+                self.visit_permission_level_weight(session, permission, recursion_depth)? as u32;
         }
 
         Ok(total_weight >= authority.threshold())
@@ -82,7 +81,7 @@ impl<'a> AuthorityChecker<'a> {
 
     pub fn visit_permission_level_weight(
         &mut self,
-        session: Rc<RefCell<UndoSession>>,
+        session: &mut UndoSession,
         permission: &PermissionLevelWeight,
         recursion_depth: u16,
     ) -> Result<u16, ChainError> {
@@ -96,7 +95,6 @@ impl<'a> AuthorityChecker<'a> {
             .contains_key(permission.permission())
         {
             let auth = session
-                .borrow_mut()
                 .find_by_secondary::<Permission, PermissionByOwnerIndex>((
                     permission.permission().actor(),
                     permission.permission().permission(),

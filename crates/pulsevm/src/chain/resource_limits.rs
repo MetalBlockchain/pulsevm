@@ -1,19 +1,14 @@
+use std::{cell::RefCell, rc::Rc};
+
 use pulsevm_chainbase::UndoSession;
+use wasmtime::Ref;
 
 use super::{Name, ResourceLimits, ResourceUsage, error::ChainError, pulse_assert};
 
 pub struct ResourceLimitsManager {}
 
 impl ResourceLimitsManager {
-    pub fn new() -> Self {
-        Self {}
-    }
-
-    pub fn initialize_account(
-        &self,
-        session: &mut UndoSession,
-        account: Name,
-    ) -> Result<(), ChainError> {
+    pub fn initialize_account(session: &mut UndoSession, account: Name) -> Result<(), ChainError> {
         let limits = ResourceLimits::new(account, -1, -1, -1);
         session.insert(&limits).map_err(|_| {
             ChainError::TransactionError(format!("failed to insert resource limits"))
@@ -28,7 +23,6 @@ impl ResourceLimitsManager {
     }
 
     pub fn add_pending_ram_usage(
-        &mut self,
         session: &mut UndoSession,
         account: Name,
         ram_delta: i64,

@@ -1,15 +1,12 @@
 use std::{
-    cell::{Ref, RefCell},
+    cell::RefCell,
     rc::Rc,
     sync::{Arc, RwLock},
 };
 
 use pulsevm_chainbase::UndoSession;
 
-use crate::chain::{
-    controller,
-    wasm_runtime::{self, WasmContext, WasmRuntime},
-};
+use crate::chain::wasm_runtime::WasmRuntime;
 
 use super::{
     Action, ActionTrace, Name, Transaction, apply_context::ApplyContext, error::ChainError,
@@ -83,7 +80,7 @@ impl TransactionContext {
     }
 
     pub fn execute_action(
-        &self,
+        &mut self,
         action_ordinal: u32,
         recurse_depth: u32,
     ) -> Result<(), ChainError> {
@@ -101,7 +98,7 @@ impl TransactionContext {
         )?;
 
         // Initialize the apply context with the action trace.
-        apply_context = apply_context.exec(self.wasm_runtime.clone())?;
+        apply_context.exec(self.wasm_runtime.clone())?;
 
         Ok(())
     }

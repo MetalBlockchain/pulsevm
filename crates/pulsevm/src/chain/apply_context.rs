@@ -6,6 +6,7 @@ use std::{
 };
 
 use pulsevm_chainbase::UndoSession;
+use pulsevm_grpc::vm::runtime;
 
 use crate::chain::{
     ActionTrace, controller,
@@ -18,7 +19,7 @@ use super::{
 
 #[derive(Clone)]
 pub struct ApplyContext {
-    pub session: Rc<RefCell<UndoSession>>, // The undo session for this context
+    session: Rc<RefCell<UndoSession>>, // The undo session for this context
 
     action: Action,     // The action being applied
     receiver: Name,     // The account that is receiving the action
@@ -27,9 +28,9 @@ pub struct ApplyContext {
     action_ordinal: u32,
     privileged: bool,
 
-    notified: VecDeque<(Name, u32)>, // List of notified accounts
-    inline_actions: Vec<u32>,        // List of inline actions
-    account_ram_deltas: HashMap<Name, i64>, // RAM usage deltas for accounts
+    notified: Rc<RefCell<VecDeque<(Name, u32)>>>, // List of notified accounts
+    inline_actions: Rc<RefCell<Vec<u32>>>,        // List of inline actions
+    account_ram_deltas: Rc<RefCell<HashMap<Name, i64>>>, // RAM usage deltas for accounts
 }
 
 impl ApplyContext {
@@ -50,29 +51,38 @@ impl ApplyContext {
             action_ordinal,
             privileged: false,
 
-            notified: VecDeque::new(),
-            inline_actions: Vec::new(),
-            account_ram_deltas: HashMap::new(),
+            notified: Rc::new(RefCell::new(VecDeque::new())),
+            inline_actions: Rc::new(RefCell::new(Vec::new())),
+            account_ram_deltas: Rc::new(RefCell::new(HashMap::new())),
         })
     }
 
-    pub fn exec(mut self, wasm_runtime: Arc<RwLock<WasmRuntime>>) -> Result<Self, ChainError> {
-        self.notified
-            .push_back((self.receiver.clone(), self.action_ordinal));
-        let mut context = self.exec_one(wasm_runtime.clone())?;
-        for i in 1..context.notified.len() {
-            let (receiver, action_ordinal) = context.notified[i];
-            context.receiver = receiver;
-            context.action_ordinal = action_ordinal;
-            context = context.exec_one(wasm_runtime.clone())?;
+    pub fn exec(&mut self, wasm_runtime: Arc<RwLock<WasmRuntime>>) -> Result<(), ChainError> {
+        {
+            self.notified
+                .borrow_mut()
+                .push_back((self.receiver.clone(), self.action_ordinal));
+        }
+
+        self.exec_one(wasm_runtime.clone())?;
+
+        let notified_pairs: Vec<(Name, u32)> = {
+            let notified = self.notified.borrow();
+            notified.iter().skip(1).cloned().collect()
+        };
+
+        for (receiver, action_ordinal) in notified_pairs {
+            self.receiver = receiver;
+            self.action_ordinal = action_ordinal;
+            self.exec_one(wasm_runtime.clone())?;
         }
 
         // TODO: Handle inline actions
 
-        Ok(context)
+        Ok(())
     }
 
-    pub fn exec_one(mut self, wasm_runtime: Arc<RwLock<WasmRuntime>>) -> Result<Self, ChainError> {
+    pub fn exec_one(&mut self, wasm_runtime: Arc<RwLock<WasmRuntime>>) -> Result<(), ChainError> {
         let code_hash = Id::zero();
         let receiver_account = self
             .session
@@ -90,25 +100,18 @@ impl ApplyContext {
             self.action.name(),
         );
         if let Some(native) = native {
-            native(&mut self)?;
+            native(self)?;
         }
 
         // Does the receiver account have a contract deployed?
         if code_hash != Id::zero() {
-            let context = wasm_runtime
-                .write()
-                .map_err(|e| {
-                    ChainError::TransactionError(format!(
-                        "failed to get mutable wasm runtime: {}",
-                        e
-                    ))
-                })?
-                .run(self, code_hash)?;
-
-            return Ok(context);
+            let mut runtime = wasm_runtime.write().map_err(|e| {
+                ChainError::TransactionError(format!("failed to get immutable wasm runtime: {}", e))
+            })?;
+            runtime.run(self.receiver, self.action.clone(), self.clone(), code_hash)?;
         }
 
-        Ok(self)
+        Ok(())
     }
 
     pub fn schedule_action_from_ordinal(
@@ -155,14 +158,16 @@ impl ApplyContext {
     }
 
     pub fn has_recipient(&self, recipient: Name) -> bool {
-        self.notified.iter().any(|(r, _)| *r == recipient)
+        self.notified.borrow().iter().any(|(r, _)| *r == recipient)
     }
 
     pub fn require_recipient(&mut self, recipient: Name) -> Result<(), ChainError> {
         if !self.has_recipient(recipient) {
             let scheduled_ordinal =
                 self.schedule_action_from_ordinal(self.action_ordinal, recipient)?;
-            self.notified.push_back((recipient, scheduled_ordinal));
+            self.notified
+                .borrow_mut()
+                .push_back((recipient, scheduled_ordinal));
         }
 
         Ok(())
@@ -180,12 +185,13 @@ impl ApplyContext {
 
     pub fn add_ram_usage(&mut self, account: Name, ram_delta: i64) {
         self.account_ram_deltas
+            .borrow_mut()
             .entry(account)
             .and_modify(|d| *d += ram_delta)
             .or_insert(ram_delta);
     }
 
-    pub fn is_account(&self, account: Name) -> Result<bool, ChainError> {
+    pub fn is_account(&mut self, account: Name) -> Result<bool, ChainError> {
         let exists = self
             .session
             .borrow_mut()
@@ -197,5 +203,9 @@ impl ApplyContext {
 
     pub fn get_receiver(&self) -> Name {
         self.receiver
+    }
+
+    pub fn undo_session(&self) -> Rc<RefCell<UndoSession>> {
+        self.session.clone()
     }
 }

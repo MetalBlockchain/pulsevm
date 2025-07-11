@@ -1,4 +1,4 @@
-use wasmtime::{Caller, Memory};
+use wasmtime::Caller;
 
 use crate::chain::wasm_runtime::WasmContext;
 
