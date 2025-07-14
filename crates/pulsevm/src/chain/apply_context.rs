@@ -6,11 +6,10 @@ use std::{
 };
 
 use pulsevm_chainbase::UndoSession;
-use pulsevm_grpc::vm::runtime;
 
 use crate::chain::{
-    ActionTrace, controller,
-    wasm_runtime::{self, WasmContext, WasmRuntime},
+    pulse_assert,
+    wasm_runtime::WasmRuntime,
 };
 
 use super::{
@@ -20,6 +19,7 @@ use super::{
 #[derive(Clone)]
 pub struct ApplyContext {
     session: Rc<RefCell<UndoSession>>, // The undo session for this context
+    wasm_runtime: Arc<RwLock<WasmRuntime>>, // Context for the Wasm runtime
 
     action: Action,     // The action being applied
     receiver: Name,     // The account that is receiving the action
@@ -36,6 +36,7 @@ pub struct ApplyContext {
 impl ApplyContext {
     pub fn new(
         session: Rc<RefCell<UndoSession>>,
+        wasm_runtime: Arc<RwLock<WasmRuntime>>,
         action: Action,
         receiver: Name,
         action_ordinal: u32,
@@ -43,6 +44,7 @@ impl ApplyContext {
     ) -> Result<Self, ChainError> {
         Ok(ApplyContext {
             session,
+            wasm_runtime,
 
             action,
             receiver,
@@ -57,14 +59,14 @@ impl ApplyContext {
         })
     }
 
-    pub fn exec(&mut self, wasm_runtime: Arc<RwLock<WasmRuntime>>) -> Result<(), ChainError> {
+    pub fn exec(&mut self, trx_context: &mut TransactionContext) -> Result<(), ChainError> {
         {
             self.notified
                 .borrow_mut()
                 .push_back((self.receiver.clone(), self.action_ordinal));
         }
 
-        self.exec_one(wasm_runtime.clone())?;
+        self.exec_one()?;
 
         let notified_pairs: Vec<(Name, u32)> = {
             let notified = self.notified.borrow();
@@ -74,15 +76,31 @@ impl ApplyContext {
         for (receiver, action_ordinal) in notified_pairs {
             self.receiver = receiver;
             self.action_ordinal = action_ordinal;
-            self.exec_one(wasm_runtime.clone())?;
+            self.exec_one()?;
         }
 
-        // TODO: Handle inline actions
+        let inline_actions: Vec<u32> = {
+            let inline_actions = self.inline_actions.borrow();
+            inline_actions.clone()
+        };
+
+        if inline_actions.len() > 0 {
+            pulse_assert(
+                self.recurse_depth < 1024, // TODO: Make this configurable
+                ChainError::TransactionError(
+                    "max inline action depth per transaction reached".to_string(),
+                ),
+            )?;
+        }
+
+        for action_ordinal in inline_actions {
+            trx_context.execute_action(action_ordinal, self.recurse_depth + 1)?;
+        }
 
         Ok(())
     }
 
-    pub fn exec_one(&mut self, wasm_runtime: Arc<RwLock<WasmRuntime>>) -> Result<(), ChainError> {
+    pub fn exec_one(&mut self) -> Result<(), ChainError> {
         let code_hash = Id::zero();
         let receiver_account = self
             .session
@@ -105,7 +123,7 @@ impl ApplyContext {
 
         // Does the receiver account have a contract deployed?
         if code_hash != Id::zero() {
-            let mut runtime = wasm_runtime.write().map_err(|e| {
+            let mut runtime = self.wasm_runtime.write().map_err(|e| {
                 ChainError::TransactionError(format!("failed to get immutable wasm runtime: {}", e))
             })?;
             runtime.run(self.receiver, self.action.clone(), self.clone(), code_hash)?;
@@ -127,9 +145,22 @@ impl ApplyContext {
         &self.action
     }
 
-    pub fn require_authorization(&self, account: Name) -> Result<(), ChainError> {
+    pub fn require_authorization(
+        &self,
+        account: Name,
+        permission: Option<Name>,
+    ) -> Result<(), ChainError> {
         for auth in self.action.authorization() {
-            if auth.actor() == account {
+            if let Some(perm) = permission {
+                if auth.actor() == account && auth.permission() == perm {
+                    return Ok(());
+                }
+
+                return Err(ChainError::TransactionError(format!(
+                    "missing authority of {}/{}",
+                    account, perm
+                )));
+            } else if auth.actor() == account {
                 return Ok(());
             }
         }
@@ -137,23 +168,6 @@ impl ApplyContext {
         return Err(ChainError::TransactionError(format!(
             "missing authority of {}",
             account
-        )));
-    }
-
-    pub fn require_authorization_with_permission(
-        &self,
-        account: Name,
-        permission: Name,
-    ) -> Result<(), ChainError> {
-        for auth in self.action.authorization() {
-            if auth.actor() == account && auth.permission() == permission {
-                return Ok(());
-            }
-        }
-
-        return Err(ChainError::TransactionError(format!(
-            "missing authority of {}/{}",
-            account, permission
         )));
     }
 

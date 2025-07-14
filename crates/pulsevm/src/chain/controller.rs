@@ -8,7 +8,7 @@ use std::{
 };
 
 use crate::{
-    chain::{ACTIVE_NAME, Account, AccountMetadata},
+    chain::{ACTIVE_NAME, Account, AccountMetadata, wasm_runtime},
     mempool::Mempool,
 };
 
@@ -79,8 +79,9 @@ impl Controller {
     pub fn new() -> Self {
         // Create a temporary database
         let db = Database::temporary(Path::new("temp")).unwrap();
+        let wasm_runtime = WasmRuntime::new().unwrap();
         let controller = Controller {
-            wasm_runtime: Arc::new(RwLock::new(WasmRuntime::new())), // TODO: Handle error properly
+            wasm_runtime: Arc::new(RwLock::new(wasm_runtime)), // TODO: Handle error properly
             last_accepted_block: Block::default(),
             preferred_id: Id::default(),
             db: db,

@@ -23,7 +23,7 @@ pub fn newaccount(context: &mut ApplyContext) -> Result<(), ChainError> {
         .get_action()
         .data_as::<NewAccount>()
         .map_err(|e| ChainError::TransactionError(format!("failed to deserialize data: {}", e)))?;
-    context.require_authorization(create.creator)?;
+    context.require_authorization(create.creator, None)?;
     pulse_assert(
         create.owner.validate(),
         ChainError::TransactionError("invalid owner authority".to_string()),
@@ -108,7 +108,7 @@ pub fn setcode(context: &mut ApplyContext) -> Result<(), ChainError> {
         .get_action()
         .data_as::<SetCode>()
         .map_err(|e| ChainError::TransactionError(format!("failed to deserialize data: {}", e)))?;
-    context.require_authorization(act.account)?;
+    context.require_authorization(act.account, None)?;
 
     pulse_assert(
         act.vm_type == 0,
@@ -221,7 +221,7 @@ pub fn setabi(context: &mut ApplyContext) -> Result<(), ChainError> {
         .get_action()
         .data_as::<SetAbi>()
         .map_err(|e| ChainError::TransactionError(format!("failed to deserialize data: {}", e)))?;
-    context.require_authorization(act.account)?;
+    context.require_authorization(act.account, None)?;
 
     let mut account = session
         .get::<Account>(act.account)
@@ -257,7 +257,7 @@ pub fn updateauth(context: &mut ApplyContext) -> Result<(), ChainError> {
         .get_action()
         .data_as::<UpdateAuth>()
         .map_err(|e| ChainError::TransactionError(format!("failed to deserialize data: {}", e)))?;
-    context.require_authorization(update.account)?;
+    context.require_authorization(update.account, None)?;
 
     pulse_assert(
         !update.permission.empty(),
@@ -360,7 +360,7 @@ pub fn deleteauth(context: &mut ApplyContext) -> Result<(), ChainError> {
         .get_action()
         .data_as::<DeleteAuth>()
         .map_err(|e| ChainError::TransactionError(format!("failed to deserialize data: {}", e)))?;
-    context.require_authorization(remove.account)?;
+    context.require_authorization(remove.account, None)?;
 
     pulse_assert(
         remove.permission != ACTIVE_NAME,

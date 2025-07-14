@@ -7,7 +7,7 @@ pub fn require_auth() -> impl Fn(Caller<'_, WasmContext>, u64) -> Result<(), was
     |caller, account| {
         let context = caller.data().apply_context();
 
-        if context.require_authorization(account.into()).is_err() {
+        if context.require_authorization(account.into(), None).is_err() {
             bail!("authorization failed");
         } else {
             Ok(())
@@ -30,7 +30,7 @@ pub fn require_auth2() -> impl Fn(Caller<'_, WasmContext>, u64, u64) -> Result<(
         let context = caller.data().apply_context();
 
         if context
-            .require_authorization_with_permission(account.into(), permission.into())
+            .require_authorization(account.into(), Some(permission.into()))
             .is_err()
         {
             bail!("authorization failed");

@@ -91,6 +91,7 @@ impl TransactionContext {
         let receiver = trace.receiver();
         let mut apply_context = ApplyContext::new(
             self.session.clone(),
+            self.wasm_runtime.clone(),
             action,
             receiver,
             action_ordinal,
@@ -98,7 +99,7 @@ impl TransactionContext {
         )?;
 
         // Initialize the apply context with the action trace.
-        apply_context.exec(self.wasm_runtime.clone())?;
+        apply_context.exec(self)?;
 
         Ok(())
     }

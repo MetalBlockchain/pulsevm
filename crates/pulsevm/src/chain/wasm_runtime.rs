@@ -1,12 +1,9 @@
-use std::{cell::RefCell, num::NonZeroUsize, rc::Rc};
+use std::num::NonZeroUsize;
 
 use lru::LruCache;
-use wasmtime::{Config, Engine, Linker, Module, Store, Strategy};
+use wasmtime::{Config, Engine, IntoFunc, Linker, Module, Store, Strategy};
 
-use crate::chain::{
-    Action, Name,
-    apply_context::{self, ApplyContext},
-};
+use crate::chain::{Action, Name, apply_context::ApplyContext};
 
 use super::{
     CodeObject, Id,
@@ -50,14 +47,13 @@ impl WasmContext {
 }
 
 pub struct WasmRuntime {
-    config: Config,
     engine: Engine,
     linker: Linker<WasmContext>,
     code_cache: LruCache<Id, Module>,
 }
 
 impl WasmRuntime {
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self, ChainError> {
         let mut config = Config::default();
 
         // Enable the Cranelift optimizing compiler.
@@ -88,28 +84,43 @@ impl WasmRuntime {
         // Add host functions to the linker.
         let mut linker = Linker::<WasmContext>::new(&engine);
         // Action functions
-        linker.func_wrap("env", "action_data_size", action_data_size());
-        linker.func_wrap("env", "current_receiver", current_receiver());
+        Self::add_host_function(&mut linker, "env", "action_data_size", action_data_size())?;
+        Self::add_host_function(&mut linker, "env", "current_receiver", current_receiver())?;
         // Authorization functions
-        linker.func_wrap("env", "require_auth", require_auth());
-        linker.func_wrap("env", "has_auth", has_auth());
-        linker.func_wrap("env", "require_auth2", require_auth());
-        linker.func_wrap("env", "require_recipient", require_auth());
-        linker.func_wrap("env", "is_account", is_account());
+        Self::add_host_function(&mut linker, "env", "require_auth", require_auth())?;
+        Self::add_host_function(&mut linker, "env", "has_auth", has_auth())?;
+        Self::add_host_function(&mut linker, "env", "require_auth2", require_auth())?;
+        Self::add_host_function(&mut linker, "env", "require_recipient", require_auth())?;
+        Self::add_host_function(&mut linker, "env", "is_account", is_account())?;
         // Memory functions
-        linker.func_wrap("env", "memcpy", memcpy());
-        linker.func_wrap("env", "memmove", memmove());
-        linker.func_wrap("env", "memcmp", memcmp());
-        linker.func_wrap("env", "memset", memset());
+        Self::add_host_function(&mut linker, "env", "memcpy", memcpy())?;
+        Self::add_host_function(&mut linker, "env", "memmove", memmove())?;
+        Self::add_host_function(&mut linker, "env", "memcmp", memcmp())?;
+        Self::add_host_function(&mut linker, "env", "memset", memset())?;
         // Transaction functions
-        linker.func_wrap("env", "send_inline", send_inline());
+        Self::add_host_function(&mut linker, "env", "send_inline", send_inline())?;
 
-        Self {
-            config: config.to_owned(),
+        Ok(Self {
             engine: engine,
             linker,
             code_cache: LruCache::new(NonZeroUsize::new(1024).unwrap()),
-        }
+        })
+    }
+
+    #[must_use]
+    fn add_host_function<Params, Args>(
+        linker: &mut Linker<WasmContext>,
+        module: &str,
+        name: &str,
+        func: impl IntoFunc<WasmContext, Params, Args>,
+    ) -> Result<(), ChainError>
+    where
+        WasmContext: 'static,
+    {
+        linker
+            .func_wrap(module, name, func)
+            .map_err(|e| ChainError::WasmRuntimeError(e.to_string()))?;
+        Ok(())
     }
 
     pub fn run(
