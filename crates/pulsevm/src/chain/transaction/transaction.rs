@@ -1,8 +1,9 @@
 use std::collections::HashSet;
 
 use pulsevm_serialization::{Deserialize, Serialize};
+use secp256k1::{Message, Secp256k1};
 
-use crate::chain::{Id, PublicKey, Signature, error::ChainError};
+use crate::chain::{Id, PrivateKey, PublicKey, Signature, error::ChainError};
 
 use super::action::Action;
 
@@ -10,10 +11,18 @@ use super::action::Action;
 pub struct Transaction {
     pub tx_type: u16, // Type of transaction (e.g., transfer, contract call)
     pub unsigned_tx: UnsignedTransaction, // Unsigned transaction data
-    pub signatures: Vec<Signature>, // Signatures of the transaction
+    pub signatures: HashSet<Signature>, // Signatures of the transaction
 }
 
 impl Transaction {
+    pub fn new(tx_type: u16, unsigned_tx: UnsignedTransaction) -> Self {
+        Self {
+            tx_type,
+            unsigned_tx,
+            signatures: HashSet::new(),
+        }
+    }
+
     pub fn id(&self) -> Id {
         let mut bytes: Vec<u8> = Vec::new();
         self.serialize(&mut bytes);
@@ -33,6 +42,13 @@ impl Transaction {
         }
         Ok(recovered_keys)
     }
+
+    pub fn sign(&mut self, private_key: &PrivateKey) {
+        let mut bytes: Vec<u8> = Vec::new();
+        self.serialize(&mut bytes);
+        let signature = private_key.sign(bytes.as_slice());
+        self.signatures.insert(signature);
+    }
 }
 
 impl Serialize for Transaction {
@@ -47,7 +63,7 @@ impl Deserialize for Transaction {
     fn deserialize(data: &[u8], pos: &mut usize) -> Result<Self, pulsevm_serialization::ReadError> {
         let tx_type = u16::deserialize(data, pos)?;
         let unsigned_tx = UnsignedTransaction::deserialize(data, pos)?;
-        let signatures = Vec::<Signature>::deserialize(data, pos)?;
+        let signatures = HashSet::<Signature>::deserialize(data, pos)?;
         Ok(Transaction {
             tx_type,
             unsigned_tx,
@@ -60,6 +76,15 @@ impl Deserialize for Transaction {
 pub struct UnsignedTransaction {
     pub blockchain_id: Id, // ID of the chain on which this transaction exists (prevents replay attacks)
     pub actions: Vec<Action>, // Actions to be executed in this transaction
+}
+
+impl UnsignedTransaction {
+    pub fn new(blockchain_id: Id, actions: Vec<Action>) -> Self {
+        Self {
+            blockchain_id,
+            actions,
+        }
+    }
 }
 
 impl Serialize for UnsignedTransaction {
@@ -91,7 +116,7 @@ pub fn encode_action_data(data: Vec<Box<dyn Serialize>>) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use std::{str::FromStr, vec};
+    use std::{collections::HashSet, str::FromStr, vec};
 
     use pulsevm_serialization::{Deserialize, Serialize};
 
@@ -144,7 +169,7 @@ mod tests {
                     )],
                 )],
             },
-            signatures: vec![Signature::new([0u8; 65])],
+            signatures: HashSet::new(),
         };
         let mut bytes: Vec<u8> = Vec::new();
         tx.serialize(&mut bytes);

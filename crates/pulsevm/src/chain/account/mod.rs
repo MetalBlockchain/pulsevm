@@ -1,3 +1,6 @@
+mod account_delta;
+pub use account_delta::AccountDelta;
+
 mod account_metadata;
 pub use account_metadata::AccountMetadata;
 

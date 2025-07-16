@@ -1,8 +1,13 @@
 use std::str::FromStr;
 
+use secp256k1::hashes::{Hash, sha256};
+use secp256k1::{Message, Secp256k1, rand};
+
+use crate::chain::Signature;
+
 use super::public_key::PublicKey;
 
-pub struct PrivateKey(secp256k1::SecretKey);
+pub struct PrivateKey(pub secp256k1::SecretKey);
 
 #[derive(Debug, Clone)]
 pub enum PrivateKeyError {
@@ -32,6 +37,21 @@ impl PrivateKey {
     pub fn public_key(&self) -> PublicKey {
         let secp = secp256k1::Secp256k1::new();
         PublicKey(secp256k1::PublicKey::from_secret_key(&secp, &self.0))
+    }
+
+    pub fn sign(&self, msg: &[u8]) -> Signature {
+        let secp = Secp256k1::new();
+        let digest = sha256::Hash::hash(msg);
+        let message = Message::from_digest(digest.to_byte_array());
+        let sig = secp.sign_ecdsa_recoverable(&message, &self.0);
+
+        sig.into()
+    }
+
+    pub fn random() -> Self {
+        let secp = Secp256k1::new();
+        let (secret_key, _) = secp.generate_keypair(&mut rand::thread_rng());
+        PrivateKey(secret_key)
     }
 }
 

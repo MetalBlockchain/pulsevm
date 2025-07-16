@@ -18,6 +18,12 @@ impl PublicKey {
     }
 }
 
+impl ToString for PublicKey {
+    fn to_string(&self) -> String {
+        hex::encode(self.0.serialize().as_ref())
+    }
+}
+
 impl Serialize for PublicKey {
     fn serialize(&self, bytes: &mut Vec<u8>) {
         bytes.extend_from_slice(self.0.serialize().as_ref());

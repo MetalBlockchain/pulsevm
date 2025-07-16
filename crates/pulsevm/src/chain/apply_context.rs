@@ -1,6 +1,7 @@
 use std::{
     cell::RefCell,
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
+    hash::Hash,
     rc::Rc,
     sync::{Arc, RwLock},
 };
@@ -8,6 +9,8 @@ use std::{
 use pulsevm_chainbase::UndoSession;
 
 use crate::chain::{
+    AuthorizationManager, CODE_NAME,
+    authority::{Permission, PermissionLevel},
     pulse_assert,
     wasm_runtime::WasmRuntime,
 };
@@ -20,6 +23,7 @@ use super::{
 pub struct ApplyContext {
     session: Rc<RefCell<UndoSession>>, // The undo session for this context
     wasm_runtime: Arc<RwLock<WasmRuntime>>, // Context for the Wasm runtime
+    trx_context: TransactionContext,   // The transaction context
 
     action: Action,     // The action being applied
     receiver: Name,     // The account that is receiving the action
@@ -37,6 +41,7 @@ impl ApplyContext {
     pub fn new(
         session: Rc<RefCell<UndoSession>>,
         wasm_runtime: Arc<RwLock<WasmRuntime>>,
+        trx_context: TransactionContext,
         action: Action,
         receiver: Name,
         action_ordinal: u32,
@@ -45,6 +50,7 @@ impl ApplyContext {
         Ok(ApplyContext {
             session,
             wasm_runtime,
+            trx_context,
 
             action,
             receiver,
@@ -107,7 +113,10 @@ impl ApplyContext {
             .borrow_mut()
             .get::<AccountMetadata>(self.receiver.clone())
             .map_err(|e| {
-                ChainError::TransactionError(format!("failed to get receiver account: {}", e))
+                ChainError::TransactionError(format!(
+                    "failed to get receiver account: {}",
+                    self.receiver.clone()
+                ))
             })?;
 
         self.privileged = receiver_account.privileged;
@@ -130,15 +139,6 @@ impl ApplyContext {
         }
 
         Ok(())
-    }
-
-    pub fn schedule_action_from_ordinal(
-        &mut self,
-        ordinal_of_action_to_schedule: u32,
-        receiver: Name,
-    ) -> Result<u32, ChainError> {
-        // TODO: Implement scheduling logic
-        Ok(0)
     }
 
     pub fn get_action(&self) -> &Action {
@@ -178,7 +178,7 @@ impl ApplyContext {
     pub fn require_recipient(&mut self, recipient: Name) -> Result<(), ChainError> {
         if !self.has_recipient(recipient) {
             let scheduled_ordinal =
-                self.schedule_action_from_ordinal(self.action_ordinal, recipient)?;
+                self.schedule_action_from_ordinal(self.action_ordinal, &recipient, false)?;
             self.notified
                 .borrow_mut()
                 .push_back((recipient, scheduled_ordinal));
@@ -221,5 +221,92 @@ impl ApplyContext {
 
     pub fn undo_session(&self) -> Rc<RefCell<UndoSession>> {
         self.session.clone()
+    }
+
+    pub fn execute_inline(&mut self, a: &Action) -> Result<(), ChainError> {
+        {
+            let mut session = self.session.borrow_mut();
+            let code = session.find::<Account>(a.account())?;
+            pulse_assert(
+                code.is_some(),
+                ChainError::TransactionError(format!(
+                    "inline action's code account {} does not exist",
+                    a.account()
+                )),
+            )?;
+
+            for auth in a.authorization() {
+                let actor = session.find::<Account>(auth.actor())?;
+                pulse_assert(
+                    actor.is_some(),
+                    ChainError::TransactionError(format!(
+                        "inline action's authorizing actor {} does not exist",
+                        auth.actor()
+                    )),
+                )?;
+                pulse_assert(
+                    AuthorizationManager::find_permission(&mut session, auth)?.is_some(),
+                    ChainError::TransactionError(format!(
+                        "inline action's authorizations include a non-existent permission: {}",
+                        auth
+                    )),
+                )?;
+            }
+
+            let mut provided_permissions = HashSet::new();
+            provided_permissions.insert(PermissionLevel::new(self.receiver.clone(), CODE_NAME));
+
+            AuthorizationManager::check_authorization(
+                &mut session,
+                &vec![a.clone()],
+                &HashSet::new(),       // No provided keys
+                &provided_permissions, // Default permission level
+                &HashSet::new(),
+            )?;
+        }
+
+        let inline_receiver = a.account();
+        let scheduled_ordinal = self.schedule_action_from_action(a, &inline_receiver, false)?;
+        self.inline_actions.borrow_mut().push(scheduled_ordinal);
+
+        Ok(())
+    }
+
+    pub fn schedule_action_from_ordinal(
+        &mut self,
+        ordinal_of_action_to_schedule: u32,
+        receiver: &Name,
+        context_free: bool,
+    ) -> Result<u32, ChainError> {
+        let scheduled_action_ordinal = self.trx_context.schedule_action_from_ordinal(
+            ordinal_of_action_to_schedule,
+            receiver,
+            context_free,
+            self.action_ordinal,
+            self.first_receiver_action_ordinal,
+        )?;
+
+        self.action = self.trx_context.get_action_trace(self.action_ordinal)?.act;
+
+        Ok(scheduled_action_ordinal)
+    }
+
+    pub fn schedule_action_from_action(
+        &mut self,
+        act_to_schedule: &Action,
+        receiver: &Name,
+        context_free: bool,
+    ) -> Result<u32, ChainError> {
+        let scheduled_action_ordinal = self.trx_context.schedule_action(
+            act_to_schedule,
+            receiver,
+            context_free,
+            self.action_ordinal,
+            self.first_receiver_action_ordinal,
+        );
+
+        self.action = self.trx_context.get_action_trace(self.action_ordinal)?.act;
+
+        Ok(scheduled_action_ordinal)
     }
 }

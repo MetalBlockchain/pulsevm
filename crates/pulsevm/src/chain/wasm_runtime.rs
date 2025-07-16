@@ -3,7 +3,11 @@ use std::num::NonZeroUsize;
 use lru::LruCache;
 use wasmtime::{Config, Engine, IntoFunc, Linker, Module, Store, Strategy};
 
-use crate::chain::{Action, Name, apply_context::ApplyContext};
+use crate::chain::{
+    Action, Name,
+    apply_context::ApplyContext,
+    webassembly::{require_auth2, require_recipient},
+};
 
 use super::{
     CodeObject, Id,
@@ -89,8 +93,8 @@ impl WasmRuntime {
         // Authorization functions
         Self::add_host_function(&mut linker, "env", "require_auth", require_auth())?;
         Self::add_host_function(&mut linker, "env", "has_auth", has_auth())?;
-        Self::add_host_function(&mut linker, "env", "require_auth2", require_auth())?;
-        Self::add_host_function(&mut linker, "env", "require_recipient", require_auth())?;
+        Self::add_host_function(&mut linker, "env", "require_auth2", require_auth2())?;
+        Self::add_host_function(&mut linker, "env", "require_recipient", require_recipient())?;
         Self::add_host_function(&mut linker, "env", "is_account", is_account())?;
         // Memory functions
         Self::add_host_function(&mut linker, "env", "memcpy", memcpy())?;

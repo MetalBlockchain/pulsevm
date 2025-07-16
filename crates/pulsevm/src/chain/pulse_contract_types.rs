@@ -9,6 +9,26 @@ pub struct NewAccount {
     pub active: Authority,
 }
 
+impl NewAccount {
+    pub fn new(creator: Name, name: Name, owner: Authority, active: Authority) -> Self {
+        NewAccount {
+            creator,
+            name,
+            owner,
+            active,
+        }
+    }
+}
+
+impl Serialize for NewAccount {
+    fn serialize(&self, bytes: &mut Vec<u8>) {
+        self.creator.serialize(bytes);
+        self.name.serialize(bytes);
+        self.owner.serialize(bytes);
+        self.active.serialize(bytes);
+    }
+}
+
 impl Deserialize for NewAccount {
     fn deserialize(data: &[u8], pos: &mut usize) -> Result<Self, pulsevm_serialization::ReadError> {
         let creator = Name::deserialize(data, pos)?;

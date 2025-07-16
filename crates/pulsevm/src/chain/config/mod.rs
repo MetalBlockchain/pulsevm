@@ -13,3 +13,6 @@ pub fn billable_size_v<T: BillableSize>() -> u64 {
     return ((T::billable_size() + BILLABLE_ALIGNMENT - 1) / BILLABLE_ALIGNMENT)
         * BILLABLE_ALIGNMENT;
 }
+
+mod gpo;
+pub use gpo::GlobalPropertyObject;

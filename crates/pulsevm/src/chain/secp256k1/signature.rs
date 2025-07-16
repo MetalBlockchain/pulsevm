@@ -50,6 +50,16 @@ impl Signature {
     }
 }
 
+impl From<RecoverableSignature> for Signature {
+    fn from(sig: RecoverableSignature) -> Self {
+        let mut bytes = [0u8; 65];
+        let (rec_id, sig_bytes) = sig.serialize_compact();
+        bytes[..64].copy_from_slice(&sig_bytes);
+        bytes[64] = rec_id as u8;
+        Signature(bytes)
+    }
+}
+
 impl Serialize for Signature {
     fn serialize(&self, bytes: &mut Vec<u8>) {
         bytes.extend_from_slice(&self.0);

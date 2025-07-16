@@ -6,17 +6,18 @@ use std::{
 
 use pulsevm_chainbase::UndoSession;
 
-use crate::chain::wasm_runtime::WasmRuntime;
+use crate::chain::{Genesis, TransactionTrace, wasm_runtime::WasmRuntime};
 
 use super::{
     Action, ActionTrace, Name, Transaction, apply_context::ApplyContext, error::ChainError,
 };
 
+#[derive(Clone)]
 pub struct TransactionContext {
     session: Rc<RefCell<UndoSession>>,
     wasm_runtime: Arc<RwLock<WasmRuntime>>,
 
-    action_traces: Vec<ActionTrace>,
+    trace: Rc<RefCell<TransactionTrace>>,
 }
 
 impl TransactionContext {
@@ -25,16 +26,16 @@ impl TransactionContext {
             session,
             wasm_runtime,
 
-            action_traces: Vec::new(),
+            trace: Rc::new(RefCell::new(TransactionTrace::default())),
         }
     }
 
     pub fn exec(&mut self, transaction: &Transaction) -> Result<(), ChainError> {
         for action in transaction.unsigned_tx.actions.iter() {
-            self.schedule_action(action, &action.account(), 0);
+            self.schedule_action(action, &action.account(), false, 0, 0);
         }
 
-        let num_original_actions_to_execute = self.action_traces.len();
+        let num_original_actions_to_execute = { self.trace.borrow().action_traces.len() };
         for i in 1..=num_original_actions_to_execute {
             self.execute_action(i as u32, 0)?;
         }
@@ -44,38 +45,62 @@ impl TransactionContext {
 
     pub fn schedule_action(
         &mut self,
-        action: &Action,
+        act: &Action,
         receiver: &Name,
+        context_free: bool,
         creator_action_ordinal: u32,
+        closest_unnotified_ancestor_action_ordinal: u32,
     ) -> u32 {
-        let new_action_ordinal = (self.action_traces.len() as u32) + 1;
-        let action_trace = ActionTrace::new(
+        let (trx_id, block_num, block_time) = {
+            let trace = self.trace.borrow();
+            (trace.id, trace.block_num, trace.block_time)
+        };
+        let mut trace = self.trace.borrow_mut();
+        let new_action_ordinal = trace.action_traces.len() as u32 + 1;
+
+        trace.action_traces.push(ActionTrace::new(
+            trx_id,
+            block_num,
+            block_time,
+            act,
+            *receiver,
+            context_free,
             new_action_ordinal,
             creator_action_ordinal,
-            receiver.clone(),
-            action.clone(),
-        );
-        self.action_traces.push(action_trace);
+            closest_unnotified_ancestor_action_ordinal,
+        ));
+
         new_action_ordinal
     }
 
     pub fn schedule_action_from_ordinal(
         &mut self,
         action_ordinal: u32,
-        receiver: Name,
+        receiver: &Name,
+        context_free: bool,
         creator_action_ordinal: u32,
+        closest_unnotified_ancestor_action_ordinal: u32,
     ) -> Result<u32, ChainError> {
-        let new_action_ordinal = (self.action_traces.len() as u32) + 1;
-        let provided_action = self
-            .get_action_trace(action_ordinal)
-            .ok_or(ChainError::TransactionError(format!("action not found")))?;
-        let action_trace = ActionTrace::new(
+        let (trx_id, block_num, block_time) = {
+            let trace = self.trace.borrow();
+            (trace.id, trace.block_num, trace.block_time)
+        };
+        let provided_action = self.get_action_trace(action_ordinal)?.act;
+        let mut trace = self.trace.borrow_mut();
+        let new_action_ordinal = trace.action_traces.len() as u32 + 1;
+
+        trace.action_traces.push(ActionTrace::new(
+            trx_id,
+            block_num,
+            block_time,
+            &provided_action,
+            *receiver,
+            context_free,
             new_action_ordinal,
             creator_action_ordinal,
-            receiver.clone(),
-            provided_action.action().clone(),
-        );
-        self.action_traces.push(action_trace);
+            closest_unnotified_ancestor_action_ordinal,
+        ));
+
         Ok(new_action_ordinal)
     }
 
@@ -84,14 +109,13 @@ impl TransactionContext {
         action_ordinal: u32,
         recurse_depth: u32,
     ) -> Result<(), ChainError> {
-        let trace = self
-            .get_action_trace(action_ordinal)
-            .ok_or(ChainError::TransactionError(format!("action not found")))?;
+        let trace = self.get_action_trace(action_ordinal)?;
         let action = trace.action();
         let receiver = trace.receiver();
         let mut apply_context = ApplyContext::new(
             self.session.clone(),
             self.wasm_runtime.clone(),
+            self.clone(),
             action,
             receiver,
             action_ordinal,
@@ -104,7 +128,17 @@ impl TransactionContext {
         Ok(())
     }
 
-    pub fn get_action_trace(&self, action_ordinal: u32) -> Option<&ActionTrace> {
-        self.action_traces.get((action_ordinal as usize) - 1)
+    pub fn get_action_trace(&self, action_ordinal: u32) -> Result<ActionTrace, ChainError> {
+        let trace = self.trace.borrow();
+        let trace = trace.action_traces.get((action_ordinal as usize) - 1);
+
+        if let Some(trace) = trace {
+            return Ok(trace.clone());
+        }
+
+        Err(ChainError::TransactionError(format!(
+            "failed to get action trace by ordinal {}",
+            action_ordinal
+        )))
     }
 }

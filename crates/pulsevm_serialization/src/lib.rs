@@ -1,5 +1,5 @@
 use core::{fmt, str};
-use std::usize;
+use std::{collections::HashSet, error::Error, hash::Hash, usize};
 
 /// Error that can be returned when writing bytes.
 #[derive(Debug, Clone, Copy)]
@@ -74,6 +74,16 @@ impl<T: Serialize> Serialize for Vec<T> {
     }
 }
 
+impl<T: Serialize> Serialize for HashSet<T> {
+    fn serialize(&self, bytes: &mut Vec<u8>) {
+        let length = self.len() as u32;
+        length.serialize(bytes);
+        for item in self {
+            item.serialize(bytes);
+        }
+    }
+}
+
 pub fn serialize(value: &impl Serialize) -> Vec<u8> {
     let mut bytes = Vec::new();
     value.serialize(&mut bytes);
@@ -97,6 +107,8 @@ impl fmt::Display for ReadError {
         }
     }
 }
+
+impl Error for ReadError {}
 
 pub trait Deserialize: Sized {
     fn deserialize(data: &[u8], pos: &mut usize) -> Result<Self, ReadError>;
@@ -197,5 +209,20 @@ impl<T: Deserialize> Deserialize for Vec<T> {
             vec.push(item);
         }
         Ok(vec)
+    }
+}
+
+impl<T: Deserialize> Deserialize for HashSet<T>
+where
+    T: Hash + Eq,
+{
+    fn deserialize(data: &[u8], pos: &mut usize) -> Result<Self, ReadError> {
+        let length = u32::deserialize(data, pos)?;
+        let mut set = HashSet::with_capacity(length as usize);
+        for _ in 0..length {
+            let item = T::deserialize(data, pos)?;
+            set.insert(item);
+        }
+        Ok(set)
     }
 }

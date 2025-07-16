@@ -8,7 +8,7 @@ use std::{
 };
 
 use crate::{
-    chain::{ACTIVE_NAME, Account, AccountMetadata, wasm_runtime},
+    chain::{ACTIVE_NAME, Account, AccountMetadata, config::GlobalPropertyObject},
     mempool::Mempool,
 };
 
@@ -55,6 +55,7 @@ pub static APPLY_HANDLERS: LazyLock<ApplyHandlerMap> = LazyLock::new(|| {
 
 pub struct Controller {
     wasm_runtime: Arc<RwLock<WasmRuntime>>,
+    genesis: Option<Genesis>,
 
     last_accepted_block: Block,
     preferred_id: Id,
@@ -82,6 +83,8 @@ impl Controller {
         let wasm_runtime = WasmRuntime::new().unwrap();
         let controller = Controller {
             wasm_runtime: Arc::new(RwLock::new(wasm_runtime)), // TODO: Handle error properly
+            genesis: None,
+
             last_accepted_block: Block::default(),
             preferred_id: Id::default(),
             db: db,
@@ -100,15 +103,19 @@ impl Controller {
             ControllerError::GenesisError(format!("failed to open database: {}", e))
         })?;
         // Parse genesis bytes
-        let genesis = Genesis::parse(genesis_bytes)
-            .map_err(|e| ControllerError::GenesisError(format!("failed to parse genesis: {}", e)))?
-            .validate()
-            .map_err(|e| ControllerError::GenesisError(format!("invalid genesis: {}", e)))?;
+        self.genesis = Some(
+            Genesis::parse(genesis_bytes)
+                .map_err(|e| {
+                    ControllerError::GenesisError(format!("failed to parse genesis: {}", e))
+                })?
+                .validate()
+                .map_err(|e| ControllerError::GenesisError(format!("invalid genesis: {}", e)))?,
+        );
 
         // Set our last accepted block to the genesis block
         self.last_accepted_block = Block::new(
             Id::default(),
-            genesis.initial_timestamp().unwrap(),
+            self.genesis.clone().unwrap().initial_timestamp().unwrap(),
             0,
             Vec::new(),
         );
@@ -129,10 +136,14 @@ impl Controller {
             session.insert(&self.last_accepted_block).map_err(|e| {
                 ControllerError::GenesisError(format!("failed to insert genesis block: {}", e))
             })?;
-            let default_key = genesis.initial_key().map_err(|e| {
+            let default_key = self.genesis.clone().unwrap().initial_key().map_err(|e| {
                 ControllerError::GenesisError(format!("failed to get initial key: {}", e))
             })?;
             info!(
+                "initializing pulse account with default key: {}",
+                default_key.0
+            );
+            println!(
                 "initializing pulse account with default key: {}",
                 default_key.0
             );
@@ -379,19 +390,80 @@ impl Controller {
     pub fn get_wasm_runtime(&self) -> Arc<RwLock<WasmRuntime>> {
         self.wasm_runtime.clone()
     }
+
+    pub fn get_global_properties(
+        session: &mut UndoSession,
+    ) -> Result<GlobalPropertyObject, ChainError> {
+        session.get::<GlobalPropertyObject>(0).map_err(|e| {
+            ChainError::TransactionError(format!("failed to get global properties: {}", e))
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::{env::temp_dir, str::FromStr};
+
+    use chrono::format;
+    use pulsevm_serialization::{Serialize, serialize};
+    use serde_json::json;
+
+    use crate::chain::{
+        Action, NewAccount, PrivateKey, UnsignedTransaction,
+        authority::{Permission, PermissionLevel},
+    };
+
     use super::*;
 
     #[test]
     fn test_initialize() {
+        let private_key = PrivateKey::random();
         let mut controller = Controller::new();
-        let genesis_bytes = b"{\"initial_timestamp\": \"2023-01-01T00:00:00Z\", \"initial_key\": \"02c66e7d8966b5c555af5805989da9fbf8db95e15631ce358c3a1710c962679063\"}".to_vec();
+        let genesis_json = json!(
+        {
+            "initial_timestamp": "2023-01-01T00:00:00Z",
+            "initial_key": private_key.public_key().to_string(),
+            "initial_configuration": {
+                "max_inline_action_size": 4096
+            }
+        });
+        println!("Genesis JSON: {}", genesis_json);
+        let genesis_bytes = genesis_json.to_string().into_bytes();
+        let temp_dir_name = format!(
+            "db_{}.pulsevm",
+            Utc::now().format("%Y%m%d%H%M%S")
+        );
+        let temp_path = temp_dir().join(Path::new(&temp_dir_name));
+        println!("Temp path: {}", temp_path.to_str().unwrap());
         controller
-            .initialize(&genesis_bytes, "database".to_owned())
+            .initialize(
+                &genesis_bytes.to_vec(),
+                temp_path.to_str().unwrap().to_string(),
+            )
             .unwrap();
         assert_eq!(controller.last_accepted_block().height, 0);
+
+        let mut transaction = Transaction::new(
+            0,
+            UnsignedTransaction::new(
+                Id::default(),
+                vec![Action::new(
+                    Name::from_str("pulse").unwrap(),
+                    Name::from_str("newaccount").unwrap(),
+                    serialize(&NewAccount::new(
+                        Name::from_str("pulse").unwrap(),
+                        Name::from_str("glenn").unwrap(),
+                        Authority::new(1, vec![], vec![]),
+                        Authority::new(1, vec![], vec![]),
+                    )),
+                    vec![PermissionLevel::new(
+                        Name::from_str("pulse").unwrap(),
+                        Name::from_str("active").unwrap(),
+                    )],
+                )],
+            ),
+        );
+        transaction.sign(&private_key);
+        controller.push_transaction(&transaction).unwrap();
     }
 }
