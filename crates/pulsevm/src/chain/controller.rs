@@ -390,7 +390,7 @@ impl Controller {
 
 #[cfg(test)]
 mod tests {
-    use std::{env::temp_dir, path::PathBuf, str::FromStr, vec};
+    use std::{env::temp_dir, fs, path::PathBuf, str::FromStr, vec};
 
     use chrono::format;
     use pulsevm_serialization::{Serialize, serialize};
@@ -452,7 +452,7 @@ mod tests {
         .sign(&private_key)
     }
 
-    fn set_code(private_key: &PrivateKey, account: Name) -> Transaction {
+    fn set_code(private_key: &PrivateKey, account: Name, wasm_bytes: Vec<u8>) -> Transaction {
         Transaction::new(
             0,
             UnsignedTransaction::new(
@@ -464,7 +464,7 @@ mod tests {
                         account,
                         0,
                         0,
-                        vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+                        wasm_bytes,
                     )),
                     vec![PermissionLevel::new(
                         account,
@@ -508,14 +508,19 @@ mod tests {
             undo_session.clone(),
             &create_account(&private_key, Name::from_str("glenn")?),
         )?;
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+        let pulse_token_contract = fs::read(root.join(Path::new("reference_contracts/pulse_token.wasm"))).unwrap();
         controller.execute_transaction(
             undo_session.clone(),
-            &set_code(&private_key, Name::from_str("glenn")?),
+            &set_code(&private_key, Name::from_str("glenn")?, pulse_token_contract),
         )?;
+
         controller.execute_transaction(
             undo_session.clone(),
             &call_contract(&private_key, Name::from_str("glenn")?, Name::from_str("issue")?),
         )?;
+        
         Ok(())
     }
 }
