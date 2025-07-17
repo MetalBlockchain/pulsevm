@@ -53,10 +53,11 @@ impl Transaction {
     }
 
     #[allow(dead_code)]
-    pub fn sign(&mut self, private_key: &PrivateKey) {
+    pub fn sign(mut self, private_key: &PrivateKey) -> Self {
         let digest = self.digest();
         let signature = private_key.sign(&digest);
         self.signatures.insert(signature);
+        self
     }
 }
 

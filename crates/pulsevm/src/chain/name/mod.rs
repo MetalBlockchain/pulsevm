@@ -4,6 +4,8 @@ use std::{ops::Deref, str::FromStr};
 use pulsevm_name::{NAME_MAX_LEN, ParseNameError, name_from_bytes, name_to_bytes};
 use pulsevm_serialization::{Deserialize, Serialize};
 
+use crate::chain::error::ChainError;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub struct Name(u64);
 
@@ -38,10 +40,11 @@ impl From<Name> for u64 {
 }
 
 impl FromStr for Name {
-    type Err = ParseNameError;
+    type Err = ChainError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let name = name_from_bytes(s.bytes())?;
+        let name = name_from_bytes(s.bytes())
+            .map_err(|e| ChainError::ParseError(format!("invalid name format: {}", e)))?;
         Ok(name.into())
     }
 }

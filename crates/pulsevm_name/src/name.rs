@@ -1,3 +1,5 @@
+use std::fmt;
+
 pub const NAME_CHARS: [u8; 32] = *b".12345abcdefghijklmnopqrstuvwxyz";
 pub const NAME_MAX_LEN: usize = 13;
 
@@ -7,6 +9,15 @@ pub enum ParseNameError {
     BadChar(u8),
     /// The name is over the maximum allowed length.
     TooLong,
+}
+
+impl fmt::Display for ParseNameError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ParseNameError::BadChar(c) => write!(f, "bad character in name: '{}'", *c as char),
+            ParseNameError::TooLong => write!(f, "name is too long"),
+        }
+    }
 }
 
 #[inline]

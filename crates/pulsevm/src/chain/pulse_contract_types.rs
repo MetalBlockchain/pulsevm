@@ -130,6 +130,26 @@ pub struct SetCode {
     pub code: Vec<u8>,
 }
 
+impl SetCode {
+    pub fn new(account: Name, vm_type: u8, vm_version: u8, code: Vec<u8>) -> Self {
+        SetCode {
+            account,
+            vm_type,
+            vm_version,
+            code,
+        }
+    }
+}
+
+impl Serialize for SetCode {
+    fn serialize(&self, bytes: &mut Vec<u8>) {
+        self.account.serialize(bytes);
+        self.vm_type.serialize(bytes);
+        self.vm_version.serialize(bytes);
+        self.code.serialize(bytes);
+    }
+}
+
 impl Deserialize for SetCode {
     fn deserialize(data: &[u8], pos: &mut usize) -> Result<Self, pulsevm_serialization::ReadError> {
         let account = Name::deserialize(data, pos)?;
