@@ -287,8 +287,12 @@ impl UndoSession {
         Ok(())
     }
 
-    pub fn commit(self) {
-        self.tx.commit().expect("failed to commit transaction");
+    pub fn commit(self) -> Result<(), Box<dyn Error>> {
+        let result = self.tx.commit()?;
+        if result.is_err() {
+            return Err("failed to commit transaction".into());
+        }
+        Ok(())
     }
 
     pub fn rollback(self) {

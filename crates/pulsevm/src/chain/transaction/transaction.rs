@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use pulsevm_serialization::{Deserialize, Serialize};
-use secp256k1::{Message, Secp256k1};
+use secp256k1::hashes::{Hash, sha256};
 
 use crate::chain::{Id, PrivateKey, PublicKey, Signature, error::ChainError};
 
@@ -15,6 +15,7 @@ pub struct Transaction {
 }
 
 impl Transaction {
+    #[allow(dead_code)]
     pub fn new(tx_type: u16, unsigned_tx: UnsignedTransaction) -> Self {
         Self {
             tx_type,
@@ -26,28 +27,37 @@ impl Transaction {
     pub fn id(&self) -> Id {
         let mut bytes: Vec<u8> = Vec::new();
         self.serialize(&mut bytes);
-        Id::from_sha256(&bytes)
+        let digest = sha256::Hash::hash(&bytes);
+        Id::from_sha256(&digest)
+    }
+
+    pub fn digest(&self) -> sha256::Hash {
+        let mut bytes: Vec<u8> = Vec::new();
+        self.unsigned_tx.serialize(&mut bytes);
+        sha256::Hash::hash(&bytes)
     }
 
     #[must_use]
     pub fn recovered_keys(&self) -> Result<HashSet<PublicKey>, ChainError> {
         let mut recovered_keys: HashSet<PublicKey> = HashSet::new();
-        let mut tx_data: Vec<u8> = Vec::new();
-        self.unsigned_tx.serialize(&mut tx_data);
+        let digest = self.digest();
+
         for signature in self.signatures.iter() {
             let public_key = signature
-                .recover_public_key(&tx_data)
+                .recover_public_key(&digest)
                 .map_err(|e| ChainError::SignatureRecoverError(format!("{}", e)))?;
             recovered_keys.insert(public_key);
         }
+
         Ok(recovered_keys)
     }
 
-    pub fn sign(&mut self, private_key: &PrivateKey) {
-        let mut bytes: Vec<u8> = Vec::new();
-        self.serialize(&mut bytes);
-        let signature = private_key.sign(bytes.as_slice());
+    #[allow(dead_code)]
+    pub fn sign(mut self, private_key: &PrivateKey) -> Self {
+        let digest = self.digest();
+        let signature = private_key.sign(&digest);
         self.signatures.insert(signature);
+        self
     }
 }
 
@@ -79,6 +89,7 @@ pub struct UnsignedTransaction {
 }
 
 impl UnsignedTransaction {
+    #[allow(dead_code)]
     pub fn new(blockchain_id: Id, actions: Vec<Action>) -> Self {
         Self {
             blockchain_id,
@@ -105,6 +116,7 @@ impl Deserialize for UnsignedTransaction {
     }
 }
 
+#[allow(dead_code)]
 #[must_use]
 pub fn encode_action_data(data: Vec<Box<dyn Serialize>>) -> Vec<u8> {
     let mut bytes: Vec<u8> = Vec::new();
@@ -121,7 +133,7 @@ mod tests {
     use pulsevm_serialization::{Deserialize, Serialize};
 
     use crate::chain::{
-        Id, Name, PrivateKey, Signature,
+        Id, Name, PrivateKey,
         authority::Authority,
         authority::KeyWeight,
         authority::PermissionLevel,

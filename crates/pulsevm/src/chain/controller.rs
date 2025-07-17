@@ -22,6 +22,7 @@ use super::{
     transaction::Transaction,
     wasm_runtime::WasmRuntime,
 };
+use anyhow::Chain;
 use chrono::Utc;
 use pulsevm_chainbase::{Database, UndoSession};
 use pulsevm_proc_macros::name;
@@ -98,18 +99,15 @@ impl Controller {
         &mut self,
         genesis_bytes: &Vec<u8>,
         db_path: String,
-    ) -> Result<(), ControllerError> {
+    ) -> Result<(), ChainError> {
         self.db = Database::new(Path::new(&db_path)).map_err(|e| {
-            ControllerError::GenesisError(format!("failed to open database: {}", e))
+            ChainError::InternalError(Some(format!("failed to open database: {}", e)))
         })?;
         // Parse genesis bytes
         self.genesis = Some(
             Genesis::parse(genesis_bytes)
-                .map_err(|e| {
-                    ControllerError::GenesisError(format!("failed to parse genesis: {}", e))
-                })?
-                .validate()
-                .map_err(|e| ControllerError::GenesisError(format!("invalid genesis: {}", e)))?,
+                .map_err(|e| ChainError::ParseError(format!("failed to parse genesis: {}", e)))?
+                .validate()?,
         );
 
         // Set our last accepted block to the genesis block
@@ -125,25 +123,21 @@ impl Controller {
             .db
             .find_by_secondary::<Block, BlockByHeightIndex>(self.last_accepted_block.height)
             .map_err(|e| {
-                ControllerError::GenesisError(format!("failed to find genesis block: {}", e))
+                ChainError::GenesisError(format!("failed to find genesis block: {}", e))
             })?;
 
         if genesis_block.is_none() {
             // If not, insert it
             let mut session = self.db.undo_session().map_err(|e| {
-                ControllerError::GenesisError(format!("failed to create undo session: {}", e))
+                ChainError::GenesisError(format!("failed to create undo session: {}", e))
             })?;
             session.insert(&self.last_accepted_block).map_err(|e| {
-                ControllerError::GenesisError(format!("failed to insert genesis block: {}", e))
+                ChainError::GenesisError(format!("failed to insert genesis block: {}", e))
             })?;
             let default_key = self.genesis.clone().unwrap().initial_key().map_err(|e| {
-                ControllerError::GenesisError(format!("failed to get initial key: {}", e))
+                ChainError::GenesisError(format!("failed to get initial key: {}", e))
             })?;
             info!(
-                "initializing pulse account with default key: {}",
-                default_key.0
-            );
-            println!(
                 "initializing pulse account with default key: {}",
                 default_key.0
             );
@@ -157,10 +151,7 @@ impl Controller {
                 default_authority.clone(),
             )
             .map_err(|e| {
-                ControllerError::GenesisError(format!(
-                    "failed to create pulse@owner permission: {}",
-                    e
-                ))
+                ChainError::GenesisError(format!("failed to create pulse@owner permission: {}", e))
             })?;
             // Create the pulse@active permission
             AuthorizationManager::create_permission(
@@ -171,25 +162,22 @@ impl Controller {
                 default_authority.clone(),
             )
             .map_err(|e| {
-                ControllerError::GenesisError(format!(
-                    "failed to create pulse@owner permission: {}",
-                    e
-                ))
+                ChainError::GenesisError(format!("failed to create pulse@owner permission: {}", e))
             })?;
             session
                 .insert(&Account::new(PULSE_NAME, 0, vec![]))
                 .map_err(|e| {
-                    ControllerError::GenesisError(format!("failed to insert pulse account: {}", e))
+                    ChainError::GenesisError(format!("failed to insert pulse account: {}", e))
                 })?;
             session
                 .insert(&AccountMetadata::new(PULSE_NAME))
                 .map_err(|e| {
-                    ControllerError::GenesisError(format!(
+                    ChainError::GenesisError(format!(
                         "failed to insert pulse account metadata: {}",
                         e
                     ))
                 })?;
-            session.commit();
+            session.commit()?;
         }
 
         Ok(())
@@ -402,24 +390,26 @@ impl Controller {
 
 #[cfg(test)]
 mod tests {
-    use std::{env::temp_dir, str::FromStr};
+    use std::{env::temp_dir, fs, path::PathBuf, str::FromStr, vec};
 
     use chrono::format;
     use pulsevm_serialization::{Serialize, serialize};
     use serde_json::json;
 
     use crate::chain::{
-        Action, NewAccount, PrivateKey, UnsignedTransaction,
+        Action, NewAccount, PrivateKey, SetCode, UnsignedTransaction,
         authority::{Permission, PermissionLevel},
     };
 
     use super::*;
 
-    #[test]
-    fn test_initialize() {
-        let private_key = PrivateKey::random();
-        let mut controller = Controller::new();
-        let genesis_json = json!(
+    fn get_temp_dir() -> PathBuf {
+        let temp_dir_name = format!("db_{}.pulsevm", Utc::now().format("%Y%m%d%H%M%S"));
+        temp_dir().join(Path::new(&temp_dir_name))
+    }
+
+    fn generate_genesis(private_key: &PrivateKey) -> Vec<u8> {
+        let genesis = json!(
         {
             "initial_timestamp": "2023-01-01T00:00:00Z",
             "initial_key": private_key.public_key().to_string(),
@@ -427,23 +417,11 @@ mod tests {
                 "max_inline_action_size": 4096
             }
         });
-        println!("Genesis JSON: {}", genesis_json);
-        let genesis_bytes = genesis_json.to_string().into_bytes();
-        let temp_dir_name = format!(
-            "db_{}.pulsevm",
-            Utc::now().format("%Y%m%d%H%M%S")
-        );
-        let temp_path = temp_dir().join(Path::new(&temp_dir_name));
-        println!("Temp path: {}", temp_path.to_str().unwrap());
-        controller
-            .initialize(
-                &genesis_bytes.to_vec(),
-                temp_path.to_str().unwrap().to_string(),
-            )
-            .unwrap();
-        assert_eq!(controller.last_accepted_block().height, 0);
+        genesis.to_string().into_bytes()
+    }
 
-        let mut transaction = Transaction::new(
+    fn create_account(private_key: &PrivateKey, account: Name) -> Transaction {
+        Transaction::new(
             0,
             UnsignedTransaction::new(
                 Id::default(),
@@ -452,9 +430,17 @@ mod tests {
                     Name::from_str("newaccount").unwrap(),
                     serialize(&NewAccount::new(
                         Name::from_str("pulse").unwrap(),
-                        Name::from_str("glenn").unwrap(),
-                        Authority::new(1, vec![], vec![]),
-                        Authority::new(1, vec![], vec![]),
+                        account,
+                        Authority::new(
+                            1,
+                            vec![KeyWeight::new(private_key.public_key(), 1)],
+                            vec![],
+                        ),
+                        Authority::new(
+                            1,
+                            vec![KeyWeight::new(private_key.public_key(), 1)],
+                            vec![],
+                        ),
                     )),
                     vec![PermissionLevel::new(
                         Name::from_str("pulse").unwrap(),
@@ -462,8 +448,79 @@ mod tests {
                     )],
                 )],
             ),
-        );
-        transaction.sign(&private_key);
-        controller.push_transaction(&transaction).unwrap();
+        )
+        .sign(&private_key)
+    }
+
+    fn set_code(private_key: &PrivateKey, account: Name, wasm_bytes: Vec<u8>) -> Transaction {
+        Transaction::new(
+            0,
+            UnsignedTransaction::new(
+                Id::default(),
+                vec![Action::new(
+                    Name::from_str("pulse").unwrap(),
+                    Name::from_str("setcode").unwrap(),
+                    serialize(&SetCode::new(
+                        account,
+                        0,
+                        0,
+                        wasm_bytes,
+                    )),
+                    vec![PermissionLevel::new(
+                        account,
+                        Name::from_str("active").unwrap(),
+                    )],
+                )],
+            ),
+        )
+        .sign(&private_key)
+    }
+
+    fn call_contract(private_key: &PrivateKey, account: Name, action: Name) -> Transaction {
+        Transaction::new(
+            0,
+            UnsignedTransaction::new(
+                Id::default(),
+                vec![Action::new(
+                    account,
+                    action,
+                    vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+                    vec![PermissionLevel::new(
+                        account,
+                        Name::from_str("active").unwrap(),
+                    )],
+                )],
+            ),
+        )
+        .sign(&private_key)
+    }
+
+    #[test]
+    fn test_initialize() -> Result<(), ChainError> {
+        let private_key = PrivateKey::random();
+        let mut controller = Controller::new();
+        let genesis_bytes = generate_genesis(&private_key);
+        let temp_path = get_temp_dir().to_str().unwrap().to_string();
+        controller.initialize(&genesis_bytes.to_vec(), temp_path)?;
+        assert_eq!(controller.last_accepted_block().height, 0);
+        let undo_session = Rc::new(RefCell::new(controller.create_undo_session()?));
+        controller.execute_transaction(
+            undo_session.clone(),
+            &create_account(&private_key, Name::from_str("glenn")?),
+        )?;
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+        let pulse_token_contract = fs::read(root.join(Path::new("reference_contracts/pulse_token.wasm"))).unwrap();
+        controller.execute_transaction(
+            undo_session.clone(),
+            &set_code(&private_key, Name::from_str("glenn")?, pulse_token_contract),
+        )?;
+
+        controller.execute_transaction(
+            undo_session.clone(),
+            &call_contract(&private_key, Name::from_str("glenn")?, Name::from_str("issue")?),
+        )?;
+        
+        Ok(())
     }
 }

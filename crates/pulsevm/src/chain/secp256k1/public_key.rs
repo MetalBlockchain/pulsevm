@@ -1,26 +1,26 @@
+use std::str::FromStr;
+
 use pulsevm_serialization::{Deserialize, Serialize};
 use secp256k1::{PublicKey as Secp256k1PublicKey, Secp256k1, SecretKey};
+
+use crate::chain::error::ChainError;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PublicKey(pub secp256k1::PublicKey);
 
-impl PublicKey {
-    pub fn from_hex(hex: &str) -> Result<Self, pulsevm_serialization::ReadError> {
-        let bytes = hex::decode(hex).map_err(|_| pulsevm_serialization::ReadError::ParseError)?;
-        if bytes.len() != 33 {
-            return Err(pulsevm_serialization::ReadError::NotEnoughBytes(0, 33));
-        }
-        let mut id = [0u8; 33];
-        id.copy_from_slice(&bytes);
-        let key = secp256k1::PublicKey::from_byte_array_compressed(&id)
-            .map_err(|_| pulsevm_serialization::ReadError::ParseError)?;
-        Ok(PublicKey(key))
+impl ToString for PublicKey {
+    fn to_string(&self) -> String {
+        self.0.to_string()
     }
 }
 
-impl ToString for PublicKey {
-    fn to_string(&self) -> String {
-        hex::encode(self.0.serialize().as_ref())
+impl FromStr for PublicKey {
+    type Err = ChainError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(PublicKey(Secp256k1PublicKey::from_str(s).map_err(|e| {
+            ChainError::AuthorizationError(format!("invalid public key format: {}", e))
+        })?))
     }
 }
 
@@ -51,5 +51,35 @@ impl Default for PublicKey {
             SecretKey::from_byte_array(&[0xcd; 32]).expect("32 bytes, within curve order");
         let public_key = Secp256k1PublicKey::from_secret_key(&secp, &secret_key);
         PublicKey(public_key)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pulsevm_serialization::Deserialize;
+
+    #[test]
+    fn test_public_key_from_hex() {
+        let hex = "030cd6c38a327849690b655003c50ca781d0f7020cc17e29428def19a342458961";
+        let public_key = PublicKey::from_str(hex).unwrap();
+        assert_eq!(
+            public_key.to_string(),
+            "030cd6c38a327849690b655003c50ca781d0f7020cc17e29428def19a342458961"
+        );
+    }
+
+    #[test]
+    fn test_public_key_serialize_deserialize() {
+        let hex = "030cd6c38a327849690b655003c50ca781d0f7020cc17e29428def19a342458961";
+        let public_key = PublicKey::from_str(hex).unwrap();
+
+        let mut serialized: Vec<u8> = Vec::new();
+        public_key.serialize(&mut serialized);
+
+        let mut pos = 0;
+        let deserialized = PublicKey::deserialize(&serialized, &mut pos).unwrap();
+
+        assert_eq!(public_key, deserialized);
     }
 }

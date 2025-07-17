@@ -432,6 +432,7 @@ impl AuthorizationManager {
 mod tests {
     use std::{
         path::Path,
+        str::FromStr,
         sync::{Arc, Mutex},
     };
 
@@ -451,7 +452,6 @@ mod tests {
         let shared_db = Arc::new(Mutex::new(Database::temporary(path).unwrap()));
         let our_db = shared_db.clone();
         let db = our_db.try_lock().unwrap();
-        println!("Database created at: {:?}", path);
         let mut undo_session = db.undo_session().unwrap();
         let owner_permission = Permission::new(
             0,
@@ -461,7 +461,7 @@ mod tests {
             Authority::new(
                 1,
                 vec![KeyWeight::new(
-                    PublicKey::from_hex(
+                    PublicKey::from_str(
                         "027f4dbe05a88d4c3974cec8d03f192c96a9813ea4d60811c4e68a2d459842497c",
                     )
                     .unwrap(),

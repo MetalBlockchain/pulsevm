@@ -3,7 +3,10 @@ use core::str;
 use pulsevm_serialization::Deserialize as PulseDeserialize;
 use pulsevm_serialization::Serialize as PulseSerialize;
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 use std::{error::Error, fmt};
+
+use crate::chain::error::ChainError;
 
 use super::{PublicKey, block::BlockTimestamp};
 
@@ -34,52 +37,39 @@ pub struct Genesis {
     initial_configuration: ChainConfig,
 }
 
-#[derive(Debug)]
-pub enum GenesisError {
-    InvalidFormat(String),
-    MissingField(String),
-}
-
-impl Error for GenesisError {}
-impl fmt::Display for GenesisError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            GenesisError::InvalidFormat(field) => write!(f, "Invalid format: {}", field),
-            GenesisError::MissingField(field) => write!(f, "Missing field: {}", field),
-        }
-    }
-}
-
 impl Genesis {
-    pub fn parse(bytes: &Vec<u8>) -> Result<Self, GenesisError> {
+    pub fn parse(bytes: &Vec<u8>) -> Result<Self, ChainError> {
         let genesis = str::from_utf8(bytes)
-            .map_err(|_| GenesisError::InvalidFormat("Invalid UTF-8".to_string()))?;
+            .map_err(|_| ChainError::GenesisError("invalid UTF-8".to_string()))?;
         let genesis: Genesis = serde_json::from_str(genesis)
-            .map_err(|e| GenesisError::InvalidFormat(format!("{}", e)))?;
+            .map_err(|e| ChainError::GenesisError(format!("{}", e)))?;
         Ok(genesis)
     }
 
-    pub fn validate(&self) -> Result<Self, GenesisError> {
+    pub fn validate(&self) -> Result<Self, ChainError> {
         if self.initial_timestamp.is_empty() {
-            return Err(GenesisError::MissingField("initial_timestamp".to_string()));
+            return Err(ChainError::GenesisError(
+                "missing field: initial_timestamp".to_string(),
+            ));
         }
         if self.initial_key.is_empty() {
-            return Err(GenesisError::MissingField("initial_key".to_string()));
+            return Err(ChainError::GenesisError(
+                "missing field: initial_key".to_string(),
+            ));
         }
         self.initial_key()?;
         Ok(self.clone())
     }
 
-    pub fn initial_timestamp(&self) -> Result<BlockTimestamp, GenesisError> {
+    pub fn initial_timestamp(&self) -> Result<BlockTimestamp, ChainError> {
         let timestamp = self
             .initial_timestamp
             .parse::<DateTime<Utc>>()
-            .map_err(|_| GenesisError::InvalidFormat("Invalid timestamp format".to_string()))?;
+            .map_err(|_| ChainError::GenesisError("invalid timestamp format".to_string()))?;
         Ok(timestamp.into())
     }
 
-    pub fn initial_key(&self) -> Result<PublicKey, GenesisError> {
-        PublicKey::from_hex(&self.initial_key)
-            .map_err(|_| GenesisError::InvalidFormat("Invalid public key format".to_string()))
+    pub fn initial_key(&self) -> Result<PublicKey, ChainError> {
+        PublicKey::from_str(&self.initial_key)
     }
 }

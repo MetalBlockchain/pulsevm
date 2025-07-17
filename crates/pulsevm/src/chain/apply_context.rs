@@ -107,7 +107,6 @@ impl ApplyContext {
     }
 
     pub fn exec_one(&mut self) -> Result<(), ChainError> {
-        let code_hash = Id::zero();
         let receiver_account = self
             .session
             .borrow_mut()
@@ -131,11 +130,11 @@ impl ApplyContext {
         }
 
         // Does the receiver account have a contract deployed?
-        if code_hash != Id::zero() {
+        if receiver_account.code_hash != Id::zero() {
             let mut runtime = self.wasm_runtime.write().map_err(|e| {
                 ChainError::TransactionError(format!("failed to get immutable wasm runtime: {}", e))
             })?;
-            runtime.run(self.receiver, self.action.clone(), self.clone(), code_hash)?;
+            runtime.run(self.receiver, self.action.clone(), self.clone(), receiver_account.code_hash)?;
         }
 
         Ok(())
