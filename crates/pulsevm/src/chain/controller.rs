@@ -143,10 +143,6 @@ impl Controller {
                 "initializing pulse account with default key: {}",
                 default_key.0
             );
-            println!(
-                "initializing pulse account with default key: {}",
-                default_key.0
-            );
             let default_authority = Authority::new(1, vec![KeyWeight::new(default_key, 1)], vec![]);
             // Create the pulse@owner permission
             let owner_permission = AuthorizationManager::create_permission(
@@ -427,11 +423,9 @@ mod tests {
                 "max_inline_action_size": 4096
             }
         });
-        println!("Genesis JSON: {}", genesis_json);
         let genesis_bytes = genesis_json.to_string().into_bytes();
         let temp_dir_name = format!("db_{}.pulsevm", Utc::now().format("%Y%m%d%H%M%S"));
         let temp_path = temp_dir().join(Path::new(&temp_dir_name));
-        println!("Temp path: {}", temp_path.to_str().unwrap());
         controller
             .initialize(
                 &genesis_bytes.to_vec(),
@@ -450,8 +444,12 @@ mod tests {
                     serialize(&NewAccount::new(
                         Name::from_str("pulse").unwrap(),
                         Name::from_str("glenn").unwrap(),
-                        Authority::new(1, vec![], vec![]),
-                        Authority::new(1, vec![], vec![]),
+                        Authority::new(1, vec![
+                            KeyWeight::new(private_key.public_key(), 1),
+                        ], vec![]),
+                        Authority::new(1, vec![
+                            KeyWeight::new(private_key.public_key(), 1),
+                        ], vec![]),
                     )),
                     vec![PermissionLevel::new(
                         Name::from_str("pulse").unwrap(),

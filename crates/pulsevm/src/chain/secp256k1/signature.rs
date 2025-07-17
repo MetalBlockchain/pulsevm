@@ -67,7 +67,7 @@ impl Deserialize for Signature {
 
 #[cfg(test)]
 mod tests {
-    use pulsevm_serialization::{serialize, Deserialize};
+    use pulsevm_serialization::{Deserialize, serialize};
     use secp256k1::hashes::{Hash, sha256};
 
     use crate::chain::{PrivateKey, Signature};
@@ -75,14 +75,16 @@ mod tests {
     #[test]
     fn test_signature_recovery() {
         let private_key = PrivateKey::random();
-        let signature = private_key.sign(b"test");
+        let digest = sha256::Hash::hash(b"test");
+        let signature = private_key.sign(&digest);
         let digest = sha256::Hash::hash(b"test");
         let public_key = signature
             .recover_public_key(&digest)
             .expect("Failed to recover public key");
         assert_eq!(public_key, private_key.public_key());
         let serialized = serialize(&signature);
-        let deserialized = Signature::deserialize(&serialized, &mut 0).expect("Failed to deserialize signature");
+        let deserialized =
+            Signature::deserialize(&serialized, &mut 0).expect("Failed to deserialize signature");
         assert_eq!(signature, deserialized);
     }
 }

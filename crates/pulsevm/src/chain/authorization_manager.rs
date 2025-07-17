@@ -452,7 +452,6 @@ mod tests {
         let shared_db = Arc::new(Mutex::new(Database::temporary(path).unwrap()));
         let our_db = shared_db.clone();
         let db = our_db.try_lock().unwrap();
-        println!("Database created at: {:?}", path);
         let mut undo_session = db.undo_session().unwrap();
         let owner_permission = Permission::new(
             0,
