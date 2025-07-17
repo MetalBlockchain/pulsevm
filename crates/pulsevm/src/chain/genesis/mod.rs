@@ -3,6 +3,7 @@ use core::str;
 use pulsevm_serialization::Deserialize as PulseDeserialize;
 use pulsevm_serialization::Serialize as PulseSerialize;
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 use std::{error::Error, fmt};
 
 use super::{PublicKey, block::BlockTimestamp};
@@ -79,7 +80,7 @@ impl Genesis {
     }
 
     pub fn initial_key(&self) -> Result<PublicKey, GenesisError> {
-        PublicKey::from_hex(&self.initial_key)
+        PublicKey::from_str(&self.initial_key)
             .map_err(|_| GenesisError::InvalidFormat("Invalid public key format".to_string()))
     }
 }

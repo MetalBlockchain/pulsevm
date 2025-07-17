@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use prost_types::Timestamp;
 use pulsevm_chainbase::{ChainbaseObject, SecondaryIndex, SecondaryKey};
 use pulsevm_serialization::{Deserialize, Serialize, serialize};
+use secp256k1::hashes::{Hash, sha256};
 
 use super::{Id, Transaction};
 
@@ -72,7 +73,8 @@ impl Block {
 
     pub fn id(&self) -> Id {
         let serialized = serialize(self);
-        Id::from_sha256(&serialized)
+        let hash = sha256::Hash::hash(&serialized);
+        Id::from_sha256(&hash)
     }
 
     pub fn bytes(&self) -> Vec<u8> {

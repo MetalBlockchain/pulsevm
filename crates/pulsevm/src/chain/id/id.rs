@@ -2,7 +2,7 @@ use core::fmt;
 use std::str::FromStr;
 
 use pulsevm_serialization::{Deserialize, Serialize};
-use sha2::Digest;
+use secp256k1::hashes::sha256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub struct Id(pub [u8; 32]);
@@ -16,10 +16,10 @@ impl Id {
         Id([0u8; 32])
     }
 
-    pub fn from_sha256(bytes: &[u8]) -> Self {
-        let mut buf = [0u8; 32];
-        buf.copy_from_slice(sha2::Sha256::digest(&bytes).as_slice());
-        Id(buf)
+    pub fn from_sha256(hash: &sha256::Hash) -> Self {
+        let mut id = [0u8; 32];
+        id.copy_from_slice(hash.as_ref());
+        Id(id)
     }
 }
 

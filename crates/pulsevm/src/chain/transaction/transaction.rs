@@ -1,7 +1,10 @@
 use std::collections::HashSet;
 
 use pulsevm_serialization::{Deserialize, Serialize};
-use secp256k1::{Message, Secp256k1};
+use secp256k1::{
+    Message, Secp256k1,
+    hashes::{Hash, sha256},
+};
 
 use crate::chain::{Id, PrivateKey, PublicKey, Signature, error::ChainError};
 
@@ -26,20 +29,29 @@ impl Transaction {
     pub fn id(&self) -> Id {
         let mut bytes: Vec<u8> = Vec::new();
         self.serialize(&mut bytes);
-        Id::from_sha256(&bytes)
+        let digest = sha256::Hash::hash(&bytes);
+        Id::from_sha256(&digest)
+    }
+
+    pub fn digest(&self) -> sha256::Hash {
+        let mut bytes: Vec<u8> = Vec::new();
+        self.unsigned_tx.serialize(&mut bytes);
+        sha256::Hash::hash(&bytes)
     }
 
     #[must_use]
     pub fn recovered_keys(&self) -> Result<HashSet<PublicKey>, ChainError> {
         let mut recovered_keys: HashSet<PublicKey> = HashSet::new();
-        let mut tx_data: Vec<u8> = Vec::new();
-        self.unsigned_tx.serialize(&mut tx_data);
+        let digest = self.digest();
+
         for signature in self.signatures.iter() {
             let public_key = signature
-                .recover_public_key(&tx_data)
+                .recover_public_key(&digest)
                 .map_err(|e| ChainError::SignatureRecoverError(format!("{}", e)))?;
+            println!("Recovered public key: {}", public_key.to_string());
             recovered_keys.insert(public_key);
         }
+
         Ok(recovered_keys)
     }
 

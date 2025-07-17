@@ -429,10 +429,7 @@ mod tests {
         });
         println!("Genesis JSON: {}", genesis_json);
         let genesis_bytes = genesis_json.to_string().into_bytes();
-        let temp_dir_name = format!(
-            "db_{}.pulsevm",
-            Utc::now().format("%Y%m%d%H%M%S")
-        );
+        let temp_dir_name = format!("db_{}.pulsevm", Utc::now().format("%Y%m%d%H%M%S"));
         let temp_path = temp_dir().join(Path::new(&temp_dir_name));
         println!("Temp path: {}", temp_path.to_str().unwrap());
         controller

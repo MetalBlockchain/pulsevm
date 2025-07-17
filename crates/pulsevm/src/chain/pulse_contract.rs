@@ -4,6 +4,7 @@ use std::{
 };
 
 use pulsevm_chainbase::UndoSession;
+use secp256k1::hashes::{Hash, sha256};
 use wasmtime::component::Resource;
 
 use crate::chain::{AuthorizationManager, resource_limits::ResourceLimitsManager};
@@ -123,7 +124,8 @@ pub fn setcode(context: &mut ApplyContext) -> Result<(), ChainError> {
     let code_size = act.code.len() as u64;
 
     if code_size > 0 {
-        code_hash = Id::from_sha256(act.code.as_slice());
+        let digest = sha256::Hash::hash(act.code.as_slice());
+        code_hash = Id::from_sha256(&digest);
         // TODO: validate wasm
     }
 

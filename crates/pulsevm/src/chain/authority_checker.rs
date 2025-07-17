@@ -72,6 +72,7 @@ impl<'a> AuthorityChecker<'a> {
     }
 
     pub fn visit_key_weight(&mut self, key: &KeyWeight) -> Result<u16, ChainError> {
+        println!("Visiting key: {:?}", self.provided_keys);
         if self.provided_keys.contains(key.key()) {
             self.used_keys.insert(key.key().clone());
             return Ok(key.weight());

@@ -432,6 +432,7 @@ impl AuthorizationManager {
 mod tests {
     use std::{
         path::Path,
+        str::FromStr,
         sync::{Arc, Mutex},
     };
 
@@ -461,7 +462,7 @@ mod tests {
             Authority::new(
                 1,
                 vec![KeyWeight::new(
-                    PublicKey::from_hex(
+                    PublicKey::from_str(
                         "027f4dbe05a88d4c3974cec8d03f192c96a9813ea4d60811c4e68a2d459842497c",
                     )
                     .unwrap(),
