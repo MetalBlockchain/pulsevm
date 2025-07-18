@@ -1,18 +1,17 @@
 use std::{
     cell::RefCell,
+    cmp::min,
     collections::{HashMap, HashSet, VecDeque},
     hash::Hash,
     rc::Rc,
     sync::{Arc, RwLock},
 };
 
+use jsonrpsee::tracing::field::Iter;
 use pulsevm_chainbase::UndoSession;
 
 use crate::chain::{
-    AuthorizationManager, CODE_NAME,
-    authority::{Permission, PermissionLevel},
-    pulse_assert,
-    wasm_runtime::WasmRuntime,
+    authority::{Permission, PermissionLevel}, pulse_assert, table, wasm_runtime::WasmRuntime, AuthorizationManager, IteratorCache, KeyValue, KeyValueByScopePrimaryIndex, Table, TableByCodeScopeTableIndex, CODE_NAME
 };
 
 use super::{
@@ -35,6 +34,7 @@ pub struct ApplyContext {
     notified: Rc<RefCell<VecDeque<(Name, u32)>>>, // List of notified accounts
     inline_actions: Rc<RefCell<Vec<u32>>>,        // List of inline actions
     account_ram_deltas: Rc<RefCell<HashMap<Name, i64>>>, // RAM usage deltas for accounts
+    keyval_cache: Rc<RefCell<IteratorCache<KeyValue>>>, // Cache for iterators
 }
 
 impl ApplyContext {
@@ -62,6 +62,7 @@ impl ApplyContext {
             notified: Rc::new(RefCell::new(VecDeque::new())),
             inline_actions: Rc::new(RefCell::new(Vec::new())),
             account_ram_deltas: Rc::new(RefCell::new(HashMap::new())),
+            keyval_cache: Rc::new(RefCell::new(IteratorCache::new())),
         })
     }
 
@@ -134,7 +135,12 @@ impl ApplyContext {
             let mut runtime = self.wasm_runtime.write().map_err(|e| {
                 ChainError::TransactionError(format!("failed to get immutable wasm runtime: {}", e))
             })?;
-            runtime.run(self.receiver, self.action.clone(), self.clone(), receiver_account.code_hash)?;
+            runtime.run(
+                self.receiver,
+                self.action.clone(),
+                self.clone(),
+                receiver_account.code_hash,
+            )?;
         }
 
         Ok(())
@@ -307,5 +313,181 @@ impl ApplyContext {
         self.action = self.trx_context.get_action_trace(self.action_ordinal)?.act;
 
         Ok(scheduled_action_ordinal)
+    }
+
+    pub fn db_find_i64(
+        &self,
+        code: Name,
+        scope: Name,
+        table: Name,
+        id: u64,
+    ) -> Result<i32, ChainError> {
+        let table = self.find_table(code, scope, table)?;
+
+        if table.is_none() {
+            return Ok(-1);
+        }
+
+        let table = table.unwrap();
+        let mut keyval_cache = self.keyval_cache.borrow_mut();
+        let table_end_itr = keyval_cache.cache_table(&table);
+        let obj = self
+            .session
+            .borrow_mut()
+            .find_by_secondary::<KeyValue, KeyValueByScopePrimaryIndex>((table.id, id))
+            .map_err(|e| ChainError::TransactionError(format!("failed to find keyval: {}", e)))?;
+
+        match obj {
+            Some(keyval) => Ok(keyval_cache.add(&keyval)),
+            None => Ok(table_end_itr),
+        }
+    }
+
+    pub fn db_store_i64(
+        &mut self,
+        code: Name,
+        scope: Name,
+        table: Name,
+        payer: Name,
+        primary_key: u64,
+        data: &Vec<u8>,
+    ) -> Result<i32, ChainError> {
+        let mut table = self.find_or_create_table(code, scope, table, payer)?;
+        pulse_assert(
+            !payer.empty(),
+            ChainError::TransactionError(format!(
+                "must specify a valid account to pay for new record"
+            )),
+        )?;
+        let mut session = self.session.borrow_mut();
+        let id = session.generate_id::<KeyValue>()?;
+        let key_value = KeyValue::new(id, table.id, primary_key, payer, data.clone());
+        session
+            .insert(&key_value)
+            .map_err(|e| ChainError::TransactionError(format!("failed to insert keyval: {}", e)))?;
+        session.modify(&mut table, |t| {
+            t.count += 1;
+        })?;
+        // TODO: Update payer's RAM usage
+
+        let mut keyval_cache = self.keyval_cache.borrow_mut();
+        keyval_cache.cache_table(&table);
+        return Ok(keyval_cache.add(&key_value));
+    }
+
+    pub fn find_table(
+        &self,
+        code: Name,
+        scope: Name,
+        table: Name,
+    ) -> Result<Option<Table>, ChainError> {
+        let mut session = self.session.borrow_mut();
+        let table = session
+            .find_by_secondary::<Table, TableByCodeScopeTableIndex>((code, scope, table))
+            .map_err(|e| ChainError::TransactionError(format!("failed to find table: {}", e)))?;
+        Ok(table)
+    }
+
+    pub fn db_get_i64(
+        &self,
+        iterator: i32,
+        buffer: &mut Vec<u8>,
+        buffer_size: usize,
+    ) -> Result<i32, ChainError> {
+        let keyval_cache = self.keyval_cache.borrow();
+        let obj = keyval_cache.get(iterator)?;
+        let s = obj.value.len();
+
+        if buffer_size == 0 {
+            return Ok(s as i32);
+        }
+
+        let copy_size = min(buffer_size, s);
+        buffer.copy_from_slice(&obj.value[..copy_size]);
+        return Ok(copy_size as i32);
+    }
+
+    pub fn db_update_i64(
+        &mut self,
+        iterator: i32,
+        payer: Name,
+        data: &Vec<u8>,
+    ) -> Result<(), ChainError> {
+        let keyval_cache = self.keyval_cache.borrow();
+        let obj = keyval_cache.get(iterator)?;
+
+        let table_obj = keyval_cache.get_table(obj.table_id)?;
+        pulse_assert(
+            table_obj.code == self.receiver,
+            ChainError::TransactionError(format!("db access violation",)),
+        )?;
+
+        let payer = if payer.empty() {
+            obj.payer.clone()
+        } else {
+            payer
+        };
+
+        // TODO: Update payer's RAM usage
+
+        let mut session = self.session.borrow_mut();
+        session.modify(&mut obj.clone(), |kv| {
+            kv.payer = payer;
+            kv.value = data.clone();
+        })?;
+        Ok(())
+    }
+
+    pub fn db_remove_i64(&mut self, iterator: i32) -> Result<(), ChainError> {
+        let mut keyval_cache = self.keyval_cache.borrow_mut();
+        let obj = keyval_cache.get(iterator)?;
+
+        let table_obj = keyval_cache.get_table(obj.table_id)?;
+        pulse_assert(
+            table_obj.code == self.receiver,
+            ChainError::TransactionError(format!("db access violation",)),
+        )?;
+
+        // TODO: Update payer's RAM usage
+
+        let mut session = self.session.borrow_mut();
+        session.remove(obj.clone())?;
+        session.modify(&mut table_obj.clone(), |t| {
+            t.count -= 1;
+        })?;
+
+        if table_obj.count == 0 {
+            // If the table is empty, we can remove it
+            session.remove(table_obj.clone())?;
+        }
+
+        keyval_cache.remove(iterator)?;
+
+        Ok(())
+    }
+
+    pub fn find_or_create_table(
+        &mut self,
+        code: Name,
+        scope: Name,
+        table: Name,
+        payer: Name,
+    ) -> Result<Table, ChainError> {
+        let mut session = self.session.borrow_mut();
+        let existing_tid = session
+            .find_by_secondary::<Table, TableByCodeScopeTableIndex>((code, scope, table))
+            .map_err(|e| ChainError::TransactionError(format!("failed to find table: {}", e)))?;
+        if let Some(existing_table) = existing_tid {
+            return Ok(existing_table);
+        }
+        // TODO: Update payer's RAM usage
+        let id = session.generate_id::<Table>()?;
+        let table = Table::new(
+            id, code, scope, table, payer, 0, // Initial count is 0
+        );
+        session
+            .insert(&table)
+            .map_err(|e| ChainError::TransactionError(format!("failed to insert table: {}", e)))?;
+        Ok(table)
     }
 }

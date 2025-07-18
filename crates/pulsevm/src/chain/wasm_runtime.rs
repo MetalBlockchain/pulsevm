@@ -4,9 +4,9 @@ use lru::LruCache;
 use wasmtime::{Config, Engine, IntoFunc, Linker, Module, Store, Strategy};
 
 use crate::chain::{
-    Action, Name,
-    apply_context::ApplyContext,
-    webassembly::{require_auth2, require_recipient},
+    apply_context::ApplyContext, webassembly::{
+        db_find_i64, db_get_i64, db_remove_i64, db_store_i64, db_update_i64, get_self, pulse_assert, read_action_data, require_auth2, require_recipient
+    }, Action, Name
 };
 
 use super::{
@@ -89,7 +89,9 @@ impl WasmRuntime {
         let mut linker = Linker::<WasmContext>::new(&engine);
         // Action functions
         Self::add_host_function(&mut linker, "env", "action_data_size", action_data_size())?;
+        Self::add_host_function(&mut linker, "env", "read_action_data", read_action_data())?;
         Self::add_host_function(&mut linker, "env", "current_receiver", current_receiver())?;
+        Self::add_host_function(&mut linker, "env", "get_self", get_self())?;
         // Authorization functions
         Self::add_host_function(&mut linker, "env", "require_auth", require_auth())?;
         Self::add_host_function(&mut linker, "env", "has_auth", has_auth())?;
@@ -103,6 +105,14 @@ impl WasmRuntime {
         Self::add_host_function(&mut linker, "env", "memset", memset())?;
         // Transaction functions
         Self::add_host_function(&mut linker, "env", "send_inline", send_inline())?;
+        // Database functions
+        Self::add_host_function(&mut linker, "env", "db_find_i64", db_find_i64())?;
+        Self::add_host_function(&mut linker, "env", "db_store_i64", db_store_i64())?;
+        Self::add_host_function(&mut linker, "env", "db_get_i64", db_get_i64())?;
+        Self::add_host_function(&mut linker, "env", "db_update_i64", db_update_i64())?;
+        Self::add_host_function(&mut linker, "env", "db_remove_i64", db_remove_i64())?;
+        // System functions
+        Self::add_host_function(&mut linker, "env", "pulse_assert", pulse_assert())?;
 
         Ok(Self {
             engine: engine,
@@ -146,7 +156,7 @@ impl WasmRuntime {
             self.code_cache.put(code_hash, module);
         }
 
-        let context = WasmContext::new(receiver, action, apply_context);
+        let context = WasmContext::new(receiver, action.clone(), apply_context);
         let mut store = Store::new(&self.engine, context);
         let module = self.code_cache.get(&code_hash).ok_or_else(|| {
             ChainError::WasmRuntimeError(format!("wasm module not found in cache: {}", code_hash))
@@ -156,10 +166,10 @@ impl WasmRuntime {
             .instantiate(&mut store, &module)
             .map_err(|e| ChainError::WasmRuntimeError(e.to_string()))?;
         let apply_func = instance
-            .get_typed_func::<(), ()>(&mut store, "run")
+            .get_typed_func::<(u64, u64, u64), ()>(&mut store, "apply")
             .map_err(|e| ChainError::WasmRuntimeError(e.to_string()))?;
         apply_func
-            .call(&mut store, ())
+            .call(&mut store, (receiver.as_u64(), action.account().as_u64(), action.name().as_u64()))
             .map_err(|e| ChainError::WasmRuntimeError(format!("apply error: {}", e.to_string())))?;
         Ok(())
     }

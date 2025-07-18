@@ -58,6 +58,9 @@ pub use service::*;
 mod secp256k1;
 pub use secp256k1::*;
 
+mod table;
+pub use table::*;
+
 mod transaction_context;
 pub use transaction_context::TransactionContext;
 
@@ -66,3 +69,6 @@ pub use utils::*;
 
 mod wasm_runtime;
 mod webassembly;
+
+mod iterator_cache;
+pub use iterator_cache::IteratorCache;

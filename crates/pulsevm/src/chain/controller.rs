@@ -460,12 +460,7 @@ mod tests {
                 vec![Action::new(
                     Name::from_str("pulse").unwrap(),
                     Name::from_str("setcode").unwrap(),
-                    serialize(&SetCode::new(
-                        account,
-                        0,
-                        0,
-                        wasm_bytes,
-                    )),
+                    serialize(&SetCode::new(account, 0, 0, wasm_bytes)),
                     vec![PermissionLevel::new(
                         account,
                         Name::from_str("active").unwrap(),
@@ -509,8 +504,13 @@ mod tests {
             &create_account(&private_key, Name::from_str("glenn")?),
         )?;
 
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
-        let pulse_token_contract = fs::read(root.join(Path::new("reference_contracts/pulse_token.wasm"))).unwrap();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let pulse_token_contract =
+            fs::read(root.join(Path::new("reference_contracts/pulse_token.wasm"))).unwrap();
         controller.execute_transaction(
             undo_session.clone(),
             &set_code(&private_key, Name::from_str("glenn")?, pulse_token_contract),
@@ -518,9 +518,13 @@ mod tests {
 
         controller.execute_transaction(
             undo_session.clone(),
-            &call_contract(&private_key, Name::from_str("glenn")?, Name::from_str("issue")?),
+            &call_contract(
+                &private_key,
+                Name::from_str("glenn")?,
+                Name::from_str("issue")?,
+            ),
         )?;
-        
+
         Ok(())
     }
 }
