@@ -11,7 +11,11 @@ use jsonrpsee::tracing::field::Iter;
 use pulsevm_chainbase::UndoSession;
 
 use crate::chain::{
-    authority::{Permission, PermissionLevel}, pulse_assert, table, wasm_runtime::WasmRuntime, AuthorizationManager, IteratorCache, KeyValue, KeyValueByScopePrimaryIndex, Table, TableByCodeScopeTableIndex, CODE_NAME
+    AuthorizationManager, CODE_NAME, IteratorCache, KeyValue, KeyValueByScopePrimaryIndex, Table,
+    TableByCodeScopeTableIndex,
+    authority::{Permission, PermissionLevel},
+    pulse_assert, table,
+    wasm_runtime::WasmRuntime,
 };
 
 use super::{
@@ -108,16 +112,7 @@ impl ApplyContext {
     }
 
     pub fn exec_one(&mut self) -> Result<(), ChainError> {
-        let receiver_account = self
-            .session
-            .borrow_mut()
-            .get::<AccountMetadata>(self.receiver.clone())
-            .map_err(|e| {
-                ChainError::TransactionError(format!(
-                    "failed to get receiver account: {}",
-                    self.receiver.clone()
-                ))
-            })?;
+        let receiver_account = self.get_account_metadata(self.receiver)?;
 
         self.privileged = receiver_account.privileged;
 
@@ -345,14 +340,13 @@ impl ApplyContext {
 
     pub fn db_store_i64(
         &mut self,
-        code: Name,
         scope: Name,
         table: Name,
         payer: Name,
         primary_key: u64,
         data: &Vec<u8>,
     ) -> Result<i32, ChainError> {
-        let mut table = self.find_or_create_table(code, scope, table, payer)?;
+        let mut table = self.find_or_create_table(self.receiver, scope, table, payer)?;
         pulse_assert(
             !payer.empty(),
             ChainError::TransactionError(format!(
@@ -489,5 +483,15 @@ impl ApplyContext {
             .insert(&table)
             .map_err(|e| ChainError::TransactionError(format!("failed to insert table: {}", e)))?;
         Ok(table)
+    }
+
+    pub fn get_account_metadata(
+        &self,
+        account: Name,
+    ) -> Result<AccountMetadata, ChainError> {
+        let mut session = self.session.borrow_mut();
+        session
+            .get::<AccountMetadata>(account)
+            .map_err(|e| ChainError::TransactionError(format!("failed to get account metadata: {}", e)))
     }
 }

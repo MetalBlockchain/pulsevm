@@ -10,7 +10,8 @@ pub fn action_data_size() -> impl Fn(Caller<'_, WasmContext>) -> Result<i32, was
     }
 }
 
-pub fn read_action_data() -> impl Fn(Caller<'_, WasmContext>, u32, u32) -> Result<i32, wasmtime::Error> {
+pub fn read_action_data()
+-> impl Fn(Caller<'_, WasmContext>, u32, u32) -> Result<i32, wasmtime::Error> {
     |mut caller, buffer, buffer_size| {
         // Extract the data early
         let context = caller.data().apply_context();

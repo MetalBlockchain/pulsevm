@@ -1,6 +1,6 @@
 use wasmtime::Caller;
 
-use crate::chain::wasm_runtime::WasmContext;
+use crate::chain::{wasm_runtime::WasmContext, Name};
 
 pub fn db_find_i64()
 -> impl Fn(Caller<'_, WasmContext>, u64, u64, u64, u64) -> Result<i32, wasmtime::Error> {
@@ -13,7 +13,7 @@ pub fn db_find_i64()
 
 pub fn db_store_i64()
 -> impl Fn(Caller<'_, WasmContext>, u64, u64, u64, u64, u32, u32) -> Result<i32, wasmtime::Error> {
-    |mut caller, code, scope, table, id, buffer, buffer_size| {
+    |mut caller, scope, table, payer, id, buffer, buffer_size| {
         let memory = caller
             .get_export("memory")
             .and_then(|ext| ext.into_memory())
@@ -25,11 +25,10 @@ pub fn db_store_i64()
 
         let context = caller.data_mut().apply_context_mut();
         let result = context.db_store_i64(
-            code.into(),
             scope.into(),
             table.into(),
+            payer.into(),
             id.into(),
-            id,
             &src_bytes,
         )?;
         Ok(result)
@@ -70,12 +69,11 @@ pub fn db_update_i64()
     }
 }
 
-pub fn db_remove_i64()
--> impl Fn(Caller<'_, WasmContext>, i32) -> Result<(), wasmtime::Error> {
+pub fn db_remove_i64() -> impl Fn(Caller<'_, WasmContext>, i32) -> Result<(), wasmtime::Error> {
     |mut caller, itr| {
         let context = caller.data_mut().apply_context_mut();
         context.db_remove_i64(itr)?;
-        
+
         Ok(())
     }
 }

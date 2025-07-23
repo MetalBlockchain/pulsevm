@@ -49,7 +49,6 @@ impl RpcService {
         &self,
         request_body: &str,
     ) -> Result<String, serde_json::Error> {
-        println!("Received request: {}", request_body);
         // Make sure `RpcService` implements your API trait
         let module = self.clone().into_rpc();
 

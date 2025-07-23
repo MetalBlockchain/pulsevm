@@ -4,9 +4,12 @@ use lru::LruCache;
 use wasmtime::{Config, Engine, IntoFunc, Linker, Module, Store, Strategy};
 
 use crate::chain::{
-    apply_context::ApplyContext, webassembly::{
-        db_find_i64, db_get_i64, db_remove_i64, db_store_i64, db_update_i64, get_self, pulse_assert, read_action_data, require_auth2, require_recipient
-    }, Action, Name
+    Action, Name,
+    apply_context::ApplyContext,
+    webassembly::{
+        db_find_i64, db_get_i64, db_remove_i64, db_store_i64, db_update_i64, get_self,
+        pulse_assert, read_action_data, require_auth2, require_recipient,
+    },
 };
 
 use super::{
@@ -81,6 +84,8 @@ impl WasmRuntime {
         // Enable parallel compilation.
         config.parallel_compilation(true);
 
+        //config.coredump_on_trap(true);
+
         let engine = Engine::new(&config)
             .map_err(|e| ChainError::WasmRuntimeError(e.to_string()))
             .unwrap();
@@ -144,20 +149,24 @@ impl WasmRuntime {
         apply_context: ApplyContext,
         code_hash: Id,
     ) -> Result<(), ChainError> {
-        let session = apply_context.undo_session();
-        let mut session = session.borrow_mut();
+        // Different scope so session is released before running the wasm code.
+        {
+            let session = apply_context.undo_session();
+            let mut session = session.borrow_mut();
 
-        if !self.code_cache.contains(&code_hash) {
-            let code_object = session.get::<CodeObject>(code_hash).map_err(|e| {
-                ChainError::WasmRuntimeError(format!("failed to get wasm code: {}", e))
-            })?;
-            let module = Module::new(&self.engine, code_object.code)
-                .map_err(|e| ChainError::WasmRuntimeError(e.to_string()))?;
-            self.code_cache.put(code_hash, module);
+            if !self.code_cache.contains(&code_hash) {
+                let code_object = session.get::<CodeObject>(code_hash).map_err(|e| {
+                    ChainError::WasmRuntimeError(format!("failed to get wasm code: {}", e))
+                })?;
+                let module = Module::new(&self.engine, code_object.code)
+                    .map_err(|e| ChainError::WasmRuntimeError(e.to_string()))?;
+                self.code_cache.put(code_hash, module);
+            }
         }
 
         let context = WasmContext::new(receiver, action.clone(), apply_context);
         let mut store = Store::new(&self.engine, context);
+        store.set_fuel(100000); // Set a fuel limit for the execution
         let module = self.code_cache.get(&code_hash).ok_or_else(|| {
             ChainError::WasmRuntimeError(format!("wasm module not found in cache: {}", code_hash))
         })?;
@@ -169,8 +178,17 @@ impl WasmRuntime {
             .get_typed_func::<(u64, u64, u64), ()>(&mut store, "apply")
             .map_err(|e| ChainError::WasmRuntimeError(e.to_string()))?;
         apply_func
-            .call(&mut store, (receiver.as_u64(), action.account().as_u64(), action.name().as_u64()))
-            .map_err(|e| ChainError::WasmRuntimeError(format!("apply error: {}", e.to_string())))?;
+            .call(
+                &mut store,
+                (
+                    receiver.as_u64(),
+                    action.account().as_u64(),
+                    action.name().as_u64(),
+                ),
+            )
+            .map_err(|e| {
+                ChainError::WasmRuntimeError(format!("apply error: {}", e.root_cause()))
+            })?;
         Ok(())
     }
 }

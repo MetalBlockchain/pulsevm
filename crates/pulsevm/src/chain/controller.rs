@@ -26,7 +26,7 @@ use anyhow::Chain;
 use chrono::Utc;
 use pulsevm_chainbase::{Database, UndoSession};
 use pulsevm_proc_macros::name;
-use pulsevm_serialization::Deserialize;
+use pulsevm_serialization::{Deserialize, Serialize};
 use spdlog::info;
 use tokio::sync::RwLock as AsyncRwLock;
 
@@ -471,7 +471,12 @@ mod tests {
         .sign(&private_key)
     }
 
-    fn call_contract(private_key: &PrivateKey, account: Name, action: Name) -> Transaction {
+    fn call_contract(
+        private_key: &PrivateKey,
+        account: Name,
+        action: Name,
+        action_data: &Vec<u8>,
+    ) -> Transaction {
         Transaction::new(
             0,
             UnsignedTransaction::new(
@@ -479,7 +484,7 @@ mod tests {
                 vec![Action::new(
                     account,
                     action,
-                    vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+                    action_data.clone(),
                     vec![PermissionLevel::new(
                         account,
                         Name::from_str("active").unwrap(),
@@ -503,6 +508,10 @@ mod tests {
             undo_session.clone(),
             &create_account(&private_key, Name::from_str("glenn")?),
         )?;
+        controller.execute_transaction(
+            undo_session.clone(),
+            &create_account(&private_key, Name::from_str("marshall")?),
+        )?;
 
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -521,10 +530,116 @@ mod tests {
             &call_contract(
                 &private_key,
                 Name::from_str("glenn")?,
+                Name::from_str("create")?,
+                &serialize(&Create {
+                    issuer: Name::from_str("glenn")?,
+                    max_supply: Asset {
+                        amount: 1000000,
+                        symbol: Symbol(1162826500), // "PLUS" in ASCII
+                    },
+                }),
+            ),
+        )?;
+
+        controller.execute_transaction(
+            undo_session.clone(),
+            &call_contract(
+                &private_key,
+                Name::from_str("glenn")?,
                 Name::from_str("issue")?,
+                &serialize(&Issue {
+                    to: Name::from_str("glenn")?,
+                    quantity: Asset {
+                        amount: 1000000,
+                        symbol: Symbol(1162826500), // "PLUS" in ASCII
+                    },
+                    memo: "Initial transfer".to_string(),
+                }),
+            ),
+        )?;
+
+        controller.execute_transaction(
+            undo_session.clone(),
+            &call_contract(
+                &private_key,
+                Name::from_str("glenn")?,
+                Name::from_str("transfer")?,
+                &serialize(&Transfer {
+                    from: Name::from_str("glenn")?,
+                    to: Name::from_str("marshall")?,
+                    quantity: Asset {
+                        amount: 5000,
+                        symbol: Symbol(1162826500), // "PLUS" in ASCII
+                    },
+                    memo: "Initial transfer".to_string(),
+                }),
             ),
         )?;
 
         Ok(())
+    }
+}
+
+struct Create {
+    issuer: Name,
+    max_supply: Asset,
+}
+
+impl Serialize for Create {
+    fn serialize(&self, bytes: &mut Vec<u8>) {
+        self.issuer.serialize(bytes);
+        self.max_supply.serialize(bytes);
+    }
+}
+
+struct Asset {
+    /// The amount of the asset
+    pub amount: i64,
+    /// The symbol name of the asset
+    pub symbol: Symbol,
+}
+
+impl Serialize for Asset {
+    fn serialize(&self, bytes: &mut Vec<u8>) {
+        self.amount.serialize(bytes);
+        self.symbol.serialize(bytes);
+    }
+}
+
+struct Symbol(u64);
+
+impl Serialize for Symbol {
+    fn serialize(&self, bytes: &mut Vec<u8>) {
+        self.0.serialize(bytes);
+    }
+}
+
+struct Transfer {
+    from: Name,
+    to: Name,
+    quantity: Asset,
+    memo: String,
+}
+
+impl Serialize for Transfer {
+    fn serialize(&self, bytes: &mut Vec<u8>) {
+        self.from.serialize(bytes);
+        self.to.serialize(bytes);
+        self.quantity.serialize(bytes);
+        self.memo.serialize(bytes);
+    }
+}
+
+struct Issue {
+    to: Name,
+    quantity: Asset,
+    memo: String,
+}
+
+impl Serialize for Issue {
+    fn serialize(&self, bytes: &mut Vec<u8>) {
+        self.to.serialize(bytes);
+        self.quantity.serialize(bytes);
+        self.memo.serialize(bytes);
     }
 }
