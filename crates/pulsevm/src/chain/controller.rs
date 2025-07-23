@@ -8,7 +8,7 @@ use std::{
 };
 
 use crate::{
-    chain::{ACTIVE_NAME, Account, AccountMetadata, config::GlobalPropertyObject},
+    chain::{config::GlobalPropertyObject, Account, AccountMetadata, Asset, ACTIVE_NAME},
     mempool::Mempool,
 };
 
@@ -397,8 +397,7 @@ mod tests {
     use serde_json::json;
 
     use crate::chain::{
-        Action, NewAccount, PrivateKey, SetCode, UnsignedTransaction,
-        authority::{Permission, PermissionLevel},
+        authority::{Permission, PermissionLevel}, Action, NewAccount, PrivateKey, SetCode, Symbol, UnsignedTransaction
     };
 
     use super::*;
@@ -589,28 +588,6 @@ impl Serialize for Create {
     fn serialize(&self, bytes: &mut Vec<u8>) {
         self.issuer.serialize(bytes);
         self.max_supply.serialize(bytes);
-    }
-}
-
-struct Asset {
-    /// The amount of the asset
-    pub amount: i64,
-    /// The symbol name of the asset
-    pub symbol: Symbol,
-}
-
-impl Serialize for Asset {
-    fn serialize(&self, bytes: &mut Vec<u8>) {
-        self.amount.serialize(bytes);
-        self.symbol.serialize(bytes);
-    }
-}
-
-struct Symbol(u64);
-
-impl Serialize for Symbol {
-    fn serialize(&self, bytes: &mut Vec<u8>) {
-        self.0.serialize(bytes);
     }
 }
 

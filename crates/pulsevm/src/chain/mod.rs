@@ -7,6 +7,9 @@ pub const CODE_NAME: Name = Name::new(name!("pulse.code"));
 mod account;
 pub use account::*;
 
+mod asset;
+pub use asset::*;
+
 mod apply_context;
 
 mod authority;
