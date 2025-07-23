@@ -16,3 +16,6 @@ pub fn billable_size_v<T: BillableSize>() -> u64 {
 
 mod gpo;
 pub use gpo::GlobalPropertyObject;
+
+mod dgpo;
+pub use dgpo::DynamicGlobalPropertyObject;

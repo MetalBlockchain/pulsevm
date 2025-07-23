@@ -8,8 +8,8 @@ pub struct AccountMetadata {
     pub name: Name,
     pub recv_sequence: u64,
     pub auth_sequence: u64,
-    pub code_sequence: u64,
-    pub abi_sequence: u64,
+    pub code_sequence: u32,
+    pub abi_sequence: u32,
     pub code_hash: Id,
     pub last_code_update: u64,
     pub privileged: bool,
@@ -58,8 +58,8 @@ impl Deserialize for AccountMetadata {
         let name = Name::deserialize(data, pos)?;
         let recv_sequence = u64::deserialize(data, pos)?;
         let auth_sequence = u64::deserialize(data, pos)?;
-        let code_sequence = u64::deserialize(data, pos)?;
-        let abi_sequence = u64::deserialize(data, pos)?;
+        let code_sequence = u32::deserialize(data, pos)?;
+        let abi_sequence = u32::deserialize(data, pos)?;
         let code_hash = Id::deserialize(data, pos)?;
         let last_code_update = u64::deserialize(data, pos)?;
         let privileged = bool::deserialize(data, pos)?;

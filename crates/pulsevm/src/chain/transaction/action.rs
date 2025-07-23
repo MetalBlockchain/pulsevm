@@ -1,6 +1,7 @@
 use core::fmt;
 
 use pulsevm_serialization::{Deserialize, Serialize};
+use secp256k1::hashes::{Hash, sha256};
 
 use crate::chain::{Name, authority::PermissionLevel};
 
@@ -57,6 +58,12 @@ impl Action {
         let mut pos = 0;
         T::deserialize(&self.data, &mut pos)
     }
+
+    pub fn digest(&self) -> sha256::Hash {
+        let mut bytes: Vec<u8> = Vec::new();
+        self.serialize(&mut bytes);
+        sha256::Hash::hash(&bytes)
+    }
 }
 
 impl Serialize for Action {
@@ -81,4 +88,13 @@ impl Deserialize for Action {
             authorization,
         })
     }
+}
+
+pub fn generate_action_digest(act: &Action, action_return_value: Option<Vec<u8>>) -> sha256::Hash {
+    let mut bytes: Vec<u8> = Vec::new();
+    act.serialize(&mut bytes);
+    if let Some(return_value) = action_return_value {
+        return_value.serialize(&mut bytes);
+    }
+    sha256::Hash::hash(&bytes)
 }

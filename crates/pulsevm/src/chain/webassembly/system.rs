@@ -3,7 +3,8 @@ use wasmtime::Caller;
 
 use crate::chain::wasm_runtime::WasmContext;
 
-pub fn pulse_assert() -> impl Fn(Caller<'_, WasmContext>, u32, u32, u32) -> Result<(), wasmtime::Error> {
+pub fn pulse_assert()
+-> impl Fn(Caller<'_, WasmContext>, u32, u32, u32) -> Result<(), wasmtime::Error> {
     |mut caller, condition, msg, msg_len| {
         if condition != 1 {
             let memory = caller

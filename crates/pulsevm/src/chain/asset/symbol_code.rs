@@ -19,11 +19,7 @@ impl fmt::Display for ParseSymbolCodeError {
             Self::TooLong => {
                 write!(f, "symbol is too long, must be 7 chars or less")
             }
-            Self::BadChar(c) => write!(
-                f,
-                "symbol contains invalid character '{}'",
-                char::from(c)
-            ),
+            Self::BadChar(c) => write!(f, "symbol contains invalid character '{}'", char::from(c)),
         }
     }
 }

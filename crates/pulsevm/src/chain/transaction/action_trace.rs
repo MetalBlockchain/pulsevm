@@ -65,4 +65,12 @@ impl ActionTrace {
     pub fn action(&self) -> Action {
         self.act.clone()
     }
+
+    pub fn elapsed(&self) -> u32 {
+        self.elapsed
+    }
+
+    pub fn set_elapsed(&mut self, elapsed: u32) {
+        self.elapsed = elapsed;
+    }
 }

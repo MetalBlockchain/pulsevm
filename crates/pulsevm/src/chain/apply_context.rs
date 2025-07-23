@@ -7,15 +7,11 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use jsonrpsee::tracing::field::Iter;
+use chrono::{DateTime, Utc};
 use pulsevm_chainbase::UndoSession;
 
 use crate::chain::{
-    AuthorizationManager, CODE_NAME, IteratorCache, KeyValue, KeyValueByScopePrimaryIndex, Table,
-    TableByCodeScopeTableIndex,
-    authority::{Permission, PermissionLevel},
-    pulse_assert, table,
-    wasm_runtime::WasmRuntime,
+    authority::{Permission, PermissionLevel}, config::{billable_size_v, DynamicGlobalPropertyObject}, generate_action_digest, pulse_assert, table, wasm_runtime::WasmRuntime, ActionReceipt, ActionTrace, AuthorizationManager, IteratorCache, KeyValue, KeyValueByScopePrimaryIndex, Table, TableByCodeScopeTableIndex, CODE_NAME
 };
 
 use super::{
@@ -34,11 +30,13 @@ pub struct ApplyContext {
     first_receiver_action_ordinal: u32,
     action_ordinal: u32,
     privileged: bool,
+    start: i64,
 
     notified: Rc<RefCell<VecDeque<(Name, u32)>>>, // List of notified accounts
     inline_actions: Rc<RefCell<Vec<u32>>>,        // List of inline actions
     account_ram_deltas: Rc<RefCell<HashMap<Name, i64>>>, // RAM usage deltas for accounts
     keyval_cache: Rc<RefCell<IteratorCache<KeyValue>>>, // Cache for iterators
+    action_return_value: Rc<RefCell<Option<Vec<u8>>>>, // Return value of the action
 }
 
 impl ApplyContext {
@@ -62,11 +60,13 @@ impl ApplyContext {
             first_receiver_action_ordinal: 0,
             action_ordinal,
             privileged: false,
+            start: Utc::now().timestamp_micros(),
 
             notified: Rc::new(RefCell::new(VecDeque::new())),
             inline_actions: Rc::new(RefCell::new(Vec::new())),
             account_ram_deltas: Rc::new(RefCell::new(HashMap::new())),
             keyval_cache: Rc::new(RefCell::new(IteratorCache::new())),
+            action_return_value: Rc::new(RefCell::new(None)),
         })
     }
 
@@ -112,7 +112,7 @@ impl ApplyContext {
     }
 
     pub fn exec_one(&mut self) -> Result<(), ChainError> {
-        let receiver_account = self.get_account_metadata(self.receiver)?;
+        let mut receiver_account = self.get_account_metadata(self.receiver)?;
 
         self.privileged = receiver_account.privileged;
 
@@ -138,7 +138,35 @@ impl ApplyContext {
             )?;
         }
 
+        let act_digest =
+            generate_action_digest(&self.action, self.action_return_value.borrow().clone());
+        let first_receiver_account = if self.action.account() == self.receiver {
+            receiver_account.clone()
+        } else {
+            self.get_account_metadata(self.action.account())?
+        };
+        let mut trace = self.trx_context.get_action_trace(self.action_ordinal)?;
+        let mut receipt = ActionReceipt::new(
+            self.receiver,
+            act_digest.into(),
+            self.next_global_sequence()?,
+            self.next_recv_sequence(&mut receiver_account)?,
+            HashMap::new(),
+            first_receiver_account.code_sequence,
+            first_receiver_account.abi_sequence,
+        );
+
+        for auth in self.action.authorization() {
+            receipt.add_auth_sequence(auth.actor(), self.next_auth_sequence(&mut auth.actor())?);
+        }
+
+        self.finalize_trace(&mut trace);
+
         Ok(())
+    }
+
+    pub fn finalize_trace(&self, trace: &mut ActionTrace) {
+        trace.set_elapsed((Utc::now().timestamp_micros() - self.start) as u32);
     }
 
     pub fn get_action(&self) -> &Action {
@@ -197,7 +225,7 @@ impl ApplyContext {
         return false;
     }
 
-    pub fn add_ram_usage(&mut self, account: Name, ram_delta: i64) {
+    pub fn add_ram_usage(&self, account: Name, ram_delta: i64) {
         self.account_ram_deltas
             .borrow_mut()
             .entry(account)
@@ -353,6 +381,7 @@ impl ApplyContext {
                 "must specify a valid account to pay for new record"
             )),
         )?;
+
         let mut session = self.session.borrow_mut();
         let id = session.generate_id::<KeyValue>()?;
         let key_value = KeyValue::new(id, table.id, primary_key, payer, data.clone());
@@ -362,7 +391,9 @@ impl ApplyContext {
         session.modify(&mut table, |t| {
             t.count += 1;
         })?;
-        // TODO: Update payer's RAM usage
+
+        let billable_size = data.len() as i64 + billable_size_v::<KeyValue>() as i64;
+        self.update_db_usage(payer, billable_size)?;
 
         let mut keyval_cache = self.keyval_cache.borrow_mut();
         keyval_cache.cache_table(&table);
@@ -416,6 +447,10 @@ impl ApplyContext {
             ChainError::TransactionError(format!("db access violation",)),
         )?;
 
+        let overhead = billable_size_v::<KeyValue>() as i64;
+        let old_size = obj.value.len() as i64 + overhead;
+        let new_size = data.len() as i64 + overhead;
+
         let payer = if payer.empty() {
             obj.payer.clone()
         } else {
@@ -423,6 +458,12 @@ impl ApplyContext {
         };
 
         // TODO: Update payer's RAM usage
+        if obj.payer != payer {
+            self.update_db_usage(obj.payer, -old_size)?;
+            self.update_db_usage(payer, new_size)?;
+        } else if old_size != new_size {
+            self.update_db_usage(obj.payer, new_size - old_size)?;
+        }
 
         let mut session = self.session.borrow_mut();
         session.modify(&mut obj.clone(), |kv| {
@@ -485,13 +526,76 @@ impl ApplyContext {
         Ok(table)
     }
 
-    pub fn get_account_metadata(
-        &self,
-        account: Name,
-    ) -> Result<AccountMetadata, ChainError> {
+    pub fn get_account_metadata(&self, account: Name) -> Result<AccountMetadata, ChainError> {
         let mut session = self.session.borrow_mut();
-        session
-            .get::<AccountMetadata>(account)
-            .map_err(|e| ChainError::TransactionError(format!("failed to get account metadata: {}", e)))
+        session.get::<AccountMetadata>(account).map_err(|e| {
+            ChainError::TransactionError(format!("failed to get account metadata: {}", e))
+        })
+    }
+
+    pub fn update_db_usage(&self, payer: Name, delta: i64) -> Result<(), ChainError> {
+        if delta > 0 {
+            // Do not allow charging RAM to other accounts during notify
+            if !(self.privileged || payer == self.receiver) {
+                self.require_authorization(payer, None).map_err(|_| {
+                    ChainError::TransactionError(format!(
+                        "cannot charge RAM to other accounts during notify"
+                    ))
+                })?;
+            }
+        }
+
+        self.add_ram_usage(payer, delta);
+
+        return Ok(());
+    }
+
+    pub fn set_action_return_value(&self, value: Vec<u8>) {
+        *self.action_return_value.borrow_mut() = Some(value);
+    }
+
+    pub fn next_recv_sequence(
+        &self,
+        receiver_account: &mut AccountMetadata,
+    ) -> Result<u64, ChainError> {
+        let mut session = self.session.borrow_mut();
+        let next_sequence = receiver_account.recv_sequence + 1;
+        session.modify(receiver_account, |am| {
+            am.recv_sequence = next_sequence;
+        })?;
+
+        Ok(next_sequence)
+    }
+
+    pub fn next_auth_sequence(
+        &self,
+        actor: &Name,
+    ) -> Result<u64, ChainError> {
+        let mut session = self.session.borrow_mut();
+        let mut amo = session.get::<AccountMetadata>(actor.clone())?;
+        let next_sequence = amo.auth_sequence + 1;
+        session.modify(&mut amo, |amo| {
+            amo.auth_sequence = next_sequence;
+        })?;
+
+        Ok(next_sequence)
+    }
+
+    pub fn next_global_sequence(
+        &self,
+    ) -> Result<u64, ChainError> {
+        let mut session = self.session.borrow_mut();
+        let dgpo = session.find::<DynamicGlobalPropertyObject>(0)?;
+
+        if let Some(mut dgpo) = dgpo {
+            let next_sequence = dgpo.global_action_sequence + 1;
+            session.modify(&mut dgpo, |dgpo| {
+                dgpo.global_action_sequence = next_sequence;
+            })?;
+            return Ok(next_sequence);
+        } else {
+            session.insert(&DynamicGlobalPropertyObject::new(1))?;
+            return Ok(1)
+        }
     }
 }

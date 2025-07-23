@@ -1,7 +1,7 @@
 use pulsevm_chainbase::{ChainbaseObject, SecondaryIndex, SecondaryKey};
 use pulsevm_serialization::{Deserialize, Serialize};
 
-use crate::chain::Name;
+use crate::chain::{Name, config::BillableSize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct KeyValue {
@@ -21,6 +21,12 @@ impl KeyValue {
             payer,
             value,
         }
+    }
+}
+
+impl BillableSize for KeyValue {
+    fn billable_size() -> u64 {
+        32 + 8 + 4 + 64
     }
 }
 

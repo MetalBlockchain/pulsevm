@@ -13,19 +13,24 @@ use super::{PublicKey, block::BlockTimestamp};
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash, Default)]
 pub struct ChainConfig {
     pub max_inline_action_size: u32,
+    pub max_action_return_value_size: u32,
 }
 
 impl PulseSerialize for ChainConfig {
     fn serialize(&self, bytes: &mut Vec<u8>) {
         pulsevm_serialization::Serialize::serialize(&self.max_inline_action_size, bytes);
+        pulsevm_serialization::Serialize::serialize(&self.max_action_return_value_size, bytes);
     }
 }
 
 impl PulseDeserialize for ChainConfig {
     fn deserialize(data: &[u8], pos: &mut usize) -> Result<Self, pulsevm_serialization::ReadError> {
         let max_inline_action_size = pulsevm_serialization::Deserialize::deserialize(data, pos)?;
+        let max_action_return_value_size =
+            pulsevm_serialization::Deserialize::deserialize(data, pos)?;
         Ok(ChainConfig {
             max_inline_action_size,
+            max_action_return_value_size,
         })
     }
 }

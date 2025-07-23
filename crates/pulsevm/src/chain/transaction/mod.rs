@@ -5,7 +5,7 @@ mod action_trace;
 pub use action_trace::ActionTrace;
 
 mod action;
-pub use action::Action;
+pub use action::{Action, generate_action_digest};
 
 mod transaction_receipt_header;
 pub use transaction_receipt_header::TransactionReceiptHeader;

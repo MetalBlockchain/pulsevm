@@ -8,7 +8,7 @@ use crate::chain::{
     apply_context::ApplyContext,
     webassembly::{
         db_find_i64, db_get_i64, db_remove_i64, db_store_i64, db_update_i64, get_self,
-        pulse_assert, read_action_data, require_auth2, require_recipient,
+        pulse_assert, read_action_data, require_auth2, require_recipient, set_action_return_value,
     },
 };
 
@@ -97,6 +97,12 @@ impl WasmRuntime {
         Self::add_host_function(&mut linker, "env", "read_action_data", read_action_data())?;
         Self::add_host_function(&mut linker, "env", "current_receiver", current_receiver())?;
         Self::add_host_function(&mut linker, "env", "get_self", get_self())?;
+        Self::add_host_function(
+            &mut linker,
+            "env",
+            "set_action_return_value",
+            set_action_return_value(),
+        )?;
         // Authorization functions
         Self::add_host_function(&mut linker, "env", "require_auth", require_auth())?;
         Self::add_host_function(&mut linker, "env", "has_auth", has_auth())?;

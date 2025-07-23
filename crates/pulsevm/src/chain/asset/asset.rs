@@ -17,7 +17,7 @@ impl fmt::Display for Asset {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let precision = self.symbol.precision();
         let symbol_code = self.symbol.code();
-        
+
         if precision == 0 {
             write!(f, "{} {}", self.amount, symbol_code)
         } else {

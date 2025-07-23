@@ -8,7 +8,7 @@ use std::{
 };
 
 use crate::{
-    chain::{config::GlobalPropertyObject, Account, AccountMetadata, Asset, ACTIVE_NAME},
+    chain::{ACTIVE_NAME, Account, AccountMetadata, Asset, config::GlobalPropertyObject},
     mempool::Mempool,
 };
 
@@ -397,7 +397,8 @@ mod tests {
     use serde_json::json;
 
     use crate::chain::{
-        authority::{Permission, PermissionLevel}, Action, NewAccount, PrivateKey, SetCode, Symbol, UnsignedTransaction
+        Action, NewAccount, PrivateKey, SetCode, Symbol, UnsignedTransaction,
+        authority::{Permission, PermissionLevel},
     };
 
     use super::*;
@@ -413,7 +414,8 @@ mod tests {
             "initial_timestamp": "2023-01-01T00:00:00Z",
             "initial_key": private_key.public_key().to_string(),
             "initial_configuration": {
-                "max_inline_action_size": 4096
+                "max_inline_action_size": 4096,
+                "max_action_return_value_size": 256,
             }
         });
         genesis.to_string().into_bytes()
