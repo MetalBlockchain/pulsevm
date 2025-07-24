@@ -136,8 +136,9 @@ pub struct BlockByHeightIndex;
 
 impl SecondaryIndex<Block> for BlockByHeightIndex {
     type Key = u64;
+    type Object = Block;
 
-    fn secondary_key(&self, object: &Block) -> Vec<u8> {
+    fn secondary_key(object: &Block) -> Vec<u8> {
         object.height.to_be_bytes().to_vec()
     }
 

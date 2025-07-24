@@ -11,7 +11,12 @@ use chrono::{DateTime, Utc};
 use pulsevm_chainbase::UndoSession;
 
 use crate::chain::{
-    authority::{Permission, PermissionLevel}, config::{billable_size_v, DynamicGlobalPropertyObject}, generate_action_digest, pulse_assert, table, wasm_runtime::WasmRuntime, ActionReceipt, ActionTrace, AuthorizationManager, IteratorCache, KeyValue, KeyValueByScopePrimaryIndex, Table, TableByCodeScopeTableIndex, CODE_NAME
+    ActionReceipt, ActionTrace, AuthorizationManager, CODE_NAME, IteratorCache, KeyValue,
+    KeyValueByScopePrimaryIndex, Table, TableByCodeScopeTableIndex,
+    authority::{Permission, PermissionLevel},
+    config::{DynamicGlobalPropertyObject, billable_size_v},
+    generate_action_digest, pulse_assert, table,
+    wasm_runtime::WasmRuntime,
 };
 
 use super::{
@@ -469,7 +474,10 @@ impl ApplyContext {
             ChainError::TransactionError(format!("db access violation",)),
         )?;
 
-        self.update_db_usage(obj.payer, -(obj.value.len() as i64 + billable_size_v::<KeyValue>() as i64))?;
+        self.update_db_usage(
+            obj.payer,
+            -(obj.value.len() as i64 + billable_size_v::<KeyValue>() as i64),
+        )?;
 
         let mut session = self.session.borrow_mut();
         session.remove(obj.clone())?;
@@ -485,6 +493,64 @@ impl ApplyContext {
         keyval_cache.remove(iterator)?;
 
         Ok(())
+    }
+
+    pub fn db_next_i64(&self, iterator: i32, primary: &mut u64) -> Result<i32, ChainError> {
+        if iterator < -1 {
+            return Ok(-1); // Cannot increment past end iterator of table
+        }
+
+        let session = self.session.borrow_mut();
+        let mut keyval_cache = self.keyval_cache.borrow_mut();
+        let obj = keyval_cache.get(iterator)?;
+        let mut idx = session.get_index::<KeyValue, KeyValueByScopePrimaryIndex>();
+
+        let mut itr = idx.iterator_to(obj)?;
+        let next_object = itr.next()?;
+
+        match next_object {
+            Some(next_object) => {
+                if next_object.table_id != obj.table_id {
+                    // If the primary key is the same, we are at the end of the table
+                    return Ok(keyval_cache.get_end_iterator_by_table_id(obj.table_id)?);
+                }
+
+                *primary = next_object.primary_key;
+
+                return Ok(keyval_cache.add(&next_object));
+            }
+            None => {
+                // No more objects in this table
+                return Ok(keyval_cache.get_end_iterator_by_table_id(obj.table_id)?);
+            }
+        }
+    }
+
+    pub fn db_previous_i64(&self, iterator: i32, primary: &mut u64) -> Result<i32, ChainError> {
+        let session = self.session.borrow_mut();
+        let mut keyval_cache = self.keyval_cache.borrow_mut();
+        let mut idx = session.get_index::<KeyValue, KeyValueByScopePrimaryIndex>();
+
+        if iterator < -1 {
+            let tab = keyval_cache.find_table_by_end_iterator(iterator)?.ok_or(
+                ChainError::TransactionError(format!("invalid end iterator")),
+            )?;
+        }
+
+        Ok(-1) // Not implemented, return -1 for now
+    }
+
+    pub fn db_end_i64(&self, code: Name, scope: Name, table: Name) -> Result<i32, ChainError> {
+        let tab = self.find_table(code, scope, table)?;
+
+        match tab {
+            Some(table) => {
+                let mut keyval_cache = self.keyval_cache.borrow_mut();
+                let end_itr = keyval_cache.cache_table(&table);
+                Ok(end_itr)
+            }
+            None => Ok(-1), // No table found, return end iterator
+        }
     }
 
     pub fn find_table(
@@ -566,10 +632,7 @@ impl ApplyContext {
         Ok(next_sequence)
     }
 
-    pub fn next_auth_sequence(
-        &self,
-        actor: &Name,
-    ) -> Result<u64, ChainError> {
+    pub fn next_auth_sequence(&self, actor: &Name) -> Result<u64, ChainError> {
         let mut session = self.session.borrow_mut();
         let mut amo = session.get::<AccountMetadata>(actor.clone())?;
         let next_sequence = amo.auth_sequence + 1;
@@ -580,9 +643,7 @@ impl ApplyContext {
         Ok(next_sequence)
     }
 
-    pub fn next_global_sequence(
-        &self,
-    ) -> Result<u64, ChainError> {
+    pub fn next_global_sequence(&self) -> Result<u64, ChainError> {
         let mut session = self.session.borrow_mut();
         let dgpo = session.find::<DynamicGlobalPropertyObject>(0)?;
 
@@ -594,7 +655,7 @@ impl ApplyContext {
             return Ok(next_sequence);
         } else {
             session.insert(&DynamicGlobalPropertyObject::new(1))?;
-            return Ok(1)
+            return Ok(1);
         }
     }
 }

@@ -125,8 +125,9 @@ pub struct PermissionByOwnerIndex;
 
 impl SecondaryIndex<Permission> for PermissionByOwnerIndex {
     type Key = (Name, Name);
+    type Object = Permission;
 
-    fn secondary_key(&self, object: &Permission) -> Vec<u8> {
+    fn secondary_key(object: &Permission) -> Vec<u8> {
         PermissionByOwnerIndex::secondary_key_as_bytes((object.owner, object.name))
     }
 

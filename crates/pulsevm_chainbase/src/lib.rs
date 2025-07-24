@@ -2,7 +2,11 @@ mod index;
 
 use fjall::{Config, Slice, TransactionalKeyspace, WriteTransaction};
 use pulsevm_serialization::{Deserialize, Serialize, serialize};
-use std::{collections::VecDeque, error::Error, path::Path, sync::Arc};
+use std::{
+    cell::RefCell, char, collections::VecDeque, error::Error, path::Path, rc::Rc, sync::Arc,
+};
+
+use crate::index::Index;
 
 pub trait ChainbaseObject: Default + Serialize + Deserialize {
     type PrimaryKey: Deserialize;
@@ -27,9 +31,10 @@ pub trait SecondaryIndex<C>
 where
     C: ChainbaseObject,
 {
+    type Object: ChainbaseObject;
     type Key: Clone;
 
-    fn secondary_key(&self, object: &C) -> Vec<u8>;
+    fn secondary_key(object: &Self::Object) -> Vec<u8>;
     fn secondary_key_as_bytes(key: Self::Key) -> Vec<u8>;
     fn index_name() -> &'static str;
 }
@@ -42,20 +47,20 @@ enum ObjectChange {
 
 #[derive(Clone)]
 pub struct Database {
-    keyspace: Arc<TransactionalKeyspace>,
+    keyspace: TransactionalKeyspace,
 }
 
 impl<'a> Database {
     #[must_use]
     pub fn new(path: &Path) -> Result<Self, fjall::Error> {
         Ok(Self {
-            keyspace: Arc::new(Config::new(path).open_transactional()?),
+            keyspace: Config::new(path).open_transactional()?,
         })
     }
 
     pub fn temporary(path: &Path) -> Result<Self, fjall::Error> {
         let config = Config::new(path).temporary(true);
-        let keyspace = Arc::new(config.open_transactional()?);
+        let keyspace = config.open_transactional()?;
         Ok(Self { keyspace })
     }
 
@@ -115,19 +120,28 @@ impl<'a> Database {
     }
 }
 
+#[derive(Clone)]
 pub struct UndoSession {
-    changes: VecDeque<ObjectChange>,
-    tx: WriteTransaction,
-    keyspace: Arc<TransactionalKeyspace>,
+    changes: Rc<RefCell<VecDeque<ObjectChange>>>,
+    tx: Rc<RefCell<WriteTransaction>>,
+    keyspace: TransactionalKeyspace,
 }
 
 impl UndoSession {
-    pub fn new(keyspace: Arc<TransactionalKeyspace>) -> Result<Self, Box<dyn Error>> {
+    pub fn new(keyspace: TransactionalKeyspace) -> Result<Self, Box<dyn Error>> {
         Ok(Self {
-            changes: VecDeque::new(),
-            tx: keyspace.write_tx()?,
+            changes: Rc::new(RefCell::new(VecDeque::new())),
+            tx: Rc::new(RefCell::new(keyspace.write_tx()?)),
             keyspace: keyspace.clone(),
         })
+    }
+
+    pub fn tx(&self) -> Rc<RefCell<WriteTransaction>> {
+        self.tx.clone()
+    }
+
+    pub fn keyspace(&self) -> TransactionalKeyspace {
+        self.keyspace.clone()
     }
 
     #[must_use]
@@ -138,9 +152,8 @@ impl UndoSession {
         let partition = self
             .keyspace
             .open_partition(T::table_name(), Default::default())?;
-        let res = self
-            .tx
-            .contains_key(&partition, T::primary_key_to_bytes(key))?;
+        let mut tx = self.tx.borrow_mut();
+        let res = tx.contains_key(&partition, T::primary_key_to_bytes(key))?;
         Ok(res)
     }
 
@@ -152,7 +165,8 @@ impl UndoSession {
         let partition = self
             .keyspace
             .open_partition(T::table_name(), Default::default())?;
-        let serialized = self.tx.get(&partition, T::primary_key_to_bytes(key))?;
+        let mut tx = self.tx.borrow_mut();
+        let serialized = tx.get(&partition, T::primary_key_to_bytes(key))?;
         if serialized.is_none() {
             return Ok(None);
         }
@@ -180,14 +194,15 @@ impl UndoSession {
         let partition = self
             .keyspace
             .open_partition(S::index_name(), Default::default())?;
-        let secondary_key = self.tx.get(&partition, S::secondary_key_as_bytes(key))?;
+        let mut tx = self.tx.borrow_mut();
+        let secondary_key = tx.get(&partition, S::secondary_key_as_bytes(key))?;
         if secondary_key.is_none() {
             return Ok(None);
         }
         let partition = self
             .keyspace
             .open_partition(T::table_name(), Default::default())?;
-        let serialized = self.tx.get(&partition, secondary_key.unwrap())?;
+        let serialized = tx.get(&partition, secondary_key.unwrap())?;
         if serialized.is_none() {
             return Ok(None);
         }
@@ -202,8 +217,9 @@ impl UndoSession {
             .keyspace
             .open_partition(T::table_name(), Default::default())?;
         let mut new_id = 0u64;
+        let mut tx = self.tx.borrow_mut();
         // Do we have a sequence for this table?
-        self.tx.fetch_update(&partition, "id", |v| {
+        tx.fetch_update(&partition, "id", |v| {
             if v.is_none() {
                 return Some(Slice::new(&0u64.to_be_bytes()));
             }
@@ -224,17 +240,19 @@ impl UndoSession {
         let partition = self
             .keyspace
             .open_partition(T::table_name(), Default::default())?;
-        let exists = self.tx.contains_key(&partition, &key)?;
+        let mut tx = self.tx.borrow_mut();
+        let exists = tx.contains_key(&partition, &key)?;
         if exists {
             return Err("Object already exists".into());
         }
-        self.changes.push_back(ObjectChange::New(key.to_owned()));
-        self.tx.insert(&partition, &key, serialized);
+        let mut changes = self.changes.borrow_mut();
+        changes.push_back(ObjectChange::New(key.to_owned()));
+        tx.insert(&partition, &key, serialized);
         for index in object.secondary_indexes() {
             let partition = self
                 .keyspace
                 .open_partition(index.index_name, Default::default())?;
-            self.tx.insert(&partition, &index.key, &key);
+            tx.insert(&partition, &index.key, &key);
         }
         Ok(())
     }
@@ -248,19 +266,21 @@ impl UndoSession {
         let partition = self
             .keyspace
             .open_partition(T::table_name(), Default::default())?;
-        let existing = self.tx.get(&partition, &key)?;
+        let mut tx = self.tx.borrow_mut();
+        let existing = tx.get(&partition, &key)?;
         if existing.is_none() {
             return Err("Object does not exist".into());
         }
         f(old);
         let serialized_old = existing.unwrap().to_vec();
         let serialized_new = serialize(old);
-        self.changes.push_back(ObjectChange::Modified(
+        let mut changes = self.changes.borrow_mut();
+        changes.push_back(ObjectChange::Modified(
             key.to_owned(),
             serialized_old,
             serialized_new.to_owned(),
         ));
-        self.tx.insert(&partition, &key, serialized_new);
+        tx.insert(&partition, &key, serialized_new);
         Ok(())
     }
 
@@ -269,34 +289,51 @@ impl UndoSession {
         let partition = self
             .keyspace
             .open_partition(T::table_name(), Default::default())?;
-        let old_value = self.tx.get(&partition, &key)?;
+        let mut tx = self.tx.borrow_mut();
+        let old_value = tx.get(&partition, &key)?;
         if old_value.is_none() {
             return Err("Object does not exist".into());
         }
-        self.changes.push_back(ObjectChange::Deleted(
+        let mut changes = self.changes.borrow_mut();
+        changes.push_back(ObjectChange::Deleted(
             key.to_owned(),
             old_value.unwrap().to_vec(),
         ));
-        self.tx.remove(&partition, &key);
+        tx.remove(&partition, &key);
         for index in object.secondary_indexes() {
             let partition = self
                 .keyspace
                 .open_partition(index.index_name, Default::default())?;
-            self.tx.remove(&partition, &index.key);
+            tx.remove(&partition, &index.key);
         }
         Ok(())
     }
 
     pub fn commit(self) -> Result<(), Box<dyn Error>> {
-        let result = self.tx.commit()?;
+        let tx = Rc::try_unwrap(self.tx)
+            .map_err(|_| "failed to unwrap Rc: multiple owners".to_string())?
+            .into_inner();
+        let result = tx.commit();
         if result.is_err() {
             return Err("failed to commit transaction".into());
         }
         Ok(())
     }
 
-    pub fn rollback(self) {
-        self.tx.rollback();
+    pub fn rollback(self) -> Result<(), Box<dyn Error>> {
+        let tx = Rc::try_unwrap(self.tx)
+            .map_err(|_| "failed to unwrap Rc: multiple owners".to_string())?
+            .into_inner();
+        tx.rollback();
+        Ok(())
+    }
+
+    pub fn get_index<C, S>(&self) -> Index<C, S>
+    where
+        C: ChainbaseObject,
+        S: SecondaryIndex<C>,
+    {
+        Index::<C, S>::new(self.clone(), self.keyspace.clone())
     }
 }
 
@@ -349,9 +386,10 @@ mod tests {
     pub struct TestObjectByNameIndex;
 
     impl SecondaryIndex<TestObject> for TestObjectByNameIndex {
+        type Object = TestObject;
         type Key = String;
 
-        fn secondary_key(&self, object: &TestObject) -> Vec<u8> {
+        fn secondary_key(object: &TestObject) -> Vec<u8> {
             TestObjectByNameIndex::secondary_key_as_bytes(object.name.clone())
         }
 

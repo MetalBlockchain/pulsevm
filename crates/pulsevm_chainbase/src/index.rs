@@ -1,100 +1,143 @@
-use std::{cell::RefCell, error::Error, marker::PhantomData, rc::Rc, sync::Arc};
+use std::ops::{Add, AddAssign, Deref};
 
-use fjall::{KvPair, Result as FjallResult, TransactionalPartitionHandle};
+use fjall::{PartitionHandle, Slice, TransactionalKeyspace, TransactionalPartitionHandle};
 
 use crate::{ChainbaseObject, SecondaryIndex, UndoSession};
 
-pub struct OrderedIndex<S, C>
+#[derive(Clone)]
+pub struct Index<C, S>
 where
     C: ChainbaseObject,
     S: SecondaryIndex<C>,
 {
-    session: Rc<RefCell<UndoSession>>,
-    _marker: std::marker::PhantomData<C>,
-    _marker2: std::marker::PhantomData<S>,
+    undo_session: UndoSession,
+    keyspace: TransactionalKeyspace,
+    __phantom: std::marker::PhantomData<(C, S)>,
 }
 
-impl<S, C> OrderedIndex<S, C>
+impl<C, S> Index<C, S>
 where
     C: ChainbaseObject,
     S: SecondaryIndex<C>,
 {
-    pub fn new(session: Rc<RefCell<UndoSession>>) -> Self {
-        OrderedIndex::<S, C> {
-            session,
-            _marker: PhantomData,
-            _marker2: PhantomData,
+    pub fn new(undo_session: UndoSession, keyspace: TransactionalKeyspace) -> Self {
+        Index::<C, S> {
+            undo_session,
+            keyspace,
+            __phantom: std::marker::PhantomData,
         }
     }
 
-    pub fn equal_range(
-        &self,
-        lower_bound: S::Key,
-        upper_bound: S::Key,
-    ) -> Result<RangeIterator<S, C>, Box<dyn Error>> {
-        Ok(RangeIterator::new(
-            self.session.clone(),
-            lower_bound,
-            upper_bound,
-        )?)
-    }
-}
-
-pub struct RangeIterator<S, C>
-where
-    C: ChainbaseObject,
-    S: SecondaryIndex<C>,
-{
-    partition: TransactionalPartitionHandle,
-    inner_iterator: Option<Box<dyn DoubleEndedIterator<Item = FjallResult<KvPair>>>>,
-    session: Rc<RefCell<UndoSession>>,
-    lower_bound: S::Key,
-    upper_bound: S::Key,
-}
-
-impl<'a, S, C> RangeIterator<S, C>
-where
-    C: ChainbaseObject,
-    S: SecondaryIndex<C>,
-{
-    pub fn new(
-        session: Rc<RefCell<UndoSession>>,
-        lower_bound: S::Key,
-        upper_bound: S::Key,
-    ) -> Result<Self, Box<dyn Error>> {
-        let partition = session
-            .borrow()
-            .keyspace
-            .open_partition(S::index_name(), Default::default())?;
-        Ok(RangeIterator::<S, C> {
-            partition: partition,
-            inner_iterator: None,
-            session: session,
-            lower_bound,
-            upper_bound,
+    pub fn iterator_to(
+        &mut self,
+        object: &S::Object,
+    ) -> Result<IndexIterator<C, S>, Box<dyn std::error::Error>> {
+        Ok(IndexIterator::<C, S> {
+            undo_session: self.undo_session.clone(),
+            partition: self
+                .keyspace
+                .open_partition(S::index_name(), Default::default())?,
+            current_key: S::secondary_key(object),
+            current_value: object.primary_key(),
+            __phantom: std::marker::PhantomData,
         })
     }
+}
 
-    /* pub fn next(&mut self) -> Result<Option<C::PrimaryKey>, Box<dyn Error>> {
-        if self.inner_iterator.is_none() {
-            let lower_bound_bytes = S::secondary_key_as_bytes(self.lower_bound.clone());
-            let upper_bound_bytes = S::secondary_key_as_bytes(self.upper_bound.clone());
-            let mut session = self.session.borrow_mut();
-            let iter = session
-                .tx
-                .range(&self.partition, lower_bound_bytes..=upper_bound_bytes);
-            self.inner_iterator = Some(Box::new(iter));
-        }
+pub struct IndexIterator<C, S>
+where
+    C: ChainbaseObject,
+    S: SecondaryIndex<C>,
+{
+    undo_session: UndoSession,
+    partition: TransactionalPartitionHandle,
+    current_key: Vec<u8>,
+    current_value: Vec<u8>,
+    __phantom: std::marker::PhantomData<(C, S)>,
+}
 
-        let iterator = self.inner_iterator.as_mut().unwrap();
-        let result = iterator.next();
+impl<C, S> IndexIterator<C, S>
+where
+    C: ChainbaseObject,
+    S: SecondaryIndex<C>,
+{
+    pub fn next(&mut self) -> Result<Option<S::Object>, Box<dyn std::error::Error>> {
+        let next = {
+            let tx = self.undo_session.tx();
+            let mut tx = tx.borrow_mut();
+            let mut range = tx.range(&self.partition, self.current_key.clone()..);
+            let next = range.next();
+            next
+        };
 
-        if result.is_some() {
-            let (_, value) = result.unwrap()?;
-            let key = C::primary_key_from_bytes(&value)?;
-            return Ok(Some(key));
+        if next.is_some() {
+            let (key, value) = next.unwrap().map_err(|e| {
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("failed to get next element: {}", e),
+                ))
+            })?;
+            self.current_key = key.to_vec();
+            self.current_value = value.to_vec();
+            if let Ok(object) = self.get_object() {
+                return Ok(Some(object));
+            } else {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "failed to get object from next element",
+                )));
+            }
         }
 
         Ok(None)
-    } */
+    }
+
+    pub fn previous(&mut self) -> Result<Option<S::Object>, Box<dyn std::error::Error>> {
+        let prev = {
+            let tx = self.undo_session.tx();
+            let mut tx = tx.borrow_mut();
+            let mut range = tx.range(&self.partition, ..self.current_key.clone()).rev();
+            let prev = range.next();
+            prev
+        };
+
+        if prev.is_some() {
+            let (key, value) = prev.unwrap().map_err(|e| {
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("failed to get previous element: {}", e),
+                ))
+            })?;
+            self.current_key = key.to_vec();
+            self.current_value = value.to_vec();
+            if let Ok(object) = self.get_object() {
+                return Ok(Some(object));
+            } else {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "failed to get object from previous element",
+                )));
+            }
+        }
+
+        Ok(None)
+    }
+
+    pub fn get_object(&mut self) -> Result<S::Object, Box<dyn std::error::Error>> {
+        return self
+            .undo_session
+            .get::<S::Object>(S::Object::primary_key_from_bytes(
+                self.current_value.as_slice(),
+            )?);
+    }
+}
+
+impl<C, S> PartialEq for IndexIterator<C, S>
+where
+    C: ChainbaseObject,
+    S: SecondaryIndex<C>,
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.current_key == other.current_key
+    }
 }

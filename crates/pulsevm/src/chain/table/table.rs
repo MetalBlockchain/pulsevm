@@ -89,8 +89,9 @@ pub struct TableByCodeScopeTableIndex;
 
 impl SecondaryIndex<Table> for TableByCodeScopeTableIndex {
     type Key = (Name, Name, Name);
+    type Object = Table;
 
-    fn secondary_key(&self, object: &Table) -> Vec<u8> {
+    fn secondary_key(object: &Table) -> Vec<u8> {
         TableByCodeScopeTableIndex::secondary_key_as_bytes((
             object.code.clone(),
             object.scope.clone(),

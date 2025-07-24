@@ -126,8 +126,9 @@ pub struct PermissionLinkByActionNameIndex;
 
 impl SecondaryIndex<PermissionLink> for PermissionLinkByActionNameIndex {
     type Key = (Name, Name, Name);
+    type Object = PermissionLink;
 
-    fn secondary_key(&self, object: &PermissionLink) -> Vec<u8> {
+    fn secondary_key(object: &PermissionLink) -> Vec<u8> {
         PermissionLinkByActionNameIndex::secondary_key_as_bytes((
             object.account,
             object.code,
@@ -152,8 +153,9 @@ pub struct PermissionLinkByPermissionNameIndex;
 
 impl SecondaryIndex<PermissionLink> for PermissionLinkByPermissionNameIndex {
     type Key = (Name, Name, Id);
+    type Object = PermissionLink;
 
-    fn secondary_key(&self, object: &PermissionLink) -> Vec<u8> {
+    fn secondary_key(object: &PermissionLink) -> Vec<u8> {
         PermissionLinkByPermissionNameIndex::secondary_key_as_bytes((
             object.account,
             object.required_permission,

@@ -1,3 +1,4 @@
+use pulsevm_serialization::serialize;
 use wasmtime::Caller;
 
 use crate::chain::{Name, wasm_runtime::WasmContext};
@@ -75,5 +76,29 @@ pub fn db_remove_i64() -> impl Fn(Caller<'_, WasmContext>, i32) -> Result<(), wa
         context.db_remove_i64(itr)?;
 
         Ok(())
+    }
+}
+
+pub fn db_next_i64() -> impl Fn(Caller<'_, WasmContext>, i32, u32) -> Result<i32, wasmtime::Error> {
+    |mut caller, itr, primary_ptr| {
+        let memory = caller
+            .get_export("memory")
+            .and_then(|ext| ext.into_memory())
+            .ok_or_else(|| anyhow::anyhow!("memory export not found"))?;
+        let context = caller.data_mut().apply_context_mut();
+        let mut next_primary = 0u64;
+        let res = context.db_next_i64(itr, &mut next_primary)?;
+        let dest_bytes = serialize(&next_primary);
+        memory.write(&mut caller, primary_ptr as usize, &dest_bytes)?;
+
+        Ok(res)
+    }
+}
+
+pub fn db_end_i64()
+-> impl Fn(Caller<'_, WasmContext>, u64, u64, u64) -> Result<i32, wasmtime::Error> {
+    |mut caller, code, scope, table| {
+        let context = caller.data_mut().apply_context_mut();
+        Ok(context.db_end_i64(code.into(), scope.into(), table.into())?)
     }
 }

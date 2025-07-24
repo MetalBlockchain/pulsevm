@@ -89,8 +89,9 @@ pub struct KeyValueByScopePrimaryIndex;
 
 impl SecondaryIndex<KeyValue> for KeyValueByScopePrimaryIndex {
     type Key = (u64, u64);
+    type Object = KeyValue;
 
-    fn secondary_key(&self, object: &KeyValue) -> Vec<u8> {
+    fn secondary_key(object: &KeyValue) -> Vec<u8> {
         KeyValueByScopePrimaryIndex::secondary_key_as_bytes((object.table_id, object.primary_key))
     }
 
