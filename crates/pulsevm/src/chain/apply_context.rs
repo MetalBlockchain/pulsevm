@@ -400,19 +400,6 @@ impl ApplyContext {
         return Ok(keyval_cache.add(&key_value));
     }
 
-    pub fn find_table(
-        &self,
-        code: Name,
-        scope: Name,
-        table: Name,
-    ) -> Result<Option<Table>, ChainError> {
-        let mut session = self.session.borrow_mut();
-        let table = session
-            .find_by_secondary::<Table, TableByCodeScopeTableIndex>((code, scope, table))
-            .map_err(|e| ChainError::TransactionError(format!("failed to find table: {}", e)))?;
-        Ok(table)
-    }
-
     pub fn db_get_i64(
         &self,
         iterator: i32,
@@ -457,7 +444,6 @@ impl ApplyContext {
             payer
         };
 
-        // TODO: Update payer's RAM usage
         if obj.payer != payer {
             self.update_db_usage(obj.payer, -old_size)?;
             self.update_db_usage(payer, new_size)?;
@@ -483,7 +469,7 @@ impl ApplyContext {
             ChainError::TransactionError(format!("db access violation",)),
         )?;
 
-        // TODO: Update payer's RAM usage
+        self.update_db_usage(obj.payer, -(obj.value.len() as i64 + billable_size_v::<KeyValue>() as i64))?;
 
         let mut session = self.session.borrow_mut();
         session.remove(obj.clone())?;
@@ -499,6 +485,19 @@ impl ApplyContext {
         keyval_cache.remove(iterator)?;
 
         Ok(())
+    }
+
+    pub fn find_table(
+        &self,
+        code: Name,
+        scope: Name,
+        table: Name,
+    ) -> Result<Option<Table>, ChainError> {
+        let mut session = self.session.borrow_mut();
+        let table = session
+            .find_by_secondary::<Table, TableByCodeScopeTableIndex>((code, scope, table))
+            .map_err(|e| ChainError::TransactionError(format!("failed to find table: {}", e)))?;
+        Ok(table)
     }
 
     pub fn find_or_create_table(
