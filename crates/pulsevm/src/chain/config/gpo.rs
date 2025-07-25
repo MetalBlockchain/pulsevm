@@ -1,30 +1,12 @@
 use pulsevm_chainbase::{ChainbaseObject, SecondaryKey};
-use pulsevm_serialization::{Deserialize, Serialize};
+use pulsevm_proc_macros::{NumBytes, Read, Write};
 
 use crate::chain::{Id, genesis::ChainConfig};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Read, Write, NumBytes)]
 pub struct GlobalPropertyObject {
     pub chain_id: Id,
     pub configuration: ChainConfig,
-}
-
-impl Serialize for GlobalPropertyObject {
-    fn serialize(&self, bytes: &mut Vec<u8>) {
-        self.chain_id.serialize(bytes);
-        self.configuration.serialize(bytes);
-    }
-}
-
-impl Deserialize for GlobalPropertyObject {
-    fn deserialize(data: &[u8], pos: &mut usize) -> Result<Self, pulsevm_serialization::ReadError> {
-        let chain_id = Id::deserialize(data, pos)?;
-        let configuration = ChainConfig::deserialize(data, pos)?;
-        Ok(GlobalPropertyObject {
-            chain_id,
-            configuration,
-        })
-    }
 }
 
 impl ChainbaseObject for GlobalPropertyObject {

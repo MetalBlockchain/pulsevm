@@ -1,22 +1,22 @@
 mod index;
 
 use fjall::{Config, Slice, TransactionalKeyspace, WriteTransaction};
-use pulsevm_serialization::{Deserialize, Serialize, serialize};
+use pulsevm_serialization::{Read, Write};
 use std::{
     cell::RefCell, char, collections::VecDeque, error::Error, path::Path, rc::Rc, sync::Arc,
 };
 
 use crate::index::Index;
 
-pub trait ChainbaseObject: Default + Serialize + Deserialize {
-    type PrimaryKey: Deserialize;
+pub trait ChainbaseObject: Default + Read + Write {
+    type PrimaryKey: Read;
 
     fn primary_key(&self) -> Vec<u8>;
     fn primary_key_to_bytes(key: Self::PrimaryKey) -> Vec<u8>;
     fn primary_key_from_bytes(key: &[u8]) -> Result<Self::PrimaryKey, Box<dyn Error>> {
         let mut pos = 0;
-        Ok(Self::PrimaryKey::deserialize(key, &mut pos)
-            .map_err(|_| format!("failed to deserialize primary key from bytes"))?)
+        Ok(Self::PrimaryKey::read(key, &mut pos)
+            .map_err(|_| format!("failed to read primary key from bytes"))?)
     }
     fn secondary_indexes(&self) -> Vec<SecondaryKey>;
     fn table_name() -> &'static str;
@@ -85,8 +85,7 @@ impl<'a> Database {
             return Ok(None);
         }
         let mut pos = 0 as usize;
-        let object: T =
-            T::deserialize(&serialized.unwrap(), &mut pos).expect("failed to deserialize object");
+        let object: T = T::read(&serialized.unwrap(), &mut pos).expect("failed to read object");
         Ok(Some(object))
     }
 
@@ -110,8 +109,7 @@ impl<'a> Database {
             return Ok(None);
         }
         let mut pos = 0 as usize;
-        let object: T =
-            T::deserialize(&serialized.unwrap(), &mut pos).expect("failed to deserialize object");
+        let object: T = T::read(&serialized.unwrap(), &mut pos).expect("failed to read object");
         Ok(Some(object))
     }
 
@@ -171,8 +169,7 @@ impl UndoSession {
             return Ok(None);
         }
         let mut pos = 0 as usize;
-        let object: T =
-            T::deserialize(&serialized.unwrap(), &mut pos).expect("failed to deserialize object");
+        let object: T = T::read(&serialized.unwrap(), &mut pos).expect("failed to read object");
         Ok(Some(object))
     }
 
@@ -207,8 +204,7 @@ impl UndoSession {
             return Ok(None);
         }
         let mut pos = 0 as usize;
-        let object: T =
-            T::deserialize(&serialized.unwrap(), &mut pos).expect("failed to deserialize object");
+        let object: T = T::read(&serialized.unwrap(), &mut pos).expect("failed to read object");
         Ok(Some(object))
     }
 
@@ -236,7 +232,7 @@ impl UndoSession {
 
     pub fn insert<T: ChainbaseObject>(&mut self, object: &T) -> Result<(), Box<dyn Error>> {
         let key = object.primary_key();
-        let serialized = serialize(object);
+        let serialized = object.pack()?;
         let partition = self
             .keyspace
             .open_partition(T::table_name(), Default::default())?;
@@ -273,7 +269,7 @@ impl UndoSession {
         }
         f(old);
         let serialized_old = existing.unwrap().to_vec();
-        let serialized_new = serialize(old);
+        let serialized_new = old.pack()?;
         let mut changes = self.changes.borrow_mut();
         changes.push_back(ObjectChange::Modified(
             key.to_owned(),
@@ -339,27 +335,12 @@ impl UndoSession {
 
 mod tests {
     use super::*;
-    use pulsevm_serialization::ReadError;
+    use pulsevm_proc_macros::{NumBytes, Read, Write};
 
-    #[derive(Debug, Default, Clone)]
+    #[derive(Debug, Default, Clone, Read, Write, NumBytes)]
     struct TestObject {
         id: u64,
         name: String,
-    }
-
-    impl Serialize for TestObject {
-        fn serialize(&self, bytes: &mut Vec<u8>) {
-            self.id.serialize(bytes);
-            self.name.serialize(bytes);
-        }
-    }
-
-    impl Deserialize for TestObject {
-        fn deserialize(data: &[u8], pos: &mut usize) -> Result<Self, ReadError> {
-            let id = u64::deserialize(data, pos)?;
-            let name = String::deserialize(data, pos)?;
-            Ok(TestObject { id, name })
-        }
     }
 
     impl ChainbaseObject for TestObject {

@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use pulsevm_serialization::{Deserialize, Serialize};
+use pulsevm_serialization::{NumBytes, Read, Write};
 use secp256k1::{PublicKey as Secp256k1PublicKey, Secp256k1, SecretKey};
 
 use crate::chain::error::ChainError;
@@ -24,16 +24,10 @@ impl FromStr for PublicKey {
     }
 }
 
-impl Serialize for PublicKey {
-    fn serialize(&self, bytes: &mut Vec<u8>) {
-        bytes.extend_from_slice(self.0.serialize().as_ref());
-    }
-}
-
-impl Deserialize for PublicKey {
-    fn deserialize(data: &[u8], pos: &mut usize) -> Result<Self, pulsevm_serialization::ReadError> {
+impl Read for PublicKey {
+    fn read(data: &[u8], pos: &mut usize) -> Result<Self, pulsevm_serialization::ReadError> {
         if *pos + 33 > data.len() {
-            return Err(pulsevm_serialization::ReadError::NotEnoughBytes(*pos, 33));
+            return Err(pulsevm_serialization::ReadError::NotEnoughBytes);
         }
         let mut id = [0u8; 33];
         id.copy_from_slice(&data[*pos..*pos + 33]);
@@ -41,6 +35,24 @@ impl Deserialize for PublicKey {
         let key = secp256k1::PublicKey::from_byte_array_compressed(&id)
             .map_err(|_| pulsevm_serialization::ReadError::ParseError)?;
         Ok(PublicKey(key))
+    }
+}
+
+impl NumBytes for PublicKey {
+    fn num_bytes(&self) -> usize {
+        33 // Compressed public key size
+    }
+}
+
+impl Write for PublicKey {
+    fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), pulsevm_serialization::WriteError> {
+        if *pos + 33 > bytes.len() {
+            return Err(pulsevm_serialization::WriteError::NotEnoughSpace);
+        }
+        let compressed = self.0.serialize();
+        bytes[*pos..*pos + 33].copy_from_slice(&compressed);
+        *pos += 33;
+        Ok(())
     }
 }
 
@@ -57,7 +69,6 @@ impl Default for PublicKey {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pulsevm_serialization::Deserialize;
 
     #[test]
     fn test_public_key_from_hex() {
@@ -74,11 +85,9 @@ mod tests {
         let hex = "030cd6c38a327849690b655003c50ca781d0f7020cc17e29428def19a342458961";
         let public_key = PublicKey::from_str(hex).unwrap();
 
-        let mut serialized: Vec<u8> = Vec::new();
-        public_key.serialize(&mut serialized);
-
+        let serialized: Vec<u8> = public_key.pack().unwrap();
         let mut pos = 0;
-        let deserialized = PublicKey::deserialize(&serialized, &mut pos).unwrap();
+        let deserialized = PublicKey::read(&serialized, &mut pos).unwrap();
 
         assert_eq!(public_key, deserialized);
     }

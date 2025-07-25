@@ -1,9 +1,9 @@
 use pulsevm_chainbase::{ChainbaseObject, SecondaryKey};
-use pulsevm_serialization::{Deserialize, Serialize};
+use pulsevm_proc_macros::{NumBytes, Read, Write};
 
 use crate::chain::Name;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Read, Write, NumBytes)]
 pub struct ResourceUsage {
     pub owner: Name,
     pub cpu_usage: u64,
@@ -19,30 +19,6 @@ impl ResourceUsage {
             net_usage,
             ram_usage,
         }
-    }
-}
-
-impl Serialize for ResourceUsage {
-    fn serialize(&self, bytes: &mut Vec<u8>) {
-        self.owner.serialize(bytes);
-        self.cpu_usage.serialize(bytes);
-        self.net_usage.serialize(bytes);
-        self.ram_usage.serialize(bytes);
-    }
-}
-
-impl Deserialize for ResourceUsage {
-    fn deserialize(data: &[u8], pos: &mut usize) -> Result<Self, pulsevm_serialization::ReadError> {
-        let owner = Name::deserialize(data, pos)?;
-        let cpu_usage = u64::deserialize(data, pos)?;
-        let net_usage = u64::deserialize(data, pos)?;
-        let ram_usage = u64::deserialize(data, pos)?;
-        Ok(ResourceUsage {
-            owner,
-            cpu_usage,
-            net_usage,
-            ram_usage,
-        })
     }
 }
 

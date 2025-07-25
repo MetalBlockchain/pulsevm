@@ -1,9 +1,9 @@
 use pulsevm_chainbase::{ChainbaseObject, SecondaryIndex, SecondaryKey};
-use pulsevm_serialization::{Deserialize, Serialize};
+use pulsevm_proc_macros::{NumBytes, Read, Write};
 
 use crate::chain::{Name, config::BillableSize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Read, Write, NumBytes)]
 pub struct KeyValue {
     pub id: u64,
     pub table_id: u64,
@@ -27,34 +27,6 @@ impl KeyValue {
 impl BillableSize for KeyValue {
     fn billable_size() -> u64 {
         32 + 8 + 4 + 64
-    }
-}
-
-impl Serialize for KeyValue {
-    fn serialize(&self, bytes: &mut Vec<u8>) {
-        self.id.serialize(bytes);
-        self.table_id.serialize(bytes);
-        self.primary_key.serialize(bytes);
-        self.payer.serialize(bytes);
-        self.value.serialize(bytes);
-    }
-}
-
-impl Deserialize for KeyValue {
-    fn deserialize(data: &[u8], pos: &mut usize) -> Result<Self, pulsevm_serialization::ReadError> {
-        let id = u64::deserialize(data, pos)?;
-        let table_id = u64::deserialize(data, pos)?;
-        let primary_key = u64::deserialize(data, pos)?;
-        let payer = Name::deserialize(data, pos)?;
-        let value = Vec::<u8>::deserialize(data, pos)?;
-
-        Ok(KeyValue {
-            id,
-            table_id,
-            primary_key,
-            payer,
-            value,
-        })
     }
 }
 

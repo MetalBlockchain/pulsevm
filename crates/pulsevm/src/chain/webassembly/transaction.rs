@@ -1,4 +1,4 @@
-use pulsevm_serialization::Deserialize;
+use pulsevm_serialization::Read;
 use wasmtime::Caller;
 
 use crate::chain::{
@@ -24,7 +24,7 @@ pub fn send_inline() -> impl Fn(Caller<'_, WasmContext>, u32, u32) -> Result<(),
             .ok_or_else(|| anyhow::anyhow!("memory export not found"))?;
         let mut src_bytes = vec![0u8; length as usize];
         memory.read(&caller, ptr as usize, &mut src_bytes)?;
-        let action = Action::deserialize(&src_bytes, &mut 0)?;
+        let action = Action::read(&src_bytes, &mut 0)?;
 
         caller
             .data_mut()

@@ -1,9 +1,9 @@
 use pulsevm_chainbase::{ChainbaseObject, SecondaryKey};
-use pulsevm_serialization::{Deserialize, Serialize};
+use pulsevm_proc_macros::{NumBytes, Read, Write};
 
 use crate::chain::{Id, Name};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Read, Write, NumBytes)]
 pub struct AccountMetadata {
     pub name: Name,
     pub recv_sequence: u64,
@@ -35,49 +35,6 @@ impl AccountMetadata {
 
     pub fn is_privileged(&self) -> bool {
         self.privileged
-    }
-}
-
-impl Serialize for AccountMetadata {
-    fn serialize(&self, bytes: &mut Vec<u8>) {
-        self.name.serialize(bytes);
-        self.recv_sequence.serialize(bytes);
-        self.auth_sequence.serialize(bytes);
-        self.code_sequence.serialize(bytes);
-        self.abi_sequence.serialize(bytes);
-        self.code_hash.serialize(bytes);
-        self.last_code_update.serialize(bytes);
-        self.privileged.serialize(bytes);
-        self.vm_type.serialize(bytes);
-        self.vm_version.serialize(bytes);
-    }
-}
-
-impl Deserialize for AccountMetadata {
-    fn deserialize(data: &[u8], pos: &mut usize) -> Result<Self, pulsevm_serialization::ReadError> {
-        let name = Name::deserialize(data, pos)?;
-        let recv_sequence = u64::deserialize(data, pos)?;
-        let auth_sequence = u64::deserialize(data, pos)?;
-        let code_sequence = u32::deserialize(data, pos)?;
-        let abi_sequence = u32::deserialize(data, pos)?;
-        let code_hash = Id::deserialize(data, pos)?;
-        let last_code_update = u64::deserialize(data, pos)?;
-        let privileged = bool::deserialize(data, pos)?;
-        let vm_type = u8::deserialize(data, pos)?;
-        let vm_version = u8::deserialize(data, pos)?;
-
-        Ok(AccountMetadata {
-            name,
-            recv_sequence,
-            auth_sequence,
-            code_sequence,
-            abi_sequence,
-            code_hash,
-            last_code_update,
-            privileged,
-            vm_type,
-            vm_version,
-        })
     }
 }
 

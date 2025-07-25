@@ -443,7 +443,7 @@ mod tests {
 
     use super::*;
     use pulsevm_chainbase::Database;
-    use pulsevm_serialization::Deserialize;
+    use pulsevm_serialization::Read;
 
     #[test]
     fn test_authority_checker() {
@@ -473,6 +473,6 @@ mod tests {
         undo_session.insert(&owner_permission).unwrap();
         let data = "0000e19b30bc0bfabfab01c9260469fab7529ae88987b2eb337dac5650305226b38e00000001aea38500000000009ab864229a9e40000000006eaea385000000000064553988000000000000000100000001027f4dbe05a88d4c3974cec8d03f192c96a9813ea4d60811c4e68a2d459842497c0001000000000000000100000001027f4dbe05a88d4c3974cec8d03f192c96a9813ea4d60811c4e68a2d459842497c00010000000000000001aea38500000000003232eda80000000000000001ada3bd9c65952513b98753bcc582cf368fb8bf8432e3e0389498a248756b209a0eb4e0846a1f85cad63fd2203cb1577514a902a54ae718a33552bb782fe11c960178ed5cd2";
         let tx_data = hex::decode(data).unwrap();
-        let tx = Transaction::deserialize(&tx_data, &mut 0).unwrap();
+        let tx = Transaction::read(&tx_data, &mut 0).unwrap();
     }
 }

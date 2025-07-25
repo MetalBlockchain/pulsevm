@@ -26,7 +26,7 @@ use anyhow::Chain;
 use chrono::Utc;
 use pulsevm_chainbase::{Database, UndoSession};
 use pulsevm_proc_macros::name;
-use pulsevm_serialization::{Deserialize, Serialize};
+use pulsevm_serialization::Read;
 use spdlog::info;
 use tokio::sync::RwLock as AsyncRwLock;
 
@@ -353,7 +353,7 @@ impl Controller {
 
     pub fn parse_block(&self, bytes: &Vec<u8>) -> Result<Block, ControllerError> {
         let mut pos = 0;
-        let block = Block::deserialize(bytes, &mut pos)
+        let block = Block::read(bytes, &mut pos)
             .map_err(|e| ControllerError::GenesisError(format!("Failed to parse block: {}", e)))?;
         Ok(block)
     }
@@ -392,8 +392,8 @@ impl Controller {
 mod tests {
     use std::{env::temp_dir, fs, path::PathBuf, str::FromStr, vec};
 
-    use chrono::format;
-    use pulsevm_serialization::{Serialize, serialize};
+    use pulsevm_proc_macros::{NumBytes, Read, Write};
+    use pulsevm_serialization::Write;
     use serde_json::json;
 
     use crate::chain::{
@@ -402,6 +402,50 @@ mod tests {
     };
 
     use super::*;
+
+    #[derive(Debug, Clone, PartialEq, Eq, Hash, Read, Write, NumBytes)]
+    struct Create {
+        issuer: Name,
+        max_supply: Asset,
+    }
+
+    impl Create {
+        pub fn new(issuer: Name, max_supply: Asset) -> Self {
+            Create { issuer, max_supply }
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Hash, Read, Write, NumBytes)]
+    struct Transfer {
+        from: Name,
+        to: Name,
+        quantity: Asset,
+        memo: String,
+    }
+
+    impl Transfer {
+        pub fn new(from: Name, to: Name, quantity: Asset, memo: String) -> Self {
+            Transfer {
+                from,
+                to,
+                quantity,
+                memo,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Hash, Read, Write, NumBytes)]
+    struct Issue {
+        to: Name,
+        quantity: Asset,
+        memo: String,
+    }
+
+    impl Issue {
+        pub fn new(to: Name, quantity: Asset, memo: String) -> Self {
+            Issue { to, quantity, memo }
+        }
+    }
 
     fn get_temp_dir() -> PathBuf {
         let temp_dir_name = format!("db_{}.pulsevm", Utc::now().format("%Y%m%d%H%M%S"));
@@ -429,7 +473,7 @@ mod tests {
                 vec![Action::new(
                     Name::from_str("pulse").unwrap(),
                     Name::from_str("newaccount").unwrap(),
-                    serialize(&NewAccount::new(
+                    NewAccount::new(
                         Name::from_str("pulse").unwrap(),
                         account,
                         Authority::new(
@@ -442,7 +486,8 @@ mod tests {
                             vec![KeyWeight::new(private_key.public_key(), 1)],
                             vec![],
                         ),
-                    )),
+                    )
+                    .pack().unwrap(),
                     vec![PermissionLevel::new(
                         Name::from_str("pulse").unwrap(),
                         Name::from_str("active").unwrap(),
@@ -461,7 +506,7 @@ mod tests {
                 vec![Action::new(
                     Name::from_str("pulse").unwrap(),
                     Name::from_str("setcode").unwrap(),
-                    serialize(&SetCode::new(account, 0, 0, wasm_bytes)),
+                    SetCode::new(account, 0, 0, wasm_bytes).pack().unwrap(),
                     vec![PermissionLevel::new(
                         account,
                         Name::from_str("active").unwrap(),
@@ -472,11 +517,11 @@ mod tests {
         .sign(&private_key)
     }
 
-    fn call_contract(
+    fn call_contract<T: Write>(
         private_key: &PrivateKey,
         account: Name,
         action: Name,
-        action_data: &Vec<u8>,
+        action_data: &T,
     ) -> Transaction {
         Transaction::new(
             0,
@@ -485,7 +530,7 @@ mod tests {
                 vec![Action::new(
                     account,
                     action,
-                    action_data.clone(),
+                    action_data.pack().unwrap(),
                     vec![PermissionLevel::new(
                         account,
                         Name::from_str("active").unwrap(),
@@ -532,13 +577,10 @@ mod tests {
                 &private_key,
                 Name::from_str("glenn")?,
                 Name::from_str("create")?,
-                &serialize(&Create {
+                &Create {
                     issuer: Name::from_str("glenn")?,
-                    max_supply: Asset {
-                        amount: 1000000,
-                        symbol: Symbol(1162826500), // "PLUS" in ASCII
-                    },
-                }),
+                    max_supply: Asset::new(1000000, Symbol(1162826500))
+                }
             ),
         )?;
 
@@ -548,14 +590,14 @@ mod tests {
                 &private_key,
                 Name::from_str("glenn")?,
                 Name::from_str("issue")?,
-                &serialize(&Issue {
+                &Issue{
                     to: Name::from_str("glenn")?,
                     quantity: Asset {
                         amount: 1000000,
                         symbol: Symbol(1162826500), // "PLUS" in ASCII
                     },
                     memo: "Initial transfer".to_string(),
-                }),
+                },
             ),
         )?;
 
@@ -565,7 +607,7 @@ mod tests {
                 &private_key,
                 Name::from_str("glenn")?,
                 Name::from_str("transfer")?,
-                &serialize(&Transfer {
+                &Transfer {
                     from: Name::from_str("glenn")?,
                     to: Name::from_str("marshall")?,
                     quantity: Asset {
@@ -573,52 +615,10 @@ mod tests {
                         symbol: Symbol(1162826500), // "PLUS" in ASCII
                     },
                     memo: "Initial transfer".to_string(),
-                }),
+                },
             ),
         )?;
 
         Ok(())
-    }
-}
-
-struct Create {
-    issuer: Name,
-    max_supply: Asset,
-}
-
-impl Serialize for Create {
-    fn serialize(&self, bytes: &mut Vec<u8>) {
-        self.issuer.serialize(bytes);
-        self.max_supply.serialize(bytes);
-    }
-}
-
-struct Transfer {
-    from: Name,
-    to: Name,
-    quantity: Asset,
-    memo: String,
-}
-
-impl Serialize for Transfer {
-    fn serialize(&self, bytes: &mut Vec<u8>) {
-        self.from.serialize(bytes);
-        self.to.serialize(bytes);
-        self.quantity.serialize(bytes);
-        self.memo.serialize(bytes);
-    }
-}
-
-struct Issue {
-    to: Name,
-    quantity: Asset,
-    memo: String,
-}
-
-impl Serialize for Issue {
-    fn serialize(&self, bytes: &mut Vec<u8>) {
-        self.to.serialize(bytes);
-        self.quantity.serialize(bytes);
-        self.memo.serialize(bytes);
     }
 }

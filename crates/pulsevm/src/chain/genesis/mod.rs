@@ -1,38 +1,19 @@
 use chrono::{DateTime, Utc};
+use pulsevm_proc_macros::NumBytes;
+use pulsevm_proc_macros::Read;
+use pulsevm_proc_macros::Write;
 use core::str;
-use pulsevm_serialization::Deserialize as PulseDeserialize;
-use pulsevm_serialization::Serialize as PulseSerialize;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
-use std::{error::Error, fmt};
 
 use crate::chain::error::ChainError;
 
 use super::{PublicKey, block::BlockTimestamp};
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash, Default, Read, Write, NumBytes)]
 pub struct ChainConfig {
     pub max_inline_action_size: u32,
     pub max_action_return_value_size: u32,
-}
-
-impl PulseSerialize for ChainConfig {
-    fn serialize(&self, bytes: &mut Vec<u8>) {
-        pulsevm_serialization::Serialize::serialize(&self.max_inline_action_size, bytes);
-        pulsevm_serialization::Serialize::serialize(&self.max_action_return_value_size, bytes);
-    }
-}
-
-impl PulseDeserialize for ChainConfig {
-    fn deserialize(data: &[u8], pos: &mut usize) -> Result<Self, pulsevm_serialization::ReadError> {
-        let max_inline_action_size = pulsevm_serialization::Deserialize::deserialize(data, pos)?;
-        let max_action_return_value_size =
-            pulsevm_serialization::Deserialize::deserialize(data, pos)?;
-        Ok(ChainConfig {
-            max_inline_action_size,
-            max_action_return_value_size,
-        })
-    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

@@ -1,9 +1,9 @@
 use pulsevm_chainbase::{ChainbaseObject, SecondaryIndex, SecondaryKey};
-use pulsevm_serialization::{Deserialize, Serialize};
+use pulsevm_proc_macros::{NumBytes, Read, Write};
 
 use crate::chain::Name;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Read, Write, NumBytes)]
 pub struct Table {
     pub id: u64,
     pub code: Name,
@@ -23,37 +23,6 @@ impl Table {
             payer,
             count,
         }
-    }
-}
-
-impl Serialize for Table {
-    fn serialize(&self, bytes: &mut Vec<u8>) {
-        self.id.serialize(bytes);
-        self.code.serialize(bytes);
-        self.scope.serialize(bytes);
-        self.table.serialize(bytes);
-        self.payer.serialize(bytes);
-        self.count.serialize(bytes);
-    }
-}
-
-impl Deserialize for Table {
-    fn deserialize(data: &[u8], pos: &mut usize) -> Result<Self, pulsevm_serialization::ReadError> {
-        let id = u64::deserialize(data, pos)?;
-        let code = Name::deserialize(data, pos)?;
-        let scope = Name::deserialize(data, pos)?;
-        let table = Name::deserialize(data, pos)?;
-        let payer = Name::deserialize(data, pos)?;
-        let count = u32::deserialize(data, pos)?;
-
-        Ok(Table {
-            id,
-            code,
-            scope,
-            table,
-            payer,
-            count,
-        })
     }
 }
 

@@ -1,9 +1,10 @@
 use pulsevm_chainbase::{ChainbaseObject, SecondaryIndex, SecondaryKey};
-use pulsevm_serialization::{Deserialize, Serialize};
+use pulsevm_proc_macros::{NumBytes, Read, Write};
+use pulsevm_serialization::Write;
 
 use crate::chain::{Id, Name};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Read, Write, NumBytes)]
 pub struct PermissionLink {
     id: Id,
     /// The account which is defining its permission requirements
@@ -53,34 +54,6 @@ impl PermissionLink {
 
     pub fn required_permission(&self) -> Name {
         self.required_permission
-    }
-}
-
-impl Serialize for PermissionLink {
-    fn serialize(&self, bytes: &mut Vec<u8>) {
-        self.id.serialize(bytes);
-        self.account.serialize(bytes);
-        self.code.serialize(bytes);
-        self.message_type.serialize(bytes);
-        self.required_permission.serialize(bytes);
-    }
-}
-
-impl Deserialize for PermissionLink {
-    fn deserialize(data: &[u8], pos: &mut usize) -> Result<Self, pulsevm_serialization::ReadError> {
-        let id = Id::deserialize(data, pos)?;
-        let account = Name::deserialize(data, pos)?;
-        let code = Name::deserialize(data, pos)?;
-        let message_type = Name::deserialize(data, pos)?;
-        let required_permission = Name::deserialize(data, pos)?;
-
-        Ok(PermissionLink {
-            id,
-            account,
-            code,
-            message_type,
-            required_permission,
-        })
     }
 }
 
@@ -137,10 +110,7 @@ impl SecondaryIndex<PermissionLink> for PermissionLinkByActionNameIndex {
     }
 
     fn secondary_key_as_bytes(key: Self::Key) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        key.0.serialize(&mut bytes);
-        key.1.serialize(&mut bytes);
-        bytes
+        key.pack().unwrap()
     }
 
     fn index_name() -> &'static str {
@@ -164,10 +134,7 @@ impl SecondaryIndex<PermissionLink> for PermissionLinkByPermissionNameIndex {
     }
 
     fn secondary_key_as_bytes(key: Self::Key) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        key.0.serialize(&mut bytes);
-        key.1.serialize(&mut bytes);
-        bytes
+        key.pack().unwrap()
     }
 
     fn index_name() -> &'static str {

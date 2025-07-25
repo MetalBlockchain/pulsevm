@@ -1,12 +1,12 @@
 use std::fmt;
 
-use pulsevm_serialization::{Deserialize, Serialize};
+use pulsevm_proc_macros::{NumBytes, Read, Write};
 
 use crate::chain::config::{self, BillableSize, FIXED_OVERHEAD_SHARED_VECTOR_RAM_BYTES};
 
 use super::{key_weight::KeyWeight, permission_level_weight::PermissionLevelWeight};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Read, Write, NumBytes)]
 pub struct Authority {
     threshold: u32,
     keys: Vec<KeyWeight>,
@@ -72,27 +72,6 @@ impl Authority {
         }
 
         accounts_size + keys_size
-    }
-}
-
-impl Serialize for Authority {
-    fn serialize(&self, bytes: &mut Vec<u8>) {
-        self.threshold.serialize(bytes);
-        self.keys.serialize(bytes);
-        self.accounts.serialize(bytes);
-    }
-}
-
-impl Deserialize for Authority {
-    fn deserialize(data: &[u8], pos: &mut usize) -> Result<Self, pulsevm_serialization::ReadError> {
-        let threshold = u32::deserialize(data, pos)?;
-        let keys = Vec::<KeyWeight>::deserialize(data, pos)?;
-        let accounts = Vec::<PermissionLevelWeight>::deserialize(data, pos)?;
-        Ok(Authority {
-            threshold,
-            keys,
-            accounts,
-        })
     }
 }
 

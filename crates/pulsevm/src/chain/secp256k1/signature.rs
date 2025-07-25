@@ -1,6 +1,6 @@
 use std::fmt;
 
-use pulsevm_serialization::{Deserialize, Serialize};
+use pulsevm_serialization::{NumBytes, Read, Write};
 use secp256k1::ecdsa::{RecoverableSignature, RecoveryId};
 use secp256k1::hashes::{Hash, sha256};
 
@@ -39,18 +39,16 @@ impl From<RecoverableSignature> for Signature {
     }
 }
 
-impl Serialize for Signature {
-    fn serialize(&self, bytes: &mut Vec<u8>) {
-        let (recovery_id, serialized) = self.0.serialize_compact();
-        bytes.extend_from_slice(&serialized);
-        bytes.push(recovery_id as u8);
+impl NumBytes for Signature {
+    fn num_bytes(&self) -> usize {
+        65 // 64 bytes for the signature + 1 byte for the recovery id
     }
 }
 
-impl Deserialize for Signature {
-    fn deserialize(data: &[u8], pos: &mut usize) -> Result<Self, pulsevm_serialization::ReadError> {
+impl Read for Signature {
+    fn read(data: &[u8], pos: &mut usize) -> Result<Self, pulsevm_serialization::ReadError> {
         if *pos + 65 > data.len() {
-            return Err(pulsevm_serialization::ReadError::NotEnoughBytes(*pos, 65));
+            return Err(pulsevm_serialization::ReadError::NotEnoughBytes);
         }
         let mut serialized = [0u8; 64];
         serialized.copy_from_slice(&data[*pos..*pos + 64]);
@@ -65,9 +63,23 @@ impl Deserialize for Signature {
     }
 }
 
+impl Write for Signature {
+    fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), pulsevm_serialization::WriteError> {
+        if *pos + 65 > bytes.len() {
+            return Err(pulsevm_serialization::WriteError::NotEnoughSpace);
+        }
+        let (recovery_id, serialized) = self.0.serialize_compact();
+        bytes[*pos..*pos + 64].copy_from_slice(&serialized);
+        *pos += 64;
+        bytes[*pos] = recovery_id as u8;
+        *pos += 1;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use pulsevm_serialization::{Deserialize, serialize};
+    use pulsevm_serialization::{Read, Write};
     use secp256k1::hashes::{Hash, sha256};
 
     use crate::chain::{PrivateKey, Signature};
@@ -82,9 +94,9 @@ mod tests {
             .recover_public_key(&digest)
             .expect("Failed to recover public key");
         assert_eq!(public_key, private_key.public_key());
-        let serialized = serialize(&signature);
+        let serialized = signature.pack().expect("Failed to serialize signature");
         let deserialized =
-            Signature::deserialize(&serialized, &mut 0).expect("Failed to deserialize signature");
+            Signature::read(&serialized, &mut 0).expect("Failed to deserialize signature");
         assert_eq!(signature, deserialized);
     }
 }

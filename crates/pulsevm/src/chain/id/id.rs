@@ -1,7 +1,7 @@
 use core::fmt;
 use std::str::FromStr;
 
-use pulsevm_serialization::{Deserialize, Serialize};
+use pulsevm_serialization::{NumBytes, Read, Write};
 use secp256k1::hashes::sha256::{self, Hash};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
@@ -37,16 +37,27 @@ impl FromStr for Id {
     }
 }
 
-impl Serialize for Id {
-    fn serialize(&self, bytes: &mut Vec<u8>) {
-        bytes.extend_from_slice(&self.0);
+impl NumBytes for Id {
+    fn num_bytes(&self) -> usize {
+        32
     }
 }
 
-impl Deserialize for Id {
-    fn deserialize(data: &[u8], pos: &mut usize) -> Result<Self, pulsevm_serialization::ReadError> {
+impl Write for Id {
+    fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), pulsevm_serialization::WriteError> {
+        if *pos + 32 > bytes.len() {
+            return Err(pulsevm_serialization::WriteError::NotEnoughSpace);
+        }
+        bytes[*pos..*pos + 32].copy_from_slice(&self.0);
+        *pos += 32;
+        Ok(())
+    }
+}
+
+impl Read for Id {
+    fn read(data: &[u8], pos: &mut usize) -> Result<Self, pulsevm_serialization::ReadError> {
         if *pos + 32 > data.len() {
-            return Err(pulsevm_serialization::ReadError::NotEnoughBytes(*pos, 32));
+            return Err(pulsevm_serialization::ReadError::NotEnoughBytes);
         }
         let mut id = [0u8; 32];
         id.copy_from_slice(&data[*pos..*pos + 32]);
@@ -67,7 +78,7 @@ impl TryFrom<&[u8]> for Id {
 
     fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
         if value.len() != 32 {
-            return Err(pulsevm_serialization::ReadError::NotEnoughBytes(0, 32));
+            return Err(pulsevm_serialization::ReadError::NotEnoughBytes);
         }
         let mut id = [0u8; 32];
         id.copy_from_slice(value);
@@ -80,7 +91,7 @@ impl TryFrom<Vec<u8>> for Id {
 
     fn try_from(value: Vec<u8>) -> Result<Self, Self::Error> {
         if value.len() != 32 {
-            return Err(pulsevm_serialization::ReadError::NotEnoughBytes(0, 32));
+            return Err(pulsevm_serialization::ReadError::NotEnoughBytes);
         }
         let mut id = [0u8; 32];
         id.copy_from_slice(&value);

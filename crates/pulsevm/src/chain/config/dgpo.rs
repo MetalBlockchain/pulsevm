@@ -1,7 +1,7 @@
 use pulsevm_chainbase::{ChainbaseObject, SecondaryKey};
-use pulsevm_serialization::{Deserialize, Serialize};
+use pulsevm_proc_macros::{NumBytes, Read, Write};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Read, Write, NumBytes)]
 pub struct DynamicGlobalPropertyObject {
     pub global_action_sequence: u64,
 }
@@ -11,21 +11,6 @@ impl DynamicGlobalPropertyObject {
         DynamicGlobalPropertyObject {
             global_action_sequence,
         }
-    }
-}
-
-impl Serialize for DynamicGlobalPropertyObject {
-    fn serialize(&self, bytes: &mut Vec<u8>) {
-        self.global_action_sequence.serialize(bytes);
-    }
-}
-
-impl Deserialize for DynamicGlobalPropertyObject {
-    fn deserialize(data: &[u8], pos: &mut usize) -> Result<Self, pulsevm_serialization::ReadError> {
-        let global_action_sequence = u64::deserialize(data, pos)?;
-        Ok(DynamicGlobalPropertyObject {
-            global_action_sequence,
-        })
     }
 }
 

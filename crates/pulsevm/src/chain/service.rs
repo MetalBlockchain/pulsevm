@@ -9,7 +9,7 @@ use jsonrpsee::{
     },
     types::{ErrorObjectOwned, Response, ResponseSuccess},
 };
-use pulsevm_serialization::Deserialize;
+use pulsevm_serialization::Read;
 use serde::Serialize;
 use tokio::sync::RwLock;
 use tonic::async_trait;
@@ -81,7 +81,7 @@ impl RpcServer for RpcService {
             )
         })?;
         let mut pos = 0 as usize;
-        let tx = Transaction::deserialize(&tx_bytes, &mut pos).map_err(|_| {
+        let tx = Transaction::read(&tx_bytes, &mut pos).map_err(|_| {
             ErrorObjectOwned::owned(
                 400,
                 "deserialize_error",

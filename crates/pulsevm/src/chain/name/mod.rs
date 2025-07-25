@@ -1,12 +1,12 @@
 use core::{fmt, str};
 use std::{ops::Deref, str::FromStr};
 
-use pulsevm_name::{NAME_MAX_LEN, ParseNameError, name_from_bytes, name_to_bytes};
-use pulsevm_serialization::{Deserialize, Serialize};
+use pulsevm_name::{NAME_MAX_LEN, name_from_bytes, name_to_bytes};
+use pulsevm_proc_macros::{NumBytes, Read, Write};
 
 use crate::chain::error::ChainError;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, Read, Write, NumBytes)]
 pub struct Name(u64);
 
 impl Name {
@@ -69,19 +69,6 @@ impl PartialEq<u64> for Name {
 impl PartialEq<Name> for u64 {
     fn eq(&self, other: &Name) -> bool {
         self == &other.0
-    }
-}
-
-impl Serialize for Name {
-    fn serialize(&self, bytes: &mut Vec<u8>) {
-        self.0.serialize(bytes);
-    }
-}
-
-impl Deserialize for Name {
-    fn deserialize(data: &[u8], pos: &mut usize) -> Result<Self, pulsevm_serialization::ReadError> {
-        let value = u64::deserialize(data, pos)?;
-        Ok(Name(value))
     }
 }
 

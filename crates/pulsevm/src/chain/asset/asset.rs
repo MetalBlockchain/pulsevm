@@ -1,15 +1,32 @@
 use std::fmt;
 
-use pulsevm_serialization::{Deserialize, Serialize};
+use pulsevm_proc_macros::{NumBytes, Read, Write};
 
 use crate::chain::Symbol;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Read, Write, NumBytes)]
 pub struct Asset {
     /// The amount of the asset
     pub amount: i64,
     /// The symbol name of the asset
     pub symbol: Symbol,
+}
+
+impl Asset {
+    /// Creates a new asset with the given amount and symbol.
+    pub fn new(amount: i64, symbol: Symbol) -> Self {
+        Asset { amount, symbol }
+    }
+
+    /// Returns the amount of the asset.
+    pub fn amount(&self) -> i64 {
+        self.amount
+    }
+
+    /// Returns the symbol of the asset.
+    pub fn symbol(&self) -> &Symbol {
+        &self.symbol
+    }
 }
 
 impl fmt::Display for Asset {
@@ -32,20 +49,5 @@ impl fmt::Display for Asset {
             let fraction = formatted.get(index..).unwrap_or_else(|| "");
             write!(f, "{}.{} {}", whole, fraction, symbol_code)
         }
-    }
-}
-
-impl Serialize for Asset {
-    fn serialize(&self, bytes: &mut Vec<u8>) {
-        self.amount.serialize(bytes);
-        self.symbol.serialize(bytes);
-    }
-}
-
-impl Deserialize for Asset {
-    fn deserialize(data: &[u8], pos: &mut usize) -> Result<Self, pulsevm_serialization::ReadError> {
-        let amount = i64::deserialize(data, pos)?;
-        let symbol = Symbol::deserialize(data, pos)?;
-        Ok(Asset { amount, symbol })
     }
 }

@@ -1,4 +1,4 @@
-use pulsevm_serialization::serialize;
+use pulsevm_serialization::Write;
 use wasmtime::Caller;
 
 use crate::chain::{Name, wasm_runtime::WasmContext};
@@ -88,7 +88,7 @@ pub fn db_next_i64() -> impl Fn(Caller<'_, WasmContext>, i32, u32) -> Result<i32
         let context = caller.data_mut().apply_context_mut();
         let mut next_primary = 0u64;
         let res = context.db_next_i64(itr, &mut next_primary)?;
-        let dest_bytes = serialize(&next_primary);
+        let dest_bytes = next_primary.pack()?;
         memory.write(&mut caller, primary_ptr as usize, &dest_bytes)?;
 
         Ok(res)

@@ -1,10 +1,10 @@
 use core::fmt;
 
-use pulsevm_serialization::{Deserialize, Serialize};
+use pulsevm_proc_macros::{NumBytes, Read, Write};
 
 use crate::chain::SymbolCode;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Read, Write, NumBytes)]
 pub struct Symbol(pub u64);
 
 impl Symbol {
@@ -39,19 +39,6 @@ impl fmt::Display for Symbol {
         extern crate alloc;
         use alloc::string::ToString;
         write!(f, "{},{}", self.precision(), self.code().to_string())
-    }
-}
-
-impl Serialize for Symbol {
-    fn serialize(&self, bytes: &mut Vec<u8>) {
-        self.0.serialize(bytes);
-    }
-}
-
-impl Deserialize for Symbol {
-    fn deserialize(data: &[u8], pos: &mut usize) -> Result<Self, pulsevm_serialization::ReadError> {
-        let value = u64::deserialize(data, pos)?;
-        Ok(Symbol(value))
     }
 }
 

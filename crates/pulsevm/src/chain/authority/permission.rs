@@ -1,7 +1,6 @@
-use std::{cell::RefCell, rc::Rc};
-
 use pulsevm_chainbase::{ChainbaseObject, SecondaryIndex, SecondaryKey, UndoSession};
-use pulsevm_serialization::{Deserialize, Serialize};
+use pulsevm_proc_macros::{NumBytes, Read, Write};
+use pulsevm_serialization::Write;
 
 use crate::chain::{
     Name,
@@ -10,7 +9,7 @@ use crate::chain::{
 
 use super::authority::Authority;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Read, Write, NumBytes)]
 pub struct Permission {
     id: u64,
     parent_id: u64,
@@ -70,33 +69,6 @@ impl Permission {
     }
 }
 
-impl Serialize for Permission {
-    fn serialize(&self, bytes: &mut Vec<u8>) {
-        self.id.serialize(bytes);
-        self.parent_id.serialize(bytes);
-        self.owner.serialize(bytes);
-        self.name.serialize(bytes);
-        self.authority.serialize(bytes);
-    }
-}
-
-impl Deserialize for Permission {
-    fn deserialize(data: &[u8], pos: &mut usize) -> Result<Self, pulsevm_serialization::ReadError> {
-        let id = u64::deserialize(data, pos)?;
-        let parent_id = u64::deserialize(data, pos)?;
-        let owner = Name::deserialize(data, pos)?;
-        let name = Name::deserialize(data, pos)?;
-        let authority = Authority::deserialize(data, pos)?;
-        Ok(Permission {
-            id,
-            parent_id,
-            owner,
-            name,
-            authority,
-        })
-    }
-}
-
 impl ChainbaseObject for Permission {
     type PrimaryKey = u64;
 
@@ -132,9 +104,7 @@ impl SecondaryIndex<Permission> for PermissionByOwnerIndex {
     }
 
     fn secondary_key_as_bytes(key: Self::Key) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        key.0.serialize(&mut bytes);
-        key.1.serialize(&mut bytes);
+        let bytes = key.pack().unwrap();
         bytes
     }
 

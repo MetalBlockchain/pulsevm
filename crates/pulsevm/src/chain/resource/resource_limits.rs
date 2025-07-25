@@ -1,9 +1,9 @@
 use pulsevm_chainbase::{ChainbaseObject, SecondaryKey};
-use pulsevm_serialization::{Deserialize, Serialize};
+use pulsevm_proc_macros::{NumBytes, Read, Write};
 
 use crate::chain::Name;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Read, Write, NumBytes)]
 pub struct ResourceLimits {
     pub owner: Name,
     pub net_weight: i64,
@@ -19,30 +19,6 @@ impl ResourceLimits {
             cpu_weight,
             ram_bytes,
         }
-    }
-}
-
-impl Serialize for ResourceLimits {
-    fn serialize(&self, bytes: &mut Vec<u8>) {
-        self.owner.serialize(bytes);
-        self.net_weight.serialize(bytes);
-        self.cpu_weight.serialize(bytes);
-        self.ram_bytes.serialize(bytes);
-    }
-}
-
-impl Deserialize for ResourceLimits {
-    fn deserialize(data: &[u8], pos: &mut usize) -> Result<Self, pulsevm_serialization::ReadError> {
-        let owner = Name::deserialize(data, pos)?;
-        let net_weight = i64::deserialize(data, pos)?;
-        let cpu_weight = i64::deserialize(data, pos)?;
-        let ram_bytes = i64::deserialize(data, pos)?;
-        Ok(ResourceLimits {
-            owner,
-            net_weight,
-            cpu_weight,
-            ram_bytes,
-        })
     }
 }
 
