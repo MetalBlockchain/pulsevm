@@ -656,6 +656,24 @@ mod tests {
                 &Vec::<u8>::new(),
             ),
         )?;
+        controller.execute_transaction(
+            undo_session.clone(),
+            &call_contract(
+                &private_key,
+                Name::from_str("glenn")?,
+                Name::from_str("pl")?,
+                &Vec::<u8>::new(),
+            ),
+        )?;
+        controller.execute_transaction(
+            undo_session.clone(),
+            &call_contract(
+                &private_key,
+                Name::from_str("glenn")?,
+                Name::from_str("pu")?,
+                &Vec::<u8>::new(),
+            ),
+        )?;
 
         Ok(())
     }

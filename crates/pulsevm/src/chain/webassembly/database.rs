@@ -117,6 +117,30 @@ pub fn db_previous_i64() -> impl Fn(Caller<'_, WasmContext>, i32, u32) -> Result
     }
 }
 
+pub fn db_lowerbound_i64() -> impl Fn(Caller<'_, WasmContext>, u64, u64, u64, u64) -> Result<i32, wasmtime::Error> {
+    |mut caller, code, scope, table, primary| {
+        let memory = caller
+            .get_export("memory")
+            .and_then(|ext| ext.into_memory())
+            .ok_or_else(|| anyhow::anyhow!("memory export not found"))?;
+        let context = caller.data_mut().apply_context_mut();
+        let res = context.db_lowerbound_i64(code.into(), scope.into(), table.into(), primary)?;
+        Ok(res)
+    }
+}
+
+pub fn db_upperbound_i64() -> impl Fn(Caller<'_, WasmContext>, u64, u64, u64, u64) -> Result<i32, wasmtime::Error> {
+    |mut caller, code, scope, table, primary| {
+        let memory = caller
+            .get_export("memory")
+            .and_then(|ext| ext.into_memory())
+            .ok_or_else(|| anyhow::anyhow!("memory export not found"))?;
+        let context = caller.data_mut().apply_context_mut();
+        let res = context.db_upperbound_i64(code.into(), scope.into(), table.into(), primary)?;
+        Ok(res)
+    }
+}
+
 pub fn db_end_i64()
 -> impl Fn(Caller<'_, WasmContext>, u64, u64, u64) -> Result<i32, wasmtime::Error> {
     |mut caller, code, scope, table| {

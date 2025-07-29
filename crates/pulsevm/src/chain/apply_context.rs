@@ -598,6 +598,62 @@ impl ApplyContext {
         }
     }
 
+    pub fn db_lowerbound_i64(
+        &self,
+        code: Name,
+        scope: Name,
+        table: Name,
+        primary: u64,
+    ) -> Result<i32, ChainError> {
+        let tab = self.find_table(code, scope, table)?;
+
+        if tab.is_none() {
+            return Ok(-1);
+        }
+
+        let tab = tab.unwrap();
+        let mut keyval_cache = self.keyval_cache.borrow_mut();
+        let end_itr = keyval_cache.cache_table(&tab);
+        let session = self.session.borrow_mut();
+        let mut idx = session.get_index::<KeyValue, KeyValueByScopePrimaryIndex>();
+
+        let mut itr = idx.lower_bound((tab.id, primary))?;
+        let obj = itr.next()?;
+        if obj.is_none() || obj.as_ref().unwrap().table_id != tab.id {
+            return Ok(end_itr);
+        }
+
+        return Ok(keyval_cache.add(&obj.unwrap()));
+    }
+
+    pub fn db_upperbound_i64(
+        &self,
+        code: Name,
+        scope: Name,
+        table: Name,
+        primary: u64,
+    ) -> Result<i32, ChainError> {
+        let tab = self.find_table(code, scope, table)?;
+
+        if tab.is_none() {
+            return Ok(-1);
+        }
+
+        let tab = tab.unwrap();
+        let mut keyval_cache = self.keyval_cache.borrow_mut();
+        let end_itr = keyval_cache.cache_table(&tab);
+        let session = self.session.borrow_mut();
+        let mut idx = session.get_index::<KeyValue, KeyValueByScopePrimaryIndex>();
+
+        let mut itr = idx.upper_bound((tab.id, primary))?;
+        let obj = itr.next()?;
+        if obj.is_none() || obj.as_ref().unwrap().table_id != tab.id {
+            return Ok(end_itr);
+        }
+
+        return Ok(keyval_cache.add(&obj.unwrap()));
+    }
+
     pub fn find_table(
         &self,
         code: Name,

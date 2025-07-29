@@ -5,7 +5,7 @@ use wasmtime::{Config, Engine, IntoFunc, Linker, Module, Store, Strategy};
 
 use crate::chain::{
     apply_context::ApplyContext, webassembly::{
-        db_end_i64, db_find_i64, db_get_i64, db_next_i64, db_previous_i64, db_remove_i64, db_store_i64, db_update_i64, get_self, pulse_assert, read_action_data, require_auth2, require_recipient, set_action_return_value
+        db_end_i64, db_find_i64, db_get_i64, db_lowerbound_i64, db_next_i64, db_previous_i64, db_remove_i64, db_store_i64, db_update_i64, db_upperbound_i64, get_self, pulse_assert, read_action_data, require_auth2, require_recipient, set_action_return_value
     }, Action, Name
 };
 
@@ -122,6 +122,8 @@ impl WasmRuntime {
         Self::add_host_function(&mut linker, "env", "db_next_i64", db_next_i64())?;
         Self::add_host_function(&mut linker, "env", "db_previous_i64", db_previous_i64())?;
         Self::add_host_function(&mut linker, "env", "db_end_i64", db_end_i64())?;
+        Self::add_host_function(&mut linker, "env", "db_lowerbound_i64", db_lowerbound_i64())?;
+        Self::add_host_function(&mut linker, "env", "db_upperbound_i64", db_upperbound_i64())?;
         // System functions
         Self::add_host_function(&mut linker, "env", "pulse_assert", pulse_assert())?;
 
