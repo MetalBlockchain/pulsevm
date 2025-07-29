@@ -36,6 +36,10 @@ impl AccountMetadata {
     pub fn is_privileged(&self) -> bool {
         self.privileged
     }
+
+    pub fn set_privileged(&mut self, privileged: bool) {
+        self.privileged = privileged;
+    }
 }
 
 impl ChainbaseObject for AccountMetadata {

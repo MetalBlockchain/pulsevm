@@ -10,6 +10,9 @@ pub use database::*;
 mod memory;
 pub use memory::*;
 
+mod privileged;
+pub use privileged::*;
+
 mod system;
 pub use system::*;
 

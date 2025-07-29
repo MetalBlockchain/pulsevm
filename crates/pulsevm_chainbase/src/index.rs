@@ -34,10 +34,10 @@ where
     ) -> Result<IndexIterator<C, S>, Box<dyn std::error::Error>> {
         Ok(IndexIterator::<C, S> {
             undo_session: self.undo_session.clone(),
-            partition: self.keyspace.clone().open_partition(
-                S::index_name(),
-                Default::default(),
-            )?,
+            partition: self
+                .keyspace
+                .clone()
+                .open_partition(S::index_name(), Default::default())?,
             current_key: S::secondary_key(object),
             current_value: object.primary_key(),
             __phantom: std::marker::PhantomData,
@@ -52,10 +52,10 @@ where
 
         Ok(RangeIterator::<C, S> {
             undo_session: self.undo_session.clone(),
-            partition: self.keyspace.clone().open_partition(
-                S::index_name(),
-                Default::default(),
-            )?,
+            partition: self
+                .keyspace
+                .clone()
+                .open_partition(S::index_name(), Default::default())?,
             range: (Bound::Included(key_bytes.clone()), Bound::Unbounded),
             current_key: key_bytes,
             current_value: Vec::new(),
@@ -68,13 +68,13 @@ where
         key: S::Key,
     ) -> Result<RangeIterator<C, S>, Box<dyn std::error::Error>> {
         let key_bytes = S::secondary_key_as_bytes(key);
-        
+
         Ok(RangeIterator::<C, S> {
             undo_session: self.undo_session.clone(),
-            partition: self.keyspace.clone().open_partition(
-                S::index_name(),
-                Default::default(),
-            )?,
+            partition: self
+                .keyspace
+                .clone()
+                .open_partition(S::index_name(), Default::default())?,
             range: (Bound::Excluded(key_bytes.clone()), Bound::Unbounded),
             current_key: key_bytes,
             current_value: Vec::new(),
@@ -96,7 +96,7 @@ where
     __phantom: std::marker::PhantomData<(C, S)>,
 }
 
-impl <C, S> RangeIterator<C, S>
+impl<C, S> RangeIterator<C, S>
 where
     C: ChainbaseObject,
     S: SecondaryIndex<C>,
@@ -208,7 +208,10 @@ where
         let next = {
             let tx = self.undo_session.tx();
             let mut tx = tx.borrow_mut();
-            let range = (std::ops::Bound::Excluded(self.current_key.clone()), std::ops::Bound::Unbounded);
+            let range = (
+                std::ops::Bound::Excluded(self.current_key.clone()),
+                std::ops::Bound::Unbounded,
+            );
             let mut range = tx.range(&self.partition, range);
             let next = range.next();
             next

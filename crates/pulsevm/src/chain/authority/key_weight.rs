@@ -1,4 +1,3 @@
-
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 
 use crate::chain::{PublicKey, config::BillableSize};

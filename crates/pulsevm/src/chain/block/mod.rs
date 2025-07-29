@@ -34,7 +34,11 @@ impl NumBytes for BlockTimestamp {
 }
 
 impl Write for BlockTimestamp {
-    fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), pulsevm_serialization::WriteError> {
+    fn write(
+        &self,
+        bytes: &mut [u8],
+        pos: &mut usize,
+    ) -> Result<(), pulsevm_serialization::WriteError> {
         if *pos + self.num_bytes() > bytes.len() {
             return Err(pulsevm_serialization::WriteError::NotEnoughSpace);
         }

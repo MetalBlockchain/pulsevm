@@ -45,7 +45,11 @@ impl NumBytes for PublicKey {
 }
 
 impl Write for PublicKey {
-    fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), pulsevm_serialization::WriteError> {
+    fn write(
+        &self,
+        bytes: &mut [u8],
+        pos: &mut usize,
+    ) -> Result<(), pulsevm_serialization::WriteError> {
         if *pos + 33 > bytes.len() {
             return Err(pulsevm_serialization::WriteError::NotEnoughSpace);
         }

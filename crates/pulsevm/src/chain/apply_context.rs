@@ -4,7 +4,8 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     hash::Hash,
     rc::Rc,
-    sync::{Arc, RwLock}, u64,
+    sync::{Arc, RwLock},
+    u64,
 };
 
 use chrono::{DateTime, Utc};
@@ -537,7 +538,8 @@ impl ApplyContext {
         let mut keyval_cache = self.keyval_cache.borrow_mut();
         let mut idx = session.get_index::<KeyValue, KeyValueByScopePrimaryIndex>();
 
-        if iterator < -1 { // is end iterator
+        if iterator < -1 {
+            // is end iterator
             let tab = keyval_cache.find_table_by_end_iterator(iterator)?.ok_or(
                 ChainError::TransactionError(format!("invalid end iterator")),
             )?;
@@ -758,5 +760,9 @@ impl ApplyContext {
             session.insert(&DynamicGlobalPropertyObject::new(1))?;
             return Ok(1);
         }
+    }
+
+    pub fn is_privileged(&self) -> bool {
+        self.privileged
     }
 }

@@ -44,7 +44,11 @@ impl NumBytes for Id {
 }
 
 impl Write for Id {
-    fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), pulsevm_serialization::WriteError> {
+    fn write(
+        &self,
+        bytes: &mut [u8],
+        pos: &mut usize,
+    ) -> Result<(), pulsevm_serialization::WriteError> {
         if *pos + 32 > bytes.len() {
             return Err(pulsevm_serialization::WriteError::NotEnoughSpace);
         }

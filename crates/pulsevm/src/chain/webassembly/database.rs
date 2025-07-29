@@ -98,7 +98,8 @@ pub fn db_next_i64() -> impl Fn(Caller<'_, WasmContext>, i32, u32) -> Result<i32
     }
 }
 
-pub fn db_previous_i64() -> impl Fn(Caller<'_, WasmContext>, i32, u32) -> Result<i32, wasmtime::Error> {
+pub fn db_previous_i64()
+-> impl Fn(Caller<'_, WasmContext>, i32, u32) -> Result<i32, wasmtime::Error> {
     |mut caller, itr, primary_ptr| {
         let memory = caller
             .get_export("memory")
@@ -117,7 +118,8 @@ pub fn db_previous_i64() -> impl Fn(Caller<'_, WasmContext>, i32, u32) -> Result
     }
 }
 
-pub fn db_lowerbound_i64() -> impl Fn(Caller<'_, WasmContext>, u64, u64, u64, u64) -> Result<i32, wasmtime::Error> {
+pub fn db_lowerbound_i64()
+-> impl Fn(Caller<'_, WasmContext>, u64, u64, u64, u64) -> Result<i32, wasmtime::Error> {
     |mut caller, code, scope, table, primary| {
         let memory = caller
             .get_export("memory")
@@ -129,7 +131,8 @@ pub fn db_lowerbound_i64() -> impl Fn(Caller<'_, WasmContext>, u64, u64, u64, u6
     }
 }
 
-pub fn db_upperbound_i64() -> impl Fn(Caller<'_, WasmContext>, u64, u64, u64, u64) -> Result<i32, wasmtime::Error> {
+pub fn db_upperbound_i64()
+-> impl Fn(Caller<'_, WasmContext>, u64, u64, u64, u64) -> Result<i32, wasmtime::Error> {
     |mut caller, code, scope, table, primary| {
         let memory = caller
             .get_export("memory")

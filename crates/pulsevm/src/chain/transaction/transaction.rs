@@ -84,7 +84,9 @@ mod tests {
     use pulsevm_serialization::{Read, Write};
 
     use crate::chain::{
-        authority::{Authority, KeyWeight, PermissionLevel}, transaction::transaction::UnsignedTransaction, Id, Name, PrivateKey, PULSE_NAME
+        Id, Name, PULSE_NAME, PrivateKey,
+        authority::{Authority, KeyWeight, PermissionLevel},
+        transaction::transaction::UnsignedTransaction,
     };
 
     use super::{Action, Transaction};
@@ -100,15 +102,14 @@ mod tests {
     fn test_p() {
         let private_key =
             PrivateKey::from_str("frqNAoTevNse58hUoJMDzPXDbfNicjCGjNz5VDgqqHJbhBBG9").unwrap();
-        let action_data = (PULSE_NAME, name!("glenn2"), Authority::new(
-            1,
-            vec![KeyWeight::new(private_key.public_key(), 1)],
-            vec![],
-        ), Authority::new(
-            1,
-            vec![KeyWeight::new(private_key.public_key(), 1)],
-            vec![],
-        )).pack().unwrap();
+        let action_data = (
+            PULSE_NAME,
+            name!("glenn2"),
+            Authority::new(1, vec![KeyWeight::new(private_key.public_key(), 1)], vec![]),
+            Authority::new(1, vec![KeyWeight::new(private_key.public_key(), 1)], vec![]),
+        )
+            .pack()
+            .unwrap();
         let tx = Transaction {
             tx_type: 0,
             unsigned_tx: UnsignedTransaction {

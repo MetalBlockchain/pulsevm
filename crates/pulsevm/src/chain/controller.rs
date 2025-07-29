@@ -487,7 +487,8 @@ mod tests {
                             vec![],
                         ),
                     )
-                    .pack().unwrap(),
+                    .pack()
+                    .unwrap(),
                     vec![PermissionLevel::new(
                         Name::from_str("pulse").unwrap(),
                         Name::from_str("active").unwrap(),
@@ -579,8 +580,8 @@ mod tests {
                 Name::from_str("create")?,
                 &Create {
                     issuer: Name::from_str("glenn")?,
-                    max_supply: Asset::new(1000000, Symbol(1162826500))
-                }
+                    max_supply: Asset::new(1000000, Symbol(1162826500)),
+                },
             ),
         )?;
 
@@ -590,7 +591,7 @@ mod tests {
                 &private_key,
                 Name::from_str("glenn")?,
                 Name::from_str("issue")?,
-                &Issue{
+                &Issue {
                     to: Name::from_str("glenn")?,
                     quantity: Asset {
                         amount: 1000000,

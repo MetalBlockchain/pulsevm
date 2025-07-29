@@ -1,8 +1,8 @@
 use chrono::{DateTime, Utc};
+use core::str;
 use pulsevm_proc_macros::NumBytes;
 use pulsevm_proc_macros::Read;
 use pulsevm_proc_macros::Write;
-use core::str;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
@@ -10,7 +10,9 @@ use crate::chain::error::ChainError;
 
 use super::{PublicKey, block::BlockTimestamp};
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash, Default, Read, Write, NumBytes)]
+#[derive(
+    Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash, Default, Read, Write, NumBytes,
+)]
 pub struct ChainConfig {
     pub max_inline_action_size: u32,
     pub max_action_return_value_size: u32,
