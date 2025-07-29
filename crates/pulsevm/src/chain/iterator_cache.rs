@@ -110,8 +110,8 @@ where
         let result = self.iterator_to_object.get_mut(iterator as usize).unwrap();
 
         if result.is_some() {
-            *result = None;
             self.object_to_iterator.remove(result.as_ref().unwrap());
+            *result = None;
         }
 
         return Ok(());
@@ -135,5 +135,30 @@ where
 
     pub fn index_to_end_iterator(&self, index: usize) -> i32 {
         return -(index as i32 + 2);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pulsevm_proc_macros::name;
+
+    use crate::chain::KeyValue;
+
+    use super::*;
+
+    #[derive(Clone, PartialEq, Eq, Hash)]
+    struct Test {
+        account: u64,
+    }
+
+    #[test]
+    fn test_iterator_cache() {
+        let mut cache = IteratorCache::<KeyValue>::new();
+        let iter_1 = cache.add(&KeyValue::default());
+        let iter_2 = cache.add(&KeyValue::default());
+        let iter_3 = cache.add(&KeyValue::new(1, 2, 3, name!("glenn").into(), vec![]));
+        assert_eq!(iter_1, 0);
+        assert_eq!(iter_2, 0);
+        assert_eq!(iter_3, 1);
     }
 }

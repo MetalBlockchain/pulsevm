@@ -114,7 +114,7 @@ impl<'a> Database {
     }
 
     pub fn undo_session(&self) -> Result<UndoSession, Box<dyn Error>> {
-        UndoSession::new(self.keyspace.clone())
+        UndoSession::new(&self.keyspace)
     }
 }
 
@@ -126,7 +126,7 @@ pub struct UndoSession {
 }
 
 impl UndoSession {
-    pub fn new(keyspace: TransactionalKeyspace) -> Result<Self, Box<dyn Error>> {
+    pub fn new(keyspace: &TransactionalKeyspace) -> Result<Self, Box<dyn Error>> {
         Ok(Self {
             changes: Rc::new(RefCell::new(VecDeque::new())),
             tx: Rc::new(RefCell::new(keyspace.write_tx()?)),

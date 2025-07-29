@@ -86,9 +86,9 @@ mod tests {
 
     #[test]
     fn test_name() {
-        let name = Name::new(0x1234567890abcdef);
-        assert_eq!(name.as_u64(), 0x1234567890abcdef);
-        assert_eq!(name.to_string(), "1234567890abcdef");
+        let name = Name::new(6138663577826885632);
+        assert_eq!(name.as_u64(), 6138663577826885632);
+        assert_eq!(name.to_string(), "eosio");
     }
 
     #[test]

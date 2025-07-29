@@ -4,7 +4,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     hash::Hash,
     rc::Rc,
-    sync::{Arc, RwLock},
+    sync::{Arc, RwLock}, u64,
 };
 
 use chrono::{DateTime, Utc};
@@ -172,6 +172,12 @@ impl ApplyContext {
 
     pub fn finalize_trace(&self, trace: &mut ActionTrace) {
         trace.set_elapsed((Utc::now().timestamp_micros() - self.start) as u32);
+        println!(
+            "Action Trace: Elapsed: {} micros, Receiver: {}, Action: {}",
+            trace.elapsed(),
+            self.receiver,
+            self.action.name()
+        );
     }
 
     pub fn get_action(&self) -> &Action {
@@ -531,13 +537,52 @@ impl ApplyContext {
         let mut keyval_cache = self.keyval_cache.borrow_mut();
         let mut idx = session.get_index::<KeyValue, KeyValueByScopePrimaryIndex>();
 
-        if iterator < -1 {
+        if iterator < -1 { // is end iterator
             let tab = keyval_cache.find_table_by_end_iterator(iterator)?.ok_or(
                 ChainError::TransactionError(format!("invalid end iterator")),
             )?;
+
+            let mut itr = idx.upper_bound(
+                (tab.id, u64::MIN), // Use u64::MAX to get the last element
+            )?;
+            let prev_object = itr.previous()?;
+
+            match prev_object {
+                Some(prev_object) => {
+                    if prev_object.table_id != tab.id {
+                        return Ok(-1); // Empty table
+                    }
+
+                    *primary = prev_object.primary_key;
+
+                    return Ok(keyval_cache.add(&prev_object));
+                }
+                None => {
+                    // No more objects in this table
+                    return Ok(-1);
+                }
+            }
         }
 
-        Ok(-1) // Not implemented, return -1 for now
+        let obj = keyval_cache.get(iterator)?;
+        let mut itr = idx.iterator_to(obj)?;
+        let prev_object = itr.previous()?;
+
+        match prev_object {
+            Some(prev_object) => {
+                if prev_object.table_id != obj.table_id {
+                    return Ok(-1); // Empty table
+                }
+
+                *primary = prev_object.primary_key;
+
+                return Ok(keyval_cache.add(&prev_object));
+            }
+            None => {
+                // No more objects in this table
+                return Ok(-1);
+            }
+        }
     }
 
     pub fn db_end_i64(&self, code: Name, scope: Name, table: Name) -> Result<i32, ChainError> {

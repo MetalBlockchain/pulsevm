@@ -621,4 +621,42 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn test_api_db() -> Result<(), ChainError> {
+        let private_key = PrivateKey::random();
+        let mut controller = Controller::new();
+        let genesis_bytes = generate_genesis(&private_key);
+        let temp_path = get_temp_dir().to_str().unwrap().to_string();
+        controller.initialize(&genesis_bytes.to_vec(), temp_path)?;
+        assert_eq!(controller.last_accepted_block().height, 0);
+        let undo_session = Rc::new(RefCell::new(controller.create_undo_session()?));
+        controller.execute_transaction(
+            undo_session.clone(),
+            &create_account(&private_key, Name::from_str("glenn")?),
+        )?;
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let contract =
+            fs::read(root.join(Path::new("reference_contracts/test_api_db.wasm"))).unwrap();
+        controller.execute_transaction(
+            undo_session.clone(),
+            &set_code(&private_key, Name::from_str("glenn")?, contract),
+        )?;
+
+        controller.execute_transaction(
+            undo_session.clone(),
+            &call_contract(
+                &private_key,
+                Name::from_str("glenn")?,
+                Name::from_str("pg")?,
+                &Vec::<u8>::new(),
+            ),
+        )?;
+
+        Ok(())
+    }
 }

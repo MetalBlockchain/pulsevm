@@ -61,17 +61,15 @@ impl Action {
     }
 
     pub fn digest(&self) -> sha256::Hash {
-        let mut bytes: Vec<u8> = self.pack().unwrap();
+        let bytes: Vec<u8> = self.pack().unwrap();
         sha256::Hash::hash(&bytes)
     }
 }
 
 pub fn generate_action_digest(act: &Action, action_return_value: Option<Vec<u8>>) -> sha256::Hash {
-    let mut bytes: Vec<u8> = Vec::new();
-    let mut pos = 0;
-    act.write(&mut bytes, &mut pos).unwrap();
+    let mut bytes = act.pack().unwrap();
     if let Some(return_value) = action_return_value {
-        return_value.write(&mut bytes, &mut pos).unwrap();
+        bytes.extend(return_value);
     }
     sha256::Hash::hash(&bytes)
 }

@@ -88,8 +88,30 @@ pub fn db_next_i64() -> impl Fn(Caller<'_, WasmContext>, i32, u32) -> Result<i32
         let context = caller.data_mut().apply_context_mut();
         let mut next_primary = 0u64;
         let res = context.db_next_i64(itr, &mut next_primary)?;
-        let dest_bytes = next_primary.pack()?;
-        memory.write(&mut caller, primary_ptr as usize, &dest_bytes)?;
+
+        if res >= 0 {
+            let dest_bytes = next_primary.to_le_bytes(); // Convert to little-endian bytes, which is standard for WASM
+            memory.write(&mut caller, primary_ptr as usize, &dest_bytes)?;
+        }
+
+        Ok(res)
+    }
+}
+
+pub fn db_previous_i64() -> impl Fn(Caller<'_, WasmContext>, i32, u32) -> Result<i32, wasmtime::Error> {
+    |mut caller, itr, primary_ptr| {
+        let memory = caller
+            .get_export("memory")
+            .and_then(|ext| ext.into_memory())
+            .ok_or_else(|| anyhow::anyhow!("memory export not found"))?;
+        let context = caller.data_mut().apply_context_mut();
+        let mut next_primary = 0u64;
+        let res = context.db_previous_i64(itr, &mut next_primary)?;
+
+        if res >= 0 {
+            let dest_bytes = next_primary.to_le_bytes(); // Convert to little-endian bytes, which is standard for WASM
+            memory.write(&mut caller, primary_ptr as usize, &dest_bytes)?;
+        }
 
         Ok(res)
     }
