@@ -2,6 +2,7 @@ mod index;
 mod ro_index;
 
 mod session;
+use jsonrpsee::types::ErrorObjectOwned;
 pub use session::Session;
 
 mod undo_session;
@@ -9,7 +10,7 @@ pub use undo_session::UndoSession;
 
 use fjall::{Config, TransactionalKeyspace, TransactionalPartitionHandle};
 use pulsevm_serialization::{Read, Write};
-use std::{error::Error, fmt, path::Path};
+use std::{error::Error, fmt, io::Chain, path::Path};
 
 #[derive(Debug, Clone)]
 pub enum ChainbaseError {
@@ -33,6 +34,24 @@ impl fmt::Display for ChainbaseError {
 }
 
 impl Error for ChainbaseError {}
+
+impl From<ChainbaseError> for ErrorObjectOwned {
+    fn from(e: ChainbaseError) -> Self {
+        match e {
+            ChainbaseError::NotFound => ErrorObjectOwned::owned::<&str>(404, "not_found", None),
+            ChainbaseError::AlreadyExists => {
+                ErrorObjectOwned::owned::<&str>(409, "already_exists", None)
+            }
+            ChainbaseError::InvalidData => {
+                ErrorObjectOwned::owned::<&str>(400, "invalid_data", None)
+            }
+            ChainbaseError::ReadError => ErrorObjectOwned::owned::<&str>(500, "read_error", None),
+            ChainbaseError::InternalError(msg) => {
+                ErrorObjectOwned::owned::<&str>(500, "internal_error", Some(&msg))
+            }
+        }
+    }
+}
 
 pub trait ChainbaseObject: Default + Read + Write {
     type PrimaryKey: Read;

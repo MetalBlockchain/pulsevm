@@ -7,3 +7,4 @@ edition = "2024"
 fjall = { version = "2.11.2", features = ["lz4", "ssi_tx"], default-features = false }
 pulsevm_serialization = { path = "../pulsevm_serialization" }
 pulsevm_proc_macros = { path = "../pulsevm_proc_macros" }
+jsonrpsee = { version = "0.24.9", features = ["server", "macros"] }

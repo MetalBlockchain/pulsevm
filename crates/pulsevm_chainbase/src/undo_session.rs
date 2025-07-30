@@ -106,12 +106,12 @@ impl UndoSession {
 
     pub fn generate_id<T: ChainbaseObject>(&mut self) -> Result<u64, ChainbaseError> {
         let partition = open_partition(&self.keyspace, T::table_name())?;
-        let mut new_id = 0u64;
+        let mut new_id = 1u64;
         let mut tx = self.tx.borrow_mut();
         // Do we have a sequence for this table?
         tx.fetch_update(&partition, "id", |v| {
             if v.is_none() {
-                return Some(Slice::new(&0u64.to_be_bytes()));
+                return Some(Slice::new(&1u64.to_be_bytes()));
             }
             let id = v.unwrap();
             let mut arr = [0u8; 8];

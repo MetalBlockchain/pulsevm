@@ -9,8 +9,11 @@ use tokio::sync::RwLock;
 use tonic::async_trait;
 
 use crate::{
-    api::{GetAccountResponse, IssueTxResponse},
-    chain::{Account, AccountMetadata, BlockTimestamp, Name, Transaction},
+    api::{GetAccountResponse, IssueTxResponse, PermissionResponse},
+    chain::{
+        Account, AccountMetadata, BlockTimestamp, Name, Permission, PermissionByOwnerIndex,
+        Transaction,
+    },
     mempool::Mempool,
 };
 
@@ -50,6 +53,7 @@ impl RpcService {
         &self,
         request_body: &str,
     ) -> Result<String, serde_json::Error> {
+        println!("Handling API request: {}", request_body);
         // Make sure `RpcService` implements your API trait
         let module = self.clone().into_rpc();
 
@@ -64,12 +68,13 @@ impl RpcService {
 #[async_trait]
 impl RpcServer for RpcService {
     async fn get_account(&self, name: Name) -> Result<GetAccountResponse, ErrorObjectOwned> {
+        println!("Getting account: {}", name);
         let controller = self.controller.clone();
         let controller = controller.read().await;
         let database = controller.database();
-        let mut session = database.session().map_err(|e| {
-            ErrorObjectOwned::owned(500, "database_error", Some(format!("{}", e)))
-        })?;
+        let mut session = database
+            .session()
+            .map_err(|e| ErrorObjectOwned::owned(500, "database_error", Some(format!("{}", e))))?;
         let accnt_obj = session.get::<Account>(name.clone()).map_err(|e| {
             ErrorObjectOwned::owned(404, "account_not_found", Some(format!("{}", e)))
         })?;
@@ -81,6 +86,28 @@ impl RpcServer for RpcService {
         result.privileged = accnt_metadata_obj.is_privileged();
         result.last_code_update = accnt_metadata_obj.last_code_update;
         result.created = accnt_obj.creation_date;
+
+        let mut permissions = session.get_index::<Permission, PermissionByOwnerIndex>();
+        let mut perm_iter = permissions.lower_bound((name.clone(), Name::default()))?;
+        while let Some(perm) = perm_iter.next()? {
+            if perm.owner != name {
+                break; // Stop if we reach a different owner
+            }
+
+            let mut parent = Name::default();
+
+            if perm.parent_id() > 0 {
+                let parent_perm = session.get::<Permission>(perm.parent_id())?;
+                parent = parent_perm.name.clone();
+            }
+
+            result.permissions.push(PermissionResponse::new(
+                perm.name.clone(),
+                parent,
+                perm.authority.clone(),
+            ));
+        }
+
         Ok(result)
     }
 

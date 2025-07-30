@@ -1,6 +1,23 @@
 use serde::Serialize;
 
-use crate::chain::{BlockTimestamp, Name, Permission};
+use crate::chain::{Authority, BlockTimestamp, Name};
+
+#[derive(Serialize, Clone, Default)]
+pub struct PermissionResponse {
+    perm_name: Name,
+    parent: Name,
+    required_auth: Authority,
+}
+
+impl PermissionResponse {
+    pub fn new(perm_name: Name, parent: Name, required_auth: Authority) -> Self {
+        PermissionResponse {
+            perm_name,
+            parent,
+            required_auth,
+        }
+    }
+}
 
 #[derive(Serialize, Clone, Default)]
 pub struct GetAccountResponse {
@@ -16,7 +33,7 @@ pub struct GetAccountResponse {
 
     pub ram_usage: i64,
 
-    pub permissions: Vec<Permission>,
+    pub permissions: Vec<PermissionResponse>,
 }
 
 #[derive(Serialize, Clone)]

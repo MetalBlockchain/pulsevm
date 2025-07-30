@@ -1,6 +1,7 @@
 use std::{io::Chain, ops::Bound};
 
 use fjall::{TransactionalKeyspace, TransactionalPartitionHandle};
+use pulsevm_serialization::Write;
 
 use crate::{ChainbaseError, ChainbaseObject, SecondaryIndex, UndoSession};
 
@@ -45,8 +46,10 @@ where
         })
     }
 
-    pub fn lower_bound(&mut self, key: S::Key) -> Result<RangeIterator<C, S>, ChainbaseError> {
-        let key_bytes = S::secondary_key_as_bytes(key);
+    pub fn lower_bound(&mut self, key: impl Write) -> Result<RangeIterator<C, S>, ChainbaseError> {
+        let key_bytes = key.pack().map_err(|e| {
+            ChainbaseError::InternalError(format!("failed to serialize key: {}", e))
+        })?;
 
         Ok(RangeIterator::<C, S> {
             undo_session: self.undo_session.clone(),
@@ -62,8 +65,10 @@ where
         })
     }
 
-    pub fn upper_bound(&mut self, key: S::Key) -> Result<RangeIterator<C, S>, ChainbaseError> {
-        let key_bytes = S::secondary_key_as_bytes(key);
+    pub fn upper_bound(&mut self, key: impl Write) -> Result<RangeIterator<C, S>, ChainbaseError> {
+        let key_bytes = key.pack().map_err(|e| {
+            ChainbaseError::InternalError(format!("failed to serialize key: {}", e))
+        })?;
 
         Ok(RangeIterator::<C, S> {
             undo_session: self.undo_session.clone(),
@@ -134,6 +139,10 @@ where
                 .map_err(|e| ChainbaseError::InternalError(e.to_string()))?;
             self.current_key = key.to_vec();
             self.current_value = value.to_vec();
+            self.range = (
+                Bound::Excluded(self.current_key.clone()),
+                Bound::Unbounded,
+            );
             if let Ok(object) = self.get_object() {
                 return Ok(Some(object));
             } else {
@@ -167,6 +176,10 @@ where
                 .map_err(|e| ChainbaseError::InternalError(e.to_string()))?;
             self.current_key = key.to_vec();
             self.current_value = value.to_vec();
+            self.range = (
+                Bound::Excluded(self.current_key.clone()),
+                Bound::Unbounded,
+            );
             if let Ok(object) = self.get_object() {
                 return Ok(Some(object));
             } else {

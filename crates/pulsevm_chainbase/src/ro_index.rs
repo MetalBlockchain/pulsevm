@@ -1,6 +1,7 @@
 use std::{io::Chain, ops::Bound};
 
 use fjall::{TransactionalKeyspace, TransactionalPartitionHandle};
+use pulsevm_serialization::Write;
 
 use crate::{ChainbaseError, ChainbaseObject, SecondaryIndex, Session};
 
@@ -47,9 +48,11 @@ where
 
     pub fn lower_bound(
         &mut self,
-        key: S::Key,
+        key: impl Write,
     ) -> Result<ReadOnlyRangeIterator<C, S>, ChainbaseError> {
-        let key_bytes = S::secondary_key_as_bytes(key);
+        let key_bytes = key.pack().map_err(|e| {
+            ChainbaseError::InternalError(format!("failed to serialize key: {}", e))
+        })?;
 
         Ok(ReadOnlyRangeIterator::<C, S> {
             session: self.session.clone(),
@@ -67,9 +70,11 @@ where
 
     pub fn upper_bound(
         &mut self,
-        key: S::Key,
+        key: impl Write,
     ) -> Result<ReadOnlyRangeIterator<C, S>, ChainbaseError> {
-        let key_bytes = S::secondary_key_as_bytes(key);
+        let key_bytes = key.pack().map_err(|e| {
+            ChainbaseError::InternalError(format!("failed to serialize key: {}", e))
+        })?;
 
         Ok(ReadOnlyRangeIterator::<C, S> {
             session: self.session.clone(),
@@ -140,6 +145,10 @@ where
                 .map_err(|e| ChainbaseError::InternalError(e.to_string()))?;
             self.current_key = key.to_vec();
             self.current_value = value.to_vec();
+            self.range = (
+                Bound::Excluded(self.current_key.clone()),
+                Bound::Unbounded,
+            );
             if let Ok(object) = self.get_object() {
                 return Ok(Some(object));
             } else {
@@ -173,6 +182,10 @@ where
                 .map_err(|e| ChainbaseError::InternalError(e.to_string()))?;
             self.current_key = key.to_vec();
             self.current_value = value.to_vec();
+            self.range = (
+                Bound::Excluded(self.current_key.clone()),
+                Bound::Unbounded,
+            );
             if let Ok(object) = self.get_object() {
                 return Ok(Some(object));
             } else {
