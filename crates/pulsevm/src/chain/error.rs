@@ -1,5 +1,8 @@
 use std::{error::Error, fmt};
 
+use jsonrpsee::types::ErrorObjectOwned;
+use pulsevm_chainbase::ChainbaseError;
+
 use super::Name;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -13,6 +16,7 @@ pub enum ChainError {
     TransactionError(String),
     NetworkError(String),
     WasmRuntimeError(String),
+    DatabaseError(String),
 }
 
 impl fmt::Display for ChainError {
@@ -37,6 +41,7 @@ impl fmt::Display for ChainError {
             ChainError::TransactionError(msg) => write!(f, "transaction error: {}", msg),
             ChainError::NetworkError(msg) => write!(f, "network error: {}", msg),
             ChainError::WasmRuntimeError(msg) => write!(f, "wasm runtime error: {}", msg),
+            ChainError::DatabaseError(msg) => write!(f, "database error: {}", msg),
         }
     }
 }
@@ -52,5 +57,23 @@ impl From<pulsevm_serialization::ReadError> for ChainError {
 impl From<Box<dyn Error>> for ChainError {
     fn from(_: Box<dyn Error>) -> Self {
         ChainError::InternalError(None)
+    }
+}
+
+impl From<ChainbaseError> for ChainError {
+    fn from(e: ChainbaseError) -> Self {
+        match e {
+            ChainbaseError::NotFound => ChainError::DatabaseError("item not found".to_string()),
+            ChainbaseError::AlreadyExists => {
+                ChainError::DatabaseError("item already exists".to_string())
+            }
+            ChainbaseError::InvalidData => {
+                ChainError::DatabaseError("invalid data provided".to_string())
+            }
+            ChainbaseError::ReadError => {
+                ChainError::DatabaseError("error reading data".to_string())
+            }
+            ChainbaseError::InternalError(msg) => ChainError::DatabaseError(msg),
+        }
     }
 }

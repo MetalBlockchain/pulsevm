@@ -167,8 +167,7 @@ impl WasmRuntime {
     ) -> Result<(), ChainError> {
         // Different scope so session is released before running the wasm code.
         {
-            let session = apply_context.undo_session();
-            let mut session = session.borrow_mut();
+            let mut session = apply_context.undo_session();
 
             if !self.code_cache.contains(&code_hash) {
                 let code_object = session.get::<CodeObject>(code_hash).map_err(|e| {

@@ -16,7 +16,7 @@ use super::{
 
 #[derive(Clone)]
 pub struct TransactionContext {
-    session: Rc<RefCell<UndoSession>>,
+    session: UndoSession,
     wasm_runtime: Arc<RwLock<WasmRuntime>>,
     pending_block_timestamp: BlockTimestamp,
 
@@ -25,7 +25,7 @@ pub struct TransactionContext {
 
 impl TransactionContext {
     pub fn new(
-        session: Rc<RefCell<UndoSession>>,
+        session: UndoSession,
         wasm_runtime: Arc<RwLock<WasmRuntime>>,
         pending_block_timestamp: BlockTimestamp,
     ) -> Self {

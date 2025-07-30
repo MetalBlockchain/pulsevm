@@ -26,9 +26,9 @@ use super::{
 
 #[derive(Clone)]
 pub struct ApplyContext {
-    session: Rc<RefCell<UndoSession>>, // The undo session for this context
+    session: UndoSession,                   // The undo session for this context
     wasm_runtime: Arc<RwLock<WasmRuntime>>, // Context for the Wasm runtime
-    trx_context: TransactionContext,   // The transaction context
+    trx_context: TransactionContext,        // The transaction context
 
     action: Action,     // The action being applied
     receiver: Name,     // The account that is receiving the action
@@ -48,7 +48,7 @@ pub struct ApplyContext {
 
 impl ApplyContext {
     pub fn new(
-        session: Rc<RefCell<UndoSession>>,
+        session: UndoSession,
         wasm_runtime: Arc<RwLock<WasmRuntime>>,
         trx_context: TransactionContext,
         action: Action,
@@ -166,7 +166,8 @@ impl ApplyContext {
             first_receiver_account.abi_sequence,
         );
 
-        for auth in self.action.authorization() {
+        let auths = self.action.authorization().to_vec();
+        for auth in auths.iter() {
             receipt.add_auth_sequence(auth.actor(), self.next_auth_sequence(&mut auth.actor())?);
         }
 
@@ -252,7 +253,6 @@ impl ApplyContext {
     pub fn is_account(&mut self, account: Name) -> Result<bool, ChainError> {
         let exists = self
             .session
-            .borrow_mut()
             .find::<Account>(account)
             .map(|account| account.is_some())
             .map_err(|e| ChainError::TransactionError(format!("failed to find account: {}", e)))?;
@@ -263,14 +263,13 @@ impl ApplyContext {
         self.receiver
     }
 
-    pub fn undo_session(&self) -> Rc<RefCell<UndoSession>> {
+    pub fn undo_session(&self) -> UndoSession {
         self.session.clone()
     }
 
     pub fn execute_inline(&mut self, a: &Action) -> Result<(), ChainError> {
         {
-            let mut session = self.session.borrow_mut();
-            let code = session.find::<Account>(a.account())?;
+            let code = self.session.find::<Account>(a.account())?;
             pulse_assert(
                 code.is_some(),
                 ChainError::TransactionError(format!(
@@ -280,7 +279,7 @@ impl ApplyContext {
             )?;
 
             for auth in a.authorization() {
-                let actor = session.find::<Account>(auth.actor())?;
+                let actor = self.session.find::<Account>(auth.actor())?;
                 pulse_assert(
                     actor.is_some(),
                     ChainError::TransactionError(format!(
@@ -289,7 +288,7 @@ impl ApplyContext {
                     )),
                 )?;
                 pulse_assert(
-                    AuthorizationManager::find_permission(&mut session, auth)?.is_some(),
+                    AuthorizationManager::find_permission(&mut self.session, auth)?.is_some(),
                     ChainError::TransactionError(format!(
                         "inline action's authorizations include a non-existent permission: {}",
                         auth
@@ -301,7 +300,7 @@ impl ApplyContext {
             provided_permissions.insert(PermissionLevel::new(self.receiver.clone(), CODE_NAME));
 
             AuthorizationManager::check_authorization(
-                &mut session,
+                &mut self.session,
                 &vec![a.clone()],
                 &HashSet::new(),       // No provided keys
                 &provided_permissions, // Default permission level
@@ -355,7 +354,7 @@ impl ApplyContext {
     }
 
     pub fn db_find_i64(
-        &self,
+        &mut self,
         code: Name,
         scope: Name,
         table: Name,
@@ -372,7 +371,6 @@ impl ApplyContext {
         let table_end_itr = keyval_cache.cache_table(&table);
         let obj = self
             .session
-            .borrow_mut()
             .find_by_secondary::<KeyValue, KeyValueByScopePrimaryIndex>((table.id, id))
             .map_err(|e| ChainError::TransactionError(format!("failed to find keyval: {}", e)))?;
 
@@ -398,13 +396,12 @@ impl ApplyContext {
             )),
         )?;
 
-        let mut session = self.session.borrow_mut();
-        let id = session.generate_id::<KeyValue>()?;
+        let id = self.session.generate_id::<KeyValue>()?;
         let key_value = KeyValue::new(id, table.id, primary_key, payer, data.clone());
-        session
+        self.session
             .insert(&key_value)
             .map_err(|e| ChainError::TransactionError(format!("failed to insert keyval: {}", e)))?;
-        session.modify(&mut table, |t| {
+        self.session.modify(&mut table, |t| {
             t.count += 1;
         })?;
 
@@ -467,8 +464,7 @@ impl ApplyContext {
             self.update_db_usage(obj.payer, new_size - old_size)?;
         }
 
-        let mut session = self.session.borrow_mut();
-        session.modify(&mut obj.clone(), |kv| {
+        self.session.modify(&mut obj.clone(), |kv| {
             kv.payer = payer;
             kv.value = data.clone();
         })?;
@@ -490,15 +486,14 @@ impl ApplyContext {
             -(obj.value.len() as i64 + billable_size_v::<KeyValue>() as i64),
         )?;
 
-        let mut session = self.session.borrow_mut();
-        session.remove(obj.clone())?;
-        session.modify(&mut table_obj.clone(), |t| {
+        self.session.remove(obj.clone())?;
+        self.session.modify(&mut table_obj.clone(), |t| {
             t.count -= 1;
         })?;
 
         if table_obj.count == 0 {
             // If the table is empty, we can remove it
-            session.remove(table_obj.clone())?;
+            self.session.remove(table_obj.clone())?;
         }
 
         keyval_cache.remove(iterator)?;
@@ -511,10 +506,11 @@ impl ApplyContext {
             return Ok(-1); // Cannot increment past end iterator of table
         }
 
-        let session = self.session.borrow_mut();
         let mut keyval_cache = self.keyval_cache.borrow_mut();
         let obj = keyval_cache.get(iterator)?;
-        let mut idx = session.get_index::<KeyValue, KeyValueByScopePrimaryIndex>();
+        let mut idx = self
+            .session
+            .get_index::<KeyValue, KeyValueByScopePrimaryIndex>();
 
         let mut itr = idx.iterator_to(obj)?;
         let next_object = itr.next()?;
@@ -538,9 +534,10 @@ impl ApplyContext {
     }
 
     pub fn db_previous_i64(&self, iterator: i32, primary: &mut u64) -> Result<i32, ChainError> {
-        let session = self.session.borrow_mut();
         let mut keyval_cache = self.keyval_cache.borrow_mut();
-        let mut idx = session.get_index::<KeyValue, KeyValueByScopePrimaryIndex>();
+        let mut idx = self
+            .session
+            .get_index::<KeyValue, KeyValueByScopePrimaryIndex>();
 
         if iterator < -1 {
             // is end iterator
@@ -591,7 +588,7 @@ impl ApplyContext {
         }
     }
 
-    pub fn db_end_i64(&self, code: Name, scope: Name, table: Name) -> Result<i32, ChainError> {
+    pub fn db_end_i64(&mut self, code: Name, scope: Name, table: Name) -> Result<i32, ChainError> {
         let tab = self.find_table(code, scope, table)?;
 
         match tab {
@@ -605,7 +602,7 @@ impl ApplyContext {
     }
 
     pub fn db_lowerbound_i64(
-        &self,
+        &mut self,
         code: Name,
         scope: Name,
         table: Name,
@@ -620,8 +617,9 @@ impl ApplyContext {
         let tab = tab.unwrap();
         let mut keyval_cache = self.keyval_cache.borrow_mut();
         let end_itr = keyval_cache.cache_table(&tab);
-        let session = self.session.borrow_mut();
-        let mut idx = session.get_index::<KeyValue, KeyValueByScopePrimaryIndex>();
+        let mut idx = self
+            .session
+            .get_index::<KeyValue, KeyValueByScopePrimaryIndex>();
 
         let mut itr = idx.lower_bound((tab.id, primary))?;
         let obj = itr.next()?;
@@ -633,7 +631,7 @@ impl ApplyContext {
     }
 
     pub fn db_upperbound_i64(
-        &self,
+        &mut self,
         code: Name,
         scope: Name,
         table: Name,
@@ -648,8 +646,9 @@ impl ApplyContext {
         let tab = tab.unwrap();
         let mut keyval_cache = self.keyval_cache.borrow_mut();
         let end_itr = keyval_cache.cache_table(&tab);
-        let session = self.session.borrow_mut();
-        let mut idx = session.get_index::<KeyValue, KeyValueByScopePrimaryIndex>();
+        let mut idx = self
+            .session
+            .get_index::<KeyValue, KeyValueByScopePrimaryIndex>();
 
         let mut itr = idx.upper_bound((tab.id, primary))?;
         let obj = itr.next()?;
@@ -661,13 +660,13 @@ impl ApplyContext {
     }
 
     pub fn find_table(
-        &self,
+        &mut self,
         code: Name,
         scope: Name,
         table: Name,
     ) -> Result<Option<Table>, ChainError> {
-        let mut session = self.session.borrow_mut();
-        let table = session
+        let table = self
+            .session
             .find_by_secondary::<Table, TableByCodeScopeTableIndex>((code, scope, table))
             .map_err(|e| ChainError::TransactionError(format!("failed to find table: {}", e)))?;
         Ok(table)
@@ -680,27 +679,26 @@ impl ApplyContext {
         table: Name,
         payer: Name,
     ) -> Result<Table, ChainError> {
-        let mut session = self.session.borrow_mut();
-        let existing_tid = session
+        let existing_tid = self
+            .session
             .find_by_secondary::<Table, TableByCodeScopeTableIndex>((code, scope, table))
             .map_err(|e| ChainError::TransactionError(format!("failed to find table: {}", e)))?;
         if let Some(existing_table) = existing_tid {
             return Ok(existing_table);
         }
         // TODO: Update payer's RAM usage
-        let id = session.generate_id::<Table>()?;
+        let id = self.session.generate_id::<Table>()?;
         let table = Table::new(
             id, code, scope, table, payer, 0, // Initial count is 0
         );
-        session
+        self.session
             .insert(&table)
             .map_err(|e| ChainError::TransactionError(format!("failed to insert table: {}", e)))?;
         Ok(table)
     }
 
-    pub fn get_account_metadata(&self, account: Name) -> Result<AccountMetadata, ChainError> {
-        let mut session = self.session.borrow_mut();
-        session.get::<AccountMetadata>(account).map_err(|e| {
+    pub fn get_account_metadata(&mut self, account: Name) -> Result<AccountMetadata, ChainError> {
+        self.session.get::<AccountMetadata>(account).map_err(|e| {
             ChainError::TransactionError(format!("failed to get account metadata: {}", e))
         })
     }
@@ -727,41 +725,38 @@ impl ApplyContext {
     }
 
     pub fn next_recv_sequence(
-        &self,
+        &mut self,
         receiver_account: &mut AccountMetadata,
     ) -> Result<u64, ChainError> {
-        let mut session = self.session.borrow_mut();
         let next_sequence = receiver_account.recv_sequence + 1;
-        session.modify(receiver_account, |am| {
+        self.session.modify(receiver_account, |am| {
             am.recv_sequence = next_sequence;
         })?;
 
         Ok(next_sequence)
     }
 
-    pub fn next_auth_sequence(&self, actor: &Name) -> Result<u64, ChainError> {
-        let mut session = self.session.borrow_mut();
-        let mut amo = session.get::<AccountMetadata>(actor.clone())?;
+    pub fn next_auth_sequence(&mut self, actor: &Name) -> Result<u64, ChainError> {
+        let mut amo = self.session.get::<AccountMetadata>(actor.clone())?;
         let next_sequence = amo.auth_sequence + 1;
-        session.modify(&mut amo, |amo| {
+        self.session.modify(&mut amo, |amo| {
             amo.auth_sequence = next_sequence;
         })?;
 
         Ok(next_sequence)
     }
 
-    pub fn next_global_sequence(&self) -> Result<u64, ChainError> {
-        let mut session = self.session.borrow_mut();
-        let dgpo = session.find::<DynamicGlobalPropertyObject>(0)?;
+    pub fn next_global_sequence(&mut self) -> Result<u64, ChainError> {
+        let dgpo = self.session.find::<DynamicGlobalPropertyObject>(0)?;
 
         if let Some(mut dgpo) = dgpo {
             let next_sequence = dgpo.global_action_sequence + 1;
-            session.modify(&mut dgpo, |dgpo| {
+            self.session.modify(&mut dgpo, |dgpo| {
                 dgpo.global_action_sequence = next_sequence;
             })?;
             return Ok(next_sequence);
         } else {
-            session.insert(&DynamicGlobalPropertyObject::new(1))?;
+            self.session.insert(&DynamicGlobalPropertyObject::new(1))?;
             return Ok(1);
         }
     }

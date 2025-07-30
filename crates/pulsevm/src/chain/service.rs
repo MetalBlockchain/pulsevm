@@ -66,11 +66,14 @@ impl RpcServer for RpcService {
     async fn get_account(&self, name: Name) -> Result<GetAccountResponse, ErrorObjectOwned> {
         let controller = self.controller.clone();
         let controller = controller.read().await;
-        let mut database = controller.database();
-        let accnt_obj = database.get::<Account>(name.clone()).map_err(|e| {
+        let database = controller.database();
+        let mut session = database.session().map_err(|e| {
+            ErrorObjectOwned::owned(500, "database_error", Some(format!("{}", e)))
+        })?;
+        let accnt_obj = session.get::<Account>(name.clone()).map_err(|e| {
             ErrorObjectOwned::owned(404, "account_not_found", Some(format!("{}", e)))
         })?;
-        let accnt_metadata_obj = database.get::<AccountMetadata>(name.clone()).map_err(|e| {
+        let accnt_metadata_obj = session.get::<AccountMetadata>(name.clone()).map_err(|e| {
             ErrorObjectOwned::owned(404, "account_not_found", Some(format!("{}", e)))
         })?;
         let mut result = GetAccountResponse::default();
@@ -104,11 +107,13 @@ impl RpcServer for RpcService {
 
         // Run transaction and revert it
         let controller = self.controller.clone();
-        let controller = controller.read().await;
+        let mut controller = controller.write().await;
         let pending_block_timestamp = BlockTimestamp::now();
-        controller.push_transaction(&tx, pending_block_timestamp).map_err(|e| {
-            ErrorObjectOwned::owned(500, "transaction_error", Some(format!("{}", e)))
-        })?;
+        controller
+            .push_transaction(&tx, pending_block_timestamp)
+            .map_err(|e| {
+                ErrorObjectOwned::owned(500, "transaction_error", Some(format!("{}", e)))
+            })?;
 
         // Add to mempool
         let mempool_clone = self.mempool.clone();

@@ -14,8 +14,7 @@ pub fn is_privileged() -> impl Fn(Caller<'_, WasmContext>, u64) -> Result<i32, w
     |mut caller, account| {
         let context = caller.data_mut().apply_context_mut();
         privileged_check(context)?;
-        let session = context.undo_session();
-        let mut session = session.borrow_mut();
+        let mut session = context.undo_session();
         let account = session
             .get::<AccountMetadata>(account.into())
             .map_err(|_| anyhow::anyhow!("account not found: {}", account))?;
@@ -29,8 +28,7 @@ pub fn set_privileged() -> impl Fn(Caller<'_, WasmContext>, u64, i32) -> Result<
     |mut caller, account, is_priv| {
         let context = caller.data_mut().apply_context_mut();
         privileged_check(context)?;
-        let session = context.undo_session();
-        let mut session = session.borrow_mut();
+        let mut session = context.undo_session();
         let mut account = session
             .get::<AccountMetadata>(account.into())
             .map_err(|_| anyhow::anyhow!("account not found: {}", account))?;

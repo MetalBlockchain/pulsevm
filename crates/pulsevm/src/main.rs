@@ -240,7 +240,7 @@ impl Vm for VirtualMachine {
     ) -> Result<tonic::Response<vm::BuildBlockResponse>, Status> {
         info!("building block");
         let controller = self.controller.clone();
-        let controller = controller.write().await;
+        let mut controller = controller.write().await;
         let mempool = self.mempool.clone();
         let block = controller
             .build_block(mempool)
@@ -279,7 +279,7 @@ impl Vm for VirtualMachine {
         request: Request<vm::GetBlockRequest>,
     ) -> Result<tonic::Response<vm::GetBlockResponse>, Status> {
         let controller = self.controller.clone();
-        let controller = controller.read().await;
+        let mut controller = controller.write().await;
         let block_id: Id = request
             .get_ref()
             .id

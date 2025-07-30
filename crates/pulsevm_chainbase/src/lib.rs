@@ -1,21 +1,47 @@
 mod index;
+mod ro_index;
+
+mod session;
+pub use session::Session;
 
 mod undo_session;
 pub use undo_session::UndoSession;
 
-use fjall::{Config, TransactionalKeyspace};
+use fjall::{Config, TransactionalKeyspace, TransactionalPartitionHandle};
 use pulsevm_serialization::{Read, Write};
-use std::{error::Error, path::Path};
+use std::{error::Error, fmt, path::Path};
+
+#[derive(Debug, Clone)]
+pub enum ChainbaseError {
+    NotFound,
+    AlreadyExists,
+    InvalidData,
+    ReadError,
+    InternalError(String),
+}
+
+impl fmt::Display for ChainbaseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ChainbaseError::NotFound => write!(f, "item not found"),
+            ChainbaseError::AlreadyExists => write!(f, "item already exists"),
+            ChainbaseError::InvalidData => write!(f, "invalid data provided"),
+            ChainbaseError::ReadError => write!(f, "error reading data"),
+            ChainbaseError::InternalError(msg) => write!(f, "internal error: {}", msg),
+        }
+    }
+}
+
+impl Error for ChainbaseError {}
 
 pub trait ChainbaseObject: Default + Read + Write {
     type PrimaryKey: Read;
 
     fn primary_key(&self) -> Vec<u8>;
     fn primary_key_to_bytes(key: Self::PrimaryKey) -> Vec<u8>;
-    fn primary_key_from_bytes(key: &[u8]) -> Result<Self::PrimaryKey, Box<dyn Error>> {
+    fn primary_key_from_bytes(key: &[u8]) -> Result<Self::PrimaryKey, ChainbaseError> {
         let mut pos = 0;
-        Ok(Self::PrimaryKey::read(key, &mut pos)
-            .map_err(|_| format!("failed to read primary key from bytes"))?)
+        Ok(Self::PrimaryKey::read(key, &mut pos).map_err(|_| ChainbaseError::ReadError)?)
     }
     fn secondary_indexes(&self) -> Vec<SecondaryKey>;
     fn table_name() -> &'static str;
@@ -57,68 +83,27 @@ impl<'a> Database {
         Ok(Self { keyspace })
     }
 
-    pub fn exists<T: ChainbaseObject>(&self, key: T::PrimaryKey) -> Result<bool, Box<dyn Error>> {
-        let partition = self
-            .keyspace
-            .open_partition(T::table_name(), Default::default())?;
-        let res = partition.contains_key(T::primary_key_to_bytes(key))?;
-        Ok(res)
+    pub fn session(&self) -> Result<Session, ChainbaseError> {
+        Session::new(&self.keyspace)
     }
 
-    #[must_use]
-    pub fn find<T: ChainbaseObject>(
-        &self,
-        key: T::PrimaryKey,
-    ) -> Result<Option<T>, Box<dyn Error>> {
-        let partition = self
-            .keyspace
-            .open_partition(T::table_name(), Default::default())?;
-        let serialized = partition.get(T::primary_key_to_bytes(key))?;
-        if serialized.is_none() {
-            return Ok(None);
-        }
-        let mut pos = 0 as usize;
-        let object: T = T::read(&serialized.unwrap(), &mut pos).expect("failed to read object");
-        Ok(Some(object))
-    }
-
-    #[must_use]
-    pub fn get<T: ChainbaseObject>(&mut self, key: T::PrimaryKey) -> Result<T, Box<dyn Error>> {
-        let found = self.find::<T>(key)?;
-        if found.is_none() {
-            return Err("Object not found".into());
-        }
-        let object = found.unwrap();
-        Ok(object)
-    }
-
-    #[must_use]
-    pub fn find_by_secondary<T: ChainbaseObject, S: SecondaryIndex<T>>(
-        &self,
-        key: S::Key,
-    ) -> Result<Option<T>, Box<dyn Error>> {
-        let partition = self
-            .keyspace
-            .open_partition(S::index_name(), Default::default())?;
-        let secondary_key = partition.get(S::secondary_key_as_bytes(key))?;
-        if secondary_key.is_none() {
-            return Ok(None);
-        }
-        let partition = self
-            .keyspace
-            .open_partition(T::table_name(), Default::default())?;
-        let serialized = partition.get(secondary_key.unwrap())?;
-        if serialized.is_none() {
-            return Ok(None);
-        }
-        let mut pos = 0 as usize;
-        let object: T = T::read(&serialized.unwrap(), &mut pos).expect("failed to read object");
-        Ok(Some(object))
-    }
-
-    pub fn undo_session(&self) -> Result<UndoSession, Box<dyn Error>> {
+    pub fn undo_session(&self) -> Result<UndoSession, ChainbaseError> {
         UndoSession::new(&self.keyspace)
     }
+}
+
+fn open_partition(
+    keyspace: &TransactionalKeyspace,
+    table_name: &str,
+) -> Result<TransactionalPartitionHandle, ChainbaseError> {
+    keyspace
+        .open_partition(table_name, Default::default())
+        .map_err(|_| {
+            ChainbaseError::InternalError(format!(
+                "failed to open partition for table: {}",
+                table_name
+            ))
+        })
 }
 
 mod tests {

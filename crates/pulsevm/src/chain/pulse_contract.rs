@@ -38,8 +38,7 @@ pub fn newaccount(context: &mut ApplyContext) -> Result<(), ChainError> {
     )?;
 
     // Check if the creator is privileged
-    let session = context.undo_session();
-    let mut session = session.borrow_mut();
+    let mut session = context.undo_session();
     let creator = session
         .get::<AccountMetadata>(create.creator)
         .map_err(|_| ChainError::TransactionError(format!("failed to find creator account")))?;
@@ -62,7 +61,11 @@ pub fn newaccount(context: &mut ApplyContext) -> Result<(), ChainError> {
         )),
     )?;
     session
-        .insert(&Account::new(create.name, context.pending_block_timestamp(), vec![]))
+        .insert(&Account::new(
+            create.name,
+            context.pending_block_timestamp(),
+            vec![],
+        ))
         .map_err(|_| ChainError::TransactionError(format!("failed to insert account")))?;
     session
         .insert(&AccountMetadata::new(create.name))
@@ -123,8 +126,7 @@ pub fn setcode(context: &mut ApplyContext) -> Result<(), ChainError> {
         // TODO: validate wasm
     }
 
-    let session = context.undo_session();
-    let mut session = session.borrow_mut();
+    let mut session = context.undo_session();
     let mut account = session
         .get::<AccountMetadata>(act.account)
         .map_err(|_| ChainError::TransactionError(format!("failed to find account")))?;
@@ -211,8 +213,7 @@ pub fn setcode(context: &mut ApplyContext) -> Result<(), ChainError> {
 }
 
 pub fn setabi(context: &mut ApplyContext) -> Result<(), ChainError> {
-    let session = context.undo_session();
-    let mut session = session.borrow_mut();
+    let mut session = context.undo_session();
     let act = context
         .get_action()
         .data_as::<SetAbi>()
@@ -270,8 +271,7 @@ pub fn updateauth(context: &mut ApplyContext) -> Result<(), ChainError> {
         ChainError::TransactionError(format!("cannot set an authority as its own parent")),
     )?;
 
-    let session = context.undo_session();
-    let mut session = session.borrow_mut();
+    let mut session = context.undo_session();
 
     session.get::<Account>(update.account).map_err(|_| {
         ChainError::TransactionError(format!("failed to find account {}", update.account))

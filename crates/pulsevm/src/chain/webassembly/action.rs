@@ -55,8 +55,7 @@ pub fn set_action_return_value()
     |mut caller, buffer_ptr, buffer_len| {
         {
             let context = caller.data().apply_context();
-            let session = context.undo_session();
-            let mut session = session.borrow_mut();
+            let mut session = context.undo_session();
             let gpo = Controller::get_global_properties(&mut session)?;
             pulse_assert(
                 buffer_len <= gpo.configuration.max_action_return_value_size,
