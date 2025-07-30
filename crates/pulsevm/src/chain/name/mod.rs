@@ -3,6 +3,7 @@ use std::{ops::Deref, str::FromStr};
 
 use pulsevm_name::{NAME_MAX_LEN, name_from_bytes, name_to_bytes};
 use pulsevm_proc_macros::{NumBytes, Read, Write};
+use serde::{Deserialize, Serialize};
 
 use crate::chain::error::ChainError;
 
@@ -77,6 +78,25 @@ impl Deref for Name {
 
     fn deref(&self) -> &Self::Target {
         &self.0
+    }
+}
+
+impl Serialize for Name {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for Name {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Name::from_str(&s).map_err(serde::de::Error::custom)
     }
 }
 

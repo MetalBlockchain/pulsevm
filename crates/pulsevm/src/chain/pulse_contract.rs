@@ -1,11 +1,5 @@
-use std::{
-    cell::{RefCell, RefMut},
-    rc::Rc,
-};
-
 use pulsevm_chainbase::UndoSession;
 use secp256k1::hashes::{Hash, sha256};
-use wasmtime::component::Resource;
 
 use crate::chain::{AuthorizationManager, resource_limits::ResourceLimitsManager};
 
@@ -68,7 +62,7 @@ pub fn newaccount(context: &mut ApplyContext) -> Result<(), ChainError> {
         )),
     )?;
     session
-        .insert(&Account::new(create.name, 0, vec![]))
+        .insert(&Account::new(create.name, context.pending_block_timestamp(), vec![]))
         .map_err(|_| ChainError::TransactionError(format!("failed to insert account")))?;
     session
         .insert(&AccountMetadata::new(create.name))

@@ -6,7 +6,9 @@ use std::{
 
 use pulsevm_chainbase::UndoSession;
 
-use crate::chain::{Genesis, TransactionTrace, wasm_runtime::WasmRuntime};
+use crate::chain::{
+    BlockTimestamp, Genesis, TransactionTrace, block::Block, wasm_runtime::WasmRuntime,
+};
 
 use super::{
     Action, ActionTrace, Name, Transaction, apply_context::ApplyContext, error::ChainError,
@@ -16,15 +18,21 @@ use super::{
 pub struct TransactionContext {
     session: Rc<RefCell<UndoSession>>,
     wasm_runtime: Arc<RwLock<WasmRuntime>>,
+    pending_block_timestamp: BlockTimestamp,
 
     trace: Rc<RefCell<TransactionTrace>>,
 }
 
 impl TransactionContext {
-    pub fn new(session: Rc<RefCell<UndoSession>>, wasm_runtime: Arc<RwLock<WasmRuntime>>) -> Self {
+    pub fn new(
+        session: Rc<RefCell<UndoSession>>,
+        wasm_runtime: Arc<RwLock<WasmRuntime>>,
+        pending_block_timestamp: BlockTimestamp,
+    ) -> Self {
         Self {
             session,
             wasm_runtime,
+            pending_block_timestamp,
 
             trace: Rc::new(RefCell::new(TransactionTrace::default())),
         }
@@ -140,5 +148,9 @@ impl TransactionContext {
             "failed to get action trace by ordinal {}",
             action_ordinal
         )))
+    }
+
+    pub fn pending_block_timestamp(&self) -> BlockTimestamp {
+        self.pending_block_timestamp
     }
 }

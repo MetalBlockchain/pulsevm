@@ -12,8 +12,8 @@ use chrono::{DateTime, Utc};
 use pulsevm_chainbase::UndoSession;
 
 use crate::chain::{
-    ActionReceipt, ActionTrace, AuthorizationManager, CODE_NAME, IteratorCache, KeyValue,
-    KeyValueByScopePrimaryIndex, Table, TableByCodeScopeTableIndex,
+    ActionReceipt, ActionTrace, AuthorizationManager, BlockTimestamp, CODE_NAME, IteratorCache,
+    KeyValue, KeyValueByScopePrimaryIndex, Table, TableByCodeScopeTableIndex,
     authority::{Permission, PermissionLevel},
     config::{DynamicGlobalPropertyObject, billable_size_v},
     generate_action_digest, pulse_assert, table,
@@ -43,6 +43,7 @@ pub struct ApplyContext {
     account_ram_deltas: Rc<RefCell<HashMap<Name, i64>>>, // RAM usage deltas for accounts
     keyval_cache: Rc<RefCell<IteratorCache<KeyValue>>>, // Cache for iterators
     action_return_value: Rc<RefCell<Option<Vec<u8>>>>, // Return value of the action
+    pending_block_timestamp: BlockTimestamp,      // Timestamp for the pending block
 }
 
 impl ApplyContext {
@@ -55,6 +56,8 @@ impl ApplyContext {
         action_ordinal: u32,
         depth: u32,
     ) -> Result<Self, ChainError> {
+        let pending_block_timestamp = trx_context.pending_block_timestamp();
+
         Ok(ApplyContext {
             session,
             wasm_runtime,
@@ -73,6 +76,7 @@ impl ApplyContext {
             account_ram_deltas: Rc::new(RefCell::new(HashMap::new())),
             keyval_cache: Rc::new(RefCell::new(IteratorCache::new())),
             action_return_value: Rc::new(RefCell::new(None)),
+            pending_block_timestamp,
         })
     }
 
@@ -764,5 +768,9 @@ impl ApplyContext {
 
     pub fn is_privileged(&self) -> bool {
         self.privileged
+    }
+
+    pub fn pending_block_timestamp(&self) -> BlockTimestamp {
+        self.pending_block_timestamp
     }
 }

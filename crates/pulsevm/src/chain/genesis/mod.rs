@@ -6,9 +6,10 @@ use pulsevm_proc_macros::Write;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
+use crate::chain::BlockTimestamp;
 use crate::chain::error::ChainError;
 
-use super::{PublicKey, block::BlockTimestamp};
+use super::PublicKey;
 
 #[derive(
     Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash, Default, Read, Write, NumBytes,

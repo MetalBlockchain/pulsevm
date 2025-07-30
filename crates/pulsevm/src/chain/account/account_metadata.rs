@@ -1,7 +1,7 @@
 use pulsevm_chainbase::{ChainbaseObject, SecondaryKey};
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 
-use crate::chain::{Id, Name};
+use crate::chain::{block::Block, BlockTimestamp, Id, Name};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Read, Write, NumBytes)]
 pub struct AccountMetadata {
@@ -11,7 +11,7 @@ pub struct AccountMetadata {
     pub code_sequence: u32,
     pub abi_sequence: u32,
     pub code_hash: Id,
-    pub last_code_update: u64,
+    pub last_code_update: BlockTimestamp,
     pub privileged: bool,
     pub vm_type: u8,
     pub vm_version: u8,
@@ -26,7 +26,7 @@ impl AccountMetadata {
             code_sequence: 0,
             abi_sequence: 0,
             code_hash: Id::default(),
-            last_code_update: 0,
+            last_code_update: BlockTimestamp::min(),
             privileged: false,
             vm_type: 0,
             vm_version: 0,

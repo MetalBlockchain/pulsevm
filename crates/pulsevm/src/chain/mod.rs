@@ -13,6 +13,7 @@ pub use asset::*;
 mod apply_context;
 
 mod authority;
+pub use authority::*;
 
 mod authority_checker;
 
@@ -63,6 +64,9 @@ pub use secp256k1::*;
 
 mod table;
 pub use table::*;
+
+mod time;
+pub use time::*;
 
 mod transaction_context;
 pub use transaction_context::TransactionContext;

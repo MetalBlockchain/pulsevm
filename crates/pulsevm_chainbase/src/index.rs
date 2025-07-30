@@ -1,6 +1,6 @@
-use std::ops::{Add, AddAssign, Bound, Deref, RangeBounds, RangeFrom, RangeFull, RangeInclusive};
+use std::ops::Bound;
 
-use fjall::{PartitionHandle, Slice, TransactionalKeyspace, TransactionalPartitionHandle};
+use fjall::{TransactionalKeyspace, TransactionalPartitionHandle};
 
 use crate::{ChainbaseObject, SecondaryIndex, UndoSession};
 

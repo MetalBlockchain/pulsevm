@@ -1,25 +1,26 @@
 use std::sync::Arc;
 
 use jsonrpsee::{
-    RpcModule,
     proc_macros::rpc,
-    server::{
-        BatchRequestConfig,
-        http::{self, call_with_service},
-    },
     types::{ErrorObjectOwned, Response, ResponseSuccess},
 };
 use pulsevm_serialization::Read;
-use serde::Serialize;
 use tokio::sync::RwLock;
 use tonic::async_trait;
 
-use crate::mempool::Mempool;
+use crate::{
+    api::{GetAccountResponse, IssueTxResponse},
+    chain::{Account, AccountMetadata, BlockTimestamp, Name, Transaction},
+    mempool::Mempool,
+};
 
-use super::{Controller, NetworkManager, Transaction};
+use super::{Controller, NetworkManager};
 
 #[rpc(server)]
 pub trait Rpc {
+    #[method(name = "pulsevm.getAccount")]
+    async fn get_account(&self, name: Name) -> Result<GetAccountResponse, ErrorObjectOwned>;
+
     #[method(name = "pulsevm.issueTx")]
     async fn issue_tx(&self, tx: &str, encoding: &str)
     -> Result<IssueTxResponse, ErrorObjectOwned>;
@@ -60,14 +61,26 @@ impl RpcService {
     }
 }
 
-#[derive(Serialize, Clone)]
-pub struct IssueTxResponse {
-    #[serde(rename(serialize = "txID"))]
-    pub tx_id: String,
-}
-
 #[async_trait]
 impl RpcServer for RpcService {
+    async fn get_account(&self, name: Name) -> Result<GetAccountResponse, ErrorObjectOwned> {
+        let controller = self.controller.clone();
+        let controller = controller.read().await;
+        let mut database = controller.database();
+        let accnt_obj = database.get::<Account>(name.clone()).map_err(|e| {
+            ErrorObjectOwned::owned(404, "account_not_found", Some(format!("{}", e)))
+        })?;
+        let accnt_metadata_obj = database.get::<AccountMetadata>(name.clone()).map_err(|e| {
+            ErrorObjectOwned::owned(404, "account_not_found", Some(format!("{}", e)))
+        })?;
+        let mut result = GetAccountResponse::default();
+        result.account_name = name.clone();
+        result.privileged = accnt_metadata_obj.is_privileged();
+        result.last_code_update = accnt_metadata_obj.last_code_update;
+        result.created = accnt_obj.creation_date;
+        Ok(result)
+    }
+
     async fn issue_tx(
         &self,
         tx_hex: &str,
@@ -92,7 +105,8 @@ impl RpcServer for RpcService {
         // Run transaction and revert it
         let controller = self.controller.clone();
         let controller = controller.read().await;
-        controller.push_transaction(&tx).map_err(|e| {
+        let pending_block_timestamp = BlockTimestamp::now();
+        controller.push_transaction(&tx, pending_block_timestamp).map_err(|e| {
             ErrorObjectOwned::owned(500, "transaction_error", Some(format!("{}", e)))
         })?;
 

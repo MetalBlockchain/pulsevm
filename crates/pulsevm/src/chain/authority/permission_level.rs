@@ -1,10 +1,11 @@
 use core::fmt;
 
 use pulsevm_proc_macros::{NumBytes, Read, Write};
+use serde::Serialize;
 
 use crate::chain::Name;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Read, Write, NumBytes)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Read, Write, NumBytes, Serialize)]
 pub struct PermissionLevel {
     actor: Name,
     permission: Name,

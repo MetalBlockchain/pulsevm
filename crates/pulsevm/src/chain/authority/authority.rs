@@ -1,12 +1,13 @@
 use std::fmt;
 
 use pulsevm_proc_macros::{NumBytes, Read, Write};
+use serde::Serialize;
 
 use crate::chain::config::{self, BillableSize, FIXED_OVERHEAD_SHARED_VECTOR_RAM_BYTES};
 
 use super::{key_weight::KeyWeight, permission_level_weight::PermissionLevelWeight};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Read, Write, NumBytes)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Read, Write, NumBytes, Serialize)]
 pub struct Authority {
     threshold: u32,
     keys: Vec<KeyWeight>,

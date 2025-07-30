@@ -8,7 +8,9 @@ use std::{
 };
 
 use crate::{
-    chain::{ACTIVE_NAME, Account, AccountMetadata, Asset, config::GlobalPropertyObject},
+    chain::{
+        ACTIVE_NAME, Account, AccountMetadata, Asset, BlockTimestamp, config::GlobalPropertyObject,
+    },
     mempool::Mempool,
 };
 
@@ -16,13 +18,12 @@ use super::{
     AuthorizationManager, Genesis, Id, Name, OWNER_NAME, PULSE_NAME, TransactionContext,
     apply_context::ApplyContext,
     authority::{Authority, KeyWeight},
-    block::{Block, BlockByHeightIndex, BlockTimestamp},
+    block::{Block, BlockByHeightIndex},
     error::ChainError,
     pulse_contract::{newaccount, setabi, setcode, updateauth},
     transaction::Transaction,
     wasm_runtime::WasmRuntime,
 };
-use anyhow::Chain;
 use chrono::Utc;
 use pulsevm_chainbase::{Database, UndoSession};
 use pulsevm_proc_macros::name;
@@ -165,7 +166,11 @@ impl Controller {
                 ChainError::GenesisError(format!("failed to create pulse@owner permission: {}", e))
             })?;
             session
-                .insert(&Account::new(PULSE_NAME, 0, vec![]))
+                .insert(&Account::new(
+                    PULSE_NAME,
+                    self.last_accepted_block().timestamp,
+                    vec![],
+                ))
                 .map_err(|e| {
                     ChainError::GenesisError(format!("failed to insert pulse account: {}", e))
                 })?;
@@ -191,6 +196,7 @@ impl Controller {
         let mut mempool = mempool.write().await;
         let undo_session = Rc::new(RefCell::new(self.db.undo_session().unwrap()));
         let mut transactions: Vec<Transaction> = Vec::new();
+        let timestamp = BlockTimestamp::new(Utc::now());
 
         // Get transactions from the mempool
         loop {
@@ -200,7 +206,7 @@ impl Controller {
                 break;
             }
             let transaction = transaction.unwrap();
-            let result = self.execute_transaction(undo_session.clone(), &transaction);
+            let result = self.execute_transaction(undo_session.clone(), &transaction, timestamp);
             // TODO: Handle rollback behavior
             if result.is_err() {
                 return Err(ChainError::TransactionError(format!(
@@ -214,7 +220,6 @@ impl Controller {
         }
 
         // Create a new block
-        let timestamp = BlockTimestamp::new(Utc::now());
         let block = Block::new(
             self.preferred_id,
             timestamp,
@@ -247,7 +252,7 @@ impl Controller {
 
         for transaction in &block.transactions {
             // Verify the transaction
-            self.execute_transaction(session.clone(), transaction)?;
+            self.execute_transaction(session.clone(), transaction, block.timestamp)?;
         }
 
         session
@@ -286,14 +291,18 @@ impl Controller {
 
     // This function will execute a transaction and roll it back instantly
     // This is useful for checking if a transaction is valid
-    pub fn push_transaction(&self, transaction: &Transaction) -> Result<(), ChainError> {
+    pub fn push_transaction(
+        &self,
+        transaction: &Transaction,
+        pending_block_timestamp: BlockTimestamp,
+    ) -> Result<(), ChainError> {
         let db = &self.db;
         let undo_session = db.undo_session().map_err(|e| {
             ChainError::TransactionError(format!("failed to create undo session: {}", e))
         })?;
         let undo_session = Rc::new(RefCell::new(undo_session));
 
-        let result = self.execute_transaction(undo_session, transaction);
+        let result = self.execute_transaction(undo_session, transaction, pending_block_timestamp);
 
         return result;
     }
@@ -304,6 +313,7 @@ impl Controller {
         &self,
         undo_session: Rc<RefCell<UndoSession>>,
         transaction: &Transaction,
+        pending_block_timestamp: BlockTimestamp,
     ) -> Result<(), ChainError> {
         {
             // Verify authority
@@ -316,8 +326,11 @@ impl Controller {
             )?;
         }
 
-        let mut trx_context =
-            TransactionContext::new(undo_session.clone(), self.wasm_runtime.clone());
+        let mut trx_context = TransactionContext::new(
+            undo_session.clone(),
+            self.wasm_runtime.clone(),
+            pending_block_timestamp,
+        );
 
         return trx_context.exec(transaction);
     }
@@ -385,6 +398,10 @@ impl Controller {
         session.get::<GlobalPropertyObject>(0).map_err(|e| {
             ChainError::TransactionError(format!("failed to get global properties: {}", e))
         })
+    }
+
+    pub fn database(&self) -> Database {
+        self.db.clone()
     }
 }
 
@@ -550,14 +567,17 @@ mod tests {
         let temp_path = get_temp_dir().to_str().unwrap().to_string();
         controller.initialize(&genesis_bytes.to_vec(), temp_path)?;
         assert_eq!(controller.last_accepted_block().height, 0);
+        let pending_block_timestamp = controller.last_accepted_block().timestamp;
         let undo_session = Rc::new(RefCell::new(controller.create_undo_session()?));
         controller.execute_transaction(
             undo_session.clone(),
             &create_account(&private_key, Name::from_str("glenn")?),
+            pending_block_timestamp
         )?;
         controller.execute_transaction(
             undo_session.clone(),
             &create_account(&private_key, Name::from_str("marshall")?),
+            pending_block_timestamp
         )?;
 
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -570,6 +590,7 @@ mod tests {
         controller.execute_transaction(
             undo_session.clone(),
             &set_code(&private_key, Name::from_str("glenn")?, pulse_token_contract),
+            pending_block_timestamp
         )?;
 
         controller.execute_transaction(
@@ -583,6 +604,7 @@ mod tests {
                     max_supply: Asset::new(1000000, Symbol(1162826500)),
                 },
             ),
+            pending_block_timestamp
         )?;
 
         controller.execute_transaction(
@@ -600,6 +622,7 @@ mod tests {
                     memo: "Initial transfer".to_string(),
                 },
             ),
+            pending_block_timestamp
         )?;
 
         controller.execute_transaction(
@@ -618,6 +641,7 @@ mod tests {
                     memo: "Initial transfer".to_string(),
                 },
             ),
+            pending_block_timestamp
         )?;
 
         Ok(())
@@ -631,10 +655,12 @@ mod tests {
         let temp_path = get_temp_dir().to_str().unwrap().to_string();
         controller.initialize(&genesis_bytes.to_vec(), temp_path)?;
         assert_eq!(controller.last_accepted_block().height, 0);
+        let pending_block_timestamp = controller.last_accepted_block().timestamp;
         let undo_session = Rc::new(RefCell::new(controller.create_undo_session()?));
         controller.execute_transaction(
             undo_session.clone(),
             &create_account(&private_key, Name::from_str("glenn")?),
+            pending_block_timestamp
         )?;
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -646,6 +672,7 @@ mod tests {
         controller.execute_transaction(
             undo_session.clone(),
             &set_code(&private_key, Name::from_str("glenn")?, contract),
+            pending_block_timestamp
         )?;
 
         controller.execute_transaction(
@@ -656,6 +683,7 @@ mod tests {
                 Name::from_str("pg")?,
                 &Vec::<u8>::new(),
             ),
+            pending_block_timestamp
         )?;
         controller.execute_transaction(
             undo_session.clone(),
@@ -665,6 +693,7 @@ mod tests {
                 Name::from_str("pl")?,
                 &Vec::<u8>::new(),
             ),
+            pending_block_timestamp
         )?;
         controller.execute_transaction(
             undo_session.clone(),
@@ -674,6 +703,7 @@ mod tests {
                 Name::from_str("pu")?,
                 &Vec::<u8>::new(),
             ),
+            pending_block_timestamp
         )?;
 
         Ok(())

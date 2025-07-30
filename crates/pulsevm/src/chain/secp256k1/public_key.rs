@@ -2,6 +2,7 @@ use std::str::FromStr;
 
 use pulsevm_serialization::{NumBytes, Read, Write};
 use secp256k1::{PublicKey as Secp256k1PublicKey, Secp256k1, SecretKey};
+use serde::Serialize;
 
 use crate::chain::error::ChainError;
 
@@ -11,6 +12,15 @@ pub struct PublicKey(pub secp256k1::PublicKey);
 impl ToString for PublicKey {
     fn to_string(&self) -> String {
         self.0.to_string()
+    }
+}
+
+impl Serialize for PublicKey {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
     }
 }
 

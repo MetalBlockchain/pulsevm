@@ -1,10 +1,11 @@
 use pulsevm_proc_macros::{NumBytes, Read, Write};
+use serde::Serialize;
 
 use crate::chain::config::BillableSize;
 
 use super::permission_level::PermissionLevel;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Read, Write, NumBytes)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Read, Write, NumBytes, Serialize)]
 pub struct PermissionLevelWeight {
     permission: PermissionLevel,
     weight: u16,
