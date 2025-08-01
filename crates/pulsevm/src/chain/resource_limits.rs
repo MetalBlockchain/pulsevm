@@ -3,6 +3,8 @@ use std::{cell::RefCell, collections::HashSet, rc::Rc};
 use pulsevm_chainbase::UndoSession;
 use wasmtime::Ref;
 
+use crate::chain::UsageAccumulator;
+
 use super::{Name, ResourceLimits, ResourceUsage, error::ChainError, pulse_assert};
 
 pub struct ResourceLimitsManager {}
@@ -14,7 +16,12 @@ impl ResourceLimitsManager {
             ChainError::TransactionError(format!("failed to insert resource limits"))
         })?;
 
-        let usage = ResourceUsage::new(account, 0, 0, 0);
+        let usage = ResourceUsage::new(
+            account,
+            UsageAccumulator::default(),
+            UsageAccumulator::default(),
+            0,
+        );
         session.insert(&usage).map_err(|_| {
             ChainError::TransactionError(format!("failed to insert resource usage"))
         })?;
@@ -29,17 +36,19 @@ impl ResourceLimitsManager {
         net_usage: u64,
         time_slot: u32,
     ) -> Result<(), ChainError> {
-        if net_usage == 0 && cpu_usage == 0 {
-            return Ok(());
+        for account in accounts {
+            let mut usage = session.get::<ResourceUsage>(account.clone())?;
+            let mut ram_bytes = 0;
+            let mut net_weight = 0;
+            let mut cpu_weight = 0;
+            Self::get_account_limits(
+                session,
+                account,
+                &mut ram_bytes,
+                &mut net_weight,
+                &mut cpu_weight,
+            )?;
         }
-        let mut usage = session.get::<ResourceUsage>(account.clone())?;
-        let new_net_usage = usage.net_usage.saturating_add(net_usage);
-        let new_cpu_usage = usage.cpu_usage.saturating_add(cpu_usage);
-
-        session.modify(&mut usage, |usage| {
-            usage.net_usage = new_net_usage;
-            usage.cpu_usage = new_cpu_usage;
-        })?;
         Ok(())
     }
 
@@ -192,10 +201,7 @@ impl ResourceLimitsManager {
         )))
     }
 
-    pub fn is_unlimited_cpu(
-        session: &mut UndoSession,
-        account: &Name,
-    ) -> Result<bool, ChainError> {
+    pub fn is_unlimited_cpu(session: &mut UndoSession, account: &Name) -> Result<bool, ChainError> {
         let limits = session.find::<ResourceLimits>((false, account.clone()))?;
         if let Some(limits) = limits {
             return Ok(limits.cpu_weight < 0);

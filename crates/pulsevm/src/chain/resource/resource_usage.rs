@@ -1,18 +1,25 @@
 use pulsevm_chainbase::{ChainbaseObject, SecondaryKey};
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 
-use crate::chain::Name;
+use crate::chain::{Name, UsageAccumulator};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Read, Write, NumBytes)]
 pub struct ResourceUsage {
     pub owner: Name,
-    pub cpu_usage: u64,
-    pub net_usage: u64,
+
+    pub cpu_usage: UsageAccumulator,
+    pub net_usage: UsageAccumulator,
+
     pub ram_usage: u64,
 }
 
 impl ResourceUsage {
-    pub fn new(owner: Name, cpu_usage: u64, net_usage: u64, ram_usage: u64) -> Self {
+    pub fn new(
+        owner: Name,
+        cpu_usage: UsageAccumulator,
+        net_usage: UsageAccumulator,
+        ram_usage: u64,
+    ) -> Self {
         ResourceUsage {
             owner,
             cpu_usage,

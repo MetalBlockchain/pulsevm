@@ -4,6 +4,11 @@ pub const BILLABLE_ALIGNMENT: u64 = 16;
 pub const FIXED_OVERHEAD_SHARED_VECTOR_RAM_BYTES: u32 = 32;
 pub const SETCODE_RAM_BYTES_MULTIPLIER: u32 = 10;
 ///< multiplier on contract size to account for multiple copies and cached compilation
+///
+
+pub const RATE_LIMITING_PRECISION: u64 = 1000 * 1000;
+
+pub const PERCENT_100: u64 = 10000; // Assuming EOS uses basis points (10000 = 100%)
 
 pub trait BillableSize {
     fn billable_size() -> u64;

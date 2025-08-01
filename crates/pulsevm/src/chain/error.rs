@@ -17,6 +17,7 @@ pub enum ChainError {
     NetworkError(String),
     WasmRuntimeError(String),
     DatabaseError(String),
+    InvalidArgument(String),
 }
 
 impl fmt::Display for ChainError {
@@ -42,6 +43,7 @@ impl fmt::Display for ChainError {
             ChainError::NetworkError(msg) => write!(f, "network error: {}", msg),
             ChainError::WasmRuntimeError(msg) => write!(f, "wasm runtime error: {}", msg),
             ChainError::DatabaseError(msg) => write!(f, "database error: {}", msg),
+            ChainError::InvalidArgument(msg) => write!(f, "invalid argument: {}", msg),
         }
     }
 }

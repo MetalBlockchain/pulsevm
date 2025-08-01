@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use anyhow::Chain;
 use jsonrpsee::{
     proc_macros::rpc,
     types::{ErrorObjectOwned, Response, ResponseSuccess},
@@ -9,10 +10,10 @@ use tokio::sync::RwLock;
 use tonic::async_trait;
 
 use crate::{
-    api::{GetAccountResponse, IssueTxResponse, PermissionResponse},
+    api::{GetAccountResponse, GetTableRowsParams, IssueTxResponse, PermissionResponse},
     chain::{
         Account, AccountMetadata, BlockTimestamp, Name, Permission, PermissionByOwnerIndex,
-        Transaction,
+        Transaction, error::ChainError, pulse_assert,
     },
     mempool::Mempool,
 };
@@ -27,6 +28,9 @@ pub trait Rpc {
     #[method(name = "pulsevm.issueTx")]
     async fn issue_tx(&self, tx: &str, encoding: &str)
     -> Result<IssueTxResponse, ErrorObjectOwned>;
+
+    #[method(name = "pulsevm.getTableRows")]
+    async fn get_table_rows(&self, params: GetTableRowsParams) -> Result<(), ErrorObjectOwned>;
 }
 
 #[derive(Clone)]
@@ -68,7 +72,6 @@ impl RpcService {
 #[async_trait]
 impl RpcServer for RpcService {
     async fn get_account(&self, name: Name) -> Result<GetAccountResponse, ErrorObjectOwned> {
-        println!("Getting account: {}", name);
         let controller = self.controller.clone();
         let controller = controller.read().await;
         let database = controller.database();
@@ -159,4 +162,85 @@ impl RpcServer for RpcService {
             tx_id: tx.id().to_string(),
         })
     }
+
+    async fn get_table_rows(&self, p: GetTableRowsParams) -> Result<(), ErrorObjectOwned> {
+        let mut primary = false;
+        let table_with_index = get_table_index_name(&p, &mut primary).map_err(|e| {
+            ErrorObjectOwned::owned(400, "invalid_table_name", Some(format!("{}", e)))
+        })?;
+
+        if primary {
+            pulse_assert(
+                p.table == table_with_index,
+                ErrorObjectOwned::owned(
+                    400,
+                    "invalid_table_name",
+                    Some(format!("invalid table name {}", p.table)),
+                ),
+            )?;
+        }
+
+        Ok(())
+    }
+}
+
+fn get_table_index_name(p: &GetTableRowsParams, primary: &mut bool) -> Result<u64, ChainError> {
+    let table = p.table.as_u64();
+    let mut index = table & 0xFFFFFFFFFFFFFFF0u64;
+    pulse_assert(
+        index == table,
+        ChainError::TransactionError(format!("unsupported table name: {}", p.table)),
+    )?;
+
+    *primary = false;
+    let mut pos = 0u64;
+
+    if p.index_position.is_empty()
+        || p.index_position == "first"
+        || p.index_position == "primary"
+        || p.index_position == "one"
+    {
+        *primary = true;
+    } else if p.index_position.starts_with("sec") || p.index_position == "two" {
+        // second, secondary
+    } else if p.index_position.starts_with("ter") || p.index_position.starts_with("th") {
+        // tertiary, ternary, third, three
+        pos = 1;
+    } else if p.index_position.starts_with("fou") {
+        // four, fourth
+        pos = 2;
+    } else if p.index_position.starts_with("fi") {
+        // five, fifth
+        pos = 3;
+    } else if p.index_position.starts_with("six") {
+        // six, sixth
+        pos = 4;
+    } else if p.index_position.starts_with("sev") {
+        // seven, seventh
+        pos = 5;
+    } else if p.index_position.starts_with("eig") {
+        // eight, eighth
+        pos = 6;
+    } else if p.index_position.starts_with("nin") {
+        // nine, ninth
+        pos = 7;
+    } else if p.index_position.starts_with("ten") {
+        // ten, tenth
+        pos = 8;
+    } else {
+        pos = p.index_position.parse::<u64>().map_err(|_| {
+            ChainError::TransactionError(format!("invalid index position: {}", p.index_position))
+        })?;
+
+        if pos < 2 {
+            *primary = true;
+            pos = 0;
+        } else {
+            pos -= 2;
+        }
+    }
+
+    index |= pos & 0x000000000000000Fu64;
+
+    Ok(index)
 }

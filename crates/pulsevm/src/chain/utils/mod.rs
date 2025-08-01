@@ -1,12 +1,16 @@
 mod usage_accumulator;
 pub use usage_accumulator::*;
 
-use super::error::ChainError;
+use crate::chain::config::PERCENT_100;
 
-pub fn pulse_assert(condition: bool, error: ChainError) -> Result<(), ChainError> {
+pub fn pulse_assert<T>(condition: bool, error: T) -> Result<(), T> {
     if condition {
         Ok(())
     } else {
         return Err(error);
     }
+}
+
+pub const fn eos_percent(value: u64, percentage: u32) -> u64 {
+    (value * percentage as u64) / PERCENT_100
 }
