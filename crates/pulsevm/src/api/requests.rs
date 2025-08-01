@@ -11,6 +11,7 @@ pub struct GetTableRowsParams {
     pub limit: u32,
     pub lower_bound: String,
     pub upper_bound: String,
+    pub key_type: String,
     pub index_position: String,
     pub reverse: Option<bool>,
     pub show_payer: Option<bool>,

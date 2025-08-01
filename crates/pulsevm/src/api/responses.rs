@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::Serialize;
 
 use crate::chain::{Authority, BlockTimestamp, Name};
@@ -40,4 +42,11 @@ pub struct GetAccountResponse {
 pub struct IssueTxResponse {
     #[serde(rename(serialize = "txID"))]
     pub tx_id: String,
+}
+
+#[derive(Serialize, Clone, Default)]
+pub struct GetTableRowsResponse {
+    pub rows: Vec<serde_json::Value>,
+    pub more: bool,
+    pub next_key: String,
 }

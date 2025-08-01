@@ -46,6 +46,32 @@ where
         })
     }
 
+    pub fn range(
+        &mut self,
+        lower_bound: impl Write,
+        upper_bound: impl Write,
+    ) -> Result<ReadOnlyRangeIterator<C, S>, ChainbaseError> {
+        let lower_bound_bytes = lower_bound.pack().map_err(|e| {
+            ChainbaseError::InternalError(format!("failed to serialize key: {}", e))
+        })?;
+        let upper_bound_bytes = upper_bound.pack().map_err(|e| {
+            ChainbaseError::InternalError(format!("failed to serialize key: {}", e))
+        })?;
+
+        Ok(ReadOnlyRangeIterator::<C, S> {
+            session: self.session.clone(),
+            partition: self
+                .keyspace
+                .clone()
+                .open_partition(S::index_name(), Default::default())
+                .map_err(|_| ChainbaseError::InternalError(format!("failed to open partition")))?,
+            range: (Bound::Included(lower_bound_bytes.clone()), Bound::Excluded(upper_bound_bytes.clone())),
+            current_key: lower_bound_bytes,
+            current_value: Vec::new(),
+            __phantom: std::marker::PhantomData,
+        })
+    }
+
     pub fn lower_bound(
         &mut self,
         key: impl Write,

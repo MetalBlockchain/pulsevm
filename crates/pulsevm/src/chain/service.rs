@@ -1,19 +1,22 @@
-use std::sync::Arc;
+use std::{str::FromStr, sync::Arc};
 
 use anyhow::Chain;
 use jsonrpsee::{
     proc_macros::rpc,
     types::{ErrorObjectOwned, Response, ResponseSuccess},
 };
+use pulsevm_chainbase::Session;
 use pulsevm_serialization::Read;
 use tokio::sync::RwLock;
 use tonic::async_trait;
 
 use crate::{
-    api::{GetAccountResponse, GetTableRowsParams, IssueTxResponse, PermissionResponse},
+    api::{
+        GetAccountResponse, GetTableRowsParams, GetTableRowsResponse, IssueTxResponse,
+        PermissionResponse,
+    },
     chain::{
-        Account, AccountMetadata, BlockTimestamp, Name, Permission, PermissionByOwnerIndex,
-        Transaction, error::ChainError, pulse_assert,
+        error::ChainError, pulse_assert, AbiDefinition, Account, AccountMetadata, BlockTimestamp, KeyValue, KeyValueByScopePrimaryIndex, Name, Permission, PermissionByOwnerIndex, Table, TableByCodeScopeTableIndex, Transaction
     },
     mempool::Mempool,
 };
@@ -22,12 +25,15 @@ use super::{Controller, NetworkManager};
 
 #[rpc(server)]
 pub trait Rpc {
-    #[method(name = "pulsevm.getAccount")]
-    async fn get_account(&self, name: Name) -> Result<GetAccountResponse, ErrorObjectOwned>;
-
     #[method(name = "pulsevm.issueTx")]
     async fn issue_tx(&self, tx: &str, encoding: &str)
     -> Result<IssueTxResponse, ErrorObjectOwned>;
+
+    #[method(name = "pulsevm.getABI")]
+    async fn get_abi(&self, account: Name) -> Result<AbiDefinition, ErrorObjectOwned>;
+
+    #[method(name = "pulsevm.getAccount")]
+    async fn get_account(&self, name: Name) -> Result<GetAccountResponse, ErrorObjectOwned>;
 
     #[method(name = "pulsevm.getTableRows")]
     async fn get_table_rows(&self, params: GetTableRowsParams) -> Result<(), ErrorObjectOwned>;
@@ -71,6 +77,22 @@ impl RpcService {
 
 #[async_trait]
 impl RpcServer for RpcService {
+    async fn get_abi(&self, account: Name) -> Result<AbiDefinition, ErrorObjectOwned> {
+        let controller = self.controller.clone();
+        let controller = controller.read().await;
+        let database = controller.database();
+        let mut session = database
+            .session()
+            .map_err(|e| ErrorObjectOwned::owned(500, "database_error", Some(format!("{}", e))))?;
+        let code_account = session.get::<Account>(account.clone()).map_err(|e| {
+            ErrorObjectOwned::owned(404, "account_not_found", Some(format!("{}", e)))
+        })?;
+        let abi = AbiDefinition::read(&code_account.abi, &mut 0).map_err(|e| {
+            ErrorObjectOwned::owned(400, "abi_error", Some(format!("failed to read ABI: {}", e)))
+        })?;
+        Ok(abi)
+    }
+
     async fn get_account(&self, name: Name) -> Result<GetAccountResponse, ErrorObjectOwned> {
         let controller = self.controller.clone();
         let controller = controller.read().await;
@@ -164,6 +186,7 @@ impl RpcServer for RpcService {
     }
 
     async fn get_table_rows(&self, p: GetTableRowsParams) -> Result<(), ErrorObjectOwned> {
+        let abi = self.get_abi(p.code.clone()).await?;
         let mut primary = false;
         let table_with_index = get_table_index_name(&p, &mut primary).map_err(|e| {
             ErrorObjectOwned::owned(400, "invalid_table_name", Some(format!("{}", e)))
@@ -178,6 +201,17 @@ impl RpcServer for RpcService {
                     Some(format!("invalid table name {}", p.table)),
                 ),
             )?;
+            let table_type = get_table_type(&abi, &p.table).map_err(|e| {
+                ErrorObjectOwned::owned(400, "invalid_table_name", Some(format!("{}", e)))
+            })?;
+            if table_type == "i64" || p.key_type == "i64" || p.key_type == "name" {
+                // Handle i64 primary key
+            }
+            return Err(ErrorObjectOwned::owned(
+                400,
+                "invalid_table_type",
+                Some(format!("invalid table type: {}", table_type)),
+            ));
         }
 
         Ok(())
@@ -243,4 +277,57 @@ fn get_table_index_name(p: &GetTableRowsParams, primary: &mut bool) -> Result<u6
     index |= pos & 0x000000000000000Fu64;
 
     Ok(index)
+}
+
+fn get_table_type(abi: &AbiDefinition, table_name: &Name) -> Result<String, ChainError> {
+    for table in &abi.tables {
+        if table.name == *table_name {
+            return Ok(table.type_name.clone());
+        }
+    }
+    Err(ChainError::TransactionError(format!(
+        "table {} not found in ABI",
+        table_name
+    )))
+}
+
+fn get_table_rows_ex(
+    session: &mut Session,
+    abi: &AbiDefinition,
+    p: &GetTableRowsParams,
+) -> Result<GetTableRowsResponse, ChainError> {
+    let response = GetTableRowsResponse::default();
+    let scope = Name::from_str(p.scope.as_str())
+        .map_err(|_| ChainError::InvalidArgument(format!("invalid scope name: {}", p.scope)))?;
+    let table =
+        session.find_by_secondary::<Table, TableByCodeScopeTableIndex>((p.code, scope, p.table))?;
+
+    if let Some(table) = table {
+        let mut idx = session.get_index::<KeyValue, KeyValueByScopePrimaryIndex>();
+        let lower_bound_lookup_tuple = (table.id, u64::MIN);
+        let upper_bound_lookup_tuple = (table.id, u64::MAX);
+
+        if upper_bound_lookup_tuple < lower_bound_lookup_tuple {
+            return Ok(response);
+        }
+
+        let mut limit = p.limit;
+
+        if limit > 100 {
+            limit = 100;
+        }
+
+        let mut itr = idx.range(lower_bound_lookup_tuple, upper_bound_lookup_tuple)?;
+        let mut count = 0;
+
+        while let Some(kv) = itr.next()? {
+            count += 1;
+
+            if count > limit {
+                break;
+            }
+        }
+    }
+
+    Ok(response)
 }
