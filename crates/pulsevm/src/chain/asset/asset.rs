@@ -1,10 +1,11 @@
 use std::fmt;
 
 use pulsevm_proc_macros::{NumBytes, Read, Write};
+use serde::{Deserialize, Serialize};
 
 use crate::chain::Symbol;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Read, Write, NumBytes)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Read, Write, NumBytes, Deserialize, Serialize)]
 pub struct Asset {
     /// The amount of the asset
     pub amount: i64,

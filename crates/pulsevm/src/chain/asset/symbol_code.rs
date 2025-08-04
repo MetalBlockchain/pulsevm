@@ -1,5 +1,8 @@
 use std::{fmt, str::FromStr};
 
+use pulsevm_proc_macros::{NumBytes, Read, Write};
+use serde::Serialize;
+
 /// The maximum allowed length of EOSIO symbol codes.
 pub const SYMBOL_CODE_MAX_LEN: usize = 7;
 
@@ -24,7 +27,7 @@ impl fmt::Display for ParseSymbolCodeError {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Read, Write, NumBytes)]
 pub struct SymbolCode(u64);
 
 impl SymbolCode {
@@ -49,6 +52,16 @@ impl fmt::Display for SymbolCode {
             .map(str::trim)
             .map_err(|_| fmt::Error)?;
         write!(f, "{}", value)
+    }
+}
+
+impl Serialize for SymbolCode {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let value = self.to_string();
+        serializer.serialize_str(&value)
     }
 }
 

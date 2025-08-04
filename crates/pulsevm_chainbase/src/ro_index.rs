@@ -65,7 +65,10 @@ where
                 .clone()
                 .open_partition(S::index_name(), Default::default())
                 .map_err(|_| ChainbaseError::InternalError(format!("failed to open partition")))?,
-            range: (Bound::Included(lower_bound_bytes.clone()), Bound::Excluded(upper_bound_bytes.clone())),
+            range: (
+                Bound::Included(lower_bound_bytes.clone()),
+                Bound::Excluded(upper_bound_bytes.clone()),
+            ),
             current_key: lower_bound_bytes,
             current_value: Vec::new(),
             __phantom: std::marker::PhantomData,

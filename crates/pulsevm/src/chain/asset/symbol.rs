@@ -1,10 +1,11 @@
 use core::fmt;
 
 use pulsevm_proc_macros::{NumBytes, Read, Write};
+use serde::{Deserialize, Serialize};
 
 use crate::chain::SymbolCode;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Read, Write, NumBytes)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Read, Write, NumBytes, Deserialize)]
 pub struct Symbol(pub u64);
 
 impl Symbol {
@@ -39,6 +40,16 @@ impl fmt::Display for Symbol {
         extern crate alloc;
         use alloc::string::ToString;
         write!(f, "{},{}", self.precision(), self.code().to_string())
+    }
+}
+
+impl Serialize for Symbol {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let value = format!("{},{}", self.precision(), self.code());
+        serializer.serialize_str(&value)
     }
 }
 
