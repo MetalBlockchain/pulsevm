@@ -134,11 +134,6 @@ pub fn setcode(context: &mut ApplyContext) -> Result<(), ChainError> {
         .map_err(|_| ChainError::TransactionError(format!("failed to find account")))?;
     let existing_code = account.code_hash != Id::default();
 
-    println!(
-        "Setting code for account: {}, code size: {}, existing code: {}",
-        act.account, code_size, existing_code
-    );
-
     pulse_assert(
         code_size > 0 || existing_code,
         ChainError::TransactionError(format!("contract is already cleared")),
