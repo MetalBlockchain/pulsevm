@@ -3,7 +3,6 @@ mod chain;
 mod mempool;
 
 use chain::{Controller, Id, NodeId};
-use mempool::build_block_timer;
 use pulsevm_grpc::{
     http::{
         self, Element,
@@ -18,11 +17,21 @@ use pulsevm_grpc::{
 use spdlog::info;
 use std::{
     net::{SocketAddr, TcpListener},
-    sync::Arc,
+    sync::{Arc, atomic::AtomicBool},
 };
-use tokio::{net::TcpListener as TokioTcpListener, signal, sync::RwLock, task::JoinHandle};
+use tokio::{
+    net::TcpListener as TokioTcpListener,
+    signal::{
+        self,
+        unix::{SignalKind, signal},
+    },
+    sync::RwLock,
+    task::JoinHandle,
+};
 use tonic::transport::server::TcpIncoming;
 use tonic::{Request, Response, Status, transport::Server};
+
+use crate::mempool::BlockTimer;
 
 const PLUGIN_VERSION: u32 = 38;
 const VERSION: &str = "0.0.1";
@@ -63,33 +72,45 @@ async fn main() {
     info!("shutting down...");
 }
 
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        signal::ctrl_c()
-            .await
-            .expect("failed to install SIGINT handler");
-    };
+async fn shutdown_signal(vm: VirtualMachine) {
+    let mut sigterm_stream =
+        signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+
     let terminate = async {
-        signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("failed to install SIGTERM handler")
-            .recv()
-            .await;
+        loop {
+            sigterm_stream.recv().await;
+
+            let ready_to_terminate = vm.ready_to_terminate.clone();
+            if ready_to_terminate.load(std::sync::atomic::Ordering::Relaxed) {
+                info!("received SIGTERM, shutting down...");
+                break;
+            }
+
+            info!("received SIGTERM, but not ready to terminate yet");
+        }
+    };
+
+    let mut sigint_stream =
+        signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
+
+    let sigint = async {
+        loop {
+            sigint_stream.recv().await; // We ignore SIGINT, this is in line with MetalGo's behavior
+        }
     };
 
     tokio::select! {
-        _ = ctrl_c => {},
         _ = terminate => {},
+        _ = sigint => {},
     }
-
-    info!("received shutdown signal, shutting down...");
 }
 
 async fn start_runtime_service(
     incoming: TcpIncoming,
     server_addr: SocketAddr,
 ) -> Result<(), tonic::transport::Error> {
-    let shutdown_signal = shutdown_signal();
     let vm = VirtualMachine::new(server_addr).unwrap();
+    let shutdown_signal = shutdown_signal(vm.clone());
     Server::builder()
         .add_service(VmServer::new(vm.clone()))
         .add_service(HttpServer::new(vm.clone()))
@@ -104,7 +125,8 @@ pub struct VirtualMachine {
     mempool: Arc<RwLock<mempool::Mempool>>,
     network_manager: Arc<RwLock<chain::NetworkManager>>,
     rpc_service: chain::RpcService,
-    block_timer: Arc<RwLock<Option<JoinHandle<()>>>>,
+    block_timer: Arc<RwLock<BlockTimer>>,
+    ready_to_terminate: Arc<AtomicBool>,
 }
 
 impl VirtualMachine {
@@ -114,6 +136,7 @@ impl VirtualMachine {
         let network_manager = Arc::new(RwLock::new(chain::NetworkManager::new()));
         let rpc_service =
             chain::RpcService::new(mempool.clone(), controller.clone(), network_manager.clone());
+        let block_timer = Arc::new(RwLock::new(BlockTimer::new(mempool.clone())));
 
         Ok(Self {
             server_addr,
@@ -121,7 +144,8 @@ impl VirtualMachine {
             mempool: mempool,
             network_manager: network_manager,
             rpc_service: rpc_service,
-            block_timer: Arc::new(RwLock::new(None)),
+            block_timer,
+            ready_to_terminate: Arc::new(AtomicBool::new(false)),
         })
     }
 }
@@ -151,7 +175,9 @@ impl Vm for VirtualMachine {
         let mut mempool = mempool.write().await;
         mempool.set_server_address(server_addr.clone());
 
-        build_block_timer(self.mempool.clone());
+        let block_timer = self.block_timer.clone();
+        let mut block_timer = block_timer.write().await;
+        block_timer.start().await;
 
         return Ok(Response::new(vm::InitializeResponse {
             last_accepted_id: controller.last_accepted_block().id().as_bytes().to_vec(),
@@ -187,6 +213,8 @@ impl Vm for VirtualMachine {
     }
 
     async fn shutdown(&self, _request: Request<()>) -> Result<tonic::Response<()>, Status> {
+        let ready_to_terminate = self.ready_to_terminate.clone();
+        ready_to_terminate.store(true, std::sync::atomic::Ordering::Relaxed);
         Ok(Response::new(()))
     }
 
@@ -242,8 +270,9 @@ impl Vm for VirtualMachine {
         let controller = self.controller.clone();
         let mut controller = controller.write().await;
         let mempool = self.mempool.clone();
+        let mut mempool = mempool.write().await;
         let block = controller
-            .build_block(mempool)
+            .build_block(&mut mempool)
             .await
             .map_err(|e| Status::internal(format!("could not build block: {}", e)))?;
         Ok(Response::new(vm::BuildBlockResponse {
@@ -260,11 +289,13 @@ impl Vm for VirtualMachine {
         &self,
         request: Request<vm::ParseBlockRequest>,
     ) -> Result<tonic::Response<vm::ParseBlockResponse>, Status> {
+        println!("parsing block");
         let controller = self.controller.clone();
         let controller = controller.read().await;
         let block = controller
             .parse_block(&request.get_ref().bytes)
             .map_err(|_| Status::internal("could not parse block"))?;
+        println!("parsed block: {:?}", block);
         Ok(Response::new(vm::ParseBlockResponse {
             id: block.id().into(),
             parent_id: block.parent_id.into(),
@@ -278,6 +309,7 @@ impl Vm for VirtualMachine {
         &self,
         request: Request<vm::GetBlockRequest>,
     ) -> Result<tonic::Response<vm::GetBlockResponse>, Status> {
+        info!("getting block");
         let controller = self.controller.clone();
         let mut controller = controller.write().await;
         let block_id: Id = request
@@ -291,6 +323,7 @@ impl Vm for VirtualMachine {
             .map_err(|_| Status::internal("could not get block"))?;
 
         if block.is_none() {
+            info!("block not found: {}", block_id);
             return Ok(Response::new(vm::GetBlockResponse {
                 parent_id: vec![],
                 bytes: vec![],
@@ -302,6 +335,8 @@ impl Vm for VirtualMachine {
         }
 
         let block = block.unwrap();
+
+        info!("block found: {:?}", block);
 
         Ok(Response::new(vm::GetBlockResponse {
             parent_id: block.parent_id.into(),
@@ -317,6 +352,7 @@ impl Vm for VirtualMachine {
         &self,
         request: Request<vm::SetPreferenceRequest>,
     ) -> Result<tonic::Response<()>, Status> {
+        info!("setting preference");
         let controller = self.controller.clone();
         let mut controller = controller.write().await;
         let preferred_id: Id = request
@@ -326,6 +362,7 @@ impl Vm for VirtualMachine {
             .try_into()
             .map_err(|_| Status::invalid_argument("invalid block id"))?;
         controller.set_preferred_id(preferred_id);
+        info!("preference set to: {}", preferred_id);
         Ok(Response::new(()))
     }
 
@@ -397,6 +434,7 @@ impl Vm for VirtualMachine {
         &self,
         request: Request<vm::BatchedParseBlockRequest>,
     ) -> Result<tonic::Response<vm::BatchedParseBlockResponse>, Status> {
+        info!("batched_parse_block: {:?}", request);
         let controller = self.controller.clone();
         let controller = controller.read().await;
         let mut parsed_blocks: Vec<ParseBlockResponse> = Vec::new();
@@ -421,6 +459,7 @@ impl Vm for VirtualMachine {
         &self,
         request: Request<vm::GetBlockIdAtHeightRequest>,
     ) -> Result<tonic::Response<vm::GetBlockIdAtHeightResponse>, Status> {
+        info!("get_block_id_at_height: {:?}", request);
         let controller = self.controller.clone();
         let controller = controller.read().await;
         let block = controller
@@ -428,6 +467,7 @@ impl Vm for VirtualMachine {
             .map_err(|_| Status::internal("could not get block by height"))?;
 
         if block.is_none() {
+            info!("block not found at height: {}", request.get_ref().height);
             return Ok(Response::new(vm::GetBlockIdAtHeightResponse {
                 blk_id: vec![].into(),
                 err: vm::Error::NotFound as i32,
@@ -501,6 +541,8 @@ impl Vm for VirtualMachine {
             .await
             .map_err(|_| Status::internal("could not verify block"))?;
 
+        info!("block verified successfully");
+
         Ok(Response::new(vm::BlockVerifyResponse {
             timestamp: Some(block.timestamp.into()),
         }))
@@ -524,6 +566,8 @@ impl Vm for VirtualMachine {
             .await
             .map_err(|e| Status::internal(format!("could not accept block: {}", e)))?;
 
+        info!("block accepted: {}", block_id);
+
         Ok(Response::new(()))
     }
 
@@ -531,7 +575,7 @@ impl Vm for VirtualMachine {
         &self,
         request: Request<vm::BlockRejectRequest>,
     ) -> Result<tonic::Response<()>, Status> {
-        info!("received request: {:?}", request);
+        info!("block_reject: {:?}", request);
         Ok(Response::new(()))
     }
 

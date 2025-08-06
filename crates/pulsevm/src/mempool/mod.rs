@@ -4,13 +4,16 @@ pub use block_timer::BlockTimer;
 use pulsevm_grpc::messenger::{Message, NotifyRequest, messenger_client::MessengerClient};
 use tonic::Request;
 
-use std::{
-    collections::VecDeque
-};
+use std::collections::VecDeque;
 
-use tokio::{sync::{
-    mpsc::{self, error::SendError, Receiver, Sender}, Mutex
-}, task::JoinHandle, time::interval};
+use tokio::{
+    sync::{
+        Mutex,
+        mpsc::{self, Receiver, Sender, error::SendError},
+    },
+    task::JoinHandle,
+    time::interval,
+};
 
 use crate::chain::Transaction;
 

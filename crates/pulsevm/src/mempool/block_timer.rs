@@ -11,7 +11,10 @@ pub struct BlockTimer {
 
 impl BlockTimer {
     pub fn new(mempool: Arc<RwLock<Mempool>>) -> Self {
-        BlockTimer { mempool, block_timer: None }
+        BlockTimer {
+            mempool,
+            block_timer: None,
+        }
     }
 
     pub async fn start(&mut self) {
