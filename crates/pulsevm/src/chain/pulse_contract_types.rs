@@ -1,5 +1,7 @@
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 
+use crate::chain::AbiDefinition;
+
 use super::{Name, authority::Authority};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Read, Write, NumBytes)]

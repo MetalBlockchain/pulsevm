@@ -7,6 +7,7 @@ use jsonrpsee::{
 };
 use pulsevm_chainbase::Session;
 use pulsevm_serialization::Read;
+use serde_json::Value;
 use tokio::sync::RwLock;
 use tonic::async_trait;
 
@@ -38,7 +39,20 @@ pub trait Rpc {
     async fn get_account(&self, name: Name) -> Result<GetAccountResponse, ErrorObjectOwned>;
 
     #[method(name = "pulsevm.getTableRows")]
-    async fn get_table_rows(&self, params: GetTableRowsParams) -> Result<(), ErrorObjectOwned>;
+    async fn get_table_rows(
+        &self,
+        code: Name,
+        scope: String,
+        table: Name,
+        json: bool,
+        limit: u32,
+        lower_bound: String,
+        upper_bound: String,
+        key_type: String,
+        index_position: String,
+        reverse: Option<bool>,
+        show_payer: Option<bool>,
+    ) -> Result<GetTableRowsResponse, ErrorObjectOwned>;
 }
 
 #[derive(Clone)]
@@ -83,7 +97,7 @@ impl RpcServer for RpcService {
         let controller = self.controller.clone();
         let controller = controller.read().await;
         let database = controller.database();
-        let mut session = database
+        let session = database
             .session()
             .map_err(|e| ErrorObjectOwned::owned(500, "database_error", Some(format!("{}", e))))?;
         let code_account = session.get::<Account>(account.clone()).map_err(|e| {
@@ -99,7 +113,7 @@ impl RpcServer for RpcService {
         let controller = self.controller.clone();
         let controller = controller.read().await;
         let database = controller.database();
-        let mut session = database
+        let session = database
             .session()
             .map_err(|e| ErrorObjectOwned::owned(500, "database_error", Some(format!("{}", e))))?;
         let accnt_obj = session.get::<Account>(name.clone()).map_err(|e| {
@@ -166,6 +180,7 @@ impl RpcServer for RpcService {
         controller
             .push_transaction(&tx, pending_block_timestamp)
             .map_err(|e| {
+                println!("Failed to push transaction: {}", e);
                 ErrorObjectOwned::owned(500, "transaction_error", Some(format!("{}", e)))
             })?;
 
@@ -187,85 +202,130 @@ impl RpcServer for RpcService {
         })
     }
 
-    async fn get_table_rows(&self, p: GetTableRowsParams) -> Result<(), ErrorObjectOwned> {
-        let abi = self.get_abi(p.code.clone()).await?;
+    async fn get_table_rows(
+        &self,
+        code: Name,
+        scope: String,
+        table: Name,
+        json: bool,
+        limit: u32,
+        lower_bound: String,
+        upper_bound: String,
+        key_type: String,
+        index_position: String,
+        reverse: Option<bool>,
+        show_payer: Option<bool>,
+    ) -> Result<GetTableRowsResponse, ErrorObjectOwned> {
+        let abi = self.get_abi(code.clone()).await?;
         let mut primary = false;
-        let table_with_index = get_table_index_name(&p, &mut primary).map_err(|e| {
-            ErrorObjectOwned::owned(400, "invalid_table_name", Some(format!("{}", e)))
-        })?;
+        let table_with_index =
+            get_table_index_name(table, index_position, &mut primary).map_err(|e| {
+                ErrorObjectOwned::owned(400, "invalid_table_name", Some(format!("{}", e)))
+            })?;
+        let controller = self.controller.clone();
+        let controller = controller.read().await;
+        let session = controller
+            .database()
+            .session()
+            .map_err(|e| ErrorObjectOwned::owned(500, "database_error", Some(format!("{}", e))))?;
 
         if primary {
             pulse_assert(
-                p.table == table_with_index,
+                table == table_with_index,
                 ErrorObjectOwned::owned(
                     400,
                     "invalid_table_name",
-                    Some(format!("invalid table name {}", p.table)),
+                    Some(format!("invalid table name {}", table)),
                 ),
             )?;
-            let table_type = get_table_type(&abi, &p.table).map_err(|e| {
+            let table_index_type = get_table_index_type(&abi, &table).map_err(|e| {
                 ErrorObjectOwned::owned(400, "invalid_table_name", Some(format!("{}", e)))
             })?;
-            if table_type == "i64" || p.key_type == "i64" || p.key_type == "name" {
-                // Handle i64 primary key
+            if table_index_type == "i64" || key_type == "i64" || key_type == "name" {
+                return get_table_rows_ex(
+                    &session,
+                    &abi,
+                    code,
+                    scope,
+                    table,
+                    limit,
+                    json,
+                    show_payer,
+                    lower_bound,
+                    upper_bound,
+                )
+                .map_err(|e| {
+                    ErrorObjectOwned::owned(400, "get_table_rows_error", Some(format!("{}", e)))
+                });
             }
             return Err(ErrorObjectOwned::owned(
                 400,
                 "invalid_table_type",
-                Some(format!("invalid table type: {}", table_type)),
+                Some(format!("invalid table index type: {}", table_index_type)),
+            ));
+        } else {
+            return Err(ErrorObjectOwned::owned(
+                400,
+                "secondary_index_not_supported",
+                Some(format!(
+                    "secondary index not supported for table: {}",
+                    table
+                )),
             ));
         }
-
-        Ok(())
     }
 }
 
-fn get_table_index_name(p: &GetTableRowsParams, primary: &mut bool) -> Result<u64, ChainError> {
-    let table = p.table.as_u64();
+fn get_table_index_name(
+    table: Name,
+    index_position: String,
+    primary: &mut bool,
+) -> Result<u64, ChainError> {
+    let table = table.as_u64();
     let mut index = table & 0xFFFFFFFFFFFFFFF0u64;
     pulse_assert(
         index == table,
-        ChainError::TransactionError(format!("unsupported table name: {}", p.table)),
+        ChainError::TransactionError(format!("unsupported table name: {}", table)),
     )?;
 
     *primary = false;
     let mut pos = 0u64;
 
-    if p.index_position.is_empty()
-        || p.index_position == "first"
-        || p.index_position == "primary"
-        || p.index_position == "one"
+    if index_position.is_empty()
+        || index_position == "first"
+        || index_position == "primary"
+        || index_position == "one"
     {
         *primary = true;
-    } else if p.index_position.starts_with("sec") || p.index_position == "two" {
+    } else if index_position.starts_with("sec") || index_position == "two" {
         // second, secondary
-    } else if p.index_position.starts_with("ter") || p.index_position.starts_with("th") {
+    } else if index_position.starts_with("ter") || index_position.starts_with("th") {
         // tertiary, ternary, third, three
         pos = 1;
-    } else if p.index_position.starts_with("fou") {
+    } else if index_position.starts_with("fou") {
         // four, fourth
         pos = 2;
-    } else if p.index_position.starts_with("fi") {
+    } else if index_position.starts_with("fi") {
         // five, fifth
         pos = 3;
-    } else if p.index_position.starts_with("six") {
+    } else if index_position.starts_with("six") {
         // six, sixth
         pos = 4;
-    } else if p.index_position.starts_with("sev") {
+    } else if index_position.starts_with("sev") {
         // seven, seventh
         pos = 5;
-    } else if p.index_position.starts_with("eig") {
+    } else if index_position.starts_with("eig") {
         // eight, eighth
         pos = 6;
-    } else if p.index_position.starts_with("nin") {
+    } else if index_position.starts_with("nin") {
         // nine, ninth
         pos = 7;
-    } else if p.index_position.starts_with("ten") {
+    } else if index_position.starts_with("ten") {
         // ten, tenth
         pos = 8;
     } else {
-        pos = p.index_position.parse::<u64>().map_err(|_| {
-            ChainError::TransactionError(format!("invalid index position: {}", p.index_position))
+        pos = index_position.parse::<u64>().map_err(|_| {
+            ChainError::TransactionError(format!("invalid index position: {}", index_position))
         })?;
 
         if pos < 2 {
@@ -281,28 +341,23 @@ fn get_table_index_name(p: &GetTableRowsParams, primary: &mut bool) -> Result<u6
     Ok(index)
 }
 
-fn get_table_type(abi: &AbiDefinition, table_name: &Name) -> Result<String, ChainError> {
-    for table in &abi.tables {
-        if table.name == *table_name {
-            return Ok(table.type_name.clone());
-        }
-    }
-    Err(ChainError::TransactionError(format!(
-        "table {} not found in ABI",
-        table_name
-    )))
-}
-
 fn get_table_rows_ex(
-    session: &mut Session,
+    session: &Session,
     abi: &AbiDefinition,
-    p: &GetTableRowsParams,
+    code: Name,
+    scope: String,
+    table_name: Name,
+    limit: u32,
+    json: bool,
+    show_payer: Option<bool>,
+    lower_bound: String,
+    upper_bound: String,
 ) -> Result<GetTableRowsResponse, ChainError> {
-    let response = GetTableRowsResponse::default();
-    let scope = Name::from_str(p.scope.as_str())
-        .map_err(|_| ChainError::InvalidArgument(format!("invalid scope name: {}", p.scope)))?;
-    let table =
-        session.find_by_secondary::<Table, TableByCodeScopeTableIndex>((p.code, scope, p.table))?;
+    let mut response = GetTableRowsResponse::default();
+    let scope = Name::from_str(scope.as_str())
+        .map_err(|_| ChainError::InvalidArgument(format!("invalid scope name: {}", scope)))?;
+    let table = session
+        .find_by_secondary::<Table, TableByCodeScopeTableIndex>((code, scope, table_name))?;
 
     if let Some(table) = table {
         let mut idx = session.get_index::<KeyValue, KeyValueByScopePrimaryIndex>();
@@ -313,7 +368,7 @@ fn get_table_rows_ex(
             return Ok(response);
         }
 
-        let mut limit = p.limit;
+        let mut limit = limit;
 
         if limit > 100 {
             limit = 100;
@@ -321,15 +376,45 @@ fn get_table_rows_ex(
 
         let mut itr = idx.range(lower_bound_lookup_tuple, upper_bound_lookup_tuple)?;
         let mut count = 0;
+        let table_type = abi.get_table_type(&table_name)?;
 
         while let Some(kv) = itr.next()? {
             count += 1;
 
             if count > limit {
+                response.more = true;
                 break;
+            }
+
+            let variant = if json {
+                abi.binary_to_variant(&table_type, &kv.value)?
+            } else {
+                Value::String(hex::encode(&kv.value))
+            };
+
+            if show_payer.is_some() && show_payer.unwrap() {
+                response.rows.push(serde_json::json!({
+                    "payer": kv.payer,
+                    "data": variant,
+                }));
+            } else {
+                response.rows.push(variant);
             }
         }
     }
 
     Ok(response)
+}
+
+fn get_table_index_type(abi: &AbiDefinition, table_name: &Name) -> Result<String, ChainError> {
+    for table in abi.tables.iter() {
+        if &table.name == table_name {
+            return Ok(table.index_type.clone());
+        }
+    }
+
+    Err(ChainError::InvalidArgument(format!(
+        "table '{}' not found in ABI",
+        table_name
+    )))
 }

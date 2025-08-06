@@ -6,66 +6,69 @@ use serde_json::{Map, Value, json};
 
 use crate::chain::{Asset, ExtendedAsset, Name, Symbol, SymbolCode, error::ChainError};
 
-#[derive(Debug, Clone, Read, Write, NumBytes, Serialize, Deserialize)]
+#[derive(Debug, Clone, Read, Write, NumBytes, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AbiTypeDefinition {
     pub new_type_name: String,
     pub type_name: String,
 }
 
-#[derive(Debug, Clone, Read, Write, NumBytes, Serialize, Deserialize)]
+#[derive(Debug, Clone, Read, Write, NumBytes, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AbiFieldDefinition {
     pub name: String,
+    #[serde(rename = "type")]
     pub type_name: String,
 }
 
-#[derive(Debug, Clone, Read, Write, NumBytes, Serialize, Deserialize)]
+#[derive(Debug, Clone, Read, Write, NumBytes, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AbiStructDefinition {
     pub name: String,
     pub base: String,
     pub fields: Vec<AbiFieldDefinition>,
 }
 
-#[derive(Debug, Clone, Read, Write, NumBytes, Serialize, Deserialize)]
+#[derive(Debug, Clone, Read, Write, NumBytes, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AbiActionDefinition {
     pub name: String,
+    #[serde(rename = "type")]
     pub type_name: String,
     pub ricardian_contract: String,
 }
 
-#[derive(Debug, Clone, Read, Write, NumBytes, Serialize, Deserialize)]
+#[derive(Debug, Clone, Read, Write, NumBytes, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AbiTableDefinition {
     pub name: Name,             // the name of the table
     pub index_type: String,     // the kind of index, i64, i128i128, etc
     pub key_names: Vec<String>, // names for the keys defined by key_types
     pub key_types: Vec<String>, // the type of key parameters
-    pub type_name: String,      // type of binary data stored in this table
+    #[serde(rename = "type")]
+    pub type_name: String, // type of binary data stored in this table
 }
 
-#[derive(Debug, Clone, Read, Write, NumBytes, Serialize, Deserialize)]
+#[derive(Debug, Clone, Read, Write, NumBytes, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AbiClausePair {
     pub id: String,
     pub body: String,
 }
 
-#[derive(Debug, Clone, Read, Write, NumBytes, Serialize, Deserialize)]
+#[derive(Debug, Clone, Read, Write, NumBytes, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AbiErrorMessage {
     pub error_code: u64,
     pub error_msg: String,
 }
 
-#[derive(Debug, Clone, Read, Write, NumBytes, Serialize, Deserialize)]
+#[derive(Debug, Clone, Read, Write, NumBytes, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AbiVariantDefinition {
     pub name: String,
     pub types: Vec<String>,
 }
 
-#[derive(Debug, Clone, Read, Write, NumBytes, Serialize, Deserialize)]
+#[derive(Debug, Clone, Read, Write, NumBytes, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AbiActionResultDefinition {
     pub name: Name,
     pub result_type: String,
 }
 
-#[derive(Debug, Clone, Read, Write, NumBytes, Serialize, Deserialize)]
+#[derive(Debug, Clone, Read, Write, NumBytes, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AbiDefinition {
     pub version: String,
     pub types: Vec<AbiTypeDefinition>,
@@ -79,11 +82,7 @@ pub struct AbiDefinition {
 }
 
 impl AbiDefinition {
-    pub fn binary_to_variant(
-        &self,
-        variant_name: &str,
-        data: &[u8],
-    ) -> Result<serde_json::Value, ChainError> {
+    pub fn binary_to_variant(&self, variant_name: &str, data: &[u8]) -> Result<Value, ChainError> {
         let struct_def = self.structs.iter().find(|v| v.name == variant_name);
         let mut variant = Map::new();
 
@@ -133,6 +132,19 @@ impl AbiDefinition {
                 type_name
             ))),
         }
+    }
+
+    pub fn get_table_type(&self, table_name: &Name) -> Result<String, ChainError> {
+        for table in &self.tables {
+            if &table.name == table_name {
+                return Ok(table.type_name.clone());
+            }
+        }
+
+        Err(ChainError::InvalidArgument(format!(
+            "table '{}' not found in ABI",
+            table_name
+        )))
     }
 }
 
@@ -255,7 +267,10 @@ mod tests {
             field11: "hello world".to_string(),
             field12: Symbol::new_with_code(4, SymbolCode::from_str("EOS").unwrap()),
             field13: SymbolCode::from_str("EOS").unwrap(),
-            field14: Asset::new(400, Symbol::new_with_code(4, SymbolCode::from_str("EOS").unwrap())),
+            field14: Asset::new(
+                400,
+                Symbol::new_with_code(4, SymbolCode::from_str("EOS").unwrap()),
+            ),
             field15: ExtendedAsset {
                 quantity: Asset::new(
                     500,

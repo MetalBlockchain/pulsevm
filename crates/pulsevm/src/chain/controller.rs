@@ -191,10 +191,8 @@ impl Controller {
 
     pub async fn build_block(
         &mut self,
-        mempool: Arc<AsyncRwLock<Mempool>>,
+        mempool: &mut Mempool,
     ) -> Result<Block, ChainError> {
-        let mempool = mempool.clone();
-        let mut mempool = mempool.write().await;
         let mut undo_session = self.db.undo_session()?;
         let mut transactions: Vec<Transaction> = Vec::new();
         let timestamp = BlockTimestamp::new(Utc::now());

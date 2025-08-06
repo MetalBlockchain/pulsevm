@@ -1,7 +1,9 @@
 use pulsevm_chainbase::UndoSession;
+use pulsevm_serialization::Write;
 use secp256k1::hashes::{Hash, sha256};
+use serde::Deserialize;
 
-use crate::chain::{AuthorizationManager, resource_limits::ResourceLimitsManager};
+use crate::chain::{AbiDefinition, AuthorizationManager, resource_limits::ResourceLimitsManager};
 
 use super::{
     ACTIVE_NAME, Account, AccountMetadata, CODE_NAME, CodeObject, DeleteAuth, Id, NewAccount,
@@ -132,6 +134,11 @@ pub fn setcode(context: &mut ApplyContext) -> Result<(), ChainError> {
         .map_err(|_| ChainError::TransactionError(format!("failed to find account")))?;
     let existing_code = account.code_hash != Id::default();
 
+    println!(
+        "Setting code for account: {}, code size: {}, existing code: {}",
+        act.account, code_size, existing_code
+    );
+
     pulse_assert(
         code_size > 0 || existing_code,
         ChainError::TransactionError(format!("contract is already cleared")),
@@ -223,13 +230,17 @@ pub fn setabi(context: &mut ApplyContext) -> Result<(), ChainError> {
     let mut account = session
         .get::<Account>(act.account)
         .map_err(|_| ChainError::TransactionError(format!("failed to find account")))?;
-
+    let abi_def: AbiDefinition = serde_json::from_str(std::str::from_utf8(&act.abi).unwrap())
+        .map_err(|e| ChainError::InvalidArgument(format!("failed to deserialize ABI: {}", e)))?;
+    let abi_def_packed = abi_def
+        .pack()
+        .map_err(|e| ChainError::TransactionError(format!("failed to serialize ABI: {}", e)))?;
     let old_size: i64 = account.abi.len() as i64;
-    let new_size: i64 = act.abi.len() as i64;
+    let new_size: i64 = abi_def_packed.len() as i64;
 
     session
         .modify(&mut account, |a| {
-            a.abi = act.abi.clone();
+            a.abi = abi_def_packed.clone();
         })
         .map_err(|_| ChainError::TransactionError(format!("failed to update account")))?;
 
