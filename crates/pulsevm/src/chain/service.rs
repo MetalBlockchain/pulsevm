@@ -17,9 +17,7 @@ use crate::{
         PermissionResponse,
     },
     chain::{
-        AbiDefinition, Account, AccountMetadata, BlockTimestamp, KeyValue,
-        KeyValueByScopePrimaryIndex, Name, Permission, PermissionByOwnerIndex, Table,
-        TableByCodeScopeTableIndex, Transaction, error::ChainError, pulse_assert,
+        error::ChainError, pulse_assert, AbiDefinition, Account, AccountMetadata, BlockTimestamp, Gossipable, KeyValue, KeyValueByScopePrimaryIndex, Name, Permission, PermissionByOwnerIndex, Table, TableByCodeScopeTableIndex, Transaction
     },
     mempool::Mempool,
 };
@@ -79,7 +77,6 @@ impl RpcService {
         &self,
         request_body: &str,
     ) -> Result<String, serde_json::Error> {
-        println!("Handling API request: {}", request_body);
         // Make sure `RpcService` implements your API trait
         let module = self.clone().into_rpc();
 
@@ -192,7 +189,10 @@ impl RpcServer for RpcService {
         // Gossip
         let nm_clone = self.network_manager.clone();
         let nm = nm_clone.read().await;
-        nm.gossip(tx_bytes)
+        let gossipable_msg = Gossipable::new(0, tx.clone()).map_err(|e| {
+            ErrorObjectOwned::owned(500, "gossip_error", Some(format!("{}", e)))
+        })?;
+        nm.gossip(gossipable_msg)
             .await
             .map_err(|e| ErrorObjectOwned::owned(500, "gossip_error", Some(format!("{}", e))))?;
 

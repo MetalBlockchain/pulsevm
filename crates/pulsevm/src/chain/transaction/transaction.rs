@@ -60,7 +60,7 @@ impl Transaction {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Read, Write, NumBytes)]
+#[derive(Debug, Clone, PartialEq, Eq, Read, Write, NumBytes, Hash)]
 pub struct UnsignedTransaction {
     pub blockchain_id: Id, // ID of the chain on which this transaction exists (prevents replay attacks)
     pub actions: Vec<Action>, // Actions to be executed in this transaction

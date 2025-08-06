@@ -4,7 +4,7 @@ pub use block_timer::BlockTimer;
 use pulsevm_grpc::messenger::{Message, NotifyRequest, messenger_client::MessengerClient};
 use tonic::Request;
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
 use tokio::{
     sync::{
@@ -15,10 +15,11 @@ use tokio::{
     time::interval,
 };
 
-use crate::chain::Transaction;
+use crate::chain::{Id, Transaction};
 
 pub struct Mempool {
-    transactions: VecDeque<Transaction>,
+    transactions_list: VecDeque<Transaction>,
+    transactions_map: HashSet<Id>,
     request_block_mutex: Mutex<()>,
     server_address: String,
 }
@@ -26,18 +27,38 @@ pub struct Mempool {
 impl Mempool {
     pub fn new() -> Self {
         Self {
-            transactions: VecDeque::new(),
+            transactions_list: VecDeque::new(),
+            transactions_map: HashSet::new(),
             request_block_mutex: Mutex::new(()),
             server_address: String::new(),
         }
     }
 
     pub fn add_transaction(&mut self, transaction: Transaction) {
-        self.transactions.push_back(transaction);
+        let tx_id = transaction.id();
+
+        if self.transactions_map.contains(&tx_id) {
+            return; // Transaction already exists in the mempool
+        }
+
+        self.transactions_list.push_back(transaction);
+        self.transactions_map.insert(tx_id);
     }
 
     pub fn pop_transaction(&mut self) -> Option<Transaction> {
-        self.transactions.pop_front()
+        if let Some(tx) = self.transactions_list.pop_front() {
+            self.transactions_map.remove(&tx.id());
+            return Some(tx)
+        }
+
+        return None
+    }
+
+    pub fn remove_transaction(&mut self, tx_id: &Id) {
+        if let Some(index) = self.transactions_list.iter().position(|x| x.id() == *tx_id) {
+            self.transactions_list.remove(index);
+            self.transactions_map.remove(tx_id);
+        }
     }
 
     pub fn set_server_address(&mut self, address: String) {
@@ -60,7 +81,7 @@ impl Mempool {
     pub async fn check_block_build(&self) {
         let _ = self.request_block_mutex.lock().await;
 
-        if self.transactions.len() > 0 {
+        if self.transactions_list.len() > 0 {
             self.request_block_build().await;
         }
     }

@@ -6,7 +6,7 @@ use secp256k1::hashes::{Hash, sha256};
 
 use crate::chain::{Name, authority::PermissionLevel};
 
-#[derive(Debug, Clone, PartialEq, Eq, Read, Write, NumBytes)]
+#[derive(Debug, Clone, PartialEq, Eq, Read, Write, NumBytes, Hash)]
 pub struct Action {
     account: Name,
     name: Name,

@@ -14,8 +14,10 @@ use pulsevm_grpc::{
         vm_server::{Vm, VmServer},
     },
 };
+use pulsevm_serialization::Read;
 use spdlog::info;
 use std::{
+    mem,
     net::{SocketAddr, TcpListener},
     sync::{Arc, atomic::AtomicBool},
 };
@@ -31,12 +33,15 @@ use tokio::{
 use tonic::transport::server::TcpIncoming;
 use tonic::{Request, Response, Status, transport::Server};
 
-use crate::mempool::BlockTimer;
+use crate::{
+    chain::{Gossipable, Transaction},
+    mempool::BlockTimer,
+};
 
 const PLUGIN_VERSION: u32 = 38;
 const VERSION: &str = "0.0.1";
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 10)]
 async fn main() {
     // Initialize logging
     spdlog::default_logger().set_level_filter(spdlog::LevelFilter::All);
@@ -266,15 +271,18 @@ impl Vm for VirtualMachine {
         &self,
         request: Request<vm::BuildBlockRequest>,
     ) -> Result<tonic::Response<vm::BuildBlockResponse>, Status> {
-        info!("building block");
+        info!("build_block");
         let controller = self.controller.clone();
         let mut controller = controller.write().await;
+        println!("build_block: got controller");
         let mempool = self.mempool.clone();
         let mut mempool = mempool.write().await;
+        println!("build_block: got mempool");
         let block = controller
             .build_block(&mut mempool)
             .await
             .map_err(|e| Status::internal(format!("could not build block: {}", e)))?;
+        println!("build_block: built block: {:?}", block);
         Ok(Response::new(vm::BuildBlockResponse {
             id: block.id().into(),
             parent_id: block.parent_id.into(),
@@ -289,13 +297,13 @@ impl Vm for VirtualMachine {
         &self,
         request: Request<vm::ParseBlockRequest>,
     ) -> Result<tonic::Response<vm::ParseBlockResponse>, Status> {
-        println!("parsing block");
+        println!("parse_block");
         let controller = self.controller.clone();
         let controller = controller.read().await;
         let block = controller
             .parse_block(&request.get_ref().bytes)
             .map_err(|_| Status::internal("could not parse block"))?;
-        println!("parsed block: {:?}", block);
+        println!("parsed block");
         Ok(Response::new(vm::ParseBlockResponse {
             id: block.id().into(),
             parent_id: block.parent_id.into(),
@@ -335,8 +343,6 @@ impl Vm for VirtualMachine {
         }
 
         let block = block.unwrap();
-
-        info!("block found: {:?}", block);
 
         Ok(Response::new(vm::GetBlockResponse {
             parent_id: block.parent_id.into(),
@@ -387,7 +393,6 @@ impl Vm for VirtualMachine {
         &self,
         request: Request<vm::AppRequestMsg>,
     ) -> Result<tonic::Response<()>, Status> {
-        info!("received request: {:?}", request);
         Ok(Response::new(()))
     }
 
@@ -395,7 +400,6 @@ impl Vm for VirtualMachine {
         &self,
         request: Request<vm::AppRequestFailedMsg>,
     ) -> Result<tonic::Response<()>, Status> {
-        info!("received request: {:?}", request);
         Ok(Response::new(()))
     }
 
@@ -403,7 +407,6 @@ impl Vm for VirtualMachine {
         &self,
         request: Request<vm::AppResponseMsg>,
     ) -> Result<tonic::Response<()>, Status> {
-        info!("received request: {:?}", request);
         Ok(Response::new(()))
     }
 
@@ -411,7 +414,20 @@ impl Vm for VirtualMachine {
         &self,
         request: Request<vm::AppGossipMsg>,
     ) -> Result<tonic::Response<()>, Status> {
-        info!("received request: {:?}", request);
+        let data = request.get_ref().msg.clone();
+        let gossipable = Gossipable::read(&data, &mut 0).map_err(|e| {
+            Status::invalid_argument(format!("failed to deserialize gossipable data: {}", e))
+        })?;
+
+        if gossipable.gossip_type == 0 {
+            let tx = gossipable.to_type::<Transaction>().map_err(|e| {
+                Status::invalid_argument(format!("failed to deserialize transaction: {}", e))
+            })?;
+            let mempool = self.mempool.clone();
+            let mut mempool = mempool.write().await;
+            mempool.add_transaction(tx);
+        }
+
         Ok(Response::new(()))
     }
 
@@ -437,6 +453,7 @@ impl Vm for VirtualMachine {
         info!("batched_parse_block: {:?}", request);
         let controller = self.controller.clone();
         let controller = controller.read().await;
+        info!("batched_parse_block: got controller");
         let mut parsed_blocks: Vec<ParseBlockResponse> = Vec::new();
         for block in request.get_ref().request.iter() {
             let block = controller
@@ -462,6 +479,7 @@ impl Vm for VirtualMachine {
         info!("get_block_id_at_height: {:?}", request);
         let controller = self.controller.clone();
         let controller = controller.read().await;
+        info!("get_block_id_at_height: got controller");
         let block = controller
             .get_block_by_height(request.get_ref().height)
             .map_err(|_| Status::internal("could not get block by height"))?;
@@ -531,13 +549,15 @@ impl Vm for VirtualMachine {
         info!("verifying block");
         let controller = self.controller.clone();
         let mut controller = controller.write().await;
+        let mempool = self.mempool.clone();
+        let mut mempool = mempool.write().await;
         let block = controller
             .parse_block(&request.get_ref().bytes)
             .map_err(|_| Status::internal("could not parse block"))?;
 
         // Verify the block
         controller
-            .verify_block(&block)
+            .verify_block(&block, &mut mempool)
             .await
             .map_err(|_| Status::internal("could not verify block"))?;
 

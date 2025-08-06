@@ -47,7 +47,7 @@ pub use controller::Controller;
 mod error;
 
 mod network;
-pub use network::NetworkManager;
+pub use network::*;
 
 mod pulse_contract_types;
 pub use pulse_contract_types::*;

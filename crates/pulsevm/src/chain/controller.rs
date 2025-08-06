@@ -1,9 +1,7 @@
 use core::fmt;
 use std::{
-    cell::RefCell,
     collections::{HashMap, HashSet},
     path::Path,
-    rc::Rc,
     sync::{Arc, LazyLock, RwLock},
 };
 
@@ -29,7 +27,6 @@ use pulsevm_chainbase::{Database, UndoSession};
 use pulsevm_proc_macros::name;
 use pulsevm_serialization::Read;
 use spdlog::info;
-use tokio::sync::RwLock as AsyncRwLock;
 
 pub type ApplyHandlerFn = fn(&mut ApplyContext) -> Result<(), ChainError>;
 pub type ApplyHandlerMap = HashMap<
@@ -215,6 +212,13 @@ impl Controller {
             transactions.push(transaction.clone());
         }
 
+        // Don't build a block if we have no transactions
+        if transactions.len() == 0 {
+            return Err(ChainError::NetworkError(format!(
+                "built block has no transactions"
+            )));
+        }
+
         // Create a new block
         let block = Block::new(
             self.preferred_id,
@@ -225,7 +229,7 @@ impl Controller {
         Ok(block)
     }
 
-    pub async fn verify_block(&mut self, block: &Block) -> Result<(), ChainError> {
+    pub async fn verify_block(&mut self, block: &Block, mempool: &mut Mempool) -> Result<(), ChainError> {
         if self.verified_blocks.contains_key(&block.id()) {
             return Ok(());
         }
@@ -245,6 +249,9 @@ impl Controller {
         for transaction in &block.transactions {
             // Verify the transaction
             self.execute_transaction(&mut session, transaction, block.timestamp)?;
+
+            // Remove from mempool if we have it
+            mempool.remove_transaction(&transaction.id());
         }
 
         session
