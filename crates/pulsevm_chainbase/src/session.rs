@@ -27,10 +27,7 @@ impl Session {
     }
 
     #[must_use]
-    pub fn exists<T: ChainbaseObject>(
-        &mut self,
-        key: T::PrimaryKey,
-    ) -> Result<bool, ChainbaseError> {
+    pub fn exists<T: ChainbaseObject>(&self, key: T::PrimaryKey) -> Result<bool, ChainbaseError> {
         let partition = self
             .keyspace
             .open_partition(T::table_name(), Default::default())
@@ -44,7 +41,7 @@ impl Session {
 
     #[must_use]
     pub fn find<T: ChainbaseObject>(
-        &mut self,
+        &self,
         key: T::PrimaryKey,
     ) -> Result<Option<T>, ChainbaseError> {
         let partition = self
@@ -64,7 +61,7 @@ impl Session {
     }
 
     #[must_use]
-    pub fn get<T: ChainbaseObject>(&mut self, key: T::PrimaryKey) -> Result<T, ChainbaseError> {
+    pub fn get<T: ChainbaseObject>(&self, key: T::PrimaryKey) -> Result<T, ChainbaseError> {
         let found = self.find::<T>(key)?;
         if found.is_none() {
             return Err(ChainbaseError::NotFound);
@@ -75,7 +72,7 @@ impl Session {
 
     #[must_use]
     pub fn find_by_secondary<T: ChainbaseObject, S: SecondaryIndex<T>>(
-        &mut self,
+        &self,
         key: S::Key,
     ) -> Result<Option<T>, ChainbaseError> {
         let partition = self
