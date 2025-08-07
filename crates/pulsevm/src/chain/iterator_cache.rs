@@ -146,11 +146,6 @@ mod tests {
 
     use super::*;
 
-    #[derive(Clone, PartialEq, Eq, Hash)]
-    struct Test {
-        account: u64,
-    }
-
     #[test]
     fn test_iterator_cache() {
         let mut cache = IteratorCache::<KeyValue>::new();

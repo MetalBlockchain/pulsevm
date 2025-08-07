@@ -1,7 +1,6 @@
 use pulsevm_chainbase::UndoSession;
 use pulsevm_serialization::Write;
 use secp256k1::hashes::{Hash, sha256};
-use serde::Deserialize;
 
 use crate::chain::{
     ANY_NAME, AbiDefinition, AuthorizationManager, LinkAuth, PermissionLink,
@@ -319,7 +318,7 @@ pub fn updateauth(context: &mut ApplyContext) -> Result<(), ChainError> {
     )?;
 
     let mut parent_id = 0u64;
-    if (update.permission != OWNER_NAME) {
+    if update.permission != OWNER_NAME {
         let parent = AuthorizationManager::get_permission(
             &mut session,
             &PermissionLevel::new(update.account, update.parent),
@@ -414,10 +413,10 @@ pub fn linkauth(context: &mut ApplyContext) -> Result<(), ChainError> {
     )?;
     context.require_authorization(requirement.account, None)?;
     let mut session = context.undo_session();
-    let account = session.get::<Account>(requirement.account).map_err(|_| {
+    let _ = session.get::<Account>(requirement.account).map_err(|_| {
         ChainError::TransactionError(format!("failed to find account {}", requirement.account))
     })?;
-    let code = session.get::<Account>(requirement.code).map_err(|_| {
+    let _ = session.get::<Account>(requirement.code).map_err(|_| {
         ChainError::TransactionError(format!("failed to find code account {}", requirement.code))
     })?;
 

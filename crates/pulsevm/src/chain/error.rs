@@ -1,6 +1,5 @@
 use std::{error::Error, fmt};
 
-use jsonrpsee::types::ErrorObjectOwned;
 use pulsevm_chainbase::ChainbaseError;
 
 use super::Name;

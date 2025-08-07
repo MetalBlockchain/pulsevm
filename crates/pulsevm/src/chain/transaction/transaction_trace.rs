@@ -1,6 +1,6 @@
 use crate::chain::{AccountDelta, ActionTrace, Id, TransactionReceiptHeader, error::ChainError};
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct TransactionTrace {
     pub id: Id,
     pub block_num: u32,

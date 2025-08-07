@@ -1,6 +1,4 @@
 use std::{
-    cell::RefCell,
-    rc::Rc,
     sync::{Arc, RwLock},
 };
 
@@ -112,6 +110,19 @@ impl Session {
         let mut pos = 0 as usize;
         let object: T = T::read(&serialized.unwrap(), &mut pos).expect("failed to read object");
         Ok(Some(object))
+    }
+
+    #[must_use]
+    pub fn get_by_secondary<T: ChainbaseObject, S: SecondaryIndex<T>>(
+        &self,
+        key: S::Key,
+    ) -> Result<T, ChainbaseError> {
+        let found = self.find_by_secondary::<T, S>(key)?;
+        if found.is_none() {
+            return Err(ChainbaseError::NotFound);
+        }
+        let object = found.unwrap();
+        Ok(object)
     }
 
     pub fn get_index<C, S>(&self) -> ReadOnlyIndex<C, S>

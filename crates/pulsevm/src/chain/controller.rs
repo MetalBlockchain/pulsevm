@@ -1,6 +1,6 @@
 use core::fmt;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     mem,
     path::Path,
     sync::{Arc, LazyLock, RwLock},
@@ -8,11 +8,7 @@ use std::{
 
 use crate::{
     chain::{
-        ACTIVE_NAME, Account, AccountMetadata, Asset, BlockTimestamp, DELETEAUTH_NAME,
-        LINKAUTH_NAME, NEWACCOUNT_NAME, SETABI_NAME, SETCODE_NAME, UNLINKAUTH_NAME,
-        UPDATEAUTH_NAME,
-        config::GlobalPropertyObject,
-        pulse_contract::{deleteauth, linkauth, unlinkauth},
+        config::GlobalPropertyObject, pulse_contract::{deleteauth, linkauth, unlinkauth}, transaction, transaction_context::TransactionResult, Account, AccountMetadata, Asset, BlockTimestamp, TransactionReceipt, TransactionReceiptHeader, TransactionTrace, ACTIVE_NAME, DELETEAUTH_NAME, LINKAUTH_NAME, NEWACCOUNT_NAME, SETABI_NAME, SETCODE_NAME, UNLINKAUTH_NAME, UPDATEAUTH_NAME
     },
     mempool::Mempool,
 };
@@ -29,6 +25,7 @@ use super::{
 };
 use chrono::Utc;
 use pulsevm_chainbase::{Database, UndoSession};
+use pulsevm_crypto::{merkle, Digest};
 use pulsevm_proc_macros::name;
 use pulsevm_serialization::Read;
 use spdlog::info;
@@ -115,6 +112,7 @@ impl Controller {
             self.genesis.initial_timestamp()?,
             0,
             Vec::new(),
+            Digest::default(),
         );
 
         let session = self.db.session()?;
@@ -187,7 +185,7 @@ impl Controller {
 
     pub async fn build_block(&mut self, mempool: &mut Mempool) -> Result<Block, ChainError> {
         let mut undo_session = self.db.undo_session()?;
-        let mut transactions: Vec<Transaction> = Vec::new();
+        let mut transaction_receipts: VecDeque<TransactionReceipt> = VecDeque::new();
         let timestamp = BlockTimestamp::new(Utc::now());
 
         // Get transactions from the mempool
@@ -198,32 +196,33 @@ impl Controller {
                 break;
             }
             let transaction = transaction.unwrap();
-            let result = self.execute_transaction(&mut undo_session, &transaction, timestamp);
-            // TODO: Handle rollback behavior
-            if result.is_err() {
-                return Err(ChainError::TransactionError(format!(
-                    "failed to execute transaction: {}",
-                    result.unwrap_err()
-                )));
-            }
+            let transaction_result = self.execute_transaction(&mut undo_session, &transaction, timestamp)?;
+            let receipt = TransactionReceipt::new(
+                super::TransactionStatus::Executed,
+                0,
+                0,
+                transaction_result.trace.id().clone(),
+            );
 
             // Add the transaction to the block
-            transactions.push(transaction.clone());
+            transaction_receipts.push_back(receipt);
         }
 
         // Don't build a block if we have no transactions
-        if transactions.len() == 0 {
+        if transaction_receipts.len() == 0 {
             return Err(ChainError::NetworkError(format!(
                 "built block has no transactions"
             )));
         }
 
         // Create a new block
+        let trx_merkle = self.calculate_trx_merkle(&transaction_receipts)?;
         let block = Block::new(
             self.preferred_id,
             timestamp,
             self.last_accepted_block.height + 1,
-            transactions,
+            transaction_receipts,
+            trx_merkle,
         );
 
         // We built this block so no need to verify it again
@@ -293,7 +292,7 @@ impl Controller {
             return Ok(());
         }
 
-        for transaction in &block.transactions {
+        for transaction in &block.transaction_receipts {
             // Verify the transaction
             self.execute_transaction(session, transaction, block.timestamp)?;
 
@@ -314,7 +313,7 @@ impl Controller {
         &mut self,
         transaction: &Transaction,
         pending_block_timestamp: BlockTimestamp,
-    ) -> Result<(), ChainError> {
+    ) -> Result<TransactionResult, ChainError> {
         let db = &self.db;
         let mut undo_session = db.undo_session()?;
         let result =
@@ -330,7 +329,7 @@ impl Controller {
         undo_session: &mut UndoSession,
         transaction: &Transaction,
         pending_block_timestamp: BlockTimestamp,
-    ) -> Result<(), ChainError> {
+    ) -> Result<TransactionResult, ChainError> {
         {
             // Verify authority
             AuthorizationManager::check_authorization(
@@ -419,6 +418,19 @@ impl Controller {
     pub fn chain_id(&self) -> Id {
         self.chain_id
     }
+
+    pub fn calculate_trx_merkle(&self, trxs: &VecDeque<TransactionReceipt>) -> Result<Digest, ChainError> {
+        let mut trx_digests = VecDeque::new();
+
+        for trx in trxs {
+            let digest = trx.digest().map_err(|e| {
+                ChainError::TransactionError(format!("failed to calculate transaction digest: {}", e))
+            })?;
+            trx_digests.push_back(digest);
+        };
+
+        Ok(merkle(trx_digests))
+    }
 }
 
 #[cfg(test)]
@@ -506,20 +518,20 @@ mod tests {
                 vec![Action::new(
                     Name::from_str("pulse").unwrap(),
                     Name::from_str("newaccount").unwrap(),
-                    NewAccount::new(
-                        Name::from_str("pulse").unwrap(),
-                        account,
-                        Authority::new(
+                    NewAccount {
+                        creator: Name::from_str("pulse").unwrap(),
+                        name: account,
+                        owner: Authority::new(
                             1,
                             vec![KeyWeight::new(private_key.public_key(), 1)],
                             vec![],
                         ),
-                        Authority::new(
+                        active: Authority::new(
                             1,
                             vec![KeyWeight::new(private_key.public_key(), 1)],
                             vec![],
                         ),
-                    )
+                    }
                     .pack()
                     .unwrap(),
                     vec![PermissionLevel::new(
@@ -540,7 +552,14 @@ mod tests {
                 vec![Action::new(
                     Name::from_str("pulse").unwrap(),
                     Name::from_str("setcode").unwrap(),
-                    SetCode::new(account, 0, 0, wasm_bytes).pack().unwrap(),
+                    SetCode {
+                        account,
+                        vm_type: 0,
+                        vm_version: 0,
+                        code: wasm_bytes,
+                    }
+                    .pack()
+                    .unwrap(),
                     vec![PermissionLevel::new(
                         account,
                         Name::from_str("active").unwrap(),

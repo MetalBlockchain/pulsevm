@@ -68,9 +68,6 @@ impl WasmRuntime {
         // Enable the Cranelift optimizing compiler.
         config.strategy(Strategy::Cranelift);
 
-        // Enable fuel consumption to limit the execution time of the contract.
-        config.consume_fuel(true);
-
         // Enable signals-based traps. This is required to elide explicit
         // bounds-checking.
         config.signals_based_traps(true);
@@ -181,7 +178,6 @@ impl WasmRuntime {
 
         let context = WasmContext::new(receiver, action.clone(), apply_context);
         let mut store = Store::new(&self.engine, context);
-        store.set_fuel(100000); // Set a fuel limit for the execution
         let module = self.code_cache.get(&code_hash).ok_or_else(|| {
             ChainError::WasmRuntimeError(format!("wasm module not found in cache: {}", code_hash))
         })?;

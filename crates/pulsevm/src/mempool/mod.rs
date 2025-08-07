@@ -9,10 +9,7 @@ use std::collections::{HashSet, VecDeque};
 use tokio::{
     sync::{
         Mutex,
-        mpsc::{self, Receiver, Sender, error::SendError},
     },
-    task::JoinHandle,
-    time::interval,
 };
 
 use crate::chain::{Id, Transaction};

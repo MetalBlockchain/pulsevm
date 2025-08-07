@@ -1,31 +1,26 @@
 use proc_macro2::TokenStream;
 use quote::{ToTokens, quote, quote_spanned};
 use syn::{
-    Data, DeriveInput, Fields, GenericParam, Generics, Ident, Index, Path,
+    Data, DeriveInput, Fields, GenericParam, Generics, Ident, Index,
     parse::{Parse, ParseStream, Result as ParseResult},
     parse_quote,
     spanned::Spanned,
 };
 
-use crate::internal::get_root_path;
-
 pub struct DeriveNumBytes {
     ident: Ident,
     generics: Generics,
     data: Data,
-    root_path: Path,
 }
 
 impl Parse for DeriveNumBytes {
     fn parse(input: ParseStream) -> ParseResult<Self> {
         let DeriveInput {
-            attrs,
             ident,
             mut generics,
             data,
             ..
         } = input.parse()?;
-        let root_path = get_root_path(&attrs);
         for param in &mut generics.params {
             if let GenericParam::Type(ref mut type_param) = *param {
                 type_param
@@ -37,7 +32,6 @@ impl Parse for DeriveNumBytes {
             ident,
             generics,
             data,
-            root_path,
         })
     }
 }

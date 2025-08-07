@@ -5,8 +5,6 @@ use pulsevm_proc_macros::{NumBytes, Read, Write};
 use pulsevm_serialization::{Read, Write};
 use tonic::Request;
 
-use crate::chain::Transaction;
-
 use super::{error::ChainError, id::NodeId};
 
 #[derive(Debug, Clone, PartialEq, Eq, Write, Read, NumBytes)]

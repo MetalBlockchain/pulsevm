@@ -1,7 +1,5 @@
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 
-use crate::chain::AbiDefinition;
-
 use super::{Name, authority::Authority};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Read, Write, NumBytes)]
@@ -10,17 +8,6 @@ pub struct NewAccount {
     pub name: Name,
     pub owner: Authority,
     pub active: Authority,
-}
-
-impl NewAccount {
-    pub fn new(creator: Name, name: Name, owner: Authority, active: Authority) -> Self {
-        NewAccount {
-            creator,
-            name,
-            owner,
-            active,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Read, Write, NumBytes)]
@@ -58,17 +45,6 @@ pub struct SetCode {
     pub vm_type: u8,
     pub vm_version: u8,
     pub code: Vec<u8>,
-}
-
-impl SetCode {
-    pub fn new(account: Name, vm_type: u8, vm_version: u8, code: Vec<u8>) -> Self {
-        SetCode {
-            account,
-            vm_type,
-            vm_version,
-            code,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Read, Write, NumBytes)]

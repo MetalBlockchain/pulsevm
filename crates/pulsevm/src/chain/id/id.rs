@@ -1,6 +1,7 @@
 use core::fmt;
-use std::str::FromStr;
+use std::{error::Error, str::FromStr};
 
+use hex::FromHexError;
 use pulsevm_serialization::{NumBytes, Read, Write};
 use secp256k1::hashes::sha256::{self, Hash};
 use serde::Serialize;
@@ -24,17 +25,30 @@ impl Id {
     }
 }
 
+#[derive(Debug)]
+pub struct IdParseError;
+
+impl fmt::Display for IdParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid hex string for id")
+    }
+}
+
+impl Error for IdParseError {}
+
 impl FromStr for Id {
-    type Err = bs58::decode::Error;
+    type Err = IdParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let value = bs58::decode(s).as_cb58(None).into_vec()?;
-        if value.len() != 32 {
-            return Err(bs58::decode::Error::BufferTooSmall);
+        let bytes = hex::decode(s).map_err(|_| IdParseError)?;
+
+        if bytes.len() != 32 {
+            return Err(IdParseError);
         }
-        let mut id = [0u8; 32];
-        id.copy_from_slice(&value);
-        Ok(Id(id))
+
+        let mut array = [0u8; 32];
+        array.copy_from_slice(&bytes);
+        Ok(Id(array))
     }
 }
 
@@ -76,15 +90,14 @@ impl Serialize for Id {
     where
         S: serde::Serializer,
     {
-        let value = bs58::encode(self.0).as_cb58(None).into_string();
-        serializer.serialize_str(&value)
+        let hex_string = hex::encode(self.0);
+        serializer.serialize_str(&hex_string)
     }
 }
 
 impl fmt::Display for Id {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let value = bs58::encode(self.0).as_cb58(None).into_string();
-        write!(f, "{}", value)
+        write!(f, "{}", hex::encode(self.0))
     }
 }
 
@@ -135,7 +148,7 @@ mod tests {
 
     #[test]
     fn test_id_from_str() {
-        let id = Id::from_str("2iMormvesjkHEuF4toW2WGvvKsrrFkytLjTjRWCvis43pTC3AJ").unwrap();
+        let id = Id::from_str("e19b30bc0bfabfab01c9260469fab7529ae88987b2eb337dac5650305226b38e").unwrap();
         assert_eq!(
             hex::encode(id.as_bytes()),
             "e19b30bc0bfabfab01c9260469fab7529ae88987b2eb337dac5650305226b38e"

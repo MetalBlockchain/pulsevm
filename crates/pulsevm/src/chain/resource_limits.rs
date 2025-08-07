@@ -1,7 +1,6 @@
-use std::{cell::RefCell, collections::HashSet, rc::Rc};
+use std::collections::HashSet;
 
 use pulsevm_chainbase::UndoSession;
-use wasmtime::Ref;
 
 use crate::chain::UsageAccumulator;
 

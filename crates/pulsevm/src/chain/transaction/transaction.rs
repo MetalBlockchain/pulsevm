@@ -3,12 +3,13 @@ use std::collections::HashSet;
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 use pulsevm_serialization::Write;
 use secp256k1::hashes::{Hash, sha256};
+use serde::Serialize;
 
 use crate::chain::{Id, PrivateKey, PublicKey, Signature, error::ChainError};
 
 use super::action::Action;
 
-#[derive(Debug, Clone, PartialEq, Eq, Read, Write, NumBytes)]
+#[derive(Debug, Clone, PartialEq, Eq, Read, Write, NumBytes, Serialize)]
 pub struct Transaction {
     pub tx_type: u16, // Type of transaction (e.g., transfer, contract call)
     pub unsigned_tx: UnsignedTransaction, // Unsigned transaction data
@@ -60,7 +61,7 @@ impl Transaction {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Read, Write, NumBytes, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Read, Write, NumBytes, Hash, Serialize)]
 pub struct UnsignedTransaction {
     pub blockchain_id: Id, // ID of the chain on which this transaction exists (prevents replay attacks)
     pub actions: Vec<Action>, // Actions to be executed in this transaction

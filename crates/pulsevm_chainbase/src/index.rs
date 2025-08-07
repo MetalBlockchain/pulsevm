@@ -1,4 +1,4 @@
-use std::{io::Chain, ops::Bound};
+use std::ops::Bound;
 
 use fjall::{TransactionalKeyspace, TransactionalPartitionHandle};
 use pulsevm_serialization::Write;

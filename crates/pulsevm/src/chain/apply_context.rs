@@ -2,21 +2,20 @@ use std::{
     cell::RefCell,
     cmp::min,
     collections::{HashMap, HashSet, VecDeque},
-    hash::Hash,
     rc::Rc,
     sync::{Arc, RwLock},
     u64,
 };
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use pulsevm_chainbase::UndoSession;
 
 use crate::chain::{
     ActionReceipt, ActionTrace, AuthorizationManager, BlockTimestamp, CODE_NAME, IteratorCache,
     KeyValue, KeyValueByScopePrimaryIndex, Table, TableByCodeScopeTableIndex,
-    authority::{Permission, PermissionLevel},
+    authority::PermissionLevel,
     config::{DynamicGlobalPropertyObject, billable_size_v},
-    generate_action_digest, pulse_assert, table,
+    generate_action_digest, pulse_assert,
     wasm_runtime::WasmRuntime,
 };
 
@@ -257,10 +256,6 @@ impl ApplyContext {
             .map(|account| account.is_some())
             .map_err(|e| ChainError::TransactionError(format!("failed to find account: {}", e)))?;
         Ok(exists)
-    }
-
-    pub fn get_receiver(&self) -> Name {
-        self.receiver
     }
 
     pub fn undo_session(&self) -> UndoSession {

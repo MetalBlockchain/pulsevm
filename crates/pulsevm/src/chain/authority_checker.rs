@@ -1,7 +1,5 @@
 use std::{
-    cell::RefCell,
     collections::{HashMap, HashSet},
-    rc::Rc,
 };
 
 use pulsevm_chainbase::UndoSession;

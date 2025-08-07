@@ -10,7 +10,3 @@ pub fn pulse_assert<T>(condition: bool, error: T) -> Result<(), T> {
         return Err(error);
     }
 }
-
-pub const fn eos_percent(value: u64, percentage: u32) -> u64 {
-    (value * percentage as u64) / PERCENT_100
-}

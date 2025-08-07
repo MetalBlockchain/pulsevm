@@ -3,10 +3,11 @@ use core::fmt;
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 use pulsevm_serialization::{Read, Write};
 use secp256k1::hashes::{Hash, sha256};
+use serde::Serialize;
 
 use crate::chain::{Name, authority::PermissionLevel};
 
-#[derive(Debug, Clone, PartialEq, Eq, Read, Write, NumBytes, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Read, Write, NumBytes, Hash, Serialize)]
 pub struct Action {
     account: Name,
     name: Name,

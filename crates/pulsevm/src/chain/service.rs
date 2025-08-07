@@ -1,9 +1,8 @@
 use std::{str::FromStr, sync::Arc};
 
-use anyhow::Chain;
 use jsonrpsee::{
     proc_macros::rpc,
-    types::{ErrorObjectOwned, Response, ResponseSuccess},
+    types::ErrorObjectOwned,
 };
 use pulsevm_chainbase::Session;
 use pulsevm_serialization::Read;
@@ -13,13 +12,11 @@ use tonic::async_trait;
 
 use crate::{
     api::{
-        GetAccountResponse, GetInfoResponse, GetTableRowsParams, GetTableRowsResponse,
+        GetAccountResponse, GetInfoResponse, GetTableRowsResponse,
         IssueTxResponse, PermissionResponse,
     },
     chain::{
-        AbiDefinition, Account, AccountMetadata, BlockTimestamp, Gossipable, KeyValue,
-        KeyValueByScopePrimaryIndex, Name, PULSE_NAME, Permission, PermissionByOwnerIndex, Table,
-        TableByCodeScopeTableIndex, Transaction, VERSION, error::ChainError, pulse_assert,
+        block::{Block, BlockByHeightIndex}, error::ChainError, pulse_assert, AbiDefinition, Account, AccountMetadata, BlockTimestamp, Gossipable, Id, KeyValue, KeyValueByScopePrimaryIndex, Name, Permission, PermissionByOwnerIndex, Table, TableByCodeScopeTableIndex, Transaction, PULSE_NAME, VERSION
     },
     mempool::Mempool,
 };
@@ -40,6 +37,9 @@ pub trait Rpc {
 
     #[method(name = "pulsevm.getInfo")]
     async fn get_info(&self) -> Result<GetInfoResponse, ErrorObjectOwned>;
+
+    #[method(name = "pulsevm.getRawBlock")]
+    async fn get_raw_block(&self, block_num_or_id: String) -> Result<Block, ErrorObjectOwned>;
 
     #[method(name = "pulsevm.getTableRows")]
     async fn get_table_rows(
@@ -176,6 +176,36 @@ impl RpcServer for RpcService {
             total_cpu_weight: 0, // Placeholder, adjust as needed
             total_net_weight: 0, // Placeholder, adjust as needed
         })
+    }
+
+    async fn get_raw_block(
+        &self,
+        block_num_or_id: String,
+    ) -> Result<Block, ErrorObjectOwned> {
+        let controller = self.controller.clone();
+        let controller = controller.read().await;
+        let session = controller
+            .database()
+            .session()
+            .map_err(|e| ErrorObjectOwned::owned(500, "database_error", Some(format!("{}", e))))?;
+
+        if let Ok(n) = block_num_or_id.parse::<u64>() {
+            let block = session.get_by_secondary::<Block, BlockByHeightIndex>(n).map_err(|e| {
+                ErrorObjectOwned::owned(404, "block_not_found", Some(format!("{}", e)))
+            })?;
+            return Ok(block);
+        } else if let Ok(id) = Id::from_str(block_num_or_id.as_str()) {
+            let block = session.get::<Block>(id).map_err(|e| {
+                ErrorObjectOwned::owned(404, "block_not_found", Some(format!("{}", e)))
+            })?;
+            return Ok(block);
+        }
+
+        return Err(ErrorObjectOwned::owned(
+            400,
+            "invalid_block_identifier",
+            Some("block number or ID is invalid".to_string()),
+        ));
     }
 
     async fn issue_tx(

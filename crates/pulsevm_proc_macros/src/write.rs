@@ -1,31 +1,26 @@
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{ToTokens, quote, quote_spanned};
 use syn::{
-    Data, DeriveInput, Fields, GenericParam, Generics, Ident, Index, Path,
+    Data, DeriveInput, Fields, GenericParam, Generics, Ident, Index,
     parse::{Parse, ParseStream, Result as ParseResult},
     parse_quote,
     spanned::Spanned,
 };
 
-use crate::internal::get_root_path;
-
 pub struct DeriveWrite {
     ident: Ident,
     generics: Generics,
     data: Data,
-    root_path: Path,
 }
 
 impl Parse for DeriveWrite {
     fn parse(input: ParseStream) -> ParseResult<Self> {
         let DeriveInput {
-            attrs,
             ident,
             mut generics,
             data,
             ..
         } = input.parse()?;
-        let root_path = get_root_path(&attrs);
         for param in &mut generics.params {
             if let GenericParam::Type(ref mut type_param) = *param {
                 type_param
@@ -37,14 +32,12 @@ impl Parse for DeriveWrite {
             ident,
             generics,
             data,
-            root_path,
         })
     }
 }
 
 impl ToTokens for DeriveWrite {
     fn to_tokens(&self, tokens: &mut TokenStream2) {
-        let root = &self.root_path;
         let name = &self.ident;
         let (impl_generics, ty_generics, where_clause) = self.generics.split_for_impl();
         let call_site = ::proc_macro2::Span::call_site();

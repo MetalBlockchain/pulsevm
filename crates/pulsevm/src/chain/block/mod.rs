@@ -1,20 +1,26 @@
+use std::collections::VecDeque;
+
 use chrono::{DateTime, Utc};
 use prost_types::Timestamp;
 use pulsevm_chainbase::{ChainbaseObject, SecondaryIndex, SecondaryKey};
+use pulsevm_crypto::Digest;
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 use pulsevm_serialization::{NumBytes, Read, Write};
 use secp256k1::hashes::{Hash, sha256};
+use serde::Serialize;
 
-use crate::chain::BlockTimestamp;
+use crate::chain::{transaction, BlockTimestamp, TransactionReceipt};
 
 use super::{Id, Transaction};
 
-#[derive(Debug, Default, Clone, Read, Write, NumBytes)]
+#[derive(Debug, Default, Clone, Read, Write, NumBytes, Serialize)]
 pub struct Block {
+    #[serde(rename = "previous")]
     pub parent_id: Id,                  // ID of the parent block
     pub timestamp: BlockTimestamp,      // Timestamp of the block
     pub height: u64,                    // Height of the block in the chain
-    pub transactions: Vec<Transaction>, // Transactions included in this block
+    pub transaction_receipts: VecDeque<TransactionReceipt>, // Transactions included in this block
+    pub transaction_mroot: Digest, // Merkle root of the transactions in this block
 }
 
 impl Block {
@@ -22,13 +28,15 @@ impl Block {
         parent_id: Id,
         timestamp: BlockTimestamp,
         height: u64,
-        transactions: Vec<Transaction>,
+        transaction_receipts: VecDeque<TransactionReceipt>,
+        transaction_mroot: Digest,
     ) -> Self {
         Block {
             parent_id,
             timestamp,
             height,
-            transactions,
+            transaction_receipts,
+            transaction_mroot,
         }
     }
 
@@ -39,7 +47,7 @@ impl Block {
     }
 
     pub fn bytes(&self) -> Vec<u8> {
-        let mut bytes = self.pack().unwrap();
+        let bytes = self.pack().unwrap();
         bytes
     }
 }

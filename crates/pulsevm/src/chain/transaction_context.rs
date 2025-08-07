@@ -1,18 +1,23 @@
 use std::{
     cell::RefCell,
     rc::Rc,
-    sync::{Arc, RwLock},
+    sync::{atomic::AtomicI64, Arc, RwLock},
 };
 
 use pulsevm_chainbase::UndoSession;
 
 use crate::chain::{
-    BlockTimestamp, Genesis, TransactionTrace, block::Block, wasm_runtime::WasmRuntime,
+    BlockTimestamp, TransactionTrace, wasm_runtime::WasmRuntime,
 };
 
 use super::{
     Action, ActionTrace, Name, Transaction, apply_context::ApplyContext, error::ChainError,
 };
+
+pub struct TransactionResult {
+    pub trace: TransactionTrace,
+    pub billed_cpu_time_us: i64,
+}
 
 #[derive(Clone)]
 pub struct TransactionContext {
@@ -21,6 +26,7 @@ pub struct TransactionContext {
     pending_block_timestamp: BlockTimestamp,
 
     trace: Rc<RefCell<TransactionTrace>>,
+    billed_cpu_time_us: Rc<AtomicI64>,
 }
 
 impl TransactionContext {
@@ -35,10 +41,11 @@ impl TransactionContext {
             pending_block_timestamp,
 
             trace: Rc::new(RefCell::new(TransactionTrace::default())),
+            billed_cpu_time_us: Rc::new(AtomicI64::new(0)),
         }
     }
 
-    pub fn exec(&mut self, transaction: &Transaction) -> Result<(), ChainError> {
+    pub fn exec(&mut self, transaction: &Transaction) -> Result<TransactionResult, ChainError> {
         for action in transaction.unsigned_tx.actions.iter() {
             self.schedule_action(action, &action.account(), false, 0, 0);
         }
@@ -48,7 +55,12 @@ impl TransactionContext {
             self.execute_action(i as u32, 0)?;
         }
 
-        Ok(())
+        let trace = { self.trace.borrow().clone() };
+        let billed_cpu_time_us = self.billed_cpu_time_us.load(std::sync::atomic::Ordering::Relaxed);
+        Ok(TransactionResult {
+            trace,
+            billed_cpu_time_us,
+        })
     }
 
     pub fn schedule_action(

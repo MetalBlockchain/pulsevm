@@ -10,7 +10,7 @@ pub use undo_session::UndoSession;
 
 use fjall::{Config, TransactionalKeyspace, TransactionalPartitionHandle};
 use pulsevm_serialization::{Read, Write};
-use std::{error::Error, fmt, io::Chain, path::Path};
+use std::{error::Error, fmt, path::Path};
 
 #[derive(Debug, Clone)]
 pub enum ChainbaseError {
@@ -195,7 +195,5 @@ mod tests {
             .find_by_secondary::<TestObject, TestObjectByNameIndex>("Test".to_string())
             .expect("failed to find object by secondary index");
         assert_eq!(found.unwrap().id, 1);
-
-        session.commit();
     }
 }

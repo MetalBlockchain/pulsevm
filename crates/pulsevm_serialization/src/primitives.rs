@@ -1,4 +1,4 @@
-use std::{collections::HashSet, hash::Hash};
+use std::{collections::{HashSet, VecDeque}, hash::Hash};
 
 use crate::{NumBytes, Read, ReadError, Write, WriteError};
 
@@ -73,6 +73,17 @@ impl NumBytes for bool {
 }
 
 impl<T: NumBytes> NumBytes for Vec<T> {
+    #[inline(always)]
+    fn num_bytes(&self) -> usize {
+        let mut count = 4;
+        for item in self {
+            count += item.num_bytes();
+        }
+        count
+    }
+}
+
+impl<T: NumBytes> NumBytes for VecDeque<T> {
     #[inline(always)]
     fn num_bytes(&self) -> usize {
         let mut count = 4;
@@ -245,6 +256,27 @@ where
         for _ in 0..len {
             let item = T::read(bytes, pos)?;
             vec.push(item);
+        }
+        Ok(vec)
+    }
+}
+
+impl<T> Read for VecDeque<T>
+where
+    T: Read,
+{
+    #[inline(always)]
+    fn read(bytes: &[u8], pos: &mut usize) -> Result<Self, ReadError> {
+        let len = u32::read(bytes, pos)? as usize;
+
+        if *pos + len > bytes.len() {
+            return Err(ReadError::NotEnoughBytes);
+        }
+
+        let mut vec = VecDeque::with_capacity(len);
+        for _ in 0..len {
+            let item = T::read(bytes, pos)?;
+            vec.push_back(item);
         }
         Ok(vec)
     }
@@ -425,6 +457,18 @@ impl Write for bool {
 }
 
 impl<T: Write> Write for Vec<T> {
+    #[inline(always)]
+    fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), WriteError> {
+        let len = self.len() as u32;
+        len.write(bytes, pos)?;
+        for item in self.iter() {
+            item.write(bytes, pos)?;
+        }
+        Ok(())
+    }
+}
+
+impl<T: Write> Write for VecDeque<T> {
     #[inline(always)]
     fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), WriteError> {
         let len = self.len() as u32;

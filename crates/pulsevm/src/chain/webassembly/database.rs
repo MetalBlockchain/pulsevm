@@ -1,7 +1,6 @@
-use pulsevm_serialization::Write;
 use wasmtime::Caller;
 
-use crate::chain::{Name, wasm_runtime::WasmContext};
+use crate::chain::wasm_runtime::WasmContext;
 
 pub fn db_find_i64()
 -> impl Fn(Caller<'_, WasmContext>, u64, u64, u64, u64) -> Result<i32, wasmtime::Error> {
@@ -121,10 +120,6 @@ pub fn db_previous_i64()
 pub fn db_lowerbound_i64()
 -> impl Fn(Caller<'_, WasmContext>, u64, u64, u64, u64) -> Result<i32, wasmtime::Error> {
     |mut caller, code, scope, table, primary| {
-        let memory = caller
-            .get_export("memory")
-            .and_then(|ext| ext.into_memory())
-            .ok_or_else(|| anyhow::anyhow!("memory export not found"))?;
         let context = caller.data_mut().apply_context_mut();
         let res = context.db_lowerbound_i64(code.into(), scope.into(), table.into(), primary)?;
         Ok(res)
@@ -134,10 +129,6 @@ pub fn db_lowerbound_i64()
 pub fn db_upperbound_i64()
 -> impl Fn(Caller<'_, WasmContext>, u64, u64, u64, u64) -> Result<i32, wasmtime::Error> {
     |mut caller, code, scope, table, primary| {
-        let memory = caller
-            .get_export("memory")
-            .and_then(|ext| ext.into_memory())
-            .ok_or_else(|| anyhow::anyhow!("memory export not found"))?;
         let context = caller.data_mut().apply_context_mut();
         let res = context.db_upperbound_i64(code.into(), scope.into(), table.into(), primary)?;
         Ok(res)

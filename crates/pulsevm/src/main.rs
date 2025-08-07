@@ -15,21 +15,17 @@ use pulsevm_grpc::{
     },
 };
 use pulsevm_serialization::Read;
-use secp256k1::hashes::{Hash, sha256};
 use spdlog::{info, warn};
 use std::{
-    mem,
     net::{SocketAddr, TcpListener},
     sync::{Arc, atomic::AtomicBool},
 };
 use tokio::{
     net::TcpListener as TokioTcpListener,
     signal::{
-        self,
         unix::{SignalKind, signal},
     },
     sync::RwLock,
-    task::JoinHandle,
 };
 use tonic::transport::server::TcpIncoming;
 use tonic::{Request, Response, Status, transport::Server};
@@ -440,21 +436,21 @@ impl Vm for VirtualMachine {
 
     async fn app_request(
         &self,
-        request: Request<vm::AppRequestMsg>,
+        _request: Request<vm::AppRequestMsg>,
     ) -> Result<tonic::Response<()>, Status> {
         Ok(Response::new(()))
     }
 
     async fn app_request_failed(
         &self,
-        request: Request<vm::AppRequestFailedMsg>,
+        _request: Request<vm::AppRequestFailedMsg>,
     ) -> Result<tonic::Response<()>, Status> {
         Ok(Response::new(()))
     }
 
     async fn app_response(
         &self,
-        request: Request<vm::AppResponseMsg>,
+        _request: Request<vm::AppResponseMsg>,
     ) -> Result<tonic::Response<()>, Status> {
         Ok(Response::new(()))
     }
