@@ -1,4 +1,4 @@
-use std::{cell::RefCell, collections::VecDeque, error::Error, rc::Rc};
+use std::{cell::RefCell, collections::VecDeque, error::Error, rc::Rc, sync::{Arc, RwLock}};
 
 use fjall::{Slice, TransactionalKeyspace, WriteTransaction};
 
@@ -12,23 +12,23 @@ enum ObjectChange {
 
 #[derive(Clone)]
 pub struct UndoSession {
-    changes: Rc<RefCell<VecDeque<ObjectChange>>>,
-    tx: Rc<RefCell<WriteTransaction>>,
+    changes: Arc<RwLock<VecDeque<ObjectChange>>>,
+    tx: Arc<RwLock<WriteTransaction>>,
     keyspace: TransactionalKeyspace,
 }
 
 impl UndoSession {
     pub fn new(keyspace: &TransactionalKeyspace) -> Result<Self, ChainbaseError> {
         Ok(Self {
-            changes: Rc::new(RefCell::new(VecDeque::new())),
-            tx: Rc::new(RefCell::new(keyspace.write_tx().map_err(|_| {
+            changes: Arc::new(RwLock::new(VecDeque::new())),
+            tx: Arc::new(RwLock::new(keyspace.write_tx().map_err(|_| {
                 ChainbaseError::InternalError("failed to create write transaction".to_string())
             })?)),
             keyspace: keyspace.clone(),
         })
     }
 
-    pub fn tx(&self) -> Rc<RefCell<WriteTransaction>> {
+    pub fn tx(&self) -> Arc<RwLock<WriteTransaction>> {
         self.tx.clone()
     }
 
@@ -42,7 +42,7 @@ impl UndoSession {
         key: T::PrimaryKey,
     ) -> Result<bool, ChainbaseError> {
         let partition = open_partition(&self.keyspace, T::table_name())?;
-        let mut tx = self.tx.borrow_mut();
+        let mut tx = self.tx.write().map_err(|_| ChainbaseError::InternalError(format!("failed to write transaction")))?;
         let res = tx
             .contains_key(&partition, T::primary_key_to_bytes(key))
             .map_err(|_| {
@@ -57,7 +57,7 @@ impl UndoSession {
         key: T::PrimaryKey,
     ) -> Result<Option<T>, ChainbaseError> {
         let partition = open_partition(&self.keyspace, T::table_name())?;
-        let mut tx = self.tx.borrow_mut();
+        let mut tx = self.tx.write().map_err(|_| ChainbaseError::InternalError(format!("failed to write transaction")))?;
         let serialized = tx
             .get(&partition, T::primary_key_to_bytes(key))
             .map_err(|_| ChainbaseError::InternalError(format!("failed to get object for key")))?;
@@ -85,7 +85,7 @@ impl UndoSession {
         key: S::Key,
     ) -> Result<Option<T>, ChainbaseError> {
         let partition = open_partition(&self.keyspace, S::index_name())?;
-        let mut tx = self.tx.borrow_mut();
+        let mut tx = self.tx.write().map_err(|_| ChainbaseError::InternalError(format!("failed to write transaction")))?;
         let secondary_key = tx
             .get(&partition, S::secondary_key_as_bytes(key))
             .map_err(|_| ChainbaseError::InternalError(format!("failed to get secondary key")))?;
@@ -107,7 +107,7 @@ impl UndoSession {
     pub fn generate_id<T: ChainbaseObject>(&mut self) -> Result<u64, ChainbaseError> {
         let partition = open_partition(&self.keyspace, T::table_name())?;
         let mut new_id = 1u64;
-        let mut tx = self.tx.borrow_mut();
+        let mut tx = self.tx.write().map_err(|_| ChainbaseError::InternalError(format!("failed to write transaction")))?;
         // Do we have a sequence for this table?
         tx.fetch_update(&partition, "id", |v| {
             if v.is_none() {
@@ -136,14 +136,14 @@ impl UndoSession {
             ChainbaseError::InternalError(format!("failed to serialize object for key: {:?}", key))
         })?;
         let partition = open_partition(&self.keyspace, T::table_name())?;
-        let mut tx = self.tx.borrow_mut();
+        let mut tx = self.tx.write().map_err(|_| ChainbaseError::InternalError(format!("failed to write transaction")))?;
         let exists = tx.contains_key(&partition, &key).map_err(|_| {
             ChainbaseError::InternalError(format!("failed to check existence for key: {:?}", key))
         })?;
         if exists {
             return Err(ChainbaseError::AlreadyExists);
         }
-        let mut changes = self.changes.borrow_mut();
+        let mut changes = self.changes.write().map_err(|_| ChainbaseError::InternalError(format!("failed to write changes")))?;
         changes.push_back(ObjectChange::New(key.to_owned()));
         tx.insert(&partition, &key, serialized);
         for index in object.secondary_indexes() {
@@ -160,7 +160,7 @@ impl UndoSession {
     {
         let key = old.primary_key();
         let partition = open_partition(&self.keyspace, T::table_name())?;
-        let mut tx = self.tx.borrow_mut();
+        let mut tx = self.tx.write().map_err(|_| ChainbaseError::InternalError(format!("failed to write transaction")))?;
         let existing = tx.get(&partition, &key).map_err(|_| {
             ChainbaseError::InternalError(format!(
                 "failed to get existing object for key: {:?}",
@@ -178,7 +178,7 @@ impl UndoSession {
                 key
             ))
         })?;
-        let mut changes = self.changes.borrow_mut();
+        let mut changes = self.changes.write().map_err(|_| ChainbaseError::InternalError(format!("failed to write changes")))?;
         changes.push_back(ObjectChange::Modified(
             key.to_owned(),
             serialized_old,
@@ -191,14 +191,14 @@ impl UndoSession {
     pub fn remove<T: ChainbaseObject>(&mut self, object: T) -> Result<(), ChainbaseError> {
         let key = object.primary_key();
         let partition = open_partition(&self.keyspace, T::table_name())?;
-        let mut tx = self.tx.borrow_mut();
+        let mut tx = self.tx.write().map_err(|_| ChainbaseError::InternalError(format!("failed to write transaction")))?;
         let old_value = tx.get(&partition, &key).map_err(|_| {
             ChainbaseError::InternalError(format!("failed to get object for key: {:?}", key))
         })?;
         if old_value.is_none() {
             return Err(ChainbaseError::NotFound);
         }
-        let mut changes = self.changes.borrow_mut();
+        let mut changes = self.changes.write().map_err(|_| ChainbaseError::InternalError(format!("failed to write changes")))?;
         changes.push_back(ObjectChange::Deleted(
             key.to_owned(),
             old_value.unwrap().to_vec(),
@@ -212,10 +212,11 @@ impl UndoSession {
     }
 
     pub fn commit(self) -> Result<(), ChainbaseError> {
-        let tx = Rc::try_unwrap(self.tx)
+        let tx = Arc::try_unwrap(self.tx)
             .map_err(|_| "failed to unwrap Rc: multiple owners".to_string())
             .map_err(|_| ChainbaseError::InternalError("failed to unwrap transaction".to_string()))?
-            .into_inner();
+            .into_inner()
+            .map_err(|_| ChainbaseError::InternalError("failed to get inner transaction".to_string()))?;
         let result = tx.commit();
         if result.is_err() {
             return Err(ChainbaseError::InternalError(
@@ -226,10 +227,11 @@ impl UndoSession {
     }
 
     pub fn rollback(self) -> Result<(), ChainbaseError> {
-        let tx = Rc::try_unwrap(self.tx)
+        let tx = Arc::try_unwrap(self.tx)
             .map_err(|_| "failed to unwrap Rc: multiple owners".to_string())
             .map_err(|_| ChainbaseError::InternalError("failed to unwrap transaction".to_string()))?
-            .into_inner();
+            .into_inner()
+            .map_err(|_| ChainbaseError::InternalError("failed to get inner transaction".to_string()))?;
         tx.rollback();
         Ok(())
     }

@@ -1,4 +1,4 @@
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::RefCell, rc::Rc, sync::{Arc, RwLock}};
 
 use fjall::{ReadTransaction, TransactionalKeyspace};
 
@@ -6,19 +6,19 @@ use crate::{ChainbaseError, ChainbaseObject, SecondaryIndex, ro_index::ReadOnlyI
 
 #[derive(Clone)]
 pub struct Session {
-    tx: Rc<RefCell<ReadTransaction>>,
+    tx: Arc<RwLock<ReadTransaction>>,
     keyspace: TransactionalKeyspace,
 }
 
 impl Session {
     pub fn new(keyspace: &TransactionalKeyspace) -> Result<Self, ChainbaseError> {
         Ok(Self {
-            tx: Rc::new(RefCell::new(keyspace.read_tx())),
+            tx: Arc::new(RwLock::new(keyspace.read_tx())),
             keyspace: keyspace.clone(),
         })
     }
 
-    pub fn tx(&self) -> Rc<RefCell<ReadTransaction>> {
+    pub fn tx(&self) -> Arc<RwLock<ReadTransaction>> {
         self.tx.clone()
     }
 
@@ -32,7 +32,7 @@ impl Session {
             .keyspace
             .open_partition(T::table_name(), Default::default())
             .map_err(|_| ChainbaseError::InternalError(format!("failed to open partition")))?;
-        let tx = self.tx.borrow();
+        let tx = self.tx.read().map_err(|_| ChainbaseError::InternalError(format!("failed to read transaction")))?;
         let res = tx
             .contains_key(&partition, T::primary_key_to_bytes(key))
             .map_err(|_| ChainbaseError::InternalError(format!("failed to check existence")))?;
@@ -48,7 +48,7 @@ impl Session {
             .keyspace
             .open_partition(T::table_name(), Default::default())
             .map_err(|_| ChainbaseError::InternalError(format!("failed to open partition")))?;
-        let tx = self.tx.borrow();
+        let tx = self.tx.read().map_err(|_| ChainbaseError::InternalError(format!("failed to read transaction")))?;
         let serialized = tx
             .get(&partition, T::primary_key_to_bytes(key))
             .map_err(|_| ChainbaseError::InternalError(format!("failed to get object")))?;
@@ -79,7 +79,7 @@ impl Session {
             .keyspace
             .open_partition(S::index_name(), Default::default())
             .map_err(|_| ChainbaseError::InternalError(format!("failed to open partition")))?;
-        let tx = self.tx.borrow();
+        let tx = self.tx.read().map_err(|_| ChainbaseError::InternalError(format!("failed to read transaction")))?;
         let secondary_key = tx
             .get(&partition, S::secondary_key_as_bytes(key))
             .map_err(|_| ChainbaseError::InternalError(format!("failed to get secondary key")))?;

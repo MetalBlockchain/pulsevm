@@ -156,7 +156,7 @@ where
     pub fn previous(&mut self) -> Result<Option<S::Object>, ChainbaseError> {
         let prev = {
             let tx = self.session.tx();
-            let tx = tx.borrow();
+            let tx = tx.read().map_err(|_| ChainbaseError::InternalError(format!("failed to read transaction")))?;
             let mut range = tx.range(&self.partition, self.range.clone()).rev();
             let prev = range.next();
             prev
@@ -190,7 +190,7 @@ where
     pub fn next(&mut self) -> Result<Option<S::Object>, ChainbaseError> {
         let next = {
             let tx = self.session.tx();
-            let tx = tx.borrow();
+            let tx = tx.read().map_err(|_| ChainbaseError::InternalError(format!("failed to read transaction")))?;
             let mut range = tx.range(&self.partition, self.range.clone());
             let next = range.next();
             next
@@ -250,7 +250,7 @@ where
     pub fn next(&mut self) -> Result<Option<S::Object>, ChainbaseError> {
         let next = {
             let tx = self.session.tx();
-            let tx = tx.borrow();
+            let tx = tx.read().map_err(|_| ChainbaseError::InternalError(format!("failed to read transaction")))?;
             let range = (
                 std::ops::Bound::Excluded(self.current_key.clone()),
                 std::ops::Bound::Unbounded,
@@ -287,7 +287,7 @@ where
     pub fn previous(&mut self) -> Result<Option<S::Object>, ChainbaseError> {
         let prev = {
             let tx = self.session.tx();
-            let tx = tx.borrow();
+            let tx = tx.read().map_err(|_| ChainbaseError::InternalError(format!("failed to read transaction")))?;
             let mut range = tx.range(&self.partition, ..self.current_key.clone()).rev();
             let prev = range.next();
             prev
