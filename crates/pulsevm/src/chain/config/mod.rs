@@ -1,3 +1,6 @@
+pub const PLUGIN_VERSION: u32 = 38;
+pub const VERSION: &str = "v0.0.1";
+
 pub const OVERHEAD_PER_ACCOUNT_RAM_BYTES: u32 = 2048;
 pub const OVERHEAD_PER_ROW_PER_INDEX_RAM_BYTES: u32 = 32;
 pub const BILLABLE_ALIGNMENT: u64 = 16;

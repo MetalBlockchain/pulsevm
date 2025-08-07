@@ -13,11 +13,11 @@ use tonic::async_trait;
 
 use crate::{
     api::{
-        GetAccountResponse, GetTableRowsParams, GetTableRowsResponse, IssueTxResponse,
-        PermissionResponse,
+        GetAccountResponse, GetInfoResponse, GetTableRowsParams, GetTableRowsResponse,
+        IssueTxResponse, PermissionResponse,
     },
     chain::{
-        error::ChainError, pulse_assert, AbiDefinition, Account, AccountMetadata, BlockTimestamp, Gossipable, KeyValue, KeyValueByScopePrimaryIndex, Name, Permission, PermissionByOwnerIndex, Table, TableByCodeScopeTableIndex, Transaction
+        error::ChainError, pulse_assert, AbiDefinition, Account, AccountMetadata, BlockTimestamp, Gossipable, KeyValue, KeyValueByScopePrimaryIndex, Name, Permission, PermissionByOwnerIndex, Table, TableByCodeScopeTableIndex, Transaction, PULSE_NAME, VERSION
     },
     mempool::Mempool,
 };
@@ -35,6 +35,9 @@ pub trait Rpc {
 
     #[method(name = "pulsevm.getAccount")]
     async fn get_account(&self, name: Name) -> Result<GetAccountResponse, ErrorObjectOwned>;
+
+    #[method(name = "pulsevm.getInfo")]
+    async fn get_info(&self) -> Result<GetInfoResponse, ErrorObjectOwned>;
 
     #[method(name = "pulsevm.getTableRows")]
     async fn get_table_rows(
@@ -149,6 +152,30 @@ impl RpcServer for RpcService {
         Ok(result)
     }
 
+    async fn get_info(&self) -> Result<GetInfoResponse, ErrorObjectOwned> {
+        let controller = self.controller.clone();
+        let controller = controller.read().await;
+        let head_block = controller.last_accepted_block();
+
+        Ok(GetInfoResponse {
+            server_version: VERSION.to_string(),
+            chain_id: controller.chain_id(),
+            head_block_num: head_block.height as u32,
+            last_irreversible_block_num: head_block.height as u32,
+            last_irreversible_block_id: head_block.id(),
+            head_block_id: head_block.id(),
+            head_block_time: head_block.timestamp,
+            head_block_producer: PULSE_NAME,
+            virtual_block_cpu_limit: 0, // Placeholder, adjust as needed
+            virtual_block_net_limit: 0, // Placeholder, adjust as needed
+            block_cpu_limit: 0, // Placeholder, adjust as needed
+            block_net_limit: 0, // Placeholder, adjust as needed
+            server_version_string: VERSION.to_string(),
+            total_cpu_weight: 0, // Placeholder, adjust as needed
+            total_net_weight: 0, // Placeholder, adjust as needed
+        })
+    }
+
     async fn issue_tx(
         &self,
         tx_hex: &str,
@@ -189,9 +216,8 @@ impl RpcServer for RpcService {
         // Gossip
         let nm_clone = self.network_manager.clone();
         let nm = nm_clone.read().await;
-        let gossipable_msg = Gossipable::new(0, tx.clone()).map_err(|e| {
-            ErrorObjectOwned::owned(500, "gossip_error", Some(format!("{}", e)))
-        })?;
+        let gossipable_msg = Gossipable::new(0, tx.clone())
+            .map_err(|e| ErrorObjectOwned::owned(500, "gossip_error", Some(format!("{}", e))))?;
         nm.gossip(gossipable_msg)
             .await
             .map_err(|e| ErrorObjectOwned::owned(500, "gossip_error", Some(format!("{}", e))))?;

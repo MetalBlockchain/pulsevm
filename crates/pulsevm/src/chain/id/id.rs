@@ -3,6 +3,7 @@ use std::str::FromStr;
 
 use pulsevm_serialization::{NumBytes, Read, Write};
 use secp256k1::hashes::sha256::{self, Hash};
+use serde::Serialize;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub struct Id(pub [u8; 32]);
@@ -67,6 +68,16 @@ impl Read for Id {
         id.copy_from_slice(&data[*pos..*pos + 32]);
         *pos += 32;
         Ok(Id(id))
+    }
+}
+
+impl Serialize for Id {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let value = bs58::encode(self.0).as_cb58(None).into_string();
+        serializer.serialize_str(&value)
     }
 }
 

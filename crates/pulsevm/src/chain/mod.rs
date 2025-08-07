@@ -26,6 +26,7 @@ pub use authorization_manager::AuthorizationManager;
 mod block;
 
 mod config;
+pub use config::*;
 
 mod genesis;
 

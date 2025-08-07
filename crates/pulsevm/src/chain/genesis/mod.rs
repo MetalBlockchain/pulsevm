@@ -3,10 +3,14 @@ use core::str;
 use pulsevm_proc_macros::NumBytes;
 use pulsevm_proc_macros::Read;
 use pulsevm_proc_macros::Write;
+use pulsevm_serialization::Write;
+use secp256k1::hashes::Hash;
+use secp256k1::hashes::sha256;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
 use crate::chain::BlockTimestamp;
+use crate::chain::Id;
 use crate::chain::error::ChainError;
 
 use super::PublicKey;
@@ -19,7 +23,7 @@ pub struct ChainConfig {
     pub max_action_return_value_size: u32,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, Read, Write, NumBytes)]
 pub struct Genesis {
     initial_timestamp: String,
     initial_key: String,
@@ -48,6 +52,15 @@ impl Genesis {
         }
         self.initial_key()?;
         Ok(self.clone())
+    }
+
+    pub fn compute_chain_id(&self) -> Result<Id, ChainError> {
+        let packed = self
+            .pack()
+            .map_err(|e| ChainError::GenesisError(format!("failed to pack genesis: {}", e)))?;
+        let hash = sha256::Hash::hash(&packed);
+        let chain_id = Id::from_sha256(&hash);
+        Ok(chain_id)
     }
 
     pub fn initial_timestamp(&self) -> Result<BlockTimestamp, ChainError> {

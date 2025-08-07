@@ -1,6 +1,7 @@
 use core::fmt;
 use std::{
     collections::{HashMap, HashSet},
+    mem,
     path::Path,
     sync::{Arc, LazyLock, RwLock},
 };
@@ -27,6 +28,7 @@ use pulsevm_chainbase::{Database, UndoSession};
 use pulsevm_proc_macros::name;
 use pulsevm_serialization::Read;
 use spdlog::info;
+use tokio::sync::RwLock as AsyncRwLock;
 
 pub type ApplyHandlerFn = fn(&mut ApplyContext) -> Result<(), ChainError>;
 pub type ApplyHandlerMap = HashMap<
@@ -54,12 +56,13 @@ pub static APPLY_HANDLERS: LazyLock<ApplyHandlerMap> = LazyLock::new(|| {
 
 pub struct Controller {
     wasm_runtime: Arc<RwLock<WasmRuntime>>,
-    genesis: Option<Genesis>,
+    genesis: Genesis,
 
     last_accepted_block: Block,
     preferred_id: Id,
     db: Database,
     verified_blocks: HashMap<Id, Block>,
+    chain_id: Id,
 }
 
 #[derive(Debug)]
@@ -82,12 +85,13 @@ impl Controller {
         let wasm_runtime = WasmRuntime::new().unwrap();
         let controller = Controller {
             wasm_runtime: Arc::new(RwLock::new(wasm_runtime)), // TODO: Handle error properly
-            genesis: None,
+            genesis: Genesis::default(),
 
             last_accepted_block: Block::default(),
             preferred_id: Id::default(),
             db: db,
             verified_blocks: HashMap::new(),
+            chain_id: Id::default(),
         };
 
         controller
@@ -102,21 +106,20 @@ impl Controller {
             ChainError::InternalError(Some(format!("failed to open database: {}", e)))
         })?;
         // Parse genesis bytes
-        self.genesis = Some(
-            Genesis::parse(genesis_bytes)
-                .map_err(|e| ChainError::ParseError(format!("failed to parse genesis: {}", e)))?
-                .validate()?,
-        );
+        self.genesis = Genesis::parse(genesis_bytes)
+            .map_err(|e| ChainError::ParseError(format!("failed to parse genesis: {}", e)))?
+            .validate()?;
+        self.chain_id = self.genesis.compute_chain_id()?;
 
         // Set our last accepted block to the genesis block
         self.last_accepted_block = Block::new(
             Id::default(),
-            self.genesis.clone().unwrap().initial_timestamp().unwrap(),
+            self.genesis.initial_timestamp()?,
             0,
             Vec::new(),
         );
 
-        let mut session = self.db.session()?;
+        let session = self.db.session()?;
 
         // Do we have the genesis block in our DB?
         let genesis_block = session
@@ -133,9 +136,7 @@ impl Controller {
             session.insert(&self.last_accepted_block).map_err(|e| {
                 ChainError::GenesisError(format!("failed to insert genesis block: {}", e))
             })?;
-            let default_key = self.genesis.clone().unwrap().initial_key().map_err(|e| {
-                ChainError::GenesisError(format!("failed to get initial key: {}", e))
-            })?;
+            let default_key = self.genesis.initial_key()?;
             info!(
                 "initializing pulse account with default key: {}",
                 default_key.0
@@ -226,17 +227,65 @@ impl Controller {
             self.last_accepted_block.height + 1,
             transactions,
         );
+
+        // We built this block so no need to verify it again
+        self.verified_blocks.insert(block.id(), block.clone());
+
         Ok(block)
     }
 
-    pub async fn verify_block(&mut self, block: &Block, mempool: &mut Mempool) -> Result<(), ChainError> {
+    pub async fn verify_block(
+        &mut self,
+        block: &Block,
+        mempool: Arc<AsyncRwLock<Mempool>>,
+    ) -> Result<(), ChainError> {
         if self.verified_blocks.contains_key(&block.id()) {
             return Ok(());
         }
 
         // Verify the block
         let mut session = self.db.undo_session()?;
+        let mut mempool = mempool.write().await;
+        self.execute_block(block, &mut session, &mut mempool)
+            .await?;
+        self.verified_blocks.insert(block.id(), block.clone());
 
+        Ok(())
+    }
+
+    pub async fn accept_block(
+        &mut self,
+        block_id: &Id,
+        mempool: Arc<AsyncRwLock<Mempool>>,
+    ) -> Result<(), ChainError> {
+        let block = {
+            self.verified_blocks
+                .get(block_id)
+                .cloned()
+                .ok_or(ChainError::NetworkError(format!(
+                    "block with id {} not verified",
+                    block_id
+                )))?
+        };
+        let mut session = self.db.undo_session()?;
+        let mut mempool = mempool.write().await;
+        self.execute_block(&block, &mut session, &mut mempool)
+            .await?;
+        session
+            .commit()
+            .map_err(|e| ChainError::TransactionError(format!("failed to commit block: {}", e)))?;
+        self.verified_blocks.remove(block_id);
+        self.last_accepted_block = block;
+
+        Ok(())
+    }
+
+    pub async fn execute_block(
+        &mut self,
+        block: &Block,
+        session: &mut UndoSession,
+        mempool: &mut Mempool,
+    ) -> Result<(), ChainError> {
         // Make sure we don't have the block already
         let existing_block = session
             .find::<Block>(block.id())
@@ -248,7 +297,7 @@ impl Controller {
 
         for transaction in &block.transactions {
             // Verify the transaction
-            self.execute_transaction(&mut session, transaction, block.timestamp)?;
+            self.execute_transaction(session, transaction, block.timestamp)?;
 
             // Remove from mempool if we have it
             mempool.remove_transaction(&transaction.id());
@@ -257,28 +306,6 @@ impl Controller {
         session
             .insert(block)
             .map_err(|e| ChainError::TransactionError(format!("failed to insert block: {}", e)))?;
-        session.commit();
-
-        self.verified_blocks.insert(block.id(), block.clone());
-
-        Ok(())
-    }
-
-    pub async fn accept_block(&mut self, block_id: &Id) -> Result<(), ChainError> {
-        let mut session = self.db.session()?;
-        let existing_block = session
-            .find::<Block>(block_id.clone())
-            .map_err(|e| ChainError::TransactionError(format!("failed to find block: {}", e)))?;
-
-        if existing_block.is_none() {
-            return Err(ChainError::TransactionError(format!(
-                "block not found in database: {}",
-                block_id
-            )));
-        }
-
-        self.verified_blocks.remove(block_id);
-        self.last_accepted_block = existing_block.unwrap();
 
         Ok(())
     }
@@ -389,6 +416,10 @@ impl Controller {
 
     pub fn database(&self) -> Database {
         self.db.clone()
+    }
+
+    pub fn chain_id(&self) -> Id {
+        self.chain_id
     }
 }
 

@@ -48,10 +48,10 @@ impl Mempool {
     pub fn pop_transaction(&mut self) -> Option<Transaction> {
         if let Some(tx) = self.transactions_list.pop_front() {
             self.transactions_map.remove(&tx.id());
-            return Some(tx)
+            return Some(tx);
         }
 
-        return None
+        return None;
     }
 
     pub fn remove_transaction(&mut self, tx_id: &Id) {

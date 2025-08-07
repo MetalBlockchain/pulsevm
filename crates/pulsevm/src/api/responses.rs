@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use serde::Serialize;
 
-use crate::chain::{Authority, BlockTimestamp, Name};
+use crate::chain::{Authority, BlockTimestamp, Id, Name};
 
 #[derive(Serialize, Clone, Default)]
 pub struct PermissionResponse {
@@ -36,6 +36,25 @@ pub struct GetAccountResponse {
     pub ram_usage: i64,
 
     pub permissions: Vec<PermissionResponse>,
+}
+
+#[derive(Serialize, Clone, Default)]
+pub struct GetInfoResponse {
+    pub server_version: String,
+    pub chain_id: Id,
+    pub head_block_num: u32,
+    pub last_irreversible_block_num: u32,
+    pub last_irreversible_block_id: Id,
+    pub head_block_id: Id,
+    pub head_block_time: BlockTimestamp,
+    pub head_block_producer: Name,
+    pub virtual_block_cpu_limit: u64,
+    pub virtual_block_net_limit: u64,
+    pub block_cpu_limit: u64,
+    pub block_net_limit: u64,
+    pub server_version_string: String,
+    pub total_cpu_weight: u64,
+    pub total_net_weight: u64,
 }
 
 #[derive(Serialize, Clone)]
