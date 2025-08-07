@@ -2,11 +2,11 @@ use pulsevm_chainbase::{ChainbaseObject, SecondaryIndex, SecondaryKey};
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 use pulsevm_serialization::Write;
 
-use crate::chain::{Id, Name};
+use crate::chain::{BillableSize, Id, Name, config};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Read, Write, NumBytes)]
 pub struct PermissionLink {
-    id: Id,
+    id: u64,
     /// The account which is defining its permission requirements
     account: Name,
     /// The contract which account requires @ref required_permission to invoke
@@ -16,12 +16,12 @@ pub struct PermissionLink {
     message_type: Name,
     /// The permission level which @ref account requires for the specified message types
     /// all of the above fields should not be changed within a chainbase modifier lambda
-    required_permission: Name,
+    pub required_permission: Name,
 }
 
 impl PermissionLink {
     pub fn new(
-        id: Id,
+        id: u64,
         account: Name,
         code: Name,
         message_type: Name,
@@ -36,7 +36,7 @@ impl PermissionLink {
         }
     }
 
-    pub fn id(&self) -> Id {
+    pub fn id(&self) -> u64 {
         self.id
     }
 
@@ -57,15 +57,26 @@ impl PermissionLink {
     }
 }
 
+impl BillableSize for PermissionLink {
+    fn billable_size() -> u64 {
+        (config::OVERHEAD_PER_ROW_PER_INDEX_RAM_BYTES as u64 * 3) // 3 indexes
+            + 8 // id
+            + 8 // account
+            + 8 // code
+            + 8 // message_type
+            + 8 // required_permission
+    }
+}
+
 impl ChainbaseObject for PermissionLink {
-    type PrimaryKey = Id;
+    type PrimaryKey = u64;
 
     fn primary_key(&self) -> Vec<u8> {
         PermissionLink::primary_key_to_bytes(self.id)
     }
 
     fn primary_key_to_bytes(key: Self::PrimaryKey) -> Vec<u8> {
-        key.0.to_vec()
+        key.to_be_bytes().to_vec()
     }
 
     fn table_name() -> &'static str {
@@ -122,7 +133,7 @@ impl SecondaryIndex<PermissionLink> for PermissionLinkByActionNameIndex {
 pub struct PermissionLinkByPermissionNameIndex;
 
 impl SecondaryIndex<PermissionLink> for PermissionLinkByPermissionNameIndex {
-    type Key = (Name, Name, Id);
+    type Key = (Name, Name, u64);
     type Object = PermissionLink;
 
     fn secondary_key(object: &PermissionLink) -> Vec<u8> {

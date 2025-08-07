@@ -3,7 +3,11 @@ use pulsevm_serialization::Write;
 use secp256k1::hashes::{Hash, sha256};
 use serde::Deserialize;
 
-use crate::chain::{resource_limits::ResourceLimitsManager, AbiDefinition, AuthorizationManager, PermissionLink, PermissionLinkByPermissionNameIndex};
+use crate::chain::{
+    ANY_NAME, AbiDefinition, AuthorizationManager, LinkAuth, PermissionLink,
+    PermissionLinkByActionNameIndex, PermissionLinkByPermissionNameIndex,
+    resource_limits::ResourceLimitsManager,
+};
 
 use super::{
     ACTIVE_NAME, Account, AccountMetadata, CODE_NAME, CodeObject, DeleteAuth, Id, NewAccount,
@@ -380,16 +384,90 @@ pub fn deleteauth(context: &mut ApplyContext) -> Result<(), ChainError> {
     if let Some(obj) = obj {
         return Err(ChainError::TransactionError(format!(
             "cannot delete a linked authority, unlink the authority first, this authority is linked to {}::{}.",
-            obj.code(), obj.message_type()
+            obj.code(),
+            obj.message_type()
         )));
     }
 
-    let permission = AuthorizationManager::get_permission(&mut session, &PermissionLevel::new(remove.account, remove.permission))?;
-    let old_size = config::billable_size_v::<Permission>() as i64 + permission.authority.get_billable_size() as i64;
+    let permission = AuthorizationManager::get_permission(
+        &mut session,
+        &PermissionLevel::new(remove.account, remove.permission),
+    )?;
+    let old_size = config::billable_size_v::<Permission>() as i64
+        + permission.authority.get_billable_size() as i64;
 
     AuthorizationManager::remove_permission(&mut session, &permission)?;
 
     context.add_ram_usage(remove.account, -old_size);
+
+    Ok(())
+}
+
+pub fn linkauth(context: &mut ApplyContext) -> Result<(), ChainError> {
+    let requirement = context
+        .get_action()
+        .data_as::<LinkAuth>()
+        .map_err(|e| ChainError::TransactionError(format!("failed to deserialize data: {}", e)))?;
+    pulse_assert(
+        !requirement.requirement.empty(),
+        ChainError::TransactionError(format!("required permission cannot be empty")),
+    )?;
+    context.require_authorization(requirement.account, None)?;
+    let mut session = context.undo_session();
+    let account = session.get::<Account>(requirement.account).map_err(|_| {
+        ChainError::TransactionError(format!("failed to find account {}", requirement.account))
+    })?;
+    let code = session.get::<Account>(requirement.code).map_err(|_| {
+        ChainError::TransactionError(format!("failed to find code account {}", requirement.code))
+    })?;
+
+    if requirement.requirement != ANY_NAME {
+        let permission = session.find_by_secondary::<Permission, PermissionByOwnerIndex>((
+            requirement.account,
+            requirement.requirement,
+        ))?;
+        pulse_assert(
+            permission.is_some(),
+            ChainError::TransactionError(format!(
+                "failed to retrieve permission: {}",
+                requirement.requirement
+            )),
+        )?;
+    }
+
+    let link_key = (
+        requirement.account,
+        requirement.code,
+        requirement.message_type,
+    );
+    let link =
+        session.find_by_secondary::<PermissionLink, PermissionLinkByActionNameIndex>(link_key)?;
+
+    if let Some(mut link) = link {
+        pulse_assert(
+            link.required_permission() != requirement.requirement,
+            ChainError::TransactionError(format!(
+                "attempting to update required authority, but new requirement is same as old"
+            )),
+        )?;
+        session.modify(&mut link, |l| {
+            l.required_permission = requirement.requirement;
+        })?;
+    } else {
+        let new_link = PermissionLink::new(
+            session.generate_id::<PermissionLink>()?,
+            requirement.account,
+            requirement.code,
+            requirement.message_type,
+            requirement.requirement,
+        );
+        session.insert(&new_link)?;
+
+        context.add_ram_usage(
+            new_link.account(),
+            config::billable_size_v::<PermissionLink>() as i64,
+        );
+    }
 
     Ok(())
 }

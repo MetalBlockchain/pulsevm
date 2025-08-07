@@ -94,13 +94,16 @@ impl ChainbaseObject for Permission {
     }
 
     fn secondary_indexes(&self) -> Vec<SecondaryKey> {
-        vec![SecondaryKey {
-            key: PermissionByOwnerIndex::secondary_key_as_bytes((self.owner, self.name)),
-            index_name: PermissionByOwnerIndex::index_name(),
-        }, SecondaryKey {
-            key: PermissionByParentIndex::secondary_key_as_bytes((self.parent_id, self.id)),
-            index_name: PermissionByParentIndex::index_name(),
-        }]
+        vec![
+            SecondaryKey {
+                key: PermissionByOwnerIndex::secondary_key_as_bytes((self.owner, self.name)),
+                index_name: PermissionByOwnerIndex::index_name(),
+            },
+            SecondaryKey {
+                key: PermissionByParentIndex::secondary_key_as_bytes((self.parent_id, self.id)),
+                index_name: PermissionByParentIndex::index_name(),
+            },
+        ]
     }
 }
 
