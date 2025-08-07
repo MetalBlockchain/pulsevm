@@ -17,7 +17,9 @@ use crate::{
         IssueTxResponse, PermissionResponse,
     },
     chain::{
-        error::ChainError, pulse_assert, AbiDefinition, Account, AccountMetadata, BlockTimestamp, Gossipable, KeyValue, KeyValueByScopePrimaryIndex, Name, Permission, PermissionByOwnerIndex, Table, TableByCodeScopeTableIndex, Transaction, PULSE_NAME, VERSION
+        AbiDefinition, Account, AccountMetadata, BlockTimestamp, Gossipable, KeyValue,
+        KeyValueByScopePrimaryIndex, Name, PULSE_NAME, Permission, PermissionByOwnerIndex, Table,
+        TableByCodeScopeTableIndex, Transaction, VERSION, error::ChainError, pulse_assert,
     },
     mempool::Mempool,
 };
@@ -168,8 +170,8 @@ impl RpcServer for RpcService {
             head_block_producer: PULSE_NAME,
             virtual_block_cpu_limit: 0, // Placeholder, adjust as needed
             virtual_block_net_limit: 0, // Placeholder, adjust as needed
-            block_cpu_limit: 0, // Placeholder, adjust as needed
-            block_net_limit: 0, // Placeholder, adjust as needed
+            block_cpu_limit: 0,         // Placeholder, adjust as needed
+            block_net_limit: 0,         // Placeholder, adjust as needed
             server_version_string: VERSION.to_string(),
             total_cpu_weight: 0, // Placeholder, adjust as needed
             total_net_weight: 0, // Placeholder, adjust as needed

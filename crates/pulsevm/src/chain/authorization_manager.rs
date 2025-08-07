@@ -1,5 +1,7 @@
 use std::{cell::RefCell, collections::HashSet, rc::Rc};
 
+use crate::chain::PermissionByParentIndex;
+
 use super::{
     ACTIVE_NAME, ANY_NAME, Action, DeleteAuth, LinkAuth, Name, PublicKey, UnlinkAuth, UpdateAuth,
     authority::{
@@ -424,6 +426,26 @@ impl AuthorizationManager {
             .map_err(|e| {
                 ChainError::AuthorizationError(format!("Failed to create permission: {}", e))
             })?;
+        Ok(())
+    }
+
+    pub fn remove_permission(
+        session: &mut UndoSession,
+        permission: &Permission,
+    ) -> Result<(), ChainError> {
+        let mut index = session.get_index::<Permission, PermissionByParentIndex>();
+        let mut range = index.lower_bound(permission.id())?;
+        let next = range.next()?;
+
+        if next.is_some() {
+            return Err(ChainError::AuthorizationError(format!(
+                "cannot delete permission '{}' because it has child permissions",
+                permission
+            )));
+        }
+
+        session.remove(permission.clone())?;
+
         Ok(())
     }
 }

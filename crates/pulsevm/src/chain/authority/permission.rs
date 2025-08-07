@@ -1,3 +1,5 @@
+use core::fmt;
+
 use pulsevm_chainbase::{ChainbaseObject, SecondaryIndex, SecondaryKey, UndoSession};
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 use pulsevm_serialization::Write;
@@ -70,6 +72,12 @@ impl Permission {
     }
 }
 
+impl fmt::Display for Permission {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}@{}", self.owner, self.name)
+    }
+}
+
 impl ChainbaseObject for Permission {
     type PrimaryKey = u64;
 
@@ -89,6 +97,9 @@ impl ChainbaseObject for Permission {
         vec![SecondaryKey {
             key: PermissionByOwnerIndex::secondary_key_as_bytes((self.owner, self.name)),
             index_name: PermissionByOwnerIndex::index_name(),
+        }, SecondaryKey {
+            key: PermissionByParentIndex::secondary_key_as_bytes((self.parent_id, self.id)),
+            index_name: PermissionByParentIndex::index_name(),
         }]
     }
 }
@@ -111,6 +122,27 @@ impl SecondaryIndex<Permission> for PermissionByOwnerIndex {
 
     fn index_name() -> &'static str {
         "permission_by_owner"
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct PermissionByParentIndex;
+
+impl SecondaryIndex<Permission> for PermissionByParentIndex {
+    type Key = (u64, u64);
+    type Object = Permission;
+
+    fn secondary_key(object: &Permission) -> Vec<u8> {
+        PermissionByParentIndex::secondary_key_as_bytes((object.parent_id, object.id))
+    }
+
+    fn secondary_key_as_bytes(key: Self::Key) -> Vec<u8> {
+        let bytes = key.pack().unwrap();
+        bytes
+    }
+
+    fn index_name() -> &'static str {
+        "permission_by_parent"
     }
 }
 

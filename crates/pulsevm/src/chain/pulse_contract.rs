@@ -3,7 +3,7 @@ use pulsevm_serialization::Write;
 use secp256k1::hashes::{Hash, sha256};
 use serde::Deserialize;
 
-use crate::chain::{AbiDefinition, AuthorizationManager, resource_limits::ResourceLimitsManager};
+use crate::chain::{resource_limits::ResourceLimitsManager, AbiDefinition, AuthorizationManager, PermissionLink, PermissionLinkByPermissionNameIndex};
 
 use super::{
     ACTIVE_NAME, Account, AccountMetadata, CODE_NAME, CodeObject, DeleteAuth, Id, NewAccount,
@@ -373,7 +373,23 @@ pub fn deleteauth(context: &mut ApplyContext) -> Result<(), ChainError> {
         ChainError::TransactionError(format!("cannot delete owner authority")),
     )?;
 
-    //let authorization = controller.get_authorization_manager();
+    let mut session = context.undo_session();
+    let mut index = session.get_index::<PermissionLink, PermissionLinkByPermissionNameIndex>();
+    let mut range = index.lower_bound((remove.account, remove.permission))?;
+    let obj = range.next()?;
+    if let Some(obj) = obj {
+        return Err(ChainError::TransactionError(format!(
+            "cannot delete a linked authority, unlink the authority first, this authority is linked to {}::{}.",
+            obj.code(), obj.message_type()
+        )));
+    }
+
+    let permission = AuthorizationManager::get_permission(&mut session, &PermissionLevel::new(remove.account, remove.permission))?;
+    let old_size = config::billable_size_v::<Permission>() as i64 + permission.authority.get_billable_size() as i64;
+
+    AuthorizationManager::remove_permission(&mut session, &permission)?;
+
+    context.add_ram_usage(remove.account, -old_size);
 
     Ok(())
 }
