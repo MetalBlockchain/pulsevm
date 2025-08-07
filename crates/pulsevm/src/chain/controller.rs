@@ -9,9 +9,10 @@ use std::{
 use crate::{
     chain::{
         ACTIVE_NAME, Account, AccountMetadata, Asset, BlockTimestamp, DELETEAUTH_NAME,
-        LINKAUTH_NAME, NEWACCOUNT_NAME, SETABI_NAME, SETCODE_NAME, UPDATEAUTH_NAME,
+        LINKAUTH_NAME, NEWACCOUNT_NAME, SETABI_NAME, SETCODE_NAME, UNLINKAUTH_NAME,
+        UPDATEAUTH_NAME,
         config::GlobalPropertyObject,
-        pulse_contract::{deleteauth, linkauth},
+        pulse_contract::{deleteauth, linkauth, unlinkauth},
     },
     mempool::Mempool,
 };
@@ -47,6 +48,7 @@ pub static APPLY_HANDLERS: LazyLock<ApplyHandlerMap> = LazyLock::new(|| {
     m.insert((PULSE_NAME, PULSE_NAME, UPDATEAUTH_NAME), updateauth);
     m.insert((PULSE_NAME, PULSE_NAME, DELETEAUTH_NAME), deleteauth);
     m.insert((PULSE_NAME, PULSE_NAME, LINKAUTH_NAME), linkauth);
+    m.insert((PULSE_NAME, PULSE_NAME, UNLINKAUTH_NAME), unlinkauth);
     m
 });
 

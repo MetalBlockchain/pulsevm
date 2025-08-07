@@ -5,7 +5,7 @@ use serde::Deserialize;
 
 use crate::chain::{
     ANY_NAME, AbiDefinition, AuthorizationManager, LinkAuth, PermissionLink,
-    PermissionLinkByActionNameIndex, PermissionLinkByPermissionNameIndex,
+    PermissionLinkByActionNameIndex, PermissionLinkByPermissionNameIndex, UnlinkAuth,
     resource_limits::ResourceLimitsManager,
 };
 
@@ -467,6 +467,33 @@ pub fn linkauth(context: &mut ApplyContext) -> Result<(), ChainError> {
             new_link.account(),
             config::billable_size_v::<PermissionLink>() as i64,
         );
+    }
+
+    Ok(())
+}
+
+pub fn unlinkauth(context: &mut ApplyContext) -> Result<(), ChainError> {
+    let unlink = context
+        .get_action()
+        .data_as::<UnlinkAuth>()
+        .map_err(|e| ChainError::TransactionError(format!("failed to deserialize data: {}", e)))?;
+    context.require_authorization(unlink.account, None)?;
+
+    let link_key = (unlink.account, unlink.code, unlink.message_type);
+    let mut session = context.undo_session();
+    let link =
+        session.find_by_secondary::<PermissionLink, PermissionLinkByActionNameIndex>(link_key)?;
+
+    if let Some(link) = link {
+        session.remove(link)?;
+        context.add_ram_usage(
+            unlink.account,
+            -(config::billable_size_v::<PermissionLink>() as i64),
+        );
+    } else {
+        return Err(ChainError::TransactionError(format!(
+            "attempting to unlink authority, but no link found"
+        )));
     }
 
     Ok(())
