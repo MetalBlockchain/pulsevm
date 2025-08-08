@@ -1,5 +1,5 @@
 use pulsevm_serialization::{NumBytes, Read, Write};
-use secp256k1::hashes::{sha256, Hash};
+use secp256k1::hashes::{Hash, sha256};
 use serde::Serialize;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]

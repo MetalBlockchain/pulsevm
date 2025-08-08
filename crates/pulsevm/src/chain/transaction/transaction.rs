@@ -5,69 +5,44 @@ use pulsevm_serialization::Write;
 use secp256k1::hashes::{Hash, sha256};
 use serde::Serialize;
 
-use crate::chain::{Id, PrivateKey, PublicKey, Signature, error::ChainError};
+use crate::chain::{
+    Id, PrivateKey, PublicKey, Signature, SignedTransaction, TransactionCompression,
+    TransactionHeader, error::ChainError, transaction::signed_transaction,
+};
 
 use super::action::Action;
 
-#[derive(Debug, Clone, PartialEq, Eq, Read, Write, NumBytes, Serialize)]
-pub struct Transaction {
-    pub tx_type: u16, // Type of transaction (e.g., transfer, contract call)
-    pub unsigned_tx: UnsignedTransaction, // Unsigned transaction data
-    pub signatures: HashSet<Signature>, // Signatures of the transaction
-}
-
-impl Transaction {
-    #[allow(dead_code)]
-    pub fn new(tx_type: u16, unsigned_tx: UnsignedTransaction) -> Self {
-        Self {
-            tx_type,
-            unsigned_tx,
-            signatures: HashSet::new(),
-        }
-    }
-
-    pub fn id(&self) -> Id {
-        let bytes: Vec<u8> = self.pack().unwrap();
-        let digest = sha256::Hash::hash(&bytes);
-        Id::from_sha256(&digest)
-    }
-
-    pub fn digest(&self) -> sha256::Hash {
-        let bytes: Vec<u8> = self.unsigned_tx.pack().unwrap();
-        sha256::Hash::hash(&bytes)
-    }
-
-    #[must_use]
-    pub fn recovered_keys(&self) -> Result<HashSet<PublicKey>, ChainError> {
-        let mut recovered_keys: HashSet<PublicKey> = HashSet::new();
-        let digest = self.digest();
-
-        for signature in self.signatures.iter() {
-            let public_key = signature
-                .recover_public_key(&digest)
-                .map_err(|e| ChainError::SignatureRecoverError(format!("{}", e)))?;
-            recovered_keys.insert(public_key);
-        }
-
-        Ok(recovered_keys)
-    }
-
-    #[allow(dead_code)]
-    pub fn sign(mut self, private_key: &PrivateKey) -> Self {
-        let digest = self.digest();
-        let signature = private_key.sign(&digest);
-        self.signatures.insert(signature);
-        self
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Read, Write, NumBytes, Hash, Serialize)]
-pub struct UnsignedTransaction {
-    pub blockchain_id: Id, // ID of the chain on which this transaction exists (prevents replay attacks)
+pub struct Transaction {
+    pub header: TransactionHeader,
     pub actions: Vec<Action>, // Actions to be executed in this transaction
 }
 
-impl UnsignedTransaction {
+impl Transaction {
+    pub fn new(header: TransactionHeader, actions: Vec<Action>) -> Self {
+        Self { header, actions }
+    }
+
+    pub fn id(&self) -> Result<Id, ChainError> {
+        Ok(Id::from_sha256(&self.digest()?))
+    }
+
+    pub fn digest(&self) -> Result<sha256::Hash, ChainError> {
+        let bytes: Vec<u8> = self.pack().map_err(|e| {
+            ChainError::SerializationError(format!("failed to pack transaction: {}", e))
+        })?;
+        Ok(sha256::Hash::hash(&bytes))
+    }
+
+    // Helper function for testing
+    pub fn sign(&self, private_key: &PrivateKey) -> Result<SignedTransaction, ChainError> {
+        let signed_transaction = SignedTransaction::new(self.clone(), HashSet::new());
+
+        signed_transaction.sign(private_key)
+    }
+}
+
+/* impl UnsignedTransaction {
     #[allow(dead_code)]
     pub fn new(blockchain_id: Id, actions: Vec<Action>) -> Self {
         Self {
@@ -136,3 +111,4 @@ mod tests {
         );
     }
 }
+ */

@@ -1,3 +1,6 @@
+mod bytes;
+pub use bytes::Bytes;
+
 mod digest;
 pub use digest::Digest;
 

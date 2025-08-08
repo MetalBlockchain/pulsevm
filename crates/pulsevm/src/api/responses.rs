@@ -60,7 +60,7 @@ pub struct GetInfoResponse {
 #[derive(Serialize, Clone)]
 pub struct IssueTxResponse {
     #[serde(rename(serialize = "txID"))]
-    pub tx_id: String,
+    pub tx_id: Id,
 }
 
 #[derive(Serialize, Clone, Default)]

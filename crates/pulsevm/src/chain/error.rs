@@ -17,6 +17,7 @@ pub enum ChainError {
     WasmRuntimeError(String),
     DatabaseError(String),
     InvalidArgument(String),
+    SerializationError(String),
 }
 
 impl fmt::Display for ChainError {
@@ -43,6 +44,7 @@ impl fmt::Display for ChainError {
             ChainError::WasmRuntimeError(msg) => write!(f, "wasm runtime error: {}", msg),
             ChainError::DatabaseError(msg) => write!(f, "database error: {}", msg),
             ChainError::InvalidArgument(msg) => write!(f, "invalid argument: {}", msg),
+            ChainError::SerializationError(msg) => write!(f, "serialization error: {}", msg),
         }
     }
 }

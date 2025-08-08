@@ -1,14 +1,12 @@
 use std::{
     cell::RefCell,
     rc::Rc,
-    sync::{atomic::AtomicI64, Arc, RwLock},
+    sync::{Arc, RwLock, atomic::AtomicI64},
 };
 
 use pulsevm_chainbase::UndoSession;
 
-use crate::chain::{
-    BlockTimestamp, TransactionTrace, wasm_runtime::WasmRuntime,
-};
+use crate::chain::{BlockTimestamp, TransactionTrace, wasm_runtime::WasmRuntime};
 
 use super::{
     Action, ActionTrace, Name, Transaction, apply_context::ApplyContext, error::ChainError,
@@ -46,7 +44,7 @@ impl TransactionContext {
     }
 
     pub fn exec(&mut self, transaction: &Transaction) -> Result<TransactionResult, ChainError> {
-        for action in transaction.unsigned_tx.actions.iter() {
+        for action in transaction.actions.iter() {
             self.schedule_action(action, &action.account(), false, 0, 0);
         }
 
@@ -56,7 +54,9 @@ impl TransactionContext {
         }
 
         let trace = { self.trace.borrow().clone() };
-        let billed_cpu_time_us = self.billed_cpu_time_us.load(std::sync::atomic::Ordering::Relaxed);
+        let billed_cpu_time_us = self
+            .billed_cpu_time_us
+            .load(std::sync::atomic::Ordering::Relaxed);
         Ok(TransactionResult {
             trace,
             billed_cpu_time_us,

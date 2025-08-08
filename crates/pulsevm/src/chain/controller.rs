@@ -1,14 +1,18 @@
 use core::fmt;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    mem,
     path::Path,
     sync::{Arc, LazyLock, RwLock},
 };
 
 use crate::{
     chain::{
-        config::GlobalPropertyObject, pulse_contract::{deleteauth, linkauth, unlinkauth}, transaction, transaction_context::TransactionResult, Account, AccountMetadata, Asset, BlockTimestamp, TransactionReceipt, TransactionReceiptHeader, TransactionTrace, ACTIVE_NAME, DELETEAUTH_NAME, LINKAUTH_NAME, NEWACCOUNT_NAME, SETABI_NAME, SETCODE_NAME, UNLINKAUTH_NAME, UPDATEAUTH_NAME
+        ACTIVE_NAME, Account, AccountMetadata, Asset, BlockTimestamp, DELETEAUTH_NAME,
+        LINKAUTH_NAME, NEWACCOUNT_NAME, PackedTransaction, SETABI_NAME, SETCODE_NAME,
+        SignedTransaction, TransactionReceipt, UNLINKAUTH_NAME, UPDATEAUTH_NAME,
+        config::GlobalPropertyObject,
+        pulse_contract::{deleteauth, linkauth, unlinkauth},
+        transaction_context::TransactionResult,
     },
     mempool::Mempool,
 };
@@ -25,8 +29,7 @@ use super::{
 };
 use chrono::Utc;
 use pulsevm_chainbase::{Database, UndoSession};
-use pulsevm_crypto::{merkle, Digest};
-use pulsevm_proc_macros::name;
+use pulsevm_crypto::{Digest, merkle};
 use pulsevm_serialization::Read;
 use spdlog::info;
 use tokio::sync::RwLock as AsyncRwLock;
@@ -111,7 +114,7 @@ impl Controller {
             Id::default(),
             self.genesis.initial_timestamp()?,
             0,
-            Vec::new(),
+            VecDeque::new(),
             Digest::default(),
         );
 
@@ -195,14 +198,15 @@ impl Controller {
             if transaction.is_none() {
                 break;
             }
+
             let transaction = transaction.unwrap();
-            let transaction_result = self.execute_transaction(&mut undo_session, &transaction, timestamp)?;
-            let receipt = TransactionReceipt::new(
-                super::TransactionStatus::Executed,
-                0,
-                0,
-                transaction_result.trace.id().clone(),
-            );
+            let transaction_result = self.execute_transaction(
+                &mut undo_session,
+                &transaction.get_signed_transaction(),
+                &timestamp,
+            )?;
+            let receipt =
+                TransactionReceipt::new(super::TransactionStatus::Executed, 0, 0, transaction);
 
             // Add the transaction to the block
             transaction_receipts.push_back(receipt);
@@ -292,12 +296,16 @@ impl Controller {
             return Ok(());
         }
 
-        for transaction in &block.transaction_receipts {
+        for receipt in &block.transaction_receipts {
             // Verify the transaction
-            self.execute_transaction(session, transaction, block.timestamp)?;
+            self.execute_transaction(
+                session,
+                receipt.trx().get_signed_transaction(),
+                &block.timestamp,
+            )?;
 
             // Remove from mempool if we have it
-            mempool.remove_transaction(&transaction.id());
+            mempool.remove_transaction(receipt.trx().id());
         }
 
         session
@@ -311,8 +319,8 @@ impl Controller {
     // This is useful for checking if a transaction is valid
     pub fn push_transaction(
         &mut self,
-        transaction: &Transaction,
-        pending_block_timestamp: BlockTimestamp,
+        transaction: &SignedTransaction,
+        pending_block_timestamp: &BlockTimestamp,
     ) -> Result<TransactionResult, ChainError> {
         let db = &self.db;
         let mut undo_session = db.undo_session()?;
@@ -327,15 +335,15 @@ impl Controller {
     pub fn execute_transaction(
         &mut self,
         undo_session: &mut UndoSession,
-        transaction: &Transaction,
-        pending_block_timestamp: BlockTimestamp,
+        signed_transaction: &SignedTransaction,
+        pending_block_timestamp: &BlockTimestamp,
     ) -> Result<TransactionResult, ChainError> {
         {
             // Verify authority
             AuthorizationManager::check_authorization(
                 undo_session,
-                &transaction.unsigned_tx.actions,
-                &transaction.recovered_keys()?,
+                &signed_transaction.transaction().actions,
+                &signed_transaction.recovered_keys()?,
                 &HashSet::new(),
                 &HashSet::new(),
             )?;
@@ -344,10 +352,10 @@ impl Controller {
         let mut trx_context = TransactionContext::new(
             undo_session.clone(),
             self.wasm_runtime.clone(),
-            pending_block_timestamp,
+            pending_block_timestamp.clone(),
         );
 
-        return trx_context.exec(transaction);
+        return trx_context.exec(signed_transaction.transaction());
     }
 
     pub fn last_accepted_block(&self) -> &Block {
@@ -419,15 +427,21 @@ impl Controller {
         self.chain_id
     }
 
-    pub fn calculate_trx_merkle(&self, trxs: &VecDeque<TransactionReceipt>) -> Result<Digest, ChainError> {
+    pub fn calculate_trx_merkle(
+        &self,
+        receipts: &VecDeque<TransactionReceipt>,
+    ) -> Result<Digest, ChainError> {
         let mut trx_digests = VecDeque::new();
 
-        for trx in trxs {
-            let digest = trx.digest().map_err(|e| {
-                ChainError::TransactionError(format!("failed to calculate transaction digest: {}", e))
+        for receipt in receipts {
+            let digest = receipt.digest().map_err(|e| {
+                ChainError::TransactionError(format!(
+                    "failed to calculate transaction digest: {}",
+                    e
+                ))
             })?;
             trx_digests.push_back(digest);
-        };
+        }
 
         Ok(merkle(trx_digests))
     }
@@ -439,10 +453,11 @@ mod tests {
 
     use pulsevm_proc_macros::{NumBytes, Read, Write};
     use pulsevm_serialization::Write;
+    use pulsevm_time::TimePointSec;
     use serde_json::json;
 
     use crate::chain::{
-        Action, NewAccount, PrivateKey, SetCode, Symbol, UnsignedTransaction,
+        Action, NewAccount, PrivateKey, SetCode, Symbol, TransactionHeader,
         authority::{Permission, PermissionLevel},
     };
 
@@ -510,62 +525,56 @@ mod tests {
         genesis.to_string().into_bytes()
     }
 
-    fn create_account(private_key: &PrivateKey, account: Name) -> Transaction {
+    fn create_account(private_key: &PrivateKey, account: Name) -> Result<SignedTransaction, ChainError> {
         Transaction::new(
-            0,
-            UnsignedTransaction::new(
-                Id::default(),
-                vec![Action::new(
+            TransactionHeader::new(TimePointSec::new(0), 0, 0, Id::default()),
+            vec![Action::new(
+                Name::from_str("pulse").unwrap(),
+                Name::from_str("newaccount").unwrap(),
+                NewAccount {
+                    creator: Name::from_str("pulse").unwrap(),
+                    name: account,
+                    owner: Authority::new(
+                        1,
+                        vec![KeyWeight::new(private_key.public_key(), 1)],
+                        vec![],
+                    ),
+                    active: Authority::new(
+                        1,
+                        vec![KeyWeight::new(private_key.public_key(), 1)],
+                        vec![],
+                    ),
+                }
+                .pack()
+                .unwrap(),
+                vec![PermissionLevel::new(
                     Name::from_str("pulse").unwrap(),
-                    Name::from_str("newaccount").unwrap(),
-                    NewAccount {
-                        creator: Name::from_str("pulse").unwrap(),
-                        name: account,
-                        owner: Authority::new(
-                            1,
-                            vec![KeyWeight::new(private_key.public_key(), 1)],
-                            vec![],
-                        ),
-                        active: Authority::new(
-                            1,
-                            vec![KeyWeight::new(private_key.public_key(), 1)],
-                            vec![],
-                        ),
-                    }
-                    .pack()
-                    .unwrap(),
-                    vec![PermissionLevel::new(
-                        Name::from_str("pulse").unwrap(),
-                        Name::from_str("active").unwrap(),
-                    )],
+                    Name::from_str("active").unwrap(),
                 )],
-            ),
+            )],
         )
         .sign(&private_key)
     }
 
-    fn set_code(private_key: &PrivateKey, account: Name, wasm_bytes: Vec<u8>) -> Transaction {
+    fn set_code(private_key: &PrivateKey, account: Name, wasm_bytes: Vec<u8>) -> Result<SignedTransaction, ChainError> {
         Transaction::new(
-            0,
-            UnsignedTransaction::new(
-                Id::default(),
-                vec![Action::new(
-                    Name::from_str("pulse").unwrap(),
-                    Name::from_str("setcode").unwrap(),
-                    SetCode {
-                        account,
-                        vm_type: 0,
-                        vm_version: 0,
-                        code: wasm_bytes,
-                    }
-                    .pack()
-                    .unwrap(),
-                    vec![PermissionLevel::new(
-                        account,
-                        Name::from_str("active").unwrap(),
-                    )],
+            TransactionHeader::new(TimePointSec::new(0), 0, 0, Id::default()),
+            vec![Action::new(
+                Name::from_str("pulse").unwrap(),
+                Name::from_str("setcode").unwrap(),
+                SetCode {
+                    account,
+                    vm_type: 0,
+                    vm_version: 0,
+                    code: wasm_bytes,
+                }
+                .pack()
+                .unwrap(),
+                vec![PermissionLevel::new(
+                    account,
+                    Name::from_str("active").unwrap(),
                 )],
-            ),
+            )],
         )
         .sign(&private_key)
     }
@@ -575,21 +584,18 @@ mod tests {
         account: Name,
         action: Name,
         action_data: &T,
-    ) -> Transaction {
+    ) -> Result<SignedTransaction, ChainError> {
         Transaction::new(
-            0,
-            UnsignedTransaction::new(
-                Id::default(),
-                vec![Action::new(
+            TransactionHeader::new(TimePointSec::new(0), 0, 0, Id::default()),
+            vec![Action::new(
+                account,
+                action,
+                action_data.pack().unwrap(),
+                vec![PermissionLevel::new(
                     account,
-                    action,
-                    action_data.pack().unwrap(),
-                    vec![PermissionLevel::new(
-                        account,
-                        Name::from_str("active").unwrap(),
-                    )],
+                    Name::from_str("active").unwrap(),
                 )],
-            ),
+            )],
         )
         .sign(&private_key)
     }
@@ -606,13 +612,13 @@ mod tests {
         let mut undo_session = controller.create_undo_session()?;
         controller.execute_transaction(
             &mut undo_session,
-            &create_account(&private_key, Name::from_str("glenn")?),
-            pending_block_timestamp,
+            &create_account(&private_key, Name::from_str("glenn")?)?,
+            &pending_block_timestamp,
         )?;
         controller.execute_transaction(
             &mut undo_session,
-            &create_account(&private_key, Name::from_str("marshall")?),
-            pending_block_timestamp,
+            &create_account(&private_key, Name::from_str("marshall")?)?,
+            &pending_block_timestamp,
         )?;
 
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -624,8 +630,8 @@ mod tests {
             fs::read(root.join(Path::new("reference_contracts/pulse_token.wasm"))).unwrap();
         controller.execute_transaction(
             &mut undo_session,
-            &set_code(&private_key, Name::from_str("glenn")?, pulse_token_contract),
-            pending_block_timestamp,
+            &set_code(&private_key, Name::from_str("glenn")?, pulse_token_contract)?,
+            &pending_block_timestamp,
         )?;
 
         controller.execute_transaction(
@@ -638,8 +644,8 @@ mod tests {
                     issuer: Name::from_str("glenn")?,
                     max_supply: Asset::new(1000000, Symbol(1162826500)),
                 },
-            ),
-            pending_block_timestamp,
+            )?,
+            &pending_block_timestamp,
         )?;
 
         controller.execute_transaction(
@@ -656,8 +662,8 @@ mod tests {
                     },
                     memo: "Initial transfer".to_string(),
                 },
-            ),
-            pending_block_timestamp,
+            )?,
+            &pending_block_timestamp,
         )?;
 
         controller.execute_transaction(
@@ -675,8 +681,8 @@ mod tests {
                     },
                     memo: "Initial transfer".to_string(),
                 },
-            ),
-            pending_block_timestamp,
+            )?,
+            &pending_block_timestamp,
         )?;
 
         Ok(())
@@ -694,8 +700,8 @@ mod tests {
         let mut undo_session = controller.create_undo_session()?;
         controller.execute_transaction(
             &mut undo_session,
-            &create_account(&private_key, Name::from_str("glenn")?),
-            pending_block_timestamp,
+            &create_account(&private_key, Name::from_str("glenn")?)?,
+            &pending_block_timestamp,
         )?;
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -706,8 +712,8 @@ mod tests {
             fs::read(root.join(Path::new("reference_contracts/test_api_db.wasm"))).unwrap();
         controller.execute_transaction(
             &mut undo_session,
-            &set_code(&private_key, Name::from_str("glenn")?, contract),
-            pending_block_timestamp,
+            &set_code(&private_key, Name::from_str("glenn")?, contract)?,
+            &pending_block_timestamp,
         )?;
 
         controller.execute_transaction(
@@ -717,8 +723,8 @@ mod tests {
                 Name::from_str("glenn")?,
                 Name::from_str("pg")?,
                 &Vec::<u8>::new(),
-            ),
-            pending_block_timestamp,
+            )?,
+            &pending_block_timestamp,
         )?;
         controller.execute_transaction(
             &mut undo_session,
@@ -727,8 +733,8 @@ mod tests {
                 Name::from_str("glenn")?,
                 Name::from_str("pl")?,
                 &Vec::<u8>::new(),
-            ),
-            pending_block_timestamp,
+            )?,
+            &pending_block_timestamp,
         )?;
         controller.execute_transaction(
             &mut undo_session,
@@ -737,8 +743,8 @@ mod tests {
                 Name::from_str("glenn")?,
                 Name::from_str("pu")?,
                 &Vec::<u8>::new(),
-            ),
-            pending_block_timestamp,
+            )?,
+            &pending_block_timestamp,
         )?;
 
         Ok(())

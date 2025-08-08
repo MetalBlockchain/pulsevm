@@ -148,7 +148,8 @@ mod tests {
 
     #[test]
     fn test_id_from_str() {
-        let id = Id::from_str("e19b30bc0bfabfab01c9260469fab7529ae88987b2eb337dac5650305226b38e").unwrap();
+        let id = Id::from_str("e19b30bc0bfabfab01c9260469fab7529ae88987b2eb337dac5650305226b38e")
+            .unwrap();
         assert_eq!(
             hex::encode(id.as_bytes()),
             "e19b30bc0bfabfab01c9260469fab7529ae88987b2eb337dac5650305226b38e"

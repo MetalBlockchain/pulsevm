@@ -1,4 +1,7 @@
-use std::{collections::{HashSet, VecDeque}, hash::Hash};
+use std::{
+    collections::{HashSet, VecDeque},
+    hash::Hash,
+};
 
 use crate::{NumBytes, Read, ReadError, Write, WriteError};
 

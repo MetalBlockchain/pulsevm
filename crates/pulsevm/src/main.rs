@@ -22,16 +22,14 @@ use std::{
 };
 use tokio::{
     net::TcpListener as TokioTcpListener,
-    signal::{
-        unix::{SignalKind, signal},
-    },
+    signal::unix::{SignalKind, signal},
     sync::RwLock,
 };
 use tonic::transport::server::TcpIncoming;
 use tonic::{Request, Response, Status, transport::Server};
 
 use crate::{
-    chain::{Gossipable, PLUGIN_VERSION, Transaction, VERSION},
+    chain::{Gossipable, PLUGIN_VERSION, PackedTransaction, Transaction, VERSION},
     mempool::BlockTimer,
 };
 
@@ -265,6 +263,7 @@ impl Vm for VirtualMachine {
         &self,
         _request: Request<vm::BuildBlockRequest>,
     ) -> Result<tonic::Response<vm::BuildBlockResponse>, Status> {
+        info!("build_block called");
         let controller = self.controller.clone();
         let mut controller = controller.write().await;
         let mempool = self.mempool.clone();
@@ -465,12 +464,12 @@ impl Vm for VirtualMachine {
         })?;
 
         if gossipable.gossip_type == 0 {
-            let tx = gossipable.to_type::<Transaction>().map_err(|e| {
+            let tx = gossipable.to_type::<PackedTransaction>().map_err(|e| {
                 Status::invalid_argument(format!("failed to deserialize transaction: {}", e))
             })?;
             let mempool = self.mempool.clone();
             let mut mempool = mempool.write().await;
-            mempool.add_transaction(tx);
+            mempool.add_transaction(&tx);
         }
 
         Ok(Response::new(()))

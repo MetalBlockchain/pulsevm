@@ -6,7 +6,7 @@ use pulsevm_serialization::{NumBytes, Read, Write};
 use ripemd::{Digest, Ripemd160};
 use secp256k1::ecdsa::{RecoverableSignature, RecoveryId};
 use secp256k1::hashes::{Hash, sha256};
-use serde::{ser, Serialize};
+use serde::{Deserialize, Serialize, ser};
 
 use super::public_key::PublicKey;
 
@@ -94,6 +94,16 @@ impl Serialize for Signature {
     }
 }
 
+impl<'de> Deserialize<'de> for Signature {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Signature::from_str(&s).map_err(serde::de::Error::custom)
+    }
+}
+
 impl fmt::Display for Signature {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Step 1: Get compact form (64 bytes + recovery ID)
@@ -166,8 +176,8 @@ impl FromStr for Signature {
 
         // Step 4: Recompute checksum
         let mut hasher = Ripemd160::new();
-        hasher.update(sig_and_recid);       // signature + recid
-        hasher.update(b"K1");               // EOS curve suffix
+        hasher.update(sig_and_recid); // signature + recid
+        hasher.update(b"K1"); // EOS curve suffix
         let digest = hasher.finalize();
         let checksum_expected = &digest[..4];
 

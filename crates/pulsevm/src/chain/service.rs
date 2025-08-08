@@ -1,10 +1,8 @@
-use std::{str::FromStr, sync::Arc};
+use std::{collections::HashSet, str::FromStr, sync::Arc};
 
-use jsonrpsee::{
-    proc_macros::rpc,
-    types::ErrorObjectOwned,
-};
+use jsonrpsee::{proc_macros::rpc, types::ErrorObjectOwned};
 use pulsevm_chainbase::Session;
+use pulsevm_crypto::Bytes;
 use pulsevm_serialization::Read;
 use serde_json::Value;
 use tokio::sync::RwLock;
@@ -12,11 +10,17 @@ use tonic::async_trait;
 
 use crate::{
     api::{
-        GetAccountResponse, GetInfoResponse, GetTableRowsResponse,
-        IssueTxResponse, PermissionResponse,
+        GetAccountResponse, GetInfoResponse, GetTableRowsResponse, IssueTxResponse,
+        PermissionResponse,
     },
     chain::{
-        block::{Block, BlockByHeightIndex}, error::ChainError, pulse_assert, AbiDefinition, Account, AccountMetadata, BlockTimestamp, Gossipable, Id, KeyValue, KeyValueByScopePrimaryIndex, Name, Permission, PermissionByOwnerIndex, Table, TableByCodeScopeTableIndex, Transaction, PULSE_NAME, VERSION
+        AbiDefinition, Account, AccountMetadata, BlockTimestamp, Gossipable, Id, KeyValue,
+        KeyValueByScopePrimaryIndex, Name, PULSE_NAME, PackedTransaction, Permission,
+        PermissionByOwnerIndex, Signature, Table, TableByCodeScopeTableIndex, Transaction,
+        TransactionCompression, VERSION,
+        block::{Block, BlockByHeightIndex},
+        error::ChainError,
+        pulse_assert,
     },
     mempool::Mempool,
 };
@@ -26,14 +30,18 @@ use super::{Controller, NetworkManager};
 #[rpc(server)]
 pub trait Rpc {
     #[method(name = "pulsevm.issueTx")]
-    async fn issue_tx(&self, tx: &str, encoding: &str)
-    -> Result<IssueTxResponse, ErrorObjectOwned>;
+    async fn issue_tx(
+        &self,
+        signatures: HashSet<Signature>,
+        compression: TransactionCompression,
+        packed_trx: Bytes,
+    ) -> Result<IssueTxResponse, ErrorObjectOwned>;
 
     #[method(name = "pulsevm.getABI")]
     async fn get_abi(&self, account: Name) -> Result<AbiDefinition, ErrorObjectOwned>;
 
     #[method(name = "pulsevm.getAccount")]
-    async fn get_account(&self, name: Name) -> Result<GetAccountResponse, ErrorObjectOwned>;
+    async fn get_account(&self, account_name: Name) -> Result<GetAccountResponse, ErrorObjectOwned>;
 
     #[method(name = "pulsevm.getInfo")]
     async fn get_info(&self) -> Result<GetInfoResponse, ErrorObjectOwned>;
@@ -48,11 +56,11 @@ pub trait Rpc {
         scope: String,
         table: Name,
         json: bool,
-        limit: u32,
+        limit: i32,
         lower_bound: String,
         upper_bound: String,
         key_type: String,
-        index_position: String,
+        index_position: u16,
         reverse: Option<bool>,
         show_payer: Option<bool>,
     ) -> Result<GetTableRowsResponse, ErrorObjectOwned>;
@@ -178,10 +186,7 @@ impl RpcServer for RpcService {
         })
     }
 
-    async fn get_raw_block(
-        &self,
-        block_num_or_id: String,
-    ) -> Result<Block, ErrorObjectOwned> {
+    async fn get_raw_block(&self, block_num_or_id: String) -> Result<Block, ErrorObjectOwned> {
         let controller = self.controller.clone();
         let controller = controller.read().await;
         let session = controller
@@ -190,9 +195,11 @@ impl RpcServer for RpcService {
             .map_err(|e| ErrorObjectOwned::owned(500, "database_error", Some(format!("{}", e))))?;
 
         if let Ok(n) = block_num_or_id.parse::<u64>() {
-            let block = session.get_by_secondary::<Block, BlockByHeightIndex>(n).map_err(|e| {
-                ErrorObjectOwned::owned(404, "block_not_found", Some(format!("{}", e)))
-            })?;
+            let block = session
+                .get_by_secondary::<Block, BlockByHeightIndex>(n)
+                .map_err(|e| {
+                    ErrorObjectOwned::owned(404, "block_not_found", Some(format!("{}", e)))
+                })?;
             return Ok(block);
         } else if let Ok(id) = Id::from_str(block_num_or_id.as_str()) {
             let block = session.get::<Block>(id).map_err(|e| {
@@ -210,31 +217,24 @@ impl RpcServer for RpcService {
 
     async fn issue_tx(
         &self,
-        tx_hex: &str,
-        encoding: &str,
+        signatures: HashSet<Signature>,
+        compression: TransactionCompression,
+        packed_trx: Bytes,
     ) -> Result<IssueTxResponse, ErrorObjectOwned> {
-        let tx_bytes = hex::decode(tx_hex.strip_prefix("0x").unwrap_or(tx_hex)).map_err(|_| {
-            ErrorObjectOwned::owned(
-                400,
-                "decode_error",
-                Some("Invalid transaction encoding".to_string()),
-            )
-        })?;
-        let mut pos = 0 as usize;
-        let tx = Transaction::read(&tx_bytes, &mut pos).map_err(|_| {
-            ErrorObjectOwned::owned(
-                400,
-                "deserialize_error",
-                Some("Invalid transaction encoding".to_string()),
-            )
-        })?;
+        let packed_trx =
+            PackedTransaction::new(signatures, compression, packed_trx).map_err(|e| {
+                ErrorObjectOwned::owned(400, "transaction_error", Some(format!("{}", e)))
+            })?;
 
         // Run transaction and revert it
         let controller = self.controller.clone();
         let mut controller = controller.write().await;
         let pending_block_timestamp = BlockTimestamp::now();
         controller
-            .push_transaction(&tx, pending_block_timestamp)
+            .push_transaction(
+                packed_trx.get_signed_transaction(),
+                &pending_block_timestamp,
+            )
             .map_err(|e| {
                 println!("Failed to push transaction: {}", e);
                 ErrorObjectOwned::owned(500, "transaction_error", Some(format!("{}", e)))
@@ -243,12 +243,12 @@ impl RpcServer for RpcService {
         // Add to mempool
         let mempool_clone = self.mempool.clone();
         let mut mempool = mempool_clone.write().await;
-        mempool.add_transaction(tx.clone());
+        mempool.add_transaction(&packed_trx);
 
         // Gossip
         let nm_clone = self.network_manager.clone();
         let nm = nm_clone.read().await;
-        let gossipable_msg = Gossipable::new(0, tx.clone())
+        let gossipable_msg = Gossipable::new(0, packed_trx.clone())
             .map_err(|e| ErrorObjectOwned::owned(500, "gossip_error", Some(format!("{}", e))))?;
         nm.gossip(gossipable_msg)
             .await
@@ -256,7 +256,7 @@ impl RpcServer for RpcService {
 
         // Return a simple response
         Ok(IssueTxResponse {
-            tx_id: tx.id().to_string(),
+            tx_id: packed_trx.id().clone(),
         })
     }
 
@@ -266,11 +266,11 @@ impl RpcServer for RpcService {
         scope: String,
         table: Name,
         json: bool,
-        limit: u32,
+        limit: i32,
         lower_bound: String,
         upper_bound: String,
         key_type: String,
-        index_position: String,
+        index_position: u16,
         reverse: Option<bool>,
         show_payer: Option<bool>,
     ) -> Result<GetTableRowsResponse, ErrorObjectOwned> {
@@ -336,7 +336,7 @@ impl RpcServer for RpcService {
 
 fn get_table_index_name(
     table: Name,
-    index_position: String,
+    index_position: u16,
     primary: &mut bool,
 ) -> Result<u64, ChainError> {
     let table = table.as_u64();
@@ -346,53 +346,8 @@ fn get_table_index_name(
         ChainError::TransactionError(format!("unsupported table name: {}", table)),
     )?;
 
-    *primary = false;
-    let mut pos = 0u64;
-
-    if index_position.is_empty()
-        || index_position == "first"
-        || index_position == "primary"
-        || index_position == "one"
-    {
-        *primary = true;
-    } else if index_position.starts_with("sec") || index_position == "two" {
-        // second, secondary
-    } else if index_position.starts_with("ter") || index_position.starts_with("th") {
-        // tertiary, ternary, third, three
-        pos = 1;
-    } else if index_position.starts_with("fou") {
-        // four, fourth
-        pos = 2;
-    } else if index_position.starts_with("fi") {
-        // five, fifth
-        pos = 3;
-    } else if index_position.starts_with("six") {
-        // six, sixth
-        pos = 4;
-    } else if index_position.starts_with("sev") {
-        // seven, seventh
-        pos = 5;
-    } else if index_position.starts_with("eig") {
-        // eight, eighth
-        pos = 6;
-    } else if index_position.starts_with("nin") {
-        // nine, ninth
-        pos = 7;
-    } else if index_position.starts_with("ten") {
-        // ten, tenth
-        pos = 8;
-    } else {
-        pos = index_position.parse::<u64>().map_err(|_| {
-            ChainError::TransactionError(format!("invalid index position: {}", index_position))
-        })?;
-
-        if pos < 2 {
-            *primary = true;
-            pos = 0;
-        } else {
-            pos -= 2;
-        }
-    }
+    *primary = true; // TODO: handle primary vs secondary index
+    let pos = 0u64;
 
     index |= pos & 0x000000000000000Fu64;
 
@@ -405,7 +360,7 @@ fn get_table_rows_ex(
     code: Name,
     scope: String,
     table_name: Name,
-    limit: u32,
+    limit: i32,
     json: bool,
     show_payer: Option<bool>,
     lower_bound: String,
@@ -428,7 +383,7 @@ fn get_table_rows_ex(
 
         let mut limit = limit;
 
-        if limit > 100 {
+        if limit <= 0 || limit > 100 {
             limit = 100;
         }
 
