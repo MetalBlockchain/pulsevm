@@ -173,7 +173,7 @@ impl Controller {
                     ChainError::GenesisError(format!("failed to insert pulse account: {}", e))
                 })?;
             session
-                .insert(&AccountMetadata::new(PULSE_NAME))
+                .insert(&AccountMetadata::new(PULSE_NAME, true))
                 .map_err(|e| {
                     ChainError::GenesisError(format!(
                         "failed to insert pulse account metadata: {}",

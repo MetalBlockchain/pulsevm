@@ -43,6 +43,9 @@ pub trait Rpc {
     #[method(name = "pulsevm.getAccount")]
     async fn get_account(&self, account_name: Name) -> Result<GetAccountResponse, ErrorObjectOwned>;
 
+    #[method(name = "pulsevm.getBlock")]
+    async fn get_block(&self, block_num_or_id: String) -> Result<Block, ErrorObjectOwned>;
+
     #[method(name = "pulsevm.getInfo")]
     async fn get_info(&self) -> Result<GetInfoResponse, ErrorObjectOwned>;
 
@@ -160,6 +163,10 @@ impl RpcServer for RpcService {
         }
 
         Ok(result)
+    }
+
+    async fn get_block(&self, block_num_or_id: String) -> Result<Block, ErrorObjectOwned> {
+        return self.get_raw_block(block_num_or_id).await;
     }
 
     async fn get_info(&self) -> Result<GetInfoResponse, ErrorObjectOwned> {

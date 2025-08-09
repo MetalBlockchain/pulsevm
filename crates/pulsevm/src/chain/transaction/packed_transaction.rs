@@ -2,13 +2,13 @@ use std::collections::HashSet;
 
 use pulsevm_crypto::Bytes;
 use pulsevm_serialization::{NumBytes, Read, ReadError, Write, WriteError};
-use serde::Serialize;
+use serde::{ser::SerializeStruct, Serialize};
 
 use crate::chain::{
     Id, Signature, SignedTransaction, Transaction, TransactionCompression, error::ChainError,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackedTransaction {
     signatures: HashSet<Signature>,      // Signatures of the transaction
     compression: TransactionCompression, // Compression type used for the transaction
@@ -97,5 +97,20 @@ impl Read for PackedTransaction {
         let packed_trx = Bytes::read(data, pos)?;
         PackedTransaction::new(signatures, compression, packed_trx)
             .map_err(|_| ReadError::ParseError)
+    }
+}
+
+impl Serialize for PackedTransaction {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut state = serializer.serialize_struct("PackedTransaction", 5)?;
+        state.serialize_field("id", &self.trx_id)?;
+        state.serialize_field("signatures", &self.signatures)?;
+        state.serialize_field("compression", &self.compression)?;
+        state.serialize_field("packed_trx", &self.packed_trx)?;
+        state.serialize_field("transaction", &self.unpacked_trx.transaction())?;
+        state.end()
     }
 }

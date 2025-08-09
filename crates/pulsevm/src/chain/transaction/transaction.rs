@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 use pulsevm_serialization::Write;
 use secp256k1::hashes::{Hash, sha256};
-use serde::Serialize;
+use serde::{ser::SerializeStruct, Serialize};
 
 use crate::chain::{
     Id, PrivateKey, PublicKey, Signature, SignedTransaction, TransactionCompression,
@@ -12,7 +12,7 @@ use crate::chain::{
 
 use super::action::Action;
 
-#[derive(Debug, Clone, PartialEq, Eq, Read, Write, NumBytes, Hash, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Read, Write, NumBytes, Hash)]
 pub struct Transaction {
     pub header: TransactionHeader,
     pub actions: Vec<Action>, // Actions to be executed in this transaction
@@ -39,6 +39,20 @@ impl Transaction {
         let signed_transaction = SignedTransaction::new(self.clone(), HashSet::new());
 
         signed_transaction.sign(private_key)
+    }
+}
+
+impl Serialize for Transaction {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut state = serializer.serialize_struct("Transaction", 4)?;
+        state.serialize_field("expiration", &self.header.expiration)?;
+        state.serialize_field("max_net_usage_words", &self.header.max_net_usage_words)?;
+        state.serialize_field("max_cpu_usage_ms", &self.header.max_cpu_usage)?;
+        state.serialize_field("actions", &self.actions)?;
+        state.end()
     }
 }
 

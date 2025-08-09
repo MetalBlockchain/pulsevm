@@ -18,7 +18,7 @@ pub struct AccountMetadata {
 }
 
 impl AccountMetadata {
-    pub fn new(name: Name) -> Self {
+    pub fn new(name: Name, privileged: bool) -> Self {
         AccountMetadata {
             name,
             recv_sequence: 0,
@@ -27,7 +27,7 @@ impl AccountMetadata {
             abi_sequence: 0,
             code_hash: Id::default(),
             last_code_update: BlockTimestamp::min(),
-            privileged: false,
+            privileged: privileged,
             vm_type: 0,
             vm_version: 0,
         }

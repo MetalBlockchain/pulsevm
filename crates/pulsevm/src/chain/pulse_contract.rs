@@ -73,7 +73,7 @@ pub fn newaccount(context: &mut ApplyContext) -> Result<(), ChainError> {
         ))
         .map_err(|_| ChainError::TransactionError(format!("failed to insert account")))?;
     session
-        .insert(&AccountMetadata::new(create.name))
+        .insert(&AccountMetadata::new(create.name, false))
         .map_err(|_| ChainError::TransactionError(format!("failed to insert account metadata")))?;
 
     validate_authority_precondition(&mut session, &create.owner)?;
