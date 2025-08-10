@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 use pulsevm_serialization::Write;
 use secp256k1::hashes::{Hash, sha256};
-use serde::{ser::SerializeStruct, Serialize};
+use serde::{Serialize, ser::SerializeStruct};
 
 use crate::chain::{
     Id, PrivateKey, PublicKey, Signature, SignedTransaction, TransactionCompression,

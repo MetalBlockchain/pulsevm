@@ -2,18 +2,18 @@ use std::collections::VecDeque;
 
 use pulsevm_chainbase::{ChainbaseObject, SecondaryIndex, SecondaryKey};
 use pulsevm_crypto::Digest;
-use pulsevm_proc_macros::{name, NumBytes, Read, Write};
+use pulsevm_proc_macros::{NumBytes, Read, Write, name};
 use pulsevm_serialization::Write;
 use secp256k1::hashes::{Hash, sha256};
-use serde::{ser::SerializeStruct, Serialize};
+use serde::{Serialize, ser::SerializeStruct};
 
 use crate::chain::{BlockTimestamp, Id, Name, TransactionReceipt};
 
 #[derive(Debug, Default, Clone, Read, Write, NumBytes)]
 pub struct Block {
-    pub parent_id: Id, // ID of the parent block
-    pub timestamp: BlockTimestamp, // Timestamp of the block
-    pub height: u64,               // Height of the block in the chain
+    pub parent_id: Id,                                      // ID of the parent block
+    pub timestamp: BlockTimestamp,                          // Timestamp of the block
+    pub height: u64,                                        // Height of the block in the chain
     pub transaction_receipts: VecDeque<TransactionReceipt>, // Transactions included in this block
     pub transaction_mroot: Digest, // Merkle root of the transactions in this block
 }

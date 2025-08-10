@@ -1,11 +1,15 @@
-use std::{collections::{HashMap, HashSet}, str::FromStr, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    str::FromStr,
+    sync::Arc,
+};
 
 use jsonrpsee::{proc_macros::rpc, types::ErrorObjectOwned};
 use pulsevm_chainbase::Session;
 use pulsevm_crypto::Bytes;
 use pulsevm_proc_macros::name;
 use pulsevm_serialization::Read;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use tokio::sync::RwLock;
 use tonic::async_trait;
 
@@ -15,7 +19,7 @@ use crate::{
         PermissionResponse,
     },
     chain::{
-        block::{Block, BlockByHeightIndex}, error::ChainError, pulse_assert, string_to_symbol, AbiDefinition, Account, AccountMetadata, BlockTimestamp, Gossipable, Id, KeyValue, KeyValueByScopePrimaryIndex, Name, PackedTransaction, Permission, PermissionByOwnerIndex, Signature, Table, TableByCodeScopeTableIndex, Transaction, TransactionCompression, PULSE_NAME, VERSION
+        block::{Block, BlockByHeightIndex}, error::ChainError, pulse_assert, string_to_symbol, AbiDefinition, Account, AccountMetadata, Asset, BlockTimestamp, Gossipable, Id, KeyValue, KeyValueByScopePrimaryIndex, Name, PackedTransaction, Permission, PermissionByOwnerIndex, Signature, Table, TableByCodeScopeTableIndex, Transaction, TransactionCompression, PULSE_NAME, VERSION
     },
     mempool::Mempool,
 };
@@ -36,13 +40,26 @@ pub trait Rpc {
     async fn get_abi(&self, account: Name) -> Result<AbiDefinition, ErrorObjectOwned>;
 
     #[method(name = "pulsevm.getAccount")]
-    async fn get_account(&self, account_name: Name) -> Result<GetAccountResponse, ErrorObjectOwned>;
+    async fn get_account(&self, account_name: Name)
+    -> Result<GetAccountResponse, ErrorObjectOwned>;
 
     #[method(name = "pulsevm.getBlock")]
     async fn get_block(&self, block_num_or_id: String) -> Result<Block, ErrorObjectOwned>;
 
+    #[method(name = "pulsevm.getCurrencyBalance")]
+    async fn get_currency_balance(
+        &self,
+        code: Name,
+        account: Name,
+        symbol: Option<String>,
+    ) -> Result<Value, ErrorObjectOwned>;
+
     #[method(name = "pulsevm.getCurrencyStats")]
-    async fn get_currency_stats(&self, code: Name, symbol: String) -> Result<Value, ErrorObjectOwned>;
+    async fn get_currency_stats(
+        &self,
+        code: Name,
+        symbol: String,
+    ) -> Result<Value, ErrorObjectOwned>;
 
     #[method(name = "pulsevm.getInfo")]
     async fn get_info(&self) -> Result<GetInfoResponse, ErrorObjectOwned>;
@@ -167,24 +184,72 @@ impl RpcServer for RpcService {
         return self.get_raw_block(block_num_or_id).await;
     }
 
-    async fn get_currency_stats(
+    async fn get_currency_balance(
         &self,
         code: Name,
-        symbol: String,
+        account: Name,
+        symbol: Option<String>,
     ) -> Result<Value, ErrorObjectOwned> {
-        let symbol = symbol.to_uppercase();
-        let scope = string_to_symbol(0, &symbol.as_str()).map_err(|e| {
-            ErrorObjectOwned::owned(400, "invalid_symbol", Some(format!("{}", e)))
-        })? >> 8;
         let controller = self.controller.clone();
         let controller = controller.read().await;
         let database = controller.database();
         let session = database
             .session()
             .map_err(|e| ErrorObjectOwned::owned(500, "database_error", Some(format!("{}", e))))?;
-        
-        let table = session
-        .find_by_secondary::<Table, TableByCodeScopeTableIndex>((code, Name::new(scope), Name::new(name!("stats"))))?;
+        let mut results: Vec<String> = Vec::new();
+        let table = session.find_by_secondary::<Table, TableByCodeScopeTableIndex>((
+            code,
+            account,
+            Name::new(name!("accounts")),
+        ))?;
+
+        if let Some(table) = table {
+            let mut idx = session.get_index::<KeyValue, KeyValueByScopePrimaryIndex>();
+            let lower_bound_lookup_tuple = (table.id, u64::MIN);
+            let upper_bound_lookup_tuple = (table.id, u64::MAX);
+            let mut itr = idx.range(lower_bound_lookup_tuple, upper_bound_lookup_tuple)?;
+
+            while let Some(kv) = itr.next()? {
+                let balance = Asset::read(&kv.value, &mut 0).map_err(|e| {
+                    ErrorObjectOwned::owned(400, "balance_read_error", Some(format!("{}", e)))
+                })?;
+
+                if let Some(symbol) = &symbol {
+                    if balance.symbol().code().to_string().eq(symbol) {
+                        results.push(balance.to_string());
+                    }
+                } else {
+                    results.push(balance.to_string());
+                }
+            }
+        }
+
+        serde_json::to_value(results).map_err(|e| {
+            ErrorObjectOwned::owned(500, "serialization_error", Some(format!("{}", e)))
+        })
+    }
+
+    async fn get_currency_stats(
+        &self,
+        code: Name,
+        symbol: String,
+    ) -> Result<Value, ErrorObjectOwned> {
+        let symbol = symbol.to_uppercase();
+        let scope = string_to_symbol(0, &symbol.as_str())
+            .map_err(|e| ErrorObjectOwned::owned(400, "invalid_symbol", Some(format!("{}", e))))?
+            >> 8;
+        let controller = self.controller.clone();
+        let controller = controller.read().await;
+        let database = controller.database();
+        let session = database
+            .session()
+            .map_err(|e| ErrorObjectOwned::owned(500, "database_error", Some(format!("{}", e))))?;
+
+        let table = session.find_by_secondary::<Table, TableByCodeScopeTableIndex>((
+            code,
+            Name::new(scope),
+            Name::new(name!("stats")),
+        ))?;
 
         if let Some(table) = table {
             let mut idx = session.get_index::<KeyValue, KeyValueByScopePrimaryIndex>();

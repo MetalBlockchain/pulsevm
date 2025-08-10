@@ -525,7 +525,10 @@ mod tests {
         genesis.to_string().into_bytes()
     }
 
-    fn create_account(private_key: &PrivateKey, account: Name) -> Result<SignedTransaction, ChainError> {
+    fn create_account(
+        private_key: &PrivateKey,
+        account: Name,
+    ) -> Result<SignedTransaction, ChainError> {
         Transaction::new(
             TransactionHeader::new(TimePointSec::new(0), 0, 0, Id::default()),
             vec![Action::new(
@@ -556,7 +559,11 @@ mod tests {
         .sign(&private_key)
     }
 
-    fn set_code(private_key: &PrivateKey, account: Name, wasm_bytes: Vec<u8>) -> Result<SignedTransaction, ChainError> {
+    fn set_code(
+        private_key: &PrivateKey,
+        account: Name,
+        wasm_bytes: Vec<u8>,
+    ) -> Result<SignedTransaction, ChainError> {
         Transaction::new(
             TransactionHeader::new(TimePointSec::new(0), 0, 0, Id::default()),
             vec![Action::new(

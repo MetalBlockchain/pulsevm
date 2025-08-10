@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use pulsevm_crypto::Bytes;
 use pulsevm_serialization::{NumBytes, Read, ReadError, Write, WriteError};
-use serde::{ser::SerializeStruct, Serialize};
+use serde::{Serialize, ser::SerializeStruct};
 
 use crate::chain::{
     Id, Signature, SignedTransaction, Transaction, TransactionCompression, error::ChainError,
