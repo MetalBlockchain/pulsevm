@@ -228,7 +228,6 @@ mod tests {
         let digest = sha256::Hash::hash(b"test");
         let signature = private_key.sign(&digest);
         let display_str = signature.to_string();
-        println!("Signature display: {}", display_str);
         assert!(display_str.starts_with("SIG_K1_"));
         assert!(display_str.len() > 10); // Ensure it's not just the prefix
         let parsed_signature = Signature::from_str(&display_str)

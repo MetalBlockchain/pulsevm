@@ -8,4 +8,4 @@ mod symbol_code;
 pub use symbol_code::SymbolCode;
 
 mod symbol;
-pub use symbol::Symbol;
+pub use symbol::{Symbol, string_to_symbol};

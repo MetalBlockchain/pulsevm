@@ -5,6 +5,23 @@ use serde::{Deserialize, Serialize};
 
 use crate::chain::SymbolCode;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SymbolError {
+    /// Found a non-uppercase ASCII letter.
+    InvalidChar(char),
+    /// More than 7 characters won't fit (precision already uses 1 byte).
+    TooLong(usize),
+}
+
+impl fmt::Display for SymbolError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SymbolError::InvalidChar(c) => write!(f, "invalid character in symbol: '{}'", c),
+            SymbolError::TooLong(len) => write!(f, "symbol is too long: {} characters", len),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Read, Write, NumBytes, Deserialize)]
 pub struct Symbol(pub u64);
 
@@ -70,6 +87,29 @@ pub const fn symbol_to_code(value: u64) -> u64 {
 #[must_use]
 pub const fn symbol_from_code(precision: u8, code: u64) -> u64 {
     (code << 8) | (precision as u64)
+}
+
+#[inline]
+#[must_use]
+pub fn string_to_symbol(precision: u8, s: &str) -> Result<u64, SymbolError> {
+    let bytes = s.as_bytes();
+
+    // Max 7 letters since 1 byte is reserved for precision.
+    if bytes.len() > 7 {
+        return Err(SymbolError::TooLong(s.len()));
+    }
+
+    let mut result: u64 = precision as u64; // LSB = precision
+
+    for (i, &b) in bytes.iter().enumerate() {
+        if !(b'A'..=b'Z').contains(&b) {
+            return Err(SymbolError::InvalidChar(b as char));
+        }
+        // place first char at bits 8..15, next at 16..23, etc.
+        result |= (b as u64) << (8 * (i + 1));
+    }
+
+    Ok(result)
 }
 
 #[cfg(test)]

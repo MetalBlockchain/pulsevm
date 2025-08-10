@@ -1,6 +1,6 @@
 use wasmtime::Caller;
 
-use crate::chain::wasm_runtime::WasmContext;
+use crate::chain::{wasm_runtime::WasmContext, Name};
 
 pub fn db_find_i64()
 -> impl Fn(Caller<'_, WasmContext>, u64, u64, u64, u64) -> Result<i32, wasmtime::Error> {

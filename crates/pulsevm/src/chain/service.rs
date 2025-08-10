@@ -1,10 +1,11 @@
-use std::{collections::HashSet, str::FromStr, sync::Arc};
+use std::{collections::{HashMap, HashSet}, str::FromStr, sync::Arc};
 
 use jsonrpsee::{proc_macros::rpc, types::ErrorObjectOwned};
 use pulsevm_chainbase::Session;
 use pulsevm_crypto::Bytes;
+use pulsevm_proc_macros::name;
 use pulsevm_serialization::Read;
-use serde_json::Value;
+use serde_json::{json, Map, Value};
 use tokio::sync::RwLock;
 use tonic::async_trait;
 
@@ -14,13 +15,7 @@ use crate::{
         PermissionResponse,
     },
     chain::{
-        AbiDefinition, Account, AccountMetadata, BlockTimestamp, Gossipable, Id, KeyValue,
-        KeyValueByScopePrimaryIndex, Name, PULSE_NAME, PackedTransaction, Permission,
-        PermissionByOwnerIndex, Signature, Table, TableByCodeScopeTableIndex, Transaction,
-        TransactionCompression, VERSION,
-        block::{Block, BlockByHeightIndex},
-        error::ChainError,
-        pulse_assert,
+        block::{Block, BlockByHeightIndex}, error::ChainError, pulse_assert, string_to_symbol, AbiDefinition, Account, AccountMetadata, BlockTimestamp, Gossipable, Id, KeyValue, KeyValueByScopePrimaryIndex, Name, PackedTransaction, Permission, PermissionByOwnerIndex, Signature, Table, TableByCodeScopeTableIndex, Transaction, TransactionCompression, PULSE_NAME, VERSION
     },
     mempool::Mempool,
 };
@@ -45,6 +40,9 @@ pub trait Rpc {
 
     #[method(name = "pulsevm.getBlock")]
     async fn get_block(&self, block_num_or_id: String) -> Result<Block, ErrorObjectOwned>;
+
+    #[method(name = "pulsevm.getCurrencyStats")]
+    async fn get_currency_stats(&self, code: Name, symbol: String) -> Result<Value, ErrorObjectOwned>;
 
     #[method(name = "pulsevm.getInfo")]
     async fn get_info(&self) -> Result<GetInfoResponse, ErrorObjectOwned>;
@@ -167,6 +165,53 @@ impl RpcServer for RpcService {
 
     async fn get_block(&self, block_num_or_id: String) -> Result<Block, ErrorObjectOwned> {
         return self.get_raw_block(block_num_or_id).await;
+    }
+
+    async fn get_currency_stats(
+        &self,
+        code: Name,
+        symbol: String,
+    ) -> Result<Value, ErrorObjectOwned> {
+        let symbol = symbol.to_uppercase();
+        let scope = string_to_symbol(0, &symbol.as_str()).map_err(|e| {
+            ErrorObjectOwned::owned(400, "invalid_symbol", Some(format!("{}", e)))
+        })? >> 8;
+        let controller = self.controller.clone();
+        let controller = controller.read().await;
+        let database = controller.database();
+        let session = database
+            .session()
+            .map_err(|e| ErrorObjectOwned::owned(500, "database_error", Some(format!("{}", e))))?;
+        
+        let table = session
+        .find_by_secondary::<Table, TableByCodeScopeTableIndex>((code, Name::new(scope), Name::new(name!("stats"))))?;
+
+        if let Some(table) = table {
+            let mut idx = session.get_index::<KeyValue, KeyValueByScopePrimaryIndex>();
+            let lower_bound_lookup_tuple = (table.id, u64::MIN);
+            let upper_bound_lookup_tuple = (table.id, u64::MAX);
+            let mut itr = idx.range(lower_bound_lookup_tuple, upper_bound_lookup_tuple)?;
+            let next = itr.next()?;
+
+            if let Some(kv) = next {
+                let abi = self.get_abi(code.clone()).await?;
+                let table_type = abi.get_table_type(&Name::new(name!("stat"))).map_err(|e| {
+                    ErrorObjectOwned::owned(400, "invalid_table_name", Some(format!("{}", e)))
+                })?;
+                let stats = abi.binary_to_variant(&table_type, &kv.value).map_err(|e| {
+                    ErrorObjectOwned::owned(400, "get_currency_stats_error", Some(format!("{}", e)))
+                })?;
+                let mut map = Map::new();
+                map.insert(symbol, stats);
+                return Ok(Value::Object(map));
+            }
+        }
+
+        Err(ErrorObjectOwned::owned(
+            404,
+            "currency_stats_not_found",
+            Some(format!("Currency stats for {} not found", symbol)),
+        ))
     }
 
     async fn get_info(&self) -> Result<GetInfoResponse, ErrorObjectOwned> {
