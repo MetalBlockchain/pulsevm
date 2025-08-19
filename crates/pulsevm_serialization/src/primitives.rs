@@ -1,6 +1,7 @@
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{BTreeMap, HashSet, VecDeque},
     hash::Hash,
+    iter::Map,
 };
 
 use crate::{NumBytes, Read, ReadError, Write, WriteError};
@@ -61,6 +62,22 @@ impl NumBytes for i64 {
     }
 }
 
+impl NumBytes for f32 {
+    #[inline]
+    #[must_use]
+    fn num_bytes(&self) -> usize {
+        4
+    }
+}
+
+impl NumBytes for f64 {
+    #[inline]
+    #[must_use]
+    fn num_bytes(&self) -> usize {
+        8
+    }
+}
+
 impl NumBytes for String {
     #[inline(always)]
     fn num_bytes(&self) -> usize {
@@ -72,6 +89,16 @@ impl NumBytes for bool {
     #[inline(always)]
     fn num_bytes(&self) -> usize {
         core::mem::size_of::<u8>()
+    }
+}
+
+impl<T: NumBytes> NumBytes for Option<T> {
+    #[inline(always)]
+    fn num_bytes(&self) -> usize {
+        match self {
+            Some(value) => 1 + value.num_bytes(),
+            None => 1,
+        }
     }
 }
 
@@ -103,6 +130,18 @@ impl<T: NumBytes> NumBytes for HashSet<T> {
         let mut count = 4;
         for item in self {
             count += item.num_bytes();
+        }
+        count
+    }
+}
+
+impl<K: Write + NumBytes, V: Write + NumBytes> NumBytes for BTreeMap<K, V> {
+    #[inline(always)]
+    fn num_bytes(&self) -> usize {
+        let mut count = 4;
+        for (key, value) in self {
+            count += key.num_bytes();
+            count += value.num_bytes();
         }
         count
     }
@@ -223,6 +262,24 @@ impl Read for i64 {
     }
 }
 
+impl Read for f32 {
+    #[inline]
+    fn read(bytes: &[u8], pos: &mut usize) -> Result<Self, ReadError> {
+        let bits = u32::read(bytes, pos)?;
+        let num = Self::from_bits(bits);
+        Ok(num)
+    }
+}
+
+impl Read for f64 {
+    #[inline]
+    fn read(bytes: &[u8], pos: &mut usize) -> Result<Self, ReadError> {
+        let bits = u64::read(bytes, pos)?;
+        let num = Self::from_bits(bits);
+        Ok(num)
+    }
+}
+
 impl Read for String {
     #[inline(always)]
     fn read(bytes: &[u8], pos: &mut usize) -> Result<Self, ReadError> {
@@ -306,6 +363,25 @@ where
     }
 }
 
+impl<K: Read + Write + NumBytes + Ord, V: Read + Write + NumBytes> Read for BTreeMap<K, V> {
+    #[inline(always)]
+    fn read(bytes: &[u8], pos: &mut usize) -> Result<Self, ReadError> {
+        let len = u32::read(bytes, pos)? as usize;
+
+        if *pos + len > bytes.len() {
+            return Err(ReadError::NotEnoughBytes);
+        }
+
+        let mut map = BTreeMap::new();
+        for _ in 0..len {
+            let key = K::read(bytes, pos)?;
+            let value = V::read(bytes, pos)?;
+            map.insert(key, value);
+        }
+        Ok(map)
+    }
+}
+
 impl<T1, T2> Read for (T1, T2)
 where
     T1: Read,
@@ -356,6 +432,19 @@ impl Read for bool {
     fn read(bytes: &[u8], pos: &mut usize) -> Result<Self, ReadError> {
         let value = u8::read(bytes, pos).expect("failed to read u8");
         Ok(value != 0)
+    }
+}
+
+impl<T: Read> Read for Option<T> {
+    #[inline(always)]
+    fn read(bytes: &[u8], pos: &mut usize) -> Result<Self, ReadError> {
+        let is_some = bool::read(bytes, pos)?;
+        if is_some {
+            let value = T::read(bytes, pos)?;
+            Ok(Some(value))
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -438,6 +527,20 @@ impl Write for i64 {
     }
 }
 
+impl Write for f32 {
+    #[inline]
+    fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), WriteError> {
+        self.to_bits().write(bytes, pos)
+    }
+}
+
+impl Write for f64 {
+    #[inline]
+    fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), WriteError> {
+        self.to_bits().write(bytes, pos)
+    }
+}
+
 impl<'a> Write for String {
     #[inline(always)]
     fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), WriteError> {
@@ -456,6 +559,18 @@ impl Write for bool {
     fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), WriteError> {
         let value = if *self { 1 } else { 0 };
         (value as u8).write(bytes, pos)
+    }
+}
+
+impl<T: Write> Write for Option<T> {
+    #[inline(always)]
+    fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), WriteError> {
+        let is_some = self.is_some();
+        is_some.write(bytes, pos)?;
+        if let Some(value) = self {
+            value.write(bytes, pos)?;
+        }
+        Ok(())
     }
 }
 
@@ -490,6 +605,19 @@ impl<T: Write> Write for HashSet<T> {
         len.write(bytes, pos)?;
         for item in self.iter() {
             item.write(bytes, pos)?;
+        }
+        Ok(())
+    }
+}
+
+impl<K: Write + NumBytes, V: Write + NumBytes> Write for BTreeMap<K, V> {
+    #[inline(always)]
+    fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), WriteError> {
+        let len = self.len() as u32;
+        len.write(bytes, pos)?;
+        for (key, value) in self.iter() {
+            key.write(bytes, pos)?;
+            value.write(bytes, pos)?;
         }
         Ok(())
     }
