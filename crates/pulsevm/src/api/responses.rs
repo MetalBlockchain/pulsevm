@@ -69,3 +69,9 @@ pub struct GetTableRowsResponse {
     pub more: bool,
     pub next_key: String,
 }
+
+#[derive(Serialize, Clone, Default)]
+pub struct GetCodeHashResponse {
+    pub account_name: Name,
+    pub code_hash: Id,
+}

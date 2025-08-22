@@ -4,14 +4,12 @@ use lru::LruCache;
 use wasmtime::{Config, Engine, IntoFunc, Linker, Module, Store, Strategy};
 
 use crate::chain::{
-    Action, Name,
-    apply_context::ApplyContext,
-    webassembly::{
+    apply_context::ApplyContext, webassembly::{
         db_end_i64, db_find_i64, db_get_i64, db_lowerbound_i64, db_next_i64, db_previous_i64,
         db_remove_i64, db_store_i64, db_update_i64, db_upperbound_i64, get_self, is_privileged,
         pulse_assert, read_action_data, require_auth2, require_recipient, set_action_return_value,
-        set_privileged,
-    },
+        set_privileged, sha1, sha256, sha512,
+    }, Action, Name
 };
 
 use super::{
@@ -131,6 +129,10 @@ impl WasmRuntime {
         // Privileged functions
         Self::add_host_function(&mut linker, "env", "is_privileged", is_privileged())?;
         Self::add_host_function(&mut linker, "env", "set_privileged", set_privileged())?;
+        // Crypto functions
+        Self::add_host_function(&mut linker, "env", "sha1", sha1())?;
+        Self::add_host_function(&mut linker, "env", "sha256", sha256())?;
+        Self::add_host_function(&mut linker, "env", "sha512", sha512())?;
 
         Ok(Self {
             engine: engine,

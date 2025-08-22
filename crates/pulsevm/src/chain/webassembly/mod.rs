@@ -4,6 +4,9 @@ pub use action::*;
 mod authorization;
 pub use authorization::*;
 
+mod crypto;
+pub use crypto::*;
+
 mod database;
 pub use database::*;
 

@@ -134,6 +134,9 @@ impl ApplyContext {
             native(self)?;
         }
 
+        // Refresh the receiver account metadata
+        receiver_account = self.get_account_metadata(self.receiver)?;
+
         // Does the receiver account have a contract deployed?
         if receiver_account.code_hash != Id::zero() {
             let mut runtime = self.wasm_runtime.write().map_err(|e| {

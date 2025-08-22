@@ -176,15 +176,14 @@ pub fn setcode(context: &mut ApplyContext) -> Result<(), ChainError> {
             .find::<CodeObject>(code_hash.clone())
             .map_err(|_| ChainError::TransactionError(format!("failed to find code")))?;
 
-        if new_code_entry.is_some() {
-            let mut new_code_entry = new_code_entry.unwrap();
+        if let Some(mut new_code_entry) = new_code_entry {
             session
-                .modify(&mut new_code_entry, |code| {
-                    code.code_ref_count += 1;
-                })
-                .map_err(|_| {
-                    ChainError::TransactionError(format!("failed to update code reference count"))
-                })?;
+            .modify(&mut new_code_entry, |code| {
+                code.code_ref_count += 1;
+            })
+            .map_err(|_| {
+                ChainError::TransactionError(format!("failed to update code reference count"))
+            })?;
         } else {
             let new_code_entry = CodeObject {
                 code_hash: code_hash.clone(),
@@ -206,7 +205,7 @@ pub fn setcode(context: &mut ApplyContext) -> Result<(), ChainError> {
             a.code_hash = code_hash.clone();
             a.vm_type = act.vm_type;
             a.vm_version = act.vm_version;
-            // TODO: a.last_code_update = current_block_number;
+            a.last_code_update = context.pending_block_timestamp();
         })
         .map_err(|_| ChainError::TransactionError(format!("failed to update account")))?;
 
