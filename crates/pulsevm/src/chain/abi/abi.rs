@@ -77,8 +77,8 @@ pub struct AbiDefinition {
     pub tables: Vec<AbiTableDefinition>,
     pub ricardian_clauses: Vec<AbiClausePair>,
     pub error_messages: Vec<AbiErrorMessage>,
-    pub variants: Vec<AbiVariantDefinition>,
-    pub action_results: Vec<AbiActionResultDefinition>,
+    pub variants: Option<Vec<AbiVariantDefinition>>,
+    pub action_results: Option<Vec<AbiActionResultDefinition>>,
 }
 
 impl AbiDefinition {
@@ -250,8 +250,8 @@ mod tests {
             tables: vec![],
             ricardian_clauses: vec![],
             error_messages: vec![],
-            variants: vec![],
-            action_results: vec![],
+            variants: None,
+            action_results: None,
         };
         let struct_1 = TestStruct {
             field1: -5,
