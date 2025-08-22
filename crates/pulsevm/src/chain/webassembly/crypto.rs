@@ -1,10 +1,9 @@
-use secp256k1::hashes::{sha1, sha256, sha512, Hash};
+use secp256k1::hashes::{Hash, sha1, sha256, sha512};
 use wasmtime::Caller;
 
 use crate::chain::wasm_runtime::WasmContext;
 
-pub fn sha1()
--> impl Fn(Caller<'_, WasmContext>, u32, u32, u32) -> Result<u32, wasmtime::Error> {
+pub fn sha1() -> impl Fn(Caller<'_, WasmContext>, u32, u32, u32) -> Result<u32, wasmtime::Error> {
     |mut caller, msg_ptr, msg_size, out_ptr| {
         // Now caller can be mutably borrowed safely
         let memory = caller
@@ -22,8 +21,7 @@ pub fn sha1()
     }
 }
 
-pub fn sha256()
--> impl Fn(Caller<'_, WasmContext>, u32, u32, u32) -> Result<u32, wasmtime::Error> {
+pub fn sha256() -> impl Fn(Caller<'_, WasmContext>, u32, u32, u32) -> Result<u32, wasmtime::Error> {
     |mut caller, msg_ptr, msg_size, out_ptr| {
         // Now caller can be mutably borrowed safely
         let memory = caller
@@ -41,8 +39,7 @@ pub fn sha256()
     }
 }
 
-pub fn sha512()
--> impl Fn(Caller<'_, WasmContext>, u32, u32, u32) -> Result<u32, wasmtime::Error> {
+pub fn sha512() -> impl Fn(Caller<'_, WasmContext>, u32, u32, u32) -> Result<u32, wasmtime::Error> {
     |mut caller, msg_ptr, msg_size, out_ptr| {
         // Now caller can be mutably borrowed safely
         let memory = caller

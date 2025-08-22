@@ -74,4 +74,8 @@ impl Genesis {
     pub fn initial_key(&self) -> Result<PublicKey, ChainError> {
         PublicKey::from_str(&self.initial_key)
     }
+
+    pub fn initial_configuration(&self) -> &ChainConfig {
+        &self.initial_configuration
+    }
 }

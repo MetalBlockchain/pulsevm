@@ -180,6 +180,10 @@ impl Controller {
                         e
                     ))
                 })?;
+            session.insert(&GlobalPropertyObject {
+                chain_id: self.chain_id.clone(),
+                configuration: self.genesis.initial_configuration().clone(),
+            })?;
             session.commit()?;
         }
 

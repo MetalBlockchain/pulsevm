@@ -4,12 +4,14 @@ use lru::LruCache;
 use wasmtime::{Config, Engine, IntoFunc, Linker, Module, Store, Strategy};
 
 use crate::chain::{
-    apply_context::ApplyContext, webassembly::{
+    Action, Name,
+    apply_context::ApplyContext,
+    webassembly::{
         db_end_i64, db_find_i64, db_get_i64, db_lowerbound_i64, db_next_i64, db_previous_i64,
         db_remove_i64, db_store_i64, db_update_i64, db_upperbound_i64, get_self, is_privileged,
         pulse_assert, read_action_data, require_auth2, require_recipient, set_action_return_value,
-        set_privileged, sha1, sha256, sha512,
-    }, Action, Name
+        set_privileged, set_resource_limits, sha1, sha256, sha512,
+    },
 };
 
 use super::{
@@ -129,6 +131,12 @@ impl WasmRuntime {
         // Privileged functions
         Self::add_host_function(&mut linker, "env", "is_privileged", is_privileged())?;
         Self::add_host_function(&mut linker, "env", "set_privileged", set_privileged())?;
+        Self::add_host_function(
+            &mut linker,
+            "env",
+            "set_resource_limits",
+            set_resource_limits(),
+        )?;
         // Crypto functions
         Self::add_host_function(&mut linker, "env", "sha1", sha1())?;
         Self::add_host_function(&mut linker, "env", "sha256", sha256())?;
@@ -169,6 +177,7 @@ impl WasmRuntime {
             let mut session = apply_context.undo_session();
 
             if !self.code_cache.contains(&code_hash) {
+                println!("not in cache");
                 let code_object = session.get::<CodeObject>(code_hash).map_err(|e| {
                     ChainError::WasmRuntimeError(format!("failed to get wasm code: {}", e))
                 })?;

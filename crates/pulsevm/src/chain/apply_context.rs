@@ -121,6 +121,11 @@ impl ApplyContext {
     }
 
     pub fn exec_one(&mut self) -> Result<(), ChainError> {
+        println!(
+            "Executing action: {}@{}",
+            self.action.account(),
+            self.action.name()
+        );
         let mut receiver_account = self.get_account_metadata(self.receiver)?;
 
         self.privileged = receiver_account.privileged;
@@ -266,6 +271,9 @@ impl ApplyContext {
     }
 
     pub fn execute_inline(&mut self, a: &Action) -> Result<(), ChainError> {
+        let send_to_self = a.account() == self.receiver;
+        let inherit_parent_authorizations = send_to_self && self.receiver == self.action.account();
+
         {
             let code = self.session.find::<Account>(a.account())?;
             pulse_assert(
@@ -275,6 +283,8 @@ impl ApplyContext {
                     a.account()
                 )),
             )?;
+
+            let mut inherited_authorizations: HashSet<PermissionLevel> = HashSet::new();
 
             for auth in a.authorization() {
                 let actor = self.session.find::<Account>(auth.actor())?;
@@ -292,18 +302,26 @@ impl ApplyContext {
                         auth
                     )),
                 )?;
+
+                if inherit_parent_authorizations
+                    && self.action.authorization().iter().any(|pl| pl == auth)
+                {
+                    inherited_authorizations.insert(auth.clone());
+                }
             }
 
             let mut provided_permissions = HashSet::new();
             provided_permissions.insert(PermissionLevel::new(self.receiver.clone(), CODE_NAME));
 
-            AuthorizationManager::check_authorization(
-                &mut self.session,
-                &vec![a.clone()],
-                &HashSet::new(),       // No provided keys
-                &provided_permissions, // Default permission level
-                &HashSet::new(),
-            )?;
+            if !self.privileged {
+                AuthorizationManager::check_authorization(
+                    &mut self.session,
+                    &vec![a.clone()],
+                    &HashSet::new(),       // No provided keys
+                    &provided_permissions, // Default permission level
+                    &inherited_authorizations,
+                )?;
+            }
         }
 
         let inline_receiver = a.account();

@@ -178,12 +178,12 @@ pub fn setcode(context: &mut ApplyContext) -> Result<(), ChainError> {
 
         if let Some(mut new_code_entry) = new_code_entry {
             session
-            .modify(&mut new_code_entry, |code| {
-                code.code_ref_count += 1;
-            })
-            .map_err(|_| {
-                ChainError::TransactionError(format!("failed to update code reference count"))
-            })?;
+                .modify(&mut new_code_entry, |code| {
+                    code.code_ref_count += 1;
+                })
+                .map_err(|_| {
+                    ChainError::TransactionError(format!("failed to update code reference count"))
+                })?;
         } else {
             let new_code_entry = CodeObject {
                 code_hash: code_hash.clone(),

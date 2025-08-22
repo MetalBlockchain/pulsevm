@@ -11,8 +11,8 @@ use crate::chain::{Name, authority::PermissionLevel};
 pub struct Action {
     account: Name,
     name: Name,
-    data: Vec<u8>,
     authorization: Vec<PermissionLevel>,
+    data: Vec<u8>,
 }
 
 impl fmt::Display for Action {

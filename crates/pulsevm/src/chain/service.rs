@@ -15,10 +15,17 @@ use tonic::async_trait;
 
 use crate::{
     api::{
-        GetAccountResponse, GetCodeHashResponse, GetInfoResponse, GetTableRowsResponse, IssueTxResponse, PermissionResponse
+        GetAccountResponse, GetCodeHashResponse, GetInfoResponse, GetTableRowsResponse,
+        IssueTxResponse, PermissionResponse,
     },
     chain::{
-        block::{Block, BlockByHeightIndex}, error::ChainError, pulse_assert, string_to_symbol, AbiDefinition, Account, AccountMetadata, Asset, BlockTimestamp, Gossipable, Id, KeyValue, KeyValueByScopePrimaryIndex, Name, PackedTransaction, Permission, PermissionByOwnerIndex, Signature, Table, TableByCodeScopeTableIndex, Transaction, TransactionCompression, PULSE_NAME, VERSION
+        AbiDefinition, Account, AccountMetadata, Asset, BlockTimestamp, Gossipable, Id, KeyValue,
+        KeyValueByScopePrimaryIndex, Name, PULSE_NAME, PackedTransaction, Permission,
+        PermissionByOwnerIndex, Signature, Table, TableByCodeScopeTableIndex, Transaction,
+        TransactionCompression, VERSION,
+        block::{Block, BlockByHeightIndex},
+        error::ChainError,
+        pulse_assert, string_to_symbol,
     },
     mempool::Mempool,
 };
@@ -46,7 +53,10 @@ pub trait Rpc {
     async fn get_block(&self, block_num_or_id: String) -> Result<Block, ErrorObjectOwned>;
 
     #[method(name = "pulsevm.getCodeHash")]
-    async fn get_code_hash(&self, account_name: Name) -> Result<GetCodeHashResponse, ErrorObjectOwned>;
+    async fn get_code_hash(
+        &self,
+        account_name: Name,
+    ) -> Result<GetCodeHashResponse, ErrorObjectOwned>;
 
     #[method(name = "pulsevm.getCurrencyBalance")]
     async fn get_currency_balance(
@@ -186,18 +196,26 @@ impl RpcServer for RpcService {
         return self.get_raw_block(block_num_or_id).await;
     }
 
-    async fn get_code_hash(&self, account_name: Name) -> Result<GetCodeHashResponse, ErrorObjectOwned> {
+    async fn get_code_hash(
+        &self,
+        account_name: Name,
+    ) -> Result<GetCodeHashResponse, ErrorObjectOwned> {
         let controller = self.controller.clone();
         let controller = controller.read().await;
         let database = controller.database();
         let session = database
             .session()
             .map_err(|e| ErrorObjectOwned::owned(500, "database_error", Some(format!("{}", e))))?;
-        let accnt_obj = session.get::<AccountMetadata>(account_name.clone()).map_err(|e| {
-            ErrorObjectOwned::owned(404, "account_not_found", Some(format!("{}", e)))
-        })?;
+        let accnt_obj = session
+            .get::<AccountMetadata>(account_name.clone())
+            .map_err(|e| {
+                ErrorObjectOwned::owned(404, "account_not_found", Some(format!("{}", e)))
+            })?;
         let code_hash = accnt_obj.code_hash;
-        Ok(GetCodeHashResponse { account_name, code_hash })
+        Ok(GetCodeHashResponse {
+            account_name,
+            code_hash,
+        })
     }
 
     async fn get_currency_balance(
