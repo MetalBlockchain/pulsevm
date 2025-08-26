@@ -1,3 +1,6 @@
+mod base64_bytes;
+pub use base64_bytes::*;
+
 mod usage_accumulator;
 pub use usage_accumulator::*;
 

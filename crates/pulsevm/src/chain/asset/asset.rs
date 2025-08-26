@@ -1,11 +1,11 @@
-use std::fmt;
+use std::{fmt, str::FromStr};
 
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 use serde::{Deserialize, Serialize};
 
-use crate::chain::Symbol;
+use crate::chain::{Symbol, SymbolCode};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Read, Write, NumBytes, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Read, Write, NumBytes, Deserialize)]
 pub struct Asset {
     /// The amount of the asset
     pub amount: i64,
@@ -50,5 +50,24 @@ impl fmt::Display for Asset {
             let fraction = formatted.get(index..).unwrap_or_else(|| "");
             write!(f, "{}.{} {}", whole, fraction, symbol_code)
         }
+    }
+}
+
+impl Default for Asset {
+    fn default() -> Self {
+        Asset {
+            amount: 0,
+            symbol: Symbol::new_with_code(4, SymbolCode::from_str("SYS").unwrap()),
+        }
+    }
+}
+
+impl Serialize for Asset {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let value = self.to_string();
+        serializer.serialize_str(&value)
     }
 }

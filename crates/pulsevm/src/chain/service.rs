@@ -6,7 +6,7 @@ use std::{
 
 use jsonrpsee::{proc_macros::rpc, types::ErrorObjectOwned};
 use pulsevm_chainbase::Session;
-use pulsevm_crypto::Bytes;
+use pulsevm_crypto::{Bytes, Digest};
 use pulsevm_proc_macros::name;
 use pulsevm_serialization::Read;
 use serde_json::{Map, Value, json};
@@ -15,17 +15,10 @@ use tonic::async_trait;
 
 use crate::{
     api::{
-        GetAccountResponse, GetCodeHashResponse, GetInfoResponse, GetTableRowsResponse,
-        IssueTxResponse, PermissionResponse,
+        GetAccountResponse, GetCodeHashResponse, GetInfoResponse, GetRawABIResponse, GetTableRowsResponse, IssueTxResponse, PermissionResponse
     },
     chain::{
-        AbiDefinition, Account, AccountMetadata, Asset, BlockTimestamp, Gossipable, Id, KeyValue,
-        KeyValueByScopePrimaryIndex, Name, PULSE_NAME, PackedTransaction, Permission,
-        PermissionByOwnerIndex, Signature, Table, TableByCodeScopeTableIndex, Transaction,
-        TransactionCompression, VERSION,
-        block::{Block, BlockByHeightIndex},
-        error::ChainError,
-        pulse_assert, string_to_symbol,
+        block::{Block, BlockByHeightIndex}, error::ChainError, pulse_assert, string_to_symbol, AbiDefinition, Account, AccountMetadata, Asset, Base64Bytes, BlockTimestamp, Gossipable, Id, KeyValue, KeyValueByScopePrimaryIndex, Name, PackedTransaction, Permission, PermissionByOwnerIndex, Signature, Table, TableByCodeScopeTableIndex, Transaction, TransactionCompression, PULSE_NAME, VERSION
     },
     mempool::Mempool,
 };
@@ -75,6 +68,9 @@ pub trait Rpc {
 
     #[method(name = "pulsevm.getInfo")]
     async fn get_info(&self) -> Result<GetInfoResponse, ErrorObjectOwned>;
+
+    #[method(name = "pulsevm.getRawABI")]
+    async fn get_raw_abi(&self, account_name: Name) -> Result<GetRawABIResponse, ErrorObjectOwned>;
 
     #[method(name = "pulsevm.getRawBlock")]
     async fn get_raw_block(&self, block_num_or_id: String) -> Result<Block, ErrorObjectOwned>;
@@ -244,6 +240,10 @@ impl RpcServer for RpcService {
             let mut itr = idx.range(lower_bound_lookup_tuple, upper_bound_lookup_tuple)?;
 
             while let Some(kv) = itr.next()? {
+                if kv.table_id != table.id {
+                    break;
+                }
+                
                 let balance = Asset::read(&kv.value, &mut 0).map_err(|e| {
                     ErrorObjectOwned::owned(400, "balance_read_error", Some(format!("{}", e)))
                 })?;
@@ -294,7 +294,7 @@ impl RpcServer for RpcService {
 
             if let Some(kv) = next {
                 let abi = self.get_abi(code.clone()).await?;
-                let table_type = abi.get_table_type(&Name::new(name!("stat"))).map_err(|e| {
+                let table_type = abi.get_table_type(&Name::new(name!("stats"))).map_err(|e| {
                     ErrorObjectOwned::owned(400, "invalid_table_name", Some(format!("{}", e)))
                 })?;
                 let stats = abi.binary_to_variant(&table_type, &kv.value).map_err(|e| {
@@ -334,6 +334,34 @@ impl RpcServer for RpcService {
             server_version_string: VERSION.to_string(),
             total_cpu_weight: 0, // Placeholder, adjust as needed
             total_net_weight: 0, // Placeholder, adjust as needed
+        })
+    }
+
+    async fn get_raw_abi(&self, account_name: Name) -> Result<GetRawABIResponse, ErrorObjectOwned> {
+        let controller = self.controller.clone();
+        let controller = controller.read().await;
+        let session = controller
+            .database()
+            .session()
+            .map_err(|e| ErrorObjectOwned::owned(500, "database_error", Some(format!("{}", e))))?;
+        let account = session.get::<Account>(account_name.clone()).map_err(|e| {
+            ErrorObjectOwned::owned(404, "account_not_found", Some(format!("{}", e)))
+        })?;
+        let account_metadata = session.get::<AccountMetadata>(account_name.clone()).map_err(|e| {
+            ErrorObjectOwned::owned(404, "account_metadata_not_found", Some(format!("{}", e)))
+        })?;
+
+        let mut abi_hash = Digest::default();
+
+        if account.abi.len() > 0 {
+            abi_hash = Digest::hash(&account.abi);
+        }
+
+        Ok(GetRawABIResponse {
+            account_name,
+            code_hash: account_metadata.code_hash,
+            abi_hash,
+            abi: Base64Bytes::new(account.abi.clone()),
         })
     }
 

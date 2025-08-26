@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 
+use pulsevm_crypto::Digest;
 use serde::Serialize;
 
-use crate::chain::{Authority, BlockTimestamp, Id, Name};
+use crate::chain::{Asset, Authority, Base64Bytes, BlockTimestamp, Id, Name};
 
 #[derive(Serialize, Clone, Default)]
 pub struct PermissionResponse {
@@ -22,20 +23,53 @@ impl PermissionResponse {
 }
 
 #[derive(Serialize, Clone, Default)]
+pub struct AccountResourceLimit {
+    pub used: u32,
+    pub available: u32,
+    pub max: u32,
+    pub last_usage_update_time: BlockTimestamp,
+    pub current_used: u32,
+}
+
+#[derive(Serialize, Clone, Default)]
+pub struct AccountTotalResources {
+    owner: Name,
+    net_weight: Asset,
+    cpu_weight: Asset,
+    ram_bytes: u32,
+}
+
+#[derive(Serialize, Clone, Default)]
+pub struct AccountVoterInfo {
+    pub owner: Name,
+    pub proxy: Name,
+    pub producers: Vec<Name>,
+    pub staked: u32,
+    pub last_vote_weight: String,
+    pub proxied_vote_weight: String,
+    pub is_proxy: u8,
+    pub flags1: u8,
+    pub reserved2: u8,
+    pub reserved3: u8,
+}
+
+#[derive(Serialize, Clone, Default)]
 pub struct GetAccountResponse {
     pub account_name: Name,
-
+    pub head_block_num: u32,
+    pub head_block_time: BlockTimestamp,
     pub privileged: bool,
     pub last_code_update: BlockTimestamp,
     pub created: BlockTimestamp,
-
     pub ram_quota: i64,
     pub net_weight: i64,
     pub cpu_weight: i64,
-
+    pub net_limit: AccountResourceLimit,
+    pub cpu_limit: AccountResourceLimit,
     pub ram_usage: i64,
-
     pub permissions: Vec<PermissionResponse>,
+    pub total_resources: AccountTotalResources,
+    pub voter_info: AccountVoterInfo,
 }
 
 #[derive(Serialize, Clone, Default)]
@@ -74,4 +108,12 @@ pub struct GetTableRowsResponse {
 pub struct GetCodeHashResponse {
     pub account_name: Name,
     pub code_hash: Id,
+}
+
+#[derive(Serialize, Clone, Default)]
+pub struct GetRawABIResponse {
+    pub account_name: Name,
+    pub code_hash: Id,
+    pub abi_hash: Digest,
+    pub abi: Base64Bytes,
 }

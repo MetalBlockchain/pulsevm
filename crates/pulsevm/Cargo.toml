@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.98"
+base64 = "0.22.1"
 bs58 = { version = "0.5.1", features = ["cb58"] }
 hex = "0.4"
 chrono = "0.4.40"

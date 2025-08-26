@@ -1,3 +1,5 @@
+use core::fmt;
+
 use pulsevm_chainbase::{ChainbaseObject, SecondaryIndex, SecondaryKey};
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 
@@ -21,6 +23,13 @@ impl KeyValue {
             payer,
             value,
         }
+    }
+}
+
+impl fmt::Display for KeyValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "KeyValue {{ id: {}, table_id: {}, primary_key: {}, payer: {}, value: {:?} }}",
+               self.id, self.table_id, self.primary_key, self.payer, self.value)
     }
 }
 

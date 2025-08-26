@@ -44,6 +44,11 @@ impl FromStr for Name {
     type Err = ChainError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // First try to parse as u64
+        if let Ok(value) = s.parse::<u64>() {
+            return Ok(value.into()); // assuming `u64: Into<YourType>`
+        }
+        
         let name = name_from_bytes(s.bytes())
             .map_err(|e| ChainError::ParseError(format!("invalid name format: {}", e)))?;
         Ok(name.into())
