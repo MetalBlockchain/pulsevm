@@ -87,8 +87,13 @@ pub struct GetInfoResponse {
     pub block_cpu_limit: u64,
     pub block_net_limit: u64,
     pub server_version_string: String,
+    pub fork_db_head_block_num: u32,
+    pub fork_db_head_block_id: Id,
+    pub server_full_version_string: String,
     pub total_cpu_weight: u64,
     pub total_net_weight: u64,
+    pub earliest_available_block_num: u32,
+    pub last_irreversible_block_time: BlockTimestamp,
 }
 
 #[derive(Serialize, Clone)]

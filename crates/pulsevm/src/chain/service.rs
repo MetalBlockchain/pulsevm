@@ -15,10 +15,17 @@ use tonic::async_trait;
 
 use crate::{
     api::{
-        GetAccountResponse, GetCodeHashResponse, GetInfoResponse, GetRawABIResponse, GetTableRowsResponse, IssueTxResponse, PermissionResponse
+        GetAccountResponse, GetCodeHashResponse, GetInfoResponse, GetRawABIResponse,
+        GetTableRowsResponse, IssueTxResponse, PermissionResponse,
     },
     chain::{
-        block::{Block, BlockByHeightIndex}, error::ChainError, pulse_assert, string_to_symbol, AbiDefinition, Account, AccountMetadata, Asset, Base64Bytes, BlockTimestamp, Gossipable, Id, KeyValue, KeyValueByScopePrimaryIndex, Name, PackedTransaction, Permission, PermissionByOwnerIndex, Signature, Table, TableByCodeScopeTableIndex, Transaction, TransactionCompression, PULSE_NAME, VERSION
+        AbiDefinition, Account, AccountMetadata, Asset, Base64Bytes, BlockTimestamp, Gossipable,
+        Id, KeyValue, KeyValueByScopePrimaryIndex, Name, PULSE_NAME, PackedTransaction, Permission,
+        PermissionByOwnerIndex, Signature, Table, TableByCodeScopeTableIndex, Transaction,
+        TransactionCompression, VERSION,
+        block::{Block, BlockByHeightIndex},
+        error::ChainError,
+        pulse_assert, string_to_symbol,
     },
     mempool::Mempool,
 };
@@ -83,8 +90,8 @@ pub trait Rpc {
         table: Name,
         json: bool,
         limit: i32,
-        lower_bound: String,
-        upper_bound: String,
+        lower_bound: Option<String>,
+        upper_bound: Option<String>,
         key_type: String,
         index_position: u16,
         reverse: Option<bool>,
@@ -118,6 +125,8 @@ impl RpcService {
     ) -> Result<String, serde_json::Error> {
         // Make sure `RpcService` implements your API trait
         let module = self.clone().into_rpc();
+
+        println!("API Request: {}", request_body);
 
         // Run the request and return the response
         let (resp, mut _stream) = module.raw_json_request(request_body, 1).await?;
@@ -243,7 +252,7 @@ impl RpcServer for RpcService {
                 if kv.table_id != table.id {
                     break;
                 }
-                
+
                 let balance = Asset::read(&kv.value, &mut 0).map_err(|e| {
                     ErrorObjectOwned::owned(400, "balance_read_error", Some(format!("{}", e)))
                 })?;
@@ -294,9 +303,11 @@ impl RpcServer for RpcService {
 
             if let Some(kv) = next {
                 let abi = self.get_abi(code.clone()).await?;
-                let table_type = abi.get_table_type(&Name::new(name!("stats"))).map_err(|e| {
-                    ErrorObjectOwned::owned(400, "invalid_table_name", Some(format!("{}", e)))
-                })?;
+                let table_type = abi
+                    .get_table_type(&Name::new(name!("stats")))
+                    .map_err(|e| {
+                        ErrorObjectOwned::owned(400, "invalid_table_name", Some(format!("{}", e)))
+                    })?;
                 let stats = abi.binary_to_variant(&table_type, &kv.value).map_err(|e| {
                     ErrorObjectOwned::owned(400, "get_currency_stats_error", Some(format!("{}", e)))
                 })?;
@@ -319,7 +330,7 @@ impl RpcServer for RpcService {
         let head_block = controller.last_accepted_block();
 
         Ok(GetInfoResponse {
-            server_version: VERSION.to_string(),
+            server_version: "d133c641".to_owned(),
             chain_id: controller.chain_id(),
             head_block_num: head_block.height as u32,
             last_irreversible_block_num: head_block.height as u32,
@@ -327,13 +338,18 @@ impl RpcServer for RpcService {
             head_block_id: head_block.id(),
             head_block_time: head_block.timestamp,
             head_block_producer: PULSE_NAME,
-            virtual_block_cpu_limit: 0, // Placeholder, adjust as needed
-            virtual_block_net_limit: 0, // Placeholder, adjust as needed
-            block_cpu_limit: 0,         // Placeholder, adjust as needed
-            block_net_limit: 0,         // Placeholder, adjust as needed
-            server_version_string: VERSION.to_string(),
-            total_cpu_weight: 0, // Placeholder, adjust as needed
-            total_net_weight: 0, // Placeholder, adjust as needed
+            virtual_block_cpu_limit: 100, // Placeholder, adjust as needed
+            virtual_block_net_limit: 100, // Placeholder, adjust as needed
+            block_cpu_limit: 100,         // Placeholder, adjust as needed
+            block_net_limit: 100,         // Placeholder, adjust as needed
+            server_version_string: "v5.0.3".to_owned(),
+            fork_db_head_block_id: head_block.id(),
+            fork_db_head_block_num: head_block.height as u32,
+            server_full_version_string: "v5.0.3-d133c6413ce8ce2e96096a0513ec25b4a8dbe837".to_owned(), // Mimic EOS here
+            total_cpu_weight: 100, // Placeholder, adjust as needed
+            total_net_weight: 100, // Placeholder, adjust as needed
+            earliest_available_block_num: 1,
+            last_irreversible_block_time: head_block.timestamp,
         })
     }
 
@@ -347,9 +363,11 @@ impl RpcServer for RpcService {
         let account = session.get::<Account>(account_name.clone()).map_err(|e| {
             ErrorObjectOwned::owned(404, "account_not_found", Some(format!("{}", e)))
         })?;
-        let account_metadata = session.get::<AccountMetadata>(account_name.clone()).map_err(|e| {
-            ErrorObjectOwned::owned(404, "account_metadata_not_found", Some(format!("{}", e)))
-        })?;
+        let account_metadata = session
+            .get::<AccountMetadata>(account_name.clone())
+            .map_err(|e| {
+                ErrorObjectOwned::owned(404, "account_metadata_not_found", Some(format!("{}", e)))
+            })?;
 
         let mut abi_hash = Digest::default();
 
@@ -446,8 +464,8 @@ impl RpcServer for RpcService {
         table: Name,
         json: bool,
         limit: i32,
-        lower_bound: String,
-        upper_bound: String,
+        lower_bound: Option<String>,
+        upper_bound: Option<String>,
         key_type: String,
         index_position: u16,
         reverse: Option<bool>,
@@ -542,8 +560,8 @@ fn get_table_rows_ex(
     limit: i32,
     json: bool,
     show_payer: Option<bool>,
-    lower_bound: String,
-    upper_bound: String,
+    lower_bound: Option<String>,
+    upper_bound: Option<String>,
 ) -> Result<GetTableRowsResponse, ChainError> {
     let mut response = GetTableRowsResponse::default();
     let scope = Name::from_str(scope.as_str())
@@ -601,7 +619,9 @@ fn get_table_rows_ex(
 fn get_table_index_type(abi: &AbiDefinition, table_name: &Name) -> Result<String, ChainError> {
     for table in abi.tables.iter() {
         if &table.name == table_name {
-            return Ok(table.index_type.clone());
+            if let Some(index_type) = &table.index_type {
+                return Ok(index_type.clone());
+            }
         }
     }
 

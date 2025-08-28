@@ -113,7 +113,7 @@ impl Controller {
         self.last_accepted_block = Block::new(
             Id::default(),
             self.genesis.initial_timestamp()?,
-            0,
+            1, // EOS Block nums start at 1
             VecDeque::new(),
             Digest::default(),
         );

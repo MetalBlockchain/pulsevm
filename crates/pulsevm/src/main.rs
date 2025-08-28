@@ -1,6 +1,7 @@
 mod api;
 mod chain;
 mod mempool;
+mod state_history;
 
 use chain::{Controller, Id, NodeId};
 use pulsevm_grpc::{
@@ -15,6 +16,7 @@ use pulsevm_grpc::{
     },
 };
 use pulsevm_serialization::Read;
+use secp256k1::hashes::siphash24::State;
 use spdlog::{info, warn};
 use std::{
     net::{SocketAddr, TcpListener},
@@ -25,12 +27,13 @@ use tokio::{
     signal::unix::{SignalKind, signal},
     sync::RwLock,
 };
+use tokio_util::sync::CancellationToken;
 use tonic::transport::server::TcpIncoming;
 use tonic::{Request, Response, Status, transport::Server};
 
 use crate::{
-    chain::{Gossipable, PLUGIN_VERSION, PackedTransaction, Transaction, VERSION},
-    mempool::BlockTimer,
+    chain::{Gossipable, PackedTransaction, Transaction, PLUGIN_VERSION, VERSION},
+    mempool::BlockTimer, state_history::StateHistoryServer,
 };
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 10)]
@@ -38,6 +41,9 @@ async fn main() {
     // Initialize logging
     spdlog::default_logger().set_level_filter(spdlog::LevelFilter::All);
 
+    let cancel = CancellationToken::new();
+    let cancel_ws = cancel.clone();
+    let cancel_runtime = cancel.clone();
     let avalanche_addr = std::env::var("AVALANCHE_VM_RUNTIME_ENGINE_ADDR").unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind to address");
     listener
@@ -48,8 +54,16 @@ async fn main() {
         TokioTcpListener::from_std(listener).expect("failed to convert to tokio listener");
     let incoming = TcpIncoming::from_listener(tokio_listener, true, None)
         .expect("failed to create incoming listener");
+    // Main VM instance
+    let vm = VirtualMachine::new(addr).unwrap();
 
-    let handle = tokio::spawn(async move { start_runtime_service(incoming, addr).await });
+    let runtime_vm = vm.clone();
+    let runtime_handle = tokio::spawn(async move {
+        let res = start_runtime_service(runtime_vm, incoming).await;
+        // if this ends, trigger shutdown for the rest
+        cancel_runtime.cancel();
+        res
+    });
     let mut client: RuntimeClient<tonic::transport::Channel> =
         RuntimeClient::connect(format!("http://{}", avalanche_addr))
             .await
@@ -62,8 +76,18 @@ async fn main() {
         .initialize(request)
         .await
         .expect("failed to initialize runtime engine");
+
+    let state_history_service = StateHistoryServer::new(vm.clone());
+    let ws_bind = std::env::var("WS_BIND").unwrap_or_else(|_| "127.0.0.1:9090".into());
+    let ws_handle = tokio::spawn(async move {
+        if let Err(e) = state_history_service.run_ws_server(&ws_bind, cancel_ws).await {
+            spdlog::error!("WS server error: {:?}", e);
+        }
+    });
+
     // Keep listening
-    let _ = handle.await;
+    let _ = runtime_handle.await;
+    let _ = ws_handle.await;
 
     // Gracefully shutdown
     info!("shutting down...");
@@ -103,10 +127,9 @@ async fn shutdown_signal(vm: VirtualMachine) {
 }
 
 async fn start_runtime_service(
+    vm: VirtualMachine,
     incoming: TcpIncoming,
-    server_addr: SocketAddr,
 ) -> Result<(), tonic::transport::Error> {
-    let vm = VirtualMachine::new(server_addr).unwrap();
     let shutdown_signal = shutdown_signal(vm.clone());
     Server::builder()
         .add_service(VmServer::new(vm.clone()))

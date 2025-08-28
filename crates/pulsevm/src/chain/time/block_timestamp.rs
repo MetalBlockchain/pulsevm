@@ -75,7 +75,15 @@ impl Serialize for BlockTimestamp {
     where
         S: serde::Serializer,
     {
-        let timestamp: Timestamp = self.clone().into();
-        serializer.serialize_str(&timestamp.to_string())
+        // Round/truncate to 500ms increments
+        let millis = (self.0.timestamp_subsec_millis() / 500) * 500;
+
+        let s = format!(
+            "{}.{:03}",
+            self.0.format("%Y-%m-%dT%H:%M:%S"),
+            millis
+        );
+
+        serializer.serialize_str(&s)
     }
 }

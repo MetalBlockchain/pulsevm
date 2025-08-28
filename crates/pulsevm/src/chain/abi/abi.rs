@@ -9,6 +9,7 @@ use crate::chain::{Asset, ExtendedAsset, Name, Symbol, SymbolCode, error::ChainE
 #[derive(Debug, Clone, Read, Write, NumBytes, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AbiTypeDefinition {
     pub new_type_name: String,
+    #[serde(rename = "type")]
     pub type_name: String,
 }
 
@@ -22,7 +23,7 @@ pub struct AbiFieldDefinition {
 #[derive(Debug, Clone, Read, Write, NumBytes, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AbiStructDefinition {
     pub name: String,
-    pub base: String,
+    pub base: Option<String>,
     pub fields: Vec<AbiFieldDefinition>,
 }
 
@@ -37,9 +38,9 @@ pub struct AbiActionDefinition {
 #[derive(Debug, Clone, Read, Write, NumBytes, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AbiTableDefinition {
     pub name: Name,             // the name of the table
-    pub index_type: String,     // the kind of index, i64, i128i128, etc
+    pub index_type: Option<String>,     // the kind of index, i64, i128i128, etc
     pub key_names: Vec<String>, // names for the keys defined by key_types
-    pub key_types: Vec<String>, // the type of key parameters
+    pub key_types: Option<Vec<String>>, // the type of key parameters
     #[serde(rename = "type")]
     pub type_name: String, // type of binary data stored in this table
 }
@@ -182,7 +183,7 @@ mod tests {
             types: vec![],
             structs: vec![AbiStructDefinition {
                 name: "test".to_string(),
-                base: "".to_string(),
+                base: None,
                 fields: vec![
                     AbiFieldDefinition {
                         name: "field1".to_string(),
