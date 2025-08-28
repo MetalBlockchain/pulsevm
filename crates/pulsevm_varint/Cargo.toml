@@ -1,7 +1,0 @@
-[package]
-name = "pulsevm_varint"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-pulsevm_serialization = { path = "../pulsevm_serialization" }

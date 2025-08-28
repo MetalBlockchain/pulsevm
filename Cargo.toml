@@ -2,7 +2,7 @@
 resolver = "2"
 members = [ "crates/pulse_cli", "crates/pulsevm", "crates/pulsevm_chainbase", "crates/pulsevm_crypto",
     "crates/pulsevm_grpc"
-, "crates/pulsevm_name", "crates/pulsevm_proc_macros", "crates/pulsevm_serialization", "crates/pulsevm_storage", "crates/pulsevm_time", "crates/pulsevm_varint"]
+, "crates/pulsevm_name", "crates/pulsevm_proc_macros", "crates/pulsevm_serialization", "crates/pulsevm_storage", "crates/pulsevm_time"]
 
 [profile.release]
 debug = true

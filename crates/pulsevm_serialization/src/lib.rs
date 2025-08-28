@@ -1,6 +1,9 @@
 use core::{fmt, str};
 use std::{collections::HashSet, error::Error, hash::Hash, usize};
 
+mod varint;
+pub use varint::*;
+
 mod primitives;
 
 pub trait NumBytes {

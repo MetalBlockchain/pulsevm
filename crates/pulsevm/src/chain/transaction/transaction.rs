@@ -6,8 +6,8 @@ use secp256k1::hashes::{Hash, sha256};
 use serde::{Serialize, ser::SerializeStruct};
 
 use crate::chain::{
-    Id, PrivateKey, PublicKey, Signature, SignedTransaction, TransactionCompression,
-    TransactionHeader, error::ChainError, transaction::signed_transaction,
+    Id, PrivateKey, SignedTransaction,
+    TransactionHeader, error::ChainError,
 };
 
 use super::action::Action;
@@ -15,12 +15,13 @@ use super::action::Action;
 #[derive(Debug, Clone, PartialEq, Eq, Read, Write, NumBytes, Hash)]
 pub struct Transaction {
     pub header: TransactionHeader,
+    pub context_free_actions: Vec<Action>, // Context-free actions, if any
     pub actions: Vec<Action>, // Actions to be executed in this transaction
 }
 
 impl Transaction {
-    pub fn new(header: TransactionHeader, actions: Vec<Action>) -> Self {
-        Self { header, actions }
+    pub fn new(header: TransactionHeader, context_free_actions: Vec<Action>, actions: Vec<Action>) -> Self {
+        Self { header, context_free_actions, actions }
     }
 
     pub fn id(&self) -> Result<Id, ChainError> {

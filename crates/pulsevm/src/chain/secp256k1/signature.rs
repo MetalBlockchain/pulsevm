@@ -155,45 +155,66 @@ impl FromStr for Signature {
     type Err = SignatureParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        // Step 1: Validate prefix
-        let prefix = "SIG_K1_";
-        if !s.starts_with(prefix) {
+        const PREFIX: &str = "SIG_K1_";
+        if !s.starts_with(PREFIX) {
             return Err(SignatureParseError::InvalidPrefix);
         }
 
-        // Step 2: Decode base58
-        let data = bs58::decode(&s[prefix.len()..])
+        // Base58 decode: expect 65 payload + 4 checksum
+        let data = bs58::decode(&s[PREFIX.len()..])
             .into_vec()
             .map_err(SignatureParseError::InvalidBase58)?;
-
         if data.len() != 65 + 4 {
             return Err(SignatureParseError::InvalidLength);
         }
+        let (payload65, checksum_provided) = data.split_at(65);
 
-        // Step 3: Split data and checksum
-        let (sig_and_recid, checksum_provided) = data.split_at(65);
-        let (sig_bytes, recid_byte) = sig_and_recid.split_at(64);
-
-        // Step 4: Recompute checksum
+        // Checksum = RIPEMD160(payload || "K1")[:4]
         let mut hasher = Ripemd160::new();
-        hasher.update(sig_and_recid); // signature + recid
-        hasher.update(b"K1"); // EOS curve suffix
+        hasher.update(payload65);
+        hasher.update(b"K1");
         let digest = hasher.finalize();
         let checksum_expected = &digest[..4];
-
         if checksum_expected != checksum_provided {
             return Err(SignatureParseError::InvalidChecksum);
         }
 
-        // Step 5: Recover RecoveryId
-        let recid = RecoveryId::try_from(recid_byte[0] as i32)
-            .map_err(|_| SignatureParseError::InvalidRecoveryId)?;
+        // Helper to finish once we have (sig64, recid_u8 in 0..=3)
+        let make = |sig64: &[u8], recid_u8: u8| -> Result<Signature, SignatureParseError> {
+            let recid = secp256k1::ecdsa::RecoveryId::try_from(recid_u8 as i32)
+                .map_err(|_| SignatureParseError::InvalidRecoveryId)?;
+            let sig = RecoverableSignature::from_compact(sig64, recid)
+                .map_err(SignatureParseError::InvalidSignature)?;
+            Ok(Signature(sig))
+        };
 
-        // Step 6: Rebuild signature
-        let sig = RecoverableSignature::from_compact(sig_bytes, recid)
-            .map_err(SignatureParseError::InvalidSignature)?;
+        // --- 1) EOS canonical: header-first (31..34) + 64-byte sig ---
+        if let Some((&hdr, sig64)) = payload65.split_first() {
+            if hdr >= 27 {
+                let v = hdr - 27;
+                let recid = v & 0x03;       // 0..=3
+                // let compressed = (v & 0x04) != 0; // always true for EOS, not needed here
+                return make(sig64, recid);
+            }
+            // If hdr looks like a raw recid (0..=3), accept that too.
+            if hdr <= 3 {
+                return make(sig64, hdr);
+            }
+        }
 
-        Ok(Signature(sig))
+        // --- 2) Fallback: recid-last variants (rare, non-EOS tools) ---
+        if let Some((&tail, sig64)) = payload65.split_last() {
+            if tail >= 27 {
+                let v = tail - 27;
+                let recid = v & 0x03;
+                return make(sig64, recid);
+            }
+            if tail <= 3 {
+                return make(sig64, tail);
+            }
+        }
+
+        Err(SignatureParseError::InvalidRecoveryId)
     }
 }
 
@@ -233,5 +254,11 @@ mod tests {
         let parsed_signature = Signature::from_str(&display_str)
             .expect("Failed to parse signature from display string");
         assert_eq!(signature, parsed_signature);
+    }
+
+    #[test]
+    fn test_deserialize_signature() {
+        let sig = "SIG_K1_K7Bombkd276QDZD3SPCQmfNZk7h1cfgovK6tMhLFU7gCwyZ1Vhqxg9JuQraV52KPrqK9Sm1iWKZ2Q1FSqK7dhMAenQGesa";
+        let signature = Signature::from_str(sig).expect("Failed to deserialize signature");
     }
 }

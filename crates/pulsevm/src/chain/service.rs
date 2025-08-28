@@ -39,6 +39,7 @@ pub trait Rpc {
         &self,
         signatures: HashSet<Signature>,
         compression: TransactionCompression,
+        packed_context_free_data: Bytes,
         packed_trx: Bytes,
     ) -> Result<IssueTxResponse, ErrorObjectOwned>;
 
@@ -416,10 +417,11 @@ impl RpcServer for RpcService {
         &self,
         signatures: HashSet<Signature>,
         compression: TransactionCompression,
+        packed_context_free_data: Bytes,
         packed_trx: Bytes,
     ) -> Result<IssueTxResponse, ErrorObjectOwned> {
         let packed_trx =
-            PackedTransaction::new(signatures, compression, packed_trx).map_err(|e| {
+            PackedTransaction::new(signatures, compression, packed_context_free_data, packed_trx).map_err(|e| {
                 ErrorObjectOwned::owned(400, "transaction_error", Some(format!("{}", e)))
             })?;
 

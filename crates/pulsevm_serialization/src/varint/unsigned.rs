@@ -1,6 +1,8 @@
-use pulsevm_serialization::{NumBytes, Read, ReadError, Write, WriteError};
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+use crate::{NumBytes, Read, ReadError, Write, WriteError};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct VarUint32(pub u32);
 
 impl NumBytes for VarUint32 {
@@ -9,7 +11,7 @@ impl NumBytes for VarUint32 {
         let v = self.0;
         if v == 0 { return 1; }
         let bits = 32 - v.leading_zeros();       // number of significant bits
-        core::cmp::min(((bits as usize + 6) / 7), 5)
+        core::cmp::min((bits as usize + 6) / 7, 5)
     }
 }
 
@@ -73,6 +75,50 @@ impl Write for VarUint32 {
             if v == 0 { break; }
         }
         Ok(())
+    }
+}
+
+impl From<usize> for VarUint32 {
+    #[allow(clippy::cast_possible_truncation)]
+    fn from(v: usize) -> Self {
+        Self(v as u32)
+    }
+}
+
+impl From<u32> for VarUint32 {
+    fn from(v: u32) -> Self {
+        Self(v)
+    }
+}
+
+impl From<u16> for VarUint32 {
+    fn from(v: u16) -> Self {
+        Self(v.into())
+    }
+}
+
+impl From<u8> for VarUint32 {
+    fn from(v: u8) -> Self {
+        Self(v.into())
+    }
+}
+
+impl Serialize for VarUint32 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_u32(self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for VarUint32 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = u32::deserialize(deserializer)?;
+        Ok(VarUint32(value))
     }
 }
 

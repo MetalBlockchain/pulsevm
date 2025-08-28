@@ -456,7 +456,7 @@ mod tests {
     use std::{env::temp_dir, fs, path::PathBuf, str::FromStr, vec};
 
     use pulsevm_proc_macros::{NumBytes, Read, Write};
-    use pulsevm_serialization::Write;
+    use pulsevm_serialization::{VarUint32, Write};
     use pulsevm_time::TimePointSec;
     use serde_json::json;
 
@@ -534,7 +534,8 @@ mod tests {
         account: Name,
     ) -> Result<SignedTransaction, ChainError> {
         Transaction::new(
-            TransactionHeader::new(TimePointSec::new(0), 0, 0, Id::default()),
+            TransactionHeader::new(TimePointSec::new(0), 0, 0, 0u32.into(), 0, 0u32.into()),
+            vec![],
             vec![Action::new(
                 Name::from_str("pulse").unwrap(),
                 Name::from_str("newaccount").unwrap(),
@@ -569,7 +570,8 @@ mod tests {
         wasm_bytes: Vec<u8>,
     ) -> Result<SignedTransaction, ChainError> {
         Transaction::new(
-            TransactionHeader::new(TimePointSec::new(0), 0, 0, Id::default()),
+            TransactionHeader::new(TimePointSec::new(0), 0, 0, 0u32.into(), 0, 0u32.into()),
+            vec![],
             vec![Action::new(
                 Name::from_str("pulse").unwrap(),
                 Name::from_str("setcode").unwrap(),
@@ -597,7 +599,8 @@ mod tests {
         action_data: &T,
     ) -> Result<SignedTransaction, ChainError> {
         Transaction::new(
-            TransactionHeader::new(TimePointSec::new(0), 0, 0, Id::default()),
+            TransactionHeader::new(TimePointSec::new(0), 0, 0, 0u32.into(), 0, 0u32.into()),
+            vec![],
             vec![Action::new(
                 account,
                 action,

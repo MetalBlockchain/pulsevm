@@ -1,10 +1,16 @@
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
     hash::Hash,
-    iter::Map,
 };
 
-use crate::{NumBytes, Read, ReadError, Write, WriteError};
+use crate::{NumBytes, Read, ReadError, VarUint32, Write, WriteError};
+
+impl NumBytes for usize {
+    #[inline(always)]
+    fn num_bytes(&self) -> usize {
+        VarUint32::from(*self).num_bytes()
+    }
+}
 
 impl NumBytes for u8 {
     #[inline(always)]
@@ -64,7 +70,6 @@ impl NumBytes for i64 {
 
 impl NumBytes for f32 {
     #[inline]
-    #[must_use]
     fn num_bytes(&self) -> usize {
         4
     }
@@ -72,7 +77,6 @@ impl NumBytes for f32 {
 
 impl NumBytes for f64 {
     #[inline]
-    #[must_use]
     fn num_bytes(&self) -> usize {
         8
     }
@@ -81,7 +85,7 @@ impl NumBytes for f64 {
 impl NumBytes for String {
     #[inline(always)]
     fn num_bytes(&self) -> usize {
-        self.len() + 2 // 2 bytes for length prefix
+        self.len().num_bytes() + self.len()
     }
 }
 
@@ -105,7 +109,7 @@ impl<T: NumBytes> NumBytes for Option<T> {
 impl<T: NumBytes> NumBytes for Vec<T> {
     #[inline(always)]
     fn num_bytes(&self) -> usize {
-        let mut count = 4;
+        let mut count = self.len().num_bytes();
         for item in self {
             count += item.num_bytes();
         }
@@ -116,7 +120,7 @@ impl<T: NumBytes> NumBytes for Vec<T> {
 impl<T: NumBytes> NumBytes for VecDeque<T> {
     #[inline(always)]
     fn num_bytes(&self) -> usize {
-        let mut count = 4;
+        let mut count = self.len().num_bytes();
         for item in self {
             count += item.num_bytes();
         }
@@ -127,7 +131,7 @@ impl<T: NumBytes> NumBytes for VecDeque<T> {
 impl<T: NumBytes> NumBytes for HashSet<T> {
     #[inline(always)]
     fn num_bytes(&self) -> usize {
-        let mut count = 4;
+        let mut count = self.len().num_bytes();
         for item in self {
             count += item.num_bytes();
         }
@@ -138,7 +142,7 @@ impl<T: NumBytes> NumBytes for HashSet<T> {
 impl<K: Write + NumBytes, V: Write + NumBytes> NumBytes for BTreeMap<K, V> {
     #[inline(always)]
     fn num_bytes(&self) -> usize {
-        let mut count = 4;
+        let mut count = self.len().num_bytes();
         for (key, value) in self {
             count += key.num_bytes();
             count += value.num_bytes();
@@ -165,6 +169,13 @@ impl<T1: NumBytes, T2: NumBytes, T3: NumBytes, T4: NumBytes> NumBytes for (T1, T
     #[inline(always)]
     fn num_bytes(&self) -> usize {
         self.0.num_bytes() + self.1.num_bytes() + self.2.num_bytes() + self.3.num_bytes()
+    }
+}
+
+impl Read for usize {
+    #[inline(always)]
+    fn read(bytes: &[u8], pos: &mut usize) -> Result<Self, ReadError> {
+        VarUint32::read(bytes, pos).map(|v| v.0 as usize)
     }
 }
 
@@ -283,8 +294,7 @@ impl Read for f64 {
 impl Read for String {
     #[inline(always)]
     fn read(bytes: &[u8], pos: &mut usize) -> Result<Self, ReadError> {
-        // Read 2-byte length prefix (big endian)
-        let len = u16::read(bytes, pos)? as usize;
+        let len = usize::read(bytes, pos)?;
 
         if *pos + len > bytes.len() {
             return Err(ReadError::NotEnoughBytes);
@@ -306,7 +316,7 @@ where
 {
     #[inline(always)]
     fn read(bytes: &[u8], pos: &mut usize) -> Result<Self, ReadError> {
-        let len = u32::read(bytes, pos)? as usize;
+        let len = usize::read(bytes, pos)?;
 
         if *pos + len > bytes.len() {
             return Err(ReadError::NotEnoughBytes);
@@ -327,7 +337,7 @@ where
 {
     #[inline(always)]
     fn read(bytes: &[u8], pos: &mut usize) -> Result<Self, ReadError> {
-        let len = u32::read(bytes, pos)? as usize;
+        let len = usize::read(bytes, pos)?;
 
         if *pos + len > bytes.len() {
             return Err(ReadError::NotEnoughBytes);
@@ -348,7 +358,7 @@ where
 {
     #[inline(always)]
     fn read(bytes: &[u8], pos: &mut usize) -> Result<Self, ReadError> {
-        let len = u32::read(bytes, pos)? as usize;
+        let len = usize::read(bytes, pos)?;
 
         if *pos + len > bytes.len() {
             return Err(ReadError::NotEnoughBytes);
@@ -366,7 +376,7 @@ where
 impl<K: Read + Write + NumBytes + Ord, V: Read + Write + NumBytes> Read for BTreeMap<K, V> {
     #[inline(always)]
     fn read(bytes: &[u8], pos: &mut usize) -> Result<Self, ReadError> {
-        let len = u32::read(bytes, pos)? as usize;
+        let len = usize::read(bytes, pos)?;
 
         if *pos + len > bytes.len() {
             return Err(ReadError::NotEnoughBytes);
@@ -445,6 +455,13 @@ impl<T: Read> Read for Option<T> {
         } else {
             Ok(None)
         }
+    }
+}
+
+impl Write for usize {
+    #[inline(always)]
+    fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), WriteError> {
+        VarUint32(*self as u32).write(bytes, pos)
     }
 }
 
@@ -544,11 +561,13 @@ impl Write for f64 {
 impl<'a> Write for String {
     #[inline(always)]
     fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), WriteError> {
-        let len = self.len() as u16;
-        len.write(bytes, pos)?;
-        for i in 0..len {
-            bytes[*pos] = self.as_bytes()[i as usize];
-            *pos = pos.saturating_add(1);
+        self.len().write(bytes, pos)?;
+        if *pos + self.len() > bytes.len() {
+            return Err(WriteError::NotEnoughSpace);
+        }
+        for i in 0..self.len() {
+            bytes[*pos] = self.as_bytes()[i];
+            *pos += 1;
         }
         Ok(())
     }
@@ -577,8 +596,7 @@ impl<T: Write> Write for Option<T> {
 impl<T: Write> Write for Vec<T> {
     #[inline(always)]
     fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), WriteError> {
-        let len = self.len() as u32;
-        len.write(bytes, pos)?;
+        self.len().write(bytes, pos)?;
         for item in self.iter() {
             item.write(bytes, pos)?;
         }
@@ -589,8 +607,7 @@ impl<T: Write> Write for Vec<T> {
 impl<T: Write> Write for VecDeque<T> {
     #[inline(always)]
     fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), WriteError> {
-        let len = self.len() as u32;
-        len.write(bytes, pos)?;
+        self.len().write(bytes, pos)?;
         for item in self.iter() {
             item.write(bytes, pos)?;
         }
@@ -601,8 +618,7 @@ impl<T: Write> Write for VecDeque<T> {
 impl<T: Write> Write for HashSet<T> {
     #[inline(always)]
     fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), WriteError> {
-        let len = self.len() as u32;
-        len.write(bytes, pos)?;
+        self.len().write(bytes, pos)?;
         for item in self.iter() {
             item.write(bytes, pos)?;
         }
@@ -613,8 +629,7 @@ impl<T: Write> Write for HashSet<T> {
 impl<K: Write + NumBytes, V: Write + NumBytes> Write for BTreeMap<K, V> {
     #[inline(always)]
     fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), WriteError> {
-        let len = self.len() as u32;
-        len.write(bytes, pos)?;
+        self.len().write(bytes, pos)?;
         for (key, value) in self.iter() {
             key.write(bytes, pos)?;
             value.write(bytes, pos)?;
@@ -650,5 +665,16 @@ impl<T1: Write, T2: Write, T3: Write, T4: Write> Write for (T1, T2, T3, T4) {
         self.2.write(bytes, pos)?;
         self.3.write(bytes, pos)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn string_num_bytes() {
+        assert_eq!("".to_string().num_bytes(), 1);
+        assert_eq!("hello".to_string().num_bytes(), 6);
     }
 }

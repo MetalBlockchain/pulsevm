@@ -3,7 +3,7 @@ use core::fmt;
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Read, Write, NumBytes)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Read, Write, NumBytes, Default)]
 pub struct Bytes(pub Vec<u8>);
 
 impl Bytes {
@@ -21,6 +21,10 @@ impl Bytes {
 
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+
+    pub fn as_ref(&self) -> &[u8] {
+        &self.0
     }
 }
 

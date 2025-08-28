@@ -1,4 +1,4 @@
-use pulsevm_serialization::{NumBytes, Read, ReadError, Write, WriteError};
+use crate::{NumBytes, Read, ReadError, Write, WriteError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VarInt32(pub i32);
