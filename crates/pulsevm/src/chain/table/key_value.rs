@@ -46,11 +46,11 @@ impl ChainbaseObject for KeyValue {
     type PrimaryKey = u64;
 
     fn primary_key(&self) -> Vec<u8> {
-        self.id.to_be_bytes().to_vec()
+        self.id.to_le_bytes().to_vec()
     }
 
     fn primary_key_to_bytes(key: Self::PrimaryKey) -> Vec<u8> {
-        key.to_be_bytes().to_vec()
+        key.to_le_bytes().to_vec()
     }
 
     fn table_name() -> &'static str {
@@ -81,8 +81,8 @@ impl SecondaryIndex<KeyValue> for KeyValueByScopePrimaryIndex {
 
     fn secondary_key_as_bytes(key: Self::Key) -> Vec<u8> {
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&key.0.to_be_bytes());
-        bytes.extend_from_slice(&key.1.to_be_bytes());
+        bytes.extend_from_slice(&key.0.to_le_bytes());
+        bytes.extend_from_slice(&key.1.to_le_bytes());
         bytes
     }
 

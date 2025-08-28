@@ -78,11 +78,11 @@ impl SecondaryIndex<Block> for BlockByHeightIndex {
     type Object = Block;
 
     fn secondary_key(object: &Block) -> Vec<u8> {
-        object.height.to_be_bytes().to_vec()
+        object.height.to_le_bytes().to_vec()
     }
 
     fn secondary_key_as_bytes(key: Self::Key) -> Vec<u8> {
-        key.to_be_bytes().to_vec()
+        key.to_le_bytes().to_vec()
     }
 
     fn index_name() -> &'static str {

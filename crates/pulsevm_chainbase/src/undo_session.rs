@@ -126,15 +126,15 @@ impl UndoSession {
         // Do we have a sequence for this table?
         tx.fetch_update(&partition, "id", |v| {
             if v.is_none() {
-                return Some(Slice::new(&1u64.to_be_bytes()));
+                return Some(Slice::new(&1u64.to_le_bytes()));
             }
             let id = v.unwrap();
             let mut arr = [0u8; 8];
             arr.copy_from_slice(&id);
-            let mut id = u64::from_be_bytes(arr);
+            let mut id = u64::from_le_bytes(arr);
             id += 1;
             new_id = id;
-            Some(Slice::new(&id.to_be_bytes()))
+            Some(Slice::new(&id.to_le_bytes()))
         })
         .map_err(|_| {
             ChainbaseError::InternalError(format!(

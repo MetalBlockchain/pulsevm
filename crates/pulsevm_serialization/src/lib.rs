@@ -48,6 +48,7 @@ pub enum ReadError {
     /// Not enough bytes.
     NotEnoughBytes,
     ParseError,
+    Overflow,
 }
 
 impl fmt::Display for ReadError {
@@ -55,6 +56,7 @@ impl fmt::Display for ReadError {
         match self {
             ReadError::NotEnoughBytes => write!(f, "not enough bytes to read"),
             ReadError::ParseError => write!(f, "parse error"),
+            ReadError::Overflow => write!(f, "integer overflow"),
         }
     }
 }

@@ -2162,6 +2162,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "pulsevm_varint"
+version = "0.1.0"
+dependencies = [
+ "pulsevm_serialization",
+]
+
+[[package]]
 name = "quick_cache"
 version = "0.6.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"

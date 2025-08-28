@@ -174,7 +174,7 @@ impl Read for u8 {
         if bytes.len() < *pos + core::mem::size_of::<u8>() {
             return Err(ReadError::NotEnoughBytes);
         }
-        let value = u8::from_be_bytes([bytes[*pos]]);
+        let value = u8::from_le_bytes([bytes[*pos]]);
         *pos += core::mem::size_of::<u8>();
         Ok(value)
     }
@@ -194,7 +194,7 @@ impl Read for u16 {
         if bytes.len() < *pos + core::mem::size_of::<u16>() {
             return Err(ReadError::NotEnoughBytes);
         }
-        let value = u16::from_be_bytes([bytes[*pos], bytes[*pos + 1]]);
+        let value = u16::from_le_bytes([bytes[*pos], bytes[*pos + 1]]);
         *pos += core::mem::size_of::<u16>();
         Ok(value)
     }
@@ -214,7 +214,7 @@ impl Read for u32 {
         if bytes.len() < *pos + core::mem::size_of::<u32>() {
             return Err(ReadError::NotEnoughBytes);
         }
-        let value = u32::from_be_bytes([
+        let value = u32::from_le_bytes([
             bytes[*pos],
             bytes[*pos + 1],
             bytes[*pos + 2],
@@ -239,7 +239,7 @@ impl Read for u64 {
         if bytes.len() < *pos + core::mem::size_of::<u64>() {
             return Err(ReadError::NotEnoughBytes);
         }
-        let value = u64::from_be_bytes([
+        let value = u64::from_le_bytes([
             bytes[*pos],
             bytes[*pos + 1],
             bytes[*pos + 2],
@@ -451,7 +451,7 @@ impl<T: Read> Read for Option<T> {
 impl Write for u8 {
     #[inline(always)]
     fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), WriteError> {
-        let value = self.to_be_bytes();
+        let value = self.to_le_bytes();
         bytes[*pos] = value[0];
         *pos += value.len();
         Ok(())
@@ -468,7 +468,7 @@ impl Write for i8 {
 impl Write for u16 {
     #[inline(always)]
     fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), WriteError> {
-        let value = self.to_be_bytes();
+        let value = self.to_le_bytes();
         bytes[*pos] = value[0];
         bytes[*pos + 1] = value[1];
         *pos += value.len();
@@ -486,7 +486,7 @@ impl Write for i16 {
 impl Write for u32 {
     #[inline(always)]
     fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), WriteError> {
-        let value = self.to_be_bytes();
+        let value = self.to_le_bytes();
         bytes[*pos] = value[0];
         bytes[*pos + 1] = value[1];
         bytes[*pos + 2] = value[2];
@@ -506,7 +506,7 @@ impl Write for i32 {
 impl Write for u64 {
     #[inline(always)]
     fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), WriteError> {
-        let value = self.to_be_bytes();
+        let value = self.to_le_bytes();
         bytes[*pos] = value[0];
         bytes[*pos + 1] = value[1];
         bytes[*pos + 2] = value[2];

@@ -37,7 +37,7 @@ impl ChainbaseObject for ResourceUsage {
     }
 
     fn primary_key_to_bytes(key: Self::PrimaryKey) -> Vec<u8> {
-        key.as_u64().to_be_bytes().to_vec()
+        key.as_u64().to_le_bytes().to_vec()
     }
 
     fn table_name() -> &'static str {

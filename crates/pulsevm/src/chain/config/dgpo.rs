@@ -22,7 +22,7 @@ impl ChainbaseObject for DynamicGlobalPropertyObject {
     }
 
     fn primary_key_to_bytes(key: Self::PrimaryKey) -> Vec<u8> {
-        key.to_be_bytes().to_vec()
+        key.to_le_bytes().to_vec()
     }
 
     fn table_name() -> &'static str {

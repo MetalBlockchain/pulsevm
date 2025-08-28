@@ -142,7 +142,7 @@ mod tests {
             TestObject::primary_key_to_bytes(self.id)
         }
         fn primary_key_to_bytes(key: Self::PrimaryKey) -> Vec<u8> {
-            key.to_be_bytes().to_vec()
+            key.to_le_bytes().to_vec()
         }
         fn secondary_indexes(&self) -> Vec<SecondaryKey> {
             vec![SecondaryKey {
