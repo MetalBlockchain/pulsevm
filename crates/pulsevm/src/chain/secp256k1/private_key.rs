@@ -37,7 +37,7 @@ impl PrivateKey {
     #[allow(dead_code)]
     pub fn public_key(&self) -> PublicKey {
         let secp = secp256k1::Secp256k1::new();
-        PublicKey(secp256k1::PublicKey::from_secret_key(&secp, &self.0))
+        PublicKey::new(secp256k1::PublicKey::from_secret_key(&secp, &self.0))
     }
 
     #[allow(dead_code)]

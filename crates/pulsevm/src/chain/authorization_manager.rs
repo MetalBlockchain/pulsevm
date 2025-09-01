@@ -490,6 +490,7 @@ mod tests {
                     1,
                 )],
                 vec![],
+                vec![],
             ),
         );
         undo_session.insert(&owner_permission).unwrap();

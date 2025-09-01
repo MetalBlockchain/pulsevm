@@ -1,3 +1,5 @@
+use pulsevm_proc_macros::{NumBytes, Read, Write};
+
 use crate::chain::{AccountDelta, ActionTrace, Id, TransactionReceiptHeader, error::ChainError};
 
 #[derive(Default, Clone)]

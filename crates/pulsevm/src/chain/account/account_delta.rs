@@ -4,6 +4,6 @@ use crate::chain::Name;
 
 #[derive(Debug, Clone, PartialEq, Eq, Read, Write, NumBytes)]
 pub struct AccountDelta {
-    account: Name,
-    delta: i64,
+    pub account: Name,
+    pub delta: i64,
 }

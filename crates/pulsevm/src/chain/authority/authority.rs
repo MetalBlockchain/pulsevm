@@ -3,7 +3,10 @@ use std::fmt;
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 use serde::Serialize;
 
-use crate::chain::config::{self, BillableSize, FIXED_OVERHEAD_SHARED_VECTOR_RAM_BYTES};
+use crate::chain::{
+    WaitWeight,
+    config::{self, BillableSize, FIXED_OVERHEAD_SHARED_VECTOR_RAM_BYTES},
+};
 
 use super::{key_weight::KeyWeight, permission_level_weight::PermissionLevelWeight};
 
@@ -12,6 +15,7 @@ pub struct Authority {
     threshold: u32,
     keys: Vec<KeyWeight>,
     accounts: Vec<PermissionLevelWeight>,
+    waits: Vec<WaitWeight>,
 }
 
 impl fmt::Display for Authority {
@@ -25,11 +29,17 @@ impl fmt::Display for Authority {
 }
 
 impl Authority {
-    pub fn new(threshold: u32, keys: Vec<KeyWeight>, accounts: Vec<PermissionLevelWeight>) -> Self {
+    pub fn new(
+        threshold: u32,
+        keys: Vec<KeyWeight>,
+        accounts: Vec<PermissionLevelWeight>,
+        waits: Vec<WaitWeight>,
+    ) -> Self {
         Authority {
             threshold,
             keys,
             accounts,
+            waits,
         }
     }
 
@@ -59,6 +69,7 @@ impl Authority {
         for account in &self.accounts {
             total_weight += account.weight() as u32;
         }
+        // TODO: Validate waits
         return total_weight >= self.threshold;
     }
 
@@ -71,7 +82,7 @@ impl Authority {
             keys_size += config::billable_size_v::<KeyWeight>();
             keys_size += 65; // 65 bytes for the public key
         }
-
+        // TODO: Validate waits
         accounts_size + keys_size
     }
 }

@@ -1,4 +1,6 @@
-use crate::chain::{Action, ActionReceipt, Id, Name, TransactionTrace, error::ChainError};
+use pulsevm_proc_macros::Read;
+
+use crate::chain::{Action, ActionReceipt, Id, Name, error::ChainError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActionTrace {

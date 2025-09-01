@@ -13,7 +13,7 @@ use crate::chain::{
 pub struct PackedTransaction {
     signatures: HashSet<Signature>,      // Signatures of the transaction
     compression: TransactionCompression, // Compression type used for the transaction
-    packed_context_free_data: Bytes,    // Packed context-free data, if any
+    packed_context_free_data: Bytes,     // Packed context-free data, if any
     packed_trx: Bytes,                   // Packed transaction, not signed, data
 
     // Following fields are not serialized
@@ -29,12 +29,14 @@ impl PackedTransaction {
         packed_trx: Bytes,
     ) -> Result<Self, ChainError> {
         let trx_bytes = maybe_decompress(compression, packed_trx.as_ref())?;
-        let b = hex::encode(&trx_bytes);
-        println!("Decompressed trx bytes: {}", b);
-        let _cfd_bytes = maybe_decompress(compression, packed_context_free_data.as_ref())?;
+        let cfd_bytes = maybe_decompress(compression, packed_context_free_data.as_ref())?;
         let unpacked_trx = Transaction::read(trx_bytes.as_slice(), &mut 0).map_err(|e| {
             ChainError::SerializationError(format!("failed to unpack transaction: {}", e))
         })?;
+        let unpacked_context_free_data =
+            Vec::<Bytes>::read(cfd_bytes.as_slice(), &mut 0).map_err(|e| {
+                ChainError::SerializationError(format!("failed to unpack context free data: {}", e))
+            })?;
         let trx_id: Id = unpacked_trx.id()?;
 
         Ok(Self {
@@ -43,7 +45,11 @@ impl PackedTransaction {
             packed_context_free_data,
             packed_trx,
 
-            unpacked_trx: SignedTransaction::new(unpacked_trx, signatures),
+            unpacked_trx: SignedTransaction::new(
+                unpacked_trx,
+                signatures,
+                unpacked_context_free_data,
+            ),
             trx_id: trx_id,
         })
     }
@@ -82,7 +88,10 @@ impl PackedTransaction {
 
 impl NumBytes for PackedTransaction {
     fn num_bytes(&self) -> usize {
-        self.signatures.num_bytes() + self.compression.num_bytes() + self.packed_context_free_data.num_bytes() + self.packed_trx.num_bytes()
+        self.signatures.num_bytes()
+            + self.compression.num_bytes()
+            + self.packed_context_free_data.num_bytes()
+            + self.packed_trx.num_bytes()
     }
 }
 
@@ -102,8 +111,13 @@ impl Read for PackedTransaction {
         let compression = TransactionCompression::read(data, pos)?;
         let packed_context_free_data = Bytes::read(data, pos)?;
         let packed_trx = Bytes::read(data, pos)?;
-        PackedTransaction::new(signatures, compression, packed_context_free_data, packed_trx)
-            .map_err(|_| ReadError::ParseError)
+        PackedTransaction::new(
+            signatures,
+            compression,
+            packed_context_free_data,
+            packed_trx,
+        )
+        .map_err(|_| ReadError::ParseError)
     }
 }
 
@@ -134,9 +148,9 @@ fn maybe_decompress(
             }
             let mut decoder = ZlibDecoder::new(data);
             let mut out = Vec::new();
-            decoder
-                .read_to_end(&mut out)
-                .map_err(|e| ChainError::SerializationError(format!("zlib decompress failed: {e}")))?;
+            decoder.read_to_end(&mut out).map_err(|e| {
+                ChainError::SerializationError(format!("zlib decompress failed: {e}"))
+            })?;
             Ok(out)
         }
     }
@@ -155,6 +169,12 @@ mod tests {
     fn it_works() {
         let packed_trx = hex::decode("789cab38bb219991415d8bfb21031030820886d6c5eb181ce6cd524ad9310b2100042bde1a19a5c1050a166d6702d28c606d4cf5befb5857f4fa58969c3b71c15e5267daca46bb25d738048f3cebd2759de1e459c308359d48a50c0055322f6f").unwrap();
         let mut pos = 0;
-        let unpacked_trx = PackedTransaction::new(HashSet::new(), crate::chain::TransactionCompression::Zlib, Bytes::default(), packed_trx.into()).unwrap();
+        let unpacked_trx = PackedTransaction::new(
+            HashSet::new(),
+            crate::chain::TransactionCompression::Zlib,
+            Bytes::default(),
+            packed_trx.into(),
+        )
+        .unwrap();
     }
 }

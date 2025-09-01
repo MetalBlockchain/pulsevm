@@ -9,8 +9,10 @@ impl NumBytes for VarUint32 {
     #[inline(always)]
     fn num_bytes(&self) -> usize {
         let v = self.0;
-        if v == 0 { return 1; }
-        let bits = 32 - v.leading_zeros();       // number of significant bits
+        if v == 0 {
+            return 1;
+        }
+        let bits = 32 - v.leading_zeros(); // number of significant bits
         core::cmp::min((bits as usize + 6) / 7, 5)
     }
 }
@@ -69,10 +71,14 @@ impl Write for VarUint32 {
         loop {
             let mut b = (v & 0x7F) as u8;
             v >>= 7;
-            if v != 0 { b |= 0x80; }      // continuation bit
+            if v != 0 {
+                b |= 0x80;
+            } // continuation bit
             bytes[*pos] = b;
             *pos += 1;
-            if v == 0 { break; }
+            if v == 0 {
+                break;
+            }
         }
         Ok(())
     }
@@ -151,11 +157,20 @@ mod tests {
         p = 0;
         assert_eq!(VarUint32::read(&[0x7F], &mut p).unwrap(), VarUint32(127));
         p = 0;
-        assert_eq!(VarUint32::read(&[0x80, 0x01], &mut p).unwrap(), VarUint32(128));
+        assert_eq!(
+            VarUint32::read(&[0x80, 0x01], &mut p).unwrap(),
+            VarUint32(128)
+        );
         p = 0;
-        assert_eq!(VarUint32::read(&[0xFF, 0x01], &mut p).unwrap(), VarUint32(255));
+        assert_eq!(
+            VarUint32::read(&[0xFF, 0x01], &mut p).unwrap(),
+            VarUint32(255)
+        );
         p = 0;
-        assert_eq!(VarUint32::read(&[0xFF,0xFF,0xFF,0xFF,0x0F], &mut p).unwrap(), VarUint32(u32::MAX));
+        assert_eq!(
+            VarUint32::read(&[0xFF, 0xFF, 0xFF, 0xFF, 0x0F], &mut p).unwrap(),
+            VarUint32(u32::MAX)
+        );
     }
 
     #[test]
@@ -163,17 +178,17 @@ mod tests {
         let mut buf = [0u8; 16];
         let mut p = 0;
 
-        VarUint32(0).write(&mut buf, &mut p).unwrap();      // [00]
-        VarUint32(1).write(&mut buf, &mut p).unwrap();      // [01]
-        VarUint32(127).write(&mut buf, &mut p).unwrap();    // [7F]
-        VarUint32(128).write(&mut buf, &mut p).unwrap();    // [80 01]
-        VarUint32(255).write(&mut buf, &mut p).unwrap();    // [FF 01]
-        assert_eq!(&buf[..p], &[0x00,0x01,0x7F,0x80,0x01,0xFF,0x01]);
+        VarUint32(0).write(&mut buf, &mut p).unwrap(); // [00]
+        VarUint32(1).write(&mut buf, &mut p).unwrap(); // [01]
+        VarUint32(127).write(&mut buf, &mut p).unwrap(); // [7F]
+        VarUint32(128).write(&mut buf, &mut p).unwrap(); // [80 01]
+        VarUint32(255).write(&mut buf, &mut p).unwrap(); // [FF 01]
+        assert_eq!(&buf[..p], &[0x00, 0x01, 0x7F, 0x80, 0x01, 0xFF, 0x01]);
 
         // u64 little-endian example
         let mut buf2 = [0u8; 8];
         let mut p2 = 0;
         (0x1122334455667788u64).write(&mut buf2, &mut p2).unwrap();
-        assert_eq!(&buf2, &[0x88,0x77,0x66,0x55,0x44,0x33,0x22,0x11]); // LE
+        assert_eq!(&buf2, &[0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11]); // LE
     }
 }

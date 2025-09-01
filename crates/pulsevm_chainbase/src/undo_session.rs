@@ -112,7 +112,8 @@ impl UndoSession {
             return Ok(None);
         }
         let mut pos = 0 as usize;
-        let object: T = T::read(&serialized.unwrap(), &mut pos).expect("failed to read object");
+        let object: T = T::read(&serialized.unwrap(), &mut pos)
+            .map_err(|_| ChainbaseError::InternalError(format!("failed to read object")))?;
         Ok(Some(object))
     }
 

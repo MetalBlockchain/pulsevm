@@ -1,4 +1,5 @@
 use core::fmt;
+use std::str::FromStr;
 
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 use serde::{Deserialize, Serialize};
@@ -11,6 +12,8 @@ pub enum SymbolError {
     InvalidChar(char),
     /// More than 7 characters won't fit (precision already uses 1 byte).
     TooLong(usize),
+    /// Failed to parse symbol code.
+    ParseError,
 }
 
 impl fmt::Display for SymbolError {
@@ -18,6 +21,7 @@ impl fmt::Display for SymbolError {
         match self {
             SymbolError::InvalidChar(c) => write!(f, "invalid character in symbol: '{}'", c),
             SymbolError::TooLong(len) => write!(f, "symbol is too long: {} characters", len),
+            SymbolError::ParseError => write!(f, "failed to parse symbol code"),
         }
     }
 }
@@ -67,6 +71,26 @@ impl Serialize for Symbol {
     {
         let value = format!("{},{}", self.precision(), self.code());
         serializer.serialize_str(&value)
+    }
+}
+
+impl FromStr for Symbol {
+    type Err = SymbolError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mut parts = s.split(',');
+        let precision_str = parts.next().ok_or(SymbolError::TooLong(0))?;
+        let code_str = parts.next().ok_or(SymbolError::TooLong(0))?;
+        if parts.next().is_some() {
+            return Err(SymbolError::TooLong(s.len()));
+        }
+
+        let precision: u8 = precision_str
+            .parse()
+            .map_err(|_| SymbolError::TooLong(precision_str.len()))?;
+        let code = SymbolCode::from_str(code_str).map_err(|_| SymbolError::ParseError)?;
+
+        Ok(Symbol::new_with_code(precision, code))
     }
 }
 

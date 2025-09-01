@@ -37,9 +37,9 @@ pub struct AbiActionDefinition {
 
 #[derive(Debug, Clone, Read, Write, NumBytes, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AbiTableDefinition {
-    pub name: Name,             // the name of the table
+    pub name: Name,                     // the name of the table
     pub index_type: Option<String>,     // the kind of index, i64, i128i128, etc
-    pub key_names: Vec<String>, // names for the keys defined by key_types
+    pub key_names: Vec<String>,         // names for the keys defined by key_types
     pub key_types: Option<Vec<String>>, // the type of key parameters
     #[serde(rename = "type")]
     pub type_name: String, // type of binary data stored in this table

@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use pulsevm_crypto::Digest;
 use serde::Serialize;
 

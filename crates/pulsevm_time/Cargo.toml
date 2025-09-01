@@ -9,3 +9,4 @@ pulsevm_proc_macros = { path = "../pulsevm_proc_macros" }
 pulsevm_serialization = { path = "../pulsevm_serialization" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+time = { version = "0.3.41", features = ["formatting", "macros", "parsing"] }

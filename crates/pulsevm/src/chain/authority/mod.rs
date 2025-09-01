@@ -15,3 +15,6 @@ pub use permission::*;
 
 mod permission_link;
 pub use permission_link::*;
+
+mod wait_weight;
+pub use wait_weight::*;

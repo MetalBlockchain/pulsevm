@@ -10,29 +10,30 @@ use crate::{
         ACTIVE_NAME, Account, AccountMetadata, Asset, BlockTimestamp, DELETEAUTH_NAME,
         LINKAUTH_NAME, NEWACCOUNT_NAME, PackedTransaction, SETABI_NAME, SETCODE_NAME,
         SignedTransaction, TransactionReceipt, UNLINKAUTH_NAME, UPDATEAUTH_NAME,
+        block::{BlockHeader, SignedBlock},
         config::GlobalPropertyObject,
         pulse_contract::{deleteauth, linkauth, unlinkauth},
         transaction_context::TransactionResult,
     },
     mempool::Mempool,
+    state_history::StateHistoryLog,
 };
 
 use super::{
     AuthorizationManager, Genesis, Id, Name, OWNER_NAME, PULSE_NAME, TransactionContext,
     apply_context::ApplyContext,
     authority::{Authority, KeyWeight},
-    block::{Block, BlockByHeightIndex},
     error::ChainError,
     pulse_contract::{newaccount, setabi, setcode, updateauth},
-    transaction::Transaction,
     wasm_runtime::WasmRuntime,
 };
 use chrono::Utc;
 use pulsevm_chainbase::{Database, UndoSession};
 use pulsevm_crypto::{Digest, merkle};
-use pulsevm_serialization::Read;
+use pulsevm_serialization::{Read, VarUint32};
+use ripemd::digest::block_buffer::Block;
 use spdlog::info;
-use tokio::sync::RwLock as AsyncRwLock;
+use tokio::sync::{RwLock as AsyncRwLock, broadcast};
 
 pub type ApplyHandlerFn = fn(&mut ApplyContext) -> Result<(), ChainError>;
 pub type ApplyHandlerMap = HashMap<
@@ -56,11 +57,14 @@ pub struct Controller {
     wasm_runtime: Arc<RwLock<WasmRuntime>>,
     genesis: Genesis,
 
-    last_accepted_block: Block,
+    last_accepted_block: SignedBlock,
     preferred_id: Id,
     db: Database,
-    verified_blocks: HashMap<Id, Block>,
+    verified_blocks: HashMap<Id, SignedBlock>,
     chain_id: Id,
+
+    trace_log: Option<StateHistoryLog>,
+    chain_state_log: Option<StateHistoryLog>,
 }
 
 #[derive(Debug)]
@@ -81,15 +85,19 @@ impl Controller {
         // Create a temporary database
         let db = Database::temporary(Path::new("temp")).unwrap();
         let wasm_runtime = WasmRuntime::new().unwrap();
+        //let (tx, mut rx1) = broadcast::channel::<Signed>(16);
         let controller = Controller {
             wasm_runtime: Arc::new(RwLock::new(wasm_runtime)), // TODO: Handle error properly
             genesis: Genesis::default(),
 
-            last_accepted_block: Block::default(),
+            last_accepted_block: SignedBlock::default(),
             preferred_id: Id::default(),
             db: db,
             verified_blocks: HashMap::new(),
             chain_id: Id::default(),
+
+            trace_log: None,
+            chain_state_log: None,
         };
 
         controller
@@ -108,12 +116,17 @@ impl Controller {
             .map_err(|e| ChainError::ParseError(format!("failed to parse genesis: {}", e)))?
             .validate()?;
         self.chain_id = self.genesis.compute_chain_id()?;
+        self.trace_log = Some(StateHistoryLog::open(&db_path, "trace_log").map_err(|e| {
+            ChainError::InternalError(Some(format!("failed to open trace log: {}", e)))
+        })?);
+        self.chain_state_log = Some(StateHistoryLog::open(&db_path, "chain_state_log").map_err(
+            |e| ChainError::InternalError(Some(format!("failed to open chain state log: {}", e))),
+        )?);
 
         // Set our last accepted block to the genesis block
-        self.last_accepted_block = Block::new(
+        self.last_accepted_block = SignedBlock::new(
             Id::default(),
-            self.genesis.initial_timestamp()?,
-            1, // EOS Block nums start at 1
+            self.genesis.initial_timestamp().clone(),
             VecDeque::new(),
             Digest::default(),
         );
@@ -121,11 +134,9 @@ impl Controller {
         let session = self.db.session()?;
 
         // Do we have the genesis block in our DB?
-        let genesis_block = session
-            .find_by_secondary::<Block, BlockByHeightIndex>(self.last_accepted_block.height)
-            .map_err(|e| {
-                ChainError::GenesisError(format!("failed to find genesis block: {}", e))
-            })?;
+        let genesis_block = session.find::<SignedBlock>(1).map_err(|e| {
+            ChainError::GenesisError(format!("failed to find genesis block: {}", e))
+        })?;
 
         if genesis_block.is_none() {
             // If not, insert it
@@ -135,12 +146,17 @@ impl Controller {
             session.insert(&self.last_accepted_block).map_err(|e| {
                 ChainError::GenesisError(format!("failed to insert genesis block: {}", e))
             })?;
-            let default_key = self.genesis.initial_key()?;
+            let default_key = self.genesis.initial_key();
             info!(
                 "initializing pulse account with default key: {}",
-                default_key.0
+                default_key
             );
-            let default_authority = Authority::new(1, vec![KeyWeight::new(default_key, 1)], vec![]);
+            let default_authority = Authority::new(
+                1,
+                vec![KeyWeight::new(default_key.clone(), 1)],
+                vec![],
+                vec![],
+            );
             // Create the pulse@owner permission
             let owner_permission = AuthorizationManager::create_permission(
                 &mut session,
@@ -166,7 +182,7 @@ impl Controller {
             session
                 .insert(&Account::new(
                     PULSE_NAME,
-                    self.last_accepted_block().timestamp,
+                    self.last_accepted_block().timestamp(),
                     vec![],
                 ))
                 .map_err(|e| {
@@ -190,10 +206,10 @@ impl Controller {
         Ok(())
     }
 
-    pub async fn build_block(&mut self, mempool: &mut Mempool) -> Result<Block, ChainError> {
+    pub async fn build_block(&mut self, mempool: &mut Mempool) -> Result<SignedBlock, ChainError> {
         let mut undo_session = self.db.undo_session()?;
         let mut transaction_receipts: VecDeque<TransactionReceipt> = VecDeque::new();
-        let timestamp = BlockTimestamp::new(Utc::now());
+        let timestamp = BlockTimestamp::now();
 
         // Get transactions from the mempool
         loop {
@@ -209,8 +225,12 @@ impl Controller {
                 &transaction.get_signed_transaction(),
                 &timestamp,
             )?;
-            let receipt =
-                TransactionReceipt::new(super::TransactionStatus::Executed, 0, 0, transaction);
+            let receipt = TransactionReceipt::new(
+                super::TransactionStatus::Executed,
+                0,
+                VarUint32(0),
+                transaction,
+            );
 
             // Add the transaction to the block
             transaction_receipts.push_back(receipt);
@@ -224,24 +244,26 @@ impl Controller {
         }
 
         // Create a new block
-        let trx_merkle = self.calculate_trx_merkle(&transaction_receipts)?;
-        let block = Block::new(
+        let transaction_mroot = self.calculate_trx_merkle(&transaction_receipts)?;
+        let block = SignedBlock::new(
             self.preferred_id,
             timestamp,
-            self.last_accepted_block.height + 1,
             transaction_receipts,
-            trx_merkle,
+            transaction_mroot,
         );
 
         // We built this block so no need to verify it again
-        self.verified_blocks.insert(block.id(), block.clone());
+        self.verified_blocks.insert(
+            block.signed_block_header.block.calculate_id().unwrap(),
+            block.clone(),
+        );
 
         Ok(block)
     }
 
     pub async fn verify_block(
         &mut self,
-        block: &Block,
+        block: &SignedBlock,
         mempool: Arc<AsyncRwLock<Mempool>>,
     ) -> Result<(), ChainError> {
         if self.verified_blocks.contains_key(&block.id()) {
@@ -276,6 +298,12 @@ impl Controller {
         let mut mempool = mempool.write().await;
         self.execute_block(&block, &mut session, &mut mempool)
             .await?;
+        self.trace_log
+            .as_ref()
+            .map(|log| log.append(block_id.clone(), block.id().as_bytes()));
+        self.chain_state_log
+            .as_ref()
+            .map(|log| log.append(block_id.clone(), block.id().as_bytes()));
         session
             .commit()
             .map_err(|e| ChainError::TransactionError(format!("failed to commit block: {}", e)))?;
@@ -287,25 +315,25 @@ impl Controller {
 
     pub async fn execute_block(
         &mut self,
-        block: &Block,
+        block: &SignedBlock,
         session: &mut UndoSession,
         mempool: &mut Mempool,
     ) -> Result<(), ChainError> {
         // Make sure we don't have the block already
         let existing_block = session
-            .find::<Block>(block.id())
+            .find::<SignedBlock>(block.block_num())
             .map_err(|e| ChainError::TransactionError(format!("failed to find block: {}", e)))?;
 
         if existing_block.is_some() {
             return Ok(());
         }
 
-        for receipt in &block.transaction_receipts {
+        for receipt in &block.transactions {
             // Verify the transaction
             self.execute_transaction(
                 session,
                 receipt.trx().get_signed_transaction(),
-                &block.timestamp,
+                &block.signed_block_header.block.timestamp,
             )?;
 
             // Remove from mempool if we have it
@@ -347,7 +375,7 @@ impl Controller {
             AuthorizationManager::check_authorization(
                 undo_session,
                 &signed_transaction.transaction().actions,
-                &signed_transaction.recovered_keys()?,
+                &signed_transaction.recovered_keys(&self.chain_id)?,
                 &HashSet::new(),
                 &HashSet::new(),
             )?;
@@ -362,34 +390,37 @@ impl Controller {
         return trx_context.exec(signed_transaction.transaction());
     }
 
-    pub fn last_accepted_block(&self) -> &Block {
+    pub fn last_accepted_block(&self) -> &SignedBlock {
         &self.last_accepted_block
     }
 
-    pub fn get_block_by_height(&self, height: u64) -> Result<Option<Block>, ChainError> {
-        if height == self.last_accepted_block.height {
+    pub fn get_block_by_height(&self, height: u32) -> Result<Option<SignedBlock>, ChainError> {
+        if height == self.last_accepted_block.block_num() {
             return Ok(Some(self.last_accepted_block.clone()));
         }
 
         // Query DB
-        let block = self
-            .db
-            .session()?
-            .find_by_secondary::<Block, BlockByHeightIndex>(height)?;
+        let block = self.db.session()?.find::<SignedBlock>(height)?;
 
         Ok(block)
     }
 
-    pub fn get_block(&mut self, id: Id) -> Result<Option<Block>, ChainError> {
+    pub fn get_block_id_for_num(&self, height: u32) -> Result<Option<Id>, ChainError> {
+        let block = self.get_block_by_height(height)?;
+
+        Ok(block.map(|b| b.id()))
+    }
+
+    pub fn get_block(&mut self, id: Id) -> Result<Option<SignedBlock>, ChainError> {
         self.db
             .session()?
-            .find::<Block>(id)
+            .find::<SignedBlock>(BlockHeader::num_from_id(&id))
             .map_err(|e| ChainError::TransactionError(format!("failed to find block: {}", e)))
     }
 
-    pub fn parse_block(&self, bytes: &Vec<u8>) -> Result<Block, ControllerError> {
+    pub fn parse_block(&self, bytes: &Vec<u8>) -> Result<SignedBlock, ControllerError> {
         let mut pos = 0;
-        let block = Block::read(bytes, &mut pos)
+        let block = SignedBlock::read(bytes, &mut pos)
             .map_err(|e| ControllerError::GenesisError(format!("Failed to parse block: {}", e)))?;
         Ok(block)
     }
@@ -449,6 +480,14 @@ impl Controller {
 
         Ok(merkle(trx_digests))
     }
+
+    pub fn trace_log(&self) -> Option<&StateHistoryLog> {
+        self.trace_log.as_ref()
+    }
+
+    pub fn chain_state_log(&self) -> Option<&StateHistoryLog> {
+        self.chain_state_log.as_ref()
+    }
 }
 
 #[cfg(test)]
@@ -461,7 +500,7 @@ mod tests {
     use serde_json::json;
 
     use crate::chain::{
-        Action, NewAccount, PrivateKey, SetCode, Symbol, TransactionHeader,
+        Action, NewAccount, PrivateKey, SetCode, Symbol, Transaction, TransactionHeader,
         authority::{Permission, PermissionLevel},
     };
 
@@ -546,10 +585,12 @@ mod tests {
                         1,
                         vec![KeyWeight::new(private_key.public_key(), 1)],
                         vec![],
+                        vec![],
                     ),
                     active: Authority::new(
                         1,
                         vec![KeyWeight::new(private_key.public_key(), 1)],
+                        vec![],
                         vec![],
                     ),
                 }
@@ -561,7 +602,7 @@ mod tests {
                 )],
             )],
         )
-        .sign(&private_key)
+        .sign(&private_key, &Id::default())
     }
 
     fn set_code(
@@ -589,7 +630,7 @@ mod tests {
                 )],
             )],
         )
-        .sign(&private_key)
+        .sign(&private_key, &Id::default())
     }
 
     fn call_contract<T: Write>(
@@ -611,7 +652,7 @@ mod tests {
                 )],
             )],
         )
-        .sign(&private_key)
+        .sign(&private_key, &Id::default())
     }
 
     #[test]
@@ -621,8 +662,8 @@ mod tests {
         let genesis_bytes = generate_genesis(&private_key);
         let temp_path = get_temp_dir().to_str().unwrap().to_string();
         controller.initialize(&genesis_bytes.to_vec(), temp_path)?;
-        assert_eq!(controller.last_accepted_block().height, 0);
-        let pending_block_timestamp = controller.last_accepted_block().timestamp;
+        assert_eq!(controller.last_accepted_block().block_num(), 0);
+        let pending_block_timestamp = controller.last_accepted_block().timestamp();
         let mut undo_session = controller.create_undo_session()?;
         controller.execute_transaction(
             &mut undo_session,
@@ -709,8 +750,7 @@ mod tests {
         let genesis_bytes = generate_genesis(&private_key);
         let temp_path = get_temp_dir().to_str().unwrap().to_string();
         controller.initialize(&genesis_bytes.to_vec(), temp_path)?;
-        assert_eq!(controller.last_accepted_block().height, 0);
-        let pending_block_timestamp = controller.last_accepted_block().timestamp;
+        let pending_block_timestamp = controller.last_accepted_block().timestamp();
         let mut undo_session = controller.create_undo_session()?;
         controller.execute_transaction(
             &mut undo_session,

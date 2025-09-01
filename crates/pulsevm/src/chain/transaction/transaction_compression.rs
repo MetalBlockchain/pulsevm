@@ -1,7 +1,10 @@
 use std::fmt;
 
 use pulsevm_serialization::{NumBytes, Read, ReadError, Write, WriteError};
-use serde::{de::{self, Visitor}, Deserialize, Deserializer, Serialize};
+use serde::{
+    Deserialize, Deserializer, Serialize,
+    de::{self, Visitor},
+};
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -19,13 +19,11 @@ use crate::{
         GetTableRowsResponse, IssueTxResponse, PermissionResponse,
     },
     chain::{
-        AbiDefinition, Account, AccountMetadata, Asset, Base64Bytes, BlockTimestamp, Gossipable,
-        Id, KeyValue, KeyValueByScopePrimaryIndex, Name, PULSE_NAME, PackedTransaction, Permission,
-        PermissionByOwnerIndex, Signature, Table, TableByCodeScopeTableIndex, Transaction,
-        TransactionCompression, VERSION,
-        block::{Block, BlockByHeightIndex},
-        error::ChainError,
-        pulse_assert, string_to_symbol,
+        AbiDefinition, Account, AccountMetadata, Asset, Base64Bytes, BlockHeader, BlockTimestamp,
+        Gossipable, Id, KeyValue, KeyValueByScopePrimaryIndex, Name, PULSE_NAME, PackedTransaction,
+        Permission, PermissionByOwnerIndex, Signature, SignedBlock, Table,
+        TableByCodeScopeTableIndex, TransactionCompression, error::ChainError, pulse_assert,
+        string_to_symbol,
     },
     mempool::Mempool,
 };
@@ -51,7 +49,7 @@ pub trait Rpc {
     -> Result<GetAccountResponse, ErrorObjectOwned>;
 
     #[method(name = "pulsevm.getBlock")]
-    async fn get_block(&self, block_num_or_id: String) -> Result<Block, ErrorObjectOwned>;
+    async fn get_block(&self, block_num_or_id: String) -> Result<SignedBlock, ErrorObjectOwned>;
 
     #[method(name = "pulsevm.getCodeHash")]
     async fn get_code_hash(
@@ -81,7 +79,8 @@ pub trait Rpc {
     async fn get_raw_abi(&self, account_name: Name) -> Result<GetRawABIResponse, ErrorObjectOwned>;
 
     #[method(name = "pulsevm.getRawBlock")]
-    async fn get_raw_block(&self, block_num_or_id: String) -> Result<Block, ErrorObjectOwned>;
+    async fn get_raw_block(&self, block_num_or_id: String)
+    -> Result<SignedBlock, ErrorObjectOwned>;
 
     #[method(name = "pulsevm.getTableRows")]
     async fn get_table_rows(
@@ -198,7 +197,7 @@ impl RpcServer for RpcService {
         Ok(result)
     }
 
-    async fn get_block(&self, block_num_or_id: String) -> Result<Block, ErrorObjectOwned> {
+    async fn get_block(&self, block_num_or_id: String) -> Result<SignedBlock, ErrorObjectOwned> {
         return self.get_raw_block(block_num_or_id).await;
     }
 
@@ -333,11 +332,11 @@ impl RpcServer for RpcService {
         Ok(GetInfoResponse {
             server_version: "d133c641".to_owned(),
             chain_id: controller.chain_id(),
-            head_block_num: head_block.height as u32,
-            last_irreversible_block_num: head_block.height as u32,
+            head_block_num: head_block.block_num(),
+            last_irreversible_block_num: head_block.block_num(),
             last_irreversible_block_id: head_block.id(),
             head_block_id: head_block.id(),
-            head_block_time: head_block.timestamp,
+            head_block_time: head_block.timestamp(),
             head_block_producer: PULSE_NAME,
             virtual_block_cpu_limit: 100, // Placeholder, adjust as needed
             virtual_block_net_limit: 100, // Placeholder, adjust as needed
@@ -345,12 +344,13 @@ impl RpcServer for RpcService {
             block_net_limit: 100,         // Placeholder, adjust as needed
             server_version_string: "v5.0.3".to_owned(),
             fork_db_head_block_id: head_block.id(),
-            fork_db_head_block_num: head_block.height as u32,
-            server_full_version_string: "v5.0.3-d133c6413ce8ce2e96096a0513ec25b4a8dbe837".to_owned(), // Mimic EOS here
+            fork_db_head_block_num: head_block.block_num(),
+            server_full_version_string: "v5.0.3-d133c6413ce8ce2e96096a0513ec25b4a8dbe837"
+                .to_owned(), // Mimic EOS here
             total_cpu_weight: 100, // Placeholder, adjust as needed
             total_net_weight: 100, // Placeholder, adjust as needed
             earliest_available_block_num: 1,
-            last_irreversible_block_time: head_block.timestamp,
+            last_irreversible_block_time: head_block.timestamp(),
         })
     }
 
@@ -384,7 +384,10 @@ impl RpcServer for RpcService {
         })
     }
 
-    async fn get_raw_block(&self, block_num_or_id: String) -> Result<Block, ErrorObjectOwned> {
+    async fn get_raw_block(
+        &self,
+        block_num_or_id: String,
+    ) -> Result<SignedBlock, ErrorObjectOwned> {
         let controller = self.controller.clone();
         let controller = controller.read().await;
         let session = controller
@@ -392,17 +395,17 @@ impl RpcServer for RpcService {
             .session()
             .map_err(|e| ErrorObjectOwned::owned(500, "database_error", Some(format!("{}", e))))?;
 
-        if let Ok(n) = block_num_or_id.parse::<u64>() {
+        if let Ok(n) = block_num_or_id.parse::<u32>() {
+            let block = session.get::<SignedBlock>(n).map_err(|e| {
+                ErrorObjectOwned::owned(404, "block_not_found", Some(format!("{}", e)))
+            })?;
+            return Ok(block);
+        } else if let Ok(id) = Id::from_str(block_num_or_id.as_str()) {
             let block = session
-                .get_by_secondary::<Block, BlockByHeightIndex>(n)
+                .get::<SignedBlock>(BlockHeader::num_from_id(&id))
                 .map_err(|e| {
                     ErrorObjectOwned::owned(404, "block_not_found", Some(format!("{}", e)))
                 })?;
-            return Ok(block);
-        } else if let Ok(id) = Id::from_str(block_num_or_id.as_str()) {
-            let block = session.get::<Block>(id).map_err(|e| {
-                ErrorObjectOwned::owned(404, "block_not_found", Some(format!("{}", e)))
-            })?;
             return Ok(block);
         }
 
@@ -420,10 +423,13 @@ impl RpcServer for RpcService {
         packed_context_free_data: Bytes,
         packed_trx: Bytes,
     ) -> Result<IssueTxResponse, ErrorObjectOwned> {
-        let packed_trx =
-            PackedTransaction::new(signatures, compression, packed_context_free_data, packed_trx).map_err(|e| {
-                ErrorObjectOwned::owned(400, "transaction_error", Some(format!("{}", e)))
-            })?;
+        let packed_trx = PackedTransaction::new(
+            signatures,
+            compression,
+            packed_context_free_data,
+            packed_trx,
+        )
+        .map_err(|e| ErrorObjectOwned::owned(400, "transaction_error", Some(format!("{}", e))))?;
 
         // Run transaction and revert it
         let controller = self.controller.clone();

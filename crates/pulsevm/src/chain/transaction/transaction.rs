@@ -1,13 +1,14 @@
 use std::collections::HashSet;
 
+use pulsevm_crypto::Bytes;
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 use pulsevm_serialization::Write;
-use secp256k1::hashes::{Hash, sha256};
+use secp256k1::hashes::{Hash, HashEngine, sha256};
 use serde::{Serialize, ser::SerializeStruct};
 
 use crate::chain::{
-    Id, PrivateKey, SignedTransaction,
-    TransactionHeader, error::ChainError,
+    Id, PrivateKey, SignedTransaction, TransactionHeader, error::ChainError,
+    transaction::signed_transaction::signing_digest,
 };
 
 use super::action::Action;
@@ -16,19 +17,29 @@ use super::action::Action;
 pub struct Transaction {
     pub header: TransactionHeader,
     pub context_free_actions: Vec<Action>, // Context-free actions, if any
-    pub actions: Vec<Action>, // Actions to be executed in this transaction
+    pub actions: Vec<Action>,              // Actions to be executed in this transaction
+    pub transaction_extensions: Vec<(u16, Vec<u8>)>, // We don't use this for now
 }
 
 impl Transaction {
-    pub fn new(header: TransactionHeader, context_free_actions: Vec<Action>, actions: Vec<Action>) -> Self {
-        Self { header, context_free_actions, actions }
+    pub fn new(
+        header: TransactionHeader,
+        context_free_actions: Vec<Action>,
+        actions: Vec<Action>,
+    ) -> Self {
+        Self {
+            header,
+            context_free_actions,
+            actions,
+            transaction_extensions: vec![],
+        }
     }
 
     pub fn id(&self) -> Result<Id, ChainError> {
         Ok(Id::from_sha256(&self.digest()?))
     }
 
-    pub fn digest(&self) -> Result<sha256::Hash, ChainError> {
+    fn digest(&self) -> Result<sha256::Hash, ChainError> {
         let bytes: Vec<u8> = self.pack().map_err(|e| {
             ChainError::SerializationError(format!("failed to pack transaction: {}", e))
         })?;
@@ -36,10 +47,26 @@ impl Transaction {
     }
 
     // Helper function for testing
-    pub fn sign(&self, private_key: &PrivateKey) -> Result<SignedTransaction, ChainError> {
-        let signed_transaction = SignedTransaction::new(self.clone(), HashSet::new());
+    pub fn sign(
+        &self,
+        private_key: &PrivateKey,
+        chain_id: &Id,
+    ) -> Result<SignedTransaction, ChainError> {
+        let signed_transaction = SignedTransaction::new(self.clone(), HashSet::new(), vec![]);
 
-        signed_transaction.sign(private_key)
+        signed_transaction.sign(private_key, chain_id)
+    }
+
+    pub fn signing_digest(
+        &self,
+        chain_id: &Id,
+        cfd_bytes: &Vec<Bytes>,
+    ) -> Result<sha256::Hash, ChainError> {
+        let trx_bytes: Vec<u8> = self.pack().map_err(|e| {
+            ChainError::SerializationError(format!("failed to pack transaction: {}", e))
+        })?;
+
+        signing_digest(chain_id, &trx_bytes, cfd_bytes)
     }
 }
 

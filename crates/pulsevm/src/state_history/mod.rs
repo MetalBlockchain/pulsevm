@@ -1,4 +1,6 @@
 mod abi;
+mod log;
+pub use log::*;
 mod request;
 mod session;
 mod types;
@@ -11,17 +13,30 @@ use std::{
     },
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use futures_util::{SinkExt, StreamExt};
 use pulsevm_serialization::{Read, Write};
 use serde::Deserialize;
-use tokio::{net::TcpListener as TokioTcpListener, select, sync::{RwLock, Semaphore}};
+use tokio::{
+    net::TcpListener as TokioTcpListener,
+    select,
+    sync::{RwLock, Semaphore},
+};
 use tokio_tungstenite::tungstenite::{Error as WsError, protocol::CloseFrame};
 use tokio_tungstenite::{accept_async, accept_async_with_config};
 use tokio_util::sync::CancellationToken;
 use tungstenite::{Message, protocol::WebSocketConfig};
 
-use crate::{chain::{AbiDefinition, Controller, Id}, state_history::{abi::SHIP_ABI, request::RequestType, session::Session, types::{BlockPosition, GetStatusResult}}, VirtualMachine};
+use crate::{
+    VirtualMachine,
+    chain::{AbiDefinition, Controller, Id},
+    state_history::{
+        abi::SHIP_ABI,
+        request::RequestType,
+        session::Session,
+        types::{BlockPosition, GetStatusResult},
+    },
+};
 
 #[derive(Clone)]
 pub struct StateHistoryServer {
@@ -30,7 +45,9 @@ pub struct StateHistoryServer {
 
 impl StateHistoryServer {
     pub fn new(vm: VirtualMachine) -> Self {
-        Self { controller: vm.controller.clone() }
+        Self {
+            controller: vm.controller.clone(),
+        }
     }
 
     pub async fn run_ws_server(&self, bind: &str, cancel: CancellationToken) -> anyhow::Result<()> {
@@ -53,7 +70,7 @@ impl StateHistoryServer {
                     let controller = self.controller.clone();
 
                     tokio::spawn(async move {
-                        let session = Session::new(peer, controller);
+                        let mut session = Session::new(peer, controller);
                         if let Err(e) = session.start(stream).await {
                             eprintln!("{} conn error: {e:?}", peer);
                         }
@@ -80,4 +97,6 @@ struct GetBlocksAck {
 }
 
 #[derive(Deserialize)]
-struct AckBody { num_messages: u32 }
+struct AckBody {
+    num_messages: u32,
+}

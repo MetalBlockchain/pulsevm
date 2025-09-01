@@ -15,12 +15,12 @@ pub struct TransactionHeader {
 
 impl TransactionHeader {
     pub fn new(
-            expiration: TimePointSec,
-            ref_block_num: u16,
-            ref_block_prefix: u32,
-            max_net_usage_words: VarUint32,
-            max_cpu_usage: u8,
-            delay_sec: VarUint32,
+        expiration: TimePointSec,
+        ref_block_num: u16,
+        ref_block_prefix: u32,
+        max_net_usage_words: VarUint32,
+        max_cpu_usage: u8,
+        delay_sec: VarUint32,
     ) -> Self {
         Self {
             expiration,

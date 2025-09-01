@@ -16,7 +16,9 @@ impl NumBytes for VarInt32 {
             count += 1;
             // termination rule for SLEB128
             let done = (v == 0 && !sign_bit) || (v == -1 && sign_bit);
-            if done || count == 5 { break; }
+            if done || count == 5 {
+                break;
+            }
         }
         count
     }
@@ -74,12 +76,16 @@ impl Write for VarInt32 {
 
             // Are we done after this byte?
             let done = (v == 0 && !sign_bit) || (v == -1 && sign_bit);
-            if !done { byte |= 0x80; } // continuation
+            if !done {
+                byte |= 0x80;
+            } // continuation
 
             bytes[*pos] = byte;
             *pos += 1;
 
-            if done { break; }
+            if done {
+                break;
+            }
         }
         Ok(())
     }
@@ -136,25 +142,55 @@ mod tests {
         p = 0;
         assert_eq!(VarInt32::read(&[0x40], &mut p).unwrap(), VarInt32(-64));
         p = 0;
-        assert_eq!(VarInt32::read(&[0xFF, 0x00], &mut p).unwrap(), VarInt32(127));
+        assert_eq!(
+            VarInt32::read(&[0xFF, 0x00], &mut p).unwrap(),
+            VarInt32(127)
+        );
         p = 0;
-        assert_eq!(VarInt32::read(&[0x80, 0x7F], &mut p).unwrap(), VarInt32(-128));
+        assert_eq!(
+            VarInt32::read(&[0x80, 0x7F], &mut p).unwrap(),
+            VarInt32(-128)
+        );
         p = 0;
-        assert_eq!(VarInt32::read(&[0xFF, 0x3F], &mut p).unwrap(), VarInt32(8191));
+        assert_eq!(
+            VarInt32::read(&[0xFF, 0x3F], &mut p).unwrap(),
+            VarInt32(8191)
+        );
         p = 0;
-        assert_eq!(VarInt32::read(&[0x80, 0x40], &mut p).unwrap(), VarInt32(-8192));
+        assert_eq!(
+            VarInt32::read(&[0x80, 0x40], &mut p).unwrap(),
+            VarInt32(-8192)
+        );
         p = 0;
-        assert_eq!(VarInt32::read(&[0xFF, 0xFF, 0x3F], &mut p).unwrap(), VarInt32(1_048_575));
+        assert_eq!(
+            VarInt32::read(&[0xFF, 0xFF, 0x3F], &mut p).unwrap(),
+            VarInt32(1_048_575)
+        );
         p = 0;
-        assert_eq!(VarInt32::read(&[0x80, 0x80, 0x40], &mut p).unwrap(), VarInt32(-1_048_576));
+        assert_eq!(
+            VarInt32::read(&[0x80, 0x80, 0x40], &mut p).unwrap(),
+            VarInt32(-1_048_576)
+        );
         p = 0;
-        assert_eq!(VarInt32::read(&[0xFF, 0xFF, 0xFF, 0x3F], &mut p).unwrap(), VarInt32(134_217_727));
+        assert_eq!(
+            VarInt32::read(&[0xFF, 0xFF, 0xFF, 0x3F], &mut p).unwrap(),
+            VarInt32(134_217_727)
+        );
         p = 0;
-        assert_eq!(VarInt32::read(&[0x80, 0x80, 0x80, 0x40], &mut p).unwrap(), VarInt32(-134_217_728));
+        assert_eq!(
+            VarInt32::read(&[0x80, 0x80, 0x80, 0x40], &mut p).unwrap(),
+            VarInt32(-134_217_728)
+        );
         p = 0;
-        assert_eq!(VarInt32::read(&[0xFF, 0xFF, 0xFF, 0xFF, 0x07], &mut p).unwrap(), VarInt32(core::i32::MAX));
+        assert_eq!(
+            VarInt32::read(&[0xFF, 0xFF, 0xFF, 0xFF, 0x07], &mut p).unwrap(),
+            VarInt32(core::i32::MAX)
+        );
         p = 0;
-        assert_eq!(VarInt32::read(&[0x80, 0x80, 0x80, 0x80, 0x78], &mut p).unwrap(), VarInt32(core::i32::MIN));
+        assert_eq!(
+            VarInt32::read(&[0x80, 0x80, 0x80, 0x80, 0x78], &mut p).unwrap(),
+            VarInt32(core::i32::MIN)
+        );
     }
 
     #[test]
@@ -162,24 +198,24 @@ mod tests {
         let mut buf = [0u8; 32];
         let mut p = 0;
 
-        VarInt32(0).write(&mut buf, &mut p).unwrap();        // [00]
-        VarInt32(1).write(&mut buf, &mut p).unwrap();        // [01]
-        VarInt32(-1).write(&mut buf, &mut p).unwrap();       // [7F]
-        VarInt32(64).write(&mut buf, &mut p).unwrap();       // [C0 00]
-        VarInt32(-64).write(&mut buf, &mut p).unwrap();      // [40]
-        VarInt32(127).write(&mut buf, &mut p).unwrap();      // [FF 00]
-        VarInt32(-128).write(&mut buf, &mut p).unwrap();     // [80 7F]
-        VarInt32(8191).write(&mut buf, &mut p).unwrap();     // [FF 3F]
-        VarInt32(-8192).write(&mut buf, &mut p).unwrap();    // [80 40]
+        VarInt32(0).write(&mut buf, &mut p).unwrap(); // [00]
+        VarInt32(1).write(&mut buf, &mut p).unwrap(); // [01]
+        VarInt32(-1).write(&mut buf, &mut p).unwrap(); // [7F]
+        VarInt32(64).write(&mut buf, &mut p).unwrap(); // [C0 00]
+        VarInt32(-64).write(&mut buf, &mut p).unwrap(); // [40]
+        VarInt32(127).write(&mut buf, &mut p).unwrap(); // [FF 00]
+        VarInt32(-128).write(&mut buf, &mut p).unwrap(); // [80 7F]
+        VarInt32(8191).write(&mut buf, &mut p).unwrap(); // [FF 3F]
+        VarInt32(-8192).write(&mut buf, &mut p).unwrap(); // [80 40]
 
         assert_eq!(
             &buf[..p],
             &[
-                0x00,       // 0
-                0x01,       // 1
-                0x7F,       // -1
+                0x00, // 0
+                0x01, // 1
+                0x7F, // -1
                 0xC0, 0x00, // 64
-                0x40,       // -64
+                0x40, // -64
                 0xFF, 0x00, // 127
                 0x80, 0x7F, // -128
                 0xFF, 0x3F, // 8191

@@ -24,6 +24,7 @@ mod authorization_manager;
 pub use authorization_manager::AuthorizationManager;
 
 mod block;
+pub use block::*;
 
 mod config;
 pub use config::*;
@@ -68,9 +69,6 @@ pub use secp256k1::*;
 
 mod table;
 pub use table::*;
-
-mod time;
-pub use time::*;
 
 mod transaction_context;
 pub use transaction_context::TransactionContext;

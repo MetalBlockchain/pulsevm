@@ -1,4 +1,3 @@
-use chrono::{DateTime, Utc};
 use core::str;
 use pulsevm_proc_macros::NumBytes;
 use pulsevm_proc_macros::Read;
@@ -7,10 +6,9 @@ use pulsevm_serialization::Write;
 use secp256k1::hashes::Hash;
 use secp256k1::hashes::sha256;
 use serde::{Deserialize, Serialize};
-use std::str::FromStr;
 
-use crate::chain::BlockTimestamp;
 use crate::chain::Id;
+use crate::chain::block::BlockTimestamp;
 use crate::chain::error::ChainError;
 
 use super::PublicKey;
@@ -25,8 +23,8 @@ pub struct ChainConfig {
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, Read, Write, NumBytes)]
 pub struct Genesis {
-    initial_timestamp: String,
-    initial_key: String,
+    initial_timestamp: BlockTimestamp,
+    initial_key: PublicKey,
     initial_configuration: ChainConfig,
 }
 
@@ -40,17 +38,6 @@ impl Genesis {
     }
 
     pub fn validate(&self) -> Result<Self, ChainError> {
-        if self.initial_timestamp.is_empty() {
-            return Err(ChainError::GenesisError(
-                "missing field: initial_timestamp".to_string(),
-            ));
-        }
-        if self.initial_key.is_empty() {
-            return Err(ChainError::GenesisError(
-                "missing field: initial_key".to_string(),
-            ));
-        }
-        self.initial_key()?;
         Ok(self.clone())
     }
 
@@ -63,16 +50,12 @@ impl Genesis {
         Ok(chain_id)
     }
 
-    pub fn initial_timestamp(&self) -> Result<BlockTimestamp, ChainError> {
-        let timestamp = self
-            .initial_timestamp
-            .parse::<DateTime<Utc>>()
-            .map_err(|_| ChainError::GenesisError("invalid timestamp format".to_string()))?;
-        Ok(timestamp.into())
+    pub fn initial_timestamp(&self) -> &BlockTimestamp {
+        &self.initial_timestamp
     }
 
-    pub fn initial_key(&self) -> Result<PublicKey, ChainError> {
-        PublicKey::from_str(&self.initial_key)
+    pub fn initial_key(&self) -> &PublicKey {
+        &self.initial_key
     }
 
     pub fn initial_configuration(&self) -> &ChainConfig {

@@ -3,8 +3,7 @@ use pulsevm_serialization::{NumBytes, Read, ReadError};
 pub enum RequestType {
     GetStatusRequestV0,
     GetBlocksRequestV0,
-    GetBlocksRequestV1,
-    GetBlocksAckRequestV0
+    GetBlocksAckRequestV0,
 }
 
 impl NumBytes for RequestType {
@@ -19,8 +18,7 @@ impl Read for RequestType {
         Ok(match id {
             0 => RequestType::GetStatusRequestV0,
             1 => RequestType::GetBlocksRequestV0,
-            2 => RequestType::GetBlocksRequestV1,
-            3 => RequestType::GetBlocksAckRequestV0,
+            2 => RequestType::GetBlocksAckRequestV0,
             _ => return Err(ReadError::ParseError),
         })
     }

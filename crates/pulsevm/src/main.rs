@@ -15,7 +15,7 @@ use pulsevm_grpc::{
         vm_server::{Vm, VmServer},
     },
 };
-use pulsevm_serialization::Read;
+use pulsevm_serialization::{Read, Write};
 use secp256k1::hashes::siphash24::State;
 use spdlog::{info, warn};
 use std::{
@@ -32,8 +32,9 @@ use tonic::transport::server::TcpIncoming;
 use tonic::{Request, Response, Status, transport::Server};
 
 use crate::{
-    chain::{Gossipable, PackedTransaction, Transaction, PLUGIN_VERSION, VERSION},
-    mempool::BlockTimer, state_history::StateHistoryServer,
+    chain::{Gossipable, PLUGIN_VERSION, PackedTransaction, Transaction, VERSION},
+    mempool::BlockTimer,
+    state_history::StateHistoryServer,
 };
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 10)]
@@ -80,7 +81,10 @@ async fn main() {
     let state_history_service = StateHistoryServer::new(vm.clone());
     let ws_bind = std::env::var("WS_BIND").unwrap_or_else(|_| "127.0.0.1:9090".into());
     let ws_handle = tokio::spawn(async move {
-        if let Err(e) = state_history_service.run_ws_server(&ws_bind, cancel_ws).await {
+        if let Err(e) = state_history_service
+            .run_ws_server(&ws_bind, cancel_ws)
+            .await
+        {
             spdlog::error!("WS server error: {:?}", e);
         }
     });
@@ -203,12 +207,15 @@ impl Vm for VirtualMachine {
             last_accepted_id: controller.last_accepted_block().id().as_bytes().to_vec(),
             last_accepted_parent_id: controller
                 .last_accepted_block()
-                .parent_id
+                .previous_id()
                 .as_bytes()
                 .to_vec(),
-            height: controller.last_accepted_block().height,
-            bytes: controller.last_accepted_block().bytes(),
-            timestamp: Some(controller.last_accepted_block().timestamp.into()),
+            height: controller.last_accepted_block().block_num() as u64,
+            bytes: controller
+                .last_accepted_block()
+                .pack()
+                .map_err(|e| Status::internal(format!("could not pack block: {}", e)))?,
+            timestamp: Some(controller.last_accepted_block().timestamp().into()),
         }));
     }
 
@@ -223,12 +230,15 @@ impl Vm for VirtualMachine {
             last_accepted_id: controller.last_accepted_block().id().as_bytes().to_vec(),
             last_accepted_parent_id: controller
                 .last_accepted_block()
-                .parent_id
+                .previous_id()
                 .as_bytes()
                 .to_vec(),
-            height: controller.last_accepted_block().height,
-            bytes: controller.last_accepted_block().bytes(),
-            timestamp: Some(controller.last_accepted_block().timestamp.into()),
+            height: controller.last_accepted_block().block_num() as u64,
+            bytes: controller
+                .last_accepted_block()
+                .pack()
+                .map_err(|e| Status::internal(format!("could not pack block: {}", e)))?,
+            timestamp: Some(controller.last_accepted_block().timestamp().into()),
         }));
     }
 
@@ -297,10 +307,12 @@ impl Vm for VirtualMachine {
             .map_err(|e| Status::internal(format!("could not build block: {}", e)))?;
         Ok(Response::new(vm::BuildBlockResponse {
             id: block.id().into(),
-            parent_id: block.parent_id.into(),
-            height: block.height,
-            bytes: block.bytes(),
-            timestamp: Some(block.timestamp.into()),
+            parent_id: block.previous_id().as_bytes().to_vec(),
+            height: block.block_num() as u64,
+            bytes: block
+                .pack()
+                .map_err(|e| Status::internal(format!("could not pack block: {}", e)))?,
+            timestamp: Some(block.timestamp().into()),
             verify_with_context: false,
         }))
     }
@@ -316,9 +328,9 @@ impl Vm for VirtualMachine {
             .map_err(|_| Status::internal("could not parse block"))?;
         Ok(Response::new(vm::ParseBlockResponse {
             id: block.id().into(),
-            parent_id: block.parent_id.into(),
-            height: block.height,
-            timestamp: Some(block.timestamp.into()),
+            parent_id: block.previous_id().as_bytes().to_vec(),
+            height: block.block_num() as u64,
+            timestamp: Some(block.timestamp().into()),
             verify_with_context: false,
         }))
     }
@@ -341,10 +353,12 @@ impl Vm for VirtualMachine {
 
         if let Some(block) = block {
             return Ok(Response::new(vm::GetBlockResponse {
-                parent_id: block.parent_id.into(),
-                bytes: block.bytes(),
-                height: block.height,
-                timestamp: Some(block.timestamp.into()),
+                parent_id: block.previous_id().as_bytes().to_vec(),
+                bytes: block
+                    .pack()
+                    .map_err(|e| Status::internal(format!("could not pack block: {}", e)))?,
+                height: block.block_num() as u64,
+                timestamp: Some(block.timestamp().into()),
                 verify_with_context: false,
                 err: 0,
             }));
@@ -389,7 +403,7 @@ impl Vm for VirtualMachine {
         info!("block verified successfully: {}", block.id());
 
         Ok(Response::new(vm::BlockVerifyResponse {
-            timestamp: Some(block.timestamp.into()),
+            timestamp: Some(block.timestamp().into()),
         }))
     }
 
@@ -528,9 +542,9 @@ impl Vm for VirtualMachine {
                 .map_err(|_| Status::internal("could not parse block"))?;
             parsed_blocks.push(ParseBlockResponse {
                 id: block.id().into(),
-                parent_id: block.parent_id.into(),
-                height: block.height,
-                timestamp: Some(block.timestamp.into()),
+                parent_id: block.previous_id().as_bytes().to_vec(),
+                height: block.block_num() as u64,
+                timestamp: Some(block.timestamp().into()),
                 verify_with_context: false,
             });
         }
@@ -546,7 +560,7 @@ impl Vm for VirtualMachine {
         let controller = self.controller.clone();
         let controller = controller.read().await;
         let block = controller
-            .get_block_by_height(request.get_ref().height)
+            .get_block_by_height(request.get_ref().height as u32)
             .map_err(|_| Status::internal("could not get block by height"))?;
 
         if block.is_none() {
