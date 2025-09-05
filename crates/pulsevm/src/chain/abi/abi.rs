@@ -20,11 +20,20 @@ pub struct AbiFieldDefinition {
     pub type_name: String,
 }
 
+impl From<(String, String)> for AbiFieldDefinition {
+    fn from(item: (String, String)) -> Self {
+        AbiFieldDefinition {
+            name: item.0,
+            type_name: item.1,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Read, Write, NumBytes, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AbiStructDefinition {
-    pub name: String,
-    pub base: Option<String>,
-    pub fields: Vec<AbiFieldDefinition>,
+    #[serde(default)] pub name: String,
+    #[serde(default)] pub base: String,
+    #[serde(default)] pub fields: Vec<AbiFieldDefinition>,
 }
 
 #[derive(Debug, Clone, Read, Write, NumBytes, Serialize, Deserialize, PartialEq, Eq)]
@@ -32,7 +41,7 @@ pub struct AbiActionDefinition {
     pub name: String,
     #[serde(rename = "type")]
     pub type_name: String,
-    pub ricardian_contract: String,
+    #[serde(default)] pub ricardian_contract: String,
 }
 
 #[derive(Debug, Clone, Read, Write, NumBytes, Serialize, Deserialize, PartialEq, Eq)]
@@ -72,14 +81,22 @@ pub struct AbiActionResultDefinition {
 #[derive(Debug, Clone, Read, Write, NumBytes, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AbiDefinition {
     pub version: String,
+    #[serde(default)]
     pub types: Vec<AbiTypeDefinition>,
+    #[serde(default)]
     pub structs: Vec<AbiStructDefinition>,
+    #[serde(default)]
     pub actions: Vec<AbiActionDefinition>,
+    #[serde(default)]
     pub tables: Vec<AbiTableDefinition>,
+    #[serde(default)]
     pub ricardian_clauses: Vec<AbiClausePair>,
+    #[serde(default)]
     pub error_messages: Vec<AbiErrorMessage>,
-    pub variants: Option<Vec<AbiVariantDefinition>>,
-    pub action_results: Option<Vec<AbiActionResultDefinition>>,
+    #[serde(default)]
+    pub variants: Vec<AbiVariantDefinition>,
+    #[serde(default)]
+    pub action_results: Vec<AbiActionResultDefinition>,
 }
 
 impl AbiDefinition {
@@ -183,7 +200,7 @@ mod tests {
             types: vec![],
             structs: vec![AbiStructDefinition {
                 name: "test".to_string(),
-                base: None,
+                base: "".to_string(),
                 fields: vec![
                     AbiFieldDefinition {
                         name: "field1".to_string(),
@@ -251,8 +268,8 @@ mod tests {
             tables: vec![],
             ricardian_clauses: vec![],
             error_messages: vec![],
-            variants: None,
-            action_results: None,
+            variants: vec![],
+            action_results: vec![],
         };
         let struct_1 = TestStruct {
             field1: -5,

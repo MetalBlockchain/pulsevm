@@ -55,6 +55,7 @@ mod pulse_contract_types;
 pub use pulse_contract_types::*;
 
 mod pulse_contract;
+mod pulse_contract_abi;
 
 mod resource;
 pub use resource::*;

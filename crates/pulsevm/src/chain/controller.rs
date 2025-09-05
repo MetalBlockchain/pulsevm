@@ -7,13 +7,7 @@ use std::{
 
 use crate::{
     chain::{
-        ACTIVE_NAME, Account, AccountMetadata, Asset, BlockTimestamp, DELETEAUTH_NAME,
-        LINKAUTH_NAME, NEWACCOUNT_NAME, PackedTransaction, SETABI_NAME, SETCODE_NAME,
-        SignedTransaction, TransactionReceipt, UNLINKAUTH_NAME, UPDATEAUTH_NAME,
-        block::{BlockHeader, SignedBlock},
-        config::GlobalPropertyObject,
-        pulse_contract::{deleteauth, linkauth, unlinkauth},
-        transaction_context::TransactionResult,
+        block::{BlockHeader, SignedBlock}, config::GlobalPropertyObject, pulse_contract::{deleteauth, linkauth, unlinkauth}, pulse_contract_abi::get_pulse_contract_abi, transaction_context::TransactionResult, AbiDefinition, Account, AccountMetadata, Asset, BlockTimestamp, PackedTransaction, SignedTransaction, TransactionReceipt, ACTIVE_NAME, DELETEAUTH_NAME, LINKAUTH_NAME, NEWACCOUNT_NAME, SETABI_NAME, SETCODE_NAME, UNLINKAUTH_NAME, UPDATEAUTH_NAME
     },
     mempool::Mempool,
     state_history::StateHistoryLog,
@@ -27,10 +21,11 @@ use super::{
     pulse_contract::{newaccount, setabi, setcode, updateauth},
     wasm_runtime::WasmRuntime,
 };
+use anyhow::Chain;
 use chrono::Utc;
 use pulsevm_chainbase::{Database, UndoSession};
 use pulsevm_crypto::{Digest, merkle};
-use pulsevm_serialization::{Read, VarUint32};
+use pulsevm_serialization::{Read, VarUint32, Write};
 use ripemd::digest::block_buffer::Block;
 use spdlog::info;
 use tokio::sync::{RwLock as AsyncRwLock, broadcast};
@@ -179,11 +174,14 @@ impl Controller {
             .map_err(|e| {
                 ChainError::GenesisError(format!("failed to create pulse@owner permission: {}", e))
             })?;
+            let abi = get_pulse_contract_abi().pack().map_err(|e| {
+                ChainError::GenesisError(format!("failed to pack pulse abi: {}", e))
+            })?;
             session
                 .insert(&Account::new(
                     PULSE_NAME,
                     self.last_accepted_block().timestamp(),
-                    vec![],
+                    abi,
                 ))
                 .map_err(|e| {
                     ChainError::GenesisError(format!("failed to insert pulse account: {}", e))

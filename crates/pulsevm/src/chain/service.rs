@@ -42,7 +42,7 @@ pub trait Rpc {
     ) -> Result<IssueTxResponse, ErrorObjectOwned>;
 
     #[method(name = "pulsevm.getABI")]
-    async fn get_abi(&self, account: Name) -> Result<AbiDefinition, ErrorObjectOwned>;
+    async fn get_abi(&self, account_name: Name) -> Result<AbiDefinition, ErrorObjectOwned>;
 
     #[method(name = "pulsevm.getAccount")]
     async fn get_account(&self, account_name: Name)
@@ -138,14 +138,14 @@ impl RpcService {
 
 #[async_trait]
 impl RpcServer for RpcService {
-    async fn get_abi(&self, account: Name) -> Result<AbiDefinition, ErrorObjectOwned> {
+    async fn get_abi(&self, account_name: Name) -> Result<AbiDefinition, ErrorObjectOwned> {
         let controller = self.controller.clone();
         let controller = controller.read().await;
         let database = controller.database();
         let session = database
             .session()
             .map_err(|e| ErrorObjectOwned::owned(500, "database_error", Some(format!("{}", e))))?;
-        let code_account = session.get::<Account>(account.clone()).map_err(|e| {
+        let code_account = session.get::<Account>(account_name.clone()).map_err(|e| {
             ErrorObjectOwned::owned(404, "account_not_found", Some(format!("{}", e)))
         })?;
         let abi = AbiDefinition::read(&code_account.abi, &mut 0).map_err(|e| {
