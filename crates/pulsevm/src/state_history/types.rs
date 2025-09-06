@@ -50,6 +50,11 @@ pub struct GetBlocksResponseV0 {
     pub deltas: Option<Bytes>,
 }
 
+#[derive(Debug, Clone, Read, Write, NumBytes)]
+pub struct GetBlocksAckRequestV0 {
+    pub num_messages: u32,
+}
+
 #[derive(Clone, Read, Write, NumBytes)]
 pub struct AccountAuthSequence {
     pub account: Name,

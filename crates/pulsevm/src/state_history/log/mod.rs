@@ -394,6 +394,38 @@ impl StateHistoryLog {
             Some((self.first_block, self.last_block))
         }
     }
+
+    pub fn get_block_id(&self, block_num: u32) -> Result<Id, ShLogError> {
+        // Look up the on-disk offset from the in-memory map
+        let pos = {
+            let m = self.map.lock().unwrap();
+            *m.get(&block_num).ok_or(ShLogError::NotFound(block_num))?
+        };
+
+        // Read and validate the header at that position
+        let mut f = OpenOptions::new().read(true).open(&self.log_path)?;
+        let header = StateHistoryLogHeader::read_at(&mut f, pos)?;
+
+        if header.magic != self.magic {
+            return Err(ShLogError::BadMagic {
+                at: pos,
+                found: header.magic,
+                expect: self.magic,
+            });
+        }
+        if num_from_block_id(&header.block_id) != block_num {
+            return Err(ShLogError::Corrupt(pos));
+        }
+
+        // Guard against torn writes (header present but payload incomplete)
+        let len_total = f.metadata()?.len();
+        let end = pos + (StateHistoryLogHeader::SIZE as u64) + header.payload_size;
+        if end > len_total {
+            return Err(ShLogError::Corrupt(pos));
+        }
+
+        Ok(header.block_id)
+    }
 }
 
 /* -------------------- validation & scan (header-aware) -------------------- */

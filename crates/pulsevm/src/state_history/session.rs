@@ -1,30 +1,27 @@
 use std::{
     net::SocketAddr,
     str::FromStr,
-    sync::{Arc, atomic::AtomicI64},
+    sync::{atomic::{AtomicI64, Ordering}, Arc}, time::Duration,
 };
 
 use anyhow::{Result, anyhow};
 use futures_util::{SinkExt, StreamExt};
 use pulsevm_crypto::Bytes;
-use pulsevm_proc_macros::name;
-use pulsevm_serialization::{Read, VarUint32, Write};
-use pulsevm_time::TimePointSec;
-use tokio::sync::RwLock;
+use pulsevm_serialization::{Read, Write};
+use spdlog::{error, info};
+use tokio::{sync::{mpsc, watch::{self, Sender}, RwLock}, task::JoinHandle};
 use tokio_tungstenite::accept_async;
 use tungstenite::Message;
 
 use crate::{
     chain::{
-        ACTIVE_NAME, Action, Controller, Id, NEWACCOUNT_NAME, Name, PULSE_NAME, Permission,
-        PermissionLevel, Signature, TransactionStatus,
+        Controller, Id,
     },
     state_history::{
         abi::SHIP_ABI,
         request::RequestType,
         types::{
-            AccountAuthSequence, ActionReceiptV0, ActionTraceV1, BlockPosition, GetBlocksRequestV0,
-            GetBlocksResponseV0, GetStatusResult, PartialTransactionV0, TransactionTraceV0,
+            BlockPosition, GetBlocksAckRequestV0, GetBlocksRequestV0, GetBlocksResponseV0, GetStatusResult
         },
     },
 };
@@ -34,6 +31,9 @@ pub struct Session {
     controller: Arc<RwLock<Controller>>,
     current_request: Option<GetBlocksRequestV0>,
     to_send_block_num: u32,
+    // streaming control
+    stream_cancel: Option<Sender<()>>,
+    stream_handle: Option<JoinHandle<()>>,
 }
 
 impl Session {
@@ -43,21 +43,39 @@ impl Session {
             controller,
             current_request: None,
             to_send_block_num: 0,
+            stream_cancel: None,
+            stream_handle: None,
         }
     }
 
     pub async fn start(&mut self, stream: tokio::net::TcpStream) -> Result<()> {
-        let mut ws = accept_async(stream).await?;
+        let ws = accept_async(stream).await?;
 
         println!("{} connected; ABI sent", self.peer);
 
-        // 1) First frame must be the ABI (text)
-        ws.send(Message::Text(SHIP_ABI.to_string())).await?;
+        // Split socket once; dedicate a writer task fed by mpsc
+        let (mut sink, mut reader) = ws.split();
+        let (tx_out, mut rx_out) = mpsc::channel::<Message>(128);
 
+        let writer = tokio::spawn(async move {
+            while let Some(msg) = rx_out.recv().await {
+                if let Err(e) = sink.send(msg).await {
+                    eprintln!("writer: send failed: {e}");
+                    break;
+                }
+            }
+            // Try to finish the close handshake gracefully
+            let _ = sink.flush().await;
+            let _ = sink.close().await;
+        });
+
+        // ABI must be the first frame sent
+        tx_out.send(Message::Text(SHIP_ABI.to_string())).await.ok();
+
+        // messages-in-flight budget (incremented by ACKs)
         let in_flight_budget = Arc::new(AtomicI64::new(0));
-        let streaming = Arc::new(tokio::sync::watch::channel(false).0);
 
-        while let Some(msg) = ws.next().await {
+        while let Some(msg) = reader.next().await {
             let msg = msg?;
             match msg {
                 Message::Binary(b) => {
@@ -68,32 +86,107 @@ impl Session {
                         RequestType::GetStatusRequestV0 => {
                             let result = self.get_status().await?;
                             let packed = result.pack()?;
-                            ws.send(Message::Binary(packed)).await?;
+                            let _ = tx_out.send(Message::Binary(packed)).await;
                         }
                         RequestType::GetBlocksRequestV0 => {
-                            println!("{} get_blocks_request_v0 {}", self.peer, hex::encode(&b));
-                            let request = GetBlocksRequestV0::read(&b, &mut 1).map_err(|e| {
+                            let mut request = GetBlocksRequestV0::read(&b, &mut 1).map_err(|e| {
                                 anyhow!("failed to parse GetBlocksRequestV0: {:?}", e)
                             })?;
-                            self.update_current_request(&request).await?;
-                            println!("{} {:?}", self.peer, request);
-                            let result = self.get_block_response().await?;
-                            let result = result.pack()?;
-                            let hex_encoded = hex::encode(&result);
-                            println!("{} sending block response {}", self.peer, hex_encoded);
-                            ws.send(Message::Binary(result)).await?;
+                            self.update_current_request(&mut request).await?;
+
+                            // Initialize window (fallback if zero)
+                            let window = if request.max_messages_in_flight == 0 {
+                                16
+                            } else {
+                                request.max_messages_in_flight as i64
+                            };
+                            in_flight_budget.store(window, Ordering::SeqCst);
+
+                            // Cancel any previous stream
+                            if let Some(tx) = &self.stream_cancel {
+                                let _ = tx.send(());
+                            }
+                            if let Some(handle) = self.stream_handle.take() {
+                                // Immediate stop; comment if you prefer graceful await
+                                handle.abort();
+                                let _ = handle.await;
+                            }
+
+                            // New cancel channel for this stream
+                            let (stop_tx, mut stop_rx) = watch::channel(());
+                            self.stream_cancel = Some(stop_tx);
+
+                            // Spawn background producer
+                            let ctrl = self.controller.clone();
+                            let start_from = self.to_send_block_num;
+                            let tx_clone = tx_out.clone();
+                            let budget = in_flight_budget.clone();
+                            
+                            self.stream_handle = Some(tokio::spawn(async move {
+                                let mut next = start_from;
+
+                                loop {
+                                    // cooperative cancel
+                                    if stop_rx.has_changed().unwrap_or(false) {
+                                        break;
+                                    }
+
+                                    // backpressure window
+                                    if budget.fetch_sub(1, Ordering::SeqCst) <= 0 {
+                                        budget.fetch_add(1, Ordering::SeqCst);
+                                        tokio::time::sleep(Duration::from_millis(3)).await;
+                                        continue;
+                                    }
+
+                                    match make_block_response_for(ctrl.clone(), &request, next).await {
+                                        Ok(resp) => {
+                                            match resp.pack() {
+                                                Ok(bytes) => {
+                                                    if tx_clone.send(Message::Binary(bytes)).await.is_err() {
+                                                        // writer/socket is gone, stop
+                                                        break;
+                                                    }
+                                                    next = next.saturating_add(1);
+                                                }
+                                                Err(e) => {
+                                                    error!("pack failed for block {next}: {e}");
+                                                    // give window slot back
+                                                    budget.fetch_add(1, Ordering::SeqCst);
+                                                    tokio::time::sleep(Duration::from_millis(5)).await;
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            // Likely "block not ready yet" — backoff and retry
+                                            // return slot because nothing was sent
+                                            budget.fetch_add(1, Ordering::SeqCst);
+                                            error!("build response for block {next} failed: {e}");
+                                            tokio::time::sleep(Duration::from_millis(100)).await;
+                                        }
+                                    }
+
+                                    // react quickly to cancellation
+                                    if stop_rx.has_changed().unwrap_or(false) {
+                                        break;
+                                    }
+                                }
+                            }));
                         }
                         RequestType::GetBlocksAckRequestV0 => {
-                            println!("{} get_blocks_ack_request_v0", self.peer);
+                            let request = GetBlocksAckRequestV0::read(&b, &mut 1).map_err(|e| {
+                                anyhow!("failed to parse GetBlocksAckRequestV0: {:?}", e)
+                            })?;
+
+                            in_flight_budget.fetch_add(request.num_messages as i64, Ordering::SeqCst);
                         }
                     }
                 }
-                Message::Close(cf) => {
-                    let _ = ws.send(Message::Close(cf)).await;
-                    break;
-                }
                 Message::Ping(p) => {
-                    ws.send(Message::Pong(p)).await?;
+                    tx_out.send(Message::Pong(p)).await.ok();
+                }
+                Message::Close(cf) => {
+                    let _ = tx_out.send(Message::Close(cf)).await;
+                    break;
                 }
                 Message::Text(s) => {
                     // SHiP clients shouldn't send text after the ABI, but we won't crash.
@@ -103,8 +196,19 @@ impl Session {
             }
         }
 
-        // turn off streaming for any background producer
-        let _ = streaming.send_replace(false);
+        // Shut down any active stream
+        if let Some(tx) = &self.stream_cancel {
+            let _ = tx.send(());
+        }
+        if let Some(h) = self.stream_handle.take() {
+            h.abort();
+            let _ = h.await;
+        }
+
+        // Drop the tx to end the writer; then await it
+        drop(tx_out);
+        let _ = writer.await;
+
         Ok(())
     }
 
@@ -131,98 +235,28 @@ impl Session {
         })
     }
 
-    async fn get_block_response(&self) -> Result<GetBlocksResponseV0> {
+    pub async fn update_current_request(&mut self, req: &mut GetBlocksRequestV0) -> Result<()> {
         let controller = self.controller.read().await;
-        let head_block = controller.last_accepted_block();
-        let head_block_packed = head_block.pack()?;
-        let encoded = hex::encode(&head_block_packed);
-        let transaction_trace = TransactionTraceV0::new(
-            Id::default(),
-            TransactionStatus::Executed,
-            100,
-            VarUint32(10),
-            150,
-            10,
-            false,
-            vec![ActionTraceV1::new(
-                VarUint32(1),
-                VarUint32(1),
-                Some(
-                    ActionReceiptV0 {
-                        variant: 0,
-                        receiver: Name::new(name!("pulse")),
-                        act_digest: Default::default(),
-                        global_sequence: 1,
-                        recv_sequence: 1,
-                        auth_sequence: vec![AccountAuthSequence {
-                            account: Name::new(name!("pulse")),
-                            sequence: 1,
-                        }],
-                        code_sequence: VarUint32(1),
-                        abi_sequence: VarUint32(1),
-                    }
-                ),
-                Name::new(name!("pulse")),
-                Action::new(PULSE_NAME, NEWACCOUNT_NAME, vec![], vec![PermissionLevel::new(PULSE_NAME, ACTIVE_NAME)]),
-                false,
-                137,
-                "".to_owned(),
-                vec![],
-                None,
-                None,
-                Bytes::new(vec![]),
-            )],
-            None,
-            None,
-            None,
-            None,
-            Some(
-                PartialTransactionV0 {
-                    variant: 0,
-                    expiration: TimePointSec::from_str("2025-08-30T22:00:00Z").unwrap(),
-                    ref_block_num: head_block.block_num() as u16,
-                    ref_block_prefix: 0,
-                    max_cpu_usage_ms: 10,
-                    max_net_usage_words: VarUint32(100),
-                    delay_sec: VarUint32(0),
-                    context_free_data: vec![Bytes::new(vec![])],
-                    transaction_extensions: vec![],
-                    signatures: vec![
-                        Signature::from_str("SIG_K1_Kd1GbZcs4icCo3Ap25o7YJrTNyXDDBSctc22M2AAR2Zqbz9CfyYxHLwf79kLmaMbEQwAQmgewQ2ozJazxZ3J47mKsBC7kP").unwrap()
-                    ],
-                }
-            ),
-        );
-        let traces = vec![transaction_trace];
-        let packed = traces.pack()?;
 
-        Ok(GetBlocksResponseV0 {
-            variant: 1,
-            head: BlockPosition {
-                block_num: head_block.block_num(),
-                block_id: head_block.id(),
-            },
-            last_irreversible: BlockPosition {
-                block_num: head_block.block_num(),
-                block_id: head_block.id(),
-            },
-            this_block: Some(BlockPosition {
-                block_num: head_block.block_num(),
-                block_id: head_block.id(),
-            }),
-            prev_block: None,
-            block: Some(head_block_packed.into()),
-            traces: Some(packed.into()),
-            deltas: None,
-        })
-    }
-
-    pub async fn update_current_request(&mut self, req: &GetBlocksRequestV0) -> Result<()> {
         self.to_send_block_num = std::cmp::max(req.start_block_num, 1);
 
         for cp in req.have_positions.iter() {
             if req.start_block_num <= cp.block_num {
                 continue;
+            }
+
+            let id = controller.get_block_id(cp.block_num).await;
+
+            if id.is_none() || id.unwrap() != cp.block_id {
+                req.start_block_num = std::cmp::min(req.start_block_num, cp.block_num);
+            }
+
+            if id.is_none() {
+                self.to_send_block_num = std::cmp::min(self.to_send_block_num, cp.block_num);
+                info!("block {} is not available", cp.block_num);
+            } else if id.unwrap() != cp.block_id {
+                self.to_send_block_num = std::cmp::min(self.to_send_block_num, cp.block_num);
+                info!("the id for block {} in block request have_positions does not match the existing", cp.block_num);
             }
         }
 
@@ -230,6 +264,58 @@ impl Session {
 
         Ok(())
     }
+}
+
+// Builds a GetBlocksResponseV0 for a specific block number.
+// Replace internals with your real "get block by number" logic.
+// As-is, it waits until head >= block_num and then returns head as the block payload.
+async fn make_block_response_for(
+    controller: Arc<RwLock<Controller>>,
+    request: &GetBlocksRequestV0,
+    block_num: u32,
+) -> Result<GetBlocksResponseV0> {
+    let controller = controller.read().await;
+    let head = controller.last_accepted_block();
+
+    if head.block_num() < block_num {
+        return Err(anyhow!("block {block_num} not yet available"));
+    }
+
+    // TODO: replace with the actual block at `block_num`
+    let head_block_packed = head.pack()?;
+
+    // Get the requested block
+    let this_block_id = controller.get_block_id(block_num).await.ok_or(
+        anyhow!("block {block_num} not found, may not be available yet"),
+    )?;
+
+    // Get the previous block if it exists
+    let mut previous_block: Option<BlockPosition> = None;
+    if block_num > 1 {
+        if let Some(prev_id) = controller.get_block_id(block_num - 1).await {
+            previous_block = Some(BlockPosition { block_num: block_num - 1, block_id: prev_id });
+        }
+    }
+
+    let mut block: Option<Bytes> = None;
+    if request.fetch_block {
+        let signed_block = controller.get_block(this_block_id).map_err(|e| {
+            anyhow!("failed to get block {block_num} by id {this_block_id:?}: {e}")
+        })?.unwrap();
+        let signed_block_packed = signed_block.pack()?;
+        block = Some(Bytes::new(signed_block_packed));
+    }
+
+    Ok(GetBlocksResponseV0 {
+        variant: 1,
+        head: BlockPosition { block_num: head.block_num(), block_id: head.id() },
+        last_irreversible: BlockPosition { block_num: head.block_num(), block_id: head.id() },
+        this_block: Some(BlockPosition { block_num, block_id: this_block_id }),
+        prev_block: previous_block,
+        block: block,
+        traces: None,
+        deltas: None,
+    })
 }
 
 #[cfg(test)]

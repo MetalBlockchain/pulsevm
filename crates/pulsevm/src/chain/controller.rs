@@ -60,6 +60,8 @@ pub struct Controller {
 
     trace_log: Option<StateHistoryLog>,
     chain_state_log: Option<StateHistoryLog>,
+
+    pub on_accepted_block: broadcast::Sender<SignedBlock>,
 }
 
 #[derive(Debug)]
@@ -93,6 +95,8 @@ impl Controller {
 
             trace_log: None,
             chain_state_log: None,
+
+            on_accepted_block: broadcast::channel::<SignedBlock>(16).0,
         };
 
         controller
@@ -409,7 +413,7 @@ impl Controller {
         Ok(block.map(|b| b.id()))
     }
 
-    pub fn get_block(&mut self, id: Id) -> Result<Option<SignedBlock>, ChainError> {
+    pub fn get_block(&self, id: Id) -> Result<Option<SignedBlock>, ChainError> {
         self.db
             .session()?
             .find::<SignedBlock>(BlockHeader::num_from_id(&id))
@@ -485,6 +489,25 @@ impl Controller {
 
     pub fn chain_state_log(&self) -> Option<&StateHistoryLog> {
         self.chain_state_log.as_ref()
+    }
+
+    pub async fn get_block_id(&self, block_num: u32) -> Option<Id> {
+        let trace_log = self.trace_log();
+        let chain_state_log = self.chain_state_log();
+
+        if let Some(log) = trace_log {
+            if let Some(entry) = log.get_block_id(block_num).ok() {
+                return Some(entry);
+            }
+        }
+
+        if let Some(log) = chain_state_log {
+            if let Some(entry) = log.get_block_id(block_num).ok() {
+                return Some(entry);
+            }
+        }
+
+        None
     }
 }
 
