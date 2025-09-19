@@ -7,7 +7,15 @@ use std::{
 
 use crate::{
     chain::{
-        block::{BlockHeader, SignedBlock}, config::GlobalPropertyObject, pulse_contract::{deleteauth, linkauth, unlinkauth}, pulse_contract_abi::get_pulse_contract_abi, transaction_context::TransactionResult, AbiDefinition, Account, AccountMetadata, Asset, BlockTimestamp, PackedTransaction, SignedTransaction, TransactionReceipt, ACTIVE_NAME, DELETEAUTH_NAME, LINKAUTH_NAME, NEWACCOUNT_NAME, SETABI_NAME, SETCODE_NAME, UNLINKAUTH_NAME, UPDATEAUTH_NAME
+        ACTIVE_NAME, AbiDefinition, Account, AccountMetadata, Asset, BlockTimestamp,
+        DELETEAUTH_NAME, LINKAUTH_NAME, NEWACCOUNT_NAME, PackedTransaction, SETABI_NAME,
+        SETCODE_NAME, SignedTransaction, TransactionReceipt, TransactionTrace, UNLINKAUTH_NAME,
+        UPDATEAUTH_NAME,
+        block::{BlockHeader, SignedBlock},
+        config::GlobalPropertyObject,
+        pulse_contract::{deleteauth, linkauth, unlinkauth},
+        pulse_contract_abi::get_pulse_contract_abi,
+        transaction_context::TransactionResult,
     },
     mempool::Mempool,
     state_history::StateHistoryLog,
@@ -222,11 +230,8 @@ impl Controller {
             }
 
             let transaction = transaction.unwrap();
-            let transaction_result = self.execute_transaction(
-                &mut undo_session,
-                &transaction.get_signed_transaction(),
-                &timestamp,
-            )?;
+            let transaction_result =
+                self.execute_transaction(&mut undo_session, &transaction, &timestamp)?;
             let receipt = TransactionReceipt::new(
                 super::TransactionStatus::Executed,
                 0,
@@ -298,11 +303,18 @@ impl Controller {
         };
         let mut session = self.db.undo_session()?;
         let mut mempool = mempool.write().await;
-        self.execute_block(&block, &mut session, &mut mempool)
+        let transaction_traces = self
+            .execute_block(&block, &mut session, &mut mempool)
             .await?;
+        let packed_transaction_traces = transaction_traces.pack().map_err(|e| {
+            ChainError::TransactionError(format!(
+                "failed to pack transaction traces for block {}: {}",
+                block_id, e
+            ))
+        })?;
         self.trace_log
             .as_ref()
-            .map(|log| log.append(block_id.clone(), block.id().as_bytes()));
+            .map(|log| log.append(block_id.clone(), packed_transaction_traces.as_slice()));
         self.chain_state_log
             .as_ref()
             .map(|log| log.append(block_id.clone(), block.id().as_bytes()));
@@ -320,23 +332,28 @@ impl Controller {
         block: &SignedBlock,
         session: &mut UndoSession,
         mempool: &mut Mempool,
-    ) -> Result<(), ChainError> {
+    ) -> Result<(Vec<TransactionTrace>), ChainError> {
         // Make sure we don't have the block already
         let existing_block = session
             .find::<SignedBlock>(block.block_num())
             .map_err(|e| ChainError::TransactionError(format!("failed to find block: {}", e)))?;
 
         if existing_block.is_some() {
-            return Ok(());
+            return Ok(Vec::new());
         }
+
+        let mut transaction_traces: Vec<TransactionTrace> = Vec::new();
 
         for receipt in &block.transactions {
             // Verify the transaction
-            self.execute_transaction(
+            let result = self.execute_transaction(
                 session,
-                receipt.trx().get_signed_transaction(),
+                receipt.trx(),
                 &block.signed_block_header.block.timestamp,
             )?;
+
+            // Add trace to traces
+            transaction_traces.push(result.trace);
 
             // Remove from mempool if we have it
             mempool.remove_transaction(receipt.trx().id());
@@ -346,14 +363,14 @@ impl Controller {
             .insert(block)
             .map_err(|e| ChainError::TransactionError(format!("failed to insert block: {}", e)))?;
 
-        Ok(())
+        Ok(transaction_traces)
     }
 
     // This function will execute a transaction and roll it back instantly
     // This is useful for checking if a transaction is valid
     pub fn push_transaction(
         &mut self,
-        transaction: &SignedTransaction,
+        transaction: &PackedTransaction,
         pending_block_timestamp: &BlockTimestamp,
     ) -> Result<TransactionResult, ChainError> {
         let db = &self.db;
@@ -369,9 +386,11 @@ impl Controller {
     pub fn execute_transaction(
         &mut self,
         undo_session: &mut UndoSession,
-        signed_transaction: &SignedTransaction,
+        packed_transaction: &PackedTransaction,
         pending_block_timestamp: &BlockTimestamp,
     ) -> Result<TransactionResult, ChainError> {
+        let signed_transaction = packed_transaction.get_signed_transaction();
+
         {
             // Verify authority
             AuthorizationManager::check_authorization(
@@ -386,10 +405,15 @@ impl Controller {
         let mut trx_context = TransactionContext::new(
             undo_session.clone(),
             self.wasm_runtime.clone(),
+            self.last_accepted_block().block_num() + 1,
             pending_block_timestamp.clone(),
+            packed_transaction,
         );
 
-        return trx_context.exec(signed_transaction.transaction());
+        trx_context.exec(signed_transaction.transaction())?;
+        let result = trx_context.finalize()?;
+
+        Ok(result)
     }
 
     pub fn last_accepted_block(&self) -> &SignedBlock {
@@ -491,23 +515,29 @@ impl Controller {
         self.chain_state_log.as_ref()
     }
 
-    pub async fn get_block_id(&self, block_num: u32) -> Option<Id> {
+    pub async fn get_block_id(&self, block_num: u32) -> Result<Option<Id>, ChainError> {
         let trace_log = self.trace_log();
         let chain_state_log = self.chain_state_log();
 
         if let Some(log) = trace_log {
             if let Some(entry) = log.get_block_id(block_num).ok() {
-                return Some(entry);
+                return Ok(Some(entry));
             }
         }
 
         if let Some(log) = chain_state_log {
             if let Some(entry) = log.get_block_id(block_num).ok() {
-                return Some(entry);
+                return Ok(Some(entry));
             }
         }
 
-        None
+        let session = self.db.session()?;
+        let block = session.find::<SignedBlock>(block_num)?;
+        if let Some(block) = block {
+            return Ok(Some(block.id()));
+        }
+
+        Ok(None)
     }
 }
 
@@ -592,8 +622,8 @@ mod tests {
     fn create_account(
         private_key: &PrivateKey,
         account: Name,
-    ) -> Result<SignedTransaction, ChainError> {
-        Transaction::new(
+    ) -> Result<PackedTransaction, ChainError> {
+        let trx = Transaction::new(
             TransactionHeader::new(TimePointSec::new(0), 0, 0, 0u32.into(), 0, 0u32.into()),
             vec![],
             vec![Action::new(
@@ -623,15 +653,17 @@ mod tests {
                 )],
             )],
         )
-        .sign(&private_key, &Id::default())
+        .sign(&private_key, &Id::default())?;
+        let packed_trx = PackedTransaction::from_signed_transaction(trx)?;
+        Ok(packed_trx)
     }
 
     fn set_code(
         private_key: &PrivateKey,
         account: Name,
         wasm_bytes: Vec<u8>,
-    ) -> Result<SignedTransaction, ChainError> {
-        Transaction::new(
+    ) -> Result<PackedTransaction, ChainError> {
+        let trx = Transaction::new(
             TransactionHeader::new(TimePointSec::new(0), 0, 0, 0u32.into(), 0, 0u32.into()),
             vec![],
             vec![Action::new(
@@ -651,7 +683,9 @@ mod tests {
                 )],
             )],
         )
-        .sign(&private_key, &Id::default())
+        .sign(&private_key, &Id::default())?;
+        let packed_trx = PackedTransaction::from_signed_transaction(trx)?;
+        Ok(packed_trx)
     }
 
     fn call_contract<T: Write>(
@@ -659,8 +693,8 @@ mod tests {
         account: Name,
         action: Name,
         action_data: &T,
-    ) -> Result<SignedTransaction, ChainError> {
-        Transaction::new(
+    ) -> Result<PackedTransaction, ChainError> {
+        let trx = Transaction::new(
             TransactionHeader::new(TimePointSec::new(0), 0, 0, 0u32.into(), 0, 0u32.into()),
             vec![],
             vec![Action::new(
@@ -673,7 +707,9 @@ mod tests {
                 )],
             )],
         )
-        .sign(&private_key, &Id::default())
+        .sign(&private_key, &Id::default())?;
+        let packed_trx = PackedTransaction::from_signed_transaction(trx)?;
+        Ok(packed_trx)
     }
 
     #[test]

@@ -1,12 +1,17 @@
 use std::{
     cell::RefCell,
+    collections::HashMap,
     rc::Rc,
     sync::{Arc, RwLock, atomic::AtomicI64},
 };
 
 use pulsevm_chainbase::UndoSession;
+use pulsevm_crypto::Digest;
 
-use crate::chain::{BlockTimestamp, TransactionTrace, wasm_runtime::WasmRuntime};
+use crate::chain::{
+    ActionReceipt, BlockTimestamp, PackedTransaction, TransactionReceiptHeader, TransactionStatus,
+    TransactionTrace, wasm_runtime::WasmRuntime,
+};
 
 use super::{
     Action, ActionTrace, Name, Transaction, apply_context::ApplyContext, error::ChainError,
@@ -31,19 +36,26 @@ impl TransactionContext {
     pub fn new(
         session: UndoSession,
         wasm_runtime: Arc<RwLock<WasmRuntime>>,
+        block_num: u32,
         pending_block_timestamp: BlockTimestamp,
+        transaction: &PackedTransaction,
     ) -> Self {
+        let mut trace = TransactionTrace::default();
+        trace.id = transaction.id().clone();
+        trace.block_num = block_num;
+        trace.block_time = pending_block_timestamp;
+
         Self {
             session,
             wasm_runtime,
             pending_block_timestamp,
 
-            trace: Rc::new(RefCell::new(TransactionTrace::default())),
+            trace: Rc::new(RefCell::new(trace)),
             billed_cpu_time_us: Rc::new(AtomicI64::new(0)),
         }
     }
 
-    pub fn exec(&mut self, transaction: &Transaction) -> Result<TransactionResult, ChainError> {
+    pub fn exec(&mut self, transaction: &Transaction) -> Result<(), ChainError> {
         for action in transaction.actions.iter() {
             self.schedule_action(action, &action.account(), false, 0, 0);
         }
@@ -53,14 +65,7 @@ impl TransactionContext {
             self.execute_action(i as u32, 0)?;
         }
 
-        let trace = { self.trace.borrow().clone() };
-        let billed_cpu_time_us = self
-            .billed_cpu_time_us
-            .load(std::sync::atomic::Ordering::Relaxed);
-        Ok(TransactionResult {
-            trace,
-            billed_cpu_time_us,
-        })
+        Ok(())
     }
 
     pub fn schedule_action(
@@ -114,7 +119,7 @@ impl TransactionContext {
             block_num,
             block_time,
             &provided_action,
-            *receiver,
+            receiver.clone(),
             context_free,
             new_action_ordinal,
             creator_action_ordinal,
@@ -162,7 +167,40 @@ impl TransactionContext {
         )))
     }
 
+    pub fn modify_action_trace<F>(&self, action_ordinal: u32, modify: F) -> Result<(), ChainError>
+    where
+        F: FnOnce(&mut ActionTrace) -> ActionTrace,
+    {
+        let mut trace = self.trace.borrow_mut();
+        let trace = trace.action_traces.get_mut((action_ordinal as usize) - 1);
+
+        if let Some(trace) = trace {
+            *trace = modify(trace);
+            Ok(())
+        } else {
+            Err(ChainError::TransactionError(format!(
+                "failed to update action trace by ordinal {}",
+                action_ordinal
+            )))
+        }
+    }
+
     pub fn pending_block_timestamp(&self) -> BlockTimestamp {
         self.pending_block_timestamp
+    }
+
+    pub fn finalize(&self) -> Result<TransactionResult, ChainError> {
+        let mut trace = self.trace.borrow_mut();
+        let receipt = TransactionReceiptHeader::new(TransactionStatus::Executed, 0, 0);
+        trace.receipt = receipt;
+
+        let billed_cpu_time_us = self
+            .billed_cpu_time_us
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        Ok(TransactionResult {
+            trace: trace.clone(),
+            billed_cpu_time_us,
+        })
     }
 }

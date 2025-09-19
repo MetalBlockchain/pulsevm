@@ -162,10 +162,9 @@ impl ApplyContext {
         } else {
             self.get_account_metadata(self.action.account())?
         };
-        let mut trace = self.trx_context.get_action_trace(self.action_ordinal)?;
         let mut receipt = ActionReceipt::new(
             self.receiver,
-            act_digest.into(),
+            act_digest,
             self.next_global_sequence()?,
             self.next_recv_sequence(&mut receiver_account)?,
             HashMap::new(),
@@ -178,19 +177,24 @@ impl ApplyContext {
             receipt.add_auth_sequence(auth.actor(), self.next_auth_sequence(&mut auth.actor())?);
         }
 
-        self.finalize_trace(&mut trace);
+        self.finalize_trace(receipt)?;
 
         Ok(())
     }
 
-    pub fn finalize_trace(&self, trace: &mut ActionTrace) {
-        trace.set_elapsed((Utc::now().timestamp_micros() - self.start) as u32);
-        println!(
-            "Action Trace: Elapsed: {} micros, Receiver: {}, Action: {}",
-            trace.elapsed(),
-            self.receiver,
-            self.action.name()
-        );
+    pub fn finalize_trace(&self, receipt: ActionReceipt) -> Result<(), ChainError> {
+        self.trx_context.modify_action_trace(self.action_ordinal, |trace| {
+            trace.receipt = Some(receipt);
+            trace.set_elapsed((Utc::now().timestamp_micros() - self.start) as u32);
+            println!(
+                "Action Trace: Elapsed: {} micros, Receiver: {}, Action: {}",
+                trace.elapsed(),
+                self.receiver,
+                self.action.name()
+            );
+            trace.clone()
+        })?;
+        Ok(())
     }
 
     pub fn get_action(&self) -> &Action {

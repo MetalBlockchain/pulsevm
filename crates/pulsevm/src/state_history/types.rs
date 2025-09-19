@@ -189,3 +189,76 @@ impl TransactionTraceV0 {
         }
     }
 }
+
+impl From<&TransactionTrace> for TransactionTraceV0 {
+    fn from(trace: &TransactionTrace) -> Self {
+        println!("{} traces", trace.action_traces.len());
+        let action_traces = trace
+            .action_traces()
+            .into_iter()
+            .map(|at| {
+                ActionTraceV1::new(
+                    VarUint32(at.action_ordinal()),
+                    VarUint32(at.creator_action_ordinal()),
+                    at.receipt.as_ref().map(|receipt| ActionReceiptV0 {
+                        variant: 0,
+                        receiver: receipt.receiver,
+                        act_digest: receipt.act_digest,
+                        global_sequence: receipt.global_sequence,
+                        recv_sequence: receipt.recv_sequence,
+                        auth_sequence: receipt
+                            .auth_sequence
+                            .iter()
+                            .map(|(k, v)| AccountAuthSequence {
+                                account: *k,
+                                sequence: *v,
+                            })
+                            .collect(),
+                        code_sequence: VarUint32(receipt.code_sequence),
+                        abi_sequence: VarUint32(receipt.abi_sequence),
+                    }),
+                    at.receiver(),
+                    at.act.clone(),
+                    at.context_free,
+                    at.elapsed as i64,
+                    at.console.clone(),
+                    vec![], // Placeholder for account RAM deltas, not implemented yet
+                    None,
+                    None,
+                    Bytes::new(at.return_value.clone()),
+                )
+            })
+            .collect();
+
+        let receipt = trace.receipt.clone();
+
+        println!("Converted receipt: {}", receipt.status);
+
+        TransactionTraceV0::new(
+            trace.id.clone(),
+            receipt.status,
+            receipt.cpu_usage_us,
+            VarUint32(trace.net_usage as u32),
+            trace.elapsed as i64,
+            trace.net_usage,
+            trace.scheduled,
+            action_traces,
+            trace.account_ram_delta.clone(),
+            None,
+            None,
+            None,
+            Some(PartialTransactionV0 {
+                variant: 0,
+                expiration: TimePointSec::min(),
+                ref_block_num: 0,
+                ref_block_prefix: 0,
+                max_net_usage_words: VarUint32(0),
+                max_cpu_usage_ms: 0,
+                delay_sec: VarUint32(0),
+                transaction_extensions: vec![],
+                signatures: vec![],
+                context_free_data: vec![],
+            }), // Placeholder for partial transaction, not implemented yet
+        )
+    }
+}

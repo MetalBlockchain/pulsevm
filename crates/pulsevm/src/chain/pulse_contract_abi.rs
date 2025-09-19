@@ -1,4 +1,8 @@
-use crate::chain::{AbiActionDefinition, AbiDefinition, AbiStructDefinition};
+use crate::chain::{
+    AbiActionDefinition, AbiDefinition, AbiStructDefinition, AbiTypeDefinition, DELETEAUTH_NAME,
+    LINKAUTH_NAME, NEWACCOUNT_NAME, ONBLOCK_NAME, ONERROR_NAME, SETABI_NAME, SETCODE_NAME,
+    UNLINKAUTH_NAME, UPDATEAUTH_NAME,
+};
 
 pub fn get_pulse_contract_abi() -> AbiDefinition {
     AbiDefinition {
@@ -48,7 +52,11 @@ pub fn get_pulse_contract_abi() -> AbiDefinition {
                 fields: vec![
                     ("context_free_actions".to_owned(), "action[]".to_owned()).into(),
                     ("actions".to_owned(), "action[]".to_owned()).into(),
-                    ("transaction_extensions".to_owned(), "extension[]".to_owned()).into(),
+                    (
+                        "transaction_extensions".to_owned(),
+                        "extension[]".to_owned(),
+                    )
+                        .into(),
                 ],
             },
             AbiStructDefinition {
@@ -112,7 +120,11 @@ pub fn get_pulse_contract_abi() -> AbiDefinition {
                 fields: vec![
                     ("threshold".to_owned(), "uint32".to_owned()).into(),
                     ("keys".to_owned(), "key_weight[]".to_owned()).into(),
-                    ("accounts".to_owned(), "permission_level_weight[]".to_owned()).into(),
+                    (
+                        "accounts".to_owned(),
+                        "permission_level_weight[]".to_owned(),
+                    )
+                        .into(),
                     ("waits".to_owned(), "wait_weight[]".to_owned()).into(),
                 ],
             },
@@ -192,62 +204,90 @@ pub fn get_pulse_contract_abi() -> AbiDefinition {
             AbiStructDefinition {
                 name: "onblock".to_string(),
                 base: "".to_string(),
-                fields: vec![
-                    ("header".to_owned(), "block_header".to_owned()).into(),
-                ],
+                fields: vec![("header".to_owned(), "block_header".to_owned()).into()],
             },
         ],
         actions: vec![
             AbiActionDefinition {
-                name: "newaccount".to_string(),
+                name: NEWACCOUNT_NAME,
                 type_name: "newaccount".to_string(),
                 ricardian_contract: "".to_string(),
             },
             AbiActionDefinition {
-                name: "setcode".to_string(),
+                name: SETCODE_NAME,
                 type_name: "setcode".to_string(),
                 ricardian_contract: "".to_string(),
             },
             AbiActionDefinition {
-                name: "setabi".to_string(),
+                name: SETABI_NAME,
                 type_name: "setabi".to_string(),
                 ricardian_contract: "".to_string(),
             },
             AbiActionDefinition {
-                name: "updateauth".to_string(),
+                name: UPDATEAUTH_NAME,
                 type_name: "updateauth".to_string(),
                 ricardian_contract: "".to_string(),
             },
             AbiActionDefinition {
-                name: "deleteauth".to_string(),
+                name: DELETEAUTH_NAME,
                 type_name: "deleteauth".to_string(),
                 ricardian_contract: "".to_string(),
             },
             AbiActionDefinition {
-                name: "linkauth".to_string(),
+                name: LINKAUTH_NAME,
                 type_name: "linkauth".to_string(),
                 ricardian_contract: "".to_string(),
             },
             AbiActionDefinition {
-                name: "unlinkauth".to_string(),
+                name: UNLINKAUTH_NAME,
                 type_name: "unlinkauth".to_string(),
                 ricardian_contract: "".to_string(),
             },
             AbiActionDefinition {
-                name: "onerror".to_string(),
+                name: ONERROR_NAME,
                 type_name: "onerror".to_string(),
                 ricardian_contract: "".to_string(),
             },
             AbiActionDefinition {
-                name: "onblock".to_string(),
+                name: ONBLOCK_NAME,
                 type_name: "onblock".to_string(),
                 ricardian_contract: "".to_string(),
-            }
+            },
         ],
-        types: vec![],
+        types: vec![
+            AbiTypeDefinition {
+                new_type_name: "account_name".to_string(),
+                type_name: "name".to_string(),
+            },
+            AbiTypeDefinition {
+                new_type_name: "permission_name".to_string(),
+                type_name: "name".to_string(),
+            },
+            AbiTypeDefinition {
+                new_type_name: "action_name".to_string(),
+                type_name: "name".to_string(),
+            },
+            AbiTypeDefinition {
+                new_type_name: "table_name".to_string(),
+                type_name: "name".to_string(),
+            },
+            AbiTypeDefinition {
+                new_type_name: "transaction_id_type".to_string(),
+                type_name: "checksum256".to_string(),
+            },
+            AbiTypeDefinition {
+                new_type_name: "block_id_type".to_string(),
+                type_name: "checksum256".to_string(),
+            },
+            AbiTypeDefinition {
+                new_type_name: "weight_type".to_string(),
+                type_name: "uint16".to_string(),
+            },
+        ],
         tables: vec![],
         ricardian_clauses: vec![],
         error_messages: vec![],
+        abi_extensions: vec![],
         variants: vec![],
         action_results: vec![],
     }

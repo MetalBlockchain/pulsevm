@@ -436,10 +436,7 @@ impl RpcServer for RpcService {
         let mut controller = controller.write().await;
         let pending_block_timestamp = BlockTimestamp::now();
         controller
-            .push_transaction(
-                packed_trx.get_signed_transaction(),
-                &pending_block_timestamp,
-            )
+            .push_transaction(&packed_trx, &pending_block_timestamp)
             .map_err(|e| {
                 println!("Failed to push transaction: {}", e);
                 ErrorObjectOwned::owned(500, "transaction_error", Some(format!("{}", e)))
@@ -627,9 +624,7 @@ fn get_table_rows_ex(
 fn get_table_index_type(abi: &AbiDefinition, table_name: &Name) -> Result<String, ChainError> {
     for table in abi.tables.iter() {
         if &table.name == table_name {
-            if let Some(index_type) = &table.index_type {
-                return Ok(index_type.clone());
-            }
+            return Ok(table.index_type.clone());
         }
     }
 

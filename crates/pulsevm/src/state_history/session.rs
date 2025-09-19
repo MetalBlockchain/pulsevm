@@ -1,7 +1,11 @@
 use std::{
     net::SocketAddr,
     str::FromStr,
-    sync::{atomic::{AtomicI64, Ordering}, Arc}, time::Duration,
+    sync::{
+        Arc,
+        atomic::{AtomicI64, Ordering},
+    },
+    time::Duration,
 };
 
 use anyhow::{Result, anyhow};
@@ -9,19 +13,24 @@ use futures_util::{SinkExt, StreamExt};
 use pulsevm_crypto::Bytes;
 use pulsevm_serialization::{Read, Write};
 use spdlog::{error, info};
-use tokio::{sync::{mpsc, watch::{self, Sender}, RwLock}, task::JoinHandle};
+use tokio::{
+    sync::{
+        RwLock, mpsc,
+        watch::{self, Sender},
+    },
+    task::JoinHandle,
+};
 use tokio_tungstenite::accept_async;
 use tungstenite::Message;
 
 use crate::{
-    chain::{
-        Controller, Id,
-    },
+    chain::{Controller, Id, TransactionTrace},
     state_history::{
         abi::SHIP_ABI,
         request::RequestType,
         types::{
-            BlockPosition, GetBlocksAckRequestV0, GetBlocksRequestV0, GetBlocksResponseV0, GetStatusResult
+            BlockPosition, GetBlocksAckRequestV0, GetBlocksRequestV0, GetBlocksResponseV0,
+            GetStatusResult, TransactionTraceV0,
         },
     },
 };
@@ -89,9 +98,10 @@ impl Session {
                             let _ = tx_out.send(Message::Binary(packed)).await;
                         }
                         RequestType::GetBlocksRequestV0 => {
-                            let mut request = GetBlocksRequestV0::read(&b, &mut 1).map_err(|e| {
-                                anyhow!("failed to parse GetBlocksRequestV0: {:?}", e)
-                            })?;
+                            let mut request =
+                                GetBlocksRequestV0::read(&b, &mut 1).map_err(|e| {
+                                    anyhow!("failed to parse GetBlocksRequestV0: {:?}", e)
+                                })?;
                             self.update_current_request(&mut request).await?;
 
                             // Initialize window (fallback if zero)
@@ -121,7 +131,7 @@ impl Session {
                             let start_from = self.to_send_block_num;
                             let tx_clone = tx_out.clone();
                             let budget = in_flight_budget.clone();
-                            
+
                             self.stream_handle = Some(tokio::spawn(async move {
                                 let mut next = start_from;
 
@@ -138,11 +148,17 @@ impl Session {
                                         continue;
                                     }
 
-                                    match make_block_response_for(ctrl.clone(), &request, next).await {
+                                    match make_block_response_for(ctrl.clone(), &request, next)
+                                        .await
+                                    {
                                         Ok(resp) => {
                                             match resp.pack() {
                                                 Ok(bytes) => {
-                                                    if tx_clone.send(Message::Binary(bytes)).await.is_err() {
+                                                    if tx_clone
+                                                        .send(Message::Binary(bytes))
+                                                        .await
+                                                        .is_err()
+                                                    {
                                                         // writer/socket is gone, stop
                                                         break;
                                                     }
@@ -152,7 +168,8 @@ impl Session {
                                                     error!("pack failed for block {next}: {e}");
                                                     // give window slot back
                                                     budget.fetch_add(1, Ordering::SeqCst);
-                                                    tokio::time::sleep(Duration::from_millis(5)).await;
+                                                    tokio::time::sleep(Duration::from_millis(5))
+                                                        .await;
                                                 }
                                             }
                                         }
@@ -161,7 +178,7 @@ impl Session {
                                             // return slot because nothing was sent
                                             budget.fetch_add(1, Ordering::SeqCst);
                                             error!("build response for block {next} failed: {e}");
-                                            tokio::time::sleep(Duration::from_millis(100)).await;
+                                            tokio::time::sleep(Duration::from_millis(500)).await;
                                         }
                                     }
 
@@ -177,7 +194,8 @@ impl Session {
                                 anyhow!("failed to parse GetBlocksAckRequestV0: {:?}", e)
                             })?;
 
-                            in_flight_budget.fetch_add(request.num_messages as i64, Ordering::SeqCst);
+                            in_flight_budget
+                                .fetch_add(request.num_messages as i64, Ordering::SeqCst);
                         }
                     }
                 }
@@ -245,7 +263,7 @@ impl Session {
                 continue;
             }
 
-            let id = controller.get_block_id(cp.block_num).await;
+            let id = controller.get_block_id(cp.block_num).await?;
 
             if id.is_none() || id.unwrap() != cp.block_id {
                 req.start_block_num = std::cmp::min(req.start_block_num, cp.block_num);
@@ -256,7 +274,10 @@ impl Session {
                 info!("block {} is not available", cp.block_num);
             } else if id.unwrap() != cp.block_id {
                 self.to_send_block_num = std::cmp::min(self.to_send_block_num, cp.block_num);
-                info!("the id for block {} in block request have_positions does not match the existing", cp.block_num);
+                info!(
+                    "the id for block {} in block request have_positions does not match the existing",
+                    cp.block_num
+                );
             }
         }
 
@@ -281,39 +302,68 @@ async fn make_block_response_for(
         return Err(anyhow!("block {block_num} not yet available"));
     }
 
-    // TODO: replace with the actual block at `block_num`
-    let head_block_packed = head.pack()?;
-
     // Get the requested block
-    let this_block_id = controller.get_block_id(block_num).await.ok_or(
-        anyhow!("block {block_num} not found, may not be available yet"),
-    )?;
+    let this_block_id = controller.get_block_id(block_num).await?.ok_or(anyhow!(
+        "block {block_num} not found, may not be available yet",
+    ))?;
 
     // Get the previous block if it exists
     let mut previous_block: Option<BlockPosition> = None;
     if block_num > 1 {
-        if let Some(prev_id) = controller.get_block_id(block_num - 1).await {
-            previous_block = Some(BlockPosition { block_num: block_num - 1, block_id: prev_id });
+        if let Some(prev_id) = controller.get_block_id(block_num - 1).await? {
+            previous_block = Some(BlockPosition {
+                block_num: block_num - 1,
+                block_id: prev_id,
+            });
         }
     }
 
     let mut block: Option<Bytes> = None;
     if request.fetch_block {
-        let signed_block = controller.get_block(this_block_id).map_err(|e| {
-            anyhow!("failed to get block {block_num} by id {this_block_id:?}: {e}")
-        })?.unwrap();
+        let signed_block = controller
+            .get_block(this_block_id)
+            .map_err(|e| anyhow!("failed to get block {block_num} by id {this_block_id:?}: {e}"))?
+            .unwrap();
         let signed_block_packed = signed_block.pack()?;
         block = Some(Bytes::new(signed_block_packed));
     }
 
+    let mut traces: Option<Bytes> = None;
+    if request.fetch_traces && block_num > 1 {
+        let trace_log = controller.trace_log();
+
+        if let Some(log) = &trace_log {
+            if let Ok(packed_traces) = log.read_block(block_num) {
+                let transaction_traces: Vec<TransactionTrace> =
+                    Vec::read(&packed_traces, &mut 0)
+                        .map_err(|e| anyhow!("failed to read traces for block {block_num}: {e}"))?;
+                let converted_traces = transaction_traces
+                    .iter()
+                    .map(|t| TransactionTraceV0::from(t))
+                    .collect::<Vec<TransactionTraceV0>>();
+                let packed_converted_traces = converted_traces.pack()?;
+                traces = Some(Bytes::new(packed_converted_traces));
+            }
+        }
+    }
+
     Ok(GetBlocksResponseV0 {
         variant: 1,
-        head: BlockPosition { block_num: head.block_num(), block_id: head.id() },
-        last_irreversible: BlockPosition { block_num: head.block_num(), block_id: head.id() },
-        this_block: Some(BlockPosition { block_num, block_id: this_block_id }),
+        head: BlockPosition {
+            block_num: head.block_num(),
+            block_id: head.id(),
+        },
+        last_irreversible: BlockPosition {
+            block_num: head.block_num(),
+            block_id: head.id(),
+        },
+        this_block: Some(BlockPosition {
+            block_num,
+            block_id: this_block_id,
+        }),
         prev_block: previous_block,
         block: block,
-        traces: None,
+        traces: traces,
         deltas: None,
     })
 }
@@ -326,11 +376,22 @@ mod tests {
     use pulsevm_serialization::{VarUint32, Write};
     use pulsevm_time::TimePointSec;
 
-    use crate::{chain::{AccountDelta, Action, Id, Name, PermissionLevel, Signature, TransactionStatus, ACTIVE_NAME, NEWACCOUNT_NAME, PULSE_NAME}, state_history::types::{AccountAuthSequence, ActionReceiptV0, ActionTraceV1, BlockPosition, GetBlocksResponseV0, PartialTransactionV0, TransactionTraceV0}};
+    use crate::{
+        chain::{
+            ACTIVE_NAME, AccountDelta, Action, Id, NEWACCOUNT_NAME, Name, PULSE_NAME,
+            PermissionLevel, Signature, TransactionStatus,
+        },
+        state_history::types::{
+            AccountAuthSequence, ActionReceiptV0, ActionTraceV1, BlockPosition,
+            GetBlocksResponseV0, PartialTransactionV0, TransactionTraceV0,
+        },
+    };
 
     #[test]
     fn it_works() {
-        let block_id = Id::from_str("384da888112027f0321850a169f737c33e53b388aad48b5adace4bab97f437e0").unwrap();
+        let block_id =
+            Id::from_str("384da888112027f0321850a169f737c33e53b388aad48b5adace4bab97f437e0")
+                .unwrap();
         let transaction_trace = TransactionTraceV0::new(
             block_id,
             TransactionStatus::Executed,

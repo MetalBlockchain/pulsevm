@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::chain::error::ChainError;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, Read, Write, NumBytes)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default, Read, Write, NumBytes,
+)]
 pub struct Name(u64);
 
 impl Name {

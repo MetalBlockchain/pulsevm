@@ -1,31 +1,33 @@
-use pulsevm_proc_macros::Read;
+use core::fmt;
 
-use crate::chain::{Action, ActionReceipt, Id, Name, error::ChainError};
+use pulsevm_proc_macros::{NumBytes, Read, Write};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+use crate::chain::{Action, ActionReceipt, BlockTimestamp, Id, Name, error::ChainError};
+
+#[derive(Debug, Clone, PartialEq, Eq, Read, Write, NumBytes)]
 pub struct ActionTrace {
-    action_ordinal: u32,
-    creator_action_ordinal: u32,
-    closest_unnotified_ancestor_action_ordinal: u32,
-    receipt: Option<ActionReceipt>,
-    receiver: Name,
+    pub action_ordinal: u32,
+    pub creator_action_ordinal: u32,
+    pub closest_unnotified_ancestor_action_ordinal: u32,
+    pub receipt: Option<ActionReceipt>,
+    pub receiver: Name,
     pub act: Action,
-    context_free: bool,
-    elapsed: u32,
-    console: String,
-    trx_id: Id,
-    block_num: u32,
-    block_time: u32,
-    except: Option<ChainError>,
-    error_code: Option<u64>,
-    return_value: Vec<u8>,
+    pub context_free: bool,
+    pub elapsed: u32,
+    pub console: String,
+    pub trx_id: Id,
+    pub block_num: u32,
+    pub block_time: BlockTimestamp,
+    pub except: Option<u8>,
+    pub error_code: Option<u64>,
+    pub return_value: Vec<u8>,
 }
 
 impl ActionTrace {
     pub fn new(
         trx_id: Id,
         block_num: u32,
-        block_time: u32,
+        block_time: BlockTimestamp,
         act: &Action,
         receiver: Name,
         context_free: bool,
@@ -74,5 +76,24 @@ impl ActionTrace {
 
     pub fn set_elapsed(&mut self, elapsed: u32) {
         self.elapsed = elapsed;
+    }
+}
+
+impl fmt::Display for ActionTrace {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "action_trace {{ action_ordinal: {}, creator_action_ordinal: {}, receiver: {}, act: {}, context_free: {}, elapsed: {}, console: {}, except: {:?}, error_code: {:?}, return_value: {:?} }}",
+            self.action_ordinal,
+            self.creator_action_ordinal,
+            self.receiver,
+            self.act,
+            self.context_free,
+            self.elapsed,
+            self.console,
+            self.except,
+            self.error_code,
+            self.return_value
+        )
     }
 }

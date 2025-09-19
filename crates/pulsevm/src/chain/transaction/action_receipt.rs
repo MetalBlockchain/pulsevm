@@ -1,22 +1,25 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+
+use pulsevm_crypto::Digest;
+use pulsevm_proc_macros::{NumBytes, Read, Write};
 
 use crate::chain::{Id, Name};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Read, Write, NumBytes)]
 pub struct ActionReceipt {
-    receiver: Name,
-    act_digest: Id,
-    global_sequence: u64,
-    recv_sequence: u64,
-    auth_sequence: HashMap<Name, u64>,
-    code_sequence: u32,
-    abi_sequence: u32,
+    pub receiver: Name,
+    pub act_digest: Digest,
+    pub global_sequence: u64,
+    pub recv_sequence: u64,
+    pub auth_sequence: HashMap<Name, u64>,
+    pub code_sequence: u32,
+    pub abi_sequence: u32,
 }
 
 impl ActionReceipt {
     pub fn new(
         receiver: Name,
-        act_digest: Id,
+        act_digest: Digest,
         global_sequence: u64,
         recv_sequence: u64,
         auth_sequence: HashMap<Name, u64>,

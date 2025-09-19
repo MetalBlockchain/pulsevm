@@ -1,5 +1,6 @@
 use core::fmt;
 
+use pulsevm_crypto::Digest;
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 use pulsevm_serialization::{Read, Write};
 use secp256k1::hashes::{Hash, sha256};
@@ -67,10 +68,10 @@ impl Action {
     }
 }
 
-pub fn generate_action_digest(act: &Action, action_return_value: Option<Vec<u8>>) -> sha256::Hash {
+pub fn generate_action_digest(act: &Action, action_return_value: Option<Vec<u8>>) -> Digest {
     let mut bytes = act.pack().unwrap();
     if let Some(return_value) = action_return_value {
         bytes.extend(return_value);
     }
-    sha256::Hash::hash(&bytes)
+    Digest::hash(&bytes)
 }

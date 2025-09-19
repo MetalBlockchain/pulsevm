@@ -1,3 +1,5 @@
+use std::fmt;
+
 use pulsevm_crypto::Digest;
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 use pulsevm_serialization::{NumBytes, Read, ReadError, Write, WriteError};
@@ -10,6 +12,23 @@ pub enum TransactionStatus {
     Executed,
     SoftFail,
     HardFail,
+}
+
+impl fmt::Display for TransactionStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let status_str = match self {
+            TransactionStatus::Executed => "Executed",
+            TransactionStatus::SoftFail => "SoftFail",
+            TransactionStatus::HardFail => "HardFail",
+        };
+        write!(f, "{}", status_str)
+    }
+}
+
+impl Default for TransactionStatus {
+    fn default() -> Self {
+        TransactionStatus::HardFail
+    }
 }
 
 impl Read for TransactionStatus {
@@ -56,19 +75,27 @@ impl Serialize for TransactionStatus {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Read, Write, NumBytes)]
+#[derive(Debug, Clone, PartialEq, Eq, Read, Default, Write, NumBytes)]
 pub struct TransactionReceiptHeader {
-    status: TransactionStatus,
-    cpu_usage_us: u32,
-    net_usage_words: u32,
+    pub status: TransactionStatus,
+    pub cpu_usage_us: u32,
+    pub net_usage_words: u32,
+}
+
+impl TransactionReceiptHeader {
+    pub fn new(status: TransactionStatus, cpu_usage_us: u32, net_usage_words: u32) -> Self {
+        TransactionReceiptHeader {
+            status,
+            cpu_usage_us,
+            net_usage_words,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Read, Write, NumBytes)]
 pub struct TransactionReceipt {
-    status: TransactionStatus,
-    cpu_usage_us: u32,
-    net_usage_words: u32,
-    trx_id: Id,
+    pub header: TransactionReceiptHeader,
+    pub trx_id: Id,
 }
 
 impl TransactionReceipt {
@@ -79,9 +106,11 @@ impl TransactionReceipt {
         trx_id: Id,
     ) -> Self {
         TransactionReceipt {
-            status,
-            cpu_usage_us,
-            net_usage_words,
+            header: TransactionReceiptHeader {
+                status,
+                cpu_usage_us,
+                net_usage_words,
+            },
             trx_id,
         }
     }

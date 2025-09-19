@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     hash::Hash,
 };
 
@@ -140,6 +140,18 @@ impl<T: NumBytes> NumBytes for HashSet<T> {
 }
 
 impl<K: Write + NumBytes, V: Write + NumBytes> NumBytes for BTreeMap<K, V> {
+    #[inline(always)]
+    fn num_bytes(&self) -> usize {
+        let mut count = self.len().num_bytes();
+        for (key, value) in self {
+            count += key.num_bytes();
+            count += value.num_bytes();
+        }
+        count
+    }
+}
+
+impl<K: Write + NumBytes, V: Write + NumBytes> NumBytes for HashMap<K, V> {
     #[inline(always)]
     fn num_bytes(&self) -> usize {
         let mut count = self.len().num_bytes();
@@ -392,6 +404,25 @@ impl<K: Read + Write + NumBytes + Ord, V: Read + Write + NumBytes> Read for BTre
     }
 }
 
+impl<K: Read + Write + NumBytes + Ord + Hash, V: Read + Write + NumBytes> Read for HashMap<K, V> {
+    #[inline(always)]
+    fn read(bytes: &[u8], pos: &mut usize) -> Result<Self, ReadError> {
+        let len = usize::read(bytes, pos)?;
+
+        if *pos + len > bytes.len() {
+            return Err(ReadError::NotEnoughBytes);
+        }
+
+        let mut map = HashMap::new();
+        for _ in 0..len {
+            let key = K::read(bytes, pos)?;
+            let value = V::read(bytes, pos)?;
+            map.insert(key, value);
+        }
+        Ok(map)
+    }
+}
+
 impl<T1, T2> Read for (T1, T2)
 where
     T1: Read,
@@ -627,6 +658,18 @@ impl<T: Write> Write for HashSet<T> {
 }
 
 impl<K: Write + NumBytes, V: Write + NumBytes> Write for BTreeMap<K, V> {
+    #[inline(always)]
+    fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), WriteError> {
+        self.len().write(bytes, pos)?;
+        for (key, value) in self.iter() {
+            key.write(bytes, pos)?;
+            value.write(bytes, pos)?;
+        }
+        Ok(())
+    }
+}
+
+impl<K: Write + NumBytes, V: Write + NumBytes> Write for HashMap<K, V> {
     #[inline(always)]
     fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), WriteError> {
         self.len().write(bytes, pos)?;
