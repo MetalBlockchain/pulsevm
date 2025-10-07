@@ -19,11 +19,7 @@ use crate::{
         GetTableRowsResponse, IssueTxResponse, PermissionResponse,
     },
     chain::{
-        AbiDefinition, Account, AccountMetadata, Asset, Base64Bytes, BlockHeader, BlockTimestamp,
-        Gossipable, Id, KeyValue, KeyValueByScopePrimaryIndex, Name, PULSE_NAME, PackedTransaction,
-        Permission, PermissionByOwnerIndex, Signature, SignedBlock, Table,
-        TableByCodeScopeTableIndex, TransactionCompression, error::ChainError, pulse_assert,
-        string_to_symbol,
+        error::ChainError, pulse_assert, string_to_symbol, AbiDefinition, AbiSerializer, Account, AccountMetadata, Asset, Base64Bytes, BlockHeader, BlockTimestamp, Gossipable, Id, KeyValue, KeyValueByScopePrimaryIndex, Name, PackedTransaction, Permission, PermissionByOwnerIndex, Signature, SignedBlock, Table, TableByCodeScopeTableIndex, TransactionCompression, PULSE_NAME
     },
     mempool::Mempool,
 };
@@ -308,7 +304,10 @@ impl RpcServer for RpcService {
                     .map_err(|e| {
                         ErrorObjectOwned::owned(400, "invalid_table_name", Some(format!("{}", e)))
                     })?;
-                let stats = abi.binary_to_variant(&table_type, &kv.value).map_err(|e| {
+                let serializer = AbiSerializer::from_abi(abi).map_err(|e| {
+                    ErrorObjectOwned::owned(500, "abi_error", Some(format!("{}", e)))
+                })?;
+                let stats = serializer.binary_to_variant(&table_type, &kv.value, &mut 0).map_err(|e| {
                     ErrorObjectOwned::owned(400, "get_currency_stats_error", Some(format!("{}", e)))
                 })?;
                 let mut map = Map::new();
@@ -573,6 +572,9 @@ fn get_table_rows_ex(
         .map_err(|_| ChainError::InvalidArgument(format!("invalid scope name: {}", scope)))?;
     let table = session
         .find_by_secondary::<Table, TableByCodeScopeTableIndex>((code, scope, table_name))?;
+    let serializer = AbiSerializer::from_abi(abi.clone()).map_err(|e| {
+        ChainError::InvalidArgument(format!("failed to create ABI serializer: {}", e))
+    })?;
 
     if let Some(table) = table {
         let mut idx = session.get_index::<KeyValue, KeyValueByScopePrimaryIndex>();
@@ -602,10 +604,12 @@ fn get_table_rows_ex(
             }
 
             let variant = if json {
-                abi.binary_to_variant(&table_type, &kv.value)?
+                serializer.binary_to_variant(&table_type, &kv.value, &mut 0)?
             } else {
                 Value::String(hex::encode(&kv.value))
             };
+
+            println!("variant: {}", variant);
 
             if show_payer.is_some() && show_payer.unwrap() {
                 response.rows.push(serde_json::json!({

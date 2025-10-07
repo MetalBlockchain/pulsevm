@@ -14,7 +14,7 @@ type TypeName = String;
 type UnpackFunction = fn(bytes: &[u8], pos: &mut usize) -> Result<Value, ReadError>;
 type PackFunction = fn(bytes: &mut [u8], pos: &mut usize) -> Result<(), WriteError>;
 
-pub struct Serializer {
+pub struct AbiSerializer {
     typedefs: HashMap<TypeName, TypeName>,
     structs: HashMap<TypeName, AbiStructDefinition>,
     actions: HashMap<Name, TypeName>,
@@ -24,7 +24,7 @@ pub struct Serializer {
     action_results: HashMap<Name, TypeName>,
     built_in_types: HashMap<TypeName, UnpackFunction>,
 }
-impl Serializer {
+impl AbiSerializer {
     pub fn from_abi(abi: AbiDefinition) -> Result<Self, ChainError> {
         if !abi.version.starts_with("eosio::abi/1.") {
             return Err(ChainError::TransactionError(
@@ -536,7 +536,7 @@ mod tests {
     #[test]
     fn test_pulse_system_abi() {
         let abi: AbiDefinition = serde_json::from_str(PULSE_ABI).unwrap();
-        let serializer = Serializer::from_abi(abi).unwrap();
+        let serializer = AbiSerializer::from_abi(abi).unwrap();
 
         // Validate the ABI
         assert!(serializer.validate().is_ok());
