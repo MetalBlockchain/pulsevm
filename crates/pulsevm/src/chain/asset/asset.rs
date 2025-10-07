@@ -71,3 +71,39 @@ impl Serialize for Asset {
         serializer.serialize_str(&value)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use pulsevm_serialization::Write;
+
+    use super::*;
+
+    #[test]
+    fn test_asset_display() {
+        let symbol = Symbol::new_with_code(4, SymbolCode::from_str("SYS").unwrap());
+        let asset = Asset::new(123456, symbol.clone());
+        assert_eq!(asset.to_string(), "12.3456 SYS");
+
+        let asset = Asset::new(-123456, symbol.clone());
+        assert_eq!(asset.to_string(), "-12.3456 SYS");
+
+        let asset = Asset::new(1000000, symbol.clone());
+        assert_eq!(asset.to_string(), "100.0000 SYS");
+
+        let asset = Asset::new(1000000, Symbol::new_with_code(0, SymbolCode::from_str("USD").unwrap()));
+        assert_eq!(asset.to_string(), "1000000 USD");
+
+        let asset = Asset::new(0, symbol);
+        assert_eq!(asset.to_string(), "0.0000 SYS");
+    }
+
+    #[test]
+    fn test_asset_pack() {
+        let symbol = Symbol::new_with_code(4, SymbolCode::from_str("SYS").unwrap());
+        let asset = Asset::new(123456, symbol);
+        let packed = asset.pack().unwrap();
+        let packed = hex::encode(packed);
+        let expected_hex = "40e20100000000000453595300000000"; // amount: 123456 (0xe201), precision: 4, symbol: "SYS"
+        assert_eq!(packed, expected_hex);
+    }
+}
