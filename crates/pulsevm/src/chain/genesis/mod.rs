@@ -17,7 +17,22 @@ use super::PublicKey;
     Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash, Default, Read, Write, NumBytes,
 )]
 pub struct ChainConfig {
+    pub max_block_net_usage: u64,
+    pub target_block_net_usage_pct: u32,
+    pub max_transaction_net_usage: u32,
+    pub base_per_transaction_net_usage: u32,
+    pub net_usage_leeway: u32,
+    pub context_free_discount_net_usage_num: u32,
+    pub context_free_discount_net_usage_den: u32,
+
+    pub max_block_cpu_usage: u32,
+    pub target_block_cpu_usage_pct: u32,
+    pub max_transaction_cpu_usage: u32,
+    pub min_transaction_cpu_usage: u32,
+
     pub max_inline_action_size: u32,
+    pub max_inline_action_depth: u16,
+    pub max_authority_depth: u16,
     pub max_action_return_value_size: u32,
 }
 
