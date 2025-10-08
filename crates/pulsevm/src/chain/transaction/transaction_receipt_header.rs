@@ -75,7 +75,7 @@ impl Serialize for TransactionStatus {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Read, Default, Write, NumBytes)]
+#[derive(Debug, Clone, PartialEq, Eq, Read, Default, Write, NumBytes, Serialize)]
 pub struct TransactionReceiptHeader {
     pub status: TransactionStatus,
     pub cpu_usage_us: u32,

@@ -237,7 +237,7 @@ impl From<&TransactionTrace> for TransactionTraceV0 {
             trace.id.clone(),
             receipt.status,
             receipt.cpu_usage_us,
-            VarUint32(trace.net_usage as u32),
+            VarUint32(receipt.net_usage_words as u32),
             trace.elapsed as i64,
             trace.net_usage,
             trace.scheduled,

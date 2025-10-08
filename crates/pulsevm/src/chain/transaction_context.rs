@@ -251,14 +251,12 @@ impl TransactionContext {
 
     pub fn finalize(&self) -> Result<TransactionResult, ChainError> {
         let mut trace = self.trace.borrow_mut();
-        let receipt = TransactionReceiptHeader::new(TransactionStatus::Executed, 0, 0);
-        trace.receipt = receipt;
-
         let billed_cpu_time_us = self
             .billed_cpu_time_us
             .load(std::sync::atomic::Ordering::Relaxed);
 
         trace.net_usage = ((trace.net_usage + 7) / 8) * 8; // Round up to nearest multiple of word size (8 bytes)
+        trace.receipt = TransactionReceiptHeader::new(TransactionStatus::Executed, 0, (trace.net_usage / 8) as u32);
 
         Ok(TransactionResult {
             trace: trace.clone(),

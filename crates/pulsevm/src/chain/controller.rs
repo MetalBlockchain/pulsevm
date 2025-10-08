@@ -232,9 +232,7 @@ impl Controller {
             let transaction_result =
                 self.execute_transaction(&mut undo_session, &transaction, &timestamp)?;
             let receipt = TransactionReceipt::new(
-                super::TransactionStatus::Executed,
-                0,
-                VarUint32(0),
+                transaction_result.trace.receipt.clone(),
                 transaction,
             );
 
