@@ -7,7 +7,8 @@ use pulsevm_time::{TimePoint, TimePointSec};
 use serde_json::{Number, Value};
 
 use crate::chain::{
-    error::ChainError, pulse_assert, AbiDefinition, AbiStructDefinition, AbiVariantDefinition, Asset, BlockTimestamp, ExtendedAsset, Name, PublicKey, Signature, Symbol, SymbolCode
+    AbiDefinition, AbiStructDefinition, AbiVariantDefinition, Asset, BlockTimestamp, ExtendedAsset,
+    Name, PublicKey, Signature, Symbol, SymbolCode, error::ChainError, pulse_assert,
 };
 
 type TypeName = String;
@@ -249,7 +250,7 @@ impl AbiSerializer {
                 return Err(ChainError::TransactionError(format!(
                     "struct '{}' not found",
                     struct_name
-                )))
+                )));
             }
         };
 
@@ -281,8 +282,9 @@ impl AbiSerializer {
         if let Some(t) = self.typedefs.get(type_name) {
             let mut i = self.typedefs.len();
             let mut itr = t.clone();
-            
-            while i > 0 { // avoid infinite recursion
+
+            while i > 0 {
+                // avoid infinite recursion
                 if let Some(t2) = self.typedefs.get(itr.as_str()) {
                     itr = t2.clone();
                     i -= 1;
@@ -543,7 +545,7 @@ mod tests {
 
         let packed = 0f64;
         let packed = packed.pack().unwrap();
-        let packed= hex::encode(packed);
+        let packed = hex::encode(packed);
         println!("packed: {}", packed);
 
         let value = serializer

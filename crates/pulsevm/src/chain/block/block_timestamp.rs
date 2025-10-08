@@ -73,6 +73,27 @@ impl BlockTimestamp {
     pub fn to_time_point(self) -> TimePoint {
         self.into()
     }
+
+    pub fn to_eos_string(&self) -> String {
+        // total ms since Unix epoch
+        let total_ms =
+            (self.slot as i64) * (Self::BLOCK_INTERVAL_MS as i64) + Self::BLOCK_TIMESTAMP_EPOCH_MS;
+
+        let secs = total_ms.div_euclid(1000);
+        let rem_ms = (total_ms.rem_euclid(1000)) as i64;
+
+        let mut dt =
+            OffsetDateTime::from_unix_timestamp(secs).expect("valid timestamp for BlockTimestamp");
+        dt += Duration::milliseconds(rem_ms);
+
+        // EOS uses "YYYY-MM-DDTHH:MM:SS.sss" (no 'Z')
+        const FMT: &[time::format_description::FormatItem<'_>] = format_description!(
+            "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]"
+        );
+
+        let s = dt.format(FMT).expect("formatting never fails");
+        s
+    }
 }
 
 impl From<BlockTimestamp> for TimePoint {
@@ -119,29 +140,18 @@ impl From<BlockTimestamp> for Timestamp {
     }
 }
 
+impl fmt::Display for BlockTimestamp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.to_eos_string())
+    }
+}
+
 impl Serialize for BlockTimestamp {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        // total ms since Unix epoch
-        let total_ms =
-            (self.slot as i64) * (Self::BLOCK_INTERVAL_MS as i64) + Self::BLOCK_TIMESTAMP_EPOCH_MS;
-
-        let secs = total_ms.div_euclid(1000);
-        let rem_ms = (total_ms.rem_euclid(1000)) as i64;
-
-        let mut dt =
-            OffsetDateTime::from_unix_timestamp(secs).expect("valid timestamp for BlockTimestamp");
-        dt += Duration::milliseconds(rem_ms);
-
-        // EOS uses "YYYY-MM-DDTHH:MM:SS.sss" (no 'Z')
-        const FMT: &[time::format_description::FormatItem<'_>] = format_description!(
-            "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]"
-        );
-
-        let s = dt.format(FMT).expect("formatting never fails");
-        serializer.serialize_str(&s)
+        serializer.serialize_str(&self.to_eos_string())
     }
 }
 

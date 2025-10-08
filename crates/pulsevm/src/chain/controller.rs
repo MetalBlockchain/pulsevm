@@ -8,9 +8,9 @@ use std::{
 use crate::{
     chain::{
         ACTIVE_NAME, AbiDefinition, Account, AccountMetadata, Asset, BlockTimestamp,
-        DELETEAUTH_NAME, LINKAUTH_NAME, NEWACCOUNT_NAME, PackedTransaction, SETABI_NAME,
-        SETCODE_NAME, SignedTransaction, TransactionReceipt, TransactionTrace, UNLINKAUTH_NAME,
-        UPDATEAUTH_NAME,
+        DELETEAUTH_NAME, HistoryPlugin, LINKAUTH_NAME, NEWACCOUNT_NAME, PackedTransaction,
+        SETABI_NAME, SETCODE_NAME, SignedTransaction, TransactionReceipt, TransactionTrace,
+        UNLINKAUTH_NAME, UPDATEAUTH_NAME,
         block::{BlockHeader, SignedBlock},
         config::GlobalPropertyObject,
         pulse_contract::{deleteauth, linkauth, unlinkauth},
@@ -29,12 +29,9 @@ use super::{
     pulse_contract::{newaccount, setabi, setcode, updateauth},
     wasm_runtime::WasmRuntime,
 };
-use anyhow::Chain;
-use chrono::Utc;
 use pulsevm_chainbase::{Database, UndoSession};
 use pulsevm_crypto::{Digest, merkle};
 use pulsevm_serialization::{Read, VarUint32, Write};
-use ripemd::digest::block_buffer::Block;
 use spdlog::info;
 use tokio::sync::{RwLock as AsyncRwLock, broadcast};
 
@@ -68,8 +65,9 @@ pub struct Controller {
 
     trace_log: Option<StateHistoryLog>,
     chain_state_log: Option<StateHistoryLog>,
+    history_plugin: Option<HistoryPlugin>,
 
-    pub on_accepted_block: broadcast::Sender<SignedBlock>,
+    on_accepted_block: broadcast::Sender<SignedBlock>,
 }
 
 #[derive(Debug)]
@@ -90,7 +88,6 @@ impl Controller {
         // Create a temporary database
         let db = Database::temporary(Path::new("temp")).unwrap();
         let wasm_runtime = WasmRuntime::new().unwrap();
-        //let (tx, mut rx1) = broadcast::channel::<Signed>(16);
         let controller = Controller {
             wasm_runtime: Arc::new(RwLock::new(wasm_runtime)), // TODO: Handle error properly
             genesis: Genesis::default(),
@@ -103,6 +100,7 @@ impl Controller {
 
             trace_log: None,
             chain_state_log: None,
+            history_plugin: None,
 
             on_accepted_block: broadcast::channel::<SignedBlock>(16).0,
         };
@@ -129,6 +127,7 @@ impl Controller {
         self.chain_state_log = Some(StateHistoryLog::open(&db_path, "chain_state_log").map_err(
             |e| ChainError::InternalError(Some(format!("failed to open chain state log: {}", e))),
         )?);
+        self.history_plugin = Some(HistoryPlugin::new(self.on_accepted_block.subscribe()));
 
         // Set our last accepted block to the genesis block
         self.last_accepted_block = SignedBlock::new(
@@ -404,12 +403,17 @@ impl Controller {
 
         let mut trx_context = TransactionContext::new(
             undo_session.clone(),
+            self.genesis.initial_configuration().clone(),
             self.wasm_runtime.clone(),
             self.last_accepted_block().block_num() + 1,
             pending_block_timestamp.clone(),
             packed_transaction,
         );
 
+        trx_context.init_for_input_trx(
+            packed_transaction.get_unprunable_size()?,
+            packed_transaction.get_prunable_size()?,
+        )?;
         trx_context.exec(signed_transaction.transaction())?;
         let result = trx_context.finalize()?;
 
@@ -545,6 +549,7 @@ impl Controller {
 mod tests {
     use std::{env::temp_dir, fs, path::PathBuf, str::FromStr, vec};
 
+    use chrono::Utc;
     use pulsevm_proc_macros::{NumBytes, Read, Write};
     use pulsevm_serialization::{VarUint32, Write};
     use pulsevm_time::TimePointSec;

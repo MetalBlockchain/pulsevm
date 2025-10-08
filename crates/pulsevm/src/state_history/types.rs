@@ -192,8 +192,7 @@ impl TransactionTraceV0 {
 
 impl From<&TransactionTrace> for TransactionTraceV0 {
     fn from(trace: &TransactionTrace) -> Self {
-        println!("{} traces", trace.action_traces.len());
-        let action_traces = trace
+        let action_traces: Vec<ActionTraceV1> = trace
             .action_traces()
             .into_iter()
             .map(|at| {
@@ -232,7 +231,7 @@ impl From<&TransactionTrace> for TransactionTraceV0 {
 
         let receipt = trace.receipt.clone();
 
-        println!("Converted receipt: {}", receipt.status);
+        println!("Converted receipt: {}", action_traces.len());
 
         TransactionTraceV0::new(
             trace.id.clone(),

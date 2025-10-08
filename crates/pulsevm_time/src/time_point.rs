@@ -1,9 +1,15 @@
 use core::fmt;
-use std::{ops::{Add, AddAssign, Sub, SubAssign}, str::FromStr};
+use std::{
+    ops::{Add, AddAssign, Sub, SubAssign},
+    str::FromStr,
+};
 
 use pulsevm_proc_macros::{NumBytes, Read, Write};
-use serde::{de::{self, Visitor}, Deserialize, Deserializer, Serialize, Serializer};
-use time::{macros::format_description, OffsetDateTime, PrimitiveDateTime};
+use serde::{
+    Deserialize, Deserializer, Serialize, Serializer,
+    de::{self, Visitor},
+};
+use time::{OffsetDateTime, PrimitiveDateTime, macros::format_description};
 
 use crate::Microseconds;
 
@@ -139,7 +145,7 @@ impl FromStr for TimePoint {
         let odt: OffsetDateTime = pdt.assume_utc();
 
         // Combine into *microseconds* since epoch (EOS time_point is microsecond-based)
-        let secs = odt.unix_timestamp();                 // i64 seconds
+        let secs = odt.unix_timestamp(); // i64 seconds
         let micros_of_sec = odt.time().microsecond() as i64;
         let total_us = secs
             .checked_mul(1_000_000)

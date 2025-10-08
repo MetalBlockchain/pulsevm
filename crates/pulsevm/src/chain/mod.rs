@@ -30,8 +30,10 @@ mod config;
 pub use config::*;
 
 mod genesis;
-
 pub use genesis::Genesis;
+
+mod history_plugin;
+pub use history_plugin::*;
 
 mod id;
 pub use id::*;

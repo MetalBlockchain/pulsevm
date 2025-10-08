@@ -90,7 +90,10 @@ mod tests {
         let asset = Asset::new(1000000, symbol.clone());
         assert_eq!(asset.to_string(), "100.0000 SYS");
 
-        let asset = Asset::new(1000000, Symbol::new_with_code(0, SymbolCode::from_str("USD").unwrap()));
+        let asset = Asset::new(
+            1000000,
+            Symbol::new_with_code(0, SymbolCode::from_str("USD").unwrap()),
+        );
         assert_eq!(asset.to_string(), "1000000 USD");
 
         let asset = Asset::new(0, symbol);

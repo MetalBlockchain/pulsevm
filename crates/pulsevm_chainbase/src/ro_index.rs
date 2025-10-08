@@ -176,7 +176,10 @@ where
                 .map_err(|e| ChainbaseError::InternalError(e.to_string()))?;
             self.current_key = key.to_vec();
             self.current_value = value.to_vec();
-            self.range = (Bound::Excluded(self.current_key.clone()), self.range.1.clone());
+            self.range = (
+                Bound::Excluded(self.current_key.clone()),
+                self.range.1.clone(),
+            );
             if let Ok(object) = self.get_object() {
                 return Ok(Some(object));
             } else {
@@ -212,7 +215,10 @@ where
                 .map_err(|e| ChainbaseError::InternalError(e.to_string()))?;
             self.current_key = key.to_vec();
             self.current_value = value.to_vec();
-            self.range = (Bound::Excluded(self.current_key.clone()), self.range.1.clone());
+            self.range = (
+                Bound::Excluded(self.current_key.clone()),
+                self.range.1.clone(),
+            );
             if let Ok(object) = self.get_object() {
                 return Ok(Some(object));
             } else {

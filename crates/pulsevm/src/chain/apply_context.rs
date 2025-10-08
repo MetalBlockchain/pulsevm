@@ -183,17 +183,18 @@ impl ApplyContext {
     }
 
     pub fn finalize_trace(&self, receipt: ActionReceipt) -> Result<(), ChainError> {
-        self.trx_context.modify_action_trace(self.action_ordinal, |trace| {
-            trace.receipt = Some(receipt);
-            trace.set_elapsed((Utc::now().timestamp_micros() - self.start) as u32);
-            println!(
-                "Action Trace: Elapsed: {} micros, Receiver: {}, Action: {}",
-                trace.elapsed(),
-                self.receiver,
-                self.action.name()
-            );
-            trace.clone()
-        })?;
+        self.trx_context
+            .modify_action_trace(self.action_ordinal, |trace| {
+                trace.receipt = Some(receipt);
+                trace.set_elapsed((Utc::now().timestamp_micros() - self.start) as u32);
+                println!(
+                    "Action Trace: Elapsed: {} micros, Receiver: {}, Action: {}",
+                    trace.elapsed(),
+                    self.receiver,
+                    self.action.name()
+                );
+                trace.clone()
+            })?;
         Ok(())
     }
 

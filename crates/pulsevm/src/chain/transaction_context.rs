@@ -10,7 +10,7 @@ use pulsevm_crypto::Digest;
 
 use crate::chain::{
     ActionReceipt, BlockTimestamp, PackedTransaction, TransactionReceiptHeader, TransactionStatus,
-    TransactionTrace, wasm_runtime::WasmRuntime,
+    TransactionTrace, config, genesis::ChainConfig, pulse_assert, wasm_runtime::WasmRuntime,
 };
 
 use super::{
@@ -24,9 +24,12 @@ pub struct TransactionResult {
 
 #[derive(Clone)]
 pub struct TransactionContext {
+    initialized: bool,
+    packed_trx: PackedTransaction,
     session: UndoSession,
     wasm_runtime: Arc<RwLock<WasmRuntime>>,
     pending_block_timestamp: BlockTimestamp,
+    config: ChainConfig,
 
     trace: Rc<RefCell<TransactionTrace>>,
     billed_cpu_time_us: Rc<AtomicI64>,
@@ -35,6 +38,7 @@ pub struct TransactionContext {
 impl TransactionContext {
     pub fn new(
         session: UndoSession,
+        config: ChainConfig,
         wasm_runtime: Arc<RwLock<WasmRuntime>>,
         block_num: u32,
         pending_block_timestamp: BlockTimestamp,
@@ -46,13 +50,69 @@ impl TransactionContext {
         trace.block_time = pending_block_timestamp;
 
         Self {
+            initialized: false,
+            packed_trx: transaction.clone(),
             session,
             wasm_runtime,
             pending_block_timestamp,
+            config,
 
             trace: Rc::new(RefCell::new(trace)),
             billed_cpu_time_us: Rc::new(AtomicI64::new(0)),
         }
+    }
+
+    pub fn init(&mut self, initial_net_usage: u64) -> Result<(), ChainError> {
+        pulse_assert(
+            self.initialized == false,
+            ChainError::TransactionError("cannot initialize twice".into()),
+        )?;
+        self.initialized = true;
+
+        if initial_net_usage > 0 {
+            self.add_net_usage(initial_net_usage);
+        }
+
+        Ok(())
+    }
+
+    pub fn init_for_input_trx(
+        &mut self,
+        packed_trx_unprunable_size: u64,
+        packed_trx_prunable_size: u64,
+    ) -> Result<(), ChainError> {
+        let trx = self.packed_trx.get_transaction();
+
+        pulse_assert(
+            trx.header.delay_sec.0 == 0,
+            ChainError::TransactionError("transaction cannot be delayed".into()),
+        )?;
+        pulse_assert(
+            trx.transaction_extensions.len() == 0,
+            ChainError::TransactionError(
+                "no transaction extensions supported yet for input transactions".into(),
+            ),
+        )?;
+
+        let mut discounted_size_for_pruned_data = packed_trx_prunable_size.clone();
+        if self.config.context_free_discount_net_usage_den > 0
+            && self.config.context_free_discount_net_usage_num
+                < self.config.context_free_discount_net_usage_den
+        {
+            discounted_size_for_pruned_data *=
+                self.config.context_free_discount_net_usage_num as u64;
+            discounted_size_for_pruned_data = (discounted_size_for_pruned_data
+                + self.config.context_free_discount_net_usage_den as u64
+                - 1)
+                / self.config.context_free_discount_net_usage_den as u64; // rounds up
+        }
+
+        let initial_net_usage: u64 = (self.config.base_per_transaction_net_usage as u64)
+            + packed_trx_unprunable_size
+            + discounted_size_for_pruned_data;
+
+        self.init(initial_net_usage)?;
+        Ok(())
     }
 
     pub fn exec(&mut self, transaction: &Transaction) -> Result<(), ChainError> {
@@ -198,9 +258,16 @@ impl TransactionContext {
             .billed_cpu_time_us
             .load(std::sync::atomic::Ordering::Relaxed);
 
+        trace.net_usage = ((trace.net_usage + 7) / 8) * 8; // Round up to nearest multiple of word size (8 bytes)
+
         Ok(TransactionResult {
             trace: trace.clone(),
             billed_cpu_time_us,
         })
+    }
+
+    pub fn add_net_usage(&self, net_usage: u64) {
+        let mut trace = self.trace.borrow_mut();
+        trace.net_usage += net_usage;
     }
 }

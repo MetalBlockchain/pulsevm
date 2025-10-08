@@ -6,7 +6,8 @@ use pulsevm_serialization::{NumBytes, Read, ReadError, Write, WriteError};
 use serde::{Serialize, ser::SerializeStruct};
 
 use crate::chain::{
-    Id, Signature, SignedTransaction, Transaction, TransactionCompression, error::ChainError,
+    FIXED_NET_OVERHEAD_OF_PACKED_TRX, Id, Signature, SignedTransaction, Transaction,
+    TransactionCompression, error::ChainError, pulse_assert,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +57,30 @@ impl PackedTransaction {
 
     pub fn get_signed_transaction(&self) -> &SignedTransaction {
         &self.unpacked_trx
+    }
+
+    pub fn get_transaction(&self) -> &Transaction {
+        self.unpacked_trx.transaction()
+    }
+
+    pub fn get_unprunable_size(&self) -> Result<u64, ChainError> {
+        let mut size = FIXED_NET_OVERHEAD_OF_PACKED_TRX as u64;
+        size += self.packed_trx.len() as u64;
+        pulse_assert(
+            size <= u32::MAX as u64,
+            ChainError::TransactionError("packed_transaction is too big".into()),
+        )?;
+        Ok(size)
+    }
+
+    pub fn get_prunable_size(&self) -> Result<u64, ChainError> {
+        let mut size = self.signatures.num_bytes() as u64;
+        size += self.packed_context_free_data.len() as u64;
+        pulse_assert(
+            size <= u32::MAX as u64,
+            ChainError::TransactionError("packed_transaction is too big".into()),
+        )?;
+        Ok(size)
     }
 
     pub fn id(&self) -> &Id {

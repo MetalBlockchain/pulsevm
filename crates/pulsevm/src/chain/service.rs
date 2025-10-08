@@ -19,7 +19,11 @@ use crate::{
         GetTableRowsResponse, IssueTxResponse, PermissionResponse,
     },
     chain::{
-        error::ChainError, pulse_assert, string_to_symbol, AbiDefinition, AbiSerializer, Account, AccountMetadata, Asset, Base64Bytes, BlockHeader, BlockTimestamp, Gossipable, Id, KeyValue, KeyValueByScopePrimaryIndex, Name, PackedTransaction, Permission, PermissionByOwnerIndex, Signature, SignedBlock, Table, TableByCodeScopeTableIndex, TransactionCompression, PULSE_NAME
+        AbiDefinition, AbiSerializer, Account, AccountMetadata, Asset, Base64Bytes, BlockHeader,
+        BlockTimestamp, Gossipable, Id, KeyValue, KeyValueByScopePrimaryIndex, Name, PULSE_NAME,
+        PackedTransaction, Permission, PermissionByOwnerIndex, Signature, SignedBlock, Table,
+        TableByCodeScopeTableIndex, TransactionCompression, error::ChainError, pulse_assert,
+        string_to_symbol,
     },
     mempool::Mempool,
 };
@@ -307,9 +311,15 @@ impl RpcServer for RpcService {
                 let serializer = AbiSerializer::from_abi(abi).map_err(|e| {
                     ErrorObjectOwned::owned(500, "abi_error", Some(format!("{}", e)))
                 })?;
-                let stats = serializer.binary_to_variant(&table_type, &kv.value, &mut 0).map_err(|e| {
-                    ErrorObjectOwned::owned(400, "get_currency_stats_error", Some(format!("{}", e)))
-                })?;
+                let stats = serializer
+                    .binary_to_variant(&table_type, &kv.value, &mut 0)
+                    .map_err(|e| {
+                        ErrorObjectOwned::owned(
+                            400,
+                            "get_currency_stats_error",
+                            Some(format!("{}", e)),
+                        )
+                    })?;
                 let mut map = Map::new();
                 map.insert(symbol, stats);
                 return Ok(Value::Object(map));
