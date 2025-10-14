@@ -177,7 +177,7 @@ impl Session {
                                             // Likely "block not ready yet" — backoff and retry
                                             // return slot because nothing was sent
                                             budget.fetch_add(1, Ordering::SeqCst);
-                                            error!("build response for block {next} failed: {e}");
+                                            //error!("build response for block {next} failed: {e}");
                                             tokio::time::sleep(Duration::from_millis(500)).await;
                                         }
                                     }
@@ -347,6 +347,8 @@ async fn make_block_response_for(
         }
     }
 
+    println!("sending block {block_num}");
+
     Ok(GetBlocksResponseV0 {
         variant: 1,
         head: BlockPosition {
@@ -370,7 +372,7 @@ async fn make_block_response_for(
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
+    use std::{collections::HashMap, str::FromStr};
 
     use pulsevm_crypto::Bytes;
     use pulsevm_serialization::{VarUint32, Write};
@@ -423,12 +425,7 @@ mod tests {
                 true,
                 137,
                 "".to_owned(),
-                vec![
-                    AccountDelta {
-                        account: PULSE_NAME,
-                        delta: 100,
-                    }
-                ],
+                HashMap::new(),
                 None,
                 None,
                 Bytes::new(vec![]),

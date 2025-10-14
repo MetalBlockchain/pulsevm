@@ -1,7 +1,7 @@
 use pulsevm_crypto::Digest;
 use serde::Serialize;
 
-use crate::chain::{Asset, Authority, Base64Bytes, BlockTimestamp, Id, Name};
+use crate::chain::{AccountResourceLimit, Asset, Authority, Base64Bytes, BlockTimestamp, Id, Name};
 
 #[derive(Serialize, Clone, Default)]
 pub struct PermissionResponse {
@@ -18,15 +18,6 @@ impl PermissionResponse {
             required_auth,
         }
     }
-}
-
-#[derive(Serialize, Clone, Default)]
-pub struct AccountResourceLimit {
-    pub used: u32,
-    pub available: u32,
-    pub max: u32,
-    pub last_usage_update_time: BlockTimestamp,
-    pub current_used: u32,
 }
 
 #[derive(Serialize, Clone, Default)]
@@ -64,7 +55,7 @@ pub struct GetAccountResponse {
     pub cpu_weight: i64,
     pub net_limit: AccountResourceLimit,
     pub cpu_limit: AccountResourceLimit,
-    pub ram_usage: i64,
+    pub ram_usage: u64,
     pub permissions: Vec<PermissionResponse>,
     pub total_resources: AccountTotalResources,
     pub voter_info: AccountVoterInfo,

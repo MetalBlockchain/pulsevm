@@ -1,6 +1,6 @@
 use crate::{NumBytes, Read, ReadError, Write, WriteError};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct VarInt32(pub i32);
 
 impl NumBytes for VarInt32 {

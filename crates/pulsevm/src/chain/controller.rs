@@ -7,15 +7,7 @@ use std::{
 
 use crate::{
     chain::{
-        ACTIVE_NAME, AbiDefinition, Account, AccountMetadata, Asset, BlockTimestamp,
-        DELETEAUTH_NAME, HistoryPlugin, LINKAUTH_NAME, NEWACCOUNT_NAME, PackedTransaction,
-        SETABI_NAME, SETCODE_NAME, SignedTransaction, TransactionReceipt, TransactionTrace,
-        UNLINKAUTH_NAME, UPDATEAUTH_NAME,
-        block::{BlockHeader, SignedBlock},
-        config::GlobalPropertyObject,
-        pulse_contract::{deleteauth, linkauth, unlinkauth},
-        pulse_contract_abi::get_pulse_contract_abi,
-        transaction_context::TransactionResult,
+        block::{BlockHeader, SignedBlock}, config::GlobalPropertyObject, pulse_contract::{deleteauth, linkauth, unlinkauth}, pulse_contract_abi::get_pulse_contract_abi, resource_limits::ResourceLimitsManager, transaction_context::TransactionResult, AbiDefinition, Account, AccountMetadata, Asset, BlockTimestamp, HistoryPlugin, PackedTransaction, SignedTransaction, TransactionReceipt, TransactionTrace, ACTIVE_NAME, DELETEAUTH_NAME, LINKAUTH_NAME, NEWACCOUNT_NAME, SETABI_NAME, SETCODE_NAME, UNLINKAUTH_NAME, UPDATEAUTH_NAME
     },
     mempool::Mempool,
     state_history::StateHistoryLog,
@@ -208,6 +200,13 @@ impl Controller {
             session.insert(&GlobalPropertyObject {
                 chain_id: self.chain_id.clone(),
                 configuration: self.genesis.initial_configuration().clone(),
+            })?;
+            ResourceLimitsManager::initialize_database(&mut session)?;
+            ResourceLimitsManager::initialize_account(&mut session, PULSE_NAME).map_err(|e| {
+                ChainError::GenesisError(format!(
+                    "failed to initialize resource limits for pulse account: {}",
+                    e
+                ))
             })?;
             session.commit()?;
         }

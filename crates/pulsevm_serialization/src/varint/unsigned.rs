@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{NumBytes, Read, ReadError, Write, WriteError};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub struct VarUint32(pub u32);
 
 impl NumBytes for VarUint32 {

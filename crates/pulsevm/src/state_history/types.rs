@@ -1,5 +1,7 @@
+use std::collections::HashMap;
+
 use pulsevm_crypto::{Bytes, Digest};
-use pulsevm_proc_macros::{NumBytes, Read, Write};
+use pulsevm_proc_macros::{name, NumBytes, Read, Write};
 use pulsevm_serialization::VarUint32;
 use pulsevm_time::TimePointSec;
 use serde::Serialize;
@@ -84,7 +86,7 @@ pub struct ActionTraceV1 {
     pub context_free: bool,
     pub elapsed: i64,
     pub console: String,
-    pub account_ram_deltas: Vec<AccountDelta>,
+    pub account_ram_deltas: HashMap<Name, i64>,
     pub except: Option<String>,
     pub error_code: Option<u64>,
     pub return_value: Bytes,
@@ -100,7 +102,7 @@ impl ActionTraceV1 {
         context_free: bool,
         elapsed: i64,
         console: String,
-        account_ram_deltas: Vec<AccountDelta>,
+        account_ram_deltas: HashMap<Name, i64>,
         except: Option<String>,
         error_code: Option<u64>,
         return_value: Bytes,
@@ -221,7 +223,7 @@ impl From<&TransactionTrace> for TransactionTraceV0 {
                     at.context_free,
                     at.elapsed as i64,
                     at.console.clone(),
-                    vec![], // Placeholder for account RAM deltas, not implemented yet
+                    at.account_ram_deltas.clone(),
                     None,
                     None,
                     Bytes::new(at.return_value.clone()),
@@ -237,7 +239,7 @@ impl From<&TransactionTrace> for TransactionTraceV0 {
             trace.id.clone(),
             receipt.status,
             receipt.cpu_usage_us,
-            VarUint32(receipt.net_usage_words as u32),
+            receipt.net_usage_words,
             trace.elapsed as i64,
             trace.net_usage,
             trace.scheduled,

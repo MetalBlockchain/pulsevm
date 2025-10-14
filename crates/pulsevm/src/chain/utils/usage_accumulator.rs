@@ -5,7 +5,7 @@ use std::{
 
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 
-use crate::chain::{config, error::ChainError, pulse_assert};
+use crate::chain::{config, error::ChainError, pulse_assert, RATE_LIMITING_PRECISION};
 
 #[derive(Debug, Clone, Copy, PartialEq, Read, Write, NumBytes, Default, Eq, Hash)]
 pub struct Ratio<T> {
@@ -37,20 +37,18 @@ impl Mul<Ratio<u64>> for u64 {
 
 #[derive(Debug, Clone, Copy, NumBytes, Read, Write, Default, PartialEq, Eq, Hash)]
 pub struct UsageAccumulator {
-    last_ordinal: u32, //< The ordinal of the last period which has contributed to the average
-    value_ex: u64,     //< The current average pre-multiplied by Precision
-    consumed: u64,     //< The last periods average + the current periods contribution so far
-
-    precision: u64, //< The precision of the average
+    pub last_ordinal: u32, //< The ordinal of the last period which has contributed to the average
+    pub value_ex: u64,     //< The current average pre-multiplied by Precision
+    pub consumed: u64,     //< The last periods average + the current periods contribution so far
 }
 
 impl UsageAccumulator {
     pub fn average(&self) -> u64 {
-        integer_divide_ceil(self.value_ex, self.precision)
+        integer_divide_ceil(self.value_ex, RATE_LIMITING_PRECISION)
     }
 
     pub fn max_raw_value(&self) -> u64 {
-        u64::MAX / self.precision
+        u64::MAX / RATE_LIMITING_PRECISION
     }
 
     pub fn add(&mut self, units: u64, ordinal: u32, window_size: u64) -> Result<(), ChainError> {
@@ -67,7 +65,7 @@ impl UsageAccumulator {
             ChainError::InvalidArgument("overflow in tracked usage when adding usage".to_string()),
         )?;
 
-        let value_ex_contrib = integer_divide_ceil(units * self.precision, window_size);
+        let value_ex_contrib = integer_divide_ceil(units * RATE_LIMITING_PRECISION, window_size);
         pulse_assert(
             u64::MAX - self.value_ex >= value_ex_contrib,
             ChainError::InvalidArgument(
@@ -103,7 +101,7 @@ impl UsageAccumulator {
     }
 }
 
-fn integer_divide_ceil<T>(num: T, den: T) -> T
+pub fn integer_divide_ceil<T>(num: T, den: T) -> T
 where
     T: Copy + PartialOrd + Div<Output = T> + Rem<Output = T> + Add<Output = T> + From<u8>,
 {

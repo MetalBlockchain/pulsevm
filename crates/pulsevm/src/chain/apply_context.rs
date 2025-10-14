@@ -187,6 +187,7 @@ impl ApplyContext {
             .modify_action_trace(self.action_ordinal, |trace| {
                 trace.receipt = Some(receipt);
                 trace.set_elapsed((Utc::now().timestamp_micros() - self.start) as u32);
+                trace.account_ram_deltas = self.account_ram_deltas.borrow().clone();
                 println!(
                     "Action Trace: Elapsed: {} micros, Receiver: {}, Action: {}",
                     trace.elapsed(),
@@ -788,5 +789,9 @@ impl ApplyContext {
 
     pub fn pending_block_timestamp(&self) -> BlockTimestamp {
         self.pending_block_timestamp
+    }
+
+    pub fn account_ram_deltas(&self) -> HashMap<Name, i64> {
+        self.account_ram_deltas.borrow().clone()
     }
 }

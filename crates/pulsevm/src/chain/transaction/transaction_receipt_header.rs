@@ -2,7 +2,7 @@ use std::fmt;
 
 use pulsevm_crypto::Digest;
 use pulsevm_proc_macros::{NumBytes, Read, Write};
-use pulsevm_serialization::{NumBytes, Read, ReadError, Write, WriteError};
+use pulsevm_serialization::{NumBytes, Read, ReadError, VarUint32, Write, WriteError};
 use serde::Serialize;
 
 use crate::chain::Id;
@@ -79,11 +79,11 @@ impl Serialize for TransactionStatus {
 pub struct TransactionReceiptHeader {
     pub status: TransactionStatus,
     pub cpu_usage_us: u32,
-    pub net_usage_words: u32,
+    pub net_usage_words: VarUint32,
 }
 
 impl TransactionReceiptHeader {
-    pub fn new(status: TransactionStatus, cpu_usage_us: u32, net_usage_words: u32) -> Self {
+    pub fn new(status: TransactionStatus, cpu_usage_us: u32, net_usage_words: VarUint32) -> Self {
         TransactionReceiptHeader {
             status,
             cpu_usage_us,
@@ -102,7 +102,7 @@ impl TransactionReceipt {
     pub fn new(
         status: TransactionStatus,
         cpu_usage_us: u32,
-        net_usage_words: u32,
+        net_usage_words: VarUint32,
         trx_id: Id,
     ) -> Self {
         TransactionReceipt {

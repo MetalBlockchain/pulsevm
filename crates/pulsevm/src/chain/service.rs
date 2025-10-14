@@ -19,11 +19,7 @@ use crate::{
         GetTableRowsResponse, IssueTxResponse, PermissionResponse,
     },
     chain::{
-        AbiDefinition, AbiSerializer, Account, AccountMetadata, Asset, Base64Bytes, BlockHeader,
-        BlockTimestamp, Gossipable, Id, KeyValue, KeyValueByScopePrimaryIndex, Name, PULSE_NAME,
-        PackedTransaction, Permission, PermissionByOwnerIndex, Signature, SignedBlock, Table,
-        TableByCodeScopeTableIndex, TransactionCompression, error::ChainError, pulse_assert,
-        string_to_symbol,
+        error::ChainError, pulse_assert, resource_limits::ResourceLimitsManager, string_to_symbol, AbiDefinition, AbiSerializer, Account, AccountMetadata, Asset, Base64Bytes, BlockHeader, BlockTimestamp, Gossipable, Id, KeyValue, KeyValueByScopePrimaryIndex, Name, PackedTransaction, Permission, PermissionByOwnerIndex, Signature, SignedBlock, Table, TableByCodeScopeTableIndex, TransactionCompression, PULSE_NAME
     },
     mempool::Mempool,
 };
@@ -156,11 +152,10 @@ impl RpcServer for RpcService {
 
     async fn get_account(&self, name: Name) -> Result<GetAccountResponse, ErrorObjectOwned> {
         let controller = self.controller.clone();
-        let controller = controller.read().await;
-        let database = controller.database();
-        let session = database
-            .session()
-            .map_err(|e| ErrorObjectOwned::owned(500, "database_error", Some(format!("{}", e))))?;
+        let mut controller = controller.write().await;
+        let mut session = controller.create_undo_session().map_err(|e| {
+            ErrorObjectOwned::owned(500, "database_error", Some(format!("{}", e)))
+        })?;
         let accnt_obj = session.get::<Account>(name.clone()).map_err(|e| {
             ErrorObjectOwned::owned(404, "account_not_found", Some(format!("{}", e)))
         })?;
@@ -168,10 +163,29 @@ impl RpcServer for RpcService {
             ErrorObjectOwned::owned(404, "account_not_found", Some(format!("{}", e)))
         })?;
         let mut result = GetAccountResponse::default();
+        result.head_block_time = controller.last_accepted_block().timestamp();
+        result.head_block_num = controller.last_accepted_block().block_num();
+
         result.account_name = name.clone();
         result.privileged = accnt_metadata_obj.is_privileged();
         result.last_code_update = accnt_metadata_obj.last_code_update;
         result.created = accnt_obj.creation_date;
+
+        let current_usage_time = result.head_block_time;
+        result.net_limit = ResourceLimitsManager::get_account_net_limit(&mut session, &name, Some(current_usage_time)).map_err(|e| {
+            ErrorObjectOwned::owned(500, "resource_limits_error", Some(format!("{}", e)))
+        })?;
+        result.cpu_limit = ResourceLimitsManager::get_account_cpu_limit(&mut session, &name, Some(current_usage_time)).map_err(|e| {
+            ErrorObjectOwned::owned(500, "resource_limits_error", Some(format!("{}", e)))
+        })?;
+
+        ResourceLimitsManager::get_account_limits(&mut session, &name, &mut result.ram_quota, &mut result.net_weight, &mut result.cpu_weight).map_err(|e| {
+            ErrorObjectOwned::owned(500, "resource_limits_error", Some(format!("{}", e)))
+        })?;
+
+        result.ram_usage = ResourceLimitsManager::get_account_ram_usage(&mut session, &name).map_err(|e| {
+            ErrorObjectOwned::owned(500, "resource_limits_error", Some(format!("{}", e)))
+        })?;
 
         let mut permissions = session.get_index::<Permission, PermissionByOwnerIndex>();
         let mut perm_iter = permissions.lower_bound((name.clone(), Name::default()))?;

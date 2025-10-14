@@ -1,8 +1,9 @@
 use core::fmt;
+use std::collections::HashMap;
 
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 
-use crate::chain::{Action, ActionReceipt, BlockTimestamp, Id, Name, error::ChainError};
+use crate::chain::{account, error::ChainError, Action, ActionReceipt, BlockTimestamp, Id, Name};
 
 #[derive(Debug, Clone, PartialEq, Eq, Read, Write, NumBytes)]
 pub struct ActionTrace {
@@ -18,6 +19,7 @@ pub struct ActionTrace {
     pub trx_id: Id,
     pub block_num: u32,
     pub block_time: BlockTimestamp,
+    pub account_ram_deltas: HashMap<Name, i64>,
     pub except: Option<u8>,
     pub error_code: Option<u64>,
     pub return_value: Vec<u8>,
@@ -34,6 +36,7 @@ impl ActionTrace {
         action_ordinal: u32,
         creator_action_ordinal: u32,
         closest_unnotified_ancestor_action_ordinal: u32,
+        account_ram_deltas: HashMap<Name, i64>,
     ) -> Self {
         ActionTrace {
             trx_id,
@@ -48,6 +51,7 @@ impl ActionTrace {
             receipt: None,
             elapsed: 0,
             console: String::new(),
+            account_ram_deltas,
             except: None,
             error_code: None,
             return_value: vec![],

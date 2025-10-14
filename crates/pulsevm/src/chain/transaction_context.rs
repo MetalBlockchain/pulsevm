@@ -1,16 +1,16 @@
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     rc::Rc,
-    sync::{Arc, RwLock, atomic::AtomicI64},
+    sync::{atomic::AtomicI64, Arc, RwLock},
 };
 
 use pulsevm_chainbase::UndoSession;
 use pulsevm_crypto::Digest;
+use pulsevm_serialization::VarUint32;
 
 use crate::chain::{
-    ActionReceipt, BlockTimestamp, PackedTransaction, TransactionReceiptHeader, TransactionStatus,
-    TransactionTrace, config, genesis::ChainConfig, pulse_assert, wasm_runtime::WasmRuntime,
+    config, genesis::ChainConfig, pulse_assert, resource_limits::ResourceLimitsManager, wasm_runtime::WasmRuntime, ActionReceipt, BlockTimestamp, PackedTransaction, TransactionReceiptHeader, TransactionStatus, TransactionTrace
 };
 
 use super::{
@@ -33,6 +33,7 @@ pub struct TransactionContext {
 
     trace: Rc<RefCell<TransactionTrace>>,
     billed_cpu_time_us: Rc<AtomicI64>,
+    validate_ram_usage: Rc<RwLock<HashSet<Name>>>,
 }
 
 impl TransactionContext {
@@ -59,6 +60,7 @@ impl TransactionContext {
 
             trace: Rc::new(RefCell::new(trace)),
             billed_cpu_time_us: Rc::new(AtomicI64::new(0)),
+            validate_ram_usage: Rc::new(RwLock::new(HashSet::new())),
         }
     }
 
@@ -153,6 +155,7 @@ impl TransactionContext {
             new_action_ordinal,
             creator_action_ordinal,
             closest_unnotified_ancestor_action_ordinal,
+            HashMap::new(),
         ));
 
         new_action_ordinal
@@ -184,6 +187,7 @@ impl TransactionContext {
             new_action_ordinal,
             creator_action_ordinal,
             closest_unnotified_ancestor_action_ordinal,
+            HashMap::new(),
         ));
 
         Ok(new_action_ordinal)
@@ -209,6 +213,11 @@ impl TransactionContext {
 
         // Initialize the apply context with the action trace.
         apply_context.exec(self)?;
+
+        // Finalize the apply context
+        for (account, ram_delta) in apply_context.account_ram_deltas().iter() {
+            self.add_ram_usage(account, *ram_delta)?;
+        }
 
         Ok(())
     }
@@ -256,7 +265,7 @@ impl TransactionContext {
             .load(std::sync::atomic::Ordering::Relaxed);
 
         trace.net_usage = ((trace.net_usage + 7) / 8) * 8; // Round up to nearest multiple of word size (8 bytes)
-        trace.receipt = TransactionReceiptHeader::new(TransactionStatus::Executed, 0, (trace.net_usage / 8) as u32);
+        trace.receipt = TransactionReceiptHeader::new(TransactionStatus::Executed, 0, VarUint32((trace.net_usage / 8) as u32));
 
         Ok(TransactionResult {
             trace: trace.clone(),
@@ -267,5 +276,20 @@ impl TransactionContext {
     pub fn add_net_usage(&self, net_usage: u64) {
         let mut trace = self.trace.borrow_mut();
         trace.net_usage += net_usage;
+    }
+
+    pub fn add_ram_usage(&self, account: &Name, ram_delta: i64) -> Result<(), ChainError> {
+        let mut session = self.session.clone();
+
+        // Update the RAM usage in the resource limits manager.
+        ResourceLimitsManager::add_pending_ram_usage(&mut session, account, ram_delta)?;
+
+        if ram_delta > 0 {
+            self.validate_ram_usage.write().map_err(|_| {
+                ChainError::TransactionError("failed to lock validate_ram_usage".into())
+            })?.insert(account.clone());
+        }
+
+        Ok(())
     }
 }
