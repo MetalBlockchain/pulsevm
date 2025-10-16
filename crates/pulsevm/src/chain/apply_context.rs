@@ -425,6 +425,7 @@ impl ApplyContext {
             .map_err(|e| ChainError::TransactionError(format!("failed to insert keyval: {}", e)))?;
         self.session.modify(&mut table, |t| {
             t.count += 1;
+            Ok(())
         })?;
 
         let billable_size = data.len() as i64 + billable_size_v::<KeyValue>() as i64;
@@ -489,6 +490,7 @@ impl ApplyContext {
         self.session.modify(&mut obj.clone(), |kv| {
             kv.payer = payer;
             kv.value = data.clone();
+            Ok(())
         })?;
         Ok(())
     }
@@ -511,6 +513,7 @@ impl ApplyContext {
         self.session.remove(obj.clone())?;
         self.session.modify(&mut table_obj.clone(), |t| {
             t.count -= 1;
+            Ok(())
         })?;
 
         if table_obj.count == 0 {
@@ -753,6 +756,7 @@ impl ApplyContext {
         let next_sequence = receiver_account.recv_sequence + 1;
         self.session.modify(receiver_account, |am| {
             am.recv_sequence = next_sequence;
+            Ok(())
         })?;
 
         Ok(next_sequence)
@@ -763,6 +767,7 @@ impl ApplyContext {
         let next_sequence = amo.auth_sequence + 1;
         self.session.modify(&mut amo, |amo| {
             amo.auth_sequence = next_sequence;
+            Ok(())
         })?;
 
         Ok(next_sequence)
@@ -775,6 +780,7 @@ impl ApplyContext {
             let next_sequence = dgpo.global_action_sequence + 1;
             self.session.modify(&mut dgpo, |dgpo| {
                 dgpo.global_action_sequence = next_sequence;
+                Ok(())
             })?;
             return Ok(next_sequence);
         } else {

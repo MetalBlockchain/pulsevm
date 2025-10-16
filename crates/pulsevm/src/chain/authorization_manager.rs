@@ -422,6 +422,7 @@ impl AuthorizationManager {
         session
             .modify(permission, |po| {
                 po.authority = auth.clone();
+                Ok(())
             })
             .map_err(|e| {
                 ChainError::AuthorizationError(format!("Failed to create permission: {}", e))

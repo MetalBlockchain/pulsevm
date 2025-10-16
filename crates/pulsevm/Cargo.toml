@@ -28,7 +28,7 @@ serde_json = "1.0"
 thiserror = "2"
 time = { version = "0.3.41", features = ["formatting", "macros", "parsing"] }
 prost-types = "0.12.3"
-wasmtime = { version = "34.0.1", features = ["coredump"] }
+wasmtime = { version = "37.0.2", features = ["coredump"] }
 
 pulsevm_crypto = { path = "../pulsevm_crypto" }
 pulsevm_grpc = { path = "../pulsevm_grpc" }

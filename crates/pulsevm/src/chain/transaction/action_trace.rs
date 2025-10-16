@@ -3,7 +3,7 @@ use std::collections::HashMap;
 
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 
-use crate::chain::{account, error::ChainError, Action, ActionReceipt, BlockTimestamp, Id, Name};
+use crate::chain::{Action, ActionReceipt, BlockTimestamp, Id, Name, account, error::ChainError};
 
 #[derive(Debug, Clone, PartialEq, Eq, Read, Write, NumBytes)]
 pub struct ActionTrace {

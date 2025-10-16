@@ -19,7 +19,11 @@ use crate::{
         GetTableRowsResponse, IssueTxResponse, PermissionResponse,
     },
     chain::{
-        error::ChainError, pulse_assert, resource_limits::ResourceLimitsManager, string_to_symbol, AbiDefinition, AbiSerializer, Account, AccountMetadata, Asset, Base64Bytes, BlockHeader, BlockTimestamp, Gossipable, Id, KeyValue, KeyValueByScopePrimaryIndex, Name, PackedTransaction, Permission, PermissionByOwnerIndex, Signature, SignedBlock, Table, TableByCodeScopeTableIndex, TransactionCompression, PULSE_NAME
+        AbiDefinition, AbiSerializer, Account, AccountMetadata, Asset, Base64Bytes, BlockHeader,
+        BlockTimestamp, Gossipable, Id, KeyValue, KeyValueByScopePrimaryIndex, Name, PULSE_NAME,
+        PackedTransaction, Permission, PermissionByOwnerIndex, Signature, SignedBlock, Table,
+        TableByCodeScopeTableIndex, TransactionCompression, error::ChainError, pulse_assert,
+        resource_limits::ResourceLimitsManager, string_to_symbol,
     },
     mempool::Mempool,
 };
@@ -153,9 +157,9 @@ impl RpcServer for RpcService {
     async fn get_account(&self, name: Name) -> Result<GetAccountResponse, ErrorObjectOwned> {
         let controller = self.controller.clone();
         let mut controller = controller.write().await;
-        let mut session = controller.create_undo_session().map_err(|e| {
-            ErrorObjectOwned::owned(500, "database_error", Some(format!("{}", e)))
-        })?;
+        let mut session = controller
+            .create_undo_session()
+            .map_err(|e| ErrorObjectOwned::owned(500, "database_error", Some(format!("{}", e))))?;
         let accnt_obj = session.get::<Account>(name.clone()).map_err(|e| {
             ErrorObjectOwned::owned(404, "account_not_found", Some(format!("{}", e)))
         })?;
@@ -172,20 +176,38 @@ impl RpcServer for RpcService {
         result.created = accnt_obj.creation_date;
 
         let current_usage_time = result.head_block_time;
-        result.net_limit = ResourceLimitsManager::get_account_net_limit(&mut session, &name, Some(current_usage_time)).map_err(|e| {
+        result.net_limit = ResourceLimitsManager::get_account_net_limit(
+            &mut session,
+            &name,
+            Some(current_usage_time),
+        )
+        .map_err(|e| {
             ErrorObjectOwned::owned(500, "resource_limits_error", Some(format!("{}", e)))
         })?;
-        result.cpu_limit = ResourceLimitsManager::get_account_cpu_limit(&mut session, &name, Some(current_usage_time)).map_err(|e| {
+        result.cpu_limit = ResourceLimitsManager::get_account_cpu_limit(
+            &mut session,
+            &name,
+            Some(current_usage_time),
+        )
+        .map_err(|e| {
             ErrorObjectOwned::owned(500, "resource_limits_error", Some(format!("{}", e)))
         })?;
 
-        ResourceLimitsManager::get_account_limits(&mut session, &name, &mut result.ram_quota, &mut result.net_weight, &mut result.cpu_weight).map_err(|e| {
+        ResourceLimitsManager::get_account_limits(
+            &mut session,
+            &name,
+            &mut result.ram_quota,
+            &mut result.net_weight,
+            &mut result.cpu_weight,
+        )
+        .map_err(|e| {
             ErrorObjectOwned::owned(500, "resource_limits_error", Some(format!("{}", e)))
         })?;
 
-        result.ram_usage = ResourceLimitsManager::get_account_ram_usage(&mut session, &name).map_err(|e| {
-            ErrorObjectOwned::owned(500, "resource_limits_error", Some(format!("{}", e)))
-        })?;
+        result.ram_usage = ResourceLimitsManager::get_account_ram_usage(&mut session, &name)
+            .map_err(|e| {
+                ErrorObjectOwned::owned(500, "resource_limits_error", Some(format!("{}", e)))
+            })?;
 
         let mut permissions = session.get_index::<Permission, PermissionByOwnerIndex>();
         let mut perm_iter = permissions.lower_bound((name.clone(), Name::default()))?;
@@ -351,6 +373,16 @@ impl RpcServer for RpcService {
         let controller = self.controller.clone();
         let controller = controller.read().await;
         let head_block = controller.last_accepted_block();
+        let session = controller
+            .database()
+            .undo_session()
+            .map_err(|e| ErrorObjectOwned::owned(500, "database_error", Some(format!("{}", e))))?;
+        let total_cpu_weight = ResourceLimitsManager::get_total_cpu_weight(&mut session.clone()).map_err(|e| {
+            ErrorObjectOwned::owned(500, "resource_limits_error", Some(format!("{}", e)))
+        })?;
+        let total_net_weight = ResourceLimitsManager::get_total_net_weight(&mut session.clone()).map_err(|e| {
+            ErrorObjectOwned::owned(500, "resource_limits_error", Some(format!("{}", e)))
+        })?;
 
         Ok(GetInfoResponse {
             server_version: "d133c641".to_owned(),
@@ -370,8 +402,8 @@ impl RpcServer for RpcService {
             fork_db_head_block_num: head_block.block_num(),
             server_full_version_string: "v5.0.3-d133c6413ce8ce2e96096a0513ec25b4a8dbe837"
                 .to_owned(), // Mimic EOS here
-            total_cpu_weight: 100, // Placeholder, adjust as needed
-            total_net_weight: 100, // Placeholder, adjust as needed
+            total_cpu_weight: total_cpu_weight,
+            total_net_weight: total_net_weight,
             earliest_available_block_num: 1,
             last_irreversible_block_time: head_block.timestamp(),
         })

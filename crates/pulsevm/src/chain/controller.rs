@@ -7,7 +7,19 @@ use std::{
 
 use crate::{
     chain::{
-        block::{BlockHeader, SignedBlock}, config::GlobalPropertyObject, pulse_contract::{deleteauth, linkauth, unlinkauth}, pulse_contract_abi::get_pulse_contract_abi, resource_limits::ResourceLimitsManager, transaction_context::TransactionResult, AbiDefinition, Account, AccountMetadata, Asset, BlockTimestamp, HistoryPlugin, PackedTransaction, SignedTransaction, TransactionReceipt, TransactionTrace, ACTIVE_NAME, DELETEAUTH_NAME, LINKAUTH_NAME, NEWACCOUNT_NAME, SETABI_NAME, SETCODE_NAME, UNLINKAUTH_NAME, UPDATEAUTH_NAME
+        ACTIVE_NAME, AbiDefinition, Account, AccountMetadata, Asset,
+        BLOCK_CPU_USAGE_AVERAGE_WINDOW_MS, BLOCK_INTERVAL_MS, BLOCK_SIZE_AVERAGE_WINDOW_MS,
+        BlockTimestamp, DELETEAUTH_NAME, ElasticLimitParameters, HistoryPlugin, LINKAUTH_NAME,
+        MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER, NEWACCOUNT_NAME, PackedTransaction, Ratio,
+        SETABI_NAME, SETCODE_NAME, SignedTransaction, TransactionReceipt, TransactionTrace,
+        UNLINKAUTH_NAME, UPDATEAUTH_NAME,
+        block::{BlockHeader, SignedBlock},
+        config::GlobalPropertyObject,
+        eos_percent, make_ratio,
+        pulse_contract::{deleteauth, linkauth, unlinkauth},
+        pulse_contract_abi::get_pulse_contract_abi,
+        resource_limits::ResourceLimitsManager,
+        transaction_context::TransactionResult,
     },
     mempool::Mempool,
     state_history::StateHistoryLog,
@@ -26,6 +38,7 @@ use pulsevm_crypto::{Digest, merkle};
 use pulsevm_serialization::{Read, VarUint32, Write};
 use spdlog::info;
 use tokio::sync::{RwLock as AsyncRwLock, broadcast};
+use wasmtime::component::Resource;
 
 pub type ApplyHandlerFn = fn(&mut ApplyContext) -> Result<(), ChainError>;
 pub type ApplyHandlerMap = HashMap<
@@ -230,10 +243,8 @@ impl Controller {
             let transaction = transaction.unwrap();
             let transaction_result =
                 self.execute_transaction(&mut undo_session, &transaction, &timestamp)?;
-            let receipt = TransactionReceipt::new(
-                transaction_result.trace.receipt.clone(),
-                transaction,
-            );
+            let receipt =
+                TransactionReceipt::new(transaction_result.trace.receipt.clone(), transaction);
 
             // Add the transaction to the block
             transaction_receipts.push_back(receipt);
@@ -358,6 +369,38 @@ impl Controller {
         session
             .insert(block)
             .map_err(|e| ChainError::TransactionError(format!("failed to insert block: {}", e)))?;
+
+        // Update resource limits
+        let chain_config = self.genesis.initial_configuration();
+        let cpu_target = eos_percent(
+            chain_config.max_block_cpu_usage as u64,
+            chain_config.target_block_cpu_usage_pct,
+        );
+        let cpu_elastic_parameters = ElasticLimitParameters::new(
+            cpu_target,
+            chain_config.max_block_cpu_usage as u64,
+            BLOCK_CPU_USAGE_AVERAGE_WINDOW_MS / BLOCK_INTERVAL_MS,
+            MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER,
+            make_ratio(99, 100),
+            make_ratio(1000, 999),
+        );
+        let net_elastic_parameters = ElasticLimitParameters::new(
+            eos_percent(
+                chain_config.max_block_net_usage,
+                chain_config.target_block_net_usage_pct,
+            ),
+            chain_config.max_block_net_usage as u64,
+            BLOCK_SIZE_AVERAGE_WINDOW_MS / BLOCK_INTERVAL_MS,
+            MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER,
+            make_ratio(99, 100),
+            make_ratio(1000, 999),
+        );
+        ResourceLimitsManager::process_account_limit_updates(session)?;
+        ResourceLimitsManager::set_block_parameters(
+            session,
+            cpu_elastic_parameters,
+            net_elastic_parameters,
+        )?;
 
         Ok(transaction_traces)
     }

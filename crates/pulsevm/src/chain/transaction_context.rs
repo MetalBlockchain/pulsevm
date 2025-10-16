@@ -2,7 +2,7 @@ use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
     rc::Rc,
-    sync::{atomic::AtomicI64, Arc, RwLock},
+    sync::{Arc, RwLock, atomic::AtomicI64},
 };
 
 use pulsevm_chainbase::UndoSession;
@@ -10,7 +10,9 @@ use pulsevm_crypto::Digest;
 use pulsevm_serialization::VarUint32;
 
 use crate::chain::{
-    config, genesis::ChainConfig, pulse_assert, resource_limits::ResourceLimitsManager, wasm_runtime::WasmRuntime, ActionReceipt, BlockTimestamp, PackedTransaction, TransactionReceiptHeader, TransactionStatus, TransactionTrace
+    ActionReceipt, BlockTimestamp, PackedTransaction, TransactionReceiptHeader, TransactionStatus,
+    TransactionTrace, config, genesis::ChainConfig, pulse_assert,
+    resource_limits::ResourceLimitsManager, wasm_runtime::WasmRuntime,
 };
 
 use super::{
@@ -33,7 +35,8 @@ pub struct TransactionContext {
 
     trace: Rc<RefCell<TransactionTrace>>,
     billed_cpu_time_us: Rc<AtomicI64>,
-    validate_ram_usage: Rc<RwLock<HashSet<Name>>>,
+    bill_to_accounts: Rc<RefCell<HashSet<Name>>>,
+    validate_ram_usage: Rc<RefCell<HashSet<Name>>>,
 }
 
 impl TransactionContext {
@@ -60,7 +63,8 @@ impl TransactionContext {
 
             trace: Rc::new(RefCell::new(trace)),
             billed_cpu_time_us: Rc::new(AtomicI64::new(0)),
-            validate_ram_usage: Rc::new(RwLock::new(HashSet::new())),
+            bill_to_accounts: Rc::new(RefCell::new(HashSet::new())),
+            validate_ram_usage: Rc::new(RefCell::new(HashSet::new())),
         }
     }
 
@@ -265,7 +269,25 @@ impl TransactionContext {
             .load(std::sync::atomic::Ordering::Relaxed);
 
         trace.net_usage = ((trace.net_usage + 7) / 8) * 8; // Round up to nearest multiple of word size (8 bytes)
-        trace.receipt = TransactionReceiptHeader::new(TransactionStatus::Executed, 0, VarUint32((trace.net_usage / 8) as u32));
+        trace.receipt = TransactionReceiptHeader::new(
+            TransactionStatus::Executed,
+            0,
+            VarUint32((trace.net_usage / 8) as u32),
+        );
+
+        let mut session = self.session.clone();
+        let validate_ram_usage = self.validate_ram_usage.borrow();
+        for account in validate_ram_usage.iter() {
+            ResourceLimitsManager::verify_account_ram_usage(&mut session, account)?;
+        }
+
+        ResourceLimitsManager::add_transaction_usage(
+            &mut session,
+            &self.bill_to_accounts.borrow(),
+            billed_cpu_time_us as u64,
+            trace.net_usage as u64,
+            self.pending_block_timestamp().slot,
+        )?;
 
         Ok(TransactionResult {
             trace: trace.clone(),
@@ -285,9 +307,7 @@ impl TransactionContext {
         ResourceLimitsManager::add_pending_ram_usage(&mut session, account, ram_delta)?;
 
         if ram_delta > 0 {
-            self.validate_ram_usage.write().map_err(|_| {
-                ChainError::TransactionError("failed to lock validate_ram_usage".into())
-            })?.insert(account.clone());
+            self.validate_ram_usage.borrow_mut().insert(account.clone());
         }
 
         Ok(())

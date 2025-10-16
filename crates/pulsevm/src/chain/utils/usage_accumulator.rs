@@ -5,7 +5,7 @@ use std::{
 
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 
-use crate::chain::{config, error::ChainError, pulse_assert, RATE_LIMITING_PRECISION};
+use crate::chain::{RATE_LIMITING_PRECISION, config, error::ChainError, pulse_assert};
 
 #[derive(Debug, Clone, Copy, PartialEq, Read, Write, NumBytes, Default, Eq, Hash)]
 pub struct Ratio<T> {

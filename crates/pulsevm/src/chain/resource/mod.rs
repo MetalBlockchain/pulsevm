@@ -11,7 +11,7 @@ mod resource_limits_state;
 pub use resource_limits_state::ResourceLimitsState;
 
 mod resource_limits;
-pub use resource_limits::ResourceLimits;
+pub use resource_limits::{ResourceLimits, ResourceLimitsByOwnerIndex};
 
 mod resource_usage;
 pub use resource_usage::ResourceUsage;

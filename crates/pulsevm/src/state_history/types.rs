@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use pulsevm_crypto::{Bytes, Digest};
-use pulsevm_proc_macros::{name, NumBytes, Read, Write};
+use pulsevm_proc_macros::{NumBytes, Read, Write, name};
 use pulsevm_serialization::VarUint32;
 use pulsevm_time::TimePointSec;
 use serde::Serialize;

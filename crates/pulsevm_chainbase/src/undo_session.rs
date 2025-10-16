@@ -3,6 +3,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
+use anyhow::Result;
 use fjall::{Slice, TransactionalKeyspace, WriteTransaction};
 
 use crate::{ChainbaseError, ChainbaseObject, SecondaryIndex, index::Index, open_partition};
@@ -85,6 +86,35 @@ impl UndoSession {
             return Err(ChainbaseError::NotFound);
         }
         let object = found.unwrap();
+        Ok(object)
+    }
+
+    #[must_use]
+    pub fn get_by_secondary<T: ChainbaseObject, S: SecondaryIndex<T>>(
+        &mut self,
+        key: S::Key,
+    ) -> Result<T, ChainbaseError> {
+        let partition = open_partition(&self.keyspace, S::index_name())?;
+        let mut tx = self
+            .tx
+            .write()
+            .map_err(|_| ChainbaseError::InternalError(format!("failed to write transaction")))?;
+        let secondary_key = tx
+            .get(&partition, S::secondary_key_as_bytes(key))
+            .map_err(|_| ChainbaseError::InternalError(format!("failed to get secondary key")))?;
+        if secondary_key.is_none() {
+            return Err(ChainbaseError::NotFound);
+        }
+        let partition = open_partition(&self.keyspace, T::table_name())?;
+        let serialized = tx.get(&partition, secondary_key.unwrap()).map_err(|_| {
+            ChainbaseError::InternalError(format!("failed to get object for secondary key"))
+        })?;
+        if serialized.is_none() {
+            return Err(ChainbaseError::NotFound);
+        }
+        let mut pos = 0 as usize;
+        let object: T = T::read(&serialized.unwrap(), &mut pos)
+            .map_err(|_| ChainbaseError::InternalError(format!("failed to read object")))?;
         Ok(object)
     }
 
@@ -178,7 +208,7 @@ impl UndoSession {
     pub fn modify<T, F>(&mut self, old: &mut T, f: F) -> Result<(), ChainbaseError>
     where
         T: ChainbaseObject,
-        F: FnOnce(&mut T),
+        F: FnOnce(&mut T) -> Result<()>,
     {
         let key = old.primary_key();
         let partition = open_partition(&self.keyspace, T::table_name())?;
@@ -195,7 +225,12 @@ impl UndoSession {
         if existing.is_none() {
             return Err(ChainbaseError::NotFound);
         }
-        f(old);
+        f(old).map_err(|e| {
+            ChainbaseError::InternalError(format!(
+                "failed to modify object for key: {:?}, error: {}",
+                key, e
+            ))
+        })?;
         let serialized_old = existing.unwrap().to_vec();
         let serialized_new = old.pack().map_err(|_| {
             ChainbaseError::InternalError(format!(

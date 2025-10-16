@@ -14,7 +14,7 @@ pub struct ResourceLimitsState {
     pub total_net_weight: u64,
     pub total_cpu_weight: u64,
     pub total_ram_bytes: u64,
-    
+
     pub virtual_net_limit: u64,
     pub virtual_cpu_limit: u64,
 }

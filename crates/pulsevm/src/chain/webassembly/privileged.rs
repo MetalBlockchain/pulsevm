@@ -38,6 +38,7 @@ pub fn set_privileged() -> impl Fn(Caller<'_, WasmContext>, u64, i32) -> Result<
         session
             .modify(&mut account, |acc| {
                 acc.set_privileged(is_priv == 1);
+                Ok(())
             })
             .map_err(|_| anyhow::anyhow!("failed to set privileged status for account"))?;
 

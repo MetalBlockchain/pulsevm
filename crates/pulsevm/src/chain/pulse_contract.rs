@@ -166,6 +166,7 @@ pub fn setcode(context: &mut ApplyContext) -> Result<(), ChainError> {
             session
                 .modify(&mut old_code_entry, |code| {
                     code.code_ref_count -= 1;
+                    Ok(())
                 })
                 .map_err(|_| ChainError::TransactionError(format!("failed to update code")))?;
         }
@@ -180,6 +181,7 @@ pub fn setcode(context: &mut ApplyContext) -> Result<(), ChainError> {
             session
                 .modify(&mut new_code_entry, |code| {
                     code.code_ref_count += 1;
+                    Ok(())
                 })
                 .map_err(|_| {
                     ChainError::TransactionError(format!("failed to update code reference count"))
@@ -206,6 +208,7 @@ pub fn setcode(context: &mut ApplyContext) -> Result<(), ChainError> {
             a.vm_type = act.vm_type;
             a.vm_version = act.vm_version;
             a.last_code_update = context.pending_block_timestamp();
+            Ok(())
         })
         .map_err(|_| ChainError::TransactionError(format!("failed to update account")))?;
 
@@ -238,6 +241,7 @@ pub fn setabi(context: &mut ApplyContext) -> Result<(), ChainError> {
     session
         .modify(&mut account, |a| {
             a.abi = abi_def_packed.clone();
+            Ok(())
         })
         .map_err(|_| ChainError::TransactionError(format!("failed to update account")))?;
 
@@ -247,6 +251,7 @@ pub fn setabi(context: &mut ApplyContext) -> Result<(), ChainError> {
     session
         .modify(&mut account_metadata, |a| {
             a.abi_sequence += 1;
+            Ok(())
         })
         .map_err(|_| ChainError::TransactionError(format!("failed to update account metadata")))?;
 
@@ -450,6 +455,7 @@ pub fn linkauth(context: &mut ApplyContext) -> Result<(), ChainError> {
         )?;
         session.modify(&mut link, |l| {
             l.required_permission = requirement.requirement;
+            Ok(())
         })?;
     } else {
         let new_link = PermissionLink::new(
