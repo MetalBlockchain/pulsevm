@@ -5,7 +5,7 @@ use wasmtime::{Config, Engine, IntoFunc, Linker, Module, Store, Strategy};
 
 use crate::chain::{
     apply_context::ApplyContext, webassembly::{
-        current_time, db_end_i64, db_find_i64, db_get_i64, db_lowerbound_i64, db_next_i64, db_previous_i64, db_remove_i64, db_store_i64, db_update_i64, db_upperbound_i64, get_resource_limits, get_self, is_privileged, pulse_assert, read_action_data, require_auth2, require_recipient, set_action_return_value, set_privileged, set_resource_limits, sha1, sha256, sha512
+        check_transaction_authorization, current_time, db_end_i64, db_find_i64, db_get_i64, db_lowerbound_i64, db_next_i64, db_previous_i64, db_remove_i64, db_store_i64, db_update_i64, db_upperbound_i64, get_resource_limits, get_self, is_privileged, pulse_assert, read_action_data, require_auth2, require_recipient, set_action_return_value, set_privileged, set_resource_limits, sha1, sha256, sha512
     }, Action, Name
 };
 
@@ -110,6 +110,7 @@ impl WasmRuntime {
         Self::add_host_function(&mut linker, "env", "memset", memset())?;
         // Transaction functions
         Self::add_host_function(&mut linker, "env", "send_inline", send_inline())?;
+        Self::add_host_function(&mut linker, "env", "check_transaction_authorization", check_transaction_authorization())?;
         // Database functions
         Self::add_host_function(&mut linker, "env", "db_find_i64", db_find_i64())?;
         Self::add_host_function(&mut linker, "env", "db_store_i64", db_store_i64())?;
