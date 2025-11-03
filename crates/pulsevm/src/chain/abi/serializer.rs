@@ -197,10 +197,8 @@ impl AbiSerializer {
         data: &[u8],
         pos: &mut usize,
     ) -> Result<Value, ChainError> {
-        println!("binary_to_variant type_name: {}", type_name);
         let rtype = self.resolve_type(type_name);
         let ftype = fundamental_type(&rtype);
-        println!("  resolved type: {}, fundamental type: {}", rtype, ftype);
 
         if let Some(btype) = self.built_in_types.get(ftype) {
             return btype(data, pos).map_err(ChainError::from);
@@ -546,7 +544,6 @@ mod tests {
         let packed = 0f64;
         let packed = packed.pack().unwrap();
         let packed = hex::encode(packed);
-        println!("packed: {}", packed);
 
         let value = serializer
             .binary_to_variant(
@@ -555,6 +552,5 @@ mod tests {
                 &mut 0,
             )
             .unwrap();
-        println!("value: {}", value);
     }
 }
