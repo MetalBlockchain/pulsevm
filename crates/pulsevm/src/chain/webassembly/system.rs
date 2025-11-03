@@ -27,3 +27,13 @@ pub fn pulse_assert()
         Ok(())
     }
 }
+
+pub fn current_time()
+-> impl Fn(Caller<'_, WasmContext>) -> Result<u64, wasmtime::Error> {
+    |mut caller| {
+        let context = caller.data_mut().apply_context();
+        let result = context.pending_block_timestamp().to_time_point().time_since_epoch().count();
+
+        Ok(result as u64)
+    }
+}

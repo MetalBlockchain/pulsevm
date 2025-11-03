@@ -4,14 +4,9 @@ use lru::LruCache;
 use wasmtime::{Config, Engine, IntoFunc, Linker, Module, Store, Strategy};
 
 use crate::chain::{
-    Action, Name,
-    apply_context::ApplyContext,
-    webassembly::{
-        db_end_i64, db_find_i64, db_get_i64, db_lowerbound_i64, db_next_i64, db_previous_i64,
-        db_remove_i64, db_store_i64, db_update_i64, db_upperbound_i64, get_self, is_privileged,
-        pulse_assert, read_action_data, require_auth2, require_recipient, set_action_return_value,
-        set_privileged, set_resource_limits, sha1, sha256, sha512,
-    },
+    apply_context::ApplyContext, webassembly::{
+        current_time, db_end_i64, db_find_i64, db_get_i64, db_lowerbound_i64, db_next_i64, db_previous_i64, db_remove_i64, db_store_i64, db_update_i64, db_upperbound_i64, get_resource_limits, get_self, is_privileged, pulse_assert, read_action_data, require_auth2, require_recipient, set_action_return_value, set_privileged, set_resource_limits, sha1, sha256, sha512
+    }, Action, Name
 };
 
 use super::{
@@ -128,6 +123,7 @@ impl WasmRuntime {
         Self::add_host_function(&mut linker, "env", "db_upperbound_i64", db_upperbound_i64())?;
         // System functions
         Self::add_host_function(&mut linker, "env", "pulse_assert", pulse_assert())?;
+        Self::add_host_function(&mut linker, "env", "current_time", current_time())?;
         // Privileged functions
         Self::add_host_function(&mut linker, "env", "is_privileged", is_privileged())?;
         Self::add_host_function(&mut linker, "env", "set_privileged", set_privileged())?;
@@ -136,6 +132,12 @@ impl WasmRuntime {
             "env",
             "set_resource_limits",
             set_resource_limits(),
+        )?;
+        Self::add_host_function(
+            &mut linker,
+            "env",
+            "get_resource_limits",
+            get_resource_limits(),
         )?;
         // Crypto functions
         Self::add_host_function(&mut linker, "env", "sha1", sha1())?;
@@ -177,7 +179,6 @@ impl WasmRuntime {
             let mut session = apply_context.undo_session();
 
             if !self.code_cache.contains(&code_hash) {
-                println!("not in cache");
                 let code_object = session.get::<CodeObject>(code_hash).map_err(|e| {
                     ChainError::WasmRuntimeError(format!("failed to get wasm code: {}", e))
                 })?;

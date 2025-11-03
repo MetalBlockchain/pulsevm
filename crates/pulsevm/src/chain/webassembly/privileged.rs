@@ -1,4 +1,7 @@
+use std::cell::RefMut;
+
 use anyhow::bail;
+use pulsevm_serialization::Write;
 use wasmtime::Caller;
 
 use crate::chain::{
@@ -78,6 +81,45 @@ pub fn set_resource_limits()
             ram_bytes,
         )?;
         // TODO: Validate ram usage
+        Ok(())
+    }
+}
+
+pub fn get_resource_limits()
+-> impl Fn(Caller<'_, WasmContext>, u64, i32, i32, i32) -> Result<(), wasmtime::Error> {
+    |mut caller, account, ram_bytes_ptr, net_weight_ptr, cpu_weight_ptr| {
+        let context = caller.data_mut().apply_context_mut();
+        privileged_check(context)?;
+        let mut session = context.undo_session();
+        let mut ram_bytes = 0;
+        let mut net_weight = 0;
+        let mut cpu_weight = 0;
+        ResourceLimitsManager::get_account_limits(
+            &mut session,
+            &account.into(),
+            &mut ram_bytes,
+            &mut net_weight,
+            &mut cpu_weight,
+        )?;
+        let memory = caller
+            .get_export("memory")
+            .and_then(|ext| ext.into_memory())
+            .ok_or_else(|| anyhow::anyhow!("memory export not found"))?;
+        memory.write(
+            &mut caller,
+            ram_bytes_ptr as usize,
+            &ram_bytes.to_le_bytes(),
+        )?;
+        memory.write(
+            &mut caller,
+            net_weight_ptr as usize,
+            &net_weight.to_le_bytes(),
+        )?;
+        memory.write(
+            &mut caller,
+            cpu_weight_ptr as usize,
+            &cpu_weight.to_le_bytes(),
+        )?;
         Ok(())
     }
 }
