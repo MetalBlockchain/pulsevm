@@ -19,11 +19,7 @@ use crate::{
         GetTableRowsResponse, IssueTxResponse, PermissionResponse,
     },
     chain::{
-        AbiDefinition, AbiSerializer, Account, AccountMetadata, Asset, Base64Bytes, BlockHeader,
-        BlockTimestamp, Gossipable, Id, KeyValue, KeyValueByScopePrimaryIndex, Name, PULSE_NAME,
-        PackedTransaction, Permission, PermissionByOwnerIndex, Signature, SignedBlock, Table,
-        TableByCodeScopeTableIndex, TransactionCompression, error::ChainError, pulse_assert,
-        resource_limits::ResourceLimitsManager, string_to_symbol,
+        error::ChainError, pulse_assert, resource_limits::ResourceLimitsManager, string_to_symbol, AbiDefinition, AbiSerializer, Account, AccountMetadata, Asset, Base64Bytes, BlockHeader, BlockTimestamp, Gossipable, I32Flex, Id, KeyValue, KeyValueByScopePrimaryIndex, Name, PackedTransaction, Permission, PermissionByOwnerIndex, Signature, SignedBlock, Table, TableByCodeScopeTableIndex, TransactionCompression, PULSE_NAME
     },
     mempool::Mempool,
 };
@@ -89,7 +85,7 @@ pub trait Rpc {
         scope: String,
         table: Name,
         json: bool,
-        limit: i32,
+        limit: I32Flex,
         lower_bound: Option<String>,
         upper_bound: Option<String>,
         key_type: String,
@@ -125,8 +121,6 @@ impl RpcService {
     ) -> Result<String, serde_json::Error> {
         // Make sure `RpcService` implements your API trait
         let module = self.clone().into_rpc();
-
-        println!("API Request: {}", request_body);
 
         // Run the request and return the response
         let (resp, mut _stream) = module.raw_json_request(request_body, 1).await?;
@@ -377,12 +371,14 @@ impl RpcServer for RpcService {
             .database()
             .undo_session()
             .map_err(|e| ErrorObjectOwned::owned(500, "database_error", Some(format!("{}", e))))?;
-        let total_cpu_weight = ResourceLimitsManager::get_total_cpu_weight(&mut session.clone()).map_err(|e| {
-            ErrorObjectOwned::owned(500, "resource_limits_error", Some(format!("{}", e)))
-        })?;
-        let total_net_weight = ResourceLimitsManager::get_total_net_weight(&mut session.clone()).map_err(|e| {
-            ErrorObjectOwned::owned(500, "resource_limits_error", Some(format!("{}", e)))
-        })?;
+        let total_cpu_weight = ResourceLimitsManager::get_total_cpu_weight(&mut session.clone())
+            .map_err(|e| {
+                ErrorObjectOwned::owned(500, "resource_limits_error", Some(format!("{}", e)))
+            })?;
+        let total_net_weight = ResourceLimitsManager::get_total_net_weight(&mut session.clone())
+            .map_err(|e| {
+                ErrorObjectOwned::owned(500, "resource_limits_error", Some(format!("{}", e)))
+            })?;
 
         Ok(GetInfoResponse {
             server_version: "d133c641".to_owned(),
@@ -484,7 +480,10 @@ impl RpcServer for RpcService {
             packed_context_free_data,
             packed_trx,
         )
-        .map_err(|e| ErrorObjectOwned::owned(400, "transaction_error", Some(format!("{}", e))))?;
+        .map_err(|e| {
+            println!("Failed to push transaction: {}", e);
+            ErrorObjectOwned::owned(500, "transaction_error", Some(format!("{}", e)))
+        })?;
 
         // Run transaction and revert it
         let controller = self.controller.clone();
@@ -523,7 +522,7 @@ impl RpcServer for RpcService {
         scope: String,
         table: Name,
         json: bool,
-        limit: i32,
+        limit: I32Flex,
         lower_bound: Option<String>,
         upper_bound: Option<String>,
         key_type: String,
@@ -563,7 +562,7 @@ impl RpcServer for RpcService {
                     code,
                     scope,
                     table,
-                    limit,
+                    limit.0,
                     json,
                     show_payer,
                     lower_bound,
@@ -660,7 +659,13 @@ fn get_table_rows_ex(
             }
 
             let variant = if json {
-                serializer.binary_to_variant(&table_type, &kv.value, &mut 0)?
+                serializer.binary_to_variant(&table_type, &kv.value, &mut 0).map_err(|e| {
+                    println!("Failed to convert binary to variant: {}", e);
+                    ChainError::InvalidArgument(format!(
+                        "failed to convert binary to variant: {}",
+                        e
+                    ))
+                })?
             } else {
                 Value::String(hex::encode(&kv.value))
             };
