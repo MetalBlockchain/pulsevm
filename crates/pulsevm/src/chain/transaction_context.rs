@@ -8,6 +8,7 @@ use std::{
 use pulsevm_chainbase::UndoSession;
 use pulsevm_crypto::Digest;
 use pulsevm_serialization::VarUint32;
+use pulsevm_time::{Microseconds, TimePoint};
 
 use crate::chain::{
     ActionReceipt, BlockTimestamp, PackedTransaction, TransactionReceiptHeader, TransactionStatus,
@@ -21,7 +22,7 @@ use super::{
 
 pub struct TransactionResult {
     pub trace: TransactionTrace,
-    pub billed_cpu_time_us: i64,
+    pub billed_cpu_time_us: u32,
 }
 
 #[derive(Clone)]
@@ -37,6 +38,10 @@ pub struct TransactionContext {
     billed_cpu_time_us: Rc<AtomicI64>,
     bill_to_accounts: Rc<RefCell<HashSet<Name>>>,
     validate_ram_usage: Rc<RefCell<HashSet<Name>>>,
+    explicit_billed_cpu_time: bool,
+    paused_time: Rc<RefCell<TimePoint>>,
+    pseudo_start: Rc<RefCell<TimePoint>>,
+    billed_time: Rc<RefCell<Microseconds>>,
 }
 
 impl TransactionContext {
@@ -65,6 +70,10 @@ impl TransactionContext {
             billed_cpu_time_us: Rc::new(AtomicI64::new(0)),
             bill_to_accounts: Rc::new(RefCell::new(HashSet::new())),
             validate_ram_usage: Rc::new(RefCell::new(HashSet::new())),
+            explicit_billed_cpu_time: false,
+            paused_time: Rc::new(RefCell::new(TimePoint::default())),
+            pseudo_start: Rc::new(RefCell::new(TimePoint::now())),
+            billed_time: Rc::new(RefCell::new(Microseconds::default())),
         }
     }
 
@@ -216,7 +225,8 @@ impl TransactionContext {
         )?;
 
         // Initialize the apply context with the action trace.
-        apply_context.exec(self)?;
+        let cpu_used = apply_context.exec(self)?;
+        self.billed_cpu_time_us.fetch_add(cpu_used as i64, std::sync::atomic::Ordering::Relaxed);
 
         // Finalize the apply context
         for (account, ram_delta) in apply_context.account_ram_deltas().iter() {
@@ -262,16 +272,15 @@ impl TransactionContext {
         self.pending_block_timestamp
     }
 
-    pub fn finalize(&self) -> Result<TransactionResult, ChainError> {
+    pub fn finalize(&mut self) -> Result<TransactionResult, ChainError> {
         let mut trace = self.trace.borrow_mut();
-        let billed_cpu_time_us = self
-            .billed_cpu_time_us
-            .load(std::sync::atomic::Ordering::Relaxed);
+        let now = TimePoint::now();
+        let billed_cpu_time_us = self.get_billed_cpu_time(now);
 
         trace.net_usage = ((trace.net_usage + 7) / 8) * 8; // Round up to nearest multiple of word size (8 bytes)
         trace.receipt = TransactionReceiptHeader::new(
             TransactionStatus::Executed,
-            0,
+            billed_cpu_time_us as u32,
             VarUint32((trace.net_usage / 8) as u32),
         );
 
@@ -311,5 +320,40 @@ impl TransactionContext {
         }
 
         Ok(())
+    }
+
+    pub fn pause_billing_timer(&self) {
+        let mut pseudo_start = self.pseudo_start.borrow_mut();
+        let mut paused_time = self.paused_time.borrow_mut();
+        let mut billed_time = self.billed_time.borrow_mut();
+
+        if self.explicit_billed_cpu_time || *pseudo_start == TimePoint::default() {
+            return;
+        }
+
+        *paused_time = TimePoint::now();
+        *billed_time = *paused_time - *pseudo_start;
+        *pseudo_start = TimePoint::default();
+    }
+
+    pub fn resume_billing_timer(&self) {
+        let mut pseudo_start = self.pseudo_start.borrow_mut();
+        let paused_time = self.paused_time.borrow_mut();
+        let billed_time = self.billed_time.borrow_mut();
+
+        if self.explicit_billed_cpu_time || *pseudo_start != TimePoint::default() {
+            return;
+        }
+
+        let now = TimePoint::now();
+        let paused = now - *paused_time;
+
+        *pseudo_start = now - *billed_time;
+    }
+
+    pub fn get_billed_cpu_time(&self, now: TimePoint) -> u32 {
+        let pseudo_start = self.pseudo_start.borrow();
+        let billed = (now - *pseudo_start).count();
+        billed as u32
     }
 }

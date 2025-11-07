@@ -1,5 +1,6 @@
 use std::num::NonZeroUsize;
 
+use chrono::Utc;
 use lru::LruCache;
 use wasmtime::{Config, Engine, IntoFunc, Linker, Module, Store, Strategy};
 
@@ -77,6 +78,9 @@ impl WasmRuntime {
 
         // Enable parallel compilation.
         config.parallel_compilation(true);
+
+        // Non-deterministic interruption
+        config.epoch_interruption(true);
 
         //config.coredump_on_trap(true);
 
@@ -172,9 +176,12 @@ impl WasmRuntime {
         &mut self,
         receiver: Name,
         action: Action,
-        apply_context: ApplyContext,
+        apply_context: &ApplyContext,
         code_hash: Id,
     ) -> Result<(), ChainError> {
+        // Pause timer
+        apply_context.pause_billing_timer();
+
         // Different scope so session is released before running the wasm code.
         {
             let mut session = apply_context.undo_session();
@@ -189,7 +196,7 @@ impl WasmRuntime {
             }
         }
 
-        let context = WasmContext::new(receiver, action.clone(), apply_context);
+        let context = WasmContext::new(receiver, action.clone(), apply_context.clone());
         let mut store = Store::new(&self.engine, context);
         let module = self.code_cache.get(&code_hash).ok_or_else(|| {
             ChainError::WasmRuntimeError(format!("wasm module not found in cache: {}", code_hash))
@@ -201,6 +208,21 @@ impl WasmRuntime {
         let apply_func = instance
             .get_typed_func::<(u64, u64, u64), ()>(&mut store, "apply")
             .map_err(|e| ChainError::WasmRuntimeError(e.to_string()))?;
+        let start = Utc::now().timestamp_micros();
+        store.epoch_deadline_callback(move |_| -> Result<wasmtime::UpdateDeadline, anyhow::Error> {
+            let now = Utc::now().timestamp_micros();
+            let diff = now - start;
+
+            if diff > 32000 {
+                return Ok(wasmtime::UpdateDeadline::Interrupt);
+            }
+
+            Ok(wasmtime::UpdateDeadline::Continue(10))
+        });
+
+        // Resume timer
+        apply_context.resume_billing_timer();
+
         apply_func
             .call(
                 &mut store,
@@ -213,6 +235,7 @@ impl WasmRuntime {
             .map_err(|e| {
                 ChainError::WasmRuntimeError(format!("apply error: {}", e.root_cause()))
             })?;
+
         Ok(())
     }
 }

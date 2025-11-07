@@ -79,14 +79,16 @@ impl ApplyContext {
         })
     }
 
-    pub fn exec(&mut self, trx_context: &mut TransactionContext) -> Result<(), ChainError> {
+    pub fn exec(&mut self, trx_context: &mut TransactionContext) -> Result<u64, ChainError> {
+        let mut cpu_used = 0;
+
         {
             self.notified
                 .borrow_mut()
                 .push_back((self.receiver.clone(), self.action_ordinal));
         }
 
-        self.exec_one()?;
+        cpu_used += self.exec_one()?;
 
         let notified_pairs: Vec<(Name, u32)> = {
             let notified = self.notified.borrow();
@@ -96,7 +98,7 @@ impl ApplyContext {
         for (receiver, action_ordinal) in notified_pairs {
             self.receiver = receiver;
             self.action_ordinal = action_ordinal;
-            self.exec_one()?;
+            cpu_used += self.exec_one()?;
         }
 
         let inline_actions: Vec<u32> = {
@@ -117,16 +119,12 @@ impl ApplyContext {
             trx_context.execute_action(action_ordinal, self.recurse_depth + 1)?;
         }
 
-        Ok(())
+        Ok(cpu_used)
     }
 
-    pub fn exec_one(&mut self) -> Result<(), ChainError> {
-        println!(
-            "Executing action: {}@{}",
-            self.action.account(),
-            self.action.name()
-        );
+    pub fn exec_one(&mut self) -> Result<u64, ChainError> {
         let mut receiver_account = self.get_account_metadata(self.receiver)?;
+        let mut cpu_used = 100; // Base usage is always 100 instructions
 
         self.privileged = receiver_account.privileged;
 
@@ -150,7 +148,7 @@ impl ApplyContext {
             runtime.run(
                 self.receiver,
                 self.action.clone(),
-                self.clone(),
+                self,
                 receiver_account.code_hash,
             )?;
         }
@@ -179,7 +177,7 @@ impl ApplyContext {
 
         self.finalize_trace(receipt)?;
 
-        Ok(())
+        Ok(cpu_used)
     }
 
     pub fn finalize_trace(&self, receipt: ActionReceipt) -> Result<(), ChainError> {
@@ -799,5 +797,13 @@ impl ApplyContext {
 
     pub fn account_ram_deltas(&self) -> HashMap<Name, i64> {
         self.account_ram_deltas.borrow().clone()
+    }
+
+    pub fn pause_billing_timer(&self) {
+        self.trx_context.pause_billing_timer();
+    }
+
+    pub fn resume_billing_timer(&self) {
+        self.trx_context.resume_billing_timer();
     }
 }
