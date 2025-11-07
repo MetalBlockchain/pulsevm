@@ -256,7 +256,7 @@ pub fn setabi(context: &mut ApplyContext) -> Result<(), ChainError> {
         .map_err(|_| ChainError::TransactionError(format!("failed to update account metadata")))?;
 
     if new_size != old_size {
-        //context.add_ram_usage(act.account, new_size - old_size);
+        context.add_ram_usage(act.account, new_size - old_size);
     }
 
     Ok(())
