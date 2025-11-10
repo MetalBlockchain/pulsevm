@@ -2154,6 +2154,15 @@ dependencies = [
 [[package]]
 name = "pulsevm_benchmark"
 version = "0.1.0"
+dependencies = [
+ "chrono",
+ "pulsevm_core",
+ "pulsevm_proc_macros",
+ "pulsevm_serialization",
+ "pulsevm_time",
+ "serde_json",
+ "spdlog-rs",
+]
 
 [[package]]
 name = "pulsevm_chainbase"

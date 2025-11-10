@@ -1,6 +1,12 @@
 use std::collections::HashMap;
 
-use pulsevm_core::{account::AccountDelta, id::Id, name::Name, secp256k1::Signature, transaction::{Action, TransactionStatus, TransactionTrace}};
+use pulsevm_core::{
+    account::AccountDelta,
+    id::Id,
+    name::Name,
+    secp256k1::Signature,
+    transaction::{Action, TransactionStatus, TransactionTrace},
+};
 use pulsevm_crypto::{Bytes, Digest};
 use pulsevm_proc_macros::{NumBytes, Read, Write, name};
 use pulsevm_serialization::VarUint32;
@@ -230,7 +236,7 @@ impl From<&TransactionTrace> for TransactionTraceV0 {
         let receipt = trace.receipt.clone();
 
         TransactionTraceV0::new(
-            trace.id.clone(),
+            trace.id,
             receipt.status,
             receipt.cpu_usage_us,
             receipt.net_usage_words,
@@ -242,18 +248,7 @@ impl From<&TransactionTrace> for TransactionTraceV0 {
             None,
             None,
             None,
-            Some(PartialTransactionV0 {
-                variant: 0,
-                expiration: TimePointSec::min(),
-                ref_block_num: 0,
-                ref_block_prefix: 0,
-                max_net_usage_words: VarUint32(0),
-                max_cpu_usage_ms: 0,
-                delay_sec: VarUint32(0),
-                transaction_extensions: vec![],
-                signatures: vec![],
-                context_free_data: vec![],
-            }), // Placeholder for partial transaction, not implemented yet
+            None, // Placeholder for partial transaction, not implemented yet
         )
     }
 }

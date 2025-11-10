@@ -1,6 +1,11 @@
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 
-use crate::chain::{account::AccountDelta, block::BlockTimestamp, id::Id, transaction::{ActionTrace, TransactionReceiptHeader}};
+use crate::chain::{
+    account::AccountDelta,
+    block::BlockTimestamp,
+    id::Id,
+    transaction::{ActionTrace, TransactionReceiptHeader},
+};
 
 #[derive(Default, Clone, Read, Write, NumBytes)]
 pub struct TransactionTrace {

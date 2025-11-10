@@ -8,7 +8,8 @@ use secp256k1::hashes::{Hash, sha256};
 use serde::{Serialize, ser::SerializeStruct};
 
 use crate::chain::{
-    block::BlockTimestamp, error::ChainError, id::Id, secp256k1::Signature, transaction::TransactionReceipt, Name
+    Name, block::BlockTimestamp, error::ChainError, id::Id, secp256k1::Signature,
+    transaction::TransactionReceipt,
 };
 
 #[derive(Debug, Default, Clone, Read, Write, NumBytes)]

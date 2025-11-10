@@ -2,7 +2,9 @@ use std::cmp::min;
 
 use wasmtime::Caller;
 
-use crate::chain::{controller::Controller, error::ChainError, utils::pulse_assert, wasm_runtime::WasmContext};
+use crate::chain::{
+    controller::Controller, error::ChainError, utils::pulse_assert, wasm_runtime::WasmContext,
+};
 
 pub fn action_data_size() -> impl Fn(Caller<'_, WasmContext>) -> Result<i32, wasmtime::Error> {
     |caller| {

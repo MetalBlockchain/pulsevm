@@ -1,15 +1,52 @@
 use core::fmt;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    mem,
     path::Path,
     sync::{Arc, LazyLock, RwLock},
 };
 
-use crate::{chain::{
-    account::{Account, AccountMetadata}, apply_context::ApplyContext, authority::{Authority, KeyWeight}, authorization_manager::AuthorizationManager, block::{BlockHeader, BlockTimestamp, SignedBlock}, config::{eos_percent, GlobalPropertyObject, BLOCK_CPU_USAGE_AVERAGE_WINDOW_MS, BLOCK_INTERVAL_MS, BLOCK_SIZE_AVERAGE_WINDOW_MS, DELETEAUTH_NAME, LINKAUTH_NAME, MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER, NEWACCOUNT_NAME, SETABI_NAME, SETCODE_NAME, UNLINKAUTH_NAME, UPDATEAUTH_NAME}, error::ChainError, genesis::Genesis, id::Id, mempool::Mempool, name::Name, pulse_contract::{deleteauth, get_pulse_contract_abi, linkauth, newaccount, setabi, setcode, unlinkauth, updateauth}, resource::ElasticLimitParameters, resource_limits::ResourceLimitsManager, state_history::StateHistoryLog, transaction::{PackedTransaction, TransactionReceipt, TransactionTrace}, transaction_context::{TransactionContext, TransactionResult}, utils::make_ratio, wasm_runtime::WasmRuntime, ACTIVE_NAME
-}, OWNER_NAME, PULSE_NAME};
+use crate::{
+    OWNER_NAME, PULSE_NAME,
+    account::CodeObject,
+    authority::{Permission, PermissionLink},
+    chain::{
+        ACTIVE_NAME,
+        account::{Account, AccountMetadata},
+        apply_context::ApplyContext,
+        authority::{Authority, KeyWeight},
+        authorization_manager::AuthorizationManager,
+        block::{BlockHeader, BlockTimestamp, SignedBlock},
+        config::{
+            BLOCK_CPU_USAGE_AVERAGE_WINDOW_MS, BLOCK_INTERVAL_MS, BLOCK_SIZE_AVERAGE_WINDOW_MS,
+            DELETEAUTH_NAME, GlobalPropertyObject, LINKAUTH_NAME,
+            MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER, NEWACCOUNT_NAME, SETABI_NAME, SETCODE_NAME,
+            UNLINKAUTH_NAME, UPDATEAUTH_NAME, eos_percent,
+        },
+        error::ChainError,
+        genesis::Genesis,
+        id::Id,
+        mempool::Mempool,
+        name::Name,
+        pulse_contract::{
+            deleteauth, get_pulse_contract_abi, linkauth, newaccount, setabi, setcode, unlinkauth,
+            updateauth,
+        },
+        resource::ElasticLimitParameters,
+        resource_limits::ResourceLimitsManager,
+        state_history::StateHistoryLog,
+        transaction::{PackedTransaction, TransactionReceipt, TransactionTrace},
+        transaction_context::{TransactionContext, TransactionResult},
+        utils::make_ratio,
+        wasm_runtime::WasmRuntime,
+    },
+    config::DynamicGlobalPropertyObject,
+    resource::{ResourceLimits, ResourceLimitsConfig, ResourceLimitsState, ResourceUsage},
+    table::{KeyValue, Table},
+    utils::prepare_db_object,
+};
 
-use pulsevm_chainbase::{Database, UndoSession};
+use pulsevm_chainbase::{ChainbaseObject, Database, UndoSession};
 use pulsevm_crypto::{Digest, merkle};
 use pulsevm_serialization::{Read, Write};
 use spdlog::info;
@@ -121,6 +158,22 @@ impl Controller {
             ChainError::GenesisError(format!("failed to find genesis block: {}", e))
         })?;
 
+        // Prep partition handles for faster access
+        prepare_db_object::<Account>(&self.db)?;
+        prepare_db_object::<AccountMetadata>(&self.db)?;
+        prepare_db_object::<SignedBlock>(&self.db)?;
+        prepare_db_object::<CodeObject>(&self.db)?;
+        prepare_db_object::<DynamicGlobalPropertyObject>(&self.db)?;
+        prepare_db_object::<GlobalPropertyObject>(&self.db)?;
+        prepare_db_object::<Permission>(&self.db)?;
+        prepare_db_object::<PermissionLink>(&self.db)?;
+        prepare_db_object::<ResourceUsage>(&self.db)?;
+        prepare_db_object::<ResourceLimits>(&self.db)?;
+        prepare_db_object::<ResourceLimitsConfig>(&self.db)?;
+        prepare_db_object::<ResourceLimitsState>(&self.db)?;
+        prepare_db_object::<Table>(&self.db)?;
+        prepare_db_object::<KeyValue>(&self.db)?;
+
         if genesis_block.is_none() {
             // If not, insert it
             let mut session = self.db.undo_session().map_err(|e| {
@@ -206,20 +259,17 @@ impl Controller {
 
         // Get transactions from the mempool
         loop {
-            let transaction = mempool.pop_transaction();
+            if let Some(transaction) = mempool.pop_transaction() {
+                let transaction_result =
+                    self.execute_transaction(&mut undo_session, &transaction, &timestamp)?;
+                let receipt =
+                    TransactionReceipt::new(transaction_result.trace.receipt, transaction);
 
-            if transaction.is_none() {
+                // Add the transaction to the block
+                transaction_receipts.push_back(receipt);
+            } else {
                 break;
-            }
-
-            let transaction = transaction.unwrap();
-            let transaction_result =
-                self.execute_transaction(&mut undo_session, &transaction, &timestamp)?;
-            let receipt =
-                TransactionReceipt::new(transaction_result.trace.receipt.clone(), transaction);
-
-            // Add the transaction to the block
-            transaction_receipts.push_back(receipt);
+            };
         }
 
         // Don't build a block if we have no transactions
@@ -569,7 +619,13 @@ mod tests {
     use pulsevm_time::TimePointSec;
     use serde_json::json;
 
-    use crate::chain::{asset::{Asset, Symbol}, authority::PermissionLevel, pulse_contract::{NewAccount, SetCode}, secp256k1::PrivateKey, transaction::{Action, Transaction, TransactionHeader}};
+    use crate::chain::{
+        asset::{Asset, Symbol},
+        authority::PermissionLevel,
+        pulse_contract::{NewAccount, SetCode},
+        secp256k1::PrivateKey,
+        transaction::{Action, Transaction, TransactionHeader},
+    };
 
     use super::*;
 

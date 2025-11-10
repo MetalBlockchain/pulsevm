@@ -2,7 +2,8 @@ use anyhow::bail;
 use wasmtime::Caller;
 
 use crate::chain::{
-    account::AccountMetadata, apply_context::ApplyContext, error::ChainError, resource_limits::ResourceLimitsManager, utils::pulse_assert, wasm_runtime::WasmContext
+    account::AccountMetadata, apply_context::ApplyContext, error::ChainError,
+    resource_limits::ResourceLimitsManager, utils::pulse_assert, wasm_runtime::WasmContext,
 };
 
 fn privileged_check(context: &ApplyContext) -> Result<(), wasmtime::Error> {

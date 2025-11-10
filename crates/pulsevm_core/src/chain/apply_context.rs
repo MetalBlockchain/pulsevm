@@ -8,10 +8,28 @@ use std::{
 
 use chrono::Utc;
 use pulsevm_chainbase::UndoSession;
+use spdlog::info;
 
-use crate::{chain::{
-    account::{Account, AccountMetadata}, authority::PermissionLevel, authorization_manager::AuthorizationManager, block::BlockTimestamp, config::{billable_size_v, DynamicGlobalPropertyObject}, controller::Controller, error::ChainError, id::Id, iterator_cache::IteratorCache, name::Name, table::{KeyValue, KeyValueByScopePrimaryIndex, Table, TableByCodeScopeTableIndex}, transaction::{generate_action_digest, Action, ActionReceipt}, transaction_context::TransactionContext, utils::pulse_assert, wasm_runtime::WasmRuntime
-}, CODE_NAME};
+use crate::{
+    CODE_NAME,
+    chain::{
+        account::{Account, AccountMetadata},
+        authority::PermissionLevel,
+        authorization_manager::AuthorizationManager,
+        block::BlockTimestamp,
+        config::{DynamicGlobalPropertyObject, billable_size_v},
+        controller::Controller,
+        error::ChainError,
+        id::Id,
+        iterator_cache::IteratorCache,
+        name::Name,
+        table::{KeyValue, KeyValueByScopePrimaryIndex, Table, TableByCodeScopeTableIndex},
+        transaction::{Action, ActionReceipt, generate_action_digest},
+        transaction_context::TransactionContext,
+        utils::pulse_assert,
+        wasm_runtime::WasmRuntime,
+    },
+};
 
 #[derive(Clone)]
 pub struct ApplyContext {
@@ -168,6 +186,8 @@ impl ApplyContext {
     }
 
     pub fn finalize_trace(&self, receipt: ActionReceipt) -> Result<(), ChainError> {
+        info!("took {} us to execute action {}@{}", Utc::now().timestamp_micros() - self.start, self.action.account(), self.action.name());
+
         self.trx_context
             .modify_action_trace(self.action_ordinal, |trace| {
                 trace.receipt = Some(receipt);

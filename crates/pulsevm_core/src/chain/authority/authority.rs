@@ -4,7 +4,8 @@ use pulsevm_proc_macros::{NumBytes, Read, Write};
 use serde::Serialize;
 
 use crate::chain::{
-    authority::WaitWeight, config::{self, BillableSize, FIXED_OVERHEAD_SHARED_VECTOR_RAM_BYTES}
+    authority::WaitWeight,
+    config::{self, BillableSize, FIXED_OVERHEAD_SHARED_VECTOR_RAM_BYTES},
 };
 
 use super::{key_weight::KeyWeight, permission_level_weight::PermissionLevelWeight};

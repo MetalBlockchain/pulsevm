@@ -1,7 +1,7 @@
 use pulsevm_chainbase::{ChainbaseObject, SecondaryKey};
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 
-use crate::chain::{block::BlockTimestamp, id::Id, Name};
+use crate::chain::{Name, block::BlockTimestamp, id::Id};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Read, Write, NumBytes)]
 pub struct AccountMetadata {

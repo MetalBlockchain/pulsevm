@@ -55,7 +55,6 @@ where
             undo_session: self.undo_session.clone(),
             partition: self
                 .keyspace
-                .clone()
                 .open_partition(S::index_name(), Default::default())
                 .map_err(|_| ChainbaseError::InternalError(format!("failed to open partition")))?,
             range: (Bound::Included(key_bytes.clone()), Bound::Unbounded),

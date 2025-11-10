@@ -14,7 +14,7 @@ pub mod id;
 mod iterator_cache;
 pub mod mempool;
 pub mod name;
-mod pulse_contract;
+pub mod pulse_contract;
 pub mod resource;
 pub mod resource_limits;
 pub mod secp256k1;

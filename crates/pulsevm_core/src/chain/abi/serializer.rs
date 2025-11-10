@@ -5,7 +5,15 @@ use pulsevm_serialization::{Read, ReadError, VarInt32, VarUint32, WriteError};
 use pulsevm_time::{TimePoint, TimePointSec};
 use serde_json::{Number, Value};
 
-use crate::chain::{abi::{AbiDefinition, AbiStructDefinition, AbiVariantDefinition}, asset::{Asset, ExtendedAsset, Symbol, SymbolCode}, block::BlockTimestamp, error::ChainError, name::Name, secp256k1::{PublicKey, Signature}, utils::pulse_assert};
+use crate::chain::{
+    abi::{AbiDefinition, AbiStructDefinition, AbiVariantDefinition},
+    asset::{Asset, ExtendedAsset, Symbol, SymbolCode},
+    block::BlockTimestamp,
+    error::ChainError,
+    name::Name,
+    secp256k1::{PublicKey, Signature},
+    utils::pulse_assert,
+};
 
 type TypeName = String;
 type UnpackFunction = fn(bytes: &[u8], pos: &mut usize) -> Result<Value, ReadError>;

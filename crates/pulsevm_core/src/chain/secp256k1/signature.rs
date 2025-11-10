@@ -248,7 +248,11 @@ mod tests {
     use pulsevm_serialization::{Read, Write};
     use secp256k1::hashes::{Hash, sha256};
 
-    use crate::chain::{id::Id, secp256k1::{PrivateKey, PublicKey, Signature}, transaction::{SignedTransaction, Transaction}};
+    use crate::chain::{
+        id::Id,
+        secp256k1::{PrivateKey, PublicKey, Signature},
+        transaction::{SignedTransaction, Transaction},
+    };
 
     #[test]
     fn test_signature_recovery() {

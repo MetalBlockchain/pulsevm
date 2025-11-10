@@ -1,6 +1,9 @@
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 
-use crate::chain::{error::ChainError, utils::{pulse_assert, Ratio}};
+use crate::chain::{
+    error::ChainError,
+    utils::{Ratio, pulse_assert},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Read, Write, NumBytes)]
 pub struct ElasticLimitParameters {

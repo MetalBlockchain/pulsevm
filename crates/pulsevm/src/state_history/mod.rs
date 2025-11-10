@@ -19,12 +19,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::{
-    VirtualMachine,
-    state_history::{
-        session::Session,
-    },
-};
+use crate::{VirtualMachine, state_history::session::Session};
 
 #[derive(Clone)]
 pub struct StateHistoryServer {

@@ -1,6 +1,12 @@
 use std::collections::HashSet;
 
-use crate::chain::{authority::PermissionByParentIndex, name::Name, pulse_contract::{DeleteAuth, LinkAuth, UnlinkAuth, UpdateAuth}, secp256k1::PublicKey, transaction::Action};
+use crate::chain::{
+    authority::PermissionByParentIndex,
+    name::Name,
+    pulse_contract::{DeleteAuth, LinkAuth, UnlinkAuth, UpdateAuth},
+    secp256k1::PublicKey,
+    transaction::Action,
+};
 
 use super::{
     ACTIVE_NAME, ANY_NAME,
@@ -460,7 +466,8 @@ mod tests {
     };
 
     use crate::chain::{
-        authority::{Authority, KeyWeight}, transaction::Transaction,
+        authority::{Authority, KeyWeight},
+        transaction::Transaction,
     };
 
     use super::*;

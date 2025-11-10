@@ -7,7 +7,10 @@ use secp256k1::hashes::{Hash, sha256};
 use serde::{Serialize, ser::SerializeStruct};
 
 use crate::chain::{
-    error::ChainError, id::Id, secp256k1::PrivateKey, transaction::{signed_transaction::signing_digest, SignedTransaction, TransactionHeader}
+    error::ChainError,
+    id::Id,
+    secp256k1::PrivateKey,
+    transaction::{SignedTransaction, TransactionHeader, signed_transaction::signing_digest},
 };
 
 use super::action::Action;

@@ -4,7 +4,14 @@ use pulsevm_serialization::Read;
 use wasmtime::Caller;
 
 use crate::chain::{
-    authority::PermissionLevel, authorization_manager::AuthorizationManager, controller::Controller, error::ChainError, secp256k1::PublicKey, transaction::{Action, Transaction}, utils::pulse_assert, wasm_runtime::WasmContext
+    authority::PermissionLevel,
+    authorization_manager::AuthorizationManager,
+    controller::Controller,
+    error::ChainError,
+    secp256k1::PublicKey,
+    transaction::{Action, Transaction},
+    utils::pulse_assert,
+    wasm_runtime::WasmContext,
 };
 
 pub fn send_inline() -> impl Fn(Caller<'_, WasmContext>, u32, u32) -> Result<(), wasmtime::Error> {

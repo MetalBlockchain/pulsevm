@@ -1,7 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
 use pulsevm_core::mempool::Mempool;
-use pulsevm_grpc::messenger::{messenger_client::MessengerClient, Message, NotifyRequest};
+use pulsevm_grpc::messenger::{Message, NotifyRequest, messenger_client::MessengerClient};
 use tokio::{sync::RwLock, task::JoinHandle, time::interval};
 use tonic::Request;
 

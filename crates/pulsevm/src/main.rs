@@ -2,7 +2,13 @@ mod api;
 mod chain;
 mod state_history;
 
-use pulsevm_core::{config::{PLUGIN_VERSION, VERSION}, controller::Controller, id::{Id, NodeId}, mempool::Mempool, transaction::PackedTransaction};
+use pulsevm_core::{
+    config::{PLUGIN_VERSION, VERSION},
+    controller::Controller,
+    id::{Id, NodeId},
+    mempool::Mempool,
+    transaction::PackedTransaction,
+};
 use pulsevm_grpc::{
     http::{
         self, Element,
@@ -29,7 +35,10 @@ use tokio_util::sync::CancellationToken;
 use tonic::transport::server::TcpIncoming;
 use tonic::{Request, Response, Status, transport::Server};
 
-use crate::{chain::{BlockTimer, Gossipable}, state_history::StateHistoryServer};
+use crate::{
+    chain::{BlockTimer, Gossipable},
+    state_history::StateHistoryServer,
+};
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 10)]
 async fn main() {

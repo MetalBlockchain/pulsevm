@@ -8,7 +8,7 @@ pub use session::Session;
 mod undo_session;
 pub use undo_session::UndoSession;
 
-use fjall::{Config, TransactionalKeyspace, TransactionalPartitionHandle};
+use fjall::{Config, PartitionCreateOptions, TransactionalKeyspace, TransactionalPartitionHandle};
 use pulsevm_serialization::{Read, Write};
 use std::{error::Error, fmt, path::Path};
 
@@ -109,6 +109,13 @@ impl<'a> Database {
     pub fn undo_session(&self) -> Result<UndoSession, ChainbaseError> {
         UndoSession::new(&self.keyspace)
     }
+
+    pub fn open_partition_handle(
+        &self,
+        table_name: &str,
+    ) -> Result<TransactionalPartitionHandle, ChainbaseError> {
+        open_partition(&self.keyspace, table_name)
+    }
 }
 
 fn open_partition(
@@ -116,7 +123,7 @@ fn open_partition(
     table_name: &str,
 ) -> Result<TransactionalPartitionHandle, ChainbaseError> {
     keyspace
-        .open_partition(table_name, Default::default())
+        .open_partition(table_name, PartitionCreateOptions::default())
         .map_err(|_| {
             ChainbaseError::InternalError(format!(
                 "failed to open partition for table: {}",

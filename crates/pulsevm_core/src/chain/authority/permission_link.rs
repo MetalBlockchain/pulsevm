@@ -2,7 +2,10 @@ use pulsevm_chainbase::{ChainbaseObject, SecondaryIndex, SecondaryKey};
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 use pulsevm_serialization::Write;
 
-use crate::chain::{config::{self, BillableSize}, name::Name};
+use crate::chain::{
+    config::{self, BillableSize},
+    name::Name,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Read, Write, NumBytes)]
 pub struct PermissionLink {

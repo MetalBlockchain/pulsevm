@@ -1,4 +1,10 @@
-use crate::chain::{abi::{AbiActionDefinition, AbiDefinition, AbiStructDefinition, AbiTypeDefinition}, config::{DELETEAUTH_NAME, LINKAUTH_NAME, NEWACCOUNT_NAME, ONBLOCK_NAME, ONERROR_NAME, SETABI_NAME, SETCODE_NAME, UNLINKAUTH_NAME, UPDATEAUTH_NAME}};
+use crate::chain::{
+    abi::{AbiActionDefinition, AbiDefinition, AbiStructDefinition, AbiTypeDefinition},
+    config::{
+        DELETEAUTH_NAME, LINKAUTH_NAME, NEWACCOUNT_NAME, ONBLOCK_NAME, ONERROR_NAME, SETABI_NAME,
+        SETCODE_NAME, UNLINKAUTH_NAME, UPDATEAUTH_NAME,
+    },
+};
 
 pub fn get_pulse_contract_abi() -> AbiDefinition {
     AbiDefinition {

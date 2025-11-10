@@ -10,7 +10,9 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use futures_util::{SinkExt, StreamExt};
-use pulsevm_core::{controller::Controller, state_history::SHIP_ABI, transaction::TransactionTrace};
+use pulsevm_core::{
+    controller::Controller, state_history::SHIP_ABI, transaction::TransactionTrace,
+};
 use pulsevm_crypto::Bytes;
 use pulsevm_serialization::{Read, Write};
 use spdlog::{error, info};
@@ -24,13 +26,11 @@ use tokio::{
 use tokio_tungstenite::accept_async;
 use tungstenite::Message;
 
-use crate::{
-    state_history::{
-        request::RequestType,
-        types::{
-            BlockPosition, GetBlocksAckRequestV0, GetBlocksRequestV0, GetBlocksResponseV0,
-            GetStatusResult, TransactionTraceV0,
-        },
+use crate::state_history::{
+    request::RequestType,
+    types::{
+        BlockPosition, GetBlocksAckRequestV0, GetBlocksRequestV0, GetBlocksResponseV0,
+        GetStatusResult, TransactionTraceV0,
     },
 };
 
@@ -371,16 +371,21 @@ async fn make_block_response_for(
 mod tests {
     use std::{collections::HashMap, str::FromStr};
 
-    use pulsevm_core::{authority::PermissionLevel, config::NEWACCOUNT_NAME, id::Id, secp256k1::Signature, transaction::{Action, TransactionStatus}, ACTIVE_NAME, PULSE_NAME};
+    use pulsevm_core::{
+        ACTIVE_NAME, PULSE_NAME,
+        authority::PermissionLevel,
+        config::NEWACCOUNT_NAME,
+        id::Id,
+        secp256k1::Signature,
+        transaction::{Action, TransactionStatus},
+    };
     use pulsevm_crypto::Bytes;
     use pulsevm_serialization::{VarUint32, Write};
     use pulsevm_time::TimePointSec;
 
-    use crate::{
-        state_history::types::{
-            AccountAuthSequence, ActionReceiptV0, ActionTraceV1, BlockPosition,
-            GetBlocksResponseV0, PartialTransactionV0, TransactionTraceV0,
-        },
+    use crate::state_history::types::{
+        AccountAuthSequence, ActionReceiptV0, ActionTraceV1, BlockPosition, GetBlocksResponseV0,
+        PartialTransactionV0, TransactionTraceV0,
     };
 
     #[test]

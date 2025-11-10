@@ -5,7 +5,14 @@ use pulsevm_crypto::Bytes;
 use pulsevm_serialization::{NumBytes, Read, ReadError, Write, WriteError};
 use serde::{Serialize, ser::SerializeStruct};
 
-use crate::chain::{config::FIXED_NET_OVERHEAD_OF_PACKED_TRX, error::ChainError, id::Id, secp256k1::Signature, transaction::{SignedTransaction, Transaction, TransactionCompression}, utils::pulse_assert};
+use crate::chain::{
+    config::FIXED_NET_OVERHEAD_OF_PACKED_TRX,
+    error::ChainError,
+    id::Id,
+    secp256k1::Signature,
+    transaction::{SignedTransaction, Transaction, TransactionCompression},
+    utils::pulse_assert,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackedTransaction {
