@@ -1,6 +1,5 @@
+use pulsevm_core::name::Name;
 use serde::Deserialize;
-
-use crate::chain::Name;
 
 #[derive(Deserialize)]
 pub struct GetTableRowsParams {

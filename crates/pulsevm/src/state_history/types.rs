@@ -1,14 +1,10 @@
 use std::collections::HashMap;
 
+use pulsevm_core::{account::AccountDelta, id::Id, name::Name, secp256k1::Signature, transaction::{Action, TransactionStatus, TransactionTrace}};
 use pulsevm_crypto::{Bytes, Digest};
 use pulsevm_proc_macros::{NumBytes, Read, Write, name};
 use pulsevm_serialization::VarUint32;
 use pulsevm_time::TimePointSec;
-use serde::Serialize;
-
-use crate::chain::{
-    AccountDelta, Action, Id, Name, Signature, TransactionStatus, TransactionTrace,
-};
 
 #[derive(Debug, Clone, Read, Write, NumBytes)]
 pub struct BlockPosition {
@@ -232,8 +228,6 @@ impl From<&TransactionTrace> for TransactionTraceV0 {
             .collect();
 
         let receipt = trace.receipt.clone();
-
-        println!("Converted receipt: {}", action_traces.len());
 
         TransactionTraceV0::new(
             trace.id.clone(),

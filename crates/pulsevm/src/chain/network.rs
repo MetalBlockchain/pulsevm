@@ -1,11 +1,10 @@
 use std::collections::HashMap;
 
+use pulsevm_core::{error::ChainError, id::NodeId};
 use pulsevm_grpc::appsender::{SendAppGossipMsg, app_sender_client::AppSenderClient};
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 use pulsevm_serialization::{Read, Write};
 use tonic::Request;
-
-use super::{error::ChainError, id::NodeId};
 
 #[derive(Debug, Clone, PartialEq, Eq, Write, Read, NumBytes)]
 pub struct Gossipable {

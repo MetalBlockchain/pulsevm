@@ -9,9 +9,9 @@ use fjall::{Slice, TransactionalKeyspace, WriteTransaction};
 use crate::{ChainbaseError, ChainbaseObject, SecondaryIndex, index::Index, open_partition};
 
 enum ObjectChange {
-    New(Vec<u8>),                        // key
-    Modified(Vec<u8>, Vec<u8>, Vec<u8>), // (key, old, new)
-    Deleted(Vec<u8>, Vec<u8>),           // key, previous value
+    New(Vec<u8>),                      // key
+    Modified(Vec<u8>, Slice, Vec<u8>), // (key, old, new)
+    Deleted(Vec<u8>, Vec<u8>),         // key, previous value
 }
 
 #[derive(Clone)]
@@ -123,28 +123,26 @@ impl UndoSession {
         &mut self,
         key: S::Key,
     ) -> Result<Option<T>, ChainbaseError> {
-        let partition = open_partition(&self.keyspace, S::index_name())?;
         let mut tx = self
             .tx
             .write()
             .map_err(|_| ChainbaseError::InternalError(format!("failed to write transaction")))?;
-        let secondary_key = tx
-            .get(&partition, S::secondary_key_as_bytes(key))
-            .map_err(|_| ChainbaseError::InternalError(format!("failed to get secondary key")))?;
-        if secondary_key.is_none() {
-            return Ok(None);
+        let sec_part = open_partition(&self.keyspace, S::index_name())?;
+        if let Some(primary_key) = tx
+            .get(&sec_part, S::secondary_key_as_bytes(key))
+            .map_err(|_| ChainbaseError::InternalError("failed to get secondary key".into()))?
+        {
+            let prim_part = open_partition(&self.keyspace, T::table_name())?;
+            if let Some(bytes) = tx.get(&prim_part, primary_key).map_err(|_| {
+                ChainbaseError::InternalError("failed to get object for secondary key".into())
+            })? {
+                let mut pos = 0usize;
+                let obj = T::read(&bytes, &mut pos)
+                    .map_err(|_| ChainbaseError::InternalError("failed to read object".into()))?;
+                return Ok(Some(obj));
+            }
         }
-        let partition = open_partition(&self.keyspace, T::table_name())?;
-        let serialized = tx.get(&partition, secondary_key.unwrap()).map_err(|_| {
-            ChainbaseError::InternalError(format!("failed to get object for secondary key"))
-        })?;
-        if serialized.is_none() {
-            return Ok(None);
-        }
-        let mut pos = 0 as usize;
-        let object: T = T::read(&serialized.unwrap(), &mut pos)
-            .map_err(|_| ChainbaseError::InternalError(format!("failed to read object")))?;
-        Ok(Some(object))
+        Ok(None)
     }
 
     pub fn generate_id<T: ChainbaseObject>(&mut self) -> Result<u64, ChainbaseError> {
@@ -177,30 +175,34 @@ impl UndoSession {
     }
 
     pub fn insert<T: ChainbaseObject>(&mut self, object: &T) -> Result<(), ChainbaseError> {
-        let key = object.primary_key();
-        let serialized = object.pack().map_err(|_| {
-            ChainbaseError::InternalError(format!("failed to serialize object for key: {:?}", key))
-        })?;
-        let partition = open_partition(&self.keyspace, T::table_name())?;
         let mut tx = self
             .tx
             .write()
             .map_err(|_| ChainbaseError::InternalError(format!("failed to write transaction")))?;
+        let key = object.primary_key();
+        let partition = open_partition(&self.keyspace, T::table_name())?;
         let exists = tx.contains_key(&partition, &key).map_err(|_| {
             ChainbaseError::InternalError(format!("failed to check existence for key: {:?}", key))
         })?;
         if exists {
             return Err(ChainbaseError::AlreadyExists);
         }
+
+        let serialized = object.pack().map_err(|_| {
+            ChainbaseError::InternalError(format!("failed to serialize object for key: {:?}", key))
+        })?;
+
         let mut changes = self
             .changes
             .write()
             .map_err(|_| ChainbaseError::InternalError(format!("failed to write changes")))?;
         changes.push_back(ObjectChange::New(key.to_owned()));
+
         tx.insert(&partition, &key, serialized);
+
         for index in object.secondary_indexes() {
-            let partition = open_partition(&self.keyspace, index.index_name)?;
-            tx.insert(&partition, &index.key, &key);
+            let part = open_partition(&self.keyspace, index.index_name)?;
+            tx.insert(&part, &index.key, &key);
         }
         Ok(())
     }
@@ -210,44 +212,46 @@ impl UndoSession {
         T: ChainbaseObject,
         F: FnOnce(&mut T) -> Result<()>,
     {
-        let key = old.primary_key();
-        let partition = open_partition(&self.keyspace, T::table_name())?;
         let mut tx = self
             .tx
             .write()
             .map_err(|_| ChainbaseError::InternalError(format!("failed to write transaction")))?;
-        let existing = tx.get(&partition, &key).map_err(|_| {
+        let partition = open_partition(&self.keyspace, T::table_name())?;
+        let key = old.primary_key();
+        let key_bytes = old.primary_key();
+
+        let existing = tx.get(&partition, &key_bytes).map_err(|_| {
             ChainbaseError::InternalError(format!(
                 "failed to get existing object for key: {:?}",
                 key
             ))
         })?;
-        if existing.is_none() {
+        let Some(old_bytes) = existing else {
             return Err(ChainbaseError::NotFound);
-        }
+        };
+
         f(old).map_err(|e| {
-            ChainbaseError::InternalError(format!(
-                "failed to modify object for key: {:?}, error: {}",
-                key, e
-            ))
+            ChainbaseError::InternalError(format!("failed to modify object for key {:?}: {e}", key))
         })?;
-        let serialized_old = existing.unwrap().to_vec();
-        let serialized_new = old.pack().map_err(|_| {
+
+        let new_bytes = old.pack().map_err(|_| {
             ChainbaseError::InternalError(format!(
                 "failed to serialize modified object for key: {:?}",
                 key
             ))
         })?;
+
         let mut changes = self
             .changes
             .write()
             .map_err(|_| ChainbaseError::InternalError(format!("failed to write changes")))?;
         changes.push_back(ObjectChange::Modified(
             key.to_owned(),
-            serialized_old,
-            serialized_new.to_owned(),
+            old_bytes,         // moved
+            new_bytes.clone(), // keep a copy for insertion below
         ));
-        tx.insert(&partition, &key, serialized_new);
+
+        tx.insert(&partition, &key, new_bytes);
         Ok(())
     }
 

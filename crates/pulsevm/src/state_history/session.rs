@@ -10,6 +10,7 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use futures_util::{SinkExt, StreamExt};
+use pulsevm_core::{controller::Controller, state_history::SHIP_ABI, transaction::TransactionTrace};
 use pulsevm_crypto::Bytes;
 use pulsevm_serialization::{Read, Write};
 use spdlog::{error, info};
@@ -24,9 +25,7 @@ use tokio_tungstenite::accept_async;
 use tungstenite::Message;
 
 use crate::{
-    chain::{Controller, Id, TransactionTrace},
     state_history::{
-        abi::SHIP_ABI,
         request::RequestType,
         types::{
             BlockPosition, GetBlocksAckRequestV0, GetBlocksRequestV0, GetBlocksResponseV0,
@@ -59,8 +58,6 @@ impl Session {
 
     pub async fn start(&mut self, stream: tokio::net::TcpStream) -> Result<()> {
         let ws = accept_async(stream).await?;
-
-        println!("{} connected; ABI sent", self.peer);
 
         // Split socket once; dedicate a writer task fed by mpsc
         let (mut sink, mut reader) = ws.split();
@@ -374,15 +371,12 @@ async fn make_block_response_for(
 mod tests {
     use std::{collections::HashMap, str::FromStr};
 
+    use pulsevm_core::{authority::PermissionLevel, config::NEWACCOUNT_NAME, id::Id, secp256k1::Signature, transaction::{Action, TransactionStatus}, ACTIVE_NAME, PULSE_NAME};
     use pulsevm_crypto::Bytes;
     use pulsevm_serialization::{VarUint32, Write};
     use pulsevm_time::TimePointSec;
 
     use crate::{
-        chain::{
-            ACTIVE_NAME, AccountDelta, Action, Id, NEWACCOUNT_NAME, Name, PULSE_NAME,
-            PermissionLevel, Signature, TransactionStatus,
-        },
         state_history::types::{
             AccountAuthSequence, ActionReceiptV0, ActionTraceV1, BlockPosition,
             GetBlocksResponseV0, PartialTransactionV0, TransactionTraceV0,

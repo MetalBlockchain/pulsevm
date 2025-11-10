@@ -1,5 +1,9 @@
 [workspace]
 resolver = "2"
-members = [ "crates/pulse_cli", "crates/pulsevm", "crates/pulsevm_chainbase", "crates/pulsevm_crypto",
+members = [ "crates/pulse_cli", "crates/pulsevm", "crates/pulsevm_benchmark", "crates/pulsevm_chainbase", "crates/pulsevm_core", "crates/pulsevm_crypto",
     "crates/pulsevm_grpc"
 , "crates/pulsevm_name", "crates/pulsevm_proc_macros", "crates/pulsevm_serialization", "crates/pulsevm_storage", "crates/pulsevm_time"]
+
+[profile.profiling]
+inherits = "release"
+debug = true

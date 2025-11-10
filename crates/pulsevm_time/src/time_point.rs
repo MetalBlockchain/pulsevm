@@ -49,22 +49,19 @@ impl TimePoint {
     pub fn now() -> Self {
         use std::time::{SystemTime, UNIX_EPOCH};
 
-        let dur = match SystemTime::now().duration_since(UNIX_EPOCH) {
-            Ok(d) => d,
-            // If the clock is before 1970-01-01 (rare), clamp to 0.
-            Err(_) => std::time::Duration::from_secs(0),
+        let dur = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let micros_u128 = dur.as_micros();
+
+        // Clamp to i64 if your Microseconds uses i64
+        let micros_i64 = if micros_u128 > i64::MAX as u128 {
+            i64::MAX
+        } else {
+            micros_u128 as i64
         };
 
-        let micros = (dur.as_secs() as i64)
-            .saturating_mul(1_000_000)
-            .saturating_add((dur.subsec_nanos() / 1_000) as i64);
-
-        // If your Microseconds type has `new(i64) -> Microseconds`
-        TimePoint::new(Microseconds::new(micros))
-
-        // If instead you use helpers, this is equivalent:
-        // use crate::microseconds::{seconds, microseconds};
-        // TimePoint::new(seconds(dur.as_secs() as i64) + microseconds((dur.subsec_nanos()/1_000) as i64))
+        TimePoint::new(Microseconds::new(micros_i64))
     }
 
     /// Exact EOS-style string: "YYYY-MM-DDTHH:MM:SSZ"

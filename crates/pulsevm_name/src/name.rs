@@ -48,7 +48,7 @@ where
 
     // Check if we have a 13th character
     if let Some(c) = iter.next() {
-        let v = char_to_value(c).ok_or_else(|| ParseNameError::BadChar(c))?;
+        let v: u8 = char_to_value(c).ok_or_else(|| ParseNameError::BadChar(c))?;
 
         // The 13th character can only be 4 bits, it has to be between letters
         // 'a' to 'j'

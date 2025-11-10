@@ -1,9 +1,8 @@
 mod api;
 mod chain;
-mod mempool;
 mod state_history;
 
-use chain::{Controller, Id, NodeId};
+use pulsevm_core::{config::{PLUGIN_VERSION, VERSION}, controller::Controller, id::{Id, NodeId}, mempool::Mempool, transaction::PackedTransaction};
 use pulsevm_grpc::{
     http::{
         self, Element,
@@ -16,7 +15,6 @@ use pulsevm_grpc::{
     },
 };
 use pulsevm_serialization::{Read, Write};
-use secp256k1::hashes::siphash24::State;
 use spdlog::{info, warn};
 use std::{
     net::{SocketAddr, TcpListener},
@@ -31,11 +29,7 @@ use tokio_util::sync::CancellationToken;
 use tonic::transport::server::TcpIncoming;
 use tonic::{Request, Response, Status, transport::Server};
 
-use crate::{
-    chain::{Gossipable, PLUGIN_VERSION, PackedTransaction, Transaction, VERSION},
-    mempool::BlockTimer,
-    state_history::StateHistoryServer,
-};
+use crate::{chain::{BlockTimer, Gossipable}, state_history::StateHistoryServer};
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 10)]
 async fn main() {
@@ -146,7 +140,7 @@ async fn start_runtime_service(
 pub struct VirtualMachine {
     server_addr: SocketAddr,
     controller: Arc<RwLock<Controller>>,
-    mempool: Arc<RwLock<mempool::Mempool>>,
+    mempool: Arc<RwLock<Mempool>>,
     network_manager: Arc<RwLock<chain::NetworkManager>>,
     rpc_service: chain::RpcService,
     block_timer: Arc<RwLock<BlockTimer>>,
@@ -156,7 +150,7 @@ pub struct VirtualMachine {
 impl VirtualMachine {
     pub fn new(server_addr: SocketAddr) -> Result<Self, Box<dyn std::error::Error>> {
         let controller = Arc::new(RwLock::new(Controller::new()));
-        let mempool = Arc::new(RwLock::new(mempool::Mempool::new()));
+        let mempool = Arc::new(RwLock::new(Mempool::new()));
         let network_manager = Arc::new(RwLock::new(chain::NetworkManager::new()));
         let rpc_service =
             chain::RpcService::new(mempool.clone(), controller.clone(), network_manager.clone());
@@ -195,13 +189,9 @@ impl Vm for VirtualMachine {
         let mut network_manager = network_manager.write().await;
         network_manager.set_server_address(server_addr.clone());
 
-        let mempool = Arc::clone(&self.mempool);
-        let mut mempool = mempool.write().await;
-        mempool.set_server_address(server_addr.clone());
-
         let block_timer = self.block_timer.clone();
         let mut block_timer = block_timer.write().await;
-        block_timer.start().await;
+        block_timer.start(server_addr.clone()).await;
 
         return Ok(Response::new(vm::InitializeResponse {
             last_accepted_id: controller.last_accepted_block().id().as_bytes().to_vec(),
@@ -305,6 +295,7 @@ impl Vm for VirtualMachine {
             .build_block(&mut mempool)
             .await
             .map_err(|e| Status::internal(format!("could not build block: {}", e)))?;
+        info!("built block");
         Ok(Response::new(vm::BuildBlockResponse {
             id: block.id().into(),
             parent_id: block.previous_id().as_bytes().to_vec(),
@@ -340,7 +331,7 @@ impl Vm for VirtualMachine {
         request: Request<vm::GetBlockRequest>,
     ) -> Result<tonic::Response<vm::GetBlockResponse>, Status> {
         let controller = self.controller.clone();
-        let mut controller = controller.write().await;
+        let controller = controller.read().await;
         let block_id: Id = request
             .get_ref()
             .id

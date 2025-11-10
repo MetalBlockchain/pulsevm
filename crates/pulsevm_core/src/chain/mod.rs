@@ -1,0 +1,36 @@
+pub mod abi;
+pub mod account;
+mod apply_context;
+pub mod asset;
+pub mod authority;
+pub mod authority_checker;
+pub mod authorization_manager;
+pub mod block;
+pub mod config;
+pub mod controller;
+pub mod error;
+mod genesis;
+pub mod id;
+mod iterator_cache;
+pub mod mempool;
+pub mod name;
+mod pulse_contract;
+pub mod resource;
+pub mod resource_limits;
+pub mod secp256k1;
+pub mod state_history;
+pub mod table;
+pub mod transaction;
+mod transaction_context;
+pub mod utils;
+mod wasm_runtime;
+mod webassembly;
+
+use crate::chain::name::Name;
+use pulsevm_proc_macros::name;
+
+pub const PULSE_NAME: Name = Name::new(name!("pulse"));
+pub const OWNER_NAME: Name = Name::new(name!("owner"));
+pub const ACTIVE_NAME: Name = Name::new(name!("active"));
+pub const ANY_NAME: Name = Name::new(name!("pulse.any"));
+pub const CODE_NAME: Name = Name::new(name!("pulse.code"));

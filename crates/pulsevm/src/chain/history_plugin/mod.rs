@@ -1,6 +1,5 @@
+use pulsevm_core::{block::SignedBlock, error::ChainError};
 use tokio::sync::broadcast::Receiver;
-
-use crate::chain::{Controller, SignedBlock, error::ChainError};
 
 pub struct HistoryPlugin {
     on_accepted_block: Receiver<SignedBlock>,

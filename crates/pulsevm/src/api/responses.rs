@@ -1,7 +1,6 @@
+use pulsevm_core::{asset::Asset, authority::Authority, block::BlockTimestamp, id::Id, name::Name, resource::AccountResourceLimit, utils::Base64Bytes};
 use pulsevm_crypto::Digest;
 use serde::Serialize;
-
-use crate::chain::{AccountResourceLimit, Asset, Authority, Base64Bytes, BlockTimestamp, Id, Name};
 
 #[derive(Serialize, Clone, Default)]
 pub struct PermissionResponse {

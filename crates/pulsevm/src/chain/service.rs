@@ -6,6 +6,7 @@ use std::{
 
 use jsonrpsee::{proc_macros::rpc, types::ErrorObjectOwned};
 use pulsevm_chainbase::Session;
+use pulsevm_core::{abi::{AbiDefinition, AbiSerializer}, account::{Account, AccountMetadata}, asset::{string_to_symbol, Asset}, authority::{Permission, PermissionByOwnerIndex}, block::{BlockHeader, BlockTimestamp, SignedBlock}, controller::Controller, error::ChainError, id::Id, mempool::Mempool, name::Name, resource_limits::ResourceLimitsManager, secp256k1::Signature, table::{KeyValue, KeyValueByScopePrimaryIndex, Table, TableByCodeScopeTableIndex}, transaction::{PackedTransaction, TransactionCompression}, utils::{pulse_assert, Base64Bytes, I32Flex}, PULSE_NAME};
 use pulsevm_crypto::{Bytes, Digest};
 use pulsevm_proc_macros::name;
 use pulsevm_serialization::Read;
@@ -13,18 +14,7 @@ use serde_json::{Map, Value, json};
 use tokio::sync::RwLock;
 use tonic::async_trait;
 
-use crate::{
-    api::{
-        GetAccountResponse, GetCodeHashResponse, GetInfoResponse, GetRawABIResponse,
-        GetTableRowsResponse, IssueTxResponse, PermissionResponse,
-    },
-    chain::{
-        error::ChainError, pulse_assert, resource_limits::ResourceLimitsManager, string_to_symbol, AbiDefinition, AbiSerializer, Account, AccountMetadata, Asset, Base64Bytes, BlockHeader, BlockTimestamp, Gossipable, I32Flex, Id, KeyValue, KeyValueByScopePrimaryIndex, Name, PackedTransaction, Permission, PermissionByOwnerIndex, Signature, SignedBlock, Table, TableByCodeScopeTableIndex, TransactionCompression, PULSE_NAME
-    },
-    mempool::Mempool,
-};
-
-use super::{Controller, NetworkManager};
+use crate::{api::{GetAccountResponse, GetCodeHashResponse, GetInfoResponse, GetRawABIResponse, GetTableRowsResponse, IssueTxResponse, PermissionResponse}, chain::{Gossipable, NetworkManager}};
 
 #[rpc(server)]
 pub trait Rpc {
@@ -214,11 +204,11 @@ impl RpcServer for RpcService {
 
             if perm.parent_id() > 0 {
                 let parent_perm = session.get::<Permission>(perm.parent_id())?;
-                parent = parent_perm.name.clone();
+                parent = parent_perm.name;
             }
 
             result.permissions.push(PermissionResponse::new(
-                perm.name.clone(),
+                perm.name,
                 parent,
                 perm.authority.clone(),
             ));
@@ -659,18 +649,18 @@ fn get_table_rows_ex(
             }
 
             let variant = if json {
-                serializer.binary_to_variant(&table_type, &kv.value, &mut 0).map_err(|e| {
-                    println!("Failed to convert binary to variant: {}", e);
-                    ChainError::InvalidArgument(format!(
-                        "failed to convert binary to variant: {}",
-                        e
-                    ))
-                })?
+                serializer
+                    .binary_to_variant(&table_type, &kv.value, &mut 0)
+                    .map_err(|e| {
+                        println!("Failed to convert binary to variant: {}", e);
+                        ChainError::InvalidArgument(format!(
+                            "failed to convert binary to variant: {}",
+                            e
+                        ))
+                    })?
             } else {
                 Value::String(hex::encode(&kv.value))
             };
-
-            println!("variant: {}", variant);
 
             if show_payer.is_some() && show_payer.unwrap() {
                 response.rows.push(serde_json::json!({
