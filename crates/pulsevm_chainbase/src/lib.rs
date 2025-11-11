@@ -86,20 +86,22 @@ where
 #[derive(Clone)]
 pub struct Database {
     keyspace: TransactionalKeyspace,
+    partition_create_options: PartitionCreateOptions,
 }
 
-impl<'a> Database {
+impl Database {
     #[must_use]
     pub fn new(path: &Path) -> Result<Self, fjall::Error> {
         Ok(Self {
             keyspace: Config::new(path).open_transactional()?,
+            partition_create_options: PartitionCreateOptions::default(),
         })
     }
 
     pub fn temporary(path: &Path) -> Result<Self, fjall::Error> {
         let config = Config::new(path).temporary(true);
         let keyspace = config.open_transactional()?;
-        Ok(Self { keyspace })
+        Ok(Self { keyspace, partition_create_options: PartitionCreateOptions::default() })
     }
 
     pub fn session(&self) -> Result<Session, ChainbaseError> {
@@ -107,23 +109,24 @@ impl<'a> Database {
     }
 
     pub fn undo_session(&self) -> Result<UndoSession, ChainbaseError> {
-        UndoSession::new(&self.keyspace)
+        UndoSession::new(&self.keyspace, self.partition_create_options.clone())
     }
 
     pub fn open_partition_handle(
         &self,
         table_name: &str,
     ) -> Result<TransactionalPartitionHandle, ChainbaseError> {
-        open_partition(&self.keyspace, table_name)
+        open_partition(&self.keyspace, table_name, self.partition_create_options.clone())
     }
 }
 
 fn open_partition(
     keyspace: &TransactionalKeyspace,
     table_name: &str,
+    partition_create_options: PartitionCreateOptions,
 ) -> Result<TransactionalPartitionHandle, ChainbaseError> {
     keyspace
-        .open_partition(table_name, PartitionCreateOptions::default())
+        .open_partition(table_name, partition_create_options)
         .map_err(|_| {
             ChainbaseError::InternalError(format!(
                 "failed to open partition for table: {}",

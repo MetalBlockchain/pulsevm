@@ -4,7 +4,7 @@ use std::{
 };
 
 use anyhow::Result;
-use fjall::{Slice, TransactionalKeyspace, WriteTransaction};
+use fjall::{PartitionCreateOptions, Slice, TransactionalKeyspace, WriteTransaction};
 
 use crate::{ChainbaseError, ChainbaseObject, SecondaryIndex, index::Index, open_partition};
 
@@ -19,16 +19,18 @@ pub struct UndoSession {
     changes: Arc<RwLock<VecDeque<ObjectChange>>>,
     tx: Arc<RwLock<WriteTransaction>>,
     keyspace: TransactionalKeyspace,
+    partition_create_options: PartitionCreateOptions,
 }
 
 impl UndoSession {
-    pub fn new(keyspace: &TransactionalKeyspace) -> Result<Self, ChainbaseError> {
+    pub fn new(keyspace: &TransactionalKeyspace, partition_create_options: PartitionCreateOptions) -> Result<Self, ChainbaseError> {
         Ok(Self {
             changes: Arc::new(RwLock::new(VecDeque::new())),
             tx: Arc::new(RwLock::new(keyspace.write_tx().map_err(|_| {
                 ChainbaseError::InternalError("failed to create write transaction".to_string())
             })?)),
             keyspace: keyspace.clone(),
+            partition_create_options,
         })
     }
 
@@ -45,7 +47,7 @@ impl UndoSession {
         &mut self,
         key: T::PrimaryKey,
     ) -> Result<bool, ChainbaseError> {
-        let partition = open_partition(&self.keyspace, T::table_name())?;
+        let partition = open_partition(&self.keyspace, T::table_name(), self.partition_create_options.clone())?;
         let mut tx = self
             .tx
             .write()
@@ -63,7 +65,7 @@ impl UndoSession {
         &mut self,
         key: T::PrimaryKey,
     ) -> Result<Option<T>, ChainbaseError> {
-        let partition = open_partition(&self.keyspace, T::table_name())?;
+        let partition = open_partition(&self.keyspace, T::table_name(), self.partition_create_options.clone())?;
         let mut tx = self
             .tx
             .write()
@@ -94,7 +96,7 @@ impl UndoSession {
         &mut self,
         key: S::Key,
     ) -> Result<T, ChainbaseError> {
-        let partition = open_partition(&self.keyspace, S::index_name())?;
+        let partition = open_partition(&self.keyspace, S::index_name(), self.partition_create_options.clone())?;
         let mut tx = self
             .tx
             .write()
@@ -105,7 +107,7 @@ impl UndoSession {
         if secondary_key.is_none() {
             return Err(ChainbaseError::NotFound);
         }
-        let partition = open_partition(&self.keyspace, T::table_name())?;
+        let partition = open_partition(&self.keyspace, T::table_name(), self.partition_create_options.clone())?;
         let serialized = tx.get(&partition, secondary_key.unwrap()).map_err(|_| {
             ChainbaseError::InternalError(format!("failed to get object for secondary key"))
         })?;
@@ -127,12 +129,12 @@ impl UndoSession {
             .tx
             .write()
             .map_err(|_| ChainbaseError::InternalError(format!("failed to write transaction")))?;
-        let sec_part = open_partition(&self.keyspace, S::index_name())?;
+        let sec_part = open_partition(&self.keyspace, S::index_name(), self.partition_create_options.clone())?;
         if let Some(primary_key) = tx
             .get(&sec_part, S::secondary_key_as_bytes(key))
             .map_err(|_| ChainbaseError::InternalError("failed to get secondary key".into()))?
         {
-            let prim_part = open_partition(&self.keyspace, T::table_name())?;
+            let prim_part = open_partition(&self.keyspace, T::table_name(), self.partition_create_options.clone())?;
             if let Some(bytes) = tx.get(&prim_part, primary_key).map_err(|_| {
                 ChainbaseError::InternalError("failed to get object for secondary key".into())
             })? {
@@ -146,7 +148,7 @@ impl UndoSession {
     }
 
     pub fn generate_id<T: ChainbaseObject>(&mut self) -> Result<u64, ChainbaseError> {
-        let partition = open_partition(&self.keyspace, T::table_name())?;
+        let partition = open_partition(&self.keyspace, T::table_name(), self.partition_create_options.clone())?;
         let mut new_id = 1u64;
         let mut tx = self
             .tx
@@ -180,7 +182,7 @@ impl UndoSession {
             .write()
             .map_err(|_| ChainbaseError::InternalError(format!("failed to write transaction")))?;
         let key = object.primary_key();
-        let partition = open_partition(&self.keyspace, T::table_name())?;
+        let partition = open_partition(&self.keyspace, T::table_name(), self.partition_create_options.clone())?;
         let exists = tx.contains_key(&partition, &key).map_err(|_| {
             ChainbaseError::InternalError(format!("failed to check existence for key: {:?}", key))
         })?;
@@ -201,7 +203,7 @@ impl UndoSession {
         tx.insert(&partition, &key, serialized);
 
         for index in object.secondary_indexes() {
-            let part = open_partition(&self.keyspace, index.index_name)?;
+            let part = open_partition(&self.keyspace, index.index_name, self.partition_create_options.clone())?;
             tx.insert(&part, &index.key, &key);
         }
         Ok(())
@@ -216,7 +218,7 @@ impl UndoSession {
             .tx
             .write()
             .map_err(|_| ChainbaseError::InternalError(format!("failed to write transaction")))?;
-        let partition = open_partition(&self.keyspace, T::table_name())?;
+        let partition = open_partition(&self.keyspace, T::table_name(), self.partition_create_options.clone())?;
         let key = old.primary_key();
         let key_bytes = old.primary_key();
 
@@ -257,7 +259,7 @@ impl UndoSession {
 
     pub fn remove<T: ChainbaseObject>(&mut self, object: T) -> Result<(), ChainbaseError> {
         let key = object.primary_key();
-        let partition = open_partition(&self.keyspace, T::table_name())?;
+        let partition = open_partition(&self.keyspace, T::table_name(), self.partition_create_options.clone())?;
         let mut tx = self
             .tx
             .write()
@@ -278,7 +280,7 @@ impl UndoSession {
         ));
         tx.remove(&partition, &key);
         for index in object.secondary_indexes() {
-            let partition = open_partition(&self.keyspace, index.index_name)?;
+            let partition = open_partition(&self.keyspace, index.index_name, self.partition_create_options.clone())?;
             tx.remove(&partition, &index.key);
         }
         Ok(())

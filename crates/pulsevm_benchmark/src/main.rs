@@ -111,6 +111,10 @@ fn main() {
                     max_supply: Asset::new(100000000, Symbol::from_str("4,EOS").unwrap()),
                 },
                 controller.chain_id(),
+                vec![PermissionLevel::new(
+                    Name::from_str("pulse.token").unwrap(),
+                    Name::from_str("active").unwrap(),
+                )],
             )
             .unwrap(),
             &pending_block_timestamp,
@@ -133,6 +137,10 @@ fn main() {
                     memo: "Initial transfer".to_string(),
                 },
                 controller.chain_id(),
+                vec![PermissionLevel::new(
+                    Name::from_str("pulse.token").unwrap(),
+                    Name::from_str("active").unwrap(),
+                )],
             )
             .unwrap(),
             &pending_block_timestamp,
@@ -156,11 +164,18 @@ fn main() {
                     memo: "Initial transfer".to_string(),
                 },
                 controller.chain_id(),
+                vec![PermissionLevel::new(
+                    Name::from_str("pulse.token").unwrap(),
+                    Name::from_str("active").unwrap(),
+                )],
             )
             .unwrap(),
             &pending_block_timestamp,
         )
         .unwrap();
+
+    undo_session.commit().unwrap();
+    let mut undo_session = controller.create_undo_session().unwrap();
 
     for _i in 0..200 {
         controller
@@ -180,6 +195,10 @@ fn main() {
                         memo: "Initial transfer".to_string(),
                     },
                     controller.chain_id(),
+                    vec![PermissionLevel::new(
+                        Name::from_str("alice").unwrap(),
+                        Name::from_str("active").unwrap(),
+                    )],
                 )
                 .unwrap(),
                 &pending_block_timestamp,
@@ -265,6 +284,7 @@ fn call_contract<T: Write>(
     action: Name,
     action_data: &T,
     chain_id: Id,
+    permissions: Vec<PermissionLevel>,
 ) -> Result<PackedTransaction, ChainError> {
     let trx = Transaction::new(
         TransactionHeader::new(TimePointSec::new(0), 0, 0, 0u32.into(), 0, 0u32.into()),
@@ -273,10 +293,7 @@ fn call_contract<T: Write>(
             account,
             action,
             action_data.pack().unwrap(),
-            vec![PermissionLevel::new(
-                account,
-                Name::from_str("active").unwrap(),
-            )],
+            permissions,
         )],
     )
     .sign(&private_key, &chain_id)?;
