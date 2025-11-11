@@ -745,7 +745,7 @@ mod tests {
                     account,
                     vm_type: 0,
                     vm_version: 0,
-                    code: wasm_bytes,
+                    code: Arc::new(wasm_bytes),
                 }
                 .pack()
                 .unwrap(),

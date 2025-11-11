@@ -201,7 +201,7 @@ impl WasmRuntime {
                 let code_object = session.get::<CodeObject>(code_hash).map_err(|e| {
                     ChainError::WasmRuntimeError(format!("failed to get wasm code: {}", e))
                 })?;
-                let module = Module::new(&self.engine, code_object.code)
+                let module = Module::new(&self.engine, code_object.code.as_ref())
                     .map_err(|e| ChainError::WasmRuntimeError(e.to_string()))?;
                 self.code_cache.put(code_hash, module);
             }

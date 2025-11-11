@@ -337,7 +337,7 @@ impl AuthorizationManager {
             .map_err(|e| ChainError::AuthorizationError(format!("{}", e)))?;
         if result.is_none() {
             return Err(ChainError::PermissionNotFound(
-                level.actor().clone(),
+                level.actor(),
                 level.permission().clone(),
             ));
         }

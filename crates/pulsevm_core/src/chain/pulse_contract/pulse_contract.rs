@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use pulsevm_chainbase::UndoSession;
 use pulsevm_serialization::Write;
 use secp256k1::hashes::{Hash, sha256};
@@ -246,7 +248,7 @@ pub fn setabi(context: &mut ApplyContext) -> Result<(), ChainError> {
 
     session
         .modify(&mut account, |a| {
-            a.abi = abi_def_packed.clone();
+            a.abi = abi_def_packed;
             Ok(())
         })
         .map_err(|_| ChainError::TransactionError(format!("failed to update account")))?;

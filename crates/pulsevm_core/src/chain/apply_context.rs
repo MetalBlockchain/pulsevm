@@ -186,7 +186,12 @@ impl ApplyContext {
     }
 
     pub fn finalize_trace(&self, receipt: ActionReceipt) -> Result<(), ChainError> {
-        info!("took {} us to execute action {}@{}", Utc::now().timestamp_micros() - self.start, self.action.account(), self.action.name());
+        info!(
+            "took {} us to execute action {}@{}",
+            Utc::now().timestamp_micros() - self.start,
+            self.action.account(),
+            self.action.name()
+        );
 
         self.trx_context
             .modify_action_trace(self.action_ordinal, |trace| {
@@ -474,7 +479,7 @@ impl ApplyContext {
         let new_size = data.len() as i64 + overhead;
 
         let payer = if payer.empty() {
-            obj.payer.clone()
+            obj.payer
         } else {
             payer
         };
@@ -762,7 +767,7 @@ impl ApplyContext {
     }
 
     pub fn next_auth_sequence(&mut self, actor: &Name) -> Result<u64, ChainError> {
-        let mut amo = self.session.get::<AccountMetadata>(actor.clone())?;
+        let mut amo = self.session.get::<AccountMetadata>(*actor)?;
         let next_sequence = amo.auth_sequence + 1;
         self.session.modify(&mut amo, |amo| {
             amo.auth_sequence = next_sequence;

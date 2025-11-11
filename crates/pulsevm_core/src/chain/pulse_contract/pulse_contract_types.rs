@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 
 use crate::chain::{authority::Authority, name::Name};
@@ -44,11 +46,11 @@ pub struct SetCode {
     pub account: Name,
     pub vm_type: u8,
     pub vm_version: u8,
-    pub code: Vec<u8>,
+    pub code: Arc<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Read, Write, NumBytes)]
 pub struct SetAbi {
     pub account: Name,
-    pub abi: Vec<u8>,
+    pub abi: Arc<Vec<u8>>,
 }

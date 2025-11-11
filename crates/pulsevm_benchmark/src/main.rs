@@ -3,7 +3,7 @@ use std::{
     fs,
     hint::black_box,
     path::{Path, PathBuf},
-    str::FromStr,
+    str::FromStr, sync::Arc,
 };
 
 use chrono::Utc;
@@ -177,7 +177,7 @@ fn main() {
     undo_session.commit().unwrap();
     let mut undo_session = controller.create_undo_session().unwrap();
 
-    for _i in 0..200 {
+    for _i in 0..2 {
         controller
             .execute_transaction(
                 &mut undo_session,
@@ -263,7 +263,7 @@ fn set_code(
                 account,
                 vm_type: 0,
                 vm_version: 0,
-                code: wasm_bytes,
+                code: Arc::new(wasm_bytes),
             }
             .pack()
             .unwrap(),
