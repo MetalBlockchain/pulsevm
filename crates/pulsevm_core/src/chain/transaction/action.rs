@@ -1,19 +1,20 @@
 use core::fmt;
+use std::sync::Arc;
 
 use pulsevm_crypto::Digest;
-use pulsevm_proc_macros::{NumBytes, Read, Write};
-use pulsevm_serialization::{Read, Write};
+use pulsevm_serialization::{NumBytes, Read, Write};
 use secp256k1::hashes::{Hash, sha256};
 use serde::Serialize;
 
 use crate::chain::{Name, authority::PermissionLevel};
 
-#[derive(Debug, Clone, PartialEq, Eq, Read, Write, NumBytes, Hash, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct Action {
     account: Name,
     name: Name,
     authorization: Vec<PermissionLevel>,
-    data: Vec<u8>,
+    #[serde(with = "arc_bytes_serde")]
+    data: Arc<[u8]>,
 }
 
 impl fmt::Display for Action {
@@ -36,7 +37,7 @@ impl Action {
         Action {
             account,
             name,
-            data,
+            data: Arc::from(data),
             authorization,
         }
     }
@@ -49,8 +50,8 @@ impl Action {
         self.name
     }
 
-    pub fn data(&self) -> &[u8] {
-        &self.data
+    pub fn data(&self) -> Arc<[u8]> {
+        Arc::clone(&self.data)
     }
 
     pub fn authorization(&self) -> &[PermissionLevel] {
@@ -74,4 +75,46 @@ pub fn generate_action_digest(act: &Action, action_return_value: Option<Vec<u8>>
         bytes.extend(return_value);
     }
     Digest::hash(&bytes)
+}
+
+impl NumBytes for Action {
+    fn num_bytes(&self) -> usize {
+        self.account.num_bytes()
+            + self.name.num_bytes()
+            + self.authorization.num_bytes()
+            + self.data.num_bytes()
+    }
+}
+
+impl Read for Action {
+    fn read(bytes: &[u8], pos: &mut usize) -> Result<Self, pulsevm_serialization::ReadError> {
+        let account = Name::read(bytes, pos)?;
+        let name = Name::read(bytes, pos)?;
+        let authorization = Vec::<PermissionLevel>::read(bytes, pos)?;
+        let data = Vec::<u8>::read(bytes, pos)?;
+        Ok(Action::new(account, name, data, authorization))
+    }
+}
+
+impl Write for Action {
+    fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), pulsevm_serialization::WriteError> {
+        self.account.write(bytes, pos)?;
+        self.name.write(bytes, pos)?;
+        self.authorization.write(bytes, pos)?;
+        self.data.as_ref().to_vec().write(bytes, pos)?;
+        Ok(())
+    }
+}
+
+mod arc_bytes_serde {
+    use serde::Serializer;
+
+    use super::*;
+    pub fn serialize<S>(data: &Arc<[u8]>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        // serialize as normal bytes (base64 for JSON)
+        serializer.serialize_bytes(data)
+    }
 }

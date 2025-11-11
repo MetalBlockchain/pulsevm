@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
-    hash::Hash,
+    hash::Hash, sync::Arc,
 };
 
 use crate::{NumBytes, Read, ReadError, VarUint32, Write, WriteError};
@@ -126,6 +126,13 @@ impl<T: NumBytes> NumBytes for Option<T> {
     }
 }
 
+impl<T: NumBytes> NumBytes for [T] {
+    #[inline]
+    fn num_bytes(&self) -> usize {
+        self.len().num_bytes() + self.iter().map(NumBytes::num_bytes).sum::<usize>()
+    }
+}
+
 impl<T: NumBytes> NumBytes for Vec<T> {
     #[inline]
     fn num_bytes(&self) -> usize {
@@ -187,6 +194,13 @@ impl<T1: NumBytes, T2: NumBytes, T3: NumBytes, T4: NumBytes> NumBytes for (T1, T
     #[inline]
     fn num_bytes(&self) -> usize {
         self.0.num_bytes() + self.1.num_bytes() + self.2.num_bytes() + self.3.num_bytes()
+    }
+}
+
+impl<T: NumBytes> NumBytes for Arc<T> {
+    #[inline]
+    fn num_bytes(&self) -> usize {
+        (**self).num_bytes()
     }
 }
 
@@ -452,6 +466,17 @@ impl<T: Read> Read for Option<T> {
     }
 }
 
+impl<T> Read for Arc<T>
+where
+    T: Read,
+{
+    #[inline]
+    fn read(bytes: &[u8], pos: &mut usize) -> Result<Self, ReadError> {
+        let value = T::read(bytes, pos)?;
+        Ok(Arc::new(value))
+    }
+}
+
 impl Write for usize {
     #[inline]
     fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), WriteError> {
@@ -680,6 +705,13 @@ impl<T1: Write, T2: Write, T3: Write, T4: Write> Write for (T1, T2, T3, T4) {
         self.2.write(bytes, pos)?;
         self.3.write(bytes, pos)?;
         Ok(())
+    }
+}
+
+impl<T: Write> Write for Arc<T> {
+    #[inline]
+    fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), WriteError> {
+        (**self).write(bytes, pos)
     }
 }
 
