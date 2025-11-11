@@ -14,7 +14,7 @@ use pulsevm_core::{
     error::ChainError,
     id::Id,
     name::Name,
-    pulse_contract::{NewAccount, SetCode},
+    pulse_contract::{NewAccount, SetAbi, SetCode},
     secp256k1::PrivateKey,
     transaction::{Action, PackedTransaction, Transaction, TransactionHeader},
 };
@@ -85,6 +85,8 @@ fn main() {
         .unwrap();
     let pulse_token_contract =
         fs::read(root.join(Path::new("reference_contracts/pulse_token.wasm"))).unwrap();
+    let pulse_token_abi =
+        fs::read(root.join(Path::new("reference_contracts/pulse_token.abi"))).unwrap();
     controller
         .execute_transaction(
             &mut undo_session,
@@ -92,6 +94,19 @@ fn main() {
                 &private_key,
                 Name::from_str("pulse.token").unwrap(),
                 pulse_token_contract,
+                controller.chain_id(),
+            )
+            .unwrap(),
+            &pending_block_timestamp,
+        )
+        .unwrap();
+    controller
+        .execute_transaction(
+            &mut undo_session,
+            &set_abi(
+                &private_key,
+                Name::from_str("pulse.token").unwrap(),
+                pulse_token_abi,
                 controller.chain_id(),
             )
             .unwrap(),
@@ -264,6 +279,35 @@ fn set_code(
                 vm_type: 0,
                 vm_version: 0,
                 code: Arc::new(wasm_bytes),
+            }
+            .pack()
+            .unwrap(),
+            vec![PermissionLevel::new(
+                account,
+                Name::from_str("active").unwrap(),
+            )],
+        )],
+    )
+    .sign(&private_key, &chain_id)?;
+    let packed_trx = PackedTransaction::from_signed_transaction(trx)?;
+    Ok(packed_trx)
+}
+
+fn set_abi(
+    private_key: &PrivateKey,
+    account: Name,
+    abi_bytes: Vec<u8>,
+    chain_id: Id,
+) -> Result<PackedTransaction, ChainError> {
+    let trx = Transaction::new(
+        TransactionHeader::new(TimePointSec::new(0), 0, 0, 0u32.into(), 0, 0u32.into()),
+        vec![],
+        vec![Action::new(
+            Name::from_str("pulse").unwrap(),
+            Name::from_str("setabi").unwrap(),
+            SetAbi {
+                account,
+                abi: Arc::new(abi_bytes),
             }
             .pack()
             .unwrap(),

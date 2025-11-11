@@ -213,7 +213,7 @@ impl TransactionContext {
             trx_id,
             block_num,
             block_time,
-            provided.action(), // no clone of ActionTrace nor Action
+            provided.action().clone(),
             *receiver,         // if Name: Copy; otherwise clone here
             context_free,
             new_action_ordinal,
@@ -231,7 +231,7 @@ impl TransactionContext {
         recurse_depth: u32,
     ) -> Result<(), ChainError> {
         let (action, receiver) =
-            self.with_action_trace(action_ordinal, |t| (t.action(), t.receiver()))?;
+            self.with_action_trace(action_ordinal, |t| (t.action().clone(), t.receiver()))?;
         let mut apply_context = ApplyContext::new(
             self.session.clone(),
             self.wasm_runtime.clone(),

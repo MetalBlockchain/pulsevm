@@ -75,8 +75,8 @@ impl ActionTrace {
         self.receiver
     }
 
-    pub fn action(&self) -> Action {
-        self.act.clone()
+    pub fn action(&self) -> &Action {
+        &self.act
     }
 
     pub fn elapsed(&self) -> u32 {
