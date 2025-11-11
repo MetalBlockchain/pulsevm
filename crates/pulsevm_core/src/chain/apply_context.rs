@@ -8,7 +8,7 @@ use std::{
 
 use chrono::Utc;
 use pulsevm_chainbase::UndoSession;
-use spdlog::info;
+use spdlog::{debug, info};
 
 use crate::{
     CODE_NAME,
@@ -186,7 +186,7 @@ impl ApplyContext {
     }
 
     pub fn finalize_trace(&self, receipt: ActionReceipt) -> Result<(), ChainError> {
-        info!(
+        debug!(
             "took {} us to execute action {}@{}",
             Utc::now().timestamp_micros() - self.start,
             self.action.account(),

@@ -88,7 +88,8 @@ impl WasmRuntime {
         config.parallel_compilation(true);
 
         // Non-deterministic interruption
-        config.epoch_interruption(true);
+        //config.epoch_interruption(true);
+        config.consume_fuel(true);
 
         let engine = Engine::new(&config)
             .map_err(|e| ChainError::WasmRuntimeError(e.to_string()))
@@ -209,6 +210,9 @@ impl WasmRuntime {
 
         let context = WasmContext::new(receiver, action.clone(), apply_context.clone());
         let mut store = Store::new(&self.engine, context);
+        store.set_fuel(32_000_000).map_err(|e| {
+            ChainError::WasmRuntimeError(format!("failed to set fuel for wasm store: {}", e))
+        })?;
         let module = self.code_cache.get(&code_hash).ok_or_else(|| {
             ChainError::WasmRuntimeError(format!("wasm module not found in cache: {}", code_hash))
         })?;
@@ -220,18 +224,6 @@ impl WasmRuntime {
             .get_typed_func::<(u64, u64, u64), ()>(&mut store, "apply")
             .map_err(|e| ChainError::WasmRuntimeError(e.to_string()))?;
         let start = Utc::now().timestamp_micros();
-        store.epoch_deadline_callback(
-            move |_| -> Result<wasmtime::UpdateDeadline, anyhow::Error> {
-                let now = Utc::now().timestamp_micros();
-                let diff = now - start;
-
-                if diff > 32000 {
-                    return Ok(wasmtime::UpdateDeadline::Interrupt);
-                }
-
-                Ok(wasmtime::UpdateDeadline::Continue(10))
-            },
-        );
 
         // Resume timer
         apply_context.resume_billing_timer();
