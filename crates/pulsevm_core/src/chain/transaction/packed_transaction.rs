@@ -27,6 +27,7 @@ pub struct PackedTransaction {
 }
 
 impl PackedTransaction {
+    #[inline]
     pub fn new(
         signatures: HashSet<Signature>,
         compression: TransactionCompression,
@@ -59,14 +60,17 @@ impl PackedTransaction {
         })
     }
 
+    #[inline]
     pub fn get_signed_transaction(&self) -> &SignedTransaction {
         &self.unpacked_trx
     }
 
+    #[inline]
     pub fn get_transaction(&self) -> &Transaction {
         self.unpacked_trx.transaction()
     }
 
+    #[inline]
     pub fn get_unprunable_size(&self) -> Result<u64, ChainError> {
         let mut size = FIXED_NET_OVERHEAD_OF_PACKED_TRX as u64;
         size += self.packed_trx.len() as u64;
@@ -77,6 +81,7 @@ impl PackedTransaction {
         Ok(size)
     }
 
+    #[inline]
     pub fn get_prunable_size(&self) -> Result<u64, ChainError> {
         let mut size = self.signatures.num_bytes() as u64;
         size += self.packed_context_free_data.len() as u64;
@@ -87,11 +92,12 @@ impl PackedTransaction {
         Ok(size)
     }
 
+    #[inline]
     pub fn id(&self) -> &Id {
         &self.trx_id
     }
 
-    #[allow(dead_code)]
+    #[inline]
     pub fn from_signed_transaction(trx: SignedTransaction) -> Result<Self, ChainError> {
         let trx_id = trx.transaction().id().map_err(|e| {
             ChainError::SerializationError(format!("failed to get transaction ID: {}", e))
@@ -116,6 +122,7 @@ impl PackedTransaction {
 }
 
 impl NumBytes for PackedTransaction {
+    #[inline]
     fn num_bytes(&self) -> usize {
         self.signatures.num_bytes()
             + self.compression.num_bytes()
@@ -125,6 +132,7 @@ impl NumBytes for PackedTransaction {
 }
 
 impl Write for PackedTransaction {
+    #[inline]
     fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), WriteError> {
         self.signatures.write(bytes, pos)?;
         self.compression.write(bytes, pos)?;
@@ -135,6 +143,7 @@ impl Write for PackedTransaction {
 }
 
 impl Read for PackedTransaction {
+    #[inline]
     fn read(data: &[u8], pos: &mut usize) -> Result<Self, ReadError> {
         let signatures = HashSet::<Signature>::read(data, pos)?;
         let compression = TransactionCompression::read(data, pos)?;
@@ -165,6 +174,7 @@ impl Serialize for PackedTransaction {
     }
 }
 
+#[inline]
 fn maybe_decompress(
     compression: TransactionCompression,
     data: &[u8],

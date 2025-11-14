@@ -103,7 +103,10 @@ impl Database {
     pub fn temporary(path: &Path) -> Result<Self, fjall::Error> {
         let config = Config::new(path).temporary(true);
         let keyspace = config.open_transactional()?;
-        Ok(Self { keyspace, partition_create_options: PartitionCreateOptions::default() })
+        Ok(Self {
+            keyspace,
+            partition_create_options: PartitionCreateOptions::default(),
+        })
     }
 
     #[inline]
@@ -121,7 +124,11 @@ impl Database {
         &self,
         table_name: &str,
     ) -> Result<TransactionalPartitionHandle, ChainbaseError> {
-        open_partition(&self.keyspace, table_name, self.partition_create_options.clone())
+        open_partition(
+            &self.keyspace,
+            table_name,
+            self.partition_create_options.clone(),
+        )
     }
 }
 

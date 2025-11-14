@@ -80,3 +80,9 @@ impl From<ChainbaseError> for ChainError {
         }
     }
 }
+
+impl<T> From<std::sync::PoisonError<T>> for ChainError {
+    fn from(_: std::sync::PoisonError<T>) -> Self {
+        ChainError::InternalError(Some("failed to acquire read/write lock".into()))
+    }
+}

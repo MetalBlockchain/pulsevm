@@ -43,7 +43,7 @@ impl Mempool {
     pub fn pop_transaction(&mut self) -> Option<PackedTransaction> {
         if let Some(transaction) = self.transactions_list.pop_front() {
             self.transactions_map.remove(transaction.id());
-            return Some(transaction.clone());
+            return Some(transaction);
         }
 
         return None;

@@ -44,9 +44,7 @@ impl ChainbaseObject for Table {
     fn secondary_indexes(&self) -> Vec<SecondaryKey> {
         vec![SecondaryKey {
             key: TableByCodeScopeTableIndex::secondary_key_as_bytes((
-                self.code,
-                self.scope,
-                self.table,
+                self.code, self.scope, self.table,
             )),
             index_name: TableByCodeScopeTableIndex::index_name(),
         }]

@@ -3,7 +3,8 @@ use std::{
     fs,
     hint::black_box,
     path::{Path, PathBuf},
-    str::FromStr, sync::Arc,
+    str::FromStr,
+    sync::Arc,
 };
 
 use chrono::Utc;

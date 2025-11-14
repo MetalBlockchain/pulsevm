@@ -1,8 +1,6 @@
-use std::sync::Arc;
-
 use pulsevm_chainbase::UndoSession;
 use pulsevm_serialization::Write;
-use secp256k1::hashes::{Hash, sha256};
+use sha2::Digest;
 
 use crate::{
     ACTIVE_NAME, ANY_NAME, CODE_NAME, OWNER_NAME,
@@ -134,8 +132,8 @@ pub fn setcode(context: &mut ApplyContext) -> Result<(), ChainError> {
     let code_size = act.code.len() as u64;
 
     if code_size > 0 {
-        let digest = sha256::Hash::hash(act.code.as_slice());
-        code_hash = Id::from_sha256(&digest);
+        let digest = sha2::Sha256::digest(act.code.as_slice());
+        code_hash = Id::new(digest.into());
         // TODO: validate wasm
     }
 

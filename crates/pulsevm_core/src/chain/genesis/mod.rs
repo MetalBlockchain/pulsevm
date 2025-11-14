@@ -3,9 +3,8 @@ use pulsevm_proc_macros::NumBytes;
 use pulsevm_proc_macros::Read;
 use pulsevm_proc_macros::Write;
 use pulsevm_serialization::Write;
-use secp256k1::hashes::Hash;
-use secp256k1::hashes::sha256;
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 
 use crate::chain::block::BlockTimestamp;
 use crate::chain::error::ChainError;
@@ -59,8 +58,8 @@ impl Genesis {
         let packed = self
             .pack()
             .map_err(|e| ChainError::GenesisError(format!("failed to pack genesis: {}", e)))?;
-        let hash = sha256::Hash::hash(&packed);
-        let chain_id = Id::from_sha256(&hash);
+        let hash = sha2::Sha256::digest(&packed);
+        let chain_id = Id::new(hash.into());
         Ok(chain_id)
     }
 

@@ -15,7 +15,7 @@ use crate::chain::{
         db_lowerbound_i64, db_next_i64, db_previous_i64, db_remove_i64, db_store_i64,
         db_update_i64, db_upperbound_i64, get_resource_limits, get_self, is_privileged,
         pulse_assert, read_action_data, require_auth2, require_recipient, set_action_return_value,
-        set_privileged, set_resource_limits, sha1, sha256, sha512,
+        set_privileged, set_resource_limits, sha224, sha256, sha512,
     },
 };
 
@@ -89,7 +89,7 @@ impl WasmRuntime {
 
         // Non-deterministic interruption
         //config.epoch_interruption(true);
-        config.consume_fuel(true);
+        //config.consume_fuel(true);
 
         let engine = Engine::new(&config)
             .map_err(|e| ChainError::WasmRuntimeError(e.to_string()))
@@ -157,7 +157,7 @@ impl WasmRuntime {
             get_resource_limits(),
         )?;
         // Crypto functions
-        Self::add_host_function(&mut linker, "env", "sha1", sha1())?;
+        Self::add_host_function(&mut linker, "env", "sha224", sha224())?;
         Self::add_host_function(&mut linker, "env", "sha256", sha256())?;
         Self::add_host_function(&mut linker, "env", "sha512", sha512())?;
 

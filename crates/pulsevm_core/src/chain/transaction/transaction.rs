@@ -3,8 +3,8 @@ use std::collections::HashSet;
 use pulsevm_crypto::Bytes;
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 use pulsevm_serialization::Write;
-use secp256k1::hashes::{Hash, sha256};
 use serde::{Serialize, ser::SerializeStruct};
+use sha2::Digest;
 
 use crate::chain::{
     error::ChainError,
@@ -38,14 +38,14 @@ impl Transaction {
     }
 
     pub fn id(&self) -> Result<Id, ChainError> {
-        Ok(Id::from_sha256(&self.digest()?))
+        Ok(Id::new(self.digest()?))
     }
 
-    fn digest(&self) -> Result<sha256::Hash, ChainError> {
+    fn digest(&self) -> Result<[u8; 32], ChainError> {
         let bytes: Vec<u8> = self.pack().map_err(|e| {
             ChainError::SerializationError(format!("failed to pack transaction: {}", e))
         })?;
-        Ok(sha256::Hash::hash(&bytes))
+        Ok(sha2::Sha256::digest(&bytes).into())
     }
 
     // Helper function for testing
@@ -63,7 +63,7 @@ impl Transaction {
         &self,
         chain_id: &Id,
         cfd_bytes: &Vec<Bytes>,
-    ) -> Result<sha256::Hash, ChainError> {
+    ) -> Result<[u8; 32], ChainError> {
         let trx_bytes: Vec<u8> = self.pack().map_err(|e| {
             ChainError::SerializationError(format!("failed to pack transaction: {}", e))
         })?;

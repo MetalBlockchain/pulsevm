@@ -1,10 +1,10 @@
 use core::fmt;
 use std::sync::Arc;
 
-use pulsevm_crypto::Digest;
+use pulsevm_crypto::Digest as OurDigest;
 use pulsevm_serialization::{NumBytes, Read, Write};
-use secp256k1::hashes::{Hash, sha256};
 use serde::Serialize;
+use sha2::Digest;
 
 use crate::chain::{Name, authority::PermissionLevel};
 
@@ -63,18 +63,18 @@ impl Action {
         T::read(&self.data, &mut pos)
     }
 
-    pub fn digest(&self) -> sha256::Hash {
+    pub fn digest(&self) -> [u8; 32] {
         let bytes: Vec<u8> = self.pack().unwrap();
-        sha256::Hash::hash(&bytes)
+        sha2::Sha256::digest(&bytes).into()
     }
 }
 
-pub fn generate_action_digest(act: &Action, action_return_value: Option<Vec<u8>>) -> Digest {
+pub fn generate_action_digest(act: &Action, action_return_value: Option<Vec<u8>>) -> OurDigest {
     let mut bytes = act.pack().unwrap();
     if let Some(return_value) = action_return_value {
         bytes.extend(return_value);
     }
-    Digest::hash(&bytes)
+    OurDigest::hash(&bytes)
 }
 
 impl NumBytes for Action {
@@ -97,7 +97,11 @@ impl Read for Action {
 }
 
 impl Write for Action {
-    fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), pulsevm_serialization::WriteError> {
+    fn write(
+        &self,
+        bytes: &mut [u8],
+        pos: &mut usize,
+    ) -> Result<(), pulsevm_serialization::WriteError> {
         self.account.write(bytes, pos)?;
         self.name.write(bytes, pos)?;
         self.authorization.write(bytes, pos)?;

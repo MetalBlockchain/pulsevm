@@ -14,9 +14,10 @@ jsonrpsee = { version = "0.24.9", features = ["server", "macros"] }
 lru = "0.14.0"
 prost-types = "0.12.3"
 ripemd = "0.1.3"
-secp256k1 = { version = "0.30.0", features = ["recovery", "global-context", "hashes", "rand"] }
+secp256k1 = { version = "0.30.0", features = ["recovery", "global-context", "rand"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = { version = "0.10", features = ["asm"] }
 spdlog-rs = "0.4"
 time = { version = "0.3.41", features = ["formatting", "macros", "parsing"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
@@ -29,3 +30,10 @@ pulsevm_name = { path = "../pulsevm_name" }
 pulsevm_proc_macros = { path = "../pulsevm_proc_macros" }
 pulsevm_serialization = { path = "../pulsevm_serialization" }
 pulsevm_time = { path = "../pulsevm_time" }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "test"
+harness = false

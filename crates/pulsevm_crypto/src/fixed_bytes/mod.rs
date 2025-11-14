@@ -1,44 +1,50 @@
 use core::fmt;
 
 use pulsevm_serialization::{NumBytes, Read, Write};
-use secp256k1::hashes::{Hash, sha256};
 use serde::Serialize;
+use sha2::Digest;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FixedBytes<const N: usize>(pub [u8; N]);
 
 impl FixedBytes<32> {
+    #[inline]
     pub fn hash(data: impl AsRef<[u8]>) -> Self {
-        let hash = sha256::Hash::hash(data.as_ref());
+        let hash = sha2::Sha256::digest(data.as_ref());
         let mut out = [0u8; 32];
         out.copy_from_slice(hash.as_ref());
         FixedBytes(out)
     }
 
+    #[inline]
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
 }
 
 impl<const N: usize> fmt::Display for FixedBytes<N> {
+    #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", hex::encode(self.0))
     }
 }
 
 impl<const N: usize> NumBytes for FixedBytes<N> {
+    #[inline]
     fn num_bytes(&self) -> usize {
         N
     }
 }
 
 impl<const N: usize> Default for FixedBytes<N> {
+    #[inline]
     fn default() -> Self {
         FixedBytes([0u8; N])
     }
 }
 
 impl<const N: usize> Write for FixedBytes<N> {
+    #[inline]
     fn write(
         &self,
         bytes: &mut [u8],
@@ -54,6 +60,7 @@ impl<const N: usize> Write for FixedBytes<N> {
 }
 
 impl<const N: usize> Read for FixedBytes<N> {
+    #[inline]
     fn read(data: &[u8], pos: &mut usize) -> Result<Self, pulsevm_serialization::ReadError> {
         if *pos + N > data.len() {
             return Err(pulsevm_serialization::ReadError::NotEnoughBytes);
@@ -66,6 +73,7 @@ impl<const N: usize> Read for FixedBytes<N> {
 }
 
 impl<const N: usize> Serialize for FixedBytes<N> {
+    #[inline]
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,

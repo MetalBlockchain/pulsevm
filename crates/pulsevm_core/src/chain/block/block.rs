@@ -4,7 +4,6 @@ use pulsevm_chainbase::{ChainbaseObject, SecondaryIndex, SecondaryKey};
 use pulsevm_crypto::Digest;
 use pulsevm_proc_macros::{NumBytes, Read, Write, name};
 use pulsevm_serialization::Write;
-use secp256k1::hashes::{Hash, sha256};
 use serde::{Serialize, ser::SerializeStruct};
 
 use crate::chain::{

@@ -175,9 +175,9 @@ impl ApplyContext {
             first_receiver_account.abi_sequence,
         );
 
-        let auths = self.action.authorization().to_vec();
-        for auth in auths.iter() {
-            receipt.add_auth_sequence(auth.actor(), self.next_auth_sequence(&mut auth.actor())?);
+        for auth in self.action.clone().authorization().iter() {
+            let auth_sequence = self.next_auth_sequence(&mut auth.actor())?;
+            receipt.add_auth_sequence(auth.actor(), auth_sequence);
         }
 
         self.finalize_trace(receipt)?;
@@ -334,7 +334,8 @@ impl ApplyContext {
         }
 
         let inline_receiver = a.account();
-        let scheduled_ordinal = self.schedule_action_from_action(a, &inline_receiver, false)?;
+        let scheduled_ordinal =
+            self.schedule_action_from_action(a.clone(), &inline_receiver, false)?;
         self.inline_actions.borrow_mut().push(scheduled_ordinal);
 
         Ok(())
@@ -361,7 +362,7 @@ impl ApplyContext {
 
     pub fn schedule_action_from_action(
         &mut self,
-        act_to_schedule: &Action,
+        act_to_schedule: Action,
         receiver: &Name,
         context_free: bool,
     ) -> Result<u32, ChainError> {
@@ -411,7 +412,7 @@ impl ApplyContext {
         table: Name,
         payer: Name,
         primary_key: u64,
-        data: &Vec<u8>,
+        data: Vec<u8>,
     ) -> Result<i32, ChainError> {
         let mut table = self.find_or_create_table(self.receiver, scope, table, payer)?;
         pulse_assert(
@@ -478,11 +479,7 @@ impl ApplyContext {
         let old_size = obj.value.len() as i64 + overhead;
         let new_size = data.len() as i64 + overhead;
 
-        let payer = if payer.empty() {
-            obj.payer
-        } else {
-            payer
-        };
+        let payer = if payer.empty() { obj.payer } else { payer };
 
         if obj.payer != payer {
             self.update_db_usage(obj.payer, -old_size)?;

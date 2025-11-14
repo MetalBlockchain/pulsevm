@@ -1,6 +1,5 @@
 use std::str::FromStr;
 
-use secp256k1::hashes::{Hash, sha256};
 use secp256k1::{Message, Secp256k1, rand};
 
 use crate::chain::secp256k1::Signature;
@@ -41,9 +40,9 @@ impl PrivateKey {
     }
 
     #[allow(dead_code)]
-    pub fn sign(&self, digest: &sha256::Hash) -> Signature {
+    pub fn sign(&self, digest: [u8; 32]) -> Signature {
         let secp = Secp256k1::signing_only();
-        let message = Message::from_digest(digest.to_byte_array());
+        let message = Message::from_digest(digest);
         let sig = secp.sign_ecdsa_recoverable(&message, &self.0);
 
         sig.into()

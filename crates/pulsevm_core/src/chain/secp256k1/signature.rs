@@ -4,7 +4,6 @@ use std::str::FromStr;
 use pulsevm_serialization::{NumBytes, Read, Write};
 use ripemd::{Digest, Ripemd160};
 use secp256k1::ecdsa::{RecoverableSignature, RecoveryId};
-use secp256k1::hashes::{Hash, sha256};
 use serde::{Deserialize, Serialize};
 
 use crate::chain::secp256k1::SignatureType;
@@ -38,8 +37,8 @@ impl Signature {
         }
     }
 
-    pub fn recover_public_key(&self, digest: &sha256::Hash) -> Result<PublicKey, SignatureError> {
-        let msg = secp256k1::Message::from_digest(digest.to_byte_array());
+    pub fn recover_public_key(&self, digest: [u8; 32]) -> Result<PublicKey, SignatureError> {
+        let msg = secp256k1::Message::from_digest(digest);
         let pub_key = self
             .recoverable
             .recover(&msg)
@@ -246,7 +245,7 @@ mod tests {
 
     use pulsevm_crypto::Bytes;
     use pulsevm_serialization::{Read, Write};
-    use secp256k1::hashes::{Hash, sha256};
+    use sha2::Digest;
 
     use crate::chain::{
         id::Id,
@@ -257,11 +256,11 @@ mod tests {
     #[test]
     fn test_signature_recovery() {
         let private_key = PrivateKey::random();
-        let digest = sha256::Hash::hash(b"test");
-        let signature = private_key.sign(&digest);
-        let digest = sha256::Hash::hash(b"test");
+        let digest = sha2::Sha256::digest(b"test");
+        let signature = private_key.sign(digest.into());
+        let digest = sha2::Sha256::digest(b"test");
         let public_key = signature
-            .recover_public_key(&digest)
+            .recover_public_key(digest.into())
             .expect("Failed to recover public key");
         assert_eq!(public_key, private_key.public_key());
         let serialized = signature.pack().expect("Failed to serialize signature");
@@ -273,8 +272,8 @@ mod tests {
     #[test]
     fn test_signature_display_and_parse() {
         let private_key = PrivateKey::random();
-        let digest = sha256::Hash::hash(b"test");
-        let signature = private_key.sign(&digest);
+        let digest = sha2::Sha256::digest(b"test");
+        let signature = private_key.sign(digest.into());
         let display_str = signature.to_string();
         assert!(display_str.starts_with("SIG_K1_"));
         assert!(display_str.len() > 10); // Ensure it's not just the prefix

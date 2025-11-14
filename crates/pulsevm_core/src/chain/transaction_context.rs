@@ -43,7 +43,7 @@ pub struct TransactionContext {
     session: UndoSession,
     wasm_runtime: Arc<RwLock<WasmRuntime>>,
     pending_block_timestamp: BlockTimestamp,
-    config: ChainConfig,
+    config: Arc<ChainConfig>,
 
     trace: Rc<RefCell<TransactionTrace>>,
     billed_cpu_time_us: Rc<AtomicI64>,
@@ -56,7 +56,7 @@ pub struct TransactionContext {
 impl TransactionContext {
     pub fn new(
         session: UndoSession,
-        config: ChainConfig,
+        config: Arc<ChainConfig>,
         wasm_runtime: Arc<RwLock<WasmRuntime>>,
         block_num: u32,
         pending_block_timestamp: BlockTimestamp,
@@ -118,7 +118,7 @@ impl TransactionContext {
             ),
         )?;
 
-        let mut discounted_size_for_pruned_data = packed_trx_prunable_size.clone();
+        let mut discounted_size_for_pruned_data = packed_trx_prunable_size;
         if self.config.context_free_discount_net_usage_den > 0
             && self.config.context_free_discount_net_usage_num
                 < self.config.context_free_discount_net_usage_den
@@ -147,7 +147,7 @@ impl TransactionContext {
         }
 
         for action in transaction.actions.iter() {
-            self.schedule_action(action, &action.account(), false, 0, 0);
+            self.schedule_action(action.clone(), &action.account(), false, 0, 0);
         }
 
         let num_original_actions_to_execute = { self.trace.borrow().action_traces.len() };
@@ -160,7 +160,7 @@ impl TransactionContext {
 
     pub fn schedule_action(
         &mut self,
-        act: &Action,
+        act: Action,
         receiver: &Name,
         context_free: bool,
         creator_action_ordinal: u32,
@@ -177,7 +177,7 @@ impl TransactionContext {
             trx_id,
             block_num,
             block_time,
-            act.clone(),
+            act,
             *receiver,
             context_free,
             new_action_ordinal,
@@ -214,7 +214,7 @@ impl TransactionContext {
             block_num,
             block_time,
             provided.action().clone(),
-            *receiver,         // if Name: Copy; otherwise clone here
+            *receiver, // if Name: Copy; otherwise clone here
             context_free,
             new_action_ordinal,
             creator_action_ordinal,

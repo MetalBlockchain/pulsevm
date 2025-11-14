@@ -1,5 +1,5 @@
 use core::fmt;
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 

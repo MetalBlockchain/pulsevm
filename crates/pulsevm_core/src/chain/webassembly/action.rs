@@ -27,7 +27,7 @@ pub fn read_action_data()
         let action_data = context.get_action().data();
         let total_len = action_data.len() as u32;
         let copy_size = buffer_size.min(total_len);
-        
+
         if copy_size == 0 {
             return Ok(total_len as i32);
         }

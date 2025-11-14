@@ -29,7 +29,7 @@ pub fn db_store_i64()
             table.into(),
             payer.into(),
             id.into(),
-            &src_bytes,
+            src_bytes,
         )?;
         Ok(result)
     }

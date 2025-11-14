@@ -3,6 +3,7 @@ use std::collections::VecDeque;
 use crate::Digest;
 
 /// Canonicalize left by clearing bit 0x80 on first byte
+#[inline]
 pub fn make_canonical_left(val: &Digest) -> Digest {
     let mut result = *val;
     result.0[0] &= 0x7F;
@@ -10,21 +11,15 @@ pub fn make_canonical_left(val: &Digest) -> Digest {
 }
 
 /// Canonicalize right by setting bit 0x80 on first byte
+#[inline]
 pub fn make_canonical_right(val: &Digest) -> Digest {
     let mut result = *val;
     result.0[0] |= 0x80;
     result
 }
 
-pub fn is_canonical_left(val: &Digest) -> bool {
-    (val.0[0] & 0x80) == 0
-}
-
-pub fn is_canonical_right(val: &Digest) -> bool {
-    (val.0[0] & 0x80) != 0
-}
-
 /// Pair two digests with canonicalization and hash the result
+#[inline]
 pub fn make_canonical_pair(a: Digest, b: Digest) -> Digest {
     let left = make_canonical_left(&a);
     let right = make_canonical_right(&b);
@@ -37,6 +32,7 @@ pub fn make_canonical_pair(a: Digest, b: Digest) -> Digest {
 }
 
 /// Compute Merkle root from a list of digests
+#[inline]
 pub fn merkle(mut ids: VecDeque<Digest>) -> Digest {
     if ids.is_empty() {
         return Digest([0u8; 32]);

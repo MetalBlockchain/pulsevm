@@ -24,7 +24,7 @@ use crate::{
             UNLINKAUTH_NAME, UPDATEAUTH_NAME, eos_percent,
         },
         error::ChainError,
-        genesis::Genesis,
+        genesis::{ChainConfig, Genesis},
         id::Id,
         mempool::Mempool,
         name::Name,
@@ -72,7 +72,7 @@ pub static APPLY_HANDLERS: LazyLock<ApplyHandlerMap> = LazyLock::new(|| {
 
 pub struct Controller {
     wasm_runtime: Arc<RwLock<WasmRuntime>>,
-    genesis: Genesis,
+    config: Arc<ChainConfig>,
 
     last_accepted_block: SignedBlock,
     preferred_id: Id,
@@ -106,7 +106,7 @@ impl Controller {
         let wasm_runtime = WasmRuntime::new().unwrap();
         let controller = Controller {
             wasm_runtime: Arc::new(RwLock::new(wasm_runtime)), // TODO: Handle error properly
-            genesis: Genesis::default(),
+            config: Arc::new(ChainConfig::default()),
 
             last_accepted_block: SignedBlock::default(),
             preferred_id: Id::default(),
@@ -132,10 +132,11 @@ impl Controller {
             ChainError::InternalError(Some(format!("failed to open database: {}", e)))
         })?;
         // Parse genesis bytes
-        self.genesis = Genesis::parse(genesis_bytes)
+        let genesis = Genesis::parse(genesis_bytes)
             .map_err(|e| ChainError::ParseError(format!("failed to parse genesis: {}", e)))?
             .validate()?;
-        self.chain_id = self.genesis.compute_chain_id()?;
+        self.config = Arc::new(genesis.initial_configuration().clone());
+        self.chain_id = genesis.compute_chain_id()?;
         self.trace_log = Some(StateHistoryLog::open(&db_path, "trace_log").map_err(|e| {
             ChainError::InternalError(Some(format!("failed to open trace log: {}", e)))
         })?);
@@ -146,7 +147,7 @@ impl Controller {
         // Set our last accepted block to the genesis block
         self.last_accepted_block = SignedBlock::new(
             Id::default(),
-            self.genesis.initial_timestamp().clone(),
+            genesis.initial_timestamp().clone(),
             VecDeque::new(),
             Digest::default(),
         );
@@ -182,7 +183,7 @@ impl Controller {
             session.insert(&self.last_accepted_block).map_err(|e| {
                 ChainError::GenesisError(format!("failed to insert genesis block: {}", e))
             })?;
-            let default_key = self.genesis.initial_key();
+            let default_key = genesis.initial_key();
             info!(
                 "initializing pulse account with default key: {}",
                 default_key
@@ -237,7 +238,7 @@ impl Controller {
                 })?;
             session.insert(&GlobalPropertyObject {
                 chain_id: self.chain_id.clone(),
-                configuration: self.genesis.initial_configuration().clone(),
+                configuration: genesis.initial_configuration().clone(),
             })?;
             ResourceLimitsManager::initialize_database(&mut session)?;
             ResourceLimitsManager::initialize_account(&mut session, PULSE_NAME).map_err(|e| {
@@ -393,7 +394,7 @@ impl Controller {
             .map_err(|e| ChainError::TransactionError(format!("failed to insert block: {}", e)))?;
 
         // Update resource limits
-        let chain_config = self.genesis.initial_configuration();
+        let chain_config = &self.config;
         let cpu_target = eos_percent(
             chain_config.max_block_cpu_usage as u64,
             chain_config.target_block_cpu_usage_pct,
@@ -465,7 +466,7 @@ impl Controller {
 
         let mut trx_context = TransactionContext::new(
             undo_session.clone(),
-            self.genesis.initial_configuration().clone(),
+            self.config.clone(),
             self.wasm_runtime.clone(),
             self.last_accepted_block().block_num() + 1,
             pending_block_timestamp.clone(),

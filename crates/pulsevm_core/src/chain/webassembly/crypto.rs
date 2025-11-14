@@ -1,9 +1,10 @@
-use secp256k1::hashes::{Hash, sha1, sha256, sha512};
+use secp256k1::hashes::{Hash, sha1};
+use sha2::Digest;
 use wasmtime::Caller;
 
 use crate::chain::wasm_runtime::WasmContext;
 
-pub fn sha1() -> impl Fn(Caller<'_, WasmContext>, u32, u32, u32) -> Result<u32, wasmtime::Error> {
+pub fn sha224() -> impl Fn(Caller<'_, WasmContext>, u32, u32, u32) -> Result<u32, wasmtime::Error> {
     |mut caller, msg_ptr, msg_size, out_ptr| {
         // Now caller can be mutably borrowed safely
         let memory = caller
@@ -14,10 +15,10 @@ pub fn sha1() -> impl Fn(Caller<'_, WasmContext>, u32, u32, u32) -> Result<u32, 
         let mut src_bytes = vec![0u8; msg_size as usize];
         memory.read(&caller, msg_ptr as usize, &mut src_bytes)?;
 
-        let hasher = sha1::Hash::hash(&src_bytes);
-        memory.write(&mut caller, out_ptr as usize, &hasher.to_byte_array())?;
+        let hasher = sha2::Sha224::digest(&src_bytes);
+        memory.write(&mut caller, out_ptr as usize, hasher.as_ref())?;
 
-        Ok(sha1::Hash::LEN as u32)
+        Ok(28 as u32)
     }
 }
 
@@ -32,10 +33,10 @@ pub fn sha256() -> impl Fn(Caller<'_, WasmContext>, u32, u32, u32) -> Result<u32
         let mut src_bytes = vec![0u8; msg_size as usize];
         memory.read(&caller, msg_ptr as usize, &mut src_bytes)?;
 
-        let hasher = sha256::Hash::hash(&src_bytes);
-        memory.write(&mut caller, out_ptr as usize, &hasher.to_byte_array())?;
+        let hasher = sha2::Sha256::digest(&src_bytes);
+        memory.write(&mut caller, out_ptr as usize, hasher.as_ref())?;
 
-        Ok(sha256::Hash::LEN as u32)
+        Ok(32 as u32)
     }
 }
 
@@ -50,9 +51,9 @@ pub fn sha512() -> impl Fn(Caller<'_, WasmContext>, u32, u32, u32) -> Result<u32
         let mut src_bytes = vec![0u8; msg_size as usize];
         memory.read(&caller, msg_ptr as usize, &mut src_bytes)?;
 
-        let hasher = sha512::Hash::hash(&src_bytes);
-        memory.write(&mut caller, out_ptr as usize, &hasher.to_byte_array())?;
+        let hasher = sha2::Sha512::digest(&src_bytes);
+        memory.write(&mut caller, out_ptr as usize, hasher.as_ref())?;
 
-        Ok(sha512::Hash::LEN as u32)
+        Ok(64 as u32)
     }
 }

@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
-    hash::Hash, sync::Arc,
+    hash::Hash,
+    sync::Arc,
 };
 
 use crate::{NumBytes, Read, ReadError, VarUint32, Write, WriteError};

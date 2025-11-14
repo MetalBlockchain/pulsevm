@@ -31,7 +31,3 @@ pulsevm_name = { path = "../pulsevm_name" }
 pulsevm_proc_macros = { path = "../pulsevm_proc_macros" }
 pulsevm_serialization = { path = "../pulsevm_serialization" }
 pulsevm_time = { path = "../pulsevm_time" }
-
-[profile.profiling]
-inherits = "release"
-debug = true

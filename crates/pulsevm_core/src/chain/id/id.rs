@@ -1,27 +1,23 @@
 use core::fmt;
 use std::{error::Error, str::FromStr};
 
-use hex::FromHexError;
 use pulsevm_serialization::{NumBytes, Read, Write};
-use secp256k1::hashes::sha256::{self, Hash};
 use serde::Serialize;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub struct Id(pub [u8; 32]);
 
 impl Id {
+    pub fn new(bytes: [u8; 32]) -> Self {
+        Id(bytes)
+    }
+
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
 
     pub fn zero() -> Self {
         Id([0u8; 32])
-    }
-
-    pub fn from_sha256(hash: &sha256::Hash) -> Self {
-        let mut id = [0u8; 32];
-        id.copy_from_slice(hash.as_ref());
-        Id(id)
     }
 }
 
@@ -130,14 +126,6 @@ impl TryFrom<Vec<u8>> for Id {
 impl Into<Vec<u8>> for Id {
     fn into(self) -> Vec<u8> {
         self.0.to_vec()
-    }
-}
-
-impl From<Hash> for Id {
-    fn from(hash: Hash) -> Self {
-        let mut id = [0u8; 32];
-        id.copy_from_slice(hash.as_ref());
-        Id(id)
     }
 }
 

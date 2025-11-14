@@ -1,30 +1,34 @@
 use pulsevm_serialization::{NumBytes, Read, Write};
-use secp256k1::hashes::{Hash, sha256};
 use serde::Serialize;
+use sha2::Digest as ShaDigest;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct Digest(pub [u8; 32]);
 
 impl Digest {
+    #[inline]
     pub fn hash(data: impl AsRef<[u8]>) -> Self {
-        let hash = sha256::Hash::hash(data.as_ref());
+        let hash = sha2::Sha256::digest(data.as_ref());
         let mut out = [0u8; 32];
         out.copy_from_slice(hash.as_ref());
         Digest(out)
     }
 
+    #[inline]
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
 }
 
 impl NumBytes for Digest {
+    #[inline]
     fn num_bytes(&self) -> usize {
         32
     }
 }
 
 impl Write for Digest {
+    #[inline]
     fn write(
         &self,
         bytes: &mut [u8],
@@ -40,6 +44,7 @@ impl Write for Digest {
 }
 
 impl Read for Digest {
+    #[inline]
     fn read(data: &[u8], pos: &mut usize) -> Result<Self, pulsevm_serialization::ReadError> {
         if *pos + 32 > data.len() {
             return Err(pulsevm_serialization::ReadError::NotEnoughBytes);
@@ -52,6 +57,7 @@ impl Read for Digest {
 }
 
 impl Serialize for Digest {
+    #[inline]
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
