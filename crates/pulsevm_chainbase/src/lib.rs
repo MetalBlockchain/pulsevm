@@ -91,6 +91,7 @@ pub struct Database {
 
 impl Database {
     #[must_use]
+    #[inline]
     pub fn new(path: &Path) -> Result<Self, fjall::Error> {
         Ok(Self {
             keyspace: Config::new(path).open_transactional()?,
@@ -98,20 +99,24 @@ impl Database {
         })
     }
 
+    #[inline]
     pub fn temporary(path: &Path) -> Result<Self, fjall::Error> {
         let config = Config::new(path).temporary(true);
         let keyspace = config.open_transactional()?;
         Ok(Self { keyspace, partition_create_options: PartitionCreateOptions::default() })
     }
 
+    #[inline]
     pub fn session(&self) -> Result<Session, ChainbaseError> {
         Session::new(&self.keyspace)
     }
 
+    #[inline]
     pub fn undo_session(&self) -> Result<UndoSession, ChainbaseError> {
         UndoSession::new(&self.keyspace, self.partition_create_options.clone())
     }
 
+    #[inline]
     pub fn open_partition_handle(
         &self,
         table_name: &str,
@@ -120,6 +125,7 @@ impl Database {
     }
 }
 
+#[inline]
 fn open_partition(
     keyspace: &TransactionalKeyspace,
     table_name: &str,

@@ -23,6 +23,7 @@ pub struct UndoSession {
 }
 
 impl UndoSession {
+    #[inline]
     pub fn new(keyspace: &TransactionalKeyspace, partition_create_options: PartitionCreateOptions) -> Result<Self, ChainbaseError> {
         Ok(Self {
             changes: Arc::new(RwLock::new(VecDeque::new())),
@@ -34,15 +35,18 @@ impl UndoSession {
         })
     }
 
+    #[inline]
     pub fn tx(&self) -> Arc<RwLock<WriteTransaction>> {
         self.tx.clone()
     }
 
+    #[inline]
     pub fn keyspace(&self) -> TransactionalKeyspace {
         self.keyspace.clone()
     }
 
     #[must_use]
+    #[inline]
     pub fn exists<T: ChainbaseObject>(
         &mut self,
         key: T::PrimaryKey,
@@ -61,6 +65,7 @@ impl UndoSession {
     }
 
     #[must_use]
+    #[inline]
     pub fn find<T: ChainbaseObject>(
         &mut self,
         key: T::PrimaryKey,
@@ -82,6 +87,7 @@ impl UndoSession {
     }
 
     #[must_use]
+    #[inline]
     pub fn get<T: ChainbaseObject>(&mut self, key: T::PrimaryKey) -> Result<T, ChainbaseError> {
         let found = self.find::<T>(key)?;
         if found.is_none() {
@@ -92,6 +98,7 @@ impl UndoSession {
     }
 
     #[must_use]
+    #[inline]
     pub fn get_by_secondary<T: ChainbaseObject, S: SecondaryIndex<T>>(
         &mut self,
         key: S::Key,
@@ -121,6 +128,7 @@ impl UndoSession {
     }
 
     #[must_use]
+    #[inline]
     pub fn find_by_secondary<T: ChainbaseObject, S: SecondaryIndex<T>>(
         &mut self,
         key: S::Key,
@@ -147,6 +155,7 @@ impl UndoSession {
         Ok(None)
     }
 
+    #[inline]
     pub fn generate_id<T: ChainbaseObject>(&mut self) -> Result<u64, ChainbaseError> {
         let partition = open_partition(&self.keyspace, T::table_name(), self.partition_create_options.clone())?;
         let mut new_id = 1u64;
@@ -176,6 +185,7 @@ impl UndoSession {
         Ok(new_id)
     }
 
+    #[inline]
     pub fn insert<T: ChainbaseObject>(&mut self, object: &T) -> Result<(), ChainbaseError> {
         let mut tx = self
             .tx
@@ -209,6 +219,7 @@ impl UndoSession {
         Ok(())
     }
 
+    #[inline]
     pub fn modify<T, F>(&mut self, old: &mut T, f: F) -> Result<(), ChainbaseError>
     where
         T: ChainbaseObject,
@@ -257,6 +268,7 @@ impl UndoSession {
         Ok(())
     }
 
+    #[inline]
     pub fn remove<T: ChainbaseObject>(&mut self, object: T) -> Result<(), ChainbaseError> {
         let key = object.primary_key();
         let partition = open_partition(&self.keyspace, T::table_name(), self.partition_create_options.clone())?;
@@ -286,6 +298,7 @@ impl UndoSession {
         Ok(())
     }
 
+    #[inline]
     pub fn commit(self) -> Result<(), ChainbaseError> {
         let tx = Arc::try_unwrap(self.tx)
             .map_err(|_| "failed to unwrap Rc: multiple owners".to_string())
@@ -303,6 +316,7 @@ impl UndoSession {
         Ok(())
     }
 
+    #[inline]
     pub fn rollback(self) -> Result<(), ChainbaseError> {
         let tx = Arc::try_unwrap(self.tx)
             .map_err(|_| "failed to unwrap Rc: multiple owners".to_string())
@@ -315,6 +329,7 @@ impl UndoSession {
         Ok(())
     }
 
+    #[inline]
     pub fn get_index<C, S>(&self) -> Index<C, S>
     where
         C: ChainbaseObject,

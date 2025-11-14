@@ -1,6 +1,6 @@
 use std::ops::Bound;
 
-use fjall::{TransactionalKeyspace, TransactionalPartitionHandle};
+use fjall::{Slice, TransactionalKeyspace, TransactionalPartitionHandle};
 use pulsevm_serialization::Write;
 
 use crate::{ChainbaseError, ChainbaseObject, SecondaryIndex, Session};
@@ -21,6 +21,7 @@ where
     C: ChainbaseObject,
     S: SecondaryIndex<C>,
 {
+    #[inline]
     pub fn new(session: Session, keyspace: TransactionalKeyspace) -> Self {
         ReadOnlyIndex::<C, S> {
             session,
@@ -29,6 +30,7 @@ where
         }
     }
 
+    #[inline]
     pub fn iterator_to(
         &mut self,
         object: &S::Object,
@@ -46,6 +48,7 @@ where
         })
     }
 
+    #[inline]
     pub fn range(
         &mut self,
         lower_bound: impl Write,
@@ -66,15 +69,16 @@ where
                 .open_partition(S::index_name(), Default::default())
                 .map_err(|_| ChainbaseError::InternalError(format!("failed to open partition")))?,
             range: (
-                Bound::Included(lower_bound_bytes.clone()),
-                Bound::Excluded(upper_bound_bytes.clone()),
+                Bound::Included(lower_bound_bytes.clone().into()),
+                Bound::Excluded(upper_bound_bytes.into()),
             ),
-            current_key: lower_bound_bytes,
-            current_value: Vec::new(),
+            current_key: lower_bound_bytes.into(),
+            current_value: Slice::new(&[]),
             __phantom: std::marker::PhantomData,
         })
     }
 
+    #[inline]
     pub fn lower_bound(
         &mut self,
         key: impl Write,
@@ -90,13 +94,14 @@ where
                 .clone()
                 .open_partition(S::index_name(), Default::default())
                 .map_err(|_| ChainbaseError::InternalError(format!("failed to open partition")))?,
-            range: (Bound::Included(key_bytes.clone()), Bound::Unbounded),
-            current_key: key_bytes,
-            current_value: Vec::new(),
+            range: (Bound::Included(key_bytes.clone().into()), Bound::Unbounded),
+            current_key: key_bytes.into(),
+            current_value: Slice::new(&[]),
             __phantom: std::marker::PhantomData,
         })
     }
 
+    #[inline]
     pub fn upper_bound(
         &mut self,
         key: impl Write,
@@ -112,9 +117,9 @@ where
                 .clone()
                 .open_partition(S::index_name(), Default::default())
                 .map_err(|_| ChainbaseError::InternalError(format!("failed to open partition")))?,
-            range: (Bound::Excluded(key_bytes.clone()), Bound::Unbounded),
-            current_key: key_bytes,
-            current_value: Vec::new(),
+            range: (Bound::Excluded(key_bytes.clone().into()), Bound::Unbounded),
+            current_key: key_bytes.into(),
+            current_value: Slice::new(&[]),
             __phantom: std::marker::PhantomData,
         })
     }
@@ -127,9 +132,9 @@ where
 {
     session: Session,
     partition: TransactionalPartitionHandle,
-    range: (Bound<Vec<u8>>, Bound<Vec<u8>>),
-    current_key: Vec<u8>,
-    current_value: Vec<u8>,
+    range: (Bound<Slice>, Bound<Slice>),
+    current_key: Slice,
+    current_value: Slice,
     __phantom: std::marker::PhantomData<(C, S)>,
 }
 
@@ -138,21 +143,23 @@ where
     C: ChainbaseObject,
     S: SecondaryIndex<C>,
 {
+    #[inline]
     pub fn new(
         session: Session,
         partition: TransactionalPartitionHandle,
-        range: (Bound<Vec<u8>>, Bound<Vec<u8>>),
+        range: (Bound<Slice>, Bound<Slice>),
     ) -> Self {
         ReadOnlyRangeIterator::<C, S> {
             session,
             partition,
             range,
-            current_key: Vec::new(),
-            current_value: Vec::new(),
+            current_key: Slice::new(&[]),
+            current_value: Slice::new(&[]),
             __phantom: std::marker::PhantomData,
         }
     }
 
+    #[inline]
     pub fn previous(&mut self) -> Result<Option<S::Object>, ChainbaseError> {
         let prev = {
             let tx = self.session.tx();
@@ -174,8 +181,8 @@ where
                     ))
                 })
                 .map_err(|e| ChainbaseError::InternalError(e.to_string()))?;
-            self.current_key = key.to_vec();
-            self.current_value = value.to_vec();
+            self.current_key = key;
+            self.current_value = value;
             self.range = (
                 Bound::Excluded(self.current_key.clone()),
                 self.range.1.clone(),
@@ -192,6 +199,7 @@ where
         Ok(None)
     }
 
+    #[inline]
     pub fn next(&mut self) -> Result<Option<S::Object>, ChainbaseError> {
         let next = {
             let tx = self.session.tx();
@@ -213,8 +221,8 @@ where
                     ))
                 })
                 .map_err(|e| ChainbaseError::InternalError(e.to_string()))?;
-            self.current_key = key.to_vec();
-            self.current_value = value.to_vec();
+            self.current_key = key;
+            self.current_value = value;
             self.range = (
                 Bound::Excluded(self.current_key.clone()),
                 self.range.1.clone(),
@@ -231,11 +239,12 @@ where
         Ok(None)
     }
 
+    #[inline]
     pub fn get_object(&mut self) -> Result<S::Object, ChainbaseError> {
         return self
             .session
             .get::<S::Object>(S::Object::primary_key_from_bytes(
-                self.current_value.as_slice(),
+                self.current_value.as_ref(),
             )?);
     }
 }
@@ -257,6 +266,7 @@ where
     C: ChainbaseObject,
     S: SecondaryIndex<C>,
 {
+    #[inline]
     pub fn next(&mut self) -> Result<Option<S::Object>, ChainbaseError> {
         let next = {
             let tx = self.session.tx();
@@ -296,6 +306,7 @@ where
         Ok(None)
     }
 
+    #[inline]
     pub fn previous(&mut self) -> Result<Option<S::Object>, ChainbaseError> {
         let prev = {
             let tx = self.session.tx();
@@ -331,6 +342,7 @@ where
         Ok(None)
     }
 
+    #[inline]
     pub fn get_object(&mut self) -> Result<S::Object, ChainbaseError> {
         return self
             .session
@@ -345,6 +357,7 @@ where
     C: ChainbaseObject,
     S: SecondaryIndex<C>,
 {
+    #[inline]
     fn eq(&self, other: &Self) -> bool {
         self.current_key == other.current_key
     }

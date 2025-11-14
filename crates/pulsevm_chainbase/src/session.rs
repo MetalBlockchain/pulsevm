@@ -11,6 +11,7 @@ pub struct Session {
 }
 
 impl Session {
+    #[inline]
     pub fn new(keyspace: &TransactionalKeyspace) -> Result<Self, ChainbaseError> {
         Ok(Self {
             tx: Arc::new(RwLock::new(keyspace.read_tx())),
@@ -18,15 +19,18 @@ impl Session {
         })
     }
 
+    #[inline]
     pub fn tx(&self) -> Arc<RwLock<ReadTransaction>> {
         self.tx.clone()
     }
 
+    #[inline]
     pub fn keyspace(&self) -> TransactionalKeyspace {
         self.keyspace.clone()
     }
 
     #[must_use]
+    #[inline]
     pub fn exists<T: ChainbaseObject>(&self, key: T::PrimaryKey) -> Result<bool, ChainbaseError> {
         let partition = self
             .keyspace
@@ -43,6 +47,7 @@ impl Session {
     }
 
     #[must_use]
+    #[inline]
     pub fn find<T: ChainbaseObject>(
         &self,
         key: T::PrimaryKey,
@@ -67,6 +72,7 @@ impl Session {
     }
 
     #[must_use]
+    #[inline]
     pub fn get<T: ChainbaseObject>(&self, key: T::PrimaryKey) -> Result<T, ChainbaseError> {
         let found = self.find::<T>(key)?;
         if found.is_none() {
@@ -77,6 +83,7 @@ impl Session {
     }
 
     #[must_use]
+    #[inline]
     pub fn find_by_secondary<T: ChainbaseObject, S: SecondaryIndex<T>>(
         &self,
         key: S::Key,
@@ -111,6 +118,7 @@ impl Session {
     }
 
     #[must_use]
+    #[inline]
     pub fn get_by_secondary<T: ChainbaseObject, S: SecondaryIndex<T>>(
         &self,
         key: S::Key,
@@ -123,6 +131,7 @@ impl Session {
         Ok(object)
     }
 
+    #[inline]
     pub fn get_index<C, S>(&self) -> ReadOnlyIndex<C, S>
     where
         C: ChainbaseObject,

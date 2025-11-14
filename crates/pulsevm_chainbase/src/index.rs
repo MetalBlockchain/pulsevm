@@ -1,6 +1,6 @@
 use std::ops::Bound;
 
-use fjall::{TransactionalKeyspace, TransactionalPartitionHandle};
+use fjall::{Slice, TransactionalKeyspace, TransactionalPartitionHandle};
 use pulsevm_serialization::Write;
 
 use crate::{ChainbaseError, ChainbaseObject, SecondaryIndex, UndoSession};
@@ -40,8 +40,8 @@ where
                 .clone()
                 .open_partition(S::index_name(), Default::default())
                 .map_err(|_| ChainbaseError::InternalError(format!("failed to open partition")))?,
-            current_key: S::secondary_key(object),
-            current_value: object.primary_key(),
+            current_key: S::secondary_key(object).into(),
+            current_value: object.primary_key().into(),
             __phantom: std::marker::PhantomData,
         })
     }
@@ -50,6 +50,7 @@ where
         let key_bytes = key.pack().map_err(|e| {
             ChainbaseError::InternalError(format!("failed to serialize key: {}", e))
         })?;
+        let current_key = Slice::new(&key_bytes);
 
         Ok(RangeIterator::<C, S> {
             undo_session: self.undo_session.clone(),
@@ -57,9 +58,9 @@ where
                 .keyspace
                 .open_partition(S::index_name(), Default::default())
                 .map_err(|_| ChainbaseError::InternalError(format!("failed to open partition")))?,
-            range: (Bound::Included(key_bytes.clone()), Bound::Unbounded),
-            current_key: key_bytes,
-            current_value: Vec::new(),
+            range: (Bound::Included(current_key.clone()), Bound::Unbounded),
+            current_key: current_key,
+            current_value: Slice::new(&[]),
             __phantom: std::marker::PhantomData,
         })
     }
@@ -68,6 +69,7 @@ where
         let key_bytes = key.pack().map_err(|e| {
             ChainbaseError::InternalError(format!("failed to serialize key: {}", e))
         })?;
+        let current_key = Slice::new(&key_bytes);
 
         Ok(RangeIterator::<C, S> {
             undo_session: self.undo_session.clone(),
@@ -76,9 +78,9 @@ where
                 .clone()
                 .open_partition(S::index_name(), Default::default())
                 .map_err(|_| ChainbaseError::InternalError(format!("failed to open partition")))?,
-            range: (Bound::Excluded(key_bytes.clone()), Bound::Unbounded),
-            current_key: key_bytes,
-            current_value: Vec::new(),
+            range: (Bound::Excluded(current_key.clone()), Bound::Unbounded),
+            current_key: current_key,
+            current_value: Slice::new(&[]),
             __phantom: std::marker::PhantomData,
         })
     }
@@ -91,9 +93,9 @@ where
 {
     undo_session: UndoSession,
     partition: TransactionalPartitionHandle,
-    range: (Bound<Vec<u8>>, Bound<Vec<u8>>),
-    current_key: Vec<u8>,
-    current_value: Vec<u8>,
+    range: (Bound<Slice>, Bound<Slice>),
+    current_key: Slice,
+    current_value: Slice,
     __phantom: std::marker::PhantomData<(C, S)>,
 }
 
@@ -102,21 +104,23 @@ where
     C: ChainbaseObject,
     S: SecondaryIndex<C>,
 {
+    #[inline]
     pub fn new(
         undo_session: UndoSession,
         partition: TransactionalPartitionHandle,
-        range: (Bound<Vec<u8>>, Bound<Vec<u8>>),
+        range: (Bound<Slice>, Bound<Slice>),
     ) -> Self {
         RangeIterator::<C, S> {
             undo_session,
             partition,
             range,
-            current_key: Vec::new(),
-            current_value: Vec::new(),
+            current_key: Slice::new(&[]),
+            current_value: Slice::new(&[]),
             __phantom: std::marker::PhantomData,
         }
     }
 
+    #[inline]
     pub fn previous(&mut self) -> Result<Option<S::Object>, ChainbaseError> {
         let prev = {
             let tx = self.undo_session.tx();
@@ -138,8 +142,8 @@ where
                     ))
                 })
                 .map_err(|e| ChainbaseError::InternalError(e.to_string()))?;
-            self.current_key = key.to_vec();
-            self.current_value = value.to_vec();
+            self.current_key = key;
+            self.current_value = value;
             self.range = (
                 Bound::Excluded(self.current_key.clone()),
                 self.range.1.clone(),
@@ -156,6 +160,7 @@ where
         Ok(None)
     }
 
+    #[inline]
     pub fn next(&mut self) -> Result<Option<S::Object>, ChainbaseError> {
         let next = {
             let tx = self.undo_session.tx();
@@ -177,8 +182,8 @@ where
                     ))
                 })
                 .map_err(|e| ChainbaseError::InternalError(e.to_string()))?;
-            self.current_key = key.to_vec();
-            self.current_value = value.to_vec();
+            self.current_key = key;
+            self.current_value = value;
             self.range = (
                 Bound::Excluded(self.current_key.clone()),
                 self.range.1.clone(),
@@ -195,11 +200,12 @@ where
         Ok(None)
     }
 
+    #[inline]
     pub fn get_object(&mut self) -> Result<S::Object, ChainbaseError> {
         return self
             .undo_session
             .get::<S::Object>(S::Object::primary_key_from_bytes(
-                self.current_value.as_slice(),
+                self.current_value.as_ref(),
             )?);
     }
 }
@@ -211,8 +217,8 @@ where
 {
     undo_session: UndoSession,
     partition: TransactionalPartitionHandle,
-    current_key: Vec<u8>,
-    current_value: Vec<u8>,
+    current_key: Slice,
+    current_value: Slice,
     __phantom: std::marker::PhantomData<(C, S)>,
 }
 
@@ -221,6 +227,7 @@ where
     C: ChainbaseObject,
     S: SecondaryIndex<C>,
 {
+    #[inline]
     pub fn next(&mut self) -> Result<Option<S::Object>, ChainbaseError> {
         let next = {
             let tx = self.undo_session.tx();
@@ -246,8 +253,8 @@ where
                     ))
                 })
                 .map_err(|e| ChainbaseError::InternalError(e.to_string()))?;
-            self.current_key = key.to_vec();
-            self.current_value = value.to_vec();
+            self.current_key = key;
+            self.current_value = value;
             if let Ok(object) = self.get_object() {
                 return Ok(Some(object));
             } else {
@@ -260,6 +267,7 @@ where
         Ok(None)
     }
 
+    #[inline]
     pub fn previous(&mut self) -> Result<Option<S::Object>, ChainbaseError> {
         let prev = {
             let tx = self.undo_session.tx();
@@ -281,8 +289,8 @@ where
                     ))
                 })
                 .map_err(|e| ChainbaseError::InternalError(e.to_string()))?;
-            self.current_key = key.to_vec();
-            self.current_value = value.to_vec();
+            self.current_key = key;
+            self.current_value = value;
             if let Ok(object) = self.get_object() {
                 return Ok(Some(object));
             } else {
@@ -295,11 +303,12 @@ where
         Ok(None)
     }
 
+    #[inline]
     pub fn get_object(&mut self) -> Result<S::Object, ChainbaseError> {
         return self
             .undo_session
             .get::<S::Object>(S::Object::primary_key_from_bytes(
-                self.current_value.as_slice(),
+                self.current_value.as_ref(),
             )?);
     }
 }
