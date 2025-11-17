@@ -296,7 +296,7 @@ impl RpcServer for RpcService {
                     break;
                 }
 
-                let balance = Asset::read(&kv.value, &mut 0).map_err(|e| {
+                let balance = Asset::read(kv.value.as_slice(), &mut 0).map_err(|e| {
                     ErrorObjectOwned::owned(400, "balance_read_error", Some(format!("{}", e)))
                 })?;
 
@@ -355,7 +355,7 @@ impl RpcServer for RpcService {
                     ErrorObjectOwned::owned(500, "abi_error", Some(format!("{}", e)))
                 })?;
                 let stats = serializer
-                    .binary_to_variant(&table_type, &kv.value, &mut 0)
+                    .binary_to_variant(&table_type, kv.value.as_slice(), &mut 0)
                     .map_err(|e| {
                         ErrorObjectOwned::owned(
                             400,
@@ -673,7 +673,7 @@ fn get_table_rows_ex(
 
             let variant = if json {
                 serializer
-                    .binary_to_variant(&table_type, &kv.value, &mut 0)
+                    .binary_to_variant(&table_type, kv.value.as_slice(), &mut 0)
                     .map_err(|e| {
                         println!("Failed to convert binary to variant: {}", e);
                         ChainError::InvalidArgument(format!(

@@ -195,7 +195,7 @@ pub fn setcode(context: &mut ApplyContext) -> Result<(), ChainError> {
         } else {
             let new_code_entry = CodeObject {
                 code_hash: code_hash.clone(),
-                code: act.code.clone(),
+                code: act.code,
                 code_ref_count: 1,
                 first_block_used: 0, // TODO: set to current block number
                 vm_type: act.vm_type,
@@ -236,7 +236,7 @@ pub fn setabi(context: &mut ApplyContext) -> Result<(), ChainError> {
     let mut account = session
         .get::<Account>(act.account)
         .map_err(|_| ChainError::TransactionError(format!("failed to find account")))?;
-    let abi_def: AbiDefinition = serde_json::from_str(std::str::from_utf8(&act.abi).unwrap())
+    let abi_def: AbiDefinition = serde_json::from_str(std::str::from_utf8(act.abi.as_slice()).unwrap())
         .map_err(|e| ChainError::InvalidArgument(format!("failed to deserialize ABI: {}", e)))?;
     let abi_def_packed = abi_def
         .pack()

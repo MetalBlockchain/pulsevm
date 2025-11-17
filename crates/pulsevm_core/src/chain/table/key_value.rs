@@ -1,6 +1,7 @@
 use core::fmt;
 
 use pulsevm_chainbase::{ChainbaseObject, SecondaryIndex, SecondaryKey};
+use pulsevm_crypto::Bytes;
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 
 use crate::chain::{Name, config::BillableSize};
@@ -11,11 +12,11 @@ pub struct KeyValue {
     pub table_id: u64,
     pub primary_key: u64,
     pub payer: Name,
-    pub value: Vec<u8>,
+    pub value: Bytes,
 }
 
 impl KeyValue {
-    pub fn new(id: u64, table_id: u64, primary_key: u64, payer: Name, value: Vec<u8>) -> Self {
+    pub fn new(id: u64, table_id: u64, primary_key: u64, payer: Name, value: Bytes) -> Self {
         KeyValue {
             id,
             table_id,

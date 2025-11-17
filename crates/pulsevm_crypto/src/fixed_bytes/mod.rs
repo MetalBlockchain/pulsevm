@@ -4,7 +4,7 @@ use pulsevm_serialization::{NumBytes, Read, Write};
 use serde::Serialize;
 use sha2::Digest;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FixedBytes<const N: usize>(pub [u8; N]);
 
 impl FixedBytes<32> {
@@ -79,5 +79,12 @@ impl<const N: usize> Serialize for FixedBytes<N> {
         S: serde::Serializer,
     {
         serializer.serialize_str(self.to_string().as_str())
+    }
+}
+
+impl<const N: usize> AsRef<[u8]> for FixedBytes<N> {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        &self.0
     }
 }

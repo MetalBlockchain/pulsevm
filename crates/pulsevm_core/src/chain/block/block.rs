@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
 use pulsevm_chainbase::{ChainbaseObject, SecondaryIndex, SecondaryKey};
-use pulsevm_crypto::Digest;
+use pulsevm_crypto::{Digest, FixedBytes};
 use pulsevm_proc_macros::{NumBytes, Read, Write, name};
 use pulsevm_serialization::Write;
 use serde::{Serialize, ser::SerializeStruct};
@@ -39,13 +39,13 @@ impl BlockHeader {
     #[inline]
     pub fn num_from_id(id: &Id) -> u32 {
         // First 4 bytes contain the block number in big-endian.
-        u32::from_be_bytes(id.0[0..4].try_into().unwrap())
+        u32::from_be_bytes(id.0.0[0..4].try_into().unwrap())
     }
 
     #[inline]
     pub fn id_from_num(id: &Id) -> u32 {
         // First 4 bytes contain the block number in big-endian.
-        u32::from_be_bytes(id.0[0..4].try_into().unwrap())
+        u32::from_be_bytes(id.0.0[0..4].try_into().unwrap())
     }
 
     #[inline]
@@ -54,7 +54,7 @@ impl BlockHeader {
         let bn_be = self.block_num().to_be_bytes(); // endian_reverse_u32 on LE == write BE bytes
         // Overwrite the first 4 bytes with the big-endian block number
         result.0[0..4].copy_from_slice(&bn_be);
-        Ok(Id(result.0))
+        Ok(Id(FixedBytes(result.0)))
     }
 }
 

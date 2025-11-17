@@ -1,4 +1,3 @@
-use secp256k1::hashes::{Hash, sha1};
 use sha2::Digest;
 use wasmtime::Caller;
 

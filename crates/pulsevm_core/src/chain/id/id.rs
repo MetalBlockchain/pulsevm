@@ -1,23 +1,24 @@
 use core::fmt;
 use std::{error::Error, str::FromStr};
 
-use pulsevm_serialization::{NumBytes, Read, Write};
+use pulsevm_crypto::FixedBytes;
+use pulsevm_proc_macros::{NumBytes, Read, Write};
 use serde::Serialize;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
-pub struct Id(pub [u8; 32]);
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, Read, Write, NumBytes)]
+pub struct Id(pub FixedBytes<32>);
 
 impl Id {
     pub fn new(bytes: [u8; 32]) -> Self {
-        Id(bytes)
+        Id(FixedBytes(bytes))
     }
 
     pub fn as_bytes(&self) -> &[u8] {
-        &self.0
+        &self.0.0
     }
 
     pub fn zero() -> Self {
-        Id([0u8; 32])
+        Id(FixedBytes::default())
     }
 }
 
@@ -44,40 +45,7 @@ impl FromStr for Id {
 
         let mut array = [0u8; 32];
         array.copy_from_slice(&bytes);
-        Ok(Id(array))
-    }
-}
-
-impl NumBytes for Id {
-    fn num_bytes(&self) -> usize {
-        32
-    }
-}
-
-impl Write for Id {
-    fn write(
-        &self,
-        bytes: &mut [u8],
-        pos: &mut usize,
-    ) -> Result<(), pulsevm_serialization::WriteError> {
-        if *pos + 32 > bytes.len() {
-            return Err(pulsevm_serialization::WriteError::NotEnoughSpace);
-        }
-        bytes[*pos..*pos + 32].copy_from_slice(&self.0);
-        *pos += 32;
-        Ok(())
-    }
-}
-
-impl Read for Id {
-    fn read(data: &[u8], pos: &mut usize) -> Result<Self, pulsevm_serialization::ReadError> {
-        if *pos + 32 > data.len() {
-            return Err(pulsevm_serialization::ReadError::NotEnoughBytes);
-        }
-        let mut id = [0u8; 32];
-        id.copy_from_slice(&data[*pos..*pos + 32]);
-        *pos += 32;
-        Ok(Id(id))
+        Ok(Id(FixedBytes(array)))
     }
 }
 
@@ -106,7 +74,7 @@ impl TryFrom<&[u8]> for Id {
         }
         let mut id = [0u8; 32];
         id.copy_from_slice(value);
-        Ok(Id(id))
+        Ok(Id(FixedBytes(id)))
     }
 }
 
@@ -119,13 +87,13 @@ impl TryFrom<Vec<u8>> for Id {
         }
         let mut id = [0u8; 32];
         id.copy_from_slice(&value);
-        Ok(Id(id))
+        Ok(Id(FixedBytes(id)))
     }
 }
 
 impl Into<Vec<u8>> for Id {
     fn into(self) -> Vec<u8> {
-        self.0.to_vec()
+        self.0.0.to_vec()
     }
 }
 

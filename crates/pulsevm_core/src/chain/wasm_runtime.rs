@@ -89,7 +89,7 @@ impl WasmRuntime {
 
         // Non-deterministic interruption
         //config.epoch_interruption(true);
-        //config.consume_fuel(true);
+        config.consume_fuel(true);
 
         let engine = Engine::new(&config)
             .map_err(|e| ChainError::WasmRuntimeError(e.to_string()))

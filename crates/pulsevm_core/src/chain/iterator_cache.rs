@@ -140,6 +140,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use pulsevm_crypto::Bytes;
     use pulsevm_proc_macros::name;
 
     use crate::chain::table::KeyValue;
@@ -151,7 +152,7 @@ mod tests {
         let mut cache = IteratorCache::<KeyValue>::new();
         let iter_1 = cache.add(&KeyValue::default());
         let iter_2 = cache.add(&KeyValue::default());
-        let iter_3 = cache.add(&KeyValue::new(1, 2, 3, name!("glenn").into(), vec![]));
+        let iter_3 = cache.add(&KeyValue::new(1, 2, 3, name!("glenn").into(), Bytes::default()));
         assert_eq!(iter_1, 0);
         assert_eq!(iter_2, 0);
         assert_eq!(iter_3, 1);

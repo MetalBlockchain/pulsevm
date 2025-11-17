@@ -1,9 +1,10 @@
 use core::fmt;
 
 use pulsevm_proc_macros::{NumBytes, Read, Write};
+use pulsevm_serialization::{NumBytes, Read, ReadError, Write};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Read, Write, NumBytes, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct Bytes(pub Vec<u8>);
 
 impl Bytes {
@@ -67,6 +68,56 @@ impl From<Vec<u8>> for Bytes {
     #[inline]
     fn from(data: Vec<u8>) -> Self {
         Bytes(data)
+    }
+}
+
+impl NumBytes for Bytes {
+    #[inline]
+    fn num_bytes(&self) -> usize {
+        4 + self.0.len() // 4 bytes for length + data
+    }
+}
+
+impl Read for Bytes {
+    #[inline]
+    fn read(bytes: &[u8], pos: &mut usize) -> Result<Self, pulsevm_serialization::ReadError> {
+        let len = usize::read(bytes, pos)?;
+
+        // bounds check
+        if bytes.len() < *pos + len {
+            return Err(ReadError::NotEnoughBytes);
+        }
+
+        let start = *pos;
+        let end = start + len;
+        *pos = end;
+
+        Ok(Bytes(bytes[start..end].to_vec()))
+    }
+}
+
+impl Write for Bytes {
+    #[inline]
+    fn write(
+        &self,
+        bytes: &mut [u8],
+        pos: &mut usize,
+    ) -> Result<(), pulsevm_serialization::WriteError> {
+        let len = self.0.len();
+        usize::write(&len, bytes, pos)?;
+        if bytes.len() < *pos + len {
+            return Err(pulsevm_serialization::WriteError::NotEnoughSpace);
+        }
+        bytes[*pos..*pos + len].copy_from_slice(&self.0);
+        *pos += len;
+        Ok(())
+    }
+}
+
+impl AsRef<[u8]> for Bytes {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        &self.0
     }
 }
 

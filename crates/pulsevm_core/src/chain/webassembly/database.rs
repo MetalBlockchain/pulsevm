@@ -29,7 +29,7 @@ pub fn db_store_i64()
             table.into(),
             payer.into(),
             id.into(),
-            src_bytes,
+            src_bytes.into(),
         )?;
         Ok(result)
     }
@@ -63,7 +63,7 @@ pub fn db_update_i64()
         memory.read(&caller, buffer as usize, &mut src_bytes)?;
 
         let context = caller.data_mut().apply_context_mut();
-        context.db_update_i64(itr, payer.into(), &src_bytes)?;
+        context.db_update_i64(itr, payer.into(), &src_bytes.into())?;
 
         Ok(())
     }

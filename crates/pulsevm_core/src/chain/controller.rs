@@ -615,6 +615,7 @@ mod tests {
     use std::{env::temp_dir, fs, path::PathBuf, str::FromStr, vec};
 
     use chrono::Utc;
+    use pulsevm_crypto::Bytes;
     use pulsevm_proc_macros::{NumBytes, Read, Write};
     use pulsevm_serialization::{VarUint32, Write};
     use pulsevm_time::TimePointSec;
@@ -746,7 +747,7 @@ mod tests {
                     account,
                     vm_type: 0,
                     vm_version: 0,
-                    code: Arc::new(wasm_bytes),
+                    code: Arc::new(wasm_bytes.into()),
                 }
                 .pack()
                 .unwrap(),

@@ -8,6 +8,7 @@ use std::{
 
 use chrono::Utc;
 use pulsevm_chainbase::UndoSession;
+use pulsevm_crypto::Bytes;
 use spdlog::{debug, info};
 
 use crate::{
@@ -186,7 +187,7 @@ impl ApplyContext {
     }
 
     pub fn finalize_trace(&self, receipt: ActionReceipt) -> Result<(), ChainError> {
-        debug!(
+        info!(
             "took {} us to execute action {}@{}",
             Utc::now().timestamp_micros() - self.start,
             self.action.account(),
@@ -412,7 +413,7 @@ impl ApplyContext {
         table: Name,
         payer: Name,
         primary_key: u64,
-        data: Vec<u8>,
+        data: Bytes,
     ) -> Result<i32, ChainError> {
         let mut table = self.find_or_create_table(self.receiver, scope, table, payer)?;
         pulse_assert(
@@ -423,7 +424,8 @@ impl ApplyContext {
         )?;
 
         let id = self.session.generate_id::<KeyValue>()?;
-        let key_value = KeyValue::new(id, table.id, primary_key, payer, data.clone());
+        let len = data.len();
+        let key_value = KeyValue::new(id, table.id, primary_key, payer, data);
         self.session
             .insert(&key_value)
             .map_err(|e| ChainError::TransactionError(format!("failed to insert keyval: {}", e)))?;
@@ -432,7 +434,7 @@ impl ApplyContext {
             Ok(())
         })?;
 
-        let billable_size = data.len() as i64 + billable_size_v::<KeyValue>() as i64;
+        let billable_size = len as i64 + billable_size_v::<KeyValue>() as i64;
         self.update_db_usage(payer, billable_size)?;
 
         let mut keyval_cache = self.keyval_cache.borrow_mut();
@@ -456,7 +458,7 @@ impl ApplyContext {
         if buffer.len() < copy_size {
             buffer.resize(copy_size, 0);
         }
-        buffer[..copy_size].copy_from_slice(&obj.value[..copy_size]);
+        buffer[..copy_size].copy_from_slice(&obj.value.as_slice()[..copy_size]);
         Ok(copy_size as i32)
     }
 
@@ -464,7 +466,7 @@ impl ApplyContext {
         &mut self,
         iterator: i32,
         payer: Name,
-        data: &Vec<u8>,
+        data: &Bytes,
     ) -> Result<(), ChainError> {
         let keyval_cache = self.keyval_cache.borrow();
         let obj = keyval_cache.get(iterator)?;

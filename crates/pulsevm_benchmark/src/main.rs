@@ -193,7 +193,7 @@ fn main() {
     undo_session.commit().unwrap();
     let mut undo_session = controller.create_undo_session().unwrap();
 
-    for _i in 0..2 {
+    for _i in 0..200 {
         controller
             .execute_transaction(
                 &mut undo_session,
@@ -279,7 +279,7 @@ fn set_code(
                 account,
                 vm_type: 0,
                 vm_version: 0,
-                code: Arc::new(wasm_bytes),
+                code: Arc::new(wasm_bytes.into()),
             }
             .pack()
             .unwrap(),
@@ -308,7 +308,7 @@ fn set_abi(
             Name::from_str("setabi").unwrap(),
             SetAbi {
                 account,
-                abi: Arc::new(abi_bytes),
+                abi: Arc::new(abi_bytes.into()),
             }
             .pack()
             .unwrap(),

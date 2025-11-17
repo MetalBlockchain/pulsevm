@@ -7,6 +7,8 @@ use std::{
     sync::Mutex,
 };
 
+use pulsevm_crypto::FixedBytes;
+
 use crate::chain::id::Id;
 
 /* -------------------- errors -------------------- */
@@ -71,7 +73,7 @@ impl StateHistoryLogHeader {
 
     fn write<W: Write>(&self, mut w: W) -> io::Result<()> {
         w.write_all(&self.magic.to_le_bytes())?;
-        w.write_all(&self.block_id.0)?;
+        w.write_all(&self.block_id.0.0)?;
         w.write_all(&self.payload_size.to_le_bytes())?;
         Ok(())
     }
@@ -83,7 +85,7 @@ impl StateHistoryLogHeader {
         let magic = u64::from_le_bytes(buf[0..8].try_into().unwrap());
         let mut id_bytes = [0u8; 32];
         id_bytes.copy_from_slice(&buf[8..40]);
-        let block_id = Id(id_bytes);
+        let block_id = Id(FixedBytes(id_bytes));
         let payload_size = u64::from_le_bytes(buf[40..48].try_into().unwrap());
         Ok(Self {
             magic,
@@ -97,7 +99,7 @@ impl StateHistoryLogHeader {
 #[inline]
 fn num_from_block_id(id: &Id) -> u32 {
     // EOS stores block num in first 4 bytes (big-endian) of the id
-    u32::from_be_bytes(id.0[0..4].try_into().unwrap())
+    u32::from_be_bytes(id.0.0[0..4].try_into().unwrap())
 }
 
 /* -------------------- log struct -------------------- */
