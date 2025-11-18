@@ -238,7 +238,13 @@ impl WasmRuntime {
                 ),
             )
             .map_err(|e| {
-                ChainError::WasmRuntimeError(format!("apply error: {}", e.root_cause()))
+                // If this was originally `Err(ChainError)`, restore it
+                if let Some(chain_err) = e.downcast_ref::<ChainError>() {
+                    return chain_err.clone();
+                }
+
+                // Otherwise wrap it
+                ChainError::WasmRuntimeError(format!("apply error: {}", e))
             })?;
 
         Ok(())

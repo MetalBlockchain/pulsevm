@@ -3,25 +3,15 @@ mod unittests;
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::{collections::HashSet, fs, path::Path, sync::Arc};
 
     use pulsevm_chainbase::UndoSession;
     use pulsevm_core::{
-        ACTIVE_NAME, CODE_NAME, OWNER_NAME, PULSE_NAME,
-        authority::{Authority, KeyWeight, PermissionLevel, PermissionLevelWeight},
-        block::BlockTimestamp,
-        config::NEWACCOUNT_NAME,
-        controller::Controller,
-        error::ChainError,
-        name::{self, Name},
-        pulse_contract::NewAccount,
-        secp256k1::{PrivateKey, PublicKey},
-        transaction::{
+        authority::{Authority, KeyWeight, PermissionLevel, PermissionLevelWeight}, block::BlockTimestamp, config::{NEWACCOUNT_NAME, SETCODE_NAME}, controller::Controller, error::ChainError, name::{self, Name}, pulse_contract::{NewAccount, SetCode}, secp256k1::{PrivateKey, PublicKey}, transaction::{
             Action, PackedTransaction, SignedTransaction, Transaction, TransactionTrace,
-        },
-        utils::pulse_assert,
+        }, utils::pulse_assert, ACTIVE_NAME, CODE_NAME, OWNER_NAME, PULSE_NAME
     };
-    use pulsevm_crypto::Digest;
+    use pulsevm_crypto::{Bytes, Digest};
     use pulsevm_proc_macros::name;
     use pulsevm_serialization::{VarUint32, Write};
     use serde_json::json;
@@ -50,11 +40,15 @@ mod tests {
                 .initialize(&genesis, temp_dir.path().to_str().unwrap())
                 .expect("Failed to initialize controller");
 
-            Testing {
+            let mut suite = Testing {
                 temp_dir,
                 controller,
                 pending_block_state: None,
-            }
+            };
+
+            suite.set_bios_contract().expect("Failed to set bios contract");
+
+            suite
         }
 
         pub fn get_temp_path(&self) -> &std::path::Path {
@@ -247,6 +241,44 @@ mod tests {
             trx.header.max_net_usage_words = VarUint32(0); // No limit
             trx.header.max_cpu_usage = 0; // No limit
             trx.header.delay_sec = VarUint32(delay_sec);
+        }
+
+        pub fn set_code(&mut self, account: Name, wasm: Bytes) -> Result<(), ChainError> {
+            let mut trx = Transaction::default();
+            self.set_transaction_headers(&mut trx, 6, 0);
+            trx.actions.push(Action::new(
+                PULSE_NAME,
+                SETCODE_NAME,
+                SetCode {
+                    account: account,
+                    vm_type: 0,
+                    vm_version: 0,
+                    code: Arc::new(wasm),
+                }
+                .pack()
+                .unwrap(),
+                vec![PermissionLevel::new(PULSE_NAME, ACTIVE_NAME)],
+            ));
+
+            let signed = trx.sign(
+                &get_private_key(PULSE_NAME, "active"),
+                &self.controller.chain_id(),
+            )?;
+            self.push_transaction(signed)?;
+            Ok(())
+        }
+
+        pub fn set_bios_contract(&mut self) -> Result<(), ChainError> {
+            let bios_wasm_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("reference_contracts")
+                .join("pulse_bios.wasm");
+            let wasm = fs::read(bios_wasm_path).expect("Failed to read bios wasm file");
+            self.set_code(PULSE_NAME, Bytes::from(wasm))?;
+            Ok(())
         }
     }
 

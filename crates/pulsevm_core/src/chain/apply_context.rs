@@ -218,7 +218,7 @@ impl ApplyContext {
                     return Ok(());
                 }
 
-                return Err(ChainError::TransactionError(format!(
+                return Err(ChainError::MissingAuthError(format!(
                     "missing authority of {}/{}",
                     account, perm
                 )));
@@ -227,7 +227,7 @@ impl ApplyContext {
             }
         }
 
-        return Err(ChainError::TransactionError(format!(
+        return Err(ChainError::MissingAuthError(format!(
             "missing authority of {}",
             account
         )));

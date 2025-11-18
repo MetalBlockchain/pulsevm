@@ -1,5 +1,5 @@
 use anyhow::bail;
-use wasmtime::Caller;
+use wasmtime::{Caller, Trap};
 
 use crate::chain::wasm_runtime::WasmContext;
 
@@ -8,7 +8,7 @@ pub fn require_auth() -> impl Fn(Caller<'_, WasmContext>, u64) -> Result<(), was
         let context = caller.data().apply_context();
 
         if let Err(err) = context.require_authorization(account.into(), None) {
-            bail!("{}", err);
+            return Err(err.into());
         } else {
             Ok(())
         }
