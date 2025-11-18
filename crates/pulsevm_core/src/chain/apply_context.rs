@@ -21,6 +21,7 @@ use crate::{
         config::{DynamicGlobalPropertyObject, billable_size_v},
         controller::Controller,
         error::ChainError,
+        genesis::ChainConfig,
         id::Id,
         iterator_cache::IteratorCache,
         name::Name,
@@ -34,6 +35,7 @@ use crate::{
 
 #[derive(Clone)]
 pub struct ApplyContext {
+    pub chain_config: Arc<ChainConfig>,
     session: UndoSession,                   // The undo session for this context
     wasm_runtime: Arc<RwLock<WasmRuntime>>, // Context for the Wasm runtime
     trx_context: TransactionContext,        // The transaction context
@@ -56,6 +58,7 @@ pub struct ApplyContext {
 
 impl ApplyContext {
     pub fn new(
+        chain_config: Arc<ChainConfig>,
         session: UndoSession,
         wasm_runtime: Arc<RwLock<WasmRuntime>>,
         trx_context: TransactionContext,
@@ -67,6 +70,7 @@ impl ApplyContext {
         let pending_block_timestamp = trx_context.pending_block_timestamp();
 
         Ok(ApplyContext {
+            chain_config,
             session,
             wasm_runtime,
             trx_context,
@@ -325,6 +329,7 @@ impl ApplyContext {
 
             if !self.privileged {
                 AuthorizationManager::check_authorization(
+                    &self.chain_config,
                     &mut self.session,
                     &vec![a.clone()],
                     &HashSet::new(),       // No provided keys

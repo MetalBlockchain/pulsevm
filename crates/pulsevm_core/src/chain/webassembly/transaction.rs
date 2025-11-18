@@ -71,6 +71,7 @@ pub fn check_transaction_authorization()
         let context = caller.data().apply_context();
         let mut session = context.undo_session();
         let result = AuthorizationManager::check_authorization(
+            &context.chain_config,
             &mut session,
             &transaction.actions,
             &provided_keys,

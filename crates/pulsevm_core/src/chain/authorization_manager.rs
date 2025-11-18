@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use crate::chain::{
     authority::PermissionByParentIndex,
+    genesis::ChainConfig,
     name::Name,
     pulse_contract::{DeleteAuth, LinkAuth, UnlinkAuth, UpdateAuth},
     secp256k1::PublicKey,
@@ -24,6 +25,7 @@ pub struct AuthorizationManager;
 
 impl AuthorizationManager {
     pub fn check_authorization(
+        chain_config: &ChainConfig,
         session: &mut UndoSession,
         actions: &Vec<Action>,
         provided_keys: &HashSet<PublicKey>,
@@ -79,7 +81,8 @@ impl AuthorizationManager {
                 }
             }
 
-            let mut authority_checker = AuthorityChecker::new(provided_keys);
+            let mut authority_checker =
+                AuthorityChecker::new(chain_config.max_authority_depth, provided_keys);
 
             // Now verify that all the declared authorizations are satisfied
             for p in permissions_to_satisfy.iter() {

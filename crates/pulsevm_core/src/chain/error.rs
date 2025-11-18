@@ -32,7 +32,7 @@ pub enum ChainError {
     #[error("serialization error: {0}")]
     SerializationError(String),
     #[error("missing required authority: {0}")]
-    MissingAuthError(String)
+    MissingAuthError(String),
 }
 
 impl From<pulsevm_serialization::ReadError> for ChainError {

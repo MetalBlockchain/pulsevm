@@ -7,9 +7,19 @@ mod tests {
 
     use pulsevm_chainbase::UndoSession;
     use pulsevm_core::{
-        authority::{Authority, KeyWeight, PermissionLevel, PermissionLevelWeight}, block::BlockTimestamp, config::{NEWACCOUNT_NAME, SETCODE_NAME}, controller::Controller, error::ChainError, name::{self, Name}, pulse_contract::{NewAccount, SetCode}, secp256k1::{PrivateKey, PublicKey}, transaction::{
+        ACTIVE_NAME, CODE_NAME, OWNER_NAME, PULSE_NAME,
+        authority::{Authority, KeyWeight, PermissionLevel, PermissionLevelWeight},
+        block::BlockTimestamp,
+        config::{NEWACCOUNT_NAME, SETCODE_NAME, UPDATEAUTH_NAME},
+        controller::Controller,
+        error::ChainError,
+        name::{self, Name},
+        pulse_contract::{NewAccount, SetCode, UpdateAuth},
+        secp256k1::{PrivateKey, PublicKey},
+        transaction::{
             Action, PackedTransaction, SignedTransaction, Transaction, TransactionTrace,
-        }, utils::pulse_assert, ACTIVE_NAME, CODE_NAME, OWNER_NAME, PULSE_NAME
+        },
+        utils::pulse_assert,
     };
     use pulsevm_crypto::{Bytes, Digest};
     use pulsevm_proc_macros::name;
@@ -17,7 +27,7 @@ mod tests {
     use serde_json::json;
 
     #[derive(Clone)]
-    struct PendingBlockState {
+    pub struct PendingBlockState {
         pub undo_session: UndoSession,
         pub timestamp: BlockTimestamp,
     }
@@ -46,13 +56,11 @@ mod tests {
                 pending_block_state: None,
             };
 
-            suite.set_bios_contract().expect("Failed to set bios contract");
+            suite
+                .set_bios_contract()
+                .expect("Failed to set bios contract");
 
             suite
-        }
-
-        pub fn get_temp_path(&self) -> &std::path::Path {
-            self.temp_dir.path()
         }
 
         pub fn create_accounts(
@@ -219,7 +227,7 @@ mod tests {
             Ok(result)
         }
 
-        fn get_pending_block_state(&mut self) -> PendingBlockState {
+        pub fn get_pending_block_state(&mut self) -> PendingBlockState {
             if let Some(pending_block_state) = &self.pending_block_state {
                 pending_block_state.clone()
             } else {
@@ -279,6 +287,51 @@ mod tests {
             let wasm = fs::read(bios_wasm_path).expect("Failed to read bios wasm file");
             self.set_code(PULSE_NAME, Bytes::from(wasm))?;
             Ok(())
+        }
+
+        pub fn set_authority(
+            &mut self,
+            account: Name,
+            permission: Name,
+            authority: Authority,
+            parent: Name,
+            auths: Vec<PermissionLevel>,
+            keys: Vec<PrivateKey>,
+        ) -> Result<(), ChainError> {
+            let mut trx = Transaction::default();
+            trx.actions.push(Action::new(
+                PULSE_NAME,
+                UPDATEAUTH_NAME,
+                UpdateAuth {
+                    account,
+                    permission,
+                    parent: parent,
+                    auth: authority,
+                }
+                .pack()
+                .unwrap(),
+                auths,
+            ));
+            self.set_transaction_headers(&mut trx, 6, 0);
+
+            let mut signed: SignedTransaction = SignedTransaction::new(trx, HashSet::new(), vec![]);
+            for key in keys.iter() {
+                signed = signed.sign(key, &self.controller.chain_id())?;
+            }
+            self.push_transaction(signed)?;
+            Ok(())
+        }
+
+        pub fn set_authority2(
+            &mut self,
+            account: Name,
+            permission: Name,
+            authority: Authority,
+            parent: Name,
+        ) -> Result<(), ChainError> {
+            let auths = vec![PermissionLevel::new(account, OWNER_NAME)];
+            let keys = vec![get_private_key(account, "owner")];
+            self.set_authority(account, permission, authority, parent, auths, keys)
         }
     }
 

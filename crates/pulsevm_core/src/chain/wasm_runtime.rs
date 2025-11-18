@@ -244,7 +244,7 @@ impl WasmRuntime {
                 }
 
                 // Otherwise wrap it
-                ChainError::WasmRuntimeError(format!("apply error: {}", e))
+                ChainError::WasmRuntimeError(format!("apply error: {}", e.root_cause()))
             })?;
 
         Ok(())

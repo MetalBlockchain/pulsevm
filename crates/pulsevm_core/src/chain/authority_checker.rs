@@ -27,10 +27,10 @@ enum PermissionCacheStatus {
 }
 
 impl<'a> AuthorityChecker<'a> {
-    pub fn new(provided_keys: &'a HashSet<PublicKey>) -> Self {
+    pub fn new(recursion_depth_limit: u16, provided_keys: &'a HashSet<PublicKey>) -> Self {
         Self {
-            recursion_depth_limit: 0,
-            provided_keys: provided_keys,
+            recursion_depth_limit,
+            provided_keys,
             used_keys: HashSet::new(),
             cached_permissions: HashMap::new(),
         }
@@ -87,48 +87,59 @@ impl<'a> AuthorityChecker<'a> {
                 "recursion depth exceeded".to_string(),
             ));
         }
-        if !self
-            .cached_permissions
-            .contains_key(permission.permission())
-        {
-            let auth = session
-                .find_by_secondary::<Permission, PermissionByOwnerIndex>((
-                    permission.permission().actor(),
-                    permission.permission().permission(),
-                ))
-                .map_err(|e| ChainError::AuthorizationError(format!("{}", e)))?;
 
-            if auth.is_none() {
+        // cache lookup
+        match self.cached_permissions.get(permission.permission()) {
+            Some(PermissionCacheStatus::BeingEvaluated) => {
+                // cycle
+                return Err(ChainError::AuthorizationError(
+                    "permission cycle detected".to_string(),
+                ));
+            }
+            Some(PermissionCacheStatus::PermissionSatisfied) => {
+                return Ok(permission.weight());
+            }
+            Some(PermissionCacheStatus::PermissionUnsatisfied) => {
                 return Ok(0);
             }
-            let auth = auth.unwrap();
-            self.cached_permissions.insert(
-                permission.permission().clone(),
-                PermissionCacheStatus::BeingEvaluated,
-            );
-            let satisfied = self.satisfied(session, &auth.authority, recursion_depth + 1)?;
-
-            if satisfied {
-                self.cached_permissions.insert(
-                    permission.permission().clone(),
-                    PermissionCacheStatus::PermissionSatisfied,
-                );
-                return Ok(permission.weight());
-            } else {
-                self.cached_permissions.insert(
-                    permission.permission().clone(),
-                    PermissionCacheStatus::PermissionUnsatisfied,
-                );
+            None => {
+                // fall through to evaluation
             }
-        } else if self
-            .cached_permissions
-            .get(permission.permission())
-            .unwrap()
-            == &PermissionCacheStatus::PermissionSatisfied
-        {
-            return Ok(permission.weight());
         }
 
-        Ok(0)
+        // not cached yet – fetch authority from DB
+        let auth = session
+            .find_by_secondary::<Permission, PermissionByOwnerIndex>((
+                permission.permission().actor(),
+                permission.permission().permission(),
+            ))
+            .map_err(|e| ChainError::AuthorizationError(format!("{}", e)))?;
+
+        let Some(auth) = auth else {
+            // no such permission → contributes 0
+            return Ok(0);
+        };
+
+        // mark as being evaluated to detect cycles
+        self.cached_permissions.insert(
+            permission.permission().clone(),
+            PermissionCacheStatus::BeingEvaluated,
+        );
+
+        let satisfied = self.satisfied(session, &auth.authority, recursion_depth + 1)?;
+
+        if satisfied {
+            self.cached_permissions.insert(
+                permission.permission().clone(),
+                PermissionCacheStatus::PermissionSatisfied,
+            );
+            Ok(permission.weight())
+        } else {
+            self.cached_permissions.insert(
+                permission.permission().clone(),
+                PermissionCacheStatus::PermissionUnsatisfied,
+            );
+            Ok(0)
+        }
     }
 }

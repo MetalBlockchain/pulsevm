@@ -40,10 +40,10 @@ pub struct TransactionResult {
 #[derive(Clone)]
 pub struct TransactionContext {
     initialized: bool,
+    chain_config: Arc<ChainConfig>,
     session: UndoSession,
     wasm_runtime: Arc<RwLock<WasmRuntime>>,
     pending_block_timestamp: BlockTimestamp,
-    config: Arc<ChainConfig>,
 
     trace: Rc<RefCell<TransactionTrace>>,
     billed_cpu_time_us: Rc<AtomicI64>,
@@ -56,7 +56,7 @@ pub struct TransactionContext {
 impl TransactionContext {
     pub fn new(
         session: UndoSession,
-        config: Arc<ChainConfig>,
+        chain_config: Arc<ChainConfig>,
         wasm_runtime: Arc<RwLock<WasmRuntime>>,
         block_num: u32,
         pending_block_timestamp: BlockTimestamp,
@@ -69,10 +69,10 @@ impl TransactionContext {
 
         Self {
             initialized: false,
+            chain_config,
             session,
             wasm_runtime,
             pending_block_timestamp,
-            config,
 
             trace: Rc::new(RefCell::new(trace)),
             billed_cpu_time_us: Rc::new(AtomicI64::new(0)),
@@ -119,19 +119,19 @@ impl TransactionContext {
         )?;
 
         let mut discounted_size_for_pruned_data = packed_trx_prunable_size;
-        if self.config.context_free_discount_net_usage_den > 0
-            && self.config.context_free_discount_net_usage_num
-                < self.config.context_free_discount_net_usage_den
+        if self.chain_config.context_free_discount_net_usage_den > 0
+            && self.chain_config.context_free_discount_net_usage_num
+                < self.chain_config.context_free_discount_net_usage_den
         {
             discounted_size_for_pruned_data *=
-                self.config.context_free_discount_net_usage_num as u64;
+                self.chain_config.context_free_discount_net_usage_num as u64;
             discounted_size_for_pruned_data = (discounted_size_for_pruned_data
-                + self.config.context_free_discount_net_usage_den as u64
+                + self.chain_config.context_free_discount_net_usage_den as u64
                 - 1)
-                / self.config.context_free_discount_net_usage_den as u64; // rounds up
+                / self.chain_config.context_free_discount_net_usage_den as u64; // rounds up
         }
 
-        let initial_net_usage: u64 = (self.config.base_per_transaction_net_usage as u64)
+        let initial_net_usage: u64 = (self.chain_config.base_per_transaction_net_usage as u64)
             + packed_trx_unprunable_size
             + discounted_size_for_pruned_data;
 
@@ -233,6 +233,7 @@ impl TransactionContext {
         let (action, receiver) =
             self.with_action_trace(action_ordinal, |t| (t.action().clone(), t.receiver()))?;
         let mut apply_context = ApplyContext::new(
+            self.chain_config.clone(),
             self.session.clone(),
             self.wasm_runtime.clone(),
             self.clone(),

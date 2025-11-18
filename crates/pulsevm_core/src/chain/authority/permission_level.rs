@@ -44,3 +44,12 @@ impl fmt::Display for PermissionLevel {
         write!(f, "{}@{}", self.actor, self.permission)
     }
 }
+
+impl From<(Name, Name)> for PermissionLevel {
+    fn from(value: (Name, Name)) -> Self {
+        PermissionLevel {
+            actor: value.0,
+            permission: value.1,
+        }
+    }
+}

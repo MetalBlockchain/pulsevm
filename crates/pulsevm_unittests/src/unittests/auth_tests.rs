@@ -1,7 +1,12 @@
 #[cfg(test)]
 mod auth_tests {
     use anyhow::Result;
-    use pulsevm_core::{ACTIVE_NAME, PULSE_NAME, authority::PermissionLevel, error::ChainError};
+    use pulsevm_core::{
+        ACTIVE_NAME, OWNER_NAME, PULSE_NAME,
+        authority::{Authority, PermissionLevel, PermissionLevelWeight},
+        authorization_manager::AuthorizationManager,
+        error::ChainError,
+    };
     use pulsevm_proc_macros::name;
 
     use crate::tests::{Testing, get_private_key};
@@ -62,10 +67,49 @@ mod auth_tests {
                 )
                 .err(),
             Some(ChainError::MissingAuthError(
-                "missing authority of alice"
-                    .into()
+                "missing authority of alice".into()
             ))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_delegate_auth() -> Result<()> {
+        let mut chain = Testing::new();
+        chain.create_accounts(
+            vec![name!("alice").into(), name!("bob").into()],
+            false,
+            true,
+        )?;
+        let delegated_auth = Authority::new(
+            1,
+            vec![],
+            vec![PermissionLevelWeight::new(
+                (name!("bob").into(), ACTIVE_NAME).into(),
+                1,
+            )],
+            vec![],
+        );
+        chain.set_authority2(
+            name!("alice").into(),
+            ACTIVE_NAME,
+            delegated_auth.clone(),
+            OWNER_NAME,
+        )?;
+        let pending_block_state = chain.get_pending_block_state();
+        let mut undo_session = pending_block_state.undo_session.clone();
+        let new_auth = AuthorizationManager::get_permission(
+            &mut undo_session,
+            &(name!("alice").into(), ACTIVE_NAME).into(),
+        )?
+        .authority;
+        assert!(new_auth == delegated_auth);
+        // execute nonce from alice signed by bob
+        chain.push_reqauth2(
+            name!("alice").into(),
+            vec![PermissionLevel::new(name!("alice").into(), ACTIVE_NAME)],
+            vec![get_private_key(name!("bob").into(), "active")],
+        )?;
         Ok(())
     }
 }

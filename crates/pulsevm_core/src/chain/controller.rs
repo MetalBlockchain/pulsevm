@@ -448,6 +448,7 @@ impl Controller {
         {
             // Verify authority
             AuthorizationManager::check_authorization(
+                &self.config,
                 undo_session,
                 &signed_transaction.transaction().actions,
                 &signed_transaction.recovered_keys(&self.chain_id)?,
