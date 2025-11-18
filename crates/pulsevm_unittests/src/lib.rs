@@ -10,11 +10,11 @@ mod tests {
         ACTIVE_NAME, CODE_NAME, OWNER_NAME, PULSE_NAME,
         authority::{Authority, KeyWeight, PermissionLevel, PermissionLevelWeight},
         block::BlockTimestamp,
-        config::{NEWACCOUNT_NAME, SETCODE_NAME, UPDATEAUTH_NAME},
+        config::{DELETEAUTH_NAME, NEWACCOUNT_NAME, SETCODE_NAME, UPDATEAUTH_NAME},
         controller::Controller,
         error::ChainError,
         name::{self, Name},
-        pulse_contract::{NewAccount, SetCode, UpdateAuth},
+        pulse_contract::{DeleteAuth, NewAccount, SetCode, UpdateAuth},
         secp256k1::{PrivateKey, PublicKey},
         transaction::{
             Action, PackedTransaction, SignedTransaction, Transaction, TransactionTrace,
@@ -332,6 +332,45 @@ mod tests {
             let auths = vec![PermissionLevel::new(account, OWNER_NAME)];
             let keys = vec![get_private_key(account, "owner")];
             self.set_authority(account, permission, authority, parent, auths, keys)
+        }
+
+        pub fn delete_authority(
+            &mut self,
+            account: Name,
+            permission: Name,
+            auths: Vec<PermissionLevel>,
+            keys: Vec<PrivateKey>,
+        ) -> Result<(), ChainError> {
+            let mut trx = Transaction::default();
+            trx.actions.push(Action::new(
+                PULSE_NAME,
+                DELETEAUTH_NAME,
+                DeleteAuth {
+                    account,
+                    permission,
+                }
+                .pack()
+                .unwrap(),
+                auths,
+            ));
+            self.set_transaction_headers(&mut trx, 6, 0);
+
+            let mut signed: SignedTransaction = SignedTransaction::new(trx, HashSet::new(), vec![]);
+            for key in keys.iter() {
+                signed = signed.sign(key, &self.controller.chain_id())?;
+            }
+            self.push_transaction(signed)?;
+            Ok(())
+        }
+
+        pub fn delete_authority2(
+            &mut self,
+            account: Name,
+            permission: Name,
+        ) -> Result<(), ChainError> {
+            let auths = vec![PermissionLevel::new(account, OWNER_NAME)];
+            let keys = vec![get_private_key(account, "owner")];
+            self.delete_authority(account, permission, auths, keys)
         }
     }
 

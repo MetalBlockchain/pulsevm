@@ -225,8 +225,8 @@ impl RpcServer for RpcService {
 
             let mut parent = Name::default();
 
-            if perm.parent_id() > 0 {
-                let parent_perm = session.get::<Permission>(perm.parent_id())?;
+            if perm.parent > 0 {
+                let parent_perm = session.get::<Permission>(perm.parent)?;
                 parent = parent_perm.name;
             }
 

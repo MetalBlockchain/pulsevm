@@ -279,17 +279,17 @@ pub fn updateauth(context: &mut ApplyContext) -> Result<(), ChainError> {
 
     pulse_assert(
         !update.permission.empty(),
-        ChainError::TransactionError(format!("cannot create authority with empty name")),
+        ChainError::ActionValidationError(format!("cannot create authority with empty name")),
     )?;
     pulse_assert(
         !update.permission.to_string().starts_with("pulse."),
-        ChainError::TransactionError(format!(
+        ChainError::ActionValidationError(format!(
             "permission names that start with 'pulse.' are reserved"
         )),
     )?;
     pulse_assert(
         update.permission != update.parent,
-        ChainError::TransactionError(format!("cannot set an authority as its own parent")),
+        ChainError::ActionValidationError(format!("cannot set an authority as its own parent")),
     )?;
 
     let mut session = context.undo_session();
@@ -341,8 +341,8 @@ pub fn updateauth(context: &mut ApplyContext) -> Result<(), ChainError> {
     if permission.is_some() {
         let mut permission = permission.unwrap();
         pulse_assert(
-            parent_id == permission.parent_id(),
-            ChainError::TransactionError(format!(
+            parent_id == permission.parent,
+            ChainError::ActionValidationError(format!(
                 "changing parent authority is not currently supported"
             )),
         )?;
@@ -381,11 +381,11 @@ pub fn deleteauth(context: &mut ApplyContext) -> Result<(), ChainError> {
 
     pulse_assert(
         remove.permission != ACTIVE_NAME,
-        ChainError::TransactionError(format!("cannot delete active authority")),
+        ChainError::ActionValidationError(format!("cannot delete active authority")),
     )?;
     pulse_assert(
         remove.permission != OWNER_NAME,
-        ChainError::TransactionError(format!("cannot delete owner authority")),
+        ChainError::ActionValidationError(format!("cannot delete owner authority")),
     )?;
 
     let mut session = context.undo_session();
@@ -517,33 +517,33 @@ fn validate_authority_precondition(
 ) -> Result<(), ChainError> {
     for a in auth.accounts() {
         let account = session
-            .find::<Account>(a.permission().actor())
+            .find::<Account>(a.permission().actor)
             .map_err(|_| ChainError::TransactionError(format!("failed to query db",)))?;
         pulse_assert(
             account.is_some(),
             ChainError::TransactionError(format!(
                 "account {} does not exist",
-                a.permission().actor()
+                a.permission().actor
             )),
         )?;
 
-        if a.permission().permission() == OWNER_NAME || a.permission().permission() == ACTIVE_NAME {
+        if a.permission().permission == OWNER_NAME || a.permission().permission == ACTIVE_NAME {
             continue; // account was already checked to exist, so its owner and active permissions should exist
         }
 
-        if a.permission().permission() == CODE_NAME {
+        if a.permission().permission == CODE_NAME {
             continue; // virtual pulse.code permission does not really exist but is allowed
         }
 
         let permission = session
             .find_by_secondary::<Permission, PermissionByOwnerIndex>((
-                a.permission().actor(),
-                a.permission().permission(),
+                a.permission().actor,
+                a.permission().permission,
             ))
             .map_err(|_| {
                 ChainError::TransactionError(format!(
                     "failed to query db for permission {}",
-                    a.permission().permission()
+                    a.permission().permission
                 ))
             })?;
         pulse_assert(

@@ -1,12 +1,15 @@
 use std::collections::HashSet;
 
-use crate::chain::{
-    authority::PermissionByParentIndex,
-    genesis::ChainConfig,
-    name::Name,
-    pulse_contract::{DeleteAuth, LinkAuth, UnlinkAuth, UpdateAuth},
-    secp256k1::PublicKey,
-    transaction::Action,
+use crate::{
+    chain::{
+        authority::PermissionByParentIndex,
+        genesis::ChainConfig,
+        name::Name,
+        pulse_contract::{DeleteAuth, LinkAuth, UnlinkAuth, UpdateAuth},
+        secp256k1::PublicKey,
+        transaction::Action,
+    },
+    utils::pulse_assert,
 };
 
 use super::{
@@ -41,7 +44,9 @@ impl AuthorizationManager {
                 special_case = true;
 
                 match act.name().as_u64() {
-                    name!("updateauth") => Self::check_updateauth_authorization(session, act)?,
+                    name!("updateauth") => {
+                        Self::check_updateauth_authorization(session, act, act.authorization())?
+                    }
                     name!("deleteauth") => Self::check_deleteauth_authorization(session, act)?,
                     name!("linkauth") => Self::check_linkauth_authorization(session, act)?,
                     name!("unlinkauth") => Self::check_unlinkauth_authorization(session, act)?,
@@ -53,7 +58,7 @@ impl AuthorizationManager {
                 if !special_case {
                     let min_permission_name = Self::lookup_minimum_permission(
                         session,
-                        declared_auth.actor(),
+                        declared_auth.actor,
                         act.account(),
                         act.name(),
                     )?;
@@ -62,7 +67,7 @@ impl AuthorizationManager {
                         let min_permission_name = min_permission_name.unwrap();
                         let min_permission = Self::get_permission(
                             session,
-                            &PermissionLevel::new(declared_auth.actor(), min_permission_name),
+                            &PermissionLevel::new(declared_auth.actor, min_permission_name),
                         )?;
                         Self::get_permission(session, &declared_auth)?
                             .satisfies(&min_permission, session)
@@ -111,35 +116,33 @@ impl AuthorizationManager {
     fn check_updateauth_authorization(
         session: &mut UndoSession,
         action: &Action,
+        auths: &[PermissionLevel],
     ) -> Result<(), ChainError> {
         let update = action
             .data_as::<UpdateAuth>()
             .map_err(|e| ChainError::AuthorizationError(format!("{}", e)))?;
-
-        if action.authorization().len() != 1 {
-            return Err(ChainError::AuthorizationError(
-                "updateauth action should only have one declared authorization".to_string(),
-            ));
-        }
-        let auth = action.authorization()[0];
-        if auth.actor().as_u64() != update.account.as_u64() {
-            return Err(ChainError::AuthorizationError(
-                "the owner of the affected permission needs to be the actor of the declared authorization".to_string(),
-            ));
-        }
-
-        let mut min_permission = Self::find_permission(
-            session,
-            &PermissionLevel::new(update.account, update.permission),
+        pulse_assert(
+            auths.len() == 1,
+            ChainError::IrrelevantAuth(
+                "updateauth action should only have one declared authorization".into(),
+            ),
         )?;
-        if min_permission.is_none() {
-            // creating a new permission
-            min_permission = Some(Self::get_permission(
-                session,
-                &PermissionLevel::new(update.account, update.parent),
-            )?);
-        }
-        let min_permission = min_permission.unwrap();
+        let auth = &auths[0];
+        pulse_assert(auth.actor == update.account, ChainError::IrrelevantAuth("the owner of the affected permission needs to be the actor of the declared authorization".into()))?;
+
+        // Determine the minimum required permission:
+        // - If the permission already exists, use it.
+        // - Otherwise, we're creating a new permission, so use the parent.
+        let requested_perm = PermissionLevel::new(update.account, update.permission);
+        let min_permission =
+            if let Some(existing) = Self::find_permission(session, &requested_perm)? {
+                existing
+            } else {
+                Self::get_permission(
+                    session,
+                    &PermissionLevel::new(update.account, update.parent),
+                )?
+            };
 
         Self::get_permission(session, &auth)?
             .satisfies(&min_permission, session)
@@ -168,7 +171,7 @@ impl AuthorizationManager {
             ));
         }
         let auth = action.authorization()[0];
-        if auth.actor().as_u64() != del.account.as_u64() {
+        if auth.actor.as_u64() != del.account.as_u64() {
             return Err(ChainError::AuthorizationError(
                 "the owner of the permission to delete needs to be the actor of the declared authorization".to_string(),
             ));
@@ -200,7 +203,7 @@ impl AuthorizationManager {
             ));
         }
         let auth = action.authorization()[0];
-        if auth.actor().as_u64() != link.account.as_u64() {
+        if auth.actor != link.account {
             return Err(ChainError::AuthorizationError(
                 "the owner of the linked permission needs to be the actor of the declared authorization".to_string(),
             ));
@@ -265,7 +268,7 @@ impl AuthorizationManager {
             ));
         }
         let auth = action.authorization()[0];
-        if auth.actor() != unlink.account {
+        if auth.actor != unlink.account {
             return Err(ChainError::AuthorizationError(
                 "the owner of the linked permission needs to be the actor of the declared authorization".to_string(),
             ));
@@ -306,15 +309,15 @@ impl AuthorizationManager {
         session: &mut UndoSession,
         level: &PermissionLevel,
     ) -> Result<Option<Permission>, ChainError> {
-        if level.actor().empty() || level.permission().empty() {
+        if level.actor.empty() || level.permission.empty() {
             return Err(ChainError::AuthorizationError(
                 "invalid permission".to_string(),
             ));
         }
         let result = session
             .find_by_secondary::<Permission, PermissionByOwnerIndex>((
-                level.actor(),
-                level.permission(),
+                level.actor,
+                level.permission,
             ))
             .map_err(|e| ChainError::AuthorizationError(format!("{}", e)))?;
         if result.is_none() {
@@ -327,21 +330,21 @@ impl AuthorizationManager {
         session: &mut UndoSession,
         level: &PermissionLevel,
     ) -> Result<Permission, ChainError> {
-        if level.actor().empty() || level.permission().empty() {
+        if level.actor.empty() || level.permission.empty() {
             return Err(ChainError::AuthorizationError(
                 "invalid permission".to_string(),
             ));
         }
         let result = session
             .find_by_secondary::<Permission, PermissionByOwnerIndex>((
-                level.actor(),
-                level.permission(),
+                level.actor,
+                level.permission,
             ))
             .map_err(|e| ChainError::AuthorizationError(format!("{}", e)))?;
         if result.is_none() {
             return Err(ChainError::PermissionNotFound(
-                level.actor(),
-                level.permission().clone(),
+                level.actor,
+                level.permission.clone(),
             ));
         }
         Ok(result.unwrap())
@@ -447,8 +450,8 @@ impl AuthorizationManager {
         let mut range = index.lower_bound(permission.id())?;
         let next = range.next()?;
 
-        if next.is_some() {
-            return Err(ChainError::AuthorizationError(format!(
+        if let Some(_) = next {
+            return Err(ChainError::ActionValidationError(format!(
                 "cannot delete permission '{}' because it has child permissions",
                 permission
             )));

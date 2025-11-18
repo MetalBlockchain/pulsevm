@@ -14,18 +14,18 @@ use super::authority::Authority;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Read, Write, NumBytes, Serialize)]
 pub struct Permission {
-    id: u64,
-    parent_id: u64,
+    pub id: u64,
+    pub parent: u64,
     pub owner: Name,
     pub name: Name,
     pub authority: Authority,
 }
 
 impl Permission {
-    pub fn new(id: u64, parent_id: u64, owner: Name, name: Name, authority: Authority) -> Self {
+    pub fn new(id: u64, parent: u64, owner: Name, name: Name, authority: Authority) -> Self {
         Permission {
             id,
-            parent_id,
+            parent,
             owner,
             name,
             authority,
@@ -34,10 +34,6 @@ impl Permission {
 
     pub fn id(&self) -> u64 {
         self.id
-    }
-
-    pub fn parent_id(&self) -> u64 {
-        self.parent_id
     }
 
     pub fn satisfies(
@@ -51,20 +47,20 @@ impl Permission {
         }
 
         // If this permission matches other, or is the immediate parent of other, then this permission satisfies other
-        if self.id == other.id || self.id == other.parent_id {
+        if self.id == other.id || self.id == other.parent {
             return Ok(true);
         }
 
         // Walk up other's parent tree, seeing if we find this permission. If so, this permission satisfies other
-        let mut parent = session.find::<Permission>(other.parent_id)?;
+        let mut parent = session.find::<Permission>(other.parent)?;
         while parent.is_some() {
             let parent_obj = parent.unwrap();
-            if self.id == parent_obj.parent_id {
+            if self.id == parent_obj.parent {
                 return Ok(true);
             } else if parent_obj.id == 0 {
                 return Ok(false);
             }
-            parent = session.find::<Permission>(parent_obj.parent_id)?;
+            parent = session.find::<Permission>(parent_obj.parent)?;
         }
 
         // This permission is not a parent of other, and so does not satisfy other
@@ -100,7 +96,7 @@ impl ChainbaseObject for Permission {
                 index_name: PermissionByOwnerIndex::index_name(),
             },
             SecondaryKey {
-                key: PermissionByParentIndex::secondary_key_as_bytes((self.parent_id, self.id)),
+                key: PermissionByParentIndex::secondary_key_as_bytes((self.parent, self.id)),
                 index_name: PermissionByParentIndex::index_name(),
             },
         ]
@@ -136,7 +132,7 @@ impl SecondaryIndex<Permission> for PermissionByParentIndex {
     type Object = Permission;
 
     fn secondary_key(object: &Permission) -> Vec<u8> {
-        PermissionByParentIndex::secondary_key_as_bytes((object.parent_id, object.id))
+        PermissionByParentIndex::secondary_key_as_bytes((object.parent, object.id))
     }
 
     fn secondary_key_as_bytes(key: Self::Key) -> Vec<u8> {

@@ -3,9 +3,13 @@ use std::fmt;
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 use serde::Serialize;
 
-use crate::chain::{
-    authority::WaitWeight,
-    config::{self, BillableSize, FIXED_OVERHEAD_SHARED_VECTOR_RAM_BYTES},
+use crate::{
+    authority::PermissionLevel,
+    chain::{
+        authority::WaitWeight,
+        config::{self, BillableSize, FIXED_OVERHEAD_SHARED_VECTOR_RAM_BYTES},
+    },
+    secp256k1::PublicKey,
 };
 
 use super::{key_weight::KeyWeight, permission_level_weight::PermissionLevelWeight};
@@ -40,6 +44,24 @@ impl Authority {
             keys,
             accounts,
             waits,
+        }
+    }
+
+    pub fn new_from_public_key(key: PublicKey) -> Self {
+        Authority {
+            threshold: 1,
+            keys: vec![KeyWeight::new(key, 1)],
+            accounts: vec![],
+            waits: vec![],
+        }
+    }
+
+    pub fn new_from_permission_level(pl: PermissionLevel) -> Self {
+        Authority {
+            threshold: 1,
+            keys: vec![],
+            accounts: vec![PermissionLevelWeight::new(pl, 1)],
+            waits: vec![],
         }
     }
 

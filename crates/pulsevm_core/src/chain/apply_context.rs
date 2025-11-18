@@ -181,8 +181,8 @@ impl ApplyContext {
         );
 
         for auth in self.action.clone().authorization().iter() {
-            let auth_sequence = self.next_auth_sequence(&mut auth.actor())?;
-            receipt.add_auth_sequence(auth.actor(), auth_sequence);
+            let auth_sequence = self.next_auth_sequence(&mut auth.actor.clone())?;
+            receipt.add_auth_sequence(auth.actor, auth_sequence);
         }
 
         self.finalize_trace(receipt)?;
@@ -218,7 +218,7 @@ impl ApplyContext {
     ) -> Result<(), ChainError> {
         for auth in self.action.authorization() {
             if let Some(perm) = permission {
-                if auth.actor() == account && auth.permission() == perm {
+                if auth.actor == account && auth.permission == perm {
                     return Ok(());
                 }
 
@@ -226,7 +226,7 @@ impl ApplyContext {
                     "missing authority of {}/{}",
                     account, perm
                 )));
-            } else if auth.actor() == account {
+            } else if auth.actor == account {
                 return Ok(());
             }
         }
@@ -255,7 +255,7 @@ impl ApplyContext {
 
     pub fn has_authorization(&self, account: Name) -> bool {
         for auth in self.action.authorization() {
-            if auth.actor() == account {
+            if auth.actor == account {
                 return true;
             }
         }
@@ -301,12 +301,12 @@ impl ApplyContext {
             let mut inherited_authorizations: HashSet<PermissionLevel> = HashSet::new();
 
             for auth in a.authorization() {
-                let actor = self.session.find::<Account>(auth.actor())?;
+                let actor = self.session.find::<Account>(auth.actor)?;
                 pulse_assert(
                     actor.is_some(),
                     ChainError::TransactionError(format!(
                         "inline action's authorizing actor {} does not exist",
-                        auth.actor()
+                        auth.actor
                     )),
                 )?;
                 pulse_assert(

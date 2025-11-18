@@ -6,6 +6,7 @@ use crate::chain::secp256k1::Signature;
 
 use super::public_key::PublicKey;
 
+#[derive(Debug, Clone)]
 pub struct PrivateKey(secp256k1::SecretKey);
 
 #[derive(Debug, Clone)]

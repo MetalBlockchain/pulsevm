@@ -21,21 +21,13 @@ use crate::chain::Name;
     Serialize,
 )]
 pub struct PermissionLevel {
-    actor: Name,
-    permission: Name,
+    pub actor: Name,
+    pub permission: Name,
 }
 
 impl PermissionLevel {
     pub fn new(actor: Name, permission: Name) -> Self {
         PermissionLevel { actor, permission }
-    }
-
-    pub fn actor(&self) -> Name {
-        self.actor
-    }
-
-    pub fn permission(&self) -> Name {
-        self.permission
     }
 }
 

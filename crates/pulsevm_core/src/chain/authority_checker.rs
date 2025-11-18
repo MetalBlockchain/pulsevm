@@ -110,8 +110,8 @@ impl<'a> AuthorityChecker<'a> {
         // not cached yet – fetch authority from DB
         let auth = session
             .find_by_secondary::<Permission, PermissionByOwnerIndex>((
-                permission.permission().actor(),
-                permission.permission().permission(),
+                permission.permission().actor,
+                permission.permission().permission,
             ))
             .map_err(|e| ChainError::AuthorizationError(format!("{}", e)))?;
 
