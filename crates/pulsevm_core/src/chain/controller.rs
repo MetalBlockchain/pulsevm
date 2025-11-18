@@ -1,7 +1,6 @@
 use core::fmt;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    mem,
     path::Path,
     sync::{Arc, LazyLock, RwLock},
 };
@@ -46,11 +45,11 @@ use crate::{
     utils::prepare_db_object,
 };
 
-use pulsevm_chainbase::{ChainbaseObject, Database, UndoSession};
+use pulsevm_chainbase::{Database, UndoSession};
 use pulsevm_crypto::{Digest, merkle};
 use pulsevm_serialization::{Read, Write};
 use spdlog::info;
-use tokio::sync::{RwLock as AsyncRwLock, broadcast};
+use tokio::sync::RwLock as AsyncRwLock;
 
 pub type ApplyHandlerFn = fn(&mut ApplyContext) -> Result<(), ChainError>;
 pub type ApplyHandlerMap = HashMap<
@@ -82,8 +81,6 @@ pub struct Controller {
 
     trace_log: Option<StateHistoryLog>,
     chain_state_log: Option<StateHistoryLog>,
-
-    on_accepted_block: broadcast::Sender<SignedBlock>,
 }
 
 #[derive(Debug)]
@@ -116,18 +113,13 @@ impl Controller {
 
             trace_log: None,
             chain_state_log: None,
-
-            on_accepted_block: broadcast::channel::<SignedBlock>(16).0,
         };
 
         controller
     }
 
-    pub fn initialize(
-        &mut self,
-        genesis_bytes: &Vec<u8>,
-        db_path: String,
-    ) -> Result<(), ChainError> {
+    pub fn initialize(&mut self, genesis_bytes: &Vec<u8>, db_path: &str) -> Result<(), ChainError> {
+        info!("initializing controller with DB path: {}", db_path);
         self.db = Database::new(Path::new(&db_path)).map_err(|e| {
             ChainError::InternalError(Some(format!("failed to open database: {}", e)))
         })?;
@@ -362,7 +354,7 @@ impl Controller {
         block: &SignedBlock,
         session: &mut UndoSession,
         mempool: &mut Mempool,
-    ) -> Result<(Vec<TransactionTrace>), ChainError> {
+    ) -> Result<Vec<TransactionTrace>, ChainError> {
         // Make sure we don't have the block already
         let existing_block = session
             .find::<SignedBlock>(block.block_num())
@@ -615,11 +607,11 @@ mod tests {
     use std::{env::temp_dir, fs, path::PathBuf, str::FromStr, vec};
 
     use chrono::Utc;
-    use pulsevm_crypto::Bytes;
     use pulsevm_proc_macros::{NumBytes, Read, Write};
-    use pulsevm_serialization::{VarUint32, Write};
+    use pulsevm_serialization::Write;
     use pulsevm_time::TimePointSec;
     use serde_json::json;
+    use tempfile::TempDir;
 
     use crate::chain::{
         asset::{Asset, Symbol},
@@ -637,29 +629,12 @@ mod tests {
         max_supply: Asset,
     }
 
-    impl Create {
-        pub fn new(issuer: Name, max_supply: Asset) -> Self {
-            Create { issuer, max_supply }
-        }
-    }
-
     #[derive(Debug, Clone, PartialEq, Eq, Hash, Read, Write, NumBytes)]
     struct Transfer {
         from: Name,
         to: Name,
         quantity: Asset,
         memo: String,
-    }
-
-    impl Transfer {
-        pub fn new(from: Name, to: Name, quantity: Asset, memo: String) -> Self {
-            Transfer {
-                from,
-                to,
-                quantity,
-                memo,
-            }
-        }
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Hash, Read, Write, NumBytes)]
@@ -669,15 +644,8 @@ mod tests {
         memo: String,
     }
 
-    impl Issue {
-        pub fn new(to: Name, quantity: Asset, memo: String) -> Self {
-            Issue { to, quantity, memo }
-        }
-    }
-
-    fn get_temp_dir() -> PathBuf {
-        let temp_dir_name = format!("db_{}.pulsevm", Utc::now().format("%Y%m%d%H%M%S"));
-        temp_dir().join(Path::new(&temp_dir_name))
+    fn get_temp_dir() -> TempDir {
+        tempfile::tempdir().expect("failed to create temp dir")
     }
 
     fn generate_genesis(private_key: &PrivateKey) -> Vec<u8> {
@@ -686,8 +654,21 @@ mod tests {
             "initial_timestamp": "2023-01-01T00:00:00Z",
             "initial_key": private_key.public_key().to_string(),
             "initial_configuration": {
+                "max_block_net_usage": 1048576,
+                "target_block_net_usage_pct": 1000,
+                "max_transaction_net_usage": 524288,
+                "base_per_transaction_net_usage": 12,
+                "net_usage_leeway": 500,
+                "context_free_discount_net_usage_num": 20,
+                "context_free_discount_net_usage_den": 100,
+                "max_block_cpu_usage": 200000,
+                "target_block_cpu_usage_pct": 2500,
+                "max_transaction_cpu_usage": 150000,
+                "min_transaction_cpu_usage": 100,
                 "max_inline_action_size": 4096,
-                "max_action_return_value_size": 256,
+                "max_inline_action_depth": 6,
+                "max_authority_depth": 6,
+                "max_action_return_value_size": 256
             }
         });
         genesis.to_string().into_bytes()
@@ -696,6 +677,7 @@ mod tests {
     fn create_account(
         private_key: &PrivateKey,
         account: Name,
+        chain_id: Id,
     ) -> Result<PackedTransaction, ChainError> {
         let trx = Transaction::new(
             TransactionHeader::new(TimePointSec::new(0), 0, 0, 0u32.into(), 0, 0u32.into()),
@@ -727,7 +709,7 @@ mod tests {
                 )],
             )],
         )
-        .sign(&private_key, &Id::default())?;
+        .sign(&private_key, &chain_id)?;
         let packed_trx = PackedTransaction::from_signed_transaction(trx)?;
         Ok(packed_trx)
     }
@@ -736,6 +718,7 @@ mod tests {
         private_key: &PrivateKey,
         account: Name,
         wasm_bytes: Vec<u8>,
+        chain_id: Id,
     ) -> Result<PackedTransaction, ChainError> {
         let trx = Transaction::new(
             TransactionHeader::new(TimePointSec::new(0), 0, 0, 0u32.into(), 0, 0u32.into()),
@@ -757,7 +740,7 @@ mod tests {
                 )],
             )],
         )
-        .sign(&private_key, &Id::default())?;
+        .sign(&private_key, &chain_id)?;
         let packed_trx = PackedTransaction::from_signed_transaction(trx)?;
         Ok(packed_trx)
     }
@@ -767,6 +750,7 @@ mod tests {
         account: Name,
         action: Name,
         action_data: &T,
+        chain_id: Id,
     ) -> Result<PackedTransaction, ChainError> {
         let trx = Transaction::new(
             TransactionHeader::new(TimePointSec::new(0), 0, 0, 0u32.into(), 0, 0u32.into()),
@@ -781,7 +765,7 @@ mod tests {
                 )],
             )],
         )
-        .sign(&private_key, &Id::default())?;
+        .sign(&private_key, &chain_id)?;
         let packed_trx = PackedTransaction::from_signed_transaction(trx)?;
         Ok(packed_trx)
     }
@@ -791,19 +775,20 @@ mod tests {
         let private_key = PrivateKey::random();
         let mut controller = Controller::new();
         let genesis_bytes = generate_genesis(&private_key);
-        let temp_path = get_temp_dir().to_str().unwrap().to_string();
-        controller.initialize(&genesis_bytes.to_vec(), temp_path)?;
-        assert_eq!(controller.last_accepted_block().block_num(), 0);
+        let temp_path = get_temp_dir();
+        controller.initialize(&genesis_bytes.to_vec(), temp_path.path().to_str().unwrap())?;
+        assert_eq!(controller.last_accepted_block().block_num(), 1);
         let pending_block_timestamp = controller.last_accepted_block().timestamp();
         let mut undo_session = controller.create_undo_session()?;
+        let chain_id = controller.chain_id();
         controller.execute_transaction(
             &mut undo_session,
-            &create_account(&private_key, Name::from_str("glenn")?)?,
+            &create_account(&private_key, Name::from_str("glenn")?, chain_id)?,
             &pending_block_timestamp,
         )?;
         controller.execute_transaction(
             &mut undo_session,
-            &create_account(&private_key, Name::from_str("marshall")?)?,
+            &create_account(&private_key, Name::from_str("marshall")?, chain_id)?,
             &pending_block_timestamp,
         )?;
 
@@ -816,7 +801,12 @@ mod tests {
             fs::read(root.join(Path::new("reference_contracts/pulse_token.wasm"))).unwrap();
         controller.execute_transaction(
             &mut undo_session,
-            &set_code(&private_key, Name::from_str("glenn")?, pulse_token_contract)?,
+            &set_code(
+                &private_key,
+                Name::from_str("glenn")?,
+                pulse_token_contract,
+                chain_id,
+            )?,
             &pending_block_timestamp,
         )?;
 
@@ -830,6 +820,7 @@ mod tests {
                     issuer: Name::from_str("glenn")?,
                     max_supply: Asset::new(1000000, Symbol(1162826500)),
                 },
+                chain_id,
             )?,
             &pending_block_timestamp,
         )?;
@@ -848,6 +839,7 @@ mod tests {
                     },
                     memo: "Initial transfer".to_string(),
                 },
+                chain_id,
             )?,
             &pending_block_timestamp,
         )?;
@@ -867,6 +859,7 @@ mod tests {
                     },
                     memo: "Initial transfer".to_string(),
                 },
+                chain_id,
             )?,
             &pending_block_timestamp,
         )?;
@@ -879,13 +872,14 @@ mod tests {
         let private_key = PrivateKey::random();
         let mut controller = Controller::new();
         let genesis_bytes = generate_genesis(&private_key);
-        let temp_path = get_temp_dir().to_str().unwrap().to_string();
-        controller.initialize(&genesis_bytes.to_vec(), temp_path)?;
+        let temp_path = get_temp_dir();
+        controller.initialize(&genesis_bytes.to_vec(), temp_path.path().to_str().unwrap())?;
         let pending_block_timestamp = controller.last_accepted_block().timestamp();
         let mut undo_session = controller.create_undo_session()?;
+        let chain_id = controller.chain_id();
         controller.execute_transaction(
             &mut undo_session,
-            &create_account(&private_key, Name::from_str("glenn")?)?,
+            &create_account(&private_key, Name::from_str("glenn")?, chain_id)?,
             &pending_block_timestamp,
         )?;
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -897,7 +891,7 @@ mod tests {
             fs::read(root.join(Path::new("reference_contracts/test_api_db.wasm"))).unwrap();
         controller.execute_transaction(
             &mut undo_session,
-            &set_code(&private_key, Name::from_str("glenn")?, contract)?,
+            &set_code(&private_key, Name::from_str("glenn")?, contract, chain_id)?,
             &pending_block_timestamp,
         )?;
 
@@ -908,6 +902,7 @@ mod tests {
                 Name::from_str("glenn")?,
                 Name::from_str("pg")?,
                 &Vec::<u8>::new(),
+                chain_id,
             )?,
             &pending_block_timestamp,
         )?;
@@ -918,6 +913,7 @@ mod tests {
                 Name::from_str("glenn")?,
                 Name::from_str("pl")?,
                 &Vec::<u8>::new(),
+                chain_id,
             )?,
             &pending_block_timestamp,
         )?;
@@ -928,6 +924,7 @@ mod tests {
                 Name::from_str("glenn")?,
                 Name::from_str("pu")?,
                 &Vec::<u8>::new(),
+                chain_id,
             )?,
             &pending_block_timestamp,
         )?;

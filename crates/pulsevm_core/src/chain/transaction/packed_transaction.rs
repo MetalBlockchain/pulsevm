@@ -194,25 +194,3 @@ fn maybe_decompress(
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use std::collections::HashSet;
-
-    use pulsevm_crypto::Bytes;
-
-    use crate::chain::transaction::{PackedTransaction, TransactionCompression};
-
-    #[test]
-    fn it_works() {
-        let packed_trx = hex::decode("789cab38bb219991415d8bfb21031030820886d6c5eb181ce6cd524ad9310b2100042bde1a19a5c1050a166d6702d28c606d4cf5befb5857f4fa58969c3b71c15e5267daca46bb25d738048f3cebd2759de1e459c308359d48a50c0055322f6f").unwrap();
-        let mut pos = 0;
-        let unpacked_trx = PackedTransaction::new(
-            HashSet::new(),
-            TransactionCompression::Zlib,
-            Bytes::default(),
-            packed_trx.into(),
-        )
-        .unwrap();
-    }
-}

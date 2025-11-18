@@ -31,7 +31,7 @@ fn main() {
     let genesis_bytes = generate_genesis(&private_key);
     let temp_path = get_temp_dir().to_str().unwrap().to_string();
     controller
-        .initialize(&genesis_bytes.to_vec(), temp_path)
+        .initialize(&genesis_bytes.to_vec(), temp_path.as_str())
         .unwrap();
 
     let pending_block_timestamp = controller.last_accepted_block().timestamp();

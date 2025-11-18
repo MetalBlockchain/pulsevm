@@ -120,7 +120,7 @@ mod tests {
 
     #[test]
     fn test_name_from_str() {
-        let name = Name::from_str("test").unwrap();
-        assert_eq!(name.as_u64(), 0x7465737400000000);
+        let name = Name::from_str("eosio").unwrap();
+        assert_eq!(name.as_u64(), 6138663577826885632);
     }
 }

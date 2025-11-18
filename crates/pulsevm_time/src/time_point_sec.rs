@@ -16,7 +16,7 @@ const EOS_FMT_NOZ: &[time::format_description::FormatItem<'_>] =
 const EOS_FMT_Z: &[time::format_description::FormatItem<'_>] =
     format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]Z");
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Read, Write, NumBytes)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Read, Write, NumBytes, Default)]
 pub struct TimePointSec {
     utc_seconds: u32,
 }

@@ -12,10 +12,10 @@ use super::{key_weight::KeyWeight, permission_level_weight::PermissionLevelWeigh
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Read, Write, NumBytes, Serialize)]
 pub struct Authority {
-    threshold: u32,
-    keys: Vec<KeyWeight>,
-    accounts: Vec<PermissionLevelWeight>,
-    waits: Vec<WaitWeight>,
+    pub threshold: u32,
+    pub keys: Vec<KeyWeight>,
+    pub accounts: Vec<PermissionLevelWeight>,
+    pub waits: Vec<WaitWeight>,
 }
 
 impl fmt::Display for Authority {

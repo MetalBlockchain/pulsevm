@@ -5,7 +5,21 @@ use serde::Serialize;
 
 use crate::chain::Name;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Read, Write, NumBytes, Serialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    Read,
+    Write,
+    NumBytes,
+    Serialize,
+)]
 pub struct PermissionLevel {
     actor: Name,
     permission: Name,

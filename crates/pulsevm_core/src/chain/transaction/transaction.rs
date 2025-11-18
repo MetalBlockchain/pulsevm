@@ -15,7 +15,7 @@ use crate::chain::{
 
 use super::action::Action;
 
-#[derive(Debug, Clone, PartialEq, Eq, Read, Write, NumBytes, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Read, Write, NumBytes, Hash, Default)]
 pub struct Transaction {
     pub header: TransactionHeader,
     pub context_free_actions: Vec<Action>, // Context-free actions, if any

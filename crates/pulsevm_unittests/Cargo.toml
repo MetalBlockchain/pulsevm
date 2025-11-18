@@ -1,0 +1,19 @@
+[package]
+name = "pulsevm_unittests"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.98"
+pulsevm_core = { path = "../pulsevm_core" }
+pulsevm_crypto = { path = "../pulsevm_crypto" }
+pulsevm_grpc = { path = "../pulsevm_grpc" }
+pulsevm_chainbase = { path = "../pulsevm_chainbase" }
+pulsevm_name = { path = "../pulsevm_name" }
+pulsevm_proc_macros = { path = "../pulsevm_proc_macros" }
+pulsevm_serialization = { path = "../pulsevm_serialization" }
+pulsevm_time = { path = "../pulsevm_time" }
+
+[dev-dependencies]
+serde_json = "1.0"
+tempfile = "3.23.0"

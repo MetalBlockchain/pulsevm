@@ -236,8 +236,10 @@ pub fn setabi(context: &mut ApplyContext) -> Result<(), ChainError> {
     let mut account = session
         .get::<Account>(act.account)
         .map_err(|_| ChainError::TransactionError(format!("failed to find account")))?;
-    let abi_def: AbiDefinition = serde_json::from_str(std::str::from_utf8(act.abi.as_slice()).unwrap())
-        .map_err(|e| ChainError::InvalidArgument(format!("failed to deserialize ABI: {}", e)))?;
+    let abi_def: AbiDefinition =
+        serde_json::from_str(std::str::from_utf8(act.abi.as_slice()).unwrap()).map_err(|e| {
+            ChainError::InvalidArgument(format!("failed to deserialize ABI: {}", e))
+        })?;
     let abi_def_packed = abi_def
         .pack()
         .map_err(|e| ChainError::TransactionError(format!("failed to serialize ABI: {}", e)))?;

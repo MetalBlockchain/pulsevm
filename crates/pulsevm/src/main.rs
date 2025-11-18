@@ -191,7 +191,7 @@ impl Vm for VirtualMachine {
 
         // Initialize the controller with the genesis bytes
         controller
-            .initialize(&genesis_bytes, db_path)
+            .initialize(&genesis_bytes, db_path.as_str())
             .map_err(|e| Status::internal(format!("could not initialize controller: {}", e)))?;
 
         let network_manager = Arc::clone(&self.network_manager);

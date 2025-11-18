@@ -3,7 +3,7 @@ use pulsevm_serialization::VarUint32;
 use pulsevm_time::TimePointSec;
 use serde::Serialize;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Read, Write, NumBytes, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Read, Write, NumBytes, Serialize, Default)]
 pub struct TransactionHeader {
     pub expiration: TimePointSec,
     pub ref_block_num: u16,

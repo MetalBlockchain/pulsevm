@@ -7,8 +7,8 @@ use super::permission_level::PermissionLevel;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Read, Write, NumBytes, Serialize)]
 pub struct PermissionLevelWeight {
-    permission: PermissionLevel,
-    weight: u16,
+    pub permission: PermissionLevel,
+    pub weight: u16,
 }
 
 impl PermissionLevelWeight {

@@ -5,7 +5,19 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.100"
+feoxdb = "0.5.0"
 fjall = { version = "2.11.2", features = ["lz4", "ssi_tx"], default-features = false }
 pulsevm_serialization = { path = "../pulsevm_serialization" }
 pulsevm_proc_macros = { path = "../pulsevm_proc_macros" }
 jsonrpsee = { version = "0.24.9", features = ["server", "macros"] }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "fjall"
+harness = false
+
+[[bench]]
+name = "feoxdb"
+harness = false

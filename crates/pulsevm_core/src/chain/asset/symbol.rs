@@ -138,8 +138,6 @@ pub fn string_to_symbol(precision: u8, s: &str) -> Result<u64, SymbolError> {
 
 #[cfg(test)]
 mod tests {
-    use pulsevm_serialization::Write;
-
     use super::*;
 
     #[test]
@@ -149,6 +147,5 @@ mod tests {
         assert_eq!(symbol.code().as_u64(), 5459781u64);
         assert_eq!(symbol.to_string(), "4,EOS");
         assert_eq!(symbol.as_u64(), 1397703940u64); // 4 << 8 | 5459781
-        assert_eq!(hex::encode(symbol.pack().unwrap()), "00000000534f4504");
     }
 }

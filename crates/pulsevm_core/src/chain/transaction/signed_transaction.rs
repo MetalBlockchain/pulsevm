@@ -13,7 +13,7 @@ use crate::chain::{
     transaction::transaction::Transaction,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, Read, Write, NumBytes, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Read, Write, NumBytes, Serialize, Default)]
 pub struct SignedTransaction {
     transaction: Transaction,
     signatures: HashSet<Signature>,

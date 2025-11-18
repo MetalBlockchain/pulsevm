@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 chrono = "0.4.40"
+dhat = "0.3.3"
 serde_json = "1.0"
 spdlog-rs = "0.4"
 
@@ -12,3 +13,6 @@ pulsevm_core = { path = "../pulsevm_core" }
 pulsevm_proc_macros = { path = "../pulsevm_proc_macros" }
 pulsevm_serialization = { path = "../pulsevm_serialization" }
 pulsevm_time = { path = "../pulsevm_time" }
+
+[features]
+dhat-heap = []

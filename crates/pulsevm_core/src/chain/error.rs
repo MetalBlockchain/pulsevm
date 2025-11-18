@@ -1,55 +1,37 @@
 use std::{error::Error, fmt};
 
 use pulsevm_chainbase::ChainbaseError;
+use thiserror::Error;
 
 use super::Name;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ChainError {
+    #[error("data store disconnected")]
     InternalError(Option<String>),
+    #[error("genesis error: {0}")]
     GenesisError(String),
+    #[error("parse error: {0}")]
     ParseError(String),
+    #[error("authorization error: {0}")]
     AuthorizationError(String),
+    #[error("permission not found: {0}@{1}")]
     PermissionNotFound(Name, Name),
+    #[error("signature recover error: {0}")]
     SignatureRecoverError(String),
+    #[error("transaction error: {0}")]
     TransactionError(String),
+    #[error("network error: {0}")]
     NetworkError(String),
+    #[error("wasm runtime error: {0}")]
     WasmRuntimeError(String),
+    #[error("database error: {0}")]
     DatabaseError(String),
+    #[error("invalid argument: {0}")]
     InvalidArgument(String),
+    #[error("serialization error: {0}")]
     SerializationError(String),
 }
-
-impl fmt::Display for ChainError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ChainError::InternalError(msg) => {
-                if let Some(m) = msg {
-                    write!(f, "internal error: {}", m)
-                } else {
-                    write!(f, "internal error")
-                }
-            }
-            ChainError::GenesisError(msg) => write!(f, "genesis error: {}", msg),
-            ChainError::ParseError(msg) => write!(f, "parse error: {}", msg),
-            ChainError::AuthorizationError(msg) => write!(f, "authorization error: {}", msg),
-            ChainError::PermissionNotFound(actor, permission) => {
-                write!(f, "permission not found: {}@{}", actor, permission)
-            }
-            ChainError::SignatureRecoverError(msg) => {
-                write!(f, "signature recover error: {}", msg)
-            }
-            ChainError::TransactionError(msg) => write!(f, "transaction error: {}", msg),
-            ChainError::NetworkError(msg) => write!(f, "network error: {}", msg),
-            ChainError::WasmRuntimeError(msg) => write!(f, "wasm runtime error: {}", msg),
-            ChainError::DatabaseError(msg) => write!(f, "database error: {}", msg),
-            ChainError::InvalidArgument(msg) => write!(f, "invalid argument: {}", msg),
-            ChainError::SerializationError(msg) => write!(f, "serialization error: {}", msg),
-        }
-    }
-}
-
-impl Error for ChainError {}
 
 impl From<pulsevm_serialization::ReadError> for ChainError {
     fn from(_: pulsevm_serialization::ReadError) -> Self {
