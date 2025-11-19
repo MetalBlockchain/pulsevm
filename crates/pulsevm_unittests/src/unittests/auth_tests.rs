@@ -537,4 +537,29 @@ mod auth_tests {
         )?;
         Ok(())
     }
+
+    #[test]
+    fn test_link_then_update_auth() -> Result<()> {
+        let mut chain = Testing::new();
+        chain.create_account(name!("alice").into(), PULSE_NAME, false, true)?;
+
+        let first_priv_key = get_private_key(name!("alice").into(), "first");
+        let first_pub_key = first_priv_key.public_key();
+        let second_priv_key = get_private_key(name!("alice").into(), "second");
+        let second_pub_key = second_priv_key.public_key();
+
+        chain.set_authority2(name!("alice").into(), name!("first").into(), Authority::new_from_public_key(first_pub_key), ACTIVE_NAME)?;
+        chain.link_authority(name!("alice").into(), PULSE_NAME, name!("first").into(), name!("reqauth").into())?;
+        chain.push_reqauth2(name!("alice").into(), vec![PermissionLevel::new(name!("alice").into(), name!("first").into())], vec![first_priv_key.clone()])?;
+
+        // Update "first" auth public key
+        chain.set_authority2(name!("alice").into(), name!("first").into(), Authority::new_from_public_key(second_pub_key), ACTIVE_NAME)?;
+        // Authority updated, using previous "first" auth should fail on linked auth
+        assert_eq!(chain.push_reqauth2(name!("alice").into(), vec![PermissionLevel::new(name!("alice").into(), name!("first").into())], vec![first_priv_key.clone()]).err(), Some(ChainError::AuthorizationError(
+            "transaction declares authority 'alice@first' but does not have signatures for it".into()
+        )));
+        // Using updated authority, should succeed
+        chain.push_reqauth2(name!("alice").into(), vec![PermissionLevel::new(name!("alice").into(), name!("first").into())], vec![second_priv_key.clone()])?;
+        Ok(())
+    }
 }
