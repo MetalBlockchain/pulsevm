@@ -5,9 +5,12 @@ use pulsevm_proc_macros::{NumBytes, Read, Write};
 use pulsevm_serialization::Write;
 use serde::Serialize;
 
-use crate::chain::{
-    Name,
-    config::{self, BillableSize, OVERHEAD_PER_ROW_PER_INDEX_RAM_BYTES},
+use crate::{
+    chain::{
+        Name,
+        config::{self, BillableSize, OVERHEAD_PER_ROW_PER_INDEX_RAM_BYTES},
+    },
+    error::ChainError,
 };
 
 use super::authority::Authority;
@@ -40,7 +43,7 @@ impl Permission {
         &self,
         other: &Permission,
         session: &mut UndoSession,
-    ) -> Result<bool, Box<dyn std::error::Error>> {
+    ) -> Result<bool, ChainError> {
         // If the owners are not the same, this permission cannot satisfy other
         if self.owner != other.owner {
             return Ok(false);
@@ -53,9 +56,9 @@ impl Permission {
 
         // Walk up other's parent tree, seeing if we find this permission. If so, this permission satisfies other
         let mut parent = session.find::<Permission>(other.parent)?;
-        while parent.is_some() {
-            let parent_obj = parent.unwrap();
-            if self.id == parent_obj.parent {
+
+        while let Some(parent_obj) = parent {
+            if self.id == parent_obj.id {
                 return Ok(true);
             } else if parent_obj.id == 0 {
                 return Ok(false);

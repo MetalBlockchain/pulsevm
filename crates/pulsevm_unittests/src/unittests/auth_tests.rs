@@ -2,9 +2,14 @@
 mod auth_tests {
     use anyhow::Result;
     use pulsevm_core::{
+        ACTIVE_NAME, OWNER_NAME, PULSE_NAME,
         authority::{
             Authority, Permission, PermissionByOwnerIndex, PermissionLevel, PermissionLevelWeight,
-        }, authorization_manager::AuthorizationManager, error::ChainError, name::{self, Name}, secp256k1::PublicKey, ACTIVE_NAME, OWNER_NAME, PULSE_NAME
+        },
+        authorization_manager::AuthorizationManager,
+        error::ChainError,
+        name::{self, Name},
+        secp256k1::PublicKey,
     };
     use pulsevm_proc_macros::name;
 
@@ -276,11 +281,12 @@ mod auth_tests {
         );
 
         // Remove spending auth
-        chain.delete_authority(name!("alice").into(), name!("spending").into(), vec![
-            PermissionLevel::new(name!("alice").into(), ACTIVE_NAME)
-        ], vec![
-            new_active_priv_key.clone()
-        ])?;
+        chain.delete_authority(
+            name!("alice").into(),
+            name!("spending").into(),
+            vec![PermissionLevel::new(name!("alice").into(), ACTIVE_NAME)],
+            vec![new_active_priv_key.clone()],
+        )?;
         let obj = undo_session.find_by_secondary::<Permission, PermissionByOwnerIndex>((
             name!("alice").into(),
             name!("spending").into(),
@@ -303,7 +309,10 @@ mod auth_tests {
             name!("spending").into(),
             Authority::new_from_public_key(spending_pub_key.clone()),
             name!("trading").into(),
-            vec![PermissionLevel::new(name!("alice").into(), name!("trading").into())],
+            vec![PermissionLevel::new(
+                name!("alice").into(),
+                name!("trading").into(),
+            )],
             vec![trading_priv_key.clone()],
         )?;
 
@@ -330,44 +339,66 @@ mod auth_tests {
         assert!(parent.name == ACTIVE_NAME);
 
         // Delete trading, should fail since it has children (spending)
-        assert_eq!(chain.delete_authority(name!("alice").into(), name!("trading").into(), vec![
-            PermissionLevel::new(name!("alice").into(), ACTIVE_NAME)
-        ], vec![
-            new_active_priv_key.clone()
-        ]).err(), Some(ChainError::ActionValidationError(
-            "cannot delete permission 'alice@trading' because it has child permissions".into()
-        )));
+        assert_eq!(
+            chain
+                .delete_authority(
+                    name!("alice").into(),
+                    name!("trading").into(),
+                    vec![PermissionLevel::new(name!("alice").into(), ACTIVE_NAME)],
+                    vec![new_active_priv_key.clone()]
+                )
+                .err(),
+            Some(ChainError::ActionValidationError(
+                "cannot delete permission 'alice@trading' because it has child permissions".into()
+            ))
+        );
 
         // Update trading parent to be spending, should fail since changing parent authority is not supported
-        assert_eq!(chain.set_authority(
-            name!("alice").into(),
-            name!("trading").into(),
-            Authority::new_from_public_key(trading_pub_key.clone()),
-            name!("spending").into(),
-            vec![PermissionLevel::new(name!("alice").into(), name!("trading").into())],
-            vec![trading_priv_key.clone()],
-        ).err(), Some(ChainError::ActionValidationError(
-            "changing parent authority is not currently supported".into()
-        )));
+        assert_eq!(
+            chain
+                .set_authority(
+                    name!("alice").into(),
+                    name!("trading").into(),
+                    Authority::new_from_public_key(trading_pub_key.clone()),
+                    name!("spending").into(),
+                    vec![PermissionLevel::new(
+                        name!("alice").into(),
+                        name!("trading").into()
+                    )],
+                    vec![trading_priv_key.clone()],
+                )
+                .err(),
+            Some(ChainError::ActionValidationError(
+                "changing parent authority is not currently supported".into()
+            ))
+        );
 
-        chain.delete_authority(name!("alice").into(), name!("spending").into(), vec![
-            PermissionLevel::new(name!("alice").into(), ACTIVE_NAME)
-        ], vec![
-            new_active_priv_key.clone()
-        ])?;
-        assert_eq!(undo_session.find_by_secondary::<Permission, PermissionByOwnerIndex>((
+        chain.delete_authority(
             name!("alice").into(),
             name!("spending").into(),
-        ))?, None);
-        chain.delete_authority(name!("alice").into(), name!("trading").into(), vec![
-            PermissionLevel::new(name!("alice").into(), ACTIVE_NAME)
-        ], vec![
-            new_active_priv_key.clone()
-        ])?;
-        assert_eq!(undo_session.find_by_secondary::<Permission, PermissionByOwnerIndex>((
+            vec![PermissionLevel::new(name!("alice").into(), ACTIVE_NAME)],
+            vec![new_active_priv_key.clone()],
+        )?;
+        assert_eq!(
+            undo_session.find_by_secondary::<Permission, PermissionByOwnerIndex>((
+                name!("alice").into(),
+                name!("spending").into(),
+            ))?,
+            None
+        );
+        chain.delete_authority(
             name!("alice").into(),
             name!("trading").into(),
-        ))?, None);
+            vec![PermissionLevel::new(name!("alice").into(), ACTIVE_NAME)],
+            vec![new_active_priv_key.clone()],
+        )?;
+        assert_eq!(
+            undo_session.find_by_secondary::<Permission, PermissionByOwnerIndex>((
+                name!("alice").into(),
+                name!("trading").into(),
+            ))?,
+            None
+        );
         Ok(())
     }
 
@@ -400,6 +431,110 @@ mod auth_tests {
         assert!(obj.authority.accounts.len() == 0);
         assert!(obj.authority.keys[0].key().clone() == new_owner_pub_key);
         assert!(obj.authority.keys[0].weight() == 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_link_auths() -> Result<()> {
+        let mut chain = Testing::new();
+        chain.create_accounts(
+            vec![name!("alice").into(), name!("bob").into()],
+            false,
+            true,
+        )?;
+
+        let spending_priv_key = get_private_key(name!("alice").into(), "spending");
+        let spending_pub_key = spending_priv_key.public_key();
+        let scud_priv_key = get_private_key(name!("alice").into(), "scud");
+        let scud_pub_key = scud_priv_key.public_key();
+
+        chain.set_authority2(
+            name!("alice").into(),
+            name!("spending").into(),
+            Authority::new_from_public_key(spending_pub_key),
+            ACTIVE_NAME,
+        )?;
+        chain.set_authority2(
+            name!("alice").into(),
+            name!("scud").into(),
+            Authority::new_from_public_key(scud_pub_key),
+            name!("spending").into(),
+        )?;
+
+        // Send req auth action with alice's spending key, it should fail
+        assert_eq!(chain.push_reqauth2(name!("alice").into(), vec![PermissionLevel::new(name!("alice").into(), name!("spending").into())], vec![spending_priv_key.clone()]).err(), Some(ChainError::IrrelevantAuth(
+            "action declares irrelevant authority 'alice@spending'; minimum authority is alice@active".into()
+        )));
+        // Link authority for pulse reqauth action with alice's spending key
+        chain.link_authority(
+            name!("alice").into(),
+            name!("pulse").into(),
+            name!("spending").into(),
+            name!("reqauth").into(),
+        )?;
+        // Now, req auth action with alice's spending key should succeed
+        chain.push_reqauth2(
+            name!("alice").into(),
+            vec![PermissionLevel::new(
+                name!("alice").into(),
+                name!("spending").into(),
+            )],
+            vec![spending_priv_key.clone()],
+        )?;
+        // Relink the same auth should fail
+        assert_eq!(
+            chain
+                .link_authority(
+                    name!("alice").into(),
+                    name!("pulse").into(),
+                    name!("spending").into(),
+                    name!("reqauth").into()
+                )
+                .err(),
+            Some(ChainError::ActionValidationError(
+                "attempting to update required authority, but new requirement is same as old"
+                    .into()
+            ))
+        );
+        // Unlink alice with pulse reqauth
+        chain.unlink_authority(
+            name!("alice").into(),
+            name!("pulse").into(),
+            name!("reqauth").into(),
+        )?;
+        // Now, req auth action with alice's spending key should fail
+        assert_eq!(chain.push_reqauth2(name!("alice").into(), vec![PermissionLevel::new(name!("alice").into(), name!("spending").into())], vec![spending_priv_key.clone()]).err(), Some(ChainError::IrrelevantAuth(
+            "action declares irrelevant authority 'alice@spending'; minimum authority is alice@active".into()
+        )));
+        // Send req auth action with scud key, it should fail
+        assert_eq!(chain.push_reqauth2(name!("alice").into(), vec![PermissionLevel::new(name!("alice").into(), name!("scud").into())], vec![scud_priv_key.clone()]).err(), Some(ChainError::IrrelevantAuth(
+            "action declares irrelevant authority 'alice@scud'; minimum authority is alice@active".into()
+        )));
+        // Link authority for any pulse action with alice's scud key
+        chain.link_authority(
+            name!("alice").into(),
+            name!("pulse").into(),
+            name!("scud").into(),
+            Name::default(),
+        )?;
+        // Now, req auth action with alice's scud key should succeed
+        chain.push_reqauth2(
+            name!("alice").into(),
+            vec![PermissionLevel::new(
+                name!("alice").into(),
+                name!("scud").into(),
+            )],
+            vec![scud_priv_key.clone()],
+        )?;
+        // req auth action with alice's spending key should also be fine, since it is the parent of alice's scud key
+        chain.push_reqauth2(
+            name!("alice").into(),
+            vec![PermissionLevel::new(
+                name!("alice").into(),
+                name!("spending").into(),
+            )],
+            vec![spending_priv_key.clone()],
+        )?;
         Ok(())
     }
 }

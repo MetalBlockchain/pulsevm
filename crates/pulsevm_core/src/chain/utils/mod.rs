@@ -10,6 +10,7 @@ pub use usage_accumulator::*;
 
 use crate::error::ChainError;
 
+#[inline]
 pub fn pulse_assert<T>(condition: bool, error: T) -> Result<(), T> {
     if condition {
         Ok(())

@@ -3,18 +3,21 @@ mod unittests;
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, fs, path::Path, sync::Arc};
+    use std::{collections::HashSet, fs, path::Path, sync::Arc, vec};
 
     use pulsevm_chainbase::UndoSession;
     use pulsevm_core::{
         ACTIVE_NAME, CODE_NAME, OWNER_NAME, PULSE_NAME,
         authority::{Authority, KeyWeight, PermissionLevel, PermissionLevelWeight},
         block::BlockTimestamp,
-        config::{DELETEAUTH_NAME, NEWACCOUNT_NAME, SETCODE_NAME, UPDATEAUTH_NAME},
+        config::{
+            DELETEAUTH_NAME, LINKAUTH_NAME, NEWACCOUNT_NAME, SETCODE_NAME, UNLINKAUTH_NAME,
+            UPDATEAUTH_NAME,
+        },
         controller::Controller,
         error::ChainError,
         name::{self, Name},
-        pulse_contract::{DeleteAuth, NewAccount, SetCode, UpdateAuth},
+        pulse_contract::{DeleteAuth, LinkAuth, NewAccount, SetCode, UnlinkAuth, UpdateAuth},
         secp256k1::{PrivateKey, PublicKey},
         transaction::{
             Action, PackedTransaction, SignedTransaction, Transaction, TransactionTrace,
@@ -371,6 +374,66 @@ mod tests {
             let auths = vec![PermissionLevel::new(account, OWNER_NAME)];
             let keys = vec![get_private_key(account, "owner")];
             self.delete_authority(account, permission, auths, keys)
+        }
+
+        pub fn link_authority(
+            &mut self,
+            account: Name,
+            code: Name,
+            requirement: Name,
+            message_type: Name,
+        ) -> Result<(), ChainError> {
+            let mut trx = Transaction::default();
+            trx.actions.push(Action::new(
+                PULSE_NAME,
+                LINKAUTH_NAME,
+                LinkAuth {
+                    account,
+                    code,
+                    message_type,
+                    requirement,
+                }
+                .pack()
+                .unwrap(),
+                vec![PermissionLevel::new(account, ACTIVE_NAME)],
+            ));
+            self.set_transaction_headers(&mut trx, 6, 0);
+
+            let signed = trx.sign(
+                &get_private_key(account, "active"),
+                &self.controller.chain_id(),
+            )?;
+            self.push_transaction(signed)?;
+            Ok(())
+        }
+
+        pub fn unlink_authority(
+            &mut self,
+            account: Name,
+            code: Name,
+            message_type: Name,
+        ) -> Result<(), ChainError> {
+            let mut trx = Transaction::default();
+            trx.actions.push(Action::new(
+                PULSE_NAME,
+                UNLINKAUTH_NAME,
+                UnlinkAuth {
+                    account,
+                    code,
+                    message_type,
+                }
+                .pack()
+                .unwrap(),
+                vec![PermissionLevel::new(account, ACTIVE_NAME)],
+            ));
+            self.set_transaction_headers(&mut trx, 6, 0);
+
+            let signed = trx.sign(
+                &get_private_key(account, "active"),
+                &self.controller.chain_id(),
+            )?;
+            self.push_transaction(signed)?;
+            Ok(())
         }
     }
 

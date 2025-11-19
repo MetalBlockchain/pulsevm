@@ -457,7 +457,7 @@ pub fn linkauth(context: &mut ApplyContext) -> Result<(), ChainError> {
     if let Some(mut link) = link {
         pulse_assert(
             link.required_permission() != requirement.requirement,
-            ChainError::TransactionError(format!(
+            ChainError::ActionValidationError(format!(
                 "attempting to update required authority, but new requirement is same as old"
             )),
         )?;
