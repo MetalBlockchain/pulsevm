@@ -2,13 +2,9 @@
 mod auth_tests {
     use anyhow::Result;
     use pulsevm_core::{
-        ACTIVE_NAME, OWNER_NAME, PULSE_NAME,
         authority::{
             Authority, Permission, PermissionByOwnerIndex, PermissionLevel, PermissionLevelWeight,
-        },
-        authorization_manager::AuthorizationManager,
-        error::ChainError,
-        name::{self, Name},
+        }, authorization_manager::AuthorizationManager, error::ChainError, name::{self, Name}, secp256k1::PublicKey, ACTIVE_NAME, OWNER_NAME, PULSE_NAME
     };
     use pulsevm_proc_macros::name;
 
@@ -372,6 +368,38 @@ mod auth_tests {
             name!("alice").into(),
             name!("trading").into(),
         ))?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn test_update_auth_unknown_private_key() -> Result<()> {
+        let mut chain = Testing::new();
+        chain.create_account(name!("alice").into(), PULSE_NAME, false, true)?;
+        // public key with no corresponding private key
+        let new_owner_pub_key = PublicKey::default();
+        chain.set_authority2(
+            name!("alice").into(),
+            OWNER_NAME,
+            Authority::new_from_public_key(new_owner_pub_key.clone()),
+            Name::default(),
+        )?;
+        // Ensure the permission is updated
+        let pending_block_state = chain.get_pending_block_state();
+        let mut undo_session = pending_block_state.undo_session.clone();
+        let obj = undo_session.find_by_secondary::<Permission, PermissionByOwnerIndex>((
+            name!("alice").into(),
+            OWNER_NAME,
+        ))?;
+        assert!(obj.is_some());
+        let obj = obj.unwrap();
+        assert!(obj.owner == name!("alice"));
+        assert!(obj.name == OWNER_NAME);
+        assert!(obj.parent == 0);
+        assert!(obj.authority.threshold == 1);
+        assert!(obj.authority.keys.len() == 1);
+        assert!(obj.authority.accounts.len() == 0);
+        assert!(obj.authority.keys[0].key().clone() == new_owner_pub_key);
+        assert!(obj.authority.keys[0].weight() == 1);
         Ok(())
     }
 }
