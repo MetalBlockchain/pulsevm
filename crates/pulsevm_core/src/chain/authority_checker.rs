@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use pulsevm_chainbase::UndoSession;
+use pulsevm_chainbase::{Session, UndoSession};
 
 use crate::chain::secp256k1::PublicKey;
 

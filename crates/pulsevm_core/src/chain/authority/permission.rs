@@ -1,6 +1,6 @@
 use core::fmt;
 
-use pulsevm_chainbase::{ChainbaseObject, SecondaryIndex, SecondaryKey, UndoSession};
+use pulsevm_chainbase::{ChainbaseObject, SecondaryIndex, SecondaryKey, Session, UndoSession};
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 use pulsevm_serialization::Write;
 use serde::Serialize;

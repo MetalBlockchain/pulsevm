@@ -1,6 +1,6 @@
 pub mod abi;
 pub mod account;
-mod apply_context;
+pub mod apply_context;
 pub mod asset;
 pub mod authority;
 pub mod authority_checker;
@@ -21,9 +21,9 @@ pub mod secp256k1;
 pub mod state_history;
 pub mod table;
 pub mod transaction;
-mod transaction_context;
+pub mod transaction_context;
 pub mod utils;
-mod wasm_runtime;
+pub mod wasm_runtime;
 mod webassembly;
 
 use crate::chain::name::Name;

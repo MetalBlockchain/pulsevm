@@ -1,56 +1,36 @@
+mod error;
+pub use error::ChainbaseError;
+
 mod index;
 mod ro_index;
 
 mod session;
-use jsonrpsee::types::ErrorObjectOwned;
-pub use session::Session;
+use heed::{Env, EnvOpenOptions, types::Bytes};
+pub use session::ReadOnlySession;
 
 mod undo_session;
 pub use undo_session::UndoSession;
 
-use fjall::{Config, PartitionCreateOptions, TransactionalKeyspace, TransactionalPartitionHandle};
 use pulsevm_serialization::{Read, Write};
-use std::{error::Error, fmt, path::Path};
+use std::{
+    collections::HashMap,
+    fs,
+    path::Path,
+    sync::{Arc, RwLock},
+};
 
-#[derive(Debug, Clone)]
-pub enum ChainbaseError {
-    NotFound,
-    AlreadyExists,
-    InvalidData,
-    ReadError,
-    InternalError(String),
-}
-
-impl fmt::Display for ChainbaseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ChainbaseError::NotFound => write!(f, "item not found"),
-            ChainbaseError::AlreadyExists => write!(f, "item already exists"),
-            ChainbaseError::InvalidData => write!(f, "invalid data provided"),
-            ChainbaseError::ReadError => write!(f, "error reading data"),
-            ChainbaseError::InternalError(msg) => write!(f, "internal error: {}", msg),
-        }
-    }
-}
-
-impl Error for ChainbaseError {}
-
-impl From<ChainbaseError> for ErrorObjectOwned {
-    fn from(e: ChainbaseError) -> Self {
-        match e {
-            ChainbaseError::NotFound => ErrorObjectOwned::owned::<&str>(404, "not_found", None),
-            ChainbaseError::AlreadyExists => {
-                ErrorObjectOwned::owned::<&str>(409, "already_exists", None)
-            }
-            ChainbaseError::InvalidData => {
-                ErrorObjectOwned::owned::<&str>(400, "invalid_data", None)
-            }
-            ChainbaseError::ReadError => ErrorObjectOwned::owned::<&str>(500, "read_error", None),
-            ChainbaseError::InternalError(msg) => {
-                ErrorObjectOwned::owned::<&str>(500, "internal_error", Some(&msg))
-            }
-        }
-    }
+pub trait Session {
+    fn exists<T: ChainbaseObject>(&mut self, key: T::PrimaryKey) -> Result<bool, ChainbaseError>;
+    fn find<T: ChainbaseObject>(&self, key: T::PrimaryKey) -> Result<Option<T>, ChainbaseError>;
+    fn find_by_secondary<T: ChainbaseObject, S: SecondaryIndex<T>>(
+        &self,
+        key: S::Key,
+    ) -> Result<Option<T>, ChainbaseError>;
+    fn get<T: ChainbaseObject>(&self, key: T::PrimaryKey) -> Result<T, ChainbaseError>;
+    fn get_by_secondary<T: ChainbaseObject, S: SecondaryIndex<T>>(
+        &self,
+        key: S::Key,
+    ) -> Result<T, ChainbaseError>;
 }
 
 pub trait ChainbaseObject: Default + Read + Write {
@@ -83,69 +63,87 @@ where
     fn index_name() -> &'static str;
 }
 
-#[derive(Clone)]
 pub struct Database {
-    keyspace: TransactionalKeyspace,
-    partition_create_options: PartitionCreateOptions,
+    environment: Arc<Env>,
+    databases: Arc<RwLock<HashMap<&'static str, heed::Database<Bytes, Bytes>>>>,
 }
 
 impl Database {
     #[must_use]
     #[inline]
-    pub fn new(path: &Path) -> Result<Self, fjall::Error> {
+    pub fn new(path: &Path) -> Result<Self, ChainbaseError> {
+        fs::create_dir_all(path).map_err(|e| {
+            ChainbaseError::InternalError(format!("failed to create database directory: {}", e))
+        })?;
+        let environment = unsafe {
+            EnvOpenOptions::new()
+                .max_dbs(40)
+                .map_size(1024 * 1024 * 100) // TODO: validate this value
+                .open(path)
+                .map_err(|e| {
+                    ChainbaseError::InternalError(format!("failed to open LMDB environment: {}", e))
+                })?
+        };
+
         Ok(Self {
-            keyspace: Config::new(path).open_transactional()?,
-            partition_create_options: PartitionCreateOptions::default(),
+            environment: Arc::new(environment),
+            databases: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
-    #[inline]
-    pub fn temporary(path: &Path) -> Result<Self, fjall::Error> {
-        let config = Config::new(path).temporary(true);
-        let keyspace = config.open_transactional()?;
-        Ok(Self {
-            keyspace,
-            partition_create_options: PartitionCreateOptions::default(),
-        })
+    pub fn open_database(
+        &self,
+        name: &'static str,
+    ) -> Result<heed::Database<Bytes, Bytes>, ChainbaseError> {
+        let mut dbs = self
+            .databases
+            .write()
+            .map_err(|_| ChainbaseError::InternalError("failed to read databases map".into()))?;
+        match self.environment.write_txn() {
+            Ok(mut tx) => {
+                let db = self
+                    .environment
+                    .create_database::<Bytes, Bytes>(&mut tx, Some(name))
+                    .map_err(|e| {
+                        ChainbaseError::InternalError(format!(
+                            "failed to open database '{}': {}",
+                            name, e
+                        ))
+                    })?;
+                tx.commit().map_err(|e| {
+                    ChainbaseError::InternalError(format!(
+                        "failed to commit database open transaction: {}",
+                        e
+                    ))
+                })?;
+                dbs.insert(name, db.clone());
+                Ok(db)
+            }
+            Err(_) => Err(ChainbaseError::InternalError(
+                "failed to open undo session".into(),
+            )),
+        }
     }
 
     #[inline]
-    pub fn session(&self) -> Result<Session, ChainbaseError> {
-        Session::new(&self.keyspace)
+    pub fn session(&self) -> Result<ReadOnlySession, ChainbaseError> {
+        match self.environment.read_txn() {
+            Ok(tx) => ReadOnlySession::new(tx, self.databases.clone()),
+            Err(_) => Err(ChainbaseError::InternalError(
+                "failed to open undo session".into(),
+            )),
+        }
     }
 
     #[inline]
     pub fn undo_session(&self) -> Result<UndoSession, ChainbaseError> {
-        UndoSession::new(&self.keyspace, self.partition_create_options.clone())
+        match self.environment.write_txn() {
+            Ok(tx) => UndoSession::new(self.databases.clone(), tx),
+            Err(_) => Err(ChainbaseError::InternalError(
+                "failed to open undo session".into(),
+            )),
+        }
     }
-
-    #[inline]
-    pub fn open_partition_handle(
-        &self,
-        table_name: &str,
-    ) -> Result<TransactionalPartitionHandle, ChainbaseError> {
-        open_partition(
-            &self.keyspace,
-            table_name,
-            self.partition_create_options.clone(),
-        )
-    }
-}
-
-#[inline]
-fn open_partition(
-    keyspace: &TransactionalKeyspace,
-    table_name: &str,
-    partition_create_options: PartitionCreateOptions,
-) -> Result<TransactionalPartitionHandle, ChainbaseError> {
-    keyspace
-        .open_partition(table_name, partition_create_options)
-        .map_err(|_| {
-            ChainbaseError::InternalError(format!(
-                "failed to open partition for table: {}",
-                table_name
-            ))
-        })
 }
 
 mod tests {
@@ -201,7 +199,7 @@ mod tests {
     #[test]
     fn test_database() {
         let path = Path::new("test_db");
-        let db = Database::temporary(&path).expect("failed to create database");
+        let db = Database::new(&path).expect("failed to create database");
         let mut session = db.undo_session().expect("failed to create session");
 
         let obj = TestObject {

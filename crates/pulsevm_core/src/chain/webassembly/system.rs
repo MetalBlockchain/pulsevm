@@ -16,11 +16,9 @@ pub fn pulse_assert()
             memory.read(&caller, msg as usize, &mut src_bytes)?;
             let c_str = String::from_utf8(src_bytes);
 
-            if c_str.is_ok() {
-                let msg_str = c_str.unwrap();
-                bail!("pulse assert failed: {}", msg_str);
-            } else {
-                bail!("pulse assert failed: condition is not zero");
+            match c_str {
+                Ok(msg_str) => bail!("pulse assert failed: {}", msg_str),
+                Err(_) => bail!("pulse assert failed: condition is not zero"),
             }
         }
 
@@ -29,10 +27,10 @@ pub fn pulse_assert()
 }
 
 pub fn current_time() -> impl Fn(Caller<'_, WasmContext>) -> Result<u64, wasmtime::Error> {
-    |mut caller| {
-        let context = caller.data_mut().apply_context();
-        let result = context
-            .pending_block_timestamp()
+    |caller| {
+        let result = caller
+            .data()
+            .pending_block_time()
             .to_time_point()
             .time_since_epoch()
             .count();

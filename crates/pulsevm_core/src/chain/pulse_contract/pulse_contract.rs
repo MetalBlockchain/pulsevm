@@ -1,4 +1,4 @@
-use pulsevm_chainbase::UndoSession;
+use pulsevm_chainbase::{Session, UndoSession};
 use pulsevm_serialization::Write;
 use sha2::Digest;
 
@@ -24,7 +24,7 @@ use crate::{
     },
 };
 
-pub fn newaccount(context: &mut ApplyContext) -> Result<(), ChainError> {
+pub fn newaccount(context: &mut ApplyContext, session: &mut UndoSession) -> Result<(), ChainError> {
     let create = context
         .get_action()
         .data_as::<NewAccount>()
@@ -49,7 +49,6 @@ pub fn newaccount(context: &mut ApplyContext) -> Result<(), ChainError> {
     )?;
 
     // Check if the creator is privileged
-    let mut session = context.undo_session();
     let creator = session
         .get::<AccountMetadata>(create.creator)
         .map_err(|_| ChainError::TransactionError(format!("failed to find creator account")))?;
@@ -82,37 +81,32 @@ pub fn newaccount(context: &mut ApplyContext) -> Result<(), ChainError> {
         .insert(&AccountMetadata::new(create.name, false))
         .map_err(|_| ChainError::TransactionError(format!("failed to insert account metadata")))?;
 
-    validate_authority_precondition(&mut session, &create.owner)?;
-    validate_authority_precondition(&mut session, &create.active)?;
+    validate_authority_precondition(session, &create.owner)?;
+    validate_authority_precondition(session, &create.active)?;
 
-    let owner_permission = AuthorizationManager::create_permission(
-        &mut session,
-        create.name,
-        OWNER_NAME,
-        0,
-        create.owner,
-    )?;
+    let owner_permission =
+        AuthorizationManager::create_permission(session, create.name, OWNER_NAME, 0, create.owner)?;
     let active_permission = AuthorizationManager::create_permission(
-        &mut session,
+        session,
         create.name,
         ACTIVE_NAME,
         owner_permission.id(),
         create.active,
     )?;
 
-    ResourceLimitsManager::initialize_account(&mut session, create.name)?;
+    ResourceLimitsManager::initialize_account(session, create.name)?;
 
     let mut ram_delta: i64 = config::OVERHEAD_PER_ACCOUNT_RAM_BYTES as i64;
     ram_delta += 2 * config::billable_size_v::<Permission>() as i64;
     ram_delta += owner_permission.authority.get_billable_size() as i64;
     ram_delta += active_permission.authority.get_billable_size() as i64;
 
-    context.add_ram_usage(create.name, ram_delta);
+    context.add_ram_usage(create.name, ram_delta)?;
 
     Ok(())
 }
 
-pub fn setcode(context: &mut ApplyContext) -> Result<(), ChainError> {
+pub fn setcode(context: &mut ApplyContext, session: &mut UndoSession) -> Result<(), ChainError> {
     let act = context
         .get_action()
         .data_as::<SetCode>()
@@ -137,7 +131,6 @@ pub fn setcode(context: &mut ApplyContext) -> Result<(), ChainError> {
         // TODO: validate wasm
     }
 
-    let mut session = context.undo_session();
     let mut account = session
         .get::<AccountMetadata>(act.account)
         .map_err(|_| ChainError::TransactionError(format!("failed to find account")))?;
@@ -219,14 +212,13 @@ pub fn setcode(context: &mut ApplyContext) -> Result<(), ChainError> {
         .map_err(|_| ChainError::TransactionError(format!("failed to update account")))?;
 
     if new_size != old_size {
-        context.add_ram_usage(act.account, new_size - old_size);
+        context.add_ram_usage(act.account, new_size - old_size)?;
     }
 
     Ok(())
 }
 
-pub fn setabi(context: &mut ApplyContext) -> Result<(), ChainError> {
-    let mut session = context.undo_session();
+pub fn setabi(context: &mut ApplyContext, session: &mut UndoSession) -> Result<(), ChainError> {
     let act = context
         .get_action()
         .data_as::<SetAbi>()
@@ -264,13 +256,13 @@ pub fn setabi(context: &mut ApplyContext) -> Result<(), ChainError> {
         .map_err(|_| ChainError::TransactionError(format!("failed to update account metadata")))?;
 
     if new_size != old_size {
-        context.add_ram_usage(act.account, new_size - old_size);
+        context.add_ram_usage(act.account, new_size - old_size)?;
     }
 
     Ok(())
 }
 
-pub fn updateauth(context: &mut ApplyContext) -> Result<(), ChainError> {
+pub fn updateauth(context: &mut ApplyContext, session: &mut UndoSession) -> Result<(), ChainError> {
     let update = context
         .get_action()
         .data_as::<UpdateAuth>()
@@ -291,8 +283,6 @@ pub fn updateauth(context: &mut ApplyContext) -> Result<(), ChainError> {
         update.permission != update.parent,
         ChainError::ActionValidationError(format!("cannot set an authority as its own parent")),
     )?;
-
-    let mut session = context.undo_session();
 
     session.get::<Account>(update.account).map_err(|_| {
         ChainError::TransactionError(format!("failed to find account {}", update.account))
@@ -322,17 +312,17 @@ pub fn updateauth(context: &mut ApplyContext) -> Result<(), ChainError> {
         )?;
     }
 
-    validate_authority_precondition(&mut session, &update.auth)?;
+    validate_authority_precondition(session, &update.auth)?;
 
     let permission = AuthorizationManager::find_permission(
-        &mut session,
+        session,
         &PermissionLevel::new(update.account, update.permission),
     )?;
 
     let mut parent_id = 0u64;
     if update.permission != OWNER_NAME {
         let parent = AuthorizationManager::get_permission(
-            &mut session,
+            session,
             &PermissionLevel::new(update.account, update.parent),
         )?;
         parent_id = parent.id();
@@ -349,14 +339,14 @@ pub fn updateauth(context: &mut ApplyContext) -> Result<(), ChainError> {
 
         let old_size: i64 = config::billable_size_v::<Permission>() as i64
             + permission.authority.get_billable_size() as i64;
-        AuthorizationManager::modify_permission(&mut session, &mut permission, &update.auth)?;
+        AuthorizationManager::modify_permission(session, &mut permission, &update.auth)?;
         let new_size: i64 = config::billable_size_v::<Permission>() as i64
             + permission.authority.get_billable_size() as i64;
 
-        context.add_ram_usage(permission.owner, new_size - old_size);
+        context.add_ram_usage(permission.owner, new_size - old_size)?;
     } else {
         let p = AuthorizationManager::create_permission(
-            &mut session,
+            session,
             update.account,
             update.permission,
             parent_id,
@@ -366,13 +356,13 @@ pub fn updateauth(context: &mut ApplyContext) -> Result<(), ChainError> {
         let new_size: i64 =
             config::billable_size_v::<Permission>() as i64 + p.authority.get_billable_size() as i64;
 
-        context.add_ram_usage(update.account, new_size);
+        context.add_ram_usage(update.account, new_size)?;
     }
 
     Ok(())
 }
 
-pub fn deleteauth(context: &mut ApplyContext) -> Result<(), ChainError> {
+pub fn deleteauth(context: &mut ApplyContext, session: &mut UndoSession) -> Result<(), ChainError> {
     let remove = context
         .get_action()
         .data_as::<DeleteAuth>()
@@ -388,7 +378,6 @@ pub fn deleteauth(context: &mut ApplyContext) -> Result<(), ChainError> {
         ChainError::ActionValidationError(format!("cannot delete owner authority")),
     )?;
 
-    let mut session = context.undo_session();
     let mut index = session.get_index::<PermissionLink, PermissionLinkByPermissionNameIndex>();
     let mut range = index.lower_bound((remove.account, remove.permission))?;
     let obj = range.next()?;
@@ -401,20 +390,20 @@ pub fn deleteauth(context: &mut ApplyContext) -> Result<(), ChainError> {
     }
 
     let permission = AuthorizationManager::get_permission(
-        &mut session,
+        session,
         &PermissionLevel::new(remove.account, remove.permission),
     )?;
     let old_size = config::billable_size_v::<Permission>() as i64
         + permission.authority.get_billable_size() as i64;
 
-    AuthorizationManager::remove_permission(&mut session, &permission)?;
+    AuthorizationManager::remove_permission(session, &permission)?;
 
-    context.add_ram_usage(remove.account, -old_size);
+    context.add_ram_usage(remove.account, -old_size)?;
 
     Ok(())
 }
 
-pub fn linkauth(context: &mut ApplyContext) -> Result<(), ChainError> {
+pub fn linkauth(context: &mut ApplyContext, session: &mut UndoSession) -> Result<(), ChainError> {
     let requirement = context
         .get_action()
         .data_as::<LinkAuth>()
@@ -424,7 +413,6 @@ pub fn linkauth(context: &mut ApplyContext) -> Result<(), ChainError> {
         ChainError::TransactionError(format!("required permission cannot be empty")),
     )?;
     context.require_authorization(requirement.account, None)?;
-    let mut session = context.undo_session();
     let _ = session.get::<Account>(requirement.account).map_err(|_| {
         ChainError::TransactionError(format!("failed to find account {}", requirement.account))
     })?;
@@ -478,13 +466,13 @@ pub fn linkauth(context: &mut ApplyContext) -> Result<(), ChainError> {
         context.add_ram_usage(
             new_link.account(),
             config::billable_size_v::<PermissionLink>() as i64,
-        );
+        )?;
     }
 
     Ok(())
 }
 
-pub fn unlinkauth(context: &mut ApplyContext) -> Result<(), ChainError> {
+pub fn unlinkauth(context: &mut ApplyContext, session: &mut UndoSession) -> Result<(), ChainError> {
     let unlink = context
         .get_action()
         .data_as::<UnlinkAuth>()
@@ -492,7 +480,6 @@ pub fn unlinkauth(context: &mut ApplyContext) -> Result<(), ChainError> {
     context.require_authorization(unlink.account, None)?;
 
     let link_key = (unlink.account, unlink.code, unlink.message_type);
-    let mut session = context.undo_session();
     let link =
         session.find_by_secondary::<PermissionLink, PermissionLinkByActionNameIndex>(link_key)?;
 
@@ -501,7 +488,7 @@ pub fn unlinkauth(context: &mut ApplyContext) -> Result<(), ChainError> {
         context.add_ram_usage(
             unlink.account,
             -(config::billable_size_v::<PermissionLink>() as i64),
-        );
+        )?;
     } else {
         return Err(ChainError::TransactionError(format!(
             "attempting to unlink authority, but no link found"

@@ -237,7 +237,6 @@ mod tests {
 
     use pulsevm_crypto::Bytes;
     use pulsevm_serialization::{Read, Write};
-    use secp256k1::hashes::hex::parse;
     use sha2::Digest;
 
     use crate::chain::{

@@ -28,7 +28,7 @@ impl BlockTimer {
         let mut block_timer = self.block_timer.write().await;
 
         if block_timer.is_none() {
-            *block_timer = Some(build_block_timer(self.clone()));
+            *block_timer = Some(build_block_timer(self.clone()).await);
         }
     }
 
@@ -55,7 +55,7 @@ impl BlockTimer {
     }
 }
 
-fn build_block_timer(timer: BlockTimer) -> JoinHandle<()> {
+async fn build_block_timer(timer: BlockTimer) -> JoinHandle<()> {
     return tokio::spawn(async move {
         let mut ticker = interval(Duration::from_millis(500));
         loop {

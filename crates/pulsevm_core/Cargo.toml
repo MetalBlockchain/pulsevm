@@ -35,7 +35,3 @@ pulsevm_time = { path = "../pulsevm_time" }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
-
-[[bench]]
-name = "test"
-harness = false

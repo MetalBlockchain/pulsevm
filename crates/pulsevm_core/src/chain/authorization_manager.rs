@@ -23,7 +23,7 @@ use super::{
     authority_checker::AuthorityChecker,
     error::ChainError,
 };
-use pulsevm_chainbase::UndoSession;
+use pulsevm_chainbase::{Session, UndoSession};
 
 pub struct AuthorizationManager;
 

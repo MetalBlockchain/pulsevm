@@ -43,15 +43,16 @@ use crate::{
     resource::{ResourceLimits, ResourceLimitsConfig, ResourceLimitsState, ResourceUsage},
     table::{KeyValue, Table},
     utils::prepare_db_object,
+    wasm_runtime,
 };
 
-use pulsevm_chainbase::{Database, UndoSession};
+use pulsevm_chainbase::{Database, ReadOnlySession, Session, UndoSession};
 use pulsevm_crypto::{Digest, merkle};
 use pulsevm_serialization::{Read, Write};
 use spdlog::info;
 use tokio::sync::RwLock as AsyncRwLock;
 
-pub type ApplyHandlerFn = fn(&mut ApplyContext) -> Result<(), ChainError>;
+pub type ApplyHandlerFn = fn(&mut ApplyContext, &mut UndoSession) -> Result<(), ChainError>;
 pub type ApplyHandlerMap = HashMap<
     (Name, Name, Name), // (receiver, contract, action)
     ApplyHandlerFn,
@@ -70,12 +71,12 @@ pub static APPLY_HANDLERS: LazyLock<ApplyHandlerMap> = LazyLock::new(|| {
 });
 
 pub struct Controller {
-    wasm_runtime: Arc<RwLock<WasmRuntime>>,
+    wasm_runtime: WasmRuntime,
     config: Arc<ChainConfig>,
 
     last_accepted_block: SignedBlock,
     preferred_id: Id,
-    db: Database,
+    db: Option<Database>,
     verified_blocks: HashMap<Id, SignedBlock>,
     chain_id: Id,
 
@@ -99,15 +100,14 @@ impl fmt::Display for ControllerError {
 impl Controller {
     pub fn new() -> Self {
         // Create a temporary database
-        let db = Database::temporary(Path::new("temp")).unwrap();
         let wasm_runtime = WasmRuntime::new().unwrap();
         let controller = Controller {
-            wasm_runtime: Arc::new(RwLock::new(wasm_runtime)), // TODO: Handle error properly
+            wasm_runtime,
             config: Arc::new(ChainConfig::default()),
 
             last_accepted_block: SignedBlock::default(),
             preferred_id: Id::default(),
-            db: db,
+            db: None,
             verified_blocks: HashMap::new(),
             chain_id: Id::default(),
 
@@ -120,9 +120,9 @@ impl Controller {
 
     pub fn initialize(&mut self, genesis_bytes: &Vec<u8>, db_path: &str) -> Result<(), ChainError> {
         info!("initializing controller with DB path: {}", db_path);
-        self.db = Database::new(Path::new(&db_path)).map_err(|e| {
+        self.db = Some(Database::new(Path::new(&db_path)).map_err(|e| {
             ChainError::InternalError(Some(format!("failed to open database: {}", e)))
-        })?;
+        })?);
         // Parse genesis bytes
         let genesis = Genesis::parse(genesis_bytes)
             .map_err(|e| ChainError::ParseError(format!("failed to parse genesis: {}", e)))?
@@ -144,34 +144,32 @@ impl Controller {
             Digest::default(),
         );
 
-        let session = self.db.session()?;
+        // Prep partition handles for faster access
+        if let Some((db)) = &self.db {
+            prepare_db_object::<Account>(db)?;
+            prepare_db_object::<AccountMetadata>(db)?;
+            prepare_db_object::<SignedBlock>(db)?;
+            prepare_db_object::<CodeObject>(db)?;
+            prepare_db_object::<DynamicGlobalPropertyObject>(db)?;
+            prepare_db_object::<GlobalPropertyObject>(db)?;
+            prepare_db_object::<Permission>(db)?;
+            prepare_db_object::<PermissionLink>(db)?;
+            prepare_db_object::<ResourceUsage>(db)?;
+            prepare_db_object::<ResourceLimits>(db)?;
+            prepare_db_object::<ResourceLimitsConfig>(db)?;
+            prepare_db_object::<ResourceLimitsState>(db)?;
+            prepare_db_object::<Table>(db)?;
+            prepare_db_object::<KeyValue>(db)?;
+        }
+
+        let mut session = self.create_undo_session()?;
 
         // Do we have the genesis block in our DB?
         let genesis_block = session.find::<SignedBlock>(1).map_err(|e| {
             ChainError::GenesisError(format!("failed to find genesis block: {}", e))
         })?;
 
-        // Prep partition handles for faster access
-        prepare_db_object::<Account>(&self.db)?;
-        prepare_db_object::<AccountMetadata>(&self.db)?;
-        prepare_db_object::<SignedBlock>(&self.db)?;
-        prepare_db_object::<CodeObject>(&self.db)?;
-        prepare_db_object::<DynamicGlobalPropertyObject>(&self.db)?;
-        prepare_db_object::<GlobalPropertyObject>(&self.db)?;
-        prepare_db_object::<Permission>(&self.db)?;
-        prepare_db_object::<PermissionLink>(&self.db)?;
-        prepare_db_object::<ResourceUsage>(&self.db)?;
-        prepare_db_object::<ResourceLimits>(&self.db)?;
-        prepare_db_object::<ResourceLimitsConfig>(&self.db)?;
-        prepare_db_object::<ResourceLimitsState>(&self.db)?;
-        prepare_db_object::<Table>(&self.db)?;
-        prepare_db_object::<KeyValue>(&self.db)?;
-
         if genesis_block.is_none() {
-            // If not, insert it
-            let mut session = self.db.undo_session().map_err(|e| {
-                ChainError::GenesisError(format!("failed to create undo session: {}", e))
-            })?;
             session.insert(&self.last_accepted_block).map_err(|e| {
                 ChainError::GenesisError(format!("failed to insert genesis block: {}", e))
             })?;
@@ -245,114 +243,131 @@ impl Controller {
         Ok(())
     }
 
-    pub async fn build_block(&mut self, mempool: &mut Mempool) -> Result<SignedBlock, ChainError> {
-        let mut undo_session = self.db.undo_session()?;
-        let mut transaction_receipts: VecDeque<TransactionReceipt> = VecDeque::new();
-        let timestamp = BlockTimestamp::now();
+    pub fn create_read_session(&self) -> Result<ReadOnlySession<'_>, ChainError> {
+        if let Some(db) = &self.db {
+            return db.session().map_err(|e| {
+                ChainError::TransactionError(format!("failed to create read session: {}", e))
+            });
+        } else {
+            return Err(ChainError::InternalError(Some(
+                "database not initialized".into(),
+            )));
+        }
+    }
 
-        // Get transactions from the mempool
-        loop {
-            if let Some(transaction) = mempool.pop_transaction() {
+    pub fn create_undo_session(&self) -> Result<UndoSession<'_>, ChainError> {
+        if let Some(db) = &self.db {
+            return db.undo_session().map_err(|e| {
+                ChainError::TransactionError(format!("failed to create undo session: {}", e))
+            });
+        } else {
+            return Err(ChainError::InternalError(Some(
+                "database not initialized".into(),
+            )));
+        }
+    }
+
+    pub fn build_block(&mut self, mempool: &mut Mempool) -> Result<SignedBlock, ChainError> {
+        let block = {
+            let mut transaction_receipts: VecDeque<TransactionReceipt> = VecDeque::new();
+            let timestamp = BlockTimestamp::now();
+            let mut undo_session = self.create_undo_session()?;
+
+            // Get transactions from the mempool
+            while let Some(transaction) = mempool.pop_transaction() {
                 let transaction_result =
                     self.execute_transaction(&mut undo_session, &transaction, &timestamp)?;
                 let receipt =
                     TransactionReceipt::new(transaction_result.trace.receipt, transaction);
 
-                // Add the transaction to the block
                 transaction_receipts.push_back(receipt);
-            } else {
-                break;
-            };
-        }
+            }
 
-        // Don't build a block if we have no transactions
-        if transaction_receipts.len() == 0 {
-            return Err(ChainError::NetworkError(format!(
-                "built block has no transactions"
-            )));
-        }
+            // Don't build a block if we have no transactions
+            if transaction_receipts.is_empty() {
+                return Err(ChainError::NetworkError(
+                    "built block has no transactions".into(),
+                ));
+            }
 
-        // Create a new block
-        let transaction_mroot = self.calculate_trx_merkle(&transaction_receipts)?;
-        let block = SignedBlock::new(
-            self.preferred_id,
-            timestamp,
-            transaction_receipts,
-            transaction_mroot,
-        );
+            // Create a new block
+            let transaction_mroot = self.calculate_trx_merkle(&transaction_receipts)?;
+            let block = SignedBlock::new(
+                self.preferred_id,
+                timestamp,
+                transaction_receipts,
+                transaction_mroot,
+            );
+            block
+        };
 
-        // We built this block so no need to verify it again
+        // Now it's safe to borrow &mut self again
         self.verified_blocks.insert(
-            block.signed_block_header.block.calculate_id().unwrap(),
+            block.signed_block_header.block.calculate_id()?,
             block.clone(),
         );
 
         Ok(block)
     }
 
-    pub async fn verify_block(
+    pub fn verify_block(
         &mut self,
         block: &SignedBlock,
-        mempool: Arc<AsyncRwLock<Mempool>>,
+        mempool: &mut Mempool,
     ) -> Result<(), ChainError> {
         if self.verified_blocks.contains_key(&block.id()) {
             return Ok(());
         }
 
         // Verify the block
-        let mut session = self.db.undo_session()?;
-        let mut mempool = mempool.write().await;
-        self.execute_block(block, &mut session, &mut mempool)
-            .await?;
+        {
+            let mut session = self.create_undo_session()?;
+            self.execute_block(block, &mut session, mempool)?;
+        }
+
         self.verified_blocks.insert(block.id(), block.clone());
 
         Ok(())
     }
 
-    pub async fn accept_block(
-        &mut self,
-        block_id: &Id,
-        mempool: Arc<AsyncRwLock<Mempool>>,
-    ) -> Result<(), ChainError> {
+    pub fn accept_block(&mut self, block_id: &Id, mempool: &mut Mempool) -> Result<(), ChainError> {
         let block = {
-            self.verified_blocks
-                .get(block_id)
-                .cloned()
-                .ok_or(ChainError::NetworkError(format!(
-                    "block with id {} not verified",
-                    block_id
-                )))?
+            let block = {
+                self.verified_blocks
+                    .get(block_id)
+                    .cloned()
+                    .ok_or(ChainError::NetworkError(format!(
+                        "block with id {} not verified",
+                        block_id
+                    )))?
+            };
+            let mut session = self.create_undo_session()?;
+            let transaction_traces = self.execute_block(&block, &mut session, mempool)?;
+            let packed_transaction_traces = transaction_traces.pack().map_err(|e| {
+                ChainError::TransactionError(format!(
+                    "failed to pack transaction traces for block {}: {}",
+                    block_id, e
+                ))
+            })?;
+            self.trace_log
+                .as_ref()
+                .map(|log| log.append(block_id.clone(), packed_transaction_traces.as_slice()));
+            self.chain_state_log
+                .as_ref()
+                .map(|log| log.append(block_id.clone(), block.id().as_bytes()));
+            session.commit()?;
+            block
         };
-        let mut session = self.db.undo_session()?;
-        let mut mempool = mempool.write().await;
-        let transaction_traces = self
-            .execute_block(&block, &mut session, &mut mempool)
-            .await?;
-        let packed_transaction_traces = transaction_traces.pack().map_err(|e| {
-            ChainError::TransactionError(format!(
-                "failed to pack transaction traces for block {}: {}",
-                block_id, e
-            ))
-        })?;
-        self.trace_log
-            .as_ref()
-            .map(|log| log.append(block_id.clone(), packed_transaction_traces.as_slice()));
-        self.chain_state_log
-            .as_ref()
-            .map(|log| log.append(block_id.clone(), block.id().as_bytes()));
-        session
-            .commit()
-            .map_err(|e| ChainError::TransactionError(format!("failed to commit block: {}", e)))?;
         self.verified_blocks.remove(block_id);
         self.last_accepted_block = block;
 
         Ok(())
     }
 
-    pub async fn execute_block(
-        &mut self,
+    pub fn execute_block(
+        &self,
         block: &SignedBlock,
-        session: &mut UndoSession,
+        session: &mut UndoSession<'_>,
         mempool: &mut Mempool,
     ) -> Result<Vec<TransactionTrace>, ChainError> {
         // Make sure we don't have the block already
@@ -423,12 +438,11 @@ impl Controller {
     // This function will execute a transaction and roll it back instantly
     // This is useful for checking if a transaction is valid
     pub fn push_transaction(
-        &mut self,
+        &self,
         transaction: &PackedTransaction,
         pending_block_timestamp: &BlockTimestamp,
     ) -> Result<TransactionResult, ChainError> {
-        let db = &self.db;
-        let mut undo_session = db.undo_session()?;
+        let mut undo_session: UndoSession<'_> = self.create_undo_session()?;
         let result =
             self.execute_transaction(&mut undo_session, transaction, pending_block_timestamp);
 
@@ -438,12 +452,13 @@ impl Controller {
     // This function will execute a transaction and commit it to the database
     // This is useful for applying a transaction to the blockchain
     pub fn execute_transaction(
-        &mut self,
-        undo_session: &mut UndoSession,
+        &self,
+        undo_session: &mut UndoSession<'_>,
         packed_transaction: &PackedTransaction,
         pending_block_timestamp: &BlockTimestamp,
     ) -> Result<TransactionResult, ChainError> {
         let signed_transaction = packed_transaction.get_signed_transaction();
+        let mut wasm_runtime = self.wasm_runtime.clone();
 
         {
             // Verify authority
@@ -458,9 +473,7 @@ impl Controller {
         }
 
         let mut trx_context = TransactionContext::new(
-            undo_session.clone(),
             self.config.clone(),
-            self.wasm_runtime.clone(),
             self.last_accepted_block().block_num() + 1,
             pending_block_timestamp.clone(),
             packed_transaction.id(),
@@ -472,8 +485,8 @@ impl Controller {
             packed_transaction.get_unprunable_size()?,
             packed_transaction.get_prunable_size()?,
         )?;
-        trx_context.exec(trx)?;
-        let result = trx_context.finalize()?;
+        trx_context.exec(undo_session, &mut wasm_runtime, &trx)?;
+        let result = trx_context.finalize(undo_session)?;
 
         Ok(result)
     }
@@ -488,7 +501,8 @@ impl Controller {
         }
 
         // Query DB
-        let block = self.db.session()?.find::<SignedBlock>(height)?;
+        let session = self.create_undo_session()?; // TODO: Should be read only
+        let block = session.find::<SignedBlock>(height)?;
 
         Ok(block)
     }
@@ -500,8 +514,8 @@ impl Controller {
     }
 
     pub fn get_block(&self, id: Id) -> Result<Option<SignedBlock>, ChainError> {
-        self.db
-            .session()?
+        let session = self.create_undo_session()?; // TODO: Should be read only
+        session
             .find::<SignedBlock>(BlockHeader::num_from_id(&id))
             .map_err(|e| ChainError::TransactionError(format!("failed to find block: {}", e)))
     }
@@ -524,26 +538,17 @@ impl Controller {
         None
     }
 
-    pub fn create_undo_session(&mut self) -> Result<UndoSession, ChainError> {
-        self.db.undo_session().map_err(|e| {
-            ChainError::TransactionError(format!("failed to create undo session: {}", e))
-        })
-    }
-
-    pub fn get_wasm_runtime(&self) -> Arc<RwLock<WasmRuntime>> {
+    #[inline]
+    pub fn get_wasm_runtime(&self) -> WasmRuntime {
         self.wasm_runtime.clone()
     }
 
     pub fn get_global_properties(
-        session: &mut UndoSession,
+        session: &UndoSession,
     ) -> Result<GlobalPropertyObject, ChainError> {
         session.get::<GlobalPropertyObject>(0).map_err(|e| {
             ChainError::TransactionError(format!("failed to get global properties: {}", e))
         })
-    }
-
-    pub fn database(&self) -> Database {
-        self.db.clone()
     }
 
     pub fn chain_id(&self) -> Id {
@@ -577,7 +582,7 @@ impl Controller {
         self.chain_state_log.as_ref()
     }
 
-    pub async fn get_block_id(&self, block_num: u32) -> Result<Option<Id>, ChainError> {
+    pub fn get_block_id(&self, block_num: u32) -> Result<Option<Id>, ChainError> {
         let trace_log = self.trace_log();
         let chain_state_log = self.chain_state_log();
 
@@ -593,7 +598,7 @@ impl Controller {
             }
         }
 
-        let session = self.db.session()?;
+        let session = self.create_undo_session()?;
         let block = session.find::<SignedBlock>(block_num)?;
         if let Some(block) = block {
             return Ok(Some(block.id()));
@@ -782,6 +787,7 @@ mod tests {
         let pending_block_timestamp = controller.last_accepted_block().timestamp();
         let mut undo_session = controller.create_undo_session()?;
         let chain_id = controller.chain_id();
+        let mut wasm_runtime = controller.get_wasm_runtime();
         controller.execute_transaction(
             &mut undo_session,
             &create_account(&private_key, Name::from_str("glenn")?, chain_id)?,
@@ -872,6 +878,7 @@ mod tests {
     fn test_api_db() -> Result<(), ChainError> {
         let private_key = PrivateKey::random();
         let mut controller = Controller::new();
+        let mut wasm_runtime = controller.get_wasm_runtime();
         let genesis_bytes = generate_genesis(&private_key);
         let temp_path = get_temp_dir();
         controller.initialize(&genesis_bytes.to_vec(), temp_path.path().to_str().unwrap())?;

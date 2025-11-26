@@ -1,11 +1,13 @@
+use std::sync::{Arc, RwLock};
+
 use anyhow::bail;
 use wasmtime::{Caller, Trap};
 
-use crate::chain::wasm_runtime::WasmContext;
+use crate::{apply_context::ApplyContext, chain::wasm_runtime::WasmContext};
 
-pub fn require_auth() -> impl Fn(Caller<'_, WasmContext>, u64) -> Result<(), wasmtime::Error> {
-    |caller, account| {
-        let context = caller.data().apply_context();
+pub fn require_auth() -> impl Fn(Caller<WasmContext>, u64) -> Result<(), wasmtime::Error> {
+    move |caller, account| {
+        let context = caller.data().context();
 
         if let Err(err) = context.require_authorization(account.into(), None) {
             return Err(err.into());
@@ -15,19 +17,18 @@ pub fn require_auth() -> impl Fn(Caller<'_, WasmContext>, u64) -> Result<(), was
     }
 }
 
-pub fn has_auth() -> impl Fn(Caller<'_, WasmContext>, u64) -> Result<i32, wasmtime::Error> {
-    |caller, account| {
-        let context = caller.data().apply_context();
+pub fn has_auth() -> impl Fn(Caller<WasmContext>, u64) -> Result<i32, wasmtime::Error> {
+    move |caller, account| {
+        let context = caller.data().context();
         let result = context.has_authorization(account.into());
 
         if result { Ok(1) } else { Ok(0) }
     }
 }
 
-pub fn require_auth2() -> impl Fn(Caller<'_, WasmContext>, u64, u64) -> Result<(), wasmtime::Error>
-{
-    |caller, account, permission| {
-        let context = caller.data().apply_context();
+pub fn require_auth2() -> impl Fn(Caller<WasmContext>, u64, u64) -> Result<(), wasmtime::Error> {
+    move |mut caller, account, permission| {
+        let context = caller.data_mut().context_mut();
 
         if let Err(err) = context.require_authorization(account.into(), Some(permission.into())) {
             bail!("{}", err);
@@ -37,9 +38,9 @@ pub fn require_auth2() -> impl Fn(Caller<'_, WasmContext>, u64, u64) -> Result<(
     }
 }
 
-pub fn require_recipient() -> impl Fn(Caller<'_, WasmContext>, u64) -> Result<(), wasmtime::Error> {
-    |mut caller, recipient| {
-        let context = caller.data_mut().apply_context_mut();
+pub fn require_recipient() -> impl Fn(Caller<WasmContext>, u64) -> Result<(), wasmtime::Error> {
+    move |mut caller, recipient| {
+        let context = caller.data_mut().context_mut();
 
         if context.require_recipient(recipient.into()).is_err() {
             bail!("failed to require recipient");
@@ -49,15 +50,18 @@ pub fn require_recipient() -> impl Fn(Caller<'_, WasmContext>, u64) -> Result<()
     }
 }
 
-pub fn is_account() -> impl Fn(Caller<'_, WasmContext>, u64) -> Result<i32, wasmtime::Error> {
-    |mut caller, recipient| {
-        let context = caller.data_mut().apply_context_mut();
-        let result = context.is_account(recipient.into());
+pub fn is_account() -> impl Fn(Caller<WasmContext>, u64) -> Result<i32, wasmtime::Error> {
+    move |caller, recipient| {
+        let context = caller.data().context();
+        let session = caller.data().session();
+        let result = context.is_account(&session, recipient.into());
 
-        if result.is_err() {
-            bail!("failed to check if account exists");
-        } else {
-            Ok(result.unwrap() as i32)
+        match result {
+            Ok(true) => Ok(1),
+            Ok(false) => Ok(0),
+            Err(err) => {
+                bail!("failed to check if account exists: {}", err);
+            }
         }
     }
 }

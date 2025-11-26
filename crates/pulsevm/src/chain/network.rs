@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use pulsevm_core::{error::ChainError, id::NodeId};
+use pulsevm_crypto::Bytes;
 use pulsevm_grpc::appsender::{SendAppGossipMsg, app_sender_client::AppSenderClient};
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 use pulsevm_serialization::{Read, Write};
@@ -9,7 +10,7 @@ use tonic::Request;
 #[derive(Debug, Clone, PartialEq, Eq, Write, Read, NumBytes)]
 pub struct Gossipable {
     pub gossip_type: u16,
-    pub data: Vec<u8>,
+    pub data: Bytes,
 }
 
 impl Gossipable {
@@ -21,14 +22,14 @@ impl Gossipable {
             ChainError::NetworkError(format!("failed to serialize gossipable data: {}", e))
         })?;
 
-        Ok(Gossipable { gossip_type, data })
+        Ok(Gossipable { gossip_type, data: data.into() })
     }
 
     pub fn to_type<T>(&self) -> Result<T, ChainError>
     where
         T: Read,
     {
-        T::read(&self.data, &mut 0).map_err(|e| {
+        T::read(&self.data.as_ref(), &mut 0).map_err(|e| {
             ChainError::NetworkError(format!("failed to deserialize gossipable data: {}", e))
         })
     }
@@ -72,6 +73,7 @@ impl NetworkManager {
         let msg = gossipable.pack().map_err(|e| {
             ChainError::NetworkError(format!("failed to serialize gossipable: {}", e))
         })?;
+        
         let result = client
             .send_app_gossip(Request::new(SendAppGossipMsg {
                 node_ids: self
