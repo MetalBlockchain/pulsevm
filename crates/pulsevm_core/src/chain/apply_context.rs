@@ -33,7 +33,6 @@ use crate::{
     },
 };
 
-#[derive(Clone)]
 pub struct ApplyContext {
     pub chain_config: Arc<ChainConfig>,
     session: UndoSession,                   // The undo session for this context
@@ -48,12 +47,12 @@ pub struct ApplyContext {
     privileged: bool,
     start: i64,
 
-    notified: Rc<RefCell<VecDeque<(Name, u32)>>>, // List of notified accounts
-    inline_actions: Rc<RefCell<Vec<u32>>>,        // List of inline actions
-    account_ram_deltas: Rc<RefCell<HashMap<Name, i64>>>, // RAM usage deltas for accounts
-    keyval_cache: Rc<RefCell<IteratorCache<KeyValue>>>, // Cache for iterators
-    action_return_value: Rc<RefCell<Option<Vec<u8>>>>, // Return value of the action
-    pending_block_timestamp: BlockTimestamp,      // Timestamp for the pending block
+    notified: VecDeque<(Name, u32)>, // List of notified accounts
+    inline_actions: Vec<u32>,        // List of inline actions
+    account_ram_deltas: HashMap<Name, i64>, // RAM usage deltas for accounts
+    keyval_cache: IteratorCache<KeyValue>, // Cache for iterators
+    action_return_value: Option<Vec<u8>>, // Return value of the action
+    pending_block_timestamp: BlockTimestamp, // Timestamp for the pending block
 }
 
 impl ApplyContext {
@@ -83,11 +82,11 @@ impl ApplyContext {
             privileged: false,
             start: Utc::now().timestamp_micros(),
 
-            notified: Rc::new(RefCell::new(VecDeque::new())),
-            inline_actions: Rc::new(RefCell::new(Vec::new())),
-            account_ram_deltas: Rc::new(RefCell::new(HashMap::new())),
-            keyval_cache: Rc::new(RefCell::new(IteratorCache::new())),
-            action_return_value: Rc::new(RefCell::new(None)),
+            notified: VecDeque::new(),
+            inline_actions: Vec::new(),
+            account_ram_deltas: HashMap::new(),
+            keyval_cache: IteratorCache::new(),
+            action_return_value: None,
             pending_block_timestamp,
         })
     }
@@ -97,16 +96,12 @@ impl ApplyContext {
 
         {
             self.notified
-                .borrow_mut()
                 .push_back((self.receiver, self.action_ordinal));
         }
 
         cpu_used += self.exec_one()?;
 
-        let notified_pairs: Vec<(Name, u32)> = {
-            let notified = self.notified.borrow();
-            notified.iter().skip(1).cloned().collect()
-        };
+        let notified_pairs: Vec<(Name, u32)> = { self.notified.iter().skip(1).cloned().collect() };
 
         for (receiver, action_ordinal) in notified_pairs {
             self.receiver = receiver;
@@ -114,9 +109,7 @@ impl ApplyContext {
             cpu_used += self.exec_one()?;
         }
 
-        let inline_actions = self.inline_actions.borrow();
-
-        if inline_actions.len() > 0 {
+        if self.inline_actions.len() > 0 {
             pulse_assert(
                 self.recurse_depth < 1024, // TODO: Make this configurable
                 ChainError::TransactionError(
@@ -125,7 +118,7 @@ impl ApplyContext {
             )?;
         }
 
-        for action_ordinal in inline_actions.iter() {
+        for action_ordinal in self.inline_actions.iter() {
             trx_context.execute_action(*action_ordinal, self.recurse_depth + 1)?;
         }
 
@@ -163,8 +156,7 @@ impl ApplyContext {
             )?;
         }
 
-        let act_digest =
-            generate_action_digest(&self.action, self.action_return_value.borrow().clone());
+        let act_digest = generate_action_digest(&self.action, self.action_return_value.clone());
         let first_receiver_account = if self.action.account() == self.receiver {
             receiver_account.clone()
         } else {
@@ -202,7 +194,7 @@ impl ApplyContext {
             .modify_action_trace(self.action_ordinal, |trace| {
                 trace.receipt = Some(receipt);
                 trace.set_elapsed((Utc::now().timestamp_micros() - self.start) as u32);
-                trace.account_ram_deltas = self.account_ram_deltas.borrow().clone();
+                trace.account_ram_deltas = self.account_ram_deltas.clone();
             })?;
         Ok(())
     }
@@ -238,16 +230,14 @@ impl ApplyContext {
     }
 
     pub fn has_recipient(&self, recipient: Name) -> bool {
-        self.notified.borrow().iter().any(|(r, _)| *r == recipient)
+        self.notified.iter().any(|(r, _)| *r == recipient)
     }
 
     pub fn require_recipient(&mut self, recipient: Name) -> Result<(), ChainError> {
         if !self.has_recipient(recipient) {
             let scheduled_ordinal =
                 self.schedule_action_from_ordinal(self.action_ordinal, &recipient, false)?;
-            self.notified
-                .borrow_mut()
-                .push_back((recipient, scheduled_ordinal));
+            self.notified.push_back((recipient, scheduled_ordinal));
         }
 
         Ok(())
@@ -263,9 +253,8 @@ impl ApplyContext {
         return false;
     }
 
-    pub fn add_ram_usage(&self, account: Name, ram_delta: i64) {
+    pub fn add_ram_usage(&mut self, account: Name, ram_delta: i64) {
         self.account_ram_deltas
-            .borrow_mut()
             .entry(account)
             .and_modify(|d| *d += ram_delta)
             .or_insert(ram_delta);
@@ -342,7 +331,7 @@ impl ApplyContext {
         let inline_receiver = a.account();
         let scheduled_ordinal =
             self.schedule_action_from_action(a.clone(), &inline_receiver, false)?;
-        self.inline_actions.borrow_mut().push(scheduled_ordinal);
+        self.inline_actions.push(scheduled_ordinal);
 
         Ok(())
     }
@@ -399,15 +388,14 @@ impl ApplyContext {
         }
 
         let table = table.unwrap();
-        let mut keyval_cache = self.keyval_cache.borrow_mut();
-        let table_end_itr = keyval_cache.cache_table(&table);
+        let table_end_itr = self.keyval_cache.cache_table(&table);
         let obj = self
             .session
             .find_by_secondary::<KeyValue, KeyValueByScopePrimaryIndex>((table.id, id))
             .map_err(|e| ChainError::TransactionError(format!("failed to find keyval: {}", e)))?;
 
         match obj {
-            Some(keyval) => Ok(keyval_cache.add(&keyval)),
+            Some(keyval) => Ok(self.keyval_cache.add(&keyval)),
             None => Ok(table_end_itr),
         }
     }
@@ -442,9 +430,8 @@ impl ApplyContext {
         let billable_size = len as i64 + billable_size_v::<KeyValue>() as i64;
         self.update_db_usage(payer, billable_size)?;
 
-        let mut keyval_cache = self.keyval_cache.borrow_mut();
-        keyval_cache.cache_table(&table);
-        return Ok(keyval_cache.add(&key_value));
+        self.keyval_cache.cache_table(&table);
+        return Ok(self.keyval_cache.add(&key_value));
     }
 
     pub fn db_get_i64(
@@ -453,8 +440,7 @@ impl ApplyContext {
         buffer: &mut Vec<u8>,
         buffer_size: usize,
     ) -> Result<i32, ChainError> {
-        let keyval_cache = self.keyval_cache.borrow();
-        let obj = keyval_cache.get(iterator)?;
+        let obj = self.keyval_cache.get(iterator)?;
         let s = obj.value.len();
         if buffer_size == 0 {
             return Ok(s as i32);
@@ -473,10 +459,9 @@ impl ApplyContext {
         payer: Name,
         data: &Bytes,
     ) -> Result<(), ChainError> {
-        let keyval_cache = self.keyval_cache.borrow();
-        let obj = keyval_cache.get(iterator)?;
+        let obj = self.keyval_cache.get(iterator)?;
 
-        let table_obj = keyval_cache.get_table(obj.table_id)?;
+        let table_obj = self.keyval_cache.get_table(obj.table_id)?;
         pulse_assert(
             table_obj.code == self.receiver,
             ChainError::TransactionError(format!("db access violation",)),
@@ -504,10 +489,8 @@ impl ApplyContext {
     }
 
     pub fn db_remove_i64(&mut self, iterator: i32) -> Result<(), ChainError> {
-        let mut keyval_cache = self.keyval_cache.borrow_mut();
-        let obj = keyval_cache.get(iterator)?;
-
-        let table_obj = keyval_cache.get_table(obj.table_id)?;
+        let obj = self.keyval_cache.get(iterator)?;
+        let table_obj = self.keyval_cache.get_table(obj.table_id)?;
         pulse_assert(
             table_obj.code == self.receiver,
             ChainError::TransactionError(format!("db access violation",)),
@@ -529,18 +512,17 @@ impl ApplyContext {
             self.session.remove(table_obj.clone())?;
         }
 
-        keyval_cache.remove(iterator)?;
+        self.keyval_cache.remove(iterator)?;
 
         Ok(())
     }
 
-    pub fn db_next_i64(&self, iterator: i32, primary: &mut u64) -> Result<i32, ChainError> {
+    pub fn db_next_i64(&mut self, iterator: i32, primary: &mut u64) -> Result<i32, ChainError> {
         if iterator < -1 {
             return Ok(-1); // Cannot increment past end iterator of table
         }
 
-        let mut keyval_cache = self.keyval_cache.borrow_mut();
-        let obj = keyval_cache.get(iterator)?;
+        let obj = self.keyval_cache.get(iterator)?;
         let mut idx = self
             .session
             .get_index::<KeyValue, KeyValueByScopePrimaryIndex>();
@@ -552,31 +534,38 @@ impl ApplyContext {
             Some(next_object) => {
                 if next_object.table_id != obj.table_id {
                     // If the primary key is the same, we are at the end of the table
-                    return Ok(keyval_cache.get_end_iterator_by_table_id(obj.table_id)?);
+                    return Ok(self
+                        .keyval_cache
+                        .get_end_iterator_by_table_id(obj.table_id)?);
                 }
 
                 *primary = next_object.primary_key;
 
-                return Ok(keyval_cache.add(&next_object));
+                return Ok(self.keyval_cache.add(&next_object));
             }
             None => {
                 // No more objects in this table
-                return Ok(keyval_cache.get_end_iterator_by_table_id(obj.table_id)?);
+                return Ok(self
+                    .keyval_cache
+                    .get_end_iterator_by_table_id(obj.table_id)?);
             }
         }
     }
 
-    pub fn db_previous_i64(&self, iterator: i32, primary: &mut u64) -> Result<i32, ChainError> {
-        let mut keyval_cache = self.keyval_cache.borrow_mut();
+    pub fn db_previous_i64(&mut self, iterator: i32, primary: &mut u64) -> Result<i32, ChainError> {
+        let obj = self.keyval_cache.get(iterator)?;
         let mut idx = self
             .session
             .get_index::<KeyValue, KeyValueByScopePrimaryIndex>();
 
         if iterator < -1 {
             // is end iterator
-            let tab = keyval_cache.find_table_by_end_iterator(iterator)?.ok_or(
-                ChainError::TransactionError(format!("invalid end iterator")),
-            )?;
+            let tab = self
+                .keyval_cache
+                .find_table_by_end_iterator(iterator)?
+                .ok_or(ChainError::TransactionError(format!(
+                    "invalid end iterator"
+                )))?;
 
             let mut itr = idx.upper_bound(
                 (tab.id, u64::MIN), // Use u64::MIN to get the last element
@@ -591,7 +580,7 @@ impl ApplyContext {
 
                     *primary = prev_object.primary_key;
 
-                    return Ok(keyval_cache.add(&prev_object));
+                    return Ok(self.keyval_cache.add(&prev_object));
                 }
                 None => {
                     // No more objects in this table
@@ -600,7 +589,7 @@ impl ApplyContext {
             }
         }
 
-        let obj = keyval_cache.get(iterator)?;
+        let obj = self.keyval_cache.get(iterator)?;
         let mut itr = idx.iterator_to(obj)?;
         let prev_object = itr.previous()?;
 
@@ -612,7 +601,7 @@ impl ApplyContext {
 
                 *primary = prev_object.primary_key;
 
-                return Ok(keyval_cache.add(&prev_object));
+                return Ok(self.keyval_cache.add(&prev_object));
             }
             None => {
                 // No more objects in this table
@@ -626,8 +615,7 @@ impl ApplyContext {
 
         match tab {
             Some(table) => {
-                let mut keyval_cache = self.keyval_cache.borrow_mut();
-                let end_itr = keyval_cache.cache_table(&table);
+                let end_itr = self.keyval_cache.cache_table(&table);
                 Ok(end_itr)
             }
             None => Ok(-1), // No table found, return end iterator
@@ -648,8 +636,7 @@ impl ApplyContext {
         }
 
         let tab = tab.unwrap();
-        let mut keyval_cache = self.keyval_cache.borrow_mut();
-        let end_itr = keyval_cache.cache_table(&tab);
+        let end_itr = self.keyval_cache.cache_table(&tab);
         let mut idx = self
             .session
             .get_index::<KeyValue, KeyValueByScopePrimaryIndex>();
