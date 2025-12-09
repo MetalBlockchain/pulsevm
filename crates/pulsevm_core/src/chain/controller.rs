@@ -70,7 +70,7 @@ pub static APPLY_HANDLERS: LazyLock<ApplyHandlerMap> = LazyLock::new(|| {
 });
 
 pub struct Controller {
-    wasm_runtime: Arc<RwLock<WasmRuntime>>,
+    wasm_runtime: WasmRuntime,
     config: Arc<ChainConfig>,
 
     last_accepted_block: SignedBlock,
@@ -102,7 +102,7 @@ impl Controller {
         let db = Database::temporary(Path::new("temp")).unwrap();
         let wasm_runtime = WasmRuntime::new().unwrap();
         let controller = Controller {
-            wasm_runtime: Arc::new(RwLock::new(wasm_runtime)), // TODO: Handle error properly
+            wasm_runtime,
             config: Arc::new(ChainConfig::default()),
 
             last_accepted_block: SignedBlock::default(),
@@ -530,8 +530,8 @@ impl Controller {
         })
     }
 
-    pub fn get_wasm_runtime(&self) -> Arc<RwLock<WasmRuntime>> {
-        self.wasm_runtime.clone()
+    pub fn get_wasm_runtime(&self) -> &WasmRuntime {
+        &self.wasm_runtime
     }
 
     pub fn get_global_properties(

@@ -1,42 +1,53 @@
-use anyhow::bail;
-use wasmtime::Caller;
+use wasmer::{FunctionEnvMut, RuntimeError, WasmPtr};
 
 use crate::chain::wasm_runtime::WasmContext;
 
-pub fn pulse_assert()
--> impl Fn(Caller<'_, WasmContext>, u32, u32, u32) -> Result<(), wasmtime::Error> {
-    |mut caller, condition, msg, msg_len| {
-        if condition != 1 {
-            let memory = caller
-                .get_export("memory")
-                .and_then(|ext| ext.into_memory())
-                .ok_or_else(|| anyhow::anyhow!("memory export not found"))?;
+pub fn pulse_assert(
+    mut env: FunctionEnvMut<WasmContext>,
+    condition: u32,
+    msg_ptr: WasmPtr<u8>,
+    msg_len: u32,
+) -> Result<(), RuntimeError> {
+    println!(
+        "pulse_assert called with condition: {}, msg_len: {}",
+        condition, msg_len
+    );
+    if condition != 1 {
+        let (env_data, store) = env.data_and_store_mut();
+        let memory = env_data
+            .memory()
+            .as_ref()
+            .expect("Wasm memory not initialized");
+        let view = memory.view(&store);
+        let slice = msg_ptr.slice(&view, msg_len)?;
+        let mut src_bytes = vec![0u8; msg_len as usize];
+        slice.read_slice(&mut src_bytes)?;
+        let c_str = String::from_utf8(src_bytes);
 
-            let mut src_bytes = vec![0u8; msg_len as usize];
-            memory.read(&caller, msg as usize, &mut src_bytes)?;
-            let c_str = String::from_utf8(src_bytes);
-
-            if c_str.is_ok() {
-                let msg_str = c_str.unwrap();
-                bail!("pulse assert failed: {}", msg_str);
-            } else {
-                bail!("pulse assert failed: condition is not zero");
+        match c_str {
+            Ok(msg_str) => {
+                return Err(RuntimeError::new(format!(
+                    "pulse assert failed: {}",
+                    msg_str
+                )));
+            }
+            Err(_) => {
+                return Err(RuntimeError::new("pulse assert failed"));
             }
         }
-
-        Ok(())
     }
+    println!("pulse_assert passed");
+
+    Ok(())
 }
 
-pub fn current_time() -> impl Fn(Caller<'_, WasmContext>) -> Result<u64, wasmtime::Error> {
-    |mut caller| {
-        let context = caller.data_mut().apply_context();
-        let result = context
-            .pending_block_timestamp()
-            .to_time_point()
-            .time_since_epoch()
-            .count();
+pub fn current_time(env: FunctionEnvMut<WasmContext>) -> Result<u64, RuntimeError> {
+    let result = env
+        .data()
+        .pending_block_timestamp()
+        .to_time_point()
+        .time_since_epoch()
+        .count();
 
-        Ok(result as u64)
-    }
+    Ok(result as u64)
 }
