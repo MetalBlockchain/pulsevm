@@ -1,5 +1,4 @@
 use std::collections::{HashSet, VecDeque};
-use tokio::sync::Mutex;
 
 use crate::chain::{id::Id, transaction::PackedTransaction};
 
@@ -19,7 +18,6 @@ impl std::fmt::Display for MempoolError {
 pub struct Mempool {
     transactions_list: VecDeque<PackedTransaction>,
     transactions_map: HashSet<Id>,
-    request_block_mutex: Mutex<()>,
 }
 
 impl Mempool {
@@ -27,7 +25,6 @@ impl Mempool {
         Self {
             transactions_list: VecDeque::new(),
             transactions_map: HashSet::new(),
-            request_block_mutex: Mutex::new(()),
         }
     }
 

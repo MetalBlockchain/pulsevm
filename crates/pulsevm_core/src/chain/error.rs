@@ -1,4 +1,4 @@
-use std::{error::Error, fmt};
+use std::{error::Error, sync::LockResult};
 
 use pulsevm_chainbase::ChainbaseError;
 use thiserror::Error;
@@ -49,6 +49,18 @@ impl From<pulsevm_serialization::ReadError> for ChainError {
 impl From<Box<dyn Error>> for ChainError {
     fn from(_: Box<dyn Error>) -> Self {
         ChainError::InternalError(None)
+    }
+}
+
+impl From<LockResult<()>> for ChainError {
+    fn from(_: LockResult<()>) -> Self {
+        ChainError::InternalError(Some("failed to acquire read/write lock".into()))
+    }
+}
+
+impl From<wasmtime::Error> for ChainError {
+    fn from(e: wasmtime::Error) -> Self {
+        ChainError::WasmRuntimeError(format!("wasm runtime error: {}", e))
     }
 }
 

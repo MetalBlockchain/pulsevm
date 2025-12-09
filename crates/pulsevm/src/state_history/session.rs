@@ -260,7 +260,7 @@ impl Session {
                 continue;
             }
 
-            let id = controller.get_block_id(cp.block_num).await?;
+            let id = controller.get_block_id(cp.block_num)?;
 
             if id.is_none() || id.unwrap() != cp.block_id {
                 req.start_block_num = std::cmp::min(req.start_block_num, cp.block_num);
@@ -300,14 +300,14 @@ async fn make_block_response_for(
     }
 
     // Get the requested block
-    let this_block_id = controller.get_block_id(block_num).await?.ok_or(anyhow!(
+    let this_block_id = controller.get_block_id(block_num)?.ok_or(anyhow!(
         "block {block_num} not found, may not be available yet",
     ))?;
 
     // Get the previous block if it exists
     let mut previous_block: Option<BlockPosition> = None;
     if block_num > 1 {
-        if let Some(prev_id) = controller.get_block_id(block_num - 1).await? {
+        if let Some(prev_id) = controller.get_block_id(block_num - 1)? {
             previous_block = Some(BlockPosition {
                 block_num: block_num - 1,
                 block_id: prev_id,

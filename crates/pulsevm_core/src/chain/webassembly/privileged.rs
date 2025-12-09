@@ -16,11 +16,11 @@ fn privileged_check(context: &ApplyContext) -> Result<(), RuntimeError> {
     Ok(())
 }
 
-pub fn is_privileged() -> impl Fn(Caller<'_, WasmContext>, u64) -> Result<i32, wasmtime::Error> {
-    |mut caller, account| {
-        let context = caller.data_mut().apply_context_mut();
-        privileged_check(context)?;
-        let mut session = context.undo_session();
+pub fn is_privileged() -> impl Fn(Caller<WasmContext>, u64) -> Result<i32, wasmtime::Error> {
+    move |mut caller, account| {
+        let context = caller.data().context().clone();
+        privileged_check(&context)?;
+        let session = caller.data_mut().session_mut();
         let account = session
             .get::<AccountMetadata>(account.into())
             .map_err(|_| anyhow::anyhow!("account not found: {}", account))?;
@@ -29,12 +29,11 @@ pub fn is_privileged() -> impl Fn(Caller<'_, WasmContext>, u64) -> Result<i32, w
     }
 }
 
-pub fn set_privileged() -> impl Fn(Caller<'_, WasmContext>, u64, i32) -> Result<(), wasmtime::Error>
-{
-    |mut caller, account, is_priv| {
-        let context = caller.data_mut().apply_context_mut();
-        privileged_check(context)?;
-        let mut session = context.undo_session();
+pub fn set_privileged() -> impl Fn(Caller<WasmContext>, u64, i32) -> Result<(), wasmtime::Error> {
+    move |mut caller, account, is_priv| {
+        let context = caller.data().context().clone();
+        privileged_check(&context)?;
+        let session = caller.data_mut().session_mut();
         let mut account = session
             .get::<AccountMetadata>(account.into())
             .map_err(|_| anyhow::anyhow!("account not found: {}", account))?;
@@ -50,8 +49,8 @@ pub fn set_privileged() -> impl Fn(Caller<'_, WasmContext>, u64, i32) -> Result<
 }
 
 pub fn set_resource_limits()
--> impl Fn(Caller<'_, WasmContext>, u64, i64, i64, i64) -> Result<(), wasmtime::Error> {
-    |mut caller, account, ram_bytes, net_weight, cpu_weight| {
+-> impl Fn(Caller<WasmContext>, u64, i64, i64, i64) -> Result<(), wasmtime::Error> {
+    move |mut caller, account, ram_bytes, net_weight, cpu_weight| {
         pulse_assert(
             ram_bytes >= -1,
             ChainError::WasmRuntimeError(format!(
@@ -70,9 +69,9 @@ pub fn set_resource_limits()
                 "invalid value for cpu resource limit expected [-1,INT64_MAX]"
             )),
         )?;
-        let context = caller.data_mut().apply_context_mut();
-        privileged_check(context)?;
-        let mut session = context.undo_session();
+        let context = caller.data().context().clone();
+        privileged_check(&context)?;
+        let mut session = caller.data_mut().session_mut();
         ResourceLimitsManager::set_account_limits(
             &mut session,
             &account.into(),
@@ -86,16 +85,16 @@ pub fn set_resource_limits()
 }
 
 pub fn get_resource_limits()
--> impl Fn(Caller<'_, WasmContext>, u64, i32, i32, i32) -> Result<(), wasmtime::Error> {
-    |mut caller, account, ram_bytes_ptr, net_weight_ptr, cpu_weight_ptr| {
-        let context = caller.data_mut().apply_context_mut();
-        privileged_check(context)?;
-        let mut session = context.undo_session();
+-> impl Fn(Caller<WasmContext>, u64, i32, i32, i32) -> Result<(), wasmtime::Error> {
+    move |mut caller, account, ram_bytes_ptr, net_weight_ptr, cpu_weight_ptr| {
+        let context = caller.data().context().clone();
+        privileged_check(&context)?;
+        let session = caller.data_mut().session_mut();
         let mut ram_bytes = 0;
         let mut net_weight = 0;
         let mut cpu_weight = 0;
         ResourceLimitsManager::get_account_limits(
-            &mut session,
+            session,
             &account.into(),
             &mut ram_bytes,
             &mut net_weight,

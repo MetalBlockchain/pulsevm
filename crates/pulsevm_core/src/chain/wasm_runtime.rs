@@ -60,8 +60,8 @@ impl WasmContext {
         }
     }
 
-    pub fn receiver(&self) -> &Name {
-        &self.receiver
+    pub fn receiver(&self) -> Name {
+        self.receiver
     }
 
     pub fn action(&self) -> &Action {
@@ -125,13 +125,9 @@ impl WasmRuntime {
 
         // Non-deterministic interruption
         //config.epoch_interruption(true);
-        config.consume_fuel(true);
+        //config.consume_fuel(true);
 
-        let engine = Engine::new(&config)
-            .map_err(|e| ChainError::WasmRuntimeError(e.to_string()))
-            .unwrap();
-
-        // Add host functions to the linker.
+        let engine = Engine::new(&config)?;
         let mut linker = Linker::<WasmContext>::new(&engine);
         // Action functions
         Self::add_host_function(&mut linker, "env", "action_data_size", action_data_size())?;
@@ -211,13 +207,8 @@ impl WasmRuntime {
         module: &str,
         name: &str,
         func: impl IntoFunc<WasmContext, Params, Args>,
-    ) -> Result<(), ChainError>
-    where
-        WasmContext: 'static,
-    {
-        linker
-            .func_wrap(module, name, func)
-            .map_err(|e| ChainError::WasmRuntimeError(e.to_string()))?;
+    ) -> Result<(), ChainError> {
+        linker.func_wrap(module, name, func)?;
         Ok(())
     } */
 
@@ -246,7 +237,6 @@ impl WasmRuntime {
                     .map_err(|e| ChainError::WasmRuntimeError(e.to_string()))?;
                 inner.code_cache.put(code_hash, module);
             }
-        }
 
         let module = inner.code_cache.get(&code_hash).ok_or_else(|| {
             ChainError::WasmRuntimeError(format!("wasm module not found in cache: {}", code_hash))
