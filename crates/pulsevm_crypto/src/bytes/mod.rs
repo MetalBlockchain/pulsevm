@@ -71,6 +71,13 @@ impl From<Vec<u8>> for Bytes {
     }
 }
 
+impl From<&[u8]> for Bytes {
+    #[inline]
+    fn from(data: &[u8]) -> Self {
+        Bytes(data.to_vec())
+    }
+}
+
 impl NumBytes for Bytes {
     #[inline]
     fn num_bytes(&self) -> usize {

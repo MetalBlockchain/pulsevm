@@ -1,18 +1,12 @@
 use std::{
-    cell::RefCell,
-    collections::HashMap,
     num::NonZeroUsize,
-    rc::Rc,
     sync::{Arc, RwLock},
 };
 
-use chrono::Utc;
 use lru::LruCache;
-use pulsevm_chainbase::{Session, UndoSession};
-use wasmtime::{
-    Caller, Config, Engine, Extern, ExternType, Func, Instance, IntoFunc, Linker, Module, Store,
-    Strategy,
-};
+use pulsevm_crypto::Bytes;
+use wasmer::{imports, sys::NativeEngineExt, Engine, Function, FunctionEnv, Instance, Memory, Module, Store, Value};
+use wasmer_compiler_llvm::LLVM;
 
 use crate::{
     block::BlockTimestamp,
@@ -25,9 +19,9 @@ use crate::{
         webassembly::{
             check_transaction_authorization, current_time, db_end_i64, db_find_i64, db_get_i64,
             db_lowerbound_i64, db_next_i64, db_previous_i64, db_remove_i64, db_store_i64,
-            db_update_i64, db_upperbound_i64, get_resource_limits, get_self, is_privileged,
-            pulse_assert, read_action_data, require_auth2, require_recipient,
-            set_action_return_value, set_privileged, set_resource_limits, sha224, sha256, sha512,
+            db_update_i64, db_upperbound_i64, get_resource_limits, is_privileged, pulse_assert,
+            read_action_data, require_auth2, require_recipient, set_action_return_value,
+            set_privileged, set_resource_limits, sha224, sha256, sha512,
         },
     },
 };
@@ -41,27 +35,28 @@ use super::{
 };
 
 pub struct WasmContext {
-    pub receiver: Name,
-    pub action: Action,
-    pub pending_block_time: BlockTimestamp,
-    pub context: ApplyContext,
-    pub session: UndoSession<'static>,
+    receiver: Name,
+    action: Action,
+    pending_block_timestamp: BlockTimestamp,
+    context: ApplyContext,
+    memory: Option<Memory>,
+    return_value: Option<Bytes>,
 }
 
 impl WasmContext {
     pub fn new(
         receiver: Name,
         action: Action,
-        pending_block_time: BlockTimestamp,
+        pending_block_timestamp: BlockTimestamp,
         context: ApplyContext,
-        session: UndoSession<'static>,
     ) -> Self {
         WasmContext {
             receiver,
             action,
-            pending_block_time,
+            pending_block_timestamp,
             context,
-            session,
+            memory: None,
+            return_value: None,
         }
     }
 
@@ -73,37 +68,42 @@ impl WasmContext {
         &self.action
     }
 
-    pub fn pending_block_time(&self) -> BlockTimestamp {
-        self.pending_block_time
+    pub fn pending_block_timestamp(&self) -> &BlockTimestamp {
+        &self.pending_block_timestamp
     }
 
-    pub fn context(&self) -> &ApplyContext {
+    pub fn apply_context(&self) -> &ApplyContext {
         &self.context
     }
 
-    pub fn context_mut(&mut self) -> &mut ApplyContext {
+    pub fn apply_context_mut(&mut self) -> &mut ApplyContext {
         &mut self.context
     }
 
-    pub fn session(&self) -> &UndoSession<'static> {
-        &self.session
+    pub fn memory(&self) -> &Option<Memory> {
+        &self.memory
     }
 
-    pub fn session_mut(&mut self) -> &mut UndoSession<'static> {
-        &mut self.session
+    pub fn set_action_return_value(&mut self, return_value: Bytes) {
+        self.return_value = Some(return_value);
     }
+}
+
+struct InnerWasmRuntime {
+    engine: Engine,
+    code_cache: LruCache<Id, Module>,
 }
 
 #[derive(Clone)]
 pub struct WasmRuntime {
-    engine: Arc<Engine>,
-    code_cache: Arc<RwLock<LruCache<Id, Module>>>,
-    linker: Arc<Linker<WasmContext>>,
+    inner: Arc<RwLock<InnerWasmRuntime>>,
 }
 
 impl WasmRuntime {
     pub fn new() -> Result<Self, ChainError> {
-        let mut config = Config::default();
+        let compiler = LLVM::default();
+
+        /* let mut config = Config::default();
 
         // Enable the Cranelift optimizing compiler.
         config.strategy(Strategy::Cranelift);
@@ -191,16 +191,17 @@ impl WasmRuntime {
         // Crypto functions
         Self::add_host_function(&mut linker, "env", "sha224", sha224())?;
         Self::add_host_function(&mut linker, "env", "sha256", sha256())?;
-        Self::add_host_function(&mut linker, "env", "sha512", sha512())?;
+        Self::add_host_function(&mut linker, "env", "sha512", sha512())?; */
 
         Ok(Self {
-            engine: Arc::new(engine),
-            code_cache: Arc::new(RwLock::new(LruCache::new(NonZeroUsize::new(1024).unwrap()))),
-            linker: Arc::new(linker),
+            inner: Arc::new(RwLock::new(InnerWasmRuntime {
+                engine: compiler.into(),
+                code_cache: LruCache::new(NonZeroUsize::new(1024).unwrap()),
+            })),
         })
     }
 
-    #[must_use]
+    /* #[must_use]
     fn add_host_function<Params, Args>(
         linker: &mut Linker<WasmContext>,
         module: &str,
@@ -209,60 +210,98 @@ impl WasmRuntime {
     ) -> Result<(), ChainError> {
         linker.func_wrap(module, name, func)?;
         Ok(())
-    }
+    } */
 
     pub fn run(
         &mut self,
         receiver: Name,
-        action: &Action,
-        pending_block_time: BlockTimestamp,
-        context: ApplyContext,
-        undo_session: UndoSession<'_>,
+        action: Action,
+        apply_context: ApplyContext,
         code_hash: Id,
     ) -> Result<(), ChainError> {
-        // Different scope so session is released before running the wasm code.
-        let module = {
-            let mut code_cache = self.code_cache.write()?;
+        // Pause timer
+        apply_context.pause_billing_timer()?;
 
-            if !code_cache.contains(&code_hash) {
-                let code_object = undo_session.get::<CodeObject>(code_hash)?;
-                let module = Module::new(&self.engine, code_object.code.as_ref())?;
-                code_cache.put(code_hash, module);
+        let mut inner = self.inner.write()?;
+        let mut store = Store::new(inner.engine.clone());
+
+        // Different scope so session is released before running the wasm code.
+        {
+            let mut session = apply_context.undo_session();
+
+            if !inner.code_cache.contains(&code_hash) {
+                let code_object = session.get::<CodeObject>(code_hash).map_err(|e| {
+                    ChainError::WasmRuntimeError(format!("failed to get wasm code: {}", e))
+                })?;
+                let module = Module::new(store.engine(), code_object.code.as_ref())
+                    .map_err(|e| ChainError::WasmRuntimeError(e.to_string()))?;
+                inner.code_cache.put(code_hash, module);
             }
 
-            code_cache
-                .get(&code_hash)
-                .ok_or_else(|| {
-                    ChainError::WasmRuntimeError(format!(
-                        "wasm module not found in cache: {}",
-                        code_hash
-                    ))
-                })?
-                .clone()
-        };
-
-        // Create the Wasm context containing the apply context and undo session
-        // for use by host functions. The undo session reference is transmuted to
-        // 'static because wasmtime requires that all data in the Store is 'static.
-        let wasm_context: WasmContext = WasmContext::new(
+        let module = inner.code_cache.get(&code_hash).ok_or_else(|| {
+            ChainError::WasmRuntimeError(format!("wasm module not found in cache: {}", code_hash))
+        })?;
+        let wasm_context = WasmContext::new(
             receiver,
             action.clone(),
-            pending_block_time,
-            context,
-            unsafe { std::mem::transmute::<UndoSession<'_>, UndoSession<'static>>(undo_session) },
+            apply_context.pending_block_timestamp(),
+            apply_context.clone(),
         );
-        let mut store = Store::new(&self.engine, wasm_context);
-        let instance = self.linker.instantiate(&mut store, &module)?;
-        let apply_func = instance.get_typed_func::<(u64, u64, u64), ()>(&mut store, "apply")?;
+        let env = FunctionEnv::new(&mut store, wasm_context);
+        let import_object = imports! {
+            "env" => {
+                "action_data_size" => Function::new_typed_with_env(&mut store, &env, action_data_size),
+                "read_action_data" => Function::new_typed_with_env(&mut store, &env, read_action_data),
+                "current_receiver" => Function::new_typed_with_env(&mut store, &env, current_receiver),
+                "require_auth" => Function::new_typed_with_env(&mut store, &env, require_auth),
+                "has_auth" => Function::new_typed_with_env(&mut store, &env, has_auth),
+                "require_auth2" => Function::new_typed_with_env(&mut store, &env, require_auth2),
+                "require_recipient" => Function::new_typed_with_env(&mut store, &env, require_recipient),
+                "is_account" => Function::new_typed_with_env(&mut store, &env, is_account),
+                "db_find_i64" => Function::new_typed_with_env(&mut store, &env, db_find_i64),
+                "db_store_i64" => Function::new_typed_with_env(&mut store, &env, db_store_i64),
+                "db_get_i64" => Function::new_typed_with_env(&mut store, &env, db_get_i64),
+                "db_update_i64" => Function::new_typed_with_env(&mut store, &env, db_update_i64),
+                "db_remove_i64" => Function::new_typed_with_env(&mut store, &env, db_remove_i64),
+                "db_next_i64" => Function::new_typed_with_env(&mut store, &env, db_next_i64),
+                "db_previous_i64" => Function::new_typed_with_env(&mut store, &env, db_previous_i64),
+                "db_end_i64" => Function::new_typed_with_env(&mut store, &env, db_end_i64),
+                "db_lowerbound_i64" => Function::new_typed_with_env(&mut store, &env, db_lowerbound_i64),
+                "db_upperbound_i64" => Function::new_typed_with_env(&mut store, &env, db_upperbound_i64),
+                "pulse_assert" => Function::new_typed_with_env(&mut store, &env, pulse_assert),
+                "current_time" => Function::new_typed_with_env(&mut store, &env, current_time),
+            }
+        };
+        let instance = Instance::new(&mut store, &module, &import_object).map_err(|e| {
+            ChainError::WasmRuntimeError(format!("failed to create wasm instance: {}", e))
+        })?;
+
+        match instance.exports.get_memory("memory") {
+            Ok(mem) => {
+                let ctx = env.as_mut(&mut store);
+                ctx.memory = Some(mem.clone());
+            }
+            Err(_) => {
+                return Err(ChainError::WasmRuntimeError(
+                    "wasm memory export not found".to_string(),
+                ));
+            }
+        }
+
+        let apply_func = instance
+            .exports
+            .get_typed_function::<(i64, i64, i64), ()>(&store, "apply")
+            .map_err(|_| ChainError::WasmRuntimeError(format!("failed to find apply function")))?;
+
+        // Resume timer
+        apply_context.resume_billing_timer()?;
 
         apply_func
             .call(
                 &mut store,
-                (
-                    receiver.as_u64(),
-                    action.account().as_u64(),
-                    action.name().as_u64(),
-                ),
+                receiver.as_u64() as i64,
+                action.account().as_u64() as i64,
+                action.name().as_u64() as i64,
             )
             .map_err(|e| {
                 // If this was originally `Err(ChainError)`, restore it
@@ -271,7 +310,7 @@ impl WasmRuntime {
                 }
 
                 // Otherwise wrap it
-                ChainError::WasmRuntimeError(format!("apply error: {}", e.root_cause()))
+                ChainError::WasmRuntimeError(format!("apply error: {}", e))
             })?;
 
         Ok(())

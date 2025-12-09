@@ -1,5 +1,5 @@
 use anyhow::bail;
-use pulsevm_chainbase::Session;
+use wasmer::RuntimeError;
 use wasmtime::Caller;
 
 use crate::chain::{
@@ -7,9 +7,11 @@ use crate::chain::{
     resource_limits::ResourceLimitsManager, utils::pulse_assert, wasm_runtime::WasmContext,
 };
 
-fn privileged_check(context: &ApplyContext) -> Result<(), wasmtime::Error> {
-    if !context.is_privileged() {
-        bail!("this function can only be called by privileged accounts");
+fn privileged_check(context: &ApplyContext) -> Result<(), RuntimeError> {
+    if !context.is_privileged()? {
+        return Err(RuntimeError::new(
+            "attempt to call privileged instruction without proper authorization",
+        ));
     }
     Ok(())
 }

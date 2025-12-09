@@ -1,169 +1,179 @@
-use wasmtime::Caller;
+use wasmer::{FunctionEnvMut, RuntimeError, WasmPtr};
 
 use crate::chain::wasm_runtime::WasmContext;
 
-pub fn db_find_i64()
--> impl Fn(Caller<'_, WasmContext>, u64, u64, u64, u64) -> Result<i32, wasmtime::Error> {
-    move |mut caller, code, scope, table, id| {
-        let context = caller.data().context().clone();
-        let mut session = caller.data_mut().session_mut();
-        let result = context.db_find_i64(
-            &mut session,
-            code.into(),
-            scope.into(),
-            table.into(),
-            id.into(),
-        )?;
-        Ok(result)
-    }
+pub fn db_find_i64(
+    mut env: FunctionEnvMut<WasmContext>,
+    code: u64,
+    scope: u64,
+    table: u64,
+    id: u64,
+) -> Result<i32, RuntimeError> {
+    let context = env.data_mut().apply_context_mut();
+    let result = context.db_find_i64(code.into(), scope.into(), table.into(), id.into())?;
+    Ok(result)
 }
 
-pub fn db_store_i64()
--> impl Fn(Caller<WasmContext>, u64, u64, u64, u64, u32, u32) -> Result<i32, wasmtime::Error> {
-    move |mut caller, scope, table, payer, id, buffer, buffer_size| {
-        let memory = caller
-            .get_export("memory")
-            .and_then(|ext| ext.into_memory())
-            .ok_or_else(|| anyhow::anyhow!("memory export not found"))?;
+pub fn db_store_i64(
+    mut env: FunctionEnvMut<WasmContext>,
+    scope: u64,
+    table: u64,
+    payer: u64,
+    id: u64,
+    buffer_ptr: WasmPtr<u8>,
+    buffer_len: u32,
+) -> Result<i32, RuntimeError> {
+    let (env_data, store) = env.data_and_store_mut();
+    let memory = env_data
+        .memory()
+        .as_ref()
+        .expect("Wasm memory not initialized");
+    let view = memory.view(&store);
+    let slice = buffer_ptr.slice(&view, buffer_len)?;
 
-        // Read source bytes safely
-        let mut src_bytes = vec![0u8; buffer_size as usize];
-        memory.read(&caller, buffer as usize, &mut src_bytes)?;
+    // Read source bytes safely
+    let mut src_bytes = vec![0u8; buffer_len as usize];
+    slice.read_slice(&mut src_bytes)?;
 
-        let context = caller.data().context().clone();
-        let mut session = caller.data_mut().session_mut();
-        let result = context.db_store_i64(
-            &mut session,
-            scope.into(),
-            table.into(),
-            payer.into(),
-            id.into(),
-            src_bytes.into(),
-        )?;
-        Ok(result)
-    }
+    let context = env_data.apply_context_mut();
+    let result = context.db_store_i64(
+        scope.into(),
+        table.into(),
+        payer.into(),
+        id.into(),
+        src_bytes.into(),
+    )?;
+    Ok(result)
 }
 
-pub fn db_get_i64() -> impl Fn(Caller<WasmContext>, i32, u32, u32) -> Result<i32, wasmtime::Error> {
-    move |mut caller, itr, buffer, buffer_size| {
-        let memory = caller
-            .get_export("memory")
-            .and_then(|ext| ext.into_memory())
-            .ok_or_else(|| anyhow::anyhow!("memory export not found"))?;
-        let mut dest_bytes = vec![0u8; buffer_size as usize];
-        let context = caller.data().context();
-        let result = context.db_get_i64(itr, &mut dest_bytes, buffer_size as usize)?;
-        memory.write(&mut caller, buffer as usize, &dest_bytes)?;
-        Ok(result)
-    }
+pub fn db_get_i64(
+    mut env: FunctionEnvMut<WasmContext>,
+    itr: i32,
+    buffer_ptr: WasmPtr<u8>,
+    buffer_len: u32,
+) -> Result<i32, RuntimeError> {
+    let (env_data, store) = env.data_and_store_mut();
+    let memory = env_data
+        .memory()
+        .as_ref()
+        .expect("Wasm memory not initialized");
+    let view = memory.view(&store);
+    let slice = buffer_ptr.slice(&view, buffer_len)?;
+    let mut dest_bytes = vec![0u8; buffer_len as usize];
+    let context = env_data.apply_context();
+    let result = context.db_get_i64(itr, &mut dest_bytes, buffer_len as usize)?;
+    slice.write_slice(&dest_bytes)?;
+    Ok(result)
 }
 
-pub fn db_update_i64()
--> impl Fn(Caller<WasmContext>, i32, u64, u32, u32) -> Result<(), wasmtime::Error> {
-    move |mut caller, itr, payer, buffer, buffer_size| {
-        let memory = caller
-            .get_export("memory")
-            .and_then(|ext| ext.into_memory())
-            .ok_or_else(|| anyhow::anyhow!("memory export not found"))?;
+pub fn db_update_i64(
+    mut env: FunctionEnvMut<WasmContext>,
+    itr: i32,
+    payer: u64,
+    buffer_ptr: WasmPtr<u8>,
+    buffer_len: u32,
+) -> Result<(), RuntimeError> {
+    let (env_data, store) = env.data_and_store_mut();
+    let memory = env_data
+        .memory()
+        .as_ref()
+        .expect("Wasm memory not initialized");
+    let view = memory.view(&store);
+    let slice = buffer_ptr.slice(&view, buffer_len)?;
 
-        // Read source bytes safely
-        let mut src_bytes = vec![0u8; buffer_size as usize];
-        memory.read(&caller, buffer as usize, &mut src_bytes)?;
+    // Read source bytes safely
+    let mut src_bytes = vec![0u8; buffer_len as usize];
+    slice.read_slice(&mut src_bytes)?;
 
-        let context = caller.data().context().clone();
-        let mut session = caller.data_mut().session_mut();
-        context.db_update_i64(&mut session, itr, payer.into(), &src_bytes.into())?;
-
-        Ok(())
-    }
+    let context = env_data.apply_context_mut();
+    context.db_update_i64(itr, payer.into(), &src_bytes)?;
+    Ok(())
 }
 
-pub fn db_remove_i64() -> impl Fn(Caller<WasmContext>, i32) -> Result<(), wasmtime::Error> {
-    move |mut caller, itr| {
-        let context = caller.data().context().clone();
-        let mut session = caller.data_mut().session_mut();
-        context.db_remove_i64(&mut session, itr)?;
-
-        Ok(())
-    }
+pub fn db_remove_i64(mut env: FunctionEnvMut<WasmContext>, itr: i32) -> Result<(), RuntimeError> {
+    let context = env.data_mut().apply_context_mut();
+    context.db_remove_i64(itr)?;
+    Ok(())
 }
 
-pub fn db_next_i64() -> impl Fn(Caller<WasmContext>, i32, u32) -> Result<i32, wasmtime::Error> {
-    move |mut caller, itr, primary_ptr| {
-        let memory = caller
-            .get_export("memory")
-            .and_then(|ext| ext.into_memory())
-            .ok_or_else(|| anyhow::anyhow!("memory export not found"))?;
-        let context = caller.data().context().clone();
-        let mut session = caller.data_mut().session_mut();
-        let mut next_primary = 0u64;
-        let res = context.db_next_i64(&mut session, itr, &mut next_primary)?;
+pub fn db_next_i64(
+    mut env: FunctionEnvMut<WasmContext>,
+    itr: i32,
+    primary_ptr: WasmPtr<u8>,
+) -> Result<i32, RuntimeError> {
+    let context = env.data_mut().apply_context_mut();
+    let mut next_primary = 0u64;
+    let res = context.db_next_i64(itr, &mut next_primary)?;
 
-        if res >= 0 {
-            let dest_bytes = next_primary.to_le_bytes(); // Convert to little-endian bytes, which is standard for WASM
-            memory.write(&mut caller, primary_ptr as usize, &dest_bytes)?;
-        }
-
-        Ok(res)
+    if res >= 0 {
+        let (env_data, store) = env.data_and_store_mut();
+        let memory = env_data
+            .memory()
+            .as_ref()
+            .expect("Wasm memory not initialized");
+        let view = memory.view(&store);
+        let slice = primary_ptr.slice(&view, 8)?;
+        let dest_bytes = next_primary.to_le_bytes(); // Convert to little-endian bytes, which is standard for WASM
+        slice.write_slice(&dest_bytes)?;
     }
+
+    Ok(res)
 }
 
-pub fn db_previous_i64() -> impl Fn(Caller<WasmContext>, i32, u32) -> Result<i32, wasmtime::Error> {
-    move |mut caller, itr, primary_ptr| {
-        let memory = caller
-            .get_export("memory")
-            .and_then(|ext| ext.into_memory())
-            .ok_or_else(|| anyhow::anyhow!("memory export not found"))?;
-        let context = caller.data().context().clone();
-        let mut session = caller.data_mut().session_mut();
-        let mut next_primary = 0u64;
-        let res = context.db_previous_i64(&mut session, itr, &mut next_primary)?;
+pub fn db_previous_i64(
+    mut env: FunctionEnvMut<WasmContext>,
+    itr: i32,
+    primary_ptr: WasmPtr<u8>,
+) -> Result<i32, RuntimeError> {
+    let context = env.data_mut().apply_context_mut();
+    let mut next_primary = 0u64;
+    let res = context.db_previous_i64(itr, &mut next_primary)?;
 
-        if res >= 0 {
-            let dest_bytes = next_primary.to_le_bytes(); // Convert to little-endian bytes, which is standard for WASM
-            memory.write(&mut caller, primary_ptr as usize, &dest_bytes)?;
-        }
-
-        Ok(res)
+    if res >= 0 {
+        let (env_data, store) = env.data_and_store_mut();
+        let memory = env_data
+            .memory()
+            .as_ref()
+            .expect("Wasm memory not initialized");
+        let view = memory.view(&store);
+        let slice = primary_ptr.slice(&view, 8)?;
+        let dest_bytes = next_primary.to_le_bytes(); // Convert to little-endian bytes, which is standard for WASM
+        slice.write_slice(&dest_bytes)?;
     }
+
+    Ok(res)
 }
 
-pub fn db_lowerbound_i64()
--> impl Fn(Caller<WasmContext>, u64, u64, u64, u64) -> Result<i32, wasmtime::Error> {
-    move |mut caller, code, scope, table, primary| {
-        let context = caller.data().context().clone();
-        let mut session = caller.data_mut().session_mut();
-        let res = context.db_lowerbound_i64(
-            &mut session,
-            code.into(),
-            scope.into(),
-            table.into(),
-            primary,
-        )?;
-        Ok(res)
-    }
+pub fn db_lowerbound_i64(
+    mut env: FunctionEnvMut<WasmContext>,
+    code: u64,
+    scope: u64,
+    table: u64,
+    primary: u64,
+) -> Result<i32, RuntimeError> {
+    let context = env.data_mut().apply_context_mut();
+    let res = context.db_lowerbound_i64(code.into(), scope.into(), table.into(), primary)?;
+    Ok(res)
 }
 
-pub fn db_upperbound_i64()
--> impl Fn(Caller<WasmContext>, u64, u64, u64, u64) -> Result<i32, wasmtime::Error> {
-    move |mut caller, code, scope, table, primary| {
-        let context = caller.data().context().clone();
-        let mut session = caller.data_mut().session_mut();
-        let res = context.db_upperbound_i64(
-            &mut session,
-            code.into(),
-            scope.into(),
-            table.into(),
-            primary,
-        )?;
-        Ok(res)
-    }
+pub fn db_upperbound_i64(
+    mut env: FunctionEnvMut<WasmContext>,
+    code: u64,
+    scope: u64,
+    table: u64,
+    primary: u64,
+) -> Result<i32, RuntimeError> {
+    let context = env.data_mut().apply_context_mut();
+    let res = context.db_upperbound_i64(code.into(), scope.into(), table.into(), primary)?;
+    Ok(res)
 }
 
-pub fn db_end_i64() -> impl Fn(Caller<WasmContext>, u64, u64, u64) -> Result<i32, wasmtime::Error> {
-    move |mut caller, code, scope, table| {
-        let context = caller.data().context().clone();
-        let mut session = caller.data_mut().session_mut();
-        Ok(context.db_end_i64(&mut session, code.into(), scope.into(), table.into())?)
-    }
+pub fn db_end_i64(
+    mut env: FunctionEnvMut<WasmContext>,
+    code: u64,
+    scope: u64,
+    table: u64,
+) -> Result<i32, RuntimeError> {
+    let context = env.data_mut().apply_context_mut();
+    Ok(context.db_end_i64(code.into(), scope.into(), table.into())?)
 }

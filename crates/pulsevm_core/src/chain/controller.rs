@@ -538,9 +538,14 @@ impl Controller {
         None
     }
 
-    #[inline]
-    pub fn get_wasm_runtime(&self) -> WasmRuntime {
-        self.wasm_runtime.clone()
+    pub fn create_undo_session(&mut self) -> Result<UndoSession, ChainError> {
+        self.db.undo_session().map_err(|e| {
+            ChainError::TransactionError(format!("failed to create undo session: {}", e))
+        })
+    }
+
+    pub fn get_wasm_runtime(&self) -> &WasmRuntime {
+        &self.wasm_runtime
     }
 
     pub fn get_global_properties(
