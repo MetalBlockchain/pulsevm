@@ -1,7 +1,13 @@
+use std::{
+    cell::RefCell,
+    rc::Rc,
+    sync::{Arc, RwLock},
+};
+
 use sha2::Digest;
 use wasmer::{FunctionEnvMut, RuntimeError, WasmPtr};
 
-use crate::chain::wasm_runtime::WasmContext;
+use crate::{apply_context::ApplyContext, chain::wasm_runtime::WasmContext};
 
 pub fn sha224(
     mut env: FunctionEnvMut<WasmContext>,

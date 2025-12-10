@@ -23,6 +23,7 @@ mod tests {
             Action, PackedTransaction, SignedTransaction, Transaction, TransactionTrace,
         },
         utils::pulse_assert,
+        wasm_runtime::{self, WasmRuntime},
     };
     use pulsevm_crypto::{Bytes, Digest};
     use pulsevm_proc_macros::name;
@@ -30,21 +31,23 @@ mod tests {
     use serde_json::json;
 
     #[derive(Clone)]
-    pub struct PendingBlockState {
-        pub undo_session: UndoSession,
+    pub struct PendingBlockState<'a> {
+        pub undo_session: UndoSession<'a>,
         pub timestamp: BlockTimestamp,
     }
 
-    pub struct Testing {
+    pub struct Testing<'a> {
         pub temp_dir: tempfile::TempDir,
         pub controller: Controller,
-        pub pending_block_state: Option<PendingBlockState>,
+        pub wasm_runtime: WasmRuntime,
+        pub pending_block_state: Option<PendingBlockState<'a>>,
     }
 
-    impl Testing {
+    impl<'a> Testing<'a> {
         pub fn new() -> Self {
             let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
             let mut controller = Controller::new();
+            let mut wasm_runtime = controller.get_wasm_runtime();
             let private_key = get_private_key(PULSE_NAME, "active");
             let genesis = generate_genesis(&private_key);
 
@@ -56,6 +59,7 @@ mod tests {
             let mut suite = Testing {
                 temp_dir,
                 controller,
+                wasm_runtime,
                 pending_block_state: None,
             };
 
@@ -76,7 +80,7 @@ mod tests {
 
             for account in accounts.iter() {
                 let trace =
-                    self.create_account(account.clone(), PULSE_NAME, multisig, include_code)?;
+                    { self.create_account(account.clone(), PULSE_NAME, multisig, include_code)? };
                 traces.push(trace);
             }
 
@@ -173,13 +177,14 @@ mod tests {
             &mut self,
             trx: SignedTransaction,
         ) -> Result<TransactionTrace, ChainError> {
-            let mut pending_block_state = self.get_pending_block_state();
+            let (mut undo_session, timestamp) = {
+                let state = self.get_pending_block_state();
+                (state.undo_session.clone(), state.timestamp.clone())
+            };
             let packed = PackedTransaction::from_signed_transaction(trx).unwrap();
-            let result = self.controller.execute_transaction(
-                &mut pending_block_state.undo_session,
-                &packed,
-                &pending_block_state.timestamp,
-            )?;
+            let result =
+                self.controller
+                    .execute_transaction(&mut undo_session, &packed, &timestamp)?;
             Ok(result.trace)
         }
 

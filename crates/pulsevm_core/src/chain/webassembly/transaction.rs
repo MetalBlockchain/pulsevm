@@ -1,17 +1,24 @@
-use std::collections::HashSet;
+use std::{
+    collections::HashSet,
+    sync::{Arc, RwLock},
+};
 
+use pulsevm_chainbase::UndoSession;
 use pulsevm_serialization::Read;
 use wasmer::{FunctionEnvMut, RuntimeError, WasmPtr};
 
-use crate::chain::{
-    authority::PermissionLevel,
-    authorization_manager::AuthorizationManager,
-    controller::Controller,
-    error::ChainError,
-    secp256k1::PublicKey,
-    transaction::{Action, Transaction},
-    utils::pulse_assert,
-    wasm_runtime::WasmContext,
+use crate::{
+    apply_context::ApplyContext,
+    chain::{
+        authority::PermissionLevel,
+        authorization_manager::AuthorizationManager,
+        controller::Controller,
+        error::ChainError,
+        secp256k1::PublicKey,
+        transaction::{Action, Transaction},
+        utils::pulse_assert,
+        wasm_runtime::WasmContext,
+    },
 };
 
 pub fn send_inline(

@@ -8,7 +8,7 @@ use sha2::Digest;
 
 use crate::chain::{Name, authority::PermissionLevel};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Default)]
 pub struct Action {
     account: Name,
     name: Name,

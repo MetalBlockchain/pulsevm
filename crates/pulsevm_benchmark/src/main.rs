@@ -18,6 +18,7 @@ use pulsevm_core::{
     pulse_contract::{NewAccount, SetAbi, SetCode},
     secp256k1::PrivateKey,
     transaction::{Action, PackedTransaction, Transaction, TransactionHeader},
+    wasm_runtime,
 };
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 use pulsevm_serialization::Write;
@@ -28,6 +29,7 @@ use spdlog::info;
 fn main() {
     let private_key = PrivateKey::random();
     let mut controller = Controller::new();
+    let mut wasm_runtime = wasm_runtime::WasmRuntime::new().unwrap();
     let genesis_bytes = generate_genesis(&private_key);
     let temp_path = get_temp_dir().to_str().unwrap().to_string();
     controller

@@ -5,7 +5,7 @@ use std::{
 };
 
 use chrono::Utc;
-use pulsevm_chainbase::UndoSession;
+use pulsevm_chainbase::{Session, UndoSession};
 use pulsevm_crypto::Bytes;
 use spdlog::info;
 
@@ -73,8 +73,6 @@ impl ApplyContext {
 
         Ok(ApplyContext {
             chain_config,
-            session,
-            wasm_runtime,
             trx_context,
 
             action,
@@ -96,7 +94,12 @@ impl ApplyContext {
         })
     }
 
-    pub fn exec(&mut self, trx_context: &mut TransactionContext) -> Result<u64, ChainError> {
+    pub fn exec(
+        &mut self,
+        wasm_runtime: &mut WasmRuntime,
+        trx_context: &mut TransactionContext,
+        session: &mut UndoSession<'_>,
+    ) -> Result<u64, ChainError> {
         let mut cpu_used = 0;
 
         {
@@ -106,7 +109,7 @@ impl ApplyContext {
                 .push_back((self.receiver, self.action_ordinal));
         }
 
-        cpu_used += self.exec_one()?;
+        cpu_used += self.exec_one(wasm_runtime, session)?;
 
         let notified_pairs: Vec<(Name, u32)> = {
             let inner = self.inner.read()?;
@@ -116,7 +119,7 @@ impl ApplyContext {
         for (receiver, action_ordinal) in notified_pairs {
             self.receiver = receiver;
             self.action_ordinal = action_ordinal;
-            cpu_used += self.exec_one()?;
+            cpu_used += self.exec_one(wasm_runtime, session)?;
         }
 
         {
@@ -139,8 +142,12 @@ impl ApplyContext {
         Ok(cpu_used)
     }
 
-    pub fn exec_one(&mut self) -> Result<u64, ChainError> {
-        let mut receiver_account = self.get_account_metadata(self.receiver)?;
+    pub fn exec_one(
+        &mut self,
+        wasm_runtime: &mut WasmRuntime,
+        session: &mut UndoSession<'_>,
+    ) -> Result<u64, ChainError> {
+        let mut receiver_account = self.get_account_metadata(session, self.receiver)?;
         let cpu_used = 100; // Base usage is always 100 instructions
 
         {
@@ -154,11 +161,11 @@ impl ApplyContext {
             self.action.name(),
         );
         if let Some(native) = native {
-            native(self)?;
+            native(self, session)?;
         }
 
         // Refresh the receiver account metadata
-        receiver_account = self.get_account_metadata(self.receiver)?;
+        receiver_account = self.get_account_metadata(session, self.receiver)?;
 
         // Does the receiver account have a contract deployed?
         if receiver_account.code_hash != Id::zero() {
@@ -177,20 +184,20 @@ impl ApplyContext {
         let first_receiver_account = if self.action.account() == self.receiver {
             receiver_account.clone()
         } else {
-            self.get_account_metadata(self.action.account())?
+            self.get_account_metadata(session, self.action.account())?
         };
         let mut receipt = ActionReceipt::new(
             self.receiver,
             act_digest,
-            self.next_global_sequence()?,
-            self.next_recv_sequence(&mut receiver_account)?,
+            self.next_global_sequence(session)?,
+            self.next_recv_sequence(session, &mut receiver_account)?,
             HashMap::new(),
             first_receiver_account.code_sequence,
             first_receiver_account.abi_sequence,
         );
 
         for auth in self.action.clone().authorization().iter() {
-            let auth_sequence = self.next_auth_sequence(&mut auth.actor.clone())?;
+            let auth_sequence = self.next_auth_sequence(session, &mut auth.actor.clone())?;
             receipt.add_auth_sequence(auth.actor, auth_sequence);
         }
 
@@ -284,25 +291,28 @@ impl ApplyContext {
         Ok(())
     }
 
-    pub fn is_account(&mut self, account: Name) -> Result<bool, ChainError> {
-        let exists = self
-            .session
+    pub fn is_account(
+        &self,
+        undo_session: &UndoSession<'_>,
+        account: Name,
+    ) -> Result<bool, ChainError> {
+        let exists = undo_session
             .find::<Account>(account)
             .map(|account| account.is_some())
             .map_err(|e| ChainError::TransactionError(format!("failed to find account: {}", e)))?;
         Ok(exists)
     }
 
-    pub fn undo_session(&self) -> UndoSession {
-        self.session.clone()
-    }
-
-    pub fn execute_inline(&mut self, a: &Action) -> Result<(), ChainError> {
+    pub fn execute_inline(
+        &mut self,
+        undo_session: &mut UndoSession<'_>,
+        a: &Action,
+    ) -> Result<(), ChainError> {
         let send_to_self = a.account() == self.receiver;
         let inherit_parent_authorizations = send_to_self && self.receiver == self.action.account();
 
         {
-            let code = self.session.find::<Account>(a.account())?;
+            let code = undo_session.find::<Account>(a.account())?;
             pulse_assert(
                 code.is_some(),
                 ChainError::TransactionError(format!(
@@ -314,7 +324,7 @@ impl ApplyContext {
             let mut inherited_authorizations: HashSet<PermissionLevel> = HashSet::new();
 
             for auth in a.authorization() {
-                let actor = self.session.find::<Account>(auth.actor)?;
+                let actor = undo_session.find::<Account>(auth.actor)?;
                 pulse_assert(
                     actor.is_some(),
                     ChainError::TransactionError(format!(
@@ -323,7 +333,7 @@ impl ApplyContext {
                     )),
                 )?;
                 pulse_assert(
-                    AuthorizationManager::find_permission(&mut self.session, auth)?.is_some(),
+                    AuthorizationManager::find_permission(undo_session, auth)?.is_some(),
                     ChainError::TransactionError(format!(
                         "inline action's authorizations include a non-existent permission: {}",
                         auth
@@ -344,7 +354,7 @@ impl ApplyContext {
             if !inner.privileged {
                 AuthorizationManager::check_authorization(
                     &self.chain_config,
-                    &mut self.session,
+                    undo_session,
                     &vec![a.clone()],
                     &HashSet::new(),       // No provided keys
                     &provided_permissions, // Default permission level
@@ -401,13 +411,14 @@ impl ApplyContext {
     }
 
     pub fn db_find_i64(
-        &mut self,
+        &self,
+        session: &mut UndoSession<'_>,
         code: Name,
         scope: Name,
         table: Name,
         id: u64,
     ) -> Result<i32, ChainError> {
-        let table = self.find_table(code, scope, table)?;
+        let table = self.find_table(session, code, scope, table)?;
 
         match table {
             Some(table) => {
@@ -430,14 +441,15 @@ impl ApplyContext {
     }
 
     pub fn db_store_i64(
-        &mut self,
+        &self,
+        session: &mut UndoSession<'_>,
         scope: Name,
         table: Name,
         payer: Name,
         primary_key: u64,
         data: Bytes,
     ) -> Result<i32, ChainError> {
-        let mut table = self.find_or_create_table(self.receiver, scope, table, payer)?;
+        let mut table = self.find_or_create_table(session, self.receiver, scope, table, payer)?;
         pulse_assert(
             !payer.empty(),
             ChainError::TransactionError(format!(
@@ -445,13 +457,13 @@ impl ApplyContext {
             )),
         )?;
 
-        let id = self.session.generate_id::<KeyValue>()?;
+        let id = session.generate_id::<KeyValue>()?;
         let len = data.len();
         let key_value = KeyValue::new(id, table.id, primary_key, payer, data);
-        self.session
+        session
             .insert(&key_value)
             .map_err(|e| ChainError::TransactionError(format!("failed to insert keyval: {}", e)))?;
-        self.session.modify(&mut table, |t| {
+        session.modify(&mut table, |t| {
             t.count += 1;
             Ok(())
         })?;
@@ -485,7 +497,8 @@ impl ApplyContext {
     }
 
     pub fn db_update_i64(
-        &mut self,
+        &self,
+        session: &mut UndoSession<'_>,
         iterator: i32,
         payer: Name,
         data: impl AsRef<[u8]>,
@@ -510,8 +523,7 @@ impl ApplyContext {
         } else if old_size != new_size {
             self.update_db_usage(obj.payer, new_size - old_size)?;
         }
-
-        self.session.modify(&mut obj.clone(), |kv| {
+        session.modify(&mut obj.clone(), |kv| {
             kv.payer = payer;
             kv.value = Bytes::from(data.as_ref().to_vec());
             Ok(())
@@ -533,15 +545,15 @@ impl ApplyContext {
             -(obj.value.len() as i64 + billable_size_v::<KeyValue>() as i64),
         )?;
 
-        self.session.remove(obj.clone())?;
-        self.session.modify(&mut table_obj.clone(), |t| {
+        session.remove(obj.clone())?;
+        session.modify(&mut table_obj.clone(), |t| {
             t.count -= 1;
             Ok(())
         })?;
 
         if table_obj.count == 0 {
             // If the table is empty, we can remove it
-            self.session.remove(table_obj.clone())?;
+            session.remove(table_obj.clone())?;
         }
 
         inner.keyval_cache.remove(iterator)?;
@@ -643,8 +655,14 @@ impl ApplyContext {
         }
     }
 
-    pub fn db_end_i64(&mut self, code: Name, scope: Name, table: Name) -> Result<i32, ChainError> {
-        let tab = self.find_table(code, scope, table)?;
+    pub fn db_end_i64(
+        &self,
+        session: &mut UndoSession<'_>,
+        code: Name,
+        scope: Name,
+        table: Name,
+    ) -> Result<i32, ChainError> {
+        let tab = self.find_table(session, code, scope, table)?;
 
         match tab {
             Some(table) => {
@@ -657,7 +675,8 @@ impl ApplyContext {
     }
 
     pub fn db_lowerbound_i64(
-        &mut self,
+        &self,
+        session: &mut UndoSession<'_>,
         code: Name,
         scope: Name,
         table: Name,
@@ -693,7 +712,8 @@ impl ApplyContext {
     }
 
     pub fn db_upperbound_i64(
-        &mut self,
+        &self,
+        session: &mut UndoSession<'_>,
         code: Name,
         scope: Name,
         table: Name,
@@ -729,45 +749,46 @@ impl ApplyContext {
     }
 
     pub fn find_table(
-        &mut self,
+        &self,
+        session: &mut UndoSession<'_>,
         code: Name,
         scope: Name,
         table: Name,
     ) -> Result<Option<Table>, ChainError> {
-        let table = self
-            .session
+        let table = session
             .find_by_secondary::<Table, TableByCodeScopeTableIndex>((code, scope, table))
             .map_err(|e| ChainError::TransactionError(format!("failed to find table: {}", e)))?;
         Ok(table)
     }
 
     pub fn find_or_create_table(
-        &mut self,
+        &self,
+        session: &mut UndoSession<'_>,
         code: Name,
         scope: Name,
         table: Name,
         payer: Name,
     ) -> Result<Table, ChainError> {
-        let existing_tid = self
-            .session
-            .find_by_secondary::<Table, TableByCodeScopeTableIndex>((code, scope, table))
-            .map_err(|e| ChainError::TransactionError(format!("failed to find table: {}", e)))?;
+        let existing_tid =
+            session.find_by_secondary::<Table, TableByCodeScopeTableIndex>((code, scope, table))?;
         if let Some(existing_table) = existing_tid {
             return Ok(existing_table);
         }
         // TODO: Update payer's RAM usage
-        let id = self.session.generate_id::<Table>()?;
+        let id = session.generate_id::<Table>()?;
         let table = Table::new(
             id, code, scope, table, payer, 0, // Initial count is 0
         );
-        self.session
-            .insert(&table)
-            .map_err(|e| ChainError::TransactionError(format!("failed to insert table: {}", e)))?;
+        session.insert(&table)?;
         Ok(table)
     }
 
-    pub fn get_account_metadata(&mut self, account: Name) -> Result<AccountMetadata, ChainError> {
-        self.session.get::<AccountMetadata>(account).map_err(|e| {
+    pub fn get_account_metadata(
+        &mut self,
+        session: &mut UndoSession<'_>,
+        account: Name,
+    ) -> Result<AccountMetadata, ChainError> {
+        session.get::<AccountMetadata>(account).map_err(|e| {
             ChainError::TransactionError(format!("failed to get account metadata: {}", e))
         })
     }
@@ -798,10 +819,11 @@ impl ApplyContext {
 
     pub fn next_recv_sequence(
         &mut self,
+        session: &mut UndoSession<'_>,
         receiver_account: &mut AccountMetadata,
     ) -> Result<u64, ChainError> {
         let next_sequence = receiver_account.recv_sequence + 1;
-        self.session.modify(receiver_account, |am| {
+        session.modify(receiver_account, |am| {
             am.recv_sequence = next_sequence;
             Ok(())
         })?;
@@ -809,10 +831,14 @@ impl ApplyContext {
         Ok(next_sequence)
     }
 
-    pub fn next_auth_sequence(&mut self, actor: &Name) -> Result<u64, ChainError> {
-        let mut amo = self.session.get::<AccountMetadata>(*actor)?;
+    pub fn next_auth_sequence(
+        &mut self,
+        session: &mut UndoSession<'_>,
+        actor: &Name,
+    ) -> Result<u64, ChainError> {
+        let mut amo = session.get::<AccountMetadata>(*actor)?;
         let next_sequence = amo.auth_sequence + 1;
-        self.session.modify(&mut amo, |amo| {
+        session.modify(&mut amo, |amo| {
             amo.auth_sequence = next_sequence;
             Ok(())
         })?;
@@ -820,18 +846,21 @@ impl ApplyContext {
         Ok(next_sequence)
     }
 
-    pub fn next_global_sequence(&mut self) -> Result<u64, ChainError> {
-        let dgpo = self.session.find::<DynamicGlobalPropertyObject>(0)?;
+    pub fn next_global_sequence(
+        &mut self,
+        session: &mut UndoSession<'_>,
+    ) -> Result<u64, ChainError> {
+        let dgpo = session.find::<DynamicGlobalPropertyObject>(0)?;
 
         if let Some(mut dgpo) = dgpo {
             let next_sequence = dgpo.global_action_sequence + 1;
-            self.session.modify(&mut dgpo, |dgpo| {
+            session.modify(&mut dgpo, |dgpo| {
                 dgpo.global_action_sequence = next_sequence;
                 Ok(())
             })?;
             return Ok(next_sequence);
         } else {
-            self.session.insert(&DynamicGlobalPropertyObject::new(1))?;
+            session.insert(&DynamicGlobalPropertyObject::new(1))?;
             return Ok(1);
         }
     }
