@@ -2,7 +2,7 @@ use core::fmt;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     path::Path,
-    sync::{Arc, LazyLock, RwLock},
+    sync::{Arc, LazyLock},
 };
 
 use crate::{
@@ -605,9 +605,8 @@ impl Controller {
 
 #[cfg(test)]
 mod tests {
-    use std::{env::temp_dir, fs, path::PathBuf, str::FromStr, vec};
+    use std::{fs, str::FromStr, vec};
 
-    use chrono::Utc;
     use pulsevm_proc_macros::{NumBytes, Read, Write};
     use pulsevm_serialization::Write;
     use pulsevm_time::TimePointSec;

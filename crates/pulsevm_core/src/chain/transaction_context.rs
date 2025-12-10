@@ -1,7 +1,5 @@
 use std::{
-    cell::RefCell,
     collections::{HashMap, HashSet},
-    rc::Rc,
     sync::{Arc, RwLock, atomic::AtomicI64},
 };
 
@@ -103,7 +101,7 @@ impl TransactionContext {
         }
 
         if initial_net_usage > 0 {
-            self.add_net_usage(initial_net_usage);
+            self.add_net_usage(initial_net_usage)?;
         }
 
         Ok(())
@@ -155,7 +153,7 @@ impl TransactionContext {
         }
 
         for action in transaction.actions.iter() {
-            self.schedule_action(action.clone(), &action.account(), false, 0, 0);
+            self.schedule_action(action.clone(), &action.account(), false, 0, 0)?;
         }
 
         let num_original_actions_to_execute = {
@@ -259,7 +257,7 @@ impl TransactionContext {
         )?;
 
         // Initialize the apply context with the action trace.
-        let cpu_used = apply_context.exec(self)?;
+        apply_context.exec(self)?;
         //self.billed_cpu_time_us
         //    .fetch_add(cpu_used as i64, std::sync::atomic::Ordering::Relaxed);
 

@@ -1,4 +1,4 @@
-use wasmtime::Caller;
+/* use wasmtime::Caller;
 
 use crate::chain::wasm_runtime::WasmContext;
 
@@ -85,3 +85,4 @@ pub fn memset() -> impl Fn(Caller<'_, WasmContext>, u32, u32, u32) -> Result<u32
         Ok(dest)
     }
 }
+ */

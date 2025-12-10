@@ -5,7 +5,9 @@ use std::{
 
 use lru::LruCache;
 use pulsevm_crypto::Bytes;
-use wasmer::{imports, sys::NativeEngineExt, Engine, Function, FunctionEnv, Instance, Memory, Module, Store, Value};
+use wasmer::{
+    Engine, Function, FunctionEnv, Instance, Memory, Module, Store, imports,
+};
 use wasmer_compiler_llvm::LLVM;
 
 use crate::{
@@ -29,7 +31,7 @@ use crate::{
 use super::{
     error::ChainError,
     webassembly::{
-        action_data_size, current_receiver, has_auth, is_account, memcmp, memcpy, memmove, memset,
+        action_data_size, current_receiver, has_auth, is_account,
         require_auth, send_inline,
     },
 };
@@ -103,100 +105,6 @@ impl WasmRuntime {
     pub fn new() -> Result<Self, ChainError> {
         let compiler = LLVM::default();
 
-        /* let mut config = Config::default();
-
-        // Enable the Cranelift optimizing compiler.
-        config.strategy(Strategy::Cranelift);
-
-        // Enable signals-based traps. This is required to elide explicit
-        // bounds-checking.
-        config.signals_based_traps(true);
-
-        // Configure linear memories such that explicit bounds-checking can be
-        // elided.
-        config.memory_reservation(1 << 32);
-        config.memory_guard_size(1 << 32);
-
-        // Enable copy-on-write heap images.
-        config.memory_init_cow(true);
-
-        // Enable parallel compilation.
-        config.parallel_compilation(true);
-
-        // Non-deterministic interruption
-        //config.epoch_interruption(true);
-        config.consume_fuel(true);
-
-        let engine = Engine::new(&config)
-            .map_err(|e| ChainError::WasmRuntimeError(e.to_string()))
-            .unwrap();
-
-        // Add host functions to the linker.
-        let mut linker = Linker::<WasmContext>::new(&engine);
-        // Action functions
-        Self::add_host_function(&mut linker, "env", "action_data_size", action_data_size())?;
-        Self::add_host_function(&mut linker, "env", "read_action_data", read_action_data())?;
-        Self::add_host_function(&mut linker, "env", "current_receiver", current_receiver())?;
-        Self::add_host_function(&mut linker, "env", "get_self", get_self())?;
-        Self::add_host_function(
-            &mut linker,
-            "env",
-            "set_action_return_value",
-            set_action_return_value(),
-        )?;
-        // Authorization functions
-        Self::add_host_function(&mut linker, "env", "require_auth", require_auth())?;
-        Self::add_host_function(&mut linker, "env", "has_auth", has_auth())?;
-        Self::add_host_function(&mut linker, "env", "require_auth2", require_auth2())?;
-        Self::add_host_function(&mut linker, "env", "require_recipient", require_recipient())?;
-        Self::add_host_function(&mut linker, "env", "is_account", is_account())?;
-        // Memory functions
-        Self::add_host_function(&mut linker, "env", "memcpy", memcpy())?;
-        Self::add_host_function(&mut linker, "env", "memmove", memmove())?;
-        Self::add_host_function(&mut linker, "env", "memcmp", memcmp())?;
-        Self::add_host_function(&mut linker, "env", "memset", memset())?;
-        // Transaction functions
-        Self::add_host_function(&mut linker, "env", "send_inline", send_inline())?;
-        Self::add_host_function(
-            &mut linker,
-            "env",
-            "check_transaction_authorization",
-            check_transaction_authorization(),
-        )?;
-        // Database functions
-        Self::add_host_function(&mut linker, "env", "db_find_i64", db_find_i64())?;
-        Self::add_host_function(&mut linker, "env", "db_store_i64", db_store_i64())?;
-        Self::add_host_function(&mut linker, "env", "db_get_i64", db_get_i64())?;
-        Self::add_host_function(&mut linker, "env", "db_update_i64", db_update_i64())?;
-        Self::add_host_function(&mut linker, "env", "db_remove_i64", db_remove_i64())?;
-        Self::add_host_function(&mut linker, "env", "db_next_i64", db_next_i64())?;
-        Self::add_host_function(&mut linker, "env", "db_previous_i64", db_previous_i64())?;
-        Self::add_host_function(&mut linker, "env", "db_end_i64", db_end_i64())?;
-        Self::add_host_function(&mut linker, "env", "db_lowerbound_i64", db_lowerbound_i64())?;
-        Self::add_host_function(&mut linker, "env", "db_upperbound_i64", db_upperbound_i64())?;
-        // System functions
-        Self::add_host_function(&mut linker, "env", "pulse_assert", pulse_assert())?;
-        Self::add_host_function(&mut linker, "env", "current_time", current_time())?;
-        // Privileged functions
-        Self::add_host_function(&mut linker, "env", "is_privileged", is_privileged())?;
-        Self::add_host_function(&mut linker, "env", "set_privileged", set_privileged())?;
-        Self::add_host_function(
-            &mut linker,
-            "env",
-            "set_resource_limits",
-            set_resource_limits(),
-        )?;
-        Self::add_host_function(
-            &mut linker,
-            "env",
-            "get_resource_limits",
-            get_resource_limits(),
-        )?;
-        // Crypto functions
-        Self::add_host_function(&mut linker, "env", "sha224", sha224())?;
-        Self::add_host_function(&mut linker, "env", "sha256", sha256())?;
-        Self::add_host_function(&mut linker, "env", "sha512", sha512())?; */
-
         Ok(Self {
             inner: Arc::new(RwLock::new(InnerWasmRuntime {
                 engine: compiler.into(),
@@ -204,22 +112,6 @@ impl WasmRuntime {
             })),
         })
     }
-
-    /* #[must_use]
-    fn add_host_function<Params, Args>(
-        linker: &mut Linker<WasmContext>,
-        module: &str,
-        name: &str,
-        func: impl IntoFunc<WasmContext, Params, Args>,
-    ) -> Result<(), ChainError>
-    where
-        WasmContext: 'static,
-    {
-        linker
-            .func_wrap(module, name, func)
-            .map_err(|e| ChainError::WasmRuntimeError(e.to_string()))?;
-        Ok(())
-    } */
 
     pub fn run(
         &mut self,
@@ -263,6 +155,7 @@ impl WasmRuntime {
                 "action_data_size" => Function::new_typed_with_env(&mut store, &env, action_data_size),
                 "read_action_data" => Function::new_typed_with_env(&mut store, &env, read_action_data),
                 "current_receiver" => Function::new_typed_with_env(&mut store, &env, current_receiver),
+                "set_action_return_value" => Function::new_typed_with_env(&mut store, &env, set_action_return_value),
                 "require_auth" => Function::new_typed_with_env(&mut store, &env, require_auth),
                 "has_auth" => Function::new_typed_with_env(&mut store, &env, has_auth),
                 "require_auth2" => Function::new_typed_with_env(&mut store, &env, require_auth2),
@@ -280,6 +173,15 @@ impl WasmRuntime {
                 "db_upperbound_i64" => Function::new_typed_with_env(&mut store, &env, db_upperbound_i64),
                 "pulse_assert" => Function::new_typed_with_env(&mut store, &env, pulse_assert),
                 "current_time" => Function::new_typed_with_env(&mut store, &env, current_time),
+                "sha224" => Function::new_typed_with_env(&mut store, &env, sha224),
+                "sha256" => Function::new_typed_with_env(&mut store, &env, sha256),
+                "sha512" => Function::new_typed_with_env(&mut store, &env, sha512),
+                "is_privileged" => Function::new_typed_with_env(&mut store, &env, is_privileged),
+                "set_privileged" => Function::new_typed_with_env(&mut store, &env, set_privileged),
+                "set_resource_limits" => Function::new_typed_with_env(&mut store, &env, set_resource_limits),
+                "get_resource_limits" => Function::new_typed_with_env(&mut store, &env, get_resource_limits),
+                "send_inline" => Function::new_typed_with_env(&mut store, &env, send_inline),
+                "check_transaction_authorization" => Function::new_typed_with_env(&mut store, &env, check_transaction_authorization),
             }
         };
         let instance = Instance::new(&mut store, &module, &import_object).map_err(|e| {

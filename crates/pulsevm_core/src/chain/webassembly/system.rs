@@ -8,10 +8,6 @@ pub fn pulse_assert(
     msg_ptr: WasmPtr<u8>,
     msg_len: u32,
 ) -> Result<(), RuntimeError> {
-    println!(
-        "pulse_assert called with condition: {}, msg_len: {}",
-        condition, msg_len
-    );
     if condition != 1 {
         let (env_data, store) = env.data_and_store_mut();
         let memory = env_data
@@ -36,7 +32,6 @@ pub fn pulse_assert(
             }
         }
     }
-    println!("pulse_assert passed");
 
     Ok(())
 }

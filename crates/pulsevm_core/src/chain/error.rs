@@ -1,4 +1,4 @@
-use std::{error::Error, fmt};
+use std::error::Error;
 
 use pulsevm_chainbase::ChainbaseError;
 use thiserror::Error;

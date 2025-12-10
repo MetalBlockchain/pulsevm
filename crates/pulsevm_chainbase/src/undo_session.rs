@@ -8,15 +8,8 @@ use fjall::{PartitionCreateOptions, Slice, TransactionalKeyspace, WriteTransacti
 
 use crate::{ChainbaseError, ChainbaseObject, SecondaryIndex, index::Index, open_partition};
 
-enum ObjectChange {
-    New(Vec<u8>),                      // key
-    Modified(Vec<u8>, Slice, Vec<u8>), // (key, old, new)
-    Deleted(Vec<u8>, Vec<u8>),         // key, previous value
-}
-
 #[derive(Clone)]
 pub struct UndoSession {
-    changes: Arc<RwLock<VecDeque<ObjectChange>>>,
     tx: Arc<RwLock<WriteTransaction>>,
     keyspace: TransactionalKeyspace,
     partition_create_options: PartitionCreateOptions,
@@ -29,7 +22,6 @@ impl UndoSession {
         partition_create_options: PartitionCreateOptions,
     ) -> Result<Self, ChainbaseError> {
         Ok(Self {
-            changes: Arc::new(RwLock::new(VecDeque::new())),
             tx: Arc::new(RwLock::new(keyspace.write_tx().map_err(|_| {
                 ChainbaseError::InternalError("failed to create write transaction".to_string())
             })?)),
@@ -228,23 +220,9 @@ impl UndoSession {
             T::table_name(),
             self.partition_create_options.clone(),
         )?;
-        let exists = tx.contains_key(&partition, &key).map_err(|_| {
-            ChainbaseError::InternalError(format!("failed to check existence for key: {:?}", key))
-        })?;
-        if exists {
-            return Err(ChainbaseError::AlreadyExists);
-        }
-
         let serialized = object.pack().map_err(|_| {
             ChainbaseError::InternalError(format!("failed to serialize object for key: {:?}", key))
         })?;
-
-        let mut changes = self
-            .changes
-            .write()
-            .map_err(|_| ChainbaseError::InternalError(format!("failed to write changes")))?;
-        changes.push_back(ObjectChange::New(key.to_owned()));
-
         tx.insert(&partition, &key, serialized);
 
         for index in object.secondary_indexes() {
@@ -274,39 +252,15 @@ impl UndoSession {
             self.partition_create_options.clone(),
         )?;
         let key = old.primary_key();
-        let key_bytes = old.primary_key();
-
-        let existing = tx.get(&partition, &key_bytes).map_err(|_| {
-            ChainbaseError::InternalError(format!(
-                "failed to get existing object for key: {:?}",
-                key
-            ))
-        })?;
-        let Some(old_bytes) = existing else {
-            return Err(ChainbaseError::NotFound);
-        };
-
         f(old).map_err(|e| {
             ChainbaseError::InternalError(format!("failed to modify object for key {:?}: {e}", key))
         })?;
-
         let new_bytes = old.pack().map_err(|_| {
             ChainbaseError::InternalError(format!(
                 "failed to serialize modified object for key: {:?}",
                 key
             ))
         })?;
-
-        let mut changes = self
-            .changes
-            .write()
-            .map_err(|_| ChainbaseError::InternalError(format!("failed to write changes")))?;
-        changes.push_back(ObjectChange::Modified(
-            key.to_owned(),
-            old_bytes,         // moved
-            new_bytes.clone(), // keep a copy for insertion below
-        ));
-
         tx.insert(&partition, &key, new_bytes);
         Ok(())
     }
@@ -329,14 +283,6 @@ impl UndoSession {
         if old_value.is_none() {
             return Err(ChainbaseError::NotFound);
         }
-        let mut changes = self
-            .changes
-            .write()
-            .map_err(|_| ChainbaseError::InternalError(format!("failed to write changes")))?;
-        changes.push_back(ObjectChange::Deleted(
-            key.to_owned(),
-            old_value.unwrap().to_vec(),
-        ));
         tx.remove(&partition, &key);
         for index in object.secondary_indexes() {
             let partition = open_partition(

@@ -1,6 +1,4 @@
-use anyhow::bail;
-use wasmer::RuntimeError;
-use wasmtime::Caller;
+use wasmer::{FunctionEnvMut, RuntimeError, WasmPtr};
 
 use crate::chain::{
     account::AccountMetadata, apply_context::ApplyContext, error::ChainError,
@@ -16,110 +14,101 @@ fn privileged_check(context: &ApplyContext) -> Result<(), RuntimeError> {
     Ok(())
 }
 
-pub fn is_privileged() -> impl Fn(Caller<'_, WasmContext>, u64) -> Result<i32, wasmtime::Error> {
-    |mut caller, account| {
-        let context = caller.data_mut().apply_context_mut();
-        privileged_check(context)?;
-        let mut session = context.undo_session();
-        let account = session
-            .get::<AccountMetadata>(account.into())
-            .map_err(|_| anyhow::anyhow!("account not found: {}", account))?;
+pub fn is_privileged(
+    mut env: FunctionEnvMut<WasmContext>,
+    account: u64,
+) -> Result<i32, RuntimeError> {
+    let context = env.data_mut().apply_context_mut();
+    privileged_check(context)?;
+    let mut session = context.undo_session();
+    let account = session
+        .get::<AccountMetadata>(account.into())
+        .map_err(|_| RuntimeError::new(format!("account not found: {}", account)))?;
 
-        Ok(account.is_privileged() as i32)
-    }
+    Ok(account.is_privileged() as i32)
 }
 
-pub fn set_privileged() -> impl Fn(Caller<'_, WasmContext>, u64, i32) -> Result<(), wasmtime::Error>
-{
-    |mut caller, account, is_priv| {
-        let context = caller.data_mut().apply_context_mut();
-        privileged_check(context)?;
-        let mut session = context.undo_session();
-        let mut account = session
-            .get::<AccountMetadata>(account.into())
-            .map_err(|_| anyhow::anyhow!("account not found: {}", account))?;
-        session
-            .modify(&mut account, |acc| {
-                acc.set_privileged(is_priv == 1);
-                Ok(())
-            })
-            .map_err(|_| anyhow::anyhow!("failed to set privileged status for account"))?;
-
-        Ok(())
-    }
+pub fn set_privileged(
+    mut env: FunctionEnvMut<WasmContext>,
+    account: u64,
+    is_priv: i32,
+) -> Result<(), RuntimeError> {
+    let context = env.data_mut().apply_context_mut();
+    privileged_check(context)?;
+    context.set_privileged(account.into(), is_priv == 1)?;
+    Ok(())
 }
 
-pub fn set_resource_limits()
--> impl Fn(Caller<'_, WasmContext>, u64, i64, i64, i64) -> Result<(), wasmtime::Error> {
-    |mut caller, account, ram_bytes, net_weight, cpu_weight| {
-        pulse_assert(
-            ram_bytes >= -1,
-            ChainError::WasmRuntimeError(format!(
-                "invalid value for ram resource limit expected [-1,INT64_MAX]"
-            )),
-        )?;
-        pulse_assert(
-            net_weight >= -1,
-            ChainError::WasmRuntimeError(format!(
-                "invalid value for net resource limit expected [-1,INT64_MAX]"
-            )),
-        )?;
-        pulse_assert(
-            cpu_weight >= -1,
-            ChainError::WasmRuntimeError(format!(
-                "invalid value for cpu resource limit expected [-1,INT64_MAX]"
-            )),
-        )?;
-        let context = caller.data_mut().apply_context_mut();
-        privileged_check(context)?;
-        let mut session = context.undo_session();
-        ResourceLimitsManager::set_account_limits(
-            &mut session,
-            &account.into(),
-            net_weight,
-            cpu_weight,
-            ram_bytes,
-        )?;
-        // TODO: Validate ram usage
-        Ok(())
-    }
+pub fn set_resource_limits(
+    mut env: FunctionEnvMut<WasmContext>,
+    account: u64,
+    ram_bytes: i64,
+    net_weight: i64,
+    cpu_weight: i64,
+) -> Result<(), RuntimeError> {
+    pulse_assert(
+        ram_bytes >= -1,
+        ChainError::WasmRuntimeError(format!(
+            "invalid value for ram resource limit expected [-1,INT64_MAX]"
+        )),
+    )?;
+    pulse_assert(
+        net_weight >= -1,
+        ChainError::WasmRuntimeError(format!(
+            "invalid value for net resource limit expected [-1,INT64_MAX]"
+        )),
+    )?;
+    pulse_assert(
+        cpu_weight >= -1,
+        ChainError::WasmRuntimeError(format!(
+            "invalid value for cpu resource limit expected [-1,INT64_MAX]"
+        )),
+    )?;
+    let context = env.data_mut().apply_context_mut();
+    privileged_check(context)?;
+    let mut session = context.undo_session();
+    ResourceLimitsManager::set_account_limits(
+        &mut session,
+        &account.into(),
+        net_weight,
+        cpu_weight,
+        ram_bytes,
+    )?;
+    // TODO: Validate ram usage
+    Ok(())
 }
 
-pub fn get_resource_limits()
--> impl Fn(Caller<'_, WasmContext>, u64, i32, i32, i32) -> Result<(), wasmtime::Error> {
-    |mut caller, account, ram_bytes_ptr, net_weight_ptr, cpu_weight_ptr| {
-        let context = caller.data_mut().apply_context_mut();
-        privileged_check(context)?;
-        let mut session = context.undo_session();
-        let mut ram_bytes = 0;
-        let mut net_weight = 0;
-        let mut cpu_weight = 0;
-        ResourceLimitsManager::get_account_limits(
-            &mut session,
-            &account.into(),
-            &mut ram_bytes,
-            &mut net_weight,
-            &mut cpu_weight,
-        )?;
-        let memory = caller
-            .get_export("memory")
-            .and_then(|ext| ext.into_memory())
-            .ok_or_else(|| anyhow::anyhow!("memory export not found"))?;
-        memory.write(
-            &mut caller,
-            ram_bytes_ptr as usize,
-            &ram_bytes.to_le_bytes(),
-        )?;
-        memory.write(
-            &mut caller,
-            net_weight_ptr as usize,
-            &net_weight.to_le_bytes(),
-        )?;
-        memory.write(
-            &mut caller,
-            cpu_weight_ptr as usize,
-            &cpu_weight.to_le_bytes(),
-        )?;
-        Ok(())
-    }
+pub fn get_resource_limits(
+    mut env: FunctionEnvMut<WasmContext>,
+    account: u64,
+    ram_bytes_ptr: WasmPtr<u8>,
+    net_weight_ptr: WasmPtr<u8>,
+    cpu_weight_ptr: WasmPtr<u8>,
+) -> Result<(), RuntimeError> {
+    let (env_data, store) = env.data_and_store_mut();
+    let context = env_data.apply_context_mut();
+    privileged_check(context)?;
+    let mut session = context.undo_session();
+    let mut ram_bytes = 0;
+    let mut net_weight = 0;
+    let mut cpu_weight = 0;
+    ResourceLimitsManager::get_account_limits(
+        &mut session,
+        &account.into(),
+        &mut ram_bytes,
+        &mut net_weight,
+        &mut cpu_weight,
+    )?;
+    let memory = env_data
+        .memory()
+        .as_ref()
+        .expect("Wasm memory not initialized");
+    let view = memory.view(&store);
+    let ram_bytes_slice = ram_bytes_ptr.slice(&view, 8)?;
+    let net_weight_slice = net_weight_ptr.slice(&view, 8)?;
+    let cpu_weight_slice = cpu_weight_ptr.slice(&view, 8)?;
+    ram_bytes_slice.write_slice(&ram_bytes.to_le_bytes())?;
+    net_weight_slice.write_slice(&net_weight.to_le_bytes())?;
+    cpu_weight_slice.write_slice(&cpu_weight.to_le_bytes())?;
+    Ok(())
 }
