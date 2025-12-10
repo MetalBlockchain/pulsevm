@@ -1,14 +1,12 @@
 use std::{
-    cell::RefCell,
-    collections::HashMap,
-    rc::Rc,
+    collections::VecDeque,
     sync::{Arc, RwLock},
 };
 
 use anyhow::Result;
-use heed::{Database, Env, PutFlags, RwTxn, types::Bytes};
+use fjall::{PartitionCreateOptions, Slice, TransactionalKeyspace, WriteTransaction};
 
-use crate::{ChainbaseError, ChainbaseObject, SecondaryIndex, Session, index::Index};
+use crate::{ChainbaseError, ChainbaseObject, SecondaryIndex, index::Index, open_partition};
 
 #[derive(Clone)]
 pub struct UndoSession {
@@ -17,11 +15,11 @@ pub struct UndoSession {
     partition_create_options: PartitionCreateOptions,
 }
 
-impl<'a> UndoSession<'a> {
+impl UndoSession {
     #[inline]
     pub fn new(
-        databases: Arc<RwLock<HashMap<&'static str, Database<Bytes, Bytes>>>>,
-        tx: RwTxn<'a>,
+        keyspace: &TransactionalKeyspace,
+        partition_create_options: PartitionCreateOptions,
     ) -> Result<Self, ChainbaseError> {
         Ok(Self {
             tx: Arc::new(RwLock::new(keyspace.write_tx().map_err(|_| {
@@ -33,56 +31,185 @@ impl<'a> UndoSession<'a> {
     }
 
     #[inline]
-    pub fn get_database(
-        &self,
-        name: &'static str,
-    ) -> Result<Database<Bytes, Bytes>, ChainbaseError> {
-        let databases = self
-            .databases
-            .read()
-            .map_err(|_| ChainbaseError::InternalError("failed to get db".into()))?;
+    pub fn tx(&self) -> Arc<RwLock<WriteTransaction>> {
+        self.tx.clone()
+    }
 
-        if let Some(db) = databases.get(name) {
-            Ok(db.clone())
-        } else {
-            Err(ChainbaseError::NotFound)
+    #[inline]
+    pub fn keyspace(&self) -> TransactionalKeyspace {
+        self.keyspace.clone()
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn exists<T: ChainbaseObject>(
+        &mut self,
+        key: T::PrimaryKey,
+    ) -> Result<bool, ChainbaseError> {
+        let partition = open_partition(
+            &self.keyspace,
+            T::table_name(),
+            self.partition_create_options.clone(),
+        )?;
+        let mut tx = self
+            .tx
+            .write()
+            .map_err(|_| ChainbaseError::InternalError(format!("failed to write transaction")))?;
+        let res = tx
+            .contains_key(&partition, T::primary_key_to_bytes(key))
+            .map_err(|_| {
+                ChainbaseError::InternalError(format!("failed to check existence for key"))
+            })?;
+        Ok(res)
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn find<T: ChainbaseObject>(
+        &mut self,
+        key: T::PrimaryKey,
+    ) -> Result<Option<T>, ChainbaseError> {
+        let partition = open_partition(
+            &self.keyspace,
+            T::table_name(),
+            self.partition_create_options.clone(),
+        )?;
+        let mut tx = self
+            .tx
+            .write()
+            .map_err(|_| ChainbaseError::InternalError(format!("failed to write transaction")))?;
+        let serialized = tx
+            .get(&partition, T::primary_key_to_bytes(key))
+            .map_err(|_| ChainbaseError::InternalError(format!("failed to get object for key")))?;
+        if serialized.is_none() {
+            return Ok(None);
         }
+        let mut pos = 0 as usize;
+        let object: T = T::read(&serialized.unwrap(), &mut pos).expect("failed to read object");
+        Ok(Some(object))
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn get<T: ChainbaseObject>(&mut self, key: T::PrimaryKey) -> Result<T, ChainbaseError> {
+        let found = self.find::<T>(key)?;
+        if found.is_none() {
+            return Err(ChainbaseError::NotFound);
+        }
+        let object = found.unwrap();
+        Ok(object)
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn get_by_secondary<T: ChainbaseObject, S: SecondaryIndex<T>>(
+        &mut self,
+        key: S::Key,
+    ) -> Result<T, ChainbaseError> {
+        let partition = open_partition(
+            &self.keyspace,
+            S::index_name(),
+            self.partition_create_options.clone(),
+        )?;
+        let mut tx = self
+            .tx
+            .write()
+            .map_err(|_| ChainbaseError::InternalError(format!("failed to write transaction")))?;
+        let secondary_key = tx
+            .get(&partition, S::secondary_key_as_bytes(key))
+            .map_err(|_| ChainbaseError::InternalError(format!("failed to get secondary key")))?;
+        if secondary_key.is_none() {
+            return Err(ChainbaseError::NotFound);
+        }
+        let partition = open_partition(
+            &self.keyspace,
+            T::table_name(),
+            self.partition_create_options.clone(),
+        )?;
+        let serialized = tx.get(&partition, secondary_key.unwrap()).map_err(|_| {
+            ChainbaseError::InternalError(format!("failed to get object for secondary key"))
+        })?;
+        if serialized.is_none() {
+            return Err(ChainbaseError::NotFound);
+        }
+        let mut pos = 0 as usize;
+        let object: T = T::read(&serialized.unwrap(), &mut pos)
+            .map_err(|_| ChainbaseError::InternalError(format!("failed to read object")))?;
+        Ok(object)
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn find_by_secondary<T: ChainbaseObject, S: SecondaryIndex<T>>(
+        &mut self,
+        key: S::Key,
+    ) -> Result<Option<T>, ChainbaseError> {
+        let mut tx = self
+            .tx
+            .write()
+            .map_err(|_| ChainbaseError::InternalError(format!("failed to write transaction")))?;
+        let sec_part = open_partition(
+            &self.keyspace,
+            S::index_name(),
+            self.partition_create_options.clone(),
+        )?;
+        if let Some(primary_key) = tx
+            .get(&sec_part, S::secondary_key_as_bytes(key))
+            .map_err(|_| ChainbaseError::InternalError("failed to get secondary key".into()))?
+        {
+            let prim_part = open_partition(
+                &self.keyspace,
+                T::table_name(),
+                self.partition_create_options.clone(),
+            )?;
+            if let Some(bytes) = tx.get(&prim_part, primary_key).map_err(|_| {
+                ChainbaseError::InternalError("failed to get object for secondary key".into())
+            })? {
+                let mut pos = 0usize;
+                let obj = T::read(&bytes, &mut pos)
+                    .map_err(|_| ChainbaseError::InternalError("failed to read object".into()))?;
+                return Ok(Some(obj));
+            }
+        }
+        Ok(None)
     }
 
     #[inline]
     pub fn generate_id<T: ChainbaseObject>(&mut self) -> Result<u64, ChainbaseError> {
-        let db = self.get_database(T::table_name())?;
+        let partition = open_partition(
+            &self.keyspace,
+            T::table_name(),
+            self.partition_create_options.clone(),
+        )?;
+        let mut new_id = 1u64;
         let mut tx = self
             .tx
             .write()
-            .map_err(|e| ChainbaseError::InternalError(format!("failed to lock tx: {}", e)))?;
-        let current_id = match db.get(&tx, &KEY) {
-            Ok(Some(bytes)) => u64::from_le_bytes(bytes.try_into().map_err(|e| {
-                ChainbaseError::InternalError(format!("failed to convert bytes to id: {}", e))
-            })?),
-            Ok(None) => 0,
-            Err(e) => {
-                return Err(ChainbaseError::InternalError(format!(
-                    "failed to get current id: {}",
-                    e
-                )));
+            .map_err(|_| ChainbaseError::InternalError(format!("failed to write transaction")))?;
+        // Do we have a sequence for this table?
+        tx.fetch_update(&partition, "id", |v| {
+            if v.is_none() {
+                return Some(Slice::new(&1u64.to_le_bytes()));
             }
-        };
-
-        // Compute new ID
-        let new_id = current_id + 1;
-
-        // Store new ID
-        db.put(&mut tx, &KEY, &new_id.to_le_bytes())
-            .map_err(|e| ChainbaseError::InternalError(format!("failed to store new id: {}", e)))?;
-
+            let id = v.unwrap();
+            let mut arr = [0u8; 8];
+            arr.copy_from_slice(&id);
+            let mut id = u64::from_le_bytes(arr);
+            id += 1;
+            new_id = id;
+            Some(Slice::new(&id.to_le_bytes()))
+        })
+        .map_err(|_| {
+            ChainbaseError::InternalError(format!(
+                "failed to generate new ID for table: {}",
+                T::table_name()
+            ))
+        })?;
         Ok(new_id)
     }
 
     #[inline]
     pub fn insert<T: ChainbaseObject>(&mut self, object: &T) -> Result<(), ChainbaseError> {
-        let key = object.primary_key();
-        let db = self.get_database(T::table_name())?;
         let mut tx = self
             .tx
             .write()
@@ -110,7 +237,7 @@ impl<'a> UndoSession<'a> {
     }
 
     #[inline]
-    pub fn modify<T, F>(&mut self, obj: &mut T, f: F) -> Result<(), ChainbaseError>
+    pub fn modify<T, F>(&mut self, old: &mut T, f: F) -> Result<(), ChainbaseError>
     where
         T: ChainbaseObject,
         F: FnOnce(&mut T) -> Result<()>,
@@ -141,16 +268,17 @@ impl<'a> UndoSession<'a> {
     #[inline]
     pub fn remove<T: ChainbaseObject>(&mut self, object: T) -> Result<(), ChainbaseError> {
         let key = object.primary_key();
-        let db = self.get_database(T::table_name())?;
+        let partition = open_partition(
+            &self.keyspace,
+            T::table_name(),
+            self.partition_create_options.clone(),
+        )?;
         let mut tx = self
             .tx
             .write()
-            .map_err(|e| ChainbaseError::InternalError(format!("failed to lock tx: {}", e)))?;
-        db.delete(&mut tx, &key).map_err(|e| {
-            ChainbaseError::InternalError(format!(
-                "failed to delete object for key {:?}: {}",
-                key, e
-            ))
+            .map_err(|_| ChainbaseError::InternalError(format!("failed to write transaction")))?;
+        let old_value = tx.get(&partition, &key).map_err(|_| {
+            ChainbaseError::InternalError(format!("failed to get object for key: {:?}", key))
         })?;
         if old_value.is_none() {
             return Err(ChainbaseError::NotFound);
@@ -167,146 +295,43 @@ impl<'a> UndoSession<'a> {
         Ok(())
     }
 
-        for index in object.secondary_indexes().iter() {
-            let db = self.get_database(index.index_name)?;
-            db.delete(&mut tx, &index.key).map_err(|e| {
-                ChainbaseError::InternalError(format!(
-                    "failed to delete secondary index for key {:?}: {}",
-                    key, e
-                ))
-            })?;
-        }
-
-        Ok(())
-    }
-
     #[inline]
     pub fn commit(self) -> Result<(), ChainbaseError> {
-        Arc::try_unwrap(self.tx)
-            .map_err(|_| ChainbaseError::InternalError("failed to unwrap tx".into()))?
+        let tx = Arc::try_unwrap(self.tx)
+            .map_err(|_| "failed to unwrap Rc: multiple owners".to_string())
+            .map_err(|_| ChainbaseError::InternalError("failed to unwrap transaction".to_string()))?
             .into_inner()
-            .map_err(|_| ChainbaseError::InternalError("failed to lock tx for commit".into()))?
-            .commit()
-            .map_err(|e| ChainbaseError::InternalError(format!("failed to commit tx: {}", e)))?;
+            .map_err(|_| {
+                ChainbaseError::InternalError("failed to get inner transaction".to_string())
+            })?;
+        let result = tx.commit();
+        if result.is_err() {
+            return Err(ChainbaseError::InternalError(
+                "failed to commit transaction".to_string(),
+            ));
+        }
         Ok(())
     }
 
     #[inline]
-    pub fn get_index<C, S>(&self) -> Index<'a, C, S>
+    pub fn rollback(self) -> Result<(), ChainbaseError> {
+        let tx = Arc::try_unwrap(self.tx)
+            .map_err(|_| "failed to unwrap Rc: multiple owners".to_string())
+            .map_err(|_| ChainbaseError::InternalError("failed to unwrap transaction".to_string()))?
+            .into_inner()
+            .map_err(|_| {
+                ChainbaseError::InternalError("failed to get inner transaction".to_string())
+            })?;
+        tx.rollback();
+        Ok(())
+    }
+
+    #[inline]
+    pub fn get_index<C, S>(&self) -> Index<C, S>
     where
         C: ChainbaseObject,
         S: SecondaryIndex<C>,
     {
-        Index::new(self.clone())
-    }
-}
-
-impl Session for UndoSession<'_> {
-    fn exists<T: ChainbaseObject>(&mut self, key: T::PrimaryKey) -> Result<bool, ChainbaseError> {
-        let db = self.get_database(T::table_name())?;
-        let tx = self
-            .tx
-            .read()
-            .map_err(|e| ChainbaseError::InternalError(format!("{}", e)))?;
-        let res = db.get(&tx, &T::primary_key_to_bytes(key));
-
-        match res {
-            Ok(Some(_)) => Ok(true),
-            Ok(None) => Ok(false),
-            Err(e) => Err(ChainbaseError::InternalError(format!(
-                "failed to check existence: {}",
-                e
-            ))),
-        }
-    }
-
-    fn find<T: ChainbaseObject>(&self, key: T::PrimaryKey) -> Result<Option<T>, ChainbaseError> {
-        let db = self.get_database(T::table_name())?;
-        let tx = self
-            .tx
-            .read()
-            .map_err(|e| ChainbaseError::InternalError(format!("{}", e)))?;
-        let res = db.get(&tx, &T::primary_key_to_bytes(key));
-
-        match res {
-            Ok(Some(data)) => {
-                let mut pos = 0;
-                let object: T = T::read(&data, &mut pos).map_err(|_| ChainbaseError::ReadError)?;
-                return Ok(Some(object));
-            }
-            Ok(None) => {
-                return Ok(None);
-            }
-            Err(e) => {
-                return Err(ChainbaseError::InternalError(format!(
-                    "failed to get object: {}",
-                    e
-                )));
-            }
-        };
-    }
-
-    fn find_by_secondary<T: ChainbaseObject, S: SecondaryIndex<T>>(
-        &self,
-        key: S::Key,
-    ) -> Result<Option<T>, ChainbaseError> {
-        let res = self.get_by_secondary::<T, S>(key);
-
-        match res {
-            Ok(obj) => Ok(Some(obj)),
-            Err(ChainbaseError::NotFound) => Ok(None),
-            Err(e) => Err(e),
-        }
-    }
-
-    fn get<T: ChainbaseObject>(&self, key: T::PrimaryKey) -> Result<T, ChainbaseError> {
-        let found = self.find::<T>(key)?;
-
-        match found {
-            Some(obj) => Ok(obj),
-            None => Err(ChainbaseError::NotFound),
-        }
-    }
-
-    fn get_by_secondary<T: ChainbaseObject, S: SecondaryIndex<T>>(
-        &self,
-        key: S::Key,
-    ) -> Result<T, ChainbaseError> {
-        let db = self.get_database(S::index_name())?;
-        let tx = self
-            .tx
-            .read()
-            .map_err(|e| ChainbaseError::InternalError(format!("{}", e)))?;
-        let secondary_key = db.get(&tx, &S::secondary_key_as_bytes(key));
-        let secondary_key = match secondary_key {
-            Err(e) => {
-                return Err(ChainbaseError::InternalError(format!(
-                    "failed to get secondary key: {}",
-                    e
-                )));
-            }
-            Ok(Some(v)) => v,
-            Ok(None) => return Err(ChainbaseError::NotFound),
-        };
-
-        let db = self.get_database(T::table_name())?;
-        let res = db.get(&tx, &secondary_key);
-
-        match res {
-            Ok(Some(data)) => {
-                let mut pos = 0;
-                let object: T = T::read(&data, &mut pos).map_err(|_| ChainbaseError::ReadError)?;
-                return Ok(object);
-            }
-            Ok(None) => {
-                return Err(ChainbaseError::NotFound);
-            }
-            Err(e) => {
-                return Err(ChainbaseError::InternalError(format!(
-                    "failed to get object: {}",
-                    e
-                )));
-            }
-        };
+        Index::<C, S>::new(self.clone(), self.keyspace.clone())
     }
 }

@@ -7,22 +7,20 @@ use pulsevm_chainbase::UndoSession;
 use pulsevm_serialization::VarUint32;
 use pulsevm_time::{Microseconds, TimePoint};
 
-use crate::{
-    chain::{
-        apply_context::ApplyContext,
-        block::BlockTimestamp,
-        error::ChainError,
-        genesis::ChainConfig,
-        id::Id,
-        name::Name,
-        resource_limits::ResourceLimitsManager,
-        transaction::{
-            Action, ActionTrace, Transaction, TransactionReceiptHeader, TransactionStatus,
-            TransactionTrace,
-        },
-        utils::pulse_assert,
+use crate::chain::{
+    apply_context::ApplyContext,
+    block::BlockTimestamp,
+    error::ChainError,
+    genesis::ChainConfig,
+    id::Id,
+    name::Name,
+    resource_limits::ResourceLimitsManager,
+    transaction::{
+        Action, ActionTrace, Transaction, TransactionReceiptHeader, TransactionStatus,
+        TransactionTrace,
     },
-    wasm_runtime::{self, WasmRuntime},
+    utils::pulse_assert,
+    wasm_runtime::WasmRuntime,
 };
 
 #[derive(Default, Clone)]
@@ -58,6 +56,7 @@ pub struct TransactionContext {
 
 impl TransactionContext {
     pub fn new(
+        session: UndoSession,
         chain_config: Arc<ChainConfig>,
         wasm_runtime: WasmRuntime,
         block_num: u32,
@@ -146,12 +145,7 @@ impl TransactionContext {
         Ok(())
     }
 
-    pub fn exec(
-        &mut self,
-        undo_session: &mut UndoSession<'_>,
-        wasm_runtime: &mut WasmRuntime,
-        transaction: &Transaction,
-    ) -> Result<(), ChainError> {
+    pub fn exec(&mut self, transaction: &Transaction) -> Result<(), ChainError> {
         // Reserve actions array
         {
             let mut inner = self.inner.write()?;
@@ -168,7 +162,7 @@ impl TransactionContext {
         };
 
         for i in 1..=num_original_actions_to_execute {
-            self.execute_action(undo_session, wasm_runtime, i as u32, 0)?;
+            self.execute_action(i as u32, 0)?;
         }
 
         Ok(())
@@ -246,8 +240,6 @@ impl TransactionContext {
 
     pub fn execute_action(
         &mut self,
-        session: &mut UndoSession,
-        wasm_runtime: &mut WasmRuntime,
         action_ordinal: u32,
         recurse_depth: u32,
     ) -> Result<(), ChainError> {
@@ -255,6 +247,8 @@ impl TransactionContext {
             self.with_action_trace(action_ordinal, |t| (t.action().clone(), t.receiver()))?;
         let mut apply_context = ApplyContext::new(
             self.chain_config.clone(),
+            self.session.clone(),
+            self.wasm_runtime.clone(),
             self.clone(),
             action,
             receiver,
@@ -275,7 +269,6 @@ impl TransactionContext {
         Ok(())
     }
 
-    #[inline]
     pub fn get_action_trace(&self, action_ordinal: u32) -> Result<ActionTrace, ChainError> {
         let inner = self.inner.read()?;
         let trace = inner.trace.action_traces.get((action_ordinal as usize) - 1);
@@ -353,7 +346,7 @@ impl TransactionContext {
         let mut session = self.session.clone();
         let validate_ram_usage = inner.validate_ram_usage.clone();
         for account in validate_ram_usage.iter() {
-            ResourceLimitsManager::verify_account_ram_usage(undo_session, account)?;
+            ResourceLimitsManager::verify_account_ram_usage(&mut session, account)?;
         }
 
         println!("Transaction took {} micros", billed_cpu_time_us);
@@ -383,7 +376,7 @@ impl TransactionContext {
         let mut inner = self.inner.write()?;
 
         // Update the RAM usage in the resource limits manager.
-        ResourceLimitsManager::add_pending_ram_usage(undo_session, account, ram_delta)?;
+        ResourceLimitsManager::add_pending_ram_usage(&mut session, account, ram_delta)?;
 
         if ram_delta > 0 {
             inner.validate_ram_usage.insert(account.clone());

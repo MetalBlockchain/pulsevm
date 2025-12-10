@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use pulsevm_chainbase::{Session, UndoSession};
+use pulsevm_chainbase::UndoSession;
 
 use crate::chain::{
     block::BlockTimestamp,
@@ -196,7 +196,7 @@ impl ResourceLimitsManager {
     }
 
     pub fn verify_account_ram_usage(
-        session: &impl Session,
+        session: &mut UndoSession,
         account: &Name,
     ) -> Result<(), ChainError> {
         let mut ram_bytes: i64 = 0;
@@ -223,7 +223,7 @@ impl ResourceLimitsManager {
     }
 
     pub fn get_account_ram_usage(
-        session: &impl Session,
+        session: &mut UndoSession,
         account: &Name,
     ) -> Result<u64, ChainError> {
         let usage = session.get::<ResourceUsage>(account.clone())?;
@@ -286,7 +286,7 @@ impl ResourceLimitsManager {
     }
 
     pub fn get_account_limits(
-        session: &impl Session,
+        session: &mut UndoSession,
         account: &Name,
         ram_bytes: &mut i64,
         net_weight: &mut i64,
@@ -321,7 +321,7 @@ impl ResourceLimitsManager {
     }
 
     pub fn get_account_net_limit(
-        session: &impl Session,
+        session: &mut UndoSession,
         account: &Name,
         current_time: Option<BlockTimestamp>,
     ) -> Result<AccountResourceLimit, ChainError> {
@@ -384,7 +384,7 @@ impl ResourceLimitsManager {
     }
 
     pub fn get_account_cpu_limit(
-        session: &impl Session,
+        session: &mut UndoSession,
         account: &Name,
         current_time: Option<BlockTimestamp>,
     ) -> Result<AccountResourceLimit, ChainError> {
@@ -446,6 +446,9 @@ impl ResourceLimitsManager {
     }
 
     pub fn process_account_limit_updates(session: &mut UndoSession) -> Result<(), ChainError> {
+        let mut by_owner_index = session.get_index::<ResourceLimits, ResourceLimitsByOwnerIndex>();
+        let mut itr = by_owner_index.lower_bound(true)?;
+
         let update_state_and_value =
             |total: &mut u64, value: &mut i64, pending_value: i64| -> Result<(), ChainError> {
                 if *value > 0 {
@@ -472,9 +475,6 @@ impl ResourceLimitsManager {
         let mut total_ram_bytes = state.total_ram_bytes;
         let mut total_cpu_weight = state.total_cpu_weight;
         let mut total_net_weight = state.total_net_weight;
-
-        let mut by_owner_index = session.get_index::<ResourceLimits, ResourceLimitsByOwnerIndex>();
-        let mut itr = by_owner_index.lower_bound(true)?;
 
         while let Some(pending_limit) = itr.next()? {
             if !pending_limit.pending {
@@ -541,12 +541,12 @@ impl ResourceLimitsManager {
         Ok(())
     }
 
-    pub fn get_total_cpu_weight(session: &impl Session) -> Result<u64, ChainError> {
+    pub fn get_total_cpu_weight(session: &mut UndoSession) -> Result<u64, ChainError> {
         let state = session.get::<ResourceLimitsState>(0)?;
         Ok(state.total_cpu_weight)
     }
 
-    pub fn get_total_net_weight(session: &impl Session) -> Result<u64, ChainError> {
+    pub fn get_total_net_weight(session: &mut UndoSession) -> Result<u64, ChainError> {
         let state = session.get::<ResourceLimitsState>(0)?;
         Ok(state.total_net_weight)
     }

@@ -1,47 +1,134 @@
-use std::{
-    collections::{HashMap, VecDeque},
-    env,
-    sync::{Arc, RwLock},
-};
+use std::sync::{Arc, RwLock};
 
-use anyhow::Result;
-use heed::{Database, PutFlags, RoTxn, RwTxn, WithTls, types::Bytes};
+use fjall::{ReadTransaction, TransactionalKeyspace};
 
-use crate::{
-    ChainbaseError, ChainbaseObject, SecondaryIndex, Session, index::Index, ro_index::ReadOnlyIndex,
-};
+use crate::{ChainbaseError, ChainbaseObject, SecondaryIndex, ro_index::ReadOnlyIndex};
 
-const KEY: &[u8] = b"id";
-
-pub struct ReadOnlySession<'a> {
-    pub databases: Arc<RwLock<HashMap<&'static str, Database<Bytes, Bytes>>>>,
-    pub tx: RoTxn<'a, WithTls>,
+#[derive(Clone)]
+pub struct Session {
+    tx: Arc<RwLock<ReadTransaction>>,
+    keyspace: TransactionalKeyspace,
 }
 
-impl<'a> ReadOnlySession<'a> {
+impl Session {
     #[inline]
-    pub fn new(
-        tx: RoTxn<'a, WithTls>,
-        databases: Arc<RwLock<HashMap<&'static str, Database<Bytes, Bytes>>>>,
-    ) -> Result<Self, ChainbaseError> {
-        Ok(Self { databases, tx })
+    pub fn new(keyspace: &TransactionalKeyspace) -> Result<Self, ChainbaseError> {
+        Ok(Self {
+            tx: Arc::new(RwLock::new(keyspace.read_tx())),
+            keyspace: keyspace.clone(),
+        })
     }
 
     #[inline]
-    pub fn get_database(
-        &self,
-        name: &'static str,
-    ) -> Result<Database<Bytes, Bytes>, ChainbaseError> {
-        let databases = self
-            .databases
-            .read()
-            .map_err(|_| ChainbaseError::InternalError("failed to get db".into()))?;
+    pub fn tx(&self) -> Arc<RwLock<ReadTransaction>> {
+        self.tx.clone()
+    }
 
-        if let Some(db) = databases.get(name) {
-            Ok(db.clone())
-        } else {
-            Err(ChainbaseError::NotFound)
+    #[inline]
+    pub fn keyspace(&self) -> TransactionalKeyspace {
+        self.keyspace.clone()
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn exists<T: ChainbaseObject>(&self, key: T::PrimaryKey) -> Result<bool, ChainbaseError> {
+        let partition = self
+            .keyspace
+            .open_partition(T::table_name(), Default::default())
+            .map_err(|_| ChainbaseError::InternalError(format!("failed to open partition")))?;
+        let tx = self
+            .tx
+            .read()
+            .map_err(|_| ChainbaseError::InternalError(format!("failed to read transaction")))?;
+        let res = tx
+            .contains_key(&partition, T::primary_key_to_bytes(key))
+            .map_err(|_| ChainbaseError::InternalError(format!("failed to check existence")))?;
+        Ok(res)
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn find<T: ChainbaseObject>(
+        &self,
+        key: T::PrimaryKey,
+    ) -> Result<Option<T>, ChainbaseError> {
+        let partition = self
+            .keyspace
+            .open_partition(T::table_name(), Default::default())
+            .map_err(|_| ChainbaseError::InternalError(format!("failed to open partition")))?;
+        let tx = self
+            .tx
+            .read()
+            .map_err(|_| ChainbaseError::InternalError(format!("failed to read transaction")))?;
+        let serialized = tx
+            .get(&partition, T::primary_key_to_bytes(key))
+            .map_err(|_| ChainbaseError::InternalError(format!("failed to get object")))?;
+        if serialized.is_none() {
+            return Ok(None);
         }
+        let mut pos = 0 as usize;
+        let object: T = T::read(&serialized.unwrap(), &mut pos).expect("failed to read object");
+        Ok(Some(object))
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn get<T: ChainbaseObject>(&self, key: T::PrimaryKey) -> Result<T, ChainbaseError> {
+        let found = self.find::<T>(key)?;
+        if found.is_none() {
+            return Err(ChainbaseError::NotFound);
+        }
+        let object = found.unwrap();
+        Ok(object)
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn find_by_secondary<T: ChainbaseObject, S: SecondaryIndex<T>>(
+        &self,
+        key: S::Key,
+    ) -> Result<Option<T>, ChainbaseError> {
+        let partition = self
+            .keyspace
+            .open_partition(S::index_name(), Default::default())
+            .map_err(|_| ChainbaseError::InternalError(format!("failed to open partition")))?;
+        let tx = self
+            .tx
+            .read()
+            .map_err(|_| ChainbaseError::InternalError(format!("failed to read transaction")))?;
+        let secondary_key = tx
+            .get(&partition, S::secondary_key_as_bytes(key))
+            .map_err(|_| ChainbaseError::InternalError(format!("failed to get secondary key")))?;
+        if secondary_key.is_none() {
+            return Ok(None);
+        }
+        let partition = self
+            .keyspace
+            .open_partition(T::table_name(), Default::default())
+            .map_err(|_| ChainbaseError::InternalError(format!("failed to open partition")))?;
+        let serialized = tx.get(&partition, secondary_key.unwrap()).map_err(|_| {
+            ChainbaseError::InternalError(format!("failed to get object by secondary key"))
+        })?;
+        if serialized.is_none() {
+            return Ok(None);
+        }
+        let mut pos = 0 as usize;
+        let object: T = T::read(&serialized.unwrap(), &mut pos).expect("failed to read object");
+        Ok(Some(object))
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn get_by_secondary<T: ChainbaseObject, S: SecondaryIndex<T>>(
+        &self,
+        key: S::Key,
+    ) -> Result<T, ChainbaseError> {
+        let found = self.find_by_secondary::<T, S>(key)?;
+        if found.is_none() {
+            return Err(ChainbaseError::NotFound);
+        }
+        let object = found.unwrap();
+        Ok(object)
     }
 
     #[inline]
@@ -50,104 +137,6 @@ impl<'a> ReadOnlySession<'a> {
         C: ChainbaseObject,
         S: SecondaryIndex<C>,
     {
-        ReadOnlyIndex::<C, S>::new(self)
-    }
-}
-
-impl Session for ReadOnlySession<'_> {
-    fn exists<T: ChainbaseObject>(&mut self, key: T::PrimaryKey) -> Result<bool, ChainbaseError> {
-        let db = self.get_database(T::table_name())?;
-        let res = db.get(&self.tx, &T::primary_key_to_bytes(key));
-
-        match res {
-            Ok(Some(_)) => Ok(true),
-            Ok(None) => Ok(false),
-            Err(e) => Err(ChainbaseError::InternalError(format!(
-                "failed to check existence: {}",
-                e
-            ))),
-        }
-    }
-
-    fn find<T: ChainbaseObject>(&self, key: T::PrimaryKey) -> Result<Option<T>, ChainbaseError> {
-        let db = self.get_database(T::table_name())?;
-        let res = db.get(&self.tx, &T::primary_key_to_bytes(key));
-
-        match res {
-            Ok(Some(data)) => {
-                let mut pos = 0;
-                let object: T = T::read(&data, &mut pos).map_err(|_| ChainbaseError::ReadError)?;
-                return Ok(Some(object));
-            }
-            Ok(None) => {
-                return Ok(None);
-            }
-            Err(e) => {
-                return Err(ChainbaseError::InternalError(format!(
-                    "failed to get object: {}",
-                    e
-                )));
-            }
-        };
-    }
-
-    fn find_by_secondary<T: ChainbaseObject, S: SecondaryIndex<T>>(
-        &self,
-        key: S::Key,
-    ) -> Result<Option<T>, ChainbaseError> {
-        let res = self.get_by_secondary::<T, S>(key);
-
-        match res {
-            Ok(obj) => Ok(Some(obj)),
-            Err(ChainbaseError::NotFound) => Ok(None),
-            Err(e) => Err(e),
-        }
-    }
-
-    fn get<T: ChainbaseObject>(&self, key: T::PrimaryKey) -> Result<T, ChainbaseError> {
-        let found = self.find::<T>(key)?;
-
-        match found {
-            Some(obj) => Ok(obj),
-            None => Err(ChainbaseError::NotFound),
-        }
-    }
-
-    fn get_by_secondary<T: ChainbaseObject, S: SecondaryIndex<T>>(
-        &self,
-        key: S::Key,
-    ) -> Result<T, ChainbaseError> {
-        let db = self.get_database(S::index_name())?;
-        let secondary_key = db.get(&self.tx, &S::secondary_key_as_bytes(key));
-        let secondary_key = match secondary_key {
-            Err(e) => {
-                return Err(ChainbaseError::InternalError(format!(
-                    "failed to get secondary key: {}",
-                    e
-                )));
-            }
-            Ok(Some(v)) => v,
-            Ok(None) => return Err(ChainbaseError::NotFound),
-        };
-
-        let db = self.get_database(T::table_name())?;
-        let res = db.get(&self.tx, &secondary_key);
-
-        match res {
-            Ok(Some(data)) => {
-                let mut pos = 0;
-                let object: T = T::read(&data, &mut pos).map_err(|_| ChainbaseError::ReadError)?;
-                return Ok(object);
-            }
-            Ok(None) => {
-                return Err(ChainbaseError::NotFound);
-            }
-            Err(e) => {
-                return Err(ChainbaseError::InternalError(format!(
-                    "failed to get object: {}",
-                    e
-                )));
-            }
-        };
+        ReadOnlyIndex::<C, S>::new(self.clone(), self.keyspace.clone())
     }
 }

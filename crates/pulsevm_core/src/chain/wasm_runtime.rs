@@ -62,8 +62,8 @@ impl WasmContext {
         }
     }
 
-    pub fn receiver(&self) -> Name {
-        self.receiver
+    pub fn receiver(&self) -> &Name {
+        &self.receiver
     }
 
     pub fn action(&self) -> &Action {
@@ -138,6 +138,7 @@ impl WasmRuntime {
                     .map_err(|e| ChainError::WasmRuntimeError(e.to_string()))?;
                 inner.code_cache.put(code_hash, module);
             }
+        }
 
         let module = inner.code_cache.get(&code_hash).ok_or_else(|| {
             ChainError::WasmRuntimeError(format!("wasm module not found in cache: {}", code_hash))

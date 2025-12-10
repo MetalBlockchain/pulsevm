@@ -1,51 +1,59 @@
 use std::ops::Bound;
 
-use pulsevm_serialization::{Read, Write};
+use fjall::{Slice, TransactionalKeyspace, TransactionalPartitionHandle};
+use pulsevm_serialization::Write;
 
-use crate::{
-    ChainbaseError, ChainbaseObject, SecondaryIndex, Session, UndoSession, session::ReadOnlySession,
-};
+use crate::{ChainbaseError, ChainbaseObject, SecondaryIndex, Session};
 
 #[derive(Clone)]
-pub struct ReadOnlyIndex<'a, C, S>
+pub struct ReadOnlyIndex<C, S>
 where
     C: ChainbaseObject,
     S: SecondaryIndex<C>,
 {
-    session: &'a ReadOnlySession<'a>,
+    session: Session,
+    keyspace: TransactionalKeyspace,
     __phantom: std::marker::PhantomData<(C, S)>,
 }
 
-impl<'a, C, S> ReadOnlyIndex<'a, C, S>
+impl<C, S> ReadOnlyIndex<C, S>
 where
     C: ChainbaseObject,
     S: SecondaryIndex<C>,
 {
-    pub fn new(session: &'a ReadOnlySession<'a>) -> Self {
-        ReadOnlyIndex::<'a, C, S> {
+    #[inline]
+    pub fn new(session: Session, keyspace: TransactionalKeyspace) -> Self {
+        ReadOnlyIndex::<C, S> {
             session,
+            keyspace,
             __phantom: std::marker::PhantomData,
         }
     }
 
+    #[inline]
     pub fn iterator_to(
-        &self,
+        &mut self,
         object: &S::Object,
-    ) -> Result<ReadOnlyIndexIterator<'a, C, S>, ChainbaseError> {
+    ) -> Result<ReadOnlyIndexIterator<C, S>, ChainbaseError> {
         Ok(ReadOnlyIndexIterator::<C, S> {
-            session: self.session,
-            current_key: S::secondary_key(object).into(),
-            current_value: object.primary_key().into(),
+            session: self.session.clone(),
+            partition: self
+                .keyspace
+                .clone()
+                .open_partition(S::index_name(), Default::default())
+                .map_err(|_| ChainbaseError::InternalError(format!("failed to open partition")))?,
+            current_key: S::secondary_key(object),
+            current_value: object.primary_key(),
             __phantom: std::marker::PhantomData,
         })
     }
 
     #[inline]
     pub fn range(
-        &self,
+        &mut self,
         lower_bound: impl Write,
         upper_bound: impl Write,
-    ) -> Result<ReadOnlyRangeIterator<'a, C, S>, ChainbaseError> {
+    ) -> Result<ReadOnlyRangeIterator<C, S>, ChainbaseError> {
         let lower_bound_bytes = lower_bound.pack().map_err(|e| {
             ChainbaseError::InternalError(format!("failed to serialize key: {}", e))
         })?;
@@ -54,76 +62,99 @@ where
         })?;
 
         Ok(ReadOnlyRangeIterator::<C, S> {
-            session: self.session,
+            session: self.session.clone(),
+            partition: self
+                .keyspace
+                .clone()
+                .open_partition(S::index_name(), Default::default())
+                .map_err(|_| ChainbaseError::InternalError(format!("failed to open partition")))?,
             range: (
                 Bound::Included(lower_bound_bytes.clone().into()),
                 Bound::Excluded(upper_bound_bytes.into()),
             ),
             current_key: lower_bound_bytes.into(),
-            current_value: Vec::new(),
+            current_value: Slice::new(&[]),
             __phantom: std::marker::PhantomData,
         })
     }
 
+    #[inline]
     pub fn lower_bound(
         &mut self,
         key: impl Write,
-    ) -> Result<ReadOnlyRangeIterator<'a, C, S>, ChainbaseError> {
+    ) -> Result<ReadOnlyRangeIterator<C, S>, ChainbaseError> {
         let key_bytes = key.pack().map_err(|e| {
             ChainbaseError::InternalError(format!("failed to serialize key: {}", e))
         })?;
 
-        Ok(ReadOnlyRangeIterator::<'a, C, S> {
-            session: self.session,
-            range: (Bound::Included(key_bytes.clone()), Bound::Unbounded),
-            current_key: key_bytes,
-            current_value: Vec::new(),
+        Ok(ReadOnlyRangeIterator::<C, S> {
+            session: self.session.clone(),
+            partition: self
+                .keyspace
+                .clone()
+                .open_partition(S::index_name(), Default::default())
+                .map_err(|_| ChainbaseError::InternalError(format!("failed to open partition")))?,
+            range: (Bound::Included(key_bytes.clone().into()), Bound::Unbounded),
+            current_key: key_bytes.into(),
+            current_value: Slice::new(&[]),
             __phantom: std::marker::PhantomData,
         })
     }
 
+    #[inline]
     pub fn upper_bound(
         &mut self,
         key: impl Write,
-    ) -> Result<ReadOnlyRangeIterator<'a, C, S>, ChainbaseError> {
+    ) -> Result<ReadOnlyRangeIterator<C, S>, ChainbaseError> {
         let key_bytes = key.pack().map_err(|e| {
             ChainbaseError::InternalError(format!("failed to serialize key: {}", e))
         })?;
 
-        Ok(ReadOnlyRangeIterator::<'a, C, S> {
-            session: self.session,
-            range: (Bound::Excluded(key_bytes.clone()), Bound::Unbounded),
-            current_key: key_bytes,
-            current_value: Vec::new(),
+        Ok(ReadOnlyRangeIterator::<C, S> {
+            session: self.session.clone(),
+            partition: self
+                .keyspace
+                .clone()
+                .open_partition(S::index_name(), Default::default())
+                .map_err(|_| ChainbaseError::InternalError(format!("failed to open partition")))?,
+            range: (Bound::Excluded(key_bytes.clone().into()), Bound::Unbounded),
+            current_key: key_bytes.into(),
+            current_value: Slice::new(&[]),
             __phantom: std::marker::PhantomData,
         })
     }
 }
 
-pub struct ReadOnlyRangeIterator<'a, C, S>
+pub struct ReadOnlyRangeIterator<C, S>
 where
     C: ChainbaseObject,
     S: SecondaryIndex<C>,
 {
-    session: &'a ReadOnlySession<'a>,
-    range: (Bound<Vec<u8>>, Bound<Vec<u8>>),
-    current_key: Vec<u8>,
-    current_value: Vec<u8>,
+    session: Session,
+    partition: TransactionalPartitionHandle,
+    range: (Bound<Slice>, Bound<Slice>),
+    current_key: Slice,
+    current_value: Slice,
     __phantom: std::marker::PhantomData<(C, S)>,
 }
 
-impl<'a, C, S> ReadOnlyRangeIterator<'a, C, S>
+impl<C, S> ReadOnlyRangeIterator<C, S>
 where
     C: ChainbaseObject,
     S: SecondaryIndex<C>,
 {
     #[inline]
-    pub fn new(session: &'a ReadOnlySession<'a>, range: (Bound<Vec<u8>>, Bound<Vec<u8>>)) -> Self {
-        ReadOnlyRangeIterator::<'a, C, S> {
+    pub fn new(
+        session: Session,
+        partition: TransactionalPartitionHandle,
+        range: (Bound<Slice>, Bound<Slice>),
+    ) -> Self {
+        ReadOnlyRangeIterator::<C, S> {
             session,
+            partition,
             range,
-            current_key: Vec::new(),
-            current_value: Vec::new(),
+            current_key: Slice::new(&[]),
+            current_value: Slice::new(&[]),
             __phantom: std::marker::PhantomData,
         }
     }
@@ -131,18 +162,27 @@ where
     #[inline]
     pub fn previous(&mut self) -> Result<Option<S::Object>, ChainbaseError> {
         let prev = {
-            let db = self.session.get_database(S::index_name())?;
-            let res = db
-                .get_lower_than(&self.session.tx, &self.current_key)
-                .map_err(|e| {
-                    ChainbaseError::InternalError(format!("failed to get previous element: {}", e))
-                })?;
-            res
+            let tx = self.session.tx();
+            let tx = tx.read().map_err(|_| {
+                ChainbaseError::InternalError(format!("failed to read transaction"))
+            })?;
+            let mut range = tx.range(&self.partition, self.range.clone()).rev();
+            let prev = range.next();
+            prev
         };
 
-        if let Some((key, value)) = prev {
-            self.current_key = key.to_vec();
-            self.current_value = value.to_vec();
+        if prev.is_some() {
+            let (key, value) = prev
+                .unwrap()
+                .map_err(|e| {
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("failed to get previous element: {}", e),
+                    ))
+                })
+                .map_err(|e| ChainbaseError::InternalError(e.to_string()))?;
+            self.current_key = key;
+            self.current_value = value;
             self.range = (
                 Bound::Excluded(self.current_key.clone()),
                 self.range.1.clone(),
@@ -162,18 +202,27 @@ where
     #[inline]
     pub fn next(&mut self) -> Result<Option<S::Object>, ChainbaseError> {
         let next = {
-            let db = self.session.get_database(S::index_name())?;
-            let res = db
-                .get_greater_than(&self.session.tx, &self.current_key)
-                .map_err(|e| {
-                    ChainbaseError::InternalError(format!("failed to get next element: {}", e))
-                })?;
-            res
+            let tx = self.session.tx();
+            let tx = tx.read().map_err(|_| {
+                ChainbaseError::InternalError(format!("failed to read transaction"))
+            })?;
+            let mut range = tx.range(&self.partition, self.range.clone());
+            let next = range.next();
+            next
         };
 
-        if let Some((key, value)) = next {
-            self.current_key = key.to_vec();
-            self.current_value = value.to_vec();
+        if next.is_some() {
+            let (key, value) = next
+                .unwrap()
+                .map_err(|e| {
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("failed to get next element: {}", e),
+                    ))
+                })
+                .map_err(|e| ChainbaseError::InternalError(e.to_string()))?;
+            self.current_key = key;
+            self.current_value = value;
             self.range = (
                 Bound::Excluded(self.current_key.clone()),
                 self.range.1.clone(),
@@ -191,7 +240,7 @@ where
     }
 
     #[inline]
-    pub fn get_object(&self) -> Result<S::Object, ChainbaseError> {
+    pub fn get_object(&mut self) -> Result<S::Object, ChainbaseError> {
         return self
             .session
             .get::<S::Object>(S::Object::primary_key_from_bytes(
@@ -200,18 +249,19 @@ where
     }
 }
 
-pub struct ReadOnlyIndexIterator<'a, C, S>
+pub struct ReadOnlyIndexIterator<C, S>
 where
     C: ChainbaseObject,
     S: SecondaryIndex<C>,
 {
-    session: &'a ReadOnlySession<'a>,
+    session: Session,
+    partition: TransactionalPartitionHandle,
     current_key: Vec<u8>,
     current_value: Vec<u8>,
     __phantom: std::marker::PhantomData<(C, S)>,
 }
 
-impl<'a, C, S> ReadOnlyIndexIterator<'a, C, S>
+impl<C, S> ReadOnlyIndexIterator<C, S>
 where
     C: ChainbaseObject,
     S: SecondaryIndex<C>,
@@ -219,16 +269,29 @@ where
     #[inline]
     pub fn next(&mut self) -> Result<Option<S::Object>, ChainbaseError> {
         let next = {
-            let db = self.session.get_database(S::index_name())?;
-            let res = db
-                .get_greater_than(&self.session.tx, &self.current_key)
-                .map_err(|e| {
-                    ChainbaseError::InternalError(format!("failed to get next element: {}", e))
-                })?;
-            res
+            let tx = self.session.tx();
+            let tx = tx.read().map_err(|_| {
+                ChainbaseError::InternalError(format!("failed to read transaction"))
+            })?;
+            let range = (
+                std::ops::Bound::Excluded(self.current_key.clone()),
+                std::ops::Bound::Unbounded,
+            );
+            let mut range = tx.range(&self.partition, range);
+            let next = range.next();
+            next
         };
 
-        if let Some((key, value)) = next {
+        if next.is_some() {
+            let (key, value) = next
+                .unwrap()
+                .map_err(|e| {
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("failed to get next element: {}", e),
+                    ))
+                })
+                .map_err(|e| ChainbaseError::InternalError(e.to_string()))?;
             self.current_key = key.to_vec();
             self.current_value = value.to_vec();
             if let Ok(object) = self.get_object() {
@@ -246,16 +309,25 @@ where
     #[inline]
     pub fn previous(&mut self) -> Result<Option<S::Object>, ChainbaseError> {
         let prev = {
-            let db = self.session.get_database(S::index_name())?;
-            let res = db
-                .get_lower_than(&self.session.tx, &self.current_key)
-                .map_err(|e| {
-                    ChainbaseError::InternalError(format!("failed to get previous element: {}", e))
-                })?;
-            res
+            let tx = self.session.tx();
+            let tx = tx.read().map_err(|_| {
+                ChainbaseError::InternalError(format!("failed to read transaction"))
+            })?;
+            let mut range = tx.range(&self.partition, ..self.current_key.clone()).rev();
+            let prev = range.next();
+            prev
         };
 
-        if let Some((key, value)) = prev {
+        if prev.is_some() {
+            let (key, value) = prev
+                .unwrap()
+                .map_err(|e| {
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("failed to get previous element: {}", e),
+                    ))
+                })
+                .map_err(|e| ChainbaseError::InternalError(e.to_string()))?;
             self.current_key = key.to_vec();
             self.current_value = value.to_vec();
             if let Ok(object) = self.get_object() {
@@ -275,16 +347,17 @@ where
         return self
             .session
             .get::<S::Object>(S::Object::primary_key_from_bytes(
-                self.current_value.as_ref(),
+                self.current_value.as_slice(),
             )?);
     }
 }
 
-impl<'a, C, S> PartialEq for ReadOnlyIndexIterator<'a, C, S>
+impl<C, S> PartialEq for ReadOnlyIndexIterator<C, S>
 where
     C: ChainbaseObject,
     S: SecondaryIndex<C>,
 {
+    #[inline]
     fn eq(&self, other: &Self) -> bool {
         self.current_key == other.current_key
     }
