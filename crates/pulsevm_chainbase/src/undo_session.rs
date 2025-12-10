@@ -10,12 +10,11 @@ use heed::{Database, Env, PutFlags, RwTxn, types::Bytes};
 
 use crate::{ChainbaseError, ChainbaseObject, SecondaryIndex, Session, index::Index};
 
-const KEY: &[u8] = b"id";
-
 #[derive(Clone)]
-pub struct UndoSession<'a> {
-    pub databases: Arc<RwLock<HashMap<&'static str, Database<Bytes, Bytes>>>>,
-    pub tx: Arc<RwLock<RwTxn<'a>>>,
+pub struct UndoSession {
+    tx: Arc<RwLock<WriteTransaction>>,
+    keyspace: TransactionalKeyspace,
+    partition_create_options: PartitionCreateOptions,
 }
 
 impl<'a> UndoSession<'a> {
@@ -25,8 +24,11 @@ impl<'a> UndoSession<'a> {
         tx: RwTxn<'a>,
     ) -> Result<Self, ChainbaseError> {
         Ok(Self {
-            databases,
-            tx: Arc::new(RwLock::new(tx)),
+            tx: Arc::new(RwLock::new(keyspace.write_tx().map_err(|_| {
+                ChainbaseError::InternalError("failed to create write transaction".to_string())
+            })?)),
+            keyspace: keyspace.clone(),
+            partition_create_options,
         })
     }
 
@@ -84,28 +86,25 @@ impl<'a> UndoSession<'a> {
         let mut tx = self
             .tx
             .write()
-            .map_err(|e| ChainbaseError::InternalError(format!("failed to lock tx: {}", e)))?;
+            .map_err(|_| ChainbaseError::InternalError(format!("failed to write transaction")))?;
+        let key = object.primary_key();
+        let partition = open_partition(
+            &self.keyspace,
+            T::table_name(),
+            self.partition_create_options.clone(),
+        )?;
         let serialized = object.pack().map_err(|_| {
             ChainbaseError::InternalError(format!("failed to serialize object for key: {:?}", key))
         })?;
+        tx.insert(&partition, &key, serialized);
 
-        db.put_with_flags(&mut tx, PutFlags::NO_OVERWRITE, &key, &serialized)
-            .map_err(|e| {
-                ChainbaseError::InternalError(format!(
-                    "failed to insert object for key {:?}: {}",
-                    key, e
-                ))
-            })?;
-
-        for index in object.secondary_indexes().iter() {
-            let db = self.get_database(index.index_name)?;
-            db.put_with_flags(&mut tx, PutFlags::NO_OVERWRITE, &index.key, &key)
-                .map_err(|e| {
-                    ChainbaseError::InternalError(format!(
-                        "failed to insert secondary index for key {:?}: {}",
-                        key, e
-                    ))
-                })?;
+        for index in object.secondary_indexes() {
+            let part = open_partition(
+                &self.keyspace,
+                index.index_name,
+                self.partition_create_options.clone(),
+            )?;
+            tx.insert(&part, &index.key, &key);
         }
         Ok(())
     }
@@ -116,31 +115,26 @@ impl<'a> UndoSession<'a> {
         T: ChainbaseObject,
         F: FnOnce(&mut T) -> Result<()>,
     {
-        let db = self.get_database(T::table_name())?;
-        let key = obj.primary_key(); // Should never change
-
-        f(obj).map_err(|e| {
-            ChainbaseError::InternalError(format!("failed to modify object for key {:?}: {e}", key))
-        })?;
-
-        let new_bytes = obj.pack().map_err(|_| {
-            ChainbaseError::InternalError(format!(
-                "failed to serialize modified object for key: {:?}",
-                key
-            ))
-        })?;
         let mut tx = self
             .tx
             .write()
-            .map_err(|e| ChainbaseError::InternalError(format!("failed to lock tx: {}", e)))?;
-
-        db.put(&mut tx, &key, &new_bytes).map_err(|_| {
+            .map_err(|_| ChainbaseError::InternalError(format!("failed to write transaction")))?;
+        let partition = open_partition(
+            &self.keyspace,
+            T::table_name(),
+            self.partition_create_options.clone(),
+        )?;
+        let key = old.primary_key();
+        f(old).map_err(|e| {
+            ChainbaseError::InternalError(format!("failed to modify object for key {:?}: {e}", key))
+        })?;
+        let new_bytes = old.pack().map_err(|_| {
             ChainbaseError::InternalError(format!(
                 "failed to serialize modified object for key: {:?}",
                 key
             ))
         })?;
-
+        tx.insert(&partition, &key, new_bytes);
         Ok(())
     }
 
@@ -158,6 +152,20 @@ impl<'a> UndoSession<'a> {
                 key, e
             ))
         })?;
+        if old_value.is_none() {
+            return Err(ChainbaseError::NotFound);
+        }
+        tx.remove(&partition, &key);
+        for index in object.secondary_indexes() {
+            let partition = open_partition(
+                &self.keyspace,
+                index.index_name,
+                self.partition_create_options.clone(),
+            )?;
+            tx.remove(&partition, &index.key);
+        }
+        Ok(())
+    }
 
         for index in object.secondary_indexes().iter() {
             let db = self.get_database(index.index_name)?;

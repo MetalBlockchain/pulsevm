@@ -1,7 +1,5 @@
 use std::{
-    cell::RefCell,
     collections::{HashMap, HashSet, VecDeque},
-    rc::Rc,
     sync::{Arc, RwLock},
     u64,
 };
@@ -9,7 +7,7 @@ use std::{
 use chrono::Utc;
 use pulsevm_chainbase::{Session, UndoSession};
 use pulsevm_crypto::Bytes;
-use spdlog::{debug, info};
+use spdlog::info;
 
 use crate::{
     CODE_NAME,
@@ -40,6 +38,7 @@ struct ApplyContextInner {
     privileged: bool,
     account_ram_deltas: HashMap<Name, i64>, // RAM usage deltas for accounts
     notified: VecDeque<(Name, u32)>,        // List of notified accounts
+    inline_actions: Vec<u32>,               // List of inline actions
 }
 
 #[derive(Clone)]
@@ -54,8 +53,6 @@ pub struct ApplyContext {
     recurse_depth: u32, // The current recursion depth
     first_receiver_action_ordinal: u32,
     action_ordinal: u32,
-
-    inline_actions: Vec<u32>,                // List of inline actions
     pending_block_timestamp: BlockTimestamp, // Timestamp for the pending block
 
     inner: Arc<RwLock<ApplyContextInner>>,
@@ -83,8 +80,6 @@ impl ApplyContext {
             recurse_depth: depth,
             first_receiver_action_ordinal: 0,
             action_ordinal,
-
-            inline_actions: Vec::new(),
             pending_block_timestamp,
 
             inner: Arc::new(RwLock::new(ApplyContextInner {
@@ -94,6 +89,7 @@ impl ApplyContext {
                 privileged: false,
                 account_ram_deltas: HashMap::new(),
                 notified: VecDeque::new(),
+                inline_actions: Vec::new(),
             })),
         })
     }
@@ -126,17 +122,21 @@ impl ApplyContext {
             cpu_used += self.exec_one(wasm_runtime, session)?;
         }
 
-        if self.inline_actions.len() > 0 {
-            pulse_assert(
-                self.recurse_depth < 1024, // TODO: Make this configurable
-                ChainError::TransactionError(
-                    "max inline action depth per transaction reached".to_string(),
-                ),
-            )?;
-        }
+        {
+            let inner = self.inner.read()?;
 
-        for action_ordinal in self.inline_actions.iter() {
-            trx_context.execute_action(*action_ordinal, self.recurse_depth + 1)?;
+            if inner.inline_actions.len() > 0 {
+                pulse_assert(
+                    self.recurse_depth < 1024, // TODO: Make this configurable
+                    ChainError::TransactionError(
+                        "max inline action depth per transaction reached".to_string(),
+                    ),
+                )?;
+            }
+
+            for action_ordinal in inner.inline_actions.iter() {
+                trx_context.execute_action(*action_ordinal, self.recurse_depth + 1)?;
+            }
         }
 
         Ok(cpu_used)
@@ -366,7 +366,8 @@ impl ApplyContext {
         let inline_receiver = a.account();
         let scheduled_ordinal =
             self.schedule_action_from_action(a.clone(), &inline_receiver, false)?;
-        self.inline_actions.push(scheduled_ordinal);
+        let mut inner = self.inner.write()?;
+        inner.inline_actions.push(scheduled_ordinal);
 
         Ok(())
     }
@@ -867,6 +868,16 @@ impl ApplyContext {
     pub fn is_privileged(&self) -> Result<bool, ChainError> {
         let inner = self.inner.read()?;
         Ok(inner.privileged)
+    }
+
+    pub fn set_privileged(&mut self, account: Name, is_privileged: bool) -> Result<(), ChainError> {
+        let mut account = self.session.get::<AccountMetadata>(account.into())?;
+        self.session.modify(&mut account, |acc| {
+            acc.set_privileged(is_privileged);
+            Ok(())
+        })?;
+
+        Ok(())
     }
 
     pub fn pending_block_timestamp(&self) -> BlockTimestamp {

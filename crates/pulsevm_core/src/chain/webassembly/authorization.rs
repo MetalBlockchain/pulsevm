@@ -55,7 +55,11 @@ pub fn is_account(
 
     match result {
         Ok(exists) => {
-            if exists { Ok(1) } else { Ok(0) }
+            if exists {
+                Ok(1)
+            } else {
+                Ok(0)
+            }
         }
         Err(err) => return Err(err.into()),
     }

@@ -1,4 +1,4 @@
-use std::{error::Error, sync::LockResult};
+use std::error::Error;
 
 use pulsevm_chainbase::ChainbaseError;
 use thiserror::Error;

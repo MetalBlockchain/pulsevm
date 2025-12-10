@@ -25,7 +25,6 @@ time = { version = "0.3.41", features = ["formatting", "macros", "parsing"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 wasmer = { version = "6.1.0", features = ["llvm"] }
 wasmer-compiler-llvm = "6.1.0"
-wasmtime = { version = "38.0.3", features = ["coredump"] }
 
 pulsevm_crypto = { path = "../pulsevm_crypto" }
 pulsevm_grpc = { path = "../pulsevm_grpc" }
