@@ -39,6 +39,7 @@ struct ApplyContextInner {
     account_ram_deltas: HashMap<Name, i64>, // RAM usage deltas for accounts
     notified: VecDeque<(Name, u32)>,        // List of notified accounts
     inline_actions: Vec<u32>,               // List of inline actions
+    recurse_depth: u32, // The current recursion depth
 }
 
 #[derive(Clone)]
@@ -50,7 +51,6 @@ pub struct ApplyContext {
 
     action: Action,     // The action being applied
     receiver: Name,     // The account that is receiving the action
-    recurse_depth: u32, // The current recursion depth
     first_receiver_action_ordinal: u32,
     action_ordinal: u32,
     pending_block_timestamp: BlockTimestamp, // Timestamp for the pending block
@@ -79,7 +79,6 @@ impl ApplyContext {
 
             action,
             receiver,
-            recurse_depth: depth,
             first_receiver_action_ordinal: 0,
             action_ordinal,
             pending_block_timestamp,
@@ -92,6 +91,7 @@ impl ApplyContext {
                 account_ram_deltas: HashMap::new(),
                 notified: VecDeque::new(),
                 inline_actions: Vec::new(),
+                recurse_depth: depth,
             })),
         })
     }
@@ -124,7 +124,7 @@ impl ApplyContext {
 
             if inner.inline_actions.len() > 0 {
                 pulse_assert(
-                    self.recurse_depth < 1024, // TODO: Make this configurable
+                    inner.recurse_depth < 1024, // TODO: Make this configurable
                     ChainError::TransactionError(
                         "max inline action depth per transaction reached".to_string(),
                     ),
@@ -132,7 +132,7 @@ impl ApplyContext {
             }
 
             for action_ordinal in inner.inline_actions.iter() {
-                trx_context.execute_action(*action_ordinal, self.recurse_depth + 1)?;
+                trx_context.execute_action(*action_ordinal, inner.recurse_depth + 1)?;
             }
         }
 
