@@ -1,6 +1,6 @@
-<p align="center" width="100%">
-    <img width="33%" src="https://github.com/MetalBlockchain/pulsevm/blob/main/logo.png?raw=true"> 
-</p>
+# PulseVM
+
+A virtual machine built for Metal Blockchain based on the XPR Network protocol, aka EOS / Leap / Spring.
 
 ## Run locally
 
