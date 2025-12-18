@@ -4,6 +4,7 @@ use pulsevm_chainbase::{ChainbaseObject, Database, SecondaryKey, UndoSession};
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 use pulsevm_serialization::{Read, Write};
 use tempfile::tempdir;
+use tokio::runtime;
 use std::{env::temp_dir, hint::black_box};
 
 #[derive(Debug, Default, Clone, Read, Write, NumBytes)]
@@ -34,8 +35,11 @@ fn bench(session: &mut UndoSession) {
 }
 
 fn criterion_benchmark(c: &mut Criterion) {
+    let runtime = runtime::Runtime::new().unwrap();
+    let _guard = runtime.enter();
     let path = tempdir().unwrap();
     let db = Database::new(path.path()).unwrap();
+    db.open_partition_handle("test_object").unwrap();
     let mut session = db.undo_session().unwrap();
     session
         .insert(&TestObject {

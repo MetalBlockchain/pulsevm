@@ -1,8 +1,10 @@
 mod index;
 mod ro_index;
-
 mod session;
+mod write_thread;
+
 use jsonrpsee::types::ErrorObjectOwned;
+use rust_rocksdb::{OptimisticTransactionDB, Options, TransactionDB, TransactionDBOptions};
 pub use session::Session;
 
 mod undo_session;
@@ -10,7 +12,7 @@ pub use undo_session::UndoSession;
 
 use fjall::{Config, PartitionCreateOptions, TransactionalKeyspace, TransactionalPartitionHandle};
 use pulsevm_serialization::{Read, Write};
-use std::{error::Error, fmt, path::Path};
+use std::{error::Error, fmt, path::Path, sync::Arc};
 
 #[derive(Debug, Clone)]
 pub enum ChainbaseError {
@@ -85,67 +87,45 @@ where
 
 #[derive(Clone)]
 pub struct Database {
-    keyspace: TransactionalKeyspace,
-    partition_create_options: PartitionCreateOptions,
+    db: Arc<OptimisticTransactionDB>,
 }
 
 impl Database {
     #[must_use]
     #[inline]
-    pub fn new(path: &Path) -> Result<Self, fjall::Error> {
+    pub fn new(path: &Path) -> Result<Self, ChainbaseError> {
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+
+        let db = OptimisticTransactionDB::open(&opts, path).map_err(|e| {
+            ChainbaseError::InternalError(format!("failed to open database: {}", e))
+        })?;
+
         Ok(Self {
-            keyspace: Config::new(path).open_transactional()?,
-            partition_create_options: PartitionCreateOptions::default(),
+            db: Arc::new(db),
         })
     }
 
-    #[inline]
-    pub fn temporary(path: &Path) -> Result<Self, fjall::Error> {
-        let config = Config::new(path).temporary(true);
-        let keyspace = config.open_transactional()?;
-        Ok(Self {
-            keyspace,
-            partition_create_options: PartitionCreateOptions::default(),
-        })
-    }
-
-    #[inline]
+    /* #[inline]
     pub fn session(&self) -> Result<Session, ChainbaseError> {
-        Session::new(&self.keyspace)
-    }
+        Session::new(self.db.clone())
+    } */
 
     #[inline]
     pub fn undo_session(&self) -> Result<UndoSession, ChainbaseError> {
-        UndoSession::new(&self.keyspace, self.partition_create_options.clone())
+        UndoSession::new(self.db.clone())
     }
 
     #[inline]
     pub fn open_partition_handle(
         &self,
         table_name: &str,
-    ) -> Result<TransactionalPartitionHandle, ChainbaseError> {
-        open_partition(
-            &self.keyspace,
-            table_name,
-            self.partition_create_options.clone(),
-        )
+    ) -> Result<(), ChainbaseError> {
+        self.db.create_cf(table_name, &Options::default()).map_err(
+            |_| ChainbaseError::InternalError(format!("failed to create column family: {}", table_name))
+        )?;
+        Ok(())
     }
-}
-
-#[inline]
-fn open_partition(
-    keyspace: &TransactionalKeyspace,
-    table_name: &str,
-    partition_create_options: PartitionCreateOptions,
-) -> Result<TransactionalPartitionHandle, ChainbaseError> {
-    keyspace
-        .open_partition(table_name, partition_create_options)
-        .map_err(|_| {
-            ChainbaseError::InternalError(format!(
-                "failed to open partition for table: {}",
-                table_name
-            ))
-        })
 }
 
 mod tests {
@@ -198,10 +178,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_database() {
+    #[tokio::test]
+    async fn test_database() {
         let path = Path::new("test_db");
-        let db = Database::temporary(&path).expect("failed to create database");
+        let db = Database::new(&path).expect("failed to create database");
         let mut session = db.undo_session().expect("failed to create session");
 
         let obj = TestObject {

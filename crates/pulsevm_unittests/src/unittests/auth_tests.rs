@@ -8,7 +8,7 @@ mod auth_tests {
         },
         authorization_manager::AuthorizationManager,
         error::ChainError,
-        name::{self, Name},
+        name::Name,
         secp256k1::PublicKey,
     };
     use pulsevm_proc_macros::name;

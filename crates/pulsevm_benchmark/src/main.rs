@@ -9,16 +9,7 @@ use std::{
 
 use chrono::Utc;
 use pulsevm_core::{
-    asset::{Asset, Symbol},
-    authority::{Authority, KeyWeight, PermissionLevel},
-    controller::Controller,
-    error::ChainError,
-    id::Id,
-    name::Name,
-    pulse_contract::{NewAccount, SetAbi, SetCode},
-    secp256k1::PrivateKey,
-    transaction::{Action, PackedTransaction, Transaction, TransactionHeader},
-    wasm_runtime,
+    account::{self, Account, AccountMetadata}, asset::{Asset, Symbol}, authority::{Authority, KeyWeight, PermissionLevel, PermissionLink}, controller::Controller, error::ChainError, id::Id, name::Name, pulse_contract::{NewAccount, SetAbi, SetCode}, secp256k1::PrivateKey, transaction::{Action, PackedTransaction, Transaction, TransactionHeader}, wasm_runtime, PULSE_NAME
 };
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 use pulsevm_serialization::Write;
@@ -26,10 +17,10 @@ use pulsevm_time::TimePointSec;
 use serde_json::json;
 use spdlog::info;
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let private_key = PrivateKey::random();
     let mut controller = Controller::new();
-    let mut wasm_runtime = wasm_runtime::WasmRuntime::new().unwrap();
     let genesis_bytes = generate_genesis(&private_key);
     let temp_path = get_temp_dir().to_str().unwrap().to_string();
     controller

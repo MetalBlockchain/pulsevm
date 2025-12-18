@@ -542,12 +542,20 @@ impl ResourceLimitsManager {
     }
 
     pub fn get_total_cpu_weight(session: &mut UndoSession) -> Result<u64, ChainError> {
-        let state = session.get::<ResourceLimitsState>(0)?;
-        Ok(state.total_cpu_weight)
+        let state = session.find::<ResourceLimitsState>(0)?;
+        
+        match state {
+            Some(s) => Ok(s.total_cpu_weight),
+            None => Err(ChainError::TransactionError("failed to get resource limits state".to_string())),
+        }
     }
 
     pub fn get_total_net_weight(session: &mut UndoSession) -> Result<u64, ChainError> {
-        let state = session.get::<ResourceLimitsState>(0)?;
-        Ok(state.total_net_weight)
+        let state = session.find::<ResourceLimitsState>(0)?;
+        
+        match state {
+            Some(s) => Ok(s.total_net_weight),
+            None => Err(ChainError::TransactionError("failed to get resource limits state".to_string())),
+        }
     }
 }

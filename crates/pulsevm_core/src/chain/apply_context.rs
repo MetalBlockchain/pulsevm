@@ -288,8 +288,7 @@ impl ApplyContext {
         let exists = self
             .session
             .find::<Account>(account)
-            .map(|account| account.is_some())
-            .map_err(|e| ChainError::TransactionError(format!("failed to find account: {}", e)))?;
+            .map(|account| account.is_some())?;
         Ok(exists)
     }
 
@@ -767,9 +766,17 @@ impl ApplyContext {
     }
 
     pub fn get_account_metadata(&mut self, account: Name) -> Result<AccountMetadata, ChainError> {
-        self.session.get::<AccountMetadata>(account).map_err(|e| {
+        let res = self.session.find::<AccountMetadata>(account).map_err(|e| {
             ChainError::TransactionError(format!("failed to get account metadata: {}", e))
-        })
+        })?;
+        
+        match res {
+            Some(account_metadata) => Ok(account_metadata),
+            None => Err(ChainError::TransactionError(format!(
+                "account metadata not found for account: {}",
+                account
+            ))),
+        }
     }
 
     pub fn update_db_usage(&self, payer: Name, delta: i64) -> Result<(), ChainError> {
@@ -810,7 +817,7 @@ impl ApplyContext {
     }
 
     pub fn next_auth_sequence(&mut self, actor: &Name) -> Result<u64, ChainError> {
-        let mut amo = self.session.get::<AccountMetadata>(*actor)?;
+        let mut amo = self.get_account_metadata(*actor)?;
         let next_sequence = amo.auth_sequence + 1;
         self.session.modify(&mut amo, |amo| {
             amo.auth_sequence = next_sequence;
@@ -842,7 +849,7 @@ impl ApplyContext {
     }
 
     pub fn set_privileged(&mut self, account: Name, is_privileged: bool) -> Result<(), ChainError> {
-        let mut account = self.session.get::<AccountMetadata>(account.into())?;
+        let mut account = self.get_account_metadata(account)?;
         self.session.modify(&mut account, |acc| {
             acc.set_privileged(is_privileged);
             Ok(())

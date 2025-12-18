@@ -16,14 +16,13 @@ mod tests {
         },
         controller::Controller,
         error::ChainError,
-        name::{self, Name},
+        name::Name,
         pulse_contract::{DeleteAuth, LinkAuth, NewAccount, SetCode, UnlinkAuth, UpdateAuth},
         secp256k1::{PrivateKey, PublicKey},
         transaction::{
             Action, PackedTransaction, SignedTransaction, Transaction, TransactionTrace,
         },
         utils::pulse_assert,
-        wasm_runtime::{self, WasmRuntime},
     };
     use pulsevm_crypto::{Bytes, Digest};
     use pulsevm_proc_macros::name;
@@ -31,23 +30,20 @@ mod tests {
     use serde_json::json;
 
     #[derive(Clone)]
-    pub struct PendingBlockState<'a> {
-        pub undo_session: UndoSession<'a>,
+    pub struct PendingBlockState {
+        pub undo_session: UndoSession,
         pub timestamp: BlockTimestamp,
     }
 
-    pub struct Testing<'a> {
-        pub temp_dir: tempfile::TempDir,
+    pub struct Testing {
         pub controller: Controller,
-        pub wasm_runtime: WasmRuntime,
-        pub pending_block_state: Option<PendingBlockState<'a>>,
+        pub pending_block_state: Option<PendingBlockState>,
     }
 
-    impl<'a> Testing<'a> {
+    impl Testing {
         pub fn new() -> Self {
             let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
             let mut controller = Controller::new();
-            let mut wasm_runtime = controller.get_wasm_runtime();
             let private_key = get_private_key(PULSE_NAME, "active");
             let genesis = generate_genesis(&private_key);
 
@@ -57,9 +53,7 @@ mod tests {
                 .expect("Failed to initialize controller");
 
             let mut suite = Testing {
-                temp_dir,
                 controller,
-                wasm_runtime,
                 pending_block_state: None,
             };
 
@@ -251,7 +245,7 @@ mod tests {
         pub fn set_transaction_headers(
             &self,
             trx: &mut Transaction,
-            expiration: u32,
+            _expiration: u32,
             delay_sec: u32,
         ) {
             trx.header.max_net_usage_words = VarUint32(0); // No limit

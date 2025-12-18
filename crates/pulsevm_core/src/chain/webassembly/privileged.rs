@@ -20,7 +20,7 @@ pub fn is_privileged(
 ) -> Result<i32, RuntimeError> {
     let context = env.data_mut().apply_context_mut();
     privileged_check(context)?;
-    let mut session = context.undo_session();
+    let session = context.undo_session();
     let account = session
         .get::<AccountMetadata>(account.into())
         .map_err(|_| RuntimeError::new(format!("account not found: {}", account)))?;

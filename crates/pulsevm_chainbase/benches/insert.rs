@@ -1,9 +1,10 @@
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use fjall::{Config, PartitionCreateOptions, PartitionHandle};
 use pulsevm_chainbase::{ChainbaseObject, Database, SecondaryKey, UndoSession};
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 use pulsevm_serialization::{Read, Write};
 use tempfile::{env::temp_dir, tempdir, tempfile};
+use tokio::runtime::{self, Runtime};
 use std::hint::black_box;
 
 #[derive(Debug, Default, Clone, Read, Write, NumBytes)]
@@ -39,10 +40,12 @@ fn bench(session: &mut UndoSession) {
 }
 
 fn criterion_benchmark(c: &mut Criterion) {
+    let runtime = runtime::Runtime::new().unwrap();
+    let _guard = runtime.enter();
     let path = tempdir().unwrap();
     let db = Database::new(path.path()).unwrap();
     let mut session = db.undo_session().unwrap();
-    c.bench_function("insert", |b| b.iter(|| bench(black_box(&mut session))));
+    c.bench_function("insert", |b| b.iter(|| bench(&mut session)));
 }
 
 criterion_group!(benches, criterion_benchmark);

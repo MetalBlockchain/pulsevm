@@ -5,7 +5,7 @@ use std::{
 };
 
 use jsonrpsee::{proc_macros::rpc, types::ErrorObjectOwned};
-use pulsevm_chainbase::Session;
+use pulsevm_chainbase::{Session, UndoSession};
 use pulsevm_core::{
     PULSE_NAME,
     abi::{AbiDefinition, AbiSerializer},
@@ -150,7 +150,7 @@ impl RpcServer for RpcService {
         let controller = controller.read().await;
         let database = controller.database();
         let session = database
-            .session()
+            .undo_session() // TODO: use read only session
             .map_err(|e| ErrorObjectOwned::owned(500, "database_error", Some(format!("{}", e))))?;
         let code_account = session.get::<Account>(account_name.clone()).map_err(|e| {
             ErrorObjectOwned::owned(404, "account_not_found", Some(format!("{}", e)))
@@ -252,7 +252,7 @@ impl RpcServer for RpcService {
         let controller = controller.read().await;
         let database = controller.database();
         let session = database
-            .session()
+            .undo_session() // TODO: use read only session
             .map_err(|e| ErrorObjectOwned::owned(500, "database_error", Some(format!("{}", e))))?;
         let accnt_obj = session
             .get::<AccountMetadata>(account_name.clone())
@@ -276,7 +276,7 @@ impl RpcServer for RpcService {
         let controller = controller.read().await;
         let database = controller.database();
         let session = database
-            .session()
+            .undo_session() // TODO: use read only session
             .map_err(|e| ErrorObjectOwned::owned(500, "database_error", Some(format!("{}", e))))?;
         let mut results: Vec<String> = Vec::new();
         let table = session.find_by_secondary::<Table, TableByCodeScopeTableIndex>((
@@ -328,7 +328,7 @@ impl RpcServer for RpcService {
         let controller = controller.read().await;
         let database = controller.database();
         let session = database
-            .session()
+            .undo_session() // TODO: use read only session
             .map_err(|e| ErrorObjectOwned::owned(500, "database_error", Some(format!("{}", e))))?;
 
         let table = session.find_by_secondary::<Table, TableByCodeScopeTableIndex>((
@@ -423,7 +423,7 @@ impl RpcServer for RpcService {
         let controller = controller.read().await;
         let session = controller
             .database()
-            .session()
+            .undo_session() // TODO: use read only session
             .map_err(|e| ErrorObjectOwned::owned(500, "database_error", Some(format!("{}", e))))?;
         let account = session.get::<Account>(account_name.clone()).map_err(|e| {
             ErrorObjectOwned::owned(404, "account_not_found", Some(format!("{}", e)))
@@ -456,7 +456,7 @@ impl RpcServer for RpcService {
         let controller = controller.read().await;
         let session = controller
             .database()
-            .session()
+            .undo_session() // TODO: use read only session
             .map_err(|e| ErrorObjectOwned::owned(500, "database_error", Some(format!("{}", e))))?;
 
         if let Ok(n) = block_num_or_id.parse::<u32>() {
@@ -553,7 +553,7 @@ impl RpcServer for RpcService {
         let controller = controller.read().await;
         let session = controller
             .database()
-            .session()
+            .undo_session() // TODO: use read only session
             .map_err(|e| ErrorObjectOwned::owned(500, "database_error", Some(format!("{}", e))))?;
 
         if primary {
@@ -624,7 +624,7 @@ fn get_table_index_name(
 }
 
 fn get_table_rows_ex(
-    session: &Session,
+    session: &UndoSession,
     abi: &AbiDefinition,
     code: Name,
     scope: String,

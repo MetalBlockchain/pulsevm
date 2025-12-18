@@ -99,7 +99,7 @@ impl fmt::Display for ControllerError {
 impl Controller {
     pub fn new() -> Self {
         // Create a temporary database
-        let db = Database::temporary(Path::new("temp")).unwrap();
+        let db = Database::new(Path::new("temp")).unwrap();
         let wasm_runtime = WasmRuntime::new().unwrap();
         let controller = Controller {
             wasm_runtime,
@@ -144,12 +144,7 @@ impl Controller {
             Digest::default(),
         );
 
-        let session = self.db.session()?;
-
-        // Do we have the genesis block in our DB?
-        let genesis_block = session.find::<SignedBlock>(1).map_err(|e| {
-            ChainError::GenesisError(format!("failed to find genesis block: {}", e))
-        })?;
+        let mut session = self.db.undo_session()?;
 
         // Prep partition handles for faster access
         prepare_db_object::<Account>(&self.db)?;
@@ -167,11 +162,12 @@ impl Controller {
         prepare_db_object::<Table>(&self.db)?;
         prepare_db_object::<KeyValue>(&self.db)?;
 
+        // Do we have the genesis block in our DB?
+        let genesis_block = session.find::<SignedBlock>(1).map_err(|e| {
+            ChainError::GenesisError(format!("failed to find genesis block: {}", e))
+        })?;
+
         if genesis_block.is_none() {
-            // If not, insert it
-            let mut session = self.db.undo_session().map_err(|e| {
-                ChainError::GenesisError(format!("failed to create undo session: {}", e))
-            })?;
             session.insert(&self.last_accepted_block).map_err(|e| {
                 ChainError::GenesisError(format!("failed to insert genesis block: {}", e))
             })?;
@@ -488,7 +484,7 @@ impl Controller {
         }
 
         // Query DB
-        let block = self.db.session()?.find::<SignedBlock>(height)?;
+        let block = self.db.undo_session()?.find::<SignedBlock>(height)?;
 
         Ok(block)
     }
@@ -501,7 +497,7 @@ impl Controller {
 
     pub fn get_block(&self, id: Id) -> Result<Option<SignedBlock>, ChainError> {
         self.db
-            .session()?
+            .undo_session()?
             .find::<SignedBlock>(BlockHeader::num_from_id(&id))
             .map_err(|e| ChainError::TransactionError(format!("failed to find block: {}", e)))
     }
@@ -593,7 +589,7 @@ impl Controller {
             }
         }
 
-        let session = self.db.session()?;
+        let session = self.db.undo_session()?;
         let block = session.find::<SignedBlock>(block_num)?;
         if let Some(block) = block {
             return Ok(Some(block.id()));
@@ -612,6 +608,7 @@ mod tests {
     use pulsevm_time::TimePointSec;
     use serde_json::json;
     use tempfile::TempDir;
+    use tokio::runtime;
 
     use crate::chain::{
         asset::{Asset, Symbol},
@@ -869,6 +866,11 @@ mod tests {
 
     #[test]
     fn test_api_db() -> Result<(), ChainError> {
+        let runtime = runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
         let private_key = PrivateKey::random();
         let mut controller = Controller::new();
         let genesis_bytes = generate_genesis(&private_key);

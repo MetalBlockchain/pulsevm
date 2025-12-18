@@ -1,5 +1,5 @@
-use core::{fmt, str};
-use std::{collections::HashSet, error::Error, hash::Hash, usize};
+use core::fmt;
+use std::{error::Error, usize};
 
 mod varint;
 pub use varint::*;

@@ -16,16 +16,6 @@ fn take<const N: usize>(bytes: &mut &[u8]) -> Result<[u8; N], ReadError> {
     Ok(head.try_into().unwrap())
 }
 
-#[inline]
-fn take_slice<'a>(bytes: &mut &'a [u8], n: usize) -> Result<&'a [u8], ReadError> {
-    if bytes.len() < n {
-        return Err(ReadError::NotEnoughBytes);
-    }
-    let (head, tail) = bytes.split_at(n);
-    *bytes = tail;
-    Ok(head)
-}
-
 impl NumBytes for usize {
     #[inline]
     fn num_bytes(&self) -> usize {

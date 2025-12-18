@@ -8,6 +8,7 @@ use pulsevm_crypto::Bytes;
 use wasmer::{
     Engine, Function, FunctionEnv, Instance, Memory, Module, Store, imports,
 };
+
 use wasmer_compiler_llvm::LLVM;
 
 use crate::{
@@ -128,7 +129,7 @@ impl WasmRuntime {
 
         // Different scope so session is released before running the wasm code.
         {
-            let mut session = apply_context.undo_session();
+            let session = apply_context.undo_session();
 
             if !inner.code_cache.contains(&code_hash) {
                 let code_object = session.get::<CodeObject>(code_hash).map_err(|e| {
