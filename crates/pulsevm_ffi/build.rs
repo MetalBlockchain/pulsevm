@@ -6,7 +6,9 @@ fn main() {
 
     // Tell cargo to look for shared libraries in the specified directory
     let project_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
-    let chainbase_root = PathBuf::from(&project_dir).join("chaindb");
+    let project_root = PathBuf::from(&project_dir);
+    let libraries_root = project_root.join("pulsevm/libraries");
+    let chainbase_root = project_root.join("chaindb");
     
     //println!("cargo:rustc-link-search=native={}/lib", chainbase_dir);
     println!("cargo:rustc-link-lib=dylib=chainbase");
@@ -36,6 +38,10 @@ fn main() {
         .include(&include_dir)
         .include(&boost_root)
         .include(&project_dir)  // For chainbase_bridge.hpp
+        .include(&libraries_root.join("libfc/include"))
+        .include(&libraries_root.join("libfc/libraries/boringssl/bssl/include"))
+        .include(&libraries_root.join("softfloat/source/include"))
+        .include(&libraries_root.join("chain/include"))
         // Compiler flags
         .flag("-std=c++20")
         .flag("-pthread")
@@ -52,6 +58,9 @@ fn main() {
     println!("cargo:rustc-link-lib=boost_system");
     println!("cargo:rustc-link-lib=boost_chrono");
     println!("cargo:rustc-link-lib=pthread");
+
+    println!("cargo:rustc-link-search=native={}", project_root.join("pulsevm/build/libraries/chain").to_str().unwrap());
+    println!("cargo:rustc-link-lib=chain");
 
     // C++ standard library
     if target.contains("apple") {

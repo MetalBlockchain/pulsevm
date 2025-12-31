@@ -22,7 +22,3 @@ std::unique_ptr<database_wrapper> open_database(
     // Create and return database
     return std::make_unique<database_wrapper>(fs_path, db_flags, size);
 }
-
-std::unique_ptr<chainbase::database::session> start_undo_session(chainbase::database& db) {
-    return std::make_unique<chainbase::database::session>(db.start_undo_session(true));
-}
