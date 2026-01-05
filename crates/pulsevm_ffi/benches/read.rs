@@ -1,18 +1,16 @@
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
 use pulsevm_ffi::Database;
-use tempfile::{env::temp_dir, tempdir, tempfile};
-use std::hint::black_box;
+use tempfile::{env::temp_dir, tempdir};
 
 fn bench(db: &mut Database) {
-    let mut account = db.get_account();
+    db.get_account();
 }
 
 fn criterion_benchmark(c: &mut Criterion) {
     let temp_dir = tempdir().unwrap();
-    println!("Temp dir path: {:?}", temp_dir.path().to_str().unwrap());
     let mut db = Database::new(temp_dir.path().to_str().unwrap()).unwrap();
     db.add_indices();
-    db.add_account();
+    //db.add_account(pulsevm_ffi::Name { value: 123 });
     c.bench_function("read", |b| b.iter(|| bench(&mut db)));
 }
 

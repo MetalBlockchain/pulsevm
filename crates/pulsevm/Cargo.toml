@@ -26,7 +26,6 @@ prost-types = "0.12.3"
 pulsevm_core = { path = "../pulsevm_core" }
 pulsevm_crypto = { path = "../pulsevm_crypto" }
 pulsevm_grpc = { path = "../pulsevm_grpc" }
-pulsevm_chainbase = { path = "../pulsevm_chainbase" }
 pulsevm_name = { path = "../pulsevm_name" }
 pulsevm_proc_macros = { path = "../pulsevm_proc_macros" }
 pulsevm_serialization = { path = "../pulsevm_serialization" }

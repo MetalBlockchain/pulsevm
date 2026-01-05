@@ -4,12 +4,11 @@ use tempfile::{env::temp_dir, tempdir, tempfile};
 use std::hint::black_box;
 
 fn bench(db: &mut Database) {
-    db.add_account();
+    //db.add_account(black_box(123));
 }
 
 fn criterion_benchmark(c: &mut Criterion) {
     let temp_dir = tempdir().unwrap();
-    println!("Temp dir path: {:?}", temp_dir.path().to_str().unwrap());
     let mut db = Database::new(temp_dir.path().to_str().unwrap()).unwrap();
     db.add_indices();
     c.bench_function("insert", |b| b.iter(|| bench(&mut db)));

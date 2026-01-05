@@ -2,7 +2,7 @@
 #include <pulsevm_ffi/src/bridge.rs.h>
 #include <filesystem>
 
-std::unique_ptr<database_wrapper> open_database(
+std::unique_ptr<pulsevm::chain::database_wrapper> open_database(
     rust::Str path,
     DatabaseOpenFlags flags,
     uint64_t size
@@ -20,5 +20,5 @@ std::unique_ptr<database_wrapper> open_database(
     }
     
     // Create and return database
-    return std::make_unique<database_wrapper>(fs_path, db_flags, size);
+    return std::make_unique<pulsevm::chain::database_wrapper>(fs_path, db_flags, size);
 }

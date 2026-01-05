@@ -1,4 +1,5 @@
 mod bridge;
+mod block_log;
 use std::{collections::HashSet, sync::{Arc, RwLock}};
 
 use bridge::ffi as ffi;

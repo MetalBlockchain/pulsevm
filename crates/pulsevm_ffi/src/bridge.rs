@@ -1,5 +1,7 @@
 #[cxx::bridge]
 pub mod ffi {
+    use crate::block_log;
+
     // Shared enums between Rust and C++
     #[repr(u32)]
     enum DatabaseOpenFlags {
@@ -8,6 +10,7 @@ pub mod ffi {
     }
 
     unsafe extern "C++" {
+        include!("block_log.hpp");
         include!("database.hpp");
         include!("name.hpp");
 
@@ -26,6 +29,15 @@ pub mod ffi {
         #[cxx_name = "account_object"]
         #[namespace = "pulsevm::chain"]
         type Account;
+
+        // Block log
+        #[cxx_name = "block_log"]
+        #[namespace = "pulsevm::chain"]
+        pub type BlockLog;
+
+        pub fn open_block_log(
+            path: &str,
+        ) -> UniquePtr<BlockLog>;
         
         // Constructor wrapper
         pub fn open_database(
@@ -62,6 +74,7 @@ pub mod ffi {
         pub fn get_account_limits(self: Pin<&mut Database>, account_name: &Name, ram_bytes: &mut i64, net_weight: &mut i64, cpu_weight: &mut i64) -> Result<()>;
         pub fn get_total_cpu_weight(self: Pin<&mut Database>) -> Result<u64>;
         pub fn get_total_net_weight(self: Pin<&mut Database>) -> Result<u64>;
+        pub fn find_block_by_number(self: Pin<&mut Database>, block_number: u32) -> Result<Option<>>;
 
         // Methods on undo_session
         pub fn push(self: Pin<&mut UndoSession>) -> Result<()>;

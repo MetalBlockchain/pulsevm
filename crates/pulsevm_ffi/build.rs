@@ -8,17 +8,16 @@ fn main() {
     let project_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
     let project_root = PathBuf::from(&project_dir);
     let libraries_root = project_root.join("pulsevm/libraries");
-    let chainbase_root = project_root.join("chaindb");
+    let chainbase_root = libraries_root.join("chainbase");
     
     //println!("cargo:rustc-link-search=native={}/lib", chainbase_dir);
     println!("cargo:rustc-link-lib=dylib=chainbase");
     
     // Tell cargo to invalidate the built crate whenever the wrapper changes
     println!("cargo:rerun-if-changed=src/bridge.rs");
-    println!("cargo:rerun-if-changed=chaindb/include/chainbase/chainbase.hpp");
+    println!("cargo:rerun-if-changed=src/block_log.rs");
     println!("cargo:rerun-if-changed=database.hpp");
     println!("cargo:rerun-if-changed=database.cpp");
-    println!("cargo:rerun-if-env-changed=CHAINBASE_DIR");
 
     // Chainbase source and include directories
     let src_dir = chainbase_root.join("src");
@@ -28,12 +27,10 @@ fn main() {
     let boost_root = env::var("BOOST_ROOT")
         .unwrap_or_else(|_| "/opt/homebrew/opt/boost@1.85/include".to_string());
 
-    cxx_build::bridge("src/bridge.rs")
-        // Chainbase source files
-        .file(src_dir.join("chainbase.cpp"))
-        .file(src_dir.join("pinnable_mapped_file.cpp"))
+    cxx_build::bridges(["src/bridge.rs", "src/block_log.rs"])
         // Bridge implementation
         .file("database.cpp")
+        .file("block_log.cpp")
         // Include directories
         .include(&include_dir)
         .include(&boost_root)
@@ -41,6 +38,7 @@ fn main() {
         .include(&libraries_root.join("libfc/include"))
         .include(&libraries_root.join("libfc/libraries/boringssl/bssl/include"))
         .include(&libraries_root.join("softfloat/source/include"))
+        .include(&libraries_root.join("chainbase/include"))
         .include(&libraries_root.join("chain/include"))
         // Compiler flags
         .flag("-std=c++20")
