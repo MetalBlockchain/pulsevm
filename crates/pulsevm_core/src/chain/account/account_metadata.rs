@@ -1,4 +1,3 @@
-use pulsevm_chainbase::{ChainbaseObject, SecondaryKey};
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 
 use crate::chain::{Name, block::BlockTimestamp, id::Id};
@@ -39,25 +38,5 @@ impl AccountMetadata {
 
     pub fn set_privileged(&mut self, privileged: bool) {
         self.privileged = privileged;
-    }
-}
-
-impl ChainbaseObject for AccountMetadata {
-    type PrimaryKey = Name;
-
-    fn primary_key(&self) -> Vec<u8> {
-        AccountMetadata::primary_key_to_bytes(self.name)
-    }
-
-    fn primary_key_to_bytes(key: Self::PrimaryKey) -> Vec<u8> {
-        key.as_u64().to_le_bytes().to_vec()
-    }
-
-    fn table_name() -> &'static str {
-        "account_metadata"
-    }
-
-    fn secondary_indexes(&self) -> Vec<SecondaryKey> {
-        vec![]
     }
 }

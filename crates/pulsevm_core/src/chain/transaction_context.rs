@@ -3,7 +3,6 @@ use std::{
     sync::{Arc, RwLock, atomic::AtomicI64},
 };
 
-use pulsevm_chainbase::UndoSession;
 use pulsevm_serialization::VarUint32;
 use pulsevm_time::{Microseconds, TimePoint};
 
@@ -49,14 +48,12 @@ struct TransactionContextInner {
 #[derive(Clone)]
 pub struct TransactionContext {
     chain_config: Arc<ChainConfig>,
-    session: UndoSession,
     wasm_runtime: WasmRuntime,
     inner: Arc<RwLock<TransactionContextInner>>,
 }
 
 impl TransactionContext {
     pub fn new(
-        session: UndoSession,
         chain_config: Arc<ChainConfig>,
         wasm_runtime: WasmRuntime,
         block_num: u32,
@@ -70,7 +67,6 @@ impl TransactionContext {
 
         Self {
             chain_config,
-            session,
             wasm_runtime,
             inner: Arc::new(RwLock::new(TransactionContextInner {
                 initialized: false,
@@ -247,7 +243,6 @@ impl TransactionContext {
             self.with_action_trace(action_ordinal, |t| (t.action().clone(), t.receiver()))?;
         let mut apply_context = ApplyContext::new(
             self.chain_config.clone(),
-            self.session.clone(),
             self.wasm_runtime.clone(),
             self.clone(),
             action,

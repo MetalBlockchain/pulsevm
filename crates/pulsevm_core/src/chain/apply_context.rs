@@ -5,7 +5,6 @@ use std::{
 };
 
 use chrono::Utc;
-use pulsevm_chainbase::UndoSession;
 use pulsevm_crypto::Bytes;
 use spdlog::info;
 
@@ -45,7 +44,6 @@ struct ApplyContextInner {
 #[derive(Clone)]
 pub struct ApplyContext {
     pub chain_config: Arc<ChainConfig>,
-    session: UndoSession,            // The undo session for this context
     wasm_runtime: WasmRuntime,       // Context for the Wasm runtime
     trx_context: TransactionContext, // The transaction context
 
@@ -61,7 +59,6 @@ pub struct ApplyContext {
 impl ApplyContext {
     pub fn new(
         chain_config: Arc<ChainConfig>,
-        session: UndoSession,
         wasm_runtime: WasmRuntime,
         trx_context: TransactionContext,
         action: Action,
@@ -73,7 +70,6 @@ impl ApplyContext {
 
         Ok(ApplyContext {
             chain_config,
-            session,
             wasm_runtime,
             trx_context,
 
@@ -290,10 +286,6 @@ impl ApplyContext {
             .find::<Account>(account)
             .map(|account| account.is_some())?;
         Ok(exists)
-    }
-
-    pub fn undo_session(&self) -> UndoSession {
-        self.session.clone()
     }
 
     pub fn execute_inline(&mut self, a: &Action) -> Result<(), ChainError> {

@@ -1,6 +1,7 @@
 use core::fmt;
 
 use pulsevm_chainbase::{ChainbaseObject, SecondaryIndex, SecondaryKey, Session, UndoSession};
+use pulsevm_ffi::Database;
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 use pulsevm_serialization::Write;
 use serde::Serialize;
@@ -42,7 +43,7 @@ impl Permission {
     pub fn satisfies(
         &self,
         other: &Permission,
-        session: &mut UndoSession,
+        db: &mut Database,
     ) -> Result<bool, ChainError> {
         // If the owners are not the same, this permission cannot satisfy other
         if self.owner != other.owner {

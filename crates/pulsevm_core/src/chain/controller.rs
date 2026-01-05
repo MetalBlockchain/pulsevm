@@ -45,8 +45,8 @@ use crate::{
     utils::prepare_db_object,
 };
 
-use pulsevm_chainbase::{Database, UndoSession};
 use pulsevm_crypto::{Digest, merkle};
+use pulsevm_ffi::Database;
 use pulsevm_serialization::{Read, Write};
 use spdlog::info;
 use tokio::sync::RwLock as AsyncRwLock;
@@ -145,22 +145,6 @@ impl Controller {
         );
 
         let mut session = self.db.undo_session()?;
-
-        // Prep partition handles for faster access
-        prepare_db_object::<Account>(&self.db)?;
-        prepare_db_object::<AccountMetadata>(&self.db)?;
-        prepare_db_object::<SignedBlock>(&self.db)?;
-        prepare_db_object::<CodeObject>(&self.db)?;
-        prepare_db_object::<DynamicGlobalPropertyObject>(&self.db)?;
-        prepare_db_object::<GlobalPropertyObject>(&self.db)?;
-        prepare_db_object::<Permission>(&self.db)?;
-        prepare_db_object::<PermissionLink>(&self.db)?;
-        prepare_db_object::<ResourceUsage>(&self.db)?;
-        prepare_db_object::<ResourceLimits>(&self.db)?;
-        prepare_db_object::<ResourceLimitsConfig>(&self.db)?;
-        prepare_db_object::<ResourceLimitsState>(&self.db)?;
-        prepare_db_object::<Table>(&self.db)?;
-        prepare_db_object::<KeyValue>(&self.db)?;
 
         // Do we have the genesis block in our DB?
         let genesis_block = session.find::<SignedBlock>(1).map_err(|e| {
@@ -319,7 +303,7 @@ impl Controller {
                     block_id
                 )))?
         };
-        let mut session = self.db.undo_session()?;
+        let mut session = self.db.create_undo_session(true)?;
         let mut mempool = mempool.write().await;
         let transaction_traces = self
             .execute_block(&block, &mut session, &mut mempool)
@@ -348,7 +332,7 @@ impl Controller {
     pub async fn execute_block(
         &mut self,
         block: &SignedBlock,
-        session: &mut UndoSession,
+        db: &mut Database,
         mempool: &mut Mempool,
     ) -> Result<Vec<TransactionTrace>, ChainError> {
         // Make sure we don't have the block already
@@ -423,11 +407,8 @@ impl Controller {
         transaction: &PackedTransaction,
         pending_block_timestamp: &BlockTimestamp,
     ) -> Result<TransactionResult, ChainError> {
-        let db = &self.db;
-        let mut undo_session = db.undo_session()?;
-        let result =
-            self.execute_transaction(&mut undo_session, transaction, pending_block_timestamp);
-
+        let mut undo_session = self.db.create_undo_session(true)?;
+        let result = self.execute_transaction(&mut undo_session, transaction, pending_block_timestamp)?;
         return result;
     }
 
@@ -435,7 +416,7 @@ impl Controller {
     // This is useful for applying a transaction to the blockchain
     pub fn execute_transaction(
         &mut self,
-        undo_session: &mut UndoSession,
+        db: &mut Database,
         packed_transaction: &PackedTransaction,
         pending_block_timestamp: &BlockTimestamp,
     ) -> Result<TransactionResult, ChainError> {
@@ -445,7 +426,7 @@ impl Controller {
             // Verify authority
             AuthorizationManager::check_authorization(
                 &self.config,
-                undo_session,
+                db,
                 &signed_transaction.transaction().actions,
                 &signed_transaction.recovered_keys(&self.chain_id)?,
                 &HashSet::new(),
@@ -454,7 +435,6 @@ impl Controller {
         }
 
         let mut trx_context = TransactionContext::new(
-            undo_session.clone(),
             self.config.clone(),
             self.wasm_runtime.clone(),
             self.last_accepted_block().block_num() + 1,
@@ -520,22 +500,16 @@ impl Controller {
         None
     }
 
-    pub fn create_undo_session(&mut self) -> Result<UndoSession, ChainError> {
-        self.db.undo_session().map_err(|e| {
-            ChainError::TransactionError(format!("failed to create undo session: {}", e))
-        })
-    }
-
     pub fn get_wasm_runtime(&self) -> &WasmRuntime {
         &self.wasm_runtime
     }
 
     pub fn get_global_properties(
-        session: &mut UndoSession,
+        db: &mut Database,
     ) -> Result<GlobalPropertyObject, ChainError> {
-        session.get::<GlobalPropertyObject>(0).map_err(|e| {
+        db.get::<GlobalPropertyObject>(0).map_err(|e| {
             ChainError::TransactionError(format!("failed to get global properties: {}", e))
-        })
+        })?;
     }
 
     pub fn database(&self) -> Database {

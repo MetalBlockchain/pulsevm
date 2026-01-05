@@ -1,6 +1,5 @@
 use std::error::Error;
 
-use pulsevm_chainbase::ChainbaseError;
 use thiserror::Error;
 use wasmer::RuntimeError;
 
@@ -49,24 +48,6 @@ impl From<pulsevm_serialization::ReadError> for ChainError {
 impl From<Box<dyn Error>> for ChainError {
     fn from(_: Box<dyn Error>) -> Self {
         ChainError::InternalError(None)
-    }
-}
-
-impl From<ChainbaseError> for ChainError {
-    fn from(e: ChainbaseError) -> Self {
-        match e {
-            ChainbaseError::NotFound => ChainError::DatabaseError("item not found".to_string()),
-            ChainbaseError::AlreadyExists => {
-                ChainError::DatabaseError("item already exists".to_string())
-            }
-            ChainbaseError::InvalidData => {
-                ChainError::DatabaseError("invalid data provided".to_string())
-            }
-            ChainbaseError::ReadError => {
-                ChainError::DatabaseError("error reading data".to_string())
-            }
-            ChainbaseError::InternalError(msg) => ChainError::DatabaseError(msg),
-        }
     }
 }
 

@@ -28,11 +28,11 @@ wasmer-compiler-llvm = "6.1.0"
 
 pulsevm_crypto = { path = "../pulsevm_crypto" }
 pulsevm_grpc = { path = "../pulsevm_grpc" }
-pulsevm_chainbase = { path = "../pulsevm_chainbase" }
 pulsevm_name = { path = "../pulsevm_name" }
 pulsevm_proc_macros = { path = "../pulsevm_proc_macros" }
 pulsevm_serialization = { path = "../pulsevm_serialization" }
 pulsevm_time = { path = "../pulsevm_time" }
+pulsevm_ffi = { path = "../pulsevm_ffi" }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
