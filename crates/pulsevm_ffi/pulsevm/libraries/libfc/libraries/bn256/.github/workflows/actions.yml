@@ -1,0 +1,47 @@
+name: actions
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: [main, master]
+jobs:
+  build:
+    runs-on: ${{ matrix.config.vm_image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - name: Ubuntu 20.04
+            mode: Release
+            os: ubuntu
+            vm_image: ubuntu-20.04
+          - name: Ubuntu 22.04
+            mode: Release
+            os: ubuntu
+            vm_image: ubuntu-22.04
+          - name: MacOS
+            mode: Release
+            os: macos
+            vm_image: macos-latest
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@v2
+        with:
+          submodules: true
+      - name: 'setup'
+        if: contains(matrix.config.vm_image, '20.04')
+        run: |
+          sudo apt-get install -y g++-10 libstdc++-10-dev
+          sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-10 100 \
+               --slave /usr/bin/gcc gcc /usr/bin/gcc-10
+      - name: 'configure'
+        run: |
+          cmake -DCMAKE_BUILD_TYPE=${{ matrix.config.mode }} -Bbuild -S.
+      - name: 'compile'
+        run: |
+          cmake --build build
+      - name: 'test'
+        run: |
+          cd build && ctest
