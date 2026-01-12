@@ -6,6 +6,8 @@ use std::{
 
 use chrono::Utc;
 use pulsevm_crypto::Bytes;
+use pulsevm_error::ChainError;
+use pulsevm_ffi::{Database, KeyValue, KeyValueIteratorCache, Name, Table};
 use spdlog::info;
 
 use crate::{
@@ -17,12 +19,8 @@ use crate::{
         block::BlockTimestamp,
         config::{DynamicGlobalPropertyObject, billable_size_v},
         controller::Controller,
-        error::ChainError,
         genesis::ChainConfig,
         id::Id,
-        iterator_cache::IteratorCache,
-        name::Name,
-        table::{KeyValue, KeyValueByScopePrimaryIndex, Table, TableByCodeScopeTableIndex},
         transaction::{Action, ActionReceipt, generate_action_digest},
         transaction_context::TransactionContext,
         utils::pulse_assert,
@@ -31,24 +29,25 @@ use crate::{
 };
 
 struct ApplyContextInner {
-    keyval_cache: IteratorCache<KeyValue>, // Cache for iterators
     action_return_value: Option<Vec<u8>>,  // Return value of the action
     start: i64,                            // Start time in microseconds
     privileged: bool,
     account_ram_deltas: HashMap<Name, i64>, // RAM usage deltas for accounts
     notified: VecDeque<(Name, u32)>,        // List of notified accounts
     inline_actions: Vec<u32>,               // List of inline actions
-    recurse_depth: u32, // The current recursion depth
+    recurse_depth: u32,                     // The current recursion depth
+    keyval_cache: KeyValueIteratorCache,    // Cache for key-value iterators
 }
 
 #[derive(Clone)]
 pub struct ApplyContext {
-    pub chain_config: Arc<ChainConfig>,
+    chain_config: Arc<ChainConfig>,
     wasm_runtime: WasmRuntime,       // Context for the Wasm runtime
     trx_context: TransactionContext, // The transaction context
+    db: Database,                 // The database being used
 
-    action: Action,     // The action being applied
-    receiver: Name,     // The account that is receiving the action
+    action: Action, // The action being applied
+    receiver: Name, // The account that is receiving the action
     first_receiver_action_ordinal: u32,
     action_ordinal: u32,
     pending_block_timestamp: BlockTimestamp, // Timestamp for the pending block
@@ -61,6 +60,7 @@ impl ApplyContext {
         chain_config: Arc<ChainConfig>,
         wasm_runtime: WasmRuntime,
         trx_context: TransactionContext,
+        db: Database,
         action: Action,
         receiver: Name,
         action_ordinal: u32,
@@ -72,6 +72,7 @@ impl ApplyContext {
             chain_config,
             wasm_runtime,
             trx_context,
+            db,
 
             action,
             receiver,
@@ -80,7 +81,6 @@ impl ApplyContext {
             pending_block_timestamp,
 
             inner: Arc::new(RwLock::new(ApplyContextInner {
-                keyval_cache: IteratorCache::new(),
                 action_return_value: None,
                 start: Utc::now().timestamp_micros(),
                 privileged: false,
@@ -88,6 +88,7 @@ impl ApplyContext {
                 notified: VecDeque::new(),
                 inline_actions: Vec::new(),
                 recurse_depth: depth,
+                keyval_cache: KeyValueIteratorCache::new(),
             })),
         })
     }
@@ -244,12 +245,12 @@ impl ApplyContext {
         )));
     }
 
-    pub fn has_recipient(&self, recipient: Name) -> Result<bool, ChainError> {
+    pub fn has_recipient(&self, recipient: &Name) -> Result<bool, ChainError> {
         let inner = self.inner.read()?;
-        Ok(inner.notified.iter().any(|(r, _)| *r == recipient))
+        Ok(inner.notified.iter().any(|(r, _)| r == recipient))
     }
 
-    pub fn require_recipient(&mut self, recipient: Name) -> Result<(), ChainError> {
+    pub fn require_recipient(&mut self, recipient: &Name) -> Result<(), ChainError> {
         if !self.has_recipient(recipient)? {
             let scheduled_ordinal =
                 self.schedule_action_from_ordinal(self.action_ordinal, &recipient, false)?;
@@ -260,7 +261,7 @@ impl ApplyContext {
         Ok(())
     }
 
-    pub fn has_authorization(&self, account: Name) -> bool {
+    pub fn has_authorization(&self, account: &Name) -> bool {
         for auth in self.action.authorization() {
             if auth.actor == account {
                 return true;
@@ -270,7 +271,7 @@ impl ApplyContext {
         return false;
     }
 
-    pub fn add_ram_usage(&self, account: Name, ram_delta: i64) -> Result<(), ChainError> {
+    pub fn add_ram_usage(&mut self, account: &Name, ram_delta: i64) -> Result<(), ChainError> {
         let mut inner = self.inner.write()?;
         inner
             .account_ram_deltas
@@ -280,12 +281,8 @@ impl ApplyContext {
         Ok(())
     }
 
-    pub fn is_account(&mut self, account: Name) -> Result<bool, ChainError> {
-        let exists = self
-            .session
-            .find::<Account>(account)
-            .map(|account| account.is_some())?;
-        Ok(exists)
+    pub fn is_account(&self, account: &Name) -> Result<bool, ChainError> {
+        self.db.is_account(account)
     }
 
     pub fn execute_inline(&mut self, a: &Action) -> Result<(), ChainError> {
@@ -393,42 +390,31 @@ impl ApplyContext {
 
     pub fn db_find_i64(
         &mut self,
-        code: Name,
-        scope: Name,
-        table: Name,
+        code: &Name,
+        scope: &Name,
+        table: &Name,
         id: u64,
     ) -> Result<i32, ChainError> {
-        let table = self.find_table(code, scope, table)?;
-
-        match table {
-            Some(table) => {
-                let mut inner = self.inner.write()?;
-                let table_end_itr = inner.keyval_cache.cache_table(&table);
-                let obj = self
-                    .session
-                    .find_by_secondary::<KeyValue, KeyValueByScopePrimaryIndex>((table.id, id))
-                    .map_err(|e| {
-                        ChainError::TransactionError(format!("failed to find keyval: {}", e))
-                    })?;
-
-                match obj {
-                    Some(keyval) => Ok(inner.keyval_cache.add(&keyval)),
-                    None => Ok(table_end_itr),
-                }
-            }
-            None => Ok(-1),
+        let inner = self.inner.write()?;
+        
+        match self.db.db_find_i64(code, scope, table, id, &mut inner.keyval_cache) {
+            Ok(itr) => Ok(itr),
+            Err(e) => Err(ChainError::DatabaseError(format!(
+                "failed to find i64 in db: {}",
+                e
+            ))),
         }
     }
 
     pub fn db_store_i64(
         &mut self,
-        scope: Name,
-        table: Name,
-        payer: Name,
+        scope: &Name,
+        table: &Name,
+        payer: &Name,
         primary_key: u64,
         data: Bytes,
     ) -> Result<i32, ChainError> {
-        let mut table = self.find_or_create_table(self.receiver, scope, table, payer)?;
+        let table = self.find_or_create_table(&self.receiver, scope, table, payer)?;
         pulse_assert(
             !payer.empty(),
             ChainError::TransactionError(format!(
@@ -436,23 +422,46 @@ impl ApplyContext {
             )),
         )?;
 
-        let id = self.session.generate_id::<KeyValue>()?;
-        let len = data.len();
-        let key_value = KeyValue::new(id, table.id, primary_key, payer, data);
-        self.session
-            .insert(&key_value)
-            .map_err(|e| ChainError::TransactionError(format!("failed to insert keyval: {}", e)))?;
-        self.session.modify(&mut table, |t| {
-            t.count += 1;
-            Ok(())
-        })?;
+        let inner = self.inner.write()?;
+        let obj = self.db.create_key_value_object(table, payer, primary_key, &data.0.as_slice())?;
 
-        let billable_size = len as i64 + billable_size_v::<KeyValue>() as i64;
+        let billable_size = data.len() as i64 + billable_size_v::<KeyValue>() as i64;
         self.update_db_usage(payer, billable_size)?;
 
-        let mut inner = self.inner.write()?;
         inner.keyval_cache.cache_table(&table);
-        return Ok(inner.keyval_cache.add(&key_value));
+        Ok(inner.keyval_cache.add(obj)?)
+    }
+
+    pub fn db_update_i64(
+        &mut self,
+        iterator: i32,
+        payer: &Name,
+        data: impl AsRef<[u8]>,
+    ) -> Result<(), ChainError> {
+        let mut inner = self.inner.write()?;
+        let obj = inner.keyval_cache.get(iterator)?;
+
+        let table_obj = inner.keyval_cache.get_table(obj.get_table_id())?;
+        pulse_assert(
+            table_obj.get_code() == &self.receiver,
+            ChainError::TransactionError(format!("db access violation",)),
+        )?;
+
+        let overhead = billable_size_v::<KeyValue>() as i64;
+        let old_size = obj.get_value().len() as i64 + overhead;
+        let new_size = data.as_ref().len() as i64 + overhead;
+
+        let payer = if payer.empty() { obj.get_payer() } else { payer };
+
+        if obj.get_payer() != payer {
+            self.update_db_usage(obj.get_payer(), -old_size)?;
+            self.update_db_usage(payer, new_size)?;
+        } else if old_size != new_size {
+            self.update_db_usage(obj.get_payer(), new_size - old_size)?;
+        }
+
+        self.db.update_key_value_object(obj, payer, data.as_ref())?;
+        Ok(())
     }
 
     pub fn db_get_i64(
@@ -461,9 +470,9 @@ impl ApplyContext {
         buffer: &mut Vec<u8>,
         buffer_size: usize,
     ) -> Result<i32, ChainError> {
-        let inner = self.inner.read()?;
+        let mut inner = self.inner.write()?;
         let obj = inner.keyval_cache.get(iterator)?;
-        let s = obj.value.len();
+        let s = obj.get_value().len();
         if buffer_size == 0 {
             return Ok(s as i32);
         }
@@ -471,57 +480,22 @@ impl ApplyContext {
         if buffer.len() < copy_size {
             buffer.resize(copy_size, 0);
         }
-        buffer[..copy_size].copy_from_slice(&obj.value.as_slice()[..copy_size]);
+        buffer[..copy_size].copy_from_slice(&obj.get_value().as_ref()[..copy_size]);
         Ok(copy_size as i32)
-    }
-
-    pub fn db_update_i64(
-        &mut self,
-        iterator: i32,
-        payer: Name,
-        data: impl AsRef<[u8]>,
-    ) -> Result<(), ChainError> {
-        let inner = self.inner.read()?;
-        let obj = inner.keyval_cache.get(iterator)?;
-        let table_obj = inner.keyval_cache.get_table(obj.table_id)?;
-        pulse_assert(
-            table_obj.code == self.receiver,
-            ChainError::TransactionError(format!("db access violation",)),
-        )?;
-
-        let overhead = billable_size_v::<KeyValue>() as i64;
-        let old_size = obj.value.len() as i64 + overhead;
-        let new_size = data.as_ref().len() as i64 + overhead;
-
-        let payer = if payer.empty() { obj.payer } else { payer };
-
-        if obj.payer != payer {
-            self.update_db_usage(obj.payer, -old_size)?;
-            self.update_db_usage(payer, new_size)?;
-        } else if old_size != new_size {
-            self.update_db_usage(obj.payer, new_size - old_size)?;
-        }
-
-        self.session.modify(&mut obj.clone(), |kv| {
-            kv.payer = payer;
-            kv.value = Bytes::from(data.as_ref().to_vec());
-            Ok(())
-        })?;
-        Ok(())
     }
 
     pub fn db_remove_i64(&mut self, iterator: i32) -> Result<(), ChainError> {
         let mut inner = self.inner.write()?;
         let obj = inner.keyval_cache.get(iterator)?;
-        let table_obj = inner.keyval_cache.get_table(obj.table_id)?;
+        let table_obj = inner.keyval_cache.get_table(obj.get_table_id())?;
         pulse_assert(
-            table_obj.code == self.receiver,
+            table_obj.get_code() == &self.receiver,
             ChainError::TransactionError(format!("db access violation",)),
         )?;
 
         self.update_db_usage(
-            obj.payer,
-            -(obj.value.len() as i64 + billable_size_v::<KeyValue>() as i64),
+            obj.get_payer(),
+            -(obj.get_value().len() as i64 + billable_size_v::<KeyValue>() as i64),
         )?;
 
         self.session.remove(obj.clone())?;
@@ -530,7 +504,7 @@ impl ApplyContext {
             Ok(())
         })?;
 
-        if table_obj.count == 0 {
+        if table_obj.get_count() == 0 {
             // If the table is empty, we can remove it
             self.session.remove(table_obj.clone())?;
         }
@@ -721,47 +695,49 @@ impl ApplyContext {
 
     pub fn find_table(
         &mut self,
-        code: Name,
-        scope: Name,
-        table: Name,
-    ) -> Result<Option<Table>, ChainError> {
-        let table = self
-            .session
-            .find_by_secondary::<Table, TableByCodeScopeTableIndex>((code, scope, table))
-            .map_err(|e| ChainError::TransactionError(format!("failed to find table: {}", e)))?;
-        Ok(table)
+        code: &Name,
+        scope: &Name,
+        table: &Name,
+    ) -> Option<&Table> {
+        let table = self.db.get_table(code, scope, table);
+
+        match table {
+            Ok(table) => Some(table),
+            Err(_) => None,
+        }
     }
 
     pub fn find_or_create_table(
         &mut self,
-        code: Name,
-        scope: Name,
-        table: Name,
-        payer: Name,
-    ) -> Result<Table, ChainError> {
-        let existing_tid = self
-            .session
-            .find_by_secondary::<Table, TableByCodeScopeTableIndex>((code, scope, table))
-            .map_err(|e| ChainError::TransactionError(format!("failed to find table: {}", e)))?;
-        if let Some(existing_table) = existing_tid {
-            return Ok(existing_table);
+        code: &Name,
+        scope: &Name,
+        table_name: &Name,
+        payer: &Name,
+    ) -> Result<&Table, ChainError> {
+        let table = self.find_table(code, scope, table_name);
+
+        match table {
+            Some(table) => Ok(table),
+            None => {
+                self.update_db_usage(payer, billable_size_v::<Table>() as i64)?;
+
+                let table = self
+                    .db
+                    .create_table(code, scope, table_name, payer)
+                    .map_err(|e| {
+                        ChainError::TransactionError(format!("failed to create table: {}", e))
+                    })?;
+
+                Ok(table)
+            }
         }
-        // TODO: Update payer's RAM usage
-        let id = self.session.generate_id::<Table>()?;
-        let table = Table::new(
-            id, code, scope, table, payer, 0, // Initial count is 0
-        );
-        self.session
-            .insert(&table)
-            .map_err(|e| ChainError::TransactionError(format!("failed to insert table: {}", e)))?;
-        Ok(table)
     }
 
     pub fn get_account_metadata(&mut self, account: Name) -> Result<AccountMetadata, ChainError> {
         let res = self.session.find::<AccountMetadata>(account).map_err(|e| {
             ChainError::TransactionError(format!("failed to get account metadata: {}", e))
         })?;
-        
+
         match res {
             Some(account_metadata) => Ok(account_metadata),
             None => Err(ChainError::TransactionError(format!(
@@ -771,7 +747,7 @@ impl ApplyContext {
         }
     }
 
-    pub fn update_db_usage(&self, payer: Name, delta: i64) -> Result<(), ChainError> {
+    pub fn update_db_usage(&mut self, payer: &Name, delta: i64) -> Result<(), ChainError> {
         if delta > 0 {
             // Do not allow charging RAM to other accounts during notify
             let inner = self.inner.read()?;
