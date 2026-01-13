@@ -1,5 +1,5 @@
 use core::fmt;
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
 
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 
@@ -71,8 +71,8 @@ impl ActionTrace {
         self.creator_action_ordinal
     }
 
-    pub fn receiver(&self) -> Name {
-        self.receiver
+    pub fn receiver(&self) -> &Name {
+        &self.receiver
     }
 
     pub fn action(&self) -> &Action {

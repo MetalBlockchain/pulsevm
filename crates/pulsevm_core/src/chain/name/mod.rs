@@ -1,44 +1,59 @@
 use core::{fmt, str};
-use std::{ops::Deref, str::FromStr};
+use std::{
+    cmp::Ordering,
+    fmt::Debug,
+    hash::{Hash, Hasher},
+    str::FromStr,
+    sync::Arc,
+};
 
+use cxx::UniquePtr;
+use pulsevm_error::ChainError;
+use pulsevm_ffi::{Name as FfiName, u64_to_name};
 use pulsevm_name::{NAME_MAX_LEN, name_from_bytes, name_to_bytes};
-use pulsevm_proc_macros::{NumBytes, Read, Write};
+use pulsevm_serialization::{NumBytes, Read, ReadError, Write, WriteError};
 use serde::{Deserialize, Serialize};
 
-use crate::chain::error::ChainError;
-
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default, Read, Write, NumBytes,
-)]
-pub struct Name(u64);
+#[derive(Clone)]
+pub struct Name {
+    inner: Arc<UniquePtr<FfiName>>,
+}
 
 impl Name {
-    pub const fn new(value: u64) -> Self {
-        Self(value)
+    pub fn new(value: u64) -> Self {
+        let ffi_name = u64_to_name(value);
+
+        Name {
+            inner: Arc::new(ffi_name),
+        }
     }
 
-    pub const fn as_u64(&self) -> u64 {
-        self.0
+    pub fn as_u64(&self) -> u64 {
+        self.inner.to_uint64_t()
     }
 
-    pub const fn empty(&self) -> bool {
-        self.0 == 0
+    pub fn empty(&self) -> bool {
+        self.inner.empty()
     }
 
     pub fn as_bytes(&self) -> [u8; NAME_MAX_LEN] {
-        name_to_bytes(self.0)
+        name_to_bytes(self.inner.to_uint64_t())
+    }
+
+    pub fn as_ref(&self) -> &FfiName {
+        &self.inner
+    }
+}
+
+impl Debug for Name {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.inner.to_string())
     }
 }
 
 impl From<u64> for Name {
     fn from(n: u64) -> Self {
-        Self(n)
-    }
-}
-
-impl From<Name> for u64 {
-    fn from(i: Name) -> Self {
-        i.0
+        Name::new(n)
     }
 }
 
@@ -70,21 +85,45 @@ impl fmt::Display for Name {
 
 impl PartialEq<u64> for Name {
     fn eq(&self, other: &u64) -> bool {
-        &self.0 == other
+        &self.inner.to_uint64_t() == other
     }
 }
 
 impl PartialEq<Name> for u64 {
     fn eq(&self, other: &Name) -> bool {
-        self == &other.0
+        self == &other.inner.to_uint64_t()
     }
 }
 
-impl Deref for Name {
-    type Target = u64;
+impl PartialEq for Name {
+    fn eq(&self, other: &Self) -> bool {
+        self.inner.to_uint64_t() == other.inner.to_uint64_t()
+    }
+}
 
-    fn deref(&self) -> &Self::Target {
-        &self.0
+impl Eq for Name {}
+
+impl Hash for Name {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.inner.to_uint64_t().hash(state);
+    }
+}
+
+impl Ord for Name {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.inner.to_uint64_t().cmp(&other.inner.to_uint64_t())
+    }
+}
+
+impl PartialOrd for Name {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Default for Name {
+    fn default() -> Self {
+        Name::new(0)
     }
 }
 
@@ -104,6 +143,25 @@ impl<'de> Deserialize<'de> for Name {
     {
         let s = String::deserialize(deserializer)?;
         Name::from_str(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+impl NumBytes for Name {
+    fn num_bytes(&self) -> usize {
+        8
+    }
+}
+
+impl Read for Name {
+    fn read(bytes: &[u8], pos: &mut usize) -> Result<Self, ReadError> {
+        let res = u64::read(bytes, pos)?;
+        Ok(Name::new(res))
+    }
+}
+
+impl Write for Name {
+    fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), WriteError> {
+        self.as_u64().write(bytes, pos)
     }
 }
 

@@ -5,7 +5,6 @@ use pulsevm_ffi::Database;
 use crate::{
     PULSE_NAME,
     chain::{
-        authority::PermissionByParentIndex,
         genesis::ChainConfig,
         name::Name,
         pulse_contract::{DeleteAuth, LinkAuth, UnlinkAuth, UpdateAuth},
@@ -18,10 +17,7 @@ use crate::{
 
 use super::{
     ACTIVE_NAME, ANY_NAME,
-    authority::{
-        Authority, Permission, PermissionByOwnerIndex, PermissionLevel, PermissionLink,
-        PermissionLinkByActionNameIndex,
-    },
+    authority::{Authority, Permission, PermissionLevel, PermissionLink},
     authority_checker::AuthorityChecker,
     error::ChainError,
 };
@@ -137,15 +133,11 @@ impl AuthorizationManager {
         // - If the permission already exists, use it.
         // - Otherwise, we're creating a new permission, so use the parent.
         let requested_perm = PermissionLevel::new(update.account, update.permission);
-        let min_permission =
-            if let Some(existing) = Self::find_permission(db, &requested_perm)? {
-                existing
-            } else {
-                Self::get_permission(
-                    db,
-                    &PermissionLevel::new(update.account, update.parent),
-                )?
-            };
+        let min_permission = if let Some(existing) = Self::find_permission(db, &requested_perm)? {
+            existing
+        } else {
+            Self::get_permission(db, &PermissionLevel::new(update.account, update.parent))?
+        };
 
         pulse_assert(
             Self::get_permission(db, &auth)?.satisfies(&min_permission, db)?,
@@ -189,10 +181,7 @@ impl AuthorizationManager {
         Ok(())
     }
 
-    fn check_linkauth_authorization(
-        db: &mut Database,
-        action: &Action,
-    ) -> Result<(), ChainError> {
+    fn check_linkauth_authorization(db: &mut Database, action: &Action) -> Result<(), ChainError> {
         let link = action
             .data_as::<LinkAuth>()
             .map_err(|e| ChainError::AuthorizationError(format!("{}", e)))?;
@@ -274,12 +263,8 @@ impl AuthorizationManager {
         pulse_assert(auth.actor == unlink.account, ChainError::AuthorizationError(
             "the owner of the linked permission needs to be the actor of the declared authorization".to_string(),
         ))?;
-        let unlinked_permission_name = Self::lookup_minimum_permission(
-            db,
-            unlink.account,
-            unlink.code,
-            unlink.message_type,
-        )?;
+        let unlinked_permission_name =
+            Self::lookup_minimum_permission(db, unlink.account, unlink.code, unlink.message_type)?;
         match unlinked_permission_name {
             None => {
                 return Err(ChainError::AuthorizationError(format!(
@@ -384,8 +369,7 @@ impl AuthorizationManager {
         } else {
             // If no specific link found, check for a contract-wide default
             key.2 = Name::default();
-            link = db
-                .find_by_secondary::<PermissionLink, PermissionLinkByActionNameIndex>(key)?;
+            link = db.find_by_secondary::<PermissionLink, PermissionLinkByActionNameIndex>(key)?;
         }
 
         if let Some(link) = &link {
@@ -420,10 +404,7 @@ impl AuthorizationManager {
         Ok(())
     }
 
-    pub fn remove_permission(
-        db: &mut Database,
-        permission: &Permission,
-    ) -> Result<(), ChainError> {
+    pub fn remove_permission(db: &mut Database, permission: &Permission) -> Result<(), ChainError> {
         let mut index = db.get_index::<Permission, PermissionByParentIndex>();
         let mut range = index.lower_bound(permission.id())?;
         let next = range.next()?;

@@ -1,18 +1,20 @@
 use std::collections::HashMap;
 
 use pulsevm_crypto::{Bytes, FixedBytes};
+use pulsevm_error::ChainError;
 use pulsevm_serialization::{Read, ReadError, VarInt32, VarUint32, WriteError};
 use pulsevm_time::{TimePoint, TimePointSec};
 use serde_json::{Number, Value};
 
-use crate::chain::{
-    abi::{AbiDefinition, AbiStructDefinition, AbiVariantDefinition},
-    asset::{Asset, ExtendedAsset, Symbol, SymbolCode},
-    block::BlockTimestamp,
-    error::ChainError,
+use crate::{
+    chain::{
+        abi::{AbiDefinition, AbiStructDefinition, AbiVariantDefinition},
+        asset::{Asset, ExtendedAsset, Symbol, SymbolCode},
+        block::BlockTimestamp,
+        secp256k1::{PublicKey, Signature},
+        utils::pulse_assert,
+    },
     name::Name,
-    secp256k1::{PublicKey, Signature},
-    utils::pulse_assert,
 };
 
 type TypeName = String;
@@ -205,11 +207,22 @@ impl AbiSerializer {
         let ftype = fundamental_type(&rtype);
 
         if let Some(btype) = self.built_in_types.get(ftype) {
-            return btype(data, pos).map_err(ChainError::from);
+            let res = btype(data, pos).map_err(|e| {
+                ChainError::TransactionError(format!(
+                    "failed to read built-in type '{}': {:?}",
+                    ftype, e
+                ))
+            })?;
+            return Ok(res);
         }
 
         if is_array(&rtype) {
-            let size = usize::read(data, pos)?;
+            let size = usize::read(data, pos).map_err(|e| {
+                ChainError::TransactionError(format!(
+                    "failed to read array size for '{}': {:?}",
+                    rtype, e
+                ))
+            })?;
             let mut vars: Vec<Value> = Vec::with_capacity(size);
             for i in 0..size {
                 let v = self.binary_to_variant(ftype, data, pos)?;
@@ -217,7 +230,12 @@ impl AbiSerializer {
             }
             return Ok(Value::Array(vars));
         } else if is_optional(&rtype) {
-            let is_some = u8::read(data, pos)?;
+            let is_some = u8::read(data, pos).map_err(|e| {
+                ChainError::TransactionError(format!(
+                    "failed to read optional flag for '{}': {:?}",
+                    rtype, e
+                ))
+            })?;
             if is_some != 0 {
                 let v = self.binary_to_variant(ftype, data, pos)?;
                 return Ok(v);
@@ -225,7 +243,12 @@ impl AbiSerializer {
                 return Ok(Value::Null);
             }
         } else if let Some(variant) = self.variants.get(&rtype) {
-            let select = usize::read(data, pos)?;
+            let select = usize::read(data, pos).map_err(|e| {
+                ChainError::TransactionError(format!(
+                    "failed to read variant selector for '{}': {:?}",
+                    rtype, e
+                ))
+            })?;
             pulse_assert(
                 select < variant.types.len(),
                 ChainError::TransactionError("variant index out of range".to_string()),

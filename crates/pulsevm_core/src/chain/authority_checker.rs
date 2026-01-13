@@ -1,16 +1,11 @@
 use std::collections::{HashMap, HashSet};
 
+use pulsevm_error::ChainError;
 use pulsevm_ffi::Database;
 
 use crate::chain::secp256k1::PublicKey;
 
-use super::{
-    authority::{
-        Authority, KeyWeight, Permission, PermissionByOwnerIndex, PermissionLevel,
-        PermissionLevelWeight,
-    },
-    error::ChainError,
-};
+use super::authority::{Authority, KeyWeight, Permission, PermissionLevel, PermissionLevelWeight};
 
 pub struct AuthorityChecker<'a> {
     recursion_depth_limit: u16,

@@ -1,4 +1,4 @@
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use pulsevm_ffi::Database;
 use tempfile::{env::temp_dir, tempdir};
 
@@ -14,7 +14,7 @@ fn criterion_benchmark(c: &mut Criterion) {
     c.bench_function("read", |b| b.iter(|| bench(&mut db)));
 }
 
-criterion_group!{
+criterion_group! {
     name = benches;
     // This can be any expression that returns a `Criterion` object.
     config = Criterion::default().significance_level(0.1).sample_size(500);

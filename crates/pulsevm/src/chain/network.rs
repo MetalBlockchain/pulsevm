@@ -22,7 +22,10 @@ impl Gossipable {
             ChainError::NetworkError(format!("failed to serialize gossipable data: {}", e))
         })?;
 
-        Ok(Gossipable { gossip_type, data: data.into() })
+        Ok(Gossipable {
+            gossip_type,
+            data: data.into(),
+        })
     }
 
     pub fn to_type<T>(&self) -> Result<T, ChainError>
@@ -73,7 +76,7 @@ impl NetworkManager {
         let msg = gossipable.pack().map_err(|e| {
             ChainError::NetworkError(format!("failed to serialize gossipable: {}", e))
         })?;
-        
+
         let result = client
             .send_app_gossip(Request::new(SendAppGossipMsg {
                 node_ids: self

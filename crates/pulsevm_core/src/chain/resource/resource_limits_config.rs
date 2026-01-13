@@ -1,4 +1,3 @@
-use pulsevm_chainbase::{ChainbaseObject, SecondaryKey};
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 
 use crate::chain::{
@@ -63,25 +62,5 @@ impl Default for ResourceLimitsConfig {
             account_net_usage_average_window: ACCOUNT_NET_USAGE_AVERAGE_WINDOW_MS
                 / BLOCK_INTERVAL_MS,
         }
-    }
-}
-
-impl ChainbaseObject for ResourceLimitsConfig {
-    type PrimaryKey = u64;
-
-    fn primary_key(&self) -> Vec<u8> {
-        ResourceLimitsConfig::primary_key_to_bytes(0)
-    }
-
-    fn primary_key_to_bytes(key: Self::PrimaryKey) -> Vec<u8> {
-        key.to_le_bytes().to_vec()
-    }
-
-    fn table_name() -> &'static str {
-        "resource_limits_config"
-    }
-
-    fn secondary_indexes(&self) -> Vec<SecondaryKey> {
-        vec![]
     }
 }

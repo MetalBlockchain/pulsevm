@@ -1,14 +1,11 @@
 use core::fmt;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    path::Path,
     sync::{Arc, LazyLock},
 };
 
 use crate::{
     OWNER_NAME, PULSE_NAME,
-    account::CodeObject,
-    authority::{Permission, PermissionLink},
     chain::{
         ACTIVE_NAME,
         account::{Account, AccountMetadata},
@@ -22,7 +19,6 @@ use crate::{
             MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER, NEWACCOUNT_NAME, SETABI_NAME, SETCODE_NAME,
             UNLINKAUTH_NAME, UPDATEAUTH_NAME, eos_percent,
         },
-        error::ChainError,
         genesis::{ChainConfig, Genesis},
         id::Id,
         mempool::Mempool,
@@ -39,14 +35,11 @@ use crate::{
         utils::make_ratio,
         wasm_runtime::WasmRuntime,
     },
-    config::DynamicGlobalPropertyObject,
-    resource::{ResourceLimits, ResourceLimitsConfig, ResourceLimitsState, ResourceUsage},
-    table::{KeyValue, Table},
-    utils::prepare_db_object,
 };
 
 use pulsevm_crypto::{Digest, merkle};
-use pulsevm_ffi::Database;
+use pulsevm_error::ChainError;
+use pulsevm_ffi::{BlockLog, Database};
 use pulsevm_serialization::{Read, Write};
 use spdlog::info;
 use tokio::sync::RwLock as AsyncRwLock;
@@ -79,6 +72,7 @@ pub struct Controller {
     verified_blocks: HashMap<Id, SignedBlock>,
     chain_id: Id,
 
+    block_log: Option<BlockLog>,
     trace_log: Option<StateHistoryLog>,
     chain_state_log: Option<StateHistoryLog>,
 }
@@ -99,7 +93,6 @@ impl fmt::Display for ControllerError {
 impl Controller {
     pub fn new() -> Self {
         // Create a temporary database
-        let db = Database::new(Path::new("temp")).unwrap();
         let wasm_runtime = WasmRuntime::new().unwrap();
         let controller = Controller {
             wasm_runtime,
@@ -107,10 +100,11 @@ impl Controller {
 
             last_accepted_block: SignedBlock::default(),
             preferred_id: Id::default(),
-            db: db,
+            db: Database::default(),
             verified_blocks: HashMap::new(),
             chain_id: Id::default(),
 
+            block_log: None,
             trace_log: None,
             chain_state_log: None,
         };
@@ -120,7 +114,7 @@ impl Controller {
 
     pub fn initialize(&mut self, genesis_bytes: &Vec<u8>, db_path: &str) -> Result<(), ChainError> {
         info!("initializing controller with DB path: {}", db_path);
-        self.db = Database::new(Path::new(&db_path)).map_err(|e| {
+        self.db = Database::new(&db_path).map_err(|e| {
             ChainError::InternalError(Some(format!("failed to open database: {}", e)))
         })?;
         // Parse genesis bytes
@@ -129,6 +123,9 @@ impl Controller {
             .validate()?;
         self.config = Arc::new(genesis.initial_configuration().clone());
         self.chain_id = genesis.compute_chain_id()?;
+        self.block_log = Some(BlockLog::open("blocks").map_err(|e| {
+            ChainError::InternalError(Some(format!("failed to open block log: {}", e)))
+        })?);
         self.trace_log = Some(StateHistoryLog::open(&db_path, "trace_log").map_err(|e| {
             ChainError::InternalError(Some(format!("failed to open trace log: {}", e)))
         })?);
@@ -144,7 +141,7 @@ impl Controller {
             Digest::default(),
         );
 
-        let mut session = self.db.undo_session()?;
+        let mut session = self.db.create_undo_session(true)?;
 
         // Do we have the genesis block in our DB?
         let genesis_block = session.find::<SignedBlock>(1).map_err(|e| {
@@ -280,7 +277,7 @@ impl Controller {
         }
 
         // Verify the block
-        let mut session = self.db.undo_session()?;
+        let mut session = self.db.create_undo_session(true)?;
         let mut mempool = mempool.write().await;
         self.execute_block(block, &mut session, &mut mempool)
             .await?;
@@ -336,12 +333,12 @@ impl Controller {
         mempool: &mut Mempool,
     ) -> Result<Vec<TransactionTrace>, ChainError> {
         // Make sure we don't have the block already
-        let existing_block = session
-            .find::<SignedBlock>(block.block_num())
-            .map_err(|e| ChainError::TransactionError(format!("failed to find block: {}", e)))?;
+        {
+            let existing_block = self.block_log()?.find_block_by_num(block.block_num())?;
 
-        if existing_block.is_some() {
-            return Ok(Vec::new());
+            if existing_block.is_some() {
+                return Ok(Vec::new());
+            }
         }
 
         let mut transaction_traces: Vec<TransactionTrace> = Vec::new();
@@ -349,7 +346,7 @@ impl Controller {
         for receipt in &block.transactions {
             // Verify the transaction
             let result = self.execute_transaction(
-                session,
+                db,
                 receipt.trx(),
                 &block.signed_block_header.block.timestamp,
             )?;
@@ -360,10 +357,6 @@ impl Controller {
             // Remove from mempool if we have it
             mempool.remove_transaction(receipt.trx().id());
         }
-
-        session
-            .insert(block)
-            .map_err(|e| ChainError::TransactionError(format!("failed to insert block: {}", e)))?;
 
         // Update resource limits
         let chain_config = &self.config;
@@ -390,12 +383,7 @@ impl Controller {
             make_ratio(99, 100),
             make_ratio(1000, 999),
         );
-        ResourceLimitsManager::process_account_limit_updates(session)?;
-        ResourceLimitsManager::set_block_parameters(
-            session,
-            cpu_elastic_parameters,
-            net_elastic_parameters,
-        )?;
+        ResourceLimitsManager::process_account_limit_updates(db)?;
 
         Ok(transaction_traces)
     }
@@ -408,7 +396,8 @@ impl Controller {
         pending_block_timestamp: &BlockTimestamp,
     ) -> Result<TransactionResult, ChainError> {
         let mut undo_session = self.db.create_undo_session(true)?;
-        let result = self.execute_transaction(&mut undo_session, transaction, pending_block_timestamp)?;
+        let result =
+            self.execute_transaction(&mut self.db, transaction, pending_block_timestamp)?;
         return result;
     }
 
@@ -493,7 +482,7 @@ impl Controller {
         self.preferred_id = id;
     }
 
-    pub fn find_apply_handler(receiver: Name, scope: Name, act: Name) -> Option<ApplyHandlerFn> {
+    pub fn find_apply_handler(receiver: &Name, scope: &Name, act: &Name) -> Option<ApplyHandlerFn> {
         if let Some(handler) = APPLY_HANDLERS.get(&(receiver, scope, act)) {
             return Some(*handler);
         }
@@ -504,9 +493,7 @@ impl Controller {
         &self.wasm_runtime
     }
 
-    pub fn get_global_properties(
-        db: &mut Database,
-    ) -> Result<GlobalPropertyObject, ChainError> {
+    pub fn get_global_properties(db: &mut Database) -> Result<GlobalPropertyObject, ChainError> {
         db.get::<GlobalPropertyObject>(0).map_err(|e| {
             ChainError::TransactionError(format!("failed to get global properties: {}", e))
         })?;
@@ -570,6 +557,12 @@ impl Controller {
         }
 
         Ok(None)
+    }
+
+    pub fn block_log(&self) -> Result<&BlockLog, ChainError> {
+        self.block_log
+            .as_ref()
+            .ok_or_else(|| ChainError::InternalError(Some("block log not initialized".to_string())))
     }
 }
 

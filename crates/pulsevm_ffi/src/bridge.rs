@@ -20,42 +20,45 @@ pub mod ffi {
     }
 
     unsafe extern "C++" {
-        include!("block_log.hpp");
         include!("database.hpp");
         include!("name.hpp");
 
         #[cxx_name = "name"]
-        type Name;
-
+        type Name = crate::name::ffi::Name;
         #[cxx_name = "database_wrapper"]
         type Database;
         pub fn open_database(
             path: &str,
             flags: DatabaseOpenFlags,
             size: u64,
-        ) -> UniquePtr<Database>;
+        ) -> SharedPtr<Database>;
 
         #[cxx_name = "undo_session"]
         type UndoSession;
-
         #[cxx_name = "account_object"]
         type Account;
-
+        #[cxx_name = "account_metadata_object"]
+        type AccountMetadata;
+        #[cxx_name = "table_id_object"]
+        type Table = crate::contract_table_objects::ffi::Table;
         #[cxx_name = "key_value_object"]
-        type KeyValue;
-
+        type KeyValue = crate::contract_table_objects::ffi::KeyValue;
         #[cxx_name = "signed_block"]
         type SignedBlock;
+        #[cxx_name = "key_value_iterator_cache"]
+        type KeyValueIteratorCache = crate::iterator_cache::ffi::KeyValueIteratorCache;
+        #[cxx_name = "permission_object"]
+        pub type PermissionObject = crate::objects::ffi::PermissionObject;
+        #[cxx_name = "permission_usage_object"]
+        pub type PermissionUsageObject = crate::objects::ffi::PermissionUsageObject;
+        #[cxx_name = "permission_link_object"]
+        pub type PermissionLinkObject = crate::objects::ffi::PermissionLinkObject;
 
         // Block log
         #[cxx_name = "block_log"]
         pub type BlockLog;
         pub fn open_block_log(path: &str) -> UniquePtr<BlockLog>;
         pub fn read_block_by_num(self: &BlockLog, block_num: u32) -> SharedPtr<SignedBlock>;
-
-        // Name methods
-        pub fn string_to_name(str: &str) -> &Name;
-        pub fn name_to_uint64(name: &Name) -> u64;
 
         // Methods on database
         pub fn flush(self: Pin<&mut Database>);
@@ -67,8 +70,26 @@ pub mod ffi {
             self: Pin<&mut Database>,
             enabled: bool,
         ) -> Result<UniquePtr<UndoSession>>;
-        pub fn add_account(self: Pin<&mut Database>, account_name: &Name);
-        pub fn get_account(self: Pin<&mut Database>) -> Result<UniquePtr<Account>>;
+
+        // Account methods
+        pub fn create_account(
+            self: Pin<&mut Database>,
+            account_name: &Name,
+            creation_date: u32,
+        ) -> Result<&Account>;
+        pub fn find_account(self: &Database, account_name: &Name) -> Result<*const Account>;
+        pub fn get_account(self: &Database, account_name: &Name) -> Result<&Account>;
+        pub fn create_account_metadata(
+            self: Pin<&mut Database>,
+            account_name: &Name,
+            is_privileged: bool,
+        ) -> Result<&AccountMetadata>;
+        pub fn find_account_metadata(
+            self: &Database,
+            account_name: &Name,
+        ) -> Result<*const AccountMetadata>;
+
+        // Resource methods
         pub fn initialize_resource_limits(self: Pin<&mut Database>) -> Result<()>;
         pub fn initialize_account_resource_limits(
             self: Pin<&mut Database>,
@@ -118,6 +139,53 @@ pub mod ffi {
             greylist_limit: u32,
         ) -> Result<CpuLimitResult>;
         pub fn process_account_limit_updates(self: Pin<&mut Database>) -> Result<()>;
+        pub fn get_table(
+            self: Pin<&mut Database>,
+            code: &Name,
+            scope: &Name,
+            table: &Name,
+        ) -> Result<&Table>;
+        pub fn create_table(
+            self: Pin<&mut Database>,
+            code: &Name,
+            scope: &Name,
+            table: &Name,
+            payer: &Name,
+        ) -> Result<&Table>;
+        pub fn db_find_i64(
+            self: Pin<&mut Database>,
+            code: &Name,
+            scope: &Name,
+            table: &Name,
+            id: u64,
+            keyval_cache: Pin<&mut KeyValueIteratorCache>,
+        ) -> Result<i32>;
+        pub fn create_key_value_object(
+            self: Pin<&mut Database>,
+            table: &Table,
+            payer: &Name,
+            id: u64,
+            buffer: &[u8],
+        ) -> Result<&KeyValue>;
+        pub fn update_key_value_object(
+            self: Pin<&mut Database>,
+            obj: &KeyValue,
+            payer: &Name,
+            buffer: &[u8],
+        ) -> Result<()>;
+        pub fn remove_key_value_object(
+            self: Pin<&mut Database>,
+            obj: &KeyValue,
+            table_obj: &Table,
+        ) -> Result<()>;
+        pub fn remove_table(self: Pin<&mut Database>, table: &Table) -> Result<()>;
+
+        // Account methods
+        pub fn is_privileged(self: &AccountMetadata) -> bool;
+        pub fn is_account(self: &Database, account: &Name) -> Result<bool>;
+
+        // Permission methods
+        pub fn find_permission(self: &Database, id: i64) -> Result<*const PermissionObject>;
 
         // Methods on undo_session
         pub fn push(self: Pin<&mut UndoSession>) -> Result<()>;

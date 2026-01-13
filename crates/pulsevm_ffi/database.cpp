@@ -2,7 +2,9 @@
 #include <pulsevm_ffi/src/bridge.rs.h>
 #include <filesystem>
 
-std::unique_ptr<pulsevm::chain::database_wrapper> open_database(
+namespace pulsevm::chain {
+
+std::shared_ptr<pulsevm::chain::database_wrapper> open_database(
     rust::Str path,
     DatabaseOpenFlags flags,
     uint64_t size
@@ -20,5 +22,17 @@ std::unique_ptr<pulsevm::chain::database_wrapper> open_database(
     }
     
     // Create and return database
-    return std::make_unique<pulsevm::chain::database_wrapper>(fs_path, db_flags, size);
+    return std::make_shared<pulsevm::chain::database_wrapper>(fs_path, db_flags, size);
+}
+
+cpu_limit_result database_wrapper::get_account_cpu_limit(const account_name& name, uint32_t greylist_limit) {
+    auto [arl, greylisted] = get_account_cpu_limit_ex(name, greylist_limit);
+    return {arl.available, greylisted};
+}
+
+net_limit_result database_wrapper::get_account_net_limit(const account_name& name, uint32_t greylist_limit) {
+    auto [arl, greylisted] = get_account_net_limit_ex(name, greylist_limit);
+    return {arl.available, greylisted};
+}
+
 }

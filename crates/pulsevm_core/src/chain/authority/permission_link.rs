@@ -1,6 +1,4 @@
-use pulsevm_chainbase::{ChainbaseObject, SecondaryIndex, SecondaryKey};
 use pulsevm_proc_macros::{NumBytes, Read, Write};
-use pulsevm_serialization::Write;
 
 use crate::chain::{
     config::{self, BillableSize},
@@ -43,20 +41,20 @@ impl PermissionLink {
         self.id
     }
 
-    pub fn account(&self) -> Name {
-        self.account
+    pub fn account(&self) -> &Name {
+        &self.account
     }
 
-    pub fn code(&self) -> Name {
-        self.code
+    pub fn code(&self) -> &Name {
+        &self.code
     }
 
-    pub fn message_type(&self) -> Name {
-        self.message_type
+    pub fn message_type(&self) -> &Name {
+        &self.message_type
     }
 
-    pub fn required_permission(&self) -> Name {
-        self.required_permission
+    pub fn required_permission(&self) -> &Name {
+        &self.required_permission
     }
 }
 
@@ -68,90 +66,5 @@ impl BillableSize for PermissionLink {
             + 8 // code
             + 8 // message_type
             + 8 // required_permission
-    }
-}
-
-impl ChainbaseObject for PermissionLink {
-    type PrimaryKey = u64;
-
-    fn primary_key(&self) -> Vec<u8> {
-        PermissionLink::primary_key_to_bytes(self.id)
-    }
-
-    fn primary_key_to_bytes(key: Self::PrimaryKey) -> Vec<u8> {
-        key.to_le_bytes().to_vec()
-    }
-
-    fn table_name() -> &'static str {
-        "permission_link"
-    }
-
-    fn secondary_indexes(&self) -> Vec<SecondaryKey> {
-        vec![
-            SecondaryKey {
-                key: PermissionLinkByActionNameIndex::secondary_key_as_bytes((
-                    self.account,
-                    self.code,
-                    self.message_type,
-                )),
-                index_name: PermissionLinkByActionNameIndex::index_name(),
-            },
-            SecondaryKey {
-                key: PermissionLinkByPermissionNameIndex::secondary_key_as_bytes((
-                    self.account,
-                    self.required_permission,
-                    self.id,
-                )),
-                index_name: PermissionLinkByPermissionNameIndex::index_name(),
-            },
-        ]
-    }
-}
-
-#[derive(Debug, Default)]
-pub struct PermissionLinkByActionNameIndex;
-
-impl SecondaryIndex<PermissionLink> for PermissionLinkByActionNameIndex {
-    type Key = (Name, Name, Name);
-    type Object = PermissionLink;
-
-    fn secondary_key(object: &PermissionLink) -> Vec<u8> {
-        PermissionLinkByActionNameIndex::secondary_key_as_bytes((
-            object.account,
-            object.code,
-            object.message_type,
-        ))
-    }
-
-    fn secondary_key_as_bytes(key: Self::Key) -> Vec<u8> {
-        key.pack().unwrap()
-    }
-
-    fn index_name() -> &'static str {
-        "permission_link_by_action_name"
-    }
-}
-
-#[derive(Debug, Default)]
-pub struct PermissionLinkByPermissionNameIndex;
-
-impl SecondaryIndex<PermissionLink> for PermissionLinkByPermissionNameIndex {
-    type Key = (Name, Name, u64);
-    type Object = PermissionLink;
-
-    fn secondary_key(object: &PermissionLink) -> Vec<u8> {
-        PermissionLinkByPermissionNameIndex::secondary_key_as_bytes((
-            object.account,
-            object.required_permission,
-            object.id,
-        ))
-    }
-
-    fn secondary_key_as_bytes(key: Self::Key) -> Vec<u8> {
-        key.pack().unwrap()
-    }
-
-    fn index_name() -> &'static str {
-        "permission_link_by_permission_name"
     }
 }

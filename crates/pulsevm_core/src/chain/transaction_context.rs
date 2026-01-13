@@ -3,13 +3,13 @@ use std::{
     sync::{Arc, RwLock, atomic::AtomicI64},
 };
 
+use pulsevm_error::ChainError;
 use pulsevm_serialization::VarUint32;
 use pulsevm_time::{Microseconds, TimePoint};
 
 use crate::chain::{
     apply_context::ApplyContext,
     block::BlockTimestamp,
-    error::ChainError,
     genesis::ChainConfig,
     id::Id,
     name::Name,
@@ -187,7 +187,7 @@ impl TransactionContext {
             block_num,
             block_time,
             act,
-            *receiver,
+            receiver.clone(),
             context_free,
             new_action_ordinal,
             creator_action_ordinal,
@@ -223,7 +223,7 @@ impl TransactionContext {
             block_num,
             block_time,
             provided.action().clone(),
-            *receiver, // if Name: Copy; otherwise clone here
+            receiver.clone(),
             context_free,
             new_action_ordinal,
             creator_action_ordinal,
@@ -242,11 +242,12 @@ impl TransactionContext {
         let (action, receiver) =
             self.with_action_trace(action_ordinal, |t| (t.action().clone(), t.receiver()))?;
         let mut apply_context = ApplyContext::new(
+            self.db.clone(),
             self.chain_config.clone(),
             self.wasm_runtime.clone(),
             self.clone(),
             action,
-            receiver,
+            receiver.clone(),
             action_ordinal,
             recurse_depth,
         )?;
@@ -338,7 +339,6 @@ impl TransactionContext {
             VarUint32((inner.trace.net_usage / 8) as u32),
         );
 
-        let mut session = self.session.clone();
         let validate_ram_usage = inner.validate_ram_usage.clone();
         for account in validate_ram_usage.iter() {
             ResourceLimitsManager::verify_account_ram_usage(&mut session, account)?;
@@ -367,7 +367,6 @@ impl TransactionContext {
     }
 
     pub fn add_ram_usage(&self, account: &Name, ram_delta: i64) -> Result<(), ChainError> {
-        let mut session = self.session.clone();
         let mut inner = self.inner.write()?;
 
         // Update the RAM usage in the resource limits manager.

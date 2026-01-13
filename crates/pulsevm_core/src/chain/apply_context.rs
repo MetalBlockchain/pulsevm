@@ -5,9 +5,10 @@ use std::{
 };
 
 use chrono::Utc;
+use cxx::SharedPtr;
 use pulsevm_crypto::Bytes;
 use pulsevm_error::ChainError;
-use pulsevm_ffi::{Database, KeyValue, KeyValueIteratorCache, Name, Table};
+use pulsevm_ffi::{Database, KeyValue, KeyValueIteratorCache, Table};
 use spdlog::info;
 
 use crate::{
@@ -26,11 +27,12 @@ use crate::{
         utils::pulse_assert,
         wasm_runtime::WasmRuntime,
     },
+    name::Name,
 };
 
 struct ApplyContextInner {
-    action_return_value: Option<Vec<u8>>,  // Return value of the action
-    start: i64,                            // Start time in microseconds
+    action_return_value: Option<Vec<u8>>, // Return value of the action
+    start: i64,                           // Start time in microseconds
     privileged: bool,
     account_ram_deltas: HashMap<Name, i64>, // RAM usage deltas for accounts
     notified: VecDeque<(Name, u32)>,        // List of notified accounts
@@ -44,7 +46,7 @@ pub struct ApplyContext {
     chain_config: Arc<ChainConfig>,
     wasm_runtime: WasmRuntime,       // Context for the Wasm runtime
     trx_context: TransactionContext, // The transaction context
-    db: Database,                 // The database being used
+    db: Database,                    // The database being used
 
     action: Action, // The action being applied
     receiver: Name, // The account that is receiving the action
@@ -57,10 +59,10 @@ pub struct ApplyContext {
 
 impl ApplyContext {
     pub fn new(
+        db: Database,
         chain_config: Arc<ChainConfig>,
         wasm_runtime: WasmRuntime,
         trx_context: TransactionContext,
-        db: Database,
         action: Action,
         receiver: Name,
         action_ordinal: u32,
@@ -137,7 +139,7 @@ impl ApplyContext {
     }
 
     pub fn exec_one(&mut self) -> Result<u64, ChainError> {
-        let mut receiver_account = self.get_account_metadata(self.receiver)?;
+        let mut receiver_account = self.get_account_metadata(&self.receiver)?;
         let cpu_used = 100; // Base usage is always 100 instructions
 
         {
@@ -146,7 +148,7 @@ impl ApplyContext {
         }
 
         let native = Controller::find_apply_handler(
-            self.receiver,
+            &self.receiver,
             self.action.account(),
             self.action.name(),
         );
@@ -155,12 +157,12 @@ impl ApplyContext {
         }
 
         // Refresh the receiver account metadata
-        receiver_account = self.get_account_metadata(self.receiver)?;
+        receiver_account = self.get_account_metadata(&self.receiver)?;
 
         // Does the receiver account have a contract deployed?
         if receiver_account.code_hash != Id::zero() {
             self.wasm_runtime.run(
-                self.receiver,
+                self.receiver.clone(),
                 self.action.clone(),
                 self.clone(),
                 receiver_account.code_hash,
@@ -171,7 +173,7 @@ impl ApplyContext {
             let inner = self.inner.read()?;
             generate_action_digest(&self.action, inner.action_return_value.clone())
         };
-        let first_receiver_account = if self.action.account() == self.receiver {
+        let first_receiver_account = if self.action.account() == &self.receiver {
             receiver_account.clone()
         } else {
             self.get_account_metadata(self.action.account())?
@@ -221,12 +223,12 @@ impl ApplyContext {
 
     pub fn require_authorization(
         &self,
-        account: Name,
+        account: &Name,
         permission: Option<Name>,
     ) -> Result<(), ChainError> {
         for auth in self.action.authorization() {
             if let Some(perm) = permission {
-                if auth.actor == account && auth.permission == perm {
+                if auth.actor == *account && auth.permission == perm {
                     return Ok(());
                 }
 
@@ -234,7 +236,7 @@ impl ApplyContext {
                     "missing authority of {}/{}",
                     account, perm
                 )));
-            } else if auth.actor == account {
+            } else if auth.actor == *account {
                 return Ok(());
             }
         }
@@ -255,7 +257,9 @@ impl ApplyContext {
             let scheduled_ordinal =
                 self.schedule_action_from_ordinal(self.action_ordinal, &recipient, false)?;
             let mut inner = self.inner.write()?;
-            inner.notified.push_back((recipient, scheduled_ordinal));
+            inner
+                .notified
+                .push_back((recipient.clone(), scheduled_ordinal));
         }
 
         Ok(())
@@ -263,7 +267,7 @@ impl ApplyContext {
 
     pub fn has_authorization(&self, account: &Name) -> bool {
         for auth in self.action.authorization() {
-            if auth.actor == account {
+            if auth.actor == *account {
                 return true;
             }
         }
@@ -275,7 +279,7 @@ impl ApplyContext {
         let mut inner = self.inner.write()?;
         inner
             .account_ram_deltas
-            .entry(account)
+            .entry(account.clone())
             .and_modify(|d| *d += ram_delta)
             .or_insert(ram_delta);
         Ok(())
@@ -395,9 +399,12 @@ impl ApplyContext {
         table: &Name,
         id: u64,
     ) -> Result<i32, ChainError> {
-        let inner = self.inner.write()?;
-        
-        match self.db.db_find_i64(code, scope, table, id, &mut inner.keyval_cache) {
+        let mut inner = self.inner.write()?;
+
+        match self
+            .db
+            .db_find_i64(code, scope, table, id, &mut inner.keyval_cache)
+        {
             Ok(itr) => Ok(itr),
             Err(e) => Err(ChainError::DatabaseError(format!(
                 "failed to find i64 in db: {}",
@@ -423,7 +430,9 @@ impl ApplyContext {
         )?;
 
         let inner = self.inner.write()?;
-        let obj = self.db.create_key_value_object(table, payer, primary_key, &data.0.as_slice())?;
+        let obj = self
+            .db
+            .create_key_value_object(table, payer, primary_key, &data.0.as_slice())?;
 
         let billable_size = data.len() as i64 + billable_size_v::<KeyValue>() as i64;
         self.update_db_usage(payer, billable_size)?;
@@ -451,7 +460,11 @@ impl ApplyContext {
         let old_size = obj.get_value().len() as i64 + overhead;
         let new_size = data.as_ref().len() as i64 + overhead;
 
-        let payer = if payer.empty() { obj.get_payer() } else { payer };
+        let payer = if payer.empty() {
+            obj.get_payer()
+        } else {
+            payer
+        };
 
         if obj.get_payer() != payer {
             self.update_db_usage(obj.get_payer(), -old_size)?;
@@ -497,12 +510,7 @@ impl ApplyContext {
             obj.get_payer(),
             -(obj.get_value().len() as i64 + billable_size_v::<KeyValue>() as i64),
         )?;
-
-        self.session.remove(obj.clone())?;
-        self.session.modify(&mut table_obj.clone(), |t| {
-            t.count -= 1;
-            Ok(())
-        })?;
+        self.db.remove_key_value_object(obj, table_obj)?;
 
         if table_obj.get_count() == 0 {
             // If the table is empty, we can remove it
@@ -693,12 +701,7 @@ impl ApplyContext {
         }
     }
 
-    pub fn find_table(
-        &mut self,
-        code: &Name,
-        scope: &Name,
-        table: &Name,
-    ) -> Option<&Table> {
+    pub fn find_table(&mut self, code: &Name, scope: &Name, table: &Name) -> Option<&Table> {
         let table = self.db.get_table(code, scope, table);
 
         match table {
@@ -733,7 +736,13 @@ impl ApplyContext {
         }
     }
 
-    pub fn get_account_metadata(&mut self, account: Name) -> Result<AccountMetadata, ChainError> {
+    pub fn remove_table(&mut self, table: &Table) -> Result<(), ChainError> {
+        self.update_db_usage(table.get_payer(), -(billable_size_v::<Table>() as i64))?;
+        self.db.remove_table(table)?;
+        Ok(())
+    }
+
+    pub fn get_account_metadata(&mut self, account: &Name) -> Result<AccountMetadata, ChainError> {
         let res = self.session.find::<AccountMetadata>(account).map_err(|e| {
             ChainError::TransactionError(format!("failed to get account metadata: {}", e))
         })?;
@@ -751,7 +760,7 @@ impl ApplyContext {
         if delta > 0 {
             // Do not allow charging RAM to other accounts during notify
             let inner = self.inner.read()?;
-            if !(inner.privileged || payer == self.receiver) {
+            if !(inner.privileged || payer == &self.receiver) {
                 self.require_authorization(payer, None).map_err(|_| {
                     ChainError::TransactionError(format!(
                         "cannot charge RAM to other accounts during notify"

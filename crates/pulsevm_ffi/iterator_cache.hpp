@@ -1,5 +1,5 @@
 #pragma once
-#include <pulsevm/contract_table_objects.hpp>
+#include "objects.hpp"
 
 namespace pulsevm::chain {
 
@@ -23,13 +23,13 @@ class iterator_cache {
         return ei;
     }
 
-    const table_id_object& get_table( table_id_object::id_type i )const {
+    const table_id_object& get_table( const table_id_object::id_type& i )const {
         auto itr = _table_cache.find(i);
         EOS_ASSERT( itr != _table_cache.end(), table_not_in_cache, "an invariant was broken, table should be in cache" );
         return *itr->second.first;
     }
 
-    int get_end_iterator_by_table_id( table_id_object::id_type i )const {
+    int get_end_iterator_by_table_id( const table_id_object::id_type& i )const {
         auto itr = _table_cache.find(i);
         EOS_ASSERT( itr != _table_cache.end(), table_not_in_cache, "an invariant was broken, table should be in cache" );
         return itr->second.second;

@@ -1,17 +1,13 @@
 use core::fmt;
 
-use pulsevm_chainbase::{ChainbaseObject, SecondaryIndex, SecondaryKey, Session, UndoSession};
+use pulsevm_error::ChainError;
 use pulsevm_ffi::Database;
 use pulsevm_proc_macros::{NumBytes, Read, Write};
-use pulsevm_serialization::Write;
 use serde::Serialize;
 
-use crate::{
-    chain::{
-        Name,
-        config::{self, BillableSize, OVERHEAD_PER_ROW_PER_INDEX_RAM_BYTES},
-    },
-    error::ChainError,
+use crate::chain::{
+    Name,
+    config::{self, BillableSize, OVERHEAD_PER_ROW_PER_INDEX_RAM_BYTES},
 };
 
 use super::authority::Authority;
@@ -40,11 +36,7 @@ impl Permission {
         self.id
     }
 
-    pub fn satisfies(
-        &self,
-        other: &Permission,
-        db: &mut Database,
-    ) -> Result<bool, ChainError> {
+    pub fn satisfies(&self, other: &Permission, db: &Database) -> Result<bool, ChainError> {
         // If the owners are not the same, this permission cannot satisfy other
         if self.owner != other.owner {
             return Ok(false);
@@ -56,15 +48,15 @@ impl Permission {
         }
 
         // Walk up other's parent tree, seeing if we find this permission. If so, this permission satisfies other
-        let mut parent = session.find::<Permission>(other.parent)?;
+        let mut parent = db.find_permission(other.parent as i64)?;
 
         while let Some(parent_obj) = parent {
-            if self.id == parent_obj.id {
+            if self.id == parent_obj.get_id() as u64 {
                 return Ok(true);
-            } else if parent_obj.id == 0 {
+            } else if parent_obj.get_id() == 0 {
                 return Ok(false);
             }
-            parent = session.find::<Permission>(parent_obj.parent)?;
+            parent = db.find_permission(parent_obj.get_parent_id() as i64)?;
         }
 
         // This permission is not a parent of other, and so does not satisfy other
@@ -75,77 +67,6 @@ impl Permission {
 impl fmt::Display for Permission {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}@{}", self.owner, self.name)
-    }
-}
-
-impl ChainbaseObject for Permission {
-    type PrimaryKey = u64;
-
-    fn primary_key(&self) -> Vec<u8> {
-        Permission::primary_key_to_bytes(self.id)
-    }
-
-    fn primary_key_to_bytes(key: Self::PrimaryKey) -> Vec<u8> {
-        key.to_le_bytes().to_vec()
-    }
-
-    fn table_name() -> &'static str {
-        "permission"
-    }
-
-    fn secondary_indexes(&self) -> Vec<SecondaryKey> {
-        vec![
-            SecondaryKey {
-                key: PermissionByOwnerIndex::secondary_key_as_bytes((self.owner, self.name)),
-                index_name: PermissionByOwnerIndex::index_name(),
-            },
-            SecondaryKey {
-                key: PermissionByParentIndex::secondary_key_as_bytes((self.parent, self.id)),
-                index_name: PermissionByParentIndex::index_name(),
-            },
-        ]
-    }
-}
-
-#[derive(Debug, Default)]
-pub struct PermissionByOwnerIndex;
-
-impl SecondaryIndex<Permission> for PermissionByOwnerIndex {
-    type Key = (Name, Name);
-    type Object = Permission;
-
-    fn secondary_key(object: &Permission) -> Vec<u8> {
-        PermissionByOwnerIndex::secondary_key_as_bytes((object.owner, object.name))
-    }
-
-    fn secondary_key_as_bytes(key: Self::Key) -> Vec<u8> {
-        let bytes = key.pack().unwrap();
-        bytes
-    }
-
-    fn index_name() -> &'static str {
-        "permission_by_owner"
-    }
-}
-
-#[derive(Debug, Default)]
-pub struct PermissionByParentIndex;
-
-impl SecondaryIndex<Permission> for PermissionByParentIndex {
-    type Key = (u64, u64);
-    type Object = Permission;
-
-    fn secondary_key(object: &Permission) -> Vec<u8> {
-        PermissionByParentIndex::secondary_key_as_bytes((object.parent, object.id))
-    }
-
-    fn secondary_key_as_bytes(key: Self::Key) -> Vec<u8> {
-        let bytes = key.pack().unwrap();
-        bytes
-    }
-
-    fn index_name() -> &'static str {
-        "permission_by_parent"
     }
 }
 

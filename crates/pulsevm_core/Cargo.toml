@@ -8,6 +8,7 @@ anyhow = "1.0.98"
 base64 = "0.22.1"
 bs58 = { version = "0.5.1", features = ["cb58"] }
 chrono = "0.4.40"
+cxx = "1.0"
 flate2 = "1.1.2"
 hex = "0.4"
 jsonrpsee = { version = "0.24.9", features = ["server", "macros"] }
@@ -27,6 +28,7 @@ wasmer = { version = "6.1.0", features = ["llvm"] }
 wasmer-compiler-llvm = "6.1.0"
 
 pulsevm_crypto = { path = "../pulsevm_crypto" }
+pulsevm_error = { path = "../pulsevm_error" }
 pulsevm_grpc = { path = "../pulsevm_grpc" }
 pulsevm_name = { path = "../pulsevm_name" }
 pulsevm_proc_macros = { path = "../pulsevm_proc_macros" }

@@ -4,3 +4,4 @@ tmpnet/
 # Added by cargo
 
 /target
+.cache

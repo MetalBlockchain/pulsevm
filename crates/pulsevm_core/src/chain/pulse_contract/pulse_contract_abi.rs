@@ -211,47 +211,47 @@ pub fn get_pulse_contract_abi() -> AbiDefinition {
         ],
         actions: vec![
             AbiActionDefinition {
-                name: NEWACCOUNT_NAME,
+                name: NEWACCOUNT_NAME.into(),
                 type_name: "newaccount".to_string(),
                 ricardian_contract: "".to_string(),
             },
             AbiActionDefinition {
-                name: SETCODE_NAME,
+                name: SETCODE_NAME.into(),
                 type_name: "setcode".to_string(),
                 ricardian_contract: "".to_string(),
             },
             AbiActionDefinition {
-                name: SETABI_NAME,
+                name: SETABI_NAME.into(),
                 type_name: "setabi".to_string(),
                 ricardian_contract: "".to_string(),
             },
             AbiActionDefinition {
-                name: UPDATEAUTH_NAME,
+                name: UPDATEAUTH_NAME.into(),
                 type_name: "updateauth".to_string(),
                 ricardian_contract: "".to_string(),
             },
             AbiActionDefinition {
-                name: DELETEAUTH_NAME,
+                name: DELETEAUTH_NAME.into(),
                 type_name: "deleteauth".to_string(),
                 ricardian_contract: "".to_string(),
             },
             AbiActionDefinition {
-                name: LINKAUTH_NAME,
+                name: LINKAUTH_NAME.into(),
                 type_name: "linkauth".to_string(),
                 ricardian_contract: "".to_string(),
             },
             AbiActionDefinition {
-                name: UNLINKAUTH_NAME,
+                name: UNLINKAUTH_NAME.into(),
                 type_name: "unlinkauth".to_string(),
                 ricardian_contract: "".to_string(),
             },
             AbiActionDefinition {
-                name: ONERROR_NAME,
+                name: ONERROR_NAME.into(),
                 type_name: "onerror".to_string(),
                 ricardian_contract: "".to_string(),
             },
             AbiActionDefinition {
-                name: ONBLOCK_NAME,
+                name: ONBLOCK_NAME.into(),
                 type_name: "onblock".to_string(),
                 ricardian_contract: "".to_string(),
             },

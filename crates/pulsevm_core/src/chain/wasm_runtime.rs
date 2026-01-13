@@ -5,9 +5,7 @@ use std::{
 
 use lru::LruCache;
 use pulsevm_crypto::Bytes;
-use wasmer::{
-    Engine, Function, FunctionEnv, Instance, Memory, Module, Store, imports,
-};
+use wasmer::{Engine, Function, FunctionEnv, Instance, Memory, Module, Store, imports};
 
 use wasmer_compiler_llvm::LLVM;
 
@@ -32,8 +30,7 @@ use crate::{
 use super::{
     error::ChainError,
     webassembly::{
-        action_data_size, current_receiver, has_auth, is_account,
-        require_auth, send_inline,
+        action_data_size, current_receiver, has_auth, is_account, require_auth, send_inline,
     },
 };
 

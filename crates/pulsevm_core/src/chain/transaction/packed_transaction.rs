@@ -2,12 +2,12 @@ use std::{collections::HashSet, io::Read as IoRead};
 
 use flate2::read::ZlibDecoder;
 use pulsevm_crypto::Bytes;
+use pulsevm_error::ChainError;
 use pulsevm_serialization::{NumBytes, Read, ReadError, Write, WriteError};
 use serde::{Serialize, ser::SerializeStruct};
 
 use crate::chain::{
     config::FIXED_NET_OVERHEAD_OF_PACKED_TRX,
-    error::ChainError,
     id::Id,
     secp256k1::Signature,
     transaction::{SignedTransaction, Transaction, TransactionCompression},

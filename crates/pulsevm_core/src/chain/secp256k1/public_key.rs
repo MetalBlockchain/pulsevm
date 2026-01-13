@@ -1,11 +1,12 @@
 use std::{fmt, str::FromStr};
 
+use pulsevm_error::ChainError;
 use pulsevm_serialization::{NumBytes, Read, Write};
 use ripemd::{Digest, Ripemd160};
 use secp256k1::{PublicKey as Secp256k1PublicKey, Secp256k1, SecretKey};
 use serde::{Deserialize, Serialize};
 
-use crate::chain::{error::ChainError, secp256k1::KeyType};
+use crate::chain::secp256k1::KeyType;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PublicKey {

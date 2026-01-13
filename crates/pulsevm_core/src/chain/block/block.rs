@@ -1,14 +1,13 @@
 use std::collections::VecDeque;
 
-use pulsevm_chainbase::{ChainbaseObject, SecondaryIndex, SecondaryKey};
 use pulsevm_crypto::{Digest, FixedBytes};
+use pulsevm_error::ChainError;
 use pulsevm_proc_macros::{NumBytes, Read, Write, name};
 use pulsevm_serialization::Write;
 use serde::{Serialize, ser::SerializeStruct};
 
 use crate::chain::{
-    Name, block::BlockTimestamp, error::ChainError, id::Id, secp256k1::Signature,
-    transaction::TransactionReceipt,
+    Name, block::BlockTimestamp, id::Id, secp256k1::Signature, transaction::TransactionReceipt,
 };
 
 #[derive(Debug, Default, Clone, Read, Write, NumBytes)]
@@ -112,30 +111,6 @@ impl SignedBlock {
 
     pub fn timestamp(&self) -> BlockTimestamp {
         self.signed_block_header.block.timestamp
-    }
-}
-
-impl ChainbaseObject for SignedBlock {
-    type PrimaryKey = u32;
-
-    fn primary_key(&self) -> Vec<u8> {
-        self.signed_block_header
-            .block
-            .block_num()
-            .to_le_bytes()
-            .to_vec()
-    }
-
-    fn primary_key_to_bytes(key: Self::PrimaryKey) -> Vec<u8> {
-        key.to_le_bytes().to_vec()
-    }
-
-    fn table_name() -> &'static str {
-        "block"
-    }
-
-    fn secondary_indexes(&self) -> Vec<SecondaryKey> {
-        vec![]
     }
 }
 

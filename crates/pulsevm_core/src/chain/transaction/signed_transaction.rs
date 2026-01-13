@@ -1,13 +1,13 @@
 use std::collections::HashSet;
 
 use pulsevm_crypto::Bytes;
+use pulsevm_error::ChainError;
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 use pulsevm_serialization::Write;
 use serde::Serialize;
 use sha2::Digest;
 
 use crate::chain::{
-    error::ChainError,
     id::Id,
     secp256k1::{PrivateKey, PublicKey, Signature},
     transaction::transaction::Transaction,

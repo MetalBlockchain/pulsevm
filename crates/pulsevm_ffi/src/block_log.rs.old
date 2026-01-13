@@ -1,0 +1,27 @@
+use crate::bridge::ffi;
+
+pub struct BlockLog {
+    ptr: cxx::UniquePtr<ffi::BlockLog>,
+}
+
+impl BlockLog {
+    pub fn open(path: &str) -> Result<Self, String> {
+        let ptr = ffi::open_block_log(path);
+        if ptr.is_null() {
+            return Err(format!("Failed to open block log at path: {}", path));
+        }
+        Ok(BlockLog { ptr })
+    }
+
+    pub fn find_block_by_num(
+        &self,
+        block_num: u32,
+    ) -> Result<Option<cxx::SharedPtr<ffi::SignedBlock>>, String> {
+        let block = self.ptr.read_block_by_num(block_num);
+
+        match block.as_ref() {
+            Some(_) => Ok(Some(block)),
+            None => Ok(None),
+        }
+    }
+}

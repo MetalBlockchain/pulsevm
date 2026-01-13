@@ -1,4 +1,5 @@
 use core::str;
+use pulsevm_error::ChainError;
 use pulsevm_proc_macros::NumBytes;
 use pulsevm_proc_macros::Read;
 use pulsevm_proc_macros::Write;
@@ -7,7 +8,6 @@ use serde::{Deserialize, Serialize};
 use sha2::Digest;
 
 use crate::chain::block::BlockTimestamp;
-use crate::chain::error::ChainError;
 use crate::chain::id::Id;
 use crate::chain::secp256k1::PublicKey;
 

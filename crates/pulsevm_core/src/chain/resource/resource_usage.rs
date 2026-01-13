@@ -1,4 +1,3 @@
-use pulsevm_chainbase::{ChainbaseObject, SecondaryKey};
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 
 use crate::chain::{name::Name, utils::UsageAccumulator};
@@ -26,25 +25,5 @@ impl ResourceUsage {
             net_usage,
             ram_usage,
         }
-    }
-}
-
-impl ChainbaseObject for ResourceUsage {
-    type PrimaryKey = Name;
-
-    fn primary_key(&self) -> Vec<u8> {
-        ResourceUsage::primary_key_to_bytes(self.owner)
-    }
-
-    fn primary_key_to_bytes(key: Self::PrimaryKey) -> Vec<u8> {
-        key.as_u64().to_le_bytes().to_vec()
-    }
-
-    fn table_name() -> &'static str {
-        "resource_usage"
-    }
-
-    fn secondary_indexes(&self) -> Vec<SecondaryKey> {
-        vec![]
     }
 }

@@ -1,8 +1,8 @@
 // chainbase_bridge.hpp - C++ bridge header for CXX
 #pragma once
 #include <chainbase/chainbase.hpp>
-#include <pulsevm/account_object.hpp>
-#include <pulsevm/resource_limits_private.hpp>
+#include "iterator_cache.hpp"
+#include "objects.hpp"
 #include <boost/multi_index_container.hpp>
 #include <boost/multi_index/member.hpp>
 #include <boost/multi_index/mem_fun.hpp>
@@ -12,11 +12,12 @@
 #include <rust/cxx.h>
 #include <string>
 
-namespace chainbase {
-  using undo_session = database::session;
-}
-
 namespace pulsevm { namespace chain {
+
+using undo_session = ::chainbase::database::session;
+
+struct cpu_limit_result;
+struct net_limit_result;
 
 class database_wrapper : public chainbase::database {
 public:
@@ -30,12 +31,35 @@ public:
         this->add_index<resource_limits::resource_usage_index>();
         this->add_index<resource_limits::resource_limits_state_index>();
         this->add_index<resource_limits::resource_limits_config_index>();
+        this->add_index<permission_usage_index>();
+        this->add_index<permission_index>();
+        this->add_index<permission_link_index>();
     }
 
-    void add_account(const account_name& account_name) {
-        auto account = this->create<account_object>([&](auto& a) {
-            a.name = account_name;
+    const account_object& create_account(const name& account_name, uint32_t creation_date) {
+        return this->create<account_object>([&](auto& a) {
+            a.name = name(account_name);
+            a.creation_date = block_timestamp_type(creation_date);
         });
+    }
+
+    const account_metadata_object& create_account_metadata(const name& account_name, bool is_privileged) {
+        return this->create<account_metadata_object>([&](auto& a) {
+            a.name = name(account_name);
+            a.set_privileged(is_privileged);
+        });
+    }
+
+    const account_object* find_account(const name& account ) const {
+        return this->find<account_object, by_name>(account);
+    }
+
+    const account_object& get_account(const name& account ) const {
+        return this->get<account_object, by_name>(account);
+    }
+
+    const account_metadata_object* find_account_metadata(const name& account ) const {
+        return this->find<account_metadata_object, by_name>(account);
     }
 
     void initialize_resource_limits() {
@@ -221,8 +245,229 @@ public:
         return state.total_net_weight;
     }
 
-    std::unique_ptr<account_object> get_account() {
-        return std::make_unique<account_object>(this->get<account_object, by_id>(account_id_type(0)));
+    cpu_limit_result get_account_cpu_limit(const account_name& name, uint32_t greylist_limit = config::maximum_elastic_resource_multiplier);
+
+    std::pair<resource_limits::account_resource_limit, bool> get_account_cpu_limit_ex( const account_name& name, uint32_t greylist_limit = config::maximum_elastic_resource_multiplier, const std::optional<block_timestamp_type>& current_time = {}) {
+        const auto& state = this->get<resource_limits::resource_limits_state_object>();
+        const auto& usage = this->get<resource_limits::resource_usage_object, resource_limits::by_owner>(name);
+        const auto& config = this->get<resource_limits::resource_limits_config_object>();
+
+        int64_t cpu_weight, x, y;
+        get_account_limits( name, x, y, cpu_weight );
+
+        if( cpu_weight < 0 || state.total_cpu_weight == 0 ) {
+            return {{ -1, -1, -1, block_timestamp_type(usage.cpu_usage.last_ordinal), -1 }, false};
+        }
+
+        resource_limits::account_resource_limit arl;
+
+        uint128_t window_size = config.account_cpu_usage_average_window;
+
+        bool greylisted = false;
+        uint128_t virtual_cpu_capacity_in_window = window_size;
+        if( greylist_limit < config::maximum_elastic_resource_multiplier ) {
+            uint64_t greylisted_virtual_cpu_limit = config.cpu_limit_parameters.max * greylist_limit;
+            if( greylisted_virtual_cpu_limit < state.virtual_cpu_limit ) {
+                virtual_cpu_capacity_in_window *= greylisted_virtual_cpu_limit;
+                greylisted = true;
+            } else {
+                virtual_cpu_capacity_in_window *= state.virtual_cpu_limit;
+            }
+        } else {
+            virtual_cpu_capacity_in_window *= state.virtual_cpu_limit;
+        }
+
+        uint128_t user_weight     = (uint128_t)cpu_weight;
+        uint128_t all_user_weight = (uint128_t)state.total_cpu_weight;
+
+        auto max_user_use_in_window = (virtual_cpu_capacity_in_window * user_weight) / all_user_weight;
+        auto cpu_used_in_window  = resource_limits::impl::integer_divide_ceil((uint128_t)usage.cpu_usage.value_ex * window_size, (uint128_t)config::rate_limiting_precision);
+
+        if( max_user_use_in_window <= cpu_used_in_window )
+            arl.available = 0;
+        else
+            arl.available = resource_limits::impl::downgrade_cast<int64_t>(max_user_use_in_window - cpu_used_in_window);
+
+        arl.used = resource_limits::impl::downgrade_cast<int64_t>(cpu_used_in_window);
+        arl.max = resource_limits::impl::downgrade_cast<int64_t>(max_user_use_in_window);
+        arl.last_usage_update_time = block_timestamp_type(usage.cpu_usage.last_ordinal);
+        arl.current_used = arl.used;
+        if ( current_time ) {
+            if (current_time->slot > usage.cpu_usage.last_ordinal) {
+                auto history_usage = usage.cpu_usage;
+                history_usage.add(0, current_time->slot, window_size);
+                arl.current_used = resource_limits::impl::downgrade_cast<int64_t>(resource_limits::impl::integer_divide_ceil((uint128_t)history_usage.value_ex * window_size, (uint128_t)config::rate_limiting_precision));
+            }
+        }
+        return {arl, greylisted};
+    }
+
+    net_limit_result get_account_net_limit(const account_name& name, uint32_t greylist_limit = config::maximum_elastic_resource_multiplier);
+
+    std::pair<resource_limits::account_resource_limit, bool> get_account_net_limit_ex( const account_name& name, uint32_t greylist_limit = config::maximum_elastic_resource_multiplier, const std::optional<block_timestamp_type>& current_time = {}) {
+        const auto& config = this->get<resource_limits::resource_limits_config_object>();
+        const auto& state  = this->get<resource_limits::resource_limits_state_object>();
+        const auto& usage  = this->get<resource_limits::resource_usage_object, resource_limits::by_owner>(name);
+
+        int64_t net_weight, x, y;
+        get_account_limits( name, x, net_weight, y );
+
+        if( net_weight < 0 || state.total_net_weight == 0) {
+            return {{ -1, -1, -1, block_timestamp_type(usage.net_usage.last_ordinal), -1 }, false};
+        }
+
+        resource_limits::account_resource_limit arl;
+
+        uint128_t window_size = config.account_net_usage_average_window;
+
+        bool greylisted = false;
+        uint128_t virtual_network_capacity_in_window = window_size;
+        if( greylist_limit < config::maximum_elastic_resource_multiplier ) {
+            uint64_t greylisted_virtual_net_limit = config.net_limit_parameters.max * greylist_limit;
+            if( greylisted_virtual_net_limit < state.virtual_net_limit ) {
+                virtual_network_capacity_in_window *= greylisted_virtual_net_limit;
+                greylisted = true;
+            } else {
+                virtual_network_capacity_in_window *= state.virtual_net_limit;
+            }
+        } else {
+            virtual_network_capacity_in_window *= state.virtual_net_limit;
+        }
+
+        uint128_t user_weight     = (uint128_t)net_weight;
+        uint128_t all_user_weight = (uint128_t)state.total_net_weight;
+
+        auto max_user_use_in_window = (virtual_network_capacity_in_window * user_weight) / all_user_weight;
+        auto net_used_in_window  = resource_limits::impl::integer_divide_ceil((uint128_t)usage.net_usage.value_ex * window_size, (uint128_t)config::rate_limiting_precision);
+
+        if( max_user_use_in_window <= net_used_in_window )
+            arl.available = 0;
+        else
+            arl.available = resource_limits::impl::downgrade_cast<int64_t>(max_user_use_in_window - net_used_in_window);
+
+        arl.used = resource_limits::impl::downgrade_cast<int64_t>(net_used_in_window);
+        arl.max = resource_limits::impl::downgrade_cast<int64_t>(max_user_use_in_window);
+        arl.last_usage_update_time = block_timestamp_type(usage.net_usage.last_ordinal);
+        arl.current_used = arl.used;
+        if ( current_time ) {
+            if (current_time->slot > usage.net_usage.last_ordinal) {
+                auto history_usage = usage.net_usage;
+                history_usage.add(0, current_time->slot, window_size);
+                arl.current_used = resource_limits::impl::downgrade_cast<int64_t>(resource_limits::impl::integer_divide_ceil((uint128_t)history_usage.value_ex * window_size, (uint128_t)config::rate_limiting_precision));
+            }
+        }
+        return {arl, greylisted};
+    }
+
+    void process_account_limit_updates() {
+        auto& multi_index = this->get_mutable_index<resource_limits::resource_limits_index>();
+        auto& by_owner_index = multi_index.indices().get<resource_limits::by_owner>();
+
+        // convenience local lambda to reduce clutter
+        auto update_state_and_value = [](uint64_t &total, int64_t &value, int64_t pending_value, const char* debug_which) -> void {
+            if (value > 0) {
+                EOS_ASSERT(total >= static_cast<uint64_t>(value), rate_limiting_state_inconsistent, "underflow when reverting old value to ${which}", ("which", debug_which));
+                total -= value;
+            }
+
+            if (pending_value > 0) {
+                EOS_ASSERT(UINT64_MAX - total >= static_cast<uint64_t>(pending_value), rate_limiting_state_inconsistent, "overflow when applying new value to ${which}", ("which", debug_which));
+                total += pending_value;
+            }
+
+            value = pending_value;
+        };
+
+        const auto& state = this->get<resource_limits::resource_limits_state_object>();
+        this->modify(state, [&](resource_limits::resource_limits_state_object& rso){
+            while(!by_owner_index.empty()) {
+                const auto& itr = by_owner_index.lower_bound(boost::make_tuple(true));
+                if (itr == by_owner_index.end() || itr->pending!= true) {
+                    break;
+                }
+
+                const auto& actual_entry = this->get<resource_limits::resource_limits_object, resource_limits::by_owner>(boost::make_tuple(false, itr->owner));
+                this->modify(actual_entry, [&](resource_limits::resource_limits_object& rlo){
+                    update_state_and_value(rso.total_ram_bytes,  rlo.ram_bytes,  itr->ram_bytes, "ram_bytes");
+                    update_state_and_value(rso.total_cpu_weight, rlo.cpu_weight, itr->cpu_weight, "cpu_weight");
+                    update_state_and_value(rso.total_net_weight, rlo.net_weight, itr->net_weight, "net_weight");
+                });
+
+                multi_index.remove(*itr);
+            }
+        });
+    }
+
+    const table_id_object* find_table( const name &code, const name &scope, const name &table ) {
+        return this->find<table_id_object, by_code_scope_table>(boost::make_tuple(code, scope, table));
+    }
+
+    const table_id_object& get_table( const name &code, const name &scope, const name &table ) {
+        return this->get<table_id_object, by_code_scope_table>(boost::make_tuple(code, scope, table));
+    }
+
+    const table_id_object& create_table( const name &code, const name &scope, const name &table, const account_name &payer ) {
+        return this->create<table_id_object>([&](table_id_object &t_id){
+            t_id.code = code;
+            t_id.scope = scope;
+            t_id.table = table;
+            t_id.payer = payer;
+        });
+    }
+
+    int db_find_i64( const name& code, const name& scope, const name& table, uint64_t id, key_value_iterator_cache& keyval_cache ) {
+        const auto* tab = find_table( code, scope, table );
+        if( !tab ) return -1;
+
+        auto table_end_itr = keyval_cache.cache_table( *tab );
+
+        const key_value_object* obj = this->find<key_value_object, by_scope_primary>( boost::make_tuple( tab->id, id ) );
+        if( !obj ) return table_end_itr;
+
+        return keyval_cache.add( *obj );
+    }
+
+    const key_value_object& create_key_value_object( const table_id_object& tab, const account_name& payer, uint64_t id, rust::Slice<const std::uint8_t> buffer ) {
+        auto tableid = tab.id;
+        EOS_ASSERT( payer != account_name(), invalid_table_payer, "must specify a valid account to pay for new record" );
+        const auto& obj = this->create<key_value_object>( [&]( auto& o ) {
+            o.t_id        = tableid;
+            o.primary_key = id;
+            o.value.assign( reinterpret_cast<const char*>(buffer.data()), buffer.size() );
+            o.payer       = payer;
+        });
+
+        this->modify( tab, [&]( auto& t ) {
+            ++t.count;
+        });
+
+        return obj;
+    }
+
+    void update_key_value_object( const key_value_object& obj, const name& payer, rust::Slice<const std::uint8_t> buffer ) {
+        this->modify( obj, [&]( auto& o ) {
+            o.value.assign( buffer.data(), buffer.size() );
+            o.payer = payer;
+        });
+    }
+
+    void remove_key_value_object( const key_value_object& obj, const table_id_object& table_obj ) {
+        this->modify( table_obj, [&]( auto& t ) {
+            --t.count;
+        });
+        this->remove( obj );
+    }
+
+    void remove_table( const table_id_object& table_obj ) {
+        this->remove( table_obj );
+    }
+
+    bool is_account( const name& account )const {
+        return nullptr != this->find<account_object,by_name>( account );
+    }
+
+    const permission_object* find_permission( int64_t id ) const {
+        return this->find<permission_object, by_id>( permission_object::id_type( id ) );
     }
 
     std::unique_ptr<chainbase::database::session> create_undo_session(bool enabled) {
@@ -237,14 +482,14 @@ void undo(::chainbase::database& db);
 void commit(::chainbase::database& db, int64_t revision);
 int64_t revision(const ::chainbase::database& db);
 
-} }
-
 // Forward declare the enum from the bridge
 enum class DatabaseOpenFlags : uint32_t;
 
 // Bridge function to open database
-std::unique_ptr<pulsevm::chain::database_wrapper> open_database(
+std::shared_ptr<database_wrapper> open_database(
     rust::Str path,
     DatabaseOpenFlags flags,
     uint64_t size
 );
+
+} }

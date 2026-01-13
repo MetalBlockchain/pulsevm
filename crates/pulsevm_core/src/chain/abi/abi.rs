@@ -1,7 +1,8 @@
+use pulsevm_error::ChainError;
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 use serde::{Deserialize, Serialize};
 
-use crate::chain::{Name, error::ChainError};
+use crate::chain::Name;
 
 #[derive(Debug, Clone, Read, Write, NumBytes, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AbiTypeDefinition {

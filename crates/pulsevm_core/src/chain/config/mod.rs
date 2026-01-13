@@ -37,15 +37,15 @@ pub const DEFAULT_MAX_TRANSACTION_CPU_USAGE: u32 = 3 * DEFAULT_MAX_BLOCK_CPU_USA
 pub const DEFAULT_MIN_TRANSACTION_CPU_USAGE: u32 = 100;
 
 // Names
-pub const NEWACCOUNT_NAME: Name = Name::new(name!("newaccount"));
-pub const SETCODE_NAME: Name = Name::new(name!("setcode"));
-pub const SETABI_NAME: Name = Name::new(name!("setabi"));
-pub const UPDATEAUTH_NAME: Name = Name::new(name!("updateauth"));
-pub const DELETEAUTH_NAME: Name = Name::new(name!("deleteauth"));
-pub const LINKAUTH_NAME: Name = Name::new(name!("linkauth"));
-pub const UNLINKAUTH_NAME: Name = Name::new(name!("unlinkauth"));
-pub const ONERROR_NAME: Name = Name::new(name!("onerror"));
-pub const ONBLOCK_NAME: Name = Name::new(name!("onblock"));
+pub const NEWACCOUNT_NAME: u64 = name!("newaccount");
+pub const SETCODE_NAME: u64 = name!("setcode");
+pub const SETABI_NAME: u64 = name!("setabi");
+pub const UPDATEAUTH_NAME: u64 = name!("updateauth");
+pub const DELETEAUTH_NAME: u64 = name!("deleteauth");
+pub const LINKAUTH_NAME: u64 = name!("linkauth");
+pub const UNLINKAUTH_NAME: u64 = name!("unlinkauth");
+pub const ONERROR_NAME: u64 = name!("onerror");
+pub const ONBLOCK_NAME: u64 = name!("onblock");
 
 pub trait BillableSize {
     fn billable_size() -> u64;
@@ -65,6 +65,19 @@ pub use gpo::GlobalPropertyObject;
 
 mod dgpo;
 pub use dgpo::DynamicGlobalPropertyObject;
+use pulsevm_ffi::{KeyValue, Table};
 use pulsevm_proc_macros::name;
 
 use crate::chain::Name;
+
+impl BillableSize for KeyValue {
+    fn billable_size() -> u64 {
+        16 + OVERHEAD_PER_ROW_PER_INDEX_RAM_BYTES as u64 // TODO: Check this
+    }
+}
+
+impl BillableSize for Table {
+    fn billable_size() -> u64 {
+        64 + OVERHEAD_PER_ACCOUNT_RAM_BYTES as u64 // TODO: Check this
+    }
+}
