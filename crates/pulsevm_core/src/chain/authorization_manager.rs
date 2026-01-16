@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use pulsevm_ffi::Database;
+use pulsevm_ffi::{Database, PermissionObject};
 
 use crate::{
     PULSE_NAME,
@@ -313,16 +313,15 @@ impl AuthorizationManager {
 
     pub fn get_permission(
         db: &mut Database,
-        level: &PermissionLevel,
-    ) -> Result<Permission, ChainError> {
+        actor: &Name,
+        permission: &Name,
+    ) -> Result<&PermissionObject, ChainError> {
         pulse_assert(
-            !level.actor.empty() && !level.permission.empty(),
+            !actor.empty() && !permission.empty(),
             ChainError::AuthorizationError("invalid permission".to_string()),
         )?;
-        let result = db.get_by_secondary::<Permission, PermissionByOwnerIndex>((
-            level.actor,
-            level.permission,
-        ))?;
+        let result =
+            db.get_permission_by_actor_and_permission(actor.as_ref(), permission.as_ref())?;
         Ok(result)
     }
 

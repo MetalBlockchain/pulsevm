@@ -1,8 +1,10 @@
 use std::fmt;
 
+use cxx::SharedPtr;
 use prost_types::Timestamp;
+use pulsevm_ffi::{BlockTimestamp as FfiBlockTimestamp, TimePoint};
 use pulsevm_proc_macros::{NumBytes, Read, Write};
-use pulsevm_time::{TimePoint, TimePointSec, milliseconds};
+use pulsevm_time::{TimePointSec, milliseconds};
 use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
     de::{self, Visitor},
@@ -10,10 +12,10 @@ use serde::{
 use time::{Duration, OffsetDateTime, PrimitiveDateTime, macros::format_description};
 
 #[derive(
-    Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Default, Read, Write, NumBytes,
+    Clone
 )]
 pub struct BlockTimestamp {
-    pub slot: u32,
+    pub inner: SharedPtr<FfiBlockTimestamp>,
 }
 
 impl BlockTimestamp {
@@ -70,8 +72,8 @@ impl BlockTimestamp {
     }
 
     #[inline]
-    pub fn to_time_point(self) -> TimePoint {
-        self.into()
+    pub fn to_time_point(&self) -> SharedPtr<TimePoint> {
+        self.inner.to_time_point()
     }
 
     pub fn to_eos_string(&self) -> String {

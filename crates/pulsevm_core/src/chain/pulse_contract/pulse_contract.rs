@@ -1,7 +1,7 @@
 use std::ops::Mul;
 
 use pulsevm_error::ChainError;
-use pulsevm_ffi::Database;
+use pulsevm_ffi::{Database, Digest};
 use pulsevm_serialization::Write;
 use sha2::Digest;
 
@@ -115,17 +115,16 @@ pub fn setcode(context: &mut ApplyContext, db: &mut Database) -> Result<(), Chai
         ChainError::TransactionError(format!("version should be 0")),
     )?;
 
-    let mut code_hash: Id = Id::default();
+    let mut code_hash = Digest::new_empty();
     let code_size = act.code.len() as u64;
 
     if code_size > 0 {
-        let digest = sha2::Sha256::digest(act.code.as_slice());
-        code_hash = Id::new(digest.into());
+        code_hash = Digest::hash(act.code.as_slice());
         // TODO: validate wasm
     }
 
-    let mut account = db.get_account_metadata(act.account.as_ref())?;
-    let existing_code = account.code_hash != Id::default();
+    let account = db.get_account_metadata(act.account.as_ref())?;
+    let existing_code = !account.get_code_hash().empty();
 
     pulse_assert(
         code_size > 0 || existing_code,
@@ -136,71 +135,30 @@ pub fn setcode(context: &mut ApplyContext, db: &mut Database) -> Result<(), Chai
     let new_size: i64 = code_size as i64 * config::SETCODE_RAM_BYTES_MULTIPLIER as i64;
 
     if existing_code {
-        let mut old_code_entry = session
-            .get::<CodeObject>(account.code_hash.clone())
-            .map_err(|_| ChainError::TransactionError(format!("failed to find code")))?;
+        let old_code_entry =
+            db.get_code_object_by_hash(code_hash.as_ref().unwrap(), act.vm_type, act.vm_version)?;
         pulse_assert(
-            old_code_entry.code_hash != code_hash,
+            old_code_entry.get_code_hash() != code_hash.as_ref().unwrap(),
             ChainError::TransactionError(format!(
                 "contract is already running this version of code"
             )),
         )?;
 
-        old_size = old_code_entry.code.len() as i64 * config::SETCODE_RAM_BYTES_MULTIPLIER as i64;
+        old_size =
+            old_code_entry.get_code().len() as i64 * config::SETCODE_RAM_BYTES_MULTIPLIER as i64;
 
-        if old_code_entry.code_ref_count == 1 {
-            session
-                .remove::<CodeObject>(old_code_entry)
-                .map_err(|_| ChainError::TransactionError(format!("failed to remove code")))?;
-        } else {
-            session
-                .modify(&mut old_code_entry, |code| {
-                    code.code_ref_count -= 1;
-                    Ok(())
-                })
-                .map_err(|_| ChainError::TransactionError(format!("failed to update code")))?;
-        }
+        db.unlink_account_code(old_code_entry)?;
     }
 
-    if code_size > 0 {
-        let new_code_entry = session
-            .find::<CodeObject>(code_hash.clone())
-            .map_err(|_| ChainError::TransactionError(format!("failed to find code")))?;
-
-        if let Some(mut new_code_entry) = new_code_entry {
-            session
-                .modify(&mut new_code_entry, |code| {
-                    code.code_ref_count += 1;
-                    Ok(())
-                })
-                .map_err(|_| {
-                    ChainError::TransactionError(format!("failed to update code reference count"))
-                })?;
-        } else {
-            let new_code_entry = CodeObject {
-                code_hash: code_hash.clone(),
-                code: act.code,
-                code_ref_count: 1,
-                first_block_used: 0, // TODO: set to current block number
-                vm_type: act.vm_type,
-                vm_version: act.vm_version,
-            };
-            session
-                .insert(&new_code_entry)
-                .map_err(|_| ChainError::TransactionError(format!("failed to insert code")))?;
-        }
-    }
-
-    session
-        .modify(&mut account, |a| {
-            a.code_sequence += 1;
-            a.code_hash = code_hash.clone();
-            a.vm_type = act.vm_type;
-            a.vm_version = act.vm_version;
-            a.last_code_update = context.pending_block_timestamp();
-            Ok(())
-        })
-        .map_err(|_| ChainError::TransactionError(format!("failed to update account")))?;
+    db.update_account_code(
+        account,
+        act.code.as_slice(),
+        context.get_head_block_num() + 1,
+        context.get_pending_block_time().to_time_point().as_ref().unwrap(),
+        code_hash.as_ref().unwrap(),
+        act.vm_type,
+        act.vm_version,
+    )?;
 
     if new_size != old_size {
         context.add_ram_usage(&act.account, new_size - old_size);
@@ -308,10 +266,7 @@ pub fn updateauth(context: &mut ApplyContext, db: &mut Database) -> Result<(), C
 
     let mut parent_id = 0u64;
     if update.permission != OWNER_NAME {
-        let parent = AuthorizationManager::get_permission(
-            db,
-            &PermissionLevel::new(update.account, update.parent),
-        )?;
+        let parent = AuthorizationManager::get_permission(db, &update.account, &update.parent)?;
         parent_id = parent.id();
     }
 
@@ -485,7 +440,7 @@ pub fn unlinkauth(context: &mut ApplyContext, db: &mut Database) -> Result<(), C
     Ok(())
 }
 
-fn validate_authority_precondition(db: &Database, auth: &Authority) -> Result<(), ChainError> {
+fn validate_authority_precondition(db: &mut Database, auth: &Authority) -> Result<(), ChainError> {
     for a in auth.accounts() {
         let account = db.get_account(a.permission().actor.as_ref()).map_err(|_| {
             ChainError::TransactionError(format!("account {} does not exist", a.permission().actor))
@@ -499,21 +454,14 @@ fn validate_authority_precondition(db: &Database, auth: &Authority) -> Result<()
             continue; // virtual pulse.code permission does not really exist but is allowed
         }
 
-        let permission = session
-            .find_by_secondary::<Permission, PermissionByOwnerIndex>((
-                a.permission().actor,
-                a.permission().permission,
-            ))
+        AuthorizationManager::get_permission(db, &a.permission().actor, &a.permission().permission)
             .map_err(|_| {
                 ChainError::TransactionError(format!(
-                    "failed to query db for permission {}",
+                    "permission {}@{} does not exist",
+                    a.permission().actor,
                     a.permission().permission
                 ))
             })?;
-        pulse_assert(
-            permission.is_some(),
-            ChainError::TransactionError(format!("permission {} does not exist", a.permission())),
-        )?;
     }
     Ok(())
 }

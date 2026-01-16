@@ -853,4 +853,12 @@ impl ApplyContext {
         self.trx_context.resume_billing_timer()?;
         Ok(())
     }
+
+    pub fn get_head_block_num(&self) -> u32 {
+        0 // TODO: Fix
+    }
+
+    pub fn get_pending_block_time(&self) -> &BlockTimestamp {
+        &self.pending_block_timestamp
+    }
 }

@@ -9,9 +9,9 @@ use cxx::{SharedPtr, UniquePtr};
 use pulsevm_error::ChainError;
 
 use crate::{
-    KeyValueIteratorCache, Name,
+    Digest, KeyValueIteratorCache, Name, TimePoint,
     bridge::ffi::{self, Table},
-    iterator_cache::ffi::KeyValue,
+    iterator_cache::ffi::KeyValue, objects::ffi::AccountMetadata,
 };
 
 #[derive(Clone)]
@@ -114,6 +114,46 @@ impl Database {
         } else {
             Ok(Some(unsafe { &*account_metadata }))
         }
+    }
+
+    pub fn unlink_account_code(
+        &mut self,
+        old_code_entry: &ffi::CodeObject,
+    ) -> Result<(), ChainError> {
+        unsafe {
+            self.inner
+                .pin_mut_unchecked()
+                .unlink_account_code(old_code_entry)
+        }
+        .map_err(|e| {
+            ChainError::InternalError(Some(format!("Failed to unlink account code: {}", e)))
+        })
+    }
+
+    pub fn update_account_code(
+        &mut self,
+        account: &AccountMetadata,
+        new_code: &[u8],
+        head_block_num: u32,
+        pending_block_time: &TimePoint,
+        code_hash: &Digest,
+        vm_type: u8,
+        vm_version: u8,
+    ) -> Result<(), ChainError> {
+        unsafe {
+            self.inner.pin_mut_unchecked().update_account_code(
+                account,
+                new_code,
+                head_block_num,
+                pending_block_time,
+                code_hash,
+                vm_type,
+                vm_version,
+            )
+        }
+        .map_err(|e| {
+            ChainError::InternalError(Some(format!("Failed to update account code: {}", e)))
+        })
     }
 
     pub fn get_account_metadata(
@@ -393,6 +433,31 @@ impl Database {
         } else {
             Ok(Some(unsafe { &*res }))
         }
+    }
+
+    pub fn get_permission_by_actor_and_permission(
+        &self,
+        actor: &Name,
+        permission: &Name,
+    ) -> Result<&ffi::PermissionObject, ChainError> {
+        unsafe {
+            self.inner
+                .get_permission_by_actor_and_permission(actor, permission)
+        }
+        .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
+    }
+
+    pub fn get_code_object_by_hash(
+        &self,
+        code_hash: &Digest,
+        vm_type: u8,
+        vm_version: u8,
+    ) -> Result<&ffi::CodeObject, ChainError> {
+        unsafe {
+            self.inner
+                .get_code_object_by_hash(code_hash, vm_type, vm_version)
+        }
+        .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
     }
 }
 

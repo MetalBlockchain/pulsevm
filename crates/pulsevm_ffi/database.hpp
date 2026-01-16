@@ -1,13 +1,16 @@
 // chainbase_bridge.hpp - C++ bridge header for CXX
 #pragma once
 #include <chainbase/chainbase.hpp>
+#include <pulsevm/chain/code_object.hpp>
+#include <pulsevm/chain/block.hpp>
+#include <pulsevm/chain/block_timestamp.hpp>
+#include <pulsevm/chain/multi_index_includes.hpp>
+#include <pulsevm/chain/resource_limits.hpp>
+#include <pulsevm/chain/resource_limits_private.hpp>
+#include <pulsevm/chain/account_object.hpp>
+#include <pulsevm/chain/permission_link_object.hpp>
 #include "iterator_cache.hpp"
 #include "objects.hpp"
-#include <boost/multi_index_container.hpp>
-#include <boost/multi_index/member.hpp>
-#include <boost/multi_index/mem_fun.hpp>
-#include <boost/multi_index/composite_key.hpp>
-#include <boost/multi_index/ordered_index.hpp>
 #include <memory>
 #include <rust/cxx.h>
 #include <string>
@@ -468,6 +471,68 @@ public:
 
     const permission_object* find_permission( int64_t id ) const {
         return this->find<permission_object, by_id>( permission_object::id_type( id ) );
+    }
+
+    const permission_object& get_permission_by_actor_and_permission( const name& actor, const name& permission ) const {
+        EOS_ASSERT( !actor.empty() && !permission.empty(), invalid_permission, "Invalid permission" );
+        return this->get<permission_object, by_owner>( boost::make_tuple(actor, permission) );
+    }
+
+    void unlink_account_code(
+        const code_object& old_code_entry
+    ) {
+        if( old_code_entry.code_ref_count == 1 ) {
+            this->remove(old_code_entry);
+        } else {
+            this->modify(old_code_entry, [](code_object& o) {
+                --o.code_ref_count;
+            });
+        }
+    }
+
+    void update_account_code(
+        const account_metadata_object& account,
+        rust::Slice<const std::uint8_t> new_code, 
+        uint32_t head_block_num, 
+        const time_point& pending_block_time,
+        const digest_type& code_hash, 
+        uint8_t vm_type, 
+        uint8_t vm_version
+    ) {
+        if( new_code.size() > 0 ) {
+            const code_object* new_code_entry = this->find<code_object, by_code_hash>( boost::make_tuple(code_hash, vm_type, vm_version) );
+
+            if( new_code_entry ) {
+                this->modify(*new_code_entry, [&](code_object& o) {
+                    ++o.code_ref_count;
+                });
+            } else {
+                this->create<code_object>([&](code_object& o) {
+                    o.code_hash = code_hash;
+                    o.code.assign( new_code.data(), new_code.size() );
+                    o.code_ref_count = 1;
+                    o.first_block_used = head_block_num + 1;
+                    o.vm_type = vm_type;
+                    o.vm_version = vm_version;
+                });
+            }
+        }
+
+        this->modify( account, [&]( auto& a ) {
+            a.code_sequence += 1;
+            a.code_hash = code_hash;
+            a.vm_type = vm_type;
+            a.vm_version = vm_version;
+            a.last_code_update = pending_block_time;
+        });
+    }
+
+    const code_object& get_code_object_by_hash(
+        const digest_type& code_hash,
+        uint8_t vm_type,
+        uint8_t vm_version
+    ) const {
+        return this->get<code_object, by_code_hash>( boost::make_tuple(code_hash, vm_type, vm_version) );
     }
 
     std::unique_ptr<chainbase::database::session> create_undo_session(bool enabled) {

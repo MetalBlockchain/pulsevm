@@ -38,11 +38,13 @@ pub mod ffi {
         #[cxx_name = "account_object"]
         type Account;
         #[cxx_name = "account_metadata_object"]
-        type AccountMetadata;
+        type AccountMetadata = crate::objects::ffi::AccountMetadata;
+        #[cxx_name = "code_object"]
+        type CodeObject = crate::objects::ffi::CodeObject;
         #[cxx_name = "table_id_object"]
-        type Table = crate::contract_table_objects::ffi::Table;
+        type Table = crate::objects::ffi::Table;
         #[cxx_name = "key_value_object"]
-        type KeyValue = crate::contract_table_objects::ffi::KeyValue;
+        type KeyValue = crate::objects::ffi::KeyValue;
         #[cxx_name = "signed_block"]
         type SignedBlock;
         #[cxx_name = "key_value_iterator_cache"]
@@ -53,12 +55,10 @@ pub mod ffi {
         pub type PermissionUsageObject = crate::objects::ffi::PermissionUsageObject;
         #[cxx_name = "permission_link_object"]
         pub type PermissionLinkObject = crate::objects::ffi::PermissionLinkObject;
-
-        // Block log
-        #[cxx_name = "block_log"]
-        pub type BlockLog;
-        pub fn open_block_log(path: &str) -> UniquePtr<BlockLog>;
-        pub fn read_block_by_num(self: &BlockLog, block_num: u32) -> SharedPtr<SignedBlock>;
+        #[cxx_name = "digest_type"]
+        type Digest = crate::types::ffi::Digest;
+        #[cxx_name = "time_point"]
+        type TimePoint = crate::types::ffi::TimePoint;
 
         // Methods on database
         pub fn flush(self: Pin<&mut Database>);
@@ -88,6 +88,28 @@ pub mod ffi {
             self: &Database,
             account_name: &Name,
         ) -> Result<*const AccountMetadata>;
+        pub fn unlink_account_code(
+            self: Pin<&mut Database>,
+            old_code_entry: &CodeObject,
+        ) -> Result<()>;
+        pub fn update_account_code(
+            self: Pin<&mut Database>,
+            account: &AccountMetadata,
+            new_code: &[u8],
+            head_block_num: u32,
+            pending_block_time: &TimePoint,
+            code_hash: &Digest,
+            vm_type: u8,
+            vm_version: u8,
+        ) -> Result<()>;
+
+        // Code object methods
+        pub fn get_code_object_by_hash(
+            self: &Database,
+            code_hash: &Digest,
+            vm_type: u8,
+            vm_version: u8,
+        ) -> Result<&CodeObject>;
 
         // Resource methods
         pub fn initialize_resource_limits(self: Pin<&mut Database>) -> Result<()>;
@@ -186,6 +208,11 @@ pub mod ffi {
 
         // Permission methods
         pub fn find_permission(self: &Database, id: i64) -> Result<*const PermissionObject>;
+        pub fn get_permission_by_actor_and_permission(
+            self: &Database,
+            actor: &Name,
+            permission: &Name,
+        ) -> Result<&PermissionObject>;
 
         // Methods on undo_session
         pub fn push(self: Pin<&mut UndoSession>) -> Result<()>;

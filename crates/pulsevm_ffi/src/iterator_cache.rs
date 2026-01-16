@@ -10,11 +10,11 @@ pub mod ffi {
         include!("iterator_cache.hpp");
 
         #[cxx_name = "table_id_object"]
-        type Table = crate::contract_table_objects::ffi::Table;
+        type Table = crate::objects::ffi::Table;
         #[cxx_name = "table_id"]
-        type TableId = crate::contract_table_objects::ffi::TableId;
+        type TableId = crate::objects::ffi::TableId;
         #[cxx_name = "key_value_object"]
-        type KeyValue = crate::contract_table_objects::ffi::KeyValue;
+        type KeyValue = crate::objects::ffi::KeyValue;
 
         #[cxx_name = "key_value_iterator_cache"]
         pub type KeyValueIteratorCache;

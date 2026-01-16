@@ -1,4 +1,4 @@
-cmake_minimum_required( VERSION 3.16 )
+cmake_minimum_required( VERSION 3.5 )
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
@@ -27,6 +27,7 @@ endif()
 option(ENABLE_WERROR "Enable `-Werror` compilation flag." Off)
 option(ENABLE_WEXTRA "Enable `-Wextra` compilation flag." Off)
 
+# http://stackoverflow.com/a/18369825
 if("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
     if (CMAKE_CXX_COMPILER_VERSION VERSION_LESS 10.2)
         message(FATAL_ERROR "GCC version must be at least 10.2.0!")
@@ -134,5 +135,4 @@ install(DIRECTORY "${CMAKE_SOURCE_DIR}/libraries/boost/"
         PATTERN "tools/*/test" EXCLUDE
         )
 
-include(package.cmake)
 include(CPack)

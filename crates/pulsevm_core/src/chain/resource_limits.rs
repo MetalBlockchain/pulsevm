@@ -123,7 +123,7 @@ impl ResourceLimitsManager {
                 ))
             })?;
 
-        Ok((res.limit, res.is_greylisted))
+        Ok((res.limit, res.greylisted))
     }
 
     pub fn get_account_cpu_limit(
@@ -140,7 +140,7 @@ impl ResourceLimitsManager {
                 ))
             })?;
 
-        Ok((res.limit, res.is_greylisted))
+        Ok((res.limit, res.greylisted))
     }
 
     pub fn process_account_limit_updates(db: &mut Database) -> Result<(), ChainError> {
