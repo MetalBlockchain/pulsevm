@@ -11,12 +11,13 @@ use pulsevm_error::ChainError;
 use crate::{
     Digest, KeyValueIteratorCache, Name, TimePoint,
     bridge::ffi::{self, Table},
-    iterator_cache::ffi::KeyValue, objects::ffi::AccountMetadata,
+    iterator_cache::ffi::KeyValue,
+    objects::ffi::AccountMetadata,
 };
 
 #[derive(Clone)]
 pub struct Database {
-    inner: SharedPtr<ffi::Database>,
+    inner: Arc<RwLock<UniquePtr<ffi::Database>>>,
 }
 
 impl Database {
@@ -30,102 +31,127 @@ impl Database {
         if db.is_null() {
             Err("Failed to open database".to_string())
         } else {
-            Ok(Database { inner: db })
+            Ok(Database {
+                inner: Arc::new(RwLock::new(db)),
+            })
         }
     }
 
-    pub fn add_indices(&mut self) {
-        unsafe {
-            self.inner.pin_mut_unchecked().add_indices();
-        }
+    pub fn add_indices(&mut self) -> Result<(), ChainError> {
+        self.inner.write()?.pin_mut().add_indices();
+        Ok(())
     }
 
     pub fn create_account(
         &mut self,
         account_name: &Name,
         creation_date: u32,
-    ) -> Result<&ffi::Account, ChainError> {
-        unsafe {
-            self.inner
-                .pin_mut_unchecked()
-                .create_account(account_name, creation_date)
-                .map_err(|e| {
-                    ChainError::InternalError(Some(format!("Failed to create account: {}", e)))
-                })
-        }
-    }
+    ) -> Result<*const ffi::Account, ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
 
-    pub fn find_account(
-        &mut self,
-        account_name: &Name,
-    ) -> Result<Option<&ffi::Account>, ChainError> {
-        let account = unsafe { self.inner.pin_mut_unchecked().find_account(account_name) }
+        let acct_ref = pinned
+            .create_account(account_name, creation_date)
             .map_err(|e| {
-                ChainError::InternalError(Some(format!("Failed to get account: {}", e)))
+                ChainError::InternalError(Some(format!("Failed to create account: {}", e)))
             })?;
 
-        if account.is_null() {
-            Ok(None)
-        } else {
-            Ok(Some(unsafe { &*account }))
-        }
+        Ok(acct_ref as *const ffi::Account)
     }
 
-    pub fn get_account(&mut self, account_name: &Name) -> Result<&ffi::Account, ChainError> {
-        match self.find_account(account_name)? {
-            Some(account) => Ok(account),
-            None => Err(ChainError::InternalError(Some(format!(
-                "Account not found"
-            )))),
+    pub fn find_account(&self, account_name: &Name) -> Result<*const ffi::Account, ChainError> {
+        let guard = self.inner.read()?;
+        let account = guard.find_account(account_name).map_err(|e| {
+            ChainError::InternalError(Some(format!("Failed to get account: {}", e)))
+        })?;
+
+        Ok(account)
+    }
+
+    pub fn get_account(&self, account_name: &Name) -> Result<*const ffi::Account, ChainError> {
+        let guard = self.inner.read()?;
+        let account = guard.find_account(account_name).map_err(|e| {
+            ChainError::InternalError(Some(format!("Failed to get account: {}", e)))
+        })?;
+
+        if account.is_null() {
+            return Err(ChainError::InternalError(Some(format!(
+                "Account not found: {}",
+                account_name
+            ))));
         }
+
+        Ok(account)
     }
 
     pub fn create_account_metadata(
         &mut self,
         account_name: &Name,
         is_privileged: bool,
-    ) -> Result<&ffi::AccountMetadata, ChainError> {
-        unsafe {
-            self.inner
-                .pin_mut_unchecked()
-                .create_account_metadata(account_name, is_privileged)
-                .map_err(|e| {
-                    ChainError::InternalError(Some(format!(
-                        "Failed to create account metadata: {}",
-                        e
-                    )))
-                })
-        }
+    ) -> Result<*const ffi::AccountMetadata, ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        let res = pinned
+            .create_account_metadata(account_name, is_privileged)
+            .map_err(|e| {
+                ChainError::InternalError(Some(format!("Failed to create account metadata: {}", e)))
+            })?;
+
+        Ok(res as *const ffi::AccountMetadata)
     }
 
     pub fn find_account_metadata(
-        &mut self,
+        &self,
         account_name: &Name,
-    ) -> Result<Option<&ffi::AccountMetadata>, ChainError> {
-        let account_metadata = unsafe {
-            self.inner
-                .pin_mut_unchecked()
-                .find_account_metadata(account_name)
-        }
-        .map_err(|e| ChainError::InternalError(Some(format!("Failed to get account: {}", e))))?;
+    ) -> Result<*const ffi::AccountMetadata, ChainError> {
+        let guard = self.inner.read()?;
 
-        if account_metadata.is_null() {
-            Ok(None)
-        } else {
-            Ok(Some(unsafe { &*account_metadata }))
+        guard.find_account_metadata(account_name).map_err(|e| {
+            ChainError::InternalError(Some(format!("Failed to find account metadata: {}", e)))
+        })
+    }
+
+    pub fn set_privileged(
+        &mut self,
+        account: &Name,
+        is_privileged: bool,
+    ) -> Result<(), ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned.set_privileged(account, is_privileged).map_err(|e| {
+            ChainError::InternalError(Some(format!("Failed to set privileged: {}", e)))
+        })
+    }
+
+    pub fn get_account_metadata(
+        &self,
+        account_name: &Name,
+    ) -> Result<*const ffi::AccountMetadata, ChainError> {
+        let guard = self.inner.read()?;
+        let res = guard.find_account_metadata(account_name).map_err(|e| {
+            ChainError::InternalError(Some(format!("Failed to find account metadata: {}", e)))
+        })?;
+
+        if res.is_null() {
+            return Err(ChainError::InternalError(Some(format!(
+                "Account metadata not found for account: {}",
+                account_name
+            ))));
         }
+
+        Ok(res as *const ffi::AccountMetadata)
     }
 
     pub fn unlink_account_code(
         &mut self,
         old_code_entry: &ffi::CodeObject,
     ) -> Result<(), ChainError> {
-        unsafe {
-            self.inner
-                .pin_mut_unchecked()
-                .unlink_account_code(old_code_entry)
-        }
-        .map_err(|e| {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned.unlink_account_code(old_code_entry).map_err(|e| {
             ChainError::InternalError(Some(format!("Failed to unlink account code: {}", e)))
         })
     }
@@ -140,8 +166,11 @@ impl Database {
         vm_type: u8,
         vm_version: u8,
     ) -> Result<(), ChainError> {
-        unsafe {
-            self.inner.pin_mut_unchecked().update_account_code(
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .update_account_code(
                 account,
                 new_code,
                 head_block_num,
@@ -150,34 +179,45 @@ impl Database {
                 vm_type,
                 vm_version,
             )
-        }
-        .map_err(|e| {
-            ChainError::InternalError(Some(format!("Failed to update account code: {}", e)))
-        })
+            .map_err(|e| {
+                ChainError::InternalError(Some(format!("Failed to update account code: {}", e)))
+            })
     }
 
-    pub fn get_account_metadata(
+    pub fn update_account_abi(
         &mut self,
-        account_name: &Name,
-    ) -> Result<&ffi::AccountMetadata, ChainError> {
-        match self.find_account_metadata(account_name)? {
-            Some(account_metadata) => Ok(account_metadata),
-            None => Err(ChainError::InternalError(Some(format!(
-                "Account metadata not found"
-            )))),
-        }
+        account: &ffi::Account,
+        account_metadata: &ffi::AccountMetadata,
+        abi: &[u8],
+    ) -> Result<(), ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .update_account_abi(account, account_metadata, abi)
+            .map_err(|e| {
+                ChainError::InternalError(Some(format!("Failed to update account abi: {}", e)))
+            })
     }
 
     pub fn create_undo_session(
         &mut self,
         enabled: bool,
     ) -> Result<cxx::UniquePtr<ffi::UndoSession>, ChainError> {
-        unsafe { self.inner.pin_mut_unchecked().create_undo_session(enabled) }
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .create_undo_session(enabled)
             .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
     }
 
     pub fn initialize_resource_limits(&mut self) -> Result<(), ChainError> {
-        unsafe { self.inner.pin_mut_unchecked().initialize_resource_limits() }
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .initialize_resource_limits()
             .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
     }
 
@@ -185,12 +225,12 @@ impl Database {
         &mut self,
         account_name: &Name,
     ) -> Result<(), ChainError> {
-        unsafe {
-            self.inner
-                .pin_mut_unchecked()
-                .initialize_account_resource_limits(account_name)
-        }
-        .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .initialize_account_resource_limits(account_name)
+            .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
     }
 
     pub fn add_transaction_usage(
@@ -201,15 +241,12 @@ impl Database {
         time_slot: u32,
     ) -> Result<(), ChainError> {
         let accounts_vec: Vec<u64> = accounts.iter().map(|name| name.to_uint64_t()).collect();
-        unsafe {
-            self.inner.pin_mut_unchecked().add_transaction_usage(
-                &accounts_vec,
-                cpu_usage,
-                net_usage,
-                time_slot,
-            )
-        }
-        .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .add_transaction_usage(&accounts_vec, cpu_usage, net_usage, time_slot)
+            .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
     }
 
     pub fn add_pending_ram_usage(
@@ -217,30 +254,30 @@ impl Database {
         account_name: &Name,
         ram_bytes: i64,
     ) -> Result<(), ChainError> {
-        unsafe {
-            self.inner
-                .pin_mut_unchecked()
-                .add_pending_ram_usage(account_name, ram_bytes)
-        }
-        .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .add_pending_ram_usage(account_name, ram_bytes)
+            .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
     }
 
     pub fn verify_account_ram_usage(&mut self, account_name: &Name) -> Result<(), ChainError> {
-        unsafe {
-            self.inner
-                .pin_mut_unchecked()
-                .verify_account_ram_usage(account_name)
-        }
-        .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .verify_account_ram_usage(account_name)
+            .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
     }
 
     pub fn get_account_ram_usage(&mut self, account_name: &Name) -> Result<i64, ChainError> {
-        unsafe {
-            self.inner
-                .pin_mut_unchecked()
-                .get_account_ram_usage(account_name)
-        }
-        .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .get_account_ram_usage(account_name)
+            .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
     }
 
     pub fn set_account_limits(
@@ -250,15 +287,12 @@ impl Database {
         net_weight: i64,
         cpu_weight: i64,
     ) -> Result<bool, ChainError> {
-        unsafe {
-            self.inner.pin_mut_unchecked().set_account_limits(
-                account_name,
-                ram_bytes,
-                net_weight,
-                cpu_weight,
-            )
-        }
-        .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .set_account_limits(account_name, ram_bytes, net_weight, cpu_weight)
+            .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
     }
 
     pub fn get_account_limits(
@@ -268,24 +302,29 @@ impl Database {
         net_weight: &mut i64,
         cpu_weight: &mut i64,
     ) -> Result<(), ChainError> {
-        unsafe {
-            self.inner.pin_mut_unchecked().get_account_limits(
-                account_name,
-                ram_bytes,
-                net_weight,
-                cpu_weight,
-            )
-        }
-        .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .get_account_limits(account_name, ram_bytes, net_weight, cpu_weight)
+            .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
     }
 
     pub fn get_total_cpu_weight(&mut self) -> Result<u64, ChainError> {
-        unsafe { self.inner.pin_mut_unchecked().get_total_cpu_weight() }
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .get_total_cpu_weight()
             .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
     }
 
     pub fn get_total_net_weight(&mut self) -> Result<u64, ChainError> {
-        unsafe { self.inner.pin_mut_unchecked().get_total_net_weight() }
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .get_total_net_weight()
             .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
     }
 
@@ -294,12 +333,12 @@ impl Database {
         name: &Name,
         greylist_limit: u32,
     ) -> Result<ffi::NetLimitResult, ChainError> {
-        unsafe {
-            self.inner
-                .pin_mut_unchecked()
-                .get_account_net_limit(name, greylist_limit)
-        }
-        .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .get_account_net_limit(name, greylist_limit)
+            .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
     }
 
     pub fn get_account_cpu_limit(
@@ -307,21 +346,21 @@ impl Database {
         name: &Name,
         greylist_limit: u32,
     ) -> Result<ffi::CpuLimitResult, ChainError> {
-        unsafe {
-            self.inner
-                .pin_mut_unchecked()
-                .get_account_cpu_limit(name, greylist_limit)
-        }
-        .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .get_account_cpu_limit(name, greylist_limit)
+            .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
     }
 
     pub fn process_account_limit_updates(&mut self) -> Result<(), ChainError> {
-        unsafe {
-            self.inner
-                .pin_mut_unchecked()
-                .process_account_limit_updates()
-        }
-        .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .process_account_limit_updates()
+            .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
     }
 
     pub fn get_table(
@@ -329,9 +368,13 @@ impl Database {
         code: &Name,
         scope: &Name,
         table: &Name,
-    ) -> Result<&Table, ChainError> {
-        unsafe { self.inner.pin_mut_unchecked().get_table(code, scope, table) }
-            .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
+    ) -> Result<*const Table, ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+        let res = pinned
+            .get_table(code, scope, table)
+            .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))?;
+        Ok(res as *const Table)
     }
 
     pub fn create_table(
@@ -340,13 +383,13 @@ impl Database {
         scope: &Name,
         table: &Name,
         payer: &Name,
-    ) -> Result<&Table, ChainError> {
-        unsafe {
-            self.inner
-                .pin_mut_unchecked()
-                .create_table(code, scope, table, payer)
-        }
-        .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
+    ) -> Result<*const Table, ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+        let res = pinned
+            .create_table(code, scope, table, payer)
+            .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))?;
+        Ok(res as *const Table)
     }
 
     pub fn db_find_i64(
@@ -357,16 +400,11 @@ impl Database {
         id: u64,
         keyval_cache: &mut KeyValueIteratorCache,
     ) -> Result<i32, ChainError> {
-        unsafe {
-            self.inner.pin_mut_unchecked().db_find_i64(
-                code,
-                scope,
-                table,
-                id,
-                keyval_cache.pin_mut(),
-            )
-        }
-        .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        unsafe { pinned.db_find_i64(code, scope, table, id, keyval_cache.pin_mut()) }
+            .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
     }
 
     pub fn create_key_value_object(
@@ -375,13 +413,14 @@ impl Database {
         payer: &Name,
         id: u64,
         buffer: &[u8],
-    ) -> Result<&KeyValue, ChainError> {
-        unsafe {
-            self.inner
-                .pin_mut_unchecked()
-                .create_key_value_object(table, payer, id, buffer)
-        }
-        .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
+    ) -> Result<*const KeyValue, ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        let res = pinned
+            .create_key_value_object(table, payer, id, buffer)
+            .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))?;
+        Ok(res as *const KeyValue)
     }
 
     pub fn update_key_value_object(
@@ -390,12 +429,12 @@ impl Database {
         payer: &Name,
         buffer: &[u8],
     ) -> Result<(), ChainError> {
-        unsafe {
-            self.inner
-                .pin_mut_unchecked()
-                .update_key_value_object(obj, payer, buffer)
-        }
-        .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .update_key_value_object(obj, payer, buffer)
+            .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
     }
 
     pub fn remove_key_value_object(
@@ -403,48 +442,113 @@ impl Database {
         obj: &KeyValue,
         table_obj: &Table,
     ) -> Result<(), ChainError> {
-        unsafe {
-            self.inner
-                .pin_mut_unchecked()
-                .remove_key_value_object(obj, table_obj)
-        }
-        .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .remove_key_value_object(obj, table_obj)
+            .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
     }
 
     pub fn remove_table(&mut self, table: &Table) -> Result<(), ChainError> {
-        unsafe { self.inner.pin_mut_unchecked().remove_table(table) }
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .remove_table(table)
             .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
     }
 
     pub fn is_account(&self, account: &Name) -> Result<bool, ChainError> {
-        self.inner
+        let guard = self.inner.read()?;
+
+        guard
             .is_account(account)
             .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
     }
 
-    pub fn find_permission(&self, id: i64) -> Result<Option<&ffi::PermissionObject>, ChainError> {
-        let res = self
-            .inner
+    pub fn find_permission(&self, id: i64) -> Result<*const ffi::PermissionObject, ChainError> {
+        let guard = self.inner.read()?;
+        let res = guard
             .find_permission(id)
             .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))?;
 
-        if res.is_null() {
-            Ok(None)
-        } else {
-            Ok(Some(unsafe { &*res }))
-        }
+        Ok(res)
+    }
+
+    pub fn find_permission_by_actor_and_permission(
+        &self,
+        actor: &Name,
+        permission: &Name,
+    ) -> Result<*const ffi::PermissionObject, ChainError> {
+        let guard = self.inner.read()?;
+        let res = guard
+            .find_permission_by_actor_and_permission(actor, permission)
+            .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))?;
+
+        Ok(res)
     }
 
     pub fn get_permission_by_actor_and_permission(
         &self,
         actor: &Name,
         permission: &Name,
-    ) -> Result<&ffi::PermissionObject, ChainError> {
-        unsafe {
-            self.inner
-                .get_permission_by_actor_and_permission(actor, permission)
+    ) -> Result<*const ffi::PermissionObject, ChainError> {
+        let guard = self.inner.read()?;
+        let res = guard
+            .find_permission_by_actor_and_permission(actor, permission)
+            .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))?;
+
+        if res.is_null() {
+            return Err(ChainError::InternalError(Some(format!(
+                "Permission not found for actor: {} permission: {}",
+                actor, permission
+            ))));
         }
-        .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
+
+        Ok(res)
+    }
+
+    pub fn delete_auth(
+        &mut self,
+        account: &Name,
+        permission_name: &Name,
+    ) -> Result<i64, ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .delete_auth(account, permission_name)
+            .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
+    }
+
+    pub fn link_auth(
+        &mut self,
+        account_name: &Name,
+        code_name: &Name,
+        requirement_name: &Name,
+        requirement_type: &Name,
+    ) -> Result<i64, ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .link_auth(account_name, code_name, requirement_name, requirement_type)
+            .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
+    }
+
+    pub fn unlink_auth(
+        &mut self,
+        account_name: &Name,
+        code_name: &Name,
+        requirement_type: &Name,
+    ) -> Result<i64, ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .unlink_auth(account_name, code_name, requirement_type)
+            .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
     }
 
     pub fn get_code_object_by_hash(
@@ -452,12 +556,43 @@ impl Database {
         code_hash: &Digest,
         vm_type: u8,
         vm_version: u8,
-    ) -> Result<&ffi::CodeObject, ChainError> {
-        unsafe {
-            self.inner
-                .get_code_object_by_hash(code_hash, vm_type, vm_version)
-        }
-        .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
+    ) -> Result<*const ffi::CodeObject, ChainError> {
+        let guard = self.inner.read()?;
+        let res = guard
+            .get_code_object_by_hash(code_hash, vm_type, vm_version)
+            .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))?;
+
+        Ok(res)
+    }
+
+    pub fn next_recv_sequence(
+        &mut self,
+        receiver_account: &AccountMetadata,
+    ) -> Result<u64, ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .next_recv_sequence(receiver_account)
+            .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
+    }
+
+    pub fn next_auth_sequence(&mut self, actor: &Name) -> Result<u64, ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .next_auth_sequence(actor)
+            .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
+    }
+
+    pub fn next_global_sequence(&mut self) -> Result<u64, ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .next_global_sequence()
+            .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
     }
 }
 
@@ -482,7 +617,7 @@ mod tests {
 impl Default for Database {
     fn default() -> Self {
         Self {
-            inner: SharedPtr::null(),
+            inner: Arc::new(RwLock::new(UniquePtr::null())),
         }
     }
 }

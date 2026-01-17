@@ -65,7 +65,8 @@ impl AuthorizationManager {
                         // since special cases were already handled, it should only be false if the permission is pulse.any
                         let min_permission = Self::get_permission(
                             db,
-                            &PermissionLevel::new(declared_auth.actor, min_permission_name),
+                            &declared_auth.actor,
+                            min_permission_name.as_ref(),
                         )?;
                         pulse_assert(
                             Self::get_permission(db, &declared_auth)?

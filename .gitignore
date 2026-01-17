@@ -5,3 +5,6 @@ tmpnet/
 
 /target
 .cache
+CMakeCache.txt
+CMakeFiles
+install/

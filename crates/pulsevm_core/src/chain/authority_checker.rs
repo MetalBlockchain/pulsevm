@@ -103,17 +103,14 @@ impl<'a> AuthorityChecker<'a> {
         }
 
         // not cached yet – fetch authority from DB
-        let auth = db
-            .find_by_secondary::<Permission, PermissionByOwnerIndex>((
-                permission.permission().actor,
-                permission.permission().permission,
-            ))
-            .map_err(|e| ChainError::AuthorizationError(format!("{}", e)))?;
+        let auth = db.find_permission_by_actor_and_permission(
+            permission.permission().actor.as_ref(),
+            permission.permission().permission.as_ref(),
+        )?;
 
-        let Some(auth) = auth else {
-            // no such permission → contributes 0
+        if auth.is_null() {
             return Ok(0);
-        };
+        }
 
         // mark as being evaluated to detect cycles
         self.cached_permissions.insert(

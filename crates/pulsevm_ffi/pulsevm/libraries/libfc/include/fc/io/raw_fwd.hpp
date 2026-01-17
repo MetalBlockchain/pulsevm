@@ -13,7 +13,7 @@
 #include <variant>
 #include <filesystem>
 
-namespace eosio::chain {
+namespace pulsevm::chain {
    struct signed_block;
 }
 
@@ -40,7 +40,7 @@ namespace fc {
     template<typename T>
     inline size_t pack_size(  const T& v );
 
-    template <typename Stream> void unpack(Stream& s, eosio::chain::signed_block& v);
+    template <typename Stream> void unpack(Stream& s, pulsevm::chain::signed_block& v);
 
     template<typename Stream, typename Storage> inline void pack( Stream& s, const fc::fixed_string<Storage>& u );
     template<typename Stream, typename Storage> inline void unpack( Stream& s, fc::fixed_string<Storage>& u );

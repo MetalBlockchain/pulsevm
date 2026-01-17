@@ -3,6 +3,8 @@ pub mod ffi {
     unsafe extern "C++" {
         include!("objects.hpp");
 
+        #[cxx_name = "account_object"]
+        type Account;
         #[cxx_name = "account_metadata_object"]
         type AccountMetadata;
         #[cxx_name = "permission_object"]
@@ -26,8 +28,15 @@ pub mod ffi {
         #[cxx_name = "shared_blob"]
         pub type SharedBlob = crate::types::ffi::SharedBlob;
 
+        // Account methods
+        pub fn get_abi(self: &Account) -> &SharedBlob;
+
         // AccountMetadata methods
         pub fn get_code_hash(self: &AccountMetadata) -> &Digest;
+        pub fn get_recv_sequence(self: &AccountMetadata) -> u64;
+        pub fn get_auth_sequence(self: &AccountMetadata) -> u64;
+        pub fn get_code_sequence(self: &AccountMetadata) -> u64;
+        pub fn get_abi_sequence(self: &AccountMetadata) -> u64;
 
         // CodeObject methods
         pub fn get_code_hash(self: &CodeObject) -> &Digest;

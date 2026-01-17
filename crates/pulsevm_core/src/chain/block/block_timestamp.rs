@@ -1,9 +1,10 @@
-use std::fmt;
+use std::fmt::{self, Debug};
 
 use cxx::SharedPtr;
 use prost_types::Timestamp;
 use pulsevm_ffi::{BlockTimestamp as FfiBlockTimestamp, TimePoint};
 use pulsevm_proc_macros::{NumBytes, Read, Write};
+use pulsevm_serialization::{NumBytes, Read, ReadError, Write, WriteError};
 use pulsevm_time::{TimePointSec, milliseconds};
 use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
@@ -11,9 +12,7 @@ use serde::{
 };
 use time::{Duration, OffsetDateTime, PrimitiveDateTime, macros::format_description};
 
-#[derive(
-    Clone
-)]
+#[derive(Clone)]
 pub struct BlockTimestamp {
     pub inner: SharedPtr<FfiBlockTimestamp>,
 }
@@ -23,52 +22,42 @@ impl BlockTimestamp {
     pub const BLOCK_TIMESTAMP_EPOCH_MS: i64 = 946_684_800_000; // 2000-01-01T00:00:00Z
 
     #[inline]
-    pub const fn new(slot: u32) -> Self {
-        Self { slot }
+    pub fn new(slot: u32) -> Self {
+        Self {
+            inner: FfiBlockTimestamp::from_slot(slot),
+        }
     }
 
     #[inline]
-    pub const fn maximum() -> Self {
-        Self { slot: 0xFFFF }
+    pub fn maximum() -> Self {
+        Self {
+            inner: FfiBlockTimestamp::from_slot(0xFFFF),
+        }
     }
     #[inline]
-    pub const fn min() -> Self {
-        Self { slot: 0 }
+    pub fn min() -> Self {
+        Self {
+            inner: FfiBlockTimestamp::from_slot(0),
+        }
     }
 
     #[inline]
     pub fn now() -> Self {
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        let dur = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default();
-        let now_ms: i128 =
-            (dur.as_secs() as i128) * 1_000 + (dur.subsec_nanos() as i128) / 1_000_000;
-
-        let epoch_ms = Self::BLOCK_TIMESTAMP_EPOCH_MS as i128; // 2000-01-01T00:00:00Z
-        let interval = Self::BLOCK_INTERVAL_MS as i128; // 500
-
-        // Truncate to the lower 500ms boundary; clamp before-epoch to 0
-        let delta = (now_ms - epoch_ms).max(0);
-        let slot_i128 = delta / interval;
-
-        // Saturate into u32
-        let slot = if slot_i128 > u32::MAX as i128 {
-            u32::MAX
-        } else {
-            slot_i128 as u32
-        };
-
-        BlockTimestamp { slot }
+        Self {
+            inner: FfiBlockTimestamp::now(),
+        }
     }
 
     #[inline]
     pub fn next(self) -> Self {
-        assert!(u32::MAX - self.slot >= 1, "block timestamp overflow");
+        assert!(u32::MAX - self.slot() >= 1, "block timestamp overflow");
         Self {
-            slot: self.slot + 1,
+            inner: FfiBlockTimestamp::from_slot(self.slot() + 1),
         }
+    }
+
+    pub fn slot(&self) -> u32 {
+        self.inner.get_slot()
     }
 
     #[inline]
@@ -78,8 +67,8 @@ impl BlockTimestamp {
 
     pub fn to_eos_string(&self) -> String {
         // total ms since Unix epoch
-        let total_ms =
-            (self.slot as i64) * (Self::BLOCK_INTERVAL_MS as i64) + Self::BLOCK_TIMESTAMP_EPOCH_MS;
+        let total_ms = (self.slot() as i64) * (Self::BLOCK_INTERVAL_MS as i64)
+            + Self::BLOCK_TIMESTAMP_EPOCH_MS;
 
         let secs = total_ms.div_euclid(1000);
         let rem_ms = (total_ms.rem_euclid(1000)) as i64;
@@ -98,12 +87,12 @@ impl BlockTimestamp {
     }
 }
 
-impl From<BlockTimestamp> for TimePoint {
+impl From<BlockTimestamp> for SharedPtr<TimePoint> {
     #[inline]
     fn from(bt: BlockTimestamp) -> Self {
-        let msec = (bt.slot as i64) * (BlockTimestamp::BLOCK_INTERVAL_MS as i64)
+        let msec = (bt.slot() as i64) * (BlockTimestamp::BLOCK_INTERVAL_MS as i64)
             + BlockTimestamp::BLOCK_TIMESTAMP_EPOCH_MS;
-        TimePoint::new(milliseconds(msec))
+        TimePoint::new(msec)
     }
 }
 
@@ -114,7 +103,7 @@ impl From<TimePoint> for BlockTimestamp {
         let msec = micro / 1_000;
         let slot = ((msec - BlockTimestamp::BLOCK_TIMESTAMP_EPOCH_MS)
             / (BlockTimestamp::BLOCK_INTERVAL_MS as i64)) as u32;
-        BlockTimestamp { slot }
+        BlockTimestamp::new(slot)
     }
 }
 
@@ -124,14 +113,14 @@ impl From<TimePointSec> for BlockTimestamp {
         let sec = t.sec_since_epoch() as i64;
         let slot = ((sec * 1_000 - BlockTimestamp::BLOCK_TIMESTAMP_EPOCH_MS)
             / (BlockTimestamp::BLOCK_INTERVAL_MS as i64)) as u32;
-        BlockTimestamp { slot }
+        BlockTimestamp::new(slot)
     }
 }
 
 impl From<BlockTimestamp> for Timestamp {
     fn from(bt: BlockTimestamp) -> Self {
         // total milliseconds since Unix epoch (1970-01-01T00:00:00Z)
-        let total_ms = (bt.slot as i128)
+        let total_ms = (bt.slot() as i128)
             * (BlockTimestamp::BLOCK_INTERVAL_MS as i128)     // 500ms per slot
             + (BlockTimestamp::BLOCK_TIMESTAMP_EPOCH_MS as i128); // epoch = 2000-01-01
 
@@ -209,10 +198,49 @@ impl<'de> Deserialize<'de> for BlockTimestamp {
                 }
                 let slot = (delta / (BlockTimestamp::BLOCK_INTERVAL_MS as i64)) as u32;
 
-                Ok(BlockTimestamp { slot })
+                Ok(BlockTimestamp::new(slot))
             }
         }
 
         deserializer.deserialize_str(BtVisitor)
     }
 }
+
+impl NumBytes for BlockTimestamp {
+    fn num_bytes(&self) -> usize {
+        4
+    }
+}
+
+impl Read for BlockTimestamp {
+    fn read(bytes: &[u8], pos: &mut usize) -> Result<Self, ReadError> {
+        let slot = u32::read(bytes, pos)?;
+        Ok(BlockTimestamp::new(slot))
+    }
+}
+
+impl Write for BlockTimestamp {
+    fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), WriteError> {
+        self.slot().write(bytes, pos)
+    }
+}
+
+impl Debug for BlockTimestamp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.to_eos_string().as_str())
+    }
+}
+
+impl Default for BlockTimestamp {
+    fn default() -> Self {
+        BlockTimestamp::min()
+    }
+}
+
+impl PartialEq for BlockTimestamp {
+    fn eq(&self, other: &Self) -> bool {
+        self.slot() == other.slot()
+    }
+}
+
+impl Eq for BlockTimestamp {}

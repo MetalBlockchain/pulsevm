@@ -2,7 +2,7 @@ use pulsevm_proc_macros::{NumBytes, Read, Write};
 
 use crate::chain::{Name, block::BlockTimestamp};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Read, Write, NumBytes)]
+#[derive(Debug, Clone, Default, Read, Write, NumBytes)]
 pub struct Account {
     pub name: Name,
     pub creation_date: BlockTimestamp,

@@ -1,6 +1,9 @@
 use cxx::{SharedPtr, UniquePtr};
 
-use crate::{TimePoint, types::ffi::{Digest, SharedBlob}};
+use crate::{
+    BlockTimestamp, TimePoint,
+    types::ffi::{Digest, SharedBlob},
+};
 
 #[cxx::bridge(namespace = "pulsevm::chain")]
 pub mod ffi {
@@ -20,15 +23,25 @@ pub mod ffi {
         #[cxx_name = "block_timestamp_type"]
         type BlockTimestamp;
         pub fn to_time_point(self: &BlockTimestamp) -> SharedPtr<TimePoint>;
+        pub fn get_slot(self: &BlockTimestamp) -> u32;
 
         #[cxx_name = "time_point"]
         type TimePoint;
+        pub fn time_since_epoch(self: &TimePoint) -> &Microseconds;
+        pub fn sec_since_epoch(self: &TimePoint) -> u32;
+
+        #[cxx_name = "microseconds"]
+        type Microseconds;
+        pub fn count(self: &Microseconds) -> i64;
 
         // Global functions
         pub fn make_empty_digest() -> UniquePtr<Digest>;
         pub fn make_digest_from_data(data: &[u8]) -> UniquePtr<Digest>;
         pub fn make_time_point_from_now() -> SharedPtr<TimePoint>;
         pub fn make_block_timestamp_from_now() -> SharedPtr<BlockTimestamp>;
+        pub fn make_block_timestamp_from_slot(slot: u32) -> SharedPtr<BlockTimestamp>;
+        pub fn make_time_point_from_i64(us: i64) -> SharedPtr<TimePoint>;
+        pub fn make_time_point_from_microseconds(us: &Microseconds) -> SharedPtr<TimePoint>;
     }
 }
 
@@ -63,7 +76,21 @@ impl SharedBlob {
 }
 
 impl TimePoint {
+    pub fn new(microseconds: i64) -> SharedPtr<TimePoint> {
+        ffi::make_time_point_from_i64(microseconds)
+    }
+
     pub fn now() -> SharedPtr<TimePoint> {
         ffi::make_time_point_from_now()
+    }
+}
+
+impl BlockTimestamp {
+    pub fn now() -> SharedPtr<BlockTimestamp> {
+        ffi::make_block_timestamp_from_now()
+    }
+
+    pub fn from_slot(slot: u32) -> SharedPtr<BlockTimestamp> {
+        ffi::make_block_timestamp_from_slot(slot)
     }
 }

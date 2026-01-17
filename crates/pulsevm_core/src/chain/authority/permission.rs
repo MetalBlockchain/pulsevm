@@ -48,7 +48,12 @@ impl Permission {
         }
 
         // Walk up other's parent tree, seeing if we find this permission. If so, this permission satisfies other
-        let mut parent = db.find_permission(other.parent as i64)?;
+        let parent = db.find_permission(other.parent as i64)?;
+        let mut parent = if parent.is_null() {
+            None
+        } else {
+            unsafe { Some(&*parent) }
+        };
 
         while let Some(parent_obj) = parent {
             if self.id == parent_obj.get_id() as u64 {
@@ -56,7 +61,12 @@ impl Permission {
             } else if parent_obj.get_id() == 0 {
                 return Ok(false);
             }
-            parent = db.find_permission(parent_obj.get_parent_id() as i64)?;
+            let other_parent = db.find_permission(parent_obj.get_parent_id() as i64)?;
+            parent = if other_parent.is_null() {
+                None
+            } else {
+                unsafe { Some(&*other_parent) }
+            };
         }
 
         // This permission is not a parent of other, and so does not satisfy other

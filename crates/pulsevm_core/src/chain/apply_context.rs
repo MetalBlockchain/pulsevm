@@ -8,13 +8,12 @@ use chrono::Utc;
 use cxx::SharedPtr;
 use pulsevm_crypto::Bytes;
 use pulsevm_error::ChainError;
-use pulsevm_ffi::{Database, KeyValue, KeyValueIteratorCache, Table};
+use pulsevm_ffi::{AccountMetadata, Database, KeyValue, KeyValueIteratorCache, Table};
 use spdlog::info;
 
 use crate::{
     CODE_NAME,
     chain::{
-        account::{Account, AccountMetadata},
         authority::PermissionLevel,
         authorization_manager::AuthorizationManager,
         block::BlockTimestamp,
@@ -102,7 +101,7 @@ impl ApplyContext {
             let mut inner = self.inner.write()?;
             inner
                 .notified
-                .push_back((self.receiver, self.action_ordinal));
+                .push_back((self.receiver.clone(), self.action_ordinal));
         }
 
         cpu_used += self.exec_one()?;
@@ -139,12 +138,12 @@ impl ApplyContext {
     }
 
     pub fn exec_one(&mut self) -> Result<u64, ChainError> {
-        let mut receiver_account = self.get_account_metadata(&self.receiver)?;
+        let receiver_account = unsafe { &*self.db.get_account_metadata(self.receiver.as_ref())? };
         let cpu_used = 100; // Base usage is always 100 instructions
 
         {
             let mut inner = self.inner.write()?;
-            inner.privileged = receiver_account.privileged;
+            inner.privileged = receiver_account.is_privileged();
         }
 
         let native = Controller::find_apply_handler(
@@ -157,15 +156,15 @@ impl ApplyContext {
         }
 
         // Refresh the receiver account metadata
-        receiver_account = self.get_account_metadata(&self.receiver)?;
+        let receiver_account = unsafe { &*self.db.get_account_metadata(self.receiver.as_ref())? };
 
         // Does the receiver account have a contract deployed?
-        if receiver_account.code_hash != Id::zero() {
+        if !receiver_account.get_code_hash().empty() {
             self.wasm_runtime.run(
                 self.receiver.clone(),
                 self.action.clone(),
                 self.clone(),
-                receiver_account.code_hash,
+                receiver_account.get_code_hash(),
             )?;
         }
 
@@ -176,16 +175,20 @@ impl ApplyContext {
         let first_receiver_account = if self.action.account() == &self.receiver {
             receiver_account.clone()
         } else {
-            self.get_account_metadata(self.action.account())?
+            unsafe {
+                &*self
+                    .db
+                    .get_account_metadata(self.action.account().as_ref())?
+            }
         };
         let mut receipt = ActionReceipt::new(
             self.receiver,
             act_digest,
             self.next_global_sequence()?,
-            self.next_recv_sequence(&mut receiver_account)?,
+            self.next_recv_sequence(&receiver_account)?,
             HashMap::new(),
-            first_receiver_account.code_sequence,
-            first_receiver_account.abi_sequence,
+            first_receiver_account.get_code_sequence() as u32,
+            first_receiver_account.get_abi_sequence() as u32,
         );
 
         for auth in self.action.clone().authorization().iter() {
@@ -286,17 +289,17 @@ impl ApplyContext {
     }
 
     pub fn is_account(&self, account: &Name) -> Result<bool, ChainError> {
-        self.db.is_account(account)
+        self.db.is_account(account.as_ref())
     }
 
     pub fn execute_inline(&mut self, a: &Action) -> Result<(), ChainError> {
-        let send_to_self = a.account() == self.receiver;
-        let inherit_parent_authorizations = send_to_self && self.receiver == self.action.account();
+        let send_to_self = a.account() == &self.receiver;
+        let inherit_parent_authorizations = send_to_self && &self.receiver == self.action.account();
 
         {
-            let code = self.session.find::<Account>(a.account())?;
+            let code = self.db.find_account(a.account().as_ref())?;
             pulse_assert(
-                code.is_some(),
+                !code.is_null(),
                 ChainError::TransactionError(format!(
                     "inline action's code account {} does not exist",
                     a.account()
@@ -306,16 +309,16 @@ impl ApplyContext {
             let mut inherited_authorizations: HashSet<PermissionLevel> = HashSet::new();
 
             for auth in a.authorization() {
-                let actor = self.session.find::<Account>(auth.actor)?;
+                let actor = self.db.find_account(auth.actor.as_ref())?;
                 pulse_assert(
-                    actor.is_some(),
+                    !actor.is_null(),
                     ChainError::TransactionError(format!(
                         "inline action's authorizing actor {} does not exist",
                         auth.actor
                     )),
                 )?;
                 pulse_assert(
-                    AuthorizationManager::find_permission(&mut self.session, auth)?.is_some(),
+                    AuthorizationManager::find_permission(&mut self.db, auth)?.is_some(),
                     ChainError::TransactionError(format!(
                         "inline action's authorizations include a non-existent permission: {}",
                         auth
@@ -330,13 +333,13 @@ impl ApplyContext {
             }
 
             let mut provided_permissions = HashSet::new();
-            provided_permissions.insert(PermissionLevel::new(self.receiver, CODE_NAME));
+            provided_permissions.insert(PermissionLevel::new(self.receiver, CODE_NAME.into()));
             let inner = self.inner.read()?;
 
             if !inner.privileged {
                 AuthorizationManager::check_authorization(
                     &self.chain_config,
-                    &mut self.session,
+                    &mut self.db,
                     &vec![a.clone()],
                     &HashSet::new(),       // No provided keys
                     &provided_permissions, // Default permission level
@@ -401,10 +404,13 @@ impl ApplyContext {
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
 
-        match self
-            .db
-            .db_find_i64(code, scope, table, id, &mut inner.keyval_cache)
-        {
+        match self.db.db_find_i64(
+            code.as_ref(),
+            scope.as_ref(),
+            table.as_ref(),
+            id,
+            &mut inner.keyval_cache,
+        ) {
             Ok(itr) => Ok(itr),
             Err(e) => Err(ChainError::DatabaseError(format!(
                 "failed to find i64 in db: {}",
@@ -421,7 +427,8 @@ impl ApplyContext {
         primary_key: u64,
         data: Bytes,
     ) -> Result<i32, ChainError> {
-        let table = self.find_or_create_table(&self.receiver, scope, table, payer)?;
+        let table = self.find_or_create_table(&self.receiver.clone(), scope, table, payer)?;
+        let table = unsafe { &*table };
         pulse_assert(
             !payer.empty(),
             ChainError::TransactionError(format!(
@@ -429,10 +436,14 @@ impl ApplyContext {
             )),
         )?;
 
-        let inner = self.inner.write()?;
-        let obj = self
-            .db
-            .create_key_value_object(table, payer, primary_key, &data.0.as_slice())?;
+        let mut inner = self.inner.write()?;
+        let obj = self.db.create_key_value_object(
+            table,
+            payer.as_ref(),
+            primary_key,
+            &data.0.as_slice(),
+        )?;
+        let obj = unsafe { &*obj };
 
         let billable_size = data.len() as i64 + billable_size_v::<KeyValue>() as i64;
         self.update_db_usage(payer, billable_size)?;
@@ -452,7 +463,7 @@ impl ApplyContext {
 
         let table_obj = inner.keyval_cache.get_table(obj.get_table_id())?;
         pulse_assert(
-            table_obj.get_code() == &self.receiver,
+            table_obj.get_code().to_uint64_t() == self.receiver.as_u64(),
             ChainError::TransactionError(format!("db access violation",)),
         )?;
 
@@ -463,7 +474,7 @@ impl ApplyContext {
         let payer = if payer.empty() {
             obj.get_payer()
         } else {
-            payer
+            payer.as_ref()
         };
 
         if obj.get_payer() != payer {
@@ -701,13 +712,14 @@ impl ApplyContext {
         }
     }
 
-    pub fn find_table(&mut self, code: &Name, scope: &Name, table: &Name) -> Option<&Table> {
-        let table = self.db.get_table(code, scope, table);
-
-        match table {
-            Ok(table) => Some(table),
-            Err(_) => None,
-        }
+    pub fn find_table(
+        &mut self,
+        code: &Name,
+        scope: &Name,
+        table: &Name,
+    ) -> Result<*const Table, ChainError> {
+        self.db
+            .get_table(code.as_ref(), scope.as_ref(), table.as_ref())
     }
 
     pub fn find_or_create_table(
@@ -716,23 +728,27 @@ impl ApplyContext {
         scope: &Name,
         table_name: &Name,
         payer: &Name,
-    ) -> Result<&Table, ChainError> {
-        let table = self.find_table(code, scope, table_name);
+    ) -> Result<*const Table, ChainError> {
+        let table = self.find_table(code, scope, table_name)?;
 
-        match table {
-            Some(table) => Ok(table),
-            None => {
-                self.update_db_usage(payer, billable_size_v::<Table>() as i64)?;
+        if table.is_null() {
+            self.update_db_usage(payer, billable_size_v::<Table>() as i64)?;
 
-                let table = self
-                    .db
-                    .create_table(code, scope, table_name, payer)
-                    .map_err(|e| {
-                        ChainError::TransactionError(format!("failed to create table: {}", e))
-                    })?;
+            let table = self
+                .db
+                .create_table(
+                    code.as_ref(),
+                    scope.as_ref(),
+                    table_name.as_ref(),
+                    payer.as_ref(),
+                )
+                .map_err(|e| {
+                    ChainError::TransactionError(format!("failed to create table: {}", e))
+                })?;
 
-                Ok(table)
-            }
+            Ok(table)
+        } else {
+            Ok(table)
         }
     }
 
@@ -740,20 +756,6 @@ impl ApplyContext {
         self.update_db_usage(table.get_payer(), -(billable_size_v::<Table>() as i64))?;
         self.db.remove_table(table)?;
         Ok(())
-    }
-
-    pub fn get_account_metadata(&mut self, account: &Name) -> Result<AccountMetadata, ChainError> {
-        let res = self.session.find::<AccountMetadata>(account).map_err(|e| {
-            ChainError::TransactionError(format!("failed to get account metadata: {}", e))
-        })?;
-
-        match res {
-            Some(account_metadata) => Ok(account_metadata),
-            None => Err(ChainError::TransactionError(format!(
-                "account metadata not found for account: {}",
-                account
-            ))),
-        }
     }
 
     pub fn update_db_usage(&mut self, payer: &Name, delta: i64) -> Result<(), ChainError> {
@@ -782,42 +784,23 @@ impl ApplyContext {
 
     pub fn next_recv_sequence(
         &mut self,
-        receiver_account: &mut AccountMetadata,
+        receiver_account: &AccountMetadata,
     ) -> Result<u64, ChainError> {
-        let next_sequence = receiver_account.recv_sequence + 1;
-        self.session.modify(receiver_account, |am| {
-            am.recv_sequence = next_sequence;
-            Ok(())
-        })?;
-
-        Ok(next_sequence)
+        self.db.next_recv_sequence(receiver_account).map_err(|e| {
+            ChainError::InternalError(Some(format!("failed to get next recv sequence: {}", e)))
+        })
     }
 
     pub fn next_auth_sequence(&mut self, actor: &Name) -> Result<u64, ChainError> {
-        let mut amo = self.get_account_metadata(*actor)?;
-        let next_sequence = amo.auth_sequence + 1;
-        self.session.modify(&mut amo, |amo| {
-            amo.auth_sequence = next_sequence;
-            Ok(())
-        })?;
-
-        Ok(next_sequence)
+        self.db.next_auth_sequence(actor.as_ref()).map_err(|e| {
+            ChainError::InternalError(Some(format!("failed to get next auth sequence: {}", e)))
+        })
     }
 
     pub fn next_global_sequence(&mut self) -> Result<u64, ChainError> {
-        let dgpo = self.session.find::<DynamicGlobalPropertyObject>(0)?;
-
-        if let Some(mut dgpo) = dgpo {
-            let next_sequence = dgpo.global_action_sequence + 1;
-            self.session.modify(&mut dgpo, |dgpo| {
-                dgpo.global_action_sequence = next_sequence;
-                Ok(())
-            })?;
-            return Ok(next_sequence);
-        } else {
-            self.session.insert(&DynamicGlobalPropertyObject::new(1))?;
-            return Ok(1);
-        }
+        self.db.next_global_sequence().map_err(|e| {
+            ChainError::InternalError(Some(format!("failed to get next global sequence: {}", e)))
+        })
     }
 
     pub fn is_privileged(&self) -> Result<bool, ChainError> {
@@ -825,18 +808,17 @@ impl ApplyContext {
         Ok(inner.privileged)
     }
 
-    pub fn set_privileged(&mut self, account: Name, is_privileged: bool) -> Result<(), ChainError> {
-        let mut account = self.get_account_metadata(account)?;
-        self.session.modify(&mut account, |acc| {
-            acc.set_privileged(is_privileged);
-            Ok(())
-        })?;
-
+    pub fn set_privileged(
+        &mut self,
+        account: &Name,
+        is_privileged: bool,
+    ) -> Result<(), ChainError> {
+        self.db.set_privileged(account.as_ref(), is_privileged)?;
         Ok(())
     }
 
-    pub fn pending_block_timestamp(&self) -> BlockTimestamp {
-        self.pending_block_timestamp
+    pub fn pending_block_timestamp(&self) -> &BlockTimestamp {
+        &self.pending_block_timestamp
     }
 
     pub fn account_ram_deltas(&self) -> Result<HashMap<Name, i64>, ChainError> {

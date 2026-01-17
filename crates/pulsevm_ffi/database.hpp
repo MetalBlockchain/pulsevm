@@ -9,6 +9,7 @@
 #include <pulsevm/chain/resource_limits_private.hpp>
 #include <pulsevm/chain/account_object.hpp>
 #include <pulsevm/chain/permission_link_object.hpp>
+#include <pulsevm/chain/global_property_object.hpp>
 #include "iterator_cache.hpp"
 #include "objects.hpp"
 #include <memory>
@@ -63,6 +64,13 @@ public:
 
     const account_metadata_object* find_account_metadata(const name& account ) const {
         return this->find<account_metadata_object, by_name>(account);
+    }
+
+    void set_privileged( const name& n, bool is_priv ) {
+        const auto& a = this->get<account_metadata_object, by_name>( n );
+        this->modify( a, [&]( auto& ma ){
+            ma.set_privileged( is_priv );
+        });
     }
 
     void initialize_resource_limits() {
@@ -473,9 +481,9 @@ public:
         return this->find<permission_object, by_id>( permission_object::id_type( id ) );
     }
 
-    const permission_object& get_permission_by_actor_and_permission( const name& actor, const name& permission ) const {
+    const permission_object* find_permission_by_actor_and_permission( const name& actor, const name& permission ) const {
         EOS_ASSERT( !actor.empty() && !permission.empty(), invalid_permission, "Invalid permission" );
-        return this->get<permission_object, by_owner>( boost::make_tuple(actor, permission) );
+        return this->find<permission_object, by_owner>( boost::make_tuple(actor, permission) );
     }
 
     void unlink_account_code(
@@ -527,12 +535,142 @@ public:
         });
     }
 
+    void update_account_abi(
+        const account_object& account,
+        const account_metadata_object& account_metadata,
+        rust::Slice<const std::uint8_t> abi
+    ) {
+        this->modify( account_metadata, [&]( auto& a ) {
+            a.abi_sequence += 1;
+        });
+
+        this->modify( account, [&]( auto& a ) {
+            a.abi.assign(abi.data(), abi.size());
+        });
+    }
+
     const code_object& get_code_object_by_hash(
         const digest_type& code_hash,
         uint8_t vm_type,
         uint8_t vm_version
     ) const {
         return this->get<code_object, by_code_hash>( boost::make_tuple(code_hash, vm_type, vm_version) );
+    }
+
+    int64_t delete_auth(const name& account, const name& permission_name) {
+        { // Check for links to this permission
+            const auto& index = this->get_index<permission_link_index, by_permission_name>();
+            auto range = index.equal_range(boost::make_tuple(account, permission_name));
+            EOS_ASSERT(range.first == range.second, action_validate_exception,
+                        "Cannot delete a linked authority. Unlink the authority first. This authority is linked to ${code}::${type}.",
+                        ("code", range.first->code)("type", range.first->message_type));
+        }
+
+        const auto& permission = this->get_permission({account, permission_name});
+        int64_t old_size = config::billable_size_v<permission_object> + permission.auth.get_billable_size();
+
+        this->remove_permission( permission );
+
+        return old_size;
+    }
+
+    int64_t link_auth( const name& account_name, const name& code_name, const name& requirement_name, const name& requirement_type ) {
+        const auto *account = this->find<account_object, by_name>(account_name);
+        EOS_ASSERT(account != nullptr, account_query_exception, "Failed to retrieve account: ${account}", ("account", account_name));
+        const auto *code = this->find<account_object, by_name>(code_name);
+        EOS_ASSERT(code != nullptr, account_query_exception, "Failed to retrieve code for account: ${account}", ("account", code_name));
+
+        if( requirement_name != config::any_name ) {
+            const permission_object* permission = this->find<permission_object, by_owner>(
+                boost::make_tuple( account_name, requirement_name )
+            );
+
+            EOS_ASSERT(permission != nullptr, permission_query_exception, "Failed to retrieve permission: ${permission}", ("permission", requirement_name));
+        }
+
+        auto link_key = boost::make_tuple(account_name, code_name, requirement_type);
+        auto link = this->find<permission_link_object, by_action_name>(link_key);
+
+        if( link ) {
+            EOS_ASSERT(link->required_permission != requirement_name, action_validate_exception, "Attempting to update required authority, but new requirement is same as old");
+            this->modify(*link, [requirement = requirement_name](permission_link_object& link) {
+                link.required_permission = requirement;
+            });
+        } else {
+            const auto& l =  this->create<permission_link_object>([&requirement_name, &account_name, &code_name, &requirement_type](permission_link_object& link) {
+                link.account = account_name;
+                link.code = code_name;
+                link.message_type = requirement_type;
+                link.required_permission = requirement_name;
+            });
+
+            return (int64_t)(config::billable_size_v<permission_link_object>);
+        }
+
+        return 0;
+    }
+
+    int64_t unlink_auth( const name& account_name, const name& code_name, const name& requirement_type ) {
+        auto link_key = boost::make_tuple(account_name, code_name, requirement_type);
+        auto link = this->find<permission_link_object, by_action_name>(link_key);
+
+        EOS_ASSERT(link != nullptr, action_validate_exception, "No authority link found for ${account} to ${code}::${type}",
+                    ("account", account_name)("code", code_name)("type", requirement_type));
+
+        this->remove(*link);
+
+        return -(int64_t)(config::billable_size_v<permission_link_object>);
+    }
+
+    void remove_permission( const permission_object& permission ) {
+        const auto& index = this->get_index<permission_index, by_parent>();
+        auto range = index.equal_range(permission.id);
+        EOS_ASSERT( range.first == range.second, action_validate_exception,
+                    "Cannot remove a permission which has children. Remove the children first.");
+
+        this->get_mutable_index<permission_usage_index>().remove_object( permission.usage_id._id );
+        this->remove( permission );
+    }
+
+    const permission_object& get_permission( const permission_level& level ) const { 
+        try {
+            EOS_ASSERT( !level.actor.empty() && !level.permission.empty(), invalid_permission, "Invalid permission" );
+            return this->get<permission_object, by_owner>( boost::make_tuple(level.actor,level.permission) );
+        } EOS_RETHROW_EXCEPTIONS( chain::permission_query_exception, "Failed to retrieve permission: ${level}", ("level", level) ) 
+    }
+
+    const dynamic_global_property_object& get_dynamic_global_properties() const {
+        return this->get<dynamic_global_property_object>();
+    }
+
+    const global_property_object& get_global_properties() const {
+        return this->get<global_property_object>();
+    }
+
+    uint64_t next_recv_sequence( const account_metadata_object& receiver_account ) {
+        this->modify( receiver_account, [&]( auto& ra ) {
+            ++ra.recv_sequence;
+        });
+        
+        return receiver_account.recv_sequence;
+    }
+
+    uint64_t next_auth_sequence( const account_name& actor ) {
+        const auto& amo = this->get<account_metadata_object,by_name>( actor );
+        this->modify( amo, [&](auto& am ){
+            ++am.auth_sequence;
+        });
+        return amo.auth_sequence;
+    }
+
+    uint64_t next_global_sequence() {
+        const auto& p = this->get_dynamic_global_properties();
+        
+        this->modify( p, [&]( auto& dgp ) {
+            ++dgp.global_action_sequence;
+        });
+
+        return p.global_action_sequence;
     }
 
     std::unique_ptr<chainbase::database::session> create_undo_session(bool enabled) {
@@ -551,7 +689,7 @@ int64_t revision(const ::chainbase::database& db);
 enum class DatabaseOpenFlags : uint32_t;
 
 // Bridge function to open database
-std::shared_ptr<database_wrapper> open_database(
+std::unique_ptr<database_wrapper> open_database(
     rust::Str path,
     DatabaseOpenFlags flags,
     uint64_t size

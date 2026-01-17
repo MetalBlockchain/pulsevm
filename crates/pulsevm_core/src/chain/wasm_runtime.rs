@@ -5,6 +5,7 @@ use std::{
 
 use lru::LruCache;
 use pulsevm_crypto::Bytes;
+use pulsevm_ffi::Digest;
 use wasmer::{Engine, Function, FunctionEnv, Instance, Memory, Module, Store, imports};
 
 use wasmer_compiler_llvm::LLVM;
@@ -116,7 +117,7 @@ impl WasmRuntime {
         receiver: Name,
         action: Action,
         apply_context: ApplyContext,
-        code_hash: Id,
+        code_hash: &Digest,
     ) -> Result<(), ChainError> {
         // Pause timer
         apply_context.pause_billing_timer()?;

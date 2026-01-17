@@ -109,8 +109,8 @@ impl SignedBlock {
         self.signed_block_header.block.block_num()
     }
 
-    pub fn timestamp(&self) -> BlockTimestamp {
-        self.signed_block_header.block.timestamp
+    pub fn timestamp(&self) -> &BlockTimestamp {
+        &self.signed_block_header.block.timestamp
     }
 }
 

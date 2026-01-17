@@ -93,6 +93,10 @@ if(${CMAKE_SYSTEM_NAME} STREQUAL "FreeBSD")
   target_compile_definitions(chainbase PUBLIC BOOST_INTERPROCESS_FORCE_GENERIC_EMULATION)
 endif()
 
+enable_testing()
+add_subdirectory( test )
+add_subdirectory( benchmark )
+
 if(CHAINBASE_INSTALL_COMPONENT)
    set(INSTALL_COMPONENT_ARGS COMPONENT ${CHAINBASE_INSTALL_COMPONENT} EXCLUDE_FROM_ALL)
 endif()

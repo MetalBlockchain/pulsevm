@@ -31,12 +31,12 @@ pub mod ffi {
             path: &str,
             flags: DatabaseOpenFlags,
             size: u64,
-        ) -> SharedPtr<Database>;
+        ) -> UniquePtr<Database>;
 
         #[cxx_name = "undo_session"]
         type UndoSession;
         #[cxx_name = "account_object"]
-        type Account;
+        type Account = crate::objects::ffi::Account;
         #[cxx_name = "account_metadata_object"]
         type AccountMetadata = crate::objects::ffi::AccountMetadata;
         #[cxx_name = "code_object"]
@@ -88,6 +88,11 @@ pub mod ffi {
             self: &Database,
             account_name: &Name,
         ) -> Result<*const AccountMetadata>;
+        pub fn set_privileged(
+            self: Pin<&mut Database>,
+            account: &Name,
+            is_privileged: bool,
+        ) -> Result<()>;
         pub fn unlink_account_code(
             self: Pin<&mut Database>,
             old_code_entry: &CodeObject,
@@ -101,6 +106,12 @@ pub mod ffi {
             code_hash: &Digest,
             vm_type: u8,
             vm_version: u8,
+        ) -> Result<()>;
+        pub fn update_account_abi(
+            self: Pin<&mut Database>,
+            account: &Account,
+            account_metadata: &AccountMetadata,
+            abi: &[u8],
         ) -> Result<()>;
 
         // Code object methods
@@ -208,11 +219,36 @@ pub mod ffi {
 
         // Permission methods
         pub fn find_permission(self: &Database, id: i64) -> Result<*const PermissionObject>;
-        pub fn get_permission_by_actor_and_permission(
+        pub fn find_permission_by_actor_and_permission(
             self: &Database,
             actor: &Name,
             permission: &Name,
-        ) -> Result<&PermissionObject>;
+        ) -> Result<*const PermissionObject>;
+        pub fn delete_auth(
+            self: Pin<&mut Database>,
+            account: &Name,
+            permission_name: &Name,
+        ) -> Result<i64>;
+        pub fn link_auth(
+            self: Pin<&mut Database>,
+            account_name: &Name,
+            code_name: &Name,
+            requirement_name: &Name,
+            requirement_type: &Name,
+        ) -> Result<i64>;
+        pub fn unlink_auth(
+            self: Pin<&mut Database>,
+            account_name: &Name,
+            code_name: &Name,
+            requirement_type: &Name,
+        ) -> Result<i64>;
+
+        pub fn next_recv_sequence(
+            self: Pin<&mut Database>,
+            receiver_account: &AccountMetadata,
+        ) -> Result<u64>;
+        pub fn next_auth_sequence(self: Pin<&mut Database>, actor: &Name) -> Result<u64>;
+        pub fn next_global_sequence(self: Pin<&mut Database>) -> Result<u64>;
 
         // Methods on undo_session
         pub fn push(self: Pin<&mut UndoSession>) -> Result<()>;
