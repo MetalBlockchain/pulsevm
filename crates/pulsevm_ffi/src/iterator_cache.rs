@@ -29,7 +29,7 @@ pub mod ffi {
             self: &KeyValueIteratorCache,
             ei: i32,
         ) -> Result<*const Table>;
-        pub fn get(self: Pin<&mut KeyValueIteratorCache>, iterator: i32) -> Result<&KeyValue>;
+        pub fn get(self: &KeyValueIteratorCache, iterator: i32) -> Result<&KeyValue>;
         pub fn remove(self: Pin<&mut KeyValueIteratorCache>, iterator: i32) -> Result<()>;
         pub fn add(self: Pin<&mut KeyValueIteratorCache>, obj: &KeyValue) -> Result<i32>;
     }
@@ -80,9 +80,8 @@ impl KeyValueIteratorCache {
         }
     }
 
-    pub fn get(&mut self, id: i32) -> Result<&KeyValue, ChainError> {
+    pub fn get(&self, id: i32) -> Result<&KeyValue, ChainError> {
         self.inner
-            .pin_mut()
             .get(id)
             .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
     }

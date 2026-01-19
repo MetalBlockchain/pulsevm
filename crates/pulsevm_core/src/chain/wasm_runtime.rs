@@ -5,6 +5,7 @@ use std::{
 
 use lru::LruCache;
 use pulsevm_crypto::Bytes;
+use pulsevm_error::ChainError;
 use pulsevm_ffi::Digest;
 use wasmer::{Engine, Function, FunctionEnv, Instance, Memory, Module, Store, imports};
 
@@ -29,7 +30,6 @@ use crate::{
 };
 
 use super::{
-    error::ChainError,
     webassembly::{
         action_data_size, current_receiver, has_auth, is_account, require_auth, send_inline,
     },
@@ -127,8 +127,6 @@ impl WasmRuntime {
 
         // Different scope so session is released before running the wasm code.
         {
-            let session = apply_context.undo_session();
-
             if !inner.code_cache.contains(&code_hash) {
                 let code_object = session.get::<CodeObject>(code_hash).map_err(|e| {
                     ChainError::WasmRuntimeError(format!("failed to get wasm code: {}", e))
@@ -145,7 +143,7 @@ impl WasmRuntime {
         let wasm_context = WasmContext::new(
             receiver,
             action.clone(),
-            apply_context.pending_block_timestamp(),
+            apply_context.pending_block_timestamp().clone(),
             apply_context.clone(),
         );
         let env = FunctionEnv::new(&mut store, wasm_context);

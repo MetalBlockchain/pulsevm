@@ -59,6 +59,10 @@ pub mod ffi {
         type Digest = crate::types::ffi::Digest;
         #[cxx_name = "time_point"]
         type TimePoint = crate::types::ffi::TimePoint;
+        #[cxx_name = "authority"]
+        type Authority = crate::types::ffi::Authority;
+        #[cxx_name = "shared_authority"]
+        type SharedAuthority = crate::types::ffi::SharedAuthority;
 
         // Methods on database
         pub fn flush(self: Pin<&mut Database>);
@@ -78,7 +82,6 @@ pub mod ffi {
             creation_date: u32,
         ) -> Result<&Account>;
         pub fn find_account(self: &Database, account_name: &Name) -> Result<*const Account>;
-        pub fn get_account(self: &Database, account_name: &Name) -> Result<&Account>;
         pub fn create_account_metadata(
             self: Pin<&mut Database>,
             account_name: &Name,
@@ -206,11 +209,6 @@ pub mod ffi {
             payer: &Name,
             buffer: &[u8],
         ) -> Result<()>;
-        pub fn remove_key_value_object(
-            self: Pin<&mut Database>,
-            obj: &KeyValue,
-            table_obj: &Table,
-        ) -> Result<()>;
         pub fn remove_table(self: Pin<&mut Database>, table: &Table) -> Result<()>;
 
         // Account methods
@@ -249,6 +247,66 @@ pub mod ffi {
         ) -> Result<u64>;
         pub fn next_auth_sequence(self: Pin<&mut Database>, actor: &Name) -> Result<u64>;
         pub fn next_global_sequence(self: Pin<&mut Database>) -> Result<u64>;
+
+        pub fn db_remove_i64(
+            self: Pin<&mut Database>,
+            keyval_cache: Pin<&mut KeyValueIteratorCache>,
+            iterator: i32,
+            receiver: &Name,
+        ) -> Result<i64>;
+        pub fn db_next_i64(
+            self: Pin<&mut Database>,
+            keyval_cache: Pin<&mut KeyValueIteratorCache>,
+            iterator: i32,
+            primary: &mut u64,
+        ) -> Result<i32>;
+        pub fn db_previous_i64(
+            self: Pin<&mut Database>,
+            keyval_cache: Pin<&mut KeyValueIteratorCache>,
+            iterator: i32,
+            primary: &mut u64,
+        ) -> Result<i32>;
+        pub fn db_end_i64(
+            self: Pin<&mut Database>,
+            keyval_cache: Pin<&mut KeyValueIteratorCache>,
+            code: &Name,
+            scope: &Name,
+            table: &Name,
+        ) -> Result<i32>;
+        pub fn db_lowerbound_i64(
+            self: Pin<&mut Database>,
+            keyval_cache: Pin<&mut KeyValueIteratorCache>,
+            code: &Name,
+            scope: &Name,
+            table: &Name,
+            id: u64,
+        ) -> Result<i32>;
+        pub fn db_upperbound_i64(
+            self: Pin<&mut Database>,
+            keyval_cache: Pin<&mut KeyValueIteratorCache>,
+            code: &Name,
+            scope: &Name,
+            table: &Name,
+            id: u64,
+        ) -> Result<i32>;
+        pub fn remove_permission(
+            self: Pin<&mut Database>,
+            permission: &PermissionObject,
+        ) -> Result<()>;
+        pub fn create_permission(
+            self: Pin<&mut Database>,
+            account: &Name,
+            name: &Name,
+            parent: u64,
+            auth: &Authority,
+            creation_time: &TimePoint,
+        ) -> Result<&PermissionObject>;
+        pub fn modify_permission(
+            self: Pin<&mut Database>,
+            permission: &PermissionObject,
+            authority: &Authority,
+            pending_block_time: &TimePoint,
+        ) -> Result<()>;
 
         // Methods on undo_session
         pub fn push(self: Pin<&mut UndoSession>) -> Result<()>;

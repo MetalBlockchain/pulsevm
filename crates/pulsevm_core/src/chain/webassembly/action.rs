@@ -3,7 +3,7 @@ use wasmer::{FunctionEnvMut, RuntimeError, WasmPtr};
 use crate::{
     apply_context::ApplyContext,
     chain::{
-        controller::Controller, error::ChainError, utils::pulse_assert, wasm_runtime::WasmContext,
+        controller::Controller, utils::pulse_assert, wasm_runtime::WasmContext,
     },
 };
 

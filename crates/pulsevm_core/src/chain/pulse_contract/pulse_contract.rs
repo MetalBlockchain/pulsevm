@@ -1,5 +1,5 @@
 use pulsevm_error::ChainError;
-use pulsevm_ffi::{Database, Digest};
+use pulsevm_ffi::{Database, Digest, u64_to_name};
 use pulsevm_serialization::Write;
 
 use crate::{
@@ -77,20 +77,20 @@ pub fn newaccount(context: &mut ApplyContext, db: &mut Database) -> Result<(), C
 
     let owner_permission = AuthorizationManager::create_permission(
         db,
-        create.name,
-        OWNER_NAME.into(),
+        &create.name,
+        &OWNER_NAME.into(),
         0,
-        create.owner,
+        &create.owner,
     )?;
     let active_permission = AuthorizationManager::create_permission(
         db,
-        create.name,
-        ACTIVE_NAME.into(),
+        &create.name,
+        &ACTIVE_NAME.into(),
         owner_permission.id(),
-        create.active,
+        &create.active,
     )?;
 
-    ResourceLimitsManager::initialize_account(db, create.name.as_ref())?;
+    ResourceLimitsManager::initialize_account(db, &create.name)?;
 
     let mut ram_delta: i64 = config::OVERHEAD_PER_ACCOUNT_RAM_BYTES as i64;
     ram_delta += 2 * config::billable_size_v::<Permission>() as i64;
@@ -282,16 +282,15 @@ pub fn updateauth(context: &mut ApplyContext, db: &mut Database) -> Result<(), C
         let new_size: i64 = config::billable_size_v::<Permission>() as i64
             + permission.authority.get_billable_size() as i64;
 
-        context.add_ram_usage(permission.owner, new_size - old_size);
+        context.add_ram_usage(&permission.owner, new_size - old_size);
     } else {
         let p = AuthorizationManager::create_permission(
             db,
-            update.account,
-            update.permission,
+            &update.account,
+            &update.permission,
             parent_id,
-            update.auth,
+            &update.auth,
         )?;
-
         let new_size: i64 =
             config::billable_size_v::<Permission>() as i64 + p.authority.get_billable_size() as i64;
 

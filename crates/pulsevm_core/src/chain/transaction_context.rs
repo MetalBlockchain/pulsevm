@@ -4,6 +4,7 @@ use std::{
 };
 
 use pulsevm_error::ChainError;
+use pulsevm_ffi::Database;
 use pulsevm_serialization::VarUint32;
 use pulsevm_time::{Microseconds, TimePoint};
 
@@ -47,6 +48,7 @@ struct TransactionContextInner {
 
 #[derive(Clone)]
 pub struct TransactionContext {
+    db: Database,
     chain_config: Arc<ChainConfig>,
     wasm_runtime: WasmRuntime,
     inner: Arc<RwLock<TransactionContextInner>>,
@@ -54,6 +56,7 @@ pub struct TransactionContext {
 
 impl TransactionContext {
     pub fn new(
+        db: Database,
         chain_config: Arc<ChainConfig>,
         wasm_runtime: WasmRuntime,
         block_num: u32,
@@ -63,9 +66,10 @@ impl TransactionContext {
         let mut trace = TransactionTrace::default();
         trace.id = *transaction_id;
         trace.block_num = block_num;
-        trace.block_time = pending_block_timestamp;
+        trace.block_time = pending_block_timestamp.clone();
 
         Self {
+            db,
             chain_config,
             wasm_runtime,
             inner: Arc::new(RwLock::new(TransactionContextInner {
@@ -177,7 +181,7 @@ impl TransactionContext {
             (
                 inner.trace.id,
                 inner.trace.block_num,
-                inner.trace.block_time,
+                inner.trace.block_time.clone(),
             )
         };
         let new_action_ordinal = inner.trace.action_traces.len() as u32 + 1;
@@ -211,7 +215,7 @@ impl TransactionContext {
             (
                 inner.trace.id,
                 inner.trace.block_num,
-                inner.trace.block_time,
+                inner.trace.block_time.clone(),
                 inner.trace.action_traces.len() as u32 + 1,
             )
         };
@@ -240,7 +244,7 @@ impl TransactionContext {
         recurse_depth: u32,
     ) -> Result<(), ChainError> {
         let (action, receiver) =
-            self.with_action_trace(action_ordinal, |t| (t.action().clone(), t.receiver()))?;
+            self.with_action_trace(action_ordinal, |t| (t.action().clone(), t.receiver().clone()))?;
         let mut apply_context = ApplyContext::new(
             self.db.clone(),
             self.chain_config.clone(),
@@ -324,7 +328,7 @@ impl TransactionContext {
 
     pub fn pending_block_timestamp(&self) -> Result<BlockTimestamp, ChainError> {
         let inner = self.inner.read()?;
-        Ok(inner.pending_block_timestamp)
+        Ok(inner.pending_block_timestamp.clone())
     }
 
     pub fn finalize(&mut self) -> Result<TransactionResult, ChainError> {
@@ -341,17 +345,17 @@ impl TransactionContext {
 
         let validate_ram_usage = inner.validate_ram_usage.clone();
         for account in validate_ram_usage.iter() {
-            ResourceLimitsManager::verify_account_ram_usage(&mut session, account)?;
+            ResourceLimitsManager::verify_account_ram_usage(&mut self.db, account)?;
         }
 
         println!("Transaction took {} micros", billed_cpu_time_us);
 
         ResourceLimitsManager::add_transaction_usage(
-            &mut session,
+            &mut self.db,
             &inner.bill_to_accounts,
             billed_cpu_time_us as u64,
             inner.trace.net_usage as u64,
-            inner.pending_block_timestamp.slot,
+            inner.pending_block_timestamp.slot(),
         )?;
 
         Ok(TransactionResult {
@@ -366,11 +370,11 @@ impl TransactionContext {
         Ok(())
     }
 
-    pub fn add_ram_usage(&self, account: &Name, ram_delta: i64) -> Result<(), ChainError> {
+    pub fn add_ram_usage(&mut self, account: &Name, ram_delta: i64) -> Result<(), ChainError> {
         let mut inner = self.inner.write()?;
 
         // Update the RAM usage in the resource limits manager.
-        ResourceLimitsManager::add_pending_ram_usage(&mut session, account, ram_delta)?;
+        ResourceLimitsManager::add_pending_ram_usage(&mut self.db, account, ram_delta)?;
 
         if ram_delta > 0 {
             inner.validate_ram_usage.insert(account.clone());

@@ -182,7 +182,7 @@ impl ApplyContext {
             }
         };
         let mut receipt = ActionReceipt::new(
-            self.receiver,
+            self.receiver.clone(),
             act_digest,
             self.next_global_sequence()?,
             self.next_recv_sequence(&receiver_account)?,
@@ -193,7 +193,7 @@ impl ApplyContext {
 
         for auth in self.action.clone().authorization().iter() {
             let auth_sequence = self.next_auth_sequence(&mut auth.actor.clone())?;
-            receipt.add_auth_sequence(auth.actor, auth_sequence);
+            receipt.add_auth_sequence(auth.actor.clone(), auth_sequence);
         }
 
         self.finalize_trace(receipt)?;
@@ -333,7 +333,10 @@ impl ApplyContext {
             }
 
             let mut provided_permissions = HashSet::new();
-            provided_permissions.insert(PermissionLevel::new(self.receiver, CODE_NAME.into()));
+            provided_permissions.insert(PermissionLevel::new(
+                self.receiver.clone(),
+                CODE_NAME.into(),
+            ));
             let inner = self.inner.read()?;
 
             if !inner.privileged {
@@ -436,20 +439,23 @@ impl ApplyContext {
             )),
         )?;
 
-        let mut inner = self.inner.write()?;
-        let obj = self.db.create_key_value_object(
-            table,
-            payer.as_ref(),
-            primary_key,
-            &data.0.as_slice(),
-        )?;
-        let obj = unsafe { &*obj };
+        let res = {
+            let mut inner = self.inner.write()?;
+            let obj = self.db.create_key_value_object(
+                table,
+                payer.as_ref(),
+                primary_key,
+                &data.0.as_slice(),
+            )?;
+            let obj = unsafe { &*obj };
+            inner.keyval_cache.cache_table(&table);
+            inner.keyval_cache.add(obj)?
+        };
 
         let billable_size = data.len() as i64 + billable_size_v::<KeyValue>() as i64;
         self.update_db_usage(payer, billable_size)?;
 
-        inner.keyval_cache.cache_table(&table);
-        Ok(inner.keyval_cache.add(obj)?)
+        Ok(res)
     }
 
     pub fn db_update_i64(
@@ -458,33 +464,39 @@ impl ApplyContext {
         payer: &Name,
         data: impl AsRef<[u8]>,
     ) -> Result<(), ChainError> {
-        let mut inner = self.inner.write()?;
-        let obj = inner.keyval_cache.get(iterator)?;
+        let (old_size, new_size, existing_payer) = {
+            let inner = self.inner.read()?;
+            let obj = inner.keyval_cache.get(iterator)?;
+            let table_obj = inner.keyval_cache.get_table(obj.get_table_id())?;
+            pulse_assert(
+                table_obj.get_code().to_uint64_t() == self.receiver.as_u64(),
+                ChainError::TransactionError(format!("db access violation",)),
+            )?;
 
-        let table_obj = inner.keyval_cache.get_table(obj.get_table_id())?;
-        pulse_assert(
-            table_obj.get_code().to_uint64_t() == self.receiver.as_u64(),
-            ChainError::TransactionError(format!("db access violation",)),
-        )?;
-
-        let overhead = billable_size_v::<KeyValue>() as i64;
-        let old_size = obj.get_value().len() as i64 + overhead;
-        let new_size = data.as_ref().len() as i64 + overhead;
-
-        let payer = if payer.empty() {
-            obj.get_payer()
-        } else {
-            payer.as_ref()
+            let old_size = obj.get_value().len() as i64;
+            self.db
+                .update_key_value_object(obj, payer.as_ref(), data.as_ref())?;
+            let new_size = obj.get_value().len() as i64;
+            let existing_payer = Name::new(obj.get_payer().to_uint64_t()); // TODO: Avoid this conversion
+            (old_size, new_size, existing_payer)
         };
 
-        if obj.get_payer() != payer {
-            self.update_db_usage(obj.get_payer(), -old_size)?;
-            self.update_db_usage(payer, new_size)?;
+        let overhead = billable_size_v::<KeyValue>() as i64;
+        let old_size = old_size + overhead;
+
+        let payer = if payer.empty() {
+            &existing_payer
+        } else {
+            payer
+        };
+
+        if existing_payer.as_u64() != payer.as_u64() {
+            self.update_db_usage(&existing_payer, -old_size)?;
+            self.update_db_usage(&payer, new_size)?;
         } else if old_size != new_size {
-            self.update_db_usage(obj.get_payer(), new_size - old_size)?;
+            self.update_db_usage(&existing_payer, new_size - old_size)?;
         }
 
-        self.db.update_key_value_object(obj, payer, data.as_ref())?;
         Ok(())
     }
 
@@ -494,7 +506,7 @@ impl ApplyContext {
         buffer: &mut Vec<u8>,
         buffer_size: usize,
     ) -> Result<i32, ChainError> {
-        let mut inner = self.inner.write()?;
+        let inner = self.inner.read()?;
         let obj = inner.keyval_cache.get(iterator)?;
         let s = obj.get_value().len();
         if buffer_size == 0 {
@@ -510,134 +522,28 @@ impl ApplyContext {
 
     pub fn db_remove_i64(&mut self, iterator: i32) -> Result<(), ChainError> {
         let mut inner = self.inner.write()?;
-        let obj = inner.keyval_cache.get(iterator)?;
-        let table_obj = inner.keyval_cache.get_table(obj.get_table_id())?;
-        pulse_assert(
-            table_obj.get_code() == &self.receiver,
-            ChainError::TransactionError(format!("db access violation",)),
-        )?;
+        let delta = self
+            .db
+            .db_remove_i64(&mut inner.keyval_cache, iterator, self.receiver.as_ref())?;
 
-        self.update_db_usage(
-            obj.get_payer(),
-            -(obj.get_value().len() as i64 + billable_size_v::<KeyValue>() as i64),
-        )?;
-        self.db.remove_key_value_object(obj, table_obj)?;
-
-        if table_obj.get_count() == 0 {
-            // If the table is empty, we can remove it
-            self.session.remove(table_obj.clone())?;
-        }
-
-        inner.keyval_cache.remove(iterator)?;
+        //self.update_db_usage(&payer, -delta)?;
 
         Ok(())
     }
 
     pub fn db_next_i64(&mut self, iterator: i32, primary: &mut u64) -> Result<i32, ChainError> {
-        if iterator < -1 {
-            return Ok(-1); // Cannot increment past end iterator of table
-        }
-
         let mut inner = self.inner.write()?;
-        let obj = inner.keyval_cache.get(iterator)?;
-        let mut idx = self
-            .session
-            .get_index::<KeyValue, KeyValueByScopePrimaryIndex>();
-
-        let mut itr = idx.iterator_to(obj)?;
-        let next_object = itr.next()?;
-
-        match next_object {
-            Some(next_object) => {
-                if next_object.table_id != obj.table_id {
-                    // If the primary key is the same, we are at the end of the table
-                    return Ok(inner
-                        .keyval_cache
-                        .get_end_iterator_by_table_id(obj.table_id)?);
-                }
-
-                *primary = next_object.primary_key;
-
-                return Ok(inner.keyval_cache.add(&next_object));
-            }
-            None => {
-                // No more objects in this table
-                return Ok(inner
-                    .keyval_cache
-                    .get_end_iterator_by_table_id(obj.table_id)?);
-            }
-        }
+        self.db.db_next_i64(&mut inner.keyval_cache, iterator, primary)
     }
 
     pub fn db_previous_i64(&mut self, iterator: i32, primary: &mut u64) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        let mut idx = self
-            .session
-            .get_index::<KeyValue, KeyValueByScopePrimaryIndex>();
-
-        if iterator < -1 {
-            // is end iterator
-            let tab = inner
-                .keyval_cache
-                .find_table_by_end_iterator(iterator)?
-                .ok_or(ChainError::TransactionError(format!(
-                    "invalid end iterator"
-                )))?;
-
-            let mut itr = idx.upper_bound(
-                (tab.id, u64::MIN), // Use u64::MIN to get the last element
-            )?;
-            let prev_object = itr.previous()?;
-
-            match prev_object {
-                Some(prev_object) => {
-                    if prev_object.table_id != tab.id {
-                        return Ok(-1); // Empty table
-                    }
-
-                    *primary = prev_object.primary_key;
-
-                    return Ok(inner.keyval_cache.add(&prev_object));
-                }
-                None => {
-                    // No more objects in this table
-                    return Ok(-1);
-                }
-            }
-        }
-
-        let obj = inner.keyval_cache.get(iterator)?;
-        let mut itr = idx.iterator_to(obj)?;
-        let prev_object = itr.previous()?;
-
-        match prev_object {
-            Some(prev_object) => {
-                if prev_object.table_id != obj.table_id {
-                    return Ok(-1); // Empty table
-                }
-
-                *primary = prev_object.primary_key;
-
-                return Ok(inner.keyval_cache.add(&prev_object));
-            }
-            None => {
-                // No more objects in this table
-                return Ok(-1);
-            }
-        }
+        self.db.db_previous_i64(&mut inner.keyval_cache, iterator, primary)
     }
 
     pub fn db_end_i64(&mut self, code: Name, scope: Name, table: Name) -> Result<i32, ChainError> {
-        let tab = self.find_table(code, scope, table)?;
-
-        match tab {
-            Some(table) => {
-                let mut inner = self.inner.write()?;
-                let end_itr = inner.keyval_cache.cache_table(&table);
-                Ok(end_itr)
-            }
-            None => Ok(-1), // No table found, return end iterator
-        }
+        let mut inner = self.inner.write()?;
+        self.db.db_end_i64(&mut inner.keyval_cache, code.as_ref(), scope.as_ref(), table.as_ref())
     }
 
     pub fn db_lowerbound_i64(
@@ -647,33 +553,8 @@ impl ApplyContext {
         table: Name,
         primary: u64,
     ) -> Result<i32, ChainError> {
-        let tab = self.find_table(code, scope, table)?;
-
-        match tab {
-            Some(table) => {
-                let mut inner = self.inner.write()?;
-                let end_itr = inner.keyval_cache.cache_table(&table);
-                let mut idx = self
-                    .session
-                    .get_index::<KeyValue, KeyValueByScopePrimaryIndex>();
-                let mut itr = idx.lower_bound((table.id, primary))?;
-                let obj = itr.next()?;
-
-                match obj {
-                    Some(obj) => {
-                        if obj.table_id != table.id {
-                            return Ok(end_itr);
-                        }
-
-                        return Ok(inner.keyval_cache.add(&obj));
-                    }
-                    None => {
-                        return Ok(end_itr);
-                    }
-                }
-            }
-            None => return Ok(-1), // No table found, return end iterator
-        }
+        let mut inner = self.inner.write()?;
+        self.db.db_lowerbound_i64(&mut inner.keyval_cache, code.as_ref(), scope.as_ref(), table.as_ref(), primary)
     }
 
     pub fn db_upperbound_i64(
@@ -683,33 +564,8 @@ impl ApplyContext {
         table: Name,
         primary: u64,
     ) -> Result<i32, ChainError> {
-        let tab = self.find_table(code, scope, table)?;
-
-        match tab {
-            Some(table) => {
-                let mut inner = self.inner.write()?;
-                let end_itr = inner.keyval_cache.cache_table(&table);
-                let mut idx = self
-                    .session
-                    .get_index::<KeyValue, KeyValueByScopePrimaryIndex>();
-                let mut itr = idx.upper_bound((table.id, primary))?;
-                let obj = itr.next()?;
-
-                match obj {
-                    Some(obj) => {
-                        if obj.table_id != table.id {
-                            return Ok(end_itr);
-                        }
-
-                        return Ok(inner.keyval_cache.add(&obj));
-                    }
-                    None => {
-                        return Ok(end_itr);
-                    }
-                }
-            }
-            None => return Ok(-1), // No table found, return end iterator
-        }
+        let mut inner = self.inner.write()?;
+        self.db.db_upperbound_i64(&mut inner.keyval_cache, code.as_ref(), scope.as_ref(), table.as_ref(), primary)
     }
 
     pub fn find_table(
@@ -753,7 +609,10 @@ impl ApplyContext {
     }
 
     pub fn remove_table(&mut self, table: &Table) -> Result<(), ChainError> {
-        self.update_db_usage(table.get_payer(), -(billable_size_v::<Table>() as i64))?;
+        self.update_db_usage(
+            &table.get_payer().into(),
+            -(billable_size_v::<Table>() as i64),
+        )?;
         self.db.remove_table(table)?;
         Ok(())
     }

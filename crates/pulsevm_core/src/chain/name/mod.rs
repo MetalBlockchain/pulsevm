@@ -57,6 +57,14 @@ impl From<u64> for Name {
     }
 }
 
+impl From<&FfiName> for Name {
+    fn from(ffi_name: &FfiName) -> Self {
+        Name {
+            inner: Arc::new(u64_to_name(ffi_name.to_uint64_t())),
+        }
+    }
+}
+
 impl FromStr for Name {
     type Err = ChainError;
 

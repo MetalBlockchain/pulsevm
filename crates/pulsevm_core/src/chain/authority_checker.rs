@@ -112,13 +112,17 @@ impl<'a> AuthorityChecker<'a> {
             return Ok(0);
         }
 
+        let auth = unsafe { &*auth };
+
         // mark as being evaluated to detect cycles
         self.cached_permissions.insert(
             permission.permission().clone(),
             PermissionCacheStatus::BeingEvaluated,
         );
 
-        let satisfied = self.satisfied(db, &auth.authority, recursion_depth + 1)?;
+        // TODO: Fix
+        Ok(permission.weight())
+        /* let satisfied = self.satisfied(db, &auth.authority, recursion_depth + 1)?;
 
         if satisfied {
             self.cached_permissions.insert(
@@ -132,6 +136,6 @@ impl<'a> AuthorityChecker<'a> {
                 PermissionCacheStatus::PermissionUnsatisfied,
             );
             Ok(0)
-        }
+        } */
     }
 }

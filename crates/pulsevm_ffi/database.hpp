@@ -10,6 +10,7 @@
 #include <pulsevm/chain/account_object.hpp>
 #include <pulsevm/chain/permission_link_object.hpp>
 #include <pulsevm/chain/global_property_object.hpp>
+#include <pulsevm/chain/protocol_state_object.hpp>
 #include "iterator_cache.hpp"
 #include "objects.hpp"
 #include <memory>
@@ -462,13 +463,6 @@ public:
         });
     }
 
-    void remove_key_value_object( const key_value_object& obj, const table_id_object& table_obj ) {
-        this->modify( table_obj, [&]( auto& t ) {
-            --t.count;
-        });
-        this->remove( obj );
-    }
-
     void remove_table( const table_id_object& table_obj ) {
         this->remove( table_obj );
     }
@@ -632,6 +626,44 @@ public:
         this->remove( permission );
     }
 
+    const permission_object& create_permission(
+        const name& account,
+        const name& name,
+        uint64_t parent,
+        const authority& auth,
+        const time_point& creation_time
+    ) {
+        for(const key_weight& k: auth.keys)
+            EOS_ASSERT(k.key.which() < this->get<protocol_state_object>().num_supported_key_types, unactivated_key_type,
+            "Unactivated key type used when creating permission");
+
+        const auto& perm_usage = this->create<permission_usage_object>([&](auto& p) {
+            p.last_used = creation_time;
+        });
+
+        const auto& perm = this->create<permission_object>([&](auto& p) {
+            p.usage_id     = perm_usage.id;
+            p.parent       = permission_object::id_type(parent);
+            p.owner        = account;
+            p.name         = name;
+            p.last_updated = creation_time;
+            p.auth         = std::move(auth);
+        });
+
+        return perm;
+    }
+
+    void modify_permission( const permission_object& permission, const authority& auth, const fc::time_point& pending_block_time ) {
+        for(const key_weight& k: auth.keys)
+            EOS_ASSERT(k.key.which() < this->get<protocol_state_object>().num_supported_key_types, unactivated_key_type,
+            "Unactivated key type used when modifying permission");
+
+        this->modify( permission, [&](permission_object& po) {
+            po.auth = auth;
+            po.last_updated = pending_block_time;
+        });
+    }
+
     const permission_object& get_permission( const permission_level& level ) const { 
         try {
             EOS_ASSERT( !level.actor.empty() && !level.permission.empty(), invalid_permission, "Invalid permission" );
@@ -651,7 +683,7 @@ public:
         this->modify( receiver_account, [&]( auto& ra ) {
             ++ra.recv_sequence;
         });
-        
+
         return receiver_account.recv_sequence;
     }
 
@@ -671,6 +703,108 @@ public:
         });
 
         return p.global_action_sequence;
+    }
+
+    int64_t db_remove_i64( iterator_cache<key_value_object>& keyval_cache, int iterator, const name& receiver ) {
+        const key_value_object& obj = keyval_cache.get( iterator );
+        const auto& table_obj = keyval_cache.get_table( obj.t_id );
+        EOS_ASSERT( table_obj.code == receiver, table_access_violation, "db access violation" );
+        auto delta = -(obj.value.size() + config::billable_size_v<key_value_object>);
+
+        this->modify( table_obj, [&]( auto& t ) {
+            --t.count;
+        });
+        this->remove( obj );
+
+        if (table_obj.count == 0) {
+            this->remove_table(table_obj);
+        }
+
+        keyval_cache.remove( iterator );
+
+        return delta;
+    }
+
+    int db_next_i64( iterator_cache<key_value_object>& keyval_cache, int iterator, uint64_t& primary ) {
+        if( iterator < -1 ) return -1; // cannot increment past end iterator of table
+
+        const auto& obj = keyval_cache.get( iterator ); // Check for iterator != -1 happens in this call
+        const auto& idx = this->get_index<key_value_index, by_scope_primary>();
+
+        auto itr = idx.iterator_to( obj );
+        ++itr;
+
+        if( itr == idx.end() || itr->t_id != obj.t_id ) return keyval_cache.get_end_iterator_by_table_id(obj.t_id);
+
+        primary = itr->primary_key;
+        return keyval_cache.add( *itr );
+    }
+
+    int db_previous_i64( iterator_cache<key_value_object>& keyval_cache, int iterator, uint64_t& primary ) {
+        const auto& idx = this->get_index<key_value_index, by_scope_primary>();
+
+        if( iterator < -1 ) // is end iterator
+        {
+            auto tab = keyval_cache.find_table_by_end_iterator(iterator);
+            EOS_ASSERT( tab, invalid_table_iterator, "not a valid end iterator" );
+
+            auto itr = idx.upper_bound(tab->id);
+            if( idx.begin() == idx.end() || itr == idx.begin() ) return -1; // Empty table
+
+            --itr;
+
+            if( itr->t_id != tab->id ) return -1; // Empty table
+
+            primary = itr->primary_key;
+            return keyval_cache.add(*itr);
+        }
+
+        const auto& obj = keyval_cache.get(iterator); // Check for iterator != -1 happens in this call
+
+        auto itr = idx.iterator_to(obj);
+        if( itr == idx.begin() ) return -1; // cannot decrement past beginning iterator of table
+
+        --itr;
+
+        if( itr->t_id != obj.t_id ) return -1; // cannot decrement past beginning iterator of table
+
+        primary = itr->primary_key;
+        return keyval_cache.add(*itr);
+    }
+
+    int db_end_i64( iterator_cache<key_value_object>& keyval_cache, const name& code, const name& scope, const name& table ) {
+        const auto* tab = this->find_table( code, scope, table );
+        if( !tab ) return -1;
+
+        return keyval_cache.cache_table( *tab );
+    }
+
+    int db_lowerbound_i64( iterator_cache<key_value_object>& keyval_cache, const name& code, const name& scope, const name& table, uint64_t id ) {
+        const auto* tab = this->find_table( code, scope, table );
+        if( !tab ) return -1;
+
+        auto table_end_itr = keyval_cache.cache_table( *tab );
+
+        const auto& idx = this->get_index<key_value_index, by_scope_primary>();
+        auto itr = idx.lower_bound( boost::make_tuple( tab->id, id ) );
+        if( itr == idx.end() ) return table_end_itr;
+        if( itr->t_id != tab->id ) return table_end_itr;
+
+        return keyval_cache.add( *itr );
+    }
+
+    int db_upperbound_i64( iterator_cache<key_value_object>& keyval_cache, const name& code, const name& scope, const name& table, uint64_t id ) {
+        const auto* tab = this->find_table( code, scope, table );
+        if( !tab ) return -1;
+
+        auto table_end_itr = keyval_cache.cache_table( *tab );
+
+        const auto& idx = this->get_index<key_value_index, by_scope_primary>();
+        auto itr = idx.upper_bound( boost::make_tuple( tab->id, id ) );
+        if( itr == idx.end() ) return table_end_itr;
+        if( itr->t_id != tab->id ) return table_end_itr;
+
+        return keyval_cache.add( *itr );
     }
 
     std::unique_ptr<chainbase::database::session> create_undo_session(bool enabled) {

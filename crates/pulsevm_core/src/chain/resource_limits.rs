@@ -1,7 +1,9 @@
 use std::collections::HashSet;
 
 use pulsevm_error::ChainError;
-use pulsevm_ffi::{Database, Name};
+use pulsevm_ffi::{Database, Name as FfiName};
+
+use crate::name::Name;
 
 pub struct ResourceLimitsManager;
 
@@ -11,7 +13,7 @@ impl ResourceLimitsManager {
     }
 
     pub fn initialize_account(db: &mut Database, account: &Name) -> Result<(), ChainError> {
-        db.initialize_account_resource_limits(account)
+        db.initialize_account_resource_limits(account.as_ref())
             .map_err(|e| {
                 ChainError::DatabaseError(format!(
                     "failed to initialize resource limits for account {}: {}",
@@ -28,13 +30,13 @@ impl ResourceLimitsManager {
         net_usage: u64,
         time_slot: u32,
     ) -> Result<(), ChainError> {
-        db.add_transaction_usage(accounts, cpu_usage, net_usage, time_slot)
+        /*db.add_transaction_usage(accounts, cpu_usage, net_usage, time_slot)
             .map_err(|e| {
                 ChainError::DatabaseError(format!(
                     "failed to add transaction usage for accounts: {}",
                     e
                 ))
-            })?;
+            })?;*/
         Ok(())
     }
 
@@ -43,7 +45,7 @@ impl ResourceLimitsManager {
         account: &Name,
         ram_delta: i64,
     ) -> Result<(), ChainError> {
-        db.add_pending_ram_usage(account, ram_delta).map_err(|e| {
+        db.add_pending_ram_usage(account.as_ref(), ram_delta).map_err(|e| {
             ChainError::DatabaseError(format!(
                 "failed to add pending ram usage for account {}: {}",
                 account, e
@@ -56,7 +58,7 @@ impl ResourceLimitsManager {
         db: &mut Database,
         account_name: &Name,
     ) -> Result<(), ChainError> {
-        db.verify_account_ram_usage(account_name).map_err(|e| {
+        db.verify_account_ram_usage(account_name.as_ref()).map_err(|e| {
             ChainError::DatabaseError(format!(
                 "failed to verify ram usage for account {}: {}",
                 account_name, e
@@ -66,7 +68,7 @@ impl ResourceLimitsManager {
     }
 
     pub fn get_account_ram_usage(db: &mut Database, account: &Name) -> Result<i64, ChainError> {
-        match db.get_account_ram_usage(account) {
+        match db.get_account_ram_usage(account.as_ref()) {
             Ok(usage) => Ok(usage),
             Err(e) => Err(ChainError::DatabaseError(format!(
                 "failed to get ram usage for account {}: {}",
@@ -82,7 +84,7 @@ impl ResourceLimitsManager {
         cpu_weight: i64,
         ram_bytes: i64,
     ) -> Result<bool, ChainError> {
-        match db.set_account_limits(account, ram_bytes, net_weight, cpu_weight) {
+        match db.set_account_limits(account.as_ref(), ram_bytes, net_weight, cpu_weight) {
             Ok(decreased) => Ok(decreased),
             Err(e) => Err(ChainError::DatabaseError(format!(
                 "failed to set resource limits for account {}: {}",
@@ -98,7 +100,7 @@ impl ResourceLimitsManager {
         net_weight: &mut i64,
         cpu_weight: &mut i64,
     ) -> Result<(), ChainError> {
-        db.get_account_limits(account, ram_bytes, net_weight, cpu_weight)
+        db.get_account_limits(account.as_ref(), ram_bytes, net_weight, cpu_weight)
             .map_err(|e| {
                 ChainError::DatabaseError(format!(
                     "failed to get resource limits for account {}: {}",
@@ -115,7 +117,7 @@ impl ResourceLimitsManager {
         greylist_limit: Option<u32>,
     ) -> Result<(i64, bool), ChainError> {
         let res = db
-            .get_account_net_limit(account, greylist_limit)
+            .get_account_net_limit(account.as_ref(), 0)
             .map_err(|e| {
                 ChainError::DatabaseError(format!(
                     "failed to get net limit for account {}: {}",
@@ -132,7 +134,7 @@ impl ResourceLimitsManager {
         greylist_limit: Option<u32>,
     ) -> Result<(i64, bool), ChainError> {
         let res = db
-            .get_account_cpu_limit(account, greylist_limit)
+            .get_account_cpu_limit(account.as_ref(), 0)
             .map_err(|e| {
                 ChainError::DatabaseError(format!(
                     "failed to get cpu limit for account {}: {}",

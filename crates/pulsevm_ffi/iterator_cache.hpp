@@ -42,7 +42,7 @@ class iterator_cache {
         return _end_iterator_to_table[indx];
     }
 
-    const T& get( int iterator ) {
+    const T& get( int iterator )const {
         EOS_ASSERT( iterator != -1, invalid_table_iterator, "invalid iterator" );
         EOS_ASSERT( iterator >= 0, table_operation_not_permitted, "dereference of end iterator" );
         EOS_ASSERT( (size_t)iterator < _iterator_to_object.size(), invalid_table_iterator, "iterator out of range" );

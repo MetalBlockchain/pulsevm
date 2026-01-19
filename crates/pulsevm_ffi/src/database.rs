@@ -9,7 +9,7 @@ use cxx::{SharedPtr, UniquePtr};
 use pulsevm_error::ChainError;
 
 use crate::{
-    Digest, KeyValueIteratorCache, Name, TimePoint,
+    Authority, Digest, KeyValueIteratorCache, Name, TimePoint,
     bridge::ffi::{self, Table},
     iterator_cache::ffi::KeyValue,
     objects::ffi::AccountMetadata,
@@ -437,19 +437,6 @@ impl Database {
             .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
     }
 
-    pub fn remove_key_value_object(
-        &mut self,
-        obj: &KeyValue,
-        table_obj: &Table,
-    ) -> Result<(), ChainError> {
-        let mut guard = self.inner.write()?;
-        let pinned = guard.pin_mut();
-
-        pinned
-            .remove_key_value_object(obj, table_obj)
-            .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
-    }
-
     pub fn remove_table(&mut self, table: &Table) -> Result<(), ChainError> {
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
@@ -592,6 +579,139 @@ impl Database {
 
         pinned
             .next_global_sequence()
+            .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
+    }
+
+    pub fn db_remove_i64(
+        &mut self,
+        keyval_cache: &mut KeyValueIteratorCache,
+        iterator: i32,
+        receiver: &Name,
+    ) -> Result<i64, ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .db_remove_i64(keyval_cache.pin_mut(), iterator, receiver)
+            .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
+    }
+
+    pub fn db_next_i64(
+        &mut self,
+        keyval_cache: &mut KeyValueIteratorCache,
+        iterator: i32,
+        primary: &mut u64,
+    ) -> Result<i32, ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .db_next_i64(keyval_cache.pin_mut(), iterator, primary)
+            .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
+    }
+
+    pub fn db_previous_i64(
+        &mut self,
+        keyval_cache: &mut KeyValueIteratorCache,
+        iterator: i32,
+        primary: &mut u64,
+    ) -> Result<i32, ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .db_previous_i64(keyval_cache.pin_mut(), iterator, primary)
+            .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
+    }
+
+    pub fn db_end_i64(
+        &mut self,
+        keyval_cache: &mut KeyValueIteratorCache,
+        code: &Name,
+        scope: &Name,
+        table: &Name,
+    ) -> Result<i32, ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .db_end_i64(keyval_cache.pin_mut(), code, scope, table)
+            .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
+    }
+
+    pub fn db_lowerbound_i64(
+        &mut self,
+        keyval_cache: &mut KeyValueIteratorCache,
+        code: &Name,
+        scope: &Name,
+        table: &Name,
+        id: u64,
+    ) -> Result<i32, ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .db_lowerbound_i64(keyval_cache.pin_mut(), code, scope, table, id)
+            .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
+    }
+
+    pub fn db_upperbound_i64(
+        &mut self,
+        keyval_cache: &mut KeyValueIteratorCache,
+        code: &Name,
+        scope: &Name,
+        table: &Name,
+        id: u64,
+    ) -> Result<i32, ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .db_upperbound_i64(keyval_cache.pin_mut(), code, scope, table, id)
+            .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
+    }
+
+    pub fn remove_permission(
+        &mut self,
+        permission: &ffi::PermissionObject,
+    ) -> Result<(), ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .remove_permission(permission)
+            .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
+    }
+
+    pub fn create_permission(
+        &mut self,
+        account: &Name,
+        name: &Name,
+        parent: u64,
+        auth: &Authority,
+        creation_time: &TimePoint,
+    ) -> Result<*const ffi::PermissionObject, ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        let res = pinned
+            .create_permission(account, name, parent, auth, creation_time)
+            .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))?;
+
+        Ok(res as *const ffi::PermissionObject)
+    }
+
+    pub fn modify_permission(
+        &mut self,
+        permission: &ffi::PermissionObject,
+        authority: &ffi::Authority,
+        pending_block_time: &TimePoint,
+    ) -> Result<(), ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .modify_permission(permission, authority, pending_block_time)
             .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
     }
 }

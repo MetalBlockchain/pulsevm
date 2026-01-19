@@ -34,6 +34,12 @@ pub mod ffi {
         type Microseconds;
         pub fn count(self: &Microseconds) -> i64;
 
+        #[cxx_name = "authority"]
+        type Authority;
+
+        #[cxx_name = "shared_authority"]
+        type SharedAuthority;
+
         // Global functions
         pub fn make_empty_digest() -> UniquePtr<Digest>;
         pub fn make_digest_from_data(data: &[u8]) -> UniquePtr<Digest>;

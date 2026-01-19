@@ -205,6 +205,8 @@ struct authority {
    vector<permission_level_weight>   accounts;
    vector<wait_weight>               waits;
 
+   uint32_t get_threshold()const { return threshold; }
+
    friend bool operator == ( const authority& lhs, const authority& rhs ) {
       return tie( lhs.threshold, lhs.keys, lhs.accounts, lhs.waits ) == tie( rhs.threshold, rhs.keys, rhs.accounts, rhs.waits );
    }
