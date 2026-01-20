@@ -6,7 +6,7 @@ use std::{
 use lru::LruCache;
 use pulsevm_crypto::Bytes;
 use pulsevm_error::ChainError;
-use pulsevm_ffi::Digest;
+use pulsevm_ffi::{Database, Digest};
 use wasmer::{Engine, Function, FunctionEnv, Instance, Memory, Module, Store, imports};
 
 use wasmer_compiler_llvm::LLVM;
@@ -29,17 +29,16 @@ use crate::{
     },
 };
 
-use super::{
-    webassembly::{
-        action_data_size, current_receiver, has_auth, is_account, require_auth, send_inline,
-    },
+use super::webassembly::{
+    action_data_size, current_receiver, has_auth, is_account, require_auth, send_inline,
 };
 
 pub struct WasmContext {
-    receiver: Name,
+    receiver: u64,
     action: Action,
     pending_block_timestamp: BlockTimestamp,
     context: ApplyContext,
+    db: Database,
     memory: Option<Memory>,
     return_value: Option<Bytes>,
 }
@@ -50,19 +49,21 @@ impl WasmContext {
         action: Action,
         pending_block_timestamp: BlockTimestamp,
         context: ApplyContext,
+        db: Database,
     ) -> Self {
         WasmContext {
-            receiver,
+            receiver: receiver.as_u64(),
             action,
             pending_block_timestamp,
             context,
+            db,
             memory: None,
             return_value: None,
         }
     }
 
-    pub fn receiver(&self) -> &Name {
-        &self.receiver
+    pub fn receiver(&self) -> u64 {
+        self.receiver
     }
 
     pub fn action(&self) -> &Action {
@@ -79,6 +80,14 @@ impl WasmContext {
 
     pub fn apply_context_mut(&mut self) -> &mut ApplyContext {
         &mut self.context
+    }
+
+    pub fn db(&self) -> &Database {
+        &self.db
+    }
+
+    pub fn db_mut(&mut self) -> &mut Database {
+        &mut self.db
     }
 
     pub fn memory(&self) -> &Option<Memory> {
@@ -117,6 +126,7 @@ impl WasmRuntime {
         receiver: Name,
         action: Action,
         apply_context: ApplyContext,
+        db: Database,
         code_hash: &Digest,
     ) -> Result<(), ChainError> {
         // Pause timer
@@ -124,27 +134,28 @@ impl WasmRuntime {
 
         let mut inner = self.inner.write()?;
         let mut store = Store::new(inner.engine.clone());
+        let id = Id::from(code_hash);
 
         // Different scope so session is released before running the wasm code.
         {
-            if !inner.code_cache.contains(&code_hash) {
-                let code_object = session.get::<CodeObject>(code_hash).map_err(|e| {
-                    ChainError::WasmRuntimeError(format!("failed to get wasm code: {}", e))
-                })?;
-                let module = Module::new(store.engine(), code_object.code.as_ref())
-                    .map_err(|e| ChainError::WasmRuntimeError(e.to_string()))?;
-                inner.code_cache.put(code_hash, module);
+            if !inner.code_cache.contains(&id) {
+                let code_object = db.get_code_object_by_hash(code_hash, 0, 0)?;
+                let code_object = unsafe { &*code_object };
+                let module = Module::new(store.engine(), code_object.get_code().as_ref())
+                .map_err(|e| ChainError::WasmRuntimeError(e.to_string()))?;
+                inner.code_cache.put(id, module);
             }
         }
 
-        let module = inner.code_cache.get(&code_hash).ok_or_else(|| {
-            ChainError::WasmRuntimeError(format!("wasm module not found in cache: {}", code_hash))
+        let module = inner.code_cache.get(&id).ok_or_else(|| {
+            ChainError::WasmRuntimeError(format!("wasm module not found in cache: {}", id))
         })?;
         let wasm_context = WasmContext::new(
-            receiver,
+            receiver.clone(),
             action.clone(),
             apply_context.pending_block_timestamp().clone(),
             apply_context.clone(),
+            db.clone(),
         );
         let env = FunctionEnv::new(&mut store, wasm_context);
         let import_object = imports! {

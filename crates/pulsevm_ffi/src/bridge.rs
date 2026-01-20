@@ -75,6 +75,12 @@ pub mod ffi {
             enabled: bool,
         ) -> Result<UniquePtr<UndoSession>>;
 
+        // Init methods
+        pub fn initialize_database(
+            self: Pin<&mut Database>,
+            genesis_data: &[u8],
+        ) -> Result<()>;
+
         // Account methods
         pub fn create_account(
             self: Pin<&mut Database>,
@@ -212,7 +218,6 @@ pub mod ffi {
         pub fn remove_table(self: Pin<&mut Database>, table: &Table) -> Result<()>;
 
         // Account methods
-        pub fn is_privileged(self: &AccountMetadata) -> bool;
         pub fn is_account(self: &Database, account: &Name) -> Result<bool>;
 
         // Permission methods
@@ -307,6 +312,12 @@ pub mod ffi {
             authority: &Authority,
             pending_block_time: &TimePoint,
         ) -> Result<()>;
+        pub fn lookup_linked_permission(
+            self: &Database,
+            account: &Name,
+            code: &Name,
+            requirement_type: &Name,
+        ) -> Result<*const Name>;
 
         // Methods on undo_session
         pub fn push(self: Pin<&mut UndoSession>) -> Result<()>;
@@ -314,3 +325,6 @@ pub mod ffi {
         pub fn undo(self: Pin<&mut UndoSession>) -> Result<()>;
     }
 }
+
+unsafe impl Send for ffi::Database {}
+unsafe impl Sync for ffi::Database {}

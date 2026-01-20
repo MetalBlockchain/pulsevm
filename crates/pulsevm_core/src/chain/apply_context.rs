@@ -164,6 +164,7 @@ impl ApplyContext {
                 self.receiver.clone(),
                 self.action.clone(),
                 self.clone(),
+                self.db.clone(),
                 receiver_account.get_code_hash(),
             )?;
         }
@@ -522,9 +523,9 @@ impl ApplyContext {
 
     pub fn db_remove_i64(&mut self, iterator: i32) -> Result<(), ChainError> {
         let mut inner = self.inner.write()?;
-        let delta = self
-            .db
-            .db_remove_i64(&mut inner.keyval_cache, iterator, self.receiver.as_ref())?;
+        let delta =
+            self.db
+                .db_remove_i64(&mut inner.keyval_cache, iterator, self.receiver.as_ref())?;
 
         //self.update_db_usage(&payer, -delta)?;
 
@@ -533,17 +534,24 @@ impl ApplyContext {
 
     pub fn db_next_i64(&mut self, iterator: i32, primary: &mut u64) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        self.db.db_next_i64(&mut inner.keyval_cache, iterator, primary)
+        self.db
+            .db_next_i64(&mut inner.keyval_cache, iterator, primary)
     }
 
     pub fn db_previous_i64(&mut self, iterator: i32, primary: &mut u64) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        self.db.db_previous_i64(&mut inner.keyval_cache, iterator, primary)
+        self.db
+            .db_previous_i64(&mut inner.keyval_cache, iterator, primary)
     }
 
     pub fn db_end_i64(&mut self, code: Name, scope: Name, table: Name) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        self.db.db_end_i64(&mut inner.keyval_cache, code.as_ref(), scope.as_ref(), table.as_ref())
+        self.db.db_end_i64(
+            &mut inner.keyval_cache,
+            code.as_ref(),
+            scope.as_ref(),
+            table.as_ref(),
+        )
     }
 
     pub fn db_lowerbound_i64(
@@ -554,7 +562,13 @@ impl ApplyContext {
         primary: u64,
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        self.db.db_lowerbound_i64(&mut inner.keyval_cache, code.as_ref(), scope.as_ref(), table.as_ref(), primary)
+        self.db.db_lowerbound_i64(
+            &mut inner.keyval_cache,
+            code.as_ref(),
+            scope.as_ref(),
+            table.as_ref(),
+            primary,
+        )
     }
 
     pub fn db_upperbound_i64(
@@ -565,7 +579,13 @@ impl ApplyContext {
         primary: u64,
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        self.db.db_upperbound_i64(&mut inner.keyval_cache, code.as_ref(), scope.as_ref(), table.as_ref(), primary)
+        self.db.db_upperbound_i64(
+            &mut inner.keyval_cache,
+            code.as_ref(),
+            scope.as_ref(),
+            table.as_ref(),
+            primary,
+        )
     }
 
     pub fn find_table(

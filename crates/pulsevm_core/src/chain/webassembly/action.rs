@@ -1,10 +1,9 @@
+use pulsevm_error::ChainError;
 use wasmer::{FunctionEnvMut, RuntimeError, WasmPtr};
 
 use crate::{
     apply_context::ApplyContext,
-    chain::{
-        controller::Controller, utils::pulse_assert, wasm_runtime::WasmContext,
-    },
+    chain::{controller::Controller, utils::pulse_assert, wasm_runtime::WasmContext},
 };
 
 #[inline]
@@ -40,7 +39,7 @@ pub fn read_action_data(
 
 #[inline]
 pub fn current_receiver(env: FunctionEnvMut<WasmContext>) -> u64 {
-    env.data().receiver().as_u64()
+    env.data().receiver()
 }
 
 #[inline]
@@ -52,9 +51,8 @@ pub fn set_action_return_value(
     let (env_data, store) = env.data_and_store_mut();
 
     {
-        let context = env_data.apply_context();
-        let mut session = context.undo_session();
-        let gpo = Controller::get_global_properties(&mut session)?;
+        let mut db = env_data.db_mut();
+        let gpo = Controller::get_global_properties(&mut db)?;
         pulse_assert(
             buffer_len <= gpo.configuration.max_action_return_value_size,
             ChainError::WasmRuntimeError(format!(

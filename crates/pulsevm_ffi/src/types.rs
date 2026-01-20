@@ -100,3 +100,6 @@ impl BlockTimestamp {
         ffi::make_block_timestamp_from_slot(slot)
     }
 }
+
+unsafe impl Send for ffi::BlockTimestamp {}
+unsafe impl Sync for ffi::BlockTimestamp {}

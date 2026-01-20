@@ -108,3 +108,6 @@ impl Deref for KeyValueIteratorCache {
         &self.inner
     }
 }
+
+unsafe impl Send for ffi::KeyValueIteratorCache {}
+unsafe impl Sync for ffi::KeyValueIteratorCache {}

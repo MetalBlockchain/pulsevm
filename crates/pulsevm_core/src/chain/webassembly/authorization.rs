@@ -5,7 +5,7 @@ use crate::{apply_context::ApplyContext, chain::wasm_runtime::WasmContext};
 pub fn require_auth(env: FunctionEnvMut<WasmContext>, account: u64) -> Result<(), RuntimeError> {
     let context = env.data().apply_context();
 
-    if let Err(err) = context.require_authorization(account.into(), None) {
+    if let Err(err) = context.require_authorization(&account.into(), None) {
         return Err(err.into());
     } else {
         Ok(())
@@ -14,7 +14,7 @@ pub fn require_auth(env: FunctionEnvMut<WasmContext>, account: u64) -> Result<()
 
 pub fn has_auth(env: FunctionEnvMut<WasmContext>, account: u64) -> Result<i32, RuntimeError> {
     let context = env.data().apply_context();
-    let result = context.has_authorization(account.into());
+    let result = context.has_authorization(&account.into());
 
     if result { Ok(1) } else { Ok(0) }
 }
@@ -26,7 +26,7 @@ pub fn require_auth2(
 ) -> Result<(), RuntimeError> {
     let context = env.data_mut().apply_context_mut();
 
-    if let Err(err) = context.require_authorization(account.into(), Some(permission.into())) {
+    if let Err(err) = context.require_authorization(&account.into(), Some(permission.into())) {
         return Err(err.into());
     } else {
         Ok(())
@@ -39,7 +39,7 @@ pub fn require_recipient(
 ) -> Result<(), RuntimeError> {
     let context = env.data_mut().apply_context_mut();
 
-    if let Err(err) = context.require_recipient(recipient.into()) {
+    if let Err(err) = context.require_recipient(&recipient.into()) {
         return Err(err.into());
     } else {
         Ok(())
@@ -51,7 +51,7 @@ pub fn is_account(
     recipient: u64,
 ) -> Result<i32, RuntimeError> {
     let context = env.data_mut().apply_context_mut();
-    let result = context.is_account(recipient.into());
+    let result = context.is_account(&recipient.into());
 
     match result {
         Ok(exists) => {

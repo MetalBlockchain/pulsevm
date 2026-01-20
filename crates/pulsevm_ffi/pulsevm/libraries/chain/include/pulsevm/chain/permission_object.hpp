@@ -28,12 +28,14 @@ namespace pulsevm { namespace chain {
       permission_usage_object::id_type  usage_id;
       id_type                           parent; ///< parent permission
       name                              owner; ///< the account this permission belongs to (should not be changed within a chainbase modifier lambda)
-      name                              name; ///< human-readable name for the permission (should not be changed within a chainbase modifier lambda)
+      name                              perm_name; ///< human-readable name for the permission (should not be changed within a chainbase modifier lambda)
       time_point                        last_updated; ///< the last time this authority was updated
       shared_authority                  auth; ///< authority required to execute this permission
 
       int64_t get_id() const { return id._id; }
       int64_t get_parent_id() const { return parent._id; }
+      const name& get_owner() const { return owner; }
+      const name& get_name() const { return perm_name; }
    };
 
 
@@ -52,13 +54,13 @@ namespace pulsevm { namespace chain {
          >,
          ordered_unique<tag<by_owner>,
             composite_key<permission_object,
-               member<permission_object, account_name, &permission_object::owner>,
-               member<permission_object, permission_name, &permission_object::name>
+               member<permission_object, name, &permission_object::owner>,
+               member<permission_object, name, &permission_object::perm_name>
             >
          >,
          ordered_unique<tag<by_name>,
             composite_key<permission_object,
-               member<permission_object, permission_name, &permission_object::name>,
+               member<permission_object, name, &permission_object::perm_name>,
                member<permission_object, permission_object::id_type, &permission_object::id>
             >
          >
@@ -77,5 +79,5 @@ namespace pulsevm { namespace chain {
 CHAINBASE_SET_INDEX_TYPE(pulsevm::chain::permission_object, pulsevm::chain::permission_index)
 CHAINBASE_SET_INDEX_TYPE(pulsevm::chain::permission_usage_object, pulsevm::chain::permission_usage_index)
 
-FC_REFLECT(pulsevm::chain::permission_object, (usage_id)(parent)(owner)(name)(last_updated)(auth))
+FC_REFLECT(pulsevm::chain::permission_object, (usage_id)(parent)(owner)(perm_name)(last_updated)(auth))
 FC_REFLECT(pulsevm::chain::permission_usage_object, (last_used))

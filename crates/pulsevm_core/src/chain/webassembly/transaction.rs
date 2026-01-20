@@ -3,17 +3,15 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use pulsevm_chainbase::UndoSession;
+use pulsevm_error::ChainError;
 use pulsevm_serialization::Read;
 use wasmer::{FunctionEnvMut, RuntimeError, WasmPtr};
 
 use crate::{
-    apply_context::ApplyContext,
     chain::{
         authority::PermissionLevel,
         authorization_manager::AuthorizationManager,
         controller::Controller,
-        error::ChainError,
         secp256k1::PublicKey,
         transaction::{Action, Transaction},
         utils::pulse_assert,
@@ -28,9 +26,8 @@ pub fn send_inline(
 ) -> Result<(), RuntimeError> {
     {
         let (env_data, _) = env.data_and_store_mut();
-        let context = env_data.apply_context_mut();
-        let mut session = context.undo_session();
-        let gpo = Controller::get_global_properties(&mut session)?;
+        let mut db = env_data.db_mut();
+        let gpo = Controller::get_global_properties(&mut db)?;
         pulse_assert(
             length < gpo.configuration.max_inline_action_size,
             ChainError::WasmRuntimeError(format!("inline action too big")),
@@ -103,11 +100,12 @@ pub fn check_transaction_authorization(
             })?;
     }
 
-    let context = env_data.apply_context_mut();
-    let mut session = context.undo_session();
+    return Ok(0); // TODO: Fix this function
+
+    /* let mut db = env_data.db_mut();
     match AuthorizationManager::check_authorization(
         &context.chain_config,
-        &mut session,
+        &mut db,
         &transaction.actions,
         &provided_keys,
         &provided_permissions,
@@ -115,5 +113,5 @@ pub fn check_transaction_authorization(
     ) {
         Ok(_) => return Ok(1),
         Err(_) => return Ok(0),
-    }
+    } */
 }

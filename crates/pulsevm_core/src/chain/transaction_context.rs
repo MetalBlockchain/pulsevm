@@ -243,8 +243,9 @@ impl TransactionContext {
         action_ordinal: u32,
         recurse_depth: u32,
     ) -> Result<(), ChainError> {
-        let (action, receiver) =
-            self.with_action_trace(action_ordinal, |t| (t.action().clone(), t.receiver().clone()))?;
+        let (action, receiver) = self.with_action_trace(action_ordinal, |t| {
+            (t.action().clone(), t.receiver().clone())
+        })?;
         let mut apply_context = ApplyContext::new(
             self.db.clone(),
             self.chain_config.clone(),

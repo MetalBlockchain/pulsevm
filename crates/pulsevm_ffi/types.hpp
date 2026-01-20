@@ -2,6 +2,8 @@
 #include <rust/cxx.h>
 #include <pulsevm/chain/block_timestamp.hpp>
 #include <pulsevm/chain/types.hpp>
+#include <pulsevm/chain/genesis_state.hpp>
+#include <fc/io/json.hpp>
 
 namespace pulsevm { namespace chain {
 
@@ -33,6 +35,10 @@ namespace pulsevm { namespace chain {
 
     std::shared_ptr<time_point> make_time_point_from_microseconds(const microseconds& us) {
         return std::make_shared<time_point>(time_point(us));
+    }
+
+    std::unique_ptr<genesis_state> make_empty_genesis_state() {
+        return std::make_unique<genesis_state>();
     }
 
 }} // namespace pulsevm::chain

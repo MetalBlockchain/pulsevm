@@ -39,3 +39,6 @@ impl PartialEq for &Name {
         ffi::name_to_uint64(self) == ffi::name_to_uint64(other)
     }
 }
+
+unsafe impl Send for ffi::Name {}
+unsafe impl Sync for ffi::Name {}

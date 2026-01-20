@@ -44,9 +44,9 @@ use pulsevm_serialization::{Read, Write};
 use spdlog::info;
 use tokio::sync::RwLock as AsyncRwLock;
 
-pub type ApplyHandlerFn = fn(&mut ApplyContext) -> Result<(), ChainError>;
+pub type ApplyHandlerFn = fn(&mut ApplyContext, &mut Database) -> Result<(), ChainError>;
 pub type ApplyHandlerMap = HashMap<
-    (Name, Name, Name), // (receiver, contract, action)
+    (u64, u64, u64), // (receiver, contract, action)
     ApplyHandlerFn,
 >;
 
@@ -176,7 +176,7 @@ impl Controller {
             })?;
             // Create the pulse@active permission
             AuthorizationManager::create_permission(
-                &mut session,
+                &mut self.db,
                 PULSE_NAME,
                 ACTIVE_NAME,
                 owner_permission.id(),
@@ -209,8 +209,8 @@ impl Controller {
                 chain_id: self.chain_id.clone(),
                 configuration: genesis.initial_configuration().clone(),
             })?;
-            ResourceLimitsManager::initialize_database(&mut session)?;
-            ResourceLimitsManager::initialize_account(&mut session, PULSE_NAME).map_err(|e| {
+            ResourceLimitsManager::initialize_database(&mut self.db)?;
+            ResourceLimitsManager::initialize_account(&mut self.db, &PULSE_NAME.into()).map_err(|e| {
                 ChainError::GenesisError(format!(
                     "failed to initialize resource limits for pulse account: {}",
                     e
@@ -223,7 +223,7 @@ impl Controller {
     }
 
     pub async fn build_block(&mut self, mempool: &mut Mempool) -> Result<SignedBlock, ChainError> {
-        let mut undo_session = self.db.undo_session()?;
+        let undo_session = self.db.create_undo_session(true)?;
         let mut transaction_receipts: VecDeque<TransactionReceipt> = VecDeque::new();
         let timestamp = BlockTimestamp::now();
 
@@ -231,7 +231,7 @@ impl Controller {
         loop {
             if let Some(transaction) = mempool.pop_transaction() {
                 let transaction_result =
-                    self.execute_transaction(&mut undo_session, &transaction, &timestamp)?;
+                    self.execute_transaction(&mut self.db.clone(), &transaction, &timestamp)?;
                 let receipt =
                     TransactionReceipt::new(transaction_result.trace.receipt, transaction);
 
@@ -277,9 +277,9 @@ impl Controller {
         }
 
         // Verify the block
-        let mut session = self.db.create_undo_session(true)?;
+        let session = self.db.create_undo_session(true)?;
         let mut mempool = mempool.write().await;
-        self.execute_block(block, &mut session, &mut mempool)
+        self.execute_block(block, &mut self.db.clone(), &mut mempool)
             .await?;
         self.verified_blocks.insert(block.id(), block.clone());
 
@@ -303,7 +303,7 @@ impl Controller {
         let mut session = self.db.create_undo_session(true)?;
         let mut mempool = mempool.write().await;
         let transaction_traces = self
-            .execute_block(&block, &mut session, &mut mempool)
+            .execute_block(&block, &mut self.db.clone(), &mut mempool)
             .await?;
         let packed_transaction_traces = transaction_traces.pack().map_err(|e| {
             ChainError::TransactionError(format!(
@@ -327,7 +327,7 @@ impl Controller {
     }
 
     pub async fn execute_block(
-        &mut self,
+        &self,
         block: &SignedBlock,
         db: &mut Database,
         mempool: &mut Mempool,
@@ -424,6 +424,7 @@ impl Controller {
         }
 
         let mut trx_context = TransactionContext::new(
+            self.db.clone(),
             self.config.clone(),
             self.wasm_runtime.clone(),
             self.last_accepted_block().block_num() + 1,

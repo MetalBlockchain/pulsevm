@@ -1,7 +1,8 @@
 use core::fmt;
-use std::{error::Error, str::FromStr};
+use std::{error::Error, slice, str::FromStr};
 
 use pulsevm_crypto::FixedBytes;
+use pulsevm_ffi::Digest;
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 use serde::Serialize;
 
@@ -88,6 +89,16 @@ impl TryFrom<Vec<u8>> for Id {
         let mut id = [0u8; 32];
         id.copy_from_slice(&value);
         Ok(Id(FixedBytes(id)))
+    }
+}
+
+impl From<&Digest> for Id {
+    fn from(digest: &Digest) -> Self {
+        let dst: [u8; 32] = unsafe {
+            let slice = slice::from_raw_parts(digest.data(), 32);
+            slice.try_into().unwrap()
+        };
+        Id(FixedBytes(dst))
     }
 }
 

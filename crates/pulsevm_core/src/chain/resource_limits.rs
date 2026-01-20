@@ -31,12 +31,12 @@ impl ResourceLimitsManager {
         time_slot: u32,
     ) -> Result<(), ChainError> {
         /*db.add_transaction_usage(accounts, cpu_usage, net_usage, time_slot)
-            .map_err(|e| {
-                ChainError::DatabaseError(format!(
-                    "failed to add transaction usage for accounts: {}",
-                    e
-                ))
-            })?;*/
+        .map_err(|e| {
+            ChainError::DatabaseError(format!(
+                "failed to add transaction usage for accounts: {}",
+                e
+            ))
+        })?;*/
         Ok(())
     }
 
@@ -45,12 +45,13 @@ impl ResourceLimitsManager {
         account: &Name,
         ram_delta: i64,
     ) -> Result<(), ChainError> {
-        db.add_pending_ram_usage(account.as_ref(), ram_delta).map_err(|e| {
-            ChainError::DatabaseError(format!(
-                "failed to add pending ram usage for account {}: {}",
-                account, e
-            ))
-        })?;
+        db.add_pending_ram_usage(account.as_ref(), ram_delta)
+            .map_err(|e| {
+                ChainError::DatabaseError(format!(
+                    "failed to add pending ram usage for account {}: {}",
+                    account, e
+                ))
+            })?;
         Ok(())
     }
 
@@ -58,12 +59,13 @@ impl ResourceLimitsManager {
         db: &mut Database,
         account_name: &Name,
     ) -> Result<(), ChainError> {
-        db.verify_account_ram_usage(account_name.as_ref()).map_err(|e| {
-            ChainError::DatabaseError(format!(
-                "failed to verify ram usage for account {}: {}",
-                account_name, e
-            ))
-        })?;
+        db.verify_account_ram_usage(account_name.as_ref())
+            .map_err(|e| {
+                ChainError::DatabaseError(format!(
+                    "failed to verify ram usage for account {}: {}",
+                    account_name, e
+                ))
+            })?;
         Ok(())
     }
 
@@ -116,14 +118,12 @@ impl ResourceLimitsManager {
         account: &Name,
         greylist_limit: Option<u32>,
     ) -> Result<(i64, bool), ChainError> {
-        let res = db
-            .get_account_net_limit(account.as_ref(), 0)
-            .map_err(|e| {
-                ChainError::DatabaseError(format!(
-                    "failed to get net limit for account {}: {}",
-                    account, e
-                ))
-            })?;
+        let res = db.get_account_net_limit(account.as_ref(), 0).map_err(|e| {
+            ChainError::DatabaseError(format!(
+                "failed to get net limit for account {}: {}",
+                account, e
+            ))
+        })?;
 
         Ok((res.limit, res.greylisted))
     }
@@ -133,14 +133,12 @@ impl ResourceLimitsManager {
         account: &Name,
         greylist_limit: Option<u32>,
     ) -> Result<(i64, bool), ChainError> {
-        let res = db
-            .get_account_cpu_limit(account.as_ref(), 0)
-            .map_err(|e| {
-                ChainError::DatabaseError(format!(
-                    "failed to get cpu limit for account {}: {}",
-                    account, e
-                ))
-            })?;
+        let res = db.get_account_cpu_limit(account.as_ref(), 0).map_err(|e| {
+            ChainError::DatabaseError(format!(
+                "failed to get cpu limit for account {}: {}",
+                account, e
+            ))
+        })?;
 
         Ok((res.limit, res.greylisted))
     }

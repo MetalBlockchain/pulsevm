@@ -1,9 +1,10 @@
+use pulsevm_error::ChainError;
 use wasmer::{FunctionEnvMut, RuntimeError, WasmPtr};
 
-use crate::chain::{
-    account::AccountMetadata, apply_context::ApplyContext, error::ChainError,
+use crate::{chain::{
+    apply_context::ApplyContext,
     resource_limits::ResourceLimitsManager, utils::pulse_assert, wasm_runtime::WasmContext,
-};
+}, name::Name};
 
 fn privileged_check(context: &ApplyContext) -> Result<(), RuntimeError> {
     if !context.is_privileged()? {
@@ -20,10 +21,9 @@ pub fn is_privileged(
 ) -> Result<i32, RuntimeError> {
     let context = env.data_mut().apply_context_mut();
     privileged_check(context)?;
-    let session = context.undo_session();
-    let account = session
-        .get::<AccountMetadata>(account.into())
-        .map_err(|_| RuntimeError::new(format!("account not found: {}", account)))?;
+    let db = env.data().db();
+    let name: &Name = &account.into();
+    let account = unsafe { &*db.get_account_metadata(name.as_ref())? };
 
     Ok(account.is_privileged() as i32)
 }
@@ -35,7 +35,7 @@ pub fn set_privileged(
 ) -> Result<(), RuntimeError> {
     let context = env.data_mut().apply_context_mut();
     privileged_check(context)?;
-    context.set_privileged(account.into(), is_priv == 1)?;
+    context.set_privileged(&account.into(), is_priv == 1)?;
     Ok(())
 }
 
@@ -66,9 +66,9 @@ pub fn set_resource_limits(
     )?;
     let context = env.data_mut().apply_context_mut();
     privileged_check(context)?;
-    let mut session = context.undo_session();
+    let mut db = env.data_mut().db_mut();
     ResourceLimitsManager::set_account_limits(
-        &mut session,
+        &mut db,
         &account.into(),
         net_weight,
         cpu_weight,
@@ -88,12 +88,12 @@ pub fn get_resource_limits(
     let (env_data, store) = env.data_and_store_mut();
     let context = env_data.apply_context_mut();
     privileged_check(context)?;
-    let mut session = context.undo_session();
+    let mut db = env_data.db_mut();
     let mut ram_bytes = 0;
     let mut net_weight = 0;
     let mut cpu_weight = 0;
     ResourceLimitsManager::get_account_limits(
-        &mut session,
+        &mut db,
         &account.into(),
         &mut ram_bytes,
         &mut net_weight,

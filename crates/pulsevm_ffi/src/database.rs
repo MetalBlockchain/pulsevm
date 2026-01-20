@@ -714,6 +714,24 @@ impl Database {
             .modify_permission(permission, authority, pending_block_time)
             .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
     }
+
+    pub fn lookup_linked_permission(
+        &self,
+        account: &Name,
+        code: &Name,
+        requirement_type: &Name,
+    ) -> Result<Option<&Name>, ChainError> {
+        let guard = self.inner.read()?;
+        let res = guard
+            .lookup_linked_permission(account, code, requirement_type)
+            .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))?;
+
+        if res.is_null() {
+            return Ok(None);
+        }
+
+        Ok(Some(unsafe { &*res }))
+    }
 }
 
 #[cfg(test)]
@@ -741,3 +759,6 @@ impl Default for Database {
         }
     }
 }
+
+unsafe impl Send for Database {}
+unsafe impl Sync for Database {}

@@ -1,3 +1,7 @@
+use pulsevm_error::ChainError;
+
+use crate::{Database, PermissionObject};
+
 #[cxx::bridge(namespace = "pulsevm::chain")]
 pub mod ffi {
     unsafe extern "C++" {
@@ -37,6 +41,7 @@ pub mod ffi {
         pub fn get_auth_sequence(self: &AccountMetadata) -> u64;
         pub fn get_code_sequence(self: &AccountMetadata) -> u64;
         pub fn get_abi_sequence(self: &AccountMetadata) -> u64;
+        pub fn is_privileged(self: &AccountMetadata) -> bool;
 
         // CodeObject methods
         pub fn get_code_hash(self: &CodeObject) -> &Digest;
@@ -45,6 +50,8 @@ pub mod ffi {
         // PermissionObject methods
         pub fn get_id(self: &PermissionObject) -> i64;
         pub fn get_parent_id(self: &PermissionObject) -> i64;
+        pub fn get_owner(self: &PermissionObject) -> &Name;
+        pub fn get_name(self: &PermissionObject) -> &Name;
 
         // Methods on Table
         pub fn get_code(self: &Table) -> &Name;
@@ -58,5 +65,11 @@ pub mod ffi {
         pub fn get_primary_key(self: &KeyValue) -> u64;
         pub fn get_payer(self: &KeyValue) -> &Name;
         pub fn get_value(self: &KeyValue) -> &SharedBlob;
+    }
+}
+
+impl PermissionObject {
+    pub fn satisfies(&self, other: &PermissionObject, db: &mut Database) -> Result<bool, ChainError> {
+        Ok(true) // TODO: Fix this
     }
 }

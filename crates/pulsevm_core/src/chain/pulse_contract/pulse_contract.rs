@@ -261,16 +261,16 @@ pub fn updateauth(context: &mut ApplyContext, db: &mut Database) -> Result<(), C
         &PermissionLevel::new(update.account, update.permission),
     )?;
 
-    let mut parent_id = 0u64;
+    let mut parent_id = 0i64;
     if update.permission != OWNER_NAME {
         let parent = AuthorizationManager::get_permission(db, &update.account, &update.parent)?;
-        parent_id = parent.id();
+        parent_id = parent.get_parent_id();
     }
 
     if permission.is_some() {
         let mut permission = permission.unwrap();
         pulse_assert(
-            parent_id == permission.parent,
+            parent_id == permission.get_parent_id(),
             ChainError::ActionValidationError(format!(
                 "changing parent authority is not currently supported"
             )),
