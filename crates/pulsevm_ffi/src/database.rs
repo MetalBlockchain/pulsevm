@@ -732,6 +732,17 @@ impl Database {
 
         Ok(Some(unsafe { &*res }))
     }
+
+    pub fn get_global_properties(
+        &self,
+    ) -> Result<*const ffi::GlobalPropertyObject, ChainError> {
+        let guard = self.inner.read()?;
+        let res = guard
+            .get_global_properties()
+            .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))?;
+
+        Ok(res)
+    }
 }
 
 #[cfg(test)]

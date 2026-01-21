@@ -60,15 +60,8 @@ pub const fn eos_percent(value: u64, percentage: u32) -> u64 {
     (value * percentage as u64) / PERCENT_100
 }
 
-mod gpo;
-pub use gpo::GlobalPropertyObject;
-
-mod dgpo;
-pub use dgpo::DynamicGlobalPropertyObject;
 use pulsevm_ffi::{KeyValue, Table};
 use pulsevm_proc_macros::name;
-
-use crate::chain::Name;
 
 impl BillableSize for KeyValue {
     fn billable_size() -> u64 {

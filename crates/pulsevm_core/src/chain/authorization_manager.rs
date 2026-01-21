@@ -1,12 +1,11 @@
 use std::collections::HashSet;
 
 use pulsevm_error::ChainError;
-use pulsevm_ffi::{Authority, Database, PermissionObject};
+use pulsevm_ffi::{Authority, ChainConfig, Database, PermissionObject};
 
 use crate::{
     PULSE_NAME,
     chain::{
-        genesis::ChainConfig,
         name::Name,
         pulse_contract::{DeleteAuth, LinkAuth, UnlinkAuth, UpdateAuth},
         secp256k1::PublicKey,
@@ -75,7 +74,10 @@ impl AuthorizationManager {
                             ChainError::IrrelevantAuth(format!(
                                 "action declares irrelevant authority '{}'; minimum authority is {}",
                                 declared_auth,
-                                PermissionLevel::new(min_permission.get_owner().into(), min_permission.get_name().into())
+                                PermissionLevel::new(
+                                    min_permission.get_owner().into(),
+                                    min_permission.get_name().into()
+                                )
                             )),
                         )?;
                     }
@@ -87,7 +89,7 @@ impl AuthorizationManager {
             }
 
             let mut authority_checker =
-                AuthorityChecker::new(chain_config.max_authority_depth, provided_keys);
+                AuthorityChecker::new(chain_config.get_max_authority_depth(), provided_keys);
 
             // Now verify that all the declared authorizations are satisfied
             for p in permissions_to_satisfy.iter() {
@@ -179,7 +181,10 @@ impl AuthorizationManager {
             ChainError::AuthorizationError(format!(
                 "deleteauth action declares irrelevant authority '{}'; minimum authority is {}",
                 auth,
-                PermissionLevel::new(min_permission.get_owner().into(), min_permission.get_name().into())
+                PermissionLevel::new(
+                    min_permission.get_owner().into(),
+                    min_permission.get_name().into()
+                )
             )),
         )?;
         Ok(())

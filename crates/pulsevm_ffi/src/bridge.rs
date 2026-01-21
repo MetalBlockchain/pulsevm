@@ -41,6 +41,10 @@ pub mod ffi {
         type AccountMetadata = crate::objects::ffi::AccountMetadata;
         #[cxx_name = "code_object"]
         type CodeObject = crate::objects::ffi::CodeObject;
+        #[cxx_name = "genesis_state"]
+        type GenesisState = crate::types::ffi::GenesisState;
+        #[cxx_name = "global_property_object"]
+        type GlobalPropertyObject = crate::objects::ffi::GlobalPropertyObject;
         #[cxx_name = "table_id_object"]
         type Table = crate::objects::ffi::Table;
         #[cxx_name = "key_value_object"]
@@ -78,7 +82,7 @@ pub mod ffi {
         // Init methods
         pub fn initialize_database(
             self: Pin<&mut Database>,
-            genesis_data: &[u8],
+            genesis_data: &GenesisState,
         ) -> Result<()>;
 
         // Account methods
@@ -318,6 +322,8 @@ pub mod ffi {
             code: &Name,
             requirement_type: &Name,
         ) -> Result<*const Name>;
+
+        pub fn get_global_properties(self: &Database) -> Result<&GlobalPropertyObject>;
 
         // Methods on undo_session
         pub fn push(self: Pin<&mut UndoSession>) -> Result<()>;

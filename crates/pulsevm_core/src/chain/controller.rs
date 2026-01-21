@@ -5,26 +5,22 @@ use std::{
 };
 
 use crate::{
-    OWNER_NAME, PULSE_NAME,
+    PULSE_NAME,
     chain::{
-        ACTIVE_NAME,
-        account::{Account, AccountMetadata},
         apply_context::ApplyContext,
-        authority::{Authority, KeyWeight},
         authorization_manager::AuthorizationManager,
         block::{BlockHeader, BlockTimestamp, SignedBlock},
         config::{
             BLOCK_CPU_USAGE_AVERAGE_WINDOW_MS, BLOCK_INTERVAL_MS, BLOCK_SIZE_AVERAGE_WINDOW_MS,
-            DELETEAUTH_NAME, GlobalPropertyObject, LINKAUTH_NAME,
+            DELETEAUTH_NAME, LINKAUTH_NAME,
             MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER, NEWACCOUNT_NAME, SETABI_NAME, SETCODE_NAME,
             UNLINKAUTH_NAME, UPDATEAUTH_NAME, eos_percent,
         },
-        genesis::{ChainConfig, Genesis},
         id::Id,
         mempool::Mempool,
         name::Name,
         pulse_contract::{
-            deleteauth, get_pulse_contract_abi, linkauth, newaccount, setabi, setcode, unlinkauth,
+            deleteauth, linkauth, newaccount, setabi, setcode, unlinkauth,
             updateauth,
         },
         resource::ElasticLimitParameters,
@@ -39,7 +35,7 @@ use crate::{
 
 use pulsevm_crypto::{Digest, merkle};
 use pulsevm_error::ChainError;
-use pulsevm_ffi::{BlockLog, Database};
+use pulsevm_ffi::{Database, GenesisState};
 use pulsevm_serialization::{Read, Write};
 use spdlog::info;
 use tokio::sync::RwLock as AsyncRwLock;
@@ -64,8 +60,6 @@ pub static APPLY_HANDLERS: LazyLock<ApplyHandlerMap> = LazyLock::new(|| {
 
 pub struct Controller {
     wasm_runtime: WasmRuntime,
-    config: Arc<ChainConfig>,
-
     last_accepted_block: SignedBlock,
     preferred_id: Id,
     db: Database,
@@ -96,8 +90,6 @@ impl Controller {
         let wasm_runtime = WasmRuntime::new().unwrap();
         let controller = Controller {
             wasm_runtime,
-            config: Arc::new(ChainConfig::default()),
-
             last_accepted_block: SignedBlock::default(),
             preferred_id: Id::default(),
             db: Database::default(),
@@ -118,10 +110,12 @@ impl Controller {
             ChainError::InternalError(Some(format!("failed to open database: {}", e)))
         })?;
         // Parse genesis bytes
-        let genesis = Genesis::parse(genesis_bytes)
-            .map_err(|e| ChainError::ParseError(format!("failed to parse genesis: {}", e)))?
-            .validate()?;
-        self.config = Arc::new(genesis.initial_configuration().clone());
+        let genesis_json = std::str::from_utf8(genesis_bytes).map_err(|e| {
+            ChainError::ParseError(format!("failed to parse genesis bytes as UTF-8: {}", e))
+        })?;
+        let genesis = GenesisState::new(genesis_json)
+            .map_err(|e| ChainError::ParseError(format!("failed to parse genesis: {}", e)))?;
+        // TODO: Validate genesis state
         self.chain_id = genesis.compute_chain_id()?;
         self.block_log = Some(BlockLog::open("blocks").map_err(|e| {
             ChainError::InternalError(Some(format!("failed to open block log: {}", e)))
@@ -149,74 +143,10 @@ impl Controller {
         })?;
 
         if genesis_block.is_none() {
-            session.insert(&self.last_accepted_block).map_err(|e| {
-                ChainError::GenesisError(format!("failed to insert genesis block: {}", e))
+            // Initialize the database with the genesis state
+            self.db.initialize_database(genesis_bytes).map_err(|e| {
+                ChainError::GenesisError(format!("failed to initialize database: {}", e))
             })?;
-            let default_key = genesis.initial_key();
-            info!(
-                "initializing pulse account with default key: {}",
-                default_key
-            );
-            let default_authority = Authority::new(
-                1,
-                vec![KeyWeight::new(default_key.clone(), 1)],
-                vec![],
-                vec![],
-            );
-            // Create the pulse@owner permission
-            let owner_permission = AuthorizationManager::create_permission(
-                &mut session,
-                PULSE_NAME,
-                OWNER_NAME,
-                0,
-                default_authority.clone(),
-            )
-            .map_err(|e| {
-                ChainError::GenesisError(format!("failed to create pulse@owner permission: {}", e))
-            })?;
-            // Create the pulse@active permission
-            AuthorizationManager::create_permission(
-                &mut self.db,
-                PULSE_NAME,
-                ACTIVE_NAME,
-                owner_permission.id(),
-                default_authority.clone(),
-            )
-            .map_err(|e| {
-                ChainError::GenesisError(format!("failed to create pulse@owner permission: {}", e))
-            })?;
-            let abi = get_pulse_contract_abi().pack().map_err(|e| {
-                ChainError::GenesisError(format!("failed to pack pulse abi: {}", e))
-            })?;
-            session
-                .insert(&Account::new(
-                    PULSE_NAME,
-                    self.last_accepted_block().timestamp(),
-                    abi,
-                ))
-                .map_err(|e| {
-                    ChainError::GenesisError(format!("failed to insert pulse account: {}", e))
-                })?;
-            session
-                .insert(&AccountMetadata::new(PULSE_NAME, true))
-                .map_err(|e| {
-                    ChainError::GenesisError(format!(
-                        "failed to insert pulse account metadata: {}",
-                        e
-                    ))
-                })?;
-            session.insert(&GlobalPropertyObject {
-                chain_id: self.chain_id.clone(),
-                configuration: genesis.initial_configuration().clone(),
-            })?;
-            ResourceLimitsManager::initialize_database(&mut self.db)?;
-            ResourceLimitsManager::initialize_account(&mut self.db, &PULSE_NAME.into()).map_err(|e| {
-                ChainError::GenesisError(format!(
-                    "failed to initialize resource limits for pulse account: {}",
-                    e
-                ))
-            })?;
-            session.commit()?;
         }
 
         Ok(())
@@ -425,7 +355,6 @@ impl Controller {
 
         let mut trx_context = TransactionContext::new(
             self.db.clone(),
-            self.config.clone(),
             self.wasm_runtime.clone(),
             self.last_accepted_block().block_num() + 1,
             pending_block_timestamp.clone(),

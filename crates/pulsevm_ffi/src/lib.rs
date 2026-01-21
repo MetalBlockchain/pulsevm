@@ -1,4 +1,5 @@
 mod bridge;
+mod crypto;
 mod database;
 mod iterator_cache;
 mod name;
@@ -13,5 +14,6 @@ pub use crate::objects::ffi::{
     PermissionUsageObject, Table, TableId,
 };
 pub use crate::types::ffi::{
-    Authority, BlockTimestamp, Digest, SharedAuthority, SharedBlob, TimePoint,
+    Authority, BlockTimestamp, ChainConfig, Digest, GenesisState, Microseconds, SharedAuthority,
+    SharedBlob, TimePoint, PublicKey,
 };

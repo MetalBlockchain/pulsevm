@@ -8,7 +8,7 @@ use chrono::Utc;
 use cxx::SharedPtr;
 use pulsevm_crypto::Bytes;
 use pulsevm_error::ChainError;
-use pulsevm_ffi::{AccountMetadata, Database, KeyValue, KeyValueIteratorCache, Table};
+use pulsevm_ffi::{AccountMetadata, ChainConfig, Database, KeyValue, KeyValueIteratorCache, Table};
 use spdlog::info;
 
 use crate::{
@@ -17,9 +17,8 @@ use crate::{
         authority::PermissionLevel,
         authorization_manager::AuthorizationManager,
         block::BlockTimestamp,
-        config::{DynamicGlobalPropertyObject, billable_size_v},
+        config::billable_size_v,
         controller::Controller,
-        genesis::ChainConfig,
         id::Id,
         transaction::{Action, ActionReceipt, generate_action_digest},
         transaction_context::TransactionContext,
@@ -42,7 +41,6 @@ struct ApplyContextInner {
 
 #[derive(Clone)]
 pub struct ApplyContext {
-    chain_config: Arc<ChainConfig>,
     wasm_runtime: WasmRuntime,       // Context for the Wasm runtime
     trx_context: TransactionContext, // The transaction context
     db: Database,                    // The database being used
@@ -59,7 +57,6 @@ pub struct ApplyContext {
 impl ApplyContext {
     pub fn new(
         db: Database,
-        chain_config: Arc<ChainConfig>,
         wasm_runtime: WasmRuntime,
         trx_context: TransactionContext,
         action: Action,
@@ -70,7 +67,6 @@ impl ApplyContext {
         let pending_block_timestamp = trx_context.pending_block_timestamp()?;
 
         Ok(ApplyContext {
-            chain_config,
             wasm_runtime,
             trx_context,
             db,
@@ -152,7 +148,7 @@ impl ApplyContext {
             self.action.name(),
         );
         if let Some(native) = native {
-            native(self)?;
+            native(self, &mut self.db.clone())?;
         }
 
         // Refresh the receiver account metadata
@@ -341,8 +337,9 @@ impl ApplyContext {
             let inner = self.inner.read()?;
 
             if !inner.privileged {
+                let global_properties = unsafe { &*self.db.get_global_properties()? };
                 AuthorizationManager::check_authorization(
-                    &self.chain_config,
+                    global_properties.get_chain_config(),
                     &mut self.db,
                     &vec![a.clone()],
                     &HashSet::new(),       // No provided keys
@@ -474,10 +471,10 @@ impl ApplyContext {
                 ChainError::TransactionError(format!("db access violation",)),
             )?;
 
-            let old_size = obj.get_value().len() as i64;
+            let old_size = obj.get_value().size() as i64;
             self.db
                 .update_key_value_object(obj, payer.as_ref(), data.as_ref())?;
-            let new_size = obj.get_value().len() as i64;
+            let new_size = obj.get_value().size() as i64;
             let existing_payer = Name::new(obj.get_payer().to_uint64_t()); // TODO: Avoid this conversion
             (old_size, new_size, existing_payer)
         };
@@ -509,7 +506,7 @@ impl ApplyContext {
     ) -> Result<i32, ChainError> {
         let inner = self.inner.read()?;
         let obj = inner.keyval_cache.get(iterator)?;
-        let s = obj.get_value().len();
+        let s = obj.get_value().size();
         if buffer_size == 0 {
             return Ok(s as i32);
         }
@@ -517,7 +514,7 @@ impl ApplyContext {
         if buffer.len() < copy_size {
             buffer.resize(copy_size, 0);
         }
-        buffer[..copy_size].copy_from_slice(&obj.get_value().as_ref()[..copy_size]);
+        buffer[..copy_size].copy_from_slice(&obj.get_value().get_data()[..copy_size]);
         Ok(copy_size as i32)
     }
 

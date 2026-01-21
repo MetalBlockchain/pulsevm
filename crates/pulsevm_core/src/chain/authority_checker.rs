@@ -1,16 +1,15 @@
 use std::collections::{HashMap, HashSet};
 
+use cxx::SharedPtr;
 use pulsevm_error::ChainError;
-use pulsevm_ffi::Database;
+use pulsevm_ffi::{Database, PublicKey};
 
-use crate::chain::secp256k1::PublicKey;
-
-use super::authority::{Authority, KeyWeight, Permission, PermissionLevel, PermissionLevelWeight};
+use super::authority::{Authority, KeyWeight, PermissionLevel, PermissionLevelWeight};
 
 pub struct AuthorityChecker<'a> {
     recursion_depth_limit: u16,
-    provided_keys: &'a HashSet<PublicKey>,
-    used_keys: HashSet<PublicKey>,
+    provided_keys: &'a HashSet<SharedPtr<PublicKey>>,
+    used_keys: HashSet<SharedPtr<PublicKey>>,
     cached_permissions: HashMap<PermissionLevel, PermissionCacheStatus>,
 }
 
@@ -22,7 +21,7 @@ enum PermissionCacheStatus {
 }
 
 impl<'a> AuthorityChecker<'a> {
-    pub fn new(recursion_depth_limit: u16, provided_keys: &'a HashSet<PublicKey>) -> Self {
+    pub fn new(recursion_depth_limit: u16, provided_keys: &'a HashSet<SharedPtr<PublicKey>>) -> Self {
         Self {
             recursion_depth_limit,
             provided_keys,

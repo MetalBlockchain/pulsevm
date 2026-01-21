@@ -11,6 +11,8 @@ pub mod ffi {
         type Account;
         #[cxx_name = "account_metadata_object"]
         type AccountMetadata;
+        #[cxx_name = "chain_config"]
+        type ChainConfig = crate::types::ffi::ChainConfig;
         #[cxx_name = "permission_object"]
         pub type PermissionObject;
         #[cxx_name = "permission_usage_object"]
@@ -21,6 +23,8 @@ pub mod ffi {
         pub type CodeObject;
         #[cxx_name = "name"]
         pub type Name = crate::name::ffi::Name;
+        #[cxx_name = "global_property_object"]
+        pub type GlobalPropertyObject;
         #[cxx_name = "table_id_object"]
         pub type Table;
         #[cxx_name = "table_id"]
@@ -65,11 +69,18 @@ pub mod ffi {
         pub fn get_primary_key(self: &KeyValue) -> u64;
         pub fn get_payer(self: &KeyValue) -> &Name;
         pub fn get_value(self: &KeyValue) -> &SharedBlob;
+
+        // Methods on GlobalPropertyObject
+        pub fn get_chain_config(self: &GlobalPropertyObject) -> &ChainConfig;
     }
 }
 
 impl PermissionObject {
-    pub fn satisfies(&self, other: &PermissionObject, db: &mut Database) -> Result<bool, ChainError> {
+    pub fn satisfies(
+        &self,
+        other: &PermissionObject,
+        db: &mut Database,
+    ) -> Result<bool, ChainError> {
         Ok(true) // TODO: Fix this
     }
 }
