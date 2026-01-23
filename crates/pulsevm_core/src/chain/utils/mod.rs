@@ -1,6 +1,9 @@
 mod base64_bytes;
 pub use base64_bytes::*;
 
+mod digest;
+pub use digest::*;
+
 mod i32_flex;
 pub use i32_flex::*;
 

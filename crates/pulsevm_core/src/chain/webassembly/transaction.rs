@@ -12,11 +12,11 @@ use crate::{
         authority::PermissionLevel,
         authorization_manager::AuthorizationManager,
         controller::Controller,
-        secp256k1::PublicKey,
         transaction::{Action, Transaction},
         utils::pulse_assert,
         wasm_runtime::WasmContext,
     },
+    crypto::PublicKey,
 };
 
 pub fn send_inline(
@@ -29,7 +29,7 @@ pub fn send_inline(
         let mut db = env_data.db_mut();
         let gpo = Controller::get_global_properties(&mut db)?;
         pulse_assert(
-            length < gpo.configuration.max_inline_action_size,
+            length < gpo.get_chain_config().get_max_inline_action_size(),
             ChainError::WasmRuntimeError(format!("inline action too big")),
         )?;
     }

@@ -1,17 +1,17 @@
 use std::collections::HashSet;
 
 use pulsevm_error::ChainError;
-use pulsevm_ffi::{Authority, ChainConfig, Database, PermissionObject};
+use pulsevm_ffi::{Authority, CxxChainConfig, CxxTimePoint, Database, PermissionObject};
 
 use crate::{
     PULSE_NAME,
     chain::{
         name::Name,
         pulse_contract::{DeleteAuth, LinkAuth, UnlinkAuth, UpdateAuth},
-        secp256k1::PublicKey,
         transaction::Action,
     },
     config::{DELETEAUTH_NAME, LINKAUTH_NAME, UNLINKAUTH_NAME, UPDATEAUTH_NAME},
+    crypto::PublicKey,
     utils::pulse_assert,
 };
 
@@ -25,7 +25,7 @@ pub struct AuthorizationManager;
 
 impl AuthorizationManager {
     pub fn check_authorization(
-        chain_config: &ChainConfig,
+        chain_config: &CxxChainConfig,
         db: &mut Database,
         actions: &Vec<Action>,
         provided_keys: &HashSet<PublicKey>,
@@ -391,7 +391,7 @@ impl AuthorizationManager {
         name: &Name,
         parent: u64,
         auth: &Authority,
-        pending_block_time: &pulsevm_ffi::TimePoint,
+        pending_block_time: &CxxTimePoint,
     ) -> Result<*const PermissionObject, ChainError> {
         db.create_permission(
             account.as_ref(),
@@ -406,7 +406,7 @@ impl AuthorizationManager {
         db: &mut Database,
         permission: &PermissionObject,
         auth: &Authority,
-        pending_block_time: &pulsevm_ffi::TimePoint,
+        pending_block_time: &CxxTimePoint,
     ) -> Result<(), ChainError> {
         db.modify_permission(permission, auth, pending_block_time)
     }

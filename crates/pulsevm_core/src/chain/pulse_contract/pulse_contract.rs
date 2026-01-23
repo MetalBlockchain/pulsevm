@@ -1,5 +1,5 @@
 use pulsevm_error::ChainError;
-use pulsevm_ffi::{Database, Digest, u64_to_name};
+use pulsevm_ffi::{CxxDigest, Database, u64_to_name};
 use pulsevm_serialization::Write;
 
 use crate::{
@@ -67,7 +67,7 @@ pub fn newaccount(context: &mut ApplyContext, db: &mut Database) -> Result<(), C
     )?;
 
     db.create_account(
-        create.name.as_ref(),
+        create.name.as_u64(),
         context.pending_block_timestamp().slot(),
     )?;
     db.create_account_metadata(create.name.as_ref(), false)?;
@@ -75,29 +75,42 @@ pub fn newaccount(context: &mut ApplyContext, db: &mut Database) -> Result<(), C
     validate_authority_precondition(db, &create.owner)?;
     validate_authority_precondition(db, &create.active)?;
 
-    let owner_permission = AuthorizationManager::create_permission(
-        db,
-        &create.name,
-        &OWNER_NAME.into(),
-        0,
-        &create.owner,
-    )?;
+    let owner_permission = unsafe {
+        &*AuthorizationManager::create_permission(
+            db,
+            &create.name,
+            &OWNER_NAME.into(),
+            0,
+            &create.owner.into(),
+            context
+                .pending_block_timestamp()
+                .to_time_point()
+                .as_ref()
+                .unwrap(),
+        )?
+    };
     let active_permission = AuthorizationManager::create_permission(
         db,
         &create.name,
         &ACTIVE_NAME.into(),
-        owner_permission.id(),
-        &create.active,
+        owner_permission.get_id() as u64,
+        &create.active.into(),
+        context
+            .pending_block_timestamp()
+            .to_time_point()
+            .as_ref()
+            .unwrap(),
     )?;
 
     ResourceLimitsManager::initialize_account(db, &create.name)?;
 
-    let mut ram_delta: i64 = config::OVERHEAD_PER_ACCOUNT_RAM_BYTES as i64;
+    // TODO: Fix RAM billing
+    /* let mut ram_delta: i64 = config::OVERHEAD_PER_ACCOUNT_RAM_BYTES as i64;
     ram_delta += 2 * config::billable_size_v::<Permission>() as i64;
     ram_delta += owner_permission.authority.get_billable_size() as i64;
     ram_delta += active_permission.authority.get_billable_size() as i64;
 
-    context.add_ram_usage(&create.name, ram_delta);
+    context.add_ram_usage(&create.name, ram_delta); */
 
     Ok(())
 }
@@ -118,11 +131,11 @@ pub fn setcode(context: &mut ApplyContext, db: &mut Database) -> Result<(), Chai
         ChainError::TransactionError(format!("version should be 0")),
     )?;
 
-    let mut code_hash = Digest::new_empty();
+    let mut code_hash = CxxDigest::new_empty();
     let code_size = act.code.len() as u64;
 
     if code_size > 0 {
-        code_hash = Digest::hash(act.code.as_slice());
+        code_hash = CxxDigest::hash(act.code.as_slice());
         // TODO: validate wasm
     }
 
@@ -150,7 +163,7 @@ pub fn setcode(context: &mut ApplyContext, db: &mut Database) -> Result<(), Chai
         )?;
 
         old_size =
-            old_code_entry.get_code().len() as i64 * config::SETCODE_RAM_BYTES_MULTIPLIER as i64;
+            old_code_entry.get_code().size() as i64 * config::SETCODE_RAM_BYTES_MULTIPLIER as i64;
 
         db.unlink_account_code(old_code_entry)?;
     }
@@ -191,7 +204,7 @@ pub fn setabi(context: &mut ApplyContext, db: &mut Database) -> Result<(), Chain
         .pack()
         .map_err(|e| ChainError::TransactionError(format!("failed to serialize ABI: {}", e)))?;
     let account = unsafe { &*db.get_account(act.account.as_ref())? };
-    let old_size: i64 = account.get_abi().len() as i64;
+    let old_size: i64 = account.get_abi().size() as i64;
     let new_size: i64 = abi_def_packed.len() as i64;
     let account_metadata = unsafe { &*db.get_account_metadata(act.account.as_ref())? };
 
@@ -258,7 +271,7 @@ pub fn updateauth(context: &mut ApplyContext, db: &mut Database) -> Result<(), C
 
     let permission = AuthorizationManager::find_permission(
         db,
-        &PermissionLevel::new(update.account, update.permission),
+        &PermissionLevel::new(update.account.clone(), update.permission.clone()),
     )?;
 
     let mut parent_id = 0i64;
@@ -268,7 +281,7 @@ pub fn updateauth(context: &mut ApplyContext, db: &mut Database) -> Result<(), C
     }
 
     if permission.is_some() {
-        let mut permission = permission.unwrap();
+        let permission = permission.unwrap();
         pulse_assert(
             parent_id == permission.get_parent_id(),
             ChainError::ActionValidationError(format!(
@@ -276,25 +289,28 @@ pub fn updateauth(context: &mut ApplyContext, db: &mut Database) -> Result<(), C
             )),
         )?;
 
-        let old_size: i64 = config::billable_size_v::<Permission>() as i64
+        // TODO: Fix RAM billing
+        /* let old_size: i64 = config::billable_size_v::<Permission>() as i64
             + permission.authority.get_billable_size() as i64;
         AuthorizationManager::modify_permission(db, &mut permission, &update.auth)?;
         let new_size: i64 = config::billable_size_v::<Permission>() as i64
             + permission.authority.get_billable_size() as i64;
 
-        context.add_ram_usage(&permission.owner, new_size - old_size);
+        context.add_ram_usage(permission.get_owner(), new_size - old_size); */
     } else {
-        let p = AuthorizationManager::create_permission(
+        /* let p = AuthorizationManager::create_permission(
             db,
             &update.account,
             &update.permission,
-            parent_id,
-            &update.auth,
-        )?;
-        let new_size: i64 =
+            parent_id as u64,
+            &update.auth.into(),
+            context.pending_block_timestamp().to_time_point().as_ref().unwrap(),
+        )?; */
+        // TODO: Fix RAM billing
+        /* let new_size: i64 =
             config::billable_size_v::<Permission>() as i64 + p.authority.get_billable_size() as i64;
 
-        context.add_ram_usage(&update.account, new_size);
+        context.add_ram_usage(&update.account, new_size); */
     }
 
     Ok(())

@@ -1,9 +1,9 @@
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 use serde::Serialize;
 
-use crate::chain::{config::BillableSize, secp256k1::PublicKey};
+use crate::{chain::config::BillableSize, crypto::PublicKey};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Read, Write, NumBytes, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Read, Write, NumBytes, Serialize)]
 pub struct KeyWeight {
     key: PublicKey,
     weight: u16,

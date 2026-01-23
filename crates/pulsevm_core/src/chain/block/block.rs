@@ -6,8 +6,9 @@ use pulsevm_proc_macros::{NumBytes, Read, Write, name};
 use pulsevm_serialization::Write;
 use serde::{Serialize, ser::SerializeStruct};
 
-use crate::chain::{
-    Name, block::BlockTimestamp, id::Id, secp256k1::Signature, transaction::TransactionReceipt,
+use crate::{
+    chain::{Name, block::BlockTimestamp, id::Id, transaction::TransactionReceipt},
+    crypto::Signature,
 };
 
 #[derive(Debug, Default, Clone, Read, Write, NumBytes)]

@@ -1,4 +1,5 @@
 #pragma once
+#include <rust/cxx.h>
 #include <span>
 #include <compare>
 #include <fc/fwd.hpp>
@@ -24,6 +25,15 @@ class sha256 : public add_packhash_to_hash<sha256>
     const char* data()const;
     char*       data();
     size_t      data_size() const { return 256 / 8; }
+    rust::Slice<const uint8_t> get_data() const {
+      if (!this->data()) {
+         return {};
+      }
+      return rust::Slice<const uint8_t>(
+         reinterpret_cast<const uint8_t*>(this->data()),
+         this->data_size()
+      );
+    }
 
     std::span<const uint8_t> to_uint8_span() const {
        return {reinterpret_cast<const uint8_t*>(data()),  reinterpret_cast<const uint8_t*>(data()) + data_size()};

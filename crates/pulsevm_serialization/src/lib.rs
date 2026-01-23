@@ -46,12 +46,13 @@ pub trait Write: Sized + NumBytes {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum ReadError {
     /// Not enough bytes.
     NotEnoughBytes,
     ParseError,
     Overflow,
+    CustomError(String),
 }
 
 impl fmt::Display for ReadError {
@@ -60,6 +61,7 @@ impl fmt::Display for ReadError {
             ReadError::NotEnoughBytes => write!(f, "not enough bytes to read"),
             ReadError::ParseError => write!(f, "parse error"),
             ReadError::Overflow => write!(f, "integer overflow"),
+            ReadError::CustomError(msg) => write!(f, "read error: {}", msg),
         }
     }
 }

@@ -2,61 +2,63 @@ use std::{ops::Deref, pin::Pin};
 
 use pulsevm_error::ChainError;
 
-use crate::{KeyValue, Table, TableId};
+use crate::objects::ffi::{KeyValueObject, TableId, TableObject};
 
 #[cxx::bridge(namespace = "pulsevm::chain")]
 pub mod ffi {
     unsafe extern "C++" {
         include!("iterator_cache.hpp");
 
-        #[cxx_name = "table_id_object"]
-        type Table = crate::objects::ffi::Table;
-        #[cxx_name = "table_id"]
+        type TableObject = crate::objects::ffi::TableObject;
         type TableId = crate::objects::ffi::TableId;
-        #[cxx_name = "key_value_object"]
-        type KeyValue = crate::objects::ffi::KeyValue;
+        type KeyValueObject = crate::objects::ffi::KeyValueObject;
 
-        #[cxx_name = "key_value_iterator_cache"]
-        pub type KeyValueIteratorCache;
-        pub fn new_key_value_iterator_cache() -> UniquePtr<KeyValueIteratorCache>;
-        pub fn cache_table(self: Pin<&mut KeyValueIteratorCache>, table: &Table) -> Result<i32>;
-        pub fn get_table(self: &KeyValueIteratorCache, table_id: &TableId) -> Result<&Table>;
+        pub type CxxKeyValueIteratorCache;
+        pub fn new_key_value_iterator_cache() -> UniquePtr<CxxKeyValueIteratorCache>;
+        pub fn cache_table(
+            self: Pin<&mut CxxKeyValueIteratorCache>,
+            table: &TableObject,
+        ) -> Result<i32>;
+        pub fn get_table(
+            self: &CxxKeyValueIteratorCache,
+            table_id: &TableId,
+        ) -> Result<&TableObject>;
         pub fn get_end_iterator_by_table_id(
-            self: &KeyValueIteratorCache,
+            self: &CxxKeyValueIteratorCache,
             table_id: &TableId,
         ) -> Result<i32>;
         pub fn find_table_by_end_iterator(
-            self: &KeyValueIteratorCache,
+            self: &CxxKeyValueIteratorCache,
             ei: i32,
-        ) -> Result<*const Table>;
-        pub fn get(self: &KeyValueIteratorCache, iterator: i32) -> Result<&KeyValue>;
-        pub fn remove(self: Pin<&mut KeyValueIteratorCache>, iterator: i32) -> Result<()>;
-        pub fn add(self: Pin<&mut KeyValueIteratorCache>, obj: &KeyValue) -> Result<i32>;
+        ) -> Result<*const TableObject>;
+        pub fn get(self: &CxxKeyValueIteratorCache, iterator: i32) -> Result<&KeyValueObject>;
+        pub fn remove(self: Pin<&mut CxxKeyValueIteratorCache>, iterator: i32) -> Result<()>;
+        pub fn add(self: Pin<&mut CxxKeyValueIteratorCache>, obj: &KeyValueObject) -> Result<i32>;
     }
 }
 
-pub struct KeyValueIteratorCache {
-    inner: cxx::UniquePtr<ffi::KeyValueIteratorCache>,
+pub struct CxxKeyValueIteratorCache {
+    inner: cxx::UniquePtr<ffi::CxxKeyValueIteratorCache>,
 }
 
-impl KeyValueIteratorCache {
+impl CxxKeyValueIteratorCache {
     pub fn new() -> Self {
         let inner = ffi::new_key_value_iterator_cache();
-        KeyValueIteratorCache { inner }
+        CxxKeyValueIteratorCache { inner }
     }
 
-    pub fn pin_mut(&mut self) -> Pin<&mut ffi::KeyValueIteratorCache> {
+    pub fn pin_mut(&mut self) -> Pin<&mut ffi::CxxKeyValueIteratorCache> {
         self.inner.pin_mut()
     }
 
-    pub fn cache_table(&mut self, table: &Table) -> Result<i32, ChainError> {
+    pub fn cache_table(&mut self, table: &TableObject) -> Result<i32, ChainError> {
         self.inner
             .pin_mut()
             .cache_table(table)
             .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
     }
 
-    pub fn get_table(&self, table_id: &TableId) -> Result<&Table, ChainError> {
+    pub fn get_table(&self, table_id: &TableId) -> Result<&TableObject, ChainError> {
         self.inner
             .get_table(table_id)
             .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
@@ -68,7 +70,7 @@ impl KeyValueIteratorCache {
             .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
     }
 
-    pub fn find_table_by_end_iterator(&self, ei: i32) -> Result<Option<&Table>, ChainError> {
+    pub fn find_table_by_end_iterator(&self, ei: i32) -> Result<Option<&TableObject>, ChainError> {
         let res = self
             .inner
             .find_table_by_end_iterator(ei)
@@ -80,7 +82,7 @@ impl KeyValueIteratorCache {
         }
     }
 
-    pub fn get(&self, id: i32) -> Result<&KeyValue, ChainError> {
+    pub fn get(&self, id: i32) -> Result<&KeyValueObject, ChainError> {
         self.inner
             .get(id)
             .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
@@ -93,7 +95,7 @@ impl KeyValueIteratorCache {
             .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
     }
 
-    pub fn add(&mut self, obj: &KeyValue) -> Result<i32, ChainError> {
+    pub fn add(&mut self, obj: &KeyValueObject) -> Result<i32, ChainError> {
         self.inner
             .pin_mut()
             .add(obj)
@@ -101,13 +103,13 @@ impl KeyValueIteratorCache {
     }
 }
 
-impl Deref for KeyValueIteratorCache {
-    type Target = cxx::UniquePtr<ffi::KeyValueIteratorCache>;
+impl Deref for CxxKeyValueIteratorCache {
+    type Target = cxx::UniquePtr<ffi::CxxKeyValueIteratorCache>;
 
     fn deref(&self) -> &Self::Target {
         &self.inner
     }
 }
 
-unsafe impl Send for ffi::KeyValueIteratorCache {}
-unsafe impl Sync for ffi::KeyValueIteratorCache {}
+unsafe impl Send for ffi::CxxKeyValueIteratorCache {}
+unsafe impl Sync for ffi::CxxKeyValueIteratorCache {}

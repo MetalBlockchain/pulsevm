@@ -2,146 +2,201 @@ use std::hash::{Hash, Hasher};
 
 use cxx::{CxxString, SharedPtr, UniquePtr};
 use pulsevm_error::ChainError;
+use pulsevm_serialization::{NumBytes, Read};
 
 use crate::{
-    BlockTimestamp, PublicKey, TimePoint, bridge::ffi::GenesisState, types::ffi::{Digest, SharedBlob}
+    CxxSignature,
+    types::ffi::{CxxBlockTimestamp, CxxDigest, CxxGenesisState, CxxPublicKey, CxxTimePoint},
 };
 
 #[cxx::bridge(namespace = "pulsevm::chain")]
 pub mod ffi {
+    pub struct KeyWeight {
+        key: SharedPtr<CxxPublicKey>,
+        weight: u16,
+    }
+
+    pub struct PermissionLevel {
+        actor: u64,
+        permission: u64,
+    }
+
+    pub struct PermissionLevelWeight {
+        permission: PermissionLevel,
+        weight: u16,
+    }
+
+    pub struct WaitWeight {
+        wait_sec: u32,
+        weight: u16,
+    }
+
+    pub struct Authority {
+        threshold: u32,
+        keys: Vec<KeyWeight>,
+        accounts: Vec<PermissionLevelWeight>,
+        waits: Vec<WaitWeight>,
+    }
+
     unsafe extern "C++" {
         include!("types.hpp");
 
-        #[cxx_name = "authority"]
-        type Authority;
+        type CxxAuthority;
 
-        #[cxx_name = "block_timestamp_type"]
-        type BlockTimestamp;
-        pub fn to_time_point(self: &BlockTimestamp) -> SharedPtr<TimePoint>;
-        pub fn get_slot(self: &BlockTimestamp) -> u32;
+        type CxxBlockTimestamp;
+        pub fn to_time_point(self: &CxxBlockTimestamp) -> SharedPtr<CxxTimePoint>;
+        pub fn get_slot(self: &CxxBlockTimestamp) -> u32;
 
-        #[cxx_name = "chain_config"]
-        type ChainConfig;
-        pub fn get_max_block_net_usage(self: &ChainConfig) -> u64;
-        pub fn get_target_block_net_usage_pct(self: &ChainConfig) -> u32;
-        pub fn get_max_transaction_net_usage(self: &ChainConfig) -> u32;
-        pub fn get_base_per_transaction_net_usage(self: &ChainConfig) -> u32;
-        pub fn get_net_usage_leeway(self: &ChainConfig) -> u32;
-        pub fn get_context_free_discount_net_usage_num(self: &ChainConfig) -> u32;
-        pub fn get_context_free_discount_net_usage_den(self: &ChainConfig) -> u32;
-        pub fn get_max_block_cpu_usage(self: &ChainConfig) -> u32;
-        pub fn get_target_block_cpu_usage_pct(self: &ChainConfig) -> u32;
-        pub fn get_max_transaction_cpu_usage(self: &ChainConfig) -> u32;
-        pub fn get_min_transaction_cpu_usage(self: &ChainConfig) -> u32;
-        pub fn get_max_transaction_lifetime(self: &ChainConfig) -> u32;
-        pub fn get_deferred_trx_expiration_window(self: &ChainConfig) -> u32;
-        pub fn get_max_transaction_delay(self: &ChainConfig) -> u32;
-        pub fn get_max_inline_action_size(self: &ChainConfig) -> u32;
-        pub fn get_max_inline_action_depth(self: &ChainConfig) -> u16;
-        pub fn get_max_authority_depth(self: &ChainConfig) -> u16;
-        pub fn get_max_action_return_value_size(self: &ChainConfig) -> u32;
+        type CxxChainConfig;
+        pub fn get_max_block_net_usage(self: &CxxChainConfig) -> u64;
+        pub fn get_target_block_net_usage_pct(self: &CxxChainConfig) -> u32;
+        pub fn get_max_transaction_net_usage(self: &CxxChainConfig) -> u32;
+        pub fn get_base_per_transaction_net_usage(self: &CxxChainConfig) -> u32;
+        pub fn get_net_usage_leeway(self: &CxxChainConfig) -> u32;
+        pub fn get_context_free_discount_net_usage_num(self: &CxxChainConfig) -> u32;
+        pub fn get_context_free_discount_net_usage_den(self: &CxxChainConfig) -> u32;
+        pub fn get_max_block_cpu_usage(self: &CxxChainConfig) -> u32;
+        pub fn get_target_block_cpu_usage_pct(self: &CxxChainConfig) -> u32;
+        pub fn get_max_transaction_cpu_usage(self: &CxxChainConfig) -> u32;
+        pub fn get_min_transaction_cpu_usage(self: &CxxChainConfig) -> u32;
+        pub fn get_max_transaction_lifetime(self: &CxxChainConfig) -> u32;
+        pub fn get_deferred_trx_expiration_window(self: &CxxChainConfig) -> u32;
+        pub fn get_max_transaction_delay(self: &CxxChainConfig) -> u32;
+        pub fn get_max_inline_action_size(self: &CxxChainConfig) -> u32;
+        pub fn get_max_inline_action_depth(self: &CxxChainConfig) -> u16;
+        pub fn get_max_authority_depth(self: &CxxChainConfig) -> u16;
+        pub fn get_max_action_return_value_size(self: &CxxChainConfig) -> u32;
 
-        #[cxx_name = "digest_type"]
-        type Digest;
-        pub fn get_data(self: &Digest) -> &[u8];
-        pub fn empty(self: &Digest) -> bool;
+        type CxxDigest;
+        pub fn get_data(self: &CxxDigest) -> &[u8];
+        pub fn empty(self: &CxxDigest) -> bool;
 
-        #[cxx_name = "genesis_state"]
-        type GenesisState;
-        pub fn get_initial_timestamp(self: &GenesisState) -> &TimePoint;
-        pub fn get_initial_key(self: &GenesisState) -> &PublicKey;
-        pub fn get_initial_configuration(self: &GenesisState) -> &ChainConfig;
+        type CxxGenesisState;
+        pub fn get_initial_timestamp(self: &CxxGenesisState) -> &CxxTimePoint;
+        pub fn get_initial_key(self: &CxxGenesisState) -> &CxxPublicKey;
+        pub fn get_initial_configuration(self: &CxxGenesisState) -> &CxxChainConfig;
 
-        #[cxx_name = "microseconds"]
-        type Microseconds;
-        pub fn count(self: &Microseconds) -> i64;
+        type CxxMicroseconds;
+        pub fn count(self: &CxxMicroseconds) -> i64;
 
-        #[cxx_name = "public_key_type"]
-        type PublicKey;
-        pub fn cmp(self: &PublicKey, other: &PublicKey) -> i32;
-        pub fn pack(self: &PublicKey) -> Vec<u8>;
+        type CxxPublicKey;
+        pub fn cmp(self: &CxxPublicKey, other: &CxxPublicKey) -> i32;
+        pub fn pack(self: &CxxPublicKey) -> Vec<u8>;
+        pub fn to_string_rust(self: &CxxPublicKey) -> &str;
+        pub fn num_bytes(self: &CxxPublicKey) -> usize;
 
-        #[cxx_name = "shared_blob"]
-        type SharedBlob;
-        pub fn get_data(self: &SharedBlob) -> &[u8];
-        pub fn size(self: &SharedBlob) -> usize;
+        type CxxSignature;
+        pub fn cmp(self: &CxxSignature, other: &CxxSignature) -> i32;
+        pub fn pack(self: &CxxSignature) -> Vec<u8>;
+        pub fn to_string_rust(self: &CxxSignature) -> &str;
+        pub fn num_bytes(self: &CxxSignature) -> usize;
 
-        #[cxx_name = "time_point"]
-        type TimePoint;
-        pub fn time_since_epoch(self: &TimePoint) -> &Microseconds;
-        pub fn sec_since_epoch(self: &TimePoint) -> u32;
+        type CxxSharedBlob;
+        pub fn get_data(self: &CxxSharedBlob) -> &[u8];
+        pub fn size(self: &CxxSharedBlob) -> usize;
 
-        #[cxx_name = "shared_authority"]
-        type SharedAuthority;
+        type CxxTimePoint;
+        pub fn time_since_epoch(self: &CxxTimePoint) -> &CxxMicroseconds;
+        pub fn sec_since_epoch(self: &CxxTimePoint) -> u32;
+
+        type CxxSharedAuthority;
+        type CxxKeyWeight;
+        type CxxPermissionLevelWeight;
+        type CxxWaitWeight;
+        type CxxPrivateKey;
 
         // Global functions
-        pub fn make_empty_digest() -> UniquePtr<Digest>;
-        pub fn make_digest_from_data(data: &[u8]) -> UniquePtr<Digest>;
-        pub fn make_time_point_from_now() -> SharedPtr<TimePoint>;
-        pub fn make_block_timestamp_from_now() -> SharedPtr<BlockTimestamp>;
-        pub fn make_block_timestamp_from_slot(slot: u32) -> SharedPtr<BlockTimestamp>;
-        pub fn make_time_point_from_i64(us: i64) -> SharedPtr<TimePoint>;
-        pub fn make_time_point_from_microseconds(us: &Microseconds) -> SharedPtr<TimePoint>;
-        pub fn parse_genesis_state(json: &str) -> Result<UniquePtr<GenesisState>>;
-        pub fn parse_public_key(key_str: &str) -> SharedPtr<PublicKey>;
+        pub fn make_empty_digest() -> UniquePtr<CxxDigest>;
+        pub fn make_digest_from_data(data: &[u8]) -> UniquePtr<CxxDigest>;
+        pub fn make_shared_digest_from_data(data: &[u8]) -> SharedPtr<CxxDigest>;
+        pub fn make_time_point_from_now() -> SharedPtr<CxxTimePoint>;
+        pub fn make_block_timestamp_from_now() -> SharedPtr<CxxBlockTimestamp>;
+        pub fn make_block_timestamp_from_slot(slot: u32) -> SharedPtr<CxxBlockTimestamp>;
+        pub fn make_time_point_from_i64(us: i64) -> SharedPtr<CxxTimePoint>;
+        pub fn make_time_point_from_microseconds(us: &CxxMicroseconds) -> SharedPtr<CxxTimePoint>;
+        pub fn parse_genesis_state(json: &str) -> Result<UniquePtr<CxxGenesisState>>;
+        pub fn parse_public_key(key_str: &str) -> SharedPtr<CxxPublicKey>;
+        pub fn parse_public_key_from_bytes(
+            data: &[u8],
+            pos: &mut usize,
+        ) -> Result<SharedPtr<CxxPublicKey>>;
+        pub fn parse_private_key(key_str: &str) -> SharedPtr<CxxPrivateKey>;
+        pub fn sign_digest_with_private_key(
+            digest: &CxxDigest,
+            priv_key: &CxxPrivateKey,
+        ) -> Result<SharedPtr<CxxSignature>>;
+        pub fn parse_signature_from_bytes(
+            data: &[u8],
+            pos: &mut usize,
+        ) -> Result<SharedPtr<CxxSignature>>;
+        pub fn make_authority(
+            threshold: u32,
+            keys: &CxxVector<CxxKeyWeight>,
+            accounts: &CxxVector<CxxPermissionLevelWeight>,
+            waits: &CxxVector<CxxWaitWeight>,
+        ) -> SharedPtr<CxxAuthority>;
+        pub fn recover_public_key_from_signature(
+            sig: &CxxSignature,
+            digest: &CxxDigest,
+        ) -> Result<SharedPtr<CxxPublicKey>>;
     }
 }
 
-impl Digest {
-    pub fn new_empty() -> UniquePtr<Digest> {
+impl CxxDigest {
+    pub fn new_empty() -> UniquePtr<CxxDigest> {
         ffi::make_empty_digest()
     }
 
-    pub fn hash(data: &[u8]) -> UniquePtr<Digest> {
+    pub fn hash(data: &[u8]) -> UniquePtr<CxxDigest> {
         ffi::make_digest_from_data(data)
     }
 }
 
-impl PartialEq for &Digest {
+impl PartialEq for &CxxDigest {
     fn eq(&self, other: &Self) -> bool {
         self.get_data() == other.get_data()
     }
 }
 
-impl TimePoint {
-    pub fn new(microseconds: i64) -> SharedPtr<TimePoint> {
+impl CxxTimePoint {
+    pub fn new(microseconds: i64) -> SharedPtr<CxxTimePoint> {
         ffi::make_time_point_from_i64(microseconds)
     }
 
-    pub fn now() -> SharedPtr<TimePoint> {
+    pub fn now() -> SharedPtr<CxxTimePoint> {
         ffi::make_time_point_from_now()
     }
 }
 
-impl BlockTimestamp {
-    pub fn now() -> SharedPtr<BlockTimestamp> {
+impl CxxBlockTimestamp {
+    pub fn now() -> SharedPtr<CxxBlockTimestamp> {
         ffi::make_block_timestamp_from_now()
     }
 
-    pub fn from_slot(slot: u32) -> SharedPtr<BlockTimestamp> {
+    pub fn from_slot(slot: u32) -> SharedPtr<CxxBlockTimestamp> {
         ffi::make_block_timestamp_from_slot(slot)
     }
 }
 
-unsafe impl Send for ffi::BlockTimestamp {}
-unsafe impl Sync for ffi::BlockTimestamp {}
+unsafe impl Send for ffi::CxxBlockTimestamp {}
+unsafe impl Sync for ffi::CxxBlockTimestamp {}
 
-impl GenesisState {
-    pub fn new(json: &str) -> Result<UniquePtr<GenesisState>, ChainError> {
+impl CxxGenesisState {
+    pub fn new(json: &str) -> Result<UniquePtr<CxxGenesisState>, ChainError> {
         ffi::parse_genesis_state(json)
             .map_err(|e| ChainError::ParseError(format!("failed to parse genesis state: {}", e)))
     }
 }
 
-impl PartialEq for PublicKey {
+impl PartialEq for CxxPublicKey {
     fn eq(&self, other: &Self) -> bool {
         self.cmp(other) == 0
     }
 }
 
-impl Eq for PublicKey {}
+impl Eq for CxxPublicKey {}
 
-impl Hash for PublicKey {
+impl Hash for CxxPublicKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.pack().hash(state);
     }

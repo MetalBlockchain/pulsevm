@@ -9,10 +9,7 @@ use cxx::{SharedPtr, UniquePtr};
 use pulsevm_error::ChainError;
 
 use crate::{
-    Authority, Digest, KeyValueIteratorCache, Name, TimePoint,
-    bridge::ffi::{self, Table},
-    iterator_cache::ffi::KeyValue,
-    objects::ffi::AccountMetadata,
+    Authority, CxxAuthority, CxxDigest, CxxGenesisState, CxxKeyValueIteratorCache, CxxName, CxxTimePoint, bridge::ffi::{self, TableObject}, iterator_cache::ffi::KeyValueObject, objects::ffi::AccountMetadataObject
 };
 
 #[derive(Clone)]
@@ -42,11 +39,20 @@ impl Database {
         Ok(())
     }
 
+    pub fn initialize_database(&mut self, genesis: &CxxGenesisState) -> Result<(), ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .initialize_database(genesis)
+            .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
+    }
+
     pub fn create_account(
         &mut self,
-        account_name: &Name,
+        account_name: u64,
         creation_date: u32,
-    ) -> Result<*const ffi::Account, ChainError> {
+    ) -> Result<*const ffi::AccountObject, ChainError> {
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
 
@@ -56,10 +62,13 @@ impl Database {
                 ChainError::InternalError(Some(format!("Failed to create account: {}", e)))
             })?;
 
-        Ok(acct_ref as *const ffi::Account)
+        Ok(acct_ref as *const ffi::AccountObject)
     }
 
-    pub fn find_account(&self, account_name: &Name) -> Result<*const ffi::Account, ChainError> {
+    pub fn find_account(
+        &self,
+        account_name: &CxxName,
+    ) -> Result<*const ffi::AccountObject, ChainError> {
         let guard = self.inner.read()?;
         let account = guard.find_account(account_name).map_err(|e| {
             ChainError::InternalError(Some(format!("Failed to get account: {}", e)))
@@ -68,7 +77,10 @@ impl Database {
         Ok(account)
     }
 
-    pub fn get_account(&self, account_name: &Name) -> Result<*const ffi::Account, ChainError> {
+    pub fn get_account(
+        &self,
+        account_name: &CxxName,
+    ) -> Result<*const ffi::AccountObject, ChainError> {
         let guard = self.inner.read()?;
         let account = guard.find_account(account_name).map_err(|e| {
             ChainError::InternalError(Some(format!("Failed to get account: {}", e)))
@@ -86,9 +98,9 @@ impl Database {
 
     pub fn create_account_metadata(
         &mut self,
-        account_name: &Name,
+        account_name: &CxxName,
         is_privileged: bool,
-    ) -> Result<*const ffi::AccountMetadata, ChainError> {
+    ) -> Result<*const ffi::AccountMetadataObject, ChainError> {
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
 
@@ -98,13 +110,13 @@ impl Database {
                 ChainError::InternalError(Some(format!("Failed to create account metadata: {}", e)))
             })?;
 
-        Ok(res as *const ffi::AccountMetadata)
+        Ok(res as *const ffi::AccountMetadataObject)
     }
 
     pub fn find_account_metadata(
         &self,
-        account_name: &Name,
-    ) -> Result<*const ffi::AccountMetadata, ChainError> {
+        account_name: &CxxName,
+    ) -> Result<*const ffi::AccountMetadataObject, ChainError> {
         let guard = self.inner.read()?;
 
         guard.find_account_metadata(account_name).map_err(|e| {
@@ -114,7 +126,7 @@ impl Database {
 
     pub fn set_privileged(
         &mut self,
-        account: &Name,
+        account: &CxxName,
         is_privileged: bool,
     ) -> Result<(), ChainError> {
         let mut guard = self.inner.write()?;
@@ -127,8 +139,8 @@ impl Database {
 
     pub fn get_account_metadata(
         &self,
-        account_name: &Name,
-    ) -> Result<*const ffi::AccountMetadata, ChainError> {
+        account_name: &CxxName,
+    ) -> Result<*const ffi::AccountMetadataObject, ChainError> {
         let guard = self.inner.read()?;
         let res = guard.find_account_metadata(account_name).map_err(|e| {
             ChainError::InternalError(Some(format!("Failed to find account metadata: {}", e)))
@@ -141,7 +153,7 @@ impl Database {
             ))));
         }
 
-        Ok(res as *const ffi::AccountMetadata)
+        Ok(res as *const ffi::AccountMetadataObject)
     }
 
     pub fn unlink_account_code(
@@ -158,11 +170,11 @@ impl Database {
 
     pub fn update_account_code(
         &mut self,
-        account: &AccountMetadata,
+        account: &ffi::AccountMetadataObject,
         new_code: &[u8],
         head_block_num: u32,
-        pending_block_time: &TimePoint,
-        code_hash: &Digest,
+        pending_block_time: &CxxTimePoint,
+        code_hash: &CxxDigest,
         vm_type: u8,
         vm_version: u8,
     ) -> Result<(), ChainError> {
@@ -186,8 +198,8 @@ impl Database {
 
     pub fn update_account_abi(
         &mut self,
-        account: &ffi::Account,
-        account_metadata: &ffi::AccountMetadata,
+        account: &ffi::AccountObject,
+        account_metadata: &ffi::AccountMetadataObject,
         abi: &[u8],
     ) -> Result<(), ChainError> {
         let mut guard = self.inner.write()?;
@@ -223,7 +235,7 @@ impl Database {
 
     pub fn initialize_account_resource_limits(
         &mut self,
-        account_name: &Name,
+        account_name: &CxxName,
     ) -> Result<(), ChainError> {
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
@@ -235,12 +247,12 @@ impl Database {
 
     pub fn add_transaction_usage(
         &mut self,
-        accounts: &HashSet<Name>,
+        accounts: &HashSet<u64>,
         cpu_usage: u64,
         net_usage: u64,
         time_slot: u32,
     ) -> Result<(), ChainError> {
-        let accounts_vec: Vec<u64> = accounts.iter().map(|name| name.to_uint64_t()).collect();
+        let accounts_vec: Vec<u64> = accounts.iter().map(|name| name.clone()).collect();
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
 
@@ -251,7 +263,7 @@ impl Database {
 
     pub fn add_pending_ram_usage(
         &mut self,
-        account_name: &Name,
+        account_name: &CxxName,
         ram_bytes: i64,
     ) -> Result<(), ChainError> {
         let mut guard = self.inner.write()?;
@@ -262,7 +274,7 @@ impl Database {
             .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
     }
 
-    pub fn verify_account_ram_usage(&mut self, account_name: &Name) -> Result<(), ChainError> {
+    pub fn verify_account_ram_usage(&mut self, account_name: &CxxName) -> Result<(), ChainError> {
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
 
@@ -271,7 +283,7 @@ impl Database {
             .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
     }
 
-    pub fn get_account_ram_usage(&mut self, account_name: &Name) -> Result<i64, ChainError> {
+    pub fn get_account_ram_usage(&mut self, account_name: &CxxName) -> Result<i64, ChainError> {
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
 
@@ -282,7 +294,7 @@ impl Database {
 
     pub fn set_account_limits(
         &mut self,
-        account_name: &Name,
+        account_name: &CxxName,
         ram_bytes: i64,
         net_weight: i64,
         cpu_weight: i64,
@@ -297,7 +309,7 @@ impl Database {
 
     pub fn get_account_limits(
         &mut self,
-        account_name: &Name,
+        account_name: &CxxName,
         ram_bytes: &mut i64,
         net_weight: &mut i64,
         cpu_weight: &mut i64,
@@ -330,7 +342,7 @@ impl Database {
 
     pub fn get_account_net_limit(
         &mut self,
-        name: &Name,
+        name: &CxxName,
         greylist_limit: u32,
     ) -> Result<ffi::NetLimitResult, ChainError> {
         let mut guard = self.inner.write()?;
@@ -343,7 +355,7 @@ impl Database {
 
     pub fn get_account_cpu_limit(
         &mut self,
-        name: &Name,
+        name: &CxxName,
         greylist_limit: u32,
     ) -> Result<ffi::CpuLimitResult, ChainError> {
         let mut guard = self.inner.write()?;
@@ -365,40 +377,40 @@ impl Database {
 
     pub fn get_table(
         &mut self,
-        code: &Name,
-        scope: &Name,
-        table: &Name,
-    ) -> Result<*const Table, ChainError> {
+        code: &CxxName,
+        scope: &CxxName,
+        table: &CxxName,
+    ) -> Result<*const TableObject, ChainError> {
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
         let res = pinned
             .get_table(code, scope, table)
             .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))?;
-        Ok(res as *const Table)
+        Ok(res as *const TableObject)
     }
 
     pub fn create_table(
         &mut self,
-        code: &Name,
-        scope: &Name,
-        table: &Name,
-        payer: &Name,
-    ) -> Result<*const Table, ChainError> {
+        code: &CxxName,
+        scope: &CxxName,
+        table: &CxxName,
+        payer: &CxxName,
+    ) -> Result<*const TableObject, ChainError> {
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
         let res = pinned
             .create_table(code, scope, table, payer)
             .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))?;
-        Ok(res as *const Table)
+        Ok(res as *const TableObject)
     }
 
     pub fn db_find_i64(
         &mut self,
-        code: &Name,
-        scope: &Name,
-        table: &Name,
+        code: &CxxName,
+        scope: &CxxName,
+        table: &CxxName,
         id: u64,
-        keyval_cache: &mut KeyValueIteratorCache,
+        keyval_cache: &mut CxxKeyValueIteratorCache,
     ) -> Result<i32, ChainError> {
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
@@ -409,24 +421,24 @@ impl Database {
 
     pub fn create_key_value_object(
         &mut self,
-        table: &Table,
-        payer: &Name,
+        table: &TableObject,
+        payer: &CxxName,
         id: u64,
         buffer: &[u8],
-    ) -> Result<*const KeyValue, ChainError> {
+    ) -> Result<*const KeyValueObject, ChainError> {
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
 
         let res = pinned
             .create_key_value_object(table, payer, id, buffer)
             .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))?;
-        Ok(res as *const KeyValue)
+        Ok(res as *const KeyValueObject)
     }
 
     pub fn update_key_value_object(
         &mut self,
-        obj: &KeyValue,
-        payer: &Name,
+        obj: &KeyValueObject,
+        payer: &CxxName,
         buffer: &[u8],
     ) -> Result<(), ChainError> {
         let mut guard = self.inner.write()?;
@@ -437,7 +449,7 @@ impl Database {
             .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
     }
 
-    pub fn remove_table(&mut self, table: &Table) -> Result<(), ChainError> {
+    pub fn remove_table(&mut self, table: &TableObject) -> Result<(), ChainError> {
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
 
@@ -446,7 +458,7 @@ impl Database {
             .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
     }
 
-    pub fn is_account(&self, account: &Name) -> Result<bool, ChainError> {
+    pub fn is_account(&self, account: &CxxName) -> Result<bool, ChainError> {
         let guard = self.inner.read()?;
 
         guard
@@ -465,8 +477,8 @@ impl Database {
 
     pub fn find_permission_by_actor_and_permission(
         &self,
-        actor: &Name,
-        permission: &Name,
+        actor: &CxxName,
+        permission: &CxxName,
     ) -> Result<*const ffi::PermissionObject, ChainError> {
         let guard = self.inner.read()?;
         let res = guard
@@ -478,8 +490,8 @@ impl Database {
 
     pub fn get_permission_by_actor_and_permission(
         &self,
-        actor: &Name,
-        permission: &Name,
+        actor: &CxxName,
+        permission: &CxxName,
     ) -> Result<*const ffi::PermissionObject, ChainError> {
         let guard = self.inner.read()?;
         let res = guard
@@ -498,8 +510,8 @@ impl Database {
 
     pub fn delete_auth(
         &mut self,
-        account: &Name,
-        permission_name: &Name,
+        account: &CxxName,
+        permission_name: &CxxName,
     ) -> Result<i64, ChainError> {
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
@@ -511,10 +523,10 @@ impl Database {
 
     pub fn link_auth(
         &mut self,
-        account_name: &Name,
-        code_name: &Name,
-        requirement_name: &Name,
-        requirement_type: &Name,
+        account_name: &CxxName,
+        code_name: &CxxName,
+        requirement_name: &CxxName,
+        requirement_type: &CxxName,
     ) -> Result<i64, ChainError> {
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
@@ -526,9 +538,9 @@ impl Database {
 
     pub fn unlink_auth(
         &mut self,
-        account_name: &Name,
-        code_name: &Name,
-        requirement_type: &Name,
+        account_name: &CxxName,
+        code_name: &CxxName,
+        requirement_type: &CxxName,
     ) -> Result<i64, ChainError> {
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
@@ -540,7 +552,7 @@ impl Database {
 
     pub fn get_code_object_by_hash(
         &self,
-        code_hash: &Digest,
+        code_hash: &CxxDigest,
         vm_type: u8,
         vm_version: u8,
     ) -> Result<*const ffi::CodeObject, ChainError> {
@@ -554,7 +566,7 @@ impl Database {
 
     pub fn next_recv_sequence(
         &mut self,
-        receiver_account: &AccountMetadata,
+        receiver_account: &AccountMetadataObject,
     ) -> Result<u64, ChainError> {
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
@@ -564,7 +576,7 @@ impl Database {
             .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
     }
 
-    pub fn next_auth_sequence(&mut self, actor: &Name) -> Result<u64, ChainError> {
+    pub fn next_auth_sequence(&mut self, actor: &CxxName) -> Result<u64, ChainError> {
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
 
@@ -584,9 +596,9 @@ impl Database {
 
     pub fn db_remove_i64(
         &mut self,
-        keyval_cache: &mut KeyValueIteratorCache,
+        keyval_cache: &mut CxxKeyValueIteratorCache,
         iterator: i32,
-        receiver: &Name,
+        receiver: &CxxName,
     ) -> Result<i64, ChainError> {
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
@@ -598,7 +610,7 @@ impl Database {
 
     pub fn db_next_i64(
         &mut self,
-        keyval_cache: &mut KeyValueIteratorCache,
+        keyval_cache: &mut CxxKeyValueIteratorCache,
         iterator: i32,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
@@ -612,7 +624,7 @@ impl Database {
 
     pub fn db_previous_i64(
         &mut self,
-        keyval_cache: &mut KeyValueIteratorCache,
+        keyval_cache: &mut CxxKeyValueIteratorCache,
         iterator: i32,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
@@ -626,10 +638,10 @@ impl Database {
 
     pub fn db_end_i64(
         &mut self,
-        keyval_cache: &mut KeyValueIteratorCache,
-        code: &Name,
-        scope: &Name,
-        table: &Name,
+        keyval_cache: &mut CxxKeyValueIteratorCache,
+        code: &CxxName,
+        scope: &CxxName,
+        table: &CxxName,
     ) -> Result<i32, ChainError> {
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
@@ -641,10 +653,10 @@ impl Database {
 
     pub fn db_lowerbound_i64(
         &mut self,
-        keyval_cache: &mut KeyValueIteratorCache,
-        code: &Name,
-        scope: &Name,
-        table: &Name,
+        keyval_cache: &mut CxxKeyValueIteratorCache,
+        code: &CxxName,
+        scope: &CxxName,
+        table: &CxxName,
         id: u64,
     ) -> Result<i32, ChainError> {
         let mut guard = self.inner.write()?;
@@ -657,10 +669,10 @@ impl Database {
 
     pub fn db_upperbound_i64(
         &mut self,
-        keyval_cache: &mut KeyValueIteratorCache,
-        code: &Name,
-        scope: &Name,
-        table: &Name,
+        keyval_cache: &mut CxxKeyValueIteratorCache,
+        code: &CxxName,
+        scope: &CxxName,
+        table: &CxxName,
         id: u64,
     ) -> Result<i32, ChainError> {
         let mut guard = self.inner.write()?;
@@ -685,11 +697,11 @@ impl Database {
 
     pub fn create_permission(
         &mut self,
-        account: &Name,
-        name: &Name,
+        account: &CxxName,
+        name: &CxxName,
         parent: u64,
         auth: &Authority,
-        creation_time: &TimePoint,
+        creation_time: &CxxTimePoint,
     ) -> Result<*const ffi::PermissionObject, ChainError> {
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
@@ -704,8 +716,8 @@ impl Database {
     pub fn modify_permission(
         &mut self,
         permission: &ffi::PermissionObject,
-        authority: &ffi::Authority,
-        pending_block_time: &TimePoint,
+        authority: &Authority,
+        pending_block_time: &CxxTimePoint,
     ) -> Result<(), ChainError> {
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
@@ -717,10 +729,10 @@ impl Database {
 
     pub fn lookup_linked_permission(
         &self,
-        account: &Name,
-        code: &Name,
-        requirement_type: &Name,
-    ) -> Result<Option<&Name>, ChainError> {
+        account: &CxxName,
+        code: &CxxName,
+        requirement_type: &CxxName,
+    ) -> Result<Option<&CxxName>, ChainError> {
         let guard = self.inner.read()?;
         let res = guard
             .lookup_linked_permission(account, code, requirement_type)
@@ -733,9 +745,7 @@ impl Database {
         Ok(Some(unsafe { &*res }))
     }
 
-    pub fn get_global_properties(
-        &self,
-    ) -> Result<*const ffi::GlobalPropertyObject, ChainError> {
+    pub fn get_global_properties(&self) -> Result<*const ffi::GlobalPropertyObject, ChainError> {
         let guard = self.inner.read()?;
         let res = guard
             .get_global_properties()

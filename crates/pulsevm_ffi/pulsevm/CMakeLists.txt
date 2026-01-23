@@ -123,16 +123,4 @@ add_compile_definitions(BOOST_UNORDERED_DISABLE_NEON)
 
 add_subdirectory( libraries )
 
-# Add the boost submodule we used to build to our install package, so headers can be found for libtester
-install(DIRECTORY "${CMAKE_SOURCE_DIR}/libraries/boost/"
-        DESTINATION ${CMAKE_INSTALL_FULL_DATAROOTDIR}/spring_boost
-        COMPONENT dev EXCLUDE_FROM_ALL
-        PATTERN ".git/*" EXCLUDE
-        PATTERN "example/*" EXCLUDE
-        PATTERN "bench/*" EXCLUDE
-        PATTERN "doc/*" EXCLUDE
-        PATTERN "libs/*/test" EXCLUDE
-        PATTERN "tools/*/test" EXCLUDE
-        )
-
 include(CPack)

@@ -34,8 +34,8 @@ namespace pulsevm { namespace chain {
          static block_timestamp maximum() { return block_timestamp( 0xffff ); }
          static block_timestamp min() { return block_timestamp(0); }
 
-         fc::time_point to_time_point() const {
-            return (fc::time_point)(*this);
+         std::shared_ptr<fc::time_point> to_time_point() const {
+            return std::make_shared<fc::time_point>((fc::time_point)(*this));
          }
 
          uint32_t get_slot() const {

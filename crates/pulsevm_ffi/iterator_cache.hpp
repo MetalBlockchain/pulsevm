@@ -86,10 +86,10 @@ class iterator_cache {
     inline int index_to_end_iterator( size_t indx )const { return -(indx + 2); }
 }; /// class iterator_cache
 
-using key_value_iterator_cache = iterator_cache<key_value_object>;
+using CxxKeyValueIteratorCache = iterator_cache<key_value_object>;
 
-std::unique_ptr<key_value_iterator_cache> new_key_value_iterator_cache() {
-    std::make_unique<key_value_iterator_cache>();
+std::unique_ptr<CxxKeyValueIteratorCache> new_key_value_iterator_cache() {
+    std::make_unique<CxxKeyValueIteratorCache>();
 }
 
 }

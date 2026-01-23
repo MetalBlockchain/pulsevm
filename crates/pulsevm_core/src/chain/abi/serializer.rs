@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
+use cxx::SharedPtr;
 use pulsevm_crypto::{Bytes, FixedBytes};
 use pulsevm_error::ChainError;
+use pulsevm_ffi::CxxSignature;
 use pulsevm_serialization::{Read, ReadError, VarInt32, VarUint32, WriteError};
 use pulsevm_time::{TimePoint, TimePointSec};
 use serde_json::{Number, Value};
@@ -11,9 +13,9 @@ use crate::{
         abi::{AbiDefinition, AbiStructDefinition, AbiVariantDefinition},
         asset::{Asset, ExtendedAsset, Symbol, SymbolCode},
         block::BlockTimestamp,
-        secp256k1::{PublicKey, Signature},
         utils::pulse_assert,
     },
+    crypto::{PublicKey, Signature},
     name::Name,
 };
 

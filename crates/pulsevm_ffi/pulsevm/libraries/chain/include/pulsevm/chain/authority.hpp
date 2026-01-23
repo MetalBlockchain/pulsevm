@@ -1,7 +1,10 @@
 #pragma once
+#include "database_utils.hpp"
 #include <chainbase/chainbase.hpp>
+#include <rust/cxx.h>
 #include "transaction.hpp"
 #include "config.hpp"
+#include "types.hpp"
 
 #include <type_traits>
 

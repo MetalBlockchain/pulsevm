@@ -60,16 +60,16 @@ pub const fn eos_percent(value: u64, percentage: u32) -> u64 {
     (value * percentage as u64) / PERCENT_100
 }
 
-use pulsevm_ffi::{KeyValue, Table};
+use pulsevm_ffi::{KeyValueObject, TableObject};
 use pulsevm_proc_macros::name;
 
-impl BillableSize for KeyValue {
+impl BillableSize for KeyValueObject {
     fn billable_size() -> u64 {
         16 + OVERHEAD_PER_ROW_PER_INDEX_RAM_BYTES as u64 // TODO: Check this
     }
 }
 
-impl BillableSize for Table {
+impl BillableSize for TableObject {
     fn billable_size() -> u64 {
         64 + OVERHEAD_PER_ACCOUNT_RAM_BYTES as u64 // TODO: Check this
     }

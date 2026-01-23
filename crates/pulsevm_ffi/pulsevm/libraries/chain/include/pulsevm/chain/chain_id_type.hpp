@@ -49,19 +49,7 @@ namespace chain {
          template<typename T>
          friend T fc::variant::as()const;
 
-         friend class pulsevm::chain_apis::get_info_db;
-
-         friend class pulsevm::net_plugin_impl;
-         friend struct pulsevm::handshake_message;
-         friend class block_log;
-         friend struct trim_data;
-         friend class controller;
-         friend struct controller_impl;
          friend class global_property_object;
-         friend struct snapshot_global_property_object;
-         friend struct legacy::snapshot_global_property_object_v3;
-         friend struct legacy::snapshot_global_property_object_v4;
-         friend struct legacy::snapshot_global_property_object_v5;
    };
 
 } }  // namespace pulsevm::chain

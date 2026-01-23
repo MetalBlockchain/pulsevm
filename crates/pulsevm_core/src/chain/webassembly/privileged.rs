@@ -1,10 +1,13 @@
 use pulsevm_error::ChainError;
 use wasmer::{FunctionEnvMut, RuntimeError, WasmPtr};
 
-use crate::{chain::{
-    apply_context::ApplyContext,
-    resource_limits::ResourceLimitsManager, utils::pulse_assert, wasm_runtime::WasmContext,
-}, name::Name};
+use crate::{
+    chain::{
+        apply_context::ApplyContext, resource_limits::ResourceLimitsManager, utils::pulse_assert,
+        wasm_runtime::WasmContext,
+    },
+    name::Name,
+};
 
 fn privileged_check(context: &ApplyContext) -> Result<(), RuntimeError> {
     if !context.is_privileged()? {

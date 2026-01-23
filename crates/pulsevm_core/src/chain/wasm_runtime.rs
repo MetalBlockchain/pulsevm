@@ -6,7 +6,7 @@ use std::{
 use lru::LruCache;
 use pulsevm_crypto::Bytes;
 use pulsevm_error::ChainError;
-use pulsevm_ffi::{Database, Digest};
+use pulsevm_ffi::{CxxDigest, Database};
 use wasmer::{Engine, Function, FunctionEnv, Instance, Memory, Module, Store, imports};
 
 use wasmer_compiler_llvm::LLVM;
@@ -14,7 +14,6 @@ use wasmer_compiler_llvm::LLVM;
 use crate::{
     block::BlockTimestamp,
     chain::{
-        account::CodeObject,
         apply_context::ApplyContext,
         id::Id,
         name::Name,
@@ -127,7 +126,7 @@ impl WasmRuntime {
         action: Action,
         apply_context: ApplyContext,
         db: Database,
-        code_hash: &Digest,
+        code_hash: &CxxDigest,
     ) -> Result<(), ChainError> {
         // Pause timer
         apply_context.pause_billing_timer()?;
@@ -141,8 +140,8 @@ impl WasmRuntime {
             if !inner.code_cache.contains(&id) {
                 let code_object = db.get_code_object_by_hash(code_hash, 0, 0)?;
                 let code_object = unsafe { &*code_object };
-                let module = Module::new(store.engine(), code_object.get_code().as_ref())
-                .map_err(|e| ChainError::WasmRuntimeError(e.to_string()))?;
+                let module = Module::new(store.engine(), code_object.get_code().get_data())
+                    .map_err(|e| ChainError::WasmRuntimeError(e.to_string()))?;
                 inner.code_cache.put(id, module);
             }
         }

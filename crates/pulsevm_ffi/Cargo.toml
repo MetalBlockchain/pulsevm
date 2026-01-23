@@ -8,6 +8,7 @@ libc = "0.2"
 cxx = "1.0"
 tempfile = "3.23.0"
 pulsevm_error = { path = "../pulsevm_error" }
+pulsevm_serialization = { path = "../pulsevm_serialization" }
 
 [build-dependencies]
 bindgen = "0.72.1"

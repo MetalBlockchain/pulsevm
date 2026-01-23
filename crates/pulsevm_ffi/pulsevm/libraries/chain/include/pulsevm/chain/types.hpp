@@ -19,6 +19,8 @@
 #include <boost/version.hpp>
 #include <boost/container/deque.hpp>
 
+#include <rust/cxx.h>
+
 #include <memory>
 #include <vector>
 #include <deque>
@@ -113,6 +115,16 @@ namespace pulsevm::chain {
       shared_blob& operator=(std::string_view sv) {
          static_cast<shared_string&>(*this) = sv;
          return *this;
+      }
+
+      rust::Slice<const uint8_t> get_data() const {
+         if (!this->data()) {
+            return {};
+         }
+         return rust::Slice<const uint8_t>(
+            reinterpret_cast<const uint8_t*>(this->data()),
+            this->size()
+         );
       }
    };
 

@@ -2,7 +2,7 @@ use core::fmt;
 use std::{error::Error, slice, str::FromStr};
 
 use pulsevm_crypto::FixedBytes;
-use pulsevm_ffi::Digest;
+use pulsevm_ffi::CxxDigest;
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 use serde::Serialize;
 
@@ -92,13 +92,11 @@ impl TryFrom<Vec<u8>> for Id {
     }
 }
 
-impl From<&Digest> for Id {
-    fn from(digest: &Digest) -> Self {
-        let dst: [u8; 32] = unsafe {
-            let slice = slice::from_raw_parts(digest.data(), 32);
-            slice.try_into().unwrap()
-        };
-        Id(FixedBytes(dst))
+impl From<&CxxDigest> for Id {
+    fn from(digest: &CxxDigest) -> Self {
+        let hash: &[u8] = digest.get_data();
+        let hash32: &[u8; 32] = hash.try_into().unwrap();
+        Id(FixedBytes(*hash32))
     }
 }
 

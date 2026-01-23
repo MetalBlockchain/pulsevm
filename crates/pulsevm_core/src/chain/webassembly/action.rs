@@ -54,10 +54,10 @@ pub fn set_action_return_value(
         let mut db = env_data.db_mut();
         let gpo = Controller::get_global_properties(&mut db)?;
         pulse_assert(
-            buffer_len <= gpo.configuration.max_action_return_value_size,
+            buffer_len <= gpo.get_chain_config().get_max_action_return_value_size(),
             ChainError::WasmRuntimeError(format!(
                 "action return value size must be less or equal to {} bytes",
-                gpo.configuration.max_action_return_value_size
+                gpo.get_chain_config().get_max_action_return_value_size()
             )),
         )?;
     }

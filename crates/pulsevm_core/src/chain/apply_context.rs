@@ -8,7 +8,10 @@ use chrono::Utc;
 use cxx::SharedPtr;
 use pulsevm_crypto::Bytes;
 use pulsevm_error::ChainError;
-use pulsevm_ffi::{AccountMetadata, ChainConfig, Database, KeyValue, KeyValueIteratorCache, Table};
+use pulsevm_ffi::{
+    AccountMetadataObject, CxxChainConfig, CxxKeyValueIteratorCache, Database, KeyValueObject,
+    TableObject,
+};
 use spdlog::info;
 
 use crate::{
@@ -36,7 +39,7 @@ struct ApplyContextInner {
     notified: VecDeque<(Name, u32)>,        // List of notified accounts
     inline_actions: Vec<u32>,               // List of inline actions
     recurse_depth: u32,                     // The current recursion depth
-    keyval_cache: KeyValueIteratorCache,    // Cache for key-value iterators
+    keyval_cache: CxxKeyValueIteratorCache, // Cache for key-value iterators
 }
 
 #[derive(Clone)]
@@ -85,7 +88,7 @@ impl ApplyContext {
                 notified: VecDeque::new(),
                 inline_actions: Vec::new(),
                 recurse_depth: depth,
-                keyval_cache: KeyValueIteratorCache::new(),
+                keyval_cache: CxxKeyValueIteratorCache::new(),
             })),
         })
     }
@@ -450,7 +453,7 @@ impl ApplyContext {
             inner.keyval_cache.add(obj)?
         };
 
-        let billable_size = data.len() as i64 + billable_size_v::<KeyValue>() as i64;
+        let billable_size = data.len() as i64 + billable_size_v::<KeyValueObject>() as i64;
         self.update_db_usage(payer, billable_size)?;
 
         Ok(res)
@@ -479,7 +482,7 @@ impl ApplyContext {
             (old_size, new_size, existing_payer)
         };
 
-        let overhead = billable_size_v::<KeyValue>() as i64;
+        let overhead = billable_size_v::<KeyValueObject>() as i64;
         let old_size = old_size + overhead;
 
         let payer = if payer.empty() {
@@ -590,7 +593,7 @@ impl ApplyContext {
         code: &Name,
         scope: &Name,
         table: &Name,
-    ) -> Result<*const Table, ChainError> {
+    ) -> Result<*const TableObject, ChainError> {
         self.db
             .get_table(code.as_ref(), scope.as_ref(), table.as_ref())
     }
@@ -601,12 +604,11 @@ impl ApplyContext {
         scope: &Name,
         table_name: &Name,
         payer: &Name,
-    ) -> Result<*const Table, ChainError> {
+    ) -> Result<*const TableObject, ChainError> {
         let table = self.find_table(code, scope, table_name)?;
 
         if table.is_null() {
-            self.update_db_usage(payer, billable_size_v::<Table>() as i64)?;
-
+            self.update_db_usage(payer, billable_size_v::<TableObject>() as i64)?;
             let table = self
                 .db
                 .create_table(
@@ -625,10 +627,10 @@ impl ApplyContext {
         }
     }
 
-    pub fn remove_table(&mut self, table: &Table) -> Result<(), ChainError> {
+    pub fn remove_table(&mut self, table: &TableObject) -> Result<(), ChainError> {
         self.update_db_usage(
             &table.get_payer().into(),
-            -(billable_size_v::<Table>() as i64),
+            -(billable_size_v::<TableObject>() as i64),
         )?;
         self.db.remove_table(table)?;
         Ok(())
@@ -660,7 +662,7 @@ impl ApplyContext {
 
     pub fn next_recv_sequence(
         &mut self,
-        receiver_account: &AccountMetadata,
+        receiver_account: &AccountMetadataObject,
     ) -> Result<u64, ChainError> {
         self.db.next_recv_sequence(receiver_account).map_err(|e| {
             ChainError::InternalError(Some(format!("failed to get next recv sequence: {}", e)))

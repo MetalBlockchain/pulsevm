@@ -2459,7 +2459,6 @@ dependencies = [
  "pulsevm_serialization",
  "pulsevm_time",
  "ripemd",
- "secp256k1",
  "serde",
  "serde_json",
  "sha2",
@@ -2489,6 +2488,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "thiserror 2.0.16",
+ "wasmer",
 ]
 
 [[package]]
@@ -2502,6 +2502,7 @@ dependencies = [
  "cxx-build",
  "libc",
  "pulsevm_error",
+ "pulsevm_serialization",
  "tempfile",
 ]
 

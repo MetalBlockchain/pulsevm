@@ -1,5 +1,6 @@
 use std::error::Error;
 use thiserror::Error;
+use wasmer::RuntimeError;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ChainError {
@@ -44,5 +45,17 @@ impl From<Box<dyn Error>> for ChainError {
 impl<T> From<std::sync::PoisonError<T>> for ChainError {
     fn from(_: std::sync::PoisonError<T>) -> Self {
         ChainError::InternalError(Some("failed to acquire read/write lock".into()))
+    }
+}
+
+impl From<RuntimeError> for ChainError {
+    fn from(err: RuntimeError) -> Self {
+        ChainError::WasmRuntimeError(err.to_string())
+    }
+}
+
+impl From<ChainError> for RuntimeError {
+    fn from(err: ChainError) -> Self {
+        RuntimeError::new(err.to_string())
     }
 }

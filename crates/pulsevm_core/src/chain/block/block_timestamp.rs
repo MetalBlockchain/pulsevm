@@ -2,7 +2,7 @@ use std::fmt::{self, Debug};
 
 use cxx::SharedPtr;
 use prost_types::Timestamp;
-use pulsevm_ffi::{BlockTimestamp as FfiBlockTimestamp, TimePoint};
+use pulsevm_ffi::{CxxBlockTimestamp, CxxTimePoint};
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 use pulsevm_serialization::{NumBytes, Read, ReadError, Write, WriteError};
 use pulsevm_time::{TimePointSec, milliseconds};
@@ -14,7 +14,7 @@ use time::{Duration, OffsetDateTime, PrimitiveDateTime, macros::format_descripti
 
 #[derive(Clone)]
 pub struct BlockTimestamp {
-    pub inner: SharedPtr<FfiBlockTimestamp>,
+    pub inner: SharedPtr<CxxBlockTimestamp>,
 }
 
 impl BlockTimestamp {
@@ -24,27 +24,27 @@ impl BlockTimestamp {
     #[inline]
     pub fn new(slot: u32) -> Self {
         Self {
-            inner: FfiBlockTimestamp::from_slot(slot),
+            inner: CxxBlockTimestamp::from_slot(slot),
         }
     }
 
     #[inline]
     pub fn maximum() -> Self {
         Self {
-            inner: FfiBlockTimestamp::from_slot(0xFFFF),
+            inner: CxxBlockTimestamp::from_slot(0xFFFF),
         }
     }
     #[inline]
     pub fn min() -> Self {
         Self {
-            inner: FfiBlockTimestamp::from_slot(0),
+            inner: CxxBlockTimestamp::from_slot(0),
         }
     }
 
     #[inline]
     pub fn now() -> Self {
         Self {
-            inner: FfiBlockTimestamp::now(),
+            inner: CxxBlockTimestamp::now(),
         }
     }
 
@@ -52,7 +52,7 @@ impl BlockTimestamp {
     pub fn next(self) -> Self {
         assert!(u32::MAX - self.slot() >= 1, "block timestamp overflow");
         Self {
-            inner: FfiBlockTimestamp::from_slot(self.slot() + 1),
+            inner: CxxBlockTimestamp::from_slot(self.slot() + 1),
         }
     }
 
@@ -61,7 +61,7 @@ impl BlockTimestamp {
     }
 
     #[inline]
-    pub fn to_time_point(&self) -> SharedPtr<TimePoint> {
+    pub fn to_time_point(&self) -> SharedPtr<CxxTimePoint> {
         self.inner.to_time_point()
     }
 
@@ -87,18 +87,18 @@ impl BlockTimestamp {
     }
 }
 
-impl From<BlockTimestamp> for SharedPtr<TimePoint> {
+impl From<BlockTimestamp> for SharedPtr<CxxTimePoint> {
     #[inline]
     fn from(bt: BlockTimestamp) -> Self {
         let msec = (bt.slot() as i64) * (BlockTimestamp::BLOCK_INTERVAL_MS as i64)
             + BlockTimestamp::BLOCK_TIMESTAMP_EPOCH_MS;
-        TimePoint::new(msec)
+        CxxTimePoint::new(msec)
     }
 }
 
-impl From<TimePoint> for BlockTimestamp {
+impl From<CxxTimePoint> for BlockTimestamp {
     #[inline]
-    fn from(t: TimePoint) -> Self {
+    fn from(t: CxxTimePoint) -> Self {
         let micro = t.time_since_epoch().count();
         let msec = micro / 1_000;
         let slot = ((msec - BlockTimestamp::BLOCK_TIMESTAMP_EPOCH_MS)

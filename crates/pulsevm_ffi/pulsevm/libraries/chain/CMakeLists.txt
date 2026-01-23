@@ -15,11 +15,14 @@ endif()
 add_library( pulsevm_chain
     authority.cpp
     block_header.cpp
+    chain_id_type.cpp
+    chain_config.cpp
+    genesis_state_root_key.cpp
     name.cpp
     ${HEADERS}
 )
 
-target_link_libraries( pulsevm_chain PUBLIC bn256 fc chainbase rt
+target_link_libraries( pulsevm_chain PUBLIC bn256 fc chainbase rt softfloat
     Boost::signals2 Boost::hana Boost::property_tree Boost::multi_index Boost::asio Boost::lockfree
     Boost::assign Boost::accumulators
 )

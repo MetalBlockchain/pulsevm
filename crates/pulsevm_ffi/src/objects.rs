@@ -5,73 +5,62 @@ use crate::{Database, PermissionObject};
 #[cxx::bridge(namespace = "pulsevm::chain")]
 pub mod ffi {
     unsafe extern "C++" {
+        include!("name.hpp");
+        include!("types.hpp");
         include!("objects.hpp");
 
-        #[cxx_name = "account_object"]
-        type Account;
-        #[cxx_name = "account_metadata_object"]
-        type AccountMetadata;
-        #[cxx_name = "chain_config"]
-        type ChainConfig = crate::types::ffi::ChainConfig;
-        #[cxx_name = "permission_object"]
-        pub type PermissionObject;
-        #[cxx_name = "permission_usage_object"]
-        pub type PermissionUsageObject;
-        #[cxx_name = "permission_link_object"]
-        pub type PermissionLinkObject;
-        #[cxx_name = "code_object"]
-        pub type CodeObject;
-        #[cxx_name = "name"]
-        pub type Name = crate::name::ffi::Name;
-        #[cxx_name = "global_property_object"]
-        pub type GlobalPropertyObject;
-        #[cxx_name = "table_id_object"]
-        pub type Table;
-        #[cxx_name = "table_id"]
-        pub type TableId;
-        #[cxx_name = "key_value_object"]
-        pub type KeyValue;
-        #[cxx_name = "digest_type"]
-        pub type Digest = crate::types::ffi::Digest;
-        #[cxx_name = "shared_blob"]
-        pub type SharedBlob = crate::types::ffi::SharedBlob;
+        type AccountObject;
+        type AccountMetadataObject;
+        type PermissionObject;
+        type PermissionUsageObject;
+        type PermissionLinkObject;
+        type CodeObject;
+        type GlobalPropertyObject;
+        type TableObject;
+        type TableId;
+        type KeyValueObject;
+
+        type CxxDigest = crate::types::ffi::CxxDigest;
+        type CxxName = crate::name::ffi::CxxName;
+        type CxxSharedBlob = crate::types::ffi::CxxSharedBlob;
+        type CxxChainConfig = crate::types::ffi::CxxChainConfig;
 
         // Account methods
-        pub fn get_abi(self: &Account) -> &SharedBlob;
+        pub fn get_abi(self: &AccountObject) -> &CxxSharedBlob;
 
         // AccountMetadata methods
-        pub fn get_code_hash(self: &AccountMetadata) -> &Digest;
-        pub fn get_recv_sequence(self: &AccountMetadata) -> u64;
-        pub fn get_auth_sequence(self: &AccountMetadata) -> u64;
-        pub fn get_code_sequence(self: &AccountMetadata) -> u64;
-        pub fn get_abi_sequence(self: &AccountMetadata) -> u64;
-        pub fn is_privileged(self: &AccountMetadata) -> bool;
+        pub fn get_code_hash(self: &AccountMetadataObject) -> &CxxDigest;
+        pub fn get_recv_sequence(self: &AccountMetadataObject) -> u64;
+        pub fn get_auth_sequence(self: &AccountMetadataObject) -> u64;
+        pub fn get_code_sequence(self: &AccountMetadataObject) -> u64;
+        pub fn get_abi_sequence(self: &AccountMetadataObject) -> u64;
+        pub fn is_privileged(self: &AccountMetadataObject) -> bool;
 
         // CodeObject methods
-        pub fn get_code_hash(self: &CodeObject) -> &Digest;
-        pub fn get_code(self: &CodeObject) -> &SharedBlob;
+        pub fn get_code_hash(self: &CodeObject) -> &CxxDigest;
+        pub fn get_code(self: &CodeObject) -> &CxxSharedBlob;
 
         // PermissionObject methods
         pub fn get_id(self: &PermissionObject) -> i64;
         pub fn get_parent_id(self: &PermissionObject) -> i64;
-        pub fn get_owner(self: &PermissionObject) -> &Name;
-        pub fn get_name(self: &PermissionObject) -> &Name;
+        pub fn get_owner(self: &PermissionObject) -> &CxxName;
+        pub fn get_name(self: &PermissionObject) -> &CxxName;
 
         // Methods on Table
-        pub fn get_code(self: &Table) -> &Name;
-        pub fn get_scope(self: &Table) -> &Name;
-        pub fn get_table(self: &Table) -> &Name;
-        pub fn get_payer(self: &Table) -> &Name;
-        pub fn get_count(self: &Table) -> u32;
+        pub fn get_code(self: &TableObject) -> &CxxName;
+        pub fn get_scope(self: &TableObject) -> &CxxName;
+        pub fn get_table(self: &TableObject) -> &CxxName;
+        pub fn get_payer(self: &TableObject) -> &CxxName;
+        pub fn get_count(self: &TableObject) -> u32;
 
-        // Methods on KeyValue
-        pub fn get_table_id(self: &KeyValue) -> &TableId;
-        pub fn get_primary_key(self: &KeyValue) -> u64;
-        pub fn get_payer(self: &KeyValue) -> &Name;
-        pub fn get_value(self: &KeyValue) -> &SharedBlob;
+        // Methods on KeyValueObject
+        pub fn get_table_id(self: &KeyValueObject) -> &TableId;
+        pub fn get_primary_key(self: &KeyValueObject) -> u64;
+        pub fn get_payer(self: &KeyValueObject) -> &CxxName;
+        pub fn get_value(self: &KeyValueObject) -> &CxxSharedBlob;
 
         // Methods on GlobalPropertyObject
-        pub fn get_chain_config(self: &GlobalPropertyObject) -> &ChainConfig;
+        pub fn get_chain_config(self: &GlobalPropertyObject) -> &CxxChainConfig;
     }
 }
 

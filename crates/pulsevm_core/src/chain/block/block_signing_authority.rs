@@ -1,6 +1,6 @@
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 
-use crate::chain::secp256k1::PublicKey;
+use crate::crypto::PublicKey;
 
 #[derive(Debug, Default, Clone, Read, Write, NumBytes)]
 pub struct BlockSigningAuthority {

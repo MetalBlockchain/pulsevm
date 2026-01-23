@@ -6,12 +6,14 @@ use pulsevm_error::ChainError;
 use pulsevm_serialization::{NumBytes, Read, ReadError, Write, WriteError};
 use serde::{Serialize, ser::SerializeStruct};
 
-use crate::chain::{
-    config::FIXED_NET_OVERHEAD_OF_PACKED_TRX,
-    id::Id,
-    secp256k1::Signature,
-    transaction::{SignedTransaction, Transaction, TransactionCompression},
-    utils::pulse_assert,
+use crate::{
+    chain::{
+        config::FIXED_NET_OVERHEAD_OF_PACKED_TRX,
+        id::Id,
+        transaction::{SignedTransaction, Transaction, TransactionCompression},
+        utils::pulse_assert,
+    },
+    crypto::Signature,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -21,6 +21,7 @@ fn main() {
         "src/iterator_cache.rs",
         "src/name.rs",
         "src/objects.rs",
+        "src/types.rs",
     ])
     // Bridge implementation
     .file("database.cpp")
@@ -44,10 +45,19 @@ fn main() {
 
     println!("cargo:rustc-link-search=native={}", "/usr/local/lib");
     println!("cargo:rustc-link-lib=pthread");
+    println!(
+        "cargo:rustc-link-search=native={}",
+        "/opt/homebrew/opt/zlib/lib"
+    );
+    println!("cargo:rustc-link-lib=z");
+    println!(
+        "cargo:rustc-link-search=native={}",
+        "/opt/homebrew/opt/boost@1.85/lib"
+    );
     println!("cargo:rustc-link-lib=boost_system");
     println!("cargo:rustc-link-lib=boost_chrono");
     println!("cargo:rustc-link-lib=boost_iostreams");
-    println!("cargo:rustc-link-lib=boost_tuple");
+    println!("cargo:rustc-link-search=native={}", "/usr/local/lib");
     println!("cargo:rustc-link-lib=static=bls12-381");
     println!("cargo:rustc-link-lib=static=bn256");
     println!(

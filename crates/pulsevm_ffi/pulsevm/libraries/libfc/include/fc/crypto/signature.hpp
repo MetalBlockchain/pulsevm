@@ -36,6 +36,31 @@ namespace fc { namespace crypto {
 
          size_t variable_size() const;
 
+         int cmp(const signature& other) const {
+            if (this != &other) {
+               return this < &other ? -1 : 1;
+            }
+
+            return 0;
+         }
+
+         rust::Str to_string_rust() const {
+            std::string s = to_string(fc::yield_function_t());
+            return rust::Str(s.data(), s.size());
+         }
+
+         size_t num_bytes() const {
+            return fc::raw::pack_size(*this);
+         }
+
+         rust::Vec<uint8_t> pack() const {
+            rust::Vec<uint8_t> out;
+            size_t sz = fc::raw::pack_size(this);
+            fc::datastream<char*> ds(reinterpret_cast<char*>(out.data()), sz);
+            fc::raw::pack(ds, this);
+            return out;
+         }
+
       private:
          storage_type _storage;
 

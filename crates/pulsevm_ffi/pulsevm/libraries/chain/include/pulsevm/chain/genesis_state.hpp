@@ -61,6 +61,9 @@ struct genesis_state {
     * This is the SHA256 serialization of the genesis_state.
     */
    chain_id_type compute_chain_id() const;
+   const time_point& get_initial_timestamp() const { return initial_timestamp; }
+   const public_key_type& get_initial_key() const { return initial_key; }
+   const chain_config& get_initial_configuration() const { return initial_configuration; }
 
    friend inline bool operator==( const genesis_state& lhs, const genesis_state& rhs ) {
       return std::tie( lhs.initial_configuration, lhs.initial_timestamp, lhs.initial_key )

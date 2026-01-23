@@ -3,6 +3,8 @@
 #include <pulsevm/chain/name.hpp>
 
 namespace pulsevm::chain {
+    using CxxName = pulsevm::chain::name;
+
     std::unique_ptr<name> u64_to_name(uint64_t val) {
         return std::make_unique<name>(val);
     }

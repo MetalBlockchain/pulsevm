@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use pulsevm_error::ChainError;
-use pulsevm_ffi::{Database, Name as FfiName};
+use pulsevm_ffi::Database;
 
 use crate::name::Name;
 

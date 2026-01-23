@@ -9,6 +9,7 @@ use crate::{
         authority::WaitWeight,
         config::{self, BillableSize, FIXED_OVERHEAD_SHARED_VECTOR_RAM_BYTES},
     },
+    crypto::PublicKey,
 };
 
 use super::{key_weight::KeyWeight, permission_level_weight::PermissionLevelWeight};

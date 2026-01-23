@@ -21,11 +21,14 @@ namespace pulsevm { namespace chain {
    {
       OBJECT_CTOR(global_property_object)
 
-   public:
-      id_type                             id;
-      chain_config                        configuration;
-      chain_id_type                       chain_id;
-      wasm_config                         wasm_configuration;
+      public:
+         id_type                             id;
+         chain_config                        configuration;
+         chain_id_type                       chain_id;
+         wasm_config                         wasm_configuration;
+
+         const chain_id_type& get_chain_id() const { return chain_id; }
+         const chain_config& get_chain_config() const { return configuration; }
    };
 
    using global_property_multi_index = chainbase::shared_multi_index_container<

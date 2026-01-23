@@ -7,10 +7,9 @@ use pulsevm_serialization::Write;
 use serde::Serialize;
 use sha2::Digest;
 
-use crate::chain::{
-    id::Id,
-    secp256k1::{PrivateKey, PublicKey, Signature},
-    transaction::transaction::Transaction,
+use crate::{
+    chain::{id::Id, transaction::transaction::Transaction},
+    crypto::{PrivateKey, PublicKey, Signature},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Read, Write, NumBytes, Serialize, Default)]
@@ -54,7 +53,7 @@ impl SignedTransaction {
 
         for signature in self.signatures.iter() {
             let public_key = signature
-                .recover_public_key(digest)
+                .recover_public_key(&digest.into())
                 .map_err(|e| ChainError::SignatureRecoverError(format!("{}", e)))?;
             recovered_keys.insert(public_key);
         }
@@ -67,7 +66,7 @@ impl SignedTransaction {
         let digest = self
             .transaction
             .signing_digest(chain_id, &self.context_free_data)?;
-        let signature = private_key.sign(digest);
+        let signature = private_key.sign(&digest.into())?;
         self.signatures.insert(signature);
         Ok(self)
     }

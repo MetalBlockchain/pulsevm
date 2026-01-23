@@ -12,16 +12,14 @@ use crate::{
         block::{BlockHeader, BlockTimestamp, SignedBlock},
         config::{
             BLOCK_CPU_USAGE_AVERAGE_WINDOW_MS, BLOCK_INTERVAL_MS, BLOCK_SIZE_AVERAGE_WINDOW_MS,
-            DELETEAUTH_NAME, LINKAUTH_NAME,
-            MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER, NEWACCOUNT_NAME, SETABI_NAME, SETCODE_NAME,
-            UNLINKAUTH_NAME, UPDATEAUTH_NAME, eos_percent,
+            DELETEAUTH_NAME, LINKAUTH_NAME, MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER, NEWACCOUNT_NAME,
+            SETABI_NAME, SETCODE_NAME, UNLINKAUTH_NAME, UPDATEAUTH_NAME, eos_percent,
         },
         id::Id,
         mempool::Mempool,
         name::Name,
         pulse_contract::{
-            deleteauth, linkauth, newaccount, setabi, setcode, unlinkauth,
-            updateauth,
+            deleteauth, linkauth, newaccount, setabi, setcode, unlinkauth, updateauth,
         },
         resource::ElasticLimitParameters,
         resource_limits::ResourceLimitsManager,
@@ -35,7 +33,7 @@ use crate::{
 
 use pulsevm_crypto::{Digest, merkle};
 use pulsevm_error::ChainError;
-use pulsevm_ffi::{Database, GenesisState};
+use pulsevm_ffi::{CxxGenesisState, Database, GlobalPropertyObject};
 use pulsevm_serialization::{Read, Write};
 use spdlog::info;
 use tokio::sync::RwLock as AsyncRwLock;
@@ -113,7 +111,7 @@ impl Controller {
         let genesis_json = std::str::from_utf8(genesis_bytes).map_err(|e| {
             ChainError::ParseError(format!("failed to parse genesis bytes as UTF-8: {}", e))
         })?;
-        let genesis = GenesisState::new(genesis_json)
+        let genesis = CxxGenesisState::new(genesis_json)
             .map_err(|e| ChainError::ParseError(format!("failed to parse genesis: {}", e)))?;
         // TODO: Validate genesis state
         self.chain_id = genesis.compute_chain_id()?;
@@ -130,24 +128,17 @@ impl Controller {
         // Set our last accepted block to the genesis block
         self.last_accepted_block = SignedBlock::new(
             Id::default(),
-            genesis.initial_timestamp().clone(),
+            genesis.get_initial_timestamp(),
             VecDeque::new(),
             Digest::default(),
         );
 
-        let mut session = self.db.create_undo_session(true)?;
+        // TODO: Check if we need to initialize the database
 
-        // Do we have the genesis block in our DB?
-        let genesis_block = session.find::<SignedBlock>(1).map_err(|e| {
-            ChainError::GenesisError(format!("failed to find genesis block: {}", e))
+        // Initialize the database with the genesis state
+        self.db.initialize_database(&genesis).map_err(|e| {
+            ChainError::GenesisError(format!("failed to initialize database: {}", e))
         })?;
-
-        if genesis_block.is_none() {
-            // Initialize the database with the genesis state
-            self.db.initialize_database(genesis_bytes).map_err(|e| {
-                ChainError::GenesisError(format!("failed to initialize database: {}", e))
-            })?;
-        }
 
         Ok(())
     }
@@ -413,7 +404,9 @@ impl Controller {
     }
 
     pub fn find_apply_handler(receiver: &Name, scope: &Name, act: &Name) -> Option<ApplyHandlerFn> {
-        if let Some(handler) = APPLY_HANDLERS.get(&(receiver, scope, act)) {
+        if let Some(handler) =
+            APPLY_HANDLERS.get(&(receiver.as_u64(), scope.as_u64(), act.as_u64()))
+        {
             return Some(*handler);
         }
         None
@@ -423,10 +416,12 @@ impl Controller {
         &self.wasm_runtime
     }
 
-    pub fn get_global_properties(db: &mut Database) -> Result<GlobalPropertyObject, ChainError> {
-        db.get::<GlobalPropertyObject>(0).map_err(|e| {
-            ChainError::TransactionError(format!("failed to get global properties: {}", e))
+    pub fn get_global_properties(db: &mut Database) -> Result<&GlobalPropertyObject, ChainError> {
+        let res = db.get_global_properties().map_err(|e| {
+            ChainError::DatabaseError(format!("failed to get global properties: {}", e))
         })?;
+
+        Ok(unsafe { &*res })
     }
 
     pub fn database(&self) -> Database {

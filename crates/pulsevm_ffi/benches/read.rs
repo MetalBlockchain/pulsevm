@@ -1,17 +1,18 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-use pulsevm_ffi::Database;
+use pulsevm_ffi::{Database, Name};
 use tempfile::{env::temp_dir, tempdir};
 
-fn bench(db: &mut Database) {
-    db.get_account();
+fn bench(db: &mut Database, name: &Name) {
+    db.get_account(name).unwrap();
 }
 
 fn criterion_benchmark(c: &mut Criterion) {
     let temp_dir = tempdir().unwrap();
     let mut db = Database::new(temp_dir.path().to_str().unwrap()).unwrap();
     db.add_indices();
-    //db.add_account(pulsevm_ffi::Name { value: 123 });
-    c.bench_function("read", |b| b.iter(|| bench(&mut db)));
+    let n = Name::new(123);
+    db.create_account(n.to_uint64_t(), 0).unwrap();
+    c.bench_function("read", |b| b.iter(|| bench(&mut db, &n)));
 }
 
 criterion_group! {

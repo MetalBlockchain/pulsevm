@@ -1,6 +1,7 @@
 // chainbase_bridge.hpp - C++ bridge header for CXX
 #pragma once
 #include <chainbase/chainbase.hpp>
+#include <pulsevm/chain/authority.hpp>
 #include <pulsevm/chain/code_object.hpp>
 #include <pulsevm/chain/block.hpp>
 #include <pulsevm/chain/block_timestamp.hpp>
@@ -11,15 +12,21 @@
 #include <pulsevm/chain/permission_link_object.hpp>
 #include <pulsevm/chain/global_property_object.hpp>
 #include <pulsevm/chain/protocol_state_object.hpp>
+#include <pulsevm/chain/database_header_object.hpp>
+#include <pulsevm/chain/genesis_state.hpp>
+#include <pulsevm/chain/pulse_abi.hpp>
+#include <pulsevm_ffi/src/types.rs.h>
 #include "iterator_cache.hpp"
 #include "objects.hpp"
+#include "name.hpp"
+#include "types.hpp"
 #include <memory>
 #include <rust/cxx.h>
 #include <string>
 
 namespace pulsevm { namespace chain {
 
-using undo_session = ::chainbase::database::session;
+using UndoSession = ::chainbase::database::session;
 
 struct cpu_limit_result;
 struct net_limit_result;
@@ -32,6 +39,13 @@ public:
     // Add your non-template wrapper methods
     void add_indices() {
         this->add_index<account_index>();
+        this->add_index<account_metadata_index>();
+        this->add_index<account_ram_correction_index>();
+        this->add_index<code_index>();
+        this->add_index<table_id_multi_index>();
+        this->add_index<key_value_index>();
+        this->add_index<global_property_multi_index>();
+        this->add_index<dynamic_global_property_multi_index>();
         this->add_index<resource_limits::resource_limits_index>();
         this->add_index<resource_limits::resource_usage_index>();
         this->add_index<resource_limits::resource_limits_state_index>();
@@ -39,9 +53,98 @@ public:
         this->add_index<permission_usage_index>();
         this->add_index<permission_index>();
         this->add_index<permission_link_index>();
+        this->add_index<protocol_state_multi_index>();
+        this->add_index<database_header_multi_index>();
     }
 
-    const account_object& create_account(const name& account_name, uint32_t creation_date) {
+    void initialize_database(const genesis_state& genesis) {
+        // create the database header sigil
+        this->create<database_header_object>([&]( auto& header ){
+            // nothing to do for now
+        });
+
+        auto chain_id = genesis.compute_chain_id();
+        this->create<global_property_object>([&genesis,&chain_id](auto& gpo ){
+            gpo.configuration = genesis.initial_configuration;
+            gpo.wasm_configuration = genesis_state::default_initial_wasm_configuration;
+            gpo.chain_id = chain_id;
+        });
+
+        this->create<protocol_state_object>([&](auto& pso ){
+            pso.num_supported_key_types = config::genesis_num_supported_key_types;
+        });
+        this->create<dynamic_global_property_object>([](auto&){});
+        this->create<permission_object>([](auto&){});  /// reserve perm 0 (used else where)
+
+        const auto& config = this->create<resource_limits::resource_limits_config_object>([](resource_limits::resource_limits_config_object& config){
+            // see default settings in the declaration
+        });
+
+        const auto& state = this->create<resource_limits::resource_limits_state_object>([&config](resource_limits::resource_limits_state_object& state){
+            // see default settings in the declaration
+
+            // start the chain off in a way that it is "congested" aka slow-start
+            state.virtual_cpu_limit = config.cpu_limit_parameters.max;
+            state.virtual_net_limit = config.net_limit_parameters.max;
+        });
+
+        authority system_auth(genesis.initial_key);
+        this->create_native_account( genesis.initial_timestamp, config::system_account_name, system_auth, system_auth, true );
+
+        auto empty_authority = authority(1, {}, {});
+        auto active_producers_authority = authority(1, {}, {});
+        active_producers_authority.accounts.push_back({{config::system_account_name, config::active_name}, 1});
+
+        this->create_native_account( genesis.initial_timestamp, config::null_account_name, empty_authority, empty_authority );
+        this->create_native_account( genesis.initial_timestamp, config::producers_account_name, empty_authority, active_producers_authority );
+        const auto& active_permission       = this->get_permission({config::producers_account_name, config::active_name});
+        const auto& majority_permission     = this->create_permission(
+            config::producers_account_name,
+            config::majority_producers_permission_name,
+            active_permission.id._id,
+            active_producers_authority,
+            genesis.initial_timestamp
+        );
+        this->create_permission(
+            config::producers_account_name, 
+            config::minority_producers_permission_name,
+            majority_permission.id._id,
+            active_producers_authority,
+            genesis.initial_timestamp
+        );
+    }
+
+    void create_native_account( const fc::time_point& initial_timestamp, account_name name, const authority& owner, const authority& active, bool is_privileged = false ) {
+        this->create<account_object>([&](auto& a) {
+            a.name = name;
+            a.creation_date = initial_timestamp;
+
+            if( name == config::system_account_name ) {
+                a.abi.assign(pulsevm_abi_bin, sizeof(pulsevm_abi_bin));
+            }
+        });
+        this->create<account_metadata_object>([&](auto & a) {
+            a.name = name;
+            a.set_privileged( is_privileged );
+        });
+
+        const auto& owner_permission  = this->create_permission(name, config::owner_name, 0,
+                                                                        owner, initial_timestamp );
+        const auto& active_permission = this->create_permission(name, config::active_name, owner_permission.id._id,
+                                                                        active, initial_timestamp );
+
+        this->initialize_account_resource_limits(name);
+
+        int64_t ram_delta = config::overhead_per_account_ram_bytes;
+        ram_delta += 2*config::billable_size_v<permission_object>;
+        ram_delta += owner_permission.auth.get_billable_size();
+        ram_delta += active_permission.auth.get_billable_size();
+
+        this->add_pending_ram_usage(name, ram_delta);
+        this->verify_account_ram_usage(name);
+    }
+
+    const account_object& create_account(uint64_t account_name, uint32_t creation_date) {
         return this->create<account_object>([&](auto& a) {
             a.name = name(account_name);
             a.creation_date = block_timestamp_type(creation_date);
@@ -427,7 +530,7 @@ public:
         });
     }
 
-    int db_find_i64( const name& code, const name& scope, const name& table, uint64_t id, key_value_iterator_cache& keyval_cache ) {
+    int db_find_i64( const name& code, const name& scope, const name& table, uint64_t id, CxxKeyValueIteratorCache& keyval_cache ) {
         const auto* tab = find_table( code, scope, table );
         if( !tab ) return -1;
 
@@ -645,7 +748,7 @@ public:
             p.usage_id     = perm_usage.id;
             p.parent       = permission_object::id_type(parent);
             p.owner        = account;
-            p.name         = name;
+            p.perm_name         = name;
             p.last_updated = creation_time;
             p.auth         = std::move(auth);
         });
@@ -653,7 +756,7 @@ public:
         return perm;
     }
 
-    void modify_permission( const permission_object& permission, const authority& auth, const fc::time_point& pending_block_time ) {
+    void modify_permission( const permission_object& permission, const Authority& auth, const fc::time_point& pending_block_time ) {
         for(const key_weight& k: auth.keys)
             EOS_ASSERT(k.key.which() < this->get<protocol_state_object>().num_supported_key_types, unactivated_key_type,
             "Unactivated key type used when modifying permission");
@@ -670,6 +773,29 @@ public:
             return this->get<permission_object, by_owner>( boost::make_tuple(level.actor,level.permission) );
         } EOS_RETHROW_EXCEPTIONS( chain::permission_query_exception, "Failed to retrieve permission: ${level}", ("level", level) ) 
     }
+
+    const name* lookup_linked_permission(
+        const name& authorizer_account,
+        const name& scope,
+        const name& act_name
+    )const {
+      try {
+         // First look up a specific link for this message act_name
+         auto key = boost::make_tuple(authorizer_account, scope, act_name);
+         auto link = this->find<permission_link_object, by_action_name>(key);
+         // If no specific link found, check for a contract-wide default
+         if (link == nullptr) {
+            boost::get<2>(key) = {};
+            link = this->find<permission_link_object, by_action_name>(key);
+         }
+
+         // If no specific or default link found, use active permission
+         if (link != nullptr) {
+            return &link->required_permission;
+         }
+         return nullptr;
+      } FC_CAPTURE_AND_RETHROW((authorizer_account)(scope)(act_name))
+   }
 
     const dynamic_global_property_object& get_dynamic_global_properties() const {
         return this->get<dynamic_global_property_object>();

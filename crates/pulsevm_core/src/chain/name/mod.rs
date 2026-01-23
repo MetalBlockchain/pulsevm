@@ -9,14 +9,14 @@ use std::{
 
 use cxx::UniquePtr;
 use pulsevm_error::ChainError;
-use pulsevm_ffi::{Name as FfiName, u64_to_name};
+use pulsevm_ffi::{CxxName, u64_to_name};
 use pulsevm_name::{NAME_MAX_LEN, name_from_bytes, name_to_bytes};
 use pulsevm_serialization::{NumBytes, Read, ReadError, Write, WriteError};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone)]
 pub struct Name {
-    inner: Arc<UniquePtr<FfiName>>,
+    inner: Arc<UniquePtr<CxxName>>,
 }
 
 impl Name {
@@ -40,7 +40,7 @@ impl Name {
         name_to_bytes(self.inner.to_uint64_t())
     }
 
-    pub fn as_ref(&self) -> &FfiName {
+    pub fn as_ref(&self) -> &CxxName {
         &self.inner
     }
 }
@@ -57,8 +57,8 @@ impl From<u64> for Name {
     }
 }
 
-impl From<&FfiName> for Name {
-    fn from(ffi_name: &FfiName) -> Self {
+impl From<&CxxName> for Name {
+    fn from(ffi_name: &CxxName) -> Self {
         Name {
             inner: Arc::new(u64_to_name(ffi_name.to_uint64_t())),
         }
