@@ -32,6 +32,7 @@ use crate::{
 };
 
 struct ApplyContextInner {
+    action: Action,                       // The action being applied
     action_return_value: Option<Vec<u8>>, // Return value of the action
     start: i64,                           // Start time in microseconds
     privileged: bool,
@@ -48,7 +49,6 @@ pub struct ApplyContext {
     trx_context: TransactionContext, // The transaction context
     db: Database,                    // The database being used
 
-    action: Action, // The action being applied
     receiver: Name, // The account that is receiving the action
     first_receiver_action_ordinal: u32,
     action_ordinal: u32,
@@ -74,13 +74,13 @@ impl ApplyContext {
             trx_context,
             db,
 
-            action,
             receiver,
             first_receiver_action_ordinal: 0,
             action_ordinal,
             pending_block_timestamp,
 
             inner: Arc::new(RwLock::new(ApplyContextInner {
+                action,
                 action_return_value: None,
                 start: Utc::now().timestamp_micros(),
                 privileged: false,
@@ -137,31 +137,35 @@ impl ApplyContext {
     }
 
     pub fn exec_one(&mut self) -> Result<u64, ChainError> {
-        let receiver_account = unsafe { &*self.db.get_account_metadata(self.receiver.as_ref())? };
+        let receiver_account = unsafe { &*self.db.get_account_metadata(self.receiver.as_u64())? };
         let cpu_used = 100; // Base usage is always 100 instructions
-
-        {
+        let action = {
             let mut inner = self.inner.write()?;
             inner.privileged = receiver_account.is_privileged();
-        }
+            inner.action.clone()
+        };
 
-        let native = Controller::find_apply_handler(
-            &self.receiver,
-            self.action.account(),
-            self.action.name(),
+        println!(
+            "Executing action {}@{} for receiver {}",
+            action.account(),
+            action.name(),
+            self.receiver
         );
+
+        let native =
+            Controller::find_apply_handler(&self.receiver, action.account(), action.name());
         if let Some(native) = native {
-            native(self, &mut self.db.clone())?;
+            native(self, &mut self.db.clone(), &action)?;
         }
 
         // Refresh the receiver account metadata
-        let receiver_account = unsafe { &*self.db.get_account_metadata(self.receiver.as_ref())? };
+        let receiver_account = unsafe { &*self.db.get_account_metadata(self.receiver.as_u64())? };
 
         // Does the receiver account have a contract deployed?
         if !receiver_account.get_code_hash().empty() {
             self.wasm_runtime.run(
                 self.receiver.clone(),
-                self.action.clone(),
+                action.clone(),
                 self.clone(),
                 self.db.clone(),
                 receiver_account.get_code_hash(),
@@ -170,16 +174,12 @@ impl ApplyContext {
 
         let act_digest = {
             let inner = self.inner.read()?;
-            generate_action_digest(&self.action, inner.action_return_value.clone())
+            generate_action_digest(&action, inner.action_return_value.clone())
         };
-        let first_receiver_account = if self.action.account() == &self.receiver {
+        let first_receiver_account = if action.account() == &self.receiver {
             receiver_account.clone()
         } else {
-            unsafe {
-                &*self
-                    .db
-                    .get_account_metadata(self.action.account().as_ref())?
-            }
+            unsafe { &*self.db.get_account_metadata(action.account().as_u64())? }
         };
         let mut receipt = ActionReceipt::new(
             self.receiver.clone(),
@@ -191,8 +191,8 @@ impl ApplyContext {
             first_receiver_account.get_abi_sequence() as u32,
         );
 
-        for auth in self.action.clone().authorization().iter() {
-            let auth_sequence = self.next_auth_sequence(&mut auth.actor.clone())?;
+        for auth in action.clone().authorization().iter() {
+            let auth_sequence = self.next_auth_sequence(auth.actor)?;
             receipt.add_auth_sequence(auth.actor.clone(), auth_sequence);
         }
 
@@ -207,8 +207,8 @@ impl ApplyContext {
         info!(
             "took {} us to execute action {}@{}",
             Utc::now().timestamp_micros() - inner.start,
-            self.action.account(),
-            self.action.name()
+            inner.action.account(),
+            inner.action.name()
         );
 
         self.trx_context
@@ -220,16 +220,14 @@ impl ApplyContext {
         Ok(())
     }
 
-    pub fn get_action(&self) -> &Action {
-        &self.action
-    }
-
     pub fn require_authorization(
         &self,
         account: &Name,
         permission: Option<Name>,
     ) -> Result<(), ChainError> {
-        for auth in self.action.authorization() {
+        let inner = self.inner.read()?;
+
+        for auth in inner.action.authorization() {
             if let Some(perm) = permission {
                 if auth.actor == *account && auth.permission == perm {
                     return Ok(());
@@ -239,7 +237,7 @@ impl ApplyContext {
                     "missing authority of {}/{}",
                     account, perm
                 )));
-            } else if auth.actor == *account {
+            } else if auth.actor == account.as_u64() {
                 return Ok(());
             }
         }
@@ -268,14 +266,16 @@ impl ApplyContext {
         Ok(())
     }
 
-    pub fn has_authorization(&self, account: &Name) -> bool {
-        for auth in self.action.authorization() {
+    pub fn has_authorization(&self, account: &Name) -> Result<bool, ChainError> {
+        let inner = self.inner.read()?;
+
+        for auth in inner.action.authorization() {
             if auth.actor == *account {
-                return true;
+                return Ok(true);
             }
         }
 
-        return false;
+        return Ok(false);
     }
 
     pub fn add_ram_usage(&mut self, account: &Name, ram_delta: i64) -> Result<(), ChainError> {
@@ -289,15 +289,19 @@ impl ApplyContext {
     }
 
     pub fn is_account(&self, account: &Name) -> Result<bool, ChainError> {
-        self.db.is_account(account.as_ref())
+        self.db.is_account(account.as_u64())
     }
 
     pub fn execute_inline(&mut self, a: &Action) -> Result<(), ChainError> {
+        let action = {
+            let inner = self.inner.read()?;
+            inner.action.clone()
+        };
         let send_to_self = a.account() == &self.receiver;
-        let inherit_parent_authorizations = send_to_self && &self.receiver == self.action.account();
+        let inherit_parent_authorizations = send_to_self && &self.receiver == action.account();
 
         {
-            let code = self.db.find_account(a.account().as_ref())?;
+            let code = self.db.find_account(a.account().as_u64())?;
             pulse_assert(
                 !code.is_null(),
                 ChainError::TransactionError(format!(
@@ -309,7 +313,7 @@ impl ApplyContext {
             let mut inherited_authorizations: HashSet<PermissionLevel> = HashSet::new();
 
             for auth in a.authorization() {
-                let actor = self.db.find_account(auth.actor.as_ref())?;
+                let actor = self.db.find_account(auth.actor)?;
                 pulse_assert(
                     !actor.is_null(),
                     ChainError::TransactionError(format!(
@@ -326,17 +330,14 @@ impl ApplyContext {
                 )?;
 
                 if inherit_parent_authorizations
-                    && self.action.authorization().iter().any(|pl| pl == auth)
+                    && action.authorization().iter().any(|pl| pl == auth)
                 {
                     inherited_authorizations.insert(auth.clone());
                 }
             }
 
             let mut provided_permissions = HashSet::new();
-            provided_permissions.insert(PermissionLevel::new(
-                self.receiver.clone(),
-                CODE_NAME.into(),
-            ));
+            provided_permissions.insert(PermissionLevel::new(*self.receiver, CODE_NAME.into()));
             let inner = self.inner.read()?;
 
             if !inner.privileged {
@@ -375,7 +376,10 @@ impl ApplyContext {
             self.first_receiver_action_ordinal,
         )?;
 
-        self.action = self.trx_context.get_action_trace(self.action_ordinal)?.act;
+        {
+            let mut inner = self.inner.write()?;
+            inner.action = self.trx_context.get_action_trace(self.action_ordinal)?.act;
+        }
 
         Ok(scheduled_action_ordinal)
     }
@@ -394,27 +398,27 @@ impl ApplyContext {
             self.first_receiver_action_ordinal,
         )?;
 
-        self.action = self.trx_context.get_action_trace(self.action_ordinal)?.act;
+        {
+            let mut inner = self.inner.write()?;
+            inner.action = self.trx_context.get_action_trace(self.action_ordinal)?.act;
+        }
 
         Ok(scheduled_action_ordinal)
     }
 
     pub fn db_find_i64(
         &mut self,
-        code: &Name,
-        scope: &Name,
-        table: &Name,
+        code: u64,
+        scope: u64,
+        table: u64,
         id: u64,
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
 
-        match self.db.db_find_i64(
-            code.as_ref(),
-            scope.as_ref(),
-            table.as_ref(),
-            id,
-            &mut inner.keyval_cache,
-        ) {
+        match self
+            .db
+            .db_find_i64(code, scope, table, id, &mut inner.keyval_cache)
+        {
             Ok(itr) => Ok(itr),
             Err(e) => Err(ChainError::DatabaseError(format!(
                 "failed to find i64 in db: {}",
@@ -425,16 +429,16 @@ impl ApplyContext {
 
     pub fn db_store_i64(
         &mut self,
-        scope: &Name,
-        table: &Name,
-        payer: &Name,
+        scope: u64,
+        table: u64,
+        payer: u64,
         primary_key: u64,
         data: Bytes,
     ) -> Result<i32, ChainError> {
-        let table = self.find_or_create_table(&self.receiver.clone(), scope, table, payer)?;
+        let table = self.find_or_create_table(*self.receiver, scope, table, payer)?;
         let table = unsafe { &*table };
         pulse_assert(
-            !payer.empty(),
+            payer != 0,
             ChainError::TransactionError(format!(
                 "must specify a valid account to pay for new record"
             )),
@@ -442,19 +446,16 @@ impl ApplyContext {
 
         let res = {
             let mut inner = self.inner.write()?;
-            let obj = self.db.create_key_value_object(
-                table,
-                payer.as_ref(),
-                primary_key,
-                &data.0.as_slice(),
-            )?;
+            let obj =
+                self.db
+                    .create_key_value_object(table, payer, primary_key, &data.0.as_slice())?;
             let obj = unsafe { &*obj };
-            inner.keyval_cache.cache_table(&table);
+            inner.keyval_cache.cache_table(&table)?;
             inner.keyval_cache.add(obj)?
         };
 
         let billable_size = data.len() as i64 + billable_size_v::<KeyValueObject>() as i64;
-        self.update_db_usage(payer, billable_size)?;
+        self.update_db_usage(&payer.into(), billable_size)?;
 
         Ok(res)
     }
@@ -465,7 +466,9 @@ impl ApplyContext {
         payer: &Name,
         data: impl AsRef<[u8]>,
     ) -> Result<(), ChainError> {
-        let (old_size, new_size, existing_payer) = {
+        let payer = payer.as_u64();
+        let new_size = data.as_ref().len() as i64;
+        let (old_size, old_payer, new_payer) = {
             let inner = self.inner.read()?;
             let obj = inner.keyval_cache.get(iterator)?;
             let table_obj = inner.keyval_cache.get_table(obj.get_table_id())?;
@@ -473,29 +476,26 @@ impl ApplyContext {
                 table_obj.get_code().to_uint64_t() == self.receiver.as_u64(),
                 ChainError::TransactionError(format!("db access violation",)),
             )?;
-
+            let old_payer = obj.get_payer().to_uint64_t();
+            let new_payer = if payer == 0 {
+                obj.get_payer().to_uint64_t()
+            } else {
+                payer
+            };
             let old_size = obj.get_value().size() as i64;
             self.db
-                .update_key_value_object(obj, payer.as_ref(), data.as_ref())?;
-            let new_size = obj.get_value().size() as i64;
-            let existing_payer = Name::new(obj.get_payer().to_uint64_t()); // TODO: Avoid this conversion
-            (old_size, new_size, existing_payer)
+                .update_key_value_object(obj, new_payer, data.as_ref())?;
+            (old_size, old_payer, new_payer)
         };
 
         let overhead = billable_size_v::<KeyValueObject>() as i64;
         let old_size = old_size + overhead;
 
-        let payer = if payer.empty() {
-            &existing_payer
-        } else {
-            payer
-        };
-
-        if existing_payer.as_u64() != payer.as_u64() {
-            self.update_db_usage(&existing_payer, -old_size)?;
-            self.update_db_usage(&payer, new_size)?;
+        if old_payer != new_payer {
+            self.update_db_usage(&Name::new(old_payer), -old_size)?;
+            self.update_db_usage(&Name::new(new_payer), new_size)?;
         } else if old_size != new_size {
-            self.update_db_usage(&existing_payer, new_size - old_size)?;
+            self.update_db_usage(&Name::new(new_payer), new_size - old_size)?;
         }
 
         Ok(())
@@ -525,7 +525,7 @@ impl ApplyContext {
         let mut inner = self.inner.write()?;
         let delta =
             self.db
-                .db_remove_i64(&mut inner.keyval_cache, iterator, self.receiver.as_ref())?;
+                .db_remove_i64(&mut inner.keyval_cache, iterator, self.receiver.as_u64())?;
 
         //self.update_db_usage(&payer, -delta)?;
 
@@ -544,84 +544,58 @@ impl ApplyContext {
             .db_previous_i64(&mut inner.keyval_cache, iterator, primary)
     }
 
-    pub fn db_end_i64(&mut self, code: Name, scope: Name, table: Name) -> Result<i32, ChainError> {
+    pub fn db_end_i64(&mut self, code: u64, scope: u64, table: u64) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        self.db.db_end_i64(
-            &mut inner.keyval_cache,
-            code.as_ref(),
-            scope.as_ref(),
-            table.as_ref(),
-        )
+        self.db
+            .db_end_i64(&mut inner.keyval_cache, code, scope, table)
     }
 
     pub fn db_lowerbound_i64(
         &mut self,
-        code: Name,
-        scope: Name,
-        table: Name,
+        code: u64,
+        scope: u64,
+        table: u64,
         primary: u64,
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        self.db.db_lowerbound_i64(
-            &mut inner.keyval_cache,
-            code.as_ref(),
-            scope.as_ref(),
-            table.as_ref(),
-            primary,
-        )
+        self.db
+            .db_lowerbound_i64(&mut inner.keyval_cache, code, scope, table, primary)
     }
 
     pub fn db_upperbound_i64(
         &mut self,
-        code: Name,
-        scope: Name,
-        table: Name,
+        code: u64,
+        scope: u64,
+        table: u64,
         primary: u64,
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        self.db.db_upperbound_i64(
-            &mut inner.keyval_cache,
-            code.as_ref(),
-            scope.as_ref(),
-            table.as_ref(),
-            primary,
-        )
+        self.db
+            .db_upperbound_i64(&mut inner.keyval_cache, code, scope, table, primary)
     }
 
     pub fn find_table(
-        &mut self,
-        code: &Name,
-        scope: &Name,
-        table: &Name,
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
     ) -> Result<*const TableObject, ChainError> {
-        self.db
-            .get_table(code.as_ref(), scope.as_ref(), table.as_ref())
+        self.db.find_table(code, scope, table)
     }
 
     pub fn find_or_create_table(
         &mut self,
-        code: &Name,
-        scope: &Name,
-        table_name: &Name,
-        payer: &Name,
+        code: u64,
+        scope: u64,
+        table_name: u64,
+        payer: u64,
     ) -> Result<*const TableObject, ChainError> {
         let table = self.find_table(code, scope, table_name)?;
 
         if table.is_null() {
-            self.update_db_usage(payer, billable_size_v::<TableObject>() as i64)?;
-            let table = self
-                .db
-                .create_table(
-                    code.as_ref(),
-                    scope.as_ref(),
-                    table_name.as_ref(),
-                    payer.as_ref(),
-                )
-                .map_err(|e| {
-                    ChainError::TransactionError(format!("failed to create table: {}", e))
-                })?;
+            self.update_db_usage(&payer.into(), billable_size_v::<TableObject>() as i64)?;
 
-            Ok(table)
+            return self.db.create_table(code, scope, table_name, payer);
         } else {
             Ok(table)
         }
@@ -629,7 +603,7 @@ impl ApplyContext {
 
     pub fn remove_table(&mut self, table: &TableObject) -> Result<(), ChainError> {
         self.update_db_usage(
-            &table.get_payer().into(),
+            &table.get_payer().to_uint64_t().into(),
             -(billable_size_v::<TableObject>() as i64),
         )?;
         self.db.remove_table(table)?;
@@ -640,7 +614,7 @@ impl ApplyContext {
         if delta > 0 {
             // Do not allow charging RAM to other accounts during notify
             let inner = self.inner.read()?;
-            if !(inner.privileged || payer == &self.receiver) {
+            if !(inner.privileged || *payer == self.receiver.as_u64()) {
                 self.require_authorization(payer, None).map_err(|_| {
                     ChainError::TransactionError(format!(
                         "cannot charge RAM to other accounts during notify"
@@ -664,21 +638,15 @@ impl ApplyContext {
         &mut self,
         receiver_account: &AccountMetadataObject,
     ) -> Result<u64, ChainError> {
-        self.db.next_recv_sequence(receiver_account).map_err(|e| {
-            ChainError::InternalError(Some(format!("failed to get next recv sequence: {}", e)))
-        })
+        self.db.next_recv_sequence(receiver_account)
     }
 
-    pub fn next_auth_sequence(&mut self, actor: &Name) -> Result<u64, ChainError> {
-        self.db.next_auth_sequence(actor.as_ref()).map_err(|e| {
-            ChainError::InternalError(Some(format!("failed to get next auth sequence: {}", e)))
-        })
+    pub fn next_auth_sequence(&mut self, actor: u64) -> Result<u64, ChainError> {
+        self.db.next_auth_sequence(actor)
     }
 
     pub fn next_global_sequence(&mut self) -> Result<u64, ChainError> {
-        self.db.next_global_sequence().map_err(|e| {
-            ChainError::InternalError(Some(format!("failed to get next global sequence: {}", e)))
-        })
+        self.db.next_global_sequence()
     }
 
     pub fn is_privileged(&self) -> Result<bool, ChainError> {
@@ -686,12 +654,8 @@ impl ApplyContext {
         Ok(inner.privileged)
     }
 
-    pub fn set_privileged(
-        &mut self,
-        account: &Name,
-        is_privileged: bool,
-    ) -> Result<(), ChainError> {
-        self.db.set_privileged(account.as_ref(), is_privileged)?;
+    pub fn set_privileged(&mut self, account: u64, is_privileged: bool) -> Result<(), ChainError> {
+        self.db.set_privileged(account, is_privileged)?;
         Ok(())
     }
 

@@ -8,8 +8,7 @@ use pulsevm_crypto::Bytes;
 use pulsevm_error::ChainError;
 use pulsevm_ffi::{CxxDigest, Database};
 use wasmer::{Engine, Function, FunctionEnv, Instance, Memory, Module, Store, imports};
-
-use wasmer_compiler_llvm::LLVM;
+use wasmer_compiler_cranelift::Cranelift;
 
 use crate::{
     block::BlockTimestamp,
@@ -110,7 +109,7 @@ pub struct WasmRuntime {
 
 impl WasmRuntime {
     pub fn new() -> Result<Self, ChainError> {
-        let compiler = LLVM::default();
+        let compiler = Cranelift::default();
 
         Ok(Self {
             inner: Arc::new(RwLock::new(InnerWasmRuntime {
@@ -132,20 +131,25 @@ impl WasmRuntime {
         apply_context.pause_billing_timer()?;
 
         let mut inner = self.inner.write()?;
-        let mut store = Store::new(inner.engine.clone());
         let id = Id::from(code_hash);
 
         // Different scope so session is released before running the wasm code.
         {
             if !inner.code_cache.contains(&id) {
+                println!("Wasm module not found in cache, loading from db: {}", id);
                 let code_object = db.get_code_object_by_hash(code_hash, 0, 0)?;
                 let code_object = unsafe { &*code_object };
-                let module = Module::new(store.engine(), code_object.get_code().get_data())
+                // Create a temporary store just for module compilation
+                let temp_store = Store::new(inner.engine.clone());
+                let module = Module::new(temp_store.engine(), code_object.get_code().get_data())
                     .map_err(|e| ChainError::WasmRuntimeError(e.to_string()))?;
                 inner.code_cache.put(id, module);
+            } else {
+                println!("Wasm module found in cache: {}", id);
             }
         }
 
+        let mut store = Store::new(inner.engine.clone());
         let module = inner.code_cache.get(&id).ok_or_else(|| {
             ChainError::WasmRuntimeError(format!("wasm module not found in cache: {}", id))
         })?;

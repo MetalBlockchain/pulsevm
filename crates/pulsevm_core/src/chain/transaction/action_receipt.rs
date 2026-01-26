@@ -11,7 +11,7 @@ pub struct ActionReceipt {
     pub act_digest: Digest,
     pub global_sequence: u64,
     pub recv_sequence: u64,
-    pub auth_sequence: HashMap<Name, u64>,
+    pub auth_sequence: HashMap<u64, u64>,
     pub code_sequence: u32,
     pub abi_sequence: u32,
 }
@@ -22,7 +22,7 @@ impl ActionReceipt {
         act_digest: Digest,
         global_sequence: u64,
         recv_sequence: u64,
-        auth_sequence: HashMap<Name, u64>,
+        auth_sequence: HashMap<u64, u64>,
         code_sequence: u32,
         abi_sequence: u32,
     ) -> Self {
@@ -37,7 +37,7 @@ impl ActionReceipt {
         }
     }
 
-    pub fn add_auth_sequence(&mut self, name: Name, sequence: u64) {
+    pub fn add_auth_sequence(&mut self, name: u64, sequence: u64) {
         self.auth_sequence.insert(name, sequence);
     }
 }

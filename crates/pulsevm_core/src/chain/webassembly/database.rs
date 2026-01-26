@@ -10,7 +10,7 @@ pub fn db_find_i64(
     id: u64,
 ) -> Result<i32, RuntimeError> {
     let context = env.data_mut().apply_context_mut();
-    let result = context.db_find_i64(&code.into(), &scope.into(), &table.into(), id.into())?;
+    let result = context.db_find_i64(code, scope, table, id)?;
     Ok(result)
 }
 
@@ -36,13 +36,7 @@ pub fn db_store_i64(
     slice.read_slice(&mut src_bytes)?;
 
     let context = env_data.apply_context_mut();
-    let result = context.db_store_i64(
-        &scope.into(),
-        &table.into(),
-        &payer.into(),
-        id.into(),
-        src_bytes.into(),
-    )?;
+    let result = context.db_store_i64(scope, table, payer, id, src_bytes.into())?;
     Ok(result)
 }
 

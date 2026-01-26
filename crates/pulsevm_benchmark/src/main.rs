@@ -9,18 +9,15 @@ use std::{
 
 use chrono::Utc;
 use pulsevm_core::{
-    PULSE_NAME,
-    account::{self, Account, AccountMetadata},
+    ACTIVE_NAME, ChainError, PULSE_NAME,
     asset::{Asset, Symbol},
-    authority::{Authority, KeyWeight, PermissionLevel, PermissionLink},
+    authority::{Authority, KeyWeight, PermissionLevel},
     controller::Controller,
-    error::ChainError,
+    crypto::PrivateKey,
     id::Id,
     name::Name,
     pulse_contract::{NewAccount, SetAbi, SetCode},
-    secp256k1::PrivateKey,
     transaction::{Action, PackedTransaction, Transaction, TransactionHeader},
-    wasm_runtime,
 };
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 use pulsevm_serialization::Write;
@@ -30,21 +27,27 @@ use spdlog::info;
 
 #[tokio::main]
 async fn main() {
-    let private_key = PrivateKey::random();
+    let private_key =
+        PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez").unwrap();
     let mut controller = Controller::new();
     let genesis_bytes = generate_genesis(&private_key);
     let temp_path = get_temp_dir().to_str().unwrap().to_string();
     controller
         .initialize(&genesis_bytes.to_vec(), temp_path.as_str())
         .unwrap();
+    let db = controller.database();
+    let global_properties = Controller::get_global_properties(&db).unwrap();
+    let mut db = controller.database();
+    let chain_config = global_properties.get_chain_config();
+    let pending_block_timestamp = controller.last_accepted_block().timestamp().clone();
 
-    let pending_block_timestamp = controller.last_accepted_block().timestamp();
-    let mut undo_session = controller.create_undo_session().unwrap();
+    println!("Setting up initial accounts and contracts...");
 
     // Create 'pulse.token' account
     controller
         .execute_transaction(
-            &mut undo_session,
+            &mut db,
+            &chain_config,
             &create_account(
                 &private_key,
                 Name::from_str("pulse.token").unwrap(),
@@ -55,10 +58,13 @@ async fn main() {
         )
         .unwrap();
 
+    println!("Created pulse.token account");
+
     // Create 'alice' account
     controller
         .execute_transaction(
-            &mut undo_session,
+            &mut db,
+            &chain_config,
             &create_account(
                 &private_key,
                 Name::from_str("alice").unwrap(),
@@ -69,10 +75,13 @@ async fn main() {
         )
         .unwrap();
 
+    println!("Created alice account");
+
     // Create 'bob' account
     controller
         .execute_transaction(
-            &mut undo_session,
+            &mut db,
+            &chain_config,
             &create_account(
                 &private_key,
                 Name::from_str("bob").unwrap(),
@@ -82,6 +91,8 @@ async fn main() {
             &pending_block_timestamp,
         )
         .unwrap();
+
+    println!("Created bob account");
 
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -94,7 +105,8 @@ async fn main() {
         fs::read(root.join(Path::new("reference_contracts/pulse_token.abi"))).unwrap();
     controller
         .execute_transaction(
-            &mut undo_session,
+            &mut db,
+            &chain_config,
             &set_code(
                 &private_key,
                 Name::from_str("pulse.token").unwrap(),
@@ -107,7 +119,8 @@ async fn main() {
         .unwrap();
     controller
         .execute_transaction(
-            &mut undo_session,
+            &mut db,
+            &chain_config,
             &set_abi(
                 &private_key,
                 Name::from_str("pulse.token").unwrap(),
@@ -121,7 +134,8 @@ async fn main() {
 
     controller
         .execute_transaction(
-            &mut undo_session,
+            &mut db,
+            &chain_config,
             &call_contract(
                 &private_key,
                 Name::from_str("pulse.token").unwrap(),
@@ -132,8 +146,8 @@ async fn main() {
                 },
                 controller.chain_id(),
                 vec![PermissionLevel::new(
-                    Name::from_str("pulse.token").unwrap(),
-                    Name::from_str("active").unwrap(),
+                    Name::from_str("pulse.token").unwrap().as_u64(),
+                    ACTIVE_NAME,
                 )],
             )
             .unwrap(),
@@ -143,7 +157,8 @@ async fn main() {
 
     controller
         .execute_transaction(
-            &mut undo_session,
+            &mut db,
+            &chain_config,
             &call_contract(
                 &private_key,
                 Name::from_str("pulse.token").unwrap(),
@@ -158,8 +173,8 @@ async fn main() {
                 },
                 controller.chain_id(),
                 vec![PermissionLevel::new(
-                    Name::from_str("pulse.token").unwrap(),
-                    Name::from_str("active").unwrap(),
+                    Name::from_str("pulse.token").unwrap().as_u64(),
+                    ACTIVE_NAME,
                 )],
             )
             .unwrap(),
@@ -169,7 +184,8 @@ async fn main() {
 
     controller
         .execute_transaction(
-            &mut undo_session,
+            &mut db,
+            &chain_config,
             &call_contract(
                 &private_key,
                 Name::from_str("pulse.token").unwrap(),
@@ -185,8 +201,8 @@ async fn main() {
                 },
                 controller.chain_id(),
                 vec![PermissionLevel::new(
-                    Name::from_str("pulse.token").unwrap(),
-                    Name::from_str("active").unwrap(),
+                    Name::from_str("pulse.token").unwrap().as_u64(),
+                    ACTIVE_NAME,
                 )],
             )
             .unwrap(),
@@ -194,13 +210,11 @@ async fn main() {
         )
         .unwrap();
 
-    undo_session.commit().unwrap();
-    let mut undo_session = controller.create_undo_session().unwrap();
-
-    for _i in 0..200 {
+    for _i in 0..50 {
         controller
             .execute_transaction(
-                &mut undo_session,
+                &mut db,
+                &chain_config,
                 &call_contract(
                     &private_key,
                     Name::from_str("pulse.token").unwrap(),
@@ -216,8 +230,8 @@ async fn main() {
                     },
                     controller.chain_id(),
                     vec![PermissionLevel::new(
-                        Name::from_str("alice").unwrap(),
-                        Name::from_str("active").unwrap(),
+                        Name::from_str("alice").unwrap().as_u64(),
+                        ACTIVE_NAME,
                     )],
                 )
                 .unwrap(),
@@ -232,37 +246,33 @@ fn create_account(
     account: Name,
     chain_id: Id,
 ) -> Result<PackedTransaction, ChainError> {
+    let authority = Authority::new(
+        1,
+        vec![KeyWeight::new(
+            private_key.get_public_key().inner().clone(),
+            1,
+        )],
+        vec![],
+        vec![],
+    );
     let trx = Transaction::new(
         TransactionHeader::new(TimePointSec::new(0), 0, 0, 0u32.into(), 0, 0u32.into()),
         vec![],
         vec![Action::new(
-            Name::from_str("pulse").unwrap(),
-            Name::from_str("newaccount").unwrap(),
+            Name::from_str("pulse")?,
+            Name::from_str("newaccount")?,
             NewAccount {
-                creator: Name::from_str("pulse").unwrap(),
+                creator: Name::from_str("pulse")?,
                 name: account,
-                owner: Authority::new(
-                    1,
-                    vec![KeyWeight::new(private_key.public_key(), 1)],
-                    vec![],
-                    vec![],
-                ),
-                active: Authority::new(
-                    1,
-                    vec![KeyWeight::new(private_key.public_key(), 1)],
-                    vec![],
-                    vec![],
-                ),
+                owner: authority.clone(),
+                active: authority.clone(),
             }
             .pack()
             .unwrap(),
-            vec![PermissionLevel::new(
-                Name::from_str("pulse").unwrap(),
-                Name::from_str("active").unwrap(),
-            )],
+            vec![PermissionLevel::new(PULSE_NAME, ACTIVE_NAME)],
         )],
-    )
-    .sign(&private_key, &chain_id)?;
+    );
+    let trx = trx.sign(&private_key, &chain_id)?;
     let packed_trx = PackedTransaction::from_signed_transaction(trx)?;
     Ok(packed_trx)
 }
@@ -287,10 +297,7 @@ fn set_code(
             }
             .pack()
             .unwrap(),
-            vec![PermissionLevel::new(
-                account,
-                Name::from_str("active").unwrap(),
-            )],
+            vec![PermissionLevel::new(account.as_u64(), ACTIVE_NAME)],
         )],
     )
     .sign(&private_key, &chain_id)?;
@@ -316,10 +323,7 @@ fn set_abi(
             }
             .pack()
             .unwrap(),
-            vec![PermissionLevel::new(
-                account,
-                Name::from_str("active").unwrap(),
-            )],
+            vec![PermissionLevel::new(account.as_u64(), ACTIVE_NAME)],
         )],
     )
     .sign(&private_key, &chain_id)?;
@@ -360,8 +364,8 @@ fn get_temp_dir() -> PathBuf {
 fn generate_genesis(private_key: &PrivateKey) -> Vec<u8> {
     let genesis = json!(
     {
-        "initial_timestamp": "2023-01-01T00:00:00Z",
-        "initial_key": private_key.public_key().to_string(),
+        "initial_timestamp": "2023-01-01T00:00:00",
+        "initial_key": "PUB_K1_8XeW7H2JhKFP8Wjw31cv4j4Bpw4in8MVMrtmfUunJV4gSVBzqZ",
         "initial_configuration": {
             "max_block_net_usage": 1048576,
             "target_block_net_usage_pct": 1000,
@@ -374,12 +378,14 @@ fn generate_genesis(private_key: &PrivateKey) -> Vec<u8> {
             "target_block_cpu_usage_pct": 2500,
             "max_transaction_cpu_usage": 150000,
             "min_transaction_cpu_usage": 100,
+            "max_transaction_lifetime": 3600,
             "max_inline_action_size": 4096,
             "max_inline_action_depth": 6,
             "max_authority_depth": 6,
             "max_action_return_value_size": 256
         }
     });
+    println!("{}", genesis.to_string());
     genesis.to_string().into_bytes()
 }
 

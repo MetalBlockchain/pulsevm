@@ -55,26 +55,26 @@ impl CxxKeyValueIteratorCache {
         self.inner
             .pin_mut()
             .cache_table(table)
-            .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 
     pub fn get_table(&self, table_id: &TableId) -> Result<&TableObject, ChainError> {
         self.inner
             .get_table(table_id)
-            .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 
     pub fn get_end_iterator_by_table_id(&self, table_id: &TableId) -> Result<i32, ChainError> {
         self.inner
             .get_end_iterator_by_table_id(table_id)
-            .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 
     pub fn find_table_by_end_iterator(&self, ei: i32) -> Result<Option<&TableObject>, ChainError> {
         let res = self
             .inner
             .find_table_by_end_iterator(ei)
-            .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))?;
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
 
         match res.is_null() {
             true => Ok(None),
@@ -85,21 +85,21 @@ impl CxxKeyValueIteratorCache {
     pub fn get(&self, id: i32) -> Result<&KeyValueObject, ChainError> {
         self.inner
             .get(id)
-            .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 
     pub fn remove(&mut self, iterator: i32) -> Result<(), ChainError> {
         self.inner
             .pin_mut()
             .remove(iterator)
-            .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 
     pub fn add(&mut self, obj: &KeyValueObject) -> Result<i32, ChainError> {
         self.inner
             .pin_mut()
             .add(obj)
-            .map_err(|e| ChainError::InternalError(Some(format!("{}", e))))
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 }
 

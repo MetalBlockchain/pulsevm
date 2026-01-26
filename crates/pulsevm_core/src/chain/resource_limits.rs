@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use pulsevm_error::ChainError;
 use pulsevm_ffi::Database;
 
-use crate::name::Name;
+use crate::{name::Name, resource::AccountResourceLimit};
 
 pub struct ResourceLimitsManager;
 
@@ -13,7 +13,7 @@ impl ResourceLimitsManager {
     }
 
     pub fn initialize_account(db: &mut Database, account: &Name) -> Result<(), ChainError> {
-        db.initialize_account_resource_limits(account.as_ref())
+        db.initialize_account_resource_limits(account.as_u64())
             .map_err(|e| {
                 ChainError::DatabaseError(format!(
                     "failed to initialize resource limits for account {}: {}",
@@ -45,7 +45,7 @@ impl ResourceLimitsManager {
         account: &Name,
         ram_delta: i64,
     ) -> Result<(), ChainError> {
-        db.add_pending_ram_usage(account.as_ref(), ram_delta)
+        db.add_pending_ram_usage(account.as_u64(), ram_delta)
             .map_err(|e| {
                 ChainError::DatabaseError(format!(
                     "failed to add pending ram usage for account {}: {}",
@@ -59,7 +59,7 @@ impl ResourceLimitsManager {
         db: &mut Database,
         account_name: &Name,
     ) -> Result<(), ChainError> {
-        db.verify_account_ram_usage(account_name.as_ref())
+        db.verify_account_ram_usage(account_name.as_u64())
             .map_err(|e| {
                 ChainError::DatabaseError(format!(
                     "failed to verify ram usage for account {}: {}",
@@ -69,8 +69,8 @@ impl ResourceLimitsManager {
         Ok(())
     }
 
-    pub fn get_account_ram_usage(db: &mut Database, account: &Name) -> Result<i64, ChainError> {
-        match db.get_account_ram_usage(account.as_ref()) {
+    pub fn get_account_ram_usage(db: &Database, account: &Name) -> Result<i64, ChainError> {
+        match db.get_account_ram_usage(account.as_u64()) {
             Ok(usage) => Ok(usage),
             Err(e) => Err(ChainError::DatabaseError(format!(
                 "failed to get ram usage for account {}: {}",
@@ -86,7 +86,7 @@ impl ResourceLimitsManager {
         cpu_weight: i64,
         ram_bytes: i64,
     ) -> Result<bool, ChainError> {
-        match db.set_account_limits(account.as_ref(), ram_bytes, net_weight, cpu_weight) {
+        match db.set_account_limits(account.as_u64(), ram_bytes, net_weight, cpu_weight) {
             Ok(decreased) => Ok(decreased),
             Err(e) => Err(ChainError::DatabaseError(format!(
                 "failed to set resource limits for account {}: {}",
@@ -96,13 +96,13 @@ impl ResourceLimitsManager {
     }
 
     pub fn get_account_limits(
-        db: &mut Database,
+        db: &Database,
         account: &Name,
         ram_bytes: &mut i64,
         net_weight: &mut i64,
         cpu_weight: &mut i64,
     ) -> Result<(), ChainError> {
-        db.get_account_limits(account.as_ref(), ram_bytes, net_weight, cpu_weight)
+        db.get_account_limits(account.as_u64(), ram_bytes, net_weight, cpu_weight)
             .map_err(|e| {
                 ChainError::DatabaseError(format!(
                     "failed to get resource limits for account {}: {}",
@@ -114,11 +114,11 @@ impl ResourceLimitsManager {
     }
 
     pub fn get_account_net_limit(
-        db: &mut Database,
+        db: &Database,
         account: &Name,
         greylist_limit: Option<u32>,
     ) -> Result<(i64, bool), ChainError> {
-        let res = db.get_account_net_limit(account.as_ref(), 0).map_err(|e| {
+        let res = db.get_account_net_limit(account.as_u64(), 0).map_err(|e| {
             ChainError::DatabaseError(format!(
                 "failed to get net limit for account {}: {}",
                 account, e
@@ -128,12 +128,29 @@ impl ResourceLimitsManager {
         Ok((res.limit, res.greylisted))
     }
 
+    pub fn get_account_net_limit_ex(
+        db: &Database,
+        account: &Name,
+        greylist_limit: Option<u32>,
+    ) -> Result<AccountResourceLimit, ChainError> {
+        let res = db.get_account_net_limit(account.as_u64(), 0).map_err(|e| {
+            ChainError::DatabaseError(format!(
+                "failed to get net limit for account {}: {}",
+                account, e
+            ))
+        })?;
+
+        // TODO: return actual AccountResourceLimit
+
+        Ok(AccountResourceLimit::default())
+    }
+
     pub fn get_account_cpu_limit(
-        db: &mut Database,
+        db: &Database,
         account: &Name,
         greylist_limit: Option<u32>,
     ) -> Result<(i64, bool), ChainError> {
-        let res = db.get_account_cpu_limit(account.as_ref(), 0).map_err(|e| {
+        let res = db.get_account_cpu_limit(account.as_u64(), 0).map_err(|e| {
             ChainError::DatabaseError(format!(
                 "failed to get cpu limit for account {}: {}",
                 account, e
@@ -143,6 +160,23 @@ impl ResourceLimitsManager {
         Ok((res.limit, res.greylisted))
     }
 
+    pub fn get_account_cpu_limit_ex(
+        db: &Database,
+        account: &Name,
+        greylist_limit: Option<u32>,
+    ) -> Result<AccountResourceLimit, ChainError> {
+        let res = db.get_account_cpu_limit(account.as_u64(), 0).map_err(|e| {
+            ChainError::DatabaseError(format!(
+                "failed to get cpu limit for account {}: {}",
+                account, e
+            ))
+        })?;
+
+        // TODO: return actual AccountResourceLimit
+
+        Ok(AccountResourceLimit::default())
+    }
+
     pub fn process_account_limit_updates(db: &mut Database) -> Result<(), ChainError> {
         db.process_account_limit_updates().map_err(|e| {
             ChainError::DatabaseError(format!("failed to process account limit updates: {}", e))
@@ -150,7 +184,7 @@ impl ResourceLimitsManager {
         Ok(())
     }
 
-    pub fn get_total_cpu_weight(db: &mut Database) -> Result<u64, ChainError> {
+    pub fn get_total_cpu_weight(db: &Database) -> Result<u64, ChainError> {
         match db.get_total_cpu_weight() {
             Ok(weight) => Ok(weight),
             Err(e) => Err(ChainError::DatabaseError(format!(
@@ -160,7 +194,7 @@ impl ResourceLimitsManager {
         }
     }
 
-    pub fn get_total_net_weight(db: &mut Database) -> Result<u64, ChainError> {
+    pub fn get_total_net_weight(db: &Database) -> Result<u64, ChainError> {
         match db.get_total_net_weight() {
             Ok(weight) => Ok(weight),
             Err(e) => Err(ChainError::DatabaseError(format!(

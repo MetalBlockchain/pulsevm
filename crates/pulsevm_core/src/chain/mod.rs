@@ -2,7 +2,6 @@ pub mod abi;
 pub mod account;
 pub mod apply_context;
 pub mod asset;
-pub mod authority;
 pub mod authority_checker;
 pub mod authorization_manager;
 pub mod block;
@@ -24,6 +23,14 @@ mod webassembly;
 
 use crate::chain::name::Name;
 use pulsevm_proc_macros::name;
+
+pub mod authority {
+    pub use pulsevm_ffi::{
+        Authority, KeyWeight, PermissionLevel, PermissionLevelWeight, WaitWeight,
+    };
+}
+
+pub use pulsevm_error::ChainError;
 
 pub const PULSE_NAME: u64 = name!("pulse");
 pub const OWNER_NAME: u64 = name!("owner");

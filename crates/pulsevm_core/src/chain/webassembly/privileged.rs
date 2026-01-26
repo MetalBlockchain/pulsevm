@@ -25,8 +25,7 @@ pub fn is_privileged(
     let context = env.data_mut().apply_context_mut();
     privileged_check(context)?;
     let db = env.data().db();
-    let name: &Name = &account.into();
-    let account = unsafe { &*db.get_account_metadata(name.as_ref())? };
+    let account = unsafe { &*db.get_account_metadata(account)? };
 
     Ok(account.is_privileged() as i32)
 }
@@ -38,7 +37,7 @@ pub fn set_privileged(
 ) -> Result<(), RuntimeError> {
     let context = env.data_mut().apply_context_mut();
     privileged_check(context)?;
-    context.set_privileged(&account.into(), is_priv == 1)?;
+    context.set_privileged(account, is_priv == 1)?;
     Ok(())
 }
 

@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use cxx::SharedPtr;
 use pulsevm_error::ChainError;
-use pulsevm_ffi::Database;
+use pulsevm_ffi::{CxxPublicKey, Database};
 
 use crate::crypto::PublicKey;
 
@@ -65,10 +65,13 @@ impl<'a> AuthorityChecker<'a> {
     }
 
     pub fn visit_key_weight(&mut self, key: &KeyWeight) -> Result<u16, ChainError> {
-        if self.provided_keys.contains(key.key()) {
-            self.used_keys.insert(key.key().clone());
-            return Ok(key.weight());
+        let pub_key = PublicKey::new(key.key.clone());
+
+        if self.provided_keys.contains(&pub_key) {
+            self.used_keys.insert(pub_key);
+            return Ok(key.weight);
         }
+
         Ok(0)
     }
 
@@ -85,7 +88,7 @@ impl<'a> AuthorityChecker<'a> {
         }
 
         // cache lookup
-        match self.cached_permissions.get(permission.permission()) {
+        match self.cached_permissions.get(&permission.permission) {
             Some(PermissionCacheStatus::BeingEvaluated) => {
                 // cycle
                 return Err(ChainError::AuthorizationError(
@@ -93,7 +96,7 @@ impl<'a> AuthorityChecker<'a> {
                 ));
             }
             Some(PermissionCacheStatus::PermissionSatisfied) => {
-                return Ok(permission.weight());
+                return Ok(permission.weight);
             }
             Some(PermissionCacheStatus::PermissionUnsatisfied) => {
                 return Ok(0);
@@ -105,8 +108,8 @@ impl<'a> AuthorityChecker<'a> {
 
         // not cached yet – fetch authority from DB
         let auth = db.find_permission_by_actor_and_permission(
-            permission.permission().actor.as_ref(),
-            permission.permission().permission.as_ref(),
+            permission.permission.actor,
+            permission.permission.permission,
         )?;
 
         if auth.is_null() {
@@ -117,12 +120,12 @@ impl<'a> AuthorityChecker<'a> {
 
         // mark as being evaluated to detect cycles
         self.cached_permissions.insert(
-            permission.permission().clone(),
+            permission.permission.clone(),
             PermissionCacheStatus::BeingEvaluated,
         );
 
         // TODO: Fix
-        Ok(permission.weight())
+        Ok(permission.weight)
         /* let satisfied = self.satisfied(db, &auth.authority, recursion_depth + 1)?;
 
         if satisfied {

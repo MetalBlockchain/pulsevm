@@ -1,11 +1,12 @@
+use jsonrpsee::types::{ErrorObject, ErrorObjectOwned};
 use std::error::Error;
 use thiserror::Error;
 use wasmer::RuntimeError;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ChainError {
-    #[error("data store disconnected")]
-    InternalError(Option<String>),
+    #[error("internal error: {0:?}")]
+    InternalError(String),
     #[error("genesis error: {0}")]
     GenesisError(String),
     #[error("parse error: {0}")]
@@ -38,13 +39,13 @@ pub enum ChainError {
 
 impl From<Box<dyn Error>> for ChainError {
     fn from(_: Box<dyn Error>) -> Self {
-        ChainError::InternalError(None)
+        ChainError::InternalError("internal error".into())
     }
 }
 
 impl<T> From<std::sync::PoisonError<T>> for ChainError {
     fn from(_: std::sync::PoisonError<T>) -> Self {
-        ChainError::InternalError(Some("failed to acquire read/write lock".into()))
+        ChainError::InternalError("failed to acquire read/write lock".into())
     }
 }
 
@@ -57,5 +58,11 @@ impl From<RuntimeError> for ChainError {
 impl From<ChainError> for RuntimeError {
     fn from(err: ChainError) -> Self {
         RuntimeError::new(err.to_string())
+    }
+}
+
+impl From<ChainError> for ErrorObjectOwned {
+    fn from(err: ChainError) -> Self {
+        ErrorObjectOwned::owned(-32000, err.to_string(), None::<()>)
     }
 }

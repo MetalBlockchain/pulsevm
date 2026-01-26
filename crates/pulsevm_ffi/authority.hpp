@@ -1,6 +1,6 @@
 #pragma once
-#include "database_utils.hpp"
 #include <chainbase/chainbase.hpp>
+#include "database_utils.hpp"
 #include <rust/cxx.h>
 #include "transaction.hpp"
 #include "config.hpp"

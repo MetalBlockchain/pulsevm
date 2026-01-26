@@ -1,10 +1,10 @@
 #pragma once
-#include <pulsevm/chain/account_object.hpp>
-#include <pulsevm/chain/code_object.hpp>
-#include <pulsevm/chain/permission_object.hpp>
-#include <pulsevm/chain/permission_link_object.hpp>
-#include <pulsevm/chain/contract_table_objects.hpp>
-#include <pulsevm/chain/global_property_object.hpp>
+#include "account_object.hpp"
+#include "code_object.hpp"
+#include "permission_object.hpp"
+#include "permission_link_object.hpp"
+#include "contract_table_objects.hpp"
+#include "global_property_object.hpp"
 
 namespace pulsevm { namespace chain {
 

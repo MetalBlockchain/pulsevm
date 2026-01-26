@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use pulsevm_core::{error::ChainError, id::NodeId};
+use pulsevm_core::{ChainError, id::NodeId};
 use pulsevm_crypto::Bytes;
 use pulsevm_grpc::appsender::{SendAppGossipMsg, app_sender_client::AppSenderClient};
 use pulsevm_proc_macros::{NumBytes, Read, Write};

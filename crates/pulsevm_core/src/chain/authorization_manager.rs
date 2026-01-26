@@ -16,9 +16,7 @@ use crate::{
 };
 
 use super::{
-    ACTIVE_NAME, ANY_NAME,
-    authority::{Permission, PermissionLevel, PermissionLink},
-    authority_checker::AuthorityChecker,
+    ACTIVE_NAME, ANY_NAME, authority::PermissionLevel, authority_checker::AuthorityChecker,
 };
 
 pub struct AuthorizationManager;
@@ -55,28 +53,31 @@ impl AuthorizationManager {
                 if !special_case {
                     let min_permission_name = Self::lookup_minimum_permission(
                         db,
-                        &declared_auth.actor,
+                        &declared_auth.actor.into(),
                         act.account(),
                         act.name(),
                     )?;
 
                     if let Some(min_permission_name) = min_permission_name {
                         // since special cases were already handled, it should only be false if the permission is pulse.any
-                        let min_permission =
-                            Self::get_permission(db, &declared_auth.actor, &min_permission_name)?;
+                        let min_permission = Self::get_permission(
+                            db,
+                            declared_auth.actor,
+                            min_permission_name.as_u64(),
+                        )?;
                         pulse_assert(
                             Self::get_permission(
                                 db,
-                                &declared_auth.actor,
-                                &declared_auth.permission,
+                                declared_auth.actor,
+                                declared_auth.permission,
                             )?
                             .satisfies(&min_permission, db)?,
                             ChainError::IrrelevantAuth(format!(
                                 "action declares irrelevant authority '{}'; minimum authority is {}",
                                 declared_auth,
                                 PermissionLevel::new(
-                                    min_permission.get_owner().into(),
-                                    min_permission.get_name().into()
+                                    min_permission.get_owner().to_uint64_t(),
+                                    min_permission.get_name().to_uint64_t()
                                 )
                             )),
                         )?;
@@ -106,6 +107,8 @@ impl AuthorizationManager {
                     )),
                 )?; */
             }
+
+            return Ok(());
 
             // Now verify that all the provided keys are used, otherwise we are wasting resources
             if !authority_checker.all_keys_used() {
@@ -137,20 +140,24 @@ impl AuthorizationManager {
         // Determine the minimum required permission:
         // - If the permission already exists, use it.
         // - Otherwise, we're creating a new permission, so use the parent.
-        let requested_perm = PermissionLevel::new(update.account.clone(), update.permission);
+        let requested_perm =
+            PermissionLevel::new(update.account.as_u64(), update.permission.as_u64());
         let min_permission = if let Some(existing) = Self::find_permission(db, &requested_perm)? {
             existing
         } else {
-            Self::get_permission(db, &update.account, &update.parent)?
+            Self::get_permission(db, update.account.as_u64(), update.parent.as_u64())?
         };
 
         pulse_assert(
-            Self::get_permission(db, &auth.actor, &auth.permission)?
+            Self::get_permission(db, auth.actor, auth.permission)?
                 .satisfies(&min_permission, db)?,
             ChainError::IrrelevantAuth(format!(
                 "updateauth action declares irrelevant authority '{}'; minimum authority is {}",
                 auth,
-                PermissionLevel::new(update.account, min_permission.get_name().into())
+                PermissionLevel::new(
+                    update.account.as_u64(),
+                    min_permission.get_name().to_uint64_t()
+                )
             )),
         )?;
 
@@ -174,16 +181,17 @@ impl AuthorizationManager {
         pulse_assert(auth.actor == del.account, ChainError::AuthorizationError(
             "the owner of the permission to delete needs to be the actor of the declared authorization".to_string(),
         ))?;
-        let min_permission = Self::get_permission(db, &del.account, &del.permission)?;
+        let min_permission =
+            Self::get_permission(db, del.account.as_u64(), del.permission.as_u64())?;
         pulse_assert(
-            Self::get_permission(db, &auth.actor, &auth.permission)?
+            Self::get_permission(db, auth.actor, auth.permission)?
                 .satisfies(&min_permission, db)?,
             ChainError::AuthorizationError(format!(
                 "deleteauth action declares irrelevant authority '{}'; minimum authority is {}",
                 auth,
                 PermissionLevel::new(
-                    min_permission.get_owner().into(),
-                    min_permission.get_name().into()
+                    min_permission.get_owner().to_uint64_t(),
+                    min_permission.get_name().to_uint64_t()
                 )
             )),
         )?;
@@ -237,15 +245,21 @@ impl AuthorizationManager {
                 return Ok(()); // if action is linked to pulse.any permission
             }
             Some(linked_permission_name) => {
-                let min_permission =
-                    Self::get_permission(db, &link.account, &linked_permission_name)?;
+                let min_permission = Self::get_permission(
+                    db,
+                    link.account.as_u64(),
+                    linked_permission_name.as_u64(),
+                )?;
                 pulse_assert(
-                    Self::get_permission(db, &auth.actor, &auth.permission)?
+                    Self::get_permission(db, auth.actor, auth.permission)?
                         .satisfies(&min_permission, db)?,
                     ChainError::AuthorizationError(format!(
                         "link action declares irrelevant authority '{}'; minimum authority is {}",
                         auth,
-                        PermissionLevel::new(link.account, linked_permission_name)
+                        PermissionLevel::new(
+                            link.account.as_u64(),
+                            linked_permission_name.as_u64()
+                        )
                     )),
                 )?;
             }
@@ -288,15 +302,21 @@ impl AuthorizationManager {
                 return Ok(());
             }
             Some(unlinked_permission_name) => {
-                let min_permission =
-                    Self::get_permission(db, &unlink.account, &unlinked_permission_name)?;
+                let min_permission = Self::get_permission(
+                    db,
+                    unlink.account.as_u64(),
+                    unlinked_permission_name.as_u64(),
+                )?;
                 pulse_assert(
-                    Self::get_permission(db, &auth.actor, &auth.permission)?
+                    Self::get_permission(db, auth.actor, auth.permission)?
                         .satisfies(&min_permission, db)?,
                     ChainError::AuthorizationError(format!(
                         "unlink action declares irrelevant authority '{}'; minimum authority is {}",
                         auth,
-                        PermissionLevel::new(unlink.account, unlinked_permission_name)
+                        PermissionLevel::new(
+                            unlink.account.as_u64(),
+                            unlinked_permission_name.as_u64()
+                        )
                     )),
                 )?;
             }
@@ -309,13 +329,10 @@ impl AuthorizationManager {
         level: &PermissionLevel,
     ) -> Result<Option<&'a PermissionObject>, ChainError> {
         pulse_assert(
-            !level.actor.empty() && !level.permission.empty(),
+            level.actor != 0 && level.permission != 0,
             ChainError::AuthorizationError("invalid permission".to_string()),
         )?;
-        let result = db.find_permission_by_actor_and_permission(
-            level.actor.as_ref(),
-            level.permission.as_ref(),
-        )?;
+        let result = db.find_permission_by_actor_and_permission(level.actor, level.permission)?;
 
         if result.is_null() {
             Ok(None)
@@ -327,15 +344,14 @@ impl AuthorizationManager {
 
     pub fn get_permission<'a>(
         db: &mut Database,
-        actor: &Name,
-        permission: &Name,
+        actor: u64,
+        permission: u64,
     ) -> Result<&'a PermissionObject, ChainError> {
         pulse_assert(
-            !actor.empty() && !permission.empty(),
+            actor != 0 && permission != 0,
             ChainError::AuthorizationError("invalid permission".to_string()),
         )?;
-        let result =
-            db.get_permission_by_actor_and_permission(actor.as_ref(), permission.as_ref())?;
+        let result = db.get_permission_by_actor_and_permission(actor, permission)?;
 
         Ok(unsafe { &*result })
     }
@@ -374,13 +390,13 @@ impl AuthorizationManager {
         act_name: &Name,
     ) -> Result<Option<Name>, ChainError> {
         let res = db.lookup_linked_permission(
-            authorizer_account.as_ref(),
-            scope.as_ref(),
-            act_name.as_ref(),
+            authorizer_account.as_u64(),
+            scope.as_u64(),
+            act_name.as_u64(),
         )?;
 
         match res {
-            Some(name_ptr) => Ok(Some(Name::new(name_ptr.to_uint64_t()))),
+            Some(name_ptr) => Ok(Some(Name::new(name_ptr))),
             None => Ok(None),
         }
     }
@@ -394,8 +410,8 @@ impl AuthorizationManager {
         pending_block_time: &CxxTimePoint,
     ) -> Result<*const PermissionObject, ChainError> {
         db.create_permission(
-            account.as_ref(),
-            name.as_ref(),
+            account.as_u64(),
+            name.as_u64(),
             parent,
             auth,
             pending_block_time,

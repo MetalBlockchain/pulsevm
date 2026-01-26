@@ -321,8 +321,7 @@ impl Vm for VirtualMachine {
         &self,
         request: Request<vm::ParseBlockRequest>,
     ) -> Result<tonic::Response<vm::ParseBlockResponse>, Status> {
-        let controller = self.controller.clone();
-        let controller = controller.read().await;
+        let controller = self.controller.read().await;
         let block = controller
             .parse_block(&request.get_ref().bytes)
             .map_err(|_| Status::internal("could not parse block"))?;
@@ -339,8 +338,7 @@ impl Vm for VirtualMachine {
         &self,
         request: Request<vm::GetBlockRequest>,
     ) -> Result<tonic::Response<vm::GetBlockResponse>, Status> {
-        let controller = self.controller.clone();
-        let controller = controller.read().await;
+        let controller = self.controller.read().await;
         let block_id: Id = request
             .get_ref()
             .id

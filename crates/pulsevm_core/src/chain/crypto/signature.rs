@@ -7,7 +7,7 @@ use cxx::SharedPtr;
 use pulsevm_error::ChainError;
 use pulsevm_ffi::{CxxSignature, recover_public_key_from_signature};
 use pulsevm_serialization::{NumBytes, Read, ReadError, Write, WriteError};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{crypto::PublicKey, utils::Digest};
 
@@ -17,14 +17,11 @@ pub struct Signature {
 }
 
 impl Signature {
-    pub fn new (inner: SharedPtr<CxxSignature>) -> Self {
+    pub fn new(inner: SharedPtr<CxxSignature>) -> Self {
         Signature { inner }
     }
-    
-    pub fn recover_public_key(
-        &self,
-        digest: &Digest,
-    ) -> Result<PublicKey, ChainError> {
+
+    pub fn recover_public_key(&self, digest: &Digest) -> Result<PublicKey, ChainError> {
         let cxx_pk = recover_public_key_from_signature(&self.inner, &digest)
             .map_err(|e| ChainError::TransactionError(e.to_string()))?;
         Ok(PublicKey::new(cxx_pk))
@@ -63,6 +60,34 @@ impl Serialize for Signature {
         S: serde::Serializer,
     {
         serializer.serialize_str(self.inner.to_string_rust())
+    }
+}
+
+impl<'de> Deserialize<'de> for Signature {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct SigVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for SigVisitor {
+            type Value = Signature;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a string representing a signature")
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                let cxx_sig = pulsevm_ffi::parse_signature(v)
+                    .map_err(|e| E::custom(format!("failed to parse signature: {}", e)))?;
+                Ok(Signature { inner: cxx_sig })
+            }
+        }
+
+        deserializer.deserialize_str(SigVisitor)
     }
 }
 

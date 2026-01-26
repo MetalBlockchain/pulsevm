@@ -96,9 +96,16 @@ impl From<BlockTimestamp> for SharedPtr<CxxTimePoint> {
     }
 }
 
-impl From<CxxTimePoint> for BlockTimestamp {
+impl From<&CxxBlockTimestamp> for BlockTimestamp {
     #[inline]
-    fn from(t: CxxTimePoint) -> Self {
+    fn from(bt: &CxxBlockTimestamp) -> Self {
+        BlockTimestamp::new(bt.get_slot())
+    }
+}
+
+impl From<&CxxTimePoint> for BlockTimestamp {
+    #[inline]
+    fn from(t: &CxxTimePoint) -> Self {
         let micro = t.time_since_epoch().count();
         let msec = micro / 1_000;
         let slot = ((msec - BlockTimestamp::BLOCK_TIMESTAMP_EPOCH_MS)
@@ -128,6 +135,19 @@ impl From<BlockTimestamp> for Timestamp {
         let nanos = 0;
 
         Timestamp { seconds, nanos }
+    }
+}
+
+impl From<&BlockTimestamp> for prost_types::Timestamp {
+    fn from(bt: &BlockTimestamp) -> Self {
+        let time_since_epoch = bt.to_time_point().time_since_epoch().count();
+        let seconds = time_since_epoch / 1_000_000;
+        let nanos = ((time_since_epoch % 1_000_000) * 1_000) as i32;
+        
+        prost_types::Timestamp {
+            seconds,
+            nanos,
+        }
     }
 }
 

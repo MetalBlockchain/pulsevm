@@ -7,10 +7,13 @@ use pulsevm_serialization::Write;
 use serde::{Serialize, ser::SerializeStruct};
 use sha2::Digest;
 
-use crate::{chain::{
-    id::Id,
-    transaction::{SignedTransaction, TransactionHeader, signed_transaction::signing_digest},
-}, crypto::PrivateKey};
+use crate::{
+    chain::{
+        id::Id,
+        transaction::{SignedTransaction, TransactionHeader, signed_transaction::signing_digest},
+    },
+    crypto::PrivateKey,
+};
 
 use super::action::Action;
 

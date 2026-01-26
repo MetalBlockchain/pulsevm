@@ -5,22 +5,18 @@ use std::{
 };
 
 use jsonrpsee::{proc_macros::rpc, types::ErrorObjectOwned};
-use pulsevm_chainbase::{Session, UndoSession};
 use pulsevm_core::{
-    PULSE_NAME,
+    ChainError, PULSE_NAME,
     abi::{AbiDefinition, AbiSerializer},
     account::{Account, AccountMetadata},
     asset::{Asset, string_to_symbol},
-    authority::{Permission, PermissionByOwnerIndex},
     block::{BlockHeader, BlockTimestamp, SignedBlock},
     controller::Controller,
-    error::ChainError,
+    crypto::Signature,
     id::Id,
     mempool::Mempool,
     name::Name,
     resource_limits::ResourceLimitsManager,
-    secp256k1::Signature,
-    table::{KeyValue, KeyValueByScopePrimaryIndex, Table, TableByCodeScopeTableIndex},
     transaction::{PackedTransaction, TransactionCompression},
     utils::{Base64Bytes, I32Flex, pulse_assert},
 };
@@ -146,96 +142,43 @@ impl RpcService {
 #[async_trait]
 impl RpcServer for RpcService {
     async fn get_abi(&self, account_name: Name) -> Result<AbiDefinition, ErrorObjectOwned> {
-        let controller = self.controller.clone();
-        let controller = controller.read().await;
-        let database = controller.database();
-        let session = database
-            .undo_session() // TODO: use read only session
-            .map_err(|e| ErrorObjectOwned::owned(500, "database_error", Some(format!("{}", e))))?;
-        let code_account = session.get::<Account>(account_name.clone()).map_err(|e| {
-            ErrorObjectOwned::owned(404, "account_not_found", Some(format!("{}", e)))
-        })?;
-        let abi = AbiDefinition::read(&code_account.abi, &mut 0).map_err(|e| {
+        let controller = self.controller.read().await;
+        let db = controller.database();
+        let code_account = db.get_account(account_name.as_u64())?;
+        let abi = AbiDefinition::read(code_account.get_abi().get_data(), &mut 0).map_err(|e| {
             ErrorObjectOwned::owned(400, "abi_error", Some(format!("failed to read ABI: {}", e)))
         })?;
         Ok(abi)
     }
 
     async fn get_account(&self, name: Name) -> Result<GetAccountResponse, ErrorObjectOwned> {
-        let controller = self.controller.clone();
-        let mut controller = controller.write().await;
-        let mut session = controller
-            .create_undo_session()
-            .map_err(|e| ErrorObjectOwned::owned(500, "database_error", Some(format!("{}", e))))?;
-        let accnt_obj = session.get::<Account>(name.clone()).map_err(|e| {
-            ErrorObjectOwned::owned(404, "account_not_found", Some(format!("{}", e)))
-        })?;
-        let accnt_metadata_obj = session.get::<AccountMetadata>(name.clone()).map_err(|e| {
-            ErrorObjectOwned::owned(404, "account_not_found", Some(format!("{}", e)))
-        })?;
+        let controller = self.controller.read().await;
+        let db = controller.database();
+        let accnt_obj = db.get_account(name.as_u64())?;
+        let accnt_metadata_obj = db.get_account_metadata(name.as_u64())?;
         let mut result = GetAccountResponse::default();
-        result.head_block_time = controller.last_accepted_block().timestamp();
+        result.head_block_time = controller.last_accepted_block().timestamp().clone();
         result.head_block_num = controller.last_accepted_block().block_num();
-
         result.account_name = name.clone();
         result.privileged = accnt_metadata_obj.is_privileged();
-        result.last_code_update = accnt_metadata_obj.last_code_update;
-        result.created = accnt_obj.creation_date;
-
-        let current_usage_time = result.head_block_time;
-        result.net_limit = ResourceLimitsManager::get_account_net_limit(
-            &mut session,
-            &name,
-            Some(current_usage_time),
-        )
-        .map_err(|e| {
-            ErrorObjectOwned::owned(500, "resource_limits_error", Some(format!("{}", e)))
-        })?;
-        result.cpu_limit = ResourceLimitsManager::get_account_cpu_limit(
-            &mut session,
-            &name,
-            Some(current_usage_time),
-        )
-        .map_err(|e| {
-            ErrorObjectOwned::owned(500, "resource_limits_error", Some(format!("{}", e)))
-        })?;
+        result.last_code_update = accnt_metadata_obj.get_last_code_update().into();
+        result.created = accnt_obj.get_creation_date().into();
+        result.net_limit =
+            ResourceLimitsManager::get_account_net_limit_ex(&db, &name, None)?;
+        result.cpu_limit =
+            ResourceLimitsManager::get_account_cpu_limit_ex(&db, &name, None)?;
 
         ResourceLimitsManager::get_account_limits(
-            &mut session,
+            &db,
             &name,
             &mut result.ram_quota,
             &mut result.net_weight,
             &mut result.cpu_weight,
-        )
-        .map_err(|e| {
-            ErrorObjectOwned::owned(500, "resource_limits_error", Some(format!("{}", e)))
-        })?;
+        )?;
 
-        result.ram_usage = ResourceLimitsManager::get_account_ram_usage(&mut session, &name)
-            .map_err(|e| {
-                ErrorObjectOwned::owned(500, "resource_limits_error", Some(format!("{}", e)))
-            })?;
+        result.ram_usage = ResourceLimitsManager::get_account_ram_usage(&db, &name)?;
 
-        let mut permissions = session.get_index::<Permission, PermissionByOwnerIndex>();
-        let mut perm_iter = permissions.lower_bound((name.clone(), Name::default()))?;
-        while let Some(perm) = perm_iter.next()? {
-            if perm.owner != name {
-                break; // Stop if we reach a different owner
-            }
-
-            let mut parent = Name::default();
-
-            if perm.parent > 0 {
-                let parent_perm = session.get::<Permission>(perm.parent)?;
-                parent = parent_perm.name;
-            }
-
-            result.permissions.push(PermissionResponse::new(
-                perm.name,
-                parent,
-                perm.authority.clone(),
-            ));
-        }
+        // TODO: Push permissions
 
         Ok(result)
     }
@@ -248,21 +191,13 @@ impl RpcServer for RpcService {
         &self,
         account_name: Name,
     ) -> Result<GetCodeHashResponse, ErrorObjectOwned> {
-        let controller = self.controller.clone();
-        let controller = controller.read().await;
-        let database = controller.database();
-        let session = database
-            .undo_session() // TODO: use read only session
-            .map_err(|e| ErrorObjectOwned::owned(500, "database_error", Some(format!("{}", e))))?;
-        let accnt_obj = session
-            .get::<AccountMetadata>(account_name.clone())
-            .map_err(|e| {
-                ErrorObjectOwned::owned(404, "account_not_found", Some(format!("{}", e)))
-            })?;
-        let code_hash = accnt_obj.code_hash;
+        let controller = self.controller.read().await;
+        let db = controller.database();
+        let accnt_obj = db.get_account_metadata(account_name.as_u64())?;
+        let code_hash = accnt_obj.get_code_hash();
         Ok(GetCodeHashResponse {
             account_name,
-            code_hash,
+            code_hash: code_hash.into(),
         })
     }
 
@@ -272,43 +207,12 @@ impl RpcServer for RpcService {
         account: Name,
         symbol: Option<String>,
     ) -> Result<Value, ErrorObjectOwned> {
-        let controller = self.controller.clone();
-        let controller = controller.read().await;
-        let database = controller.database();
-        let session = database
-            .undo_session() // TODO: use read only session
-            .map_err(|e| ErrorObjectOwned::owned(500, "database_error", Some(format!("{}", e))))?;
+        let controller = self.controller.read().await;
+        let db = controller.database();
         let mut results: Vec<String> = Vec::new();
-        let table = session.find_by_secondary::<Table, TableByCodeScopeTableIndex>((
-            code,
-            account,
-            Name::new(name!("accounts")),
-        ))?;
+        let table = db.find_table(code.as_u64(), account.as_u64(), name!("accounts"))?;
 
-        if let Some(table) = table {
-            let mut idx = session.get_index::<KeyValue, KeyValueByScopePrimaryIndex>();
-            let lower_bound_lookup_tuple = (table.id, u64::MIN);
-            let upper_bound_lookup_tuple = (table.id, u64::MAX);
-            let mut itr = idx.range(lower_bound_lookup_tuple, upper_bound_lookup_tuple)?;
-
-            while let Some(kv) = itr.next()? {
-                if kv.table_id != table.id {
-                    break;
-                }
-
-                let balance = Asset::read(kv.value.as_slice(), &mut 0).map_err(|e| {
-                    ErrorObjectOwned::owned(400, "balance_read_error", Some(format!("{}", e)))
-                })?;
-
-                if let Some(symbol) = &symbol {
-                    if balance.symbol().code().to_string().eq(symbol) {
-                        results.push(balance.to_string());
-                    }
-                } else {
-                    results.push(balance.to_string());
-                }
-            }
-        }
+        // TODO: Finalize symbol handling
 
         serde_json::to_value(results).map_err(|e| {
             ErrorObjectOwned::owned(500, "serialization_error", Some(format!("{}", e)))
@@ -320,54 +224,8 @@ impl RpcServer for RpcService {
         code: Name,
         symbol: String,
     ) -> Result<Value, ErrorObjectOwned> {
-        let symbol = symbol.to_uppercase();
-        let scope = string_to_symbol(0, &symbol.as_str())
-            .map_err(|e| ErrorObjectOwned::owned(400, "invalid_symbol", Some(format!("{}", e))))?
-            >> 8;
-        let controller = self.controller.clone();
-        let controller = controller.read().await;
+        let controller = self.controller.read().await;
         let database = controller.database();
-        let session = database
-            .undo_session() // TODO: use read only session
-            .map_err(|e| ErrorObjectOwned::owned(500, "database_error", Some(format!("{}", e))))?;
-
-        let table = session.find_by_secondary::<Table, TableByCodeScopeTableIndex>((
-            code,
-            Name::new(scope),
-            Name::new(name!("stats")),
-        ))?;
-
-        if let Some(table) = table {
-            let mut idx = session.get_index::<KeyValue, KeyValueByScopePrimaryIndex>();
-            let lower_bound_lookup_tuple = (table.id, u64::MIN);
-            let upper_bound_lookup_tuple = (table.id, u64::MAX);
-            let mut itr = idx.range(lower_bound_lookup_tuple, upper_bound_lookup_tuple)?;
-            let next = itr.next()?;
-
-            if let Some(kv) = next {
-                let abi = self.get_abi(code.clone()).await?;
-                let table_type = abi
-                    .get_table_type(&Name::new(name!("stats")))
-                    .map_err(|e| {
-                        ErrorObjectOwned::owned(400, "invalid_table_name", Some(format!("{}", e)))
-                    })?;
-                let serializer = AbiSerializer::from_abi(abi).map_err(|e| {
-                    ErrorObjectOwned::owned(500, "abi_error", Some(format!("{}", e)))
-                })?;
-                let stats = serializer
-                    .binary_to_variant(&table_type, kv.value.as_slice(), &mut 0)
-                    .map_err(|e| {
-                        ErrorObjectOwned::owned(
-                            400,
-                            "get_currency_stats_error",
-                            Some(format!("{}", e)),
-                        )
-                    })?;
-                let mut map = Map::new();
-                map.insert(symbol, stats);
-                return Ok(Value::Object(map));
-            }
-        }
 
         Err(ErrorObjectOwned::owned(
             404,
@@ -377,22 +235,11 @@ impl RpcServer for RpcService {
     }
 
     async fn get_info(&self) -> Result<GetInfoResponse, ErrorObjectOwned> {
-        let controller = self.controller.clone();
-        let controller = controller.read().await;
+        let controller = self.controller.read().await;
         let head_block = controller.last_accepted_block();
-        let session = controller
-            .database()
-            .undo_session()
-            .map_err(|e| ErrorObjectOwned::owned(500, "database_error", Some(format!("{}", e))))?;
-        let total_cpu_weight = ResourceLimitsManager::get_total_cpu_weight(&mut session.clone())
-            .map_err(|e| {
-                ErrorObjectOwned::owned(500, "resource_limits_error", Some(format!("{}", e)))
-            })?;
-        let total_net_weight = ResourceLimitsManager::get_total_net_weight(&mut session.clone())
-            .map_err(|e| {
-                ErrorObjectOwned::owned(500, "resource_limits_error", Some(format!("{}", e)))
-            })?;
-
+        let db = controller.database();
+        let total_cpu_weight = ResourceLimitsManager::get_total_cpu_weight(&db)?;
+        let total_net_weight = ResourceLimitsManager::get_total_net_weight(&db)?;
         Ok(GetInfoResponse {
             server_version: "d133c641".to_owned(),
             chain_id: controller.chain_id(),
@@ -400,8 +247,8 @@ impl RpcServer for RpcService {
             last_irreversible_block_num: head_block.block_num(),
             last_irreversible_block_id: head_block.id(),
             head_block_id: head_block.id(),
-            head_block_time: head_block.timestamp(),
-            head_block_producer: PULSE_NAME,
+            head_block_time: head_block.timestamp().clone(),
+            head_block_producer: head_block.signed_block_header.block.producer,
             virtual_block_cpu_limit: 100, // Placeholder, adjust as needed
             virtual_block_net_limit: 100, // Placeholder, adjust as needed
             block_cpu_limit: 100,         // Placeholder, adjust as needed
@@ -414,37 +261,27 @@ impl RpcServer for RpcService {
             total_cpu_weight: total_cpu_weight,
             total_net_weight: total_net_weight,
             earliest_available_block_num: 1,
-            last_irreversible_block_time: head_block.timestamp(),
+            last_irreversible_block_time: head_block.timestamp().clone(),
         })
     }
 
     async fn get_raw_abi(&self, account_name: Name) -> Result<GetRawABIResponse, ErrorObjectOwned> {
-        let controller = self.controller.clone();
-        let controller = controller.read().await;
-        let session = controller
-            .database()
-            .undo_session() // TODO: use read only session
-            .map_err(|e| ErrorObjectOwned::owned(500, "database_error", Some(format!("{}", e))))?;
-        let account = session.get::<Account>(account_name.clone()).map_err(|e| {
-            ErrorObjectOwned::owned(404, "account_not_found", Some(format!("{}", e)))
-        })?;
-        let account_metadata = session
-            .get::<AccountMetadata>(account_name.clone())
-            .map_err(|e| {
-                ErrorObjectOwned::owned(404, "account_metadata_not_found", Some(format!("{}", e)))
-            })?;
+        let controller = self.controller.read().await;
+        let db = controller.database();
+        let account = db.get_account(account_name.as_u64())?;
+        let account_metadata = db.get_account_metadata(account_name.as_u64())?;
 
         let mut abi_hash = Digest::default();
 
-        if account.abi.len() > 0 {
-            abi_hash = Digest::hash(&account.abi);
+        if account.get_abi().size() > 0 {
+            abi_hash = Digest::hash(account.get_abi().get_data());
         }
 
         Ok(GetRawABIResponse {
             account_name,
-            code_hash: account_metadata.code_hash,
+            code_hash: account_metadata.get_code_hash().into(),
             abi_hash,
-            abi: Base64Bytes::new(account.abi.clone()),
+            abi: Base64Bytes::new(account.get_abi().get_data().to_vec()),
         })
     }
 
@@ -454,23 +291,33 @@ impl RpcServer for RpcService {
     ) -> Result<SignedBlock, ErrorObjectOwned> {
         let controller = self.controller.clone();
         let controller = controller.read().await;
-        let session = controller
-            .database()
-            .undo_session() // TODO: use read only session
-            .map_err(|e| ErrorObjectOwned::owned(500, "database_error", Some(format!("{}", e))))?;
 
         if let Ok(n) = block_num_or_id.parse::<u32>() {
-            let block = session.get::<SignedBlock>(n).map_err(|e| {
-                ErrorObjectOwned::owned(404, "block_not_found", Some(format!("{}", e)))
-            })?;
-            return Ok(block);
+            let block = controller.get_block_by_height(n)?;
+
+            match block {
+                Some(b) => return Ok(b),
+                None => {
+                    return Err(ErrorObjectOwned::owned(
+                        404,
+                        "block_not_found",
+                        Some(format!("block {} not found", n)),
+                    ));
+                }
+            }
         } else if let Ok(id) = Id::from_str(block_num_or_id.as_str()) {
-            let block = session
-                .get::<SignedBlock>(BlockHeader::num_from_id(&id))
-                .map_err(|e| {
-                    ErrorObjectOwned::owned(404, "block_not_found", Some(format!("{}", e)))
-                })?;
-            return Ok(block);
+            let block = controller.get_block(id)?;
+
+            match block {
+                Some(b) => return Ok(b),
+                None => {
+                    return Err(ErrorObjectOwned::owned(
+                        404,
+                        "block_not_found",
+                        Some(format!("block {} not found", id)),
+                    ));
+                }
+            }
         }
 
         return Err(ErrorObjectOwned::owned(
@@ -492,36 +339,23 @@ impl RpcServer for RpcService {
             compression,
             packed_context_free_data,
             packed_trx,
-        )
-        .map_err(|e| {
-            println!("Failed to push transaction: {}", e);
-            ErrorObjectOwned::owned(500, "transaction_error", Some(format!("{}", e)))
-        })?;
+        )?;
 
         // Run transaction and revert it
-        let controller = self.controller.clone();
-        let mut controller = controller.write().await;
+        let mut controller = self.controller.write().await;
+        let db = controller.database();
         let pending_block_timestamp = BlockTimestamp::now();
-        controller
-            .push_transaction(&packed_trx, &pending_block_timestamp)
-            .map_err(|e| {
-                println!("Failed to push transaction: {}", e);
-                ErrorObjectOwned::owned(500, "transaction_error", Some(format!("{}", e)))
-            })?;
+        let gpo = Controller::get_global_properties(&db)?;
+        controller.push_transaction(gpo.get_chain_config(), &packed_trx, &pending_block_timestamp)?;
 
         // Add to mempool
-        let mempool_clone = self.mempool.clone();
-        let mut mempool = mempool_clone.write().await;
+        let mut mempool = self.mempool.write().await;
         mempool.add_transaction(&packed_trx);
 
         // Gossip
-        let nm_clone = self.network_manager.clone();
-        let nm = nm_clone.read().await;
-        let gossipable_msg = Gossipable::new(0, packed_trx.clone())
-            .map_err(|e| ErrorObjectOwned::owned(500, "gossip_error", Some(format!("{}", e))))?;
-        nm.gossip(gossipable_msg)
-            .await
-            .map_err(|e| ErrorObjectOwned::owned(500, "gossip_error", Some(format!("{}", e))))?;
+        let nm = self.network_manager.read().await;
+        let gossipable_msg = Gossipable::new(0, packed_trx.clone())?;
+        nm.gossip(gossipable_msg).await?;
 
         // Return a simple response
         Ok(IssueTxResponse {
@@ -543,63 +377,14 @@ impl RpcServer for RpcService {
         reverse: Option<bool>,
         show_payer: Option<bool>,
     ) -> Result<GetTableRowsResponse, ErrorObjectOwned> {
-        let abi = self.get_abi(code.clone()).await?;
-        let mut primary = false;
-        let table_with_index =
-            get_table_index_name(table, index_position, &mut primary).map_err(|e| {
-                ErrorObjectOwned::owned(400, "invalid_table_name", Some(format!("{}", e)))
-            })?;
-        let controller = self.controller.clone();
-        let controller = controller.read().await;
-        let session = controller
-            .database()
-            .undo_session() // TODO: use read only session
-            .map_err(|e| ErrorObjectOwned::owned(500, "database_error", Some(format!("{}", e))))?;
-
-        if primary {
-            pulse_assert(
-                table == table_with_index,
-                ErrorObjectOwned::owned(
-                    400,
-                    "invalid_table_name",
-                    Some(format!("invalid table name {}", table)),
-                ),
-            )?;
-            let table_index_type = get_table_index_type(&abi, &table).map_err(|e| {
-                ErrorObjectOwned::owned(400, "invalid_table_name", Some(format!("{}", e)))
-            })?;
-            if table_index_type == "i64" || key_type == "i64" || key_type == "name" {
-                return get_table_rows_ex(
-                    &session,
-                    &abi,
-                    code,
-                    scope,
-                    table,
-                    limit.0,
-                    json,
-                    show_payer,
-                    lower_bound,
-                    upper_bound,
-                )
-                .map_err(|e| {
-                    ErrorObjectOwned::owned(400, "get_table_rows_error", Some(format!("{}", e)))
-                });
-            }
-            return Err(ErrorObjectOwned::owned(
-                400,
-                "invalid_table_type",
-                Some(format!("invalid table index type: {}", table_index_type)),
-            ));
-        } else {
-            return Err(ErrorObjectOwned::owned(
-                400,
-                "secondary_index_not_supported",
-                Some(format!(
-                    "secondary index not supported for table: {}",
-                    table
-                )),
-            ));
-        }
+        return Err(ErrorObjectOwned::owned(
+            400,
+            "secondary_index_not_supported",
+            Some(format!(
+                "secondary index not supported for table: {}",
+                table
+            )),
+        ));
     }
 }
 
@@ -621,93 +406,4 @@ fn get_table_index_name(
     index |= pos & 0x000000000000000Fu64;
 
     Ok(index)
-}
-
-fn get_table_rows_ex(
-    session: &UndoSession,
-    abi: &AbiDefinition,
-    code: Name,
-    scope: String,
-    table_name: Name,
-    limit: i32,
-    json: bool,
-    show_payer: Option<bool>,
-    lower_bound: Option<String>,
-    upper_bound: Option<String>,
-) -> Result<GetTableRowsResponse, ChainError> {
-    let mut response = GetTableRowsResponse::default();
-    let scope = Name::from_str(scope.as_str())
-        .map_err(|_| ChainError::InvalidArgument(format!("invalid scope name: {}", scope)))?;
-    let table = session
-        .find_by_secondary::<Table, TableByCodeScopeTableIndex>((code, scope, table_name))?;
-    let serializer = AbiSerializer::from_abi(abi.clone()).map_err(|e| {
-        ChainError::InvalidArgument(format!("failed to create ABI serializer: {}", e))
-    })?;
-
-    if let Some(table) = table {
-        let mut idx = session.get_index::<KeyValue, KeyValueByScopePrimaryIndex>();
-        let lower_bound_lookup_tuple = (table.id, u64::MIN);
-        let upper_bound_lookup_tuple = (table.id, u64::MAX);
-
-        if upper_bound_lookup_tuple < lower_bound_lookup_tuple {
-            return Ok(response);
-        }
-
-        let mut limit = limit;
-
-        if limit <= 0 || limit > 100 {
-            limit = 100;
-        }
-
-        let mut itr = idx.range(lower_bound_lookup_tuple, upper_bound_lookup_tuple)?;
-        let mut count = 0;
-        let table_type = abi.get_table_type(&table_name)?;
-
-        while let Some(kv) = itr.next()? {
-            count += 1;
-
-            if count > limit {
-                response.more = true;
-                break;
-            }
-
-            let variant = if json {
-                serializer
-                    .binary_to_variant(&table_type, kv.value.as_slice(), &mut 0)
-                    .map_err(|e| {
-                        println!("Failed to convert binary to variant: {}", e);
-                        ChainError::InvalidArgument(format!(
-                            "failed to convert binary to variant: {}",
-                            e
-                        ))
-                    })?
-            } else {
-                Value::String(hex::encode(&kv.value))
-            };
-
-            if show_payer.is_some() && show_payer.unwrap() {
-                response.rows.push(serde_json::json!({
-                    "payer": kv.payer,
-                    "data": variant,
-                }));
-            } else {
-                response.rows.push(variant);
-            }
-        }
-    }
-
-    Ok(response)
-}
-
-fn get_table_index_type(abi: &AbiDefinition, table_name: &Name) -> Result<String, ChainError> {
-    for table in abi.tables.iter() {
-        if &table.name == table_name {
-            return Ok(table.index_type.clone());
-        }
-    }
-
-    Err(ChainError::InvalidArgument(format!(
-        "table '{}' not found in ABI",
-        table_name
-    )))
 }

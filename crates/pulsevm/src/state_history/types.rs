@@ -1,11 +1,7 @@
 use std::collections::HashMap;
 
 use pulsevm_core::{
-    account::AccountDelta,
-    id::Id,
-    name::Name,
-    secp256k1::Signature,
-    transaction::{Action, TransactionStatus, TransactionTrace},
+    account::AccountDelta, crypto::Signature, id::Id, name::Name, transaction::{Action, TransactionStatus, TransactionTrace}
 };
 use pulsevm_crypto::{Bytes, Digest};
 use pulsevm_proc_macros::{NumBytes, Read, Write, name};
@@ -61,14 +57,14 @@ pub struct GetBlocksAckRequestV0 {
 
 #[derive(Clone, Read, Write, NumBytes)]
 pub struct AccountAuthSequence {
-    pub account: Name,
+    pub account: u64,
     pub sequence: u64,
 }
 
 #[derive(Clone, Read, Write, NumBytes)]
 pub struct ActionReceiptV0 {
     pub variant: u8,
-    pub receiver: Name,
+    pub receiver: u64,
     pub act_digest: Digest,
     pub global_sequence: u64,
     pub recv_sequence: u64,
@@ -83,7 +79,7 @@ pub struct ActionTraceV1 {
     pub action_ordinal: VarUint32,
     pub creator_action_ordinal: VarUint32,
     pub receipt: Option<ActionReceiptV0>,
-    pub receiver: Name,
+    pub receiver: u64,
     pub act: Action,
     pub context_free: bool,
     pub elapsed: i64,
@@ -99,7 +95,7 @@ impl ActionTraceV1 {
         action_ordinal: VarUint32,
         creator_action_ordinal: VarUint32,
         receipt: Option<ActionReceiptV0>,
-        receiver: Name,
+        receiver: u64,
         act: Action,
         context_free: bool,
         elapsed: i64,
@@ -205,7 +201,7 @@ impl From<&TransactionTrace> for TransactionTraceV0 {
                     VarUint32(at.creator_action_ordinal()),
                     at.receipt.as_ref().map(|receipt| ActionReceiptV0 {
                         variant: 0,
-                        receiver: receipt.receiver,
+                        receiver: receipt.receiver.as_u64(),
                         act_digest: receipt.act_digest,
                         global_sequence: receipt.global_sequence,
                         recv_sequence: receipt.recv_sequence,
@@ -220,7 +216,7 @@ impl From<&TransactionTrace> for TransactionTraceV0 {
                         code_sequence: VarUint32(receipt.code_sequence),
                         abi_sequence: VarUint32(receipt.abi_sequence),
                     }),
-                    at.receiver(),
+                    at.receiver().as_u64(),
                     at.act.clone(),
                     at.context_free,
                     at.elapsed as i64,

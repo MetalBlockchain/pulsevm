@@ -244,6 +244,7 @@ impl TransactionContext {
         let (action, receiver) = self.with_action_trace(action_ordinal, |t| {
             (t.action().clone(), t.receiver().clone())
         })?;
+
         let mut apply_context = ApplyContext::new(
             self.db.clone(),
             self.wasm_runtime.clone(),
@@ -372,6 +373,10 @@ impl TransactionContext {
         let mut inner = self.inner.write()?;
 
         // Update the RAM usage in the resource limits manager.
+        println!(
+            "Adding RAM usage for account {}: {} bytes",
+            account, ram_delta
+        );
         ResourceLimitsManager::add_pending_ram_usage(&mut self.db, account, ram_delta)?;
 
         if ram_delta > 0 {

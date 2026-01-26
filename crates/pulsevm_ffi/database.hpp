@@ -1,25 +1,26 @@
 // chainbase_bridge.hpp - C++ bridge header for CXX
 #pragma once
 #include <chainbase/chainbase.hpp>
-#include <pulsevm/chain/authority.hpp>
-#include <pulsevm/chain/code_object.hpp>
-#include <pulsevm/chain/block.hpp>
-#include <pulsevm/chain/block_timestamp.hpp>
-#include <pulsevm/chain/multi_index_includes.hpp>
-#include <pulsevm/chain/resource_limits.hpp>
-#include <pulsevm/chain/resource_limits_private.hpp>
-#include <pulsevm/chain/account_object.hpp>
-#include <pulsevm/chain/permission_link_object.hpp>
-#include <pulsevm/chain/global_property_object.hpp>
-#include <pulsevm/chain/protocol_state_object.hpp>
-#include <pulsevm/chain/database_header_object.hpp>
-#include <pulsevm/chain/genesis_state.hpp>
-#include <pulsevm/chain/pulse_abi.hpp>
-#include <pulsevm_ffi/src/types.rs.h>
+#include "authority.hpp"
+#include "code_object.hpp"
+#include "block.hpp"
+#include "block_timestamp.hpp"
+#include "multi_index_includes.hpp"
+#include "resource_limits.hpp"
+#include "resource_limits_private.hpp"
+#include "account_object.hpp"
+#include "permission_link_object.hpp"
+#include "global_property_object.hpp"
+#include "protocol_state_object.hpp"
+#include "database_header_object.hpp"
+#include "genesis_state.hpp"
+#include "pulse_abi.hpp"
 #include "iterator_cache.hpp"
 #include "objects.hpp"
 #include "name.hpp"
 #include "types.hpp"
+#include "type_defs.hpp"
+#include <pulsevm_ffi/src/types.rs.h>
 #include <memory>
 #include <rust/cxx.h>
 #include <string>
@@ -40,20 +41,23 @@ public:
     void add_indices() {
         this->add_index<account_index>();
         this->add_index<account_metadata_index>();
-        this->add_index<account_ram_correction_index>();
-        this->add_index<code_index>();
-        this->add_index<table_id_multi_index>();
+        this->add_index<permission_index>();
+        this->add_index<permission_usage_index>();
+        this->add_index<permission_link_index>();
         this->add_index<key_value_index>();
+        this->add_index<index64_index>();
+        this->add_index<index128_index>();
+        this->add_index<index256_index>();
         this->add_index<global_property_multi_index>();
         this->add_index<dynamic_global_property_multi_index>();
+        this->add_index<table_id_multi_index>();
         this->add_index<resource_limits::resource_limits_index>();
         this->add_index<resource_limits::resource_usage_index>();
         this->add_index<resource_limits::resource_limits_state_index>();
         this->add_index<resource_limits::resource_limits_config_index>();
-        this->add_index<permission_usage_index>();
-        this->add_index<permission_index>();
-        this->add_index<permission_link_index>();
         this->add_index<protocol_state_multi_index>();
+        this->add_index<account_ram_correction_index>();
+        this->add_index<code_index>();
         this->add_index<database_header_multi_index>();
     }
 
@@ -89,59 +93,59 @@ public:
         });
 
         authority system_auth(genesis.initial_key);
-        this->create_native_account( genesis.initial_timestamp, config::system_account_name, system_auth, system_auth, true );
+        this->create_native_account( genesis.initial_timestamp, config::system_account_name.to_uint64_t(), system_auth, system_auth, true );
 
         auto empty_authority = authority(1, {}, {});
         auto active_producers_authority = authority(1, {}, {});
         active_producers_authority.accounts.push_back({{config::system_account_name, config::active_name}, 1});
 
-        this->create_native_account( genesis.initial_timestamp, config::null_account_name, empty_authority, empty_authority );
-        this->create_native_account( genesis.initial_timestamp, config::producers_account_name, empty_authority, active_producers_authority );
+        this->create_native_account( genesis.initial_timestamp, config::null_account_name.to_uint64_t(), empty_authority, empty_authority );
+        this->create_native_account( genesis.initial_timestamp, config::producers_account_name.to_uint64_t(), empty_authority, active_producers_authority );
         const auto& active_permission       = this->get_permission({config::producers_account_name, config::active_name});
         const auto& majority_permission     = this->create_permission(
-            config::producers_account_name,
-            config::majority_producers_permission_name,
+            config::producers_account_name.to_uint64_t(),
+            config::majority_producers_permission_name.to_uint64_t(),
             active_permission.id._id,
             active_producers_authority,
             genesis.initial_timestamp
         );
         this->create_permission(
-            config::producers_account_name, 
-            config::minority_producers_permission_name,
+            config::producers_account_name.to_uint64_t(), 
+            config::minority_producers_permission_name.to_uint64_t(),
             majority_permission.id._id,
             active_producers_authority,
             genesis.initial_timestamp
         );
     }
 
-    void create_native_account( const fc::time_point& initial_timestamp, account_name name, const authority& owner, const authority& active, bool is_privileged = false ) {
+    void create_native_account( const fc::time_point& initial_timestamp, u_int64_t account_name, const authority& owner, const authority& active, bool is_privileged = false ) {
         this->create<account_object>([&](auto& a) {
-            a.name = name;
+            a.name = name(account_name);
             a.creation_date = initial_timestamp;
 
-            if( name == config::system_account_name ) {
+            if( account_name == config::system_account_name.to_uint64_t() ) {
                 a.abi.assign(pulsevm_abi_bin, sizeof(pulsevm_abi_bin));
             }
         });
         this->create<account_metadata_object>([&](auto & a) {
-            a.name = name;
+            a.name = name(account_name);
             a.set_privileged( is_privileged );
         });
 
-        const auto& owner_permission  = this->create_permission(name, config::owner_name, 0,
+        const auto& owner_permission  = this->create_permission(account_name, config::owner_name.to_uint64_t(), 0,
                                                                         owner, initial_timestamp );
-        const auto& active_permission = this->create_permission(name, config::active_name, owner_permission.id._id,
+        const auto& active_permission = this->create_permission(account_name, config::active_name.to_uint64_t(), owner_permission.id._id,
                                                                         active, initial_timestamp );
 
-        this->initialize_account_resource_limits(name);
+        this->initialize_account_resource_limits(account_name);
 
         int64_t ram_delta = config::overhead_per_account_ram_bytes;
         ram_delta += 2*config::billable_size_v<permission_object>;
         ram_delta += owner_permission.auth.get_billable_size();
         ram_delta += active_permission.auth.get_billable_size();
 
-        this->add_pending_ram_usage(name, ram_delta);
-        this->verify_account_ram_usage(name);
+        this->add_pending_ram_usage(account_name, ram_delta);
+        this->verify_account_ram_usage(account_name);
     }
 
     const account_object& create_account(uint64_t account_name, uint32_t creation_date) {
@@ -151,27 +155,27 @@ public:
         });
     }
 
-    const account_metadata_object& create_account_metadata(const name& account_name, bool is_privileged) {
+    const account_metadata_object& create_account_metadata(uint64_t account_name, bool is_privileged) {
         return this->create<account_metadata_object>([&](auto& a) {
             a.name = name(account_name);
             a.set_privileged(is_privileged);
         });
     }
 
-    const account_object* find_account(const name& account ) const {
-        return this->find<account_object, by_name>(account);
+    const account_object* find_account(uint64_t account_name) const {
+        return this->find<account_object, by_name>(name(account_name));
     }
 
-    const account_object& get_account(const name& account ) const {
-        return this->get<account_object, by_name>(account);
+    const account_object& get_account(uint64_t account_name) const {
+        return this->get<account_object, by_name>(name(account_name));
     }
 
-    const account_metadata_object* find_account_metadata(const name& account ) const {
-        return this->find<account_metadata_object, by_name>(account);
+    const account_metadata_object* find_account_metadata(uint64_t account_name) const {
+        return this->find<account_metadata_object, by_name>(name(account_name));
     }
 
-    void set_privileged( const name& n, bool is_priv ) {
-        const auto& a = this->get<account_metadata_object, by_name>( n );
+    void set_privileged( uint64_t account_name, bool is_priv ) {
+        const auto& a = this->get<account_metadata_object, by_name>( name(account_name) );
         this->modify( a, [&]( auto& ma ){
             ma.set_privileged( is_priv );
         });
@@ -191,13 +195,13 @@ public:
         });
     }
 
-    void initialize_account_resource_limits(const account_name& account_name) {
+    void initialize_account_resource_limits( uint64_t account_name) {
         const auto& limits = this->create<resource_limits::resource_limits_object>([&]( resource_limits::resource_limits_object& bl ) {
-            bl.owner = account_name;
+            bl.owner = name(account_name);
         });
 
         const auto& usage = this->create<resource_limits::resource_usage_object>([&]( resource_limits::resource_usage_object& bu ) {
-            bu.owner = account_name;
+            bu.owner = name(account_name);
         });
     }
 
@@ -206,12 +210,11 @@ public:
         const auto& config = this->get<resource_limits::resource_limits_config_object>();
 
         for( const auto& ac : accounts ) {
-            const account_name a(ac);
-            const auto& usage = this->get<resource_limits::resource_usage_object,resource_limits::by_owner>( a );
+            const auto& usage = this->get<resource_limits::resource_usage_object,resource_limits::by_owner>( name(ac) );
             int64_t unused;
             int64_t net_weight;
             int64_t cpu_weight;
-            get_account_limits( a, unused, net_weight, cpu_weight );
+            get_account_limits( ac, unused, net_weight, cpu_weight );
 
             this->modify( usage, [&]( auto& bu ){
                 bu.net_usage.add( net_usage, time_slot, config.account_net_usage_average_window );
@@ -232,7 +235,7 @@ public:
                             tx_cpu_usage_exceeded,
                             "authorizing account '${n}' has insufficient objective cpu resources for this transaction,"
                             " used in window ${cpu_used_in_window}us, allowed in window ${max_user_use_in_window}us",
-                            ("n", a)
+                            ("n", name(ac))
                             ("cpu_used_in_window",cpu_used_in_window)
                             ("max_user_use_in_window",max_user_use_in_window) );
             }
@@ -252,7 +255,7 @@ public:
                             tx_net_usage_exceeded,
                             "authorizing account '${n}' has insufficient net resources for this transaction,"
                             " used in window ${net_used_in_window}, allowed in window ${max_user_use_in_window}",
-                            ("n", a)
+                            ("n", name(ac))
                             ("net_used_in_window",net_used_in_window)
                             ("max_user_use_in_window",max_user_use_in_window) );
 
@@ -269,12 +272,12 @@ public:
         EOS_ASSERT( state.pending_net_usage <= config.net_limit_parameters.max, block_resource_exhausted, "Block has insufficient net resources" );
     }
 
-    void add_pending_ram_usage( const account_name& account, int64_t ram_delta ) {
+    void add_pending_ram_usage( uint64_t account, int64_t ram_delta ) {
         if (ram_delta == 0) {
             return;
         }
 
-        const auto& usage  = this->get<resource_limits::resource_usage_object,resource_limits::by_owner>( account );
+        const auto& usage  = this->get<resource_limits::resource_usage_object,resource_limits::by_owner>( name(account) );
 
         EOS_ASSERT( ram_delta <= 0 || UINT64_MAX - usage.ram_usage >= (uint64_t)ram_delta, transaction_exception,
                     "Ram usage delta would overflow UINT64_MAX");
@@ -286,27 +289,27 @@ public:
         });
     }
 
-    void verify_account_ram_usage( const account_name& account ) {
+    void verify_account_ram_usage( uint64_t account ) {
         int64_t ram_bytes; int64_t net_weight; int64_t cpu_weight;
         get_account_limits( account, ram_bytes, net_weight, cpu_weight );
-        const auto& usage  = this->get<resource_limits::resource_usage_object,resource_limits::by_owner>( account );
+        const auto& usage  = this->get<resource_limits::resource_usage_object,resource_limits::by_owner>( name(account) );
 
         if( ram_bytes >= 0 ) {
             EOS_ASSERT( usage.ram_usage <= static_cast<uint64_t>(ram_bytes), ram_usage_exceeded,
                         "account ${account} has insufficient ram; needs ${needs} bytes has ${available} bytes",
-                        ("account", account)("needs",usage.ram_usage)("available",ram_bytes)              );
+                        ("account", name(account))("needs",usage.ram_usage)("available",ram_bytes)              );
         }
     }
 
-    int64_t get_account_ram_usage( const account_name& name ) {
-        return this->get<resource_limits::resource_usage_object,resource_limits::by_owner>( name ).ram_usage;
+    int64_t get_account_ram_usage( uint64_t account_name ) const {
+        return this->get<resource_limits::resource_usage_object,resource_limits::by_owner>( name(account_name) ).ram_usage;
     }
 
-    bool set_account_limits( const account_name& account, int64_t ram_bytes, int64_t net_weight, int64_t cpu_weight) {
+    bool set_account_limits( uint64_t account, int64_t ram_bytes, int64_t net_weight, int64_t cpu_weight) {
         auto find_or_create_pending_limits = [&]() -> const resource_limits::resource_limits_object& {
-            const auto* pending_limits = this->find<resource_limits::resource_limits_object, resource_limits::by_owner>( boost::make_tuple(true, account) );
+            const auto* pending_limits = this->find<resource_limits::resource_limits_object, resource_limits::by_owner>( boost::make_tuple(true, name(account)) );
             if (pending_limits == nullptr) {
-                const auto& limits = this->get<resource_limits::resource_limits_object, resource_limits::by_owner>( boost::make_tuple(false, account));
+                const auto& limits = this->get<resource_limits::resource_limits_object, resource_limits::by_owner>( boost::make_tuple(false, name(account)));
                 return this->create<resource_limits::resource_limits_object>([&](resource_limits::resource_limits_object& pending_limits){
                     pending_limits.owner = limits.owner;
                     pending_limits.ram_bytes = limits.ram_bytes;
@@ -336,40 +339,39 @@ public:
         return decreased_limit;
     }
 
-    void get_account_limits( const account_name& account, int64_t& ram_bytes, int64_t& net_weight, int64_t& cpu_weight ) {
-        const auto* pending_buo = this->find<resource_limits::resource_limits_object,resource_limits::by_owner>( boost::make_tuple(true, account) );
+    void get_account_limits(  uint64_t account, int64_t& ram_bytes, int64_t& net_weight, int64_t& cpu_weight ) const {
+        const auto* pending_buo = this->find<resource_limits::resource_limits_object,resource_limits::by_owner>( boost::make_tuple(true, name(account)) );
         if (pending_buo) {
             ram_bytes  = pending_buo->ram_bytes;
             net_weight = pending_buo->net_weight;
             cpu_weight = pending_buo->cpu_weight;
         } else {
-            const auto& buo = this->get<resource_limits::resource_limits_object,resource_limits::by_owner>( boost::make_tuple( false, account ) );
+            const auto& buo = this->get<resource_limits::resource_limits_object,resource_limits::by_owner>( boost::make_tuple( false, name(account) ) );
             ram_bytes  = buo.ram_bytes;
             net_weight = buo.net_weight;
             cpu_weight = buo.cpu_weight;
         }
     }
 
-    uint64_t get_total_cpu_weight() {
+    uint64_t get_total_cpu_weight() const {
         const auto& state = this->get<resource_limits::resource_limits_state_object>();
         return state.total_cpu_weight;
     }
 
-    uint64_t get_total_net_weight() {
+    uint64_t get_total_net_weight() const {
         const auto& state = this->get<resource_limits::resource_limits_state_object>();
         return state.total_net_weight;
     }
 
-    cpu_limit_result get_account_cpu_limit(const account_name& name, uint32_t greylist_limit = config::maximum_elastic_resource_multiplier);
+    cpu_limit_result get_account_cpu_limit(uint64_t name, uint32_t greylist_limit = config::maximum_elastic_resource_multiplier) const;
 
-    std::pair<resource_limits::account_resource_limit, bool> get_account_cpu_limit_ex( const account_name& name, uint32_t greylist_limit = config::maximum_elastic_resource_multiplier, const std::optional<block_timestamp_type>& current_time = {}) {
+    std::pair<resource_limits::account_resource_limit, bool> get_account_cpu_limit_ex( uint64_t account_name, uint32_t greylist_limit = config::maximum_elastic_resource_multiplier, const std::optional<block_timestamp_type>& current_time = {}) const {
         const auto& state = this->get<resource_limits::resource_limits_state_object>();
-        const auto& usage = this->get<resource_limits::resource_usage_object, resource_limits::by_owner>(name);
+        const auto& usage = this->get<resource_limits::resource_usage_object, resource_limits::by_owner>(name(account_name));
         const auto& config = this->get<resource_limits::resource_limits_config_object>();
 
         int64_t cpu_weight, x, y;
-        get_account_limits( name, x, y, cpu_weight );
-
+        get_account_limits( account_name, x, y, cpu_weight );
         if( cpu_weight < 0 || state.total_cpu_weight == 0 ) {
             return {{ -1, -1, -1, block_timestamp_type(usage.cpu_usage.last_ordinal), -1 }, false};
         }
@@ -417,15 +419,15 @@ public:
         return {arl, greylisted};
     }
 
-    net_limit_result get_account_net_limit(const account_name& name, uint32_t greylist_limit = config::maximum_elastic_resource_multiplier);
+    net_limit_result get_account_net_limit(u_int64_t name, uint32_t greylist_limit = config::maximum_elastic_resource_multiplier) const;
 
-    std::pair<resource_limits::account_resource_limit, bool> get_account_net_limit_ex( const account_name& name, uint32_t greylist_limit = config::maximum_elastic_resource_multiplier, const std::optional<block_timestamp_type>& current_time = {}) {
+    std::pair<resource_limits::account_resource_limit, bool> get_account_net_limit_ex( u_int64_t account_name, uint32_t greylist_limit = config::maximum_elastic_resource_multiplier, const std::optional<block_timestamp_type>& current_time = {}) const {
         const auto& config = this->get<resource_limits::resource_limits_config_object>();
         const auto& state  = this->get<resource_limits::resource_limits_state_object>();
-        const auto& usage  = this->get<resource_limits::resource_usage_object, resource_limits::by_owner>(name);
+        const auto& usage  = this->get<resource_limits::resource_usage_object, resource_limits::by_owner>(name(account_name));
 
         int64_t net_weight, x, y;
-        get_account_limits( name, x, net_weight, y );
+        get_account_limits( account_name, x, net_weight, y );
 
         if( net_weight < 0 || state.total_net_weight == 0) {
             return {{ -1, -1, -1, block_timestamp_type(usage.net_usage.last_ordinal), -1 }, false};
@@ -513,24 +515,24 @@ public:
         });
     }
 
-    const table_id_object* find_table( const name &code, const name &scope, const name &table ) {
-        return this->find<table_id_object, by_code_scope_table>(boost::make_tuple(code, scope, table));
+    const table_id_object* find_table( uint64_t code, uint64_t scope, uint64_t table ) const {
+        return this->find<table_id_object, by_code_scope_table>(boost::make_tuple(name(code), name(scope), name(table)));
     }
 
-    const table_id_object& get_table( const name &code, const name &scope, const name &table ) {
-        return this->get<table_id_object, by_code_scope_table>(boost::make_tuple(code, scope, table));
+    const table_id_object& get_table( uint64_t code, uint64_t scope, uint64_t table ) {
+        return this->get<table_id_object, by_code_scope_table>(boost::make_tuple(name(code), name(scope), name(table)));
     }
 
-    const table_id_object& create_table( const name &code, const name &scope, const name &table, const account_name &payer ) {
+    const table_id_object& create_table( uint64_t code, uint64_t scope, uint64_t table, uint64_t payer ) {
         return this->create<table_id_object>([&](table_id_object &t_id){
-            t_id.code = code;
-            t_id.scope = scope;
-            t_id.table = table;
-            t_id.payer = payer;
+            t_id.code = name(code);
+            t_id.scope = name(scope);
+            t_id.table = name(table);
+            t_id.payer = name(payer);
         });
     }
 
-    int db_find_i64( const name& code, const name& scope, const name& table, uint64_t id, CxxKeyValueIteratorCache& keyval_cache ) {
+    int db_find_i64( uint64_t code, uint64_t scope, uint64_t table, uint64_t id, CxxKeyValueIteratorCache& keyval_cache ) {
         const auto* tab = find_table( code, scope, table );
         if( !tab ) return -1;
 
@@ -542,14 +544,14 @@ public:
         return keyval_cache.add( *obj );
     }
 
-    const key_value_object& create_key_value_object( const table_id_object& tab, const account_name& payer, uint64_t id, rust::Slice<const std::uint8_t> buffer ) {
+    const key_value_object& create_key_value_object( const table_id_object& tab, uint64_t payer, uint64_t id, rust::Slice<const std::uint8_t> buffer ) {
         auto tableid = tab.id;
-        EOS_ASSERT( payer != account_name(), invalid_table_payer, "must specify a valid account to pay for new record" );
+        EOS_ASSERT( payer != 0, invalid_table_payer, "must specify a valid account to pay for new record" );
         const auto& obj = this->create<key_value_object>( [&]( auto& o ) {
             o.t_id        = tableid;
             o.primary_key = id;
             o.value.assign( reinterpret_cast<const char*>(buffer.data()), buffer.size() );
-            o.payer       = payer;
+            o.payer       = name(payer);
         });
 
         this->modify( tab, [&]( auto& t ) {
@@ -559,10 +561,10 @@ public:
         return obj;
     }
 
-    void update_key_value_object( const key_value_object& obj, const name& payer, rust::Slice<const std::uint8_t> buffer ) {
+    void update_key_value_object( const key_value_object& obj, uint64_t payer, rust::Slice<const std::uint8_t> buffer ) {
         this->modify( obj, [&]( auto& o ) {
             o.value.assign( buffer.data(), buffer.size() );
-            o.payer = payer;
+            o.payer = name(payer);
         });
     }
 
@@ -570,17 +572,17 @@ public:
         this->remove( table_obj );
     }
 
-    bool is_account( const name& account )const {
-        return nullptr != this->find<account_object,by_name>( account );
+    bool is_account( uint64_t account )const {
+        return nullptr != this->find<account_object,by_name>( name(account) );
     }
 
     const permission_object* find_permission( int64_t id ) const {
         return this->find<permission_object, by_id>( permission_object::id_type( id ) );
     }
 
-    const permission_object* find_permission_by_actor_and_permission( const name& actor, const name& permission ) const {
-        EOS_ASSERT( !actor.empty() && !permission.empty(), invalid_permission, "Invalid permission" );
-        return this->find<permission_object, by_owner>( boost::make_tuple(actor, permission) );
+    const permission_object* find_permission_by_actor_and_permission( uint64_t actor, uint64_t permission ) const {
+        EOS_ASSERT( actor != 0 && permission != 0, invalid_permission, "Invalid permission" );
+        return this->find<permission_object, by_owner>( boost::make_tuple(name(actor), name(permission)) );
     }
 
     void unlink_account_code(
@@ -654,16 +656,16 @@ public:
         return this->get<code_object, by_code_hash>( boost::make_tuple(code_hash, vm_type, vm_version) );
     }
 
-    int64_t delete_auth(const name& account, const name& permission_name) {
+    int64_t delete_auth(uint64_t account, uint64_t permission_name) {
         { // Check for links to this permission
             const auto& index = this->get_index<permission_link_index, by_permission_name>();
-            auto range = index.equal_range(boost::make_tuple(account, permission_name));
+            auto range = index.equal_range(boost::make_tuple(name(account), name(permission_name)));
             EOS_ASSERT(range.first == range.second, action_validate_exception,
                         "Cannot delete a linked authority. Unlink the authority first. This authority is linked to ${code}::${type}.",
                         ("code", range.first->code)("type", range.first->message_type));
         }
 
-        const auto& permission = this->get_permission({account, permission_name});
+        const auto& permission = this->get_permission({name(account), name(permission_name)});
         int64_t old_size = config::billable_size_v<permission_object> + permission.auth.get_billable_size();
 
         this->remove_permission( permission );
@@ -671,34 +673,34 @@ public:
         return old_size;
     }
 
-    int64_t link_auth( const name& account_name, const name& code_name, const name& requirement_name, const name& requirement_type ) {
-        const auto *account = this->find<account_object, by_name>(account_name);
-        EOS_ASSERT(account != nullptr, account_query_exception, "Failed to retrieve account: ${account}", ("account", account_name));
-        const auto *code = this->find<account_object, by_name>(code_name);
-        EOS_ASSERT(code != nullptr, account_query_exception, "Failed to retrieve code for account: ${account}", ("account", code_name));
+    int64_t link_auth( uint64_t account_name,  uint64_t code_name, uint64_t requirement_name, uint64_t requirement_type ) {
+        const auto *account = this->find<account_object, by_name>(name(account_name));
+        EOS_ASSERT(account != nullptr, account_query_exception, "Failed to retrieve account: ${account}", ("account", name(account_name)));
+        const auto *code = this->find<account_object, by_name>(name(code_name));
+        EOS_ASSERT(code != nullptr, account_query_exception, "Failed to retrieve code for account: ${account}", ("account", name(code_name)));
 
-        if( requirement_name != config::any_name ) {
+        if( name(requirement_name) != config::any_name ) {
             const permission_object* permission = this->find<permission_object, by_owner>(
-                boost::make_tuple( account_name, requirement_name )
+                boost::make_tuple( name(account_name), name(requirement_name) )
             );
 
-            EOS_ASSERT(permission != nullptr, permission_query_exception, "Failed to retrieve permission: ${permission}", ("permission", requirement_name));
+            EOS_ASSERT(permission != nullptr, permission_query_exception, "Failed to retrieve permission: ${permission}", ("permission", name(requirement_name)));
         }
 
-        auto link_key = boost::make_tuple(account_name, code_name, requirement_type);
+        auto link_key = boost::make_tuple(name(account_name), name(code_name), name(requirement_type));
         auto link = this->find<permission_link_object, by_action_name>(link_key);
 
         if( link ) {
-            EOS_ASSERT(link->required_permission != requirement_name, action_validate_exception, "Attempting to update required authority, but new requirement is same as old");
-            this->modify(*link, [requirement = requirement_name](permission_link_object& link) {
+            EOS_ASSERT(link->required_permission != name(requirement_name), action_validate_exception, "Attempting to update required authority, but new requirement is same as old");
+            this->modify(*link, [requirement = name(requirement_name)](permission_link_object& link) {
                 link.required_permission = requirement;
             });
         } else {
             const auto& l =  this->create<permission_link_object>([&requirement_name, &account_name, &code_name, &requirement_type](permission_link_object& link) {
-                link.account = account_name;
-                link.code = code_name;
-                link.message_type = requirement_type;
-                link.required_permission = requirement_name;
+                link.account = name(account_name);
+                link.code = name(code_name);
+                link.message_type = name(requirement_type);
+                link.required_permission = name(requirement_name);
             });
 
             return (int64_t)(config::billable_size_v<permission_link_object>);
@@ -707,12 +709,12 @@ public:
         return 0;
     }
 
-    int64_t unlink_auth( const name& account_name, const name& code_name, const name& requirement_type ) {
-        auto link_key = boost::make_tuple(account_name, code_name, requirement_type);
+    int64_t unlink_auth( uint64_t account_name,  uint64_t code_name,  uint64_t requirement_type ) {
+        auto link_key = boost::make_tuple(name(account_name), name(code_name), name(requirement_type));
         auto link = this->find<permission_link_object, by_action_name>(link_key);
 
         EOS_ASSERT(link != nullptr, action_validate_exception, "No authority link found for ${account} to ${code}::${type}",
-                    ("account", account_name)("code", code_name)("type", requirement_type));
+                    ("account", name(account_name))("code", name(code_name))("type", name(requirement_type)));
 
         this->remove(*link);
 
@@ -730,8 +732,50 @@ public:
     }
 
     const permission_object& create_permission(
-        const name& account,
-        const name& name,
+        uint64_t account,
+        uint64_t permission_name,
+        uint64_t parent,
+        const Authority& a,
+        const time_point& creation_time
+    ) {
+        authority auth;
+        auth.threshold = a.threshold;
+        auth.keys.reserve(a.keys.size());
+        auth.accounts.reserve(a.accounts.size());
+        auth.waits.reserve(a.waits.size());
+        for (const auto& k : a.keys) {
+            auth.keys.emplace_back( key_weight{ *k.key, k.weight } );
+        }
+        for (const auto& ac : a.accounts) {
+            auth.accounts.emplace_back( permission_level_weight{ { name(ac.permission.actor), name(ac.permission.permission) }, ac.weight } );
+        }
+        for (const auto& w : a.waits) {
+            auth.waits.emplace_back( wait_weight{ w.wait_sec, w.weight } );
+        }
+
+        for(const key_weight& k: auth.keys)
+            EOS_ASSERT(k.key.which() < this->get<protocol_state_object>().num_supported_key_types, unactivated_key_type,
+            "Unactivated key type used when creating permission");
+
+        const auto& perm_usage = this->create<permission_usage_object>([&](auto& p) {
+            p.last_used = creation_time;
+        });
+
+        const auto& perm = this->create<permission_object>([&](auto& p) {
+            p.usage_id     = perm_usage.id;
+            p.parent       = permission_object::id_type(parent);
+            p.owner        = name(account);
+            p.perm_name    = name(permission_name);
+            p.last_updated = creation_time;
+            p.auth         = std::move(auth);
+        });
+
+        return perm;
+    }
+
+    const permission_object& create_permission(
+        uint64_t account,
+        uint64_t permission_name,
         uint64_t parent,
         const authority& auth,
         const time_point& creation_time
@@ -747,8 +791,8 @@ public:
         const auto& perm = this->create<permission_object>([&](auto& p) {
             p.usage_id     = perm_usage.id;
             p.parent       = permission_object::id_type(parent);
-            p.owner        = account;
-            p.perm_name         = name;
+            p.owner        = name(account);
+            p.perm_name    = name(permission_name);
             p.last_updated = creation_time;
             p.auth         = std::move(auth);
         });
@@ -756,7 +800,22 @@ public:
         return perm;
     }
 
-    void modify_permission( const permission_object& permission, const Authority& auth, const fc::time_point& pending_block_time ) {
+    void modify_permission( const permission_object& permission, const Authority& a, const fc::time_point& pending_block_time ) {
+        authority auth;
+        auth.threshold = a.threshold;
+        auth.keys.reserve(a.keys.size());
+        auth.accounts.reserve(a.accounts.size());
+        auth.waits.reserve(a.waits.size());
+        for (const auto& k : a.keys) {
+            auth.keys.emplace_back( key_weight{ *k.key, k.weight } );
+        }
+        for (const auto& ac : a.accounts) {
+            auth.accounts.emplace_back( permission_level_weight{ { name(ac.permission.actor), name(ac.permission.permission) }, ac.weight } );
+        }
+        for (const auto& w : a.waits) {
+            auth.waits.emplace_back( wait_weight{ w.wait_sec, w.weight } );
+        }
+
         for(const key_weight& k: auth.keys)
             EOS_ASSERT(k.key.which() < this->get<protocol_state_object>().num_supported_key_types, unactivated_key_type,
             "Unactivated key type used when modifying permission");
@@ -775,13 +834,13 @@ public:
     }
 
     const name* lookup_linked_permission(
-        const name& authorizer_account,
-        const name& scope,
-        const name& act_name
+        u_int64_t authorizer_account,
+        u_int64_t scope,
+        u_int64_t act_name
     )const {
       try {
          // First look up a specific link for this message act_name
-         auto key = boost::make_tuple(authorizer_account, scope, act_name);
+         auto key = boost::make_tuple(name(authorizer_account), name(scope), name(act_name));
          auto link = this->find<permission_link_object, by_action_name>(key);
          // If no specific link found, check for a contract-wide default
          if (link == nullptr) {
@@ -813,8 +872,8 @@ public:
         return receiver_account.recv_sequence;
     }
 
-    uint64_t next_auth_sequence( const account_name& actor ) {
-        const auto& amo = this->get<account_metadata_object,by_name>( actor );
+    uint64_t next_auth_sequence( u_int64_t actor ) {
+        const auto& amo = this->get<account_metadata_object,by_name>( name(actor) );
         this->modify( amo, [&](auto& am ){
             ++am.auth_sequence;
         });
@@ -831,10 +890,10 @@ public:
         return p.global_action_sequence;
     }
 
-    int64_t db_remove_i64( iterator_cache<key_value_object>& keyval_cache, int iterator, const name& receiver ) {
+    int64_t db_remove_i64( iterator_cache<key_value_object>& keyval_cache, int iterator, u_int64_t receiver ) {
         const key_value_object& obj = keyval_cache.get( iterator );
         const auto& table_obj = keyval_cache.get_table( obj.t_id );
-        EOS_ASSERT( table_obj.code == receiver, table_access_violation, "db access violation" );
+        EOS_ASSERT( table_obj.code == name(receiver), table_access_violation, "db access violation" );
         auto delta = -(obj.value.size() + config::billable_size_v<key_value_object>);
 
         this->modify( table_obj, [&]( auto& t ) {
@@ -898,14 +957,14 @@ public:
         return keyval_cache.add(*itr);
     }
 
-    int db_end_i64( iterator_cache<key_value_object>& keyval_cache, const name& code, const name& scope, const name& table ) {
+    int db_end_i64( iterator_cache<key_value_object>& keyval_cache,  uint64_t code,  uint64_t scope,  uint64_t table ) {
         const auto* tab = this->find_table( code, scope, table );
         if( !tab ) return -1;
 
         return keyval_cache.cache_table( *tab );
     }
 
-    int db_lowerbound_i64( iterator_cache<key_value_object>& keyval_cache, const name& code, const name& scope, const name& table, uint64_t id ) {
+    int db_lowerbound_i64( iterator_cache<key_value_object>& keyval_cache, uint64_t code, uint64_t scope, uint64_t table, uint64_t id ) {
         const auto* tab = this->find_table( code, scope, table );
         if( !tab ) return -1;
 
@@ -919,7 +978,7 @@ public:
         return keyval_cache.add( *itr );
     }
 
-    int db_upperbound_i64( iterator_cache<key_value_object>& keyval_cache, const name& code, const name& scope, const name& table, uint64_t id ) {
+    int db_upperbound_i64( iterator_cache<key_value_object>& keyval_cache, uint64_t code, uint64_t scope, uint64_t table, uint64_t id ) {
         const auto* tab = this->find_table( code, scope, table );
         if( !tab ) return -1;
 

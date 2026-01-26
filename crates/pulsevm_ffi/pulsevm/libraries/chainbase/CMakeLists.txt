@@ -1,5 +1,4 @@
 # Defines ChainBase library target.
-cmake_minimum_required( VERSION 3.5 )
 project( ChainBase )
 
 #list( APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/CMakeModules" )

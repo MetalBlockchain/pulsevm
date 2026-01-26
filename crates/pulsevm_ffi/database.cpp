@@ -25,12 +25,12 @@ std::unique_ptr<pulsevm::chain::database_wrapper> open_database(
     return std::make_unique<pulsevm::chain::database_wrapper>(fs_path, db_flags, size);
 }
 
-cpu_limit_result database_wrapper::get_account_cpu_limit(const account_name& name, uint32_t greylist_limit) {
+cpu_limit_result database_wrapper::get_account_cpu_limit(uint64_t name, uint32_t greylist_limit) const {
     auto [arl, greylisted] = get_account_cpu_limit_ex(name, greylist_limit);
     return {arl.available, greylisted};
 }
 
-net_limit_result database_wrapper::get_account_net_limit(const account_name& name, uint32_t greylist_limit) {
+net_limit_result database_wrapper::get_account_net_limit(uint64_t name, uint32_t greylist_limit) const {
     auto [arl, greylisted] = get_account_net_limit_ex(name, greylist_limit);
     return {arl.available, greylisted};
 }

@@ -17,6 +17,10 @@ impl PublicKey {
     pub fn new(inner: SharedPtr<CxxPublicKey>) -> Self {
         PublicKey { inner }
     }
+
+    pub fn inner(&self) -> &SharedPtr<CxxPublicKey> {
+        &self.inner
+    }
 }
 
 impl Debug for PublicKey {
@@ -41,7 +45,7 @@ impl Eq for PublicKey {}
 
 impl Hash for PublicKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.inner.pack().hash(state);
+        self.inner.packed_bytes().hash(state);
     }
 }
 
@@ -70,7 +74,7 @@ impl Read for PublicKey {
 
 impl Write for PublicKey {
     fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), WriteError> {
-        let packed = self.inner.pack();
+        let packed = self.inner.packed_bytes();
         let end_pos = *pos + packed.len();
         if end_pos > bytes.len() {
             return Err(WriteError::NotEnoughSpace);

@@ -55,9 +55,10 @@ namespace fc { namespace crypto {
 
          rust::Vec<uint8_t> pack() const {
             rust::Vec<uint8_t> out;
-            size_t sz = fc::raw::pack_size(this);
+            size_t sz = fc::raw::pack_size(*this);
+            out.reserve(sz);
             fc::datastream<char*> ds(reinterpret_cast<char*>(out.data()), sz);
-            fc::raw::pack(ds, this);
+            fc::raw::pack(ds, *this);
             return out;
          }
 

@@ -14,7 +14,7 @@ pub fn require_auth(env: FunctionEnvMut<WasmContext>, account: u64) -> Result<()
 
 pub fn has_auth(env: FunctionEnvMut<WasmContext>, account: u64) -> Result<i32, RuntimeError> {
     let context = env.data().apply_context();
-    let result = context.has_authorization(&account.into());
+    let result = context.has_authorization(&account.into())?;
 
     if result { Ok(1) } else { Ok(0) }
 }
@@ -46,21 +46,9 @@ pub fn require_recipient(
     }
 }
 
-pub fn is_account(
-    mut env: FunctionEnvMut<WasmContext>,
-    recipient: u64,
-) -> Result<i32, RuntimeError> {
-    let context = env.data_mut().apply_context_mut();
-    let result = context.is_account(&recipient.into());
+pub fn is_account(env: FunctionEnvMut<WasmContext>, recipient: u64) -> Result<i32, RuntimeError> {
+    let context = env.data().apply_context();
+    let result = context.is_account(&recipient.into())?;
 
-    match result {
-        Ok(exists) => {
-            if exists {
-                Ok(1)
-            } else {
-                Ok(0)
-            }
-        }
-        Err(err) => return Err(err.into()),
-    }
+    if result { Ok(1) } else { Ok(0) }
 }

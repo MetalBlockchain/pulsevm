@@ -6,7 +6,7 @@ use crate::{Database, PermissionObject};
 pub mod ffi {
     unsafe extern "C++" {
         include!("name.hpp");
-        include!("types.hpp");
+        include!("type_defs.hpp");
         include!("objects.hpp");
 
         type AccountObject;
@@ -24,8 +24,11 @@ pub mod ffi {
         type CxxName = crate::name::ffi::CxxName;
         type CxxSharedBlob = crate::types::ffi::CxxSharedBlob;
         type CxxChainConfig = crate::types::ffi::CxxChainConfig;
+        type CxxBlockTimestamp = crate::types::ffi::CxxBlockTimestamp;
+        type CxxTimePoint = crate::types::ffi::CxxTimePoint;
 
         // Account methods
+        pub fn get_creation_date(self: &AccountObject) -> &CxxBlockTimestamp;
         pub fn get_abi(self: &AccountObject) -> &CxxSharedBlob;
 
         // AccountMetadata methods
@@ -34,6 +37,7 @@ pub mod ffi {
         pub fn get_auth_sequence(self: &AccountMetadataObject) -> u64;
         pub fn get_code_sequence(self: &AccountMetadataObject) -> u64;
         pub fn get_abi_sequence(self: &AccountMetadataObject) -> u64;
+        pub fn get_last_code_update(self: &AccountMetadataObject) -> &CxxTimePoint;
         pub fn is_privileged(self: &AccountMetadataObject) -> bool;
 
         // CodeObject methods

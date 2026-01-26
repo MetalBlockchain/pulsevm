@@ -23,8 +23,8 @@ tempfile = "3.23.0"
 thiserror = "2"
 time = { version = "0.3.41", features = ["formatting", "macros", "parsing"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
-wasmer = { version = "6.1.0", features = ["llvm"] }
-wasmer-compiler-llvm = "6.1.0"
+wasmer = { version = "6.1.0", features = ["cranelift"] }
+wasmer-compiler-cranelift = "6.1.0"
 
 pulsevm_crypto = { path = "../pulsevm_crypto" }
 pulsevm_error = { path = "../pulsevm_error" }

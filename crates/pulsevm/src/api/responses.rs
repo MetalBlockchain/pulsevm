@@ -5,7 +5,7 @@ use pulsevm_core::{
 use pulsevm_crypto::Digest;
 use serde::Serialize;
 
-#[derive(Serialize, Clone, Default)]
+#[derive(Serialize, Clone)]
 pub struct PermissionResponse {
     perm_name: Name,
     parent: Name,
@@ -57,7 +57,7 @@ pub struct GetAccountResponse {
     pub cpu_weight: i64,
     pub net_limit: AccountResourceLimit,
     pub cpu_limit: AccountResourceLimit,
-    pub ram_usage: u64,
+    pub ram_usage: i64,
     pub permissions: Vec<PermissionResponse>,
     pub total_resources: AccountTotalResources,
     pub voter_info: AccountVoterInfo,

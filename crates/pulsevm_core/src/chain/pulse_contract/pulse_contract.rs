@@ -3,26 +3,28 @@ use pulsevm_ffi::{CxxDigest, Database, u64_to_name};
 use pulsevm_serialization::Write;
 
 use crate::{
-    ACTIVE_NAME, ANY_NAME, CODE_NAME, OWNER_NAME,
+    ACTIVE_NAME, CODE_NAME, OWNER_NAME,
     chain::{
         abi::AbiDefinition,
-        account::{Account, AccountMetadata, CodeObject},
         apply_context::ApplyContext,
-        authority::{Authority, Permission, PermissionLevel, PermissionLink},
+        authority::{Authority, PermissionLevel},
         authorization_manager::AuthorizationManager,
         config,
-        id::Id,
         pulse_contract::pulse_contract_types::{
             DeleteAuth, LinkAuth, NewAccount, SetAbi, SetCode, UnlinkAuth, UpdateAuth,
         },
         resource_limits::ResourceLimitsManager,
         utils::pulse_assert,
     },
+    transaction::Action,
 };
 
-pub fn newaccount(context: &mut ApplyContext, db: &mut Database) -> Result<(), ChainError> {
-    let create = context
-        .get_action()
+pub fn newaccount(
+    context: &mut ApplyContext,
+    db: &mut Database,
+    act: &Action,
+) -> Result<(), ChainError> {
+    let create = act
         .data_as::<NewAccount>()
         .map_err(|e| ChainError::TransactionError(format!("failed to deserialize data: {}", e)))?;
     context.require_authorization(&create.creator, None)?;
@@ -45,7 +47,7 @@ pub fn newaccount(context: &mut ApplyContext, db: &mut Database) -> Result<(), C
     )?;
 
     // Check if the creator is privileged
-    let creator = db.find_account_metadata(create.creator.as_ref())?;
+    let creator = db.find_account_metadata(create.creator.as_u64())?;
     let creator = unsafe { &*creator };
 
     if !creator.is_privileged() {
@@ -57,7 +59,7 @@ pub fn newaccount(context: &mut ApplyContext, db: &mut Database) -> Result<(), C
         )?;
     }
 
-    let existing_account = db.find_account(create.name.as_ref())?;
+    let existing_account = db.find_account(create.name.as_u64())?;
     pulse_assert(
         existing_account.is_null(),
         ChainError::TransactionError(format!(
@@ -70,7 +72,7 @@ pub fn newaccount(context: &mut ApplyContext, db: &mut Database) -> Result<(), C
         create.name.as_u64(),
         context.pending_block_timestamp().slot(),
     )?;
-    db.create_account_metadata(create.name.as_ref(), false)?;
+    db.create_account_metadata(create.name.as_u64(), false)?;
 
     validate_authority_precondition(db, &create.owner)?;
     validate_authority_precondition(db, &create.active)?;
@@ -115,9 +117,12 @@ pub fn newaccount(context: &mut ApplyContext, db: &mut Database) -> Result<(), C
     Ok(())
 }
 
-pub fn setcode(context: &mut ApplyContext, db: &mut Database) -> Result<(), ChainError> {
-    let act = context
-        .get_action()
+pub fn setcode(
+    context: &mut ApplyContext,
+    db: &mut Database,
+    act: &Action,
+) -> Result<(), ChainError> {
+    let act = act
         .data_as::<SetCode>()
         .map_err(|e| ChainError::TransactionError(format!("failed to deserialize data: {}", e)))?;
     context.require_authorization(&act.account, None)?;
@@ -135,11 +140,11 @@ pub fn setcode(context: &mut ApplyContext, db: &mut Database) -> Result<(), Chai
     let code_size = act.code.len() as u64;
 
     if code_size > 0 {
-        code_hash = CxxDigest::hash(act.code.as_slice());
+        code_hash = CxxDigest::hash(act.code.as_slice())?;
         // TODO: validate wasm
     }
 
-    let account = db.get_account_metadata(act.account.as_ref())?;
+    let account = db.get_account_metadata(act.account.as_u64())?;
     let account = unsafe { &*account };
     let existing_code = !account.get_code_hash().empty();
 
@@ -189,9 +194,12 @@ pub fn setcode(context: &mut ApplyContext, db: &mut Database) -> Result<(), Chai
     Ok(())
 }
 
-pub fn setabi(context: &mut ApplyContext, db: &mut Database) -> Result<(), ChainError> {
-    let act = context
-        .get_action()
+pub fn setabi(
+    context: &mut ApplyContext,
+    db: &mut Database,
+    act: &Action,
+) -> Result<(), ChainError> {
+    let act = act
         .data_as::<SetAbi>()
         .map_err(|e| ChainError::TransactionError(format!("failed to deserialize data: {}", e)))?;
     context.require_authorization(&act.account, None)?;
@@ -203,10 +211,10 @@ pub fn setabi(context: &mut ApplyContext, db: &mut Database) -> Result<(), Chain
     let abi_def_packed = abi_def
         .pack()
         .map_err(|e| ChainError::TransactionError(format!("failed to serialize ABI: {}", e)))?;
-    let account = unsafe { &*db.get_account(act.account.as_ref())? };
+    let account = db.get_account(act.account.as_u64())?;
     let old_size: i64 = account.get_abi().size() as i64;
     let new_size: i64 = abi_def_packed.len() as i64;
-    let account_metadata = unsafe { &*db.get_account_metadata(act.account.as_ref())? };
+    let account_metadata = unsafe { &*db.get_account_metadata(act.account.as_u64())? };
 
     db.update_account_abi(account, account_metadata, act.abi.as_slice())?;
 
@@ -217,9 +225,12 @@ pub fn setabi(context: &mut ApplyContext, db: &mut Database) -> Result<(), Chain
     Ok(())
 }
 
-pub fn updateauth(context: &mut ApplyContext, db: &mut Database) -> Result<(), ChainError> {
-    let update = context
-        .get_action()
+pub fn updateauth(
+    context: &mut ApplyContext,
+    db: &mut Database,
+    act: &Action,
+) -> Result<(), ChainError> {
+    let update = act
         .data_as::<UpdateAuth>()
         .map_err(|e| ChainError::TransactionError(format!("failed to deserialize data: {}", e)))?;
     context.require_authorization(&update.account, None)?;
@@ -239,7 +250,7 @@ pub fn updateauth(context: &mut ApplyContext, db: &mut Database) -> Result<(), C
         ChainError::ActionValidationError(format!("cannot set an authority as its own parent")),
     )?;
 
-    db.get_account(update.account.as_ref()).map_err(|_| {
+    db.get_account(update.account.as_u64()).map_err(|_| {
         ChainError::TransactionError(format!("failed to find account {}", update.account))
     })?;
 
@@ -271,12 +282,16 @@ pub fn updateauth(context: &mut ApplyContext, db: &mut Database) -> Result<(), C
 
     let permission = AuthorizationManager::find_permission(
         db,
-        &PermissionLevel::new(update.account.clone(), update.permission.clone()),
+        &PermissionLevel::new(update.account.as_u64(), update.permission.as_u64()),
     )?;
 
     let mut parent_id = 0i64;
     if update.permission != OWNER_NAME {
-        let parent = AuthorizationManager::get_permission(db, &update.account, &update.parent)?;
+        let parent = AuthorizationManager::get_permission(
+            db,
+            update.account.as_u64(),
+            update.parent.as_u64(),
+        )?;
         parent_id = parent.get_parent_id();
     }
 
@@ -316,9 +331,12 @@ pub fn updateauth(context: &mut ApplyContext, db: &mut Database) -> Result<(), C
     Ok(())
 }
 
-pub fn deleteauth(context: &mut ApplyContext, db: &mut Database) -> Result<(), ChainError> {
-    let remove = context
-        .get_action()
+pub fn deleteauth(
+    context: &mut ApplyContext,
+    db: &mut Database,
+    act: &Action,
+) -> Result<(), ChainError> {
+    let remove = act
         .data_as::<DeleteAuth>()
         .map_err(|e| ChainError::TransactionError(format!("failed to deserialize data: {}", e)))?;
     context.require_authorization(&remove.account, None)?;
@@ -332,15 +350,18 @@ pub fn deleteauth(context: &mut ApplyContext, db: &mut Database) -> Result<(), C
         ChainError::ActionValidationError(format!("cannot delete owner authority")),
     )?;
 
-    let old_size = db.delete_auth(remove.account.as_ref(), remove.permission.as_ref())?;
+    let old_size = db.delete_auth(remove.account.as_u64(), remove.permission.as_u64())?;
     context.add_ram_usage(&remove.account, -old_size);
 
     Ok(())
 }
 
-pub fn linkauth(context: &mut ApplyContext, db: &mut Database) -> Result<(), ChainError> {
-    let requirement = context
-        .get_action()
+pub fn linkauth(
+    context: &mut ApplyContext,
+    db: &mut Database,
+    act: &Action,
+) -> Result<(), ChainError> {
+    let requirement = act
         .data_as::<LinkAuth>()
         .map_err(|e| ChainError::TransactionError(format!("failed to deserialize data: {}", e)))?;
     pulse_assert(
@@ -350,10 +371,10 @@ pub fn linkauth(context: &mut ApplyContext, db: &mut Database) -> Result<(), Cha
     context.require_authorization(&requirement.account, None)?;
 
     let delta = db.link_auth(
-        requirement.account.as_ref(),
-        requirement.code.as_ref(),
-        requirement.requirement.as_ref(),
-        requirement.message_type.as_ref(),
+        requirement.account.as_u64(),
+        requirement.code.as_u64(),
+        requirement.requirement.as_u64(),
+        requirement.message_type.as_u64(),
     )?;
 
     if delta != 0 {
@@ -363,17 +384,20 @@ pub fn linkauth(context: &mut ApplyContext, db: &mut Database) -> Result<(), Cha
     Ok(())
 }
 
-pub fn unlinkauth(context: &mut ApplyContext, db: &mut Database) -> Result<(), ChainError> {
-    let unlink = context
-        .get_action()
+pub fn unlinkauth(
+    context: &mut ApplyContext,
+    db: &mut Database,
+    act: &Action,
+) -> Result<(), ChainError> {
+    let unlink = act
         .data_as::<UnlinkAuth>()
         .map_err(|e| ChainError::TransactionError(format!("failed to deserialize data: {}", e)))?;
     context.require_authorization(&unlink.account, None)?;
 
     let delta = db.unlink_auth(
-        unlink.account.as_ref(),
-        unlink.code.as_ref(),
-        unlink.message_type.as_ref(),
+        unlink.account.as_u64(),
+        unlink.code.as_u64(),
+        unlink.message_type.as_u64(),
     )?;
 
     if delta != 0 {
@@ -385,24 +409,23 @@ pub fn unlinkauth(context: &mut ApplyContext, db: &mut Database) -> Result<(), C
 
 fn validate_authority_precondition(db: &mut Database, auth: &Authority) -> Result<(), ChainError> {
     for a in auth.accounts() {
-        let account = db.get_account(a.permission().actor.as_ref()).map_err(|_| {
-            ChainError::TransactionError(format!("account {} does not exist", a.permission().actor))
+        let account = db.get_account(a.permission.actor).map_err(|_| {
+            ChainError::TransactionError(format!("account {} does not exist", a.permission.actor))
         })?;
 
-        if a.permission().permission == OWNER_NAME || a.permission().permission == ACTIVE_NAME {
+        if a.permission.permission == OWNER_NAME || a.permission.permission == ACTIVE_NAME {
             continue; // account was already checked to exist, so its owner and active permissions should exist
         }
 
-        if a.permission().permission == CODE_NAME {
+        if a.permission.permission == CODE_NAME {
             continue; // virtual pulse.code permission does not really exist but is allowed
         }
 
-        AuthorizationManager::get_permission(db, &a.permission().actor, &a.permission().permission)
+        AuthorizationManager::get_permission(db, a.permission.actor, a.permission.permission)
             .map_err(|_| {
                 ChainError::TransactionError(format!(
                     "permission {}@{} does not exist",
-                    a.permission().actor,
-                    a.permission().permission
+                    a.permission.actor, a.permission.permission
                 ))
             })?;
     }
