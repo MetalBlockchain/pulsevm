@@ -37,6 +37,7 @@ fn main() {
     .file("genesis_state.cpp")
     .file("genesis_state_root_key.cpp")
     // Include directories
+    .include("/usr/include") // Standard system headers
     .include(libraries_root.join("chainbase/include")) // Add chainbase source headers
     .include(libraries_root.join("libfc/include")) // Add fc source headers
     .include(libraries_root.join("libfc/libraries/boringssl/bssl/include")) // Add boring ssl headers
