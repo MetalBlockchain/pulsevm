@@ -37,7 +37,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y gcc-12 g++-12
 
       - name: Install rust/cxx.h
-        run: cargo install cxxbridge-cmd && mkdir -p /usr/local/include/rust && cxxbridge --header > /usr/local/include/rust/cxx.h
+        run: cargo install cxxbridge-cmd && sudo mkdir -p /usr/local/include/rust && sudo cxxbridge --header > /usr/local/include/rust/cxx.h
 
       - name: Build release artifact
         run: cargo build --release
