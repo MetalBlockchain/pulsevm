@@ -9,7 +9,7 @@ namespace pulsevm { namespace chain {
       OBJECT_CTOR(account_object,(abi))
 
       id_type              id;
-      name                 name; //< name should not be changed within a chainbase modifier lambda
+      account_name         name; //< name should not be changed within a chainbase modifier lambda
       block_timestamp_type creation_date;
       shared_blob          abi;
 

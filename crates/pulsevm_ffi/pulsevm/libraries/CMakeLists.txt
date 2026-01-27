@@ -10,5 +10,4 @@ set( BOOST_EXCLUDE_LIBRARIES "mysql" )
 
 add_subdirectory( boost EXCLUDE_FROM_ALL )
 add_subdirectory( libfc )
-add_subdirectory( softfloat )
 add_subdirectory( chainbase )

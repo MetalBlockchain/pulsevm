@@ -2,7 +2,6 @@
 
 #include "types.hpp"
 #include <fc/io/raw.hpp>
-#include <softfloat.hpp>
 
 namespace pulsevm::chain {
 
@@ -154,63 +153,6 @@ namespace fc {
    }
 
    inline
-   void float64_to_double (const float64_t& f, double& d) {
-      memcpy(&d, &f, sizeof(d));
-   }
-
-   inline
-   void double_to_float64 (const double& d, float64_t& f) {
-      memcpy(&f, &d, sizeof(f));
-   }
-
-   inline
-   void float128_to_uint128 (const float128_t& f, pulsevm::chain::uint128_t& u) {
-      memcpy(&u, &f, sizeof(u));
-   }
-
-   inline
-   void uint128_to_float128 (const pulsevm::chain::uint128_t& u,  float128_t& f) {
-      memcpy(&f, &u, sizeof(f));
-   }
-
-   inline
-   void to_variant( const float64_t& f, variant& v ) {
-      double double_f;
-      float64_to_double(f, double_f);
-      v = variant(double_f);
-   }
-
-   inline
-   void from_variant( const variant& v, float64_t& f ) {
-      double double_f;
-      from_variant(v, double_f);
-      double_to_float64(double_f, f);
-   }
-
-   inline
-   void to_variant( const float128_t& f, variant& v ) {
-      // Assumes platform is little endian and hex representation of 128-bit integer is in little endian order.	
-      char as_bytes[sizeof(pulsevm::chain::uint128_t)];
-      memcpy(as_bytes, &f, sizeof(as_bytes));
-      std::string s = "0x";	
-      s.append( to_hex( as_bytes, sizeof(as_bytes) ) );
-      v = s;
-   }
-
-   inline
-   void from_variant( const variant& v, float128_t& f ) {
-      // Temporarily hold the binary in uint128_t before casting it to float128_t
-      char temp[sizeof(pulsevm::chain::uint128_t)];
-      memset(temp, 0, sizeof(temp));
-      auto s = v.as_string();	
-      FC_ASSERT( s.size() == 2 + 2 * sizeof(temp) && s.find("0x") == 0,	"Failure in converting hex data into a float128_t");	
-      auto sz = from_hex( s.substr(2), temp, sizeof(temp) );
-      // Assumes platform is little endian and hex representation of 128-bit integer is in little endian order.	
-      FC_ASSERT( sz == sizeof(temp), "Failure in converting hex data into a float128_t" );	
-      memcpy(&f, temp, sizeof(f));
-   }
-
-   inline
    void to_variant( const pulsevm::chain::shared_string& s, variant& v ) {
       v = variant(std::string(s.begin(), s.end()));
    }
@@ -332,21 +274,4 @@ namespace chainbase {
          s.write((const char*)v.data(), v.size());
       return s;
    }
-}
-
-// overloads for softfloat packing
-template<typename DataStream>
-DataStream& operator << ( DataStream& ds, const float64_t& v ) {
-   double double_v;
-   fc::float64_to_double(v, double_v);
-   fc::raw::pack(ds, double_v);
-   return ds;
-}
-
-template<typename DataStream>
-DataStream& operator >> ( DataStream& ds, float64_t& v ) {
-   double double_v;
-   fc::raw::unpack(ds, double_v);
-   fc::double_to_float64(double_v, v);
-   return ds;
 }

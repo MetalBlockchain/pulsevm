@@ -40,7 +40,6 @@ fn main() {
     .include(libraries_root.join("chainbase/include")) // Add chainbase source headers
     .include(libraries_root.join("libfc/include")) // Add fc source headers
     .include(libraries_root.join("libfc/libraries/boringssl/bssl/include")) // Add boring ssl headers
-    .include(libraries_root.join("softfloat/source/include"))
     .include(&project_dir)
     // Compiler flags
     .std("c++20")
@@ -50,8 +49,9 @@ fn main() {
     .flag_if_supported("-Wno-missing-template-arg-list-after-template-kw")
     .flag_if_supported("-Wno-deprecated-declarations")
     .flag_if_supported("-Wno-unused-variable")
+    .flag_if_supported("-Wno-unused-parameter")
     // Compile everything into one library
-    .compile("ffi");
+    .compile("pulsevm_ffi");
 
     println!("cargo:rustc-link-search=native={}", "/usr/local/lib");
     println!("cargo:rustc-link-lib=pthread");
@@ -60,11 +60,6 @@ fn main() {
         "/opt/homebrew/opt/zlib/lib"
     );
     println!("cargo:rustc-link-lib=z");
-    println!(
-        "cargo:rustc-link-search=native={}",
-        "/opt/homebrew/opt/libffi/lib"
-    );
-    println!("cargo:rustc-link-lib=ffi");
     println!(
         "cargo:rustc-link-search=native={}",
         "/opt/homebrew/opt/boost@1.85/lib"
@@ -83,13 +78,8 @@ fn main() {
     );
     println!("cargo:rustc-link-lib=static=fc");
     println!("cargo:rustc-link-lib=static=chainbase");
-    println!("cargo:rustc-link-lib=static=softfloat");
     println!("cargo:rustc-link-lib=static=bls12-381");
 
     // C++ standard library
-    if target.contains("apple") {
-        println!("cargo:rustc-link-lib=c++");
-    } else {
-        println!("cargo:rustc-link-lib=stdc++");
-    }
+    //println!("cargo:rustc-link-lib=c++");
 }
