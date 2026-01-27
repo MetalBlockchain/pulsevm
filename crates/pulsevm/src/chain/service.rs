@@ -1,16 +1,14 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     str::FromStr,
     sync::Arc,
 };
 
 use jsonrpsee::{proc_macros::rpc, types::ErrorObjectOwned};
 use pulsevm_core::{
-    ChainError, PULSE_NAME,
-    abi::{AbiDefinition, AbiSerializer},
-    account::{Account, AccountMetadata},
-    asset::{Asset, string_to_symbol},
-    block::{BlockHeader, BlockTimestamp, SignedBlock},
+    ChainError,
+    abi::AbiDefinition,
+    block::{BlockTimestamp, SignedBlock},
     controller::Controller,
     crypto::Signature,
     id::Id,
@@ -23,14 +21,14 @@ use pulsevm_core::{
 use pulsevm_crypto::{Bytes, Digest};
 use pulsevm_proc_macros::name;
 use pulsevm_serialization::Read;
-use serde_json::{Map, Value, json};
+use serde_json::Value;
 use tokio::sync::RwLock;
 use tonic::async_trait;
 
 use crate::{
     api::{
         GetAccountResponse, GetCodeHashResponse, GetInfoResponse, GetRawABIResponse,
-        GetTableRowsResponse, IssueTxResponse, PermissionResponse,
+        GetTableRowsResponse, IssueTxResponse,
     },
     chain::{Gossipable, NetworkManager},
 };
@@ -145,7 +143,7 @@ impl RpcServer for RpcService {
         let controller = self.controller.read().await;
         let db = controller.database();
         let code_account = db.get_account(account_name.as_u64())?;
-        let abi = AbiDefinition::read(code_account.get_abi().get_data(), &mut 0).map_err(|e| {
+        let abi = AbiDefinition::read(code_account.get_abi().as_slice(), &mut 0).map_err(|e| {
             ErrorObjectOwned::owned(400, "abi_error", Some(format!("failed to read ABI: {}", e)))
         })?;
         Ok(abi)
@@ -274,14 +272,14 @@ impl RpcServer for RpcService {
         let mut abi_hash = Digest::default();
 
         if account.get_abi().size() > 0 {
-            abi_hash = Digest::hash(account.get_abi().get_data());
+            abi_hash = Digest::hash(account.get_abi().as_slice());
         }
 
         Ok(GetRawABIResponse {
             account_name,
             code_hash: account_metadata.get_code_hash().into(),
             abi_hash,
-            abi: Base64Bytes::new(account.get_abi().get_data().to_vec()),
+            abi: Base64Bytes::new(account.get_abi().as_slice().to_vec()),
         })
     }
 

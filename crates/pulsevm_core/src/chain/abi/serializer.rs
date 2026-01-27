@@ -1,10 +1,8 @@
 use std::collections::HashMap;
 
-use cxx::SharedPtr;
 use pulsevm_crypto::{Bytes, FixedBytes};
 use pulsevm_error::ChainError;
-use pulsevm_ffi::CxxSignature;
-use pulsevm_serialization::{Read, ReadError, VarInt32, VarUint32, WriteError};
+use pulsevm_serialization::{Read, ReadError, VarInt32, VarUint32};
 use pulsevm_time::{TimePoint, TimePointSec};
 use serde_json::{Number, Value};
 
@@ -21,14 +19,13 @@ use crate::{
 
 type TypeName = String;
 type UnpackFunction = fn(bytes: &[u8], pos: &mut usize) -> Result<Value, ReadError>;
-type PackFunction = fn(bytes: &mut [u8], pos: &mut usize) -> Result<(), WriteError>;
 
 pub struct AbiSerializer {
     typedefs: HashMap<TypeName, TypeName>,
     structs: HashMap<TypeName, AbiStructDefinition>,
     actions: HashMap<Name, TypeName>,
     tables: HashMap<Name, TypeName>,
-    error_messages: HashMap<u64, String>,
+    _error_messages: HashMap<u64, String>,
     variants: HashMap<TypeName, AbiVariantDefinition>,
     action_results: HashMap<Name, TypeName>,
     built_in_types: HashMap<TypeName, UnpackFunction>,
@@ -97,7 +94,7 @@ impl AbiSerializer {
             structs,
             actions,
             tables,
-            error_messages,
+            _error_messages: error_messages,
             variants,
             action_results,
             built_in_types,
@@ -574,9 +571,9 @@ mod tests {
 
         let packed = 0f64;
         let packed = packed.pack().unwrap();
-        let packed = hex::encode(packed);
+        let _packed = hex::encode(packed);
 
-        let value = serializer
+        let _value = serializer
             .binary_to_variant(
                 "exchange_state",
                 &hex::decode("40e2010000000000045359530000000040e20100000000000453595300000000000000000000000040e201000000000004535953000000000000000000000000").unwrap(),

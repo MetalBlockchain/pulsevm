@@ -1,5 +1,5 @@
 use core::fmt;
-use std::{error::Error, slice, str::FromStr};
+use std::{error::Error, str::FromStr};
 
 use pulsevm_crypto::FixedBytes;
 use pulsevm_ffi::CxxDigest;
@@ -94,7 +94,7 @@ impl TryFrom<Vec<u8>> for Id {
 
 impl From<&CxxDigest> for Id {
     fn from(digest: &CxxDigest) -> Self {
-        let hash: &[u8] = digest.get_data();
+        let hash: &[u8] = digest.as_slice();
         let hash32: &[u8; 32] = hash.try_into().unwrap();
         Id(FixedBytes(*hash32))
     }

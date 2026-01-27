@@ -1,4 +1,4 @@
-use jsonrpsee::types::{ErrorObject, ErrorObjectOwned};
+use jsonrpsee::types::ErrorObjectOwned;
 use std::error::Error;
 use thiserror::Error;
 use wasmer::RuntimeError;

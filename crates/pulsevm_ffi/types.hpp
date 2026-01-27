@@ -119,7 +119,7 @@ namespace pulsevm::chain {
          return *this;
       }
 
-      rust::Slice<const uint8_t> get_data() const {
+      rust::Slice<const uint8_t> as_slice() const {
          if (!this->data()) {
             return {};
          }

@@ -106,4 +106,50 @@ namespace pulsevm { namespace chain {
         return std::make_shared<CxxPublicKey>(std::move(pk));
     }
 
+    rust::Vec<uint8_t> packed_public_key_bytes(const fc::crypto::public_key& public_key) {
+        rust::Vec<uint8_t> out;
+        size_t sz = fc::raw::pack_size(public_key);
+        out.reserve(sz);
+        fc::datastream<char*> ds(reinterpret_cast<char*>(out.data()), sz);
+        fc::raw::pack(ds, public_key);
+        return out;
+    }
+
+    rust::Str public_key_to_string(const fc::crypto::public_key& public_key) {
+        std::string s = public_key.to_string(fc::yield_function_t());
+        return rust::Str(s.data(), s.size());
+    }
+
+    size_t public_key_num_bytes(const fc::crypto::public_key& public_key) {
+        return fc::raw::pack_size(public_key);
+    }
+
+    rust::Str signature_to_string(const fc::crypto::signature& signature) {
+        std::string s = signature.to_string(fc::yield_function_t());
+        return rust::Str(s.data(), s.size());
+    }
+
+    size_t signature_num_bytes(const fc::crypto::signature& signature) {
+        return fc::raw::pack_size(signature);
+    }
+
+    rust::Vec<uint8_t> packed_signature_bytes(const fc::crypto::signature& signature) {
+        rust::Vec<uint8_t> out;
+        size_t sz = fc::raw::pack_size(signature);
+        out.reserve(sz);
+        fc::datastream<char*> ds(reinterpret_cast<char*>(out.data()), sz);
+        fc::raw::pack(ds, signature);
+        return out;
+    }
+
+    rust::Slice<const uint8_t> get_digest_data(const CxxDigest& sha) {
+        if (!sha.data()) {
+            return {};
+        }
+        return rust::Slice<const uint8_t>(
+            reinterpret_cast<const uint8_t*>(sha.data()),
+            sha.data_size()
+        );
+    }
+
 }} // namespace pulsevm::chain

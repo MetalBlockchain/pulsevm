@@ -141,7 +141,7 @@ impl WasmRuntime {
                 let code_object = unsafe { &*code_object };
                 // Create a temporary store just for module compilation
                 let temp_store = Store::new(inner.engine.clone());
-                let module = Module::new(temp_store.engine(), code_object.get_code().get_data())
+                let module = Module::new(temp_store.engine(), code_object.get_code().as_slice())
                     .map_err(|e| ChainError::WasmRuntimeError(e.to_string()))?;
                 inner.code_cache.put(id, module);
             } else {

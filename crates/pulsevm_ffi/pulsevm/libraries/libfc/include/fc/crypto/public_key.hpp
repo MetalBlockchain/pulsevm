@@ -6,7 +6,6 @@
 #include <fc/reflect/reflect.hpp>
 #include <fc/reflect/variant.hpp>
 #include <fc/static_variant.hpp>
-#include <rust/cxx.h>
 
 namespace fc { namespace crypto {
    namespace config {
@@ -51,24 +50,6 @@ namespace fc { namespace crypto {
             }
 
             return 0;
-         }
-         
-         rust::Vec<uint8_t> packed_bytes() const {
-            rust::Vec<uint8_t> out;
-            size_t sz = fc::raw::pack_size(*this);
-            out.reserve(sz);
-            fc::datastream<char*> ds(reinterpret_cast<char*>(out.data()), sz);
-            fc::raw::pack(ds, *this);
-            return out;
-         }
-
-         rust::Str to_string_rust() const {
-            std::string s = to_string(fc::yield_function_t());
-            return rust::Str(s.data(), s.size());
-         }
-
-         size_t num_bytes() const {
-            return fc::raw::pack_size(*this);
          }
 
       private:

@@ -1,6 +1,5 @@
 use core::fmt;
 
-use pulsevm_proc_macros::{NumBytes, Read, Write};
 use pulsevm_serialization::{NumBytes, Read, ReadError, Write};
 use serde::{Deserialize, Serialize};
 

@@ -50,7 +50,7 @@ impl Eq for Signature {}
 
 impl Hash for Signature {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.inner.pack().hash(state);
+        self.inner.packed_bytes().hash(state);
     }
 }
 
@@ -107,7 +107,7 @@ impl Read for Signature {
 
 impl Write for Signature {
     fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), WriteError> {
-        let packed = self.inner.pack();
+        let packed = self.inner.packed_bytes();
         let end_pos = *pos + packed.len();
         if end_pos > bytes.len() {
             return Err(WriteError::NotEnoughSpace);

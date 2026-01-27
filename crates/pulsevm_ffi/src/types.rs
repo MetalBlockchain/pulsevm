@@ -70,7 +70,6 @@ pub mod ffi {
         pub fn get_max_action_return_value_size(self: &CxxChainConfig) -> u32;
 
         type CxxDigest;
-        pub fn get_data(self: &CxxDigest) -> &[u8];
         pub fn empty(self: &CxxDigest) -> bool;
 
         type CxxGenesisState;
@@ -83,19 +82,13 @@ pub mod ffi {
 
         type CxxPublicKey;
         pub fn cmp(self: &CxxPublicKey, other: &CxxPublicKey) -> i32;
-        pub fn packed_bytes(self: &CxxPublicKey) -> Vec<u8>;
-        pub fn to_string_rust(self: &CxxPublicKey) -> &str;
-        pub fn num_bytes(self: &CxxPublicKey) -> usize;
 
         type CxxSignature;
         pub fn cmp(self: &CxxSignature, other: &CxxSignature) -> i32;
-        pub fn pack(self: &CxxSignature) -> Vec<u8>;
-        pub fn to_string_rust(self: &CxxSignature) -> &str;
-        pub fn num_bytes(self: &CxxSignature) -> usize;
 
         type CxxSharedBlob;
-        pub fn get_data(self: &CxxSharedBlob) -> &[u8];
         pub fn size(self: &CxxSharedBlob) -> usize;
+        pub fn as_slice(self: &CxxSharedBlob) -> &[u8];
 
         type CxxTimePoint;
         pub fn time_since_epoch(self: &CxxTimePoint) -> &CxxMicroseconds;
@@ -136,6 +129,27 @@ pub mod ffi {
         pub fn get_public_key_from_private_key(
             private_key: &CxxPrivateKey,
         ) -> SharedPtr<CxxPublicKey>;
+        pub fn packed_public_key_bytes(
+            public_key: &CxxPublicKey,
+        ) -> Vec<u8>;
+        pub fn public_key_to_string(
+            public_key: &CxxPublicKey,
+        ) -> &str;
+        pub fn public_key_num_bytes(
+            public_key: &CxxPublicKey,
+        ) -> usize;
+        pub fn packed_signature_bytes(
+            signature: &CxxSignature,
+        ) -> Vec<u8>;
+        pub fn signature_to_string(
+            signature: &CxxSignature,
+        ) -> &str;
+        pub fn signature_num_bytes(
+            signature: &CxxSignature,
+        ) -> usize;
+        pub fn get_digest_data(
+            digest: &CxxDigest,
+        ) -> &[u8];
     }
 }
 
@@ -149,11 +163,15 @@ impl ffi::CxxDigest {
             ChainError::InternalError(format!("failed to create digest from data: {}", e))
         })
     }
+
+    pub fn as_slice(&self) -> &[u8] {
+        ffi::get_digest_data(self)
+    }
 }
 
 impl PartialEq for &ffi::CxxDigest {
     fn eq(&self, other: &Self) -> bool {
-        self.get_data() == other.get_data()
+        self.as_slice() == other.as_slice()
     }
 }
 
@@ -514,9 +532,37 @@ impl ffi::KeyWeight {
     }
 }
 
+impl ffi::CxxPublicKey {
+    pub fn packed_bytes(&self) -> Vec<u8> {
+        ffi::packed_public_key_bytes(self)
+    }
+
+    pub fn to_string_rust(&self) -> &str {
+        ffi::public_key_to_string(self)
+    }
+
+    pub fn num_bytes(&self) -> usize {
+        ffi::public_key_num_bytes(self)
+    }
+}
+
 impl ffi::CxxPrivateKey {
     pub fn get_public_key(&self) -> SharedPtr<ffi::CxxPublicKey> {
         ffi::get_public_key_from_private_key(self)
+    }
+}
+
+impl ffi::CxxSignature {
+    pub fn packed_bytes(&self) -> Vec<u8> {
+        ffi::packed_signature_bytes(self)
+    }
+
+    pub fn to_string_rust(&self) -> &str {
+        ffi::signature_to_string(self)
+    }
+
+    pub fn num_bytes(&self) -> usize {
+        ffi::signature_num_bytes(self)
     }
 }
 

@@ -3,9 +3,8 @@ use std::fmt::{self, Debug};
 use cxx::SharedPtr;
 use prost_types::Timestamp;
 use pulsevm_ffi::{CxxBlockTimestamp, CxxTimePoint};
-use pulsevm_proc_macros::{NumBytes, Read, Write};
 use pulsevm_serialization::{NumBytes, Read, ReadError, Write, WriteError};
-use pulsevm_time::{TimePointSec, milliseconds};
+use pulsevm_time::TimePointSec;
 use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
     de::{self, Visitor},

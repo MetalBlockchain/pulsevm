@@ -517,7 +517,7 @@ impl ApplyContext {
         if buffer.len() < copy_size {
             buffer.resize(copy_size, 0);
         }
-        buffer[..copy_size].copy_from_slice(&obj.get_value().get_data()[..copy_size]);
+        buffer[..copy_size].copy_from_slice(&obj.get_value().as_slice()[..copy_size]);
         Ok(copy_size as i32)
     }
 
