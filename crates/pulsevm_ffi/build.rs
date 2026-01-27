@@ -53,25 +53,7 @@ fn main() {
     // Compile everything into one library
     .compile("pulsevm_ffi");
 
-    println!("cargo:rustc-link-search=native={}", "/usr/local/lib");
-    println!("cargo:rustc-link-lib=pthread");
-    println!(
-        "cargo:rustc-link-search=native={}",
-        "/opt/homebrew/opt/zlib/lib"
-    );
-    println!("cargo:rustc-link-lib=z");
-    println!(
-        "cargo:rustc-link-search=native={}",
-        "/opt/homebrew/opt/boost@1.85/lib"
-    );
-    println!("cargo:rustc-link-lib=boost_system");
-    println!("cargo:rustc-link-lib=boost_chrono");
-    println!("cargo:rustc-link-lib=boost_iostreams");
-    println!("cargo:rustc-link-search=native={}", "/usr/local/lib");
-    println!("cargo:rustc-link-lib=static=bn256");
-    println!("cargo:rustc-link-lib=static=bscrypto");
-    println!("cargo:rustc-link-lib=static=secp256k1");
-    println!("cargo:rustc-link-lib=static=decrepit");
+    // Link to the built static libraries
     println!(
         "cargo:rustc-link-search=native={}",
         libraries_dest.join("lib").display()
@@ -79,7 +61,15 @@ fn main() {
     println!("cargo:rustc-link-lib=static=fc");
     println!("cargo:rustc-link-lib=static=chainbase");
     println!("cargo:rustc-link-lib=static=bls12-381");
+    println!("cargo:rustc-link-lib=static=decrepit");
+    println!("cargo:rustc-link-lib=static=bscrypto");
+    println!("cargo:rustc-link-lib=static=secp256k1");
+    println!("cargo:rustc-link-lib=static=boost_system");
 
     // C++ standard library
-    //println!("cargo:rustc-link-lib=c++");
+    if target.contains("apple") {
+        println!("cargo:rustc-link-lib=c++");
+    } else {
+        println!("cargo:rustc-link-lib=stdc++");
+    }
 }

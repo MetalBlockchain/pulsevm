@@ -34,7 +34,7 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y gcc-12 g++-12
+        run: sudo apt-get update && sudo apt-get install -y gcc-12 g++-12 libboost-all-dev
 
       - name: Build release artifact
         run: cargo build --release
