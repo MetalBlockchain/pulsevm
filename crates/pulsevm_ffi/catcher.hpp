@@ -1,5 +1,5 @@
 #pragma once
-#include "exceptions.hpp"
+#include <pulsevm/chain/exceptions.hpp>
 #include <rust/cxx.h>
 
 namespace rust {

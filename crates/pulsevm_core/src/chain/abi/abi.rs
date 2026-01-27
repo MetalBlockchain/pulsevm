@@ -116,9 +116,6 @@ impl AbiDefinition {
             }
         }
 
-        Err(ChainError::InvalidArgument(format!(
-            "table '{}' not found in ABI",
-            table_name
-        )))
+        Err(ChainError::InvalidArgument(format!("table '{}' not found in ABI", table_name)))
     }
 }

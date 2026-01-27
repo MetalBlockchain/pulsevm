@@ -13,12 +13,7 @@ pub struct ResourceUsage {
 }
 
 impl ResourceUsage {
-    pub fn new(
-        owner: Name,
-        cpu_usage: UsageAccumulator,
-        net_usage: UsageAccumulator,
-        ram_usage: u64,
-    ) -> Self {
+    pub fn new(owner: Name, cpu_usage: UsageAccumulator, net_usage: UsageAccumulator, ram_usage: u64) -> Self {
         ResourceUsage {
             owner,
             cpu_usage,

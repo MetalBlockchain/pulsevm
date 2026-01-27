@@ -18,9 +18,9 @@ impl Gossipable {
     where
         T: Write,
     {
-        let data = data.pack().map_err(|e| {
-            ChainError::NetworkError(format!("failed to serialize gossipable data: {}", e))
-        })?;
+        let data = data
+            .pack()
+            .map_err(|e| ChainError::NetworkError(format!("failed to serialize gossipable data: {}", e)))?;
 
         Ok(Gossipable {
             gossip_type,
@@ -32,9 +32,7 @@ impl Gossipable {
     where
         T: Read,
     {
-        T::read(&self.data.as_ref(), &mut 0).map_err(|e| {
-            ChainError::NetworkError(format!("failed to deserialize gossipable data: {}", e))
-        })
+        T::read(&self.data.as_ref(), &mut 0).map_err(|e| ChainError::NetworkError(format!("failed to deserialize gossipable data: {}", e)))
     }
 }
 
@@ -56,8 +54,7 @@ impl NetworkManager {
     }
 
     pub fn connected(&mut self, node_id: NodeId) {
-        self.connected_nodes
-            .insert(node_id, ConnectedNode { id: node_id });
+        self.connected_nodes.insert(node_id, ConnectedNode { id: node_id });
     }
 
     pub fn disconnected(&mut self, node_id: NodeId) {
@@ -69,21 +66,16 @@ impl NetworkManager {
     }
 
     pub async fn gossip(&self, gossipable: Gossipable) -> Result<(), ChainError> {
-        let mut client: AppSenderClient<tonic::transport::Channel> =
-            AppSenderClient::connect(format!("http://{}", self.server_address))
-                .await
-                .expect("failed to connect to appsender engine");
-        let msg = gossipable.pack().map_err(|e| {
-            ChainError::NetworkError(format!("failed to serialize gossipable: {}", e))
-        })?;
+        let mut client: AppSenderClient<tonic::transport::Channel> = AppSenderClient::connect(format!("http://{}", self.server_address))
+            .await
+            .expect("failed to connect to appsender engine");
+        let msg = gossipable
+            .pack()
+            .map_err(|e| ChainError::NetworkError(format!("failed to serialize gossipable: {}", e)))?;
 
         let result = client
             .send_app_gossip(Request::new(SendAppGossipMsg {
-                node_ids: self
-                    .connected_nodes
-                    .keys()
-                    .map(|id| id.0.to_vec())
-                    .collect(),
+                node_ids: self.connected_nodes.keys().map(|id| id.0.to_vec()).collect(),
                 validators: 3,
                 non_validators: 2,
                 peers: 5,
@@ -92,10 +84,7 @@ impl NetworkManager {
             .await;
 
         if result.is_err() {
-            return Err(ChainError::NetworkError(format!(
-                "failed to send gossip: {}",
-                result.unwrap_err()
-            )));
+            return Err(ChainError::NetworkError(format!("failed to send gossip: {}", result.unwrap_err())));
         }
 
         Ok(())

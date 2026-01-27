@@ -38,13 +38,10 @@ impl PackedTransaction {
     ) -> Result<Self, ChainError> {
         let trx_bytes = maybe_decompress(compression, packed_trx.as_ref())?;
         let cfd_bytes = maybe_decompress(compression, packed_context_free_data.as_ref())?;
-        let unpacked_trx = Transaction::read(trx_bytes.as_slice(), &mut 0).map_err(|e| {
-            ChainError::SerializationError(format!("failed to unpack transaction: {}", e))
-        })?;
-        let unpacked_context_free_data =
-            Vec::<Bytes>::read(cfd_bytes.as_slice(), &mut 0).map_err(|e| {
-                ChainError::SerializationError(format!("failed to unpack context free data: {}", e))
-            })?;
+        let unpacked_trx = Transaction::read(trx_bytes.as_slice(), &mut 0)
+            .map_err(|e| ChainError::SerializationError(format!("failed to unpack transaction: {}", e)))?;
+        let unpacked_context_free_data = Vec::<Bytes>::read(cfd_bytes.as_slice(), &mut 0)
+            .map_err(|e| ChainError::SerializationError(format!("failed to unpack context free data: {}", e)))?;
         let trx_id: Id = unpacked_trx.id()?;
 
         Ok(Self {
@@ -53,11 +50,7 @@ impl PackedTransaction {
             packed_context_free_data,
             packed_trx,
 
-            unpacked_trx: SignedTransaction::new(
-                unpacked_trx,
-                signatures,
-                unpacked_context_free_data,
-            ),
+            unpacked_trx: SignedTransaction::new(unpacked_trx, signatures, unpacked_context_free_data),
             trx_id: trx_id,
         })
     }
@@ -101,20 +94,19 @@ impl PackedTransaction {
 
     #[inline]
     pub fn from_signed_transaction(trx: SignedTransaction) -> Result<Self, ChainError> {
-        let trx_id = trx.transaction().id().map_err(|e| {
-            ChainError::SerializationError(format!("failed to get transaction ID: {}", e))
-        })?;
+        let trx_id = trx
+            .transaction()
+            .id()
+            .map_err(|e| ChainError::SerializationError(format!("failed to get transaction ID: {}", e)))?;
 
         Ok(Self {
             signatures: trx.signatures().clone(),
-            compression: TransactionCompression::None, // Default to no compression for now
+            compression: TransactionCompression::None,  // Default to no compression for now
             packed_context_free_data: Bytes::default(), // No context-free data for now
             packed_trx: trx
                 .transaction()
                 .pack()
-                .map_err(|e| {
-                    ChainError::SerializationError(format!("failed to pack transaction: {}", e))
-                })?
+                .map_err(|e| ChainError::SerializationError(format!("failed to pack transaction: {}", e)))?
                 .into(),
 
             unpacked_trx: trx,
@@ -126,10 +118,7 @@ impl PackedTransaction {
 impl NumBytes for PackedTransaction {
     #[inline]
     fn num_bytes(&self) -> usize {
-        self.signatures.num_bytes()
-            + self.compression.num_bytes()
-            + self.packed_context_free_data.num_bytes()
-            + self.packed_trx.num_bytes()
+        self.signatures.num_bytes() + self.compression.num_bytes() + self.packed_context_free_data.num_bytes() + self.packed_trx.num_bytes()
     }
 }
 
@@ -151,13 +140,7 @@ impl Read for PackedTransaction {
         let compression = TransactionCompression::read(data, pos)?;
         let packed_context_free_data = Bytes::read(data, pos)?;
         let packed_trx = Bytes::read(data, pos)?;
-        PackedTransaction::new(
-            signatures,
-            compression,
-            packed_context_free_data,
-            packed_trx,
-        )
-        .map_err(|_| ReadError::ParseError)
+        PackedTransaction::new(signatures, compression, packed_context_free_data, packed_trx).map_err(|_| ReadError::ParseError)
     }
 }
 
@@ -177,10 +160,7 @@ impl Serialize for PackedTransaction {
 }
 
 #[inline]
-fn maybe_decompress(
-    compression: TransactionCompression,
-    data: &[u8],
-) -> Result<Vec<u8>, ChainError> {
+fn maybe_decompress(compression: TransactionCompression, data: &[u8]) -> Result<Vec<u8>, ChainError> {
     match compression {
         TransactionCompression::None => Ok(data.to_vec()),
         TransactionCompression::Zlib => {
@@ -189,9 +169,9 @@ fn maybe_decompress(
             }
             let mut decoder = ZlibDecoder::new(data);
             let mut out = Vec::new();
-            decoder.read_to_end(&mut out).map_err(|e| {
-                ChainError::SerializationError(format!("zlib decompress failed: {e}"))
-            })?;
+            decoder
+                .read_to_end(&mut out)
+                .map_err(|e| ChainError::SerializationError(format!("zlib decompress failed: {e}")))?;
             Ok(out)
         }
     }

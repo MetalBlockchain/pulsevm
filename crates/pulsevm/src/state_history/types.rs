@@ -1,7 +1,11 @@
 use std::collections::HashMap;
 
 use pulsevm_core::{
-    account::AccountDelta, crypto::Signature, id::Id, name::Name, transaction::{Action, TransactionStatus, TransactionTrace}
+    account::AccountDelta,
+    crypto::Signature,
+    id::Id,
+    name::Name,
+    transaction::{Action, TransactionStatus, TransactionTrace},
 };
 use pulsevm_crypto::{Bytes, Digest};
 use pulsevm_proc_macros::{NumBytes, Read, Write, name};
@@ -208,10 +212,7 @@ impl From<&TransactionTrace> for TransactionTraceV0 {
                         auth_sequence: receipt
                             .auth_sequence
                             .iter()
-                            .map(|(k, v)| AccountAuthSequence {
-                                account: *k,
-                                sequence: *v,
-                            })
+                            .map(|(k, v)| AccountAuthSequence { account: *k, sequence: *v })
                             .collect(),
                         code_sequence: VarUint32(receipt.code_sequence),
                         abi_sequence: VarUint32(receipt.abi_sequence),

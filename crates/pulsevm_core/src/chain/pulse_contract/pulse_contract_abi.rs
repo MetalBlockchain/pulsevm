@@ -1,8 +1,7 @@
 use crate::chain::{
     abi::{AbiActionDefinition, AbiDefinition, AbiStructDefinition, AbiTypeDefinition},
     config::{
-        DELETEAUTH_NAME, LINKAUTH_NAME, NEWACCOUNT_NAME, ONBLOCK_NAME, ONERROR_NAME, SETABI_NAME,
-        SETCODE_NAME, UNLINKAUTH_NAME, UPDATEAUTH_NAME,
+        DELETEAUTH_NAME, LINKAUTH_NAME, NEWACCOUNT_NAME, ONBLOCK_NAME, ONERROR_NAME, SETABI_NAME, SETCODE_NAME, UNLINKAUTH_NAME, UPDATEAUTH_NAME,
     },
 };
 
@@ -54,11 +53,7 @@ pub fn get_pulse_contract_abi() -> AbiDefinition {
                 fields: vec![
                     ("context_free_actions".to_owned(), "action[]".to_owned()).into(),
                     ("actions".to_owned(), "action[]".to_owned()).into(),
-                    (
-                        "transaction_extensions".to_owned(),
-                        "extension[]".to_owned(),
-                    )
-                        .into(),
+                    ("transaction_extensions".to_owned(), "extension[]".to_owned()).into(),
                 ],
             },
             AbiStructDefinition {
@@ -122,11 +117,7 @@ pub fn get_pulse_contract_abi() -> AbiDefinition {
                 fields: vec![
                     ("threshold".to_owned(), "uint32".to_owned()).into(),
                     ("keys".to_owned(), "key_weight[]".to_owned()).into(),
-                    (
-                        "accounts".to_owned(),
-                        "permission_level_weight[]".to_owned(),
-                    )
-                        .into(),
+                    ("accounts".to_owned(), "permission_level_weight[]".to_owned()).into(),
                     ("waits".to_owned(), "wait_weight[]".to_owned()).into(),
                 ],
             },

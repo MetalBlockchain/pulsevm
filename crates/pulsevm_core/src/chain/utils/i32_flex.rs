@@ -38,30 +38,21 @@ impl<'de> Deserialize<'de> for I32Flex {
             }
 
             fn visit_i64<E: DeError>(self, v: i64) -> Result<Self::Value, E> {
-                i32::try_from(v)
-                    .map(I32Flex)
-                    .map_err(|_| E::custom("out of range for i32"))
+                i32::try_from(v).map(I32Flex).map_err(|_| E::custom("out of range for i32"))
             }
             fn visit_u64<E: DeError>(self, v: u64) -> Result<Self::Value, E> {
-                i32::try_from(v)
-                    .map(I32Flex)
-                    .map_err(|_| E::custom("out of range for i32"))
+                i32::try_from(v).map(I32Flex).map_err(|_| E::custom("out of range for i32"))
             }
             fn visit_f64<E: DeError>(self, v: f64) -> Result<Self::Value, E> {
                 if v.is_finite() && v.fract() == 0.0 {
                     let i = v as i64;
-                    i32::try_from(i)
-                        .map(I32Flex)
-                        .map_err(|_| E::custom("out of range for i32"))
+                    i32::try_from(i).map(I32Flex).map_err(|_| E::custom("out of range for i32"))
                 } else {
                     Err(E::custom("expected an integer-valued number"))
                 }
             }
             fn visit_str<E: DeError>(self, s: &str) -> Result<Self::Value, E> {
-                s.trim()
-                    .parse::<i32>()
-                    .map(I32Flex)
-                    .map_err(|_| E::custom("invalid i32 string"))
+                s.trim().parse::<i32>().map(I32Flex).map_err(|_| E::custom("invalid i32 string"))
             }
             fn visit_string<E: DeError>(self, s: String) -> Result<Self::Value, E> {
                 self.visit_str(&s)

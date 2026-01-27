@@ -99,12 +99,7 @@ pub struct TransactionReceipt {
 }
 
 impl TransactionReceipt {
-    pub fn new(
-        status: TransactionStatus,
-        cpu_usage_us: u32,
-        net_usage_words: VarUint32,
-        trx_id: Id,
-    ) -> Self {
+    pub fn new(status: TransactionStatus, cpu_usage_us: u32, net_usage_words: VarUint32, trx_id: Id) -> Self {
         TransactionReceipt {
             header: TransactionReceiptHeader {
                 status,

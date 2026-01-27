@@ -1,5 +1,3 @@
-use prost_types::Timestamp;
-
 mod io {
     pub mod prometheus {
         pub mod client {

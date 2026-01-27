@@ -34,10 +34,9 @@ impl BlockTimer {
 
     pub async fn request_block_build(&self) {
         let server_address = self.server_address.read().await;
-        let mut client: MessengerClient<tonic::transport::Channel> =
-            MessengerClient::connect(format!("http://{}", server_address.as_ref().unwrap()))
-                .await
-                .expect("failed to connect to messenger engine");
+        let mut client: MessengerClient<tonic::transport::Channel> = MessengerClient::connect(format!("http://{}", server_address.as_ref().unwrap()))
+            .await
+            .expect("failed to connect to messenger engine");
 
         let _ = client
             .notify(Request::new(NotifyRequest {

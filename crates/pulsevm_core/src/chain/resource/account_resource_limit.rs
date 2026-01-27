@@ -16,13 +16,7 @@ pub struct AccountResourceLimit {
 }
 
 impl AccountResourceLimit {
-    pub fn new(
-        used: i64,
-        available: i64,
-        max: i64,
-        last_usage_update_time: BlockTimestamp,
-        current_used: i64,
-    ) -> Self {
+    pub fn new(used: i64, available: i64, max: i64, last_usage_update_time: BlockTimestamp, current_used: i64) -> Self {
         Self {
             used,
             available,

@@ -21,11 +21,7 @@ pub struct SignedTransaction {
 
 impl SignedTransaction {
     #[inline]
-    pub fn new(
-        transaction: Transaction,
-        signatures: HashSet<Signature>,
-        context_free_data: Vec<Bytes>,
-    ) -> Self {
+    pub fn new(transaction: Transaction, signatures: HashSet<Signature>, context_free_data: Vec<Bytes>) -> Self {
         Self {
             transaction,
             signatures,
@@ -47,9 +43,7 @@ impl SignedTransaction {
     #[inline]
     pub fn recovered_keys(&self, chain_id: &Id) -> Result<HashSet<PublicKey>, ChainError> {
         let mut recovered_keys: HashSet<PublicKey> = HashSet::new();
-        let digest = self
-            .transaction
-            .signing_digest(chain_id, &self.context_free_data)?;
+        let digest = self.transaction.signing_digest(chain_id, &self.context_free_data)?;
 
         for signature in self.signatures.iter() {
             let public_key = signature
@@ -63,9 +57,7 @@ impl SignedTransaction {
 
     #[inline]
     pub fn sign(mut self, private_key: &PrivateKey, chain_id: &Id) -> Result<Self, ChainError> {
-        let digest = self
-            .transaction
-            .signing_digest(chain_id, &self.context_free_data)?;
+        let digest = self.transaction.signing_digest(chain_id, &self.context_free_data)?;
         let signature = private_key.sign(&digest.into())?;
         self.signatures.insert(signature);
         Ok(self)
@@ -73,17 +65,13 @@ impl SignedTransaction {
 }
 
 #[inline]
-pub fn signing_digest(
-    chain_id: &Id,
-    trx_bytes: &Vec<u8>,
-    cfd_bytes: &Vec<Bytes>,
-) -> Result<[u8; 32], ChainError> {
+pub fn signing_digest(chain_id: &Id, trx_bytes: &Vec<u8>, cfd_bytes: &Vec<Bytes>) -> Result<[u8; 32], ChainError> {
     let cf_hash = if cfd_bytes.is_empty() {
         [0u8; 32]
     } else {
-        let cfd_bytes = cfd_bytes.pack().map_err(|e| {
-            ChainError::SerializationError(format!("failed to pack transaction: {}", e))
-        })?;
+        let cfd_bytes = cfd_bytes
+            .pack()
+            .map_err(|e| ChainError::SerializationError(format!("failed to pack transaction: {}", e)))?;
         sha2::Sha256::digest(&cfd_bytes).into()
     };
 

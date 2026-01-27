@@ -38,15 +38,9 @@ impl fmt::Display for WriteError {
 impl From<WriteError> for ChainError {
     fn from(error: WriteError) -> ChainError {
         match error {
-            WriteError::NotEnoughSpace => {
-                ChainError::SerializationError("not enough space to write".to_string())
-            }
-            WriteError::TryFromIntError => {
-                ChainError::SerializationError("failed to parse integer".to_string())
-            }
-            WriteError::NotEnoughBytes => {
-                ChainError::SerializationError("not enough bytes to read".to_string())
-            }
+            WriteError::NotEnoughSpace => ChainError::SerializationError("not enough space to write".to_string()),
+            WriteError::TryFromIntError => ChainError::SerializationError("failed to parse integer".to_string()),
+            WriteError::NotEnoughBytes => ChainError::SerializationError("not enough bytes to read".to_string()),
         }
     }
 }
@@ -88,14 +82,10 @@ impl Error for ReadError {}
 impl From<ReadError> for ChainError {
     fn from(error: ReadError) -> ChainError {
         match error {
-            ReadError::NotEnoughBytes => {
-                ChainError::SerializationError("not enough bytes to read".to_string())
-            }
+            ReadError::NotEnoughBytes => ChainError::SerializationError("not enough bytes to read".to_string()),
             ReadError::ParseError => ChainError::SerializationError("parse error".to_string()),
             ReadError::Overflow => ChainError::SerializationError("integer overflow".to_string()),
-            ReadError::CustomError(msg) => {
-                ChainError::SerializationError(format!("read error: {}", msg))
-            }
+            ReadError::CustomError(msg) => ChainError::SerializationError(format!("read error: {}", msg)),
         }
     }
 }

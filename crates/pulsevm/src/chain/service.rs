@@ -1,8 +1,4 @@
-use std::{
-    collections::HashSet,
-    str::FromStr,
-    sync::Arc,
-};
+use std::{collections::HashSet, str::FromStr, sync::Arc};
 
 use jsonrpsee::{proc_macros::rpc, types::ErrorObjectOwned};
 use pulsevm_core::{
@@ -26,10 +22,7 @@ use tokio::sync::RwLock;
 use tonic::async_trait;
 
 use crate::{
-    api::{
-        GetAccountResponse, GetCodeHashResponse, GetInfoResponse, GetRawABIResponse,
-        GetTableRowsResponse, IssueTxResponse,
-    },
+    api::{GetAccountResponse, GetCodeHashResponse, GetInfoResponse, GetRawABIResponse, GetTableRowsResponse, IssueTxResponse},
     chain::{Gossipable, NetworkManager},
 };
 
@@ -48,32 +41,19 @@ pub trait Rpc {
     async fn get_abi(&self, account_name: Name) -> Result<AbiDefinition, ErrorObjectOwned>;
 
     #[method(name = "pulsevm.getAccount")]
-    async fn get_account(&self, account_name: Name)
-    -> Result<GetAccountResponse, ErrorObjectOwned>;
+    async fn get_account(&self, account_name: Name) -> Result<GetAccountResponse, ErrorObjectOwned>;
 
     #[method(name = "pulsevm.getBlock")]
     async fn get_block(&self, block_num_or_id: String) -> Result<SignedBlock, ErrorObjectOwned>;
 
     #[method(name = "pulsevm.getCodeHash")]
-    async fn get_code_hash(
-        &self,
-        account_name: Name,
-    ) -> Result<GetCodeHashResponse, ErrorObjectOwned>;
+    async fn get_code_hash(&self, account_name: Name) -> Result<GetCodeHashResponse, ErrorObjectOwned>;
 
     #[method(name = "pulsevm.getCurrencyBalance")]
-    async fn get_currency_balance(
-        &self,
-        code: Name,
-        account: Name,
-        symbol: Option<String>,
-    ) -> Result<Value, ErrorObjectOwned>;
+    async fn get_currency_balance(&self, code: Name, account: Name, symbol: Option<String>) -> Result<Value, ErrorObjectOwned>;
 
     #[method(name = "pulsevm.getCurrencyStats")]
-    async fn get_currency_stats(
-        &self,
-        code: Name,
-        symbol: String,
-    ) -> Result<Value, ErrorObjectOwned>;
+    async fn get_currency_stats(&self, code: Name, symbol: String) -> Result<Value, ErrorObjectOwned>;
 
     #[method(name = "pulsevm.getInfo")]
     async fn get_info(&self) -> Result<GetInfoResponse, ErrorObjectOwned>;
@@ -82,8 +62,7 @@ pub trait Rpc {
     async fn get_raw_abi(&self, account_name: Name) -> Result<GetRawABIResponse, ErrorObjectOwned>;
 
     #[method(name = "pulsevm.getRawBlock")]
-    async fn get_raw_block(&self, block_num_or_id: String)
-    -> Result<SignedBlock, ErrorObjectOwned>;
+    async fn get_raw_block(&self, block_num_or_id: String) -> Result<SignedBlock, ErrorObjectOwned>;
 
     #[method(name = "pulsevm.getTableRows")]
     async fn get_table_rows(
@@ -110,11 +89,7 @@ pub struct RpcService {
 }
 
 impl RpcService {
-    pub fn new(
-        mempool: Arc<RwLock<Mempool>>,
-        controller: Arc<RwLock<Controller>>,
-        network_manager: Arc<RwLock<NetworkManager>>,
-    ) -> Self {
+    pub fn new(mempool: Arc<RwLock<Mempool>>, controller: Arc<RwLock<Controller>>, network_manager: Arc<RwLock<NetworkManager>>) -> Self {
         RpcService {
             mempool,
             controller,
@@ -122,10 +97,7 @@ impl RpcService {
         }
     }
 
-    pub async fn handle_api_request(
-        &self,
-        request_body: &str,
-    ) -> Result<String, serde_json::Error> {
+    pub async fn handle_api_request(&self, request_body: &str) -> Result<String, serde_json::Error> {
         // Make sure `RpcService` implements your API trait
         let module = self.clone().into_rpc();
 
@@ -143,9 +115,8 @@ impl RpcServer for RpcService {
         let controller = self.controller.read().await;
         let db = controller.database();
         let code_account = db.get_account(account_name.as_u64())?;
-        let abi = AbiDefinition::read(code_account.get_abi().as_slice(), &mut 0).map_err(|e| {
-            ErrorObjectOwned::owned(400, "abi_error", Some(format!("failed to read ABI: {}", e)))
-        })?;
+        let abi = AbiDefinition::read(code_account.get_abi().as_slice(), &mut 0)
+            .map_err(|e| ErrorObjectOwned::owned(400, "abi_error", Some(format!("failed to read ABI: {}", e))))?;
         Ok(abi)
     }
 
@@ -161,18 +132,10 @@ impl RpcServer for RpcService {
         result.privileged = accnt_metadata_obj.is_privileged();
         result.last_code_update = accnt_metadata_obj.get_last_code_update().into();
         result.created = accnt_obj.get_creation_date().into();
-        result.net_limit =
-            ResourceLimitsManager::get_account_net_limit_ex(&db, &name, None)?;
-        result.cpu_limit =
-            ResourceLimitsManager::get_account_cpu_limit_ex(&db, &name, None)?;
+        result.net_limit = ResourceLimitsManager::get_account_net_limit_ex(&db, &name, None)?;
+        result.cpu_limit = ResourceLimitsManager::get_account_cpu_limit_ex(&db, &name, None)?;
 
-        ResourceLimitsManager::get_account_limits(
-            &db,
-            &name,
-            &mut result.ram_quota,
-            &mut result.net_weight,
-            &mut result.cpu_weight,
-        )?;
+        ResourceLimitsManager::get_account_limits(&db, &name, &mut result.ram_quota, &mut result.net_weight, &mut result.cpu_weight)?;
 
         result.ram_usage = ResourceLimitsManager::get_account_ram_usage(&db, &name)?;
 
@@ -185,10 +148,7 @@ impl RpcServer for RpcService {
         return self.get_raw_block(block_num_or_id).await;
     }
 
-    async fn get_code_hash(
-        &self,
-        account_name: Name,
-    ) -> Result<GetCodeHashResponse, ErrorObjectOwned> {
+    async fn get_code_hash(&self, account_name: Name) -> Result<GetCodeHashResponse, ErrorObjectOwned> {
         let controller = self.controller.read().await;
         let db = controller.database();
         let accnt_obj = db.get_account_metadata(account_name.as_u64())?;
@@ -199,12 +159,7 @@ impl RpcServer for RpcService {
         })
     }
 
-    async fn get_currency_balance(
-        &self,
-        code: Name,
-        account: Name,
-        symbol: Option<String>,
-    ) -> Result<Value, ErrorObjectOwned> {
+    async fn get_currency_balance(&self, code: Name, account: Name, symbol: Option<String>) -> Result<Value, ErrorObjectOwned> {
         let controller = self.controller.read().await;
         let db = controller.database();
         let mut results: Vec<String> = Vec::new();
@@ -212,16 +167,10 @@ impl RpcServer for RpcService {
 
         // TODO: Finalize symbol handling
 
-        serde_json::to_value(results).map_err(|e| {
-            ErrorObjectOwned::owned(500, "serialization_error", Some(format!("{}", e)))
-        })
+        serde_json::to_value(results).map_err(|e| ErrorObjectOwned::owned(500, "serialization_error", Some(format!("{}", e))))
     }
 
-    async fn get_currency_stats(
-        &self,
-        code: Name,
-        symbol: String,
-    ) -> Result<Value, ErrorObjectOwned> {
+    async fn get_currency_stats(&self, code: Name, symbol: String) -> Result<Value, ErrorObjectOwned> {
         let controller = self.controller.read().await;
         let database = controller.database();
 
@@ -254,8 +203,7 @@ impl RpcServer for RpcService {
             server_version_string: "v5.0.3".to_owned(),
             fork_db_head_block_id: head_block.id(),
             fork_db_head_block_num: head_block.block_num(),
-            server_full_version_string: "v5.0.3-d133c6413ce8ce2e96096a0513ec25b4a8dbe837"
-                .to_owned(), // Mimic EOS here
+            server_full_version_string: "v5.0.3-d133c6413ce8ce2e96096a0513ec25b4a8dbe837".to_owned(), // Mimic EOS here
             total_cpu_weight: total_cpu_weight,
             total_net_weight: total_net_weight,
             earliest_available_block_num: 1,
@@ -283,10 +231,7 @@ impl RpcServer for RpcService {
         })
     }
 
-    async fn get_raw_block(
-        &self,
-        block_num_or_id: String,
-    ) -> Result<SignedBlock, ErrorObjectOwned> {
+    async fn get_raw_block(&self, block_num_or_id: String) -> Result<SignedBlock, ErrorObjectOwned> {
         let controller = self.controller.clone();
         let controller = controller.read().await;
 
@@ -296,11 +241,7 @@ impl RpcServer for RpcService {
             match block {
                 Some(b) => return Ok(b),
                 None => {
-                    return Err(ErrorObjectOwned::owned(
-                        404,
-                        "block_not_found",
-                        Some(format!("block {} not found", n)),
-                    ));
+                    return Err(ErrorObjectOwned::owned(404, "block_not_found", Some(format!("block {} not found", n))));
                 }
             }
         } else if let Ok(id) = Id::from_str(block_num_or_id.as_str()) {
@@ -309,11 +250,7 @@ impl RpcServer for RpcService {
             match block {
                 Some(b) => return Ok(b),
                 None => {
-                    return Err(ErrorObjectOwned::owned(
-                        404,
-                        "block_not_found",
-                        Some(format!("block {} not found", id)),
-                    ));
+                    return Err(ErrorObjectOwned::owned(404, "block_not_found", Some(format!("block {} not found", id))));
                 }
             }
         }
@@ -332,12 +269,7 @@ impl RpcServer for RpcService {
         packed_context_free_data: Bytes,
         packed_trx: Bytes,
     ) -> Result<IssueTxResponse, ErrorObjectOwned> {
-        let packed_trx = PackedTransaction::new(
-            signatures,
-            compression,
-            packed_context_free_data,
-            packed_trx,
-        )?;
+        let packed_trx = PackedTransaction::new(signatures, compression, packed_context_free_data, packed_trx)?;
 
         // Run transaction and revert it
         let mut controller = self.controller.write().await;
@@ -378,25 +310,15 @@ impl RpcServer for RpcService {
         return Err(ErrorObjectOwned::owned(
             400,
             "secondary_index_not_supported",
-            Some(format!(
-                "secondary index not supported for table: {}",
-                table
-            )),
+            Some(format!("secondary index not supported for table: {}", table)),
         ));
     }
 }
 
-fn get_table_index_name(
-    table: Name,
-    index_position: u16,
-    primary: &mut bool,
-) -> Result<u64, ChainError> {
+fn get_table_index_name(table: Name, index_position: u16, primary: &mut bool) -> Result<u64, ChainError> {
     let table = table.as_u64();
     let mut index = table & 0xFFFFFFFFFFFFFFF0u64;
-    pulse_assert(
-        index == table,
-        ChainError::TransactionError(format!("unsupported table name: {}", table)),
-    )?;
+    pulse_assert(index == table, ChainError::TransactionError(format!("unsupported table name: {}", table)))?;
 
     *primary = true; // TODO: handle primary vs secondary index
     let pos = 0u64;

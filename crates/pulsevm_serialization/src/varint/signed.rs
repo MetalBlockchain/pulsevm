@@ -142,55 +142,25 @@ mod tests {
         p = 0;
         assert_eq!(VarInt32::read(&[0x40], &mut p).unwrap(), VarInt32(-64));
         p = 0;
-        assert_eq!(
-            VarInt32::read(&[0xFF, 0x00], &mut p).unwrap(),
-            VarInt32(127)
-        );
+        assert_eq!(VarInt32::read(&[0xFF, 0x00], &mut p).unwrap(), VarInt32(127));
         p = 0;
-        assert_eq!(
-            VarInt32::read(&[0x80, 0x7F], &mut p).unwrap(),
-            VarInt32(-128)
-        );
+        assert_eq!(VarInt32::read(&[0x80, 0x7F], &mut p).unwrap(), VarInt32(-128));
         p = 0;
-        assert_eq!(
-            VarInt32::read(&[0xFF, 0x3F], &mut p).unwrap(),
-            VarInt32(8191)
-        );
+        assert_eq!(VarInt32::read(&[0xFF, 0x3F], &mut p).unwrap(), VarInt32(8191));
         p = 0;
-        assert_eq!(
-            VarInt32::read(&[0x80, 0x40], &mut p).unwrap(),
-            VarInt32(-8192)
-        );
+        assert_eq!(VarInt32::read(&[0x80, 0x40], &mut p).unwrap(), VarInt32(-8192));
         p = 0;
-        assert_eq!(
-            VarInt32::read(&[0xFF, 0xFF, 0x3F], &mut p).unwrap(),
-            VarInt32(1_048_575)
-        );
+        assert_eq!(VarInt32::read(&[0xFF, 0xFF, 0x3F], &mut p).unwrap(), VarInt32(1_048_575));
         p = 0;
-        assert_eq!(
-            VarInt32::read(&[0x80, 0x80, 0x40], &mut p).unwrap(),
-            VarInt32(-1_048_576)
-        );
+        assert_eq!(VarInt32::read(&[0x80, 0x80, 0x40], &mut p).unwrap(), VarInt32(-1_048_576));
         p = 0;
-        assert_eq!(
-            VarInt32::read(&[0xFF, 0xFF, 0xFF, 0x3F], &mut p).unwrap(),
-            VarInt32(134_217_727)
-        );
+        assert_eq!(VarInt32::read(&[0xFF, 0xFF, 0xFF, 0x3F], &mut p).unwrap(), VarInt32(134_217_727));
         p = 0;
-        assert_eq!(
-            VarInt32::read(&[0x80, 0x80, 0x80, 0x40], &mut p).unwrap(),
-            VarInt32(-134_217_728)
-        );
+        assert_eq!(VarInt32::read(&[0x80, 0x80, 0x80, 0x40], &mut p).unwrap(), VarInt32(-134_217_728));
         p = 0;
-        assert_eq!(
-            VarInt32::read(&[0xFF, 0xFF, 0xFF, 0xFF, 0x07], &mut p).unwrap(),
-            VarInt32(core::i32::MAX)
-        );
+        assert_eq!(VarInt32::read(&[0xFF, 0xFF, 0xFF, 0xFF, 0x07], &mut p).unwrap(), VarInt32(core::i32::MAX));
         p = 0;
-        assert_eq!(
-            VarInt32::read(&[0x80, 0x80, 0x80, 0x80, 0x78], &mut p).unwrap(),
-            VarInt32(core::i32::MIN)
-        );
+        assert_eq!(VarInt32::read(&[0x80, 0x80, 0x80, 0x80, 0x78], &mut p).unwrap(), VarInt32(core::i32::MIN));
     }
 
     #[test]

@@ -1,36 +1,22 @@
 // chainbase_bridge.hpp - C++ bridge header for CXX
 #pragma once
 #include <chainbase/chainbase.hpp>
-#include "authority.hpp"
-#include "code_object.hpp"
-#include "block.hpp"
-#include "block_timestamp.hpp"
-#include "multi_index_includes.hpp"
-#include "resource_limits.hpp"
-#include "resource_limits_private.hpp"
-#include "account_object.hpp"
-#include "permission_link_object.hpp"
-#include "global_property_object.hpp"
-#include "protocol_state_object.hpp"
-#include "database_header_object.hpp"
-#include "genesis_state.hpp"
-#include "pulse_abi.hpp"
+#include <pulsevm/chain/pulse_contract_abi_bin.hpp>
+#include <rust/cxx.h>
+
+#include "type_defs.hpp"
 #include "iterator_cache.hpp"
 #include "objects.hpp"
-#include "name.hpp"
-#include "types.hpp"
-#include "type_defs.hpp"
-#include <pulsevm_ffi/src/types.rs.h>
+
 #include <memory>
-#include <rust/cxx.h>
 #include <string>
+#include <filesystem>
 
 namespace pulsevm { namespace chain {
 
-using UndoSession = ::chainbase::database::session;
-
-struct cpu_limit_result;
-struct net_limit_result;
+    struct Authority; // Forward declaration
+    struct CpuLimitResult; // Forward declaration
+    struct NetLimitResult; // Forward declaration
 
 class database_wrapper : public chainbase::database {
 public:
@@ -363,7 +349,7 @@ public:
         return state.total_net_weight;
     }
 
-    cpu_limit_result get_account_cpu_limit(uint64_t name, uint32_t greylist_limit = config::maximum_elastic_resource_multiplier) const;
+    CpuLimitResult get_account_cpu_limit(uint64_t name, uint32_t greylist_limit) const;
 
     std::pair<resource_limits::account_resource_limit, bool> get_account_cpu_limit_ex( uint64_t account_name, uint32_t greylist_limit = config::maximum_elastic_resource_multiplier, const std::optional<block_timestamp_type>& current_time = {}) const {
         const auto& state = this->get<resource_limits::resource_limits_state_object>();
@@ -419,7 +405,7 @@ public:
         return {arl, greylisted};
     }
 
-    net_limit_result get_account_net_limit(u_int64_t name, uint32_t greylist_limit = config::maximum_elastic_resource_multiplier) const;
+    NetLimitResult get_account_net_limit(uint64_t name, uint32_t greylist_limit) const;
 
     std::pair<resource_limits::account_resource_limit, bool> get_account_net_limit_ex( u_int64_t account_name, uint32_t greylist_limit = config::maximum_elastic_resource_multiplier, const std::optional<block_timestamp_type>& current_time = {}) const {
         const auto& config = this->get<resource_limits::resource_limits_config_object>();
@@ -737,41 +723,7 @@ public:
         uint64_t parent,
         const Authority& a,
         const time_point& creation_time
-    ) {
-        authority auth;
-        auth.threshold = a.threshold;
-        auth.keys.reserve(a.keys.size());
-        auth.accounts.reserve(a.accounts.size());
-        auth.waits.reserve(a.waits.size());
-        for (const auto& k : a.keys) {
-            auth.keys.emplace_back( key_weight{ *k.key, k.weight } );
-        }
-        for (const auto& ac : a.accounts) {
-            auth.accounts.emplace_back( permission_level_weight{ { name(ac.permission.actor), name(ac.permission.permission) }, ac.weight } );
-        }
-        for (const auto& w : a.waits) {
-            auth.waits.emplace_back( wait_weight{ w.wait_sec, w.weight } );
-        }
-
-        for(const key_weight& k: auth.keys)
-            EOS_ASSERT(k.key.which() < this->get<protocol_state_object>().num_supported_key_types, unactivated_key_type,
-            "Unactivated key type used when creating permission");
-
-        const auto& perm_usage = this->create<permission_usage_object>([&](auto& p) {
-            p.last_used = creation_time;
-        });
-
-        const auto& perm = this->create<permission_object>([&](auto& p) {
-            p.usage_id     = perm_usage.id;
-            p.parent       = permission_object::id_type(parent);
-            p.owner        = name(account);
-            p.perm_name    = name(permission_name);
-            p.last_updated = creation_time;
-            p.auth         = std::move(auth);
-        });
-
-        return perm;
-    }
+    );
 
     const permission_object& create_permission(
         uint64_t account,
@@ -800,31 +752,7 @@ public:
         return perm;
     }
 
-    void modify_permission( const permission_object& permission, const Authority& a, const fc::time_point& pending_block_time ) {
-        authority auth;
-        auth.threshold = a.threshold;
-        auth.keys.reserve(a.keys.size());
-        auth.accounts.reserve(a.accounts.size());
-        auth.waits.reserve(a.waits.size());
-        for (const auto& k : a.keys) {
-            auth.keys.emplace_back( key_weight{ *k.key, k.weight } );
-        }
-        for (const auto& ac : a.accounts) {
-            auth.accounts.emplace_back( permission_level_weight{ { name(ac.permission.actor), name(ac.permission.permission) }, ac.weight } );
-        }
-        for (const auto& w : a.waits) {
-            auth.waits.emplace_back( wait_weight{ w.wait_sec, w.weight } );
-        }
-
-        for(const key_weight& k: auth.keys)
-            EOS_ASSERT(k.key.which() < this->get<protocol_state_object>().num_supported_key_types, unactivated_key_type,
-            "Unactivated key type used when modifying permission");
-
-        this->modify( permission, [&](permission_object& po) {
-            po.auth = auth;
-            po.last_updated = pending_block_time;
-        });
-    }
+    void modify_permission( const permission_object& permission, const Authority& a, const fc::time_point& pending_block_time );
 
     const permission_object& get_permission( const permission_level& level ) const { 
         try {
@@ -1008,7 +936,7 @@ int64_t revision(const ::chainbase::database& db);
 enum class DatabaseOpenFlags : uint32_t;
 
 // Bridge function to open database
-std::unique_ptr<database_wrapper> open_database(
+std::unique_ptr<pulsevm::chain::database_wrapper> open_database(
     rust::Str path,
     DatabaseOpenFlags flags,
     uint64_t size

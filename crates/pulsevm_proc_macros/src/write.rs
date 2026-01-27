@@ -16,23 +16,14 @@ pub struct DeriveWrite {
 impl Parse for DeriveWrite {
     fn parse(input: ParseStream) -> ParseResult<Self> {
         let DeriveInput {
-            ident,
-            mut generics,
-            data,
-            ..
+            ident, mut generics, data, ..
         } = input.parse()?;
         for param in &mut generics.params {
             if let GenericParam::Type(ref mut type_param) = *param {
-                type_param
-                    .bounds
-                    .push(parse_quote!(pulsevm_serialization::Write));
+                type_param.bounds.push(parse_quote!(pulsevm_serialization::Write));
             }
         }
-        Ok(Self {
-            ident,
-            generics,
-            data,
-        })
+        Ok(Self { ident, generics, data })
     }
 }
 

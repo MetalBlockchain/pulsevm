@@ -66,8 +66,7 @@ impl NumBytes for PublicKey {
 
 impl Read for PublicKey {
     fn read(bytes: &[u8], pos: &mut usize) -> Result<Self, ReadError> {
-        let cxx_key = pulsevm_ffi::parse_public_key_from_bytes(bytes, pos)
-            .map_err(|e| ReadError::CustomError(e.to_string()))?;
+        let cxx_key = pulsevm_ffi::parse_public_key_from_bytes(bytes, pos).map_err(|e| ReadError::CustomError(e.to_string()))?;
         Ok(PublicKey { inner: cxx_key })
     }
 }

@@ -45,11 +45,7 @@ impl<const N: usize> Default for FixedBytes<N> {
 
 impl<const N: usize> Write for FixedBytes<N> {
     #[inline]
-    fn write(
-        &self,
-        bytes: &mut [u8],
-        pos: &mut usize,
-    ) -> Result<(), pulsevm_serialization::WriteError> {
+    fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), pulsevm_serialization::WriteError> {
         if *pos + N > bytes.len() {
             return Err(pulsevm_serialization::WriteError::NotEnoughSpace);
         }

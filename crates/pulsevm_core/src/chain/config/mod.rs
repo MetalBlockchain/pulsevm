@@ -52,8 +52,7 @@ pub trait BillableSize {
 }
 
 pub fn billable_size_v<T: BillableSize>() -> u64 {
-    return ((T::billable_size() + BILLABLE_ALIGNMENT - 1) / BILLABLE_ALIGNMENT)
-        * BILLABLE_ALIGNMENT;
+    return ((T::billable_size() + BILLABLE_ALIGNMENT - 1) / BILLABLE_ALIGNMENT) * BILLABLE_ALIGNMENT;
 }
 
 pub const fn eos_percent(value: u64, percentage: u32) -> u64 {

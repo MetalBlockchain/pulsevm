@@ -10,9 +10,7 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use futures_util::{SinkExt, StreamExt};
-use pulsevm_core::{
-    controller::Controller, state_history::SHIP_ABI, transaction::TransactionTrace,
-};
+use pulsevm_core::{controller::Controller, state_history::SHIP_ABI, transaction::TransactionTrace};
 use pulsevm_crypto::Bytes;
 use pulsevm_serialization::{Read, Write};
 use spdlog::{error, info};
@@ -28,10 +26,7 @@ use tungstenite::Message;
 
 use crate::state_history::{
     request::RequestType,
-    types::{
-        BlockPosition, GetBlocksAckRequestV0, GetBlocksRequestV0, GetBlocksResponseV0,
-        GetStatusResult, TransactionTraceV0,
-    },
+    types::{BlockPosition, GetBlocksAckRequestV0, GetBlocksRequestV0, GetBlocksResponseV0, GetStatusResult, TransactionTraceV0},
 };
 
 pub struct Session {
@@ -85,8 +80,7 @@ impl Session {
             let msg = msg?;
             match msg {
                 Message::Binary(b) => {
-                    let req_type = RequestType::read(&b, &mut 0)
-                        .map_err(|e| anyhow!("failed to parse request type: {:?}", e))?;
+                    let req_type = RequestType::read(&b, &mut 0).map_err(|e| anyhow!("failed to parse request type: {:?}", e))?;
 
                     match req_type {
                         RequestType::GetStatusRequestV0 => {
@@ -96,9 +90,7 @@ impl Session {
                         }
                         RequestType::GetBlocksRequestV0 => {
                             let mut request =
-                                GetBlocksRequestV0::read(&b, &mut 1).map_err(|e| {
-                                    anyhow!("failed to parse GetBlocksRequestV0: {:?}", e)
-                                })?;
+                                GetBlocksRequestV0::read(&b, &mut 1).map_err(|e| anyhow!("failed to parse GetBlocksRequestV0: {:?}", e))?;
                             self.update_current_request(&mut request).await?;
 
                             // Initialize window (fallback if zero)
@@ -145,17 +137,11 @@ impl Session {
                                         continue;
                                     }
 
-                                    match make_block_response_for(ctrl.clone(), &request, next)
-                                        .await
-                                    {
+                                    match make_block_response_for(ctrl.clone(), &request, next).await {
                                         Ok(resp) => {
                                             match resp.pack() {
                                                 Ok(bytes) => {
-                                                    if tx_clone
-                                                        .send(Message::Binary(bytes))
-                                                        .await
-                                                        .is_err()
-                                                    {
+                                                    if tx_clone.send(Message::Binary(bytes)).await.is_err() {
                                                         // writer/socket is gone, stop
                                                         break;
                                                     }
@@ -165,8 +151,7 @@ impl Session {
                                                     error!("pack failed for block {next}: {e}");
                                                     // give window slot back
                                                     budget.fetch_add(1, Ordering::SeqCst);
-                                                    tokio::time::sleep(Duration::from_millis(5))
-                                                        .await;
+                                                    tokio::time::sleep(Duration::from_millis(5)).await;
                                                 }
                                             }
                                         }
@@ -187,12 +172,10 @@ impl Session {
                             }));
                         }
                         RequestType::GetBlocksAckRequestV0 => {
-                            let request = GetBlocksAckRequestV0::read(&b, &mut 1).map_err(|e| {
-                                anyhow!("failed to parse GetBlocksAckRequestV0: {:?}", e)
-                            })?;
+                            let request =
+                                GetBlocksAckRequestV0::read(&b, &mut 1).map_err(|e| anyhow!("failed to parse GetBlocksAckRequestV0: {:?}", e))?;
 
-                            in_flight_budget
-                                .fetch_add(request.num_messages as i64, Ordering::SeqCst);
+                            in_flight_budget.fetch_add(request.num_messages as i64, Ordering::SeqCst);
                         }
                     }
                 }
@@ -287,11 +270,7 @@ impl Session {
 // Builds a GetBlocksResponseV0 for a specific block number.
 // Replace internals with your real "get block by number" logic.
 // As-is, it waits until head >= block_num and then returns head as the block payload.
-async fn make_block_response_for(
-    controller: Arc<RwLock<Controller>>,
-    request: &GetBlocksRequestV0,
-    block_num: u32,
-) -> Result<GetBlocksResponseV0> {
+async fn make_block_response_for(controller: Arc<RwLock<Controller>>, request: &GetBlocksRequestV0, block_num: u32) -> Result<GetBlocksResponseV0> {
     let controller = controller.read().await;
     let head = controller.last_accepted_block();
 
@@ -300,9 +279,10 @@ async fn make_block_response_for(
     }
 
     // Get the requested block
-    let this_block_id = controller.get_block_id(block_num).await?.ok_or(anyhow!(
-        "block {block_num} not found, may not be available yet",
-    ))?;
+    let this_block_id = controller
+        .get_block_id(block_num)
+        .await?
+        .ok_or(anyhow!("block {block_num} not found, may not be available yet",))?;
 
     // Get the previous block if it exists
     let mut previous_block: Option<BlockPosition> = None;
@@ -332,8 +312,7 @@ async fn make_block_response_for(
         if let Some(log) = &trace_log {
             if let Ok(packed_traces) = log.read_block(block_num) {
                 let transaction_traces: Vec<TransactionTrace> =
-                    Vec::read(&packed_traces, &mut 0)
-                        .map_err(|e| anyhow!("failed to read traces for block {block_num}: {e}"))?;
+                    Vec::read(&packed_traces, &mut 0).map_err(|e| anyhow!("failed to read traces for block {block_num}: {e}"))?;
                 let converted_traces = transaction_traces
                     .iter()
                     .map(|t| TransactionTraceV0::from(t))

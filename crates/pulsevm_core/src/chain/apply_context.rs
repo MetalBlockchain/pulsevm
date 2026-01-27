@@ -5,13 +5,9 @@ use std::{
 };
 
 use chrono::Utc;
-use cxx::SharedPtr;
 use pulsevm_crypto::Bytes;
 use pulsevm_error::ChainError;
-use pulsevm_ffi::{
-    AccountMetadataObject, CxxChainConfig, CxxKeyValueIteratorCache, Database, KeyValueObject,
-    TableObject,
-};
+use pulsevm_ffi::{AccountMetadataObject, Database, KeyValueIteratorCache, KeyValueObject, TableObject};
 use spdlog::info;
 
 use crate::{
@@ -22,7 +18,6 @@ use crate::{
         block::BlockTimestamp,
         config::billable_size_v,
         controller::Controller,
-        id::Id,
         transaction::{Action, ActionReceipt, generate_action_digest},
         transaction_context::TransactionContext,
         utils::pulse_assert,
@@ -40,7 +35,7 @@ struct ApplyContextInner {
     notified: VecDeque<(Name, u32)>,        // List of notified accounts
     inline_actions: Vec<u32>,               // List of inline actions
     recurse_depth: u32,                     // The current recursion depth
-    keyval_cache: CxxKeyValueIteratorCache, // Cache for key-value iterators
+    keyval_cache: KeyValueIteratorCache, // Cache for key-value iterators
 }
 
 #[derive(Clone)]
@@ -88,7 +83,7 @@ impl ApplyContext {
                 notified: VecDeque::new(),
                 inline_actions: Vec::new(),
                 recurse_depth: depth,
-                keyval_cache: CxxKeyValueIteratorCache::new(),
+                keyval_cache: KeyValueIteratorCache::new(),
             })),
         })
     }
@@ -98,9 +93,7 @@ impl ApplyContext {
 
         {
             let mut inner = self.inner.write()?;
-            inner
-                .notified
-                .push_back((self.receiver.clone(), self.action_ordinal));
+            inner.notified.push_back((self.receiver.clone(), self.action_ordinal));
         }
 
         cpu_used += self.exec_one()?;
@@ -122,9 +115,7 @@ impl ApplyContext {
             if inner.inline_actions.len() > 0 {
                 pulse_assert(
                     inner.recurse_depth < 1024, // TODO: Make this configurable
-                    ChainError::TransactionError(
-                        "max inline action depth per transaction reached".to_string(),
-                    ),
+                    ChainError::TransactionError("max inline action depth per transaction reached".to_string()),
                 )?;
             }
 
@@ -145,15 +136,9 @@ impl ApplyContext {
             inner.action.clone()
         };
 
-        println!(
-            "Executing action {}@{} for receiver {}",
-            action.account(),
-            action.name(),
-            self.receiver
-        );
+        println!("Executing action {}@{} for receiver {}", action.account(), action.name(), self.receiver);
 
-        let native =
-            Controller::find_apply_handler(&self.receiver, action.account(), action.name());
+        let native = Controller::find_apply_handler(&self.receiver, action.account(), action.name());
         if let Some(native) = native {
             native(self, &mut self.db.clone(), &action)?;
         }
@@ -211,20 +196,15 @@ impl ApplyContext {
             inner.action.name()
         );
 
-        self.trx_context
-            .modify_action_trace(self.action_ordinal, |trace| {
-                trace.receipt = Some(receipt);
-                trace.set_elapsed((Utc::now().timestamp_micros() - inner.start) as u32);
-                trace.account_ram_deltas = inner.account_ram_deltas.clone();
-            })?;
+        self.trx_context.modify_action_trace(self.action_ordinal, |trace| {
+            trace.receipt = Some(receipt);
+            trace.set_elapsed((Utc::now().timestamp_micros() - inner.start) as u32);
+            trace.account_ram_deltas = inner.account_ram_deltas.clone();
+        })?;
         Ok(())
     }
 
-    pub fn require_authorization(
-        &self,
-        account: &Name,
-        permission: Option<Name>,
-    ) -> Result<(), ChainError> {
+    pub fn require_authorization(&self, account: &Name, permission: Option<Name>) -> Result<(), ChainError> {
         let inner = self.inner.read()?;
 
         for auth in inner.action.authorization() {
@@ -233,19 +213,13 @@ impl ApplyContext {
                     return Ok(());
                 }
 
-                return Err(ChainError::MissingAuthError(format!(
-                    "missing authority of {}/{}",
-                    account, perm
-                )));
+                return Err(ChainError::MissingAuthError(format!("missing authority of {}/{}", account, perm)));
             } else if auth.actor == account.as_u64() {
                 return Ok(());
             }
         }
 
-        return Err(ChainError::MissingAuthError(format!(
-            "missing authority of {}",
-            account
-        )));
+        return Err(ChainError::MissingAuthError(format!("missing authority of {}", account)));
     }
 
     pub fn has_recipient(&self, recipient: &Name) -> Result<bool, ChainError> {
@@ -255,12 +229,9 @@ impl ApplyContext {
 
     pub fn require_recipient(&mut self, recipient: &Name) -> Result<(), ChainError> {
         if !self.has_recipient(recipient)? {
-            let scheduled_ordinal =
-                self.schedule_action_from_ordinal(self.action_ordinal, &recipient, false)?;
+            let scheduled_ordinal = self.schedule_action_from_ordinal(self.action_ordinal, &recipient, false)?;
             let mut inner = self.inner.write()?;
-            inner
-                .notified
-                .push_back((recipient.clone(), scheduled_ordinal));
+            inner.notified.push_back((recipient.clone(), scheduled_ordinal));
         }
 
         Ok(())
@@ -304,10 +275,7 @@ impl ApplyContext {
             let code = self.db.find_account(a.account().as_u64())?;
             pulse_assert(
                 !code.is_null(),
-                ChainError::TransactionError(format!(
-                    "inline action's code account {} does not exist",
-                    a.account()
-                )),
+                ChainError::TransactionError(format!("inline action's code account {} does not exist", a.account())),
             )?;
 
             let mut inherited_authorizations: HashSet<PermissionLevel> = HashSet::new();
@@ -316,22 +284,14 @@ impl ApplyContext {
                 let actor = self.db.find_account(auth.actor)?;
                 pulse_assert(
                     !actor.is_null(),
-                    ChainError::TransactionError(format!(
-                        "inline action's authorizing actor {} does not exist",
-                        auth.actor
-                    )),
+                    ChainError::TransactionError(format!("inline action's authorizing actor {} does not exist", auth.actor)),
                 )?;
                 pulse_assert(
                     AuthorizationManager::find_permission(&mut self.db, auth)?.is_some(),
-                    ChainError::TransactionError(format!(
-                        "inline action's authorizations include a non-existent permission: {}",
-                        auth
-                    )),
+                    ChainError::TransactionError(format!("inline action's authorizations include a non-existent permission: {}", auth)),
                 )?;
 
-                if inherit_parent_authorizations
-                    && action.authorization().iter().any(|pl| pl == auth)
-                {
+                if inherit_parent_authorizations && action.authorization().iter().any(|pl| pl == auth) {
                     inherited_authorizations.insert(auth.clone());
                 }
             }
@@ -354,8 +314,7 @@ impl ApplyContext {
         }
 
         let inline_receiver = a.account();
-        let scheduled_ordinal =
-            self.schedule_action_from_action(a.clone(), &inline_receiver, false)?;
+        let scheduled_ordinal = self.schedule_action_from_action(a.clone(), &inline_receiver, false)?;
         let mut inner = self.inner.write()?;
         inner.inline_actions.push(scheduled_ordinal);
 
@@ -384,12 +343,7 @@ impl ApplyContext {
         Ok(scheduled_action_ordinal)
     }
 
-    pub fn schedule_action_from_action(
-        &mut self,
-        act_to_schedule: Action,
-        receiver: &Name,
-        context_free: bool,
-    ) -> Result<u32, ChainError> {
+    pub fn schedule_action_from_action(&mut self, act_to_schedule: Action, receiver: &Name, context_free: bool) -> Result<u32, ChainError> {
         let scheduled_action_ordinal = self.trx_context.schedule_action(
             act_to_schedule,
             receiver,
@@ -406,49 +360,26 @@ impl ApplyContext {
         Ok(scheduled_action_ordinal)
     }
 
-    pub fn db_find_i64(
-        &mut self,
-        code: u64,
-        scope: u64,
-        table: u64,
-        id: u64,
-    ) -> Result<i32, ChainError> {
+    pub fn db_find_i64(&mut self, code: u64, scope: u64, table: u64, id: u64) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
 
-        match self
-            .db
-            .db_find_i64(code, scope, table, id, &mut inner.keyval_cache)
-        {
+        match self.db.db_find_i64(code, scope, table, id, &mut inner.keyval_cache) {
             Ok(itr) => Ok(itr),
-            Err(e) => Err(ChainError::DatabaseError(format!(
-                "failed to find i64 in db: {}",
-                e
-            ))),
+            Err(e) => Err(ChainError::DatabaseError(format!("failed to find i64 in db: {}", e))),
         }
     }
 
-    pub fn db_store_i64(
-        &mut self,
-        scope: u64,
-        table: u64,
-        payer: u64,
-        primary_key: u64,
-        data: Bytes,
-    ) -> Result<i32, ChainError> {
+    pub fn db_store_i64(&mut self, scope: u64, table: u64, payer: u64, primary_key: u64, data: Bytes) -> Result<i32, ChainError> {
         let table = self.find_or_create_table(*self.receiver, scope, table, payer)?;
         let table = unsafe { &*table };
         pulse_assert(
             payer != 0,
-            ChainError::TransactionError(format!(
-                "must specify a valid account to pay for new record"
-            )),
+            ChainError::TransactionError(format!("must specify a valid account to pay for new record")),
         )?;
 
         let res = {
             let mut inner = self.inner.write()?;
-            let obj =
-                self.db
-                    .create_key_value_object(table, payer, primary_key, &data.0.as_slice())?;
+            let obj = self.db.create_key_value_object(table, payer, primary_key, &data.0.as_slice())?;
             let obj = unsafe { &*obj };
             inner.keyval_cache.cache_table(&table)?;
             inner.keyval_cache.add(obj)?
@@ -460,12 +391,7 @@ impl ApplyContext {
         Ok(res)
     }
 
-    pub fn db_update_i64(
-        &mut self,
-        iterator: i32,
-        payer: &Name,
-        data: impl AsRef<[u8]>,
-    ) -> Result<(), ChainError> {
+    pub fn db_update_i64(&mut self, iterator: i32, payer: &Name, data: impl AsRef<[u8]>) -> Result<(), ChainError> {
         let payer = payer.as_u64();
         let new_size = data.as_ref().len() as i64;
         let (old_size, old_payer, new_payer) = {
@@ -477,14 +403,9 @@ impl ApplyContext {
                 ChainError::TransactionError(format!("db access violation",)),
             )?;
             let old_payer = obj.get_payer().to_uint64_t();
-            let new_payer = if payer == 0 {
-                obj.get_payer().to_uint64_t()
-            } else {
-                payer
-            };
+            let new_payer = if payer == 0 { obj.get_payer().to_uint64_t() } else { payer };
             let old_size = obj.get_value().size() as i64;
-            self.db
-                .update_key_value_object(obj, new_payer, data.as_ref())?;
+            self.db.update_key_value_object(obj, new_payer, data.as_ref())?;
             (old_size, old_payer, new_payer)
         };
 
@@ -501,12 +422,7 @@ impl ApplyContext {
         Ok(())
     }
 
-    pub fn db_get_i64(
-        &self,
-        iterator: i32,
-        buffer: &mut Vec<u8>,
-        buffer_size: usize,
-    ) -> Result<i32, ChainError> {
+    pub fn db_get_i64(&self, iterator: i32, buffer: &mut Vec<u8>, buffer_size: usize) -> Result<i32, ChainError> {
         let inner = self.inner.read()?;
         let obj = inner.keyval_cache.get(iterator)?;
         let s = obj.get_value().size();
@@ -523,9 +439,7 @@ impl ApplyContext {
 
     pub fn db_remove_i64(&mut self, iterator: i32) -> Result<(), ChainError> {
         let mut inner = self.inner.write()?;
-        let delta =
-            self.db
-                .db_remove_i64(&mut inner.keyval_cache, iterator, self.receiver.as_u64())?;
+        let delta = self.db.db_remove_i64(&mut inner.keyval_cache, iterator, self.receiver.as_u64())?;
 
         //self.update_db_usage(&payer, -delta)?;
 
@@ -534,62 +448,34 @@ impl ApplyContext {
 
     pub fn db_next_i64(&mut self, iterator: i32, primary: &mut u64) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        self.db
-            .db_next_i64(&mut inner.keyval_cache, iterator, primary)
+        self.db.db_next_i64(&mut inner.keyval_cache, iterator, primary)
     }
 
     pub fn db_previous_i64(&mut self, iterator: i32, primary: &mut u64) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        self.db
-            .db_previous_i64(&mut inner.keyval_cache, iterator, primary)
+        self.db.db_previous_i64(&mut inner.keyval_cache, iterator, primary)
     }
 
     pub fn db_end_i64(&mut self, code: u64, scope: u64, table: u64) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        self.db
-            .db_end_i64(&mut inner.keyval_cache, code, scope, table)
+        self.db.db_end_i64(&mut inner.keyval_cache, code, scope, table)
     }
 
-    pub fn db_lowerbound_i64(
-        &mut self,
-        code: u64,
-        scope: u64,
-        table: u64,
-        primary: u64,
-    ) -> Result<i32, ChainError> {
+    pub fn db_lowerbound_i64(&mut self, code: u64, scope: u64, table: u64, primary: u64) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        self.db
-            .db_lowerbound_i64(&mut inner.keyval_cache, code, scope, table, primary)
+        self.db.db_lowerbound_i64(&mut inner.keyval_cache, code, scope, table, primary)
     }
 
-    pub fn db_upperbound_i64(
-        &mut self,
-        code: u64,
-        scope: u64,
-        table: u64,
-        primary: u64,
-    ) -> Result<i32, ChainError> {
+    pub fn db_upperbound_i64(&mut self, code: u64, scope: u64, table: u64, primary: u64) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        self.db
-            .db_upperbound_i64(&mut inner.keyval_cache, code, scope, table, primary)
+        self.db.db_upperbound_i64(&mut inner.keyval_cache, code, scope, table, primary)
     }
 
-    pub fn find_table(
-        &self,
-        code: u64,
-        scope: u64,
-        table: u64,
-    ) -> Result<*const TableObject, ChainError> {
+    pub fn find_table(&self, code: u64, scope: u64, table: u64) -> Result<*const TableObject, ChainError> {
         self.db.find_table(code, scope, table)
     }
 
-    pub fn find_or_create_table(
-        &mut self,
-        code: u64,
-        scope: u64,
-        table_name: u64,
-        payer: u64,
-    ) -> Result<*const TableObject, ChainError> {
+    pub fn find_or_create_table(&mut self, code: u64, scope: u64, table_name: u64, payer: u64) -> Result<*const TableObject, ChainError> {
         let table = self.find_table(code, scope, table_name)?;
 
         if table.is_null() {
@@ -602,10 +488,7 @@ impl ApplyContext {
     }
 
     pub fn remove_table(&mut self, table: &TableObject) -> Result<(), ChainError> {
-        self.update_db_usage(
-            &table.get_payer().to_uint64_t().into(),
-            -(billable_size_v::<TableObject>() as i64),
-        )?;
+        self.update_db_usage(&table.get_payer().to_uint64_t().into(), -(billable_size_v::<TableObject>() as i64))?;
         self.db.remove_table(table)?;
         Ok(())
     }
@@ -615,11 +498,8 @@ impl ApplyContext {
             // Do not allow charging RAM to other accounts during notify
             let inner = self.inner.read()?;
             if !(inner.privileged || *payer == self.receiver.as_u64()) {
-                self.require_authorization(payer, None).map_err(|_| {
-                    ChainError::TransactionError(format!(
-                        "cannot charge RAM to other accounts during notify"
-                    ))
-                })?;
+                self.require_authorization(payer, None)
+                    .map_err(|_| ChainError::TransactionError(format!("cannot charge RAM to other accounts during notify")))?;
             }
         }
 
@@ -634,10 +514,7 @@ impl ApplyContext {
         Ok(())
     }
 
-    pub fn next_recv_sequence(
-        &mut self,
-        receiver_account: &AccountMetadataObject,
-    ) -> Result<u64, ChainError> {
+    pub fn next_recv_sequence(&mut self, receiver_account: &AccountMetadataObject) -> Result<u64, ChainError> {
         self.db.next_recv_sequence(receiver_account)
     }
 

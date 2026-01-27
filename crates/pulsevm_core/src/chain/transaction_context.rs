@@ -14,10 +14,7 @@ use crate::chain::{
     id::Id,
     name::Name,
     resource_limits::ResourceLimitsManager,
-    transaction::{
-        Action, ActionTrace, Transaction, TransactionReceiptHeader, TransactionStatus,
-        TransactionTrace,
-    },
+    transaction::{Action, ActionTrace, Transaction, TransactionReceiptHeader, TransactionStatus, TransactionTrace},
     utils::pulse_assert,
     wasm_runtime::WasmRuntime,
 };
@@ -53,13 +50,7 @@ pub struct TransactionContext {
 }
 
 impl TransactionContext {
-    pub fn new(
-        db: Database,
-        wasm_runtime: WasmRuntime,
-        block_num: u32,
-        pending_block_timestamp: BlockTimestamp,
-        transaction_id: &Id,
-    ) -> Self {
+    pub fn new(db: Database, wasm_runtime: WasmRuntime, block_num: u32, pending_block_timestamp: BlockTimestamp, transaction_id: &Id) -> Self {
         let mut trace = TransactionTrace::default();
         trace.id = *transaction_id;
         trace.block_num = block_num;
@@ -89,10 +80,7 @@ impl TransactionContext {
         {
             let mut inner = self.inner.write()?;
 
-            pulse_assert(
-                inner.initialized == false,
-                ChainError::TransactionError("cannot initialize twice".into()),
-            )?;
+            pulse_assert(inner.initialized == false, ChainError::TransactionError("cannot initialize twice".into()))?;
             inner.initialized = true;
         }
 
@@ -115,29 +103,22 @@ impl TransactionContext {
         )?;
         pulse_assert(
             transaction.transaction_extensions.len() == 0,
-            ChainError::TransactionError(
-                "no transaction extensions supported yet for input transactions".into(),
-            ),
+            ChainError::TransactionError("no transaction extensions supported yet for input transactions".into()),
         )?;
 
         let mut discounted_size_for_pruned_data = packed_trx_prunable_size;
         let global_properties = unsafe { &*self.db.get_global_properties()? };
         let chain_config = global_properties.get_chain_config();
         if chain_config.get_context_free_discount_net_usage_den() > 0
-            && chain_config.get_context_free_discount_net_usage_num()
-                < chain_config.get_context_free_discount_net_usage_den()
+            && chain_config.get_context_free_discount_net_usage_num() < chain_config.get_context_free_discount_net_usage_den()
         {
-            discounted_size_for_pruned_data *=
-                chain_config.get_context_free_discount_net_usage_num() as u64;
-            discounted_size_for_pruned_data = (discounted_size_for_pruned_data
-                + chain_config.get_context_free_discount_net_usage_den() as u64
-                - 1)
+            discounted_size_for_pruned_data *= chain_config.get_context_free_discount_net_usage_num() as u64;
+            discounted_size_for_pruned_data = (discounted_size_for_pruned_data + chain_config.get_context_free_discount_net_usage_den() as u64 - 1)
                 / chain_config.get_context_free_discount_net_usage_den() as u64; // rounds up
         }
 
-        let initial_net_usage: u64 = (chain_config.get_base_per_transaction_net_usage() as u64)
-            + packed_trx_unprunable_size
-            + discounted_size_for_pruned_data;
+        let initial_net_usage: u64 =
+            (chain_config.get_base_per_transaction_net_usage() as u64) + packed_trx_unprunable_size + discounted_size_for_pruned_data;
 
         self.init(initial_net_usage)?;
         Ok(())
@@ -175,13 +156,7 @@ impl TransactionContext {
         closest_unnotified_ancestor_action_ordinal: u32,
     ) -> Result<u32, ChainError> {
         let mut inner = self.inner.write()?;
-        let (trx_id, block_num, block_time) = {
-            (
-                inner.trace.id,
-                inner.trace.block_num,
-                inner.trace.block_time.clone(),
-            )
-        };
+        let (trx_id, block_num, block_time) = { (inner.trace.id, inner.trace.block_num, inner.trace.block_time.clone()) };
         let new_action_ordinal = inner.trace.action_traces.len() as u32 + 1;
 
         inner.trace.action_traces.push(ActionTrace::new(
@@ -236,14 +211,8 @@ impl TransactionContext {
         Ok(new_action_ordinal)
     }
 
-    pub fn execute_action(
-        &mut self,
-        action_ordinal: u32,
-        recurse_depth: u32,
-    ) -> Result<(), ChainError> {
-        let (action, receiver) = self.with_action_trace(action_ordinal, |t| {
-            (t.action().clone(), t.receiver().clone())
-        })?;
+    pub fn execute_action(&mut self, action_ordinal: u32, recurse_depth: u32) -> Result<(), ChainError> {
+        let (action, receiver) = self.with_action_trace(action_ordinal, |t| (t.action().clone(), t.receiver().clone()))?;
 
         let mut apply_context = ApplyContext::new(
             self.db.clone(),
@@ -282,17 +251,9 @@ impl TransactionContext {
     }
 
     #[inline]
-    fn with_action_trace_mut<R>(
-        &self,
-        action_ordinal: u32,
-        f: impl FnOnce(&mut ActionTrace) -> R,
-    ) -> Result<R, ChainError> {
+    fn with_action_trace_mut<R>(&self, action_ordinal: u32, f: impl FnOnce(&mut ActionTrace) -> R) -> Result<R, ChainError> {
         let mut inner = self.inner.write()?;
-        match inner
-            .trace
-            .action_traces
-            .get_mut(action_ordinal as usize - 1)
-        {
+        match inner.trace.action_traces.get_mut(action_ordinal as usize - 1) {
             Some(t) => Ok(f(t)),
             None => Err(ChainError::TransactionError(format!(
                 "failed to update action trace by ordinal {}",
@@ -302,11 +263,7 @@ impl TransactionContext {
     }
 
     #[inline]
-    fn with_action_trace<R>(
-        &self,
-        action_ordinal: u32,
-        f: impl FnOnce(&ActionTrace) -> R,
-    ) -> Result<R, ChainError> {
+    fn with_action_trace<R>(&self, action_ordinal: u32, f: impl FnOnce(&ActionTrace) -> R) -> Result<R, ChainError> {
         let inner = self.inner.read()?;
         match inner.trace.action_traces.get(action_ordinal as usize - 1) {
             Some(t) => Ok(f(t)),
@@ -373,10 +330,7 @@ impl TransactionContext {
         let mut inner = self.inner.write()?;
 
         // Update the RAM usage in the resource limits manager.
-        println!(
-            "Adding RAM usage for account {}: {} bytes",
-            account, ram_delta
-        );
+        println!("Adding RAM usage for account {}: {} bytes", account, ram_delta);
         ResourceLimitsManager::add_pending_ram_usage(&mut self.db, account, ram_delta)?;
 
         if ram_delta > 0 {

@@ -117,10 +117,6 @@ set(CMAKE_DISABLE_FIND_PACKAGE_OpenSSL On)
 # is effectively --catch_system_errors=no broadly across all tests
 add_compile_definitions(BOOST_TEST_DEFAULTS_TO_CORE_DUMP)
 
-# Unless this is set, some boost unordered headers include `arm_neon.h` when building on ARM processors,
-# which includes a definition for `float16_t` conflicting with the one in `libraries/softfloat`.
-add_compile_definitions(BOOST_UNORDERED_DISABLE_NEON)
-
 add_subdirectory( libraries )
 
 include(CPack)

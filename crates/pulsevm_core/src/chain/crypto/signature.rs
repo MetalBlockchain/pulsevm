@@ -22,8 +22,7 @@ impl Signature {
     }
 
     pub fn recover_public_key(&self, digest: &Digest) -> Result<PublicKey, ChainError> {
-        let cxx_pk = recover_public_key_from_signature(&self.inner, &digest)
-            .map_err(|e| ChainError::TransactionError(e.to_string()))?;
+        let cxx_pk = recover_public_key_from_signature(&self.inner, &digest).map_err(|e| ChainError::TransactionError(e.to_string()))?;
         Ok(PublicKey::new(cxx_pk))
     }
 }
@@ -81,8 +80,7 @@ impl<'de> Deserialize<'de> for Signature {
             where
                 E: serde::de::Error,
             {
-                let cxx_sig = pulsevm_ffi::parse_signature(v)
-                    .map_err(|e| E::custom(format!("failed to parse signature: {}", e)))?;
+                let cxx_sig = pulsevm_ffi::parse_signature(v).map_err(|e| E::custom(format!("failed to parse signature: {}", e)))?;
                 Ok(Signature { inner: cxx_sig })
             }
         }
@@ -99,8 +97,7 @@ impl NumBytes for Signature {
 
 impl Read for Signature {
     fn read(bytes: &[u8], pos: &mut usize) -> Result<Self, ReadError> {
-        let cxx_key = pulsevm_ffi::parse_signature_from_bytes(bytes, pos)
-            .map_err(|e| ReadError::CustomError(e.to_string()))?;
+        let cxx_key = pulsevm_ffi::parse_signature_from_bytes(bytes, pos).map_err(|e| ReadError::CustomError(e.to_string()))?;
         Ok(Signature { inner: cxx_key })
     }
 }

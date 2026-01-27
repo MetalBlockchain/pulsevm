@@ -3,9 +3,7 @@ mod auth_tests {
     use anyhow::Result;
     use pulsevm_core::{
         ACTIVE_NAME, OWNER_NAME, PULSE_NAME,
-        authority::{
-            Authority, Permission, PermissionByOwnerIndex, PermissionLevel, PermissionLevelWeight,
-        },
+        authority::{Authority, Permission, PermissionByOwnerIndex, PermissionLevel, PermissionLevelWeight},
         authorization_manager::AuthorizationManager,
         error::ChainError,
         name::Name,
@@ -28,8 +26,7 @@ mod auth_tests {
                 )
                 .err(),
             Some(ChainError::AuthorizationError(
-                "transaction declares authority 'alice@active' but does not have signatures for it"
-                    .into()
+                "transaction declares authority 'alice@active' but does not have signatures for it".into()
             ))
         );
         chain.push_reqauth(name!("alice").into(), "owner", false)?;
@@ -41,12 +38,9 @@ mod auth_tests {
         let mut chain = Testing::new();
         chain.create_account(name!("alice").into(), PULSE_NAME, true, true)?;
         assert_eq!(
-            chain
-                .push_reqauth(name!("alice").into(), "owner", false,)
-                .err(),
+            chain.push_reqauth(name!("alice").into(), "owner", false,).err(),
             Some(ChainError::AuthorizationError(
-                "transaction declares authority 'alice@owner' but does not have signatures for it"
-                    .into()
+                "transaction declares authority 'alice@owner' but does not have signatures for it".into()
             ))
         );
         chain.push_reqauth(name!("alice").into(), "owner", true)?;
@@ -56,11 +50,7 @@ mod auth_tests {
     #[test]
     fn test_missing_auths() -> Result<()> {
         let mut chain = Testing::new();
-        chain.create_accounts(
-            vec![name!("alice").into(), name!("bob").into()],
-            false,
-            true,
-        )?;
+        chain.create_accounts(vec![name!("alice").into(), name!("bob").into()], false, true)?;
         // action not provided from authority
         assert_eq!(
             chain
@@ -70,9 +60,7 @@ mod auth_tests {
                     vec![get_private_key(name!("bob").into(), "active")],
                 )
                 .err(),
-            Some(ChainError::MissingAuthError(
-                "missing authority of alice".into()
-            ))
+            Some(ChainError::MissingAuthError("missing authority of alice".into()))
         );
         Ok(())
     }
@@ -80,33 +68,17 @@ mod auth_tests {
     #[test]
     fn test_delegate_auth() -> Result<()> {
         let mut chain = Testing::new();
-        chain.create_accounts(
-            vec![name!("alice").into(), name!("bob").into()],
-            false,
-            true,
-        )?;
+        chain.create_accounts(vec![name!("alice").into(), name!("bob").into()], false, true)?;
         let delegated_auth = Authority::new(
             1,
             vec![],
-            vec![PermissionLevelWeight::new(
-                (name!("bob").into(), ACTIVE_NAME).into(),
-                1,
-            )],
+            vec![PermissionLevelWeight::new((name!("bob").into(), ACTIVE_NAME).into(), 1)],
             vec![],
         );
-        chain.set_authority2(
-            name!("alice").into(),
-            ACTIVE_NAME,
-            delegated_auth.clone(),
-            OWNER_NAME,
-        )?;
+        chain.set_authority2(name!("alice").into(), ACTIVE_NAME, delegated_auth.clone(), OWNER_NAME)?;
         let pending_block_state = chain.get_pending_block_state();
         let mut undo_session = pending_block_state.undo_session.clone();
-        let new_auth = AuthorizationManager::get_permission(
-            &mut undo_session,
-            &(name!("alice").into(), ACTIVE_NAME).into(),
-        )?
-        .authority;
+        let new_auth = AuthorizationManager::get_permission(&mut undo_session, &(name!("alice").into(), ACTIVE_NAME).into())?.authority;
         assert!(new_auth == delegated_auth);
         // execute nonce from alice signed by bob
         chain.push_reqauth2(
@@ -124,20 +96,12 @@ mod auth_tests {
         chain.create_account(name!("bob").into(), PULSE_NAME, false, true)?;
         // Deleting active or owner should fail
         assert_eq!(
-            chain
-                .delete_authority2(name!("alice").into(), ACTIVE_NAME)
-                .err(),
-            Some(ChainError::ActionValidationError(format!(
-                "cannot delete active authority"
-            )))
+            chain.delete_authority2(name!("alice").into(), ACTIVE_NAME).err(),
+            Some(ChainError::ActionValidationError(format!("cannot delete active authority")))
         );
         assert_eq!(
-            chain
-                .delete_authority2(name!("alice").into(), OWNER_NAME)
-                .err(),
-            Some(ChainError::ActionValidationError(format!(
-                "cannot delete owner authority"
-            )))
+            chain.delete_authority2(name!("alice").into(), OWNER_NAME).err(),
+            Some(ChainError::ActionValidationError(format!("cannot delete owner authority")))
         );
 
         // Change owner permission
@@ -153,10 +117,7 @@ mod auth_tests {
         // Ensure the permission is updated
         let pending_block_state = chain.get_pending_block_state();
         let mut undo_session = pending_block_state.undo_session.clone();
-        let obj = undo_session.find_by_secondary::<Permission, PermissionByOwnerIndex>((
-            name!("alice").into(),
-            OWNER_NAME,
-        ))?;
+        let obj = undo_session.find_by_secondary::<Permission, PermissionByOwnerIndex>((name!("alice").into(), OWNER_NAME))?;
         assert!(obj.is_some());
         let obj = obj.unwrap();
         let owner_id = obj.id;
@@ -182,10 +143,7 @@ mod auth_tests {
             vec![get_private_key(name!("alice").into(), "active")],
         )?;
 
-        let obj = undo_session.find_by_secondary::<Permission, PermissionByOwnerIndex>((
-            name!("alice").into(),
-            ACTIVE_NAME,
-        ))?;
+        let obj = undo_session.find_by_secondary::<Permission, PermissionByOwnerIndex>((name!("alice").into(), ACTIVE_NAME))?;
         assert!(obj.is_some());
         let obj = obj.unwrap();
         assert!(obj.owner == name!("alice"));
@@ -228,10 +186,7 @@ mod auth_tests {
             vec![PermissionLevel::new(name!("alice").into(), ACTIVE_NAME)],
             vec![new_active_priv_key.clone()],
         )?;
-        let obj = undo_session.find_by_secondary::<Permission, PermissionByOwnerIndex>((
-            name!("alice").into(),
-            name!("spending").into(),
-        ))?;
+        let obj = undo_session.find_by_secondary::<Permission, PermissionByOwnerIndex>((name!("alice").into(), name!("spending").into()))?;
         assert!(obj.is_some());
         let obj = obj.unwrap();
         assert!(obj.owner == name!("alice"));
@@ -248,16 +203,11 @@ mod auth_tests {
                     name!("spending").into(),
                     Authority::new_from_public_key(spending_pub_key.clone()),
                     name!("spending").into(),
-                    vec![PermissionLevel::new(
-                        name!("alice").into(),
-                        name!("spending").into()
-                    )],
+                    vec![PermissionLevel::new(name!("alice").into(), name!("spending").into())],
                     vec![spending_priv_key.clone()],
                 )
                 .err(),
-            Some(ChainError::ActionValidationError(
-                "cannot set an authority as its own parent".into()
-            ))
+            Some(ChainError::ActionValidationError("cannot set an authority as its own parent".into()))
         );
 
         // Update spending auth parent to be owner, should fail
@@ -268,10 +218,7 @@ mod auth_tests {
                     name!("spending").into(),
                     Authority::new_from_public_key(spending_pub_key.clone()),
                     OWNER_NAME,
-                    vec![PermissionLevel::new(
-                        name!("alice").into(),
-                        name!("spending").into()
-                    )],
+                    vec![PermissionLevel::new(name!("alice").into(), name!("spending").into())],
                     vec![spending_priv_key.clone()],
                 )
                 .err(),
@@ -287,10 +234,7 @@ mod auth_tests {
             vec![PermissionLevel::new(name!("alice").into(), ACTIVE_NAME)],
             vec![new_active_priv_key.clone()],
         )?;
-        let obj = undo_session.find_by_secondary::<Permission, PermissionByOwnerIndex>((
-            name!("alice").into(),
-            name!("spending").into(),
-        ))?;
+        let obj = undo_session.find_by_secondary::<Permission, PermissionByOwnerIndex>((name!("alice").into(), name!("spending").into()))?;
         assert!(obj.is_none());
 
         // Create new trading auth
@@ -309,22 +253,13 @@ mod auth_tests {
             name!("spending").into(),
             Authority::new_from_public_key(spending_pub_key.clone()),
             name!("trading").into(),
-            vec![PermissionLevel::new(
-                name!("alice").into(),
-                name!("trading").into(),
-            )],
+            vec![PermissionLevel::new(name!("alice").into(), name!("trading").into())],
             vec![trading_priv_key.clone()],
         )?;
 
         // Verify correctness of trading and spending
-        let trading = undo_session.find_by_secondary::<Permission, PermissionByOwnerIndex>((
-            name!("alice").into(),
-            name!("trading").into(),
-        ))?;
-        let spending = undo_session.find_by_secondary::<Permission, PermissionByOwnerIndex>((
-            name!("alice").into(),
-            name!("spending").into(),
-        ))?;
+        let trading = undo_session.find_by_secondary::<Permission, PermissionByOwnerIndex>((name!("alice").into(), name!("trading").into()))?;
+        let spending = undo_session.find_by_secondary::<Permission, PermissionByOwnerIndex>((name!("alice").into(), name!("spending").into()))?;
         assert!(trading.is_some());
         assert!(spending.is_some());
         let trading = trading.unwrap();
@@ -361,10 +296,7 @@ mod auth_tests {
                     name!("trading").into(),
                     Authority::new_from_public_key(trading_pub_key.clone()),
                     name!("spending").into(),
-                    vec![PermissionLevel::new(
-                        name!("alice").into(),
-                        name!("trading").into()
-                    )],
+                    vec![PermissionLevel::new(name!("alice").into(), name!("trading").into())],
                     vec![trading_priv_key.clone()],
                 )
                 .err(),
@@ -380,10 +312,7 @@ mod auth_tests {
             vec![new_active_priv_key.clone()],
         )?;
         assert_eq!(
-            undo_session.find_by_secondary::<Permission, PermissionByOwnerIndex>((
-                name!("alice").into(),
-                name!("spending").into(),
-            ))?,
+            undo_session.find_by_secondary::<Permission, PermissionByOwnerIndex>((name!("alice").into(), name!("spending").into(),))?,
             None
         );
         chain.delete_authority(
@@ -393,10 +322,7 @@ mod auth_tests {
             vec![new_active_priv_key.clone()],
         )?;
         assert_eq!(
-            undo_session.find_by_secondary::<Permission, PermissionByOwnerIndex>((
-                name!("alice").into(),
-                name!("trading").into(),
-            ))?,
+            undo_session.find_by_secondary::<Permission, PermissionByOwnerIndex>((name!("alice").into(), name!("trading").into(),))?,
             None
         );
         Ok(())
@@ -417,10 +343,7 @@ mod auth_tests {
         // Ensure the permission is updated
         let pending_block_state = chain.get_pending_block_state();
         let mut undo_session = pending_block_state.undo_session.clone();
-        let obj = undo_session.find_by_secondary::<Permission, PermissionByOwnerIndex>((
-            name!("alice").into(),
-            OWNER_NAME,
-        ))?;
+        let obj = undo_session.find_by_secondary::<Permission, PermissionByOwnerIndex>((name!("alice").into(), OWNER_NAME))?;
         assert!(obj.is_some());
         let obj = obj.unwrap();
         assert!(obj.owner == name!("alice"));
@@ -437,11 +360,7 @@ mod auth_tests {
     #[test]
     fn test_link_auths() -> Result<()> {
         let mut chain = Testing::new();
-        chain.create_accounts(
-            vec![name!("alice").into(), name!("bob").into()],
-            false,
-            true,
-        )?;
+        chain.create_accounts(vec![name!("alice").into(), name!("bob").into()], false, true)?;
 
         let spending_priv_key = get_private_key(name!("alice").into(), "spending");
         let spending_pub_key = spending_priv_key.public_key();
@@ -462,9 +381,18 @@ mod auth_tests {
         )?;
 
         // Send req auth action with alice's spending key, it should fail
-        assert_eq!(chain.push_reqauth2(name!("alice").into(), vec![PermissionLevel::new(name!("alice").into(), name!("spending").into())], vec![spending_priv_key.clone()]).err(), Some(ChainError::IrrelevantAuth(
-            "action declares irrelevant authority 'alice@spending'; minimum authority is alice@active".into()
-        )));
+        assert_eq!(
+            chain
+                .push_reqauth2(
+                    name!("alice").into(),
+                    vec![PermissionLevel::new(name!("alice").into(), name!("spending").into())],
+                    vec![spending_priv_key.clone()]
+                )
+                .err(),
+            Some(ChainError::IrrelevantAuth(
+                "action declares irrelevant authority 'alice@spending'; minimum authority is alice@active".into()
+            ))
+        );
         // Link authority for pulse reqauth action with alice's spending key
         chain.link_authority(
             name!("alice").into(),
@@ -475,10 +403,7 @@ mod auth_tests {
         // Now, req auth action with alice's spending key should succeed
         chain.push_reqauth2(
             name!("alice").into(),
-            vec![PermissionLevel::new(
-                name!("alice").into(),
-                name!("spending").into(),
-            )],
+            vec![PermissionLevel::new(name!("alice").into(), name!("spending").into())],
             vec![spending_priv_key.clone()],
         )?;
         // Relink the same auth should fail
@@ -492,47 +417,49 @@ mod auth_tests {
                 )
                 .err(),
             Some(ChainError::ActionValidationError(
-                "attempting to update required authority, but new requirement is same as old"
-                    .into()
+                "attempting to update required authority, but new requirement is same as old".into()
             ))
         );
         // Unlink alice with pulse reqauth
-        chain.unlink_authority(
-            name!("alice").into(),
-            name!("pulse").into(),
-            name!("reqauth").into(),
-        )?;
+        chain.unlink_authority(name!("alice").into(), name!("pulse").into(), name!("reqauth").into())?;
         // Now, req auth action with alice's spending key should fail
-        assert_eq!(chain.push_reqauth2(name!("alice").into(), vec![PermissionLevel::new(name!("alice").into(), name!("spending").into())], vec![spending_priv_key.clone()]).err(), Some(ChainError::IrrelevantAuth(
-            "action declares irrelevant authority 'alice@spending'; minimum authority is alice@active".into()
-        )));
+        assert_eq!(
+            chain
+                .push_reqauth2(
+                    name!("alice").into(),
+                    vec![PermissionLevel::new(name!("alice").into(), name!("spending").into())],
+                    vec![spending_priv_key.clone()]
+                )
+                .err(),
+            Some(ChainError::IrrelevantAuth(
+                "action declares irrelevant authority 'alice@spending'; minimum authority is alice@active".into()
+            ))
+        );
         // Send req auth action with scud key, it should fail
-        assert_eq!(chain.push_reqauth2(name!("alice").into(), vec![PermissionLevel::new(name!("alice").into(), name!("scud").into())], vec![scud_priv_key.clone()]).err(), Some(ChainError::IrrelevantAuth(
-            "action declares irrelevant authority 'alice@scud'; minimum authority is alice@active".into()
-        )));
+        assert_eq!(
+            chain
+                .push_reqauth2(
+                    name!("alice").into(),
+                    vec![PermissionLevel::new(name!("alice").into(), name!("scud").into())],
+                    vec![scud_priv_key.clone()]
+                )
+                .err(),
+            Some(ChainError::IrrelevantAuth(
+                "action declares irrelevant authority 'alice@scud'; minimum authority is alice@active".into()
+            ))
+        );
         // Link authority for any pulse action with alice's scud key
-        chain.link_authority(
-            name!("alice").into(),
-            name!("pulse").into(),
-            name!("scud").into(),
-            Name::default(),
-        )?;
+        chain.link_authority(name!("alice").into(), name!("pulse").into(), name!("scud").into(), Name::default())?;
         // Now, req auth action with alice's scud key should succeed
         chain.push_reqauth2(
             name!("alice").into(),
-            vec![PermissionLevel::new(
-                name!("alice").into(),
-                name!("scud").into(),
-            )],
+            vec![PermissionLevel::new(name!("alice").into(), name!("scud").into())],
             vec![scud_priv_key.clone()],
         )?;
         // req auth action with alice's spending key should also be fine, since it is the parent of alice's scud key
         chain.push_reqauth2(
             name!("alice").into(),
-            vec![PermissionLevel::new(
-                name!("alice").into(),
-                name!("spending").into(),
-            )],
+            vec![PermissionLevel::new(name!("alice").into(), name!("spending").into())],
             vec![spending_priv_key.clone()],
         )?;
         Ok(())
@@ -554,18 +481,10 @@ mod auth_tests {
             Authority::new_from_public_key(first_pub_key),
             ACTIVE_NAME,
         )?;
-        chain.link_authority(
-            name!("alice").into(),
-            PULSE_NAME,
-            name!("first").into(),
-            name!("reqauth").into(),
-        )?;
+        chain.link_authority(name!("alice").into(), PULSE_NAME, name!("first").into(), name!("reqauth").into())?;
         chain.push_reqauth2(
             name!("alice").into(),
-            vec![PermissionLevel::new(
-                name!("alice").into(),
-                name!("first").into(),
-            )],
+            vec![PermissionLevel::new(name!("alice").into(), name!("first").into())],
             vec![first_priv_key.clone()],
         )?;
 
@@ -581,25 +500,18 @@ mod auth_tests {
             chain
                 .push_reqauth2(
                     name!("alice").into(),
-                    vec![PermissionLevel::new(
-                        name!("alice").into(),
-                        name!("first").into()
-                    )],
+                    vec![PermissionLevel::new(name!("alice").into(), name!("first").into())],
                     vec![first_priv_key.clone()]
                 )
                 .err(),
             Some(ChainError::AuthorizationError(
-                "transaction declares authority 'alice@first' but does not have signatures for it"
-                    .into()
+                "transaction declares authority 'alice@first' but does not have signatures for it".into()
             ))
         );
         // Using updated authority, should succeed
         chain.push_reqauth2(
             name!("alice").into(),
-            vec![PermissionLevel::new(
-                name!("alice").into(),
-                name!("first").into(),
-            )],
+            vec![PermissionLevel::new(name!("alice").into(), name!("first").into())],
             vec![second_priv_key.clone()],
         )?;
         Ok(())

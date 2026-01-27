@@ -25,9 +25,7 @@ use crate::chain::name::Name;
 use pulsevm_proc_macros::name;
 
 pub mod authority {
-    pub use pulsevm_ffi::{
-        Authority, KeyWeight, PermissionLevel, PermissionLevelWeight, WaitWeight,
-    };
+    pub use pulsevm_ffi::{Authority, KeyWeight, PermissionLevel, PermissionLevelWeight, WaitWeight};
 }
 
 pub use pulsevm_error::ChainError;

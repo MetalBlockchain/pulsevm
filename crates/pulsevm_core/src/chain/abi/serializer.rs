@@ -33,23 +33,17 @@ pub struct AbiSerializer {
 impl AbiSerializer {
     pub fn from_abi(abi: AbiDefinition) -> Result<Self, ChainError> {
         if !abi.version.starts_with("eosio::abi/1.") {
-            return Err(ChainError::TransactionError(
-                "unsupported ABI version".to_string(),
-            ));
+            return Err(ChainError::TransactionError("unsupported ABI version".to_string()));
         }
 
         let built_in_types = builtin_types();
-        let mut structs: HashMap<TypeName, AbiStructDefinition> =
-            HashMap::with_capacity(abi.structs.len());
+        let mut structs: HashMap<TypeName, AbiStructDefinition> = HashMap::with_capacity(abi.structs.len());
         let mut typedefs: HashMap<TypeName, TypeName> = HashMap::with_capacity(abi.types.len());
         let mut actions: HashMap<Name, TypeName> = HashMap::with_capacity(abi.actions.len());
         let mut tables: HashMap<Name, TypeName> = HashMap::with_capacity(abi.tables.len());
-        let mut error_messages: HashMap<u64, String> =
-            HashMap::with_capacity(abi.error_messages.len());
-        let mut variants: HashMap<TypeName, AbiVariantDefinition> =
-            HashMap::with_capacity(abi.variants.len());
-        let mut action_results: HashMap<Name, TypeName> =
-            HashMap::with_capacity(abi.action_results.len());
+        let mut error_messages: HashMap<u64, String> = HashMap::with_capacity(abi.error_messages.len());
+        let mut variants: HashMap<TypeName, AbiVariantDefinition> = HashMap::with_capacity(abi.variants.len());
+        let mut action_results: HashMap<Name, TypeName> = HashMap::with_capacity(abi.action_results.len());
 
         for s in abi.structs {
             structs.insert(s.name.clone(), s);
@@ -57,13 +51,7 @@ impl AbiSerializer {
 
         for t in abi.types {
             pulse_assert(
-                !is_type(
-                    &t.new_type_name,
-                    &built_in_types,
-                    &typedefs,
-                    &structs,
-                    &variants,
-                ),
+                !is_type(&t.new_type_name, &built_in_types, &typedefs, &structs, &variants),
                 ChainError::TransactionError("type already exists".to_string()),
             )?;
             typedefs.insert(t.new_type_name.clone(), t.type_name.clone());
@@ -104,13 +92,7 @@ impl AbiSerializer {
     pub fn validate(&self) -> Result<(), ChainError> {
         for t in self.typedefs.iter() {
             pulse_assert(
-                is_type(
-                    t.1.as_ref(),
-                    &self.built_in_types,
-                    &self.typedefs,
-                    &self.structs,
-                    &self.variants,
-                ),
+                is_type(t.1.as_ref(), &self.built_in_types, &self.typedefs, &self.structs, &self.variants),
                 ChainError::TransactionError(format!("type '{}' does not exist", t.1)),
             )?;
         }
@@ -125,10 +107,7 @@ impl AbiSerializer {
                         &self.structs,
                         &self.variants,
                     ),
-                    ChainError::TransactionError(format!(
-                        "struct field type '{}' does not exist",
-                        field.type_name
-                    )),
+                    ChainError::TransactionError(format!("struct field type '{}' does not exist", field.type_name)),
                 )?;
             }
         }
@@ -136,92 +115,48 @@ impl AbiSerializer {
         for s in self.variants.iter() {
             for variant_type in s.1.types.iter() {
                 pulse_assert(
-                    is_type(
-                        variant_type.as_ref(),
-                        &self.built_in_types,
-                        &self.typedefs,
-                        &self.structs,
-                        &self.variants,
-                    ),
-                    ChainError::TransactionError(format!(
-                        "variant type '{}' does not exist",
-                        variant_type
-                    )),
+                    is_type(variant_type.as_ref(), &self.built_in_types, &self.typedefs, &self.structs, &self.variants),
+                    ChainError::TransactionError(format!("variant type '{}' does not exist", variant_type)),
                 )?;
             }
         }
 
         for a in self.actions.iter() {
             pulse_assert(
-                is_type(
-                    a.1.as_ref(),
-                    &self.built_in_types,
-                    &self.typedefs,
-                    &self.structs,
-                    &self.variants,
-                ),
+                is_type(a.1.as_ref(), &self.built_in_types, &self.typedefs, &self.structs, &self.variants),
                 ChainError::TransactionError(format!("action type '{}' does not exist", a.1)),
             )?;
         }
 
         for t in self.tables.iter() {
             pulse_assert(
-                is_type(
-                    t.1.as_ref(),
-                    &self.built_in_types,
-                    &self.typedefs,
-                    &self.structs,
-                    &self.variants,
-                ),
+                is_type(t.1.as_ref(), &self.built_in_types, &self.typedefs, &self.structs, &self.variants),
                 ChainError::TransactionError(format!("table type '{}' does not exist", t.1)),
             )?;
         }
 
         for r in self.action_results.iter() {
             pulse_assert(
-                is_type(
-                    r.1.as_ref(),
-                    &self.built_in_types,
-                    &self.typedefs,
-                    &self.structs,
-                    &self.variants,
-                ),
-                ChainError::TransactionError(format!(
-                    "action result type '{}' does not exist",
-                    r.1
-                )),
+                is_type(r.1.as_ref(), &self.built_in_types, &self.typedefs, &self.structs, &self.variants),
+                ChainError::TransactionError(format!("action result type '{}' does not exist", r.1)),
             )?;
         }
 
         Ok(())
     }
 
-    pub fn binary_to_variant(
-        &self,
-        type_name: &str,
-        data: &[u8],
-        pos: &mut usize,
-    ) -> Result<Value, ChainError> {
+    pub fn binary_to_variant(&self, type_name: &str, data: &[u8], pos: &mut usize) -> Result<Value, ChainError> {
         let rtype = self.resolve_type(type_name);
         let ftype = fundamental_type(&rtype);
 
         if let Some(btype) = self.built_in_types.get(ftype) {
-            let res = btype(data, pos).map_err(|e| {
-                ChainError::TransactionError(format!(
-                    "failed to read built-in type '{}': {:?}",
-                    ftype, e
-                ))
-            })?;
+            let res = btype(data, pos).map_err(|e| ChainError::TransactionError(format!("failed to read built-in type '{}': {:?}", ftype, e)))?;
             return Ok(res);
         }
 
         if is_array(&rtype) {
-            let size = usize::read(data, pos).map_err(|e| {
-                ChainError::TransactionError(format!(
-                    "failed to read array size for '{}': {:?}",
-                    rtype, e
-                ))
-            })?;
+            let size =
+                usize::read(data, pos).map_err(|e| ChainError::TransactionError(format!("failed to read array size for '{}': {:?}", rtype, e)))?;
             let mut vars: Vec<Value> = Vec::with_capacity(size);
             for i in 0..size {
                 let v = self.binary_to_variant(ftype, data, pos)?;
@@ -229,12 +164,8 @@ impl AbiSerializer {
             }
             return Ok(Value::Array(vars));
         } else if is_optional(&rtype) {
-            let is_some = u8::read(data, pos).map_err(|e| {
-                ChainError::TransactionError(format!(
-                    "failed to read optional flag for '{}': {:?}",
-                    rtype, e
-                ))
-            })?;
+            let is_some =
+                u8::read(data, pos).map_err(|e| ChainError::TransactionError(format!("failed to read optional flag for '{}': {:?}", rtype, e)))?;
             if is_some != 0 {
                 let v = self.binary_to_variant(ftype, data, pos)?;
                 return Ok(v);
@@ -242,12 +173,8 @@ impl AbiSerializer {
                 return Ok(Value::Null);
             }
         } else if let Some(variant) = self.variants.get(&rtype) {
-            let select = usize::read(data, pos).map_err(|e| {
-                ChainError::TransactionError(format!(
-                    "failed to read variant selector for '{}': {:?}",
-                    rtype, e
-                ))
-            })?;
+            let select = usize::read(data, pos)
+                .map_err(|e| ChainError::TransactionError(format!("failed to read variant selector for '{}': {:?}", rtype, e)))?;
             pulse_assert(
                 select < variant.types.len(),
                 ChainError::TransactionError("variant index out of range".to_string()),
@@ -261,20 +188,11 @@ impl AbiSerializer {
         Ok(Value::Object(mvo))
     }
 
-    fn _binary_to_struct(
-        &self,
-        struct_name: &str,
-        data: &[u8],
-        pos: &mut usize,
-        mvo: &mut serde_json::Map<String, Value>,
-    ) -> Result<(), ChainError> {
+    fn _binary_to_struct(&self, struct_name: &str, data: &[u8], pos: &mut usize, mvo: &mut serde_json::Map<String, Value>) -> Result<(), ChainError> {
         let st = match self.structs.get(struct_name) {
             Some(s) => s,
             None => {
-                return Err(ChainError::TransactionError(format!(
-                    "struct '{}' not found",
-                    struct_name
-                )));
+                return Err(ChainError::TransactionError(format!("struct '{}' not found", struct_name)));
             }
         };
 
@@ -289,9 +207,7 @@ impl AbiSerializer {
                 if extension {
                     break;
                 }
-                return Err(ChainError::TransactionError(
-                    "not enough data to read struct field".to_string(),
-                ));
+                return Err(ChainError::TransactionError("not enough data to read struct field".to_string()));
             }
 
             let field_type = self.resolve_type(remove_bin_extension(field.type_name.as_ref()));

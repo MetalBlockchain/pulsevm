@@ -1,8 +1,8 @@
 #pragma once
-#include "types.hpp"
-#include "authority.hpp"
-#include "block_timestamp.hpp"
-#include "genesis_state.hpp"
+#include <pulsevm/chain/types.hpp>
+#include <pulsevm/chain/authority.hpp>
+#include <pulsevm/chain/block_timestamp.hpp>
+#include <pulsevm/chain/genesis_state.hpp>
 
 namespace pulsevm { namespace chain {
     using CxxBlockTimestamp = pulsevm::chain::block_timestamp_type;

@@ -104,11 +104,7 @@ impl Read for Bytes {
 
 impl Write for Bytes {
     #[inline]
-    fn write(
-        &self,
-        bytes: &mut [u8],
-        pos: &mut usize,
-    ) -> Result<(), pulsevm_serialization::WriteError> {
+    fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), pulsevm_serialization::WriteError> {
         let len = self.0.len();
         usize::write(&len, bytes, pos)?;
         if bytes.len() < *pos + len {

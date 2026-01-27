@@ -48,9 +48,7 @@ impl fmt::Display for SymbolCode {
     #[inline]
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let bytes = symbol_code_to_bytes(self.0);
-        let value = str::from_utf8(&bytes)
-            .map(str::trim)
-            .map_err(|_| fmt::Error)?;
+        let value = str::from_utf8(&bytes).map(str::trim).map_err(|_| fmt::Error)?;
         write!(f, "{}", value)
     }
 }
@@ -122,10 +120,7 @@ mod tests {
 
     #[test]
     fn test_symbol_code_from_str() {
-        assert_eq!(
-            SymbolCode::from_str("EOS").unwrap(),
-            SymbolCode::new(5459781u64)
-        );
+        assert_eq!(SymbolCode::from_str("EOS").unwrap(), SymbolCode::new(5459781u64));
         assert!(SymbolCode::from_str("TOOLONGS").is_err());
         assert!(SymbolCode::from_str("BAD!").is_err());
     }

@@ -66,20 +66,17 @@ impl BlockTimestamp {
 
     pub fn to_eos_string(&self) -> String {
         // total ms since Unix epoch
-        let total_ms = (self.slot() as i64) * (Self::BLOCK_INTERVAL_MS as i64)
-            + Self::BLOCK_TIMESTAMP_EPOCH_MS;
+        let total_ms = (self.slot() as i64) * (Self::BLOCK_INTERVAL_MS as i64) + Self::BLOCK_TIMESTAMP_EPOCH_MS;
 
         let secs = total_ms.div_euclid(1000);
         let rem_ms = (total_ms.rem_euclid(1000)) as i64;
 
-        let mut dt =
-            OffsetDateTime::from_unix_timestamp(secs).expect("valid timestamp for BlockTimestamp");
+        let mut dt = OffsetDateTime::from_unix_timestamp(secs).expect("valid timestamp for BlockTimestamp");
         dt += Duration::milliseconds(rem_ms);
 
         // EOS uses "YYYY-MM-DDTHH:MM:SS.sss" (no 'Z')
-        const FMT: &[time::format_description::FormatItem<'_>] = format_description!(
-            "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]"
-        );
+        const FMT: &[time::format_description::FormatItem<'_>] =
+            format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]");
 
         let s = dt.format(FMT).expect("formatting never fails");
         s
@@ -89,8 +86,7 @@ impl BlockTimestamp {
 impl From<BlockTimestamp> for SharedPtr<CxxTimePoint> {
     #[inline]
     fn from(bt: BlockTimestamp) -> Self {
-        let msec = (bt.slot() as i64) * (BlockTimestamp::BLOCK_INTERVAL_MS as i64)
-            + BlockTimestamp::BLOCK_TIMESTAMP_EPOCH_MS;
+        let msec = (bt.slot() as i64) * (BlockTimestamp::BLOCK_INTERVAL_MS as i64) + BlockTimestamp::BLOCK_TIMESTAMP_EPOCH_MS;
         CxxTimePoint::new(msec)
     }
 }
@@ -107,8 +103,7 @@ impl From<&CxxTimePoint> for BlockTimestamp {
     fn from(t: &CxxTimePoint) -> Self {
         let micro = t.time_since_epoch().count();
         let msec = micro / 1_000;
-        let slot = ((msec - BlockTimestamp::BLOCK_TIMESTAMP_EPOCH_MS)
-            / (BlockTimestamp::BLOCK_INTERVAL_MS as i64)) as u32;
+        let slot = ((msec - BlockTimestamp::BLOCK_TIMESTAMP_EPOCH_MS) / (BlockTimestamp::BLOCK_INTERVAL_MS as i64)) as u32;
         BlockTimestamp::new(slot)
     }
 }
@@ -117,8 +112,7 @@ impl From<TimePointSec> for BlockTimestamp {
     #[inline]
     fn from(t: TimePointSec) -> Self {
         let sec = t.sec_since_epoch() as i64;
-        let slot = ((sec * 1_000 - BlockTimestamp::BLOCK_TIMESTAMP_EPOCH_MS)
-            / (BlockTimestamp::BLOCK_INTERVAL_MS as i64)) as u32;
+        let slot = ((sec * 1_000 - BlockTimestamp::BLOCK_TIMESTAMP_EPOCH_MS) / (BlockTimestamp::BLOCK_INTERVAL_MS as i64)) as u32;
         BlockTimestamp::new(slot)
     }
 }
@@ -142,11 +136,8 @@ impl From<&BlockTimestamp> for prost_types::Timestamp {
         let time_since_epoch = bt.to_time_point().time_since_epoch().count();
         let seconds = time_since_epoch / 1_000_000;
         let nanos = ((time_since_epoch % 1_000_000) * 1_000) as i32;
-        
-        prost_types::Timestamp {
-            seconds,
-            nanos,
-        }
+
+        prost_types::Timestamp { seconds, nanos }
     }
 }
 
@@ -189,11 +180,9 @@ impl<'de> Deserialize<'de> for BlockTimestamp {
                 }
 
                 // Try with milliseconds first, then without (assume .000)
-                const FMT_MS: &[time::format_description::FormatItem<'_>] = format_description!(
-                    "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]"
-                );
-                const FMT_SEC: &[time::format_description::FormatItem<'_>] =
-                    format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]");
+                const FMT_MS: &[time::format_description::FormatItem<'_>] =
+                    format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]");
+                const FMT_SEC: &[time::format_description::FormatItem<'_>] = format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]");
 
                 let pdt = PrimitiveDateTime::parse(v, FMT_MS)
                     .or_else(|_| PrimitiveDateTime::parse(v, FMT_SEC))
@@ -208,9 +197,7 @@ impl<'de> Deserialize<'de> for BlockTimestamp {
                 // Convert to EOS slot (500 ms from 2000-01-01T00:00:00Z)
                 let delta = total_ms - BlockTimestamp::BLOCK_TIMESTAMP_EPOCH_MS;
                 if delta < 0 {
-                    return Err(E::custom(
-                        "timestamp before EOS block timestamp epoch (2000-01-01T00:00:00Z)",
-                    ));
+                    return Err(E::custom("timestamp before EOS block timestamp epoch (2000-01-01T00:00:00Z)"));
                 }
                 if delta % (BlockTimestamp::BLOCK_INTERVAL_MS as i64) != 0 {
                     return Err(E::custom("timestamp not aligned to 500ms boundary"));

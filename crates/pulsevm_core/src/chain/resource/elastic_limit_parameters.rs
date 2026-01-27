@@ -14,14 +14,7 @@ pub struct ElasticLimitParameters {
 }
 
 impl ElasticLimitParameters {
-    pub fn new(
-        target: u64,
-        max: u64,
-        periods: u32,
-        max_multiplier: u32,
-        contract_rate: Ratio<u64>,
-        expand_rate: Ratio<u64>,
-    ) -> Self {
+    pub fn new(target: u64, max: u64, periods: u32, max_multiplier: u32, contract_rate: Ratio<u64>, expand_rate: Ratio<u64>) -> Self {
         ElasticLimitParameters {
             target,
             max,
@@ -35,21 +28,15 @@ impl ElasticLimitParameters {
     pub fn validate(&self) -> Result<(), ChainError> {
         pulse_assert(
             self.periods > 0,
-            ChainError::InvalidArgument(
-                "elastic limit parameter 'periods' cannot be zero".to_owned(),
-            ),
+            ChainError::InvalidArgument("elastic limit parameter 'periods' cannot be zero".to_owned()),
         )?;
         pulse_assert(
             self.contract_rate.denominator > 0,
-            ChainError::InvalidArgument(
-                "elastic limit parameter 'contract_rate' is not a well-defined ratio".to_owned(),
-            ),
+            ChainError::InvalidArgument("elastic limit parameter 'contract_rate' is not a well-defined ratio".to_owned()),
         )?;
         pulse_assert(
             self.expand_rate.denominator > 0,
-            ChainError::InvalidArgument(
-                "elastic limit parameter 'expand_rate' is not a well-defined ratio".to_owned(),
-            ),
+            ChainError::InvalidArgument("elastic limit parameter 'expand_rate' is not a well-defined ratio".to_owned()),
         )?;
         Ok(())
     }

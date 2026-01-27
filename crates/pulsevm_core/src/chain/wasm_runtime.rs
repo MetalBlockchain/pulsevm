@@ -18,18 +18,14 @@ use crate::{
         name::Name,
         transaction::Action,
         webassembly::{
-            check_transaction_authorization, current_time, db_end_i64, db_find_i64, db_get_i64,
-            db_lowerbound_i64, db_next_i64, db_previous_i64, db_remove_i64, db_store_i64,
-            db_update_i64, db_upperbound_i64, get_resource_limits, is_privileged, pulse_assert,
-            read_action_data, require_auth2, require_recipient, set_action_return_value,
-            set_privileged, set_resource_limits, sha224, sha256, sha512,
+            check_transaction_authorization, current_time, db_end_i64, db_find_i64, db_get_i64, db_lowerbound_i64, db_next_i64, db_previous_i64,
+            db_remove_i64, db_store_i64, db_update_i64, db_upperbound_i64, get_resource_limits, is_privileged, pulse_assert, read_action_data,
+            require_auth2, require_recipient, set_action_return_value, set_privileged, set_resource_limits, sha224, sha256, sha512,
         },
     },
 };
 
-use super::webassembly::{
-    action_data_size, current_receiver, has_auth, is_account, require_auth, send_inline,
-};
+use super::webassembly::{action_data_size, current_receiver, has_auth, is_account, require_auth, send_inline};
 
 pub struct WasmContext {
     receiver: u64,
@@ -42,13 +38,7 @@ pub struct WasmContext {
 }
 
 impl WasmContext {
-    pub fn new(
-        receiver: Name,
-        action: Action,
-        pending_block_timestamp: BlockTimestamp,
-        context: ApplyContext,
-        db: Database,
-    ) -> Self {
+    pub fn new(receiver: Name, action: Action, pending_block_timestamp: BlockTimestamp, context: ApplyContext, db: Database) -> Self {
         WasmContext {
             receiver: receiver.as_u64(),
             action,
@@ -141,8 +131,8 @@ impl WasmRuntime {
                 let code_object = unsafe { &*code_object };
                 // Create a temporary store just for module compilation
                 let temp_store = Store::new(inner.engine.clone());
-                let module = Module::new(temp_store.engine(), code_object.get_code().as_slice())
-                    .map_err(|e| ChainError::WasmRuntimeError(e.to_string()))?;
+                let module =
+                    Module::new(temp_store.engine(), code_object.get_code().as_slice()).map_err(|e| ChainError::WasmRuntimeError(e.to_string()))?;
                 inner.code_cache.put(id, module);
             } else {
                 println!("Wasm module found in cache: {}", id);
@@ -150,9 +140,10 @@ impl WasmRuntime {
         }
 
         let mut store = Store::new(inner.engine.clone());
-        let module = inner.code_cache.get(&id).ok_or_else(|| {
-            ChainError::WasmRuntimeError(format!("wasm module not found in cache: {}", id))
-        })?;
+        let module = inner
+            .code_cache
+            .get(&id)
+            .ok_or_else(|| ChainError::WasmRuntimeError(format!("wasm module not found in cache: {}", id)))?;
         let wasm_context = WasmContext::new(
             receiver.clone(),
             action.clone(),
@@ -195,9 +186,8 @@ impl WasmRuntime {
                 "check_transaction_authorization" => Function::new_typed_with_env(&mut store, &env, check_transaction_authorization),
             }
         };
-        let instance = Instance::new(&mut store, &module, &import_object).map_err(|e| {
-            ChainError::WasmRuntimeError(format!("failed to create wasm instance: {}", e))
-        })?;
+        let instance = Instance::new(&mut store, &module, &import_object)
+            .map_err(|e| ChainError::WasmRuntimeError(format!("failed to create wasm instance: {}", e)))?;
 
         match instance.exports.get_memory("memory") {
             Ok(mem) => {
@@ -205,9 +195,7 @@ impl WasmRuntime {
                 ctx.memory = Some(mem.clone());
             }
             Err(_) => {
-                return Err(ChainError::WasmRuntimeError(
-                    "wasm memory export not found".to_string(),
-                ));
+                return Err(ChainError::WasmRuntimeError("wasm memory export not found".to_string()));
             }
         }
 

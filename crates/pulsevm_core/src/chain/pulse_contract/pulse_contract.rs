@@ -10,20 +10,14 @@ use crate::{
         authority::{Authority, PermissionLevel},
         authorization_manager::AuthorizationManager,
         config,
-        pulse_contract::pulse_contract_types::{
-            DeleteAuth, LinkAuth, NewAccount, SetAbi, SetCode, UnlinkAuth, UpdateAuth,
-        },
+        pulse_contract::pulse_contract_types::{DeleteAuth, LinkAuth, NewAccount, SetAbi, SetCode, UnlinkAuth, UpdateAuth},
         resource_limits::ResourceLimitsManager,
         utils::pulse_assert,
     },
     transaction::Action,
 };
 
-pub fn newaccount(
-    context: &mut ApplyContext,
-    db: &mut Database,
-    act: &Action,
-) -> Result<(), ChainError> {
+pub fn newaccount(context: &mut ApplyContext, db: &mut Database, act: &Action) -> Result<(), ChainError> {
     let create = act
         .data_as::<NewAccount>()
         .map_err(|e| ChainError::TransactionError(format!("failed to deserialize data: {}", e)))?;
@@ -53,25 +47,17 @@ pub fn newaccount(
     if !creator.is_privileged() {
         pulse_assert(
             !name_str.starts_with("pulse."),
-            ChainError::TransactionError(
-                "only privileged accounts can have names that start with 'pulse.'".to_string(),
-            ),
+            ChainError::TransactionError("only privileged accounts can have names that start with 'pulse.'".to_string()),
         )?;
     }
 
     let existing_account = db.find_account(create.name.as_u64())?;
     pulse_assert(
         existing_account.is_null(),
-        ChainError::TransactionError(format!(
-            "cannot create account named {}, as that name is already taken",
-            create.name
-        )),
+        ChainError::TransactionError(format!("cannot create account named {}, as that name is already taken", create.name)),
     )?;
 
-    db.create_account(
-        create.name.as_u64(),
-        context.pending_block_timestamp().slot(),
-    )?;
+    db.create_account(create.name.as_u64(), context.pending_block_timestamp().slot())?;
     db.create_account_metadata(create.name.as_u64(), false)?;
 
     validate_authority_precondition(db, &create.owner)?;
@@ -84,11 +70,7 @@ pub fn newaccount(
             &OWNER_NAME.into(),
             0,
             &create.owner.into(),
-            context
-                .pending_block_timestamp()
-                .to_time_point()
-                .as_ref()
-                .unwrap(),
+            context.pending_block_timestamp().to_time_point().as_ref().unwrap(),
         )?
     };
     let active_permission = AuthorizationManager::create_permission(
@@ -97,11 +79,7 @@ pub fn newaccount(
         &ACTIVE_NAME.into(),
         owner_permission.get_id() as u64,
         &create.active.into(),
-        context
-            .pending_block_timestamp()
-            .to_time_point()
-            .as_ref()
-            .unwrap(),
+        context.pending_block_timestamp().to_time_point().as_ref().unwrap(),
     )?;
 
     ResourceLimitsManager::initialize_account(db, &create.name)?;
@@ -117,24 +95,14 @@ pub fn newaccount(
     Ok(())
 }
 
-pub fn setcode(
-    context: &mut ApplyContext,
-    db: &mut Database,
-    act: &Action,
-) -> Result<(), ChainError> {
+pub fn setcode(context: &mut ApplyContext, db: &mut Database, act: &Action) -> Result<(), ChainError> {
     let act = act
         .data_as::<SetCode>()
         .map_err(|e| ChainError::TransactionError(format!("failed to deserialize data: {}", e)))?;
     context.require_authorization(&act.account, None)?;
 
-    pulse_assert(
-        act.vm_type == 0,
-        ChainError::TransactionError(format!("code should be 0")),
-    )?;
-    pulse_assert(
-        act.vm_version == 0,
-        ChainError::TransactionError(format!("version should be 0")),
-    )?;
+    pulse_assert(act.vm_type == 0, ChainError::TransactionError(format!("code should be 0")))?;
+    pulse_assert(act.vm_version == 0, ChainError::TransactionError(format!("version should be 0")))?;
 
     let mut code_hash = CxxDigest::new_empty();
     let code_size = act.code.len() as u64;
@@ -157,18 +125,13 @@ pub fn setcode(
     let new_size: i64 = code_size as i64 * config::SETCODE_RAM_BYTES_MULTIPLIER as i64;
 
     if existing_code {
-        let old_code_entry = unsafe {
-            &*db.get_code_object_by_hash(code_hash.as_ref().unwrap(), act.vm_type, act.vm_version)?
-        };
+        let old_code_entry = unsafe { &*db.get_code_object_by_hash(code_hash.as_ref().unwrap(), act.vm_type, act.vm_version)? };
         pulse_assert(
             old_code_entry.get_code_hash() != code_hash.as_ref().unwrap(),
-            ChainError::TransactionError(format!(
-                "contract is already running this version of code"
-            )),
+            ChainError::TransactionError(format!("contract is already running this version of code")),
         )?;
 
-        old_size =
-            old_code_entry.get_code().size() as i64 * config::SETCODE_RAM_BYTES_MULTIPLIER as i64;
+        old_size = old_code_entry.get_code().size() as i64 * config::SETCODE_RAM_BYTES_MULTIPLIER as i64;
 
         db.unlink_account_code(old_code_entry)?;
     }
@@ -177,11 +140,7 @@ pub fn setcode(
         account,
         act.code.as_slice(),
         context.get_head_block_num() + 1,
-        context
-            .get_pending_block_time()
-            .to_time_point()
-            .as_ref()
-            .unwrap(),
+        context.get_pending_block_time().to_time_point().as_ref().unwrap(),
         code_hash.as_ref().unwrap(),
         act.vm_type,
         act.vm_version,
@@ -194,20 +153,14 @@ pub fn setcode(
     Ok(())
 }
 
-pub fn setabi(
-    context: &mut ApplyContext,
-    db: &mut Database,
-    act: &Action,
-) -> Result<(), ChainError> {
+pub fn setabi(context: &mut ApplyContext, db: &mut Database, act: &Action) -> Result<(), ChainError> {
     let act = act
         .data_as::<SetAbi>()
         .map_err(|e| ChainError::TransactionError(format!("failed to deserialize data: {}", e)))?;
     context.require_authorization(&act.account, None)?;
 
-    let abi_def: AbiDefinition =
-        serde_json::from_str(std::str::from_utf8(act.abi.as_slice()).unwrap()).map_err(|e| {
-            ChainError::InvalidArgument(format!("failed to deserialize ABI: {}", e))
-        })?;
+    let abi_def: AbiDefinition = serde_json::from_str(std::str::from_utf8(act.abi.as_slice()).unwrap())
+        .map_err(|e| ChainError::InvalidArgument(format!("failed to deserialize ABI: {}", e)))?;
     let abi_def_packed = abi_def
         .pack()
         .map_err(|e| ChainError::TransactionError(format!("failed to serialize ABI: {}", e)))?;
@@ -225,11 +178,7 @@ pub fn setabi(
     Ok(())
 }
 
-pub fn updateauth(
-    context: &mut ApplyContext,
-    db: &mut Database,
-    act: &Action,
-) -> Result<(), ChainError> {
+pub fn updateauth(context: &mut ApplyContext, db: &mut Database, act: &Action) -> Result<(), ChainError> {
     let update = act
         .data_as::<UpdateAuth>()
         .map_err(|e| ChainError::TransactionError(format!("failed to deserialize data: {}", e)))?;
@@ -241,18 +190,15 @@ pub fn updateauth(
     )?;
     pulse_assert(
         !update.permission.to_string().starts_with("pulse."),
-        ChainError::ActionValidationError(format!(
-            "permission names that start with 'pulse.' are reserved"
-        )),
+        ChainError::ActionValidationError(format!("permission names that start with 'pulse.' are reserved")),
     )?;
     pulse_assert(
         update.permission != update.parent,
         ChainError::ActionValidationError(format!("cannot set an authority as its own parent")),
     )?;
 
-    db.get_account(update.account.as_u64()).map_err(|_| {
-        ChainError::TransactionError(format!("failed to find account {}", update.account))
-    })?;
+    db.get_account(update.account.as_u64())
+        .map_err(|_| ChainError::TransactionError(format!("failed to find account {}", update.account)))?;
 
     pulse_assert(
         update.auth.validate(),
@@ -262,9 +208,7 @@ pub fn updateauth(
     if update.permission == ACTIVE_NAME {
         pulse_assert(
             update.parent == OWNER_NAME,
-            ChainError::TransactionError(format!(
-                "cannot change active authority's parent from owner"
-            )),
+            ChainError::TransactionError(format!("cannot change active authority's parent from owner")),
         )?;
     } else if update.permission == OWNER_NAME {
         pulse_assert(
@@ -280,18 +224,11 @@ pub fn updateauth(
 
     validate_authority_precondition(db, &update.auth)?;
 
-    let permission = AuthorizationManager::find_permission(
-        db,
-        &PermissionLevel::new(update.account.as_u64(), update.permission.as_u64()),
-    )?;
+    let permission = AuthorizationManager::find_permission(db, &PermissionLevel::new(update.account.as_u64(), update.permission.as_u64()))?;
 
     let mut parent_id = 0i64;
     if update.permission != OWNER_NAME {
-        let parent = AuthorizationManager::get_permission(
-            db,
-            update.account.as_u64(),
-            update.parent.as_u64(),
-        )?;
+        let parent = AuthorizationManager::get_permission(db, update.account.as_u64(), update.parent.as_u64())?;
         parent_id = parent.get_parent_id();
     }
 
@@ -299,9 +236,7 @@ pub fn updateauth(
         let permission = permission.unwrap();
         pulse_assert(
             parent_id == permission.get_parent_id(),
-            ChainError::ActionValidationError(format!(
-                "changing parent authority is not currently supported"
-            )),
+            ChainError::ActionValidationError(format!("changing parent authority is not currently supported")),
         )?;
 
         // TODO: Fix RAM billing
@@ -331,11 +266,7 @@ pub fn updateauth(
     Ok(())
 }
 
-pub fn deleteauth(
-    context: &mut ApplyContext,
-    db: &mut Database,
-    act: &Action,
-) -> Result<(), ChainError> {
+pub fn deleteauth(context: &mut ApplyContext, db: &mut Database, act: &Action) -> Result<(), ChainError> {
     let remove = act
         .data_as::<DeleteAuth>()
         .map_err(|e| ChainError::TransactionError(format!("failed to deserialize data: {}", e)))?;
@@ -356,11 +287,7 @@ pub fn deleteauth(
     Ok(())
 }
 
-pub fn linkauth(
-    context: &mut ApplyContext,
-    db: &mut Database,
-    act: &Action,
-) -> Result<(), ChainError> {
+pub fn linkauth(context: &mut ApplyContext, db: &mut Database, act: &Action) -> Result<(), ChainError> {
     let requirement = act
         .data_as::<LinkAuth>()
         .map_err(|e| ChainError::TransactionError(format!("failed to deserialize data: {}", e)))?;
@@ -384,21 +311,13 @@ pub fn linkauth(
     Ok(())
 }
 
-pub fn unlinkauth(
-    context: &mut ApplyContext,
-    db: &mut Database,
-    act: &Action,
-) -> Result<(), ChainError> {
+pub fn unlinkauth(context: &mut ApplyContext, db: &mut Database, act: &Action) -> Result<(), ChainError> {
     let unlink = act
         .data_as::<UnlinkAuth>()
         .map_err(|e| ChainError::TransactionError(format!("failed to deserialize data: {}", e)))?;
     context.require_authorization(&unlink.account, None)?;
 
-    let delta = db.unlink_auth(
-        unlink.account.as_u64(),
-        unlink.code.as_u64(),
-        unlink.message_type.as_u64(),
-    )?;
+    let delta = db.unlink_auth(unlink.account.as_u64(), unlink.code.as_u64(), unlink.message_type.as_u64())?;
 
     if delta != 0 {
         context.add_ram_usage(&unlink.account, delta);
@@ -409,9 +328,9 @@ pub fn unlinkauth(
 
 fn validate_authority_precondition(db: &mut Database, auth: &Authority) -> Result<(), ChainError> {
     for a in auth.accounts() {
-        let account = db.get_account(a.permission.actor).map_err(|_| {
-            ChainError::TransactionError(format!("account {} does not exist", a.permission.actor))
-        })?;
+        let account = db
+            .get_account(a.permission.actor)
+            .map_err(|_| ChainError::TransactionError(format!("account {} does not exist", a.permission.actor)))?;
 
         if a.permission.permission == OWNER_NAME || a.permission.permission == ACTIVE_NAME {
             continue; // account was already checked to exist, so its owner and active permissions should exist
@@ -422,12 +341,7 @@ fn validate_authority_precondition(db: &mut Database, auth: &Authority) -> Resul
         }
 
         AuthorizationManager::get_permission(db, a.permission.actor, a.permission.permission)
-            .map_err(|_| {
-                ChainError::TransactionError(format!(
-                    "permission {}@{} does not exist",
-                    a.permission.actor, a.permission.permission
-                ))
-            })?;
+            .map_err(|_| ChainError::TransactionError(format!("permission {}@{} does not exist", a.permission.actor, a.permission.permission)))?;
     }
     Ok(())
 }

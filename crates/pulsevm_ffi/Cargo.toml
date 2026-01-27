@@ -16,7 +16,7 @@ zerocopy-derive = "0.8.34"
 
 [build-dependencies]
 cc = "1.2.50"
-cxx-build = "1.0"
+cxx-build = { version = "1.0" }
 cmake = "0.1"
 
 [dev-dependencies]
