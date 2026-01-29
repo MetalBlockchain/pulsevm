@@ -5,6 +5,12 @@ use serde::{Serialize, ser::SerializeStruct};
 
 use crate::bridge::ffi::{PermissionLevel, PermissionLevelWeight};
 
+impl PermissionLevelWeight {
+    pub fn new(permission: PermissionLevel, weight: u16) -> Self {
+        PermissionLevelWeight { permission, weight }
+    }
+}
+
 impl fmt::Debug for PermissionLevelWeight {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PermissionLevelWeight")

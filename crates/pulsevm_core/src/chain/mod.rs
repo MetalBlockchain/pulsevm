@@ -22,16 +22,16 @@ pub mod wasm_runtime;
 mod webassembly;
 
 use crate::chain::name::Name;
-use pulsevm_proc_macros::name;
 
 pub mod authority {
     pub use pulsevm_ffi::{Authority, KeyWeight, PermissionLevel, PermissionLevelWeight, WaitWeight};
 }
 
 pub use pulsevm_error::ChainError;
+use pulsevm_name_macro::name;
 
-pub const PULSE_NAME: u64 = name!("pulse");
-pub const OWNER_NAME: u64 = name!("owner");
-pub const ACTIVE_NAME: u64 = name!("active");
-pub const ANY_NAME: u64 = name!("pulse.any");
-pub const CODE_NAME: u64 = name!("pulse.code");
+pub const PULSE_NAME: Name = Name::new(name!("pulse"));
+pub const OWNER_NAME: Name = Name::new(name!("owner"));
+pub const ACTIVE_NAME: Name = Name::new(name!("active"));
+pub const ANY_NAME: Name = Name::new(name!("pulse.any"));
+pub const CODE_NAME: Name = Name::new(name!("pulse.code"));

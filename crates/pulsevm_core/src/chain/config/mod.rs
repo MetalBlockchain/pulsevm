@@ -1,3 +1,8 @@
+use pulsevm_ffi::{KeyValueObject, TableObject};
+use pulsevm_name_macro::name;
+
+use crate::name::Name;
+
 pub const PLUGIN_VERSION: u32 = 38;
 pub const VERSION: &str = "v0.0.1";
 
@@ -37,15 +42,15 @@ pub const DEFAULT_MAX_TRANSACTION_CPU_USAGE: u32 = 3 * DEFAULT_MAX_BLOCK_CPU_USA
 pub const DEFAULT_MIN_TRANSACTION_CPU_USAGE: u32 = 100;
 
 // Names
-pub const NEWACCOUNT_NAME: u64 = name!("newaccount");
-pub const SETCODE_NAME: u64 = name!("setcode");
-pub const SETABI_NAME: u64 = name!("setabi");
-pub const UPDATEAUTH_NAME: u64 = name!("updateauth");
-pub const DELETEAUTH_NAME: u64 = name!("deleteauth");
-pub const LINKAUTH_NAME: u64 = name!("linkauth");
-pub const UNLINKAUTH_NAME: u64 = name!("unlinkauth");
-pub const ONERROR_NAME: u64 = name!("onerror");
-pub const ONBLOCK_NAME: u64 = name!("onblock");
+pub const NEWACCOUNT_NAME: Name = Name::new(name!("newaccount"));
+pub const SETCODE_NAME: Name = Name::new(name!("setcode"));
+pub const SETABI_NAME: Name = Name::new(name!("setabi"));
+pub const UPDATEAUTH_NAME: Name = Name::new(name!("updateauth"));
+pub const DELETEAUTH_NAME: Name = Name::new(name!("deleteauth"));
+pub const LINKAUTH_NAME: Name = Name::new(name!("linkauth"));
+pub const UNLINKAUTH_NAME: Name = Name::new(name!("unlinkauth"));
+pub const ONERROR_NAME: Name = Name::new(name!("onerror"));
+pub const ONBLOCK_NAME: Name = Name::new(name!("onblock"));
 
 pub trait BillableSize {
     fn billable_size() -> u64;
@@ -58,9 +63,6 @@ pub fn billable_size_v<T: BillableSize>() -> u64 {
 pub const fn eos_percent(value: u64, percentage: u32) -> u64 {
     (value * percentage as u64) / PERCENT_100
 }
-
-use pulsevm_ffi::{KeyValueObject, TableObject};
-use pulsevm_proc_macros::name;
 
 impl BillableSize for KeyValueObject {
     fn billable_size() -> u64 {

@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{cmp::Ordering, fmt};
 
 use pulsevm_serialization::{NumBytes, Read, Write, WriteError};
 use serde::{Serialize, ser::SerializeStruct};
@@ -65,5 +65,27 @@ impl Serialize for PermissionLevel {
         state.serialize_field("actor", &self.actor)?;
         state.serialize_field("permission", &self.permission)?;
         state.end()
+    }
+}
+
+impl From<(u64, u64)> for PermissionLevel {
+    fn from(tuple: (u64, u64)) -> Self {
+        PermissionLevel {
+            actor: tuple.0,
+            permission: tuple.1,
+        }
+    }
+}
+
+impl Ord for PermissionLevel {
+    fn cmp(&self, other: &Self) -> Ordering {
+        (self.actor, self.permission)
+            .cmp(&(other.actor, other.permission))
+    }
+}
+
+impl PartialOrd for PermissionLevel {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
 }

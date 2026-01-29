@@ -21,7 +21,6 @@ pub struct AuthorizationManager;
 
 impl AuthorizationManager {
     pub fn check_authorization(
-        chain_config: &CxxChainConfig,
         db: &mut Database,
         actions: &Vec<Action>,
         provided_keys: &HashSet<PublicKey>,
@@ -36,7 +35,7 @@ impl AuthorizationManager {
             if act.account().as_u64() == PULSE_NAME {
                 special_case = true;
 
-                match act.name().as_u64() {
+                match *act.name() {
                     UPDATEAUTH_NAME => Self::check_updateauth_authorization(db, act, act.authorization())?,
                     DELETEAUTH_NAME => Self::check_deleteauth_authorization(db, act)?,
                     LINKAUTH_NAME => Self::check_linkauth_authorization(db, act)?,
@@ -68,6 +67,8 @@ impl AuthorizationManager {
                 }
             }
 
+            let global_properties = unsafe { &*db.get_global_properties()? };
+            let chain_config = global_properties.get_chain_config();
             let mut authority_checker = AuthorityChecker::new(chain_config.get_max_authority_depth(), provided_keys);
 
             // Now verify that all the declared authorizations are satisfied
@@ -171,7 +172,7 @@ impl AuthorizationManager {
             ChainError::AuthorizationError("the owner of the linked permission needs to be the actor of the declared authorization".to_string()),
         )?;
         if link.code == PULSE_NAME {
-            match link.message_type.as_u64() {
+            match link.message_type {
                 UPDATEAUTH_NAME => {
                     return Err(ChainError::AuthorizationError(
                         "cannot link pulse::updateauth to a minimum permission".to_string(),

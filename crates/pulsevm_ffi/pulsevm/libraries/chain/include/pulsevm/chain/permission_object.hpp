@@ -36,6 +36,7 @@ namespace pulsevm { namespace chain {
       int64_t get_parent_id() const { return parent._id; }
       const name& get_owner() const { return owner; }
       const name& get_name() const { return perm_name; }
+      const shared_authority& get_authority() const { return auth; }
    };
 
 

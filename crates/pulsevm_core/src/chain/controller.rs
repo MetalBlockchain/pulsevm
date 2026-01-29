@@ -6,7 +6,7 @@ use std::{
 
 use crate::{
     PULSE_NAME,
-    block::SignedBlock,
+    block::{BlockStatus, SignedBlock},
     chain::{
         apply_context::ApplyContext,
         authorization_manager::AuthorizationManager,
@@ -30,18 +30,16 @@ use crate::{
     transaction::Action,
 };
 
-use cxx::SharedPtr;
 use pulsevm_crypto::{Digest, merkle};
 use pulsevm_error::ChainError;
 use pulsevm_ffi::{CxxChainConfig, CxxGenesisState, Database, GlobalPropertyObject};
 use pulsevm_serialization::{Read, Write};
-use spdlog::info;
+use spdlog::{info, warn};
 use tokio::sync::RwLock as AsyncRwLock;
-use wasmer::sys::global;
 
 pub type ApplyHandlerFn = fn(&mut ApplyContext, &mut Database, &Action) -> Result<(), ChainError>;
 pub type ApplyHandlerMap = HashMap<
-    (u64, u64, u64), // (receiver, contract, action)
+    (Name, Name, Name), // (receiver, contract, action)
     ApplyHandlerFn,
 >;
 
@@ -105,9 +103,7 @@ impl Controller {
     pub fn initialize(&mut self, genesis_bytes: &Vec<u8>, db_path: &str) -> Result<(), ChainError> {
         info!("initializing controller with DB path: {}", db_path);
         self.db = Database::new(&db_path).map_err(|e| ChainError::InternalError(format!("failed to open database: {}", e)))?;
-        info!("database opened successfully");
         self.db.add_indices()?;
-        info!("database indices added successfully");
         // Parse genesis bytes
         let genesis_json =
             std::str::from_utf8(genesis_bytes).map_err(|e| ChainError::ParseError(format!("failed to parse genesis bytes as UTF-8: {}", e)))?;
@@ -140,23 +136,30 @@ impl Controller {
 
     pub async fn build_block(&mut self, mempool: &mut Mempool) -> Result<SignedBlock, ChainError> {
         let mut db = self.db.clone();
-        let undo_session = db.create_undo_session(true)?;
+        let _ = db.create_undo_session(true)?; // As we are building the block, drop the changes once built
         let mut transaction_receipts: VecDeque<TransactionReceipt> = VecDeque::new();
         let timestamp = BlockTimestamp::now();
-        let global_properties = Controller::get_global_properties(&db)?;
-        let chain_config = global_properties.get_chain_config();
+        let block_status = BlockStatus::Building;
 
         // Get transactions from the mempool
-        loop {
-            if let Some(transaction) = mempool.pop_transaction() {
-                let transaction_result = self.execute_transaction(&mut db.clone(), &chain_config, &transaction, &timestamp)?;
-                let receipt = TransactionReceipt::new(transaction_result.trace.receipt, transaction);
+        while let Some(transaction) = mempool.pop_transaction() {
+            let mut child_session = db.create_undo_session(true)?;
+            let transaction_result = self.execute_transaction(&transaction, &timestamp, &block_status);
 
-                // Add the transaction to the block
-                transaction_receipts.push_back(receipt);
-            } else {
-                break;
-            };
+            match transaction_result {
+                Ok(result) => {
+                    child_session.pin_mut().squash(); // Push changes to upstream session
+
+                    // Add the transaction to the block
+                    let receipt = TransactionReceipt::new(result.trace.receipt, transaction);
+                    transaction_receipts.push_back(receipt);
+                },
+                Err(e) => {
+                    warn!("transaction {} failed to execute, dropping: {}", transaction.id(), e);
+
+                    child_session.pin_mut().undo(); // Revert changes made during this transaction
+                }
+            }
         }
 
         // Don't build a block if we have no transactions
@@ -181,9 +184,10 @@ impl Controller {
         }
 
         // Verify the block
-        let session = self.db.create_undo_session(true)?;
+        let _ = self.db.create_undo_session(true)?;
         let mut mempool = mempool.write().await;
-        self.execute_block(block, &mut self.db.clone(), &mut mempool).await?;
+        let block_status = BlockStatus::Verifying;
+        self.execute_block(block, &block_status, &mut mempool).await?;
         self.verified_blocks.insert(block.id(), block.clone());
 
         Ok(())
@@ -198,7 +202,8 @@ impl Controller {
         };
         let mut root_session = self.db.create_undo_session(true)?;
         let mut mempool = mempool.write().await;
-        let transaction_traces = self.execute_block(&block, &mut self.db.clone(), &mut mempool).await?;
+        let block_status = BlockStatus::Accepting;
+        let transaction_traces = self.execute_block(&block, &block_status,&mut mempool).await?;
         let packed_transaction_traces = transaction_traces
             .pack()
             .map_err(|e| ChainError::TransactionError(format!("failed to pack transaction traces for block {}: {}", block_id, e)))?;
@@ -221,7 +226,7 @@ impl Controller {
     pub async fn execute_block(
         &mut self,
         block: &SignedBlock,
-        db: &mut Database,
+        block_status: &BlockStatus,
         mempool: &mut Mempool,
     ) -> Result<Vec<TransactionTrace>, ChainError> {
         // Make sure we don't have the block already
@@ -233,13 +238,11 @@ impl Controller {
             }
         }
 
-        let global_properties = Controller::get_global_properties(db)?;
-        let chain_config = global_properties.get_chain_config();
         let mut transaction_traces: Vec<TransactionTrace> = Vec::new();
 
         for receipt in &block.transactions {
             // Verify the transaction
-            let result = self.execute_transaction(&mut db.clone(), &chain_config, receipt.trx(), &block.signed_block_header.block.timestamp)?;
+            let result = self.execute_transaction(receipt.trx(), &block.signed_block_header.block.timestamp, block_status)?;
 
             // Add trace to traces
             transaction_traces.push(result.trace);
@@ -249,7 +252,7 @@ impl Controller {
         }
 
         // Update resource limits
-        let global_property = Controller::get_global_properties(db)?;
+        let global_property = Controller::get_global_properties(&self.db)?;
         let chain_config = global_property.get_chain_config();
         let cpu_target = eos_percent(
             chain_config.get_max_block_cpu_usage() as u64,
@@ -274,7 +277,7 @@ impl Controller {
             make_ratio(99, 100),
             make_ratio(1000, 999),
         );
-        ResourceLimitsManager::process_account_limit_updates(db)?;
+        ResourceLimitsManager::process_account_limit_updates(&mut self.db)?;
 
         Ok(transaction_traces)
     }
@@ -283,13 +286,13 @@ impl Controller {
     // This is useful for checking if a transaction is valid
     pub fn push_transaction(
         &mut self,
-        chain_config: &CxxChainConfig,
         transaction: &PackedTransaction,
         pending_block_timestamp: &BlockTimestamp,
+        block_status: &BlockStatus,
     ) -> Result<TransactionResult, ChainError> {
         let mut db = self.db.clone();
-        let undo_session = db.create_undo_session(true)?;
-        let result = self.execute_transaction(&mut db, chain_config, transaction, pending_block_timestamp)?;
+        let _undo_session = db.create_undo_session(true)?;
+        let result = self.execute_transaction(transaction, pending_block_timestamp, block_status)?;
         return Ok(result);
     }
 
@@ -297,18 +300,17 @@ impl Controller {
     // This is useful for applying a transaction to the blockchain
     pub fn execute_transaction(
         &mut self,
-        db: &mut Database,
-        chain_config: &CxxChainConfig,
         packed_transaction: &PackedTransaction,
         pending_block_timestamp: &BlockTimestamp,
+        block_status: &BlockStatus,
     ) -> Result<TransactionResult, ChainError> {
         let signed_transaction = packed_transaction.get_signed_transaction();
+        let mut db = self.db.clone();
 
         {
             // Verify authority
             AuthorizationManager::check_authorization(
-                &chain_config,
-                db,
+                &mut db,
                 &signed_transaction.transaction().actions,
                 &signed_transaction.recovered_keys(&self.chain_id)?,
                 &HashSet::new(),
@@ -317,11 +319,12 @@ impl Controller {
         }
 
         let mut trx_context = TransactionContext::new(
-            self.db.clone(),
+            db,
             self.wasm_runtime.clone(),
             self.last_accepted_block().block_num() + 1,
             pending_block_timestamp.clone(),
             packed_transaction.id(),
+            *block_status,
         );
 
         let trx = packed_transaction.get_transaction();
@@ -373,7 +376,7 @@ impl Controller {
     }
 
     pub fn find_apply_handler(receiver: &Name, scope: &Name, act: &Name) -> Option<ApplyHandlerFn> {
-        if let Some(handler) = APPLY_HANDLERS.get(&(receiver.as_u64(), scope.as_u64(), act.as_u64())) {
+        if let Some(handler) = APPLY_HANDLERS.get(&(*receiver, *scope, *act)) {
             return Some(*handler);
         }
         None
@@ -532,17 +535,17 @@ mod tests {
             TransactionHeader::new(TimePointSec::new(0), 0, 0, 0u32.into(), 0, 0u32.into()),
             vec![],
             vec![Action::new(
-                Name::from_str("pulse").unwrap(),
-                Name::from_str("newaccount").unwrap(),
+                Name::from_str("pulse")?,
+                Name::from_str("newaccount")?,
                 NewAccount {
-                    creator: Name::from_str("pulse").unwrap(),
+                    creator: Name::from_str("pulse")?,
                     name: account,
-                    owner: Authority::new(1, vec![KeyWeight::new(private_key.public_key(), 1)], vec![], vec![]),
-                    active: Authority::new(1, vec![KeyWeight::new(private_key.public_key(), 1)], vec![], vec![]),
+                    owner: Authority::new(1, vec![KeyWeight::new(private_key.get_public_key().into(), 1)], vec![], vec![]),
+                    active: Authority::new(1, vec![KeyWeight::new(private_key.get_public_key().into(), 1)], vec![], vec![]),
                 }
                 .pack()
                 .unwrap(),
-                vec![PermissionLevel::new(PULSE_NAME, ACTIVE_NAME)],
+                vec![PermissionLevel::new(PULSE_NAME.as_u64(), ACTIVE_NAME.as_u64())],
             )],
         )
         .sign(&private_key, &chain_id)?;
@@ -565,7 +568,7 @@ mod tests {
                 }
                 .pack()
                 .unwrap(),
-                vec![PermissionLevel::new(account.as_u64(), ACTIVE_NAME)],
+                vec![PermissionLevel::new(account.as_u64(), ACTIVE_NAME.as_u64())],
             )],
         )
         .sign(&private_key, &chain_id)?;
@@ -587,7 +590,7 @@ mod tests {
                 account,
                 action,
                 action_data.pack().unwrap(),
-                vec![PermissionLevel::new(account.as_u64(), ACTIVE_NAME)],
+                vec![PermissionLevel::new(account.as_u64(), ACTIVE_NAME.as_u64())],
             )],
         )
         .sign(&private_key, &chain_id)?;
@@ -597,36 +600,35 @@ mod tests {
 
     #[test]
     fn test_initialize() -> Result<(), ChainError> {
-        let private_key = PrivateKey::random();
+        let private_key = PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
         let mut controller = Controller::new();
         let genesis_bytes = generate_genesis(&private_key);
         let temp_path = get_temp_dir();
         controller.initialize(&genesis_bytes.to_vec(), temp_path.path().to_str().unwrap())?;
         assert_eq!(controller.last_accepted_block().block_num(), 1);
-        let pending_block_timestamp = controller.last_accepted_block().timestamp();
+        let pending_block_timestamp = controller.last_accepted_block().timestamp().clone();
         let chain_id = controller.chain_id();
-        let db = controller.database();
+        let block_status = BlockStatus::Building;
         controller.execute_transaction(
-            &mut db,
             &create_account(&private_key, Name::from_str("glenn")?, chain_id)?,
             &pending_block_timestamp,
+            &block_status,
         )?;
         controller.execute_transaction(
-            &mut db,
             &create_account(&private_key, Name::from_str("marshall")?, chain_id)?,
             &pending_block_timestamp,
+            &block_status,
         )?;
 
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
         let pulse_token_contract = fs::read(root.join(Path::new("reference_contracts/pulse_token.wasm"))).unwrap();
         controller.execute_transaction(
-            &mut db,
             &set_code(&private_key, Name::from_str("glenn")?, pulse_token_contract, chain_id)?,
             &pending_block_timestamp,
+            &block_status,
         )?;
 
         controller.execute_transaction(
-            &mut db,
             &call_contract(
                 &private_key,
                 Name::from_str("glenn")?,
@@ -638,10 +640,10 @@ mod tests {
                 chain_id,
             )?,
             &pending_block_timestamp,
+            &block_status,
         )?;
 
         controller.execute_transaction(
-            &mut db,
             &call_contract(
                 &private_key,
                 Name::from_str("glenn")?,
@@ -657,10 +659,10 @@ mod tests {
                 chain_id,
             )?,
             &pending_block_timestamp,
+            &block_status,
         )?;
 
         controller.execute_transaction(
-            &mut db,
             &call_contract(
                 &private_key,
                 Name::from_str("glenn")?,
@@ -677,6 +679,7 @@ mod tests {
                 chain_id,
             )?,
             &pending_block_timestamp,
+            &block_status,
         )?;
 
         Ok(())
@@ -686,41 +689,42 @@ mod tests {
     fn test_api_db() -> Result<(), ChainError> {
         let runtime = runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let _guard = runtime.enter();
-        let private_key = PrivateKey::random();
+        let private_key = PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
         let mut controller = Controller::new();
         let genesis_bytes = generate_genesis(&private_key);
         let temp_path = get_temp_dir();
         controller.initialize(&genesis_bytes.to_vec(), temp_path.path().to_str().unwrap())?;
-        let pending_block_timestamp = controller.last_accepted_block().timestamp();
+        let pending_block_timestamp = controller.last_accepted_block().timestamp().clone();
         let mut db = controller.database();
         let chain_id = controller.chain_id();
+        let block_status = BlockStatus::Building;
         controller.execute_transaction(
-            &mut db,
             &create_account(&private_key, Name::from_str("glenn")?, chain_id)?,
             &pending_block_timestamp,
+            &block_status,
         )?;
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
         let contract = fs::read(root.join(Path::new("reference_contracts/test_api_db.wasm"))).unwrap();
         controller.execute_transaction(
-            &mut db,
             &set_code(&private_key, Name::from_str("glenn")?, contract, chain_id)?,
             &pending_block_timestamp,
+            &block_status,
         )?;
 
         controller.execute_transaction(
-            &mut db,
             &call_contract(&private_key, Name::from_str("glenn")?, Name::from_str("pg")?, &Vec::<u8>::new(), chain_id)?,
             &pending_block_timestamp,
+            &block_status,
         )?;
         controller.execute_transaction(
-            &mut db,
             &call_contract(&private_key, Name::from_str("glenn")?, Name::from_str("pl")?, &Vec::<u8>::new(), chain_id)?,
             &pending_block_timestamp,
+            &block_status,
         )?;
         controller.execute_transaction(
-            &mut db,
             &call_contract(&private_key, Name::from_str("glenn")?, Name::from_str("pu")?, &Vec::<u8>::new(), chain_id)?,
             &pending_block_timestamp,
+            &block_status,
         )?;
 
         Ok(())

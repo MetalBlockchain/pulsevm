@@ -5,7 +5,7 @@ impl CxxSignature {
         packed_signature_bytes(self)
     }
 
-    pub fn to_string_rust(&self) -> &str {
+    pub fn to_string_rust(&self) -> String {
         signature_to_string(self)
     }
 

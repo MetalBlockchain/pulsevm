@@ -3,31 +3,20 @@ mod unittests;
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, fs, path::Path, sync::Arc, vec};
+    use std::{collections::HashSet, fs, path::Path, str::FromStr, sync::Arc, vec};
 
-    use pulsevm_chainbase::UndoSession;
     use pulsevm_core::{
-        ACTIVE_NAME, CODE_NAME, OWNER_NAME, PULSE_NAME,
-        authority::{Authority, KeyWeight, PermissionLevel, PermissionLevelWeight},
-        block::BlockTimestamp,
-        config::{DELETEAUTH_NAME, LINKAUTH_NAME, NEWACCOUNT_NAME, SETCODE_NAME, UNLINKAUTH_NAME, UPDATEAUTH_NAME},
-        controller::Controller,
-        error::ChainError,
-        name::Name,
-        pulse_contract::{DeleteAuth, LinkAuth, NewAccount, SetCode, UnlinkAuth, UpdateAuth},
-        secp256k1::{PrivateKey, PublicKey},
-        transaction::{Action, PackedTransaction, SignedTransaction, Transaction, TransactionTrace},
-        utils::pulse_assert,
+        ACTIVE_NAME, CODE_NAME, ChainError, Database, OWNER_NAME, PULSE_NAME, authority::{Authority, KeyWeight, PermissionLevel, PermissionLevelWeight}, block::{BlockStatus, BlockTimestamp}, config::{DELETEAUTH_NAME, LINKAUTH_NAME, NEWACCOUNT_NAME, SETCODE_NAME, UNLINKAUTH_NAME, UPDATEAUTH_NAME}, controller::Controller, crypto::{PrivateKey, PublicKey}, name::Name, pulse_contract::{DeleteAuth, LinkAuth, NewAccount, SetCode, UnlinkAuth, UpdateAuth}, transaction::{Action, PackedTransaction, SignedTransaction, Transaction, TransactionTrace}, utils::pulse_assert
     };
     use pulsevm_crypto::{Bytes, Digest};
-    use pulsevm_proc_macros::name;
+    use pulsevm_name_macro::name;
     use pulsevm_serialization::{VarUint32, Write};
     use serde_json::json;
 
     #[derive(Clone)]
     pub struct PendingBlockState {
-        pub undo_session: UndoSession,
         pub timestamp: BlockTimestamp,
+        pub db: Database,
     }
 
     pub struct Testing {
@@ -39,7 +28,7 @@ mod tests {
         pub fn new() -> Self {
             let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
             let mut controller = Controller::new();
-            let private_key = get_private_key(PULSE_NAME, "active");
+            let private_key = get_private_key(PULSE_NAME.into(), "active");
             let genesis = generate_genesis(&private_key);
 
             // Initialize controller
@@ -61,7 +50,7 @@ mod tests {
             let mut traces: Vec<TransactionTrace> = Vec::with_capacity(accounts.len());
 
             for account in accounts.iter() {
-                let trace = { self.create_account(account.clone(), PULSE_NAME, multisig, include_code)? };
+                let trace = { self.create_account(account.clone(), PULSE_NAME.into(), multisig, include_code)? };
                 traces.push(trace);
             }
 
@@ -71,18 +60,18 @@ mod tests {
         pub fn create_account(&mut self, account: Name, creator: Name, multisig: bool, include_code: bool) -> Result<TransactionTrace, ChainError> {
             let mut trx = Transaction::default();
             self.set_transaction_headers(&mut trx, 6, 0);
-            let mut owner_auth = Authority::new(1, vec![KeyWeight::new(get_public_key(account, "owner"), 1)], vec![], vec![]);
+            let mut owner_auth = Authority::new(1, vec![KeyWeight::new(get_public_key(account, "owner").inner(), 1)], vec![], vec![]);
 
             if multisig {
                 owner_auth = Authority::new(
                     2,
-                    vec![KeyWeight::new(get_public_key(account, "owner"), 1)],
-                    vec![PermissionLevelWeight::new(PermissionLevel::new(creator, ACTIVE_NAME), 1)],
+                    vec![KeyWeight::new(get_public_key(account, "owner").inner(), 1)],
+                    vec![PermissionLevelWeight::new(PermissionLevel::new(creator.as_u64(), ACTIVE_NAME.as_u64()), 1)],
                     vec![],
                 );
             }
 
-            let mut active_auth = Authority::new(1, vec![KeyWeight::new(get_public_key(account, "active"), 1)], vec![], vec![]);
+            let mut active_auth = Authority::new(1, vec![KeyWeight::new(get_public_key(account, "active").inner(), 1)], vec![], vec![]);
 
             let sort_permissions = |auth: &mut Authority| {
                 auth.accounts.sort_by(|lhs, rhs| lhs.permission.cmp(&rhs.permission));
@@ -91,27 +80,27 @@ mod tests {
             if include_code {
                 pulse_assert(
                     owner_auth.threshold() <= u16::MAX as u32,
-                    ChainError::InternalError(Some("threshold too high".to_string())),
+                    ChainError::InternalError("threshold too high".to_string()),
                 )?;
                 pulse_assert(
                     active_auth.threshold() <= u16::MAX as u32,
-                    ChainError::InternalError(Some("threshold too high".to_string())),
+                    ChainError::InternalError("threshold too high".to_string()),
                 )?;
                 owner_auth.accounts.push(PermissionLevelWeight::new(
-                    PermissionLevel::new(account, CODE_NAME),
+                    PermissionLevel::new(account.as_u64(), CODE_NAME.as_u64()),
                     owner_auth.threshold() as u16,
                 ));
                 sort_permissions(&mut owner_auth);
                 active_auth.accounts.push(PermissionLevelWeight::new(
-                    PermissionLevel::new(account, CODE_NAME),
+                    PermissionLevel::new(account.as_u64(), CODE_NAME.as_u64()),
                     active_auth.threshold() as u16,
                 ));
                 sort_permissions(&mut active_auth);
             }
 
             trx.actions.push(Action::new(
-                PULSE_NAME,
-                NEWACCOUNT_NAME,
+                PULSE_NAME.into(),
+                NEWACCOUNT_NAME.into(),
                 NewAccount {
                     creator,
                     name: account,
@@ -120,7 +109,7 @@ mod tests {
                 }
                 .pack()
                 .unwrap(),
-                vec![PermissionLevel::new(creator, ACTIVE_NAME)],
+                vec![PermissionLevel::new(creator.as_u64(), ACTIVE_NAME.as_u64())],
             ));
 
             self.set_transaction_headers(&mut trx, 6, 0);
@@ -130,23 +119,24 @@ mod tests {
         }
 
         pub fn push_transaction(&mut self, trx: SignedTransaction) -> Result<TransactionTrace, ChainError> {
-            let (mut undo_session, timestamp) = {
-                let state = self.get_pending_block_state();
-                (state.undo_session.clone(), state.timestamp.clone())
-            };
-            let packed = PackedTransaction::from_signed_transaction(trx).unwrap();
-            let result = self.controller.execute_transaction(&mut undo_session, &packed, &timestamp)?;
+            let pbs = self.get_pending_block_state();
+            let packed = PackedTransaction::from_signed_transaction(trx).map_err(|e| {
+                ChainError::DatabaseError(format!("failed to pack transaction for pushing: {}", e))
+            })?;
+            let block_status = BlockStatus::Verifying;
+            println!("Pushing transaction with {}", serde_json::to_string(&packed).unwrap());
+            let result = self.controller.execute_transaction(&packed, &pbs.timestamp, &block_status)?;
             Ok(result.trace)
         }
 
         pub fn push_reqauth(&mut self, from: Name, role: &str, multi_sig: bool) -> Result<TransactionTrace, ChainError> {
             if !multi_sig {
-                return self.push_reqauth2(from, vec![PermissionLevel::new(from, OWNER_NAME)], vec![get_private_key(from, role)]);
+                return self.push_reqauth2(from, vec![PermissionLevel::new(from.as_u64(), OWNER_NAME.as_u64())], vec![get_private_key(from, role)]);
             } else {
                 return self.push_reqauth2(
                     from,
-                    vec![PermissionLevel::new(from, OWNER_NAME)],
-                    vec![get_private_key(from, role), get_private_key(PULSE_NAME, "active")],
+                    vec![PermissionLevel::new(from.as_u64(), OWNER_NAME.as_u64())],
+                    vec![get_private_key(from, role), get_private_key(PULSE_NAME.into(), "active")],
                 );
             }
         }
@@ -154,7 +144,7 @@ mod tests {
         pub fn push_reqauth2(&mut self, from: Name, auths: Vec<PermissionLevel>, keys: Vec<PrivateKey>) -> Result<TransactionTrace, ChainError> {
             let mut trx = Transaction::default();
             trx.actions
-                .push(Action::new(PULSE_NAME, name!("reqauth").into(), from.pack().unwrap(), auths));
+                .push(Action::new(PULSE_NAME.into(), name!("reqauth").into(), from.pack().unwrap(), auths));
 
             self.set_transaction_headers(&mut trx, 6, 0);
             let mut signed: SignedTransaction = SignedTransaction::new(trx, HashSet::new(), vec![]);
@@ -170,8 +160,8 @@ mod tests {
                 pending_block_state.clone()
             } else {
                 self.pending_block_state = Some(PendingBlockState {
-                    undo_session: self.controller.create_undo_session().unwrap(),
                     timestamp: BlockTimestamp::now(),
+                    db: self.controller.database(),
                 });
 
                 self.pending_block_state.as_ref().unwrap().clone()
@@ -188,8 +178,8 @@ mod tests {
             let mut trx = Transaction::default();
             self.set_transaction_headers(&mut trx, 6, 0);
             trx.actions.push(Action::new(
-                PULSE_NAME,
-                SETCODE_NAME,
+                PULSE_NAME.into(),
+                SETCODE_NAME.into(),
                 SetCode {
                     account: account,
                     vm_type: 0,
@@ -198,7 +188,7 @@ mod tests {
                 }
                 .pack()
                 .unwrap(),
-                vec![PermissionLevel::new(PULSE_NAME, ACTIVE_NAME)],
+                vec![PermissionLevel::new(PULSE_NAME.as_u64(), ACTIVE_NAME.as_u64())],
             ));
 
             let signed = trx.sign(&get_private_key(PULSE_NAME, "active"), &self.controller.chain_id())?;
@@ -253,7 +243,7 @@ mod tests {
         }
 
         pub fn set_authority2(&mut self, account: Name, permission: Name, authority: Authority, parent: Name) -> Result<(), ChainError> {
-            let auths = vec![PermissionLevel::new(account, OWNER_NAME)];
+            let auths = vec![PermissionLevel::new(account.as_u64(), OWNER_NAME.as_u64())];
             let keys = vec![get_private_key(account, "owner")];
             self.set_authority(account, permission, authority, parent, auths, keys)
         }
@@ -283,7 +273,7 @@ mod tests {
         }
 
         pub fn delete_authority2(&mut self, account: Name, permission: Name) -> Result<(), ChainError> {
-            let auths = vec![PermissionLevel::new(account, OWNER_NAME)];
+            let auths = vec![PermissionLevel::new(account.as_u64(), OWNER_NAME.as_u64())];
             let keys = vec![get_private_key(account, "owner")];
             self.delete_authority(account, permission, auths, keys)
         }
@@ -301,7 +291,7 @@ mod tests {
                 }
                 .pack()
                 .unwrap(),
-                vec![PermissionLevel::new(account, ACTIVE_NAME)],
+                vec![PermissionLevel::new(account.as_u64(), ACTIVE_NAME.as_u64())],
             ));
             self.set_transaction_headers(&mut trx, 6, 0);
 
@@ -316,7 +306,7 @@ mod tests {
                 PULSE_NAME,
                 UNLINKAUTH_NAME,
                 UnlinkAuth { account, code, message_type }.pack().unwrap(),
-                vec![PermissionLevel::new(account, ACTIVE_NAME)],
+                vec![PermissionLevel::new(account.as_u64(), ACTIVE_NAME.as_u64())],
             ));
             self.set_transaction_headers(&mut trx, 6, 0);
 
@@ -328,21 +318,20 @@ mod tests {
 
     pub fn get_private_key(key_name: Name, role: &str) -> PrivateKey {
         let secret = key_name.to_string() + "_" + role;
-        let secret = Digest::hash(secret.as_bytes());
-        let private_key = PrivateKey::from_bytes(&secret.0).expect("Failed to create private key");
+        let private_key = PrivateKey::new_k1_from_string(&secret).expect("Failed to create private key");
         private_key
     }
 
     pub fn get_public_key(key_name: Name, role: &str) -> PublicKey {
         let private_key = get_private_key(key_name, role);
-        private_key.public_key()
+        private_key.get_public_key()
     }
 
     pub fn generate_genesis(private_key: &PrivateKey) -> Vec<u8> {
         let genesis = json!(
         {
-            "initial_timestamp": "2023-01-01T00:00:00Z",
-            "initial_key": private_key.public_key().to_string(),
+            "initial_timestamp": "2023-01-01T00:00:00",
+            "initial_key": private_key.get_public_key().to_string(),
             "initial_configuration": {
                 "max_block_net_usage": 1048576,
                 "target_block_net_usage_pct": 1000,
@@ -355,6 +344,7 @@ mod tests {
                 "target_block_cpu_usage_pct": 2500,
                 "max_transaction_cpu_usage": 150000,
                 "min_transaction_cpu_usage": 100,
+                "max_transaction_lifetime": 3600,
                 "max_inline_action_size": 4096,
                 "max_inline_action_depth": 6,
                 "max_authority_depth": 6,

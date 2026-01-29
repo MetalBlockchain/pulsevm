@@ -49,6 +49,12 @@ pub mod ffi {
         waits: Vec<WaitWeight>,
     }
 
+    #[derive(Clone, PartialEq, Eq, Hash)]
+    pub struct Genesis {
+        test: u64,
+        test2: u32,
+    }
+
     unsafe extern "C++" {
         include!("catcher.hpp");
         include!("utils.hpp");
@@ -86,6 +92,7 @@ pub mod ffi {
         pub fn get_parent_id(self: &PermissionObject) -> i64;
         pub fn get_owner(self: &PermissionObject) -> &CxxName;
         pub fn get_name(self: &PermissionObject) -> &CxxName;
+        pub fn get_authority(self: &PermissionObject) -> &CxxSharedAuthority;
 
         #[cxx_name = "permission_usage_object"]
         type PermissionUsageObject;
@@ -304,6 +311,8 @@ pub mod ffi {
         pub fn sec_since_epoch(self: &CxxTimePoint) -> u32;
 
         type CxxSharedAuthority;
+
+        type CxxSharedKeyWeight;
         
         type CxxPrivateKey;
 
@@ -311,28 +320,33 @@ pub mod ffi {
         pub fn make_empty_digest() -> UniquePtr<CxxDigest>;
         pub fn make_digest_from_data(data: &[u8]) -> Result<UniquePtr<CxxDigest>>;
         pub fn make_shared_digest_from_data(data: &[u8]) -> SharedPtr<CxxDigest>;
+        pub fn make_shared_digest_from_string(key_str: &str) -> SharedPtr<CxxDigest>;
         pub fn make_time_point_from_now() -> SharedPtr<CxxTimePoint>;
         pub fn make_block_timestamp_from_now() -> SharedPtr<CxxBlockTimestamp>;
         pub fn make_block_timestamp_from_slot(slot: u32) -> SharedPtr<CxxBlockTimestamp>;
         pub fn make_time_point_from_i64(us: i64) -> SharedPtr<CxxTimePoint>;
         pub fn make_time_point_from_microseconds(us: &CxxMicroseconds) -> SharedPtr<CxxTimePoint>;
         pub fn parse_genesis_state(json: &str) -> Result<UniquePtr<CxxGenesisState>>;
-        pub fn parse_public_key(key_str: &str) -> SharedPtr<CxxPublicKey>;
-        pub fn parse_public_key_from_bytes(data: &[u8], pos: &mut usize) -> Result<SharedPtr<CxxPublicKey>>;
+        pub fn parse_public_key(key_str: &str) -> Result<SharedPtr<CxxPublicKey>>;
+        pub fn parse_public_key_from_bytes(data: &[u8]) -> Result<SharedPtr<CxxPublicKey>>;
         pub fn parse_private_key(key_str: &str) -> Result<SharedPtr<CxxPrivateKey>>;
+        pub fn private_key_to_string(private_key: &CxxPrivateKey) -> String;
         pub fn sign_digest_with_private_key(digest: &CxxDigest, priv_key: &CxxPrivateKey) -> Result<SharedPtr<CxxSignature>>;
         pub fn parse_signature_from_bytes(data: &[u8], pos: &mut usize) -> Result<SharedPtr<CxxSignature>>;
         pub fn parse_signature(signature_str: &str) -> Result<SharedPtr<CxxSignature>>;
         pub fn recover_public_key_from_signature(sig: &CxxSignature, digest: &CxxDigest) -> Result<SharedPtr<CxxPublicKey>>;
         pub fn get_public_key_from_private_key(private_key: &CxxPrivateKey) -> SharedPtr<CxxPublicKey>;
         pub fn packed_public_key_bytes(public_key: &CxxPublicKey) -> Vec<u8>;
-        pub fn public_key_to_string(public_key: &CxxPublicKey) -> &str;
+        pub fn public_key_to_string(public_key: &CxxPublicKey) -> String;
         pub fn public_key_num_bytes(public_key: &CxxPublicKey) -> usize;
         pub fn packed_signature_bytes(signature: &CxxSignature) -> Vec<u8>;
-        pub fn signature_to_string(signature: &CxxSignature) -> &str;
+        pub fn signature_to_string(signature: &CxxSignature) -> String;
         pub fn signature_num_bytes(signature: &CxxSignature) -> usize;
         pub fn get_digest_data(digest: &CxxDigest) -> &[u8];
         pub fn get_shared_blob_data(blob: &CxxSharedBlob) -> &[u8];
+        pub fn get_authority_from_shared_authority(shared_auth: &CxxSharedAuthority) -> Authority;
+        pub fn make_unknown_public_key() -> SharedPtr<CxxPublicKey>;
+        pub fn make_k1_private_key(secret: &CxxDigest) -> SharedPtr<CxxPrivateKey>;
 
         pub type CxxName;
 

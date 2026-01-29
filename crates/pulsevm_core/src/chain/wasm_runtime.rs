@@ -99,7 +99,10 @@ pub struct WasmRuntime {
 
 impl WasmRuntime {
     pub fn new() -> Result<Self, ChainError> {
-        let compiler = Cranelift::default();
+        let mut compiler = Cranelift::default();
+
+        // Deterministic floating point operations
+        Cranelift::canonicalize_nans(&mut compiler, true);
 
         Ok(Self {
             inner: Arc::new(RwLock::new(InnerWasmRuntime {

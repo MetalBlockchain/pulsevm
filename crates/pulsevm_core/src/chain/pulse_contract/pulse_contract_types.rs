@@ -55,3 +55,60 @@ pub struct SetAbi {
     pub account: Name,
     pub abi: Arc<Bytes>,
 }
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use crate::crypto::PublicKey;
+
+    use super::*;
+    use pulsevm_ffi::{KeyWeight, PermissionLevel, PermissionLevelWeight, WaitWeight, parse_public_key};
+    use pulsevm_serialization::{Read, Write};
+    use pulsevm_name_macro::name;
+
+    #[test]
+    fn test_new_account_serialization() {
+        let new_account = NewAccount {
+            creator: Name::from_str("alice").unwrap(),
+            name: Name::from_str("newaccount").unwrap(),
+            owner: Authority::new(
+                1,
+                vec![
+                    KeyWeight {
+                        key: parse_public_key(
+                            "PUB_K1_5bbkxaLdB5bfVZW6DJY8M74vwT2m61PqwywNUa5azfkJTvYa5H",
+                        ).unwrap(),
+                        weight: 1,
+                    },
+                ],
+                vec![
+                    PermissionLevelWeight {
+                        permission: PermissionLevel {
+                            actor: name!("bob"),
+                            permission: name!("active"),
+                        },
+                        weight: 1,
+                    }
+                ],
+                vec![
+                    WaitWeight {
+                        wait_sec: 10,
+                        weight: 1,
+                    }
+                ],
+            ),
+            active: Authority::new(
+                1,
+                vec![],
+                vec![],
+                vec![],
+            ),
+        };
+
+        let packed = new_account.pack().unwrap();
+        let unpacked = NewAccount::read(&packed, &mut 0).unwrap();
+
+        assert_eq!(new_account, unpacked);
+    }
+}

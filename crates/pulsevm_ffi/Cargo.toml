@@ -9,6 +9,7 @@ cxx = "1.0.194"
 tempfile = "3.23.0"
 serde = { version = "1.0", features = ["derive"] }
 pulsevm_error = { path = "../pulsevm_error" }
+pulsevm_name = { path = "../pulsevm_name" }
 pulsevm_proc_macros = { path = "../pulsevm_proc_macros" }
 pulsevm_serialization = { path = "../pulsevm_serialization" }
 zerocopy = "0.8.34"

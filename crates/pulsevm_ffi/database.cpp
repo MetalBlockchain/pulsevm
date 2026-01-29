@@ -1,5 +1,6 @@
 #include "database.hpp"
 #include <pulsevm_ffi/src/bridge.rs.h>
+#include <fc/reflect/reflect.hpp>
 #include <filesystem>
 
 namespace pulsevm::chain {

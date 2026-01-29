@@ -58,7 +58,7 @@ impl Serialize for Signature {
     where
         S: serde::Serializer,
     {
-        serializer.serialize_str(self.inner.to_string_rust())
+        serializer.serialize_str(&self.inner.to_string_rust())
     }
 }
 
@@ -91,13 +91,14 @@ impl<'de> Deserialize<'de> for Signature {
 
 impl NumBytes for Signature {
     fn num_bytes(&self) -> usize {
-        self.inner.num_bytes()
+        self.inner.num_bytes().num_bytes() + self.inner.num_bytes()
     }
 }
 
 impl Read for Signature {
     fn read(bytes: &[u8], pos: &mut usize) -> Result<Self, ReadError> {
-        let cxx_key = pulsevm_ffi::parse_signature_from_bytes(bytes, pos).map_err(|e| ReadError::CustomError(e.to_string()))?;
+        let packed = Vec::<u8>::read(bytes, pos)?;
+        let cxx_key = pulsevm_ffi::parse_signature_from_bytes(&packed, pos).map_err(|e| ReadError::CustomError(e.to_string()))?;
         Ok(Signature { inner: cxx_key })
     }
 }

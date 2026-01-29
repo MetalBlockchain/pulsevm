@@ -301,9 +301,7 @@ impl ApplyContext {
             let inner = self.inner.read()?;
 
             if !inner.privileged {
-                let global_properties = unsafe { &*self.db.get_global_properties()? };
                 AuthorizationManager::check_authorization(
-                    global_properties.get_chain_config(),
                     &mut self.db,
                     &vec![a.clone()],
                     &HashSet::new(),       // No provided keys

@@ -17,4 +17,5 @@ namespace pulsevm { namespace chain {
     using CxxSharedAuthority = pulsevm::chain::shared_authority;
     using CxxPrivateKey = pulsevm::chain::private_key_type;
     using CxxSharedKeyWeight = pulsevm::chain::shared_key_weight;
+    using CxxSharedKeyWeightVector = pulsevm::chain::shared_vector<pulsevm::chain::shared_key_weight>;
 }}

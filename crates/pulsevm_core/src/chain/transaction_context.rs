@@ -8,7 +8,7 @@ use pulsevm_ffi::Database;
 use pulsevm_serialization::VarUint32;
 use pulsevm_time::{Microseconds, TimePoint};
 
-use crate::chain::{
+use crate::{block::BlockStatus, chain::{
     apply_context::ApplyContext,
     block::BlockTimestamp,
     id::Id,
@@ -17,7 +17,7 @@ use crate::chain::{
     transaction::{Action, ActionTrace, Transaction, TransactionReceiptHeader, TransactionStatus, TransactionTrace},
     utils::pulse_assert,
     wasm_runtime::WasmRuntime,
-};
+}};
 
 #[derive(Default, Clone)]
 struct Billing {
@@ -46,11 +46,12 @@ struct TransactionContextInner {
 pub struct TransactionContext {
     db: Database,
     wasm_runtime: WasmRuntime,
+    block_status: BlockStatus,
     inner: Arc<RwLock<TransactionContextInner>>,
 }
 
 impl TransactionContext {
-    pub fn new(db: Database, wasm_runtime: WasmRuntime, block_num: u32, pending_block_timestamp: BlockTimestamp, transaction_id: &Id) -> Self {
+    pub fn new(db: Database, wasm_runtime: WasmRuntime, block_num: u32, pending_block_timestamp: BlockTimestamp, transaction_id: &Id, block_status: BlockStatus) -> Self {
         let mut trace = TransactionTrace::default();
         trace.id = *transaction_id;
         trace.block_num = block_num;
@@ -59,6 +60,7 @@ impl TransactionContext {
         Self {
             db,
             wasm_runtime,
+            block_status,
             inner: Arc::new(RwLock::new(TransactionContextInner {
                 initialized: false,
                 trace,

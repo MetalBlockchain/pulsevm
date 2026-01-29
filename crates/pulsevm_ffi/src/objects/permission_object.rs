@@ -7,3 +7,11 @@ impl PermissionObject {
         Ok(true) // TODO: Fix this
     }
 }
+
+impl PartialEq for PermissionObject {
+    fn eq(&self, other: &Self) -> bool {
+        self.get_id() == other.get_id()
+    }
+}
+
+impl Eq for PermissionObject {}
