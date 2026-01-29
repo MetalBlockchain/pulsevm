@@ -2,16 +2,11 @@
 mod auth_tests {
     use anyhow::Result;
     use pulsevm_core::{
-        ACTIVE_NAME, OWNER_NAME, PULSE_NAME,
-        authority::{Authority, Permission, PermissionByOwnerIndex, PermissionLevel, PermissionLevelWeight},
-        authorization_manager::AuthorizationManager,
-        error::ChainError,
-        name::Name,
-        secp256k1::PublicKey,
+        ACTIVE_NAME, ChainError, OWNER_NAME, PULSE_NAME, authority::{self, Authority, PermissionLevel, PermissionLevelWeight}, authorization_manager::AuthorizationManager, crypto::PublicKey, name::Name
     };
-    use pulsevm_proc_macros::name;
 
     use crate::tests::{Testing, get_private_key};
+    use pulsevm_name_macro::name;
 
     #[test]
     fn test_missing_sigs() -> Result<()> {
@@ -21,7 +16,7 @@ mod auth_tests {
             chain
                 .push_reqauth2(
                     name!("alice").into(),
-                    vec![PermissionLevel::new(name!("alice").into(), ACTIVE_NAME)],
+                    vec![PermissionLevel::new(name!("alice").into(), ACTIVE_NAME.as_u64())],
                     vec![],
                 )
                 .err(),
@@ -36,7 +31,7 @@ mod auth_tests {
     #[test]
     fn test_missing_multi_sigs() -> Result<()> {
         let mut chain = Testing::new();
-        chain.create_account(name!("alice").into(), PULSE_NAME, true, true)?;
+        chain.create_account(name!("alice").into(), PULSE_NAME.into(), true, true)?;
         assert_eq!(
             chain.push_reqauth(name!("alice").into(), "owner", false,).err(),
             Some(ChainError::AuthorizationError(
@@ -56,7 +51,7 @@ mod auth_tests {
             chain
                 .push_reqauth2(
                     name!("alice").into(),
-                    vec![PermissionLevel::new(name!("bob").into(), ACTIVE_NAME)],
+                    vec![PermissionLevel::new(name!("bob").into(), ACTIVE_NAME.as_u64())],
                     vec![get_private_key(name!("bob").into(), "active")],
                 )
                 .err(),
@@ -72,18 +67,17 @@ mod auth_tests {
         let delegated_auth = Authority::new(
             1,
             vec![],
-            vec![PermissionLevelWeight::new((name!("bob").into(), ACTIVE_NAME).into(), 1)],
+            vec![PermissionLevelWeight::new((name!("bob"), ACTIVE_NAME.as_u64()).into(), 1)],
             vec![],
         );
-        chain.set_authority2(name!("alice").into(), ACTIVE_NAME, delegated_auth.clone(), OWNER_NAME)?;
+        chain.set_authority2(name!("alice").into(), ACTIVE_NAME.into(), delegated_auth.clone(), OWNER_NAME.into())?;
         let pending_block_state = chain.get_pending_block_state();
-        let mut undo_session = pending_block_state.undo_session.clone();
-        let new_auth = AuthorizationManager::get_permission(&mut undo_session, &(name!("alice").into(), ACTIVE_NAME).into())?.authority;
-        assert!(new_auth == delegated_auth);
+        let new_auth = AuthorizationManager::get_permission(&mut pending_block_state.db.clone(), name!("alice"), ACTIVE_NAME.as_u64())?;
+        assert!(new_auth.get_authority().to_authority() == delegated_auth);
         // execute nonce from alice signed by bob
         chain.push_reqauth2(
             name!("alice").into(),
-            vec![PermissionLevel::new(name!("alice").into(), ACTIVE_NAME)],
+            vec![PermissionLevel::new(name!("alice").into(), ACTIVE_NAME.as_u64())],
             vec![get_private_key(name!("bob").into(), "active")],
         )?;
         Ok(())
@@ -92,73 +86,73 @@ mod auth_tests {
     #[test]
     fn test_update_auths() -> Result<()> {
         let mut chain = Testing::new();
-        chain.create_account(name!("alice").into(), PULSE_NAME, false, true)?;
-        chain.create_account(name!("bob").into(), PULSE_NAME, false, true)?;
+        chain.create_account(name!("alice").into(), PULSE_NAME.into(), false, true)?;
+        chain.create_account(name!("bob").into(), PULSE_NAME.into(), false, true)?;
         // Deleting active or owner should fail
         assert_eq!(
-            chain.delete_authority2(name!("alice").into(), ACTIVE_NAME).err(),
+            chain.delete_authority2(name!("alice").into(), ACTIVE_NAME.into()).err(),
             Some(ChainError::ActionValidationError(format!("cannot delete active authority")))
         );
         assert_eq!(
-            chain.delete_authority2(name!("alice").into(), OWNER_NAME).err(),
+            chain.delete_authority2(name!("alice").into(), OWNER_NAME.into()).err(),
             Some(ChainError::ActionValidationError(format!("cannot delete owner authority")))
         );
 
         // Change owner permission
         let new_owner_priv_key = get_private_key(name!("alice").into(), "new_owner");
-        let new_owner_pub_key = new_owner_priv_key.public_key();
+        let new_owner_pub_key = new_owner_priv_key.get_public_key();
         chain.set_authority2(
             name!("alice").into(),
-            OWNER_NAME,
-            Authority::new_from_public_key(new_owner_pub_key.clone()),
+            OWNER_NAME.into(),
+            Authority::new_from_public_key(new_owner_pub_key.inner()),
             Name::default(),
         )?;
 
         // Ensure the permission is updated
         let pending_block_state = chain.get_pending_block_state();
-        let mut undo_session = pending_block_state.undo_session.clone();
-        let obj = undo_session.find_by_secondary::<Permission, PermissionByOwnerIndex>((name!("alice").into(), OWNER_NAME))?;
-        assert!(obj.is_some());
-        let obj = obj.unwrap();
-        let owner_id = obj.id;
-        assert!(obj.owner == name!("alice"));
-        assert!(obj.name == OWNER_NAME);
-        assert!(obj.parent == 0);
-        assert!(obj.authority.threshold == 1);
-        assert!(obj.authority.keys.len() == 1);
-        assert!(obj.authority.accounts.len() == 0);
-        assert!(obj.authority.keys[0].key().to_string() == new_owner_pub_key.to_string());
-        assert!(obj.authority.keys[0].key().clone() == new_owner_pub_key);
-        assert!(obj.authority.keys[0].weight() == 1);
+        let obj = pending_block_state.db.find_permission_by_actor_and_permission(name!("alice"), OWNER_NAME.as_u64())?;
+        assert!(!obj.is_null());
+        let obj = unsafe { obj.as_ref().unwrap() };
+        let owner_id = obj.get_id();
+        assert!(obj.get_owner().to_uint64_t() == name!("alice"));
+        assert!(obj.get_name().to_uint64_t() == OWNER_NAME);
+        assert!(obj.get_parent_id() == 0);
+        let authority = obj.get_authority().to_authority();
+        assert!(authority.threshold == 1);
+        assert!(authority.keys.len() == 1);
+        assert!(authority.accounts.len() == 0);
+        assert!(authority.keys[0].key.to_string() == new_owner_pub_key.to_string());
+        assert!(authority.keys[0].weight == 1);
 
         // Change active permission, remember that the owner key has been changed
         let new_active_priv_key = get_private_key(name!("alice").into(), "new_active");
-        let new_active_pub_key = new_active_priv_key.public_key();
+        let new_active_pub_key = new_active_priv_key.get_public_key();
         chain.set_authority(
             name!("alice").into(),
             ACTIVE_NAME,
-            Authority::new_from_public_key(new_active_pub_key.clone()),
+            Authority::new_from_public_key(new_active_pub_key.inner()),
             OWNER_NAME,
-            vec![PermissionLevel::new(name!("alice").into(), ACTIVE_NAME)],
+            vec![PermissionLevel::new(name!("alice").into(), ACTIVE_NAME.as_u64())],
             vec![get_private_key(name!("alice").into(), "active")],
         )?;
 
-        let obj = undo_session.find_by_secondary::<Permission, PermissionByOwnerIndex>((name!("alice").into(), ACTIVE_NAME))?;
-        assert!(obj.is_some());
-        let obj = obj.unwrap();
-        assert!(obj.owner == name!("alice"));
-        assert!(obj.name == ACTIVE_NAME);
-        assert!(obj.parent == owner_id);
-        assert!(obj.authority.threshold == 1);
-        assert!(obj.authority.keys.len() == 1);
-        assert!(obj.authority.accounts.len() == 0);
-        assert!(obj.authority.keys[0].key().clone() == new_active_pub_key);
-        assert!(obj.authority.keys[0].weight() == 1);
+        let obj = pending_block_state.db.find_permission_by_actor_and_permission(name!("alice"), ACTIVE_NAME.as_u64())?;
+        assert!(!obj.is_null());
+        let obj = unsafe { obj.as_ref().unwrap() };
+        assert!(obj.get_owner().to_uint64_t() == name!("alice"));
+        assert!(obj.get_name().to_uint64_t() == ACTIVE_NAME);
+        assert!(obj.get_parent_id() == owner_id);
+        let authority = obj.get_authority().to_authority();
+        assert!(authority.threshold == 1);
+        assert!(authority.keys.len() == 1);
+        assert!(authority.accounts.len() == 0);
+        assert!(authority.keys[0].key.to_string_rust() == new_active_pub_key.to_string());
+        assert!(authority.keys[0].weight == 1);
 
         let spending_priv_key = get_private_key(name!("alice").into(), "spending");
-        let spending_pub_key = spending_priv_key.public_key();
+        let spending_pub_key = spending_priv_key.get_public_key();
         let trading_priv_key = get_private_key(name!("alice").into(), "trading");
-        let trading_pub_key = trading_priv_key.public_key();
+        let trading_pub_key = trading_priv_key.get_public_key();
 
         // Bob attempts to create new spending auth for Alice
         assert_eq!(
@@ -166,9 +160,9 @@ mod auth_tests {
                 .set_authority(
                     name!("alice").into(),
                     name!("spending").into(),
-                    Authority::new_from_public_key(spending_pub_key.clone()),
+                    Authority::new_from_public_key(spending_pub_key.inner()),
                     ACTIVE_NAME,
-                    vec![PermissionLevel::new(name!("bob").into(), ACTIVE_NAME)],
+                    vec![PermissionLevel::new(name!("bob").into(), ACTIVE_NAME.as_u64())],
                     vec![get_private_key(name!("bob").into(), "active")],
                 )
                 .err(),
@@ -181,19 +175,21 @@ mod auth_tests {
         chain.set_authority(
             name!("alice").into(),
             name!("spending").into(),
-            Authority::new_from_public_key(spending_pub_key.clone()),
+            Authority::new_from_public_key(spending_pub_key.inner()),
             ACTIVE_NAME,
-            vec![PermissionLevel::new(name!("alice").into(), ACTIVE_NAME)],
+            vec![PermissionLevel::new(name!("alice").into(), ACTIVE_NAME.as_u64())],
             vec![new_active_priv_key.clone()],
         )?;
-        let obj = undo_session.find_by_secondary::<Permission, PermissionByOwnerIndex>((name!("alice").into(), name!("spending").into()))?;
-        assert!(obj.is_some());
-        let obj = obj.unwrap();
-        assert!(obj.owner == name!("alice"));
-        assert!(obj.name == name!("spending"));
-        let parent = undo_session.get::<Permission>(obj.parent)?;
-        assert!(parent.owner == name!("alice"));
-        assert!(parent.name == ACTIVE_NAME);
+        let obj = pending_block_state.db.find_permission_by_actor_and_permission(name!("alice"), name!("spending"))?;
+        assert!(!obj.is_null());
+        let obj = unsafe { obj.as_ref().unwrap() };
+        assert!(obj.get_owner().to_uint64_t() == name!("alice"));
+        assert!(obj.get_name().to_uint64_t() == name!("spending"));
+        let parent = pending_block_state.db.find_permission(obj.get_parent_id())?;
+        assert!(!parent.is_null());
+        let parent = unsafe { parent.as_ref().unwrap() };
+        assert!(parent.get_owner().to_uint64_t() == name!("alice"));
+        assert!(parent.get_name().to_uint64_t() == ACTIVE_NAME);
 
         // Update spending auth parent to be its own, should fail
         assert_eq!(
@@ -201,7 +197,7 @@ mod auth_tests {
                 .set_authority(
                     name!("alice").into(),
                     name!("spending").into(),
-                    Authority::new_from_public_key(spending_pub_key.clone()),
+                    Authority::new_from_public_key(spending_pub_key.inner()),
                     name!("spending").into(),
                     vec![PermissionLevel::new(name!("alice").into(), name!("spending").into())],
                     vec![spending_priv_key.clone()],
@@ -216,7 +212,7 @@ mod auth_tests {
                 .set_authority(
                     name!("alice").into(),
                     name!("spending").into(),
-                    Authority::new_from_public_key(spending_pub_key.clone()),
+                    Authority::new_from_public_key(spending_pub_key.inner()),
                     OWNER_NAME,
                     vec![PermissionLevel::new(name!("alice").into(), name!("spending").into())],
                     vec![spending_priv_key.clone()],
@@ -231,19 +227,20 @@ mod auth_tests {
         chain.delete_authority(
             name!("alice").into(),
             name!("spending").into(),
-            vec![PermissionLevel::new(name!("alice").into(), ACTIVE_NAME)],
+            vec![PermissionLevel::new(name!("alice").into(), ACTIVE_NAME.as_u64())],
             vec![new_active_priv_key.clone()],
         )?;
-        let obj = undo_session.find_by_secondary::<Permission, PermissionByOwnerIndex>((name!("alice").into(), name!("spending").into()))?;
-        assert!(obj.is_none());
+        let obj = pending_block_state.db.find_permission_by_actor_and_permission(name!("alice"), name!("spending"))?;
+        assert!(!obj.is_null());
+        let obj = unsafe { obj.as_ref().unwrap() };
 
         // Create new trading auth
         chain.set_authority(
             name!("alice").into(),
             name!("trading").into(),
-            Authority::new_from_public_key(trading_pub_key.clone()),
+            Authority::new_from_public_key(trading_pub_key.inner()),
             ACTIVE_NAME,
-            vec![PermissionLevel::new(name!("alice").into(), ACTIVE_NAME)],
+            vec![PermissionLevel::new(name!("alice").into(), ACTIVE_NAME.as_u64())],
             vec![new_active_priv_key.clone()],
         )?;
 
@@ -251,27 +248,29 @@ mod auth_tests {
         chain.set_authority(
             name!("alice").into(),
             name!("spending").into(),
-            Authority::new_from_public_key(spending_pub_key.clone()),
+            Authority::new_from_public_key(spending_pub_key.inner()),
             name!("trading").into(),
             vec![PermissionLevel::new(name!("alice").into(), name!("trading").into())],
             vec![trading_priv_key.clone()],
         )?;
 
         // Verify correctness of trading and spending
-        let trading = undo_session.find_by_secondary::<Permission, PermissionByOwnerIndex>((name!("alice").into(), name!("trading").into()))?;
-        let spending = undo_session.find_by_secondary::<Permission, PermissionByOwnerIndex>((name!("alice").into(), name!("spending").into()))?;
-        assert!(trading.is_some());
-        assert!(spending.is_some());
-        let trading = trading.unwrap();
-        let spending = spending.unwrap();
-        assert!(trading.owner == name!("alice"));
-        assert!(spending.owner == name!("alice"));
-        assert!(trading.name == name!("trading"));
-        assert!(spending.name == name!("spending"));
-        assert!(spending.parent == trading.id);
-        let parent = undo_session.get::<Permission>(trading.parent)?;
-        assert!(parent.owner == name!("alice"));
-        assert!(parent.name == ACTIVE_NAME);
+        let trading = pending_block_state.db.find_permission_by_actor_and_permission(name!("alice"), name!("trading"))?;
+        let spending = pending_block_state.db.find_permission_by_actor_and_permission(name!("alice"), name!("spending"))?;
+        assert!(!trading.is_null());
+        assert!(!spending.is_null());
+        let trading = unsafe { trading.as_ref().unwrap() };
+        let spending = unsafe { spending.as_ref().unwrap() };
+        assert!(trading.get_owner().to_uint64_t() == name!("alice"));
+        assert!(spending.get_owner().to_uint64_t() == name!("alice"));
+        assert!(trading.get_name().to_uint64_t() == name!("trading"));
+        assert!(spending.get_name().to_uint64_t() == name!("spending"));
+        assert!(spending.get_parent_id() == trading.get_id());
+        let parent = pending_block_state.db.find_permission(trading.get_parent_id())?;
+        assert!(!parent.is_null());
+        let parent = unsafe { parent.as_ref().unwrap() };
+        assert!(parent.get_owner().to_uint64_t() == name!("alice"));
+        assert!(parent.get_name().to_uint64_t() == ACTIVE_NAME);
 
         // Delete trading, should fail since it has children (spending)
         assert_eq!(
@@ -279,7 +278,7 @@ mod auth_tests {
                 .delete_authority(
                     name!("alice").into(),
                     name!("trading").into(),
-                    vec![PermissionLevel::new(name!("alice").into(), ACTIVE_NAME)],
+                    vec![PermissionLevel::new(name!("alice").into(), ACTIVE_NAME.as_u64())],
                     vec![new_active_priv_key.clone()]
                 )
                 .err(),
@@ -294,7 +293,7 @@ mod auth_tests {
                 .set_authority(
                     name!("alice").into(),
                     name!("trading").into(),
-                    Authority::new_from_public_key(trading_pub_key.clone()),
+                    Authority::new_from_public_key(trading_pub_key.inner()),
                     name!("spending").into(),
                     vec![PermissionLevel::new(name!("alice").into(), name!("trading").into())],
                     vec![trading_priv_key.clone()],
@@ -308,23 +307,19 @@ mod auth_tests {
         chain.delete_authority(
             name!("alice").into(),
             name!("spending").into(),
-            vec![PermissionLevel::new(name!("alice").into(), ACTIVE_NAME)],
+            vec![PermissionLevel::new(name!("alice").into(), ACTIVE_NAME.as_u64())],
             vec![new_active_priv_key.clone()],
         )?;
-        assert_eq!(
-            undo_session.find_by_secondary::<Permission, PermissionByOwnerIndex>((name!("alice").into(), name!("spending").into(),))?,
-            None
-        );
+        let res = pending_block_state.db.find_permission_by_actor_and_permission(name!("alice"), name!("spending"))?;
+        assert!(res.is_null());
         chain.delete_authority(
             name!("alice").into(),
             name!("trading").into(),
-            vec![PermissionLevel::new(name!("alice").into(), ACTIVE_NAME)],
+            vec![PermissionLevel::new(name!("alice").into(), ACTIVE_NAME.as_u64())],
             vec![new_active_priv_key.clone()],
         )?;
-        assert_eq!(
-            undo_session.find_by_secondary::<Permission, PermissionByOwnerIndex>((name!("alice").into(), name!("trading").into(),))?,
-            None
-        );
+        let res = pending_block_state.db.find_permission_by_actor_and_permission(name!("alice"), name!("trading"))?;
+        assert!(res.is_null());
         Ok(())
     }
 
@@ -333,27 +328,27 @@ mod auth_tests {
         let mut chain = Testing::new();
         chain.create_account(name!("alice").into(), PULSE_NAME, false, true)?;
         // public key with no corresponding private key
-        let new_owner_pub_key = PublicKey::default();
+        let new_owner_pub_key = PublicKey::new_unknown();
         chain.set_authority2(
             name!("alice").into(),
             OWNER_NAME,
-            Authority::new_from_public_key(new_owner_pub_key.clone()),
+            Authority::new_from_public_key(new_owner_pub_key.inner()),
             Name::default(),
         )?;
         // Ensure the permission is updated
         let pending_block_state = chain.get_pending_block_state();
-        let mut undo_session = pending_block_state.undo_session.clone();
-        let obj = undo_session.find_by_secondary::<Permission, PermissionByOwnerIndex>((name!("alice").into(), OWNER_NAME))?;
-        assert!(obj.is_some());
-        let obj = obj.unwrap();
-        assert!(obj.owner == name!("alice"));
-        assert!(obj.name == OWNER_NAME);
-        assert!(obj.parent == 0);
-        assert!(obj.authority.threshold == 1);
-        assert!(obj.authority.keys.len() == 1);
-        assert!(obj.authority.accounts.len() == 0);
-        assert!(obj.authority.keys[0].key().clone() == new_owner_pub_key);
-        assert!(obj.authority.keys[0].weight() == 1);
+        let obj = pending_block_state.db.find_permission_by_actor_and_permission(name!("alice"), OWNER_NAME.as_u64())?;
+        assert!(!obj.is_null());
+        let obj = unsafe { obj.as_ref().unwrap() };
+        assert!(obj.get_owner().to_uint64_t() == name!("alice"));
+        assert!(obj.get_name().to_uint64_t() == OWNER_NAME.as_u64());
+        assert!(obj.get_parent_id() == 0);
+        let authority = obj.get_authority().to_authority();
+        assert!(authority.threshold == 1);
+        assert!(authority.keys.len() == 1);
+        assert!(authority.accounts.len() == 0);
+        assert!(authority.keys[0].key.to_string_rust() == new_owner_pub_key.to_string());
+        assert!(authority.keys[0].weight == 1);
         Ok(())
     }
 
@@ -363,20 +358,20 @@ mod auth_tests {
         chain.create_accounts(vec![name!("alice").into(), name!("bob").into()], false, true)?;
 
         let spending_priv_key = get_private_key(name!("alice").into(), "spending");
-        let spending_pub_key = spending_priv_key.public_key();
+        let spending_pub_key = spending_priv_key.get_public_key();
         let scud_priv_key = get_private_key(name!("alice").into(), "scud");
-        let scud_pub_key = scud_priv_key.public_key();
+        let scud_pub_key = scud_priv_key.get_public_key();
 
         chain.set_authority2(
             name!("alice").into(),
             name!("spending").into(),
-            Authority::new_from_public_key(spending_pub_key),
+            Authority::new_from_public_key(spending_pub_key.inner()),
             ACTIVE_NAME,
         )?;
         chain.set_authority2(
             name!("alice").into(),
             name!("scud").into(),
-            Authority::new_from_public_key(scud_pub_key),
+            Authority::new_from_public_key(scud_pub_key.inner()),
             name!("spending").into(),
         )?;
 
@@ -471,14 +466,14 @@ mod auth_tests {
         chain.create_account(name!("alice").into(), PULSE_NAME, false, true)?;
 
         let first_priv_key = get_private_key(name!("alice").into(), "first");
-        let first_pub_key = first_priv_key.public_key();
+        let first_pub_key = first_priv_key.get_public_key();
         let second_priv_key = get_private_key(name!("alice").into(), "second");
-        let second_pub_key = second_priv_key.public_key();
+        let second_pub_key = second_priv_key.get_public_key();
 
         chain.set_authority2(
             name!("alice").into(),
             name!("first").into(),
-            Authority::new_from_public_key(first_pub_key),
+            Authority::new_from_public_key(first_pub_key.inner()),
             ACTIVE_NAME,
         )?;
         chain.link_authority(name!("alice").into(), PULSE_NAME, name!("first").into(), name!("reqauth").into())?;
@@ -492,7 +487,7 @@ mod auth_tests {
         chain.set_authority2(
             name!("alice").into(),
             name!("first").into(),
-            Authority::new_from_public_key(second_pub_key),
+            Authority::new_from_public_key(second_pub_key.inner()),
             ACTIVE_NAME,
         )?;
         // Authority updated, using previous "first" auth should fail on linked auth
