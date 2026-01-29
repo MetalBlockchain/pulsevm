@@ -91,20 +91,13 @@ namespace fc { namespace crypto {
    static private_key::storage_type priv_parse_base58(const string& base58str)
    {
       const auto pivot = base58str.find('_');
+      constexpr auto prefix = config::private_key_base_prefix;
+      const auto prefix_str = base58str.substr(0, pivot);
+      FC_ASSERT(prefix == prefix_str, "Private Key has invalid prefix: ${str}", ("str", base58str)("prefix_str", prefix_str));
 
-      if (pivot == std::string::npos) {
-         // wif import
-         using default_type = std::variant_alternative_t<0, private_key::storage_type>;
-         return private_key::storage_type(from_wif<default_type>(base58str));
-      } else {
-         constexpr auto prefix = config::private_key_base_prefix;
-         const auto prefix_str = base58str.substr(0, pivot);
-         FC_ASSERT(prefix == prefix_str, "Private Key has invalid prefix: ${str}", ("str", base58str)("prefix_str", prefix_str));
-
-         auto data_str = base58str.substr(pivot + 1);
-         FC_ASSERT(!data_str.empty(), "Private Key has no data: ${str}", ("str", base58str));
-         return base58_str_parser<private_key::storage_type, config::private_key_prefix>::apply(data_str);
-      }
+      auto data_str = base58str.substr(pivot + 1);
+      FC_ASSERT(!data_str.empty(), "Private Key has no data: ${str}", ("str", base58str));
+      return base58_str_parser<private_key::storage_type, config::private_key_prefix>::apply(data_str);
    }
 
    private_key::private_key(const std::string& base58str)
@@ -113,13 +106,6 @@ namespace fc { namespace crypto {
 
    std::string private_key::to_string(const fc::yield_function_t& yield) const
    {
-      auto which = _storage.index();
-
-      if (which == 0) {
-         using default_type = std::variant_alternative_t<0, private_key::storage_type>;
-         return to_wif(std::template get<default_type>(_storage), yield);
-      }
-
       auto data_str = std::visit(base58str_visitor<storage_type, config::private_key_prefix>(yield), _storage);
       return std::string(config::private_key_base_prefix) + "_" + data_str;
    }
