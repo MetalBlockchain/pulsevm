@@ -4,3 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+syn = { version = "1.0.13", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+pulsevm_error = { path = "../pulsevm_error" }
+pulsevm_proc_macros = { path = "../pulsevm_proc_macros" }
+pulsevm_serialization = { path = "../pulsevm_serialization" }
+proc-macro2 = "1"
+quote = "1"

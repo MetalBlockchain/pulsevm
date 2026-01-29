@@ -6,18 +6,9 @@ use quote::quote;
 use syn::parse_macro_input;
 
 mod internal;
-mod name;
 mod num_bytes;
 mod read;
 mod write;
-
-#[inline]
-#[proc_macro]
-pub fn name(input: TokenStream) -> TokenStream {
-    use crate::name::PulseName;
-    let item = parse_macro_input!(input as PulseName);
-    quote!(#item).into()
-}
 
 #[inline]
 #[proc_macro_derive(NumBytes)]

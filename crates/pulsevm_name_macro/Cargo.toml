@@ -1,9 +1,10 @@
 [package]
-name = "pulsevm_proc_macros"
+name = "pulsevm_name_macro"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+pulsevm_name = { path = "../pulsevm_name" }
 proc-macro2 = "1"
 quote = "1"
 syn = { version = "1.0.13", features = ["full"] }
