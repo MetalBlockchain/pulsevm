@@ -26,11 +26,13 @@ This process takes around `200 milliseconds` depending on various factors.
 
 - Supported OS
   - Ubuntu 22.04 or greater
-  - Mac OSX
+  - Mac OSX: only for development
 - zstd
   - For Mac: `brew install zstd`
-- LLVM >= 18: used to compile and run WebAssembly contracts
+- LLVM 18: used to compile and run WebAssembly contracts
   - For Mac: `brew install llvm@18`
+- LibFFI
+  - For Mac: `brew install libffi`
 
 If you are getting a zstd error on Mac, try:
 

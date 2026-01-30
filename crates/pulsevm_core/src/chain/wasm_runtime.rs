@@ -7,8 +7,8 @@ use lru::LruCache;
 use pulsevm_crypto::Bytes;
 use pulsevm_error::ChainError;
 use pulsevm_ffi::{CxxDigest, Database};
-use wasmer::{Engine, Function, FunctionEnv, Instance, Memory, Module, Store, imports};
-use wasmer_compiler_cranelift::Cranelift;
+use wasmer::{Engine, Function, FunctionEnv, Instance, Memory, Module, Store, imports, sys::CompilerConfig};
+use wasmer_compiler_llvm::LLVM;
 
 use crate::{
     block::BlockTimestamp,
@@ -99,10 +99,10 @@ pub struct WasmRuntime {
 
 impl WasmRuntime {
     pub fn new() -> Result<Self, ChainError> {
-        let mut compiler = Cranelift::default();
+        let mut compiler = LLVM::default();
 
         // Deterministic floating point operations
-        Cranelift::canonicalize_nans(&mut compiler, true);
+        LLVM::canonicalize_nans(&mut compiler, true);
 
         Ok(Self {
             inner: Arc::new(RwLock::new(InnerWasmRuntime {
