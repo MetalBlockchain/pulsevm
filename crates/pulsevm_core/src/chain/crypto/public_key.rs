@@ -1,6 +1,7 @@
 use std::{
     fmt::{self, Debug, Display},
-    hash::{Hash, Hasher}, str::FromStr,
+    hash::{Hash, Hasher},
+    str::FromStr,
 };
 
 use cxx::SharedPtr;

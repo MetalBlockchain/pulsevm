@@ -6,7 +6,16 @@ mod tests {
     use std::{collections::HashSet, fs, path::Path, str::FromStr, sync::Arc, vec};
 
     use pulsevm_core::{
-        ACTIVE_NAME, CODE_NAME, ChainError, Database, OWNER_NAME, PULSE_NAME, authority::{Authority, KeyWeight, PermissionLevel, PermissionLevelWeight}, block::{BlockStatus, BlockTimestamp}, config::{DELETEAUTH_NAME, LINKAUTH_NAME, NEWACCOUNT_NAME, SETCODE_NAME, UNLINKAUTH_NAME, UPDATEAUTH_NAME}, controller::Controller, crypto::{PrivateKey, PublicKey}, name::Name, pulse_contract::{DeleteAuth, LinkAuth, NewAccount, SetCode, UnlinkAuth, UpdateAuth}, transaction::{Action, PackedTransaction, SignedTransaction, Transaction, TransactionTrace}, utils::pulse_assert
+        ACTIVE_NAME, CODE_NAME, ChainError, Database, OWNER_NAME, PULSE_NAME,
+        authority::{Authority, KeyWeight, PermissionLevel, PermissionLevelWeight},
+        block::{BlockStatus, BlockTimestamp},
+        config::{DELETEAUTH_NAME, LINKAUTH_NAME, NEWACCOUNT_NAME, SETCODE_NAME, UNLINKAUTH_NAME, UPDATEAUTH_NAME},
+        controller::Controller,
+        crypto::{PrivateKey, PublicKey},
+        name::Name,
+        pulse_contract::{DeleteAuth, LinkAuth, NewAccount, SetCode, UnlinkAuth, UpdateAuth},
+        transaction::{Action, PackedTransaction, SignedTransaction, Transaction, TransactionTrace},
+        utils::pulse_assert,
     };
     use pulsevm_crypto::{Bytes, Digest};
     use pulsevm_name_macro::name;
@@ -66,7 +75,10 @@ mod tests {
                 owner_auth = Authority::new(
                     2,
                     vec![KeyWeight::new(get_public_key(account, "owner").inner(), 1)],
-                    vec![PermissionLevelWeight::new(PermissionLevel::new(creator.as_u64(), ACTIVE_NAME.as_u64()), 1)],
+                    vec![PermissionLevelWeight::new(
+                        PermissionLevel::new(creator.as_u64(), ACTIVE_NAME.as_u64()),
+                        1,
+                    )],
                     vec![],
                 );
             }
@@ -120,9 +132,8 @@ mod tests {
 
         pub fn push_transaction(&mut self, trx: SignedTransaction) -> Result<TransactionTrace, ChainError> {
             let pbs = self.get_pending_block_state();
-            let packed = PackedTransaction::from_signed_transaction(trx).map_err(|e| {
-                ChainError::DatabaseError(format!("failed to pack transaction for pushing: {}", e))
-            })?;
+            let packed = PackedTransaction::from_signed_transaction(trx)
+                .map_err(|e| ChainError::DatabaseError(format!("failed to pack transaction for pushing: {}", e)))?;
             let block_status = BlockStatus::Verifying;
             let result = self.controller.execute_transaction(&packed, &pbs.timestamp, &block_status)?;
             Ok(result.trace)
@@ -130,7 +141,11 @@ mod tests {
 
         pub fn push_reqauth(&mut self, from: Name, role: &str, multi_sig: bool) -> Result<TransactionTrace, ChainError> {
             if !multi_sig {
-                return self.push_reqauth2(from, vec![PermissionLevel::new(from.as_u64(), OWNER_NAME.as_u64())], vec![get_private_key(from, role)]);
+                return self.push_reqauth2(
+                    from,
+                    vec![PermissionLevel::new(from.as_u64(), OWNER_NAME.as_u64())],
+                    vec![get_private_key(from, role)],
+                );
             } else {
                 return self.push_reqauth2(
                     from,

@@ -229,7 +229,7 @@ impl Session {
             trace_end_block: head_block.block_num(),
             chain_state_begin_block: 1,
             chain_state_end_block: head_block.block_num(),
-            chain_id: chain_id,
+            chain_id: chain_id.clone(),
         })
     }
 

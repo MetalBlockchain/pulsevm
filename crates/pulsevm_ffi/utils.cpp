@@ -24,6 +24,10 @@ std::shared_ptr<CxxDigest> make_shared_digest_from_data(rust::Slice<const std::u
     return std::make_shared<CxxDigest>(hash);
 }
 
+std::shared_ptr<CxxDigest> make_shared_digest_from_existing_hash(rust::Slice<const std::uint8_t> data) {
+    return std::make_shared<CxxDigest>(reinterpret_cast<const char*>(data.data()), data.size());
+}
+
 std::shared_ptr<CxxDigest> make_shared_digest_from_string(rust::Str key_str) {
     std::string s(key_str.data(), key_str.size());
     CxxDigest hash = CxxDigest::hash(s);
@@ -178,13 +182,14 @@ rust::Slice<const uint8_t> get_digest_data(const CxxDigest& sha) {
 }
 
 rust::Slice<const uint8_t> get_shared_blob_data(const CxxSharedBlob& blob) {
-        if (!blob.data()) {
+    if (!blob.data()) {
         return {};
-        }
-        return rust::Slice<const uint8_t>(
+    }
+
+    return rust::Slice<const uint8_t>(
         reinterpret_cast<const uint8_t*>(blob.data()),
         blob.size()
-        );
+    );
 }
 
 Authority get_authority_from_shared_authority(const CxxSharedAuthority& shared_auth) {
@@ -219,6 +224,17 @@ std::shared_ptr<CxxPublicKey> make_unknown_public_key() {
 std::shared_ptr<CxxPrivateKey> make_k1_private_key(const CxxDigest& secret) {
     CxxPrivateKey pk = CxxPrivateKey::regenerate<fc::ecc::private_key_shim>(std::move(secret));
     return std::make_shared<CxxPrivateKey>(std::move(pk));
+}
+
+rust::Vec<uint8_t> extract_chain_id_from_genesis_state(const CxxGenesisState& genesis) {
+    chain_id_type cid = genesis.compute_chain_id();
+    rust::Vec<uint8_t> out;
+    out.reserve(cid.data_size());
+    const uint8_t* data_ptr = reinterpret_cast<const uint8_t*>(cid.data());
+    for (size_t i = 0; i < cid.data_size(); ++i) {
+        out.push_back(data_ptr[i]);
+    }
+    return out;
 }
 
 } }

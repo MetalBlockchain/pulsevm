@@ -2,6 +2,7 @@ use core::fmt;
 use std::{error::Error, str::FromStr};
 
 use pulsevm_crypto::FixedBytes;
+use pulsevm_error::ChainError;
 use pulsevm_ffi::CxxDigest;
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 use serde::Serialize;
@@ -80,11 +81,11 @@ impl TryFrom<&[u8]> for Id {
 }
 
 impl TryFrom<Vec<u8>> for Id {
-    type Error = pulsevm_serialization::ReadError;
+    type Error = ChainError;
 
     fn try_from(value: Vec<u8>) -> Result<Self, Self::Error> {
         if value.len() != 32 {
-            return Err(pulsevm_serialization::ReadError::NotEnoughBytes);
+            return Err(ChainError::ParseError("id is expected to be 32 bytes".to_owned()));
         }
         let mut id = [0u8; 32];
         id.copy_from_slice(&value);

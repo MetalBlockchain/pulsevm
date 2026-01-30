@@ -5,8 +5,9 @@ use pulsevm_error::ChainError;
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 use pulsevm_serialization::Write;
 use serde::Serialize;
-use sha2::Digest;
+use sha2::Digest as Sha2Digest;
 
+use crate::utils::Digest;
 use crate::{
     chain::{id::Id, transaction::transaction::Transaction},
     crypto::{PrivateKey, PublicKey, Signature},
@@ -44,11 +45,10 @@ impl SignedTransaction {
     pub fn recovered_keys(&self, chain_id: &Id) -> Result<HashSet<PublicKey>, ChainError> {
         let mut recovered_keys: HashSet<PublicKey> = HashSet::new();
         let digest = self.transaction.signing_digest(chain_id, &self.context_free_data)?;
+        let digest: Digest = Digest::from_existing_hash(&digest);
 
         for signature in self.signatures.iter() {
-            let public_key = signature
-                .recover_public_key(&digest.into())
-                .map_err(|e| ChainError::SignatureRecoverError(format!("{}", e)))?;
+            let public_key = signature.recover_public_key(&digest)?;
             recovered_keys.insert(public_key);
         }
 

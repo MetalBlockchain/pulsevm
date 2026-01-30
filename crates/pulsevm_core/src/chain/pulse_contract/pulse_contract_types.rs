@@ -62,8 +62,8 @@ mod tests {
 
     use super::*;
     use pulsevm_ffi::{KeyWeight, PermissionLevel, PermissionLevelWeight, WaitWeight, parse_public_key};
-    use pulsevm_serialization::{Read, Write};
     use pulsevm_name_macro::name;
+    use pulsevm_serialization::{Read, Write};
 
     #[test]
     fn test_new_account_serialization() {
@@ -72,36 +72,20 @@ mod tests {
             name: Name::from_str("newaccount").unwrap(),
             owner: Authority::new(
                 1,
-                vec![
-                    KeyWeight {
-                        key: parse_public_key(
-                            "PUB_K1_5bbkxaLdB5bfVZW6DJY8M74vwT2m61PqwywNUa5azfkJTvYa5H",
-                        ).unwrap(),
-                        weight: 1,
+                vec![KeyWeight {
+                    key: parse_public_key("PUB_K1_5bbkxaLdB5bfVZW6DJY8M74vwT2m61PqwywNUa5azfkJTvYa5H").unwrap(),
+                    weight: 1,
+                }],
+                vec![PermissionLevelWeight {
+                    permission: PermissionLevel {
+                        actor: name!("bob"),
+                        permission: name!("active"),
                     },
-                ],
-                vec![
-                    PermissionLevelWeight {
-                        permission: PermissionLevel {
-                            actor: name!("bob"),
-                            permission: name!("active"),
-                        },
-                        weight: 1,
-                    }
-                ],
-                vec![
-                    WaitWeight {
-                        wait_sec: 10,
-                        weight: 1,
-                    }
-                ],
+                    weight: 1,
+                }],
+                vec![WaitWeight { wait_sec: 10, weight: 1 }],
             ),
-            active: Authority::new(
-                1,
-                vec![],
-                vec![],
-                vec![],
-            ),
+            active: Authority::new(1, vec![], vec![], vec![]),
         };
 
         let packed = new_account.pack().unwrap();

@@ -189,7 +189,7 @@ impl RpcServer for RpcService {
         let total_net_weight = ResourceLimitsManager::get_total_net_weight(&db)?;
         Ok(GetInfoResponse {
             server_version: "d133c641".to_owned(),
-            chain_id: controller.chain_id(),
+            chain_id: controller.chain_id().clone(),
             head_block_num: head_block.block_num(),
             last_irreversible_block_num: head_block.block_num(),
             last_irreversible_block_id: head_block.id(),

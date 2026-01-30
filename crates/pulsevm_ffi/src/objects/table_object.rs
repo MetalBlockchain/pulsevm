@@ -1,5 +1,5 @@
 use pulsevm_billable_size::BillableSize;
-use pulsevm_constants::{OVERHEAD_PER_ROW_PER_INDEX_RAM_BYTES};
+use pulsevm_constants::OVERHEAD_PER_ROW_PER_INDEX_RAM_BYTES;
 
 use crate::TableObject;
 

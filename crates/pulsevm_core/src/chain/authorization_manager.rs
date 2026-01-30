@@ -76,15 +76,8 @@ impl AuthorizationManager {
                 let auth = Authority::new_from_permission_level(p);
 
                 pulse_assert(
-                    authority_checker.satisfied(
-                        db,
-                        &auth,
-                        0,
-                    )?,
-                    ChainError::AuthorizationError(format!(
-                        "transaction declares authority '{}' but does not have signatures for it",
-                        p
-                    )),
+                    authority_checker.satisfied(db, &auth, 0)?,
+                    ChainError::AuthorizationError(format!("transaction declares authority '{}' but does not have signatures for it", p)),
                 )?;
             }
 

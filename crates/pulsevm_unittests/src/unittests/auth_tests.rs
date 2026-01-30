@@ -2,7 +2,11 @@
 mod auth_tests {
     use anyhow::Result;
     use pulsevm_core::{
-        ACTIVE_NAME, ChainError, OWNER_NAME, PULSE_NAME, authority::{self, Authority, PermissionLevel, PermissionLevelWeight}, authorization_manager::AuthorizationManager, crypto::PublicKey, name::Name
+        ACTIVE_NAME, ChainError, OWNER_NAME, PULSE_NAME,
+        authority::{self, Authority, PermissionLevel, PermissionLevelWeight},
+        authorization_manager::AuthorizationManager,
+        crypto::PublicKey,
+        name::Name,
     };
 
     use crate::tests::{Testing, get_private_key};
@@ -55,7 +59,9 @@ mod auth_tests {
                     vec![get_private_key(name!("bob").into(), "active")],
                 )
                 .err(),
-            Some(ChainError::WasmRuntimeError("apply error: RuntimeError: missing authority of alice".into()))
+            Some(ChainError::WasmRuntimeError(
+                "apply error: RuntimeError: missing authority of alice".into()
+            ))
         );
         Ok(())
     }
@@ -110,7 +116,9 @@ mod auth_tests {
 
         // Ensure the permission is updated
         let pending_block_state = chain.get_pending_block_state();
-        let obj = pending_block_state.db.find_permission_by_actor_and_permission(name!("alice"), OWNER_NAME.as_u64())?;
+        let obj = pending_block_state
+            .db
+            .find_permission_by_actor_and_permission(name!("alice"), OWNER_NAME.as_u64())?;
         assert!(!obj.is_null());
         let obj = unsafe { obj.as_ref().unwrap() };
         let owner_id = obj.get_id();
@@ -136,7 +144,9 @@ mod auth_tests {
             vec![get_private_key(name!("alice").into(), "active")],
         )?;
 
-        let obj = pending_block_state.db.find_permission_by_actor_and_permission(name!("alice"), ACTIVE_NAME.as_u64())?;
+        let obj = pending_block_state
+            .db
+            .find_permission_by_actor_and_permission(name!("alice"), ACTIVE_NAME.as_u64())?;
         assert!(!obj.is_null());
         let obj = unsafe { obj.as_ref().unwrap() };
         assert!(obj.get_owner().to_uint64_t() == name!("alice"));
@@ -180,7 +190,9 @@ mod auth_tests {
             vec![PermissionLevel::new(name!("alice").into(), ACTIVE_NAME.as_u64())],
             vec![new_active_priv_key.clone()],
         )?;
-        let obj = pending_block_state.db.find_permission_by_actor_and_permission(name!("alice"), name!("spending"))?;
+        let obj = pending_block_state
+            .db
+            .find_permission_by_actor_and_permission(name!("alice"), name!("spending"))?;
         assert!(!obj.is_null());
         let obj = unsafe { obj.as_ref().unwrap() };
         assert!(obj.get_owner().to_uint64_t() == name!("alice"));
@@ -230,7 +242,9 @@ mod auth_tests {
             vec![PermissionLevel::new(name!("alice").into(), ACTIVE_NAME.as_u64())],
             vec![new_active_priv_key.clone()],
         )?;
-        let obj = pending_block_state.db.find_permission_by_actor_and_permission(name!("alice"), name!("spending"))?;
+        let obj = pending_block_state
+            .db
+            .find_permission_by_actor_and_permission(name!("alice"), name!("spending"))?;
         assert!(obj.is_null());
 
         // Create new trading auth
@@ -254,8 +268,12 @@ mod auth_tests {
         )?;
 
         // Verify correctness of trading and spending
-        let trading = pending_block_state.db.find_permission_by_actor_and_permission(name!("alice"), name!("trading"))?;
-        let spending = pending_block_state.db.find_permission_by_actor_and_permission(name!("alice"), name!("spending"))?;
+        let trading = pending_block_state
+            .db
+            .find_permission_by_actor_and_permission(name!("alice"), name!("trading"))?;
+        let spending = pending_block_state
+            .db
+            .find_permission_by_actor_and_permission(name!("alice"), name!("spending"))?;
         assert!(!trading.is_null());
         assert!(!spending.is_null());
         let trading = unsafe { trading.as_ref().unwrap() };
@@ -309,7 +327,9 @@ mod auth_tests {
             vec![PermissionLevel::new(name!("alice").into(), ACTIVE_NAME.as_u64())],
             vec![new_active_priv_key.clone()],
         )?;
-        let res = pending_block_state.db.find_permission_by_actor_and_permission(name!("alice"), name!("spending"))?;
+        let res = pending_block_state
+            .db
+            .find_permission_by_actor_and_permission(name!("alice"), name!("spending"))?;
         assert!(res.is_null());
         chain.delete_authority(
             name!("alice").into(),
@@ -317,7 +337,9 @@ mod auth_tests {
             vec![PermissionLevel::new(name!("alice").into(), ACTIVE_NAME.as_u64())],
             vec![new_active_priv_key.clone()],
         )?;
-        let res = pending_block_state.db.find_permission_by_actor_and_permission(name!("alice"), name!("trading"))?;
+        let res = pending_block_state
+            .db
+            .find_permission_by_actor_and_permission(name!("alice"), name!("trading"))?;
         assert!(res.is_null());
         Ok(())
     }
@@ -336,7 +358,9 @@ mod auth_tests {
         )?;
         // Ensure the permission is updated
         let pending_block_state = chain.get_pending_block_state();
-        let obj = pending_block_state.db.find_permission_by_actor_and_permission(name!("alice"), OWNER_NAME.as_u64())?;
+        let obj = pending_block_state
+            .db
+            .find_permission_by_actor_and_permission(name!("alice"), OWNER_NAME.as_u64())?;
         assert!(!obj.is_null());
         let obj = unsafe { obj.as_ref().unwrap() };
         assert!(obj.get_owner().to_uint64_t() == name!("alice"));

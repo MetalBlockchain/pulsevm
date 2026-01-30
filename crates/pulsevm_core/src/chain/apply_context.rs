@@ -35,7 +35,7 @@ struct ApplyContextInner {
     notified: VecDeque<(Name, u32)>,        // List of notified accounts
     inline_actions: Vec<u32>,               // List of inline actions
     recurse_depth: u32,                     // The current recursion depth
-    keyval_cache: KeyValueIteratorCache, // Cache for key-value iterators
+    keyval_cache: KeyValueIteratorCache,    // Cache for key-value iterators
 }
 
 #[derive(Clone)]

@@ -1,6 +1,7 @@
 use std::{
     fmt::{self, Debug, Display},
     hash::{Hash, Hasher},
+    str::FromStr,
 };
 
 use cxx::SharedPtr;
@@ -118,7 +119,15 @@ impl Write for Signature {
 
 impl Default for Signature {
     fn default() -> Self {
-        let empty_sig = SharedPtr::null();
-        Signature { inner: empty_sig }
+        Self::from_str("SIG_K1_111111111111111111111111111111111111111111111111111111111111111116uk5ne").unwrap()
+    }
+}
+
+impl FromStr for Signature {
+    type Err = ChainError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let cxx_sig = pulsevm_ffi::parse_signature(s).map_err(|e| ChainError::TransactionError(format!("failed to parse signature: {}", e)))?;
+        Ok(Signature { inner: cxx_sig })
     }
 }

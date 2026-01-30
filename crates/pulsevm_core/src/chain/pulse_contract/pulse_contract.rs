@@ -76,14 +76,16 @@ pub fn newaccount(context: &mut ApplyContext, db: &mut Database, act: &Action) -
             context.pending_block_timestamp().to_time_point().as_ref().unwrap(),
         )?
     };
-    let active_permission = unsafe { &*AuthorizationManager::create_permission(
-        db,
-        &create.name,
-        &ACTIVE_NAME.into(),
-        owner_permission.get_id() as u64,
-        &create.active.into(),
-        context.pending_block_timestamp().to_time_point().as_ref().unwrap(),
-    )? };
+    let active_permission = unsafe {
+        &*AuthorizationManager::create_permission(
+            db,
+            &create.name,
+            &ACTIVE_NAME.into(),
+            owner_permission.get_id() as u64,
+            &create.active.into(),
+            context.pending_block_timestamp().to_time_point().as_ref().unwrap(),
+        )?
+    };
 
     ResourceLimitsManager::initialize_account(db, &create.name)?;
 
@@ -240,25 +242,24 @@ pub fn updateauth(context: &mut ApplyContext, db: &mut Database, act: &Action) -
             ChainError::ActionValidationError(format!("changing parent authority is not currently supported")),
         )?;
 
-        let old_size: i64 = billable_size_v::<PermissionObject>() as i64
-            + permission.get_authority().get_billable_size() as i64;
+        let old_size: i64 = billable_size_v::<PermissionObject>() as i64 + permission.get_authority().get_billable_size() as i64;
         AuthorizationManager::modify_permission(db, permission, &update.auth, &context.get_pending_block_time().to_time_point())?;
-        let new_size: i64 = billable_size_v::<PermissionObject>() as i64
-            + permission.get_authority().get_billable_size() as i64;
+        let new_size: i64 = billable_size_v::<PermissionObject>() as i64 + permission.get_authority().get_billable_size() as i64;
 
         context.add_ram_usage(&permission.get_owner().to_uint64_t().into(), new_size - old_size)?;
     } else {
-        let permission = unsafe { &*AuthorizationManager::create_permission(
-            db,
-            &update.account,
-            &update.permission,
-            parent_id as u64,
-            &update.auth.into(),
-            context.pending_block_timestamp().to_time_point().as_ref().unwrap(),
-        )? };
+        let permission = unsafe {
+            &*AuthorizationManager::create_permission(
+                db,
+                &update.account,
+                &update.permission,
+                parent_id as u64,
+                &update.auth.into(),
+                context.pending_block_timestamp().to_time_point().as_ref().unwrap(),
+            )?
+        };
 
-        let new_size: i64 =
-            billable_size_v::<PermissionObject>() as i64 + permission.get_authority().get_billable_size() as i64;
+        let new_size: i64 = billable_size_v::<PermissionObject>() as i64 + permission.get_authority().get_billable_size() as i64;
 
         context.add_ram_usage(&update.account, new_size)?;
     }

@@ -9,7 +9,16 @@ use std::{
 
 use chrono::Utc;
 use pulsevm_core::{
-    ACTIVE_NAME, ChainError, PULSE_NAME, asset::{Asset, Symbol}, authority::{Authority, KeyWeight, PermissionLevel}, block::BlockStatus, controller::Controller, crypto::PrivateKey, id::Id, name::Name, pulse_contract::{NewAccount, SetAbi, SetCode}, transaction::{Action, PackedTransaction, Transaction, TransactionHeader}
+    ACTIVE_NAME, ChainError, PULSE_NAME,
+    asset::{Asset, Symbol},
+    authority::{Authority, KeyWeight, PermissionLevel},
+    block::BlockStatus,
+    controller::Controller,
+    crypto::PrivateKey,
+    id::Id,
+    name::Name,
+    pulse_contract::{NewAccount, SetAbi, SetCode},
+    transaction::{Action, PackedTransaction, Transaction, TransactionHeader},
 };
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 use pulsevm_serialization::Write;
@@ -32,7 +41,7 @@ async fn main() {
     // Create 'pulse.token' account
     controller
         .execute_transaction(
-            &create_account(&private_key, Name::from_str("pulse.token").unwrap(), controller.chain_id()).unwrap(),
+            &create_account(&private_key, Name::from_str("pulse.token").unwrap(), controller.chain_id().clone()).unwrap(),
             &pending_block_timestamp,
             &block_status,
         )
@@ -43,7 +52,7 @@ async fn main() {
     // Create 'alice' account
     controller
         .execute_transaction(
-            &create_account(&private_key, Name::from_str("alice").unwrap(), controller.chain_id()).unwrap(),
+            &create_account(&private_key, Name::from_str("alice").unwrap(), controller.chain_id().clone()).unwrap(),
             &pending_block_timestamp,
             &block_status,
         )
@@ -54,7 +63,7 @@ async fn main() {
     // Create 'bob' account
     controller
         .execute_transaction(
-            &create_account(&private_key, Name::from_str("bob").unwrap(), controller.chain_id()).unwrap(),
+            &create_account(&private_key, Name::from_str("bob").unwrap(), controller.chain_id().clone()).unwrap(),
             &pending_block_timestamp,
             &block_status,
         )
@@ -71,7 +80,7 @@ async fn main() {
                 &private_key,
                 Name::from_str("pulse.token").unwrap(),
                 pulse_token_contract,
-                controller.chain_id(),
+                controller.chain_id().clone(),
             )
             .unwrap(),
             &pending_block_timestamp,
@@ -84,7 +93,7 @@ async fn main() {
                 &private_key,
                 Name::from_str("pulse.token").unwrap(),
                 pulse_token_abi,
-                controller.chain_id(),
+                controller.chain_id().clone(),
             )
             .unwrap(),
             &pending_block_timestamp,
@@ -102,8 +111,11 @@ async fn main() {
                     issuer: Name::from_str("pulse.token").unwrap(),
                     max_supply: Asset::new(100000000, Symbol::from_str("4,EOS").unwrap()),
                 },
-                controller.chain_id(),
-                vec![PermissionLevel::new(Name::from_str("pulse.token").unwrap().as_u64(), ACTIVE_NAME.as_u64())],
+                controller.chain_id().clone(),
+                vec![PermissionLevel::new(
+                    Name::from_str("pulse.token").unwrap().as_u64(),
+                    ACTIVE_NAME.as_u64(),
+                )],
             )
             .unwrap(),
             &pending_block_timestamp,
@@ -125,8 +137,11 @@ async fn main() {
                     },
                     memo: "Initial transfer".to_string(),
                 },
-                controller.chain_id(),
-                vec![PermissionLevel::new(Name::from_str("pulse.token").unwrap().as_u64(), ACTIVE_NAME.as_u64())],
+                controller.chain_id().clone(),
+                vec![PermissionLevel::new(
+                    Name::from_str("pulse.token").unwrap().as_u64(),
+                    ACTIVE_NAME.as_u64(),
+                )],
             )
             .unwrap(),
             &pending_block_timestamp,
@@ -149,8 +164,11 @@ async fn main() {
                     },
                     memo: "Initial transfer".to_string(),
                 },
-                controller.chain_id(),
-                vec![PermissionLevel::new(Name::from_str("pulse.token").unwrap().as_u64(), ACTIVE_NAME.as_u64())],
+                controller.chain_id().clone(),
+                vec![PermissionLevel::new(
+                    Name::from_str("pulse.token").unwrap().as_u64(),
+                    ACTIVE_NAME.as_u64(),
+                )],
             )
             .unwrap(),
             &pending_block_timestamp,
@@ -174,7 +192,7 @@ async fn main() {
                         },
                         memo: "Initial transfer".to_string(),
                     },
-                    controller.chain_id(),
+                    controller.chain_id().clone(),
                     vec![PermissionLevel::new(Name::from_str("alice").unwrap().as_u64(), ACTIVE_NAME.as_u64())],
                 )
                 .unwrap(),

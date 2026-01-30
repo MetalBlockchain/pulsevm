@@ -7,7 +7,7 @@ use pulsevm_constants::RATE_LIMITING_PRECISION;
 use pulsevm_error::ChainError;
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 
-use crate::chain::{utils::pulse_assert};
+use crate::chain::utils::pulse_assert;
 
 #[derive(Debug, Clone, Copy, PartialEq, Read, Write, NumBytes, Default, Eq, Hash)]
 pub struct Ratio<T> {

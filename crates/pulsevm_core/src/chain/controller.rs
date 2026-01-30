@@ -11,10 +11,7 @@ use crate::{
         apply_context::ApplyContext,
         authorization_manager::AuthorizationManager,
         block::{BlockHeader, BlockTimestamp},
-        config::{
-            DELETEAUTH_NAME, LINKAUTH_NAME,
-            NEWACCOUNT_NAME, SETABI_NAME, SETCODE_NAME, UNLINKAUTH_NAME, UPDATEAUTH_NAME, eos_percent,
-        },
+        config::{DELETEAUTH_NAME, LINKAUTH_NAME, NEWACCOUNT_NAME, SETABI_NAME, SETCODE_NAME, UNLINKAUTH_NAME, UPDATEAUTH_NAME, eos_percent},
         id::Id,
         mempool::Mempool,
         name::Name,
@@ -110,7 +107,7 @@ impl Controller {
             std::str::from_utf8(genesis_bytes).map_err(|e| ChainError::ParseError(format!("failed to parse genesis bytes as UTF-8: {}", e)))?;
         let genesis = CxxGenesisState::new(genesis_json).map_err(|e| ChainError::ParseError(format!("failed to parse genesis: {}", e)))?;
         // TODO: Validate genesis state
-        //self.chain_id = genesis.compute_chain_id()?;
+        self.chain_id = genesis.compute_chain_id().try_into()?;
         self.block_log =
             Some(StateHistoryLog::open(&db_path, "block_log").map_err(|e| ChainError::InternalError(format!("failed to open block log: {}", e)))?);
         self.trace_log =
@@ -154,7 +151,7 @@ impl Controller {
                     // Add the transaction to the block
                     let receipt = TransactionReceipt::new(result.trace.receipt, transaction);
                     transaction_receipts.push_back(receipt);
-                },
+                }
                 Err(e) => {
                     warn!("transaction {} failed to execute, dropping: {}", transaction.id(), e);
 
@@ -180,6 +177,7 @@ impl Controller {
     }
 
     pub async fn verify_block(&mut self, block: &SignedBlock, mempool: Arc<AsyncRwLock<Mempool>>) -> Result<(), ChainError> {
+        println!("verifying block {}", block.block_num());
         if self.verified_blocks.contains_key(&block.id()) {
             return Ok(());
         }
@@ -195,6 +193,7 @@ impl Controller {
     }
 
     pub async fn accept_block(&mut self, block_id: &Id, mempool: Arc<AsyncRwLock<Mempool>>) -> Result<(), ChainError> {
+        println!("accepting block {}", block_id);
         let block = {
             self.verified_blocks
                 .get(block_id)
@@ -230,6 +229,7 @@ impl Controller {
         block_status: &BlockStatus,
         mempool: &mut Mempool,
     ) -> Result<Vec<TransactionTrace>, ChainError> {
+        println!("executing block {}", block.block_num());
         // Make sure we don't have the block already
         {
             let existing_block = self.block_log()?.read_block(block.block_num());
@@ -399,8 +399,8 @@ impl Controller {
         self.db.clone()
     }
 
-    pub fn chain_id(&self) -> Id {
-        self.chain_id
+    pub fn chain_id(&self) -> &Id {
+        &self.chain_id
     }
 
     pub fn calculate_trx_merkle(&self, receipts: &VecDeque<TransactionReceipt>) -> Result<Digest, ChainError> {

@@ -69,7 +69,7 @@ pub mod ffi {
 
         #[cxx_name = "session"]
         type UndoSession;
-    
+
         // Database objects
         #[cxx_name = "account_object"]
         type AccountObject;
@@ -108,7 +108,7 @@ pub mod ffi {
         #[cxx_name = "global_property_object"]
         type GlobalPropertyObject;
         pub fn get_chain_config(self: &GlobalPropertyObject) -> &CxxChainConfig;
-        
+
         #[cxx_name = "table_id_object"]
         type TableObject;
         pub fn get_code(self: &TableObject) -> &CxxName;
@@ -319,13 +319,14 @@ pub mod ffi {
         pub fn get_billable_size(self: &CxxSharedAuthority) -> usize;
 
         type CxxSharedKeyWeight;
-        
+
         type CxxPrivateKey;
 
         // Global functions
         pub fn make_empty_digest() -> UniquePtr<CxxDigest>;
         pub fn make_digest_from_data(data: &[u8]) -> Result<UniquePtr<CxxDigest>>;
         pub fn make_shared_digest_from_data(data: &[u8]) -> SharedPtr<CxxDigest>;
+        pub fn make_shared_digest_from_existing_hash(data: &[u8]) -> SharedPtr<CxxDigest>;
         pub fn make_shared_digest_from_string(key_str: &str) -> SharedPtr<CxxDigest>;
         pub fn make_time_point_from_now() -> SharedPtr<CxxTimePoint>;
         pub fn make_block_timestamp_from_now() -> SharedPtr<CxxBlockTimestamp>;
@@ -353,6 +354,7 @@ pub mod ffi {
         pub fn get_authority_from_shared_authority(shared_auth: &CxxSharedAuthority) -> Authority;
         pub fn make_unknown_public_key() -> SharedPtr<CxxPublicKey>;
         pub fn make_k1_private_key(secret: &CxxDigest) -> SharedPtr<CxxPrivateKey>;
+        pub fn extract_chain_id_from_genesis_state(genesis: &CxxGenesisState) -> Vec<u8>;
 
         pub type CxxName;
 

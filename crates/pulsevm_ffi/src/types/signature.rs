@@ -1,4 +1,7 @@
-use crate::{CxxSignature, bridge::ffi::{packed_signature_bytes, signature_num_bytes, signature_to_string}};
+use crate::{
+    CxxSignature,
+    bridge::ffi::{packed_signature_bytes, signature_num_bytes, signature_to_string},
+};
 
 impl CxxSignature {
     pub fn packed_bytes(&self) -> Vec<u8> {

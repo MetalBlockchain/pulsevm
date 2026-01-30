@@ -112,16 +112,12 @@ impl<'a> AuthorityChecker<'a> {
         let satisfied = self.satisfied(db, &auth.get_authority().to_authority(), recursion_depth + 1)?;
 
         if satisfied {
-            self.cached_permissions.insert(
-                permission.permission.clone(),
-                PermissionCacheStatus::PermissionSatisfied,
-            );
+            self.cached_permissions
+                .insert(permission.permission.clone(), PermissionCacheStatus::PermissionSatisfied);
             Ok(permission.weight)
         } else {
-            self.cached_permissions.insert(
-                permission.permission.clone(),
-                PermissionCacheStatus::PermissionUnsatisfied,
-            );
+            self.cached_permissions
+                .insert(permission.permission.clone(), PermissionCacheStatus::PermissionUnsatisfied);
             Ok(0)
         }
     }

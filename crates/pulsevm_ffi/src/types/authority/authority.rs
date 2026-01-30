@@ -4,7 +4,10 @@ use cxx::SharedPtr;
 use pulsevm_serialization::{NumBytes, Read, Write, WriteError};
 use serde::{Serialize, ser::SerializeStruct};
 
-use crate::{CxxPublicKey, PermissionLevel, bridge::ffi::{Authority, KeyWeight, PermissionLevelWeight, WaitWeight}};
+use crate::{
+    CxxPublicKey, PermissionLevel,
+    bridge::ffi::{Authority, KeyWeight, PermissionLevelWeight, WaitWeight},
+};
 
 impl Authority {
     pub fn new(threshold: u32, keys: Vec<KeyWeight>, accounts: Vec<PermissionLevelWeight>, waits: Vec<WaitWeight>) -> Self {
@@ -16,7 +19,7 @@ impl Authority {
         }
     }
 
-    pub fn new_from_public_key(key: SharedPtr<CxxPublicKey>) -> Self {        
+    pub fn new_from_public_key(key: SharedPtr<CxxPublicKey>) -> Self {
         Authority {
             threshold: 1,
             keys: vec![KeyWeight::new(key, 1)],

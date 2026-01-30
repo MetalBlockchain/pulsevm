@@ -1,6 +1,9 @@
 use cxx::SharedPtr;
 
-use crate::{CxxBlockTimestamp, bridge::ffi::{make_block_timestamp_from_now, make_block_timestamp_from_slot}};
+use crate::{
+    CxxBlockTimestamp,
+    bridge::ffi::{make_block_timestamp_from_now, make_block_timestamp_from_slot},
+};
 
 impl CxxBlockTimestamp {
     pub fn now() -> SharedPtr<CxxBlockTimestamp> {

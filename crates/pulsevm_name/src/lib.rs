@@ -1,9 +1,9 @@
-use std::{fmt, ops::Deref, str::FromStr};
+use proc_macro2::{Literal, TokenStream};
 use pulsevm_error::ChainError;
 use pulsevm_proc_macros::{NumBytes, Read, Write};
-use serde::{Deserialize, Serialize};
-use proc_macro2::{Literal, TokenStream};
 use quote::{ToTokens, TokenStreamExt};
+use serde::{Deserialize, Serialize};
+use std::{fmt, ops::Deref, str::FromStr};
 use syn::{
     LitStr,
     parse::{Parse, ParseStream, Result as ParseResult},

@@ -10,6 +10,7 @@ namespace pulsevm { namespace chain {
     std::unique_ptr<CxxDigest> make_empty_digest();
     std::unique_ptr<CxxDigest> make_digest_from_data(rust::Slice<const std::uint8_t> data);
     std::shared_ptr<CxxDigest> make_shared_digest_from_data(rust::Slice<const std::uint8_t> data);
+    std::shared_ptr<CxxDigest> make_shared_digest_from_existing_hash(rust::Slice<const std::uint8_t> data);
     std::shared_ptr<CxxDigest> make_shared_digest_from_string(rust::Str key_str);
     std::shared_ptr<CxxTimePoint> make_time_point_from_now();
     std::shared_ptr<CxxBlockTimestamp> make_block_timestamp_from_now();
@@ -38,5 +39,6 @@ namespace pulsevm { namespace chain {
     rust::Slice<const uint8_t> get_digest_data(const CxxDigest& sha);
     rust::Slice<const uint8_t> get_shared_blob_data(const CxxSharedBlob& blob);
     Authority get_authority_from_shared_authority(const CxxSharedAuthority& shared_auth);
+    rust::Vec<uint8_t> extract_chain_id_from_genesis_state(const CxxGenesisState& genesis);
 
 }} // namespace pulsevm::chain

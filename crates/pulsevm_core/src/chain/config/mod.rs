@@ -1,6 +1,6 @@
+use crate::name::Name;
 use pulsevm_constants::PERCENT_100;
 use pulsevm_name_macro::name;
-use crate::name::Name;
 
 pub const PLUGIN_VERSION: u32 = 38;
 pub const VERSION: &str = "v0.0.1";

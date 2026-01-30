@@ -8,3 +8,4 @@ tmpnet/
 CMakeCache.txt
 CMakeFiles
 install/
+plugins/

@@ -7,7 +7,9 @@ use cxx::UniquePtr;
 use pulsevm_error::ChainError;
 
 use crate::{
-    AccountMetadataObject, KeyValueObject, bridge::ffi::{self, Authority, CxxDigest, CxxGenesisState, CxxTimePoint, TableObject}, iterator_cache::KeyValueIteratorCache
+    AccountMetadataObject, KeyValueObject,
+    bridge::ffi::{self, Authority, CxxDigest, CxxGenesisState, CxxTimePoint, TableObject},
+    iterator_cache::KeyValueIteratorCache,
 };
 
 #[derive(Clone)]
@@ -311,14 +313,7 @@ impl Database {
         Ok(res as *const TableObject)
     }
 
-    pub fn db_find_i64(
-        &mut self,
-        code: u64,
-        scope: u64,
-        table: u64,
-        id: u64,
-        keyval_cache: &mut KeyValueIteratorCache,
-    ) -> Result<i32, ChainError> {
+    pub fn db_find_i64(&mut self, code: u64, scope: u64, table: u64, id: u64, keyval_cache: &mut KeyValueIteratorCache) -> Result<i32, ChainError> {
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
 

@@ -1,7 +1,10 @@
 use cxx::UniquePtr;
 use pulsevm_error::ChainError;
 
-use crate::{CxxDigest, bridge::ffi::{get_digest_data, make_digest_from_data, make_empty_digest}};
+use crate::{
+    CxxDigest,
+    bridge::ffi::{get_digest_data, make_digest_from_data, make_empty_digest},
+};
 
 impl CxxDigest {
     pub fn new_empty() -> UniquePtr<CxxDigest> {

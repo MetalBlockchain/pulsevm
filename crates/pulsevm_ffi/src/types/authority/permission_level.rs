@@ -80,8 +80,7 @@ impl From<(u64, u64)> for PermissionLevel {
 
 impl Ord for PermissionLevel {
     fn cmp(&self, other: &Self) -> Ordering {
-        (self.actor, self.permission)
-            .cmp(&(other.actor, other.permission))
+        (self.actor, self.permission).cmp(&(other.actor, other.permission))
     }
 }
 

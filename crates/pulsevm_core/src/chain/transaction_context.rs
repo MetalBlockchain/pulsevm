@@ -8,16 +8,19 @@ use pulsevm_ffi::Database;
 use pulsevm_serialization::VarUint32;
 use pulsevm_time::{Microseconds, TimePoint};
 
-use crate::{block::BlockStatus, chain::{
-    apply_context::ApplyContext,
-    block::BlockTimestamp,
-    id::Id,
-    name::Name,
-    resource_limits::ResourceLimitsManager,
-    transaction::{Action, ActionTrace, Transaction, TransactionReceiptHeader, TransactionStatus, TransactionTrace},
-    utils::pulse_assert,
-    wasm_runtime::WasmRuntime,
-}};
+use crate::{
+    block::BlockStatus,
+    chain::{
+        apply_context::ApplyContext,
+        block::BlockTimestamp,
+        id::Id,
+        name::Name,
+        resource_limits::ResourceLimitsManager,
+        transaction::{Action, ActionTrace, Transaction, TransactionReceiptHeader, TransactionStatus, TransactionTrace},
+        utils::pulse_assert,
+        wasm_runtime::WasmRuntime,
+    },
+};
 
 #[derive(Default, Clone)]
 struct Billing {
@@ -51,7 +54,14 @@ pub struct TransactionContext {
 }
 
 impl TransactionContext {
-    pub fn new(db: Database, wasm_runtime: WasmRuntime, block_num: u32, pending_block_timestamp: BlockTimestamp, transaction_id: &Id, block_status: BlockStatus) -> Self {
+    pub fn new(
+        db: Database,
+        wasm_runtime: WasmRuntime,
+        block_num: u32,
+        pending_block_timestamp: BlockTimestamp,
+        transaction_id: &Id,
+        block_status: BlockStatus,
+    ) -> Self {
         let mut trace = TransactionTrace::default();
         trace.id = *transaction_id;
         trace.block_num = block_num;

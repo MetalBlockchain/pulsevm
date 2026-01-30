@@ -7,5 +7,5 @@ mod private_key;
 mod public_key;
 mod shared_authority;
 mod shared_blob;
-mod time_point;
 mod signature;
+mod time_point;

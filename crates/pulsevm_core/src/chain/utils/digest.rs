@@ -17,6 +17,11 @@ impl Digest {
         let cxx_digest = pulsevm_ffi::make_shared_digest_from_data(data);
         Digest { inner: cxx_digest }
     }
+
+    pub fn from_existing_hash(data: &[u8; 32]) -> Self {
+        let cxx_digest = pulsevm_ffi::make_shared_digest_from_data(data);
+        Digest { inner: cxx_digest }
+    }
 }
 
 impl Deref for Digest {
