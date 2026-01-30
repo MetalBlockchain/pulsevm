@@ -2,7 +2,7 @@
 resolver = "2"
 members = [ "crates/pulse_cli", "crates/pulsevm", "crates/pulsevm_benchmark", "crates/pulsevm_ffi", "crates/pulsevm_core", "crates/pulsevm_crypto",
     "crates/pulsevm_grpc"
-, "crates/pulsevm_name", "crates/pulsevm_proc_macros", "crates/pulsevm_serialization", "crates/pulsevm_time", "crates/pulsevm_unittests", "crates/pulsevm_error", "crates/pulsevm_name_macro"]
+, "crates/pulsevm_name", "crates/pulsevm_proc_macros", "crates/pulsevm_serialization", "crates/pulsevm_time", "crates/pulsevm_unittests", "crates/pulsevm_error", "crates/pulsevm_name_macro", "crates/pulsevm_billable_size", "crates/pulsevm_constants"]
 
 [profile.profiling]
 inherits = "release"

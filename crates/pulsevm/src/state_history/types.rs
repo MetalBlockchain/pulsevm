@@ -8,7 +8,7 @@ use pulsevm_core::{
     transaction::{Action, TransactionStatus, TransactionTrace},
 };
 use pulsevm_crypto::{Bytes, Digest};
-use pulsevm_proc_macros::{NumBytes, Read, Write, name};
+use pulsevm_proc_macros::{NumBytes, Read, Write};
 use pulsevm_serialization::VarUint32;
 use pulsevm_time::TimePointSec;
 

@@ -1,5 +1,6 @@
 use std::{cmp::Ordering, fmt};
 
+use pulsevm_name::Name;
 use pulsevm_serialization::{NumBytes, Read, Write, WriteError};
 use serde::{Serialize, ser::SerializeStruct};
 
@@ -22,15 +23,15 @@ impl PermissionLevel {
 impl fmt::Debug for PermissionLevel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PermissionLevel")
-            .field("actor", &self.actor)
-            .field("permission", &self.permission)
+            .field("actor", &Name::new(self.actor))
+            .field("permission", &Name::new(self.permission))
             .finish()
     }
 }
 
 impl fmt::Display for PermissionLevel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "PermissionLevel(actor: {}, permission: {})", self.actor, self.permission)
+        write!(f, "{}@{}", Name::new(self.actor), Name::new(self.permission))
     }
 }
 

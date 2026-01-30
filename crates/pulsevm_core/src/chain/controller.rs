@@ -12,8 +12,8 @@ use crate::{
         authorization_manager::AuthorizationManager,
         block::{BlockHeader, BlockTimestamp},
         config::{
-            BLOCK_CPU_USAGE_AVERAGE_WINDOW_MS, BLOCK_INTERVAL_MS, BLOCK_SIZE_AVERAGE_WINDOW_MS, DELETEAUTH_NAME, LINKAUTH_NAME,
-            MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER, NEWACCOUNT_NAME, SETABI_NAME, SETCODE_NAME, UNLINKAUTH_NAME, UPDATEAUTH_NAME, eos_percent,
+            DELETEAUTH_NAME, LINKAUTH_NAME,
+            NEWACCOUNT_NAME, SETABI_NAME, SETCODE_NAME, UNLINKAUTH_NAME, UPDATEAUTH_NAME, eos_percent,
         },
         id::Id,
         mempool::Mempool,
@@ -30,6 +30,7 @@ use crate::{
     transaction::Action,
 };
 
+use pulsevm_constants::{BLOCK_CPU_USAGE_AVERAGE_WINDOW_MS, BLOCK_INTERVAL_MS, BLOCK_SIZE_AVERAGE_WINDOW_MS, MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER};
 use pulsevm_crypto::{Digest, merkle};
 use pulsevm_error::ChainError;
 use pulsevm_ffi::{CxxChainConfig, CxxGenesisState, Database, GlobalPropertyObject};
@@ -203,7 +204,7 @@ impl Controller {
         let mut root_session = self.db.create_undo_session(true)?;
         let mut mempool = mempool.write().await;
         let block_status = BlockStatus::Accepting;
-        let transaction_traces = self.execute_block(&block, &block_status,&mut mempool).await?;
+        let transaction_traces = self.execute_block(&block, &block_status, &mut mempool).await?;
         let packed_transaction_traces = transaction_traces
             .pack()
             .map_err(|e| ChainError::TransactionError(format!("failed to pack transaction traces for block {}: {}", block_id, e)))?;

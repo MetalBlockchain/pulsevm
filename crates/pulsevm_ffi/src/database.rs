@@ -125,7 +125,7 @@ impl Database {
 
         pinned
             .unlink_account_code(old_code_entry)
-            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+            .map_err(|e| ChainError::ActionValidationError(format!("{}", e)))
     }
 
     pub fn update_account_code(
@@ -143,7 +143,7 @@ impl Database {
 
         pinned
             .update_account_code(account, new_code, head_block_num, pending_block_time, code_hash, vm_type, vm_version)
-            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+            .map_err(|e| ChainError::ActionValidationError(format!("{}", e)))
     }
 
     pub fn update_account_abi(
@@ -404,7 +404,7 @@ impl Database {
 
         pinned
             .link_auth(account_name, code_name, requirement_name, requirement_type)
-            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+            .map_err(|e| ChainError::ActionValidationError(format!("{}", e)))
     }
 
     pub fn unlink_auth(&mut self, account_name: u64, code_name: u64, requirement_type: u64) -> Result<i64, ChainError> {
@@ -541,6 +541,19 @@ impl Database {
             .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
 
         Ok(res as *const ffi::PermissionObject)
+    }
+
+    pub fn permission_satisfies_other_permission(
+        &self,
+        permission: &ffi::PermissionObject,
+        other_permission: &ffi::PermissionObject,
+    ) -> Result<bool, ChainError> {
+        let guard = self.inner.read()?;
+        let res = guard
+            .permission_satisfies_other_permission(permission, other_permission)
+            .map_err(|e| ChainError::TransactionError(format!("{}", e)))?;
+
+        Ok(res)
     }
 
     pub fn modify_permission(

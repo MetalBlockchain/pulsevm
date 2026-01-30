@@ -60,8 +60,6 @@ pub struct SetAbi {
 mod tests {
     use std::str::FromStr;
 
-    use crate::crypto::PublicKey;
-
     use super::*;
     use pulsevm_ffi::{KeyWeight, PermissionLevel, PermissionLevelWeight, WaitWeight, parse_public_key};
     use pulsevm_serialization::{Read, Write};

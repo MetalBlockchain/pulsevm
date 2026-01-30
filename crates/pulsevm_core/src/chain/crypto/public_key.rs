@@ -43,7 +43,7 @@ impl Display for PublicKey {
 
 impl PartialEq for PublicKey {
     fn eq(&self, other: &Self) -> bool {
-        self.inner.cmp(&other.inner) == 0
+        self.inner.packed_bytes() == other.inner.packed_bytes()
     }
 }
 
@@ -102,6 +102,8 @@ impl FromStr for PublicKey {
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::HashSet, str::FromStr};
+
     use crate::crypto::PublicKey;
 
     #[test]
@@ -110,5 +112,15 @@ mod tests {
         let key_str = "PUB_K1_5bbkxaLdB5bfVZW6DJY8M74vwT2m61PqwywNUa5azfkJTvYa5H";
         let public_key = PublicKey::from_str(key_str).unwrap();
         assert_eq!(public_key.to_string(), key_str);
+    }
+
+    #[test]
+    fn test_public_key_hash() {
+        let mut set = HashSet::new();
+        let key_str = "PUB_K1_5bbkxaLdB5bfVZW6DJY8M74vwT2m61PqwywNUa5azfkJTvYa5H";
+        let public_key = PublicKey::from_str(key_str).unwrap();
+        set.insert(public_key);
+        let public_key2 = PublicKey::from_str(key_str).unwrap();
+        assert!(set.contains(&public_key2));
     }
 }

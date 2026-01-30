@@ -124,7 +124,6 @@ mod tests {
                 ChainError::DatabaseError(format!("failed to pack transaction for pushing: {}", e))
             })?;
             let block_status = BlockStatus::Verifying;
-            println!("Pushing transaction with {}", serde_json::to_string(&packed).unwrap());
             let result = self.controller.execute_transaction(&packed, &pbs.timestamp, &block_status)?;
             Ok(result.trace)
         }

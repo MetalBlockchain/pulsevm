@@ -29,7 +29,7 @@ pub enum ChainError {
     InvalidArgument(String),
     #[error("serialization error: {0}")]
     SerializationError(String),
-    #[error("missing required authority: {0}")]
+    #[error("{0}")]
     MissingAuthError(String),
     #[error("action validation error: {0}")]
     ActionValidationError(String),

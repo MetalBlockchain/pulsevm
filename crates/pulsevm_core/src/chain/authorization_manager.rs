@@ -73,21 +73,20 @@ impl AuthorizationManager {
 
             // Now verify that all the declared authorizations are satisfied
             for p in permissions_to_satisfy.iter() {
-                // TODO: Fix this
-                /* pulse_assert(
+                let auth = Authority::new_from_permission_level(p);
+
+                pulse_assert(
                     authority_checker.satisfied(
                         db,
-                        &Authority::new_from_permission_level(p.clone()),
+                        &auth,
                         0,
                     )?,
                     ChainError::AuthorizationError(format!(
                         "transaction declares authority '{}' but does not have signatures for it",
                         p
                     )),
-                )?; */
+                )?;
             }
-
-            return Ok(());
 
             // Now verify that all the provided keys are used, otherwise we are wasting resources
             if !authority_checker.all_keys_used() {

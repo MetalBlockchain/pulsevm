@@ -239,6 +239,11 @@ pub mod ffi {
             auth: &Authority,
             creation_time: &CxxTimePoint,
         ) -> Result<&PermissionObject>;
+        pub fn permission_satisfies_other_permission(
+            self: &Database,
+            permission: &PermissionObject,
+            required_permission: &PermissionObject,
+        ) -> Result<bool>;
         pub fn modify_permission(
             self: Pin<&mut Database>,
             permission: &PermissionObject,
@@ -311,6 +316,7 @@ pub mod ffi {
         pub fn sec_since_epoch(self: &CxxTimePoint) -> u32;
 
         type CxxSharedAuthority;
+        pub fn get_billable_size(self: &CxxSharedAuthority) -> usize;
 
         type CxxSharedKeyWeight;
         

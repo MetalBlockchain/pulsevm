@@ -2326,6 +2326,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "pulsevm_billable_size"
+version = "0.1.0"
+
+[[package]]
+name = "pulsevm_constants"
+version = "0.1.0"
+
+[[package]]
 name = "pulsevm_core"
 version = "0.1.0"
 dependencies = [
@@ -2339,6 +2347,8 @@ dependencies = [
  "jsonrpsee",
  "lru",
  "prost-types",
+ "pulsevm_billable_size",
+ "pulsevm_constants",
  "pulsevm_crypto",
  "pulsevm_error",
  "pulsevm_ffi",
@@ -2392,6 +2402,8 @@ dependencies = [
  "cxx",
  "cxx-build",
  "libc",
+ "pulsevm_billable_size",
+ "pulsevm_constants",
  "pulsevm_error",
  "pulsevm_name",
  "pulsevm_proc_macros",

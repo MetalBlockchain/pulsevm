@@ -677,7 +677,7 @@ public:
         auto link = this->find<permission_link_object, by_action_name>(link_key);
 
         if( link ) {
-            EOS_ASSERT(link->required_permission != name(requirement_name), action_validate_exception, "Attempting to update required authority, but new requirement is same as old");
+            EOS_ASSERT(link->required_permission != name(requirement_name), action_validate_exception, "attempting to update required authority, but new requirement is same as old");
             this->modify(*link, [requirement = name(requirement_name)](permission_link_object& link) {
                 link.required_permission = requirement;
             });
@@ -711,7 +711,7 @@ public:
         const auto& index = this->get_index<permission_index, by_parent>();
         auto range = index.equal_range(permission.id);
         EOS_ASSERT( range.first == range.second, action_validate_exception,
-                    "Cannot remove a permission which has children. Remove the children first.");
+                    "cannot delete permission '${account}@${perm_name}' because it has child permissions", ("account", permission.owner)("perm_name", permission.perm_name) );
 
         this->get_mutable_index<permission_usage_index>().remove_object( permission.usage_id._id );
         this->remove( permission );
@@ -750,6 +750,29 @@ public:
         });
 
         return perm;
+    }
+
+    bool permission_satisfies_other_permission(const permission_object& permission, const permission_object& other) const {
+        // If the owners are not the same, this permission cannot satisfy other
+        if( permission.owner != other.owner )
+            return false;
+
+        // If this permission matches other, or is the immediate parent of other, then this permission satisfies other
+         if( permission.id == other.id || permission.id == other.parent )
+            return true;
+
+        // Walk up other's parent tree, seeing if we find this permission. If so, this permission satisfies other
+        const permission_object* parent = this->find<permission_object, by_id>(other.parent);
+        while( parent ) {
+            if( permission.id == parent->parent )
+               return true;
+            if( parent->parent._id == 0 )
+               return false;
+            parent = this->find<permission_object, by_id>(parent->parent);
+        }
+
+        // This permission is not a parent of other, and so does not satisfy other
+        return false;
     }
 
     void modify_permission( const permission_object& permission, const Authority& a, const fc::time_point& pending_block_time );

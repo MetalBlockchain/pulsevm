@@ -5,6 +5,7 @@ use std::{
 };
 
 use chrono::Utc;
+use pulsevm_billable_size::billable_size_v;
 use pulsevm_crypto::Bytes;
 use pulsevm_error::ChainError;
 use pulsevm_ffi::{AccountMetadataObject, Database, KeyValueIteratorCache, KeyValueObject, TableObject};
@@ -16,7 +17,6 @@ use crate::{
         authority::PermissionLevel,
         authorization_manager::AuthorizationManager,
         block::BlockTimestamp,
-        config::billable_size_v,
         controller::Controller,
         transaction::{Action, ActionReceipt, generate_action_digest},
         transaction_context::TransactionContext,

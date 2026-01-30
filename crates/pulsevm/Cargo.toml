@@ -27,6 +27,7 @@ pulsevm_core = { path = "../pulsevm_core" }
 pulsevm_crypto = { path = "../pulsevm_crypto" }
 pulsevm_grpc = { path = "../pulsevm_grpc" }
 pulsevm_name = { path = "../pulsevm_name" }
+pulsevm_name_macro = { path = "../pulsevm_name_macro" }
 pulsevm_proc_macros = { path = "../pulsevm_proc_macros" }
 pulsevm_serialization = { path = "../pulsevm_serialization" }
 pulsevm_time = { path = "../pulsevm_time" }

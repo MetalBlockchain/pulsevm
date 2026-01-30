@@ -137,8 +137,6 @@ impl WasmRuntime {
                 let module =
                     Module::new(temp_store.engine(), code_object.get_code().as_slice()).map_err(|e| ChainError::WasmRuntimeError(e.to_string()))?;
                 inner.code_cache.put(id, module);
-            } else {
-                println!("Wasm module found in cache: {}", id);
             }
         }
 

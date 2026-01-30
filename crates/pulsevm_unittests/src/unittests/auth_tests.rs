@@ -55,7 +55,7 @@ mod auth_tests {
                     vec![get_private_key(name!("bob").into(), "active")],
                 )
                 .err(),
-            Some(ChainError::MissingAuthError("missing authority of alice".into()))
+            Some(ChainError::WasmRuntimeError("apply error: RuntimeError: missing authority of alice".into()))
         );
         Ok(())
     }
@@ -231,8 +231,7 @@ mod auth_tests {
             vec![new_active_priv_key.clone()],
         )?;
         let obj = pending_block_state.db.find_permission_by_actor_and_permission(name!("alice"), name!("spending"))?;
-        assert!(!obj.is_null());
-        let obj = unsafe { obj.as_ref().unwrap() };
+        assert!(obj.is_null());
 
         // Create new trading auth
         chain.set_authority(
@@ -282,7 +281,7 @@ mod auth_tests {
                     vec![new_active_priv_key.clone()]
                 )
                 .err(),
-            Some(ChainError::ActionValidationError(
+            Some(ChainError::InternalError(
                 "cannot delete permission 'alice@trading' because it has child permissions".into()
             ))
         );

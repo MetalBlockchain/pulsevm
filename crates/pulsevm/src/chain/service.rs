@@ -15,7 +15,7 @@ use pulsevm_core::{
     utils::{Base64Bytes, I32Flex, pulse_assert},
 };
 use pulsevm_crypto::{Bytes, Digest};
-use pulsevm_proc_macros::name;
+use pulsevm_name_macro::name;
 use pulsevm_serialization::Read;
 use serde_json::Value;
 use tokio::sync::RwLock;
@@ -273,10 +273,8 @@ impl RpcServer for RpcService {
 
         // Run transaction and revert it
         let mut controller = self.controller.write().await;
-        let db = controller.database();
         let pending_block_timestamp = BlockTimestamp::now();
-        let gpo = Controller::get_global_properties(&db)?;
-        controller.push_transaction(gpo.get_chain_config(), &packed_trx, &pending_block_timestamp)?;
+        controller.push_transaction(&packed_trx, &pending_block_timestamp, &pulsevm_core::block::BlockStatus::Verifying)?;
 
         // Add to mempool
         let mut mempool = self.mempool.write().await;

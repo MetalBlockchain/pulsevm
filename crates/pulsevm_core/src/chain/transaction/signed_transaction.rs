@@ -52,6 +52,8 @@ impl SignedTransaction {
             recovered_keys.insert(public_key);
         }
 
+        println!("Recovered keys: {:?}", recovered_keys);
+
         Ok(recovered_keys)
     }
 

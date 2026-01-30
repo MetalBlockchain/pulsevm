@@ -1,6 +1,7 @@
 use std::fmt;
 
 use cxx::{SharedPtr, UniquePtr};
+use pulsevm_billable_size::BillableSize;
 use pulsevm_serialization::{NumBytes, Read, Write, WriteError};
 use serde::{Serialize, ser::SerializeStruct};
 
@@ -56,4 +57,9 @@ impl Serialize for KeyWeight {
         state.serialize_field("weight", &self.weight)?;
         state.end()
     }
+}
+
+impl BillableSize for KeyWeight {
+    const OVERHEAD: u64 = 0;
+    const VALUE: u64 = 8;
 }

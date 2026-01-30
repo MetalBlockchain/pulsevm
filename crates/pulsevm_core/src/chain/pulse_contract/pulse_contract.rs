@@ -1,5 +1,9 @@
+use core::panic;
+
+use pulsevm_billable_size::billable_size_v;
+use pulsevm_constants::{OVERHEAD_PER_ACCOUNT_RAM_BYTES, SETCODE_RAM_BYTES_MULTIPLIER};
 use pulsevm_error::ChainError;
-use pulsevm_ffi::{CxxDigest, Database, u64_to_name};
+use pulsevm_ffi::{CxxDigest, Database, PermissionObject};
 use pulsevm_serialization::Write;
 
 use crate::{
@@ -9,7 +13,6 @@ use crate::{
         apply_context::ApplyContext,
         authority::{Authority, PermissionLevel},
         authorization_manager::AuthorizationManager,
-        config,
         pulse_contract::pulse_contract_types::{DeleteAuth, LinkAuth, NewAccount, SetAbi, SetCode, UnlinkAuth, UpdateAuth},
         resource_limits::ResourceLimitsManager,
         utils::pulse_assert,
@@ -73,24 +76,23 @@ pub fn newaccount(context: &mut ApplyContext, db: &mut Database, act: &Action) -
             context.pending_block_timestamp().to_time_point().as_ref().unwrap(),
         )?
     };
-    let active_permission = AuthorizationManager::create_permission(
+    let active_permission = unsafe { &*AuthorizationManager::create_permission(
         db,
         &create.name,
         &ACTIVE_NAME.into(),
         owner_permission.get_id() as u64,
         &create.active.into(),
         context.pending_block_timestamp().to_time_point().as_ref().unwrap(),
-    )?;
+    )? };
 
     ResourceLimitsManager::initialize_account(db, &create.name)?;
 
-    // TODO: Fix RAM billing
-    /* let mut ram_delta: i64 = config::OVERHEAD_PER_ACCOUNT_RAM_BYTES as i64;
-    ram_delta += 2 * config::billable_size_v::<Permission>() as i64;
-    ram_delta += owner_permission.authority.get_billable_size() as i64;
-    ram_delta += active_permission.authority.get_billable_size() as i64;
+    let mut ram_delta: i64 = OVERHEAD_PER_ACCOUNT_RAM_BYTES as i64;
+    ram_delta += 2 * billable_size_v::<PermissionObject>() as i64;
+    ram_delta += owner_permission.get_authority().get_billable_size() as i64;
+    ram_delta += active_permission.get_authority().get_billable_size() as i64;
 
-    context.add_ram_usage(&create.name, ram_delta); */
+    context.add_ram_usage(&create.name, ram_delta)?;
 
     Ok(())
 }
@@ -113,7 +115,6 @@ pub fn setcode(context: &mut ApplyContext, db: &mut Database, act: &Action) -> R
     }
 
     let account = db.get_account_metadata(act.account.as_u64())?;
-    let account = unsafe { &*account };
     let existing_code = !account.get_code_hash().empty();
 
     pulse_assert(
@@ -122,7 +123,7 @@ pub fn setcode(context: &mut ApplyContext, db: &mut Database, act: &Action) -> R
     )?;
 
     let mut old_size = 0i64;
-    let new_size: i64 = code_size as i64 * config::SETCODE_RAM_BYTES_MULTIPLIER as i64;
+    let new_size: i64 = code_size as i64 * SETCODE_RAM_BYTES_MULTIPLIER as i64;
 
     if existing_code {
         let old_code_entry = unsafe { &*db.get_code_object_by_hash(code_hash.as_ref().unwrap(), act.vm_type, act.vm_version)? };
@@ -131,7 +132,7 @@ pub fn setcode(context: &mut ApplyContext, db: &mut Database, act: &Action) -> R
             ChainError::TransactionError(format!("contract is already running this version of code")),
         )?;
 
-        old_size = old_code_entry.get_code().size() as i64 * config::SETCODE_RAM_BYTES_MULTIPLIER as i64;
+        old_size = old_code_entry.get_code().size() as i64 * SETCODE_RAM_BYTES_MULTIPLIER as i64;
 
         db.unlink_account_code(old_code_entry)?;
     }
@@ -147,7 +148,7 @@ pub fn setcode(context: &mut ApplyContext, db: &mut Database, act: &Action) -> R
     )?;
 
     if new_size != old_size {
-        context.add_ram_usage(&act.account, new_size - old_size);
+        context.add_ram_usage(&act.account, new_size - old_size)?;
     }
 
     Ok(())
@@ -167,12 +168,12 @@ pub fn setabi(context: &mut ApplyContext, db: &mut Database, act: &Action) -> Re
     let account = db.get_account(act.account.as_u64())?;
     let old_size: i64 = account.get_abi().size() as i64;
     let new_size: i64 = abi_def_packed.len() as i64;
-    let account_metadata = unsafe { &*db.get_account_metadata(act.account.as_u64())? };
+    let account_metadata = db.get_account_metadata(act.account.as_u64())?;
 
     db.update_account_abi(account, account_metadata, act.abi.as_slice())?;
 
     if new_size != old_size {
-        context.add_ram_usage(&act.account, new_size - old_size);
+        context.add_ram_usage(&act.account, new_size - old_size)?;
     }
 
     Ok(())
@@ -229,7 +230,7 @@ pub fn updateauth(context: &mut ApplyContext, db: &mut Database, act: &Action) -
     let mut parent_id = 0i64;
     if update.permission != OWNER_NAME {
         let parent = AuthorizationManager::get_permission(db, update.account.as_u64(), update.parent.as_u64())?;
-        parent_id = parent.get_parent_id();
+        parent_id = parent.get_id();
     }
 
     if permission.is_some() {
@@ -239,28 +240,27 @@ pub fn updateauth(context: &mut ApplyContext, db: &mut Database, act: &Action) -
             ChainError::ActionValidationError(format!("changing parent authority is not currently supported")),
         )?;
 
-        // TODO: Fix RAM billing
-        /* let old_size: i64 = config::billable_size_v::<Permission>() as i64
-            + permission.authority.get_billable_size() as i64;
-        AuthorizationManager::modify_permission(db, &mut permission, &update.auth)?;
-        let new_size: i64 = config::billable_size_v::<Permission>() as i64
-            + permission.authority.get_billable_size() as i64;
+        let old_size: i64 = billable_size_v::<PermissionObject>() as i64
+            + permission.get_authority().get_billable_size() as i64;
+        AuthorizationManager::modify_permission(db, permission, &update.auth, &context.get_pending_block_time().to_time_point())?;
+        let new_size: i64 = billable_size_v::<PermissionObject>() as i64
+            + permission.get_authority().get_billable_size() as i64;
 
-        context.add_ram_usage(permission.get_owner(), new_size - old_size); */
+        context.add_ram_usage(&permission.get_owner().to_uint64_t().into(), new_size - old_size)?;
     } else {
-        /* let p = AuthorizationManager::create_permission(
+        let permission = unsafe { &*AuthorizationManager::create_permission(
             db,
             &update.account,
             &update.permission,
             parent_id as u64,
             &update.auth.into(),
             context.pending_block_timestamp().to_time_point().as_ref().unwrap(),
-        )?; */
-        // TODO: Fix RAM billing
-        /* let new_size: i64 =
-            config::billable_size_v::<Permission>() as i64 + p.authority.get_billable_size() as i64;
+        )? };
 
-        context.add_ram_usage(&update.account, new_size); */
+        let new_size: i64 =
+            billable_size_v::<PermissionObject>() as i64 + permission.get_authority().get_billable_size() as i64;
+
+        context.add_ram_usage(&update.account, new_size)?;
     }
 
     Ok(())
@@ -282,7 +282,7 @@ pub fn deleteauth(context: &mut ApplyContext, db: &mut Database, act: &Action) -
     )?;
 
     let old_size = db.delete_auth(remove.account.as_u64(), remove.permission.as_u64())?;
-    context.add_ram_usage(&remove.account, -old_size);
+    context.add_ram_usage(&remove.account, -old_size)?;
 
     Ok(())
 }
@@ -305,7 +305,7 @@ pub fn linkauth(context: &mut ApplyContext, db: &mut Database, act: &Action) -> 
     )?;
 
     if delta != 0 {
-        context.add_ram_usage(&requirement.account, delta);
+        context.add_ram_usage(&requirement.account, delta)?;
     }
 
     Ok(())
@@ -320,7 +320,7 @@ pub fn unlinkauth(context: &mut ApplyContext, db: &mut Database, act: &Action) -
     let delta = db.unlink_auth(unlink.account.as_u64(), unlink.code.as_u64(), unlink.message_type.as_u64())?;
 
     if delta != 0 {
-        context.add_ram_usage(&unlink.account, delta);
+        context.add_ram_usage(&unlink.account, delta)?;
     }
 
     Ok(())
@@ -328,7 +328,7 @@ pub fn unlinkauth(context: &mut ApplyContext, db: &mut Database, act: &Action) -
 
 fn validate_authority_precondition(db: &mut Database, auth: &Authority) -> Result<(), ChainError> {
     for a in auth.accounts() {
-        let account = db
+        let _ = db
             .get_account(a.permission.actor)
             .map_err(|_| ChainError::TransactionError(format!("account {} does not exist", a.permission.actor)))?;
 

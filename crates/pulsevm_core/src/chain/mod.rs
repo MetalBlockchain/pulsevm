@@ -10,7 +10,6 @@ pub mod controller;
 pub mod crypto;
 pub mod id;
 pub mod mempool;
-pub mod name;
 pub mod pulse_contract;
 pub mod resource;
 pub mod resource_limits;
@@ -21,13 +20,16 @@ pub mod utils;
 pub mod wasm_runtime;
 mod webassembly;
 
-use crate::chain::name::Name;
-
+// Re-export types for easier access
+pub mod name {
+    pub use pulsevm_name::Name;
+}
 pub mod authority {
     pub use pulsevm_ffi::{Authority, KeyWeight, PermissionLevel, PermissionLevelWeight, WaitWeight};
 }
 
 pub use pulsevm_error::ChainError;
+use pulsevm_name::Name;
 use pulsevm_name_macro::name;
 
 pub const PULSE_NAME: Name = Name::new(name!("pulse"));

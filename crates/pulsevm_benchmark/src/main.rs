@@ -9,15 +9,7 @@ use std::{
 
 use chrono::Utc;
 use pulsevm_core::{
-    ACTIVE_NAME, ChainError, PULSE_NAME,
-    asset::{Asset, Symbol},
-    authority::{Authority, KeyWeight, PermissionLevel},
-    controller::Controller,
-    crypto::PrivateKey,
-    id::Id,
-    name::Name,
-    pulse_contract::{NewAccount, SetAbi, SetCode},
-    transaction::{Action, PackedTransaction, Transaction, TransactionHeader},
+    ACTIVE_NAME, ChainError, PULSE_NAME, asset::{Asset, Symbol}, authority::{Authority, KeyWeight, PermissionLevel}, block::BlockStatus, controller::Controller, crypto::PrivateKey, id::Id, name::Name, pulse_contract::{NewAccount, SetAbi, SetCode}, transaction::{Action, PackedTransaction, Transaction, TransactionHeader}
 };
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 use pulsevm_serialization::Write;
@@ -32,21 +24,17 @@ async fn main() {
     let genesis_bytes = generate_genesis(&private_key);
     let temp_path = get_temp_dir().to_str().unwrap().to_string();
     controller.initialize(&genesis_bytes.to_vec(), temp_path.as_str()).unwrap();
-    let db = controller.database();
-    let global_properties = Controller::get_global_properties(&db).unwrap();
-    let mut db = controller.database();
-    let chain_config = global_properties.get_chain_config();
     let pending_block_timestamp = controller.last_accepted_block().timestamp().clone();
+    let block_status = BlockStatus::Building;
 
     println!("Setting up initial accounts and contracts...");
 
     // Create 'pulse.token' account
     controller
         .execute_transaction(
-            &mut db,
-            &chain_config,
             &create_account(&private_key, Name::from_str("pulse.token").unwrap(), controller.chain_id()).unwrap(),
             &pending_block_timestamp,
+            &block_status,
         )
         .unwrap();
 
@@ -55,10 +43,9 @@ async fn main() {
     // Create 'alice' account
     controller
         .execute_transaction(
-            &mut db,
-            &chain_config,
             &create_account(&private_key, Name::from_str("alice").unwrap(), controller.chain_id()).unwrap(),
             &pending_block_timestamp,
+            &block_status,
         )
         .unwrap();
 
@@ -67,10 +54,9 @@ async fn main() {
     // Create 'bob' account
     controller
         .execute_transaction(
-            &mut db,
-            &chain_config,
             &create_account(&private_key, Name::from_str("bob").unwrap(), controller.chain_id()).unwrap(),
             &pending_block_timestamp,
+            &block_status,
         )
         .unwrap();
 
@@ -81,8 +67,6 @@ async fn main() {
     let pulse_token_abi = fs::read(root.join(Path::new("reference_contracts/pulse_token.abi"))).unwrap();
     controller
         .execute_transaction(
-            &mut db,
-            &chain_config,
             &set_code(
                 &private_key,
                 Name::from_str("pulse.token").unwrap(),
@@ -91,12 +75,11 @@ async fn main() {
             )
             .unwrap(),
             &pending_block_timestamp,
+            &block_status,
         )
         .unwrap();
     controller
         .execute_transaction(
-            &mut db,
-            &chain_config,
             &set_abi(
                 &private_key,
                 Name::from_str("pulse.token").unwrap(),
@@ -105,13 +88,12 @@ async fn main() {
             )
             .unwrap(),
             &pending_block_timestamp,
+            &block_status,
         )
         .unwrap();
 
     controller
         .execute_transaction(
-            &mut db,
-            &chain_config,
             &call_contract(
                 &private_key,
                 Name::from_str("pulse.token").unwrap(),
@@ -121,17 +103,16 @@ async fn main() {
                     max_supply: Asset::new(100000000, Symbol::from_str("4,EOS").unwrap()),
                 },
                 controller.chain_id(),
-                vec![PermissionLevel::new(Name::from_str("pulse.token").unwrap().as_u64(), ACTIVE_NAME)],
+                vec![PermissionLevel::new(Name::from_str("pulse.token").unwrap().as_u64(), ACTIVE_NAME.as_u64())],
             )
             .unwrap(),
             &pending_block_timestamp,
+            &block_status,
         )
         .unwrap();
 
     controller
         .execute_transaction(
-            &mut db,
-            &chain_config,
             &call_contract(
                 &private_key,
                 Name::from_str("pulse.token").unwrap(),
@@ -145,17 +126,16 @@ async fn main() {
                     memo: "Initial transfer".to_string(),
                 },
                 controller.chain_id(),
-                vec![PermissionLevel::new(Name::from_str("pulse.token").unwrap().as_u64(), ACTIVE_NAME)],
+                vec![PermissionLevel::new(Name::from_str("pulse.token").unwrap().as_u64(), ACTIVE_NAME.as_u64())],
             )
             .unwrap(),
             &pending_block_timestamp,
+            &block_status,
         )
         .unwrap();
 
     controller
         .execute_transaction(
-            &mut db,
-            &chain_config,
             &call_contract(
                 &private_key,
                 Name::from_str("pulse.token").unwrap(),
@@ -170,18 +150,17 @@ async fn main() {
                     memo: "Initial transfer".to_string(),
                 },
                 controller.chain_id(),
-                vec![PermissionLevel::new(Name::from_str("pulse.token").unwrap().as_u64(), ACTIVE_NAME)],
+                vec![PermissionLevel::new(Name::from_str("pulse.token").unwrap().as_u64(), ACTIVE_NAME.as_u64())],
             )
             .unwrap(),
             &pending_block_timestamp,
+            &block_status,
         )
         .unwrap();
 
     for _i in 0..50 {
         controller
             .execute_transaction(
-                &mut db,
-                &chain_config,
                 &call_contract(
                     &private_key,
                     Name::from_str("pulse.token").unwrap(),
@@ -196,10 +175,11 @@ async fn main() {
                         memo: "Initial transfer".to_string(),
                     },
                     controller.chain_id(),
-                    vec![PermissionLevel::new(Name::from_str("alice").unwrap().as_u64(), ACTIVE_NAME)],
+                    vec![PermissionLevel::new(Name::from_str("alice").unwrap().as_u64(), ACTIVE_NAME.as_u64())],
                 )
                 .unwrap(),
                 &pending_block_timestamp,
+                &block_status,
             )
             .unwrap();
     }
@@ -221,7 +201,7 @@ fn create_account(private_key: &PrivateKey, account: Name, chain_id: Id) -> Resu
             }
             .pack()
             .unwrap(),
-            vec![PermissionLevel::new(PULSE_NAME, ACTIVE_NAME)],
+            vec![PermissionLevel::new(PULSE_NAME.as_u64(), ACTIVE_NAME.as_u64())],
         )],
     );
     let trx = trx.sign(&private_key, &chain_id)?;
@@ -244,7 +224,7 @@ fn set_code(private_key: &PrivateKey, account: Name, wasm_bytes: Vec<u8>, chain_
             }
             .pack()
             .unwrap(),
-            vec![PermissionLevel::new(account.as_u64(), ACTIVE_NAME)],
+            vec![PermissionLevel::new(account.as_u64(), ACTIVE_NAME.as_u64())],
         )],
     )
     .sign(&private_key, &chain_id)?;
@@ -265,7 +245,7 @@ fn set_abi(private_key: &PrivateKey, account: Name, abi_bytes: Vec<u8>, chain_id
             }
             .pack()
             .unwrap(),
-            vec![PermissionLevel::new(account.as_u64(), ACTIVE_NAME)],
+            vec![PermissionLevel::new(account.as_u64(), ACTIVE_NAME.as_u64())],
         )],
     )
     .sign(&private_key, &chain_id)?;
@@ -322,7 +302,6 @@ fn generate_genesis(private_key: &PrivateKey) -> Vec<u8> {
             "max_action_return_value_size": 256
         }
     });
-    println!("{}", genesis.to_string());
     genesis.to_string().into_bytes()
 }
 

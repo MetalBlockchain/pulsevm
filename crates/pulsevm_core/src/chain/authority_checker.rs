@@ -40,7 +40,7 @@ impl<'a> AuthorityChecker<'a> {
         return *self.provided_keys == self.used_keys;
     }
 
-    pub fn satisfied(&mut self, db: &mut Database, authority: &Authority, recursion_depth: u16) -> Result<bool, ChainError> {
+    pub fn satisfied(&mut self, db: &Database, authority: &Authority, recursion_depth: u16) -> Result<bool, ChainError> {
         let mut total_weight = 0u32;
 
         for key in authority.keys() {
@@ -69,9 +69,9 @@ impl<'a> AuthorityChecker<'a> {
         Ok(0)
     }
 
-    pub fn visit_permission_level_weight(
+    pub fn visit_permission_level_weight<'b>(
         &mut self,
-        db: &mut Database,
+        db: &Database,
         permission: &PermissionLevelWeight,
         recursion_depth: u16,
     ) -> Result<u16, ChainError> {
@@ -109,22 +109,20 @@ impl<'a> AuthorityChecker<'a> {
         self.cached_permissions
             .insert(permission.permission.clone(), PermissionCacheStatus::BeingEvaluated);
 
-        // TODO: Fix
-        Ok(permission.weight)
-        /* let satisfied = self.satisfied(db, &auth.authority, recursion_depth + 1)?;
+        let satisfied = self.satisfied(db, &auth.get_authority().to_authority(), recursion_depth + 1)?;
 
         if satisfied {
             self.cached_permissions.insert(
-                permission.permission().clone(),
+                permission.permission.clone(),
                 PermissionCacheStatus::PermissionSatisfied,
             );
-            Ok(permission.weight())
+            Ok(permission.weight)
         } else {
             self.cached_permissions.insert(
-                permission.permission().clone(),
+                permission.permission.clone(),
                 PermissionCacheStatus::PermissionUnsatisfied,
             );
             Ok(0)
-        } */
+        }
     }
 }

@@ -1,5 +1,6 @@
 use std::fmt;
 
+use pulsevm_billable_size::BillableSize;
 use pulsevm_serialization::{NumBytes, Read, Write, WriteError};
 use serde::{Serialize, ser::SerializeStruct};
 
@@ -46,4 +47,9 @@ impl Serialize for WaitWeight {
         state.serialize_field("weight", &self.weight)?;
         state.end()
     }
+}
+
+impl BillableSize for WaitWeight {
+    const OVERHEAD: u64 = 0;
+    const VALUE: u64 = 16;
 }
