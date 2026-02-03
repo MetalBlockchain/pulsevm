@@ -40,7 +40,11 @@ impl fmt::Display for Asset {
             write!(f, "{} {}", self.amount, symbol_code)
         } else {
             let precision = usize::from(precision);
-            let formatted = format!("{:0precision$}", self.amount, precision = precision + if self.amount < 0 { 2 } else { 1 });
+            let formatted = format!(
+                "{:0precision$}",
+                self.amount,
+                precision = precision + if self.amount < 0 { 2 } else { 1 }
+            );
             let index = formatted.len() - precision;
             let whole = formatted.get(..index).unwrap_or_else(|| "");
             let fraction = formatted.get(index..).unwrap_or_else(|| "");
@@ -86,7 +90,10 @@ mod tests {
         let asset = Asset::new(1000000, symbol.clone());
         assert_eq!(asset.to_string(), "100.0000 SYS");
 
-        let asset = Asset::new(1000000, Symbol::new_with_code(0, SymbolCode::from_str("USD").unwrap()));
+        let asset = Asset::new(
+            1000000,
+            Symbol::new_with_code(0, SymbolCode::from_str("USD").unwrap()),
+        );
         assert_eq!(asset.to_string(), "1000000 USD");
 
         let asset = Asset::new(0, symbol);

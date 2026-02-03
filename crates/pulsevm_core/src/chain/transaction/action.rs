@@ -28,7 +28,12 @@ impl fmt::Display for Action {
 }
 
 impl Action {
-    pub fn new(account: Name, name: Name, data: Vec<u8>, authorization: Vec<PermissionLevel>) -> Self {
+    pub fn new(
+        account: Name,
+        name: Name,
+        data: Vec<u8>,
+        authorization: Vec<PermissionLevel>,
+    ) -> Self {
         Action {
             account,
             name,
@@ -74,7 +79,10 @@ pub fn generate_action_digest(act: &Action, action_return_value: Option<Vec<u8>>
 
 impl NumBytes for Action {
     fn num_bytes(&self) -> usize {
-        self.account.num_bytes() + self.name.num_bytes() + self.authorization.num_bytes() + self.data.num_bytes()
+        self.account.num_bytes()
+            + self.name.num_bytes()
+            + self.authorization.num_bytes()
+            + self.data.num_bytes()
     }
 }
 
@@ -89,7 +97,11 @@ impl Read for Action {
 }
 
 impl Write for Action {
-    fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), pulsevm_serialization::WriteError> {
+    fn write(
+        &self,
+        bytes: &mut [u8],
+        pos: &mut usize,
+    ) -> Result<(), pulsevm_serialization::WriteError> {
         self.account.write(bytes, pos)?;
         self.name.write(bytes, pos)?;
         self.authorization.write(bytes, pos)?;

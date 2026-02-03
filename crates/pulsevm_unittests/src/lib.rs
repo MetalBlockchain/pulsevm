@@ -9,12 +9,18 @@ mod tests {
         ACTIVE_NAME, CODE_NAME, ChainError, Database, OWNER_NAME, PULSE_NAME,
         authority::{Authority, KeyWeight, PermissionLevel, PermissionLevelWeight},
         block::{BlockStatus, BlockTimestamp},
-        config::{DELETEAUTH_NAME, LINKAUTH_NAME, NEWACCOUNT_NAME, SETCODE_NAME, UNLINKAUTH_NAME, UPDATEAUTH_NAME},
+        config::{
+            DELETEAUTH_NAME, LINKAUTH_NAME, NEWACCOUNT_NAME, SETCODE_NAME, UNLINKAUTH_NAME,
+            UPDATEAUTH_NAME,
+        },
         controller::Controller,
         crypto::{PrivateKey, PublicKey},
+        id::Id,
         name::Name,
         pulse_contract::{DeleteAuth, LinkAuth, NewAccount, SetCode, UnlinkAuth, UpdateAuth},
-        transaction::{Action, PackedTransaction, SignedTransaction, Transaction, TransactionTrace},
+        transaction::{
+            Action, PackedTransaction, SignedTransaction, Transaction, TransactionTrace,
+        },
         utils::pulse_assert,
     };
     use pulsevm_crypto::{Bytes, Digest};
@@ -36,13 +42,16 @@ mod tests {
     impl Testing {
         pub fn new() -> Self {
             let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+            let chain_id =
+                Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                    .unwrap();
             let mut controller = Controller::new();
             let private_key = get_private_key(PULSE_NAME.into(), "active");
             let genesis = generate_genesis(&private_key);
 
             // Initialize controller
             controller
-                .initialize(&genesis, temp_dir.path().to_str().unwrap())
+                .initialize(&chain_id, &genesis, temp_dir.path().to_str().unwrap())
                 .expect("Failed to initialize controller");
 
             let mut suite = Testing {
@@ -50,26 +59,46 @@ mod tests {
                 pending_block_state: None,
             };
 
-            suite.set_bios_contract().expect("Failed to set bios contract");
+            suite
+                .set_bios_contract()
+                .expect("Failed to set bios contract");
 
             suite
         }
 
-        pub fn create_accounts(&mut self, accounts: Vec<Name>, multisig: bool, include_code: bool) -> Result<Vec<TransactionTrace>, ChainError> {
+        pub fn create_accounts(
+            &mut self,
+            accounts: Vec<Name>,
+            multisig: bool,
+            include_code: bool,
+        ) -> Result<Vec<TransactionTrace>, ChainError> {
             let mut traces: Vec<TransactionTrace> = Vec::with_capacity(accounts.len());
 
             for account in accounts.iter() {
-                let trace = { self.create_account(account.clone(), PULSE_NAME.into(), multisig, include_code)? };
+                let trace = {
+                    self.create_account(account.clone(), PULSE_NAME.into(), multisig, include_code)?
+                };
                 traces.push(trace);
             }
 
             Ok(traces)
         }
 
-        pub fn create_account(&mut self, account: Name, creator: Name, multisig: bool, include_code: bool) -> Result<TransactionTrace, ChainError> {
+        pub fn create_account(
+            &mut self,
+            account: Name,
+            creator: Name,
+            multisig: bool,
+            include_code: bool,
+        ) -> Result<TransactionTrace, ChainError> {
             let mut trx = Transaction::default();
             self.set_transaction_headers(&mut trx, 6, 0);
-            let mut owner_auth = Authority::new(1, vec![KeyWeight::new(get_public_key(account, "owner").inner(), 1)], vec![], vec![]);
+            let mut owner_auth = Authority::new(
+                1,
+                vec![KeyWeight::new(get_public_key(account, "owner").inner(), 1)],
+                vec![],
+                vec![],
+            );
 
             if multisig {
                 owner_auth = Authority::new(
@@ -83,10 +112,16 @@ mod tests {
                 );
             }
 
-            let mut active_auth = Authority::new(1, vec![KeyWeight::new(get_public_key(account, "active").inner(), 1)], vec![], vec![]);
+            let mut active_auth = Authority::new(
+                1,
+                vec![KeyWeight::new(get_public_key(account, "active").inner(), 1)],
+                vec![],
+                vec![],
+            );
 
             let sort_permissions = |auth: &mut Authority| {
-                auth.accounts.sort_by(|lhs, rhs| lhs.permission.cmp(&rhs.permission));
+                auth.accounts
+                    .sort_by(|lhs, rhs| lhs.permission.cmp(&rhs.permission));
             };
 
             if include_code {
@@ -125,21 +160,37 @@ mod tests {
             ));
 
             self.set_transaction_headers(&mut trx, 6, 0);
-            let signed = trx.sign(&get_private_key(creator, "active"), &self.controller.chain_id()).unwrap();
+            let signed = trx
+                .sign(
+                    &get_private_key(creator, "active"),
+                    &self.controller.chain_id(),
+                )
+                .unwrap();
             let result = self.push_transaction(signed).unwrap();
             Ok(result)
         }
 
-        pub fn push_transaction(&mut self, trx: SignedTransaction) -> Result<TransactionTrace, ChainError> {
+        pub fn push_transaction(
+            &mut self,
+            trx: SignedTransaction,
+        ) -> Result<TransactionTrace, ChainError> {
             let pbs = self.get_pending_block_state();
-            let packed = PackedTransaction::from_signed_transaction(trx)
-                .map_err(|e| ChainError::DatabaseError(format!("failed to pack transaction for pushing: {}", e)))?;
+            let packed = PackedTransaction::from_signed_transaction(trx).map_err(|e| {
+                ChainError::DatabaseError(format!("failed to pack transaction for pushing: {}", e))
+            })?;
             let block_status = BlockStatus::Verifying;
-            let result = self.controller.execute_transaction(&packed, &pbs.timestamp, &block_status)?;
+            let result =
+                self.controller
+                    .execute_transaction(&packed, &pbs.timestamp, &block_status)?;
             Ok(result.trace)
         }
 
-        pub fn push_reqauth(&mut self, from: Name, role: &str, multi_sig: bool) -> Result<TransactionTrace, ChainError> {
+        pub fn push_reqauth(
+            &mut self,
+            from: Name,
+            role: &str,
+            multi_sig: bool,
+        ) -> Result<TransactionTrace, ChainError> {
             if !multi_sig {
                 return self.push_reqauth2(
                     from,
@@ -150,15 +201,27 @@ mod tests {
                 return self.push_reqauth2(
                     from,
                     vec![PermissionLevel::new(from.as_u64(), OWNER_NAME.as_u64())],
-                    vec![get_private_key(from, role), get_private_key(PULSE_NAME.into(), "active")],
+                    vec![
+                        get_private_key(from, role),
+                        get_private_key(PULSE_NAME.into(), "active"),
+                    ],
                 );
             }
         }
 
-        pub fn push_reqauth2(&mut self, from: Name, auths: Vec<PermissionLevel>, keys: Vec<PrivateKey>) -> Result<TransactionTrace, ChainError> {
+        pub fn push_reqauth2(
+            &mut self,
+            from: Name,
+            auths: Vec<PermissionLevel>,
+            keys: Vec<PrivateKey>,
+        ) -> Result<TransactionTrace, ChainError> {
             let mut trx = Transaction::default();
-            trx.actions
-                .push(Action::new(PULSE_NAME.into(), name!("reqauth").into(), from.pack().unwrap(), auths));
+            trx.actions.push(Action::new(
+                PULSE_NAME.into(),
+                name!("reqauth").into(),
+                from.pack().unwrap(),
+                auths,
+            ));
 
             self.set_transaction_headers(&mut trx, 6, 0);
             let mut signed: SignedTransaction = SignedTransaction::new(trx, HashSet::new(), vec![]);
@@ -182,7 +245,12 @@ mod tests {
             }
         }
 
-        pub fn set_transaction_headers(&self, trx: &mut Transaction, _expiration: u32, delay_sec: u32) {
+        pub fn set_transaction_headers(
+            &self,
+            trx: &mut Transaction,
+            _expiration: u32,
+            delay_sec: u32,
+        ) {
             trx.header.max_net_usage_words = VarUint32(0); // No limit
             trx.header.max_cpu_usage = 0; // No limit
             trx.header.delay_sec = VarUint32(delay_sec);
@@ -202,10 +270,16 @@ mod tests {
                 }
                 .pack()
                 .unwrap(),
-                vec![PermissionLevel::new(PULSE_NAME.as_u64(), ACTIVE_NAME.as_u64())],
+                vec![PermissionLevel::new(
+                    PULSE_NAME.as_u64(),
+                    ACTIVE_NAME.as_u64(),
+                )],
             ));
 
-            let signed = trx.sign(&get_private_key(PULSE_NAME, "active"), &self.controller.chain_id())?;
+            let signed = trx.sign(
+                &get_private_key(PULSE_NAME, "active"),
+                &self.controller.chain_id(),
+            )?;
             self.push_transaction(signed)?;
             Ok(())
         }
@@ -256,7 +330,13 @@ mod tests {
             Ok(())
         }
 
-        pub fn set_authority2(&mut self, account: Name, permission: Name, authority: Authority, parent: Name) -> Result<(), ChainError> {
+        pub fn set_authority2(
+            &mut self,
+            account: Name,
+            permission: Name,
+            authority: Authority,
+            parent: Name,
+        ) -> Result<(), ChainError> {
             let auths = vec![PermissionLevel::new(account.as_u64(), OWNER_NAME.as_u64())];
             let keys = vec![get_private_key(account, "owner")];
             self.set_authority(account, permission, authority, parent, auths, keys)
@@ -273,7 +353,12 @@ mod tests {
             trx.actions.push(Action::new(
                 PULSE_NAME,
                 DELETEAUTH_NAME,
-                DeleteAuth { account, permission }.pack().unwrap(),
+                DeleteAuth {
+                    account,
+                    permission,
+                }
+                .pack()
+                .unwrap(),
                 auths,
             ));
             self.set_transaction_headers(&mut trx, 6, 0);
@@ -286,13 +371,23 @@ mod tests {
             Ok(())
         }
 
-        pub fn delete_authority2(&mut self, account: Name, permission: Name) -> Result<(), ChainError> {
+        pub fn delete_authority2(
+            &mut self,
+            account: Name,
+            permission: Name,
+        ) -> Result<(), ChainError> {
             let auths = vec![PermissionLevel::new(account.as_u64(), OWNER_NAME.as_u64())];
             let keys = vec![get_private_key(account, "owner")];
             self.delete_authority(account, permission, auths, keys)
         }
 
-        pub fn link_authority(&mut self, account: Name, code: Name, requirement: Name, message_type: Name) -> Result<(), ChainError> {
+        pub fn link_authority(
+            &mut self,
+            account: Name,
+            code: Name,
+            requirement: Name,
+            message_type: Name,
+        ) -> Result<(), ChainError> {
             let mut trx = Transaction::default();
             trx.actions.push(Action::new(
                 PULSE_NAME,
@@ -309,22 +404,39 @@ mod tests {
             ));
             self.set_transaction_headers(&mut trx, 6, 0);
 
-            let signed = trx.sign(&get_private_key(account, "active"), &self.controller.chain_id())?;
+            let signed = trx.sign(
+                &get_private_key(account, "active"),
+                &self.controller.chain_id(),
+            )?;
             self.push_transaction(signed)?;
             Ok(())
         }
 
-        pub fn unlink_authority(&mut self, account: Name, code: Name, message_type: Name) -> Result<(), ChainError> {
+        pub fn unlink_authority(
+            &mut self,
+            account: Name,
+            code: Name,
+            message_type: Name,
+        ) -> Result<(), ChainError> {
             let mut trx = Transaction::default();
             trx.actions.push(Action::new(
                 PULSE_NAME,
                 UNLINKAUTH_NAME,
-                UnlinkAuth { account, code, message_type }.pack().unwrap(),
+                UnlinkAuth {
+                    account,
+                    code,
+                    message_type,
+                }
+                .pack()
+                .unwrap(),
                 vec![PermissionLevel::new(account.as_u64(), ACTIVE_NAME.as_u64())],
             ));
             self.set_transaction_headers(&mut trx, 6, 0);
 
-            let signed = trx.sign(&get_private_key(account, "active"), &self.controller.chain_id())?;
+            let signed = trx.sign(
+                &get_private_key(account, "active"),
+                &self.controller.chain_id(),
+            )?;
             self.push_transaction(signed)?;
             Ok(())
         }
@@ -332,7 +444,8 @@ mod tests {
 
     pub fn get_private_key(key_name: Name, role: &str) -> PrivateKey {
         let secret = key_name.to_string() + "_" + role;
-        let private_key = PrivateKey::new_k1_from_string(&secret).expect("Failed to create private key");
+        let private_key =
+            PrivateKey::new_k1_from_string(&secret).expect("Failed to create private key");
         private_key
     }
 

@@ -28,11 +28,16 @@ use spdlog::info;
 
 #[tokio::main]
 async fn main() {
-    let private_key = PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez").unwrap();
+    let chain_id =
+        Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6").unwrap();
+    let private_key =
+        PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez").unwrap();
     let mut controller = Controller::new();
     let genesis_bytes = generate_genesis(&private_key);
     let temp_path = get_temp_dir().to_str().unwrap().to_string();
-    controller.initialize(&genesis_bytes.to_vec(), temp_path.as_str()).unwrap();
+    controller
+        .initialize(&chain_id, &genesis_bytes.to_vec(), temp_path.as_str())
+        .unwrap();
     let pending_block_timestamp = controller.last_accepted_block().timestamp().clone();
     let block_status = BlockStatus::Building;
 
@@ -41,7 +46,12 @@ async fn main() {
     // Create 'pulse.token' account
     controller
         .execute_transaction(
-            &create_account(&private_key, Name::from_str("pulse.token").unwrap(), controller.chain_id().clone()).unwrap(),
+            &create_account(
+                &private_key,
+                Name::from_str("pulse.token").unwrap(),
+                controller.chain_id().clone(),
+            )
+            .unwrap(),
             &pending_block_timestamp,
             &block_status,
         )
@@ -52,7 +62,12 @@ async fn main() {
     // Create 'alice' account
     controller
         .execute_transaction(
-            &create_account(&private_key, Name::from_str("alice").unwrap(), controller.chain_id().clone()).unwrap(),
+            &create_account(
+                &private_key,
+                Name::from_str("alice").unwrap(),
+                controller.chain_id().clone(),
+            )
+            .unwrap(),
             &pending_block_timestamp,
             &block_status,
         )
@@ -63,7 +78,12 @@ async fn main() {
     // Create 'bob' account
     controller
         .execute_transaction(
-            &create_account(&private_key, Name::from_str("bob").unwrap(), controller.chain_id().clone()).unwrap(),
+            &create_account(
+                &private_key,
+                Name::from_str("bob").unwrap(),
+                controller.chain_id().clone(),
+            )
+            .unwrap(),
             &pending_block_timestamp,
             &block_status,
         )
@@ -71,9 +91,15 @@ async fn main() {
 
     println!("Created bob account");
 
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
-    let pulse_token_contract = fs::read(root.join(Path::new("reference_contracts/pulse_token.wasm"))).unwrap();
-    let pulse_token_abi = fs::read(root.join(Path::new("reference_contracts/pulse_token.abi"))).unwrap();
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    let pulse_token_contract =
+        fs::read(root.join(Path::new("reference_contracts/pulse_token.wasm"))).unwrap();
+    let pulse_token_abi =
+        fs::read(root.join(Path::new("reference_contracts/pulse_token.abi"))).unwrap();
     controller
         .execute_transaction(
             &set_code(
@@ -193,7 +219,10 @@ async fn main() {
                         memo: "Initial transfer".to_string(),
                     },
                     controller.chain_id().clone(),
-                    vec![PermissionLevel::new(Name::from_str("alice").unwrap().as_u64(), ACTIVE_NAME.as_u64())],
+                    vec![PermissionLevel::new(
+                        Name::from_str("alice").unwrap().as_u64(),
+                        ACTIVE_NAME.as_u64(),
+                    )],
                 )
                 .unwrap(),
                 &pending_block_timestamp,
@@ -203,8 +232,20 @@ async fn main() {
     }
 }
 
-fn create_account(private_key: &PrivateKey, account: Name, chain_id: Id) -> Result<PackedTransaction, ChainError> {
-    let authority = Authority::new(1, vec![KeyWeight::new(private_key.get_public_key().inner().clone(), 1)], vec![], vec![]);
+fn create_account(
+    private_key: &PrivateKey,
+    account: Name,
+    chain_id: Id,
+) -> Result<PackedTransaction, ChainError> {
+    let authority = Authority::new(
+        1,
+        vec![KeyWeight::new(
+            private_key.get_public_key().inner().clone(),
+            1,
+        )],
+        vec![],
+        vec![],
+    );
     let trx = Transaction::new(
         TransactionHeader::new(TimePointSec::new(0), 0, 0, 0u32.into(), 0, 0u32.into()),
         vec![],
@@ -219,7 +260,10 @@ fn create_account(private_key: &PrivateKey, account: Name, chain_id: Id) -> Resu
             }
             .pack()
             .unwrap(),
-            vec![PermissionLevel::new(PULSE_NAME.as_u64(), ACTIVE_NAME.as_u64())],
+            vec![PermissionLevel::new(
+                PULSE_NAME.as_u64(),
+                ACTIVE_NAME.as_u64(),
+            )],
         )],
     );
     let trx = trx.sign(&private_key, &chain_id)?;
@@ -227,7 +271,12 @@ fn create_account(private_key: &PrivateKey, account: Name, chain_id: Id) -> Resu
     Ok(packed_trx)
 }
 
-fn set_code(private_key: &PrivateKey, account: Name, wasm_bytes: Vec<u8>, chain_id: Id) -> Result<PackedTransaction, ChainError> {
+fn set_code(
+    private_key: &PrivateKey,
+    account: Name,
+    wasm_bytes: Vec<u8>,
+    chain_id: Id,
+) -> Result<PackedTransaction, ChainError> {
     let trx = Transaction::new(
         TransactionHeader::new(TimePointSec::new(0), 0, 0, 0u32.into(), 0, 0u32.into()),
         vec![],
@@ -250,7 +299,12 @@ fn set_code(private_key: &PrivateKey, account: Name, wasm_bytes: Vec<u8>, chain_
     Ok(packed_trx)
 }
 
-fn set_abi(private_key: &PrivateKey, account: Name, abi_bytes: Vec<u8>, chain_id: Id) -> Result<PackedTransaction, ChainError> {
+fn set_abi(
+    private_key: &PrivateKey,
+    account: Name,
+    abi_bytes: Vec<u8>,
+    chain_id: Id,
+) -> Result<PackedTransaction, ChainError> {
     let trx = Transaction::new(
         TransactionHeader::new(TimePointSec::new(0), 0, 0, 0u32.into(), 0, 0u32.into()),
         vec![],
@@ -282,7 +336,12 @@ fn call_contract<T: Write>(
     let trx = Transaction::new(
         TransactionHeader::new(TimePointSec::new(0), 0, 0, 0u32.into(), 0, 0u32.into()),
         vec![],
-        vec![Action::new(account, action, action_data.pack().unwrap(), permissions)],
+        vec![Action::new(
+            account,
+            action,
+            action_data.pack().unwrap(),
+            permissions,
+        )],
     )
     .sign(&private_key, &chain_id)?;
     let packed_trx = PackedTransaction::from_signed_transaction(trx)?;

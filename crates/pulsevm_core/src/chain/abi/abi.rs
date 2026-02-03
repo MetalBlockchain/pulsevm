@@ -1,5 +1,6 @@
 use pulsevm_error::ChainError;
 use pulsevm_proc_macros::{NumBytes, Read, Write};
+use pulsevm_serialization::Read;
 use serde::{Deserialize, Serialize};
 
 use crate::chain::Name;
@@ -85,7 +86,7 @@ pub struct AbiActionResultDefinition {
     pub result_type: String,
 }
 
-#[derive(Debug, Clone, Read, Write, NumBytes, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Write, NumBytes, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AbiDefinition {
     pub version: String,
     #[serde(default)]
@@ -116,6 +117,44 @@ impl AbiDefinition {
             }
         }
 
-        Err(ChainError::InvalidArgument(format!("table '{}' not found in ABI", table_name)))
+        Err(ChainError::InvalidArgument(format!(
+            "table '{}' not found in ABI",
+            table_name
+        )))
+    }
+}
+
+impl Read for AbiDefinition {
+    fn read(bytes: &[u8], pos: &mut usize) -> Result<Self, pulsevm_serialization::ReadError> {
+        let version = String::read(bytes, pos)?;
+        let types = Vec::<AbiTypeDefinition>::read(bytes, pos)?;
+        let structs = Vec::<AbiStructDefinition>::read(bytes, pos)?;
+        let actions = Vec::<AbiActionDefinition>::read(bytes, pos)?;
+        let tables = Vec::<AbiTableDefinition>::read(bytes, pos)?;
+        let ricardian_clauses = Vec::<AbiClausePair>::read(bytes, pos)?;
+        let error_messages = Vec::<AbiErrorMessage>::read(bytes, pos)?;
+        let abi_extensions = Vec::<(u16, Vec<u8>)>::read(bytes, pos)?;
+        let mut variants = Vec::<AbiVariantDefinition>::new();
+        let mut action_results = Vec::<AbiActionResultDefinition>::new();
+
+        if bytes.len() > *pos {
+            variants = Vec::<AbiVariantDefinition>::read(bytes, pos)?;
+        }
+        if bytes.len() > *pos {
+            action_results = Vec::<AbiActionResultDefinition>::read(bytes, pos)?;
+        }
+
+        Ok(AbiDefinition {
+            version,
+            types,
+            structs,
+            actions,
+            tables,
+            ricardian_clauses,
+            error_messages,
+            abi_extensions,
+            variants,
+            action_results,
+        })
     }
 }

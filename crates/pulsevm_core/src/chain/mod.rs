@@ -25,7 +25,9 @@ pub mod name {
     pub use pulsevm_name::Name;
 }
 pub mod authority {
-    pub use pulsevm_ffi::{Authority, KeyWeight, PermissionLevel, PermissionLevelWeight, WaitWeight};
+    pub use pulsevm_ffi::{
+        Authority, KeyWeight, PermissionLevel, PermissionLevelWeight, WaitWeight,
+    };
 }
 
 pub use pulsevm_error::ChainError;

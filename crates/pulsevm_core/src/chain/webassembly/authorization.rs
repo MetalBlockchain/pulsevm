@@ -19,7 +19,11 @@ pub fn has_auth(env: FunctionEnvMut<WasmContext>, account: u64) -> Result<i32, R
     if result { Ok(1) } else { Ok(0) }
 }
 
-pub fn require_auth2(mut env: FunctionEnvMut<WasmContext>, account: u64, permission: u64) -> Result<(), RuntimeError> {
+pub fn require_auth2(
+    mut env: FunctionEnvMut<WasmContext>,
+    account: u64,
+    permission: u64,
+) -> Result<(), RuntimeError> {
     let context = env.data_mut().apply_context_mut();
 
     if let Err(err) = context.require_authorization(&account.into(), Some(permission.into())) {
@@ -29,7 +33,10 @@ pub fn require_auth2(mut env: FunctionEnvMut<WasmContext>, account: u64, permiss
     }
 }
 
-pub fn require_recipient(mut env: FunctionEnvMut<WasmContext>, recipient: u64) -> Result<(), RuntimeError> {
+pub fn require_recipient(
+    mut env: FunctionEnvMut<WasmContext>,
+    recipient: u64,
+) -> Result<(), RuntimeError> {
     let context = env.data_mut().apply_context_mut();
 
     if let Err(err) = context.require_recipient(&recipient.into()) {

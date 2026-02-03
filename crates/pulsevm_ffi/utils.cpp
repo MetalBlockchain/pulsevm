@@ -103,11 +103,10 @@ std::shared_ptr<CxxSignature> sign_digest_with_private_key(const CxxDigest& dige
     return std::make_shared<CxxSignature>(std::move(sig));
 }
 
-std::shared_ptr<CxxSignature> parse_signature_from_bytes(rust::Slice<const std::uint8_t> data, size_t& pos) {
+std::shared_ptr<CxxSignature> parse_signature_from_bytes(rust::Slice<const std::uint8_t> data) {
     fc::datastream<const char*> ds(reinterpret_cast<const char*>(data.data()), data.size());
     CxxSignature sig;
     fc::raw::unpack(ds, sig);
-    pos += ds.tellp();
     return std::make_shared<CxxSignature>(std::move(sig));
 }
 

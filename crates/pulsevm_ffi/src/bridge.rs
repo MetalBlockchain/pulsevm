@@ -61,8 +61,13 @@ pub mod ffi {
         include!("name.hpp");
         include!("database.hpp");
         include!("iterator_cache.hpp");
+        include!("api.hpp");
 
-        pub fn open_database(path: &str, flags: DatabaseOpenFlags, size: u64) -> UniquePtr<Database>;
+        pub fn open_database(
+            path: &str,
+            flags: DatabaseOpenFlags,
+            size: u64,
+        ) -> UniquePtr<Database>;
 
         #[cxx_name = "database_wrapper"]
         type Database;
@@ -133,14 +138,38 @@ pub mod ffi {
         pub fn commit(self: Pin<&mut Database>, revision: i64);
         pub fn revision(self: &Database) -> i64;
         pub fn add_indices(self: Pin<&mut Database>);
-        pub fn create_undo_session(self: Pin<&mut Database>, enabled: bool) -> Result<UniquePtr<UndoSession>>;
-        pub fn initialize_database(self: Pin<&mut Database>, genesis_data: &CxxGenesisState) -> Result<()>;
-        pub fn create_account(self: Pin<&mut Database>, account_name: u64, creation_date: u32) -> Result<&AccountObject>;
+        pub fn create_undo_session(
+            self: Pin<&mut Database>,
+            enabled: bool,
+        ) -> Result<UniquePtr<UndoSession>>;
+        pub fn initialize_database(
+            self: Pin<&mut Database>,
+            genesis_data: &CxxGenesisState,
+        ) -> Result<()>;
+        pub fn create_account(
+            self: Pin<&mut Database>,
+            account_name: u64,
+            creation_date: u32,
+        ) -> Result<&AccountObject>;
         pub fn find_account(self: &Database, account_name: u64) -> Result<*const AccountObject>;
-        pub fn create_account_metadata(self: Pin<&mut Database>, account_name: u64, is_privileged: bool) -> Result<&AccountMetadataObject>;
-        pub fn find_account_metadata(self: &Database, account_name: u64) -> Result<*const AccountMetadataObject>;
-        pub fn set_privileged(self: Pin<&mut Database>, account: u64, is_privileged: bool) -> Result<()>;
-        pub fn unlink_account_code(self: Pin<&mut Database>, old_code_entry: &CodeObject) -> Result<()>;
+        pub fn create_account_metadata(
+            self: Pin<&mut Database>,
+            account_name: u64,
+            is_privileged: bool,
+        ) -> Result<&AccountMetadataObject>;
+        pub fn find_account_metadata(
+            self: &Database,
+            account_name: u64,
+        ) -> Result<*const AccountMetadataObject>;
+        pub fn set_privileged(
+            self: Pin<&mut Database>,
+            account: u64,
+            is_privileged: bool,
+        ) -> Result<()>;
+        pub fn unlink_account_code(
+            self: Pin<&mut Database>,
+            old_code_entry: &CodeObject,
+        ) -> Result<()>;
         pub fn update_account_code(
             self: Pin<&mut Database>,
             account: &AccountMetadataObject,
@@ -157,22 +186,71 @@ pub mod ffi {
             account_metadata: &AccountMetadataObject,
             abi: &[u8],
         ) -> Result<()>;
-        pub fn get_code_object_by_hash(self: &Database, code_hash: &CxxDigest, vm_type: u8, vm_version: u8) -> Result<&CodeObject>;
+        pub fn get_code_object_by_hash(
+            self: &Database,
+            code_hash: &CxxDigest,
+            vm_type: u8,
+            vm_version: u8,
+        ) -> Result<&CodeObject>;
         pub fn initialize_resource_limits(self: Pin<&mut Database>) -> Result<()>;
-        pub fn initialize_account_resource_limits(self: Pin<&mut Database>, account_name: u64) -> Result<()>;
-        pub fn add_transaction_usage(self: Pin<&mut Database>, accounts: &Vec<u64>, cpu_usage: u64, net_usage: u64, time_slot: u32) -> Result<()>;
-        pub fn add_pending_ram_usage(self: Pin<&mut Database>, account_name: u64, ram_bytes: i64) -> Result<()>;
+        pub fn initialize_account_resource_limits(
+            self: Pin<&mut Database>,
+            account_name: u64,
+        ) -> Result<()>;
+        pub fn add_transaction_usage(
+            self: Pin<&mut Database>,
+            accounts: &Vec<u64>,
+            cpu_usage: u64,
+            net_usage: u64,
+            time_slot: u32,
+        ) -> Result<()>;
+        pub fn add_pending_ram_usage(
+            self: Pin<&mut Database>,
+            account_name: u64,
+            ram_bytes: i64,
+        ) -> Result<()>;
         pub fn verify_account_ram_usage(self: Pin<&mut Database>, account_name: u64) -> Result<()>;
         pub fn get_account_ram_usage(self: &Database, account_name: u64) -> Result<i64>;
-        pub fn set_account_limits(self: Pin<&mut Database>, account_name: u64, ram_bytes: i64, net_weight: i64, cpu_weight: i64) -> Result<bool>;
-        pub fn get_account_limits(self: &Database, account_name: u64, ram_bytes: &mut i64, net_weight: &mut i64, cpu_weight: &mut i64) -> Result<()>;
+        pub fn set_account_limits(
+            self: Pin<&mut Database>,
+            account_name: u64,
+            ram_bytes: i64,
+            net_weight: i64,
+            cpu_weight: i64,
+        ) -> Result<bool>;
+        pub fn get_account_limits(
+            self: &Database,
+            account_name: u64,
+            ram_bytes: &mut i64,
+            net_weight: &mut i64,
+            cpu_weight: &mut i64,
+        ) -> Result<()>;
         pub fn get_total_cpu_weight(self: &Database) -> Result<u64>;
         pub fn get_total_net_weight(self: &Database) -> Result<u64>;
-        pub fn get_account_net_limit(self: &Database, name: u64, greylist_limit: u32) -> Result<NetLimitResult>;
-        pub fn get_account_cpu_limit(self: &Database, name: u64, greylist_limit: u32) -> Result<CpuLimitResult>;
+        pub fn get_account_net_limit(
+            self: &Database,
+            name: u64,
+            greylist_limit: u32,
+        ) -> Result<NetLimitResult>;
+        pub fn get_account_cpu_limit(
+            self: &Database,
+            name: u64,
+            greylist_limit: u32,
+        ) -> Result<CpuLimitResult>;
         pub fn process_account_limit_updates(self: Pin<&mut Database>) -> Result<()>;
-        pub fn find_table(self: &Database, code: u64, scope: u64, table: u64) -> Result<*const TableObject>;
-        pub fn create_table(self: Pin<&mut Database>, code: u64, scope: u64, table: u64, payer: u64) -> Result<&TableObject>;
+        pub fn find_table(
+            self: &Database,
+            code: u64,
+            scope: u64,
+            table: u64,
+        ) -> Result<*const TableObject>;
+        pub fn create_table(
+            self: Pin<&mut Database>,
+            code: u64,
+            scope: u64,
+            table: u64,
+            payer: u64,
+        ) -> Result<&TableObject>;
         pub fn db_find_i64(
             self: Pin<&mut Database>,
             code: u64,
@@ -181,20 +259,57 @@ pub mod ffi {
             id: u64,
             keyval_cache: Pin<&mut CxxKeyValueIteratorCache>,
         ) -> Result<i32>;
-        pub fn create_key_value_object(self: Pin<&mut Database>, table: &TableObject, payer: u64, id: u64, buffer: &[u8]) -> Result<&KeyValueObject>;
-        pub fn update_key_value_object(self: Pin<&mut Database>, obj: &KeyValueObject, payer: u64, buffer: &[u8]) -> Result<()>;
+        pub fn create_key_value_object(
+            self: Pin<&mut Database>,
+            table: &TableObject,
+            payer: u64,
+            id: u64,
+            buffer: &[u8],
+        ) -> Result<&KeyValueObject>;
+        pub fn update_key_value_object(
+            self: Pin<&mut Database>,
+            obj: &KeyValueObject,
+            payer: u64,
+            buffer: &[u8],
+        ) -> Result<()>;
         pub fn remove_table(self: Pin<&mut Database>, table: &TableObject) -> Result<()>;
         pub fn is_account(self: &Database, account: u64) -> Result<bool>;
         pub fn find_permission(self: &Database, id: i64) -> Result<*const PermissionObject>;
-        pub fn find_permission_by_actor_and_permission(self: &Database, actor: u64, permission: u64) -> Result<*const PermissionObject>;
-        pub fn delete_auth(self: Pin<&mut Database>, account: u64, permission_name: u64) -> Result<i64>;
-        pub fn link_auth(self: Pin<&mut Database>, account_name: u64, code_name: u64, requirement_name: u64, requirement_type: u64) -> Result<i64>;
-        pub fn unlink_auth(self: Pin<&mut Database>, account_name: u64, code_name: u64, requirement_type: u64) -> Result<i64>;
-        pub fn next_recv_sequence(self: Pin<&mut Database>, receiver_account: &AccountMetadataObject) -> Result<u64>;
+        pub fn find_permission_by_actor_and_permission(
+            self: &Database,
+            actor: u64,
+            permission: u64,
+        ) -> Result<*const PermissionObject>;
+        pub fn delete_auth(
+            self: Pin<&mut Database>,
+            account: u64,
+            permission_name: u64,
+        ) -> Result<i64>;
+        pub fn link_auth(
+            self: Pin<&mut Database>,
+            account_name: u64,
+            code_name: u64,
+            requirement_name: u64,
+            requirement_type: u64,
+        ) -> Result<i64>;
+        pub fn unlink_auth(
+            self: Pin<&mut Database>,
+            account_name: u64,
+            code_name: u64,
+            requirement_type: u64,
+        ) -> Result<i64>;
+        pub fn next_recv_sequence(
+            self: Pin<&mut Database>,
+            receiver_account: &AccountMetadataObject,
+        ) -> Result<u64>;
         pub fn next_auth_sequence(self: Pin<&mut Database>, actor: u64) -> Result<u64>;
         pub fn next_global_sequence(self: Pin<&mut Database>) -> Result<u64>;
-        pub fn db_remove_i64(self: Pin<&mut Database>, keyval_cache: Pin<&mut CxxKeyValueIteratorCache>, iterator: i32, receiver: u64)
-        -> Result<i64>;
+        pub fn db_remove_i64(
+            self: Pin<&mut Database>,
+            keyval_cache: Pin<&mut CxxKeyValueIteratorCache>,
+            iterator: i32,
+            receiver: u64,
+        ) -> Result<i64>;
         pub fn db_next_i64(
             self: Pin<&mut Database>,
             keyval_cache: Pin<&mut CxxKeyValueIteratorCache>,
@@ -230,7 +345,10 @@ pub mod ffi {
             table: u64,
             id: u64,
         ) -> Result<i32>;
-        pub fn remove_permission(self: Pin<&mut Database>, permission: &PermissionObject) -> Result<()>;
+        pub fn remove_permission(
+            self: Pin<&mut Database>,
+            permission: &PermissionObject,
+        ) -> Result<()>;
         pub fn create_permission(
             self: Pin<&mut Database>,
             account: u64,
@@ -250,8 +368,17 @@ pub mod ffi {
             authority: &Authority,
             pending_block_time: &CxxTimePoint,
         ) -> Result<()>;
-        pub fn lookup_linked_permission(self: &Database, account: u64, code: u64, requirement_type: u64) -> Result<*const CxxName>;
+        pub fn lookup_linked_permission(
+            self: &Database,
+            account: u64,
+            code: u64,
+            requirement_type: u64,
+        ) -> Result<*const CxxName>;
         pub fn get_global_properties(self: &Database) -> Result<&GlobalPropertyObject>;
+        pub fn get_virtual_block_cpu_limit(self: &Database) -> Result<u64>;
+        pub fn get_virtual_block_net_limit(self: &Database) -> Result<u64>;
+        pub fn get_block_cpu_limit(self: &Database) -> Result<u64>;
+        pub fn get_block_net_limit(self: &Database) -> Result<u64>;
 
         // Methods on undo_session
         pub fn push(self: Pin<&mut UndoSession>) -> Result<()>;
@@ -260,10 +387,22 @@ pub mod ffi {
 
         pub type CxxKeyValueIteratorCache;
         pub fn new_key_value_iterator_cache() -> UniquePtr<CxxKeyValueIteratorCache>;
-        pub fn cache_table(self: Pin<&mut CxxKeyValueIteratorCache>, table: &TableObject) -> Result<i32>;
-        pub fn get_table(self: &CxxKeyValueIteratorCache, table_id: &TableId) -> Result<&TableObject>;
-        pub fn get_end_iterator_by_table_id(self: &CxxKeyValueIteratorCache, table_id: &TableId) -> Result<i32>;
-        pub fn find_table_by_end_iterator(self: &CxxKeyValueIteratorCache, ei: i32) -> Result<*const TableObject>;
+        pub fn cache_table(
+            self: Pin<&mut CxxKeyValueIteratorCache>,
+            table: &TableObject,
+        ) -> Result<i32>;
+        pub fn get_table(
+            self: &CxxKeyValueIteratorCache,
+            table_id: &TableId,
+        ) -> Result<&TableObject>;
+        pub fn get_end_iterator_by_table_id(
+            self: &CxxKeyValueIteratorCache,
+            table_id: &TableId,
+        ) -> Result<i32>;
+        pub fn find_table_by_end_iterator(
+            self: &CxxKeyValueIteratorCache,
+            ei: i32,
+        ) -> Result<*const TableObject>;
         pub fn get(self: &CxxKeyValueIteratorCache, iterator: i32) -> Result<&KeyValueObject>;
         pub fn remove(self: Pin<&mut CxxKeyValueIteratorCache>, iterator: i32) -> Result<()>;
         pub fn add(self: Pin<&mut CxxKeyValueIteratorCache>, obj: &KeyValueObject) -> Result<i32>;
@@ -338,11 +477,19 @@ pub mod ffi {
         pub fn parse_public_key_from_bytes(data: &[u8]) -> Result<SharedPtr<CxxPublicKey>>;
         pub fn parse_private_key(key_str: &str) -> Result<SharedPtr<CxxPrivateKey>>;
         pub fn private_key_to_string(private_key: &CxxPrivateKey) -> String;
-        pub fn sign_digest_with_private_key(digest: &CxxDigest, priv_key: &CxxPrivateKey) -> Result<SharedPtr<CxxSignature>>;
-        pub fn parse_signature_from_bytes(data: &[u8], pos: &mut usize) -> Result<SharedPtr<CxxSignature>>;
+        pub fn sign_digest_with_private_key(
+            digest: &CxxDigest,
+            priv_key: &CxxPrivateKey,
+        ) -> Result<SharedPtr<CxxSignature>>;
+        pub fn parse_signature_from_bytes(data: &[u8]) -> Result<SharedPtr<CxxSignature>>;
         pub fn parse_signature(signature_str: &str) -> Result<SharedPtr<CxxSignature>>;
-        pub fn recover_public_key_from_signature(sig: &CxxSignature, digest: &CxxDigest) -> Result<SharedPtr<CxxPublicKey>>;
-        pub fn get_public_key_from_private_key(private_key: &CxxPrivateKey) -> SharedPtr<CxxPublicKey>;
+        pub fn recover_public_key_from_signature(
+            sig: &CxxSignature,
+            digest: &CxxDigest,
+        ) -> Result<SharedPtr<CxxPublicKey>>;
+        pub fn get_public_key_from_private_key(
+            private_key: &CxxPrivateKey,
+        ) -> SharedPtr<CxxPublicKey>;
         pub fn packed_public_key_bytes(public_key: &CxxPublicKey) -> Vec<u8>;
         pub fn public_key_to_string(public_key: &CxxPublicKey) -> String;
         pub fn public_key_num_bytes(public_key: &CxxPublicKey) -> usize;
@@ -364,6 +511,49 @@ pub mod ffi {
         pub fn name_to_uint64(name: &CxxName) -> u64;
         pub fn to_uint64_t(self: &CxxName) -> u64;
         pub fn empty(self: &CxxName) -> bool;
+
+        // API methods
+        pub fn get_account_info_without_core_symbol(
+            db: &Database,
+            account: u64,
+            head_block_num: u32,
+            head_block_time: &CxxTimePoint,
+        ) -> Result<String>;
+        pub fn get_account_info_with_core_symbol(
+            db: &Database,
+            account: u64,
+            expected_core_symbol: &str,
+            head_block_num: u32,
+            head_block_time: &CxxTimePoint,
+        ) -> Result<String>;
+        pub fn get_currency_balance_with_symbol(
+            db: &Database,
+            code: u64,
+            account: u64,
+            symbol: &str,
+        ) -> Result<String>;
+        pub fn get_currency_balance_without_symbol(
+            db: &Database,
+            code: u64,
+            account: u64,
+        ) -> Result<String>;
+        pub fn get_currency_stats(db: &Database, code: u64, symbol: &str) -> Result<String>;
+        pub fn get_table_rows(
+            db: &Database,
+            json: bool,
+            code: u64,
+            scope: &str,
+            table: u64,
+            table_key: &str,
+            lower_bound: &str,
+            upper_bound: &str,
+            limit: u32,
+            key_type: &str,
+            index_position: &str,
+            encode_type: &str,
+            reverse: bool,
+            show_payer: bool,
+        ) -> Result<String>;
     }
 }
 

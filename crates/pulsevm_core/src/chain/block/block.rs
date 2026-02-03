@@ -21,13 +21,15 @@ pub struct BlockHeader {
     pub transaction_mroot: Digest,
     pub action_mroot: Id,
     pub schedule_version: u32,
-    pub new_producers: Option<Vec<u8>>,         // Placeholder for new producers, we don't use this for now
+    pub new_producers: Option<Vec<u8>>, // Placeholder for new producers, we don't use this for now
     pub header_extensions: Vec<(u16, Vec<u8>)>, // Placeholder for header extensions, we don't use this for now
 }
 
 impl BlockHeader {
     fn digest(&self) -> Result<Digest, ChainError> {
-        let packed = self.pack().map_err(|e| ChainError::SerializationError(e.to_string()))?;
+        let packed = self
+            .pack()
+            .map_err(|e| ChainError::SerializationError(e.to_string()))?;
         Ok(Digest::hash(&packed))
     }
 
@@ -67,11 +69,16 @@ pub struct SignedBlockHeader {
 pub struct SignedBlock {
     pub signed_block_header: SignedBlockHeader,
     pub transactions: VecDeque<TransactionReceipt>, // Placeholder for transactions, we don't use this for now
-    pub block_extensions: Vec<(u16, Vec<u8>)>,      // Placeholder for header extensions, we don't use this for now
+    pub block_extensions: Vec<(u16, Vec<u8>)>, // Placeholder for header extensions, we don't use this for now
 }
 
 impl SignedBlock {
-    pub fn new(parent_id: Id, timestamp: BlockTimestamp, transaction_receipts: VecDeque<TransactionReceipt>, transaction_mroot: Digest) -> Self {
+    pub fn new(
+        parent_id: Id,
+        timestamp: BlockTimestamp,
+        transaction_receipts: VecDeque<TransactionReceipt>,
+        transaction_mroot: Digest,
+    ) -> Self {
         SignedBlock {
             signed_block_header: SignedBlockHeader {
                 block: BlockHeader {
@@ -119,10 +126,30 @@ impl Serialize for SignedBlock {
         state.serialize_field("producer", &self.signed_block_header.block.producer)?;
         state.serialize_field("confirmed", &self.signed_block_header.block.confirmed)?;
         state.serialize_field("previous", &self.signed_block_header.block.previous)?;
-        state.serialize_field("transaction_mroot", &self.signed_block_header.block.transaction_mroot)?;
+        state.serialize_field(
+            "transaction_mroot",
+            &self.signed_block_header.block.transaction_mroot,
+        )?;
         state.serialize_field("transactions", &self.transactions)?;
-        state.serialize_field("id", &self.signed_block_header.block.calculate_id().unwrap())?;
+        state.serialize_field(
+            "id",
+            &self.signed_block_header.block.calculate_id().unwrap(),
+        )?;
         state.serialize_field("block_num", &self.signed_block_header.block.block_num())?;
         state.end()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pulsevm_serialization::{Read, Write};
+
+    use crate::block::SignedBlock;
+
+    #[test]
+    pub fn test_block_serialization() {
+        let signed_block = SignedBlock::default();
+        let packed = signed_block.pack().unwrap();
+        let unpacked = SignedBlock::read(&packed, &mut 0).unwrap();
     }
 }

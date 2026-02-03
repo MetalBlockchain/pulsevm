@@ -12,7 +12,9 @@ impl CxxDigest {
     }
 
     pub fn hash(data: &[u8]) -> Result<UniquePtr<CxxDigest>, ChainError> {
-        make_digest_from_data(data).map_err(|e| ChainError::InternalError(format!("failed to create digest from data: {}", e)))
+        make_digest_from_data(data).map_err(|e| {
+            ChainError::InternalError(format!("failed to create digest from data: {}", e))
+        })
     }
 
     pub fn as_slice(&self) -> &[u8] {

@@ -10,9 +10,11 @@ use time::{OffsetDateTime, PrimitiveDateTime, macros::format_description};
 use crate::{TimePoint, microseconds::seconds};
 
 // Base EOS format (no 'Z')
-const EOS_FMT_NOZ: &[time::format_description::FormatItem<'_>] = format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]");
+const EOS_FMT_NOZ: &[time::format_description::FormatItem<'_>] =
+    format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]");
 // Exact output format (with trailing 'Z')
-const EOS_FMT_Z: &[time::format_description::FormatItem<'_>] = format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]Z");
+const EOS_FMT_Z: &[time::format_description::FormatItem<'_>] =
+    format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]Z");
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Read, Write, NumBytes, Default)]
 pub struct TimePointSec {
@@ -22,12 +24,16 @@ pub struct TimePointSec {
 impl TimePointSec {
     #[inline]
     pub const fn new(seconds: u32) -> Self {
-        Self { utc_seconds: seconds }
+        Self {
+            utc_seconds: seconds,
+        }
     }
 
     #[inline]
     pub const fn maximum() -> Self {
-        Self { utc_seconds: u32::MAX }
+        Self {
+            utc_seconds: u32::MAX,
+        }
     }
 
     #[inline]
@@ -42,7 +48,8 @@ impl TimePointSec {
 
     /// Exact EOS-style string: "YYYY-MM-DDTHH:MM:SSZ"
     pub fn to_eos_string(&self) -> String {
-        let dt = OffsetDateTime::from_unix_timestamp(self.utc_seconds as i64).expect("valid unix timestamp");
+        let dt = OffsetDateTime::from_unix_timestamp(self.utc_seconds as i64)
+            .expect("valid unix timestamp");
         dt.format(EOS_FMT_Z).expect("formatting never fails")
     }
 }
@@ -60,12 +67,15 @@ impl FromStr for TimePointSec {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         // Accept both "...SS" and "...SSZ"
         let s_noz = s.strip_suffix('Z').unwrap_or(s);
-        let pdt = PrimitiveDateTime::parse(s_noz, EOS_FMT_NOZ).map_err(|e| format!("invalid EOS time_point_sec: {e}"))?;
+        let pdt = PrimitiveDateTime::parse(s_noz, EOS_FMT_NOZ)
+            .map_err(|e| format!("invalid EOS time_point_sec: {e}"))?;
         let ts = pdt.assume_utc().unix_timestamp();
         if ts < 0 || ts > u32::MAX as i64 {
             return Err("timestamp out of range for u32".into());
         }
-        Ok(TimePointSec { utc_seconds: ts as u32 })
+        Ok(TimePointSec {
+            utc_seconds: ts as u32,
+        })
     }
 }
 
@@ -74,7 +84,9 @@ impl From<TimePoint> for TimePointSec {
     fn from(t: TimePoint) -> Self {
         // Truncate microseconds to whole seconds
         let secs = (t.elapsed.count() / 1_000_000) as i64;
-        Self { utc_seconds: secs as u32 } // C++ semantics: wrap on cast if negative/large
+        Self {
+            utc_seconds: secs as u32,
+        } // C++ semantics: wrap on cast if negative/large
     }
 }
 

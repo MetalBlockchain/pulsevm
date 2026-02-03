@@ -2485,6 +2485,7 @@ dependencies = [
  "libc",
  "pulsevm_billable_size",
  "pulsevm_constants",
+ "pulsevm_crypto",
  "pulsevm_error",
  "pulsevm_name",
  "pulsevm_proc_macros",

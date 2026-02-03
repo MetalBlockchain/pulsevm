@@ -40,7 +40,12 @@ impl<'a> AuthorityChecker<'a> {
         return *self.provided_keys == self.used_keys;
     }
 
-    pub fn satisfied(&mut self, db: &Database, authority: &Authority, recursion_depth: u16) -> Result<bool, ChainError> {
+    pub fn satisfied(
+        &mut self,
+        db: &Database,
+        authority: &Authority,
+        recursion_depth: u16,
+    ) -> Result<bool, ChainError> {
         let mut total_weight = 0u32;
 
         for key in authority.keys() {
@@ -52,7 +57,8 @@ impl<'a> AuthorityChecker<'a> {
         }
 
         for permission in authority.accounts() {
-            total_weight += self.visit_permission_level_weight(db, permission, recursion_depth)? as u32;
+            total_weight +=
+                self.visit_permission_level_weight(db, permission, recursion_depth)? as u32;
         }
 
         Ok(total_weight >= authority.threshold())
@@ -76,14 +82,18 @@ impl<'a> AuthorityChecker<'a> {
         recursion_depth: u16,
     ) -> Result<u16, ChainError> {
         if recursion_depth > self.recursion_depth_limit {
-            return Err(ChainError::AuthorizationError("recursion depth exceeded".to_string()));
+            return Err(ChainError::AuthorizationError(
+                "recursion depth exceeded".to_string(),
+            ));
         }
 
         // cache lookup
         match self.cached_permissions.get(&permission.permission) {
             Some(PermissionCacheStatus::BeingEvaluated) => {
                 // cycle
-                return Err(ChainError::AuthorizationError("permission cycle detected".to_string()));
+                return Err(ChainError::AuthorizationError(
+                    "permission cycle detected".to_string(),
+                ));
             }
             Some(PermissionCacheStatus::PermissionSatisfied) => {
                 return Ok(permission.weight);
@@ -97,7 +107,10 @@ impl<'a> AuthorityChecker<'a> {
         }
 
         // not cached yet – fetch authority from DB
-        let auth = db.find_permission_by_actor_and_permission(permission.permission.actor, permission.permission.permission)?;
+        let auth = db.find_permission_by_actor_and_permission(
+            permission.permission.actor,
+            permission.permission.permission,
+        )?;
 
         if auth.is_null() {
             return Ok(0);
@@ -106,18 +119,28 @@ impl<'a> AuthorityChecker<'a> {
         let auth = unsafe { &*auth };
 
         // mark as being evaluated to detect cycles
-        self.cached_permissions
-            .insert(permission.permission.clone(), PermissionCacheStatus::BeingEvaluated);
+        self.cached_permissions.insert(
+            permission.permission.clone(),
+            PermissionCacheStatus::BeingEvaluated,
+        );
 
-        let satisfied = self.satisfied(db, &auth.get_authority().to_authority(), recursion_depth + 1)?;
+        let satisfied = self.satisfied(
+            db,
+            &auth.get_authority().to_authority(),
+            recursion_depth + 1,
+        )?;
 
         if satisfied {
-            self.cached_permissions
-                .insert(permission.permission.clone(), PermissionCacheStatus::PermissionSatisfied);
+            self.cached_permissions.insert(
+                permission.permission.clone(),
+                PermissionCacheStatus::PermissionSatisfied,
+            );
             Ok(permission.weight)
         } else {
-            self.cached_permissions
-                .insert(permission.permission.clone(), PermissionCacheStatus::PermissionUnsatisfied);
+            self.cached_permissions.insert(
+                permission.permission.clone(),
+                PermissionCacheStatus::PermissionUnsatisfied,
+            );
             Ok(0)
         }
     }

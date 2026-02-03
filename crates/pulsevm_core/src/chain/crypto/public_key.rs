@@ -4,7 +4,9 @@ use std::{
     str::FromStr,
 };
 
+use chrono::format::Fixed;
 use cxx::SharedPtr;
+use pulsevm_crypto::FixedBytes;
 use pulsevm_error::ChainError;
 use pulsevm_ffi::CxxPublicKey;
 use pulsevm_serialization::{NumBytes, Read, ReadError, Write, WriteError};
@@ -67,21 +69,24 @@ impl Serialize for PublicKey {
 
 impl NumBytes for PublicKey {
     fn num_bytes(&self) -> usize {
-        self.inner.num_bytes().num_bytes() + self.inner.num_bytes() // Encode is as a vec<u8>
+        34 // Fixed size for packed public key representation
     }
 }
 
 impl Read for PublicKey {
     fn read(bytes: &[u8], pos: &mut usize) -> Result<Self, ReadError> {
-        let packed = Vec::<u8>::read(bytes, pos)?;
-        let cxx_key = pulsevm_ffi::parse_public_key_from_bytes(&packed).map_err(|e| ReadError::CustomError(e.to_string()))?;
+        let packed = FixedBytes::<34>::read(bytes, pos)?;
+        let cxx_key = pulsevm_ffi::parse_public_key_from_bytes(packed.as_ref())
+            .map_err(|e| ReadError::CustomError(e.to_string()))?;
         Ok(PublicKey { inner: cxx_key })
     }
 }
 
 impl Write for PublicKey {
     fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), WriteError> {
-        let packed = self.inner.packed_bytes();
+        let packed: FixedBytes<34> = self.inner.packed_bytes().try_into().map_err(|_| {
+            WriteError::CustomError("Failed to convert packed public key to FixedBytes<34>".into())
+        })?;
         packed.write(bytes, pos)
     }
 }
@@ -96,7 +101,8 @@ impl FromStr for PublicKey {
     type Err = ChainError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let cxx_key = pulsevm_ffi::parse_public_key(s).map_err(|e| ChainError::ParseError(e.to_string()))?;
+        let cxx_key =
+            pulsevm_ffi::parse_public_key(s).map_err(|e| ChainError::ParseError(e.to_string()))?;
         Ok(PublicKey { inner: cxx_key })
     }
 }

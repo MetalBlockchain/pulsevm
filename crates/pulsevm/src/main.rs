@@ -36,7 +36,7 @@ use tonic::transport::server::TcpIncoming;
 use tonic::{Request, Response, Status, transport::Server};
 
 use crate::{
-    chain::{BlockTimer, Gossipable},
+    chain::{BlockTimer, GossipType, Gossipable},
     state_history::StateHistoryServer,
 };
 
@@ -50,10 +50,14 @@ async fn main() {
     let cancel_runtime = cancel.clone();
     let avalanche_addr = std::env::var("AVALANCHE_VM_RUNTIME_ENGINE_ADDR").unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind to address");
-    listener.set_nonblocking(true).expect("failed to set listener to non-blocking");
+    listener
+        .set_nonblocking(true)
+        .expect("failed to set listener to non-blocking");
     let addr: std::net::SocketAddr = listener.local_addr().expect("failed to get local address");
-    let tokio_listener = TokioTcpListener::from_std(listener).expect("failed to convert to tokio listener");
-    let incoming = TcpIncoming::from_listener(tokio_listener, true, None).expect("failed to create incoming listener");
+    let tokio_listener =
+        TokioTcpListener::from_std(listener).expect("failed to convert to tokio listener");
+    let incoming = TcpIncoming::from_listener(tokio_listener, true, None)
+        .expect("failed to create incoming listener");
     // Main VM instance
     let vm = VirtualMachine::new(addr).unwrap();
 
@@ -64,19 +68,26 @@ async fn main() {
         cancel_runtime.cancel();
         res
     });
-    let mut client: RuntimeClient<tonic::transport::Channel> = RuntimeClient::connect(format!("http://{}", avalanche_addr))
-        .await
-        .expect("failed to connect to runtime engine");
+    let mut client: RuntimeClient<tonic::transport::Channel> =
+        RuntimeClient::connect(format!("http://{}", avalanche_addr))
+            .await
+            .expect("failed to connect to runtime engine");
     let request = Request::new(InitializeRequest {
         protocol_version: PLUGIN_VERSION,
         addr: addr.to_string(),
     });
-    client.initialize(request).await.expect("failed to initialize runtime engine");
+    client
+        .initialize(request)
+        .await
+        .expect("failed to initialize runtime engine");
 
     let state_history_service = StateHistoryServer::new(vm.clone());
     let ws_bind = std::env::var("WS_BIND").unwrap_or_else(|_| "127.0.0.1:9090".into());
     let ws_handle = tokio::spawn(async move {
-        if let Err(e) = state_history_service.run_ws_server(&ws_bind, cancel_ws).await {
+        if let Err(e) = state_history_service
+            .run_ws_server(&ws_bind, cancel_ws)
+            .await
+        {
             spdlog::error!("WS server error: {:?}", e);
         }
     });
@@ -90,7 +101,8 @@ async fn main() {
 }
 
 async fn shutdown_signal(vm: VirtualMachine) {
-    let mut sigterm_stream = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+    let mut sigterm_stream =
+        signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
 
     let terminate = async {
         loop {
@@ -106,7 +118,8 @@ async fn shutdown_signal(vm: VirtualMachine) {
         }
     };
 
-    let mut sigint_stream = signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
+    let mut sigint_stream =
+        signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
 
     let sigint = async {
         loop {
@@ -120,7 +133,10 @@ async fn shutdown_signal(vm: VirtualMachine) {
     }
 }
 
-async fn start_runtime_service(vm: VirtualMachine, incoming: TcpIncoming) -> Result<(), tonic::transport::Error> {
+async fn start_runtime_service(
+    vm: VirtualMachine,
+    incoming: TcpIncoming,
+) -> Result<(), tonic::transport::Error> {
     let shutdown_signal = shutdown_signal(vm.clone());
     Server::builder()
         .add_service(VmServer::new(vm.clone()))
@@ -145,7 +161,8 @@ impl VirtualMachine {
         let controller = Arc::new(RwLock::new(Controller::new()));
         let mempool = Arc::new(RwLock::new(Mempool::new()));
         let network_manager = Arc::new(RwLock::new(chain::NetworkManager::new()));
-        let rpc_service = chain::RpcService::new(mempool.clone(), controller.clone(), network_manager.clone());
+        let rpc_service =
+            chain::RpcService::new(mempool.clone(), controller.clone(), network_manager.clone());
         let block_timer = Arc::new(RwLock::new(BlockTimer::new(mempool.clone())));
 
         Ok(Self {
@@ -162,16 +179,25 @@ impl VirtualMachine {
 
 #[tonic::async_trait]
 impl Vm for VirtualMachine {
-    async fn initialize(&self, request: Request<vm::InitializeRequest>) -> Result<tonic::Response<vm::InitializeResponse>, Status> {
+    async fn initialize(
+        &self,
+        request: Request<vm::InitializeRequest>,
+    ) -> Result<tonic::Response<vm::InitializeResponse>, Status> {
         let genesis_bytes = request.get_ref().genesis_bytes.clone();
         let db_path = request.get_ref().chain_data_dir.clone();
         let server_addr = request.get_ref().server_addr.clone();
+        let chain_id: Id = request
+            .get_ref()
+            .chain_id
+            .clone()
+            .try_into()
+            .map_err(|_| Status::invalid_argument("invalid chain id"))?;
         let controller = self.controller.clone();
         let mut controller = controller.write().await;
 
         // Initialize the controller with the genesis bytes
         controller
-            .initialize(&genesis_bytes, db_path.as_str())
+            .initialize(&chain_id, &genesis_bytes, db_path.as_str())
             .map_err(|e| Status::internal(format!("could not initialize controller: {}", e)))?;
 
         let network_manager = Arc::clone(&self.network_manager);
@@ -184,7 +210,11 @@ impl Vm for VirtualMachine {
 
         return Ok(Response::new(vm::InitializeResponse {
             last_accepted_id: controller.last_accepted_block().id().as_bytes().to_vec(),
-            last_accepted_parent_id: controller.last_accepted_block().previous_id().as_bytes().to_vec(),
+            last_accepted_parent_id: controller
+                .last_accepted_block()
+                .previous_id()
+                .as_bytes()
+                .to_vec(),
             height: controller.last_accepted_block().block_num() as u64,
             bytes: controller
                 .last_accepted_block()
@@ -194,13 +224,20 @@ impl Vm for VirtualMachine {
         }));
     }
 
-    async fn set_state(&self, _request: Request<vm::SetStateRequest>) -> Result<tonic::Response<vm::SetStateResponse>, Status> {
+    async fn set_state(
+        &self,
+        _request: Request<vm::SetStateRequest>,
+    ) -> Result<tonic::Response<vm::SetStateResponse>, Status> {
         let controller = self.controller.clone();
         let controller = controller.read().await;
 
         return Ok(Response::new(vm::SetStateResponse {
             last_accepted_id: controller.last_accepted_block().id().as_bytes().to_vec(),
-            last_accepted_parent_id: controller.last_accepted_block().previous_id().as_bytes().to_vec(),
+            last_accepted_parent_id: controller
+                .last_accepted_block()
+                .previous_id()
+                .as_bytes()
+                .to_vec(),
             height: controller.last_accepted_block().block_num() as u64,
             bytes: controller
                 .last_accepted_block()
@@ -216,7 +253,10 @@ impl Vm for VirtualMachine {
         Ok(Response::new(()))
     }
 
-    async fn create_handlers(&self, _request: Request<()>) -> Result<tonic::Response<vm::CreateHandlersResponse>, Status> {
+    async fn create_handlers(
+        &self,
+        _request: Request<()>,
+    ) -> Result<tonic::Response<vm::CreateHandlersResponse>, Status> {
         Ok(Response::new(vm::CreateHandlersResponse {
             handlers: vec![Handler {
                 prefix: "/rpc".to_string(),
@@ -225,7 +265,10 @@ impl Vm for VirtualMachine {
         }))
     }
 
-    async fn connected(&self, request: Request<vm::ConnectedRequest>) -> Result<tonic::Response<()>, Status> {
+    async fn connected(
+        &self,
+        request: Request<vm::ConnectedRequest>,
+    ) -> Result<tonic::Response<()>, Status> {
         let network_manager = Arc::clone(&self.network_manager);
         let mut network_manager = network_manager.write().await;
         let node_id: NodeId = request
@@ -238,7 +281,10 @@ impl Vm for VirtualMachine {
         Ok(Response::new(()))
     }
 
-    async fn disconnected(&self, request: Request<vm::DisconnectedRequest>) -> Result<tonic::Response<()>, Status> {
+    async fn disconnected(
+        &self,
+        request: Request<vm::DisconnectedRequest>,
+    ) -> Result<tonic::Response<()>, Status> {
         let network_manager = Arc::clone(&self.network_manager);
         let mut network_manager = network_manager.write().await;
         let node_id: NodeId = request
@@ -251,7 +297,10 @@ impl Vm for VirtualMachine {
         Ok(Response::new(()))
     }
 
-    async fn build_block(&self, _request: Request<vm::BuildBlockRequest>) -> Result<tonic::Response<vm::BuildBlockResponse>, Status> {
+    async fn build_block(
+        &self,
+        _request: Request<vm::BuildBlockRequest>,
+    ) -> Result<tonic::Response<vm::BuildBlockResponse>, Status> {
         info!("build_block called");
         let controller = self.controller.clone();
         let mut controller = controller.write().await;
@@ -266,13 +315,18 @@ impl Vm for VirtualMachine {
             id: block.id().into(),
             parent_id: block.previous_id().as_bytes().to_vec(),
             height: block.block_num() as u64,
-            bytes: block.pack().map_err(|e| Status::internal(format!("could not pack block: {}", e)))?,
+            bytes: block
+                .pack()
+                .map_err(|e| Status::internal(format!("could not pack block: {}", e)))?,
             timestamp: Some(block.timestamp().into()),
             verify_with_context: false,
         }))
     }
 
-    async fn parse_block(&self, request: Request<vm::ParseBlockRequest>) -> Result<tonic::Response<vm::ParseBlockResponse>, Status> {
+    async fn parse_block(
+        &self,
+        request: Request<vm::ParseBlockRequest>,
+    ) -> Result<tonic::Response<vm::ParseBlockResponse>, Status> {
         let controller = self.controller.read().await;
         let block = controller
             .parse_block(&request.get_ref().bytes)
@@ -286,7 +340,10 @@ impl Vm for VirtualMachine {
         }))
     }
 
-    async fn get_block(&self, request: Request<vm::GetBlockRequest>) -> Result<tonic::Response<vm::GetBlockResponse>, Status> {
+    async fn get_block(
+        &self,
+        request: Request<vm::GetBlockRequest>,
+    ) -> Result<tonic::Response<vm::GetBlockResponse>, Status> {
         let controller = self.controller.read().await;
         let block_id: Id = request
             .get_ref()
@@ -294,18 +351,24 @@ impl Vm for VirtualMachine {
             .clone()
             .try_into()
             .map_err(|_| Status::invalid_argument("invalid block id"))?;
-        let block = controller.get_block(block_id).map_err(|_| Status::internal("could not get block"))?;
+        let block = controller
+            .get_block(block_id)
+            .map_err(|_| Status::internal("could not get block"))?;
 
         if let Some(block) = block {
             return Ok(Response::new(vm::GetBlockResponse {
                 parent_id: block.previous_id().as_bytes().to_vec(),
-                bytes: block.pack().map_err(|e| Status::internal(format!("could not pack block: {}", e)))?,
+                bytes: block
+                    .pack()
+                    .map_err(|e| Status::internal(format!("could not pack block: {}", e)))?,
                 height: block.block_num() as u64,
                 timestamp: Some(block.timestamp().into()),
                 verify_with_context: false,
                 err: 0,
             }));
         }
+
+        warn!("get_block: block not found: {}", block_id);
 
         return Ok(Response::new(vm::GetBlockResponse {
             parent_id: vec![],
@@ -317,7 +380,10 @@ impl Vm for VirtualMachine {
         }));
     }
 
-    async fn block_verify(&self, request: Request<vm::BlockVerifyRequest>) -> Result<tonic::Response<vm::BlockVerifyResponse>, Status> {
+    async fn block_verify(
+        &self,
+        request: Request<vm::BlockVerifyRequest>,
+    ) -> Result<tonic::Response<vm::BlockVerifyResponse>, Status> {
         let controller = self.controller.clone();
         let mut controller = controller.write().await;
         let block = controller.parse_block(&request.get_ref().bytes);
@@ -328,13 +394,17 @@ impl Vm for VirtualMachine {
         }
 
         let block = block.unwrap();
+        println!("block_verify: verifying block {}", block.id());
 
         // Verify the block
         let res = controller.verify_block(&block, self.mempool.clone()).await;
 
         if res.is_err() {
             warn!("block_verify: failed to verify block: {:?}", res);
-            return Err(Status::internal(format!("could not verify block: {}", res.unwrap_err())));
+            return Err(Status::internal(format!(
+                "could not verify block: {}",
+                res.unwrap_err()
+            )));
         }
 
         info!("block verified successfully: {}", block.id());
@@ -344,7 +414,10 @@ impl Vm for VirtualMachine {
         }))
     }
 
-    async fn block_accept(&self, request: Request<vm::BlockAcceptRequest>) -> Result<tonic::Response<()>, Status> {
+    async fn block_accept(
+        &self,
+        request: Request<vm::BlockAcceptRequest>,
+    ) -> Result<tonic::Response<()>, Status> {
         let controller = self.controller.clone();
         let mut controller = controller.write().await;
         let block_id: Id = request
@@ -363,12 +436,24 @@ impl Vm for VirtualMachine {
         Ok(Response::new(()))
     }
 
-    async fn block_reject(&self, request: Request<vm::BlockRejectRequest>) -> Result<tonic::Response<()>, Status> {
-        warn!("block rejected: {:?}", request.get_ref().id);
+    async fn block_reject(
+        &self,
+        request: Request<vm::BlockRejectRequest>,
+    ) -> Result<tonic::Response<()>, Status> {
+        let block_id: Id = request
+            .get_ref()
+            .id
+            .clone()
+            .try_into()
+            .map_err(|_| Status::invalid_argument("invalid block id"))?;
+        warn!("block rejected: {}", block_id);
         Ok(Response::new(()))
     }
 
-    async fn set_preference(&self, request: Request<vm::SetPreferenceRequest>) -> Result<tonic::Response<()>, Status> {
+    async fn set_preference(
+        &self,
+        request: Request<vm::SetPreferenceRequest>,
+    ) -> Result<tonic::Response<()>, Status> {
         let controller = self.controller.clone();
         let mut controller = controller.write().await;
         let preferred_id: Id = request
@@ -381,51 +466,85 @@ impl Vm for VirtualMachine {
         Ok(Response::new(()))
     }
 
-    async fn health(&self, _request: Request<()>) -> Result<tonic::Response<vm::HealthResponse>, Status> {
+    async fn health(
+        &self,
+        _request: Request<()>,
+    ) -> Result<tonic::Response<vm::HealthResponse>, Status> {
         Ok(Response::new(vm::HealthResponse::default()))
     }
 
-    async fn version(&self, _request: Request<()>) -> Result<tonic::Response<vm::VersionResponse>, Status> {
+    async fn version(
+        &self,
+        _request: Request<()>,
+    ) -> Result<tonic::Response<vm::VersionResponse>, Status> {
         let response = vm::VersionResponse {
             version: VERSION.to_string(),
         };
         Ok(Response::new(response))
     }
 
-    async fn app_request(&self, _request: Request<vm::AppRequestMsg>) -> Result<tonic::Response<()>, Status> {
+    async fn app_request(
+        &self,
+        _request: Request<vm::AppRequestMsg>,
+    ) -> Result<tonic::Response<()>, Status> {
         Ok(Response::new(()))
     }
 
-    async fn app_request_failed(&self, _request: Request<vm::AppRequestFailedMsg>) -> Result<tonic::Response<()>, Status> {
+    async fn app_request_failed(
+        &self,
+        _request: Request<vm::AppRequestFailedMsg>,
+    ) -> Result<tonic::Response<()>, Status> {
         Ok(Response::new(()))
     }
 
-    async fn app_response(&self, _request: Request<vm::AppResponseMsg>) -> Result<tonic::Response<()>, Status> {
+    async fn app_response(
+        &self,
+        _request: Request<vm::AppResponseMsg>,
+    ) -> Result<tonic::Response<()>, Status> {
         Ok(Response::new(()))
     }
 
-    async fn app_gossip(&self, request: Request<vm::AppGossipMsg>) -> Result<tonic::Response<()>, Status> {
-        let data = request.get_ref().msg.clone();
-        let gossipable =
-            Gossipable::read(&data, &mut 0).map_err(|e| Status::invalid_argument(format!("failed to deserialize gossipable data: {}", e)))?;
+    async fn app_gossip(
+        &self,
+        request: Request<vm::AppGossipMsg>,
+    ) -> Result<tonic::Response<()>, Status> {
+        let data = request.get_ref().msg.as_slice();
+        let gossipable = match Gossipable::read(data, &mut 0) {
+            Err(e) => {
+                warn!("failed to read gossip: {}", e);
+                return Ok(Response::new(()));
+            }
+            Ok(gossipable) => gossipable,
+        };
 
-        if gossipable.gossip_type == 0 {
-            let tx = gossipable
-                .to_type::<PackedTransaction>()
-                .map_err(|e| Status::invalid_argument(format!("failed to deserialize transaction: {}", e)))?;
-            let mempool = self.mempool.clone();
-            let mut mempool = mempool.write().await;
-            mempool.add_transaction(&tx);
+        if gossipable.gossip_type == GossipType::Transaction {
+            match gossipable.to_type::<PackedTransaction>() {
+                Err(e) => {
+                    warn!("failed to parse gossip as packed transaction: {}", e);
+                    return Ok(Response::new(()));
+                }
+                Ok(tx) => {
+                    let mempool = self.mempool.clone();
+                    let mut mempool = mempool.write().await;
+                    mempool.add_transaction(&tx);
+                }
+            }
         }
 
         Ok(Response::new(()))
     }
 
-    async fn gather(&self, _request: Request<()>) -> Result<tonic::Response<vm::GatherResponse>, Status> {
+    async fn gather(
+        &self,
+        _request: Request<()>,
+    ) -> Result<tonic::Response<vm::GatherResponse>, Status> {
         Ok(Response::new(vm::GatherResponse::default()))
     }
 
-    async fn get_ancestors(&self, request: Request<vm::GetAncestorsRequest>) -> Result<tonic::Response<vm::GetAncestorsResponse>, Status> {
+    async fn get_ancestors(
+        &self,
+        request: Request<vm::GetAncestorsRequest>,
+    ) -> Result<tonic::Response<vm::GetAncestorsResponse>, Status> {
         info!("received request: {:?}", request);
         Ok(Response::new(vm::GetAncestorsResponse::default()))
     }
@@ -440,7 +559,9 @@ impl Vm for VirtualMachine {
         info!("batched_parse_block: got controller");
         let mut parsed_blocks: Vec<ParseBlockResponse> = Vec::new();
         for block in request.get_ref().request.iter() {
-            let block = controller.parse_block(&block).map_err(|_| Status::internal("could not parse block"))?;
+            let block = controller
+                .parse_block(&block)
+                .map_err(|_| Status::internal("could not parse block"))?;
             parsed_blocks.push(ParseBlockResponse {
                 id: block.id().into(),
                 parent_id: block.previous_id().as_bytes().to_vec(),
@@ -449,7 +570,9 @@ impl Vm for VirtualMachine {
                 verify_with_context: false,
             });
         }
-        Ok(Response::new(vm::BatchedParseBlockResponse { response: parsed_blocks }))
+        Ok(Response::new(vm::BatchedParseBlockResponse {
+            response: parsed_blocks,
+        }))
     }
 
     async fn get_block_id_at_height(
@@ -475,16 +598,30 @@ impl Vm for VirtualMachine {
         }))
     }
 
-    async fn state_sync_enabled(&self, _request: Request<()>) -> Result<tonic::Response<vm::StateSyncEnabledResponse>, Status> {
-        Ok(Response::new(vm::StateSyncEnabledResponse { enabled: false, err: 0 }))
+    async fn state_sync_enabled(
+        &self,
+        _request: Request<()>,
+    ) -> Result<tonic::Response<vm::StateSyncEnabledResponse>, Status> {
+        Ok(Response::new(vm::StateSyncEnabledResponse {
+            enabled: false,
+            err: 0,
+        }))
     }
 
-    async fn get_ongoing_sync_state_summary(&self, request: Request<()>) -> Result<tonic::Response<vm::GetOngoingSyncStateSummaryResponse>, Status> {
+    async fn get_ongoing_sync_state_summary(
+        &self,
+        request: Request<()>,
+    ) -> Result<tonic::Response<vm::GetOngoingSyncStateSummaryResponse>, Status> {
         info!("received request: {:?}", request);
-        Ok(Response::new(vm::GetOngoingSyncStateSummaryResponse::default()))
+        Ok(Response::new(
+            vm::GetOngoingSyncStateSummaryResponse::default(),
+        ))
     }
 
-    async fn get_last_state_summary(&self, request: Request<()>) -> Result<tonic::Response<vm::GetLastStateSummaryResponse>, Status> {
+    async fn get_last_state_summary(
+        &self,
+        request: Request<()>,
+    ) -> Result<tonic::Response<vm::GetLastStateSummaryResponse>, Status> {
         info!("received request: {:?}", request);
         Ok(Response::new(vm::GetLastStateSummaryResponse::default()))
     }
@@ -497,7 +634,10 @@ impl Vm for VirtualMachine {
         Ok(Response::new(vm::ParseStateSummaryResponse::default()))
     }
 
-    async fn get_state_summary(&self, request: Request<vm::GetStateSummaryRequest>) -> Result<tonic::Response<vm::GetStateSummaryResponse>, Status> {
+    async fn get_state_summary(
+        &self,
+        request: Request<vm::GetStateSummaryRequest>,
+    ) -> Result<tonic::Response<vm::GetStateSummaryResponse>, Status> {
         info!("received request: {:?}", request);
         Ok(Response::new(vm::GetStateSummaryResponse::default()))
     }
@@ -513,7 +653,10 @@ impl Vm for VirtualMachine {
 
 #[tonic::async_trait]
 impl Http for VirtualMachine {
-    async fn handle(&self, _request: Request<http::HttpRequest>) -> Result<tonic::Response<()>, Status> {
+    async fn handle(
+        &self,
+        _request: Request<http::HttpRequest>,
+    ) -> Result<tonic::Response<()>, Status> {
         Err(Status::unimplemented("not implemented"))
     }
 
@@ -521,7 +664,8 @@ impl Http for VirtualMachine {
         &self,
         request: Request<http::HandleSimpleHttpRequest>,
     ) -> Result<tonic::Response<http::HandleSimpleHttpResponse>, Status> {
-        let body = std::str::from_utf8(request.get_ref().body.as_slice()).map_err(|_| Status::invalid_argument("invalid utf-8"))?;
+        let body = std::str::from_utf8(request.get_ref().body.as_slice())
+            .map_err(|_| Status::invalid_argument("invalid utf-8"))?;
         let resp = self
             .rpc_service
             .handle_api_request(&body)

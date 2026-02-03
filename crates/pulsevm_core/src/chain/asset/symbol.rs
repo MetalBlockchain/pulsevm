@@ -85,7 +85,9 @@ impl FromStr for Symbol {
             return Err(SymbolError::TooLong(s.len()));
         }
 
-        let precision: u8 = precision_str.parse().map_err(|_| SymbolError::TooLong(precision_str.len()))?;
+        let precision: u8 = precision_str
+            .parse()
+            .map_err(|_| SymbolError::TooLong(precision_str.len()))?;
         let code = SymbolCode::from_str(code_str).map_err(|_| SymbolError::ParseError)?;
 
         Ok(Symbol::new_with_code(precision, code))

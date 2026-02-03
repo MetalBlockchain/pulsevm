@@ -11,6 +11,10 @@ pub struct Account {
 
 impl Account {
     pub fn new(name: Name, creation_date: BlockTimestamp, abi: Vec<u8>) -> Self {
-        Account { name, creation_date, abi }
+        Account {
+            name,
+            creation_date,
+            abi,
+        }
     }
 }

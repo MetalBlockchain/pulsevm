@@ -91,6 +91,12 @@ impl From<usize> for VarUint32 {
     }
 }
 
+impl From<i32> for VarUint32 {
+    fn from(v: i32) -> Self {
+        Self(v as u32)
+    }
+}
+
 impl From<u32> for VarUint32 {
     fn from(v: u32) -> Self {
         Self(v)
@@ -157,11 +163,20 @@ mod tests {
         p = 0;
         assert_eq!(VarUint32::read(&[0x7F], &mut p).unwrap(), VarUint32(127));
         p = 0;
-        assert_eq!(VarUint32::read(&[0x80, 0x01], &mut p).unwrap(), VarUint32(128));
+        assert_eq!(
+            VarUint32::read(&[0x80, 0x01], &mut p).unwrap(),
+            VarUint32(128)
+        );
         p = 0;
-        assert_eq!(VarUint32::read(&[0xFF, 0x01], &mut p).unwrap(), VarUint32(255));
+        assert_eq!(
+            VarUint32::read(&[0xFF, 0x01], &mut p).unwrap(),
+            VarUint32(255)
+        );
         p = 0;
-        assert_eq!(VarUint32::read(&[0xFF, 0xFF, 0xFF, 0xFF, 0x0F], &mut p).unwrap(), VarUint32(u32::MAX));
+        assert_eq!(
+            VarUint32::read(&[0xFF, 0xFF, 0xFF, 0xFF, 0x0F], &mut p).unwrap(),
+            VarUint32(u32::MAX)
+        );
     }
 
     #[test]

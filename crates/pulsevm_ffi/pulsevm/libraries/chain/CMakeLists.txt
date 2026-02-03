@@ -2,11 +2,14 @@ file(GLOB HEADERS "include/pulsevm/chain/*.hpp" )
 
 ## SORT .cpp by most likely to change / break compile
 add_library( pulsevm_chain
+   abi_serializer.cpp
+   asset.cpp
    name.cpp
    genesis_state_root_key.cpp
    genesis_state.cpp
    authority.cpp
    pulse_contract_abi_bin.cpp
+   symbol.cpp
    ${HEADERS}
 )
 

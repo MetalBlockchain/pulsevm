@@ -61,7 +61,9 @@ mod tests {
     use std::str::FromStr;
 
     use super::*;
-    use pulsevm_ffi::{KeyWeight, PermissionLevel, PermissionLevelWeight, WaitWeight, parse_public_key};
+    use pulsevm_ffi::{
+        KeyWeight, PermissionLevel, PermissionLevelWeight, WaitWeight, parse_public_key,
+    };
     use pulsevm_name_macro::name;
     use pulsevm_serialization::{Read, Write};
 
@@ -73,7 +75,10 @@ mod tests {
             owner: Authority::new(
                 1,
                 vec![KeyWeight {
-                    key: parse_public_key("PUB_K1_5bbkxaLdB5bfVZW6DJY8M74vwT2m61PqwywNUa5azfkJTvYa5H").unwrap(),
+                    key: parse_public_key(
+                        "PUB_K1_5bbkxaLdB5bfVZW6DJY8M74vwT2m61PqwywNUa5azfkJTvYa5H",
+                    )
+                    .unwrap(),
                     weight: 1,
                 }],
                 vec![PermissionLevelWeight {
@@ -83,7 +88,10 @@ mod tests {
                     },
                     weight: 1,
                 }],
-                vec![WaitWeight { wait_sec: 10, weight: 1 }],
+                vec![WaitWeight {
+                    wait_sec: 10,
+                    weight: 1,
+                }],
             ),
             active: Authority::new(1, vec![], vec![], vec![]),
         };

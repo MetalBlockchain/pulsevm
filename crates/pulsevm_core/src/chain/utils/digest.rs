@@ -13,13 +13,9 @@ impl Digest {
         Digest { inner }
     }
 
+    // Ths function creates a Digest from existing hash data, it does not compute the hash
     pub fn from_data(data: &[u8]) -> Self {
-        let cxx_digest = pulsevm_ffi::make_shared_digest_from_data(data);
-        Digest { inner: cxx_digest }
-    }
-
-    pub fn from_existing_hash(data: &[u8; 32]) -> Self {
-        let cxx_digest = pulsevm_ffi::make_shared_digest_from_data(data);
+        let cxx_digest = pulsevm_ffi::make_shared_digest_from_existing_hash(data);
         Digest { inner: cxx_digest }
     }
 }

@@ -29,7 +29,9 @@ impl KeyValueIteratorCache {
     }
 
     pub fn get_table(&self, table_id: &TableId) -> Result<&TableObject, ChainError> {
-        self.inner.get_table(table_id).map_err(|e| ChainError::InternalError(format!("{}", e)))
+        self.inner
+            .get_table(table_id)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 
     pub fn get_end_iterator_by_table_id(&self, table_id: &TableId) -> Result<i32, ChainError> {
@@ -51,7 +53,9 @@ impl KeyValueIteratorCache {
     }
 
     pub fn get(&self, id: i32) -> Result<&KeyValueObject, ChainError> {
-        self.inner.get(id).map_err(|e| ChainError::InternalError(format!("{}", e)))
+        self.inner
+            .get(id)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 
     pub fn remove(&mut self, iterator: i32) -> Result<(), ChainError> {
@@ -62,7 +66,10 @@ impl KeyValueIteratorCache {
     }
 
     pub fn add(&mut self, obj: &KeyValueObject) -> Result<i32, ChainError> {
-        self.inner.pin_mut().add(obj).map_err(|e| ChainError::InternalError(format!("{}", e)))
+        self.inner
+            .pin_mut()
+            .add(obj)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 }
 

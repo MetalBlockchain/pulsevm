@@ -943,6 +943,28 @@ public:
         return keyval_cache.add( *itr );
     }
 
+    uint64_t get_virtual_block_cpu_limit() const {
+        const auto& state = this->get<resource_limits::resource_limits_state_object>();
+        return state.virtual_cpu_limit;
+    }
+
+    uint64_t get_virtual_block_net_limit() const {
+        const auto& state = this->get<resource_limits::resource_limits_state_object>();
+        return state.virtual_net_limit;
+    }
+
+    uint64_t get_block_cpu_limit() const {
+        const auto& state = this->get<resource_limits::resource_limits_state_object>();
+        const auto& config = this->get<resource_limits::resource_limits_config_object>();
+        return config.cpu_limit_parameters.max - state.pending_cpu_usage;
+    }
+
+    uint64_t get_block_net_limit() const {
+        const auto& state = this->get<resource_limits::resource_limits_state_object>();
+        const auto& config = this->get<resource_limits::resource_limits_config_object>();
+        return config.net_limit_parameters.max - state.pending_net_usage;
+    }
+
     std::unique_ptr<chainbase::database::session> create_undo_session(bool enabled) {
         return std::make_unique<chainbase::database::session>(this->start_undo_session(enabled));
     }

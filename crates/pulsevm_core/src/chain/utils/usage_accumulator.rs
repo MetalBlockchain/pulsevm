@@ -28,7 +28,10 @@ impl Mul<Ratio<u64>> for u64 {
     fn mul(self, r: Ratio<u64>) -> Self::Output {
         pulse_assert(
             r.numerator == 0 || u64::MAX / r.numerator >= self,
-            ChainError::InvalidArgument("usage exceeds maximum value representable after extending for precision".to_string()),
+            ChainError::InvalidArgument(
+                "usage exceeds maximum value representable after extending for precision"
+                    .to_string(),
+            ),
         )?;
         Ok((self * r.numerator) / r.denominator)
     }
@@ -54,7 +57,10 @@ impl UsageAccumulator {
         // check for some numerical limits before doing any state mutations
         pulse_assert(
             units <= self.max_raw_value(),
-            ChainError::InvalidArgument("usage exceeds maximum value representable after extending for precision".to_string()),
+            ChainError::InvalidArgument(
+                "usage exceeds maximum value representable after extending for precision"
+                    .to_string(),
+            ),
         )?;
         pulse_assert(
             u64::MAX - self.consumed >= units,
@@ -64,13 +70,17 @@ impl UsageAccumulator {
         let value_ex_contrib = integer_divide_ceil(units * RATE_LIMITING_PRECISION, window_size);
         pulse_assert(
             u64::MAX - self.value_ex >= value_ex_contrib,
-            ChainError::InvalidArgument("overflow in accumulated value when adding usage".to_string()),
+            ChainError::InvalidArgument(
+                "overflow in accumulated value when adding usage".to_string(),
+            ),
         )?;
 
         if self.last_ordinal != ordinal {
             pulse_assert(
                 ordinal > self.last_ordinal,
-                ChainError::InvalidArgument("new ordinal cannot be less than the previous ordinal".to_string()),
+                ChainError::InvalidArgument(
+                    "new ordinal cannot be less than the previous ordinal".to_string(),
+                ),
             )?;
 
             if self.last_ordinal as u64 + window_size > ordinal as u64 {
@@ -99,5 +109,9 @@ where
 {
     let div = num / den;
     let rem = num % den;
-    if rem > T::from(0) { div + T::from(1) } else { div }
+    if rem > T::from(0) {
+        div + T::from(1)
+    } else {
+        div
+    }
 }

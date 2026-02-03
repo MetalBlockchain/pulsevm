@@ -2,6 +2,7 @@ use std::fmt;
 
 use cxx::{SharedPtr, UniquePtr};
 use pulsevm_billable_size::BillableSize;
+use pulsevm_crypto::FixedBytes;
 use pulsevm_serialization::{NumBytes, Read, Write, WriteError};
 use serde::{Serialize, ser::SerializeStruct};
 
@@ -25,15 +26,19 @@ impl fmt::Debug for KeyWeight {
 impl NumBytes for KeyWeight {
     fn num_bytes(&self) -> usize {
         // Add the number of bytes for the packed public key and the weight
-        self.key.num_bytes().num_bytes() + self.key.num_bytes() + self.weight.num_bytes()
+        34 + self.weight.num_bytes()
     }
 }
 
 impl Read for KeyWeight {
     fn read(bytes: &[u8], pos: &mut usize) -> Result<Self, pulsevm_serialization::ReadError> {
-        let packed_key = Vec::<u8>::read(bytes, pos)?;
-        let key = parse_public_key_from_bytes(&packed_key)
-            .map_err(|e| pulsevm_serialization::ReadError::CustomError(format!("failed to parse public key in KeyWeight: {}", e)))?;
+        let packed_key = FixedBytes::<34>::read(bytes, pos)?;
+        let key = parse_public_key_from_bytes(packed_key.as_ref()).map_err(|e| {
+            pulsevm_serialization::ReadError::CustomError(format!(
+                "failed to parse public key in KeyWeight: {}",
+                e
+            ))
+        })?;
         let weight = u16::read(bytes, pos)?;
         Ok(KeyWeight { key, weight })
     }
@@ -41,7 +46,10 @@ impl Read for KeyWeight {
 
 impl Write for KeyWeight {
     fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), WriteError> {
-        self.key.packed_bytes().write(bytes, pos)?;
+        let packed_key: FixedBytes<34> = self.key.packed_bytes().try_into().map_err(|_| {
+            WriteError::CustomError("Failed to convert packed public key to FixedBytes<34>".into())
+        })?;
+        packed_key.write(bytes, pos)?;
         self.weight.write(bytes, pos)?;
         Ok(())
     }

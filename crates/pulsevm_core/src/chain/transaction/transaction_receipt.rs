@@ -16,7 +16,11 @@ pub struct TransactionReceipt {
 
 impl TransactionReceipt {
     pub fn new(header: TransactionReceiptHeader, trx: PackedTransaction) -> Self {
-        TransactionReceipt { header, trx_variant: 1, trx }
+        TransactionReceipt {
+            header,
+            trx_variant: 1,
+            trx,
+        }
     }
 
     pub fn trx(&self) -> &PackedTransaction {

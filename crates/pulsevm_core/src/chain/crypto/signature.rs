@@ -5,6 +5,7 @@ use std::{
 };
 
 use cxx::SharedPtr;
+use pulsevm_crypto::FixedBytes;
 use pulsevm_error::ChainError;
 use pulsevm_ffi::{CxxSignature, recover_public_key_from_signature};
 use pulsevm_serialization::{NumBytes, Read, ReadError, Write, WriteError};
@@ -23,7 +24,8 @@ impl Signature {
     }
 
     pub fn recover_public_key(&self, digest: &Digest) -> Result<PublicKey, ChainError> {
-        let cxx_pk = recover_public_key_from_signature(&self.inner, &digest).map_err(|e| ChainError::TransactionError(e.to_string()))?;
+        let cxx_pk = recover_public_key_from_signature(&self.inner, &digest)
+            .map_err(|e| ChainError::TransactionError(e.to_string()))?;
         Ok(PublicKey::new(cxx_pk))
     }
 }
@@ -81,7 +83,8 @@ impl<'de> Deserialize<'de> for Signature {
             where
                 E: serde::de::Error,
             {
-                let cxx_sig = pulsevm_ffi::parse_signature(v).map_err(|e| E::custom(format!("failed to parse signature: {}", e)))?;
+                let cxx_sig = pulsevm_ffi::parse_signature(v)
+                    .map_err(|e| E::custom(format!("failed to parse signature: {}", e)))?;
                 Ok(Signature { inner: cxx_sig })
             }
         }
@@ -92,34 +95,34 @@ impl<'de> Deserialize<'de> for Signature {
 
 impl NumBytes for Signature {
     fn num_bytes(&self) -> usize {
-        self.inner.num_bytes().num_bytes() + self.inner.num_bytes()
+        66 // Fixed size for packed signature representation
     }
 }
 
 impl Read for Signature {
     fn read(bytes: &[u8], pos: &mut usize) -> Result<Self, ReadError> {
-        let packed = Vec::<u8>::read(bytes, pos)?;
-        let cxx_key = pulsevm_ffi::parse_signature_from_bytes(&packed, pos).map_err(|e| ReadError::CustomError(e.to_string()))?;
+        let packed = FixedBytes::<66>::read(bytes, pos)?;
+        let cxx_key = pulsevm_ffi::parse_signature_from_bytes(packed.as_ref())
+            .map_err(|e| ReadError::CustomError(e.to_string()))?;
         Ok(Signature { inner: cxx_key })
     }
 }
 
 impl Write for Signature {
     fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), WriteError> {
-        let packed = self.inner.packed_bytes();
-        let end_pos = *pos + packed.len();
-        if end_pos > bytes.len() {
-            return Err(WriteError::NotEnoughSpace);
-        }
-        bytes[*pos..end_pos].copy_from_slice(&packed);
-        *pos = end_pos;
-        Ok(())
+        let packed: FixedBytes<66> = self.inner.packed_bytes().try_into().map_err(|_| {
+            WriteError::CustomError("Failed to convert packed signature to FixedBytes<66>".into())
+        })?;
+        packed.write(bytes, pos)
     }
 }
 
 impl Default for Signature {
     fn default() -> Self {
-        Self::from_str("SIG_K1_111111111111111111111111111111111111111111111111111111111111111116uk5ne").unwrap()
+        Self::from_str(
+            "SIG_K1_111111111111111111111111111111111111111111111111111111111111111116uk5ne",
+        )
+        .unwrap()
     }
 }
 
@@ -127,7 +130,9 @@ impl FromStr for Signature {
     type Err = ChainError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let cxx_sig = pulsevm_ffi::parse_signature(s).map_err(|e| ChainError::TransactionError(format!("failed to parse signature: {}", e)))?;
+        let cxx_sig = pulsevm_ffi::parse_signature(s).map_err(|e| {
+            ChainError::TransactionError(format!("failed to parse signature: {}", e))
+        })?;
         Ok(Signature { inner: cxx_sig })
     }
 }

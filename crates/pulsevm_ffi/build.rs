@@ -3,7 +3,9 @@ use std::{env, fs};
 
 fn build_libraries(root: &PathBuf) -> PathBuf {
     // Only run CMake if the build directory doesn't exist or if CMakeLists.txt changed
-    cmake::Config::new(&root.join("pulsevm")).define("CMAKE_BUILD_TYPE", "Release").build()
+    cmake::Config::new(&root.join("pulsevm"))
+        .define("CMAKE_BUILD_TYPE", "Release")
+        .build()
 }
 
 fn main() {
@@ -35,7 +37,11 @@ fn main() {
     let boost_lib = match env::var("BOOST_LIB") {
         Ok(val) => PathBuf::from(val),
         Err(_) => {
-            let mut default_path = if target.contains("apple") { "/usr/local/lib" } else { "/usr/lib" };
+            let mut default_path = if target.contains("apple") {
+                "/usr/local/lib"
+            } else {
+                "/usr/lib"
+            };
 
             // On some Linux systems, Boost libraries are in a different directory
             if Path::new("/usr/lib/x86_64-linux-gnu").exists() {
@@ -48,7 +54,11 @@ fn main() {
     let zlib_root = match env::var("ZLIB_ROOT") {
         Ok(val) => PathBuf::from(val),
         Err(_) => {
-            let mut default_path = if target.contains("apple") { "/usr/local/lib" } else { "/usr/lib" };
+            let mut default_path = if target.contains("apple") {
+                "/usr/local/lib"
+            } else {
+                "/usr/lib"
+            };
 
             // On some Linux systems, Boost libraries are in a different directory
             if Path::new("/usr/lib/x86_64-linux-gnu").exists() {
@@ -59,13 +69,18 @@ fn main() {
         }
     };
 
-    let cxx_standard = if target.contains("apple") { "c++20" } else { "gnu++20" };
+    let cxx_standard = if target.contains("apple") {
+        "c++20"
+    } else {
+        "gnu++20"
+    };
 
     cxx_build::bridges(["src/bridge.rs"])
         .file("database.cpp")
         .file("utils.cpp")
         .file("name.cpp")
         .file("iterator_cache.cpp")
+        .file("api.cpp")
         // Include directories
         .include(boost_headers) // Standard system headers
         .include(libraries_root.join("chainbase/include")) // Add chainbase source headers
@@ -86,7 +101,10 @@ fn main() {
         .compile("pulsevm_ffi");
 
     // Link to the built static libraries
-    println!("cargo:rustc-link-search=native={}", libraries_dest.join("lib").display());
+    println!(
+        "cargo:rustc-link-search=native={}",
+        libraries_dest.join("lib").display()
+    );
     println!("cargo:rustc-link-lib=static=fc");
     println!("cargo:rustc-link-lib=static=chainbase");
     println!("cargo:rustc-link-lib=static=bls12-381");

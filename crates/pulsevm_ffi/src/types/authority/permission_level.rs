@@ -31,7 +31,12 @@ impl fmt::Debug for PermissionLevel {
 
 impl fmt::Display for PermissionLevel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}@{}", Name::new(self.actor), Name::new(self.permission))
+        write!(
+            f,
+            "{}@{}",
+            Name::new(self.actor),
+            Name::new(self.permission)
+        )
     }
 }
 

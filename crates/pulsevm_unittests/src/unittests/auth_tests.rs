@@ -20,12 +20,16 @@ mod auth_tests {
             chain
                 .push_reqauth2(
                     name!("alice").into(),
-                    vec![PermissionLevel::new(name!("alice").into(), ACTIVE_NAME.as_u64())],
+                    vec![PermissionLevel::new(
+                        name!("alice").into(),
+                        ACTIVE_NAME.as_u64()
+                    )],
                     vec![],
                 )
                 .err(),
             Some(ChainError::AuthorizationError(
-                "transaction declares authority 'alice@active' but does not have signatures for it".into()
+                "transaction declares authority 'alice@active' but does not have signatures for it"
+                    .into()
             ))
         );
         chain.push_reqauth(name!("alice").into(), "owner", false)?;
@@ -37,9 +41,12 @@ mod auth_tests {
         let mut chain = Testing::new();
         chain.create_account(name!("alice").into(), PULSE_NAME.into(), true, true)?;
         assert_eq!(
-            chain.push_reqauth(name!("alice").into(), "owner", false,).err(),
+            chain
+                .push_reqauth(name!("alice").into(), "owner", false,)
+                .err(),
             Some(ChainError::AuthorizationError(
-                "transaction declares authority 'alice@owner' but does not have signatures for it".into()
+                "transaction declares authority 'alice@owner' but does not have signatures for it"
+                    .into()
             ))
         );
         chain.push_reqauth(name!("alice").into(), "owner", true)?;
@@ -49,13 +56,20 @@ mod auth_tests {
     #[test]
     fn test_missing_auths() -> Result<()> {
         let mut chain = Testing::new();
-        chain.create_accounts(vec![name!("alice").into(), name!("bob").into()], false, true)?;
+        chain.create_accounts(
+            vec![name!("alice").into(), name!("bob").into()],
+            false,
+            true,
+        )?;
         // action not provided from authority
         assert_eq!(
             chain
                 .push_reqauth2(
                     name!("alice").into(),
-                    vec![PermissionLevel::new(name!("bob").into(), ACTIVE_NAME.as_u64())],
+                    vec![PermissionLevel::new(
+                        name!("bob").into(),
+                        ACTIVE_NAME.as_u64()
+                    )],
                     vec![get_private_key(name!("bob").into(), "active")],
                 )
                 .err(),
@@ -69,21 +83,40 @@ mod auth_tests {
     #[test]
     fn test_delegate_auth() -> Result<()> {
         let mut chain = Testing::new();
-        chain.create_accounts(vec![name!("alice").into(), name!("bob").into()], false, true)?;
+        chain.create_accounts(
+            vec![name!("alice").into(), name!("bob").into()],
+            false,
+            true,
+        )?;
         let delegated_auth = Authority::new(
             1,
             vec![],
-            vec![PermissionLevelWeight::new((name!("bob"), ACTIVE_NAME.as_u64()).into(), 1)],
+            vec![PermissionLevelWeight::new(
+                (name!("bob"), ACTIVE_NAME.as_u64()).into(),
+                1,
+            )],
             vec![],
         );
-        chain.set_authority2(name!("alice").into(), ACTIVE_NAME.into(), delegated_auth.clone(), OWNER_NAME.into())?;
+        chain.set_authority2(
+            name!("alice").into(),
+            ACTIVE_NAME.into(),
+            delegated_auth.clone(),
+            OWNER_NAME.into(),
+        )?;
         let pending_block_state = chain.get_pending_block_state();
-        let new_auth = AuthorizationManager::get_permission(&mut pending_block_state.db.clone(), name!("alice"), ACTIVE_NAME.as_u64())?;
+        let new_auth = AuthorizationManager::get_permission(
+            &mut pending_block_state.db.clone(),
+            name!("alice"),
+            ACTIVE_NAME.as_u64(),
+        )?;
         assert!(new_auth.get_authority().to_authority() == delegated_auth);
         // execute nonce from alice signed by bob
         chain.push_reqauth2(
             name!("alice").into(),
-            vec![PermissionLevel::new(name!("alice").into(), ACTIVE_NAME.as_u64())],
+            vec![PermissionLevel::new(
+                name!("alice").into(),
+                ACTIVE_NAME.as_u64(),
+            )],
             vec![get_private_key(name!("bob").into(), "active")],
         )?;
         Ok(())
@@ -96,12 +129,20 @@ mod auth_tests {
         chain.create_account(name!("bob").into(), PULSE_NAME.into(), false, true)?;
         // Deleting active or owner should fail
         assert_eq!(
-            chain.delete_authority2(name!("alice").into(), ACTIVE_NAME.into()).err(),
-            Some(ChainError::ActionValidationError(format!("cannot delete active authority")))
+            chain
+                .delete_authority2(name!("alice").into(), ACTIVE_NAME.into())
+                .err(),
+            Some(ChainError::ActionValidationError(format!(
+                "cannot delete active authority"
+            )))
         );
         assert_eq!(
-            chain.delete_authority2(name!("alice").into(), OWNER_NAME.into()).err(),
-            Some(ChainError::ActionValidationError(format!("cannot delete owner authority")))
+            chain
+                .delete_authority2(name!("alice").into(), OWNER_NAME.into())
+                .err(),
+            Some(ChainError::ActionValidationError(format!(
+                "cannot delete owner authority"
+            )))
         );
 
         // Change owner permission
@@ -140,7 +181,10 @@ mod auth_tests {
             ACTIVE_NAME,
             Authority::new_from_public_key(new_active_pub_key.inner()),
             OWNER_NAME,
-            vec![PermissionLevel::new(name!("alice").into(), ACTIVE_NAME.as_u64())],
+            vec![PermissionLevel::new(
+                name!("alice").into(),
+                ACTIVE_NAME.as_u64(),
+            )],
             vec![get_private_key(name!("alice").into(), "active")],
         )?;
 
@@ -187,7 +231,10 @@ mod auth_tests {
             name!("spending").into(),
             Authority::new_from_public_key(spending_pub_key.inner()),
             ACTIVE_NAME,
-            vec![PermissionLevel::new(name!("alice").into(), ACTIVE_NAME.as_u64())],
+            vec![PermissionLevel::new(
+                name!("alice").into(),
+                ACTIVE_NAME.as_u64(),
+            )],
             vec![new_active_priv_key.clone()],
         )?;
         let obj = pending_block_state
@@ -197,7 +244,9 @@ mod auth_tests {
         let obj = unsafe { obj.as_ref().unwrap() };
         assert!(obj.get_owner().to_uint64_t() == name!("alice"));
         assert!(obj.get_name().to_uint64_t() == name!("spending"));
-        let parent = pending_block_state.db.find_permission(obj.get_parent_id())?;
+        let parent = pending_block_state
+            .db
+            .find_permission(obj.get_parent_id())?;
         assert!(!parent.is_null());
         let parent = unsafe { parent.as_ref().unwrap() };
         assert!(parent.get_owner().to_uint64_t() == name!("alice"));
@@ -211,11 +260,16 @@ mod auth_tests {
                     name!("spending").into(),
                     Authority::new_from_public_key(spending_pub_key.inner()),
                     name!("spending").into(),
-                    vec![PermissionLevel::new(name!("alice").into(), name!("spending").into())],
+                    vec![PermissionLevel::new(
+                        name!("alice").into(),
+                        name!("spending").into()
+                    )],
                     vec![spending_priv_key.clone()],
                 )
                 .err(),
-            Some(ChainError::ActionValidationError("cannot set an authority as its own parent".into()))
+            Some(ChainError::ActionValidationError(
+                "cannot set an authority as its own parent".into()
+            ))
         );
 
         // Update spending auth parent to be owner, should fail
@@ -226,7 +280,10 @@ mod auth_tests {
                     name!("spending").into(),
                     Authority::new_from_public_key(spending_pub_key.inner()),
                     OWNER_NAME,
-                    vec![PermissionLevel::new(name!("alice").into(), name!("spending").into())],
+                    vec![PermissionLevel::new(
+                        name!("alice").into(),
+                        name!("spending").into()
+                    )],
                     vec![spending_priv_key.clone()],
                 )
                 .err(),
@@ -239,7 +296,10 @@ mod auth_tests {
         chain.delete_authority(
             name!("alice").into(),
             name!("spending").into(),
-            vec![PermissionLevel::new(name!("alice").into(), ACTIVE_NAME.as_u64())],
+            vec![PermissionLevel::new(
+                name!("alice").into(),
+                ACTIVE_NAME.as_u64(),
+            )],
             vec![new_active_priv_key.clone()],
         )?;
         let obj = pending_block_state
@@ -253,7 +313,10 @@ mod auth_tests {
             name!("trading").into(),
             Authority::new_from_public_key(trading_pub_key.inner()),
             ACTIVE_NAME,
-            vec![PermissionLevel::new(name!("alice").into(), ACTIVE_NAME.as_u64())],
+            vec![PermissionLevel::new(
+                name!("alice").into(),
+                ACTIVE_NAME.as_u64(),
+            )],
             vec![new_active_priv_key.clone()],
         )?;
 
@@ -263,7 +326,10 @@ mod auth_tests {
             name!("spending").into(),
             Authority::new_from_public_key(spending_pub_key.inner()),
             name!("trading").into(),
-            vec![PermissionLevel::new(name!("alice").into(), name!("trading").into())],
+            vec![PermissionLevel::new(
+                name!("alice").into(),
+                name!("trading").into(),
+            )],
             vec![trading_priv_key.clone()],
         )?;
 
@@ -283,7 +349,9 @@ mod auth_tests {
         assert!(trading.get_name().to_uint64_t() == name!("trading"));
         assert!(spending.get_name().to_uint64_t() == name!("spending"));
         assert!(spending.get_parent_id() == trading.get_id());
-        let parent = pending_block_state.db.find_permission(trading.get_parent_id())?;
+        let parent = pending_block_state
+            .db
+            .find_permission(trading.get_parent_id())?;
         assert!(!parent.is_null());
         let parent = unsafe { parent.as_ref().unwrap() };
         assert!(parent.get_owner().to_uint64_t() == name!("alice"));
@@ -295,7 +363,10 @@ mod auth_tests {
                 .delete_authority(
                     name!("alice").into(),
                     name!("trading").into(),
-                    vec![PermissionLevel::new(name!("alice").into(), ACTIVE_NAME.as_u64())],
+                    vec![PermissionLevel::new(
+                        name!("alice").into(),
+                        ACTIVE_NAME.as_u64()
+                    )],
                     vec![new_active_priv_key.clone()]
                 )
                 .err(),
@@ -312,7 +383,10 @@ mod auth_tests {
                     name!("trading").into(),
                     Authority::new_from_public_key(trading_pub_key.inner()),
                     name!("spending").into(),
-                    vec![PermissionLevel::new(name!("alice").into(), name!("trading").into())],
+                    vec![PermissionLevel::new(
+                        name!("alice").into(),
+                        name!("trading").into()
+                    )],
                     vec![trading_priv_key.clone()],
                 )
                 .err(),
@@ -324,7 +398,10 @@ mod auth_tests {
         chain.delete_authority(
             name!("alice").into(),
             name!("spending").into(),
-            vec![PermissionLevel::new(name!("alice").into(), ACTIVE_NAME.as_u64())],
+            vec![PermissionLevel::new(
+                name!("alice").into(),
+                ACTIVE_NAME.as_u64(),
+            )],
             vec![new_active_priv_key.clone()],
         )?;
         let res = pending_block_state
@@ -334,7 +411,10 @@ mod auth_tests {
         chain.delete_authority(
             name!("alice").into(),
             name!("trading").into(),
-            vec![PermissionLevel::new(name!("alice").into(), ACTIVE_NAME.as_u64())],
+            vec![PermissionLevel::new(
+                name!("alice").into(),
+                ACTIVE_NAME.as_u64(),
+            )],
             vec![new_active_priv_key.clone()],
         )?;
         let res = pending_block_state
@@ -378,7 +458,11 @@ mod auth_tests {
     #[test]
     fn test_link_auths() -> Result<()> {
         let mut chain = Testing::new();
-        chain.create_accounts(vec![name!("alice").into(), name!("bob").into()], false, true)?;
+        chain.create_accounts(
+            vec![name!("alice").into(), name!("bob").into()],
+            false,
+            true,
+        )?;
 
         let spending_priv_key = get_private_key(name!("alice").into(), "spending");
         let spending_pub_key = spending_priv_key.get_public_key();
@@ -421,7 +505,10 @@ mod auth_tests {
         // Now, req auth action with alice's spending key should succeed
         chain.push_reqauth2(
             name!("alice").into(),
-            vec![PermissionLevel::new(name!("alice").into(), name!("spending").into())],
+            vec![PermissionLevel::new(
+                name!("alice").into(),
+                name!("spending").into(),
+            )],
             vec![spending_priv_key.clone()],
         )?;
         // Relink the same auth should fail
@@ -435,11 +522,16 @@ mod auth_tests {
                 )
                 .err(),
             Some(ChainError::ActionValidationError(
-                "attempting to update required authority, but new requirement is same as old".into()
+                "attempting to update required authority, but new requirement is same as old"
+                    .into()
             ))
         );
         // Unlink alice with pulse reqauth
-        chain.unlink_authority(name!("alice").into(), name!("pulse").into(), name!("reqauth").into())?;
+        chain.unlink_authority(
+            name!("alice").into(),
+            name!("pulse").into(),
+            name!("reqauth").into(),
+        )?;
         // Now, req auth action with alice's spending key should fail
         assert_eq!(
             chain
@@ -467,17 +559,28 @@ mod auth_tests {
             ))
         );
         // Link authority for any pulse action with alice's scud key
-        chain.link_authority(name!("alice").into(), name!("pulse").into(), name!("scud").into(), Name::default())?;
+        chain.link_authority(
+            name!("alice").into(),
+            name!("pulse").into(),
+            name!("scud").into(),
+            Name::default(),
+        )?;
         // Now, req auth action with alice's scud key should succeed
         chain.push_reqauth2(
             name!("alice").into(),
-            vec![PermissionLevel::new(name!("alice").into(), name!("scud").into())],
+            vec![PermissionLevel::new(
+                name!("alice").into(),
+                name!("scud").into(),
+            )],
             vec![scud_priv_key.clone()],
         )?;
         // req auth action with alice's spending key should also be fine, since it is the parent of alice's scud key
         chain.push_reqauth2(
             name!("alice").into(),
-            vec![PermissionLevel::new(name!("alice").into(), name!("spending").into())],
+            vec![PermissionLevel::new(
+                name!("alice").into(),
+                name!("spending").into(),
+            )],
             vec![spending_priv_key.clone()],
         )?;
         Ok(())
@@ -499,10 +602,18 @@ mod auth_tests {
             Authority::new_from_public_key(first_pub_key.inner()),
             ACTIVE_NAME,
         )?;
-        chain.link_authority(name!("alice").into(), PULSE_NAME, name!("first").into(), name!("reqauth").into())?;
+        chain.link_authority(
+            name!("alice").into(),
+            PULSE_NAME,
+            name!("first").into(),
+            name!("reqauth").into(),
+        )?;
         chain.push_reqauth2(
             name!("alice").into(),
-            vec![PermissionLevel::new(name!("alice").into(), name!("first").into())],
+            vec![PermissionLevel::new(
+                name!("alice").into(),
+                name!("first").into(),
+            )],
             vec![first_priv_key.clone()],
         )?;
 
@@ -518,18 +629,25 @@ mod auth_tests {
             chain
                 .push_reqauth2(
                     name!("alice").into(),
-                    vec![PermissionLevel::new(name!("alice").into(), name!("first").into())],
+                    vec![PermissionLevel::new(
+                        name!("alice").into(),
+                        name!("first").into()
+                    )],
                     vec![first_priv_key.clone()]
                 )
                 .err(),
             Some(ChainError::AuthorizationError(
-                "transaction declares authority 'alice@first' but does not have signatures for it".into()
+                "transaction declares authority 'alice@first' but does not have signatures for it"
+                    .into()
             ))
         );
         // Using updated authority, should succeed
         chain.push_reqauth2(
             name!("alice").into(),
-            vec![PermissionLevel::new(name!("alice").into(), name!("first").into())],
+            vec![PermissionLevel::new(
+                name!("alice").into(),
+                name!("first").into(),
+            )],
             vec![second_priv_key.clone()],
         )?;
         Ok(())

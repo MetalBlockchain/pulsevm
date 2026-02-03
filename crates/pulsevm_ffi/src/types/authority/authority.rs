@@ -10,7 +10,12 @@ use crate::{
 };
 
 impl Authority {
-    pub fn new(threshold: u32, keys: Vec<KeyWeight>, accounts: Vec<PermissionLevelWeight>, waits: Vec<WaitWeight>) -> Self {
+    pub fn new(
+        threshold: u32,
+        keys: Vec<KeyWeight>,
+        accounts: Vec<PermissionLevelWeight>,
+        waits: Vec<WaitWeight>,
+    ) -> Self {
         Authority {
             threshold,
             keys,
@@ -81,7 +86,10 @@ impl fmt::Debug for Authority {
 
 impl NumBytes for Authority {
     fn num_bytes(&self) -> usize {
-        self.threshold.num_bytes() + self.keys.num_bytes() + self.accounts.num_bytes() + self.waits.num_bytes()
+        self.threshold.num_bytes()
+            + self.keys.num_bytes()
+            + self.accounts.num_bytes()
+            + self.waits.num_bytes()
     }
 }
 

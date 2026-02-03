@@ -10,6 +10,7 @@ tempfile = "3.23.0"
 serde = { version = "1.0", features = ["derive"] }
 pulsevm_billable_size = { path = "../pulsevm_billable_size" }
 pulsevm_constants = { path = "../pulsevm_constants" }
+pulsevm_crypto = { path = "../pulsevm_crypto" }
 pulsevm_error = { path = "../pulsevm_error" }
 pulsevm_name = { path = "../pulsevm_name" }
 pulsevm_proc_macros = { path = "../pulsevm_proc_macros" }

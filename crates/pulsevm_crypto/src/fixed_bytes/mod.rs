@@ -45,7 +45,11 @@ impl<const N: usize> Default for FixedBytes<N> {
 
 impl<const N: usize> Write for FixedBytes<N> {
     #[inline]
-    fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), pulsevm_serialization::WriteError> {
+    fn write(
+        &self,
+        bytes: &mut [u8],
+        pos: &mut usize,
+    ) -> Result<(), pulsevm_serialization::WriteError> {
         if *pos + N > bytes.len() {
             return Err(pulsevm_serialization::WriteError::NotEnoughSpace);
         }
@@ -82,5 +86,19 @@ impl<const N: usize> AsRef<[u8]> for FixedBytes<N> {
     #[inline]
     fn as_ref(&self) -> &[u8] {
         &self.0
+    }
+}
+
+impl<const N: usize> TryFrom<Vec<u8>> for FixedBytes<N> {
+    type Error = ();
+
+    #[inline]
+    fn try_from(value: Vec<u8>) -> Result<Self, Self::Error> {
+        if value.len() != N {
+            return Err(());
+        }
+        let mut bytes = [0u8; N];
+        bytes.copy_from_slice(&value);
+        Ok(FixedBytes(bytes))
     }
 }

@@ -29,7 +29,9 @@ impl fmt::Display for ParseNameError {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default, Read, Write, NumBytes)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default, Read, Write, NumBytes,
+)]
 pub struct Name(u64);
 
 impl Name {
@@ -71,7 +73,8 @@ impl FromStr for Name {
             return Ok(value.into()); // assuming `u64: Into<YourType>`
         }
 
-        let name = name_from_bytes(s.bytes()).map_err(|e| ChainError::ParseError(format!("invalid name format: {}", e)))?;
+        let name = name_from_bytes(s.bytes())
+            .map_err(|e| ChainError::ParseError(format!("invalid name format: {}", e)))?;
         Ok(name.into())
     }
 }
@@ -80,7 +83,9 @@ impl fmt::Display for Name {
     #[inline]
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let bytes = self.as_bytes();
-        let value = str::from_utf8(&bytes).map(|s| s.trim_end_matches('.')).map_err(|_| fmt::Error)?;
+        let value = str::from_utf8(&bytes)
+            .map(|s| s.trim_end_matches('.'))
+            .map_err(|_| fmt::Error)?;
         write!(f, "{}", value)
     }
 }
@@ -127,7 +132,9 @@ impl<'de> Deserialize<'de> for Name {
 impl Parse for Name {
     fn parse(input: ParseStream) -> ParseResult<Self> {
         let name = input.parse::<LitStr>()?.value();
-        name_from_bytes(name.bytes()).map(Self).map_err(|_e| input.error("failed to parse name"))
+        name_from_bytes(name.bytes())
+            .map(Self)
+            .map_err(|_e| input.error("failed to parse name"))
     }
 }
 

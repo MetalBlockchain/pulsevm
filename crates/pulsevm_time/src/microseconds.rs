@@ -2,7 +2,9 @@ use core::ops::{Add, AddAssign, Sub, SubAssign};
 
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 
-#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Default, Read, Write, NumBytes)]
+#[derive(
+    Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Default, Read, Write, NumBytes,
+)]
 pub struct Microseconds(pub i64);
 
 impl Microseconds {

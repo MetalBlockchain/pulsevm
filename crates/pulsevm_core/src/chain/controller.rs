@@ -11,11 +11,16 @@ use crate::{
         apply_context::ApplyContext,
         authorization_manager::AuthorizationManager,
         block::{BlockHeader, BlockTimestamp},
-        config::{DELETEAUTH_NAME, LINKAUTH_NAME, NEWACCOUNT_NAME, SETABI_NAME, SETCODE_NAME, UNLINKAUTH_NAME, UPDATEAUTH_NAME, eos_percent},
+        config::{
+            DELETEAUTH_NAME, LINKAUTH_NAME, NEWACCOUNT_NAME, SETABI_NAME, SETCODE_NAME,
+            UNLINKAUTH_NAME, UPDATEAUTH_NAME, eos_percent,
+        },
         id::Id,
         mempool::Mempool,
         name::Name,
-        pulse_contract::{deleteauth, linkauth, newaccount, setabi, setcode, unlinkauth, updateauth},
+        pulse_contract::{
+            deleteauth, linkauth, newaccount, setabi, setcode, unlinkauth, updateauth,
+        },
         resource::ElasticLimitParameters,
         resource_limits::ResourceLimitsManager,
         state_history::StateHistoryLog,
@@ -27,7 +32,10 @@ use crate::{
     transaction::Action,
 };
 
-use pulsevm_constants::{BLOCK_CPU_USAGE_AVERAGE_WINDOW_MS, BLOCK_INTERVAL_MS, BLOCK_SIZE_AVERAGE_WINDOW_MS, MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER};
+use pulsevm_constants::{
+    BLOCK_CPU_USAGE_AVERAGE_WINDOW_MS, BLOCK_INTERVAL_MS, BLOCK_SIZE_AVERAGE_WINDOW_MS,
+    MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER,
+};
 use pulsevm_crypto::{Digest, merkle};
 use pulsevm_error::ChainError;
 use pulsevm_ffi::{CxxChainConfig, CxxGenesisState, Database, GlobalPropertyObject};
@@ -98,35 +106,52 @@ impl Controller {
         controller
     }
 
-    pub fn initialize(&mut self, genesis_bytes: &Vec<u8>, db_path: &str) -> Result<(), ChainError> {
+    pub fn initialize(
+        &mut self,
+        chain_id: &Id,
+        genesis_bytes: &Vec<u8>,
+        db_path: &str,
+    ) -> Result<(), ChainError> {
         info!("initializing controller with DB path: {}", db_path);
-        self.db = Database::new(&db_path).map_err(|e| ChainError::InternalError(format!("failed to open database: {}", e)))?;
+        self.db = Database::new(&db_path)
+            .map_err(|e| ChainError::InternalError(format!("failed to open database: {}", e)))?;
         self.db.add_indices()?;
         // Parse genesis bytes
-        let genesis_json =
-            std::str::from_utf8(genesis_bytes).map_err(|e| ChainError::ParseError(format!("failed to parse genesis bytes as UTF-8: {}", e)))?;
-        let genesis = CxxGenesisState::new(genesis_json).map_err(|e| ChainError::ParseError(format!("failed to parse genesis: {}", e)))?;
+        let genesis_json = std::str::from_utf8(genesis_bytes).map_err(|e| {
+            ChainError::ParseError(format!("failed to parse genesis bytes as UTF-8: {}", e))
+        })?;
+        let genesis = CxxGenesisState::new(genesis_json)
+            .map_err(|e| ChainError::ParseError(format!("failed to parse genesis: {}", e)))?;
         // TODO: Validate genesis state
-        self.chain_id = genesis.compute_chain_id().try_into()?;
+        self.chain_id = chain_id.clone();
         self.block_log =
-            Some(StateHistoryLog::open(&db_path, "block_log").map_err(|e| ChainError::InternalError(format!("failed to open block log: {}", e)))?);
+            Some(StateHistoryLog::open(&db_path, "block_log").map_err(|e| {
+                ChainError::InternalError(format!("failed to open block log: {}", e))
+            })?);
         self.trace_log =
-            Some(StateHistoryLog::open(&db_path, "trace_log").map_err(|e| ChainError::InternalError(format!("failed to open trace log: {}", e)))?);
-        self.chain_state_log = Some(
-            StateHistoryLog::open(&db_path, "chain_state_log")
-                .map_err(|e| ChainError::InternalError(format!("failed to open chain state log: {}", e)))?,
-        );
+            Some(StateHistoryLog::open(&db_path, "trace_log").map_err(|e| {
+                ChainError::InternalError(format!("failed to open trace log: {}", e))
+            })?);
+        self.chain_state_log = Some(StateHistoryLog::open(&db_path, "chain_state_log").map_err(
+            |e| ChainError::InternalError(format!("failed to open chain state log: {}", e)),
+        )?);
 
         // Set our last accepted block to the genesis block
-        self.last_accepted_block = SignedBlock::new(Id::default(), BlockTimestamp::now(), VecDeque::new(), Digest::default());
+        self.last_accepted_block = SignedBlock::new(
+            Id::default(),
+            BlockTimestamp::now(),
+            VecDeque::new(),
+            Digest::default(),
+        );
+        self.preferred_id = self.last_accepted_block.id();
 
         // TODO: Check if we need to initialize the database
 
         // Initialize the database with the genesis state
         info!("initializing database with genesis state");
-        self.db
-            .initialize_database(&genesis)
-            .map_err(|e| ChainError::GenesisError(format!("failed to initialize database: {}", e)))?;
+        self.db.initialize_database(&genesis).map_err(|e| {
+            ChainError::GenesisError(format!("failed to initialize database: {}", e))
+        })?;
         info!("database initialized successfully");
 
         Ok(())
@@ -134,7 +159,7 @@ impl Controller {
 
     pub async fn build_block(&mut self, mempool: &mut Mempool) -> Result<SignedBlock, ChainError> {
         let mut db = self.db.clone();
-        let _ = db.create_undo_session(true)?; // As we are building the block, drop the changes once built
+        let mut root_session = db.create_undo_session(true)?; // As we are building the block, drop the changes once built
         let mut transaction_receipts: VecDeque<TransactionReceipt> = VecDeque::new();
         let timestamp = BlockTimestamp::now();
         let block_status = BlockStatus::Building;
@@ -142,71 +167,119 @@ impl Controller {
         // Get transactions from the mempool
         while let Some(transaction) = mempool.pop_transaction() {
             let mut child_session = db.create_undo_session(true)?;
-            let transaction_result = self.execute_transaction(&transaction, &timestamp, &block_status);
+            let transaction_result =
+                self.execute_transaction(&transaction, &timestamp, &block_status);
 
             match transaction_result {
                 Ok(result) => {
-                    child_session.pin_mut().squash(); // Push changes to upstream session
+                    child_session.pin_mut().squash().map_err(|e| {
+                        ChainError::DatabaseError(format!(
+                            "failed to commit transaction changes: {}",
+                            e
+                        ))
+                    })?; // Push changes to upstream session
 
                     // Add the transaction to the block
                     let receipt = TransactionReceipt::new(result.trace.receipt, transaction);
                     transaction_receipts.push_back(receipt);
                 }
                 Err(e) => {
-                    warn!("transaction {} failed to execute, dropping: {}", transaction.id(), e);
+                    warn!(
+                        "transaction {} failed to execute, dropping: {}",
+                        transaction.id(),
+                        e
+                    );
 
-                    child_session.pin_mut().undo(); // Revert changes made during this transaction
+                    child_session.pin_mut().undo().map_err(|e| {
+                        ChainError::DatabaseError(format!("failed to undo changes: {}", e))
+                    })?; // Revert changes made during this transaction
                 }
             }
         }
 
         // Don't build a block if we have no transactions
         if transaction_receipts.len() == 0 {
-            return Err(ChainError::NetworkError(format!("built block has no transactions")));
+            return Err(ChainError::NetworkError(format!(
+                "built block has no transactions"
+            )));
         }
 
         // Create a new block
         let transaction_mroot = self.calculate_trx_merkle(&transaction_receipts)?;
-        let block = SignedBlock::new(self.preferred_id, timestamp, transaction_receipts, transaction_mroot);
+        let block = SignedBlock::new(
+            self.preferred_id,
+            timestamp,
+            transaction_receipts,
+            transaction_mroot,
+        );
 
         // We built this block so no need to verify it again
-        self.verified_blocks
-            .insert(block.signed_block_header.block.calculate_id().unwrap(), block.clone());
+        self.verified_blocks.insert(
+            block.signed_block_header.block.calculate_id().unwrap(),
+            block.clone(),
+        );
+
+        root_session
+            .pin_mut()
+            .undo()
+            .map_err(|e| ChainError::DatabaseError(format!("failed to undo changes: {}", e)))?; // Revert changes made during this transaction
 
         Ok(block)
     }
 
-    pub async fn verify_block(&mut self, block: &SignedBlock, mempool: Arc<AsyncRwLock<Mempool>>) -> Result<(), ChainError> {
+    pub async fn verify_block(
+        &mut self,
+        block: &SignedBlock,
+        mempool: Arc<AsyncRwLock<Mempool>>,
+    ) -> Result<(), ChainError> {
         println!("verifying block {}", block.block_num());
         if self.verified_blocks.contains_key(&block.id()) {
             return Ok(());
         }
 
         // Verify the block
-        let _ = self.db.create_undo_session(true)?;
+        let mut root_session = self.db.create_undo_session(true)?;
         let mut mempool = mempool.write().await;
         let block_status = BlockStatus::Verifying;
-        self.execute_block(block, &block_status, &mut mempool).await?;
+        self.execute_block(block, &block_status, &mut mempool)
+            .await?;
         self.verified_blocks.insert(block.id(), block.clone());
+
+        root_session
+            .pin_mut()
+            .undo()
+            .map_err(|e| ChainError::DatabaseError(format!("failed to undo changes: {}", e)))?; // Revert changes made during this transaction
 
         Ok(())
     }
 
-    pub async fn accept_block(&mut self, block_id: &Id, mempool: Arc<AsyncRwLock<Mempool>>) -> Result<(), ChainError> {
+    pub async fn accept_block(
+        &mut self,
+        block_id: &Id,
+        mempool: Arc<AsyncRwLock<Mempool>>,
+    ) -> Result<(), ChainError> {
         println!("accepting block {}", block_id);
         let block = {
             self.verified_blocks
                 .get(block_id)
                 .cloned()
-                .ok_or(ChainError::NetworkError(format!("block with id {} not verified", block_id)))?
+                .ok_or(ChainError::NetworkError(format!(
+                    "block with id {} not verified",
+                    block_id
+                )))?
         };
         let mut root_session = self.db.create_undo_session(true)?;
         let mut mempool = mempool.write().await;
         let block_status = BlockStatus::Accepting;
-        let transaction_traces = self.execute_block(&block, &block_status, &mut mempool).await?;
-        let packed_transaction_traces = transaction_traces
-            .pack()
-            .map_err(|e| ChainError::TransactionError(format!("failed to pack transaction traces for block {}: {}", block_id, e)))?;
+        let transaction_traces = self
+            .execute_block(&block, &block_status, &mut mempool)
+            .await?;
+        let packed_transaction_traces = transaction_traces.pack().map_err(|e| {
+            ChainError::TransactionError(format!(
+                "failed to pack transaction traces for block {}: {}",
+                block_id, e
+            ))
+        })?;
         self.trace_log
             .as_ref()
             .map(|log| log.append(block_id.clone(), packed_transaction_traces.as_slice()));
@@ -243,7 +316,11 @@ impl Controller {
 
         for receipt in &block.transactions {
             // Verify the transaction
-            let result = self.execute_transaction(receipt.trx(), &block.signed_block_header.block.timestamp, block_status)?;
+            let result = self.execute_transaction(
+                receipt.trx(),
+                &block.signed_block_header.block.timestamp,
+                block_status,
+            )?;
 
             // Add trace to traces
             transaction_traces.push(result.trace);
@@ -293,7 +370,8 @@ impl Controller {
     ) -> Result<TransactionResult, ChainError> {
         let mut db = self.db.clone();
         let _undo_session = db.create_undo_session(true)?;
-        let result = self.execute_transaction(transaction, pending_block_timestamp, block_status)?;
+        let result =
+            self.execute_transaction(transaction, pending_block_timestamp, block_status)?;
         return Ok(result);
     }
 
@@ -329,7 +407,11 @@ impl Controller {
         );
 
         let trx = packed_transaction.get_transaction();
-        trx_context.init_for_input_trx(trx, packed_transaction.get_unprunable_size()?, packed_transaction.get_prunable_size()?)?;
+        trx_context.init_for_input_trx(
+            trx,
+            packed_transaction.get_unprunable_size()?,
+            packed_transaction.get_prunable_size()?,
+        )?;
         trx_context.exec(trx)?;
         let result = trx_context.finalize()?;
 
@@ -368,7 +450,8 @@ impl Controller {
 
     pub fn parse_block(&self, bytes: &Vec<u8>) -> Result<SignedBlock, ControllerError> {
         let mut pos = 0;
-        let block = SignedBlock::read(bytes, &mut pos).map_err(|e| ControllerError::GenesisError(format!("Failed to parse block: {}", e)))?;
+        let block = SignedBlock::read(bytes, &mut pos)
+            .map_err(|e| ControllerError::GenesisError(format!("Failed to parse block: {}", e)))?;
         Ok(block)
     }
 
@@ -388,9 +471,9 @@ impl Controller {
     }
 
     pub fn get_global_properties(db: &Database) -> Result<&GlobalPropertyObject, ChainError> {
-        let res = db
-            .get_global_properties()
-            .map_err(|e| ChainError::DatabaseError(format!("failed to get global properties: {}", e)))?;
+        let res = db.get_global_properties().map_err(|e| {
+            ChainError::DatabaseError(format!("failed to get global properties: {}", e))
+        })?;
 
         Ok(unsafe { &*res })
     }
@@ -403,13 +486,19 @@ impl Controller {
         &self.chain_id
     }
 
-    pub fn calculate_trx_merkle(&self, receipts: &VecDeque<TransactionReceipt>) -> Result<Digest, ChainError> {
+    pub fn calculate_trx_merkle(
+        &self,
+        receipts: &VecDeque<TransactionReceipt>,
+    ) -> Result<Digest, ChainError> {
         let mut trx_digests = VecDeque::new();
 
         for receipt in receipts {
-            let digest = receipt
-                .digest()
-                .map_err(|e| ChainError::TransactionError(format!("failed to calculate transaction digest: {}", e)))?;
+            let digest = receipt.digest().map_err(|e| {
+                ChainError::TransactionError(format!(
+                    "failed to calculate transaction digest: {}",
+                    e
+                ))
+            })?;
             trx_digests.push_back(digest);
         }
 
@@ -445,7 +534,9 @@ impl Controller {
             return Ok(Some(entry));
         }
 
-        Err(ChainError::InternalError(format!("failed to get block id from logs")))
+        Err(ChainError::InternalError(format!(
+            "failed to get block id from logs"
+        )))
     }
 
     pub fn block_log(&self) -> Result<&StateHistoryLog, ChainError> {
@@ -508,7 +599,7 @@ mod tests {
     fn generate_genesis(private_key: &PrivateKey) -> Vec<u8> {
         let genesis = json!(
         {
-            "initial_timestamp": "2023-01-01T00:00:00Z",
+            "initial_timestamp": "2023-01-01T00:00:00",
             "initial_key": private_key.get_public_key().to_string(),
             "initial_configuration": {
                 "max_block_net_usage": 1048576,
@@ -531,7 +622,11 @@ mod tests {
         genesis.to_string().into_bytes()
     }
 
-    fn create_account(private_key: &PrivateKey, account: Name, chain_id: Id) -> Result<PackedTransaction, ChainError> {
+    fn create_account(
+        private_key: &PrivateKey,
+        account: Name,
+        chain_id: Id,
+    ) -> Result<PackedTransaction, ChainError> {
         let trx = Transaction::new(
             TransactionHeader::new(TimePointSec::new(0), 0, 0, 0u32.into(), 0, 0u32.into()),
             vec![],
@@ -541,12 +636,25 @@ mod tests {
                 NewAccount {
                     creator: Name::from_str("pulse")?,
                     name: account,
-                    owner: Authority::new(1, vec![KeyWeight::new(private_key.get_public_key().into(), 1)], vec![], vec![]),
-                    active: Authority::new(1, vec![KeyWeight::new(private_key.get_public_key().into(), 1)], vec![], vec![]),
+                    owner: Authority::new(
+                        1,
+                        vec![KeyWeight::new(private_key.get_public_key().into(), 1)],
+                        vec![],
+                        vec![],
+                    ),
+                    active: Authority::new(
+                        1,
+                        vec![KeyWeight::new(private_key.get_public_key().into(), 1)],
+                        vec![],
+                        vec![],
+                    ),
                 }
                 .pack()
                 .unwrap(),
-                vec![PermissionLevel::new(PULSE_NAME.as_u64(), ACTIVE_NAME.as_u64())],
+                vec![PermissionLevel::new(
+                    PULSE_NAME.as_u64(),
+                    ACTIVE_NAME.as_u64(),
+                )],
             )],
         )
         .sign(&private_key, &chain_id)?;
@@ -554,7 +662,12 @@ mod tests {
         Ok(packed_trx)
     }
 
-    fn set_code(private_key: &PrivateKey, account: Name, wasm_bytes: Vec<u8>, chain_id: Id) -> Result<PackedTransaction, ChainError> {
+    fn set_code(
+        private_key: &PrivateKey,
+        account: Name,
+        wasm_bytes: Vec<u8>,
+        chain_id: Id,
+    ) -> Result<PackedTransaction, ChainError> {
         let trx = Transaction::new(
             TransactionHeader::new(TimePointSec::new(0), 0, 0, 0u32.into(), 0, 0u32.into()),
             vec![],
@@ -601,14 +714,22 @@ mod tests {
 
     #[test]
     fn test_initialize() -> Result<(), ChainError> {
-        let private_key = PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
+        let private_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
         let mut controller = Controller::new();
         let genesis_bytes = generate_genesis(&private_key);
         let temp_path = get_temp_dir();
-        controller.initialize(&genesis_bytes.to_vec(), temp_path.path().to_str().unwrap())?;
+        controller.initialize(
+            &chain_id,
+            &genesis_bytes.to_vec(),
+            temp_path.path().to_str().unwrap(),
+        )?;
         assert_eq!(controller.last_accepted_block().block_num(), 1);
         let pending_block_timestamp = controller.last_accepted_block().timestamp().clone();
-        let chain_id = controller.chain_id();
+        let chain_id = controller.chain_id().clone();
         let block_status = BlockStatus::Building;
         controller.execute_transaction(
             &create_account(&private_key, Name::from_str("glenn")?, chain_id)?,
@@ -621,10 +742,20 @@ mod tests {
             &block_status,
         )?;
 
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
-        let pulse_token_contract = fs::read(root.join(Path::new("reference_contracts/pulse_token.wasm"))).unwrap();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let pulse_token_contract =
+            fs::read(root.join(Path::new("reference_contracts/pulse_token.wasm"))).unwrap();
         controller.execute_transaction(
-            &set_code(&private_key, Name::from_str("glenn")?, pulse_token_contract, chain_id)?,
+            &set_code(
+                &private_key,
+                Name::from_str("glenn")?,
+                pulse_token_contract,
+                chain_id,
+            )?,
             &pending_block_timestamp,
             &block_status,
         )?;
@@ -688,24 +819,40 @@ mod tests {
 
     #[test]
     fn test_api_db() -> Result<(), ChainError> {
-        let runtime = runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
+        let runtime = runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         let _guard = runtime.enter();
-        let private_key = PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let private_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
         let mut controller = Controller::new();
         let genesis_bytes = generate_genesis(&private_key);
         let temp_path = get_temp_dir();
-        controller.initialize(&genesis_bytes.to_vec(), temp_path.path().to_str().unwrap())?;
+        controller.initialize(
+            &chain_id,
+            &genesis_bytes.to_vec(),
+            temp_path.path().to_str().unwrap(),
+        )?;
         let pending_block_timestamp = controller.last_accepted_block().timestamp().clone();
         let mut db = controller.database();
-        let chain_id = controller.chain_id();
+        let chain_id = controller.chain_id().clone();
         let block_status = BlockStatus::Building;
         controller.execute_transaction(
             &create_account(&private_key, Name::from_str("glenn")?, chain_id)?,
             &pending_block_timestamp,
             &block_status,
         )?;
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
-        let contract = fs::read(root.join(Path::new("reference_contracts/test_api_db.wasm"))).unwrap();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let contract =
+            fs::read(root.join(Path::new("reference_contracts/test_api_db.wasm"))).unwrap();
         controller.execute_transaction(
             &set_code(&private_key, Name::from_str("glenn")?, contract, chain_id)?,
             &pending_block_timestamp,
@@ -713,17 +860,35 @@ mod tests {
         )?;
 
         controller.execute_transaction(
-            &call_contract(&private_key, Name::from_str("glenn")?, Name::from_str("pg")?, &Vec::<u8>::new(), chain_id)?,
+            &call_contract(
+                &private_key,
+                Name::from_str("glenn")?,
+                Name::from_str("pg")?,
+                &Vec::<u8>::new(),
+                chain_id,
+            )?,
             &pending_block_timestamp,
             &block_status,
         )?;
         controller.execute_transaction(
-            &call_contract(&private_key, Name::from_str("glenn")?, Name::from_str("pl")?, &Vec::<u8>::new(), chain_id)?,
+            &call_contract(
+                &private_key,
+                Name::from_str("glenn")?,
+                Name::from_str("pl")?,
+                &Vec::<u8>::new(),
+                chain_id,
+            )?,
             &pending_block_timestamp,
             &block_status,
         )?;
         controller.execute_transaction(
-            &call_contract(&private_key, Name::from_str("glenn")?, Name::from_str("pu")?, &Vec::<u8>::new(), chain_id)?,
+            &call_contract(
+                &private_key,
+                Name::from_str("glenn")?,
+                Name::from_str("pu")?,
+                &Vec::<u8>::new(),
+                chain_id,
+            )?,
             &pending_block_timestamp,
             &block_status,
         )?;

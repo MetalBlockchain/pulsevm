@@ -19,9 +19,12 @@ const EOS_FMT_MILLIS_NOZ: &[time::format_description::FormatItem<'_>] =
 const EOS_FMT_MILLIS_Z: &[time::format_description::FormatItem<'_>] =
     format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z");
 
-const EOS_FMT_SECS_NOZ: &[time::format_description::FormatItem<'_>] = format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]");
+const EOS_FMT_SECS_NOZ: &[time::format_description::FormatItem<'_>] =
+    format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]");
 
-#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Default, Read, Write, NumBytes)]
+#[derive(
+    Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Default, Read, Write, NumBytes,
+)]
 pub struct TimePoint {
     pub elapsed: Microseconds, // microseconds since UNIX epoch
 }
@@ -46,18 +49,25 @@ impl TimePoint {
     pub fn now() -> Self {
         use std::time::{SystemTime, UNIX_EPOCH};
 
-        let dur = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+        let dur = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
         let micros_u128 = dur.as_micros();
 
         // Clamp to i64 if your Microseconds uses i64
-        let micros_i64 = if micros_u128 > i64::MAX as u128 { i64::MAX } else { micros_u128 as i64 };
+        let micros_i64 = if micros_u128 > i64::MAX as u128 {
+            i64::MAX
+        } else {
+            micros_u128 as i64
+        };
 
         TimePoint::new(Microseconds::new(micros_i64))
     }
 
     /// Exact EOS-style string: "YYYY-MM-DDTHH:MM:SSZ"
     pub fn to_eos_string(&self) -> String {
-        let dt = OffsetDateTime::from_unix_timestamp(self.sec_since_epoch() as i64).expect("valid unix timestamp");
+        let dt = OffsetDateTime::from_unix_timestamp(self.sec_since_epoch() as i64)
+            .expect("valid unix timestamp");
         dt.format(EOS_FMT_MILLIS_Z).expect("formatting never fails")
     }
 }

@@ -20,13 +20,17 @@ use super::action::Action;
 #[derive(Debug, Clone, PartialEq, Eq, Read, Write, NumBytes, Hash, Default)]
 pub struct Transaction {
     pub header: TransactionHeader,
-    pub context_free_actions: Vec<Action>,           // Context-free actions, if any
-    pub actions: Vec<Action>,                        // Actions to be executed in this transaction
+    pub context_free_actions: Vec<Action>, // Context-free actions, if any
+    pub actions: Vec<Action>,              // Actions to be executed in this transaction
     pub transaction_extensions: Vec<(u16, Vec<u8>)>, // We don't use this for now
 }
 
 impl Transaction {
-    pub fn new(header: TransactionHeader, context_free_actions: Vec<Action>, actions: Vec<Action>) -> Self {
+    pub fn new(
+        header: TransactionHeader,
+        context_free_actions: Vec<Action>,
+        actions: Vec<Action>,
+    ) -> Self {
         Self {
             header,
             context_free_actions,
@@ -40,23 +44,31 @@ impl Transaction {
     }
 
     fn digest(&self) -> Result<[u8; 32], ChainError> {
-        let bytes: Vec<u8> = self
-            .pack()
-            .map_err(|e| ChainError::SerializationError(format!("failed to pack transaction: {}", e)))?;
+        let bytes: Vec<u8> = self.pack().map_err(|e| {
+            ChainError::SerializationError(format!("failed to pack transaction: {}", e))
+        })?;
         Ok(sha2::Sha256::digest(&bytes).into())
     }
 
     // Helper function for testing
-    pub fn sign(&self, private_key: &PrivateKey, chain_id: &Id) -> Result<SignedTransaction, ChainError> {
+    pub fn sign(
+        &self,
+        private_key: &PrivateKey,
+        chain_id: &Id,
+    ) -> Result<SignedTransaction, ChainError> {
         let signed_transaction = SignedTransaction::new(self.clone(), HashSet::new(), vec![]);
 
         signed_transaction.sign(private_key, chain_id)
     }
 
-    pub fn signing_digest(&self, chain_id: &Id, cfd_bytes: &Vec<Bytes>) -> Result<[u8; 32], ChainError> {
-        let trx_bytes: Vec<u8> = self
-            .pack()
-            .map_err(|e| ChainError::SerializationError(format!("failed to pack transaction: {}", e)))?;
+    pub fn signing_digest(
+        &self,
+        chain_id: &Id,
+        cfd_bytes: &Vec<Bytes>,
+    ) -> Result<[u8; 32], ChainError> {
+        let trx_bytes: Vec<u8> = self.pack().map_err(|e| {
+            ChainError::SerializationError(format!("failed to pack transaction: {}", e))
+        })?;
 
         signing_digest(chain_id, &trx_bytes, cfd_bytes)
     }

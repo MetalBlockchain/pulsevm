@@ -16,7 +16,8 @@ pub struct PrivateKey {
 
 impl PrivateKey {
     pub fn sign(&self, digest: &Digest) -> Result<Signature, ChainError> {
-        let cxx_sig = sign_digest_with_private_key(&digest, &self.inner).map_err(|e| ChainError::TransactionError(e.to_string()))?;
+        let cxx_sig = sign_digest_with_private_key(&digest, &self.inner)
+            .map_err(|e| ChainError::TransactionError(e.to_string()))?;
         Ok(Signature::new(cxx_sig))
     }
 
@@ -35,7 +36,8 @@ impl FromStr for PrivateKey {
     type Err = ChainError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let cxx_key = pulsevm_ffi::parse_private_key(s).map_err(|e| ChainError::TransactionError(e.to_string()))?;
+        let cxx_key = pulsevm_ffi::parse_private_key(s)
+            .map_err(|e| ChainError::TransactionError(e.to_string()))?;
         Ok(PrivateKey { inner: cxx_key })
     }
 }

@@ -1,5 +1,6 @@
 use pulsevm_core::{
-    asset::Asset, authority::Authority, block::BlockTimestamp, id::Id, name::Name, resource::AccountResourceLimit, utils::Base64Bytes,
+    asset::Asset, authority::Authority, block::BlockTimestamp, id::Id, name::Name,
+    resource::AccountResourceLimit, utils::Base64Bytes,
 };
 use pulsevm_crypto::Digest;
 use serde::Serialize;

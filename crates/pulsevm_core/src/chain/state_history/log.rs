@@ -30,7 +30,10 @@ impl fmt::Display for ShLogError {
             ShLogError::Corrupt(off) => write!(f, "corrupt entry at offset {off}"),
             ShLogError::MissedBlock(name) => write!(f, "missed a block in {name}"),
             ShLogError::NotFound(b) => write!(f, "block {b} not found"),
-            ShLogError::BadMagic { at, found, expect } => write!(f, "bad magic at offset {at}: found {found:#x}, expected {expect:#x}"),
+            ShLogError::BadMagic { at, found, expect } => write!(
+                f,
+                "bad magic at offset {at}: found {found:#x}, expected {expect:#x}"
+            ),
         }
     }
 }
@@ -116,13 +119,25 @@ pub struct StateHistoryLog {
 
 impl StateHistoryLog {
     /// Open with explicit magic (use EOS' `ship_magic(ship_current_version)`).
-    pub fn open_with_magic<P: AsRef<Path>>(dir: P, name: &str, magic: u64) -> Result<Self, ShLogError> {
+    pub fn open_with_magic<P: AsRef<Path>>(
+        dir: P,
+        name: &str,
+        magic: u64,
+    ) -> Result<Self, ShLogError> {
         let log_path = dir.as_ref().join(format!("{name}.log"));
         let idx_path = dir.as_ref().join(format!("{name}.index"));
 
         // open/create files
-        let mut log_file = OpenOptions::new().read(true).write(true).create(true).open(&log_path)?;
-        let mut idx_file = OpenOptions::new().read(true).write(true).create(true).open(&idx_path)?;
+        let mut log_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&log_path)?;
+        let mut idx_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&idx_path)?;
 
         // load index
         let mut map = BTreeMap::new();
@@ -147,7 +162,10 @@ impl StateHistoryLog {
             (fb, lb)
         } else {
             // validate the tail header/payload; truncate torn writes
-            let (fb, lb) = (*map.keys().next().unwrap_or(&0), *map.keys().last().unwrap());
+            let (fb, lb) = (
+                *map.keys().next().unwrap_or(&0),
+                *map.keys().last().unwrap(),
+            );
             if let Some(&tail_off) = map.get(&lb) {
                 let ok_end = match validate_entry_at_with_header(&mut log_file, tail_off, magic) {
                     Ok(end) => end,
@@ -193,7 +211,10 @@ impl StateHistoryLog {
         let block_num = num_from_block_id(&block_id);
 
         if self.last_block != 0 && block_num != self.last_block + 1 {
-            return Err(ShLogError::MissedBlock(format!("{}_history.log", self.name)));
+            return Err(ShLogError::MissedBlock(format!(
+                "{}_history.log",
+                self.name
+            )));
         }
 
         let mut log_guard = self.log.lock().unwrap();
@@ -290,7 +311,10 @@ impl StateHistoryLog {
 
     pub fn prune_from(&self, start_block: u32) -> Result<(), ShLogError> {
         let old_map = self.map.lock().unwrap().clone();
-        let keep: Vec<(u32, u64)> = old_map.range(start_block..=u32::MAX).map(|(k, v)| (*k, *v)).collect();
+        let keep: Vec<(u32, u64)> = old_map
+            .range(start_block..=u32::MAX)
+            .map(|(k, v)| (*k, *v))
+            .collect();
         if keep.is_empty() {
             return Ok(());
         }
@@ -298,8 +322,20 @@ impl StateHistoryLog {
         let tmp_log = self.log_path.with_extension("log.tmp");
         let tmp_idx = self.idx_path.with_extension("index.tmp");
 
-        let mut out_log = BufWriter::new(OpenOptions::new().write(true).create(true).truncate(true).open(&tmp_log)?);
-        let mut out_idx = BufWriter::new(OpenOptions::new().write(true).create(true).truncate(true).open(&tmp_idx)?);
+        let mut out_log = BufWriter::new(
+            OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp_log)?,
+        );
+        let mut out_idx = BufWriter::new(
+            OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp_idx)?,
+        );
         let mut in_log = BufReader::new(OpenOptions::new().read(true).open(&self.log_path)?);
 
         for (block, old_pos) in &keep {
@@ -332,8 +368,18 @@ impl StateHistoryLog {
         // reset append handles
         let mut log_lock = self.log.lock().unwrap();
         let mut idx_lock = self.idx.lock().unwrap();
-        *log_lock = BufWriter::new(OpenOptions::new().read(true).write(true).open(&self.log_path)?);
-        *idx_lock = BufWriter::new(OpenOptions::new().read(true).write(true).open(&self.idx_path)?);
+        *log_lock = BufWriter::new(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&self.log_path)?,
+        );
+        *idx_lock = BufWriter::new(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&self.idx_path)?,
+        );
         log_lock.get_ref().seek(SeekFrom::End(0))?;
         idx_lock.get_ref().seek(SeekFrom::End(0))?;
 
@@ -387,7 +433,11 @@ impl StateHistoryLog {
 /* -------------------- validation & scan (header-aware) -------------------- */
 
 /// Validate one header+payload at `pos`. Return end offset if valid.
-fn validate_entry_at_with_header(file: &mut File, pos: u64, expect_magic: u64) -> Result<u64, ShLogError> {
+fn validate_entry_at_with_header(
+    file: &mut File,
+    pos: u64,
+    expect_magic: u64,
+) -> Result<u64, ShLogError> {
     file.seek(SeekFrom::Start(pos))?;
     let len_total = file.metadata()?.len();
     if pos + (StateHistoryLogHeader::SIZE as u64) > len_total {
@@ -409,7 +459,10 @@ fn validate_entry_at_with_header(file: &mut File, pos: u64, expect_magic: u64) -
 }
 
 /// Full scan: build map from on-disk log with headers.
-fn scan_log_build_index_with_header(file: &mut File, expect_magic: u64) -> Result<(u32, u32, BTreeMap<u32, u64>), ShLogError> {
+fn scan_log_build_index_with_header(
+    file: &mut File,
+    expect_magic: u64,
+) -> Result<(u32, u32, BTreeMap<u32, u64>), ShLogError> {
     let mut pos = 0u64;
     let len_total = file.metadata()?.len();
     let mut map = BTreeMap::new();

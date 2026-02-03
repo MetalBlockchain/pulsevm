@@ -13,7 +13,14 @@ pub struct ResourceLimits {
 }
 
 impl ResourceLimits {
-    pub fn new(id: u64, owner: Name, pending: bool, net_weight: i64, cpu_weight: i64, ram_bytes: i64) -> Self {
+    pub fn new(
+        id: u64,
+        owner: Name,
+        pending: bool,
+        net_weight: i64,
+        cpu_weight: i64,
+        ram_bytes: i64,
+    ) -> Self {
         ResourceLimits {
             id,
             owner,

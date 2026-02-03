@@ -148,14 +148,22 @@ impl<T: NumBytes> NumBytes for HashSet<T> {
 impl<K: Write + NumBytes, V: Write + NumBytes> NumBytes for BTreeMap<K, V> {
     #[inline]
     fn num_bytes(&self) -> usize {
-        self.len().num_bytes() + self.iter().map(|(k, v)| k.num_bytes() + v.num_bytes()).sum::<usize>()
+        self.len().num_bytes()
+            + self
+                .iter()
+                .map(|(k, v)| k.num_bytes() + v.num_bytes())
+                .sum::<usize>()
     }
 }
 
 impl<K: Write + NumBytes, V: Write + NumBytes> NumBytes for HashMap<K, V> {
     #[inline]
     fn num_bytes(&self) -> usize {
-        self.len().num_bytes() + self.iter().map(|(k, v)| k.num_bytes() + v.num_bytes()).sum::<usize>()
+        self.len().num_bytes()
+            + self
+                .iter()
+                .map(|(k, v)| k.num_bytes() + v.num_bytes())
+                .sum::<usize>()
     }
 }
 

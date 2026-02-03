@@ -212,7 +212,10 @@ impl From<&TransactionTrace> for TransactionTraceV0 {
                         auth_sequence: receipt
                             .auth_sequence
                             .iter()
-                            .map(|(k, v)| AccountAuthSequence { account: *k, sequence: *v })
+                            .map(|(k, v)| AccountAuthSequence {
+                                account: *k,
+                                sequence: *v,
+                            })
                             .collect(),
                         code_sequence: VarUint32(receipt.code_sequence),
                         abi_sequence: VarUint32(receipt.abi_sequence),

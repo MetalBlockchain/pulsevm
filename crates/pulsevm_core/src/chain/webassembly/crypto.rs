@@ -9,9 +9,17 @@ use wasmer::{FunctionEnvMut, RuntimeError, WasmPtr};
 
 use crate::{apply_context::ApplyContext, chain::wasm_runtime::WasmContext};
 
-pub fn sha224(mut env: FunctionEnvMut<WasmContext>, msg_ptr: WasmPtr<u8>, msg_size: u32, out_ptr: WasmPtr<u8>) -> Result<u32, RuntimeError> {
+pub fn sha224(
+    mut env: FunctionEnvMut<WasmContext>,
+    msg_ptr: WasmPtr<u8>,
+    msg_size: u32,
+    out_ptr: WasmPtr<u8>,
+) -> Result<u32, RuntimeError> {
     let (env_data, store) = env.data_and_store_mut();
-    let memory = env_data.memory().as_ref().expect("Wasm memory not initialized");
+    let memory = env_data
+        .memory()
+        .as_ref()
+        .expect("Wasm memory not initialized");
     let view = memory.view(&store);
     let slice = msg_ptr.slice(&view, msg_size)?;
     let mut src_bytes = vec![0u8; msg_size as usize];
@@ -24,9 +32,17 @@ pub fn sha224(mut env: FunctionEnvMut<WasmContext>, msg_ptr: WasmPtr<u8>, msg_si
     Ok(28)
 }
 
-pub fn sha256(mut env: FunctionEnvMut<WasmContext>, msg_ptr: WasmPtr<u8>, msg_size: u32, out_ptr: WasmPtr<u8>) -> Result<u32, RuntimeError> {
+pub fn sha256(
+    mut env: FunctionEnvMut<WasmContext>,
+    msg_ptr: WasmPtr<u8>,
+    msg_size: u32,
+    out_ptr: WasmPtr<u8>,
+) -> Result<u32, RuntimeError> {
     let (env_data, store) = env.data_and_store_mut();
-    let memory = env_data.memory().as_ref().expect("Wasm memory not initialized");
+    let memory = env_data
+        .memory()
+        .as_ref()
+        .expect("Wasm memory not initialized");
     let view = memory.view(&store);
     let slice = msg_ptr.slice(&view, msg_size)?;
     let mut src_bytes = vec![0u8; msg_size as usize];
@@ -39,9 +55,17 @@ pub fn sha256(mut env: FunctionEnvMut<WasmContext>, msg_ptr: WasmPtr<u8>, msg_si
     Ok(32)
 }
 
-pub fn sha512(mut env: FunctionEnvMut<WasmContext>, msg_ptr: WasmPtr<u8>, msg_size: u32, out_ptr: WasmPtr<u8>) -> Result<u32, RuntimeError> {
+pub fn sha512(
+    mut env: FunctionEnvMut<WasmContext>,
+    msg_ptr: WasmPtr<u8>,
+    msg_size: u32,
+    out_ptr: WasmPtr<u8>,
+) -> Result<u32, RuntimeError> {
     let (env_data, store) = env.data_and_store_mut();
-    let memory = env_data.memory().as_ref().expect("Wasm memory not initialized");
+    let memory = env_data
+        .memory()
+        .as_ref()
+        .expect("Wasm memory not initialized");
     let view = memory.view(&store);
     let slice = msg_ptr.slice(&view, msg_size)?;
     let mut src_bytes = vec![0u8; msg_size as usize];
