@@ -133,10 +133,11 @@ pub mod ffi {
         pub fn get_value(self: &KeyValueObject) -> &CxxSharedBlob;
 
         // Methods on database
-        pub fn flush(self: Pin<&mut Database>);
+        pub fn flush(self: Pin<&mut Database>) -> Result<()>;
         pub fn undo(self: Pin<&mut Database>);
-        pub fn commit(self: Pin<&mut Database>, revision: i64);
+        pub fn commit(self: Pin<&mut Database>, revision: i64) -> Result<()>;
         pub fn revision(self: &Database) -> i64;
+        pub fn set_revision(self: Pin<&mut Database>, revision: i64) -> Result<()>;
         pub fn add_indices(self: Pin<&mut Database>);
         pub fn create_undo_session(
             self: Pin<&mut Database>,

@@ -307,7 +307,6 @@ namespace chainbase {
          void commit( int64_t revision );
          void undo_all();
 
-
          void set_revision( uint64_t revision )
          {
              if ( _read_only_mode ) {
@@ -315,7 +314,6 @@ namespace chainbase {
              }
              for( auto i : _index_list ) i->set_revision( revision );
          }
-
 
          template<typename MultiIndexType>
          void add_index() {

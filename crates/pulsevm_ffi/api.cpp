@@ -204,7 +204,6 @@ namespace pulsevm { namespace chain {
                     return {};
                 };
                 
-                http_params.total_resources          = lookup_object("userres"_n, account_name);
                 http_params.self_delegated_bandwidth = lookup_object("delband"_n, account_name);
                 http_params.refund_request           = lookup_object("refunds"_n, account_name);
                 http_params.voter_info               = lookup_object("voters"_n, config::system_account_name);
@@ -214,15 +213,15 @@ namespace pulsevm { namespace chain {
                 abi_serializer abis(std::move(abi), yield());
                 
                 if (http_params.total_resources)
-                    result.total_resources = abis.binary_to_variant("user_resources", *http_params.total_resources, yield(), shorten_abi_errors);
+                    result.total_resources = abis.binary_to_variant("UserResources", *http_params.total_resources, yield(), shorten_abi_errors);
                 if (http_params.self_delegated_bandwidth)
-                    result.self_delegated_bandwidth = abis.binary_to_variant("delegated_bandwidth", *http_params.self_delegated_bandwidth, yield(), shorten_abi_errors);
+                    result.self_delegated_bandwidth = abis.binary_to_variant("DelegatedBandwidth", *http_params.self_delegated_bandwidth, yield(), shorten_abi_errors);
                 if (http_params.refund_request)
-                    result.refund_request = abis.binary_to_variant("refund_request", *http_params.refund_request, yield(), shorten_abi_errors);
+                    result.refund_request = abis.binary_to_variant("RefundRequest", *http_params.refund_request, yield(), shorten_abi_errors);
                 if (http_params.voter_info)
-                    result.voter_info = abis.binary_to_variant("voter_info", *http_params.voter_info, yield(), shorten_abi_errors);
+                    result.voter_info = abis.binary_to_variant("VoterInfo", *http_params.voter_info, yield(), shorten_abi_errors);
                 if (http_params.rex_info)
-                    result.rex_info = abis.binary_to_variant("rex_balance", *http_params.rex_info, yield(), shorten_abi_errors);
+                    result.rex_info = abis.binary_to_variant("RexBalance", *http_params.rex_info, yield(), shorten_abi_errors);
                 return result;
             }
             

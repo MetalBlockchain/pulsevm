@@ -43,11 +43,11 @@ impl StateHistoryServer {
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => {
-                    spdlog::info!("WS server: shutdown signal received");
+                    spdlog::info!("state history server: shutdown signal received");
                     break;
                 }
                 accept_res = listener.accept() => {
-                    spdlog::info!("WS server: new connection accepted");
+                    spdlog::info!("state history server: new connection accepted");
                     let (stream, peer): (tokio::net::TcpStream, SocketAddr) = accept_res?;
                     stream.set_nodelay(true).ok();
                     let controller = self.controller.clone();
@@ -63,23 +63,4 @@ impl StateHistoryServer {
         }
         Ok(())
     }
-}
-
-fn wrap_variant(input: &str, key: &str) -> String {
-    // input is like {"get_blocks_ack_request_v0":{"num_messages":1}}
-    // We wrap into {"<key>":{...}} which it already is, but we normalize by extracting that subobject.
-    let v: serde_json::Value = serde_json::from_str(input).unwrap_or_default();
-    let inner = v.get(key).cloned().unwrap_or(serde_json::json!({}));
-    serde_json::json!({ key: inner }).to_string()
-}
-
-#[derive(Deserialize)]
-struct GetBlocksAck {
-    #[serde(rename = "get_blocks_ack_request_v0")]
-    get_blocks_ack_request_v0: AckBody,
-}
-
-#[derive(Deserialize)]
-struct AckBody {
-    num_messages: u32,
 }

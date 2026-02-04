@@ -22,6 +22,10 @@ class database_wrapper : public chainbase::database {
 public:
     // Inherit constructors
     using chainbase::database::database;
+
+    void set_revision(int64_t revision) {
+        chainbase::database::set_revision(revision);
+    }
     
     // Add your non-template wrapper methods
     void add_indices() {

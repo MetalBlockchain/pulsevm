@@ -15,7 +15,7 @@ use pulsevm_core::{
 };
 use pulsevm_crypto::Bytes;
 use pulsevm_serialization::{Read, Write};
-use spdlog::{error, info};
+use spdlog::{debug, error, info};
 use tokio::{
     sync::{
         RwLock, mpsc,
@@ -262,19 +262,22 @@ impl Session {
 
             let id = controller.get_block_id(cp.block_num).await?;
 
-            if id.is_none() || id.unwrap() != cp.block_id {
-                req.start_block_num = std::cmp::min(req.start_block_num, cp.block_num);
-            }
-
-            if id.is_none() {
-                self.to_send_block_num = std::cmp::min(self.to_send_block_num, cp.block_num);
-                info!("block {} is not available", cp.block_num);
-            } else if id.unwrap() != cp.block_id {
-                self.to_send_block_num = std::cmp::min(self.to_send_block_num, cp.block_num);
-                info!(
-                    "the id for block {} in block request have_positions does not match the existing",
-                    cp.block_num
-                );
+            match id {
+                Some(block_id) => {
+                    if block_id != cp.block_id {
+                        req.start_block_num = std::cmp::min(req.start_block_num, cp.block_num);
+                        self.to_send_block_num = std::cmp::min(self.to_send_block_num, cp.block_num);
+                        debug!(
+                            "the id for block {} in block request have_positions does not match the existing",
+                            cp.block_num
+                        );
+                    }
+                }
+                None => {
+                    info!("block {} is not available", cp.block_num);
+                    req.start_block_num = std::cmp::min(req.start_block_num, cp.block_num);
+                    self.to_send_block_num = std::cmp::min(self.to_send_block_num, cp.block_num);
+                }
             }
         }
 

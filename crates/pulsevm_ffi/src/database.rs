@@ -23,11 +23,11 @@ pub struct Database {
 }
 
 impl Database {
-    pub fn new(path: &str) -> Result<Self, String> {
+    pub fn new(path: &str, size: u64) -> Result<Self, String> {
         let db = ffi::open_database(
             path,
             ffi::DatabaseOpenFlags::ReadWrite,
-            20 * 1024 * 1024 * 1024,
+            size,
         );
 
         if db.is_null() {
@@ -37,6 +37,33 @@ impl Database {
                 inner: Arc::new(RwLock::new(db)),
             })
         }
+    }
+
+    // Replace the inner database with null to call the destructors
+    pub fn close(&self) -> Result<(), ChainError> {
+        let mut db = self.inner.write()?;
+        *db = UniquePtr::<ffi::Database>::null();
+        Ok(())
+    }
+
+    pub fn commit(&mut self, revision: i64) -> Result<(), ChainError> {
+        self.inner
+            .write()?
+            .pin_mut()
+            .commit(revision)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
+    pub fn revision(&self) -> i64 {
+        self.inner.read().unwrap().revision()
+    }
+
+    pub fn set_revision(&mut self, revision: i64) -> Result<(), ChainError> {
+        self.inner
+            .write()?
+            .pin_mut()
+            .set_revision(revision)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 
     pub fn add_indices(&mut self) -> Result<(), ChainError> {
@@ -912,7 +939,7 @@ mod tests {
     fn test_database_creation() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().to_str().unwrap();
-        let mut db = Database::new(path).unwrap();
+        let mut db = Database::new(path, 1 * 1024 * 1024 * 1024).unwrap();
         let name = string_to_name("test").unwrap();
         db.add_indices();
     }

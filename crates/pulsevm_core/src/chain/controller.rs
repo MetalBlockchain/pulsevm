@@ -113,7 +113,8 @@ impl Controller {
         db_path: &str,
     ) -> Result<(), ChainError> {
         info!("initializing controller with DB path: {}", db_path);
-        self.db = Database::new(&db_path)
+        // TODO: Set database size from config
+        self.db = Database::new(&db_path, 1 * 1024 * 1024 * 1024)
             .map_err(|e| ChainError::InternalError(format!("failed to open database: {}", e)))?;
         self.db.add_indices()?;
         // Parse genesis bytes
@@ -139,21 +140,34 @@ impl Controller {
         // Set our last accepted block to the genesis block
         self.last_accepted_block = SignedBlock::new(
             Id::default(),
-            BlockTimestamp::now(),
+            genesis.get_initial_timestamp().into(),
             VecDeque::new(),
             Digest::default(),
         );
         self.preferred_id = self.last_accepted_block.id();
 
         // TODO: Check if we need to initialize the database
+        let revision = self.db.revision();
+        info!("database revision: {}", revision);
 
-        // Initialize the database with the genesis state
-        info!("initializing database with genesis state");
-        self.db.initialize_database(&genesis).map_err(|e| {
-            ChainError::GenesisError(format!("failed to initialize database: {}", e))
-        })?;
-        info!("database initialized successfully");
+        if revision <= 0 {
+            // Initialize the database with the genesis state
+            info!("initializing database with genesis state");
+            self.db.initialize_database(&genesis).map_err(|e| {
+                ChainError::GenesisError(format!("failed to initialize database: {}", e))
+            })?;
+            self.db.set_revision(self.last_accepted_block.block_num() as i64)?;
+            info!("database initialized successfully");
+        }
 
+        Ok(())
+    }
+
+    pub fn shutdown(&self) -> Result<(), ChainError> {
+        // Explicitly close the database
+        info!("shutting down controller and closing database");
+        self.db.close()?;
+        info!("database closed successfully");
         Ok(())
     }
 

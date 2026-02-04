@@ -250,6 +250,11 @@ impl Vm for VirtualMachine {
     async fn shutdown(&self, _request: Request<()>) -> Result<tonic::Response<()>, Status> {
         let ready_to_terminate = self.ready_to_terminate.clone();
         ready_to_terminate.store(true, std::sync::atomic::Ordering::Relaxed);
+        let controller = self.controller.clone();
+        let mut controller = controller.write().await;
+        controller.shutdown().map_err(
+            |e| Status::internal(format!("could not shutdown controller: {}", e)),
+        );
         Ok(Response::new(()))
     }
 
