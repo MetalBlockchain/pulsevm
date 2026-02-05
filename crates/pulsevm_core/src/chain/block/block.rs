@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 
 use pulsevm_crypto::{Digest, FixedBytes};
 use pulsevm_error::ChainError;
+use pulsevm_ffi::Database;
 use pulsevm_name_macro::name;
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 use pulsevm_serialization::Write;
@@ -10,6 +11,8 @@ use serde::{Serialize, ser::SerializeStruct};
 use crate::{
     chain::{Name, block::BlockTimestamp, id::Id, transaction::TransactionReceipt},
     crypto::Signature,
+    state_history::StateHistoryLog,
+    utils::pulse_assert,
 };
 
 #[derive(Debug, Default, Clone, Read, Write, NumBytes)]
@@ -57,12 +60,51 @@ impl BlockHeader {
         result.0[0..4].copy_from_slice(&bn_be);
         Ok(Id(FixedBytes(result.0)))
     }
+
+    pub fn validate(&self, db: &Database) -> Result<(), ChainError> {
+        // TODO: Allow some small time skew (e.g. 1 second) to account for clock differences between nodes
+        pulse_assert(
+            self.timestamp <= BlockTimestamp::now(),
+            ChainError::BlockError("block timestamp is in the future".into()),
+        )?;
+        pulse_assert(
+            db.is_account(self.producer.as_u64())?,
+            ChainError::BlockError("producer account does not exist".into()),
+        )?;
+        pulse_assert(
+            self.confirmed == 0,
+            ChainError::BlockError("confirmed count must be 0".into()),
+        )?;
+        // TODO: Validate previous block ID if we have the previous block available
+        // TODO: Validate transaction_mroot and action_mroot if we have the transactions available
+        pulse_assert(
+            self.schedule_version == 0,
+            ChainError::BlockError("schedule version must be 0".into()),
+        )?;
+        pulse_assert(
+            self.new_producers.is_none(),
+            ChainError::BlockError("new producers should be none".into()),
+        )?;
+        pulse_assert(
+            self.header_extensions.is_empty(),
+            ChainError::BlockError("header extensions not supported".into()),
+        )?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default, Clone, Read, Write, NumBytes)]
 pub struct SignedBlockHeader {
-    pub block: BlockHeader,
+    pub header: BlockHeader,
     pub signature: Signature,
+}
+
+impl SignedBlockHeader {
+    pub fn validate(&self, db: &Database) -> Result<(), ChainError> {
+        self.header.validate(db)?;
+        // TODO: validate signature if we have the producer's public key available
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default, Clone, Read, Write, NumBytes)]
@@ -81,7 +123,7 @@ impl SignedBlock {
     ) -> Self {
         SignedBlock {
             signed_block_header: SignedBlockHeader {
-                block: BlockHeader {
+                header: BlockHeader {
                     timestamp,
                     producer: Name::from(name!("pulse")), // Placeholder producer name
                     confirmed: 0,                         // Placeholder confirmed count
@@ -99,20 +141,35 @@ impl SignedBlock {
         }
     }
 
-    pub fn id(&self) -> Id {
-        self.signed_block_header.block.calculate_id().unwrap()
+    pub fn id(&self) -> Result<Id, ChainError> {
+        self.signed_block_header.header.calculate_id()
     }
 
     pub fn previous_id(&self) -> &Id {
-        &self.signed_block_header.block.previous
+        &self.signed_block_header.header.previous
     }
 
     pub fn block_num(&self) -> u32 {
-        self.signed_block_header.block.block_num()
+        self.signed_block_header.header.block_num()
     }
 
     pub fn timestamp(&self) -> &BlockTimestamp {
-        &self.signed_block_header.block.timestamp
+        &self.signed_block_header.header.timestamp
+    }
+
+    pub fn validate(&self, db: &Database) -> Result<(), ChainError> {
+        self.signed_block_header.validate(db)?;
+
+        pulse_assert(
+            self.transactions.len() > 0,
+            ChainError::BlockError("block has no transactions".into()),
+        )?;
+        pulse_assert(
+            self.block_extensions.is_empty(),
+            ChainError::BlockError("block extensions not supported".into()),
+        )?;
+
+        Ok(())
     }
 }
 
@@ -122,20 +179,20 @@ impl Serialize for SignedBlock {
         S: serde::Serializer,
     {
         let mut state = serializer.serialize_struct("Block", 8)?;
-        state.serialize_field("timestamp", &self.signed_block_header.block.timestamp)?;
-        state.serialize_field("producer", &self.signed_block_header.block.producer)?;
-        state.serialize_field("confirmed", &self.signed_block_header.block.confirmed)?;
-        state.serialize_field("previous", &self.signed_block_header.block.previous)?;
+        state.serialize_field("timestamp", &self.signed_block_header.header.timestamp)?;
+        state.serialize_field("producer", &self.signed_block_header.header.producer)?;
+        state.serialize_field("confirmed", &self.signed_block_header.header.confirmed)?;
+        state.serialize_field("previous", &self.signed_block_header.header.previous)?;
         state.serialize_field(
             "transaction_mroot",
-            &self.signed_block_header.block.transaction_mroot,
+            &self.signed_block_header.header.transaction_mroot,
         )?;
         state.serialize_field("transactions", &self.transactions)?;
         state.serialize_field(
             "id",
-            &self.signed_block_header.block.calculate_id().unwrap(),
+            &self.signed_block_header.header.calculate_id().unwrap(),
         )?;
-        state.serialize_field("block_num", &self.signed_block_header.block.block_num())?;
+        state.serialize_field("block_num", &self.signed_block_header.header.block_num())?;
         state.end()
     }
 }

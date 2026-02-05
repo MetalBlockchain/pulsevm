@@ -7,6 +7,8 @@ use wasmer::RuntimeError;
 pub enum ChainError {
     #[error("internal error: {0:?}")]
     InternalError(String),
+    #[error("block error: {0}")]
+    BlockError(String),
     #[error("genesis error: {0}")]
     GenesisError(String),
     #[error("parse error: {0}")]

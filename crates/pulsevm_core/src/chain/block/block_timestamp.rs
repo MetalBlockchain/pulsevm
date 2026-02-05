@@ -260,3 +260,9 @@ impl PartialEq for BlockTimestamp {
 }
 
 impl Eq for BlockTimestamp {}
+
+impl PartialOrd for BlockTimestamp {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.slot().partial_cmp(&other.slot())
+    }
+}

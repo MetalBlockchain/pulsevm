@@ -261,22 +261,24 @@ impl RpcServer for RpcService {
         let controller = self.controller.read().await;
         let head_block = controller.last_accepted_block();
         let db = controller.database();
+        let head_block_id = head_block.id()?;
+
         Ok(GetInfoResponse {
             server_version: "d133c641".to_owned(),
             server_time: BlockTimestamp::now(),
             chain_id: controller.chain_id().clone(),
             head_block_num: head_block.block_num(),
             last_irreversible_block_num: head_block.block_num(),
-            last_irreversible_block_id: head_block.id(),
-            head_block_id: head_block.id(),
+            last_irreversible_block_id: head_block_id,
+            head_block_id: head_block_id,
             head_block_time: head_block.timestamp().clone(),
-            head_block_producer: head_block.signed_block_header.block.producer,
+            head_block_producer: head_block.signed_block_header.header.producer,
             virtual_block_cpu_limit: db.get_virtual_block_cpu_limit()?,
             virtual_block_net_limit: db.get_virtual_block_net_limit()?,
             block_cpu_limit: db.get_block_cpu_limit()?,
             block_net_limit: db.get_block_net_limit()?,
             server_version_string: "v5.0.3".to_owned(),
-            fork_db_head_block_id: head_block.id(),
+            fork_db_head_block_id: head_block_id,
             fork_db_head_block_num: head_block.block_num(),
             server_full_version_string: "v5.0.3-d133c6413ce8ce2e96096a0513ec25b4a8dbe837"
                 .to_owned(), // Mimic EOS here
