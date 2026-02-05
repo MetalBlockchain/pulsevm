@@ -44,8 +44,11 @@ pub trait Rpc {
     async fn get_abi(&self, account_name: Name) -> Result<AbiDefinition, ErrorObjectOwned>;
 
     #[method(name = "pulsevm.getAccount")]
-    async fn get_account(&self, account_name: Name, expected_core_symbol: Option<String>)
-    -> Result<Value, ErrorObjectOwned>;
+    async fn get_account(
+        &self,
+        account_name: Name,
+        expected_core_symbol: Option<String>,
+    ) -> Result<Value, ErrorObjectOwned>;
 
     #[method(name = "pulsevm.getBlock")]
     async fn get_block(&self, block_num_or_id: String) -> Result<SignedBlock, ErrorObjectOwned>;
@@ -147,12 +150,16 @@ impl RpcServer for RpcService {
         Ok(abi)
     }
 
-    async fn get_account(&self, name: Name, expected_core_symbol: Option<String>) -> Result<Value, ErrorObjectOwned> {
+    async fn get_account(
+        &self,
+        name: Name,
+        expected_core_symbol: Option<String>,
+    ) -> Result<Value, ErrorObjectOwned> {
         let controller = self.controller.read().await;
         let db = controller.database();
         let head_block_time = controller.last_accepted_block().timestamp().to_time_point();
         let head_block_num = controller.last_accepted_block().block_num();
-        
+
         match expected_core_symbol {
             Some(symbol) => {
                 let account_info_json = db.get_account_info_with_core_symbol(
@@ -161,20 +168,22 @@ impl RpcServer for RpcService {
                     head_block_num,
                     &head_block_time,
                 )?;
-                let account_info: Value = serde_json::from_str(&account_info_json).map_err(|e| {
-                    ErrorObjectOwned::owned(500, "serialization_error", Some(format!("{}", e)))
-                })?;
+                let account_info: Value =
+                    serde_json::from_str(&account_info_json).map_err(|e| {
+                        ErrorObjectOwned::owned(500, "serialization_error", Some(format!("{}", e)))
+                    })?;
                 Ok(account_info)
-            },
+            }
             None => {
                 let account_info_json = db.get_account_info_without_core_symbol(
                     name.as_u64(),
                     head_block_num,
                     &head_block_time,
                 )?;
-                let account_info: Value = serde_json::from_str(&account_info_json).map_err(|e| {
-                    ErrorObjectOwned::owned(500, "serialization_error", Some(format!("{}", e)))
-                })?;
+                let account_info: Value =
+                    serde_json::from_str(&account_info_json).map_err(|e| {
+                        ErrorObjectOwned::owned(500, "serialization_error", Some(format!("{}", e)))
+                    })?;
                 Ok(account_info)
             }
         }
@@ -254,6 +263,7 @@ impl RpcServer for RpcService {
         let db = controller.database();
         Ok(GetInfoResponse {
             server_version: "d133c641".to_owned(),
+            server_time: BlockTimestamp::now(),
             chain_id: controller.chain_id().clone(),
             head_block_num: head_block.block_num(),
             last_irreversible_block_num: head_block.block_num(),

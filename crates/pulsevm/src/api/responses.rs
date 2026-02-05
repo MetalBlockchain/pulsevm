@@ -66,6 +66,7 @@ pub struct GetAccountResponse {
 #[derive(Serialize, Clone, Default)]
 pub struct GetInfoResponse {
     pub server_version: String,
+    pub server_time: BlockTimestamp,
     pub chain_id: Id,
     pub head_block_num: u32,
     pub last_irreversible_block_num: u32,
