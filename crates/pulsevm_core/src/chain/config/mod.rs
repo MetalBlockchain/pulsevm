@@ -1,3 +1,6 @@
+mod node_config;
+pub use node_config::NodeConfig;
+
 use crate::name::Name;
 use pulsevm_constants::PERCENT_100;
 use pulsevm_name_macro::name;

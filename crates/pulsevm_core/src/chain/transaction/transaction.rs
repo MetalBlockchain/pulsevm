@@ -8,11 +8,13 @@ use serde::{Serialize, ser::SerializeStruct};
 use sha2::Digest;
 
 use crate::{
+    block::{self, BlockTimestamp},
     chain::{
         id::Id,
         transaction::{SignedTransaction, TransactionHeader, signed_transaction::signing_digest},
     },
     crypto::PrivateKey,
+    utils::pulse_assert,
 };
 
 use super::action::Action;
@@ -71,6 +73,28 @@ impl Transaction {
         })?;
 
         signing_digest(chain_id, &trx_bytes, cfd_bytes)
+    }
+
+    pub fn validate(&self, block_timestamp: &BlockTimestamp) -> Result<(), ChainError> {
+        pulse_assert(
+            self.header.delay_sec().0 == 0,
+            ChainError::TransactionError("delay larger than 0 not supported".into()),
+        )?;
+        pulse_assert(
+            self.header.expiration().sec_since_epoch()
+                >= block_timestamp.to_time_point().sec_since_epoch(),
+            ChainError::TransactionError(format!(
+                "transaction expired at {}",
+                self.header.expiration.to_eos_string()
+            )),
+        )?;
+        pulse_assert(
+            self.transaction_extensions.len() == 0,
+            ChainError::TransactionError(format!(
+                "transaction extensions are not supported right now"
+            )),
+        )?;
+        return Ok(());
     }
 }
 

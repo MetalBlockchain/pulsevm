@@ -33,10 +33,21 @@ async fn main() {
     let private_key =
         PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez").unwrap();
     let mut controller = Controller::new();
+    let config_bytes = json!({
+        "producer_name": "pulse",
+        "producer_key": private_key.to_string(),
+    })
+    .to_string()
+    .into_bytes();
     let genesis_bytes = generate_genesis(&private_key);
     let temp_path = get_temp_dir().to_str().unwrap().to_string();
     controller
-        .initialize(&chain_id, &genesis_bytes.to_vec(), temp_path.as_str())
+        .initialize(
+            &chain_id,
+            &config_bytes,
+            &genesis_bytes.to_vec(),
+            temp_path.as_str(),
+        )
         .unwrap();
     let pending_block_timestamp = controller.last_accepted_block().timestamp().clone();
     let block_status = BlockStatus::Building;

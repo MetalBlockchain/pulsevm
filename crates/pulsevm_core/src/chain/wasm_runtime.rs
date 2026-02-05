@@ -142,7 +142,6 @@ impl WasmRuntime {
         // Different scope so session is released before running the wasm code.
         {
             if !inner.code_cache.contains(&id) {
-                println!("Wasm module not found in cache, loading from db: {}", id);
                 let code_object = db.get_code_object_by_hash(code_hash, 0, 0)?;
                 let code_object = unsafe { &*code_object };
                 // Create a temporary store just for module compilation

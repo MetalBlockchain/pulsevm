@@ -16,3 +16,6 @@ impl fmt::Display for CxxPrivateKey {
         write!(f, "{}", s)
     }
 }
+
+unsafe impl Send for CxxPrivateKey {}
+unsafe impl Sync for CxxPrivateKey {}

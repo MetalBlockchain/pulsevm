@@ -24,11 +24,7 @@ pub struct Database {
 
 impl Database {
     pub fn new(path: &str, size: u64) -> Result<Self, String> {
-        let db = ffi::open_database(
-            path,
-            ffi::DatabaseOpenFlags::ReadWrite,
-            size,
-        );
+        let db = ffi::open_database(path, ffi::DatabaseOpenFlags::ReadWrite, size);
 
         if db.is_null() {
             Err("Failed to open database".to_string())

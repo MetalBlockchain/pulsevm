@@ -321,12 +321,12 @@ namespace pulsevm { namespace chain {
             show_payer,
         };
         auto deadline = fc::time_point::now().safe_add( fc::microseconds(30 * 1000 * 1000) ); // 30 seconds from now
-        auto result = get_table_rows_internal(db, params, deadline)();
+        auto result = get_table_rows_internal(db, params, deadline);
         auto json_result = fc::json::to_pretty_string( result );
         return rust::String( json_result.c_str() );
     }
 
-    get_table_rows_return_t get_table_rows_internal( const database_wrapper& db, const get_table_rows_params& p, const fc::time_point& deadline ) {
+    get_table_rows_result get_table_rows_internal( const database_wrapper& db, const get_table_rows_params& p, const fc::time_point& deadline ) {
         abi_def abi = get_abi( db, p.code.to_uint64_t() );
         bool primary = false;
         auto table_with_index = get_table_index_name( p, primary );

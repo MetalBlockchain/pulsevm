@@ -116,8 +116,6 @@ namespace pulsevm { namespace chain {
       string              next_key; ///< fill lower_bound with this value to fetch more rows
    };
 
-   using get_table_rows_return_t = std::function<chain::t_or_exception<get_table_rows_result>()>;
-
    static void copy_inline_row(const key_value_object& obj, vector<char>& data) {
       data.resize( obj.value.size() );
       memcpy( data.data(), obj.value.data(), obj.value.size() );
@@ -182,9 +180,9 @@ namespace pulsevm { namespace chain {
       bool show_payer
    );
 
-   get_table_rows_return_t get_table_rows_internal( const database_wrapper& db, const get_table_rows_params& p, const fc::time_point& deadline );
+   get_table_rows_result get_table_rows_internal( const database_wrapper& db, const get_table_rows_params& p, const fc::time_point& deadline );
    template <typename IndexType>
-   get_table_rows_return_t get_table_rows_ex( const database_wrapper& db, const get_table_rows_params& p, abi_def&& abi, const fc::time_point& deadline ) {
+   get_table_rows_result get_table_rows_ex( const database_wrapper& db, const get_table_rows_params& p, abi_def&& abi, const fc::time_point& deadline ) {
         fc::time_point params_deadline = p.time_limit_ms ? std::min(fc::time_point::now().safe_add(fc::milliseconds(p.time_limit_ms)), deadline) : deadline;
 
         struct http_params_t {
@@ -227,9 +225,7 @@ namespace pulsevm { namespace chain {
             }
 
             if( upper_bound_lookup_tuple < lower_bound_lookup_tuple  )
-               return []() ->  chain::t_or_exception<get_table_rows_result> {
-                  return get_table_rows_result();
-               };
+               return get_table_rows_result();
 
             auto walk_table_row_range = [&]( auto itr, auto end_itr ) {
                vector<char> data;
@@ -257,41 +253,36 @@ namespace pulsevm { namespace chain {
             }
         }
         
-        // not enforcing the deadline for that second processing part (the serialization), as it is not taking place
-        // on the main thread, but in the http thread pool.
-        return [p = std::move(http_params), abi=std::move(abi), abi_serializer_max_time=abi_serializer_max_time]() mutable ->
-            chain::t_or_exception<get_table_rows_result> {
-            get_table_rows_result result;
-            abi_serializer abis;
-            abis.set_abi(std::move(abi), abi_serializer::create_yield_function(abi_serializer_max_time));
-            auto table_type = abis.get_table_type(p.table);
-            
-            for (auto& row : p.rows) {
-                fc::variant data_var;
-                if( p.json ) {
-                data_var = abis.binary_to_variant(table_type, row.first,
-                                                    abi_serializer::create_yield_function(abi_serializer_max_time),
-                                                    p.shorten_abi_errors );
-                } else {
-                data_var = fc::variant(row.first);
-                }
+         get_table_rows_result result;
+         abi_serializer abis;
+         abis.set_abi(std::move(abi), abi_serializer::create_yield_function(abi_serializer_max_time));
+         auto table_type = abis.get_table_type(http_params.table);
+         
+         for (auto& row : http_params.rows) {
+               fc::variant data_var;
+               if( http_params.json ) {
+               data_var = abis.binary_to_variant(table_type, row.first,
+                                                   abi_serializer::create_yield_function(abi_serializer_max_time),
+                                                   http_params.shorten_abi_errors );
+               } else {
+               data_var = fc::variant(row.first);
+               }
 
-                if (p.show_payer) {
-                result.rows.emplace_back(fc::mutable_variant_object("data", std::move(data_var))("payer", row.second));
-                } else {
-                result.rows.emplace_back(std::move(data_var));
-                }            
-            }
-            result.more = p.more;
-            result.next_key = p.next_key;
-            return result;
-        };
+               if (http_params.show_payer) {
+               result.rows.emplace_back(fc::mutable_variant_object("data", std::move(data_var))("payer", row.second));
+               } else {
+               result.rows.emplace_back(std::move(data_var));
+               }            
+         }
+         result.more = http_params.more;
+         result.next_key = http_params.next_key;
+         return result;
    }
 
    uint64_t get_table_index_name(const get_table_rows_params& p, bool& primary);
 
    template <typename IndexType, typename SecKeyType, typename ConvFn>
-   get_table_rows_return_t
+   get_table_rows_result
    get_table_rows_by_seckey( const database_wrapper& db, const get_table_rows_params& p, abi_def&& abi, const fc::time_point& deadline, ConvFn conv ) {
 
       fc::time_point params_deadline = p.time_limit_ms ? std::min(fc::time_point::now().safe_add(fc::milliseconds(p.time_limit_ms)), deadline) : deadline;
@@ -353,9 +344,7 @@ namespace pulsevm { namespace chain {
          }
 
          if( upper_bound_lookup_tuple < lower_bound_lookup_tuple )
-            return []() ->  chain::t_or_exception<get_table_rows_result> {
-               return get_table_rows_result();
-            };
+            return get_table_rows_result();
 
          auto walk_table_row_range = [&]( auto itr, auto end_itr ) {
             vector<char> data;
@@ -385,35 +374,30 @@ namespace pulsevm { namespace chain {
          }
       }
 
-      // not enforcing the deadline for that second processing part (the serialization), as it is not taking place
-      // on the main thread, but in the http thread pool.
-      return [p = std::move(http_params), abi=std::move(abi), abi_serializer_max_time=abi_serializer_max_time]() mutable ->
-         chain::t_or_exception<get_table_rows_result> {
-         get_table_rows_result result;
-         abi_serializer abis;
-         abis.set_abi(std::move(abi), abi_serializer::create_yield_function(abi_serializer_max_time));
-         auto table_type = abis.get_table_type(p.table);
-         
-         for (auto& row : p.rows) {
-            fc::variant data_var;
-            if( p.json ) {
-               data_var = abis.binary_to_variant(table_type, row.first,
-                                                 abi_serializer::create_yield_function(abi_serializer_max_time),
-                                                 p.shorten_abi_errors );
-            } else {
-               data_var = fc::variant(row.first);
-            }
-
-            if (p.show_payer) {
-               result.rows.emplace_back(fc::mutable_variant_object("data", std::move(data_var))("payer", row.second));
-            } else {
-               result.rows.emplace_back(std::move(data_var));
-            }            
+      get_table_rows_result result;
+      abi_serializer abis;
+      abis.set_abi(std::move(abi), abi_serializer::create_yield_function(abi_serializer_max_time));
+      auto table_type = abis.get_table_type(http_params.table);
+      
+      for (auto& row : http_params.rows) {
+         fc::variant data_var;
+         if( http_params.json ) {
+            data_var = abis.binary_to_variant(table_type, row.first,
+                                                abi_serializer::create_yield_function(abi_serializer_max_time),
+                                                http_params.shorten_abi_errors );
+         } else {
+            data_var = fc::variant(row.first);
          }
-         result.more = p.more;
-         result.next_key = p.next_key;
-         return result;
-      };
+
+         if (http_params.show_payer) {
+            result.rows.emplace_back(fc::mutable_variant_object("data", std::move(data_var))("payer", row.second));
+         } else {
+            result.rows.emplace_back(std::move(data_var));
+         }            
+      }
+      result.more = http_params.more;
+      result.next_key = http_params.next_key;
+      return result;
    }
 } }
 

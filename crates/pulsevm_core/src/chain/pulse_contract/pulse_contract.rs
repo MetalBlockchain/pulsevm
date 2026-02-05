@@ -206,8 +206,6 @@ pub fn setabi(
         .map_err(|e| ChainError::TransactionError(format!("failed to deserialize data: {}", e)))?;
     context.require_authorization(&act.account, None)?;
 
-    println!("Setting ABI for account: {}", act.abi);
-
     // Try and parse the ABI definition
     let _: AbiDefinition = AbiDefinition::read(act.abi.as_slice(), &mut 0).map_err(|e| {
         ChainError::TransactionError(format!("failed to deserialize ABI definition: {}", e))

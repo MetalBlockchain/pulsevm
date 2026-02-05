@@ -162,7 +162,6 @@ impl Session {
                                                     next = next.saturating_add(1);
                                                 }
                                                 Err(e) => {
-                                                    error!("pack failed for block {next}: {e}");
                                                     // give window slot back
                                                     budget.fetch_add(1, Ordering::SeqCst);
                                                     tokio::time::sleep(Duration::from_millis(5))
@@ -174,7 +173,6 @@ impl Session {
                                             // Likely "block not ready yet" — backoff and retry
                                             // return slot because nothing was sent
                                             budget.fetch_add(1, Ordering::SeqCst);
-                                            //error!("build response for block {next} failed: {e}");
                                             tokio::time::sleep(Duration::from_millis(500)).await;
                                         }
                                     }
@@ -231,16 +229,17 @@ impl Session {
         let controller = self.controller.read().await;
         let chain_id = controller.chain_id();
         let head_block = controller.last_accepted_block();
+        let head_block_id = head_block.id()?;
 
         Ok(GetStatusResult {
             variant: 0,
             head: BlockPosition {
                 block_num: head_block.block_num(),
-                block_id: head_block.id(),
+                block_id: head_block_id,
             },
             last_irreversible: BlockPosition {
                 block_num: head_block.block_num(),
-                block_id: head_block.id(),
+                block_id: head_block_id,
             },
             trace_begin_block: 1,
             trace_end_block: head_block.block_num(),
@@ -266,7 +265,8 @@ impl Session {
                 Some(block_id) => {
                     if block_id != cp.block_id {
                         req.start_block_num = std::cmp::min(req.start_block_num, cp.block_num);
-                        self.to_send_block_num = std::cmp::min(self.to_send_block_num, cp.block_num);
+                        self.to_send_block_num =
+                            std::cmp::min(self.to_send_block_num, cp.block_num);
                         debug!(
                             "the id for block {} in block request have_positions does not match the existing",
                             cp.block_num
@@ -302,7 +302,7 @@ async fn make_block_response_for(
         return Err(anyhow!("block {block_num} not yet available"));
     }
 
-    // Get the requested block
+    let head_block_id = head.id()?;
     let this_block_id = controller.get_block_id(block_num).await?.ok_or(anyhow!(
         "block {block_num} not found, may not be available yet",
     ))?;
@@ -347,17 +347,15 @@ async fn make_block_response_for(
         }
     }
 
-    println!("sending block {block_num}");
-
     Ok(GetBlocksResponseV0 {
         variant: 1,
         head: BlockPosition {
             block_num: head.block_num(),
-            block_id: head.id(),
+            block_id: head_block_id,
         },
         last_irreversible: BlockPosition {
             block_num: head.block_num(),
-            block_id: head.id(),
+            block_id: head_block_id,
         },
         this_block: Some(BlockPosition {
             block_num,

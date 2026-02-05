@@ -21,7 +21,7 @@ use pulsevm_grpc::{
     },
 };
 use pulsevm_serialization::{Read, Write};
-use spdlog::{info, warn};
+use spdlog::{debug, info, warn};
 use std::{
     net::{SocketAddr, TcpListener},
     sync::{Arc, atomic::AtomicBool},
@@ -183,6 +183,7 @@ impl Vm for VirtualMachine {
         &self,
         request: Request<vm::InitializeRequest>,
     ) -> Result<tonic::Response<vm::InitializeResponse>, Status> {
+        let config_bytes = request.get_ref().config_bytes.clone();
         let genesis_bytes = request.get_ref().genesis_bytes.clone();
         let db_path = request.get_ref().chain_data_dir.clone();
         let server_addr = request.get_ref().server_addr.clone();
@@ -197,7 +198,7 @@ impl Vm for VirtualMachine {
 
         // Initialize the controller with the genesis bytes
         controller
-            .initialize(&chain_id, &genesis_bytes, db_path.as_str())
+            .initialize(&chain_id, &config_bytes, &genesis_bytes, db_path.as_str())
             .map_err(|e| Status::internal(format!("could not initialize controller: {}", e)))?;
 
         let network_manager = Arc::clone(&self.network_manager);
@@ -208,8 +209,12 @@ impl Vm for VirtualMachine {
         let mut block_timer = block_timer.write().await;
         block_timer.start(server_addr.clone()).await;
 
+        let last_accepted_block_id = controller.last_accepted_block().id().map_err(|e| {
+            Status::internal(format!("could not get last accepted block id: {}", e))
+        })?;
+
         return Ok(Response::new(vm::InitializeResponse {
-            last_accepted_id: controller.last_accepted_block().id().as_bytes().to_vec(),
+            last_accepted_id: last_accepted_block_id.into(),
             last_accepted_parent_id: controller
                 .last_accepted_block()
                 .previous_id()
@@ -230,9 +235,12 @@ impl Vm for VirtualMachine {
     ) -> Result<tonic::Response<vm::SetStateResponse>, Status> {
         let controller = self.controller.clone();
         let controller = controller.read().await;
+        let last_accepted_block_id = controller.last_accepted_block().id().map_err(|e| {
+            Status::internal(format!("could not get last accepted block id: {}", e))
+        })?;
 
         return Ok(Response::new(vm::SetStateResponse {
-            last_accepted_id: controller.last_accepted_block().id().as_bytes().to_vec(),
+            last_accepted_id: last_accepted_block_id.into(),
             last_accepted_parent_id: controller
                 .last_accepted_block()
                 .previous_id()
@@ -252,9 +260,9 @@ impl Vm for VirtualMachine {
         ready_to_terminate.store(true, std::sync::atomic::Ordering::Relaxed);
         let controller = self.controller.clone();
         let mut controller = controller.write().await;
-        controller.shutdown().map_err(
-            |e| Status::internal(format!("could not shutdown controller: {}", e)),
-        );
+        controller
+            .shutdown()
+            .map_err(|e| Status::internal(format!("could not shutdown controller: {}", e)));
         Ok(Response::new(()))
     }
 
@@ -306,7 +314,6 @@ impl Vm for VirtualMachine {
         &self,
         _request: Request<vm::BuildBlockRequest>,
     ) -> Result<tonic::Response<vm::BuildBlockResponse>, Status> {
-        info!("build_block called");
         let controller = self.controller.clone();
         let mut controller = controller.write().await;
         let mempool = self.mempool.clone();
@@ -315,9 +322,12 @@ impl Vm for VirtualMachine {
             .build_block(&mut mempool)
             .await
             .map_err(|e| Status::internal(format!("could not build block: {}", e)))?;
-        info!("built block");
+        let block_id = block
+            .id()
+            .map_err(|e| Status::internal(format!("could not get block id: {}", e)))?;
+        debug!("built block: {}", block_id);
         Ok(Response::new(vm::BuildBlockResponse {
-            id: block.id().into(),
+            id: block_id.into(),
             parent_id: block.previous_id().as_bytes().to_vec(),
             height: block.block_num() as u64,
             bytes: block
@@ -336,8 +346,11 @@ impl Vm for VirtualMachine {
         let block = controller
             .parse_block(&request.get_ref().bytes)
             .map_err(|_| Status::internal("could not parse block"))?;
+        let block_id = block
+            .id()
+            .map_err(|e| Status::internal(format!("could not get block id: {}", e)))?;
         Ok(Response::new(vm::ParseBlockResponse {
-            id: block.id().into(),
+            id: block_id.into(),
             parent_id: block.previous_id().as_bytes().to_vec(),
             height: block.block_num() as u64,
             timestamp: Some(block.timestamp().into()),
@@ -391,28 +404,31 @@ impl Vm for VirtualMachine {
     ) -> Result<tonic::Response<vm::BlockVerifyResponse>, Status> {
         let controller = self.controller.clone();
         let mut controller = controller.write().await;
-        let block = controller.parse_block(&request.get_ref().bytes);
+        let block = match controller.parse_block(&request.get_ref().bytes) {
+            Ok(block) => block,
+            Err(e) => {
+                warn!("failed parsing block for verification: {}", e);
 
-        if block.is_err() {
-            warn!("block_verify: failed to parse block: {:?}", block);
-            return Err(Status::internal("could not parse block"));
-        }
-
-        let block = block.unwrap();
-        println!("block_verify: verifying block {}", block.id());
+                return Err(Status::internal("could not parse block"));
+            }
+        };
 
         // Verify the block
-        let res = controller.verify_block(&block, self.mempool.clone()).await;
+        match controller.verify_block(&block, self.mempool.clone()).await {
+            Ok(_) => {
+                debug!(
+                    "block verified successfully: {}",
+                    block.id().map_err(|_| Status::internal(
+                        "failed getting block id during verification"
+                    ))?
+                );
+            }
+            Err(e) => {
+                warn!("could not verify block: {:?}", e);
 
-        if res.is_err() {
-            warn!("block_verify: failed to verify block: {:?}", res);
-            return Err(Status::internal(format!(
-                "could not verify block: {}",
-                res.unwrap_err()
-            )));
+                return Err(Status::internal(format!("could not verify block: {}", e)));
+            }
         }
-
-        info!("block verified successfully: {}", block.id());
 
         Ok(Response::new(vm::BlockVerifyResponse {
             timestamp: Some(block.timestamp().into()),
@@ -550,7 +566,7 @@ impl Vm for VirtualMachine {
         &self,
         request: Request<vm::GetAncestorsRequest>,
     ) -> Result<tonic::Response<vm::GetAncestorsResponse>, Status> {
-        info!("received request: {:?}", request);
+        debug!("received request: {:?}", request);
         Ok(Response::new(vm::GetAncestorsResponse::default()))
     }
 
@@ -558,23 +574,26 @@ impl Vm for VirtualMachine {
         &self,
         request: Request<vm::BatchedParseBlockRequest>,
     ) -> Result<tonic::Response<vm::BatchedParseBlockResponse>, Status> {
-        info!("batched_parse_block: {:?}", request);
         let controller = self.controller.clone();
         let controller = controller.read().await;
-        info!("batched_parse_block: got controller");
         let mut parsed_blocks: Vec<ParseBlockResponse> = Vec::new();
+
         for block in request.get_ref().request.iter() {
             let block = controller
                 .parse_block(&block)
                 .map_err(|_| Status::internal("could not parse block"))?;
+            let block_id = block
+                .id()
+                .map_err(|e| Status::internal(format!("could not get block id: {}", e)))?;
             parsed_blocks.push(ParseBlockResponse {
-                id: block.id().into(),
+                id: block_id.into(),
                 parent_id: block.previous_id().as_bytes().to_vec(),
                 height: block.block_num() as u64,
                 timestamp: Some(block.timestamp().into()),
                 verify_with_context: false,
             });
         }
+
         Ok(Response::new(vm::BatchedParseBlockResponse {
             response: parsed_blocks,
         }))
@@ -586,21 +605,33 @@ impl Vm for VirtualMachine {
     ) -> Result<tonic::Response<vm::GetBlockIdAtHeightResponse>, Status> {
         let controller = self.controller.clone();
         let controller = controller.read().await;
-        let block = controller
-            .get_block_by_height(request.get_ref().height as u32)
-            .map_err(|_| Status::internal("could not get block by height"))?;
 
-        if block.is_none() {
-            return Ok(Response::new(vm::GetBlockIdAtHeightResponse {
-                blk_id: vec![].into(),
-                err: vm::Error::NotFound as i32,
-            }));
+        match controller.get_block_by_height(request.get_ref().height as u32) {
+            Ok(Some(block)) => {
+                let block_id = block
+                    .id()
+                    .map_err(|e| Status::internal(format!("could not get block id: {}", e)))?;
+
+                return Ok(Response::new(vm::GetBlockIdAtHeightResponse {
+                    blk_id: block_id.into(),
+                    err: 0,
+                }));
+            }
+            Ok(None) => {
+                return Ok(Response::new(vm::GetBlockIdAtHeightResponse {
+                    blk_id: vec![].into(),
+                    err: vm::Error::NotFound as i32,
+                }));
+            }
+            Err(e) => {
+                warn!(
+                    "could not get block at height {}: {}",
+                    request.get_ref().height,
+                    e
+                );
+                return Err(Status::internal("could not get block at height"));
+            }
         }
-
-        Ok(Response::new(vm::GetBlockIdAtHeightResponse {
-            blk_id: block.unwrap().id().as_bytes().to_vec(),
-            err: 0,
-        }))
     }
 
     async fn state_sync_enabled(

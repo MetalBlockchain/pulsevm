@@ -16,7 +16,7 @@ const EOS_FMT_NOZ: &[time::format_description::FormatItem<'_>] =
 const EOS_FMT_Z: &[time::format_description::FormatItem<'_>] =
     format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]Z");
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Read, Write, NumBytes, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Read, Write, NumBytes, Default, PartialOrd, Ord)]
 pub struct TimePointSec {
     utc_seconds: u32,
 }
@@ -42,7 +42,7 @@ impl TimePointSec {
     }
 
     #[inline]
-    pub const fn sec_since_epoch(self) -> u32 {
+    pub const fn sec_since_epoch(&self) -> u32 {
         self.utc_seconds
     }
 
@@ -83,7 +83,7 @@ impl From<TimePoint> for TimePointSec {
     #[inline]
     fn from(t: TimePoint) -> Self {
         // Truncate microseconds to whole seconds
-        let secs = (t.elapsed.count() / 1_000_000) as i64;
+        let secs = (t.time_since_epoch().count() / 1_000_000) as i64;
         Self {
             utc_seconds: secs as u32,
         } // C++ semantics: wrap on cast if negative/large

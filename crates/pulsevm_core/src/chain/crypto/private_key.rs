@@ -3,6 +3,7 @@ use std::{fmt, str::FromStr};
 use cxx::SharedPtr;
 use pulsevm_error::ChainError;
 use pulsevm_ffi::{CxxPrivateKey, sign_digest_with_private_key};
+use serde::Deserialize;
 
 use crate::{
     crypto::{PublicKey, Signature},
@@ -45,5 +46,15 @@ impl FromStr for PrivateKey {
 impl fmt::Display for PrivateKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.inner.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for PrivateKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        PrivateKey::from_str(&s).map_err(serde::de::Error::custom)
     }
 }

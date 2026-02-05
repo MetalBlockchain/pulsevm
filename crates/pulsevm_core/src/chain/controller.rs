@@ -29,6 +29,7 @@ use crate::{
         utils::make_ratio,
         wasm_runtime::WasmRuntime,
     },
+    config::NodeConfig,
     transaction::Action,
 };
 
@@ -72,6 +73,7 @@ pub struct Controller {
     block_log: Option<StateHistoryLog>,
     trace_log: Option<StateHistoryLog>,
     chain_state_log: Option<StateHistoryLog>,
+    node_config: Option<NodeConfig>,
 }
 
 #[derive(Debug)]
@@ -91,7 +93,8 @@ impl Controller {
     pub fn new() -> Self {
         // Create a temporary database
         let wasm_runtime = WasmRuntime::new().unwrap();
-        let controller = Controller {
+
+        Controller {
             wasm_runtime,
             last_accepted_block: SignedBlock::default(),
             preferred_id: Id::default(),
@@ -101,14 +104,14 @@ impl Controller {
             block_log: None,
             trace_log: None,
             chain_state_log: None,
-        };
-
-        controller
+            node_config: None,
+        }
     }
 
     pub fn initialize(
         &mut self,
         chain_id: &Id,
+        config_bytes: &Vec<u8>,
         genesis_bytes: &Vec<u8>,
         db_path: &str,
     ) -> Result<(), ChainError> {
@@ -117,6 +120,13 @@ impl Controller {
         self.db = Database::new(&db_path, 1 * 1024 * 1024 * 1024)
             .map_err(|e| ChainError::InternalError(format!("failed to open database: {}", e)))?;
         self.db.add_indices()?;
+        // Parse config bytes
+        let config_json = std::str::from_utf8(config_bytes).map_err(|e| {
+            ChainError::ParseError(format!("failed to parse config bytes as UTF-8: {}", e))
+        })?;
+        self.node_config = Some(serde_json::from_str(config_json).map_err(|e| {
+            ChainError::ParseError(format!("failed to parse node config JSON: {}", e))
+        })?);
         // Parse genesis bytes
         let genesis_json = std::str::from_utf8(genesis_bytes).map_err(|e| {
             ChainError::ParseError(format!("failed to parse genesis bytes as UTF-8: {}", e))
@@ -144,7 +154,7 @@ impl Controller {
             VecDeque::new(),
             Digest::default(),
         );
-        self.preferred_id = self.last_accepted_block.id();
+        self.preferred_id = self.last_accepted_block.id()?;
 
         // TODO: Check if we need to initialize the database
         let revision = self.db.revision();
@@ -156,8 +166,35 @@ impl Controller {
             self.db.initialize_database(&genesis).map_err(|e| {
                 ChainError::GenesisError(format!("failed to initialize database: {}", e))
             })?;
-            self.db.set_revision(self.last_accepted_block.block_num() as i64)?;
+            self.db
+                .set_revision(self.last_accepted_block.block_num() as i64)?;
             info!("database initialized successfully");
+        }
+
+        let block_log_range = self.block_log.as_ref().unwrap().range();
+
+        match block_log_range {
+            None => {
+                self.block_log
+                    .as_ref()
+                    .unwrap()
+                    .append(
+                        self.last_accepted_block.id()?,
+                        &self.last_accepted_block.pack().map_err(|e| {
+                            ChainError::GenesisError(format!(
+                                "failed to pack genesis block for block log: {}",
+                                e
+                            ))
+                        })?,
+                    )
+                    .map_err(|e| {
+                        ChainError::GenesisError(format!(
+                            "failed to append genesis block to block log: {}",
+                            e
+                        ))
+                    })?;
+            }
+            Some((start, end)) => info!("block log contains blocks from {} to {}", start, end),
         }
 
         Ok(())
@@ -229,7 +266,7 @@ impl Controller {
 
         // We built this block so no need to verify it again
         self.verified_blocks.insert(
-            block.signed_block_header.block.calculate_id().unwrap(),
+            block.signed_block_header.header.calculate_id()?,
             block.clone(),
         );
 
@@ -246,18 +283,19 @@ impl Controller {
         block: &SignedBlock,
         mempool: Arc<AsyncRwLock<Mempool>>,
     ) -> Result<(), ChainError> {
-        println!("verifying block {}", block.block_num());
-        if self.verified_blocks.contains_key(&block.id()) {
+        if self.verified_blocks.contains_key(&block.id()?) {
             return Ok(());
         }
 
         // Verify the block
+        block.validate(&self.db)?;
+
         let mut root_session = self.db.create_undo_session(true)?;
         let mut mempool = mempool.write().await;
         let block_status = BlockStatus::Verifying;
         self.execute_block(block, &block_status, &mut mempool)
             .await?;
-        self.verified_blocks.insert(block.id(), block.clone());
+        self.verified_blocks.insert(block.id()?, block.clone());
 
         root_session
             .pin_mut()
@@ -294,18 +332,25 @@ impl Controller {
                 block_id, e
             ))
         })?;
+        let packed_block = block.pack().map_err(|e| {
+            ChainError::TransactionError(format!("failed to pack block {}: {}", block_id, e))
+        })?;
+        self.block_log
+            .as_ref()
+            .map(|log| log.append(block_id.clone(), &packed_block));
         self.trace_log
             .as_ref()
             .map(|log| log.append(block_id.clone(), packed_transaction_traces.as_slice()));
         self.chain_state_log
             .as_ref()
-            .map(|log| log.append(block_id.clone(), block.id().as_bytes()));
+            .map(|log| log.append(block_id.clone(), block_id.clone().as_bytes()));
         root_session
             .pin_mut()
             .push()
             .map_err(|e| ChainError::TransactionError(format!("failed to commit block: {}", e)))?;
         self.verified_blocks.remove(block_id);
-        self.last_accepted_block = block;
+        self.last_accepted_block = block.clone();
+        self.db.commit(block.block_num() as i64)?;
 
         Ok(())
     }
@@ -316,7 +361,6 @@ impl Controller {
         block_status: &BlockStatus,
         mempool: &mut Mempool,
     ) -> Result<Vec<TransactionTrace>, ChainError> {
-        println!("executing block {}", block.block_num());
         // Make sure we don't have the block already
         {
             let existing_block = self.block_log()?.read_block(block.block_num());
@@ -332,7 +376,7 @@ impl Controller {
             // Verify the transaction
             let result = self.execute_transaction(
                 receipt.trx(),
-                &block.signed_block_header.block.timestamp,
+                &block.signed_block_header.header.timestamp,
                 block_status,
             )?;
 
@@ -398,6 +442,12 @@ impl Controller {
         block_status: &BlockStatus,
     ) -> Result<TransactionResult, ChainError> {
         let signed_transaction = packed_transaction.get_signed_transaction();
+
+        // Verify basic transaction validity
+        signed_transaction
+            .transaction()
+            .validate(pending_block_timestamp)?;
+
         let mut db = self.db.clone();
 
         {
@@ -453,7 +503,10 @@ impl Controller {
     pub fn get_block_id_for_num(&self, height: u32) -> Result<Option<Id>, ChainError> {
         let block = self.get_block_by_height(height)?;
 
-        Ok(block.map(|b| b.id()))
+        match block {
+            None => Ok(None),
+            Some(block) => Ok(Some(block.id()?)),
+        }
     }
 
     pub fn get_block(&self, id: Id) -> Result<Option<SignedBlock>, ChainError> {
