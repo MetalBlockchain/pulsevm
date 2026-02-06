@@ -1,0 +1,7 @@
+{
+    "node1": {"producer_name": "pulse", "producer_key": "PVT_K1_2pjSqJxTbRHq8h8aHHTux81Ypscb36Q2syB8UJbZcUmxbfZdnT"},
+    "node2": {"producer_name": "pulse", "producer_key": "PVT_K1_2pjSqJxTbRHq8h8aHHTux81Ypscb36Q2syB8UJbZcUmxbfZdnT"},
+    "node3": {"producer_name": "pulse", "producer_key": "PVT_K1_2pjSqJxTbRHq8h8aHHTux81Ypscb36Q2syB8UJbZcUmxbfZdnT"},
+    "node4": {"producer_name": "pulse", "producer_key": "PVT_K1_2pjSqJxTbRHq8h8aHHTux81Ypscb36Q2syB8UJbZcUmxbfZdnT"},
+    "node5": {"producer_name": "pulse", "producer_key": "PVT_K1_2pjSqJxTbRHq8h8aHHTux81Ypscb36Q2syB8UJbZcUmxbfZdnT"}
+}

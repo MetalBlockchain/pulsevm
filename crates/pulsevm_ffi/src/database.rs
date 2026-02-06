@@ -529,7 +529,7 @@ impl Database {
         if res.is_null() {
             return Err(ChainError::InternalError(format!(
                 "permission not found for actor: {} permission: {}",
-                actor, permission
+                pulsevm_name::Name::new(actor), pulsevm_name::Name::new(permission)
             )));
         }
 

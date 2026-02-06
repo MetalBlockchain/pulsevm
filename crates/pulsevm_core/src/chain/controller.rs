@@ -125,8 +125,9 @@ impl Controller {
             ChainError::ParseError(format!("failed to parse config bytes as UTF-8: {}", e))
         })?;
         self.node_config = Some(serde_json::from_str(config_json).map_err(|e| {
-            ChainError::ParseError(format!("failed to parse node config JSON: {}", e))
+            ChainError::ParseError(format!("failed to parse node config JSON: {} - {}", e, config_json))
         })?);
+        info!("node config parsed successfully: {:?}", self.node_config);
         // Parse genesis bytes
         let genesis_json = std::str::from_utf8(genesis_bytes).map_err(|e| {
             ChainError::ParseError(format!("failed to parse genesis bytes as UTF-8: {}", e))
@@ -151,6 +152,7 @@ impl Controller {
         self.last_accepted_block = SignedBlock::new(
             Id::default(),
             genesis.get_initial_timestamp().into(),
+            PULSE_NAME, // Use the provided producer name from genesis
             VecDeque::new(),
             Digest::default(),
         );
@@ -260,6 +262,7 @@ impl Controller {
         let block = SignedBlock::new(
             self.preferred_id,
             timestamp,
+            self.node_config.as_ref().unwrap().producer_name, // Use producer name from config
             transaction_receipts,
             transaction_mroot,
         );
@@ -285,6 +288,28 @@ impl Controller {
     ) -> Result<(), ChainError> {
         if self.verified_blocks.contains_key(&block.id()?) {
             return Ok(());
+        } else if let Some(block_log) = &self.block_log {
+            if let Ok(existing_block) = block_log.read_block(block.block_num()) {
+                let existing_block = SignedBlock::read(existing_block.as_slice(), &mut 0)?;
+
+                if existing_block.id()? == block.id()? {
+                    self.verified_blocks.insert(block.id()?, block.clone());
+                    warn!(
+                        "block {} already exists in block log, skipping verification",
+                        block.id()?
+                    );
+                    return Ok(());
+                } else {
+                    warn!(
+                        "block {} has same block number as existing block in block log but different id, rejecting",
+                        block.id()?
+                    );
+                    return Err(ChainError::NetworkError(format!(
+                        "block with id {} has same block number as existing block in block log but different id",
+                        block.id()?
+                    )));
+                }
+            }
         }
 
         // Verify the block
@@ -310,7 +335,6 @@ impl Controller {
         block_id: &Id,
         mempool: Arc<AsyncRwLock<Mempool>>,
     ) -> Result<(), ChainError> {
-        println!("accepting block {}", block_id);
         let block = {
             self.verified_blocks
                 .get(block_id)
@@ -320,6 +344,7 @@ impl Controller {
                     block_id
                 )))?
         };
+
         let mut root_session = self.db.create_undo_session(true)?;
         let mut mempool = mempool.write().await;
         let block_status = BlockStatus::Accepting;

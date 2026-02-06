@@ -118,6 +118,7 @@ impl SignedBlock {
     pub fn new(
         parent_id: Id,
         timestamp: BlockTimestamp,
+        producer: Name,
         transaction_receipts: VecDeque<TransactionReceipt>,
         transaction_mroot: Digest,
     ) -> Self {
@@ -125,7 +126,7 @@ impl SignedBlock {
             signed_block_header: SignedBlockHeader {
                 header: BlockHeader {
                     timestamp,
-                    producer: Name::from(name!("pulse")), // Placeholder producer name
+                    producer, // Use the provided producer name
                     confirmed: 0,                         // Placeholder confirmed count
                     previous: parent_id,
                     transaction_mroot: transaction_mroot,

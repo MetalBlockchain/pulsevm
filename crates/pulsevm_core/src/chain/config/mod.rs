@@ -5,7 +5,7 @@ use crate::name::Name;
 use pulsevm_constants::PERCENT_100;
 use pulsevm_name_macro::name;
 
-pub const PLUGIN_VERSION: u32 = 38;
+pub const PLUGIN_VERSION: u32 = 39;
 pub const VERSION: &str = "v0.0.1";
 
 // Names

@@ -43,6 +43,14 @@ impl FromStr for PrivateKey {
     }
 }
 
+impl fmt::Debug for PrivateKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PrivateKey")
+            .field("public_key", &self.get_public_key())
+            .finish()
+    }
+}
+
 impl fmt::Display for PrivateKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.inner.to_string())

@@ -30,7 +30,7 @@ impl fmt::Display for ParseNameError {
 }
 
 #[derive(
-    Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default, Read, Write, NumBytes,
+    Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default, Read, Write, NumBytes,
 )]
 pub struct Name(u64);
 
@@ -76,6 +76,16 @@ impl FromStr for Name {
         let name = name_from_bytes(s.bytes())
             .map_err(|e| ChainError::ParseError(format!("invalid name format: {}", e)))?;
         Ok(name.into())
+    }
+}
+
+impl fmt::Debug for Name {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let bytes = self.as_bytes();
+        let value = str::from_utf8(&bytes)
+            .map(|s| s.trim_end_matches('.'))
+            .map_err(|_| fmt::Error)?;
+        write!(f, "Name({} - {})", self.0, value)
     }
 }
 
