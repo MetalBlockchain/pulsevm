@@ -34,7 +34,7 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y gcc-13 g++-13 cmake libgmp-dev zlib1g-dev pkg-config libcurl4-openssl-dev libboost-all-dev llvm-18-dev libpolly-19-dev
+        run: sudo apt-get update && sudo apt-get install -y gcc-13 g++-13 cmake libgmp-dev zlib1g-dev pkg-config libcurl4-openssl-dev libboost-all-dev llvm-18-dev libpolly-18-dev
 
       - name: Build release artifact
         run: CXX=/usr/bin/g++-13 CC=/usr/bin/gcc-13 LLVM_SYS_180_PREFIX=/usr/lib/llvm-18 cargo build --release
