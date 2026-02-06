@@ -383,7 +383,7 @@ impl TransactionContext {
             "Adding RAM usage for account {}: {} bytes",
             account, ram_delta
         );
-        ResourceLimitsManager::add_pending_ram_usage(&mut self.db, account, ram_delta)?;
+        //ResourceLimitsManager::add_pending_ram_usage(&mut self.db, account, ram_delta)?;
 
         if ram_delta > 0 {
             inner.validate_ram_usage.insert(account.clone());
