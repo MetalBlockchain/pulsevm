@@ -82,7 +82,7 @@ async fn main() {
         .expect("failed to initialize runtime engine");
 
     let state_history_service = StateHistoryServer::new(vm.clone());
-    let ws_bind = std::env::var("WS_BIND").unwrap_or_else(|_| "127.0.0.1:9090".into());
+    let ws_bind = std::env::var("WS_BIND").unwrap_or_else(|_| "0.0.0.0:9090".into());
     let ws_handle = tokio::spawn(async move {
         if let Err(e) = state_history_service
             .run_ws_server(&ws_bind, cancel_ws)
