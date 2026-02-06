@@ -16,6 +16,7 @@ RUN apt-get install -y \
     pkg-config \
     libboost-all-dev \
     libcurl4-openssl-dev \
+    llvm-18-dev \
     file 
 
 # Add Rust to PATH
@@ -36,5 +37,6 @@ ENV CXX=/usr/bin/g++-13
 ENV CC=/usr/bin/gcc-13
 ENV BOOST_LIB=/usr/lib/x86_64-linux-gnu
 ENV ZLIB_ROOT=/usr/lib/x86_64-linux-gnu
+ENV LLVM_SYS_180_PREFIX=/usr/lib/llvm-18
 
 RUN cargo build --release
