@@ -5,6 +5,7 @@ use std::{
 
 use cxx::UniquePtr;
 use pulsevm_error::ChainError;
+use pulsevm_name::Name;
 
 use crate::{
     AccountMetadataObject, KeyValueObject,
@@ -260,12 +261,12 @@ impl Database {
 
     pub fn add_transaction_usage(
         &mut self,
-        accounts: &HashSet<u64>,
+        accounts: &HashSet<Name>,
         cpu_usage: u64,
         net_usage: u64,
         time_slot: u32,
     ) -> Result<(), ChainError> {
-        let accounts_vec: Vec<u64> = accounts.iter().map(|name| name.clone()).collect();
+        let accounts_vec: Vec<u64> = accounts.iter().map(|name| name.as_u64()).collect();
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
 

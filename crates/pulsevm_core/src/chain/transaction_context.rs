@@ -348,8 +348,7 @@ impl TransactionContext {
             VarUint32((inner.trace.net_usage / 8) as u32),
         );
 
-        let validate_ram_usage = inner.validate_ram_usage.clone();
-        for account in validate_ram_usage.iter() {
+        for account in inner.validate_ram_usage.iter() {
             ResourceLimitsManager::verify_account_ram_usage(&mut self.db, account)?;
         }
 
@@ -383,7 +382,7 @@ impl TransactionContext {
             "Adding RAM usage for account {}: {} bytes",
             account, ram_delta
         );
-        //ResourceLimitsManager::add_pending_ram_usage(&mut self.db, account, ram_delta)?;
+        ResourceLimitsManager::add_pending_ram_usage(&mut self.db, account, ram_delta)?;
 
         if ram_delta > 0 {
             inner.validate_ram_usage.insert(account.clone());
