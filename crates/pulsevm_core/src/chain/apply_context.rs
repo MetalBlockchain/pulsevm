@@ -485,6 +485,7 @@ impl ApplyContext {
 
         let overhead = billable_size_v::<KeyValueObject>() as i64;
         let old_size = old_size + overhead;
+        let new_size = new_size + overhead;
 
         if old_payer != new_payer {
             self.update_db_usage(&Name::new(old_payer), -old_size)?;
@@ -517,12 +518,13 @@ impl ApplyContext {
     }
 
     pub fn db_remove_i64(&mut self, iterator: i32) -> Result<(), ChainError> {
-        let mut inner = self.inner.write()?;
-        let delta =
-            self.db
-                .db_remove_i64(&mut inner.keyval_cache, iterator, self.receiver.as_u64())?;
+        let delta = {
+            let mut inner = self.inner.write()?;
+            let delta = self.db.db_remove_i64(&mut inner.keyval_cache, iterator, self.receiver.as_u64())?;
+            delta
+        };
 
-        //self.update_db_usage(&payer, -delta)?;
+        self.update_db_usage(&Name::new(self.receiver.as_u64()), -delta)?;
 
         Ok(())
     }
