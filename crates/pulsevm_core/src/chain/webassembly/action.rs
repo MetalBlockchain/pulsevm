@@ -2,7 +2,6 @@ use pulsevm_error::ChainError;
 use wasmer::{FunctionEnvMut, RuntimeError, WasmPtr};
 
 use crate::{
-    apply_context::ApplyContext,
     chain::{controller::Controller, utils::pulse_assert, wasm_runtime::WasmContext},
 };
 

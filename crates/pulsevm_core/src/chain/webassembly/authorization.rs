@@ -1,6 +1,6 @@
 use wasmer::{FunctionEnvMut, RuntimeError};
 
-use crate::{apply_context::ApplyContext, chain::wasm_runtime::WasmContext};
+use crate::chain::wasm_runtime::WasmContext;
 
 pub fn require_auth(env: FunctionEnvMut<WasmContext>, account: u64) -> Result<(), RuntimeError> {
     let context = env.data().apply_context();

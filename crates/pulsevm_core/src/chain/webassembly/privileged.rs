@@ -6,7 +6,6 @@ use crate::{
         apply_context::ApplyContext, resource_limits::ResourceLimitsManager, utils::pulse_assert,
         wasm_runtime::WasmContext,
     },
-    name::Name,
 };
 
 fn privileged_check(context: &ApplyContext) -> Result<(), RuntimeError> {
@@ -25,7 +24,7 @@ pub fn is_privileged(
     let context = env.data_mut().apply_context_mut();
     privileged_check(context)?;
     let db = env.data().db();
-    let account = unsafe { &*db.get_account_metadata(account)? };
+    let account = db.get_account_metadata(account)?;
 
     Ok(account.is_privileged() as i32)
 }
