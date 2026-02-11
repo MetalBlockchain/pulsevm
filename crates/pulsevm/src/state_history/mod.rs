@@ -6,13 +6,10 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc,
-        atomic::{AtomicI64, Ordering},
     },
 };
 
 use pulsevm_core::controller::Controller;
-use pulsevm_serialization::{Read, Write};
-use serde::Deserialize;
 use tokio::{
     net::TcpListener as TokioTcpListener,
     sync::{RwLock, Semaphore},

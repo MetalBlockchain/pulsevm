@@ -2,7 +2,6 @@ use std::{collections::HashSet, str::FromStr, sync::Arc};
 
 use jsonrpsee::{proc_macros::rpc, types::ErrorObjectOwned};
 use pulsevm_core::{
-    ChainError,
     abi::AbiDefinition,
     block::{BlockTimestamp, SignedBlock},
     controller::Controller,
@@ -10,12 +9,10 @@ use pulsevm_core::{
     id::Id,
     mempool::Mempool,
     name::Name,
-    resource_limits::ResourceLimitsManager,
     transaction::{PackedTransaction, TransactionCompression},
-    utils::{Base64Bytes, I32Flex, pulse_assert},
+    utils::{Base64Bytes, I32Flex},
 };
 use pulsevm_crypto::{Bytes, Digest};
-use pulsevm_name_macro::name;
 use pulsevm_serialization::Read;
 use serde_json::Value;
 use tokio::sync::RwLock;
@@ -23,8 +20,8 @@ use tonic::async_trait;
 
 use crate::{
     api::{
-        GetAccountResponse, GetCodeHashResponse, GetInfoResponse, GetRawABIResponse,
-        GetTableRowsResponse, IssueTxResponse,
+        GetCodeHashResponse, GetInfoResponse, GetRawABIResponse,
+        IssueTxResponse,
     },
     chain::{GossipType, Gossipable, NetworkManager},
 };
@@ -429,24 +426,4 @@ impl RpcServer for RpcService {
 
         Ok(rows)
     }
-}
-
-fn get_table_index_name(
-    table: Name,
-    index_position: u16,
-    primary: &mut bool,
-) -> Result<u64, ChainError> {
-    let table = table.as_u64();
-    let mut index = table & 0xFFFFFFFFFFFFFFF0u64;
-    pulse_assert(
-        index == table,
-        ChainError::TransactionError(format!("unsupported table name: {}", table)),
-    )?;
-
-    *primary = true; // TODO: handle primary vs secondary index
-    let pos = 0u64;
-
-    index |= pos & 0x000000000000000Fu64;
-
-    Ok(index)
 }

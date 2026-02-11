@@ -1,5 +1,5 @@
 use std::{
-    ops::{Add, Div, Mul, Rem},
+    ops::{Add, Div, Rem},
     u64,
 };
 
