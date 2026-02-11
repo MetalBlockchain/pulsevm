@@ -1,9 +1,7 @@
 use pulsevm_error::ChainError;
 use wasmer::{FunctionEnvMut, RuntimeError, WasmPtr};
 
-use crate::{
-    chain::{controller::Controller, utils::pulse_assert, wasm_runtime::WasmContext},
-};
+use crate::chain::{controller::Controller, utils::pulse_assert, wasm_runtime::WasmContext};
 
 #[inline]
 pub fn action_data_size(env: FunctionEnvMut<WasmContext>) -> i32 {

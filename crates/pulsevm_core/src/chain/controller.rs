@@ -38,9 +38,7 @@ use pulsevm_constants::{
 };
 use pulsevm_crypto::{Digest, merkle};
 use pulsevm_error::ChainError;
-use pulsevm_ffi::{
-    CxxChainConfig, CxxGenesisState, Database, ElasticLimitParameters, GlobalPropertyObject,
-};
+use pulsevm_ffi::{CxxGenesisState, Database, ElasticLimitParameters, GlobalPropertyObject};
 use pulsevm_serialization::{Read, Write};
 use spdlog::{info, warn};
 use tokio::sync::RwLock as AsyncRwLock;
@@ -483,21 +481,17 @@ impl Controller {
             .transaction()
             .validate(pending_block_timestamp)?;
 
-        let mut db = self.db.clone();
-
-        {
-            // Verify authority
-            AuthorizationManager::check_authorization(
-                &mut db,
-                &signed_transaction.transaction().actions,
-                &signed_transaction.recovered_keys(&self.chain_id)?,
-                &HashSet::new(),
-                &HashSet::new(),
-            )?;
-        }
+        // Verify authority
+        AuthorizationManager::check_authorization(
+            &mut self.db,
+            &signed_transaction.transaction().actions,
+            &signed_transaction.recovered_keys(&self.chain_id)?,
+            &HashSet::new(),
+            &HashSet::new(),
+        )?;
 
         let mut trx_context = TransactionContext::new(
-            db,
+            self.db.clone(),
             self.wasm_runtime.clone(),
             self.last_accepted_block().block_num() + 1,
             pending_block_timestamp.clone(),

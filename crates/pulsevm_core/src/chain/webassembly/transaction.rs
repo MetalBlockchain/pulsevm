@@ -1,19 +1,19 @@
-use std::{
-    collections::HashSet,
-};
+use std::collections::HashSet;
 
 use pulsevm_error::ChainError;
 use pulsevm_serialization::Read;
 use wasmer::{FunctionEnvMut, RuntimeError, WasmPtr};
 
 use crate::{
-    authorization_manager::AuthorizationManager, chain::{
+    authorization_manager::AuthorizationManager,
+    chain::{
         authority::PermissionLevel,
         controller::Controller,
         transaction::{Action, Transaction},
         utils::pulse_assert,
         wasm_runtime::WasmContext,
-    }, crypto::PublicKey
+    },
+    crypto::PublicKey,
 };
 
 pub fn send_inline(
@@ -98,7 +98,7 @@ pub fn check_transaction_authorization(
     }
 
     let mut db = env_data.db_mut();
-    
+
     match AuthorizationManager::check_authorization(
         &mut db,
         &transaction.actions,

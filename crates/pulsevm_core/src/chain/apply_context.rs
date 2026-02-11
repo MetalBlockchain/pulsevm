@@ -11,7 +11,7 @@ use pulsevm_error::ChainError;
 use pulsevm_ffi::{
     AccountMetadataObject, Database, KeyValueIteratorCache, KeyValueObject, TableObject,
 };
-use spdlog::{debug, info};
+use spdlog::debug;
 
 use crate::{
     CODE_NAME,
@@ -134,7 +134,7 @@ impl ApplyContext {
     }
 
     pub fn exec_one(&mut self) -> Result<u64, ChainError> {
-        let receiver_account = unsafe { &*self.db.get_account_metadata(self.receiver.as_u64())? };
+        let receiver_account = self.db.get_account_metadata(self.receiver.as_u64())?;
         let cpu_used = 100; // Base usage is always 100 instructions
         let action = {
             let mut inner = self.inner.write()?;
@@ -149,7 +149,7 @@ impl ApplyContext {
         }
 
         // Refresh the receiver account metadata
-        let receiver_account = unsafe { &*self.db.get_account_metadata(self.receiver.as_u64())? };
+        let receiver_account = self.db.get_account_metadata(self.receiver.as_u64())?;
 
         // Does the receiver account have a contract deployed?
         if !receiver_account.get_code_hash().empty() {
@@ -167,9 +167,9 @@ impl ApplyContext {
             generate_action_digest(&action, inner.action_return_value.clone())
         };
         let first_receiver_account = if action.account() == &self.receiver {
-            receiver_account.clone()
+            receiver_account
         } else {
-            unsafe { &*self.db.get_account_metadata(action.account().as_u64())? }
+            self.db.get_account_metadata(action.account().as_u64())?
         };
         let mut receipt = ActionReceipt::new(
             self.receiver.clone(),

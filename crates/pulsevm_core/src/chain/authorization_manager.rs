@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use pulsevm_error::ChainError;
-use pulsevm_ffi::{Authority, CxxChainConfig, CxxTimePoint, Database, PermissionObject};
+use pulsevm_ffi::{Authority, CxxTimePoint, Database, PermissionObject};
 
 use crate::{
     PULSE_NAME,
@@ -90,8 +90,11 @@ impl AuthorizationManager {
 
             let global_properties = unsafe { &*db.get_global_properties()? };
             let chain_config = global_properties.get_chain_config();
-            let mut authority_checker =
-                AuthorityChecker::new(chain_config.get_max_authority_depth(), provided_keys);
+            let mut authority_checker = AuthorityChecker::new(
+                chain_config.get_max_authority_depth(),
+                provided_keys,
+                provided_permissions,
+            );
 
             // Now verify that all the declared authorizations are satisfied
             for p in permissions_to_satisfy.iter() {
