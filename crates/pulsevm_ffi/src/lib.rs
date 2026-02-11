@@ -8,9 +8,10 @@ use pulsevm_error::ChainError;
 
 pub use crate::bridge::ffi::DatabaseOpenFlags;
 pub use crate::bridge::ffi::{
-    AccountMetadataObject, AccountObject, Authority, CodeObject, GlobalPropertyObject,
-    KeyValueObject, KeyWeight, PermissionLevel, PermissionLevelWeight, PermissionLinkObject,
-    PermissionObject, PermissionUsageObject, TableId, TableObject, WaitWeight,
+    AccountMetadataObject, AccountObject, Authority, CodeObject, ElasticLimitParameters,
+    GlobalPropertyObject, KeyValueObject, KeyWeight, PermissionLevel, PermissionLevelWeight,
+    PermissionLinkObject, PermissionObject, PermissionUsageObject, Ratio, TableId, TableObject,
+    WaitWeight,
 };
 pub use crate::bridge::ffi::{
     CxxBlockTimestamp, CxxChainConfig, CxxDigest, CxxGenesisState, CxxMicroseconds, CxxPrivateKey,

@@ -104,4 +104,46 @@ void database_wrapper::modify_permission( const permission_object& permission, c
     });
 }
 
+void database_wrapper::set_block_parameters(const ElasticLimitParameters& cpu_limit_parameters, const ElasticLimitParameters& net_limit_parameters ) {
+    const auto& config = this->get<resource_limits::resource_limits_config_object>();
+    
+    if( config.cpu_limit_parameters.target == cpu_limit_parameters.target &&
+        config.cpu_limit_parameters.max == cpu_limit_parameters.max &&
+        config.cpu_limit_parameters.periods == cpu_limit_parameters.periods &&
+        config.cpu_limit_parameters.max_multiplier == cpu_limit_parameters.max_multiplier &&
+        config.cpu_limit_parameters.contract_rate.numerator == cpu_limit_parameters.contract_rate.numerator &&
+        config.cpu_limit_parameters.contract_rate.denominator == cpu_limit_parameters.contract_rate.denominator &&
+        config.cpu_limit_parameters.expand_rate.numerator == cpu_limit_parameters.expand_rate.numerator &&
+        config.cpu_limit_parameters.expand_rate.denominator == cpu_limit_parameters.expand_rate.denominator &&
+        config.net_limit_parameters.target == net_limit_parameters.target &&
+        config.net_limit_parameters.max == net_limit_parameters.max &&
+        config.net_limit_parameters.periods == net_limit_parameters.periods &&
+        config.net_limit_parameters.max_multiplier == net_limit_parameters.max_multiplier &&
+        config.net_limit_parameters.contract_rate.numerator == net_limit_parameters.contract_rate.numerator &&
+        config.net_limit_parameters.contract_rate.denominator == net_limit_parameters.contract_rate.denominator &&
+        config.net_limit_parameters.expand_rate.numerator == net_limit_parameters.expand_rate.numerator &&
+        config.net_limit_parameters.expand_rate.denominator == net_limit_parameters.expand_rate.denominator )
+        return;
+
+    this->modify(config, [&](resource_limits::resource_limits_config_object& c){
+        c.cpu_limit_parameters.target = cpu_limit_parameters.target;
+        c.cpu_limit_parameters.max = cpu_limit_parameters.max;
+        c.cpu_limit_parameters.periods = cpu_limit_parameters.periods;
+        c.cpu_limit_parameters.max_multiplier = cpu_limit_parameters.max_multiplier;
+        c.cpu_limit_parameters.contract_rate.numerator = cpu_limit_parameters.contract_rate.numerator;
+        c.cpu_limit_parameters.contract_rate.denominator = cpu_limit_parameters.contract_rate.denominator;
+        c.cpu_limit_parameters.expand_rate.numerator = cpu_limit_parameters.expand_rate.numerator;
+        c.cpu_limit_parameters.expand_rate.denominator = cpu_limit_parameters.expand_rate.denominator;
+
+        c.net_limit_parameters.target = net_limit_parameters.target;
+        c.net_limit_parameters.max = net_limit_parameters.max;
+        c.net_limit_parameters.periods = net_limit_parameters.periods;
+        c.net_limit_parameters.max_multiplier = net_limit_parameters.max_multiplier;
+        c.net_limit_parameters.contract_rate.numerator = net_limit_parameters.contract_rate.numerator;
+        c.net_limit_parameters.contract_rate.denominator = net_limit_parameters.contract_rate.denominator;
+        c.net_limit_parameters.expand_rate.numerator = net_limit_parameters.expand_rate.numerator;
+        c.net_limit_parameters.expand_rate.denominator = net_limit_parameters.expand_rate.denominator;
+    });
+}
+
 }

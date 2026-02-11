@@ -17,6 +17,20 @@ pub mod ffi {
         greylisted: bool,
     }
 
+    struct Ratio {
+        numerator: u64,
+        denominator: u64,
+    }
+
+    struct ElasticLimitParameters {
+        target: u64,
+        max: u64,
+        periods: u32,
+        max_multiplier: u32,
+        contract_rate: Ratio,
+        expand_rate: Ratio,
+    }
+
     #[derive(Clone, PartialEq, Eq, Hash)]
     pub struct KeyWeight {
         key: SharedPtr<CxxPublicKey>,
@@ -239,6 +253,12 @@ pub mod ffi {
             greylist_limit: u32,
         ) -> Result<CpuLimitResult>;
         pub fn process_account_limit_updates(self: Pin<&mut Database>) -> Result<()>;
+        pub fn set_block_parameters(
+            self: Pin<&mut Database>,
+            cpu_limit_parameters: &ElasticLimitParameters,
+            net_limit_parameters: &ElasticLimitParameters,
+        ) -> Result<()>;
+        pub fn process_block_usage(self: Pin<&mut Database>, block_num: u32) -> Result<()>;
         pub fn find_table(
             self: &Database,
             code: u64,

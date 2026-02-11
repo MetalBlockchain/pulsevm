@@ -17,6 +17,7 @@ namespace pulsevm { namespace chain {
     struct Authority; // Forward declaration
     struct CpuLimitResult; // Forward declaration
     struct NetLimitResult; // Forward declaration
+    struct ElasticLimitParameters; // Forward declaration
 
 class database_wrapper : public chainbase::database {
 public:
@@ -260,6 +261,23 @@ public:
 
         EOS_ASSERT( state.pending_cpu_usage <= config.cpu_limit_parameters.max, block_resource_exhausted, "Block has insufficient cpu resources" );
         EOS_ASSERT( state.pending_net_usage <= config.net_limit_parameters.max, block_resource_exhausted, "Block has insufficient net resources" );
+    }
+
+    void set_block_parameters(const ElasticLimitParameters& cpu_limit_parameters, const ElasticLimitParameters& net_limit_parameters );
+
+    void process_block_usage(uint32_t block_num) {
+        const auto& s = this->get<resource_limits::resource_limits_state_object>();
+        const auto& config = this->get<resource_limits::resource_limits_config_object>();
+
+        this->modify(s, [&](resource_limits::resource_limits_state_object& state){
+            state.average_block_cpu_usage.add(state.pending_cpu_usage, block_num, config.cpu_limit_parameters.periods);
+            state.update_virtual_cpu_limit(config);
+            state.pending_cpu_usage = 0;
+
+            state.average_block_net_usage.add(state.pending_net_usage, block_num, config.net_limit_parameters.periods);
+            state.update_virtual_net_limit(config);
+            state.pending_net_usage = 0;
+        });
     }
 
     void add_pending_ram_usage( uint64_t account, int64_t ram_delta ) {

@@ -21,7 +21,6 @@ use crate::{
         pulse_contract::{
             deleteauth, linkauth, newaccount, setabi, setcode, unlinkauth, updateauth,
         },
-        resource::ElasticLimitParameters,
         resource_limits::ResourceLimitsManager,
         state_history::StateHistoryLog,
         transaction::{PackedTransaction, TransactionReceipt, TransactionTrace},
@@ -39,7 +38,9 @@ use pulsevm_constants::{
 };
 use pulsevm_crypto::{Digest, merkle};
 use pulsevm_error::ChainError;
-use pulsevm_ffi::{CxxChainConfig, CxxGenesisState, Database, GlobalPropertyObject};
+use pulsevm_ffi::{
+    CxxChainConfig, CxxGenesisState, Database, ElasticLimitParameters, GlobalPropertyObject,
+};
 use pulsevm_serialization::{Read, Write};
 use spdlog::{info, warn};
 use tokio::sync::RwLock as AsyncRwLock;
@@ -125,7 +126,10 @@ impl Controller {
             ChainError::ParseError(format!("failed to parse config bytes as UTF-8: {}", e))
         })?;
         self.node_config = Some(serde_json::from_str(config_json).map_err(|e| {
-            ChainError::ParseError(format!("failed to parse node config JSON: {} - {}", e, config_json))
+            ChainError::ParseError(format!(
+                "failed to parse node config JSON: {} - {}",
+                e, config_json
+            ))
         })?);
         info!("node config parsed successfully: {:?}", self.node_config);
         // Parse genesis bytes
@@ -439,6 +443,12 @@ impl Controller {
             make_ratio(1000, 999),
         );
         ResourceLimitsManager::process_account_limit_updates(&mut self.db)?;
+        ResourceLimitsManager::set_block_parameters(
+            &mut self.db,
+            &cpu_elastic_parameters,
+            &net_elastic_parameters,
+        )?;
+        ResourceLimitsManager::process_block_usage(&mut self.db, block.block_num())?;
 
         Ok(transaction_traces)
     }

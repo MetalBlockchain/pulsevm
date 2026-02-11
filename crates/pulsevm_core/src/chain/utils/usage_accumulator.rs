@@ -5,35 +5,15 @@ use std::{
 
 use pulsevm_constants::RATE_LIMITING_PRECISION;
 use pulsevm_error::ChainError;
+use pulsevm_ffi::Ratio;
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 
 use crate::chain::utils::pulse_assert;
 
-#[derive(Debug, Clone, Copy, PartialEq, Read, Write, NumBytes, Default, Eq, Hash)]
-pub struct Ratio<T> {
-    pub numerator: T,
-    pub denominator: T,
-}
-
-pub fn make_ratio<T>(n: T, d: T) -> Ratio<T> {
+pub fn make_ratio(n: u64, d: u64) -> Ratio {
     Ratio {
         numerator: n,
         denominator: d,
-    }
-}
-
-impl Mul<Ratio<u64>> for u64 {
-    type Output = Result<u64, ChainError>;
-
-    fn mul(self, r: Ratio<u64>) -> Self::Output {
-        pulse_assert(
-            r.numerator == 0 || u64::MAX / r.numerator >= self,
-            ChainError::InvalidArgument(
-                "usage exceeds maximum value representable after extending for precision"
-                    .to_string(),
-            ),
-        )?;
-        Ok((self * r.numerator) / r.denominator)
     }
 }
 

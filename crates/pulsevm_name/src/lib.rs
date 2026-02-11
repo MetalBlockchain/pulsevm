@@ -29,9 +29,7 @@ impl fmt::Display for ParseNameError {
     }
 }
 
-#[derive(
-    Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default, Read, Write, NumBytes,
-)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default, Read, Write, NumBytes)]
 pub struct Name(u64);
 
 impl Name {

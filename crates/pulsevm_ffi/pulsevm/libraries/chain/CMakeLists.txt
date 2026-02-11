@@ -9,6 +9,7 @@ add_library( pulsevm_chain
    genesis_state.cpp
    authority.cpp
    pulse_contract_abi_bin.cpp
+   resource_limits.cpp
    symbol.cpp
    ${HEADERS}
 )

@@ -126,8 +126,8 @@ impl SignedBlock {
             signed_block_header: SignedBlockHeader {
                 header: BlockHeader {
                     timestamp,
-                    producer, // Use the provided producer name
-                    confirmed: 0,                         // Placeholder confirmed count
+                    producer,     // Use the provided producer name
+                    confirmed: 0, // Placeholder confirmed count
                     previous: parent_id,
                     transaction_mroot: transaction_mroot,
                     action_mroot: Id::default(), // Placeholder action merkle root

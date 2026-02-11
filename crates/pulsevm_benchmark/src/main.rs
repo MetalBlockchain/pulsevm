@@ -5,11 +5,13 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
+    u32,
 };
 
 use chrono::Utc;
 use pulsevm_core::{
     ACTIVE_NAME, ChainError, PULSE_NAME,
+    abi::AbiDefinition,
     asset::{Asset, Symbol},
     authority::{Authority, KeyWeight, PermissionLevel},
     block::BlockStatus,
@@ -111,6 +113,8 @@ async fn main() {
         fs::read(root.join(Path::new("reference_contracts/pulse_token.wasm"))).unwrap();
     let pulse_token_abi =
         fs::read(root.join(Path::new("reference_contracts/pulse_token.abi"))).unwrap();
+    let packed_abi: AbiDefinition = serde_json::from_slice(&pulse_token_abi).unwrap();
+    let packed_abi_bytes = packed_abi.pack().unwrap();
     controller
         .execute_transaction(
             &set_code(
@@ -129,7 +133,7 @@ async fn main() {
             &set_abi(
                 &private_key,
                 Name::from_str("pulse.token").unwrap(),
-                pulse_token_abi,
+                packed_abi_bytes,
                 controller.chain_id().clone(),
             )
             .unwrap(),
@@ -258,7 +262,14 @@ fn create_account(
         vec![],
     );
     let trx = Transaction::new(
-        TransactionHeader::new(TimePointSec::new(0), 0, 0, 0u32.into(), 0, 0u32.into()),
+        TransactionHeader::new(
+            TimePointSec::new(u32::MAX),
+            0,
+            0,
+            0u32.into(),
+            0,
+            0u32.into(),
+        ),
         vec![],
         vec![Action::new(
             Name::from_str("pulse")?,
@@ -289,7 +300,14 @@ fn set_code(
     chain_id: Id,
 ) -> Result<PackedTransaction, ChainError> {
     let trx = Transaction::new(
-        TransactionHeader::new(TimePointSec::new(0), 0, 0, 0u32.into(), 0, 0u32.into()),
+        TransactionHeader::new(
+            TimePointSec::new(u32::MAX),
+            0,
+            0,
+            0u32.into(),
+            0,
+            0u32.into(),
+        ),
         vec![],
         vec![Action::new(
             Name::from_str("pulse").unwrap(),
@@ -317,7 +335,14 @@ fn set_abi(
     chain_id: Id,
 ) -> Result<PackedTransaction, ChainError> {
     let trx = Transaction::new(
-        TransactionHeader::new(TimePointSec::new(0), 0, 0, 0u32.into(), 0, 0u32.into()),
+        TransactionHeader::new(
+            TimePointSec::new(u32::MAX),
+            0,
+            0,
+            0u32.into(),
+            0,
+            0u32.into(),
+        ),
         vec![],
         vec![Action::new(
             Name::from_str("pulse").unwrap(),
@@ -345,7 +370,14 @@ fn call_contract<T: Write>(
     permissions: Vec<PermissionLevel>,
 ) -> Result<PackedTransaction, ChainError> {
     let trx = Transaction::new(
-        TransactionHeader::new(TimePointSec::new(0), 0, 0, 0u32.into(), 0, 0u32.into()),
+        TransactionHeader::new(
+            TimePointSec::new(u32::MAX),
+            0,
+            0,
+            0u32.into(),
+            0,
+            0u32.into(),
+        ),
         vec![],
         vec![Action::new(
             account,

@@ -10,8 +10,8 @@ use pulsevm_name::Name;
 use crate::{
     AccountMetadataObject, KeyValueObject,
     bridge::ffi::{
-        self, Authority, CxxDigest, CxxGenesisState, CxxTimePoint, TableObject,
-        get_account_info_with_core_symbol, get_account_info_without_core_symbol,
+        self, Authority, CxxDigest, CxxGenesisState, CxxTimePoint, ElasticLimitParameters,
+        TableObject, get_account_info_with_core_symbol, get_account_info_without_core_symbol,
         get_currency_balance_with_symbol, get_currency_balance_without_symbol, get_currency_stats,
         get_table_rows,
     },
@@ -383,6 +383,28 @@ impl Database {
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 
+    pub fn set_block_parameters(
+        &mut self,
+        cpu_limit_parameters: &ElasticLimitParameters,
+        net_limit_parameters: &ElasticLimitParameters,
+    ) -> Result<(), ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .set_block_parameters(cpu_limit_parameters, net_limit_parameters)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
+    pub fn process_block_usage(&mut self, block_num: u32) -> Result<(), ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .process_block_usage(block_num)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
     pub fn find_table(
         &self,
         code: u64,
@@ -530,7 +552,8 @@ impl Database {
         if res.is_null() {
             return Err(ChainError::InternalError(format!(
                 "permission not found for actor: {} permission: {}",
-                pulsevm_name::Name::new(actor), pulsevm_name::Name::new(permission)
+                pulsevm_name::Name::new(actor),
+                pulsevm_name::Name::new(permission)
             )));
         }
 

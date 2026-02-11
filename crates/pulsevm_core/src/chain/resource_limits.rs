@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use pulsevm_error::ChainError;
-use pulsevm_ffi::Database;
+use pulsevm_ffi::{Database, ElasticLimitParameters};
 
 use crate::{name::Name, resource::AccountResourceLimit};
 
@@ -31,12 +31,12 @@ impl ResourceLimitsManager {
         time_slot: u32,
     ) -> Result<(), ChainError> {
         db.add_transaction_usage(accounts, cpu_usage, net_usage, time_slot)
-        .map_err(|e| {
-            ChainError::DatabaseError(format!(
-                "failed to add transaction usage for accounts: {}",
-                e
-            ))
-        })?;
+            .map_err(|e| {
+                ChainError::DatabaseError(format!(
+                    "failed to add transaction usage for accounts: {}",
+                    e
+                ))
+            })?;
         Ok(())
     }
 
@@ -202,5 +202,24 @@ impl ResourceLimitsManager {
                 e
             ))),
         }
+    }
+
+    pub fn set_block_parameters(
+        db: &mut Database,
+        cpu_limit_parameters: &ElasticLimitParameters,
+        net_limit_parameters: &ElasticLimitParameters,
+    ) -> Result<(), ChainError> {
+        cpu_limit_parameters.validate()?;
+        net_limit_parameters.validate()?;
+
+        db.set_block_parameters(cpu_limit_parameters, net_limit_parameters)
+            .map_err(|e| {
+                ChainError::DatabaseError(format!("failed to set block parameters: {}", e))
+            })?;
+        Ok(())
+    }
+
+    pub fn process_block_usage(db: &mut Database, block_num: u32) -> Result<(), ChainError> {
+        db.process_block_usage(block_num)
     }
 }
