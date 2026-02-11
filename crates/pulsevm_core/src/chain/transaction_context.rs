@@ -7,6 +7,7 @@ use pulsevm_error::ChainError;
 use pulsevm_ffi::Database;
 use pulsevm_serialization::VarUint32;
 use pulsevm_time::{Microseconds, TimePoint};
+use spdlog::debug;
 
 use crate::{
     block::BlockStatus,
@@ -352,7 +353,7 @@ impl TransactionContext {
             ResourceLimitsManager::verify_account_ram_usage(&mut self.db, account)?;
         }
 
-        println!("Transaction took {} micros", billed_cpu_time_us);
+        debug!("Transaction took {} micros", billed_cpu_time_us);
 
         ResourceLimitsManager::add_transaction_usage(
             &mut self.db,
@@ -377,11 +378,6 @@ impl TransactionContext {
     pub fn add_ram_usage(&mut self, account: &Name, ram_delta: i64) -> Result<(), ChainError> {
         let mut inner = self.inner.write()?;
 
-        // Update the RAM usage in the resource limits manager.
-        println!(
-            "Adding RAM usage for account {}: {} bytes",
-            account, ram_delta
-        );
         ResourceLimitsManager::add_pending_ram_usage(&mut self.db, account, ram_delta)?;
 
         if ram_delta > 0 {

@@ -148,7 +148,6 @@ namespace fc {
          using crypto::shim<compact_signature>::shim;
 
          public_key_type recover(const sha256& digest, bool check_canonical) const {
-            std::cout << digest.str() << std::endl;
             return public_key_type(public_key(_data, digest, check_canonical).serialize());
          }
       };

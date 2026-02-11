@@ -11,7 +11,7 @@ use pulsevm_error::ChainError;
 use pulsevm_ffi::{
     AccountMetadataObject, Database, KeyValueIteratorCache, KeyValueObject, TableObject,
 };
-use spdlog::info;
+use spdlog::{debug, info};
 
 use crate::{
     CODE_NAME,
@@ -142,13 +142,6 @@ impl ApplyContext {
             inner.action.clone()
         };
 
-        println!(
-            "Executing action {}@{} for receiver {}",
-            action.account(),
-            action.name(),
-            self.receiver
-        );
-
         let native =
             Controller::find_apply_handler(&self.receiver, action.account(), action.name());
         if let Some(native) = native {
@@ -201,7 +194,7 @@ impl ApplyContext {
     pub fn finalize_trace(&self, receipt: ActionReceipt) -> Result<(), ChainError> {
         let inner = self.inner.read()?;
 
-        info!(
+        debug!(
             "took {} us to execute action {}@{}",
             Utc::now().timestamp_micros() - inner.start,
             inner.action.account(),
@@ -520,7 +513,9 @@ impl ApplyContext {
     pub fn db_remove_i64(&mut self, iterator: i32) -> Result<(), ChainError> {
         let delta = {
             let mut inner = self.inner.write()?;
-            let delta = self.db.db_remove_i64(&mut inner.keyval_cache, iterator, self.receiver.as_u64())?;
+            let delta =
+                self.db
+                    .db_remove_i64(&mut inner.keyval_cache, iterator, self.receiver.as_u64())?;
             delta
         };
 
