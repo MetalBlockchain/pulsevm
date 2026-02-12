@@ -355,13 +355,15 @@ impl TransactionContext {
 
         debug!("Transaction took {} micros", billed_cpu_time_us);
 
-        ResourceLimitsManager::add_transaction_usage(
-            &mut self.db,
-            &inner.bill_to_accounts,
-            billed_cpu_time_us as u64,
-            inner.trace.net_usage as u64,
-            inner.pending_block_timestamp.slot(),
-        )?;
+        if self.block_status != BlockStatus::Benchmarking {
+            ResourceLimitsManager::add_transaction_usage(
+                &mut self.db,
+                &inner.bill_to_accounts,
+                billed_cpu_time_us as u64,
+                inner.trace.net_usage as u64,
+                inner.pending_block_timestamp.slot(),
+            )?;
+        }
 
         Ok(TransactionResult {
             trace: inner.trace.clone(),

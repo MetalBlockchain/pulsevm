@@ -37,4 +37,8 @@ pulsevm_time = { path = "../pulsevm_time" }
 pulsevm_ffi = { path = "../pulsevm_ffi" }
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
+
+[[bench]]
+name = "transfer"
+harness = false

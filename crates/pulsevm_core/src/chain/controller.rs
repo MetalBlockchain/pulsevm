@@ -818,8 +818,15 @@ mod tests {
         let mut controller = Controller::new();
         let genesis_bytes = generate_genesis(&private_key);
         let temp_path = get_temp_dir();
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": private_key.to_string(),
+        })
+        .to_string()
+        .into_bytes();
         controller.initialize(
             &chain_id,
+            &config_bytes,
             &genesis_bytes.to_vec(),
             temp_path.path().to_str().unwrap(),
         )?;
@@ -928,8 +935,15 @@ mod tests {
         let mut controller = Controller::new();
         let genesis_bytes = generate_genesis(&private_key);
         let temp_path = get_temp_dir();
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": private_key.to_string(),
+        })
+        .to_string()
+        .into_bytes();
         controller.initialize(
             &chain_id,
+            &config_bytes,
             &genesis_bytes.to_vec(),
             temp_path.path().to_str().unwrap(),
         )?;
