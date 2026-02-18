@@ -501,7 +501,6 @@ impl Controller {
 
         let trx = packed_transaction.get_transaction();
         trx_context.init_for_input_trx(
-            trx,
             packed_transaction.get_unprunable_size()?,
             packed_transaction.get_prunable_size()?,
         )?;

@@ -8,9 +8,10 @@ use pulsevm_crypto::Bytes;
 use pulsevm_error::ChainError;
 use pulsevm_ffi::{CxxDigest, Database};
 use wasmer::{
-    Engine, Function, FunctionEnv, Instance, Memory, Module, Store, imports, sys::CompilerConfig,
+    Engine, Function, FunctionEnv, Instance, Memory, Module, Store, imports, sys::CompilerConfig, wasmparser::Operator,
 };
 use wasmer_compiler_llvm::{LLVM, LLVMOptLevel};
+use wasmer_middlewares::{Metering, metering::{MeteringPoints, get_remaining_points, set_remaining_points}};
 
 use crate::{
     block::BlockTimestamp,
@@ -113,6 +114,16 @@ impl WasmRuntime {
     pub fn new() -> Result<Self, ChainError> {
         let mut compiler = LLVM::default();
 
+        let cost_function = |operator: &Operator| -> u64 {
+            match operator {
+                Operator::MemoryGrow { .. } => 1000, // Higher cost for memory growth
+                _ => 1, // Default cost for unrecognized operators
+            }
+        };
+
+        let metering = Arc::new(Metering::new(0, cost_function));
+        compiler.push_middleware(metering);
+
         // Deterministic floating point operations
         LLVM::canonicalize_nans(&mut compiler, true);
         LLVM::opt_level(&mut compiler, LLVMOptLevel::Aggressive);
@@ -123,6 +134,11 @@ impl WasmRuntime {
                 code_cache: LruCache::new(NonZeroUsize::new(1024).unwrap()),
             })),
         })
+    }
+
+    pub fn compile_module(&self, code: &[u8]) -> Result<Module, ChainError> {
+        let store = Store::new(self.inner.read()?.engine.clone());
+        Module::new(store.engine(), code).map_err(|e| ChainError::WasmRuntimeError(e.to_string()))
     }
 
     pub fn run(
@@ -139,17 +155,14 @@ impl WasmRuntime {
         let mut inner = self.inner.write()?;
         let id = Id::from(code_hash);
 
-        // Different scope so session is released before running the wasm code.
-        {
-            if !inner.code_cache.contains(&id) {
-                let code_object = db.get_code_object_by_hash(code_hash, 0, 0)?;
-                let code_object = unsafe { &*code_object };
-                // Create a temporary store just for module compilation
-                let temp_store = Store::new(inner.engine.clone());
-                let module = Module::new(temp_store.engine(), code_object.get_code().as_slice())
-                    .map_err(|e| ChainError::WasmRuntimeError(e.to_string()))?;
-                inner.code_cache.put(id, module);
-            }
+        if !inner.code_cache.contains(&id) {
+            let code_object = db.get_code_object_by_hash(code_hash, 0, 0)?;
+            let code_object = unsafe { &*code_object };
+            // Create a temporary store just for module compilation
+            let temp_store = Store::new(inner.engine.clone());
+            let module = Module::new(temp_store.engine(), code_object.get_code().as_slice())
+                .map_err(|e| ChainError::WasmRuntimeError(e.to_string()))?;
+            inner.code_cache.put(id, module);
         }
 
         let mut store = Store::new(inner.engine.clone());
@@ -214,6 +227,9 @@ impl WasmRuntime {
             }
         }
 
+        // Set initial metering points based on resource limits
+        set_remaining_points(&mut store, &instance, 1000);
+
         let apply_func = instance
             .exports
             .get_typed_function::<(i64, i64, i64), ()>(&store, "apply")
@@ -222,7 +238,7 @@ impl WasmRuntime {
         // Resume timer
         apply_context.resume_billing_timer()?;
 
-        apply_func
+        let result = apply_func
             .call(
                 &mut store,
                 receiver.as_u64() as i64,
@@ -237,7 +253,18 @@ impl WasmRuntime {
 
                 // Otherwise wrap it
                 ChainError::WasmRuntimeError(format!("apply error: {}", e))
-            })?;
+            });
+        let remaining_points_after_second_call = get_remaining_points(&mut store, &instance);
+
+        if remaining_points_after_second_call == MeteringPoints::Exhausted {
+            return Err(ChainError::WasmRuntimeError(
+                "wasm execution metering points exhausted".to_string(),
+            ));
+        }
+
+        if let Err(e) = result {
+            return Err(e);
+        }
 
         Ok(())
     }

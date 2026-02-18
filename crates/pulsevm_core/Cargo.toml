@@ -23,6 +23,7 @@ time = { version = "0.3.41", features = ["formatting", "macros", "parsing"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 wasmer = { version = "7.0.1", features = ["llvm"] }
 wasmer-compiler-llvm = "7.0.1"
+wasmer-middlewares = "7.0.1"
 
 pulsevm_billable_size = { path = "../pulsevm_billable_size" }
 pulsevm_constants = { path = "../pulsevm_constants" }

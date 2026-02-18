@@ -41,7 +41,6 @@ pub struct TransactionResult {
 struct TransactionContextInner {
     initialized: bool,
     trace: TransactionTrace,
-    billed_cpu_time_us: AtomicI64,
     bill_to_accounts: HashSet<Name>,
     validate_ram_usage: HashSet<Name>,
     explicit_billed_cpu_time: bool,
@@ -78,7 +77,6 @@ impl TransactionContext {
             inner: Arc::new(RwLock::new(TransactionContextInner {
                 initialized: false,
                 trace,
-                billed_cpu_time_us: AtomicI64::new(0),
                 bill_to_accounts: HashSet::new(),
                 validate_ram_usage: HashSet::new(),
                 explicit_billed_cpu_time: false,
@@ -112,21 +110,9 @@ impl TransactionContext {
 
     pub fn init_for_input_trx(
         &mut self,
-        transaction: &Transaction,
         packed_trx_unprunable_size: u64,
         packed_trx_prunable_size: u64,
     ) -> Result<(), ChainError> {
-        pulse_assert(
-            transaction.header.delay_sec.0 == 0,
-            ChainError::TransactionError("transaction cannot be delayed".into()),
-        )?;
-        pulse_assert(
-            transaction.transaction_extensions.len() == 0,
-            ChainError::TransactionError(
-                "no transaction extensions supported yet for input transactions".into(),
-            ),
-        )?;
-
         let mut discounted_size_for_pruned_data = packed_trx_prunable_size;
         let global_properties = unsafe { &*self.db.get_global_properties()? };
         let chain_config = global_properties.get_chain_config();

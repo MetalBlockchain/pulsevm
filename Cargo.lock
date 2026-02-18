@@ -2488,6 +2488,7 @@ dependencies = [
  "tokio",
  "wasmer",
  "wasmer-compiler-llvm",
+ "wasmer-middlewares",
 ]
 
 [[package]]
@@ -3917,6 +3918,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.106",
+]
+
+[[package]]
+name = "wasmer-middlewares"
+version = "7.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9926b98ba6b49686b1a27be04d2599425f64bacaba249118c389e6c3cf4c096"
+dependencies = [
+ "wasmer",
+ "wasmer-types",
+ "wasmer-vm",
 ]
 
 [[package]]
