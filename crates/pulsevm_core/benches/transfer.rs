@@ -1,14 +1,30 @@
 use chrono::Utc;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use pulsevm_core::{ACTIVE_NAME, ChainError, PULSE_NAME, abi::AbiDefinition, asset::{Asset, Symbol}, block::{BlockStatus, BlockTimestamp}, controller::Controller, crypto::PrivateKey, id::Id, pulse_contract::{NewAccount, SetCode}, transaction::{Action, PackedTransaction, Transaction, TransactionHeader}};
+use pulsevm_core::{
+    ACTIVE_NAME, ChainError, PULSE_NAME,
+    abi::AbiDefinition,
+    asset::{Asset, Symbol},
+    block::{BlockStatus, BlockTimestamp},
+    controller::Controller,
+    crypto::PrivateKey,
+    id::Id,
+    pulse_contract::{NewAccount, SetCode},
+    transaction::{Action, PackedTransaction, Transaction, TransactionHeader},
+};
 use pulsevm_ffi::{Authority, Database, KeyWeight, PermissionLevel, string_to_name};
 use pulsevm_name::Name;
 use pulsevm_proc_macros::{NumBytes, Read, Write};
-use pulsevm_time::TimePointSec;
 use pulsevm_serialization::Write;
+use pulsevm_time::TimePointSec;
 use serde_json::json;
+use std::{
+    fs,
+    hint::black_box,
+    path::{Path, PathBuf},
+    str::FromStr,
+    sync::Arc,
+};
 use tempfile::env::temp_dir;
-use std::{fs, hint::black_box, path::{Path, PathBuf}, str::FromStr, sync::Arc};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Read, Write, NumBytes)]
 struct Issue {
@@ -31,7 +47,12 @@ struct Create {
     max_supply: Asset,
 }
 
-fn bench(controller: &mut Controller, pending_block_timestamp: &BlockTimestamp, block_status: &BlockStatus, private_key: &PrivateKey) {
+fn bench(
+    controller: &mut Controller,
+    pending_block_timestamp: &BlockTimestamp,
+    block_status: &BlockStatus,
+    private_key: &PrivateKey,
+) {
     controller
         .execute_transaction(
             &call_contract(
@@ -227,7 +248,16 @@ fn criterion_benchmark(c: &mut Criterion) {
         )
         .unwrap();
 
-    c.bench_function("transfer", |b| b.iter(|| bench(&mut controller, &pending_block_timestamp, &block_status, &private_key)));
+    c.bench_function("transfer", |b| {
+        b.iter(|| {
+            bench(
+                &mut controller,
+                &pending_block_timestamp,
+                &block_status,
+                &private_key,
+            )
+        })
+    });
 }
 
 fn call_contract<T: Write>(

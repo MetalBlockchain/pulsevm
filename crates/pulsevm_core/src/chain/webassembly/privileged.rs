@@ -1,4 +1,6 @@
 use pulsevm_error::ChainError;
+use pulsevm_name::Name;
+use spdlog::info;
 use wasmer::{FunctionEnvMut, RuntimeError, WasmPtr};
 
 use crate::chain::{

@@ -11,7 +11,7 @@ use pulsevm_error::ChainError;
 use pulsevm_ffi::{
     AccountMetadataObject, Database, KeyValueIteratorCache, KeyValueObject, TableObject,
 };
-use spdlog::debug;
+use spdlog::{debug, info};
 
 use crate::{
     CODE_NAME,
@@ -38,6 +38,7 @@ struct ApplyContextInner {
     inline_actions: Vec<u32>,               // List of inline actions
     recurse_depth: u32,                     // The current recursion depth
     keyval_cache: KeyValueIteratorCache,    // Cache for key-value iterators
+    cpu_limit: i64,                         // CPU limit for the current action
 }
 
 #[derive(Clone)]
@@ -63,6 +64,7 @@ impl ApplyContext {
         receiver: Name,
         action_ordinal: u32,
         depth: u32,
+        cpu_limit: i64,
     ) -> Result<Self, ChainError> {
         let pending_block_timestamp = trx_context.pending_block_timestamp()?;
 
@@ -86,6 +88,7 @@ impl ApplyContext {
                 inline_actions: Vec::new(),
                 recurse_depth: depth,
                 keyval_cache: KeyValueIteratorCache::new(),
+                cpu_limit,
             })),
         })
     }
@@ -135,7 +138,7 @@ impl ApplyContext {
 
     pub fn exec_one(&mut self) -> Result<u64, ChainError> {
         let receiver_account = self.db.get_account_metadata(self.receiver.as_u64())?;
-        let cpu_used = 100; // Base usage is always 100 instructions
+        let mut cpu_used = 100; // Base usage is always 100 instructions
         let action = {
             let mut inner = self.inner.write()?;
             inner.privileged = receiver_account.is_privileged();
@@ -153,12 +156,19 @@ impl ApplyContext {
 
         // Does the receiver account have a contract deployed?
         if !receiver_account.get_code_hash().empty() {
-            self.wasm_runtime.run(
+            // Separate context here because we need to release the lock on inner before executing the Wasm code, which may call back into the context and cause deadlock if we hold the lock.
+            let cpu_limit = {
+                let inner = self.inner.read()?;
+                inner.cpu_limit
+            };
+
+            cpu_used += self.wasm_runtime.run(
                 self.receiver.clone(),
                 action.clone(),
                 self.clone(),
                 self.db.clone(),
                 receiver_account.get_code_hash(),
+                cpu_limit,
             )?;
         }
 

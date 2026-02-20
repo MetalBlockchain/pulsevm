@@ -7,11 +7,16 @@ use lru::LruCache;
 use pulsevm_crypto::Bytes;
 use pulsevm_error::ChainError;
 use pulsevm_ffi::{CxxDigest, Database};
+use spdlog::info;
 use wasmer::{
-    Engine, Function, FunctionEnv, Instance, Memory, Module, Store, imports, sys::CompilerConfig, wasmparser::Operator,
+    Engine, Function, FunctionEnv, Instance, Memory, Module, Store, imports, sys::CompilerConfig,
+    wasmparser::Operator,
 };
 use wasmer_compiler_llvm::{LLVM, LLVMOptLevel};
-use wasmer_middlewares::{Metering, metering::{MeteringPoints, get_remaining_points, set_remaining_points}};
+use wasmer_middlewares::{
+    Metering,
+    metering::{MeteringPoints, get_remaining_points, set_remaining_points},
+};
 
 use crate::{
     block::BlockTimestamp,
@@ -100,45 +105,42 @@ impl WasmContext {
     }
 }
 
-struct InnerWasmRuntime {
+struct CachedModule {
+    module: Module,
     engine: Engine,
-    code_cache: LruCache<Id, Module>,
+}
+
+struct InnerWasmRuntime {
+    code_cache: LruCache<Id, CachedModule>,
 }
 
 #[derive(Clone)]
 pub struct WasmRuntime {
+    engine: Engine,
     inner: Arc<RwLock<InnerWasmRuntime>>,
 }
+
+const COST_FUNCTION: fn(&Operator) -> u64 = |operator: &Operator| -> u64 {
+    match operator {
+        Operator::MemoryGrow { .. } => 1000, // Higher cost for memory growth
+        _ => 1,                              // Default cost for unrecognized operators
+    }
+};
 
 impl WasmRuntime {
     pub fn new() -> Result<Self, ChainError> {
         let mut compiler = LLVM::default();
-
-        let cost_function = |operator: &Operator| -> u64 {
-            match operator {
-                Operator::MemoryGrow { .. } => 1000, // Higher cost for memory growth
-                _ => 1, // Default cost for unrecognized operators
-            }
-        };
-
-        let metering = Arc::new(Metering::new(0, cost_function));
-        compiler.push_middleware(metering);
 
         // Deterministic floating point operations
         LLVM::canonicalize_nans(&mut compiler, true);
         LLVM::opt_level(&mut compiler, LLVMOptLevel::Aggressive);
 
         Ok(Self {
+            engine: compiler.into(),
             inner: Arc::new(RwLock::new(InnerWasmRuntime {
-                engine: compiler.into(),
                 code_cache: LruCache::new(NonZeroUsize::new(1024).unwrap()),
             })),
         })
-    }
-
-    pub fn compile_module(&self, code: &[u8]) -> Result<Module, ChainError> {
-        let store = Store::new(self.inner.read()?.engine.clone());
-        Module::new(store.engine(), code).map_err(|e| ChainError::WasmRuntimeError(e.to_string()))
     }
 
     pub fn run(
@@ -148,27 +150,39 @@ impl WasmRuntime {
         apply_context: ApplyContext,
         db: Database,
         code_hash: &CxxDigest,
-    ) -> Result<(), ChainError> {
+        cpu_limit: i64,
+    ) -> Result<u64, ChainError> {
         // Pause timer
         apply_context.pause_billing_timer()?;
 
-        let mut inner = self.inner.write()?;
         let id = Id::from(code_hash);
+        let mut inner = self.inner.write()?;
 
-        if !inner.code_cache.contains(&id) {
-            let code_object = db.get_code_object_by_hash(code_hash, 0, 0)?;
-            let code_object = unsafe { &*code_object };
-            // Create a temporary store just for module compilation
-            let temp_store = Store::new(inner.engine.clone());
-            let module = Module::new(temp_store.engine(), code_object.get_code().as_slice())
-                .map_err(|e| ChainError::WasmRuntimeError(e.to_string()))?;
-            inner.code_cache.put(id, module);
-        }
+        let module = {
+            if !inner.code_cache.contains(&id) {
+                let code_object = db.get_code_object_by_hash(code_hash, 0, 0)?;
+                let code_object = unsafe { &*code_object };
+                
+                // Create a temporary store just for module compilation
+                let mut compiler = LLVM::default();
 
-        let mut store = Store::new(inner.engine.clone());
-        let module = inner.code_cache.get(&id).ok_or_else(|| {
-            ChainError::WasmRuntimeError(format!("wasm module not found in cache: {}", id))
-        })?;
+                let metering = Arc::new(Metering::new(0, COST_FUNCTION));
+                compiler.push_middleware(metering);
+                LLVM::canonicalize_nans(&mut compiler, true);
+                LLVM::opt_level(&mut compiler, LLVMOptLevel::Aggressive);
+
+                let temp_engine: Engine = compiler.into();
+                let temp_store = Store::new(temp_engine.clone());
+
+                let module = Module::new(temp_store.engine(), code_object.get_code().as_slice())
+                    .map_err(|e| ChainError::WasmRuntimeError(e.to_string()))?;
+                inner.code_cache.put(id, CachedModule { module, engine: temp_engine.clone() });
+            }
+
+            inner.code_cache.get(&id).unwrap()
+        };
+
+        let mut store = Store::new(module.engine.clone());
         let wasm_context = WasmContext::new(
             receiver.clone(),
             action.clone(),
@@ -211,7 +225,7 @@ impl WasmRuntime {
                 "check_transaction_authorization" => Function::new_typed_with_env(&mut store, &env, check_transaction_authorization),
             }
         };
-        let instance = Instance::new(&mut store, &module, &import_object).map_err(|e| {
+        let instance = Instance::new(&mut store, &module.module, &import_object).map_err(|e| {
             ChainError::WasmRuntimeError(format!("failed to create wasm instance: {}", e))
         })?;
 
@@ -227,8 +241,15 @@ impl WasmRuntime {
             }
         }
 
+        // If CPU limit is -1, it means no limit, so we can set it to a very high value. Otherwise, use the provided limit.
+        let cpu_limit = if cpu_limit >= 0 {
+            cpu_limit as u64
+        } else {
+            300_000_000
+        };
+
         // Set initial metering points based on resource limits
-        set_remaining_points(&mut store, &instance, 1000);
+        set_remaining_points(&mut store, &instance, cpu_limit);
 
         let apply_func = instance
             .exports
@@ -254,18 +275,21 @@ impl WasmRuntime {
                 // Otherwise wrap it
                 ChainError::WasmRuntimeError(format!("apply error: {}", e))
             });
-        let remaining_points_after_second_call = get_remaining_points(&mut store, &instance);
+        let remaining_points: MeteringPoints = get_remaining_points(&mut store, &instance);
 
-        if remaining_points_after_second_call == MeteringPoints::Exhausted {
-            return Err(ChainError::WasmRuntimeError(
-                "wasm execution metering points exhausted".to_string(),
-            ));
+        match remaining_points {
+            MeteringPoints::Remaining(points) => {
+                // If the apply function returned an error, return it now that we've captured the remaining points
+                if let Err(e) = result {
+                    return Err(e);
+                }
+
+                Ok(cpu_limit.saturating_sub(points) as u64)
+            }
+            MeteringPoints::Exhausted => Err(ChainError::WasmRuntimeError(format!(
+                "CPU limit of {} exhausted during apply",
+                cpu_limit
+            ))),
         }
-
-        if let Err(e) = result {
-            return Err(e);
-        }
-
-        Ok(())
     }
 }

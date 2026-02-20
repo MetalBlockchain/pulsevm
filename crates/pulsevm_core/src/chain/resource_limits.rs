@@ -23,18 +23,32 @@ impl ResourceLimitsManager {
         Ok(())
     }
 
+    pub fn update_account_usage(
+        db: &mut Database,
+        account: &Name,
+        time_slot: u32,
+    ) -> Result<(), ChainError> {
+        db.update_account_usage(account, time_slot).map_err(|e| {
+            ChainError::DatabaseError(format!(
+                "failed to update account usage for account {}: {}",
+                account, e
+            ))
+        })?;
+        Ok(())
+    }
+
     pub fn add_transaction_usage(
         db: &mut Database,
-        accounts: &HashSet<Name>,
+        account: &Name,
         cpu_usage: u64,
         net_usage: u64,
         time_slot: u32,
     ) -> Result<(), ChainError> {
-        db.add_transaction_usage(accounts, cpu_usage, net_usage, time_slot)
+        db.add_transaction_usage(account, cpu_usage, net_usage, time_slot)
             .map_err(|e| {
                 ChainError::DatabaseError(format!(
-                    "failed to add transaction usage for accounts: {}",
-                    e
+                    "failed to add transaction usage for account {}: {}",
+                    account, e
                 ))
             })?;
         Ok(())

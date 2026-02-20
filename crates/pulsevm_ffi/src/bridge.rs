@@ -212,9 +212,14 @@ pub mod ffi {
             self: Pin<&mut Database>,
             account_name: u64,
         ) -> Result<()>;
+        pub fn update_account_usage(
+            self: Pin<&mut Database>,
+            account: u64,
+            time_slot: u32,
+        ) -> Result<()>;
         pub fn add_transaction_usage(
             self: Pin<&mut Database>,
-            accounts: &Vec<u64>,
+            account: u64,
             cpu_usage: u64,
             net_usage: u64,
             time_slot: u32,

@@ -196,61 +196,68 @@ public:
         });
     }
 
-    void add_transaction_usage(const rust::Vec<uint64_t>& accounts, uint64_t cpu_usage, uint64_t net_usage, uint32_t time_slot ) {
+    void update_account_usage(uint64_t account, uint32_t time_slot ) {
+        const auto& config = this->get<resource_limits::resource_limits_config_object>();
+        const auto& usage = this->get<resource_limits::resource_usage_object,resource_limits::by_owner>( name(account) );
+
+        this->modify( usage, [&]( auto& bu ){
+            bu.net_usage.add( 0, time_slot, config.account_net_usage_average_window );
+            bu.cpu_usage.add( 0, time_slot, config.account_cpu_usage_average_window );
+        });
+    }
+
+    void add_transaction_usage(uint64_t account, uint64_t cpu_usage, uint64_t net_usage, uint32_t time_slot ) {
         const auto& state = this->get<resource_limits::resource_limits_state_object>();
         const auto& config = this->get<resource_limits::resource_limits_config_object>();
+        const auto& usage = this->get<resource_limits::resource_usage_object,resource_limits::by_owner>( name(account) );
+        int64_t unused;
+        int64_t net_weight;
+        int64_t cpu_weight;
+        get_account_limits( account, unused, net_weight, cpu_weight );
 
-        for( const auto& ac : accounts ) {
-            const auto& usage = this->get<resource_limits::resource_usage_object,resource_limits::by_owner>( name(ac) );
-            int64_t unused;
-            int64_t net_weight;
-            int64_t cpu_weight;
-            get_account_limits( ac, unused, net_weight, cpu_weight );
+        this->modify( usage, [&]( auto& bu ){
+            bu.net_usage.add( net_usage, time_slot, config.account_net_usage_average_window );
+            bu.cpu_usage.add( cpu_usage, time_slot, config.account_cpu_usage_average_window );
+        });
 
-            this->modify( usage, [&]( auto& bu ){
-                bu.net_usage.add( net_usage, time_slot, config.account_net_usage_average_window );
-                bu.cpu_usage.add( cpu_usage, time_slot, config.account_cpu_usage_average_window );
-            });
+        if( cpu_weight >= 0 && state.total_cpu_weight > 0 ) {
+            uint128_t window_size = config.account_cpu_usage_average_window;
+            auto virtual_network_capacity_in_window = (uint128_t)state.virtual_cpu_limit * window_size;
+            auto cpu_used_in_window                 = ((uint128_t)usage.cpu_usage.value_ex * window_size) / (uint128_t)config::rate_limiting_precision;
 
-            if( cpu_weight >= 0 && state.total_cpu_weight > 0 ) {
-                uint128_t window_size = config.account_cpu_usage_average_window;
-                auto virtual_network_capacity_in_window = (uint128_t)state.virtual_cpu_limit * window_size;
-                auto cpu_used_in_window                 = ((uint128_t)usage.cpu_usage.value_ex * window_size) / (uint128_t)config::rate_limiting_precision;
+            uint128_t user_weight     = (uint128_t)cpu_weight;
+            uint128_t all_user_weight = state.total_cpu_weight;
 
-                uint128_t user_weight     = (uint128_t)cpu_weight;
-                uint128_t all_user_weight = state.total_cpu_weight;
+            auto max_user_use_in_window = (virtual_network_capacity_in_window * user_weight) / all_user_weight;
 
-                auto max_user_use_in_window = (virtual_network_capacity_in_window * user_weight) / all_user_weight;
+            EOS_ASSERT( cpu_used_in_window <= max_user_use_in_window,
+                        tx_cpu_usage_exceeded,
+                        "authorizing account '${n}' has insufficient objective cpu resources for this transaction,"
+                        " used in window ${cpu_used_in_window}us, allowed in window ${max_user_use_in_window}us",
+                        ("n", name(account))
+                        ("cpu_used_in_window",cpu_used_in_window)
+                        ("max_user_use_in_window",max_user_use_in_window) );
+        }
 
-                EOS_ASSERT( cpu_used_in_window <= max_user_use_in_window,
-                            tx_cpu_usage_exceeded,
-                            "authorizing account '${n}' has insufficient objective cpu resources for this transaction,"
-                            " used in window ${cpu_used_in_window}us, allowed in window ${max_user_use_in_window}us",
-                            ("n", name(ac))
-                            ("cpu_used_in_window",cpu_used_in_window)
-                            ("max_user_use_in_window",max_user_use_in_window) );
-            }
+        if( net_weight >= 0 && state.total_net_weight > 0) {
 
-            if( net_weight >= 0 && state.total_net_weight > 0) {
+            uint128_t window_size = config.account_net_usage_average_window;
+            auto virtual_network_capacity_in_window = (uint128_t)state.virtual_net_limit * window_size;
+            auto net_used_in_window                 = ((uint128_t)usage.net_usage.value_ex * window_size) / (uint128_t)config::rate_limiting_precision;
 
-                uint128_t window_size = config.account_net_usage_average_window;
-                auto virtual_network_capacity_in_window = (uint128_t)state.virtual_net_limit * window_size;
-                auto net_used_in_window                 = ((uint128_t)usage.net_usage.value_ex * window_size) / (uint128_t)config::rate_limiting_precision;
+            uint128_t user_weight     = (uint128_t)net_weight;
+            uint128_t all_user_weight = state.total_net_weight;
 
-                uint128_t user_weight     = (uint128_t)net_weight;
-                uint128_t all_user_weight = state.total_net_weight;
+            auto max_user_use_in_window = (virtual_network_capacity_in_window * user_weight) / all_user_weight;
 
-                auto max_user_use_in_window = (virtual_network_capacity_in_window * user_weight) / all_user_weight;
+            EOS_ASSERT( net_used_in_window <= max_user_use_in_window,
+                        tx_net_usage_exceeded,
+                        "authorizing account '${n}' has insufficient net resources for this transaction,"
+                        " used in window ${net_used_in_window}, allowed in window ${max_user_use_in_window}",
+                        ("n", name(account))
+                        ("net_used_in_window",net_used_in_window)
+                        ("max_user_use_in_window",max_user_use_in_window) );
 
-                EOS_ASSERT( net_used_in_window <= max_user_use_in_window,
-                            tx_net_usage_exceeded,
-                            "authorizing account '${n}' has insufficient net resources for this transaction,"
-                            " used in window ${net_used_in_window}, allowed in window ${max_user_use_in_window}",
-                            ("n", name(ac))
-                            ("net_used_in_window",net_used_in_window)
-                            ("max_user_use_in_window",max_user_use_in_window) );
-
-            }
         }
 
         // account for this transaction in the block and do not exceed those limits either
@@ -408,10 +415,11 @@ public:
         auto max_user_use_in_window = (virtual_cpu_capacity_in_window * user_weight) / all_user_weight;
         auto cpu_used_in_window  = resource_limits::impl::integer_divide_ceil((uint128_t)usage.cpu_usage.value_ex * window_size, (uint128_t)config::rate_limiting_precision);
 
-        if( max_user_use_in_window <= cpu_used_in_window )
+        if( max_user_use_in_window <= cpu_used_in_window ) {
             arl.available = 0;
-        else
+        } else {
             arl.available = resource_limits::impl::downgrade_cast<int64_t>(max_user_use_in_window - cpu_used_in_window);
+        }
 
         arl.used = resource_limits::impl::downgrade_cast<int64_t>(cpu_used_in_window);
         arl.max = resource_limits::impl::downgrade_cast<int64_t>(max_user_use_in_window);

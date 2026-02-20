@@ -7,7 +7,7 @@ use pulsevm_error::ChainError;
 use pulsevm_ffi::Database;
 use pulsevm_serialization::VarUint32;
 use pulsevm_time::{Microseconds, TimePoint};
-use spdlog::debug;
+use spdlog::{debug, info};
 
 use crate::{
     block::BlockStatus,
@@ -41,11 +41,12 @@ pub struct TransactionResult {
 struct TransactionContextInner {
     initialized: bool,
     trace: TransactionTrace,
-    bill_to_accounts: HashSet<Name>,
+    bill_to_account: Option<Name>,
     validate_ram_usage: HashSet<Name>,
     explicit_billed_cpu_time: bool,
     billing: Billing,
     pending_block_timestamp: BlockTimestamp,
+    cpu_limit: i64,
 }
 
 #[derive(Clone)]
@@ -77,7 +78,7 @@ impl TransactionContext {
             inner: Arc::new(RwLock::new(TransactionContextInner {
                 initialized: false,
                 trace,
-                bill_to_accounts: HashSet::new(),
+                bill_to_account: None,
                 validate_ram_usage: HashSet::new(),
                 explicit_billed_cpu_time: false,
                 billing: Billing {
@@ -86,11 +87,16 @@ impl TransactionContext {
                     billed_time: Microseconds::default(),
                 },
                 pending_block_timestamp,
+                cpu_limit: 0,
             })),
         }
     }
 
-    pub fn init(&mut self, initial_net_usage: u64) -> Result<(), ChainError> {
+    pub fn init(
+        &mut self,
+        initial_net_usage: u64,
+        first_authorizer: Option<u64>,
+    ) -> Result<(), ChainError> {
         {
             let mut inner = self.inner.write()?;
 
@@ -105,6 +111,27 @@ impl TransactionContext {
             self.add_net_usage(initial_net_usage)?;
         }
 
+        // Record accounts to be billed for network and CPU usage
+        if let Some(authorizer) = first_authorizer {
+            let mut inner = self.inner.write()?;
+            let first_authorizer_name = Name::new(authorizer);
+            inner.bill_to_account = Some(first_authorizer_name.clone());
+
+            let (cpu_limit, _) = ResourceLimitsManager::get_account_cpu_limit(
+                &self.db,
+                &first_authorizer_name,
+                Some(1000),
+            )?;
+            inner.cpu_limit = cpu_limit;
+
+            // Update usage values of accounts to reflect new time
+            ResourceLimitsManager::update_account_usage(
+                &mut self.db,
+                &first_authorizer_name,
+                inner.pending_block_timestamp.slot(),
+            )?;
+        }
+
         Ok(())
     }
 
@@ -112,6 +139,7 @@ impl TransactionContext {
         &mut self,
         packed_trx_unprunable_size: u64,
         packed_trx_prunable_size: u64,
+        transaction: &Transaction,
     ) -> Result<(), ChainError> {
         let mut discounted_size_for_pruned_data = packed_trx_prunable_size;
         let global_properties = unsafe { &*self.db.get_global_properties()? };
@@ -131,8 +159,9 @@ impl TransactionContext {
         let initial_net_usage: u64 = (chain_config.get_base_per_transaction_net_usage() as u64)
             + packed_trx_unprunable_size
             + discounted_size_for_pruned_data;
+        let first_authorizer = transaction.first_authorizer();
 
-        self.init(initial_net_usage)?;
+        self.init(initial_net_usage, first_authorizer)?;
         Ok(())
     }
 
@@ -242,16 +271,16 @@ impl TransactionContext {
             self.db.clone(),
             self.wasm_runtime.clone(),
             self.clone(),
-            action,
+            action.clone(),
             receiver.clone(),
             action_ordinal,
             recurse_depth,
+            self.get_cpu_limit()?,
         )?;
 
         // Initialize the apply context with the action trace.
-        apply_context.exec(self)?;
-        //self.billed_cpu_time_us
-        //    .fetch_add(cpu_used as i64, std::sync::atomic::Ordering::Relaxed);
+        let cpu_used = apply_context.exec(self)?;
+        self.add_cpu_usage(cpu_used as u32)?;
 
         // Finalize the apply context
         for (account, ram_delta) in apply_context.account_ram_deltas()?.iter() {
@@ -329,11 +358,8 @@ impl TransactionContext {
 
         let mut inner = self.inner.write()?;
         inner.trace.net_usage = ((inner.trace.net_usage + 7) / 8) * 8; // Round up to nearest multiple of word size (8 bytes)
-        inner.trace.receipt = TransactionReceiptHeader::new(
-            TransactionStatus::Executed,
-            billed_cpu_time_us as u32,
-            VarUint32((inner.trace.net_usage / 8) as u32),
-        );
+        inner.trace.receipt.status = TransactionStatus::Executed;
+        inner.trace.receipt.net_usage_words = VarUint32((inner.trace.net_usage / 8) as u32);
 
         for account in inner.validate_ram_usage.iter() {
             ResourceLimitsManager::verify_account_ram_usage(&mut self.db, account)?;
@@ -341,10 +367,11 @@ impl TransactionContext {
 
         debug!("Transaction took {} micros", billed_cpu_time_us);
 
+        // During benchmarks this would throw an error because the accounts won't have enough CPU to cover the billed time, so we skip this step if we're benchmarking.
         if self.block_status != BlockStatus::Benchmarking {
             ResourceLimitsManager::add_transaction_usage(
                 &mut self.db,
-                &inner.bill_to_accounts,
+                &inner.bill_to_account.unwrap(),
                 billed_cpu_time_us as u64,
                 inner.trace.net_usage as u64,
                 inner.pending_block_timestamp.slot(),
@@ -355,6 +382,12 @@ impl TransactionContext {
             trace: inner.trace.clone(),
             billed_cpu_time_us,
         })
+    }
+
+    pub fn add_cpu_usage(&self, cpu_usage: u32) -> Result<(), ChainError> {
+        let mut inner = self.inner.write()?;
+        inner.trace.receipt.cpu_usage_us += cpu_usage;
+        Ok(())
     }
 
     pub fn add_net_usage(&self, net_usage: u64) -> Result<(), ChainError> {
@@ -407,5 +440,10 @@ impl TransactionContext {
         let inner = self.inner.read()?;
         let billed = (now - inner.billing.pseudo_start).count();
         Ok(billed as u32)
+    }
+
+    pub fn get_cpu_limit(&self) -> Result<i64, ChainError> {
+        let inner = self.inner.read()?;
+        Ok(inner.cpu_limit)
     }
 }

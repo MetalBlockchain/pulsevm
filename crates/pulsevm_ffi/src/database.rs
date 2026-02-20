@@ -259,19 +259,31 @@ impl Database {
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 
-    pub fn add_transaction_usage(
+    pub fn update_account_usage(
         &mut self,
-        accounts: &HashSet<Name>,
-        cpu_usage: u64,
-        net_usage: u64,
+        account: &Name,
         time_slot: u32,
     ) -> Result<(), ChainError> {
-        let accounts_vec: Vec<u64> = accounts.iter().map(|name| name.as_u64()).collect();
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
 
         pinned
-            .add_transaction_usage(&accounts_vec, cpu_usage, net_usage, time_slot)
+            .update_account_usage(account.as_u64(), time_slot)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
+    pub fn add_transaction_usage(
+        &mut self,
+        account: &Name,
+        cpu_usage: u64,
+        net_usage: u64,
+        time_slot: u32,
+    ) -> Result<(), ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .add_transaction_usage(account.as_u64(), cpu_usage, net_usage, time_slot)
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 

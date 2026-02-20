@@ -96,6 +96,15 @@ impl Transaction {
         )?;
         return Ok(());
     }
+
+    pub fn first_authorizer(&self) -> Option<u64> {
+        for action in &self.actions {
+            if let Some(auth) = action.authorization().first() {
+                return Some(auth.actor.clone());
+            }
+        }
+        None
+    }
 }
 
 impl Serialize for Transaction {

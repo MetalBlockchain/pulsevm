@@ -2,12 +2,7 @@ mod request;
 mod session;
 mod types;
 
-use std::{
-    net::SocketAddr,
-    sync::{
-        Arc,
-    },
-};
+use std::{net::SocketAddr, sync::Arc};
 
 use pulsevm_core::controller::Controller;
 use tokio::{

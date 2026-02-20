@@ -19,10 +19,7 @@ use tokio::sync::RwLock;
 use tonic::async_trait;
 
 use crate::{
-    api::{
-        GetCodeHashResponse, GetInfoResponse, GetRawABIResponse,
-        IssueTxResponse,
-    },
+    api::{GetCodeHashResponse, GetInfoResponse, GetRawABIResponse, IssueTxResponse},
     chain::{GossipType, Gossipable, NetworkManager},
 };
 
