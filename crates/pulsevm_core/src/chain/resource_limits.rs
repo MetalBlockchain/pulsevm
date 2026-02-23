@@ -132,7 +132,7 @@ impl ResourceLimitsManager {
         account: &Name,
         greylist_limit: Option<u32>,
     ) -> Result<(i64, bool), ChainError> {
-        let res = db.get_account_net_limit(account.as_u64(), 0).map_err(|e| {
+        let res = db.get_account_net_limit(account.as_u64(), greylist_limit.unwrap_or(1000)).map_err(|e| {
             ChainError::DatabaseError(format!(
                 "failed to get net limit for account {}: {}",
                 account, e
@@ -147,7 +147,7 @@ impl ResourceLimitsManager {
         account: &Name,
         greylist_limit: Option<u32>,
     ) -> Result<(i64, bool), ChainError> {
-        let res = db.get_account_cpu_limit(account.as_u64(), 0).map_err(|e| {
+        let res = db.get_account_cpu_limit(account.as_u64(), greylist_limit.unwrap_or(1000)).map_err(|e| {
             ChainError::DatabaseError(format!(
                 "failed to get cpu limit for account {}: {}",
                 account, e
