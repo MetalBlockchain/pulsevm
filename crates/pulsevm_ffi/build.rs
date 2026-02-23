@@ -46,6 +46,8 @@ fn main() {
             // On some Linux systems, Boost libraries are in a different directory
             if Path::new("/usr/lib/x86_64-linux-gnu").exists() {
                 default_path = "/usr/lib/x86_64-linux-gnu";
+            } else if Path::new("/usr/lib/aarch64-linux-gnu").exists() {
+                default_path = "/usr/lib/aarch64-linux-gnu";
             }
 
             PathBuf::from(default_path)
@@ -63,6 +65,8 @@ fn main() {
             // On some Linux systems, Boost libraries are in a different directory
             if Path::new("/usr/lib/x86_64-linux-gnu").exists() {
                 default_path = "/usr/lib/x86_64-linux-gnu";
+            } else if Path::new("/usr/lib/aarch64-linux-gnu").exists() {
+                default_path = "/usr/lib/aarch64-linux-gnu";
             }
 
             PathBuf::from(default_path)
