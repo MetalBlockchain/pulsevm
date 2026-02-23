@@ -11,10 +11,11 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
-      - name: Install LLVM and Clang
-        uses: KyleMayes/install-llvm-action@v2
-        with:
-          version: "21.1.8"
+      - name: Configure LLVM APT repository
+        run: wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key|sudo apt-key add - && sudo echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm.list
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y gcc-13 g++-13 cmake libgmp-dev zlib1g-dev pkg-config libcurl4-openssl-dev libboost-all-dev llvm-21-dev libpolly-21-dev
 
       - name: Checkout source code
         uses: actions/checkout@v4
@@ -38,8 +39,5 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y gcc-13 g++-13 cmake libgmp-dev zlib1g-dev pkg-config libcurl4-openssl-dev libboost-all-dev llvm-18-dev libpolly-18-dev
-
       - name: Build release artifact
-        run: CXX=/usr/bin/g++-13 CC=/usr/bin/gcc-13 LLVM_SYS_211_PREFIX=/home/runner/work/pulsevm/pulsevm/llvm cargo build --release
+        run: CXX=/usr/bin/g++-13 CC=/usr/bin/gcc-13 LLVM_SYS_211_PREFIX=/usr/lib/llvm-21 cargo build --release
