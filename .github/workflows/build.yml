@@ -11,6 +11,11 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
+      - name: Install LLVM and Clang
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: "21.1.8"
+
       - name: Checkout source code
         uses: actions/checkout@v4
         with:
