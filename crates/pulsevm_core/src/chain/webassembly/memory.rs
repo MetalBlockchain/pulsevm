@@ -1,88 +1,45 @@
-/* use wasmtime::Caller;
+use wasmer::{FunctionEnvMut, RuntimeError, WasmPtr};
 
-use crate::chain::wasm_runtime::WasmContext;
+use crate::wasm_runtime::WasmContext;
 
-pub fn memcpy() -> impl Fn(Caller<'_, WasmContext>, u32, u32, u32) -> Result<u32, wasmtime::Error> {
-    |mut caller, dest, src, length| {
-        let memory = caller
-            .get_export("memory")
-            .and_then(|ext| ext.into_memory())
-            .ok_or_else(|| anyhow::anyhow!("memory export not found"))?;
-
-        // Read source bytes safely
-        let mut src_bytes = vec![0u8; length as usize];
-        memory.read(&caller, src as usize, &mut src_bytes)?;
-
-        // Overlap check
-        let dest_start = dest as isize;
-        let src_start = src as isize;
-        if (dest_start - src_start).abs() < length as isize {
-            anyhow::bail!("memcpy requires non-overlapping memory regions");
-        }
-
-        // Write bytes safely to dest
-        memory.write(&mut caller, dest as usize, &src_bytes)?;
-
-        Ok(dest) // Return destination pointer like EOS does
+ #[inline]
+pub fn memmove(
+    mut env: FunctionEnvMut<WasmContext>,
+    dest_ptr: WasmPtr<u8>,
+    src_ptr: WasmPtr<u8>,
+    src_size: u32,
+) -> Result<WasmPtr<u8>, RuntimeError> {
+    if src_size == 0 {
+        return Ok(dest_ptr);
     }
-}
 
-pub fn memmove() -> impl Fn(Caller<'_, WasmContext>, u32, u32, u32) -> Result<u32, wasmtime::Error>
-{
-    |mut caller, dest, src, length| {
-        let memory = caller
-            .get_export("memory")
-            .and_then(|ext| ext.into_memory())
-            .ok_or_else(|| anyhow::anyhow!("memory export not found"))?;
+    let (env_data, store) = env.data_and_store_mut();
+    let memory = env_data
+        .memory()
+        .as_ref()
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
+    let view = memory.view(&store);
 
-        // Read source bytes safely
-        let mut src_bytes = vec![0u8; length as usize];
-        memory.read(&caller, src as usize, &mut src_bytes)?;
+    // Bounds-check + obtain access guards (no Vec)
+    let mut dest_access = dest_ptr
+        .slice(&view, src_size)
+        .map_err(|e| RuntimeError::new(format!("memmove: invalid dest range: {e}")))?
+        .access()
+        .map_err(|e| RuntimeError::new(format!("memmove: cannot access dest: {e}")))?;
 
-        // Write bytes safely to dest
-        memory.write(&mut caller, dest as usize, &src_bytes)?;
+    let src_access = src_ptr
+        .slice(&view, src_size)
+        .map_err(|e| RuntimeError::new(format!("memmove: invalid src range: {e}")))?
+        .access()
+        .map_err(|e| RuntimeError::new(format!("memmove: cannot access src: {e}")))?;
 
-        Ok(dest) // Return destination pointer like EOS does
+    let dst: &mut [u8] = dest_access.as_mut();
+    let src: &[u8] = src_access.as_ref();
+
+    // memmove semantics: overlap-safe
+    unsafe {
+        std::ptr::copy(src.as_ptr(), dst.as_mut_ptr(), src_size as usize);
     }
+
+    Ok(dest_ptr)
 }
-
-pub fn memcmp() -> impl Fn(Caller<'_, WasmContext>, u32, u32, u32) -> Result<i32, wasmtime::Error> {
-    |mut caller, lhs, rhs, length| {
-        let memory = caller
-            .get_export("memory")
-            .and_then(|ext| ext.into_memory())
-            .ok_or_else(|| anyhow::anyhow!("memory export not found"))?;
-
-        let len = length as usize;
-        let mut lhs_bytes = vec![0u8; len];
-        memory.read(&caller, lhs as usize, &mut lhs_bytes)?;
-        let mut rhs_bytes = vec![0u8; len];
-        memory.read(&caller, rhs as usize, &mut rhs_bytes)?;
-
-        let result = match lhs_bytes.cmp(&rhs_bytes) {
-            std::cmp::Ordering::Less => -1,
-            std::cmp::Ordering::Equal => 0,
-            std::cmp::Ordering::Greater => 1,
-        };
-
-        Ok(result) // Return destination pointer like EOS does
-    }
-}
-
-pub fn memset() -> impl Fn(Caller<'_, WasmContext>, u32, u32, u32) -> Result<u32, wasmtime::Error> {
-    |mut caller, dest, value, length| {
-        let memory = caller
-            .get_export("memory")
-            .and_then(|ext| ext.into_memory())
-            .ok_or_else(|| anyhow::anyhow!("memory export not found"))?;
-
-        let len = length as usize;
-        let val = value as u8;
-        let fill = vec![val; len];
-
-        memory.write(&mut caller, dest as usize, &fill)?;
-
-        Ok(dest)
-    }
-}
- */

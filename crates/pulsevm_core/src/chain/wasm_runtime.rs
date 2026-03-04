@@ -7,7 +7,7 @@ use lru::LruCache;
 use pulsevm_crypto::Bytes;
 use pulsevm_error::ChainError;
 use pulsevm_ffi::{CxxDigest, Database};
-use spdlog::info;
+use spdlog::{debug, info};
 use wasmer::{
     Engine, Function, FunctionEnv, Instance, Memory, Module, Store, imports, sys::CompilerConfig,
     wasmparser::Operator,
@@ -26,11 +26,7 @@ use crate::{
         name::Name,
         transaction::Action,
         webassembly::{
-            check_transaction_authorization, current_time, db_end_i64, db_find_i64, db_get_i64,
-            db_lowerbound_i64, db_next_i64, db_previous_i64, db_remove_i64, db_store_i64,
-            db_update_i64, db_upperbound_i64, get_resource_limits, is_privileged, pulse_assert,
-            read_action_data, require_auth2, require_recipient, set_action_return_value,
-            set_privileged, set_resource_limits, sha224, sha256, sha512,
+            assert_sha224, assert_sha256, assert_sha512, check_transaction_authorization, current_time, db_end_i64, db_find_i64, db_get_i64, db_lowerbound_i64, db_next_i64, db_previous_i64, db_remove_i64, db_store_i64, db_update_i64, db_upperbound_i64, get_resource_limits, is_privileged, memmove, pulse_assert, read_action_data, require_auth2, require_recipient, set_action_return_value, set_privileged, set_resource_limits, sha224, sha256, sha512
         },
     },
 };
@@ -193,6 +189,7 @@ impl WasmRuntime {
         let env = FunctionEnv::new(&mut store, wasm_context);
         let import_object = imports! {
             "env" => {
+                "memmove" => Function::new_typed_with_env(&mut store, &env, memmove),
                 "action_data_size" => Function::new_typed_with_env(&mut store, &env, action_data_size),
                 "read_action_data" => Function::new_typed_with_env(&mut store, &env, read_action_data),
                 "current_receiver" => Function::new_typed_with_env(&mut store, &env, current_receiver),
@@ -217,6 +214,9 @@ impl WasmRuntime {
                 "sha224" => Function::new_typed_with_env(&mut store, &env, sha224),
                 "sha256" => Function::new_typed_with_env(&mut store, &env, sha256),
                 "sha512" => Function::new_typed_with_env(&mut store, &env, sha512),
+                "assert_sha224" => Function::new_typed_with_env(&mut store, &env, assert_sha224),
+                "assert_sha256" => Function::new_typed_with_env(&mut store, &env, assert_sha256),
+                "assert_sha512" => Function::new_typed_with_env(&mut store, &env, assert_sha512),
                 "is_privileged" => Function::new_typed_with_env(&mut store, &env, is_privileged),
                 "set_privileged" => Function::new_typed_with_env(&mut store, &env, set_privileged),
                 "set_resource_limits" => Function::new_typed_with_env(&mut store, &env, set_resource_limits),
