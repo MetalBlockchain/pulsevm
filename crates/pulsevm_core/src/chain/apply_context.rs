@@ -151,9 +151,6 @@ impl ApplyContext {
             native(self, &mut self.db.clone(), &action)?;
         }
 
-        // Refresh the receiver account metadata
-        let receiver_account = self.db.get_account_metadata(self.receiver.as_u64())?;
-
         // Does the receiver account have a contract deployed?
         if !receiver_account.get_code_hash().empty() {
             // Separate context here because we need to release the lock on inner before executing the Wasm code, which may call back into the context and cause deadlock if we hold the lock.
