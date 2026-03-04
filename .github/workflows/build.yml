@@ -49,6 +49,9 @@ jobs:
             target
           key: ${{ runner.os }}-${{ matrix.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
+      - name: Run unit tests
+        run: CXX=/usr/bin/g++-13 CC=/usr/bin/gcc-13 LLVM_SYS_211_PREFIX=/usr/lib/llvm-21 cargo test
+
       - name: Build release artifact
         run: CXX=/usr/bin/g++-13 CC=/usr/bin/gcc-13 LLVM_SYS_211_PREFIX=/usr/lib/llvm-21 cargo build --release
 

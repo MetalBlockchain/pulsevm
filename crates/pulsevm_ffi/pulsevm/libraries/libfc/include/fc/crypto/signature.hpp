@@ -37,10 +37,8 @@ namespace fc { namespace crypto {
          size_t variable_size() const;
 
          int cmp(const signature& other) const {
-            if (this != &other) {
-               return this < &other ? -1 : 1;
-            }
-
+            if (*this < other) return -1;
+            if (other < *this) return 1;
             return 0;
          }
 

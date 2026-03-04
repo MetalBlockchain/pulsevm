@@ -3,7 +3,7 @@ mod unittests;
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, fs, path::Path, str::FromStr, sync::Arc, vec};
+    use std::{collections::HashSet, fs, path::Path, str::FromStr, sync::Arc, u32, vec};
 
     use pulsevm_core::{
         ACTIVE_NAME, CODE_NAME, ChainError, Database, OWNER_NAME, PULSE_NAME,
@@ -26,6 +26,7 @@ mod tests {
     use pulsevm_crypto::{Bytes, Digest};
     use pulsevm_name_macro::name;
     use pulsevm_serialization::{VarUint32, Write};
+    use pulsevm_time::TimePointSec;
     use serde_json::json;
 
     #[derive(Clone)]
@@ -48,10 +49,16 @@ mod tests {
             let mut controller = Controller::new();
             let private_key = get_private_key(PULSE_NAME.into(), "active");
             let genesis = generate_genesis(&private_key);
+            let config_bytes = json!({
+                "producer_name": "pulse",
+                "producer_key": private_key.to_string(),
+            })
+            .to_string()
+            .into_bytes();
 
             // Initialize controller
             controller
-                .initialize(&chain_id, &genesis, temp_dir.path().to_str().unwrap())
+                .initialize(&chain_id, &config_bytes, &genesis, temp_dir.path().to_str().unwrap())
                 .expect("Failed to initialize controller");
 
             let mut suite = Testing {
@@ -92,7 +99,7 @@ mod tests {
             include_code: bool,
         ) -> Result<TransactionTrace, ChainError> {
             let mut trx = Transaction::default();
-            self.set_transaction_headers(&mut trx, 6, 0);
+            self.set_transaction_headers(&mut trx, u32::MAX, 0);
             let mut owner_auth = Authority::new(
                 1,
                 vec![KeyWeight::new(get_public_key(account, "owner").inner(), 1)],
@@ -159,7 +166,7 @@ mod tests {
                 vec![PermissionLevel::new(creator.as_u64(), ACTIVE_NAME.as_u64())],
             ));
 
-            self.set_transaction_headers(&mut trx, 6, 0);
+            self.set_transaction_headers(&mut trx, u32::MAX, 0);
             let signed = trx
                 .sign(
                     &get_private_key(creator, "active"),
@@ -223,7 +230,7 @@ mod tests {
                 auths,
             ));
 
-            self.set_transaction_headers(&mut trx, 6, 0);
+            self.set_transaction_headers(&mut trx, u32::MAX, 0);
             let mut signed: SignedTransaction = SignedTransaction::new(trx, HashSet::new(), vec![]);
             for key in keys.iter() {
                 signed = signed.sign(key, &self.controller.chain_id())?;
@@ -248,17 +255,18 @@ mod tests {
         pub fn set_transaction_headers(
             &self,
             trx: &mut Transaction,
-            _expiration: u32,
+            expiration: u32,
             delay_sec: u32,
         ) {
             trx.header.max_net_usage_words = VarUint32(0); // No limit
             trx.header.max_cpu_usage = 0; // No limit
             trx.header.delay_sec = VarUint32(delay_sec);
+            trx.header.expiration = TimePointSec::new(expiration)
         }
 
         pub fn set_code(&mut self, account: Name, wasm: Bytes) -> Result<(), ChainError> {
             let mut trx = Transaction::default();
-            self.set_transaction_headers(&mut trx, 6, 0);
+            self.set_transaction_headers(&mut trx, u32::MAX, 0);
             trx.actions.push(Action::new(
                 PULSE_NAME.into(),
                 SETCODE_NAME.into(),
@@ -320,7 +328,7 @@ mod tests {
                 .unwrap(),
                 auths,
             ));
-            self.set_transaction_headers(&mut trx, 6, 0);
+            self.set_transaction_headers(&mut trx, u32::MAX, 0);
 
             let mut signed: SignedTransaction = SignedTransaction::new(trx, HashSet::new(), vec![]);
             for key in keys.iter() {
@@ -361,7 +369,7 @@ mod tests {
                 .unwrap(),
                 auths,
             ));
-            self.set_transaction_headers(&mut trx, 6, 0);
+            self.set_transaction_headers(&mut trx, u32::MAX, 0);
 
             let mut signed: SignedTransaction = SignedTransaction::new(trx, HashSet::new(), vec![]);
             for key in keys.iter() {
@@ -402,7 +410,7 @@ mod tests {
                 .unwrap(),
                 vec![PermissionLevel::new(account.as_u64(), ACTIVE_NAME.as_u64())],
             ));
-            self.set_transaction_headers(&mut trx, 6, 0);
+            self.set_transaction_headers(&mut trx, u32::MAX, 0);
 
             let signed = trx.sign(
                 &get_private_key(account, "active"),
@@ -431,7 +439,7 @@ mod tests {
                 .unwrap(),
                 vec![PermissionLevel::new(account.as_u64(), ACTIVE_NAME.as_u64())],
             ));
-            self.set_transaction_headers(&mut trx, 6, 0);
+            self.set_transaction_headers(&mut trx, u32::MAX, 0);
 
             let signed = trx.sign(
                 &get_private_key(account, "active"),

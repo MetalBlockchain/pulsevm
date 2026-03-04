@@ -45,10 +45,8 @@ namespace fc { namespace crypto {
          storage_type _storage;
 
          int cmp(const public_key& other) const {
-            if (this != &other) {
-               return this < &other ? -1 : 1;
-            }
-
+            if (*this < other) return -1;
+            if (other < *this) return 1;
             return 0;
          }
 

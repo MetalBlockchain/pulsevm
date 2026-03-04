@@ -273,7 +273,7 @@ impl WasmRuntime {
                 }
 
                 // Otherwise wrap it
-                ChainError::WasmRuntimeError(format!("apply error: {}", e))
+                ChainError::WasmRuntimeError(format!("apply error: {}", e.message()))
             });
         let remaining_points: MeteringPoints = get_remaining_points(&mut store, &instance);
 

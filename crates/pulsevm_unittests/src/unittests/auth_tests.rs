@@ -74,7 +74,7 @@ mod auth_tests {
                 )
                 .err(),
             Some(ChainError::WasmRuntimeError(
-                "apply error: RuntimeError: missing authority of alice".into()
+                "apply error: missing authority of alice".into()
             ))
         );
         Ok(())

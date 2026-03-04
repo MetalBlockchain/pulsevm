@@ -724,7 +724,7 @@ mod tests {
         chain_id: Id,
     ) -> Result<PackedTransaction, ChainError> {
         let trx = Transaction::new(
-            TransactionHeader::new(TimePointSec::new(0), 0, 0, 0u32.into(), 0, 0u32.into()),
+            TransactionHeader::new(TimePointSec::maximum(), 0, 0, 0u32.into(), 0, 0u32.into()),
             vec![],
             vec![Action::new(
                 Name::from_str("pulse")?,
@@ -765,7 +765,7 @@ mod tests {
         chain_id: Id,
     ) -> Result<PackedTransaction, ChainError> {
         let trx = Transaction::new(
-            TransactionHeader::new(TimePointSec::new(0), 0, 0, 0u32.into(), 0, 0u32.into()),
+            TransactionHeader::new(TimePointSec::maximum(), 0, 0, 0u32.into(), 0, 0u32.into()),
             vec![],
             vec![Action::new(
                 Name::from_str("pulse").unwrap(),
@@ -794,7 +794,7 @@ mod tests {
         chain_id: Id,
     ) -> Result<PackedTransaction, ChainError> {
         let trx = Transaction::new(
-            TransactionHeader::new(TimePointSec::new(0), 0, 0, 0u32.into(), 0, 0u32.into()),
+            TransactionHeader::new(TimePointSec::maximum(), 0, 0, 0u32.into(), 0, 0u32.into()),
             vec![],
             vec![Action::new(
                 account,
