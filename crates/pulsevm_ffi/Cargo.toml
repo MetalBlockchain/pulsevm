@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 libc = "0.2"
 cxx = "1.0.194"
+hex = "0.4"
 tempfile = "3.23.0"
 serde = { version = "1.0", features = ["derive"] }
 pulsevm_billable_size = { path = "../pulsevm_billable_size" }

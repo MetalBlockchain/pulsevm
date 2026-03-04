@@ -33,6 +33,7 @@ pub mod authority {
 pub use pulsevm_error::ChainError;
 use pulsevm_name::Name;
 use pulsevm_name_macro::name;
+pub use wat::parse_str as wat2wasm;
 
 pub const PULSE_NAME: Name = Name::new(name!("pulse"));
 pub const OWNER_NAME: Name = Name::new(name!("owner"));

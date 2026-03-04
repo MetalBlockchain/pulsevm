@@ -279,13 +279,13 @@ mod tests {
                 .pack()
                 .unwrap(),
                 vec![PermissionLevel::new(
-                    PULSE_NAME.as_u64(),
+                    account.as_u64(),
                     ACTIVE_NAME.as_u64(),
                 )],
             ));
 
             let signed = trx.sign(
-                &get_private_key(PULSE_NAME, "active"),
+                &get_private_key(account, "active"),
                 &self.controller.chain_id(),
             )?;
             self.push_transaction(signed)?;

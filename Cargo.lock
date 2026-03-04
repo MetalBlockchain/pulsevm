@@ -2489,6 +2489,7 @@ dependencies = [
  "wasmer",
  "wasmer-compiler-llvm",
  "wasmer-middlewares",
+ "wat",
 ]
 
 [[package]]
@@ -2522,6 +2523,7 @@ dependencies = [
  "criterion",
  "cxx",
  "cxx-build",
+ "hex",
  "libc",
  "pulsevm_billable_size",
  "pulsevm_constants",

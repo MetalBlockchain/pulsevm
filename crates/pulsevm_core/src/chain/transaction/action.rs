@@ -10,11 +10,11 @@ use crate::chain::{Name, authority::PermissionLevel};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Default)]
 pub struct Action {
-    account: Name,
-    name: Name,
-    authorization: Vec<PermissionLevel>,
+    pub account: Name,
+    pub name: Name,
+    pub authorization: Vec<PermissionLevel>,
     #[serde(with = "arc_bytes_serde")]
-    data: Arc<[u8]>,
+    pub data: Arc<[u8]>,
 }
 
 impl fmt::Display for Action {
