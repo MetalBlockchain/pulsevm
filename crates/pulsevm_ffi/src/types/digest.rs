@@ -1,3 +1,5 @@
+use core::fmt;
+
 use cxx::UniquePtr;
 use pulsevm_error::ChainError;
 
@@ -25,5 +27,17 @@ impl CxxDigest {
 impl PartialEq for &CxxDigest {
     fn eq(&self, other: &Self) -> bool {
         self.as_slice() == other.as_slice()
+    }
+}
+
+impl fmt::Debug for CxxDigest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", hex::encode(self.as_slice()))
+    }
+}
+
+impl fmt::Display for CxxDigest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", hex::encode(self.as_slice()))
     }
 }
