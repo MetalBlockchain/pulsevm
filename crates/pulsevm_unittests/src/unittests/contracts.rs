@@ -118,3 +118,37 @@ pub static ENTRY_WAST: &str = r#"(module
  )
  (start $entry)
 )"#;
+
+pub static ENTRY_WAST_2: &str = r#"(module
+ (import "env" "require_auth" (func $require_auth (param i64)))
+ (import "env" "pulse_assert" (func $pulse_assert (param i32 i32 i32)))
+ (import "env" "current_time" (func $current_time (result i64)))
+ (table 0 funcref)
+ (memory $0 1)
+ (export "memory" (memory $0))
+ (export "apply" (func $apply))
+ (start $entry)
+ (func $apply (param $0 i64) (param $1 i64) (param $2 i64)
+  (block
+   (call $require_auth (i64.const 6121376101093867520))
+   (call $pulse_assert
+    (i64.eq
+     (i64.load offset=4
+      (i32.const 0)
+     )
+     (call $current_time)
+    )
+    (i32.const 0)
+    (i32.const 0)
+   )
+  )
+ )
+ (func $entry
+  (block
+   (i64.store offset=4
+    (i32.const 0)
+    (call $current_time)
+   )
+  )
+ )
+)"#;
