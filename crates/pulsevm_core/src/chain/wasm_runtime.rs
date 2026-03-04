@@ -162,7 +162,8 @@ impl WasmRuntime {
                 // Create a temporary store just for module compilation
                 let mut compiler = LLVM::default();
 
-                let metering = Arc::new(Metering::new(0, COST_FUNCTION));
+                // Add initial limit of 1,000 so start function can run if present
+                let metering = Arc::new(Metering::new(1_000, COST_FUNCTION));
                 compiler.push_middleware(metering);
                 LLVM::canonicalize_nans(&mut compiler, true);
                 LLVM::opt_level(&mut compiler, LLVMOptLevel::Aggressive);
