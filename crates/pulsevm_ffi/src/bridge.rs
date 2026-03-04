@@ -104,6 +104,8 @@ pub mod ffi {
         pub fn get_abi_sequence(self: &AccountMetadataObject) -> u64;
         pub fn get_last_code_update(self: &AccountMetadataObject) -> &CxxTimePoint;
         pub fn is_privileged(self: &AccountMetadataObject) -> bool;
+        pub fn get_vm_type(self: &AccountMetadataObject) -> u8;
+        pub fn get_vm_version(self: &AccountMetadataObject) -> u8;
 
         #[cxx_name = "permission_object"]
         type PermissionObject;

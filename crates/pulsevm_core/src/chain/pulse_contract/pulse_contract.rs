@@ -1,10 +1,8 @@
-use core::panic;
-
 use pulsevm_billable_size::billable_size_v;
 use pulsevm_constants::{OVERHEAD_PER_ACCOUNT_RAM_BYTES, SETCODE_RAM_BYTES_MULTIPLIER};
 use pulsevm_error::ChainError;
 use pulsevm_ffi::{CxxDigest, Database, PermissionObject};
-use pulsevm_serialization::{Read, Write};
+use pulsevm_serialization::Read;
 
 use crate::{
     ACTIVE_NAME, CODE_NAME, OWNER_NAME,
@@ -161,7 +159,7 @@ pub fn setcode(
 
     if existing_code {
         let old_code_entry = unsafe {
-            &*db.get_code_object_by_hash(code_hash.as_ref().unwrap(), act.vm_type, act.vm_version)?
+            &*db.get_code_object_by_hash(account.get_code_hash(), account.get_vm_type(), account.get_vm_version())?
         };
         pulse_assert(
             old_code_entry.get_code_hash() != code_hash.as_ref().unwrap(),

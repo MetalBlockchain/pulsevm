@@ -53,6 +53,8 @@ namespace pulsevm { namespace chain {
       uint64_t get_abi_sequence() const { return abi_sequence; }
       const digest_type& get_code_hash() const { return code_hash; }
       const time_point& get_last_code_update() const { return last_code_update; }
+      uint8_t get_vm_type() const { return vm_type; }
+      uint8_t get_vm_version() const { return vm_version; }
 
       bool is_privileged()const { return has_field( flags, flags_fields::privileged ); }
 
