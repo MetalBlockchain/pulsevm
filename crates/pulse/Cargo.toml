@@ -1,0 +1,15 @@
+[package]
+name = "pulse"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "pulse"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+spdlog-rs = "0.4"
+tokio = { version = "1", features = ["full"] }
+
+pulsevm_core = { path = "../pulsevm_core" }
