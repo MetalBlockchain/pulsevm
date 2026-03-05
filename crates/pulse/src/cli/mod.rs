@@ -1,5 +1,6 @@
 pub mod create;
 pub mod dispatcher;
+pub mod wallet;
 
 use clap::{Parser, Subcommand};
 
@@ -11,6 +12,10 @@ pub struct Cli {
     /// URL of the nodeos RPC endpoint
     #[arg(short, long, default_value = "http://127.0.0.1:8888", global = true)]
     pub url: String,
+
+    /// URL of the keosd wallet endpoint
+    #[arg(long, global = true)]
+    pub wallet_url: Option<String>,
 
     /// Logging verbosity
     #[arg(long, default_value = "info", global = true, value_enum)]
@@ -34,6 +39,11 @@ pub enum Commands {
     Create {
         #[command(subcommand)]
         subcmd: CreateSubcommand,
+    },
+    /// Interact with local wallet
+    Wallet {
+        #[command(subcommand)]
+        subcmd: WalletSubcommand,
     },
 }
 
@@ -66,7 +76,7 @@ pub enum WalletSubcommand {
     /// Create a new wallet locally
     Create {
         /// Wallet name
-        #[arg(short, long, default_value = "default")]
+        #[arg(default_value = "default")]
         name: String,
         /// Save password to file
         #[arg(long)]
@@ -79,14 +89,14 @@ pub enum WalletSubcommand {
     /// Open an existing wallet
     Open {
         /// Wallet name
-        #[arg(short, long, default_value = "default")]
+        #[arg(default_value = "default")]
         name: String,
     },
 
     /// Lock a wallet
     Lock {
         /// Wallet name
-        #[arg(short, long, default_value = "default")]
+        #[arg(default_value = "default")]
         name: String,
     },
 
@@ -97,7 +107,7 @@ pub enum WalletSubcommand {
     /// Unlock a wallet
     Unlock {
         /// Wallet name
-        #[arg(short, long, default_value = "default")]
+        #[arg(default_value = "default")]
         name: String,
         /// Wallet password
         #[arg(long)]
@@ -107,7 +117,7 @@ pub enum WalletSubcommand {
     /// Import a private key into a wallet
     Import {
         /// Wallet name
-        #[arg(short, long, default_value = "default")]
+        #[arg(default_value = "default")]
         name: String,
         /// Private key (will prompt if not provided)
         #[arg(long)]
@@ -118,7 +128,14 @@ pub enum WalletSubcommand {
     List,
 
     /// List of public keys from all unlocked wallets
-    Keys,
+    Keys {
+        /// Wallet name
+        #[arg(default_value = "default")]
+        name: String,
+        /// Password to unlock wallet (will prompt if not provided)
+        #[arg(long)]
+        password: Option<String>,
+    },
 
     /// Remove a key from a wallet
     #[command(name = "remove_key")]
@@ -126,15 +143,18 @@ pub enum WalletSubcommand {
         /// Public key to remove
         key: String,
         /// Wallet name
-        #[arg(short, long, default_value = "default")]
+        #[arg(default_value = "default")]
         name: String,
+        /// Password to unlock wallet (will prompt if not provided)
+        #[arg(long)]
+        password: Option<String>,
     },
 
     /// Create a key within a wallet
     #[command(name = "create_key")]
     CreateKey {
         /// Wallet name
-        #[arg(short, long, default_value = "default")]
+        #[arg(default_value = "default")]
         name: String,
         /// Key type (K1 or R1)
         #[arg(default_value = "K1")]
