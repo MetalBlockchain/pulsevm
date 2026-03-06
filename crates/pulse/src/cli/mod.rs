@@ -62,12 +62,15 @@ pub enum CreateSubcommand {
     },
     /// Create a new keypair and print the public and private keys
     Key {
-        /// Key type (K1 or R1)
-        #[arg(long, default_value = "K1")]
-        key_type: String,
-        /// Save keys to file
-        #[arg(long)]
+        /// Name of file to write private/public key output to. (Must be set, unless "--to-console" is passed
+        #[arg(short, long)]
+        file: Option<String>,
+        /// Print private/public keys to console
+        #[arg(long, default_value_t = false)]
         to_console: bool,
+        /// Generate a key using the R1 curve (iPhone), instead of the K1 curve (Bitcoin)
+        #[arg(long, default_value_t = false)]
+        r1: bool,
     },
 }
 

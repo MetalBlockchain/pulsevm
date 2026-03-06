@@ -31,6 +31,18 @@ impl PrivateKey {
     pub fn get_public_key(&self) -> PublicKey {
         PublicKey::new(self.inner.get_public_key())
     }
+
+    /// Generates a random K1 private key.
+    pub fn random() -> Self {
+        let cxx_key = pulsevm_ffi::random_private_key();
+        PrivateKey { inner: cxx_key }
+    }
+
+    /// Generates a random R1 private key.
+    pub fn random_r1() -> Self {
+        let cxx_key = pulsevm_ffi::random_private_key_r1();
+        PrivateKey { inner: cxx_key }
+    }
 }
 
 impl FromStr for PrivateKey {

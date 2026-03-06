@@ -225,6 +225,16 @@ std::shared_ptr<CxxPrivateKey> make_k1_private_key(const CxxDigest& secret) {
     return std::make_shared<CxxPrivateKey>(std::move(pk));
 }
 
+std::shared_ptr<CxxPrivateKey> random_private_key() {
+    CxxPrivateKey pk = private_key_type::generate();
+    return std::make_shared<CxxPrivateKey>(std::move(pk));
+}
+
+std::shared_ptr<CxxPrivateKey> random_private_key_r1() {
+    CxxPrivateKey pk = private_key_type::generate_r1();
+    return std::make_shared<CxxPrivateKey>(std::move(pk));
+}
+
 rust::Vec<uint8_t> extract_chain_id_from_genesis_state(const CxxGenesisState& genesis) {
     chain_id_type cid = genesis.compute_chain_id();
     rust::Vec<uint8_t> out;

@@ -24,6 +24,8 @@ namespace pulsevm { namespace chain {
     std::shared_ptr<CxxPrivateKey> parse_private_key(rust::Str key_str);
     rust::String private_key_to_string(const CxxPrivateKey& key);
     std::shared_ptr<CxxPrivateKey> make_k1_private_key(const CxxDigest& secret);
+    std::shared_ptr<CxxPrivateKey> random_private_key();
+    std::shared_ptr<CxxPrivateKey> random_private_key_r1();
     std::shared_ptr<CxxSignature> sign_digest_with_private_key(const CxxDigest& digest, const CxxPrivateKey& private_key);
     std::shared_ptr<CxxSignature> parse_signature_from_bytes(rust::Slice<const std::uint8_t> data);
     std::shared_ptr<CxxSignature> parse_signature(rust::Str signature_str);

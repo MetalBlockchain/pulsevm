@@ -229,7 +229,7 @@ impl KeosdClient {
     /// Create a client that connects via TCP.
     ///
     /// ```rust,no_run
-    /// let client = keosd_rs::client::KeosdClient::tcp("http://127.0.0.1:8900");
+    /// let client = pulsevm_keosd_client::KeosdClient::tcp("http://127.0.0.1:8900");
     /// ```
     pub fn tcp(base_url: &str) -> Self {
         let base_url = base_url.trim_end_matches('/').to_string();
@@ -244,7 +244,7 @@ impl KeosdClient {
     /// Create a client that connects via a Unix domain socket.
     ///
     /// ```rust,no_run
-    /// let client = keosd_rs::client::KeosdClient::unix("/home/user/eosio-wallet/keosd.sock");
+    /// let client = pulsevm_keosd_client::KeosdClient::unix("/home/user/eosio-wallet/keosd.sock");
     /// ```
     pub fn unix(socket_path: impl AsRef<Path>) -> Self {
         KeosdClient {

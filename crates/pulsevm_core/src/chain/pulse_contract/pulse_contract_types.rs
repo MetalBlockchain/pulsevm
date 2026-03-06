@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use pulsevm_crypto::Bytes;
 use pulsevm_proc_macros::{NumBytes, Read, Write};
+use pulsevm_serialization::Write;
 
 use crate::chain::{authority::Authority, name::Name};
 
@@ -11,6 +12,14 @@ pub struct NewAccount {
     pub name: Name,
     pub owner: Authority,
     pub active: Authority,
+}
+
+impl TryFrom<NewAccount> for Arc<[u8]> {
+    type Error = String;
+
+    fn try_from(value: NewAccount) -> Result<Self, Self::Error> {
+        value.pack().map(Arc::from).map_err(|e| e.to_string())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Read, Write, NumBytes)]

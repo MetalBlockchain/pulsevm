@@ -19,7 +19,7 @@ pub async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     match cli.command {
-        Commands::Create { subcmd } => create::handle(subcmd).await?,
+        Commands::Create { subcmd } => create::handle(&keosd_client, subcmd).await?,
         Commands::Wallet { subcmd } => wallet::handle(&keosd_client, subcmd).await?,
     }
 

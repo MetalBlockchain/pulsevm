@@ -529,6 +529,8 @@ pub mod ffi {
         pub fn get_authority_from_shared_authority(shared_auth: &CxxSharedAuthority) -> Authority;
         pub fn make_unknown_public_key() -> SharedPtr<CxxPublicKey>;
         pub fn make_k1_private_key(secret: &CxxDigest) -> SharedPtr<CxxPrivateKey>;
+        pub fn random_private_key() -> SharedPtr<CxxPrivateKey>;
+        pub fn random_private_key_r1() -> SharedPtr<CxxPrivateKey>;
         pub fn extract_chain_id_from_genesis_state(genesis: &CxxGenesisState) -> Vec<u8>;
 
         pub type CxxName;

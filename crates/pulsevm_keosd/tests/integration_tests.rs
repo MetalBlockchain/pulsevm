@@ -17,8 +17,8 @@ mod key_tests {
             "WIF key has unexpected prefix: {}",
             wif
         );
-        assert!(pubkey.starts_with("EOS"), "Public key missing EOS prefix: {}", pubkey);
-        // EOS public keys are ~50-53 chars
+        assert!(pubkey.starts_with("PUB_K1_"), "Public key missing PUB_K1_ prefix: {}", pubkey);
+        // PUB_K1_ public keys are ~50-53 chars
         assert!(pubkey.len() > 45 && pubkey.len() < 60, "Unexpected pubkey length: {}", pubkey.len());
     }
 
@@ -182,7 +182,7 @@ mod wallet_tests {
         let (dir, password) = setup();
         let mut wallet = Wallet::create("test", &password, dir.path()).unwrap();
         let pub_key = wallet.create_key().unwrap();
-        assert!(pub_key.starts_with("EOS"));
+        assert!(pub_key.starts_with("PUB_K1_"), "Public key should start with PUB_K1_: {}", pub_key);
     }
 
     #[test]
@@ -450,7 +450,7 @@ mod manager_tests {
         let (_dir, mut mgr) = setup();
         mgr.create("test").unwrap();
         let pub_key = mgr.create_key("test").unwrap();
-        assert!(pub_key.starts_with("EOS"));
+        assert!(pub_key.starts_with("PUB_K1_"), "Public key should start with PUB_K1_: {}", pub_key);
     }
 
     #[test]
@@ -481,6 +481,8 @@ mod manager_tests {
         let (_dir, mut mgr) = setup();
         let (wif1, pub1) = keys::generate_keypair().unwrap();
         let (wif2, pub2) = keys::generate_keypair().unwrap();
+        mgr.create("w1").unwrap();
+        mgr.create("w2").unwrap();
         mgr.import_key("w1", &wif1).unwrap();
         mgr.import_key("w2", &wif2).unwrap();
 
@@ -808,7 +810,7 @@ mod api_tests {
         assert_eq!(resp.status(), StatusCode::CREATED);
 
         let pub_key: String = test::read_body_json(resp).await;
-        assert!(pub_key.starts_with("EOS"));
+        assert!(pub_key.starts_with("PUB_K1_"), "Public key should start with PUB_K1_: {}", pub_key);
     }
 
     #[actix_rt::test]
