@@ -118,8 +118,8 @@ pub async fn handle(
         }
 
         WalletSubcommand::CreateKey { name, key_type } => {
-            spdlog::debug!(" Creating {} key in wallet '{}'", key_type, name);
-            println!("Created new private key with a public key of: EOS6MRyAjQq8ud7hVNYcfnVPJqcVpscN5So8BhtHuGYqET5GDW5CV");
+            let res = client.create_key(&name, &key_type).await?;
+            println!("Created new private key with a public key of: {}", res);
         }
 
         WalletSubcommand::Stop => {
