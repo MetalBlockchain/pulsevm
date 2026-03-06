@@ -31,8 +31,33 @@ impl WalletManager {
         fs::create_dir_all(&wallet_dir)
             .map_err(|e| ManagerError::LockFileError(e.to_string()))?;
 
+        // Scan for existing .wallet files and load them (in locked state)
+        let mut wallets = BTreeMap::new();
+        if let Ok(entries) = fs::read_dir(&wallet_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("wallet") {
+                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                        match Wallet::open(stem, &wallet_dir) {
+                            Ok(wallet) => {
+                                wallets.insert(stem.to_string(), wallet);
+                            }
+                            Err(e) => {
+                                // Log but don't fail — a corrupt file shouldn't
+                                // prevent the daemon from starting.
+                                eprintln!(
+                                    "Warning: failed to load wallet '{}': {}",
+                                    stem, e
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(WalletManager {
-            wallets: BTreeMap::new(),
+            wallets,
             wallet_dir,
             timeout: Duration::from_secs(timeout_secs),
             last_activity: Instant::now(),
