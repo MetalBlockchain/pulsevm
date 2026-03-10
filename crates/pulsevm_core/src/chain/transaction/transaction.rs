@@ -3,7 +3,8 @@ use std::collections::HashSet;
 use pulsevm_crypto::Bytes;
 use pulsevm_error::ChainError;
 use pulsevm_proc_macros::{NumBytes, Read, Write};
-use pulsevm_serialization::Write;
+use pulsevm_serialization::{VarUint32, Write};
+use pulsevm_time::TimePointSec;
 use serde::{Deserialize, Serialize, ser::SerializeStruct};
 use sha2::Digest;
 
@@ -19,7 +20,7 @@ use crate::{
 
 use super::action::Action;
 
-#[derive(Debug, Clone, PartialEq, Eq, Read, Write, NumBytes, Hash, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Read, Write, NumBytes, Hash, Default)]
 pub struct Transaction {
     pub header: TransactionHeader,
     pub context_free_actions: Vec<Action>, // Context-free actions, if any
@@ -118,5 +119,35 @@ impl Serialize for Transaction {
         state.serialize_field("max_cpu_usage_ms", &self.header.max_cpu_usage)?;
         state.serialize_field("actions", &self.actions)?;
         state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for Transaction {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct TransactionHelper {
+            expiration: TimePointSec,
+            max_net_usage_words: VarUint32,
+            max_cpu_usage_ms: u8,
+            actions: Vec<Action>,
+        }
+
+        let helper = TransactionHelper::deserialize(deserializer)?;
+
+        Ok(Transaction::new(
+            TransactionHeader::new(
+                helper.expiration,
+                0, // ref_block_num
+                0, // ref_block_prefix
+                helper.max_net_usage_words,
+                helper.max_cpu_usage_ms,
+                VarUint32(0), // delay_sec
+            ),
+            vec![], // context_free_actions
+            helper.actions,
+        ))
     }
 }

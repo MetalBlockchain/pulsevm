@@ -118,8 +118,8 @@ mod arc_bytes_serde {
     where
         S: Serializer,
     {
-        // serialize as normal bytes (base64 for JSON)
-        serializer.serialize_bytes(data)
+        let hex_string = hex::encode(data.as_ref());
+        serializer.serialize_str(&hex_string)
     }
 
     use serde::Deserializer;
@@ -127,7 +127,8 @@ mod arc_bytes_serde {
     where
         D: Deserializer<'de>,
     {
-        let bytes = Vec::<u8>::deserialize(deserializer)?;
+        let str = String::deserialize(deserializer)?;
+        let bytes = hex::decode(str).map_err(serde::de::Error::custom)?;
         Ok(Arc::from(bytes))
     }
 }
