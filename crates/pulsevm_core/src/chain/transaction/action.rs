@@ -3,12 +3,12 @@ use std::sync::Arc;
 
 use pulsevm_crypto::Digest as OurDigest;
 use pulsevm_serialization::{NumBytes, Read, Write};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::Digest;
 
 use crate::chain::{Name, authority::PermissionLevel};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize, Default)]
 pub struct Action {
     pub account: Name,
     pub name: Name,
@@ -120,5 +120,14 @@ mod arc_bytes_serde {
     {
         // serialize as normal bytes (base64 for JSON)
         serializer.serialize_bytes(data)
+    }
+
+    use serde::Deserializer;
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Arc<[u8]>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let bytes = Vec::<u8>::deserialize(deserializer)?;
+        Ok(Arc::from(bytes))
     }
 }

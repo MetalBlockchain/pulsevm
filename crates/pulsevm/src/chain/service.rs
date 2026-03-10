@@ -2,15 +2,7 @@ use std::{collections::HashSet, str::FromStr, sync::Arc};
 
 use jsonrpsee::{proc_macros::rpc, types::ErrorObjectOwned};
 use pulsevm_core::{
-    abi::AbiDefinition,
-    block::{BlockTimestamp, SignedBlock},
-    controller::Controller,
-    crypto::Signature,
-    id::Id,
-    mempool::Mempool,
-    name::Name,
-    transaction::{PackedTransaction, TransactionCompression},
-    utils::{Base64Bytes, I32Flex},
+    abi::AbiDefinition, authorization_manager::AuthorizationManager, block::{BlockTimestamp, SignedBlock}, controller::Controller, crypto::{PublicKey, Signature}, id::Id, mempool::Mempool, name::Name, transaction::{PackedTransaction, Transaction, TransactionCompression}, utils::{Base64Bytes, I32Flex}
 };
 use pulsevm_crypto::{Bytes, Digest};
 use pulsevm_serialization::Read;
@@ -77,6 +69,10 @@ pub trait Rpc {
     #[method(name = "pulsevm.getRawBlock")]
     async fn get_raw_block(&self, block_num_or_id: String)
     -> Result<SignedBlock, ErrorObjectOwned>;
+
+    #[method(name = "pulsevm.getRequiredKeys")]
+    async fn get_required_keys(&self, trx: Transaction, candidate_keys: HashSet<PublicKey>)
+    -> Result<HashSet<PublicKey>, ErrorObjectOwned>;
 
     #[method(name = "pulsevm.getTableRows")]
     async fn get_table_rows(
@@ -381,6 +377,19 @@ impl RpcServer for RpcService {
         Ok(IssueTxResponse {
             tx_id: packed_trx.id().clone(),
         })
+    }
+
+    async fn get_required_keys(
+        &self,
+        trx: Transaction,
+        candidate_keys: HashSet<PublicKey>,
+    ) -> Result<HashSet<PublicKey>, ErrorObjectOwned> {
+        let controller = self.controller.read().await;
+        let mut db = controller.database();
+
+        let required_keys = AuthorizationManager::get_required_keys(&mut db, &trx, &candidate_keys)?;
+
+        Ok(required_keys)
     }
 
     async fn get_table_rows(

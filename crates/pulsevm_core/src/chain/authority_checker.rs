@@ -52,6 +52,10 @@ impl<'a> AuthorityChecker<'a> {
         return *self.provided_keys == self.used_keys;
     }
 
+    pub fn used_keys(&self) -> &HashSet<PublicKey> {
+        &self.used_keys
+    }
+
     pub fn satisfied(
         &mut self,
         db: &Database,

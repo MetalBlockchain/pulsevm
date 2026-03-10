@@ -4,15 +4,11 @@ use pulsevm_error::ChainError;
 use pulsevm_ffi::{Authority, CxxTimePoint, Database, PermissionObject};
 
 use crate::{
-    PULSE_NAME,
-    chain::{
+    PULSE_NAME, chain::{
         name::Name,
         pulse_contract::{DeleteAuth, LinkAuth, UnlinkAuth, UpdateAuth},
         transaction::Action,
-    },
-    config::{DELETEAUTH_NAME, LINKAUTH_NAME, UNLINKAUTH_NAME, UPDATEAUTH_NAME},
-    crypto::PublicKey,
-    utils::pulse_assert,
+    }, config::{DELETEAUTH_NAME, LINKAUTH_NAME, UNLINKAUTH_NAME, UPDATEAUTH_NAME}, crypto::PublicKey, transaction::Transaction, utils::pulse_assert
 };
 
 use super::{
@@ -117,6 +113,37 @@ impl AuthorizationManager {
             }
         }
         Ok(())
+    }
+
+    pub fn get_required_keys(
+        db: &mut Database,
+        trx: &Transaction,
+        candidate_keys: &HashSet<PublicKey>,
+    ) -> Result<HashSet<PublicKey>, ChainError> {
+        let global_properties = unsafe { &*db.get_global_properties()? };
+        let chain_config = global_properties.get_chain_config();
+        let provided_permissions = HashSet::<PermissionLevel>::new();
+        let mut authority_checker = AuthorityChecker::new(
+            chain_config.get_max_authority_depth(),
+            candidate_keys,
+            &provided_permissions,
+        );
+
+        for act in trx.actions.iter() {
+            for declared_auth in act.authorization() {
+                let auth = Authority::new_from_permission_level(declared_auth);
+
+                pulse_assert(
+                    authority_checker.satisfied(db, &auth, 0)?,
+                    ChainError::AuthorizationError(format!(
+                        "transaction declares authority '{}' but does not have signatures for it",
+                        declared_auth
+                    )),
+                )?;
+            }
+        }
+
+        Ok(authority_checker.used_keys().clone())
     }
 
     fn check_updateauth_authorization(

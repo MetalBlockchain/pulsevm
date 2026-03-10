@@ -59,3 +59,6 @@ mod tests {
         assert_eq!(public_key1, public_key2);
     }
 }
+
+unsafe impl Send for CxxPublicKey {}
+unsafe impl Sync for CxxPublicKey {}

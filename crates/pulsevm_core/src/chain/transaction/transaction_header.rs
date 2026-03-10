@@ -1,9 +1,9 @@
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 use pulsevm_serialization::VarUint32;
 use pulsevm_time::TimePointSec;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Read, Write, NumBytes, Serialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Read, Write, NumBytes, Deserialize, Serialize, Default)]
 pub struct TransactionHeader {
     pub expiration: TimePointSec,
     pub ref_block_num: u16,

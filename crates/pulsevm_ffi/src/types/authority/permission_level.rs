@@ -2,7 +2,7 @@ use std::{cmp::Ordering, fmt};
 
 use pulsevm_name::Name;
 use pulsevm_serialization::{NumBytes, Read, Write, WriteError};
-use serde::{Serialize, ser::SerializeStruct};
+use serde::{Deserialize, Serialize, ser::SerializeStruct};
 
 use crate::bridge::ffi::PermissionLevel;
 
@@ -59,6 +59,26 @@ impl Write for PermissionLevel {
         self.actor.write(bytes, pos)?;
         self.permission.write(bytes, pos)?;
         Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for PermissionLevel {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct PermissionLevelHelper {
+            actor: Name,
+            permission: Name,
+        }
+
+        let helper = PermissionLevelHelper::deserialize(deserializer)?;
+        
+        Ok(PermissionLevel {
+            actor: helper.actor.as_u64(),
+            permission: helper.permission.as_u64(),
+        })
     }
 }
 

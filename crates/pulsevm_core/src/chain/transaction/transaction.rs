@@ -4,7 +4,7 @@ use pulsevm_crypto::Bytes;
 use pulsevm_error::ChainError;
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 use pulsevm_serialization::Write;
-use serde::{Serialize, ser::SerializeStruct};
+use serde::{Deserialize, Serialize, ser::SerializeStruct};
 use sha2::Digest;
 
 use crate::{
@@ -19,7 +19,7 @@ use crate::{
 
 use super::action::Action;
 
-#[derive(Debug, Clone, PartialEq, Eq, Read, Write, NumBytes, Hash, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Read, Write, NumBytes, Hash, Default, Deserialize)]
 pub struct Transaction {
     pub header: TransactionHeader,
     pub context_free_actions: Vec<Action>, // Context-free actions, if any

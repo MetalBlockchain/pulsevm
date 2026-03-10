@@ -10,7 +10,7 @@ use pulsevm_crypto::FixedBytes;
 use pulsevm_error::ChainError;
 use pulsevm_ffi::CxxPublicKey;
 use pulsevm_serialization::{NumBytes, Read, ReadError, Write, WriteError};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone)]
 pub struct PublicKey {
@@ -55,6 +55,18 @@ impl Eq for PublicKey {}
 impl Hash for PublicKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.inner.packed_bytes().hash(state);
+    }
+}
+
+impl<'de> Deserialize<'de> for PublicKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        let cxx_key = pulsevm_ffi::parse_public_key(&s)
+            .map_err(|e| serde::de::Error::custom(format!("Failed to parse public key: {}", e)))?;
+        Ok(PublicKey { inner: cxx_key })
     }
 }
 
