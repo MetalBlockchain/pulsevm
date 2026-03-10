@@ -4,9 +4,9 @@ use std::fs;
 
 use aes::Aes256;
 use cbc::{Encryptor, Decryptor, cipher::{block_padding::Pkcs7, BlockEncryptMut, BlockDecryptMut, KeyIvInit}};
-use k256::ecdsa::SigningKey;
-use sha2::{Sha512, Sha256, Digest};
+use sha2::{Sha512, Digest};
 use serde::{Serialize, Deserialize};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::keys::{self, KeyError};
 
@@ -34,7 +34,7 @@ pub enum WalletError {
 }
 
 /// On-disk format for an encrypted wallet file.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 struct WalletFileData {
     /// AES-256-CBC encrypted blob containing the serialized key map.
     cipher_keys: Vec<u8>,
@@ -62,7 +62,7 @@ impl Wallet {
         let checksum = sha512_hash(password.as_bytes());
         let keys = BTreeMap::new();
 
-        let mut wallet = Wallet {
+        let wallet = Wallet {
             name: name.to_string(),
             file_path,
             locked: false,
@@ -136,7 +136,7 @@ impl Wallet {
         }
 
         let sk = keys::wif_to_private_key(wif)?;
-        let pub_key = keys::eos_public_key_string(&sk);
+        let pub_key = keys::pub_k1_string(&sk);
 
         if self.keys.contains_key(&pub_key) {
             return Err(WalletError::KeyAlreadyExists);
