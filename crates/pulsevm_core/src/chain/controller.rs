@@ -377,6 +377,7 @@ impl Controller {
             .map_err(|e| ChainError::TransactionError(format!("failed to commit block: {}", e)))?;
         self.verified_blocks.remove(block_id);
         self.last_accepted_block = block.clone();
+        self.db.clear_expired_input_transactions(&block.timestamp().to_time_point())?;
         self.db.commit(block.block_num() as i64)?;
 
         Ok(())

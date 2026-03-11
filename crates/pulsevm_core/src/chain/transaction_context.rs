@@ -4,7 +4,7 @@ use std::{
 };
 
 use pulsevm_error::ChainError;
-use pulsevm_ffi::Database;
+use pulsevm_ffi::{CxxDigest, Database};
 use pulsevm_serialization::VarUint32;
 use pulsevm_time::{Microseconds, TimePoint};
 use spdlog::{debug, info};
@@ -162,6 +162,7 @@ impl TransactionContext {
         let first_authorizer = transaction.first_authorizer();
 
         self.init(initial_net_usage, first_authorizer)?;
+        self.record_transaction(&transaction.id()?, transaction.header.expiration().sec_since_epoch())?;
         Ok(())
     }
 
@@ -445,5 +446,13 @@ impl TransactionContext {
     pub fn get_cpu_limit(&self) -> Result<i64, ChainError> {
         let inner = self.inner.read()?;
         Ok(inner.cpu_limit)
+    }
+
+    pub fn record_transaction(&mut self, id: &Id, expiration: u32) -> Result<(), ChainError> {
+        let id_digest = id.to_digest()?;
+
+        self.db.record_transaction(&id_digest, expiration).map_err(|e| {
+            ChainError::DatabaseError(format!("duplicate tx: {}", e))
+        })
     }
 }

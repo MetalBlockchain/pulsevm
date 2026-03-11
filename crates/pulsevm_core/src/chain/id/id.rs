@@ -1,6 +1,7 @@
 use core::fmt;
 use std::{error::Error, str::FromStr};
 
+use cxx::UniquePtr;
 use pulsevm_crypto::FixedBytes;
 use pulsevm_error::ChainError;
 use pulsevm_ffi::CxxDigest;
@@ -21,6 +22,10 @@ impl Id {
 
     pub fn zero() -> Self {
         Id(FixedBytes::default())
+    }
+
+    pub fn to_digest(&self) -> Result<UniquePtr<CxxDigest>, ChainError> {
+        CxxDigest::new_from_existing_hash(self.as_bytes())
     }
 }
 

@@ -50,6 +50,7 @@ public:
         this->add_index<account_ram_correction_index>();
         this->add_index<code_index>();
         this->add_index<database_header_multi_index>();
+        this->add_index<transaction_multi_index>();
     }
 
     void initialize_database(const genesis_state& genesis) {
@@ -993,6 +994,31 @@ public:
         const auto& state = this->get<resource_limits::resource_limits_state_object>();
         const auto& config = this->get<resource_limits::resource_limits_config_object>();
         return config.net_limit_parameters.max - state.pending_net_usage;
+    }
+
+    void record_transaction( const transaction_id_type& id, uint32_t expiration ) {
+        try {
+            this->create<transaction_object>([&](transaction_object& transaction) {
+                transaction.trx_id = id;
+                transaction.expiration = fc::time_point_sec(expiration);
+            });
+        } catch( const boost::interprocess::bad_alloc& ) {
+            throw;
+        } catch ( ... ) {
+            EOS_ASSERT( false, tx_duplicate, "duplicate transaction ${id}", ("id", id ) );
+        }
+    }
+
+    void clear_expired_input_transactions(const fc::time_point& cutoff) {
+        //Look for expired transactions in the deduplication list, and remove them.
+        auto& transaction_idx = this->get_mutable_index<transaction_multi_index>();
+        const auto& dedupe_index = transaction_idx.indices().get<by_expiration>();
+        const auto total = dedupe_index.size();
+        uint32_t num_removed = 0;
+        while( (!dedupe_index.empty()) && ( cutoff > dedupe_index.begin()->expiration.to_time_point() ) ) {
+            transaction_idx.remove(*dedupe_index.begin());
+            ++num_removed;
+        }
     }
 
     std::unique_ptr<chainbase::database::session> create_undo_session(bool enabled) {

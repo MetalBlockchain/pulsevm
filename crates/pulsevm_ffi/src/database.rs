@@ -855,6 +855,28 @@ impl Database {
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 
+    pub fn record_transaction(
+        &mut self,
+        trx_id: &ffi::CxxDigest,
+        expiration: u32,
+    ) -> Result<(), ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .record_transaction(trx_id, expiration)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
+    pub fn clear_expired_input_transactions(&mut self, cutoff: &CxxTimePoint) -> Result<(), ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .clear_expired_input_transactions(cutoff)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
     pub fn get_currency_balance_with_symbol(
         &self,
         code: u64,

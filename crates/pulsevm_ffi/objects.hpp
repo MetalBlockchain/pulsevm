@@ -8,6 +8,7 @@
 #include <pulsevm/chain/resource_limits_private.hpp>
 #include <pulsevm/chain/protocol_state_object.hpp>
 #include <pulsevm/chain/database_header_object.hpp>
+#include <pulsevm/chain/transaction_object.hpp>
 
 namespace pulsevm { namespace chain {
 
@@ -21,5 +22,5 @@ namespace pulsevm { namespace chain {
     using TableId = pulsevm::chain::table_id;
     using KeyValueObject = pulsevm::chain::key_value_object;
     using GlobalPropertyObject = pulsevm::chain::global_property_object;
-
+    using TransactionObject = pulsevm::chain::transaction_object;
 } } // pulsevm::chain

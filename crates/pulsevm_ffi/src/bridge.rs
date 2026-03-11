@@ -407,6 +407,12 @@ pub mod ffi {
         pub fn get_virtual_block_net_limit(self: &Database) -> Result<u64>;
         pub fn get_block_cpu_limit(self: &Database) -> Result<u64>;
         pub fn get_block_net_limit(self: &Database) -> Result<u64>;
+        pub fn record_transaction(
+            self: Pin<&mut Database>,
+            trx_id: &CxxDigest,
+            expiration: u32,
+        ) -> Result<()>;
+        pub fn clear_expired_input_transactions(self: Pin<&mut Database>, cutoff: &CxxTimePoint) -> Result<()>;
 
         // Methods on undo_session
         pub fn push(self: Pin<&mut UndoSession>) -> Result<()>;
@@ -493,6 +499,7 @@ pub mod ffi {
         pub fn make_empty_digest() -> UniquePtr<CxxDigest>;
         pub fn make_digest_from_data(data: &[u8]) -> Result<UniquePtr<CxxDigest>>;
         pub fn make_shared_digest_from_data(data: &[u8]) -> SharedPtr<CxxDigest>;
+        pub fn make_digest_from_existing_hash(data: &[u8]) -> Result<UniquePtr<CxxDigest>>;
         pub fn make_shared_digest_from_existing_hash(data: &[u8]) -> SharedPtr<CxxDigest>;
         pub fn make_shared_digest_from_string(key_str: &str) -> SharedPtr<CxxDigest>;
         pub fn make_time_point_from_now() -> SharedPtr<CxxTimePoint>;

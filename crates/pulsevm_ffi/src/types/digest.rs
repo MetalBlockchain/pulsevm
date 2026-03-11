@@ -5,7 +5,7 @@ use pulsevm_error::ChainError;
 
 use crate::{
     CxxDigest,
-    bridge::ffi::{get_digest_data, make_digest_from_data, make_empty_digest},
+    bridge::ffi::{get_digest_data, make_digest_from_data, make_digest_from_existing_hash, make_empty_digest},
 };
 
 impl CxxDigest {
@@ -16,6 +16,12 @@ impl CxxDigest {
     pub fn hash(data: &[u8]) -> Result<UniquePtr<CxxDigest>, ChainError> {
         make_digest_from_data(data).map_err(|e| {
             ChainError::InternalError(format!("failed to create digest from data: {}", e))
+        })
+    }
+
+    pub fn new_from_existing_hash(data: &[u8]) -> Result<UniquePtr<CxxDigest>, ChainError> {
+        make_digest_from_existing_hash(data).map_err(|e| {
+            ChainError::InternalError(format!("failed to create digest from existing hash: {}", e))
         })
     }
 

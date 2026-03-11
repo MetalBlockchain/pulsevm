@@ -28,6 +28,10 @@ std::shared_ptr<CxxDigest> make_shared_digest_from_existing_hash(rust::Slice<con
     return std::make_shared<CxxDigest>(reinterpret_cast<const char*>(data.data()), data.size());
 }
 
+std::unique_ptr<CxxDigest> make_digest_from_existing_hash(rust::Slice<const std::uint8_t> data) {
+    return std::make_unique<CxxDigest>(reinterpret_cast<const char*>(data.data()), data.size());
+}
+
 std::shared_ptr<CxxDigest> make_shared_digest_from_string(rust::Str key_str) {
     std::string s(key_str.data(), key_str.size());
     CxxDigest hash = CxxDigest::hash(s);

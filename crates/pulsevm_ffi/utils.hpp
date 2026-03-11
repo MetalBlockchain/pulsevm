@@ -11,6 +11,7 @@ namespace pulsevm { namespace chain {
     std::unique_ptr<CxxDigest> make_digest_from_data(rust::Slice<const std::uint8_t> data);
     std::shared_ptr<CxxDigest> make_shared_digest_from_data(rust::Slice<const std::uint8_t> data);
     std::shared_ptr<CxxDigest> make_shared_digest_from_existing_hash(rust::Slice<const std::uint8_t> data);
+    std::unique_ptr<CxxDigest> make_digest_from_existing_hash(rust::Slice<const std::uint8_t> data);
     std::shared_ptr<CxxDigest> make_shared_digest_from_string(rust::Str key_str);
     std::shared_ptr<CxxTimePoint> make_time_point_from_now();
     std::shared_ptr<CxxBlockTimestamp> make_block_timestamp_from_now();
