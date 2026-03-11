@@ -143,7 +143,11 @@ pub fn setcode(
 
     if code_size > 0 {
         code_hash = CxxDigest::hash(act.code.as_slice())?;
-        // TODO: validate wasm
+        
+        // Validate the code before accepting it
+        pulsevm_wasm_validation::validate_wasm(act.code.as_slice()).map_err(|e| {
+            ChainError::TransactionError(format!("contract code failed validation: {}", e))
+        })?;
     }
 
     let account = db.get_account_metadata(act.account.as_u64())?;

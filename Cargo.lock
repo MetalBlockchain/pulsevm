@@ -1765,6 +1765,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
 dependencies = [
  "foldhash 0.2.0",
+ "serde",
+ "serde_core",
 ]
 
 [[package]]
@@ -2170,6 +2172,8 @@ checksum = "7714e70437a7dc3ac8eb7e6f8df75fd8eb422675fc7678aff7364301092b1017"
 dependencies = [
  "equivalent",
  "hashbrown 0.16.1",
+ "serde",
+ "serde_core",
 ]
 
 [[package]]
@@ -3202,6 +3206,7 @@ dependencies = [
  "pulsevm_proc_macros",
  "pulsevm_serialization",
  "pulsevm_time",
+ "pulsevm_wasm_validation",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -3376,6 +3381,15 @@ dependencies = [
  "pulsevm_time",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "pulsevm_wasm_validation"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.18",
+ "wasmparser 0.245.1",
+ "wat",
 ]
 
 [[package]]
@@ -4905,7 +4919,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "95d568e113f706ee7a7df9b33547bb80721f55abffc79b3dc4d09c368690e662"
 dependencies = [
  "leb128fmt",
- "wasmparser 0.245.0",
+ "wasmparser 0.245.1",
 ]
 
 [[package]]
@@ -5107,13 +5121,15 @@ dependencies = [
 
 [[package]]
 name = "wasmparser"
-version = "0.245.0"
+version = "0.245.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "48a767a48974f0c8b66f211b96e01aa77feed58b8ccce4e7f0cff0ae55b174d4"
+checksum = "4f08c9adee0428b7bddf3890fc27e015ac4b761cc608c822667102b8bfd6995e"
 dependencies = [
  "bitflags 2.9.4",
+ "hashbrown 0.16.1",
  "indexmap 2.13.0",
  "semver",
+ "serde",
 ]
 
 [[package]]

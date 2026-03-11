@@ -1,0 +1,11 @@
+[package]
+name = "pulsevm_wasm_validation"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+thiserror = "2.0.18"
+wasmparser = "0.245.1"
+
+[dev-dependencies]
+wat = "1"
