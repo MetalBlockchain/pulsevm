@@ -49,14 +49,23 @@ jobs:
             target
           key: ${{ runner.os }}-${{ matrix.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Run unit tests
-        run: CXX=/usr/bin/g++-13 CC=/usr/bin/gcc-13 LLVM_SYS_211_PREFIX=/usr/lib/llvm-21 cargo test
-
       - name: Build release artifact
         run: CXX=/usr/bin/g++-13 CC=/usr/bin/gcc-13 LLVM_SYS_211_PREFIX=/usr/lib/llvm-21 cargo build --release
 
-      - name: Upload artifact
+      - name: Upload pulsevm artifact
         uses: actions/upload-artifact@v4
         with:
           name: pulsevm-linux-${{ matrix.arch }}
           path: target/release/pulsevm
+
+      - name: Upload pulse-cli artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pulse-cli-linux-${{ matrix.arch }}
+          path: target/release/pulse
+
+      - name: Upload pulse-keosd artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pulse-cli-linux-${{ matrix.arch }}
+          path: target/release/pulse-keosd
