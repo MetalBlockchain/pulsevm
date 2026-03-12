@@ -118,8 +118,17 @@ pub struct WasmRuntime {
 
 const COST_FUNCTION: fn(&Operator) -> u64 = |operator: &Operator| -> u64 {
     match operator {
+        Operator::Drop => 2,
+        Operator::Select => 3,
+        Operator::Br { .. } | Operator::BrTable { .. } | Operator::Call { .. } | Operator::CallIndirect { .. } | Operator::Return { .. } => 2,
+        Operator::BrIf { .. } => 3,
+        Operator::GlobalGet { .. } | Operator::GlobalSet { .. } | Operator::LocalGet { .. } | Operator::LocalSet { .. } => 3,
+        Operator::I32Mul { .. } | Operator::I64Mul { .. } | Operator::F32Mul { .. } | Operator::F64Mul { .. } => 3,
+        Operator::I32DivS { .. } | Operator::I32DivU { .. } | Operator::I32RemS { .. } | Operator::I32RemU { .. } | Operator::I64DivS { .. } | Operator::I64DivU { .. } | Operator::I64RemS { .. } | Operator::I64RemU { .. } => 80,
+        Operator::I32Clz { .. } | Operator::I64Clz { .. } => 105,
+        Operator::MemoryCopy { .. } | Operator::MemoryFill { .. } => 500,
         Operator::MemoryGrow { .. } => 1000, // Higher cost for memory growth
-        _ => 1,                              // Default cost for unrecognized operators
+        _ => 1,                              // Default cost
     }
 };
 
