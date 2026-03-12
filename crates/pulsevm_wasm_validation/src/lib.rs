@@ -17,8 +17,8 @@
 //! | `apply(i64, i64, i64)` export     | required                    |
 
 use wasmparser::{
-    BinaryReaderError, Export, ExternalKind, FuncType, GlobalType, MemoryType, Operator,
-    Parser, Payload, TableType, ValType,
+    BinaryReaderError, Export, ExternalKind, FuncType, GlobalType, MemoryType, Operator, Parser,
+    Payload, TableType, ValType,
 };
 
 // ---------------------------------------------------------------------------
@@ -101,7 +101,13 @@ pub enum ValidationError {
     #[error("Nested depth exceeded")]
     NestedDepthExceeded,
 
-    #[error("Smart contract code size exceeds maximum ({} bytes)", constraints::MAXIMUM_CODE_SIZE)]
+    #[error("Error, blacklisted opcode {0}")]
+    BlacklistedOpcode(String),
+
+    #[error(
+        "Smart contract code size exceeds maximum ({} bytes)",
+        constraints::MAXIMUM_CODE_SIZE
+    )]
     CodeTooLarge,
 
     #[error("WASM parse error: {0}")]
@@ -316,6 +322,228 @@ fn validate_nesting(op: &Operator, depth: &mut u32) -> Result<()> {
     Ok(())
 }
 
+/// Validates that only allowed opcodes are used. Mirrors `opcode_whitelist_validator`.
+fn validate_opcode_whitelist(op: &Operator) -> Result<()> {
+    let allowed = matches!(
+        op,
+        // Control flow (block/loop/if/else also go through nested_validator)
+        Operator::Block { .. }
+        | Operator::Loop { .. }
+        | Operator::If { .. }
+        | Operator::Else
+        | Operator::End
+        | Operator::Unreachable
+        | Operator::Br { .. }
+        | Operator::BrIf { .. }
+        | Operator::BrTable { .. }
+        | Operator::Return
+        | Operator::Call { .. }
+        | Operator::CallIndirect { .. }
+        | Operator::Drop
+        | Operator::Select
+        // Locals / globals
+        | Operator::LocalGet { .. }
+        | Operator::LocalSet { .. }
+        | Operator::LocalTee { .. }
+        | Operator::GlobalGet { .. }
+        | Operator::GlobalSet { .. }
+        // Memory
+        | Operator::MemoryGrow { .. }
+        | Operator::MemorySize { .. }
+        | Operator::MemoryCopy { .. }
+        | Operator::MemoryFill { .. }
+        | Operator::Nop
+        // Loads
+        | Operator::I32Load { .. }
+        | Operator::I64Load { .. }
+        | Operator::F32Load { .. }
+        | Operator::F64Load { .. }
+        | Operator::I32Load8S { .. }
+        | Operator::I32Load8U { .. }
+        | Operator::I32Load16S { .. }
+        | Operator::I32Load16U { .. }
+        | Operator::I64Load8S { .. }
+        | Operator::I64Load8U { .. }
+        | Operator::I64Load16S { .. }
+        | Operator::I64Load16U { .. }
+        | Operator::I64Load32S { .. }
+        | Operator::I64Load32U { .. }
+        // Stores
+        | Operator::I32Store { .. }
+        | Operator::I64Store { .. }
+        | Operator::F32Store { .. }
+        | Operator::F64Store { .. }
+        | Operator::I32Store8 { .. }
+        | Operator::I32Store16 { .. }
+        | Operator::I64Store8 { .. }
+        | Operator::I64Store16 { .. }
+        | Operator::I64Store32 { .. }
+        // Constants
+        | Operator::I32Const { .. }
+        | Operator::I64Const { .. }
+        | Operator::F32Const { .. }
+        | Operator::F64Const { .. }
+        // i32 comparison
+        | Operator::I32Eqz
+        | Operator::I32Eq
+        | Operator::I32Ne
+        | Operator::I32LtS
+        | Operator::I32LtU
+        | Operator::I32GtS
+        | Operator::I32GtU
+        | Operator::I32LeS
+        | Operator::I32LeU
+        | Operator::I32GeS
+        | Operator::I32GeU
+        // i32 unary
+        | Operator::I32Clz
+        | Operator::I32Ctz
+        | Operator::I32Popcnt
+        // i32 binary
+        | Operator::I32Add
+        | Operator::I32Sub
+        | Operator::I32Mul
+        | Operator::I32DivS
+        | Operator::I32DivU
+        | Operator::I32RemS
+        | Operator::I32RemU
+        | Operator::I32And
+        | Operator::I32Or
+        | Operator::I32Xor
+        | Operator::I32Shl
+        | Operator::I32ShrS
+        | Operator::I32ShrU
+        | Operator::I32Rotl
+        | Operator::I32Rotr
+        // i64 comparison
+        | Operator::I64Eqz
+        | Operator::I64Eq
+        | Operator::I64Ne
+        | Operator::I64LtS
+        | Operator::I64LtU
+        | Operator::I64GtS
+        | Operator::I64GtU
+        | Operator::I64LeS
+        | Operator::I64LeU
+        | Operator::I64GeS
+        | Operator::I64GeU
+        // i64 unary
+        | Operator::I64Clz
+        | Operator::I64Ctz
+        | Operator::I64Popcnt
+        // i64 binary
+        | Operator::I64Add
+        | Operator::I64Sub
+        | Operator::I64Mul
+        | Operator::I64DivS
+        | Operator::I64DivU
+        | Operator::I64RemS
+        | Operator::I64RemU
+        | Operator::I64And
+        | Operator::I64Or
+        | Operator::I64Xor
+        | Operator::I64Shl
+        | Operator::I64ShrS
+        | Operator::I64ShrU
+        | Operator::I64Rotl
+        | Operator::I64Rotr
+        // f32 comparison
+        | Operator::F32Eq
+        | Operator::F32Ne
+        | Operator::F32Lt
+        | Operator::F32Gt
+        | Operator::F32Le
+        | Operator::F32Ge
+        // f64 comparison
+        | Operator::F64Eq
+        | Operator::F64Ne
+        | Operator::F64Lt
+        | Operator::F64Gt
+        | Operator::F64Le
+        | Operator::F64Ge
+        // f32 unary / binary
+        | Operator::F32Abs
+        | Operator::F32Neg
+        | Operator::F32Ceil
+        | Operator::F32Floor
+        | Operator::F32Trunc
+        | Operator::F32Nearest
+        | Operator::F32Sqrt
+        | Operator::F32Add
+        | Operator::F32Sub
+        | Operator::F32Mul
+        | Operator::F32Div
+        | Operator::F32Min
+        | Operator::F32Max
+        | Operator::F32Copysign
+        // f64 unary / binary
+        | Operator::F64Abs
+        | Operator::F64Neg
+        | Operator::F64Ceil
+        | Operator::F64Floor
+        | Operator::F64Trunc
+        | Operator::F64Nearest
+        | Operator::F64Sqrt
+        | Operator::F64Add
+        | Operator::F64Sub
+        | Operator::F64Mul
+        | Operator::F64Div
+        | Operator::F64Min
+        | Operator::F64Max
+        | Operator::F64Copysign
+        // Conversions
+        | Operator::I32TruncF32S
+        | Operator::I32TruncF32U
+        | Operator::I32TruncF64S
+        | Operator::I32TruncF64U
+        | Operator::I64TruncF32S
+        | Operator::I64TruncF32U
+        | Operator::I64TruncF64S
+        | Operator::I64TruncF64U
+        | Operator::F32ConvertI32S
+        | Operator::F32ConvertI32U
+        | Operator::F32ConvertI64S
+        | Operator::F32ConvertI64U
+        | Operator::F32DemoteF64
+        | Operator::F64ConvertI32S
+        | Operator::F64ConvertI32U
+        | Operator::F64ConvertI64S
+        | Operator::F64ConvertI64U
+        | Operator::F64PromoteF32
+        // Wraps / extends / reinterprets
+        | Operator::I32WrapI64
+        | Operator::I32Extend8S
+        | Operator::I32Extend16S
+        | Operator::I64ExtendI32S
+        | Operator::I64ExtendI32U
+        | Operator::I64Extend8S
+        | Operator::I64Extend16S
+        | Operator::I64Extend32S
+        | Operator::I32ReinterpretF32
+        | Operator::F32ReinterpretI32
+        | Operator::I64ReinterpretF64
+        | Operator::F64ReinterpretI64
+        // Non-trapping SIMD ops (not actually used in EOSIO contracts, but we allow them
+        | Operator::I32TruncSatF32S
+        | Operator::I32TruncSatF32U
+        | Operator::I32TruncSatF64S
+        | Operator::I32TruncSatF64U
+        | Operator::I64TruncSatF32S
+        | Operator::I64TruncSatF32U
+        | Operator::I64TruncSatF64S
+        | Operator::I64TruncSatF64U
+    );
+
+    if !allowed {
+        // Extract just the variant name (e.g. "MemoryCopy" from "MemoryCopy { ... }")
+        let debug = format!("{:?}", op);
+        let name = debug.split([' ', '{', '(']).next().unwrap_or(&debug).to_string();
+        return Err(ValidationError::BlacklistedOpcode(name));
+    }
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Data segment validation
 // ---------------------------------------------------------------------------
@@ -324,17 +552,14 @@ fn validate_nesting(op: &Operator, depth: &mut u32) -> Result<()> {
 ///
 /// Each active data segment must have an i32.const base offset, and the
 /// segment must lie entirely within `MAXIMUM_LINEAR_MEMORY_INIT` bytes.
-fn validate_data_segment(
-    offset_expr: &wasmparser::ConstExpr,
-    data: &[u8],
-) -> Result<()> {
+fn validate_data_segment(offset_expr: &wasmparser::ConstExpr, data: &[u8]) -> Result<()> {
     let mut reader = offset_expr.get_operators_reader();
     let op = reader.read()?;
 
     match op {
         Operator::I32Const { value } => {
             let base = value as u32 as u64;
-            let end = base + data.len() as u64;
+            let end = base.saturating_add(data.len() as u64);
             if end > constraints::MAXIMUM_LINEAR_MEMORY_INIT {
                 return Err(ValidationError::DataSegmentOutOfRange);
             }
@@ -505,6 +730,7 @@ pub fn validate_wasm(wasm: &[u8]) -> Result<()> {
 
                 for op in ops_reader {
                     let op = op?;
+                    validate_opcode_whitelist(&op)?;
                     validate_operator_offset(&op)?;
                     validate_nesting(&op, &mut nesting_depth)?;
                 }
@@ -756,6 +982,26 @@ mod tests {
         wat.push_str(")\n");
 
         let wasm = wat::parse_str(&wat).unwrap();
+        assert!(validate_wasm(&wasm).is_ok());
+    }
+
+    #[test]
+    fn test_function_stack_params_plus_locals_combined() {
+        // 3 × i64 params (24 bytes) + 20 × i64 locals (160 bytes) = 184, passes.
+
+        let wasm = wat::parse_str(
+            r#"(module
+                (type (func (param i64 i64 i64)))
+                (func (type 0)
+                    (local i64 i64 i64 i64 i64 i64 i64 i64 i64 i64)
+                    (local i64 i64 i64 i64 i64 i64 i64 i64 i64 i64)
+                )
+                (memory 1)
+                (export "apply" (func 0))
+            )"#,
+        )
+        .unwrap();
+
         assert!(validate_wasm(&wasm).is_ok());
     }
 }
