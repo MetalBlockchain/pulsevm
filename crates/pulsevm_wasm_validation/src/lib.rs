@@ -306,7 +306,7 @@ fn validate_operator_offset(op: &Operator) -> Result<()> {
 /// Tracks block nesting depth. Mirrors `nested_validator`.
 fn validate_nesting(op: &Operator, depth: &mut u32) -> Result<()> {
     match op {
-        Operator::Block { .. } | Operator::Loop { .. } | Operator::If { .. } => {
+        Operator::Block { .. } | Operator::Loop { .. } | Operator::If { .. } | Operator::Else => {
             *depth += 1;
             if *depth >= 1024 {
                 return Err(ValidationError::NestedDepthExceeded);
