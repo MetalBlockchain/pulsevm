@@ -112,6 +112,18 @@ pub enum ValidationError {
 
     #[error("WASM parse error: {0}")]
     Parse(#[from] BinaryReaderError),
+
+    #[error(
+        "Smart contract has more than {} section elements",
+        constraints::MAXIMUM_SECTION_ELEMENTS
+    )]
+    TooManySectionElements,
+
+    #[error(
+        "Smart contract data segment exceeds maximum size of {} bytes",
+        constraints::MAXIMUM_FUNC_LOCAL_BYTES
+    )]
+    DataSegmentTooLarge,
 }
 
 pub type Result<T> = std::result::Result<T, ValidationError>;
@@ -537,7 +549,11 @@ fn validate_opcode_whitelist(op: &Operator) -> Result<()> {
     if !allowed {
         // Extract just the variant name (e.g. "MemoryCopy" from "MemoryCopy { ... }")
         let debug = format!("{:?}", op);
-        let name = debug.split([' ', '{', '(']).next().unwrap_or(&debug).to_string();
+        let name = debug
+            .split([' ', '{', '('])
+            .next()
+            .unwrap_or(&debug)
+            .to_string();
         return Err(ValidationError::BlacklistedOpcode(name));
     }
 
@@ -637,9 +653,16 @@ pub fn validate_wasm(wasm: &[u8]) -> Result<()> {
 
             // ----- Function section ----------------------------------------
             Payload::FunctionSection(reader) => {
+                let mut count = 0u32;
+
                 for func in reader {
                     let type_idx = func?;
                     info.func_type_indices.push(type_idx);
+                    count += 1;
+                }
+
+                if count + info.num_imported_functions > constraints::MAXIMUM_SECTION_ELEMENTS {
+                    return Err(ValidationError::TooManySectionElements);
                 }
             }
 
@@ -678,6 +701,11 @@ pub fn validate_wasm(wasm: &[u8]) -> Result<()> {
             Payload::DataSection(reader) => {
                 for segment in reader {
                     let segment = segment?;
+
+                    if segment.data.len() >= constraints::MAXIMUM_FUNC_LOCAL_BYTES as usize {
+                        return Err(ValidationError::DataSegmentTooLarge);
+                    }
+
                     if let wasmparser::DataKind::Active {
                         memory_index: _,
                         offset_expr,
@@ -786,6 +814,8 @@ impl Default for WasmConstraints {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::fmt::Write;
 
     /// Helper: build a minimal valid EOSIO WASM module from WAT.
     fn valid_module() -> Vec<u8> {
@@ -1003,5 +1033,499 @@ mod tests {
         .unwrap();
 
         assert!(validate_wasm(&wasm).is_ok());
+    }
+
+    #[test]
+    fn test_nested_loops_at_limit_passes() {
+        // 1023 nested loops should pass
+        let mut wat = String::from(
+            "(module (export \"apply\" (func $apply)) (func $apply (param $0 i64) (param $1 i64) (param $2 i64)",
+        );
+        for i in 0..1023u32 {
+            write!(wat, "(loop (drop (i32.const {})) ", i).unwrap();
+        }
+        for _ in 0..1023u32 {
+            wat.push(')');
+        }
+        wat.push_str("))");
+
+        let wasm = wat::parse_str(&wat).unwrap();
+        assert!(validate_wasm(&wasm).is_ok());
+    }
+
+    #[test]
+    fn test_nested_loops_exceeds_limit() {
+        let mut wat = String::from(
+            "(module (export \"apply\" (func $apply)) (func $apply (param $0 i64) (param $1 i64) (param $2 i64)",
+        );
+        for i in 0..1024u32 {
+            write!(wat, "(loop (drop (i32.const {})) ", i).unwrap();
+        }
+        for _ in 0..1024u32 {
+            wat.push(')');
+        }
+        wat.push_str("))");
+
+        let wasm = wat::parse_str(&wat).unwrap();
+        assert!(matches!(
+            validate_wasm(&wasm).unwrap_err(),
+            ValidationError::NestedDepthExceeded
+        ));
+    }
+
+    #[test]
+    fn test_nested_blocks_at_limit_passes() {
+        let mut wat = String::from(
+            "(module (export \"apply\" (func $apply)) (func $apply (param $0 i64) (param $1 i64) (param $2 i64)",
+        );
+        for i in 0..1023u32 {
+            write!(wat, "(block (drop (i32.const {})) ", i).unwrap();
+        }
+        for _ in 0..1023u32 {
+            wat.push(')');
+        }
+        wat.push_str("))");
+
+        let wasm = wat::parse_str(&wat).unwrap();
+        assert!(validate_wasm(&wasm).is_ok());
+    }
+
+    #[test]
+    fn test_nested_blocks_exceeds_limit() {
+        let mut wat = String::from(
+            "(module (export \"apply\" (func $apply)) (func $apply (param $0 i64) (param $1 i64) (param $2 i64)",
+        );
+        for i in 0..1024u32 {
+            write!(wat, "(block (drop (i32.const {})) ", i).unwrap();
+        }
+        for _ in 0..1024u32 {
+            wat.push(')');
+        }
+        wat.push_str("))");
+
+        let wasm = wat::parse_str(&wat).unwrap();
+        assert!(matches!(
+            validate_wasm(&wasm).unwrap_err(),
+            ValidationError::NestedDepthExceeded
+        ));
+    }
+
+    #[test]
+    fn test_nested_ifs_at_limit_passes() {
+        let mut wat = String::from(
+            "(module (export \"apply\" (func $apply)) (func $apply (param $0 i64) (param $1 i64) (param $2 i64)",
+        );
+        for i in 0..1023u32 {
+            write!(
+                wat,
+                "(if (i32.wrap_i64 (local.get $0)) (then (drop (i32.const {})) ",
+                i
+            )
+            .unwrap();
+        }
+        for _ in 0..1023u32 {
+            wat.push_str("))");
+        }
+        wat.push_str("))");
+
+        let wasm = wat::parse_str(&wat).unwrap();
+        assert!(validate_wasm(&wasm).is_ok());
+    }
+
+    #[test]
+    fn test_nested_ifs_exceeds_limit() {
+        let mut wat = String::from(
+            "(module (export \"apply\" (func $apply)) (func $apply (param $0 i64) (param $1 i64) (param $2 i64)",
+        );
+        for i in 0..1024u32 {
+            write!(
+                wat,
+                "(if (i32.wrap_i64 (local.get $0)) (then (drop (i32.const {})) ",
+                i
+            )
+            .unwrap();
+        }
+        for _ in 0..1024u32 {
+            wat.push_str("))");
+        }
+        wat.push_str("))");
+
+        let wasm = wat::parse_str(&wat).unwrap();
+        assert!(matches!(
+            validate_wasm(&wasm).unwrap_err(),
+            ValidationError::NestedDepthExceeded
+        ));
+    }
+
+    #[test]
+    fn test_mixed_nested_at_limit_passes() {
+        // 223 ifs + 400 blocks + 400 loops = 1023
+        let mut wat = String::from(
+            "(module (export \"apply\" (func $apply)) (func $apply (param $0 i64) (param $1 i64) (param $2 i64)",
+        );
+        for i in 0..223u32 {
+            write!(
+                wat,
+                "(if (i32.wrap_i64 (local.get $0)) (then (drop (i32.const {})) ",
+                i
+            )
+            .unwrap();
+        }
+        for i in 0..400u32 {
+            write!(wat, "(block (drop (i32.const {})) ", i).unwrap();
+        }
+        for i in 0..400u32 {
+            write!(wat, "(loop (drop (i32.const {})) ", i).unwrap();
+        }
+        for _ in 0..800u32 {
+            wat.push(')');
+        }
+        for _ in 0..223u32 {
+            wat.push_str("))");
+        }
+        wat.push_str("))");
+
+        let wasm = wat::parse_str(&wat).unwrap();
+        assert!(validate_wasm(&wasm).is_ok());
+    }
+
+    #[test]
+    fn test_mixed_nested_exceeds_limit() {
+        // 224 ifs + 400 blocks + 400 loops = 1024
+        let mut wat = String::from(
+            "(module (export \"apply\" (func $apply)) (func $apply (param $0 i64) (param $1 i64) (param $2 i64)",
+        );
+        for i in 0..224u32 {
+            write!(
+                wat,
+                "(if (i32.wrap_i64 (local.get $0)) (then (drop (i32.const {})) ",
+                i
+            )
+            .unwrap();
+        }
+        for i in 0..400u32 {
+            write!(wat, "(block (drop (i32.const {})) ", i).unwrap();
+        }
+        for i in 0..400u32 {
+            write!(wat, "(loop (drop (i32.const {})) ", i).unwrap();
+        }
+        for _ in 0..800u32 {
+            wat.push(')');
+        }
+        for _ in 0..224u32 {
+            wat.push_str("))");
+        }
+        wat.push_str("))");
+
+        let wasm = wat::parse_str(&wat).unwrap();
+        assert!(matches!(
+            validate_wasm(&wasm).unwrap_err(),
+            ValidationError::NestedDepthExceeded
+        ));
+    }
+
+    #[test]
+    fn test_lotso_globals_under_limit_passes() {
+        // 85 pairs of (mut i32 + mut i64) = 85 * (4 + 8) = 1020 bytes
+        // plus 10 immutable i32 globals (don't count toward mutable total)
+        let mut wat = String::from(
+            "(module (export \"apply\" (func $apply)) (func $apply (param $0 i64) (param $1 i64) (param $2 i64))",
+        );
+        for i in 0..85u32 {
+            write!(wat, "(global $g{} (mut i32) (i32.const 0))", i).unwrap();
+            write!(wat, "(global $g{} (mut i64) (i64.const 0))", i + 100).unwrap();
+        }
+        for i in 0..10u32 {
+            write!(wat, "(global $g{} i32 (i32.const 0))", i + 200).unwrap();
+        }
+        wat.push(')');
+
+        let wasm = wat::parse_str(&wat).unwrap();
+        assert!(validate_wasm(&wasm).is_ok());
+    }
+
+    #[test]
+    fn test_lotso_globals_at_limit_passes() {
+        // 1020 bytes + one more mut i32 (4 bytes) = 1024, exactly at limit
+        let mut wat = String::from(
+            "(module (export \"apply\" (func $apply)) (func $apply (param $0 i64) (param $1 i64) (param $2 i64))",
+        );
+        for i in 0..85u32 {
+            write!(wat, "(global $g{} (mut i32) (i32.const 0))", i).unwrap();
+            write!(wat, "(global $g{} (mut i64) (i64.const 0))", i + 100).unwrap();
+        }
+        for i in 0..10u32 {
+            write!(wat, "(global $g{} i32 (i32.const 0))", i + 200).unwrap();
+        }
+        wat.push_str("(global $z (mut i32) (i32.const -12)))");
+
+        let wasm = wat::parse_str(&wat).unwrap();
+        assert!(validate_wasm(&wasm).is_ok());
+    }
+
+    #[test]
+    fn test_lotso_globals_exceeds_limit() {
+        // 1020 bytes + one mut i64 (8 bytes) = 1028, over the 1024 limit
+        let mut wat = String::from(
+            "(module (export \"apply\" (func $apply)) (func $apply (param $0 i64) (param $1 i64) (param $2 i64))",
+        );
+        for i in 0..85u32 {
+            write!(wat, "(global $g{} (mut i32) (i32.const 0))", i).unwrap();
+            write!(wat, "(global $g{} (mut i64) (i64.const 0))", i + 100).unwrap();
+        }
+        for i in 0..10u32 {
+            write!(wat, "(global $g{} i32 (i32.const 0))", i + 200).unwrap();
+        }
+        wat.push_str("(global $z (mut i64) (i64.const -12)))");
+
+        let wasm = wat::parse_str(&wat).unwrap();
+        assert!(matches!(
+            validate_wasm(&wasm).unwrap_err(),
+            ValidationError::TooManyMutableGlobals
+        ));
+    }
+
+    #[test]
+    fn test_load_offset_under_limit_passes() {
+        let mem_pages = constraints::MAXIMUM_LINEAR_MEMORY / constraints::WASM_PAGE_SIZE;
+        let valid_offset = constraints::MAXIMUM_LINEAR_MEMORY - 2;
+
+        let loadops = [
+            "i32.load",
+            "i64.load",
+            "f32.load",
+            "f64.load",
+            "i32.load8_s",
+            "i32.load8_u",
+            "i32.load16_s",
+            "i32.load16_u",
+            "i64.load8_s",
+            "i64.load8_u",
+            "i64.load16_s",
+            "i64.load16_u",
+            "i64.load32_s",
+            "i64.load32_u",
+        ];
+
+        for op in &loadops {
+            let wat = format!(
+                "(module (memory $0 {mem_pages}) \
+             (func $apply (param $0 i64) (param $1 i64) (param $2 i64) \
+             (drop ({op} offset={valid_offset} (i32.const 0)))) \
+             (export \"apply\" (func $apply)))"
+            );
+            let wasm = wat::parse_str(&wat).unwrap_or_else(|e| panic!("failed to parse {op}: {e}"));
+            assert!(
+                validate_wasm(&wasm).is_ok(),
+                "expected {op} with offset {valid_offset} to pass"
+            );
+        }
+    }
+
+    #[test]
+    fn test_store_offset_under_limit_passes() {
+        let mem_pages = constraints::MAXIMUM_LINEAR_MEMORY / constraints::WASM_PAGE_SIZE;
+        let valid_offset = constraints::MAXIMUM_LINEAR_MEMORY - 2;
+
+        let storeops: &[(&str, &str)] = &[
+            ("i32.store", "i32"),
+            ("i64.store", "i64"),
+            ("f32.store", "f32"),
+            ("f64.store", "f64"),
+            ("i32.store8", "i32"),
+            ("i32.store16", "i32"),
+            ("i64.store8", "i64"),
+            ("i64.store16", "i64"),
+            ("i64.store32", "i64"),
+        ];
+
+        for (op, ty) in storeops {
+            let wat = format!(
+                "(module (memory $0 {mem_pages}) \
+             (func $apply (param $0 i64) (param $1 i64) (param $2 i64) \
+             ({op} offset={valid_offset} (i32.const 0) ({ty}.const 0))) \
+             (export \"apply\" (func $apply)))"
+            );
+            let wasm = wat::parse_str(&wat).unwrap_or_else(|e| panic!("failed to parse {op}: {e}"));
+            assert!(
+                validate_wasm(&wasm).is_ok(),
+                "expected {op} with offset {valid_offset} to pass"
+            );
+        }
+    }
+
+    #[test]
+    fn test_load_offset_exceeds_limit() {
+        let mem_pages = constraints::MAXIMUM_LINEAR_MEMORY / constraints::WASM_PAGE_SIZE;
+        let bad_offset = constraints::MAXIMUM_LINEAR_MEMORY + 4;
+
+        let loadops = [
+            "i32.load",
+            "i64.load",
+            "f32.load",
+            "f64.load",
+            "i32.load8_s",
+            "i32.load8_u",
+            "i32.load16_s",
+            "i32.load16_u",
+            "i64.load8_s",
+            "i64.load8_u",
+            "i64.load16_s",
+            "i64.load16_u",
+            "i64.load32_s",
+            "i64.load32_u",
+        ];
+
+        for op in &loadops {
+            let wat = format!(
+                "(module (memory $0 {mem_pages}) \
+             (func $apply (param $0 i64) (param $1 i64) (param $2 i64) \
+             (drop ({op} offset={bad_offset} (i32.const 0)))) \
+             (export \"apply\" (func $apply)))"
+            );
+            let wasm = wat::parse_str(&wat).unwrap_or_else(|e| panic!("failed to parse {op}: {e}"));
+            assert!(
+                matches!(
+                    validate_wasm(&wasm).unwrap_err(),
+                    ValidationError::LargeMemoryOffset
+                ),
+                "expected {op} with offset {bad_offset} to fail with LargeMemoryOffset"
+            );
+        }
+    }
+
+    #[test]
+    fn test_store_offset_exceeds_limit() {
+        let mem_pages = constraints::MAXIMUM_LINEAR_MEMORY / constraints::WASM_PAGE_SIZE;
+        let bad_offset = constraints::MAXIMUM_LINEAR_MEMORY + 4;
+
+        let storeops: &[(&str, &str)] = &[
+            ("i32.store", "i32"),
+            ("i64.store", "i64"),
+            ("f32.store", "f32"),
+            ("f64.store", "f64"),
+            ("i32.store8", "i32"),
+            ("i32.store16", "i32"),
+            ("i64.store8", "i64"),
+            ("i64.store16", "i64"),
+            ("i64.store32", "i64"),
+        ];
+
+        for (op, ty) in storeops {
+            let wat = format!(
+                "(module (memory $0 {mem_pages}) \
+             (func $apply (param $0 i64) (param $1 i64) (param $2 i64) \
+             ({op} offset={bad_offset} (i32.const 0) ({ty}.const 0))) \
+             (export \"apply\" (func $apply)))"
+            );
+            let wasm = wat::parse_str(&wat).unwrap_or_else(|e| panic!("failed to parse {op}: {e}"));
+            assert!(
+                matches!(
+                    validate_wasm(&wasm).unwrap_err(),
+                    ValidationError::LargeMemoryOffset
+                ),
+                "expected {op} with offset {bad_offset} to fail with LargeMemoryOffset"
+            );
+        }
+    }
+
+    #[test]
+    fn test_big_deserialization_many_functions_under_limit() {
+        // maximum_section_elements - 2 extra functions + 1 apply func = maximum_section_elements - 1 total
+        let mut wat = String::from(
+            "(module \
+         (export \"apply\" (func $apply)) \
+         (func $apply (param $0 i64) (param $1 i64) (param $2 i64))",
+        );
+        for i in 0..(constraints::MAXIMUM_SECTION_ELEMENTS - 2) {
+            write!(wat, "(func $AA_{})", i).unwrap();
+        }
+        wat.push(')');
+
+        let wasm = wat::parse_str(&wat).unwrap();
+        assert!(validate_wasm(&wasm).is_ok());
+    }
+
+    #[test]
+    fn test_big_deserialization_many_functions_exceeds_limit() {
+        // maximum_section_elements extra functions + 1 apply func exceeds the limit.
+        // The C++ old_wasm_parser rejects this with wasm_serialization_error.
+        let mut wat = String::from(
+            "(module \
+         (export \"apply\" (func $apply)) \
+         (func $apply (param $0 i64) (param $1 i64) (param $2 i64))",
+        );
+        for i in 0..constraints::MAXIMUM_SECTION_ELEMENTS {
+            write!(wat, "(func $AA_{})", i).unwrap();
+        }
+        wat.push(')');
+
+        let wasm = wat::parse_str(&wat).unwrap();
+        assert!(validate_wasm(&wasm).is_err());
+    }
+
+    #[test]
+    fn test_big_deserialization_code_too_large() {
+        // A function body with maximum_code_size drop instructions produces a
+        // binary well over the MAXIMUM_CODE_SIZE limit.
+        let mut wat = String::from(
+            "(module \
+         (export \"apply\" (func $apply)) \
+         (func $apply (param $0 i64) (param $1 i64) (param $2 i64)) \
+         (func $aa ",
+        );
+        for _ in 0..constraints::MAXIMUM_CODE_SIZE {
+            wat.push_str("(drop (i32.const 3))");
+        }
+        wat.push_str("))");
+
+        let wasm = wat::parse_str(&wat).unwrap();
+        assert!(matches!(
+            validate_wasm(&wasm).unwrap_err(),
+            ValidationError::CodeTooLarge
+        ));
+    }
+
+    #[test]
+    fn test_big_deserialization_data_segment_under_limit() {
+        // Data segment: offset=20, length=maximum_func_local_bytes-1 (8191)
+        // Total end = 20 + 8191 = 8211 < 65536 (MAXIMUM_LINEAR_MEMORY_INIT), passes.
+        let data_len = constraints::MAXIMUM_FUNC_LOCAL_BYTES as usize - 1;
+        let data_str: String = std::iter::repeat('a').take(data_len).collect();
+
+        let wat = format!(
+            "(module \
+         (memory $0 1) \
+         (data (i32.const 20) \"{data_str}\") \
+         (export \"apply\" (func $apply)) \
+         (func $apply (param $0 i64) (param $1 i64) (param $2 i64)) \
+         (func $aa (drop (i32.const 3))))"
+        );
+
+        let wasm = wat::parse_str(&wat).unwrap();
+        assert!(validate_wasm(&wasm).is_ok());
+    }
+
+    #[test]
+    fn test_big_deserialization_data_segment_exceeds_limit() {
+        // Data segment: offset=20, length=maximum_func_local_bytes (8192)
+        // Total end = 20 + 8192 = 8212, still within 64KiB.
+        // The C++ old_wasm_parser rejects this via a serialization-level size
+        // check on data segment byte length, not the range check. This constraint
+        // is not implemented in the Rust validator.
+        let data_len = constraints::MAXIMUM_FUNC_LOCAL_BYTES as usize;
+        let data_str: String = std::iter::repeat('a').take(data_len).collect();
+
+        let wat = format!(
+            "(module \
+         (memory $0 1) \
+         (data (i32.const 20) \"{data_str}\") \
+         (export \"apply\" (func $apply)) \
+         (func $apply (param $0 i64) (param $1 i64) (param $2 i64)) \
+         (func $aa (drop (i32.const 3))))"
+        );
+
+        let wasm = wat::parse_str(&wat).unwrap();
+        assert!(validate_wasm(&wasm).is_err());
     }
 }
