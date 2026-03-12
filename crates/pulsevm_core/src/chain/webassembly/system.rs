@@ -1,4 +1,3 @@
-use spdlog::info;
 use wasmer::{FunctionEnvMut, RuntimeError, WasmPtr};
 
 use crate::chain::wasm_runtime::WasmContext;
