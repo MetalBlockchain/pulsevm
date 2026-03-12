@@ -14,8 +14,8 @@ pub fn read_action_data(
     buffer_ptr: WasmPtr<u8>,
     buffer_len: u32,
 ) -> Result<i32, RuntimeError> {
-    // Extract the data early
-    let action_data = env.data().action().data();
+    let (env_data, store) = env.data_and_store_mut();
+    let action_data = env_data.action().data();
     let total_len = action_data.len() as u32;
     let copy_size = buffer_len.min(total_len);
 
@@ -23,7 +23,6 @@ pub fn read_action_data(
         return Ok(total_len as i32);
     }
 
-    let (env_data, store) = env.data_and_store_mut();
     let memory = env_data
         .memory()
         .as_ref()
