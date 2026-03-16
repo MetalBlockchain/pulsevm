@@ -1,6 +1,5 @@
 use std::{
     net::SocketAddr,
-    str::FromStr,
     sync::{
         Arc,
         atomic::{AtomicI64, Ordering},
@@ -15,7 +14,7 @@ use pulsevm_core::{
 };
 use pulsevm_crypto::Bytes;
 use pulsevm_serialization::{Read, Write};
-use spdlog::{debug, error, info};
+use spdlog::{debug, info};
 use tokio::{
     sync::{
         RwLock, mpsc,
@@ -120,7 +119,7 @@ impl Session {
                             }
 
                             // New cancel channel for this stream
-                            let (stop_tx, mut stop_rx) = watch::channel(());
+                            let (stop_tx, stop_rx) = watch::channel(());
                             self.stream_cancel = Some(stop_tx);
 
                             // Spawn background producer
@@ -161,7 +160,7 @@ impl Session {
                                                     }
                                                     next = next.saturating_add(1);
                                                 }
-                                                Err(e) => {
+                                                Err(_) => {
                                                     // give window slot back
                                                     budget.fetch_add(1, Ordering::SeqCst);
                                                     tokio::time::sleep(Duration::from_millis(5))
@@ -169,7 +168,7 @@ impl Session {
                                                 }
                                             }
                                         }
-                                        Err(e) => {
+                                        Err(_) => {
                                             // Likely "block not ready yet" — backoff and retry
                                             // return slot because nothing was sent
                                             budget.fetch_add(1, Ordering::SeqCst);
@@ -329,10 +328,10 @@ async fn make_block_response_for(
     }
 
     let mut traces: Option<Bytes> = None;
-    if request.fetch_traces && block_num > 1 {
+    if request.fetch_traces {
         let trace_log = controller.trace_log();
 
-        if let Some(log) = &trace_log {
+        if let Some(log) = trace_log {
             if let Ok(packed_traces) = log.read_block(block_num) {
                 let transaction_traces: Vec<TransactionTrace> =
                     Vec::read(&packed_traces, &mut 0)
@@ -343,6 +342,17 @@ async fn make_block_response_for(
                     .collect::<Vec<TransactionTraceV0>>();
                 let packed_converted_traces = converted_traces.pack()?;
                 traces = Some(Bytes::new(packed_converted_traces));
+            }
+        }
+    }
+
+    let mut deltas: Option<Bytes> = None;
+    if request.fetch_deltas {
+        let chain_state_log = controller.chain_state_log();
+
+        if let Some(log) = chain_state_log {
+            if let Ok(packed_deltas) = log.read_block(block_num) {
+                deltas = Some(Bytes::new(packed_deltas));
             }
         }
     }
@@ -364,6 +374,6 @@ async fn make_block_response_for(
         prev_block: previous_block,
         block: block,
         traces: traces,
-        deltas: None,
+        deltas: deltas,
     })
 }

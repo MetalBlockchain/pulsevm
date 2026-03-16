@@ -591,6 +591,9 @@ pub mod ffi {
             reverse: bool,
             show_payer: bool,
         ) -> Result<String>;
+
+        // State history
+        pub fn pack_deltas(self: &Database, full_snapshot: bool) -> Result<Vec<u8>>;
     }
 }
 

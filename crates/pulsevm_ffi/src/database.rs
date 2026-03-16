@@ -979,6 +979,14 @@ impl Database {
         )
         .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
+
+    pub fn pack_deltas(&self, full_snapshot: bool) -> Result<Vec<u8>, ChainError> {
+        let guard = self.inner.read()?;
+
+        guard
+            .pack_deltas(full_snapshot)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
 }
 
 #[cfg(test)]
@@ -996,6 +1004,21 @@ mod tests {
         let mut db = Database::new(path, 1 * 1024 * 1024 * 1024).unwrap();
         let name = string_to_name("test").unwrap();
         db.add_indices();
+    }
+
+    #[test]
+    fn test_pack_deltas() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().to_str().unwrap();
+        let mut db = Database::new(path, 1 * 1024 * 1024 * 1024).unwrap();
+        let name = string_to_name("test").unwrap();
+        db.add_indices().unwrap();
+        let mut session = db.create_undo_session(true).unwrap();
+        let account = db.create_account(name.to_uint64_t(), 0).unwrap();
+        session.pin_mut().push().unwrap();
+        let deltas = db.pack_deltas(false).unwrap();
+        let hex_deltas = hex::encode(deltas);
+        assert_eq!(hex_deltas, "0100076163636f756e7401010e00000000000090b1ca0000000000");
     }
 }
 

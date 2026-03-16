@@ -353,28 +353,18 @@ impl Controller {
         let transaction_traces = self
             .execute_block(&block, &block_status, &mut mempool)
             .await?;
-        let packed_transaction_traces = transaction_traces.pack().map_err(|e| {
-            ChainError::TransactionError(format!(
-                "failed to pack transaction traces for block {}: {}",
-                block_id, e
-            ))
-        })?;
         let packed_block = block.pack().map_err(|e| {
             ChainError::TransactionError(format!("failed to pack block {}: {}", block_id, e))
         })?;
-        self.block_log
-            .as_ref()
-            .map(|log| log.append(block_id.clone(), &packed_block));
-        self.trace_log
-            .as_ref()
-            .map(|log| log.append(block_id.clone(), packed_transaction_traces.as_slice()));
-        self.chain_state_log
-            .as_ref()
-            .map(|log| log.append(block_id.clone(), block_id.clone().as_bytes()));
         root_session
             .pin_mut()
             .push()
             .map_err(|e| ChainError::TransactionError(format!("failed to commit block: {}", e)))?;
+        self.block_log
+            .as_ref()
+            .map(|log| log.append(block_id.clone(), &packed_block));
+        self.store_traces(block_id, &transaction_traces)?;
+        self.store_chain_state(block_id)?;
         self.verified_blocks.remove(block_id);
         self.last_accepted_block = block.clone();
         self.db.clear_expired_input_transactions(&block.timestamp().to_time_point())?;
@@ -640,6 +630,54 @@ impl Controller {
         self.block_log
             .as_ref()
             .ok_or_else(|| ChainError::InternalError("block log not initialized".to_string()))
+    }
+
+    pub fn store_traces(&mut self, block_id: &Id, transaction_traces: &Vec<TransactionTrace>) -> Result<(), ChainError> {
+        match &self.trace_log {
+            None => {
+                return Err(ChainError::InternalError(
+                    "trace log not initialized".to_string(),
+                ))
+            }
+            Some(trace_log) => {
+                let packed_transaction_traces = transaction_traces.pack().map_err(|e| {
+                    ChainError::TransactionError(format!(
+                        "failed to pack transaction traces for block {}: {}",
+                        block_id, e
+                    ))
+                })?;
+
+                trace_log
+                .append(block_id.clone(), &packed_transaction_traces)
+                .map_err(|e| {
+                    ChainError::InternalError(format!("failed to append to trace log: {}", e))
+                })?;
+
+                return Ok(());
+            }
+        }
+    }
+
+    pub fn store_chain_state(&mut self, block_id: &Id) -> Result<(), ChainError> {
+        match &self.chain_state_log {
+            None => {
+                return Err(ChainError::InternalError(
+                    "chain state log not initialized".to_string(),
+                ))
+            }
+            Some(chain_state_log) => {
+                let fresh = chain_state_log.range().is_none();
+                let chain_state = self.db.pack_deltas(fresh)?;
+
+                chain_state_log
+                .append(block_id.clone(), &chain_state)
+                .map_err(|e| {
+                    ChainError::InternalError(format!("failed to append to chain state log: {}", e))
+                })?;
+
+                return Ok(());
+            }
+        }
     }
 }
 

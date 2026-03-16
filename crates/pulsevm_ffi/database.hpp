@@ -7,6 +7,7 @@
 #include "type_defs.hpp"
 #include "iterator_cache.hpp"
 #include "objects.hpp"
+#include <fc/io/datastream.hpp>
 
 #include <memory>
 #include <string>
@@ -1024,6 +1025,8 @@ public:
     std::unique_ptr<chainbase::database::session> create_undo_session(bool enabled) {
         return std::make_unique<chainbase::database::session>(this->start_undo_session(enabled));
     }
+
+    rust::Vec<uint8_t> pack_deltas(bool full_snapshot) const;
 };
 
 // Wrapper methods for database operations

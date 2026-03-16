@@ -1,5 +1,6 @@
 #include "database.hpp"
 #include <pulsevm_ffi/src/bridge.rs.h>
+#include <pulsevm/state_history/create_deltas.hpp>
 #include <fc/reflect/reflect.hpp>
 #include <filesystem>
 
@@ -144,6 +145,24 @@ void database_wrapper::set_block_parameters(const ElasticLimitParameters& cpu_li
         c.net_limit_parameters.expand_rate.numerator = net_limit_parameters.expand_rate.numerator;
         c.net_limit_parameters.expand_rate.denominator = net_limit_parameters.expand_rate.denominator;
     });
+}
+
+rust::Vec<uint8_t> database_wrapper::pack_deltas(bool full_snapshot) const {
+    fc::datastream<size_t> ps;
+    pulsevm::state_history::pack_deltas(ps, *this, full_snapshot);
+    size_t sz = ps.tellp();
+
+    std::vector<char> temp_buffer(sz);
+    fc::datastream<char*> ds(temp_buffer.data(), sz);
+    pulsevm::state_history::pack_deltas(ds, *this, full_snapshot);
+
+    rust::Vec<uint8_t> out;
+    out.reserve(sz);
+    for (const auto& byte : temp_buffer) {
+        out.push_back(static_cast<uint8_t>(byte));
+    }
+
+    return out;
 }
 
 }
