@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod auth_tests {
-    use std::sync::Arc;
+    use std::{fs, path::Path, sync::Arc};
 
     use anyhow::Result;
     use pulsevm_core::{
@@ -100,6 +100,40 @@ mod auth_tests {
             chain.controller.chain_id(),
         )?;
         chain.push_transaction(trx)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_endless_loop() -> Result<()> {
+        let mut chain = Testing::new();
+        chain.create_accounts(vec![name!("loop").into()], false, true)?;
+        let wasm_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("reference_contracts")
+                .join("endless_loop.wasm");
+        let wasm = fs::read(wasm_path).expect("Failed to read endless loop wasm file");
+        chain.set_code(name!("loop").into(), wasm.into())?;
+
+        let mut trx = Transaction::default();
+        chain.set_transaction_headers(&mut trx, u32::MAX, 0);
+        trx.actions.push(Action {
+            account: name!("loop").into(),
+            name: name!("el").into(),
+            authorization: vec![PermissionLevel {
+                actor: name!("loop").into(),
+                permission: name!("active").into(),
+            }],
+            data: Arc::from(vec![]),
+        });
+        let trx = trx.sign(
+            &get_private_key(name!("loop").into(), "active"),
+            chain.controller.chain_id(),
+        )?;
+        assert!(chain.push_transaction(trx).is_err());
 
         Ok(())
     }
