@@ -9,7 +9,7 @@ use std::{path::PathBuf, sync::Mutex};
 
 use actix_web::{App, HttpServer, middleware, web};
 use clap::Parser;
-use spdlog::{info, error};
+use spdlog::{error, info};
 
 use crate::cli::Cli;
 

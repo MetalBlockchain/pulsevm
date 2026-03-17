@@ -1,11 +1,14 @@
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
 use std::fs;
+use std::path::{Path, PathBuf};
 
 use aes::Aes256;
-use cbc::{Encryptor, Decryptor, cipher::{block_padding::Pkcs7, BlockEncryptMut, BlockDecryptMut, KeyIvInit}};
-use sha2::{Sha512, Digest};
-use serde::{Serialize, Deserialize};
+use cbc::{
+    Decryptor, Encryptor,
+    cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit, block_padding::Pkcs7},
+};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha512};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::keys::{self, KeyError};
@@ -200,7 +203,11 @@ impl Wallet {
     }
 
     /// Try to sign a digest with a specific public key. Returns the signature hex or None.
-    pub fn try_sign_digest(&self, digest: &[u8], public_key: &str) -> Result<Option<String>, WalletError> {
+    pub fn try_sign_digest(
+        &self,
+        digest: &[u8],
+        public_key: &str,
+    ) -> Result<Option<String>, WalletError> {
         if self.locked {
             return Err(WalletError::Locked);
         }
@@ -257,7 +264,9 @@ fn encrypt_data(plaintext: &[u8], checksum: &[u8; 64]) -> Vec<u8> {
 fn decrypt_data(ciphertext: &[u8], checksum: &[u8; 64]) -> Result<Vec<u8>, ()> {
     let (key, iv) = derive_key_iv(checksum);
     let decryptor = Aes256CbcDec::new(&key.into(), &iv.into());
-    decryptor.decrypt_padded_vec_mut::<Pkcs7>(ciphertext).map_err(|_| ())
+    decryptor
+        .decrypt_padded_vec_mut::<Pkcs7>(ciphertext)
+        .map_err(|_| ())
 }
 
 fn sha512_hash(data: &[u8]) -> [u8; 64] {

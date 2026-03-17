@@ -21,9 +21,8 @@ pub use crate::bridge::ffi::{CxxName, string_to_name, u64_to_name};
 pub use crate::bridge::ffi::{
     make_k1_private_key, make_shared_digest_from_data, make_shared_digest_from_existing_hash,
     make_shared_digest_from_string, make_unknown_public_key, parse_private_key, parse_public_key,
-    parse_public_key_from_bytes, parse_signature, parse_signature_from_bytes,
-    recover_public_key_from_signature, sign_digest_with_private_key,
-    random_private_key, random_private_key_r1,
+    parse_public_key_from_bytes, parse_signature, parse_signature_from_bytes, random_private_key,
+    random_private_key_r1, recover_public_key_from_signature, sign_digest_with_private_key,
 };
 pub use crate::database::Database;
 pub use crate::iterator_cache::KeyValueIteratorCache;

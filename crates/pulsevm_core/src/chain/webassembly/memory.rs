@@ -2,7 +2,7 @@ use wasmer::{FunctionEnvMut, RuntimeError, WasmPtr};
 
 use crate::wasm_runtime::WasmContext;
 
- #[inline]
+#[inline]
 pub fn memmove(
     mut env: FunctionEnvMut<WasmContext>,
     dest_ptr: WasmPtr<u8>,

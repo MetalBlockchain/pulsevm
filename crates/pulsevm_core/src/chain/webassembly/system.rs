@@ -10,7 +10,9 @@ pub fn pulse_assert(
 ) -> Result<(), RuntimeError> {
     if condition != 1 {
         if msg_len == 0 {
-            return Err(RuntimeError::new("pulse assertion is false with no message"));
+            return Err(RuntimeError::new(
+                "pulse assertion is false with no message",
+            ));
         }
 
         let (env_data, store) = env.data_and_store_mut();

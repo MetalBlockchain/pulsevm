@@ -58,7 +58,12 @@ mod tests {
 
             // Initialize controller
             controller
-                .initialize(&chain_id, &config_bytes, &genesis, temp_dir.path().to_str().unwrap())
+                .initialize(
+                    &chain_id,
+                    &config_bytes,
+                    &genesis,
+                    temp_dir.path().to_str().unwrap(),
+                )
                 .expect("Failed to initialize controller");
 
             let mut suite = Testing {
@@ -278,10 +283,7 @@ mod tests {
                 }
                 .pack()
                 .unwrap(),
-                vec![PermissionLevel::new(
-                    account.as_u64(),
-                    ACTIVE_NAME.as_u64(),
-                )],
+                vec![PermissionLevel::new(account.as_u64(), ACTIVE_NAME.as_u64())],
             ));
 
             let signed = trx.sign(

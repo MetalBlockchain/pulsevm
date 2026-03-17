@@ -9,9 +9,11 @@ pub async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let data_dir = dirs_or_default();
     let wallet_url = match cli.wallet_url {
         Some(url) => url,
-        None => {
-            data_dir.join("pulse-keosd.sock").to_str().unwrap().to_string()
-        },
+        None => data_dir
+            .join("pulse-keosd.sock")
+            .to_str()
+            .unwrap()
+            .to_string(),
     };
     let keosd_client = match wallet_url.strip_prefix("http://") {
         Some(url) => KeosdClient::tcp(url),

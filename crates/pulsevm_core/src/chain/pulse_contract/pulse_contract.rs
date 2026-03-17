@@ -143,7 +143,7 @@ pub fn setcode(
 
     if code_size > 0 {
         code_hash = CxxDigest::hash(act.code.as_slice())?;
-        
+
         // Validate the code before accepting it
         pulsevm_wasm_validation::validate_wasm(act.code.as_slice()).map_err(|e| {
             ChainError::TransactionError(format!("contract code failed validation: {}", e))
@@ -163,7 +163,11 @@ pub fn setcode(
 
     if existing_code {
         let old_code_entry = unsafe {
-            &*db.get_code_object_by_hash(account.get_code_hash(), account.get_vm_type(), account.get_vm_version())?
+            &*db.get_code_object_by_hash(
+                account.get_code_hash(),
+                account.get_vm_type(),
+                account.get_vm_version(),
+            )?
         };
         pulse_assert(
             old_code_entry.get_code_hash() != code_hash.as_ref().unwrap(),

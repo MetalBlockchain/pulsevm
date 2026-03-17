@@ -7,7 +7,11 @@ pub async fn handle(
     subcmd: WalletSubcommand,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match subcmd {
-        WalletSubcommand::Create { name, to_console, file } => {
+        WalletSubcommand::Create {
+            name,
+            to_console,
+            file,
+        } => {
             let password = client.create(&name).await?;
             println!("Creating wallet: {}", name);
             println!("Save password to use in the future to unlock this wallet.");
@@ -41,9 +45,8 @@ pub async fn handle(
                 Some(p) => p,
                 None => {
                     eprint!("password: ");
-                    rpassword::read_password().map_err(|e| {
-                        format!("failed to read password from terminal: {}", e)
-                    })?
+                    rpassword::read_password()
+                        .map_err(|e| format!("failed to read password from terminal: {}", e))?
                 }
             };
             if pw.is_empty() {
@@ -58,16 +61,17 @@ pub async fn handle(
                 Some(k) => k,
                 None => {
                     eprint!("private key: ");
-                    rpassword::read_password().map_err(|e| {
-                        format!("failed to read private key from terminal: {}", e)
-                    })?
+                    rpassword::read_password()
+                        .map_err(|e| format!("failed to read private key from terminal: {}", e))?
                 }
             };
             if key.is_empty() {
                 return Err("private key must not be empty".into());
             }
             client.import_key(&name, &key).await?;
-            println!("imported private key for: EOS6MRyAjQq8ud7hVNYcfnVPJqcVpscN5So8BhtHuGYqET5GDW5CV");
+            println!(
+                "imported private key for: EOS6MRyAjQq8ud7hVNYcfnVPJqcVpscN5So8BhtHuGYqET5GDW5CV"
+            );
         }
 
         WalletSubcommand::List => {
@@ -83,9 +87,8 @@ pub async fn handle(
                 Some(p) => p,
                 None => {
                     eprint!("password: ");
-                    rpassword::read_password().map_err(|e| {
-                        format!("failed to read password from terminal: {}", e)
-                    })?
+                    rpassword::read_password()
+                        .map_err(|e| format!("failed to read password from terminal: {}", e))?
                 }
             };
             if pw.is_empty() {
@@ -95,19 +98,22 @@ pub async fn handle(
             println!("[");
             for (i, k) in keys.iter().enumerate() {
                 let comma = if i < keys.len() - 1 { "," } else { "" };
-                println!("  \"{}\"{}",k[0], comma);
+                println!("  \"{}\"{}", k[0], comma);
             }
             println!("]");
         }
 
-        WalletSubcommand::RemoveKey { key, name, password } => {
+        WalletSubcommand::RemoveKey {
+            key,
+            name,
+            password,
+        } => {
             let pw = match password {
                 Some(p) => p,
                 None => {
                     eprint!("password: ");
-                    rpassword::read_password().map_err(|e| {
-                        format!("failed to read password from terminal: {}", e)
-                    })?
+                    rpassword::read_password()
+                        .map_err(|e| format!("failed to read password from terminal: {}", e))?
                 }
             };
             if pw.is_empty() {

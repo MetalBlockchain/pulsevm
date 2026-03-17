@@ -3,10 +3,20 @@ mod auth_tests {
     use std::sync::Arc;
 
     use anyhow::Result;
-    use pulsevm_core::{authority::PermissionLevel, transaction::{Action, SignedTransaction, Transaction}, wat2wasm};
+    use pulsevm_core::{
+        authority::PermissionLevel,
+        transaction::{Action, SignedTransaction, Transaction},
+        wat2wasm,
+    };
     use pulsevm_name_macro::name;
 
-    use crate::{tests::{Testing, get_private_key}, unittests::contracts::{ALIGNED_CONST_REF_WAST, ALIGNED_REF_WAST, ENTRY_WAST, ENTRY_WAST_2, MISALIGNED_CONST_REF_WAST, MISALIGNED_REF_WAST}};
+    use crate::{
+        tests::{Testing, get_private_key},
+        unittests::contracts::{
+            ALIGNED_CONST_REF_WAST, ALIGNED_REF_WAST, ENTRY_WAST, ENTRY_WAST_2,
+            MISALIGNED_CONST_REF_WAST, MISALIGNED_REF_WAST,
+        },
+    };
 
     #[test]
     fn test_misaligned() -> Result<()> {
@@ -26,7 +36,10 @@ mod auth_tests {
                 }],
                 data: Arc::from(vec![]),
             });
-            let trx = trx.sign(&get_private_key(name!("aligncheck").into(), "active"), chain.controller.chain_id())?;
+            let trx = trx.sign(
+                &get_private_key(name!("aligncheck").into(), "active"),
+                chain.controller.chain_id(),
+            )?;
             chain.push_transaction(trx)?;
             Ok(())
         };
@@ -35,7 +48,7 @@ mod auth_tests {
         check_aligned(&mut chain, MISALIGNED_REF_WAST)?;
         check_aligned(&mut chain, ALIGNED_CONST_REF_WAST)?;
         check_aligned(&mut chain, MISALIGNED_CONST_REF_WAST)?;
-        
+
         Ok(())
     }
 
@@ -56,9 +69,12 @@ mod auth_tests {
             }],
             data: Arc::from(vec![]),
         });
-        let trx = trx.sign(&get_private_key(name!("entrycheck").into(), "active"), chain.controller.chain_id())?;
+        let trx = trx.sign(
+            &get_private_key(name!("entrycheck").into(), "active"),
+            chain.controller.chain_id(),
+        )?;
         chain.push_transaction(trx)?;
-        
+
         Ok(())
     }
 
@@ -79,9 +95,12 @@ mod auth_tests {
             }],
             data: Arc::from(vec![]),
         });
-        let trx = trx.sign(&get_private_key(name!("entrycheck").into(), "active"), chain.controller.chain_id())?;
+        let trx = trx.sign(
+            &get_private_key(name!("entrycheck").into(), "active"),
+            chain.controller.chain_id(),
+        )?;
         chain.push_transaction(trx)?;
-        
+
         Ok(())
     }
 }

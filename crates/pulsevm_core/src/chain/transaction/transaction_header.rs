@@ -1,7 +1,6 @@
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 use pulsevm_serialization::VarUint32;
 use pulsevm_time::TimePointSec;
-use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Read, Write, NumBytes, Default)]
 pub struct TransactionHeader {

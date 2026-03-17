@@ -1,7 +1,7 @@
-use k256::ecdsa::{SigningKey, VerifyingKey, signature::Signer, Signature};
+use k256::ecdsa::{Signature, SigningKey, VerifyingKey, signature::Signer};
 use k256::elliptic_curve::sec1::ToEncodedPoint;
 use ripemd::Ripemd160;
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 /// The key type suffix used in the RIPEMD-160 checksum for PUB_K1_ / PVT_K1_ keys.
@@ -34,7 +34,9 @@ fn base58check_encode(version: u8, payload: &[u8]) -> String {
 
 /// Decode base58check, returning (version_byte, payload).
 fn base58check_decode(s: &str) -> Result<(u8, Vec<u8>), KeyError> {
-    let data = bs58::decode(s).into_vec().map_err(|_| KeyError::InvalidWif)?;
+    let data = bs58::decode(s)
+        .into_vec()
+        .map_err(|_| KeyError::InvalidWif)?;
     if data.len() < 5 {
         return Err(KeyError::InvalidWif);
     }
@@ -145,8 +147,7 @@ pub fn wif_to_private_key(wif: &str) -> Result<SigningKey, KeyError> {
     } else {
         return Err(KeyError::InvalidWif);
     };
-    SigningKey::from_bytes(key_bytes.into())
-        .map_err(|e| KeyError::CryptoError(e.to_string()))
+    SigningKey::from_bytes(key_bytes.into()).map_err(|e| KeyError::CryptoError(e.to_string()))
 }
 
 /// Get the public key string in `PUB_K1_...` format from a SigningKey.
@@ -209,7 +210,11 @@ mod tests {
     fn test_roundtrip_keypair_pub_k1() {
         let (wif, pubkey) = generate_keypair().unwrap();
         assert!(wif.starts_with('5') || wif.starts_with('K') || wif.starts_with('L'));
-        assert!(pubkey.starts_with("PUB_K1_"), "Expected PUB_K1_ prefix, got: {}", pubkey);
+        assert!(
+            pubkey.starts_with("PUB_K1_"),
+            "Expected PUB_K1_ prefix, got: {}",
+            pubkey
+        );
 
         // Roundtrip WIF -> SigningKey -> PUB_K1_
         let sk = wif_to_private_key(&wif).unwrap();

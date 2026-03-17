@@ -74,7 +74,7 @@ impl<'de> Deserialize<'de> for PermissionLevel {
         }
 
         let helper = PermissionLevelHelper::deserialize(deserializer)?;
-        
+
         Ok(PermissionLevel {
             actor: helper.actor.as_u64(),
             permission: helper.permission.as_u64(),

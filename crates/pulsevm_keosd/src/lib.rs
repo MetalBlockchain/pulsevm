@@ -1,4 +1,4 @@
-pub mod keys;
-pub mod wallet;
-pub mod manager;
 pub mod api;
+pub mod keys;
+pub mod manager;
+pub mod wallet;

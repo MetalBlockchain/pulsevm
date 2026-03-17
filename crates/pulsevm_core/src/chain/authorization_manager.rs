@@ -4,11 +4,16 @@ use pulsevm_error::ChainError;
 use pulsevm_ffi::{Authority, CxxTimePoint, Database, PermissionObject};
 
 use crate::{
-    PULSE_NAME, chain::{
+    PULSE_NAME,
+    chain::{
         name::Name,
         pulse_contract::{DeleteAuth, LinkAuth, UnlinkAuth, UpdateAuth},
         transaction::Action,
-    }, config::{DELETEAUTH_NAME, LINKAUTH_NAME, UNLINKAUTH_NAME, UPDATEAUTH_NAME}, crypto::PublicKey, transaction::Transaction, utils::pulse_assert
+    },
+    config::{DELETEAUTH_NAME, LINKAUTH_NAME, UNLINKAUTH_NAME, UPDATEAUTH_NAME},
+    crypto::PublicKey,
+    transaction::Transaction,
+    utils::pulse_assert,
 };
 
 use super::{

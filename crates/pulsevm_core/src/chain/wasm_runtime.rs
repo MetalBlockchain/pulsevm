@@ -7,7 +7,6 @@ use lru::LruCache;
 use pulsevm_crypto::Bytes;
 use pulsevm_error::ChainError;
 use pulsevm_ffi::{CxxDigest, Database};
-use spdlog::{debug, info};
 use wasmer::{
     Engine, Function, FunctionEnv, Instance, Memory, Module, Store, imports, sys::CompilerConfig,
     wasmparser::Operator,
@@ -26,7 +25,12 @@ use crate::{
         name::Name,
         transaction::Action,
         webassembly::{
-            assert_sha224, assert_sha256, assert_sha512, check_transaction_authorization, current_time, db_end_i64, db_find_i64, db_get_i64, db_lowerbound_i64, db_next_i64, db_previous_i64, db_remove_i64, db_store_i64, db_update_i64, db_upperbound_i64, get_resource_limits, is_privileged, memmove, pulse_assert, read_action_data, require_auth2, require_recipient, set_action_return_value, set_privileged, set_resource_limits, sha224, sha256, sha512
+            assert_sha224, assert_sha256, assert_sha512, check_transaction_authorization,
+            current_time, db_end_i64, db_find_i64, db_get_i64, db_lowerbound_i64, db_next_i64,
+            db_previous_i64, db_remove_i64, db_store_i64, db_update_i64, db_upperbound_i64,
+            get_resource_limits, is_privileged, memmove, pulse_assert, read_action_data,
+            require_auth2, require_recipient, set_action_return_value, set_privileged,
+            set_resource_limits, sha224, sha256, sha512,
         },
     },
 };
@@ -112,7 +116,6 @@ struct InnerWasmRuntime {
 
 #[derive(Clone)]
 pub struct WasmRuntime {
-    engine: Engine,
     inner: Arc<RwLock<InnerWasmRuntime>>,
 }
 
@@ -120,11 +123,28 @@ const COST_FUNCTION: fn(&Operator) -> u64 = |operator: &Operator| -> u64 {
     match operator {
         Operator::Drop => 2,
         Operator::Select => 3,
-        Operator::Br { .. } | Operator::BrTable { .. } | Operator::Call { .. } | Operator::CallIndirect { .. } | Operator::Return { .. } => 2,
+        Operator::Br { .. }
+        | Operator::BrTable { .. }
+        | Operator::Call { .. }
+        | Operator::CallIndirect { .. }
+        | Operator::Return { .. } => 2,
         Operator::BrIf { .. } => 3,
-        Operator::GlobalGet { .. } | Operator::GlobalSet { .. } | Operator::LocalGet { .. } | Operator::LocalSet { .. } => 3,
-        Operator::I32Mul { .. } | Operator::I64Mul { .. } | Operator::F32Mul { .. } | Operator::F64Mul { .. } => 3,
-        Operator::I32DivS { .. } | Operator::I32DivU { .. } | Operator::I32RemS { .. } | Operator::I32RemU { .. } | Operator::I64DivS { .. } | Operator::I64DivU { .. } | Operator::I64RemS { .. } | Operator::I64RemU { .. } => 80,
+        Operator::GlobalGet { .. }
+        | Operator::GlobalSet { .. }
+        | Operator::LocalGet { .. }
+        | Operator::LocalSet { .. } => 3,
+        Operator::I32Mul { .. }
+        | Operator::I64Mul { .. }
+        | Operator::F32Mul { .. }
+        | Operator::F64Mul { .. } => 3,
+        Operator::I32DivS { .. }
+        | Operator::I32DivU { .. }
+        | Operator::I32RemS { .. }
+        | Operator::I32RemU { .. }
+        | Operator::I64DivS { .. }
+        | Operator::I64DivU { .. }
+        | Operator::I64RemS { .. }
+        | Operator::I64RemU { .. } => 80,
         Operator::I32Clz { .. } | Operator::I64Clz { .. } => 105,
         Operator::MemoryCopy { .. } | Operator::MemoryFill { .. } => 500,
         Operator::MemoryGrow { .. } => 1000, // Higher cost for memory growth
@@ -141,7 +161,6 @@ impl WasmRuntime {
         LLVM::opt_level(&mut compiler, LLVMOptLevel::Aggressive);
 
         Ok(Self {
-            engine: compiler.into(),
             inner: Arc::new(RwLock::new(InnerWasmRuntime {
                 code_cache: LruCache::new(NonZeroUsize::new(1024).unwrap()),
             })),
@@ -167,7 +186,7 @@ impl WasmRuntime {
             if !inner.code_cache.contains(&id) {
                 let code_object = db.get_code_object_by_hash(code_hash, 0, 0)?;
                 let code_object = unsafe { &*code_object };
-                
+
                 // Create a temporary store just for module compilation
                 let mut compiler = LLVM::default();
 
@@ -182,7 +201,13 @@ impl WasmRuntime {
 
                 let module = Module::new(temp_store.engine(), code_object.get_code().as_slice())
                     .map_err(|e| ChainError::WasmRuntimeError(e.to_string()))?;
-                inner.code_cache.put(id, CachedModule { module, engine: temp_engine.clone() });
+                inner.code_cache.put(
+                    id,
+                    CachedModule {
+                        module,
+                        engine: temp_engine.clone(),
+                    },
+                );
             }
 
             inner.code_cache.get(&id).unwrap()

@@ -47,15 +47,24 @@ impl fmt::Debug for CxxPublicKey {
 mod tests {
     #[test]
     fn test_public_key_display() {
-        let public_key = crate::parse_public_key("PUB_K1_5bbkxaLdB5bfVZW6DJY8M74vwT2m61PqwywNUa5azfkJTvYa5H").unwrap();
+        let public_key =
+            crate::parse_public_key("PUB_K1_5bbkxaLdB5bfVZW6DJY8M74vwT2m61PqwywNUa5azfkJTvYa5H")
+                .unwrap();
         let s = public_key.to_string();
-        assert_eq!(s, "PUB_K1_5bbkxaLdB5bfVZW6DJY8M74vwT2m61PqwywNUa5azfkJTvYa5H");
+        assert_eq!(
+            s,
+            "PUB_K1_5bbkxaLdB5bfVZW6DJY8M74vwT2m61PqwywNUa5azfkJTvYa5H"
+        );
     }
 
     #[test]
     fn test_public_key_equality() {
-        let public_key1 = crate::parse_public_key("PUB_K1_5bbkxaLdB5bfVZW6DJY8M74vwT2m61PqwywNUa5azfkJTvYa5H").unwrap();
-        let public_key2 = crate::parse_public_key("PUB_K1_5bbkxaLdB5bfVZW6DJY8M74vwT2m61PqwywNUa5azfkJTvYa5H").unwrap();
+        let public_key1 =
+            crate::parse_public_key("PUB_K1_5bbkxaLdB5bfVZW6DJY8M74vwT2m61PqwywNUa5azfkJTvYa5H")
+                .unwrap();
+        let public_key2 =
+            crate::parse_public_key("PUB_K1_5bbkxaLdB5bfVZW6DJY8M74vwT2m61PqwywNUa5azfkJTvYa5H")
+                .unwrap();
         assert_eq!(public_key1, public_key2);
     }
 }

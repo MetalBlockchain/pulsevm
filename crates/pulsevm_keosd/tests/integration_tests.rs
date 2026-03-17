@@ -1,4 +1,4 @@
-use actix_web::{web, App};
+use actix_web::{App, web};
 use tempfile::TempDir;
 
 // ============================================================================
@@ -17,9 +17,17 @@ mod key_tests {
             "WIF key has unexpected prefix: {}",
             wif
         );
-        assert!(pubkey.starts_with("PUB_K1_"), "Public key missing PUB_K1_ prefix: {}", pubkey);
+        assert!(
+            pubkey.starts_with("PUB_K1_"),
+            "Public key missing PUB_K1_ prefix: {}",
+            pubkey
+        );
         // PUB_K1_ public keys are ~50-53 chars
-        assert!(pubkey.len() > 45 && pubkey.len() < 60, "Unexpected pubkey length: {}", pubkey.len());
+        assert!(
+            pubkey.len() > 45 && pubkey.len() < 60,
+            "Unexpected pubkey length: {}",
+            pubkey.len()
+        );
     }
 
     #[test]
@@ -59,7 +67,12 @@ mod key_tests {
         let digest = [0xab_u8; 32];
         let sig = keys::sign_digest(&sk, &digest).unwrap();
         // ECDSA signature is 64 bytes = 128 hex chars
-        assert_eq!(sig.len(), 128, "Signature hex should be 128 chars, got {}", sig.len());
+        assert_eq!(
+            sig.len(),
+            128,
+            "Signature hex should be 128 chars, got {}",
+            sig.len()
+        );
         // Should be valid hex
         assert!(hex::decode(&sig).is_ok());
     }
@@ -182,7 +195,11 @@ mod wallet_tests {
         let (dir, password) = setup();
         let mut wallet = Wallet::create("test", &password, dir.path()).unwrap();
         let pub_key = wallet.create_key().unwrap();
-        assert!(pub_key.starts_with("PUB_K1_"), "Public key should start with PUB_K1_: {}", pub_key);
+        assert!(
+            pub_key.starts_with("PUB_K1_"),
+            "Public key should start with PUB_K1_: {}",
+            pub_key
+        );
     }
 
     #[test]
@@ -354,7 +371,10 @@ mod manager_tests {
     fn create_wallet_returns_password() {
         let (_dir, mut mgr) = setup();
         let password = mgr.create("test").unwrap();
-        assert!(password.starts_with("PW"), "Password should start with PW prefix");
+        assert!(
+            password.starts_with("PW"),
+            "Password should start with PW prefix"
+        );
         assert!(password.len() > 10, "Password should be reasonably long");
     }
 
@@ -450,7 +470,11 @@ mod manager_tests {
         let (_dir, mut mgr) = setup();
         mgr.create("test").unwrap();
         let pub_key = mgr.create_key("test").unwrap();
-        assert!(pub_key.starts_with("PUB_K1_"), "Public key should start with PUB_K1_: {}", pub_key);
+        assert!(
+            pub_key.starts_with("PUB_K1_"),
+            "Public key should start with PUB_K1_: {}",
+            pub_key
+        );
     }
 
     #[test]
@@ -551,7 +575,9 @@ mod manager_tests {
         mgr.import_key("test", &wif2).unwrap();
 
         let digest = [0xfe_u8; 32];
-        let sigs = mgr.sign_digest(&digest, &[pub1.clone(), pub2.clone()]).unwrap();
+        let sigs = mgr
+            .sign_digest(&digest, &[pub1.clone(), pub2.clone()])
+            .unwrap();
         assert_eq!(sigs.len(), 2);
         assert!(sigs.contains_key(&pub1));
         assert!(sigs.contains_key(&pub2));
@@ -612,12 +638,8 @@ mod api_tests {
             manager: Mutex::new(mgr),
         });
 
-        let app = test::init_service(
-            App::new()
-                .app_data(state)
-                .configure(api::configure_routes),
-        )
-        .await;
+        let app =
+            test::init_service(App::new().app_data(state).configure(api::configure_routes)).await;
 
         (dir, app)
     }
@@ -634,7 +656,11 @@ mod api_tests {
         assert_eq!(resp.status(), StatusCode::CREATED);
 
         let body: String = test::read_body_json(resp).await;
-        assert!(body.starts_with("PW"), "Password should start with PW: {}", body);
+        assert!(
+            body.starts_with("PW"),
+            "Password should start with PW: {}",
+            body
+        );
     }
 
     #[actix_rt::test]
@@ -810,7 +836,11 @@ mod api_tests {
         assert_eq!(resp.status(), StatusCode::CREATED);
 
         let pub_key: String = test::read_body_json(resp).await;
-        assert!(pub_key.starts_with("PUB_K1_"), "Public key should start with PUB_K1_: {}", pub_key);
+        assert!(
+            pub_key.starts_with("PUB_K1_"),
+            "Public key should start with PUB_K1_: {}",
+            pub_key
+        );
     }
 
     #[actix_rt::test]

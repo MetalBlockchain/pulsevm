@@ -4,7 +4,6 @@ use std::{
     str::FromStr,
 };
 
-use chrono::format::Fixed;
 use cxx::SharedPtr;
 use pulsevm_crypto::FixedBytes;
 use pulsevm_error::ChainError;

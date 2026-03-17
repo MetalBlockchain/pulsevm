@@ -37,7 +37,13 @@ struct ErrorResponse {
     error: ErrorBody,
 }
 
-fn error_response(status: u16, code: u32, name: &str, what: &str, detail_msg: &str) -> HttpResponse {
+fn error_response(
+    status: u16,
+    code: u32,
+    name: &str,
+    what: &str,
+    detail_msg: &str,
+) -> HttpResponse {
     let resp = ErrorResponse {
         code: status,
         message: match status {
@@ -57,38 +63,73 @@ fn error_response(status: u16, code: u32, name: &str, what: &str, detail_msg: &s
             }],
         },
     };
-    HttpResponse::build(actix_web::http::StatusCode::from_u16(status).unwrap_or(actix_web::http::StatusCode::INTERNAL_SERVER_ERROR))
-        .json(resp)
+    HttpResponse::build(
+        actix_web::http::StatusCode::from_u16(status)
+            .unwrap_or(actix_web::http::StatusCode::INTERNAL_SERVER_ERROR),
+    )
+    .json(resp)
 }
 
 fn manager_err_to_response(e: ManagerError) -> HttpResponse {
     match &e {
-        ManagerError::WalletAlreadyExists(_) => {
-            error_response(500, 3120001, "wallet_exist_exception", "Wallet already exists", &e.to_string())
-        }
-        ManagerError::WalletNotFound(_) => {
-            error_response(500, 3120002, "wallet_nonexistent_exception", "Nonexistent wallet", &e.to_string())
-        }
+        ManagerError::WalletAlreadyExists(_) => error_response(
+            500,
+            3120001,
+            "wallet_exist_exception",
+            "Wallet already exists",
+            &e.to_string(),
+        ),
+        ManagerError::WalletNotFound(_) => error_response(
+            500,
+            3120002,
+            "wallet_nonexistent_exception",
+            "Nonexistent wallet",
+            &e.to_string(),
+        ),
         ManagerError::WalletError(we) => match we {
-            crate::wallet::WalletError::Locked => {
-                error_response(500, 3120003, "wallet_locked_exception", "Wallet locked", &e.to_string())
-            }
-            crate::wallet::WalletError::InvalidPassword(_) => {
-                error_response(500, 3120005, "wallet_invalid_password_exception", "Invalid wallet password", &e.to_string())
-            }
-            _ => {
-                error_response(500, 3120000, "wallet_exception", "Wallet exception", &e.to_string())
-            }
-        }
-        ManagerError::NoUnlockedWallets => {
-            error_response(500, 3120003, "wallet_locked_exception", "Wallet locked", &e.to_string())
-        }
-        ManagerError::PublicKeyNotFound(_) => {
-            error_response(500, 3120004, "wallet_missing_pub_key_exception", "Missing public key", &e.to_string())
-        }
-        _ => {
-            error_response(500, 3120000, "wallet_exception", "Wallet exception", &e.to_string())
-        }
+            crate::wallet::WalletError::Locked => error_response(
+                500,
+                3120003,
+                "wallet_locked_exception",
+                "Wallet locked",
+                &e.to_string(),
+            ),
+            crate::wallet::WalletError::InvalidPassword(_) => error_response(
+                500,
+                3120005,
+                "wallet_invalid_password_exception",
+                "Invalid wallet password",
+                &e.to_string(),
+            ),
+            _ => error_response(
+                500,
+                3120000,
+                "wallet_exception",
+                "Wallet exception",
+                &e.to_string(),
+            ),
+        },
+        ManagerError::NoUnlockedWallets => error_response(
+            500,
+            3120003,
+            "wallet_locked_exception",
+            "Wallet locked",
+            &e.to_string(),
+        ),
+        ManagerError::PublicKeyNotFound(_) => error_response(
+            500,
+            3120004,
+            "wallet_missing_pub_key_exception",
+            "Missing public key",
+            &e.to_string(),
+        ),
+        _ => error_response(
+            500,
+            3120000,
+            "wallet_exception",
+            "Wallet exception",
+            &e.to_string(),
+        ),
     }
 }
 
@@ -124,10 +165,7 @@ struct SignTransactionRequest(Value, Vec<String>, String); // [transaction, publ
 /// Body: "wallet_name" (JSON string)
 /// Returns: "password" (JSON string)
 #[post("/v1/wallet/create")]
-async fn wallet_create(
-    data: web::Data<AppState>,
-    body: web::Json<String>,
-) -> HttpResponse {
+async fn wallet_create(data: web::Data<AppState>, body: web::Json<String>) -> HttpResponse {
     let name = body.into_inner();
     let mut mgr = data.manager.lock().unwrap();
     match mgr.create(&name) {
@@ -139,10 +177,7 @@ async fn wallet_create(
 /// POST /v1/wallet/open
 /// Body: "wallet_name" (JSON string)
 #[post("/v1/wallet/open")]
-async fn wallet_open(
-    data: web::Data<AppState>,
-    body: web::Json<String>,
-) -> HttpResponse {
+async fn wallet_open(data: web::Data<AppState>, body: web::Json<String>) -> HttpResponse {
     let name = body.into_inner();
     let mut mgr = data.manager.lock().unwrap();
     match mgr.open(&name) {
@@ -154,10 +189,7 @@ async fn wallet_open(
 /// POST /v1/wallet/lock
 /// Body: "wallet_name" (JSON string)
 #[post("/v1/wallet/lock")]
-async fn wallet_lock(
-    data: web::Data<AppState>,
-    body: web::Json<String>,
-) -> HttpResponse {
+async fn wallet_lock(data: web::Data<AppState>, body: web::Json<String>) -> HttpResponse {
     let name = body.into_inner();
     let mut mgr = data.manager.lock().unwrap();
     match mgr.lock(&name) {
@@ -179,10 +211,7 @@ async fn wallet_lock_all(data: web::Data<AppState>) -> HttpResponse {
 /// POST /v1/wallet/unlock
 /// Body: ["wallet_name", "password"]
 #[post("/v1/wallet/unlock")]
-async fn wallet_unlock(
-    data: web::Data<AppState>,
-    body: web::Json<UnlockRequest>,
-) -> HttpResponse {
+async fn wallet_unlock(data: web::Data<AppState>, body: web::Json<UnlockRequest>) -> HttpResponse {
     let req = body.into_inner();
     let mut mgr = data.manager.lock().unwrap();
     match mgr.unlock(&req.0, &req.1) {
@@ -297,10 +326,7 @@ async fn wallet_get_public_keys_get(data: web::Data<AppState>) -> HttpResponse {
 /// POST /v1/wallet/set_timeout
 /// Body: integer (seconds)
 #[post("/v1/wallet/set_timeout")]
-async fn wallet_set_timeout(
-    data: web::Data<AppState>,
-    body: web::Json<u64>,
-) -> HttpResponse {
+async fn wallet_set_timeout(data: web::Data<AppState>, body: web::Json<u64>) -> HttpResponse {
     let secs = body.into_inner();
     let mut mgr = data.manager.lock().unwrap();
     mgr.set_timeout(secs);
@@ -318,7 +344,15 @@ async fn wallet_sign_digest(
 
     let digest_bytes = match hex::decode(&digest_hex) {
         Ok(b) => b,
-        Err(_) => return error_response(500, 3120000, "wallet_exception", "Wallet exception", "Invalid digest hex"),
+        Err(_) => {
+            return error_response(
+                500,
+                3120000,
+                "wallet_exception",
+                "Wallet exception",
+                "Invalid digest hex",
+            );
+        }
     };
 
     let mut mgr = data.manager.lock().unwrap();
@@ -328,7 +362,13 @@ async fn wallet_sign_digest(
             if let Some(sig) = sigs.values().next() {
                 HttpResponse::Ok().json(sig)
             } else {
-                error_response(500, 3120004, "wallet_missing_pub_key_exception", "Missing public key", "No signature produced")
+                error_response(
+                    500,
+                    3120004,
+                    "wallet_missing_pub_key_exception",
+                    "Missing public key",
+                    "No signature produced",
+                )
             }
         }
         Err(e) => manager_err_to_response(e),
@@ -350,7 +390,7 @@ async fn wallet_sign_transaction(
     // In a full implementation, we'd compute the signing digest from the
     // serialized transaction + chain_id. For now, we hash the chain_id + transaction
     // as a simplified version.
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(hex::decode(&chain_id).unwrap_or_default());
     hasher.update(_transaction.to_string().as_bytes());

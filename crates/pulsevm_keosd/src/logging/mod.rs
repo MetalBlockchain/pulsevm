@@ -17,13 +17,13 @@ impl LogLevel {
     /// Map our CLI enum to the spdlog `LevelFilter`.
     fn to_spdlog_filter(self) -> spdlog::LevelFilter {
         match self {
-            LogLevel::Trace    => LevelFilter::All,
-            LogLevel::Debug    => LevelFilter::MoreSevereEqual(Level::Debug),
-            LogLevel::Info     => LevelFilter::MoreSevereEqual(Level::Info),
-            LogLevel::Warn     => LevelFilter::MoreSevereEqual(Level::Warn),
-            LogLevel::Error    => LevelFilter::MoreSevereEqual(Level::Error),
+            LogLevel::Trace => LevelFilter::All,
+            LogLevel::Debug => LevelFilter::MoreSevereEqual(Level::Debug),
+            LogLevel::Info => LevelFilter::MoreSevereEqual(Level::Info),
+            LogLevel::Warn => LevelFilter::MoreSevereEqual(Level::Warn),
+            LogLevel::Error => LevelFilter::MoreSevereEqual(Level::Error),
             LogLevel::Critical => LevelFilter::MoreSevereEqual(Level::Critical),
-            LogLevel::Off      => LevelFilter::Off,
+            LogLevel::Off => LevelFilter::Off,
         }
     }
 }
@@ -37,5 +37,8 @@ pub fn init(level: LogLevel) {
     // Configure the global default logger.
     spdlog::default_logger().set_level_filter(filter);
 
-    trace!("logging initialised at level {:?} (filter={:?})", level, filter);
+    trace!(
+        "logging initialised at level {:?} (filter={:?})",
+        level, filter
+    );
 }

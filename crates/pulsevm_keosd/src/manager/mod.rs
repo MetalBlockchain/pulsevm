@@ -1,4 +1,9 @@
-use std::{collections::BTreeMap, fs, path::PathBuf, time::{Duration, Instant}};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use crate::wallet::{Wallet, WalletError};
 
@@ -28,8 +33,7 @@ pub struct WalletManager {
 impl WalletManager {
     pub fn new(wallet_dir: PathBuf, timeout_secs: u64) -> Result<Self, ManagerError> {
         // Create wallet directory if it doesn't exist
-        fs::create_dir_all(&wallet_dir)
-            .map_err(|e| ManagerError::LockFileError(e.to_string()))?;
+        fs::create_dir_all(&wallet_dir).map_err(|e| ManagerError::LockFileError(e.to_string()))?;
 
         // Scan for existing .wallet files and load them (in locked state)
         let mut wallets = BTreeMap::new();
@@ -45,10 +49,7 @@ impl WalletManager {
                             Err(e) => {
                                 // Log but don't fail — a corrupt file shouldn't
                                 // prevent the daemon from starting.
-                                eprintln!(
-                                    "Warning: failed to load wallet '{}': {}",
-                                    stem, e
-                                );
+                                eprintln!("Warning: failed to load wallet '{}': {}", stem, e);
                             }
                         }
                     }
@@ -128,7 +129,9 @@ impl WalletManager {
     pub fn lock(&mut self, name: &str) -> Result<(), ManagerError> {
         self.check_timeout();
 
-        let wallet = self.wallets.get_mut(name)
+        let wallet = self
+            .wallets
+            .get_mut(name)
             .ok_or_else(|| ManagerError::WalletNotFound(name.to_string()))?;
 
         wallet.lock();
@@ -158,7 +161,9 @@ impl WalletManager {
             self.open(name)?;
         }
 
-        let wallet = self.wallets.get_mut(name)
+        let wallet = self
+            .wallets
+            .get_mut(name)
             .ok_or_else(|| ManagerError::WalletNotFound(name.to_string()))?;
 
         wallet.unlock(password)?;
@@ -169,7 +174,9 @@ impl WalletManager {
     pub fn import_key(&mut self, name: &str, wif: &str) -> Result<(), ManagerError> {
         self.check_timeout();
 
-        let wallet = self.wallets.get_mut(name)
+        let wallet = self
+            .wallets
+            .get_mut(name)
             .ok_or_else(|| ManagerError::WalletNotFound(name.to_string()))?;
 
         wallet.import_key(wif)?;
@@ -177,10 +184,17 @@ impl WalletManager {
     }
 
     /// Remove a key from a wallet (requires password).
-    pub fn remove_key(&mut self, name: &str, password: &str, public_key: &str) -> Result<(), ManagerError> {
+    pub fn remove_key(
+        &mut self,
+        name: &str,
+        password: &str,
+        public_key: &str,
+    ) -> Result<(), ManagerError> {
         self.check_timeout();
 
-        let wallet = self.wallets.get_mut(name)
+        let wallet = self
+            .wallets
+            .get_mut(name)
             .ok_or_else(|| ManagerError::WalletNotFound(name.to_string()))?;
 
         wallet.remove_key(password, public_key)?;
@@ -191,7 +205,9 @@ impl WalletManager {
     pub fn create_key(&mut self, name: &str) -> Result<String, ManagerError> {
         self.check_timeout();
 
-        let wallet = self.wallets.get_mut(name)
+        let wallet = self
+            .wallets
+            .get_mut(name)
             .ok_or_else(|| ManagerError::WalletNotFound(name.to_string()))?;
 
         let pub_key = wallet.create_key()?;
@@ -199,10 +215,16 @@ impl WalletManager {
     }
 
     /// List keys for a specific wallet (requires name and password).
-    pub fn list_keys(&mut self, name: &str, password: &str) -> Result<BTreeMap<String, String>, ManagerError> {
+    pub fn list_keys(
+        &mut self,
+        name: &str,
+        password: &str,
+    ) -> Result<BTreeMap<String, String>, ManagerError> {
         self.check_timeout();
 
-        let wallet = self.wallets.get(name)
+        let wallet = self
+            .wallets
+            .get(name)
             .ok_or_else(|| ManagerError::WalletNotFound(name.to_string()))?;
 
         let keys = wallet.list_keys(password)?;
@@ -235,7 +257,11 @@ impl WalletManager {
     }
 
     /// Sign a digest with the key matching one of the provided public keys.
-    pub fn sign_digest(&mut self, digest: &[u8], public_keys: &[String]) -> Result<BTreeMap<String, String>, ManagerError> {
+    pub fn sign_digest(
+        &mut self,
+        digest: &[u8],
+        public_keys: &[String],
+    ) -> Result<BTreeMap<String, String>, ManagerError> {
         self.check_timeout();
 
         let mut signatures = BTreeMap::new();

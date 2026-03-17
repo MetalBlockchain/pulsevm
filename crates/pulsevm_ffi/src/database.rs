@@ -868,7 +868,10 @@ impl Database {
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 
-    pub fn clear_expired_input_transactions(&mut self, cutoff: &CxxTimePoint) -> Result<(), ChainError> {
+    pub fn clear_expired_input_transactions(
+        &mut self,
+        cutoff: &CxxTimePoint,
+    ) -> Result<(), ChainError> {
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
 
@@ -1018,7 +1021,10 @@ mod tests {
         session.pin_mut().push().unwrap();
         let deltas = db.pack_deltas(false).unwrap();
         let hex_deltas = hex::encode(deltas);
-        assert_eq!(hex_deltas, "0100076163636f756e7401010e00000000000090b1ca0000000000");
+        assert_eq!(
+            hex_deltas,
+            "0100076163636f756e7401010e00000000000090b1ca0000000000"
+        );
     }
 }
 

@@ -79,7 +79,10 @@ pub fn assert_sha224(
     hash_val_ptr: WasmPtr<u8>,
 ) -> Result<(), RuntimeError> {
     let (env_data, store) = env.data_and_store_mut();
-    let memory = env_data.memory().as_ref().ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
+    let memory = env_data
+        .memory()
+        .as_ref()
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
 
     // Borrow the input bytes from guest memory
@@ -116,7 +119,10 @@ pub fn assert_sha256(
     hash_val_ptr: WasmPtr<u8>,
 ) -> Result<(), RuntimeError> {
     let (env_data, store) = env.data_and_store_mut();
-    let memory = env_data.memory().as_ref().ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
+    let memory = env_data
+        .memory()
+        .as_ref()
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
 
     // Borrow the input bytes from guest memory
@@ -153,7 +159,10 @@ pub fn assert_sha512(
     hash_val_ptr: WasmPtr<u8>,
 ) -> Result<(), RuntimeError> {
     let (env_data, store) = env.data_and_store_mut();
-    let memory = env_data.memory().as_ref().ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
+    let memory = env_data
+        .memory()
+        .as_ref()
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
 
     // Borrow the input bytes from guest memory

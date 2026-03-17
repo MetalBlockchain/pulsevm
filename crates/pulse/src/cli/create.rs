@@ -1,6 +1,14 @@
 use std::str::FromStr;
 
-use pulsevm_core::{PULSE_NAME, authority::{Authority, KeyWeight, PermissionLevel}, config::NEWACCOUNT_NAME, crypto::{PrivateKey, PublicKey}, name::Name, pulse_contract::NewAccount, transaction::{Action, Transaction}};
+use pulsevm_core::{
+    PULSE_NAME,
+    authority::{Authority, KeyWeight, PermissionLevel},
+    config::NEWACCOUNT_NAME,
+    crypto::{PrivateKey, PublicKey},
+    name::Name,
+    pulse_contract::NewAccount,
+    transaction::{Action, Transaction},
+};
 use pulsevm_keosd_client::KeosdClient;
 
 use crate::cli::CreateSubcommand;
@@ -10,48 +18,56 @@ pub async fn handle(
     subcmd: CreateSubcommand,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match subcmd {
-        CreateSubcommand::Account { creator, name, owner_key, active_key } => {
+        CreateSubcommand::Account {
+            creator,
+            name,
+            owner_key,
+            active_key,
+        } => {
             let active_key = if let Some(k) = active_key {
                 k
             } else {
                 owner_key.clone()
             };
             let mut txn = Transaction::default();
-            txn.actions.push(
-                Action {
-                    account: PULSE_NAME,
-                    name: NEWACCOUNT_NAME,
-                    authorization: vec![PermissionLevel {
-                        actor: Name::from_str(&creator)?.into(),
-                        permission: Name::from_str("active")?.into(),
-                    }],
-                    data: NewAccount {
-                        creator: Name::from_str(&creator)?.into(),
-                        name: Name::from_str(&name)?.into(),
-                        owner: Authority {
-                            threshold: 1,
-                            keys: vec![KeyWeight {
-                                key: PublicKey::from_str(&owner_key)?.into(),
-                                weight: 1,
-                            }],
-                            accounts: vec![],
-                            waits: vec![],
-                        },
-                        active: Authority {
-                            threshold: 1,
-                            keys: vec![KeyWeight {
-                                key: PublicKey::from_str(&active_key)?.into(),
-                                weight: 1,
-                            }],
-                            accounts: vec![],
-                            waits: vec![],
-                        },
-                    }.try_into()?,
+            txn.actions.push(Action {
+                account: PULSE_NAME,
+                name: NEWACCOUNT_NAME,
+                authorization: vec![PermissionLevel {
+                    actor: Name::from_str(&creator)?.into(),
+                    permission: Name::from_str("active")?.into(),
+                }],
+                data: NewAccount {
+                    creator: Name::from_str(&creator)?.into(),
+                    name: Name::from_str(&name)?.into(),
+                    owner: Authority {
+                        threshold: 1,
+                        keys: vec![KeyWeight {
+                            key: PublicKey::from_str(&owner_key)?.into(),
+                            weight: 1,
+                        }],
+                        accounts: vec![],
+                        waits: vec![],
+                    },
+                    active: Authority {
+                        threshold: 1,
+                        keys: vec![KeyWeight {
+                            key: PublicKey::from_str(&active_key)?.into(),
+                            weight: 1,
+                        }],
+                        accounts: vec![],
+                        waits: vec![],
+                    },
                 }
-            );
+                .try_into()?,
+            });
             todo!("sign and push transaction to create account");
         }
-        CreateSubcommand::Key { file, to_console, r1 } => {
+        CreateSubcommand::Key {
+            file,
+            to_console,
+            r1,
+        } => {
             let private_key = if r1 {
                 PrivateKey::random_r1()
             } else {
@@ -60,7 +76,11 @@ pub async fn handle(
 
             match file {
                 Some(path) => {
-                    let content = format!("Private Key: {}\nPublic Key: {}", private_key, private_key.get_public_key());
+                    let content = format!(
+                        "Private Key: {}\nPublic Key: {}",
+                        private_key,
+                        private_key.get_public_key()
+                    );
                     std::fs::write(&path, content)?;
                     println!("Public key saved to {}", path);
                 }

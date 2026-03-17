@@ -412,7 +412,10 @@ pub mod ffi {
             trx_id: &CxxDigest,
             expiration: u32,
         ) -> Result<()>;
-        pub fn clear_expired_input_transactions(self: Pin<&mut Database>, cutoff: &CxxTimePoint) -> Result<()>;
+        pub fn clear_expired_input_transactions(
+            self: Pin<&mut Database>,
+            cutoff: &CxxTimePoint,
+        ) -> Result<()>;
 
         // Methods on undo_session
         pub fn push(self: Pin<&mut UndoSession>) -> Result<()>;

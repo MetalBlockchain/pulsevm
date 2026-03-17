@@ -90,9 +90,7 @@ enum Transport {
         client: reqwest::Client,
     },
     /// Unix domain socket connection using raw HTTP over UDS.
-    Unix {
-        socket_path: PathBuf,
-    },
+    Unix { socket_path: PathBuf },
 }
 
 impl Transport {
@@ -101,18 +99,12 @@ impl Transport {
         match self {
             Transport::Tcp { base_url, client } => {
                 let url = format!("{}{}", base_url, path);
-                let resp = client
-                    .post(&url)
-                    .json(body)
-                    .send()
-                    .await?;
+                let resp = client.post(&url).json(body).send().await?;
                 let status = resp.status().as_u16();
                 let bytes = resp.bytes().await?.to_vec();
                 Ok((status, bytes))
             }
-            Transport::Unix { socket_path } => {
-                unix_post(socket_path, path, body).await
-            }
+            Transport::Unix { socket_path } => unix_post(socket_path, path, body).await,
         }
     }
 
@@ -126,16 +118,18 @@ impl Transport {
                 let bytes = resp.bytes().await?.to_vec();
                 Ok((status, bytes))
             }
-            Transport::Unix { socket_path } => {
-                unix_get(socket_path, path).await
-            }
+            Transport::Unix { socket_path } => unix_get(socket_path, path).await,
         }
     }
 }
 
 /// Perform an HTTP POST over a Unix domain socket using raw I/O.
 #[cfg(unix)]
-async fn unix_post(socket_path: &Path, path: &str, body: &Value) -> Result<(u16, Vec<u8>), ClientError> {
+async fn unix_post(
+    socket_path: &Path,
+    path: &str,
+    body: &Value,
+) -> Result<(u16, Vec<u8>), ClientError> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixStream;
 
@@ -179,13 +173,21 @@ async fn unix_get(socket_path: &Path, path: &str) -> Result<(u16, Vec<u8>), Clie
 }
 
 #[cfg(not(unix))]
-async fn unix_post(_socket_path: &Path, _path: &str, _body: &Value) -> Result<(u16, Vec<u8>), ClientError> {
-    Err(ClientError::UnixSocket("Unix sockets not supported on this platform".to_string()))
+async fn unix_post(
+    _socket_path: &Path,
+    _path: &str,
+    _body: &Value,
+) -> Result<(u16, Vec<u8>), ClientError> {
+    Err(ClientError::UnixSocket(
+        "Unix sockets not supported on this platform".to_string(),
+    ))
 }
 
 #[cfg(not(unix))]
 async fn unix_get(_socket_path: &Path, _path: &str) -> Result<(u16, Vec<u8>), ClientError> {
-    Err(ClientError::UnixSocket("Unix sockets not supported on this platform".to_string()))
+    Err(ClientError::UnixSocket(
+        "Unix sockets not supported on this platform".to_string(),
+    ))
 }
 
 /// Parse a raw HTTP/1.1 response into (status_code, body_bytes).
@@ -193,9 +195,9 @@ fn parse_http_response(raw: &[u8]) -> Result<(u16, Vec<u8>), ClientError> {
     let raw_str = String::from_utf8_lossy(raw);
 
     // Find the end of headers
-    let header_end = raw_str
-        .find("\r\n\r\n")
-        .ok_or_else(|| ClientError::Parse("Malformed HTTP response: no header terminator".to_string()))?;
+    let header_end = raw_str.find("\r\n\r\n").ok_or_else(|| {
+        ClientError::Parse("Malformed HTTP response: no header terminator".to_string())
+    })?;
 
     let headers = &raw_str[..header_end];
     let body = &raw[header_end + 4..];
@@ -257,24 +259,38 @@ impl KeosdClient {
     // ------ Internal helpers ------
 
     /// POST with JSON body, parse the response. Checks for keosd error format.
-    async fn post<T: serde::de::DeserializeOwned>(&self, path: &str, body: &Value) -> Result<T, ClientError> {
+    async fn post<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &Value,
+    ) -> Result<T, ClientError> {
         let (status, bytes) = self.transport.post(path, body).await?;
         self.handle_response::<T>(status, &bytes)
     }
 
     /// POST with no body (empty JSON object).
-    async fn post_empty<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T, ClientError> {
+    async fn post_empty<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+    ) -> Result<T, ClientError> {
         self.post(path, &serde_json::json!(null)).await
     }
 
     /// GET request, parse the response.
-    async fn get_request<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T, ClientError> {
+    async fn get_request<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+    ) -> Result<T, ClientError> {
         let (status, bytes) = self.transport.get(path).await?;
         self.handle_response::<T>(status, &bytes)
     }
 
     /// Check status and deserialize, or parse a keosd error.
-    fn handle_response<T: serde::de::DeserializeOwned>(&self, status: u16, bytes: &[u8]) -> Result<T, ClientError> {
+    fn handle_response<T: serde::de::DeserializeOwned>(
+        &self,
+        status: u16,
+        bytes: &[u8],
+    ) -> Result<T, ClientError> {
         if status >= 200 && status < 300 {
             serde_json::from_slice(bytes).map_err(|e| {
                 ClientError::Parse(format!(
@@ -308,14 +324,17 @@ impl KeosdClient {
     ///
     /// `POST /v1/wallet/create`
     pub async fn create(&self, name: &str) -> Result<String, ClientError> {
-        self.post("/v1/wallet/create", &serde_json::json!(name)).await
+        self.post("/v1/wallet/create", &serde_json::json!(name))
+            .await
     }
 
     /// Open an existing wallet file.
     ///
     /// `POST /v1/wallet/open`
     pub async fn open(&self, name: &str) -> Result<(), ClientError> {
-        let _: Value = self.post("/v1/wallet/open", &serde_json::json!(name)).await?;
+        let _: Value = self
+            .post("/v1/wallet/open", &serde_json::json!(name))
+            .await?;
         Ok(())
     }
 
@@ -323,7 +342,9 @@ impl KeosdClient {
     ///
     /// `POST /v1/wallet/lock`
     pub async fn lock(&self, name: &str) -> Result<(), ClientError> {
-        let _: Value = self.post("/v1/wallet/lock", &serde_json::json!(name)).await?;
+        let _: Value = self
+            .post("/v1/wallet/lock", &serde_json::json!(name))
+            .await?;
         Ok(())
     }
 
@@ -331,7 +352,9 @@ impl KeosdClient {
     ///
     /// `POST /v1/wallet/lock_all`
     pub async fn lock_all(&self) -> Result<(), ClientError> {
-        let _: Value = self.post("/v1/wallet/lock_all", &serde_json::json!(null)).await?;
+        let _: Value = self
+            .post("/v1/wallet/lock_all", &serde_json::json!(null))
+            .await?;
         Ok(())
     }
 
