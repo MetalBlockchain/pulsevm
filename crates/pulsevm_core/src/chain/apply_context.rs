@@ -11,7 +11,7 @@ use pulsevm_error::ChainError;
 use pulsevm_ffi::{
     AccountMetadataObject, Database, KeyValueIteratorCache, KeyValueObject, TableObject,
 };
-use spdlog::{debug, info};
+use spdlog::debug;
 
 use crate::{
     CODE_NAME,
@@ -193,6 +193,8 @@ impl ApplyContext {
             receipt.add_auth_sequence(auth.actor.clone(), auth_sequence);
         }
 
+        // Calculate action digest
+        self.trx_context.add_executed_action_receipt_digest(receipt.digest()?)?;
         self.finalize_trace(receipt)?;
 
         Ok(cpu_used)

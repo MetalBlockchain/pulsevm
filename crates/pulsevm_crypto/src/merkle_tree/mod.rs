@@ -33,7 +33,7 @@ pub fn make_canonical_pair(a: Digest, b: Digest) -> Digest {
 
 /// Compute Merkle root from a list of digests
 #[inline]
-pub fn merkle(mut ids: VecDeque<Digest>) -> Digest {
+pub fn merkle(ids: &mut VecDeque<Digest>) -> Digest {
     if ids.is_empty() {
         return Digest([0u8; 32]);
     }

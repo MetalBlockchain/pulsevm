@@ -1,3 +1,5 @@
+use core::fmt;
+
 use pulsevm_serialization::{NumBytes, Read, Write};
 use serde::Serialize;
 use sha2::Digest as ShaDigest;
@@ -17,6 +19,12 @@ impl Digest {
     #[inline]
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+}
+
+impl fmt::Display for Digest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", hex::encode(self.0))
     }
 }
 

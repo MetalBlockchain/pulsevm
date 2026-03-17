@@ -1,13 +1,14 @@
 use std::{
-    collections::{HashMap, HashSet},
-    sync::{Arc, RwLock, atomic::AtomicI64},
+    collections::{HashMap, HashSet, VecDeque},
+    sync::{Arc, RwLock},
 };
 
+use pulsevm_crypto::Digest;
 use pulsevm_error::ChainError;
-use pulsevm_ffi::{CxxDigest, Database};
+use pulsevm_ffi::Database;
 use pulsevm_serialization::VarUint32;
 use pulsevm_time::{Microseconds, TimePoint};
-use spdlog::{debug, info};
+use spdlog::debug;
 
 use crate::{
     block::BlockStatus,
@@ -18,7 +19,7 @@ use crate::{
         name::Name,
         resource_limits::ResourceLimitsManager,
         transaction::{
-            Action, ActionTrace, Transaction, TransactionReceiptHeader, TransactionStatus,
+            Action, ActionTrace, Transaction, TransactionStatus,
             TransactionTrace,
         },
         utils::pulse_assert,
@@ -36,6 +37,7 @@ struct Billing {
 pub struct TransactionResult {
     pub trace: TransactionTrace,
     pub billed_cpu_time_us: u32,
+    pub action_receipt_digests: VecDeque<Digest>,
 }
 
 struct TransactionContextInner {
@@ -47,6 +49,7 @@ struct TransactionContextInner {
     billing: Billing,
     pending_block_timestamp: BlockTimestamp,
     cpu_limit: i64,
+    executed_action_receipt_digests: VecDeque<Digest>,
 }
 
 #[derive(Clone)]
@@ -88,6 +91,7 @@ impl TransactionContext {
                 },
                 pending_block_timestamp,
                 cpu_limit: 0,
+                executed_action_receipt_digests: VecDeque::with_capacity(6),
             })),
         }
     }
@@ -162,7 +166,10 @@ impl TransactionContext {
         let first_authorizer = transaction.first_authorizer();
 
         self.init(initial_net_usage, first_authorizer)?;
-        self.record_transaction(&transaction.id()?, transaction.header.expiration().sec_since_epoch())?;
+        self.record_transaction(
+            &transaction.id()?,
+            transaction.header.expiration().sec_since_epoch(),
+        )?;
         Ok(())
     }
 
@@ -353,7 +360,7 @@ impl TransactionContext {
         Ok(inner.pending_block_timestamp.clone())
     }
 
-    pub fn finalize(&mut self) -> Result<TransactionResult, ChainError> {
+    pub fn finalize(mut self) -> Result<TransactionResult, ChainError> {
         let now = TimePoint::now();
         let billed_cpu_time_us = self.get_billed_cpu_time(now)?;
 
@@ -382,6 +389,7 @@ impl TransactionContext {
         Ok(TransactionResult {
             trace: inner.trace.clone(),
             billed_cpu_time_us,
+            action_receipt_digests: inner.executed_action_receipt_digests.clone(),
         })
     }
 
@@ -451,8 +459,14 @@ impl TransactionContext {
     pub fn record_transaction(&mut self, id: &Id, expiration: u32) -> Result<(), ChainError> {
         let id_digest = id.to_digest()?;
 
-        self.db.record_transaction(&id_digest, expiration).map_err(|e| {
-            ChainError::DatabaseError(format!("duplicate tx: {}", e))
-        })
+        self.db
+            .record_transaction(&id_digest, expiration)
+            .map_err(|e| ChainError::DatabaseError(format!("duplicate tx: {}", e)))
+    }
+
+    pub fn add_executed_action_receipt_digest(&mut self, digest: Digest) -> Result<(), ChainError> {
+        let mut inner = self.inner.write()?;
+        inner.executed_action_receipt_digests.push_back(digest);
+        Ok(())
     }
 }

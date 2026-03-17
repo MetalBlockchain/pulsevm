@@ -3,7 +3,6 @@ use std::collections::VecDeque;
 use pulsevm_crypto::{Digest, FixedBytes};
 use pulsevm_error::ChainError;
 use pulsevm_ffi::Database;
-use pulsevm_name_macro::name;
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 use pulsevm_serialization::Write;
 use serde::{Serialize, ser::SerializeStruct};
@@ -11,7 +10,6 @@ use serde::{Serialize, ser::SerializeStruct};
 use crate::{
     chain::{Name, block::BlockTimestamp, id::Id, transaction::TransactionReceipt},
     crypto::Signature,
-    state_history::StateHistoryLog,
     utils::pulse_assert,
 };
 
@@ -22,7 +20,7 @@ pub struct BlockHeader {
     pub confirmed: u16,
     pub previous: Id,
     pub transaction_mroot: Digest,
-    pub action_mroot: Id,
+    pub action_mroot: Digest,
     pub schedule_version: u32,
     pub new_producers: Option<Vec<u8>>, // Placeholder for new producers, we don't use this for now
     pub header_extensions: Vec<(u16, Vec<u8>)>, // Placeholder for header extensions, we don't use this for now
@@ -121,6 +119,7 @@ impl SignedBlock {
         producer: Name,
         transaction_receipts: VecDeque<TransactionReceipt>,
         transaction_mroot: Digest,
+        action_mroot: Digest,
     ) -> Self {
         SignedBlock {
             signed_block_header: SignedBlockHeader {
@@ -129,11 +128,11 @@ impl SignedBlock {
                     producer,     // Use the provided producer name
                     confirmed: 0, // Placeholder confirmed count
                     previous: parent_id,
-                    transaction_mroot: transaction_mroot,
-                    action_mroot: Id::default(), // Placeholder action merkle root
-                    schedule_version: 0,         // Placeholder schedule version
-                    new_producers: None,         // Placeholder for new producers
-                    header_extensions: vec![],   // Placeholder for header extensions
+                    transaction_mroot,
+                    action_mroot, // Use the provided action merkle root
+                    schedule_version: 0,             // Placeholder schedule version
+                    new_producers: None,             // Placeholder for new producers
+                    header_extensions: vec![],       // Placeholder for header extensions
                 },
                 signature: Signature::default(), // Placeholder signature
             },
@@ -179,7 +178,7 @@ impl Serialize for SignedBlock {
     where
         S: serde::Serializer,
     {
-        let mut state = serializer.serialize_struct("Block", 8)?;
+        let mut state = serializer.serialize_struct("Block", 9)?;
         state.serialize_field("timestamp", &self.signed_block_header.header.timestamp)?;
         state.serialize_field("producer", &self.signed_block_header.header.producer)?;
         state.serialize_field("confirmed", &self.signed_block_header.header.confirmed)?;
@@ -187,6 +186,10 @@ impl Serialize for SignedBlock {
         state.serialize_field(
             "transaction_mroot",
             &self.signed_block_header.header.transaction_mroot,
+        )?;
+        state.serialize_field(
+            "action_mroot",
+            &self.signed_block_header.header.action_mroot,
         )?;
         state.serialize_field("transactions", &self.transactions)?;
         state.serialize_field(
@@ -208,6 +211,6 @@ mod tests {
     pub fn test_block_serialization() {
         let signed_block = SignedBlock::default();
         let packed = signed_block.pack().unwrap();
-        let unpacked = SignedBlock::read(&packed, &mut 0).unwrap();
+        let _ = SignedBlock::read(&packed, &mut 0).unwrap();
     }
 }

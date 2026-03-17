@@ -157,6 +157,7 @@ impl Controller {
             PULSE_NAME, // Use the provided producer name from genesis
             VecDeque::new(),
             Digest::default(),
+            Digest::default(), // Placeholder action merkle root
         );
         self.preferred_id = self.last_accepted_block.id()?;
 
@@ -216,6 +217,7 @@ impl Controller {
         let mut db = self.db.clone();
         let mut root_session = db.create_undo_session(true)?; // As we are building the block, drop the changes once built
         let mut transaction_receipts: VecDeque<TransactionReceipt> = VecDeque::new();
+        let mut action_receipt_digests: VecDeque<Digest> = VecDeque::new();
         let timestamp = BlockTimestamp::now();
         let block_status = BlockStatus::Building;
 
@@ -237,6 +239,7 @@ impl Controller {
                     // Add the transaction to the block
                     let receipt = TransactionReceipt::new(result.trace.receipt, transaction);
                     transaction_receipts.push_back(receipt);
+                    action_receipt_digests.extend(result.action_receipt_digests);
                 }
                 Err(e) => {
                     warn!(
@@ -261,12 +264,14 @@ impl Controller {
 
         // Create a new block
         let transaction_mroot = self.calculate_trx_merkle(&transaction_receipts)?;
+        let action_mroot = self.calculate_action_merkle(&mut action_receipt_digests)?;
         let block = SignedBlock::new(
             self.preferred_id,
             timestamp,
             self.node_config.as_ref().unwrap().producer_name, // Use producer name from config
             transaction_receipts,
             transaction_mroot,
+            action_mroot,
         );
 
         // We built this block so no need to verify it again
@@ -367,7 +372,8 @@ impl Controller {
         self.store_chain_state(block_id)?;
         self.verified_blocks.remove(block_id);
         self.last_accepted_block = block.clone();
-        self.db.clear_expired_input_transactions(&block.timestamp().to_time_point())?;
+        self.db
+            .clear_expired_input_transactions(&block.timestamp().to_time_point())?;
         self.db.commit(block.block_num() as i64)?;
 
         Ok(())
@@ -589,7 +595,14 @@ impl Controller {
             trx_digests.push_back(digest);
         }
 
-        Ok(merkle(trx_digests))
+        Ok(merkle(&mut trx_digests))
+    }
+
+    pub fn calculate_action_merkle(
+        &self,
+        digests: &mut VecDeque<Digest>,
+    ) -> Result<Digest, ChainError> {
+        Ok(merkle(digests))
     }
 
     pub fn trace_log(&self) -> Option<&StateHistoryLog> {
@@ -632,12 +645,16 @@ impl Controller {
             .ok_or_else(|| ChainError::InternalError("block log not initialized".to_string()))
     }
 
-    pub fn store_traces(&mut self, block_id: &Id, transaction_traces: &Vec<TransactionTrace>) -> Result<(), ChainError> {
+    pub fn store_traces(
+        &mut self,
+        block_id: &Id,
+        transaction_traces: &Vec<TransactionTrace>,
+    ) -> Result<(), ChainError> {
         match &self.trace_log {
             None => {
                 return Err(ChainError::InternalError(
                     "trace log not initialized".to_string(),
-                ))
+                ));
             }
             Some(trace_log) => {
                 let packed_transaction_traces = transaction_traces.pack().map_err(|e| {
@@ -648,10 +665,10 @@ impl Controller {
                 })?;
 
                 trace_log
-                .append(block_id.clone(), &packed_transaction_traces)
-                .map_err(|e| {
-                    ChainError::InternalError(format!("failed to append to trace log: {}", e))
-                })?;
+                    .append(block_id.clone(), &packed_transaction_traces)
+                    .map_err(|e| {
+                        ChainError::InternalError(format!("failed to append to trace log: {}", e))
+                    })?;
 
                 return Ok(());
             }
@@ -663,17 +680,20 @@ impl Controller {
             None => {
                 return Err(ChainError::InternalError(
                     "chain state log not initialized".to_string(),
-                ))
+                ));
             }
             Some(chain_state_log) => {
                 let fresh = chain_state_log.range().is_none();
                 let chain_state = self.db.pack_deltas(fresh)?;
 
                 chain_state_log
-                .append(block_id.clone(), &chain_state)
-                .map_err(|e| {
-                    ChainError::InternalError(format!("failed to append to chain state log: {}", e))
-                })?;
+                    .append(block_id.clone(), &chain_state)
+                    .map_err(|e| {
+                        ChainError::InternalError(format!(
+                            "failed to append to chain state log: {}",
+                            e
+                        ))
+                    })?;
 
                 return Ok(());
             }
@@ -987,7 +1007,6 @@ mod tests {
             temp_path.path().to_str().unwrap(),
         )?;
         let pending_block_timestamp = controller.last_accepted_block().timestamp().clone();
-        let mut db = controller.database();
         let chain_id = controller.chain_id().clone();
         let block_status = BlockStatus::Building;
         controller.execute_transaction(
