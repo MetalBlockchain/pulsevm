@@ -88,8 +88,8 @@ impl Serialize for PermissionLevel {
         S: serde::Serializer,
     {
         let mut state = serializer.serialize_struct("PermissionLevel", 2)?;
-        state.serialize_field("actor", &self.actor)?;
-        state.serialize_field("permission", &self.permission)?;
+        state.serialize_field("actor", &Name::new(self.actor))?;
+        state.serialize_field("permission", &Name::new(self.permission))?;
         state.end()
     }
 }
