@@ -129,25 +129,28 @@ pub fn generate_keypair() -> Result<(String, String), KeyError> {
 
 /// Convert a SigningKey to WIF (Wallet Import Format).
 pub fn private_key_to_wif(key: &SigningKey) -> String {
-    let secret_bytes = key.to_bytes();
-    base58check_encode(0x80, &secret_bytes)
+    let raw = key.to_bytes();
+    let check = k1_checksum(&raw, K1_SUFFIX);
+    let mut data = raw.to_vec();
+    data.extend_from_slice(&check);
+    format!("PVT_K1_{}", bs58::encode(data).into_string())
 }
 
-/// Parse a WIF-encoded private key into a SigningKey.
-pub fn wif_to_private_key(wif: &str) -> Result<SigningKey, KeyError> {
-    let (version, payload) = base58check_decode(wif)?;
-    if version != 0x80 {
+/// Parse a `PVT_K1_...` private key into a SigningKey.
+pub fn wif_to_private_key(pvt: &str) -> Result<SigningKey, KeyError> {
+    let encoded = pvt.strip_prefix("PVT_K1_").ok_or(KeyError::InvalidWif)?;
+    let decoded = bs58::decode(encoded)
+        .into_vec()
+        .map_err(|_| KeyError::InvalidWif)?;
+    if decoded.len() < 5 {
         return Err(KeyError::InvalidWif);
     }
-    // Some WIF keys have a compression flag byte appended
-    let key_bytes = if payload.len() == 33 && payload[32] == 0x01 {
-        &payload[..32]
-    } else if payload.len() == 32 {
-        &payload
-    } else {
-        return Err(KeyError::InvalidWif);
-    };
-    SigningKey::from_bytes(key_bytes.into()).map_err(|e| KeyError::CryptoError(e.to_string()))
+    let (raw, checksum) = decoded.split_at(decoded.len() - 4);
+    let computed = k1_checksum(raw, K1_SUFFIX);
+    if checksum != computed {
+        return Err(KeyError::ChecksumMismatch);
+    }
+    SigningKey::from_bytes(raw.into()).map_err(|e| KeyError::CryptoError(e.to_string()))
 }
 
 /// Get the public key string in `PUB_K1_...` format from a SigningKey.
