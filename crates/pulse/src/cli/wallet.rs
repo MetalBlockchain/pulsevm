@@ -70,7 +70,7 @@ pub async fn handle(
             }
             client.import_key(&name, &key).await?;
             println!(
-                "imported private key for: EOS6MRyAjQq8ud7hVNYcfnVPJqcVpscN5So8BhtHuGYqET5GDW5CV"
+                "imported private key for"
             );
         }
 

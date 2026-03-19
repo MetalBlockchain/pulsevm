@@ -1,5 +1,6 @@
 use std::str::FromStr;
 
+use pulsevm_api_client::PulseVmClient;
 use pulsevm_core::{
     PULSE_NAME,
     authority::{Authority, KeyWeight, PermissionLevel},
@@ -14,7 +15,8 @@ use pulsevm_keosd_client::KeosdClient;
 use crate::cli::CreateSubcommand;
 
 pub async fn handle(
-    client: &KeosdClient,
+    api_client: &PulseVmClient,
+    keosd_client: &KeosdClient,
     subcmd: CreateSubcommand,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match subcmd {
@@ -61,6 +63,11 @@ pub async fn handle(
                 }
                 .try_into()?,
             });
+            let candidate_keys = keosd_client.get_public_keys().await?;
+            let required_keys = api_client
+                .get_required_keys(&txn, &candidate_keys)
+                .await?;
+            let signed = keosd_client.sign_transaction(&txn, &required_keys).await?;
             todo!("sign and push transaction to create account");
         }
         CreateSubcommand::Key {

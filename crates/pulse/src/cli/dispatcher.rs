@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use pulsevm_api_client::PulseVmClient;
 use pulsevm_keosd_client::KeosdClient;
 
 use crate::cli::{Cli, Commands, create, wallet};
@@ -15,13 +16,14 @@ pub async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             .unwrap()
             .to_string(),
     };
+    let pulsevm_api_client = PulseVmClient::new(&cli.url);
     let keosd_client = match wallet_url.strip_prefix("http://") {
         Some(url) => KeosdClient::tcp(url),
         None => KeosdClient::unix(&wallet_url),
     };
 
     match cli.command {
-        Commands::Create { subcmd } => create::handle(&keosd_client, subcmd).await?,
+        Commands::Create { subcmd } => create::handle(&pulsevm_api_client, &keosd_client, subcmd).await?,
         Commands::Wallet { subcmd } => wallet::handle(&keosd_client, subcmd).await?,
     }
 
