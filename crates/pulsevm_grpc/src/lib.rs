@@ -18,10 +18,6 @@ pub mod appsender {
     tonic::include_proto!("appsender");
 }
 
-pub mod messenger {
-    tonic::include_proto!("messenger");
-}
-
 pub mod http {
     tonic::include_proto!("http");
 }

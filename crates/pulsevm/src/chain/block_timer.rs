@@ -1,13 +1,12 @@
 use std::{sync::Arc, time::Duration};
 
 use pulsevm_core::mempool::Mempool;
-use pulsevm_grpc::messenger::{Message, NotifyRequest, messenger_client::MessengerClient};
-use tokio::{sync::RwLock, task::JoinHandle, time::interval};
-use tonic::Request;
+use tokio::{sync::{Notify, RwLock}, task::JoinHandle, time::interval};
 
 #[derive(Clone)]
 pub struct BlockTimer {
     pub mempool: Arc<RwLock<Mempool>>,
+    pub notify_block_build: Arc<Notify>,
     pub server_address: Arc<RwLock<Option<String>>>,
     pub block_timer: Arc<RwLock<Option<JoinHandle<()>>>>,
 }
@@ -16,6 +15,7 @@ impl BlockTimer {
     pub fn new(mempool: Arc<RwLock<Mempool>>) -> Self {
         BlockTimer {
             mempool,
+            notify_block_build: Arc::new(Notify::new()),
             server_address: Arc::new(RwLock::new(None)),
             block_timer: Arc::new(RwLock::new(None)),
         }
@@ -33,17 +33,7 @@ impl BlockTimer {
     }
 
     pub async fn request_block_build(&self) {
-        let server_address = self.server_address.read().await;
-        let mut client: MessengerClient<tonic::transport::Channel> =
-            MessengerClient::connect(format!("http://{}", server_address.as_ref().unwrap()))
-                .await
-                .expect("failed to connect to messenger engine");
-
-        let _ = client
-            .notify(Request::new(NotifyRequest {
-                message: Message::BuildBlock as i32,
-            }))
-            .await;
+        self.notify_block_build.notify_one();
     }
 
     pub async fn check_block_build(&self) {
@@ -52,6 +42,10 @@ impl BlockTimer {
         if mempool.has_transactions() {
             self.request_block_build().await;
         }
+    }
+
+    pub async fn wait_for_block_build(&self) {
+        self.notify_block_build.notified().await;
     }
 }
 

@@ -123,7 +123,7 @@ impl PulseVmClient {
     // ------ Internal helpers ------
 
     /// Build a JSON-RPC 2.0 request envelope.
-    fn build_request(&self, method: &str, params: Value) -> Value {
+    fn build_request(&self, method: &str, params: Option<Value>) -> Value {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         serde_json::json!({
             "jsonrpc": "2.0",
@@ -137,7 +137,7 @@ impl PulseVmClient {
     async fn rpc_call<T: serde::de::DeserializeOwned>(
         &self,
         method: &str,
-        params: Value,
+        params: Option<Value>,
     ) -> Result<T, ClientError> {
         let request = self.build_request(method, params);
         // JSON-RPC is path-agnostic; POST to "/" (or "/rpc" depending on server).
@@ -176,6 +176,12 @@ impl PulseVmClient {
     }
 
     // ------ Public API ------
+
+    pub async fn get_info(
+        &self,
+    ) -> Result<Vec<String>, ClientError> {
+        self.rpc_call("pulsevm.getInfo", None).await
+    }
 
     /// Get the set of public keys required to sign a transaction.
     ///
@@ -225,7 +231,7 @@ impl PulseVmClient {
             candidate_keys: candidate_keys.to_vec(),
         })?;
 
-        self.rpc_call("pulsevm.getRequiredKeys", params).await
+        self.rpc_call("pulsevm.getRequiredKeys", Some(params)).await
     }
 }
 
@@ -276,7 +282,7 @@ mod tests {
     fn build_request_format() {
         let client = PulseVmClient::new("http://localhost");
         let params = serde_json::json!({"trx": {}, "candidate_keys": []});
-        let req = client.build_request("pulsevm.getRequiredKeys", params);
+        let req = client.build_request("pulsevm.getRequiredKeys", Some(params));
 
         assert_eq!(req["jsonrpc"], "2.0");
         assert_eq!(req["method"], "pulsevm.getRequiredKeys");
@@ -286,8 +292,8 @@ mod tests {
     #[test]
     fn request_id_increments() {
         let client = PulseVmClient::new("http://localhost");
-        let r1 = client.build_request("test", serde_json::json!(null));
-        let r2 = client.build_request("test", serde_json::json!(null));
+        let r1 = client.build_request("test", Some(serde_json::json!(null)));
+        let r2 = client.build_request("test", Some(serde_json::json!(null)));
         assert_eq!(r1["id"].as_u64().unwrap() + 1, r2["id"].as_u64().unwrap());
     }
 }

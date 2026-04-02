@@ -29,7 +29,7 @@ use std::{
 use tokio::{
     net::TcpListener as TokioTcpListener,
     signal::unix::{SignalKind, signal},
-    sync::RwLock,
+    sync::{Notify, RwLock},
 };
 use tokio_util::sync::CancellationToken;
 use tonic::transport::server::TcpIncoming;
@@ -253,6 +253,26 @@ impl Vm for VirtualMachine {
                 .map_err(|e| Status::internal(format!("could not pack block: {}", e)))?,
             timestamp: Some(controller.last_accepted_block().timestamp().into()),
         }));
+    }
+
+    async fn new_http_handler(
+        &self,
+        _request: Request<()>,
+    ) -> Result<tonic::Response<vm::NewHttpHandlerResponse>, Status> {
+        Ok(Response::new(vm::NewHttpHandlerResponse::default()))
+    }
+
+    async fn wait_for_event(
+        &self,
+        _request: Request<()>,
+    ) -> Result<tonic::Response<vm::WaitForEventResponse>, Status> {
+        let block_timer = self.block_timer.clone();
+        let block_timer = block_timer.read().await;
+        block_timer.wait_for_block_build().await;
+
+        Ok(Response::new(vm::WaitForEventResponse {
+            message: vm::Message::BuildBlock.into()
+        }))
     }
 
     async fn shutdown(&self, _request: Request<()>) -> Result<tonic::Response<()>, Status> {
@@ -692,7 +712,7 @@ impl Http for VirtualMachine {
     async fn handle(
         &self,
         _request: Request<http::HttpRequest>,
-    ) -> Result<tonic::Response<()>, Status> {
+    ) -> Result<tonic::Response<http::HttpResponse>, Status> {
         Err(Status::unimplemented("not implemented"))
     }
 
