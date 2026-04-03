@@ -67,7 +67,7 @@ pub async fn handle(
             let required_keys = api_client
                 .get_required_keys(&txn, &candidate_keys)
                 .await?;
-            let signed = keosd_client.sign_transaction(&txn, &required_keys).await?;
+            //let signed = keosd_client.sign_transaction(&txn, &required_keys).await?;
             todo!("sign and push transaction to create account");
         }
         CreateSubcommand::Key {
