@@ -13,7 +13,7 @@ use crate::{
         self, Authority, CxxDigest, CxxGenesisState, CxxTimePoint, ElasticLimitParameters,
         TableObject, get_account_info_with_core_symbol, get_account_info_without_core_symbol,
         get_currency_balance_with_symbol, get_currency_balance_without_symbol, get_currency_stats,
-        get_table_rows,
+        get_table_by_scope, get_table_rows,
     },
     iterator_cache::KeyValueIteratorCache,
 };
@@ -908,6 +908,29 @@ impl Database {
 
         get_currency_stats(guard.as_ref().unwrap(), code, symbol)
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
+    pub fn get_table_by_scope(
+        &self,
+        code: u64,
+        table: u64,
+        lower_bound: &str,
+        upper_bound: &str,
+        limit: u32,
+        reverse: bool,
+    ) -> Result<String, ChainError> {
+        let guard = self.inner.read()?;
+
+        get_table_by_scope(
+            guard.as_ref().unwrap(),
+            code,
+            table,
+            lower_bound,
+            upper_bound,
+            limit,
+            reverse,
+        )
+        .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 
     pub fn get_table_rows(

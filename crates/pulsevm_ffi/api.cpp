@@ -289,6 +289,66 @@ namespace pulsevm { namespace chain {
         return rust::String( json.c_str() );
     }
 
+    rust::String get_table_by_scope(
+      const database_wrapper& db,
+      uint64_t code,
+      uint64_t table,
+      rust::Str lower_bound,
+      rust::Str upper_bound,
+      uint32_t limit,
+      bool reverse
+    ) {
+        auto deadline = fc::time_point::now().safe_add( fc::microseconds(30 * 1000 * 1000) ); // 30 seconds from now
+        get_table_by_scope_result result;
+        const auto& idx = db.get_index<chain::table_id_multi_index, chain::by_code_scope_table>();
+        auto lower_bound_lookup_tuple = std::make_tuple( name(code), name(std::numeric_limits<uint64_t>::lowest()), name(table) );
+        auto upper_bound_lookup_tuple = std::make_tuple( name(code), name(std::numeric_limits<uint64_t>::max()),
+                                                    (table == 0 ? name(std::numeric_limits<uint64_t>::max()) : name(table)) );
+
+        if( lower_bound.size() ) {
+            uint64_t scope = convert_to_type<uint64_t>(string(lower_bound.data(), lower_bound.size()), "lower_bound scope");
+            std::get<1>(lower_bound_lookup_tuple) = name(scope);
+        }
+
+        if( upper_bound.size() ) {
+            uint64_t scope = convert_to_type<uint64_t>(string(upper_bound.data(), upper_bound.size()), "upper_bound scope");
+            std::get<1>(upper_bound_lookup_tuple) = name(scope);
+        }
+
+        if( upper_bound_lookup_tuple < lower_bound_lookup_tuple ) {
+            auto json_result = fc::json::to_pretty_string( result );
+            return rust::String( json_result.c_str() );
+        }
+
+        auto walk_table_range = [&]( auto itr, auto end_itr ) {
+            if (deadline != fc::time_point::maximum() && limit > max_return_items)
+                limit = max_return_items;
+            for( unsigned int count = 0; count < limit && itr != end_itr; ++itr, ++count ) {
+                if( name(table) && itr->table != name(table) ) continue;
+
+                result.rows.push_back( {itr->code, itr->scope, itr->table, itr->payer, itr->count} );
+
+                if (fc::time_point::now() >= deadline)
+                    break;
+            }
+            if( itr != end_itr ) {
+                result.more = itr->scope.to_string();
+            }
+        };
+
+        auto lower = idx.lower_bound( lower_bound_lookup_tuple );
+        auto upper = idx.upper_bound( upper_bound_lookup_tuple );
+
+        if( reverse ) {
+            walk_table_range( boost::make_reverse_iterator(upper), boost::make_reverse_iterator(lower) );
+        } else {
+            walk_table_range( lower, upper );
+        }
+
+        auto json_result = fc::json::to_pretty_string( result );
+        return rust::String( json_result.c_str() );
+    }
+
     rust::String get_table_rows(
         const database_wrapper& db,
         bool json,

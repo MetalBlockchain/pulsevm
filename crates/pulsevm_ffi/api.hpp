@@ -93,6 +93,19 @@ namespace pulsevm { namespace chain {
       account_name   issuer;
    };
 
+   struct get_table_by_scope_result_row {
+      name        code;
+      name        scope;
+      name        table;
+      name        payer;
+      uint32_t    count = 0;
+   };
+
+   struct get_table_by_scope_result {
+      vector<get_table_by_scope_result_row> rows;
+      string      more; ///< fill lower_bound with this value to fetch more rows
+   };
+
    struct get_table_rows_params {
       bool                 json = false;
       name                 code;
@@ -163,6 +176,15 @@ namespace pulsevm { namespace chain {
    rust::String get_currency_balance_with_symbol( const database_wrapper& db, uint64_t code, uint64_t account, rust::Str symbol );
    rust::String get_currency_balance_without_symbol( const database_wrapper& db, uint64_t code, uint64_t account );
    rust::String get_currency_stats( const database_wrapper& db, uint64_t code, rust::Str symbol );
+   rust::String get_table_by_scope(
+      const database_wrapper& db,
+      uint64_t code,
+      uint64_t table,
+      rust::Str lower_bound,
+      rust::Str upper_bound,
+      uint32_t limit,
+      bool reverse
+   );
    rust::String get_table_rows(
       const database_wrapper& db,
       bool json,
@@ -409,5 +431,7 @@ FC_REFLECT( pulsevm::chain::get_account_results,
             (core_liquid_balance)(ram_quota)(net_weight)(cpu_weight)(net_limit)(cpu_limit)(ram_usage)(permissions)
             (total_resources)(self_delegated_bandwidth)(refund_request)(voter_info)(rex_info)
             (subjective_cpu_bill_limit) (eosio_any_linked_actions) )
+FC_REFLECT( pulsevm::chain::get_table_by_scope_result_row, (code)(scope)(table)(payer)(count));
+FC_REFLECT( pulsevm::chain::get_table_by_scope_result, (rows)(more) );
 FC_REFLECT( pulsevm::chain::get_table_rows_result, (rows)(more)(next_key) );
 FC_REFLECT( pulsevm::chain::get_currency_stats_result, (supply)(max_supply)(issuer));

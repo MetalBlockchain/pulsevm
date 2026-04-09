@@ -578,6 +578,15 @@ pub mod ffi {
             account: u64,
         ) -> Result<String>;
         pub fn get_currency_stats(db: &Database, code: u64, symbol: &str) -> Result<String>;
+        pub fn get_table_by_scope(
+            db: &Database,
+            code: u64,
+            table: u64,
+            lower_bound: &str,
+            upper_bound: &str,
+            limit: u32,
+            reverse: bool,
+        ) -> Result<String>;
         pub fn get_table_rows(
             db: &Database,
             json: bool,

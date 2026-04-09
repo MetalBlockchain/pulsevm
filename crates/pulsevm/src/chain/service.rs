@@ -86,6 +86,17 @@ pub trait Rpc {
         candidate_keys: HashSet<PublicKey>,
     ) -> Result<HashSet<PublicKey>, ErrorObjectOwned>;
 
+    #[method(name = "pulsevm.getTableByScope")]
+    async fn get_table_by_scope(
+        &self,
+        code: Name,
+        table: Name,
+        lower_bound: Option<String>,
+        upper_bound: Option<String>,
+        limit: Option<I32Flex>,
+        reverse: Option<bool>,
+    ) -> Result<Value, ErrorObjectOwned>;
+
     #[method(name = "pulsevm.getTableRows")]
     async fn get_table_rows(
         &self,
@@ -403,6 +414,33 @@ impl RpcServer for RpcService {
             AuthorizationManager::get_required_keys(&mut db, &trx, &candidate_keys)?;
 
         Ok(required_keys)
+    }
+
+    async fn get_table_by_scope(
+        &self,
+        code: Name,
+        table: Name,
+        lower_bound: Option<String>,
+        upper_bound: Option<String>,
+        limit: Option<I32Flex>,
+        reverse: Option<bool>,
+    ) -> Result<Value, ErrorObjectOwned> {
+        let controller = self.controller.read().await;
+        let db = controller.database();
+        let response = db.get_table_by_scope(
+            code.as_u64(),
+            table.as_u64(),
+            &lower_bound.unwrap_or_default(),
+            &upper_bound.unwrap_or_default(),
+            limit.unwrap_or(I32Flex(10)).0 as u32,
+            reverse.unwrap_or(false),
+        )?;
+
+        let response: Value = serde_json::from_str(&response).map_err(|e| {
+            ErrorObjectOwned::owned(500, "serialization_error", Some(format!("{}", e)))
+        })?;
+
+        Ok(response)
     }
 
     async fn get_table_rows(
