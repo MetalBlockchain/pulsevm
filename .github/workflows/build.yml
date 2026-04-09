@@ -40,7 +40,7 @@ jobs:
       - name: Install Protobuf (protoc)
         uses: arduino/setup-protoc@v2
         with:
-          version: '27.1' # choose your required version
+          version: '27.1'
 
       - name: Cache cargo registry
         uses: actions/cache@v3
@@ -71,3 +71,32 @@ jobs:
         with:
           name: pulse-keosd-linux-${{ matrix.arch }}
           path: target/release/pulse-keosd
+
+  release:
+    name: Create draft release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          cd artifacts
+          for dir in */; do
+            name="${dir%/}"
+            chmod +x "$dir"*
+            tar -czf "${name}.tar.gz" -C "$dir" .
+          done
+
+      - name: Create draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          files: artifacts/*.tar.gz
