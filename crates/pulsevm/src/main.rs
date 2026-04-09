@@ -25,6 +25,7 @@ use spdlog::{debug, info, warn};
 use std::{
     net::{SocketAddr, TcpListener},
     sync::{Arc, atomic::AtomicBool},
+    time::{Duration, Instant},
 };
 use tokio::{
     net::TcpListener as TokioTcpListener,
@@ -163,7 +164,10 @@ impl VirtualMachine {
         let network_manager = Arc::new(RwLock::new(chain::NetworkManager::new()));
         let rpc_service =
             chain::RpcService::new(mempool.clone(), controller.clone(), network_manager.clone());
-        let block_timer = Arc::new(RwLock::new(BlockTimer::new(mempool.clone())));
+        let block_timer = Arc::new(RwLock::new(BlockTimer::new(
+            controller.clone(),
+            mempool.clone(),
+        )));
 
         Ok(Self {
             server_addr,
@@ -231,13 +235,20 @@ impl Vm for VirtualMachine {
 
     async fn set_state(
         &self,
-        _request: Request<vm::SetStateRequest>,
+        request: Request<vm::SetStateRequest>,
     ) -> Result<tonic::Response<vm::SetStateResponse>, Status> {
+        debug!("updating state to {:?}", request.get_ref().state);
         let controller = self.controller.clone();
-        let controller = controller.read().await;
+        let mut controller = controller.write().await;
         let last_accepted_block_id = controller.last_accepted_block().id().map_err(|e| {
             Status::internal(format!("could not get last accepted block id: {}", e))
         })?;
+
+        // Update state in controller
+        controller.set_state(
+            vm::State::try_from(request.get_ref().state)
+                .map_err(|_| Status::invalid_argument("invalid state"))?,
+        );
 
         return Ok(Response::new(vm::SetStateResponse {
             last_accepted_id: last_accepted_block_id.into(),
@@ -586,8 +597,56 @@ impl Vm for VirtualMachine {
         &self,
         request: Request<vm::GetAncestorsRequest>,
     ) -> Result<tonic::Response<vm::GetAncestorsResponse>, Status> {
-        debug!("received request: {:?}", request);
-        Ok(Response::new(vm::GetAncestorsResponse::default()))
+        debug!("received get_ancestors request: {:?}", request);
+        let controller = self.controller.clone();
+        let controller = controller.read().await;
+        let deadline = Instant::now()
+            + Duration::from_nanos(request.get_ref().max_blocks_retrival_time as u64);
+        let mut ancestors: Vec<Vec<u8>> = Vec::new();
+        let mut total_size = 0usize;
+        let mut current_id: Id = request
+            .get_ref()
+            .blk_id
+            .clone()
+            .try_into()
+            .map_err(|_| Status::invalid_argument("invalid block id"))?;
+        let max_blocks_size = request.get_ref().max_blocks_size as usize;
+
+        while ancestors.len() < request.get_ref().max_blocks_num as usize {
+            // If we are past the deadline, break out of the loop and return what we have so far
+            if Instant::now() > deadline {
+                break;
+            }
+
+            let blk = match controller.get_block(current_id) {
+                Ok(Some(blk)) => blk,
+                Ok(None) if !ancestors.is_empty() => break,
+                Ok(None) => return Err(Status::not_found("block not found")),
+                Err(e) => return Err(Status::internal(format!("could not get block: {}", e))),
+            };
+
+            let blk_bytes = blk
+                .pack()
+                .map_err(|e| Status::internal(format!("could not pack block: {}", e)))?;
+            if total_size + blk_bytes.len() > max_blocks_size && !ancestors.is_empty() {
+                break;
+            }
+
+            total_size += blk_bytes.len();
+            let parent_id = blk.previous_id().clone();
+            ancestors.push(blk_bytes);
+
+            // Did we hit the genesis block? If so, break out of the loop
+            if parent_id.is_empty() {
+                break;
+            }
+
+            current_id = parent_id;
+        }
+
+        Ok(Response::new(vm::GetAncestorsResponse {
+            blks_bytes: ancestors,
+        }))
     }
 
     async fn batched_parse_block(

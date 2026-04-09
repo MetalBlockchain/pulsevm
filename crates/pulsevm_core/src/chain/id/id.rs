@@ -16,6 +16,10 @@ impl Id {
         Id(FixedBytes(bytes))
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.0.0.iter().all(|&b| b == 0)
+    }
+
     pub fn as_bytes(&self) -> &[u8] {
         &self.0.0
     }

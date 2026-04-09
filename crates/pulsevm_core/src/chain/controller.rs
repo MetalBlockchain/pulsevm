@@ -39,8 +39,9 @@ use pulsevm_constants::{
 use pulsevm_crypto::{Digest, merkle};
 use pulsevm_error::ChainError;
 use pulsevm_ffi::{CxxGenesisState, Database, ElasticLimitParameters, GlobalPropertyObject};
+use pulsevm_grpc::vm;
 use pulsevm_serialization::{Read, Write};
-use spdlog::{info, warn};
+use spdlog::{error, info, warn};
 use tokio::sync::RwLock as AsyncRwLock;
 
 pub type ApplyHandlerFn = fn(&mut ApplyContext, &mut Database, &Action) -> Result<(), ChainError>;
@@ -68,6 +69,7 @@ pub struct Controller {
     db: Database,
     verified_blocks: HashMap<Id, SignedBlock>,
     chain_id: Id,
+    state: vm::State,
 
     block_log: Option<StateHistoryLog>,
     trace_log: Option<StateHistoryLog>,
@@ -100,6 +102,8 @@ impl Controller {
             db: Database::default(),
             verified_blocks: HashMap::new(),
             chain_id: Id::default(),
+            state: vm::State::Unspecified,
+
             block_log: None,
             trace_log: None,
             chain_state_log: None,
@@ -125,7 +129,6 @@ impl Controller {
                 e, config_json
             ))
         })?);
-        info!("node config parsed successfully: {:?}", self.node_config);
 
         // Initialize database
         self.db = Database::new(&db_path, self.node_config.as_ref().unwrap().db_size)
@@ -136,7 +139,6 @@ impl Controller {
         let genesis_json = std::str::from_utf8(genesis_bytes).map_err(|e| {
             ChainError::ParseError(format!("failed to parse genesis bytes as UTF-8: {}", e))
         })?;
-        info!("genesis JSON parsed successfully: {}", genesis_json);
         let genesis = CxxGenesisState::new(genesis_json)
             .map_err(|e| ChainError::ParseError(format!("failed to parse genesis: {}", e)))?;
         // TODO: Validate genesis state
@@ -164,7 +166,6 @@ impl Controller {
         );
         self.preferred_id = self.last_accepted_block.id()?;
 
-        // TODO: Check if we need to initialize the database
         let revision = self.db.revision();
         info!("database revision: {}", revision);
 
@@ -202,7 +203,29 @@ impl Controller {
                         ))
                     })?;
             }
-            Some((start, end)) => info!("block log contains blocks from {} to {}", start, end),
+            Some((start, end)) => {
+                if revision != end as i64 {
+                    error!(
+                        "database revision {} does not match block log end {}",
+                        revision, end
+                    );
+
+                    return Err(ChainError::DatabaseError(format!(
+                        "database revision {} does not match block log end {}",
+                        revision, end
+                    )));
+                }
+
+                info!("block log contains blocks from {} to {}", start, end);
+
+                self.last_accepted_block = self.get_block_by_height(end)?.ok_or_else(|| {
+                    ChainError::DatabaseError(format!(
+                        "failed to retrieve last block from block log at height {}",
+                        end
+                    ))
+                })?;
+                self.preferred_id = self.last_accepted_block.id()?;
+            }
         }
 
         Ok(())
@@ -701,6 +724,14 @@ impl Controller {
                 return Ok(());
             }
         }
+    }
+
+    pub fn set_state(&mut self, state: vm::State) {
+        self.state = state;
+    }
+
+    pub fn get_state(&self) -> &vm::State {
+        &self.state
     }
 }
 
