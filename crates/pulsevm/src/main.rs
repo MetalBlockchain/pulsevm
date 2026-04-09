@@ -271,7 +271,7 @@ impl Vm for VirtualMachine {
         block_timer.wait_for_block_build().await;
 
         Ok(Response::new(vm::WaitForEventResponse {
-            message: vm::Message::BuildBlock.into()
+            message: vm::Message::BuildBlock.into(),
         }))
     }
 

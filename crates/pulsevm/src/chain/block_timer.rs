@@ -1,7 +1,11 @@
 use std::{sync::Arc, time::Duration};
 
 use pulsevm_core::mempool::Mempool;
-use tokio::{sync::{Notify, RwLock}, task::JoinHandle, time::interval};
+use tokio::{
+    sync::{Notify, RwLock},
+    task::JoinHandle,
+    time::interval,
+};
 
 #[derive(Clone)]
 pub struct BlockTimer {

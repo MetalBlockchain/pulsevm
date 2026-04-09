@@ -194,7 +194,8 @@ impl ApplyContext {
         }
 
         // Calculate action digest
-        self.trx_context.add_executed_action_receipt_digest(receipt.digest()?)?;
+        self.trx_context
+            .add_executed_action_receipt_digest(receipt.digest()?)?;
         self.finalize_trace(receipt)?;
 
         Ok(cpu_used)

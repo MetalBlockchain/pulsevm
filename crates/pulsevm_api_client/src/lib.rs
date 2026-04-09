@@ -82,7 +82,11 @@ struct Transport {
 impl Transport {
     /// Send a POST request with a JSON body and return the raw response bytes.
     async fn post(&self, path: &str, body: &Value) -> Result<(u16, Vec<u8>), ClientError> {
-        let url = format!("{}{}", self.base_url, path.trim_end_matches("/").to_string());
+        let url = format!(
+            "{}{}",
+            self.base_url,
+            path.trim_end_matches("/").to_string()
+        );
         let resp = self.client.post(&url).json(body).send().await?;
         println!("sending POST to {} with body: {}", url, body);
         let status = resp.status().as_u16();
@@ -151,14 +155,13 @@ impl PulseVmClient {
         _status: u16,
         bytes: &[u8],
     ) -> Result<T, ClientError> {
-        let envelope: JsonRpcResponse =
-            serde_json::from_slice(bytes).map_err(|e| {
-                ClientError::Parse(format!(
-                    "{} — raw body: {}",
-                    e,
-                    String::from_utf8_lossy(bytes)
-                ))
-            })?;
+        let envelope: JsonRpcResponse = serde_json::from_slice(bytes).map_err(|e| {
+            ClientError::Parse(format!(
+                "{} — raw body: {}",
+                e,
+                String::from_utf8_lossy(bytes)
+            ))
+        })?;
 
         if let Some(err) = envelope.error {
             return Err(ClientError::Rpc {
@@ -177,9 +180,7 @@ impl PulseVmClient {
 
     // ------ Public API ------
 
-    pub async fn get_info(
-        &self,
-    ) -> Result<Vec<String>, ClientError> {
+    pub async fn get_info(&self) -> Result<Vec<String>, ClientError> {
         self.rpc_call("pulsevm.getInfo", None).await
     }
 
@@ -267,7 +268,8 @@ mod tests {
     #[test]
     fn handle_response_rpc_error() {
         let client = PulseVmClient::new("http://localhost");
-        let body = br#"{"jsonrpc":"2.0","id":0,"error":{"code":-32601,"message":"Method not found"}}"#;
+        let body =
+            br#"{"jsonrpc":"2.0","id":0,"error":{"code":-32601,"message":"Method not found"}}"#;
         let result: Result<Vec<String>, _> = client.handle_response(200, body);
         match result {
             Err(ClientError::Rpc { code, message, .. }) => {

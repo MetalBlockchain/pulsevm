@@ -109,12 +109,12 @@ mod auth_tests {
         let mut chain = Testing::new();
         chain.create_accounts(vec![name!("loop").into()], false, true)?;
         let wasm_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .unwrap()
-                .parent()
-                .unwrap()
-                .join("reference_contracts")
-                .join("endless_loop.wasm");
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("reference_contracts")
+            .join("endless_loop.wasm");
         let wasm = fs::read(wasm_path).expect("Failed to read endless loop wasm file");
         chain.set_code(name!("loop").into(), wasm.into())?;
 

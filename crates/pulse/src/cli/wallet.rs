@@ -69,9 +69,7 @@ pub async fn handle(
                 return Err("private key must not be empty".into());
             }
             client.import_key(&name, &key).await?;
-            println!(
-                "imported private key for"
-            );
+            println!("imported private key for");
         }
 
         WalletSubcommand::List => {

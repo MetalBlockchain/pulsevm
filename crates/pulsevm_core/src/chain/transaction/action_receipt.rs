@@ -74,6 +74,9 @@ mod tests {
         );
 
         let digest = receipt.digest().unwrap();
-        assert_eq!(digest.to_string(), "aef915d3b57bc88c3a09423e051ca1084738e41c0d4c8d1d3f179aa0bec895b0");
+        assert_eq!(
+            digest.to_string(),
+            "aef915d3b57bc88c3a09423e051ca1084738e41c0d4c8d1d3f179aa0bec895b0"
+        );
     }
 }

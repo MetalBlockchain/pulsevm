@@ -129,10 +129,10 @@ impl SignedBlock {
                     confirmed: 0, // Placeholder confirmed count
                     previous: parent_id,
                     transaction_mroot,
-                    action_mroot, // Use the provided action merkle root
-                    schedule_version: 0,             // Placeholder schedule version
-                    new_producers: None,             // Placeholder for new producers
-                    header_extensions: vec![],       // Placeholder for header extensions
+                    action_mroot,              // Use the provided action merkle root
+                    schedule_version: 0,       // Placeholder schedule version
+                    new_producers: None,       // Placeholder for new producers
+                    header_extensions: vec![], // Placeholder for header extensions
                 },
                 signature: Signature::default(), // Placeholder signature
             },

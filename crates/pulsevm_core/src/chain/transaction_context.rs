@@ -18,10 +18,7 @@ use crate::{
         id::Id,
         name::Name,
         resource_limits::ResourceLimitsManager,
-        transaction::{
-            Action, ActionTrace, Transaction, TransactionStatus,
-            TransactionTrace,
-        },
+        transaction::{Action, ActionTrace, Transaction, TransactionStatus, TransactionTrace},
         utils::pulse_assert,
         wasm_runtime::WasmRuntime,
     },

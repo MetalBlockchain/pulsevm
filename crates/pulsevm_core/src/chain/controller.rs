@@ -115,10 +115,6 @@ impl Controller {
         db_path: &str,
     ) -> Result<(), ChainError> {
         info!("initializing controller with DB path: {}", db_path);
-        // TODO: Set database size from config
-        self.db = Database::new(&db_path, 1 * 1024 * 1024 * 1024)
-            .map_err(|e| ChainError::InternalError(format!("failed to open database: {}", e)))?;
-        self.db.add_indices()?;
         // Parse config bytes
         let config_json = std::str::from_utf8(config_bytes).map_err(|e| {
             ChainError::ParseError(format!("failed to parse config bytes as UTF-8: {}", e))
@@ -130,10 +126,17 @@ impl Controller {
             ))
         })?);
         info!("node config parsed successfully: {:?}", self.node_config);
+
+        // Initialize database
+        self.db = Database::new(&db_path, self.node_config.as_ref().unwrap().db_size)
+            .map_err(|e| ChainError::InternalError(format!("failed to open database: {}", e)))?;
+        self.db.add_indices()?;
+
         // Parse genesis bytes
         let genesis_json = std::str::from_utf8(genesis_bytes).map_err(|e| {
             ChainError::ParseError(format!("failed to parse genesis bytes as UTF-8: {}", e))
         })?;
+        info!("genesis JSON parsed successfully: {}", genesis_json);
         let genesis = CxxGenesisState::new(genesis_json)
             .map_err(|e| ChainError::ParseError(format!("failed to parse genesis: {}", e)))?;
         // TODO: Validate genesis state
