@@ -1,5 +1,7 @@
 pub mod create;
 pub mod dispatcher;
+pub mod get;
+pub mod set;
 pub mod wallet;
 
 use clap::{Parser, Subcommand};
@@ -10,8 +12,8 @@ use crate::logging::LogLevel;
 #[command(name = "cleos", version, about, long_about = None)]
 pub struct Cli {
     /// URL of the nodeos RPC endpoint
-    #[arg(short, long, default_value = "http://127.0.0.1:8888", global = true)]
-    pub url: String,
+    #[arg(short, long, global = true)]
+    pub url: Option<String>,
 
     /// URL of the keosd wallet endpoint
     #[arg(long, global = true)]
@@ -44,6 +46,16 @@ pub enum Commands {
     Wallet {
         #[command(subcommand)]
         subcmd: WalletSubcommand,
+    },
+    /// Get blockchain information
+    Get {
+        #[command(subcommand)]
+        subcmd: GetSubcommand,
+    },
+    /// Set configuration values
+    Set {
+        #[command(subcommand)]
+        subcmd: SetSubcommand,
     },
 }
 
@@ -166,4 +178,19 @@ pub enum WalletSubcommand {
 
     /// Stop keosd (doesn't work with nodeos-based wallet plugin)
     Stop,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum GetSubcommand {
+    /// Get blockchain information
+    Info,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SetSubcommand {
+    /// Set blockchain information
+    Url {
+        /// URL of the RPC endpoint
+        url: String,
+    },
 }

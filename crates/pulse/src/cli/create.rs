@@ -64,8 +64,9 @@ pub async fn handle(
                 .try_into()?,
             });
             let candidate_keys = keosd_client.get_public_keys().await?;
+            let chain_info = api_client.get_info().await?;
             let required_keys = api_client.get_required_keys(&txn, &candidate_keys).await?;
-            //let signed = keosd_client.sign_transaction(&txn, &required_keys).await?;
+            //let signed = keosd_client.sign_transaction(&txn, &required_keys, &chain_info.chain_id).await?;
             todo!("sign and push transaction to create account");
         }
         CreateSubcommand::Key {

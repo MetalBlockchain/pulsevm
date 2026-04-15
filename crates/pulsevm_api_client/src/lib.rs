@@ -4,6 +4,11 @@ use serde_json::Value;
 use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 
+mod responses;
+use responses::*;
+
+use crate::responses::chain_info::ChainInfo;
+
 // ---------------------------------------------------------------------------
 // Error types
 // ---------------------------------------------------------------------------
@@ -88,7 +93,6 @@ impl Transport {
             path.trim_end_matches("/").to_string()
         );
         let resp = self.client.post(&url).json(body).send().await?;
-        println!("sending POST to {} with body: {}", url, body);
         let status = resp.status().as_u16();
         let bytes = resp.bytes().await?.to_vec();
         Ok((status, bytes))
@@ -180,7 +184,7 @@ impl PulseVmClient {
 
     // ------ Public API ------
 
-    pub async fn get_info(&self) -> Result<Vec<String>, ClientError> {
+    pub async fn get_info(&self) -> Result<ChainInfo, ClientError> {
         self.rpc_call("pulsevm.getInfo", None).await
     }
 
