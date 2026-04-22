@@ -6,7 +6,7 @@ use pulsevm_crypto::FixedBytes;
 use pulsevm_error::ChainError;
 use pulsevm_ffi::CxxDigest;
 use pulsevm_proc_macros::{NumBytes, Read, Write};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, Read, Write, NumBytes)]
 pub struct Id(pub FixedBytes<32>);
@@ -67,6 +67,16 @@ impl Serialize for Id {
     {
         let hex_string = hex::encode(self.0);
         serializer.serialize_str(&hex_string)
+    }
+}
+
+impl<'de> Deserialize<'de> for Id {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let hex_string = String::deserialize(deserializer)?;
+        Id::from_str(&hex_string).map_err(serde::de::Error::custom)
     }
 }
 
