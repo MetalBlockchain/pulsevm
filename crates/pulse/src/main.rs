@@ -1,6 +1,7 @@
-mod config;
 mod cli;
+mod config;
 mod logging;
+mod utils;
 
 use clap::Parser;
 use spdlog::error;

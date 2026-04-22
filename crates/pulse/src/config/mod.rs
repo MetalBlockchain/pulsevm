@@ -15,7 +15,8 @@ impl Config {
 }
 
 fn config_path() -> anyhow::Result<PathBuf> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
     Ok(home.join(".pulse-cli").join("config.json"))
 }
 

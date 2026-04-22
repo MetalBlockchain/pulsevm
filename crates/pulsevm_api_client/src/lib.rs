@@ -1,13 +1,15 @@
-use pulsevm_core::transaction::Transaction;
+use pulsevm_api_types::{ChainInfoResponse, IssueTxResponse};
+use pulsevm_core::{
+    crypto::Signature,
+    transaction::{PackedTransaction, Transaction, TransactionCompression},
+};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use std::sync::atomic::{AtomicU64, Ordering};
+use serde_json::{Value, json};
+use std::{
+    collections::HashSet,
+    sync::atomic::{AtomicU64, Ordering},
+};
 use thiserror::Error;
-
-mod responses;
-use responses::*;
-
-use crate::responses::chain_info::ChainInfo;
 
 // ---------------------------------------------------------------------------
 // Error types
@@ -184,7 +186,7 @@ impl PulseVmClient {
 
     // ------ Public API ------
 
-    pub async fn get_info(&self) -> Result<ChainInfo, ClientError> {
+    pub async fn get_info(&self) -> Result<ChainInfoResponse, ClientError> {
         self.rpc_call("pulsevm.getInfo", None).await
     }
 
@@ -237,6 +239,14 @@ impl PulseVmClient {
         })?;
 
         self.rpc_call("pulsevm.getRequiredKeys", Some(params)).await
+    }
+
+    pub async fn issue_tx(
+        &self,
+        packed_trx: &PackedTransaction,
+    ) -> Result<IssueTxResponse, ClientError> {
+        let params = serde_json::to_value(packed_trx)?;
+        self.rpc_call("pulsevm.issueTx", Some(params)).await
     }
 }
 

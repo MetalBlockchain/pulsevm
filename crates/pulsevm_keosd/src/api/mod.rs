@@ -1,8 +1,9 @@
-use std::sync::Mutex;
+use std::{iter::chain, sync::Mutex};
 
 use actix_web::{HttpResponse, get, post, web};
+use pulsevm_core::{id::Id, transaction::Transaction};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use spdlog::info;
 
 use crate::manager::{ManagerError, WalletManager};
@@ -157,7 +158,7 @@ struct SignDigestRequest {
 }
 
 #[derive(Deserialize)]
-struct SignTransactionRequest(Value, Vec<String>, String); // [transaction, public_keys, chain_id]
+struct SignTransactionRequest(Transaction, Vec<String>, Id); // [transaction, public_keys, chain_id]
 
 // ---------- Endpoint handlers ----------
 
@@ -386,26 +387,16 @@ async fn wallet_sign_transaction(
     let _transaction = req.0;
     let public_keys = req.1;
     let chain_id = req.2;
-
-    // In a full implementation, we'd compute the signing digest from the
-    // serialized transaction + chain_id. For now, we hash the chain_id + transaction
-    // as a simplified version.
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(hex::decode(&chain_id).unwrap_or_default());
-    hasher.update(_transaction.to_string().as_bytes());
-    let digest = hasher.finalize();
+    let digest = _transaction.signing_digest(&chain_id, &Vec::new()).unwrap(); // TODO: Handle error gracefully
 
     let mut mgr = data.manager.lock().unwrap();
     match mgr.sign_digest(&digest, &public_keys) {
         Ok(sigs) => {
             // Attach signatures to the transaction
-            let mut tx = _transaction.clone();
-            if let Value::Object(ref mut map) = tx {
-                let sig_array: Vec<String> = sigs.values().cloned().collect();
-                map.insert("signatures".to_string(), serde_json::json!(sig_array));
-            }
-            HttpResponse::Ok().json(tx)
+            let mut map = Map::new();
+            let sig_array: Vec<String> = sigs.values().cloned().collect();
+            map.insert("signatures".to_string(), serde_json::json!(sig_array));
+            HttpResponse::Ok().json(map)
         }
         Err(e) => manager_err_to_response(e),
     }

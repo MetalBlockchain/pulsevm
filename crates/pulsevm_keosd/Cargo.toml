@@ -25,6 +25,8 @@ spdlog-rs = "0.4"
 thiserror = "2"
 zeroize = { version = "1.8.2", features = ["derive"] }
 
+pulsevm_core = { path = "../pulsevm_core" }
+
 [dev-dependencies]
 actix-rt = "2"
 actix-http = "3"

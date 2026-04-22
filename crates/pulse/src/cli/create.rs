@@ -1,18 +1,18 @@
-use std::str::FromStr;
+use std::{collections::HashSet, str::FromStr};
 
 use pulsevm_api_client::PulseVmClient;
 use pulsevm_core::{
-    PULSE_NAME,
+    ACTIVE_NAME, PULSE_NAME,
     authority::{Authority, KeyWeight, PermissionLevel},
     config::NEWACCOUNT_NAME,
     crypto::{PrivateKey, PublicKey},
     name::Name,
-    pulse_contract::NewAccount,
-    transaction::{Action, Transaction},
+    pulse_contract::NewAccount, transaction::Action,
 };
 use pulsevm_keosd_client::KeosdClient;
+use spdlog::info;
 
-use crate::cli::CreateSubcommand;
+use crate::{cli::CreateSubcommand, utils::push_actions};
 
 pub async fn handle(
     api_client: &PulseVmClient,
@@ -31,43 +31,43 @@ pub async fn handle(
             } else {
                 owner_key.clone()
             };
-            let mut txn = Transaction::default();
-            txn.actions.push(Action {
-                account: PULSE_NAME,
-                name: NEWACCOUNT_NAME,
-                authorization: vec![PermissionLevel {
-                    actor: Name::from_str(&creator)?.into(),
-                    permission: Name::from_str("active")?.into(),
+            let response = push_actions(
+                api_client,
+                keosd_client,
+                vec![Action {
+                    account: PULSE_NAME,
+                    name: NEWACCOUNT_NAME,
+                    authorization: vec![PermissionLevel {
+                        actor: Name::from_str(&creator)?.into(),
+                        permission: ACTIVE_NAME.into(),
+                    }],
+                    data: NewAccount {
+                        creator: Name::from_str(&creator)?.into(),
+                        name: Name::from_str(&name)?.into(),
+                        owner: Authority {
+                            threshold: 1,
+                            keys: vec![KeyWeight {
+                                key: PublicKey::from_str(&owner_key)?.into(),
+                                weight: 1,
+                            }],
+                            accounts: vec![],
+                            waits: vec![],
+                        },
+                        active: Authority {
+                            threshold: 1,
+                            keys: vec![KeyWeight {
+                                key: PublicKey::from_str(&active_key)?.into(),
+                                weight: 1,
+                            }],
+                            accounts: vec![],
+                            waits: vec![],
+                        },
+                    }
+                    .try_into()?,
                 }],
-                data: NewAccount {
-                    creator: Name::from_str(&creator)?.into(),
-                    name: Name::from_str(&name)?.into(),
-                    owner: Authority {
-                        threshold: 1,
-                        keys: vec![KeyWeight {
-                            key: PublicKey::from_str(&owner_key)?.into(),
-                            weight: 1,
-                        }],
-                        accounts: vec![],
-                        waits: vec![],
-                    },
-                    active: Authority {
-                        threshold: 1,
-                        keys: vec![KeyWeight {
-                            key: PublicKey::from_str(&active_key)?.into(),
-                            weight: 1,
-                        }],
-                        accounts: vec![],
-                        waits: vec![],
-                    },
-                }
-                .try_into()?,
-            });
-            let candidate_keys = keosd_client.get_public_keys().await?;
-            let chain_info = api_client.get_info().await?;
-            let required_keys = api_client.get_required_keys(&txn, &candidate_keys).await?;
-            //let signed = keosd_client.sign_transaction(&txn, &required_keys, &chain_info.chain_id).await?;
-            todo!("sign and push transaction to create account");
+            )
+            .await?;
+            info!("Account creation transaction issued: {}", response);
         }
         CreateSubcommand::Key {
             file,

@@ -3,6 +3,10 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+use crate::types::SignedKeosdTransaction;
+
+pub mod types;
+
 // ---------------------------------------------------------------------------
 // Error types
 // ---------------------------------------------------------------------------
@@ -474,7 +478,7 @@ impl KeosdClient {
         transaction: &Value,
         public_keys: &[String],
         chain_id: &str,
-    ) -> Result<Value, ClientError> {
+    ) -> Result<SignedKeosdTransaction, ClientError> {
         self.post(
             "/v1/wallet/sign_transaction",
             &serde_json::json!([transaction, public_keys, chain_id]),

@@ -1,7 +1,9 @@
+use pulsevm_core::id::Id;
+use pulsevm_time::TimePointSec;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChainInfo {
+pub struct ChainInfoResponse {
     pub server_version: String,
     pub server_time: String,
     pub chain_id: String,
@@ -23,4 +25,10 @@ pub struct ChainInfo {
     pub total_net_weight: u64,
     pub earliest_available_block_num: u32,
     pub last_irreversible_block_time: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct IssueTxResponse {
+    #[serde(rename(serialize = "txID", deserialize = "txID"))]
+    pub tx_id: Id,
 }
