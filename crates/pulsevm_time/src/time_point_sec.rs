@@ -1,4 +1,8 @@
-use std::{fmt, str::FromStr};
+use std::{
+    fmt,
+    ops::{Add, AddAssign},
+    str::FromStr,
+};
 
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 use serde::{
@@ -44,6 +48,16 @@ impl TimePointSec {
     #[inline]
     pub const fn sec_since_epoch(&self) -> u32 {
         self.utc_seconds
+    }
+
+    pub fn now() -> Self {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_secs();
+        Self {
+            utc_seconds: secs as u32,
+        }
     }
 
     /// Exact EOS-style string: "YYYY-MM-DDTHH:MM:SSZ"
@@ -132,6 +146,24 @@ impl<'de> Deserialize<'de> for TimePointSec {
             }
         }
         deserializer.deserialize_str(TPVisitor)
+    }
+}
+
+impl Add<u32> for TimePointSec {
+    type Output = Self;
+
+    #[inline]
+    fn add(self, rhs: u32) -> Self {
+        Self {
+            utc_seconds: self.utc_seconds.wrapping_add(rhs),
+        }
+    }
+}
+
+impl AddAssign<u32> for TimePointSec {
+    #[inline]
+    fn add_assign(&mut self, rhs: u32) {
+        self.utc_seconds = self.utc_seconds.wrapping_add(rhs);
     }
 }
 
