@@ -41,10 +41,13 @@ impl PackedTransaction {
         let unpacked_trx = Transaction::read(trx_bytes.as_slice(), &mut 0).map_err(|e| {
             ChainError::SerializationError(format!("failed to unpack transaction: {}", e))
         })?;
-        let unpacked_context_free_data =
+        let unpacked_context_free_data = if cfd_bytes.len() > 0 {
             Vec::<Bytes>::read(cfd_bytes.as_slice(), &mut 0).map_err(|e| {
                 ChainError::SerializationError(format!("failed to unpack context free data: {}", e))
-            })?;
+            })?
+        } else {
+            vec![]
+        };
         let trx_id: Id = unpacked_trx.id()?;
 
         Ok(Self {
@@ -171,6 +174,7 @@ impl Serialize for PackedTransaction {
         state.serialize_field("signatures", &self.signatures)?;
         state.serialize_field("compression", &self.compression)?;
         state.serialize_field("packed_trx", &self.packed_trx)?;
+        state.serialize_field("packed_context_free_data", &self.packed_context_free_data)?;
         state.serialize_field("transaction", &self.unpacked_trx.transaction())?;
         state.end()
     }
