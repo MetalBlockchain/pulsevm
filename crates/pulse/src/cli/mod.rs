@@ -201,4 +201,14 @@ pub enum SetSubcommand {
         /// URL of the RPC endpoint
         url: String,
     },
+    /// Set account contract
+    Code {
+        /// Account name
+        account: String,
+        /// File name
+        wasm_path: String,
+        /// Clear the contract?
+        #[arg(long, short, default_value_t = false)]
+        clear: bool,
+    },
 }

@@ -59,6 +59,14 @@ pub struct SetCode {
     pub code: Arc<Bytes>,
 }
 
+impl TryFrom<SetCode> for Arc<[u8]> {
+    type Error = String;
+
+    fn try_from(value: SetCode) -> Result<Self, Self::Error> {
+        value.pack().map(Arc::from).map_err(|e| e.to_string())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Read, Write, NumBytes)]
 pub struct SetAbi {
     pub account: Name,
