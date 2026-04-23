@@ -2,6 +2,7 @@ pub mod create;
 pub mod dispatcher;
 pub mod get;
 pub mod set;
+pub mod transfer;
 pub mod wallet;
 
 use clap::{Parser, Subcommand};
@@ -56,6 +57,24 @@ pub enum Commands {
     Set {
         #[command(subcommand)]
         subcmd: SetSubcommand,
+    },
+    /// Transfer tokens from account to account
+    Transfer {
+        /// The account sending tokens
+        sender: String,
+        /// The account receiving tokens
+        recipient: String,
+        /// The amount of tokens to send
+        amount: String,
+        /// The memo for the transfer
+        #[arg(default_value = "")]
+        memo: String,
+        /// The contract that controls the token, defaults to pulse.token
+        #[arg(short, long, default_value = "pulse.token")]
+        contract: String,
+        /// An account and permission level to authorize, as in 'account@permission' (defaults to 'sender@active')
+        #[arg(short, long)]
+        permission: Option<String>,
     },
 }
 

@@ -4,7 +4,7 @@ use pulsevm_api_client::PulseVmClient;
 use pulsevm_keosd_client::KeosdClient;
 
 use crate::{
-    cli::{Cli, Commands, create, get, set, wallet},
+    cli::{Cli, Commands, create, get, set, transfer, wallet},
     config::load_or_create_config,
 };
 
@@ -35,6 +35,27 @@ pub async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Get { subcmd } => get::handle(&pulsevm_api_client, &keosd_client, subcmd).await?,
         Commands::Set { subcmd } => {
             set::handle(&pulsevm_api_client, &mut config, &keosd_client, subcmd).await?
+        }
+        Commands::Transfer {
+            sender,
+            recipient,
+            amount,
+            memo,
+            contract,
+            permission,
+        } => {
+            transfer::handle(
+                &pulsevm_api_client,
+                &mut config,
+                &keosd_client,
+                sender,
+                recipient,
+                amount,
+                memo,
+                contract,
+                permission,
+            )
+            .await?
         }
     }
 

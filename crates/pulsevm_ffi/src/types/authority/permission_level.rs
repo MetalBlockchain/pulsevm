@@ -114,3 +114,36 @@ impl PartialOrd for PermissionLevel {
         Some(self.cmp(other))
     }
 }
+
+use std::str::FromStr;
+
+#[derive(Debug)]
+pub struct ParsePermissionLevelError(String);
+
+impl fmt::Display for ParsePermissionLevelError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for ParsePermissionLevelError {}
+
+impl FromStr for PermissionLevel {
+    type Err = ParsePermissionLevelError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (actor_str, permission_str) = s.split_once('@').ok_or_else(|| {
+            ParsePermissionLevelError("expected format: \"actor@permission\"".into())
+        })?;
+
+        let actor = Name::from_str(actor_str)
+            .map_err(|e| ParsePermissionLevelError(format!("invalid actor: {}", e)))?;
+        let permission = Name::from_str(permission_str)
+            .map_err(|e| ParsePermissionLevelError(format!("invalid permission: {}", e)))?;
+
+        Ok(PermissionLevel {
+            actor: actor.as_u64(),
+            permission: permission.as_u64(),
+        })
+    }
+}
