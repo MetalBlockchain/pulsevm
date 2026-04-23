@@ -34,6 +34,8 @@ pub enum WalletError {
     IoError(#[from] std::io::Error),
     #[error("Serialization error: {0}")]
     SerializationError(String),
+    #[error("Invalid path: {0}")]
+    PathError(String),
 }
 
 /// On-disk format for an encrypted wallet file.
@@ -60,7 +62,17 @@ pub struct Wallet {
 impl Wallet {
     /// Create a brand-new wallet with the given password. Returns the wallet.
     pub fn create(name: &str, password: &str, wallet_dir: &Path) -> Result<Self, WalletError> {
+        // Reject names with path separators or traversal sequences
+        if name.contains('/') || name.contains('\\') || name.contains('.') {
+            return Err(WalletError::PathError(format!("name rejected")));
+        }
+
         let file_path = wallet_dir.join(format!("{}.wallet", name));
+        let canonical = file_path.canonicalize()?;
+
+        if !canonical.starts_with(wallet_dir.canonicalize()?) {
+            return Err(WalletError::PathError(format!("name rejected")));
+        }
 
         let checksum = sha512_hash(password.as_bytes());
         let keys = BTreeMap::new();
