@@ -7,7 +7,8 @@ use pulsevm_core::{
     config::NEWACCOUNT_NAME,
     crypto::{PrivateKey, PublicKey},
     name::Name,
-    pulse_contract::NewAccount, transaction::Action,
+    pulse_contract::NewAccount,
+    transaction::Action,
 };
 use pulsevm_keosd_client::KeosdClient;
 use spdlog::info;

@@ -4,9 +4,13 @@ use cxx::{SharedPtr, UniquePtr};
 use pulsevm_billable_size::BillableSize;
 use pulsevm_crypto::FixedBytes;
 use pulsevm_serialization::{NumBytes, Read, Write, WriteError};
-use serde::{Serialize, ser::SerializeStruct};
+use serde::{
+    Deserialize, Serialize,
+    de::{self, MapAccess, SeqAccess, Visitor},
+    ser::SerializeStruct,
+};
 
-use crate::{CxxPublicKey, bridge::ffi::KeyWeight, parse_public_key_from_bytes};
+use crate::{CxxPublicKey, bridge::ffi::KeyWeight, parse_public_key, parse_public_key_from_bytes};
 
 impl KeyWeight {
     pub fn new(key: SharedPtr<CxxPublicKey>, weight: u16) -> Self {
@@ -64,6 +68,102 @@ impl Serialize for KeyWeight {
         state.serialize_field("key", &self.key.to_string_rust())?;
         state.serialize_field("weight", &self.weight)?;
         state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for KeyWeight {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &["key", "weight"];
+
+        enum Field {
+            Key,
+            Weight,
+        }
+
+        impl<'de> Deserialize<'de> for Field {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct FieldVisitor;
+
+                impl<'de> Visitor<'de> for FieldVisitor {
+                    type Value = Field;
+
+                    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                        f.write_str("`key` or `weight`")
+                    }
+
+                    fn visit_str<E: de::Error>(self, value: &str) -> Result<Field, E> {
+                        match value {
+                            "key" => Ok(Field::Key),
+                            "weight" => Ok(Field::Weight),
+                            _ => Err(de::Error::unknown_field(value, FIELDS)),
+                        }
+                    }
+                }
+
+                deserializer.deserialize_identifier(FieldVisitor)
+            }
+        }
+
+        struct KeyWeightVisitor;
+
+        impl<'de> Visitor<'de> for KeyWeightVisitor {
+            type Value = KeyWeight;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("struct KeyWeight")
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let key_str: String = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(0, &self))?;
+                let weight = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(1, &self))?;
+
+                let key = parse_public_key(&key_str)
+                    .map_err(|e| de::Error::custom(format!("invalid public key: {}", e)))?;
+
+                Ok(KeyWeight { key, weight })
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut key: Option<String> = None;
+                let mut weight = None;
+
+                while let Some(field) = map.next_key()? {
+                    match field {
+                        Field::Key => {
+                            if key.is_some() {
+                                return Err(de::Error::duplicate_field("key"));
+                            }
+                            key = Some(map.next_value()?);
+                        }
+                        Field::Weight => {
+                            if weight.is_some() {
+                                return Err(de::Error::duplicate_field("weight"));
+                            }
+                            weight = Some(map.next_value()?);
+                        }
+                    }
+                }
+
+                let key_str = key.ok_or_else(|| de::Error::missing_field("key"))?;
+                let key = parse_public_key(&key_str)
+                    .map_err(|e| de::Error::custom(format!("invalid public key: {}", e)))?;
+                let weight = weight.ok_or_else(|| de::Error::missing_field("weight"))?;
+
+                Ok(KeyWeight { key, weight })
+            }
+        }
+
+        deserializer.deserialize_struct("KeyWeight", FIELDS, KeyWeightVisitor)
     }
 }
 

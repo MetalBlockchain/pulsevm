@@ -1,6 +1,7 @@
-use pulsevm_api_types::{ChainInfoResponse, IssueTxResponse};
+use pulsevm_api_types::{AccountResponse, ChainInfoResponse, IssueTxResponse};
 use pulsevm_core::{
     crypto::Signature,
+    name::Name,
     transaction::{PackedTransaction, Transaction, TransactionCompression},
 };
 use serde::{Deserialize, Serialize};
@@ -185,6 +186,21 @@ impl PulseVmClient {
     }
 
     // ------ Public API ------
+    pub async fn get_account(
+        &self,
+        account_name: &Name,
+        expected_core_symbol: &Option<String>,
+    ) -> Result<AccountResponse, ClientError> {
+        let mut params = json!({
+            "account_name": account_name,
+        });
+
+        if let Some(symbol) = expected_core_symbol {
+            params["expected_core_symbol"] = json!(symbol);
+        }
+
+        self.rpc_call("pulsevm.getAccount", Some(params)).await
+    }
 
     pub async fn get_info(&self) -> Result<ChainInfoResponse, ClientError> {
         self.rpc_call("pulsevm.getInfo", None).await

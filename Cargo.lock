@@ -3149,6 +3149,7 @@ dependencies = [
  "clap",
  "dirs",
  "pulsevm_api_client",
+ "pulsevm_api_types",
  "pulsevm_core",
  "pulsevm_keosd_client",
  "pulsevm_time",

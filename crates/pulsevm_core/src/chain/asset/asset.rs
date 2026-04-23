@@ -1,11 +1,22 @@
 use std::{fmt, str::FromStr};
 
 use pulsevm_proc_macros::{NumBytes, Read, Write};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de};
 
 use crate::chain::asset::{Symbol, SymbolCode};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Read, Write, NumBytes, Deserialize)]
+#[derive(Debug)]
+pub struct ParseAssetError(String);
+
+impl fmt::Display for ParseAssetError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for ParseAssetError {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Read, Write, NumBytes)]
 pub struct Asset {
     /// The amount of the asset
     pub amount: i64,
@@ -69,6 +80,46 @@ impl Serialize for Asset {
     {
         let value = self.to_string();
         serializer.serialize_str(&value)
+    }
+}
+
+impl<'de> Deserialize<'de> for Asset {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        s.parse::<Asset>().map_err(de::Error::custom)
+    }
+}
+
+impl FromStr for Asset {
+    type Err = ParseAssetError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (amount_str, symbol_str) = s
+            .split_once(' ')
+            .ok_or_else(|| ParseAssetError("expected format: \"1.0000 XPR\"".into()))?;
+
+        let symbol_code = SymbolCode::from_str(symbol_str)
+            .map_err(|e| ParseAssetError(format!("invalid symbol code: {}", e)))?;
+
+        let (amount, precision) = if let Some((whole, fraction)) = amount_str.split_once('.') {
+            let precision = fraction.len() as u8;
+            let combined = format!("{}{}", whole, fraction);
+            let amount = combined
+                .parse::<i64>()
+                .map_err(|e| ParseAssetError(format!("invalid amount: {}", e)))?;
+            (amount, precision)
+        } else {
+            let amount = amount_str
+                .parse::<i64>()
+                .map_err(|e| ParseAssetError(format!("invalid amount: {}", e)))?;
+            (amount, 0u8)
+        };
+
+        let symbol = Symbol::new_with_code(precision, symbol_code);
+        Ok(Asset { amount, symbol })
     }
 }
 

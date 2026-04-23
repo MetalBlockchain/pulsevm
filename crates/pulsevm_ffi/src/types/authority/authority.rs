@@ -2,7 +2,11 @@ use std::fmt;
 
 use cxx::SharedPtr;
 use pulsevm_serialization::{NumBytes, Read, Write, WriteError};
-use serde::{Serialize, ser::SerializeStruct};
+use serde::{
+    Deserialize, Serialize,
+    de::{self, MapAccess, SeqAccess, Visitor},
+    ser::SerializeStruct,
+};
 
 use crate::{
     CxxPublicKey, PermissionLevel,
@@ -129,5 +133,126 @@ impl Serialize for Authority {
         state.serialize_field("accounts", &self.accounts)?;
         state.serialize_field("waits", &self.waits)?;
         state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for Authority {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &["threshold", "keys", "accounts", "waits"];
+
+        enum Field {
+            Threshold,
+            Keys,
+            Accounts,
+            Waits,
+        }
+
+        impl<'de> Deserialize<'de> for Field {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct FieldVisitor;
+
+                impl<'de> Visitor<'de> for FieldVisitor {
+                    type Value = Field;
+
+                    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                        f.write_str("`threshold`, `keys`, `accounts`, or `waits`")
+                    }
+
+                    fn visit_str<E: de::Error>(self, value: &str) -> Result<Field, E> {
+                        match value {
+                            "threshold" => Ok(Field::Threshold),
+                            "keys" => Ok(Field::Keys),
+                            "accounts" => Ok(Field::Accounts),
+                            "waits" => Ok(Field::Waits),
+                            _ => Err(de::Error::unknown_field(value, FIELDS)),
+                        }
+                    }
+                }
+
+                deserializer.deserialize_identifier(FieldVisitor)
+            }
+        }
+
+        struct AuthorityVisitor;
+
+        impl<'de> Visitor<'de> for AuthorityVisitor {
+            type Value = Authority;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("struct Authority")
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let threshold = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(0, &self))?;
+                let keys = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(1, &self))?;
+                let accounts = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(2, &self))?;
+                let waits = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(3, &self))?;
+                Ok(Authority {
+                    threshold,
+                    keys,
+                    accounts,
+                    waits,
+                })
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut threshold = None;
+                let mut keys = None;
+                let mut accounts = None;
+                let mut waits = None;
+
+                while let Some(key) = map.next_key()? {
+                    match key {
+                        Field::Threshold => {
+                            if threshold.is_some() {
+                                return Err(de::Error::duplicate_field("threshold"));
+                            }
+                            threshold = Some(map.next_value()?);
+                        }
+                        Field::Keys => {
+                            if keys.is_some() {
+                                return Err(de::Error::duplicate_field("keys"));
+                            }
+                            keys = Some(map.next_value()?);
+                        }
+                        Field::Accounts => {
+                            if accounts.is_some() {
+                                return Err(de::Error::duplicate_field("accounts"));
+                            }
+                            accounts = Some(map.next_value()?);
+                        }
+                        Field::Waits => {
+                            if waits.is_some() {
+                                return Err(de::Error::duplicate_field("waits"));
+                            }
+                            waits = Some(map.next_value()?);
+                        }
+                    }
+                }
+
+                Ok(Authority {
+                    threshold: threshold.ok_or_else(|| de::Error::missing_field("threshold"))?,
+                    keys: keys.ok_or_else(|| de::Error::missing_field("keys"))?,
+                    accounts: accounts.ok_or_else(|| de::Error::missing_field("accounts"))?,
+                    waits: waits.ok_or_else(|| de::Error::missing_field("waits"))?,
+                })
+            }
+        }
+
+        deserializer.deserialize_struct("Authority", FIELDS, AuthorityVisitor)
     }
 }

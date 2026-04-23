@@ -184,6 +184,14 @@ pub enum WalletSubcommand {
 pub enum GetSubcommand {
     /// Get blockchain information
     Info,
+    /// Get account information
+    #[command(name = "account")]
+    Account {
+        /// Account name
+        name: String,
+        /// Expected core symbol
+        expected_core_symbol: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
