@@ -73,6 +73,14 @@ pub struct SetAbi {
     pub abi: Arc<Bytes>,
 }
 
+impl TryFrom<SetAbi> for Arc<[u8]> {
+    type Error = String;
+
+    fn try_from(value: SetAbi) -> Result<Self, Self::Error> {
+        value.pack().map(Arc::from).map_err(|e| e.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;

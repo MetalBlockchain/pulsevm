@@ -211,4 +211,14 @@ pub enum SetSubcommand {
         #[arg(long, short, default_value_t = false)]
         clear: bool,
     },
+    /// Set account contract
+    ABI {
+        /// Account name
+        account: String,
+        /// File name
+        abi_path: String,
+        /// Clear the contract?
+        #[arg(long, short, default_value_t = false)]
+        clear: bool,
+    },
 }

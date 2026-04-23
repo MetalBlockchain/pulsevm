@@ -2,11 +2,11 @@ use std::{str::FromStr, sync::Arc};
 
 use pulsevm_api_client::PulseVmClient;
 use pulsevm_core::{
-    ACTIVE_NAME, PULSE_NAME, authority::PermissionLevel, config::SETCODE_NAME, name::Name,
-    pulse_contract::SetCode, transaction::Action,
+    ACTIVE_NAME, PULSE_NAME, abi::AbiDefinition, authority::PermissionLevel, config::{SETABI_NAME, SETCODE_NAME}, name::Name, pulse_contract::{SetAbi, SetCode}, transaction::Action
 };
 use pulsevm_crypto::Bytes;
 use pulsevm_keosd_client::KeosdClient;
+use pulsevm_serialization::Write;
 
 use crate::{cli::SetSubcommand, config::Config, utils::push_actions};
 
@@ -65,6 +65,50 @@ pub async fn handle(
                         vm_type: 0,
                         vm_version: 0,
                         code: Arc::new(code_bytes),
+                    }
+                    .try_into()?,
+                }],
+            )
+            .await?;
+
+            println!("Updated code for {}: {}", account, response);
+        }
+        SetSubcommand::ABI {
+            account,
+            abi_path,
+            clear,
+        } => {
+            let account = Name::from_str(&account)?;
+            let mut abi_bytes = Bytes::default();
+
+            if !clear {
+                println!("Reading ABI from {}...", abi_path);
+                let abi = std::fs::read(&abi_path)
+                    .map_err(|e| format!("failed to read abi file {}: {}", abi_path, e))?;
+
+                if abi.is_empty() {
+                    return Err(format!("no abi file found {}", abi_path).into());
+                }
+
+                let abi: AbiDefinition = serde_json::from_slice(&abi)
+                    .map_err(|e| format!("failed to parse abi file {}: {}", abi_path, e))?;
+
+                abi_bytes = Bytes::new(abi.pack()?);
+            }
+
+            let response = push_actions(
+                api_client,
+                keosd_client,
+                vec![Action {
+                    account: PULSE_NAME,
+                    name: SETABI_NAME,
+                    authorization: vec![PermissionLevel {
+                        actor: account.into(),
+                        permission: ACTIVE_NAME.into(),
+                    }],
+                    data: SetAbi {
+                        account: account.into(),
+                        abi: Arc::new(abi_bytes),
                     }
                     .try_into()?,
                 }],

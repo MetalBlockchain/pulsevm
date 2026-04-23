@@ -3153,6 +3153,7 @@ dependencies = [
  "pulsevm_core",
  "pulsevm_crypto",
  "pulsevm_keosd_client",
+ "pulsevm_serialization",
  "pulsevm_time",
  "rpassword",
  "serde",

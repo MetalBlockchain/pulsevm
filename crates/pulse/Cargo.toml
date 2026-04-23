@@ -22,4 +22,5 @@ pulsevm_api_types = { path = "../pulsevm_api_types" }
 pulsevm_core = { path = "../pulsevm_core" }
 pulsevm_crypto = { path = "../pulsevm_crypto" }
 pulsevm_keosd_client = { path = "../pulsevm_keosd_client" }
+pulsevm_serialization = { path = "../pulsevm_serialization" }
 pulsevm_time = { path = "../pulsevm_time" }
