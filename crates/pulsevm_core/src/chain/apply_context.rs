@@ -280,11 +280,10 @@ impl ApplyContext {
 
     pub fn add_ram_usage(&mut self, account: &Name, ram_delta: i64) -> Result<(), ChainError> {
         let mut inner = self.inner.write()?;
-        inner
-            .account_ram_deltas
-            .entry(account.clone())
-            .and_modify(|d| *d += ram_delta)
-            .or_insert(ram_delta);
+        let entry = inner.account_ram_deltas.entry(account.clone()).or_insert(0);
+        *entry = entry.checked_add(ram_delta).ok_or_else(|| {
+            ChainError::ActionValidationError(format!("RAM usage overflow for account {}", account))
+        })?;
         Ok(())
     }
 
