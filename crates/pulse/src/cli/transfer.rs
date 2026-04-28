@@ -1,7 +1,9 @@
 use std::{str::FromStr, sync::Arc};
 
 use pulsevm_api_client::PulseVmClient;
-use pulsevm_core::{ACTIVE_NAME, asset::Asset, authority::PermissionLevel, name::Name, transaction::Action};
+use pulsevm_core::{
+    ACTIVE_NAME, asset::Asset, authority::PermissionLevel, name::Name, transaction::Action,
+};
 use pulsevm_crypto::Bytes;
 use pulsevm_keosd_client::KeosdClient;
 use pulsevm_proc_macros::{NumBytes, Read, Write};
@@ -62,6 +64,9 @@ pub async fn handle(
         }],
     )
     .await?;
-    println!("Transferred {} from {} to {}: {}", amount, sender, recipient, response);
+    println!(
+        "Transferred {} from {} to {}: {}",
+        amount, sender, recipient, response
+    );
     Ok(())
 }
