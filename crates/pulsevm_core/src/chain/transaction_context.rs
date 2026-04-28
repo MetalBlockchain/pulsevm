@@ -398,7 +398,11 @@ impl TransactionContext {
 
     pub fn add_net_usage(&self, net_usage: u64) -> Result<(), ChainError> {
         let mut inner = self.inner.write()?;
-        inner.trace.net_usage += net_usage;
+        inner.trace.net_usage = inner
+            .trace
+            .net_usage
+            .checked_add(net_usage)
+            .ok_or_else(|| ChainError::ActionValidationError("net usage overflow".to_string()))?;
         Ok(())
     }
 
