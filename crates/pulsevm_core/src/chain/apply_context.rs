@@ -229,17 +229,19 @@ impl ApplyContext {
 
         for auth in inner.action.authorization() {
             if let Some(perm) = permission {
-                if auth.actor == *account && auth.permission == perm {
+                if auth.actor == account.as_u64() && auth.permission == perm.as_u64() {
                     return Ok(());
                 }
-
-                return Err(ChainError::MissingAuthError(format!(
-                    "missing authority of {}/{}",
-                    account, perm
-                )));
-            } else if auth.actor == account.as_u64() {
+            } else if permission == None && auth.actor == account.as_u64() {
                 return Ok(());
             }
+        }
+
+        if let Some(perm) = permission {
+            return Err(ChainError::MissingAuthError(format!(
+                "missing authority of {}/{}",
+                account, perm
+            )));
         }
 
         return Err(ChainError::MissingAuthError(format!(
