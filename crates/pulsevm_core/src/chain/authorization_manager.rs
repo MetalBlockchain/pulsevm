@@ -390,6 +390,14 @@ impl AuthorizationManager {
         )?;
         let result = db.get_permission_by_actor_and_permission(actor, permission)?;
 
+        if result.is_null() {
+            return Err(ChainError::AuthorizationError(format!(
+                "permission {}/{} does not exist",
+                Name::new(actor),
+                Name::new(permission)
+            )));
+        }
+
         Ok(unsafe { &*result })
     }
 
