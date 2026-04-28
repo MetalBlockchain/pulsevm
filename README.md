@@ -29,8 +29,8 @@ This process takes around `200 milliseconds` depending on various factors.
   - Mac OSX: only for development
 - zstd
   - For Mac: `brew install zstd`
-- LLVM 18: used to compile and run WebAssembly contracts
-  - For Mac: `brew install llvm@18`
+- LLVM 21: used to compile and run WebAssembly contracts (CI installs `llvm-21-dev libpolly-21-dev` and exports `LLVM_SYS_211_PREFIX=/usr/lib/llvm-21`)
+  - For Mac: `brew install llvm@21`
 - LibFFI
   - For Mac: `brew install libffi`
 
@@ -59,7 +59,7 @@ Make sure `METALGO_EXEC_PATH` points to a compiled `metalgo` binary. The `--plug
 metal-network-runner control start --log-level info \
 --endpoint="0.0.0.0:8080" \
 --number-of-nodes=5 \
---metalgo-path ${METALGO_EXEC_PATH} \
+--avalanchego-path ${METALGO_EXEC_PATH} \
 --plugin-dir $(pwd)/build \
 --blockchain-specs '[{"vm_name": "pulsevm", "genesis": "/Users/glennmarien/Documents/MetalBlockchain/pulsevm/genesis.json"}]'
 ```
