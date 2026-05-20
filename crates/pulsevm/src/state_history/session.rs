@@ -138,10 +138,21 @@ impl Session {
                                     }
 
                                     // backpressure window
-                                    if budget.fetch_sub(1, Ordering::SeqCst) <= 0 {
-                                        budget.fetch_add(1, Ordering::SeqCst);
+                                    let current = budget.load(Ordering::SeqCst);
+                                    if current <= 0 {
                                         tokio::time::sleep(Duration::from_millis(3)).await;
                                         continue;
+                                    }
+                                    if budget
+                                        .compare_exchange(
+                                            current,
+                                            current - 1,
+                                            Ordering::SeqCst,
+                                            Ordering::SeqCst,
+                                        )
+                                        .is_ok()
+                                    {
+                                        break;
                                     }
 
                                     match make_block_response_for(ctrl.clone(), &request, next)
@@ -159,6 +170,12 @@ impl Session {
                                                         break;
                                                     }
                                                     next = next.saturating_add(1);
+
+                                                    if request.end_block_num > 0
+                                                        && next > request.end_block_num
+                                                    {
+                                                        break;
+                                                    }
                                                 }
                                                 Err(_) => {
                                                     // give window slot back
