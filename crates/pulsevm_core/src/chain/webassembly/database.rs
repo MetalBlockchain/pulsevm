@@ -210,3 +210,9 @@ pub fn db_idx64_update(
     context.db_idx64_update(itr, &payer.into(), secondary)?;
     Ok(())
 }
+
+pub fn db_idx64_remove(mut env: FunctionEnvMut<WasmContext>, itr: i32) -> Result<(), RuntimeError> {
+    let context = env.data_mut().apply_context_mut();
+    context.db_idx64_remove(itr)?;
+    Ok(())
+}

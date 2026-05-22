@@ -647,6 +647,17 @@ impl ApplyContext {
         Ok(())
     }
 
+    pub fn db_idx64_remove(&mut self, iterator: i32) -> Result<(), ChainError> {
+        {
+            let mut inner = self.inner.write()?;
+            self.db.db_idx64_remove(&mut inner.index64_cache, iterator, self.receiver.as_u64())?;
+        }
+        
+        self.update_db_usage(&Name::new(self.receiver.as_u64()), -(billable_size_v::<Index64Object>() as i64))?;
+
+        Ok(())
+    }
+
     pub fn find_table(
         &self,
         code: u64,

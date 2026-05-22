@@ -393,6 +393,15 @@ pub mod ffi {
             table: u64,
             id: u64,
         ) -> Result<i32>;
+        
+        // Index 64 methods
+        pub fn db_idx64_remove(
+            self: Pin<&mut Database>,
+            keyval_cache: Pin<&mut CxxIndex64IteratorCache>,
+            iterator: i32,
+            receiver: u64,
+        ) -> Result<()>;
+
         pub fn remove_permission(
             self: Pin<&mut Database>,
             permission: &PermissionObject,

@@ -999,6 +999,23 @@ public:
         return keyval_cache.add( *itr );
     }
 
+    void db_idx64_remove( iterator_cache<index64_object>& keyval_cache, int iterator, u_int64_t receiver ) {
+        const index64_object& obj = keyval_cache.get( iterator );
+        const auto& table_obj = keyval_cache.get_table( obj.t_id );
+        EOS_ASSERT( table_obj.code == name(receiver), table_access_violation, "db access violation" );
+
+        this->modify( table_obj, [&]( auto& t ) {
+            --t.count;
+        });
+        this->remove( obj );
+
+        if (table_obj.count == 0) {
+            this->remove_table(table_obj);
+        }
+
+        keyval_cache.remove( iterator );
+    }
+
     uint64_t get_virtual_block_cpu_limit() const {
         const auto& state = this->get<resource_limits::resource_limits_state_object>();
         return state.virtual_cpu_limit;

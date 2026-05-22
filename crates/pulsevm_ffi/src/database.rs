@@ -8,11 +8,9 @@ use pulsevm_error::ChainError;
 use pulsevm_name::Name;
 
 use crate::{
-    AccountMetadataObject, KeyValueObject,
-    bridge::ffi::{
+    AccountMetadataObject, Index64IteratorCache, KeyValueObject, bridge::ffi::{
         self, Authority, CxxDigest, CxxGenesisState, CxxTimePoint, ElasticLimitParameters, Index64Object, TableObject, get_account_info_with_core_symbol, get_account_info_without_core_symbol, get_currency_balance_with_symbol, get_currency_balance_without_symbol, get_currency_stats, get_table_by_scope, get_table_rows
-    },
-    iterator_cache::KeyValueIteratorCache,
+    }, iterator_cache::KeyValueIteratorCache
 };
 
 #[derive(Clone)]
@@ -692,6 +690,20 @@ impl Database {
 
         pinned
             .db_remove_i64(keyval_cache.pin_mut(), iterator, receiver)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
+    pub fn db_idx64_remove(
+        &mut self,
+        keyval_cache: &mut Index64IteratorCache,
+        iterator: i32,
+        receiver: u64,
+    ) -> Result<(), ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .db_idx64_remove(keyval_cache.pin_mut(), iterator, receiver)
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 
