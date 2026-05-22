@@ -579,6 +579,23 @@ public:
         return obj;
     }
 
+    const index64_object& create_index64_object( const table_id_object& tab, uint64_t payer, uint64_t id, uint64_t secondary ) {
+        auto tableid = tab.id;
+        EOS_ASSERT( payer != 0, invalid_table_payer, "must specify a valid account to pay for new record" );
+        const auto& obj = this->create<index64_object>( [&]( auto& o ) {
+            o.t_id          = tableid;
+            o.primary_key   = id;
+            o.secondary_key = secondary;
+            o.payer         = name(payer);
+        });
+
+        this->modify( tab, [&]( auto& t ) {
+            ++t.count;
+        });
+
+        return obj;
+    }
+
     void update_key_value_object( const key_value_object& obj, uint64_t payer, rust::Slice<const std::uint8_t> buffer ) {
         this->modify( obj, [&]( auto& o ) {
             o.value.assign( buffer.data(), buffer.size() );

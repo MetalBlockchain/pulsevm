@@ -10,10 +10,7 @@ use pulsevm_name::Name;
 use crate::{
     AccountMetadataObject, KeyValueObject,
     bridge::ffi::{
-        self, Authority, CxxDigest, CxxGenesisState, CxxTimePoint, ElasticLimitParameters,
-        TableObject, get_account_info_with_core_symbol, get_account_info_without_core_symbol,
-        get_currency_balance_with_symbol, get_currency_balance_without_symbol, get_currency_stats,
-        get_table_by_scope, get_table_rows,
+        self, Authority, CxxDigest, CxxGenesisState, CxxTimePoint, ElasticLimitParameters, Index64Object, TableObject, get_account_info_with_core_symbol, get_account_info_without_core_symbol, get_currency_balance_with_symbol, get_currency_balance_without_symbol, get_currency_stats, get_table_by_scope, get_table_rows
     },
     iterator_cache::KeyValueIteratorCache,
 };
@@ -496,6 +493,22 @@ impl Database {
             .create_key_value_object(table, payer, id, buffer)
             .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
         Ok(res as *const KeyValueObject)
+    }
+
+    pub fn create_index64_object(
+        &mut self,
+        table: &TableObject,
+        payer: u64,
+        id: u64,
+        secondary_key: u64,
+    ) -> Result<*const Index64Object, ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        let res = pinned
+            .create_index64_object(table, payer, id, secondary_key)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        Ok(res as *const Index64Object)
     }
 
     pub fn update_key_value_object(

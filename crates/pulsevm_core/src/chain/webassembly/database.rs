@@ -171,3 +171,23 @@ pub fn db_end_i64(
     let context = env.data_mut().apply_context_mut();
     Ok(context.db_end_i64(code.into(), scope.into(), table.into())?)
 }
+
+pub fn db_idx64_store(
+    mut env: FunctionEnvMut<WasmContext>,
+    scope: u64,
+    table: u64,
+    payer: u64,
+    id: u64,
+    secondary_ptr: WasmPtr<u64>,
+) -> Result<i32, RuntimeError> {
+    let (env_data, store) = env.data_and_store_mut();
+    let memory = env_data
+        .memory()
+        .as_ref()
+        .expect("Wasm memory not initialized");
+    let view = memory.view(&store);
+    let secondary: u64 = secondary_ptr.deref(&view).read()?;
+    let context = env_data.apply_context_mut();
+    let result = context.db_idx64_store(scope, table, payer, id, secondary)?;
+    Ok(result)
+}

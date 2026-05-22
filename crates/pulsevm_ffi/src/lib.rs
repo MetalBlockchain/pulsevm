@@ -4,14 +4,12 @@ mod iterator_cache;
 mod objects;
 mod types;
 
-use pulsevm_error::ChainError;
-
 pub use crate::bridge::ffi::DatabaseOpenFlags;
 pub use crate::bridge::ffi::{
     AccountMetadataObject, AccountObject, Authority, CodeObject, ElasticLimitParameters,
     GlobalPropertyObject, KeyValueObject, KeyWeight, PermissionLevel, PermissionLevelWeight,
     PermissionLinkObject, PermissionObject, PermissionUsageObject, Ratio, TableId, TableObject,
-    WaitWeight,
+    WaitWeight, Index64Object,
 };
 pub use crate::bridge::ffi::{
     CxxBlockTimestamp, CxxChainConfig, CxxDigest, CxxGenesisState, CxxMicroseconds, CxxPrivateKey,
@@ -25,4 +23,4 @@ pub use crate::bridge::ffi::{
     random_private_key_r1, recover_public_key_from_signature, sign_digest_with_private_key,
 };
 pub use crate::database::Database;
-pub use crate::iterator_cache::KeyValueIteratorCache;
+pub use crate::iterator_cache::{KeyValueIteratorCache, Index64IteratorCache};

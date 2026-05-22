@@ -25,12 +25,7 @@ use crate::{
         name::Name,
         transaction::Action,
         webassembly::{
-            assert_sha224, assert_sha256, assert_sha512, check_transaction_authorization,
-            current_time, db_end_i64, db_find_i64, db_get_i64, db_lowerbound_i64, db_next_i64,
-            db_previous_i64, db_remove_i64, db_store_i64, db_update_i64, db_upperbound_i64,
-            get_resource_limits, is_privileged, memmove, pulse_assert, read_action_data,
-            require_auth2, require_recipient, set_action_return_value, set_privileged,
-            set_resource_limits, sha224, sha256, sha512,
+            assert_sha224, assert_sha256, assert_sha512, check_transaction_authorization, current_time, db_end_i64, db_find_i64, db_get_i64, db_idx64_store, db_lowerbound_i64, db_next_i64, db_previous_i64, db_remove_i64, db_store_i64, db_update_i64, db_upperbound_i64, get_resource_limits, is_privileged, memmove, pulse_assert, read_action_data, require_auth2, require_recipient, set_action_return_value, set_privileged, set_resource_limits, sha224, sha256, sha512
         },
     },
 };
@@ -244,6 +239,7 @@ impl WasmRuntime {
                 "db_end_i64" => Function::new_typed_with_env(&mut store, &env, db_end_i64),
                 "db_lowerbound_i64" => Function::new_typed_with_env(&mut store, &env, db_lowerbound_i64),
                 "db_upperbound_i64" => Function::new_typed_with_env(&mut store, &env, db_upperbound_i64),
+                "db_idx64_store" => Function::new_typed_with_env(&mut store, &env, db_idx64_store),
                 "pulse_assert" => Function::new_typed_with_env(&mut store, &env, pulse_assert),
                 "current_time" => Function::new_typed_with_env(&mut store, &env, current_time),
                 "sha224" => Function::new_typed_with_env(&mut store, &env, sha224),

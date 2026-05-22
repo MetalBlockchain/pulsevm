@@ -87,7 +87,9 @@ class iterator_cache {
 }; /// class iterator_cache
 
 using CxxKeyValueIteratorCache = iterator_cache<key_value_object>;
+using CxxIndex64IteratorCache = iterator_cache<index64_object>;
 
 std::unique_ptr<CxxKeyValueIteratorCache> new_key_value_iterator_cache();
+std::unique_ptr<CxxIndex64IteratorCache> new_index64_iterator_cache();
 
 }

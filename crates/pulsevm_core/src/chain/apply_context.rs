@@ -9,7 +9,7 @@ use pulsevm_billable_size::billable_size_v;
 use pulsevm_crypto::Bytes;
 use pulsevm_error::ChainError;
 use pulsevm_ffi::{
-    AccountMetadataObject, Database, KeyValueIteratorCache, KeyValueObject, TableObject,
+    AccountMetadataObject, Database, Index64IteratorCache, Index64Object, KeyValueIteratorCache, KeyValueObject, TableObject
 };
 use spdlog::debug;
 
@@ -38,6 +38,7 @@ struct ApplyContextInner {
     inline_actions: Vec<u32>,               // List of inline actions
     recurse_depth: u32,                     // The current recursion depth
     keyval_cache: KeyValueIteratorCache,    // Cache for key-value iterators
+    index64_cache: Index64IteratorCache,    // Cache for index64 iterators
     cpu_limit: i64,                         // CPU limit for the current action
 }
 
@@ -88,6 +89,7 @@ impl ApplyContext {
                 inline_actions: Vec::new(),
                 recurse_depth: depth,
                 keyval_cache: KeyValueIteratorCache::new(),
+                index64_cache: Index64IteratorCache::new(),
                 cpu_limit,
             })),
         })
@@ -575,6 +577,39 @@ impl ApplyContext {
         let mut inner = self.inner.write()?;
         self.db
             .db_upperbound_i64(&mut inner.keyval_cache, code, scope, table, primary)
+    }
+
+    pub fn db_idx64_store(
+        &mut self,
+        scope: u64,
+        table: u64,
+        payer: u64,
+        primary_key: u64,
+        secondary_key: u64,
+    ) -> Result<i32, ChainError> {
+        let table = self.find_or_create_table(*self.receiver, scope, table, payer)?;
+        let table = unsafe { &*table };
+        pulse_assert(
+            payer != 0,
+            ChainError::TransactionError(format!(
+                "must specify a valid account to pay for new record"
+            )),
+        )?;
+
+        let res = {
+            let mut inner = self.inner.write()?;
+            let obj =
+                self.db
+                    .create_index64_object(table, payer, primary_key, secondary_key)?;
+            let obj = unsafe { &*obj };
+            inner.index64_cache.cache_table(&table)?;
+            inner.index64_cache.add(obj)?
+        };
+
+        let billable_size = billable_size_v::<Index64Object>() as i64;
+        self.update_db_usage(&payer.into(), billable_size)?;
+
+        Ok(res)
     }
 
     pub fn find_table(

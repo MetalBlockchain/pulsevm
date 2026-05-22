@@ -148,6 +148,9 @@ pub mod ffi {
         pub fn get_payer(self: &KeyValueObject) -> &CxxName;
         pub fn get_value(self: &KeyValueObject) -> &CxxSharedBlob;
 
+        #[cxx_name = "index64_object"]
+        type Index64Object;
+
         // Methods on database
         pub fn flush(self: Pin<&mut Database>) -> Result<()>;
         pub fn undo(self: Pin<&mut Database>);
@@ -294,6 +297,13 @@ pub mod ffi {
             id: u64,
             buffer: &[u8],
         ) -> Result<&KeyValueObject>;
+        pub fn create_index64_object(
+            self: Pin<&mut Database>,
+            table: &TableObject,
+            payer: u64,
+            id: u64,
+            secondary_key: u64,
+        ) -> Result<&Index64Object>;
         pub fn update_key_value_object(
             self: Pin<&mut Database>,
             obj: &KeyValueObject,
@@ -443,6 +453,28 @@ pub mod ffi {
         pub fn get(self: &CxxKeyValueIteratorCache, iterator: i32) -> Result<&KeyValueObject>;
         pub fn remove(self: Pin<&mut CxxKeyValueIteratorCache>, iterator: i32) -> Result<()>;
         pub fn add(self: Pin<&mut CxxKeyValueIteratorCache>, obj: &KeyValueObject) -> Result<i32>;
+
+        pub type CxxIndex64IteratorCache;
+        pub fn new_index64_iterator_cache() -> UniquePtr<CxxIndex64IteratorCache>;
+        pub fn cache_table(
+            self: Pin<&mut CxxIndex64IteratorCache>,
+            table: &TableObject,
+        ) -> Result<i32>;
+        pub fn get_table(
+            self: &CxxIndex64IteratorCache,
+            table_id: &TableId,
+        ) -> Result<&TableObject>;
+        pub fn get_end_iterator_by_table_id(
+            self: &CxxIndex64IteratorCache,
+            table_id: &TableId,
+        ) -> Result<i32>;
+        pub fn find_table_by_end_iterator(
+            self: &CxxIndex64IteratorCache,
+            ei: i32,
+        ) -> Result<*const TableObject>;
+        pub fn get(self: &CxxIndex64IteratorCache, iterator: i32) -> Result<&Index64Object>;
+        pub fn remove(self: Pin<&mut CxxIndex64IteratorCache>, iterator: i32) -> Result<()>;
+        pub fn add(self: Pin<&mut CxxIndex64IteratorCache>, obj: &Index64Object) -> Result<i32>;
 
         pub type CxxBlockTimestamp;
         pub fn to_time_point(self: &CxxBlockTimestamp) -> SharedPtr<CxxTimePoint>;
