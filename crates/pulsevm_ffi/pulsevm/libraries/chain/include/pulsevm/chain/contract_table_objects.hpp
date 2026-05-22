@@ -102,6 +102,11 @@ namespace pulsevm { namespace chain {
          uint64_t      primary_key; //< primary_key should not be changed within a chainbase modifier lambda
          name          payer;
          SecondaryKey  secondary_key; //< secondary_key should not be changed within a chainbase modifier lambda
+
+         const table_id& get_table_id() const { return t_id; }
+         uint64_t get_primary_key() const { return primary_key; }
+         SecondaryKey get_secondary_key() const { return secondary_key; }
+         const name& get_payer() const { return payer; }
       };
 
 

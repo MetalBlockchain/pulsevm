@@ -525,6 +525,20 @@ impl Database {
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 
+    pub fn update_index64_object(
+        &mut self,
+        obj: &Index64Object,
+        payer: u64,
+        secondary_key: u64,
+    ) -> Result<(), ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .update_index64_object(obj, payer, secondary_key)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
     pub fn remove_table(&mut self, table: &TableObject) -> Result<(), ChainError> {
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();

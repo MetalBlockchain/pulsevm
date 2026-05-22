@@ -603,6 +603,13 @@ public:
         });
     }
 
+    void update_index64_object( const index64_object& obj, uint64_t payer, uint64_t secondary ) {
+        this->modify( obj, [&]( auto& o ) {
+            o.secondary_key = secondary;
+            o.payer = name(payer);
+        });
+    }
+
     void remove_table( const table_id_object& table_obj ) {
         this->remove( table_obj );
     }

@@ -191,3 +191,22 @@ pub fn db_idx64_store(
     let result = context.db_idx64_store(scope, table, payer, id, secondary)?;
     Ok(result)
 }
+
+pub fn db_idx64_update(
+    mut env: FunctionEnvMut<WasmContext>,
+    itr: i32,
+    payer: u64,
+    secondary_ptr: WasmPtr<u64>,
+) -> Result<(), RuntimeError> {
+    let (env_data, store) = env.data_and_store_mut();
+    let memory = env_data
+        .memory()
+        .as_ref()
+        .expect("Wasm memory not initialized");
+    let view = memory.view(&store);
+    let secondary: u64 = secondary_ptr.deref(&view).read()?;
+
+    let context = env_data.apply_context_mut();
+    context.db_idx64_update(itr, &payer.into(), secondary)?;
+    Ok(())
+}

@@ -150,6 +150,10 @@ pub mod ffi {
 
         #[cxx_name = "index64_object"]
         type Index64Object;
+        pub fn get_table_id(self: &Index64Object) -> &TableId;
+        pub fn get_primary_key(self: &Index64Object) -> u64;
+        pub fn get_secondary_key(self: &Index64Object) -> u64;
+        pub fn get_payer(self: &Index64Object) -> &CxxName;
 
         // Methods on database
         pub fn flush(self: Pin<&mut Database>) -> Result<()>;
@@ -309,6 +313,12 @@ pub mod ffi {
             obj: &KeyValueObject,
             payer: u64,
             buffer: &[u8],
+        ) -> Result<()>;
+        pub fn update_index64_object(
+            self: Pin<&mut Database>,
+            obj: &Index64Object,
+            payer: u64,
+            secondary_key: u64,
         ) -> Result<()>;
         pub fn remove_table(self: Pin<&mut Database>, table: &TableObject) -> Result<()>;
         pub fn is_account(self: &Database, account: u64) -> Result<bool>;

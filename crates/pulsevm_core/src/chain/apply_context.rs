@@ -612,6 +612,41 @@ impl ApplyContext {
         Ok(res)
     }
 
+    pub fn db_idx64_update(
+        &mut self,
+        iterator: i32,
+        payer: &Name,
+        secondary: u64,
+    ) -> Result<(), ChainError> {
+        let payer = payer.as_u64();
+        let billing_size = billable_size_v::<Index64Object>() as i64;
+        let (old_payer, new_payer) = {
+            let inner = self.inner.read()?;
+            let obj = inner.index64_cache.get(iterator)?;
+            let table_obj = inner.index64_cache.get_table(obj.get_table_id())?;
+            pulse_assert(
+                table_obj.get_code().to_uint64_t() == self.receiver.as_u64(),
+                ChainError::TransactionError(format!("db access violation",)),
+            )?;
+            let old_payer = obj.get_payer().to_uint64_t();
+            let new_payer = if payer == 0 {
+                obj.get_payer().to_uint64_t()
+            } else {
+                payer
+            };
+            self.db
+                .update_index64_object(obj, new_payer, secondary)?;
+            (old_payer, new_payer)
+        };
+
+        if old_payer != new_payer {
+            self.update_db_usage(&Name::new(old_payer), -billing_size)?;
+            self.update_db_usage(&Name::new(new_payer), billing_size)?;
+        }
+
+        Ok(())
+    }
+
     pub fn find_table(
         &self,
         code: u64,
