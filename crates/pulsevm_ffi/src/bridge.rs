@@ -401,6 +401,61 @@ pub mod ffi {
             iterator: i32,
             receiver: u64,
         ) -> Result<()>;
+        pub fn db_idx64_find_secondary(
+            self: Pin<&mut Database>,
+            keyval_cache: Pin<&mut CxxIndex64IteratorCache>,
+            code: u64,
+            scope: u64,
+            table: u64,
+            secondary_key: u64,
+            primary_key: &mut u64,
+        ) -> Result<i32>;
+        pub fn db_idx64_find_primary(
+            self: Pin<&mut Database>,
+            keyval_cache: Pin<&mut CxxIndex64IteratorCache>,
+            code: u64,
+            scope: u64,
+            table: u64,
+            secondary_key: &mut u64,
+            primary_key: u64,
+        ) -> Result<i32>;
+        pub fn db_idx64_lowerbound(
+            self: Pin<&mut Database>,
+            keyval_cache: Pin<&mut CxxIndex64IteratorCache>,
+            code: u64,
+            scope: u64,
+            table: u64,
+            secondary_key: &mut u64,
+            primary_key: &mut u64,
+        ) -> Result<i32>;
+        pub fn db_idx64_upperbound(
+            self: Pin<&mut Database>,
+            keyval_cache: Pin<&mut CxxIndex64IteratorCache>,
+            code: u64,
+            scope: u64,
+            table: u64,
+            secondary_key: &mut u64,
+            primary_key: &mut u64,
+        ) -> Result<i32>;
+        pub fn db_idx64_end(
+            self: Pin<&mut Database>,
+            keyval_cache: Pin<&mut CxxIndex64IteratorCache>,
+            code: u64,
+            scope: u64,
+            table: u64,
+        ) -> Result<i32>;
+        pub fn db_idx64_next(
+            self: Pin<&mut Database>,
+            keyval_cache: Pin<&mut CxxIndex64IteratorCache>,
+            iterator: i32,
+            primary_key: &mut u64,
+        ) -> Result<i32>;
+        pub fn db_idx64_previous(
+            self: Pin<&mut Database>,
+            keyval_cache: Pin<&mut CxxIndex64IteratorCache>,
+            iterator: i32,
+            primary_key: &mut u64,
+        ) -> Result<i32>;
 
         pub fn remove_permission(
             self: Pin<&mut Database>,

@@ -1016,6 +1016,122 @@ public:
         keyval_cache.remove( iterator );
     }
 
+    int db_idx64_find_secondary( iterator_cache<index64_object>& keyval_cache, uint64_t code, uint64_t scope, uint64_t table, uint64_t secondary, uint64_t& primary ) {
+        auto tab = this->find_table( code, scope, table );
+        if( !tab ) return -1;
+
+        auto table_end_itr = keyval_cache.cache_table( *tab );
+
+        const auto* obj = this->find<index64_object, by_secondary>( boost::make_tuple( tab->id, secondary ) );
+        if( !obj ) return table_end_itr;
+
+        primary = obj->primary_key;
+
+        return keyval_cache.add( *obj );
+    }
+
+    int db_idx64_find_primary( iterator_cache<index64_object>& keyval_cache, uint64_t code, uint64_t scope, uint64_t table, uint64_t& secondary, uint64_t primary ) {
+        auto tab = this->find_table( code, scope, table );
+        if( !tab ) return -1;
+
+        auto table_end_itr = keyval_cache.cache_table( *tab );
+
+        const auto* obj = this->find<index64_object, by_primary>( boost::make_tuple( tab->id, primary ) );
+        if( !obj ) return table_end_itr;
+
+        secondary = obj->secondary_key;
+
+        return keyval_cache.add( *obj );
+    }
+
+    int db_idx64_lowerbound( iterator_cache<index64_object>& keyval_cache, uint64_t code, uint64_t scope, uint64_t table, uint64_t& secondary, uint64_t& primary ) {
+        auto tab = this->find_table( code, scope, table );
+        if( !tab ) return -1;
+
+        auto table_end_itr = keyval_cache.cache_table( *tab );
+
+        const auto& idx = this->get_index<typename chainbase::get_index_type<index64_object>::type, by_secondary>();
+        auto itr = idx.lower_bound( boost::make_tuple( tab->id, secondary ) );
+        if( itr == idx.end() ) return table_end_itr;
+        if( itr->t_id != tab->id ) return table_end_itr;
+
+        primary = itr->primary_key;
+        secondary = itr->secondary_key;
+
+        return keyval_cache.add( *itr );
+    }
+
+    int db_idx64_upperbound( iterator_cache<index64_object>& keyval_cache, uint64_t code, uint64_t scope, uint64_t table, uint64_t& secondary, uint64_t& primary ) {
+        auto tab = this->find_table( code, scope, table );
+        if( !tab ) return -1;
+
+        auto table_end_itr = keyval_cache.cache_table( *tab );
+
+        const auto& idx = this->get_index<typename chainbase::get_index_type<index64_object>::type, by_secondary>();
+        auto itr = idx.upper_bound( boost::make_tuple( tab->id, secondary ) );
+        if( itr == idx.end() ) return table_end_itr;
+        if( itr->t_id != tab->id ) return table_end_itr;
+
+        primary = itr->primary_key;
+        secondary = itr->secondary_key;
+
+        return keyval_cache.add( *itr );
+    }
+
+    int db_idx64_end( iterator_cache<index64_object>& keyval_cache, uint64_t code, uint64_t scope, uint64_t table ) {
+        auto tab = this->find_table( code, scope, table );
+        if( !tab ) return -1;
+
+        return keyval_cache.cache_table( *tab );
+    }
+
+    int db_idx64_next( iterator_cache<index64_object>& keyval_cache, int iterator, uint64_t& primary ) {
+        if( iterator < -1 ) return -1; // cannot increment past end iterator of index
+
+        const auto& obj = keyval_cache.get(iterator); // Check for iterator != -1 happens in this call
+        const auto& idx = this->get_index<typename chainbase::get_index_type<index64_object>::type, by_secondary>();
+
+        auto itr = idx.iterator_to(obj);
+        ++itr;
+
+        if( itr == idx.end() || itr->t_id != obj.t_id ) return keyval_cache.get_end_iterator_by_table_id(obj.t_id);
+
+        primary = itr->primary_key;
+        return keyval_cache.add(*itr);
+    }
+
+    int db_idx64_previous( iterator_cache<index64_object>& keyval_cache, int iterator, uint64_t& primary ) {
+        const auto& idx = this->get_index<typename chainbase::get_index_type<index64_object>::type, by_secondary>();
+
+        if( iterator < -1 ) // is end iterator
+        {
+            auto tab = keyval_cache.find_table_by_end_iterator(iterator);
+            EOS_ASSERT( tab, invalid_table_iterator, "not a valid end iterator" );
+
+            auto itr = idx.upper_bound(tab->id);
+            if( idx.begin() == idx.end() || itr == idx.begin() ) return -1; // Empty index
+
+            --itr;
+
+            if( itr->t_id != tab->id ) return -1; // Empty index
+
+            primary = itr->primary_key;
+            return keyval_cache.add(*itr);
+        }
+
+        const auto& obj = keyval_cache.get(iterator); // Check for iterator != -1 happens in this call
+
+        auto itr = idx.iterator_to(obj);
+        if( itr == idx.begin() ) return -1; // cannot decrement past beginning iterator of index
+
+        --itr;
+
+        if( itr->t_id != obj.t_id ) return -1; // cannot decrement past beginning iterator of index
+
+        primary = itr->primary_key;
+        return keyval_cache.add(*itr);
+    }
+
     uint64_t get_virtual_block_cpu_limit() const {
         const auto& state = this->get<resource_limits::resource_limits_state_object>();
         return state.virtual_cpu_limit;

@@ -658,6 +658,81 @@ impl ApplyContext {
         Ok(())
     }
 
+    pub fn db_idx64_find_secondary(
+        &mut self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        secondary: u64,
+        primary: &mut u64,
+    ) -> Result<i32, ChainError> {
+        let mut inner = self.inner.write()?;
+        self.db
+            .db_idx64_find_secondary(&mut inner.index64_cache, code, scope, table, secondary, primary)
+    }
+
+    pub fn db_idx64_find_primary(
+        &mut self,
+         code: u64,
+         scope: u64,
+         table: u64,
+         secondary: &mut u64,
+         primary: u64,
+    ) -> Result<i32, ChainError> {
+        let mut inner = self.inner.write()?;
+        self.db
+            .db_idx64_find_primary(&mut inner.index64_cache, code, scope, table, secondary, primary)
+    }
+
+    pub fn db_idx64_lowerbound(
+        &mut self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        secondary: &mut u64,
+        primary: &mut u64,
+    ) -> Result<i32, ChainError> {
+        let mut inner = self.inner.write()?;
+        self.db
+            .db_idx64_lowerbound(&mut inner.index64_cache, code, scope, table, secondary, primary)
+    }
+
+    pub fn db_idx64_upperbound(
+        &mut self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        secondary: &mut u64,
+        primary: &mut u64,
+    ) -> Result<i32, ChainError> {
+        let mut inner = self.inner.write()?;
+        self.db
+            .db_idx64_upperbound(&mut inner.index64_cache, code, scope, table, secondary, primary)
+    }
+
+    pub fn db_idx64_end(
+        &mut self,
+        code: u64,
+        scope: u64,
+        table: u64,
+    ) -> Result<i32, ChainError> {
+        let mut inner = self.inner.write()?;
+        self.db
+            .db_idx64_end(&mut inner.index64_cache, code, scope, table)
+    }
+
+    pub fn db_idx64_next(&mut self, iterator: i32, primary: &mut u64) -> Result<i32, ChainError> {
+        let mut inner = self.inner.write()?;
+        self.db
+            .db_idx64_next(&mut inner.index64_cache, iterator, primary)
+    }
+
+    pub fn db_idx64_previous(&mut self, iterator: i32, primary: &mut u64) -> Result<i32, ChainError> {
+        let mut inner = self.inner.write()?;
+        self.db
+            .db_idx64_previous(&mut inner.index64_cache, iterator, primary)
+    }
+
     pub fn find_table(
         &self,
         code: u64,
