@@ -206,13 +206,6 @@ impl ApplyContext {
     pub fn finalize_trace(&self, receipt: ActionReceipt) -> Result<(), ChainError> {
         let inner = self.inner.read()?;
 
-        debug!(
-            "took {} us to execute action {}@{}",
-            Utc::now().timestamp_micros() - inner.start,
-            inner.action.account(),
-            inner.action.name()
-        );
-
         self.trx_context
             .modify_action_trace(self.action_ordinal, |trace| {
                 trace.receipt = Some(receipt);

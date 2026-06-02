@@ -237,7 +237,6 @@ impl Vm for VirtualMachine {
         &self,
         request: Request<vm::SetStateRequest>,
     ) -> Result<tonic::Response<vm::SetStateResponse>, Status> {
-        debug!("updating state to {:?}", request.get_ref().state);
         let controller = self.controller.clone();
         let mut controller = controller.write().await;
         let last_accepted_block_id = controller.last_accepted_block().id().map_err(|e| {
@@ -597,7 +596,6 @@ impl Vm for VirtualMachine {
         &self,
         request: Request<vm::GetAncestorsRequest>,
     ) -> Result<tonic::Response<vm::GetAncestorsResponse>, Status> {
-        debug!("received get_ancestors request: {:?}", request);
         let controller = self.controller.clone();
         let controller = controller.read().await;
         let deadline = Instant::now()

@@ -1,6 +1,6 @@
 use wasmer::{FunctionEnvMut, RuntimeError, WasmPtr};
 
-use crate::chain::wasm_runtime::WasmContext;
+use crate::chain::{wasm_runtime::WasmContext, webassembly::{read_u64, write_u64}};
 
 pub fn db_find_i64(
     mut env: FunctionEnvMut<WasmContext>,
@@ -186,7 +186,7 @@ pub fn db_idx64_store(
         .as_ref()
         .expect("Wasm memory not initialized");
     let view = memory.view(&store);
-    let secondary: u64 = secondary_ptr.deref(&view).read()?;
+    let secondary: u64 = read_u64(&view, secondary_ptr)?;
     let context = env_data.apply_context_mut();
     let result = context.db_idx64_store(scope, table, payer, id, secondary)?;
     Ok(result)
@@ -204,7 +204,7 @@ pub fn db_idx64_update(
         .as_ref()
         .expect("Wasm memory not initialized");
     let view = memory.view(&store);
-    let secondary: u64 = secondary_ptr.deref(&view).read()?;
+    let secondary: u64 = read_u64(&view, secondary_ptr)?;
 
     let context = env_data.apply_context_mut();
     context.db_idx64_update(itr, &payer.into(), secondary)?;
@@ -236,11 +236,10 @@ pub fn db_idx64_find_secondary(
 
     // Read input from Wasm memory
     let view = memory.view(&store);
-    let secondary: u64 = secondary_ptr.deref(&view).read()?;
-    drop(view);
+    let secondary: u64 = read_u64(&view, secondary_ptr)?;
 
     // Now safe to borrow env_data mutably
-    let mut primary: u64 = 0;
+    let mut primary: u64 = read_u64(&view, primary_ptr)?;
     let context = env_data.apply_context_mut();
     let res = context.db_idx64_find_secondary(
         code.into(),
@@ -251,8 +250,7 @@ pub fn db_idx64_find_secondary(
     )?;
 
     // Write result back to Wasm memory
-    let view = memory.view(&store);
-    primary_ptr.deref(&view).write(primary)?;
+    write_u64(&view, primary_ptr, primary)?;
 
     Ok(res)
 }
@@ -263,7 +261,7 @@ pub fn db_idx64_find_primary(
     scope: u64,
     table: u64,
     secondary_ptr: WasmPtr<u64>,
-    primary_ptr: WasmPtr<u64>,
+    primary: u64,
 ) -> Result<i32, RuntimeError> {
     let (env_data, store) = env.data_and_store_mut();
 
@@ -274,13 +272,9 @@ pub fn db_idx64_find_primary(
         .expect("Wasm memory not initialized")
         .clone();
 
-    // Read input from Wasm memory
-    let view = memory.view(&store);
-    let primary: u64 = primary_ptr.deref(&view).read()?;
-    drop(view);
-
     // Now safe to borrow env_data mutably
-    let mut secondary: u64 = 0;
+    let view = memory.view(&store);
+    let mut secondary: u64 = read_u64(&view, secondary_ptr)?;
     let context = env_data.apply_context_mut();
     let res = context.db_idx64_find_primary(
         code.into(),
@@ -291,8 +285,7 @@ pub fn db_idx64_find_primary(
     )?;
 
     // Write result back to Wasm memory
-    let view = memory.view(&store);
-    secondary_ptr.deref(&view).write(secondary)?;
+    write_u64(&view, secondary_ptr, secondary)?;
 
     Ok(res)
 }
@@ -316,9 +309,8 @@ pub fn db_idx64_lowerbound(
 
     // Read input from Wasm memory
     let view = memory.view(&store);
-    let mut primary: u64 = 0;
-    let mut secondary: u64 = secondary_ptr.deref(&view).read()?;
-    drop(view);
+    let mut primary: u64 = read_u64(&view, primary_ptr)?;
+    let mut secondary: u64 = read_u64(&view, secondary_ptr)?;
 
     // Now safe to borrow env_data mutably
     let context = env_data.apply_context_mut();
@@ -331,9 +323,8 @@ pub fn db_idx64_lowerbound(
     )?;
 
     // Write result back to Wasm memory
-    let view = memory.view(&store);
-    primary_ptr.deref(&view).write(primary)?;
-    secondary_ptr.deref(&view).write(secondary)?;
+    write_u64(&view, secondary_ptr, secondary)?;
+    write_u64(&view, primary_ptr, primary)?;
 
     Ok(res)
 }
@@ -357,9 +348,8 @@ pub fn db_idx64_upperbound(
 
     // Read input from Wasm memory
     let view = memory.view(&store);
-    let mut primary: u64 = 0;
-    let mut secondary: u64 = secondary_ptr.deref(&view).read()?;
-    drop(view);
+    let mut primary: u64 = read_u64(&view, primary_ptr)?;
+    let mut secondary: u64 = read_u64(&view, secondary_ptr)?;
 
     // Now safe to borrow env_data mutably
     let context = env_data.apply_context_mut();
@@ -372,9 +362,8 @@ pub fn db_idx64_upperbound(
     )?;
 
     // Write result back to Wasm memory
-    let view = memory.view(&store);
-    primary_ptr.deref(&view).write(primary)?;
-    secondary_ptr.deref(&view).write(secondary)?;
+    write_u64(&view, secondary_ptr, secondary)?;
+    write_u64(&view, primary_ptr, primary)?;
 
     Ok(res)
 }
@@ -394,16 +383,16 @@ pub fn db_idx64_next(
     itr: i32,
     primary_ptr: WasmPtr<u64>,
 ) -> Result<i32, RuntimeError> {
-    let context = env.data_mut().apply_context_mut();
-    let mut next_primary = 0u64;
-    let res = context.db_idx64_next(itr, &mut next_primary)?;
     let (env_data, store) = env.data_and_store_mut();
     let memory = env_data
         .memory()
         .as_ref()
         .expect("Wasm memory not initialized");
     let view = memory.view(&store);
-    primary_ptr.deref(&view).write(next_primary)?;
+    let mut next_primary = read_u64(&view, primary_ptr)?;
+    let context = env_data.apply_context_mut();
+    let res = context.db_idx64_next(itr, &mut next_primary)?;
+    write_u64(&view, primary_ptr, next_primary)?;
 
     Ok(res)
 }
@@ -413,16 +402,16 @@ pub fn db_idx64_previous(
     itr: i32,
     primary_ptr: WasmPtr<u64>,
 ) -> Result<i32, RuntimeError> {
-    let context = env.data_mut().apply_context_mut();
-    let mut next_primary = 0u64;
-    let res = context.db_idx64_previous(itr, &mut next_primary)?;
     let (env_data, store) = env.data_and_store_mut();
     let memory = env_data
         .memory()
         .as_ref()
         .expect("Wasm memory not initialized");
     let view = memory.view(&store);
-    primary_ptr.deref(&view).write(next_primary)?;
+    let mut next_primary = read_u64(&view, primary_ptr)?;
+    let context = env_data.apply_context_mut();
+    let res = context.db_idx64_previous(itr, &mut next_primary)?;
+    write_u64(&view, primary_ptr, next_primary)?;
 
     Ok(res)
 }

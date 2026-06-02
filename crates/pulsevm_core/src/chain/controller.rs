@@ -1044,7 +1044,12 @@ mod tests {
         let chain_id = controller.chain_id().clone();
         let block_status = BlockStatus::Building;
         controller.execute_transaction(
-            &create_account(&private_key, Name::from_str("glenn")?, chain_id)?,
+            &create_account(&private_key, Name::from_str("testapi")?, chain_id)?,
+            &pending_block_timestamp,
+            &block_status,
+        )?;
+        controller.execute_transaction(
+            &create_account(&private_key, Name::from_str("testapi2")?, chain_id)?,
             &pending_block_timestamp,
             &block_status,
         )?;
@@ -1056,7 +1061,12 @@ mod tests {
         let contract =
             fs::read(root.join(Path::new("reference_contracts/test_api_db.wasm"))).unwrap();
         controller.execute_transaction(
-            &set_code(&private_key, Name::from_str("glenn")?, contract, chain_id)?,
+            &set_code(&private_key, Name::from_str("testapi")?, contract.clone(), chain_id)?,
+            &pending_block_timestamp,
+            &block_status,
+        )?;
+        controller.execute_transaction(
+            &set_code(&private_key, Name::from_str("testapi2")?, contract, chain_id)?,
             &pending_block_timestamp,
             &block_status,
         )?;
@@ -1064,7 +1074,7 @@ mod tests {
         controller.execute_transaction(
             &call_contract(
                 &private_key,
-                Name::from_str("glenn")?,
+                Name::from_str("testapi")?,
                 Name::from_str("pg")?,
                 &Vec::<u8>::new(),
                 chain_id,
@@ -1075,7 +1085,7 @@ mod tests {
         controller.execute_transaction(
             &call_contract(
                 &private_key,
-                Name::from_str("glenn")?,
+                Name::from_str("testapi")?,
                 Name::from_str("pl")?,
                 &Vec::<u8>::new(),
                 chain_id,
@@ -1086,9 +1096,155 @@ mod tests {
         controller.execute_transaction(
             &call_contract(
                 &private_key,
-                Name::from_str("glenn")?,
+                Name::from_str("testapi")?,
                 Name::from_str("pu")?,
                 &Vec::<u8>::new(),
+                chain_id,
+            )?,
+            &pending_block_timestamp,
+            &block_status,
+        )?;
+        controller.execute_transaction(
+            &call_contract(
+                &private_key,
+                Name::from_str("testapi")?,
+                Name::from_str("s1g")?,
+                &Vec::<u8>::new(),
+                chain_id,
+            )?,
+            &pending_block_timestamp,
+            &block_status,
+        )?;
+        controller.execute_transaction(
+            &call_contract(
+                &private_key,
+                Name::from_str("testapi")?,
+                Name::from_str("s1l")?,
+                &Vec::<u8>::new(),
+                chain_id,
+            )?,
+            &pending_block_timestamp,
+            &block_status,
+        )?;
+        controller.execute_transaction(
+            &call_contract(
+                &private_key,
+                Name::from_str("testapi")?,
+                Name::from_str("s1u")?,
+                &Vec::<u8>::new(),
+                chain_id,
+            )?,
+            &pending_block_timestamp,
+            &block_status,
+        )?;
+
+        // Access checks
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, Read, Write, NumBytes)]
+        struct TestInvalidAccess {
+            code: Name,
+            val: u64,
+            index: u32,
+            store: bool,
+        }
+        controller.execute_transaction(
+            &call_contract(
+                &private_key,
+                Name::from_str("testapi")?,
+                Name::from_str("tia")?,
+                &TestInvalidAccess {
+                    code: Name::from_str("testapi")?,
+                    val: 10,
+                    index: 0,
+                    store: true,
+                },
+                chain_id,
+            )?,
+            &pending_block_timestamp,
+            &block_status,
+        )?;
+
+        let mut result = controller.execute_transaction(
+            &call_contract(
+                &private_key,
+                Name::from_str("testapi2")?,
+                Name::from_str("tia")?,
+                &TestInvalidAccess {
+                    code: Name::from_str("testapi")?,
+                    val: 20,
+                    index: 0,
+                    store: true,
+                },
+                chain_id,
+            )?,
+            &pending_block_timestamp,
+            &block_status,
+        );
+
+        assert!(result.is_err());
+
+        controller.execute_transaction(
+            &call_contract(
+                &private_key,
+                Name::from_str("testapi")?,
+                Name::from_str("tia")?,
+                &TestInvalidAccess {
+                    code: Name::from_str("testapi")?,
+                    val: 10,
+                    index: 0,
+                    store: false,
+                },
+                chain_id,
+            )?,
+            &pending_block_timestamp,
+            &block_status,
+        )?;
+        controller.execute_transaction(
+            &call_contract(
+                &private_key,
+                Name::from_str("testapi")?,
+                Name::from_str("tia")?,
+                &TestInvalidAccess {
+                    code: Name::from_str("testapi")?,
+                    val: 10,
+                    index: 1,
+                    store: true,
+                },
+                chain_id,
+            )?,
+            &pending_block_timestamp,
+            &block_status,
+        )?;
+
+        result = controller.execute_transaction(
+            &call_contract(
+                &private_key,
+                Name::from_str("testapi2")?,
+                Name::from_str("tia")?,
+                &TestInvalidAccess {
+                    code: Name::from_str("testapi")?,
+                    val: 20,
+                    index: 1,
+                    store: true,
+                },
+                chain_id,
+            )?,
+            &pending_block_timestamp,
+            &block_status,
+        );
+
+        assert!(result.is_err());
+
+        controller.execute_transaction(
+            &call_contract(
+                &private_key,
+                Name::from_str("testapi")?,
+                Name::from_str("tia")?,
+                &TestInvalidAccess {
+                    code: Name::from_str("testapi")?,
+                    val: 10,
+                    index: 1,
+                    store: false,
+                },
                 chain_id,
             )?,
             &pending_block_timestamp,

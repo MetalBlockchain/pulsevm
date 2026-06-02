@@ -478,14 +478,11 @@ impl Write for usize {
 impl Write for u8 {
     #[inline]
     fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), WriteError> {
-        let out = self.to_le_bytes();
-        let start = *pos;
-        let end = start + 1;
-        if bytes.len() < end {
+        if *pos >= bytes.len() {
             return Err(WriteError::NotEnoughSpace);
         }
-        bytes[start..end].copy_from_slice(&out);
-        *pos = end;
+        bytes[*pos] = *self;
+        *pos += 1;
         Ok(())
     }
 }
@@ -595,8 +592,7 @@ impl<'a> Write for String {
 impl Write for bool {
     #[inline]
     fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), WriteError> {
-        let value = if *self { 1 } else { 0 };
-        (value as u8).write(bytes, pos)
+        (*self as u8).write(bytes, pos)
     }
 }
 

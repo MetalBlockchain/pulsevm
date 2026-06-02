@@ -370,8 +370,6 @@ impl TransactionContext {
             ResourceLimitsManager::verify_account_ram_usage(&mut self.db, account)?;
         }
 
-        debug!("Transaction took {} micros", billed_cpu_time_us);
-
         // During benchmarks this would throw an error because the accounts won't have enough CPU to cover the billed time, so we skip this step if we're benchmarking.
         if self.block_status != BlockStatus::Benchmarking {
             ResourceLimitsManager::add_transaction_usage(
