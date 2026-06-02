@@ -1,18 +1,38 @@
-name: Rust Tests
+name: Build release artifacts
 
 on:
   push:
     branches: [ main ]
+    tags:
+      - 'v*'
   pull_request:
     branches: [ main ]
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    name: linux-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
 
     steps:
+      - name: Configure LLVM APT repository
+        run: wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key|sudo apt-key add - && sudo echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm.list
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y gcc-13 g++-13 cmake libgmp-dev zlib1g-dev pkg-config libcurl4-openssl-dev libboost-all-dev llvm-21-dev libpolly-21-dev
+
       - name: Checkout source code
         uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -20,7 +40,7 @@ jobs:
       - name: Install Protobuf (protoc)
         uses: arduino/setup-protoc@v2
         with:
-          version: '27.1' # choose your required version
+          version: '27.1'
 
       - name: Cache cargo registry
         uses: actions/cache@v3
@@ -29,7 +49,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ matrix.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Run tests
-        run: cargo test
+        run: CXX=/usr/bin/g++-13 CC=/usr/bin/gcc-13 LLVM_SYS_211_PREFIX=/usr/lib/llvm-21 cargo test
