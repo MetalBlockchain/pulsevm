@@ -142,4 +142,13 @@ mod tests {
             "e19b30bc0bfabfab01c9260469fab7529ae88987b2eb337dac5650305226b38e"
         );
     }
+
+    #[test]
+    fn test_id_equals() {
+        let id = Id::from_str("e19b30bc0bfabfab01c9260469fab7529ae88987b2eb337dac5650305226b38e")
+            .unwrap();
+        let id2 = Id::from_str("e19b30bc0bfabfab01c9260469fab7529ae88987b2eb337dac5650305226b38e")
+            .unwrap();
+        assert_eq!(id, id2);
+    }
 }

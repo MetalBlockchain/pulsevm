@@ -416,8 +416,6 @@ impl Vm for VirtualMachine {
             }));
         }
 
-        warn!("get_block: block not found: {}", block_id);
-
         return Ok(Response::new(vm::GetBlockResponse {
             parent_id: vec![],
             bytes: vec![],
@@ -445,18 +443,11 @@ impl Vm for VirtualMachine {
 
         // Verify the block
         match controller.verify_block(&block, self.mempool.clone()).await {
-            Ok(_) => {
-                debug!(
-                    "block verified successfully: {}",
-                    block.id().map_err(|_| Status::internal(
-                        "failed getting block id during verification"
-                    ))?
-                );
-            }
+            Ok(_) => {}
             Err(e) => {
                 warn!("could not verify block: {:?}", e);
 
-                return Err(Status::internal(format!("could not verify block: {}", e)));
+                return Err(Status::internal(format!("could not verify block with id {}: {}", block.id().unwrap_or_default(), e)));
             }
         }
 
@@ -481,8 +472,6 @@ impl Vm for VirtualMachine {
             .accept_block(&block_id, self.mempool.clone())
             .await
             .map_err(|e| Status::internal(format!("could not accept block: {}", e)))?;
-
-        info!("block accepted: {}", block_id);
 
         Ok(Response::new(()))
     }

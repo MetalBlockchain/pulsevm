@@ -1,7 +1,6 @@
 use core::fmt;
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    sync::{Arc, LazyLock},
+    collections::{HashMap, HashSet, VecDeque}, str::FromStr, sync::{Arc, LazyLock}
 };
 
 use crate::{
@@ -351,6 +350,8 @@ impl Controller {
         let mut root_session = self.db.create_undo_session(true)?;
         let mut mempool = mempool.write().await;
         let block_status = BlockStatus::Verifying;
+        self.db
+            .clear_expired_input_transactions(&block.timestamp().to_time_point())?;
         self.execute_block(block, &block_status, &mut mempool)
             .await?;
         self.verified_blocks.insert(block.id()?, block.clone());
@@ -405,6 +406,8 @@ impl Controller {
         let mut root_session = self.db.create_undo_session(true)?;
         let mut mempool = mempool.write().await;
         let block_status = BlockStatus::Accepting;
+        self.db
+            .clear_expired_input_transactions(&block.timestamp().to_time_point())?;
         let transaction_traces = self
             .execute_block(&block, &block_status, &mut mempool)
             .await?;
@@ -422,9 +425,22 @@ impl Controller {
         self.store_chain_state(block_id)?;
         self.verified_blocks.remove(block_id);
         self.last_accepted_block = block.clone();
-        self.db
-            .clear_expired_input_transactions(&block.timestamp().to_time_point())?;
         self.db.commit(block.block_num() as i64)?;
+
+        if self.get_state() == &vm::State::NormalOp {
+            info!(
+                "block {} accepted successfully with {} transactions",
+                block_id,
+                block.transactions.len()
+            );
+        } else if block.block_num() % 1000 == 0 {
+            info!(
+                "block {} accepted successfully with {} transactions, current state: {:?}",
+                block_id,
+                block.transactions.len(),
+                self.get_state()
+            );
+        }
 
         Ok(())
     }
@@ -779,7 +795,7 @@ mod tests {
             pulse_contract::{NewAccount, SetCode},
             transaction::{Action, Transaction, TransactionHeader},
         },
-        crypto::PrivateKey,
+        crypto::PrivateKey, transaction::TransactionReceiptHeader,
     };
 
     use super::*;
@@ -1274,6 +1290,48 @@ mod tests {
             &pending_block_timestamp,
             &block_status,
         )?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_verify_block() -> Result<(), ChainError> {
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
+        let private_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let mempool = Arc::new(AsyncRwLock::new(Mempool::new()));
+        let mut controller = Controller::new();
+        let genesis_bytes = generate_genesis(&private_key);
+        let temp_path = get_temp_dir();
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": private_key.to_string(),
+        })
+        .to_string()
+        .into_bytes();
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &genesis_bytes.to_vec(),
+            temp_path.path().to_str().unwrap(),
+        )?;
+        assert_eq!(controller.last_accepted_block().block_num(), 1);
+        let chain_id = controller.chain_id().clone();
+        let mut txs = VecDeque::new();
+        txs.push_back(TransactionReceipt::new(TransactionReceiptHeader::new(crate::transaction::TransactionStatus::Executed, 1, 1.into()), create_account(&private_key, Name::from_str("testapi")?, chain_id)?));
+        let block = SignedBlock::new(
+            controller.last_accepted_block().id()?,
+            BlockTimestamp::now(),
+            "pulse".parse().unwrap(),
+            txs,
+            Digest::default(), // TODO: Validate this when we implement merkle root calculation
+            Digest::default(),
+        );
+        controller.verify_block(&block, mempool.clone()).await?;
+        controller.accept_block(&block.id()?, mempool.clone()).await?;
+        controller.verify_block(&block, mempool.clone()).await?;
 
         Ok(())
     }
