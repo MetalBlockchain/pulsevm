@@ -378,6 +378,30 @@ impl Controller {
                 )))?
         };
 
+        // Do we already have this block in our block log?
+        if let Some(block_log) = &self.block_log {
+            if let Ok(existing_block) = block_log.read_block(block.block_num()) {
+                let existing_block = SignedBlock::read(existing_block.as_slice(), &mut 0)?;
+
+                if existing_block.id()? == block.id()? {
+                    warn!(
+                        "block {} already exists in block log, skipping acceptance",
+                        block.id()?
+                    );
+                    return Ok(());
+                } else {
+                    warn!(
+                        "block {} has same block number as existing block in block log but different id, rejecting",
+                        block.id()?
+                    );
+                    return Err(ChainError::NetworkError(format!(
+                        "block with id {} has same block number as existing block in block log but different id",
+                        block.id()?
+                    )));
+                }
+            }
+        }
+
         let mut root_session = self.db.create_undo_session(true)?;
         let mut mempool = mempool.write().await;
         let block_status = BlockStatus::Accepting;
