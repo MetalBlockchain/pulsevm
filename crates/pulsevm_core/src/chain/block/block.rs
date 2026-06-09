@@ -60,13 +60,6 @@ impl BlockHeader {
     }
 
     pub fn validate(&self, db: &Database) -> Result<(), ChainError> {
-        let now = BlockTimestamp::now();
-        let skew = BlockTimestamp::new(now.slot() + 6); // Allow up to 3 seconds in the future (6 slots)
-
-        pulse_assert(
-            self.timestamp <= skew,
-            ChainError::BlockError("block timestamp is in the future".into()),
-        )?;
         pulse_assert(
             db.is_account(self.producer.as_u64())?,
             ChainError::BlockError("producer account does not exist".into()),
