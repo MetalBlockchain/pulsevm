@@ -8,6 +8,7 @@ use std::{
 };
 
 use pulsevm_crypto::FixedBytes;
+use spdlog::{error, warn};
 
 use crate::chain::id::Id;
 
@@ -254,18 +255,38 @@ impl StateHistoryLog {
     pub fn read_block(&self, block_num: u32) -> Result<Vec<u8>, ShLogError> {
         let pos = {
             let m = self.map.lock().unwrap();
-            *m.get(&block_num).ok_or(ShLogError::NotFound(block_num))?
+            match m.get(&block_num) {
+                Some(p) => *p,
+                None => {
+                    warn!(
+                        "[ship][{}] read_block NotFound: block_num={} not in map (map_len={})",
+                        self.name,
+                        block_num,
+                        m.len()
+                    );
+                    return Err(ShLogError::NotFound(block_num));
+                }
+            }
         };
         let mut f = OpenOptions::new().read(true).open(&self.log_path)?;
         let header = StateHistoryLogHeader::read_at(&mut f, pos)?;
         if header.magic != self.magic {
+            error!(
+                "[ship][{}] read_block BadMagic: block_num={} pos={} found={:#x} expect={:#x}",
+                self.name, block_num, pos, header.magic, self.magic
+            );
             return Err(ShLogError::BadMagic {
                 at: pos,
                 found: header.magic,
                 expect: self.magic,
             });
         }
-        if num_from_block_id(&header.block_id) != block_num {
+        let stored_num = num_from_block_id(&header.block_id);
+        if stored_num != block_num {
+            error!(
+                "[ship][{}] read_block Corrupt: requested block_num={} pos={} but stored id encodes block_num={} (id={:?})",
+                self.name, block_num, pos, stored_num, header.block_id
+            );
             return Err(ShLogError::Corrupt(pos));
         }
         let mut buf = vec![0u8; header.payload_size as usize];
@@ -387,6 +408,10 @@ impl StateHistoryLog {
             (*(self as *const _ as *mut Self)).first_block = start_block;
         }
         Ok(())
+    }
+
+    pub fn last_block(&self) -> u32 {
+        self.last_block
     }
 
     pub fn range(&self) -> Option<(u32, u32)> {
