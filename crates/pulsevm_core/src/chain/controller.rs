@@ -110,7 +110,7 @@ impl Controller {
         }
     }
 
-    pub fn initialize(
+    pub async fn initialize(
         &mut self,
         chain_id: &Id,
         config_bytes: &Vec<u8>,
@@ -179,6 +179,7 @@ impl Controller {
             info!("database initialized successfully");
         }
 
+        let revision = self.db.revision();
         let block_log_range = self.block_log.as_ref().unwrap().range();
 
         match block_log_range {
@@ -203,7 +204,7 @@ impl Controller {
                     })?;
             }
             Some((start, end)) => {
-                if revision != end as i64 {
+                if revision > end as i64 {
                     error!(
                         "database revision {} does not match block log end {}",
                         revision, end
@@ -316,7 +317,7 @@ impl Controller {
     pub async fn verify_block(
         &mut self,
         block: &SignedBlock,
-        mempool: Arc<AsyncRwLock<Mempool>>,
+        mempool: &mut Mempool,
     ) -> Result<(), ChainError> {
         if self.verified_blocks.contains_key(&block.id()?) {
             return Ok(());
@@ -348,12 +349,10 @@ impl Controller {
         block.validate(&self.db)?;
 
         let mut root_session = self.db.create_undo_session(true)?;
-        let mut mempool = mempool.write().await;
         let block_status = BlockStatus::Verifying;
         self.db
             .clear_expired_input_transactions(&block.timestamp().to_time_point())?;
-        self.execute_block(block, &block_status, &mut mempool)
-            .await?;
+        self.execute_block(block, &block_status, mempool)?;
         self.verified_blocks.insert(block.id()?, block.clone());
 
         root_session
@@ -364,10 +363,10 @@ impl Controller {
         Ok(())
     }
 
-    pub async fn accept_block(
+    pub fn accept_block(
         &mut self,
         block_id: &Id,
-        mempool: Arc<AsyncRwLock<Mempool>>,
+        mempool: &mut Mempool,
     ) -> Result<(), ChainError> {
         let block = {
             self.verified_blocks
@@ -404,13 +403,12 @@ impl Controller {
         }
 
         let mut root_session = self.db.create_undo_session(true)?;
-        let mut mempool = mempool.write().await;
         let block_status = BlockStatus::Accepting;
         self.db
             .clear_expired_input_transactions(&block.timestamp().to_time_point())?;
         let transaction_traces = self
-            .execute_block(&block, &block_status, &mut mempool)
-            .await?;
+            .execute_block(&block, &block_status, mempool)
+            .map_err(|e| ChainError::DatabaseError(format!("failed to execute block {}: {}", block_id, e)))?;
         let packed_block = block.pack().map_err(|e| {
             ChainError::TransactionError(format!("failed to pack block {}: {}", block_id, e))
         })?;
@@ -445,21 +443,12 @@ impl Controller {
         Ok(())
     }
 
-    pub async fn execute_block(
+    pub fn execute_block(
         &mut self,
         block: &SignedBlock,
         block_status: &BlockStatus,
         mempool: &mut Mempool,
     ) -> Result<Vec<TransactionTrace>, ChainError> {
-        // Make sure we don't have the block already
-        {
-            let existing_block = self.block_log()?.read_block(block.block_num());
-
-            if existing_block.is_ok() {
-                return Ok(Vec::new());
-            }
-        }
-
         let mut transaction_traces: Vec<TransactionTrace> = Vec::new();
 
         for receipt in &block.transactions {
@@ -941,8 +930,8 @@ mod tests {
         Ok(packed_trx)
     }
 
-    #[test]
-    fn test_initialize() -> Result<(), ChainError> {
+    #[tokio::test]
+    async fn test_initialize() -> Result<(), ChainError> {
         let chain_id =
             Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
                 .unwrap();
@@ -962,7 +951,7 @@ mod tests {
             &config_bytes,
             &genesis_bytes.to_vec(),
             temp_path.path().to_str().unwrap(),
-        )?;
+        ).await?;
         assert_eq!(controller.last_accepted_block().block_num(), 1);
         let pending_block_timestamp = controller.last_accepted_block().timestamp().clone();
         let chain_id = controller.chain_id().clone();
@@ -1053,8 +1042,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_api_db() -> Result<(), ChainError> {
+    #[tokio::test]
+    async fn test_api_db() -> Result<(), ChainError> {
         let chain_id =
             Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
                 .unwrap();
@@ -1079,7 +1068,7 @@ mod tests {
             &config_bytes,
             &genesis_bytes.to_vec(),
             temp_path.path().to_str().unwrap(),
-        )?;
+        ).await?;
         let pending_block_timestamp = controller.last_accepted_block().timestamp().clone();
         let chain_id = controller.chain_id().clone();
         let block_status = BlockStatus::Building;
@@ -1302,6 +1291,7 @@ mod tests {
         let private_key =
             PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
         let mempool = Arc::new(AsyncRwLock::new(Mempool::new()));
+        let mut mempool = mempool.write().await;
         let mut controller = Controller::new();
         let genesis_bytes = generate_genesis(&private_key);
         let temp_path = get_temp_dir();
@@ -1316,7 +1306,7 @@ mod tests {
             &config_bytes,
             &genesis_bytes.to_vec(),
             temp_path.path().to_str().unwrap(),
-        )?;
+        ).await?;
         assert_eq!(controller.last_accepted_block().block_num(), 1);
         let chain_id = controller.chain_id().clone();
         let mut txs = VecDeque::new();
@@ -1329,9 +1319,9 @@ mod tests {
             Digest::default(), // TODO: Validate this when we implement merkle root calculation
             Digest::default(),
         );
-        controller.verify_block(&block, mempool.clone()).await?;
-        controller.accept_block(&block.id()?, mempool.clone()).await?;
-        controller.verify_block(&block, mempool.clone()).await?;
+        controller.verify_block(&block, &mut mempool).await?;
+        controller.accept_block(&block.id()?, &mut mempool)?;
+        controller.verify_block(&block, &mut mempool).await?;
 
         Ok(())
     }

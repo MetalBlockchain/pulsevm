@@ -15,3 +15,6 @@ impl CxxGenesisState {
         extract_chain_id_from_genesis_state(self)
     }
 }
+
+unsafe impl Send for CxxGenesisState {}
+unsafe impl Sync for CxxGenesisState {}

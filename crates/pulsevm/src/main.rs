@@ -6,7 +6,7 @@ use pulsevm_core::{
     config::{PLUGIN_VERSION, VERSION},
     controller::Controller,
     id::{Id, NodeId},
-    mempool::Mempool,
+    mempool::{self, Mempool},
     transaction::PackedTransaction,
 };
 use pulsevm_grpc::{
@@ -21,6 +21,7 @@ use pulsevm_grpc::{
     },
 };
 use pulsevm_serialization::{Read, Write};
+use secp256k1::hashes::{Hash, sha256};
 use spdlog::{debug, info, warn};
 use std::{
     net::{SocketAddr, TcpListener},
@@ -203,6 +204,7 @@ impl Vm for VirtualMachine {
         // Initialize the controller with the genesis bytes
         controller
             .initialize(&chain_id, &config_bytes, &genesis_bytes, db_path.as_str())
+            .await
             .map_err(|e| Status::internal(format!("could not initialize controller: {}", e)))?;
 
         let network_manager = Arc::clone(&self.network_manager);
@@ -355,7 +357,6 @@ impl Vm for VirtualMachine {
         let block_id = block
             .id()
             .map_err(|e| Status::internal(format!("could not get block id: {}", e)))?;
-        debug!("built block: {}", block_id);
         Ok(Response::new(vm::BuildBlockResponse {
             id: block_id.into(),
             parent_id: block.previous_id().as_bytes().to_vec(),
@@ -379,6 +380,7 @@ impl Vm for VirtualMachine {
         let block_id = block
             .id()
             .map_err(|e| Status::internal(format!("could not get block id: {}", e)))?;
+        info!("parsed block with id {} and num {}", block_id, block.block_num());
         Ok(Response::new(vm::ParseBlockResponse {
             id: block_id.into(),
             parent_id: block.previous_id().as_bytes().to_vec(),
@@ -414,6 +416,8 @@ impl Vm for VirtualMachine {
                 verify_with_context: false,
                 err: 0,
             }));
+        } else {
+            warn!("block not found: {}", block_id);
         }
 
         return Ok(Response::new(vm::GetBlockResponse {
@@ -430,8 +434,8 @@ impl Vm for VirtualMachine {
         &self,
         request: Request<vm::BlockVerifyRequest>,
     ) -> Result<tonic::Response<vm::BlockVerifyResponse>, Status> {
-        let controller = self.controller.clone();
-        let mut controller = controller.write().await;
+        let mut controller = self.controller.write().await;
+        let mut mempool = self.mempool.write().await;
         let block = match controller.parse_block(&request.get_ref().bytes) {
             Ok(block) => block,
             Err(e) => {
@@ -442,7 +446,7 @@ impl Vm for VirtualMachine {
         };
 
         // Verify the block
-        match controller.verify_block(&block, self.mempool.clone()).await {
+        match controller.verify_block(&block, &mut mempool).await {
             Ok(_) => {}
             Err(e) => {
                 warn!("could not verify block: {:?}", e);
@@ -460,8 +464,8 @@ impl Vm for VirtualMachine {
         &self,
         request: Request<vm::BlockAcceptRequest>,
     ) -> Result<tonic::Response<()>, Status> {
-        let controller = self.controller.clone();
-        let mut controller = controller.write().await;
+        let mut controller = self.controller.write().await;
+        let mut mempool = self.mempool.write().await;
         let block_id: Id = request
             .get_ref()
             .id
@@ -469,8 +473,7 @@ impl Vm for VirtualMachine {
             .try_into()
             .map_err(|_| Status::invalid_argument("invalid block id"))?;
         controller
-            .accept_block(&block_id, self.mempool.clone())
-            .await
+            .accept_block(&block_id, &mut mempool)
             .map_err(|e| Status::internal(format!("could not accept block: {}", e)))?;
 
         Ok(Response::new(()))
@@ -684,18 +687,20 @@ impl Vm for VirtualMachine {
                 }));
             }
             Ok(None) => {
+                warn!("block not found at height: {}", request.get_ref().height);
+                
                 return Ok(Response::new(vm::GetBlockIdAtHeightResponse {
                     blk_id: vec![].into(),
                     err: vm::Error::NotFound as i32,
                 }));
             }
             Err(e) => {
-                warn!(
-                    "could not get block at height {}: {}",
-                    request.get_ref().height,
-                    e
-                );
-                return Err(Status::internal("could not get block at height"));
+                warn!("block not found at height: {}", request.get_ref().height);
+
+                return Ok(Response::new(vm::GetBlockIdAtHeightResponse {
+                    blk_id: vec![].into(),
+                    err: vm::Error::NotFound as i32,
+                }));
             }
         }
     }
