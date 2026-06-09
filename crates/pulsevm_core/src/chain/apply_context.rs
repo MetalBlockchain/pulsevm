@@ -175,11 +175,7 @@ impl ApplyContext {
             let inner = self.inner.read()?;
             generate_action_digest(&action, inner.action_return_value.clone())
         };
-        let first_receiver_account = if action.account() == &self.receiver {
-            receiver_account
-        } else {
-            self.db.get_account_metadata(action.account().as_u64())?
-        };
+        let first_receiver_account = self.db.get_account_metadata(action.account().as_u64())?;
         let mut receipt = ActionReceipt::new(
             self.receiver.clone(),
             act_digest,
