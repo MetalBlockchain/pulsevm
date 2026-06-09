@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     sync::{Arc, RwLock},
     u64,
 };
@@ -11,7 +11,7 @@ use pulsevm_error::ChainError;
 use pulsevm_ffi::{
     AccountMetadataObject, Database, Index64IteratorCache, Index64Object, KeyValueIteratorCache, KeyValueObject, TableObject
 };
-use spdlog::debug;
+use spdlog::{debug, info};
 
 use crate::{
     CODE_NAME,
@@ -33,7 +33,7 @@ struct ApplyContextInner {
     action_return_value: Option<Vec<u8>>, // Return value of the action
     start: i64,                           // Start time in microseconds
     privileged: bool,
-    account_ram_deltas: HashMap<Name, i64>, // RAM usage deltas for accounts
+    account_ram_deltas: BTreeMap<Name, i64>, // RAM usage deltas for accounts
     notified: VecDeque<(Name, u32)>,        // List of notified accounts
     inline_actions: Vec<u32>,               // List of inline actions
     recurse_depth: u32,                     // The current recursion depth
@@ -84,7 +84,7 @@ impl ApplyContext {
                 action_return_value: None,
                 start: Utc::now().timestamp_micros(),
                 privileged: false,
-                account_ram_deltas: HashMap::new(),
+                account_ram_deltas: BTreeMap::new(),
                 notified: VecDeque::new(),
                 inline_actions: Vec::new(),
                 recurse_depth: depth,
@@ -185,7 +185,7 @@ impl ApplyContext {
             act_digest,
             self.next_global_sequence()?,
             self.next_recv_sequence(&receiver_account)?,
-            HashMap::new(),
+            BTreeMap::new(),
             first_receiver_account.get_code_sequence() as u32,
             first_receiver_account.get_abi_sequence() as u32,
         );
@@ -815,7 +815,7 @@ impl ApplyContext {
         &self.pending_block_timestamp
     }
 
-    pub fn account_ram_deltas(&self) -> Result<HashMap<Name, i64>, ChainError> {
+    pub fn account_ram_deltas(&self) -> Result<BTreeMap<Name, i64>, ChainError> {
         let inner = self.inner.read()?;
         Ok(inner.account_ram_deltas.clone())
     }

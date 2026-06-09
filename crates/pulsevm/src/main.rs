@@ -380,7 +380,6 @@ impl Vm for VirtualMachine {
         let block_id = block
             .id()
             .map_err(|e| Status::internal(format!("could not get block id: {}", e)))?;
-        info!("parsed block with id {} and num {}", block_id, block.block_num());
         Ok(Response::new(vm::ParseBlockResponse {
             id: block_id.into(),
             parent_id: block.previous_id().as_bytes().to_vec(),

@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     sync::{Arc, RwLock},
 };
 
@@ -221,7 +221,7 @@ impl TransactionContext {
             new_action_ordinal,
             creator_action_ordinal,
             closest_unnotified_ancestor_action_ordinal,
-            HashMap::new(),
+            BTreeMap::new(),
         ));
 
         Ok(new_action_ordinal)
@@ -257,7 +257,7 @@ impl TransactionContext {
             new_action_ordinal,
             creator_action_ordinal,
             closest_unnotified_ancestor_action_ordinal,
-            HashMap::new(),
+            BTreeMap::new(),
         ));
 
         Ok(new_action_ordinal)

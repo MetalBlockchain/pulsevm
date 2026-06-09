@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::{BTreeMap, HashMap}, fmt};
 
 use pulsevm_crypto::Digest;
 use pulsevm_error::ChainError;
@@ -13,7 +13,7 @@ pub struct ActionReceipt {
     pub act_digest: Digest,
     pub global_sequence: u64,
     pub recv_sequence: u64,
-    pub auth_sequence: HashMap<u64, u64>,
+    pub auth_sequence: BTreeMap<u64, u64>,
     pub code_sequence: u32,
     pub abi_sequence: u32,
 }
@@ -24,7 +24,7 @@ impl ActionReceipt {
         act_digest: Digest,
         global_sequence: u64,
         recv_sequence: u64,
-        auth_sequence: HashMap<u64, u64>,
+        auth_sequence: BTreeMap<u64, u64>,
         code_sequence: u32,
         abi_sequence: u32,
     ) -> Self {
@@ -52,6 +52,22 @@ impl ActionReceipt {
     }
 }
 
+impl fmt::Display for ActionReceipt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "ActionReceipt {{ receiver: {}, act_digest: {}, global_sequence: {}, recv_sequence: {}, auth_sequence: {:?}, code_sequence: {}, abi_sequence: {} }}",
+            self.receiver,
+            self.act_digest,
+            self.global_sequence,
+            self.recv_sequence,
+            self.auth_sequence,
+            self.code_sequence,
+            self.abi_sequence
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -59,7 +75,7 @@ mod tests {
 
     #[test]
     fn test_action_receipt_digest() {
-        let mut auth_sequence = HashMap::new();
+        let mut auth_sequence = BTreeMap::new();
         auth_sequence.insert(1, 100);
         auth_sequence.insert(2, 200);
 

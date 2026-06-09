@@ -346,13 +346,16 @@ impl Controller {
         }
 
         // Verify the block
-        block.validate(&self.db)?;
+        block.validate_syntactically(&self.db)?;
 
         let mut root_session = self.db.create_undo_session(true)?;
         let block_status = BlockStatus::Verifying;
         self.db
             .clear_expired_input_transactions(&block.timestamp().to_time_point())?;
-        self.execute_block(block, &block_status, mempool)?;
+
+        let (_transaction_traces, transaction_mroot, action_mroot) = self.execute_block(block, &block_status, mempool)?;
+        block.validate_semantically(transaction_mroot, action_mroot)?;
+
         self.verified_blocks.insert(block.id()?, block.clone());
 
         root_session
@@ -406,7 +409,7 @@ impl Controller {
         let block_status = BlockStatus::Accepting;
         self.db
             .clear_expired_input_transactions(&block.timestamp().to_time_point())?;
-        let transaction_traces = self
+        let (transaction_traces, _transaction_mroot, _action_mroot) = self
             .execute_block(&block, &block_status, mempool)
             .map_err(|e| ChainError::DatabaseError(format!("failed to execute block {}: {}", block_id, e)))?;
         let packed_block = block.pack().map_err(|e| {
@@ -448,8 +451,10 @@ impl Controller {
         block: &SignedBlock,
         block_status: &BlockStatus,
         mempool: &mut Mempool,
-    ) -> Result<Vec<TransactionTrace>, ChainError> {
+    ) -> Result<(Vec<TransactionTrace>, Digest, Digest), ChainError> {
         let mut transaction_traces: Vec<TransactionTrace> = Vec::new();
+        let mut transaction_receipts: VecDeque<TransactionReceipt> = VecDeque::new();
+        let mut action_receipt_digests: VecDeque<Digest> = VecDeque::new();
 
         for receipt in &block.transactions {
             // Verify the transaction
@@ -460,11 +465,16 @@ impl Controller {
             )?;
 
             // Add trace to traces
-            transaction_traces.push(result.trace);
+            transaction_traces.push(result.trace.clone());
+            transaction_receipts.push_back(TransactionReceipt::new(result.trace.receipt, receipt.trx().clone()));
+            action_receipt_digests.extend(result.action_receipt_digests);
 
             // Remove from mempool if we have it
             mempool.remove_transaction(receipt.trx().id());
         }
+
+        let transaction_mroot = self.calculate_trx_merkle(&transaction_receipts)?;
+        let action_mroot = self.calculate_action_merkle(&mut action_receipt_digests)?;
 
         // Update resource limits
         let global_property = Controller::get_global_properties(&self.db)?;
@@ -500,7 +510,7 @@ impl Controller {
         )?;
         ResourceLimitsManager::process_block_usage(&mut self.db, block.block_num())?;
 
-        Ok(transaction_traces)
+        Ok((transaction_traces, transaction_mroot, action_mroot))
     }
 
     // This function will execute a transaction and roll it back instantly

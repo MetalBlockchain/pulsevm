@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use pulsevm_core::{
     account::AccountDelta,
@@ -88,7 +88,7 @@ pub struct ActionTraceV1 {
     pub context_free: bool,
     pub elapsed: i64,
     pub console: String,
-    pub account_ram_deltas: HashMap<Name, i64>,
+    pub account_ram_deltas: BTreeMap<Name, i64>,
     pub except: Option<String>,
     pub error_code: Option<u64>,
     pub return_value: Bytes,
@@ -104,7 +104,7 @@ impl ActionTraceV1 {
         context_free: bool,
         elapsed: i64,
         console: String,
-        account_ram_deltas: HashMap<Name, i64>,
+        account_ram_deltas: BTreeMap<Name, i64>,
         except: Option<String>,
         error_code: Option<u64>,
         return_value: Bytes,

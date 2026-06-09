@@ -152,7 +152,7 @@ impl SignedBlock {
         &self.signed_block_header.header.timestamp
     }
 
-    pub fn validate(&self, db: &Database) -> Result<(), ChainError> {
+    pub fn validate_syntactically(&self, db: &Database) -> Result<(), ChainError> {
         self.signed_block_header.validate(db)?;
 
         pulse_assert(
@@ -164,6 +164,18 @@ impl SignedBlock {
             ChainError::BlockError("block extensions not supported".into()),
         )?;
 
+        Ok(())
+    }
+
+    pub fn validate_semantically(&self, transaction_mroot: Digest, action_mroot: Digest) -> Result<(), ChainError> {
+        /* pulse_assert(
+            self.signed_block_header.header.transaction_mroot == transaction_mroot,
+            ChainError::BlockError(format!("transaction merkle root mismatch: expected {}, got {}", transaction_mroot, self.signed_block_header.header.transaction_mroot)),
+        )?; */
+        /* pulse_assert(
+            self.signed_block_header.header.action_mroot == action_mroot,
+            ChainError::BlockError(format!("action merkle root mismatch: expected {}, got {}", action_mroot, self.signed_block_header.header.action_mroot)),
+        )?; */
         Ok(())
     }
 }
