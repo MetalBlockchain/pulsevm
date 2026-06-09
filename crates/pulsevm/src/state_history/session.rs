@@ -14,7 +14,7 @@ use pulsevm_core::{
 };
 use pulsevm_crypto::Bytes;
 use pulsevm_serialization::{Read, Write};
-use spdlog::{debug, info};
+use spdlog::{debug, error, info, warn};
 use tokio::{
     sync::{
         RwLock, mpsc,
@@ -150,10 +150,12 @@ impl Session {
                                             Ordering::SeqCst,
                                             Ordering::SeqCst,
                                         )
-                                        .is_ok()
+                                        .is_err()
                                     {
-                                        break;
+                                        // lost the race for a slot; retry acquisition
+                                        continue;
                                     }
+                                    // slot acquired: fall through and stream this block
 
                                     match make_block_response_for(ctrl.clone(), &request, next)
                                         .await
@@ -177,7 +179,10 @@ impl Session {
                                                         break;
                                                     }
                                                 }
-                                                Err(_) => {
+                                                Err(e) => {
+                                                    error!(
+                                                        "[ship] failed to pack block response for block {next}: {e}"
+                                                    );
                                                     // give window slot back
                                                     budget.fetch_add(1, Ordering::SeqCst);
                                                     tokio::time::sleep(Duration::from_millis(5))
@@ -185,9 +190,12 @@ impl Session {
                                                 }
                                             }
                                         }
-                                        Err(_) => {
+                                        Err(e) => {
                                             // Likely "block not ready yet" — backoff and retry
                                             // return slot because nothing was sent
+                                            warn!(
+                                                "[ship] make_block_response_for failed for block {next}: {e}"
+                                            );
                                             budget.fetch_add(1, Ordering::SeqCst);
                                             tokio::time::sleep(Duration::from_millis(500)).await;
                                         }
@@ -247,20 +255,29 @@ impl Session {
         let head_block = controller.last_accepted_block();
         let head_block_id = head_block.id()?;
 
+        // Serveable end is bounded by what is actually appended to block_log on disk.
+        // last_accepted can run ~1 block ahead; advertising it as the head/end makes the
+        // reader request a block read_block cannot yet serve, stalling indexing.
+        let serveable = controller.block_log().map(|l| l.last_block()).unwrap_or(0);
+        let serveable_head_id = controller
+            .get_block_id(serveable)
+            .await?
+            .unwrap_or(head_block_id);
+
         Ok(GetStatusResult {
             variant: 0,
             head: BlockPosition {
-                block_num: head_block.block_num(),
-                block_id: head_block_id,
+                block_num: serveable,
+                block_id: serveable_head_id,
             },
             last_irreversible: BlockPosition {
                 block_num: head_block.block_num(),
                 block_id: head_block_id,
             },
             trace_begin_block: 1,
-            trace_end_block: head_block.block_num(),
+            trace_end_block: serveable,
             chain_state_begin_block: 1,
-            chain_state_end_block: head_block.block_num(),
+            chain_state_end_block: serveable,
             chain_id: chain_id.clone(),
         })
     }
@@ -314,7 +331,12 @@ async fn make_block_response_for(
     let controller = controller.read().await;
     let head = controller.last_accepted_block();
 
-    if head.block_num() < block_num {
+    // Serveability bound: only advertise/serve blocks actually appended to block_log.
+    // last_accepted can run ~1 block ahead of what is on disk, and read_block would
+    // then return NotFound, stalling the reader. Bound the head to the on-disk last block.
+    let serveable = controller.block_log().map(|l| l.last_block()).unwrap_or(0);
+
+    if serveable < block_num {
         return Err(anyhow!("block {block_num} not yet available"));
     }
 
@@ -336,10 +358,20 @@ async fn make_block_response_for(
 
     let mut block: Option<Bytes> = None;
     if request.fetch_block {
-        let signed_block = controller
-            .get_block(this_block_id)
+        let signed_block = match controller
+            .get_block_by_height(block_num)
             .map_err(|e| anyhow!("failed to get block {block_num} by id {this_block_id:?}: {e}"))?
-            .unwrap();
+        {
+            Some(b) => b,
+            None => {
+                error!(
+                    "[ship] get_block returned None for block {block_num} id {this_block_id:?} (read_block failed for synced block); aborting response build",
+                );
+                return Err(anyhow!(
+                    "get_block returned None for block {block_num} id {this_block_id:?}",
+                ));
+            }
+        };
         let signed_block_packed = signed_block.pack()?;
         block = Some(Bytes::new(signed_block_packed));
     }
@@ -374,11 +406,16 @@ async fn make_block_response_for(
         }
     }
 
+    let serveable_head_id = controller
+        .get_block_id(serveable)
+        .await?
+        .unwrap_or(head_block_id);
+
     Ok(GetBlocksResponseV0 {
         variant: 1,
         head: BlockPosition {
-            block_num: head.block_num(),
-            block_id: head_block_id,
+            block_num: serveable,
+            block_id: serveable_head_id,
         },
         last_irreversible: BlockPosition {
             block_num: head.block_num(),
