@@ -19,6 +19,9 @@ namespace pulsevm { namespace chain {
     struct CpuLimitResult; // Forward declaration
     struct NetLimitResult; // Forward declaration
     struct ElasticLimitParameters; // Forward declaration
+    struct U128;
+
+    U128 index128_object_secondary_key_as_u128(const index128_object& o);
 
 class database_wrapper : public chainbase::database {
 public:
@@ -596,6 +599,8 @@ public:
         return obj;
     }
 
+    const index128_object& create_index128_object( const table_id_object& tab, uint64_t payer, uint64_t id, U128 secondary );
+
     void update_key_value_object( const key_value_object& obj, uint64_t payer, rust::Slice<const std::uint8_t> buffer ) {
         this->modify( obj, [&]( auto& o ) {
             o.value.assign( buffer.data(), buffer.size() );
@@ -1131,6 +1136,16 @@ public:
         primary = itr->primary_key;
         return keyval_cache.add(*itr);
     }
+
+    void update_index128_object( const index128_object& obj, uint64_t payer, U128 secondary );
+    void db_idx128_remove( iterator_cache<index128_object>& keyval_cache, int iterator, u_int64_t receiver );
+    int db_idx128_find_secondary( iterator_cache<index128_object>& keyval_cache, uint64_t code, uint64_t scope, uint64_t table, U128 secondary, uint64_t& primary );
+    int db_idx128_find_primary( iterator_cache<index128_object>& keyval_cache, uint64_t code, uint64_t scope, uint64_t table, U128& secondary, uint64_t primary );
+    int db_idx128_lowerbound( iterator_cache<index128_object>& keyval_cache, uint64_t code, uint64_t scope, uint64_t table, U128& secondary, uint64_t& primary );
+    int db_idx128_upperbound( iterator_cache<index128_object>& keyval_cache, uint64_t code, uint64_t scope, uint64_t table, U128& secondary, uint64_t& primary );
+    int db_idx128_end( iterator_cache<index128_object>& keyval_cache, uint64_t code, uint64_t scope, uint64_t table );
+    int db_idx128_next( iterator_cache<index128_object>& keyval_cache, int iterator, uint64_t& primary );
+    int db_idx128_previous( iterator_cache<index128_object>& keyval_cache, int iterator, uint64_t& primary );
 
     uint64_t get_virtual_block_cpu_limit() const {
         const auto& state = this->get<resource_limits::resource_limits_state_object>();

@@ -31,6 +31,11 @@ pub mod ffi {
         expand_rate: Ratio,
     }
 
+    struct U128 {
+        lo: u64,
+        hi: u64,
+    }
+
     #[derive(Clone, PartialEq, Eq, Hash)]
     pub struct KeyWeight {
         key: SharedPtr<CxxPublicKey>,
@@ -154,6 +159,12 @@ pub mod ffi {
         pub fn get_primary_key(self: &Index64Object) -> u64;
         pub fn get_secondary_key(self: &Index64Object) -> u64;
         pub fn get_payer(self: &Index64Object) -> &CxxName;
+
+        #[cxx_name = "index128_object"]
+        type Index128Object;
+        pub fn get_table_id(self: &Index128Object) -> &TableId;
+        pub fn get_primary_key(self: &Index128Object) -> u64;
+        pub fn get_payer(self: &Index128Object) -> &CxxName;
 
         // Methods on database
         pub fn flush(self: Pin<&mut Database>) -> Result<()>;
@@ -308,6 +319,13 @@ pub mod ffi {
             id: u64,
             secondary_key: u64,
         ) -> Result<&Index64Object>;
+        pub fn create_index128_object(
+            self: Pin<&mut Database>,
+            table: &TableObject,
+            payer: u64,
+            id: u64,
+            secondary_key: U128,
+        ) -> Result<&Index128Object>;
         pub fn update_key_value_object(
             self: Pin<&mut Database>,
             obj: &KeyValueObject,
@@ -319,6 +337,12 @@ pub mod ffi {
             obj: &Index64Object,
             payer: u64,
             secondary_key: u64,
+        ) -> Result<()>;
+        pub fn update_index128_object(
+            self: Pin<&mut Database>,
+            obj: &Index128Object,
+            payer: u64,
+            secondary_key: U128,
         ) -> Result<()>;
         pub fn remove_table(self: Pin<&mut Database>, table: &TableObject) -> Result<()>;
         pub fn is_account(self: &Database, account: u64) -> Result<bool>;
@@ -457,6 +481,69 @@ pub mod ffi {
             primary_key: &mut u64,
         ) -> Result<i32>;
 
+        // Index 128 methods
+        pub fn db_idx128_remove(
+            self: Pin<&mut Database>,
+            keyval_cache: Pin<&mut CxxIndex128IteratorCache>,
+            iterator: i32,
+            receiver: u64,
+        ) -> Result<()>;
+        pub fn db_idx128_find_secondary(
+            self: Pin<&mut Database>,
+            keyval_cache: Pin<&mut CxxIndex128IteratorCache>,
+            code: u64,
+            scope: u64,
+            table: u64,
+            secondary_key: U128,
+            primary_key: &mut u64,
+        ) -> Result<i32>;
+        pub fn db_idx128_find_primary(
+            self: Pin<&mut Database>,
+            keyval_cache: Pin<&mut CxxIndex128IteratorCache>,
+            code: u64,
+            scope: u64,
+            table: u64,
+            secondary_key: &mut U128,
+            primary_key: u64,
+        ) -> Result<i32>;
+        pub fn db_idx128_lowerbound(
+            self: Pin<&mut Database>,
+            keyval_cache: Pin<&mut CxxIndex128IteratorCache>,
+            code: u64,
+            scope: u64,
+            table: u64,
+            secondary_key: &mut U128,
+            primary_key: &mut u64,
+        ) -> Result<i32>;
+        pub fn db_idx128_upperbound(
+            self: Pin<&mut Database>,
+            keyval_cache: Pin<&mut CxxIndex128IteratorCache>,
+            code: u64,
+            scope: u64,
+            table: u64,
+            secondary_key: &mut U128,
+            primary_key: &mut u64,
+        ) -> Result<i32>;
+        pub fn db_idx128_end(
+            self: Pin<&mut Database>,
+            keyval_cache: Pin<&mut CxxIndex128IteratorCache>,
+            code: u64,
+            scope: u64,
+            table: u64,
+        ) -> Result<i32>;
+        pub fn db_idx128_next(
+            self: Pin<&mut Database>,
+            keyval_cache: Pin<&mut CxxIndex128IteratorCache>,
+            iterator: i32,
+            primary_key: &mut u64,
+        ) -> Result<i32>;
+        pub fn db_idx128_previous(
+            self: Pin<&mut Database>,
+            keyval_cache: Pin<&mut CxxIndex128IteratorCache>,
+            iterator: i32,
+            primary_key: &mut u64,
+        ) -> Result<i32>;
+
         pub fn remove_permission(
             self: Pin<&mut Database>,
             permission: &PermissionObject,
@@ -549,6 +636,28 @@ pub mod ffi {
         pub fn get(self: &CxxIndex64IteratorCache, iterator: i32) -> Result<&Index64Object>;
         pub fn remove(self: Pin<&mut CxxIndex64IteratorCache>, iterator: i32) -> Result<()>;
         pub fn add(self: Pin<&mut CxxIndex64IteratorCache>, obj: &Index64Object) -> Result<i32>;
+
+        pub type CxxIndex128IteratorCache;
+        pub fn new_index128_iterator_cache() -> UniquePtr<CxxIndex128IteratorCache>;
+        pub fn cache_table(
+            self: Pin<&mut CxxIndex128IteratorCache>,
+            table: &TableObject,
+        ) -> Result<i32>;
+        pub fn get_table(
+            self: &CxxIndex128IteratorCache,
+            table_id: &TableId,
+        ) -> Result<&TableObject>;
+        pub fn get_end_iterator_by_table_id(
+            self: &CxxIndex128IteratorCache,
+            table_id: &TableId,
+        ) -> Result<i32>;
+        pub fn find_table_by_end_iterator(
+            self: &CxxIndex128IteratorCache,
+            ei: i32,
+        ) -> Result<*const TableObject>;
+        pub fn get(self: &CxxIndex128IteratorCache, iterator: i32) -> Result<&Index128Object>;
+        pub fn remove(self: Pin<&mut CxxIndex128IteratorCache>, iterator: i32) -> Result<()>;
+        pub fn add(self: Pin<&mut CxxIndex128IteratorCache>, obj: &Index128Object) -> Result<i32>;
 
         pub type CxxBlockTimestamp;
         pub fn to_time_point(self: &CxxBlockTimestamp) -> SharedPtr<CxxTimePoint>;
@@ -648,6 +757,7 @@ pub mod ffi {
         pub fn random_private_key() -> SharedPtr<CxxPrivateKey>;
         pub fn random_private_key_r1() -> SharedPtr<CxxPrivateKey>;
         pub fn extract_chain_id_from_genesis_state(genesis: &CxxGenesisState) -> Vec<u8>;
+        pub fn index128_object_secondary_key_as_u128(obj: &Index128Object) -> U128;
 
         pub type CxxName;
 

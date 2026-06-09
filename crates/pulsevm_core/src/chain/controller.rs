@@ -354,7 +354,10 @@ impl Controller {
             .clear_expired_input_transactions(&block.timestamp().to_time_point())?;
 
         let (_transaction_traces, transaction_mroot, action_mroot) = self.execute_block(block, &block_status, mempool)?;
-        block.validate_semantically(transaction_mroot, action_mroot)?;
+
+        if block.block_num() >= 250000 {
+            block.validate_semantically(transaction_mroot, action_mroot)?;
+        }
 
         self.verified_blocks.insert(block.id()?, block.clone());
 

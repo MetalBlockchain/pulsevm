@@ -6,6 +6,7 @@ use pulsevm_ffi::Database;
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 use pulsevm_serialization::Write;
 use serde::{Serialize, ser::SerializeStruct};
+use spdlog::info;
 
 use crate::{
     chain::{Name, block::BlockTimestamp, id::Id, transaction::TransactionReceipt},
@@ -168,14 +169,15 @@ impl SignedBlock {
     }
 
     pub fn validate_semantically(&self, transaction_mroot: Digest, action_mroot: Digest) -> Result<(), ChainError> {
-        /* pulse_assert(
+        info!("Validating block {} with transaction_mroot {} and action_mroot {}", self.id()?, transaction_mroot, action_mroot);
+        pulse_assert(
             self.signed_block_header.header.transaction_mroot == transaction_mroot,
             ChainError::BlockError(format!("transaction merkle root mismatch: expected {}, got {}", transaction_mroot, self.signed_block_header.header.transaction_mroot)),
-        )?; */
-        /* pulse_assert(
+        )?;
+        pulse_assert(
             self.signed_block_header.header.action_mroot == action_mroot,
             ChainError::BlockError(format!("action merkle root mismatch: expected {}, got {}", action_mroot, self.signed_block_header.header.action_mroot)),
-        )?; */
+        )?;
         Ok(())
     }
 }

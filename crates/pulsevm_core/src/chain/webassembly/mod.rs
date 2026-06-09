@@ -29,7 +29,18 @@ fn read_u64(view: &MemoryView, ptr: WasmPtr<u64>) -> Result<u64, RuntimeError> {
     Ok(u64::from_le_bytes(bytes))
 }
 
+fn read_u128(view: &MemoryView, ptr: WasmPtr<u128>) -> Result<u128, RuntimeError> {
+    let mut bytes = [0u8; 16];
+    view.read(ptr.offset() as u64, &mut bytes)?;
+    Ok(u128::from_le_bytes(bytes))
+}
+
 fn write_u64(view: &MemoryView, ptr: WasmPtr<u64>, val: u64) -> Result<(), RuntimeError> {
+    view.write(ptr.offset() as u64, &val.to_le_bytes())?;
+    Ok(())
+}
+
+fn write_u128(view: &MemoryView, ptr: WasmPtr<u128>, val: u128) -> Result<(), RuntimeError> {
     view.write(ptr.offset() as u64, &val.to_le_bytes())?;
     Ok(())
 }
