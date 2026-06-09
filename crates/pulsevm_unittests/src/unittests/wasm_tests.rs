@@ -18,9 +18,9 @@ mod auth_tests {
         },
     };
 
-    #[test]
-    fn test_misaligned() -> Result<()> {
-        let mut chain = Testing::new();
+    #[tokio::test]
+    async fn test_misaligned() -> Result<()> {
+        let mut chain = Testing::new().await;
         chain.create_accounts(vec![name!("aligncheck").into()], false, true)?;
 
         let check_aligned = |chain: &mut Testing, wast: &str| -> Result<()> {
@@ -52,9 +52,9 @@ mod auth_tests {
         Ok(())
     }
 
-    #[test]
-    fn test_entry_behavior() -> Result<()> {
-        let mut chain = Testing::new();
+    #[tokio::test]
+    async fn test_entry_behavior() -> Result<()> {
+        let mut chain = Testing::new().await;
         chain.create_accounts(vec![name!("entrycheck").into()], false, true)?;
         chain.set_code(name!("entrycheck").into(), wat2wasm(ENTRY_WAST)?.into())?;
 
@@ -78,9 +78,9 @@ mod auth_tests {
         Ok(())
     }
 
-    #[test]
-    fn test_entry_behavior_2() -> Result<()> {
-        let mut chain = Testing::new();
+    #[tokio::test]
+    async fn test_entry_behavior_2() -> Result<()> {
+        let mut chain = Testing::new().await;
         chain.create_accounts(vec![name!("entrycheck").into()], false, true)?;
         chain.set_code(name!("entrycheck").into(), wat2wasm(ENTRY_WAST_2)?.into())?;
 
@@ -104,9 +104,9 @@ mod auth_tests {
         Ok(())
     }
 
-    #[test]
-    fn test_endless_loop() -> Result<()> {
-        let mut chain = Testing::new();
+    #[tokio::test]
+    async fn test_endless_loop() -> Result<()> {
+        let mut chain = Testing::new().await;
         chain.create_accounts(vec![name!("loop").into()], false, true)?;
         let wasm_path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()

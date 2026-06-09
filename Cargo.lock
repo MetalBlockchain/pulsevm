@@ -3442,6 +3442,7 @@ dependencies = [
  "pulsevm_time",
  "serde_json",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]

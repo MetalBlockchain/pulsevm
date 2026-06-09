@@ -12,9 +12,9 @@ mod auth_tests {
     use crate::tests::{Testing, get_private_key};
     use pulsevm_name_macro::name;
 
-    #[test]
-    fn test_missing_sigs() -> Result<()> {
-        let mut chain = Testing::new();
+    #[tokio::test]
+    async fn test_missing_sigs() -> Result<()> {
+        let mut chain = Testing::new().await;
         chain.create_accounts(vec![name!("alice").into()], false, true)?;
         assert_eq!(
             chain
@@ -36,9 +36,9 @@ mod auth_tests {
         Ok(())
     }
 
-    #[test]
-    fn test_missing_multi_sigs() -> Result<()> {
-        let mut chain = Testing::new();
+    #[tokio::test]
+    async fn test_missing_multi_sigs() -> Result<()> {
+        let mut chain = Testing::new().await;
         chain.create_account(name!("alice").into(), PULSE_NAME.into(), true, true)?;
         assert_eq!(
             chain
@@ -53,9 +53,9 @@ mod auth_tests {
         Ok(())
     }
 
-    #[test]
-    fn test_missing_auths() -> Result<()> {
-        let mut chain = Testing::new();
+    #[tokio::test]
+    async fn test_missing_auths() -> Result<()> {
+        let mut chain = Testing::new().await;
         chain.create_accounts(
             vec![name!("alice").into(), name!("bob").into()],
             false,
@@ -80,9 +80,9 @@ mod auth_tests {
         Ok(())
     }
 
-    #[test]
-    fn test_delegate_auth() -> Result<()> {
-        let mut chain = Testing::new();
+    #[tokio::test]
+    async fn test_delegate_auth() -> Result<()> {
+        let mut chain = Testing::new().await;
         chain.create_accounts(
             vec![name!("alice").into(), name!("bob").into()],
             false,
@@ -122,9 +122,9 @@ mod auth_tests {
         Ok(())
     }
 
-    #[test]
-    fn test_update_auths() -> Result<()> {
-        let mut chain = Testing::new();
+    #[tokio::test]
+    async fn test_update_auths() -> Result<()> {
+        let mut chain = Testing::new().await;
         chain.create_account(name!("alice").into(), PULSE_NAME.into(), false, true)?;
         chain.create_account(name!("bob").into(), PULSE_NAME.into(), false, true)?;
         // Deleting active or owner should fail
@@ -424,9 +424,9 @@ mod auth_tests {
         Ok(())
     }
 
-    #[test]
-    fn test_update_auth_unknown_private_key() -> Result<()> {
-        let mut chain = Testing::new();
+    #[tokio::test]
+    async fn test_update_auth_unknown_private_key() -> Result<()> {
+        let mut chain = Testing::new().await;
         chain.create_account(name!("alice").into(), PULSE_NAME, false, true)?;
         // public key with no corresponding private key
         let new_owner_pub_key = PublicKey::new_unknown();
@@ -455,9 +455,9 @@ mod auth_tests {
         Ok(())
     }
 
-    #[test]
-    fn test_link_auths() -> Result<()> {
-        let mut chain = Testing::new();
+    #[tokio::test]
+    async fn test_link_auths() -> Result<()> {
+        let mut chain = Testing::new().await;
         chain.create_accounts(
             vec![name!("alice").into(), name!("bob").into()],
             false,
@@ -586,9 +586,9 @@ mod auth_tests {
         Ok(())
     }
 
-    #[test]
-    fn test_link_then_update_auth() -> Result<()> {
-        let mut chain = Testing::new();
+    #[tokio::test]
+    async fn test_link_then_update_auth() -> Result<()> {
+        let mut chain = Testing::new().await;
         chain.create_account(name!("alice").into(), PULSE_NAME, false, true)?;
 
         let first_priv_key = get_private_key(name!("alice").into(), "first");

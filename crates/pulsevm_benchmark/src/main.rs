@@ -50,6 +50,7 @@ async fn main() {
             &genesis_bytes.to_vec(),
             temp_path.as_str(),
         )
+        .await
         .unwrap();
     let pending_block_timestamp = controller.last_accepted_block().timestamp().clone();
     let block_status = BlockStatus::Building;

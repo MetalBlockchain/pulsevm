@@ -41,7 +41,7 @@ mod tests {
     }
 
     impl Testing {
-        pub fn new() -> Self {
+        pub async fn new() -> Self {
             let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
             let chain_id =
                 Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
@@ -64,6 +64,7 @@ mod tests {
                     &genesis,
                     temp_dir.path().to_str().unwrap(),
                 )
+                .await
                 .expect("Failed to initialize controller");
 
             let mut suite = Testing {
