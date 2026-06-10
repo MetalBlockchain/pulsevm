@@ -119,21 +119,22 @@ impl ApplyContext {
             cpu_used += self.exec_one()?;
         }
 
-        {
+        let (recurse_depth, inline_actions) = {
             let inner = self.inner.read()?;
+            (inner.recurse_depth, inner.inline_actions.clone())
+        };
 
-            if inner.inline_actions.len() > 0 {
-                pulse_assert(
-                    inner.recurse_depth < 1024, // TODO: Make this configurable
-                    ChainError::TransactionError(
-                        "max inline action depth per transaction reached".to_string(),
-                    ),
-                )?;
-            }
+        if inline_actions.len() > 0 {
+            pulse_assert(
+                recurse_depth < 1024, // TODO: Make this configurable
+                ChainError::TransactionError(
+                    "max inline action depth per transaction reached".to_string(),
+                ),
+            )?;
+        }
 
-            for action_ordinal in inner.inline_actions.iter() {
-                trx_context.execute_action(*action_ordinal, inner.recurse_depth + 1)?;
-            }
+        for action_ordinal in inline_actions.iter() {
+            trx_context.execute_action(*action_ordinal, recurse_depth + 1)?;
         }
 
         Ok(cpu_used)
@@ -916,8 +917,12 @@ impl ApplyContext {
     pub fn update_db_usage(&mut self, payer: &Name, delta: i64) -> Result<(), ChainError> {
         if delta > 0 {
             // Do not allow charging RAM to other accounts during notify
-            let inner = self.inner.read()?;
-            if !(inner.privileged || *payer == self.receiver.as_u64()) {
+            let privileged = {
+                let inner = self.inner.read()?;
+                inner.privileged
+            };
+
+            if !(privileged || *payer == self.receiver.as_u64()) {
                 self.require_authorization(payer, None).map_err(|_| {
                     ChainError::TransactionError(format!(
                         "cannot charge RAM to other accounts during notify"

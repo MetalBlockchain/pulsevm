@@ -37,7 +37,7 @@ impl BlockTimer {
     }
 
     pub async fn check_block_build(&self) {
-        let _ = self.request_block_mutex.lock().await;
+        let _lock = self.request_block_mutex.lock().await;
 
         if self.transactions_list.len() > 0 {
             self.request_block_build().await;
