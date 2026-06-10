@@ -277,7 +277,7 @@ impl RpcServer for RpcService {
         let head_block_id = head_block.id()?;
 
         Ok(GetInfoResponse {
-            server_version: "d133c641".to_owned(),
+            server_version: env!("PULSEVM_COMMIT").to_owned(),
             server_time: BlockTimestamp::now(),
             chain_id: controller.chain_id().clone(),
             head_block_num: head_block.block_num(),
@@ -290,11 +290,15 @@ impl RpcServer for RpcService {
             virtual_block_net_limit: db.get_virtual_block_net_limit()?,
             block_cpu_limit: db.get_block_cpu_limit()?,
             block_net_limit: db.get_block_net_limit()?,
-            server_version_string: "v5.0.3".to_owned(),
+            server_version_string: env!("PULSEVM_VERSION").to_owned(),
             fork_db_head_block_id: head_block_id,
             fork_db_head_block_num: head_block.block_num(),
-            server_full_version_string: "v5.0.3-d133c6413ce8ce2e96096a0513ec25b4a8dbe837"
-                .to_owned(), // Mimic EOS here
+            server_full_version_string: concat!(
+                env!("PULSEVM_VERSION"),
+                "-",
+                env!("PULSEVM_COMMIT_LONG")
+            )
+            .to_owned(), // Mimic EOS vX.Y.Z-<commit> format
             total_cpu_weight: db.get_total_cpu_weight()?,
             total_net_weight: db.get_total_net_weight()?,
             earliest_available_block_num: 1,
