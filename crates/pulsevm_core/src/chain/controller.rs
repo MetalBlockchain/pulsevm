@@ -247,8 +247,30 @@ impl Controller {
         let timestamp = BlockTimestamp::now();
         let block_status = BlockStatus::Building;
 
+        // Transactions already present in a verified-but-not-yet-accepted block
+        // must not be included again. At build time the earlier block has not
+        // committed its `transaction_object` dedup record yet, so a re-gossiped
+        // copy of one of its transactions passes `record_transaction` here and
+        // gets packed into this block too. The duplicate is only detected later,
+        // when this block is verified after the earlier one is accepted — at
+        // which point `record_transaction` fails permanently and the block can
+        // never validate, halting the chain (it is retried forever by consensus).
+        // Defer such transactions instead of dropping them: if the pending block
+        // is accepted they are removed from the mempool then; if it is rejected
+        // on a fork they remain available for a later block.
+        let pending_tx_ids: HashSet<Id> = self
+            .verified_blocks
+            .values()
+            .flat_map(|b| b.transactions.iter().map(|r| r.trx().id().clone()))
+            .collect();
+        let mut deferred: Vec<PackedTransaction> = Vec::new();
+
         // Get transactions from the mempool
         while let Some(transaction) = mempool.pop_transaction() {
+            if pending_tx_ids.contains(transaction.id()) {
+                deferred.push(transaction);
+                continue;
+            }
             let mut child_session = db.create_undo_session(true)?;
             let transaction_result =
                 self.execute_transaction(&transaction, &timestamp, &block_status);
@@ -279,6 +301,11 @@ impl Controller {
                     })?; // Revert changes made during this transaction
                 }
             }
+        }
+
+        // Return deferred transactions to the mempool for a later block.
+        for tx in deferred {
+            mempool.add_transaction(&tx);
         }
 
         // Don't build a block if we have no transactions
