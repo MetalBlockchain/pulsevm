@@ -25,7 +25,7 @@ use crate::{
         name::Name,
         transaction::Action,
         webassembly::{
-            abort, assert_sha224, assert_sha256, assert_sha512, check_transaction_authorization, current_time, db_end_i64, db_find_i64, db_get_i64, db_idx64_end, db_idx64_find_primary, db_idx64_find_secondary, db_idx64_lowerbound, db_idx64_next, db_idx64_previous, db_idx64_remove, db_idx64_store, db_idx64_update, db_idx64_upperbound, db_idx128_end, db_idx128_find_primary, db_idx128_find_secondary, db_idx128_lowerbound, db_idx128_next, db_idx128_previous, db_idx128_remove, db_idx128_store, db_idx128_update, db_idx128_upperbound, db_lowerbound_i64, db_next_i64, db_previous_i64, db_remove_i64, db_store_i64, db_update_i64, db_upperbound_i64, get_resource_limits, is_privileged, memcmp, memcpy, memmove, memset, printdf, printhex, printi, printi128, printn, prints, prints_l, printsf, printui, printui128, pulse_assert, pulse_assert_code, pulse_assert_message, pulse_exit, read_action_data, require_auth2, require_recipient, set_action_return_value, set_privileged, set_resource_limits, sha224, sha256, sha512
+            __ashlti3, __ashrti3, __divti3, __floatuntidf, __lshlti3, __lshrti3, __modti3, __multi3, __udivti3, __umodti3, abort, assert_sha224, assert_sha256, assert_sha512, check_transaction_authorization, current_time, db_end_i64, db_find_i64, db_get_i64, db_idx64_end, db_idx64_find_primary, db_idx64_find_secondary, db_idx64_lowerbound, db_idx64_next, db_idx64_previous, db_idx64_remove, db_idx64_store, db_idx64_update, db_idx64_upperbound, db_idx128_end, db_idx128_find_primary, db_idx128_find_secondary, db_idx128_lowerbound, db_idx128_next, db_idx128_previous, db_idx128_remove, db_idx128_store, db_idx128_update, db_idx128_upperbound, db_lowerbound_i64, db_next_i64, db_previous_i64, db_remove_i64, db_store_i64, db_update_i64, db_upperbound_i64, eosio_assert, get_resource_limits, is_privileged, memcmp, memcpy, memmove, memset, printdf, printhex, printi, printi128, printn, prints, prints_l, printsf, printui, printui128, pulse_assert, pulse_assert_code, pulse_assert_message, pulse_exit, read_action_data, require_auth2, require_recipient, set_action_return_value, set_privileged, set_resource_limits, sha224, sha256, sha512
         },
     },
 };
@@ -100,6 +100,7 @@ impl WasmContext {
     }
 }
 
+#[derive(Clone)]
 struct CachedModule {
     module: Module,
     engine: Engine,
@@ -175,9 +176,9 @@ impl WasmRuntime {
         apply_context.pause_billing_timer()?;
 
         let id = Id::from(code_hash);
-        let mut inner = self.inner.write()?;
-
         let module = {
+            let mut inner = self.inner.write()?;
+
             if !inner.code_cache.contains(&id) {
                 let code_object = db.get_code_object_by_hash(code_hash, 0, 0)?;
                 let code_object = unsafe { &*code_object };
@@ -205,7 +206,7 @@ impl WasmRuntime {
                 );
             }
 
-            inner.code_cache.get(&id).unwrap()
+            inner.code_cache.get(&id).unwrap().clone()
         };
 
         let mut store = Store::new(module.engine.clone());
@@ -224,6 +225,17 @@ impl WasmRuntime {
                 "memset" => Function::new_typed_with_env(&mut store, &env, memset),
                 "memcmp" => Function::new_typed_with_env(&mut store, &env, memcmp),
                 "memmove" => Function::new_typed_with_env(&mut store, &env, memmove),
+                // Builtins
+                "__ashlti3" => Function::new_typed_with_env(&mut store, &env, __ashlti3),
+                "__ashrti3" => Function::new_typed_with_env(&mut store, &env, __ashrti3),
+                "__lshlti3" => Function::new_typed_with_env(&mut store, &env, __lshlti3),
+                "__lshrti3" => Function::new_typed_with_env(&mut store, &env, __lshrti3),
+                "__divti3" => Function::new_typed_with_env(&mut store, &env, __divti3),
+                "__udivti3" => Function::new_typed_with_env(&mut store, &env, __udivti3),
+                "__multi3" => Function::new_typed_with_env(&mut store, &env, __multi3),
+                "__modti3" => Function::new_typed_with_env(&mut store, &env, __modti3),
+                "__umodti3" => Function::new_typed_with_env(&mut store, &env, __umodti3),
+                "__floatuntidf" => Function::new_typed_with_env(&mut store, &env, __floatuntidf),
                 "action_data_size" => Function::new_typed_with_env(&mut store, &env, action_data_size),
                 "read_action_data" => Function::new_typed_with_env(&mut store, &env, read_action_data),
                 "current_receiver" => Function::new_typed_with_env(&mut store, &env, current_receiver),
@@ -268,7 +280,7 @@ impl WasmRuntime {
                 "db_idx128_previous" => Function::new_typed_with_env(&mut store, &env, db_idx128_previous),
                 // System functions
                 "pulse_assert" => Function::new_typed_with_env(&mut store, &env, pulse_assert),
-                "eosio_assert" => Function::new_typed_with_env(&mut store, &env, pulse_assert),
+                "eosio_assert" => Function::new_typed_with_env(&mut store, &env, eosio_assert),
                 "pulse_assert_message" => Function::new_typed_with_env(&mut store, &env, pulse_assert_message),
                 "eosio_assert_message" => Function::new_typed_with_env(&mut store, &env, pulse_assert_message),
                 "pulse_assert_code" => Function::new_typed_with_env(&mut store, &env, pulse_assert_code),

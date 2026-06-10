@@ -27,6 +27,7 @@ wasmer-middlewares = "7.0.1"
 wat = "1"
 
 pulsevm_billable_size = { path = "../pulsevm_billable_size" }
+pulsevm_builtins = { path = "../pulsevm_builtins" }
 pulsevm_constants = { path = "../pulsevm_constants" }
 pulsevm_crypto = { path = "../pulsevm_crypto" }
 pulsevm_error = { path = "../pulsevm_error" }

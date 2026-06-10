@@ -4,6 +4,45 @@ use crate::chain::wasm_runtime::WasmContext;
 
 const MAX_ASSERT_MESSAGE: usize = 1024;
 
+pub fn eosio_assert(
+    mut env: FunctionEnvMut<WasmContext>,
+    condition: u32,
+    msg_ptr: WasmPtr<u8>,
+) -> Result<(), RuntimeError> {
+    if condition != 1 {
+        if msg_ptr.is_null() {
+            return Err(RuntimeError::new(
+                "pulse assertion is false with no message",
+            ));
+        }
+
+        let (env_data, store) = env.data_and_store_mut();
+        let memory = env_data
+            .memory()
+            .as_ref()
+            .expect("Wasm memory not initialized");
+        let view = memory.view(&store);
+        let slice = msg_ptr.slice(&view, MAX_ASSERT_MESSAGE as u32)?;
+        let mut src_bytes = vec![0u8; MAX_ASSERT_MESSAGE];
+        slice.read_slice(&mut src_bytes)?;
+        let c_str = String::from_utf8(src_bytes);
+
+        match c_str {
+            Ok(msg_str) => {
+                return Err(RuntimeError::new(format!(
+                    "pulse assert failed: {}",
+                    msg_str
+                )));
+            }
+            Err(_) => {
+                return Err(RuntimeError::new("pulse assert failed"));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 pub fn pulse_assert(
     mut env: FunctionEnvMut<WasmContext>,
     condition: u32,

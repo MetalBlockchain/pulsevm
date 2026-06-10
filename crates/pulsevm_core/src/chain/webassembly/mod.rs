@@ -4,6 +4,9 @@ pub use action::*;
 mod authorization;
 pub use authorization::*;
 
+mod builtins;
+pub use builtins::*;
+
 mod console;
 pub use console::*;
 

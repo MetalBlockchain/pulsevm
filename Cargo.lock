@@ -3237,6 +3237,10 @@ name = "pulsevm_billable_size"
 version = "0.1.0"
 
 [[package]]
+name = "pulsevm_builtins"
+version = "0.1.0"
+
+[[package]]
 name = "pulsevm_constants"
 version = "0.1.0"
 
@@ -3255,6 +3259,7 @@ dependencies = [
  "lru",
  "prost-types",
  "pulsevm_billable_size",
+ "pulsevm_builtins",
  "pulsevm_constants",
  "pulsevm_crypto",
  "pulsevm_error",
