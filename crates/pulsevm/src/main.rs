@@ -580,7 +580,7 @@ impl Vm for VirtualMachine {
                 Ok(tx) => {
                     let mempool = self.mempool.clone();
                     let mut mempool = mempool.write().await;
-                    mempool.add_transaction(&tx);
+                    mempool.add_transaction(tx);
                 }
             }
         }

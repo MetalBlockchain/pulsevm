@@ -20,6 +20,8 @@ pub struct Mempool {
     transactions_map: HashSet<Id>,
 }
 
+pub const MAX_MEMPOOL_SIZE: usize = 10000;
+
 impl Mempool {
     pub fn new() -> Self {
         Self {
@@ -28,13 +30,15 @@ impl Mempool {
         }
     }
 
-    pub fn add_transaction(&mut self, transaction: &PackedTransaction) {
-        if self.transactions_map.contains(transaction.id()) {
-            return; // Transaction already exists in the mempool
+    pub fn add_transaction(&mut self, transaction: PackedTransaction) -> bool {
+        if self.transactions_list.len() >= MAX_MEMPOOL_SIZE {
+            return false; // mempool is full
         }
-
-        self.transactions_list.push_back(transaction.clone());
-        self.transactions_map.insert(transaction.id().clone());
+        if !self.transactions_map.insert(transaction.id().clone()) {
+            return false; // already present
+        }
+        self.transactions_list.push_back(transaction);
+        true
     }
 
     pub fn pop_transaction(&mut self) -> Option<PackedTransaction> {

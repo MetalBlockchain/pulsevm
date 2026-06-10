@@ -389,7 +389,7 @@ impl RpcServer for RpcService {
 
         // Add to mempool
         let mut mempool = self.mempool.write().await;
-        mempool.add_transaction(&packed_trx);
+        mempool.add_transaction(packed_trx.clone());
 
         // Gossip
         let nm = self.network_manager.read().await;
