@@ -277,9 +277,11 @@ impl Vm for VirtualMachine {
         &self,
         _request: Request<()>,
     ) -> Result<tonic::Response<vm::WaitForEventResponse>, Status> {
+        debug!("wait_for_event called, waiting for block build event...");
         let block_timer = self.block_timer.clone();
         let block_timer = block_timer.read().await;
         block_timer.wait_for_block_build().await;
+        debug!("block build event received, returning from wait_for_event");
 
         Ok(Response::new(vm::WaitForEventResponse {
             message: vm::Message::BuildBlock.into(),
@@ -345,6 +347,7 @@ impl Vm for VirtualMachine {
         &self,
         _request: Request<vm::BuildBlockRequest>,
     ) -> Result<tonic::Response<vm::BuildBlockResponse>, Status> {
+        debug!("build_block called, building block...");
         let controller = self.controller.clone();
         let mut controller = controller.write().await;
         let mempool = self.mempool.clone();
@@ -356,6 +359,7 @@ impl Vm for VirtualMachine {
         let block_id = block
             .id()
             .map_err(|e| Status::internal(format!("could not get block id: {}", e)))?;
+        debug!("block built with id {}, returning from build_block", block_id);
         Ok(Response::new(vm::BuildBlockResponse {
             id: block_id.into(),
             parent_id: block.previous_id().as_bytes().to_vec(),
@@ -372,6 +376,7 @@ impl Vm for VirtualMachine {
         &self,
         request: Request<vm::ParseBlockRequest>,
     ) -> Result<tonic::Response<vm::ParseBlockResponse>, Status> {
+        debug!("parse_block called, parsing block...");
         let controller = self.controller.read().await;
         let block = controller
             .parse_block(&request.get_ref().bytes)
@@ -379,6 +384,7 @@ impl Vm for VirtualMachine {
         let block_id = block
             .id()
             .map_err(|e| Status::internal(format!("could not get block id: {}", e)))?;
+        debug!("block parsed with id {}, returning from parse_block", block_id);
         Ok(Response::new(vm::ParseBlockResponse {
             id: block_id.into(),
             parent_id: block.previous_id().as_bytes().to_vec(),
@@ -404,6 +410,7 @@ impl Vm for VirtualMachine {
             .map_err(|_| Status::internal("could not get block"))?;
 
         if let Some(block) = block {
+            debug!("block found with id {}, returning from get_block", block_id);
             return Ok(Response::new(vm::GetBlockResponse {
                 parent_id: block.previous_id().as_bytes().to_vec(),
                 bytes: block
@@ -432,6 +439,7 @@ impl Vm for VirtualMachine {
         &self,
         request: Request<vm::BlockVerifyRequest>,
     ) -> Result<tonic::Response<vm::BlockVerifyResponse>, Status> {
+        debug!("block_verify called, verifying block...");
         let mut controller = self.controller.write().await;
         let mut mempool = self.mempool.write().await;
         let block = match controller.parse_block(&request.get_ref().bytes) {
@@ -445,7 +453,9 @@ impl Vm for VirtualMachine {
 
         // Verify the block
         match controller.verify_block(&block, &mut mempool).await {
-            Ok(_) => {}
+            Ok(_) => {
+                debug!("block verified with id {}, returning from block_verify", block.id().unwrap_or_default());
+            }
             Err(e) => {
                 warn!("could not verify block: {:?}", e);
 
@@ -462,6 +472,7 @@ impl Vm for VirtualMachine {
         &self,
         request: Request<vm::BlockAcceptRequest>,
     ) -> Result<tonic::Response<()>, Status> {
+        debug!("block_accept called, accepting block...");
         let mut controller = self.controller.write().await;
         let mut mempool = self.mempool.write().await;
         let block_id: Id = request
@@ -473,6 +484,7 @@ impl Vm for VirtualMachine {
         controller
             .accept_block(&block_id, &mut mempool)
             .map_err(|e| Status::internal(format!("could not accept block: {}", e)))?;
+        debug!("block accepted with id {}, returning from block_accept", block_id);
 
         Ok(Response::new(()))
     }
@@ -503,6 +515,7 @@ impl Vm for VirtualMachine {
             .clone()
             .try_into()
             .map_err(|_| Status::invalid_argument("invalid block id"))?;
+        debug!("set_preference called, setting preferred block to {}", preferred_id);
         controller.set_preferred_id(preferred_id);
         Ok(Response::new(()))
     }
@@ -586,6 +599,7 @@ impl Vm for VirtualMachine {
         &self,
         request: Request<vm::GetAncestorsRequest>,
     ) -> Result<tonic::Response<vm::GetAncestorsResponse>, Status> {
+        debug!("get_ancestors called, retrieving ancestors...");
         let controller = self.controller.clone();
         let controller = controller.read().await;
         let deadline = Instant::now()
@@ -632,6 +646,8 @@ impl Vm for VirtualMachine {
             current_id = parent_id;
         }
 
+        debug!("retrieved {} ancestors with total size {}, returning from get_ancestors", ancestors.len(), total_size);
+
         Ok(Response::new(vm::GetAncestorsResponse {
             blks_bytes: ancestors,
         }))
@@ -641,6 +657,7 @@ impl Vm for VirtualMachine {
         &self,
         request: Request<vm::BatchedParseBlockRequest>,
     ) -> Result<tonic::Response<vm::BatchedParseBlockResponse>, Status> {
+        debug!("batched_parse_block called, parsing blocks...");
         let controller = self.controller.clone();
         let controller = controller.read().await;
         let mut parsed_blocks: Vec<ParseBlockResponse> = Vec::new();
@@ -661,6 +678,8 @@ impl Vm for VirtualMachine {
             });
         }
 
+        debug!("parsed {} blocks, returning from batched_parse_block", parsed_blocks.len());
+
         Ok(Response::new(vm::BatchedParseBlockResponse {
             response: parsed_blocks,
         }))
@@ -670,6 +689,7 @@ impl Vm for VirtualMachine {
         &self,
         request: Request<vm::GetBlockIdAtHeightRequest>,
     ) -> Result<tonic::Response<vm::GetBlockIdAtHeightResponse>, Status> {
+        debug!("get_block_id_at_height called, retrieving block id at height {}...", request.get_ref().height);
         let controller = self.controller.clone();
         let controller = controller.read().await;
 
