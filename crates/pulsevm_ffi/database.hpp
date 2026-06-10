@@ -1169,6 +1169,10 @@ public:
         return config.net_limit_parameters.max - state.pending_net_usage;
     }
 
+    bool is_known_unexpired_transaction( const transaction_id_type& id) const {
+        return this->find<transaction_object, by_trx_id>(id);
+    }
+
     void record_transaction( const transaction_id_type& id, uint32_t expiration ) {
         try {
             this->create<transaction_object>([&](transaction_object& transaction) {

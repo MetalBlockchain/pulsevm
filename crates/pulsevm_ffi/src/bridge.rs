@@ -578,6 +578,7 @@ pub mod ffi {
         pub fn get_virtual_block_net_limit(self: &Database) -> Result<u64>;
         pub fn get_block_cpu_limit(self: &Database) -> Result<u64>;
         pub fn get_block_net_limit(self: &Database) -> Result<u64>;
+        pub fn is_known_unexpired_transaction(self: &Database, trx_id: &CxxDigest) -> Result<bool>;
         pub fn record_transaction(
             self: Pin<&mut Database>,
             trx_id: &CxxDigest,

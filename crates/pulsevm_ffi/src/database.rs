@@ -1235,6 +1235,14 @@ impl Database {
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 
+    pub fn is_known_unexpired_transaction(&self, trx_id: &ffi::CxxDigest) -> Result<bool, ChainError> {
+        let guard = self.inner.read()?;
+
+        guard
+            .is_known_unexpired_transaction(trx_id)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
     pub fn record_transaction(
         &mut self,
         trx_id: &ffi::CxxDigest,

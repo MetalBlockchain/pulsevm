@@ -249,6 +249,16 @@ impl Controller {
 
         // Get transactions from the mempool
         while let Some(transaction) = mempool.pop_transaction() {
+            let id_digest = transaction.id().to_digest()?;
+
+            if db.is_known_unexpired_transaction(&id_digest)? {
+                warn!(
+                    "transaction {} is already known and unexpired, skipping",
+                    transaction.id()
+                );
+                continue;
+            }
+
             let mut child_session = db.create_undo_session(true)?;
             let transaction_result =
                 self.execute_transaction(&transaction, &timestamp, &block_status);
