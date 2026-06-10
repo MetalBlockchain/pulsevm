@@ -25,7 +25,7 @@ use crate::{
         name::Name,
         transaction::Action,
         webassembly::{
-            assert_sha224, assert_sha256, assert_sha512, check_transaction_authorization, current_time, db_end_i64, db_find_i64, db_get_i64, db_idx64_end, db_idx64_find_primary, db_idx64_find_secondary, db_idx64_lowerbound, db_idx64_next, db_idx64_previous, db_idx64_remove, db_idx64_store, db_idx64_update, db_idx64_upperbound, db_idx128_end, db_idx128_find_primary, db_idx128_find_secondary, db_idx128_lowerbound, db_idx128_next, db_idx128_previous, db_idx128_remove, db_idx128_store, db_idx128_update, db_idx128_upperbound, db_lowerbound_i64, db_next_i64, db_previous_i64, db_remove_i64, db_store_i64, db_update_i64, db_upperbound_i64, get_resource_limits, is_privileged, memmove, pulse_assert, read_action_data, require_auth2, require_recipient, set_action_return_value, set_privileged, set_resource_limits, sha224, sha256, sha512
+            assert_sha224, assert_sha256, assert_sha512, check_transaction_authorization, current_time, db_end_i64, db_find_i64, db_get_i64, db_idx64_end, db_idx64_find_primary, db_idx64_find_secondary, db_idx64_lowerbound, db_idx64_next, db_idx64_previous, db_idx64_remove, db_idx64_store, db_idx64_update, db_idx64_upperbound, db_idx128_end, db_idx128_find_primary, db_idx128_find_secondary, db_idx128_lowerbound, db_idx128_next, db_idx128_previous, db_idx128_remove, db_idx128_store, db_idx128_update, db_idx128_upperbound, db_lowerbound_i64, db_next_i64, db_previous_i64, db_remove_i64, db_store_i64, db_update_i64, db_upperbound_i64, get_resource_limits, is_privileged, memmove, printdf, printhex, printi, printi128, printn, printsf, printui, printui128, pulse_assert, read_action_data, require_auth2, require_recipient, set_action_return_value, set_privileged, set_resource_limits, sha224, sha256, sha512
         },
     },
 };
@@ -273,6 +273,15 @@ impl WasmRuntime {
                 "get_resource_limits" => Function::new_typed_with_env(&mut store, &env, get_resource_limits),
                 "send_inline" => Function::new_typed_with_env(&mut store, &env, send_inline),
                 "check_transaction_authorization" => Function::new_typed_with_env(&mut store, &env, check_transaction_authorization),
+                // Console functions
+                "printi" => Function::new_typed_with_env(&mut store, &env, printi),
+                "printui" => Function::new_typed_with_env(&mut store, &env, printui),
+                "printi128" => Function::new_typed_with_env(&mut store, &env, printi128),
+                "printui128" => Function::new_typed_with_env(&mut store, &env, printui128),
+                "printsf" => Function::new_typed_with_env(&mut store, &env, printsf),
+                "printdf" => Function::new_typed_with_env(&mut store, &env, printdf),
+                "printn" => Function::new_typed_with_env(&mut store, &env, printn),
+                "printhex" => Function::new_typed_with_env(&mut store, &env, printhex),
             }
         };
         let instance = Instance::new(&mut store, &module.module, &import_object).map_err(|e| {
