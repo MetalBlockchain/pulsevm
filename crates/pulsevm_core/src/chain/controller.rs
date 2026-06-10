@@ -247,6 +247,9 @@ impl Controller {
         let timestamp = BlockTimestamp::now();
         let block_status = BlockStatus::Building;
 
+        // Clear expired transactions from the database
+        db.clear_expired_input_transactions(&timestamp.to_time_point())?;
+
         // Get transactions from the mempool
         while let Some(transaction) = mempool.pop_transaction() {
             let id_digest = transaction.id().to_digest()?;
