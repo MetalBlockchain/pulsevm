@@ -4,7 +4,6 @@ use pulsevm_core::{
     controller::{self, Controller},
     mempool::Mempool,
 };
-use pulsevm_grpc::vm::State;
 use tokio::{
     sync::{Notify, RwLock},
     task::JoinHandle,
@@ -13,7 +12,6 @@ use tokio::{
 
 #[derive(Clone)]
 pub struct BlockTimer {
-    pub controller: Arc<RwLock<Controller>>,
     pub mempool: Arc<RwLock<Mempool>>,
     pub notify_block_build: Arc<Notify>,
     pub server_address: Arc<RwLock<Option<String>>>,
@@ -21,9 +19,8 @@ pub struct BlockTimer {
 }
 
 impl BlockTimer {
-    pub fn new(controller: Arc<RwLock<Controller>>, mempool: Arc<RwLock<Mempool>>) -> Self {
+    pub fn new(mempool: Arc<RwLock<Mempool>>) -> Self {
         BlockTimer {
-            controller,
             mempool,
             notify_block_build: Arc::new(Notify::new()),
             server_address: Arc::new(RwLock::new(None)),
@@ -47,10 +44,9 @@ impl BlockTimer {
     }
 
     pub async fn check_block_build(&self) {
-        let controller = self.controller.read().await;
         let mempool = self.mempool.read().await;
 
-        if *controller.get_state() == State::NormalOp && mempool.has_transactions() {
+        if mempool.has_transactions() {
             self.request_block_build().await;
         }
     }

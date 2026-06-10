@@ -166,7 +166,6 @@ impl VirtualMachine {
         let rpc_service =
             chain::RpcService::new(mempool.clone(), controller.clone(), network_manager.clone());
         let block_timer = Arc::new(RwLock::new(BlockTimer::new(
-            controller.clone(),
             mempool.clone(),
         )));
 
