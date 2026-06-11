@@ -457,7 +457,7 @@ impl Vm for VirtualMachine {
                 debug!("block verified with id {}, returning from block_verify", block.id().unwrap_or_default());
             }
             Err(e) => {
-                warn!("could not verify block: {:?}", e);
+                warn!("could not verify block with id {} and height {}: {:?}", block.id().unwrap_or_default(), block.block_num(), e);
 
                 return Err(Status::internal(format!("could not verify block with id {}: {}", block.id().unwrap_or_default(), e)));
             }

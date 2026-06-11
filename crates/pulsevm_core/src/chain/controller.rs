@@ -250,15 +250,28 @@ impl Controller {
         // Clear expired transactions from the database
         db.clear_expired_input_transactions(&timestamp.to_time_point())?;
 
+        // Transactions already present in a verified-but-not-yet-accepted block
+        // must not be included again. At build time the earlier block has not
+        // committed its `transaction_object` dedup record yet, so a re-gossiped
+        // copy of one of its transactions passes `record_transaction` here and
+        // gets packed into this block too. The duplicate is only detected later,
+        // when this block is verified after the earlier one is accepted — at
+        // which point `record_transaction` fails permanently and the block can
+        // never validate, halting the chain (it is retried forever by consensus).
+        // Defer such transactions instead of dropping them: if the pending block
+        // is accepted they are removed from the mempool then; if it is rejected
+        // on a fork they remain available for a later block.
+        let pending_tx_ids: HashSet<Id> = self
+            .verified_blocks
+            .values()
+            .flat_map(|b| b.transactions.iter().map(|r| r.trx().id().clone()))
+            .collect();
+        let mut deferred: Vec<PackedTransaction> = Vec::new();
+
         // Get transactions from the mempool
         while let Some(transaction) = mempool.pop_transaction() {
-            let id_digest = transaction.id().to_digest()?;
-
-            if db.is_known_unexpired_transaction(&id_digest)? {
-                warn!(
-                    "transaction {} is already known and unexpired, skipping",
-                    transaction.id()
-                );
+            if pending_tx_ids.contains(transaction.id()) {
+                deferred.push(transaction);
                 continue;
             }
 
@@ -292,6 +305,11 @@ impl Controller {
                     })?; // Revert changes made during this transaction
                 }
             }
+        }
+
+        // Return deferred transactions to the mempool for a later block.
+        for tx in deferred {
+            mempool.add_transaction(tx);
         }
 
         // Don't build a block if we have no transactions
@@ -396,30 +414,6 @@ impl Controller {
                     block_id
                 )))?
         };
-
-        // Do we already have this block in our block log?
-        if let Some(block_log) = &self.block_log {
-            if let Ok(existing_block) = block_log.read_block(block.block_num()) {
-                let existing_block = SignedBlock::read(existing_block.as_slice(), &mut 0)?;
-
-                if existing_block.id()? == block.id()? {
-                    warn!(
-                        "block {} already exists in block log, skipping acceptance",
-                        block.id()?
-                    );
-                    return Ok(());
-                } else {
-                    warn!(
-                        "block {} has same block number as existing block in block log but different id, rejecting",
-                        block.id()?
-                    );
-                    return Err(ChainError::NetworkError(format!(
-                        "block with id {} has same block number as existing block in block log but different id",
-                        block.id()?
-                    )));
-                }
-            }
-        }
 
         let mut root_session = self.db.create_undo_session(true)?;
         let block_status = BlockStatus::Accepting;
@@ -1348,6 +1342,45 @@ mod tests {
         controller.verify_block(&block, &mut mempool).await?;
         controller.accept_block(&block.id()?, &mut mempool)?;
         controller.verify_block(&block, &mut mempool).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_push_transaction() -> Result<(), ChainError> {
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
+        let private_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let mut controller = Controller::new();
+        let genesis_bytes = generate_genesis(&private_key);
+        let temp_path = get_temp_dir();
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": private_key.to_string(),
+        })
+        .to_string()
+        .into_bytes();
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &genesis_bytes.to_vec(),
+            temp_path.path().to_str().unwrap(),
+        ).await?;
+        assert_eq!(controller.last_accepted_block().block_num(), 1);
+        let pending_block_timestamp = controller.last_accepted_block().timestamp().clone();
+        let chain_id = controller.chain_id().clone();
+        let block_status = BlockStatus::Building;
+        let result = controller.push_transaction(
+            &create_account(&private_key, Name::from_str("testapi")?, chain_id)?,
+            &pending_block_timestamp,
+            &block_status,
+        )?;
+        assert_eq!(result.trace.receipt.status, crate::transaction::TransactionStatus::Executed);
+        let digest = result.trace.id.to_digest()?;
+        let found = controller.database().is_known_unexpired_transaction(&digest)?;
+        assert!(!found);
 
         Ok(())
     }
