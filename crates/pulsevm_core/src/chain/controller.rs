@@ -611,6 +611,10 @@ impl Controller {
     }
 
     pub fn get_block(&self, id: Id) -> Result<Option<SignedBlock>, ChainError> {
+        if self.verified_blocks.contains_key(&id) {
+            return Ok(self.verified_blocks.get(&id).cloned());
+        }
+        
         let num = BlockHeader::num_from_id(&id);
 
         self.get_block_by_height(num)
