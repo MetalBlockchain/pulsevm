@@ -40,7 +40,7 @@ use pulsevm_error::ChainError;
 use pulsevm_ffi::{CxxGenesisState, Database, ElasticLimitParameters, GlobalPropertyObject};
 use pulsevm_grpc::vm;
 use pulsevm_serialization::{Read, Write};
-use spdlog::{error, info, warn};
+use spdlog::{debug, error, info, warn};
 use tokio::sync::RwLock as AsyncRwLock;
 
 pub type ApplyHandlerFn = fn(&mut ApplyContext, &mut Database, &Action) -> Result<(), ChainError>;
@@ -64,6 +64,7 @@ pub static APPLY_HANDLERS: LazyLock<ApplyHandlerMap> = LazyLock::new(|| {
 pub struct Controller {
     wasm_runtime: WasmRuntime,
     last_accepted_block: SignedBlock,
+    last_accepted_block_id: Id,
     preferred_id: Id,
     db: Database,
     verified_blocks: HashMap<Id, SignedBlock>,
@@ -97,6 +98,7 @@ impl Controller {
         Controller {
             wasm_runtime,
             last_accepted_block: SignedBlock::default(),
+            last_accepted_block_id: Id::default(),
             preferred_id: Id::default(),
             db: Database::default(),
             verified_blocks: HashMap::new(),
@@ -163,6 +165,7 @@ impl Controller {
             Digest::default(),
             Digest::default(), // Placeholder action merkle root
         );
+        self.last_accepted_block_id = self.last_accepted_block.id()?;
         self.preferred_id = self.last_accepted_block.id()?;
 
         let revision = self.db.revision();
@@ -224,6 +227,7 @@ impl Controller {
                         end
                     ))
                 })?;
+                self.last_accepted_block_id = self.last_accepted_block.id()?;
                 self.preferred_id = self.last_accepted_block.id()?;
             }
         }
@@ -267,6 +271,9 @@ impl Controller {
             .flat_map(|b| b.transactions.iter().map(|r| r.trx().id().clone()))
             .collect();
         let mut deferred: Vec<PackedTransaction> = Vec::new();
+
+        // We need to build on top of preferred id, so rollback state if needed
+        self.replay_accepted_state_to(self.preferred_id, &BlockStatus::Building, mempool)?;
 
         // Get transactions from the mempool
         while let Some(transaction) = mempool.pop_transaction() {
@@ -380,15 +387,13 @@ impl Controller {
         block.validate_syntactically(&self.db)?;
 
         let mut root_session = self.db.create_undo_session(true)?;
+        let parent_block_id = block.previous_id();
         let block_status = BlockStatus::Verifying;
-        self.db
-            .clear_expired_input_transactions(&block.timestamp().to_time_point())?;
-
+        self.replay_accepted_state_to(parent_block_id.clone(), &block_status, mempool)?;
         let (_transaction_traces, transaction_mroot, action_mroot) = self.execute_block(block, &block_status, mempool)?;
 
-        if block.block_num() >= 250000 {
-            block.validate_semantically(transaction_mroot, action_mroot)?;
-        }
+        // Validate the block's transaction and action merkle roots
+        block.validate_semantically(transaction_mroot, action_mroot)?;
 
         self.verified_blocks.insert(block.id()?, block.clone());
 
@@ -417,8 +422,8 @@ impl Controller {
 
         let mut root_session = self.db.create_undo_session(true)?;
         let block_status = BlockStatus::Accepting;
-        self.db
-            .clear_expired_input_transactions(&block.timestamp().to_time_point())?;
+        let parent_block_id = block.previous_id();
+        self.replay_accepted_state_to(parent_block_id.clone(), &block_status, mempool)?;
         let (transaction_traces, _transaction_mroot, _action_mroot) = self
             .execute_block(&block, &block_status, mempool)
             .map_err(|e| ChainError::DatabaseError(format!("failed to execute block {}: {}", block_id, e)))?;
@@ -436,6 +441,7 @@ impl Controller {
         self.store_chain_state(block_id)?;
         self.verified_blocks.remove(block_id);
         self.last_accepted_block = block.clone();
+        self.last_accepted_block_id = block.id()?;
         self.db.commit(block.block_num() as i64)?;
 
         if self.get_state() == &vm::State::NormalOp {
@@ -466,6 +472,9 @@ impl Controller {
         let mut transaction_receipts: VecDeque<TransactionReceipt> = VecDeque::new();
         let mut action_receipt_digests: VecDeque<Digest> = VecDeque::new();
 
+        self.db
+            .clear_expired_input_transactions(&block.timestamp().to_time_point())?;
+
         for receipt in &block.transactions {
             // Verify the transaction
             let result = self.execute_transaction(
@@ -480,7 +489,9 @@ impl Controller {
             action_receipt_digests.extend(result.action_receipt_digests);
 
             // Remove from mempool if we have it
-            mempool.remove_transaction(receipt.trx().id());
+            if block_status == &BlockStatus::Accepting {
+                mempool.remove_transaction(receipt.trx().id());
+            }
         }
 
         let transaction_mroot = self.calculate_trx_merkle(&transaction_receipts)?;
@@ -785,6 +796,34 @@ impl Controller {
 
     pub fn get_state(&self) -> &vm::State {
         &self.state
+    }
+
+    // This function will replay the accepted state from the last accepted block to the given block id
+    // This is useful for switching forks and making sure we have the correct state for the preferred block
+    // In the future we should optimize chainbase so we can replay deltas instead of executing blocks, but for now this is simpler to implement and works fine for our use case
+    pub fn replay_accepted_state_to(&mut self, block_id: Id, block_status: &BlockStatus, mempool: &mut Mempool) -> Result<(), ChainError> {
+        // Build the path from target back to last_accepted, then reverse.
+        let mut path: Vec<SignedBlock> = Vec::new();
+        let mut cursor = block_id;
+        while cursor != self.last_accepted_block_id {
+            let block = self.verified_blocks.get(&cursor).ok_or_else(|| {
+                ChainError::NetworkError(format!("block {} not found in verified blocks", cursor))
+            })?.clone();
+            let prev = block.previous_id().clone();
+            path.push(block);
+            cursor = prev;
+        }
+
+        // path is target..=first-child; replay oldest first
+        for block in path.into_iter().rev() {
+            debug!(
+                "replaying accepted state from block {} to block {}",
+                self.last_accepted_block_id, block.id()?
+            );
+            self.execute_block(&block, block_status, mempool)?;
+        }
+
+        Ok(())
     }
 }
 

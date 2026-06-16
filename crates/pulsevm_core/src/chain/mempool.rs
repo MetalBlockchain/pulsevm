@@ -60,4 +60,13 @@ impl Mempool {
     pub fn has_transactions(&self) -> bool {
         self.transactions_list.len() > 0
     }
+
+    // Prune transactions that are included in a new block or expired
+    pub fn prune(&mut self, pending_ids: &HashSet<Id>) {
+        self.transactions_list
+            .retain(|tx| !pending_ids.contains(tx.id()));
+        for tx_id in pending_ids {
+            self.transactions_map.remove(tx_id);
+        }
+    }
 }

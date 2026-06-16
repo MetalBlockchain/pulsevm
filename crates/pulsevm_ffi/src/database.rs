@@ -46,6 +46,14 @@ impl Database {
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 
+    pub fn undo(&mut self) -> Result<(), ChainError> {
+        self.inner
+            .write()?
+            .pin_mut()
+            .undo()
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
     pub fn revision(&self) -> i64 {
         self.inner.read().unwrap().revision()
     }
