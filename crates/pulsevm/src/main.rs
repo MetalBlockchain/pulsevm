@@ -493,12 +493,18 @@ impl Vm for VirtualMachine {
         &self,
         request: Request<vm::BlockRejectRequest>,
     ) -> Result<tonic::Response<()>, Status> {
+        debug!("block_reject called, rejecting block...");
+        let mut controller = self.controller.write().await;
+        let mut mempool = self.mempool.write().await;
         let block_id: Id = request
             .get_ref()
             .id
             .clone()
             .try_into()
             .map_err(|_| Status::invalid_argument("invalid block id"))?;
+        controller
+            .reject_block(&block_id, &mut mempool)
+            .map_err(|e| Status::internal(format!("could not reject block: {}", e)))?;
         warn!("block rejected: {}", block_id);
         Ok(Response::new(()))
     }

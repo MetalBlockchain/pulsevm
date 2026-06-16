@@ -462,6 +462,27 @@ impl Controller {
         Ok(())
     }
 
+    pub fn reject_block(&mut self, block_id: &Id, mempool: &mut Mempool) -> Result<(), ChainError> {
+        let block = {
+            self.verified_blocks
+                .get(block_id)
+                .cloned()
+                .ok_or(ChainError::NetworkError(format!(
+                    "block with id {} not verified",
+                    block_id
+                )))?
+        };
+
+        // Add transactions back to the mempool
+        for receipt in &block.transactions {
+            mempool.add_transaction(receipt.trx().clone());
+        }
+
+        self.verified_blocks.remove(block_id);
+
+        Ok(())
+    }
+
     pub fn execute_block(
         &mut self,
         block: &SignedBlock,
