@@ -157,3 +157,16 @@ pub fn transaction_size(
 
     Ok(size as u32)
 }
+
+pub fn expiration(
+    env: FunctionEnvMut<WasmContext>,
+) -> Result<u32, RuntimeError> {
+    let env_data = env.data();
+    let trx = env_data
+        .apply_context()
+        .get_packed_transaction()
+        .get_transaction();
+    let expiration = trx.header.expiration();
+
+    Ok(expiration.sec_since_epoch())
+}
