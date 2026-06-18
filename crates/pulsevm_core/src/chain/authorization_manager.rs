@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 use pulsevm_error::ChainError;
 use pulsevm_ffi::{Authority, CxxTimePoint, Database, PermissionObject};
@@ -26,11 +26,11 @@ impl AuthorizationManager {
     pub fn check_authorization(
         db: &mut Database,
         actions: &Vec<Action>,
-        provided_keys: &HashSet<PublicKey>,
-        provided_permissions: &HashSet<PermissionLevel>,
-        satisfied_authorizations: &HashSet<PermissionLevel>,
+        provided_keys: &BTreeSet<PublicKey>,
+        provided_permissions: &BTreeSet<PermissionLevel>,
+        satisfied_authorizations: &BTreeSet<PermissionLevel>,
     ) -> Result<(), ChainError> {
-        let mut permissions_to_satisfy = HashSet::<PermissionLevel>::new();
+        let mut permissions_to_satisfy = BTreeSet::<PermissionLevel>::new();
 
         for act in actions.iter() {
             let mut special_case = false;
@@ -123,11 +123,11 @@ impl AuthorizationManager {
     pub fn get_required_keys(
         db: &mut Database,
         trx: &Transaction,
-        candidate_keys: &HashSet<PublicKey>,
-    ) -> Result<HashSet<PublicKey>, ChainError> {
+        candidate_keys: &BTreeSet<PublicKey>,
+    ) -> Result<BTreeSet<PublicKey>, ChainError> {
         let global_properties = unsafe { &*db.get_global_properties()? };
         let chain_config = global_properties.get_chain_config();
-        let provided_permissions = HashSet::<PermissionLevel>::new();
+        let provided_permissions = BTreeSet::<PermissionLevel>::new();
         let mut authority_checker = AuthorityChecker::new(
             chain_config.get_max_authority_depth(),
             candidate_keys,

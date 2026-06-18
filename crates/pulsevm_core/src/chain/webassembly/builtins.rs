@@ -1,5 +1,8 @@
 use pulsevm_ffi::{
-    addtf3, cmptf2, divtf3, eqtf2, extenddftf2, extendsftf2, fixdfti, fixsfti, fixtfdi, fixtfsi, fixtfti, fixunsdfti, fixunssfti, fixunstfdi, fixunstfsi, fixunstfti, floatditf, floatsidf, floatsitf, floattidf, floatunditf, floatunsitf, floatuntidf, getf2, gttf2, letf2, lttf2, multf3, negtf2, netf2, subtf3, trunctfdf2, trunctfsf2, unordtf2
+    addtf3, cmptf2, divtf3, eqtf2, extenddftf2, extendsftf2, fixdfti, fixsfti, fixtfdi, fixtfsi,
+    fixtfti, fixunsdfti, fixunssfti, fixunstfdi, fixunstfsi, fixunstfti, floatditf, floatsidf,
+    floatsitf, floattidf, floatunditf, floatunsitf, floatuntidf, getf2, gttf2, letf2, lttf2,
+    multf3, negtf2, netf2, subtf3, trunctfdf2, trunctfsf2, unordtf2,
 };
 use wasmer::{FunctionEnvMut, RuntimeError, WasmPtr};
 

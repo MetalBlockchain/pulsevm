@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use pulsevm_error::ChainError;
 use pulsevm_ffi::Database;
@@ -9,8 +9,8 @@ use super::authority::{Authority, KeyWeight, PermissionLevel, PermissionLevelWei
 
 pub struct AuthorityChecker<'a> {
     recursion_depth_limit: u16,
-    provided_keys: &'a HashSet<PublicKey>,
-    used_keys: HashSet<PublicKey>,
+    provided_keys: &'a BTreeSet<PublicKey>,
+    used_keys: BTreeSet<PublicKey>,
     cached_permissions: HashMap<PermissionLevel, PermissionCacheStatus>,
 }
 
@@ -24,8 +24,8 @@ enum PermissionCacheStatus {
 impl<'a> AuthorityChecker<'a> {
     pub fn new(
         recursion_depth_limit: u16,
-        provided_keys: &'a HashSet<PublicKey>,
-        provided_permissions: &'a HashSet<PermissionLevel>,
+        provided_keys: &'a BTreeSet<PublicKey>,
+        provided_permissions: &'a BTreeSet<PermissionLevel>,
     ) -> Self {
         let mut cached_permissions = HashMap::new();
 
@@ -39,7 +39,7 @@ impl<'a> AuthorityChecker<'a> {
         Self {
             recursion_depth_limit,
             provided_keys,
-            used_keys: HashSet::new(),
+            used_keys: BTreeSet::new(),
             cached_permissions,
         }
     }
@@ -52,7 +52,7 @@ impl<'a> AuthorityChecker<'a> {
         return *self.provided_keys == self.used_keys;
     }
 
-    pub fn used_keys(&self) -> &HashSet<PublicKey> {
+    pub fn used_keys(&self) -> &BTreeSet<PublicKey> {
         &self.used_keys
     }
 

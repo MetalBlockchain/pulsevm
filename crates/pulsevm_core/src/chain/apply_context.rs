@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
     sync::{Arc, RwLock},
     u64,
 };
@@ -305,7 +305,7 @@ impl ApplyContext {
                 )),
             )?;
 
-            let mut inherited_authorizations: HashSet<PermissionLevel> = HashSet::new();
+            let mut inherited_authorizations: BTreeSet<PermissionLevel> = BTreeSet::new();
 
             for auth in a.authorization() {
                 let actor = self.db.find_account(auth.actor)?;
@@ -331,7 +331,7 @@ impl ApplyContext {
                 }
             }
 
-            let mut provided_permissions = HashSet::new();
+            let mut provided_permissions = BTreeSet::new();
             provided_permissions.insert(PermissionLevel::new(*self.receiver, CODE_NAME.into()));
             let inner = self.inner.read()?;
 
@@ -339,7 +339,7 @@ impl ApplyContext {
                 AuthorizationManager::check_authorization(
                     &mut self.db,
                     &vec![a.clone()],
-                    &HashSet::new(),       // No provided keys
+                    &BTreeSet::new(),      // No provided keys
                     &provided_permissions, // Default permission level
                     &inherited_authorizations,
                 )?;

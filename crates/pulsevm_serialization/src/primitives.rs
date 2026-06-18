@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     hash::Hash,
     sync::Arc,
 };
@@ -138,7 +138,7 @@ impl<T: NumBytes> NumBytes for VecDeque<T> {
     }
 }
 
-impl<T: NumBytes> NumBytes for HashSet<T> {
+impl<T: NumBytes> NumBytes for BTreeSet<T> {
     #[inline]
     fn num_bytes(&self) -> usize {
         self.len().num_bytes() + self.iter().map(NumBytes::num_bytes).sum::<usize>()
@@ -347,14 +347,14 @@ where
     }
 }
 
-impl<T> Read for HashSet<T>
+impl<T> Read for BTreeSet<T>
 where
-    T: Read + Hash + Eq,
+    T: Read + Hash + Eq + Ord,
 {
     #[inline]
     fn read(bytes: &[u8], pos: &mut usize) -> Result<Self, ReadError> {
         let len = usize::read(bytes, pos)?;
-        let mut set = HashSet::with_capacity(len);
+        let mut set = BTreeSet::new();
         for _ in 0..len {
             let item = T::read(bytes, pos)?;
             set.insert(item);
@@ -630,7 +630,7 @@ impl<T: Write> Write for VecDeque<T> {
     }
 }
 
-impl<T: Write> Write for HashSet<T> {
+impl<T: Write> Write for BTreeSet<T> {
     #[inline]
     fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), WriteError> {
         self.len().write(bytes, pos)?;

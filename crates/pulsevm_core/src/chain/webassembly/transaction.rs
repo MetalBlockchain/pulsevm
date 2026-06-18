@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 use pulsevm_error::ChainError;
 use pulsevm_serialization::Read;
@@ -70,15 +70,15 @@ pub fn check_transaction_authorization(
         .read_slice(&mut trx_bytes)?;
     let transaction = Transaction::read(&trx_bytes, &mut 0)
         .map_err(|e| RuntimeError::new(format!("failed to deserialize transaction: {}", e)))?;
-    let mut provided_keys: HashSet<PublicKey> = HashSet::new();
-    let mut provided_permissions: HashSet<PermissionLevel> = HashSet::new();
+    let mut provided_keys: BTreeSet<PublicKey> = BTreeSet::new();
+    let mut provided_permissions: BTreeSet<PermissionLevel> = BTreeSet::new();
 
     if pubkeys_length > 0 {
         let mut pubkeys_bytes = vec![0u8; pubkeys_length as usize];
         pubkeys_ptr
             .slice(&view, pubkeys_length)?
             .read_slice(&mut pubkeys_bytes)?;
-        provided_keys = HashSet::<PublicKey>::read(&pubkeys_bytes, &mut 0).map_err(|e| {
+        provided_keys = BTreeSet::<PublicKey>::read(&pubkeys_bytes, &mut 0).map_err(|e| {
             RuntimeError::new(format!("failed to deserialize provided public keys: {}", e))
         })?;
     }
@@ -89,7 +89,7 @@ pub fn check_transaction_authorization(
             .slice(&view, perms_length)?
             .read_slice(&mut perms_bytes)?;
         provided_permissions =
-            HashSet::<PermissionLevel>::read(&perms_bytes, &mut 0).map_err(|e| {
+            BTreeSet::<PermissionLevel>::read(&perms_bytes, &mut 0).map_err(|e| {
                 RuntimeError::new(format!(
                     "failed to deserialize provided permission levels: {}",
                     e
@@ -104,7 +104,7 @@ pub fn check_transaction_authorization(
         &transaction.actions,
         &provided_keys,
         &provided_permissions,
-        &HashSet::new(),
+        &BTreeSet::new(),
     ) {
         Ok(_) => return Ok(1),
         Err(_) => return Ok(0),

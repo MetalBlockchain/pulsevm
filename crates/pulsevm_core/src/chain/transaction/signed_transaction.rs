@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 
 use pulsevm_crypto::Bytes;
 use pulsevm_error::ChainError;
@@ -16,7 +16,7 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq, Read, Write, NumBytes, Serialize, Default)]
 pub struct SignedTransaction {
     transaction: Transaction,
-    signatures: HashSet<Signature>,
+    signatures: BTreeSet<Signature>,
     context_free_data: Vec<Bytes>,
 }
 
@@ -24,7 +24,7 @@ impl SignedTransaction {
     #[inline]
     pub fn new(
         transaction: Transaction,
-        signatures: HashSet<Signature>,
+        signatures: BTreeSet<Signature>,
         context_free_data: Vec<Bytes>,
     ) -> Self {
         Self {
@@ -40,14 +40,14 @@ impl SignedTransaction {
     }
 
     #[inline]
-    pub fn signatures(&self) -> &HashSet<Signature> {
+    pub fn signatures(&self) -> &BTreeSet<Signature> {
         &self.signatures
     }
 
     #[must_use]
     #[inline]
-    pub fn recovered_keys(&self, chain_id: &Id) -> Result<HashSet<PublicKey>, ChainError> {
-        let mut recovered_keys: HashSet<PublicKey> = HashSet::new();
+    pub fn recovered_keys(&self, chain_id: &Id) -> Result<BTreeSet<PublicKey>, ChainError> {
+        let mut recovered_keys: BTreeSet<PublicKey> = BTreeSet::new();
         let digest = self
             .transaction
             .signing_digest(chain_id, &self.context_free_data)?;
@@ -98,7 +98,10 @@ pub fn signing_digest(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, str::FromStr};
+    use std::{
+        collections::{BTreeSet, HashSet},
+        str::FromStr,
+    };
 
     use pulsevm_time::TimePointSec;
 
@@ -120,7 +123,7 @@ mod tests {
                 vec![],
                 vec![],
             ),
-            HashSet::new(),
+            BTreeSet::new(),
             vec![],
         );
         let chain_id =

@@ -1,6 +1,6 @@
 use core::fmt;
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     str::FromStr,
     sync::{Arc, LazyLock},
 };
@@ -594,8 +594,8 @@ impl Controller {
             &mut self.db,
             &signed_transaction.transaction().actions,
             &signed_transaction.recovered_keys(&self.chain_id)?,
-            &HashSet::new(),
-            &HashSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
         )?;
 
         let mut trx_context = TransactionContext::new(

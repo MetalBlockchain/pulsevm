@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 use pulsevm_crypto::Bytes;
 use pulsevm_error::ChainError;
@@ -59,7 +59,7 @@ impl Transaction {
         private_key: &PrivateKey,
         chain_id: &Id,
     ) -> Result<SignedTransaction, ChainError> {
-        let signed_transaction = SignedTransaction::new(self.clone(), HashSet::new(), vec![]);
+        let signed_transaction = SignedTransaction::new(self.clone(), BTreeSet::new(), vec![]);
 
         signed_transaction.sign(private_key, chain_id)
     }

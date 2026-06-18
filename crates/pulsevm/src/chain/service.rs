@@ -1,4 +1,8 @@
-use std::{collections::HashSet, str::FromStr, sync::Arc};
+use std::{
+    collections::{BTreeSet, HashSet},
+    str::FromStr,
+    sync::Arc,
+};
 
 use jsonrpsee::{proc_macros::rpc, types::ErrorObjectOwned};
 use pulsevm_core::{
@@ -29,7 +33,7 @@ pub trait Rpc {
     #[method(name = "pulsevm.issueTx")]
     async fn issue_tx(
         &self,
-        signatures: HashSet<Signature>,
+        signatures: BTreeSet<Signature>,
         compression: TransactionCompression,
         packed_context_free_data: Bytes,
         packed_trx: Bytes,
@@ -83,8 +87,8 @@ pub trait Rpc {
     async fn get_required_keys(
         &self,
         trx: Transaction,
-        candidate_keys: HashSet<PublicKey>,
-    ) -> Result<HashSet<PublicKey>, ErrorObjectOwned>;
+        candidate_keys: BTreeSet<PublicKey>,
+    ) -> Result<BTreeSet<PublicKey>, ErrorObjectOwned>;
 
     #[method(name = "pulsevm.getTableByScope")]
     async fn get_table_by_scope(
@@ -366,7 +370,7 @@ impl RpcServer for RpcService {
 
     async fn issue_tx(
         &self,
-        signatures: HashSet<Signature>,
+        signatures: BTreeSet<Signature>,
         compression: TransactionCompression,
         packed_context_free_data: Bytes,
         packed_trx: Bytes,
@@ -405,8 +409,8 @@ impl RpcServer for RpcService {
     async fn get_required_keys(
         &self,
         trx: Transaction,
-        candidate_keys: HashSet<PublicKey>,
-    ) -> Result<HashSet<PublicKey>, ErrorObjectOwned> {
+        candidate_keys: BTreeSet<PublicKey>,
+    ) -> Result<BTreeSet<PublicKey>, ErrorObjectOwned> {
         let controller = self.controller.read().await;
         let mut db = controller.database();
 

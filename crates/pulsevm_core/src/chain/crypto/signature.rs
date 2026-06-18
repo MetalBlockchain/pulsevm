@@ -42,6 +42,18 @@ impl Display for Signature {
     }
 }
 
+impl PartialOrd for Signature {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.inner.packed_bytes().cmp(&other.inner.packed_bytes()))
+    }
+}
+
+impl Ord for Signature {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.inner.packed_bytes().cmp(&other.inner.packed_bytes())
+    }
+}
+
 impl PartialEq for Signature {
     fn eq(&self, other: &Self) -> bool {
         self.inner.cmp(&other.inner) == 0

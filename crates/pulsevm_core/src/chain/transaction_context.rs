@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
     sync::{Arc, RwLock},
 };
 
@@ -41,7 +41,7 @@ struct TransactionContextInner {
     initialized: bool,
     trace: TransactionTrace,
     bill_to_account: Option<Name>,
-    validate_ram_usage: HashSet<Name>,
+    validate_ram_usage: BTreeSet<Name>,
     explicit_billed_cpu_time: bool,
     billing: Billing,
     pending_block_timestamp: BlockTimestamp,
@@ -79,7 +79,7 @@ impl TransactionContext {
                 initialized: false,
                 trace,
                 bill_to_account: None,
-                validate_ram_usage: HashSet::new(),
+                validate_ram_usage: BTreeSet::new(),
                 explicit_billed_cpu_time: false,
                 billing: Billing {
                     paused_time: TimePoint::default(),
