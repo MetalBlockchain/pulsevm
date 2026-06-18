@@ -69,8 +69,6 @@ impl BlockHeader {
             self.confirmed == 0,
             ChainError::BlockError("confirmed count must be 0".into()),
         )?;
-        // TODO: Validate previous block ID if we have the previous block available
-        // TODO: Validate transaction_mroot and action_mroot if we have the transactions available
         pulse_assert(
             self.schedule_version == 0,
             ChainError::BlockError("schedule version must be 0".into()),
