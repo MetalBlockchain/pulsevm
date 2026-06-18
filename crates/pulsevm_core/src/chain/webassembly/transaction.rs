@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashSet};
 
 use pulsevm_error::ChainError;
-use pulsevm_serialization::Read;
+use pulsevm_serialization::{Read, Write};
 use wasmer::{FunctionEnvMut, RuntimeError, WasmPtr};
 
 use crate::{
@@ -109,4 +109,38 @@ pub fn check_transaction_authorization(
         Ok(_) => return Ok(1),
         Err(_) => return Ok(0),
     }
+}
+
+pub fn read_transaction(
+    mut env: FunctionEnvMut<WasmContext>,
+    trx_ptr: WasmPtr<u8>,
+    trx_length: u32,
+) -> Result<u32, RuntimeError> {
+    let (env_data, store) = env.data_and_store_mut();
+
+    // Pack the (base) transaction — exact pack format is part of consensus.
+    let packed = env_data
+        .apply_context()
+        .get_packed_transaction()
+        .get_transaction()
+        .pack()
+        .map_err(|e| RuntimeError::new(format!("failed to pack transaction: {}", e)))?;
+
+    // data.size() == 0 returns transaction_size()
+    if trx_length == 0 {
+        return Ok(packed.len() as u32);
+    }
+
+    let memory = env_data
+        .memory()
+        .as_ref()
+        .expect("Wasm memory not initialized");
+    let view = memory.view(&store);
+
+    let copy_size = (trx_length as usize).min(packed.len());
+
+    view.write(trx_ptr.offset() as u64, &packed[..copy_size])
+        .map_err(|e| RuntimeError::new(format!("failed to write transaction data: {}", e)))?;
+
+    Ok(copy_size as u32)
 }

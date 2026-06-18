@@ -25,7 +25,7 @@ use crate::{
         utils::pulse_assert,
         wasm_runtime::WasmRuntime,
     },
-    name::Name,
+    name::Name, transaction::PackedTransaction,
 };
 
 struct ApplyContextInner {
@@ -1048,5 +1048,9 @@ impl ApplyContext {
 
     pub fn get_pending_block_time(&self) -> &BlockTimestamp {
         &self.pending_block_timestamp
+    }
+
+    pub fn get_packed_transaction(&self) -> &PackedTransaction {
+        self.trx_context.get_packed_transaction()
     }
 }

@@ -605,6 +605,7 @@ impl Controller {
             pending_block_timestamp.clone(),
             packed_transaction.id(),
             *block_status,
+            packed_transaction.clone(),
         );
 
         let trx = packed_transaction.get_transaction();

@@ -21,7 +21,7 @@ use crate::{
         transaction::{Action, ActionTrace, Transaction, TransactionStatus, TransactionTrace},
         utils::pulse_assert,
         wasm_runtime::WasmRuntime,
-    },
+    }, transaction::PackedTransaction,
 };
 
 #[derive(Default, Clone)]
@@ -54,6 +54,7 @@ pub struct TransactionContext {
     db: Database,
     wasm_runtime: WasmRuntime,
     block_status: BlockStatus,
+    packed_transaction: PackedTransaction,
     inner: Arc<RwLock<TransactionContextInner>>,
 }
 
@@ -65,6 +66,7 @@ impl TransactionContext {
         pending_block_timestamp: BlockTimestamp,
         transaction_id: &Id,
         block_status: BlockStatus,
+        packed_transaction: PackedTransaction,
     ) -> Self {
         let mut trace = TransactionTrace::default();
         trace.id = *transaction_id;
@@ -90,6 +92,7 @@ impl TransactionContext {
                 cpu_limit: 0,
                 executed_action_receipt_digests: VecDeque::with_capacity(6),
             })),
+            packed_transaction,
         }
     }
 
@@ -467,5 +470,9 @@ impl TransactionContext {
         let mut inner = self.inner.write()?;
         inner.executed_action_receipt_digests.push_back(digest);
         Ok(())
+    }
+
+    pub fn get_packed_transaction(&self) -> &PackedTransaction {
+        &self.packed_transaction
     }
 }
