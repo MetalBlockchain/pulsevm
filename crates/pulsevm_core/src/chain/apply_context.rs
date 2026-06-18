@@ -12,6 +12,7 @@ use pulsevm_ffi::{
     AccountMetadataObject, Database, Index64IteratorCache, Index64Object, Index128IteratorCache,
     Index128Object, KeyValueIteratorCache, KeyValueObject, TableObject,
 };
+use pulsevm_serialization::{NumBytes, Write};
 
 use crate::{
     CODE_NAME,
@@ -1052,5 +1053,43 @@ impl ApplyContext {
 
     pub fn get_packed_transaction(&self) -> &PackedTransaction {
         self.trx_context.get_packed_transaction()
+    }
+
+    pub fn get_action(
+        &self,
+        type_id: u32,
+        index: u32,
+        buffer: &mut [u8],
+        buffer_size: usize,
+    ) -> Result<i32, ChainError> {
+        let trx = self.trx_context.get_packed_transaction().get_transaction();
+
+        let action: &Action = if type_id == 0 {
+            match trx.context_free_actions.get(index as usize) {
+                Some(a) => a,
+                None => return Ok(-1),
+            }
+        } else if type_id == 1 {
+            match trx.actions.get(index as usize) {
+                Some(a) => a,
+                None => return Ok(-1),
+            }
+        } else {
+            return Err(ChainError::TransactionError(
+                "get_action: invalid action type".to_string(),
+            ));
+        };
+
+        let data = action.pack()?;
+        let ps = data.len();
+
+        // Only copy if the whole thing fits — matches EOSIO's `ps <= buffer_size`.
+        // Clamp against the real slice length too, so the copy can never panic.
+        let limit = buffer_size.min(buffer.len());
+        if ps <= limit {
+            buffer[..ps].copy_from_slice(&data);
+        }
+
+        Ok(ps as i32)
     }
 }

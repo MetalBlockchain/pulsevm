@@ -196,3 +196,38 @@ pub fn tapos_block_prefix(
 
     Ok(ref_block_prefix)
 }
+
+pub fn get_action(
+    mut env: FunctionEnvMut<WasmContext>,
+    action_type: u32,
+    index: u32,
+    buffer_ptr: WasmPtr<u8>,
+    buffer_size: u32,
+) -> Result<i32, RuntimeError> {
+    let (env_data, store) = env.data_and_store_mut();
+
+    let memory = env_data
+        .memory()
+        .as_ref()
+        .expect("Wasm memory not initialized");
+    let view = memory.view(&store);
+
+    // Read the wasm buffer out into a host-side scratch buffer, run get_action
+    // against it, then write back. Avoids holding a MemoryView borrow across
+    // the apply_context call.
+    let mut scratch = vec![0u8; buffer_size as usize];
+
+    let written = env_data
+        .apply_context()
+        .get_action(action_type, index, &mut scratch, buffer_size as usize)
+        .map_err(|e| RuntimeError::new(format!("get_action failed: {}", e)))?;
+
+    // get_action returns the packed size; it only filled scratch if it fit.
+    if written >= 0 {
+        let copy = (written as usize).min(scratch.len());
+        view.write(buffer_ptr.offset() as u64, &scratch[..copy])
+            .map_err(|e| RuntimeError::new(format!("failed to write action data: {}", e)))?;
+    }
+
+    Ok(written)
+}
