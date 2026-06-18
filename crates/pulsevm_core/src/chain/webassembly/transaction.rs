@@ -170,3 +170,29 @@ pub fn expiration(
 
     Ok(expiration.sec_since_epoch())
 }
+
+pub fn tapos_block_num(
+    env: FunctionEnvMut<WasmContext>,
+) -> Result<u32, RuntimeError> {
+    let env_data = env.data();
+    let trx = env_data
+        .apply_context()
+        .get_packed_transaction()
+        .get_transaction();
+    let ref_block_num = trx.header.ref_block_num;
+
+    Ok(ref_block_num as u32)
+}
+
+pub fn tapos_block_prefix(
+    env: FunctionEnvMut<WasmContext>,
+) -> Result<u32, RuntimeError> {
+    let env_data = env.data();
+    let trx = env_data
+        .apply_context()
+        .get_packed_transaction()
+        .get_transaction();
+    let ref_block_prefix = trx.header.ref_block_prefix;
+
+    Ok(ref_block_prefix)
+}
