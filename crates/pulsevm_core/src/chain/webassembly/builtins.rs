@@ -1,7 +1,12 @@
-use pulsevm_builtins::floatuntidf;
+use pulsevm_ffi::{
+    addtf3, cmptf2, divtf3, eqtf2, extenddftf2, extendsftf2, fixdfti, fixsfti, fixtfdi, fixtfsi, fixtfti, fixunsdfti, fixunssfti, fixunstfdi, fixunstfsi, fixunstfti, floatditf, floatsidf, floatsitf, floattidf, floatunditf, floatunsitf, floatuntidf, getf2, gttf2, letf2, lttf2, multf3, negtf2, netf2, subtf3, trunctfdf2, trunctfsf2, unordtf2
+};
 use wasmer::{FunctionEnvMut, RuntimeError, WasmPtr};
 
-use crate::wasm_runtime::WasmContext;
+use crate::{
+    chain::webassembly::{write_i128_ffi, write_u128_ffi},
+    wasm_runtime::WasmContext,
+};
 
 pub fn __ashlti3(
     mut env: FunctionEnvMut<WasmContext>,
@@ -260,10 +265,501 @@ pub fn __umodti3(
     Ok(())
 }
 
+pub fn __addtf3(
+    mut env: FunctionEnvMut<WasmContext>,
+    ret_ptr: WasmPtr<u8>,
+    la: u64,
+    ha: u64,
+    lb: u64,
+    hb: u64,
+) -> Result<(), RuntimeError> {
+    let result = addtf3(la, ha, lb, hb);
+    let (env_data, store) = env.data_and_store_mut();
+    let memory = env_data
+        .memory()
+        .as_ref()
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
+    let view = memory.view(&store);
+
+    let mut bytes = [0u8; 16];
+    bytes[0..8].copy_from_slice(&result.lo.to_le_bytes());
+    bytes[8..16].copy_from_slice(&result.hi.to_le_bytes());
+
+    view.write(ret_ptr.offset() as u64, &bytes)
+        .map_err(|e| RuntimeError::new(e.to_string()))?;
+    Ok(())
+}
+
+pub fn __subtf3(
+    mut env: FunctionEnvMut<WasmContext>,
+    ret_ptr: WasmPtr<u8>,
+    la: u64,
+    ha: u64,
+    lb: u64,
+    hb: u64,
+) -> Result<(), RuntimeError> {
+    let result = subtf3(la, ha, lb, hb);
+    let (env_data, store) = env.data_and_store_mut();
+    let memory = env_data
+        .memory()
+        .as_ref()
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
+    let view = memory.view(&store);
+
+    let mut bytes = [0u8; 16];
+    bytes[0..8].copy_from_slice(&result.lo.to_le_bytes());
+    bytes[8..16].copy_from_slice(&result.hi.to_le_bytes());
+
+    view.write(ret_ptr.offset() as u64, &bytes)
+        .map_err(|e| RuntimeError::new(e.to_string()))?;
+    Ok(())
+}
+
+pub fn __multf3(
+    mut env: FunctionEnvMut<WasmContext>,
+    ret_ptr: WasmPtr<u8>,
+    la: u64,
+    ha: u64,
+    lb: u64,
+    hb: u64,
+) -> Result<(), RuntimeError> {
+    let result = multf3(la, ha, lb, hb);
+    let (env_data, store) = env.data_and_store_mut();
+    let memory = env_data
+        .memory()
+        .as_ref()
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
+    let view = memory.view(&store);
+
+    let mut bytes = [0u8; 16];
+    bytes[0..8].copy_from_slice(&result.lo.to_le_bytes());
+    bytes[8..16].copy_from_slice(&result.hi.to_le_bytes());
+
+    view.write(ret_ptr.offset() as u64, &bytes)
+        .map_err(|e| RuntimeError::new(e.to_string()))?;
+    Ok(())
+}
+
+pub fn __divtf3(
+    mut env: FunctionEnvMut<WasmContext>,
+    ret_ptr: WasmPtr<u8>,
+    la: u64,
+    ha: u64,
+    lb: u64,
+    hb: u64,
+) -> Result<(), RuntimeError> {
+    let result = divtf3(la, ha, lb, hb);
+    let (env_data, store) = env.data_and_store_mut();
+    let memory = env_data
+        .memory()
+        .as_ref()
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
+    let view = memory.view(&store);
+
+    let mut bytes = [0u8; 16];
+    bytes[0..8].copy_from_slice(&result.lo.to_le_bytes());
+    bytes[8..16].copy_from_slice(&result.hi.to_le_bytes());
+
+    view.write(ret_ptr.offset() as u64, &bytes)
+        .map_err(|e| RuntimeError::new(e.to_string()))?;
+    Ok(())
+}
+
+pub fn __negtf2(
+    mut env: FunctionEnvMut<WasmContext>,
+    ret_ptr: WasmPtr<u8>,
+    la: u64,
+    ha: u64,
+) -> Result<(), RuntimeError> {
+    // Flip the sign bit (bit 63 of the high limb); low limb unchanged.
+    let result = negtf2(la, ha);
+    let (env_data, store) = env.data_and_store_mut();
+    let memory = env_data
+        .memory()
+        .as_ref()
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
+    let view = memory.view(&store);
+
+    let mut bytes = [0u8; 16];
+    bytes[0..8].copy_from_slice(&result.lo.to_le_bytes());
+    bytes[8..16].copy_from_slice(&result.hi.to_le_bytes());
+
+    view.write(ret_ptr.offset() as u64, &bytes)
+        .map_err(|e| RuntimeError::new(e.to_string()))?;
+    Ok(())
+}
+
+pub fn __extendsftf2(
+    mut env: FunctionEnvMut<WasmContext>,
+    ret_ptr: WasmPtr<u8>,
+    f: f32,
+) -> Result<(), RuntimeError> {
+    let result = extendsftf2(f);
+    let (env_data, store) = env.data_and_store_mut();
+    let memory = env_data
+        .memory()
+        .as_ref()
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
+    let view = memory.view(&store);
+
+    // float128_t is two little-endian u64 limbs: lo (low) then hi (high).
+    let mut bytes = [0u8; 16];
+    bytes[0..8].copy_from_slice(&result.lo.to_le_bytes());
+    bytes[8..16].copy_from_slice(&result.hi.to_le_bytes());
+
+    view.write(ret_ptr.offset() as u64, &bytes)
+        .map_err(|e| RuntimeError::new(e.to_string()))?;
+    Ok(())
+}
+
+pub fn __extenddftf2(
+    mut env: FunctionEnvMut<WasmContext>,
+    ret_ptr: WasmPtr<u8>,
+    d: f64,
+) -> Result<(), RuntimeError> {
+    let result = extenddftf2(d);
+    let (env_data, store) = env.data_and_store_mut();
+    let memory = env_data
+        .memory()
+        .as_ref()
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
+    let view = memory.view(&store);
+
+    let mut bytes = [0u8; 16];
+    bytes[0..8].copy_from_slice(&result.lo.to_le_bytes());
+    bytes[8..16].copy_from_slice(&result.hi.to_le_bytes());
+
+    view.write(ret_ptr.offset() as u64, &bytes)
+        .map_err(|e| RuntimeError::new(e.to_string()))?;
+    Ok(())
+}
+
+pub fn __trunctfdf2(
+    env: FunctionEnvMut<WasmContext>,
+    la: u64,
+    ha: u64,
+) -> Result<f64, RuntimeError> {
+    Ok(trunctfdf2(la, ha))
+}
+
+pub fn __trunctfsf2(
+    env: FunctionEnvMut<WasmContext>,
+    la: u64,
+    ha: u64,
+) -> Result<f32, RuntimeError> {
+    Ok(trunctfsf2(la, ha))
+}
+
+pub fn __fixtfsi(_env: FunctionEnvMut<WasmContext>, la: u64, ha: u64) -> Result<i32, RuntimeError> {
+    Ok(fixtfsi(la, ha))
+}
+
+pub fn __fixtfdi(_env: FunctionEnvMut<WasmContext>, la: u64, ha: u64) -> Result<i64, RuntimeError> {
+    Ok(fixtfdi(la, ha))
+}
+
+pub fn __fixtfti(
+    mut env: FunctionEnvMut<WasmContext>,
+    ret_ptr: WasmPtr<i128>,
+    l: u64,
+    h: u64,
+) -> Result<(), RuntimeError> {
+    let result = fixtfti(l, h); // the f128 -> i128 core function ported earlier
+    let (env_data, store) = env.data_and_store_mut();
+    let memory = env_data
+        .memory()
+        .as_ref()
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
+    let view = memory.view(&store);
+
+    write_i128_ffi(&view, ret_ptr, result)?;
+    Ok(())
+}
+
+pub fn __fixunstfsi(
+    _env: FunctionEnvMut<WasmContext>,
+    la: u64,
+    ha: u64,
+) -> Result<u32, RuntimeError> {
+    Ok(fixunstfsi(la, ha))
+}
+
+pub fn __fixunstfdi(
+    _env: FunctionEnvMut<WasmContext>,
+    la: u64,
+    ha: u64,
+) -> Result<u64, RuntimeError> {
+    Ok(fixunstfdi(la, ha))
+}
+
+pub fn __fixunstfti(
+    mut env: FunctionEnvMut<WasmContext>,
+    ret_ptr: WasmPtr<u128>,
+    l: u64,
+    h: u64,
+) -> Result<(), RuntimeError> {
+    let result = fixunstfti(l, h); // the f128 -> u128 core function ported earlier
+    let (env_data, store) = env.data_and_store_mut();
+    let memory = env_data
+        .memory()
+        .as_ref()
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
+    let view = memory.view(&store);
+    write_u128_ffi(&view, ret_ptr, result)?;
+    Ok(())
+}
+
+pub fn __fixsfti(
+    mut env: FunctionEnvMut<WasmContext>,
+    ret_ptr: WasmPtr<i128>,
+    a: f32,
+) -> Result<(), RuntimeError> {
+    let result = fixsfti(a);
+    let (env_data, store) = env.data_and_store_mut();
+    let memory = env_data
+        .memory()
+        .as_ref()
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
+    let view = memory.view(&store);
+    write_i128_ffi(&view, ret_ptr, result)?;
+    Ok(())
+}
+
+pub fn __fixdfti(
+    mut env: FunctionEnvMut<WasmContext>,
+    ret_ptr: WasmPtr<i128>,
+    a: f64,
+) -> Result<(), RuntimeError> {
+    let result = fixdfti(a); // to_softfloat64 -> u64 bit pattern
+    let (env_data, store) = env.data_and_store_mut();
+    let memory = env_data
+        .memory()
+        .as_ref()
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
+    let view = memory.view(&store);
+    write_i128_ffi(&view, ret_ptr, result)?;
+    Ok(())
+}
+
+pub fn __fixunssfti(
+    mut env: FunctionEnvMut<WasmContext>,
+    ret_ptr: WasmPtr<u128>,
+    a: f32,
+) -> Result<(), RuntimeError> {
+    let result = fixunssfti(a);
+    let (env_data, store) = env.data_and_store_mut();
+    let memory = env_data
+        .memory()
+        .as_ref()
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
+    let view = memory.view(&store);
+    write_u128_ffi(&view, ret_ptr, result)?;
+    Ok(())
+}
+
+pub fn __fixunsdfti(
+    mut env: FunctionEnvMut<WasmContext>,
+    ret_ptr: WasmPtr<u128>,
+    a: f64,
+) -> Result<(), RuntimeError> {
+    let result = fixunsdfti(a);
+    let (env_data, store) = env.data_and_store_mut();
+    let memory = env_data
+        .memory()
+        .as_ref()
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
+    let view = memory.view(&store);
+    write_u128_ffi(&view, ret_ptr, result)?;
+    Ok(())
+}
+
+pub fn __floatsidf(_env: FunctionEnvMut<WasmContext>, i: i32) -> Result<f64, RuntimeError> {
+    Ok(floatsidf(i))
+}
+
+pub fn __floatsitf(
+    mut env: FunctionEnvMut<WasmContext>,
+    ret_ptr: WasmPtr<u8>,
+    i: i32,
+) -> Result<(), RuntimeError> {
+    let result = floatsitf(i);
+
+    let (env_data, store) = env.data_and_store_mut();
+    let memory = env_data
+        .memory()
+        .as_ref()
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
+    let view = memory.view(&store);
+
+    let mut bytes = [0u8; 16];
+    bytes[0..8].copy_from_slice(&result.lo.to_le_bytes());
+    bytes[8..16].copy_from_slice(&result.hi.to_le_bytes());
+
+    view.write(ret_ptr.offset() as u64, &bytes)
+        .map_err(|e| RuntimeError::new(e.to_string()))?;
+    Ok(())
+}
+
+pub fn __floatditf(
+    mut env: FunctionEnvMut<WasmContext>,
+    ret_ptr: WasmPtr<u8>,
+    i: u64,
+) -> Result<(), RuntimeError> {
+    let result = floatditf(i);
+    let (env_data, store) = env.data_and_store_mut();
+    let memory = env_data
+        .memory()
+        .as_ref()
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
+    let view = memory.view(&store);
+
+    let mut bytes = [0u8; 16];
+    bytes[0..8].copy_from_slice(&result.lo.to_le_bytes());
+    bytes[8..16].copy_from_slice(&result.hi.to_le_bytes());
+
+    view.write(ret_ptr.offset() as u64, &bytes)
+        .map_err(|e| RuntimeError::new(e.to_string()))?;
+    Ok(())
+}
+
+pub fn __floatunsitf(
+    mut env: FunctionEnvMut<WasmContext>,
+    ret_ptr: WasmPtr<u8>,
+    i: u32,
+) -> Result<(), RuntimeError> {
+    let result = floatunsitf(i);
+
+    let (env_data, store) = env.data_and_store_mut();
+    let memory = env_data
+        .memory()
+        .as_ref()
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
+    let view = memory.view(&store);
+
+    let mut bytes = [0u8; 16];
+    bytes[0..8].copy_from_slice(&result.lo.to_le_bytes());
+    bytes[8..16].copy_from_slice(&result.hi.to_le_bytes());
+
+    view.write(ret_ptr.offset() as u64, &bytes)
+        .map_err(|e| RuntimeError::new(e.to_string()))?;
+    Ok(())
+}
+
+pub fn __floatunditf(
+    mut env: FunctionEnvMut<WasmContext>,
+    ret_ptr: WasmPtr<u8>,
+    i: u64,
+) -> Result<(), RuntimeError> {
+    let result = floatunditf(i);
+
+    let (env_data, store) = env.data_and_store_mut();
+    let memory = env_data
+        .memory()
+        .as_ref()
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
+    let view = memory.view(&store);
+
+    let mut bytes = [0u8; 16];
+    bytes[0..8].copy_from_slice(&result.lo.to_le_bytes());
+    bytes[8..16].copy_from_slice(&result.hi.to_le_bytes());
+
+    view.write(ret_ptr.offset() as u64, &bytes)
+        .map_err(|e| RuntimeError::new(e.to_string()))?;
+    Ok(())
+}
+
+pub fn __floattidf(
+    _env: FunctionEnvMut<WasmContext>,
+    la: u64,
+    ha: u64,
+) -> Result<f64, RuntimeError> {
+    Ok(floattidf(la, ha))
+}
+
 pub fn __floatuntidf(
     _env: FunctionEnvMut<WasmContext>,
     la: u64,
     ha: u64,
 ) -> Result<f64, RuntimeError> {
-    Ok(floatuntidf(((ha as u128) << 64) | (la as u128)))
+    Ok(floatuntidf(la, ha))
+}
+
+pub fn __eqtf2(
+    _env: FunctionEnvMut<WasmContext>,
+    la: u64,
+    ha: u64,
+    lb: u64,
+    hb: u64,
+) -> Result<i32, RuntimeError> {
+    Ok(eqtf2(la, ha, lb, hb))
+}
+
+pub fn __netf2(
+    _env: FunctionEnvMut<WasmContext>,
+    la: u64,
+    ha: u64,
+    lb: u64,
+    hb: u64,
+) -> Result<i32, RuntimeError> {
+    Ok(netf2(la, ha, lb, hb))
+}
+
+pub fn __getf2(
+    _env: FunctionEnvMut<WasmContext>,
+    la: u64,
+    ha: u64,
+    lb: u64,
+    hb: u64,
+) -> Result<i32, RuntimeError> {
+    Ok(getf2(la, ha, lb, hb))
+}
+
+pub fn __gttf2(
+    _env: FunctionEnvMut<WasmContext>,
+    la: u64,
+    ha: u64,
+    lb: u64,
+    hb: u64,
+) -> Result<i32, RuntimeError> {
+    Ok(gttf2(la, ha, lb, hb))
+}
+
+pub fn __letf2(
+    _env: FunctionEnvMut<WasmContext>,
+    la: u64,
+    ha: u64,
+    lb: u64,
+    hb: u64,
+) -> Result<i32, RuntimeError> {
+    Ok(letf2(la, ha, lb, hb))
+}
+
+pub fn __lttf2(
+    _env: FunctionEnvMut<WasmContext>,
+    la: u64,
+    ha: u64,
+    lb: u64,
+    hb: u64,
+) -> Result<i32, RuntimeError> {
+    Ok(lttf2(la, ha, lb, hb))
+}
+
+pub fn __cmptf2(
+    _env: FunctionEnvMut<WasmContext>,
+    la: u64,
+    ha: u64,
+    lb: u64,
+    hb: u64,
+) -> Result<i32, RuntimeError> {
+    Ok(cmptf2(la, ha, lb, hb))
+}
+
+pub fn __unordtf2(
+    _env: FunctionEnvMut<WasmContext>,
+    la: u64,
+    ha: u64,
+    lb: u64,
+    hb: u64,
+) -> Result<i32, RuntimeError> {
+    Ok(unordtf2(la, ha, lb, hb))
 }

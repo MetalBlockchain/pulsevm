@@ -8,9 +8,15 @@ use pulsevm_error::ChainError;
 use pulsevm_name::Name;
 
 use crate::{
-    AccountMetadataObject, Index64IteratorCache, Index128IteratorCache, KeyValueObject, bridge::ffi::{
-        self, Authority, CxxDigest, CxxGenesisState, CxxTimePoint, ElasticLimitParameters, Index64Object, Index128Object, TableObject, U128, get_account_info_with_core_symbol, get_account_info_without_core_symbol, get_currency_balance_with_symbol, get_currency_balance_without_symbol, get_currency_stats, get_table_by_scope, get_table_rows
-    }, iterator_cache::KeyValueIteratorCache
+    AccountMetadataObject, Index64IteratorCache, Index128IteratorCache, KeyValueObject,
+    bridge::ffi::{
+        self, Authority, CxxDigest, CxxGenesisState, CxxTimePoint, ElasticLimitParameters,
+        Index64Object, Index128Object, TableObject, U128, get_account_info_with_core_symbol,
+        get_account_info_without_core_symbol, get_currency_balance_with_symbol,
+        get_currency_balance_without_symbol, get_currency_stats, get_table_by_scope,
+        get_table_rows,
+    },
+    iterator_cache::KeyValueIteratorCache,
 };
 
 #[derive(Clone)]
@@ -852,12 +858,7 @@ impl Database {
         let pinned = guard.pin_mut();
 
         pinned
-            .db_idx64_end(
-                keyval_cache.pin_mut(),
-                code,
-                scope,
-                table,
-            )
+            .db_idx64_end(keyval_cache.pin_mut(), code, scope, table)
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 
@@ -1019,12 +1020,7 @@ impl Database {
         let pinned = guard.pin_mut();
 
         pinned
-            .db_idx128_end(
-                keyval_cache.pin_mut(),
-                code,
-                scope,
-                table,
-            )
+            .db_idx128_end(keyval_cache.pin_mut(), code, scope, table)
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 
@@ -1243,7 +1239,10 @@ impl Database {
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 
-    pub fn is_known_unexpired_transaction(&self, trx_id: &ffi::CxxDigest) -> Result<bool, ChainError> {
+    pub fn is_known_unexpired_transaction(
+        &self,
+        trx_id: &ffi::CxxDigest,
+    ) -> Result<bool, ChainError> {
         let guard = self.inner.read()?;
 
         guard

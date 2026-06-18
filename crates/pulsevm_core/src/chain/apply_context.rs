@@ -9,7 +9,8 @@ use pulsevm_billable_size::billable_size_v;
 use pulsevm_crypto::Bytes;
 use pulsevm_error::ChainError;
 use pulsevm_ffi::{
-    AccountMetadataObject, Database, Index64IteratorCache, Index64Object, Index128IteratorCache, Index128Object, KeyValueIteratorCache, KeyValueObject, TableObject
+    AccountMetadataObject, Database, Index64IteratorCache, Index64Object, Index128IteratorCache,
+    Index128Object, KeyValueIteratorCache, KeyValueObject, TableObject,
 };
 
 use crate::{
@@ -33,13 +34,13 @@ struct ApplyContextInner {
     start: i64,                           // Start time in microseconds
     privileged: bool,
     account_ram_deltas: BTreeMap<Name, i64>, // RAM usage deltas for accounts
-    notified: VecDeque<(Name, u32)>,        // List of notified accounts
-    inline_actions: Vec<u32>,               // List of inline actions
-    recurse_depth: u32,                     // The current recursion depth
-    keyval_cache: KeyValueIteratorCache,    // Cache for key-value iterators
-    index64_cache: Index64IteratorCache,    // Cache for index64 iterators
-    index128_cache: Index128IteratorCache,    // Cache for index128 iterators
-    cpu_limit: i64,                         // CPU limit for the current action
+    notified: VecDeque<(Name, u32)>,         // List of notified accounts
+    inline_actions: Vec<u32>,                // List of inline actions
+    recurse_depth: u32,                      // The current recursion depth
+    keyval_cache: KeyValueIteratorCache,     // Cache for key-value iterators
+    index64_cache: Index64IteratorCache,     // Cache for index64 iterators
+    index128_cache: Index128IteratorCache,   // Cache for index128 iterators
+    cpu_limit: i64,                          // CPU limit for the current action
 }
 
 #[derive(Clone)]
@@ -589,9 +590,9 @@ impl ApplyContext {
 
         let res = {
             let mut inner = self.inner.write()?;
-            let obj =
-                self.db
-                    .create_index64_object(table, payer, primary_key, secondary_key)?;
+            let obj = self
+                .db
+                .create_index64_object(table, payer, primary_key, secondary_key)?;
             let obj = unsafe { &*obj };
             inner.index64_cache.cache_table(&table)?;
             inner.index64_cache.add(obj)?
@@ -625,8 +626,7 @@ impl ApplyContext {
             } else {
                 payer
             };
-            self.db
-                .update_index64_object(obj, new_payer, secondary)?;
+            self.db.update_index64_object(obj, new_payer, secondary)?;
             (old_payer, new_payer)
         };
 
@@ -641,10 +641,14 @@ impl ApplyContext {
     pub fn db_idx64_remove(&mut self, iterator: i32) -> Result<(), ChainError> {
         {
             let mut inner = self.inner.write()?;
-            self.db.db_idx64_remove(&mut inner.index64_cache, iterator, self.receiver.as_u64())?;
+            self.db
+                .db_idx64_remove(&mut inner.index64_cache, iterator, self.receiver.as_u64())?;
         }
-        
-        self.update_db_usage(&Name::new(self.receiver.as_u64()), -(billable_size_v::<Index64Object>() as i64))?;
+
+        self.update_db_usage(
+            &Name::new(self.receiver.as_u64()),
+            -(billable_size_v::<Index64Object>() as i64),
+        )?;
 
         Ok(())
     }
@@ -658,21 +662,33 @@ impl ApplyContext {
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        self.db
-            .db_idx64_find_secondary(&mut inner.index64_cache, code, scope, table, secondary, primary)
+        self.db.db_idx64_find_secondary(
+            &mut inner.index64_cache,
+            code,
+            scope,
+            table,
+            secondary,
+            primary,
+        )
     }
 
     pub fn db_idx64_find_primary(
         &mut self,
-         code: u64,
-         scope: u64,
-         table: u64,
-         secondary: &mut u64,
-         primary: u64,
+        code: u64,
+        scope: u64,
+        table: u64,
+        secondary: &mut u64,
+        primary: u64,
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        self.db
-            .db_idx64_find_primary(&mut inner.index64_cache, code, scope, table, secondary, primary)
+        self.db.db_idx64_find_primary(
+            &mut inner.index64_cache,
+            code,
+            scope,
+            table,
+            secondary,
+            primary,
+        )
     }
 
     pub fn db_idx64_lowerbound(
@@ -684,8 +700,14 @@ impl ApplyContext {
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        self.db
-            .db_idx64_lowerbound(&mut inner.index64_cache, code, scope, table, secondary, primary)
+        self.db.db_idx64_lowerbound(
+            &mut inner.index64_cache,
+            code,
+            scope,
+            table,
+            secondary,
+            primary,
+        )
     }
 
     pub fn db_idx64_upperbound(
@@ -697,16 +719,17 @@ impl ApplyContext {
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        self.db
-            .db_idx64_upperbound(&mut inner.index64_cache, code, scope, table, secondary, primary)
+        self.db.db_idx64_upperbound(
+            &mut inner.index64_cache,
+            code,
+            scope,
+            table,
+            secondary,
+            primary,
+        )
     }
 
-    pub fn db_idx64_end(
-        &mut self,
-        code: u64,
-        scope: u64,
-        table: u64,
-    ) -> Result<i32, ChainError> {
+    pub fn db_idx64_end(&mut self, code: u64, scope: u64, table: u64) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
         self.db
             .db_idx64_end(&mut inner.index64_cache, code, scope, table)
@@ -718,7 +741,11 @@ impl ApplyContext {
             .db_idx64_next(&mut inner.index64_cache, iterator, primary)
     }
 
-    pub fn db_idx64_previous(&mut self, iterator: i32, primary: &mut u64) -> Result<i32, ChainError> {
+    pub fn db_idx64_previous(
+        &mut self,
+        iterator: i32,
+        primary: &mut u64,
+    ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
         self.db
             .db_idx64_previous(&mut inner.index64_cache, iterator, primary)
@@ -743,9 +770,9 @@ impl ApplyContext {
 
         let res = {
             let mut inner = self.inner.write()?;
-            let obj =
-                self.db
-                    .create_index128_object(table, payer, primary_key, secondary_key)?;
+            let obj = self
+                .db
+                .create_index128_object(table, payer, primary_key, secondary_key)?;
             let obj = unsafe { &*obj };
             inner.index128_cache.cache_table(&table)?;
             inner.index128_cache.add(obj)?
@@ -779,8 +806,7 @@ impl ApplyContext {
             } else {
                 payer
             };
-            self.db
-                .update_index128_object(obj, new_payer, secondary)?;
+            self.db.update_index128_object(obj, new_payer, secondary)?;
             (old_payer, new_payer)
         };
 
@@ -795,10 +821,17 @@ impl ApplyContext {
     pub fn db_idx128_remove(&mut self, iterator: i32) -> Result<(), ChainError> {
         {
             let mut inner = self.inner.write()?;
-            self.db.db_idx128_remove(&mut inner.index128_cache, iterator, self.receiver.as_u64())?;
+            self.db.db_idx128_remove(
+                &mut inner.index128_cache,
+                iterator,
+                self.receiver.as_u64(),
+            )?;
         }
-        
-        self.update_db_usage(&Name::new(self.receiver.as_u64()), -(billable_size_v::<Index128Object>() as i64))?;
+
+        self.update_db_usage(
+            &Name::new(self.receiver.as_u64()),
+            -(billable_size_v::<Index128Object>() as i64),
+        )?;
 
         Ok(())
     }
@@ -812,21 +845,33 @@ impl ApplyContext {
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        self.db
-            .db_idx128_find_secondary(&mut inner.index128_cache, code, scope, table, secondary, primary)
+        self.db.db_idx128_find_secondary(
+            &mut inner.index128_cache,
+            code,
+            scope,
+            table,
+            secondary,
+            primary,
+        )
     }
 
     pub fn db_idx128_find_primary(
         &mut self,
-         code: u64,
-         scope: u64,
-         table: u64,
-         secondary: &mut u128,
-         primary: u64,
+        code: u64,
+        scope: u64,
+        table: u64,
+        secondary: &mut u128,
+        primary: u64,
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        self.db
-            .db_idx128_find_primary(&mut inner.index128_cache, code, scope, table, secondary, primary)
+        self.db.db_idx128_find_primary(
+            &mut inner.index128_cache,
+            code,
+            scope,
+            table,
+            secondary,
+            primary,
+        )
     }
 
     pub fn db_idx128_lowerbound(
@@ -838,8 +883,14 @@ impl ApplyContext {
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        self.db
-            .db_idx128_lowerbound(&mut inner.index128_cache, code, scope, table, secondary, primary)
+        self.db.db_idx128_lowerbound(
+            &mut inner.index128_cache,
+            code,
+            scope,
+            table,
+            secondary,
+            primary,
+        )
     }
 
     pub fn db_idx128_upperbound(
@@ -851,16 +902,17 @@ impl ApplyContext {
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        self.db
-            .db_idx128_upperbound(&mut inner.index128_cache, code, scope, table, secondary, primary)
+        self.db.db_idx128_upperbound(
+            &mut inner.index128_cache,
+            code,
+            scope,
+            table,
+            secondary,
+            primary,
+        )
     }
 
-    pub fn db_idx128_end(
-        &mut self,
-        code: u64,
-        scope: u64,
-        table: u64,
-    ) -> Result<i32, ChainError> {
+    pub fn db_idx128_end(&mut self, code: u64, scope: u64, table: u64) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
         self.db
             .db_idx128_end(&mut inner.index128_cache, code, scope, table)
@@ -872,7 +924,11 @@ impl ApplyContext {
             .db_idx128_next(&mut inner.index128_cache, iterator, primary)
     }
 
-    pub fn db_idx128_previous(&mut self, iterator: i32, primary: &mut u64) -> Result<i32, ChainError> {
+    pub fn db_idx128_previous(
+        &mut self,
+        iterator: i32,
+        primary: &mut u64,
+    ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
         self.db
             .db_idx128_previous(&mut inner.index128_cache, iterator, primary)

@@ -1,6 +1,9 @@
 use wasmer::{FunctionEnvMut, RuntimeError, WasmPtr};
 
-use crate::chain::{wasm_runtime::WasmContext, webassembly::{read_u64, read_u128, write_u64, write_u128}};
+use crate::chain::{
+    wasm_runtime::WasmContext,
+    webassembly::{read_u64, read_u128, write_u64, write_u128},
+};
 
 pub fn db_find_i64(
     mut env: FunctionEnvMut<WasmContext>,
@@ -455,7 +458,10 @@ pub fn db_idx128_update(
     Ok(())
 }
 
-pub fn db_idx128_remove(mut env: FunctionEnvMut<WasmContext>, itr: i32) -> Result<(), RuntimeError> {
+pub fn db_idx128_remove(
+    mut env: FunctionEnvMut<WasmContext>,
+    itr: i32,
+) -> Result<(), RuntimeError> {
     let context = env.data_mut().apply_context_mut();
     context.db_idx128_remove(itr)?;
     Ok(())

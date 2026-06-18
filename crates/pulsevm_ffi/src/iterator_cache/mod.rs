@@ -3,7 +3,12 @@ use std::{ops::Deref, pin::Pin};
 use pulsevm_error::ChainError;
 
 use crate::{
-    Index64Object, KeyValueObject, TableId, TableObject, bridge::ffi::{CxxIndex64IteratorCache, CxxIndex128IteratorCache, CxxKeyValueIteratorCache, Index128Object, new_index64_iterator_cache, new_index128_iterator_cache, new_key_value_iterator_cache}
+    Index64Object, KeyValueObject, TableId, TableObject,
+    bridge::ffi::{
+        CxxIndex64IteratorCache, CxxIndex128IteratorCache, CxxKeyValueIteratorCache,
+        Index128Object, new_index64_iterator_cache, new_index128_iterator_cache,
+        new_key_value_iterator_cache,
+    },
 };
 
 pub struct KeyValueIteratorCache {

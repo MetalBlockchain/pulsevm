@@ -36,6 +36,16 @@ pub mod ffi {
         hi: u64,
     }
 
+    struct I128 {
+        lo: u64,
+        hi: u64,
+    }
+
+    struct Float128 {
+        lo: u64,
+        hi: u64,
+    }
+
     #[derive(Clone, PartialEq, Eq, Hash)]
     pub struct KeyWeight {
         key: SharedPtr<CxxPublicKey>,
@@ -81,6 +91,7 @@ pub mod ffi {
         include!("database.hpp");
         include!("iterator_cache.hpp");
         include!("api.hpp");
+        include!("builtins.hpp");
 
         pub fn open_database(
             path: &str,
@@ -417,7 +428,7 @@ pub mod ffi {
             table: u64,
             id: u64,
         ) -> Result<i32>;
-        
+
         // Index 64 methods
         pub fn db_idx64_remove(
             self: Pin<&mut Database>,
@@ -823,6 +834,56 @@ pub mod ffi {
 
         // State history
         pub fn pack_deltas(self: &Database, full_snapshot: bool) -> Result<Vec<u8>>;
+
+        // Arithmetic operations
+        pub fn addtf3(la: u64, ha: u64, lb: u64, hb: u64) -> Float128;
+        pub fn subtf3(la: u64, ha: u64, lb: u64, hb: u64) -> Float128;
+        pub fn multf3(la: u64, ha: u64, lb: u64, hb: u64) -> Float128;
+        pub fn divtf3(la: u64, ha: u64, lb: u64, hb: u64) -> Float128;
+        pub fn negtf2(la: u64, ha: u64) -> Float128;
+
+        // ---- widening: float -> f128 ----
+        pub fn extendsftf2(f: f32) -> Float128;
+        pub fn extenddftf2(d: f64) -> Float128;
+
+        // ---- narrowing: f128 -> float ----
+        pub fn trunctfdf2(l: u64, h: u64) -> f64;
+        pub fn trunctfsf2(l: u64, h: u64) -> f32;
+
+        // ---- f128 -> signed/unsigned int ----
+        pub fn fixtfsi(l: u64, h: u64) -> i32;
+        pub fn fixtfdi(l: u64, h: u64) -> i64;
+        pub fn fixtfti(l: u64, h: u64) -> I128;
+        pub fn fixunstfsi(l: u64, h: u64) -> u32;
+        pub fn fixunstfdi(l: u64, h: u64) -> u64;
+        pub fn fixunstfti(l: u64, h: u64) -> U128;
+
+        // ---- float -> i128/u128 ----
+        pub fn fixsfti(a: f32) -> I128;
+        pub fn fixdfti(a: f64) -> I128;
+        pub fn fixunssfti(a: f32) -> U128;
+        pub fn fixunsdfti(a: f64) -> U128;
+
+        // ---- int -> float/f128 ----
+        pub fn floatsidf(i: i32) -> f64;
+        pub fn floatsitf(i: i32) -> Float128;
+        pub fn floatditf(a: u64) -> Float128;
+        pub fn floatunsitf(i: u32) -> Float128;
+        pub fn floatunditf(a: u64) -> Float128;
+
+        // ---- 128-bit int -> double ----
+        pub fn floattidf(l: u64, h: u64) -> f64;
+        pub fn floatuntidf(l: u64, h: u64) -> f64;
+
+        // ---- comparisons ----
+        pub fn unordtf2(la: u64, ha: u64, lb: u64, hb: u64) -> i32;
+        pub fn eqtf2(la: u64, ha: u64, lb: u64, hb: u64) -> i32;
+        pub fn netf2(la: u64, ha: u64, lb: u64, hb: u64) -> i32;
+        pub fn getf2(la: u64, ha: u64, lb: u64, hb: u64) -> i32;
+        pub fn gttf2(la: u64, ha: u64, lb: u64, hb: u64) -> i32;
+        pub fn letf2(la: u64, ha: u64, lb: u64, hb: u64) -> i32;
+        pub fn lttf2(la: u64, ha: u64, lb: u64, hb: u64) -> i32;
+        pub fn cmptf2(la: u64, ha: u64, lb: u64, hb: u64) -> i32;
     }
 }
 

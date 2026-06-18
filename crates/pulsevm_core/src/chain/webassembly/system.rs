@@ -104,9 +104,7 @@ pub fn pulse_assert_message(
         // Truncation to max_assert_message happens after validation
         let sz = (msg_len as usize).min(MAX_ASSERT_MESSAGE);
         let mut src_bytes = vec![0u8; sz];
-        slice
-            .subslice(0..sz as u64)
-            .read_slice(&mut src_bytes)?;
+        slice.subslice(0..sz as u64).read_slice(&mut src_bytes)?;
 
         let msg = String::from_utf8_lossy(&src_bytes);
         return Err(RuntimeError::new(format!(
@@ -133,19 +131,14 @@ pub fn pulse_assert_code(
     Ok(())
 }
 
-pub fn pulse_exit(
-    _env: FunctionEnvMut<WasmContext>,
-    code: u32,
-) -> Result<(), RuntimeError> {
+pub fn pulse_exit(_env: FunctionEnvMut<WasmContext>, code: u32) -> Result<(), RuntimeError> {
     return Err(RuntimeError::new(format!(
         "exit called with code: {}",
         code
     )));
 }
 
-pub fn abort(
-    _env: FunctionEnvMut<WasmContext>,
-) -> Result<(), RuntimeError> {
+pub fn abort(_env: FunctionEnvMut<WasmContext>) -> Result<(), RuntimeError> {
     return Err(RuntimeError::new("abort called"));
 }
 

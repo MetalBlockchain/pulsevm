@@ -1,4 +1,7 @@
-use std::{collections::{BTreeMap, HashMap}, fmt};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fmt,
+};
 
 use pulsevm_crypto::Digest;
 use pulsevm_error::ChainError;

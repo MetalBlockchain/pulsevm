@@ -1,6 +1,8 @@
 use core::fmt;
 use std::{
-    collections::{HashMap, HashSet, VecDeque}, str::FromStr, sync::{Arc, LazyLock}
+    collections::{HashMap, HashSet, VecDeque},
+    str::FromStr,
+    sync::{Arc, LazyLock},
 };
 
 use crate::{
@@ -390,7 +392,8 @@ impl Controller {
         let parent_block_id = block.previous_id();
         let block_status = BlockStatus::Verifying;
         self.replay_accepted_state_to(parent_block_id.clone(), &block_status, mempool)?;
-        let (_transaction_traces, transaction_mroot, action_mroot) = self.execute_block(block, &block_status, mempool)?;
+        let (_transaction_traces, transaction_mroot, action_mroot) =
+            self.execute_block(block, &block_status, mempool)?;
 
         // Validate the block's transaction and action merkle roots
         block.validate_semantically(transaction_mroot, action_mroot)?;
@@ -405,11 +408,7 @@ impl Controller {
         Ok(())
     }
 
-    pub fn accept_block(
-        &mut self,
-        block_id: &Id,
-        mempool: &mut Mempool,
-    ) -> Result<(), ChainError> {
+    pub fn accept_block(&mut self, block_id: &Id, mempool: &mut Mempool) -> Result<(), ChainError> {
         let block = {
             self.verified_blocks
                 .get(block_id)
@@ -426,7 +425,9 @@ impl Controller {
         self.replay_accepted_state_to(parent_block_id.clone(), &block_status, mempool)?;
         let (transaction_traces, _transaction_mroot, _action_mroot) = self
             .execute_block(&block, &block_status, mempool)
-            .map_err(|e| ChainError::DatabaseError(format!("failed to execute block {}: {}", block_id, e)))?;
+            .map_err(|e| {
+                ChainError::DatabaseError(format!("failed to execute block {}: {}", block_id, e))
+            })?;
         let packed_block = block.pack().map_err(|e| {
             ChainError::TransactionError(format!("failed to pack block {}: {}", block_id, e))
         })?;
@@ -506,7 +507,10 @@ impl Controller {
 
             // Add trace to traces
             transaction_traces.push(result.trace.clone());
-            transaction_receipts.push_back(TransactionReceipt::new(result.trace.receipt, receipt.trx().clone()));
+            transaction_receipts.push_back(TransactionReceipt::new(
+                result.trace.receipt,
+                receipt.trx().clone(),
+            ));
             action_receipt_digests.extend(result.action_receipt_digests);
 
             // Remove from mempool if we have it
@@ -646,7 +650,7 @@ impl Controller {
         if self.verified_blocks.contains_key(&id) {
             return Ok(self.verified_blocks.get(&id).cloned());
         }
-        
+
         let num = BlockHeader::num_from_id(&id);
 
         self.get_block_by_height(num)
@@ -822,14 +826,26 @@ impl Controller {
     // This function will replay the accepted state from the last accepted block to the given block id
     // This is useful for switching forks and making sure we have the correct state for the preferred block
     // In the future we should optimize chainbase so we can replay deltas instead of executing blocks, but for now this is simpler to implement and works fine for our use case
-    pub fn replay_accepted_state_to(&mut self, block_id: Id, block_status: &BlockStatus, mempool: &mut Mempool) -> Result<(), ChainError> {
+    pub fn replay_accepted_state_to(
+        &mut self,
+        block_id: Id,
+        block_status: &BlockStatus,
+        mempool: &mut Mempool,
+    ) -> Result<(), ChainError> {
         // Build the path from target back to last_accepted, then reverse.
         let mut path: Vec<SignedBlock> = Vec::new();
         let mut cursor = block_id;
         while cursor != self.last_accepted_block_id {
-            let block = self.verified_blocks.get(&cursor).ok_or_else(|| {
-                ChainError::NetworkError(format!("block {} not found in verified blocks", cursor))
-            })?.clone();
+            let block = self
+                .verified_blocks
+                .get(&cursor)
+                .ok_or_else(|| {
+                    ChainError::NetworkError(format!(
+                        "block {} not found in verified blocks",
+                        cursor
+                    ))
+                })?
+                .clone();
             let prev = block.previous_id().clone();
             path.push(block);
             cursor = prev;
@@ -839,7 +855,8 @@ impl Controller {
         for block in path.into_iter().rev() {
             debug!(
                 "replaying accepted state from block {} to block {}",
-                self.last_accepted_block_id, block.id()?
+                self.last_accepted_block_id,
+                block.id()?
             );
             self.execute_block(&block, block_status, mempool)?;
         }
@@ -868,7 +885,8 @@ mod tests {
             pulse_contract::{NewAccount, SetCode},
             transaction::{Action, Transaction, TransactionHeader},
         },
-        crypto::PrivateKey, transaction::TransactionReceiptHeader,
+        crypto::PrivateKey,
+        transaction::TransactionReceiptHeader,
     };
 
     use super::*;
@@ -1030,12 +1048,14 @@ mod tests {
         })
         .to_string()
         .into_bytes();
-        controller.initialize(
-            &chain_id,
-            &config_bytes,
-            &genesis_bytes.to_vec(),
-            temp_path.path().to_str().unwrap(),
-        ).await?;
+        controller
+            .initialize(
+                &chain_id,
+                &config_bytes,
+                &genesis_bytes.to_vec(),
+                temp_path.path().to_str().unwrap(),
+            )
+            .await?;
         assert_eq!(controller.last_accepted_block().block_num(), 1);
         let pending_block_timestamp = controller.last_accepted_block().timestamp().clone();
         let chain_id = controller.chain_id().clone();
@@ -1147,12 +1167,14 @@ mod tests {
         })
         .to_string()
         .into_bytes();
-        controller.initialize(
-            &chain_id,
-            &config_bytes,
-            &genesis_bytes.to_vec(),
-            temp_path.path().to_str().unwrap(),
-        ).await?;
+        controller
+            .initialize(
+                &chain_id,
+                &config_bytes,
+                &genesis_bytes.to_vec(),
+                temp_path.path().to_str().unwrap(),
+            )
+            .await?;
         let pending_block_timestamp = controller.last_accepted_block().timestamp().clone();
         let chain_id = controller.chain_id().clone();
         let block_status = BlockStatus::Building;
@@ -1174,12 +1196,22 @@ mod tests {
         let contract =
             fs::read(root.join(Path::new("reference_contracts/test_api_db.wasm"))).unwrap();
         controller.execute_transaction(
-            &set_code(&private_key, Name::from_str("testapi")?, contract.clone(), chain_id)?,
+            &set_code(
+                &private_key,
+                Name::from_str("testapi")?,
+                contract.clone(),
+                chain_id,
+            )?,
             &pending_block_timestamp,
             &block_status,
         )?;
         controller.execute_transaction(
-            &set_code(&private_key, Name::from_str("testapi2")?, contract, chain_id)?,
+            &set_code(
+                &private_key,
+                Name::from_str("testapi2")?,
+                contract,
+                chain_id,
+            )?,
             &pending_block_timestamp,
             &block_status,
         )?;
@@ -1385,16 +1417,25 @@ mod tests {
         })
         .to_string()
         .into_bytes();
-        controller.initialize(
-            &chain_id,
-            &config_bytes,
-            &genesis_bytes.to_vec(),
-            temp_path.path().to_str().unwrap(),
-        ).await?;
+        controller
+            .initialize(
+                &chain_id,
+                &config_bytes,
+                &genesis_bytes.to_vec(),
+                temp_path.path().to_str().unwrap(),
+            )
+            .await?;
         assert_eq!(controller.last_accepted_block().block_num(), 1);
         let chain_id = controller.chain_id().clone();
         let mut txs = VecDeque::new();
-        txs.push_back(TransactionReceipt::new(TransactionReceiptHeader::new(crate::transaction::TransactionStatus::Executed, 1, 1.into()), create_account(&private_key, Name::from_str("testapi")?, chain_id)?));
+        txs.push_back(TransactionReceipt::new(
+            TransactionReceiptHeader::new(
+                crate::transaction::TransactionStatus::Executed,
+                1,
+                1.into(),
+            ),
+            create_account(&private_key, Name::from_str("testapi")?, chain_id)?,
+        ));
         let block = SignedBlock::new(
             controller.last_accepted_block().id()?,
             BlockTimestamp::now(),
@@ -1426,12 +1467,14 @@ mod tests {
         })
         .to_string()
         .into_bytes();
-        controller.initialize(
-            &chain_id,
-            &config_bytes,
-            &genesis_bytes.to_vec(),
-            temp_path.path().to_str().unwrap(),
-        ).await?;
+        controller
+            .initialize(
+                &chain_id,
+                &config_bytes,
+                &genesis_bytes.to_vec(),
+                temp_path.path().to_str().unwrap(),
+            )
+            .await?;
         assert_eq!(controller.last_accepted_block().block_num(), 1);
         let pending_block_timestamp = controller.last_accepted_block().timestamp().clone();
         let chain_id = controller.chain_id().clone();
@@ -1441,9 +1484,14 @@ mod tests {
             &pending_block_timestamp,
             &block_status,
         )?;
-        assert_eq!(result.trace.receipt.status, crate::transaction::TransactionStatus::Executed);
+        assert_eq!(
+            result.trace.receipt.status,
+            crate::transaction::TransactionStatus::Executed
+        );
         let digest = result.trace.id.to_digest()?;
-        let found = controller.database().is_known_unexpired_transaction(&digest)?;
+        let found = controller
+            .database()
+            .is_known_unexpired_transaction(&digest)?;
         assert!(!found);
 
         Ok(())

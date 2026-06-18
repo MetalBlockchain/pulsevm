@@ -23,6 +23,7 @@ mod privileged;
 pub use privileged::*;
 
 mod system;
+use pulsevm_ffi::{I128, U128};
 pub use system::*;
 
 mod transaction;
@@ -48,5 +49,21 @@ fn write_u64(view: &MemoryView, ptr: WasmPtr<u64>, val: u64) -> Result<(), Runti
 
 fn write_u128(view: &MemoryView, ptr: WasmPtr<u128>, val: u128) -> Result<(), RuntimeError> {
     view.write(ptr.offset() as u64, &val.to_le_bytes())?;
+    Ok(())
+}
+
+fn write_u128_ffi(view: &MemoryView, ptr: WasmPtr<u128>, val: U128) -> Result<(), RuntimeError> {
+    let mut out = [0u8; 16];
+    out[0..8].copy_from_slice(&val.lo.to_le_bytes());
+    out[8..16].copy_from_slice(&val.hi.to_le_bytes());
+    view.write(ptr.offset() as u64, &out)?;
+    Ok(())
+}
+
+fn write_i128_ffi(view: &MemoryView, ptr: WasmPtr<i128>, val: I128) -> Result<(), RuntimeError> {
+    let mut out = [0u8; 16];
+    out[0..8].copy_from_slice(&val.lo.to_le_bytes());
+    out[8..16].copy_from_slice(&val.hi.to_le_bytes());
+    view.write(ptr.offset() as u64, &out)?;
     Ok(())
 }

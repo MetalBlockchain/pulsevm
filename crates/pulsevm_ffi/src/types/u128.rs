@@ -2,7 +2,10 @@ use crate::bridge::ffi::U128;
 
 impl From<u128> for U128 {
     fn from(v: u128) -> Self {
-        U128 { lo: v as u64, hi: (v >> 64) as u64 }
+        U128 {
+            lo: v as u64,
+            hi: (v >> 64) as u64,
+        }
     }
 }
 

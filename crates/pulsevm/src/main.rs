@@ -165,9 +165,7 @@ impl VirtualMachine {
         let network_manager = Arc::new(RwLock::new(chain::NetworkManager::new()));
         let rpc_service =
             chain::RpcService::new(mempool.clone(), controller.clone(), network_manager.clone());
-        let block_timer = Arc::new(RwLock::new(BlockTimer::new(
-            mempool.clone(),
-        )));
+        let block_timer = Arc::new(RwLock::new(BlockTimer::new(mempool.clone())));
 
         Ok(Self {
             server_addr,
@@ -359,7 +357,10 @@ impl Vm for VirtualMachine {
         let block_id = block
             .id()
             .map_err(|e| Status::internal(format!("could not get block id: {}", e)))?;
-        debug!("block built with id {}, returning from build_block", block_id);
+        debug!(
+            "block built with id {}, returning from build_block",
+            block_id
+        );
         Ok(Response::new(vm::BuildBlockResponse {
             id: block_id.into(),
             parent_id: block.previous_id().as_bytes().to_vec(),
@@ -384,7 +385,10 @@ impl Vm for VirtualMachine {
         let block_id = block
             .id()
             .map_err(|e| Status::internal(format!("could not get block id: {}", e)))?;
-        debug!("block parsed with id {}, returning from parse_block", block_id);
+        debug!(
+            "block parsed with id {}, returning from parse_block",
+            block_id
+        );
         Ok(Response::new(vm::ParseBlockResponse {
             id: block_id.into(),
             parent_id: block.previous_id().as_bytes().to_vec(),
@@ -454,12 +458,24 @@ impl Vm for VirtualMachine {
         // Verify the block
         match controller.verify_block(&block, &mut mempool).await {
             Ok(_) => {
-                debug!("block verified with id {}, returning from block_verify", block.id().unwrap_or_default());
+                debug!(
+                    "block verified with id {}, returning from block_verify",
+                    block.id().unwrap_or_default()
+                );
             }
             Err(e) => {
-                warn!("could not verify block with id {} and height {}: {:?}", block.id().unwrap_or_default(), block.block_num(), e);
+                warn!(
+                    "could not verify block with id {} and height {}: {:?}",
+                    block.id().unwrap_or_default(),
+                    block.block_num(),
+                    e
+                );
 
-                return Err(Status::internal(format!("could not verify block with id {}: {}", block.id().unwrap_or_default(), e)));
+                return Err(Status::internal(format!(
+                    "could not verify block with id {}: {}",
+                    block.id().unwrap_or_default(),
+                    e
+                )));
             }
         }
 
@@ -484,7 +500,10 @@ impl Vm for VirtualMachine {
         controller
             .accept_block(&block_id, &mut mempool)
             .map_err(|e| Status::internal(format!("could not accept block: {}", e)))?;
-        debug!("block accepted with id {}, returning from block_accept", block_id);
+        debug!(
+            "block accepted with id {}, returning from block_accept",
+            block_id
+        );
 
         Ok(Response::new(()))
     }
@@ -521,7 +540,10 @@ impl Vm for VirtualMachine {
             .clone()
             .try_into()
             .map_err(|_| Status::invalid_argument("invalid block id"))?;
-        debug!("set_preference called, setting preferred block to {}", preferred_id);
+        debug!(
+            "set_preference called, setting preferred block to {}",
+            preferred_id
+        );
         controller.set_preferred_id(preferred_id);
         Ok(Response::new(()))
     }
@@ -652,7 +674,11 @@ impl Vm for VirtualMachine {
             current_id = parent_id;
         }
 
-        debug!("retrieved {} ancestors with total size {}, returning from get_ancestors", ancestors.len(), total_size);
+        debug!(
+            "retrieved {} ancestors with total size {}, returning from get_ancestors",
+            ancestors.len(),
+            total_size
+        );
 
         Ok(Response::new(vm::GetAncestorsResponse {
             blks_bytes: ancestors,
@@ -684,7 +710,10 @@ impl Vm for VirtualMachine {
             });
         }
 
-        debug!("parsed {} blocks, returning from batched_parse_block", parsed_blocks.len());
+        debug!(
+            "parsed {} blocks, returning from batched_parse_block",
+            parsed_blocks.len()
+        );
 
         Ok(Response::new(vm::BatchedParseBlockResponse {
             response: parsed_blocks,
@@ -695,7 +724,10 @@ impl Vm for VirtualMachine {
         &self,
         request: Request<vm::GetBlockIdAtHeightRequest>,
     ) -> Result<tonic::Response<vm::GetBlockIdAtHeightResponse>, Status> {
-        debug!("get_block_id_at_height called, retrieving block id at height {}...", request.get_ref().height);
+        debug!(
+            "get_block_id_at_height called, retrieving block id at height {}...",
+            request.get_ref().height
+        );
         let controller = self.controller.clone();
         let controller = controller.read().await;
 
@@ -712,7 +744,7 @@ impl Vm for VirtualMachine {
             }
             Ok(None) => {
                 warn!("block not found at height: {}", request.get_ref().height);
-                
+
                 return Ok(Response::new(vm::GetBlockIdAtHeightResponse {
                     blk_id: vec![].into(),
                     err: vm::Error::NotFound as i32,

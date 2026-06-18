@@ -85,9 +85,12 @@ fn main() {
         .file("name.cpp")
         .file("iterator_cache.cpp")
         .file("api.cpp")
+        .file("builtins.cpp")
         // Include directories
         .include(boost_headers) // Standard system headers
         .include(libraries_root.join("chainbase/include")) // Add chainbase source headers
+        .include(libraries_root.join("builtins")) // Add chainbase source headers
+        .include(libraries_root.join("softfloat/source/include")) // Add chainbase source headers
         .include(libraries_root.join("chain/include")) // Add fc built headers
         .include(libraries_root.join("state_history/include")) // Add state_history built headers
         .include(libraries_root.join("libfc/include")) // Add fc source headers
@@ -113,6 +116,8 @@ fn main() {
     println!("cargo:rustc-link-lib=static=fc");
     println!("cargo:rustc-link-lib=static=state_history");
     println!("cargo:rustc-link-lib=static=chainbase");
+    println!("cargo:rustc-link-lib=static=softfloat");
+    println!("cargo:rustc-link-lib=static=builtins");
     println!("cargo:rustc-link-lib=static=bls12-381");
     println!("cargo:rustc-link-lib=static=decrepit");
     println!("cargo:rustc-link-lib=static=bscrypto");
