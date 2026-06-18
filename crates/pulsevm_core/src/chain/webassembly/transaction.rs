@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashSet};
 
 use pulsevm_error::ChainError;
-use pulsevm_serialization::{Read, Write};
+use pulsevm_serialization::{NumBytes, Read, Write};
 use wasmer::{FunctionEnvMut, RuntimeError, WasmPtr};
 
 use crate::{
@@ -143,4 +143,17 @@ pub fn read_transaction(
         .map_err(|e| RuntimeError::new(format!("failed to write transaction data: {}", e)))?;
 
     Ok(copy_size as u32)
+}
+
+pub fn transaction_size(
+    env: FunctionEnvMut<WasmContext>,
+) -> Result<u32, RuntimeError> {
+    let env_data = env.data();
+    let size = env_data
+        .apply_context()
+        .get_packed_transaction()
+        .get_transaction()
+        .num_bytes();
+
+    Ok(size as u32)
 }
