@@ -177,7 +177,11 @@ impl TransactionContext {
         // Reserve actions array
         {
             let mut inner = self.inner.write()?;
-            inner.trace.action_traces.reserve(transaction.actions.len());
+            inner.trace.action_traces.reserve(transaction.actions.len() + transaction.context_free_actions.len());
+        }
+
+        for action in transaction.context_free_actions.iter() {
+            self.schedule_action(action.clone(), &action.account(), true, 0, 0)?;
         }
 
         for action in transaction.actions.iter() {
@@ -271,8 +275,8 @@ impl TransactionContext {
         action_ordinal: u32,
         recurse_depth: u32,
     ) -> Result<(), ChainError> {
-        let (action, receiver) = self.with_action_trace(action_ordinal, |t| {
-            (t.action().clone(), t.receiver().clone())
+        let (action, receiver, context_free) = self.with_action_trace(action_ordinal, |t| {
+            (t.action().clone(), t.receiver().clone(), t.context_free())
         })?;
 
         let mut apply_context = ApplyContext::new(
@@ -284,6 +288,7 @@ impl TransactionContext {
             action_ordinal,
             recurse_depth,
             self.get_cpu_limit()?,
+            context_free,
         )?;
 
         // Initialize the apply context with the action trace.

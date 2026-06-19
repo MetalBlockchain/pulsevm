@@ -1,7 +1,7 @@
 use pulsevm_error::ChainError;
 use wasmer::{FunctionEnvMut, RuntimeError, WasmPtr};
 
-use crate::chain::{controller::Controller, utils::pulse_assert, wasm_runtime::WasmContext};
+use crate::chain::{controller::Controller, utils::pulse_assert, wasm_runtime::WasmContext, webassembly::context_aware_check};
 
 #[inline]
 pub fn action_data_size(env: FunctionEnvMut<WasmContext>) -> i32 {
@@ -44,6 +44,8 @@ pub fn set_action_return_value(
     buffer_ptr: WasmPtr<u8>,
     buffer_len: u32,
 ) -> Result<(), RuntimeError> {
+    context_aware_check(&env)?;
+
     let (env_data, store) = env.data_and_store_mut();
 
     {

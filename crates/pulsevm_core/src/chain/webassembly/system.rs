@@ -1,6 +1,6 @@
 use wasmer::{FunctionEnvMut, RuntimeError, WasmPtr};
 
-use crate::chain::wasm_runtime::WasmContext;
+use crate::chain::{wasm_runtime::WasmContext, webassembly::context_aware_check};
 
 const MAX_ASSERT_MESSAGE: usize = 1024;
 
@@ -143,6 +143,7 @@ pub fn abort(_env: FunctionEnvMut<WasmContext>) -> Result<(), RuntimeError> {
 }
 
 pub fn current_time(env: FunctionEnvMut<WasmContext>) -> Result<u64, RuntimeError> {
+    context_aware_check(&env)?;
     let result = env
         .data()
         .pending_block_timestamp()

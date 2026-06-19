@@ -2,7 +2,7 @@ use wasmer::{FunctionEnvMut, RuntimeError, WasmPtr};
 
 use crate::chain::{
     wasm_runtime::WasmContext,
-    webassembly::{read_u64, read_u128, write_u64, write_u128},
+    webassembly::{context_aware_check, read_u64, read_u128, write_u64, write_u128},
 };
 
 pub fn db_find_i64(
@@ -12,6 +12,7 @@ pub fn db_find_i64(
     table: u64,
     id: u64,
 ) -> Result<i32, RuntimeError> {
+    context_aware_check(&env)?;
     let context = env.data_mut().apply_context_mut();
     let result = context.db_find_i64(code, scope, table, id)?;
     Ok(result)
@@ -26,6 +27,7 @@ pub fn db_store_i64(
     buffer_ptr: WasmPtr<u8>,
     buffer_len: u32,
 ) -> Result<i32, RuntimeError> {
+    context_aware_check(&env)?;
     let (env_data, store) = env.data_and_store_mut();
     let memory = env_data
         .memory()
@@ -49,6 +51,7 @@ pub fn db_get_i64(
     buffer_ptr: WasmPtr<u8>,
     buffer_len: u32,
 ) -> Result<i32, RuntimeError> {
+    context_aware_check(&env)?;
     let (env_data, store) = env.data_and_store_mut();
     let memory = env_data
         .memory()
@@ -70,6 +73,7 @@ pub fn db_update_i64(
     buffer_ptr: WasmPtr<u8>,
     buffer_len: u32,
 ) -> Result<(), RuntimeError> {
+    context_aware_check(&env)?;
     let (env_data, store) = env.data_and_store_mut();
     let memory = env_data
         .memory()
@@ -88,6 +92,7 @@ pub fn db_update_i64(
 }
 
 pub fn db_remove_i64(mut env: FunctionEnvMut<WasmContext>, itr: i32) -> Result<(), RuntimeError> {
+    context_aware_check(&env)?;
     let context = env.data_mut().apply_context_mut();
     context.db_remove_i64(itr)?;
     Ok(())
@@ -98,6 +103,7 @@ pub fn db_next_i64(
     itr: i32,
     primary_ptr: WasmPtr<u8>,
 ) -> Result<i32, RuntimeError> {
+    context_aware_check(&env)?;
     let context = env.data_mut().apply_context_mut();
     let mut next_primary = 0u64;
     let res = context.db_next_i64(itr, &mut next_primary)?;
@@ -122,6 +128,7 @@ pub fn db_previous_i64(
     itr: i32,
     primary_ptr: WasmPtr<u8>,
 ) -> Result<i32, RuntimeError> {
+    context_aware_check(&env)?;
     let context = env.data_mut().apply_context_mut();
     let mut next_primary = 0u64;
     let res = context.db_previous_i64(itr, &mut next_primary)?;
@@ -148,6 +155,7 @@ pub fn db_lowerbound_i64(
     table: u64,
     primary: u64,
 ) -> Result<i32, RuntimeError> {
+    context_aware_check(&env)?;
     let context = env.data_mut().apply_context_mut();
     let res = context.db_lowerbound_i64(code.into(), scope.into(), table.into(), primary)?;
     Ok(res)
@@ -160,6 +168,7 @@ pub fn db_upperbound_i64(
     table: u64,
     primary: u64,
 ) -> Result<i32, RuntimeError> {
+    context_aware_check(&env)?;
     let context = env.data_mut().apply_context_mut();
     let res = context.db_upperbound_i64(code.into(), scope.into(), table.into(), primary)?;
     Ok(res)
@@ -171,6 +180,7 @@ pub fn db_end_i64(
     scope: u64,
     table: u64,
 ) -> Result<i32, RuntimeError> {
+    context_aware_check(&env)?;
     let context = env.data_mut().apply_context_mut();
     Ok(context.db_end_i64(code.into(), scope.into(), table.into())?)
 }
@@ -183,6 +193,7 @@ pub fn db_idx64_store(
     id: u64,
     secondary_ptr: WasmPtr<u64>,
 ) -> Result<i32, RuntimeError> {
+    context_aware_check(&env)?;
     let (env_data, store) = env.data_and_store_mut();
     let memory = env_data
         .memory()
@@ -201,6 +212,7 @@ pub fn db_idx64_update(
     payer: u64,
     secondary_ptr: WasmPtr<u64>,
 ) -> Result<(), RuntimeError> {
+    context_aware_check(&env)?;
     let (env_data, store) = env.data_and_store_mut();
     let memory = env_data
         .memory()
@@ -215,6 +227,7 @@ pub fn db_idx64_update(
 }
 
 pub fn db_idx64_remove(mut env: FunctionEnvMut<WasmContext>, itr: i32) -> Result<(), RuntimeError> {
+    context_aware_check(&env)?;
     let context = env.data_mut().apply_context_mut();
     context.db_idx64_remove(itr)?;
     Ok(())
@@ -228,6 +241,7 @@ pub fn db_idx64_find_secondary(
     secondary_ptr: WasmPtr<u64>,
     primary_ptr: WasmPtr<u64>,
 ) -> Result<i32, RuntimeError> {
+    context_aware_check(&env)?;
     let (env_data, store) = env.data_and_store_mut();
 
     // Clone the memory handle so the borrow on env_data is released
@@ -266,6 +280,7 @@ pub fn db_idx64_find_primary(
     secondary_ptr: WasmPtr<u64>,
     primary: u64,
 ) -> Result<i32, RuntimeError> {
+    context_aware_check(&env)?;
     let (env_data, store) = env.data_and_store_mut();
 
     // Clone the memory handle so the borrow on env_data is released
@@ -301,6 +316,7 @@ pub fn db_idx64_lowerbound(
     secondary_ptr: WasmPtr<u64>,
     primary_ptr: WasmPtr<u64>,
 ) -> Result<i32, RuntimeError> {
+    context_aware_check(&env)?;
     let (env_data, store) = env.data_and_store_mut();
 
     // Clone the memory handle so the borrow on env_data is released
@@ -340,6 +356,7 @@ pub fn db_idx64_upperbound(
     secondary_ptr: WasmPtr<u64>,
     primary_ptr: WasmPtr<u64>,
 ) -> Result<i32, RuntimeError> {
+    context_aware_check(&env)?;
     let (env_data, store) = env.data_and_store_mut();
 
     // Clone the memory handle so the borrow on env_data is released
@@ -377,6 +394,7 @@ pub fn db_idx64_end(
     scope: u64,
     table: u64,
 ) -> Result<i32, RuntimeError> {
+    context_aware_check(&env)?;
     let context = env.data_mut().apply_context_mut();
     Ok(context.db_idx64_end(code.into(), scope.into(), table.into())?)
 }
@@ -386,6 +404,7 @@ pub fn db_idx64_next(
     itr: i32,
     primary_ptr: WasmPtr<u64>,
 ) -> Result<i32, RuntimeError> {
+    context_aware_check(&env)?;
     let (env_data, store) = env.data_and_store_mut();
     let memory = env_data
         .memory()
@@ -405,6 +424,7 @@ pub fn db_idx64_previous(
     itr: i32,
     primary_ptr: WasmPtr<u64>,
 ) -> Result<i32, RuntimeError> {
+    context_aware_check(&env)?;
     let (env_data, store) = env.data_and_store_mut();
     let memory = env_data
         .memory()
@@ -427,6 +447,7 @@ pub fn db_idx128_store(
     id: u64,
     secondary_ptr: WasmPtr<u128>,
 ) -> Result<i32, RuntimeError> {
+    context_aware_check(&env)?;
     let (env_data, store) = env.data_and_store_mut();
     let memory = env_data
         .memory()
@@ -445,6 +466,7 @@ pub fn db_idx128_update(
     payer: u64,
     secondary_ptr: WasmPtr<u128>,
 ) -> Result<(), RuntimeError> {
+    context_aware_check(&env)?;
     let (env_data, store) = env.data_and_store_mut();
     let memory = env_data
         .memory()
@@ -462,6 +484,7 @@ pub fn db_idx128_remove(
     mut env: FunctionEnvMut<WasmContext>,
     itr: i32,
 ) -> Result<(), RuntimeError> {
+    context_aware_check(&env)?;
     let context = env.data_mut().apply_context_mut();
     context.db_idx128_remove(itr)?;
     Ok(())
@@ -475,6 +498,7 @@ pub fn db_idx128_find_secondary(
     secondary_ptr: WasmPtr<u128>,
     primary_ptr: WasmPtr<u64>,
 ) -> Result<i32, RuntimeError> {
+    context_aware_check(&env)?;
     let (env_data, store) = env.data_and_store_mut();
 
     // Clone the memory handle so the borrow on env_data is released
@@ -513,6 +537,7 @@ pub fn db_idx128_find_primary(
     secondary_ptr: WasmPtr<u128>,
     primary: u64,
 ) -> Result<i32, RuntimeError> {
+    context_aware_check(&env)?;
     let (env_data, store) = env.data_and_store_mut();
 
     // Clone the memory handle so the borrow on env_data is released
@@ -548,6 +573,7 @@ pub fn db_idx128_lowerbound(
     secondary_ptr: WasmPtr<u128>,
     primary_ptr: WasmPtr<u64>,
 ) -> Result<i32, RuntimeError> {
+    context_aware_check(&env)?;
     let (env_data, store) = env.data_and_store_mut();
 
     // Clone the memory handle so the borrow on env_data is released
@@ -587,6 +613,7 @@ pub fn db_idx128_upperbound(
     secondary_ptr: WasmPtr<u128>,
     primary_ptr: WasmPtr<u64>,
 ) -> Result<i32, RuntimeError> {
+    context_aware_check(&env)?;
     let (env_data, store) = env.data_and_store_mut();
 
     // Clone the memory handle so the borrow on env_data is released
@@ -624,6 +651,7 @@ pub fn db_idx128_end(
     scope: u64,
     table: u64,
 ) -> Result<i32, RuntimeError> {
+    context_aware_check(&env)?;
     let context = env.data_mut().apply_context_mut();
     Ok(context.db_idx128_end(code.into(), scope.into(), table.into())?)
 }
@@ -633,6 +661,7 @@ pub fn db_idx128_next(
     itr: i32,
     primary_ptr: WasmPtr<u64>,
 ) -> Result<i32, RuntimeError> {
+    context_aware_check(&env)?;
     let (env_data, store) = env.data_and_store_mut();
     let memory = env_data
         .memory()
@@ -652,6 +681,7 @@ pub fn db_idx128_previous(
     itr: i32,
     primary_ptr: WasmPtr<u64>,
 ) -> Result<i32, RuntimeError> {
+    context_aware_check(&env)?;
     let (env_data, store) = env.data_and_store_mut();
     let memory = env_data
         .memory()

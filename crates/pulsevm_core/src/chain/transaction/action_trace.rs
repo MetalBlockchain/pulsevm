@@ -86,6 +86,10 @@ impl ActionTrace {
     pub fn set_elapsed(&mut self, elapsed: u32) {
         self.elapsed = elapsed;
     }
+
+    pub fn context_free(&self) -> bool {
+        self.context_free
+    }
 }
 
 impl fmt::Display for ActionTrace {

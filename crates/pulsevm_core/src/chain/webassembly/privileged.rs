@@ -3,7 +3,7 @@ use wasmer::{FunctionEnvMut, RuntimeError, WasmPtr};
 
 use crate::chain::{
     apply_context::ApplyContext, resource_limits::ResourceLimitsManager, utils::pulse_assert,
-    wasm_runtime::WasmContext,
+    wasm_runtime::WasmContext, webassembly::context_aware_check,
 };
 
 fn privileged_check(context: &ApplyContext) -> Result<(), RuntimeError> {
@@ -19,6 +19,7 @@ pub fn is_privileged(
     mut env: FunctionEnvMut<WasmContext>,
     account: u64,
 ) -> Result<i32, RuntimeError> {
+    context_aware_check(&env)?;
     let context = env.data_mut().apply_context_mut();
     privileged_check(context)?;
     let db = env.data().db();
@@ -32,6 +33,7 @@ pub fn set_privileged(
     account: u64,
     is_priv: i32,
 ) -> Result<(), RuntimeError> {
+    context_aware_check(&env)?;
     let context = env.data_mut().apply_context_mut();
     privileged_check(context)?;
     context.set_privileged(account, is_priv == 1)?;
@@ -45,6 +47,7 @@ pub fn set_resource_limits(
     net_weight: i64,
     cpu_weight: i64,
 ) -> Result<(), RuntimeError> {
+    context_aware_check(&env)?;
     pulse_assert(
         ram_bytes >= -1,
         ChainError::WasmRuntimeError(format!(
@@ -84,6 +87,7 @@ pub fn get_resource_limits(
     net_weight_ptr: WasmPtr<u8>,
     cpu_weight_ptr: WasmPtr<u8>,
 ) -> Result<(), RuntimeError> {
+    context_aware_check(&env)?;
     let (env_data, store) = env.data_and_store_mut();
     let context = env_data.apply_context_mut();
     privileged_check(context)?;

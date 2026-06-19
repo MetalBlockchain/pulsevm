@@ -11,7 +11,7 @@ use crate::{
         controller::Controller,
         transaction::{Action, Transaction},
         utils::pulse_assert,
-        wasm_runtime::WasmContext,
+        wasm_runtime::WasmContext, webassembly::context_aware_check,
     },
     crypto::PublicKey,
 };
@@ -21,6 +21,8 @@ pub fn send_inline(
     ptr: WasmPtr<u8>,
     length: u32,
 ) -> Result<(), RuntimeError> {
+    context_aware_check(&env)?;
+
     {
         let (env_data, _) = env.data_and_store_mut();
         let mut db = env_data.db_mut();
@@ -45,6 +47,40 @@ pub fn send_inline(
 
     let context = env_data.apply_context_mut();
     context.execute_inline(&action)?;
+
+    Ok(())
+}
+
+pub fn send_context_free_inline(
+    mut env: FunctionEnvMut<WasmContext>,
+    ptr: WasmPtr<u8>,
+    length: u32,
+) -> Result<(), RuntimeError> {
+    context_aware_check(&env)?;
+    {
+        let (env_data, _) = env.data_and_store_mut();
+        let mut db = env_data.db_mut();
+        let gpo = Controller::get_global_properties(&mut db)?;
+        pulse_assert(
+            length < gpo.get_chain_config().get_max_inline_action_size(),
+            ChainError::WasmRuntimeError(format!("inline action too big")),
+        )?;
+    }
+
+    let (env_data, store) = env.data_and_store_mut();
+    let memory = env_data
+        .memory()
+        .as_ref()
+        .expect("Wasm memory not initialized");
+    let view = memory.view(&store);
+    let slice = ptr.slice(&view, length)?;
+    let mut src_bytes = vec![0u8; length as usize];
+    slice.read_slice(&mut src_bytes)?;
+    let action = Action::read(&src_bytes, &mut 0)
+        .map_err(|e| RuntimeError::new(format!("failed to deserialize inline action: {}", e)))?;
+
+    let context = env_data.apply_context_mut();
+    context.execute_context_free_inline(&action)?;
 
     Ok(())
 }

@@ -35,6 +35,7 @@ struct ApplyContextInner {
     account_ram_deltas: BTreeMap<Name, i64>, // RAM usage deltas for accounts
     notified: VecDeque<(Name, u32)>,         // List of notified accounts
     inline_actions: Vec<u32>,                // List of inline actions
+    context_free_inline_actions: Vec<u32>,   // List of context-free inline actions
     recurse_depth: u32,                      // The current recursion depth
     keyval_cache: KeyValueIteratorCache,     // Cache for key-value iterators
     index64_cache: Index64IteratorCache,     // Cache for index64 iterators
@@ -52,6 +53,7 @@ pub struct ApplyContext {
     first_receiver_action_ordinal: u32,
     action_ordinal: u32,
     pending_block_timestamp: BlockTimestamp, // Timestamp for the pending block
+    context_free: bool, // Whether the current action is context-free
 
     inner: Arc<RwLock<ApplyContextInner>>,
 }
@@ -66,6 +68,7 @@ impl ApplyContext {
         action_ordinal: u32,
         depth: u32,
         cpu_limit: i64,
+        context_free: bool,
     ) -> Result<Self, ChainError> {
         let pending_block_timestamp = trx_context.pending_block_timestamp()?;
 
@@ -78,6 +81,7 @@ impl ApplyContext {
             first_receiver_action_ordinal: 0,
             action_ordinal,
             pending_block_timestamp,
+            context_free,
 
             inner: Arc::new(RwLock::new(ApplyContextInner {
                 action,
@@ -87,6 +91,7 @@ impl ApplyContext {
                 account_ram_deltas: BTreeMap::new(),
                 notified: VecDeque::new(),
                 inline_actions: Vec::new(),
+                context_free_inline_actions: Vec::new(),
                 recurse_depth: depth,
                 keyval_cache: KeyValueIteratorCache::new(),
                 index64_cache: Index64IteratorCache::new(),
@@ -119,18 +124,22 @@ impl ApplyContext {
             cpu_used += self.exec_one()?;
         }
 
-        let (recurse_depth, inline_actions) = {
+        let (recurse_depth, inline_actions, context_free_inline_actions) = {
             let inner = self.inner.read()?;
-            (inner.recurse_depth, inner.inline_actions.clone())
+            (inner.recurse_depth, inner.inline_actions.clone(), inner.context_free_inline_actions.clone())
         };
 
-        if inline_actions.len() > 0 {
+        if inline_actions.len() > 0 || context_free_inline_actions.len() > 0 {
             pulse_assert(
                 recurse_depth < 1024, // TODO: Make this configurable
                 ChainError::TransactionError(
                     "max inline action depth per transaction reached".to_string(),
                 ),
             )?;
+        }
+
+        for action_ordinal in context_free_inline_actions.iter() {
+            trx_context.execute_action(*action_ordinal, recurse_depth + 1)?;
         }
 
         for action_ordinal in inline_actions.iter() {
@@ -351,6 +360,31 @@ impl ApplyContext {
             self.schedule_action_from_action(a.clone(), &inline_receiver, false)?;
         let mut inner = self.inner.write()?;
         inner.inline_actions.push(scheduled_ordinal);
+
+        Ok(())
+    }
+
+    pub fn execute_context_free_inline(&mut self, a: &Action) -> Result<(), ChainError> {
+        let code = self.db.find_account(a.account().as_u64())?;
+        pulse_assert(
+            !code.is_null(),
+            ChainError::TransactionError(format!(
+                "inline action's code account {} does not exist",
+                a.account()
+            )),
+        )?;
+        pulse_assert(
+            a.authorization().len() == 0,
+            ChainError::TransactionError(format!(
+                "context-free actions cannot have authorizations",
+            )),
+        )?;
+
+        let inline_receiver = a.account();
+        let scheduled_ordinal =
+            self.schedule_action_from_action(a.clone(), &inline_receiver, true)?;
+        let mut inner = self.inner.write()?;
+        inner.context_free_inline_actions.push(scheduled_ordinal);
 
         Ok(())
     }
@@ -1114,5 +1148,10 @@ impl ApplyContext {
         }
 
         Ok(ps as i32)
+    }
+
+    pub fn is_context_free(&self) -> bool {
+        let inner = self.inner.read().unwrap();
+        inner.context_free_inline_actions.len() > 0
     }
 }

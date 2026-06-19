@@ -4,7 +4,7 @@ use pulsevm_ffi::{PermissionLevel, microseconds, seconds};
 use pulsevm_serialization::Read;
 use wasmer::{FunctionEnvMut, RuntimeError, WasmPtr};
 
-use crate::{authorization_manager::AuthorizationManager, crypto::PublicKey, transaction::Transaction, wasm_runtime::WasmContext};
+use crate::{authorization_manager::AuthorizationManager, chain::webassembly::context_aware_check, crypto::PublicKey, transaction::Transaction, wasm_runtime::WasmContext};
 
 pub fn check_transaction_authorization(
     mut env: FunctionEnvMut<WasmContext>,
@@ -15,6 +15,7 @@ pub fn check_transaction_authorization(
     perms_ptr: WasmPtr<u8>,
     perms_length: u32,
 ) -> Result<u32, RuntimeError> {
+    context_aware_check(&env)?;
     let (env_data, store) = env.data_and_store_mut();
     let memory = env_data
         .memory()
@@ -79,6 +80,7 @@ pub fn check_permission_authorization(
     perms_size: u32,
     delay_us: u64,
 ) -> Result<u32, RuntimeError> {
+    context_aware_check(&env)?;
     // EOS_ASSERT: delay must fit in an i64.
     if delay_us > i64::MAX as u64 {
         return Err(RuntimeError::new(
@@ -127,6 +129,7 @@ pub fn get_permission_last_used(
     account: u64,
     permission: u64,
 ) -> Result<i64, RuntimeError> {
+    context_aware_check(&env)?;
     let env_data = env.data();
     let db = env_data.db();
     let permission = AuthorizationManager::get_permission(db, account, permission)?;
@@ -138,6 +141,7 @@ pub fn get_account_creation_time(
     env: FunctionEnvMut<WasmContext>,
     account: u64,
 ) -> Result<i64, RuntimeError> {
+    context_aware_check(&env)?;
     let env_data = env.data();
     let db = env_data.db();
     let account = db.get_account(account)?;

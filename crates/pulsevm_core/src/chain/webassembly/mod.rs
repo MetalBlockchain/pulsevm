@@ -34,7 +34,9 @@ pub use system::*;
 
 mod transaction;
 pub use transaction::*;
-use wasmer::{MemoryView, RuntimeError, WasmPtr};
+use wasmer::{FunctionEnvMut, MemoryView, RuntimeError, WasmPtr};
+
+use crate::wasm_runtime::WasmContext;
 
 fn read_u64(view: &MemoryView, ptr: WasmPtr<u64>) -> Result<u64, RuntimeError> {
     let mut bytes = [0u8; 8];
@@ -71,5 +73,13 @@ fn write_i128_ffi(view: &MemoryView, ptr: WasmPtr<i128>, val: I128) -> Result<()
     out[0..8].copy_from_slice(&val.lo.to_le_bytes());
     out[8..16].copy_from_slice(&val.hi.to_le_bytes());
     view.write(ptr.offset() as u64, &out)?;
+    Ok(())
+}
+
+pub fn context_aware_check(env: &FunctionEnvMut<WasmContext>) -> Result<(), RuntimeError> {
+    if env.data().apply_context().is_context_free() {
+        return Err(RuntimeError::new("cannot call this function from a context-free action"));
+    }
+
     Ok(())
 }
