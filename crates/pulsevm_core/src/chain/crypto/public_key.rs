@@ -153,4 +153,22 @@ mod tests {
         let public_key2 = PublicKey::from_str(key_str).unwrap();
         assert!(set.contains(&public_key2));
     }
+
+    #[test]
+    fn test_public_key_not_equals() {
+        let key_1_str = "PUB_K1_5bbkxaLdB5bfVZW6DJY8M74vwT2m61PqwywNUa5azfkJTvYa5H";
+        let key_2_str = "PUB_K1_5JF4aXt1DrtCLioNsL4ZEcDq88PAXtLjVn5uwhrCUeYBHAw7YD";
+        let public_key_1 = PublicKey::from_str(key_1_str).unwrap();
+        let public_key_2 = PublicKey::from_str(key_2_str).unwrap();
+        assert!(public_key_1 != public_key_2);
+    }
+
+    #[test]
+    fn test_public_key_equals() {
+        let key_1_str = "PUB_K1_5bbkxaLdB5bfVZW6DJY8M74vwT2m61PqwywNUa5azfkJTvYa5H";
+        let key_2_str = "PUB_K1_5bbkxaLdB5bfVZW6DJY8M74vwT2m61PqwywNUa5azfkJTvYa5H";
+        let public_key_1 = PublicKey::from_str(key_1_str).unwrap();
+        let public_key_2 = PublicKey::from_str(key_2_str).unwrap();
+        assert!(public_key_1 == public_key_2);
+    }
 }

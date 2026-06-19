@@ -1,7 +1,83 @@
-use sha2::Digest;
+use pulsevm_serialization::{Read, Write};
+use sha1::Digest as Sha1Digest;
 use wasmer::{FunctionEnvMut, RuntimeError, WasmPtr};
 
-use crate::chain::wasm_runtime::WasmContext;
+use crate::{chain::wasm_runtime::WasmContext, crypto::{PublicKey, Signature}, utils::Digest};
+
+pub fn assert_recover_key(
+    mut env: FunctionEnvMut<WasmContext>,
+    digest_ptr: WasmPtr<u8>,
+    sig_ptr: WasmPtr<u8>,
+    sig_len: u32,
+    pub_ptr: WasmPtr<u8>,
+    pub_len: u32,
+) -> Result<(), RuntimeError> {
+    let (env_data, store) = env.data_and_store_mut();
+    let memory = env_data
+        .memory()
+        .as_ref()
+        .expect("Wasm memory not initialized");
+    let view = memory.view(&store);
+    let sig_slice = sig_ptr.slice(&view, sig_len)?;
+    let mut sig_bytes = vec![0u8; sig_len as usize];
+    sig_slice.read_slice(&mut sig_bytes)?;
+    let signature = Signature::read(sig_bytes.as_slice(), &mut 0).map_err(|e| {
+        RuntimeError::new(format!("failed to read signature from wasm memory: {}", e))
+    })?;
+    let digest_slice = digest_ptr.slice(&view, 32)?;
+    let mut digest_bytes = vec![0u8; 32];
+    digest_slice.read_slice(&mut digest_bytes)?;
+    let digest: Digest = Digest::from_data(&digest_bytes);
+    let pub_slice = pub_ptr.slice(&view, pub_len)?;
+    let mut pubkey_bytes = vec![0u8; pub_len as usize];
+    pub_slice.read_slice(&mut pubkey_bytes)?;
+    let pubkey = PublicKey::read(pubkey_bytes.as_slice(), &mut 0).map_err(|e| {
+        RuntimeError::new(format!("failed to read public key from wasm memory: {}", e))
+    })?;
+    let recovered_pubkey = signature.recover_public_key(&digest)?;
+
+    if recovered_pubkey != pubkey {
+        return Err(RuntimeError::new(
+            "assertion failed: recovered public key does not match expected public key",
+        ));
+    }
+
+    Ok(())
+}
+
+pub fn recover_key(
+    mut env: FunctionEnvMut<WasmContext>,
+    digest_ptr: WasmPtr<u8>,
+    sig_ptr: WasmPtr<u8>,
+    sig_len: u32,
+    pub_ptr: WasmPtr<u8>,
+    pub_len: u32,
+) -> Result<i32, RuntimeError> {
+    let (env_data, store) = env.data_and_store_mut();
+    let memory = env_data
+        .memory()
+        .as_ref()
+        .expect("Wasm memory not initialized");
+    let view = memory.view(&store);
+    let sig_slice = sig_ptr.slice(&view, sig_len)?;
+    let mut sig_bytes = vec![0u8; sig_len as usize];
+    sig_slice.read_slice(&mut sig_bytes)?;
+    let signature = Signature::read(sig_bytes.as_slice(), &mut 0).map_err(|e| {
+        RuntimeError::new(format!("failed to read signature from wasm memory: {}", e))
+    })?;
+    let digest_slice = digest_ptr.slice(&view, 32)?;
+    let mut digest_bytes = vec![0u8; 32];
+    digest_slice.read_slice(&mut digest_bytes)?;
+    let digest: Digest = Digest::from_data(&digest_bytes);
+    let public_key = signature.recover_public_key(&digest)?;
+    let packed_public_key = public_key.pack().map_err(|e| {
+        RuntimeError::new(format!("failed to pack public key: {}", e))
+    })?;
+    let copy_size = std::cmp::min(pub_len as usize, packed_public_key.len());
+    let slice_out = pub_ptr.slice(&view, copy_size as u32)?;
+    slice_out.write_slice(&packed_public_key[..copy_size])?;
+    Ok(packed_public_key.len() as i32)
+}
 
 pub fn sha1(
     mut env: FunctionEnvMut<WasmContext>,
