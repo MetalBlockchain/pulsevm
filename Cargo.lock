@@ -3261,6 +3261,7 @@ dependencies = [
  "pulsevm_proc_macros",
  "pulsevm_serialization",
  "pulsevm_wasm_validation",
+ "ripemd",
  "serde",
  "serde_json",
  "sha1",
