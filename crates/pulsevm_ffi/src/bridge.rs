@@ -84,7 +84,7 @@ pub mod ffi {
         test2: u32,
     }
 
-    #[derive(Clone, Copy, PartialEq, Eq, Hash, Default, Debug)]
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, Default, Debug, PartialOrd, Ord)]
     pub struct Microseconds {
         count: i64,
     }
@@ -717,6 +717,7 @@ pub mod ffi {
         pub fn get_max_transaction_cpu_usage(self: &CxxChainConfig) -> u32;
         pub fn get_min_transaction_cpu_usage(self: &CxxChainConfig) -> u32;
         pub fn get_max_transaction_lifetime(self: &CxxChainConfig) -> u32;
+        pub fn get_max_transaction_delay(self: &CxxChainConfig) -> u32;
         pub fn get_max_inline_action_size(self: &CxxChainConfig) -> u32;
         pub fn get_max_inline_action_depth(self: &CxxChainConfig) -> u16;
         pub fn get_max_authority_depth(self: &CxxChainConfig) -> u16;

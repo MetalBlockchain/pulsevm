@@ -20,6 +20,8 @@ struct chain_config {
    uint32_t   min_transaction_cpu_usage;           ///< the minimum billable cpu usage (in microseconds) that the chain requires
 
    uint32_t   max_transaction_lifetime;            ///< the maximum number of seconds that an input transaction's expiration can be ahead of the time of the block in which it is first included
+   uint32_t   deferred_trx_expiration_window;      ///< the number of seconds after the time a deferred transaction can first execute until it expires
+   uint32_t   max_transaction_delay;               ///< the maximum number of seconds that can be imposed as a delay requirement by authorization checks
    uint32_t   max_inline_action_size;              ///< maximum allowed size (in bytes) of an inline action
    uint16_t   max_inline_action_depth;             ///< recursion depth limit on sending inline actions
    uint16_t   max_authority_depth;                 ///< recursion depth limit for checking if an authority is satisfied
@@ -40,6 +42,7 @@ struct chain_config {
    uint32_t   get_min_transaction_cpu_usage() const { return min_transaction_cpu_usage; }
 
    uint32_t   get_max_transaction_lifetime() const { return max_transaction_lifetime; }
+   uint32_t   get_max_transaction_delay() const { return max_transaction_delay; }
    uint32_t   get_max_inline_action_size() const { return max_inline_action_size; }
    uint16_t   get_max_inline_action_depth() const { return max_inline_action_depth; }
    uint16_t   get_max_authority_depth() const { return max_authority_depth; }
@@ -63,6 +66,8 @@ struct chain_config {
                            lhs.max_transaction_cpu_usage,
                            lhs.max_transaction_cpu_usage,
                            lhs.max_transaction_lifetime,
+                           lhs.deferred_trx_expiration_window,
+                           lhs.max_transaction_delay,
                            lhs.max_inline_action_size,
                            lhs.max_inline_action_depth,
                            lhs.max_authority_depth,
@@ -81,6 +86,8 @@ struct chain_config {
                            rhs.max_transaction_cpu_usage,
                            rhs.max_transaction_cpu_usage,
                            rhs.max_transaction_lifetime,
+                           rhs.deferred_trx_expiration_window,
+                           rhs.max_transaction_delay,
                            rhs.max_inline_action_size,
                            rhs.max_inline_action_depth,
                            rhs.max_authority_depth,
@@ -123,6 +130,6 @@ FC_REFLECT(pulsevm::chain::chain_config,
            (max_block_cpu_usage)(target_block_cpu_usage_pct)
            (max_transaction_cpu_usage)(min_transaction_cpu_usage)
 
-           (max_transaction_lifetime)(max_inline_action_size)(max_inline_action_depth)(max_authority_depth)
+           (max_transaction_lifetime)(deferred_trx_expiration_window)(max_transaction_delay)(max_inline_action_size)(max_inline_action_depth)(max_authority_depth)
            (max_action_return_value_size)
 )

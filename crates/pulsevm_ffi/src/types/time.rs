@@ -114,6 +114,10 @@ pub const fn milliseconds(ms: i64) -> Microseconds {
     Microseconds { count: ms * 1_000 }
 }
 #[inline]
+pub const fn microseconds(us: i64) -> Microseconds {
+    Microseconds { count: us }
+}
+#[inline]
 pub const fn minutes(m: i64) -> Microseconds {
     seconds(60 * m)
 }

@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use pulsevm_error::ChainError;
-use pulsevm_ffi::Database;
+use pulsevm_ffi::{Database, Microseconds};
 
 use crate::crypto::PublicKey;
 
@@ -10,6 +10,7 @@ use super::authority::{Authority, KeyWeight, PermissionLevel, PermissionLevelWei
 pub struct AuthorityChecker<'a> {
     recursion_depth_limit: u16,
     provided_keys: &'a BTreeSet<PublicKey>,
+    provided_delay: Microseconds,
     used_keys: BTreeSet<PublicKey>,
     cached_permissions: HashMap<PermissionLevel, PermissionCacheStatus>,
 }
@@ -26,6 +27,7 @@ impl<'a> AuthorityChecker<'a> {
         recursion_depth_limit: u16,
         provided_keys: &'a BTreeSet<PublicKey>,
         provided_permissions: &'a BTreeSet<PermissionLevel>,
+        provided_delay: Microseconds,
     ) -> Self {
         let mut cached_permissions = HashMap::new();
 
@@ -39,6 +41,7 @@ impl<'a> AuthorityChecker<'a> {
         Self {
             recursion_depth_limit,
             provided_keys,
+            provided_delay,
             used_keys: BTreeSet::new(),
             cached_permissions,
         }
@@ -75,6 +78,16 @@ impl<'a> AuthorityChecker<'a> {
         for permission in authority.accounts() {
             total_weight +=
                 self.visit_permission_level_weight(db, permission, recursion_depth)? as u32;
+        }
+
+        if total_weight >= authority.threshold() {
+            return Ok(true);
+        }
+
+        for wait in authority.waits() {
+            if self.provided_delay >= Microseconds::new(wait.wait_sec as i64 * 1_000_000) {
+                total_weight += wait.weight as u32;
+            }
         }
 
         Ok(total_weight >= authority.threshold())

@@ -49,68 +49,6 @@ pub fn send_inline(
     Ok(())
 }
 
-pub fn check_transaction_authorization(
-    mut env: FunctionEnvMut<WasmContext>,
-    trx_ptr: WasmPtr<u8>,
-    trx_length: u32,
-    pubkeys_ptr: WasmPtr<u8>,
-    pubkeys_length: u32,
-    perms_ptr: WasmPtr<u8>,
-    perms_length: u32,
-) -> Result<u32, RuntimeError> {
-    let (env_data, store) = env.data_and_store_mut();
-    let memory = env_data
-        .memory()
-        .as_ref()
-        .expect("Wasm memory not initialized");
-    let view = memory.view(&store);
-    let mut trx_bytes = vec![0u8; trx_length as usize];
-    trx_ptr
-        .slice(&view, trx_length)?
-        .read_slice(&mut trx_bytes)?;
-    let transaction = Transaction::read(&trx_bytes, &mut 0)
-        .map_err(|e| RuntimeError::new(format!("failed to deserialize transaction: {}", e)))?;
-    let mut provided_keys: BTreeSet<PublicKey> = BTreeSet::new();
-    let mut provided_permissions: BTreeSet<PermissionLevel> = BTreeSet::new();
-
-    if pubkeys_length > 0 {
-        let mut pubkeys_bytes = vec![0u8; pubkeys_length as usize];
-        pubkeys_ptr
-            .slice(&view, pubkeys_length)?
-            .read_slice(&mut pubkeys_bytes)?;
-        provided_keys = BTreeSet::<PublicKey>::read(&pubkeys_bytes, &mut 0).map_err(|e| {
-            RuntimeError::new(format!("failed to deserialize provided public keys: {}", e))
-        })?;
-    }
-
-    if perms_length > 0 {
-        let mut perms_bytes = vec![0u8; perms_length as usize];
-        perms_ptr
-            .slice(&view, perms_length)?
-            .read_slice(&mut perms_bytes)?;
-        provided_permissions =
-            BTreeSet::<PermissionLevel>::read(&perms_bytes, &mut 0).map_err(|e| {
-                RuntimeError::new(format!(
-                    "failed to deserialize provided permission levels: {}",
-                    e
-                ))
-            })?;
-    }
-
-    let mut db = env_data.db_mut();
-
-    match AuthorizationManager::check_authorization(
-        &mut db,
-        &transaction.actions,
-        &provided_keys,
-        &provided_permissions,
-        &BTreeSet::new(),
-    ) {
-        Ok(_) => return Ok(1),
-        Err(_) => return Ok(0),
-    }
-}
-
 pub fn read_transaction(
     mut env: FunctionEnvMut<WasmContext>,
     trx_ptr: WasmPtr<u8>,

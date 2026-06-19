@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashSet};
 
 use pulsevm_error::ChainError;
-use pulsevm_ffi::{Authority, CxxTimePoint, Database, PermissionObject, TimePoint};
+use pulsevm_ffi::{Authority, CxxTimePoint, Database, Microseconds, PermissionObject, TimePoint, seconds};
 
 use crate::{
     PULSE_NAME,
@@ -24,12 +24,21 @@ pub struct AuthorizationManager;
 
 impl AuthorizationManager {
     pub fn check_authorization(
-        db: &mut Database,
+        db: &Database,
         actions: &Vec<Action>,
         provided_keys: &BTreeSet<PublicKey>,
         provided_permissions: &BTreeSet<PermissionLevel>,
+        provided_delay: Microseconds,
         satisfied_authorizations: &BTreeSet<PermissionLevel>,
     ) -> Result<(), ChainError> {
+        let global_properties = unsafe { &*db.get_global_properties()? };
+        let chain_config = global_properties.get_chain_config();
+        let delay_max_limit = seconds(chain_config.get_max_transaction_delay() as i64);
+        let effective_provided_delay = if provided_delay >= delay_max_limit {
+            Microseconds::maximum()
+        } else {
+            provided_delay
+        };
         let mut permissions_to_satisfy = BTreeSet::<PermissionLevel>::new();
 
         for act in actions.iter() {
@@ -95,6 +104,7 @@ impl AuthorizationManager {
                 chain_config.get_max_authority_depth(),
                 provided_keys,
                 provided_permissions,
+                effective_provided_delay,
             );
 
             // Now verify that all the declared authorizations are satisfied
@@ -120,10 +130,51 @@ impl AuthorizationManager {
         Ok(())
     }
 
+    pub fn check_permission_authorization(
+        db: &Database,
+        permission: PermissionLevel,
+        provided_keys: &BTreeSet<PublicKey>,
+        provided_permissions: &BTreeSet<PermissionLevel>,
+        provided_delay: Microseconds,
+        allow_unused_keys: bool,
+    ) -> Result<(), ChainError> {
+        let auth = Authority::new_from_permission_level(&permission);
+        let global_properties = unsafe { &*db.get_global_properties()? };
+        let chain_config = global_properties.get_chain_config();
+        let delay_max_limit = seconds(chain_config.get_max_transaction_delay() as i64);
+        let mut authority_checker = AuthorityChecker::new(
+            chain_config.get_max_authority_depth(),
+            provided_keys,
+            provided_permissions,
+            if (provided_delay >= delay_max_limit) {
+                Microseconds::maximum()
+            } else {
+                provided_delay
+            },
+        );
+
+        pulse_assert(
+            authority_checker.satisfied(db, &auth, 0)?,
+            ChainError::AuthorizationError(format!(
+                "permission '{}' is not satisfied by the provided keys and permissions",
+                permission
+            )),
+        )?;
+
+        if !allow_unused_keys && !authority_checker.all_keys_used() {
+            return Err(ChainError::AuthorizationError(
+                "irrelevant keys provided".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
     pub fn get_required_keys(
         db: &mut Database,
         trx: &Transaction,
         candidate_keys: &BTreeSet<PublicKey>,
+        provided_delay: Microseconds,
     ) -> Result<BTreeSet<PublicKey>, ChainError> {
         let global_properties = unsafe { &*db.get_global_properties()? };
         let chain_config = global_properties.get_chain_config();
@@ -132,6 +183,7 @@ impl AuthorizationManager {
             chain_config.get_max_authority_depth(),
             candidate_keys,
             &provided_permissions,
+            provided_delay,
         );
 
         for act in trx.actions.iter() {
@@ -152,7 +204,7 @@ impl AuthorizationManager {
     }
 
     fn check_updateauth_authorization(
-        db: &mut Database,
+        db: &Database,
         action: &Action,
         auths: &[PermissionLevel],
     ) -> Result<(), ChainError> {
@@ -199,7 +251,7 @@ impl AuthorizationManager {
     }
 
     fn check_deleteauth_authorization(
-        db: &mut Database,
+        db: &Database,
         action: &Action,
     ) -> Result<(), ChainError> {
         let del = action
@@ -233,7 +285,7 @@ impl AuthorizationManager {
         Ok(())
     }
 
-    fn check_linkauth_authorization(db: &mut Database, action: &Action) -> Result<(), ChainError> {
+    fn check_linkauth_authorization(db: &Database, action: &Action) -> Result<(), ChainError> {
         let link = action
             .data_as::<LinkAuth>()
             .map_err(|e| ChainError::AuthorizationError(format!("{}", e)))?;
@@ -305,7 +357,7 @@ impl AuthorizationManager {
     }
 
     fn check_unlinkauth_authorization(
-        db: &mut Database,
+        db: &Database,
         action: &Action,
     ) -> Result<(), ChainError> {
         let unlink = action
@@ -402,7 +454,7 @@ impl AuthorizationManager {
     }
 
     fn lookup_minimum_permission(
-        db: &mut Database,
+        db: &Database,
         authorizer_account: &Name,
         scope: &Name,
         act_name: &Name,
@@ -435,7 +487,7 @@ impl AuthorizationManager {
     }
 
     fn lookup_linked_permission(
-        db: &mut Database,
+        db: &Database,
         authorizer_account: &Name,
         scope: &Name,
         act_name: &Name,

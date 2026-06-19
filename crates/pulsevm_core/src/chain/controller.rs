@@ -39,7 +39,7 @@ use pulsevm_constants::{
 };
 use pulsevm_crypto::{Digest, merkle};
 use pulsevm_error::ChainError;
-use pulsevm_ffi::{BlockTimestamp, CxxGenesisState, Database, ElasticLimitParameters, GlobalPropertyObject, TimePoint};
+use pulsevm_ffi::{BlockTimestamp, CxxGenesisState, Database, ElasticLimitParameters, GlobalPropertyObject, Microseconds, TimePoint, seconds};
 use pulsevm_grpc::vm;
 use pulsevm_serialization::{Read, Write};
 use spdlog::{debug, error, info, warn};
@@ -595,6 +595,7 @@ impl Controller {
             &signed_transaction.transaction().actions,
             &signed_transaction.recovered_keys(&self.chain_id)?,
             &BTreeSet::new(),
+            seconds(signed_transaction.transaction().header.delay_sec.into()),
             &BTreeSet::new(),
         )?;
 

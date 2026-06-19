@@ -376,7 +376,7 @@ impl TransactionContext {
             for action in trx.actions.iter() {
                 for auth in action.authorization().iter() {
                     let permission = AuthorizationManager::get_permission(&self.db, auth.actor(), auth.permission())?;
-                    
+
                     AuthorizationManager::update_permission_usage(
                         &mut self.db,
                         permission,

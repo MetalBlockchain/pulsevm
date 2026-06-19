@@ -91,6 +91,12 @@ impl From<usize> for VarUint32 {
     }
 }
 
+impl From<VarUint32> for i64 {
+    fn from(v: VarUint32) -> Self {
+        v.0 as i64
+    }
+}
+
 impl From<i32> for VarUint32 {
     fn from(v: i32) -> Self {
         Self(v as u32)

@@ -9,7 +9,7 @@ use pulsevm_billable_size::billable_size_v;
 use pulsevm_crypto::Bytes;
 use pulsevm_error::ChainError;
 use pulsevm_ffi::{
-    AccountMetadataObject, BlockTimestamp, Database, Index64IteratorCache, Index64Object, Index128IteratorCache, Index128Object, KeyValueIteratorCache, KeyValueObject, TableObject
+    AccountMetadataObject, BlockTimestamp, Database, Index64IteratorCache, Index64Object, Index128IteratorCache, Index128Object, KeyValueIteratorCache, KeyValueObject, Microseconds, TableObject, TimePoint
 };
 use pulsevm_serialization::{NumBytes, Write};
 
@@ -340,6 +340,7 @@ impl ApplyContext {
                     &vec![a.clone()],
                     &BTreeSet::new(),      // No provided keys
                     &provided_permissions, // Default permission level
+                    Microseconds::new(0),                     // No delay
                     &inherited_authorizations,
                 )?;
             }

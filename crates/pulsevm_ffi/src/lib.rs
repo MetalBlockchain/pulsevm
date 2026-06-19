@@ -13,7 +13,7 @@ pub use crate::bridge::ffi::{
 };
 pub use crate::bridge::ffi::{
     CxxBlockTimestamp, CxxChainConfig, CxxDigest, CxxGenesisState, CxxMicroseconds, CxxPrivateKey,
-    CxxPublicKey, CxxSignature, CxxTimePoint, Float128, I128, U128, TimePoint, TimePointSec, Microseconds, BlockTimestamp,
+    CxxPublicKey, CxxSignature, CxxTimePoint, Float128, I128, U128, TimePoint, TimePointSec, Microseconds, BlockTimestamp
 };
 pub use crate::bridge::ffi::{CxxName, string_to_name, u64_to_name};
 pub use crate::bridge::ffi::{
@@ -31,3 +31,4 @@ pub use crate::database::Database;
 pub use crate::iterator_cache::{
     Index64IteratorCache, Index128IteratorCache, KeyValueIteratorCache,
 };
+pub use types::*;
