@@ -399,6 +399,30 @@ impl ApplyContext {
         Ok(scheduled_action_ordinal)
     }
 
+    pub fn get_context_free_data(
+        &self,
+        index: u32,
+        buffer: &mut [u8],
+        buffer_size: usize,
+    ) -> Result<i32, ChainError> {
+        let trx = self.trx_context.get_packed_transaction().get_signed_transaction();
+        let cfd = trx.context_free_data();
+
+        let segment = match cfd.get(index as usize) {
+            Some(seg) => seg,
+            None => return Ok(-1),
+        };
+
+        let s = segment.len();
+        if buffer_size == 0 {
+            return Ok(s as i32);
+        }
+
+        let copy_size = buffer_size.min(buffer.len()).min(s);
+        buffer[..copy_size].copy_from_slice(&segment.as_slice()[..copy_size]);
+        Ok(copy_size as i32)
+    }
+
     pub fn db_find_i64(
         &mut self,
         code: u64,

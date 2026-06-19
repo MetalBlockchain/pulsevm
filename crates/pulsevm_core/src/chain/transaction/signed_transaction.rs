@@ -34,14 +34,16 @@ impl SignedTransaction {
         }
     }
 
-    #[inline]
     pub fn transaction(&self) -> &Transaction {
         &self.transaction
     }
 
-    #[inline]
     pub fn signatures(&self) -> &BTreeSet<Signature> {
         &self.signatures
+    }
+
+    pub fn context_free_data(&self) -> &Vec<Bytes> {
+        &self.context_free_data
     }
 
     #[must_use]

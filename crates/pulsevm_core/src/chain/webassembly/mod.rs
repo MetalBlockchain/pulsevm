@@ -10,6 +10,9 @@ pub use builtins::*;
 mod console;
 pub use console::*;
 
+mod context_free;
+pub use context_free::*;
+
 mod crypto;
 pub use crypto::*;
 
