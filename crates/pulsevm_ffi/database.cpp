@@ -32,6 +32,130 @@ std::unique_ptr<pulsevm::chain::database_wrapper> open_database(
     return std::make_unique<pulsevm::chain::database_wrapper>(fs_path, db_flags, size);
 }
 
+void database_wrapper::initialize_database(const genesis_state& genesis) {
+    // create the database header sigil
+    this->create<database_header_object>([&]( auto& header ){
+        // nothing to do for now
+    });
+
+    auto chain_id = genesis.compute_chain_id();
+    this->create<global_property_object>([&genesis,&chain_id](auto& gpo ){
+        gpo.configuration = genesis.initial_configuration;
+        gpo.wasm_configuration = genesis_state::default_initial_wasm_configuration;
+        gpo.chain_id = chain_id;
+    });
+
+    this->create<protocol_state_object>([&](auto& pso ){
+        pso.num_supported_key_types = config::genesis_num_supported_key_types;
+    });
+    this->create<dynamic_global_property_object>([](auto&){});
+    this->create<permission_object>([](auto&){});  /// reserve perm 0 (used else where)
+
+    const auto& config = this->create<resource_limits::resource_limits_config_object>([](resource_limits::resource_limits_config_object& config){
+        // see default settings in the declaration
+    });
+
+    const auto& state = this->create<resource_limits::resource_limits_state_object>([&config](resource_limits::resource_limits_state_object& state){
+        // see default settings in the declaration
+
+        // start the chain off in a way that it is "congested" aka slow-start
+        state.virtual_cpu_limit = config.cpu_limit_parameters.max;
+        state.virtual_net_limit = config.net_limit_parameters.max;
+    });
+
+    authority system_auth(genesis.initial_key);
+    this->create_native_account( genesis.initial_timestamp, config::system_account_name.to_uint64_t(), system_auth, system_auth, true );
+
+    auto empty_authority = authority(1, {}, {});
+    auto active_producers_authority = authority(1, {}, {});
+    active_producers_authority.accounts.push_back({{config::system_account_name, config::active_name}, 1});
+
+    this->create_native_account( genesis.initial_timestamp, config::null_account_name.to_uint64_t(), empty_authority, empty_authority );
+    this->create_native_account( genesis.initial_timestamp, config::producers_account_name.to_uint64_t(), empty_authority, active_producers_authority );
+    const auto& active_permission       = this->get_permission({config::producers_account_name, config::active_name});
+    const auto& majority_permission     = this->create_permission(
+        config::producers_account_name.to_uint64_t(),
+        config::majority_producers_permission_name.to_uint64_t(),
+        active_permission.id._id,
+        active_producers_authority,
+        TimePoint { Microseconds { genesis.initial_timestamp.time_since_epoch().count() } }
+    );
+    this->create_permission(
+        config::producers_account_name.to_uint64_t(), 
+        config::minority_producers_permission_name.to_uint64_t(),
+        majority_permission.id._id,
+        active_producers_authority,
+        TimePoint { Microseconds { genesis.initial_timestamp.time_since_epoch().count() } }
+    );
+}
+
+void database_wrapper::create_native_account( const fc::time_point& initial_timestamp, u_int64_t account_name, const authority& owner, const authority& active, bool is_privileged ) {
+    this->create<account_object>([&](auto& a) {
+        a.name = name(account_name);
+        a.creation_date = initial_timestamp;
+
+        if( account_name == config::system_account_name.to_uint64_t() ) {
+            a.abi.assign(pulsevm_abi_bin, sizeof(pulsevm_abi_bin));
+        }
+    });
+    this->create<account_metadata_object>([&](auto & a) {
+        a.name = name(account_name);
+        a.set_privileged( is_privileged );
+    });
+
+    const auto& owner_permission  = this->create_permission(account_name, config::owner_name.to_uint64_t(), 0,
+                                                                    owner, TimePoint { Microseconds { initial_timestamp.time_since_epoch().count() } } );
+    const auto& active_permission = this->create_permission(account_name, config::active_name.to_uint64_t(), owner_permission.id._id,
+                                                                    active, TimePoint { Microseconds { initial_timestamp.time_since_epoch().count() } } );
+
+    this->initialize_account_resource_limits(account_name);
+
+    int64_t ram_delta = config::overhead_per_account_ram_bytes;
+    ram_delta += 2*config::billable_size_v<permission_object>;
+    ram_delta += owner_permission.auth.get_billable_size();
+    ram_delta += active_permission.auth.get_billable_size();
+
+    this->add_pending_ram_usage(account_name, ram_delta);
+    this->verify_account_ram_usage(account_name);
+}
+
+void database_wrapper::update_account_code(
+    const account_metadata_object& account,
+    rust::Slice<const std::uint8_t> new_code, 
+    uint32_t head_block_num, 
+    const TimePoint& pending_block_time,
+    const digest_type& code_hash, 
+    uint8_t vm_type, 
+    uint8_t vm_version
+) {
+    if( new_code.size() > 0 ) {
+        const code_object* new_code_entry = this->find<code_object, by_code_hash>( boost::make_tuple(code_hash, vm_type, vm_version) );
+
+        if( new_code_entry ) {
+            this->modify(*new_code_entry, [&](code_object& o) {
+                ++o.code_ref_count;
+            });
+        } else {
+            this->create<code_object>([&](code_object& o) {
+                o.code_hash = code_hash;
+                o.code.assign( new_code.data(), new_code.size() );
+                o.code_ref_count = 1;
+                o.first_block_used = head_block_num + 1;
+                o.vm_type = vm_type;
+                o.vm_version = vm_version;
+            });
+        }
+    }
+
+    this->modify( account, [&]( auto& a ) {
+        a.code_sequence += 1;
+        a.code_hash = code_hash;
+        a.vm_type = vm_type;
+        a.vm_version = vm_version;
+        a.last_code_update = fc::time_point(fc::microseconds(pending_block_time.elapsed.count));
+    });
+}
+
 CpuLimitResult database_wrapper::get_account_cpu_limit(uint64_t name, uint32_t greylist_limit) const {
     auto [arl, greylisted] = get_account_cpu_limit_ex(name, greylist_limit);
     return {arl.available, greylisted};
@@ -47,7 +171,7 @@ const permission_object& database_wrapper::create_permission(
     uint64_t permission_name,
     uint64_t parent,
     const Authority& a,
-    const time_point& creation_time
+    const TimePoint& creation_time
 ) {
     authority auth;
     auth.threshold = a.threshold;
@@ -69,7 +193,7 @@ const permission_object& database_wrapper::create_permission(
         "Unactivated key type used when creating permission");
 
     const auto& perm_usage = this->create<permission_usage_object>([&](auto& p) {
-        p.last_used = creation_time;
+        p.last_used = fc::time_point(fc::microseconds(creation_time.elapsed.count));
     });
 
     const auto& perm = this->create<permission_object>([&](auto& p) {
@@ -77,14 +201,41 @@ const permission_object& database_wrapper::create_permission(
         p.parent       = permission_object::id_type(parent);
         p.owner        = name(account);
         p.perm_name    = name(permission_name);
-        p.last_updated = creation_time;
+        p.last_updated = fc::time_point(fc::microseconds(creation_time.elapsed.count));
         p.auth         = std::move(auth);
     });
 
     return perm;
 }
 
-void database_wrapper::modify_permission( const permission_object& permission, const Authority& a, const fc::time_point& pending_block_time ) {
+const permission_object& database_wrapper::create_permission(
+    uint64_t account,
+    uint64_t permission_name,
+    uint64_t parent,
+    const authority& auth,
+    const TimePoint& creation_time
+) {
+    for(const key_weight& k: auth.keys)
+        EOS_ASSERT(k.key.which() < this->get<protocol_state_object>().num_supported_key_types, unactivated_key_type,
+        "Unactivated key type used when creating permission");
+
+    const auto& perm_usage = this->create<permission_usage_object>([&](auto& p) {
+        p.last_used = fc::time_point(fc::microseconds(creation_time.elapsed.count));
+    });
+
+    const auto& perm = this->create<permission_object>([&](auto& p) {
+        p.usage_id     = perm_usage.id;
+        p.parent       = permission_object::id_type(parent);
+        p.owner        = name(account);
+        p.perm_name    = name(permission_name);
+        p.last_updated = fc::time_point(fc::microseconds(creation_time.elapsed.count));
+        p.auth         = std::move(auth);
+    });
+
+    return perm;
+}
+
+void database_wrapper::modify_permission( const permission_object& permission, const Authority& a, const TimePoint& pending_block_time ) {
     authority auth;
     auth.threshold = a.threshold;
     auth.keys.reserve(a.keys.size());
@@ -106,8 +257,20 @@ void database_wrapper::modify_permission( const permission_object& permission, c
 
     this->modify( permission, [&](permission_object& po) {
         po.auth = auth;
-        po.last_updated = pending_block_time;
+        po.last_updated = fc::time_point(fc::microseconds(pending_block_time.elapsed.count));
     });
+}
+
+void database_wrapper::update_permission_usage( const permission_object& permission, const TimePoint& pending_block_time ) {
+    const auto& puo = this->get<permission_usage_object, by_id>( permission.usage_id );
+    this->modify( puo, [&](permission_usage_object& p) {
+        p.last_used = fc::time_point(fc::microseconds(pending_block_time.elapsed.count));
+    });
+}
+
+TimePoint database_wrapper::get_permission_last_used( const permission_object& permission ) const {
+    fc::time_point last_used = this->get<permission_usage_object, by_id>( permission.usage_id ).last_used;
+    return TimePoint { Microseconds { last_used.time_since_epoch().count() } };
 }
 
 void database_wrapper::set_block_parameters(const ElasticLimitParameters& cpu_limit_parameters, const ElasticLimitParameters& net_limit_parameters ) {
@@ -168,6 +331,18 @@ rust::Vec<uint8_t> database_wrapper::pack_deltas(bool full_snapshot) const {
     }
 
     return out;
+}
+
+void database_wrapper::clear_expired_input_transactions(const TimePoint& cutoff) {
+    //Look for expired transactions in the deduplication list, and remove them.
+    auto& transaction_idx = this->get_mutable_index<transaction_multi_index>();
+    const auto& dedupe_index = transaction_idx.indices().get<by_expiration>();
+    const auto total = dedupe_index.size();
+    uint32_t num_removed = 0;
+    while( (!dedupe_index.empty()) && ( fc::time_point(fc::microseconds(cutoff.elapsed.count)) > dedupe_index.begin()->expiration.to_time_point() ) ) {
+        transaction_idx.remove(*dedupe_index.begin());
+        ++num_removed;
+    }
 }
 
 inline unsigned __int128 to_u128(const U128& v) {

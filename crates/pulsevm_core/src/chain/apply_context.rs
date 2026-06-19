@@ -9,8 +9,7 @@ use pulsevm_billable_size::billable_size_v;
 use pulsevm_crypto::Bytes;
 use pulsevm_error::ChainError;
 use pulsevm_ffi::{
-    AccountMetadataObject, Database, Index64IteratorCache, Index64Object, Index128IteratorCache,
-    Index128Object, KeyValueIteratorCache, KeyValueObject, TableObject,
+    AccountMetadataObject, BlockTimestamp, Database, Index64IteratorCache, Index64Object, Index128IteratorCache, Index128Object, KeyValueIteratorCache, KeyValueObject, TableObject
 };
 use pulsevm_serialization::{NumBytes, Write};
 
@@ -19,7 +18,6 @@ use crate::{
     chain::{
         authority::PermissionLevel,
         authorization_manager::AuthorizationManager,
-        block::BlockTimestamp,
         controller::Controller,
         transaction::{Action, ActionReceipt, generate_action_digest},
         transaction_context::TransactionContext,

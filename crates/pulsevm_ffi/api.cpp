@@ -1,4 +1,5 @@
 #include "api.hpp"
+#include <pulsevm_ffi/src/bridge.rs.h>
 
 namespace pulsevm { namespace chain {
 
@@ -59,19 +60,19 @@ namespace pulsevm { namespace chain {
         return abi;
     }
 
-    rust::String get_account_info_without_core_symbol( const database_wrapper& db, uint64_t account, uint32_t head_block_num, const fc::time_point& head_block_time ) {
+    rust::String get_account_info_without_core_symbol( const database_wrapper& db, uint64_t account, uint32_t head_block_num, const TimePoint& head_block_time ) {
         auto result = get_account_info( db, account, std::nullopt, head_block_num, head_block_time );
         auto json = fc::json::to_pretty_string( result );
         return rust::String( json.c_str() );
     }
 
-    rust::String get_account_info_with_core_symbol( const database_wrapper& db, uint64_t account, rust::Str expected_core_symbol, uint32_t head_block_num, const fc::time_point& head_block_time ) {
+    rust::String get_account_info_with_core_symbol( const database_wrapper& db, uint64_t account, rust::Str expected_core_symbol, uint32_t head_block_num, const TimePoint& head_block_time ) {
         auto result = get_account_info( db, account, symbol::from_string(string(expected_core_symbol.data(), expected_core_symbol.size())), head_block_num, head_block_time );
         auto json = fc::json::to_pretty_string( result );
         return rust::String( json.c_str() );
     }
 
-    get_account_results get_account_info( const database_wrapper& db, uint64_t account, std::optional<symbol> expected_core_symbol, uint32_t head_block_num, const fc::time_point& head_block_time ) {
+    get_account_results get_account_info( const database_wrapper& db, uint64_t account, std::optional<symbol> expected_core_symbol, uint32_t head_block_num, const TimePoint& head_block_time ) {
         auto deadline = fc::time_point::now().safe_add( fc::microseconds(30 * 1000 * 1000) ); // 30 seconds from now
         auto account_name = name(account);
 
@@ -80,7 +81,7 @@ namespace pulsevm { namespace chain {
             result.account_name = account_name;
 
             result.head_block_num  = head_block_num;
-            result.head_block_time = head_block_time;
+            result.head_block_time = fc::time_point(fc::microseconds(head_block_time.elapsed.count));
 
             db.get_account_limits( account, result.ram_quota, result.net_weight, result.cpu_weight );
 
@@ -92,7 +93,7 @@ namespace pulsevm { namespace chain {
             result.created          = accnt_obj.creation_date;
 
             uint32_t greylist_limit = config::maximum_elastic_resource_multiplier;
-            const block_timestamp_type current_usage_time (head_block_time);
+            const block_timestamp_type current_usage_time (fc::time_point(fc::microseconds(head_block_time.elapsed.count)));
             result.net_limit.set( db.get_account_net_limit_ex( account, greylist_limit, current_usage_time).first );
             if ( result.net_limit.last_usage_update_time && (result.net_limit.last_usage_update_time->slot == 0) ) {   // account has no action yet
                 result.net_limit.last_usage_update_time = accnt_obj.creation_date;

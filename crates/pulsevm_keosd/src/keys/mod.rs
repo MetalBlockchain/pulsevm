@@ -1,12 +1,10 @@
 use std::str::FromStr;
 
-use k256::ecdsa::{Signature, SigningKey, VerifyingKey, signature::Signer};
-use k256::elliptic_curve::sec1::ToEncodedPoint;
+use k256::ecdsa::{SigningKey, VerifyingKey};
 use pulsevm_core::crypto::PrivateKey;
 use pulsevm_core::utils::Digest as PulseDigest;
 use ripemd::Ripemd160;
 use sha2::{Digest, Sha256};
-use spdlog::info;
 use thiserror::Error;
 
 /// The key type suffix used in the RIPEMD-160 checksum for PUB_K1_ / PVT_K1_ keys.

@@ -1,17 +1,14 @@
-use core::fmt;
-use std::{
-    ops::{Add, AddAssign, Sub, SubAssign},
-    str::FromStr,
-};
+use std::{fmt, ops::{Add, AddAssign, Sub, SubAssign}, str::FromStr};
 
-use pulsevm_proc_macros::{NumBytes, Read, Write};
-use serde::{
-    Deserialize, Deserializer, Serialize, Serializer,
-    de::{self, Visitor},
-};
+use cxx::SharedPtr;
+use pulsevm_serialization::{NumBytes, Read, Write};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::{self, Visitor}};
 use time::{OffsetDateTime, PrimitiveDateTime, macros::format_description};
 
-use crate::Microseconds;
+use crate::{
+    CxxTimePoint,
+    bridge::ffi::{Microseconds, TimePoint, make_time_point_from_i64, make_time_point_from_now},
+};
 
 const EOS_FMT_MILLIS_NOZ: &[time::format_description::FormatItem<'_>] =
     format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]");
@@ -22,11 +19,111 @@ const EOS_FMT_MILLIS_Z: &[time::format_description::FormatItem<'_>] =
 const EOS_FMT_SECS_NOZ: &[time::format_description::FormatItem<'_>] =
     format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]");
 
-#[derive(
-    Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Default, Read, Write, NumBytes,
-)]
-pub struct TimePoint {
-    pub elapsed: Microseconds, // microseconds since UNIX epoch
+impl CxxTimePoint {
+    pub fn new(microseconds: i64) -> SharedPtr<CxxTimePoint> {
+        make_time_point_from_i64(microseconds)
+    }
+
+    pub fn now() -> SharedPtr<CxxTimePoint> {
+        make_time_point_from_now()
+    }
+}
+
+impl Microseconds {
+    #[inline]
+    pub const fn new(count: i64) -> Self {
+        Self {
+            count
+        }
+    }
+
+    #[inline]
+    pub const fn maximum() -> Self {
+        Self {
+            count: 0x7fff_ffff_ffff_ffff
+        }
+    }
+
+    #[inline]
+    pub const fn count(self) -> i64 {
+        self.count
+    }
+
+    #[inline]
+    pub const fn to_seconds(self) -> i64 {
+        self.count / 1_000_000
+    }
+}
+
+impl Add for Microseconds {
+    type Output = Self;
+    #[inline]
+    fn add(self, rhs: Self) -> Self {
+        Self { count: self.count + rhs.count }
+    }
+}
+impl Sub for Microseconds {
+    type Output = Self;
+    #[inline]
+    fn sub(self, rhs: Self) -> Self {
+        Self { count: self.count - rhs.count }
+    }
+}
+impl AddAssign for Microseconds {
+    #[inline]
+    fn add_assign(&mut self, rhs: Self) {
+        self.count += rhs.count;
+    }
+}
+impl SubAssign for Microseconds {
+    #[inline]
+    fn sub_assign(&mut self, rhs: Self) {
+        self.count -= rhs.count;
+    }
+}
+
+impl NumBytes for Microseconds {
+    #[inline]
+    fn num_bytes(&self) -> usize {
+        8
+    }
+}
+
+impl Read for Microseconds {
+    #[inline]
+    fn read(data: &[u8], pos: &mut usize) -> Result<Self, pulsevm_serialization::ReadError> {
+        let count = i64::read(data, pos)?;
+        Ok(Self { count })
+    }
+}
+
+impl Write for Microseconds {
+    #[inline]
+    fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), pulsevm_serialization::WriteError> {
+        self.count.write(bytes, pos)
+    }
+}
+
+/* helper constructors (match the C++ free functions) */
+#[inline]
+pub const fn seconds(s: i64) -> Microseconds {
+    Microseconds { count: s * 1_000_000 }
+}
+#[inline]
+pub const fn milliseconds(ms: i64) -> Microseconds {
+    Microseconds { count: ms * 1_000 }
+}
+#[inline]
+pub const fn minutes(m: i64) -> Microseconds {
+    seconds(60 * m)
+}
+#[inline]
+pub const fn hours(h: i64) -> Microseconds {
+    minutes(60 * h)
+}
+#[inline]
+pub const fn days(d: i64) -> Microseconds {
+    hours(24 * d)
 }
 
 impl TimePoint {
@@ -71,8 +168,6 @@ impl TimePoint {
         dt.format(EOS_FMT_MILLIS_Z).expect("formatting never fails")
     }
 }
-
-/* ---- arithmetic/relations (match C++ semantics) ---- */
 
 impl Add<Microseconds> for TimePoint {
     type Output = TimePoint;
@@ -190,6 +285,28 @@ impl<'de> Deserialize<'de> for TimePoint {
             }
         }
         deserializer.deserialize_str(TPVisitor)
+    }
+}
+
+impl NumBytes for TimePoint {
+    #[inline]
+    fn num_bytes(&self) -> usize {
+        self.elapsed.num_bytes()
+    }
+}
+
+impl Read for TimePoint {
+    #[inline]
+    fn read(data: &[u8], pos: &mut usize) -> Result<Self, pulsevm_serialization::ReadError> {
+        let elapsed = Microseconds::read(data, pos)?;
+        Ok(Self { elapsed })
+    }
+}
+
+impl Write for TimePoint {
+    #[inline]
+    fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), pulsevm_serialization::WriteError> {
+        self.elapsed.write(bytes, pos)
     }
 }
 

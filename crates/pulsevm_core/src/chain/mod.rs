@@ -30,6 +30,10 @@ pub mod authority {
     };
 }
 
+pub mod time {
+    pub use pulsevm_ffi::{TimePoint, TimePointSec};
+}
+
 pub use pulsevm_error::ChainError;
 use pulsevm_name::Name;
 use pulsevm_name_macro::name;

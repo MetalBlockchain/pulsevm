@@ -11,7 +11,7 @@ use crate::{
     chain::{
         apply_context::ApplyContext,
         authorization_manager::AuthorizationManager,
-        block::{BlockHeader, BlockTimestamp},
+        block::{BlockHeader},
         config::{
             DELETEAUTH_NAME, LINKAUTH_NAME, NEWACCOUNT_NAME, SETABI_NAME, SETCODE_NAME,
             UNLINKAUTH_NAME, UPDATEAUTH_NAME, eos_percent,
@@ -39,7 +39,7 @@ use pulsevm_constants::{
 };
 use pulsevm_crypto::{Digest, merkle};
 use pulsevm_error::ChainError;
-use pulsevm_ffi::{CxxGenesisState, Database, ElasticLimitParameters, GlobalPropertyObject};
+use pulsevm_ffi::{BlockTimestamp, CxxGenesisState, Database, ElasticLimitParameters, GlobalPropertyObject, TimePoint};
 use pulsevm_grpc::vm;
 use pulsevm_serialization::{Read, Write};
 use spdlog::{debug, error, info, warn};
@@ -250,11 +250,11 @@ impl Controller {
         let mut root_session = db.create_undo_session(true)?; // As we are building the block, drop the changes once built
         let mut transaction_receipts: VecDeque<TransactionReceipt> = VecDeque::new();
         let mut action_receipt_digests: VecDeque<Digest> = VecDeque::new();
-        let timestamp = BlockTimestamp::now();
+        let timestamp: BlockTimestamp = TimePoint::now().into();
         let block_status = BlockStatus::Building;
 
         // Clear expired transactions from the database
-        db.clear_expired_input_transactions(&timestamp.to_time_point())?;
+        db.clear_expired_input_transactions(&timestamp.into())?;
 
         // Transactions already present in a verified-but-not-yet-accepted block
         // must not be included again. At build time the earlier block has not
@@ -870,10 +870,9 @@ impl Controller {
 mod tests {
     use std::{fs, path::Path, str::FromStr, vec};
 
-    use pulsevm_ffi::{Authority, KeyWeight};
+    use pulsevm_ffi::{Authority, KeyWeight, TimePointSec};
     use pulsevm_proc_macros::{NumBytes, Read, Write};
     use pulsevm_serialization::Write;
-    use pulsevm_time::TimePointSec;
     use serde_json::json;
     use tempfile::TempDir;
     use tokio::runtime;
@@ -1439,7 +1438,7 @@ mod tests {
         ));
         let block = SignedBlock::new(
             controller.last_accepted_block().id()?,
-            BlockTimestamp::now(),
+            TimePoint::now().into(),
             "pulse".parse().unwrap(),
             txs,
             Digest::default(), // TODO: Validate this when we implement merkle root calculation

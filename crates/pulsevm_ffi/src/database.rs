@@ -10,11 +10,7 @@ use pulsevm_name::Name;
 use crate::{
     AccountMetadataObject, Index64IteratorCache, Index128IteratorCache, KeyValueObject,
     bridge::ffi::{
-        self, Authority, CxxDigest, CxxGenesisState, CxxTimePoint, ElasticLimitParameters,
-        Index64Object, Index128Object, TableObject, U128, get_account_info_with_core_symbol,
-        get_account_info_without_core_symbol, get_currency_balance_with_symbol,
-        get_currency_balance_without_symbol, get_currency_stats, get_table_by_scope,
-        get_table_rows,
+        self, Authority, CxxDigest, CxxGenesisState, CxxTimePoint, ElasticLimitParameters, Index64Object, Index128Object, TableObject, TimePoint, U128, get_account_info_with_core_symbol, get_account_info_without_core_symbol, get_currency_balance_with_symbol, get_currency_balance_without_symbol, get_currency_stats, get_table_by_scope, get_table_rows
     },
     iterator_cache::KeyValueIteratorCache,
 };
@@ -200,7 +196,7 @@ impl Database {
         account: &ffi::AccountMetadataObject,
         new_code: &[u8],
         head_block_num: u32,
-        pending_block_time: &CxxTimePoint,
+        pending_block_time: &TimePoint,
         code_hash: &CxxDigest,
         vm_type: u8,
         vm_version: u8,
@@ -1145,7 +1141,7 @@ impl Database {
         name: u64,
         parent: u64,
         auth: &Authority,
-        creation_time: &CxxTimePoint,
+        creation_time: &TimePoint,
     ) -> Result<*const ffi::PermissionObject, ChainError> {
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
@@ -1174,7 +1170,7 @@ impl Database {
         &mut self,
         permission: &ffi::PermissionObject,
         authority: &Authority,
-        pending_block_time: &CxxTimePoint,
+        pending_block_time: &TimePoint,
     ) -> Result<(), ChainError> {
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
@@ -1182,6 +1178,31 @@ impl Database {
         pinned
             .modify_permission(permission, authority, pending_block_time)
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
+    pub fn update_permission_usage(
+        &mut self,
+        permission: &ffi::PermissionObject,
+        pending_block_time: &TimePoint,
+    ) -> Result<(), ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .update_permission_usage(permission, pending_block_time)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
+    pub fn get_permission_last_used(
+        &self,
+        permission: &ffi::PermissionObject,
+    ) -> Result<TimePoint, ChainError> {
+        let guard = self.inner.read()?;
+        let res = guard
+            .get_permission_last_used(permission)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+
+        Ok(res)
     }
 
     pub fn lookup_linked_permission(
@@ -1265,7 +1286,7 @@ impl Database {
 
     pub fn clear_expired_input_transactions(
         &mut self,
-        cutoff: &CxxTimePoint,
+        cutoff: &TimePoint,
     ) -> Result<(), ChainError> {
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
@@ -1369,7 +1390,7 @@ impl Database {
         &self,
         account: u64,
         head_block_num: u32,
-        head_block_time: &CxxTimePoint,
+        head_block_time: &TimePoint,
     ) -> Result<String, ChainError> {
         let guard = self.inner.read()?;
 
@@ -1387,7 +1408,7 @@ impl Database {
         account: u64,
         expected_core_symbol: &str,
         head_block_num: u32,
-        head_block_time: &CxxTimePoint,
+        head_block_time: &TimePoint,
     ) -> Result<String, ChainError> {
         let guard = self.inner.read()?;
 

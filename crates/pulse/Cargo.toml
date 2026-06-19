@@ -24,4 +24,3 @@ pulsevm_crypto = { path = "../pulsevm_crypto" }
 pulsevm_keosd_client = { path = "../pulsevm_keosd_client" }
 pulsevm_proc_macros = { path = "../pulsevm_proc_macros" }
 pulsevm_serialization = { path = "../pulsevm_serialization" }
-pulsevm_time = { path = "../pulsevm_time" }

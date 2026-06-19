@@ -84,6 +84,26 @@ pub mod ffi {
         test2: u32,
     }
 
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, Default, Debug)]
+    pub struct Microseconds {
+        count: i64,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, Default, Debug)]
+    pub struct TimePoint {
+        elapsed: Microseconds,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, Default, Debug)]
+    pub struct TimePointSec {
+        utc_seconds: u32,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, Default, Debug)]
+    pub struct BlockTimestamp {
+        slot: u32,
+    }
+
     unsafe extern "C++" {
         include!("catcher.hpp");
         include!("utils.hpp");
@@ -221,7 +241,7 @@ pub mod ffi {
             account: &AccountMetadataObject,
             new_code: &[u8],
             head_block_num: u32,
-            pending_block_time: &CxxTimePoint,
+            pending_block_time: &TimePoint,
             code_hash: &CxxDigest,
             vm_type: u8,
             vm_version: u8,
@@ -565,7 +585,7 @@ pub mod ffi {
             name: u64,
             parent: u64,
             auth: &Authority,
-            creation_time: &CxxTimePoint,
+            creation_time: &TimePoint,
         ) -> Result<&PermissionObject>;
         pub fn permission_satisfies_other_permission(
             self: &Database,
@@ -576,8 +596,17 @@ pub mod ffi {
             self: Pin<&mut Database>,
             permission: &PermissionObject,
             authority: &Authority,
-            pending_block_time: &CxxTimePoint,
+            pending_block_time: &TimePoint,
         ) -> Result<()>;
+        pub fn update_permission_usage(
+            self: Pin<&mut Database>,
+            permission: &PermissionObject,
+            pending_block_time: &TimePoint,
+        ) -> Result<()>;
+        pub fn get_permission_last_used(
+            self: &Database,
+            permission: &PermissionObject,
+        ) -> Result<TimePoint>;
         pub fn lookup_linked_permission(
             self: &Database,
             account: u64,
@@ -597,7 +626,7 @@ pub mod ffi {
         ) -> Result<()>;
         pub fn clear_expired_input_transactions(
             self: Pin<&mut Database>,
-            cutoff: &CxxTimePoint,
+            cutoff: &TimePoint,
         ) -> Result<()>;
 
         // Methods on undo_session
@@ -785,14 +814,14 @@ pub mod ffi {
             db: &Database,
             account: u64,
             head_block_num: u32,
-            head_block_time: &CxxTimePoint,
+            head_block_time: &TimePoint,
         ) -> Result<String>;
         pub fn get_account_info_with_core_symbol(
             db: &Database,
             account: u64,
             expected_core_symbol: &str,
             head_block_num: u32,
-            head_block_time: &CxxTimePoint,
+            head_block_time: &TimePoint,
         ) -> Result<String>;
         pub fn get_currency_balance_with_symbol(
             db: &Database,

@@ -1,10 +1,10 @@
 use core::fmt;
 use std::collections::{BTreeMap, HashMap};
 
+use pulsevm_ffi::BlockTimestamp;
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 
 use crate::chain::{
-    block::BlockTimestamp,
     id::Id,
     name::Name,
     transaction::{Action, ActionReceipt},

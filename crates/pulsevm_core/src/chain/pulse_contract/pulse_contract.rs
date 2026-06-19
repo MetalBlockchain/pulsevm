@@ -85,11 +85,9 @@ pub fn newaccount(
             &OWNER_NAME.into(),
             0,
             &create.owner.into(),
-            context
+            &context
                 .pending_block_timestamp()
-                .to_time_point()
-                .as_ref()
-                .unwrap(),
+                .into(),
         )?
     };
     let active_permission = unsafe {
@@ -99,11 +97,9 @@ pub fn newaccount(
             &ACTIVE_NAME.into(),
             owner_permission.get_id() as u64,
             &create.active.into(),
-            context
+            &context
                 .pending_block_timestamp()
-                .to_time_point()
-                .as_ref()
-                .unwrap(),
+                .into(),
         )?
     };
 
@@ -185,11 +181,9 @@ pub fn setcode(
         account,
         act.code.as_slice(),
         context.get_head_block_num() + 1,
-        context
+        &context
             .get_pending_block_time()
-            .to_time_point()
-            .as_ref()
-            .unwrap(),
+            .into(),
         code_hash.as_ref().unwrap(),
         act.vm_type,
         act.vm_version,
@@ -333,11 +327,9 @@ pub fn updateauth(
                 &update.permission,
                 parent_id as u64,
                 &update.auth.into(),
-                context
+                &context
                     .pending_block_timestamp()
-                    .to_time_point()
-                    .as_ref()
-                    .unwrap(),
+                    .into(),
             )?
         };
 

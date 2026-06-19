@@ -35,7 +35,6 @@ pulsevm_name = { path = "../pulsevm_name" }
 pulsevm_name_macro = { path = "../pulsevm_name_macro" }
 pulsevm_proc_macros = { path = "../pulsevm_proc_macros" }
 pulsevm_serialization = { path = "../pulsevm_serialization" }
-pulsevm_time = { path = "../pulsevm_time" }
 pulsevm_ffi = { path = "../pulsevm_ffi" }
 pulsevm_wasm_validation = { path = "../pulsevm_wasm_validation" }
 

@@ -170,9 +170,9 @@ namespace pulsevm { namespace chain {
 
    abi_def get_abi( const database_wrapper& db, uint64_t account );
    using get_account_return_t = std::function<t_or_exception<get_account_results>()>;
-   rust::String get_account_info_without_core_symbol( const database_wrapper& db, uint64_t account, uint32_t head_block_num, const fc::time_point& head_block_time );
-   rust::String get_account_info_with_core_symbol( const database_wrapper& db, uint64_t account, rust::Str expected_core_symbol, uint32_t head_block_num, const fc::time_point& head_block_time );
-   get_account_results get_account_info( const database_wrapper& db, uint64_t account, std::optional<symbol> expected_core_symbol, uint32_t head_block_num, const fc::time_point& head_block_time );
+   rust::String get_account_info_without_core_symbol( const database_wrapper& db, uint64_t account, uint32_t head_block_num, const TimePoint& head_block_time );
+   rust::String get_account_info_with_core_symbol( const database_wrapper& db, uint64_t account, rust::Str expected_core_symbol, uint32_t head_block_num, const TimePoint& head_block_time );
+   get_account_results get_account_info( const database_wrapper& db, uint64_t account, std::optional<symbol> expected_core_symbol, uint32_t head_block_num, const TimePoint& head_block_time );
    rust::String get_currency_balance_with_symbol( const database_wrapper& db, uint64_t code, uint64_t account, rust::Str symbol );
    rust::String get_currency_balance_without_symbol( const database_wrapper& db, uint64_t code, uint64_t account );
    rust::String get_currency_stats( const database_wrapper& db, uint64_t code, rust::Str symbol );

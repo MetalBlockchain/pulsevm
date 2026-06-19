@@ -99,11 +99,11 @@ pub fn signing_digest(
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::{BTreeSet, HashSet},
+        collections::{BTreeSet},
         str::FromStr,
     };
 
-    use pulsevm_time::TimePointSec;
+    use pulsevm_ffi::TimePointSec;
 
     use crate::{
         crypto::PrivateKey,

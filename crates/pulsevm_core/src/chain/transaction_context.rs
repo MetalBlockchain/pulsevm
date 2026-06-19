@@ -1,27 +1,23 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{Arc, RwLock},
 };
 
 use pulsevm_crypto::Digest;
 use pulsevm_error::ChainError;
-use pulsevm_ffi::Database;
+use pulsevm_ffi::{BlockTimestamp, Database, Microseconds, TimePoint};
 use pulsevm_serialization::VarUint32;
-use pulsevm_time::{Microseconds, TimePoint};
-use spdlog::debug;
 
 use crate::{
-    block::BlockStatus,
-    chain::{
+    authorization_manager::AuthorizationManager, block::BlockStatus, chain::{
         apply_context::ApplyContext,
-        block::BlockTimestamp,
         id::Id,
         name::Name,
         resource_limits::ResourceLimitsManager,
         transaction::{Action, ActionTrace, Transaction, TransactionStatus, TransactionTrace},
         utils::pulse_assert,
         wasm_runtime::WasmRuntime,
-    }, transaction::PackedTransaction,
+    }, transaction::PackedTransaction
 };
 
 #[derive(Default, Clone)]
@@ -47,6 +43,7 @@ struct TransactionContextInner {
     pending_block_timestamp: BlockTimestamp,
     cpu_limit: i64,
     executed_action_receipt_digests: VecDeque<Digest>,
+    is_input: bool,
 }
 
 #[derive(Clone)]
@@ -91,6 +88,7 @@ impl TransactionContext {
                 pending_block_timestamp,
                 cpu_limit: 0,
                 executed_action_receipt_digests: VecDeque::with_capacity(6),
+                is_input: false,
             })),
             packed_transaction,
         }
@@ -100,6 +98,7 @@ impl TransactionContext {
         &mut self,
         initial_net_usage: u64,
         first_authorizer: Option<u64>,
+        is_input: bool,
     ) -> Result<(), ChainError> {
         {
             let mut inner = self.inner.write()?;
@@ -109,6 +108,7 @@ impl TransactionContext {
                 ChainError::TransactionError("cannot initialize twice".into()),
             )?;
             inner.initialized = true;
+            inner.is_input = is_input;
         }
 
         if initial_net_usage > 0 {
@@ -165,7 +165,7 @@ impl TransactionContext {
             + discounted_size_for_pruned_data;
         let first_authorizer = transaction.first_authorizer();
 
-        self.init(initial_net_usage, first_authorizer)?;
+        self.init(initial_net_usage, first_authorizer, true)?;
         self.record_transaction(
             &transaction.id()?,
             transaction.header.expiration().sec_since_epoch(),
@@ -368,6 +368,23 @@ impl TransactionContext {
         inner.trace.net_usage = ((inner.trace.net_usage + 7) / 8) * 8; // Round up to nearest multiple of word size (8 bytes)
         inner.trace.receipt.status = TransactionStatus::Executed;
         inner.trace.receipt.net_usage_words = VarUint32((inner.trace.net_usage / 8) as u32);
+
+        if inner.is_input {
+            let trx = self.packed_transaction.get_transaction();
+            let time: TimePoint = (&inner.pending_block_timestamp).into();
+
+            for action in trx.actions.iter() {
+                for auth in action.authorization().iter() {
+                    let permission = AuthorizationManager::get_permission(&self.db, auth.actor(), auth.permission())?;
+                    
+                    AuthorizationManager::update_permission_usage(
+                        &mut self.db,
+                        permission,
+                        &time,
+                    )?;
+                }
+            }
+        }
 
         for account in inner.validate_ram_usage.iter() {
             ResourceLimitsManager::verify_account_ram_usage(&mut self.db, account)?;

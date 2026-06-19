@@ -1,21 +1,12 @@
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeSet},
     str::FromStr,
     sync::Arc,
 };
 
 use jsonrpsee::{proc_macros::rpc, types::ErrorObjectOwned};
 use pulsevm_core::{
-    abi::AbiDefinition,
-    authorization_manager::AuthorizationManager,
-    block::{BlockTimestamp, SignedBlock},
-    controller::Controller,
-    crypto::{PublicKey, Signature},
-    id::Id,
-    mempool::Mempool,
-    name::Name,
-    transaction::{PackedTransaction, Transaction, TransactionCompression},
-    utils::{Base64Bytes, I32Flex},
+    abi::AbiDefinition, authorization_manager::AuthorizationManager, block::{BlockTimestamp, SignedBlock}, controller::Controller, crypto::{PublicKey, Signature}, id::Id, mempool::Mempool, name::Name, time::TimePoint, transaction::{PackedTransaction, Transaction, TransactionCompression}, utils::{Base64Bytes, I32Flex}
 };
 use pulsevm_crypto::{Bytes, Digest};
 use pulsevm_serialization::Read;
@@ -282,7 +273,7 @@ impl RpcServer for RpcService {
 
         Ok(GetInfoResponse {
             server_version: "d133c641".to_owned(),
-            server_time: BlockTimestamp::now(),
+            server_time: TimePoint::now().into(),
             chain_id: controller.chain_id().clone(),
             head_block_num: head_block.block_num(),
             last_irreversible_block_num: head_block.block_num(),
@@ -384,7 +375,7 @@ impl RpcServer for RpcService {
 
         // Run transaction and revert it
         let mut controller = self.controller.write().await;
-        let pending_block_timestamp = BlockTimestamp::now();
+        let pending_block_timestamp = TimePoint::now().into();
         controller.push_transaction(
             &packed_trx,
             &pending_block_timestamp,

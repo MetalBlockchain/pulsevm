@@ -1,17 +1,10 @@
-use std::{
-    fmt,
-    ops::{Add, AddAssign},
-    str::FromStr,
-};
+use std::{fmt, ops::{Add, AddAssign}, str::FromStr};
 
-use pulsevm_proc_macros::{NumBytes, Read, Write};
-use serde::{
-    Deserialize, Deserializer, Serialize, Serializer,
-    de::{self, Visitor},
-};
+use pulsevm_serialization::{NumBytes, Read, Write};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::{self, Visitor}};
 use time::{OffsetDateTime, PrimitiveDateTime, macros::format_description};
 
-use crate::{TimePoint, microseconds::seconds};
+use crate::{TimePoint, bridge::ffi::TimePointSec, types::time::seconds};
 
 // Base EOS format (no 'Z')
 const EOS_FMT_NOZ: &[time::format_description::FormatItem<'_>] =
@@ -19,11 +12,6 @@ const EOS_FMT_NOZ: &[time::format_description::FormatItem<'_>] =
 // Exact output format (with trailing 'Z')
 const EOS_FMT_Z: &[time::format_description::FormatItem<'_>] =
     format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]Z");
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Read, Write, NumBytes, Default, PartialOrd, Ord)]
-pub struct TimePointSec {
-    utc_seconds: u32,
-}
 
 impl TimePointSec {
     #[inline]
@@ -164,6 +152,28 @@ impl AddAssign<u32> for TimePointSec {
     #[inline]
     fn add_assign(&mut self, rhs: u32) {
         self.utc_seconds = self.utc_seconds.wrapping_add(rhs);
+    }
+}
+
+impl NumBytes for TimePointSec {
+    #[inline]
+    fn num_bytes(&self) -> usize {
+        4
+    }
+}
+
+impl Read for TimePointSec {
+    #[inline]
+    fn read(data: &[u8], pos: &mut usize) -> Result<Self, pulsevm_serialization::ReadError> {
+        let secs = u32::read(data, pos)?;
+        Ok(Self { utc_seconds: secs })
+    }
+}
+
+impl Write for TimePointSec {
+    #[inline]
+    fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), pulsevm_serialization::WriteError> {
+        self.utc_seconds.write(bytes, pos)
     }
 }
 

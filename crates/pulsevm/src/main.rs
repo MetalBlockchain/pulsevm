@@ -21,7 +21,6 @@ use pulsevm_grpc::{
     },
 };
 use pulsevm_serialization::{Read, Write};
-use secp256k1::hashes::{Hash, sha256};
 use spdlog::{debug, info, warn};
 use std::{
     net::{SocketAddr, TcpListener},
@@ -31,7 +30,7 @@ use std::{
 use tokio::{
     net::TcpListener as TokioTcpListener,
     signal::unix::{SignalKind, signal},
-    sync::{Notify, RwLock},
+    sync::{RwLock},
 };
 use tokio_util::sync::CancellationToken;
 use tonic::transport::server::TcpIncoming;

@@ -1,6 +1,5 @@
+use pulsevm_ffi::BlockTimestamp;
 use serde::Serialize;
-
-use crate::chain::block::BlockTimestamp;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct AccountResourceLimit {

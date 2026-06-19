@@ -2,15 +2,14 @@ use std::collections::HashMap;
 
 use pulsevm_crypto::{Bytes, FixedBytes};
 use pulsevm_error::ChainError;
+use pulsevm_ffi::{BlockTimestamp, TimePoint, TimePointSec};
 use pulsevm_serialization::{Read, ReadError, VarInt32, VarUint32};
-use pulsevm_time::{TimePoint, TimePointSec};
 use serde_json::{Number, Value};
 
 use crate::{
     chain::{
         abi::{AbiDefinition, AbiStructDefinition, AbiVariantDefinition},
         asset::{Asset, ExtendedAsset, Symbol, SymbolCode},
-        block::BlockTimestamp,
         utils::pulse_assert,
     },
     crypto::{PublicKey, Signature},
@@ -418,7 +417,7 @@ fn builtin_types() -> HashMap<TypeName, UnpackFunction> {
     });
     m.insert("block_timestamp_type".to_string(), |bytes, pos| {
         let res = BlockTimestamp::read(bytes, pos)?;
-        Ok(serde_json::Value::String(res.to_string()))
+        Ok(serde_json::Value::String(res.to_eos_string()))
     });
 
     m.insert("name".to_string(), |bytes, pos| {

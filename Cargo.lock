@@ -3155,7 +3155,6 @@ dependencies = [
  "pulsevm_keosd_client",
  "pulsevm_proc_macros",
  "pulsevm_serialization",
- "pulsevm_time",
  "rpassword",
  "serde",
  "serde_json",
@@ -3181,7 +3180,6 @@ dependencies = [
  "pulsevm_name_macro",
  "pulsevm_proc_macros",
  "pulsevm_serialization",
- "pulsevm_time",
  "secp256k1",
  "serde",
  "serde_json",
@@ -3212,7 +3210,6 @@ name = "pulsevm_api_types"
 version = "0.1.0"
 dependencies = [
  "pulsevm_core",
- "pulsevm_time",
  "serde",
  "serde_json",
 ]
@@ -3226,7 +3223,6 @@ dependencies = [
  "pulsevm_core",
  "pulsevm_proc_macros",
  "pulsevm_serialization",
- "pulsevm_time",
  "serde_json",
  "spdlog-rs",
  "tokio",
@@ -3264,7 +3260,6 @@ dependencies = [
  "pulsevm_name_macro",
  "pulsevm_proc_macros",
  "pulsevm_serialization",
- "pulsevm_time",
  "pulsevm_wasm_validation",
  "serde",
  "serde_json",
@@ -3313,6 +3308,7 @@ dependencies = [
  "cxx-build",
  "hex",
  "libc",
+ "prost-types",
  "pulsevm_billable_size",
  "pulsevm_constants",
  "pulsevm_crypto",
@@ -3321,7 +3317,9 @@ dependencies = [
  "pulsevm_proc_macros",
  "pulsevm_serialization",
  "serde",
+ "serde_json",
  "tempfile",
+ "time",
  "zerocopy",
  "zerocopy-derive",
 ]
@@ -3416,18 +3414,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pulsevm_time"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "pulsevm_proc_macros",
- "pulsevm_serialization",
- "serde",
- "serde_json",
- "time",
-]
-
-[[package]]
 name = "pulsevm_unittests"
 version = "0.1.0"
 dependencies = [
@@ -3439,7 +3425,6 @@ dependencies = [
  "pulsevm_name_macro",
  "pulsevm_proc_macros",
  "pulsevm_serialization",
- "pulsevm_time",
  "serde_json",
  "tempfile",
  "tokio",

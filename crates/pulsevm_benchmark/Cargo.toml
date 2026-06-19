@@ -13,7 +13,6 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 pulsevm_core = { path = "../pulsevm_core" }
 pulsevm_proc_macros = { path = "../pulsevm_proc_macros" }
 pulsevm_serialization = { path = "../pulsevm_serialization" }
-pulsevm_time = { path = "../pulsevm_time" }
 
 [features]
 dhat-heap = []

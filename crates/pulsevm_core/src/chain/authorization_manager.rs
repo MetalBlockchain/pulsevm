@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashSet};
 
 use pulsevm_error::ChainError;
-use pulsevm_ffi::{Authority, CxxTimePoint, Database, PermissionObject};
+use pulsevm_ffi::{Authority, CxxTimePoint, Database, PermissionObject, TimePoint};
 
 use crate::{
     PULSE_NAME,
@@ -380,7 +380,7 @@ impl AuthorizationManager {
     }
 
     pub fn get_permission<'a>(
-        db: &mut Database,
+        db: &Database,
         actor: u64,
         permission: u64,
     ) -> Result<&'a PermissionObject, ChainError> {
@@ -458,7 +458,7 @@ impl AuthorizationManager {
         name: &Name,
         parent: u64,
         auth: &Authority,
-        pending_block_time: &CxxTimePoint,
+        pending_block_time: &TimePoint,
     ) -> Result<*const PermissionObject, ChainError> {
         db.create_permission(
             account.as_u64(),
@@ -473,7 +473,7 @@ impl AuthorizationManager {
         db: &mut Database,
         permission: &PermissionObject,
         auth: &Authority,
-        pending_block_time: &CxxTimePoint,
+        pending_block_time: &TimePoint,
     ) -> Result<(), ChainError> {
         db.modify_permission(permission, auth, pending_block_time)
     }
@@ -483,5 +483,19 @@ impl AuthorizationManager {
         permission: &PermissionObject,
     ) -> Result<(), ChainError> {
         db.remove_permission(permission)
+    }
+
+    pub fn update_permission_usage(
+        db: &mut Database,
+        permission: &PermissionObject,
+        pending_block_time: &TimePoint,
+    ) -> Result<(), ChainError> {
+        db.update_permission_usage(permission, pending_block_time).map_err(|e| {
+            ChainError::DatabaseError(format!(
+                "failed to update permission usage: {}",
+                e
+            ))
+        })?;
+        Ok(())
     }
 }

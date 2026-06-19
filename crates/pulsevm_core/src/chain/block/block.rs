@@ -2,14 +2,14 @@ use std::collections::VecDeque;
 
 use pulsevm_crypto::{Digest, FixedBytes};
 use pulsevm_error::ChainError;
-use pulsevm_ffi::Database;
+use pulsevm_ffi::{BlockTimestamp, Database};
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 use pulsevm_serialization::Write;
 use serde::{Serialize, ser::SerializeStruct};
 use spdlog::{info, warn};
 
 use crate::{
-    chain::{Name, block::BlockTimestamp, id::Id, transaction::TransactionReceipt},
+    chain::{Name, id::Id, transaction::TransactionReceipt},
     crypto::Signature,
     utils::pulse_assert,
 };
