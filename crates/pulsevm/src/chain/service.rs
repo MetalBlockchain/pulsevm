@@ -15,7 +15,7 @@ use pulsevm_core::{
     mempool::Mempool,
     name::Name,
     transaction::{PackedTransaction, Transaction, TransactionCompression},
-    utils::{Base64Bytes, I32Flex},
+    utils::{Base64Bytes, I32Flex, StringFlex},
 };
 use pulsevm_crypto::{Bytes, Digest};
 use pulsevm_serialization::Read;
@@ -106,13 +106,13 @@ pub trait Rpc {
         &self,
         json: Option<bool>,
         code: Name,
-        scope: String,
+        scope: StringFlex,
         table: Name,
-        table_key: Option<String>,
-        lower_bound: Option<String>,
-        upper_bound: Option<String>,
+        table_key: Option<StringFlex>,
+        lower_bound: Option<StringFlex>,
+        upper_bound: Option<StringFlex>,
         limit: Option<I32Flex>,
-        key_type: String,
+        key_type: Option<String>,
         index_position: Option<I32Flex>,
         encode_type: Option<String>, //dec, hex , default=dec
         reverse: Option<bool>,
@@ -451,13 +451,13 @@ impl RpcServer for RpcService {
         &self,
         json: Option<bool>,
         code: Name,
-        scope: String,
+        scope: StringFlex,
         table: Name,
-        table_key: Option<String>,
-        lower_bound: Option<String>,
-        upper_bound: Option<String>,
+        table_key: Option<StringFlex>,
+        lower_bound: Option<StringFlex>,
+        upper_bound: Option<StringFlex>,
         limit: Option<I32Flex>,
-        key_type: String,
+        key_type: Option<String>,
         index_position: Option<I32Flex>,
         encode_type: Option<String>, //dec, hex , default=dec
         reverse: Option<bool>,
@@ -465,16 +465,21 @@ impl RpcServer for RpcService {
     ) -> Result<Value, ErrorObjectOwned> {
         let controller = self.controller.read().await;
         let db = controller.database();
+        // eosjs-style clients send limit: -1 for "no limit"
+        let limit = match limit.unwrap_or(I32Flex(10)).0 {
+            v if v < 0 => u32::MAX,
+            v => v as u32,
+        };
         let response = db.get_table_rows(
             json.unwrap_or(false),
             code.as_u64(),
-            &scope,
+            &scope.0,
             table.as_u64(),
-            &table_key.unwrap_or_default(),
-            &lower_bound.unwrap_or_default(),
-            &upper_bound.unwrap_or_default(),
-            limit.unwrap_or(I32Flex(10)).0 as u32,
-            &key_type,
+            &table_key.unwrap_or_default().0,
+            &lower_bound.unwrap_or_default().0,
+            &upper_bound.unwrap_or_default().0,
+            limit,
+            &key_type.unwrap_or_default(),
             &index_position.unwrap_or(I32Flex(1)).0.to_string(),
             &encode_type.unwrap_or_else(|| "dec".to_string()),
             reverse.unwrap_or(false),
