@@ -3263,6 +3263,7 @@ dependencies = [
  "pulsevm_wasm_validation",
  "serde",
  "serde_json",
+ "sha1",
  "sha2 0.10.9",
  "spdlog-rs",
  "tempfile",
