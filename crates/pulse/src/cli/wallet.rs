@@ -1,6 +1,6 @@
 use pulsevm_keosd_client::KeosdClient;
 
-use crate::cli::{CreateSubcommand, WalletSubcommand};
+use crate::cli::WalletSubcommand;
 
 pub async fn handle(
     client: &KeosdClient,

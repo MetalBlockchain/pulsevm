@@ -26,6 +26,7 @@ namespace pulsevm { namespace chain {
     struct U128;
     struct U256;
     struct Float128;
+    struct ChainConfigV0;
 
     U128 index128_object_secondary_key_as_u128(const index128_object& o);
     U256 index256_object_secondary_key_as_u256(const index256_object& o);
@@ -756,6 +757,8 @@ public:
     const global_property_object& get_global_properties() const {
         return this->get<global_property_object>();
     }
+
+    void set_global_properties(const ChainConfigV0& chain_config);
 
     uint64_t next_recv_sequence( const account_metadata_object& receiver_account ) {
         this->modify( receiver_account, [&]( auto& ra ) {

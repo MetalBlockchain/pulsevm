@@ -108,6 +108,45 @@ pub mod ffi {
         slot: u32,
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ChainConfigV0 {
+        /// Maximum net usage (in instructions) for a block.
+        pub max_block_net_usage: u64,
+        /// Target percent (1% == 100, 100% == 10,000) of max net usage; exceeding triggers congestion handling.
+        pub target_block_net_usage_pct: u32,
+        /// Maximum objectively measured net usage the chain allows regardless of account limits.
+        pub max_transaction_net_usage: u32,
+        /// Base net usage billed per transaction to cover incidentals.
+        pub base_per_transaction_net_usage: u32,
+        pub net_usage_leeway: u32,
+        /// Numerator of the discount on net usage of context-free data.
+        pub context_free_discount_net_usage_num: u32,
+        /// Denominator of the discount on net usage of context-free data.
+        pub context_free_discount_net_usage_den: u32,
+
+        /// Maximum billable cpu usage (microseconds) for a block.
+        pub max_block_cpu_usage: u32,
+        /// Target percent (1% == 100, 100% == 10,000) of max cpu usage; exceeding triggers congestion handling.
+        pub target_block_cpu_usage_pct: u32,
+        /// Maximum billable cpu usage (microseconds) the chain allows regardless of account limits.
+        pub max_transaction_cpu_usage: u32,
+        /// Minimum billable cpu usage (microseconds) the chain requires.
+        pub min_transaction_cpu_usage: u32,
+
+        /// Max seconds an input transaction's expiration can be ahead of its first-including block.
+        pub max_transaction_lifetime: u32,
+        /// Seconds after first-executable time until a deferred transaction expires.
+        pub deferred_trx_expiration_window: u32,
+        /// Max seconds that can be imposed as a delay requirement by authorization checks.
+        pub max_transaction_delay: u32,
+        /// Maximum allowed size (bytes) of an inline action.
+        pub max_inline_action_size: u32,
+        /// Recursion depth limit on sending inline actions.
+        pub max_inline_action_depth: u16,
+        /// Recursion depth limit for checking if an authority is satisfied.
+        pub max_authority_depth: u16,
+    }
+
     unsafe extern "C++" {
         include!("catcher.hpp");
         include!("utils.hpp");
@@ -864,6 +903,7 @@ pub mod ffi {
             requirement_type: u64,
         ) -> Result<*const CxxName>;
         pub fn get_global_properties(self: &Database) -> Result<&GlobalPropertyObject>;
+        pub fn set_global_properties(self: Pin<&mut Database>, cfg: &ChainConfigV0) -> Result<()>;
         pub fn get_virtual_block_cpu_limit(self: &Database) -> Result<u64>;
         pub fn get_virtual_block_net_limit(self: &Database) -> Result<u64>;
         pub fn get_block_cpu_limit(self: &Database) -> Result<u64>;

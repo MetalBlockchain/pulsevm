@@ -1,4 +1,6 @@
 use pulsevm_error::ChainError;
+use pulsevm_ffi::ChainConfigV0;
+use pulsevm_serialization::Read;
 use wasmer::{FunctionEnvMut, RuntimeError, WasmPtr};
 
 use crate::chain::{
@@ -17,8 +19,8 @@ fn privileged_check(context: &ApplyContext) -> Result<(), RuntimeError> {
 
 pub fn set_proposed_producers(
     mut env: FunctionEnvMut<WasmContext>,
-    data_ptr: WasmPtr<u8>,
-    data_len: u32,
+    _data_ptr: WasmPtr<u8>,
+    _data_len: u32,
 ) -> Result<i64, RuntimeError> {
     context_aware_check(&env)?;
     let context = env.data_mut().apply_context_mut();
@@ -29,8 +31,8 @@ pub fn set_proposed_producers(
 
 pub fn get_blockchain_parameters_packed(
     mut env: FunctionEnvMut<WasmContext>,
-    data_ptr: WasmPtr<u8>,
-    data_len: u32,
+    _data_ptr: WasmPtr<u8>,
+    _data_len: u32,
 ) -> Result<u32, RuntimeError> {
     context_aware_check(&env)?;
     let context = env.data_mut().apply_context_mut();
@@ -43,10 +45,26 @@ pub fn set_blockchain_parameters_packed(
     data_ptr: WasmPtr<u8>,
     data_len: u32,
 ) -> Result<(), RuntimeError> {
-    context_aware_check(&env)?;
-    let context = env.data_mut().apply_context_mut();
-    privileged_check(context)?;
-    // TODO: Implement set_blockchain_parameters_packed logic
+    {
+        context_aware_check(&env)?;
+        let context = env.data_mut().apply_context_mut();
+        privileged_check(context)?;
+    }
+
+    let (env_data, store) = env.data_and_store_mut();
+    let memory = env_data
+        .memory()
+        .as_ref()
+        .expect("Wasm memory not initialized");
+    let view = memory.view(&store);
+    let slice = data_ptr.slice(&view, data_len)?;
+    let mut src_bytes = vec![0u8; data_len as usize];
+    slice.read_slice(&mut src_bytes)?;
+    let cfg = ChainConfigV0::read(&src_bytes, &mut 0)
+        .map_err(|e| RuntimeError::new(format!("failed to read blockchain parameters: {}", e)))?;
+    cfg.validate()?;
+    let context = env_data.apply_context_mut();
+    context.set_global_properties(&cfg)?;
     Ok(())
 }
 

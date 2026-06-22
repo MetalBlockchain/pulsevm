@@ -1610,16 +1610,14 @@ mod tests {
                     Name::from_str(action).unwrap(),
                     &Vec::<u8>::new(),
                     chain_id,
-                ).unwrap(),
+                )
+                .unwrap(),
                 &pending_block_timestamp,
                 &block_status,
             );
 
             assert!(result.is_err());
-            assert_eq!(
-                result.err().unwrap().to_string(),
-                expected_error
-            );
+            assert_eq!(result.err().unwrap().to_string(), expected_error);
         };
 
         check_failure(

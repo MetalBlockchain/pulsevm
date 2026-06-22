@@ -4,7 +4,6 @@ use pulsevm_api_client::PulseVmClient;
 use pulsevm_core::{
     ACTIVE_NAME, asset::Asset, authority::PermissionLevel, name::Name, transaction::Action,
 };
-use pulsevm_crypto::Bytes;
 use pulsevm_keosd_client::KeosdClient;
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 use pulsevm_serialization::Write;
@@ -29,7 +28,7 @@ impl TryFrom<Transfer> for Arc<[u8]> {
 
 pub async fn handle(
     api_client: &PulseVmClient,
-    config: &mut Config,
+    _config: &mut Config,
     keosd_client: &KeosdClient,
     sender: String,
     recipient: String,

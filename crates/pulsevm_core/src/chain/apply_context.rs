@@ -9,11 +9,7 @@ use pulsevm_billable_size::billable_size_v;
 use pulsevm_crypto::Bytes;
 use pulsevm_error::ChainError;
 use pulsevm_ffi::{
-    AccountMetadataObject, BlockTimestamp, Database, Float128, Index64IteratorCache, Index64Object,
-    Index128IteratorCache, Index128Object, Index256IteratorCache, Index256Object,
-    IndexDoubleIteratorCache, IndexDoubleObject, IndexLongDoubleIteratorCache,
-    IndexLongDoubleObject, KeyValueIteratorCache, KeyValueObject, Microseconds, TableObject,
-    TimePoint, U256,
+    AccountMetadataObject, BlockTimestamp, ChainConfigV0, Database, Float128, Index64IteratorCache, Index64Object, Index128IteratorCache, Index128Object, Index256IteratorCache, Index256Object, IndexDoubleIteratorCache, IndexDoubleObject, IndexLongDoubleIteratorCache, IndexLongDoubleObject, KeyValueIteratorCache, KeyValueObject, Microseconds, TableObject, TimePoint, U256
 };
 use pulsevm_serialization::{NumBytes, Write};
 
@@ -1742,5 +1738,10 @@ impl ApplyContext {
     pub fn is_context_free(&self) -> bool {
         let inner = self.inner.read().unwrap();
         inner.context_free_inline_actions.len() > 0
+    }
+
+    pub fn set_global_properties(&mut self, cfg: &ChainConfigV0) -> Result<(), ChainError> {
+        self.db.set_global_properties(cfg)?;
+        Ok(())
     }
 }

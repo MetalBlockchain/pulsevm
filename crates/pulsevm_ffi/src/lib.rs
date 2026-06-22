@@ -13,9 +13,9 @@ pub use crate::bridge::ffi::{
     WaitWeight,
 };
 pub use crate::bridge::ffi::{
-    BlockTimestamp, CxxBlockTimestamp, CxxChainConfig, CxxDigest, CxxGenesisState, CxxMicroseconds,
-    CxxPrivateKey, CxxPublicKey, CxxSignature, CxxTimePoint, Float128, I128, Microseconds,
-    TimePoint, TimePointSec, U128, U256,
+    BlockTimestamp, ChainConfigV0, CxxBlockTimestamp, CxxChainConfig, CxxDigest, CxxGenesisState,
+    CxxMicroseconds, CxxPrivateKey, CxxPublicKey, CxxSignature, CxxTimePoint, Float128, I128,
+    Microseconds, TimePoint, TimePointSec, U128, U256,
 };
 pub use crate::bridge::ffi::{CxxName, string_to_name, u64_to_name};
 pub use crate::bridge::ffi::{

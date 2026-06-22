@@ -119,6 +119,28 @@ void database_wrapper::create_native_account( const fc::time_point& initial_time
     this->verify_account_ram_usage(account_name);
 }
 
+void database_wrapper::set_global_properties(const ChainConfigV0& cfg) {
+    this->modify( this->get_global_properties(), [&]( pulsevm::chain::global_property_object& gprops ) {
+        gprops.configuration.max_block_net_usage = cfg.max_block_net_usage;
+        gprops.configuration.target_block_net_usage_pct = cfg.target_block_net_usage_pct;
+        gprops.configuration.max_transaction_net_usage = cfg.max_transaction_net_usage;
+        gprops.configuration.base_per_transaction_net_usage = cfg.base_per_transaction_net_usage;
+        gprops.configuration.net_usage_leeway = cfg.net_usage_leeway;
+        gprops.configuration.context_free_discount_net_usage_num = cfg.context_free_discount_net_usage_num;
+        gprops.configuration.context_free_discount_net_usage_den = cfg.context_free_discount_net_usage_den;
+        gprops.configuration.max_block_cpu_usage = cfg.max_block_cpu_usage;
+        gprops.configuration.target_block_cpu_usage_pct = cfg.target_block_cpu_usage_pct;
+        gprops.configuration.max_transaction_cpu_usage = cfg.max_transaction_cpu_usage;
+        gprops.configuration.min_transaction_cpu_usage = cfg.min_transaction_cpu_usage;
+        gprops.configuration.max_transaction_lifetime = cfg.max_transaction_lifetime;
+        gprops.configuration.deferred_trx_expiration_window = cfg.deferred_trx_expiration_window;
+        gprops.configuration.max_transaction_delay = cfg.max_transaction_delay;
+        gprops.configuration.max_inline_action_size = cfg.max_inline_action_size;
+        gprops.configuration.max_inline_action_depth = cfg.max_inline_action_depth;
+        gprops.configuration.max_authority_depth = cfg.max_authority_depth;
+    });
+}
+
 void database_wrapper::update_account_code(
     const account_metadata_object& account,
     rust::Slice<const std::uint8_t> new_code, 

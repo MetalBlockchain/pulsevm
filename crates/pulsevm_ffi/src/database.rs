@@ -8,17 +8,14 @@ use pulsevm_error::ChainError;
 use pulsevm_name::Name;
 
 use crate::{
-    AccountMetadataObject, Float128, Index64IteratorCache, Index128IteratorCache,
-    IndexDoubleIteratorCache, IndexLongDoubleIteratorCache, IndexLongDoubleObject, KeyValueObject,
-    bridge::ffi::{
+    AccountMetadataObject, ChainConfigV0, Float128, Index64IteratorCache, Index128IteratorCache, IndexDoubleIteratorCache, IndexLongDoubleIteratorCache, IndexLongDoubleObject, KeyValueObject, bridge::ffi::{
         self, Authority, CxxDigest, CxxGenesisState, CxxIndex256IteratorCache, CxxTimePoint,
         ElasticLimitParameters, Index64Object, Index128Object, Index256Object, IndexDoubleObject,
         TableObject, TimePoint, U128, U256, get_account_info_with_core_symbol,
         get_account_info_without_core_symbol, get_currency_balance_with_symbol,
         get_currency_balance_without_symbol, get_currency_stats, get_table_by_scope,
         get_table_rows,
-    },
-    iterator_cache::{Index256IteratorCache, KeyValueIteratorCache},
+    }, iterator_cache::{Index256IteratorCache, KeyValueIteratorCache}
 };
 
 #[derive(Clone)]
@@ -1791,6 +1788,17 @@ impl Database {
             .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
 
         Ok(res)
+    }
+
+    pub fn set_global_properties(&self, cfg: &ChainConfigV0) -> Result<(), ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .set_global_properties(cfg)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+
+        Ok(())
     }
 
     pub fn get_virtual_block_cpu_limit(&self) -> Result<u64, ChainError> {

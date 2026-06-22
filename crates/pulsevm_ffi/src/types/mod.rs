@@ -1,5 +1,6 @@
 mod authority;
 mod block_timestamp;
+mod config;
 mod digest;
 mod elastic_limit_parameters;
 mod genesis_state;
