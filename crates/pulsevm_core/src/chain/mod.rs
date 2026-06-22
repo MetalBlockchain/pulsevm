@@ -31,7 +31,9 @@ pub mod authority {
 }
 
 pub mod time {
-    pub use pulsevm_ffi::{TimePoint, TimePointSec, Microseconds, seconds, milliseconds, microseconds};
+    pub use pulsevm_ffi::{
+        Microseconds, TimePoint, TimePointSec, microseconds, milliseconds, seconds,
+    };
 }
 
 pub use pulsevm_error::ChainError;

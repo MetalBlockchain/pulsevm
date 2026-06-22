@@ -9,7 +9,7 @@ mod public_key;
 mod shared_authority;
 mod shared_blob;
 mod signature;
-mod time_point_sec;
 mod time;
+mod time_point_sec;
 pub use time::*;
 mod u128;

@@ -146,22 +146,42 @@ namespace pulsevm::chain {
       permission_object_type,
       permission_usage_object_type,
       permission_link_object_type,
+      UNUSED_action_code_object_type,
       key_value_object_type,
       index64_object_type,
       index128_object_type,
       index256_object_type,
+      index_double_object_type,
+      index_long_double_object_type,
       global_property_object_type,
       dynamic_global_property_object_type,
+      block_summary_object_type,
+      transaction_object_type,
+      generated_transaction_object_type,
+      UNUSED_producer_object_type,
+      UNUSED_chain_property_object_type,
+      account_control_history_object_type,     ///< Defined by history_plugin
+      UNUSED_account_transaction_history_object_type,
+      UNUSED_transaction_history_object_type,
+      public_key_history_object_type,          ///< Defined by history_plugin
+      UNUSED_balance_object_type,
+      UNUSED_staked_balance_object_type,
+      UNUSED_producer_votes_object_type,
+      UNUSED_producer_schedule_object_type,
+      UNUSED_proxy_vote_object_type,
+      UNUSED_scope_sequence_object_type,
       table_id_object_type,
       resource_limits_object_type,
       resource_usage_object_type,
       resource_limits_state_object_type,
       resource_limits_config_object_type,
+      account_history_object_type,              ///< Defined by history_plugin
+      action_history_object_type,               ///< Defined by history_plugin
+      reversible_block_object_type,
       protocol_state_object_type,
       account_ram_correction_object_type,
       code_object_type,
       database_header_object_type,
-      transaction_object_type,
       OBJECT_TYPE_COUNT ///< Sentry value which contains the number of different object types
    };
 

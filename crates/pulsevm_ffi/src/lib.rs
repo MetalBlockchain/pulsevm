@@ -7,13 +7,15 @@ mod types;
 pub use crate::bridge::ffi::DatabaseOpenFlags;
 pub use crate::bridge::ffi::{
     AccountMetadataObject, AccountObject, Authority, CodeObject, ElasticLimitParameters,
-    GlobalPropertyObject, Index64Object, Index128Object, KeyValueObject, KeyWeight,
-    PermissionLevel, PermissionLevelWeight, PermissionLinkObject, PermissionObject,
-    PermissionUsageObject, Ratio, TableId, TableObject, WaitWeight,
+    GlobalPropertyObject, Index64Object, Index128Object, Index256Object, IndexDoubleObject,
+    IndexLongDoubleObject, KeyValueObject, KeyWeight, PermissionLevel, PermissionLevelWeight,
+    PermissionLinkObject, PermissionObject, PermissionUsageObject, Ratio, TableId, TableObject,
+    WaitWeight,
 };
 pub use crate::bridge::ffi::{
-    CxxBlockTimestamp, CxxChainConfig, CxxDigest, CxxGenesisState, CxxMicroseconds, CxxPrivateKey,
-    CxxPublicKey, CxxSignature, CxxTimePoint, Float128, I128, U128, TimePoint, TimePointSec, Microseconds, BlockTimestamp
+    BlockTimestamp, CxxBlockTimestamp, CxxChainConfig, CxxDigest, CxxGenesisState, CxxMicroseconds,
+    CxxPrivateKey, CxxPublicKey, CxxSignature, CxxTimePoint, Float128, I128, Microseconds,
+    TimePoint, TimePointSec, U128, U256,
 };
 pub use crate::bridge::ffi::{CxxName, string_to_name, u64_to_name};
 pub use crate::bridge::ffi::{
@@ -29,6 +31,7 @@ pub use crate::bridge::ffi::{
 };
 pub use crate::database::Database;
 pub use crate::iterator_cache::{
-    Index64IteratorCache, Index128IteratorCache, KeyValueIteratorCache,
+    Index64IteratorCache, Index128IteratorCache, Index256IteratorCache, IndexDoubleIteratorCache,
+    IndexLongDoubleIteratorCache, KeyValueIteratorCache,
 };
 pub use types::*;

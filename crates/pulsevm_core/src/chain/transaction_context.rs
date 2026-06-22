@@ -9,7 +9,9 @@ use pulsevm_ffi::{BlockTimestamp, Database, Microseconds, TimePoint};
 use pulsevm_serialization::VarUint32;
 
 use crate::{
-    authorization_manager::AuthorizationManager, block::BlockStatus, chain::{
+    authorization_manager::AuthorizationManager,
+    block::BlockStatus,
+    chain::{
         apply_context::ApplyContext,
         id::Id,
         name::Name,
@@ -17,7 +19,8 @@ use crate::{
         transaction::{Action, ActionTrace, Transaction, TransactionStatus, TransactionTrace},
         utils::pulse_assert,
         wasm_runtime::WasmRuntime,
-    }, transaction::PackedTransaction
+    },
+    transaction::PackedTransaction,
 };
 
 #[derive(Default, Clone)]
@@ -177,7 +180,10 @@ impl TransactionContext {
         // Reserve actions array
         {
             let mut inner = self.inner.write()?;
-            inner.trace.action_traces.reserve(transaction.actions.len() + transaction.context_free_actions.len());
+            inner
+                .trace
+                .action_traces
+                .reserve(transaction.actions.len() + transaction.context_free_actions.len());
         }
 
         for action in transaction.context_free_actions.iter() {
@@ -380,13 +386,13 @@ impl TransactionContext {
 
             for action in trx.actions.iter() {
                 for auth in action.authorization().iter() {
-                    let permission = AuthorizationManager::get_permission(&self.db, auth.actor(), auth.permission())?;
-
-                    AuthorizationManager::update_permission_usage(
-                        &mut self.db,
-                        permission,
-                        &time,
+                    let permission = AuthorizationManager::get_permission(
+                        &self.db,
+                        auth.actor(),
+                        auth.permission(),
                     )?;
+
+                    AuthorizationManager::update_permission_usage(&mut self.db, permission, &time)?;
                 }
             }
         }

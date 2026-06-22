@@ -15,6 +15,41 @@ fn privileged_check(context: &ApplyContext) -> Result<(), RuntimeError> {
     Ok(())
 }
 
+pub fn set_proposed_producers(
+    mut env: FunctionEnvMut<WasmContext>,
+    data_ptr: WasmPtr<u8>,
+    data_len: u32,
+) -> Result<i64, RuntimeError> {
+    context_aware_check(&env)?;
+    let context = env.data_mut().apply_context_mut();
+    privileged_check(context)?;
+    // TODO: Implement set_proposed_producers logic
+    Ok(0)
+}
+
+pub fn get_blockchain_parameters_packed(
+    mut env: FunctionEnvMut<WasmContext>,
+    data_ptr: WasmPtr<u8>,
+    data_len: u32,
+) -> Result<u32, RuntimeError> {
+    context_aware_check(&env)?;
+    let context = env.data_mut().apply_context_mut();
+    privileged_check(context)?;
+    Ok(0)
+}
+
+pub fn set_blockchain_parameters_packed(
+    mut env: FunctionEnvMut<WasmContext>,
+    data_ptr: WasmPtr<u8>,
+    data_len: u32,
+) -> Result<(), RuntimeError> {
+    context_aware_check(&env)?;
+    let context = env.data_mut().apply_context_mut();
+    privileged_check(context)?;
+    // TODO: Implement set_blockchain_parameters_packed logic
+    Ok(())
+}
+
 pub fn is_privileged(
     mut env: FunctionEnvMut<WasmContext>,
     account: u64,

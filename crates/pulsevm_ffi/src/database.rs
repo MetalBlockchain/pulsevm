@@ -8,11 +8,17 @@ use pulsevm_error::ChainError;
 use pulsevm_name::Name;
 
 use crate::{
-    AccountMetadataObject, Index64IteratorCache, Index128IteratorCache, KeyValueObject,
+    AccountMetadataObject, Float128, Index64IteratorCache, Index128IteratorCache,
+    IndexDoubleIteratorCache, IndexLongDoubleIteratorCache, IndexLongDoubleObject, KeyValueObject,
     bridge::ffi::{
-        self, Authority, CxxDigest, CxxGenesisState, CxxTimePoint, ElasticLimitParameters, Index64Object, Index128Object, TableObject, TimePoint, U128, get_account_info_with_core_symbol, get_account_info_without_core_symbol, get_currency_balance_with_symbol, get_currency_balance_without_symbol, get_currency_stats, get_table_by_scope, get_table_rows
+        self, Authority, CxxDigest, CxxGenesisState, CxxIndex256IteratorCache, CxxTimePoint,
+        ElasticLimitParameters, Index64Object, Index128Object, Index256Object, IndexDoubleObject,
+        TableObject, TimePoint, U128, U256, get_account_info_with_core_symbol,
+        get_account_info_without_core_symbol, get_currency_balance_with_symbol,
+        get_currency_balance_without_symbol, get_currency_stats, get_table_by_scope,
+        get_table_rows,
     },
-    iterator_cache::KeyValueIteratorCache,
+    iterator_cache::{Index256IteratorCache, KeyValueIteratorCache},
 };
 
 #[derive(Clone)]
@@ -519,22 +525,6 @@ impl Database {
         Ok(res as *const Index64Object)
     }
 
-    pub fn create_index128_object(
-        &mut self,
-        table: &TableObject,
-        payer: u64,
-        id: u64,
-        secondary_key: u128,
-    ) -> Result<*const Index128Object, ChainError> {
-        let mut guard = self.inner.write()?;
-        let pinned = guard.pin_mut();
-
-        let res = pinned
-            .create_index128_object(table, payer, id, secondary_key.into())
-            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
-        Ok(res as *const Index128Object)
-    }
-
     pub fn update_key_value_object(
         &mut self,
         obj: &KeyValueObject,
@@ -560,20 +550,6 @@ impl Database {
 
         pinned
             .update_index64_object(obj, payer, secondary_key)
-            .map_err(|e| ChainError::InternalError(format!("{}", e)))
-    }
-
-    pub fn update_index128_object(
-        &mut self,
-        obj: &Index128Object,
-        payer: u64,
-        secondary_key: u128,
-    ) -> Result<(), ChainError> {
-        let mut guard = self.inner.write()?;
-        let pinned = guard.pin_mut();
-
-        pinned
-            .update_index128_object(obj, payer, secondary_key.into())
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 
@@ -886,6 +862,36 @@ impl Database {
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 
+    pub fn create_index128_object(
+        &mut self,
+        table: &TableObject,
+        payer: u64,
+        id: u64,
+        secondary_key: u128,
+    ) -> Result<*const Index128Object, ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        let res = pinned
+            .create_index128_object(table, payer, id, secondary_key.into())
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        Ok(res as *const Index128Object)
+    }
+
+    pub fn update_index128_object(
+        &mut self,
+        obj: &Index128Object,
+        payer: u64,
+        secondary_key: u128,
+    ) -> Result<(), ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .update_index128_object(obj, payer, secondary_key.into())
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
     pub fn db_idx128_remove(
         &mut self,
         keyval_cache: &mut Index128IteratorCache,
@@ -1045,6 +1051,561 @@ impl Database {
 
         pinned
             .db_idx128_previous(keyval_cache.pin_mut(), iterator, primary)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
+    pub fn create_index256_object(
+        &mut self,
+        table: &TableObject,
+        payer: u64,
+        id: u64,
+        secondary_key: U256,
+    ) -> Result<*const Index256Object, ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        let res = pinned
+            .create_index256_object(table, payer, id, secondary_key)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        Ok(res as *const Index256Object)
+    }
+
+    pub fn update_index256_object(
+        &mut self,
+        obj: &Index256Object,
+        payer: u64,
+        secondary_key: U256,
+    ) -> Result<(), ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .update_index256_object(obj, payer, secondary_key)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
+    pub fn db_idx256_remove(
+        &mut self,
+        keyval_cache: &mut Index256IteratorCache,
+        iterator: i32,
+        receiver: u64,
+    ) -> Result<(), ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .db_idx256_remove(keyval_cache.pin_mut(), iterator, receiver)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
+    pub fn db_idx256_find_secondary(
+        &mut self,
+        keyval_cache: &mut Index256IteratorCache,
+        code: u64,
+        scope: u64,
+        table: u64,
+        secondary_key: U256,
+        primary: &mut u64,
+    ) -> Result<i32, ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        let res = pinned
+            .db_idx256_find_secondary(
+                keyval_cache.pin_mut(),
+                code,
+                scope,
+                table,
+                secondary_key,
+                primary,
+            )
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        Ok(res)
+    }
+
+    pub fn db_idx256_find_primary(
+        &mut self,
+        keyval_cache: &mut Index256IteratorCache,
+        code: u64,
+        scope: u64,
+        table: u64,
+        secondary: &mut U256,
+        primary_key: u64,
+    ) -> Result<i32, ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+        let res = pinned
+            .db_idx256_find_primary(
+                keyval_cache.pin_mut(),
+                code,
+                scope,
+                table,
+                secondary,
+                primary_key,
+            )
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        Ok(res)
+    }
+
+    pub fn db_idx256_lowerbound(
+        &mut self,
+        keyval_cache: &mut Index256IteratorCache,
+        code: u64,
+        scope: u64,
+        table: u64,
+        secondary_key: &mut U256,
+        primary: &mut u64,
+    ) -> Result<i32, ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        let res = pinned
+            .db_idx256_lowerbound(
+                keyval_cache.pin_mut(),
+                code,
+                scope,
+                table,
+                secondary_key,
+                primary,
+            )
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        Ok(res)
+    }
+
+    pub fn db_idx256_upperbound(
+        &mut self,
+        keyval_cache: &mut Index256IteratorCache,
+        code: u64,
+        scope: u64,
+        table: u64,
+        secondary_key: &mut U256,
+        primary: &mut u64,
+    ) -> Result<i32, ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+        let res = pinned
+            .db_idx256_upperbound(
+                keyval_cache.pin_mut(),
+                code,
+                scope,
+                table,
+                secondary_key,
+                primary,
+            )
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        Ok(res)
+    }
+
+    pub fn db_idx256_end(
+        &mut self,
+        keyval_cache: &mut Index256IteratorCache,
+        code: u64,
+        scope: u64,
+        table: u64,
+    ) -> Result<i32, ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .db_idx256_end(keyval_cache.pin_mut(), code, scope, table)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
+    pub fn db_idx256_next(
+        &mut self,
+        keyval_cache: &mut Index256IteratorCache,
+        iterator: i32,
+        primary: &mut u64,
+    ) -> Result<i32, ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .db_idx256_next(keyval_cache.pin_mut(), iterator, primary)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
+    pub fn db_idx256_previous(
+        &mut self,
+        keyval_cache: &mut Index256IteratorCache,
+        iterator: i32,
+        primary: &mut u64,
+    ) -> Result<i32, ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .db_idx256_previous(keyval_cache.pin_mut(), iterator, primary)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
+    pub fn create_idx_double_object(
+        &mut self,
+        table: &TableObject,
+        payer: u64,
+        id: u64,
+        secondary_key: u64,
+    ) -> Result<*const IndexDoubleObject, ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        let res = pinned
+            .create_idx_double_object(table, payer, id, secondary_key)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        Ok(res as *const IndexDoubleObject)
+    }
+
+    pub fn update_idx_double_object(
+        &mut self,
+        obj: &IndexDoubleObject,
+        payer: u64,
+        secondary_key: u64,
+    ) -> Result<(), ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .update_idx_double_object(obj, payer, secondary_key)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
+    pub fn db_idx_double_remove(
+        &mut self,
+        keyval_cache: &mut IndexDoubleIteratorCache,
+        iterator: i32,
+        receiver: u64,
+    ) -> Result<(), ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .db_idx_double_remove(keyval_cache.pin_mut(), iterator, receiver)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
+    pub fn db_idx_double_find_secondary(
+        &mut self,
+        keyval_cache: &mut IndexDoubleIteratorCache,
+        code: u64,
+        scope: u64,
+        table: u64,
+        secondary_key: u64,
+        primary: &mut u64,
+    ) -> Result<i32, ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        let res = pinned
+            .db_idx_double_find_secondary(
+                keyval_cache.pin_mut(),
+                code,
+                scope,
+                table,
+                secondary_key,
+                primary,
+            )
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        Ok(res)
+    }
+
+    pub fn db_idx_double_find_primary(
+        &mut self,
+        keyval_cache: &mut IndexDoubleIteratorCache,
+        code: u64,
+        scope: u64,
+        table: u64,
+        secondary: &mut u64,
+        primary_key: u64,
+    ) -> Result<i32, ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+        let res = pinned
+            .db_idx_double_find_primary(
+                keyval_cache.pin_mut(),
+                code,
+                scope,
+                table,
+                secondary,
+                primary_key,
+            )
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        Ok(res)
+    }
+
+    pub fn db_idx_double_lowerbound(
+        &mut self,
+        keyval_cache: &mut IndexDoubleIteratorCache,
+        code: u64,
+        scope: u64,
+        table: u64,
+        secondary_key: &mut u64,
+        primary: &mut u64,
+    ) -> Result<i32, ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        let res = pinned
+            .db_idx_double_lowerbound(
+                keyval_cache.pin_mut(),
+                code,
+                scope,
+                table,
+                secondary_key,
+                primary,
+            )
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        Ok(res)
+    }
+
+    pub fn db_idx_double_upperbound(
+        &mut self,
+        keyval_cache: &mut IndexDoubleIteratorCache,
+        code: u64,
+        scope: u64,
+        table: u64,
+        secondary_key: &mut u64,
+        primary: &mut u64,
+    ) -> Result<i32, ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+        let res = pinned
+            .db_idx_double_upperbound(
+                keyval_cache.pin_mut(),
+                code,
+                scope,
+                table,
+                secondary_key,
+                primary,
+            )
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        Ok(res)
+    }
+
+    pub fn db_idx_double_end(
+        &mut self,
+        keyval_cache: &mut IndexDoubleIteratorCache,
+        code: u64,
+        scope: u64,
+        table: u64,
+    ) -> Result<i32, ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .db_idx_double_end(keyval_cache.pin_mut(), code, scope, table)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
+    pub fn db_idx_double_next(
+        &mut self,
+        keyval_cache: &mut IndexDoubleIteratorCache,
+        iterator: i32,
+        primary: &mut u64,
+    ) -> Result<i32, ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .db_idx_double_next(keyval_cache.pin_mut(), iterator, primary)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
+    pub fn db_idx_double_previous(
+        &mut self,
+        keyval_cache: &mut IndexDoubleIteratorCache,
+        iterator: i32,
+        primary: &mut u64,
+    ) -> Result<i32, ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .db_idx_double_previous(keyval_cache.pin_mut(), iterator, primary)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
+    pub fn create_idx_long_double_object(
+        &mut self,
+        table: &TableObject,
+        payer: u64,
+        id: u64,
+        secondary_key: Float128,
+    ) -> Result<*const IndexLongDoubleObject, ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        let res = pinned
+            .create_idx_long_double_object(table, payer, id, secondary_key)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        Ok(res as *const IndexLongDoubleObject)
+    }
+
+    pub fn update_idx_long_double_object(
+        &mut self,
+        obj: &IndexLongDoubleObject,
+        payer: u64,
+        secondary_key: Float128,
+    ) -> Result<(), ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .update_idx_long_double_object(obj, payer, secondary_key)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
+    pub fn db_idx_long_double_remove(
+        &mut self,
+        keyval_cache: &mut IndexLongDoubleIteratorCache,
+        iterator: i32,
+        receiver: u64,
+    ) -> Result<(), ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .db_idx_long_double_remove(keyval_cache.pin_mut(), iterator, receiver)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
+    pub fn db_idx_long_double_find_secondary(
+        &mut self,
+        keyval_cache: &mut IndexLongDoubleIteratorCache,
+        code: u64,
+        scope: u64,
+        table: u64,
+        secondary_key: Float128,
+        primary: &mut u64,
+    ) -> Result<i32, ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        let res = pinned
+            .db_idx_long_double_find_secondary(
+                keyval_cache.pin_mut(),
+                code,
+                scope,
+                table,
+                secondary_key,
+                primary,
+            )
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        Ok(res)
+    }
+
+    pub fn db_idx_long_double_find_primary(
+        &mut self,
+        keyval_cache: &mut IndexLongDoubleIteratorCache,
+        code: u64,
+        scope: u64,
+        table: u64,
+        secondary: &mut Float128,
+        primary_key: u64,
+    ) -> Result<i32, ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+        let res = pinned
+            .db_idx_long_double_find_primary(
+                keyval_cache.pin_mut(),
+                code,
+                scope,
+                table,
+                secondary,
+                primary_key,
+            )
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        Ok(res)
+    }
+
+    pub fn db_idx_long_double_lowerbound(
+        &mut self,
+        keyval_cache: &mut IndexLongDoubleIteratorCache,
+        code: u64,
+        scope: u64,
+        table: u64,
+        secondary_key: &mut Float128,
+        primary: &mut u64,
+    ) -> Result<i32, ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        let res = pinned
+            .db_idx_long_double_lowerbound(
+                keyval_cache.pin_mut(),
+                code,
+                scope,
+                table,
+                secondary_key,
+                primary,
+            )
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        Ok(res)
+    }
+
+    pub fn db_idx_long_double_upperbound(
+        &mut self,
+        keyval_cache: &mut IndexLongDoubleIteratorCache,
+        code: u64,
+        scope: u64,
+        table: u64,
+        secondary_key: &mut Float128,
+        primary: &mut u64,
+    ) -> Result<i32, ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+        let res = pinned
+            .db_idx_long_double_upperbound(
+                keyval_cache.pin_mut(),
+                code,
+                scope,
+                table,
+                secondary_key,
+                primary,
+            )
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        Ok(res)
+    }
+
+    pub fn db_idx_long_double_end(
+        &mut self,
+        keyval_cache: &mut IndexLongDoubleIteratorCache,
+        code: u64,
+        scope: u64,
+        table: u64,
+    ) -> Result<i32, ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .db_idx_long_double_end(keyval_cache.pin_mut(), code, scope, table)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
+    pub fn db_idx_long_double_next(
+        &mut self,
+        keyval_cache: &mut IndexLongDoubleIteratorCache,
+        iterator: i32,
+        primary: &mut u64,
+    ) -> Result<i32, ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .db_idx_long_double_next(keyval_cache.pin_mut(), iterator, primary)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
+    pub fn db_idx_long_double_previous(
+        &mut self,
+        keyval_cache: &mut IndexLongDoubleIteratorCache,
+        iterator: i32,
+        primary: &mut u64,
+    ) -> Result<i32, ChainError> {
+        let mut guard = self.inner.write()?;
+        let pinned = guard.pin_mut();
+
+        pinned
+            .db_idx_long_double_previous(keyval_cache.pin_mut(), iterator, primary)
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 

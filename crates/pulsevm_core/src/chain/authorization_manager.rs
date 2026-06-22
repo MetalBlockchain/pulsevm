@@ -1,7 +1,9 @@
 use std::collections::{BTreeSet, HashSet};
 
 use pulsevm_error::ChainError;
-use pulsevm_ffi::{Authority, CxxTimePoint, Database, Microseconds, PermissionObject, TimePoint, seconds};
+use pulsevm_ffi::{
+    Authority, CxxTimePoint, Database, Microseconds, PermissionObject, TimePoint, seconds,
+};
 
 use crate::{
     PULSE_NAME,
@@ -250,10 +252,7 @@ impl AuthorizationManager {
         Ok(())
     }
 
-    fn check_deleteauth_authorization(
-        db: &Database,
-        action: &Action,
-    ) -> Result<(), ChainError> {
+    fn check_deleteauth_authorization(db: &Database, action: &Action) -> Result<(), ChainError> {
         let del = action
             .data_as::<DeleteAuth>()
             .map_err(|e| ChainError::AuthorizationError(format!("{}", e)))?;
@@ -356,10 +355,7 @@ impl AuthorizationManager {
         Ok(())
     }
 
-    fn check_unlinkauth_authorization(
-        db: &Database,
-        action: &Action,
-    ) -> Result<(), ChainError> {
+    fn check_unlinkauth_authorization(db: &Database, action: &Action) -> Result<(), ChainError> {
         let unlink = action
             .data_as::<UnlinkAuth>()
             .map_err(|e| ChainError::AuthorizationError(format!("{}", e)))?;
@@ -542,12 +538,10 @@ impl AuthorizationManager {
         permission: &PermissionObject,
         pending_block_time: &TimePoint,
     ) -> Result<(), ChainError> {
-        db.update_permission_usage(permission, pending_block_time).map_err(|e| {
-            ChainError::DatabaseError(format!(
-                "failed to update permission usage: {}",
-                e
-            ))
-        })?;
+        db.update_permission_usage(permission, pending_block_time)
+            .map_err(|e| {
+                ChainError::DatabaseError(format!("failed to update permission usage: {}", e))
+            })?;
         Ok(())
     }
 }

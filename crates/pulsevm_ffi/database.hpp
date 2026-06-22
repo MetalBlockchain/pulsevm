@@ -24,8 +24,11 @@ namespace pulsevm { namespace chain {
     struct TimePointSec;
     struct BlockTimestamp;
     struct U128;
+    struct U256;
+    struct Float128;
 
     U128 index128_object_secondary_key_as_u128(const index128_object& o);
+    U256 index256_object_secondary_key_as_u256(const index256_object& o);
 
 class database_wrapper : public chainbase::database {
 public:
@@ -47,6 +50,8 @@ public:
         this->add_index<index64_index>();
         this->add_index<index128_index>();
         this->add_index<index256_index>();
+        this->add_index<index_double_index>();
+        this->add_index<index_long_double_index>();
         this->add_index<global_property_multi_index>();
         this->add_index<dynamic_global_property_multi_index>();
         this->add_index<table_id_multi_index>();
@@ -1022,6 +1027,39 @@ public:
     int db_idx128_end( iterator_cache<index128_object>& keyval_cache, uint64_t code, uint64_t scope, uint64_t table );
     int db_idx128_next( iterator_cache<index128_object>& keyval_cache, int iterator, uint64_t& primary );
     int db_idx128_previous( iterator_cache<index128_object>& keyval_cache, int iterator, uint64_t& primary );
+
+    const index256_object& create_index256_object( const table_id_object& tab, uint64_t payer, uint64_t id, U256 secondary );
+    void update_index256_object( const index256_object& obj, uint64_t payer, U256 secondary );
+    void db_idx256_remove( iterator_cache<index256_object>& keyval_cache, int iterator, u_int64_t receiver );
+    int db_idx256_find_secondary( iterator_cache<index256_object>& keyval_cache, uint64_t code, uint64_t scope, uint64_t table, U256 secondary, uint64_t& primary );
+    int db_idx256_find_primary( iterator_cache<index256_object>& keyval_cache, uint64_t code, uint64_t scope, uint64_t table, U256& secondary, uint64_t primary );
+    int db_idx256_lowerbound( iterator_cache<index256_object>& keyval_cache, uint64_t code, uint64_t scope, uint64_t table, U256& secondary, uint64_t& primary );
+    int db_idx256_upperbound( iterator_cache<index256_object>& keyval_cache, uint64_t code, uint64_t scope, uint64_t table, U256& secondary, uint64_t& primary );
+    int db_idx256_end( iterator_cache<index256_object>& keyval_cache, uint64_t code, uint64_t scope, uint64_t table );
+    int db_idx256_next( iterator_cache<index256_object>& keyval_cache, int iterator, uint64_t& primary );
+    int db_idx256_previous( iterator_cache<index256_object>& keyval_cache, int iterator, uint64_t& primary );
+
+    const index_double_object& create_idx_double_object( const table_id_object& tab, uint64_t payer, uint64_t id, uint64_t secondary );
+    void update_idx_double_object( const index_double_object& obj, uint64_t payer, uint64_t secondary );
+    void db_idx_double_remove( iterator_cache<index_double_object>& keyval_cache, int iterator, u_int64_t receiver );
+    int db_idx_double_find_secondary( iterator_cache<index_double_object>& keyval_cache, uint64_t code, uint64_t scope, uint64_t table, uint64_t secondary, uint64_t& primary );
+    int db_idx_double_find_primary( iterator_cache<index_double_object>& keyval_cache, uint64_t code, uint64_t scope, uint64_t table, uint64_t& secondary, uint64_t primary );
+    int db_idx_double_lowerbound( iterator_cache<index_double_object>& keyval_cache, uint64_t code, uint64_t scope, uint64_t table, uint64_t& secondary, uint64_t& primary );
+    int db_idx_double_upperbound( iterator_cache<index_double_object>& keyval_cache, uint64_t code, uint64_t scope, uint64_t table, uint64_t& secondary, uint64_t& primary );
+    int db_idx_double_end( iterator_cache<index_double_object>& keyval_cache, uint64_t code, uint64_t scope, uint64_t table );
+    int db_idx_double_next( iterator_cache<index_double_object>& keyval_cache, int iterator, uint64_t& primary );
+    int db_idx_double_previous( iterator_cache<index_double_object>& keyval_cache, int iterator, uint64_t& primary );
+
+    const index_long_double_object& create_idx_long_double_object( const table_id_object& tab, uint64_t payer, uint64_t id, Float128 secondary );
+    void update_idx_long_double_object( const index_long_double_object& obj, uint64_t payer, Float128 secondary );
+    void db_idx_long_double_remove( iterator_cache<index_long_double_object>& keyval_cache, int iterator, u_int64_t receiver );
+    int db_idx_long_double_find_secondary( iterator_cache<index_long_double_object>& keyval_cache, uint64_t code, uint64_t scope, uint64_t table, Float128 secondary, uint64_t& primary );
+    int db_idx_long_double_find_primary( iterator_cache<index_long_double_object>& keyval_cache, uint64_t code, uint64_t scope, uint64_t table, Float128& secondary, uint64_t primary );
+    int db_idx_long_double_lowerbound( iterator_cache<index_long_double_object>& keyval_cache, uint64_t code, uint64_t scope, uint64_t table, Float128& secondary, uint64_t& primary );
+    int db_idx_long_double_upperbound( iterator_cache<index_long_double_object>& keyval_cache, uint64_t code, uint64_t scope, uint64_t table, Float128& secondary, uint64_t& primary );
+    int db_idx_long_double_end( iterator_cache<index_long_double_object>& keyval_cache, uint64_t code, uint64_t scope, uint64_t table );
+    int db_idx_long_double_next( iterator_cache<index_long_double_object>& keyval_cache, int iterator, uint64_t& primary );
+    int db_idx_long_double_previous( iterator_cache<index_long_double_object>& keyval_cache, int iterator, uint64_t& primary );
 
     uint64_t get_virtual_block_cpu_limit() const {
         const auto& state = this->get<resource_limits::resource_limits_state_object>();

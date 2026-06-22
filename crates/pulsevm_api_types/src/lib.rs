@@ -1,4 +1,6 @@
-use pulsevm_core::{asset::Asset, authority::Authority, block::BlockTimestamp, id::Id, name::Name, time::TimePoint};
+use pulsevm_core::{
+    asset::Asset, authority::Authority, block::BlockTimestamp, id::Id, name::Name, time::TimePoint,
+};
 use serde::{Deserialize, Serialize, de};
 
 fn string_or_i64<'de, D: de::Deserializer<'de>>(deserializer: D) -> Result<i64, D::Error> {

@@ -5,6 +5,8 @@
 #include "multi_index_includes.hpp"
 #include "database_utils.hpp"
 
+#include <softfloat.hpp>
+
 #include <array>
 #include <type_traits>
 
@@ -143,6 +145,35 @@ namespace pulsevm { namespace chain {
    typedef secondary_index<key256_t,index256_object_type>::index_object index256_object;
    typedef secondary_index<key256_t,index256_object_type>::index_index  index256_index;
 
+   struct soft_double_less {
+      bool operator()( const float64_t& lhs, const float64_t& rhs ) const {
+         return f64_lt( lhs, rhs );
+      }
+   };
+
+   struct soft_long_double_less {
+      bool operator()( const float128_t& lhs, const float128_t& rhs ) const {
+         return f128_lt( lhs, rhs );
+      }
+   };
+
+   /**
+    *  This index supports a deterministic software implementation of double as the secondary key.
+    *
+    *  The software double implementation is using the Berkeley softfloat library (release 3).
+    */
+
+   typedef secondary_index<float64_t,index_double_object_type,soft_double_less>::index_object  index_double_object;
+   typedef secondary_index<float64_t,index_double_object_type,soft_double_less>::index_index   index_double_index;
+
+   /**
+    *  This index supports a deterministic software implementation of long double as the secondary key.
+    *
+    *  The software long double implementation is using the Berkeley softfloat library (release 3).
+    */
+   typedef secondary_index<float128_t,index_long_double_object_type,soft_long_double_less>::index_object  index_long_double_object;
+   typedef secondary_index<float128_t,index_long_double_object_type,soft_long_double_less>::index_index   index_long_double_index;
+
    template<typename T>
    struct secondary_key_traits {
       using value_type = std::enable_if_t<std::is_integral<T>::value, T>;
@@ -193,6 +224,8 @@ namespace pulsevm { namespace chain {
    DECLARE_TABLE_ID_TAG(index64_object, by_primary)
    DECLARE_TABLE_ID_TAG(index128_object, by_primary)
    DECLARE_TABLE_ID_TAG(index256_object, by_primary)
+   DECLARE_TABLE_ID_TAG(index_double_object, by_primary)
+   DECLARE_TABLE_ID_TAG(index_long_double_object, by_primary)
 
    template<typename T>
    using object_to_table_id_tag_t = typename object_to_table_id_tag<T>::tag_type;
@@ -228,6 +261,18 @@ namespace config {
       static const uint64_t value = 24 + 32 + overhead; ///< 24 bytes for fixed fields + 32 bytes key + overhead
    };
 
+   template<>
+   struct billable_size<index_double_object> {
+      static const uint64_t overhead = overhead_per_row_per_index_ram_bytes * 3;  ///< overhead for potentially single-row table, 3x indices internal-key, primary key and primary+secondary key
+      static const uint64_t value = 24 + 8 + overhead; ///< 24 bytes for fixed fields + 8 bytes key + overhead
+   };
+
+   template<>
+   struct billable_size<index_long_double_object> {
+      static const uint64_t overhead = overhead_per_row_per_index_ram_bytes * 3;  ///< overhead for potentially single-row table, 3x indices internal-key, primary key and primary+secondary key
+      static const uint64_t value = 24 + 16 + overhead; ///< 24 bytes for fixed fields + 16 bytes key + overhead
+   };
+
 } // namespace config
 
 } }  // namespace pulsevm::chain
@@ -238,6 +283,8 @@ CHAINBASE_SET_INDEX_TYPE(pulsevm::chain::key_value_object, pulsevm::chain::key_v
 CHAINBASE_SET_INDEX_TYPE(pulsevm::chain::index64_object, pulsevm::chain::index64_index)
 CHAINBASE_SET_INDEX_TYPE(pulsevm::chain::index128_object, pulsevm::chain::index128_index)
 CHAINBASE_SET_INDEX_TYPE(pulsevm::chain::index256_object, pulsevm::chain::index256_index)
+CHAINBASE_SET_INDEX_TYPE(pulsevm::chain::index_double_object, pulsevm::chain::index_double_index)
+CHAINBASE_SET_INDEX_TYPE(pulsevm::chain::index_long_double_object, pulsevm::chain::index_long_double_index)
 
 FC_REFLECT(pulsevm::chain::table_id_object, (code)(scope)(table)(payer)(count) )
 FC_REFLECT(pulsevm::chain::key_value_object, (primary_key)(payer)(value) )
@@ -248,3 +295,5 @@ FC_REFLECT(pulsevm::chain::key_value_object, (primary_key)(payer)(value) )
 REFLECT_SECONDARY(pulsevm::chain::index64_object)
 REFLECT_SECONDARY(pulsevm::chain::index128_object)
 REFLECT_SECONDARY(pulsevm::chain::index256_object)
+REFLECT_SECONDARY(pulsevm::chain::index_double_object)
+REFLECT_SECONDARY(pulsevm::chain::index_long_double_object)

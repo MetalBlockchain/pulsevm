@@ -1,7 +1,14 @@
-use std::{fmt, ops::{Add, AddAssign}, str::FromStr};
+use std::{
+    fmt,
+    ops::{Add, AddAssign},
+    str::FromStr,
+};
 
 use pulsevm_serialization::{NumBytes, Read, Write};
-use serde::{Deserialize, Deserializer, Serialize, Serializer, de::{self, Visitor}};
+use serde::{
+    Deserialize, Deserializer, Serialize, Serializer,
+    de::{self, Visitor},
+};
 use time::{OffsetDateTime, PrimitiveDateTime, macros::format_description};
 
 use crate::{TimePoint, bridge::ffi::TimePointSec, types::time::seconds};
@@ -172,7 +179,11 @@ impl Read for TimePointSec {
 
 impl Write for TimePointSec {
     #[inline]
-    fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), pulsevm_serialization::WriteError> {
+    fn write(
+        &self,
+        bytes: &mut [u8],
+        pos: &mut usize,
+    ) -> Result<(), pulsevm_serialization::WriteError> {
         self.utc_seconds.write(bytes, pos)
     }
 }

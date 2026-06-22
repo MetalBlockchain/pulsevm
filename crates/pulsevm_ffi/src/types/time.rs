@@ -1,8 +1,15 @@
-use std::{fmt, ops::{Add, AddAssign, Sub, SubAssign}, str::FromStr};
+use std::{
+    fmt,
+    ops::{Add, AddAssign, Sub, SubAssign},
+    str::FromStr,
+};
 
 use cxx::SharedPtr;
 use pulsevm_serialization::{NumBytes, Read, Write};
-use serde::{Deserialize, Deserializer, Serialize, Serializer, de::{self, Visitor}};
+use serde::{
+    Deserialize, Deserializer, Serialize, Serializer,
+    de::{self, Visitor},
+};
 use time::{OffsetDateTime, PrimitiveDateTime, macros::format_description};
 
 use crate::{
@@ -32,15 +39,13 @@ impl CxxTimePoint {
 impl Microseconds {
     #[inline]
     pub const fn new(count: i64) -> Self {
-        Self {
-            count
-        }
+        Self { count }
     }
 
     #[inline]
     pub const fn maximum() -> Self {
         Self {
-            count: 0x7fff_ffff_ffff_ffff
+            count: 0x7fff_ffff_ffff_ffff,
         }
     }
 
@@ -59,14 +64,18 @@ impl Add for Microseconds {
     type Output = Self;
     #[inline]
     fn add(self, rhs: Self) -> Self {
-        Self { count: self.count + rhs.count }
+        Self {
+            count: self.count + rhs.count,
+        }
     }
 }
 impl Sub for Microseconds {
     type Output = Self;
     #[inline]
     fn sub(self, rhs: Self) -> Self {
-        Self { count: self.count - rhs.count }
+        Self {
+            count: self.count - rhs.count,
+        }
     }
 }
 impl AddAssign for Microseconds {
@@ -99,7 +108,11 @@ impl Read for Microseconds {
 
 impl Write for Microseconds {
     #[inline]
-    fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), pulsevm_serialization::WriteError> {
+    fn write(
+        &self,
+        bytes: &mut [u8],
+        pos: &mut usize,
+    ) -> Result<(), pulsevm_serialization::WriteError> {
         self.count.write(bytes, pos)
     }
 }
@@ -107,7 +120,9 @@ impl Write for Microseconds {
 /* helper constructors (match the C++ free functions) */
 #[inline]
 pub const fn seconds(s: i64) -> Microseconds {
-    Microseconds { count: s * 1_000_000 }
+    Microseconds {
+        count: s * 1_000_000,
+    }
 }
 #[inline]
 pub const fn milliseconds(ms: i64) -> Microseconds {
@@ -309,7 +324,11 @@ impl Read for TimePoint {
 
 impl Write for TimePoint {
     #[inline]
-    fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), pulsevm_serialization::WriteError> {
+    fn write(
+        &self,
+        bytes: &mut [u8],
+        pos: &mut usize,
+    ) -> Result<(), pulsevm_serialization::WriteError> {
         self.elapsed.write(bytes, pos)
     }
 }

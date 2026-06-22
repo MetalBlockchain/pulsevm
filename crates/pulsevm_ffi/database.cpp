@@ -357,6 +357,30 @@ inline U128 from_u128(unsigned __int128 x) {
     };
 }
 
+inline U256 from_u256(const key256_t& k) {
+    U256 out;
+    static_assert(sizeof(k) == 32, "key256_t must be 32 bytes");
+    std::memcpy(out.value.data(), k.data(), 32);
+    return out;
+}
+
+inline key256_t to_u256(const U256& u) {
+    key256_t k;
+    std::memcpy(k.data(), u.value.data(), 32);
+    return k;
+}
+
+inline float128_t to_float128(const Float128& f) {
+    float128_t out;
+    out.v[0] = f.lo;   // low 64 bits
+    out.v[1] = f.hi;   // high 64 bits
+    return out;
+}
+
+inline Float128 from_float128(const float128_t& f) {
+    return Float128{ f.v[0], f.v[1] };   // lo = v[0], hi = v[1]
+}
+
 const index128_object& database_wrapper::create_index128_object( const table_id_object& tab, uint64_t payer, uint64_t id, U128 secondary ) {
     unsigned __int128 sec = to_u128(secondary);
     auto tableid = tab.id;
@@ -488,6 +512,488 @@ int database_wrapper::db_idx128_next( iterator_cache<index128_object>& keyval_ca
 
 int database_wrapper::db_idx128_previous( iterator_cache<index128_object>& keyval_cache, int iterator, uint64_t& primary ) {
     const auto& idx = this->get_index<typename chainbase::get_index_type<index128_object>::type, by_secondary>();
+
+    if( iterator < -1 ) // is end iterator
+    {
+        auto tab = keyval_cache.find_table_by_end_iterator(iterator);
+        EOS_ASSERT( tab, invalid_table_iterator, "not a valid end iterator" );
+
+        auto itr = idx.upper_bound(tab->id);
+        if( idx.begin() == idx.end() || itr == idx.begin() ) return -1; // Empty index
+
+        --itr;
+
+        if( itr->t_id != tab->id ) return -1; // Empty index
+
+        primary = itr->primary_key;
+        return keyval_cache.add(*itr);
+    }
+
+    const auto& obj = keyval_cache.get(iterator); // Check for iterator != -1 happens in this call
+
+    auto itr = idx.iterator_to(obj);
+    if( itr == idx.begin() ) return -1; // cannot decrement past beginning iterator of index
+
+    --itr;
+
+    if( itr->t_id != obj.t_id ) return -1; // cannot decrement past beginning iterator of index
+
+    primary = itr->primary_key;
+    return keyval_cache.add(*itr);
+}
+
+const index256_object& database_wrapper::create_index256_object( const table_id_object& tab, uint64_t payer, uint64_t id, U256 secondary ) {
+    auto sec = to_u256(secondary);
+    auto tableid = tab.id;
+    EOS_ASSERT( payer != 0, invalid_table_payer, "must specify a valid account to pay for new record" );
+    const auto& obj = this->create<index256_object>( [&]( auto& o ) {
+        o.t_id          = tableid;
+        o.primary_key   = id;
+        o.secondary_key = sec;
+        o.payer         = name(payer);
+    });
+
+    this->modify( tab, [&]( auto& t ) {
+        ++t.count;
+    });
+
+    return obj;
+}
+
+void database_wrapper::update_index256_object( const index256_object& obj, uint64_t payer, U256 secondary ) {
+    this->modify( obj, [&]( auto& o ) {
+        o.secondary_key = to_u256(secondary);
+        o.payer = name(payer);
+    });
+}
+
+void database_wrapper::db_idx256_remove( iterator_cache<index256_object>& keyval_cache, int iterator, u_int64_t receiver ) {
+    const index256_object& obj = keyval_cache.get( iterator );
+    const auto& table_obj = keyval_cache.get_table( obj.t_id );
+    EOS_ASSERT( table_obj.code == name(receiver), table_access_violation, "db access violation" );
+
+    this->modify( table_obj, [&]( auto& t ) {
+        --t.count;
+    });
+    this->remove( obj );
+
+    if (table_obj.count == 0) {
+        this->remove_table(table_obj);
+    }
+
+    keyval_cache.remove( iterator );
+}
+
+int database_wrapper::db_idx256_find_secondary( iterator_cache<index256_object>& keyval_cache, uint64_t code, uint64_t scope, uint64_t table, U256 secondary, uint64_t& primary ) {
+    auto tab = this->find_table( code, scope, table );
+    if( !tab ) return -1;
+
+    auto table_end_itr = keyval_cache.cache_table( *tab );
+    auto sec = to_u256(secondary);
+
+    const auto* obj = this->find<index256_object, by_secondary>( boost::make_tuple( tab->id, sec ) );
+    if( !obj ) return table_end_itr;
+
+    primary = obj->primary_key;
+
+    return keyval_cache.add( *obj );
+}
+
+int database_wrapper::db_idx256_find_primary( iterator_cache<index256_object>& keyval_cache, uint64_t code, uint64_t scope, uint64_t table, U256& secondary, uint64_t primary ) {
+    auto tab = this->find_table( code, scope, table );
+    if( !tab ) return -1;
+
+    auto table_end_itr = keyval_cache.cache_table( *tab );
+
+    const auto* obj = this->find<index256_object, by_primary>( boost::make_tuple( tab->id, primary ) );
+    if( !obj ) return table_end_itr;
+
+    secondary = from_u256(obj->secondary_key);
+
+    return keyval_cache.add( *obj );
+}
+
+int database_wrapper::db_idx256_lowerbound( iterator_cache<index256_object>& keyval_cache, uint64_t code, uint64_t scope, uint64_t table, U256& secondary, uint64_t& primary ) {
+    auto tab = this->find_table( code, scope, table );
+    if( !tab ) return -1;
+
+    auto table_end_itr = keyval_cache.cache_table( *tab );
+    auto sec = to_u256(secondary);
+
+    const auto& idx = this->get_index<typename chainbase::get_index_type<index256_object>::type, by_secondary>();
+    auto itr = idx.lower_bound( boost::make_tuple( tab->id, sec ) );
+    if( itr == idx.end() ) return table_end_itr;
+    if( itr->t_id != tab->id ) return table_end_itr;
+
+    primary = itr->primary_key;
+    secondary = from_u256(itr->secondary_key);
+
+    return keyval_cache.add( *itr );
+}
+
+int database_wrapper::db_idx256_upperbound( iterator_cache<index256_object>& keyval_cache, uint64_t code, uint64_t scope, uint64_t table, U256& secondary, uint64_t& primary ) {
+    auto tab = this->find_table( code, scope, table );
+    if( !tab ) return -1;
+
+    auto table_end_itr = keyval_cache.cache_table( *tab );
+    auto sec = to_u256(secondary);
+
+    const auto& idx = this->get_index<typename chainbase::get_index_type<index256_object>::type, by_secondary>();
+    auto itr = idx.upper_bound( boost::make_tuple( tab->id, sec ) );
+    if( itr == idx.end() ) return table_end_itr;
+    if( itr->t_id != tab->id ) return table_end_itr;
+
+    primary = itr->primary_key;
+    secondary = from_u256(itr->secondary_key);
+
+    return keyval_cache.add( *itr );
+}
+
+int database_wrapper::db_idx256_end( iterator_cache<index256_object>& keyval_cache, uint64_t code, uint64_t scope, uint64_t table ) {
+    auto tab = this->find_table( code, scope, table );
+    if( !tab ) return -1;
+
+    return keyval_cache.cache_table( *tab );
+}
+
+int database_wrapper::db_idx256_next( iterator_cache<index256_object>& keyval_cache, int iterator, uint64_t& primary ) {
+    if( iterator < -1 ) return -1; // cannot increment past end iterator of index
+
+    const auto& obj = keyval_cache.get(iterator); // Check for iterator != -1 happens in this call
+    const auto& idx = this->get_index<typename chainbase::get_index_type<index256_object>::type, by_secondary>();
+
+    auto itr = idx.iterator_to(obj);
+    ++itr;
+
+    if( itr == idx.end() || itr->t_id != obj.t_id ) return keyval_cache.get_end_iterator_by_table_id(obj.t_id);
+
+    primary = itr->primary_key;
+    return keyval_cache.add(*itr);
+}
+
+int database_wrapper::db_idx256_previous( iterator_cache<index256_object>& keyval_cache, int iterator, uint64_t& primary ) {
+    const auto& idx = this->get_index<typename chainbase::get_index_type<index256_object>::type, by_secondary>();
+
+    if( iterator < -1 ) // is end iterator
+    {
+        auto tab = keyval_cache.find_table_by_end_iterator(iterator);
+        EOS_ASSERT( tab, invalid_table_iterator, "not a valid end iterator" );
+
+        auto itr = idx.upper_bound(tab->id);
+        if( idx.begin() == idx.end() || itr == idx.begin() ) return -1; // Empty index
+
+        --itr;
+
+        if( itr->t_id != tab->id ) return -1; // Empty index
+
+        primary = itr->primary_key;
+        return keyval_cache.add(*itr);
+    }
+
+    const auto& obj = keyval_cache.get(iterator); // Check for iterator != -1 happens in this call
+
+    auto itr = idx.iterator_to(obj);
+    if( itr == idx.begin() ) return -1; // cannot decrement past beginning iterator of index
+
+    --itr;
+
+    if( itr->t_id != obj.t_id ) return -1; // cannot decrement past beginning iterator of index
+
+    primary = itr->primary_key;
+    return keyval_cache.add(*itr);
+}
+
+const index_double_object& database_wrapper::create_idx_double_object( const table_id_object& tab, uint64_t payer, uint64_t id, uint64_t secondary ) {
+    auto tableid = tab.id;
+    EOS_ASSERT( payer != 0, invalid_table_payer, "must specify a valid account to pay for new record" );
+    const auto& obj = this->create<index_double_object>( [&]( auto& o ) {
+        o.t_id          = tableid;
+        o.primary_key   = id;
+        o.secondary_key = float64_t { secondary };;
+        o.payer         = name(payer);
+    });
+
+    this->modify( tab, [&]( auto& t ) {
+        ++t.count;
+    });
+
+    return obj;
+}
+
+void database_wrapper::update_idx_double_object( const index_double_object& obj, uint64_t payer, uint64_t secondary ) {
+    this->modify( obj, [&]( auto& o ) {
+        o.secondary_key = float64_t { secondary };;
+        o.payer = name(payer);
+    });
+}
+
+void database_wrapper::db_idx_double_remove( iterator_cache<index_double_object>& keyval_cache, int iterator, u_int64_t receiver ) {
+    const index_double_object& obj = keyval_cache.get( iterator );
+    const auto& table_obj = keyval_cache.get_table( obj.t_id );
+    EOS_ASSERT( table_obj.code == name(receiver), table_access_violation, "db access violation" );
+
+    this->modify( table_obj, [&]( auto& t ) {
+        --t.count;
+    });
+    this->remove( obj );
+
+    if (table_obj.count == 0) {
+        this->remove_table(table_obj);
+    }
+
+    keyval_cache.remove( iterator );
+}
+
+int database_wrapper::db_idx_double_find_secondary( iterator_cache<index_double_object>& keyval_cache, uint64_t code, uint64_t scope, uint64_t table, uint64_t secondary, uint64_t& primary ) {
+    auto tab = this->find_table( code, scope, table );
+    if( !tab ) return -1;
+
+    auto table_end_itr = keyval_cache.cache_table( *tab );
+
+    auto sec = float64_t { secondary };
+    const auto* obj = this->find<index_double_object, by_secondary>( boost::make_tuple( tab->id, sec ) );
+    if( !obj ) return table_end_itr;
+
+    primary = obj->primary_key;
+
+    return keyval_cache.add( *obj );
+}
+
+int database_wrapper::db_idx_double_find_primary( iterator_cache<index_double_object>& keyval_cache, uint64_t code, uint64_t scope, uint64_t table, uint64_t& secondary, uint64_t primary ) {
+    auto tab = this->find_table( code, scope, table );
+    if( !tab ) return -1;
+
+    auto table_end_itr = keyval_cache.cache_table( *tab );
+
+    const auto* obj = this->find<index_double_object, by_primary>( boost::make_tuple( tab->id, primary ) );
+    if( !obj ) return table_end_itr;
+
+    secondary = obj->secondary_key.v;
+
+    return keyval_cache.add( *obj );
+}
+
+int database_wrapper::db_idx_double_lowerbound( iterator_cache<index_double_object>& keyval_cache, uint64_t code, uint64_t scope, uint64_t table, uint64_t& secondary, uint64_t& primary ) {
+    auto tab = this->find_table( code, scope, table );
+    if( !tab ) return -1;
+
+    auto table_end_itr = keyval_cache.cache_table( *tab );
+
+    const auto& idx = this->get_index<typename chainbase::get_index_type<index_double_object>::type, by_secondary>();
+    auto sec = float64_t { secondary };
+    auto itr = idx.lower_bound( boost::make_tuple( tab->id, sec ) );
+    if( itr == idx.end() ) return table_end_itr;
+    if( itr->t_id != tab->id ) return table_end_itr;
+
+    primary = itr->primary_key;
+    secondary = itr->secondary_key.v;
+
+    return keyval_cache.add( *itr );
+}
+
+int database_wrapper::db_idx_double_upperbound( iterator_cache<index_double_object>& keyval_cache, uint64_t code, uint64_t scope, uint64_t table, uint64_t& secondary, uint64_t& primary ) {
+    auto tab = this->find_table( code, scope, table );
+    if( !tab ) return -1;
+
+    auto table_end_itr = keyval_cache.cache_table( *tab );
+
+    const auto& idx = this->get_index<typename chainbase::get_index_type<index_double_object>::type, by_secondary>();
+    auto sec = float64_t { secondary };
+    auto itr = idx.upper_bound( boost::make_tuple( tab->id, sec ) );
+    if( itr == idx.end() ) return table_end_itr;
+    if( itr->t_id != tab->id ) return table_end_itr;
+
+    primary = itr->primary_key;
+    secondary = itr->secondary_key.v;
+
+    return keyval_cache.add( *itr );
+}
+
+int database_wrapper::db_idx_double_end( iterator_cache<index_double_object>& keyval_cache, uint64_t code, uint64_t scope, uint64_t table ) {
+    auto tab = this->find_table( code, scope, table );
+    if( !tab ) return -1;
+
+    return keyval_cache.cache_table( *tab );
+}
+
+int database_wrapper::db_idx_double_next( iterator_cache<index_double_object>& keyval_cache, int iterator, uint64_t& primary ) {
+    if( iterator < -1 ) return -1; // cannot increment past end iterator of index
+
+    const auto& obj = keyval_cache.get(iterator); // Check for iterator != -1 happens in this call
+    const auto& idx = this->get_index<typename chainbase::get_index_type<index_double_object>::type, by_secondary>();
+
+    auto itr = idx.iterator_to(obj);
+    ++itr;
+
+    if( itr == idx.end() || itr->t_id != obj.t_id ) return keyval_cache.get_end_iterator_by_table_id(obj.t_id);
+
+    primary = itr->primary_key;
+    return keyval_cache.add(*itr);
+}
+
+int database_wrapper::db_idx_double_previous( iterator_cache<index_double_object>& keyval_cache, int iterator, uint64_t& primary ) {
+    const auto& idx = this->get_index<typename chainbase::get_index_type<index_double_object>::type, by_secondary>();
+
+    if( iterator < -1 ) // is end iterator
+    {
+        auto tab = keyval_cache.find_table_by_end_iterator(iterator);
+        EOS_ASSERT( tab, invalid_table_iterator, "not a valid end iterator" );
+
+        auto itr = idx.upper_bound(tab->id);
+        if( idx.begin() == idx.end() || itr == idx.begin() ) return -1; // Empty index
+
+        --itr;
+
+        if( itr->t_id != tab->id ) return -1; // Empty index
+
+        primary = itr->primary_key;
+        return keyval_cache.add(*itr);
+    }
+
+    const auto& obj = keyval_cache.get(iterator); // Check for iterator != -1 happens in this call
+
+    auto itr = idx.iterator_to(obj);
+    if( itr == idx.begin() ) return -1; // cannot decrement past beginning iterator of index
+
+    --itr;
+
+    if( itr->t_id != obj.t_id ) return -1; // cannot decrement past beginning iterator of index
+
+    primary = itr->primary_key;
+    return keyval_cache.add(*itr);
+}
+
+const index_long_double_object& database_wrapper::create_idx_long_double_object( const table_id_object& tab, uint64_t payer, uint64_t id, Float128 secondary ) {
+    auto sec = to_float128(secondary);
+    auto tableid = tab.id;
+    EOS_ASSERT( payer != 0, invalid_table_payer, "must specify a valid account to pay for new record" );
+    const auto& obj = this->create<index_long_double_object>( [&]( auto& o ) {
+        o.t_id          = tableid;
+        o.primary_key   = id;
+        o.secondary_key = sec;
+        o.payer         = name(payer);
+    });
+
+    this->modify( tab, [&]( auto& t ) {
+        ++t.count;
+    });
+
+    return obj;
+}
+
+void database_wrapper::update_idx_long_double_object( const index_long_double_object& obj, uint64_t payer, Float128 secondary ) {
+    this->modify( obj, [&]( auto& o ) {
+        o.secondary_key = to_float128(secondary);
+        o.payer = name(payer);
+    });
+}
+
+void database_wrapper::db_idx_long_double_remove( iterator_cache<index_long_double_object>& keyval_cache, int iterator, u_int64_t receiver ) {
+    const index_long_double_object& obj = keyval_cache.get( iterator );
+    const auto& table_obj = keyval_cache.get_table( obj.t_id );
+    EOS_ASSERT( table_obj.code == name(receiver), table_access_violation, "db access violation" );
+
+    this->modify( table_obj, [&]( auto& t ) {
+        --t.count;
+    });
+    this->remove( obj );
+
+    if (table_obj.count == 0) {
+        this->remove_table(table_obj);
+    }
+
+    keyval_cache.remove( iterator );
+}
+
+int database_wrapper::db_idx_long_double_find_secondary( iterator_cache<index_long_double_object>& keyval_cache, uint64_t code, uint64_t scope, uint64_t table, Float128 secondary, uint64_t& primary ) {
+    auto tab = this->find_table( code, scope, table );
+    if( !tab ) return -1;
+
+    auto table_end_itr = keyval_cache.cache_table( *tab );
+    auto sec = to_float128(secondary);
+
+    const auto* obj = this->find<index_long_double_object, by_secondary>( boost::make_tuple( tab->id, sec ) );
+    if( !obj ) return table_end_itr;
+
+    primary = obj->primary_key;
+
+    return keyval_cache.add( *obj );
+}
+
+int database_wrapper::db_idx_long_double_find_primary( iterator_cache<index_long_double_object>& keyval_cache, uint64_t code, uint64_t scope, uint64_t table, Float128& secondary, uint64_t primary ) {
+    auto tab = this->find_table( code, scope, table );
+    if( !tab ) return -1;
+
+    auto table_end_itr = keyval_cache.cache_table( *tab );
+
+    const auto* obj = this->find<index_long_double_object, by_primary>( boost::make_tuple( tab->id, primary ) );
+    if( !obj ) return table_end_itr;
+
+    secondary = from_float128(obj->secondary_key);
+
+    return keyval_cache.add( *obj );
+}
+
+int database_wrapper::db_idx_long_double_lowerbound( iterator_cache<index_long_double_object>& keyval_cache, uint64_t code, uint64_t scope, uint64_t table, Float128& secondary, uint64_t& primary ) {
+    auto tab = this->find_table( code, scope, table );
+    if( !tab ) return -1;
+
+    auto table_end_itr = keyval_cache.cache_table( *tab );
+    auto sec = to_float128(secondary);
+
+    const auto& idx = this->get_index<typename chainbase::get_index_type<index_long_double_object>::type, by_secondary>();
+    auto itr = idx.lower_bound( boost::make_tuple( tab->id, sec ) );
+    if( itr == idx.end() ) return table_end_itr;
+    if( itr->t_id != tab->id ) return table_end_itr;
+
+    primary = itr->primary_key;
+    secondary = from_float128(itr->secondary_key);
+
+    return keyval_cache.add( *itr );
+}
+
+int database_wrapper::db_idx_long_double_upperbound( iterator_cache<index_long_double_object>& keyval_cache, uint64_t code, uint64_t scope, uint64_t table, Float128& secondary, uint64_t& primary ) {
+    auto tab = this->find_table( code, scope, table );
+    if( !tab ) return -1;
+
+    auto table_end_itr = keyval_cache.cache_table( *tab );
+    auto sec = to_float128(secondary);
+
+    const auto& idx = this->get_index<typename chainbase::get_index_type<index_long_double_object>::type, by_secondary>();
+    auto itr = idx.upper_bound( boost::make_tuple( tab->id, sec ) );
+    if( itr == idx.end() ) return table_end_itr;
+    if( itr->t_id != tab->id ) return table_end_itr;
+
+    primary = itr->primary_key;
+    secondary = from_float128(itr->secondary_key);
+
+    return keyval_cache.add( *itr );
+}
+
+int database_wrapper::db_idx_long_double_end( iterator_cache<index_long_double_object>& keyval_cache, uint64_t code, uint64_t scope, uint64_t table ) {
+    auto tab = this->find_table( code, scope, table );
+    if( !tab ) return -1;
+
+    return keyval_cache.cache_table( *tab );
+}
+
+int database_wrapper::db_idx_long_double_next( iterator_cache<index_long_double_object>& keyval_cache, int iterator, uint64_t& primary ) {
+    if( iterator < -1 ) return -1; // cannot increment past end iterator of index
+
+    const auto& obj = keyval_cache.get(iterator); // Check for iterator != -1 happens in this call
+    const auto& idx = this->get_index<typename chainbase::get_index_type<index_long_double_object>::type, by_secondary>();
+
+    auto itr = idx.iterator_to(obj);
+    ++itr;
+
+    if( itr == idx.end() || itr->t_id != obj.t_id ) return keyval_cache.get_end_iterator_by_table_id(obj.t_id);
+
+    primary = itr->primary_key;
+    return keyval_cache.add(*itr);
+}
+
+int database_wrapper::db_idx_long_double_previous( iterator_cache<index_long_double_object>& keyval_cache, int iterator, uint64_t& primary ) {
+    const auto& idx = this->get_index<typename chainbase::get_index_type<index_long_double_object>::type, by_secondary>();
 
     if( iterator < -1 ) // is end iterator
     {

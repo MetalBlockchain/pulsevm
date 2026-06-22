@@ -89,9 +89,15 @@ class iterator_cache {
 using CxxKeyValueIteratorCache = iterator_cache<key_value_object>;
 using CxxIndex64IteratorCache = iterator_cache<index64_object>;
 using CxxIndex128IteratorCache = iterator_cache<index128_object>;
+using CxxIndex256IteratorCache = iterator_cache<index256_object>;
+using CxxIndexDoubleIteratorCache = iterator_cache<index_double_object>;
+using CxxIndexLongDoubleIteratorCache = iterator_cache<index_long_double_object>;
 
 std::unique_ptr<CxxKeyValueIteratorCache> new_key_value_iterator_cache();
 std::unique_ptr<CxxIndex64IteratorCache> new_index64_iterator_cache();
 std::unique_ptr<CxxIndex128IteratorCache> new_index128_iterator_cache();
+std::unique_ptr<CxxIndex256IteratorCache> new_index256_iterator_cache();
+std::unique_ptr<CxxIndexDoubleIteratorCache> new_index_double_iterator_cache();
+std::unique_ptr<CxxIndexLongDoubleIteratorCache> new_index_long_double_iterator_cache();
 
 }

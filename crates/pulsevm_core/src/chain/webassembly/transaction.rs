@@ -11,7 +11,8 @@ use crate::{
         controller::Controller,
         transaction::{Action, Transaction},
         utils::pulse_assert,
-        wasm_runtime::WasmContext, webassembly::context_aware_check,
+        wasm_runtime::WasmContext,
+        webassembly::context_aware_check,
     },
     crypto::PublicKey,
 };
@@ -119,9 +120,7 @@ pub fn read_transaction(
     Ok(copy_size as u32)
 }
 
-pub fn transaction_size(
-    env: FunctionEnvMut<WasmContext>,
-) -> Result<u32, RuntimeError> {
+pub fn transaction_size(env: FunctionEnvMut<WasmContext>) -> Result<u32, RuntimeError> {
     let env_data = env.data();
     let size = env_data
         .apply_context()
@@ -132,9 +131,7 @@ pub fn transaction_size(
     Ok(size as u32)
 }
 
-pub fn expiration(
-    env: FunctionEnvMut<WasmContext>,
-) -> Result<u32, RuntimeError> {
+pub fn expiration(env: FunctionEnvMut<WasmContext>) -> Result<u32, RuntimeError> {
     let env_data = env.data();
     let trx = env_data
         .apply_context()
@@ -145,9 +142,7 @@ pub fn expiration(
     Ok(expiration.sec_since_epoch())
 }
 
-pub fn tapos_block_num(
-    env: FunctionEnvMut<WasmContext>,
-) -> Result<u32, RuntimeError> {
+pub fn tapos_block_num(env: FunctionEnvMut<WasmContext>) -> Result<u32, RuntimeError> {
     let env_data = env.data();
     let trx = env_data
         .apply_context()
@@ -158,9 +153,7 @@ pub fn tapos_block_num(
     Ok(ref_block_num as u32)
 }
 
-pub fn tapos_block_prefix(
-    env: FunctionEnvMut<WasmContext>,
-) -> Result<u32, RuntimeError> {
+pub fn tapos_block_prefix(env: FunctionEnvMut<WasmContext>) -> Result<u32, RuntimeError> {
     let env_data = env.data();
     let trx = env_data
         .apply_context()

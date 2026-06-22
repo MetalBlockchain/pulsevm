@@ -11,7 +11,7 @@ use crate::{
     chain::{
         apply_context::ApplyContext,
         authorization_manager::AuthorizationManager,
-        block::{BlockHeader},
+        block::BlockHeader,
         config::{
             DELETEAUTH_NAME, LINKAUTH_NAME, NEWACCOUNT_NAME, SETABI_NAME, SETCODE_NAME,
             UNLINKAUTH_NAME, UPDATEAUTH_NAME, eos_percent,
@@ -39,7 +39,10 @@ use pulsevm_constants::{
 };
 use pulsevm_crypto::{Digest, merkle};
 use pulsevm_error::ChainError;
-use pulsevm_ffi::{BlockTimestamp, CxxGenesisState, Database, ElasticLimitParameters, GlobalPropertyObject, Microseconds, TimePoint, seconds};
+use pulsevm_ffi::{
+    BlockTimestamp, CxxGenesisState, Database, ElasticLimitParameters, GlobalPropertyObject,
+    Microseconds, TimePoint, seconds,
+};
 use pulsevm_grpc::vm;
 use pulsevm_serialization::{Read, Write};
 use spdlog::{debug, error, info, warn};
@@ -114,7 +117,7 @@ impl Controller {
         }
     }
 
-    pub async fn initialize(
+    pub fn initialize(
         &mut self,
         chain_id: &Id,
         config_bytes: &Vec<u8>,
@@ -1049,14 +1052,12 @@ mod tests {
         })
         .to_string()
         .into_bytes();
-        controller
-            .initialize(
-                &chain_id,
-                &config_bytes,
-                &genesis_bytes.to_vec(),
-                temp_path.path().to_str().unwrap(),
-            )
-            .await?;
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &genesis_bytes.to_vec(),
+            temp_path.path().to_str().unwrap(),
+        )?;
         assert_eq!(controller.last_accepted_block().block_num(), 1);
         let pending_block_timestamp = controller.last_accepted_block().timestamp().clone();
         let chain_id = controller.chain_id().clone();
@@ -1168,14 +1169,12 @@ mod tests {
         })
         .to_string()
         .into_bytes();
-        controller
-            .initialize(
-                &chain_id,
-                &config_bytes,
-                &genesis_bytes.to_vec(),
-                temp_path.path().to_str().unwrap(),
-            )
-            .await?;
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &genesis_bytes.to_vec(),
+            temp_path.path().to_str().unwrap(),
+        )?;
         let pending_block_timestamp = controller.last_accepted_block().timestamp().clone();
         let chain_id = controller.chain_id().clone();
         let block_status = BlockStatus::Building;
@@ -1400,6 +1399,347 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn test_multi_index() -> Result<(), ChainError> {
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
+        let runtime = runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        let private_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let mut controller = Controller::new();
+        let genesis_bytes = generate_genesis(&private_key);
+        let temp_path = get_temp_dir();
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": private_key.to_string(),
+        })
+        .to_string()
+        .into_bytes();
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &genesis_bytes.to_vec(),
+            temp_path.path().to_str().unwrap(),
+        )?;
+        let pending_block_timestamp = controller.last_accepted_block().timestamp().clone();
+        let chain_id = controller.chain_id().clone();
+        let block_status = BlockStatus::Building;
+        controller.execute_transaction(
+            &create_account(&private_key, Name::from_str("testapi")?, chain_id)?,
+            &pending_block_timestamp,
+            &block_status,
+        )?;
+        controller.execute_transaction(
+            &create_account(&private_key, Name::from_str("testapi2")?, chain_id)?,
+            &pending_block_timestamp,
+            &block_status,
+        )?;
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let contract =
+            fs::read(root.join(Path::new("reference_contracts/test_api_multi_index.wasm")))
+                .unwrap();
+        controller.execute_transaction(
+            &set_code(
+                &private_key,
+                Name::from_str("testapi")?,
+                contract.clone(),
+                chain_id,
+            )?,
+            &pending_block_timestamp,
+            &block_status,
+        )?;
+
+        controller.execute_transaction(
+            &call_contract(
+                &private_key,
+                Name::from_str("testapi")?,
+                Name::from_str("s1g")?,
+                &Vec::<u8>::new(),
+                chain_id,
+            )?,
+            &pending_block_timestamp,
+            &block_status,
+        )?;
+
+        controller.execute_transaction(
+            &call_contract(
+                &private_key,
+                Name::from_str("testapi")?,
+                Name::from_str("s1store")?,
+                &Vec::<u8>::new(),
+                chain_id,
+            )?,
+            &pending_block_timestamp,
+            &block_status,
+        )?;
+
+        controller.execute_transaction(
+            &call_contract(
+                &private_key,
+                Name::from_str("testapi")?,
+                Name::from_str("s1check")?,
+                &Vec::<u8>::new(),
+                chain_id,
+            )?,
+            &pending_block_timestamp,
+            &block_status,
+        )?;
+
+        controller.execute_transaction(
+            &call_contract(
+                &private_key,
+                Name::from_str("testapi")?,
+                Name::from_str("s2g")?,
+                &Vec::<u8>::new(),
+                chain_id,
+            )?,
+            &pending_block_timestamp,
+            &block_status,
+        )?;
+
+        controller.execute_transaction(
+            &call_contract(
+                &private_key,
+                Name::from_str("testapi")?,
+                Name::from_str("s2store")?,
+                &Vec::<u8>::new(),
+                chain_id,
+            )?,
+            &pending_block_timestamp,
+            &block_status,
+        )?;
+
+        controller.execute_transaction(
+            &call_contract(
+                &private_key,
+                Name::from_str("testapi")?,
+                Name::from_str("s2check")?,
+                &Vec::<u8>::new(),
+                chain_id,
+            )?,
+            &pending_block_timestamp,
+            &block_status,
+        )?;
+
+        controller.execute_transaction(
+            &call_contract(
+                &private_key,
+                Name::from_str("testapi")?,
+                Name::from_str("s2autoinc")?,
+                &Vec::<u8>::new(),
+                chain_id,
+            )?,
+            &pending_block_timestamp,
+            &block_status,
+        )?;
+
+        controller.execute_transaction(
+            &call_contract(
+                &private_key,
+                Name::from_str("testapi")?,
+                Name::from_str("s2autoinc1")?,
+                &Vec::<u8>::new(),
+                chain_id,
+            )?,
+            &pending_block_timestamp,
+            &block_status,
+        )?;
+
+        controller.execute_transaction(
+            &call_contract(
+                &private_key,
+                Name::from_str("testapi")?,
+                Name::from_str("s2autoinc2")?,
+                &Vec::<u8>::new(),
+                chain_id,
+            )?,
+            &pending_block_timestamp,
+            &block_status,
+        )?;
+
+        controller.execute_transaction(
+            &call_contract(
+                &private_key,
+                Name::from_str("testapi")?,
+                Name::from_str("s3g")?,
+                &Vec::<u8>::new(),
+                chain_id,
+            )?,
+            &pending_block_timestamp,
+            &block_status,
+        )?;
+
+        controller.execute_transaction(
+            &call_contract(
+                &private_key,
+                Name::from_str("testapi")?,
+                Name::from_str("sdg")?,
+                &Vec::<u8>::new(),
+                chain_id,
+            )?,
+            &pending_block_timestamp,
+            &block_status,
+        )?;
+
+        controller.execute_transaction(
+            &call_contract(
+                &private_key,
+                Name::from_str("testapi")?,
+                Name::from_str("sldg")?,
+                &Vec::<u8>::new(),
+                chain_id,
+            )?,
+            &pending_block_timestamp,
+            &block_status,
+        )?;
+
+        let check_failure = |controller: &mut Controller, action: &str, expected_error: &str| {
+            let result = controller.execute_transaction(
+                &call_contract(
+                    &private_key,
+                    Name::from_str("testapi").unwrap(),
+                    Name::from_str(action).unwrap(),
+                    &Vec::<u8>::new(),
+                    chain_id,
+                ).unwrap(),
+                &pending_block_timestamp,
+                &block_status,
+            );
+
+            assert!(result.is_err());
+            assert_eq!(
+                result.err().unwrap().to_string(),
+                expected_error
+            );
+        };
+
+        check_failure(
+            &mut controller,
+            "s1pkend",
+            "apply error: eosio assert failed: cannot increment end iterator",
+        );
+        check_failure(
+            &mut controller,
+            "s1skend",
+            "apply error: eosio assert failed: cannot increment end iterator",
+        );
+        check_failure(
+            &mut controller,
+            "s1pkbegin",
+            "apply error: eosio assert failed: cannot decrement iterator at beginning of table",
+        );
+        check_failure(
+            &mut controller,
+            "s1skbegin",
+            "apply error: eosio assert failed: cannot decrement iterator at beginning of index",
+        );
+        check_failure(
+            &mut controller,
+            "s1pkref",
+            "apply error: eosio assert failed: object passed to iterator_to is not in multi_index",
+        );
+        check_failure(
+            &mut controller,
+            "s1skref",
+            "apply error: eosio assert failed: object passed to iterator_to is not in multi_index",
+        );
+        check_failure(
+            &mut controller,
+            "s1pkitrto",
+            "apply error: eosio assert failed: object passed to iterator_to is not in multi_index",
+        );
+        check_failure(
+            &mut controller,
+            "s1pkmodify",
+            "apply error: eosio assert failed: cannot pass end iterator to modify",
+        );
+        check_failure(
+            &mut controller,
+            "s1pkerase",
+            "apply error: eosio assert failed: cannot pass end iterator to erase",
+        );
+        check_failure(
+            &mut controller,
+            "s1skitrto",
+            "apply error: eosio assert failed: object passed to iterator_to is not in multi_index",
+        );
+        check_failure(
+            &mut controller,
+            "s1skmodify",
+            "apply error: eosio assert failed: cannot pass end iterator to modify",
+        );
+        check_failure(
+            &mut controller,
+            "s1skerase",
+            "apply error: eosio assert failed: cannot pass end iterator to erase",
+        );
+        check_failure(
+            &mut controller,
+            "s1modpk",
+            "apply error: eosio assert failed: updater cannot change primary key when modifying an object",
+        );
+        check_failure(
+            &mut controller,
+            "s1exhaustpk",
+            "apply error: eosio assert failed: next primary key in table is at autoincrement limit",
+        );
+        check_failure(
+            &mut controller,
+            "s1findfail1",
+            "apply error: eosio assert failed: unable to find key",
+        );
+        check_failure(
+            &mut controller,
+            "s1findfail2",
+            "apply error: eosio assert failed: unable to find primary key in require_find",
+        );
+        check_failure(
+            &mut controller,
+            "s1findfail3",
+            "apply error: eosio assert failed: unable to find secondary key",
+        );
+        check_failure(
+            &mut controller,
+            "s1findfail4",
+            "apply error: eosio assert failed: unable to find sec key",
+        );
+
+        controller.execute_transaction(
+            &call_contract(
+                &private_key,
+                Name::from_str("testapi")?,
+                Name::from_str("s1skcache")?,
+                &Vec::<u8>::new(),
+                chain_id,
+            )?,
+            &pending_block_timestamp,
+            &block_status,
+        )?;
+
+        controller.execute_transaction(
+            &call_contract(
+                &private_key,
+                Name::from_str("testapi")?,
+                Name::from_str("s1pkcache")?,
+                &Vec::<u8>::new(),
+                chain_id,
+            )?,
+            &pending_block_timestamp,
+            &block_status,
+        )?;
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_verify_block() -> Result<(), ChainError> {
         let chain_id =
@@ -1418,14 +1758,12 @@ mod tests {
         })
         .to_string()
         .into_bytes();
-        controller
-            .initialize(
-                &chain_id,
-                &config_bytes,
-                &genesis_bytes.to_vec(),
-                temp_path.path().to_str().unwrap(),
-            )
-            .await?;
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &genesis_bytes.to_vec(),
+            temp_path.path().to_str().unwrap(),
+        )?;
         assert_eq!(controller.last_accepted_block().block_num(), 1);
         let chain_id = controller.chain_id().clone();
         let mut txs = VecDeque::new();
@@ -1468,14 +1806,12 @@ mod tests {
         })
         .to_string()
         .into_bytes();
-        controller
-            .initialize(
-                &chain_id,
-                &config_bytes,
-                &genesis_bytes.to_vec(),
-                temp_path.path().to_str().unwrap(),
-            )
-            .await?;
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &genesis_bytes.to_vec(),
+            temp_path.path().to_str().unwrap(),
+        )?;
         assert_eq!(controller.last_accepted_block().block_num(), 1);
         let pending_block_timestamp = controller.last_accepted_block().timestamp().clone();
         let chain_id = controller.chain_id().clone();

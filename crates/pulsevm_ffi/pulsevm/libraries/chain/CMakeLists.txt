@@ -14,7 +14,7 @@ add_library( pulsevm_chain
    ${HEADERS}
 )
 
-target_link_libraries( pulsevm_chain PUBLIC bn256 fc chainbase
+target_link_libraries( pulsevm_chain PUBLIC bn256 fc chainbase softfloat
    Boost::signals2 Boost::hana Boost::property_tree Boost::multi_index Boost::asio Boost::lockfree
    Boost::assign Boost::accumulators
 )

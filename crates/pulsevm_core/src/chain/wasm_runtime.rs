@@ -7,6 +7,7 @@ use lru::LruCache;
 use pulsevm_crypto::Bytes;
 use pulsevm_error::ChainError;
 use pulsevm_ffi::{BlockTimestamp, CxxDigest, Database};
+use spdlog::{debug, info};
 use wasmer::{
     Engine, Function, FunctionEnv, Instance, Memory, Module, Store, imports, sys::CompilerConfig,
     wasmparser::Operator,
@@ -18,14 +19,45 @@ use wasmer_middlewares::{
 };
 
 use crate::chain::{
-        apply_context::ApplyContext,
-        id::Id,
-        name::Name,
-        transaction::Action,
-        webassembly::{
-            __addtf3, __ashlti3, __ashrti3, __cmptf2, __divtf3, __divti3, __eqtf2, __extenddftf2, __extendsftf2, __fixdfti, __fixsfti, __fixtfdi, __fixtfsi, __fixtfti, __fixunsdfti, __fixunssfti, __fixunstfsi, __fixunstfti, __floatditf, __floatsidf, __floatsitf, __floattidf, __floatunditf, __floatunsitf, __floatuntidf, __getf2, __gttf2, __letf2, __lshlti3, __lshrti3, __lttf2, __modti3, __multf3, __multi3, __negtf2, __netf2, __subtf3, __trunctfdf2, __trunctfsf2, __udivti3, __umodti3, __unordtf2, abort, assert_recover_key, assert_ripemd160, assert_sha1, assert_sha224, assert_sha256, assert_sha512, check_permission_authorization, check_transaction_authorization, current_time, db_end_i64, db_find_i64, db_get_i64, db_idx64_end, db_idx64_find_primary, db_idx64_find_secondary, db_idx64_lowerbound, db_idx64_next, db_idx64_previous, db_idx64_remove, db_idx64_store, db_idx64_update, db_idx64_upperbound, db_idx128_end, db_idx128_find_primary, db_idx128_find_secondary, db_idx128_lowerbound, db_idx128_next, db_idx128_previous, db_idx128_remove, db_idx128_store, db_idx128_update, db_idx128_upperbound, db_lowerbound_i64, db_next_i64, db_previous_i64, db_remove_i64, db_store_i64, db_update_i64, db_upperbound_i64, eosio_assert, expiration, get_account_creation_time, get_action, get_context_free_data, get_permission_last_used, get_resource_limits, is_privileged, memcmp, memcpy, memmove, memset, printdf, printhex, printi, printi128, printn, prints, prints_l, printsf, printui, printui128, pulse_assert, pulse_assert_code, pulse_assert_message, pulse_exit, read_action_data, read_transaction, recover_key, require_auth2, require_recipient, ripemd160, set_action_return_value, set_privileged, set_resource_limits, sha1, sha224, sha256, sha512, tapos_block_num, tapos_block_prefix, transaction_size
-        },
-    };
+    apply_context::ApplyContext,
+    id::Id,
+    name::Name,
+    transaction::Action,
+    webassembly::{
+        __addtf3, __ashlti3, __ashrti3, __cmptf2, __divtf3, __divti3, __eqtf2, __extenddftf2,
+        __extendsftf2, __fixdfti, __fixsfti, __fixtfdi, __fixtfsi, __fixtfti, __fixunsdfti,
+        __fixunssfti, __fixunstfsi, __fixunstfti, __floatditf, __floatsidf, __floatsitf,
+        __floattidf, __floatunditf, __floatunsitf, __floatuntidf, __getf2, __gttf2, __letf2,
+        __lshlti3, __lshrti3, __lttf2, __modti3, __multf3, __multi3, __negtf2, __netf2, __subtf3,
+        __trunctfdf2, __trunctfsf2, __udivti3, __umodti3, __unordtf2, abort, assert_recover_key,
+        assert_ripemd160, assert_sha1, assert_sha224, assert_sha256, assert_sha512,
+        check_permission_authorization, check_transaction_authorization, current_time, db_end_i64,
+        db_find_i64, db_get_i64, db_idx_double_end, db_idx_double_find_primary,
+        db_idx_double_find_secondary, db_idx_double_lowerbound, db_idx_double_next,
+        db_idx_double_previous, db_idx_double_remove, db_idx_double_store, db_idx_double_update,
+        db_idx_double_upperbound, db_idx_long_double_end, db_idx_long_double_find_primary,
+        db_idx_long_double_find_secondary, db_idx_long_double_lowerbound, db_idx_long_double_next,
+        db_idx_long_double_previous, db_idx_long_double_remove, db_idx_long_double_store,
+        db_idx_long_double_update, db_idx_long_double_upperbound, db_idx64_end,
+        db_idx64_find_primary, db_idx64_find_secondary, db_idx64_lowerbound, db_idx64_next,
+        db_idx64_previous, db_idx64_remove, db_idx64_store, db_idx64_update, db_idx64_upperbound,
+        db_idx128_end, db_idx128_find_primary, db_idx128_find_secondary, db_idx128_lowerbound,
+        db_idx128_next, db_idx128_previous, db_idx128_remove, db_idx128_store, db_idx128_update,
+        db_idx128_upperbound, db_idx256_end, db_idx256_find_primary, db_idx256_find_secondary,
+        db_idx256_lowerbound, db_idx256_next, db_idx256_previous, db_idx256_remove,
+        db_idx256_store, db_idx256_update, db_idx256_upperbound, db_lowerbound_i64, db_next_i64,
+        db_previous_i64, db_remove_i64, db_store_i64, db_update_i64, db_upperbound_i64,
+        eosio_assert, expiration, get_account_creation_time, get_action, get_active_producers,
+        get_blockchain_parameters_packed, get_context_free_data, get_permission_last_used,
+        get_resource_limits, is_privileged, memcmp, memcpy, memmove, memset, printdf, printhex,
+        printi, printi128, printn, printqf, prints, prints_l, printsf, printui, printui128,
+        pulse_assert, pulse_assert_code, pulse_assert_message, pulse_exit, read_action_data,
+        read_transaction, recover_key, require_auth2, require_recipient, ripemd160,
+        send_context_free_inline, set_action_return_value, set_blockchain_parameters_packed,
+        set_privileged, set_proposed_producers, set_resource_limits, sha1, sha224, sha256, sha512,
+        tapos_block_num, tapos_block_prefix, transaction_size,
+    },
+};
 
 use super::webassembly::{
     action_data_size, current_receiver, has_auth, is_account, require_auth, send_inline,
@@ -307,6 +339,39 @@ impl WasmRuntime {
                 "db_idx128_end" => Function::new_typed_with_env(&mut store, &env, db_idx128_end),
                 "db_idx128_next" => Function::new_typed_with_env(&mut store, &env, db_idx128_next),
                 "db_idx128_previous" => Function::new_typed_with_env(&mut store, &env, db_idx128_previous),
+                // Index 256 functions
+                "db_idx256_store" => Function::new_typed_with_env(&mut store, &env, db_idx256_store),
+                "db_idx256_update" => Function::new_typed_with_env(&mut store, &env, db_idx256_update),
+                "db_idx256_remove" => Function::new_typed_with_env(&mut store, &env, db_idx256_remove),
+                "db_idx256_find_secondary" => Function::new_typed_with_env(&mut store, &env, db_idx256_find_secondary),
+                "db_idx256_find_primary" => Function::new_typed_with_env(&mut store, &env, db_idx256_find_primary),
+                "db_idx256_lowerbound" => Function::new_typed_with_env(&mut store, &env, db_idx256_lowerbound),
+                "db_idx256_upperbound" => Function::new_typed_with_env(&mut store, &env, db_idx256_upperbound),
+                "db_idx256_end" => Function::new_typed_with_env(&mut store, &env, db_idx256_end),
+                "db_idx256_next" => Function::new_typed_with_env(&mut store, &env, db_idx256_next),
+                "db_idx256_previous" => Function::new_typed_with_env(&mut store, &env, db_idx256_previous),
+                // Index double functions
+                "db_idx_double_store" => Function::new_typed_with_env(&mut store, &env, db_idx_double_store),
+                "db_idx_double_update" => Function::new_typed_with_env(&mut store, &env, db_idx_double_update),
+                "db_idx_double_remove" => Function::new_typed_with_env(&mut store, &env, db_idx_double_remove),
+                "db_idx_double_find_secondary" => Function::new_typed_with_env(&mut store, &env, db_idx_double_find_secondary),
+                "db_idx_double_find_primary" => Function::new_typed_with_env(&mut store, &env, db_idx_double_find_primary),
+                "db_idx_double_lowerbound" => Function::new_typed_with_env(&mut store, &env, db_idx_double_lowerbound),
+                "db_idx_double_upperbound" => Function::new_typed_with_env(&mut store, &env, db_idx_double_upperbound),
+                "db_idx_double_end" => Function::new_typed_with_env(&mut store, &env, db_idx_double_end),
+                "db_idx_double_next" => Function::new_typed_with_env(&mut store, &env, db_idx_double_next),
+                "db_idx_double_previous" => Function::new_typed_with_env(&mut store, &env, db_idx_double_previous),
+                // Index long double functions
+                "db_idx_long_double_store" => Function::new_typed_with_env(&mut store, &env, db_idx_long_double_store),
+                "db_idx_long_double_update" => Function::new_typed_with_env(&mut store, &env, db_idx_long_double_update),
+                "db_idx_long_double_remove" => Function::new_typed_with_env(&mut store, &env, db_idx_long_double_remove),
+                "db_idx_long_double_find_secondary" => Function::new_typed_with_env(&mut store, &env, db_idx_long_double_find_secondary),
+                "db_idx_long_double_find_primary" => Function::new_typed_with_env(&mut store, &env, db_idx_long_double_find_primary),
+                "db_idx_long_double_lowerbound" => Function::new_typed_with_env(&mut store, &env, db_idx_long_double_lowerbound),
+                "db_idx_long_double_upperbound" => Function::new_typed_with_env(&mut store, &env, db_idx_long_double_upperbound),
+                "db_idx_long_double_end" => Function::new_typed_with_env(&mut store, &env, db_idx_long_double_end),
+                "db_idx_long_double_next" => Function::new_typed_with_env(&mut store, &env, db_idx_long_double_next),
+                "db_idx_long_double_previous" => Function::new_typed_with_env(&mut store, &env, db_idx_long_double_previous),
                 // System functions
                 "pulse_assert" => Function::new_typed_with_env(&mut store, &env, pulse_assert),
                 "eosio_assert" => Function::new_typed_with_env(&mut store, &env, eosio_assert),
@@ -331,12 +396,17 @@ impl WasmRuntime {
                 "assert_sha256" => Function::new_typed_with_env(&mut store, &env, assert_sha256),
                 "assert_sha512" => Function::new_typed_with_env(&mut store, &env, assert_sha512),
                 "assert_ripemd160" => Function::new_typed_with_env(&mut store, &env, assert_ripemd160),
+                // Privilege and resource limit functions
                 "is_privileged" => Function::new_typed_with_env(&mut store, &env, is_privileged),
                 "set_privileged" => Function::new_typed_with_env(&mut store, &env, set_privileged),
+                "set_proposed_producers" => Function::new_typed_with_env(&mut store, &env, set_proposed_producers),
+                "get_blockchain_parameters_packed" => Function::new_typed_with_env(&mut store, &env, get_blockchain_parameters_packed),
+                "set_blockchain_parameters_packed" => Function::new_typed_with_env(&mut store, &env, set_blockchain_parameters_packed),
                 "set_resource_limits" => Function::new_typed_with_env(&mut store, &env, set_resource_limits),
                 "get_resource_limits" => Function::new_typed_with_env(&mut store, &env, get_resource_limits),
                 // Transaction functions
                 "send_inline" => Function::new_typed_with_env(&mut store, &env, send_inline),
+                "send_context_free_inline" => Function::new_typed_with_env(&mut store, &env, send_context_free_inline),
                 "read_transaction" => Function::new_typed_with_env(&mut store, &env, read_transaction),
                 "transaction_size" => Function::new_typed_with_env(&mut store, &env, transaction_size),
                 "expiration" => Function::new_typed_with_env(&mut store, &env, expiration),
@@ -352,6 +422,7 @@ impl WasmRuntime {
                 "printui128" => Function::new_typed_with_env(&mut store, &env, printui128),
                 "printsf" => Function::new_typed_with_env(&mut store, &env, printsf),
                 "printdf" => Function::new_typed_with_env(&mut store, &env, printdf),
+                "printqf" => Function::new_typed_with_env(&mut store, &env, printqf),
                 "printn" => Function::new_typed_with_env(&mut store, &env, printn),
                 "printhex" => Function::new_typed_with_env(&mut store, &env, printhex),
                 // Permission functions
@@ -361,6 +432,8 @@ impl WasmRuntime {
                 "get_account_creation_time" => Function::new_typed_with_env(&mut store, &env, get_account_creation_time),
                 // Context free functions
                 "get_context_free_data" => Function::new_typed_with_env(&mut store, &env, get_context_free_data),
+                // Producer functions
+                "get_active_producers" => Function::new_typed_with_env(&mut store, &env, get_active_producers),
             }
         };
         let instance = Instance::new(&mut store, &module.module, &import_object).map_err(|e| {
@@ -411,7 +484,7 @@ impl WasmRuntime {
                 }
 
                 // Otherwise wrap it
-                ChainError::WasmRuntimeError(format!("apply error: {}", e.message()))
+                ChainError::ApplyError(format!("{}", e.message()))
             });
         let remaining_points: MeteringPoints = get_remaining_points(&mut store, &instance);
 
@@ -424,7 +497,7 @@ impl WasmRuntime {
 
                 Ok(cpu_limit.saturating_sub(points) as u64)
             }
-            MeteringPoints::Exhausted => Err(ChainError::WasmRuntimeError(format!(
+            MeteringPoints::Exhausted => Err(ChainError::ApplyError(format!(
                 "CPU limit of {} exhausted during apply",
                 cpu_limit
             ))),

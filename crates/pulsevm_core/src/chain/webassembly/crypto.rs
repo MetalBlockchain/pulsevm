@@ -2,7 +2,11 @@ use pulsevm_serialization::{Read, Write};
 use sha1::Digest as Sha1Digest;
 use wasmer::{FunctionEnvMut, RuntimeError, WasmPtr};
 
-use crate::{chain::wasm_runtime::WasmContext, crypto::{PublicKey, Signature}, utils::Digest};
+use crate::{
+    chain::wasm_runtime::WasmContext,
+    crypto::{PublicKey, Signature},
+    utils::Digest,
+};
 
 pub fn assert_recover_key(
     mut env: FunctionEnvMut<WasmContext>,
@@ -70,9 +74,9 @@ pub fn recover_key(
     digest_slice.read_slice(&mut digest_bytes)?;
     let digest: Digest = Digest::from_data(&digest_bytes);
     let public_key = signature.recover_public_key(&digest)?;
-    let packed_public_key = public_key.pack().map_err(|e| {
-        RuntimeError::new(format!("failed to pack public key: {}", e))
-    })?;
+    let packed_public_key = public_key
+        .pack()
+        .map_err(|e| RuntimeError::new(format!("failed to pack public key: {}", e)))?;
     let copy_size = std::cmp::min(pub_len as usize, packed_public_key.len());
     let slice_out = pub_ptr.slice(&view, copy_size as u32)?;
     slice_out.write_slice(&packed_public_key[..copy_size])?;
@@ -388,7 +392,9 @@ pub fn assert_ripemd160(
     }
 
     if expected_hash != digest.as_slice() {
-        return Err(RuntimeError::new("assertion failed: ripemd160 hash mismatch"));
+        return Err(RuntimeError::new(
+            "assertion failed: ripemd160 hash mismatch",
+        ));
     }
 
     Ok(())

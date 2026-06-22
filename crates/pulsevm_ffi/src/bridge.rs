@@ -41,6 +41,10 @@ pub mod ffi {
         hi: u64,
     }
 
+    struct U256 {
+        value: [u8; 32],
+    }
+
     struct Float128 {
         lo: u64,
         hi: u64,
@@ -196,6 +200,24 @@ pub mod ffi {
         pub fn get_table_id(self: &Index128Object) -> &TableId;
         pub fn get_primary_key(self: &Index128Object) -> u64;
         pub fn get_payer(self: &Index128Object) -> &CxxName;
+
+        #[cxx_name = "index256_object"]
+        type Index256Object;
+        pub fn get_table_id(self: &Index256Object) -> &TableId;
+        pub fn get_primary_key(self: &Index256Object) -> u64;
+        pub fn get_payer(self: &Index256Object) -> &CxxName;
+
+        #[cxx_name = "index_double_object"]
+        type IndexDoubleObject;
+        pub fn get_table_id(self: &IndexDoubleObject) -> &TableId;
+        pub fn get_primary_key(self: &IndexDoubleObject) -> u64;
+        pub fn get_payer(self: &IndexDoubleObject) -> &CxxName;
+
+        #[cxx_name = "index_long_double_object"]
+        type IndexLongDoubleObject;
+        pub fn get_table_id(self: &IndexLongDoubleObject) -> &TableId;
+        pub fn get_primary_key(self: &IndexLongDoubleObject) -> u64;
+        pub fn get_payer(self: &IndexLongDoubleObject) -> &CxxName;
 
         // Methods on database
         pub fn flush(self: Pin<&mut Database>) -> Result<()>;
@@ -357,6 +379,13 @@ pub mod ffi {
             id: u64,
             secondary_key: U128,
         ) -> Result<&Index128Object>;
+        pub fn create_index256_object(
+            self: Pin<&mut Database>,
+            table: &TableObject,
+            payer: u64,
+            id: u64,
+            secondary_key: U256,
+        ) -> Result<&Index256Object>;
         pub fn update_key_value_object(
             self: Pin<&mut Database>,
             obj: &KeyValueObject,
@@ -374,6 +403,12 @@ pub mod ffi {
             obj: &Index128Object,
             payer: u64,
             secondary_key: U128,
+        ) -> Result<()>;
+        pub fn update_index256_object(
+            self: Pin<&mut Database>,
+            obj: &Index256Object,
+            payer: u64,
+            secondary_key: U256,
         ) -> Result<()>;
         pub fn remove_table(self: Pin<&mut Database>, table: &TableObject) -> Result<()>;
         pub fn is_account(self: &Database, account: u64) -> Result<bool>;
@@ -575,6 +610,221 @@ pub mod ffi {
             primary_key: &mut u64,
         ) -> Result<i32>;
 
+        // Index 256 methods
+        pub fn db_idx256_remove(
+            self: Pin<&mut Database>,
+            keyval_cache: Pin<&mut CxxIndex256IteratorCache>,
+            iterator: i32,
+            receiver: u64,
+        ) -> Result<()>;
+        pub fn db_idx256_find_secondary(
+            self: Pin<&mut Database>,
+            keyval_cache: Pin<&mut CxxIndex256IteratorCache>,
+            code: u64,
+            scope: u64,
+            table: u64,
+            secondary_key: U256,
+            primary_key: &mut u64,
+        ) -> Result<i32>;
+        pub fn db_idx256_find_primary(
+            self: Pin<&mut Database>,
+            keyval_cache: Pin<&mut CxxIndex256IteratorCache>,
+            code: u64,
+            scope: u64,
+            table: u64,
+            secondary_key: &mut U256,
+            primary_key: u64,
+        ) -> Result<i32>;
+        pub fn db_idx256_lowerbound(
+            self: Pin<&mut Database>,
+            keyval_cache: Pin<&mut CxxIndex256IteratorCache>,
+            code: u64,
+            scope: u64,
+            table: u64,
+            secondary_key: &mut U256,
+            primary_key: &mut u64,
+        ) -> Result<i32>;
+        pub fn db_idx256_upperbound(
+            self: Pin<&mut Database>,
+            keyval_cache: Pin<&mut CxxIndex256IteratorCache>,
+            code: u64,
+            scope: u64,
+            table: u64,
+            secondary_key: &mut U256,
+            primary_key: &mut u64,
+        ) -> Result<i32>;
+        pub fn db_idx256_end(
+            self: Pin<&mut Database>,
+            keyval_cache: Pin<&mut CxxIndex256IteratorCache>,
+            code: u64,
+            scope: u64,
+            table: u64,
+        ) -> Result<i32>;
+        pub fn db_idx256_next(
+            self: Pin<&mut Database>,
+            keyval_cache: Pin<&mut CxxIndex256IteratorCache>,
+            iterator: i32,
+            primary_key: &mut u64,
+        ) -> Result<i32>;
+        pub fn db_idx256_previous(
+            self: Pin<&mut Database>,
+            keyval_cache: Pin<&mut CxxIndex256IteratorCache>,
+            iterator: i32,
+            primary_key: &mut u64,
+        ) -> Result<i32>;
+
+        // Index double methods
+        pub fn create_idx_double_object(
+            self: Pin<&mut Database>,
+            table: &TableObject,
+            payer: u64,
+            id: u64,
+            secondary_key: u64,
+        ) -> Result<&IndexDoubleObject>;
+        pub fn update_idx_double_object(
+            self: Pin<&mut Database>,
+            obj: &IndexDoubleObject,
+            payer: u64,
+            secondary_key: u64,
+        ) -> Result<()>;
+        pub fn db_idx_double_remove(
+            self: Pin<&mut Database>,
+            keyval_cache: Pin<&mut CxxIndexDoubleIteratorCache>,
+            iterator: i32,
+            receiver: u64,
+        ) -> Result<()>;
+        pub fn db_idx_double_find_secondary(
+            self: Pin<&mut Database>,
+            keyval_cache: Pin<&mut CxxIndexDoubleIteratorCache>,
+            code: u64,
+            scope: u64,
+            table: u64,
+            secondary_key: u64,
+            primary_key: &mut u64,
+        ) -> Result<i32>;
+        pub fn db_idx_double_find_primary(
+            self: Pin<&mut Database>,
+            keyval_cache: Pin<&mut CxxIndexDoubleIteratorCache>,
+            code: u64,
+            scope: u64,
+            table: u64,
+            secondary_key: &mut u64,
+            primary_key: u64,
+        ) -> Result<i32>;
+        pub fn db_idx_double_lowerbound(
+            self: Pin<&mut Database>,
+            keyval_cache: Pin<&mut CxxIndexDoubleIteratorCache>,
+            code: u64,
+            scope: u64,
+            table: u64,
+            secondary_key: &mut u64,
+            primary_key: &mut u64,
+        ) -> Result<i32>;
+        pub fn db_idx_double_upperbound(
+            self: Pin<&mut Database>,
+            keyval_cache: Pin<&mut CxxIndexDoubleIteratorCache>,
+            code: u64,
+            scope: u64,
+            table: u64,
+            secondary_key: &mut u64,
+            primary_key: &mut u64,
+        ) -> Result<i32>;
+        pub fn db_idx_double_end(
+            self: Pin<&mut Database>,
+            keyval_cache: Pin<&mut CxxIndexDoubleIteratorCache>,
+            code: u64,
+            scope: u64,
+            table: u64,
+        ) -> Result<i32>;
+        pub fn db_idx_double_next(
+            self: Pin<&mut Database>,
+            keyval_cache: Pin<&mut CxxIndexDoubleIteratorCache>,
+            iterator: i32,
+            primary_key: &mut u64,
+        ) -> Result<i32>;
+        pub fn db_idx_double_previous(
+            self: Pin<&mut Database>,
+            keyval_cache: Pin<&mut CxxIndexDoubleIteratorCache>,
+            iterator: i32,
+            primary_key: &mut u64,
+        ) -> Result<i32>;
+
+        // Index long double methods
+        pub fn create_idx_long_double_object(
+            self: Pin<&mut Database>,
+            table: &TableObject,
+            payer: u64,
+            id: u64,
+            secondary_key: Float128,
+        ) -> Result<&IndexLongDoubleObject>;
+        pub fn update_idx_long_double_object(
+            self: Pin<&mut Database>,
+            obj: &IndexLongDoubleObject,
+            payer: u64,
+            secondary_key: Float128,
+        ) -> Result<()>;
+        pub fn db_idx_long_double_remove(
+            self: Pin<&mut Database>,
+            keyval_cache: Pin<&mut CxxIndexLongDoubleIteratorCache>,
+            iterator: i32,
+            receiver: u64,
+        ) -> Result<()>;
+        pub fn db_idx_long_double_find_secondary(
+            self: Pin<&mut Database>,
+            keyval_cache: Pin<&mut CxxIndexLongDoubleIteratorCache>,
+            code: u64,
+            scope: u64,
+            table: u64,
+            secondary_key: Float128,
+            primary_key: &mut u64,
+        ) -> Result<i32>;
+        pub fn db_idx_long_double_find_primary(
+            self: Pin<&mut Database>,
+            keyval_cache: Pin<&mut CxxIndexLongDoubleIteratorCache>,
+            code: u64,
+            scope: u64,
+            table: u64,
+            secondary_key: &mut Float128,
+            primary_key: u64,
+        ) -> Result<i32>;
+        pub fn db_idx_long_double_lowerbound(
+            self: Pin<&mut Database>,
+            keyval_cache: Pin<&mut CxxIndexLongDoubleIteratorCache>,
+            code: u64,
+            scope: u64,
+            table: u64,
+            secondary_key: &mut Float128,
+            primary_key: &mut u64,
+        ) -> Result<i32>;
+        pub fn db_idx_long_double_upperbound(
+            self: Pin<&mut Database>,
+            keyval_cache: Pin<&mut CxxIndexLongDoubleIteratorCache>,
+            code: u64,
+            scope: u64,
+            table: u64,
+            secondary_key: &mut Float128,
+            primary_key: &mut u64,
+        ) -> Result<i32>;
+        pub fn db_idx_long_double_end(
+            self: Pin<&mut Database>,
+            keyval_cache: Pin<&mut CxxIndexLongDoubleIteratorCache>,
+            code: u64,
+            scope: u64,
+            table: u64,
+        ) -> Result<i32>;
+        pub fn db_idx_long_double_next(
+            self: Pin<&mut Database>,
+            keyval_cache: Pin<&mut CxxIndexLongDoubleIteratorCache>,
+            iterator: i32,
+            primary_key: &mut u64,
+        ) -> Result<i32>;
+        pub fn db_idx_long_double_previous(
+            self: Pin<&mut Database>,
+            keyval_cache: Pin<&mut CxxIndexLongDoubleIteratorCache>,
+            iterator: i32,
+            primary_key: &mut u64,
+        ) -> Result<i32>;
+
         pub fn remove_permission(
             self: Pin<&mut Database>,
             permission: &PermissionObject,
@@ -699,6 +949,83 @@ pub mod ffi {
         pub fn get(self: &CxxIndex128IteratorCache, iterator: i32) -> Result<&Index128Object>;
         pub fn remove(self: Pin<&mut CxxIndex128IteratorCache>, iterator: i32) -> Result<()>;
         pub fn add(self: Pin<&mut CxxIndex128IteratorCache>, obj: &Index128Object) -> Result<i32>;
+
+        pub type CxxIndex256IteratorCache;
+        pub fn new_index256_iterator_cache() -> UniquePtr<CxxIndex256IteratorCache>;
+        pub fn cache_table(
+            self: Pin<&mut CxxIndex256IteratorCache>,
+            table: &TableObject,
+        ) -> Result<i32>;
+        pub fn get_table(
+            self: &CxxIndex256IteratorCache,
+            table_id: &TableId,
+        ) -> Result<&TableObject>;
+        pub fn get_end_iterator_by_table_id(
+            self: &CxxIndex256IteratorCache,
+            table_id: &TableId,
+        ) -> Result<i32>;
+        pub fn find_table_by_end_iterator(
+            self: &CxxIndex256IteratorCache,
+            ei: i32,
+        ) -> Result<*const TableObject>;
+        pub fn get(self: &CxxIndex256IteratorCache, iterator: i32) -> Result<&Index256Object>;
+        pub fn remove(self: Pin<&mut CxxIndex256IteratorCache>, iterator: i32) -> Result<()>;
+        pub fn add(self: Pin<&mut CxxIndex256IteratorCache>, obj: &Index256Object) -> Result<i32>;
+
+        pub type CxxIndexDoubleIteratorCache;
+        pub fn new_index_double_iterator_cache() -> UniquePtr<CxxIndexDoubleIteratorCache>;
+        pub fn cache_table(
+            self: Pin<&mut CxxIndexDoubleIteratorCache>,
+            table: &TableObject,
+        ) -> Result<i32>;
+        pub fn get_table(
+            self: &CxxIndexDoubleIteratorCache,
+            table_id: &TableId,
+        ) -> Result<&TableObject>;
+        pub fn get_end_iterator_by_table_id(
+            self: &CxxIndexDoubleIteratorCache,
+            table_id: &TableId,
+        ) -> Result<i32>;
+        pub fn find_table_by_end_iterator(
+            self: &CxxIndexDoubleIteratorCache,
+            ei: i32,
+        ) -> Result<*const TableObject>;
+        pub fn get(self: &CxxIndexDoubleIteratorCache, iterator: i32)
+        -> Result<&IndexDoubleObject>;
+        pub fn remove(self: Pin<&mut CxxIndexDoubleIteratorCache>, iterator: i32) -> Result<()>;
+        pub fn add(
+            self: Pin<&mut CxxIndexDoubleIteratorCache>,
+            obj: &IndexDoubleObject,
+        ) -> Result<i32>;
+
+        pub type CxxIndexLongDoubleIteratorCache;
+        pub fn new_index_long_double_iterator_cache() -> UniquePtr<CxxIndexLongDoubleIteratorCache>;
+        pub fn cache_table(
+            self: Pin<&mut CxxIndexLongDoubleIteratorCache>,
+            table: &TableObject,
+        ) -> Result<i32>;
+        pub fn get_table(
+            self: &CxxIndexLongDoubleIteratorCache,
+            table_id: &TableId,
+        ) -> Result<&TableObject>;
+        pub fn get_end_iterator_by_table_id(
+            self: &CxxIndexLongDoubleIteratorCache,
+            table_id: &TableId,
+        ) -> Result<i32>;
+        pub fn find_table_by_end_iterator(
+            self: &CxxIndexLongDoubleIteratorCache,
+            ei: i32,
+        ) -> Result<*const TableObject>;
+        pub fn get(
+            self: &CxxIndexLongDoubleIteratorCache,
+            iterator: i32,
+        ) -> Result<&IndexLongDoubleObject>;
+        pub fn remove(self: Pin<&mut CxxIndexLongDoubleIteratorCache>, iterator: i32)
+        -> Result<()>;
+        pub fn add(
+            self: Pin<&mut CxxIndexLongDoubleIteratorCache>,
+            obj: &IndexLongDoubleObject,
+        ) -> Result<i32>;
 
         pub type CxxBlockTimestamp;
         pub fn to_time_point(self: &CxxBlockTimestamp) -> SharedPtr<CxxTimePoint>;

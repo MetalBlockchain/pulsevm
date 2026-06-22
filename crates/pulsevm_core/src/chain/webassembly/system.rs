@@ -22,22 +22,24 @@ pub fn eosio_assert(
             .as_ref()
             .expect("Wasm memory not initialized");
         let view = memory.view(&store);
-        let slice = msg_ptr.slice(&view, MAX_ASSERT_MESSAGE as u32)?;
-        let mut src_bytes = vec![0u8; MAX_ASSERT_MESSAGE];
-        slice.read_slice(&mut src_bytes)?;
-        let c_str = String::from_utf8(src_bytes);
 
-        match c_str {
-            Ok(msg_str) => {
-                return Err(RuntimeError::new(format!(
-                    "pulse assert failed: {}",
-                    msg_str
-                )));
-            }
-            Err(_) => {
-                return Err(RuntimeError::new("pulse assert failed"));
-            }
+        // Clamp the read window to what memory can actually provide, so a short
+        // message near the end of memory doesn't trap as an out-of-bounds slice.
+        let mem_len = view.data_size(); // u64, total linear-memory bytes
+        let start = msg_ptr.offset() as u64;
+        if start >= mem_len {
+            return Err(RuntimeError::new("eosio assert failed"));
         }
+        let max = MAX_ASSERT_MESSAGE.min((mem_len - start) as usize);
+
+        let mut buf = vec![0u8; max];
+        view.read(start, &mut buf)?;
+
+        // EOSIO treats msg as a NUL-terminated C string: stop at the first NUL.
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        let msg = String::from_utf8_lossy(&buf[..end]);
+
+        return Err(RuntimeError::new(format!("eosio assert failed: {}", msg)));
     }
 
     Ok(())

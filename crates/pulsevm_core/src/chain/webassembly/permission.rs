@@ -4,7 +4,10 @@ use pulsevm_ffi::{PermissionLevel, microseconds, seconds};
 use pulsevm_serialization::Read;
 use wasmer::{FunctionEnvMut, RuntimeError, WasmPtr};
 
-use crate::{authorization_manager::AuthorizationManager, chain::webassembly::context_aware_check, crypto::PublicKey, transaction::Transaction, wasm_runtime::WasmContext};
+use crate::{
+    authorization_manager::AuthorizationManager, chain::webassembly::context_aware_check,
+    crypto::PublicKey, transaction::Transaction, wasm_runtime::WasmContext,
+};
 
 pub fn check_transaction_authorization(
     mut env: FunctionEnvMut<WasmContext>,
@@ -83,9 +86,7 @@ pub fn check_permission_authorization(
     context_aware_check(&env)?;
     // EOS_ASSERT: delay must fit in an i64.
     if delay_us > i64::MAX as u64 {
-        return Err(RuntimeError::new(
-            "provided delay is too large",
-        ));
+        return Err(RuntimeError::new("provided delay is too large"));
     }
 
     let (env_data, store) = env.data_and_store_mut();
@@ -101,9 +102,8 @@ pub fn check_permission_authorization(
     if pubkeys_size > 0 {
         view.read(pubkeys_ptr.offset() as u64, &mut pubkeys_data)
             .map_err(|e| RuntimeError::new(format!("failed to read pubkeys: {}", e)))?;
-        provided_keys = BTreeSet::<PublicKey>::read(pubkeys_data.as_slice(), &mut 0).map_err(|e| {
-            RuntimeError::new(format!("failed to unpack pubkeys: {}", e))
-        })?;
+        provided_keys = BTreeSet::<PublicKey>::read(pubkeys_data.as_slice(), &mut 0)
+            .map_err(|e| RuntimeError::new(format!("failed to unpack pubkeys: {}", e)))?;
     }
 
     let mut provided_permissions: BTreeSet<PermissionLevel> = BTreeSet::new();
@@ -111,14 +111,20 @@ pub fn check_permission_authorization(
     if perms_size > 0 {
         view.read(perms_ptr.offset() as u64, &mut perms_data)
             .map_err(|e| RuntimeError::new(format!("failed to read perms: {}", e)))?;
-        provided_permissions = BTreeSet::<PermissionLevel>::read(perms_data.as_slice(), &mut 0).map_err(|e| {
-            RuntimeError::new(format!("failed to unpack perms: {}", e))
-        })?;
+        provided_permissions = BTreeSet::<PermissionLevel>::read(perms_data.as_slice(), &mut 0)
+            .map_err(|e| RuntimeError::new(format!("failed to unpack perms: {}", e)))?;
     }
 
     let permission = PermissionLevel::new(account, permission);
 
-    match AuthorizationManager::check_permission_authorization(env_data.db(), permission, &provided_keys, &provided_permissions, microseconds(delay_us as i64), false) {
+    match AuthorizationManager::check_permission_authorization(
+        env_data.db(),
+        permission,
+        &provided_keys,
+        &provided_permissions,
+        microseconds(delay_us as i64),
+        false,
+    ) {
         Ok(_) => Ok(1),
         Err(_) => Ok(0),
     }
@@ -145,5 +151,9 @@ pub fn get_account_creation_time(
     let env_data = env.data();
     let db = env_data.db();
     let account = db.get_account(account)?;
-    Ok(account.get_creation_date().to_time_point().time_since_epoch().count())
+    Ok(account
+        .get_creation_date()
+        .to_time_point()
+        .time_since_epoch()
+        .count())
 }

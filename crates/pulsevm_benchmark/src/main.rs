@@ -9,7 +9,18 @@ use std::{
 
 use chrono::Utc;
 use pulsevm_core::{
-    ACTIVE_NAME, ChainError, PULSE_NAME, abi::AbiDefinition, asset::{Asset, Symbol}, authority::{Authority, KeyWeight, PermissionLevel}, block::BlockStatus, controller::Controller, crypto::PrivateKey, id::Id, name::Name, pulse_contract::{NewAccount, SetAbi, SetCode}, time::TimePointSec, transaction::{Action, PackedTransaction, Transaction, TransactionHeader}
+    ACTIVE_NAME, ChainError, PULSE_NAME,
+    abi::AbiDefinition,
+    asset::{Asset, Symbol},
+    authority::{Authority, KeyWeight, PermissionLevel},
+    block::BlockStatus,
+    controller::Controller,
+    crypto::PrivateKey,
+    id::Id,
+    name::Name,
+    pulse_contract::{NewAccount, SetAbi, SetCode},
+    time::TimePointSec,
+    transaction::{Action, PackedTransaction, Transaction, TransactionHeader},
 };
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 use pulsevm_serialization::Write;
@@ -38,7 +49,6 @@ async fn main() {
             &genesis_bytes.to_vec(),
             temp_path.as_str(),
         )
-        .await
         .unwrap();
     let pending_block_timestamp = controller.last_accepted_block().timestamp().clone();
     let block_status = BlockStatus::Building;

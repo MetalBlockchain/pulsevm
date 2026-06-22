@@ -30,7 +30,7 @@ use std::{
 use tokio::{
     net::TcpListener as TokioTcpListener,
     signal::unix::{SignalKind, signal},
-    sync::{RwLock},
+    sync::RwLock,
 };
 use tokio_util::sync::CancellationToken;
 use tonic::transport::server::TcpIncoming;
@@ -200,7 +200,6 @@ impl Vm for VirtualMachine {
         // Initialize the controller with the genesis bytes
         controller
             .initialize(&chain_id, &config_bytes, &genesis_bytes, db_path.as_str())
-            .await
             .map_err(|e| Status::internal(format!("could not initialize controller: {}", e)))?;
 
         let network_manager = Arc::clone(&self.network_manager);

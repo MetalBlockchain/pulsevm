@@ -25,6 +25,8 @@ pub enum ChainError {
     NetworkError(String),
     #[error("wasm runtime error: {0}")]
     WasmRuntimeError(String),
+    #[error("apply error: {0}")]
+    ApplyError(String),
     #[error("database error: {0}")]
     DatabaseError(String),
     #[error("invalid argument: {0}")]

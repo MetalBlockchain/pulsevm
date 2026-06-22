@@ -7,7 +7,6 @@ use crate::wasm_runtime::WasmContext;
 pub fn prints(
     mut env: FunctionEnvMut<WasmContext>,
     msg_ptr: WasmPtr<u8>,
-    msg_len: u32,
 ) -> Result<(), RuntimeError> {
     Ok(())
 }
@@ -47,6 +46,11 @@ pub fn printsf(_env: FunctionEnvMut<WasmContext>, _val: f32) {
 
 #[inline]
 pub fn printdf(_env: FunctionEnvMut<WasmContext>, _val: f64) {
+    // No op
+}
+
+#[inline]
+pub fn printqf(_env: FunctionEnvMut<WasmContext>, _data_ptr: u32) {
     // No op
 }
 

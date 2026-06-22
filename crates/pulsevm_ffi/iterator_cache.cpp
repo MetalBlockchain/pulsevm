@@ -15,4 +15,16 @@ std::unique_ptr<CxxIndex128IteratorCache> new_index128_iterator_cache() {
     return std::make_unique<CxxIndex128IteratorCache>();
 }
 
+std::unique_ptr<CxxIndex256IteratorCache> new_index256_iterator_cache() {
+    return std::make_unique<CxxIndex256IteratorCache>();
+}
+
+std::unique_ptr<CxxIndexDoubleIteratorCache> new_index_double_iterator_cache() {
+    return std::make_unique<CxxIndexDoubleIteratorCache>();
+}
+
+std::unique_ptr<CxxIndexLongDoubleIteratorCache> new_index_long_double_iterator_cache() {
+    return std::make_unique<CxxIndexLongDoubleIteratorCache>();
+}
+
 }

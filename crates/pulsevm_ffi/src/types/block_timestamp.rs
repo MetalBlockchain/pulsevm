@@ -1,7 +1,10 @@
 use std::fmt;
 
 use pulsevm_serialization::{NumBytes, Read, ReadError, Write, WriteError};
-use serde::{Deserialize, Deserializer, Serialize, Serializer, de::{self, Visitor}};
+use serde::{
+    Deserialize, Deserializer, Serialize, Serializer,
+    de::{self, Visitor},
+};
 use time::{Duration, OffsetDateTime, PrimitiveDateTime, macros::format_description};
 
 use crate::{CxxTimePoint, TimePoint, bridge::ffi::BlockTimestamp};
@@ -12,22 +15,16 @@ impl BlockTimestamp {
 
     #[inline]
     pub fn new(slot: u32) -> Self {
-        Self {
-            slot,
-        }
+        Self { slot }
     }
 
     #[inline]
     pub fn maximum() -> Self {
-        Self {
-            slot: 0xFFFF,
-        }
+        Self { slot: 0xFFFF }
     }
     #[inline]
     pub fn min() -> Self {
-        Self {
-            slot: 0,
-        }
+        Self { slot: 0 }
     }
 
     pub fn to_time_point(&self) -> TimePoint {

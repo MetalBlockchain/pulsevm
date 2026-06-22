@@ -100,10 +100,7 @@ pub fn signing_digest(
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::{BTreeSet},
-        str::FromStr,
-    };
+    use std::{collections::BTreeSet, str::FromStr};
 
     use pulsevm_ffi::TimePointSec;
 

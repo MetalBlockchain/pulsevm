@@ -1,12 +1,18 @@
-use std::{
-    collections::{BTreeSet},
-    str::FromStr,
-    sync::Arc,
-};
+use std::{collections::BTreeSet, str::FromStr, sync::Arc};
 
 use jsonrpsee::{proc_macros::rpc, types::ErrorObjectOwned};
 use pulsevm_core::{
-    abi::AbiDefinition, authorization_manager::AuthorizationManager, block::{BlockTimestamp, SignedBlock}, controller::Controller, crypto::{PublicKey, Signature}, id::Id, mempool::Mempool, name::Name, time::{TimePoint, seconds}, transaction::{PackedTransaction, Transaction, TransactionCompression}, utils::{Base64Bytes, I32Flex}
+    abi::AbiDefinition,
+    authorization_manager::AuthorizationManager,
+    block::{BlockTimestamp, SignedBlock},
+    controller::Controller,
+    crypto::{PublicKey, Signature},
+    id::Id,
+    mempool::Mempool,
+    name::Name,
+    time::{TimePoint, seconds},
+    transaction::{PackedTransaction, Transaction, TransactionCompression},
+    utils::{Base64Bytes, I32Flex},
 };
 use pulsevm_crypto::{Bytes, Digest};
 use pulsevm_serialization::Read;
@@ -405,8 +411,12 @@ impl RpcServer for RpcService {
         let controller = self.controller.read().await;
         let mut db = controller.database();
 
-        let required_keys =
-            AuthorizationManager::get_required_keys(&mut db, &trx, &candidate_keys, seconds(trx.header.delay_sec.into()))?;
+        let required_keys = AuthorizationManager::get_required_keys(
+            &mut db,
+            &trx,
+            &candidate_keys,
+            seconds(trx.header.delay_sec.into()),
+        )?;
 
         Ok(required_keys)
     }
