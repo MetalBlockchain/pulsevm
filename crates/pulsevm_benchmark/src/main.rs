@@ -397,7 +397,7 @@ fn get_temp_dir() -> PathBuf {
     res
 }
 
-fn generate_genesis(private_key: &PrivateKey) -> Vec<u8> {
+fn generate_genesis(_private_key: &PrivateKey) -> Vec<u8> {
     let genesis = json!(
     {
         "initial_timestamp": "2023-01-01T00:00:00",

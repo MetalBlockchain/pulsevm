@@ -1,9 +1,6 @@
 use std::{sync::Arc, time::Duration};
 
-use pulsevm_core::{
-    controller::{self, Controller},
-    mempool::Mempool,
-};
+use pulsevm_core::mempool::Mempool;
 use tokio::{
     sync::{Notify, RwLock},
     task::JoinHandle,

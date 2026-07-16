@@ -259,6 +259,7 @@ pub mod ffi {
         pub fn get_payer(self: &IndexLongDoubleObject) -> &CxxName;
 
         // Methods on database
+        #[allow(dead_code)]
         pub fn flush(self: Pin<&mut Database>) -> Result<()>;
         pub fn undo(self: Pin<&mut Database>) -> Result<()>;
         pub fn commit(self: Pin<&mut Database>, revision: i64) -> Result<()>;
@@ -1130,9 +1131,12 @@ pub mod ffi {
         pub fn make_shared_digest_from_existing_hash(data: &[u8]) -> SharedPtr<CxxDigest>;
         pub fn make_shared_digest_from_string(key_str: &str) -> SharedPtr<CxxDigest>;
         pub fn make_time_point_from_now() -> SharedPtr<CxxTimePoint>;
+        #[allow(dead_code)]
         pub fn make_block_timestamp_from_now() -> SharedPtr<CxxBlockTimestamp>;
+        #[allow(dead_code)]
         pub fn make_block_timestamp_from_slot(slot: u32) -> SharedPtr<CxxBlockTimestamp>;
         pub fn make_time_point_from_i64(us: i64) -> SharedPtr<CxxTimePoint>;
+        #[allow(dead_code)]
         pub fn make_time_point_from_microseconds(us: &CxxMicroseconds) -> SharedPtr<CxxTimePoint>;
         pub fn parse_genesis_state(json: &str) -> Result<UniquePtr<CxxGenesisState>>;
         pub fn parse_public_key(key_str: &str) -> Result<SharedPtr<CxxPublicKey>>;
@@ -1166,6 +1170,7 @@ pub mod ffi {
         pub fn random_private_key() -> SharedPtr<CxxPrivateKey>;
         pub fn random_private_key_r1() -> SharedPtr<CxxPrivateKey>;
         pub fn extract_chain_id_from_genesis_state(genesis: &CxxGenesisState) -> Vec<u8>;
+        #[allow(dead_code)]
         pub fn index128_object_secondary_key_as_u128(obj: &Index128Object) -> U128;
 
         pub type CxxName;
@@ -1173,6 +1178,7 @@ pub mod ffi {
         // Name methods
         pub fn u64_to_name(val: u64) -> UniquePtr<CxxName>;
         pub fn string_to_name(str: &str) -> Result<UniquePtr<CxxName>>;
+        #[allow(dead_code)]
         pub fn name_to_uint64(name: &CxxName) -> u64;
         pub fn to_uint64_t(self: &CxxName) -> u64;
         pub fn empty(self: &CxxName) -> bool;

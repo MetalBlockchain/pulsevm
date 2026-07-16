@@ -1,15 +1,11 @@
 use pulsevm_api_types::{AccountResponse, ChainInfoResponse, IssueTxResponse};
 use pulsevm_core::{
-    crypto::Signature,
     name::Name,
-    transaction::{PackedTransaction, Transaction, TransactionCompression},
+    transaction::{PackedTransaction, Transaction},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{
-    collections::HashSet,
-    sync::atomic::{AtomicU64, Ordering},
-};
+use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 
 // ---------------------------------------------------------------------------
@@ -28,7 +24,9 @@ pub struct JsonRpcError {
 /// Full JSON-RPC response envelope.
 #[derive(Debug, Deserialize)]
 struct JsonRpcResponse {
+    #[allow(dead_code)]
     pub jsonrpc: String,
+    #[allow(dead_code)]
     pub id: u64,
     #[serde(default)]
     pub result: Option<Value>,

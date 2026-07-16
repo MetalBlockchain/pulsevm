@@ -113,6 +113,7 @@ impl Transport {
     }
 
     /// Send a GET request and return the raw response bytes.
+    #[allow(dead_code)]
     async fn get(&self, path: &str) -> Result<(u16, Vec<u8>), ClientError> {
         match self {
             Transport::Tcp { base_url, client } => {
@@ -273,6 +274,7 @@ impl KeosdClient {
     }
 
     /// POST with no body (empty JSON object).
+    #[allow(dead_code)]
     async fn post_empty<T: serde::de::DeserializeOwned>(
         &self,
         path: &str,
@@ -281,6 +283,7 @@ impl KeosdClient {
     }
 
     /// GET request, parse the response.
+    #[allow(dead_code)]
     async fn get_request<T: serde::de::DeserializeOwned>(
         &self,
         path: &str,

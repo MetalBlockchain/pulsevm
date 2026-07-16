@@ -29,8 +29,8 @@ impl StateHistoryServer {
         let listener = TokioTcpListener::bind(bind).await?;
         spdlog::info!("WebSocket listening on {}", bind);
 
-        // Limit concurrent connections
-        let permits = Arc::new(Semaphore::new(1024));
+        // TODO: Limit concurrent connections
+        let _permits = Arc::new(Semaphore::new(1024));
 
         loop {
             tokio::select! {

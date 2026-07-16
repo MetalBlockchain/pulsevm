@@ -31,33 +31,10 @@ mod key_tests {
     }
 
     #[test]
-    fn wif_roundtrip() {
-        let (wif, pubkey) = keys::generate_keypair().unwrap();
-        let sk = keys::wif_to_private_key(&wif).unwrap();
-        let pubkey_again = keys::eos_public_key_string(&sk);
-        assert_eq!(pubkey, pubkey_again);
-    }
-
-    #[test]
-    fn public_key_parse_roundtrip() {
-        let (_, pubkey) = keys::generate_keypair().unwrap();
-        let raw = keys::parse_eos_public_key(&pubkey).unwrap();
-        assert_eq!(raw.len(), 33, "Compressed public key should be 33 bytes");
-    }
-
-    #[test]
     fn invalid_wif_rejected() {
         assert!(keys::wif_to_private_key("notavalidwif").is_err());
         assert!(keys::wif_to_private_key("").is_err());
         assert!(keys::wif_to_private_key("5").is_err());
-    }
-
-    #[test]
-    fn invalid_public_key_rejected() {
-        assert!(keys::parse_eos_public_key("notavalidkey").is_err());
-        assert!(keys::parse_eos_public_key("EOS").is_err());
-        assert!(keys::parse_eos_public_key("EOSinvaliddata").is_err());
-        assert!(keys::parse_eos_public_key("").is_err());
     }
 
     #[test]

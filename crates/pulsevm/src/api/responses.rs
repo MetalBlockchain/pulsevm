@@ -1,67 +1,6 @@
-use pulsevm_core::{
-    asset::Asset, authority::Authority, block::BlockTimestamp, id::Id, name::Name,
-    resource::AccountResourceLimit, utils::Base64Bytes,
-};
+use pulsevm_core::{block::BlockTimestamp, id::Id, name::Name, utils::Base64Bytes};
 use pulsevm_crypto::Digest;
 use serde::Serialize;
-
-#[derive(Serialize, Clone)]
-pub struct PermissionResponse {
-    perm_name: Name,
-    parent: Name,
-    required_auth: Authority,
-}
-
-impl PermissionResponse {
-    pub fn new(perm_name: Name, parent: Name, required_auth: Authority) -> Self {
-        PermissionResponse {
-            perm_name,
-            parent,
-            required_auth,
-        }
-    }
-}
-
-#[derive(Serialize, Clone, Default)]
-pub struct AccountTotalResources {
-    owner: Name,
-    net_weight: Asset,
-    cpu_weight: Asset,
-    ram_bytes: u32,
-}
-
-#[derive(Serialize, Clone, Default)]
-pub struct AccountVoterInfo {
-    pub owner: Name,
-    pub proxy: Name,
-    pub producers: Vec<Name>,
-    pub staked: u32,
-    pub last_vote_weight: String,
-    pub proxied_vote_weight: String,
-    pub is_proxy: u8,
-    pub flags1: u8,
-    pub reserved2: u8,
-    pub reserved3: u8,
-}
-
-#[derive(Serialize, Clone, Default)]
-pub struct GetAccountResponse {
-    pub account_name: Name,
-    pub head_block_num: u32,
-    pub head_block_time: BlockTimestamp,
-    pub privileged: bool,
-    pub last_code_update: BlockTimestamp,
-    pub created: BlockTimestamp,
-    pub ram_quota: i64,
-    pub net_weight: i64,
-    pub cpu_weight: i64,
-    pub net_limit: AccountResourceLimit,
-    pub cpu_limit: AccountResourceLimit,
-    pub ram_usage: i64,
-    pub permissions: Vec<PermissionResponse>,
-    pub total_resources: AccountTotalResources,
-    pub voter_info: AccountVoterInfo,
-}
 
 #[derive(Serialize, Clone, Default)]
 pub struct GetInfoResponse {
@@ -92,13 +31,6 @@ pub struct GetInfoResponse {
 pub struct IssueTxResponse {
     #[serde(rename(serialize = "txID"))]
     pub tx_id: Id,
-}
-
-#[derive(Serialize, Clone, Default)]
-pub struct GetTableRowsResponse {
-    pub rows: Vec<serde_json::Value>,
-    pub more: bool,
-    pub next_key: String,
 }
 
 #[derive(Serialize, Clone, Default)]

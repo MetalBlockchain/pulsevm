@@ -7,7 +7,6 @@ use lru::LruCache;
 use pulsevm_crypto::Bytes;
 use pulsevm_error::ChainError;
 use pulsevm_ffi::{BlockTimestamp, CxxDigest, Database};
-use spdlog::{debug, info};
 use wasmer::{
     Engine, Function, FunctionEnv, Instance, Memory, Module, Store, imports, sys::CompilerConfig,
     wasmparser::Operator,

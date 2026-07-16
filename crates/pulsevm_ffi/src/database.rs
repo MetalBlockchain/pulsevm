@@ -1,7 +1,4 @@
-use std::{
-    collections::HashSet,
-    sync::{Arc, RwLock},
-};
+use std::sync::{Arc, RwLock};
 
 use cxx::UniquePtr;
 use pulsevm_error::ChainError;
@@ -11,12 +8,11 @@ use crate::{
     AccountMetadataObject, ChainConfigV0, Float128, Index64IteratorCache, Index128IteratorCache,
     IndexDoubleIteratorCache, IndexLongDoubleIteratorCache, IndexLongDoubleObject, KeyValueObject,
     bridge::ffi::{
-        self, Authority, CxxDigest, CxxGenesisState, CxxIndex256IteratorCache, CxxTimePoint,
-        ElasticLimitParameters, Index64Object, Index128Object, Index256Object, IndexDoubleObject,
-        TableObject, TimePoint, U128, U256, get_account_info_with_core_symbol,
-        get_account_info_without_core_symbol, get_currency_balance_with_symbol,
-        get_currency_balance_without_symbol, get_currency_stats, get_table_by_scope,
-        get_table_rows,
+        self, Authority, CxxDigest, CxxGenesisState, ElasticLimitParameters, Index64Object,
+        Index128Object, Index256Object, IndexDoubleObject, TableObject, TimePoint, U128, U256,
+        get_account_info_with_core_symbol, get_account_info_without_core_symbol,
+        get_currency_balance_with_symbol, get_currency_balance_without_symbol, get_currency_stats,
+        get_table_by_scope, get_table_rows,
     },
     iterator_cache::{Index256IteratorCache, KeyValueIteratorCache},
 };
@@ -489,7 +485,7 @@ impl Database {
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
 
-        unsafe { pinned.db_find_i64(code, scope, table, id, keyval_cache.pin_mut()) }
+        { pinned.db_find_i64(code, scope, table, id, keyval_cache.pin_mut()) }
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 
@@ -2028,7 +2024,7 @@ mod tests {
         let name = string_to_name("test").unwrap();
         db.add_indices().unwrap();
         let mut session = db.create_undo_session(true).unwrap();
-        let account = db.create_account(name.to_uint64_t(), 0).unwrap();
+        let _account = db.create_account(name.to_uint64_t(), 0).unwrap();
         session.pin_mut().push().unwrap();
         let deltas = db.pack_deltas(false).unwrap();
         let hex_deltas = hex::encode(deltas);

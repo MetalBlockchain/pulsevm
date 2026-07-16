@@ -1,9 +1,9 @@
-use std::{iter::chain, sync::Mutex};
+use std::sync::Mutex;
 
 use actix_web::{HttpResponse, get, post, web};
 use pulsevm_core::{id::Id, transaction::Transaction};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::Map;
 use spdlog::info;
 
 use crate::manager::{ManagerError, WalletManager};
@@ -149,9 +149,11 @@ struct RemoveKeyRequest(String, String, String); // [name, password, public_key]
 struct ListKeysRequest(String, String); // [name, password]
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct CreateKeyRequest(String, String); // [name, key_type] (key_type ignored, always K1)
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct SignDigestRequest {
     digest: String,
     public_key: String,

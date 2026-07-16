@@ -3,7 +3,7 @@ mod auth_tests {
     use anyhow::Result;
     use pulsevm_core::{
         ACTIVE_NAME, ChainError, OWNER_NAME, PULSE_NAME,
-        authority::{self, Authority, PermissionLevel, PermissionLevelWeight},
+        authority::{Authority, PermissionLevel, PermissionLevelWeight},
         authorization_manager::AuthorizationManager,
         crypto::PublicKey,
         name::Name,

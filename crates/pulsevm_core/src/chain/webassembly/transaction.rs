@@ -1,20 +1,10 @@
-use std::collections::{BTreeSet, HashSet};
-
 use pulsevm_error::ChainError;
 use pulsevm_serialization::{NumBytes, Read, Write};
 use wasmer::{FunctionEnvMut, RuntimeError, WasmPtr};
 
-use crate::{
-    authorization_manager::AuthorizationManager,
-    chain::{
-        authority::PermissionLevel,
-        controller::Controller,
-        transaction::{Action, Transaction},
-        utils::pulse_assert,
-        wasm_runtime::WasmContext,
-        webassembly::context_aware_check,
-    },
-    crypto::PublicKey,
+use crate::chain::{
+    controller::Controller, transaction::Action, utils::pulse_assert, wasm_runtime::WasmContext,
+    webassembly::context_aware_check,
 };
 
 pub fn send_inline(

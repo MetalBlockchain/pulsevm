@@ -217,6 +217,7 @@ fn to_pretty_net(nbytes: i64, width_for_units: usize) -> String {
     }
 }
 
+#[allow(dead_code)]
 fn to_pretty_time(nmicro: i64, width_for_units: usize) -> String {
     if nmicro == -1 {
         return "unlimited".to_string();

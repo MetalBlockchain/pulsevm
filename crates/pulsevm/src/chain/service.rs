@@ -4,7 +4,7 @@ use jsonrpsee::{proc_macros::rpc, types::ErrorObjectOwned};
 use pulsevm_core::{
     abi::AbiDefinition,
     authorization_manager::AuthorizationManager,
-    block::{BlockTimestamp, SignedBlock},
+    block::SignedBlock,
     controller::Controller,
     crypto::{PublicKey, Signature},
     id::Id,

@@ -281,7 +281,7 @@ impl TransactionContext {
         action_ordinal: u32,
         recurse_depth: u32,
     ) -> Result<(), ChainError> {
-        let (action, receiver, context_free) = self.with_action_trace(action_ordinal, |t| {
+        let (action, receiver, _) = self.with_action_trace(action_ordinal, |t| {
             (t.action().clone(), t.receiver().clone(), t.context_free())
         })?;
 
@@ -294,7 +294,6 @@ impl TransactionContext {
             action_ordinal,
             recurse_depth,
             self.get_cpu_limit()?,
-            context_free,
         )?;
 
         // Initialize the apply context with the action trace.

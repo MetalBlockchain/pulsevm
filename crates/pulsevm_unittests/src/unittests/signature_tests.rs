@@ -2,7 +2,7 @@
 mod private_key_tests {
     use std::str::FromStr;
 
-    use pulsevm_core::crypto::{PrivateKey, PublicKey, Signature};
+    use pulsevm_core::crypto::Signature;
 
     #[test]
     fn test_signature_parsing() {

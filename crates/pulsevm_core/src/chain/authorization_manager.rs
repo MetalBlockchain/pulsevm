@@ -1,9 +1,7 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
 
 use pulsevm_error::ChainError;
-use pulsevm_ffi::{
-    Authority, CxxTimePoint, Database, Microseconds, PermissionObject, TimePoint, seconds,
-};
+use pulsevm_ffi::{Authority, Database, Microseconds, PermissionObject, TimePoint, seconds};
 
 use crate::{
     PULSE_NAME,
@@ -148,7 +146,7 @@ impl AuthorizationManager {
             chain_config.get_max_authority_depth(),
             provided_keys,
             provided_permissions,
-            if (provided_delay >= delay_max_limit) {
+            if provided_delay >= delay_max_limit {
                 Microseconds::maximum()
             } else {
                 provided_delay

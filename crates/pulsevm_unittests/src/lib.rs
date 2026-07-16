@@ -3,14 +3,7 @@ mod unittests;
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::{BTreeSet, HashSet},
-        fs,
-        path::Path,
-        str::FromStr,
-        sync::Arc,
-        u32, vec,
-    };
+    use std::{collections::BTreeSet, fs, path::Path, str::FromStr, sync::Arc, u32, vec};
 
     use pulsevm_core::{
         ACTIVE_NAME, CODE_NAME, ChainError, Database, OWNER_NAME, PULSE_NAME,

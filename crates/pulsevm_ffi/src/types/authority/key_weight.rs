@@ -1,6 +1,6 @@
 use std::fmt;
 
-use cxx::{SharedPtr, UniquePtr};
+use cxx::SharedPtr;
 use pulsevm_billable_size::BillableSize;
 use pulsevm_crypto::FixedBytes;
 use pulsevm_serialization::{NumBytes, Read, Write, WriteError};

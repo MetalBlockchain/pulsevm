@@ -1,8 +1,7 @@
 use core::fmt;
 use std::{
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
-    str::FromStr,
-    sync::{Arc, LazyLock},
+    sync::LazyLock,
 };
 
 use crate::{
@@ -41,12 +40,11 @@ use pulsevm_crypto::{Digest, merkle};
 use pulsevm_error::ChainError;
 use pulsevm_ffi::{
     BlockTimestamp, CxxGenesisState, Database, ElasticLimitParameters, GlobalPropertyObject,
-    Microseconds, TimePoint, seconds,
+    TimePoint, seconds,
 };
 use pulsevm_grpc::vm;
 use pulsevm_serialization::{Read, Write};
 use spdlog::{debug, error, info, warn};
-use tokio::sync::RwLock as AsyncRwLock;
 
 pub type ApplyHandlerFn = fn(&mut ApplyContext, &mut Database, &Action) -> Result<(), ChainError>;
 pub type ApplyHandlerMap = HashMap<
@@ -149,17 +147,21 @@ impl Controller {
             .map_err(|e| ChainError::ParseError(format!("failed to parse genesis: {}", e)))?;
         // TODO: Validate genesis state
         self.chain_id = chain_id.clone();
-        self.block_log =
-            Some(StateHistoryLog::open(&db_path, "block_log").map_err(|e| {
+        self.block_log = Some(
+            StateHistoryLog::open_with_magic(&db_path, "block_log", 0).map_err(|e| {
                 ChainError::InternalError(format!("failed to open block log: {}", e))
-            })?);
-        self.trace_log =
-            Some(StateHistoryLog::open(&db_path, "trace_log").map_err(|e| {
+            })?,
+        );
+        self.trace_log = Some(
+            StateHistoryLog::open_with_magic(&db_path, "trace_log", 0).map_err(|e| {
                 ChainError::InternalError(format!("failed to open trace log: {}", e))
-            })?);
-        self.chain_state_log = Some(StateHistoryLog::open(&db_path, "chain_state_log").map_err(
-            |e| ChainError::InternalError(format!("failed to open chain state log: {}", e)),
-        )?);
+            })?,
+        );
+        self.chain_state_log = Some(
+            StateHistoryLog::open_with_magic(&db_path, "chain_state_log", 0).map_err(|e| {
+                ChainError::InternalError(format!("failed to open chain state log: {}", e))
+            })?,
+        );
 
         // Set our last accepted block to the genesis block
         self.last_accepted_block = SignedBlock::new(
@@ -872,14 +874,14 @@ impl Controller {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path, str::FromStr, vec};
+    use std::{fs, path::Path, str::FromStr, sync::Arc, vec};
 
     use pulsevm_ffi::{Authority, KeyWeight, TimePointSec};
     use pulsevm_proc_macros::{NumBytes, Read, Write};
     use pulsevm_serialization::Write;
     use serde_json::json;
     use tempfile::TempDir;
-    use tokio::runtime;
+    use tokio::{runtime, sync::RwLock};
 
     use crate::{
         ACTIVE_NAME,
@@ -1745,7 +1747,7 @@ mod tests {
                 .unwrap();
         let private_key =
             PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
-        let mempool = Arc::new(AsyncRwLock::new(Mempool::new()));
+        let mempool = Arc::new(RwLock::new(Mempool::new()));
         let mut mempool = mempool.write().await;
         let mut controller = Controller::new();
         let genesis_bytes = generate_genesis(&private_key);

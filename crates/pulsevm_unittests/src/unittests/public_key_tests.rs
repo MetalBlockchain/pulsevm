@@ -2,7 +2,7 @@
 mod private_key_tests {
     use std::str::FromStr;
 
-    use pulsevm_core::crypto::{PrivateKey, PublicKey};
+    use pulsevm_core::crypto::PublicKey;
 
     #[test]
     fn test_public_key_parsing() {

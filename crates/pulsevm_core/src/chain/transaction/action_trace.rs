@@ -1,5 +1,5 @@
 use core::fmt;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use pulsevm_ffi::BlockTimestamp;
 use pulsevm_proc_macros::{NumBytes, Read, Write};

@@ -74,6 +74,7 @@ impl Gossipable {
 }
 
 pub struct ConnectedNode {
+    #[allow(dead_code)]
     pub id: NodeId,
 }
 

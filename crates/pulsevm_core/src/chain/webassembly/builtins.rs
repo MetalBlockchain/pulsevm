@@ -438,7 +438,7 @@ pub fn __extenddftf2(
 }
 
 pub fn __trunctfdf2(
-    env: FunctionEnvMut<WasmContext>,
+    _env: FunctionEnvMut<WasmContext>,
     la: u64,
     ha: u64,
 ) -> Result<f64, RuntimeError> {
@@ -446,7 +446,7 @@ pub fn __trunctfdf2(
 }
 
 pub fn __trunctfsf2(
-    env: FunctionEnvMut<WasmContext>,
+    _env: FunctionEnvMut<WasmContext>,
     la: u64,
     ha: u64,
 ) -> Result<f32, RuntimeError> {

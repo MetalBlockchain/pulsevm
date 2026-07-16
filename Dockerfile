@@ -37,6 +37,6 @@ ENV CXX=/usr/bin/g++-13
 ENV CC=/usr/bin/gcc-13
 ENV BOOST_LIB=/usr/lib/x86_64-linux-gnu
 ENV ZLIB_ROOT=/usr/lib/x86_64-linux-gnu
-ENV LLVM_SYS_180_PREFIX=/usr/lib/llvm-18
+ENV LLVM_SYS_221_PREFIX=/usr/lib/llvm-22
 
 RUN cargo build --release

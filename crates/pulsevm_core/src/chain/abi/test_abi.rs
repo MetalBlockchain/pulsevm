@@ -1,3 +1,4 @@
+#[allow(dead_code)]
 pub const PULSE_ABI: &str = r#"
 {
     "____comment": "This file was generated with eosio-abigen. DO NOT EDIT ",

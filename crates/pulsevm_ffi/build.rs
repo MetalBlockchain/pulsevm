@@ -126,7 +126,7 @@ fn main() {
 
     // Statically link to Boost and zlib
     println!("cargo:rustc-link-search=native={}", boost_lib.display());
-    println!("cargo:rustc-link-lib=static=boost_system");
+    //println!("cargo:rustc-link-lib=static=boost_system");
     println!("cargo:rustc-link-lib=static=boost_iostreams");
     println!("cargo:rustc-link-lib=static=boost_chrono");
     println!("cargo:rustc-link-search=native={}", zlib_root.display());

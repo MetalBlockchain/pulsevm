@@ -23,9 +23,9 @@ tempfile = "3.23.0"
 thiserror = "2"
 time = { version = "0.3.41", features = ["formatting", "macros", "parsing"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
-wasmer = { version = "7.0.1", features = ["llvm"] }
-wasmer-compiler-llvm = "7.0.1"
-wasmer-middlewares = "7.0.1"
+wasmer = { version = "7.2.0", features = ["llvm"] }
+wasmer-compiler-llvm = "7.2.0"
+wasmer-middlewares = "7.2.0"
 wat = "1"
 
 pulsevm_billable_size = { path = "../pulsevm_billable_size" }

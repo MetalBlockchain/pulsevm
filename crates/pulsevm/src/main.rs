@@ -6,7 +6,7 @@ use pulsevm_core::{
     config::{PLUGIN_VERSION, VERSION},
     controller::Controller,
     id::{Id, NodeId},
-    mempool::{self, Mempool},
+    mempool::Mempool,
     transaction::PackedTransaction,
 };
 use pulsevm_grpc::{
@@ -748,7 +748,7 @@ impl Vm for VirtualMachine {
                     err: vm::Error::NotFound as i32,
                 }));
             }
-            Err(e) => {
+            Err(_) => {
                 warn!("block not found at height: {}", request.get_ref().height);
 
                 return Ok(Response::new(vm::GetBlockIdAtHeightResponse {

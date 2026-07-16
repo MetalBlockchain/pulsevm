@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{Arc, RwLock},
     u64,
 };
@@ -12,10 +12,9 @@ use pulsevm_ffi::{
     AccountMetadataObject, BlockTimestamp, ChainConfigV0, Database, Float128, Index64IteratorCache,
     Index64Object, Index128IteratorCache, Index128Object, Index256IteratorCache, Index256Object,
     IndexDoubleIteratorCache, IndexDoubleObject, IndexLongDoubleIteratorCache,
-    IndexLongDoubleObject, KeyValueIteratorCache, KeyValueObject, Microseconds, TableObject,
-    TimePoint, U256,
+    IndexLongDoubleObject, KeyValueIteratorCache, KeyValueObject, Microseconds, TableObject, U256,
 };
-use pulsevm_serialization::{NumBytes, Write};
+use pulsevm_serialization::Write;
 
 use crate::{
     CODE_NAME,
@@ -61,7 +60,6 @@ pub struct ApplyContext {
     first_receiver_action_ordinal: u32,
     action_ordinal: u32,
     pending_block_timestamp: BlockTimestamp, // Timestamp for the pending block
-    context_free: bool,                      // Whether the current action is context-free
 
     inner: Arc<RwLock<ApplyContextInner>>,
 }
@@ -76,7 +74,6 @@ impl ApplyContext {
         action_ordinal: u32,
         depth: u32,
         cpu_limit: i64,
-        context_free: bool,
     ) -> Result<Self, ChainError> {
         let pending_block_timestamp = trx_context.pending_block_timestamp()?;
 
@@ -89,7 +86,6 @@ impl ApplyContext {
             first_receiver_action_ordinal: 0,
             action_ordinal,
             pending_block_timestamp,
-            context_free,
 
             inner: Arc::new(RwLock::new(ApplyContextInner {
                 action,

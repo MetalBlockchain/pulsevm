@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 
 use pulsevm_error::ChainError;
 use pulsevm_ffi::{Database, Microseconds};

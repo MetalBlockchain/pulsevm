@@ -707,7 +707,7 @@ pub fn db_idx256_store(
     payer: u64,
     id: u64,
     secondary_ptr: WasmPtr<u8>,
-    secondary_len: u32,
+    _secondary_len: u32,
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, store) = env.data_and_store_mut();
@@ -727,7 +727,7 @@ pub fn db_idx256_update(
     itr: i32,
     payer: u64,
     secondary_ptr: WasmPtr<u8>,
-    secondary_len: u32,
+    _secondary_len: u32,
 ) -> Result<(), RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, store) = env.data_and_store_mut();
@@ -759,7 +759,7 @@ pub fn db_idx256_find_secondary(
     scope: u64,
     table: u64,
     secondary_ptr: WasmPtr<u8>,
-    secondary_len: u32,
+    _secondary_len: u32,
     primary_ptr: WasmPtr<u64>,
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
@@ -799,7 +799,7 @@ pub fn db_idx256_find_primary(
     scope: u64,
     table: u64,
     secondary_ptr: WasmPtr<u8>,
-    secondary_len: u32,
+    _secondary_len: u32,
     primary: u64,
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
@@ -836,7 +836,7 @@ pub fn db_idx256_lowerbound(
     scope: u64,
     table: u64,
     secondary_ptr: WasmPtr<u8>,
-    secondary_len: u32,
+    _secondary_len: u32,
     primary_ptr: WasmPtr<u64>,
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
@@ -877,7 +877,7 @@ pub fn db_idx256_upperbound(
     scope: u64,
     table: u64,
     secondary_ptr: WasmPtr<u8>,
-    secondary_len: u32,
+    _secondary_len: u32,
     primary_ptr: WasmPtr<u64>,
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;

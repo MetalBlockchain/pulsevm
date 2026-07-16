@@ -27,6 +27,7 @@ pub enum KeyError {
 // ---------------------------------------------------------------------------
 
 /// Encode raw bytes to base58check (Bitcoin-style with double-SHA256 checksum).
+#[allow(dead_code)]
 fn base58check_encode(version: u8, payload: &[u8]) -> String {
     let mut data = vec![version];
     data.extend_from_slice(payload);
@@ -36,6 +37,7 @@ fn base58check_encode(version: u8, payload: &[u8]) -> String {
 }
 
 /// Decode base58check, returning (version_byte, payload).
+#[allow(dead_code)]
 fn base58check_decode(s: &str) -> Result<(u8, Vec<u8>), KeyError> {
     let data = bs58::decode(s)
         .into_vec()
@@ -51,6 +53,7 @@ fn base58check_decode(s: &str) -> Result<(u8, Vec<u8>), KeyError> {
     Ok((payload[0], payload[1..].to_vec()))
 }
 
+#[allow(dead_code)]
 fn double_sha256(data: &[u8]) -> Vec<u8> {
     let first = Sha256::digest(data);
     Sha256::digest(&first).to_vec()
@@ -186,18 +189,21 @@ pub fn parse_public_key(s: &str) -> Result<Vec<u8>, KeyError> {
 
 /// Deprecated: use [`pub_k1_string`] instead.
 #[deprecated(note = "Use pub_k1_string() for PUB_K1_ format")]
+#[allow(dead_code)]
 pub fn eos_public_key_string(signing_key: &SigningKey) -> String {
     pub_k1_string(signing_key)
 }
 
 /// Deprecated: use [`parse_public_key`] instead.
 #[deprecated(note = "Use parse_public_key() which accepts both PUB_K1_ and EOS formats")]
+#[allow(dead_code)]
 pub fn parse_eos_public_key(s: &str) -> Result<Vec<u8>, KeyError> {
     parse_public_key(s)
 }
 
 /// Deprecated: use [`verifying_key_to_pub_k1_string`] instead.
 #[deprecated(note = "Use verifying_key_to_pub_k1_string() for PUB_K1_ format")]
+#[allow(dead_code)]
 pub fn verifying_key_to_eos_string(vk: &VerifyingKey) -> String {
     verifying_key_to_pub_k1_string(vk)
 }
