@@ -1,5 +1,5 @@
 use chrono::Utc;
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use pulsevm_core::{
     ACTIVE_NAME, ChainError, PULSE_NAME,
     abi::AbiDefinition,
@@ -11,15 +11,13 @@ use pulsevm_core::{
     pulse_contract::{NewAccount, SetCode},
     transaction::{Action, PackedTransaction, Transaction, TransactionHeader},
 };
-use pulsevm_ffi::{Authority, Database, KeyWeight, PermissionLevel, string_to_name};
+use pulsevm_ffi::{Authority, KeyWeight, PermissionLevel, TimePointSec};
 use pulsevm_name::Name;
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 use pulsevm_serialization::Write;
-use pulsevm_time::TimePointSec;
 use serde_json::json;
 use std::{
     fs,
-    hint::black_box,
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,

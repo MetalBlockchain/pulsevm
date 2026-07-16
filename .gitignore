@@ -1,4 +1,4 @@
-build/
+./build/
 tmpnet/
 
 # Added by cargo

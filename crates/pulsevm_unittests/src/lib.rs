@@ -3,7 +3,14 @@ mod unittests;
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, fs, path::Path, str::FromStr, sync::Arc, u32, vec};
+    use std::{
+        collections::{BTreeSet, HashSet},
+        fs,
+        path::Path,
+        str::FromStr,
+        sync::Arc,
+        u32, vec,
+    };
 
     use pulsevm_core::{
         ACTIVE_NAME, CODE_NAME, ChainError, Database, OWNER_NAME, PULSE_NAME,
@@ -18,15 +25,15 @@ mod tests {
         id::Id,
         name::Name,
         pulse_contract::{DeleteAuth, LinkAuth, NewAccount, SetCode, UnlinkAuth, UpdateAuth},
+        time::{TimePoint, TimePointSec},
         transaction::{
             Action, PackedTransaction, SignedTransaction, Transaction, TransactionTrace,
         },
         utils::pulse_assert,
     };
-    use pulsevm_crypto::{Bytes, Digest};
+    use pulsevm_crypto::Bytes;
     use pulsevm_name_macro::name;
     use pulsevm_serialization::{VarUint32, Write};
-    use pulsevm_time::TimePointSec;
     use serde_json::json;
 
     #[derive(Clone)]
@@ -64,7 +71,6 @@ mod tests {
                     &genesis,
                     temp_dir.path().to_str().unwrap(),
                 )
-                .await
                 .expect("Failed to initialize controller");
 
             let mut suite = Testing {
@@ -237,7 +243,8 @@ mod tests {
             ));
 
             self.set_transaction_headers(&mut trx, u32::MAX, 0);
-            let mut signed: SignedTransaction = SignedTransaction::new(trx, HashSet::new(), vec![]);
+            let mut signed: SignedTransaction =
+                SignedTransaction::new(trx, BTreeSet::new(), vec![]);
             for key in keys.iter() {
                 signed = signed.sign(key, &self.controller.chain_id())?;
             }
@@ -250,7 +257,7 @@ mod tests {
                 pending_block_state.clone()
             } else {
                 self.pending_block_state = Some(PendingBlockState {
-                    timestamp: BlockTimestamp::now(),
+                    timestamp: TimePoint::now().into(),
                     db: self.controller.database(),
                 });
 
@@ -267,7 +274,7 @@ mod tests {
             trx.header.max_net_usage_words = VarUint32(0); // No limit
             trx.header.max_cpu_usage = 0; // No limit
             trx.header.delay_sec = VarUint32(delay_sec);
-            trx.header.expiration = TimePointSec::new(expiration)
+            trx.header.expiration = TimePointSec::new(expiration);
         }
 
         pub fn set_code(&mut self, account: Name, wasm: Bytes) -> Result<(), ChainError> {
@@ -333,7 +340,8 @@ mod tests {
             ));
             self.set_transaction_headers(&mut trx, u32::MAX, 0);
 
-            let mut signed: SignedTransaction = SignedTransaction::new(trx, HashSet::new(), vec![]);
+            let mut signed: SignedTransaction =
+                SignedTransaction::new(trx, BTreeSet::new(), vec![]);
             for key in keys.iter() {
                 signed = signed.sign(key, &self.controller.chain_id())?;
             }
@@ -374,7 +382,8 @@ mod tests {
             ));
             self.set_transaction_headers(&mut trx, u32::MAX, 0);
 
-            let mut signed: SignedTransaction = SignedTransaction::new(trx, HashSet::new(), vec![]);
+            let mut signed: SignedTransaction =
+                SignedTransaction::new(trx, BTreeSet::new(), vec![]);
             for key in keys.iter() {
                 signed = signed.sign(key, &self.controller.chain_id())?;
             }
