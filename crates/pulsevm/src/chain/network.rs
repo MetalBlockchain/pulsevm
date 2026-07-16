@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
 use pulsevm_core::{ChainError, id::NodeId};
 use pulsevm_crypto::Bytes;
@@ -104,24 +104,27 @@ impl NetworkManager {
     }
 
     pub async fn gossip(&self, gossipable: Gossipable) -> Result<(), ChainError> {
-        let mut client: AppSenderClient<tonic::transport::Channel> =
-            AppSenderClient::connect(format!("http://{}", self.server_address))
+        let channel =
+            tonic::transport::Endpoint::from_shared(format!("http://{}", self.server_address))
+                .map_err(|e| ChainError::NetworkError(format!("bad appsender address: {}", e)))?
+                .connect_timeout(Duration::from_secs(5))
+                .timeout(Duration::from_secs(5)) // applies to all requests on this channel
+                .connect()
                 .await
-                .expect("failed to connect to appsender engine");
+                .map_err(|e| {
+                    ChainError::NetworkError(format!("failed to connect to appsender: {}", e))
+                })?;
+        let mut client = AppSenderClient::new(channel);
         let msg = gossipable.pack().map_err(|e| {
             ChainError::NetworkError(format!("failed to serialize gossipable: {}", e))
         })?;
 
         let result = client
             .send_app_gossip(Request::new(SendAppGossipMsg {
-                node_ids: self
-                    .connected_nodes
-                    .keys()
-                    .map(|id| id.0.to_vec())
-                    .collect(),
+                node_ids: vec![], // don't hand-pick; let the engine sample
                 validators: 3,
-                non_validators: 2,
-                peers: 5,
+                non_validators: 0,
+                peers: 2,
                 msg: msg,
             }))
             .await;

@@ -380,17 +380,21 @@ impl RpcServer for RpcService {
         )?;
 
         // Run transaction and revert it
-        let mut controller = self.controller.write().await;
-        let pending_block_timestamp = TimePoint::now().into();
-        controller.push_transaction(
-            &packed_trx,
-            &pending_block_timestamp,
-            &pulsevm_core::block::BlockStatus::Verifying,
-        )?;
+        {
+            let mut controller = self.controller.write().await;
+            let pending_block_timestamp = TimePoint::now().into();
+            controller.push_transaction(
+                &packed_trx,
+                &pending_block_timestamp,
+                &pulsevm_core::block::BlockStatus::Verifying,
+            )?;
+        }
 
         // Add to mempool
-        let mut mempool = self.mempool.write().await;
-        mempool.add_transaction(packed_trx.clone());
+        {
+            let mut mempool = self.mempool.write().await;
+            mempool.add_transaction(packed_trx.clone());
+        }
 
         // Gossip
         let nm = self.network_manager.read().await;
