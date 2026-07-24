@@ -147,7 +147,7 @@ impl ApplyContext {
             let gpo = Controller::get_global_properties(&mut self.db)?;
 
             pulse_assert(
-                recurse_depth < gpo.get_chain_config().get_max_inline_action_depth() as u32, // TODO: Make this configurable
+                recurse_depth < gpo.get_chain_config().get_max_inline_action_depth() as u32,
                 ChainError::TransactionError(
                     "max inline action depth per transaction reached".to_string(),
                 ),

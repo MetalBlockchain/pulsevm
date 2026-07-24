@@ -5,13 +5,11 @@ use std::{
 
 use pulsevm_crypto::Digest;
 use pulsevm_error::ChainError;
-use pulsevm_ffi::{BlockTimestamp, Database, Microseconds, TimePoint};
+use pulsevm_ffi::{BlockTimestamp, Database, Microseconds, TimePoint, seconds};
 use pulsevm_serialization::VarUint32;
 
 use crate::{
-    authorization_manager::AuthorizationManager,
-    block::BlockStatus,
-    chain::{
+    authorization_manager::AuthorizationManager, block::BlockStatus, chain::{
         apply_context::ApplyContext,
         id::Id,
         name::Name,
@@ -19,8 +17,7 @@ use crate::{
         transaction::{Action, ActionTrace, Transaction, TransactionStatus, TransactionTrace},
         utils::pulse_assert,
         wasm_runtime::WasmRuntime,
-    },
-    transaction::PackedTransaction,
+    }, controller::Controller, transaction::PackedTransaction,
 };
 
 #[derive(Default, Clone)]
@@ -168,6 +165,8 @@ impl TransactionContext {
             + discounted_size_for_pruned_data;
         let first_authorizer = transaction.first_authorizer();
 
+        self.validate_expiration(self.packed_transaction.get_transaction())?;
+        self.validate_referenced_accounts(self.packed_transaction.get_transaction())?;
         self.init(initial_net_usage, first_authorizer, true)?;
         self.record_transaction(
             &transaction.id()?,
@@ -498,5 +497,89 @@ impl TransactionContext {
 
     pub fn get_packed_transaction(&self) -> &PackedTransaction {
         &self.packed_transaction
+    }
+
+    pub fn validate_expiration(&self, trx: &Transaction) -> Result<(), ChainError> {
+        let inner = self.inner.read()?;
+        let expiration: TimePoint = trx.header.expiration().into();
+        let pending_block_timestamp: TimePoint = inner.pending_block_timestamp.into();
+        let gpo = Controller::get_global_properties(&self.db)?;
+
+        if expiration < pending_block_timestamp {
+            return Err(ChainError::TransactionError(
+                "transaction expired".to_string(),
+            ));
+        }
+
+        if expiration > pending_block_timestamp + seconds(gpo.get_chain_config().get_max_transaction_lifetime() as i64) {
+            return Err(ChainError::TransactionError(
+                "transaction has too long lifetime".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    pub fn validate_referenced_accounts(&self, trx: &Transaction) -> Result<(), ChainError> {
+        if !trx.context_free_actions.is_empty() {
+            for action in trx.context_free_actions.iter() {
+                let code = self.db.find_account(action.account.as_u64())?;
+
+                if code.is_null() {
+                    return Err(ChainError::TransactionError(format!(
+                        "context free action {} references non-existent account {}",
+                        action.name(),
+                        action.account()
+                    )));
+                }
+
+                if action.authorization.len() > 0 {
+                    return Err(ChainError::TransactionError(format!(
+                        "context-free actions cannot have authorizations"
+                    )));
+                }
+            }
+        }
+
+        let mut one_auth = false;
+
+        for action in trx.actions.iter() {
+            let code = self.db.find_account(action.account.as_u64())?;
+
+            if code.is_null() {
+                return Err(ChainError::TransactionError(format!(
+                    "action {} references non-existent account {}",
+                    action.name(),
+                    action.account()
+                )));
+            }
+
+            for auth in action.authorization().iter() {
+                one_auth = true;
+                let actor = self.db.find_account(auth.actor())?;
+
+                if actor.is_null() {
+                    return Err(ChainError::TransactionError(format!(
+                        "action's authorizing actor '{}' does not exist",
+                        Name::new(auth.actor)
+                    )));
+                }
+
+                if AuthorizationManager::find_permission(&self.db, auth)? == None {
+                    return Err(ChainError::TransactionError(format!(
+                        "action's authorizations include a non-existent permission: {}",
+                        auth,
+                    )));
+                }
+            }
+        }
+
+        if !one_auth {
+            return Err(ChainError::TransactionError(format!(
+                "transaction must have at least one authorization"
+            )));
+        }
+
+        Ok(())
     }
 }

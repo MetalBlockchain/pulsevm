@@ -106,6 +106,13 @@ impl From<TimePointSec> for TimePoint {
     }
 }
 
+impl From<&TimePointSec> for TimePoint {
+    #[inline]
+    fn from(t: &TimePointSec) -> Self {
+        TimePoint::new(seconds(t.utc_seconds as i64))
+    }
+}
+
 impl Serialize for TimePointSec {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where

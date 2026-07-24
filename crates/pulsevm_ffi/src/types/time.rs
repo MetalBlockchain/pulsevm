@@ -333,6 +333,12 @@ impl Write for TimePoint {
     }
 }
 
+impl PartialOrd for TimePoint {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.elapsed.partial_cmp(&other.elapsed)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
