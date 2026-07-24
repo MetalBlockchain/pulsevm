@@ -371,10 +371,8 @@ impl TransactionContext {
     }
 
     pub fn finalize(mut self) -> Result<TransactionResult, ChainError> {
-        let now = TimePoint::now();
-        let billed_cpu_time_us = self.get_billed_cpu_time(now)?;
-
         let mut inner = self.inner.write()?;
+        let billed_cpu_time_us = inner.trace.receipt.cpu_usage_us;
         inner.trace.net_usage = ((inner.trace.net_usage + 7) / 8) * 8; // Round up to nearest multiple of word size (8 bytes)
         inner.trace.receipt.status = TransactionStatus::Executed;
         inner.trace.receipt.net_usage_words = VarUint32((inner.trace.net_usage / 8) as u32);
@@ -476,12 +474,6 @@ impl TransactionContext {
         let _paused = now - inner.billing.paused_time; // if needed later
         inner.billing.pseudo_start = now - inner.billing.billed_time;
         Ok(())
-    }
-
-    pub fn get_billed_cpu_time(&self, now: TimePoint) -> Result<u32, ChainError> {
-        let inner = self.inner.read()?;
-        let billed = (now - inner.billing.pseudo_start).count();
-        Ok(billed as u32)
     }
 
     pub fn get_cpu_limit(&self) -> Result<i64, ChainError> {
