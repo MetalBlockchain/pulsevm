@@ -110,10 +110,8 @@ impl<'a> AuthorityChecker<'a> {
         permission: &PermissionLevelWeight,
         recursion_depth: u16,
     ) -> Result<u16, ChainError> {
-        if recursion_depth > self.recursion_depth_limit {
-            return Err(ChainError::AuthorizationError(
-                "recursion depth exceeded".to_string(),
-            ));
+        if recursion_depth >= self.recursion_depth_limit {
+            return Ok(0);
         }
 
         // cache lookup
