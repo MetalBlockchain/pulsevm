@@ -60,6 +60,7 @@ pub struct ApplyContext {
     first_receiver_action_ordinal: u32,
     action_ordinal: u32,
     pending_block_timestamp: BlockTimestamp, // Timestamp for the pending block
+    context_free: bool,
 
     inner: Arc<RwLock<ApplyContextInner>>,
 }
@@ -74,6 +75,7 @@ impl ApplyContext {
         action_ordinal: u32,
         depth: u32,
         cpu_limit: i64,
+        context_free: bool
     ) -> Result<Self, ChainError> {
         let pending_block_timestamp = trx_context.pending_block_timestamp()?;
 
@@ -86,6 +88,7 @@ impl ApplyContext {
             first_receiver_action_ordinal: 0,
             action_ordinal,
             pending_block_timestamp,
+            context_free,
 
             inner: Arc::new(RwLock::new(ApplyContextInner {
                 action,
@@ -1736,8 +1739,7 @@ impl ApplyContext {
     }
 
     pub fn is_context_free(&self) -> bool {
-        let inner = self.inner.read().unwrap();
-        inner.context_free_inline_actions.len() > 0
+        self.context_free
     }
 
     pub fn set_global_properties(&mut self, cfg: &ChainConfigV0) -> Result<(), ChainError> {
