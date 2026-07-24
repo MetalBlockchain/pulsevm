@@ -9,7 +9,7 @@ pub fn eosio_assert(
     condition: u32,
     msg_ptr: WasmPtr<u8>,
 ) -> Result<(), RuntimeError> {
-    if condition != 1 {
+    if condition == 0 {
         if msg_ptr.is_null() {
             return Err(RuntimeError::new(
                 "pulse assertion is false with no message",
@@ -51,7 +51,7 @@ pub fn pulse_assert(
     msg_ptr: WasmPtr<u8>,
     msg_len: u32,
 ) -> Result<(), RuntimeError> {
-    if condition != 1 {
+    if condition == 0 {
         if msg_len == 0 {
             return Err(RuntimeError::new(
                 "pulse assertion is false with no message",
