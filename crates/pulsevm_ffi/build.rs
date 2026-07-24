@@ -27,7 +27,7 @@ fn main() {
         Ok(val) => PathBuf::from(val),
         Err(_) => {
             let default_path = if target.contains("apple") {
-                "/usr/local/include"
+                "/opt/homebrew/include"
             } else {
                 "/usr/include"
             };
@@ -57,7 +57,7 @@ fn main() {
         Ok(val) => PathBuf::from(val),
         Err(_) => {
             let mut default_path = if target.contains("apple") {
-                "/usr/local/lib"
+                "/opt/homebrew/opt/zlib/lib"
             } else {
                 "/usr/lib"
             };
