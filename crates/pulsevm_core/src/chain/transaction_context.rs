@@ -402,9 +402,13 @@ impl TransactionContext {
 
         // During benchmarks this would throw an error because the accounts won't have enough CPU to cover the billed time, so we skip this step if we're benchmarking.
         if self.block_status != BlockStatus::Benchmarking {
+            let bill_to_account = inner.bill_to_account.clone().ok_or_else(|| {
+                ChainError::TransactionError("bill to account is not set".to_string())
+            })?;
+
             ResourceLimitsManager::add_transaction_usage(
                 &mut self.db,
-                &inner.bill_to_account.unwrap(),
+                &bill_to_account,
                 billed_cpu_time_us as u64,
                 inner.trace.net_usage as u64,
                 inner.pending_block_timestamp.slot(),
