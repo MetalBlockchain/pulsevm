@@ -63,7 +63,58 @@ impl Authority {
     }
 
     pub fn validate(&self) -> bool {
-        return true;
+        // Overflow protection: weights are u16, threshold is u32. With at most
+        // 2^16 entries the u32 accumulator cannot wrap.
+        if self.keys.len() + self.accounts.len() + self.waits.len() > (1 << 16) {
+            return false;
+        }
+
+        if self.threshold == 0 {
+            return false;
+        }
+
+        let mut total_weight: u32 = 0;
+
+        // Keys must be strictly ascending by public key.
+        let mut prev_key: Option<&KeyWeight> = None;
+        for k in &self.keys {
+            if let Some(prev) = prev_key {
+                if prev.key.cmp(&k.key) >= 0 {
+                    return false;
+                }
+            }
+            total_weight += k.weight as u32;
+            prev_key = Some(k);
+        }
+
+        // Accounts must be strictly ascending by permission level.
+        let mut prev_account: Option<&PermissionLevelWeight> = None;
+        for a in &self.accounts {
+            if let Some(prev) = prev_account {
+                if prev.permission >= a.permission {
+                    return false;
+                }
+            }
+            total_weight += a.weight as u32;
+            prev_account = Some(a);
+        }
+
+        // Waits must be strictly ascending by wait_sec, and none may be zero.
+        if self.waits.first().is_some_and(|w| w.wait_sec == 0) {
+            return false;
+        }
+        let mut prev_wait: Option<&WaitWeight> = None;
+        for w in &self.waits {
+            if let Some(prev) = prev_wait {
+                if prev.wait_sec >= w.wait_sec {
+                    return false;
+                }
+            }
+            total_weight += w.weight as u32;
+            prev_wait = Some(w);
+        }
+
+        total_weight >= self.threshold
     }
 }
 
