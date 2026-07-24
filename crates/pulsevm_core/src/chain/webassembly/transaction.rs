@@ -166,12 +166,22 @@ pub fn get_action(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized");
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
 
-    // Read the wasm buffer out into a host-side scratch buffer, run get_action
-    // against it, then write back. Avoids holding a MemoryView borrow across
-    // the apply_context call.
+    // Bounds-check the destination before allocating a host buffer of the
+    // guest-supplied size. `slice` uses checked arithmetic, so offset + len
+    // near u32::MAX cannot wrap into a valid range.
+    //
+    // buffer_size == 0 is the size-query form: nodeos returns the packed size
+    // without touching the buffer, so skip the range check entirely.
+    if buffer_size > 0 {
+        buffer_ptr
+            .slice(&view, buffer_size)
+            .map_err(|e| RuntimeError::new(format!("get_action: invalid buffer range: {e}")))?;
+    }
+
+    // Safe to allocate now: buffer_size is bounded by linear memory size.
     let mut scratch = vec![0u8; buffer_size as usize];
 
     let written = env_data
@@ -180,9 +190,14 @@ pub fn get_action(
         .map_err(|e| RuntimeError::new(format!("get_action failed: {}", e)))?;
 
     // get_action returns the packed size; it only filled scratch if it fit.
-    if written >= 0 {
+    if written > 0 && buffer_size > 0 {
         let copy = (written as usize).min(scratch.len());
-        view.write(buffer_ptr.offset() as u64, &scratch[..copy])
+        // Re-slice at the actual written length rather than reusing the
+        // full-size slice.
+        buffer_ptr
+            .slice(&view, copy as u32)
+            .map_err(|e| RuntimeError::new(format!("get_action: invalid buffer range: {e}")))?
+            .write_slice(&scratch[..copy])
             .map_err(|e| RuntimeError::new(format!("failed to write action data: {}", e)))?;
     }
 
