@@ -298,7 +298,7 @@ impl TransactionContext {
 
         // Initialize the apply context with the action trace.
         let cpu_used = apply_context.exec(self)?;
-        self.add_cpu_usage(cpu_used as u32)?;
+        self.add_cpu_usage(cpu_used)?;
 
         // Finalize the apply context
         for (account, ram_delta) in apply_context.account_ram_deltas()?.iter() {
@@ -420,9 +420,21 @@ impl TransactionContext {
         })
     }
 
-    pub fn add_cpu_usage(&self, cpu_usage: u32) -> Result<(), ChainError> {
+    pub fn add_cpu_usage(&self, cpu_usage: u64) -> Result<(), ChainError> {
         let mut inner = self.inner.write()?;
-        inner.trace.receipt.cpu_usage_us += cpu_usage;
+
+        // Widen the field, not the argument: narrowing `cpu_usage` to u32 first
+        // would silently truncate any value above u32::MAX before the check runs.
+        let total = (inner.trace.receipt.cpu_usage_us as u64)
+            .checked_add(cpu_usage)
+            .ok_or_else(|| ChainError::ActionValidationError("CPU usage overflow".to_string()))?;
+
+        let total = u32::try_from(total).map_err(|_| {
+            ChainError::ActionValidationError("CPU usage overflow".to_string())
+        })?;
+
+        inner.trace.receipt.cpu_usage_us = total;
+
         Ok(())
     }
 
