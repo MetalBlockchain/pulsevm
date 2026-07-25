@@ -40,6 +40,12 @@ impl AuthorizationManager {
             provided_delay
         };
         let mut permissions_to_satisfy = BTreeSet::<PermissionLevel>::new();
+        let mut authority_checker = AuthorityChecker::new(
+            chain_config.get_max_authority_depth(),
+            provided_keys,
+            provided_permissions,
+            effective_provided_delay,
+        );
 
         for act in actions.iter() {
             let mut special_case = false;
@@ -97,15 +103,6 @@ impl AuthorizationManager {
                     permissions_to_satisfy.insert(declared_auth.clone());
                 }
             }
-
-            let global_properties = unsafe { &*db.get_global_properties()? };
-            let chain_config = global_properties.get_chain_config();
-            let mut authority_checker = AuthorityChecker::new(
-                chain_config.get_max_authority_depth(),
-                provided_keys,
-                provided_permissions,
-                effective_provided_delay,
-            );
 
             // Now verify that all the declared authorizations are satisfied
             for p in permissions_to_satisfy.iter() {
