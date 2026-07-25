@@ -5,6 +5,12 @@ pub const SETCODE_RAM_BYTES_MULTIPLIER: u32 = 10;
 
 pub const FIXED_NET_OVERHEAD_OF_PACKED_TRX: u32 = 16;
 
+// Hard ceiling on the decompressed size of packed_trx / packed_context_free_data. This is a
+// defensive bound applied before any validation, so it cannot depend on chain config; it is set
+// well above DEFAULT_MAX_TRANSACTION_NET_USAGE so that raising the net usage limits through
+// governance does not start rejecting otherwise valid transactions at decompression time.
+pub const MAX_UNCOMPRESSED_PACKED_TRX_SIZE: usize = 8 * 1024 * 1024;
+
 pub const RATE_LIMITING_PRECISION: u64 = 1000 * 1000;
 
 pub const BLOCK_INTERVAL_MS: u32 = 500;

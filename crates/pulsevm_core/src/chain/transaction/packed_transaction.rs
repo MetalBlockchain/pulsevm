@@ -1,7 +1,7 @@
 use std::{collections::BTreeSet, io::Read as IoRead};
 
 use flate2::read::ZlibDecoder;
-use pulsevm_constants::FIXED_NET_OVERHEAD_OF_PACKED_TRX;
+use pulsevm_constants::{FIXED_NET_OVERHEAD_OF_PACKED_TRX, MAX_UNCOMPRESSED_PACKED_TRX_SIZE};
 use pulsevm_crypto::Bytes;
 use pulsevm_error::ChainError;
 use pulsevm_serialization::{NumBytes, Read, ReadError, Write, WriteError};
@@ -191,12 +191,65 @@ fn maybe_decompress(
             if data.is_empty() {
                 return Ok(Vec::new());
             }
-            let mut decoder = ZlibDecoder::new(data);
+            // Cap the decompressed output: a small compressed payload can otherwise expand by a
+            // factor of ~1000, and this runs on unauthenticated ingress before any net usage
+            // accounting. Read one byte past the limit so an oversized stream is detectable.
+            let mut decoder =
+                ZlibDecoder::new(data).take(MAX_UNCOMPRESSED_PACKED_TRX_SIZE as u64 + 1);
             let mut out = Vec::new();
             decoder.read_to_end(&mut out).map_err(|e| {
                 ChainError::SerializationError(format!("zlib decompress failed: {e}"))
             })?;
+            pulse_assert(
+                out.len() <= MAX_UNCOMPRESSED_PACKED_TRX_SIZE,
+                ChainError::SerializationError(
+                    "zlib decompress failed: uncompressed data is too big".into(),
+                ),
+            )?;
             Ok(out)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flate2::{Compression, write::ZlibEncoder};
+    use std::io::Write as IoWrite;
+
+    fn zlib_compress(data: &[u8]) -> Vec<u8> {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn decompression_bomb_is_rejected() {
+        // A highly compressible payload one byte past the cap. This is a few KB compressed.
+        let bomb = zlib_compress(&vec![0u8; MAX_UNCOMPRESSED_PACKED_TRX_SIZE + 1]);
+        assert!(bomb.len() < 64 * 1024, "test payload should be tiny");
+
+        let err = maybe_decompress(TransactionCompression::Zlib, &bomb)
+            .expect_err("oversized payload must be rejected");
+        assert!(
+            format!("{err}").contains("uncompressed data is too big"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn decompression_at_the_limit_succeeds() {
+        let payload = vec![0u8; MAX_UNCOMPRESSED_PACKED_TRX_SIZE];
+        let out =
+            maybe_decompress(TransactionCompression::Zlib, &zlib_compress(&payload)).unwrap();
+        assert_eq!(out.len(), MAX_UNCOMPRESSED_PACKED_TRX_SIZE);
+    }
+
+    #[test]
+    fn ordinary_payload_round_trips() {
+        let payload = b"a normally sized transaction payload".to_vec();
+        let out =
+            maybe_decompress(TransactionCompression::Zlib, &zlib_compress(&payload)).unwrap();
+        assert_eq!(out, payload);
     }
 }
