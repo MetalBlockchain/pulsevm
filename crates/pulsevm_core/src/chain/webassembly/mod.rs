@@ -122,3 +122,13 @@ pub fn context_aware_check(env: &FunctionEnvMut<WasmContext>) -> Result<(), Runt
 
     Ok(())
 }
+
+pub fn context_free_check(env: &FunctionEnvMut<WasmContext>) -> Result<(), RuntimeError> {
+    if !env.data().apply_context().is_context_free() {
+        return Err(RuntimeError::new(
+            "cannot call this function from a context-aware action",
+        ));
+    }
+
+    Ok(())
+}
