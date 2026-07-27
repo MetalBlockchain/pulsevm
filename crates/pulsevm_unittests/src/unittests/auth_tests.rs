@@ -1,16 +1,188 @@
 #[cfg(test)]
 mod auth_tests {
+    use std::collections::BTreeSet;
+
     use anyhow::Result;
     use pulsevm_core::{
         ACTIVE_NAME, ChainError, OWNER_NAME, PULSE_NAME,
-        authority::{Authority, PermissionLevel, PermissionLevelWeight},
+        authority::{Authority, KeyWeight, PermissionLevel, PermissionLevelWeight},
         authorization_manager::AuthorizationManager,
-        crypto::PublicKey,
+        crypto::{PrivateKey, PublicKey},
         name::Name,
+        transaction::{Action, SignedTransaction, Transaction, TransactionTrace},
     };
+    use pulsevm_serialization::Write;
 
-    use crate::tests::{Testing, get_private_key};
+    use crate::tests::{DEFAULT_EXPIRATION_DELTA, Testing, get_private_key};
     use pulsevm_name_macro::name;
+
+    /// Pushes a single transaction holding one `reqauth` action per entry in
+    /// `reqs`, each declaring its own authorization, signed by `keys`.
+    fn push_multi_reqauth(
+        chain: &mut Testing,
+        reqs: Vec<(Name, PermissionLevel)>,
+        keys: Vec<PrivateKey>,
+    ) -> Result<TransactionTrace, ChainError> {
+        let mut trx = Transaction::default();
+        for (from, auth) in reqs {
+            trx.actions.push(Action::new(
+                PULSE_NAME.into(),
+                name!("reqauth").into(),
+                from.pack().unwrap(),
+                vec![auth],
+            ));
+        }
+
+        chain.set_transaction_headers(&mut trx, DEFAULT_EXPIRATION_DELTA, 0);
+        let mut signed: SignedTransaction = SignedTransaction::new(trx, BTreeSet::new(), vec![]);
+        for key in keys.iter() {
+            signed = signed.sign(key, &chain.controller.chain_id())?;
+        }
+        chain.push_transaction(signed)
+    }
+
+    /// A transaction may carry actions whose authorities share no keys. Every
+    /// signature is relevant to the transaction as a whole even though none is
+    /// relevant to every individual action.
+    #[tokio::test]
+    async fn test_multi_action_disjoint_auths() -> Result<()> {
+        let mut chain = Testing::new().await;
+        let alice: Name = name!("alice").into();
+        let bob: Name = name!("bob").into();
+        chain.create_accounts(vec![alice, bob], false, true)?;
+
+        push_multi_reqauth(
+            &mut chain,
+            vec![
+                (alice, PermissionLevel::new(alice.as_u64(), ACTIVE_NAME.as_u64())),
+                (bob, PermissionLevel::new(bob.as_u64(), ACTIVE_NAME.as_u64())),
+            ],
+            vec![
+                get_private_key(alice, "active"),
+                get_private_key(bob, "active"),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The irrelevant-signature check still fires for a multi-action
+    /// transaction when a key is needed by no action at all.
+    #[tokio::test]
+    async fn test_multi_action_irrelevant_sig() -> Result<()> {
+        let mut chain = Testing::new().await;
+        let alice: Name = name!("alice").into();
+        let bob: Name = name!("bob").into();
+        chain.create_accounts(vec![alice, bob], false, true)?;
+
+        assert_eq!(
+            push_multi_reqauth(
+                &mut chain,
+                vec![
+                    (alice, PermissionLevel::new(alice.as_u64(), ACTIVE_NAME.as_u64())),
+                    (bob, PermissionLevel::new(bob.as_u64(), ACTIVE_NAME.as_u64())),
+                ],
+                vec![
+                    get_private_key(alice, "active"),
+                    get_private_key(bob, "active"),
+                    get_private_key(alice, "unrelated"),
+                ],
+            )
+            .err(),
+            Some(ChainError::AuthorizationError(
+                "transaction bears irrelevant signatures".into()
+            ))
+        );
+        Ok(())
+    }
+
+    /// alice@active is satisfied by K1 + carol@active; the bob@active branch is
+    /// visited but fails, so K2 is an irrelevant signature and must be rejected.
+    #[tokio::test]
+    async fn test_irrelevant_key_in_failed_subauthority() -> Result<()> {
+        let mut chain = Testing::new().await;
+        let alice: Name = name!("alice").into();
+        let bob: Name = name!("bob").into();
+        let carol: Name = name!("carol").into();
+        chain.create_accounts(vec![alice, bob, carol], false, true)?;
+
+        let k1 = get_private_key(alice, "k1");
+        let k1_pub = k1.get_public_key();
+        let k2 = get_private_key(bob, "k2");
+        let k2_pub = k2.get_public_key();
+        let k2b_pub = get_private_key(bob, "k2b").get_public_key();
+        let k3 = get_private_key(carol, "k3");
+        let k3_pub = k3.get_public_key();
+
+        // carol@active = threshold 1, [K3]
+        chain.set_authority2(
+            carol,
+            ACTIVE_NAME.into(),
+            Authority::new(1, vec![KeyWeight::new(k3_pub.inner(), 1)], vec![], vec![]),
+            OWNER_NAME.into(),
+        )?;
+
+        // bob@active = threshold 2, [K2, K2b] — valid, but needs BOTH keys.
+        // An authority's keys must be supplied in sorted order.
+        let mut bob_keys = vec![k2_pub.clone(), k2b_pub.clone()];
+        bob_keys.sort();
+        chain.set_authority2(
+            bob,
+            ACTIVE_NAME.into(),
+            Authority::new(
+                2,
+                bob_keys.iter().map(|k| KeyWeight::new(k.inner(), 1)).collect(),
+                vec![],
+                vec![],
+            ),
+            OWNER_NAME.into(),
+        )?;
+
+        // alice@active = threshold 2, keys[K1], accounts[bob@active, carol@active]
+        let mut alice_accounts = vec![
+            PermissionLevelWeight::new(
+                PermissionLevel::new(bob.as_u64(), ACTIVE_NAME.as_u64()),
+                1,
+            ),
+            PermissionLevelWeight::new(
+                PermissionLevel::new(carol.as_u64(), ACTIVE_NAME.as_u64()),
+                1,
+            ),
+        ];
+        alice_accounts.sort_by(|a, b| a.permission.cmp(&b.permission));
+        chain.set_authority2(
+            alice,
+            ACTIVE_NAME.into(),
+            Authority::new(
+                2,
+                vec![KeyWeight::new(k1_pub.inner(), 1)],
+                alice_accounts,
+                vec![],
+            ),
+            OWNER_NAME.into(),
+        )?;
+
+        // Declaring alice@active, signed by K1 + K2 + K3: K2 is irrelevant.
+        assert_eq!(
+            chain
+                .push_reqauth2(
+                    alice,
+                    vec![PermissionLevel::new(alice.as_u64(), ACTIVE_NAME.as_u64())],
+                    vec![k1.clone(), k2.clone(), k3.clone()],
+                )
+                .err(),
+            Some(ChainError::AuthorizationError(
+                "transaction bears irrelevant signatures".into()
+            ))
+        );
+
+        // Without the irrelevant K2, the same transaction is accepted.
+        chain.push_reqauth2(
+            alice,
+            vec![PermissionLevel::new(alice.as_u64(), ACTIVE_NAME.as_u64())],
+            vec![k1, k3],
+        )?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_missing_sigs() -> Result<()> {
@@ -73,8 +245,8 @@ mod auth_tests {
                     vec![get_private_key(name!("bob").into(), "active")],
                 )
                 .err(),
-            Some(ChainError::WasmRuntimeError(
-                "apply error: missing authority of alice".into()
+            Some(ChainError::ApplyError(
+                "missing authority of alice".into()
             ))
         );
         Ok(())

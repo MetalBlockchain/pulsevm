@@ -16,7 +16,7 @@ add_library( pulsevm_chain
 
 target_link_libraries( pulsevm_chain PUBLIC bn256 fc chainbase softfloat
    Boost::signals2 Boost::hana Boost::property_tree Boost::multi_index Boost::asio Boost::lockfree
-   Boost::assign Boost::accumulators
+   Boost::assign Boost::accumulators Boost::rational
 )
 
 target_include_directories( pulsevm_chain PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_BINARY_DIR}/include" )
