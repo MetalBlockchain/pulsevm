@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use pulsevm_error::ChainError;
-use pulsevm_ffi::{Database, Microseconds};
+use pulsevm_ffi::{DbRead, Microseconds};
 
 use crate::crypto::PublicKey;
 
@@ -61,7 +61,7 @@ impl<'a> AuthorityChecker<'a> {
 
     pub fn satisfied(
         &mut self,
-        db: &Database,
+        db: &DbRead<'_>,
         authority: &Authority,
         recursion_depth: u16,
     ) -> Result<bool, ChainError> {
@@ -106,7 +106,7 @@ impl<'a> AuthorityChecker<'a> {
 
     pub fn visit_permission_level_weight<'b>(
         &mut self,
-        db: &Database,
+        db: &DbRead<'_>,
         permission: &PermissionLevelWeight,
         recursion_depth: u16,
     ) -> Result<u16, ChainError> {
@@ -134,16 +134,13 @@ impl<'a> AuthorityChecker<'a> {
         }
 
         // not cached yet – fetch authority from DB
-        let auth = db.find_permission_by_actor_and_permission(
+        let auth = match db.find_permission_by_actor_and_permission(
             permission.permission.actor,
             permission.permission.permission,
-        )?;
-
-        if auth.is_null() {
-            return Ok(0);
-        }
-
-        let auth = unsafe { &*auth };
+        )? {
+            Some(auth) => auth,
+            None => return Ok(0),
+        };
 
         // mark as being evaluated to detect cycles
         self.cached_permissions.insert(

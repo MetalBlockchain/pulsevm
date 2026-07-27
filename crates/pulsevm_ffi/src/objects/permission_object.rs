@@ -2,10 +2,10 @@ use pulsevm_billable_size::{BillableSize, billable_size_v};
 use pulsevm_constants::OVERHEAD_PER_ROW_PER_INDEX_RAM_BYTES;
 use pulsevm_error::ChainError;
 
-use crate::{Database, PermissionObject, bridge::ffi::CxxSharedAuthority};
+use crate::{DbRead, PermissionObject, bridge::ffi::CxxSharedAuthority};
 
 impl PermissionObject {
-    pub fn satisfies(&self, other: &PermissionObject, db: &Database) -> Result<bool, ChainError> {
+    pub fn satisfies(&self, other: &PermissionObject, db: &DbRead<'_>) -> Result<bool, ChainError> {
         db.permission_satisfies_other_permission(self, other)
     }
 }

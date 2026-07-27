@@ -12,6 +12,66 @@ mod auth_tests {
     use crate::tests::{Testing, get_private_key};
     use pulsevm_name_macro::name;
 
+    /// Guards the DB read-API soundness fix. `get_permission` now returns a
+    /// `&PermissionObject` bound to a `DbRead` guard, so a permission reference
+    /// cannot be held across a mutation — the aliasing UB is a compile error.
+    ///
+    /// The pre-fix version of this test held the reference across the mutation:
+    ///
+    /// ```ignore
+    /// let perm = AuthorizationManager::get_permission(&db, alice, spending)?;
+    /// let before = perm.get_authority().to_authority();
+    /// chain.set_authority2(alice, spending, new_auth, active)?; // mutates *perm
+    /// let after = perm.get_authority().to_authority();          // UB: reads through shared &
+    /// ```
+    ///
+    /// That no longer type-checks: `get_permission` wants `&DbRead`, and the
+    /// reference borrows the guard, so it cannot outlive a `db.read()` scope or
+    /// coexist with a `&mut db` mutation. The safe pattern below reads each
+    /// value inside its own read scope and mutates in between.
+    #[tokio::test]
+    async fn test_permission_ref_is_guard_scoped() -> Result<()> {
+        let mut chain = Testing::new().await;
+        let alice: Name = name!("alice").into();
+        chain.create_account(alice, PULSE_NAME.into(), false, true)?;
+
+        let key1 = get_private_key(alice, "spend_one").get_public_key();
+        chain.set_authority2(
+            alice,
+            name!("spending").into(),
+            Authority::new_from_public_key(key1.inner()),
+            ACTIVE_NAME.into(),
+        )?;
+
+        let db = chain.get_pending_block_state().db;
+
+        // The reference is confined to this read scope and dropped at its end.
+        let auth_before = {
+            let r = db.read()?;
+            let perm =
+                AuthorizationManager::get_permission(&r, alice.as_u64(), name!("spending"))?;
+            perm.get_authority().to_authority()
+        };
+
+        let key2 = get_private_key(alice, "spend_two").get_public_key();
+        chain.set_authority2(
+            alice,
+            name!("spending").into(),
+            Authority::new_from_public_key(key2.inner()),
+            ACTIVE_NAME.into(),
+        )?;
+
+        let auth_after = {
+            let r = db.read()?;
+            let perm =
+                AuthorizationManager::get_permission(&r, alice.as_u64(), name!("spending"))?;
+            perm.get_authority().to_authority()
+        };
+
+        assert_ne!(auth_before, auth_after);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_missing_sigs() -> Result<()> {
         let mut chain = Testing::new().await;
@@ -73,8 +133,8 @@ mod auth_tests {
                     vec![get_private_key(name!("bob").into(), "active")],
                 )
                 .err(),
-            Some(ChainError::WasmRuntimeError(
-                "apply error: missing authority of alice".into()
+            Some(ChainError::ApplyError(
+                "missing authority of alice".into()
             ))
         );
         Ok(())
@@ -104,12 +164,16 @@ mod auth_tests {
             OWNER_NAME.into(),
         )?;
         let pending_block_state = chain.get_pending_block_state();
-        let new_auth = AuthorizationManager::get_permission(
-            &mut pending_block_state.db.clone(),
-            name!("alice"),
-            ACTIVE_NAME.as_u64(),
-        )?;
-        assert!(new_auth.get_authority().to_authority() == delegated_auth);
+        let db = pending_block_state.db.clone();
+        // Read the permission in a scope that drops the guard before push_reqauth2
+        // below, which needs the write lock on the same db.
+        let new_authority = {
+            let r = db.read()?;
+            let new_auth =
+                AuthorizationManager::get_permission(&r, name!("alice"), ACTIVE_NAME.as_u64())?;
+            new_auth.get_authority().to_authority()
+        };
+        assert!(new_authority == delegated_auth);
         // execute nonce from alice signed by bob
         chain.push_reqauth2(
             name!("alice").into(),

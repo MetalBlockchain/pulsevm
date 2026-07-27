@@ -162,8 +162,9 @@ pub fn get_permission_last_used(
     context_aware_check(&env)?;
     let env_data = env.data();
     let db = env_data.db();
-    let permission = AuthorizationManager::get_permission(db, account, permission)?;
-    let last_used = db.get_permission_last_used(permission)?;
+    let r = db.read()?;
+    let permission = AuthorizationManager::get_permission(&r, account, permission)?;
+    let last_used = r.get_permission_last_used(permission)?;
     Ok(last_used.time_since_epoch().count())
 }
 

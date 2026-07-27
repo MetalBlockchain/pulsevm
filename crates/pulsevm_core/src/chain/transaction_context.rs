@@ -383,13 +383,12 @@ impl TransactionContext {
 
             for action in trx.actions.iter() {
                 for auth in action.authorization().iter() {
-                    let permission = AuthorizationManager::get_permission(
-                        &self.db,
+                    AuthorizationManager::update_permission_usage(
+                        &mut self.db,
                         auth.actor(),
                         auth.permission(),
+                        &time,
                     )?;
-
-                    AuthorizationManager::update_permission_usage(&mut self.db, permission, &time)?;
                 }
             }
         }
@@ -577,7 +576,7 @@ impl TransactionContext {
                     )));
                 }
 
-                if AuthorizationManager::find_permission(&self.db, auth)? == None {
+                if AuthorizationManager::find_permission(&self.db.read()?, auth)?.is_none() {
                     return Err(ChainError::TransactionError(format!(
                         "action's authorizations include a non-existent permission: {}",
                         auth,
