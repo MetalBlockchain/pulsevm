@@ -379,15 +379,30 @@ impl RpcServer for RpcService {
             packed_trx,
         )?;
 
-        // Run transaction and revert it
+        // Run transaction and revert it. Execution is synchronous, blocking
+        // FFI/wasm work with no await points, so run it on the blocking pool
+        // and take the lock with blocking_write() instead of holding the async
+        // lock on a runtime worker, which would stall every other RPC handler.
         {
-            let mut controller = self.controller.write().await;
-            let pending_block_timestamp = TimePoint::now().into();
-            controller.push_transaction(
-                &packed_trx,
-                &pending_block_timestamp,
-                &pulsevm_core::block::BlockStatus::Verifying,
-            )?;
+            let controller = self.controller.clone();
+            let trx_for_exec = packed_trx.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut controller = controller.blocking_write();
+                let pending_block_timestamp = TimePoint::now().into();
+                controller.push_transaction(
+                    &trx_for_exec,
+                    &pending_block_timestamp,
+                    &pulsevm_core::block::BlockStatus::Verifying,
+                )
+            })
+            .await
+            .map_err(|e| {
+                ErrorObjectOwned::owned(
+                    -32000,
+                    format!("transaction execution task failed: {e}"),
+                    None::<()>,
+                )
+            })??;
         }
 
         // Add to mempool
