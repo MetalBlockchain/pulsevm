@@ -1,0 +1,99 @@
+name: E2E tests
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+# The e2e suite boots a real multi-node metalgo network with the PulseVM plugin
+# loaded, so it needs both a compiled plugin and a metalgo binary. The metalgo
+# version is pinned: the plugin and the node must agree on the rpcchainvm
+# protocol version, and TestPluginProtocolVersion asserts exactly that.
+env:
+  METALGO_VERSION: v1.13.5
+  # The VM ID metalgo resolves the plugin by. Derived from the name "pulsevm"
+  # zero-padded to 32 bytes; see scripts/install.sh.
+  VM_ID: rXcAFxZvio99epp6TzEwYfexCfPAbJuBTMsjUUoiT7PkVykNs
+
+jobs:
+  e2e:
+    name: e2e-linux-amd64
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Configure LLVM APT repository
+        run: wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key|sudo apt-key add - && sudo echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" | sudo tee /etc/apt/sources.list.d/llvm.list
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y gcc-13 g++-13 cmake libgmp-dev zlib1g-dev pkg-config libcurl4-openssl-dev libboost-all-dev llvm-22-dev libpolly-22-dev
+
+      - name: Checkout source code
+        uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Protobuf (protoc)
+        uses: arduino/setup-protoc@v2
+        with:
+          version: '27.1'
+
+      - name: Cache cargo registry
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-amd64-e2e-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build PulseVM plugin and boot fixture
+        env:
+          CC: /usr/bin/gcc-13
+          CXX: /usr/bin/g++-13
+          LLVM_SYS_221_PREFIX: /usr/lib/llvm-22
+          BOOST_LIB: /usr/lib/x86_64-linux-gnu
+        run: cargo build -p pulsevm -p pulsevm_e2e_boot
+
+      - name: Install plugin under its VM ID
+        run: |
+          mkdir -p build
+          cp target/debug/pulsevm "build/${VM_ID}"
+          chmod +x "build/${VM_ID}"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Check out metalgo
+        uses: actions/checkout@v4
+        with:
+          repository: MetalBlockchain/metalgo
+          ref: ${{ env.METALGO_VERSION }}
+          path: metalgo
+
+      - name: Build metalgo
+        working-directory: metalgo
+        run: ./scripts/build.sh
+
+      - name: Run e2e tests
+        working-directory: tests/e2e
+        env:
+          METALGO_PATH: ${{ github.workspace }}/metalgo/build/metalgo
+        run: go test -v -timeout 30m ./...
+
+      # Node logs, flags and databases live here. Without them a red build is
+      # almost impossible to diagnose, since the failure is usually inside a
+      # node or the plugin rather than in the test.
+      - name: Collect network artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tmpnet-networks
+          path: ~/.tmpnet/networks
+          retention-days: 7
+          if-no-files-found: ignore
