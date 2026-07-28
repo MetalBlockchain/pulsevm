@@ -440,6 +440,10 @@ impl WasmRuntime {
                 "get_active_producers" => Function::new_typed_with_env(&mut store, &env, get_active_producers),
             }
         };
+        // Everything above (compile/cache lookup, store, import wiring) is setup;
+        // instantiation is the separate, per-call Instance::new cost.
+        drop(setup_timer);
+        let instantiate_timer = Timer::new(Metric::WasmInstantiate);
         let instance = Instance::new(&mut store, &module.module, &import_object).map_err(|e| {
             ChainError::WasmRuntimeError(format!("failed to create wasm instance: {}", e))
         })?;
@@ -474,7 +478,7 @@ impl WasmRuntime {
         // Resume timer
         apply_context.resume_billing_timer()?;
 
-        drop(setup_timer);
+        drop(instantiate_timer);
         // The apply call runs the contract's WASM and, interleaved, any host
         // functions it invokes (which perform the FFI/chainbase state ops).
         let result = {

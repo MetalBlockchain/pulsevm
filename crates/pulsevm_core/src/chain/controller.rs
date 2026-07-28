@@ -46,6 +46,8 @@ use pulsevm_grpc::vm;
 use pulsevm_serialization::{Read, Write};
 use spdlog::{debug, error, info, warn};
 
+use crate::profiling::{Metric, Timer};
+
 pub type ApplyHandlerFn = fn(&mut ApplyContext, &mut Database, &Action) -> Result<(), ChainError>;
 pub type ApplyHandlerMap = HashMap<
     (Name, Name, Name), // (receiver, contract, action)
@@ -433,22 +435,33 @@ impl Controller {
             .map_err(|e| {
                 ChainError::DatabaseError(format!("failed to execute block {}: {}", block_id, e))
             })?;
-        let packed_block = block.pack().map_err(|e| {
-            ChainError::TransactionError(format!("failed to pack block {}: {}", block_id, e))
-        })?;
-        root_session
-            .pin_mut()
-            .push()
-            .map_err(|e| ChainError::TransactionError(format!("failed to commit block: {}", e)))?;
+        let packed_block = {
+            let _t = Timer::new(Metric::BlockPack);
+            block.pack().map_err(|e| {
+                ChainError::TransactionError(format!("failed to pack block {}: {}", block_id, e))
+            })?
+        };
+        {
+            let _t = Timer::new(Metric::BlockCommit);
+            root_session.pin_mut().push().map_err(|e| {
+                ChainError::TransactionError(format!("failed to commit block: {}", e))
+            })?;
+        }
         self.block_log
             .as_ref()
             .map(|log| log.append(block_id.clone(), &packed_block));
-        self.store_traces(block_id, &transaction_traces)?;
-        self.store_chain_state(block_id)?;
+        {
+            let _t = Timer::new(Metric::BlockStore);
+            self.store_traces(block_id, &transaction_traces)?;
+            self.store_chain_state(block_id)?;
+        }
         self.verified_blocks.remove(block_id);
         self.last_accepted_block = block.clone();
         self.last_accepted_block_id = block.id()?;
-        self.db.commit(block.block_num() as i64)?;
+        {
+            let _t = Timer::new(Metric::BlockCommit);
+            self.db.commit(block.block_num() as i64)?;
+        }
 
         if self.get_state() == &vm::State::NormalOp {
             info!(
@@ -524,8 +537,13 @@ impl Controller {
             }
         }
 
-        let transaction_mroot = self.calculate_trx_merkle(&transaction_receipts)?;
-        let action_mroot = self.calculate_action_merkle(&mut action_receipt_digests)?;
+        let (transaction_mroot, action_mroot) = {
+            let _t = Timer::new(Metric::BlockMerkle);
+            (
+                self.calculate_trx_merkle(&transaction_receipts)?,
+                self.calculate_action_merkle(&mut action_receipt_digests)?,
+            )
+        };
 
         // Update resource limits
         let global_property = Controller::get_global_properties(&self.db)?;
@@ -587,9 +605,10 @@ impl Controller {
         pending_block_timestamp: &BlockTimestamp,
         block_status: &BlockStatus,
     ) -> Result<TransactionResult, ChainError> {
-        use crate::profiling::{Metric, Timer};
-
-        let signed_transaction = packed_transaction.get_signed_transaction();
+        let signed_transaction = {
+            let _t = Timer::new(Metric::TxDecode);
+            packed_transaction.get_signed_transaction()
+        };
 
         // Verify basic transaction validity
         signed_transaction
@@ -613,17 +632,20 @@ impl Controller {
             )?;
         }
 
-        let mut trx_context = TransactionContext::new(
-            self.db.clone(),
-            self.wasm_runtime.clone(),
-            self.last_accepted_block().block_num() + 1,
-            pending_block_timestamp.clone(),
-            packed_transaction.id(),
-            *block_status,
-            packed_transaction.clone(),
-        );
-
-        let trx = packed_transaction.get_transaction();
+        let (mut trx_context, trx) = {
+            let _t = Timer::new(Metric::TxDecode);
+            let trx_context = TransactionContext::new(
+                self.db.clone(),
+                self.wasm_runtime.clone(),
+                self.last_accepted_block().block_num() + 1,
+                pending_block_timestamp.clone(),
+                packed_transaction.id(),
+                *block_status,
+                packed_transaction.clone(),
+            );
+            let trx = packed_transaction.get_transaction();
+            (trx_context, trx)
+        };
         {
             let _t = Timer::new(Metric::TxInit);
             trx_context.init_for_input_trx(

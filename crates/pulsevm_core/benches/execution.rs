@@ -35,6 +35,7 @@ use pulsevm_serialization::Write;
 use serde_json::json;
 use std::{
     fs,
+    hint::black_box,
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
@@ -46,7 +47,6 @@ use tempfile::env::temp_dir;
 // and cached), not the one-off LLVM compile of the contract.
 const WARMUP_TXS: usize = 50;
 const PROFILE_TXS: usize = 3000;
-const BLOCK_TXS: usize = 300;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Read, Write, NumBytes)]
 struct Issue {
@@ -105,7 +105,9 @@ fn main() {
     }
 
     println!();
-    lifecycle_throughput();
+    sig_recovery_micro();
+    println!();
+    lifecycle_throughput(profiled);
 }
 
 struct SizeResult {
@@ -117,7 +119,6 @@ struct SizeResult {
     find_ns: f64,
     find_per_tx: f64,
     modify_ns: f64,
-    ffi_ops_per_tx: f64,
     ffi_pct: f64,
 }
 
@@ -160,11 +161,6 @@ fn run_size(n_extra: usize) -> SizeResult {
         .filter(|(m, _)| profiling::group(*m) == Group::FfiState)
         .map(|(_, s)| s.total)
         .sum();
-    let ffi_calls: u64 = snap
-        .iter()
-        .filter(|(m, _)| profiling::group(*m) == Group::FfiState)
-        .map(|(_, s)| s.calls)
-        .sum();
 
     SizeResult {
         n_extra,
@@ -174,7 +170,6 @@ fn run_size(n_extra: usize) -> SizeResult {
         find_ns: per_op_ns(find),
         find_per_tx: find.calls as f64 / PROFILE_TXS as f64,
         modify_ns: per_op_ns(modify),
-        ffi_ops_per_tx: ffi_calls as f64 / PROFILE_TXS as f64,
         ffi_pct: ffi_sum.as_secs_f64() / wall.as_secs_f64() * 100.0,
     }
 }
@@ -220,9 +215,37 @@ fn account_sizes() -> Vec<usize> {
     vec![0, 20_000, 100_000]
 }
 
-/// Part B — build a block of transfers, then accept it. On this baseline the
-/// accept re-executes what build already ran; the two timings show that gap.
-fn lifecycle_throughput() {
+/// Part C — signature recovery in isolation (the ~20% execution stage), so the
+/// per-recovery cost is separable from the transfer workload.
+fn sig_recovery_micro() {
+    let (controller, private_key) = setup();
+    let chain_id = controller.chain_id().clone();
+    let tx = transfer_tx(&private_key, &chain_id, 0);
+    let signed = tx.get_signed_transaction();
+
+    for _ in 0..200 {
+        signed.recovered_keys(&chain_id).unwrap();
+    }
+    const N: usize = 20_000;
+    let start = Instant::now();
+    for _ in 0..N {
+        black_box(signed.recovered_keys(&chain_id).unwrap());
+    }
+    let e = start.elapsed();
+    println!("Part C — signature recovery (single-signature transaction)");
+    println!(
+        "  {N} recoveries in {:.3?}  =>  {:.2?}/recovery  ({:.0}/s)",
+        e,
+        e / N as u32,
+        N as f64 / e.as_secs_f64(),
+    );
+}
+
+/// Part B — build a block of transfers then accept it, over a sweep of block
+/// sizes. On this baseline accept re-executes what build already ran; both
+/// timings are shown, and the largest block gets a full per-stage/per-op/block
+/// breakdown.
+fn lifecycle_throughput(profiled: bool) {
     let (mut controller, private_key) = setup();
     let chain_id = controller.chain_id().clone();
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -235,51 +258,85 @@ fn lifecycle_throughput() {
     let ts = controller.last_accepted_block().timestamp().clone();
     for i in 0..WARMUP_TXS {
         controller
-            .execute_transaction(&transfer_tx(&private_key, &chain_id, 10_000_000 + i), &ts, &BlockStatus::Benchmarking)
+            .execute_transaction(
+                &transfer_tx(&private_key, &chain_id, 90_000_000 + i),
+                &ts,
+                &BlockStatus::Benchmarking,
+            )
             .unwrap();
     }
 
-    let mut mempool = Mempool::new();
-    for i in 0..BLOCK_TXS {
-        mempool.add_transaction(transfer_tx(&private_key, &chain_id, i));
-    }
+    let sizes = block_sizes();
+    let last = *sizes.last().unwrap();
+    println!("Part B — block lifecycle (build then accept), block sizes {sizes:?}");
+    println!(
+        "  {:>10}  {:>12}  {:>12}  {:>13}",
+        "txs/block", "build tx/s", "accept tx/s", "accept/build"
+    );
 
-    let build_start = Instant::now();
-    let block = match rt.block_on(controller.build_block(&mut mempool)) {
-        Ok(b) => b,
-        Err(e) => {
-            println!("Part B — skipped (build_block failed: {e})");
-            return;
+    let mut nonce = 0usize;
+    for &size in &sizes {
+        let mut mempool = Mempool::new();
+        for _ in 0..size {
+            mempool.add_transaction(transfer_tx(&private_key, &chain_id, 1_000_000 + nonce));
+            nonce += 1;
         }
-    };
-    let build_elapsed = build_start.elapsed();
-    let n = block.transactions.len();
 
-    let accept_start = Instant::now();
-    if let Err(e) = controller.accept_block(&block.id().unwrap(), &mut mempool) {
-        println!("Part B — build measured, accept failed: {e}");
-        return;
+        let profile_this = profiled && size == last;
+        if profile_this {
+            profiling::reset();
+        }
+
+        let t0 = Instant::now();
+        let block = match rt.block_on(controller.build_block(&mut mempool)) {
+            Ok(b) => b,
+            Err(e) => {
+                println!("  {size:>10}  build failed: {e}");
+                continue;
+            }
+        };
+        let build = t0.elapsed();
+        let n = block.transactions.len();
+
+        let t1 = Instant::now();
+        if let Err(e) = controller.accept_block(&block.id().unwrap(), &mut mempool) {
+            println!("  {size:>10}  accept failed: {e}");
+            continue;
+        }
+        let accept = t1.elapsed();
+        // Advance preferred so the next size builds on the just-accepted block
+        // (build_block builds on preferred, which we must keep at the tip).
+        controller.set_preferred_id(block.id().unwrap());
+
+        println!(
+            "  {:>10}  {:>12.0}  {:>12.0}  {:>12.2}x",
+            n,
+            n as f64 / build.as_secs_f64(),
+            n as f64 / accept.as_secs_f64(),
+            accept.as_secs_f64() / build.as_secs_f64().max(f64::MIN_POSITIVE),
+        );
+
+        if profile_this {
+            println!("\nPart B detail — one {n}-tx block (build + accept):");
+            print_profile(build + accept, n);
+        }
     }
-    let accept_elapsed = accept_start.elapsed();
+    println!(
+        "  (build > accept because build also does per-tx child sessions, merkle and mempool work;"
+    );
+    println!(
+        "   both execute every tx, so the ~2x re-execution is real work, not accept == build)"
+    );
+}
 
-    println!("Part B — block lifecycle ({n} transfers/block)");
-    println!(
-        "  build : {:.3?}  =>  {:.0} tx/s",
-        build_elapsed,
-        n as f64 / build_elapsed.as_secs_f64()
-    );
-    println!(
-        "  accept: {:.3?}  =>  {:.0} tx/s   (re-executes the block on this baseline)",
-        accept_elapsed,
-        n as f64 / accept_elapsed.as_secs_f64()
-    );
-    let total = build_elapsed + accept_elapsed;
-    println!(
-        "  total : {:.3?}  =>  {:.0} tx/s effective   (accept/build = {:.2}x)",
-        total,
-        n as f64 / total.as_secs_f64(),
-        accept_elapsed.as_secs_f64() / build_elapsed.as_secs_f64().max(f64::MIN_POSITIVE),
-    );
+fn block_sizes() -> Vec<usize> {
+    if let Ok(v) = std::env::var("BENCH_BLOCK_TXS") {
+        let parsed: Vec<usize> = v.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+        if !parsed.is_empty() {
+            return parsed;
+        }
+    }
+    vec![200, 1_000, 5_000]
 }
 
 fn print_profile(total_wall: Duration, txs: usize) {
@@ -320,6 +377,21 @@ fn print_profile(total_wall: Duration, txs: usize) {
         "  note: object field accessors (get_payer/get_value/...) are cxx calls not yet counted;"
     );
     println!("        the FFI figures are lock-guarded Database ops only.");
+
+    // Block finalization is per-block (populated only in the lifecycle path); skip
+    // it when nothing was recorded (e.g. the Part A execute_transaction loop).
+    let block: Vec<_> = snap.iter().filter(|(m, _)| profiling::group(*m) == Group::Block).collect();
+    let block_sum: Duration = block.iter().map(|(_, s)| s.total).sum();
+    if block_sum > Duration::ZERO {
+        println!(
+            "  block finalization (sum {:.3?} = {:.0}% of wall):",
+            block_sum,
+            block_sum.as_secs_f64() / total_wall.as_secs_f64() * 100.0
+        );
+        for (m, s) in &block {
+            print_row(profiling::metric_name(*m), s.total, block_sum, s.calls, txs);
+        }
+    }
 }
 
 fn print_row(name: &str, total: Duration, group_sum: Duration, calls: u64, txs: f64) {
@@ -514,14 +586,16 @@ fn generate_genesis() -> Vec<u8> {
         "initial_timestamp": "2023-01-01T00:00:00",
         "initial_key": "PUB_K1_8XeW7H2JhKFP8Wjw31cv4j4Bpw4in8MVMrtmfUunJV4gSVBzqZ",
         "initial_configuration": {
-            "max_block_net_usage": 1048576,
+            // block net/cpu limits raised so the lifecycle sweep can put thousands
+            // of transactions in one block instead of filling up at ~130.
+            "max_block_net_usage": 1073741824u32,
             "target_block_net_usage_pct": 1000,
             "max_transaction_net_usage": 524288,
             "base_per_transaction_net_usage": 12,
             "net_usage_leeway": 500,
             "context_free_discount_net_usage_num": 20,
             "context_free_discount_net_usage_den": 100,
-            "max_block_cpu_usage": 200000,
+            "max_block_cpu_usage": 1000000000u32,
             "target_block_cpu_usage_pct": 2500,
             "max_transaction_cpu_usage": 150000,
             "min_transaction_cpu_usage": 100,

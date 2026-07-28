@@ -1,15 +1,14 @@
-//! Feature-gated execution + FFI/state profiler.
+//! Feature-gated execution + FFI/state + block-finalization profiler.
 //!
-//! One thread-local registry attributes time and call counts across two groups:
+//! One thread-local registry attributes time and call counts across three groups:
 //!
-//! * **Execution** stages of a single transaction (signature recovery, authority
-//!   check, WASM setup/exec, finalize) — recorded by `pulsevm_core`.
-//! * **FFI / state** operations at the database boundary (each one takes the
+//! * **Execution** stages of a single transaction (decode, signature recovery,
+//!   authority check, WASM setup/instantiate/exec, finalize) — recorded by
+//!   `pulsevm_core`.
+//! * **FFI / state** operations at the database boundary (each takes the
 //!   `RwLock` and crosses into C++ chainbase) — recorded here in `database.rs`.
-//!
-//! Comparing the two answers the question the optimization work hinges on: how
-//! much of "execution" is actually the fine-grained FFI/state boundary, and is
-//! it worth batching (state deltas) or parallelizing.
+//! * **Block finalization** (merkle roots, block serialization, state-history
+//!   store, chainbase commit) — recorded by `pulsevm_core` around a block.
 //!
 //! Everything is behind the `profiling` feature. With it off, `Timer::new`,
 //! `count`, `reset` and `snapshot` are empty inlines, so the consensus path
@@ -17,13 +16,15 @@
 
 pub use imp::{Group, Metric, MetricStat, Timer, count, reset, snapshot};
 
-/// Every metric, in report order. Execution stages first, then the FFI/state
-/// boundary. Kept in sync with the `Metric` enum's discriminants.
-pub const METRICS: [Metric; 17] = [
+/// Every metric, in report order (Execution, then FFI/state, then Block). Kept
+/// in sync with the `Metric` enum's discriminants.
+pub const METRICS: [Metric; 23] = [
+    Metric::TxDecode,
     Metric::SigRecovery,
     Metric::Authorization,
     Metric::TxInit,
     Metric::WasmSetup,
+    Metric::WasmInstantiate,
     Metric::WasmExec,
     Metric::Finalize,
     Metric::DbFind,
@@ -37,26 +38,37 @@ pub const METRICS: [Metric; 17] = [
     Metric::DbCommit,
     Metric::DbResource,
     Metric::DbGlobal,
+    Metric::BlockMerkle,
+    Metric::BlockPack,
+    Metric::BlockStore,
+    Metric::BlockCommit,
 ];
 
 pub fn group(metric: Metric) -> Group {
     match metric {
-        Metric::SigRecovery
+        Metric::TxDecode
+        | Metric::SigRecovery
         | Metric::Authorization
         | Metric::TxInit
         | Metric::WasmSetup
+        | Metric::WasmInstantiate
         | Metric::WasmExec
         | Metric::Finalize => Group::Execution,
+        Metric::BlockMerkle | Metric::BlockPack | Metric::BlockStore | Metric::BlockCommit => {
+            Group::Block
+        }
         _ => Group::FfiState,
     }
 }
 
 pub fn metric_name(metric: Metric) -> &'static str {
     match metric {
+        Metric::TxDecode => "tx decode + context setup",
         Metric::SigRecovery => "signature recovery",
         Metric::Authorization => "authority check",
         Metric::TxInit => "tx init (net/cpu)",
-        Metric::WasmSetup => "wasm setup (compile/instantiate)",
+        Metric::WasmSetup => "wasm setup (compile/store/imports)",
+        Metric::WasmInstantiate => "wasm instantiate (Instance::new)",
         Metric::WasmExec => "wasm exec (+ host calls)",
         Metric::Finalize => "finalize / billing",
         Metric::DbFind => "db find (by key)",
@@ -70,6 +82,10 @@ pub fn metric_name(metric: Metric) -> &'static str {
         Metric::DbCommit => "db commit",
         Metric::DbResource => "resource limits/usage",
         Metric::DbGlobal => "global properties",
+        Metric::BlockMerkle => "merkle roots",
+        Metric::BlockPack => "block serialize (pack)",
+        Metric::BlockStore => "state-history store",
+        Metric::BlockCommit => "chainbase commit",
     }
 }
 
@@ -82,15 +98,18 @@ mod imp {
     pub enum Group {
         Execution,
         FfiState,
+        Block,
     }
 
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     #[repr(usize)]
     pub enum Metric {
-        SigRecovery = 0,
+        TxDecode = 0,
+        SigRecovery,
         Authorization,
         TxInit,
         WasmSetup,
+        WasmInstantiate,
         WasmExec,
         Finalize,
         DbFind,
@@ -104,9 +123,13 @@ mod imp {
         DbCommit,
         DbResource,
         DbGlobal,
+        BlockMerkle,
+        BlockPack,
+        BlockStore,
+        BlockCommit,
     }
 
-    const N: usize = 17;
+    const N: usize = 23;
 
     #[derive(Clone, Copy, Default, Debug)]
     pub struct MetricStat {
@@ -171,14 +194,17 @@ mod imp {
     pub enum Group {
         Execution,
         FfiState,
+        Block,
     }
 
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub enum Metric {
+        TxDecode,
         SigRecovery,
         Authorization,
         TxInit,
         WasmSetup,
+        WasmInstantiate,
         WasmExec,
         Finalize,
         DbFind,
@@ -192,6 +218,10 @@ mod imp {
         DbCommit,
         DbResource,
         DbGlobal,
+        BlockMerkle,
+        BlockPack,
+        BlockStore,
+        BlockCommit,
     }
 
     #[derive(Clone, Copy, Default, Debug)]

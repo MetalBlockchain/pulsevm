@@ -8,9 +8,10 @@ fn bench(value: &Vec<u8>) {
 }
 
 fn criterion_benchmark(c: &mut Criterion) {
+    // ~800 KB of packed bytes (100k u64s), read back as a length-prefixed byte vec.
     let value: Vec<u64> = (0..100000).map(|v| v + 1000).collect();
     let value = value.pack().unwrap();
-    c.bench_function("fib 20", |b| b.iter(|| bench(black_box(&value))));
+    c.bench_function("read_vec_u8_800kb", |b| b.iter(|| bench(black_box(&value))));
 }
 
 criterion_group!(benches, criterion_benchmark);
