@@ -359,11 +359,11 @@ impl Controller {
         // holds the preferred state, reusing any already-executed prefix.
         self.replay_accepted_state_to(self.preferred_id, &block_status, mempool)?;
 
-        // This block's own session sits on top of the reconciled preferred state.
         let mut db = self.db.clone();
         let mut block_session = db.create_undo_session(true)?;
 
-        // Clear expired transactions from the database (part of this block's state).
+        // Expiry clearing is part of the block's state, so it belongs inside the
+        // block's session rather than before it.
         db.clear_expired_input_transactions(&timestamp.into())?;
 
         // Get transactions from the mempool
@@ -499,7 +499,6 @@ impl Controller {
         let (transaction_traces, transaction_mroot, action_mroot) =
             self.execute_block(block, &block_status, mempool)?;
 
-        // Validate the block's transaction and action merkle roots.
         block.validate_semantically(transaction_mroot, action_mroot)?;
 
         let block_id = block.id()?;
