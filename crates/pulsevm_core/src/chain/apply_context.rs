@@ -341,7 +341,7 @@ impl ApplyContext {
                     )),
                 )?;
                 pulse_assert(
-                    AuthorizationManager::find_permission(&mut self.db, auth)?.is_some(),
+                    AuthorizationManager::find_permission(&self.db.read()?, auth)?.is_some(),
                     ChainError::TransactionError(format!(
                         "inline action's authorizations include a non-existent permission: {}",
                         auth

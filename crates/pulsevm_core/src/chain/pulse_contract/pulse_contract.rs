@@ -78,33 +78,44 @@ pub fn newaccount(
     validate_authority_precondition(db, &create.owner)?;
     validate_authority_precondition(db, &create.active)?;
 
-    let owner_permission = unsafe {
-        &*AuthorizationManager::create_permission(
-            db,
-            &create.name,
-            &OWNER_NAME.into(),
-            0,
-            &create.owner.into(),
-            &context.pending_block_timestamp().into(),
-        )?
+    AuthorizationManager::create_permission(
+        db,
+        &create.name,
+        &OWNER_NAME.into(),
+        0,
+        &create.owner.into(),
+        &context.pending_block_timestamp().into(),
+    )?;
+    // Re-read the created permission's id and size rather than holding the
+    // creation pointer across the next create.
+    let (owner_id, owner_size) = {
+        let r = db.read()?;
+        let p =
+            AuthorizationManager::get_permission(&r, create.name.as_u64(), OWNER_NAME.as_u64())?;
+        (p.get_id(), p.get_authority().get_billable_size() as i64)
     };
-    let active_permission = unsafe {
-        &*AuthorizationManager::create_permission(
-            db,
-            &create.name,
-            &ACTIVE_NAME.into(),
-            owner_permission.get_id() as u64,
-            &create.active.into(),
-            &context.pending_block_timestamp().into(),
-        )?
+
+    AuthorizationManager::create_permission(
+        db,
+        &create.name,
+        &ACTIVE_NAME.into(),
+        owner_id as u64,
+        &create.active.into(),
+        &context.pending_block_timestamp().into(),
+    )?;
+    let active_size = {
+        let r = db.read()?;
+        let p =
+            AuthorizationManager::get_permission(&r, create.name.as_u64(), ACTIVE_NAME.as_u64())?;
+        p.get_authority().get_billable_size() as i64
     };
 
     ResourceLimitsManager::initialize_account(db, &create.name)?;
 
     let mut ram_delta: i64 = OVERHEAD_PER_ACCOUNT_RAM_BYTES as i64;
     ram_delta += 2 * billable_size_v::<PermissionObject>() as i64;
-    ram_delta += owner_permission.get_authority().get_billable_size() as i64;
-    ram_delta += active_permission.get_authority().get_billable_size() as i64;
+    ram_delta += owner_size;
+    ram_delta += active_size;
 
     context.add_ram_usage(&create.name, ram_delta)?;
 
@@ -274,59 +285,79 @@ pub fn updateauth(
 
     validate_authority_precondition(db, &update.auth)?;
 
-    let permission = AuthorizationManager::find_permission(
-        db,
-        &PermissionLevel::new(update.account.as_u64(), update.permission.as_u64()),
-    )?;
+    let requested = PermissionLevel::new(update.account.as_u64(), update.permission.as_u64());
 
-    let mut parent_id = 0i64;
-    if update.permission != OWNER_NAME {
-        let parent = AuthorizationManager::get_permission(
-            db,
-            update.account.as_u64(),
-            update.parent.as_u64(),
-        )?;
-        parent_id = parent.get_id();
-    }
+    // Resolve the parent id and the existing permission's size in a read scope
+    // that closes before the mutation below, so nothing borrows the DB across it.
+    let (exists, parent_id, old_size) = {
+        let r = db.read()?;
+        let mut parent_id = 0i64;
+        if update.permission != OWNER_NAME {
+            parent_id = AuthorizationManager::get_permission(
+                &r,
+                update.account.as_u64(),
+                update.parent.as_u64(),
+            )?
+            .get_id();
+        }
+        match AuthorizationManager::find_permission(&r, &requested)? {
+            Some(permission) => {
+                pulse_assert(
+                    parent_id == permission.get_parent_id(),
+                    ChainError::ActionValidationError(format!(
+                        "changing parent authority is not currently supported"
+                    )),
+                )?;
+                let old_size = billable_size_v::<PermissionObject>() as i64
+                    + permission.get_authority().get_billable_size() as i64;
+                (true, parent_id, old_size)
+            }
+            None => (false, parent_id, 0i64),
+        }
+    };
 
-    if permission.is_some() {
-        let permission = permission.unwrap();
-        pulse_assert(
-            parent_id == permission.get_parent_id(),
-            ChainError::ActionValidationError(format!(
-                "changing parent authority is not currently supported"
-            )),
-        )?;
-
-        let old_size: i64 = billable_size_v::<PermissionObject>() as i64
-            + permission.get_authority().get_billable_size() as i64;
+    if exists {
         AuthorizationManager::modify_permission(
             db,
-            permission,
+            update.account.as_u64(),
+            update.permission.as_u64(),
             &update.auth,
             &context.get_pending_block_time().to_time_point(),
         )?;
-        let new_size: i64 = billable_size_v::<PermissionObject>() as i64
-            + permission.get_authority().get_billable_size() as i64;
-
-        context.add_ram_usage(
-            &permission.get_owner().to_uint64_t().into(),
-            new_size - old_size,
-        )?;
-    } else {
-        let permission = unsafe {
-            &*AuthorizationManager::create_permission(
-                db,
-                &update.account,
-                &update.permission,
-                parent_id as u64,
-                &update.auth.into(),
-                &context.pending_block_timestamp().into(),
-            )?
+        // Re-read the modified permission's size rather than reading it through
+        // a reference held across the mutation.
+        let new_size = {
+            let r = db.read()?;
+            let permission = AuthorizationManager::get_permission(
+                &r,
+                update.account.as_u64(),
+                update.permission.as_u64(),
+            )?;
+            billable_size_v::<PermissionObject>() as i64
+                + permission.get_authority().get_billable_size() as i64
         };
 
-        let new_size: i64 = billable_size_v::<PermissionObject>() as i64
-            + permission.get_authority().get_billable_size() as i64;
+        context.add_ram_usage(&update.account, new_size - old_size)?;
+    } else {
+        AuthorizationManager::create_permission(
+            db,
+            &update.account,
+            &update.permission,
+            parent_id as u64,
+            &update.auth.into(),
+            &context.pending_block_timestamp().into(),
+        )?;
+
+        let new_size = {
+            let r = db.read()?;
+            let permission = AuthorizationManager::get_permission(
+                &r,
+                update.account.as_u64(),
+                update.permission.as_u64(),
+            )?;
+            billable_size_v::<PermissionObject>() as i64
+                + permission.get_authority().get_billable_size() as i64
+        };
 
         context.add_ram_usage(&update.account, new_size)?;
     }
@@ -424,7 +455,7 @@ fn validate_authority_precondition(db: &mut Database, auth: &Authority) -> Resul
             continue; // virtual pulse.code permission does not really exist but is allowed
         }
 
-        AuthorizationManager::get_permission(db, a.permission.actor, a.permission.permission)
+        AuthorizationManager::get_permission(&db.read()?, a.permission.actor, a.permission.permission)
             .map_err(|_| {
                 ChainError::TransactionError(format!(
                     "permission {}@{} does not exist",

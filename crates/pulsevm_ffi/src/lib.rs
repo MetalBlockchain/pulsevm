@@ -30,7 +30,7 @@ pub use crate::bridge::ffi::{
     trunctfsf2, unordtf2,
 };
 pub use crate::bridge::ffi::UndoSession;
-pub use crate::database::Database;
+pub use crate::database::{Database, DbRead, DbWrite};
 pub use crate::iterator_cache::{
     Index64IteratorCache, Index128IteratorCache, Index256IteratorCache, IndexDoubleIteratorCache,
     IndexLongDoubleIteratorCache, KeyValueIteratorCache,

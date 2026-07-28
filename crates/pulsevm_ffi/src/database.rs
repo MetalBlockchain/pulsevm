@@ -1725,28 +1725,56 @@ impl Database {
 
     pub fn modify_permission(
         &mut self,
-        permission: &ffi::PermissionObject,
+        actor: u64,
+        permission: u64,
         authority: &Authority,
         pending_block_time: &TimePoint,
     ) -> Result<(), ChainError> {
         let mut guard = self.inner.write()?;
+        // Resolve and modify under one write guard; the resolved pointer never
+        // escapes this method, so no shared reference is held across the mutation.
+        let perm = guard
+            .find_permission_by_actor_and_permission(actor, permission)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        if perm.is_null() {
+            return Err(ChainError::InternalError(format!(
+                "permission not found for actor: {} permission: {}",
+                Name::new(actor),
+                Name::new(permission)
+            )));
+        }
+        let perm = unsafe { &*perm };
         let pinned = guard.pin_mut();
 
         pinned
-            .modify_permission(permission, authority, pending_block_time)
+            .modify_permission(perm, authority, pending_block_time)
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 
     pub fn update_permission_usage(
         &mut self,
-        permission: &ffi::PermissionObject,
+        actor: u64,
+        permission: u64,
         pending_block_time: &TimePoint,
     ) -> Result<(), ChainError> {
         let mut guard = self.inner.write()?;
+        // Resolve and modify under one write guard; the resolved pointer never
+        // escapes this method, so no shared reference is held across the mutation.
+        let perm = guard
+            .find_permission_by_actor_and_permission(actor, permission)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        if perm.is_null() {
+            return Err(ChainError::InternalError(format!(
+                "permission not found for actor: {} permission: {}",
+                Name::new(actor),
+                Name::new(permission)
+            )));
+        }
+        let perm = unsafe { &*perm };
         let pinned = guard.pin_mut();
 
         pinned
-            .update_permission_usage(permission, pending_block_time)
+            .update_permission_usage(perm, pending_block_time)
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 
@@ -2032,6 +2060,162 @@ mod tests {
             hex_deltas,
             "0100076163636f756e7401010e00000000000090b1ca0000000000"
         );
+    }
+}
+
+impl Database {
+    /// Acquire a read view. The lock is held for the lifetime of the returned
+    /// `DbRead`, and every reference it hands out is bound to `&self`, so a
+    /// chainbase reference can never outlive the lock or escape the view.
+    pub fn read(&self) -> Result<DbRead<'_>, ChainError> {
+        Ok(DbRead {
+            guard: self.inner.read()?,
+        })
+    }
+
+    /// Acquire a write view. Exposes the same reads as [`DbRead`] plus mutation,
+    /// all under a single write lock, so reads and the mutations that depend on
+    /// them share one guard instead of re-locking.
+    pub fn write(&self) -> Result<DbWrite<'_>, ChainError> {
+        Ok(DbWrite {
+            guard: self.inner.write()?,
+        })
+    }
+}
+
+/// Read view over the chainbase database. Holds an [`RwLockReadGuard`] for its
+/// lifetime; references returned by its methods borrow `&self` and therefore
+/// cannot outlive the held lock.
+pub struct DbRead<'g> {
+    guard: std::sync::RwLockReadGuard<'g, UniquePtr<ffi::Database>>,
+}
+
+impl<'g> DbRead<'g> {
+    fn db(&self) -> &ffi::Database {
+        &self.guard
+    }
+
+    pub fn find_permission_by_actor_and_permission(
+        &self,
+        actor: u64,
+        permission: u64,
+    ) -> Result<Option<&ffi::PermissionObject>, ChainError> {
+        let res = self
+            .db()
+            .find_permission_by_actor_and_permission(actor, permission)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        Ok(unsafe { res.as_ref() })
+    }
+
+    pub fn find_permission(&self, id: i64) -> Result<Option<&ffi::PermissionObject>, ChainError> {
+        let res = self
+            .db()
+            .find_permission(id)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        Ok(unsafe { res.as_ref() })
+    }
+
+    pub fn find_account(&self, account_name: u64) -> Result<Option<&ffi::AccountObject>, ChainError> {
+        let res = self
+            .db()
+            .find_account(account_name)
+            .map_err(|e| ChainError::InternalError(format!("failed to get account: {}", e)))?;
+        Ok(unsafe { res.as_ref() })
+    }
+
+    pub fn find_account_metadata(
+        &self,
+        account_name: u64,
+    ) -> Result<Option<&ffi::AccountMetadataObject>, ChainError> {
+        let res = self.db().find_account_metadata(account_name).map_err(|e| {
+            ChainError::InternalError(format!("failed to find account metadata: {}", e))
+        })?;
+        Ok(unsafe { res.as_ref() })
+    }
+
+    pub fn get_global_properties(&self) -> Result<&ffi::GlobalPropertyObject, ChainError> {
+        let res = self
+            .db()
+            .get_global_properties()
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        Ok(res)
+    }
+
+    /// Like [`find_permission_by_actor_and_permission`] but errors when absent.
+    pub fn get_permission_by_actor_and_permission(
+        &self,
+        actor: u64,
+        permission: u64,
+    ) -> Result<&ffi::PermissionObject, ChainError> {
+        self.find_permission_by_actor_and_permission(actor, permission)?
+            .ok_or_else(|| {
+                ChainError::InternalError(format!(
+                    "permission not found for actor: {} permission: {}",
+                    Name::new(actor),
+                    Name::new(permission)
+                ))
+            })
+    }
+
+    pub fn permission_satisfies_other_permission(
+        &self,
+        permission: &ffi::PermissionObject,
+        other_permission: &ffi::PermissionObject,
+    ) -> Result<bool, ChainError> {
+        self.db()
+            .permission_satisfies_other_permission(permission, other_permission)
+            .map_err(|e| ChainError::TransactionError(format!("{}", e)))
+    }
+
+    pub fn get_permission_last_used(
+        &self,
+        permission: &ffi::PermissionObject,
+    ) -> Result<TimePoint, ChainError> {
+        self.db()
+            .get_permission_last_used(permission)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
+    pub fn lookup_linked_permission(
+        &self,
+        account: u64,
+        code: u64,
+        requirement_type: u64,
+    ) -> Result<Option<u64>, ChainError> {
+        let res = self
+            .db()
+            .lookup_linked_permission(account, code, requirement_type)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+
+        if res.is_null() {
+            return Ok(None);
+        }
+
+        Ok(Some(unsafe { &*res }.to_uint64_t()))
+    }
+}
+
+/// Write view over the chainbase database. Wraps a write guard and exposes the
+/// same reads as [`DbRead`] (via [`DbWrite::reads`]) plus mutating operations.
+pub struct DbWrite<'g> {
+    guard: std::sync::RwLockWriteGuard<'g, UniquePtr<ffi::Database>>,
+}
+
+impl<'g> DbWrite<'g> {
+    fn db(&self) -> &ffi::Database {
+        &self.guard
+    }
+
+    pub fn find_permission_by_actor_and_permission(
+        &self,
+        actor: u64,
+        permission: u64,
+    ) -> Result<Option<&ffi::PermissionObject>, ChainError> {
+        let res = self
+            .db()
+            .find_permission_by_actor_and_permission(actor, permission)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        Ok(unsafe { res.as_ref() })
     }
 }
 
