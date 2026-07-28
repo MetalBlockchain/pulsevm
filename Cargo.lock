@@ -3305,6 +3305,18 @@ name = "pulsevm_billable_size"
 version = "0.1.0"
 
 [[package]]
+name = "pulsevm_chainbase"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "memmap2 0.9.11",
+ "parking_lot",
+ "pulsevm_proc_macros",
+ "pulsevm_serialization",
+ "tempfile",
+]
+
+[[package]]
 name = "pulsevm_constants"
 version = "0.1.0"
 
