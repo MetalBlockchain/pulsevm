@@ -392,7 +392,7 @@ fn generate_genesis(private_key: &PrivateKey) -> Vec<u8> {
             "target_block_cpu_usage_pct": 2500,
             "max_transaction_cpu_usage": 150000,
             "min_transaction_cpu_usage": 100,
-            "max_transaction_lifetime": 3600,
+            "max_transaction_lifetime": 4294967295u32,
             "max_inline_action_size": 4096,
             "max_inline_action_depth": 6,
             "max_authority_depth": 6,

@@ -3,6 +3,11 @@ name = "pulsevm_core"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Enables the execution + FFI/state profiler (re-exported from pulsevm_ffi). Off
+# by default so the consensus path carries no timing overhead; on for benchmarks.
+profiling = ["pulsevm_ffi/profiling"]
+
 [dependencies]
 anyhow = "1.0.98"
 base64 = "0.22.1"
@@ -45,4 +50,8 @@ criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 
 [[bench]]
 name = "transfer"
+harness = false
+
+[[bench]]
+name = "execution"
 harness = false

@@ -43,6 +43,7 @@ impl Database {
     }
 
     pub fn commit(&mut self, revision: i64) -> Result<(), ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbCommit);
         self.inner
             .write()?
             .pin_mut()
@@ -51,6 +52,7 @@ impl Database {
     }
 
     pub fn undo(&mut self) -> Result<(), ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbSession);
         self.inner
             .write()?
             .pin_mut()
@@ -89,6 +91,7 @@ impl Database {
         account_name: u64,
         creation_date: u32,
     ) -> Result<*const ffi::AccountObject, ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbInsert);
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
 
@@ -100,6 +103,7 @@ impl Database {
     }
 
     pub fn find_account(&self, account_name: u64) -> Result<*const ffi::AccountObject, ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbFind);
         let guard = self.inner.read()?;
         let account = guard
             .find_account(account_name)
@@ -112,6 +116,7 @@ impl Database {
         &self,
         account_name: u64,
     ) -> Result<&'static ffi::AccountObject, ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbFind);
         let guard = self.inner.read()?;
         let account = guard
             .find_account(account_name)
@@ -132,6 +137,7 @@ impl Database {
         account_name: u64,
         is_privileged: bool,
     ) -> Result<*const ffi::AccountMetadataObject, ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbInsert);
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
 
@@ -146,6 +152,7 @@ impl Database {
         &self,
         account_name: u64,
     ) -> Result<*const ffi::AccountMetadataObject, ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbFind);
         let guard = self.inner.read()?;
 
         guard.find_account_metadata(account_name).map_err(|e| {
@@ -166,6 +173,7 @@ impl Database {
         &self,
         account_name: u64,
     ) -> Result<&'static ffi::AccountMetadataObject, ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbFind);
         let guard = self.inner.read()?;
         let res = guard.find_account_metadata(account_name).map_err(|e| {
             ChainError::InternalError(format!("failed to find account metadata: {}", e))
@@ -203,6 +211,7 @@ impl Database {
         vm_type: u8,
         vm_version: u8,
     ) -> Result<(), ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbModify);
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
 
@@ -225,6 +234,7 @@ impl Database {
         account_metadata: &ffi::AccountMetadataObject,
         abi: &[u8],
     ) -> Result<(), ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbModify);
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
 
@@ -237,6 +247,7 @@ impl Database {
         &mut self,
         enabled: bool,
     ) -> Result<cxx::UniquePtr<ffi::UndoSession>, ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbSession);
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
 
@@ -258,6 +269,7 @@ impl Database {
         &mut self,
         account_name: u64,
     ) -> Result<(), ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbResource);
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
 
@@ -271,6 +283,7 @@ impl Database {
         account: &Name,
         time_slot: u32,
     ) -> Result<(), ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbModify);
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
 
@@ -286,6 +299,7 @@ impl Database {
         net_usage: u64,
         time_slot: u32,
     ) -> Result<(), ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbResource);
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
 
@@ -299,6 +313,7 @@ impl Database {
         account_name: u64,
         ram_bytes: i64,
     ) -> Result<(), ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbResource);
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
 
@@ -308,6 +323,7 @@ impl Database {
     }
 
     pub fn verify_account_ram_usage(&mut self, account_name: u64) -> Result<(), ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbResource);
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
 
@@ -317,6 +333,7 @@ impl Database {
     }
 
     pub fn get_account_ram_usage(&self, account_name: u64) -> Result<i64, ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbResource);
         let guard = self.inner.read()?;
 
         guard
@@ -346,6 +363,7 @@ impl Database {
         net_weight: &mut i64,
         cpu_weight: &mut i64,
     ) -> Result<(), ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbResource);
         let guard = self.inner.read()?;
 
         guard
@@ -374,6 +392,7 @@ impl Database {
         name: u64,
         greylist_limit: u32,
     ) -> Result<ffi::NetLimitResult, ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbResource);
         let guard = self.inner.read()?;
 
         guard
@@ -386,6 +405,7 @@ impl Database {
         name: u64,
         greylist_limit: u32,
     ) -> Result<ffi::CpuLimitResult, ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbResource);
         let guard = self.inner.read()?;
 
         guard
@@ -394,6 +414,7 @@ impl Database {
     }
 
     pub fn process_account_limit_updates(&mut self) -> Result<(), ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbResource);
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
 
@@ -407,6 +428,7 @@ impl Database {
         cpu_limit_parameters: &ElasticLimitParameters,
         net_limit_parameters: &ElasticLimitParameters,
     ) -> Result<(), ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbResource);
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
 
@@ -416,6 +438,7 @@ impl Database {
     }
 
     pub fn process_block_usage(&mut self, block_num: u32) -> Result<(), ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbResource);
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
 
@@ -430,6 +453,7 @@ impl Database {
         scope: u64,
         table: u64,
     ) -> Result<*const TableObject, ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbFind);
         let guard = self.inner.read()?;
         let res = guard
             .find_table(code, scope, table)
@@ -466,6 +490,7 @@ impl Database {
         table: u64,
         payer: u64,
     ) -> Result<*const TableObject, ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbInsert);
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
         let res = pinned
@@ -482,6 +507,7 @@ impl Database {
         id: u64,
         keyval_cache: &mut KeyValueIteratorCache,
     ) -> Result<i32, ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbFind);
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
 
@@ -496,6 +522,7 @@ impl Database {
         id: u64,
         buffer: &[u8],
     ) -> Result<*const KeyValueObject, ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbInsert);
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
 
@@ -527,6 +554,7 @@ impl Database {
         payer: u64,
         buffer: &[u8],
     ) -> Result<(), ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbModify);
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
 
@@ -550,6 +578,7 @@ impl Database {
     }
 
     pub fn remove_table(&mut self, table: &TableObject) -> Result<(), ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbRemove);
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
 
@@ -559,6 +588,7 @@ impl Database {
     }
 
     pub fn is_account(&self, account: u64) -> Result<bool, ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbFind);
         let guard = self.inner.read()?;
 
         guard
@@ -567,6 +597,7 @@ impl Database {
     }
 
     pub fn find_permission(&self, id: i64) -> Result<*const ffi::PermissionObject, ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbFind);
         let guard = self.inner.read()?;
         let res = guard
             .find_permission(id)
@@ -580,6 +611,7 @@ impl Database {
         actor: u64,
         permission: u64,
     ) -> Result<*const ffi::PermissionObject, ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbFind);
         let guard = self.inner.read()?;
         let res = guard
             .find_permission_by_actor_and_permission(actor, permission)
@@ -593,6 +625,7 @@ impl Database {
         actor: u64,
         permission: u64,
     ) -> Result<*const ffi::PermissionObject, ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbFind);
         let guard = self.inner.read()?;
         let res = guard
             .find_permission_by_actor_and_permission(actor, permission)
@@ -653,6 +686,7 @@ impl Database {
         vm_type: u8,
         vm_version: u8,
     ) -> Result<*const ffi::CodeObject, ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbFind);
         let guard = self.inner.read()?;
         let res = guard
             .get_code_object_by_hash(code_hash, vm_type, vm_version)
@@ -665,6 +699,7 @@ impl Database {
         &mut self,
         receiver_account: &AccountMetadataObject,
     ) -> Result<u64, ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbModify);
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
 
@@ -674,6 +709,7 @@ impl Database {
     }
 
     pub fn next_auth_sequence(&mut self, actor: u64) -> Result<u64, ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbModify);
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
 
@@ -683,6 +719,7 @@ impl Database {
     }
 
     pub fn next_global_sequence(&mut self) -> Result<u64, ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbModify);
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
 
@@ -697,6 +734,7 @@ impl Database {
         iterator: i32,
         receiver: u64,
     ) -> Result<i64, ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbRemove);
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
 
@@ -1611,6 +1649,7 @@ impl Database {
         iterator: i32,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbIterate);
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
 
@@ -1625,6 +1664,7 @@ impl Database {
         iterator: i32,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbIterate);
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
 
@@ -1640,6 +1680,7 @@ impl Database {
         scope: u64,
         table: u64,
     ) -> Result<i32, ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbIterate);
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
 
@@ -1656,6 +1697,7 @@ impl Database {
         table: u64,
         id: u64,
     ) -> Result<i32, ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbIterate);
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
 
@@ -1672,6 +1714,7 @@ impl Database {
         table: u64,
         id: u64,
     ) -> Result<i32, ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbIterate);
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
 
@@ -1684,6 +1727,7 @@ impl Database {
         &mut self,
         permission: &ffi::PermissionObject,
     ) -> Result<(), ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbRemove);
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
 
@@ -1700,6 +1744,7 @@ impl Database {
         auth: &Authority,
         creation_time: &TimePoint,
     ) -> Result<*const ffi::PermissionObject, ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbInsert);
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
 
@@ -1715,6 +1760,7 @@ impl Database {
         permission: &ffi::PermissionObject,
         other_permission: &ffi::PermissionObject,
     ) -> Result<bool, ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbFind);
         let guard = self.inner.read()?;
         let res = guard
             .permission_satisfies_other_permission(permission, other_permission)
@@ -1730,6 +1776,7 @@ impl Database {
         authority: &Authority,
         pending_block_time: &TimePoint,
     ) -> Result<(), ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbModify);
         let mut guard = self.inner.write()?;
         // Resolve and modify under one write guard; the resolved pointer never
         // escapes this method, so no shared reference is held across the mutation.
@@ -1757,6 +1804,7 @@ impl Database {
         permission: u64,
         pending_block_time: &TimePoint,
     ) -> Result<(), ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbModify);
         let mut guard = self.inner.write()?;
         // Resolve and modify under one write guard; the resolved pointer never
         // escapes this method, so no shared reference is held across the mutation.
@@ -1796,6 +1844,7 @@ impl Database {
         code: u64,
         requirement_type: u64,
     ) -> Result<Option<u64>, ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbFind);
         let guard = self.inner.read()?;
         let res = guard
             .lookup_linked_permission(account, code, requirement_type)
@@ -1809,6 +1858,7 @@ impl Database {
     }
 
     pub fn get_global_properties(&self) -> Result<*const ffi::GlobalPropertyObject, ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbGlobal);
         let guard = self.inner.read()?;
         let res = guard
             .get_global_properties()
@@ -1818,6 +1868,7 @@ impl Database {
     }
 
     pub fn set_global_properties(&self, cfg: &ChainConfigV0) -> Result<(), ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbGlobal);
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
 
@@ -1860,6 +1911,7 @@ impl Database {
         &self,
         trx_id: &ffi::CxxDigest,
     ) -> Result<bool, ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbFind);
         let guard = self.inner.read()?;
 
         guard
@@ -1872,6 +1924,7 @@ impl Database {
         trx_id: &ffi::CxxDigest,
         expiration: u32,
     ) -> Result<(), ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbInsert);
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
 
@@ -1884,6 +1937,7 @@ impl Database {
         &mut self,
         cutoff: &TimePoint,
     ) -> Result<(), ChainError> {
+        let _t = crate::profiling::Timer::new(crate::profiling::Metric::DbSession);
         let mut guard = self.inner.write()?;
         let pinned = guard.pin_mut();
 

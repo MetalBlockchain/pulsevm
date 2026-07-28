@@ -2,6 +2,7 @@ mod bridge;
 mod database;
 mod iterator_cache;
 mod objects;
+pub mod profiling;
 mod types;
 
 pub use crate::bridge::ffi::DatabaseOpenFlags;
