@@ -29,6 +29,9 @@ mod tests {
     use pulsevm_serialization::{VarUint32, Write};
     use serde_json::json;
 
+    /// Tx expiration, in seconds past the pending block time.
+    pub const DEFAULT_EXPIRATION_DELTA: u32 = 6;
+
     #[derive(Clone)]
     pub struct PendingBlockState {
         pub timestamp: BlockTimestamp,
@@ -38,6 +41,8 @@ mod tests {
     pub struct Testing {
         pub controller: Controller,
         pub pending_block_state: Option<PendingBlockState>,
+        /// Bumped per tx to keep identical txs distinct; the block clock never advances here.
+        expiration_nonce: u32,
     }
 
     impl Testing {
@@ -69,6 +74,7 @@ mod tests {
             let mut suite = Testing {
                 controller,
                 pending_block_state: None,
+                expiration_nonce: 0,
             };
 
             suite
@@ -104,7 +110,7 @@ mod tests {
             include_code: bool,
         ) -> Result<TransactionTrace, ChainError> {
             let mut trx = Transaction::default();
-            self.set_transaction_headers(&mut trx, u32::MAX, 0);
+            self.set_transaction_headers(&mut trx, DEFAULT_EXPIRATION_DELTA, 0);
             let mut owner_auth = Authority::new(
                 1,
                 vec![KeyWeight::new(get_public_key(account, "owner").inner(), 1)],
@@ -171,7 +177,7 @@ mod tests {
                 vec![PermissionLevel::new(creator.as_u64(), ACTIVE_NAME.as_u64())],
             ));
 
-            self.set_transaction_headers(&mut trx, u32::MAX, 0);
+            self.set_transaction_headers(&mut trx, DEFAULT_EXPIRATION_DELTA, 0);
             let signed = trx
                 .sign(
                     &get_private_key(creator, "active"),
@@ -235,7 +241,7 @@ mod tests {
                 auths,
             ));
 
-            self.set_transaction_headers(&mut trx, u32::MAX, 0);
+            self.set_transaction_headers(&mut trx, DEFAULT_EXPIRATION_DELTA, 0);
             let mut signed: SignedTransaction =
                 SignedTransaction::new(trx, BTreeSet::new(), vec![]);
             for key in keys.iter() {
@@ -258,21 +264,26 @@ mod tests {
             }
         }
 
+        /// `expiration_delta_sec` is relative to the pending block time.
         pub fn set_transaction_headers(
-            &self,
+            &mut self,
             trx: &mut Transaction,
-            expiration: u32,
+            expiration_delta_sec: u32,
             delay_sec: u32,
         ) {
+            let pending_block_state = self.get_pending_block_state();
+            let base = pending_block_state.timestamp.to_time_point().sec_since_epoch();
+            self.expiration_nonce += 1;
             trx.header.max_net_usage_words = VarUint32(0); // No limit
             trx.header.max_cpu_usage = 0; // No limit
             trx.header.delay_sec = VarUint32(delay_sec);
-            trx.header.expiration = TimePointSec::new(expiration);
+            trx.header.expiration =
+                TimePointSec::new(base + expiration_delta_sec + self.expiration_nonce);
         }
 
         pub fn set_code(&mut self, account: Name, wasm: Bytes) -> Result<(), ChainError> {
             let mut trx = Transaction::default();
-            self.set_transaction_headers(&mut trx, u32::MAX, 0);
+            self.set_transaction_headers(&mut trx, DEFAULT_EXPIRATION_DELTA, 0);
             trx.actions.push(Action::new(
                 PULSE_NAME.into(),
                 SETCODE_NAME.into(),
@@ -331,7 +342,7 @@ mod tests {
                 .unwrap(),
                 auths,
             ));
-            self.set_transaction_headers(&mut trx, u32::MAX, 0);
+            self.set_transaction_headers(&mut trx, DEFAULT_EXPIRATION_DELTA, 0);
 
             let mut signed: SignedTransaction =
                 SignedTransaction::new(trx, BTreeSet::new(), vec![]);
@@ -373,7 +384,7 @@ mod tests {
                 .unwrap(),
                 auths,
             ));
-            self.set_transaction_headers(&mut trx, u32::MAX, 0);
+            self.set_transaction_headers(&mut trx, DEFAULT_EXPIRATION_DELTA, 0);
 
             let mut signed: SignedTransaction =
                 SignedTransaction::new(trx, BTreeSet::new(), vec![]);
@@ -415,7 +426,7 @@ mod tests {
                 .unwrap(),
                 vec![PermissionLevel::new(account.as_u64(), ACTIVE_NAME.as_u64())],
             ));
-            self.set_transaction_headers(&mut trx, u32::MAX, 0);
+            self.set_transaction_headers(&mut trx, DEFAULT_EXPIRATION_DELTA, 0);
 
             let signed = trx.sign(
                 &get_private_key(account, "active"),
@@ -444,7 +455,7 @@ mod tests {
                 .unwrap(),
                 vec![PermissionLevel::new(account.as_u64(), ACTIVE_NAME.as_u64())],
             ));
-            self.set_transaction_headers(&mut trx, u32::MAX, 0);
+            self.set_transaction_headers(&mut trx, DEFAULT_EXPIRATION_DELTA, 0);
 
             let signed = trx.sign(
                 &get_private_key(account, "active"),

@@ -11,7 +11,7 @@ mod auth_tests {
     use pulsevm_name_macro::name;
 
     use crate::{
-        tests::{Testing, get_private_key},
+        tests::{DEFAULT_EXPIRATION_DELTA, Testing, get_private_key},
         unittests::contracts::{
             ALIGNED_CONST_REF_WAST, ALIGNED_REF_WAST, ENTRY_WAST, ENTRY_WAST_2,
             MISALIGNED_CONST_REF_WAST, MISALIGNED_REF_WAST,
@@ -26,7 +26,7 @@ mod auth_tests {
         let check_aligned = |chain: &mut Testing, wast: &str| -> Result<()> {
             chain.set_code(name!("aligncheck").into(), wat2wasm(wast)?.into())?;
             let mut trx = Transaction::default();
-            chain.set_transaction_headers(&mut trx, u32::MAX, 0);
+            chain.set_transaction_headers(&mut trx, DEFAULT_EXPIRATION_DELTA, 0);
             trx.actions.push(Action {
                 account: name!("aligncheck").into(),
                 name: name!("").into(),
@@ -59,7 +59,7 @@ mod auth_tests {
         chain.set_code(name!("entrycheck").into(), wat2wasm(ENTRY_WAST)?.into())?;
 
         let mut trx = Transaction::default();
-        chain.set_transaction_headers(&mut trx, u32::MAX, 0);
+        chain.set_transaction_headers(&mut trx, DEFAULT_EXPIRATION_DELTA, 0);
         trx.actions.push(Action {
             account: name!("entrycheck").into(),
             name: name!("").into(),
@@ -85,7 +85,7 @@ mod auth_tests {
         chain.set_code(name!("entrycheck").into(), wat2wasm(ENTRY_WAST_2)?.into())?;
 
         let mut trx = Transaction::default();
-        chain.set_transaction_headers(&mut trx, u32::MAX, 0);
+        chain.set_transaction_headers(&mut trx, DEFAULT_EXPIRATION_DELTA, 0);
         trx.actions.push(Action {
             account: name!("entrycheck").into(),
             name: name!("").into(),
@@ -119,7 +119,7 @@ mod auth_tests {
         chain.set_code(name!("loop").into(), wasm.into())?;
 
         let mut trx = Transaction::default();
-        chain.set_transaction_headers(&mut trx, u32::MAX, 0);
+        chain.set_transaction_headers(&mut trx, DEFAULT_EXPIRATION_DELTA, 0);
         trx.actions.push(Action {
             account: name!("loop").into(),
             name: name!("el").into(),
