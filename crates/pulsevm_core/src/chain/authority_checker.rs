@@ -65,6 +65,9 @@ impl<'a> AuthorityChecker<'a> {
         authority: &Authority,
         recursion_depth: u16,
     ) -> Result<bool, ChainError> {
+        // Restore used_keys unless satisfied: keys from a failed branch must not count as used.
+        let used_keys_snapshot = self.used_keys.clone();
+
         let mut total_weight = 0u32;
 
         for key in authority.keys() {
@@ -90,7 +93,12 @@ impl<'a> AuthorityChecker<'a> {
             }
         }
 
-        Ok(total_weight >= authority.threshold())
+        if total_weight >= authority.threshold() {
+            Ok(true)
+        } else {
+            self.used_keys = used_keys_snapshot;
+            Ok(false)
+        }
     }
 
     pub fn visit_key_weight(&mut self, key: &KeyWeight) -> Result<u16, ChainError> {
@@ -110,17 +118,13 @@ impl<'a> AuthorityChecker<'a> {
         permission: &PermissionLevelWeight,
         recursion_depth: u16,
     ) -> Result<u16, ChainError> {
-        if recursion_depth >= self.recursion_depth_limit {
-            return Ok(0);
-        }
-
-        // cache lookup
+        // Cache before the depth limit, so an already-satisfied permission counts at any depth.
         match self.cached_permissions.get(&permission.permission) {
             Some(PermissionCacheStatus::BeingEvaluated) => {
-                // cycle
-                return Err(ChainError::AuthorizationError(
-                    "permission cycle detected".to_string(),
-                ));
+                // Cycle (A->B->A): the back-edge grants no real authority, so
+                // return weight 0 and keep evaluating siblings (e.g. a sibling
+                // permission with a signed key) instead of failing the tx.
+                return Ok(0);
             }
             Some(PermissionCacheStatus::PermissionSatisfied) => {
                 return Ok(permission.weight);
@@ -131,6 +135,10 @@ impl<'a> AuthorityChecker<'a> {
             None => {
                 // fall through to evaluation
             }
+        }
+
+        if recursion_depth >= self.recursion_depth_limit {
+            return Ok(0);
         }
 
         // not cached yet – fetch authority from DB

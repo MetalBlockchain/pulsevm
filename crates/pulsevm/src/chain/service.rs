@@ -12,7 +12,7 @@ use pulsevm_core::{
     name::Name,
     time::{TimePoint, seconds},
     transaction::{PackedTransaction, Transaction, TransactionCompression},
-    utils::{Base64Bytes, I32Flex},
+    utils::{Base64Bytes, I32Flex, StringFlex},
 };
 use pulsevm_crypto::{Bytes, Digest};
 use pulsevm_serialization::Read;
@@ -92,8 +92,8 @@ pub trait Rpc {
         &self,
         code: Name,
         table: Name,
-        lower_bound: Option<String>,
-        upper_bound: Option<String>,
+        lower_bound: Option<StringFlex>,
+        upper_bound: Option<StringFlex>,
         limit: Option<I32Flex>,
         reverse: Option<bool>,
     ) -> Result<Value, ErrorObjectOwned>;
@@ -106,8 +106,8 @@ pub trait Rpc {
         scope: String,
         table: Name,
         table_key: Option<String>,
-        lower_bound: Option<String>,
-        upper_bound: Option<String>,
+        lower_bound: Option<StringFlex>,
+        upper_bound: Option<StringFlex>,
         limit: Option<I32Flex>,
         key_type: String,
         index_position: Option<I32Flex>,
@@ -379,15 +379,30 @@ impl RpcServer for RpcService {
             packed_trx,
         )?;
 
-        // Run transaction and revert it
+        // Run transaction and revert it. Execution is synchronous, blocking
+        // FFI/wasm work with no await points, so run it on the blocking pool
+        // and take the lock with blocking_write() instead of holding the async
+        // lock on a runtime worker, which would stall every other RPC handler.
         {
-            let mut controller = self.controller.write().await;
-            let pending_block_timestamp = TimePoint::now().into();
-            controller.push_transaction(
-                &packed_trx,
-                &pending_block_timestamp,
-                &pulsevm_core::block::BlockStatus::Verifying,
-            )?;
+            let controller = self.controller.clone();
+            let trx_for_exec = packed_trx.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut controller = controller.blocking_write();
+                let pending_block_timestamp = TimePoint::now().into();
+                controller.push_transaction(
+                    &trx_for_exec,
+                    &pending_block_timestamp,
+                    &pulsevm_core::block::BlockStatus::Verifying,
+                )
+            })
+            .await
+            .map_err(|e| {
+                ErrorObjectOwned::owned(
+                    -32000,
+                    format!("transaction execution task failed: {e}"),
+                    None::<()>,
+                )
+            })??;
         }
 
         // Add to mempool
@@ -429,8 +444,8 @@ impl RpcServer for RpcService {
         &self,
         code: Name,
         table: Name,
-        lower_bound: Option<String>,
-        upper_bound: Option<String>,
+        lower_bound: Option<StringFlex>,
+        upper_bound: Option<StringFlex>,
         limit: Option<I32Flex>,
         reverse: Option<bool>,
     ) -> Result<Value, ErrorObjectOwned> {
@@ -439,8 +454,8 @@ impl RpcServer for RpcService {
         let response = db.get_table_by_scope(
             code.as_u64(),
             table.as_u64(),
-            &lower_bound.unwrap_or_default(),
-            &upper_bound.unwrap_or_default(),
+            &lower_bound.unwrap_or_default().0,
+            &upper_bound.unwrap_or_default().0,
             limit.unwrap_or(I32Flex(10)).0 as u32,
             reverse.unwrap_or(false),
         )?;
@@ -459,8 +474,8 @@ impl RpcServer for RpcService {
         scope: String,
         table: Name,
         table_key: Option<String>,
-        lower_bound: Option<String>,
-        upper_bound: Option<String>,
+        lower_bound: Option<StringFlex>,
+        upper_bound: Option<StringFlex>,
         limit: Option<I32Flex>,
         key_type: String,
         index_position: Option<I32Flex>,
@@ -476,8 +491,8 @@ impl RpcServer for RpcService {
             &scope,
             table.as_u64(),
             &table_key.unwrap_or_default(),
-            &lower_bound.unwrap_or_default(),
-            &upper_bound.unwrap_or_default(),
+            &lower_bound.unwrap_or_default().0,
+            &upper_bound.unwrap_or_default().0,
             limit.unwrap_or(I32Flex(10)).0 as u32,
             &key_type,
             &index_position.unwrap_or(I32Flex(1)).0.to_string(),

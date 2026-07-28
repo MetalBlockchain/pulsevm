@@ -107,27 +107,28 @@ impl AuthorizationManager {
                     permissions_to_satisfy.insert(declared_auth.clone());
                 }
             }
-
-            // Now verify that all the declared authorizations are satisfied
-            for p in permissions_to_satisfy.iter() {
-                let auth = Authority::new_from_permission_level(p);
-
-                pulse_assert(
-                    authority_checker.satisfied(&r, &auth, 0)?,
-                    ChainError::AuthorizationError(format!(
-                        "transaction declares authority '{}' but does not have signatures for it",
-                        p
-                    )),
-                )?;
-            }
-
-            // Now verify that all the provided keys are used, otherwise we are wasting resources
-            if !authority_checker.all_keys_used() {
-                return Err(ChainError::AuthorizationError(
-                    "transaction bears irrelevant signatures".to_string(),
-                ));
-            }
         }
+
+        // Now verify that all the declared authorizations are satisfied
+        for p in permissions_to_satisfy.iter() {
+            let auth = Authority::new_from_permission_level(p);
+
+            pulse_assert(
+                authority_checker.satisfied(&r, &auth, 0)?,
+                ChainError::AuthorizationError(format!(
+                    "transaction declares authority '{}' but does not have signatures for it",
+                    p
+                )),
+            )?;
+        }
+
+        // Now verify that all the provided keys are used, otherwise we are wasting resources
+        if !authority_checker.all_keys_used() {
+            return Err(ChainError::AuthorizationError(
+                "transaction bears irrelevant signatures".to_string(),
+            ));
+        }
+
         Ok(())
     }
 

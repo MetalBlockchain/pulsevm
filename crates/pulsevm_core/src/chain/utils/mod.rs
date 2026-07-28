@@ -7,6 +7,9 @@ pub use digest::*;
 mod i32_flex;
 pub use i32_flex::*;
 
+mod string_flex;
+pub use string_flex::*;
+
 mod usage_accumulator;
 pub use usage_accumulator::*;
 
