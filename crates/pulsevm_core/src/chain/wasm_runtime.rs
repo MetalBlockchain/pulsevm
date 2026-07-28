@@ -200,8 +200,13 @@ impl WasmRuntime {
         code_hash: &CxxDigest,
         cpu_limit: i64,
     ) -> Result<u64, ChainError> {
+        use crate::profiling::{Metric, Timer};
+
         // Pause timer
         apply_context.pause_billing_timer()?;
+        // Times module compile/cache, store creation, import wiring and
+        // instantiation — everything up to the apply call below.
+        let setup_timer = Timer::new(Metric::WasmSetup);
 
         let id = Id::from(code_hash);
         let module = {
@@ -469,22 +474,28 @@ impl WasmRuntime {
         // Resume timer
         apply_context.resume_billing_timer()?;
 
-        let result = apply_func
-            .call(
-                &mut store,
-                receiver.as_u64() as i64,
-                action.account().as_u64() as i64,
-                action.name().as_u64() as i64,
-            )
-            .map_err(|e| {
-                // If this was originally `Err(ChainError)`, restore it
-                if let Some(chain_err) = e.downcast_ref::<ChainError>() {
-                    return chain_err.clone();
-                }
+        drop(setup_timer);
+        // The apply call runs the contract's WASM and, interleaved, any host
+        // functions it invokes (which perform the FFI/chainbase state ops).
+        let result = {
+            let _exec = Timer::new(Metric::WasmExec);
+            apply_func
+                .call(
+                    &mut store,
+                    receiver.as_u64() as i64,
+                    action.account().as_u64() as i64,
+                    action.name().as_u64() as i64,
+                )
+                .map_err(|e| {
+                    // If this was originally `Err(ChainError)`, restore it
+                    if let Some(chain_err) = e.downcast_ref::<ChainError>() {
+                        return chain_err.clone();
+                    }
 
-                // Otherwise wrap it
-                ChainError::ApplyError(format!("{}", e.message()))
-            });
+                    // Otherwise wrap it
+                    ChainError::ApplyError(format!("{}", e.message()))
+                })
+        };
         let remaining_points: MeteringPoints = get_remaining_points(&mut store, &instance);
 
         match remaining_points {

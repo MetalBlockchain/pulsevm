@@ -587,6 +587,8 @@ impl Controller {
         pending_block_timestamp: &BlockTimestamp,
         block_status: &BlockStatus,
     ) -> Result<TransactionResult, ChainError> {
+        use crate::profiling::{Metric, Timer};
+
         let signed_transaction = packed_transaction.get_signed_transaction();
 
         // Verify basic transaction validity
@@ -595,14 +597,21 @@ impl Controller {
             .validate(pending_block_timestamp)?;
 
         // Verify authority
-        AuthorizationManager::check_authorization(
-            &mut self.db,
-            &signed_transaction.transaction().actions,
-            &signed_transaction.recovered_keys(&self.chain_id)?,
-            &BTreeSet::new(),
-            seconds(signed_transaction.transaction().header.delay_sec.into()),
-            &BTreeSet::new(),
-        )?;
+        let recovered_keys = {
+            let _t = Timer::new(Metric::SigRecovery);
+            signed_transaction.recovered_keys(&self.chain_id)?
+        };
+        {
+            let _t = Timer::new(Metric::Authorization);
+            AuthorizationManager::check_authorization(
+                &mut self.db,
+                &signed_transaction.transaction().actions,
+                &recovered_keys,
+                &BTreeSet::new(),
+                seconds(signed_transaction.transaction().header.delay_sec.into()),
+                &BTreeSet::new(),
+            )?;
+        }
 
         let mut trx_context = TransactionContext::new(
             self.db.clone(),
@@ -615,13 +624,20 @@ impl Controller {
         );
 
         let trx = packed_transaction.get_transaction();
-        trx_context.init_for_input_trx(
-            packed_transaction.get_unprunable_size()?,
-            packed_transaction.get_prunable_size()?,
-            &trx,
-        )?;
+        {
+            let _t = Timer::new(Metric::TxInit);
+            trx_context.init_for_input_trx(
+                packed_transaction.get_unprunable_size()?,
+                packed_transaction.get_prunable_size()?,
+                &trx,
+            )?;
+        }
+        // WasmSetup and WasmExec are recorded inside WasmRuntime::run.
         trx_context.exec(&trx)?;
-        let result = trx_context.finalize()?;
+        let result = {
+            let _t = Timer::new(Metric::Finalize);
+            trx_context.finalize()?
+        };
 
         Ok(result)
     }

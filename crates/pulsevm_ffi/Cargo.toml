@@ -3,6 +3,10 @@ name = "pulsevm_ffi"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Enables the execution + FFI/state profiler (crate::profiling). Off by default.
+profiling = []
+
 [dependencies]
 libc = "0.2"
 cxx = "1.0.194"
