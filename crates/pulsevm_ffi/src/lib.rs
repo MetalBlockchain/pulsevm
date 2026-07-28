@@ -29,6 +29,7 @@ pub use crate::bridge::ffi::{
     recover_public_key_from_signature, sign_digest_with_private_key, subtf3, trunctfdf2,
     trunctfsf2, unordtf2,
 };
+pub use crate::bridge::ffi::UndoSession;
 pub use crate::database::Database;
 pub use crate::iterator_cache::{
     Index64IteratorCache, Index128IteratorCache, Index256IteratorCache, IndexDoubleIteratorCache,
