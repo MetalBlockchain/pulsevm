@@ -3328,6 +3328,14 @@ name = "pulsevm_constants"
 version = "0.1.0"
 
 [[package]]
+name = "pulsevm_contractdb"
+version = "0.1.0"
+dependencies = [
+ "pulsevm_arena",
+ "zerocopy",
+]
+
+[[package]]
 name = "pulsevm_core"
 version = "0.1.0"
 dependencies = [

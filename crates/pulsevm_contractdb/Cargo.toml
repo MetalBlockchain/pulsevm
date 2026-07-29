@@ -1,0 +1,10 @@
+[package]
+name = "pulsevm_contractdb"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+pulsevm_arena = { path = "../pulsevm_arena" }
+zerocopy = { version = "0.8", features = ["derive"] }
+
+[dev-dependencies]
