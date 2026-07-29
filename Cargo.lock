@@ -3287,6 +3287,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "pulsevm_arena"
+version = "0.1.0"
+
+[[package]]
 name = "pulsevm_benchmark"
 version = "0.1.0"
 dependencies = [
