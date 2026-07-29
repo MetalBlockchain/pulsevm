@@ -257,6 +257,7 @@ impl Controller {
     pub async fn build_block(&mut self, mempool: &mut Mempool) -> Result<SignedBlock, ChainError> {
         let mut db = self.db.clone();
         let mut root_session = db.create_undo_session(true)?; // As we are building the block, drop the changes once built
+        db.arena_start_undo_session(); // mirror the root session
         let mut transaction_receipts: VecDeque<TransactionReceipt> = VecDeque::new();
         let mut action_receipt_digests: VecDeque<Digest> = VecDeque::new();
         let timestamp: BlockTimestamp = TimePoint::now().into();
@@ -294,6 +295,7 @@ impl Controller {
             }
 
             let mut child_session = db.create_undo_session(true)?;
+            db.arena_start_undo_session(); // mirror the per-transaction session
             let transaction_result =
                 self.execute_transaction(&transaction, &timestamp, &block_status);
 
@@ -305,6 +307,7 @@ impl Controller {
                             e
                         ))
                     })?; // Push changes to upstream session
+                    db.arena_squash(); // fold the tx into the block on both
 
                     // Add the transaction to the block
                     let receipt = TransactionReceipt::new(result.trace.receipt, transaction);
@@ -321,6 +324,7 @@ impl Controller {
                     child_session.pin_mut().undo().map_err(|e| {
                         ChainError::DatabaseError(format!("failed to undo changes: {}", e))
                     })?; // Revert changes made during this transaction
+                    db.arena_undo(); // a failed tx leaves no trace on either
                 }
             }
         }
@@ -359,6 +363,7 @@ impl Controller {
             .pin_mut()
             .undo()
             .map_err(|e| ChainError::DatabaseError(format!("failed to undo changes: {}", e)))?; // Revert changes made during this transaction
+        db.arena_undo(); // the built block is speculative; discard on both
 
         Ok(block)
     }
@@ -398,6 +403,7 @@ impl Controller {
         block.validate_syntactically(&self.db)?;
 
         let mut root_session = self.db.create_undo_session(true)?;
+        self.db.arena_start_undo_session(); // mirror the verify root session
         let parent_block_id = block.previous_id();
         let block_status = BlockStatus::Verifying;
         self.replay_accepted_state_to(parent_block_id.clone(), &block_status, mempool)?;
@@ -413,6 +419,7 @@ impl Controller {
             .pin_mut()
             .undo()
             .map_err(|e| ChainError::DatabaseError(format!("failed to undo changes: {}", e)))?; // Revert changes made during this transaction
+        self.db.arena_undo(); // verification is speculative; discard on both
 
         Ok(())
     }
@@ -429,6 +436,7 @@ impl Controller {
         };
 
         let mut root_session = self.db.create_undo_session(true)?;
+        self.db.arena_start_undo_session(); // mirror the accept root session; committed below
         let block_status = BlockStatus::Accepting;
         let parent_block_id = block.previous_id();
         self.replay_accepted_state_to(parent_block_id.clone(), &block_status, mempool)?;
@@ -590,9 +598,12 @@ impl Controller {
     ) -> Result<TransactionResult, ChainError> {
         let mut db = self.db.clone();
         let _undo_session = db.create_undo_session(true)?;
-        let result =
-            self.execute_transaction(transaction, pending_block_timestamp, block_status)?;
-        return Ok(result);
+        db.arena_start_undo_session();
+        let result = self.execute_transaction(transaction, pending_block_timestamp, block_status);
+        // Mempool admission is advisory: `_undo_session` reverts chainbase when
+        // it drops, so revert the arena in lockstep on both the ok and err path.
+        db.arena_undo();
+        result
     }
 
     // This function will execute a transaction and commit it to the database
@@ -1173,6 +1184,69 @@ mod tests {
             db.arena_account_metadata_privileged(name),
             None,
             "arena kept a row chainbase undid — session desync"
+        );
+        Ok(())
+    }
+
+    /// Oracle harness (step 3): the real block path. verify_block executes a
+    /// block speculatively and undoes it, so the arena must not retain the
+    /// block's writes; accept_block commits, so the arena must then match
+    /// chainbase. This exercises the arena session lockstep wired into
+    /// build/verify/accept.
+    #[cfg(feature = "arena-shadow")]
+    #[tokio::test]
+    async fn oracle_block_accept_mirrors_into_arena() -> Result<(), ChainError> {
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
+        let private_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let mempool = Arc::new(RwLock::new(Mempool::new()));
+        let mut mempool = mempool.write().await;
+        let mut controller = Controller::new();
+        let genesis_bytes = generate_genesis(&private_key);
+        let temp_path = get_temp_dir();
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": private_key.to_string(),
+        })
+        .to_string()
+        .into_bytes();
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &genesis_bytes.to_vec(),
+            temp_path.path().to_str().unwrap(),
+        )?;
+        let chain_id = controller.chain_id().clone();
+        let name = Name::from_str("glenn")?.as_u64();
+
+        // build_block produces a valid block (correct merkle roots) and undoes
+        // its speculative state, so afterwards the arena must not keep the
+        // account it created while building.
+        mempool.add_transaction(create_account(
+            &private_key,
+            Name::from_str("glenn")?,
+            chain_id,
+        )?);
+        let block = controller.build_block(&mut mempool).await?;
+        assert_eq!(
+            controller.database().arena_account_metadata_privileged(name),
+            None,
+            "build_block left a speculative account in the arena"
+        );
+
+        // accept_block commits: both sides must now hold the account.
+        controller.accept_block(&block.id()?, &mut mempool)?;
+        let db = controller.database();
+        assert!(
+            !db.find_account_metadata(name)?.is_null(),
+            "chainbase is missing the accepted account"
+        );
+        assert_eq!(
+            db.arena_account_metadata_privileged(name),
+            Some(false),
+            "accept_block did not commit the account into the arena"
         );
         Ok(())
     }
