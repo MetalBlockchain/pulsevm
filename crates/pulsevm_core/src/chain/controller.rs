@@ -2803,6 +2803,86 @@ mod tests {
         Ok(())
     }
 
+    /// Same as the packed-block replay, but routed through a real StateHistoryLog
+    /// block_log on disk — append the built block, reopen the log, read it back,
+    /// and replay. This exercises the exact open_with_magic/append/range/read_block
+    /// path that replay_local_block_log uses against a node's block_log, so it
+    /// de-risks that harness independently of the (fixture-less) log unit tests.
+    #[cfg(feature = "arena-shadow")]
+    #[tokio::test]
+    async fn replay_via_block_log_keeps_shadow_in_sync() -> Result<(), ChainError> {
+        use crate::chain::state_history::StateHistoryLog;
+
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
+        let private_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": private_key.to_string(),
+        })
+        .to_string()
+        .into_bytes();
+        let genesis = generate_genesis(&private_key);
+        let glenn = Name::from_str("glenn")?;
+
+        // Node A builds a block and writes it to a block_log on disk.
+        let log_dir = get_temp_dir();
+        let (built_id, built_packed) = {
+            let mempool = Arc::new(RwLock::new(Mempool::new()));
+            let mut mempool = mempool.write().await;
+            let mut a = Controller::new();
+            let dir = get_temp_dir();
+            a.initialize(&chain_id, &config_bytes, &genesis, dir.path().to_str().unwrap())?;
+            let cid = a.chain_id().clone();
+            mempool.add_transaction(create_account(&private_key, glenn, cid)?);
+            mempool.add_transaction(update_auth(
+                &private_key,
+                glenn,
+                Name::from_str("claude")?,
+                ACTIVE_NAME,
+                1,
+                cid,
+            )?);
+            let block = a.build_block(&mut mempool).await?;
+            a.accept_block(&block.id()?, &mut mempool)?;
+
+            let log = StateHistoryLog::open_with_magic(log_dir.path(), "block_log", 0)
+                .map_err(|e| ChainError::InternalError(format!("open log: {e:?}")))?;
+            log.append(block.id()?, &block.pack().unwrap())
+                .map_err(|e| ChainError::InternalError(format!("append: {e:?}")))?;
+            (block.id()?, block.pack().unwrap())
+        };
+
+        // Reopen the log fresh, read the block back, and replay it on node B.
+        let src = StateHistoryLog::open_with_magic(log_dir.path(), "block_log", 0)
+            .map_err(|e| ChainError::InternalError(format!("reopen log: {e:?}")))?;
+        let (_start, end) = src.range().expect("block_log is empty after append");
+        let packed = src
+            .read_block(end)
+            .map_err(|e| ChainError::InternalError(format!("read_block: {e:?}")))?;
+        assert_eq!(packed, built_packed, "block_log round-trip corrupted the block");
+
+        let mempool = Arc::new(RwLock::new(Mempool::new()));
+        let mut mempool = mempool.write().await;
+        let mut b = Controller::new();
+        let dir = get_temp_dir();
+        b.initialize(&chain_id, &config_bytes, &genesis, dir.path().to_str().unwrap())?;
+        let block = SignedBlock::read(packed.as_slice(), &mut 0)?;
+        assert_eq!(block.id()?, built_id, "read block id mismatch");
+        b.verify_block(&block, &mut mempool).await?;
+        b.accept_block(&block.id()?, &mut mempool)?;
+
+        for (name, chain_bytes, arena_bytes) in cross_impl_tables(&b.database())? {
+            assert_eq!(
+                chain_bytes, arena_bytes,
+                "block_log-replayed cross-impl state diverged for table {name}"
+            );
+        }
+        Ok(())
+    }
+
     /// Block-sequence fuzzer: random sequences of blocks — each with a few
     /// newaccount transactions, then either accepted or discarded — must keep
     /// the arena mirror in step with chainbase. After every block, for every
