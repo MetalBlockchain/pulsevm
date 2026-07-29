@@ -20,3 +20,8 @@ mod table;
 pub use db::{Db, DbError};
 pub use object::{ArenaObject, IndexedBy, KeyIndex, ObjectId, SecondaryIndex, key_index};
 pub use table::{IndexView, Table, TableError};
+
+/// `#[derive(ArenaObject)]` — generates the trait impl and secondary-index
+/// declarations. Re-exported so `use pulsevm_arena::ArenaObject` brings both the
+/// trait and the derive into scope, as serde does.
+pub use pulsevm_arena_derive::ArenaObject;

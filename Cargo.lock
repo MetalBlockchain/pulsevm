@@ -3289,6 +3289,21 @@ dependencies = [
 [[package]]
 name = "pulsevm_arena"
 version = "0.1.0"
+dependencies = [
+ "criterion",
+ "pulsevm_arena_derive",
+ "tempfile",
+ "zerocopy",
+]
+
+[[package]]
+name = "pulsevm_arena_derive"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
 
 [[package]]
 name = "pulsevm_benchmark"
