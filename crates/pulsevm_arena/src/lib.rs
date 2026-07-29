@@ -13,8 +13,10 @@
 //! full undo lifecycle. POD layout + mmap persistence and the multi-table
 //! database layer build on top of it.
 
+mod db;
 mod object;
 mod table;
 
+pub use db::{Db, DbError};
 pub use object::{ArenaObject, IndexedBy, KeyIndex, ObjectId, SecondaryIndex, key_index};
 pub use table::{IndexView, Table, TableError};
