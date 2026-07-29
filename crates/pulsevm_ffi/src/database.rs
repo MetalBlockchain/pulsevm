@@ -465,12 +465,20 @@ impl Database {
         account_metadata: &ffi::AccountMetadataObject,
         abi: &[u8],
     ) -> Result<(), ChainError> {
-        let mut guard = self.inner.write()?;
-        let pinned = guard.pin_mut();
-
-        pinned
-            .update_account_abi(account, account_metadata, abi)
-            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+        {
+            let mut guard = self.inner.write()?;
+            let pinned = guard.pin_mut();
+            pinned
+                .update_account_abi(account, account_metadata, abi)
+                .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        }
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && let Err(e) = s.update_account_abi(account_metadata.get_name(), abi)
+        {
+            eprintln!("arena mirror of update_account_abi diverged: {e:?}");
+        }
+        Ok(())
     }
 
     pub fn create_undo_session(

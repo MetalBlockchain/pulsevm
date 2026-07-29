@@ -860,6 +860,29 @@ impl ArenaShadow {
         Ok(())
     }
 
+    /// Mirrors `update_account_abi`: bumps the account_metadata abi_sequence and
+    /// reassigns the account_object abi blob. Both rows are located by the name
+    /// recovered from the metadata object's get_name accessor.
+    pub fn update_account_abi(&self, name: u64, abi: &[u8]) -> Result<(), DbError> {
+        let mut db = self.lock();
+
+        let meta_id = db
+            .find_by::<AccountMetaRow, AccountMetaRowByName>(&name)?
+            .map(|r| r.id());
+        if let Some(id) = meta_id {
+            db.modify::<AccountMetaRow>(id, |row| row.abi_sequence += 1)?;
+        }
+
+        let acct_id = db
+            .find_by::<AccountRow, AccountRowByName>(&name)?
+            .map(|r| r.id());
+        if let Some(id) = acct_id {
+            let abi_blob = db.alloc_blob::<AccountRow>(abi)?;
+            db.modify::<AccountRow>(id, |row| row.abi = abi_blob)?;
+        }
+        Ok(())
+    }
+
     // ----- account_object ---------------------------------------------------
 
     pub fn create_account(&self, name: u64, creation_date: u32) -> Result<(), DbError> {

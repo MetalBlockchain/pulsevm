@@ -915,7 +915,8 @@ mod tests {
         chain::{
             asset::{Asset, Symbol},
             authority::PermissionLevel,
-            pulse_contract::{NewAccount, SetCode},
+            abi::AbiDefinition,
+            pulse_contract::{NewAccount, SetAbi, SetCode},
             transaction::{Action, Transaction, TransactionHeader},
         },
         crypto::PrivateKey,
@@ -1033,6 +1034,32 @@ mod tests {
                     vm_type: 0,
                     vm_version: 0,
                     code: Arc::new(wasm_bytes.into()),
+                }
+                .pack()
+                .unwrap(),
+                vec![PermissionLevel::new(account.as_u64(), ACTIVE_NAME.as_u64())],
+            )],
+        )
+        .sign(&private_key, &chain_id)?;
+        let packed_trx = PackedTransaction::from_signed_transaction(trx)?;
+        Ok(packed_trx)
+    }
+
+    fn set_abi(
+        private_key: &PrivateKey,
+        account: Name,
+        abi_bytes: Vec<u8>,
+        chain_id: Id,
+    ) -> Result<PackedTransaction, ChainError> {
+        let trx = Transaction::new(
+            TransactionHeader::new(TimePointSec::maximum(), 0, 0, 0u32.into(), 0, 0u32.into()),
+            vec![],
+            vec![Action::new(
+                Name::from_str("pulse").unwrap(),
+                Name::from_str("setabi").unwrap(),
+                SetAbi {
+                    account,
+                    abi: Arc::new(abi_bytes.into()),
                 }
                 .pack()
                 .unwrap(),
@@ -1251,13 +1278,12 @@ mod tests {
         Ok(())
     }
 
-    /// Full-field oracle for account_metadata: a block that creates an account
-    /// and then sets its code must leave the arena's account_metadata_object
-    /// matching chainbase field-for-field. code_sequence advances through
-    /// update_account_code (which reaches the object by reference) and
-    /// auth_sequence advances because glenn authorizes the setcode; both are
-    /// located by the get_name accessor added to the FFI. abi_sequence stays at
-    /// zero (no setabi here) and so is checked as an equality too.
+    /// Full-field oracle for account_metadata: a block that creates an account,
+    /// sets its code, then sets its abi must leave the arena's
+    /// account_metadata_object matching chainbase field-for-field. code_sequence
+    /// (setcode), abi_sequence (setabi) and auth_sequence (glenn authorizes all
+    /// three actions) each advance through a path the mirror drives via the
+    /// get_name accessor added to the FFI.
     #[cfg(feature = "arena-shadow")]
     #[tokio::test]
     async fn oracle_setcode_mirrors_account_metadata_fields() -> Result<(), ChainError> {
@@ -1307,6 +1333,27 @@ mod tests {
             wasm,
             chain_id,
         )?);
+        // A minimal but valid ABI — setabi parses it before storing, so an empty
+        // blob would be rejected. The mirror only has to track the sequence bump
+        // and the stored bytes, not the ABI's meaning.
+        let abi = AbiDefinition {
+            version: "eosio::abi/1.2".to_string(),
+            types: vec![],
+            structs: vec![],
+            actions: vec![],
+            tables: vec![],
+            ricardian_clauses: vec![],
+            error_messages: vec![],
+            abi_extensions: vec![],
+            variants: vec![],
+            action_results: vec![],
+        };
+        mempool.add_transaction(set_abi(
+            &private_key,
+            Name::from_str("glenn")?,
+            abi.pack().unwrap(),
+            chain_id,
+        )?);
         let block = controller.build_block(&mut mempool).await?;
         controller.accept_block(&block.id()?, &mut mempool)?;
 
@@ -1335,8 +1382,12 @@ mod tests {
             "setcode did not advance code_sequence in the mirror"
         );
         assert!(
+            arena.abi_sequence >= 1,
+            "setabi did not advance abi_sequence in the mirror"
+        );
+        assert!(
             arena.auth_sequence >= 1,
-            "authorizing setcode did not advance auth_sequence in the mirror"
+            "authorizing the actions did not advance auth_sequence in the mirror"
         );
         Ok(())
     }
