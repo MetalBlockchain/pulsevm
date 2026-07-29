@@ -973,21 +973,37 @@ impl Database {
         &mut self,
         receiver_account: &AccountMetadataObject,
     ) -> Result<u64, ChainError> {
-        let mut guard = self.inner.write()?;
-        let pinned = guard.pin_mut();
-
-        pinned
-            .next_recv_sequence(receiver_account)
-            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+        let res = {
+            let mut guard = self.inner.write()?;
+            let pinned = guard.pin_mut();
+            pinned
+                .next_recv_sequence(receiver_account)
+                .map_err(|e| ChainError::InternalError(format!("{}", e)))?
+        };
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && let Err(e) = s.next_recv_sequence(receiver_account.get_name())
+        {
+            eprintln!("arena mirror of next_recv_sequence diverged: {e:?}");
+        }
+        Ok(res)
     }
 
     pub fn next_auth_sequence(&mut self, actor: u64) -> Result<u64, ChainError> {
-        let mut guard = self.inner.write()?;
-        let pinned = guard.pin_mut();
-
-        pinned
-            .next_auth_sequence(actor)
-            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+        let res = {
+            let mut guard = self.inner.write()?;
+            let pinned = guard.pin_mut();
+            pinned
+                .next_auth_sequence(actor)
+                .map_err(|e| ChainError::InternalError(format!("{}", e)))?
+        };
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && let Err(e) = s.next_auth_sequence(actor)
+        {
+            eprintln!("arena mirror of next_auth_sequence diverged: {e:?}");
+        }
+        Ok(res)
     }
 
     pub fn next_global_sequence(&mut self) -> Result<u64, ChainError> {

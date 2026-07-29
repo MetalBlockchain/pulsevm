@@ -1253,13 +1253,11 @@ mod tests {
 
     /// Full-field oracle for account_metadata: a block that creates an account
     /// and then sets its code must leave the arena's account_metadata_object
-    /// matching chainbase field-for-field on the paths the mirror drives. The
-    /// telling field is code_sequence — it only advances through
-    /// update_account_code, which reaches the metadata object by reference; the
-    /// get_name accessor added to the FFI is what lets the mirror locate the
-    /// arena row to bump. recv/auth/abi sequences are not asserted here: they
-    /// advance through receiver dispatch and authorization accounting, paths not
-    /// yet mirrored.
+    /// matching chainbase field-for-field. code_sequence advances through
+    /// update_account_code (which reaches the object by reference) and
+    /// auth_sequence advances because glenn authorizes the setcode; both are
+    /// located by the get_name accessor added to the FFI. abi_sequence stays at
+    /// zero (no setabi here) and so is checked as an equality too.
     #[cfg(feature = "arena-shadow")]
     #[tokio::test]
     async fn oracle_setcode_mirrors_account_metadata_fields() -> Result<(), ChainError> {
@@ -1327,11 +1325,18 @@ mod tests {
 
         assert_eq!(arena.privileged, chain_meta.is_privileged());
         assert_eq!(arena.code_sequence, chain_meta.get_code_sequence());
+        assert_eq!(arena.abi_sequence, chain_meta.get_abi_sequence());
+        assert_eq!(arena.recv_sequence, chain_meta.get_recv_sequence());
+        assert_eq!(arena.auth_sequence, chain_meta.get_auth_sequence());
         assert_eq!(arena.vm_type, chain_meta.get_vm_type());
         assert_eq!(arena.vm_version, chain_meta.get_vm_version());
         assert!(
             arena.code_sequence >= 1,
             "setcode did not advance code_sequence in the mirror"
+        );
+        assert!(
+            arena.auth_sequence >= 1,
+            "authorizing setcode did not advance auth_sequence in the mirror"
         );
         Ok(())
     }

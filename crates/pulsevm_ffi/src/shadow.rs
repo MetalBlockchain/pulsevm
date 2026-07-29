@@ -833,6 +833,33 @@ impl ArenaShadow {
         Ok(())
     }
 
+    /// Mirrors `next_auth_sequence`: bumps the actor's account_metadata
+    /// auth_sequence by one, matching chainbase's per-call increment. A missing
+    /// row is a no-op — the caller only advances sequences for existing accounts.
+    pub fn next_auth_sequence(&self, actor: u64) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let id = db
+            .find_by::<AccountMetaRow, AccountMetaRowByName>(&actor)?
+            .map(|r| r.id());
+        if let Some(id) = id {
+            db.modify::<AccountMetaRow>(id, |row| row.auth_sequence += 1)?;
+        }
+        Ok(())
+    }
+
+    /// Mirrors `next_recv_sequence`: bumps the receiver's account_metadata
+    /// recv_sequence by one, matching chainbase's per-call increment.
+    pub fn next_recv_sequence(&self, receiver: u64) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let id = db
+            .find_by::<AccountMetaRow, AccountMetaRowByName>(&receiver)?
+            .map(|r| r.id());
+        if let Some(id) = id {
+            db.modify::<AccountMetaRow>(id, |row| row.recv_sequence += 1)?;
+        }
+        Ok(())
+    }
+
     // ----- account_object ---------------------------------------------------
 
     pub fn create_account(&self, name: u64, creation_date: u32) -> Result<(), DbError> {
