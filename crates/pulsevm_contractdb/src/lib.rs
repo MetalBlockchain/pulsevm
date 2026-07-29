@@ -93,6 +93,52 @@ impl ArenaObject for KeyValueObject {
     }
 }
 
+/// `chainbase::index64_object` — a `uint64` secondary-index entry, ordered by
+/// `(t_id, secondary_key, primary_key)`. A multi-index table has one of these
+/// tables per secondary index, sharing the `table_id_object` with the primary
+/// `key_value_object`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Default, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable,
+    zerocopy::KnownLayout,
+)]
+pub struct Index64Object {
+    id: ObjectId<Index64Object>,
+    t_id: i64,
+    primary_key: u64,
+    secondary_key: u64,
+}
+
+struct Idx64ByPrimary;
+impl IndexedBy<Index64Object> for Idx64ByPrimary {
+    type Key = (i64, u64);
+    fn key(o: &Index64Object) -> Self::Key {
+        (o.t_id, o.primary_key)
+    }
+}
+struct Idx64BySecondary;
+impl IndexedBy<Index64Object> for Idx64BySecondary {
+    type Key = (i64, u64, u64);
+    fn key(o: &Index64Object) -> Self::Key {
+        (o.t_id, o.secondary_key, o.primary_key)
+    }
+}
+impl ArenaObject for Index64Object {
+    const TYPE_ID: u16 = 2;
+    fn id(&self) -> ObjectId<Self> {
+        self.id
+    }
+    fn set_id(&mut self, id: ObjectId<Self>) {
+        self.id = id;
+    }
+    fn secondary_indices() -> Vec<Box<dyn SecondaryIndex<Self>>> {
+        vec![
+            key_index::<Self, Idx64ByPrimary>(),
+            key_index::<Self, Idx64BySecondary>(),
+        ]
+    }
+}
+
 /// Assigns stable iterator handles for one transaction, with EOS's encoding:
 /// real rows get non-negative handles; each table gets a negative end iterator
 /// `-(index + 2)`.
@@ -139,10 +185,12 @@ impl IteratorCache {
     }
 }
 
-/// The contract database and its per-transaction iterator cache.
+/// The contract database and its per-transaction iterator caches (one per
+/// index, as in EOS — a primary handle and an idx64 handle never collide).
 pub struct ContractDb {
     db: Db,
     cache: IteratorCache,
+    idx64_cache: IteratorCache,
 }
 
 impl Default for ContractDb {
@@ -156,15 +204,18 @@ impl ContractDb {
         let mut db = Db::new();
         db.add_table::<TableIdObject>().unwrap();
         db.add_table::<KeyValueObject>().unwrap();
+        db.add_table::<Index64Object>().unwrap();
         ContractDb {
             db,
             cache: IteratorCache::default(),
+            idx64_cache: IteratorCache::default(),
         }
     }
 
     /// Clears iterator handles (a new transaction starts fresh).
     pub fn reset_iterators(&mut self) {
         self.cache = IteratorCache::default();
+        self.idx64_cache = IteratorCache::default();
     }
 
     fn find_table(&self, code: u64, scope: u64, table: u64) -> Option<i64> {
@@ -377,6 +428,243 @@ impl ContractDb {
             Some((p, kv_id)) => {
                 *primary = p;
                 self.cache.add(kv_id)
+            }
+            None => -1,
+        }
+    }
+
+    // ----- the db_idx64_* secondary-index API -------------------------------
+
+    fn idx64(&self, id: i64) -> Index64Object {
+        *self.db.get::<Index64Object>(ObjectId::new(id)).unwrap()
+    }
+
+    /// First idx64 entry with `(secondary, primary) >= (sec, prim)` in the table.
+    fn idx64_from(&self, t_id: i64, sec: u64, prim: u64) -> Option<Index64Object> {
+        self.db
+            .table::<Index64Object>()
+            .unwrap()
+            .get_index::<Idx64BySecondary>()
+            .range((Bound::Included((t_id, sec, prim)), Bound::Unbounded))
+            .next()
+            .filter(|(k, _)| k.0 == t_id)
+            .map(|(_, o)| *o)
+    }
+
+    /// First idx64 entry with `secondary > sec` in the table (upper bound
+    /// ignores the primary key, as in EOS).
+    fn idx64_above(&self, t_id: i64, sec: u64) -> Option<Index64Object> {
+        self.db
+            .table::<Index64Object>()
+            .unwrap()
+            .get_index::<Idx64BySecondary>()
+            .range((Bound::Excluded((t_id, sec, u64::MAX)), Bound::Unbounded))
+            .next()
+            .filter(|(k, _)| k.0 == t_id)
+            .map(|(_, o)| *o)
+    }
+
+    fn idx64_after(&self, t_id: i64, sec: u64, prim: u64) -> Option<Index64Object> {
+        self.db
+            .table::<Index64Object>()
+            .unwrap()
+            .get_index::<Idx64BySecondary>()
+            .range((Bound::Excluded((t_id, sec, prim)), Bound::Unbounded))
+            .next()
+            .filter(|(k, _)| k.0 == t_id)
+            .map(|(_, o)| *o)
+    }
+
+    fn idx64_before(&self, t_id: i64, sec: u64, prim: u64) -> Option<Index64Object> {
+        self.db
+            .table::<Index64Object>()
+            .unwrap()
+            .get_index::<Idx64BySecondary>()
+            .range((Bound::Unbounded, Bound::Excluded((t_id, sec, prim))))
+            .next_back()
+            .filter(|(k, _)| k.0 == t_id)
+            .map(|(_, o)| *o)
+    }
+
+    fn idx64_last(&self, t_id: i64) -> Option<Index64Object> {
+        self.db
+            .table::<Index64Object>()
+            .unwrap()
+            .get_index::<Idx64BySecondary>()
+            .range((
+                Bound::Included((t_id, u64::MIN, u64::MIN)),
+                Bound::Included((t_id, u64::MAX, u64::MAX)),
+            ))
+            .next_back()
+            .map(|(_, o)| *o)
+    }
+
+    pub fn db_idx64_store(
+        &mut self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        payer: u64,
+        primary: u64,
+        secondary: u64,
+    ) -> i32 {
+        let t_id = self.find_or_create_table(code, scope, table, payer);
+        let id = self
+            .db
+            .create::<Index64Object>(|e| {
+                e.t_id = t_id;
+                e.primary_key = primary;
+                e.secondary_key = secondary;
+            })
+            .unwrap()
+            .id()
+            .raw();
+        self.idx64_cache.cache_table(t_id);
+        self.idx64_cache.add(id)
+    }
+
+    pub fn db_idx64_update(&mut self, itr: i32, secondary: u64) {
+        let id = self.idx64_cache.kv_of(itr);
+        self.db
+            .modify::<Index64Object>(ObjectId::new(id), |e| e.secondary_key = secondary)
+            .unwrap();
+    }
+
+    pub fn db_idx64_remove(&mut self, itr: i32) {
+        let id = self.idx64_cache.kv_of(itr);
+        self.db.remove::<Index64Object>(ObjectId::new(id)).unwrap();
+    }
+
+    /// Find the first entry with the given secondary key; sets `primary` to it.
+    pub fn db_idx64_find_secondary(
+        &mut self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        secondary: u64,
+        primary: &mut u64,
+    ) -> i32 {
+        let Some(t_id) = self.find_table(code, scope, table) else {
+            return -1;
+        };
+        let end = self.idx64_cache.cache_table(t_id);
+        match self.idx64_from(t_id, secondary, 0) {
+            Some(e) if e.secondary_key == secondary => {
+                *primary = e.primary_key;
+                self.idx64_cache.add(e.id().raw())
+            }
+            _ => end,
+        }
+    }
+
+    /// Find the entry for a primary key; sets `secondary` to its secondary key.
+    pub fn db_idx64_find_primary(
+        &mut self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        secondary: &mut u64,
+        primary: u64,
+    ) -> i32 {
+        let Some(t_id) = self.find_table(code, scope, table) else {
+            return -1;
+        };
+        let end = self.idx64_cache.cache_table(t_id);
+        match self
+            .db
+            .find_by::<Index64Object, Idx64ByPrimary>(&(t_id, primary))
+            .unwrap()
+            .map(|e| (e.secondary_key, e.id().raw()))
+        {
+            Some((sec, id)) => {
+                *secondary = sec;
+                self.idx64_cache.add(id)
+            }
+            None => end,
+        }
+    }
+
+    pub fn db_idx64_lowerbound(
+        &mut self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        secondary: &mut u64,
+        primary: &mut u64,
+    ) -> i32 {
+        let Some(t_id) = self.find_table(code, scope, table) else {
+            return -1;
+        };
+        let end = self.idx64_cache.cache_table(t_id);
+        match self.idx64_from(t_id, *secondary, 0) {
+            Some(e) => {
+                *secondary = e.secondary_key;
+                *primary = e.primary_key;
+                self.idx64_cache.add(e.id().raw())
+            }
+            None => end,
+        }
+    }
+
+    pub fn db_idx64_upperbound(
+        &mut self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        secondary: &mut u64,
+        primary: &mut u64,
+    ) -> i32 {
+        let Some(t_id) = self.find_table(code, scope, table) else {
+            return -1;
+        };
+        let end = self.idx64_cache.cache_table(t_id);
+        match self.idx64_above(t_id, *secondary) {
+            Some(e) => {
+                *secondary = e.secondary_key;
+                *primary = e.primary_key;
+                self.idx64_cache.add(e.id().raw())
+            }
+            None => end,
+        }
+    }
+
+    pub fn db_idx64_end(&mut self, code: u64, scope: u64, table: u64) -> i32 {
+        let Some(t_id) = self.find_table(code, scope, table) else {
+            return -1;
+        };
+        self.idx64_cache.cache_table(t_id)
+    }
+
+    pub fn db_idx64_next(&mut self, itr: i32, primary: &mut u64) -> i32 {
+        if itr < -1 {
+            return itr;
+        }
+        let e = self.idx64(self.idx64_cache.kv_of(itr));
+        match self.idx64_after(e.t_id, e.secondary_key, e.primary_key) {
+            Some(n) => {
+                *primary = n.primary_key;
+                self.idx64_cache.add(n.id().raw())
+            }
+            None => self.idx64_cache.end_iterator_of(e.t_id),
+        }
+    }
+
+    pub fn db_idx64_previous(&mut self, itr: i32, primary: &mut u64) -> i32 {
+        if itr < -1 {
+            let t_id = self.idx64_cache.table_of_end_iterator(itr);
+            return match self.idx64_last(t_id) {
+                Some(e) => {
+                    *primary = e.primary_key;
+                    self.idx64_cache.add(e.id().raw())
+                }
+                None => -1,
+            };
+        }
+        let e = self.idx64(self.idx64_cache.kv_of(itr));
+        match self.idx64_before(e.t_id, e.secondary_key, e.primary_key) {
+            Some(p) => {
+                *primary = p.primary_key;
+                self.idx64_cache.add(p.id().raw())
             }
             None => -1,
         }
