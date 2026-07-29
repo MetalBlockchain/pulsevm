@@ -11,6 +11,7 @@ pulsevm_arena_derive = { path = "../pulsevm_arena_derive" }
 zerocopy = { version = "0.8", features = ["derive"] }
 tempfile = "3"
 criterion = { version = "0.5" }
+proptest = "1"
 
 [[bench]]
 name = "arena"
