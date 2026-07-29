@@ -357,6 +357,12 @@ pub mod ffi {
         pub fn account_metadata_state_bytes(self: &Database) -> Result<Vec<u8>>;
         pub fn account_state_bytes(self: &Database) -> Result<Vec<u8>>;
         pub fn permission_keys_bytes(self: &Database) -> Result<Vec<u8>>;
+        pub fn permission_link_state_bytes(self: &Database) -> Result<Vec<u8>>;
+        pub fn code_state_bytes(self: &Database) -> Result<Vec<u8>>;
+        pub fn transaction_state_bytes(self: &Database) -> Result<Vec<u8>>;
+        pub fn resource_usage_state_bytes(self: &Database) -> Result<Vec<u8>>;
+        pub fn account_limits_state_bytes(self: &Database) -> Result<Vec<u8>>;
+        pub fn resource_state_bytes(self: &Database) -> Result<Vec<u8>>;
         pub fn set_account_limits(
             self: Pin<&mut Database>,
             account_name: u64,

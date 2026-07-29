@@ -403,6 +403,97 @@ rust::Vec<uint8_t> database_wrapper::permission_keys_bytes() const {
     return out;
 }
 
+rust::Vec<uint8_t> database_wrapper::permission_link_state_bytes() const {
+    rust::Vec<uint8_t> out;
+    auto put_u64 = [&](uint64_t v){ for (int i = 0; i < 8; ++i) out.push_back(static_cast<uint8_t>(v >> (8 * i))); };
+    const auto& idx = this->get_index<permission_link_index, by_action_name>();
+    for (const auto& o : idx) {
+        put_u64(o.account.to_uint64_t());
+        put_u64(o.code.to_uint64_t());
+        put_u64(o.message_type.to_uint64_t());
+        put_u64(o.required_permission.to_uint64_t());
+    }
+    return out;
+}
+
+rust::Vec<uint8_t> database_wrapper::code_state_bytes() const {
+    rust::Vec<uint8_t> out;
+    auto put_u64 = [&](uint64_t v){ for (int i = 0; i < 8; ++i) out.push_back(static_cast<uint8_t>(v >> (8 * i))); };
+    auto put_u32 = [&](uint32_t v){ for (int i = 0; i < 4; ++i) out.push_back(static_cast<uint8_t>(v >> (8 * i))); };
+    const auto& idx = this->get_index<code_index, by_code_hash>();
+    for (const auto& o : idx) {
+        const char* hd = o.get_code_hash().data();
+        for (size_t i = 0; i < 32; ++i) out.push_back(static_cast<uint8_t>(hd[i]));
+        out.push_back(o.vm_type);
+        out.push_back(o.vm_version);
+        put_u64(o.code_ref_count);
+        put_u32(o.first_block_used);
+        const auto& code = o.get_code();
+        put_u32(static_cast<uint32_t>(code.size()));
+        for (size_t i = 0; i < code.size(); ++i) out.push_back(static_cast<uint8_t>(code.data()[i]));
+    }
+    return out;
+}
+
+rust::Vec<uint8_t> database_wrapper::transaction_state_bytes() const {
+    rust::Vec<uint8_t> out;
+    auto put_u32 = [&](uint32_t v){ for (int i = 0; i < 4; ++i) out.push_back(static_cast<uint8_t>(v >> (8 * i))); };
+    const auto& idx = this->get_index<transaction_multi_index, by_trx_id>();
+    for (const auto& o : idx) {
+        const char* td = o.trx_id.data();
+        for (size_t i = 0; i < 32; ++i) out.push_back(static_cast<uint8_t>(td[i]));
+        put_u32(o.expiration.sec_since_epoch());
+    }
+    return out;
+}
+
+rust::Vec<uint8_t> database_wrapper::resource_usage_state_bytes() const {
+    rust::Vec<uint8_t> out;
+    auto put_u64 = [&](uint64_t v){ for (int i = 0; i < 8; ++i) out.push_back(static_cast<uint8_t>(v >> (8 * i))); };
+    auto put_u32 = [&](uint32_t v){ for (int i = 0; i < 4; ++i) out.push_back(static_cast<uint8_t>(v >> (8 * i))); };
+    auto put_acc = [&](const resource_limits::usage_accumulator& a){ put_u64(a.value_ex); put_u64(a.consumed); put_u32(a.last_ordinal); };
+    const auto& idx = this->get_index<resource_limits::resource_usage_index, resource_limits::by_owner>();
+    for (const auto& o : idx) {
+        put_u64(o.owner.to_uint64_t());
+        put_u64(o.ram_usage);
+        put_acc(o.net_usage);
+        put_acc(o.cpu_usage);
+    }
+    return out;
+}
+
+rust::Vec<uint8_t> database_wrapper::account_limits_state_bytes() const {
+    rust::Vec<uint8_t> out;
+    auto put_u64 = [&](uint64_t v){ for (int i = 0; i < 8; ++i) out.push_back(static_cast<uint8_t>(v >> (8 * i))); };
+    const auto& idx = this->get_index<resource_limits::resource_limits_index, resource_limits::by_owner>();
+    for (const auto& o : idx) {
+        out.push_back(o.pending ? 1 : 0);
+        put_u64(o.owner.to_uint64_t());
+        put_u64(static_cast<uint64_t>(o.ram_bytes));
+        put_u64(static_cast<uint64_t>(o.net_weight));
+        put_u64(static_cast<uint64_t>(o.cpu_weight));
+    }
+    return out;
+}
+
+rust::Vec<uint8_t> database_wrapper::resource_state_bytes() const {
+    rust::Vec<uint8_t> out;
+    auto put_u64 = [&](uint64_t v){ for (int i = 0; i < 8; ++i) out.push_back(static_cast<uint8_t>(v >> (8 * i))); };
+    auto put_u32 = [&](uint32_t v){ for (int i = 0; i < 4; ++i) out.push_back(static_cast<uint8_t>(v >> (8 * i))); };
+    auto put_acc = [&](const resource_limits::usage_accumulator& a){ put_u64(a.value_ex); put_u64(a.consumed); put_u32(a.last_ordinal); };
+    const auto& s = this->get<resource_limits::resource_limits_state_object>();
+    put_acc(s.average_block_net_usage);
+    put_acc(s.average_block_cpu_usage);
+    put_u64(s.pending_net_usage);
+    put_u64(s.pending_cpu_usage);
+    put_u64(s.total_net_weight);
+    put_u64(s.total_cpu_weight);
+    put_u64(s.total_ram_bytes);
+    put_u64(s.virtual_net_limit);
+    put_u64(s.virtual_cpu_limit);
+    return out;
+}
+
 rust::Vec<uint8_t> database_wrapper::pack_deltas(bool full_snapshot) const {
     fc::datastream<size_t> ps;
     pulsevm::state_history::pack_deltas(ps, *this, full_snapshot);

@@ -2445,6 +2445,112 @@ mod tests {
         Ok(())
     }
 
+    /// Unified full-state cross-impl root across every mirrored table that a
+    /// normal block populates. A rich block (create, setcode, setabi, updateauth,
+    /// linkauth) exercises each table, then each table's canonical serialization
+    /// is compared byte-for-byte (so a mismatch names the table) and a single
+    /// SHA-256 over all of them — the full-state root — must match. The seven
+    /// contract tables are empty in this flow (no WASM db writes) and are covered
+    /// against chainbase separately in diff_contract_iter.
+    #[cfg(feature = "arena-shadow")]
+    #[tokio::test]
+    async fn oracle_cross_impl_full_state_root() -> Result<(), ChainError> {
+        use sha2::{Digest, Sha256};
+
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
+        let private_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let mempool = Arc::new(RwLock::new(Mempool::new()));
+        let mut mempool = mempool.write().await;
+        let mut controller = Controller::new();
+        let genesis_bytes = generate_genesis(&private_key);
+        let temp_path = get_temp_dir();
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": private_key.to_string(),
+        })
+        .to_string()
+        .into_bytes();
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &genesis_bytes.to_vec(),
+            temp_path.path().to_str().unwrap(),
+        )?;
+        let chain_id = controller.chain_id().clone();
+        let glenn = Name::from_str("glenn")?;
+        let perm = Name::from_str("claude")?;
+        let msg_type = Name::from_str("transfer")?;
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let wasm =
+            fs::read(root.join(Path::new("reference_contracts/pulse_token.wasm"))).unwrap();
+        let abi = AbiDefinition {
+            version: "eosio::abi/1.2".to_string(),
+            types: vec![],
+            structs: vec![],
+            actions: vec![],
+            tables: vec![],
+            ricardian_clauses: vec![],
+            error_messages: vec![],
+            abi_extensions: vec![],
+            variants: vec![],
+            action_results: vec![],
+        };
+
+        mempool.add_transaction(create_account(&private_key, glenn, chain_id)?);
+        mempool.add_transaction(set_code(&private_key, glenn, wasm, chain_id)?);
+        mempool.add_transaction(set_abi(&private_key, glenn, abi.pack().unwrap(), chain_id)?);
+        mempool.add_transaction(update_auth(&private_key, glenn, perm, ACTIVE_NAME, 1, chain_id)?);
+        mempool.add_transaction(link_auth(&private_key, glenn, glenn, msg_type, perm, chain_id)?);
+        let block = controller.build_block(&mut mempool).await?;
+        controller.accept_block(&block.id()?, &mut mempool)?;
+
+        let db = controller.database();
+        // (table name, chainbase bytes, arena bytes)
+        let tables: Vec<(&str, Vec<u8>, Vec<u8>)> = vec![
+            ("account_metadata", db.account_metadata_state_bytes()?, db.arena_account_metadata_state_bytes().unwrap()),
+            ("account", db.account_state_bytes()?, db.arena_account_state_bytes().unwrap()),
+            ("permission", db.permission_state_bytes()?, db.arena_permission_state_bytes().unwrap()),
+            ("permission_link", db.permission_link_state_bytes()?, db.arena_permission_link_state_bytes().unwrap()),
+            ("code", db.code_state_bytes()?, db.arena_code_state_bytes().unwrap()),
+            ("transaction", db.transaction_state_bytes()?, db.arena_transaction_state_bytes().unwrap()),
+            ("resource_usage", db.resource_usage_state_bytes()?, db.arena_resource_usage_state_bytes().unwrap()),
+            ("resource_limits", db.account_limits_state_bytes()?, db.arena_account_limits_state_bytes().unwrap()),
+            ("resource_state", db.resource_state_bytes()?, db.arena_resource_state_bytes().unwrap()),
+            ("dynamic_global_property", db.get_global_action_sequence()?.to_le_bytes().to_vec(), db.arena_global_action_sequence().unwrap().to_le_bytes().to_vec()),
+        ];
+
+        let mut chain_root = Sha256::new();
+        let mut arena_root = Sha256::new();
+        for (name, chain_bytes, arena_bytes) in &tables {
+            assert_eq!(
+                chain_bytes, arena_bytes,
+                "cross-impl state diverged for table {name}"
+            );
+            chain_root.update(name.as_bytes());
+            chain_root.update(chain_bytes);
+            arena_root.update(name.as_bytes());
+            arena_root.update(arena_bytes);
+        }
+        let chain_root: [u8; 32] = chain_root.finalize().into();
+        let arena_root: [u8; 32] = arena_root.finalize().into();
+        assert_eq!(chain_root, arena_root, "full-state cross-impl root diverged");
+
+        // Sanity: the populated tables are non-empty on both sides.
+        for name in ["account_metadata", "account", "permission", "code", "resource_usage"] {
+            let (_, chain_bytes, _) = tables.iter().find(|t| t.0 == name).unwrap();
+            assert!(!chain_bytes.is_empty(), "expected {name} to be populated");
+        }
+        Ok(())
+    }
+
     /// Block-sequence fuzzer: random sequences of blocks — each with a few
     /// newaccount transactions, then either accepted or discarded — must keep
     /// the arena mirror in step with chainbase. After every block, for every

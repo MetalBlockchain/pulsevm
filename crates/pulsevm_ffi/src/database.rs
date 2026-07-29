@@ -336,6 +336,117 @@ impl Database {
         }
     }
 
+    pub fn permission_link_state_bytes(&self) -> Result<Vec<u8>, ChainError> {
+        let guard = self.inner.read()?;
+        guard
+            .permission_link_state_bytes()
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
+    pub fn code_state_bytes(&self) -> Result<Vec<u8>, ChainError> {
+        let guard = self.inner.read()?;
+        guard
+            .code_state_bytes()
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
+    pub fn transaction_state_bytes(&self) -> Result<Vec<u8>, ChainError> {
+        let guard = self.inner.read()?;
+        guard
+            .transaction_state_bytes()
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
+    pub fn resource_usage_state_bytes(&self) -> Result<Vec<u8>, ChainError> {
+        let guard = self.inner.read()?;
+        guard
+            .resource_usage_state_bytes()
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
+    pub fn account_limits_state_bytes(&self) -> Result<Vec<u8>, ChainError> {
+        let guard = self.inner.read()?;
+        guard
+            .account_limits_state_bytes()
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
+    pub fn resource_state_bytes(&self) -> Result<Vec<u8>, ChainError> {
+        let guard = self.inner.read()?;
+        guard
+            .resource_state_bytes()
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
+    /// Arena mirror canonical serializations for the remaining tables, `None`
+    /// when shadowing is off — each byte-compatible with the chainbase method of
+    /// the same name for the cross-impl root.
+    pub fn arena_permission_link_state_bytes(&self) -> Option<Vec<u8>> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow.as_ref().map(|s| s.permission_link_state_bytes())
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            None
+        }
+    }
+
+    pub fn arena_code_state_bytes(&self) -> Option<Vec<u8>> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow.as_ref().map(|s| s.code_state_bytes())
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            None
+        }
+    }
+
+    pub fn arena_transaction_state_bytes(&self) -> Option<Vec<u8>> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow.as_ref().map(|s| s.transaction_state_bytes())
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            None
+        }
+    }
+
+    pub fn arena_resource_usage_state_bytes(&self) -> Option<Vec<u8>> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow.as_ref().map(|s| s.resource_usage_state_bytes())
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            None
+        }
+    }
+
+    pub fn arena_account_limits_state_bytes(&self) -> Option<Vec<u8>> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow.as_ref().map(|s| s.account_limits_state_bytes())
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            None
+        }
+    }
+
+    pub fn arena_resource_state_bytes(&self) -> Option<Vec<u8>> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow.as_ref().map(|s| s.resource_state_bytes())
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            None
+        }
+    }
+
     /// Whether the arena mirror holds an account_object for `name` — for diffing
     /// against chainbase's `find_account`.
     pub fn arena_account_exists(&self, name: u64) -> bool {
@@ -490,6 +601,28 @@ impl Database {
                     }
                 }
                 Err(e) => eprintln!("arena mirror could not read genesis permissions: {e:?}"),
+            }
+            // Genesis native accounts get resource_usage (billed ram) and
+            // resource_limits rows inside create_native_account; seed them.
+            match self.resource_usage_state_bytes() {
+                Ok(bytes) => {
+                    if let Some(s) = &self.shadow
+                        && let Err(e) = s.hydrate_resource_usage(&bytes)
+                    {
+                        eprintln!("arena mirror could not hydrate genesis resource_usage: {e:?}");
+                    }
+                }
+                Err(e) => eprintln!("arena mirror could not read genesis resource_usage: {e:?}"),
+            }
+            match self.account_limits_state_bytes() {
+                Ok(bytes) => {
+                    if let Some(s) = &self.shadow
+                        && let Err(e) = s.hydrate_account_limits(&bytes)
+                    {
+                        eprintln!("arena mirror could not hydrate genesis resource_limits: {e:?}");
+                    }
+                }
+                Err(e) => eprintln!("arena mirror could not read genesis resource_limits: {e:?}"),
             }
         }
         Ok(())

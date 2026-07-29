@@ -63,6 +63,17 @@ fn integer_divide_ceil(num: u128, den: u128) -> u128 {
     (num / den) + if num % den > 0 { 1 } else { 0 }
 }
 
+/// Parses a 20-byte canonical usage accumulator (value_ex u64 LE, consumed u64
+/// LE, last_ordinal u32 LE) — the inverse of the serializers' `put_acc`.
+fn read_acc(b: &[u8]) -> UsageAccumulator {
+    UsageAccumulator {
+        value_ex: u64::from_le_bytes(b[0..8].try_into().unwrap()),
+        consumed: u64::from_le_bytes(b[8..16].try_into().unwrap()),
+        last_ordinal: u32::from_le_bytes(b[16..20].try_into().unwrap()),
+        _pad: 0,
+    }
+}
+
 /// Port of chainbase `exponential_moving_average_accumulator` (the
 /// `usage_accumulator` used for net/cpu). The field order differs from the C++
 /// struct to keep the row free of implicit padding for the zero-copy layout, but
@@ -1320,6 +1331,215 @@ impl ArenaShadow {
             })?;
         }
         Ok(())
+    }
+
+    /// Canonical serialization of permission_link in (account, code,
+    /// message_type) order. No genesis rows (links come only from linkauth).
+    pub fn permission_link_state_bytes(&self) -> Vec<u8> {
+        let db = self.lock();
+        let mut rows: Vec<(u64, u64, u64, u64)> = match db.table::<PermissionLinkRow>() {
+            Ok(t) => t
+                .iter()
+                .map(|l| (l.account, l.code, l.message_type, l.required_permission))
+                .collect(),
+            Err(_) => return Vec::new(),
+        };
+        rows.sort_by_key(|r| (r.0, r.1, r.2));
+        let mut out = Vec::new();
+        for (account, code, message_type, required) in rows {
+            out.extend_from_slice(&account.to_le_bytes());
+            out.extend_from_slice(&code.to_le_bytes());
+            out.extend_from_slice(&message_type.to_le_bytes());
+            out.extend_from_slice(&required.to_le_bytes());
+        }
+        out
+    }
+
+    /// Canonical serialization of code_object in (code_hash, vm_type, vm_version)
+    /// order: hash 32B, vm_type, vm_version, ref_count u64 LE, first_block u32 LE,
+    /// then a u32 LE length-prefixed code blob. No genesis rows (setcode only).
+    pub fn code_state_bytes(&self) -> Vec<u8> {
+        let db = self.lock();
+        let mut refs: Vec<([u8; 32], u8, u8, u64, u32, BlobRef)> = match db.table::<CodeRow>() {
+            Ok(t) => t
+                .iter()
+                .map(|c| {
+                    (
+                        c.code_hash,
+                        c.vm_type,
+                        c.vm_version,
+                        c.code_ref_count,
+                        c.first_block_used,
+                        c.code,
+                    )
+                })
+                .collect(),
+            Err(_) => return Vec::new(),
+        };
+        refs.sort_by_key(|r| (r.0, r.1, r.2));
+        let mut out = Vec::new();
+        for (hash, vm_type, vm_version, ref_count, first_block, code_ref) in refs {
+            out.extend_from_slice(&hash);
+            out.push(vm_type);
+            out.push(vm_version);
+            out.extend_from_slice(&ref_count.to_le_bytes());
+            out.extend_from_slice(&first_block.to_le_bytes());
+            let code = db.blob::<CodeRow>(code_ref).unwrap_or(&[]);
+            out.extend_from_slice(&(code.len() as u32).to_le_bytes());
+            out.extend_from_slice(code);
+        }
+        out
+    }
+
+    /// Canonical serialization of the transaction dedupe set in trx_id order:
+    /// trx_id 32B, expiration u32 LE (seconds). No genesis rows.
+    pub fn transaction_state_bytes(&self) -> Vec<u8> {
+        let db = self.lock();
+        let mut rows: Vec<([u8; 32], u32)> = match db.table::<TransactionRow>() {
+            Ok(t) => t.iter().map(|t| (t.trx_id, t.expiration)).collect(),
+            Err(_) => return Vec::new(),
+        };
+        rows.sort_by_key(|r| r.0);
+        let mut out = Vec::new();
+        for (trx_id, expiration) in rows {
+            out.extend_from_slice(&trx_id);
+            out.extend_from_slice(&expiration.to_le_bytes());
+        }
+        out
+    }
+
+    /// Canonical serialization of resource_usage in owner order: owner u64 LE,
+    /// ram_usage u64 LE, then the net and cpu accumulators.
+    pub fn resource_usage_state_bytes(&self) -> Vec<u8> {
+        let db = self.lock();
+        let mut rows: Vec<(u64, u64, UsageAccumulator, UsageAccumulator)> =
+            match db.table::<ResourceUsageRow>() {
+                Ok(t) => t
+                    .iter()
+                    .map(|r| (r.owner, r.ram_usage, r.net_usage, r.cpu_usage))
+                    .collect(),
+                Err(_) => return Vec::new(),
+            };
+        rows.sort_by_key(|r| r.0);
+        let mut out = Vec::new();
+        let put_acc = |out: &mut Vec<u8>, a: &UsageAccumulator| {
+            out.extend_from_slice(&a.value_ex.to_le_bytes());
+            out.extend_from_slice(&a.consumed.to_le_bytes());
+            out.extend_from_slice(&a.last_ordinal.to_le_bytes());
+        };
+        for (owner, ram, net, cpu) in rows {
+            out.extend_from_slice(&owner.to_le_bytes());
+            out.extend_from_slice(&ram.to_le_bytes());
+            put_acc(&mut out, &net);
+            put_acc(&mut out, &cpu);
+        }
+        out
+    }
+
+    /// Seeds resource_usage rows from the canonical layout — genesis native
+    /// accounts get their rows (and billed ram) inside C++. A present owner is
+    /// left untouched.
+    pub fn hydrate_resource_usage(&self, bytes: &[u8]) -> Result<(), DbError> {
+        const ROW: usize = 8 + 8 + 20 + 20; // owner, ram, net acc, cpu acc
+        let mut db = self.lock();
+        for c in bytes.chunks_exact(ROW) {
+            let owner = u64::from_le_bytes(c[0..8].try_into().unwrap());
+            if db
+                .find_by::<ResourceUsageRow, ResourceUsageRowByOwner>(&owner)?
+                .is_some()
+            {
+                continue;
+            }
+            let ram = u64::from_le_bytes(c[8..16].try_into().unwrap());
+            let net = read_acc(&c[16..36]);
+            let cpu = read_acc(&c[36..56]);
+            db.create::<ResourceUsageRow>(|r| {
+                r.owner = owner;
+                r.ram_usage = ram;
+                r.net_usage = net;
+                r.cpu_usage = cpu;
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Canonical serialization of resource_limits in (pending, owner) order.
+    pub fn account_limits_state_bytes(&self) -> Vec<u8> {
+        let db = self.lock();
+        let mut rows: Vec<(u8, u64, i64, i64, i64)> = match db.table::<ResourceLimitsRow>() {
+            Ok(t) => t
+                .iter()
+                .map(|r| (r.pending, r.owner, r.ram_bytes, r.net_weight, r.cpu_weight))
+                .collect(),
+            Err(_) => return Vec::new(),
+        };
+        rows.sort_by_key(|r| (r.0, r.1));
+        let mut out = Vec::new();
+        for (pending, owner, ram, net, cpu) in rows {
+            out.push(pending);
+            out.extend_from_slice(&owner.to_le_bytes());
+            out.extend_from_slice(&(ram as u64).to_le_bytes());
+            out.extend_from_slice(&(net as u64).to_le_bytes());
+            out.extend_from_slice(&(cpu as u64).to_le_bytes());
+        }
+        out
+    }
+
+    /// Seeds resource_limits rows from the canonical layout (genesis native
+    /// accounts). A present `(pending, owner)` is left untouched.
+    pub fn hydrate_account_limits(&self, bytes: &[u8]) -> Result<(), DbError> {
+        const ROW: usize = 1 + 8 + 8 + 8 + 8;
+        let mut db = self.lock();
+        for c in bytes.chunks_exact(ROW) {
+            let pending = c[0];
+            let owner = u64::from_le_bytes(c[1..9].try_into().unwrap());
+            if db
+                .find_by::<ResourceLimitsRow, LimitsByOwner>(&(pending, owner))?
+                .is_some()
+            {
+                continue;
+            }
+            let ram = u64::from_le_bytes(c[9..17].try_into().unwrap()) as i64;
+            let net = u64::from_le_bytes(c[17..25].try_into().unwrap()) as i64;
+            let cpu = u64::from_le_bytes(c[25..33].try_into().unwrap()) as i64;
+            db.create::<ResourceLimitsRow>(|r| {
+                r.pending = pending;
+                r.owner = owner;
+                r.ram_bytes = ram;
+                r.net_weight = net;
+                r.cpu_weight = cpu;
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Canonical serialization of the resource_limits_state singleton: the net
+    /// and cpu block-usage accumulators, then pending/total/virtual scalars.
+    pub fn resource_state_bytes(&self) -> Vec<u8> {
+        let db = self.lock();
+        let s = match db.table::<ResourceStateRow>() {
+            Ok(t) => match t.iter().next() {
+                Some(s) => *s,
+                None => return Vec::new(),
+            },
+            Err(_) => return Vec::new(),
+        };
+        let mut out = Vec::new();
+        let put_acc = |out: &mut Vec<u8>, a: &UsageAccumulator| {
+            out.extend_from_slice(&a.value_ex.to_le_bytes());
+            out.extend_from_slice(&a.consumed.to_le_bytes());
+            out.extend_from_slice(&a.last_ordinal.to_le_bytes());
+        };
+        put_acc(&mut out, &s.average_block_net_usage);
+        put_acc(&mut out, &s.average_block_cpu_usage);
+        out.extend_from_slice(&s.pending_net_usage.to_le_bytes());
+        out.extend_from_slice(&s.pending_cpu_usage.to_le_bytes());
+        out.extend_from_slice(&s.total_net_weight.to_le_bytes());
+        out.extend_from_slice(&s.total_cpu_weight.to_le_bytes());
+        out.extend_from_slice(&s.total_ram_bytes.to_le_bytes());
+        out.extend_from_slice(&s.virtual_net_limit.to_le_bytes());
+        out.extend_from_slice(&s.virtual_cpu_limit.to_le_bytes());
+        out
     }
 
     /// Mirrors `remove_permission` (and the `delete_auth` path that calls it):

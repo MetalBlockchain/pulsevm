@@ -293,6 +293,15 @@ public:
     // included here.
     rust::Vec<uint8_t> permission_keys_bytes() const;
 
+    // Canonical serializations of the remaining tables for cross-impl roots.
+    // Field order/endianness must match the arena serializers exactly.
+    rust::Vec<uint8_t> permission_link_state_bytes() const;
+    rust::Vec<uint8_t> code_state_bytes() const;
+    rust::Vec<uint8_t> transaction_state_bytes() const;
+    rust::Vec<uint8_t> resource_usage_state_bytes() const;
+    rust::Vec<uint8_t> account_limits_state_bytes() const;
+    rust::Vec<uint8_t> resource_state_bytes() const;
+
     bool set_account_limits( uint64_t account, int64_t ram_bytes, int64_t net_weight, int64_t cpu_weight) {
         auto find_or_create_pending_limits = [&]() -> const resource_limits::resource_limits_object& {
             const auto* pending_limits = this->find<resource_limits::resource_limits_object, resource_limits::by_owner>( boost::make_tuple(true, name(account)) );
