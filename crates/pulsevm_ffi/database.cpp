@@ -355,6 +355,25 @@ ElasticLimitParameters database_wrapper::get_net_limit_parameters() const {
     };
 }
 
+rust::Vec<uint8_t> database_wrapper::account_metadata_state_bytes() const {
+    rust::Vec<uint8_t> out;
+    auto put_u64 = [&](uint64_t v){ for (int i = 0; i < 8; ++i) out.push_back(static_cast<uint8_t>(v >> (8 * i))); };
+    const auto& idx = this->get_index<account_metadata_index, by_name>();
+    for (const auto& o : idx) {
+        put_u64(o.name.to_uint64_t());
+        out.push_back(o.is_privileged() ? 1 : 0);
+        put_u64(o.get_recv_sequence());
+        put_u64(o.get_auth_sequence());
+        put_u64(o.get_code_sequence());
+        put_u64(o.get_abi_sequence());
+        const char* hd = o.get_code_hash().data();
+        for (size_t i = 0; i < 32; ++i) out.push_back(static_cast<uint8_t>(hd[i]));
+        out.push_back(o.get_vm_type());
+        out.push_back(o.get_vm_version());
+    }
+    return out;
+}
+
 rust::Vec<uint8_t> database_wrapper::pack_deltas(bool full_snapshot) const {
     fc::datastream<size_t> ps;
     pulsevm::state_history::pack_deltas(ps, *this, full_snapshot);

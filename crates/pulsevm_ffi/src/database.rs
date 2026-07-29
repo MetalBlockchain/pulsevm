@@ -238,6 +238,32 @@ impl Database {
         }
     }
 
+    /// Canonical serialization of chainbase's whole account_metadata table in
+    /// by_name order — hash it to get a cross-implementation state root for the
+    /// account set.
+    pub fn account_metadata_state_bytes(&self) -> Result<Vec<u8>, ChainError> {
+        let guard = self.inner.read()?;
+        guard
+            .account_metadata_state_bytes()
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
+    /// The arena mirror's canonical account_metadata serialization, or `None`
+    /// when shadowing is off — byte-compatible with `account_metadata_state_bytes`
+    /// so their hashes match iff the tables hold the same state.
+    pub fn arena_account_metadata_state_bytes(&self) -> Option<Vec<u8>> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow
+                .as_ref()
+                .map(|s| s.account_metadata_state_bytes())
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            None
+        }
+    }
+
     /// Whether the arena mirror holds an account_object for `name` — for diffing
     /// against chainbase's `find_account`.
     pub fn arena_account_exists(&self, name: u64) -> bool {
@@ -359,6 +385,19 @@ impl Database {
                     }
                 }
                 _ => eprintln!("arena mirror could not read limit parameters at init"),
+            }
+            // Genesis creates its native accounts inside C++, below the mirror
+            // hooks, so seed their account_metadata into the mirror from
+            // chainbase once here. Later accounts flow through the live path.
+            match self.account_metadata_state_bytes() {
+                Ok(bytes) => {
+                    if let Some(s) = &self.shadow
+                        && let Err(e) = s.hydrate_account_metadata(&bytes)
+                    {
+                        eprintln!("arena mirror could not hydrate genesis account_metadata: {e:?}");
+                    }
+                }
+                Err(e) => eprintln!("arena mirror could not read genesis account_metadata: {e:?}"),
             }
         }
         Ok(())

@@ -967,6 +967,90 @@ impl ArenaShadow {
             })
     }
 
+    /// Canonical serialization of the whole account_metadata table in name order.
+    /// Field order and endianness match the chainbase `account_metadata_state_
+    /// bytes` enumerator byte for byte, so hashing the two streams yields the
+    /// same root when the tables hold the same logical state — a true
+    /// cross-implementation state-root check over the full account set.
+    pub fn account_metadata_state_bytes(&self) -> Vec<u8> {
+        let db = self.lock();
+        let mut rows: Vec<(u64, bool, u64, u64, u64, u64, [u8; 32], u8, u8)> =
+            match db.table::<AccountMetaRow>() {
+                Ok(t) => t
+                    .iter()
+                    .map(|r| {
+                        (
+                            r.name,
+                            r.flags & 1 != 0,
+                            r.recv_sequence,
+                            r.auth_sequence,
+                            r.code_sequence,
+                            r.abi_sequence,
+                            r.code_hash,
+                            r.vm_type,
+                            r.vm_version,
+                        )
+                    })
+                    .collect(),
+                Err(_) => return Vec::new(),
+            };
+        rows.sort_by_key(|r| r.0);
+        let mut out = Vec::new();
+        for (name, privileged, recv, auth, code, abi, hash, vm_type, vm_version) in rows {
+            out.extend_from_slice(&name.to_le_bytes());
+            out.push(privileged as u8);
+            out.extend_from_slice(&recv.to_le_bytes());
+            out.extend_from_slice(&auth.to_le_bytes());
+            out.extend_from_slice(&code.to_le_bytes());
+            out.extend_from_slice(&abi.to_le_bytes());
+            out.extend_from_slice(&hash);
+            out.push(vm_type);
+            out.push(vm_version);
+        }
+        out
+    }
+
+    /// Loads account_metadata rows from the canonical byte layout produced by
+    /// `account_metadata_state_bytes`. Genesis creates its native accounts inside
+    /// C++ (`create_native_account`), below the per-write mirror hooks, so the
+    /// mirror seeds those rows here from chainbase once at init; rows created
+    /// later by actions still flow through the live `create_account_metadata`
+    /// path. A name already present is left untouched, so re-seeding is safe.
+    pub fn hydrate_account_metadata(&self, bytes: &[u8]) -> Result<(), DbError> {
+        const ROW: usize = 75;
+        let mut db = self.lock();
+        for chunk in bytes.chunks_exact(ROW) {
+            let name = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
+            if db
+                .find_by::<AccountMetaRow, AccountMetaRowByName>(&name)?
+                .is_some()
+            {
+                continue;
+            }
+            let privileged = chunk[8];
+            let recv = u64::from_le_bytes(chunk[9..17].try_into().unwrap());
+            let auth = u64::from_le_bytes(chunk[17..25].try_into().unwrap());
+            let code = u64::from_le_bytes(chunk[25..33].try_into().unwrap());
+            let abi = u64::from_le_bytes(chunk[33..41].try_into().unwrap());
+            let mut code_hash = [0u8; 32];
+            code_hash.copy_from_slice(&chunk[41..73]);
+            let vm_type = chunk[73];
+            let vm_version = chunk[74];
+            db.create::<AccountMetaRow>(|r| {
+                r.name = name;
+                r.flags = privileged as u32;
+                r.recv_sequence = recv;
+                r.auth_sequence = auth;
+                r.code_sequence = code;
+                r.abi_sequence = abi;
+                r.code_hash = code_hash;
+                r.vm_type = vm_type;
+                r.vm_version = vm_version;
+            })?;
+        }
+        Ok(())
+    }
+
     /// Whether the mirror holds an account_object row for `name` — for diffing
     /// against chainbase's `find_account`.
     pub fn account_exists(&self, name: u64) -> bool {
