@@ -22,6 +22,14 @@ use pulsevm_arena::{
     ArenaObject, BlobRef, Db, IndexedBy, ObjectId, SecondaryIndex, key_index,
 };
 
+/// RAM overhead billed per row, matching EOS `config::billable_size_v<...>`.
+/// RAM usage is consensus state, so these must equal the C++ constants; the
+/// values below mirror EOS and should be calibrated against `pulsevm_billable_size`
+/// before mainnet use.
+const KV_OVERHEAD: i64 = 112; // billable_size_v<key_value_object>
+const IDX64_OVERHEAD: i64 = 80; // billable_size_v<index64_object>
+const TABLE_OVERHEAD: i64 = 44; // billable_size_v<table_id_object>
+
 /// `chainbase::table_id_object` — one contract table, identified by
 /// `(code, scope, table)`.
 #[repr(C)]
@@ -107,6 +115,7 @@ pub struct Index64Object {
     t_id: i64,
     primary_key: u64,
     secondary_key: u64,
+    payer: u64,
 }
 
 struct Idx64ByPrimary;
@@ -191,6 +200,8 @@ pub struct ContractDb {
     db: Db,
     cache: IteratorCache,
     idx64_cache: IteratorCache,
+    /// RAM bytes billed per account (chainbase bills the row payer on write).
+    ram: HashMap<u64, i64>,
 }
 
 impl Default for ContractDb {
@@ -209,6 +220,7 @@ impl ContractDb {
             db,
             cache: IteratorCache::default(),
             idx64_cache: IteratorCache::default(),
+            ram: HashMap::new(),
         }
     }
 
@@ -216,6 +228,15 @@ impl ContractDb {
     pub fn reset_iterators(&mut self) {
         self.cache = IteratorCache::default();
         self.idx64_cache = IteratorCache::default();
+    }
+
+    /// RAM bytes currently billed to `account`.
+    pub fn ram_usage(&self, account: u64) -> i64 {
+        self.ram.get(&account).copied().unwrap_or(0)
+    }
+
+    fn bill(&mut self, account: u64, delta: i64) {
+        *self.ram.entry(account).or_insert(0) += delta;
     }
 
     fn find_table(&self, code: u64, scope: u64, table: u64) -> Option<i64> {
@@ -229,7 +250,8 @@ impl ContractDb {
         if let Some(t) = self.find_table(code, scope, table) {
             return t;
         }
-        self.db
+        let t_id = self
+            .db
             .create::<TableIdObject>(|t| {
                 t.code = code;
                 t.scope = scope;
@@ -239,7 +261,9 @@ impl ContractDb {
             })
             .unwrap()
             .id()
-            .raw()
+            .raw();
+        self.bill(payer, TABLE_OVERHEAD);
+        t_id
     }
 
     fn kv(&self, kv_id: i64) -> KeyValueObject {
@@ -323,12 +347,23 @@ impl ContractDb {
         self.db
             .modify::<TableIdObject>(ObjectId::new(t_id), |t| t.count += 1)
             .unwrap();
+        self.bill(payer, value.len() as i64 + KV_OVERHEAD);
         self.cache.cache_table(t_id);
         self.cache.add(kv_id)
     }
 
     pub fn db_update_i64(&mut self, itr: i32, payer: u64, value: &[u8]) {
         let kv_id = self.cache.kv_of(itr);
+        let old = self.kv(kv_id);
+        let old_bytes = old.value.len as i64 + KV_OVERHEAD;
+        let new_bytes = value.len() as i64 + KV_OVERHEAD;
+        // Move the billed bytes to the new payer, or adjust the delta if same.
+        if old.payer == payer {
+            self.bill(payer, new_bytes - old_bytes);
+        } else {
+            self.bill(old.payer, -old_bytes);
+            self.bill(payer, new_bytes);
+        }
         let blob = self.db.alloc_blob::<KeyValueObject>(value).unwrap();
         self.db
             .modify::<KeyValueObject>(ObjectId::new(kv_id), |k| {
@@ -340,10 +375,11 @@ impl ContractDb {
 
     pub fn db_remove_i64(&mut self, itr: i32) {
         let kv_id = self.cache.kv_of(itr);
-        let t_id = self.kv(kv_id).t_id;
+        let kv = self.kv(kv_id);
+        self.bill(kv.payer, -(kv.value.len as i64 + KV_OVERHEAD));
         self.db.remove::<KeyValueObject>(ObjectId::new(kv_id)).unwrap();
         self.db
-            .modify::<TableIdObject>(ObjectId::new(t_id), |t| t.count -= 1)
+            .modify::<TableIdObject>(ObjectId::new(kv.t_id), |t| t.count -= 1)
             .unwrap();
     }
 
@@ -515,10 +551,12 @@ impl ContractDb {
                 e.t_id = t_id;
                 e.primary_key = primary;
                 e.secondary_key = secondary;
+                e.payer = payer;
             })
             .unwrap()
             .id()
             .raw();
+        self.bill(payer, IDX64_OVERHEAD);
         self.idx64_cache.cache_table(t_id);
         self.idx64_cache.add(id)
     }
@@ -532,6 +570,8 @@ impl ContractDb {
 
     pub fn db_idx64_remove(&mut self, itr: i32) {
         let id = self.idx64_cache.kv_of(itr);
+        let payer = self.idx64(id).payer;
+        self.bill(payer, -IDX64_OVERHEAD);
         self.db.remove::<Index64Object>(ObjectId::new(id)).unwrap();
     }
 
