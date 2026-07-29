@@ -166,6 +166,7 @@ mod tests {
     #[test]
     fn test_name_from_str() {
         let name = Name::from_str("oracles").unwrap();
-        assert_eq!(name.as_u64(), 6138663577826885632);
+        assert_eq!(name.as_u64(), 11947074179527868416);
+        assert_eq!(name.to_string(), "oracles");
     }
 }

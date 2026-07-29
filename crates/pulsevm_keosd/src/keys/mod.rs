@@ -228,7 +228,11 @@ mod tests {
     #[test]
     fn test_roundtrip_keypair_pub_k1() {
         let (wif, pubkey) = generate_keypair().unwrap();
-        assert!(wif.starts_with('5') || wif.starts_with('K') || wif.starts_with('L'));
+        assert!(
+            wif.starts_with("PVT_K1_"),
+            "Expected PVT_K1_ prefix, got: {}",
+            wif
+        );
         assert!(
             pubkey.starts_with("PUB_K1_"),
             "Expected PUB_K1_ prefix, got: {}",

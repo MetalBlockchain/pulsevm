@@ -212,7 +212,7 @@ pub fn symbol_code_to_bytes(value: u64) -> [u8; SYMBOL_CODE_MAX_LEN] {
 #[inline]
 pub fn symbol_code_from_bytes<I>(iter: I) -> Result<u64, ParseSymbolCodeError>
 where
-    I: DoubleEndedIterator<Item = u8> + ExactSizeIterator,
+    I: Iterator<Item = u8> + ExactSizeIterator,
 {
     // Check length once, up front — the previous per-index check compared a
     // reversed index against the max length, which reads as an off-by-one.
@@ -224,13 +224,17 @@ where
         return Err(ParseSymbolCodeError::TooLong);
     }
 
+    // Walk in reading order so the *first* offending character is the one
+    // reported. The first character occupies the least-significant byte, so
+    // shift each one into place rather than left-shifting a reversed walk.
     let mut value = 0_u64;
-    for c in iter.rev() {
+    let mut shift = 0;
+    for c in iter {
         if !c.is_ascii_uppercase() {
             return Err(ParseSymbolCodeError::BadChar(c));
         }
-        value <<= 8;
-        value |= u64::from(c);
+        value |= u64::from(c) << shift;
+        shift += 8;
     }
     Ok(value)
 }
