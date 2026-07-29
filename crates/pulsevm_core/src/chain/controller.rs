@@ -38,9 +38,10 @@ use pulsevm_constants::{
 };
 use pulsevm_crypto::{Digest, merkle};
 use pulsevm_error::ChainError;
+use cxx::UniquePtr;
 use pulsevm_ffi::{
     BlockTimestamp, CxxGenesisState, Database, ElasticLimitParameters, GlobalPropertyObject,
-    TimePoint, seconds,
+    TimePoint, UndoSession, seconds,
 };
 use pulsevm_grpc::vm;
 use pulsevm_serialization::{Read, Write};
@@ -78,6 +79,44 @@ pub struct Controller {
     trace_log: Option<StateHistoryLog>,
     chain_state_log: Option<StateHistoryLog>,
     node_config: Option<NodeConfig>,
+
+    // The chain of blocks that have been executed (during build or verify) but
+    // not yet accepted, ordered oldest first. Their state is materialized on the
+    // live database as a stack of chainbase undo sessions on top of
+    // `last_accepted_block_id`: `pending_chain[0].parent == last_accepted_block_id`
+    // and `pending_chain[i].parent == pending_chain[i-1].id`. Retaining these lets
+    // `replay_accepted_state_to` reuse an already-executed prefix instead of
+    // re-running every unaccepted ancestor, and lets `accept_block` commit the
+    // front block without re-executing it.
+    pending_chain: Vec<PendingBlock>,
+
+    // Count of `execute_block` invocations, for measuring how much re-execution
+    // the pending-chain reuse actually avoids. Not consensus state.
+    blocks_executed: u64,
+}
+
+struct PendingBlock {
+    id: Id,
+    // Parent block id. For the front of the chain this equals the last accepted
+    // block; for later entries it is the previous entry's id.
+    parent: Id,
+    // Live chainbase undo session holding this block's state mutations. Kept
+    // alive (neither pushed nor undone) so the state stays applied; accepting the
+    // block pushes+commits it, unwinding undoes it.
+    session: UniquePtr<UndoSession>,
+    // Transaction traces produced during execution, needed by `store_traces` at
+    // accept time. Retaining them avoids recomputing via a second execution.
+    traces: Vec<TransactionTrace>,
+}
+
+impl Drop for Controller {
+    fn drop(&mut self) {
+        // The pending sessions form a chainbase undo stack and must be released in
+        // reverse (LIFO) order. Letting the `Vec<PendingBlock>` drop naturally would
+        // destroy them oldest-first, undoing the stack out of order and corrupting
+        // it. Pop from the tip so each session's destructor undoes the top state.
+        while self.pending_chain.pop().is_some() {}
+    }
 }
 
 #[derive(Debug)]
@@ -112,7 +151,42 @@ impl Controller {
             trace_log: None,
             chain_state_log: None,
             node_config: None,
+
+            pending_chain: Vec::new(),
+            blocks_executed: 0,
         }
+    }
+
+    // The id of the block whose state is currently live on the database: the tip
+    // of the pending chain, or the last accepted block when the chain is empty.
+    fn pending_tip_id(&self) -> Id {
+        self.pending_chain
+            .last()
+            .map(|p| p.id)
+            .unwrap_or(self.last_accepted_block_id)
+    }
+
+    // Undo and drop pending-chain entries from the tip down until only `len`
+    // remain, restoring the live database to that prefix. Entries are undone in
+    // reverse order to respect chainbase's LIFO undo stack.
+    fn unwind_pending_to(&mut self, len: usize) -> Result<(), ChainError> {
+        while self.pending_chain.len() > len {
+            let mut entry = self.pending_chain.pop().unwrap();
+            entry.session.pin_mut().undo().map_err(|e| {
+                ChainError::DatabaseError(format!(
+                    "failed to undo pending block {}: {}",
+                    entry.id, e
+                ))
+            })?;
+        }
+        Ok(())
+    }
+
+    // Discard the whole pending chain, restoring the database to the last
+    // accepted state. Paths that must execute against the plain accepted base
+    // call this first.
+    fn clear_pending(&mut self) -> Result<(), ChainError> {
+        self.unwind_pending_to(0)
     }
 
     pub fn initialize(
@@ -242,7 +316,13 @@ impl Controller {
         Ok(())
     }
 
-    pub fn shutdown(&self) -> Result<(), ChainError> {
+    pub fn shutdown(&mut self) -> Result<(), ChainError> {
+        // Release the pending chain's live undo sessions before the database is
+        // torn down. `close()` destroys the chainbase indices the sessions point
+        // into, so leaving them live would make their destructors (and `Drop`)
+        // touch freed memory.
+        self.clear_pending()?;
+
         // Explicitly close the database
         info!("shutting down controller and closing database");
         self.db.close()?;
@@ -251,15 +331,11 @@ impl Controller {
     }
 
     pub async fn build_block(&mut self, mempool: &mut Mempool) -> Result<SignedBlock, ChainError> {
-        let mut db = self.db.clone();
-        let mut root_session = db.create_undo_session(true)?; // As we are building the block, drop the changes once built
         let mut transaction_receipts: VecDeque<TransactionReceipt> = VecDeque::new();
+        let mut transaction_traces: Vec<TransactionTrace> = Vec::new();
         let mut action_receipt_digests: VecDeque<Digest> = VecDeque::new();
         let timestamp: BlockTimestamp = TimePoint::now().into();
         let block_status = BlockStatus::Building;
-
-        // Clear expired transactions from the database
-        db.clear_expired_input_transactions(&timestamp.into())?;
 
         // Transactions already present in a verified-but-not-yet-accepted block
         // must not be included again. At build time the earlier block has not
@@ -279,8 +355,16 @@ impl Controller {
             .collect();
         let mut deferred: Vec<PackedTransaction> = Vec::new();
 
-        // We need to build on top of preferred id, so rollback state if needed
-        self.replay_accepted_state_to(self.preferred_id, &BlockStatus::Building, mempool)?;
+        // Build on top of preferred: reconcile the pending chain so the database
+        // holds the preferred state, reusing any already-executed prefix.
+        self.replay_accepted_state_to(self.preferred_id, &block_status, mempool)?;
+
+        let mut db = self.db.clone();
+        let mut block_session = db.create_undo_session(true)?;
+
+        // Expiry clearing is part of the block's state, so it belongs inside the
+        // block's session rather than before it.
+        db.clear_expired_input_transactions(&timestamp.into())?;
 
         // Get transactions from the mempool
         while let Some(transaction) = mempool.pop_transaction() {
@@ -303,6 +387,7 @@ impl Controller {
                     })?; // Push changes to upstream session
 
                     // Add the transaction to the block
+                    transaction_traces.push(result.trace.clone());
                     let receipt = TransactionReceipt::new(result.trace.receipt, transaction);
                     transaction_receipts.push_back(receipt);
                     action_receipt_digests.extend(result.action_receipt_digests);
@@ -328,6 +413,9 @@ impl Controller {
 
         // Don't build a block if we have no transactions
         if transaction_receipts.len() == 0 {
+            block_session.pin_mut().undo().map_err(|e| {
+                ChainError::DatabaseError(format!("failed to undo changes: {}", e))
+            })?;
             return Err(ChainError::NetworkError(format!(
                 "built block has no transactions"
             )));
@@ -346,15 +434,20 @@ impl Controller {
         );
 
         // We built this block so no need to verify it again
-        self.verified_blocks.insert(
-            block.signed_block_header.header.calculate_id()?,
-            block.clone(),
-        );
+        let block_id = block.id()?;
+        self.verified_blocks.insert(block_id, block.clone());
 
-        root_session
-            .pin_mut()
-            .undo()
-            .map_err(|e| ChainError::DatabaseError(format!("failed to undo changes: {}", e)))?; // Revert changes made during this transaction
+        // Match the end-of-block bookkeeping that `execute_block` applies at
+        // verify/accept, so the retained state is identical to what a re-execution
+        // would commit, then retain the block on the pending chain (it was built
+        // on the current tip).
+        self.finalize_block_resources(block.block_num())?;
+        self.pending_chain.push(PendingBlock {
+            id: block_id,
+            parent: self.preferred_id,
+            session: block_session,
+            traces: transaction_traces,
+        });
 
         Ok(block)
     }
@@ -393,22 +486,32 @@ impl Controller {
         // Verify the block
         block.validate_syntactically(&self.db)?;
 
-        let mut root_session = self.db.create_undo_session(true)?;
-        let parent_block_id = block.previous_id();
+        let parent_block_id = block.previous_id().clone();
         let block_status = BlockStatus::Verifying;
+        // Reconcile the pending chain to the parent, reusing any already-executed
+        // prefix instead of re-running every unaccepted ancestor.
         self.replay_accepted_state_to(parent_block_id.clone(), &block_status, mempool)?;
-        let (_transaction_traces, transaction_mroot, action_mroot) =
+
+        // This block's own session sits on top of the reconciled parent state. If
+        // execution or validation below fails, `?` drops the session and chainbase
+        // undoes it, leaving the pending chain at the parent.
+        let block_session = self.db.create_undo_session(true)?;
+        let (transaction_traces, transaction_mroot, action_mroot) =
             self.execute_block(block, &block_status, mempool)?;
 
-        // Validate the block's transaction and action merkle roots
         block.validate_semantically(transaction_mroot, action_mroot)?;
 
-        self.verified_blocks.insert(block.id()?, block.clone());
+        let block_id = block.id()?;
+        self.verified_blocks.insert(block_id, block.clone());
 
-        root_session
-            .pin_mut()
-            .undo()
-            .map_err(|e| ChainError::DatabaseError(format!("failed to undo changes: {}", e)))?; // Revert changes made during this transaction
+        // Retain the executed block on the pending chain so `accept_block` can
+        // commit it without re-executing.
+        self.pending_chain.push(PendingBlock {
+            id: block_id,
+            parent: parent_block_id,
+            session: block_session,
+            traces: transaction_traces,
+        });
 
         Ok(())
     }
@@ -424,19 +527,61 @@ impl Controller {
                 )))?
         };
 
-        let mut root_session = self.db.create_undo_session(true)?;
-        let block_status = BlockStatus::Accepting;
-        let parent_block_id = block.previous_id();
-        self.replay_accepted_state_to(parent_block_id.clone(), &block_status, mempool)?;
-        let (transaction_traces, _transaction_mroot, _action_mroot) = self
-            .execute_block(&block, &block_status, mempool)
-            .map_err(|e| {
-                ChainError::DatabaseError(format!("failed to execute block {}: {}", block_id, e))
-            })?;
+        // Pack the block before touching the pending chain. In the fast path below
+        // the front session is `remove`d from the chain but only detached from
+        // auto-undo by `push()` afterwards; a fallible step in between (like this
+        // pack) that bailed via `?` would drop the front session and wrongly undo
+        // the chain *tip* (the front is the stack bottom). Doing it here keeps the
+        // remove(0)→push() window free of fallible operations.
         let packed_block = block.pack().map_err(|e| {
             ChainError::TransactionError(format!("failed to pack block {}: {}", block_id, e))
         })?;
-        root_session
+
+        // Fast path: consensus accepts blocks in order, so the accepted block is
+        // the front of the pending chain (its parent is the last accepted block,
+        // which the chain invariant guarantees). Commit that retained session and
+        // reuse its traces rather than re-executing. The rest of the chain stays
+        // live: chainbase commits only the oldest undo state.
+        let front_matches = self
+            .pending_chain
+            .first()
+            .map(|p| p.id == *block_id)
+            .unwrap_or(false);
+
+        let (mut session, transaction_traces) = if front_matches {
+            let front = self.pending_chain.remove(0);
+            // `execute_block` removes accepted transactions from the mempool as it
+            // runs; the retained pass did not (build pops them while assembling,
+            // verify never touches the mempool), so mirror that here.
+            for receipt in &block.transactions {
+                mempool.remove_transaction(receipt.trx().id());
+            }
+            (front.session, front.traces)
+        } else {
+            // Fallback: the block is not the retained front (e.g. a fork sibling
+            // won, or nothing is pending). Discard the pending chain and execute
+            // the block fresh on top of the last accepted state.
+            if block.previous_id() != &self.last_accepted_block_id {
+                return Err(ChainError::NetworkError(format!(
+                    "cannot accept block {} out of order: its parent is not the last accepted block",
+                    block_id
+                )));
+            }
+            self.clear_pending()?;
+            let session = self.db.create_undo_session(true)?;
+            let block_status = BlockStatus::Accepting;
+            let (transaction_traces, _transaction_mroot, _action_mroot) = self
+                .execute_block(&block, &block_status, mempool)
+                .map_err(|e| {
+                    ChainError::DatabaseError(format!(
+                        "failed to execute block {}: {}",
+                        block_id, e
+                    ))
+                })?;
+            (session, transaction_traces)
+        };
+
+        session
             .pin_mut()
             .push()
             .map_err(|e| ChainError::TransactionError(format!("failed to commit block: {}", e)))?;
@@ -469,6 +614,13 @@ impl Controller {
     }
 
     pub fn reject_block(&mut self, block_id: &Id, mempool: &mut Mempool) -> Result<(), ChainError> {
+        // If the rejected block is on the pending chain, unwind it and everything
+        // built on top of it (its descendants can no longer be accepted either),
+        // restoring the live database to the state below it.
+        if let Some(idx) = self.pending_chain.iter().position(|p| &p.id == block_id) {
+            self.unwind_pending_to(idx)?;
+        }
+
         let block = {
             self.verified_blocks
                 .get(block_id)
@@ -499,6 +651,8 @@ impl Controller {
         let mut transaction_receipts: VecDeque<TransactionReceipt> = VecDeque::new();
         let mut action_receipt_digests: VecDeque<Digest> = VecDeque::new();
 
+        self.blocks_executed += 1;
+
         self.db
             .clear_expired_input_transactions(&block.timestamp().to_time_point())?;
 
@@ -527,7 +681,17 @@ impl Controller {
         let transaction_mroot = self.calculate_trx_merkle(&transaction_receipts)?;
         let action_mroot = self.calculate_action_merkle(&mut action_receipt_digests)?;
 
-        // Update resource limits
+        self.finalize_block_resources(block.block_num())?;
+
+        Ok((transaction_traces, transaction_mroot, action_mroot))
+    }
+
+    // Apply the end-of-block resource-limit bookkeeping. This is part of the
+    // block's committed state and must run identically whether the block is
+    // executed via `execute_block` (verify/accept) or assembled in `build_block`,
+    // otherwise a retained build session would commit state that diverges from
+    // what validators compute.
+    fn finalize_block_resources(&mut self, block_num: u32) -> Result<(), ChainError> {
         let global_property = Controller::get_global_properties(&self.db)?;
         let chain_config = global_property.get_chain_config();
         let cpu_target = eos_percent(
@@ -559,9 +723,9 @@ impl Controller {
             &cpu_elastic_parameters,
             &net_elastic_parameters,
         )?;
-        ResourceLimitsManager::process_block_usage(&mut self.db, block.block_num())?;
+        ResourceLimitsManager::process_block_usage(&mut self.db, block_num)?;
 
-        Ok((transaction_traces, transaction_mroot, action_mroot))
+        Ok(())
     }
 
     // This function will execute a transaction and roll it back instantly
@@ -830,16 +994,23 @@ impl Controller {
         &self.state
     }
 
-    // This function will replay the accepted state from the last accepted block to the given block id
-    // This is useful for switching forks and making sure we have the correct state for the preferred block
-    // In the future we should optimize chainbase so we can replay deltas instead of executing blocks, but for now this is simpler to implement and works fine for our use case
+    // Make the live database hold the state at `block_id` (which must be the last
+    // accepted block or one of its verified descendants), leaving the pending
+    // chain equal to the path from the last accepted block up to `block_id`.
+    //
+    // Rather than re-executing every block on that path, this reuses the longest
+    // prefix already materialized on the pending chain: it unwinds only the
+    // entries that diverge from the target path and executes only the blocks not
+    // already applied. When the pending chain already matches the target path
+    // (the common case — building or verifying on the current tip) it is a no-op.
     pub fn replay_accepted_state_to(
         &mut self,
         block_id: Id,
         block_status: &BlockStatus,
         mempool: &mut Mempool,
     ) -> Result<(), ChainError> {
-        // Build the path from target back to last_accepted, then reverse.
+        // Desired path from last_accepted (exclusive) up to the target (inclusive),
+        // oldest first.
         let mut path: Vec<SignedBlock> = Vec::new();
         let mut cursor = block_id;
         while cursor != self.last_accepted_block_id {
@@ -857,15 +1028,34 @@ impl Controller {
             path.push(block);
             cursor = prev;
         }
+        path.reverse();
 
-        // path is target..=first-child; replay oldest first
-        for block in path.into_iter().rev() {
+        // Longest prefix of the pending chain that already matches the target path.
+        let mut common = 0;
+        while common < self.pending_chain.len()
+            && common < path.len()
+            && self.pending_chain[common].id == path[common].id()?
+        {
+            common += 1;
+        }
+
+        // Drop the divergent tail, then execute and retain the blocks not yet applied.
+        self.unwind_pending_to(common)?;
+        for block in &path[common..] {
             debug!(
-                "replaying accepted state from block {} to block {}",
-                self.last_accepted_block_id,
-                block.id()?
+                "replaying block {} onto pending chain (tip {})",
+                block.id()?,
+                self.pending_tip_id()
             );
-            self.execute_block(&block, block_status, mempool)?;
+            let session = self.db.create_undo_session(true)?;
+            let (traces, _transaction_mroot, _action_mroot) =
+                self.execute_block(block, block_status, mempool)?;
+            self.pending_chain.push(PendingBlock {
+                id: block.id()?,
+                parent: block.previous_id().clone(),
+                session,
+                traces,
+            });
         }
 
         Ok(())
@@ -881,7 +1071,7 @@ mod tests {
     use pulsevm_serialization::Write;
     use serde_json::json;
     use tempfile::TempDir;
-    use tokio::{runtime, sync::RwLock};
+    use tokio::runtime;
 
     use crate::{
         ACTIVE_NAME,
@@ -892,7 +1082,6 @@ mod tests {
             transaction::{Action, Transaction, TransactionHeader},
         },
         crypto::PrivateKey,
-        transaction::TransactionReceiptHeader,
     };
 
     use super::*;
@@ -939,6 +1128,10 @@ mod tests {
                 "target_block_cpu_usage_pct": 2500,
                 "max_transaction_cpu_usage": 150000,
                 "min_transaction_cpu_usage": 100,
+                // The test transaction builders use TimePointSec::maximum() as the
+                // expiration ("never expires"); allow that by widening the lifetime
+                // window well past the default one hour.
+                "max_transaction_lifetime": 4294967295u32,
                 "max_inline_action_size": 4096,
                 "max_inline_action_depth": 6,
                 "max_authority_depth": 6,
@@ -953,8 +1146,17 @@ mod tests {
         account: Name,
         chain_id: Id,
     ) -> Result<PackedTransaction, ChainError> {
+        create_account_with_expiration(private_key, account, chain_id, TimePointSec::maximum())
+    }
+
+    fn create_account_with_expiration(
+        private_key: &PrivateKey,
+        account: Name,
+        chain_id: Id,
+        expiration: TimePointSec,
+    ) -> Result<PackedTransaction, ChainError> {
         let trx = Transaction::new(
-            TransactionHeader::new(TimePointSec::maximum(), 0, 0, 0u32.into(), 0, 0u32.into()),
+            TransactionHeader::new(expiration, 0, 0, 0u32.into(), 0, 0u32.into()),
             vec![],
             vec![Action::new(
                 Name::from_str("pulse")?,
@@ -1150,16 +1352,10 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_api_db() -> Result<(), ChainError> {
+    fn init_test_controller() -> Result<(Controller, PrivateKey, Id, TempDir), ChainError> {
         let chain_id =
             Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
                 .unwrap();
-        let runtime = runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let _guard = runtime.enter();
         let private_key =
             PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
         let mut controller = Controller::new();
@@ -1177,6 +1373,226 @@ mod tests {
             &genesis_bytes.to_vec(),
             temp_path.path().to_str().unwrap(),
         )?;
+        Ok((controller, private_key, chain_id, temp_path))
+    }
+
+    // A block built directly on the last accepted block retains its executed
+    // state, and accept_block commits that retained state without re-executing.
+    #[tokio::test]
+    async fn test_build_accept_reuses_pending_state() -> Result<(), ChainError> {
+        let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
+
+        // build_block validates transaction lifetime against the real clock, so
+        // use an expiration a minute out rather than the far-future default.
+        let expiration = TimePointSec::new(TimePointSec::now().sec_since_epoch() + 60);
+        let glenn = Name::from_str("glenn")?;
+        let mut mempool = Mempool::new();
+        mempool.add_transaction(create_account_with_expiration(
+            &private_key,
+            glenn,
+            chain_id,
+            expiration,
+        )?);
+
+        let base_block_num = controller.last_accepted_block().block_num();
+
+        let block = controller.build_block(&mut mempool).await?;
+        let block_id = block.id()?;
+
+        // Build retained the executed state on top of the accepted base.
+        assert_eq!(controller.pending_chain.len(), 1);
+        let pending = &controller.pending_chain[0];
+        assert_eq!(pending.id, block_id);
+        assert_eq!(pending.parent, controller.last_accepted_block_id);
+
+        controller.accept_block(&block_id, &mut mempool)?;
+
+        // The fast path consumed the retained state rather than leaving it live.
+        assert!(controller.pending_chain.is_empty());
+        assert_eq!(controller.last_accepted_block_id, block_id);
+        assert_eq!(controller.last_accepted_block().block_num(), base_block_num + 1);
+
+        // The account created by the block is present in committed state, proving
+        // the retained session was committed rather than discarded.
+        let account = controller.database().find_account(glenn.as_u64())?;
+        assert!(
+            !account.is_null(),
+            "accepted account should exist in committed state"
+        );
+
+        Ok(())
+    }
+
+    // Rejecting a retained pending block undoes its state and restores the base.
+    #[tokio::test]
+    async fn test_reject_discards_pending_state() -> Result<(), ChainError> {
+        let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
+
+        let expiration = TimePointSec::new(TimePointSec::now().sec_since_epoch() + 60);
+        let glenn = Name::from_str("glenn")?;
+        let mut mempool = Mempool::new();
+        mempool.add_transaction(create_account_with_expiration(
+            &private_key,
+            glenn,
+            chain_id,
+            expiration,
+        )?);
+
+        let base_block_id = controller.last_accepted_block_id;
+
+        let block = controller.build_block(&mut mempool).await?;
+        let block_id = block.id()?;
+        assert!(!controller.pending_chain.is_empty());
+
+        controller.reject_block(&block_id, &mut mempool)?;
+
+        assert!(controller.pending_chain.is_empty());
+        assert_eq!(controller.last_accepted_block_id, base_block_id);
+        let account = controller.database().find_account(glenn.as_u64())?;
+        assert!(
+            account.is_null(),
+            "rejected block's state must not persist in the database"
+        );
+
+        Ok(())
+    }
+
+    // Verifying a second block on top of a still-pending first block reuses the
+    // first block's already-executed state instead of re-running it, and both can
+    // then be accepted in order without further execution.
+    #[tokio::test]
+    async fn test_pending_chain_reuses_executed_prefix() -> Result<(), ChainError> {
+        // Producer builds two chained blocks (b3 on top of the still-pending b2).
+        let (mut producer, private_key, chain_id, _p_temp) = init_test_controller()?;
+        let mut p_mempool = Mempool::new();
+        p_mempool.add_transaction(create_account(&private_key, Name::from_str("aaa")?, chain_id)?);
+        let b2 = producer.build_block(&mut p_mempool).await?;
+        producer.set_preferred_id(b2.id()?);
+        p_mempool.add_transaction(create_account(&private_key, Name::from_str("bbb")?, chain_id)?);
+        let b3 = producer.build_block(&mut p_mempool).await?;
+        assert_eq!(b3.previous_id(), &b2.id()?);
+
+        // Validator verifies both, then accepts them in order.
+        let (mut validator, _pk, _cid, _v_temp) = init_test_controller()?;
+        let mut v_mempool = Mempool::new();
+
+        validator.verify_block(&b2, &mut v_mempool).await?;
+        assert_eq!(validator.pending_chain.len(), 1);
+        assert_eq!(validator.blocks_executed, 1);
+
+        validator.verify_block(&b3, &mut v_mempool).await?;
+        assert_eq!(validator.pending_chain.len(), 2);
+        // b2 was NOT re-executed to establish b3's parent state — only b3 ran.
+        // The old replay-from-last-accepted behavior would have made this 3.
+        assert_eq!(validator.blocks_executed, 2);
+
+        validator.accept_block(&b2.id()?, &mut v_mempool)?;
+        assert_eq!(validator.pending_chain.len(), 1);
+        validator.accept_block(&b3.id()?, &mut v_mempool)?;
+        assert!(validator.pending_chain.is_empty());
+
+        // Acceptance committed the retained state without any extra execution.
+        assert_eq!(validator.blocks_executed, 2);
+        assert_eq!(validator.last_accepted_block_id, b3.id()?);
+        assert_eq!(validator.last_accepted_block().block_num(), 3);
+
+        // Both accounts are present in committed state.
+        let db = validator.database();
+        assert!(!db.find_account(Name::from_str("aaa")?.as_u64())?.is_null());
+        assert!(!db.find_account(Name::from_str("bbb")?.as_u64())?.is_null());
+
+        Ok(())
+    }
+
+    // Verifying a block on a competing fork reuses the common prefix, unwinds only
+    // the divergent suffix, and executes only the new block. After accepting the
+    // winning fork, the losing branch's state is absent.
+    #[tokio::test]
+    async fn test_pending_chain_reconciles_fork() -> Result<(), ChainError> {
+        // Producer builds A, then two children of A: B and C (siblings).
+        let (mut producer, private_key, chain_id, _p_temp) = init_test_controller()?;
+        let mut p_mempool = Mempool::new();
+        p_mempool.add_transaction(create_account(&private_key, Name::from_str("aaa")?, chain_id)?);
+        let a = producer.build_block(&mut p_mempool).await?;
+
+        producer.set_preferred_id(a.id()?);
+        p_mempool.add_transaction(create_account(&private_key, Name::from_str("bbb")?, chain_id)?);
+        let b = producer.build_block(&mut p_mempool).await?;
+
+        // Re-prefer A so the next build reconciles back to A (unwinding B) and
+        // builds C as B's sibling.
+        producer.set_preferred_id(a.id()?);
+        p_mempool.add_transaction(create_account(&private_key, Name::from_str("ccc")?, chain_id)?);
+        let c = producer.build_block(&mut p_mempool).await?;
+        assert_eq!(b.previous_id(), &a.id()?);
+        assert_eq!(c.previous_id(), &a.id()?);
+        assert_ne!(b.id()?, c.id()?);
+
+        // Validator verifies A, then B, then diverges to C.
+        let (mut validator, _pk, _cid, _v_temp) = init_test_controller()?;
+        let mut v_mempool = Mempool::new();
+
+        validator.verify_block(&a, &mut v_mempool).await?;
+        validator.verify_block(&b, &mut v_mempool).await?;
+        assert_eq!(validator.pending_chain.len(), 2);
+        assert_eq!(validator.blocks_executed, 2);
+
+        // Verifying C reuses A (no re-execution), unwinds B, and executes C.
+        validator.verify_block(&c, &mut v_mempool).await?;
+        assert_eq!(validator.pending_chain.len(), 2);
+        assert_eq!(validator.pending_chain[0].id, a.id()?);
+        assert_eq!(validator.pending_chain[1].id, c.id()?);
+        assert_eq!(validator.blocks_executed, 3); // A, B, C — each once, A not re-run.
+
+        // Accept the winning fork A -> C.
+        validator.accept_block(&a.id()?, &mut v_mempool)?;
+        validator.accept_block(&c.id()?, &mut v_mempool)?;
+        assert!(validator.pending_chain.is_empty());
+        assert_eq!(validator.last_accepted_block_id, c.id()?);
+
+        // aaa and ccc are committed; bbb (the losing branch) is not.
+        let db = validator.database();
+        assert!(!db.find_account(Name::from_str("aaa")?.as_u64())?.is_null());
+        assert!(!db.find_account(Name::from_str("ccc")?.as_u64())?.is_null());
+        assert!(db.find_account(Name::from_str("bbb")?.as_u64())?.is_null());
+
+        Ok(())
+    }
+
+    // Rejecting a block on the pending chain unwinds it and every descendant built
+    // on top of it, restoring the last accepted state.
+    #[tokio::test]
+    async fn test_reject_unwinds_descendants() -> Result<(), ChainError> {
+        let (mut producer, private_key, chain_id, _p_temp) = init_test_controller()?;
+        let mut p_mempool = Mempool::new();
+        p_mempool.add_transaction(create_account(&private_key, Name::from_str("aaa")?, chain_id)?);
+        let a = producer.build_block(&mut p_mempool).await?;
+        producer.set_preferred_id(a.id()?);
+        p_mempool.add_transaction(create_account(&private_key, Name::from_str("bbb")?, chain_id)?);
+        let b = producer.build_block(&mut p_mempool).await?;
+
+        let (mut validator, _pk, _cid, _v_temp) = init_test_controller()?;
+        let genesis_id = validator.last_accepted_block_id;
+        let mut v_mempool = Mempool::new();
+        validator.verify_block(&a, &mut v_mempool).await?;
+        validator.verify_block(&b, &mut v_mempool).await?;
+        assert_eq!(validator.pending_chain.len(), 2);
+
+        // Rejecting A must also unwind B, which was built on top of it.
+        validator.reject_block(&a.id()?, &mut v_mempool)?;
+        assert!(validator.pending_chain.is_empty());
+        assert_eq!(validator.last_accepted_block_id, genesis_id);
+
+        let db = validator.database();
+        assert!(db.find_account(Name::from_str("aaa")?.as_u64())?.is_null());
+        assert!(db.find_account(Name::from_str("bbb")?.as_u64())?.is_null());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_api_db() -> Result<(), ChainError> {
+        let (mut controller, private_key, _chain_id, _temp) = init_test_controller()?;
         let pending_block_timestamp = controller.last_accepted_block().timestamp().clone();
         let chain_id = controller.chain_id().clone();
         let block_status = BlockStatus::Building;
@@ -1742,50 +2158,26 @@ mod tests {
 
     #[tokio::test]
     async fn test_verify_block() -> Result<(), ChainError> {
-        let chain_id =
-            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
-                .unwrap();
-        let private_key =
-            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
-        let mempool = Arc::new(RwLock::new(Mempool::new()));
-        let mut mempool = mempool.write().await;
-        let mut controller = Controller::new();
-        let genesis_bytes = generate_genesis(&private_key);
-        let temp_path = get_temp_dir();
-        let config_bytes = json!({
-            "producer_name": "pulse",
-            "producer_key": private_key.to_string(),
-        })
-        .to_string()
-        .into_bytes();
-        controller.initialize(
-            &chain_id,
-            &config_bytes,
-            &genesis_bytes.to_vec(),
-            temp_path.path().to_str().unwrap(),
-        )?;
-        assert_eq!(controller.last_accepted_block().block_num(), 1);
-        let chain_id = controller.chain_id().clone();
-        let mut txs = VecDeque::new();
-        txs.push_back(TransactionReceipt::new(
-            TransactionReceiptHeader::new(
-                crate::transaction::TransactionStatus::Executed,
-                1,
-                1.into(),
-            ),
-            create_account(&private_key, Name::from_str("testapi")?, chain_id)?,
-        ));
-        let block = SignedBlock::new(
-            controller.last_accepted_block().id()?,
-            TimePoint::now().into(),
-            "pulse".parse().unwrap(),
-            txs,
-            Digest::default(), // TODO: Validate this when we implement merkle root calculation
-            Digest::default(),
-        );
-        controller.verify_block(&block, &mut mempool).await?;
-        controller.accept_block(&block.id()?, &mut mempool)?;
-        controller.verify_block(&block, &mut mempool).await?;
+        // Build a valid block (with correct merkle roots) on a producer.
+        let (mut producer, private_key, chain_id, _p_temp) = init_test_controller()?;
+        let mut p_mempool = Mempool::new();
+        p_mempool
+            .add_transaction(create_account(&private_key, Name::from_str("testapi")?, chain_id)?);
+        let block = producer.build_block(&mut p_mempool).await?;
+
+        // A validator verifies it, accepts it, then a repeat verify short-circuits
+        // because the block is now in the block log.
+        let (mut validator, _pk, _cid, _v_temp) = init_test_controller()?;
+        let mut v_mempool = Mempool::new();
+
+        validator.verify_block(&block, &mut v_mempool).await?;
+        assert_eq!(validator.pending_chain.len(), 1);
+
+        validator.accept_block(&block.id()?, &mut v_mempool)?;
+        assert!(validator.pending_chain.is_empty());
+        assert_eq!(validator.last_accepted_block_id, block.id()?);
+
+        validator.verify_block(&block, &mut v_mempool).await?;
 
         Ok(())
     }
