@@ -2,7 +2,7 @@ use std::any::TypeId;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ops::Bound;
 
-use crate::object::{ArenaObject, IndexedBy, KeyIndex, ObjectId, SecondaryIndex};
+use crate::object::{ArenaObject, BlobRef, IndexedBy, KeyIndex, ObjectId, SecondaryIndex};
 
 /// Errors from table operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +29,9 @@ struct UndoState<T> {
     old_values: HashMap<i64, T>,
     removed_values: HashMap<i64, T>,
     old_next_id: i64,
+    /// Blob-arena length when the session started; undo truncates back to it,
+    /// dropping every blob appended during the session.
+    old_blob_len: usize,
 }
 
 /// A table of `T` stored in an index-addressed arena: rows live in a
@@ -40,6 +43,9 @@ struct UndoState<T> {
 pub struct Table<T: ArenaObject> {
     /// Indexed by id; `primary.len()` is the next id to assign.
     primary: Vec<Option<T>>,
+    /// Append-only byte arena for variable-length fields, addressed by
+    /// [`BlobRef`]. Grows within a session and is truncated back on undo.
+    blobs: Vec<u8>,
     secondaries: Vec<Box<dyn SecondaryIndex<T>>>,
     tag_positions: HashMap<TypeId, usize>,
     undo_stack: VecDeque<UndoState<T>>,
@@ -68,12 +74,34 @@ impl<T: ArenaObject> Table<T> {
         }
         Table {
             primary: Vec::new(),
+            blobs: Vec::new(),
             secondaries,
             tag_positions,
             undo_stack: VecDeque::new(),
             row_count: 0,
             revision: 0,
         }
+    }
+
+    /// Appends `bytes` to the blob arena and returns a [`BlobRef`] to them, for
+    /// a variable-length field. Call during `create`/`modify`, then store the
+    /// ref on the object. Empty input yields the default empty ref.
+    pub fn alloc_blob(&mut self, bytes: &[u8]) -> BlobRef {
+        if bytes.is_empty() {
+            return BlobRef::default();
+        }
+        let off = self.blobs.len() as u32;
+        self.blobs.extend_from_slice(bytes);
+        BlobRef {
+            off,
+            len: bytes.len() as u32,
+        }
+    }
+
+    /// Resolves a [`BlobRef`] to its bytes.
+    pub fn blob(&self, r: BlobRef) -> &[u8] {
+        let start = r.off as usize;
+        &self.blobs[start..start + r.len as usize]
     }
 
     fn next_id(&self) -> i64 {
@@ -218,6 +246,7 @@ impl<T: ArenaObject> Table<T> {
             old_values: HashMap::new(),
             removed_values: HashMap::new(),
             old_next_id: self.next_id(),
+            old_blob_len: self.blobs.len(),
         });
         self.revision += 1;
         self.revision
@@ -257,7 +286,11 @@ impl<T: ArenaObject> Table<T> {
             mut old_values,
             removed_values,
             old_next_id,
+            old_blob_len,
         } = state;
+        // Drop every blob appended during the session; restored objects only
+        // reference bytes from before it started.
+        self.blobs.truncate(old_blob_len);
 
         // Erase everything created during the session (ids >= old_next_id) and
         // drop those slots.
@@ -374,6 +407,8 @@ impl<T: ArenaObject> Table<T> {
                 out.extend_from_slice(obj.as_bytes());
             }
         }
+        out.extend_from_slice(&(self.blobs.len() as u64).to_le_bytes());
+        out.extend_from_slice(&self.blobs);
     }
 
     /// Restores rows written by [`Table::pack_into`] into this freshly
@@ -406,6 +441,13 @@ impl<T: ArenaObject> Table<T> {
             self.primary[id] = Some(obj);
             self.row_count += 1;
         }
+        let blob_len = read_u64(bytes, &mut pos)? as usize;
+        let end = pos
+            .checked_add(blob_len)
+            .filter(|end| *end <= bytes.len())
+            .ok_or(TableError::Corrupted("blob arena extends past snapshot"))?;
+        self.blobs.extend_from_slice(&bytes[pos..end]);
+        pos = end;
         if pos != bytes.len() {
             return Err(TableError::Corrupted("trailing bytes in table snapshot"));
         }

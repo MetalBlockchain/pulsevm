@@ -76,6 +76,17 @@ impl<T: ?Sized> From<i64> for ObjectId<T> {
     }
 }
 
+/// Reference into a table's blob arena, for a variable-length field on an
+/// otherwise fixed-size object (chainbase's `shared_blob`). The bytes live in
+/// the table's byte arena, addressed by offset — still pointer-free, so the
+/// object stays POD. A default `BlobRef` is the empty slice.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout)]
+pub struct BlobRef {
+    pub off: u32,
+    pub len: u32,
+}
+
 /// A type stored in a [`Table`]. The `by_id` index is built in; this trait only
 /// declares the additional ordered-unique secondary indices.
 ///

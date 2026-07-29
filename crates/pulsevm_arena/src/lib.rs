@@ -18,7 +18,7 @@ mod object;
 mod table;
 
 pub use db::{Db, DbError};
-pub use object::{ArenaObject, IndexedBy, KeyIndex, ObjectId, SecondaryIndex, key_index};
+pub use object::{ArenaObject, BlobRef, IndexedBy, KeyIndex, ObjectId, SecondaryIndex, key_index};
 pub use table::{IndexView, Table, TableError};
 
 /// `#[derive(ArenaObject)]` — generates the trait impl and secondary-index

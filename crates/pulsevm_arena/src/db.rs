@@ -2,7 +2,7 @@ use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::object::{ArenaObject, IndexedBy};
+use crate::object::{ArenaObject, BlobRef, IndexedBy};
 use crate::table::{Table, TableError};
 
 /// Errors from the database layer.
@@ -217,6 +217,17 @@ impl Db {
         key: &Tag::Key,
     ) -> Result<Option<&T>, DbError> {
         Ok(self.table::<T>()?.get_index::<Tag>().find(key))
+    }
+
+    /// Appends a variable-length value to `T`'s blob arena; store the returned
+    /// ref on the object.
+    pub fn alloc_blob<T: ArenaObject>(&mut self, bytes: &[u8]) -> Result<BlobRef, DbError> {
+        Ok(self.table_mut::<T>()?.alloc_blob(bytes))
+    }
+
+    /// Resolves a blob ref against `T`'s arena.
+    pub fn blob<T: ArenaObject>(&self, r: BlobRef) -> Result<&[u8], DbError> {
+        Ok(self.table::<T>()?.blob(r))
     }
 
     // ----- revision / undo lifecycle ----------------------------------------
