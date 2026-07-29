@@ -1109,6 +1109,74 @@ mod tests {
         Ok(())
     }
 
+    /// Oracle harness (step 2): the arena's undo session must track chainbase's.
+    /// Run a newaccount inside an undo session, mirror the session on the arena,
+    /// then undo both — chainbase discards the account and the arena must too.
+    /// Omitting the `arena_*` lockstep calls makes the final assert fail (the
+    /// arena keeps a row chainbase discarded), which is the divergence the full
+    /// controller wiring must avoid.
+    #[cfg(feature = "arena-shadow")]
+    #[tokio::test]
+    async fn oracle_undone_tx_leaves_no_trace_in_arena() -> Result<(), ChainError> {
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
+        let private_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let mut controller = Controller::new();
+        let genesis_bytes = generate_genesis(&private_key);
+        let temp_path = get_temp_dir();
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": private_key.to_string(),
+        })
+        .to_string()
+        .into_bytes();
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &genesis_bytes.to_vec(),
+            temp_path.path().to_str().unwrap(),
+        )?;
+        let ts = controller.last_accepted_block().timestamp().clone();
+        let chain_id = controller.chain_id().clone();
+        let status = BlockStatus::Building;
+        let name = Name::from_str("glenn")?.as_u64();
+
+        // A clone shares the same chainbase and the same arena mirror.
+        let mut db = controller.database();
+        let mut session = db.create_undo_session(true)?;
+        db.arena_start_undo_session();
+
+        controller.execute_transaction(
+            &create_account(&private_key, Name::from_str("glenn")?, chain_id)?,
+            &ts,
+            &status,
+        )?;
+        // Inside the session, both sides have the account.
+        assert!(!db.find_account_metadata(name)?.is_null());
+        assert_eq!(db.arena_account_metadata_privileged(name), Some(false));
+
+        // Undo the session on both.
+        session
+            .pin_mut()
+            .undo()
+            .map_err(|e| ChainError::DatabaseError(format!("{}", e)))?;
+        db.arena_undo();
+
+        // Both must now agree the account is gone.
+        assert!(
+            db.find_account_metadata(name)?.is_null(),
+            "chainbase kept the undone account"
+        );
+        assert_eq!(
+            db.arena_account_metadata_privileged(name),
+            None,
+            "arena kept a row chainbase undid — session desync"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_initialize() -> Result<(), ChainError> {
         let chain_id =
