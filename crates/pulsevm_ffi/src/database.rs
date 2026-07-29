@@ -17,6 +17,20 @@ use crate::{
     iterator_cache::{Index256IteratorCache, KeyValueIteratorCache},
 };
 
+/// Field-for-field snapshot of an `account_metadata_object` read back from the
+/// arena mirror, matching the chainbase accessors used to diff it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArenaAccountMetadata {
+    pub privileged: bool,
+    pub recv_sequence: u64,
+    pub auth_sequence: u64,
+    pub code_sequence: u64,
+    pub abi_sequence: u64,
+    pub code_hash: [u8; 32],
+    pub vm_type: u8,
+    pub vm_version: u8,
+}
+
 /// Copies a chainbase `digest_type` (sha256) into a fixed 32-byte array for the
 /// arena mirror. A digest that is not 32 bytes is zero-padded/truncated, which
 /// only degrades the mirror's fidelity, never chainbase.
@@ -123,6 +137,34 @@ impl Database {
             self.shadow
                 .as_ref()
                 .and_then(|s| s.account_metadata_privileged(name))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = name;
+            None
+        }
+    }
+
+    /// Full account_metadata snapshot from the mirror, or `None` when shadowing
+    /// is off / the row is absent — for field-for-field diffing against the
+    /// chainbase `account_metadata_object` accessors.
+    pub fn arena_account_metadata(&self, name: u64) -> Option<ArenaAccountMetadata> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow.as_ref().and_then(|s| s.account_metadata(name)).map(
+                |(privileged, recv_sequence, auth_sequence, code_sequence, abi_sequence, code_hash, vm_type, vm_version)| {
+                    ArenaAccountMetadata {
+                        privileged,
+                        recv_sequence,
+                        auth_sequence,
+                        code_sequence,
+                        abi_sequence,
+                        code_hash,
+                        vm_type,
+                        vm_version,
+                    }
+                },
+            )
         }
         #[cfg(not(feature = "arena-shadow"))]
         {
@@ -407,8 +449,9 @@ impl Database {
         #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow {
             let hash = digest_to_array(code_hash);
+            let name = account.get_name();
             if let Err(e) =
-                s.update_account_code(new_code, hash, head_block_num, vm_type, vm_version)
+                s.update_account_code(name, new_code, hash, head_block_num, vm_type, vm_version)
             {
                 eprintln!("arena mirror of update_account_code diverged: {e:?}");
             }

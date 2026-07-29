@@ -176,6 +176,7 @@ pub mod ffi {
 
         #[cxx_name = "account_metadata_object"]
         type AccountMetadataObject;
+        pub fn get_name(self: &AccountMetadataObject) -> u64;
         pub fn get_code_hash(self: &AccountMetadataObject) -> &CxxDigest;
         pub fn get_recv_sequence(self: &AccountMetadataObject) -> u64;
         pub fn get_auth_sequence(self: &AccountMetadataObject) -> u64;

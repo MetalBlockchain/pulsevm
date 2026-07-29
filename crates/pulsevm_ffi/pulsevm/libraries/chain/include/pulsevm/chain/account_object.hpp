@@ -47,6 +47,7 @@ namespace pulsevm { namespace chain {
       uint8_t               vm_type = 0;
       uint8_t               vm_version = 0;
 
+      uint64_t get_name() const { return name.to_uint64_t(); }
       uint64_t get_recv_sequence() const { return recv_sequence; }
       uint64_t get_auth_sequence() const { return auth_sequence; }
       uint64_t get_code_sequence() const { return code_sequence; }

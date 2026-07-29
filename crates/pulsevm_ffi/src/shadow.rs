@@ -28,8 +28,16 @@ struct AccountMetaRow {
     id: ObjectId<AccountMetaRow>,
     #[arena(index)]
     name: u64,
-    privileged: u8,
-    _pad: [u8; 7],
+    recv_sequence: u64,
+    auth_sequence: u64,
+    code_sequence: u64,
+    abi_sequence: u64,
+    last_code_update: i64,
+    code_hash: [u8; 32],
+    flags: u32, // bit 0 = privileged, matching chainbase
+    vm_type: u8,
+    vm_version: u8,
+    _pad: [u8; 2],
 }
 
 /// Arena mirror of chainbase `account_object`. `abi` is a `shared_blob`, so it
@@ -757,7 +765,7 @@ impl ArenaShadow {
     pub fn create_account_metadata(&self, name: u64, privileged: bool) -> Result<(), DbError> {
         self.lock().create::<AccountMetaRow>(|row| {
             row.name = name;
-            row.privileged = privileged as u8;
+            row.flags = privileged as u32;
         })?;
         Ok(())
     }
@@ -769,7 +777,33 @@ impl ArenaShadow {
             .find_by::<AccountMetaRow, AccountMetaRowByName>(&name)
             .ok()
             .flatten()
-            .map(|row| row.privileged != 0)
+            .map(|row| row.flags & 1 != 0)
+    }
+
+    /// Full account_metadata snapshot for `name`, mirroring the chainbase
+    /// `account_metadata_object` accessors — for field-for-field diffing.
+    /// Tuple: (privileged, recv_seq, auth_seq, code_seq, abi_seq, code_hash, vm_type, vm_version).
+    #[allow(clippy::type_complexity)]
+    pub fn account_metadata(
+        &self,
+        name: u64,
+    ) -> Option<(bool, u64, u64, u64, u64, [u8; 32], u8, u8)> {
+        self.lock()
+            .find_by::<AccountMetaRow, AccountMetaRowByName>(&name)
+            .ok()
+            .flatten()
+            .map(|row| {
+                (
+                    row.flags & 1 != 0,
+                    row.recv_sequence,
+                    row.auth_sequence,
+                    row.code_sequence,
+                    row.abi_sequence,
+                    row.code_hash,
+                    row.vm_type,
+                    row.vm_version,
+                )
+            })
     }
 
     /// Whether the mirror holds an account_object row for `name` — for diffing
@@ -788,7 +822,13 @@ impl ArenaShadow {
             .find_by::<AccountMetaRow, AccountMetaRowByName>(&name)?
             .map(|r| r.id());
         if let Some(id) = id {
-            db.modify::<AccountMetaRow>(id, |row| row.privileged = privileged as u8)?;
+            db.modify::<AccountMetaRow>(id, |row| {
+                row.flags = if privileged {
+                    row.flags | 1
+                } else {
+                    row.flags & !1
+                };
+            })?;
         }
         Ok(())
     }
@@ -929,24 +969,39 @@ impl ArenaShadow {
 
     // ----- code_object ------------------------------------------------------
 
-    /// Mirrors the `code_object` side of `update_account_code`: for a non-empty
-    /// code image, either bumps the ref count of the row with a matching
-    /// `(code_hash, vm_type, vm_version)` or creates a new one. The
-    /// `account_metadata_object` fields updated in the same C++ call are not
-    /// mirrored here — that object is reached by reference, with no key exposed
-    /// through the FFI to locate the arena row.
+    /// Mirrors `update_account_code`: bumps the `account_metadata_object` code
+    /// fields for `name` (code_hash, code_sequence++, vm_type, vm_version,
+    /// last_code_update) and the `code_object` ref count for a non-empty image.
+    /// `name` comes from the metadata object's `get_name` accessor added to the
+    /// FFI, which is what lets the mirror locate the arena row that the C++ call
+    /// reaches only by reference.
     pub fn update_account_code(
         &self,
+        name: u64,
         code: &[u8],
         code_hash: [u8; 32],
         head_block_num: u32,
         vm_type: u8,
         vm_version: u8,
     ) -> Result<(), DbError> {
+        let mut db = self.lock();
+
+        let meta_id = db
+            .find_by::<AccountMetaRow, AccountMetaRowByName>(&name)?
+            .map(|r| r.id());
+        if let Some(id) = meta_id {
+            db.modify::<AccountMetaRow>(id, |row| {
+                row.code_hash = code_hash;
+                row.code_sequence += 1;
+                row.vm_type = vm_type;
+                row.vm_version = vm_version;
+                row.last_code_update = head_block_num as i64;
+            })?;
+        }
+
         if code.is_empty() {
             return Ok(());
         }
-        let mut db = self.lock();
         let existing = db
             .find_by::<CodeRow, CodeByHash>(&(code_hash, vm_type, vm_version))?
             .map(|c| c.id());

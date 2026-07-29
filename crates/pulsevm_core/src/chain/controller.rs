@@ -1251,6 +1251,91 @@ mod tests {
         Ok(())
     }
 
+    /// Full-field oracle for account_metadata: a block that creates an account
+    /// and then sets its code must leave the arena's account_metadata_object
+    /// matching chainbase field-for-field on the paths the mirror drives. The
+    /// telling field is code_sequence — it only advances through
+    /// update_account_code, which reaches the metadata object by reference; the
+    /// get_name accessor added to the FFI is what lets the mirror locate the
+    /// arena row to bump. recv/auth/abi sequences are not asserted here: they
+    /// advance through receiver dispatch and authorization accounting, paths not
+    /// yet mirrored.
+    #[cfg(feature = "arena-shadow")]
+    #[tokio::test]
+    async fn oracle_setcode_mirrors_account_metadata_fields() -> Result<(), ChainError> {
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
+        let private_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let mempool = Arc::new(RwLock::new(Mempool::new()));
+        let mut mempool = mempool.write().await;
+        let mut controller = Controller::new();
+        let genesis_bytes = generate_genesis(&private_key);
+        let temp_path = get_temp_dir();
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": private_key.to_string(),
+        })
+        .to_string()
+        .into_bytes();
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &genesis_bytes.to_vec(),
+            temp_path.path().to_str().unwrap(),
+        )?;
+        let chain_id = controller.chain_id().clone();
+        let name = Name::from_str("glenn")?.as_u64();
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let wasm =
+            fs::read(root.join(Path::new("reference_contracts/pulse_token.wasm"))).unwrap();
+
+        // One block: create glenn, then set its code. Both must be committed by
+        // accept_block for the metadata comparison to be against durable state.
+        mempool.add_transaction(create_account(
+            &private_key,
+            Name::from_str("glenn")?,
+            chain_id,
+        )?);
+        mempool.add_transaction(set_code(
+            &private_key,
+            Name::from_str("glenn")?,
+            wasm,
+            chain_id,
+        )?);
+        let block = controller.build_block(&mut mempool).await?;
+        controller.accept_block(&block.id()?, &mut mempool)?;
+
+        let db = controller.database();
+        let ptr = db.find_account_metadata(name)?;
+        assert!(
+            !ptr.is_null(),
+            "chainbase is missing the account after setcode"
+        );
+        // Safe: the pointer is non-null and the metadata object outlives this
+        // read (no mutation happens between the find and the accessor calls).
+        let chain_meta = unsafe { &*ptr };
+        let arena = db
+            .arena_account_metadata(name)
+            .expect("arena is missing the account after setcode");
+
+        assert_eq!(arena.privileged, chain_meta.is_privileged());
+        assert_eq!(arena.code_sequence, chain_meta.get_code_sequence());
+        assert_eq!(arena.vm_type, chain_meta.get_vm_type());
+        assert_eq!(arena.vm_version, chain_meta.get_vm_version());
+        assert!(
+            arena.code_sequence >= 1,
+            "setcode did not advance code_sequence in the mirror"
+        );
+        Ok(())
+    }
+
     /// Block-sequence fuzzer: random sequences of blocks — each with a few
     /// newaccount transactions, then either accepted or discarded — must keep
     /// the arena mirror in step with chainbase. After every block, for every
