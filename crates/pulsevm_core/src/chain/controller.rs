@@ -1939,6 +1939,54 @@ mod tests {
         Ok(())
     }
 
+    /// Dynamic-global-property oracle: every applied action advances the
+    /// global_action_sequence on the singleton dynamic_global_property_object.
+    /// After a newaccount block the mirrored sequence must equal chainbase's.
+    #[cfg(feature = "arena-shadow")]
+    #[tokio::test]
+    async fn oracle_global_action_sequence_mirrors() -> Result<(), ChainError> {
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
+        let private_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let mempool = Arc::new(RwLock::new(Mempool::new()));
+        let mut mempool = mempool.write().await;
+        let mut controller = Controller::new();
+        let genesis_bytes = generate_genesis(&private_key);
+        let temp_path = get_temp_dir();
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": private_key.to_string(),
+        })
+        .to_string()
+        .into_bytes();
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &genesis_bytes.to_vec(),
+            temp_path.path().to_str().unwrap(),
+        )?;
+        let chain_id = controller.chain_id().clone();
+
+        mempool.add_transaction(create_account(
+            &private_key,
+            Name::from_str("glenn")?,
+            chain_id,
+        )?);
+        let block = controller.build_block(&mut mempool).await?;
+        controller.accept_block(&block.id()?, &mut mempool)?;
+
+        let db = controller.database();
+        let chain_seq = db.get_global_action_sequence()?;
+        let arena_seq = db
+            .arena_global_action_sequence()
+            .expect("arena is missing the dynamic_global_property row");
+        assert_eq!(arena_seq, chain_seq, "mirrored global_action_sequence diverged");
+        assert!(chain_seq > 0, "expected applied actions to advance the sequence");
+        Ok(())
+    }
+
     /// Block-sequence fuzzer: random sequences of blocks — each with a few
     /// newaccount transactions, then either accepted or discarded — must keep
     /// the arena mirror in step with chainbase. After every block, for every

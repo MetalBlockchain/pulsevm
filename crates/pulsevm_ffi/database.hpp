@@ -774,6 +774,10 @@ public:
         return this->get<dynamic_global_property_object>();
     }
 
+    uint64_t get_global_action_sequence() const {
+        return this->get<dynamic_global_property_object>().global_action_sequence;
+    }
+
     const global_property_object& get_global_properties() const {
         return this->get<global_property_object>();
     }

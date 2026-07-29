@@ -1453,6 +1453,17 @@ impl ArenaShadow {
         Ok(())
     }
 
+    /// Mirrored `global_action_sequence`, or `None` if the singleton row has not
+    /// been written yet — for diffing against chainbase.
+    pub fn global_action_sequence(&self) -> Option<u64> {
+        self.lock()
+            .table::<DynGlobalPropertyRow>()
+            .ok()?
+            .iter()
+            .next()
+            .map(|r| r.global_action_sequence)
+    }
+
     // ----- transaction_object -----------------------------------------------
 
     /// Mirrors `record_transaction`: inserts a dedupe entry keyed by `trx_id`

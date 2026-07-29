@@ -494,6 +494,7 @@ pub mod ffi {
         ) -> Result<u64>;
         pub fn next_auth_sequence(self: Pin<&mut Database>, actor: u64) -> Result<u64>;
         pub fn next_global_sequence(self: Pin<&mut Database>) -> Result<u64>;
+        pub fn get_global_action_sequence(self: &Database) -> Result<u64>;
         pub fn db_remove_i64(
             self: Pin<&mut Database>,
             keyval_cache: Pin<&mut CxxKeyValueIteratorCache>,

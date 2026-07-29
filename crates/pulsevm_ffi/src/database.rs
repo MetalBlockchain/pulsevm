@@ -1235,6 +1235,26 @@ impl Database {
         Ok(res)
     }
 
+    pub fn get_global_action_sequence(&self) -> Result<u64, ChainError> {
+        let guard = self.inner.read()?;
+        guard
+            .get_global_action_sequence()
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
+    /// Mirrored `global_action_sequence`, or `None` when shadowing is off / the
+    /// singleton row is unwritten — for diffing against chainbase.
+    pub fn arena_global_action_sequence(&self) -> Option<u64> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow.as_ref().and_then(|s| s.global_action_sequence())
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            None
+        }
+    }
+
     pub fn db_remove_i64(
         &mut self,
         keyval_cache: &mut KeyValueIteratorCache,
