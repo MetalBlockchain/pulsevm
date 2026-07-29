@@ -68,10 +68,16 @@ impl Wallet {
         }
 
         let file_path = wallet_dir.join(format!("{}.wallet", name));
-        let canonical = file_path.canonicalize()?;
 
-        if !canonical.starts_with(wallet_dir.canonicalize()?) {
-            return Err(WalletError::PathError(format!("name rejected")));
+        // Defense-in-depth against path traversal: resolve the target
+        // *directory* (the wallet file itself does not exist yet, so it
+        // cannot be canonicalized) and confirm the wallet file lands
+        // inside it. The name check above already rejects separators and
+        // dots, so this is belt-and-suspenders.
+        fs::create_dir_all(wallet_dir)?;
+        let canonical_dir = wallet_dir.canonicalize()?;
+        if !canonical_dir.join(format!("{}.wallet", name)).starts_with(&canonical_dir) {
+            return Err(WalletError::PathError("name rejected".to_string()));
         }
 
         let checksum = sha512_hash(password.as_bytes());
