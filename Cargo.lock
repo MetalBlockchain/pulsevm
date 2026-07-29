@@ -3367,6 +3367,7 @@ version = "0.1.0"
 name = "pulsevm_contractdb"
 version = "0.1.0"
 dependencies = [
+ "proptest",
  "pulsevm_arena",
  "zerocopy",
 ]
@@ -3445,9 +3446,11 @@ dependencies = [
  "cxx-build",
  "hex",
  "libc",
+ "proptest",
  "prost-types",
  "pulsevm_billable_size",
  "pulsevm_constants",
+ "pulsevm_contractdb",
  "pulsevm_crypto",
  "pulsevm_error",
  "pulsevm_name",
