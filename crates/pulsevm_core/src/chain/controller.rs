@@ -2636,6 +2636,173 @@ mod tests {
         Ok(())
     }
 
+    /// Every cross-impl table as `(name, chainbase bytes, arena bytes)` for the
+    /// full-state root — the 10 block-populated tables plus the two contract
+    /// primary tables (empty unless a contract wrote rows).
+    #[cfg(feature = "arena-shadow")]
+    fn cross_impl_tables(db: &Database) -> Result<Vec<(&'static str, Vec<u8>, Vec<u8>)>, ChainError> {
+        Ok(vec![
+            ("account_metadata", db.account_metadata_state_bytes()?, db.arena_account_metadata_state_bytes().unwrap_or_default()),
+            ("account", db.account_state_bytes()?, db.arena_account_state_bytes().unwrap_or_default()),
+            ("permission", db.permission_state_bytes()?, db.arena_permission_state_bytes().unwrap_or_default()),
+            ("permission_link", db.permission_link_state_bytes()?, db.arena_permission_link_state_bytes().unwrap_or_default()),
+            ("code", db.code_state_bytes()?, db.arena_code_state_bytes().unwrap_or_default()),
+            ("transaction", db.transaction_state_bytes()?, db.arena_transaction_state_bytes().unwrap_or_default()),
+            ("resource_usage", db.resource_usage_state_bytes()?, db.arena_resource_usage_state_bytes().unwrap_or_default()),
+            ("resource_limits", db.account_limits_state_bytes()?, db.arena_account_limits_state_bytes().unwrap_or_default()),
+            ("resource_state", db.resource_state_bytes()?, db.arena_resource_state_bytes().unwrap_or_default()),
+            ("dynamic_global_property", db.get_global_action_sequence()?.to_le_bytes().to_vec(), db.arena_global_action_sequence().unwrap_or(0).to_le_bytes().to_vec()),
+            ("contract_table", db.contract_table_state_bytes()?, db.arena_contract_table_state_bytes().unwrap_or_default()),
+            ("contract_key_value", db.contract_kv_state_bytes()?, db.arena_contract_kv_state_bytes().unwrap_or_default()),
+        ])
+    }
+
+    /// Replay a real node's block_log against the shadow. Ignored by default:
+    /// run a local pulsevm node (optionally bootstrapped from the testnet) to
+    /// produce a block_log, then point this at it —
+    ///
+    ///   PULSEVM_REPLAY_BLOCK_LOG_DIR=<node data dir with block_log> \
+    ///   PULSEVM_REPLAY_GENESIS=<genesis.json> \
+    ///   PULSEVM_REPLAY_CHAIN_ID=<hex chain id> \
+    ///   cargo test -p pulsevm_core --features arena-shadow \
+    ///     replay_local_block_log -- --ignored --nocapture
+    ///
+    /// It replays into a fresh db from genesis, so it re-derives state from the
+    /// block history with the shadow mirroring alongside, and after every block
+    /// asserts the cross-impl full-state root — reporting the first block/table
+    /// that diverges. Requires our node to be able to execute every real block;
+    /// a replay failure there is a node-completeness gap, not a mirror gap.
+    #[cfg(feature = "arena-shadow")]
+    #[tokio::test]
+    #[ignore]
+    async fn replay_local_block_log() -> Result<(), ChainError> {
+        let (Ok(src_dir), Ok(genesis_path), Ok(chain_id_hex)) = (
+            std::env::var("PULSEVM_REPLAY_BLOCK_LOG_DIR"),
+            std::env::var("PULSEVM_REPLAY_GENESIS"),
+            std::env::var("PULSEVM_REPLAY_CHAIN_ID"),
+        ) else {
+            eprintln!("replay_local_block_log: set PULSEVM_REPLAY_{{BLOCK_LOG_DIR,GENESIS,CHAIN_ID}} to run");
+            return Ok(());
+        };
+
+        let chain_id = Id::from_str(&chain_id_hex).expect("PULSEVM_REPLAY_CHAIN_ID must be hex");
+        let genesis_bytes = fs::read(&genesis_path).expect("cannot read genesis file");
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": "PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez",
+        })
+        .to_string()
+        .into_bytes();
+
+        let mempool = Arc::new(RwLock::new(Mempool::new()));
+        let mut mempool = mempool.write().await;
+        let mut controller = Controller::new();
+        let temp_path = get_temp_dir();
+        controller.initialize(&chain_id, &config_bytes, &genesis_bytes, temp_path.path().to_str().unwrap())?;
+
+        // Open the source node's block_log (separate from our fresh one).
+        let src = crate::chain::state_history::StateHistoryLog::open_with_magic(&src_dir, "block_log", 0)
+            .map_err(|e| ChainError::InternalError(format!("open source block_log: {e:?}")))?;
+        let (log_start, log_end) = src
+            .range()
+            .ok_or_else(|| ChainError::InternalError("source block_log is empty".into()))?;
+        let start = controller.last_accepted_block().block_num() + 1;
+        eprintln!("replaying blocks {start}..={log_end} (log range {log_start}..={log_end})");
+
+        for n in start..=log_end {
+            let packed = src
+                .read_block(n)
+                .map_err(|e| ChainError::InternalError(format!("read block {n}: {e:?}")))?;
+            let block = SignedBlock::read(packed.as_slice(), &mut 0)?;
+            controller.verify_block(&block, &mut mempool).await?;
+            controller.accept_block(&block.id()?, &mut mempool)?;
+            controller.set_preferred_id(block.id()?);
+
+            let tables = cross_impl_tables(&controller.database())?;
+            for (name, chain_bytes, arena_bytes) in &tables {
+                assert_eq!(
+                    chain_bytes, arena_bytes,
+                    "cross-impl state diverged at block {n}, table {name}"
+                );
+            }
+        }
+        eprintln!("replayed to block {log_end}; cross-impl full-state root matched every block");
+        Ok(())
+    }
+
+    /// Self-contained replay test: one node builds a rich block, and a fresh
+    /// node replays it from its packed bytes — the same pack → SignedBlock::read
+    /// → verify → accept path a block_log replay uses — with the shadow on. The
+    /// replaying node must re-derive the full state so its arena and chainbase
+    /// agree on the cross-impl root. This proves the replay path end to end
+    /// without a live node; real testnet blocks drop into replay_local_block_log.
+    #[cfg(feature = "arena-shadow")]
+    #[tokio::test]
+    async fn replay_packed_block_keeps_shadow_in_sync() -> Result<(), ChainError> {
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
+        let private_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": private_key.to_string(),
+        })
+        .to_string()
+        .into_bytes();
+        let genesis = generate_genesis(&private_key);
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let wasm =
+            fs::read(root.join(Path::new("reference_contracts/pulse_token.wasm"))).unwrap();
+        let glenn = Name::from_str("glenn")?;
+
+        // Node A builds a rich block and packs it — the "fixture".
+        let packed = {
+            let mempool = Arc::new(RwLock::new(Mempool::new()));
+            let mut mempool = mempool.write().await;
+            let mut a = Controller::new();
+            let dir = get_temp_dir();
+            a.initialize(&chain_id, &config_bytes, &genesis, dir.path().to_str().unwrap())?;
+            let cid = a.chain_id().clone();
+            mempool.add_transaction(create_account(&private_key, glenn, cid)?);
+            mempool.add_transaction(set_code(&private_key, glenn, wasm, cid)?);
+            mempool.add_transaction(update_auth(
+                &private_key,
+                glenn,
+                Name::from_str("claude")?,
+                ACTIVE_NAME,
+                1,
+                cid,
+            )?);
+            let block = a.build_block(&mut mempool).await?;
+            a.accept_block(&block.id()?, &mut mempool)?;
+            block.pack().unwrap()
+        };
+
+        // Node B replays the packed block from scratch and must match.
+        let mempool = Arc::new(RwLock::new(Mempool::new()));
+        let mut mempool = mempool.write().await;
+        let mut b = Controller::new();
+        let dir = get_temp_dir();
+        b.initialize(&chain_id, &config_bytes, &genesis, dir.path().to_str().unwrap())?;
+        let block = SignedBlock::read(packed.as_slice(), &mut 0)?;
+        b.verify_block(&block, &mut mempool).await?;
+        b.accept_block(&block.id()?, &mut mempool)?;
+
+        for (name, chain_bytes, arena_bytes) in cross_impl_tables(&b.database())? {
+            assert_eq!(
+                chain_bytes, arena_bytes,
+                "replayed cross-impl state diverged for table {name}"
+            );
+        }
+        Ok(())
+    }
+
     /// Block-sequence fuzzer: random sequences of blocks — each with a few
     /// newaccount transactions, then either accepted or discarded — must keep
     /// the arena mirror in step with chainbase. After every block, for every
