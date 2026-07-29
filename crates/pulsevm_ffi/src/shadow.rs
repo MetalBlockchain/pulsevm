@@ -772,6 +772,16 @@ impl ArenaShadow {
             .map(|row| row.privileged != 0)
     }
 
+    /// Whether the mirror holds an account_object row for `name` — for diffing
+    /// against chainbase's `find_account`.
+    pub fn account_exists(&self, name: u64) -> bool {
+        self.lock()
+            .find_by::<AccountRow, AccountRowByName>(&name)
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
     pub fn set_privileged(&self, name: u64, privileged: bool) -> Result<(), DbError> {
         let mut db = self.lock();
         let id = db

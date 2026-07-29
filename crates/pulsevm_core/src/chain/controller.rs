@@ -1330,10 +1330,24 @@ mod tests {
                     let db = controller.database();
                     for &u in &used {
                         let want = expected.contains(&u);
-                        let in_chain = !db.find_account_metadata(u)?.is_null();
-                        let in_arena = db.arena_account_metadata_privileged(u).is_some();
-                        assert_eq!(in_chain, want, "chainbase disagrees with the committed set");
-                        assert_eq!(in_arena, in_chain, "arena diverged from chainbase");
+                        // account_metadata table
+                        let meta_chain = !db.find_account_metadata(u)?.is_null();
+                        let meta_arena = db.arena_account_metadata_privileged(u);
+                        assert_eq!(meta_chain, want, "chainbase account_metadata disagrees with committed set");
+                        assert_eq!(
+                            meta_arena.is_some(),
+                            meta_chain,
+                            "arena account_metadata diverged from chainbase"
+                        );
+                        // account_object table
+                        let acct_chain = !db.find_account(u)?.is_null();
+                        let acct_arena = db.arena_account_exists(u);
+                        assert_eq!(acct_chain, want, "chainbase account disagrees with committed set");
+                        assert_eq!(acct_arena, acct_chain, "arena account table diverged from chainbase");
+                        // a committed account is never privileged when just created
+                        if want {
+                            assert_eq!(meta_arena, Some(false), "arena privileged flag diverged");
+                        }
                     }
                 }
                 Ok::<(), ChainError>(())

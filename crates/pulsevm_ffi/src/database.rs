@@ -131,6 +131,20 @@ impl Database {
         }
     }
 
+    /// Whether the arena mirror holds an account_object for `name` — for diffing
+    /// against chainbase's `find_account`.
+    pub fn arena_account_exists(&self, name: u64) -> bool {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow.as_ref().map(|s| s.account_exists(name)).unwrap_or(false)
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = name;
+            false
+        }
+    }
+
     /// State root of the mirrored subset, or `None` when shadowing is off. Only
     /// ported tables contribute, so it is comparable to chainbase for those.
     pub fn arena_state_root(&self) -> Option<[u8; 32]> {
