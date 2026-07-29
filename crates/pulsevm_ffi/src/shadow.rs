@@ -13,7 +13,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use pulsevm_arena::{ArenaObject, Db, DbError, ObjectId};
+use pulsevm_arena::{
+    ArenaObject, BlobRef, Db, DbError, IndexedBy, ObjectId, SecondaryIndex, key_index,
+};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 /// Arena mirror of chainbase `account_metadata_object` — the first table ported.
@@ -30,6 +32,668 @@ struct AccountMetaRow {
     _pad: [u8; 7],
 }
 
+/// Arena mirror of chainbase `account_object`. `abi` is a `shared_blob`, so it
+/// lives in the table's blob arena and the row keeps only a `BlobRef`.
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout, ArenaObject)]
+#[arena(type_id = 2)]
+struct AccountRow {
+    id: ObjectId<AccountRow>,
+    #[arena(index)]
+    name: u64,
+    creation_date: u32,
+    _pad: u32,
+    abi: BlobRef,
+}
+
+/// Arena mirror of chainbase `permission_object`. `auth` (a `shared_authority`)
+/// is variable-length, so it is encoded into the blob arena; the row holds the
+/// `BlobRef`. The three secondary indices reproduce chainbase's key ordering
+/// exactly: `by_parent` = `(parent, id)`, `by_owner` = `(owner, perm_name)`,
+/// `by_name` = `(perm_name, id)`.
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout)]
+struct PermissionRow {
+    id: ObjectId<PermissionRow>,
+    usage_id: i64,
+    parent: i64,
+    owner: u64,
+    perm_name: u64,
+    last_updated: i64,
+    auth: BlobRef,
+}
+
+struct PermByParent;
+impl IndexedBy<PermissionRow> for PermByParent {
+    type Key = (i64, i64);
+    fn key(o: &PermissionRow) -> Self::Key {
+        (o.parent, o.id.raw())
+    }
+}
+struct PermByOwner;
+impl IndexedBy<PermissionRow> for PermByOwner {
+    type Key = (u64, u64);
+    fn key(o: &PermissionRow) -> Self::Key {
+        (o.owner, o.perm_name)
+    }
+}
+struct PermByName;
+impl IndexedBy<PermissionRow> for PermByName {
+    type Key = (u64, i64);
+    fn key(o: &PermissionRow) -> Self::Key {
+        (o.perm_name, o.id.raw())
+    }
+}
+impl ArenaObject for PermissionRow {
+    const TYPE_ID: u16 = 3;
+    fn id(&self) -> ObjectId<Self> {
+        self.id
+    }
+    fn set_id(&mut self, id: ObjectId<Self>) {
+        self.id = id;
+    }
+    fn secondary_indices() -> Vec<Box<dyn SecondaryIndex<Self>>> {
+        vec![
+            key_index::<Self, PermByParent>(),
+            key_index::<Self, PermByOwner>(),
+            key_index::<Self, PermByName>(),
+        ]
+    }
+}
+
+/// Arena mirror of chainbase `permission_usage_object`. It has no secondary
+/// index and no dedicated mutation entry point; it is created, touched and
+/// removed only alongside a `permission_object`.
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout, ArenaObject)]
+#[arena(type_id = 4)]
+struct PermissionUsageRow {
+    id: ObjectId<PermissionUsageRow>,
+    last_used: i64,
+}
+
+/// Arena mirror of chainbase `permission_link_object`. Secondary indices match
+/// chainbase: `by_action_name` = `(account, code, message_type)`,
+/// `by_permission_name` = `(account, required_permission, id)`.
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout)]
+struct PermissionLinkRow {
+    id: ObjectId<PermissionLinkRow>,
+    account: u64,
+    code: u64,
+    message_type: u64,
+    required_permission: u64,
+}
+
+struct LinkByActionName;
+impl IndexedBy<PermissionLinkRow> for LinkByActionName {
+    type Key = (u64, u64, u64);
+    fn key(o: &PermissionLinkRow) -> Self::Key {
+        (o.account, o.code, o.message_type)
+    }
+}
+struct LinkByPermissionName;
+impl IndexedBy<PermissionLinkRow> for LinkByPermissionName {
+    type Key = (u64, u64, i64);
+    fn key(o: &PermissionLinkRow) -> Self::Key {
+        (o.account, o.required_permission, o.id.raw())
+    }
+}
+impl ArenaObject for PermissionLinkRow {
+    const TYPE_ID: u16 = 5;
+    fn id(&self) -> ObjectId<Self> {
+        self.id
+    }
+    fn set_id(&mut self, id: ObjectId<Self>) {
+        self.id = id;
+    }
+    fn secondary_indices() -> Vec<Box<dyn SecondaryIndex<Self>>> {
+        vec![
+            key_index::<Self, LinkByActionName>(),
+            key_index::<Self, LinkByPermissionName>(),
+        ]
+    }
+}
+
+/// Arena mirror of chainbase `code_object`. `code` is a `shared_blob`. The
+/// `by_code_hash` index is composite `(code_hash, vm_type, vm_version)`, the
+/// same ordering chainbase uses.
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout)]
+struct CodeRow {
+    id: ObjectId<CodeRow>,
+    code_ref_count: u64,
+    code: BlobRef,
+    first_block_used: u32,
+    vm_type: u8,
+    vm_version: u8,
+    _pad: [u8; 2],
+    code_hash: [u8; 32],
+}
+
+struct CodeByHash;
+impl IndexedBy<CodeRow> for CodeByHash {
+    type Key = ([u8; 32], u8, u8);
+    fn key(o: &CodeRow) -> Self::Key {
+        (o.code_hash, o.vm_type, o.vm_version)
+    }
+}
+impl ArenaObject for CodeRow {
+    const TYPE_ID: u16 = 6;
+    fn id(&self) -> ObjectId<Self> {
+        self.id
+    }
+    fn set_id(&mut self, id: ObjectId<Self>) {
+        self.id = id;
+    }
+    fn secondary_indices() -> Vec<Box<dyn SecondaryIndex<Self>>> {
+        vec![key_index::<Self, CodeByHash>()]
+    }
+}
+
+/// Arena mirror of chainbase `dynamic_global_property_object` — a singleton
+/// carrying the monotonically increasing global action sequence. Genesis creates
+/// the chainbase row on the C++ side, which the mirror never observes, so the
+/// mirror creates its own row lazily the first time a sequence is drawn.
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout, ArenaObject)]
+#[arena(type_id = 14)]
+struct DynGlobalPropertyRow {
+    id: ObjectId<DynGlobalPropertyRow>,
+    global_action_sequence: u64,
+}
+
+/// Arena mirror of chainbase `transaction_object`, the per-block duplicate-trx
+/// dedupe set. Secondary indices reproduce chainbase's ordering: `by_trx_id` =
+/// `trx_id`, `by_expiration` = `(expiration, id)`.
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout)]
+struct TransactionRow {
+    id: ObjectId<TransactionRow>,
+    expiration: u32,
+    _pad: u32,
+    trx_id: [u8; 32],
+}
+
+struct TxByTrxId;
+impl IndexedBy<TransactionRow> for TxByTrxId {
+    type Key = [u8; 32];
+    fn key(o: &TransactionRow) -> Self::Key {
+        o.trx_id
+    }
+}
+struct TxByExpiration;
+impl IndexedBy<TransactionRow> for TxByExpiration {
+    type Key = (u32, i64);
+    fn key(o: &TransactionRow) -> Self::Key {
+        (o.expiration, o.id.raw())
+    }
+}
+impl ArenaObject for TransactionRow {
+    const TYPE_ID: u16 = 15;
+    fn id(&self) -> ObjectId<Self> {
+        self.id
+    }
+    fn set_id(&mut self, id: ObjectId<Self>) {
+        self.id = id;
+    }
+    fn secondary_indices() -> Vec<Box<dyn SecondaryIndex<Self>>> {
+        vec![
+            key_index::<Self, TxByTrxId>(),
+            key_index::<Self, TxByExpiration>(),
+        ]
+    }
+}
+
+// ----- contract tables + secondary indices ------------------------------
+//
+// These mirror chainbase's `table_id_object`, `key_value_object` and the five
+// `secondary_index<...>` tables. The row shapes and index orderings are copied
+// from the proven definitions in `pulsevm_contractdb`, so the arena's key
+// ordering matches chainbase's `boost::multi_index` comparators exactly. The
+// only additions here are the `payer` field on every row (chainbase carries it;
+// contractdb dropped it) and the `index_long_double` table, which contractdb
+// does not model.
+//
+// `t_id` is the mirror's own `table_id` row id (an `i64` oid), assigned when the
+// table is first seen — it is not chainbase's oid, but every child row keys off
+// the same local value, so `(t_id, primary_key)` locates a row unambiguously.
+
+/// Mirror of `table_id_object`. `count` tracks the number of child rows
+/// (primary + every secondary), matching chainbase, which increments it on each
+/// child create and decrements it on each child remove, deleting the table when
+/// it reaches zero. `payer` is sampled at creation only; chainbase can reassign
+/// it internally with no FFI hook, so the mirror does not track that drift.
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout)]
+struct ContractTableRow {
+    id: ObjectId<ContractTableRow>,
+    code: u64,
+    scope: u64,
+    table: u64,
+    payer: u64,
+    count: u32,
+    _pad: u32,
+}
+
+struct ContractTableByCodeScopeTable;
+impl IndexedBy<ContractTableRow> for ContractTableByCodeScopeTable {
+    type Key = (u64, u64, u64);
+    fn key(o: &ContractTableRow) -> Self::Key {
+        (o.code, o.scope, o.table)
+    }
+}
+impl ArenaObject for ContractTableRow {
+    const TYPE_ID: u16 = 7;
+    fn id(&self) -> ObjectId<Self> {
+        self.id
+    }
+    fn set_id(&mut self, id: ObjectId<Self>) {
+        self.id = id;
+    }
+    fn secondary_indices() -> Vec<Box<dyn SecondaryIndex<Self>>> {
+        vec![key_index::<Self, ContractTableByCodeScopeTable>()]
+    }
+}
+
+/// Mirror of `key_value_object`. `value` is a `shared_blob`, so it lives in the
+/// blob arena and the row keeps a `BlobRef`. Ordered by `(t_id, primary_key)`.
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout)]
+struct ContractKeyValueRow {
+    id: ObjectId<ContractKeyValueRow>,
+    t_id: i64,
+    primary_key: u64,
+    payer: u64,
+    value: BlobRef,
+}
+
+struct ContractKvByScopePrimary;
+impl IndexedBy<ContractKeyValueRow> for ContractKvByScopePrimary {
+    type Key = (i64, u64);
+    fn key(o: &ContractKeyValueRow) -> Self::Key {
+        (o.t_id, o.primary_key)
+    }
+}
+impl ArenaObject for ContractKeyValueRow {
+    const TYPE_ID: u16 = 8;
+    fn id(&self) -> ObjectId<Self> {
+        self.id
+    }
+    fn set_id(&mut self, id: ObjectId<Self>) {
+        self.id = id;
+    }
+    fn secondary_indices() -> Vec<Box<dyn SecondaryIndex<Self>>> {
+        vec![key_index::<Self, ContractKvByScopePrimary>()]
+    }
+}
+
+/// Mirror of `index64_object` — a `uint64` secondary key, ordered by
+/// `(t_id, secondary_key, primary_key)`, plus a `by_primary` index.
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout)]
+struct ContractIndex64Row {
+    id: ObjectId<ContractIndex64Row>,
+    t_id: i64,
+    primary_key: u64,
+    secondary_key: u64,
+    payer: u64,
+}
+
+struct ContractIdx64ByPrimary;
+impl IndexedBy<ContractIndex64Row> for ContractIdx64ByPrimary {
+    type Key = (i64, u64);
+    fn key(o: &ContractIndex64Row) -> Self::Key {
+        (o.t_id, o.primary_key)
+    }
+}
+struct ContractIdx64BySecondary;
+impl IndexedBy<ContractIndex64Row> for ContractIdx64BySecondary {
+    type Key = (i64, u64, u64);
+    fn key(o: &ContractIndex64Row) -> Self::Key {
+        (o.t_id, o.secondary_key, o.primary_key)
+    }
+}
+impl ArenaObject for ContractIndex64Row {
+    const TYPE_ID: u16 = 9;
+    fn id(&self) -> ObjectId<Self> {
+        self.id
+    }
+    fn set_id(&mut self, id: ObjectId<Self>) {
+        self.id = id;
+    }
+    fn secondary_indices() -> Vec<Box<dyn SecondaryIndex<Self>>> {
+        vec![
+            key_index::<Self, ContractIdx64ByPrimary>(),
+            key_index::<Self, ContractIdx64BySecondary>(),
+        ]
+    }
+}
+
+/// Mirror of `index128_object`. The `uint128` key is split into two `u64` words
+/// so the row stays 8-byte aligned (a real `u128` would force 16-byte alignment
+/// and thus padding, which `IntoBytes` rejects); the comparator rejoins them.
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout)]
+struct ContractIndex128Row {
+    id: ObjectId<ContractIndex128Row>,
+    t_id: i64,
+    primary_key: u64,
+    sec_lo: u64,
+    sec_hi: u64,
+    payer: u64,
+}
+
+impl ContractIndex128Row {
+    fn secondary_key(&self) -> u128 {
+        join_u128(self.sec_lo, self.sec_hi)
+    }
+}
+
+struct ContractIdx128ByPrimary;
+impl IndexedBy<ContractIndex128Row> for ContractIdx128ByPrimary {
+    type Key = (i64, u64);
+    fn key(o: &ContractIndex128Row) -> Self::Key {
+        (o.t_id, o.primary_key)
+    }
+}
+struct ContractIdx128BySecondary;
+impl IndexedBy<ContractIndex128Row> for ContractIdx128BySecondary {
+    type Key = (i64, u128, u64);
+    fn key(o: &ContractIndex128Row) -> Self::Key {
+        (o.t_id, o.secondary_key(), o.primary_key)
+    }
+}
+impl ArenaObject for ContractIndex128Row {
+    const TYPE_ID: u16 = 10;
+    fn id(&self) -> ObjectId<Self> {
+        self.id
+    }
+    fn set_id(&mut self, id: ObjectId<Self>) {
+        self.id = id;
+    }
+    fn secondary_indices() -> Vec<Box<dyn SecondaryIndex<Self>>> {
+        vec![
+            key_index::<Self, ContractIdx128ByPrimary>(),
+            key_index::<Self, ContractIdx128BySecondary>(),
+        ]
+    }
+}
+
+/// Mirror of `index256_object` — a `key256_t` (`std::array<uint128_t, 2>`) key.
+/// The 32 bytes are stored verbatim; chainbase orders the array with the default
+/// `operator<` (lexicographic over the two words, element `[0]` most
+/// significant). The words are the two little-endian `uint128` halves of the
+/// buffer, so the comparator reads word `[0]` from bytes `0..16` and word `[1]`
+/// from `16..32` and compares `(word0, word1)`.
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout)]
+struct ContractIndex256Row {
+    id: ObjectId<ContractIndex256Row>,
+    t_id: i64,
+    primary_key: u64,
+    payer: u64,
+    secondary_key: [u8; 32],
+}
+
+impl ContractIndex256Row {
+    fn secondary_words(&self) -> (u128, u128) {
+        let mut w0 = [0u8; 16];
+        let mut w1 = [0u8; 16];
+        w0.copy_from_slice(&self.secondary_key[0..16]);
+        w1.copy_from_slice(&self.secondary_key[16..32]);
+        (u128::from_le_bytes(w0), u128::from_le_bytes(w1))
+    }
+}
+
+struct ContractIdx256ByPrimary;
+impl IndexedBy<ContractIndex256Row> for ContractIdx256ByPrimary {
+    type Key = (i64, u64);
+    fn key(o: &ContractIndex256Row) -> Self::Key {
+        (o.t_id, o.primary_key)
+    }
+}
+struct ContractIdx256BySecondary;
+impl IndexedBy<ContractIndex256Row> for ContractIdx256BySecondary {
+    type Key = (i64, u128, u128, u64);
+    fn key(o: &ContractIndex256Row) -> Self::Key {
+        let (w0, w1) = o.secondary_words();
+        (o.t_id, w0, w1, o.primary_key)
+    }
+}
+impl ArenaObject for ContractIndex256Row {
+    const TYPE_ID: u16 = 11;
+    fn id(&self) -> ObjectId<Self> {
+        self.id
+    }
+    fn set_id(&mut self, id: ObjectId<Self>) {
+        self.id = id;
+    }
+    fn secondary_indices() -> Vec<Box<dyn SecondaryIndex<Self>>> {
+        vec![
+            key_index::<Self, ContractIdx256ByPrimary>(),
+            key_index::<Self, ContractIdx256BySecondary>(),
+        ]
+    }
+}
+
+/// Total order over the idx_double key matching chainbase `soft_double_less`
+/// (`f64_lt`): numeric order with `-0.0` and `+0.0` equal. Chainbase asserts the
+/// key is not NaN before it reaches the index, so a well-formed caller never
+/// inserts one; folding `-0.0` onto `+0.0` and leaning on `total_cmp` reproduces
+/// `f64_lt` on every non-NaN input and still yields a valid total order if a NaN
+/// ever slips through, rather than corrupting the BTree.
+#[derive(Clone, Copy)]
+struct DoubleKey(f64);
+
+impl DoubleKey {
+    fn canonical(self) -> f64 {
+        if self.0 == 0.0 { 0.0 } else { self.0 }
+    }
+}
+impl PartialEq for DoubleKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+impl Eq for DoubleKey {}
+impl PartialOrd for DoubleKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for DoubleKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.canonical().total_cmp(&other.canonical())
+    }
+}
+
+/// Mirror of `index_double_object` — an IEEE-754 `double`, ordered by
+/// [`DoubleKey`] to match chainbase's software-float comparison.
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout)]
+struct ContractIndexDoubleRow {
+    id: ObjectId<ContractIndexDoubleRow>,
+    t_id: i64,
+    primary_key: u64,
+    secondary_key: f64,
+    payer: u64,
+}
+
+struct ContractIdxDoubleByPrimary;
+impl IndexedBy<ContractIndexDoubleRow> for ContractIdxDoubleByPrimary {
+    type Key = (i64, u64);
+    fn key(o: &ContractIndexDoubleRow) -> Self::Key {
+        (o.t_id, o.primary_key)
+    }
+}
+struct ContractIdxDoubleBySecondary;
+impl IndexedBy<ContractIndexDoubleRow> for ContractIdxDoubleBySecondary {
+    type Key = (i64, DoubleKey, u64);
+    fn key(o: &ContractIndexDoubleRow) -> Self::Key {
+        (o.t_id, DoubleKey(o.secondary_key), o.primary_key)
+    }
+}
+impl ArenaObject for ContractIndexDoubleRow {
+    const TYPE_ID: u16 = 12;
+    fn id(&self) -> ObjectId<Self> {
+        self.id
+    }
+    fn set_id(&mut self, id: ObjectId<Self>) {
+        self.id = id;
+    }
+    fn secondary_indices() -> Vec<Box<dyn SecondaryIndex<Self>>> {
+        vec![
+            key_index::<Self, ContractIdxDoubleByPrimary>(),
+            key_index::<Self, ContractIdxDoubleBySecondary>(),
+        ]
+    }
+}
+
+/// Total order over the idx_long_double key matching chainbase
+/// `soft_long_double_less` (`f128_lt`): the IEEE binary128 numeric order, again
+/// with `-0.0` and `+0.0` folded together. Rather than call softfloat (not
+/// reachable from a BTree comparator), this reproduces IEEE-754 total ordering
+/// on the 128-bit pattern the same way `f64::total_cmp` does for 64-bit: flip
+/// the sign bit for positives, flip all bits for negatives, then compare as a
+/// signed integer. That equals `f128_lt` on every non-NaN, non-`-0.0` input.
+#[derive(Clone, Copy)]
+struct LongDoubleKey {
+    lo: u64,
+    hi: u64,
+}
+
+impl LongDoubleKey {
+    fn ordering_key(self) -> i128 {
+        let bits: u128 = ((self.hi as u128) << 64) | self.lo as u128;
+        let sign_mask: u128 = 1u128 << 127;
+        // Fold both zeros (exponent and mantissa all zero, either sign) onto
+        // `+0.0` so they compare equal, as `f128_lt` treats them.
+        let bits = if bits & !sign_mask == 0 { 0 } else { bits };
+        let mut key = bits as i128;
+        key ^= (((key >> 127) as u128) >> 1) as i128;
+        key
+    }
+}
+impl PartialEq for LongDoubleKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.ordering_key() == other.ordering_key()
+    }
+}
+impl Eq for LongDoubleKey {}
+impl PartialOrd for LongDoubleKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for LongDoubleKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.ordering_key().cmp(&other.ordering_key())
+    }
+}
+
+/// Mirror of `index_long_double_object` — a `float128_t`, stored as two `u64`
+/// words and ordered by [`LongDoubleKey`].
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout)]
+struct ContractIndexLongDoubleRow {
+    id: ObjectId<ContractIndexLongDoubleRow>,
+    t_id: i64,
+    primary_key: u64,
+    sec_lo: u64,
+    sec_hi: u64,
+    payer: u64,
+}
+
+struct ContractIdxLongDoubleByPrimary;
+impl IndexedBy<ContractIndexLongDoubleRow> for ContractIdxLongDoubleByPrimary {
+    type Key = (i64, u64);
+    fn key(o: &ContractIndexLongDoubleRow) -> Self::Key {
+        (o.t_id, o.primary_key)
+    }
+}
+struct ContractIdxLongDoubleBySecondary;
+impl IndexedBy<ContractIndexLongDoubleRow> for ContractIdxLongDoubleBySecondary {
+    type Key = (i64, LongDoubleKey, u64);
+    fn key(o: &ContractIndexLongDoubleRow) -> Self::Key {
+        (
+            o.t_id,
+            LongDoubleKey {
+                lo: o.sec_lo,
+                hi: o.sec_hi,
+            },
+            o.primary_key,
+        )
+    }
+}
+impl ArenaObject for ContractIndexLongDoubleRow {
+    const TYPE_ID: u16 = 13;
+    fn id(&self) -> ObjectId<Self> {
+        self.id
+    }
+    fn set_id(&mut self, id: ObjectId<Self>) {
+        self.id = id;
+    }
+    fn secondary_indices() -> Vec<Box<dyn SecondaryIndex<Self>>> {
+        vec![
+            key_index::<Self, ContractIdxLongDoubleByPrimary>(),
+            key_index::<Self, ContractIdxLongDoubleBySecondary>(),
+        ]
+    }
+}
+
+/// Rejoins `(low, high)` `u64` words into a `u128`.
+fn join_u128(lo: u64, hi: u64) -> u128 {
+    ((hi as u128) << 64) | lo as u128
+}
+
+/// Resolves the mirror-local `table_id` for `(code, scope, table)`, creating the
+/// table row (with `count == 0`) the first time it is seen. Matches chainbase's
+/// implicit `find_or_create_table` inside the child-store paths.
+fn contract_table_oid(
+    db: &mut Db,
+    code: u64,
+    scope: u64,
+    table: u64,
+    payer: u64,
+) -> Result<i64, DbError> {
+    if let Some(id) = db
+        .find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&(code, scope, table))?
+        .map(|t| t.id().raw())
+    {
+        return Ok(id);
+    }
+    let id = db
+        .create::<ContractTableRow>(|t| {
+            t.code = code;
+            t.scope = scope;
+            t.table = table;
+            t.payer = payer;
+            t.count = 0;
+        })?
+        .id()
+        .raw();
+    Ok(id)
+}
+
+/// Bumps a table's child-row count, mirroring the `++t.count` chainbase does on
+/// every primary/secondary create.
+fn contract_table_incr(db: &mut Db, t_id: i64) -> Result<(), DbError> {
+    db.modify::<ContractTableRow>(ObjectId::new(t_id), |t| t.count += 1)
+}
+
+/// Drops a table's child-row count and removes the table when it hits zero,
+/// mirroring the `--t.count` / `remove_table` chainbase does on every remove.
+fn contract_table_decr(db: &mut Db, t_id: i64) -> Result<(), DbError> {
+    db.modify::<ContractTableRow>(ObjectId::new(t_id), |t| {
+        t.count = t.count.saturating_sub(1)
+    })?;
+    if db.get::<ContractTableRow>(ObjectId::new(t_id))?.count == 0 {
+        db.remove::<ContractTableRow>(ObjectId::new(t_id))?;
+    }
+    Ok(())
+}
+
 /// A cheaply cloned, `Send + Sync` handle to the shadow arena, held by
 /// `Database` and shared across its clones.
 #[derive(Clone)]
@@ -42,6 +706,20 @@ impl ArenaShadow {
     pub fn new() -> Result<Self, DbError> {
         let mut db = Db::new();
         db.add_table::<AccountMetaRow>()?;
+        db.add_table::<AccountRow>()?;
+        db.add_table::<PermissionRow>()?;
+        db.add_table::<PermissionUsageRow>()?;
+        db.add_table::<PermissionLinkRow>()?;
+        db.add_table::<CodeRow>()?;
+        db.add_table::<DynGlobalPropertyRow>()?;
+        db.add_table::<TransactionRow>()?;
+        db.add_table::<ContractTableRow>()?;
+        db.add_table::<ContractKeyValueRow>()?;
+        db.add_table::<ContractIndex64Row>()?;
+        db.add_table::<ContractIndex128Row>()?;
+        db.add_table::<ContractIndex256Row>()?;
+        db.add_table::<ContractIndexDoubleRow>()?;
+        db.add_table::<ContractIndexLongDoubleRow>()?;
         Ok(ArenaShadow {
             inner: Arc::new(Mutex::new(db)),
         })
@@ -81,6 +759,584 @@ impl ArenaShadow {
             row.name = name;
             row.privileged = privileged as u8;
         })?;
+        Ok(())
+    }
+
+    pub fn set_privileged(&self, name: u64, privileged: bool) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let id = db
+            .find_by::<AccountMetaRow, AccountMetaRowByName>(&name)?
+            .map(|r| r.id());
+        if let Some(id) = id {
+            db.modify::<AccountMetaRow>(id, |row| row.privileged = privileged as u8)?;
+        }
+        Ok(())
+    }
+
+    // ----- account_object ---------------------------------------------------
+
+    pub fn create_account(&self, name: u64, creation_date: u32) -> Result<(), DbError> {
+        self.lock().create::<AccountRow>(|row| {
+            row.name = name;
+            row.creation_date = creation_date;
+        })?;
+        Ok(())
+    }
+
+    // ----- permission_object / permission_usage_object ----------------------
+
+    /// Mirrors `create_permission`, which also creates the linked
+    /// `permission_usage_object`. The usage row is created first so its id can be
+    /// stored on the permission, exactly as the C++ path does.
+    pub fn create_permission(
+        &self,
+        parent: i64,
+        owner: u64,
+        perm_name: u64,
+        creation_time_us: i64,
+        auth: &[u8],
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let usage_id = db
+            .create::<PermissionUsageRow>(|p| p.last_used = creation_time_us)?
+            .id()
+            .raw();
+        let auth_blob = db.alloc_blob::<PermissionRow>(auth)?;
+        db.create::<PermissionRow>(|p| {
+            p.usage_id = usage_id;
+            p.parent = parent;
+            p.owner = owner;
+            p.perm_name = perm_name;
+            p.last_updated = creation_time_us;
+            p.auth = auth_blob;
+        })?;
+        Ok(())
+    }
+
+    pub fn modify_permission(
+        &self,
+        owner: u64,
+        perm_name: u64,
+        auth: &[u8],
+        last_updated_us: i64,
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let id = db
+            .find_by::<PermissionRow, PermByOwner>(&(owner, perm_name))?
+            .map(|p| p.id());
+        let Some(id) = id else { return Ok(()) };
+        let auth_blob = db.alloc_blob::<PermissionRow>(auth)?;
+        db.modify::<PermissionRow>(id, |p| {
+            p.auth = auth_blob;
+            p.last_updated = last_updated_us;
+        })?;
+        Ok(())
+    }
+
+    /// Mirrors `remove_permission` (and the `delete_auth` path that calls it):
+    /// removes the permission and its linked `permission_usage_object`.
+    pub fn remove_permission(&self, owner: u64, perm_name: u64) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let found = db
+            .find_by::<PermissionRow, PermByOwner>(&(owner, perm_name))?
+            .map(|p| (p.id(), p.usage_id));
+        let Some((id, usage_id)) = found else {
+            return Ok(());
+        };
+        db.remove::<PermissionUsageRow>(ObjectId::new(usage_id))?;
+        db.remove::<PermissionRow>(id)?;
+        Ok(())
+    }
+
+    pub fn update_permission_usage(
+        &self,
+        owner: u64,
+        perm_name: u64,
+        last_used_us: i64,
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let usage_id = db
+            .find_by::<PermissionRow, PermByOwner>(&(owner, perm_name))?
+            .map(|p| p.usage_id);
+        let Some(usage_id) = usage_id else {
+            return Ok(());
+        };
+        db.modify::<PermissionUsageRow>(ObjectId::new(usage_id), |p| p.last_used = last_used_us)?;
+        Ok(())
+    }
+
+    // ----- permission_link_object -------------------------------------------
+
+    /// Mirrors `link_auth`: updates an existing link's required permission, or
+    /// creates a new link when none exists for `(account, code, message_type)`.
+    pub fn link_auth(
+        &self,
+        account: u64,
+        code: u64,
+        message_type: u64,
+        required_permission: u64,
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let existing = db
+            .find_by::<PermissionLinkRow, LinkByActionName>(&(account, code, message_type))?
+            .map(|l| l.id());
+        match existing {
+            Some(id) => {
+                db.modify::<PermissionLinkRow>(id, |l| l.required_permission = required_permission)?;
+            }
+            None => {
+                db.create::<PermissionLinkRow>(|l| {
+                    l.account = account;
+                    l.code = code;
+                    l.message_type = message_type;
+                    l.required_permission = required_permission;
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn unlink_auth(&self, account: u64, code: u64, message_type: u64) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let id = db
+            .find_by::<PermissionLinkRow, LinkByActionName>(&(account, code, message_type))?
+            .map(|l| l.id());
+        if let Some(id) = id {
+            db.remove::<PermissionLinkRow>(id)?;
+        }
+        Ok(())
+    }
+
+    // ----- code_object ------------------------------------------------------
+
+    /// Mirrors the `code_object` side of `update_account_code`: for a non-empty
+    /// code image, either bumps the ref count of the row with a matching
+    /// `(code_hash, vm_type, vm_version)` or creates a new one. The
+    /// `account_metadata_object` fields updated in the same C++ call are not
+    /// mirrored here — that object is reached by reference, with no key exposed
+    /// through the FFI to locate the arena row.
+    pub fn update_account_code(
+        &self,
+        code: &[u8],
+        code_hash: [u8; 32],
+        head_block_num: u32,
+        vm_type: u8,
+        vm_version: u8,
+    ) -> Result<(), DbError> {
+        if code.is_empty() {
+            return Ok(());
+        }
+        let mut db = self.lock();
+        let existing = db
+            .find_by::<CodeRow, CodeByHash>(&(code_hash, vm_type, vm_version))?
+            .map(|c| c.id());
+        match existing {
+            Some(id) => db.modify::<CodeRow>(id, |c| c.code_ref_count += 1)?,
+            None => {
+                let code_blob = db.alloc_blob::<CodeRow>(code)?;
+                db.create::<CodeRow>(|c| {
+                    c.code_hash = code_hash;
+                    c.code = code_blob;
+                    c.code_ref_count = 1;
+                    c.first_block_used = head_block_num.wrapping_add(1);
+                    c.vm_type = vm_type;
+                    c.vm_version = vm_version;
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Mirrors `unlink_account_code`: drops the ref count of the code row and
+    /// removes it at zero. The FFI `code_object` exposes only its hash, not
+    /// `vm_type`/`vm_version`, so the row is located by hash; a hash is unique
+    /// across the code table in practice.
+    pub fn unlink_account_code(&self, code_hash: [u8; 32]) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let found = {
+            let table = db.table::<CodeRow>()?;
+            table
+                .iter()
+                .find(|c| c.code_hash == code_hash)
+                .map(|c| (c.id(), c.code_ref_count))
+        };
+        let Some((id, ref_count)) = found else {
+            return Ok(());
+        };
+        if ref_count <= 1 {
+            db.remove::<CodeRow>(id)?;
+        } else {
+            db.modify::<CodeRow>(id, |c| c.code_ref_count -= 1)?;
+        }
+        Ok(())
+    }
+
+    // ----- dynamic_global_property_object -----------------------------------
+
+    /// Mirrors `next_global_sequence`, which returns the post-increment global
+    /// action sequence. The mirror stores that value into its singleton row,
+    /// creating the row on first use (genesis creates the chainbase row on the
+    /// C++ side, so the mirror never sees its initial `0`).
+    pub fn set_global_action_sequence(&self, value: u64) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let existing = db
+            .table::<DynGlobalPropertyRow>()?
+            .iter()
+            .next()
+            .map(|r| r.id());
+        match existing {
+            Some(id) => {
+                db.modify::<DynGlobalPropertyRow>(id, |r| r.global_action_sequence = value)?
+            }
+            None => {
+                db.create::<DynGlobalPropertyRow>(|r| r.global_action_sequence = value)?;
+            }
+        }
+        Ok(())
+    }
+
+    // ----- transaction_object -----------------------------------------------
+
+    /// Mirrors `record_transaction`: inserts a dedupe entry keyed by `trx_id`
+    /// with its `expiration` (whole seconds).
+    pub fn record_transaction(&self, trx_id: [u8; 32], expiration: u32) -> Result<(), DbError> {
+        self.lock().create::<TransactionRow>(|t| {
+            t.trx_id = trx_id;
+            t.expiration = expiration;
+        })?;
+        Ok(())
+    }
+
+    /// Mirrors `clear_expired_input_transactions`: drops every row whose
+    /// expiration falls strictly before `cutoff` (both in microseconds, as the
+    /// C++ compares `cutoff > expiration.to_time_point()`). Expirations are whole
+    /// seconds, so they are scaled to microseconds for the comparison.
+    pub fn clear_expired_input_transactions(&self, cutoff_micros: i64) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let expired: Vec<ObjectId<TransactionRow>> = db
+            .table::<TransactionRow>()?
+            .iter()
+            .filter(|t| (t.expiration as i64) * 1_000_000 < cutoff_micros)
+            .map(|t| t.id())
+            .collect();
+        for id in expired {
+            db.remove::<TransactionRow>(id)?;
+        }
+        Ok(())
+    }
+
+    // ----- contract tables + secondary indices ------------------------------
+    //
+    // The `update_*` chainbase paths are not mirrored: they take only an object
+    // handle (`&key_value_object`, `&index64_object`, ...), whose `table_id` is
+    // opaque across the FFI, so the owning `(code, scope, table)` cannot be
+    // recovered at the call site to locate the arena row. Creates carry the
+    // `&table_id_object` (hence code/scope/table); removes are resolved through
+    // the iterator cache before deletion — so both are mirrored.
+
+    /// Mirrors `create_table`. Idempotent: chainbase also reaches a table
+    /// lazily, so a row may already exist from a child-store path.
+    pub fn create_table(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        payer: u64,
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        contract_table_oid(&mut db, code, scope, table, payer)?;
+        Ok(())
+    }
+
+    /// Mirrors `remove_table`. No-op when the row is already gone (a preceding
+    /// child remove may have deleted the now-empty table).
+    pub fn remove_table(&self, code: u64, scope: u64, table: u64) -> Result<(), DbError> {
+        let mut db = self.lock();
+        if let Some(id) = db
+            .find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&(code, scope, table))?
+            .map(|t| t.id())
+        {
+            db.remove::<ContractTableRow>(id)?;
+        }
+        Ok(())
+    }
+
+    pub fn create_key_value_object(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        payer: u64,
+        primary_key: u64,
+        value: &[u8],
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let t_id = contract_table_oid(&mut db, code, scope, table, payer)?;
+        let blob = db.alloc_blob::<ContractKeyValueRow>(value)?;
+        db.create::<ContractKeyValueRow>(|k| {
+            k.t_id = t_id;
+            k.primary_key = primary_key;
+            k.payer = payer;
+            k.value = blob;
+        })?;
+        contract_table_incr(&mut db, t_id)?;
+        Ok(())
+    }
+
+    pub fn remove_key_value_object(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary_key: u64,
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let Some(t_id) = db
+            .find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&(code, scope, table))?
+            .map(|t| t.id().raw())
+        else {
+            return Ok(());
+        };
+        let found = db
+            .find_by::<ContractKeyValueRow, ContractKvByScopePrimary>(&(t_id, primary_key))?
+            .map(|k| k.id());
+        if let Some(id) = found {
+            db.remove::<ContractKeyValueRow>(id)?;
+            contract_table_decr(&mut db, t_id)?;
+        }
+        Ok(())
+    }
+
+    pub fn create_index64_object(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        payer: u64,
+        primary_key: u64,
+        secondary_key: u64,
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let t_id = contract_table_oid(&mut db, code, scope, table, payer)?;
+        db.create::<ContractIndex64Row>(|e| {
+            e.t_id = t_id;
+            e.primary_key = primary_key;
+            e.secondary_key = secondary_key;
+            e.payer = payer;
+        })?;
+        contract_table_incr(&mut db, t_id)?;
+        Ok(())
+    }
+
+    pub fn remove_index64_object(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary_key: u64,
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let Some(t_id) = db
+            .find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&(code, scope, table))?
+            .map(|t| t.id().raw())
+        else {
+            return Ok(());
+        };
+        let found = db
+            .find_by::<ContractIndex64Row, ContractIdx64ByPrimary>(&(t_id, primary_key))?
+            .map(|e| e.id());
+        if let Some(id) = found {
+            db.remove::<ContractIndex64Row>(id)?;
+            contract_table_decr(&mut db, t_id)?;
+        }
+        Ok(())
+    }
+
+    pub fn create_index128_object(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        payer: u64,
+        primary_key: u64,
+        secondary_key: u128,
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let t_id = contract_table_oid(&mut db, code, scope, table, payer)?;
+        db.create::<ContractIndex128Row>(|e| {
+            e.t_id = t_id;
+            e.primary_key = primary_key;
+            e.sec_lo = secondary_key as u64;
+            e.sec_hi = (secondary_key >> 64) as u64;
+            e.payer = payer;
+        })?;
+        contract_table_incr(&mut db, t_id)?;
+        Ok(())
+    }
+
+    pub fn remove_index128_object(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary_key: u64,
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let Some(t_id) = db
+            .find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&(code, scope, table))?
+            .map(|t| t.id().raw())
+        else {
+            return Ok(());
+        };
+        let found = db
+            .find_by::<ContractIndex128Row, ContractIdx128ByPrimary>(&(t_id, primary_key))?
+            .map(|e| e.id());
+        if let Some(id) = found {
+            db.remove::<ContractIndex128Row>(id)?;
+            contract_table_decr(&mut db, t_id)?;
+        }
+        Ok(())
+    }
+
+    pub fn create_index256_object(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        payer: u64,
+        primary_key: u64,
+        secondary_key: [u8; 32],
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let t_id = contract_table_oid(&mut db, code, scope, table, payer)?;
+        db.create::<ContractIndex256Row>(|e| {
+            e.t_id = t_id;
+            e.primary_key = primary_key;
+            e.secondary_key = secondary_key;
+            e.payer = payer;
+        })?;
+        contract_table_incr(&mut db, t_id)?;
+        Ok(())
+    }
+
+    pub fn remove_index256_object(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary_key: u64,
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let Some(t_id) = db
+            .find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&(code, scope, table))?
+            .map(|t| t.id().raw())
+        else {
+            return Ok(());
+        };
+        let found = db
+            .find_by::<ContractIndex256Row, ContractIdx256ByPrimary>(&(t_id, primary_key))?
+            .map(|e| e.id());
+        if let Some(id) = found {
+            db.remove::<ContractIndex256Row>(id)?;
+            contract_table_decr(&mut db, t_id)?;
+        }
+        Ok(())
+    }
+
+    /// `secondary_key` is the raw IEEE-754 bit pattern (the FFI carries the
+    /// softfloat `float64_t` as a `u64`); it is reinterpreted, not converted.
+    pub fn create_idx_double_object(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        payer: u64,
+        primary_key: u64,
+        secondary_key: u64,
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let t_id = contract_table_oid(&mut db, code, scope, table, payer)?;
+        db.create::<ContractIndexDoubleRow>(|e| {
+            e.t_id = t_id;
+            e.primary_key = primary_key;
+            e.secondary_key = f64::from_bits(secondary_key);
+            e.payer = payer;
+        })?;
+        contract_table_incr(&mut db, t_id)?;
+        Ok(())
+    }
+
+    pub fn remove_idx_double_object(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary_key: u64,
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let Some(t_id) = db
+            .find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&(code, scope, table))?
+            .map(|t| t.id().raw())
+        else {
+            return Ok(());
+        };
+        let found = db
+            .find_by::<ContractIndexDoubleRow, ContractIdxDoubleByPrimary>(&(t_id, primary_key))?
+            .map(|e| e.id());
+        if let Some(id) = found {
+            db.remove::<ContractIndexDoubleRow>(id)?;
+            contract_table_decr(&mut db, t_id)?;
+        }
+        Ok(())
+    }
+
+    /// `secondary` is the `float128_t` as its `(lo, hi)` `u64` words.
+    pub fn create_idx_long_double_object(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        payer: u64,
+        primary_key: u64,
+        secondary: (u64, u64),
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let t_id = contract_table_oid(&mut db, code, scope, table, payer)?;
+        db.create::<ContractIndexLongDoubleRow>(|e| {
+            e.t_id = t_id;
+            e.primary_key = primary_key;
+            e.sec_lo = secondary.0;
+            e.sec_hi = secondary.1;
+            e.payer = payer;
+        })?;
+        contract_table_incr(&mut db, t_id)?;
+        Ok(())
+    }
+
+    pub fn remove_idx_long_double_object(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary_key: u64,
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let Some(t_id) = db
+            .find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&(code, scope, table))?
+            .map(|t| t.id().raw())
+        else {
+            return Ok(());
+        };
+        let found = db
+            .find_by::<ContractIndexLongDoubleRow, ContractIdxLongDoubleByPrimary>(&(
+                t_id,
+                primary_key,
+            ))?
+            .map(|e| e.id());
+        if let Some(id) = found {
+            db.remove::<ContractIndexLongDoubleRow>(id)?;
+            contract_table_decr(&mut db, t_id)?;
+        }
         Ok(())
     }
 }

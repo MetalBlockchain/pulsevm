@@ -17,6 +17,61 @@ use crate::{
     iterator_cache::{Index256IteratorCache, KeyValueIteratorCache},
 };
 
+/// Copies a chainbase `digest_type` (sha256) into a fixed 32-byte array for the
+/// arena mirror. A digest that is not 32 bytes is zero-padded/truncated, which
+/// only degrades the mirror's fidelity, never chainbase.
+#[cfg(feature = "arena-shadow")]
+fn digest_to_array(digest: &CxxDigest) -> [u8; 32] {
+    let data = ffi::get_digest_data(digest);
+    let mut out = [0u8; 32];
+    let n = data.len().min(32);
+    out[..n].copy_from_slice(&data[..n]);
+    out
+}
+
+/// Serializes an [`Authority`] into the deterministic byte layout the arena
+/// mirror stores for `permission_object::auth` (a `shared_authority`). The exact
+/// encoding is private to the mirror; it only has to be stable so equal
+/// authorities hash equal.
+#[cfg(feature = "arena-shadow")]
+fn encode_authority(auth: &Authority) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&auth.threshold.to_le_bytes());
+    out.extend_from_slice(&(auth.keys.len() as u32).to_le_bytes());
+    for k in &auth.keys {
+        let bytes = match k.key.as_ref() {
+            Some(pk) => ffi::packed_public_key_bytes(pk),
+            None => Vec::new(),
+        };
+        out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(&bytes);
+        out.extend_from_slice(&k.weight.to_le_bytes());
+    }
+    out.extend_from_slice(&(auth.accounts.len() as u32).to_le_bytes());
+    for a in &auth.accounts {
+        out.extend_from_slice(&a.permission.actor.to_le_bytes());
+        out.extend_from_slice(&a.permission.permission.to_le_bytes());
+        out.extend_from_slice(&a.weight.to_le_bytes());
+    }
+    out.extend_from_slice(&(auth.waits.len() as u32).to_le_bytes());
+    for w in &auth.waits {
+        out.extend_from_slice(&w.wait_sec.to_le_bytes());
+        out.extend_from_slice(&w.weight.to_le_bytes());
+    }
+    out
+}
+
+/// The `(code, scope, table)` triple of a contract table, packed into `u64`s for
+/// the arena mirror, which keys its contract-table rows by this triple.
+#[cfg(feature = "arena-shadow")]
+fn table_key(table: &TableObject) -> (u64, u64, u64) {
+    (
+        table.get_code().to_uint64_t(),
+        table.get_scope().to_uint64_t(),
+        table.get_table().to_uint64_t(),
+    )
+}
+
 #[derive(Clone)]
 pub struct Database {
     inner: Arc<RwLock<UniquePtr<ffi::Database>>>,
@@ -155,14 +210,21 @@ impl Database {
         account_name: u64,
         creation_date: u32,
     ) -> Result<*const ffi::AccountObject, ChainError> {
-        let mut guard = self.inner.write()?;
-        let pinned = guard.pin_mut();
-
-        let acct_ref = pinned
-            .create_account(account_name, creation_date)
-            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
-
-        Ok(acct_ref as *const ffi::AccountObject)
+        let res = {
+            let mut guard = self.inner.write()?;
+            let pinned = guard.pin_mut();
+            pinned
+                .create_account(account_name, creation_date)
+                .map_err(|e| ChainError::InternalError(format!("{}", e)))?
+                as *const ffi::AccountObject
+        };
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && let Err(e) = s.create_account(account_name, creation_date)
+        {
+            eprintln!("arena mirror of account {account_name} diverged: {e:?}");
+        }
+        Ok(res)
     }
 
     pub fn find_account(&self, account_name: u64) -> Result<*const ffi::AccountObject, ChainError> {
@@ -229,12 +291,20 @@ impl Database {
     }
 
     pub fn set_privileged(&mut self, account: u64, is_privileged: bool) -> Result<(), ChainError> {
-        let mut guard = self.inner.write()?;
-        let pinned = guard.pin_mut();
-
-        pinned
-            .set_privileged(account, is_privileged)
-            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+        {
+            let mut guard = self.inner.write()?;
+            let pinned = guard.pin_mut();
+            pinned
+                .set_privileged(account, is_privileged)
+                .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        }
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && let Err(e) = s.set_privileged(account, is_privileged)
+        {
+            eprintln!("arena mirror of set_privileged {account} diverged: {e:?}");
+        }
+        Ok(())
     }
 
     pub fn get_account_metadata(
@@ -260,12 +330,22 @@ impl Database {
         &mut self,
         old_code_entry: &ffi::CodeObject,
     ) -> Result<(), ChainError> {
-        let mut guard = self.inner.write()?;
-        let pinned = guard.pin_mut();
-
-        pinned
-            .unlink_account_code(old_code_entry)
-            .map_err(|e| ChainError::ActionValidationError(format!("{}", e)))
+        #[cfg(feature = "arena-shadow")]
+        let hash = digest_to_array(old_code_entry.get_code_hash());
+        {
+            let mut guard = self.inner.write()?;
+            let pinned = guard.pin_mut();
+            pinned
+                .unlink_account_code(old_code_entry)
+                .map_err(|e| ChainError::ActionValidationError(format!("{}", e)))?;
+        }
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && let Err(e) = s.unlink_account_code(hash)
+        {
+            eprintln!("arena mirror of unlink_account_code diverged: {e:?}");
+        }
+        Ok(())
     }
 
     pub fn update_account_code(
@@ -278,20 +358,31 @@ impl Database {
         vm_type: u8,
         vm_version: u8,
     ) -> Result<(), ChainError> {
-        let mut guard = self.inner.write()?;
-        let pinned = guard.pin_mut();
-
-        pinned
-            .update_account_code(
-                account,
-                new_code,
-                head_block_num,
-                pending_block_time,
-                code_hash,
-                vm_type,
-                vm_version,
-            )
-            .map_err(|e| ChainError::ActionValidationError(format!("{}", e)))
+        {
+            let mut guard = self.inner.write()?;
+            let pinned = guard.pin_mut();
+            pinned
+                .update_account_code(
+                    account,
+                    new_code,
+                    head_block_num,
+                    pending_block_time,
+                    code_hash,
+                    vm_type,
+                    vm_version,
+                )
+                .map_err(|e| ChainError::ActionValidationError(format!("{}", e)))?;
+        }
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow {
+            let hash = digest_to_array(code_hash);
+            if let Err(e) =
+                s.update_account_code(new_code, hash, head_block_num, vm_type, vm_version)
+            {
+                eprintln!("arena mirror of update_account_code diverged: {e:?}");
+            }
+        }
+        Ok(())
     }
 
     pub fn update_account_abi(
@@ -541,12 +632,21 @@ impl Database {
         table: u64,
         payer: u64,
     ) -> Result<*const TableObject, ChainError> {
-        let mut guard = self.inner.write()?;
-        let pinned = guard.pin_mut();
-        let res = pinned
-            .create_table(code, scope, table, payer)
-            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
-        Ok(res as *const TableObject)
+        let res = {
+            let mut guard = self.inner.write()?;
+            let pinned = guard.pin_mut();
+            pinned
+                .create_table(code, scope, table, payer)
+                .map_err(|e| ChainError::InternalError(format!("{}", e)))?
+                as *const TableObject
+        };
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && let Err(e) = s.create_table(code, scope, table, payer)
+        {
+            eprintln!("arena mirror of create_table diverged: {e:?}");
+        }
+        Ok(res)
     }
 
     pub fn db_find_i64(
@@ -571,13 +671,23 @@ impl Database {
         id: u64,
         buffer: &[u8],
     ) -> Result<*const KeyValueObject, ChainError> {
-        let mut guard = self.inner.write()?;
-        let pinned = guard.pin_mut();
-
-        let res = pinned
-            .create_key_value_object(table, payer, id, buffer)
-            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
-        Ok(res as *const KeyValueObject)
+        #[cfg(feature = "arena-shadow")]
+        let key = table_key(table);
+        let res = {
+            let mut guard = self.inner.write()?;
+            let pinned = guard.pin_mut();
+            pinned
+                .create_key_value_object(table, payer, id, buffer)
+                .map_err(|e| ChainError::InternalError(format!("{}", e)))?
+                as *const KeyValueObject
+        };
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && let Err(e) = s.create_key_value_object(key.0, key.1, key.2, payer, id, buffer)
+        {
+            eprintln!("arena mirror of create_key_value_object diverged: {e:?}");
+        }
+        Ok(res)
     }
 
     pub fn create_index64_object(
@@ -587,13 +697,23 @@ impl Database {
         id: u64,
         secondary_key: u64,
     ) -> Result<*const Index64Object, ChainError> {
-        let mut guard = self.inner.write()?;
-        let pinned = guard.pin_mut();
-
-        let res = pinned
-            .create_index64_object(table, payer, id, secondary_key)
-            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
-        Ok(res as *const Index64Object)
+        #[cfg(feature = "arena-shadow")]
+        let key = table_key(table);
+        let res = {
+            let mut guard = self.inner.write()?;
+            let pinned = guard.pin_mut();
+            pinned
+                .create_index64_object(table, payer, id, secondary_key)
+                .map_err(|e| ChainError::InternalError(format!("{}", e)))?
+                as *const Index64Object
+        };
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && let Err(e) = s.create_index64_object(key.0, key.1, key.2, payer, id, secondary_key)
+        {
+            eprintln!("arena mirror of create_index64_object diverged: {e:?}");
+        }
+        Ok(res)
     }
 
     pub fn update_key_value_object(
@@ -625,12 +745,23 @@ impl Database {
     }
 
     pub fn remove_table(&mut self, table: &TableObject) -> Result<(), ChainError> {
-        let mut guard = self.inner.write()?;
-        let pinned = guard.pin_mut();
-
-        pinned
-            .remove_table(table)
-            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+        // Read the key before removal, while the object is still valid.
+        #[cfg(feature = "arena-shadow")]
+        let key = table_key(table);
+        {
+            let mut guard = self.inner.write()?;
+            let pinned = guard.pin_mut();
+            pinned
+                .remove_table(table)
+                .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        }
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && let Err(e) = s.remove_table(key.0, key.1, key.2)
+        {
+            eprintln!("arena mirror of remove_table diverged: {e:?}");
+        }
+        Ok(())
     }
 
     pub fn is_account(&self, account: u64) -> Result<bool, ChainError> {
@@ -685,12 +816,21 @@ impl Database {
     }
 
     pub fn delete_auth(&mut self, account: u64, permission_name: u64) -> Result<i64, ChainError> {
-        let mut guard = self.inner.write()?;
-        let pinned = guard.pin_mut();
-
-        pinned
-            .delete_auth(account, permission_name)
-            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+        let res = {
+            let mut guard = self.inner.write()?;
+            let pinned = guard.pin_mut();
+            pinned
+                .delete_auth(account, permission_name)
+                .map_err(|e| ChainError::InternalError(format!("{}", e)))?
+        };
+        // delete_auth removes the permission (and its usage row) in C++.
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && let Err(e) = s.remove_permission(account, permission_name)
+        {
+            eprintln!("arena mirror of delete_auth {account} diverged: {e:?}");
+        }
+        Ok(res)
     }
 
     pub fn link_auth(
@@ -700,12 +840,23 @@ impl Database {
         requirement_name: u64,
         requirement_type: u64,
     ) -> Result<i64, ChainError> {
-        let mut guard = self.inner.write()?;
-        let pinned = guard.pin_mut();
-
-        pinned
-            .link_auth(account_name, code_name, requirement_name, requirement_type)
-            .map_err(|e| ChainError::ActionValidationError(format!("{}", e)))
+        let res = {
+            let mut guard = self.inner.write()?;
+            let pinned = guard.pin_mut();
+            pinned
+                .link_auth(account_name, code_name, requirement_name, requirement_type)
+                .map_err(|e| ChainError::ActionValidationError(format!("{}", e)))?
+        };
+        // In C++ the link's message_type is the requirement_type and its
+        // required_permission is the requirement_name.
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && let Err(e) =
+                s.link_auth(account_name, code_name, requirement_type, requirement_name)
+        {
+            eprintln!("arena mirror of link_auth diverged: {e:?}");
+        }
+        Ok(res)
     }
 
     pub fn unlink_auth(
@@ -714,12 +865,20 @@ impl Database {
         code_name: u64,
         requirement_type: u64,
     ) -> Result<i64, ChainError> {
-        let mut guard = self.inner.write()?;
-        let pinned = guard.pin_mut();
-
-        pinned
-            .unlink_auth(account_name, code_name, requirement_type)
-            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+        let res = {
+            let mut guard = self.inner.write()?;
+            let pinned = guard.pin_mut();
+            pinned
+                .unlink_auth(account_name, code_name, requirement_type)
+                .map_err(|e| ChainError::InternalError(format!("{}", e)))?
+        };
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && let Err(e) = s.unlink_auth(account_name, code_name, requirement_type)
+        {
+            eprintln!("arena mirror of unlink_auth diverged: {e:?}");
+        }
+        Ok(res)
     }
 
     pub fn get_code_object_by_hash(
@@ -758,12 +917,20 @@ impl Database {
     }
 
     pub fn next_global_sequence(&mut self) -> Result<u64, ChainError> {
-        let mut guard = self.inner.write()?;
-        let pinned = guard.pin_mut();
-
-        pinned
-            .next_global_sequence()
-            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+        let res = {
+            let mut guard = self.inner.write()?;
+            let pinned = guard.pin_mut();
+            pinned
+                .next_global_sequence()
+                .map_err(|e| ChainError::InternalError(format!("{}", e)))?
+        };
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && let Err(e) = s.set_global_action_sequence(res)
+        {
+            eprintln!("arena mirror of next_global_sequence diverged: {e:?}");
+        }
+        Ok(res)
     }
 
     pub fn db_remove_i64(
@@ -772,12 +939,30 @@ impl Database {
         iterator: i32,
         receiver: u64,
     ) -> Result<i64, ChainError> {
-        let mut guard = self.inner.write()?;
-        let pinned = guard.pin_mut();
-
-        pinned
-            .db_remove_i64(keyval_cache.pin_mut(), iterator, receiver)
-            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+        // Resolve the row's (code, scope, table, primary) through the cache
+        // before it is deleted; a mirror-resolution error must never abort the
+        // authoritative removal, so it is swallowed to `None`.
+        #[cfg(feature = "arena-shadow")]
+        let mirror_key = self.shadow.as_ref().and_then(|_| {
+            let obj = keyval_cache.get(iterator).ok()?;
+            let tbl = keyval_cache.get_table(obj.get_table_id()).ok()?;
+            let (code, scope, table) = table_key(tbl);
+            Some((code, scope, table, obj.get_primary_key()))
+        });
+        let res = {
+            let mut guard = self.inner.write()?;
+            let pinned = guard.pin_mut();
+            pinned
+                .db_remove_i64(keyval_cache.pin_mut(), iterator, receiver)
+                .map_err(|e| ChainError::InternalError(format!("{}", e)))?
+        };
+        #[cfg(feature = "arena-shadow")]
+        if let (Some(s), Some((code, scope, table, primary))) = (&self.shadow, mirror_key)
+            && let Err(e) = s.remove_key_value_object(code, scope, table, primary)
+        {
+            eprintln!("arena mirror of db_remove_i64 diverged: {e:?}");
+        }
+        Ok(res)
     }
 
     pub fn db_idx64_remove(
@@ -786,12 +971,27 @@ impl Database {
         iterator: i32,
         receiver: u64,
     ) -> Result<(), ChainError> {
-        let mut guard = self.inner.write()?;
-        let pinned = guard.pin_mut();
-
-        pinned
-            .db_idx64_remove(keyval_cache.pin_mut(), iterator, receiver)
-            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+        #[cfg(feature = "arena-shadow")]
+        let mirror_key = self.shadow.as_ref().and_then(|_| {
+            let obj = keyval_cache.get(iterator).ok()?;
+            let tbl = keyval_cache.get_table(obj.get_table_id()).ok()?;
+            let (code, scope, table) = table_key(tbl);
+            Some((code, scope, table, obj.get_primary_key()))
+        });
+        {
+            let mut guard = self.inner.write()?;
+            let pinned = guard.pin_mut();
+            pinned
+                .db_idx64_remove(keyval_cache.pin_mut(), iterator, receiver)
+                .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        }
+        #[cfg(feature = "arena-shadow")]
+        if let (Some(s), Some((code, scope, table, primary))) = (&self.shadow, mirror_key)
+            && let Err(e) = s.remove_index64_object(code, scope, table, primary)
+        {
+            eprintln!("arena mirror of db_idx64_remove diverged: {e:?}");
+        }
+        Ok(())
     }
 
     pub fn db_idx64_find_secondary(
@@ -940,13 +1140,23 @@ impl Database {
         id: u64,
         secondary_key: u128,
     ) -> Result<*const Index128Object, ChainError> {
-        let mut guard = self.inner.write()?;
-        let pinned = guard.pin_mut();
-
-        let res = pinned
-            .create_index128_object(table, payer, id, secondary_key.into())
-            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
-        Ok(res as *const Index128Object)
+        #[cfg(feature = "arena-shadow")]
+        let key = table_key(table);
+        let res = {
+            let mut guard = self.inner.write()?;
+            let pinned = guard.pin_mut();
+            pinned
+                .create_index128_object(table, payer, id, secondary_key.into())
+                .map_err(|e| ChainError::InternalError(format!("{}", e)))?
+                as *const Index128Object
+        };
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && let Err(e) = s.create_index128_object(key.0, key.1, key.2, payer, id, secondary_key)
+        {
+            eprintln!("arena mirror of create_index128_object diverged: {e:?}");
+        }
+        Ok(res)
     }
 
     pub fn update_index128_object(
@@ -969,12 +1179,27 @@ impl Database {
         iterator: i32,
         receiver: u64,
     ) -> Result<(), ChainError> {
-        let mut guard = self.inner.write()?;
-        let pinned = guard.pin_mut();
-
-        pinned
-            .db_idx128_remove(keyval_cache.pin_mut(), iterator, receiver)
-            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+        #[cfg(feature = "arena-shadow")]
+        let mirror_key = self.shadow.as_ref().and_then(|_| {
+            let obj = keyval_cache.get(iterator).ok()?;
+            let tbl = keyval_cache.get_table(obj.get_table_id()).ok()?;
+            let (code, scope, table) = table_key(tbl);
+            Some((code, scope, table, obj.get_primary_key()))
+        });
+        {
+            let mut guard = self.inner.write()?;
+            let pinned = guard.pin_mut();
+            pinned
+                .db_idx128_remove(keyval_cache.pin_mut(), iterator, receiver)
+                .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        }
+        #[cfg(feature = "arena-shadow")]
+        if let (Some(s), Some((code, scope, table, primary))) = (&self.shadow, mirror_key)
+            && let Err(e) = s.remove_index128_object(code, scope, table, primary)
+        {
+            eprintln!("arena mirror of db_idx128_remove diverged: {e:?}");
+        }
+        Ok(())
     }
 
     pub fn db_idx128_find_secondary(
@@ -1132,13 +1357,25 @@ impl Database {
         id: u64,
         secondary_key: U256,
     ) -> Result<*const Index256Object, ChainError> {
-        let mut guard = self.inner.write()?;
-        let pinned = guard.pin_mut();
-
-        let res = pinned
-            .create_index256_object(table, payer, id, secondary_key)
-            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
-        Ok(res as *const Index256Object)
+        #[cfg(feature = "arena-shadow")]
+        let key = table_key(table);
+        #[cfg(feature = "arena-shadow")]
+        let sec_bytes = secondary_key.value;
+        let res = {
+            let mut guard = self.inner.write()?;
+            let pinned = guard.pin_mut();
+            pinned
+                .create_index256_object(table, payer, id, secondary_key)
+                .map_err(|e| ChainError::InternalError(format!("{}", e)))?
+                as *const Index256Object
+        };
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && let Err(e) = s.create_index256_object(key.0, key.1, key.2, payer, id, sec_bytes)
+        {
+            eprintln!("arena mirror of create_index256_object diverged: {e:?}");
+        }
+        Ok(res)
     }
 
     pub fn update_index256_object(
@@ -1161,12 +1398,27 @@ impl Database {
         iterator: i32,
         receiver: u64,
     ) -> Result<(), ChainError> {
-        let mut guard = self.inner.write()?;
-        let pinned = guard.pin_mut();
-
-        pinned
-            .db_idx256_remove(keyval_cache.pin_mut(), iterator, receiver)
-            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+        #[cfg(feature = "arena-shadow")]
+        let mirror_key = self.shadow.as_ref().and_then(|_| {
+            let obj = keyval_cache.get(iterator).ok()?;
+            let tbl = keyval_cache.get_table(obj.get_table_id()).ok()?;
+            let (code, scope, table) = table_key(tbl);
+            Some((code, scope, table, obj.get_primary_key()))
+        });
+        {
+            let mut guard = self.inner.write()?;
+            let pinned = guard.pin_mut();
+            pinned
+                .db_idx256_remove(keyval_cache.pin_mut(), iterator, receiver)
+                .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        }
+        #[cfg(feature = "arena-shadow")]
+        if let (Some(s), Some((code, scope, table, primary))) = (&self.shadow, mirror_key)
+            && let Err(e) = s.remove_index256_object(code, scope, table, primary)
+        {
+            eprintln!("arena mirror of db_idx256_remove diverged: {e:?}");
+        }
+        Ok(())
     }
 
     pub fn db_idx256_find_secondary(
@@ -1317,13 +1569,23 @@ impl Database {
         id: u64,
         secondary_key: u64,
     ) -> Result<*const IndexDoubleObject, ChainError> {
-        let mut guard = self.inner.write()?;
-        let pinned = guard.pin_mut();
-
-        let res = pinned
-            .create_idx_double_object(table, payer, id, secondary_key)
-            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
-        Ok(res as *const IndexDoubleObject)
+        #[cfg(feature = "arena-shadow")]
+        let key = table_key(table);
+        let res = {
+            let mut guard = self.inner.write()?;
+            let pinned = guard.pin_mut();
+            pinned
+                .create_idx_double_object(table, payer, id, secondary_key)
+                .map_err(|e| ChainError::InternalError(format!("{}", e)))?
+                as *const IndexDoubleObject
+        };
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && let Err(e) = s.create_idx_double_object(key.0, key.1, key.2, payer, id, secondary_key)
+        {
+            eprintln!("arena mirror of create_idx_double_object diverged: {e:?}");
+        }
+        Ok(res)
     }
 
     pub fn update_idx_double_object(
@@ -1346,12 +1608,27 @@ impl Database {
         iterator: i32,
         receiver: u64,
     ) -> Result<(), ChainError> {
-        let mut guard = self.inner.write()?;
-        let pinned = guard.pin_mut();
-
-        pinned
-            .db_idx_double_remove(keyval_cache.pin_mut(), iterator, receiver)
-            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+        #[cfg(feature = "arena-shadow")]
+        let mirror_key = self.shadow.as_ref().and_then(|_| {
+            let obj = keyval_cache.get(iterator).ok()?;
+            let tbl = keyval_cache.get_table(obj.get_table_id()).ok()?;
+            let (code, scope, table) = table_key(tbl);
+            Some((code, scope, table, obj.get_primary_key()))
+        });
+        {
+            let mut guard = self.inner.write()?;
+            let pinned = guard.pin_mut();
+            pinned
+                .db_idx_double_remove(keyval_cache.pin_mut(), iterator, receiver)
+                .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        }
+        #[cfg(feature = "arena-shadow")]
+        if let (Some(s), Some((code, scope, table, primary))) = (&self.shadow, mirror_key)
+            && let Err(e) = s.remove_idx_double_object(code, scope, table, primary)
+        {
+            eprintln!("arena mirror of db_idx_double_remove diverged: {e:?}");
+        }
+        Ok(())
     }
 
     pub fn db_idx_double_find_secondary(
@@ -1502,13 +1779,26 @@ impl Database {
         id: u64,
         secondary_key: Float128,
     ) -> Result<*const IndexLongDoubleObject, ChainError> {
-        let mut guard = self.inner.write()?;
-        let pinned = guard.pin_mut();
-
-        let res = pinned
-            .create_idx_long_double_object(table, payer, id, secondary_key)
-            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
-        Ok(res as *const IndexLongDoubleObject)
+        #[cfg(feature = "arena-shadow")]
+        let key = table_key(table);
+        #[cfg(feature = "arena-shadow")]
+        let (sec_lo, sec_hi) = (secondary_key.lo, secondary_key.hi);
+        let res = {
+            let mut guard = self.inner.write()?;
+            let pinned = guard.pin_mut();
+            pinned
+                .create_idx_long_double_object(table, payer, id, secondary_key)
+                .map_err(|e| ChainError::InternalError(format!("{}", e)))?
+                as *const IndexLongDoubleObject
+        };
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && let Err(e) =
+                s.create_idx_long_double_object(key.0, key.1, key.2, payer, id, (sec_lo, sec_hi))
+        {
+            eprintln!("arena mirror of create_idx_long_double_object diverged: {e:?}");
+        }
+        Ok(res)
     }
 
     pub fn update_idx_long_double_object(
@@ -1531,12 +1821,27 @@ impl Database {
         iterator: i32,
         receiver: u64,
     ) -> Result<(), ChainError> {
-        let mut guard = self.inner.write()?;
-        let pinned = guard.pin_mut();
-
-        pinned
-            .db_idx_long_double_remove(keyval_cache.pin_mut(), iterator, receiver)
-            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+        #[cfg(feature = "arena-shadow")]
+        let mirror_key = self.shadow.as_ref().and_then(|_| {
+            let obj = keyval_cache.get(iterator).ok()?;
+            let tbl = keyval_cache.get_table(obj.get_table_id()).ok()?;
+            let (code, scope, table) = table_key(tbl);
+            Some((code, scope, table, obj.get_primary_key()))
+        });
+        {
+            let mut guard = self.inner.write()?;
+            let pinned = guard.pin_mut();
+            pinned
+                .db_idx_long_double_remove(keyval_cache.pin_mut(), iterator, receiver)
+                .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        }
+        #[cfg(feature = "arena-shadow")]
+        if let (Some(s), Some((code, scope, table, primary))) = (&self.shadow, mirror_key)
+            && let Err(e) = s.remove_idx_long_double_object(code, scope, table, primary)
+        {
+            eprintln!("arena mirror of db_idx_long_double_remove diverged: {e:?}");
+        }
+        Ok(())
     }
 
     pub fn db_idx_long_double_find_secondary(
@@ -1759,12 +2064,26 @@ impl Database {
         &mut self,
         permission: &ffi::PermissionObject,
     ) -> Result<(), ChainError> {
-        let mut guard = self.inner.write()?;
-        let pinned = guard.pin_mut();
-
-        pinned
-            .remove_permission(permission)
-            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+        // Read the key before removal, while the object is still valid.
+        #[cfg(feature = "arena-shadow")]
+        let owner_perm = (
+            permission.get_owner().to_uint64_t(),
+            permission.get_name().to_uint64_t(),
+        );
+        {
+            let mut guard = self.inner.write()?;
+            let pinned = guard.pin_mut();
+            pinned
+                .remove_permission(permission)
+                .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        }
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && let Err(e) = s.remove_permission(owner_perm.0, owner_perm.1)
+        {
+            eprintln!("arena mirror of remove_permission diverged: {e:?}");
+        }
+        Ok(())
     }
 
     pub fn create_permission(
@@ -1775,14 +2094,28 @@ impl Database {
         auth: &Authority,
         creation_time: &TimePoint,
     ) -> Result<*const ffi::PermissionObject, ChainError> {
-        let mut guard = self.inner.write()?;
-        let pinned = guard.pin_mut();
-
-        let res = pinned
-            .create_permission(account, name, parent, auth, creation_time)
-            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
-
-        Ok(res as *const ffi::PermissionObject)
+        let res = {
+            let mut guard = self.inner.write()?;
+            let pinned = guard.pin_mut();
+            pinned
+                .create_permission(account, name, parent, auth, creation_time)
+                .map_err(|e| ChainError::InternalError(format!("{}", e)))?
+                as *const ffi::PermissionObject
+        };
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow {
+            let auth_bytes = encode_authority(auth);
+            if let Err(e) = s.create_permission(
+                parent as i64,
+                account,
+                name,
+                creation_time.elapsed.count,
+                &auth_bytes,
+            ) {
+                eprintln!("arena mirror of create_permission diverged: {e:?}");
+            }
+        }
+        Ok(res)
     }
 
     pub fn permission_satisfies_other_permission(
@@ -1805,25 +2138,40 @@ impl Database {
         authority: &Authority,
         pending_block_time: &TimePoint,
     ) -> Result<(), ChainError> {
-        let mut guard = self.inner.write()?;
-        // Resolve and modify under one write guard; the resolved pointer never
-        // escapes this method, so no shared reference is held across the mutation.
-        let perm = guard
-            .find_permission_by_actor_and_permission(actor, permission)
-            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
-        if perm.is_null() {
-            return Err(ChainError::InternalError(format!(
-                "permission not found for actor: {} permission: {}",
-                Name::new(actor),
-                Name::new(permission)
-            )));
-        }
-        let perm = unsafe { &*perm };
-        let pinned = guard.pin_mut();
+        {
+            let mut guard = self.inner.write()?;
+            // Resolve and modify under one write guard; the resolved pointer never
+            // escapes this method, so no shared reference is held across the mutation.
+            let perm = guard
+                .find_permission_by_actor_and_permission(actor, permission)
+                .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+            if perm.is_null() {
+                return Err(ChainError::InternalError(format!(
+                    "permission not found for actor: {} permission: {}",
+                    Name::new(actor),
+                    Name::new(permission)
+                )));
+            }
+            let perm = unsafe { &*perm };
+            let pinned = guard.pin_mut();
 
-        pinned
-            .modify_permission(perm, authority, pending_block_time)
-            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+            pinned
+                .modify_permission(perm, authority, pending_block_time)
+                .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        }
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow {
+            let auth_bytes = encode_authority(authority);
+            if let Err(e) = s.modify_permission(
+                actor,
+                permission,
+                &auth_bytes,
+                pending_block_time.elapsed.count,
+            ) {
+                eprintln!("arena mirror of modify_permission diverged: {e:?}");
+            }
+        }
+        Ok(())
     }
 
     pub fn update_permission_usage(
@@ -1832,25 +2180,35 @@ impl Database {
         permission: u64,
         pending_block_time: &TimePoint,
     ) -> Result<(), ChainError> {
-        let mut guard = self.inner.write()?;
-        // Resolve and modify under one write guard; the resolved pointer never
-        // escapes this method, so no shared reference is held across the mutation.
-        let perm = guard
-            .find_permission_by_actor_and_permission(actor, permission)
-            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
-        if perm.is_null() {
-            return Err(ChainError::InternalError(format!(
-                "permission not found for actor: {} permission: {}",
-                Name::new(actor),
-                Name::new(permission)
-            )));
-        }
-        let perm = unsafe { &*perm };
-        let pinned = guard.pin_mut();
+        {
+            let mut guard = self.inner.write()?;
+            // Resolve and modify under one write guard; the resolved pointer never
+            // escapes this method, so no shared reference is held across the mutation.
+            let perm = guard
+                .find_permission_by_actor_and_permission(actor, permission)
+                .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+            if perm.is_null() {
+                return Err(ChainError::InternalError(format!(
+                    "permission not found for actor: {} permission: {}",
+                    Name::new(actor),
+                    Name::new(permission)
+                )));
+            }
+            let perm = unsafe { &*perm };
+            let pinned = guard.pin_mut();
 
-        pinned
-            .update_permission_usage(perm, pending_block_time)
-            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+            pinned
+                .update_permission_usage(perm, pending_block_time)
+                .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        }
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && let Err(e) =
+                s.update_permission_usage(actor, permission, pending_block_time.elapsed.count)
+        {
+            eprintln!("arena mirror of update_permission_usage diverged: {e:?}");
+        }
+        Ok(())
     }
 
     pub fn get_permission_last_used(
@@ -1947,24 +2305,41 @@ impl Database {
         trx_id: &ffi::CxxDigest,
         expiration: u32,
     ) -> Result<(), ChainError> {
-        let mut guard = self.inner.write()?;
-        let pinned = guard.pin_mut();
-
-        pinned
-            .record_transaction(trx_id, expiration)
-            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+        {
+            let mut guard = self.inner.write()?;
+            let pinned = guard.pin_mut();
+            pinned
+                .record_transaction(trx_id, expiration)
+                .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        }
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow {
+            let id = digest_to_array(trx_id);
+            if let Err(e) = s.record_transaction(id, expiration) {
+                eprintln!("arena mirror of record_transaction diverged: {e:?}");
+            }
+        }
+        Ok(())
     }
 
     pub fn clear_expired_input_transactions(
         &mut self,
         cutoff: &TimePoint,
     ) -> Result<(), ChainError> {
-        let mut guard = self.inner.write()?;
-        let pinned = guard.pin_mut();
-
-        pinned
-            .clear_expired_input_transactions(cutoff)
-            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+        {
+            let mut guard = self.inner.write()?;
+            let pinned = guard.pin_mut();
+            pinned
+                .clear_expired_input_transactions(cutoff)
+                .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        }
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && let Err(e) = s.clear_expired_input_transactions(cutoff.elapsed.count)
+        {
+            eprintln!("arena mirror of clear_expired_input_transactions diverged: {e:?}");
+        }
+        Ok(())
     }
 
     pub fn get_currency_balance_with_symbol(
