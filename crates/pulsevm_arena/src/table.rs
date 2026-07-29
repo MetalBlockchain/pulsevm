@@ -545,6 +545,22 @@ impl<T: ArenaObject> Table<T> {
         self.dirty.clear();
         self.flushed_blob_len = self.blobs.len();
     }
+
+    /// Feeds this table's committed content into the state hasher: the live rows
+    /// in id order, then the blob arena. Order is deterministic, so equal state
+    /// yields an equal digest.
+    pub(crate) fn hash_state(&self, hasher: &mut sha2::Sha256) {
+        use sha2::Digest;
+        hasher.update((self.row_count as u64).to_le_bytes());
+        for (id, slot) in self.primary.iter().enumerate() {
+            if let Some(obj) = slot {
+                hasher.update((id as u64).to_le_bytes());
+                hasher.update(obj.as_bytes());
+            }
+        }
+        hasher.update((self.blobs.len() as u64).to_le_bytes());
+        hasher.update(&self.blobs);
+    }
 }
 
 fn read_u64(bytes: &[u8], pos: &mut usize) -> Result<u64, TableError> {

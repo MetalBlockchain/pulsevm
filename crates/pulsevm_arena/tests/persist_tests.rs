@@ -114,6 +114,33 @@ fn revision_survives_reload() {
 }
 
 #[test]
+fn state_root_is_stable_across_reload_and_sensitive_to_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let snap = dir.path().join("state");
+    let wal = dir.path().join("wal");
+
+    let mut db = new_db();
+    for i in 0..100 {
+        db.create::<Account>(|a| a.name = i).unwrap();
+    }
+    db.checkpoint(&snap).unwrap();
+    db.modify::<Account>(ObjectId::new(7), |a| a.value = 1).unwrap();
+    db.remove::<Account>(ObjectId::new(3)).unwrap();
+    db.flush_delta(&wal).unwrap();
+    let root = db.state_root();
+
+    // Reloading from disk reproduces the exact state root.
+    let mut r = new_db();
+    r.load(&snap).unwrap();
+    r.replay_log(&wal).unwrap();
+    assert_eq!(r.state_root(), root);
+
+    // Any change moves the root.
+    r.modify::<Account>(ObjectId::new(7), |a| a.value = 2).unwrap();
+    assert_ne!(r.state_root(), root);
+}
+
+#[test]
 fn torn_final_frame_is_ignored() {
     let dir = tempfile::tempdir().unwrap();
     let snap = dir.path().join("state");

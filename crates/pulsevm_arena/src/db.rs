@@ -96,6 +96,7 @@ trait AbstractTable: Send {
     fn pack_delta(&self, out: &mut Vec<u8>);
     fn apply_delta(&mut self, bytes: &[u8]) -> Result<(), TableError>;
     fn mark_flushed(&mut self);
+    fn hash_state(&self, hasher: &mut sha2::Sha256);
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
 }
@@ -148,6 +149,9 @@ impl<T: ArenaObject> AbstractTable for Table<T> {
     }
     fn mark_flushed(&mut self) {
         Table::mark_flushed(self)
+    }
+    fn hash_state(&self, hasher: &mut sha2::Sha256) {
+        Table::hash_state(self, hasher)
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -469,6 +473,26 @@ impl Db {
             pos = end;
         }
         Ok(())
+    }
+
+    /// A deterministic SHA-256 over all committed state — every table's live
+    /// rows (in id order) and blob arena, tables in `type_id` order. Equal state
+    /// gives an equal root, so it is the fingerprint a block-level differential
+    /// test compares after each block.
+    ///
+    /// This is canonical across reloads of this store. A cross-implementation
+    /// root (vs C++ chainbase) additionally needs blob refs resolved to their
+    /// bytes per object — a small extension once the object schemas are wired.
+    pub fn state_root(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut ordered: Vec<usize> = (0..self.tables.len()).collect();
+        ordered.sort_by_key(|&pos| self.tables[pos].type_id_num());
+        let mut hasher = Sha256::new();
+        for pos in ordered {
+            hasher.update(self.tables[pos].type_id_num().to_le_bytes());
+            self.tables[pos].hash_state(&mut hasher);
+        }
+        hasher.finalize().into()
     }
 
     /// Rows per table as `(count, type name)`, sorted like chainbase

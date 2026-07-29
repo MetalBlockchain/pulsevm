@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 zerocopy = { version = "0.8", features = ["derive"] }
 pulsevm_arena_derive = { path = "../pulsevm_arena_derive" }
+sha2 = "0.10"
 
 [dev-dependencies]
 zerocopy = { version = "0.8", features = ["derive"] }
