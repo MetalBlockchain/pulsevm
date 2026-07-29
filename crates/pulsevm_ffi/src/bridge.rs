@@ -350,6 +350,10 @@ pub mod ffi {
         pub fn get_account_cpu_usage_average_window(self: &Database) -> Result<u32>;
         pub fn get_account_net_usage_value_ex(self: &Database, account_name: u64) -> Result<u64>;
         pub fn get_account_cpu_usage_value_ex(self: &Database, account_name: u64) -> Result<u64>;
+        pub fn get_virtual_cpu_limit(self: &Database) -> Result<u64>;
+        pub fn get_virtual_net_limit(self: &Database) -> Result<u64>;
+        pub fn get_cpu_limit_parameters(self: &Database) -> Result<ElasticLimitParameters>;
+        pub fn get_net_limit_parameters(self: &Database) -> Result<ElasticLimitParameters>;
         pub fn set_account_limits(
             self: Pin<&mut Database>,
             account_name: u64,

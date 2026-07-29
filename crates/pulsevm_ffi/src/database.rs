@@ -43,6 +43,20 @@ fn digest_to_array(digest: &CxxDigest) -> [u8; 32] {
     out
 }
 
+/// Converts the FFI elastic-limit parameters into the plain form the arena
+/// mirror needs to run its own `update_elastic_limit`.
+#[cfg(feature = "arena-shadow")]
+fn to_elastic_params(p: &ElasticLimitParameters) -> crate::shadow::ElasticParams {
+    crate::shadow::ElasticParams {
+        target: p.target,
+        max: p.max,
+        periods: p.periods,
+        max_multiplier: p.max_multiplier,
+        contract: (p.contract_rate.numerator, p.contract_rate.denominator),
+        expand: (p.expand_rate.numerator, p.expand_rate.denominator),
+    }
+}
+
 /// Serializes an [`Authority`] into the deterministic byte layout the arena
 /// mirror stores for `permission_object::auth` (a `shared_authority`). The exact
 /// encoding is private to the mirror; it only has to be stable so equal
@@ -321,12 +335,33 @@ impl Database {
     }
 
     pub fn initialize_database(&mut self, genesis: &CxxGenesisState) -> Result<(), ChainError> {
-        let mut guard = self.inner.write()?;
-        let pinned = guard.pin_mut();
-
-        pinned
-            .initialize_database(genesis)
-            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+        {
+            let mut guard = self.inner.write()?;
+            let pinned = guard.pin_mut();
+            pinned
+                .initialize_database(genesis)
+                .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        }
+        // Genesis creates the resource_limits state singleton inside C++, out of
+        // reach of the per-write mirror hooks, so seed the mirror's copy here
+        // with the same slow-start virtual limits (each resource's max).
+        #[cfg(feature = "arena-shadow")]
+        if self.shadow.is_some() {
+            match (
+                self.get_cpu_limit_parameters(),
+                self.get_net_limit_parameters(),
+            ) {
+                (Ok(cpu), Ok(net)) => {
+                    if let Some(s) = &self.shadow
+                        && let Err(e) = s.initialize_resource_state(cpu.max, net.max)
+                    {
+                        eprintln!("arena mirror of resource state init diverged: {e:?}");
+                    }
+                }
+                _ => eprintln!("arena mirror could not read limit parameters at init"),
+            }
+        }
+        Ok(())
     }
 
     pub fn create_account(
@@ -627,11 +662,17 @@ impl Database {
                 return;
             }
         };
-        if let Some(s) = &self.shadow
-            && let Err(e) =
-                s.add_transaction_usage(account, cpu_usage, net_usage, time_slot, net_window, cpu_window)
-        {
-            eprintln!("arena mirror of add_transaction_usage diverged: {e:?}");
+        if let Some(s) = &self.shadow {
+            if let Err(e) = s.add_transaction_usage(
+                account, cpu_usage, net_usage, time_slot, net_window, cpu_window,
+            ) {
+                eprintln!("arena mirror of add_transaction_usage diverged: {e:?}");
+            }
+            // The same call also folds the usage into the block's pending totals
+            // on the state singleton (the block-accounting half in chainbase).
+            if let Err(e) = s.add_block_usage(cpu_usage, net_usage) {
+                eprintln!("arena mirror of block usage diverged: {e:?}");
+            }
         }
     }
 
@@ -727,6 +768,48 @@ impl Database {
         #[cfg(not(feature = "arena-shadow"))]
         {
             let _ = account_name;
+            None
+        }
+    }
+
+    pub fn get_virtual_cpu_limit(&self) -> Result<u64, ChainError> {
+        let guard = self.inner.read()?;
+        guard
+            .get_virtual_cpu_limit()
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
+    pub fn get_virtual_net_limit(&self) -> Result<u64, ChainError> {
+        let guard = self.inner.read()?;
+        guard
+            .get_virtual_net_limit()
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
+    pub fn get_cpu_limit_parameters(&self) -> Result<ElasticLimitParameters, ChainError> {
+        let guard = self.inner.read()?;
+        guard
+            .get_cpu_limit_parameters()
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
+    pub fn get_net_limit_parameters(&self) -> Result<ElasticLimitParameters, ChainError> {
+        let guard = self.inner.read()?;
+        guard
+            .get_net_limit_parameters()
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
+    /// Mirrored `(virtual_cpu_limit, virtual_net_limit)`, or `None` when
+    /// shadowing is off / the state row is absent — for diffing against
+    /// chainbase's `get_virtual_cpu_limit`/`get_virtual_net_limit`.
+    pub fn arena_virtual_limits(&self) -> Option<(u64, u64)> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow.as_ref().and_then(|s| s.state_virtual_limits())
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
             None
         }
     }
@@ -856,12 +939,31 @@ impl Database {
     }
 
     pub fn process_block_usage(&mut self, block_num: u32) -> Result<(), ChainError> {
-        let mut guard = self.inner.write()?;
-        let pinned = guard.pin_mut();
-
-        pinned
-            .process_block_usage(block_num)
-            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+        {
+            let mut guard = self.inner.write()?;
+            let pinned = guard.pin_mut();
+            pinned
+                .process_block_usage(block_num)
+                .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        }
+        #[cfg(feature = "arena-shadow")]
+        if self.shadow.is_some() {
+            match (
+                self.get_cpu_limit_parameters(),
+                self.get_net_limit_parameters(),
+            ) {
+                (Ok(cpu), Ok(net)) => {
+                    let (cpu, net) = (to_elastic_params(&cpu), to_elastic_params(&net));
+                    if let Some(s) = &self.shadow
+                        && let Err(e) = s.process_block_usage(block_num, cpu, net)
+                    {
+                        eprintln!("arena mirror of process_block_usage diverged: {e:?}");
+                    }
+                }
+                _ => eprintln!("arena mirror could not read limit parameters for block usage"),
+            }
+        }
+        Ok(())
     }
 
     pub fn find_table(

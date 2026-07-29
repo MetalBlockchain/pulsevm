@@ -1987,6 +1987,59 @@ mod tests {
         Ok(())
     }
 
+    /// Elastic virtual-limit oracle: process_block_usage recomputes the global
+    /// virtual cpu/net limits every block from the block's pending usage and the
+    /// windowed averages. After a block the mirrored virtual limits — produced by
+    /// the ported EMA plus update_elastic_limit, fed the same config parameters —
+    /// must equal chainbase's exactly.
+    #[cfg(feature = "arena-shadow")]
+    #[tokio::test]
+    async fn oracle_virtual_limits_mirror_chainbase() -> Result<(), ChainError> {
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
+        let private_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let mempool = Arc::new(RwLock::new(Mempool::new()));
+        let mut mempool = mempool.write().await;
+        let mut controller = Controller::new();
+        let genesis_bytes = generate_genesis(&private_key);
+        let temp_path = get_temp_dir();
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": private_key.to_string(),
+        })
+        .to_string()
+        .into_bytes();
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &genesis_bytes.to_vec(),
+            temp_path.path().to_str().unwrap(),
+        )?;
+        let chain_id = controller.chain_id().clone();
+
+        mempool.add_transaction(create_account(
+            &private_key,
+            Name::from_str("glenn")?,
+            chain_id,
+        )?);
+        let block = controller.build_block(&mut mempool).await?;
+        controller.accept_block(&block.id()?, &mut mempool)?;
+
+        let db = controller.database();
+        let chain = (db.get_virtual_cpu_limit()?, db.get_virtual_net_limit()?);
+        let arena = db
+            .arena_virtual_limits()
+            .expect("arena is missing the resource_limits state row");
+        assert_eq!(arena, chain, "mirrored virtual limits diverged from chainbase");
+        assert!(
+            chain.0 > 0 && chain.1 > 0,
+            "expected non-zero virtual limits after a block"
+        );
+        Ok(())
+    }
+
     /// Block-sequence fuzzer: random sequences of blocks — each with a few
     /// newaccount transactions, then either accepted or discarded — must keep
     /// the arena mirror in step with chainbase. After every block, for every

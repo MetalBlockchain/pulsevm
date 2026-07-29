@@ -337,6 +337,24 @@ void database_wrapper::set_block_parameters(const ElasticLimitParameters& cpu_li
     });
 }
 
+ElasticLimitParameters database_wrapper::get_cpu_limit_parameters() const {
+    const auto& p = this->get<resource_limits::resource_limits_config_object>().cpu_limit_parameters;
+    return ElasticLimitParameters{
+        p.target, p.max, p.periods, p.max_multiplier,
+        Ratio{ p.contract_rate.numerator, p.contract_rate.denominator },
+        Ratio{ p.expand_rate.numerator, p.expand_rate.denominator }
+    };
+}
+
+ElasticLimitParameters database_wrapper::get_net_limit_parameters() const {
+    const auto& p = this->get<resource_limits::resource_limits_config_object>().net_limit_parameters;
+    return ElasticLimitParameters{
+        p.target, p.max, p.periods, p.max_multiplier,
+        Ratio{ p.contract_rate.numerator, p.contract_rate.denominator },
+        Ratio{ p.expand_rate.numerator, p.expand_rate.denominator }
+    };
+}
+
 rust::Vec<uint8_t> database_wrapper::pack_deltas(bool full_snapshot) const {
     fc::datastream<size_t> ps;
     pulsevm::state_history::pack_deltas(ps, *this, full_snapshot);

@@ -163,6 +163,55 @@ impl ArenaObject for ResourceLimitsRow {
     }
 }
 
+/// Chainbase `elastic_limit_parameters` for one resource, as plain values pulled
+/// from config so the mirror can run `update_elastic_limit` itself.
+#[derive(Clone, Copy)]
+pub struct ElasticParams {
+    pub target: u64,
+    pub max: u64,
+    pub periods: u32,
+    pub max_multiplier: u32,
+    pub contract: (u64, u64),
+    pub expand: (u64, u64),
+}
+
+/// Port of chainbase `update_elastic_limit`: contract the limit when average
+/// usage is over target, expand it otherwise, then clamp to `[max, max *
+/// max_multiplier]`. The ratio multiply matches the C++ `value * ratio` (u64
+/// `(value * num) / den`); a u128 intermediate gives the same result in every
+/// non-overflowing case, which is the only case chainbase does not abort on.
+fn update_elastic_limit(current: u64, average: u64, p: &ElasticParams) -> u64 {
+    let (num, den) = if average > p.target {
+        p.contract
+    } else {
+        p.expand
+    };
+    let result = ((current as u128 * num as u128) / den as u128) as u64;
+    result.max(p.max).min(p.max * p.max_multiplier as u64)
+}
+
+/// Arena mirror of chainbase `resource_limits::resource_limits_state_object` — a
+/// singleton. `average_block_{net,cpu}_usage` are windowed accumulators; the
+/// virtual limits are the elastic rate-limit ceilings recomputed each block by
+/// `process_block_usage`. The total_* weights are only moved by
+/// `process_account_limit_updates` (which the mirror does not touch on the state
+/// object yet), so they stay at chainbase's genesis values in the default flow.
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout, ArenaObject)]
+#[arena(type_id = 18)]
+struct ResourceStateRow {
+    id: ObjectId<ResourceStateRow>,
+    average_block_net_usage: UsageAccumulator,
+    average_block_cpu_usage: UsageAccumulator,
+    pending_net_usage: u64,
+    pending_cpu_usage: u64,
+    total_net_weight: u64,
+    total_cpu_weight: u64,
+    total_ram_bytes: u64,
+    virtual_net_limit: u64,
+    virtual_cpu_limit: u64,
+}
+
 /// Arena mirror of chainbase `permission_object`. `auth` (a `shared_authority`)
 /// is variable-length, so it is encoded into the blob arena; the row holds the
 /// `BlobRef`. The three secondary indices reproduce chainbase's key ordering
@@ -839,6 +888,7 @@ impl ArenaShadow {
         db.add_table::<ContractIndexLongDoubleRow>()?;
         db.add_table::<ResourceUsageRow>()?;
         db.add_table::<ResourceLimitsRow>()?;
+        db.add_table::<ResourceStateRow>()?;
         Ok(ArenaShadow {
             inner: Arc::new(Mutex::new(db)),
         })
@@ -1262,6 +1312,86 @@ impl ArenaShadow {
             .ok()
             .flatten()
             .map(|r| (r.ram_bytes, r.net_weight, r.cpu_weight))
+    }
+
+    // ----- resource_limits_state (block usage + elastic virtual limits) -----
+
+    /// Mirrors the state singleton `initialize_database`/`initialize_resource_
+    /// limits` creates: virtual limits seeded to each resource's max (chainbase's
+    /// slow-start), everything else zero. Idempotent — a second call is ignored
+    /// so the genesis and direct-init paths cannot double-create the row.
+    pub fn initialize_resource_state(&self, cpu_max: u64, net_max: u64) -> Result<(), DbError> {
+        let mut db = self.lock();
+        if db.table::<ResourceStateRow>()?.iter().next().is_some() {
+            return Ok(());
+        }
+        db.create::<ResourceStateRow>(|s| {
+            s.virtual_cpu_limit = cpu_max;
+            s.virtual_net_limit = net_max;
+        })?;
+        Ok(())
+    }
+
+    /// Mirrors the block-accounting half of `add_transaction_usage`: adds the
+    /// billed units to the block's pending totals on the state singleton.
+    pub fn add_block_usage(&self, cpu_usage: u64, net_usage: u64) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let id = db
+            .table::<ResourceStateRow>()?
+            .iter()
+            .next()
+            .map(|s| s.id());
+        if let Some(id) = id {
+            db.modify::<ResourceStateRow>(id, |s| {
+                s.pending_cpu_usage += cpu_usage;
+                s.pending_net_usage += net_usage;
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Mirrors `process_block_usage`: folds the block's pending usage into the
+    /// windowed averages, recomputes the elastic virtual limits, and clears the
+    /// pending totals — matching chainbase step for step.
+    pub fn process_block_usage(
+        &self,
+        block_num: u32,
+        cpu: ElasticParams,
+        net: ElasticParams,
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let id = db
+            .table::<ResourceStateRow>()?
+            .iter()
+            .next()
+            .map(|s| s.id());
+        if let Some(id) = id {
+            db.modify::<ResourceStateRow>(id, |s| {
+                s.average_block_cpu_usage
+                    .add(s.pending_cpu_usage, block_num, cpu.periods);
+                s.virtual_cpu_limit =
+                    update_elastic_limit(s.virtual_cpu_limit, s.average_block_cpu_usage.average(), &cpu);
+                s.pending_cpu_usage = 0;
+
+                s.average_block_net_usage
+                    .add(s.pending_net_usage, block_num, net.periods);
+                s.virtual_net_limit =
+                    update_elastic_limit(s.virtual_net_limit, s.average_block_net_usage.average(), &net);
+                s.pending_net_usage = 0;
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Mirrored `(virtual_cpu_limit, virtual_net_limit)`, or `None` if the state
+    /// row is absent — for diffing against chainbase.
+    pub fn state_virtual_limits(&self) -> Option<(u64, u64)> {
+        self.lock()
+            .table::<ResourceStateRow>()
+            .ok()?
+            .iter()
+            .next()
+            .map(|s| (s.virtual_cpu_limit, s.virtual_net_limit))
     }
 
     /// Mirrors `add_pending_ram_usage`: applies the externally-computed byte
