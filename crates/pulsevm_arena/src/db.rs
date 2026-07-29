@@ -41,6 +41,42 @@ fn read_u16(bytes: &[u8], pos: &mut usize) -> Result<u16, DbError> {
     Ok(v)
 }
 
+fn read_i64(bytes: &[u8], pos: &mut usize) -> Result<i64, DbError> {
+    Ok(read_u64(bytes, pos)? as i64)
+}
+
+/// Reads a u64 without advancing, or `None` if fewer than 8 bytes remain.
+fn try_read_u64(bytes: &[u8], pos: usize) -> Option<u64> {
+    bytes
+        .get(pos..pos + 8)
+        .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+}
+
+/// Writes `bytes` to a temp file, fsyncs it, then renames it over `path`, so a
+/// crash never leaves a half-written file in place.
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), DbError> {
+    use std::io::Write;
+    let tmp = path.with_extension("tmp");
+    let mut f = std::fs::File::create(&tmp).map_err(|e| DbError::Io(e.to_string()))?;
+    f.write_all(bytes).map_err(|e| DbError::Io(e.to_string()))?;
+    f.sync_all().map_err(|e| DbError::Io(e.to_string()))?;
+    std::fs::rename(&tmp, path).map_err(|e| DbError::Io(e.to_string()))
+}
+
+/// Appends `[len][frame]` to the log and fsyncs.
+fn append_frame(path: &Path, frame: &[u8]) -> Result<(), DbError> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| DbError::Io(e.to_string()))?;
+    f.write_all(&(frame.len() as u64).to_le_bytes())
+        .map_err(|e| DbError::Io(e.to_string()))?;
+    f.write_all(frame).map_err(|e| DbError::Io(e.to_string()))?;
+    f.sync_all().map_err(|e| DbError::Io(e.to_string()))
+}
+
 /// Type-erased view of a `Table<T>` so the database can drive the shared
 /// revision/undo lifecycle across a heterogeneous set of tables.
 trait AbstractTable: Send {
@@ -57,6 +93,9 @@ trait AbstractTable: Send {
     fn type_name(&self) -> &'static str;
     fn pack_into(&self, out: &mut Vec<u8>);
     fn load_from(&mut self, bytes: &[u8]) -> Result<(), TableError>;
+    fn pack_delta(&self, out: &mut Vec<u8>);
+    fn apply_delta(&mut self, bytes: &[u8]) -> Result<(), TableError>;
+    fn mark_flushed(&mut self);
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
 }
@@ -100,6 +139,15 @@ impl<T: ArenaObject> AbstractTable for Table<T> {
     }
     fn load_from(&mut self, bytes: &[u8]) -> Result<(), TableError> {
         Table::load_from(self, bytes)
+    }
+    fn pack_delta(&self, out: &mut Vec<u8>) {
+        Table::pack_delta(self, out)
+    }
+    fn apply_delta(&mut self, bytes: &[u8]) -> Result<(), TableError> {
+        Table::apply_delta(self, bytes)
+    }
+    fn mark_flushed(&mut self) {
+        Table::mark_flushed(self)
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -277,15 +325,18 @@ impl Db {
 
     // ----- persistence ------------------------------------------------------
 
-    /// Writes a snapshot of committed state to `path`: every table's live rows
-    /// as raw bytes, tagged by `type_id`. Fast because objects are POD — the
-    /// per-row cost is a copy, not a serialization pass. The undo stack is not
-    /// part of a snapshot.
-    pub fn save(&self, path: impl AsRef<Path>) -> Result<(), DbError> {
+    /// Writes a full checkpoint of committed state to `path`: the revision plus
+    /// every table's live rows as raw bytes, tagged by `type_id`. Fast because
+    /// objects are POD — the per-row cost is a copy, not a serialization pass.
+    /// The write is atomic (temp file + fsync + rename) so a crash mid-write
+    /// leaves the previous checkpoint intact. Marks the tables flushed, so a
+    /// following [`Db::flush_delta`] only records changes made after this.
+    pub fn checkpoint(&mut self, path: impl AsRef<Path>) -> Result<(), DbError> {
         let mut ordered: Vec<usize> = (0..self.tables.len()).collect();
         ordered.sort_by_key(|&pos| self.tables[pos].type_id_num());
 
         let mut out = Vec::new();
+        out.extend_from_slice(&self.revision().to_le_bytes());
         out.extend_from_slice(&(ordered.len() as u64).to_le_bytes());
         for pos in ordered {
             let table = &self.tables[pos];
@@ -297,15 +348,25 @@ impl Db {
             let len = (out.len() - start) as u64;
             out[len_at..len_at + 8].copy_from_slice(&len.to_le_bytes());
         }
-        std::fs::write(path.as_ref(), &out).map_err(|e| DbError::Io(e.to_string()))
+        write_atomic(path.as_ref(), &out)?;
+        for table in &mut self.tables {
+            table.mark_flushed();
+        }
+        Ok(())
     }
 
-    /// Loads a snapshot written by [`Db::save`] into the already-registered
-    /// (empty) tables. Every section must map to a registered table and every
-    /// registered table must appear in the file.
+    /// Back-compat alias for [`Db::checkpoint`].
+    pub fn save(&mut self, path: impl AsRef<Path>) -> Result<(), DbError> {
+        self.checkpoint(path)
+    }
+
+    /// Loads a checkpoint written by [`Db::checkpoint`] into the already-
+    /// registered (empty) tables and restores the revision. Every section must
+    /// map to a registered table and every registered table must appear.
     pub fn load(&mut self, path: impl AsRef<Path>) -> Result<(), DbError> {
         let data = std::fs::read(path.as_ref()).map_err(|e| DbError::Io(e.to_string()))?;
         let mut pos = 0usize;
+        let revision = read_i64(&data, &mut pos)?;
         let count = read_u64(&data, &mut pos)? as usize;
         let mut seen = 0usize;
         for _ in 0..count {
@@ -314,9 +375,9 @@ impl Db {
             let end = pos
                 .checked_add(len)
                 .filter(|end| *end <= data.len())
-                .ok_or_else(|| DbError::Corrupted("section extends past snapshot".into()))?;
+                .ok_or_else(|| DbError::Corrupted("section extends past checkpoint".into()))?;
             let table_pos = *self.by_type_id.get(&type_id).ok_or_else(|| {
-                DbError::Corrupted(format!("snapshot has unregistered type_id {type_id}"))
+                DbError::Corrupted(format!("checkpoint has unregistered type_id {type_id}"))
             })?;
             self.tables[table_pos].load_from(&data[pos..end])?;
             pos = end;
@@ -324,8 +385,88 @@ impl Db {
         }
         if seen != self.tables.len() {
             return Err(DbError::Corrupted(
-                "snapshot is missing a registered table".into(),
+                "checkpoint is missing a registered table".into(),
             ));
+        }
+        self.set_revision(revision)?;
+        Ok(())
+    }
+
+    /// Appends the changes since the last flush/checkpoint to the write-ahead
+    /// log at `path` as one framed record (length-prefixed, so a torn final
+    /// frame from a crash is detectable), then fsyncs. Cost is O(rows changed),
+    /// not O(total state) — the chainbase dirty-page profile, in software.
+    pub fn flush_delta(&mut self, path: impl AsRef<Path>) -> Result<(), DbError> {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&self.revision().to_le_bytes());
+        frame.extend_from_slice(&(self.tables.len() as u64).to_le_bytes());
+        for table in &self.tables {
+            frame.extend_from_slice(&table.type_id_num().to_le_bytes());
+            let len_at = frame.len();
+            frame.extend_from_slice(&0u64.to_le_bytes());
+            let start = frame.len();
+            table.pack_delta(&mut frame);
+            let len = (frame.len() - start) as u64;
+            frame[len_at..len_at + 8].copy_from_slice(&len.to_le_bytes());
+        }
+        append_frame(path.as_ref(), &frame)?;
+        for table in &mut self.tables {
+            table.mark_flushed();
+        }
+        Ok(())
+    }
+
+    /// Replays every complete frame in the log at `path` onto the current state
+    /// (typically right after [`Db::load`]), restoring the revision. A trailing
+    /// partial frame — a crash during the last flush — is ignored.
+    pub fn replay_log(&mut self, path: impl AsRef<Path>) -> Result<(), DbError> {
+        let data = match std::fs::read(path.as_ref()) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(DbError::Io(e.to_string())),
+        };
+        let mut pos = 0usize;
+        let mut last_revision: Option<i64> = None;
+        while pos < data.len() {
+            let Some(frame_len) = try_read_u64(&data, pos) else {
+                break; // torn length prefix
+            };
+            let frame_start = pos + 8;
+            let frame_end = frame_start + frame_len as usize;
+            if frame_end > data.len() {
+                break; // torn frame; stop cleanly
+            }
+            let frame = &data[frame_start..frame_end];
+            self.apply_frame(frame)?;
+            let mut fp = 0usize;
+            last_revision = Some(read_i64(frame, &mut fp)?);
+            pos = frame_end;
+        }
+        if let Some(rev) = last_revision {
+            for table in &mut self.tables {
+                table.mark_flushed();
+            }
+            self.set_revision(rev)?;
+        }
+        Ok(())
+    }
+
+    fn apply_frame(&mut self, frame: &[u8]) -> Result<(), DbError> {
+        let mut pos = 0usize;
+        let _revision = read_i64(frame, &mut pos)?;
+        let count = read_u64(frame, &mut pos)? as usize;
+        for _ in 0..count {
+            let type_id = read_u16(frame, &mut pos)?;
+            let len = read_u64(frame, &mut pos)? as usize;
+            let end = pos
+                .checked_add(len)
+                .filter(|end| *end <= frame.len())
+                .ok_or_else(|| DbError::Corrupted("delta extends past frame".into()))?;
+            let table_pos = *self.by_type_id.get(&type_id).ok_or_else(|| {
+                DbError::Corrupted(format!("delta for unregistered type_id {type_id}"))
+            })?;
+            self.tables[table_pos].apply_delta(&frame[pos..end])?;
+            pos = end;
         }
         Ok(())
     }

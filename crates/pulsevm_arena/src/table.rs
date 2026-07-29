@@ -1,5 +1,5 @@
 use std::any::TypeId;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ops::Bound;
 
 use crate::object::{ArenaObject, BlobRef, IndexedBy, KeyIndex, ObjectId, SecondaryIndex};
@@ -51,6 +51,11 @@ pub struct Table<T: ArenaObject> {
     undo_stack: VecDeque<UndoState<T>>,
     row_count: usize,
     revision: i64,
+    /// Ids touched since the last incremental flush; drives the delta log so
+    /// persistence is O(changed), not O(total state).
+    dirty: BTreeSet<i64>,
+    /// Blob bytes already written to the log; the tail beyond this is new.
+    flushed_blob_len: usize,
 }
 
 impl<T: ArenaObject> Default for Table<T> {
@@ -80,6 +85,8 @@ impl<T: ArenaObject> Table<T> {
             undo_stack: VecDeque::new(),
             row_count: 0,
             revision: 0,
+            dirty: BTreeSet::new(),
+            flushed_blob_len: 0,
         }
     }
 
@@ -122,6 +129,7 @@ impl<T: ArenaObject> Table<T> {
         // A fresh id needs no undo record; `old_next_id` marks it as new.
         self.primary.push(Some(obj));
         self.row_count += 1;
+        self.dirty.insert(id);
         Ok(self.primary[id as usize].as_ref().unwrap())
     }
 
@@ -166,6 +174,7 @@ impl<T: ArenaObject> Table<T> {
         let slot = self.primary[raw as usize].as_mut().unwrap();
         let old = std::mem::replace(slot, updated);
         self.on_modify(raw, old);
+        self.dirty.insert(raw);
         Ok(())
     }
 
@@ -181,6 +190,7 @@ impl<T: ArenaObject> Table<T> {
                 id: raw,
             })?;
         self.row_count -= 1;
+        self.dirty.insert(raw);
         for index in &mut self.secondaries {
             index.erase(&obj);
         }
@@ -295,6 +305,7 @@ impl<T: ArenaObject> Table<T> {
         // Erase everything created during the session (ids >= old_next_id) and
         // drop those slots.
         for id in old_next_id as usize..self.primary.len() {
+            self.dirty.insert(id as i64);
             if let Some(obj) = &self.primary[id] {
                 for index in &mut self.secondaries {
                     index.erase(obj);
@@ -335,6 +346,7 @@ impl<T: ArenaObject> Table<T> {
             if was_absent {
                 self.row_count += 1;
             }
+            self.dirty.insert(id);
         }
 
         self.revision -= 1;
@@ -451,7 +463,87 @@ impl<T: ArenaObject> Table<T> {
         if pos != bytes.len() {
             return Err(TableError::Corrupted("trailing bytes in table snapshot"));
         }
+        self.flushed_blob_len = self.blobs.len();
         Ok(())
+    }
+
+    /// Encodes only the rows touched since the last flush (and the blob tail) —
+    /// the delta-log record that makes persistence O(changed). Each dirty id is
+    /// written as present (with bytes) or as a tombstone.
+    pub(crate) fn pack_delta(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&(self.primary.len() as u64).to_le_bytes());
+        out.extend_from_slice(&(self.dirty.len() as u64).to_le_bytes());
+        for &id in &self.dirty {
+            out.extend_from_slice(&(id as u64).to_le_bytes());
+            match self.primary.get(id as usize).and_then(|s| s.as_ref()) {
+                Some(obj) => {
+                    out.push(1);
+                    out.extend_from_slice(obj.as_bytes());
+                }
+                None => out.push(0),
+            }
+        }
+        let tail = &self.blobs[self.flushed_blob_len..];
+        out.extend_from_slice(&(tail.len() as u64).to_le_bytes());
+        out.extend_from_slice(tail);
+    }
+
+    /// Replays a delta produced by [`Table::pack_delta`] onto the current state.
+    pub(crate) fn apply_delta(&mut self, bytes: &[u8]) -> Result<(), TableError> {
+        let obj_size = std::mem::size_of::<T>();
+        let mut pos = 0usize;
+        let next_id = read_u64(bytes, &mut pos)? as usize;
+        if self.primary.len() < next_id {
+            self.primary.resize_with(next_id, || None);
+        }
+        let count = read_u64(bytes, &mut pos)?;
+        for _ in 0..count {
+            let id = read_u64(bytes, &mut pos)? as usize;
+            let tag = *bytes.get(pos).ok_or(TableError::Corrupted("delta truncated"))?;
+            pos += 1;
+            if let Some(old) = self.primary.get_mut(id).and_then(|s| s.take()) {
+                for index in &mut self.secondaries {
+                    index.erase(&old);
+                }
+                self.row_count -= 1;
+            }
+            if tag == 1 {
+                let end = pos
+                    .checked_add(obj_size)
+                    .filter(|end| *end <= bytes.len())
+                    .ok_or(TableError::Corrupted("delta row extends past record"))?;
+                let obj = T::read_from_bytes(&bytes[pos..end])
+                    .map_err(|_| TableError::Corrupted("delta row does not decode"))?;
+                pos = end;
+                if id >= self.primary.len() {
+                    return Err(TableError::Corrupted("delta row id out of range"));
+                }
+                for index in &mut self.secondaries {
+                    if !index.try_insert(&obj) {
+                        return Err(TableError::Corrupted("delta secondary key conflict"));
+                    }
+                }
+                self.primary[id] = Some(obj);
+                self.row_count += 1;
+            }
+        }
+        let blob_len = read_u64(bytes, &mut pos)? as usize;
+        let end = pos
+            .checked_add(blob_len)
+            .filter(|end| *end <= bytes.len())
+            .ok_or(TableError::Corrupted("delta blob extends past record"))?;
+        self.blobs.extend_from_slice(&bytes[pos..end]);
+        pos = end;
+        if pos != bytes.len() {
+            return Err(TableError::Corrupted("trailing bytes in delta"));
+        }
+        self.flushed_blob_len = self.blobs.len();
+        Ok(())
+    }
+
+    pub(crate) fn mark_flushed(&mut self) {
+        self.dirty.clear();
+        self.flushed_blob_len = self.blobs.len();
     }
 }
 

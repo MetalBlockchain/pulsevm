@@ -120,6 +120,21 @@ fn bench_persistence(c: &mut Criterion) {
             black_box(fresh.table::<Account>().unwrap().len());
         })
     });
+
+    // O(dirty): flush the WAL after touching 10 rows of the 100k-row DB. Cost
+    // tracks the change, not the total size — unlike the full checkpoint above.
+    let wal = dir.path().join("wal");
+    db.checkpoint(&path).unwrap();
+    let mut n = 0u64;
+    group.bench_function(BenchmarkId::new("flush_delta_after_10", rows), |b| {
+        b.iter(|| {
+            for i in 0..10u64 {
+                db.modify::<Account>(ObjectId::new(i as i64), |a| a.name = rows + n + i).unwrap();
+            }
+            n += 10;
+            db.flush_delta(&wal).unwrap();
+        })
+    });
     group.finish();
 }
 
