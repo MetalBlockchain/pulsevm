@@ -1,5 +1,6 @@
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
+use std::path::Path;
 
 use crate::object::{ArenaObject, IndexedBy};
 use crate::table::{Table, TableError};
@@ -10,6 +11,7 @@ pub enum DbError {
     NotRegistered { type_name: &'static str },
     TypeIdInUse { type_id: u16, type_name: &'static str },
     Corrupted(String),
+    Io(String),
     Table(TableError),
 }
 
@@ -17,6 +19,26 @@ impl From<TableError> for DbError {
     fn from(e: TableError) -> Self {
         DbError::Table(e)
     }
+}
+
+fn read_u64(bytes: &[u8], pos: &mut usize) -> Result<u64, DbError> {
+    let end = pos
+        .checked_add(8)
+        .filter(|end| *end <= bytes.len())
+        .ok_or_else(|| DbError::Corrupted("snapshot truncated".into()))?;
+    let v = u64::from_le_bytes(bytes[*pos..end].try_into().unwrap());
+    *pos = end;
+    Ok(v)
+}
+
+fn read_u16(bytes: &[u8], pos: &mut usize) -> Result<u16, DbError> {
+    let end = pos
+        .checked_add(2)
+        .filter(|end| *end <= bytes.len())
+        .ok_or_else(|| DbError::Corrupted("snapshot truncated".into()))?;
+    let v = u16::from_le_bytes(bytes[*pos..end].try_into().unwrap());
+    *pos = end;
+    Ok(v)
 }
 
 /// Type-erased view of a `Table<T>` so the database can drive the shared
@@ -31,7 +53,10 @@ trait AbstractTable: Send {
     fn undo_all(&mut self);
     fn undo_stack_revision_range(&self) -> (i64, i64);
     fn len(&self) -> usize;
+    fn type_id_num(&self) -> u16;
     fn type_name(&self) -> &'static str;
+    fn pack_into(&self, out: &mut Vec<u8>);
+    fn load_from(&mut self, bytes: &[u8]) -> Result<(), TableError>;
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
 }
@@ -64,8 +89,17 @@ impl<T: ArenaObject> AbstractTable for Table<T> {
     fn len(&self) -> usize {
         Table::len(self)
     }
+    fn type_id_num(&self) -> u16 {
+        T::TYPE_ID
+    }
     fn type_name(&self) -> &'static str {
         T::type_name()
+    }
+    fn pack_into(&self, out: &mut Vec<u8>) {
+        Table::pack_into(self, out)
+    }
+    fn load_from(&mut self, bytes: &[u8]) -> Result<(), TableError> {
+        Table::load_from(self, bytes)
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -228,6 +262,61 @@ impl Db {
         for table in &mut self.tables {
             table.undo_all();
         }
+    }
+
+    // ----- persistence ------------------------------------------------------
+
+    /// Writes a snapshot of committed state to `path`: every table's live rows
+    /// as raw bytes, tagged by `type_id`. Fast because objects are POD — the
+    /// per-row cost is a copy, not a serialization pass. The undo stack is not
+    /// part of a snapshot.
+    pub fn save(&self, path: impl AsRef<Path>) -> Result<(), DbError> {
+        let mut ordered: Vec<usize> = (0..self.tables.len()).collect();
+        ordered.sort_by_key(|&pos| self.tables[pos].type_id_num());
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&(ordered.len() as u64).to_le_bytes());
+        for pos in ordered {
+            let table = &self.tables[pos];
+            out.extend_from_slice(&table.type_id_num().to_le_bytes());
+            let len_at = out.len();
+            out.extend_from_slice(&0u64.to_le_bytes()); // section length placeholder
+            let start = out.len();
+            table.pack_into(&mut out);
+            let len = (out.len() - start) as u64;
+            out[len_at..len_at + 8].copy_from_slice(&len.to_le_bytes());
+        }
+        std::fs::write(path.as_ref(), &out).map_err(|e| DbError::Io(e.to_string()))
+    }
+
+    /// Loads a snapshot written by [`Db::save`] into the already-registered
+    /// (empty) tables. Every section must map to a registered table and every
+    /// registered table must appear in the file.
+    pub fn load(&mut self, path: impl AsRef<Path>) -> Result<(), DbError> {
+        let data = std::fs::read(path.as_ref()).map_err(|e| DbError::Io(e.to_string()))?;
+        let mut pos = 0usize;
+        let count = read_u64(&data, &mut pos)? as usize;
+        let mut seen = 0usize;
+        for _ in 0..count {
+            let type_id = read_u16(&data, &mut pos)?;
+            let len = read_u64(&data, &mut pos)? as usize;
+            let end = pos
+                .checked_add(len)
+                .filter(|end| *end <= data.len())
+                .ok_or_else(|| DbError::Corrupted("section extends past snapshot".into()))?;
+            let table_pos = *self.by_type_id.get(&type_id).ok_or_else(|| {
+                DbError::Corrupted(format!("snapshot has unregistered type_id {type_id}"))
+            })?;
+            self.tables[table_pos].load_from(&data[pos..end])?;
+            pos = end;
+            seen += 1;
+        }
+        if seen != self.tables.len() {
+            return Err(DbError::Corrupted(
+                "snapshot is missing a registered table".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Rows per table as `(count, type name)`, sorted like chainbase

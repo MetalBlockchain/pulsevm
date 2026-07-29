@@ -1,6 +1,7 @@
 use pulsevm_arena::{ArenaObject, IndexedBy, ObjectId, SecondaryIndex, Table, TableError, key_index};
 
-#[derive(Clone, Default, Debug, PartialEq)]
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout)]
 struct Account {
     id: ObjectId<Account>,
     name: u64,

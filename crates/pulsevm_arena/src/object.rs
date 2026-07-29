@@ -4,9 +4,16 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+
 /// Typed primary key of a stored object, the equivalent of chainbase `oid<T>`.
 /// Ids are assigned sequentially by the table in insertion order and are never
 /// reused unless the insertion that produced them is undone.
+///
+/// `repr(transparent)` over the raw id keeps it plain-old-data, so objects can
+/// hold it and still be dumped to the arena as raw bytes.
+#[repr(transparent)]
+#[derive(FromBytes, IntoBytes, Immutable, KnownLayout)]
 pub struct ObjectId<T: ?Sized> {
     raw: i64,
     _marker: PhantomData<fn() -> T>,
@@ -74,7 +81,9 @@ impl<T: ?Sized> From<i64> for ObjectId<T> {
 ///
 /// The engine core keeps `T` as an ordinary owned value in the arena; the POD
 /// layout required for mmap persistence is layered on later.
-pub trait ArenaObject: Clone + Default + Send + 'static {
+pub trait ArenaObject:
+    Copy + Default + Send + FromBytes + IntoBytes + Immutable + KnownLayout + 'static
+{
     /// Unique per-database table number (chainbase `object::type_id`).
     const TYPE_ID: u16;
 

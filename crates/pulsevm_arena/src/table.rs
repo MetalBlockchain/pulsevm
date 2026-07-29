@@ -15,6 +15,7 @@ pub enum TableError {
     },
     IdChanged { type_name: &'static str },
     Revision(&'static str),
+    Corrupted(&'static str),
 }
 
 /// One entry of the undo stack (chainbase `undo_index::undo_state`).
@@ -357,6 +358,69 @@ impl<T: ArenaObject> Table<T> {
             }
         }
     }
+
+    // ----- persistence ------------------------------------------------------
+
+    /// Appends `next_id`, the live-row count, then each live `(id, object)` as
+    /// raw bytes. No per-field encoding: the object is fixed-size POD, so its
+    /// bytes go out with a single copy. The undo stack is deliberately not
+    /// persisted — a snapshot is committed state.
+    pub(crate) fn pack_into(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&(self.primary.len() as u64).to_le_bytes());
+        out.extend_from_slice(&(self.row_count as u64).to_le_bytes());
+        for (id, slot) in self.primary.iter().enumerate() {
+            if let Some(obj) = slot {
+                out.extend_from_slice(&(id as u64).to_le_bytes());
+                out.extend_from_slice(obj.as_bytes());
+            }
+        }
+    }
+
+    /// Restores rows written by [`Table::pack_into`] into this freshly
+    /// registered (empty) table, rebuilding the secondary indices.
+    pub(crate) fn load_from(&mut self, bytes: &[u8]) -> Result<(), TableError> {
+        debug_assert!(self.primary.is_empty() && self.undo_stack.is_empty());
+        let obj_size = std::mem::size_of::<T>();
+        let mut pos = 0usize;
+        let next_id = read_u64(bytes, &mut pos)? as usize;
+        let live = read_u64(bytes, &mut pos)? as usize;
+
+        self.primary.resize_with(next_id, || None);
+        for _ in 0..live {
+            let id = read_u64(bytes, &mut pos)? as usize;
+            let end = pos
+                .checked_add(obj_size)
+                .filter(|end| *end <= bytes.len())
+                .ok_or(TableError::Corrupted("row extends past snapshot"))?;
+            let obj = T::read_from_bytes(&bytes[pos..end])
+                .map_err(|_| TableError::Corrupted("row bytes do not decode"))?;
+            pos = end;
+            if id >= next_id || self.primary[id].is_some() {
+                return Err(TableError::Corrupted("row id out of range or duplicated"));
+            }
+            for index in &mut self.secondaries {
+                if !index.try_insert(&obj) {
+                    return Err(TableError::Corrupted("duplicate secondary key in snapshot"));
+                }
+            }
+            self.primary[id] = Some(obj);
+            self.row_count += 1;
+        }
+        if pos != bytes.len() {
+            return Err(TableError::Corrupted("trailing bytes in table snapshot"));
+        }
+        Ok(())
+    }
+}
+
+fn read_u64(bytes: &[u8], pos: &mut usize) -> Result<u64, TableError> {
+    let end = pos
+        .checked_add(8)
+        .filter(|end| *end <= bytes.len())
+        .ok_or(TableError::Corrupted("snapshot truncated"))?;
+    let v = u64::from_le_bytes(bytes[*pos..end].try_into().unwrap());
+    *pos = end;
+    Ok(v)
 }
 
 /// Inserts an object into every secondary index, rolling back on a conflict so

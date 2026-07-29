@@ -1,6 +1,7 @@
 use pulsevm_arena::{ArenaObject, Db, DbError, IndexedBy, ObjectId, SecondaryIndex, key_index};
 
-#[derive(Clone, Default, Debug, PartialEq)]
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout)]
 struct Account {
     id: ObjectId<Account>,
     name: u64,
@@ -25,7 +26,8 @@ impl ArenaObject for Account {
     }
 }
 
-#[derive(Clone, Default, Debug, PartialEq)]
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout)]
 struct Resource {
     id: ObjectId<Resource>,
     owner: u64,
@@ -41,7 +43,7 @@ impl ArenaObject for Resource {
     }
 }
 
-fn db() -> Db {
+fn new_db() -> Db {
     let mut db = Db::new();
     db.add_table::<Account>().unwrap();
     db.add_table::<Resource>().unwrap();
@@ -50,7 +52,7 @@ fn db() -> Db {
 
 #[test]
 fn cross_table_operations() {
-    let mut db = db();
+    let mut db = new_db();
     let a = db.create::<Account>(|a| a.name = 5).unwrap().id;
     db.create::<Resource>(|r| {
         r.owner = 5;
@@ -79,7 +81,7 @@ fn unregistered_table_errors() {
 
 #[test]
 fn undo_session_spans_all_tables() {
-    let mut db = db();
+    let mut db = new_db();
     db.create::<Account>(|a| a.name = 1).unwrap();
     db.create::<Resource>(|r| r.owner = 1).unwrap();
 
@@ -99,7 +101,7 @@ fn undo_session_spans_all_tables() {
 
 #[test]
 fn shared_revision_and_commit() {
-    let mut db = db();
+    let mut db = new_db();
     assert_eq!(db.revision(), 0);
     db.start_undo_session();
     db.create::<Account>(|a| a.name = 1).unwrap();
@@ -117,6 +119,54 @@ fn shared_revision_and_commit() {
     db.undo(); // nothing left to revert
     assert_eq!(db.table::<Account>().unwrap().len(), 1);
     assert_eq!(db.table::<Resource>().unwrap().len(), 1);
+}
+
+#[test]
+fn snapshot_round_trips() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("snapshot.bin");
+
+    let mut db = new_db();
+    for i in 0..1000u64 {
+        db.create::<Account>(|a| a.name = i).unwrap();
+    }
+    db.create::<Resource>(|r| {
+        r.owner = 42;
+        r.ram = -7;
+    })
+    .unwrap();
+    // A tombstone in the middle must survive the round trip as an absent id.
+    db.remove::<Account>(ObjectId::new(500)).unwrap();
+    db.save(&path).unwrap();
+
+    let mut restored = new_db();
+    restored.load(&path).unwrap();
+    assert_eq!(restored.table::<Account>().unwrap().len(), 999);
+    assert!(restored.find::<Account>(ObjectId::new(500)).unwrap().is_none());
+    assert_eq!(restored.get::<Account>(ObjectId::new(499)).unwrap().name, 499);
+    // Secondary index was rebuilt.
+    assert_eq!(
+        restored.find_by::<Account, AccountByName>(&777).unwrap().unwrap().id.raw(),
+        777
+    );
+    assert_eq!(restored.get::<Resource>(ObjectId::new(0)).unwrap().ram, -7);
+    // Next id continues past the tombstone, not reusing 500 or 1000.
+    let next = restored.create::<Account>(|a| a.name = 9999).unwrap().id.raw();
+    assert_eq!(next, 1000);
+}
+
+#[test]
+fn load_rejects_unregistered_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("snapshot.bin");
+    let mut full = new_db();
+    full.create::<Account>(|a| a.name = 1).unwrap();
+    full.save(&path).unwrap();
+
+    let mut partial = Db::new();
+    partial.add_table::<Account>().unwrap();
+    let err = partial.load(&path).unwrap_err();
+    assert!(matches!(err, DbError::Corrupted(_)));
 }
 
 #[test]
