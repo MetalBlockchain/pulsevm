@@ -916,7 +916,7 @@ mod tests {
             asset::{Asset, Symbol},
             authority::PermissionLevel,
             abi::AbiDefinition,
-            pulse_contract::{NewAccount, SetAbi, SetCode},
+            pulse_contract::{NewAccount, SetAbi, SetCode, UpdateAuth},
             transaction::{Action, Transaction, TransactionHeader},
         },
         crypto::PrivateKey,
@@ -1060,6 +1060,41 @@ mod tests {
                 SetAbi {
                     account,
                     abi: Arc::new(abi_bytes.into()),
+                }
+                .pack()
+                .unwrap(),
+                vec![PermissionLevel::new(account.as_u64(), ACTIVE_NAME.as_u64())],
+            )],
+        )
+        .sign(&private_key, &chain_id)?;
+        let packed_trx = PackedTransaction::from_signed_transaction(trx)?;
+        Ok(packed_trx)
+    }
+
+    fn update_auth(
+        private_key: &PrivateKey,
+        account: Name,
+        permission: Name,
+        parent: Name,
+        threshold: u32,
+        chain_id: Id,
+    ) -> Result<PackedTransaction, ChainError> {
+        let trx = Transaction::new(
+            TransactionHeader::new(TimePointSec::maximum(), 0, 0, 0u32.into(), 0, 0u32.into()),
+            vec![],
+            vec![Action::new(
+                Name::from_str("pulse").unwrap(),
+                Name::from_str("updateauth").unwrap(),
+                UpdateAuth {
+                    account,
+                    permission,
+                    parent,
+                    auth: Authority::new(
+                        threshold,
+                        vec![KeyWeight::new(private_key.get_public_key().into(), 1)],
+                        vec![],
+                        vec![],
+                    ),
                 }
                 .pack()
                 .unwrap(),
@@ -1389,6 +1424,75 @@ mod tests {
             arena.auth_sequence >= 1,
             "authorizing the actions did not advance auth_sequence in the mirror"
         );
+        Ok(())
+    }
+
+    /// Permission oracle: updateauth creating a new named permission under an
+    /// existing account must mirror into the arena. The permission is keyed by
+    /// (owner, name) — no opaque handle — so the check is presence plus the
+    /// stored parent id (must equal chainbase's) and the authority threshold
+    /// (must equal what the action set, proving the auth blob round-trips).
+    #[cfg(feature = "arena-shadow")]
+    #[tokio::test]
+    async fn oracle_updateauth_mirrors_permission() -> Result<(), ChainError> {
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
+        let private_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let mempool = Arc::new(RwLock::new(Mempool::new()));
+        let mut mempool = mempool.write().await;
+        let mut controller = Controller::new();
+        let genesis_bytes = generate_genesis(&private_key);
+        let temp_path = get_temp_dir();
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": private_key.to_string(),
+        })
+        .to_string()
+        .into_bytes();
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &genesis_bytes.to_vec(),
+            temp_path.path().to_str().unwrap(),
+        )?;
+        let chain_id = controller.chain_id().clone();
+        let glenn = Name::from_str("glenn")?;
+        let perm = Name::from_str("claude")?;
+
+        mempool.add_transaction(create_account(&private_key, glenn, chain_id)?);
+        // A new "claude" permission parented on active. Threshold 1 with the one
+        // available key keeps the authority satisfiable (updateauth rejects an
+        // authority whose threshold exceeds its total key weight).
+        mempool.add_transaction(update_auth(
+            &private_key,
+            glenn,
+            perm,
+            ACTIVE_NAME,
+            1,
+            chain_id,
+        )?);
+        let block = controller.build_block(&mut mempool).await?;
+        controller.accept_block(&block.id()?, &mut mempool)?;
+
+        let db = controller.database();
+        let owner = glenn.as_u64();
+        let perm_u = perm.as_u64();
+        let ptr = db.find_permission_by_actor_and_permission(owner, perm_u)?;
+        assert!(!ptr.is_null(), "chainbase is missing the new permission");
+        // Safe: non-null, and no mutation happens before the accessor read.
+        let chain_perm = unsafe { &*ptr };
+        let (parent, threshold) = db
+            .arena_permission(owner, perm_u)
+            .expect("arena is missing the new permission");
+
+        assert_eq!(
+            parent,
+            chain_perm.get_parent_id(),
+            "mirrored permission parent id diverged from chainbase"
+        );
+        assert_eq!(threshold, 1, "mirrored authority threshold did not round-trip");
         Ok(())
     }
 

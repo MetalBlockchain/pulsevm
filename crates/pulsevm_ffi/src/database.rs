@@ -173,6 +173,23 @@ impl Database {
         }
     }
 
+    /// Permission snapshot `(parent id, authority threshold)` from the mirror, or
+    /// `None` when shadowing is off / the permission is absent — for diffing
+    /// against chainbase's `find_permission_by_actor_and_permission`.
+    pub fn arena_permission(&self, owner: u64, perm_name: u64) -> Option<(i64, u32)> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow
+                .as_ref()
+                .and_then(|s| s.permission(owner, perm_name))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = (owner, perm_name);
+            None
+        }
+    }
+
     /// Whether the arena mirror holds an account_object for `name` — for diffing
     /// against chainbase's `find_account`.
     pub fn arena_account_exists(&self, name: u64) -> bool {

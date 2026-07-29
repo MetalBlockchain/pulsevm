@@ -943,6 +943,21 @@ impl ArenaShadow {
         Ok(())
     }
 
+    /// Permission snapshot for diffing: `(parent id, authority threshold)`. The
+    /// threshold is the first field of the encoded `shared_authority` blob, so it
+    /// is read straight off the blob without decoding the whole authority.
+    pub fn permission(&self, owner: u64, perm_name: u64) -> Option<(i64, u32)> {
+        let db = self.lock();
+        let (parent, auth) = db
+            .find_by::<PermissionRow, PermByOwner>(&(owner, perm_name))
+            .ok()
+            .flatten()
+            .map(|p| (p.parent, p.auth))?;
+        let bytes = db.blob::<PermissionRow>(auth).ok()?;
+        let threshold = u32::from_le_bytes(bytes.get(0..4)?.try_into().ok()?);
+        Some((parent, threshold))
+    }
+
     /// Mirrors `remove_permission` (and the `delete_auth` path that calls it):
     /// removes the permission and its linked `permission_usage_object`.
     pub fn remove_permission(&self, owner: u64, perm_name: u64) -> Result<(), DbError> {
