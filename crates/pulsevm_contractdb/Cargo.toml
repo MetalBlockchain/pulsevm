@@ -8,3 +8,4 @@ pulsevm_arena = { path = "../pulsevm_arena" }
 zerocopy = { version = "0.8", features = ["derive"] }
 
 [dev-dependencies]
+proptest = "1"

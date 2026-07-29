@@ -148,6 +148,39 @@ impl ArenaObject for Index64Object {
     }
 }
 
+/// Per-account RAM usage. Held in the database (not a side map) so that a failed
+/// transaction's `undo` reverts the billing along with the rows — RAM usage is
+/// consensus state and must roll back exactly like everything else.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Default, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable,
+    zerocopy::KnownLayout,
+)]
+pub struct ResourceUsageObject {
+    id: ObjectId<ResourceUsageObject>,
+    account: u64,
+    ram_bytes: i64,
+}
+struct UsageByAccount;
+impl IndexedBy<ResourceUsageObject> for UsageByAccount {
+    type Key = u64;
+    fn key(o: &ResourceUsageObject) -> u64 {
+        o.account
+    }
+}
+impl ArenaObject for ResourceUsageObject {
+    const TYPE_ID: u16 = 3;
+    fn id(&self) -> ObjectId<Self> {
+        self.id
+    }
+    fn set_id(&mut self, id: ObjectId<Self>) {
+        self.id = id;
+    }
+    fn secondary_indices() -> Vec<Box<dyn SecondaryIndex<Self>>> {
+        vec![key_index::<Self, UsageByAccount>()]
+    }
+}
+
 /// Assigns stable iterator handles for one transaction, with EOS's encoding:
 /// real rows get non-negative handles; each table gets a negative end iterator
 /// `-(index + 2)`.
@@ -200,8 +233,6 @@ pub struct ContractDb {
     db: Db,
     cache: IteratorCache,
     idx64_cache: IteratorCache,
-    /// RAM bytes billed per account (chainbase bills the row payer on write).
-    ram: HashMap<u64, i64>,
 }
 
 impl Default for ContractDb {
@@ -216,11 +247,11 @@ impl ContractDb {
         db.add_table::<TableIdObject>().unwrap();
         db.add_table::<KeyValueObject>().unwrap();
         db.add_table::<Index64Object>().unwrap();
+        db.add_table::<ResourceUsageObject>().unwrap();
         ContractDb {
             db,
             cache: IteratorCache::default(),
             idx64_cache: IteratorCache::default(),
-            ram: HashMap::new(),
         }
     }
 
@@ -230,13 +261,87 @@ impl ContractDb {
         self.idx64_cache = IteratorCache::default();
     }
 
+    // ----- block/transaction lifecycle --------------------------------------
+
+    pub fn revision(&self) -> i64 {
+        self.db.revision()
+    }
+    /// Opens an undo session (a block or a transaction).
+    pub fn start_undo_session(&mut self) -> i64 {
+        self.db.start_undo_session()
+    }
+    /// Reverts the innermost session — a failed transaction, leaving no trace
+    /// (rows *and* RAM). Iterator handles are invalidated.
+    pub fn undo(&mut self) {
+        self.db.undo();
+        self.reset_iterators();
+    }
+    /// Folds the innermost session into the one below (a successful tx).
+    pub fn squash(&mut self) {
+        self.db.squash();
+    }
+    pub fn commit(&mut self, revision: i64) {
+        self.db.commit(revision);
+    }
+
+    /// A deterministic root over all contract state, including RAM.
+    pub fn state_root(&self) -> [u8; 32] {
+        self.db.state_root()
+    }
+
+    /// Canonical logical state for differential testing: the sorted primary
+    /// rows `(code, scope, table, primary, payer, value)` and the sorted
+    /// non-zero RAM `(account, bytes)`.
+    #[allow(clippy::type_complexity)]
+    pub fn dump(&self) -> (Vec<(u64, u64, u64, u64, u64, Vec<u8>)>, Vec<(u64, i64)>) {
+        let tid = self.db.table::<TableIdObject>().unwrap();
+        let mut names: HashMap<i64, (u64, u64, u64)> = HashMap::new();
+        for t in tid.iter() {
+            names.insert(t.id().raw(), (t.code, t.scope, t.table));
+        }
+        let mut rows = Vec::new();
+        for kv in self.db.table::<KeyValueObject>().unwrap().iter() {
+            let (code, scope, table) = names[&kv.t_id];
+            let value = self.db.blob::<KeyValueObject>(kv.value).unwrap().to_vec();
+            rows.push((code, scope, table, kv.primary_key, kv.payer, value));
+        }
+        rows.sort();
+        let mut ram = Vec::new();
+        for u in self.db.table::<ResourceUsageObject>().unwrap().iter() {
+            if u.ram_bytes != 0 {
+                ram.push((u.account, u.ram_bytes));
+            }
+        }
+        ram.sort();
+        (rows, ram)
+    }
+
     /// RAM bytes currently billed to `account`.
     pub fn ram_usage(&self, account: u64) -> i64 {
-        self.ram.get(&account).copied().unwrap_or(0)
+        self.db
+            .find_by::<ResourceUsageObject, UsageByAccount>(&account)
+            .unwrap()
+            .map(|u| u.ram_bytes)
+            .unwrap_or(0)
     }
 
     fn bill(&mut self, account: u64, delta: i64) {
-        *self.ram.entry(account).or_insert(0) += delta;
+        let existing = self
+            .db
+            .find_by::<ResourceUsageObject, UsageByAccount>(&account)
+            .unwrap()
+            .map(|u| u.id());
+        match existing {
+            Some(id) => self.db.modify::<ResourceUsageObject>(id, |u| u.ram_bytes += delta).unwrap(),
+            None => {
+                self.db
+                    .create::<ResourceUsageObject>(|u| {
+                        u.account = account;
+                        u.ram_bytes = delta;
+                    })
+                    .unwrap();
+            }
+        }
     }
 
     fn find_table(&self, code: u64, scope: u64, table: u64) -> Option<i64> {
