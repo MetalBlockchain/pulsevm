@@ -3385,6 +3385,7 @@ dependencies = [
  "hex",
  "jsonrpsee",
  "lru",
+ "proptest",
  "prost-types",
  "pulsevm_billable_size",
  "pulsevm_constants",

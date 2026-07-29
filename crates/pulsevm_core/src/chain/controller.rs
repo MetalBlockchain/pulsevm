@@ -1251,6 +1251,97 @@ mod tests {
         Ok(())
     }
 
+    /// Block-sequence fuzzer: random sequences of blocks — each with a few
+    /// newaccount transactions, then either accepted or discarded — must keep
+    /// the arena mirror in step with chainbase. After every block, for every
+    /// account name used so far, the arena and chainbase must agree on whether
+    /// it exists, and that must match the set committed by accepted blocks. This
+    /// stresses the session lockstep (speculative build/discard, accept/commit,
+    /// revision advancing across blocks) under random inputs — chainbase is the
+    /// C++ oracle.
+    #[cfg(feature = "arena-shadow")]
+    #[test]
+    fn fuzz_block_sequence_keeps_arena_in_sync() {
+        use std::collections::HashSet;
+
+        // A distinct, always-valid account name (6 lowercase letters) per index.
+        fn nth_name(i: usize) -> Name {
+            let mut s = String::from("z");
+            let mut n = i;
+            for _ in 0..5 {
+                s.push((b'a' + (n % 26) as u8) as char);
+                n /= 26;
+            }
+            Name::from_str(&s).unwrap()
+        }
+
+        proptest::proptest!(
+            proptest::prelude::ProptestConfig::with_cases(200),
+            |(specs in proptest::collection::vec((1usize..=2, proptest::prelude::any::<bool>()), 1..=5))| {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let chain_id = Id::from_str(
+                    "c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6",
+                )
+                .unwrap();
+                let private_key = PrivateKey::from_str(
+                    "PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez",
+                )?;
+                let mempool = Arc::new(RwLock::new(Mempool::new()));
+                let mut mempool = mempool.write().await;
+                let mut controller = Controller::new();
+                let genesis_bytes = generate_genesis(&private_key);
+                let temp_path = get_temp_dir();
+                let config_bytes = json!({
+                    "producer_name": "pulse",
+                    "producer_key": private_key.to_string(),
+                })
+                .to_string()
+                .into_bytes();
+                controller.initialize(
+                    &chain_id,
+                    &config_bytes,
+                    &genesis_bytes.to_vec(),
+                    temp_path.path().to_str().unwrap(),
+                )?;
+                let chain_id = controller.chain_id().clone();
+
+                let mut expected: HashSet<u64> = HashSet::new();
+                let mut used: Vec<u64> = Vec::new();
+                let mut counter = 0usize;
+
+                for (n, accept) in specs {
+                    let mut names = Vec::new();
+                    for _ in 0..n {
+                        let nm = nth_name(counter);
+                        counter += 1;
+                        mempool.add_transaction(create_account(&private_key, nm, chain_id)?);
+                        names.push(nm.as_u64());
+                        used.push(nm.as_u64());
+                    }
+                    let block = controller.build_block(&mut mempool).await?;
+                    if accept {
+                        controller.accept_block(&block.id()?, &mut mempool)?;
+                        controller.set_preferred_id(block.id()?);
+                        expected.extend(names.iter().copied());
+                    }
+                    // After each block, arena and chainbase must agree, and match
+                    // the committed set.
+                    let db = controller.database();
+                    for &u in &used {
+                        let want = expected.contains(&u);
+                        let in_chain = !db.find_account_metadata(u)?.is_null();
+                        let in_arena = db.arena_account_metadata_privileged(u).is_some();
+                        assert_eq!(in_chain, want, "chainbase disagrees with the committed set");
+                        assert_eq!(in_arena, in_chain, "arena diverged from chainbase");
+                    }
+                }
+                Ok::<(), ChainError>(())
+            })
+            .unwrap();
+        });
+    }
+
     #[tokio::test]
     async fn test_initialize() -> Result<(), ChainError> {
         let chain_id =
