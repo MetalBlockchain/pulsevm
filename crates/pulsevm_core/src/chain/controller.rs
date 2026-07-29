@@ -916,7 +916,9 @@ mod tests {
             asset::{Asset, Symbol},
             authority::PermissionLevel,
             abi::AbiDefinition,
-            pulse_contract::{LinkAuth, NewAccount, SetAbi, SetCode, UpdateAuth},
+            pulse_contract::{
+                DeleteAuth, LinkAuth, NewAccount, SetAbi, SetCode, UnlinkAuth, UpdateAuth,
+            },
             transaction::{Action, Transaction, TransactionHeader},
         },
         crypto::PrivateKey,
@@ -1125,6 +1127,60 @@ mod tests {
                     code,
                     message_type,
                     requirement,
+                }
+                .pack()
+                .unwrap(),
+                vec![PermissionLevel::new(account.as_u64(), ACTIVE_NAME.as_u64())],
+            )],
+        )
+        .sign(&private_key, &chain_id)?;
+        let packed_trx = PackedTransaction::from_signed_transaction(trx)?;
+        Ok(packed_trx)
+    }
+
+    fn unlink_auth(
+        private_key: &PrivateKey,
+        account: Name,
+        code: Name,
+        message_type: Name,
+        chain_id: Id,
+    ) -> Result<PackedTransaction, ChainError> {
+        let trx = Transaction::new(
+            TransactionHeader::new(TimePointSec::maximum(), 0, 0, 0u32.into(), 0, 0u32.into()),
+            vec![],
+            vec![Action::new(
+                Name::from_str("pulse").unwrap(),
+                Name::from_str("unlinkauth").unwrap(),
+                UnlinkAuth {
+                    account,
+                    code,
+                    message_type,
+                }
+                .pack()
+                .unwrap(),
+                vec![PermissionLevel::new(account.as_u64(), ACTIVE_NAME.as_u64())],
+            )],
+        )
+        .sign(&private_key, &chain_id)?;
+        let packed_trx = PackedTransaction::from_signed_transaction(trx)?;
+        Ok(packed_trx)
+    }
+
+    fn delete_auth(
+        private_key: &PrivateKey,
+        account: Name,
+        permission: Name,
+        chain_id: Id,
+    ) -> Result<PackedTransaction, ChainError> {
+        let trx = Transaction::new(
+            TransactionHeader::new(TimePointSec::maximum(), 0, 0, 0u32.into(), 0, 0u32.into()),
+            vec![],
+            vec![Action::new(
+                Name::from_str("pulse").unwrap(),
+                Name::from_str("deleteauth").unwrap(),
+                DeleteAuth {
+                    account,
+                    permission,
                 }
                 .pack()
                 .unwrap(),
@@ -1598,6 +1654,87 @@ mod tests {
             "mirrored permission link required_permission diverged from chainbase"
         );
         assert_eq!(required, perm.as_u64(), "link did not point at the new permission");
+        Ok(())
+    }
+
+    /// Removal oracle: unlinkauth then deleteauth must drop the mirrored rows in
+    /// step with chainbase. A permission cannot be deleted while a link points at
+    /// it, so the link is removed first. Afterwards both the link and the
+    /// permission must be absent on both sides.
+    #[cfg(feature = "arena-shadow")]
+    #[tokio::test]
+    async fn oracle_unlink_and_delete_auth_remove_from_arena() -> Result<(), ChainError> {
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
+        let private_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let mempool = Arc::new(RwLock::new(Mempool::new()));
+        let mut mempool = mempool.write().await;
+        let mut controller = Controller::new();
+        let genesis_bytes = generate_genesis(&private_key);
+        let temp_path = get_temp_dir();
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": private_key.to_string(),
+        })
+        .to_string()
+        .into_bytes();
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &genesis_bytes.to_vec(),
+            temp_path.path().to_str().unwrap(),
+        )?;
+        let chain_id = controller.chain_id().clone();
+        let glenn = Name::from_str("glenn")?;
+        let perm = Name::from_str("claude")?;
+        let msg_type = Name::from_str("transfer")?;
+
+        mempool.add_transaction(create_account(&private_key, glenn, chain_id)?);
+        mempool.add_transaction(update_auth(
+            &private_key,
+            glenn,
+            perm,
+            ACTIVE_NAME,
+            1,
+            chain_id,
+        )?);
+        mempool.add_transaction(link_auth(
+            &private_key,
+            glenn,
+            glenn,
+            msg_type,
+            perm,
+            chain_id,
+        )?);
+        mempool.add_transaction(unlink_auth(&private_key, glenn, glenn, msg_type, chain_id)?);
+        mempool.add_transaction(delete_auth(&private_key, glenn, perm, chain_id)?);
+        let block = controller.build_block(&mut mempool).await?;
+        controller.accept_block(&block.id()?, &mut mempool)?;
+
+        let db = controller.database();
+        let (account, code, mtype) = (glenn.as_u64(), glenn.as_u64(), msg_type.as_u64());
+
+        assert!(
+            db.find_permission_link(account, code, mtype)?.is_null(),
+            "chainbase kept the unlinked permission link"
+        );
+        assert_eq!(
+            db.arena_permission_link(account, code, mtype),
+            None,
+            "arena kept the unlinked permission link"
+        );
+        assert!(
+            db.find_permission_by_actor_and_permission(account, perm.as_u64())?
+                .is_null(),
+            "chainbase kept the deleted permission"
+        );
+        assert_eq!(
+            db.arena_permission(account, perm.as_u64()),
+            None,
+            "arena kept the deleted permission"
+        );
         Ok(())
     }
 
