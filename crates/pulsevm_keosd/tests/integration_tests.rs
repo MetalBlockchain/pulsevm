@@ -11,9 +11,9 @@ mod key_tests {
     #[test]
     fn generate_keypair_returns_valid_formats() {
         let (wif, pubkey) = keys::generate_keypair().unwrap();
-        // WIF keys for uncompressed start with '5', compressed with 'K' or 'L'
+        // Private keys use the modern EOSIO `PVT_K1_` format.
         assert!(
-            wif.starts_with('5') || wif.starts_with('K') || wif.starts_with('L'),
+            wif.starts_with("PVT_K1_"),
             "WIF key has unexpected prefix: {}",
             wif
         );
@@ -43,15 +43,12 @@ mod key_tests {
         let sk = keys::wif_to_private_key(&wif).unwrap();
         let digest = [0xab_u8; 32];
         let sig = keys::sign_digest(&sk, &digest).unwrap();
-        // ECDSA signature is 64 bytes = 128 hex chars
-        assert_eq!(
-            sig.len(),
-            128,
-            "Signature hex should be 128 chars, got {}",
-            sig.len()
+        // Signatures use the EOSIO `SIG_K1_` string format.
+        assert!(
+            sig.starts_with("SIG_K1_"),
+            "Signature has unexpected prefix: {}",
+            sig
         );
-        // Should be valid hex
-        assert!(hex::decode(&sig).is_ok());
     }
 
     #[test]
@@ -269,7 +266,7 @@ mod wallet_tests {
         let digest = [0xde_u8; 32];
         let sig = wallet.try_sign_digest(&digest, &pub_key).unwrap();
         assert!(sig.is_some());
-        assert_eq!(sig.unwrap().len(), 128); // 64 bytes = 128 hex
+        assert!(sig.unwrap().starts_with("SIG_K1_"));
     }
 
     #[test]
@@ -530,7 +527,7 @@ mod manager_tests {
         let sigs = mgr.sign_digest(&digest, &[pub_key.clone()]).unwrap();
         assert_eq!(sigs.len(), 1);
         assert!(sigs.contains_key(&pub_key));
-        assert_eq!(sigs[&pub_key].len(), 128); // 64 bytes hex
+        assert!(sigs[&pub_key].starts_with("SIG_K1_"));
     }
 
     #[test]
@@ -1004,8 +1001,7 @@ mod api_tests {
         assert_eq!(resp.status(), StatusCode::OK);
 
         let sig: String = test::read_body_json(resp).await;
-        assert_eq!(sig.len(), 128);
-        assert!(hex::decode(&sig).is_ok());
+        assert!(sig.starts_with("SIG_K1_"), "unexpected signature: {}", sig);
     }
 
     #[actix_rt::test]
@@ -1052,6 +1048,8 @@ mod api_tests {
             "expiration": "2025-01-01T00:00:00",
             "ref_block_num": 0,
             "ref_block_prefix": 0,
+            "max_net_usage_words": 0,
+            "max_cpu_usage_ms": 0,
             "actions": []
         });
         let req = test::TestRequest::post()
