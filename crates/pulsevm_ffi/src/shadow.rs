@@ -1606,6 +1606,16 @@ impl ArenaShadow {
         Ok(())
     }
 
+    /// Whether the mirror holds a dedupe row for `trx_id` — for diffing against
+    /// chainbase's `is_known_unexpired_transaction`.
+    pub fn transaction_exists(&self, trx_id: [u8; 32]) -> bool {
+        self.lock()
+            .find_by::<TransactionRow, TxByTrxId>(&trx_id)
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
     /// Mirrors `clear_expired_input_transactions`: drops every row whose
     /// expiration falls strictly before `cutoff` (both in microseconds, as the
     /// C++ compares `cutoff > expiration.to_time_point()`). Expirations are whole

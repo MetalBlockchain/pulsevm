@@ -2040,6 +2040,192 @@ mod tests {
         Ok(())
     }
 
+    /// Transaction-dedupe oracle: applying a transaction records it in the
+    /// per-block dedupe set (transaction_object). After the block the mirror must
+    /// agree with chainbase's is_known_unexpired_transaction — present for the
+    /// applied trx id, absent for an unrelated one.
+    #[cfg(feature = "arena-shadow")]
+    #[tokio::test]
+    async fn oracle_transaction_dedupe_mirrors() -> Result<(), ChainError> {
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
+        let private_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let mempool = Arc::new(RwLock::new(Mempool::new()));
+        let mut mempool = mempool.write().await;
+        let mut controller = Controller::new();
+        let genesis_bytes = generate_genesis(&private_key);
+        let temp_path = get_temp_dir();
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": private_key.to_string(),
+        })
+        .to_string()
+        .into_bytes();
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &genesis_bytes.to_vec(),
+            temp_path.path().to_str().unwrap(),
+        )?;
+        let chain_id = controller.chain_id().clone();
+
+        let tx = create_account(&private_key, Name::from_str("glenn")?, chain_id)?;
+        let trx_digest = tx.id().to_digest()?;
+        mempool.add_transaction(tx);
+        let block = controller.build_block(&mut mempool).await?;
+        controller.accept_block(&block.id()?, &mut mempool)?;
+
+        let db = controller.database();
+        assert!(
+            db.is_known_unexpired_transaction(&trx_digest)?,
+            "chainbase is missing the dedupe record"
+        );
+        assert!(
+            db.arena_transaction_exists(&trx_digest),
+            "arena is missing the dedupe record"
+        );
+        // Negative control: an unrelated id is absent on both sides.
+        let unknown = Id::default().to_digest()?;
+        assert!(!db.is_known_unexpired_transaction(&unknown)?);
+        assert!(!db.arena_transaction_exists(&unknown));
+        Ok(())
+    }
+
+    /// Full-state cross-check: one block exercising the whole write surface
+    /// (newaccount, setcode, setabi, updateauth, linkauth) must leave every
+    /// mirrored table agreeing with chainbase at once — not just table by table
+    /// in isolation. This is the closest thing to a full-state diff over the
+    /// surface the FFI exposes reads for, and it guards against cross-table
+    /// interactions the per-table oracles miss.
+    #[cfg(feature = "arena-shadow")]
+    #[tokio::test]
+    async fn oracle_full_state_cross_check() -> Result<(), ChainError> {
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
+        let private_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let mempool = Arc::new(RwLock::new(Mempool::new()));
+        let mut mempool = mempool.write().await;
+        let mut controller = Controller::new();
+        let genesis_bytes = generate_genesis(&private_key);
+        let temp_path = get_temp_dir();
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": private_key.to_string(),
+        })
+        .to_string()
+        .into_bytes();
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &genesis_bytes.to_vec(),
+            temp_path.path().to_str().unwrap(),
+        )?;
+        let chain_id = controller.chain_id().clone();
+        let glenn = Name::from_str("glenn")?;
+        let perm = Name::from_str("claude")?;
+        let msg_type = Name::from_str("transfer")?;
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let wasm =
+            fs::read(root.join(Path::new("reference_contracts/pulse_token.wasm"))).unwrap();
+        let abi = AbiDefinition {
+            version: "eosio::abi/1.2".to_string(),
+            types: vec![],
+            structs: vec![],
+            actions: vec![],
+            tables: vec![],
+            ricardian_clauses: vec![],
+            error_messages: vec![],
+            abi_extensions: vec![],
+            variants: vec![],
+            action_results: vec![],
+        };
+
+        let create_tx = create_account(&private_key, glenn, chain_id)?;
+        let create_digest = create_tx.id().to_digest()?;
+        mempool.add_transaction(create_tx);
+        mempool.add_transaction(set_code(&private_key, glenn, wasm, chain_id)?);
+        mempool.add_transaction(set_abi(&private_key, glenn, abi.pack().unwrap(), chain_id)?);
+        mempool.add_transaction(update_auth(&private_key, glenn, perm, ACTIVE_NAME, 1, chain_id)?);
+        mempool.add_transaction(link_auth(&private_key, glenn, glenn, msg_type, perm, chain_id)?);
+        let block = controller.build_block(&mut mempool).await?;
+        controller.accept_block(&block.id()?, &mut mempool)?;
+
+        let db = controller.database();
+        let name = glenn.as_u64();
+
+        // account_object + account_metadata_object, field for field.
+        assert!(!db.find_account(name)?.is_null(), "chainbase account missing");
+        assert!(db.arena_account_exists(name), "arena account missing");
+        let ptr = db.find_account_metadata(name)?;
+        assert!(!ptr.is_null());
+        let meta = unsafe { &*ptr };
+        let arena_meta = db.arena_account_metadata(name).expect("arena metadata missing");
+        assert_eq!(arena_meta.privileged, meta.is_privileged());
+        assert_eq!(arena_meta.recv_sequence, meta.get_recv_sequence());
+        assert_eq!(arena_meta.auth_sequence, meta.get_auth_sequence());
+        assert_eq!(arena_meta.code_sequence, meta.get_code_sequence());
+        assert_eq!(arena_meta.abi_sequence, meta.get_abi_sequence());
+        assert_eq!(arena_meta.vm_type, meta.get_vm_type());
+        assert_eq!(arena_meta.vm_version, meta.get_vm_version());
+
+        // resource_usage: RAM + net/cpu accumulators.
+        assert_eq!(
+            db.arena_account_ram_usage(name).map(|r| r as i64),
+            Some(db.get_account_ram_usage(name)?),
+        );
+        assert_eq!(
+            db.arena_account_net_usage_value_ex(name),
+            Some(db.get_account_net_usage_value_ex(name)?),
+        );
+        assert_eq!(
+            db.arena_account_cpu_usage_value_ex(name),
+            Some(db.get_account_cpu_usage_value_ex(name)?),
+        );
+
+        // resource_limits + global elastic virtual limits.
+        let (mut ram, mut net, mut cpu) = (0i64, 0i64, 0i64);
+        db.get_account_limits(name, &mut ram, &mut net, &mut cpu)?;
+        assert_eq!(db.arena_account_limits(name), Some((ram, net, cpu)));
+        assert_eq!(
+            db.arena_virtual_limits(),
+            Some((db.get_virtual_cpu_limit()?, db.get_virtual_net_limit()?)),
+        );
+
+        // permission + permission_link created by updateauth/linkauth.
+        let perm_ptr = db.find_permission_by_actor_and_permission(name, perm.as_u64())?;
+        assert!(!perm_ptr.is_null());
+        let (parent, _threshold) = db.arena_permission(name, perm.as_u64()).expect("arena perm");
+        assert_eq!(parent, unsafe { &*perm_ptr }.get_parent_id());
+        let link_ptr = db.find_permission_link(name, name, msg_type.as_u64())?;
+        assert!(!link_ptr.is_null());
+        assert_eq!(
+            db.arena_permission_link(name, name, msg_type.as_u64()),
+            Some(unsafe { &*link_ptr }.get_required_permission()),
+        );
+
+        // dynamic_global_property + transaction dedupe.
+        assert_eq!(
+            db.arena_global_action_sequence(),
+            Some(db.get_global_action_sequence()?),
+        );
+        assert!(db.is_known_unexpired_transaction(&create_digest)?);
+        assert!(db.arena_transaction_exists(&create_digest));
+
+        // The mirrored state has a populated root.
+        let root_hash = db.arena_state_root().expect("state root");
+        assert_ne!(root_hash, [0u8; 32], "arena state root is empty");
+        Ok(())
+    }
+
     /// Block-sequence fuzzer: random sequences of blocks — each with a few
     /// newaccount transactions, then either accepted or discarded — must keep
     /// the arena mirror in step with chainbase. After every block, for every

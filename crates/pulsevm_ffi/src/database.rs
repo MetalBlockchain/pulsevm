@@ -2746,6 +2746,24 @@ impl Database {
         Ok(())
     }
 
+    /// Whether the arena mirror holds a dedupe row for `trx_id` — for diffing
+    /// against chainbase's `is_known_unexpired_transaction`. Uses the same
+    /// digest-to-bytes conversion `record_transaction` mirrors with.
+    pub fn arena_transaction_exists(&self, trx_id: &ffi::CxxDigest) -> bool {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow
+                .as_ref()
+                .map(|s| s.transaction_exists(digest_to_array(trx_id)))
+                .unwrap_or(false)
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = trx_id;
+            false
+        }
+    }
+
     pub fn clear_expired_input_transactions(
         &mut self,
         cutoff: &TimePoint,
