@@ -36,8 +36,8 @@ fn mk() -> Table<Account> {
 #[test]
 fn create_assigns_sequential_ids_and_finds() {
     let mut t = mk();
-    let a = t.emplace(|a| a.name = 10).unwrap().clone();
-    let b = t.emplace(|a| a.name = 20).unwrap().clone();
+    let a = *t.emplace(|a| a.name = 10).unwrap();
+    let b = *t.emplace(|a| a.name = 20).unwrap();
     assert_eq!(a.id.raw(), 0);
     assert_eq!(b.id.raw(), 1);
     assert_eq!(t.find(ObjectId::new(0)).unwrap().name, 10);

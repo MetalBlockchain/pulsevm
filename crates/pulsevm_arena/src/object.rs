@@ -123,6 +123,9 @@ pub trait SecondaryIndex<T: ArenaObject>: Send {
     fn replace(&mut self, old: &T, new: &T) -> bool;
     fn erase(&mut self, obj: &T);
     fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
     fn as_any(&self) -> &dyn Any;
 }
 

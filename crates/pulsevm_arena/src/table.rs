@@ -111,7 +111,7 @@ impl<T: ArenaObject> Table<T> {
                 id: raw,
             });
         };
-        let mut updated = current.clone();
+        let mut updated = *current;
         m(&mut updated);
         if updated.id() != id {
             return Err(TableError::IdChanged {
