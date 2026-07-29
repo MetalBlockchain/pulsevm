@@ -207,6 +207,23 @@ impl Database {
         }
     }
 
+    /// Mirrored RAM usage for `account_name`, or `None` when shadowing is off /
+    /// the account is absent — for diffing against chainbase's
+    /// `get_account_ram_usage`.
+    pub fn arena_account_ram_usage(&self, account_name: u64) -> Option<u64> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow
+                .as_ref()
+                .and_then(|s| s.account_ram_usage(account_name))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = account_name;
+            None
+        }
+    }
+
     /// Whether the arena mirror holds an account_object for `name` — for diffing
     /// against chainbase's `find_account`.
     pub fn arena_account_exists(&self, name: u64) -> bool {
@@ -540,12 +557,20 @@ impl Database {
         &mut self,
         account_name: u64,
     ) -> Result<(), ChainError> {
-        let mut guard = self.inner.write()?;
-        let pinned = guard.pin_mut();
-
-        pinned
-            .initialize_account_resource_limits(account_name)
-            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+        {
+            let mut guard = self.inner.write()?;
+            let pinned = guard.pin_mut();
+            pinned
+                .initialize_account_resource_limits(account_name)
+                .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        }
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && let Err(e) = s.initialize_account_resource_limits(account_name)
+        {
+            eprintln!("arena mirror of initialize_account_resource_limits diverged: {e:?}");
+        }
+        Ok(())
     }
 
     pub fn update_account_usage(
@@ -581,12 +606,20 @@ impl Database {
         account_name: u64,
         ram_bytes: i64,
     ) -> Result<(), ChainError> {
-        let mut guard = self.inner.write()?;
-        let pinned = guard.pin_mut();
-
-        pinned
-            .add_pending_ram_usage(account_name, ram_bytes)
-            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+        {
+            let mut guard = self.inner.write()?;
+            let pinned = guard.pin_mut();
+            pinned
+                .add_pending_ram_usage(account_name, ram_bytes)
+                .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        }
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && let Err(e) = s.add_pending_ram_usage(account_name, ram_bytes)
+        {
+            eprintln!("arena mirror of add_pending_ram_usage diverged: {e:?}");
+        }
+        Ok(())
     }
 
     pub fn verify_account_ram_usage(&mut self, account_name: u64) -> Result<(), ChainError> {

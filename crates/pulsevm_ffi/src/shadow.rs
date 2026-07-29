@@ -54,6 +54,21 @@ struct AccountRow {
     abi: BlobRef,
 }
 
+/// Arena mirror of chainbase `resource_limits::resource_usage_object`, RAM only.
+/// The net/cpu usage accumulators are not mirrored yet. The row is created by
+/// `initialize_account_resource_limits`; its `ram_usage` accumulates every delta
+/// handed to `add_pending_ram_usage` — the same externally-computed deltas
+/// chainbase applies, so no billing logic is duplicated here.
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout, ArenaObject)]
+#[arena(type_id = 16)]
+struct ResourceUsageRow {
+    id: ObjectId<ResourceUsageRow>,
+    #[arena(index)]
+    owner: u64,
+    ram_usage: u64,
+}
+
 /// Arena mirror of chainbase `permission_object`. `auth` (a `shared_authority`)
 /// is variable-length, so it is encoded into the blob arena; the row holds the
 /// `BlobRef`. The three secondary indices reproduce chainbase's key ordering
@@ -728,6 +743,7 @@ impl ArenaShadow {
         db.add_table::<ContractIndex256Row>()?;
         db.add_table::<ContractIndexDoubleRow>()?;
         db.add_table::<ContractIndexLongDoubleRow>()?;
+        db.add_table::<ResourceUsageRow>()?;
         Ok(ArenaShadow {
             inner: Arc::new(Mutex::new(db)),
         })
@@ -1041,6 +1057,47 @@ impl ArenaShadow {
             .ok()
             .flatten()
             .map(|l| l.required_permission)
+    }
+
+    // ----- resource_usage (RAM) ---------------------------------------------
+
+    /// Mirrors `initialize_account_resource_limits`: creates the account's
+    /// resource_usage row with zero RAM, matching chainbase.
+    pub fn initialize_account_resource_limits(&self, owner: u64) -> Result<(), DbError> {
+        self.lock().create::<ResourceUsageRow>(|r| {
+            r.owner = owner;
+            r.ram_usage = 0;
+        })?;
+        Ok(())
+    }
+
+    /// Mirrors `add_pending_ram_usage`: applies the externally-computed byte
+    /// delta to the account's mirrored ram_usage. Chainbase guards against
+    /// over/underflow before this runs, so the signed accumulation is safe.
+    pub fn add_pending_ram_usage(&self, owner: u64, ram_delta: i64) -> Result<(), DbError> {
+        if ram_delta == 0 {
+            return Ok(());
+        }
+        let mut db = self.lock();
+        let id = db
+            .find_by::<ResourceUsageRow, ResourceUsageRowByOwner>(&owner)?
+            .map(|r| r.id());
+        if let Some(id) = id {
+            db.modify::<ResourceUsageRow>(id, |r| {
+                r.ram_usage = (r.ram_usage as i64 + ram_delta) as u64;
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Mirrored RAM usage for `owner`, or `None` if absent — for diffing against
+    /// chainbase's `get_account_ram_usage`.
+    pub fn account_ram_usage(&self, owner: u64) -> Option<u64> {
+        self.lock()
+            .find_by::<ResourceUsageRow, ResourceUsageRowByOwner>(&owner)
+            .ok()
+            .flatten()
+            .map(|r| r.ram_usage)
     }
 
     // ----- code_object ------------------------------------------------------

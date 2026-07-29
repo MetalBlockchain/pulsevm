@@ -1738,6 +1738,79 @@ mod tests {
         Ok(())
     }
 
+    /// RAM oracle: after a block that creates an account and sets its code and
+    /// abi, the mirrored resource_usage.ram_usage must equal chainbase's. Every
+    /// RAM delta funnels through add_pending_ram_usage, which the mirror
+    /// accumulates, so this exercises the whole billing path end to end without
+    /// duplicating any billing rules — the mirror only replays the same deltas.
+    #[cfg(feature = "arena-shadow")]
+    #[tokio::test]
+    async fn oracle_ram_usage_mirrors_chainbase() -> Result<(), ChainError> {
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
+        let private_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let mempool = Arc::new(RwLock::new(Mempool::new()));
+        let mut mempool = mempool.write().await;
+        let mut controller = Controller::new();
+        let genesis_bytes = generate_genesis(&private_key);
+        let temp_path = get_temp_dir();
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": private_key.to_string(),
+        })
+        .to_string()
+        .into_bytes();
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &genesis_bytes.to_vec(),
+            temp_path.path().to_str().unwrap(),
+        )?;
+        let chain_id = controller.chain_id().clone();
+        let glenn = Name::from_str("glenn")?;
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let wasm =
+            fs::read(root.join(Path::new("reference_contracts/pulse_token.wasm"))).unwrap();
+        let abi = AbiDefinition {
+            version: "eosio::abi/1.2".to_string(),
+            types: vec![],
+            structs: vec![],
+            actions: vec![],
+            tables: vec![],
+            ricardian_clauses: vec![],
+            error_messages: vec![],
+            abi_extensions: vec![],
+            variants: vec![],
+            action_results: vec![],
+        };
+
+        mempool.add_transaction(create_account(&private_key, glenn, chain_id)?);
+        mempool.add_transaction(set_code(&private_key, glenn, wasm, chain_id)?);
+        mempool.add_transaction(set_abi(&private_key, glenn, abi.pack().unwrap(), chain_id)?);
+        let block = controller.build_block(&mut mempool).await?;
+        controller.accept_block(&block.id()?, &mut mempool)?;
+
+        let db = controller.database();
+        let name = glenn.as_u64();
+        let chain_ram = db.get_account_ram_usage(name)?;
+        let arena_ram = db
+            .arena_account_ram_usage(name)
+            .expect("arena is missing the resource_usage row");
+        assert_eq!(
+            arena_ram as i64, chain_ram,
+            "mirrored ram_usage diverged from chainbase"
+        );
+        assert!(chain_ram > 0, "expected the block to charge RAM");
+        Ok(())
+    }
+
     /// Block-sequence fuzzer: random sequences of blocks — each with a few
     /// newaccount transactions, then either accepted or discarded — must keep
     /// the arena mirror in step with chainbase. After every block, for every
