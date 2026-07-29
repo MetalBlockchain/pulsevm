@@ -3450,6 +3450,7 @@ dependencies = [
  "libc",
  "proptest",
  "prost-types",
+ "pulsevm_arena",
  "pulsevm_billable_size",
  "pulsevm_constants",
  "pulsevm_contractdb",

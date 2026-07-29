@@ -20,6 +20,11 @@ use crate::{
 #[derive(Clone)]
 pub struct Database {
     inner: Arc<RwLock<UniquePtr<ffi::Database>>>,
+    /// The native pulsevm_arena mirror, shared across clones. Carried here so
+    /// writes reach it through the same handle every apply/transaction context
+    /// already uses (see `shadow.rs`). Only present in arena-shadow builds.
+    #[cfg(feature = "arena-shadow")]
+    shadow: Option<crate::shadow::ArenaShadow>,
 }
 
 impl Database {
@@ -31,8 +36,69 @@ impl Database {
         } else {
             Ok(Database {
                 inner: Arc::new(RwLock::new(db)),
+                #[cfg(feature = "arena-shadow")]
+                shadow: None,
             })
         }
+    }
+
+    // ----- arena shadow (differential testing; no-ops without the feature) ---
+
+    /// Attaches a fresh arena mirror at chainbase's current revision. Every
+    /// clone of this handle then shares it, so ported writes are mirrored.
+    pub fn enable_shadow(&mut self) -> Result<(), ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            let shadow = crate::shadow::ArenaShadow::new()
+                .map_err(|e| ChainError::InternalError(format!("arena shadow init: {e:?}")))?;
+            shadow
+                .set_revision(self.revision())
+                .map_err(|e| ChainError::InternalError(format!("arena set_revision: {e:?}")))?;
+            self.shadow = Some(shadow);
+        }
+        Ok(())
+    }
+
+    /// State root of the mirrored subset, or `None` when shadowing is off. Only
+    /// ported tables contribute, so it is comparable to chainbase for those.
+    pub fn arena_state_root(&self) -> Option<[u8; 32]> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow.as_ref().map(|s| s.state_root())
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            None
+        }
+    }
+
+    /// Arena undo-session lifecycle, driven by the controller in lockstep with
+    /// the chainbase session boundaries.
+    pub fn arena_start_undo_session(&self) {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow {
+            s.start_undo_session();
+        }
+    }
+    pub fn arena_squash(&self) {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow {
+            s.squash();
+        }
+    }
+    pub fn arena_undo(&self) {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow {
+            s.undo();
+        }
+    }
+    pub fn arena_commit(&self, revision: i64) {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow {
+            s.commit(revision);
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        let _ = revision;
     }
 
     // Replace the inner database with null to call the destructors
@@ -132,14 +198,23 @@ impl Database {
         account_name: u64,
         is_privileged: bool,
     ) -> Result<*const ffi::AccountMetadataObject, ChainError> {
-        let mut guard = self.inner.write()?;
-        let pinned = guard.pin_mut();
-
-        let res = pinned
-            .create_account_metadata(account_name, is_privileged)
-            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
-
-        Ok(res as *const ffi::AccountMetadataObject)
+        let res = {
+            let mut guard = self.inner.write()?;
+            let pinned = guard.pin_mut();
+            pinned
+                .create_account_metadata(account_name, is_privileged)
+                .map_err(|e| ChainError::InternalError(format!("{}", e)))?
+                as *const ffi::AccountMetadataObject
+        };
+        // Mirror after releasing the chainbase lock, so the two locks are never
+        // held at once. Chainbase is authoritative; a mirror error is logged.
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && let Err(e) = s.create_account_metadata(account_name, is_privileged)
+        {
+            eprintln!("arena mirror of account_metadata {account_name} diverged: {e:?}");
+        }
+        Ok(res)
     }
 
     pub fn find_account_metadata(
@@ -2223,6 +2298,8 @@ impl Default for Database {
     fn default() -> Self {
         Self {
             inner: Arc::new(RwLock::new(UniquePtr::null())),
+            #[cfg(feature = "arena-shadow")]
+            shadow: None,
         }
     }
 }
