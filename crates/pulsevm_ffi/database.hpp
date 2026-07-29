@@ -283,6 +283,10 @@ public:
     // mirror. Field order/endianness must match the arena's exactly.
     rust::Vec<uint8_t> account_metadata_state_bytes() const;
 
+    // Same, for the account_object table (name, creation_date slot, then a
+    // length-prefixed abi blob).
+    rust::Vec<uint8_t> account_state_bytes() const;
+
     bool set_account_limits( uint64_t account, int64_t ram_bytes, int64_t net_weight, int64_t cpu_weight) {
         auto find_or_create_pending_limits = [&]() -> const resource_limits::resource_limits_object& {
             const auto* pending_limits = this->find<resource_limits::resource_limits_object, resource_limits::by_owner>( boost::make_tuple(true, name(account)) );

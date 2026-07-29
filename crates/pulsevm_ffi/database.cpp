@@ -374,6 +374,21 @@ rust::Vec<uint8_t> database_wrapper::account_metadata_state_bytes() const {
     return out;
 }
 
+rust::Vec<uint8_t> database_wrapper::account_state_bytes() const {
+    rust::Vec<uint8_t> out;
+    auto put_u64 = [&](uint64_t v){ for (int i = 0; i < 8; ++i) out.push_back(static_cast<uint8_t>(v >> (8 * i))); };
+    auto put_u32 = [&](uint32_t v){ for (int i = 0; i < 4; ++i) out.push_back(static_cast<uint8_t>(v >> (8 * i))); };
+    const auto& idx = this->get_index<account_index, by_name>();
+    for (const auto& o : idx) {
+        put_u64(o.name.to_uint64_t());
+        put_u32(o.get_creation_date().get_slot());
+        const auto& abi = o.get_abi();
+        put_u32(static_cast<uint32_t>(abi.size()));
+        for (size_t i = 0; i < abi.size(); ++i) out.push_back(static_cast<uint8_t>(abi.data()[i]));
+    }
+    return out;
+}
+
 rust::Vec<uint8_t> database_wrapper::pack_deltas(bool full_snapshot) const {
     fc::datastream<size_t> ps;
     pulsevm::state_history::pack_deltas(ps, *this, full_snapshot);

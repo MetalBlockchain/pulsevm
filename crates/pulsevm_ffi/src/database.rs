@@ -264,6 +264,29 @@ impl Database {
         }
     }
 
+    /// Canonical serialization of chainbase's whole account_object table in
+    /// by_name order — the account-table counterpart of
+    /// `account_metadata_state_bytes`.
+    pub fn account_state_bytes(&self) -> Result<Vec<u8>, ChainError> {
+        let guard = self.inner.read()?;
+        guard
+            .account_state_bytes()
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
+    /// The arena mirror's canonical account_object serialization, or `None` when
+    /// shadowing is off.
+    pub fn arena_account_state_bytes(&self) -> Option<Vec<u8>> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow.as_ref().map(|s| s.account_state_bytes())
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            None
+        }
+    }
+
     /// Whether the arena mirror holds an account_object for `name` — for diffing
     /// against chainbase's `find_account`.
     pub fn arena_account_exists(&self, name: u64) -> bool {
@@ -398,6 +421,16 @@ impl Database {
                     }
                 }
                 Err(e) => eprintln!("arena mirror could not read genesis account_metadata: {e:?}"),
+            }
+            match self.account_state_bytes() {
+                Ok(bytes) => {
+                    if let Some(s) = &self.shadow
+                        && let Err(e) = s.hydrate_accounts(&bytes)
+                    {
+                        eprintln!("arena mirror could not hydrate genesis accounts: {e:?}");
+                    }
+                }
+                Err(e) => eprintln!("arena mirror could not read genesis accounts: {e:?}"),
             }
         }
         Ok(())

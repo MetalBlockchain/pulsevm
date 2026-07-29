@@ -1138,6 +1138,57 @@ impl ArenaShadow {
         Ok(())
     }
 
+    /// Canonical serialization of the whole account_object table in name order,
+    /// matching the chainbase `account_state_bytes` enumerator: per row name u64
+    /// LE, creation_date slot u32 LE, then a u32 LE length-prefixed abi blob.
+    pub fn account_state_bytes(&self) -> Vec<u8> {
+        let db = self.lock();
+        let mut refs: Vec<(u64, u32, BlobRef)> = match db.table::<AccountRow>() {
+            Ok(t) => t.iter().map(|r| (r.name, r.creation_date, r.abi)).collect(),
+            Err(_) => return Vec::new(),
+        };
+        refs.sort_by_key(|r| r.0);
+        let mut out = Vec::new();
+        for (name, creation_date, abi_ref) in refs {
+            out.extend_from_slice(&name.to_le_bytes());
+            out.extend_from_slice(&creation_date.to_le_bytes());
+            let abi = db.blob::<AccountRow>(abi_ref).unwrap_or(&[]);
+            out.extend_from_slice(&(abi.len() as u32).to_le_bytes());
+            out.extend_from_slice(abi);
+        }
+        out
+    }
+
+    /// Seeds account_object rows from the canonical layout — the genesis
+    /// counterpart to `hydrate_account_metadata`, since `create_native_account`
+    /// makes these below the mirror hooks (the system account even carries a
+    /// non-empty abi). A name already present is left untouched.
+    pub fn hydrate_accounts(&self, bytes: &[u8]) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let mut pos = 0usize;
+        while pos + 16 <= bytes.len() {
+            let name = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
+            let creation_date = u32::from_le_bytes(bytes[pos + 8..pos + 12].try_into().unwrap());
+            let abi_len = u32::from_le_bytes(bytes[pos + 12..pos + 16].try_into().unwrap()) as usize;
+            pos += 16;
+            if pos + abi_len > bytes.len() {
+                break;
+            }
+            let abi = &bytes[pos..pos + abi_len];
+            pos += abi_len;
+            if db.find_by::<AccountRow, AccountRowByName>(&name)?.is_some() {
+                continue;
+            }
+            let blob = db.alloc_blob::<AccountRow>(abi)?;
+            db.create::<AccountRow>(|r| {
+                r.name = name;
+                r.creation_date = creation_date;
+                r.abi = blob;
+            })?;
+        }
+        Ok(())
+    }
+
     // ----- permission_object / permission_usage_object ----------------------
 
     /// Mirrors `create_permission`, which also creates the linked

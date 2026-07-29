@@ -2317,6 +2317,71 @@ mod tests {
         Ok(())
     }
 
+    /// Cross-impl state root for account_object: the whole table (including the
+    /// system account's non-empty genesis abi and glenn's abi from setabi) must
+    /// serialize identically on both sides and hash to the same root. Exercises
+    /// the blob path of the cross-impl mechanism.
+    #[cfg(feature = "arena-shadow")]
+    #[tokio::test]
+    async fn oracle_cross_impl_account_root() -> Result<(), ChainError> {
+        use sha2::{Digest, Sha256};
+
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
+        let private_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let mempool = Arc::new(RwLock::new(Mempool::new()));
+        let mut mempool = mempool.write().await;
+        let mut controller = Controller::new();
+        let genesis_bytes = generate_genesis(&private_key);
+        let temp_path = get_temp_dir();
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": private_key.to_string(),
+        })
+        .to_string()
+        .into_bytes();
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &genesis_bytes.to_vec(),
+            temp_path.path().to_str().unwrap(),
+        )?;
+        let chain_id = controller.chain_id().clone();
+        let glenn = Name::from_str("glenn")?;
+        let abi = AbiDefinition {
+            version: "eosio::abi/1.2".to_string(),
+            types: vec![],
+            structs: vec![],
+            actions: vec![],
+            tables: vec![],
+            ricardian_clauses: vec![],
+            error_messages: vec![],
+            abi_extensions: vec![],
+            variants: vec![],
+            action_results: vec![],
+        };
+
+        mempool.add_transaction(create_account(&private_key, glenn, chain_id)?);
+        mempool.add_transaction(set_abi(&private_key, glenn, abi.pack().unwrap(), chain_id)?);
+        let block = controller.build_block(&mut mempool).await?;
+        controller.accept_block(&block.id()?, &mut mempool)?;
+
+        let db = controller.database();
+        let chain_bytes = db.account_state_bytes()?;
+        let arena_bytes = db.arena_account_state_bytes().expect("shadow enabled");
+        assert_eq!(
+            chain_bytes, arena_bytes,
+            "canonical account_object serialization diverged between chainbase and the mirror"
+        );
+        let chain_root: [u8; 32] = Sha256::digest(&chain_bytes).into();
+        let arena_root: [u8; 32] = Sha256::digest(&arena_bytes).into();
+        assert_eq!(chain_root, arena_root, "cross-impl account_object state root diverged");
+        assert!(chain_bytes.len() > 16, "expected multiple accounts with abi data");
+        Ok(())
+    }
+
     /// Block-sequence fuzzer: random sequences of blocks — each with a few
     /// newaccount transactions, then either accepted or discarded — must keep
     /// the arena mirror in step with chainbase. After every block, for every
