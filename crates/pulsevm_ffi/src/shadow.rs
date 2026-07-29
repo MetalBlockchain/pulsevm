@@ -54,11 +54,66 @@ struct AccountRow {
     abi: BlobRef,
 }
 
-/// Arena mirror of chainbase `resource_limits::resource_usage_object`, RAM only.
-/// The net/cpu usage accumulators are not mirrored yet. The row is created by
-/// `initialize_account_resource_limits`; its `ram_usage` accumulates every delta
-/// handed to `add_pending_ram_usage` — the same externally-computed deltas
-/// chainbase applies, so no billing logic is duplicated here.
+/// `config::rate_limiting_precision` — the fixed-point scale the usage
+/// accumulators pre-multiply by.
+const RATE_LIMITING_PRECISION: u64 = 1_000_000;
+
+/// `num` divided by `den`, rounded up — chainbase's `integer_divide_ceil`.
+fn integer_divide_ceil(num: u128, den: u128) -> u128 {
+    (num / den) + if num % den > 0 { 1 } else { 0 }
+}
+
+/// Port of chainbase `exponential_moving_average_accumulator` (the
+/// `usage_accumulator` used for net/cpu). The field order differs from the C++
+/// struct to keep the row free of implicit padding for the zero-copy layout, but
+/// the arithmetic in `add` matches bit for bit, so a mirrored accumulator tracks
+/// chainbase exactly given the same units/ordinal/window inputs. The C++ range
+/// asserts are omitted: chainbase enforces them before the mirror runs, so any
+/// input reaching here already passed them.
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout, PartialEq)]
+struct UsageAccumulator {
+    value_ex: u64,
+    consumed: u64,
+    last_ordinal: u32,
+    _pad: u32,
+}
+
+impl UsageAccumulator {
+    fn average(&self) -> u64 {
+        integer_divide_ceil(self.value_ex as u128, RATE_LIMITING_PRECISION as u128) as u64
+    }
+
+    fn add(&mut self, units: u64, ordinal: u32, window_size: u32) {
+        let value_ex_contrib = integer_divide_ceil(
+            units as u128 * RATE_LIMITING_PRECISION as u128,
+            window_size as u128,
+        ) as u64;
+
+        if self.last_ordinal != ordinal {
+            if self.last_ordinal as u64 + window_size as u64 > ordinal as u64 {
+                let delta = ordinal - self.last_ordinal; // 0 < delta < window_size
+                let num = (window_size - delta) as u128;
+                let den = window_size as u128;
+                self.value_ex = ((self.value_ex as u128 * num) / den) as u64;
+            } else {
+                self.value_ex = 0;
+            }
+            self.last_ordinal = ordinal;
+            self.consumed = self.average();
+        }
+
+        self.consumed += units;
+        self.value_ex += value_ex_contrib;
+    }
+}
+
+/// Arena mirror of chainbase `resource_limits::resource_usage_object`. `ram_usage`
+/// accumulates every delta handed to `add_pending_ram_usage` — the same
+/// externally-computed deltas chainbase applies, so no billing logic is
+/// duplicated. `net_usage`/`cpu_usage` are the windowed-average accumulators,
+/// advanced by `add_transaction_usage`/`update_account_usage` with the window
+/// pulled from chainbase config so the decay matches.
 #[repr(C)]
 #[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout, ArenaObject)]
 #[arena(type_id = 16)]
@@ -67,6 +122,8 @@ struct ResourceUsageRow {
     #[arena(index)]
     owner: u64,
     ram_usage: u64,
+    net_usage: UsageAccumulator,
+    cpu_usage: UsageAccumulator,
 }
 
 /// Arena mirror of chainbase `permission_object`. `auth` (a `shared_authority`)
@@ -1098,6 +1155,63 @@ impl ArenaShadow {
             .ok()
             .flatten()
             .map(|r| r.ram_usage)
+    }
+
+    /// Mirrors `add_transaction_usage`: advances the account's net/cpu usage
+    /// accumulators by the billed units at `time_slot`. The windows come from
+    /// chainbase config (passed in by the caller, which has the Database handle).
+    pub fn add_transaction_usage(
+        &self,
+        owner: u64,
+        cpu_usage: u64,
+        net_usage: u64,
+        time_slot: u32,
+        net_window: u32,
+        cpu_window: u32,
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let id = db
+            .find_by::<ResourceUsageRow, ResourceUsageRowByOwner>(&owner)?
+            .map(|r| r.id());
+        if let Some(id) = id {
+            db.modify::<ResourceUsageRow>(id, |r| {
+                r.net_usage.add(net_usage, time_slot, net_window);
+                r.cpu_usage.add(cpu_usage, time_slot, cpu_window);
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Mirrors `update_account_usage`: decays the account's net/cpu accumulators
+    /// to `time_slot` by adding zero units (the same call chainbase makes).
+    pub fn update_account_usage(
+        &self,
+        owner: u64,
+        time_slot: u32,
+        net_window: u32,
+        cpu_window: u32,
+    ) -> Result<(), DbError> {
+        self.add_transaction_usage(owner, 0, 0, time_slot, net_window, cpu_window)
+    }
+
+    /// Mirrored net_usage `value_ex` (the pre-multiplied accumulator state) for
+    /// `owner` — for exact diffing against chainbase.
+    pub fn account_net_usage_value_ex(&self, owner: u64) -> Option<u64> {
+        self.lock()
+            .find_by::<ResourceUsageRow, ResourceUsageRowByOwner>(&owner)
+            .ok()
+            .flatten()
+            .map(|r| r.net_usage.value_ex)
+    }
+
+    /// Mirrored cpu_usage `value_ex` for `owner` — for exact diffing against
+    /// chainbase.
+    pub fn account_cpu_usage_value_ex(&self, owner: u64) -> Option<u64> {
+        self.lock()
+            .find_by::<ResourceUsageRow, ResourceUsageRowByOwner>(&owner)
+            .ok()
+            .flatten()
+            .map(|r| r.cpu_usage.value_ex)
     }
 
     // ----- code_object ------------------------------------------------------

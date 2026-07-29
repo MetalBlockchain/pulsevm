@@ -346,6 +346,10 @@ pub mod ffi {
         ) -> Result<()>;
         pub fn verify_account_ram_usage(self: Pin<&mut Database>, account_name: u64) -> Result<()>;
         pub fn get_account_ram_usage(self: &Database, account_name: u64) -> Result<i64>;
+        pub fn get_account_net_usage_average_window(self: &Database) -> Result<u32>;
+        pub fn get_account_cpu_usage_average_window(self: &Database) -> Result<u32>;
+        pub fn get_account_net_usage_value_ex(self: &Database, account_name: u64) -> Result<u64>;
+        pub fn get_account_cpu_usage_value_ex(self: &Database, account_name: u64) -> Result<u64>;
         pub fn set_account_limits(
             self: Pin<&mut Database>,
             account_name: u64,

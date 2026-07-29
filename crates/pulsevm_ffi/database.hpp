@@ -251,6 +251,22 @@ public:
         return this->get<resource_limits::resource_usage_object,resource_limits::by_owner>( name(account_name) ).ram_usage;
     }
 
+    uint32_t get_account_net_usage_average_window() const {
+        return this->get<resource_limits::resource_limits_config_object>().account_net_usage_average_window;
+    }
+
+    uint32_t get_account_cpu_usage_average_window() const {
+        return this->get<resource_limits::resource_limits_config_object>().account_cpu_usage_average_window;
+    }
+
+    uint64_t get_account_net_usage_value_ex( uint64_t account_name ) const {
+        return this->get<resource_limits::resource_usage_object,resource_limits::by_owner>( name(account_name) ).net_usage.value_ex;
+    }
+
+    uint64_t get_account_cpu_usage_value_ex( uint64_t account_name ) const {
+        return this->get<resource_limits::resource_usage_object,resource_limits::by_owner>( name(account_name) ).cpu_usage.value_ex;
+    }
+
     bool set_account_limits( uint64_t account, int64_t ram_bytes, int64_t net_weight, int64_t cpu_weight) {
         auto find_or_create_pending_limits = [&]() -> const resource_limits::resource_limits_object& {
             const auto* pending_limits = this->find<resource_limits::resource_limits_object, resource_limits::by_owner>( boost::make_tuple(true, name(account)) );

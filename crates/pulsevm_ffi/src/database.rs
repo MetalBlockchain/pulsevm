@@ -578,12 +578,16 @@ impl Database {
         account: &Name,
         time_slot: u32,
     ) -> Result<(), ChainError> {
-        let mut guard = self.inner.write()?;
-        let pinned = guard.pin_mut();
-
-        pinned
-            .update_account_usage(account.as_u64(), time_slot)
-            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+        {
+            let mut guard = self.inner.write()?;
+            let pinned = guard.pin_mut();
+            pinned
+                .update_account_usage(account.as_u64(), time_slot)
+                .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        }
+        #[cfg(feature = "arena-shadow")]
+        self.mirror_account_usage(account.as_u64(), 0, 0, time_slot);
+        Ok(())
     }
 
     pub fn add_transaction_usage(
@@ -593,12 +597,42 @@ impl Database {
         net_usage: u64,
         time_slot: u32,
     ) -> Result<(), ChainError> {
-        let mut guard = self.inner.write()?;
-        let pinned = guard.pin_mut();
+        {
+            let mut guard = self.inner.write()?;
+            let pinned = guard.pin_mut();
+            pinned
+                .add_transaction_usage(account.as_u64(), cpu_usage, net_usage, time_slot)
+                .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        }
+        #[cfg(feature = "arena-shadow")]
+        self.mirror_account_usage(account.as_u64(), cpu_usage, net_usage, time_slot);
+        Ok(())
+    }
 
-        pinned
-            .add_transaction_usage(account.as_u64(), cpu_usage, net_usage, time_slot)
-            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    /// Replays a net/cpu usage advance onto the arena mirror, pulling the average
+    /// windows from chainbase config so the accumulator decay matches. Best
+    /// effort: a divergence is logged, never propagated.
+    #[cfg(feature = "arena-shadow")]
+    fn mirror_account_usage(&self, account: u64, cpu_usage: u64, net_usage: u64, time_slot: u32) {
+        if self.shadow.is_none() {
+            return;
+        }
+        let windows = self
+            .get_account_net_usage_average_window()
+            .and_then(|nw| self.get_account_cpu_usage_average_window().map(|cw| (nw, cw)));
+        let (net_window, cpu_window) = match windows {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("arena mirror could not read usage windows: {e:?}");
+                return;
+            }
+        };
+        if let Some(s) = &self.shadow
+            && let Err(e) =
+                s.add_transaction_usage(account, cpu_usage, net_usage, time_slot, net_window, cpu_window)
+        {
+            eprintln!("arena mirror of add_transaction_usage diverged: {e:?}");
+        }
     }
 
     pub fn add_pending_ram_usage(
@@ -637,6 +671,64 @@ impl Database {
         guard
             .get_account_ram_usage(account_name)
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
+    pub fn get_account_net_usage_average_window(&self) -> Result<u32, ChainError> {
+        let guard = self.inner.read()?;
+        guard
+            .get_account_net_usage_average_window()
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
+    pub fn get_account_cpu_usage_average_window(&self) -> Result<u32, ChainError> {
+        let guard = self.inner.read()?;
+        guard
+            .get_account_cpu_usage_average_window()
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
+    pub fn get_account_net_usage_value_ex(&self, account_name: u64) -> Result<u64, ChainError> {
+        let guard = self.inner.read()?;
+        guard
+            .get_account_net_usage_value_ex(account_name)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
+    pub fn get_account_cpu_usage_value_ex(&self, account_name: u64) -> Result<u64, ChainError> {
+        let guard = self.inner.read()?;
+        guard
+            .get_account_cpu_usage_value_ex(account_name)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
+    /// Mirrored net/cpu usage `value_ex` for `account_name`, or `None` when
+    /// shadowing is off / the account is absent — for diffing against chainbase.
+    pub fn arena_account_net_usage_value_ex(&self, account_name: u64) -> Option<u64> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow
+                .as_ref()
+                .and_then(|s| s.account_net_usage_value_ex(account_name))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = account_name;
+            None
+        }
+    }
+
+    pub fn arena_account_cpu_usage_value_ex(&self, account_name: u64) -> Option<u64> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow
+                .as_ref()
+                .and_then(|s| s.account_cpu_usage_value_ex(account_name))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = account_name;
+            None
+        }
     }
 
     pub fn set_account_limits(
