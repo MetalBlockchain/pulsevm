@@ -389,6 +389,20 @@ rust::Vec<uint8_t> database_wrapper::account_state_bytes() const {
     return out;
 }
 
+rust::Vec<uint8_t> database_wrapper::permission_keys_bytes() const {
+    rust::Vec<uint8_t> out;
+    auto put_u64 = [&](uint64_t v){ for (int i = 0; i < 8; ++i) out.push_back(static_cast<uint8_t>(v >> (8 * i))); };
+    const auto& idx = this->get_index<permission_index, by_owner>();
+    for (const auto& o : idx) {
+        uint64_t owner = o.owner.to_uint64_t();
+        if (owner == 0) continue; // reserved perm 0
+        put_u64(owner);
+        put_u64(o.perm_name.to_uint64_t());
+        put_u64(static_cast<uint64_t>(o.get_parent_id()));
+    }
+    return out;
+}
+
 rust::Vec<uint8_t> database_wrapper::pack_deltas(bool full_snapshot) const {
     fc::datastream<size_t> ps;
     pulsevm::state_history::pack_deltas(ps, *this, full_snapshot);

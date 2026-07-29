@@ -287,6 +287,55 @@ impl Database {
         }
     }
 
+    /// Canonical serialization of chainbase's whole permission table in
+    /// (owner, perm_name) order. The authority is reconstructed from each
+    /// permission's `shared_authority` and re-encoded with the same
+    /// `encode_authority` the mirror stores, so the two streams match without
+    /// reimplementing the encoding in C++. Reserved perm 0 is skipped by the
+    /// C++ key enumerator. Gated on the mirror feature since it reuses
+    /// `encode_authority`.
+    #[cfg(feature = "arena-shadow")]
+    pub fn permission_state_bytes(&self) -> Result<Vec<u8>, ChainError> {
+        let guard = self.inner.read()?;
+        let keys = guard
+            .permission_keys_bytes()
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        let mut out = Vec::new();
+        for triple in keys.chunks_exact(24) {
+            let owner = u64::from_le_bytes(triple[0..8].try_into().unwrap());
+            let perm_name = u64::from_le_bytes(triple[8..16].try_into().unwrap());
+            let parent = u64::from_le_bytes(triple[16..24].try_into().unwrap());
+            let ptr = guard
+                .find_permission_by_actor_and_permission(owner, perm_name)
+                .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+            if ptr.is_null() {
+                continue;
+            }
+            // Safe: non-null, read-only, no mutation between the find and read.
+            let auth = ffi::get_authority_from_shared_authority(unsafe { &*ptr }.get_authority());
+            let auth_bytes = encode_authority(&auth);
+            out.extend_from_slice(&owner.to_le_bytes());
+            out.extend_from_slice(&perm_name.to_le_bytes());
+            out.extend_from_slice(&parent.to_le_bytes());
+            out.extend_from_slice(&(auth_bytes.len() as u32).to_le_bytes());
+            out.extend_from_slice(&auth_bytes);
+        }
+        Ok(out)
+    }
+
+    /// The arena mirror's canonical permission serialization, or `None` when
+    /// shadowing is off.
+    pub fn arena_permission_state_bytes(&self) -> Option<Vec<u8>> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow.as_ref().map(|s| s.permission_state_bytes())
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            None
+        }
+    }
+
     /// Whether the arena mirror holds an account_object for `name` — for diffing
     /// against chainbase's `find_account`.
     pub fn arena_account_exists(&self, name: u64) -> bool {
@@ -431,6 +480,16 @@ impl Database {
                     }
                 }
                 Err(e) => eprintln!("arena mirror could not read genesis accounts: {e:?}"),
+            }
+            match self.permission_state_bytes() {
+                Ok(bytes) => {
+                    if let Some(s) = &self.shadow
+                        && let Err(e) = s.hydrate_permissions(&bytes)
+                    {
+                        eprintln!("arena mirror could not hydrate genesis permissions: {e:?}");
+                    }
+                }
+                Err(e) => eprintln!("arena mirror could not read genesis permissions: {e:?}"),
             }
         }
         Ok(())

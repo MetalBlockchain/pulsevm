@@ -1254,6 +1254,74 @@ impl ArenaShadow {
         Some((parent, threshold))
     }
 
+    /// Canonical serialization of the whole permission table in (owner, perm_name)
+    /// order, matching `Database::permission_state_bytes`: per row owner u64 LE,
+    /// perm_name u64 LE, parent id u64 LE, then a u32 LE length-prefixed authority
+    /// blob (the arena stores the auth already in the shared encode form). The
+    /// reserved perm 0 (owner 0) is skipped. parent is the chainbase id, which the
+    /// mirror stores verbatim, so it compares directly.
+    pub fn permission_state_bytes(&self) -> Vec<u8> {
+        let db = self.lock();
+        let mut refs: Vec<(u64, u64, i64, BlobRef)> = match db.table::<PermissionRow>() {
+            Ok(t) => t
+                .iter()
+                .filter(|p| p.owner != 0)
+                .map(|p| (p.owner, p.perm_name, p.parent, p.auth))
+                .collect(),
+            Err(_) => return Vec::new(),
+        };
+        refs.sort_by_key(|r| (r.0, r.1));
+        let mut out = Vec::new();
+        for (owner, perm_name, parent, auth_ref) in refs {
+            out.extend_from_slice(&owner.to_le_bytes());
+            out.extend_from_slice(&perm_name.to_le_bytes());
+            out.extend_from_slice(&(parent as u64).to_le_bytes());
+            let auth = db.blob::<PermissionRow>(auth_ref).unwrap_or(&[]);
+            out.extend_from_slice(&(auth.len() as u32).to_le_bytes());
+            out.extend_from_slice(auth);
+        }
+        out
+    }
+
+    /// Seeds permission rows (and their linked usage rows) from the canonical
+    /// layout — genesis counterpart to `hydrate_accounts`, since
+    /// `create_native_account` and the genesis block make several permissions in
+    /// C++. last_updated/last_used are not part of the canonical form, so they
+    /// are left at zero. A `(owner, perm_name)` already present is left untouched.
+    pub fn hydrate_permissions(&self, bytes: &[u8]) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let mut pos = 0usize;
+        while pos + 28 <= bytes.len() {
+            let owner = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
+            let perm_name = u64::from_le_bytes(bytes[pos + 8..pos + 16].try_into().unwrap());
+            let parent = u64::from_le_bytes(bytes[pos + 16..pos + 24].try_into().unwrap()) as i64;
+            let auth_len = u32::from_le_bytes(bytes[pos + 24..pos + 28].try_into().unwrap()) as usize;
+            pos += 28;
+            if pos + auth_len > bytes.len() {
+                break;
+            }
+            let auth = &bytes[pos..pos + auth_len];
+            pos += auth_len;
+            if db
+                .find_by::<PermissionRow, PermByOwner>(&(owner, perm_name))?
+                .is_some()
+            {
+                continue;
+            }
+            let usage_id = db.create::<PermissionUsageRow>(|u| u.last_used = 0)?.id().raw();
+            let blob = db.alloc_blob::<PermissionRow>(auth)?;
+            db.create::<PermissionRow>(|p| {
+                p.usage_id = usage_id;
+                p.parent = parent;
+                p.owner = owner;
+                p.perm_name = perm_name;
+                p.last_updated = 0;
+                p.auth = blob;
+            })?;
+        }
+        Ok(())
+    }
+
     /// Mirrors `remove_permission` (and the `delete_auth` path that calls it):
     /// removes the permission and its linked `permission_usage_object`.
     pub fn remove_permission(&self, owner: u64, perm_name: u64) -> Result<(), DbError> {

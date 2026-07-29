@@ -287,6 +287,12 @@ public:
     // length-prefixed abi blob).
     rust::Vec<uint8_t> account_state_bytes() const;
 
+    // The permission table's key triples (owner, perm_name, parent id) in
+    // by_owner order, skipping the reserved perm 0. The authority is assembled
+    // on the Rust side (it reuses the arena's authority encoding), so it is not
+    // included here.
+    rust::Vec<uint8_t> permission_keys_bytes() const;
+
     bool set_account_limits( uint64_t account, int64_t ram_bytes, int64_t net_weight, int64_t cpu_weight) {
         auto find_or_create_pending_limits = [&]() -> const resource_limits::resource_limits_object& {
             const auto* pending_limits = this->find<resource_limits::resource_limits_object, resource_limits::by_owner>( boost::make_tuple(true, name(account)) );

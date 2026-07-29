@@ -356,6 +356,7 @@ pub mod ffi {
         pub fn get_net_limit_parameters(self: &Database) -> Result<ElasticLimitParameters>;
         pub fn account_metadata_state_bytes(self: &Database) -> Result<Vec<u8>>;
         pub fn account_state_bytes(self: &Database) -> Result<Vec<u8>>;
+        pub fn permission_keys_bytes(self: &Database) -> Result<Vec<u8>>;
         pub fn set_account_limits(
             self: Pin<&mut Database>,
             account_name: u64,
