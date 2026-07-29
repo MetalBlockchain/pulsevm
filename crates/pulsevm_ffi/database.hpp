@@ -558,6 +558,10 @@ public:
         return this->find<permission_object, by_owner>( boost::make_tuple(name(actor), name(permission)) );
     }
 
+    const permission_link_object* find_permission_link( uint64_t account_name, uint64_t code_name, uint64_t message_type ) const {
+        return this->find<permission_link_object, by_action_name>( boost::make_tuple(name(account_name), name(code_name), name(message_type)) );
+    }
+
     void unlink_account_code(
         const code_object& old_code_entry
     ) {

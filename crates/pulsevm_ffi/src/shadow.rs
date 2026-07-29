@@ -1032,6 +1032,17 @@ impl ArenaShadow {
         Ok(())
     }
 
+    /// Required permission of the mirrored `permission_link_object` for
+    /// `(account, code, message_type)`, or `None` when absent — for diffing
+    /// against chainbase's `find_permission_link`.
+    pub fn permission_link(&self, account: u64, code: u64, message_type: u64) -> Option<u64> {
+        self.lock()
+            .find_by::<PermissionLinkRow, LinkByActionName>(&(account, code, message_type))
+            .ok()
+            .flatten()
+            .map(|l| l.required_permission)
+    }
+
     // ----- code_object ------------------------------------------------------
 
     /// Mirrors `update_account_code`: bumps the `account_metadata_object` code

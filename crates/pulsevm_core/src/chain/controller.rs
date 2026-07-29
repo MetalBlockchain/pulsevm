@@ -916,7 +916,7 @@ mod tests {
             asset::{Asset, Symbol},
             authority::PermissionLevel,
             abi::AbiDefinition,
-            pulse_contract::{NewAccount, SetAbi, SetCode, UpdateAuth},
+            pulse_contract::{LinkAuth, NewAccount, SetAbi, SetCode, UpdateAuth},
             transaction::{Action, Transaction, TransactionHeader},
         },
         crypto::PrivateKey,
@@ -1095,6 +1095,36 @@ mod tests {
                         vec![],
                         vec![],
                     ),
+                }
+                .pack()
+                .unwrap(),
+                vec![PermissionLevel::new(account.as_u64(), ACTIVE_NAME.as_u64())],
+            )],
+        )
+        .sign(&private_key, &chain_id)?;
+        let packed_trx = PackedTransaction::from_signed_transaction(trx)?;
+        Ok(packed_trx)
+    }
+
+    fn link_auth(
+        private_key: &PrivateKey,
+        account: Name,
+        code: Name,
+        message_type: Name,
+        requirement: Name,
+        chain_id: Id,
+    ) -> Result<PackedTransaction, ChainError> {
+        let trx = Transaction::new(
+            TransactionHeader::new(TimePointSec::maximum(), 0, 0, 0u32.into(), 0, 0u32.into()),
+            vec![],
+            vec![Action::new(
+                Name::from_str("pulse").unwrap(),
+                Name::from_str("linkauth").unwrap(),
+                LinkAuth {
+                    account,
+                    code,
+                    message_type,
+                    requirement,
                 }
                 .pack()
                 .unwrap(),
@@ -1493,6 +1523,81 @@ mod tests {
             "mirrored permission parent id diverged from chainbase"
         );
         assert_eq!(threshold, 1, "mirrored authority threshold did not round-trip");
+        Ok(())
+    }
+
+    /// Permission-link oracle: linkauth binding an action to a permission must
+    /// mirror into the arena. The link is keyed by (account, code, message_type)
+    /// and the mirrored required_permission must equal chainbase's, read back
+    /// through the find_permission_link accessor added to the FFI.
+    #[cfg(feature = "arena-shadow")]
+    #[tokio::test]
+    async fn oracle_linkauth_mirrors_permission_link() -> Result<(), ChainError> {
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
+        let private_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let mempool = Arc::new(RwLock::new(Mempool::new()));
+        let mut mempool = mempool.write().await;
+        let mut controller = Controller::new();
+        let genesis_bytes = generate_genesis(&private_key);
+        let temp_path = get_temp_dir();
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": private_key.to_string(),
+        })
+        .to_string()
+        .into_bytes();
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &genesis_bytes.to_vec(),
+            temp_path.path().to_str().unwrap(),
+        )?;
+        let chain_id = controller.chain_id().clone();
+        let glenn = Name::from_str("glenn")?;
+        let perm = Name::from_str("claude")?;
+        let msg_type = Name::from_str("transfer")?;
+
+        mempool.add_transaction(create_account(&private_key, glenn, chain_id)?);
+        // Create the target permission, then link glenn's "transfer" actions on
+        // its own scope to require it.
+        mempool.add_transaction(update_auth(
+            &private_key,
+            glenn,
+            perm,
+            ACTIVE_NAME,
+            1,
+            chain_id,
+        )?);
+        mempool.add_transaction(link_auth(
+            &private_key,
+            glenn,
+            glenn,
+            msg_type,
+            perm,
+            chain_id,
+        )?);
+        let block = controller.build_block(&mut mempool).await?;
+        controller.accept_block(&block.id()?, &mut mempool)?;
+
+        let db = controller.database();
+        let (account, code, mtype) = (glenn.as_u64(), glenn.as_u64(), msg_type.as_u64());
+        let ptr = db.find_permission_link(account, code, mtype)?;
+        assert!(!ptr.is_null(), "chainbase is missing the permission link");
+        // Safe: non-null, and no mutation happens before the accessor read.
+        let chain_link = unsafe { &*ptr };
+        let required = db
+            .arena_permission_link(account, code, mtype)
+            .expect("arena is missing the permission link");
+
+        assert_eq!(
+            required,
+            chain_link.get_required_permission(),
+            "mirrored permission link required_permission diverged from chainbase"
+        );
+        assert_eq!(required, perm.as_u64(), "link did not point at the new permission");
         Ok(())
     }
 

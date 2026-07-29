@@ -200,6 +200,7 @@ pub mod ffi {
 
         #[cxx_name = "permission_link_object"]
         type PermissionLinkObject;
+        pub fn get_required_permission(self: &PermissionLinkObject) -> u64;
 
         #[cxx_name = "code_object"]
         type CodeObject;
@@ -459,6 +460,12 @@ pub mod ffi {
             actor: u64,
             permission: u64,
         ) -> Result<*const PermissionObject>;
+        pub fn find_permission_link(
+            self: &Database,
+            account_name: u64,
+            code_name: u64,
+            message_type: u64,
+        ) -> Result<*const PermissionLinkObject>;
         pub fn delete_auth(
             self: Pin<&mut Database>,
             account: u64,

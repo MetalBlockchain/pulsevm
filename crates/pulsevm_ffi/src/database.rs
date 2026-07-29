@@ -190,6 +190,23 @@ impl Database {
         }
     }
 
+    /// Required permission of the mirrored permission_link for `(account, code,
+    /// message_type)`, or `None` when shadowing is off / the link is absent — for
+    /// diffing against chainbase's `find_permission_link`.
+    pub fn arena_permission_link(&self, account: u64, code: u64, message_type: u64) -> Option<u64> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow
+                .as_ref()
+                .and_then(|s| s.permission_link(account, code, message_type))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = (account, code, message_type);
+            None
+        }
+    }
+
     /// Whether the arena mirror holds an account_object for `name` — for diffing
     /// against chainbase's `find_account`.
     pub fn arena_account_exists(&self, name: u64) -> bool {
@@ -891,6 +908,18 @@ impl Database {
             .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
 
         Ok(res)
+    }
+
+    pub fn find_permission_link(
+        &self,
+        account_name: u64,
+        code_name: u64,
+        message_type: u64,
+    ) -> Result<*const ffi::PermissionLinkObject, ChainError> {
+        let guard = self.inner.read()?;
+        guard
+            .find_permission_link(account_name, code_name, message_type)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 
     pub fn get_permission_by_actor_and_permission(
