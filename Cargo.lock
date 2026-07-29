@@ -3386,7 +3386,6 @@ dependencies = [
  "jsonrpsee",
  "lru",
  "prost-types",
- "pulsevm_arena",
  "pulsevm_billable_size",
  "pulsevm_constants",
  "pulsevm_crypto",
@@ -3412,7 +3411,6 @@ dependencies = [
  "wasmer-compiler-llvm",
  "wasmer-middlewares",
  "wat",
- "zerocopy",
 ]
 
 [[package]]

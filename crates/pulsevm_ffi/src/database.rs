@@ -114,6 +114,23 @@ impl Database {
         Ok(())
     }
 
+    /// The arena mirror's account_metadata privileged flag for `name`, or
+    /// `None` if the mirror has no such row / shadowing is off — for diffing
+    /// against chainbase's `find_account_metadata`.
+    pub fn arena_account_metadata_privileged(&self, name: u64) -> Option<bool> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow
+                .as_ref()
+                .and_then(|s| s.account_metadata_privileged(name))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = name;
+            None
+        }
+    }
+
     /// State root of the mirrored subset, or `None` when shadowing is off. Only
     /// ported tables contribute, so it is comparable to chainbase for those.
     pub fn arena_state_root(&self) -> Option<[u8; 32]> {

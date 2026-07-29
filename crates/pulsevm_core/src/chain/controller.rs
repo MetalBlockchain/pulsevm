@@ -74,11 +74,6 @@ pub struct Controller {
     chain_id: Id,
     state: vm::State,
 
-    // Native-arena mirror of chainbase, driven in lockstep so its per-block root
-    // can be checked against chainbase. Only present in `arena-shadow` builds.
-    #[cfg(feature = "arena-shadow")]
-    shadow: Option<crate::chain::shadow_state::ShadowDb>,
-
     block_log: Option<StateHistoryLog>,
     trace_log: Option<StateHistoryLog>,
     chain_state_log: Option<StateHistoryLog>,
@@ -113,9 +108,6 @@ impl Controller {
             chain_id: Id::default(),
             state: vm::State::Unspecified,
 
-            #[cfg(feature = "arena-shadow")]
-            shadow: None,
-
             block_log: None,
             trace_log: None,
             chain_state_log: None,
@@ -146,6 +138,9 @@ impl Controller {
         self.db = Database::new(&db_path, self.node_config.as_ref().unwrap().db_size)
             .map_err(|e| ChainError::InternalError(format!("failed to open database: {}", e)))?;
         self.db.add_indices()?;
+        // Bring up the arena mirror now, before any write, so every ported
+        // mutation is reflected. A no-op unless the arena-shadow feature is on.
+        self.db.enable_shadow()?;
 
         // Parse genesis bytes
         let genesis_json = std::str::from_utf8(genesis_bytes).map_err(|e| {
@@ -198,20 +193,6 @@ impl Controller {
         }
 
         let revision = self.db.revision();
-
-        // Bring the arena mirror up at the same revision chainbase is at. It
-        // starts empty; write sites feed it as tables are ported (see
-        // shadow_state.rs), and its root is checked at the accept boundary.
-        #[cfg(feature = "arena-shadow")]
-        {
-            let shadow = crate::chain::shadow_state::ShadowDb::new().map_err(|e| {
-                ChainError::InternalError(format!("failed to init arena shadow: {e:?}"))
-            })?;
-            shadow.set_revision(revision).map_err(|e| {
-                ChainError::InternalError(format!("failed to set arena revision: {e:?}"))
-            })?;
-            self.shadow = Some(shadow);
-        }
 
         let block_log_range = self.block_log.as_ref().unwrap().range();
 
@@ -474,15 +455,14 @@ impl Controller {
         self.db.commit(block.block_num() as i64)?;
 
         // Accept boundary: commit the arena mirror in lockstep and surface its
-        // root. Once writes are mirrored this is where chainbase and arena get
-        // compared; for now it tracks the ported subset.
-        #[cfg(feature = "arena-shadow")]
-        if let Some(shadow) = &self.shadow {
-            shadow.commit(block.block_num() as i64);
+        // root. The full session lockstep across build/verify is still to come;
+        // for now this commits and logs the ported subset the shadow carries.
+        self.db.arena_commit(block.block_num() as i64);
+        if let Some(root) = self.db.arena_state_root() {
             debug!(
                 "arena shadow root at block {}: {}",
                 block.block_num(),
-                hex::encode(shadow.state_root())
+                hex::encode(root)
             );
         }
 
@@ -975,6 +955,7 @@ mod tests {
                 "target_block_cpu_usage_pct": 2500,
                 "max_transaction_cpu_usage": 150000,
                 "min_transaction_cpu_usage": 100,
+                "max_transaction_lifetime": 4294967295u32,
                 "max_inline_action_size": 4096,
                 "max_inline_action_depth": 6,
                 "max_authority_depth": 6,
@@ -1072,6 +1053,60 @@ mod tests {
         .sign(&private_key, &chain_id)?;
         let packed_trx = PackedTransaction::from_signed_transaction(trx)?;
         Ok(packed_trx)
+    }
+
+    /// Oracle harness (step 1): run a real newaccount transaction through the
+    /// controller and check the arena mirror agrees with chainbase on the new
+    /// account's metadata. Executing the action drives the same `create_account`
+    /// / `create_account_metadata` paths that carry the mirror hooks. This is the
+    /// feedback loop the session-lockstep work is built against.
+    #[cfg(feature = "arena-shadow")]
+    #[tokio::test]
+    async fn oracle_newaccount_mirrors_into_arena() -> Result<(), ChainError> {
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
+        let private_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let mut controller = Controller::new();
+        let genesis_bytes = generate_genesis(&private_key);
+        let temp_path = get_temp_dir();
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": private_key.to_string(),
+        })
+        .to_string()
+        .into_bytes();
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &genesis_bytes.to_vec(),
+            temp_path.path().to_str().unwrap(),
+        )?;
+        let ts = controller.last_accepted_block().timestamp().clone();
+        let chain_id = controller.chain_id().clone();
+        let status = BlockStatus::Building;
+
+        controller.execute_transaction(
+            &create_account(&private_key, Name::from_str("glenn")?, chain_id)?,
+            &ts,
+            &status,
+        )?;
+
+        let db = controller.database();
+        let name = Name::from_str("glenn")?.as_u64();
+        // chainbase created the account_metadata...
+        assert!(
+            !db.find_account_metadata(name)?.is_null(),
+            "chainbase is missing glenn's account_metadata"
+        );
+        // ...and the arena mirror must carry the same row.
+        assert_eq!(
+            db.arena_account_metadata_privileged(name),
+            Some(false),
+            "arena did not mirror glenn's account_metadata"
+        );
+        Ok(())
     }
 
     #[tokio::test]

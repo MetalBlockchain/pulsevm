@@ -762,6 +762,16 @@ impl ArenaShadow {
         Ok(())
     }
 
+    /// Whether the mirror holds an account_metadata row for `name`, and its
+    /// privileged flag — for diffing against chainbase.
+    pub fn account_metadata_privileged(&self, name: u64) -> Option<bool> {
+        self.lock()
+            .find_by::<AccountMetaRow, AccountMetaRowByName>(&name)
+            .ok()
+            .flatten()
+            .map(|row| row.privileged != 0)
+    }
+
     pub fn set_privileged(&self, name: u64, privileged: bool) -> Result<(), DbError> {
         let mut db = self.lock();
         let id = db
