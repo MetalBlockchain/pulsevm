@@ -1542,6 +1542,70 @@ impl ArenaShadow {
         out
     }
 
+    /// Canonical serialization of the contract table_id_object rows in
+    /// (code, scope, table) order: code, scope, table, payer (u64 LE each),
+    /// count (u32 LE). No genesis rows (contracts create tables at runtime).
+    pub fn contract_table_state_bytes(&self) -> Vec<u8> {
+        let db = self.lock();
+        let mut rows: Vec<(u64, u64, u64, u64, u32)> = match db.table::<ContractTableRow>() {
+            Ok(t) => t
+                .iter()
+                .map(|r| (r.code, r.scope, r.table, r.payer, r.count))
+                .collect(),
+            Err(_) => return Vec::new(),
+        };
+        rows.sort_by_key(|r| (r.0, r.1, r.2));
+        let mut out = Vec::new();
+        for (code, scope, table, payer, count) in rows {
+            out.extend_from_slice(&code.to_le_bytes());
+            out.extend_from_slice(&scope.to_le_bytes());
+            out.extend_from_slice(&table.to_le_bytes());
+            out.extend_from_slice(&payer.to_le_bytes());
+            out.extend_from_slice(&count.to_le_bytes());
+        }
+        out
+    }
+
+    /// Canonical serialization of the contract key_value rows in
+    /// (code, scope, table, primary_key) order, with the table identity resolved
+    /// from `t_id` (so the arena's own ids are never serialized): code, scope,
+    /// table, primary_key, payer (u64 LE each), then a length-prefixed value.
+    pub fn contract_kv_state_bytes(&self) -> Vec<u8> {
+        use std::collections::HashMap;
+        let db = self.lock();
+        let table_key: HashMap<i64, (u64, u64, u64)> = match db.table::<ContractTableRow>() {
+            Ok(t) => t
+                .iter()
+                .map(|r| (r.id().raw(), (r.code, r.scope, r.table)))
+                .collect(),
+            Err(_) => return Vec::new(),
+        };
+        let mut refs: Vec<(u64, u64, u64, u64, u64, BlobRef)> = match db.table::<ContractKeyValueRow>() {
+            Ok(t) => t
+                .iter()
+                .filter_map(|r| {
+                    table_key
+                        .get(&r.t_id)
+                        .map(|&(c, s, tb)| (c, s, tb, r.primary_key, r.payer, r.value))
+                })
+                .collect(),
+            Err(_) => return Vec::new(),
+        };
+        refs.sort_by_key(|r| (r.0, r.1, r.2, r.3));
+        let mut out = Vec::new();
+        for (code, scope, table, primary, payer, value_ref) in refs {
+            out.extend_from_slice(&code.to_le_bytes());
+            out.extend_from_slice(&scope.to_le_bytes());
+            out.extend_from_slice(&table.to_le_bytes());
+            out.extend_from_slice(&primary.to_le_bytes());
+            out.extend_from_slice(&payer.to_le_bytes());
+            let value = db.blob::<ContractKeyValueRow>(value_ref).unwrap_or(&[]);
+            out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            out.extend_from_slice(value);
+        }
+        out
+    }
+
     /// Mirrors `remove_permission` (and the `delete_auth` path that calls it):
     /// removes the permission and its linked `permission_usage_object`.
     pub fn remove_permission(&self, owner: u64, perm_name: u64) -> Result<(), DbError> {

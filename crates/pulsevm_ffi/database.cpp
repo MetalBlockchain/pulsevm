@@ -494,6 +494,40 @@ rust::Vec<uint8_t> database_wrapper::resource_state_bytes() const {
     return out;
 }
 
+rust::Vec<uint8_t> database_wrapper::contract_table_state_bytes() const {
+    rust::Vec<uint8_t> out;
+    auto put_u64 = [&](uint64_t v){ for (int i = 0; i < 8; ++i) out.push_back(static_cast<uint8_t>(v >> (8 * i))); };
+    auto put_u32 = [&](uint32_t v){ for (int i = 0; i < 4; ++i) out.push_back(static_cast<uint8_t>(v >> (8 * i))); };
+    const auto& idx = this->get_index<table_id_multi_index, by_code_scope_table>();
+    for (const auto& o : idx) {
+        put_u64(o.code.to_uint64_t());
+        put_u64(o.scope.to_uint64_t());
+        put_u64(o.table.to_uint64_t());
+        put_u64(o.payer.to_uint64_t());
+        put_u32(o.count);
+    }
+    return out;
+}
+
+rust::Vec<uint8_t> database_wrapper::contract_kv_state_bytes() const {
+    rust::Vec<uint8_t> out;
+    auto put_u64 = [&](uint64_t v){ for (int i = 0; i < 8; ++i) out.push_back(static_cast<uint8_t>(v >> (8 * i))); };
+    auto put_u32 = [&](uint32_t v){ for (int i = 0; i < 4; ++i) out.push_back(static_cast<uint8_t>(v >> (8 * i))); };
+    const auto& idx = this->get_index<key_value_index, by_scope_primary>();
+    for (const auto& o : idx) {
+        const auto& t = this->get<table_id_object>(o.t_id);
+        put_u64(t.code.to_uint64_t());
+        put_u64(t.scope.to_uint64_t());
+        put_u64(t.table.to_uint64_t());
+        put_u64(o.primary_key);
+        put_u64(o.payer.to_uint64_t());
+        const auto& v = o.get_value();
+        put_u32(static_cast<uint32_t>(v.size()));
+        for (size_t i = 0; i < v.size(); ++i) out.push_back(static_cast<uint8_t>(v.data()[i]));
+    }
+    return out;
+}
+
 rust::Vec<uint8_t> database_wrapper::pack_deltas(bool full_snapshot) const {
     fc::datastream<size_t> ps;
     pulsevm::state_history::pack_deltas(ps, *this, full_snapshot);

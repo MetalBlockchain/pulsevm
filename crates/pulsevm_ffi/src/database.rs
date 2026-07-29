@@ -447,6 +447,42 @@ impl Database {
         }
     }
 
+    pub fn contract_table_state_bytes(&self) -> Result<Vec<u8>, ChainError> {
+        let guard = self.inner.read()?;
+        guard
+            .contract_table_state_bytes()
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
+    pub fn contract_kv_state_bytes(&self) -> Result<Vec<u8>, ChainError> {
+        let guard = self.inner.read()?;
+        guard
+            .contract_kv_state_bytes()
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
+    pub fn arena_contract_table_state_bytes(&self) -> Option<Vec<u8>> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow.as_ref().map(|s| s.contract_table_state_bytes())
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            None
+        }
+    }
+
+    pub fn arena_contract_kv_state_bytes(&self) -> Option<Vec<u8>> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow.as_ref().map(|s| s.contract_kv_state_bytes())
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            None
+        }
+    }
+
     /// Whether the arena mirror holds an account_object for `name` — for diffing
     /// against chainbase's `find_account`.
     pub fn arena_account_exists(&self, name: u64) -> bool {

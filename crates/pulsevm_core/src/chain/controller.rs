@@ -2551,6 +2551,91 @@ mod tests {
         Ok(())
     }
 
+    /// Cross-impl root for the contract primary tables. A block deploys the
+    /// token contract and runs its `create` action, which stores a currency-stats
+    /// row — populating table_id_object and key_value_object through the mirrored
+    /// create path. Both sides serialize the two tables (the arena resolves the
+    /// table identity from t_id so its own ids never leak into the bytes) and the
+    /// roots must match. Contract row UPDATES (issue/transfer) are not mirrored
+    /// yet — update_key_value_object reaches the row by an opaque handle whose
+    /// table id is not resolvable through the FFI — so this covers the create
+    /// path only; the full contract db is separately diff-tested vs C++ in
+    /// diff_contract_iter.
+    #[cfg(feature = "arena-shadow")]
+    #[tokio::test]
+    async fn oracle_cross_impl_contract_root() -> Result<(), ChainError> {
+        use sha2::{Digest, Sha256};
+
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
+        let private_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let mempool = Arc::new(RwLock::new(Mempool::new()));
+        let mut mempool = mempool.write().await;
+        let mut controller = Controller::new();
+        let genesis_bytes = generate_genesis(&private_key);
+        let temp_path = get_temp_dir();
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": private_key.to_string(),
+        })
+        .to_string()
+        .into_bytes();
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &genesis_bytes.to_vec(),
+            temp_path.path().to_str().unwrap(),
+        )?;
+        let chain_id = controller.chain_id().clone();
+        let glenn = Name::from_str("glenn")?;
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let wasm =
+            fs::read(root.join(Path::new("reference_contracts/pulse_token.wasm"))).unwrap();
+
+        mempool.add_transaction(create_account(&private_key, glenn, chain_id)?);
+        mempool.add_transaction(set_code(&private_key, glenn, wasm, chain_id)?);
+        mempool.add_transaction(call_contract(
+            &private_key,
+            glenn,
+            Name::from_str("create")?,
+            &Create {
+                issuer: glenn,
+                max_supply: Asset::new(1000000, Symbol(1162826500)),
+            },
+            chain_id,
+        )?);
+        let block = controller.build_block(&mut mempool).await?;
+        controller.accept_block(&block.id()?, &mut mempool)?;
+
+        let db = controller.database();
+        let tables: Vec<(&str, Vec<u8>, Vec<u8>)> = vec![
+            ("table_id", db.contract_table_state_bytes()?, db.arena_contract_table_state_bytes().unwrap()),
+            ("key_value", db.contract_kv_state_bytes()?, db.arena_contract_kv_state_bytes().unwrap()),
+        ];
+        let mut chain_root = Sha256::new();
+        let mut arena_root = Sha256::new();
+        for (name, chain_bytes, arena_bytes) in &tables {
+            assert_eq!(chain_bytes, arena_bytes, "cross-impl contract state diverged for {name}");
+            chain_root.update(chain_bytes);
+            arena_root.update(arena_bytes);
+        }
+        assert_eq!(
+            <[u8; 32]>::from(chain_root.finalize()),
+            <[u8; 32]>::from(arena_root.finalize()),
+            "cross-impl contract root diverged"
+        );
+        assert!(!tables[0].1.is_empty(), "expected the create action to make a table");
+        assert!(!tables[1].1.is_empty(), "expected the create action to store a row");
+        Ok(())
+    }
+
     /// Block-sequence fuzzer: random sequences of blocks — each with a few
     /// newaccount transactions, then either accepted or discarded — must keep
     /// the arena mirror in step with chainbase. After every block, for every

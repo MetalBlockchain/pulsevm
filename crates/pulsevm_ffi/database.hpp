@@ -302,6 +302,12 @@ public:
     rust::Vec<uint8_t> account_limits_state_bytes() const;
     rust::Vec<uint8_t> resource_state_bytes() const;
 
+    // Contract primary tables. table_id: code, scope, table, payer, count.
+    // key_value: the table's (code, scope, table) resolved from t_id, then
+    // primary_key, payer, length-prefixed value.
+    rust::Vec<uint8_t> contract_table_state_bytes() const;
+    rust::Vec<uint8_t> contract_kv_state_bytes() const;
+
     bool set_account_limits( uint64_t account, int64_t ram_bytes, int64_t net_weight, int64_t cpu_weight) {
         auto find_or_create_pending_limits = [&]() -> const resource_limits::resource_limits_object& {
             const auto* pending_limits = this->find<resource_limits::resource_limits_object, resource_limits::by_owner>( boost::make_tuple(true, name(account)) );
