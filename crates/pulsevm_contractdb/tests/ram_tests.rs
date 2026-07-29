@@ -11,8 +11,8 @@ const BOB: u64 = 200;
 
 // Overheads mirrored from the crate (kept in sync with its consts).
 const KV_OVERHEAD: i64 = 112;
-const IDX64_OVERHEAD: i64 = 80;
-const TABLE_OVERHEAD: i64 = 44;
+const IDX64_OVERHEAD: i64 = 128;
+const TABLE_OVERHEAD: i64 = 112;
 
 #[test]
 fn store_bills_payer_including_table_and_value() {

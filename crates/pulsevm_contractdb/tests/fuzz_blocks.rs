@@ -17,7 +17,7 @@ use pulsevm_contractdb::ContractDb;
 const CODE: u64 = 10;
 const TABLE: u64 = 20;
 const KV_OVERHEAD: i64 = 112;
-const TABLE_OVERHEAD: i64 = 44;
+const TABLE_OVERHEAD: i64 = 112;
 
 type Rows = BTreeMap<(u64, u64, u64, u64), (u64, Vec<u8>)>;
 type Tables = BTreeSet<(u64, u64, u64)>;
