@@ -738,12 +738,20 @@ impl Database {
         net_weight: i64,
         cpu_weight: i64,
     ) -> Result<bool, ChainError> {
-        let mut guard = self.inner.write()?;
-        let pinned = guard.pin_mut();
-
-        pinned
-            .set_account_limits(account_name, ram_bytes, net_weight, cpu_weight)
-            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+        let res = {
+            let mut guard = self.inner.write()?;
+            let pinned = guard.pin_mut();
+            pinned
+                .set_account_limits(account_name, ram_bytes, net_weight, cpu_weight)
+                .map_err(|e| ChainError::InternalError(format!("{}", e)))?
+        };
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && let Err(e) = s.set_account_limits(account_name, ram_bytes, net_weight, cpu_weight)
+        {
+            eprintln!("arena mirror of set_account_limits diverged: {e:?}");
+        }
+        Ok(res)
     }
 
     pub fn get_account_limits(
@@ -801,12 +809,37 @@ impl Database {
     }
 
     pub fn process_account_limit_updates(&mut self) -> Result<(), ChainError> {
-        let mut guard = self.inner.write()?;
-        let pinned = guard.pin_mut();
+        {
+            let mut guard = self.inner.write()?;
+            let pinned = guard.pin_mut();
+            pinned
+                .process_account_limit_updates()
+                .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        }
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && let Err(e) = s.process_account_limit_updates()
+        {
+            eprintln!("arena mirror of process_account_limit_updates diverged: {e:?}");
+        }
+        Ok(())
+    }
 
-        pinned
-            .process_account_limit_updates()
-            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    /// Mirrored effective limits `(ram_bytes, net_weight, cpu_weight)` for
+    /// `account_name`, or `None` when shadowing is off / the account is absent —
+    /// for diffing against chainbase's `get_account_limits`.
+    pub fn arena_account_limits(&self, account_name: u64) -> Option<(i64, i64, i64)> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow
+                .as_ref()
+                .and_then(|s| s.account_limits(account_name))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = account_name;
+            None
+        }
     }
 
     pub fn set_block_parameters(

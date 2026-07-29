@@ -126,6 +126,43 @@ struct ResourceUsageRow {
     cpu_usage: UsageAccumulator,
 }
 
+/// Arena mirror of chainbase `resource_limits::resource_limits_object`. Chainbase
+/// keeps two rows per account keyed by `(pending, owner)`: the committed limits
+/// (`pending = false`) and, while a change is staged, a pending copy. -1 means
+/// unlimited. The global total-weight bookkeeping that `process_account_limit_
+/// updates` also touches lives in a separate object not mirrored here yet.
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout)]
+struct ResourceLimitsRow {
+    id: ObjectId<ResourceLimitsRow>,
+    owner: u64,
+    ram_bytes: i64,
+    net_weight: i64,
+    cpu_weight: i64,
+    pending: u8,
+    _pad: [u8; 7],
+}
+
+struct LimitsByOwner;
+impl IndexedBy<ResourceLimitsRow> for LimitsByOwner {
+    type Key = (u8, u64);
+    fn key(o: &ResourceLimitsRow) -> Self::Key {
+        (o.pending, o.owner)
+    }
+}
+impl ArenaObject for ResourceLimitsRow {
+    const TYPE_ID: u16 = 17;
+    fn id(&self) -> ObjectId<Self> {
+        self.id
+    }
+    fn set_id(&mut self, id: ObjectId<Self>) {
+        self.id = id;
+    }
+    fn secondary_indices() -> Vec<Box<dyn SecondaryIndex<Self>>> {
+        vec![key_index::<Self, LimitsByOwner>()]
+    }
+}
+
 /// Arena mirror of chainbase `permission_object`. `auth` (a `shared_authority`)
 /// is variable-length, so it is encoded into the blob arena; the row holds the
 /// `BlobRef`. The three secondary indices reproduce chainbase's key ordering
@@ -801,6 +838,7 @@ impl ArenaShadow {
         db.add_table::<ContractIndexDoubleRow>()?;
         db.add_table::<ContractIndexLongDoubleRow>()?;
         db.add_table::<ResourceUsageRow>()?;
+        db.add_table::<ResourceLimitsRow>()?;
         Ok(ArenaShadow {
             inner: Arc::new(Mutex::new(db)),
         })
@@ -1119,13 +1157,111 @@ impl ArenaShadow {
     // ----- resource_usage (RAM) ---------------------------------------------
 
     /// Mirrors `initialize_account_resource_limits`: creates the account's
-    /// resource_usage row with zero RAM, matching chainbase.
+    /// resource_usage row (zero RAM) and its committed resource_limits row (-1
+    /// unlimited on every dimension), matching chainbase.
     pub fn initialize_account_resource_limits(&self, owner: u64) -> Result<(), DbError> {
-        self.lock().create::<ResourceUsageRow>(|r| {
+        let mut db = self.lock();
+        db.create::<ResourceUsageRow>(|r| {
             r.owner = owner;
             r.ram_usage = 0;
         })?;
+        db.create::<ResourceLimitsRow>(|r| {
+            r.owner = owner;
+            r.pending = 0;
+            r.ram_bytes = -1;
+            r.net_weight = -1;
+            r.cpu_weight = -1;
+        })?;
         Ok(())
+    }
+
+    /// Mirrors `set_account_limits`: stages the new limits on a pending row,
+    /// creating it as a copy of the committed row on first change (matching
+    /// chainbase's find-or-create-pending). The global weight totals are updated
+    /// on commit in `process_account_limit_updates`, not here.
+    pub fn set_account_limits(
+        &self,
+        account: u64,
+        ram_bytes: i64,
+        net_weight: i64,
+        cpu_weight: i64,
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let pending = db
+            .find_by::<ResourceLimitsRow, LimitsByOwner>(&(1u8, account))?
+            .map(|r| r.id());
+        let id = match pending {
+            Some(id) => id,
+            None => {
+                let actual = db
+                    .find_by::<ResourceLimitsRow, LimitsByOwner>(&(0u8, account))?
+                    .map(|r| (r.ram_bytes, r.net_weight, r.cpu_weight));
+                let Some((a_ram, a_net, a_cpu)) = actual else {
+                    return Ok(());
+                };
+                db.create::<ResourceLimitsRow>(|r| {
+                    r.owner = account;
+                    r.pending = 1;
+                    r.ram_bytes = a_ram;
+                    r.net_weight = a_net;
+                    r.cpu_weight = a_cpu;
+                })?
+                .id()
+            }
+        };
+        db.modify::<ResourceLimitsRow>(id, |r| {
+            r.ram_bytes = ram_bytes;
+            r.net_weight = net_weight;
+            r.cpu_weight = cpu_weight;
+        })?;
+        Ok(())
+    }
+
+    /// Mirrors the account-row half of `process_account_limit_updates`: copies
+    /// each pending row onto its committed row and drops the pending row. The
+    /// global total-weight bookkeeping is not mirrored (separate object).
+    pub fn process_account_limit_updates(&self) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let pendings: Vec<(ObjectId<ResourceLimitsRow>, u64, i64, i64, i64)> = {
+            let table = db.table::<ResourceLimitsRow>()?;
+            table
+                .iter()
+                .filter(|r| r.pending == 1)
+                .map(|r| (r.id(), r.owner, r.ram_bytes, r.net_weight, r.cpu_weight))
+                .collect()
+        };
+        for (pending_id, owner, ram_bytes, net_weight, cpu_weight) in pendings {
+            let actual = db
+                .find_by::<ResourceLimitsRow, LimitsByOwner>(&(0u8, owner))?
+                .map(|r| r.id());
+            if let Some(actual_id) = actual {
+                db.modify::<ResourceLimitsRow>(actual_id, |r| {
+                    r.ram_bytes = ram_bytes;
+                    r.net_weight = net_weight;
+                    r.cpu_weight = cpu_weight;
+                })?;
+            }
+            db.remove::<ResourceLimitsRow>(pending_id)?;
+        }
+        Ok(())
+    }
+
+    /// Effective limits `(ram_bytes, net_weight, cpu_weight)` for `account` —
+    /// pending row if one is staged, else the committed row — mirroring
+    /// chainbase's `get_account_limits`.
+    pub fn account_limits(&self, account: u64) -> Option<(i64, i64, i64)> {
+        let db = self.lock();
+        if let Some(r) = db
+            .find_by::<ResourceLimitsRow, LimitsByOwner>(&(1u8, account))
+            .ok()
+            .flatten()
+        {
+            return Some((r.ram_bytes, r.net_weight, r.cpu_weight));
+        }
+        db.find_by::<ResourceLimitsRow, LimitsByOwner>(&(0u8, account))
+            .ok()
+            .flatten()
+            .map(|r| (r.ram_bytes, r.net_weight, r.cpu_weight))
     }
 
     /// Mirrors `add_pending_ram_usage`: applies the externally-computed byte

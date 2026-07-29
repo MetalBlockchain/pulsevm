@@ -1890,6 +1890,55 @@ mod tests {
         Ok(())
     }
 
+    /// Resource-limits oracle: creating an account initializes its committed
+    /// resource_limits row to unlimited (-1). The mirrored effective limits must
+    /// equal chainbase's get_account_limits after a newaccount block. (The
+    /// pending/commit cycle is exercised at the Database boundary in the ffi
+    /// arena_shadow tests, since no action in this chain calls set_account_limits.)
+    #[cfg(feature = "arena-shadow")]
+    #[tokio::test]
+    async fn oracle_account_limits_mirror_defaults() -> Result<(), ChainError> {
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
+        let private_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let mempool = Arc::new(RwLock::new(Mempool::new()));
+        let mut mempool = mempool.write().await;
+        let mut controller = Controller::new();
+        let genesis_bytes = generate_genesis(&private_key);
+        let temp_path = get_temp_dir();
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": private_key.to_string(),
+        })
+        .to_string()
+        .into_bytes();
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &genesis_bytes.to_vec(),
+            temp_path.path().to_str().unwrap(),
+        )?;
+        let chain_id = controller.chain_id().clone();
+        let glenn = Name::from_str("glenn")?;
+
+        mempool.add_transaction(create_account(&private_key, glenn, chain_id)?);
+        let block = controller.build_block(&mut mempool).await?;
+        controller.accept_block(&block.id()?, &mut mempool)?;
+
+        let db = controller.database();
+        let name = glenn.as_u64();
+        let (mut ram, mut net, mut cpu) = (0i64, 0i64, 0i64);
+        db.get_account_limits(name, &mut ram, &mut net, &mut cpu)?;
+        let arena = db
+            .arena_account_limits(name)
+            .expect("arena is missing the resource_limits row");
+        assert_eq!(arena, (ram, net, cpu), "mirrored account limits diverged");
+        assert_eq!(arena, (-1, -1, -1), "expected unlimited defaults at init");
+        Ok(())
+    }
+
     /// Block-sequence fuzzer: random sequences of blocks — each with a few
     /// newaccount transactions, then either accepted or discarded — must keep
     /// the arena mirror in step with chainbase. After every block, for every

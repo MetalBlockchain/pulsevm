@@ -46,6 +46,44 @@ fn account_metadata_writes_mirror_into_the_arena() {
     assert_eq!(kept, db.arena_state_root().unwrap(), "commit did not keep the mirror");
 }
 
+/// The resource_limits pending/commit cycle has no action path in this chain,
+/// so it is exercised directly at the Database boundary: chainbase does each
+/// write, and the mirror must agree with get_account_limits at every step —
+/// unlimited at init, the staged values once set, and the same after commit.
+#[test]
+fn account_limits_pending_and_commit_mirror() {
+    let dir = tempdir().unwrap();
+    let mut db = Database::new(dir.path().to_str().unwrap(), DB_SIZE).unwrap();
+    db.add_indices().unwrap();
+    db.initialize_resource_limits().unwrap();
+    db.enable_shadow().unwrap();
+    db.arena_start_undo_session();
+
+    let acct = 0x9999u64;
+
+    let check = |db: &Database| {
+        let (mut ram, mut net, mut cpu) = (0i64, 0i64, 0i64);
+        db.get_account_limits(acct, &mut ram, &mut net, &mut cpu).unwrap();
+        assert_eq!(
+            db.arena_account_limits(acct),
+            Some((ram, net, cpu)),
+            "mirror disagreed with chainbase get_account_limits"
+        );
+        (ram, net, cpu)
+    };
+
+    db.initialize_account_resource_limits(acct).unwrap();
+    assert_eq!(check(&db), (-1, -1, -1), "init should be unlimited");
+
+    // Staged on a pending row: the effective limits change immediately.
+    db.set_account_limits(acct, 8192, 100, 200).unwrap();
+    assert_eq!(check(&db), (8192, 100, 200), "pending limits not effective");
+
+    // Commit merges pending into the committed row and drops the pending row.
+    db.process_account_limit_updates().unwrap();
+    assert_eq!(check(&db), (8192, 100, 200), "committed limits diverged");
+}
+
 #[test]
 fn shadow_is_absent_until_enabled() {
     let dir = tempdir().unwrap();
