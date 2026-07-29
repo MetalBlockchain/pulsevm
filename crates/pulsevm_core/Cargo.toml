@@ -40,6 +40,15 @@ pulsevm_serialization = { path = "../pulsevm_serialization" }
 pulsevm_ffi = { path = "../pulsevm_ffi" }
 pulsevm_wasm_validation = { path = "../pulsevm_wasm_validation" }
 
+# Only pulled in for the `arena-shadow` differential-testing build.
+pulsevm_arena = { path = "../pulsevm_arena", optional = true }
+zerocopy = { version = "0.8", features = ["derive"], optional = true }
+
+[features]
+# Mirrors state mutations into a native pulsevm_arena Db alongside chainbase so
+# the two can be compared per block. Off in normal builds; carries no cost there.
+arena-shadow = ["dep:pulsevm_arena", "dep:zerocopy"]
+
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 

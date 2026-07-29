@@ -74,6 +74,11 @@ pub struct Controller {
     chain_id: Id,
     state: vm::State,
 
+    // Native-arena mirror of chainbase, driven in lockstep so its per-block root
+    // can be checked against chainbase. Only present in `arena-shadow` builds.
+    #[cfg(feature = "arena-shadow")]
+    shadow: Option<crate::chain::shadow_state::ShadowDb>,
+
     block_log: Option<StateHistoryLog>,
     trace_log: Option<StateHistoryLog>,
     chain_state_log: Option<StateHistoryLog>,
@@ -107,6 +112,9 @@ impl Controller {
             verified_blocks: HashMap::new(),
             chain_id: Id::default(),
             state: vm::State::Unspecified,
+
+            #[cfg(feature = "arena-shadow")]
+            shadow: None,
 
             block_log: None,
             trace_log: None,
@@ -190,6 +198,21 @@ impl Controller {
         }
 
         let revision = self.db.revision();
+
+        // Bring the arena mirror up at the same revision chainbase is at. It
+        // starts empty; write sites feed it as tables are ported (see
+        // shadow_state.rs), and its root is checked at the accept boundary.
+        #[cfg(feature = "arena-shadow")]
+        {
+            let shadow = crate::chain::shadow_state::ShadowDb::new().map_err(|e| {
+                ChainError::InternalError(format!("failed to init arena shadow: {e:?}"))
+            })?;
+            shadow.set_revision(revision).map_err(|e| {
+                ChainError::InternalError(format!("failed to set arena revision: {e:?}"))
+            })?;
+            self.shadow = Some(shadow);
+        }
+
         let block_log_range = self.block_log.as_ref().unwrap().range();
 
         match block_log_range {
@@ -449,6 +472,19 @@ impl Controller {
         self.last_accepted_block = block.clone();
         self.last_accepted_block_id = block.id()?;
         self.db.commit(block.block_num() as i64)?;
+
+        // Accept boundary: commit the arena mirror in lockstep and surface its
+        // root. Once writes are mirrored this is where chainbase and arena get
+        // compared; for now it tracks the ported subset.
+        #[cfg(feature = "arena-shadow")]
+        if let Some(shadow) = &self.shadow {
+            shadow.commit(block.block_num() as i64);
+            debug!(
+                "arena shadow root at block {}: {}",
+                block.block_num(),
+                hex::encode(shadow.state_root())
+            );
+        }
 
         if self.get_state() == &vm::State::NormalOp {
             info!(
