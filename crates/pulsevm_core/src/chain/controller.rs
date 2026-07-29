@@ -2415,6 +2415,15 @@ mod tests {
                             assert_eq!(meta_arena, Some(false), "arena privileged flag diverged");
                         }
                     }
+                    // Cross-impl state root over the whole account_metadata table
+                    // after every block: the canonical serializations must stay
+                    // byte-identical through the speculative build/undo and commit
+                    // sessions, not just for the names this sequence touched.
+                    assert_eq!(
+                        db.account_metadata_state_bytes()?,
+                        db.arena_account_metadata_state_bytes().expect("shadow enabled"),
+                        "cross-impl account_metadata state diverged after a block"
+                    );
                 }
                 Ok::<(), ChainError>(())
             })
