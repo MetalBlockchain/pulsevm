@@ -3177,8 +3177,35 @@ mod tests {
             }
             replayed = n;
         }
+
+        // Read-surface check: the cross-impl root proves the arena *holds* the
+        // same rows as chainbase, but running as primary means the arena must
+        // *serve* reads. Drive the arena's raw contract read (arena_kv_get — the
+        // primitive behind db_get_i64) from chainbase's own enumeration of every
+        // contract row, and require the arena to return the same value bytes.
+        // Chainbase enumerates, the arena point-reads independently, so a match
+        // is a real read-path agreement, not a serialization tautology.
+        let db = controller.database();
+        let chain_kv = db.contract_kv_state_bytes()?;
+        let mut checked = 0u64;
+        let mut p = 0usize;
+        while p + 44 <= chain_kv.len() {
+            let u = |o: usize| u64::from_le_bytes(chain_kv[o..o + 8].try_into().unwrap());
+            let (code, scope, table, primary) = (u(p), u(p + 8), u(p + 16), u(p + 24));
+            let vlen = u32::from_le_bytes(chain_kv[p + 40..p + 44].try_into().unwrap()) as usize;
+            let value = &chain_kv[p + 44..(p + 44 + vlen).min(chain_kv.len())];
+            let got = db.arena_kv_get(code, scope, table, primary);
+            assert_eq!(
+                got.as_deref(),
+                Some(value),
+                "arena_kv_get({code},{scope},{table},{primary}) != chainbase value"
+            );
+            checked += 1;
+            p += 44 + vlen;
+        }
+
         eprintln!(
-            "replayed real testnet blocks up to {replayed}; C++ chainbase and the Rust arena matched the cross-impl full-state root at every block"
+            "replayed real testnet blocks up to {replayed}; C++ chainbase and the Rust arena matched the cross-impl full-state root at every block; arena served {checked} contract-row reads identical to chainbase"
         );
         Ok(())
     }

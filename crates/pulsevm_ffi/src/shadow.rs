@@ -2218,6 +2218,25 @@ impl ArenaShadow {
     /// Mirrors `update_key_value_object`: reassigns the value blob and payer of
     /// the row at `(code, scope, table, primary_key)`. The FFI reaches the row by
     /// an opaque handle, so the caller resolves the table key via `get_table_by_kv`.
+    /// Serve the raw contract-db read `(code, scope, table, primary_key)` -> value
+    /// from the arena — the primitive behind db_get_i64/db_find_i64. Returns the
+    /// stored value bytes, or `None` if the row is absent. This is the read the
+    /// arena must answer identically to chainbase to run as primary.
+    pub fn kv_get(&self, code: u64, scope: u64, table: u64, primary_key: u64) -> Option<Vec<u8>> {
+        let db = self.lock();
+        let t_id = db
+            .find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&(code, scope, table))
+            .ok()
+            .flatten()
+            .map(|t| t.id().raw())?;
+        let value_ref = db
+            .find_by::<ContractKeyValueRow, ContractKvByScopePrimary>(&(t_id, primary_key))
+            .ok()
+            .flatten()
+            .map(|k| k.value)?;
+        db.blob::<ContractKeyValueRow>(value_ref).ok().map(|b| b.to_vec())
+    }
+
     pub fn update_key_value_object(
         &self,
         code: u64,

@@ -485,6 +485,28 @@ impl Database {
         }
     }
 
+    /// Serve a raw contract-db read from the arena: the value stored at
+    /// `(code, scope, table, primary_key)`, or `None` if absent. This is the
+    /// primitive behind db_get_i64/db_find_i64 — the read the arena must answer
+    /// identically to chainbase to stand in as the primary store.
+    pub fn arena_kv_get(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary_key: u64,
+    ) -> Option<Vec<u8>> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow.as_ref().and_then(|s| s.kv_get(code, scope, table, primary_key))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = (code, scope, table, primary_key);
+            None
+        }
+    }
+
     /// Whether the arena mirror holds an account_object for `name` — for diffing
     /// against chainbase's `find_account`.
     pub fn arena_account_exists(&self, name: u64) -> bool {
