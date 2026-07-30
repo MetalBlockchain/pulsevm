@@ -547,6 +547,28 @@ impl Database {
         }
     }
 
+    /// Route contract reads through the arena instead of chainbase (the staged
+    /// cutover switch). No-op when shadowing is off.
+    pub fn enable_arena_reads(&self) {
+        #[cfg(feature = "arena-shadow")]
+        {
+            if let Some(s) = &self.shadow {
+                s.enable_reads();
+            }
+        }
+    }
+
+    pub fn arena_reads_enabled(&self) -> bool {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow.as_ref().map(|s| s.reads_enabled()).unwrap_or(false)
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            false
+        }
+    }
+
     /// (matches, mismatches) tallied by the inline read cross-check, or (0, 0)
     /// when shadowing is off.
     pub fn arena_read_crosscheck_counts(&self) -> (u64, u64) {

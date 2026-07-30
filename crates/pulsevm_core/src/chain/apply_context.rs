@@ -584,20 +584,31 @@ impl ApplyContext {
         // Inline read cross-check: the arena must serve this contract read — the
         // exact bytes at the exact key, at this point mid-execution (speculative,
         // pre-commit) — identically to chainbase. Stronger than the block-boundary
-        // root diff, which only sees committed state.
+        // root diff, which only sees committed state. When the cutover switch is
+        // on, the value the contract receives comes FROM the arena.
         #[cfg(feature = "arena-shadow")]
-        {
+        let arena_value: Option<Vec<u8>> = {
             let table_obj = inner.keyval_cache.get_table(obj.get_table_id())?;
-            self.db.arena_crosscheck_kv(
-                table_obj.get_code().to_uint64_t(),
-                table_obj.get_scope().to_uint64_t(),
-                table_obj.get_table().to_uint64_t(),
-                obj.get_primary_key(),
-                obj.get_value().as_slice(),
-            );
-        }
+            let code = table_obj.get_code().to_uint64_t();
+            let scope = table_obj.get_scope().to_uint64_t();
+            let table = table_obj.get_table().to_uint64_t();
+            let primary = obj.get_primary_key();
+            self.db
+                .arena_crosscheck_kv(code, scope, table, primary, obj.get_value().as_slice());
+            if self.db.arena_reads_enabled() {
+                self.db.arena_kv_get(code, scope, table, primary)
+            } else {
+                None
+            }
+        };
 
-        let s = obj.get_value().size();
+        let cb_value = obj.get_value();
+        #[cfg(feature = "arena-shadow")]
+        let source: &[u8] = arena_value.as_deref().unwrap_or_else(|| cb_value.as_slice());
+        #[cfg(not(feature = "arena-shadow"))]
+        let source: &[u8] = cb_value.as_slice();
+
+        let s = source.len();
         if buffer_size == 0 {
             return Ok(s as i32);
         }
@@ -605,7 +616,7 @@ impl ApplyContext {
         if buffer.len() < copy_size {
             buffer.resize(copy_size, 0);
         }
-        buffer[..copy_size].copy_from_slice(&obj.get_value().as_slice()[..copy_size]);
+        buffer[..copy_size].copy_from_slice(&source[..copy_size]);
         Ok(copy_size as i32)
     }
 

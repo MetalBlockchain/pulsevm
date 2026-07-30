@@ -3100,6 +3100,16 @@ mod tests {
         let temp = get_temp_dir();
         controller.initialize(&chain_id, &config_bytes, &genesis_bytes, temp.path().to_str().unwrap())?;
 
+        // Cutover mode: when set, the node serves every contract read FROM the
+        // arena (chainbase still takes the writes, and the inline cross-check
+        // still runs). If the arena served a wrong byte, execution would diverge
+        // and the cross-impl root would break — so a clean full-history replay in
+        // this mode is the node running on arena-served reads.
+        let arena_reads = std::env::var("PULSEVM_ARENA_READS").is_ok();
+        if arena_reads {
+            controller.database().enable_arena_reads();
+        }
+
         // Our genesis (block 1) must match the testnet's, or block 2 won't chain.
         let genesis_id = controller.last_accepted_block().id()?;
         let start = controller.last_accepted_block().block_num() + 1;
@@ -3246,8 +3256,9 @@ mod tests {
         let (read_ok, read_fail) = db.arena_read_crosscheck_counts();
         assert_eq!(read_fail, 0, "arena served {read_fail} contract reads that diverged from chainbase mid-execution");
 
+        let read_source = if arena_reads { "the ARENA" } else { "chainbase" };
         eprintln!(
-            "replayed real testnet blocks up to {replayed}; C++ chainbase and the Rust arena matched the cross-impl full-state root at every block; arena served {checked} point reads and {tables_scanned} table scans identical to chainbase; {read_ok} inline contract reads cross-checked live, 0 divergences"
+            "replayed real testnet blocks up to {replayed} serving contract reads from {read_source}; C++ chainbase and the Rust arena matched the cross-impl full-state root at every block; arena served {checked} point reads and {tables_scanned} table scans identical to chainbase; {read_ok} inline contract reads cross-checked live, 0 divergences"
         );
         Ok(())
     }

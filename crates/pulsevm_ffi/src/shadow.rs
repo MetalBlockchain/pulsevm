@@ -881,6 +881,9 @@ pub struct ArenaShadow {
     // across Database clones so the totals are chain-wide. See `crosscheck_kv`.
     read_ok: Arc<std::sync::atomic::AtomicU64>,
     read_fail: Arc<std::sync::atomic::AtomicU64>,
+    // When set, the node serves contract reads FROM the arena instead of
+    // chainbase — the staged cutover switch. Shared across clones. Off by default.
+    reads_enabled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ArenaShadow {
@@ -909,7 +912,17 @@ impl ArenaShadow {
             inner: Arc::new(Mutex::new(db)),
             read_ok: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             read_fail: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            reads_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
+    }
+
+    /// Route contract reads through the arena from now on (the cutover switch).
+    pub fn enable_reads(&self) {
+        self.reads_enabled.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn reads_enabled(&self) -> bool {
+        self.reads_enabled.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Db> {
