@@ -25,15 +25,6 @@ impl IndexedBy<Account> for ByName {
     }
 }
 
-// Same key, hash-backed — to compare point-lookup latency against `ByName`.
-struct ByNameHash;
-impl IndexedBy<Account> for ByNameHash {
-    type Key = u64;
-    fn key(o: &Account) -> u64 {
-        o.name
-    }
-}
-
 impl ArenaObject for Account {
     const TYPE_ID: u16 = 0;
     fn id(&self) -> ObjectId<Self> {
@@ -43,8 +34,49 @@ impl ArenaObject for Account {
         self.id = id;
     }
     fn secondary_indices() -> Vec<Box<dyn SecondaryIndex<Self>>> {
-        vec![key_index::<Self, ByName>(), hash_index::<Self, ByNameHash>()]
+        vec![key_index::<Self, ByName>()]
     }
+}
+
+/// Identical to `Account` but with a hash-backed name index, to compare
+/// point-lookup latency in isolation (kept off `Account` so the insert/undo
+/// benches maintain a single realistic index, as chainbase's account does).
+#[repr(C)]
+#[derive(Clone, Copy, Default, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout)]
+struct HashAccount {
+    id: ObjectId<HashAccount>,
+    name: u64,
+    creation_date: u32,
+    _pad: u32,
+}
+
+struct HashByName;
+impl IndexedBy<HashAccount> for HashByName {
+    type Key = u64;
+    fn key(o: &HashAccount) -> u64 {
+        o.name
+    }
+}
+
+impl ArenaObject for HashAccount {
+    const TYPE_ID: u16 = 1;
+    fn id(&self) -> ObjectId<Self> {
+        self.id
+    }
+    fn set_id(&mut self, id: ObjectId<Self>) {
+        self.id = id;
+    }
+    fn secondary_indices() -> Vec<Box<dyn SecondaryIndex<Self>>> {
+        vec![hash_index::<Self, HashByName>()]
+    }
+}
+
+fn hash_table(rows: u64) -> Table<HashAccount> {
+    let mut t = Table::<HashAccount>::new();
+    for i in 0..rows {
+        t.emplace(|a| a.name = i).unwrap();
+    }
+    t
 }
 
 fn table(rows: u64) -> Table<Account> {
@@ -70,6 +102,7 @@ fn bench_hot_path(c: &mut Criterion) {
     let mut find = c.benchmark_group("find");
     for rows in [1_000u64, 100_000] {
         let t = table(rows);
+        let ht = hash_table(rows);
         let mut k = 0u64;
         find.bench_with_input(BenchmarkId::new("by_name", rows), &rows, |b, rows| {
             b.iter(|| {
@@ -82,7 +115,7 @@ fn bench_hot_path(c: &mut Criterion) {
         find.bench_with_input(BenchmarkId::new("by_name_hash", rows), &rows, |b, rows| {
             b.iter(|| {
                 let name =
-                    t.get_hash_index::<ByNameHash>().find(black_box(&(h % rows))).map(|a| a.name);
+                    ht.get_hash_index::<HashByName>().find(black_box(&(h % rows))).map(|a| a.name);
                 h += 1;
                 black_box(name)
             })

@@ -1,21 +1,33 @@
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use pulsevm_ffi::Database;
 use std::hint::black_box;
 use tempfile::tempdir;
 
-const DB_SIZE: u64 = 1024 * 1024 * 1024;
+const DB_SIZE: u64 = 4 * 1024 * 1024 * 1024;
 
+// Find an account against a populated chainbase, at the same row counts the
+// pulsevm_arena `find` bench uses, so the two are comparable. get_account is a
+// by-name lookup through the FFI (RwLock read guard + cxx boundary + boost
+// multi_index), which is the cost the arena's index-addressed find replaces.
 fn criterion_benchmark(c: &mut Criterion) {
-    let temp_dir = tempdir().unwrap();
-    let mut db = Database::new(temp_dir.path().to_str().unwrap(), DB_SIZE).unwrap();
-    db.add_indices().unwrap();
-    let name = 123u64;
-    db.create_account(name, 0).unwrap();
-    c.bench_function("read", |b| {
-        b.iter(|| {
-            black_box(db.get_account(black_box(name)).unwrap());
-        })
-    });
+    let mut group = c.benchmark_group("read");
+    for rows in [1_000u64, 100_000] {
+        let dir = tempdir().unwrap();
+        let mut db = Database::new(dir.path().to_str().unwrap(), DB_SIZE).unwrap();
+        db.add_indices().unwrap();
+        for n in 0..rows {
+            db.create_account(n, 0).unwrap();
+        }
+        let mut k = 0u64;
+        group.bench_with_input(BenchmarkId::new("get_account", rows), &rows, |b, rows| {
+            b.iter(|| {
+                let a = db.get_account(black_box(k % rows)).unwrap();
+                k += 1;
+                black_box(a);
+            })
+        });
+    }
+    group.finish();
 }
 
 criterion_group! {
