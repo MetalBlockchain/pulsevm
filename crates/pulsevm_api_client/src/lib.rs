@@ -116,7 +116,7 @@ impl PulseVmClient {
     /// Create a client that connects via HTTP.
     ///
     /// ```rust,no_run
-    /// let client = pulsevm_rpc_client::PulseVmClient::new("http://127.0.0.1:8080");
+    /// let client = pulsevm_api_client::PulseVmClient::new("http://127.0.0.1:8080");
     /// ```
     pub fn new(base_url: &str) -> Self {
         let base_url = base_url.trim_end_matches('/').to_string();
@@ -213,28 +213,16 @@ impl PulseVmClient {
     /// # Example
     ///
     /// ```rust,no_run
-    /// # async fn example() -> Result<(), pulsevm_rpc_client::ClientError> {
-    /// use pulsevm_rpc_client::*;
+    /// # async fn example() -> Result<(), pulsevm_api_client::ClientError> {
+    /// use pulsevm_api_client::PulseVmClient;
+    /// use pulsevm_core::transaction::Transaction;
     ///
     /// let client = PulseVmClient::new("http://127.0.0.1:8080");
     ///
-    /// let trx = Transaction {
-    ///     actions: vec![Action {
-    ///         account: "pulse".into(),
-    ///         name: "newaccount".into(),
-    ///         data: "00".into(),
-    ///         authorization: vec![Authorization {
-    ///             actor: "pulse".into(),
-    ///             permission: "active".into(),
-    ///         }],
-    ///     }],
-    ///     expiration: "1970-01-01T00:00:00Z".into(),
-    ///     max_net_usage_words: 0,
-    ///     max_cpu_usage_ms: 0,
-    /// };
+    /// let trx = Transaction::default();
     ///
     /// let candidate_keys = vec![
-    ///     "PUB_K1_8fsJkG5ka4o1G1wBhySUavHuGqstcjtXMrquxiRWVcYw8ZvZLX".into(),
+    ///     "PUB_K1_8fsJkG5ka4o1G1wBhySUavHuGqstcjtXMrquxiRWVcYw8ZvZLX".to_string(),
     /// ];
     ///
     /// let required = client.get_required_keys(&trx, &candidate_keys).await?;

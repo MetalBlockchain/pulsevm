@@ -643,22 +643,17 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    /// Fixture: a real SHiP log checked in at ROOT/test-data/block_log.log.
-    fn fixture_path() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("test-data")
-            .join("block_log.log")
-    }
+    /// Number of blocks the generated fixture contains. Several tests
+    /// require at least 3 (open, prune); 5 leaves comfortable margin.
+    const FIXTURE_BLOCKS: u32 = 5;
 
-    /// The tests derive the expected magic from the fixture itself
-    /// (first 8 bytes, LE) so they don't need to hardcode
-    /// ship_magic(version) and silently rot when it changes.
+    /// Magic stamped into the generated fixture. Must be non-zero: the
+    /// log deliberately refuses a zero magic because it would "validate"
+    /// any zeroed or sparse file (see `open_with_magic`). The exact value
+    /// is arbitrary — it only has to be a fixed, non-zero tag the whole
+    /// suite agrees on — but it mirrors EOS' `ship_magic(version)` shape.
     fn fixture_magic() -> u64 {
-        0
+        0x5348_4950_0000_0001 // "SHIP" v1
     }
 
     /// Unique scratch dir per test, cleaned up on drop. std-only, no
@@ -691,13 +686,24 @@ mod tests {
         }
     }
 
-    /// Copy the fixture into a fresh dir (no index yet). Opening is
-    /// read-write and creates/repairs files, so tests never touch the
-    /// checked-in fixture directly.
+    /// Build a fresh SHiP log fixture in a new dir and hand it back with
+    /// its magic. The fixture is generated through the real writer rather
+    /// than checked in as a binary blob, so the suite is hermetic. The
+    /// index is then removed so each test's first `open` rebuilds it by
+    /// scanning the log — the same code path a log-only fixture exercised,
+    /// which `opens_fixture_and_builds_index` depends on.
     fn setup(tag: &str) -> (TestDir, u64) {
         let dir = TestDir::new(tag);
-        std::fs::copy(fixture_path(), dir.log_path()).unwrap();
-        (dir, fixture_magic())
+        let magic = fixture_magic();
+        {
+            let log = StateHistoryLog::open_with_magic(dir.path(), "block_log", magic).unwrap();
+            for n in 1..=FIXTURE_BLOCKS {
+                let payload = format!("ship-block-{n}-payload").into_bytes();
+                log.append(make_id(n, n as u8), &payload).unwrap();
+            }
+        }
+        std::fs::remove_file(dir.idx_path()).unwrap();
+        (dir, magic)
     }
 
     fn make_id(block_num: u32, filler: u8) -> Id {
