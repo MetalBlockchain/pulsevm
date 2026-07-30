@@ -138,5 +138,42 @@ fn bench_persistence(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_hot_path, bench_persistence);
+/// Where does `load` actually spend its time? An mmap-backed open would make the
+/// raw row bytes zero-copy (removing `raw_row_copy`), but the ordered secondary
+/// index is heap-only and must be rebuilt on every open (`index_rebuild`) no
+/// matter how the rows arrive. This isolates the two so we know the real ceiling
+/// on what mmap can save.
+fn bench_open_breakdown(c: &mut Criterion) {
+    use std::collections::BTreeMap;
+    let rows = 100_000u64;
+    let mut group = c.benchmark_group("open_breakdown");
+    group.sample_size(20);
+
+    // The part mmap removes: materialize the raw row slab (a bulk copy).
+    let slab: Vec<Account> = (0..rows)
+        .map(|i| {
+            let mut a = Account::default();
+            a.name = i;
+            a
+        })
+        .collect();
+    group.bench_function(BenchmarkId::new("raw_row_copy", rows), |b| {
+        b.iter(|| black_box(slab.clone()))
+    });
+
+    // The part mmap cannot remove: rebuild the ordered secondary index. Insert in
+    // id order (as load does) — the friendly case for a BTree.
+    group.bench_function(BenchmarkId::new("index_rebuild", rows), |b| {
+        b.iter(|| {
+            let mut idx: BTreeMap<u64, i64> = BTreeMap::new();
+            for a in &slab {
+                idx.insert(a.name, a.id.raw());
+            }
+            black_box(idx.len());
+        })
+    });
+    group.finish();
+}
+
+criterion_group!(benches, bench_hot_path, bench_persistence, bench_open_breakdown);
 criterion_main!(benches);
