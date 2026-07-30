@@ -2179,6 +2179,38 @@ impl ArenaShadow {
         Ok(())
     }
 
+    /// Mirrors `update_key_value_object`: reassigns the value blob and payer of
+    /// the row at `(code, scope, table, primary_key)`. The FFI reaches the row by
+    /// an opaque handle, so the caller resolves the table key via `get_table_by_kv`.
+    pub fn update_key_value_object(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary_key: u64,
+        payer: u64,
+        value: &[u8],
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let Some(t_id) = db
+            .find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&(code, scope, table))?
+            .map(|t| t.id().raw())
+        else {
+            return Ok(());
+        };
+        let id = db
+            .find_by::<ContractKeyValueRow, ContractKvByScopePrimary>(&(t_id, primary_key))?
+            .map(|k| k.id());
+        if let Some(id) = id {
+            let blob = db.alloc_blob::<ContractKeyValueRow>(value)?;
+            db.modify::<ContractKeyValueRow>(id, |k| {
+                k.value = blob;
+                k.payer = payer;
+            })?;
+        }
+        Ok(())
+    }
+
     pub fn remove_key_value_object(
         &self,
         code: u64,

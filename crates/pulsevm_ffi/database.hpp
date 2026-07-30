@@ -137,7 +137,7 @@ public:
         });
     }
 
-    void add_transaction_usage(uint64_t account, uint64_t cpu_usage, uint64_t net_usage, uint32_t time_slot ) {
+    void add_transaction_usage(uint64_t account, uint64_t cpu_usage, uint64_t net_usage, uint32_t time_slot, bool validate ) {
         const auto& state = this->get<resource_limits::resource_limits_state_object>();
         const auto& config = this->get<resource_limits::resource_limits_config_object>();
         const auto& usage = this->get<resource_limits::resource_usage_object,resource_limits::by_owner>( name(account) );
@@ -151,7 +151,11 @@ public:
             bu.cpu_usage.add( cpu_usage, time_slot, config.account_cpu_usage_average_window );
         });
 
-        if( cpu_weight >= 0 && state.total_cpu_weight > 0 ) {
+        // On light/replay validation the block was already validated by
+        // consensus and its transactions carry recorded (subjective) usage that
+        // can exceed the objective limits, so skip the enforcement asserts while
+        // still billing the accumulators and pending block usage.
+        if( validate && cpu_weight >= 0 && state.total_cpu_weight > 0 ) {
             uint128_t window_size = config.account_cpu_usage_average_window;
             auto virtual_network_capacity_in_window = (uint128_t)state.virtual_cpu_limit * window_size;
             auto cpu_used_in_window                 = ((uint128_t)usage.cpu_usage.value_ex * window_size) / (uint128_t)config::rate_limiting_precision;
@@ -170,7 +174,7 @@ public:
                         ("max_user_use_in_window",max_user_use_in_window) );
         }
 
-        if( net_weight >= 0 && state.total_net_weight > 0) {
+        if( validate && net_weight >= 0 && state.total_net_weight > 0) {
 
             uint128_t window_size = config.account_net_usage_average_window;
             auto virtual_network_capacity_in_window = (uint128_t)state.virtual_net_limit * window_size;
@@ -197,8 +201,10 @@ public:
             rls.pending_net_usage += net_usage;
         });
 
-        EOS_ASSERT( state.pending_cpu_usage <= config.cpu_limit_parameters.max, block_resource_exhausted, "Block has insufficient cpu resources" );
-        EOS_ASSERT( state.pending_net_usage <= config.net_limit_parameters.max, block_resource_exhausted, "Block has insufficient net resources" );
+        if( validate ) {
+            EOS_ASSERT( state.pending_cpu_usage <= config.cpu_limit_parameters.max, block_resource_exhausted, "Block has insufficient cpu resources" );
+            EOS_ASSERT( state.pending_net_usage <= config.net_limit_parameters.max, block_resource_exhausted, "Block has insufficient net resources" );
+        }
     }
 
     void set_block_parameters(const ElasticLimitParameters& cpu_limit_parameters, const ElasticLimitParameters& net_limit_parameters );
@@ -813,6 +819,13 @@ public:
 
     const dynamic_global_property_object& get_dynamic_global_properties() const {
         return this->get<dynamic_global_property_object>();
+    }
+
+    // Resolve the table (code, scope, table) that a key_value_object belongs to,
+    // so the arena mirror can locate its row on update — the FFI hands over the
+    // object by reference with only an opaque t_id.
+    const table_id_object& get_table_by_kv( const key_value_object& kv ) const {
+        return this->get<table_id_object>( kv.t_id );
     }
 
     uint64_t get_global_action_sequence() const {

@@ -225,6 +225,7 @@ pub mod ffi {
         #[cxx_name = "key_value_object"]
         type KeyValueObject;
         pub fn get_table_id(self: &KeyValueObject) -> &TableId;
+        pub fn get_table_by_kv(self: &Database, kv: &KeyValueObject) -> &TableObject;
         pub fn get_primary_key(self: &KeyValueObject) -> u64;
         pub fn get_payer(self: &KeyValueObject) -> &CxxName;
         pub fn get_value(self: &KeyValueObject) -> &CxxSharedBlob;
@@ -338,6 +339,7 @@ pub mod ffi {
             cpu_usage: u64,
             net_usage: u64,
             time_slot: u32,
+            validate: bool,
         ) -> Result<()>;
         pub fn add_pending_ram_usage(
             self: Pin<&mut Database>,

@@ -931,12 +931,13 @@ impl Database {
         cpu_usage: u64,
         net_usage: u64,
         time_slot: u32,
+        validate: bool,
     ) -> Result<(), ChainError> {
         {
             let mut guard = self.inner.write()?;
             let pinned = guard.pin_mut();
             pinned
-                .add_transaction_usage(account.as_u64(), cpu_usage, net_usage, time_slot)
+                .add_transaction_usage(account.as_u64(), cpu_usage, net_usage, time_slot, validate)
                 .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
         }
         #[cfg(feature = "arena-shadow")]
@@ -1398,12 +1399,33 @@ impl Database {
         payer: u64,
         buffer: &[u8],
     ) -> Result<(), ChainError> {
-        let mut guard = self.inner.write()?;
-        let pinned = guard.pin_mut();
-
-        pinned
-            .update_key_value_object(obj, payer, buffer)
-            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+        // Resolve the row's table (code, scope, table) + primary before the write,
+        // so the arena mirror can locate the row the FFI reaches by opaque handle.
+        #[cfg(feature = "arena-shadow")]
+        let key = {
+            let guard = self.inner.read()?;
+            let t = guard.get_table_by_kv(obj);
+            (
+                t.get_code().to_uint64_t(),
+                t.get_scope().to_uint64_t(),
+                t.get_table().to_uint64_t(),
+                obj.get_primary_key(),
+            )
+        };
+        {
+            let mut guard = self.inner.write()?;
+            let pinned = guard.pin_mut();
+            pinned
+                .update_key_value_object(obj, payer, buffer)
+                .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        }
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && let Err(e) = s.update_key_value_object(key.0, key.1, key.2, key.3, payer, buffer)
+        {
+            eprintln!("arena mirror of update_key_value_object diverged: {e:?}");
+        }
+        Ok(())
     }
 
     pub fn update_index64_object(

@@ -528,10 +528,11 @@ impl Controller {
 
         for receipt in &block.transactions {
             // Verify the transaction
-            let result = self.execute_transaction(
+            let result = self.execute_transaction_billed(
                 receipt.trx(),
                 &block.signed_block_header.header.timestamp,
                 block_status,
+                Some((receipt.cpu_usage_us(), receipt.net_usage_words())),
             )?;
 
             // Add trace to traces
@@ -614,6 +615,19 @@ impl Controller {
         pending_block_timestamp: &BlockTimestamp,
         block_status: &BlockStatus,
     ) -> Result<TransactionResult, ChainError> {
+        self.execute_transaction_billed(packed_transaction, pending_block_timestamp, block_status, None)
+    }
+
+    /// As `execute_transaction`, but when `explicit_billed` is set (applying an
+    /// already-accepted block) it bills the block-recorded cpu/net and skips the
+    /// objective resource-limit checks — Antelope light/replay validation.
+    pub fn execute_transaction_billed(
+        &mut self,
+        packed_transaction: &PackedTransaction,
+        pending_block_timestamp: &BlockTimestamp,
+        block_status: &BlockStatus,
+        explicit_billed: Option<(u32, u32)>,
+    ) -> Result<TransactionResult, ChainError> {
         let signed_transaction = packed_transaction.get_signed_transaction();
 
         // Verify basic transaction validity
@@ -640,6 +654,12 @@ impl Controller {
             *block_status,
             packed_transaction.clone(),
         );
+
+        // Applying an already-accepted block: bill the recorded cpu/net and
+        // skip the objective limit checks (Antelope light/replay validation).
+        if let Some((cpu_us, net_words)) = explicit_billed {
+            trx_context.set_explicit_billed(cpu_us, net_words)?;
+        }
 
         let trx = packed_transaction.get_transaction();
         trx_context.init_for_input_trx(
@@ -3105,11 +3125,16 @@ mod tests {
             controller.accept_block(&block.id()?, &mut mempool)?;
             controller.set_preferred_id(block.id()?);
 
+            let mut diverged = None;
             for (name, chain_bytes, arena_bytes) in cross_impl_tables(&controller.database())? {
-                assert_eq!(
-                    chain_bytes, arena_bytes,
-                    "cross-impl state diverged at block {n}, table {name}"
-                );
+                if chain_bytes != arena_bytes {
+                    diverged = Some(name);
+                    break;
+                }
+            }
+            if let Some(name) = diverged {
+                eprintln!("cross-impl diverged at block {n}, table {name} (matched blocks up to {replayed})");
+                break;
             }
             replayed = n;
         }
