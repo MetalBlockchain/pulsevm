@@ -3240,8 +3240,14 @@ mod tests {
             tables_scanned += 1;
         }
 
+        // Inline read cross-check tally: accumulated by apply_context::db_get_i64
+        // over every contract read the node actually served during execution
+        // (including mid-transaction speculative reads). Must be all matches.
+        let (read_ok, read_fail) = db.arena_read_crosscheck_counts();
+        assert_eq!(read_fail, 0, "arena served {read_fail} contract reads that diverged from chainbase mid-execution");
+
         eprintln!(
-            "replayed real testnet blocks up to {replayed}; C++ chainbase and the Rust arena matched the cross-impl full-state root at every block; arena served {checked} point reads and {tables_scanned} table scans identical to chainbase"
+            "replayed real testnet blocks up to {replayed}; C++ chainbase and the Rust arena matched the cross-impl full-state root at every block; arena served {checked} point reads and {tables_scanned} table scans identical to chainbase; {read_ok} inline contract reads cross-checked live, 0 divergences"
         );
         Ok(())
     }

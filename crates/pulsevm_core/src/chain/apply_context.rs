@@ -580,6 +580,23 @@ impl ApplyContext {
     ) -> Result<i32, ChainError> {
         let inner = self.inner.read()?;
         let obj = inner.keyval_cache.get(iterator)?;
+
+        // Inline read cross-check: the arena must serve this contract read — the
+        // exact bytes at the exact key, at this point mid-execution (speculative,
+        // pre-commit) — identically to chainbase. Stronger than the block-boundary
+        // root diff, which only sees committed state.
+        #[cfg(feature = "arena-shadow")]
+        {
+            let table_obj = inner.keyval_cache.get_table(obj.get_table_id())?;
+            self.db.arena_crosscheck_kv(
+                table_obj.get_code().to_uint64_t(),
+                table_obj.get_scope().to_uint64_t(),
+                table_obj.get_table().to_uint64_t(),
+                obj.get_primary_key(),
+                obj.get_value().as_slice(),
+            );
+        }
+
         let s = obj.get_value().size();
         if buffer_size == 0 {
             return Ok(s as i32);

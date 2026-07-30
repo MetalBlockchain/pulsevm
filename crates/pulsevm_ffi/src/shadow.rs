@@ -876,6 +876,11 @@ fn contract_table_decr(db: &mut Db, t_id: i64) -> Result<(), DbError> {
 #[derive(Clone)]
 pub struct ArenaShadow {
     inner: Arc<Mutex<Db>>,
+    // Inline read cross-check tallies: every contract read the node serves
+    // (db_get_i64) is answered a second time by the arena and compared. Shared
+    // across Database clones so the totals are chain-wide. See `crosscheck_kv`.
+    read_ok: Arc<std::sync::atomic::AtomicU64>,
+    read_fail: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ArenaShadow {
@@ -902,11 +907,38 @@ impl ArenaShadow {
         db.add_table::<ResourceStateRow>()?;
         Ok(ArenaShadow {
             inner: Arc::new(Mutex::new(db)),
+            read_ok: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            read_fail: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Db> {
         self.inner.lock().expect("shadow arena mutex poisoned")
+    }
+
+    /// Inline read cross-check: given the value the node is about to hand a
+    /// contract for `(code, scope, table, primary)`, confirm the arena serves the
+    /// same bytes from its own state — including uncommitted, mid-transaction
+    /// speculative writes, which the block-boundary root diff never sees. Tallies
+    /// a match or mismatch (mismatches also print). Returns nothing; the counts
+    /// are asserted after replay via `read_crosscheck_counts`.
+    pub fn crosscheck_kv(&self, code: u64, scope: u64, table: u64, primary: u64, expected: &[u8]) {
+        use std::sync::atomic::Ordering;
+        if self.kv_get(code, scope, table, primary).as_deref() == Some(expected) {
+            self.read_ok.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.read_fail.fetch_add(1, Ordering::Relaxed);
+            eprintln!(
+                "arena read cross-check mismatch at ({code},{scope},{table},{primary}): expected {} bytes",
+                expected.len()
+            );
+        }
+    }
+
+    /// (matches, mismatches) tallied by `crosscheck_kv` so far.
+    pub fn read_crosscheck_counts(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering;
+        (self.read_ok.load(Ordering::Relaxed), self.read_fail.load(Ordering::Relaxed))
     }
 
     pub fn set_revision(&self, revision: i64) -> Result<(), DbError> {

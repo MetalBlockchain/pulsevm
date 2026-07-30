@@ -523,6 +523,43 @@ impl Database {
         }
     }
 
+    /// Inline read cross-check: confirm the arena would serve `expected` (the
+    /// value the node is handing a contract) for `(code, scope, table, primary)`.
+    /// No-op when shadowing is off. Tallies match/mismatch; see
+    /// `arena_read_crosscheck_counts`.
+    pub fn arena_crosscheck_kv(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary: u64,
+        expected: &[u8],
+    ) {
+        #[cfg(feature = "arena-shadow")]
+        {
+            if let Some(s) = &self.shadow {
+                s.crosscheck_kv(code, scope, table, primary, expected);
+            }
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = (code, scope, table, primary, expected);
+        }
+    }
+
+    /// (matches, mismatches) tallied by the inline read cross-check, or (0, 0)
+    /// when shadowing is off.
+    pub fn arena_read_crosscheck_counts(&self) -> (u64, u64) {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow.as_ref().map(|s| s.read_crosscheck_counts()).unwrap_or((0, 0))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            (0, 0)
+        }
+    }
+
     /// Whether the arena mirror holds an account_object for `name` — for diffing
     /// against chainbase's `find_account`.
     pub fn arena_account_exists(&self, name: u64) -> bool {
