@@ -648,6 +648,19 @@ impl Database {
         }
     }
 
+    /// (matches, mismatches) tallied by non-contract read cross-checks
+    /// (accounts/permissions read during authorization and dispatch).
+    pub fn arena_noncontract_crosscheck_counts(&self) -> (u64, u64) {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow.as_ref().map(|s| s.noncontract_crosscheck_counts()).unwrap_or((0, 0))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            (0, 0)
+        }
+    }
+
     /// Whether the arena mirror holds an account_object for `name` — for diffing
     /// against chainbase's `find_account`.
     pub fn arena_account_exists(&self, name: u64) -> bool {
@@ -3449,6 +3462,8 @@ impl Database {
     pub fn read(&self) -> Result<DbRead<'_>, ChainError> {
         Ok(DbRead {
             guard: self.inner.read()?,
+            #[cfg(feature = "arena-shadow")]
+            shadow: self.shadow.clone(),
         })
     }
 
@@ -3467,6 +3482,10 @@ impl Database {
 /// cannot outlive the held lock.
 pub struct DbRead<'g> {
     guard: std::sync::RwLockReadGuard<'g, UniquePtr<ffi::Database>>,
+    // The arena mirror, so reads served here can be cross-checked against it
+    // during execution. A cheap Arc clone; `None` when shadowing is off.
+    #[cfg(feature = "arena-shadow")]
+    shadow: Option<crate::shadow::ArenaShadow>,
 }
 
 impl<'g> DbRead<'g> {
@@ -3483,7 +3502,22 @@ impl<'g> DbRead<'g> {
             .db()
             .find_permission_by_actor_and_permission(actor, permission)
             .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
-        Ok(unsafe { res.as_ref() })
+        let res = unsafe { res.as_ref() };
+
+        // The arena must answer this authorization read the same way: same
+        // existence, same parent in the permission tree, same authority
+        // threshold. Consensus depends on it — every transaction authorizes here.
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow {
+            let chainbase = res.map(|p| {
+                let threshold =
+                    ffi::get_authority_from_shared_authority(p.get_authority()).threshold;
+                (p.get_parent_id(), threshold)
+            });
+            s.note_noncontract(s.permission(actor, permission) == chainbase);
+        }
+
+        Ok(res)
     }
 
     pub fn find_permission(&self, id: i64) -> Result<Option<&ffi::PermissionObject>, ChainError> {
@@ -3499,7 +3533,16 @@ impl<'g> DbRead<'g> {
             .db()
             .find_account(account_name)
             .map_err(|e| ChainError::InternalError(format!("failed to get account: {}", e)))?;
-        Ok(unsafe { res.as_ref() })
+        let res = unsafe { res.as_ref() };
+
+        // Account existence gates authorization and dispatch; the arena must
+        // agree on whether the account is there.
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow {
+            s.note_noncontract(s.account_exists(account_name) == res.is_some());
+        }
+
+        Ok(res)
     }
 
     pub fn find_account_metadata(
@@ -3509,7 +3552,17 @@ impl<'g> DbRead<'g> {
         let res = self.db().find_account_metadata(account_name).map_err(|e| {
             ChainError::InternalError(format!("failed to find account metadata: {}", e))
         })?;
-        Ok(unsafe { res.as_ref() })
+        let res = unsafe { res.as_ref() };
+
+        // The privileged flag changes execution (privileged contracts skip some
+        // checks), so the arena must reproduce it (and existence).
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow {
+            let chainbase = res.map(|m| m.is_privileged());
+            s.note_noncontract(s.account_metadata_privileged(account_name) == chainbase);
+        }
+
+        Ok(res)
     }
 
     pub fn get_global_properties(&self) -> Result<&ffi::GlobalPropertyObject, ChainError> {

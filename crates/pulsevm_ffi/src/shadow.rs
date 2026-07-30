@@ -885,6 +885,10 @@ pub struct ArenaShadow {
     // arena computes where the cursor lands and it's compared to chainbase.
     pos_ok: Arc<std::sync::atomic::AtomicU64>,
     pos_fail: Arc<std::sync::atomic::AtomicU64>,
+    // Non-contract read cross-check tallies (accounts/permissions the node reads
+    // during authorization and dispatch): the arena answers the same lookup.
+    nc_ok: Arc<std::sync::atomic::AtomicU64>,
+    nc_fail: Arc<std::sync::atomic::AtomicU64>,
     // When set, the node serves contract reads FROM the arena instead of
     // chainbase — the staged cutover switch. Shared across clones. Off by default.
     reads_enabled: Arc<std::sync::atomic::AtomicBool>,
@@ -918,6 +922,8 @@ impl ArenaShadow {
             read_fail: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             pos_ok: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             pos_fail: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            nc_ok: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            nc_fail: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             reads_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
@@ -2383,6 +2389,22 @@ impl ArenaShadow {
     pub fn pos_crosscheck_counts(&self) -> (u64, u64) {
         use std::sync::atomic::Ordering;
         (self.pos_ok.load(Ordering::Relaxed), self.pos_fail.load(Ordering::Relaxed))
+    }
+
+    /// Tally a non-contract read cross-check (arena lookup == chainbase's).
+    pub fn note_noncontract(&self, matched: bool) {
+        use std::sync::atomic::Ordering;
+        if matched {
+            self.nc_ok.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.nc_fail.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// (matches, mismatches) tallied by non-contract read cross-checks.
+    pub fn noncontract_crosscheck_counts(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering;
+        (self.nc_ok.load(Ordering::Relaxed), self.nc_fail.load(Ordering::Relaxed))
     }
 
     pub fn update_key_value_object(
