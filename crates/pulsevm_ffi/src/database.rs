@@ -636,6 +636,83 @@ impl Database {
         }
     }
 
+    /// Arena idx64 secondary-index positioning, mirroring db_idx64_find_secondary
+    /// (primary of the first row with that secondary), db_idx64_lowerbound /
+    /// db_idx64_upperbound (`(primary, secondary)` landing), and
+    /// db_idx64_find_primary (secondary stored for a primary). All `None` when
+    /// shadowing is off.
+    pub fn arena_idx64_find_secondary(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        secondary: u64,
+    ) -> Option<u64> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow.as_ref().and_then(|s| s.idx64_find_secondary(code, scope, table, secondary))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = (code, scope, table, secondary);
+            None
+        }
+    }
+
+    pub fn arena_idx64_lower_bound(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        secondary: u64,
+    ) -> Option<(u64, u64)> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow.as_ref().and_then(|s| s.idx64_lower_bound(code, scope, table, secondary))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = (code, scope, table, secondary);
+            None
+        }
+    }
+
+    pub fn arena_idx64_upper_bound(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        secondary: u64,
+    ) -> Option<(u64, u64)> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow.as_ref().and_then(|s| s.idx64_upper_bound(code, scope, table, secondary))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = (code, scope, table, secondary);
+            None
+        }
+    }
+
+    pub fn arena_idx64_find_primary(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary: u64,
+    ) -> Option<u64> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow.as_ref().and_then(|s| s.idx64_find_primary(code, scope, table, primary))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = (code, scope, table, primary);
+            None
+        }
+    }
+
     /// Tally an iterator-positioning cross-check (arena landing vs chainbase).
     pub fn arena_note_pos(&self, matched: bool) {
         #[cfg(feature = "arena-shadow")]

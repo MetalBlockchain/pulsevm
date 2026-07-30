@@ -844,14 +844,32 @@ impl ApplyContext {
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        self.db.db_idx64_find_secondary(
+        let res = self.db.db_idx64_find_secondary(
             &mut inner.index64_cache,
             code,
             scope,
             table,
             secondary,
             primary,
-        )
+        )?;
+
+        // Arena answers the same secondary lookup: found -> the same primary,
+        // not-found -> both agree there's no match. Serve the primary when the
+        // cutover switch is on.
+        #[cfg(feature = "arena-shadow")]
+        {
+            let arena = self.db.arena_idx64_find_secondary(code, scope, table, secondary);
+            let ffi = if res >= 0 { Some(*primary) } else { None };
+            self.db.arena_note_pos(arena == ffi);
+            if self.db.arena_reads_enabled()
+                && res >= 0
+                && let Some(p) = arena
+            {
+                *primary = p;
+            }
+        }
+
+        Ok(res)
     }
 
     pub fn db_idx64_find_primary(
@@ -863,14 +881,29 @@ impl ApplyContext {
         primary: u64,
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        self.db.db_idx64_find_primary(
+        let res = self.db.db_idx64_find_primary(
             &mut inner.index64_cache,
             code,
             scope,
             table,
             secondary,
             primary,
-        )
+        )?;
+
+        #[cfg(feature = "arena-shadow")]
+        {
+            let arena = self.db.arena_idx64_find_primary(code, scope, table, primary);
+            let ffi = if res >= 0 { Some(*secondary) } else { None };
+            self.db.arena_note_pos(arena == ffi);
+            if self.db.arena_reads_enabled()
+                && res >= 0
+                && let Some(s) = arena
+            {
+                *secondary = s;
+            }
+        }
+
+        Ok(res)
     }
 
     pub fn db_idx64_lowerbound(
@@ -881,15 +914,37 @@ impl ApplyContext {
         secondary: &mut u64,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
+        // `secondary` is the search key on the way in and the landing key on the
+        // way out, so capture it before the FFI overwrites it.
+        #[cfg(feature = "arena-shadow")]
+        let search = *secondary;
         let mut inner = self.inner.write()?;
-        self.db.db_idx64_lowerbound(
+        let res = self.db.db_idx64_lowerbound(
             &mut inner.index64_cache,
             code,
             scope,
             table,
             secondary,
             primary,
-        )
+        )?;
+
+        // lowerbound/upperbound land on a row and write BOTH its secondary and
+        // primary; the arena must reproduce the pair (or agree on the end).
+        #[cfg(feature = "arena-shadow")]
+        {
+            let arena = self.db.arena_idx64_lower_bound(code, scope, table, search);
+            let ffi = if res >= 0 { Some((*primary, *secondary)) } else { None };
+            self.db.arena_note_pos(arena == ffi);
+            if self.db.arena_reads_enabled()
+                && res >= 0
+                && let Some((p, s)) = arena
+            {
+                *primary = p;
+                *secondary = s;
+            }
+        }
+
+        Ok(res)
     }
 
     pub fn db_idx64_upperbound(
@@ -900,15 +955,33 @@ impl ApplyContext {
         secondary: &mut u64,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        let search = *secondary;
         let mut inner = self.inner.write()?;
-        self.db.db_idx64_upperbound(
+        let res = self.db.db_idx64_upperbound(
             &mut inner.index64_cache,
             code,
             scope,
             table,
             secondary,
             primary,
-        )
+        )?;
+
+        #[cfg(feature = "arena-shadow")]
+        {
+            let arena = self.db.arena_idx64_upper_bound(code, scope, table, search);
+            let ffi = if res >= 0 { Some((*primary, *secondary)) } else { None };
+            self.db.arena_note_pos(arena == ffi);
+            if self.db.arena_reads_enabled()
+                && res >= 0
+                && let Some((p, s)) = arena
+            {
+                *primary = p;
+                *secondary = s;
+            }
+        }
+
+        Ok(res)
     }
 
     pub fn db_idx64_end(&mut self, code: u64, scope: u64, table: u64) -> Result<i32, ChainError> {
