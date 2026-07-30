@@ -3361,6 +3361,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "pulsevm_e2e_boot"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "pulsevm_api_client",
+ "pulsevm_core",
+ "pulsevm_crypto",
+ "pulsevm_name_macro",
+ "pulsevm_proc_macros",
+ "pulsevm_serialization",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "pulsevm_error"
 version = "0.1.0"
 dependencies = [

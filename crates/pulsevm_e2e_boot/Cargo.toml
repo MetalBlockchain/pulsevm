@@ -1,0 +1,25 @@
+[package]
+name = "pulsevm_e2e_boot"
+version = "0.1.0"
+edition = "2024"
+
+# Drives the boot sequence of a running PulseVM chain over its RPC API, for use
+# as an end-to-end test fixture. Signs locally with a supplied private key, so
+# no keosd instance is required -- unlike the `pulse` CLI, which delegates
+# signing to the wallet daemon.
+
+[[bin]]
+name = "pulsevm-e2e-boot"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.98"
+serde_json = "1.0"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+pulsevm_api_client = { path = "../pulsevm_api_client" }
+pulsevm_core = { path = "../pulsevm_core" }
+pulsevm_crypto = { path = "../pulsevm_crypto" }
+pulsevm_name_macro = { path = "../pulsevm_name_macro" }
+pulsevm_proc_macros = { path = "../pulsevm_proc_macros" }
+pulsevm_serialization = { path = "../pulsevm_serialization" }

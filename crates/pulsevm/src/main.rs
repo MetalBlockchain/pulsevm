@@ -41,6 +41,10 @@ use crate::{
     state_history::StateHistoryServer,
 };
 
+/// Default bind address for the state history WebSocket API. Used when WS_BIND
+/// is unset, in which case a busy port is tolerated (see run_ws_server).
+const DEFAULT_WS_BIND: &str = "0.0.0.0:9090";
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 10)]
 async fn main() {
     // Initialize logging
@@ -83,10 +87,14 @@ async fn main() {
         .expect("failed to initialize runtime engine");
 
     let state_history_service = StateHistoryServer::new(vm.clone());
-    let ws_bind = std::env::var("WS_BIND").unwrap_or_else(|_| "0.0.0.0:9090".into());
+    // An explicit WS_BIND is honoured exactly; the default is allowed to move to
+    // an ephemeral port so that co-located nodes do not contend for one port.
+    let ws_bind_override = std::env::var("WS_BIND").ok();
+    let allow_port_fallback = ws_bind_override.is_none();
+    let ws_bind = ws_bind_override.unwrap_or_else(|| DEFAULT_WS_BIND.into());
     let ws_handle = tokio::spawn(async move {
         if let Err(e) = state_history_service
-            .run_ws_server(&ws_bind, cancel_ws)
+            .run_ws_server(&ws_bind, allow_port_fallback, cancel_ws)
             .await
         {
             spdlog::error!("WS server error: {:?}", e);
