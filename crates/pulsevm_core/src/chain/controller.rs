@@ -2883,6 +2883,242 @@ mod tests {
         Ok(())
     }
 
+    /// Proves we can reconstruct a real testnet block header from the getBlock
+    /// JSON: rebuild block 2's header from `a-chain-alpine-rpc` (timestamp slot =
+    /// (unix_ms - 946684800000)/500, hex digests, defaults for the unused header
+    /// fields) and check calculate_id() reproduces the block's real id. This
+    /// nails the timestamp round-trip — the only fiddly part of feeding real
+    /// blocks into replay + the cross-impl diff.
+    #[test]
+    fn reconstruct_testnet_block2_header_id() {
+        let hexd = |s: &str| -> [u8; 32] { hex::decode(s).unwrap().try_into().unwrap() };
+        let header = BlockHeader {
+            timestamp: pulsevm_ffi::BlockTimestamp { slot: 1676935919 },
+            producer: Name::from_str("pulse").unwrap(),
+            confirmed: 0,
+            previous: Id::from_str(
+                "000000017ba27a5af30bd801863775add48d21100c72ba8904ee8c88fa98ec23",
+            )
+            .unwrap(),
+            transaction_mroot: Digest(hexd(
+                "2c120a750efa0e284ff1650c510aa39e7a9238d85b5827ba2f09f728a7fb6af7",
+            )),
+            action_mroot: Digest(hexd(
+                "ba245130138acfc919e5aa1ad4aeadc100a4b420598931f6ef88f6d987de481e",
+            )),
+            schedule_version: 0,
+            new_producers: None,
+            header_extensions: vec![],
+        };
+        let got = header.calculate_id().unwrap();
+        let expected = Id::from_str(
+            "000000020aacb295ab19375a5c59dbdd5678f8287cdf7395bc42f73fcdc820b4",
+        )
+        .unwrap();
+        assert_eq!(got, expected, "reconstructed block 2 id mismatch: got {got}");
+    }
+
+    /// ISO block timestamp -> Antelope slot (500ms interval, 2000-01-01 epoch).
+    #[cfg(feature = "arena-shadow")]
+    fn iso_to_slot(iso: &str) -> u32 {
+        let fmt = if iso.contains('.') {
+            "%Y-%m-%dT%H:%M:%S%.f"
+        } else {
+            "%Y-%m-%dT%H:%M:%S"
+        };
+        let dt = chrono::NaiveDateTime::parse_from_str(iso.trim_end_matches('Z'), fmt).unwrap();
+        let epoch = chrono::NaiveDate::from_ymd_opt(2000, 1, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+        ((dt - epoch).num_milliseconds() / 500) as u32
+    }
+
+    /// Reconstruct a SignedBlock from the getBlock JSON `result` object — the
+    /// header (proven id-exact) plus every transaction rebuilt from its wire
+    /// data (signatures, compression, packed_trx, packed_context_free_data), so
+    /// the block re-derives the same merkle roots on replay.
+    #[cfg(feature = "arena-shadow")]
+    fn reconstruct_block(r: &serde_json::Value) -> Result<SignedBlock, ChainError> {
+        use crate::chain::block::SignedBlockHeader;
+        use crate::chain::crypto::Signature;
+        use crate::chain::transaction::{
+            PackedTransaction, TransactionCompression, TransactionReceipt,
+            TransactionReceiptHeader, TransactionStatus,
+        };
+        use pulsevm_crypto::Bytes;
+        use pulsevm_serialization::VarUint32;
+        use std::collections::{BTreeSet, VecDeque};
+
+        let hexd32 = |s: &str| -> [u8; 32] { hex::decode(s).unwrap().try_into().unwrap() };
+        let header = BlockHeader {
+            timestamp: pulsevm_ffi::BlockTimestamp {
+                slot: iso_to_slot(r["timestamp"].as_str().unwrap()),
+            },
+            producer: Name::from_str(r["producer"].as_str().unwrap())?,
+            confirmed: r["confirmed"].as_u64().unwrap() as u16,
+            previous: Id::from_str(r["previous"].as_str().unwrap())
+                .map_err(|_| ChainError::BlockError("bad previous id".into()))?,
+            transaction_mroot: Digest(hexd32(r["transaction_mroot"].as_str().unwrap())),
+            action_mroot: Digest(hexd32(r["action_mroot"].as_str().unwrap())),
+            schedule_version: 0,
+            new_producers: None,
+            header_extensions: vec![],
+        };
+
+        let mut txs: VecDeque<TransactionReceipt> = VecDeque::new();
+        for t in r["transactions"].as_array().unwrap() {
+            let status = match t["status"].as_str().unwrap() {
+                "executed" => TransactionStatus::Executed,
+                other => {
+                    return Err(ChainError::BlockError(format!("unhandled tx status {other}")));
+                }
+            };
+            let cpu = t["cpu_usage_us"].as_u64().unwrap() as u32;
+            let net = t["net_usage_words"].as_u64().unwrap() as u32;
+            let trx = &t["trx"];
+            if !trx.is_object() {
+                return Err(ChainError::BlockError("pruned transaction (id only)".into()));
+            }
+            let mut sigs = BTreeSet::new();
+            for s in trx["signatures"].as_array().unwrap() {
+                sigs.insert(
+                    Signature::from_str(s.as_str().unwrap())
+                        .map_err(|e| ChainError::BlockError(format!("signature parse: {e:?}")))?,
+                );
+            }
+            let compression = match trx["compression"].as_str().unwrap() {
+                "none" | "0" => TransactionCompression::None,
+                "zlib" | "1" => TransactionCompression::Zlib,
+                other => return Err(ChainError::BlockError(format!("compression: {other}"))),
+            };
+            let packed_trx: Bytes = hex::decode(trx["packed_trx"].as_str().unwrap()).unwrap().into();
+            let cfd: Bytes = hex::decode(trx["packed_context_free_data"].as_str().unwrap())
+                .unwrap()
+                .into();
+            let packed = PackedTransaction::new(sigs, compression, cfd, packed_trx)?;
+            let receipt_header = TransactionReceiptHeader::new(status, cpu, VarUint32(net));
+            txs.push_back(TransactionReceipt::new(receipt_header, packed));
+        }
+
+        Ok(SignedBlock {
+            signed_block_header: SignedBlockHeader {
+                header,
+                signature: Signature::default(),
+            },
+            transactions: txs,
+            block_extensions: vec![],
+        })
+    }
+
+    /// Replay real testnet blocks (fetched via scripts/fetch-blocks.sh into
+    /// PULSEVM_RPC_BLOCKS_DIR) into a fresh node with the arena shadow on, and
+    /// after every block assert the cross-impl full-state root — C++ chainbase
+    /// vs the Rust arena — over all twelve tables. Ignored by default; reports
+    /// exactly how far it stays 1:1 and the first divergence (mirror mismatch,
+    /// merkle-root mismatch, or an unexecutable tx) if any.
+    #[cfg(feature = "arena-shadow")]
+    #[tokio::test]
+    #[ignore]
+    async fn replay_testnet_blocks() -> Result<(), ChainError> {
+        let Ok(dir) = std::env::var("PULSEVM_RPC_BLOCKS_DIR") else {
+            eprintln!("set PULSEVM_RPC_BLOCKS_DIR (see scripts/fetch-blocks.sh) to run");
+            return Ok(());
+        };
+        let chain_id = Id::from_str(
+            "531a7002b4a4b67987f8706c01b965c76ffc3ad301608ac61a1f738cba6c3a9a",
+        )
+        .unwrap();
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+        let config_bytes = json!({"producer_name":"pulse","producer_key":"PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez"})
+            .to_string()
+            .into_bytes();
+
+        let mut files: Vec<_> = fs::read_dir(&dir)
+            .expect("blocks dir")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().map(|x| x == "json").unwrap_or(false))
+            .collect();
+        files.sort();
+
+        // The genesis initial_timestamp is block 1's timestamp; the committed
+        // genesis.json may carry a placeholder, so patch it to the real one so
+        // our genesis block (and the genesis accounts' creation dates) match.
+        let b1: serde_json::Value =
+            serde_json::from_slice(&fs::read(files.first().expect("no block fixtures")).unwrap())
+                .unwrap();
+        assert_eq!(b1["result"]["block_num"].as_u64(), Some(1), "first fixture must be block 1");
+        let ts = b1["result"]["timestamp"].as_str().unwrap().trim_end_matches(".000");
+        let mut g: serde_json::Value =
+            serde_json::from_slice(&fs::read(repo_root.join("genesis.json")).unwrap()).unwrap();
+        g["initial_timestamp"] = json!(ts);
+
+        // The committed genesis.json also carries a placeholder initial_key, so
+        // recover the real system-account key from the first signed transaction
+        // (using the real chain_id) and patch it in — otherwise pulse@active
+        // won't have the key its transactions are signed with.
+        for f in &files {
+            let v: serde_json::Value = serde_json::from_slice(&fs::read(f).unwrap()).unwrap();
+            let r = &v["result"];
+            if r["transactions"].as_array().map(|a| !a.is_empty()).unwrap_or(false) {
+                let b = reconstruct_block(r)?;
+                let keys = b.transactions[0]
+                    .trx()
+                    .get_signed_transaction()
+                    .recovered_keys(&chain_id)?;
+                if let Some(k) = keys.iter().next() {
+                    g["initial_key"] = json!(k.to_string());
+                }
+                break;
+            }
+        }
+        let genesis_bytes = serde_json::to_vec(&g).unwrap();
+
+        let mempool = Arc::new(RwLock::new(Mempool::new()));
+        let mut mempool = mempool.write().await;
+        let mut controller = Controller::new();
+        let temp = get_temp_dir();
+        controller.initialize(&chain_id, &config_bytes, &genesis_bytes, temp.path().to_str().unwrap())?;
+
+        // Our genesis (block 1) must match the testnet's, or block 2 won't chain.
+        let genesis_id = controller.last_accepted_block().id()?;
+        let start = controller.last_accepted_block().block_num() + 1;
+        assert_eq!(
+            genesis_id.to_string(),
+            b1["result"]["id"].as_str().unwrap(),
+            "our genesis block id != testnet block 1 id — genesis mismatch"
+        );
+
+        let mut replayed = 0u32;
+        for f in &files {
+            let v: serde_json::Value = serde_json::from_slice(&fs::read(f).unwrap()).unwrap();
+            let r = &v["result"];
+            let n = r["block_num"].as_u64().unwrap_or(0) as u32;
+            if n < start {
+                continue;
+            }
+            let block = reconstruct_block(r)?;
+            if let Err(e) = controller.verify_block(&block, &mut mempool).await {
+                eprintln!("stalled applying block {n}: {e:?}");
+                break;
+            }
+            controller.accept_block(&block.id()?, &mut mempool)?;
+            controller.set_preferred_id(block.id()?);
+
+            for (name, chain_bytes, arena_bytes) in cross_impl_tables(&controller.database())? {
+                assert_eq!(
+                    chain_bytes, arena_bytes,
+                    "cross-impl state diverged at block {n}, table {name}"
+                );
+            }
+            replayed = n;
+        }
+        eprintln!(
+            "replayed real testnet blocks up to {replayed}; C++ chainbase and the Rust arena matched the cross-impl full-state root at every block"
+        );
+        Ok(())
+    }
+
     /// Block-sequence fuzzer: random sequences of blocks — each with a few
     /// newaccount transactions, then either accepted or discarded — must keep
     /// the arena mirror in step with chainbase. After every block, for every
