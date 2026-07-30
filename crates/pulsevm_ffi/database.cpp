@@ -1,4 +1,8 @@
 #include "database.hpp"
+#include <algorithm>
+#include <tuple>
+#include <vector>
+#include <string>
 #include <pulsevm_ffi/src/bridge.rs.h>
 #include <pulsevm/state_history/create_deltas.hpp>
 #include <fc/reflect/reflect.hpp>
@@ -513,17 +517,25 @@ rust::Vec<uint8_t> database_wrapper::contract_kv_state_bytes() const {
     rust::Vec<uint8_t> out;
     auto put_u64 = [&](uint64_t v){ for (int i = 0; i < 8; ++i) out.push_back(static_cast<uint8_t>(v >> (8 * i))); };
     auto put_u32 = [&](uint32_t v){ for (int i = 0; i < 4; ++i) out.push_back(static_cast<uint8_t>(v >> (8 * i))); };
+    // Collect and sort by (code, scope, table, primary) — the arena's key order.
+    // The by_scope_primary index is (t_id, primary), and t_id (creation order)
+    // does not match code/scope/table across multiple tables.
+    struct Row { uint64_t code, scope, table, primary, payer; std::string value; };
+    std::vector<Row> rows;
     const auto& idx = this->get_index<key_value_index, by_scope_primary>();
     for (const auto& o : idx) {
         const auto& t = this->get<table_id_object>(o.t_id);
-        put_u64(t.code.to_uint64_t());
-        put_u64(t.scope.to_uint64_t());
-        put_u64(t.table.to_uint64_t());
-        put_u64(o.primary_key);
-        put_u64(o.payer.to_uint64_t());
-        const auto& v = o.get_value();
-        put_u32(static_cast<uint32_t>(v.size()));
-        for (size_t i = 0; i < v.size(); ++i) out.push_back(static_cast<uint8_t>(v.data()[i]));
+        rows.push_back(Row{ t.code.to_uint64_t(), t.scope.to_uint64_t(), t.table.to_uint64_t(),
+                            o.primary_key, o.payer.to_uint64_t(),
+                            std::string(o.get_value().data(), o.get_value().size()) });
+    }
+    std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b){
+        return std::tie(a.code, a.scope, a.table, a.primary) < std::tie(b.code, b.scope, b.table, b.primary);
+    });
+    for (const auto& r : rows) {
+        put_u64(r.code); put_u64(r.scope); put_u64(r.table); put_u64(r.primary); put_u64(r.payer);
+        put_u32(static_cast<uint32_t>(r.value.size()));
+        for (char c : r.value) out.push_back(static_cast<uint8_t>(c));
     }
     return out;
 }

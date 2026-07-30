@@ -1767,16 +1767,38 @@ impl ArenaShadow {
                 .map(|r| (r.id(), r.owner, r.ram_bytes, r.net_weight, r.cpu_weight))
                 .collect()
         };
+        let state_id = db
+            .table::<ResourceStateRow>()?
+            .iter()
+            .next()
+            .map(|s| s.id());
+        // update_state_and_value: revert the old value from the total (if > 0)
+        // and apply the new one (if > 0) — chainbase's total-weight bookkeeping.
+        let update_total = |total: &mut u64, old: i64, new: i64| {
+            if old > 0 {
+                *total -= old as u64;
+            }
+            if new > 0 {
+                *total += new as u64;
+            }
+        };
         for (pending_id, owner, ram_bytes, net_weight, cpu_weight) in pendings {
             let actual = db
                 .find_by::<ResourceLimitsRow, LimitsByOwner>(&(0u8, owner))?
-                .map(|r| r.id());
-            if let Some(actual_id) = actual {
+                .map(|r| (r.id(), r.ram_bytes, r.net_weight, r.cpu_weight));
+            if let Some((actual_id, old_ram, old_net, old_cpu)) = actual {
                 db.modify::<ResourceLimitsRow>(actual_id, |r| {
                     r.ram_bytes = ram_bytes;
                     r.net_weight = net_weight;
                     r.cpu_weight = cpu_weight;
                 })?;
+                if let Some(sid) = state_id {
+                    db.modify::<ResourceStateRow>(sid, |s| {
+                        update_total(&mut s.total_ram_bytes, old_ram, ram_bytes);
+                        update_total(&mut s.total_net_weight, old_net, net_weight);
+                        update_total(&mut s.total_cpu_weight, old_cpu, cpu_weight);
+                    })?;
+                }
             }
             db.remove::<ResourceLimitsRow>(pending_id)?;
         }

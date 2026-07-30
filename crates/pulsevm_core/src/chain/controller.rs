@@ -3128,6 +3128,45 @@ mod tests {
             let mut diverged = None;
             for (name, chain_bytes, arena_bytes) in cross_impl_tables(&controller.database())? {
                 if chain_bytes != arena_bytes {
+                    if name == "contract_key_value" && std::env::var("PULSEVM_KV_DEBUG").is_ok() {
+                        let rows = |b: &[u8]| {
+                            let mut m = std::collections::BTreeMap::new();
+                            let mut p = 0;
+                            while p + 44 <= b.len() {
+                                let u = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+                                let vlen = u32::from_le_bytes(b[p + 40..p + 44].try_into().unwrap()) as usize;
+                                let key = (u(p), u(p + 8), u(p + 16), u(p + 24)); // code,scope,table,pk
+                                m.insert(key, (u(p + 32), b[p + 44..(p + 44 + vlen).min(b.len())].to_vec()));
+                                p += 44 + vlen;
+                            }
+                            m
+                        };
+                        let (c, a) = (rows(&chain_bytes), rows(&arena_bytes));
+                        for (k, cv) in &c {
+                            match a.get(k) {
+                                None => eprintln!("  chain-only row {k:?} payer={} vlen={}", cv.0, cv.1.len()),
+                                Some(av) if av != cv => eprintln!("  DIFF row {k:?}: chain payer={} vlen={} | arena payer={} vlen={}", cv.0, cv.1.len(), av.0, av.1.len()),
+                                _ => {}
+                            }
+                        }
+                        for (k, av) in &a {
+                            if !c.contains_key(k) {
+                                eprintln!("  arena-only row {k:?} payer={} vlen={}", av.0, av.1.len());
+                            }
+                        }
+                    }
+                    if name == "resource_state" && std::env::var("PULSEVM_KV_DEBUG").is_ok() {
+                        let f = |b: &[u8]| {
+                            let u64a = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+                            // avg_net(20) avg_cpu(20) then 7 u64 scalars
+                            format!(
+                                "pending_net={} pending_cpu={} tot_net={} tot_cpu={} tot_ram={} vnet={} vcpu={} avgnet_vex={} avgcpu_vex={}",
+                                u64a(40), u64a(48), u64a(56), u64a(64), u64a(72), u64a(80), u64a(88), u64a(0), u64a(20)
+                            )
+                        };
+                        eprintln!("  chain: {}", f(&chain_bytes));
+                        eprintln!("  arena: {}", f(&arena_bytes));
+                    }
                     diverged = Some(name);
                     break;
                 }
