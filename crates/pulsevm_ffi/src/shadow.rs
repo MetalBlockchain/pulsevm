@@ -2797,6 +2797,19 @@ impl ArenaShadow {
         self.lock().load(path)
     }
 
+    /// Append the committed changes since the last flush to the write-ahead log
+    /// at `path` (O(rows changed)). Called once per accepted block, this is the
+    /// incremental durability a running node relies on between checkpoints.
+    pub fn flush_delta(&self, path: &std::path::Path) -> Result<(), DbError> {
+        self.lock().flush_delta(path)
+    }
+
+    /// Replay every complete frame in the log at `path` onto this mirror,
+    /// restoring the state a sequence of `flush_delta` calls recorded.
+    pub fn replay_log(&self, path: &std::path::Path) -> Result<(), DbError> {
+        self.lock().replay_log(path)
+    }
+
     /// Tally a non-contract read cross-check (arena lookup == chainbase's).
     pub fn note_noncontract(&self, matched: bool) {
         use std::sync::atomic::Ordering;

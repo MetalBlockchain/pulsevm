@@ -3119,6 +3119,11 @@ mod tests {
             "our genesis block id != testnet block 1 id — genesis mismatch"
         );
 
+        // Incremental durability: append the mirror's delta to a WAL after every
+        // accepted block, exactly as a running node would, so the crash-recovery
+        // reconstruction at the end runs over a real per-block flush cadence.
+        let wal = temp.path().join("arena.wal");
+
         let mut replayed = 0u32;
         for f in &files {
             let v: serde_json::Value = serde_json::from_slice(&fs::read(f).unwrap()).unwrap();
@@ -3134,6 +3139,7 @@ mod tests {
             }
             controller.accept_block(&block.id()?, &mut mempool)?;
             controller.set_preferred_id(block.id()?);
+            controller.database().arena_flush_delta(&wal)?;
 
             let mut diverged = None;
             for (name, chain_bytes, arena_bytes) in cross_impl_tables(&controller.database())? {
@@ -3283,9 +3289,20 @@ mod tests {
             None => "persistence check skipped (shadow off)".to_string(),
         };
 
+        // Crash recovery over the incremental path: rebuild a fresh mirror purely
+        // from the per-block WAL and require the same state root as the live one.
+        let wal_msg = match db.arena_wal_reload_matches(&wal)? {
+            Some(matched) => {
+                assert!(matched, "arena state root changed when rebuilt from the WAL");
+                let size = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+                format!("{size}-byte per-block WAL replayed to identical state root")
+            }
+            None => "WAL check skipped (shadow off)".to_string(),
+        };
+
         let read_source = if arena_reads { "the ARENA" } else { "chainbase" };
         eprintln!(
-            "replayed real testnet blocks up to {replayed} serving contract reads from {read_source}; C++ chainbase and the Rust arena matched the cross-impl full-state root at every block; arena served {checked} point reads and {tables_scanned} table scans identical to chainbase; {read_ok} inline reads + {pos_ok} iterator positions + {nc_ok} account/permission reads cross-checked live, 0 divergences; {persist_msg}"
+            "replayed real testnet blocks up to {replayed} serving contract reads from {read_source}; C++ chainbase and the Rust arena matched the cross-impl full-state root at every block; arena served {checked} point reads and {tables_scanned} table scans identical to chainbase; {read_ok} inline reads + {pos_ok} iterator positions + {nc_ok} account/permission reads cross-checked live, 0 divergences; {persist_msg}; {wal_msg}"
         );
         Ok(())
     }

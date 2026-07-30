@@ -770,6 +770,48 @@ impl Database {
         }
     }
 
+    /// Append the mirror's committed delta since the last flush to the WAL at
+    /// `path`. Call once per accepted block for incremental durability. No-op
+    /// when shadowing is off.
+    pub fn arena_flush_delta(&self, path: &std::path::Path) -> Result<(), ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            if let Some(s) = &self.shadow {
+                s.flush_delta(path)
+                    .map_err(|e| ChainError::InternalError(format!("arena flush_delta: {e:?}")))?;
+            }
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = path;
+        }
+        Ok(())
+    }
+
+    /// Reconstruct a fresh mirror by replaying the WAL at `path` (no base
+    /// checkpoint), and return whether its state root matches the live mirror —
+    /// the crash-recovery guarantee for the incremental path. `None` when
+    /// shadowing is off.
+    pub fn arena_wal_reload_matches(&self, path: &std::path::Path) -> Result<Option<bool>, ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            let Some(cur) = &self.shadow else {
+                return Ok(None);
+            };
+            let fresh = crate::shadow::ArenaShadow::new()
+                .map_err(|e| ChainError::InternalError(format!("arena new: {e:?}")))?;
+            fresh
+                .replay_log(path)
+                .map_err(|e| ChainError::InternalError(format!("arena replay_log: {e:?}")))?;
+            Ok(Some(cur.state_root() == fresh.state_root()))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = path;
+            Ok(None)
+        }
+    }
+
     /// (matches, mismatches) tallied by non-contract read cross-checks
     /// (accounts/permissions read during authorization and dispatch).
     pub fn arena_noncontract_crosscheck_counts(&self) -> (u64, u64) {
