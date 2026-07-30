@@ -3741,11 +3741,17 @@ impl<'g> DbRead<'g> {
             .lookup_linked_permission(account, code, requirement_type)
             .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
 
-        if res.is_null() {
-            return Ok(None);
+        let linked =
+            if res.is_null() { None } else { Some(unsafe { &*res }.to_uint64_t()) };
+
+        // linkauth resolution feeds authorization: the arena must resolve the
+        // same linked permission (or agree there's none).
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow {
+            s.note_noncontract(s.permission_link(account, code, requirement_type) == linked);
         }
 
-        Ok(Some(unsafe { &*res }.to_uint64_t()))
+        Ok(linked)
     }
 }
 
