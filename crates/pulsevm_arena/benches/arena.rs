@@ -172,6 +172,20 @@ fn bench_open_breakdown(c: &mut Criterion) {
             black_box(idx.len());
         })
     });
+
+    // If the index were persisted key-sorted, open could bulk-build it:
+    // BTreeMap::from_iter sorts + builds bottom-up instead of N inserts.
+    let sorted: Vec<(u64, i64)> = {
+        let mut v: Vec<(u64, i64)> = slab.iter().map(|a| (a.name, a.id.raw())).collect();
+        v.sort_by_key(|&(k, _)| k);
+        v
+    };
+    group.bench_function(BenchmarkId::new("index_bulk_build_sorted", rows), |b| {
+        b.iter(|| {
+            let idx: BTreeMap<u64, i64> = sorted.iter().copied().collect();
+            black_box(idx.len());
+        })
+    });
     group.finish();
 }
 

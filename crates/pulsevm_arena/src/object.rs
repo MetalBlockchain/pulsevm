@@ -133,6 +133,11 @@ pub trait SecondaryIndex<T: ArenaObject>: Send {
     /// unchanged. Returns `false` (index unchanged) if `new`'s key is taken.
     fn replace(&mut self, old: &T, new: &T) -> bool;
     fn erase(&mut self, obj: &T);
+    /// Rebuild the whole index from a table's row slab in one pass — the open
+    /// path. Bulk-building (sort + bottom-up) is an order of magnitude cheaper
+    /// than one `try_insert` per row, and index reconstruction dominates open.
+    /// Returns `false` if two live rows share a key (a corrupt snapshot).
+    fn bulk_build(&mut self, rows: &[Option<T>]) -> bool;
     fn len(&self) -> usize;
     fn is_empty(&self) -> bool {
         self.len() == 0
@@ -203,6 +208,25 @@ impl<T: ArenaObject, Tag: IndexedBy<T>> SecondaryIndex<T> for KeyIndex<T, Tag> {
             "erased entry did not belong to the object in index {}",
             self.index_name()
         );
+    }
+
+    fn bulk_build(&mut self, rows: &[Option<T>]) -> bool {
+        // `BTreeMap::from_iter` sorts the pairs and builds the tree bottom-up,
+        // far cheaper than inserting each row into an empty map. Row position is
+        // the object id.
+        let mut live = 0usize;
+        self.map = rows
+            .iter()
+            .enumerate()
+            .filter_map(|(id, slot)| {
+                slot.as_ref().map(|o| {
+                    live += 1;
+                    (Tag::key(o), id as i64)
+                })
+            })
+            .collect();
+        // Unique index: a dropped entry means two rows collided on a key.
+        self.map.len() == live
     }
 
     fn len(&self) -> usize {
