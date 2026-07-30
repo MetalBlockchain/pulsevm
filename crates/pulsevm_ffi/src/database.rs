@@ -812,6 +812,31 @@ impl Database {
         }
     }
 
+    /// Simulate a node restart: checkpoint the live mirror to `path`, then
+    /// rebuild it in place from that checkpoint. After this the shadow holds
+    /// reloaded-from-disk state (same object, restored revision) and keeps
+    /// serving — so the caller can carry on applying blocks and confirm the
+    /// mirror stays in lockstep with chainbase across the restart. `Ok(false)`
+    /// when shadowing is off.
+    pub fn arena_restart(&self, path: &std::path::Path) -> Result<bool, ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            let Some(cur) = &self.shadow else {
+                return Ok(false);
+            };
+            cur.checkpoint(path)
+                .map_err(|e| ChainError::InternalError(format!("arena checkpoint: {e:?}")))?;
+            cur.reload_from(path)
+                .map_err(|e| ChainError::InternalError(format!("arena reload: {e:?}")))?;
+            Ok(true)
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = path;
+            Ok(false)
+        }
+    }
+
     /// (matches, mismatches) tallied by non-contract read cross-checks
     /// (accounts/permissions read during authorization and dispatch).
     pub fn arena_noncontract_crosscheck_counts(&self) -> (u64, u64) {

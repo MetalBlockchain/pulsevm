@@ -3123,6 +3123,13 @@ mod tests {
         // accepted block, exactly as a running node would, so the crash-recovery
         // reconstruction at the end runs over a real per-block flush cadence.
         let wal = temp.path().join("arena.wal");
+        let ckpt = temp.path().join("arena_checkpoint.bin");
+
+        // Restart the mirror once around the middle of the run to prove it
+        // resumes from disk and keeps matching chainbase afterward.
+        let restart_at = start + (files.len() as u32) / 2;
+        let mut restarted = false;
+        let mut restart_block = 0u32;
 
         let mut replayed = 0u32;
         for f in &files {
@@ -3192,6 +3199,19 @@ mod tests {
                 break;
             }
             replayed = n;
+
+            // Restart the mirror once, mid-chain: checkpoint it, drop the live
+            // state, reload from disk, and keep going. Every following block still
+            // has to match chainbase, which only holds if the reloaded revision
+            // and rows line up exactly — the node-reboot guarantee.
+            if !restarted && n >= restart_at {
+                assert!(
+                    controller.database().arena_restart(&ckpt)?,
+                    "arena restart should run with the shadow enabled"
+                );
+                restarted = true;
+                restart_block = n;
+            }
         }
 
         // Read-surface check: the cross-impl root proves the arena *holds* the
@@ -3279,7 +3299,6 @@ mod tests {
         // full history, reload it into a fresh mirror, and require a byte-
         // identical state root. This is the durability the store needs to be
         // primary — the state survives a save/load intact.
-        let ckpt = temp.path().join("arena_checkpoint.bin");
         let persist = db.arena_persistence_roundtrip(&ckpt)?;
         let persist_msg = match persist {
             Some((matched, size)) => {
@@ -3300,9 +3319,15 @@ mod tests {
             None => "WAL check skipped (shadow off)".to_string(),
         };
 
+        let restart_msg = if restarted {
+            format!("mirror restarted from disk at block {restart_block} and stayed in lockstep to {replayed}")
+        } else {
+            "no mid-chain restart (run too short)".to_string()
+        };
+
         let read_source = if arena_reads { "the ARENA" } else { "chainbase" };
         eprintln!(
-            "replayed real testnet blocks up to {replayed} serving contract reads from {read_source}; C++ chainbase and the Rust arena matched the cross-impl full-state root at every block; arena served {checked} point reads and {tables_scanned} table scans identical to chainbase; {read_ok} inline reads + {pos_ok} iterator positions + {nc_ok} account/permission reads cross-checked live, 0 divergences; {persist_msg}; {wal_msg}"
+            "replayed real testnet blocks up to {replayed} serving contract reads from {read_source}; C++ chainbase and the Rust arena matched the cross-impl full-state root at every block; arena served {checked} point reads and {tables_scanned} table scans identical to chainbase; {read_ok} inline reads + {pos_ok} iterator positions + {nc_ok} account/permission reads cross-checked live, 0 divergences; {persist_msg}; {wal_msg}; {restart_msg}"
         );
         Ok(())
     }

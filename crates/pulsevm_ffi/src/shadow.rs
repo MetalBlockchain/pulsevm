@@ -894,28 +894,35 @@ pub struct ArenaShadow {
     reads_enabled: Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// Builds an empty `Db` with every mirrored table registered. Shared by
+/// `ArenaShadow::new` and the restart path so both agree on the table set.
+fn build_registered_db() -> Result<Db, DbError> {
+    let mut db = Db::new();
+    db.add_table::<AccountMetaRow>()?;
+    db.add_table::<AccountRow>()?;
+    db.add_table::<PermissionRow>()?;
+    db.add_table::<PermissionUsageRow>()?;
+    db.add_table::<PermissionLinkRow>()?;
+    db.add_table::<CodeRow>()?;
+    db.add_table::<DynGlobalPropertyRow>()?;
+    db.add_table::<TransactionRow>()?;
+    db.add_table::<ContractTableRow>()?;
+    db.add_table::<ContractKeyValueRow>()?;
+    db.add_table::<ContractIndex64Row>()?;
+    db.add_table::<ContractIndex128Row>()?;
+    db.add_table::<ContractIndex256Row>()?;
+    db.add_table::<ContractIndexDoubleRow>()?;
+    db.add_table::<ContractIndexLongDoubleRow>()?;
+    db.add_table::<ResourceUsageRow>()?;
+    db.add_table::<ResourceLimitsRow>()?;
+    db.add_table::<ResourceStateRow>()?;
+    Ok(db)
+}
+
 impl ArenaShadow {
     /// Registers every ported table. Grows as tables come online.
     pub fn new() -> Result<Self, DbError> {
-        let mut db = Db::new();
-        db.add_table::<AccountMetaRow>()?;
-        db.add_table::<AccountRow>()?;
-        db.add_table::<PermissionRow>()?;
-        db.add_table::<PermissionUsageRow>()?;
-        db.add_table::<PermissionLinkRow>()?;
-        db.add_table::<CodeRow>()?;
-        db.add_table::<DynGlobalPropertyRow>()?;
-        db.add_table::<TransactionRow>()?;
-        db.add_table::<ContractTableRow>()?;
-        db.add_table::<ContractKeyValueRow>()?;
-        db.add_table::<ContractIndex64Row>()?;
-        db.add_table::<ContractIndex128Row>()?;
-        db.add_table::<ContractIndex256Row>()?;
-        db.add_table::<ContractIndexDoubleRow>()?;
-        db.add_table::<ContractIndexLongDoubleRow>()?;
-        db.add_table::<ResourceUsageRow>()?;
-        db.add_table::<ResourceLimitsRow>()?;
-        db.add_table::<ResourceStateRow>()?;
+        let db = build_registered_db()?;
         Ok(ArenaShadow {
             inner: Arc::new(Mutex::new(db)),
             read_ok: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -2795,6 +2802,18 @@ impl ArenaShadow {
     /// Load a checkpoint into this (freshly constructed, empty) mirror.
     pub fn load(&self, path: &std::path::Path) -> Result<(), DbError> {
         self.lock().load(path)
+    }
+
+    /// Restart in place: discard the live `Db` and rebuild it from the checkpoint
+    /// at `path`, exactly as a node would on reboot. The shared counters and the
+    /// cutover switch survive (they live outside the `Db`), so the reloaded
+    /// mirror keeps serving. The restored revision must line up with chainbase's
+    /// for the next block's undo session to match.
+    pub fn reload_from(&self, path: &std::path::Path) -> Result<(), DbError> {
+        let mut fresh = build_registered_db()?;
+        fresh.load(path)?;
+        *self.lock() = fresh;
+        Ok(())
     }
 
     /// Append the committed changes since the last flush to the write-ahead log
