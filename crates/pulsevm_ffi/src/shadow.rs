@@ -1273,20 +1273,30 @@ impl ArenaShadow {
     /// mirror stores verbatim, so it compares directly.
     pub fn permission_state_bytes(&self) -> Vec<u8> {
         let db = self.lock();
-        let mut refs: Vec<(u64, u64, i64, BlobRef)> = match db.table::<PermissionRow>() {
+        let mut refs: Vec<(u64, u64, i64, i64, BlobRef)> = match db.table::<PermissionRow>() {
             Ok(t) => t
                 .iter()
                 .filter(|p| p.owner != 0)
-                .map(|p| (p.owner, p.perm_name, p.parent, p.auth))
+                .map(|p| {
+                    // last_used lives on the linked permission_usage row.
+                    let last_used = db
+                        .find::<PermissionUsageRow>(ObjectId::new(p.usage_id))
+                        .ok()
+                        .flatten()
+                        .map(|u| u.last_used)
+                        .unwrap_or(0);
+                    (p.owner, p.perm_name, p.parent, last_used, p.auth)
+                })
                 .collect(),
             Err(_) => return Vec::new(),
         };
         refs.sort_by_key(|r| (r.0, r.1));
         let mut out = Vec::new();
-        for (owner, perm_name, parent, auth_ref) in refs {
+        for (owner, perm_name, parent, last_used, auth_ref) in refs {
             out.extend_from_slice(&owner.to_le_bytes());
             out.extend_from_slice(&perm_name.to_le_bytes());
             out.extend_from_slice(&(parent as u64).to_le_bytes());
+            out.extend_from_slice(&(last_used as u64).to_le_bytes());
             let auth = db.blob::<PermissionRow>(auth_ref).unwrap_or(&[]);
             out.extend_from_slice(&(auth.len() as u32).to_le_bytes());
             out.extend_from_slice(auth);
@@ -1302,12 +1312,13 @@ impl ArenaShadow {
     pub fn hydrate_permissions(&self, bytes: &[u8]) -> Result<(), DbError> {
         let mut db = self.lock();
         let mut pos = 0usize;
-        while pos + 28 <= bytes.len() {
+        while pos + 36 <= bytes.len() {
             let owner = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
             let perm_name = u64::from_le_bytes(bytes[pos + 8..pos + 16].try_into().unwrap());
             let parent = u64::from_le_bytes(bytes[pos + 16..pos + 24].try_into().unwrap()) as i64;
-            let auth_len = u32::from_le_bytes(bytes[pos + 24..pos + 28].try_into().unwrap()) as usize;
-            pos += 28;
+            let last_used = u64::from_le_bytes(bytes[pos + 24..pos + 32].try_into().unwrap()) as i64;
+            let auth_len = u32::from_le_bytes(bytes[pos + 32..pos + 36].try_into().unwrap()) as usize;
+            pos += 36;
             if pos + auth_len > bytes.len() {
                 break;
             }
@@ -1319,7 +1330,10 @@ impl ArenaShadow {
             {
                 continue;
             }
-            let usage_id = db.create::<PermissionUsageRow>(|u| u.last_used = 0)?.id().raw();
+            let usage_id = db
+                .create::<PermissionUsageRow>(|u| u.last_used = last_used)?
+                .id()
+                .raw();
             let blob = db.alloc_blob::<PermissionRow>(auth)?;
             db.create::<PermissionRow>(|p| {
                 p.usage_id = usage_id;

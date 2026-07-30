@@ -301,10 +301,11 @@ impl Database {
             .permission_keys_bytes()
             .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
         let mut out = Vec::new();
-        for triple in keys.chunks_exact(24) {
-            let owner = u64::from_le_bytes(triple[0..8].try_into().unwrap());
-            let perm_name = u64::from_le_bytes(triple[8..16].try_into().unwrap());
-            let parent = u64::from_le_bytes(triple[16..24].try_into().unwrap());
+        for quad in keys.chunks_exact(32) {
+            let owner = u64::from_le_bytes(quad[0..8].try_into().unwrap());
+            let perm_name = u64::from_le_bytes(quad[8..16].try_into().unwrap());
+            let parent = u64::from_le_bytes(quad[16..24].try_into().unwrap());
+            let last_used = u64::from_le_bytes(quad[24..32].try_into().unwrap());
             let ptr = guard
                 .find_permission_by_actor_and_permission(owner, perm_name)
                 .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
@@ -317,6 +318,7 @@ impl Database {
             out.extend_from_slice(&owner.to_le_bytes());
             out.extend_from_slice(&perm_name.to_le_bytes());
             out.extend_from_slice(&parent.to_le_bytes());
+            out.extend_from_slice(&last_used.to_le_bytes());
             out.extend_from_slice(&(auth_bytes.len() as u32).to_le_bytes());
             out.extend_from_slice(&auth_bytes);
         }

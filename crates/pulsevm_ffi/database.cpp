@@ -403,6 +403,9 @@ rust::Vec<uint8_t> database_wrapper::permission_keys_bytes() const {
         put_u64(owner);
         put_u64(o.perm_name.to_uint64_t());
         put_u64(static_cast<uint64_t>(o.get_parent_id()));
+        // last_used from the linked permission_usage_object (µs since epoch).
+        const auto& usage = this->get<permission_usage_object>(o.usage_id);
+        put_u64(static_cast<uint64_t>(usage.last_used.time_since_epoch().count()));
     }
     return out;
 }
