@@ -2460,6 +2460,151 @@ impl ArenaShadow {
             .map(|r| r.secondary_key)
     }
 
+    /// idx128 secondary-index positioning, same semantics as the idx64 family but
+    /// over a `u128` secondary key: `(primary, secondary)` of the landing row,
+    /// in `(secondary, primary)` order.
+    pub fn idx128_lower_bound(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        secondary: u128,
+    ) -> Option<(u64, u128)> {
+        use std::ops::Bound;
+        let db = self.lock();
+        let t_id = self.resolve_t_id(&db, code, scope, table)?;
+        db.table::<ContractIndex128Row>()
+            .ok()?
+            .get_index::<ContractIdx128BySecondary>()
+            .range((
+                Bound::Included((t_id, secondary, u64::MIN)),
+                Bound::Included((t_id, u128::MAX, u64::MAX)),
+            ))
+            .next()
+            .map(|(&(_, sec, primary), _)| (primary, sec))
+    }
+
+    pub fn idx128_upper_bound(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        secondary: u128,
+    ) -> Option<(u64, u128)> {
+        use std::ops::Bound;
+        let db = self.lock();
+        let t_id = self.resolve_t_id(&db, code, scope, table)?;
+        db.table::<ContractIndex128Row>()
+            .ok()?
+            .get_index::<ContractIdx128BySecondary>()
+            .range((
+                Bound::Excluded((t_id, secondary, u64::MAX)),
+                Bound::Included((t_id, u128::MAX, u64::MAX)),
+            ))
+            .next()
+            .map(|(&(_, sec, primary), _)| (primary, sec))
+    }
+
+    pub fn idx128_find_secondary(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        secondary: u128,
+    ) -> Option<u64> {
+        self.idx128_lower_bound(code, scope, table, secondary)
+            .filter(|&(_, sec)| sec == secondary)
+            .map(|(primary, _)| primary)
+    }
+
+    pub fn idx128_find_primary(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary: u64,
+    ) -> Option<u128> {
+        let db = self.lock();
+        let t_id = self.resolve_t_id(&db, code, scope, table)?;
+        db.find_by::<ContractIndex128Row, ContractIdx128ByPrimary>(&(t_id, primary))
+            .ok()
+            .flatten()
+            .map(|r| r.secondary_key())
+    }
+
+    /// idx256 secondary-index positioning over a 32-byte key, ordered by its two
+    /// little-endian `u128` words then primary. Landing row as `(primary, key)`.
+    pub fn idx256_lower_bound(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        secondary: [u8; 32],
+    ) -> Option<(u64, [u8; 32])> {
+        use std::ops::Bound;
+        let (w0, w1) = split_key256(&secondary);
+        let db = self.lock();
+        let t_id = self.resolve_t_id(&db, code, scope, table)?;
+        db.table::<ContractIndex256Row>()
+            .ok()?
+            .get_index::<ContractIdx256BySecondary>()
+            .range((
+                Bound::Included((t_id, w0, w1, u64::MIN)),
+                Bound::Included((t_id, u128::MAX, u128::MAX, u64::MAX)),
+            ))
+            .next()
+            .map(|(&(_, a, b, primary), _)| (primary, join_key256(a, b)))
+    }
+
+    pub fn idx256_upper_bound(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        secondary: [u8; 32],
+    ) -> Option<(u64, [u8; 32])> {
+        use std::ops::Bound;
+        let (w0, w1) = split_key256(&secondary);
+        let db = self.lock();
+        let t_id = self.resolve_t_id(&db, code, scope, table)?;
+        db.table::<ContractIndex256Row>()
+            .ok()?
+            .get_index::<ContractIdx256BySecondary>()
+            .range((
+                Bound::Excluded((t_id, w0, w1, u64::MAX)),
+                Bound::Included((t_id, u128::MAX, u128::MAX, u64::MAX)),
+            ))
+            .next()
+            .map(|(&(_, a, b, primary), _)| (primary, join_key256(a, b)))
+    }
+
+    pub fn idx256_find_secondary(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        secondary: [u8; 32],
+    ) -> Option<u64> {
+        self.idx256_lower_bound(code, scope, table, secondary)
+            .filter(|&(_, key)| key == secondary)
+            .map(|(primary, _)| primary)
+    }
+
+    pub fn idx256_find_primary(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary: u64,
+    ) -> Option<[u8; 32]> {
+        let db = self.lock();
+        let t_id = self.resolve_t_id(&db, code, scope, table)?;
+        db.find_by::<ContractIndex256Row, ContractIdx256ByPrimary>(&(t_id, primary))
+            .ok()
+            .flatten()
+            .map(|r| r.secondary_key)
+    }
+
     fn resolve_t_id(&self, db: &Db, code: u64, scope: u64, table: u64) -> Option<i64> {
         db.find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&(code, scope, table))
             .ok()
@@ -2796,6 +2941,25 @@ impl ArenaShadow {
     }
 }
 
+/// Split a 32-byte idx256 key into its two little-endian `u128` words, the same
+/// way `ContractIndex256Row::secondary_words` does, so query keys sort against
+/// stored rows identically.
+fn split_key256(key: &[u8; 32]) -> (u128, u128) {
+    let mut w0 = [0u8; 16];
+    let mut w1 = [0u8; 16];
+    w0.copy_from_slice(&key[0..16]);
+    w1.copy_from_slice(&key[16..32]);
+    (u128::from_le_bytes(w0), u128::from_le_bytes(w1))
+}
+
+/// Inverse of [`split_key256`].
+fn join_key256(w0: u128, w1: u128) -> [u8; 32] {
+    let mut key = [0u8; 32];
+    key[0..16].copy_from_slice(&w0.to_le_bytes());
+    key[16..32].copy_from_slice(&w1.to_le_bytes());
+    key
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2875,5 +3039,51 @@ mod tests {
         // find_primary: the secondary stored for a primary.
         assert_eq!(s.idx64_find_primary(code, scope, table, 5), Some(200));
         assert_eq!(s.idx64_find_primary(code, scope, table, 42), None);
+    }
+
+    /// idx128 reads follow the same (secondary, primary) order over a u128 key,
+    /// including secondaries above u64::MAX that a narrower key would truncate.
+    #[test]
+    fn idx128_secondary_reads_follow_secondary_then_primary() {
+        let s = ArenaShadow::new().unwrap();
+        let (code, scope, table, payer) = (1u64, 2u64, 3u64, 9u64);
+        let big = (1u128 << 96) + 7; // well beyond u64
+        for &(primary, secondary) in &[(7u64, big), (5, 200u128), (2, 200), (9, 100)] {
+            s.create_index128_object(code, scope, table, payer, primary, secondary)
+                .unwrap();
+        }
+
+        assert_eq!(s.idx128_lower_bound(code, scope, table, 150), Some((2, 200)));
+        assert_eq!(s.idx128_lower_bound(code, scope, table, big), Some((7, big)));
+        assert_eq!(s.idx128_upper_bound(code, scope, table, 200), Some((7, big)));
+        assert_eq!(s.idx128_upper_bound(code, scope, table, big), None);
+        assert_eq!(s.idx128_find_secondary(code, scope, table, 200), Some(2));
+        assert_eq!(s.idx128_find_secondary(code, scope, table, 199), None);
+        assert_eq!(s.idx128_find_primary(code, scope, table, 7), Some(big));
+    }
+
+    /// idx256 reads order by the 32-byte key's two little-endian words then
+    /// primary, and round-trip the key bytes unchanged.
+    #[test]
+    fn idx256_secondary_reads_order_by_key_words() {
+        let s = ArenaShadow::new().unwrap();
+        let (code, scope, table, payer) = (1u64, 2u64, 3u64, 9u64);
+        let key = |n: u8| {
+            let mut k = [0u8; 32];
+            k[0] = n;
+            k
+        };
+        for &(primary, n) in &[(7u64, 30u8), (5, 20), (2, 20), (9, 10)] {
+            s.create_index256_object(code, scope, table, payer, primary, key(n))
+                .unwrap();
+        }
+
+        assert_eq!(s.idx256_lower_bound(code, scope, table, key(15)), Some((2, key(20))));
+        assert_eq!(s.idx256_lower_bound(code, scope, table, key(10)), Some((9, key(10))));
+        assert_eq!(s.idx256_upper_bound(code, scope, table, key(20)), Some((7, key(30))));
+        assert_eq!(s.idx256_upper_bound(code, scope, table, key(30)), None);
+        assert_eq!(s.idx256_find_secondary(code, scope, table, key(20)), Some(2));
+        assert_eq!(s.idx256_find_secondary(code, scope, table, key(25)), None);
+        assert_eq!(s.idx256_find_primary(code, scope, table, 5), Some(key(20)));
     }
 }
