@@ -2237,6 +2237,37 @@ impl ArenaShadow {
         db.blob::<ContractKeyValueRow>(value_ref).ok().map(|b| b.to_vec())
     }
 
+    /// Serve a contract-table forward scan from the arena: every row in
+    /// `(code, scope, table)` as `(primary_key, value)`, in ascending primary
+    /// order — the sequence a contract walks with db_lowerbound_i64 + repeated
+    /// db_next_i64. The order comes from the `by (t_id, primary_key)` index, not
+    /// a sort we impose, so it exercises the same ordered structure the reads use.
+    pub fn table_range(&self, code: u64, scope: u64, table: u64) -> Vec<(u64, Vec<u8>)> {
+        use std::ops::Bound;
+        let db = self.lock();
+        let Some(t_id) = db
+            .find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&(code, scope, table))
+            .ok()
+            .flatten()
+            .map(|t| t.id().raw())
+        else {
+            return Vec::new();
+        };
+        let Ok(tbl) = db.table::<ContractKeyValueRow>() else {
+            return Vec::new();
+        };
+        tbl.get_index::<ContractKvByScopePrimary>()
+            .range((
+                Bound::Included((t_id, u64::MIN)),
+                Bound::Included((t_id, u64::MAX)),
+            ))
+            .map(|(&(_, primary), row)| {
+                let value = tbl.blob(row.value).to_vec();
+                (primary, value)
+            })
+            .collect()
+    }
+
     pub fn update_key_value_object(
         &self,
         code: u64,

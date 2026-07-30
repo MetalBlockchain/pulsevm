@@ -507,6 +507,22 @@ impl Database {
         }
     }
 
+    /// Serve a contract-table forward scan from the arena: `(primary_key, value)`
+    /// for every row in `(code, scope, table)`, ascending by primary — the order
+    /// a contract sees walking db_lowerbound_i64 -> db_next_i64. Empty when the
+    /// table is absent or shadowing is off.
+    pub fn arena_table_range(&self, code: u64, scope: u64, table: u64) -> Vec<(u64, Vec<u8>)> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow.as_ref().map(|s| s.table_range(code, scope, table)).unwrap_or_default()
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = (code, scope, table);
+            Vec::new()
+        }
+    }
+
     /// Whether the arena mirror holds an account_object for `name` — for diffing
     /// against chainbase's `find_account`.
     pub fn arena_account_exists(&self, name: u64) -> bool {

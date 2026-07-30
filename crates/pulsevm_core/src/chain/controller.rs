@@ -3188,24 +3188,60 @@ mod tests {
         let db = controller.database();
         let chain_kv = db.contract_kv_state_bytes()?;
         let mut checked = 0u64;
+        // chainbase's wire format is already sorted by (code,scope,table,primary),
+        // so rows for a table arrive contiguously and in ascending primary order —
+        // exactly the sequence a forward scan must reproduce. Collect that expected
+        // scan per table as we go, then diff it against the arena's own scan.
+        let mut cur_table: Option<(u64, u64, u64)> = None;
+        let mut expected_scan: Vec<(u64, Vec<u8>)> = Vec::new();
+        let mut tables_scanned = 0u64;
+        let flush = |t: (u64, u64, u64), rows: &[(u64, Vec<u8>)]| {
+            let got = db.arena_table_range(t.0, t.1, t.2);
+            assert_eq!(
+                got.as_slice(),
+                rows,
+                "arena_table_range({},{},{}) scan != chainbase forward scan",
+                t.0,
+                t.1,
+                t.2
+            );
+        };
         let mut p = 0usize;
         while p + 44 <= chain_kv.len() {
             let u = |o: usize| u64::from_le_bytes(chain_kv[o..o + 8].try_into().unwrap());
             let (code, scope, table, primary) = (u(p), u(p + 8), u(p + 16), u(p + 24));
             let vlen = u32::from_le_bytes(chain_kv[p + 40..p + 44].try_into().unwrap()) as usize;
-            let value = &chain_kv[p + 44..(p + 44 + vlen).min(chain_kv.len())];
+            let value = chain_kv[p + 44..(p + 44 + vlen).min(chain_kv.len())].to_vec();
+
+            // Point read: the db_get_i64 primitive returns chainbase's value.
             let got = db.arena_kv_get(code, scope, table, primary);
             assert_eq!(
                 got.as_deref(),
-                Some(value),
+                Some(value.as_slice()),
                 "arena_kv_get({code},{scope},{table},{primary}) != chainbase value"
             );
             checked += 1;
+
+            // Accumulate this table's expected forward scan; flush at each boundary.
+            let key = (code, scope, table);
+            if cur_table != Some(key) {
+                if let Some(prev) = cur_table.take() {
+                    flush(prev, &expected_scan);
+                    tables_scanned += 1;
+                    expected_scan.clear();
+                }
+                cur_table = Some(key);
+            }
+            expected_scan.push((primary, value));
             p += 44 + vlen;
+        }
+        if let Some(prev) = cur_table.take() {
+            flush(prev, &expected_scan);
+            tables_scanned += 1;
         }
 
         eprintln!(
-            "replayed real testnet blocks up to {replayed}; C++ chainbase and the Rust arena matched the cross-impl full-state root at every block; arena served {checked} contract-row reads identical to chainbase"
+            "replayed real testnet blocks up to {replayed}; C++ chainbase and the Rust arena matched the cross-impl full-state root at every block; arena served {checked} point reads and {tables_scanned} table scans identical to chainbase"
         );
         Ok(())
     }
