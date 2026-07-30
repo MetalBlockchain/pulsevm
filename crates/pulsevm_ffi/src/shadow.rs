@@ -2391,6 +2391,16 @@ impl ArenaShadow {
         (self.pos_ok.load(Ordering::Relaxed), self.pos_fail.load(Ordering::Relaxed))
     }
 
+    /// Write a full checkpoint of the mirror's committed state to `path` (atomic).
+    pub fn checkpoint(&self, path: &std::path::Path) -> Result<(), DbError> {
+        self.lock().checkpoint(path)
+    }
+
+    /// Load a checkpoint into this (freshly constructed, empty) mirror.
+    pub fn load(&self, path: &std::path::Path) -> Result<(), DbError> {
+        self.lock().load(path)
+    }
+
     /// Tally a non-contract read cross-check (arena lookup == chainbase's).
     pub fn note_noncontract(&self, matched: bool) {
         use std::sync::atomic::Ordering;

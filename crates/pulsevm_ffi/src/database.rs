@@ -648,6 +648,37 @@ impl Database {
         }
     }
 
+    /// Persistence round-trip at the mirror's current (real) state size:
+    /// checkpoint the live mirror to `path`, load it into a fresh, empty mirror,
+    /// and return `(state_roots_match, checkpoint_bytes)`. A `true` means the
+    /// arena survived a full save/load with a byte-identical state root — the
+    /// durability the primary store needs. Returns `None` when shadowing is off.
+    pub fn arena_persistence_roundtrip(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<Option<(bool, u64)>, ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            let Some(cur) = &self.shadow else {
+                return Ok(None);
+            };
+            cur.checkpoint(path)
+                .map_err(|e| ChainError::InternalError(format!("arena checkpoint: {e:?}")))?;
+            let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            let fresh = crate::shadow::ArenaShadow::new()
+                .map_err(|e| ChainError::InternalError(format!("arena new: {e:?}")))?;
+            fresh
+                .load(path)
+                .map_err(|e| ChainError::InternalError(format!("arena load: {e:?}")))?;
+            Ok(Some((cur.state_root() == fresh.state_root(), size)))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = path;
+            Ok(None)
+        }
+    }
+
     /// (matches, mismatches) tallied by non-contract read cross-checks
     /// (accounts/permissions read during authorization and dispatch).
     pub fn arena_noncontract_crosscheck_counts(&self) -> (u64, u64) {

@@ -3269,9 +3269,23 @@ mod tests {
         let (nc_ok, nc_fail) = db.arena_noncontract_crosscheck_counts();
         assert_eq!(nc_fail, 0, "arena answered {nc_fail} account/permission reads differently from chainbase");
 
+        // Persistence at real state size: checkpoint the mirror built from the
+        // full history, reload it into a fresh mirror, and require a byte-
+        // identical state root. This is the durability the store needs to be
+        // primary — the state survives a save/load intact.
+        let ckpt = temp.path().join("arena_checkpoint.bin");
+        let persist = db.arena_persistence_roundtrip(&ckpt)?;
+        let persist_msg = match persist {
+            Some((matched, size)) => {
+                assert!(matched, "arena state root changed across checkpoint save/load");
+                format!("checkpoint {size} bytes reloaded with identical state root")
+            }
+            None => "persistence check skipped (shadow off)".to_string(),
+        };
+
         let read_source = if arena_reads { "the ARENA" } else { "chainbase" };
         eprintln!(
-            "replayed real testnet blocks up to {replayed} serving contract reads from {read_source}; C++ chainbase and the Rust arena matched the cross-impl full-state root at every block; arena served {checked} point reads and {tables_scanned} table scans identical to chainbase; {read_ok} inline reads + {pos_ok} iterator positions + {nc_ok} account/permission reads cross-checked live, 0 divergences"
+            "replayed real testnet blocks up to {replayed} serving contract reads from {read_source}; C++ chainbase and the Rust arena matched the cross-impl full-state root at every block; arena served {checked} point reads and {tables_scanned} table scans identical to chainbase; {read_ok} inline reads + {pos_ok} iterator positions + {nc_ok} account/permission reads cross-checked live, 0 divergences; {persist_msg}"
         );
         Ok(())
     }
