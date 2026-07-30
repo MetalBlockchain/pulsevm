@@ -2382,6 +2382,84 @@ impl ArenaShadow {
             .map(|(&(_, p), _)| p)
     }
 
+    /// Secondary-index (idx64) positioning from the arena, in `(secondary_key,
+    /// primary_key)` order — the sequence a contract walks with
+    /// db_idx64_lowerbound + db_idx64_next. Each returns `(primary, secondary)`
+    /// of the landing row. `idx64_lower_bound` = first secondary >= key,
+    /// `idx64_upper_bound` = first secondary > key. Ordering is the
+    /// `(t_id, secondary_key, primary_key)` index's own.
+    pub fn idx64_lower_bound(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        secondary: u64,
+    ) -> Option<(u64, u64)> {
+        use std::ops::Bound;
+        let db = self.lock();
+        let t_id = self.resolve_t_id(&db, code, scope, table)?;
+        db.table::<ContractIndex64Row>()
+            .ok()?
+            .get_index::<ContractIdx64BySecondary>()
+            .range((
+                Bound::Included((t_id, secondary, u64::MIN)),
+                Bound::Included((t_id, u64::MAX, u64::MAX)),
+            ))
+            .next()
+            .map(|(&(_, sec, primary), _)| (primary, sec))
+    }
+
+    pub fn idx64_upper_bound(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        secondary: u64,
+    ) -> Option<(u64, u64)> {
+        use std::ops::Bound;
+        let db = self.lock();
+        let t_id = self.resolve_t_id(&db, code, scope, table)?;
+        db.table::<ContractIndex64Row>()
+            .ok()?
+            .get_index::<ContractIdx64BySecondary>()
+            .range((
+                Bound::Excluded((t_id, secondary, u64::MAX)),
+                Bound::Included((t_id, u64::MAX, u64::MAX)),
+            ))
+            .next()
+            .map(|(&(_, sec, primary), _)| (primary, sec))
+    }
+
+    /// db_idx64_find_secondary: the primary of the first row whose secondary key
+    /// equals `secondary`, or `None` if none matches.
+    pub fn idx64_find_secondary(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        secondary: u64,
+    ) -> Option<u64> {
+        self.idx64_lower_bound(code, scope, table, secondary)
+            .filter(|&(_, sec)| sec == secondary)
+            .map(|(primary, _)| primary)
+    }
+
+    /// db_idx64_find_primary: the secondary key stored for `primary`, or `None`.
+    pub fn idx64_find_primary(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary: u64,
+    ) -> Option<u64> {
+        let db = self.lock();
+        let t_id = self.resolve_t_id(&db, code, scope, table)?;
+        db.find_by::<ContractIndex64Row, ContractIdx64ByPrimary>(&(t_id, primary))
+            .ok()
+            .flatten()
+            .map(|r| r.secondary_key)
+    }
+
     fn resolve_t_id(&self, db: &Db, code: u64, scope: u64, table: u64) -> Option<i64> {
         db.find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&(code, scope, table))
             .ok()
@@ -2763,5 +2841,39 @@ mod tests {
         assert_eq!(s.kv_last(code, scope, 999), None);
         assert_eq!(s.kv_lower_bound(code, scope, 999, 0), None);
         assert_eq!(s.table_range(code, scope, 999), Vec::new());
+    }
+
+    /// The idx64 secondary-index reads must walk `(secondary_key, primary_key)`
+    /// order, including duplicate secondaries (find_secondary returns the lowest
+    /// primary; the next distinct secondary is upper_bound's landing).
+    #[test]
+    fn idx64_secondary_reads_follow_secondary_then_primary() {
+        let s = ArenaShadow::new().unwrap();
+        let (code, scope, table, payer) = (1u64, 2u64, 3u64, 9u64);
+        // (primary, secondary) pairs, inserted out of order, with a duplicate
+        // secondary (200) across primaries 5 and 2.
+        for &(primary, secondary) in &[(7u64, 300u64), (5, 200), (2, 200), (9, 100)] {
+            s.create_index64_object(code, scope, table, payer, primary, secondary)
+                .unwrap();
+        }
+
+        // lower_bound by secondary: first row with secondary >= key, as
+        // (primary, secondary). The 200s tie-break by primary, so 2 comes first.
+        assert_eq!(s.idx64_lower_bound(code, scope, table, 100), Some((9, 100)));
+        assert_eq!(s.idx64_lower_bound(code, scope, table, 150), Some((2, 200)));
+        assert_eq!(s.idx64_lower_bound(code, scope, table, 200), Some((2, 200)));
+        assert_eq!(s.idx64_lower_bound(code, scope, table, 301), None);
+
+        // upper_bound by secondary: first row with secondary strictly greater.
+        assert_eq!(s.idx64_upper_bound(code, scope, table, 200), Some((7, 300)));
+        assert_eq!(s.idx64_upper_bound(code, scope, table, 300), None);
+
+        // find_secondary: lowest primary carrying that secondary; None if absent.
+        assert_eq!(s.idx64_find_secondary(code, scope, table, 200), Some(2));
+        assert_eq!(s.idx64_find_secondary(code, scope, table, 250), None);
+
+        // find_primary: the secondary stored for a primary.
+        assert_eq!(s.idx64_find_primary(code, scope, table, 5), Some(200));
+        assert_eq!(s.idx64_find_primary(code, scope, table, 42), None);
     }
 }
