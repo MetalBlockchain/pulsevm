@@ -2368,6 +2368,20 @@ impl ArenaShadow {
             .map(|(&(_, p), _)| p)
     }
 
+    /// The largest primary key in `(code, scope, table)`, or `None` if empty —
+    /// where db_previous_i64 lands when stepping back from the end iterator.
+    pub fn kv_last(&self, code: u64, scope: u64, table: u64) -> Option<u64> {
+        use std::ops::Bound;
+        let db = self.lock();
+        let t_id = self.resolve_t_id(&db, code, scope, table)?;
+        db.table::<ContractKeyValueRow>()
+            .ok()?
+            .get_index::<ContractKvByScopePrimary>()
+            .range((Bound::Included((t_id, u64::MIN)), Bound::Included((t_id, u64::MAX))))
+            .next_back()
+            .map(|(&(_, p), _)| p)
+    }
+
     fn resolve_t_id(&self, db: &Db, code: u64, scope: u64, table: u64) -> Option<i64> {
         db.find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&(code, scope, table))
             .ok()
@@ -2701,5 +2715,53 @@ impl ArenaShadow {
             contract_table_decr(&mut db, t_id)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The read primitives the arena serves to a contract — point read, forward
+    /// scan, and the four iterator-positioning queries — must follow the index's
+    /// primary-key order regardless of insertion order.
+    #[test]
+    fn contract_read_positioning_follows_index_order() {
+        let s = ArenaShadow::new().unwrap();
+        let (code, scope, table, payer) = (1u64, 2u64, 3u64, 9u64);
+        // Insert out of order; the index, not insertion, decides traversal.
+        for &pk in &[50u64, 10, 30, 20, 40] {
+            s.create_key_value_object(code, scope, table, payer, pk, &[pk as u8])
+                .unwrap();
+        }
+
+        // Point read (db_get_i64).
+        assert_eq!(s.kv_get(code, scope, table, 30), Some(vec![30u8]));
+        assert_eq!(s.kv_get(code, scope, table, 99), None);
+
+        // Forward scan (db_lowerbound -> repeated db_next).
+        let scan: Vec<u64> = s.table_range(code, scope, table).into_iter().map(|(p, _)| p).collect();
+        assert_eq!(scan, vec![10, 20, 30, 40, 50]);
+
+        // lower_bound: first primary >= key.
+        assert_eq!(s.kv_lower_bound(code, scope, table, 25), Some(30));
+        assert_eq!(s.kv_lower_bound(code, scope, table, 30), Some(30));
+        assert_eq!(s.kv_lower_bound(code, scope, table, 51), None);
+
+        // upper_bound: first primary > key (the db_next successor).
+        assert_eq!(s.kv_upper_bound(code, scope, table, 30), Some(40));
+        assert_eq!(s.kv_upper_bound(code, scope, table, 50), None);
+
+        // prev: last primary < key (the db_previous step from a live row).
+        assert_eq!(s.kv_prev(code, scope, table, 30), Some(20));
+        assert_eq!(s.kv_prev(code, scope, table, 10), None);
+
+        // last: greatest primary (db_previous from the end iterator).
+        assert_eq!(s.kv_last(code, scope, table), Some(50));
+
+        // An absent table answers empty everywhere, never a wrong row.
+        assert_eq!(s.kv_last(code, scope, 999), None);
+        assert_eq!(s.kv_lower_bound(code, scope, 999, 0), None);
+        assert_eq!(s.table_range(code, scope, 999), Vec::new());
     }
 }

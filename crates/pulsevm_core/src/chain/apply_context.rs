@@ -670,17 +670,24 @@ impl ApplyContext {
     pub fn db_previous_i64(&mut self, iterator: i32, primary: &mut u64) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
 
+        // From a live row: predecessor = arena `prev` of its key. From an end
+        // iterator (the db_end -> db_previous backward-iteration entry): the
+        // table's last row = arena `kv_last`.
         #[cfg(feature = "arena-shadow")]
-        let cur = current_iter_key(&inner.keyval_cache, iterator);
+        let arena_prev = match current_iter_key(&inner.keyval_cache, iterator) {
+            Some((code, scope, table, cur_pk)) => {
+                Some(self.db.arena_kv_prev(code, scope, table, cur_pk))
+            }
+            None => end_iter_table(&inner.keyval_cache, iterator)
+                .map(|(code, scope, table)| self.db.arena_kv_last(code, scope, table)),
+        };
 
         let res = self
             .db
             .db_previous_i64(&mut inner.keyval_cache, iterator, primary)?;
 
-        // db_previous steps to the largest primary < current: the arena's `prev`.
         #[cfg(feature = "arena-shadow")]
-        if let Some((code, scope, table, cur_pk)) = cur {
-            let arena_prev = self.db.arena_kv_prev(code, scope, table, cur_pk);
+        if let Some(arena_prev) = arena_prev {
             let ffi_prev = if res >= 0 { Some(*primary) } else { None };
             self.db.arena_note_pos(arena_prev == ffi_prev);
             if self.db.arena_reads_enabled()
@@ -1869,4 +1876,17 @@ fn landing_primary(cache: &KeyValueIteratorCache, res: i32) -> Option<u64> {
         return None;
     }
     cache.get(res).ok().map(|o| o.get_primary_key())
+}
+
+/// The `(code, scope, table)` an end iterator belongs to, so a step back from
+/// the end can be positioned against the arena. `None` if `iterator` isn't a
+/// known end iterator.
+#[cfg(feature = "arena-shadow")]
+fn end_iter_table(cache: &KeyValueIteratorCache, iterator: i32) -> Option<(u64, u64, u64)> {
+    let table = cache.find_table_by_end_iterator(iterator).ok().flatten()?;
+    Some((
+        table.get_code().to_uint64_t(),
+        table.get_scope().to_uint64_t(),
+        table.get_table().to_uint64_t(),
+    ))
 }

@@ -622,6 +622,20 @@ impl Database {
         }
     }
 
+    /// Largest primary in the table — db_previous_i64's landing when stepping
+    /// back from the end iterator. `None` if empty or shadowing is off.
+    pub fn arena_kv_last(&self, code: u64, scope: u64, table: u64) -> Option<u64> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow.as_ref().and_then(|s| s.kv_last(code, scope, table))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = (code, scope, table);
+            None
+        }
+    }
+
     /// Tally an iterator-positioning cross-check (arena landing vs chainbase).
     pub fn arena_note_pos(&self, matched: bool) {
         #[cfg(feature = "arena-shadow")]
