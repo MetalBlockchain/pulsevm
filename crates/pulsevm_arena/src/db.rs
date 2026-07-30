@@ -271,6 +271,18 @@ impl Db {
         Ok(self.table::<T>()?.get_index::<Tag>().find(key))
     }
 
+    /// Point lookup on a hash-backed index (declared with `hash_index`). O(1)
+    /// where an ordered `find_by` is O(log n); use for indexes never scanned.
+    pub fn find_by_hash<T: ArenaObject, Tag: IndexedBy<T>>(
+        &self,
+        key: &Tag::Key,
+    ) -> Result<Option<&T>, DbError>
+    where
+        Tag::Key: std::hash::Hash + Eq,
+    {
+        Ok(self.table::<T>()?.get_hash_index::<Tag>().find(key))
+    }
+
     /// Appends a variable-length value to `T`'s blob arena; store the returned
     /// ref on the object.
     pub fn alloc_blob<T: ArenaObject>(&mut self, bytes: &[u8]) -> Result<BlobRef, DbError> {

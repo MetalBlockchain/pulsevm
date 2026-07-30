@@ -18,8 +18,11 @@ mod object;
 mod table;
 
 pub use db::{Db, DbError};
-pub use object::{ArenaObject, BlobRef, IndexedBy, KeyIndex, ObjectId, SecondaryIndex, key_index};
-pub use table::{IndexView, Table, TableError};
+pub use object::{
+    ArenaObject, BlobRef, HashKeyIndex, IndexedBy, KeyIndex, ObjectId, SecondaryIndex, hash_index,
+    key_index,
+};
+pub use table::{HashIndexView, IndexView, Table, TableError};
 
 /// `#[derive(ArenaObject)]` — generates the trait impl and secondary-index
 /// declarations. Re-exported so `use pulsevm_arena::ArenaObject` brings both the

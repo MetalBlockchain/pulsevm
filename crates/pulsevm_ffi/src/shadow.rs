@@ -26,7 +26,10 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 #[arena(type_id = 1)]
 struct AccountMetaRow {
     id: ObjectId<AccountMetaRow>,
-    #[arena(index)]
+    // Point-queried only (account lookups by name), never scanned in order, and
+    // grows with the account count — so a hash index beats the ordered one at
+    // scale. Reads go through `find_by_hash`.
+    #[arena(hash_index)]
     name: u64,
     recv_sequence: u64,
     auth_sequence: u64,
@@ -1010,7 +1013,7 @@ impl ArenaShadow {
     /// privileged flag — for diffing against chainbase.
     pub fn account_metadata_privileged(&self, name: u64) -> Option<bool> {
         self.lock()
-            .find_by::<AccountMetaRow, AccountMetaRowByName>(&name)
+            .find_by_hash::<AccountMetaRow, AccountMetaRowByName>(&name)
             .ok()
             .flatten()
             .map(|row| row.flags & 1 != 0)
@@ -1025,7 +1028,7 @@ impl ArenaShadow {
         name: u64,
     ) -> Option<(bool, u64, u64, u64, u64, [u8; 32], u8, u8)> {
         self.lock()
-            .find_by::<AccountMetaRow, AccountMetaRowByName>(&name)
+            .find_by_hash::<AccountMetaRow, AccountMetaRowByName>(&name)
             .ok()
             .flatten()
             .map(|row| {
@@ -1097,7 +1100,7 @@ impl ArenaShadow {
         for chunk in bytes.chunks_exact(ROW) {
             let name = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
             if db
-                .find_by::<AccountMetaRow, AccountMetaRowByName>(&name)?
+                .find_by_hash::<AccountMetaRow, AccountMetaRowByName>(&name)?
                 .is_some()
             {
                 continue;
@@ -1139,7 +1142,7 @@ impl ArenaShadow {
     pub fn set_privileged(&self, name: u64, privileged: bool) -> Result<(), DbError> {
         let mut db = self.lock();
         let id = db
-            .find_by::<AccountMetaRow, AccountMetaRowByName>(&name)?
+            .find_by_hash::<AccountMetaRow, AccountMetaRowByName>(&name)?
             .map(|r| r.id());
         if let Some(id) = id {
             db.modify::<AccountMetaRow>(id, |row| {
@@ -1159,7 +1162,7 @@ impl ArenaShadow {
     pub fn next_auth_sequence(&self, actor: u64) -> Result<(), DbError> {
         let mut db = self.lock();
         let id = db
-            .find_by::<AccountMetaRow, AccountMetaRowByName>(&actor)?
+            .find_by_hash::<AccountMetaRow, AccountMetaRowByName>(&actor)?
             .map(|r| r.id());
         if let Some(id) = id {
             db.modify::<AccountMetaRow>(id, |row| row.auth_sequence += 1)?;
@@ -1172,7 +1175,7 @@ impl ArenaShadow {
     pub fn next_recv_sequence(&self, receiver: u64) -> Result<(), DbError> {
         let mut db = self.lock();
         let id = db
-            .find_by::<AccountMetaRow, AccountMetaRowByName>(&receiver)?
+            .find_by_hash::<AccountMetaRow, AccountMetaRowByName>(&receiver)?
             .map(|r| r.id());
         if let Some(id) = id {
             db.modify::<AccountMetaRow>(id, |row| row.recv_sequence += 1)?;
@@ -1187,7 +1190,7 @@ impl ArenaShadow {
         let mut db = self.lock();
 
         let meta_id = db
-            .find_by::<AccountMetaRow, AccountMetaRowByName>(&name)?
+            .find_by_hash::<AccountMetaRow, AccountMetaRowByName>(&name)?
             .map(|r| r.id());
         if let Some(id) = meta_id {
             db.modify::<AccountMetaRow>(id, |row| row.abi_sequence += 1)?;
@@ -2087,7 +2090,7 @@ impl ArenaShadow {
         let mut db = self.lock();
 
         let meta_id = db
-            .find_by::<AccountMetaRow, AccountMetaRowByName>(&name)?
+            .find_by_hash::<AccountMetaRow, AccountMetaRowByName>(&name)?
             .map(|r| r.id());
         if let Some(id) = meta_id {
             db.modify::<AccountMetaRow>(id, |row| {

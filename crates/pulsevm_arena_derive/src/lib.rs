@@ -72,7 +72,8 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     };
 
     let mut has_id = false;
-    let mut tags = Vec::new();
+    let mut ordered_tags = Vec::new();
+    let mut hashed_tags = Vec::new();
     let mut index_defs = Vec::new();
     for field in fields {
         let ident = field.ident.as_ref().unwrap();
@@ -83,7 +84,13 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             .attrs
             .iter()
             .any(|a| a.path().is_ident("arena") && attr_has_flag(a, "index"));
-        if is_index {
+        // `#[arena(hash_index)]` picks the O(1) hash backend for a point-only
+        // index (no range/iteration); plain `#[arena(index)]` stays ordered.
+        let is_hash = field
+            .attrs
+            .iter()
+            .any(|a| a.path().is_ident("arena") && attr_has_flag(a, "hash_index"));
+        if is_index || is_hash {
             let field_ty = &field.ty;
             let tag = format_ident!("{}By{}", name, pascal(&ident.to_string()));
             index_defs.push(quote! {
@@ -96,7 +103,11 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                     }
                 }
             });
-            tags.push(tag);
+            if is_hash {
+                hashed_tags.push(tag);
+            } else {
+                ordered_tags.push(tag);
+            }
         }
     }
 
@@ -108,7 +119,10 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     }
 
     let secondary = quote! {
-        vec![ #( ::pulsevm_arena::key_index::<Self, #tags>() ),* ]
+        vec![
+            #( ::pulsevm_arena::key_index::<Self, #ordered_tags>(), )*
+            #( ::pulsevm_arena::hash_index::<Self, #hashed_tags>(), )*
+        ]
     };
 
     Ok(quote! {

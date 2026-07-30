@@ -49,3 +49,60 @@ fn derived_object_has_both_indices() {
     assert_eq!(db.find_by::<Account, AccountByName>(&101).unwrap().unwrap().id, id);
     assert_eq!(db.find_by::<Account, AccountByAlias>(&200).unwrap().unwrap().id, id);
 }
+
+#[repr(C)]
+#[derive(
+    Clone,
+    Copy,
+    Default,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::Immutable,
+    zerocopy::KnownLayout,
+    ArenaObject,
+)]
+#[arena(type_id = 8)]
+struct HashedRow {
+    id: ObjectId<HashedRow>,
+    #[arena(hash_index)]
+    key: u64,
+    payload: u64,
+}
+
+/// A `#[arena(hash_index)]` field is queried through `find_by_hash`, stays in
+/// step across modify/remove, and survives a checkpoint round-trip (whose open
+/// path bulk-builds the hash index).
+#[test]
+fn hash_index_point_lookups_and_reload() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("snap.bin");
+
+    let mut db = Db::new();
+    db.add_table::<HashedRow>().unwrap();
+    for k in [10u64, 20, 30] {
+        db.create::<HashedRow>(|r| {
+            r.key = k;
+            r.payload = k * 2;
+        })
+        .unwrap();
+    }
+
+    assert_eq!(db.find_by_hash::<HashedRow, HashedRowByKey>(&20).unwrap().unwrap().payload, 40);
+    assert!(db.find_by_hash::<HashedRow, HashedRowByKey>(&99).unwrap().is_none());
+
+    // Rekey and remove keep the hash index consistent.
+    let id20 =
+        db.find_by_hash::<HashedRow, HashedRowByKey>(&20).unwrap().unwrap().id;
+    db.modify::<HashedRow>(id20, |r| r.key = 25).unwrap();
+    assert!(db.find_by_hash::<HashedRow, HashedRowByKey>(&20).unwrap().is_none());
+    assert_eq!(db.find_by_hash::<HashedRow, HashedRowByKey>(&25).unwrap().unwrap().id, id20);
+
+    db.save(&path).unwrap();
+    let mut fresh = Db::new();
+    fresh.add_table::<HashedRow>().unwrap();
+    fresh.load(&path).unwrap();
+    // The hash index was bulk-rebuilt on open and answers the same.
+    assert_eq!(fresh.find_by_hash::<HashedRow, HashedRowByKey>(&30).unwrap().unwrap().payload, 60);
+    assert_eq!(fresh.find_by_hash::<HashedRow, HashedRowByKey>(&25).unwrap().unwrap().id, id20);
+    assert!(fresh.find_by_hash::<HashedRow, HashedRowByKey>(&10).unwrap().is_some());
+}

@@ -234,6 +234,30 @@ impl<T: ArenaObject> Table<T> {
         }
     }
 
+    /// Typed view of a hash-backed secondary index (declared with `hash_index`).
+    /// Point queries only — a hash has no order. Panics if `Tag` is not declared,
+    /// or was declared ordered (`key_index`) rather than hashed.
+    pub fn get_hash_index<Tag: IndexedBy<T>>(&self) -> HashIndexView<'_, T, Tag>
+    where
+        Tag::Key: std::hash::Hash + Eq,
+    {
+        let pos = *self.tag_positions.get(&TypeId::of::<Tag>()).unwrap_or_else(|| {
+            panic!(
+                "index {} is not declared by {}",
+                std::any::type_name::<Tag>(),
+                T::type_name()
+            )
+        });
+        let index = self.secondaries[pos]
+            .as_any()
+            .downcast_ref::<crate::object::HashKeyIndex<T, Tag>>()
+            .expect("tag registered as ordered; use get_index, not get_hash_index");
+        HashIndexView {
+            map: &index.map,
+            primary: &self.primary,
+        }
+    }
+
     /// Iterates live objects in id order.
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = &T> + '_ {
         self.primary.iter().filter_map(|s| s.as_ref())
@@ -651,6 +675,42 @@ impl<'a, T: ArenaObject, Tag: IndexedBy<T>> IndexView<'a, T, Tag> {
         self.map
             .range((range.start_bound().cloned(), range.end_bound().cloned()))
             .map(|(key, &id)| (key, self.row(id)))
+    }
+
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+}
+
+/// Read view over a hash-backed secondary index: O(1) point lookups, no order.
+pub struct HashIndexView<'a, T: ArenaObject, Tag: IndexedBy<T>>
+where
+    Tag::Key: std::hash::Hash + Eq,
+{
+    map: &'a std::collections::HashMap<Tag::Key, i64>,
+    primary: &'a [Option<T>],
+}
+
+impl<'a, T: ArenaObject, Tag: IndexedBy<T>> HashIndexView<'a, T, Tag>
+where
+    Tag::Key: std::hash::Hash + Eq,
+{
+    fn row(&self, id: i64) -> &'a T {
+        self.primary[id as usize]
+            .as_ref()
+            .expect("secondary index points at a live row")
+    }
+
+    pub fn find(&self, key: &Tag::Key) -> Option<&'a T> {
+        self.map.get(key).map(|&id| self.row(id))
+    }
+
+    pub fn contains(&self, key: &Tag::Key) -> bool {
+        self.map.contains_key(key)
     }
 
     pub fn len(&self) -> usize {

@@ -4,7 +4,9 @@
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use pulsevm_arena::{ArenaObject, Db, IndexedBy, ObjectId, SecondaryIndex, Table, key_index};
+use pulsevm_arena::{
+    ArenaObject, Db, IndexedBy, ObjectId, SecondaryIndex, Table, hash_index, key_index,
+};
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout)]
@@ -23,6 +25,15 @@ impl IndexedBy<Account> for ByName {
     }
 }
 
+// Same key, hash-backed — to compare point-lookup latency against `ByName`.
+struct ByNameHash;
+impl IndexedBy<Account> for ByNameHash {
+    type Key = u64;
+    fn key(o: &Account) -> u64 {
+        o.name
+    }
+}
+
 impl ArenaObject for Account {
     const TYPE_ID: u16 = 0;
     fn id(&self) -> ObjectId<Self> {
@@ -32,7 +43,7 @@ impl ArenaObject for Account {
         self.id = id;
     }
     fn secondary_indices() -> Vec<Box<dyn SecondaryIndex<Self>>> {
-        vec![key_index::<Self, ByName>()]
+        vec![key_index::<Self, ByName>(), hash_index::<Self, ByNameHash>()]
     }
 }
 
@@ -64,6 +75,15 @@ fn bench_hot_path(c: &mut Criterion) {
             b.iter(|| {
                 let name = t.get_index::<ByName>().find(black_box(&(k % rows))).map(|a| a.name);
                 k += 1;
+                black_box(name)
+            })
+        });
+        let mut h = 0u64;
+        find.bench_with_input(BenchmarkId::new("by_name_hash", rows), &rows, |b, rows| {
+            b.iter(|| {
+                let name =
+                    t.get_hash_index::<ByNameHash>().find(black_box(&(h % rows))).map(|a| a.name);
+                h += 1;
                 black_box(name)
             })
         });

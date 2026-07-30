@@ -1,5 +1,5 @@
 use std::any::{Any, TypeId};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
@@ -226,6 +226,108 @@ impl<T: ArenaObject, Tag: IndexedBy<T>> SecondaryIndex<T> for KeyIndex<T, Tag> {
             })
             .collect();
         // Unique index: a dropped entry means two rows collided on a key.
+        self.map.len() == live
+    }
+
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Unordered secondary index: a hash map from `Tag::Key` to object id. Use for
+/// indexes that are only ever point-queried (`find`/`contains`) — it answers
+/// those in O(1) instead of the BTree's O(log n). It supports no range/iteration
+/// (a hash has no order), so [`IndexView`] panics if those are called on it.
+pub struct HashKeyIndex<T: ArenaObject, Tag: IndexedBy<T>>
+where
+    Tag::Key: Hash + Eq,
+{
+    pub(crate) map: HashMap<Tag::Key, i64>,
+    _marker: PhantomData<fn() -> (T, Tag)>,
+}
+
+/// Creates a hash-backed secondary index. `Tag::Key` must be `Hash + Eq` in
+/// addition to the `Ord` that [`IndexedBy`] already requires.
+pub fn hash_index<T: ArenaObject, Tag: IndexedBy<T>>() -> Box<dyn SecondaryIndex<T>>
+where
+    Tag::Key: Hash + Eq,
+{
+    Box::new(HashKeyIndex::<T, Tag> {
+        map: HashMap::new(),
+        _marker: PhantomData,
+    })
+}
+
+impl<T: ArenaObject, Tag: IndexedBy<T>> SecondaryIndex<T> for HashKeyIndex<T, Tag>
+where
+    Tag::Key: Hash + Eq,
+{
+    fn tag(&self) -> TypeId {
+        TypeId::of::<Tag>()
+    }
+
+    fn index_name(&self) -> &'static str {
+        std::any::type_name::<Tag>()
+    }
+
+    fn try_insert(&mut self, obj: &T) -> bool {
+        match self.map.entry(Tag::key(obj)) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(obj.id().raw());
+                true
+            }
+            std::collections::hash_map::Entry::Occupied(_) => false,
+        }
+    }
+
+    fn replace(&mut self, old: &T, new: &T) -> bool {
+        let old_key = Tag::key(old);
+        let new_key = Tag::key(new);
+        if old_key == new_key {
+            return true;
+        }
+        match self.map.entry(new_key) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(old.id().raw());
+            }
+            std::collections::hash_map::Entry::Occupied(_) => return false,
+        }
+        let removed = self.map.remove(&old_key);
+        debug_assert_eq!(
+            removed,
+            Some(old.id().raw()),
+            "replaced entry did not belong to the object in index {}",
+            self.index_name()
+        );
+        true
+    }
+
+    fn erase(&mut self, obj: &T) {
+        let removed = self.map.remove(&Tag::key(obj));
+        debug_assert_eq!(
+            removed,
+            Some(obj.id().raw()),
+            "erased entry did not belong to the object in index {}",
+            self.index_name()
+        );
+    }
+
+    fn bulk_build(&mut self, rows: &[Option<T>]) -> bool {
+        let mut live = 0usize;
+        self.map = rows
+            .iter()
+            .enumerate()
+            .filter_map(|(id, slot)| {
+                slot.as_ref().map(|o| {
+                    live += 1;
+                    (Tag::key(o), id as i64)
+                })
+            })
+            .collect();
         self.map.len() == live
     }
 
