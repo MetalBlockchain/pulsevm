@@ -881,6 +881,10 @@ pub struct ArenaShadow {
     // across Database clones so the totals are chain-wide. See `crosscheck_kv`.
     read_ok: Arc<std::sync::atomic::AtomicU64>,
     read_fail: Arc<std::sync::atomic::AtomicU64>,
+    // Iterator-positioning cross-check tallies (db_next/previous/lower/upper): the
+    // arena computes where the cursor lands and it's compared to chainbase.
+    pos_ok: Arc<std::sync::atomic::AtomicU64>,
+    pos_fail: Arc<std::sync::atomic::AtomicU64>,
     // When set, the node serves contract reads FROM the arena instead of
     // chainbase — the staged cutover switch. Shared across clones. Off by default.
     reads_enabled: Arc<std::sync::atomic::AtomicBool>,
@@ -912,6 +916,8 @@ impl ArenaShadow {
             inner: Arc::new(Mutex::new(db)),
             read_ok: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             read_fail: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            pos_ok: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            pos_fail: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             reads_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
@@ -2311,6 +2317,72 @@ impl ArenaShadow {
                 (primary, value)
             })
             .collect()
+    }
+
+    /// Iterator positioning from the arena — the primary key a contract's cursor
+    /// lands on. `kv_lower_bound` = smallest primary >= key (db_lowerbound_i64);
+    /// `kv_upper_bound` = smallest primary > key (db_upperbound_i64, and the
+    /// successor db_next_i64 advances to); `kv_prev` = largest primary < key (the
+    /// db_previous_i64 step). `None` means the walk ran off the table's end. All
+    /// three read the `(t_id, primary_key)` index directly, so the order is the
+    /// index's, not one we impose.
+    pub fn kv_lower_bound(&self, code: u64, scope: u64, table: u64, key: u64) -> Option<u64> {
+        use std::ops::Bound;
+        let db = self.lock();
+        let t_id = self.resolve_t_id(&db, code, scope, table)?;
+        db.table::<ContractKeyValueRow>()
+            .ok()?
+            .get_index::<ContractKvByScopePrimary>()
+            .range((Bound::Included((t_id, key)), Bound::Included((t_id, u64::MAX))))
+            .next()
+            .map(|(&(_, p), _)| p)
+    }
+
+    pub fn kv_upper_bound(&self, code: u64, scope: u64, table: u64, key: u64) -> Option<u64> {
+        use std::ops::Bound;
+        let db = self.lock();
+        let t_id = self.resolve_t_id(&db, code, scope, table)?;
+        db.table::<ContractKeyValueRow>()
+            .ok()?
+            .get_index::<ContractKvByScopePrimary>()
+            .range((Bound::Excluded((t_id, key)), Bound::Included((t_id, u64::MAX))))
+            .next()
+            .map(|(&(_, p), _)| p)
+    }
+
+    pub fn kv_prev(&self, code: u64, scope: u64, table: u64, key: u64) -> Option<u64> {
+        use std::ops::Bound;
+        let db = self.lock();
+        let t_id = self.resolve_t_id(&db, code, scope, table)?;
+        db.table::<ContractKeyValueRow>()
+            .ok()?
+            .get_index::<ContractKvByScopePrimary>()
+            .range((Bound::Included((t_id, u64::MIN)), Bound::Excluded((t_id, key))))
+            .next_back()
+            .map(|(&(_, p), _)| p)
+    }
+
+    fn resolve_t_id(&self, db: &Db, code: u64, scope: u64, table: u64) -> Option<i64> {
+        db.find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&(code, scope, table))
+            .ok()
+            .flatten()
+            .map(|t| t.id().raw())
+    }
+
+    /// Tally an iterator-positioning cross-check (arena landing == chainbase's).
+    pub fn note_pos(&self, matched: bool) {
+        use std::sync::atomic::Ordering;
+        if matched {
+            self.pos_ok.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.pos_fail.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// (matches, mismatches) tallied by iterator-positioning cross-checks.
+    pub fn pos_crosscheck_counts(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering;
+        (self.pos_ok.load(Ordering::Relaxed), self.pos_fail.load(Ordering::Relaxed))
     }
 
     pub fn update_key_value_object(

@@ -3256,9 +3256,15 @@ mod tests {
         let (read_ok, read_fail) = db.arena_read_crosscheck_counts();
         assert_eq!(read_fail, 0, "arena served {read_fail} contract reads that diverged from chainbase mid-execution");
 
+        // Iterator-positioning cross-check tally: accumulated by the
+        // db_next/previous/lowerbound/upperbound wrappers over every cursor move
+        // during execution. The arena computed the same landing key as chainbase.
+        let (pos_ok, pos_fail) = db.arena_pos_crosscheck_counts();
+        assert_eq!(pos_fail, 0, "arena positioned {pos_fail} iterator moves differently from chainbase");
+
         let read_source = if arena_reads { "the ARENA" } else { "chainbase" };
         eprintln!(
-            "replayed real testnet blocks up to {replayed} serving contract reads from {read_source}; C++ chainbase and the Rust arena matched the cross-impl full-state root at every block; arena served {checked} point reads and {tables_scanned} table scans identical to chainbase; {read_ok} inline contract reads cross-checked live, 0 divergences"
+            "replayed real testnet blocks up to {replayed} serving contract reads from {read_source}; C++ chainbase and the Rust arena matched the cross-impl full-state root at every block; arena served {checked} point reads and {tables_scanned} table scans identical to chainbase; {read_ok} inline reads + {pos_ok} iterator positions cross-checked live, 0 divergences"
         );
         Ok(())
     }

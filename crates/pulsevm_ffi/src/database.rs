@@ -582,6 +582,72 @@ impl Database {
         }
     }
 
+    /// Arena iterator positioning: the primary a cursor lands on. `lower_bound` =
+    /// first primary >= key, `upper_bound` = first primary > key (also the
+    /// db_next successor), `prev` = last primary < key. `None` = off the end.
+    /// All return `None` when shadowing is off.
+    pub fn arena_kv_lower_bound(&self, code: u64, scope: u64, table: u64, key: u64) -> Option<u64> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow.as_ref().and_then(|s| s.kv_lower_bound(code, scope, table, key))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = (code, scope, table, key);
+            None
+        }
+    }
+
+    pub fn arena_kv_upper_bound(&self, code: u64, scope: u64, table: u64, key: u64) -> Option<u64> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow.as_ref().and_then(|s| s.kv_upper_bound(code, scope, table, key))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = (code, scope, table, key);
+            None
+        }
+    }
+
+    pub fn arena_kv_prev(&self, code: u64, scope: u64, table: u64, key: u64) -> Option<u64> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow.as_ref().and_then(|s| s.kv_prev(code, scope, table, key))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = (code, scope, table, key);
+            None
+        }
+    }
+
+    /// Tally an iterator-positioning cross-check (arena landing vs chainbase).
+    pub fn arena_note_pos(&self, matched: bool) {
+        #[cfg(feature = "arena-shadow")]
+        {
+            if let Some(s) = &self.shadow {
+                s.note_pos(matched);
+            }
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = matched;
+        }
+    }
+
+    /// (matches, mismatches) tallied by iterator-positioning cross-checks.
+    pub fn arena_pos_crosscheck_counts(&self) -> (u64, u64) {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow.as_ref().map(|s| s.pos_crosscheck_counts()).unwrap_or((0, 0))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            (0, 0)
+        }
+    }
+
     /// Whether the arena mirror holds an account_object for `name` — for diffing
     /// against chainbase's `find_account`.
     pub fn arena_account_exists(&self, name: u64) -> bool {
