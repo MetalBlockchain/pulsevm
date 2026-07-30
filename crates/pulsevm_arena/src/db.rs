@@ -289,9 +289,30 @@ impl Db {
         Ok(self.table_mut::<T>()?.alloc_blob(bytes))
     }
 
+    /// Frees `old` and allocates `bytes` in `T`'s blob arena — the update path
+    /// for a blob field, reusing the abandoned span instead of only growing.
+    pub fn realloc_blob<T: ArenaObject>(
+        &mut self,
+        old: BlobRef,
+        bytes: &[u8],
+    ) -> Result<BlobRef, DbError> {
+        Ok(self.table_mut::<T>()?.realloc_blob(old, bytes))
+    }
+
+    /// Marks `T`'s blob span as reusable (call when a row carrying it is removed).
+    pub fn free_blob<T: ArenaObject>(&mut self, r: BlobRef) -> Result<(), DbError> {
+        self.table_mut::<T>()?.free_blob(r);
+        Ok(())
+    }
+
     /// Resolves a blob ref against `T`'s arena.
     pub fn blob<T: ArenaObject>(&self, r: BlobRef) -> Result<&[u8], DbError> {
         Ok(self.table::<T>()?.blob(r))
+    }
+
+    /// Total bytes in `T`'s blob arena — for checking reuse bounds growth.
+    pub fn blob_arena_len<T: ArenaObject>(&self) -> Result<usize, DbError> {
+        Ok(self.table::<T>()?.blob_arena_len())
     }
 
     // ----- revision / undo lifecycle ----------------------------------------

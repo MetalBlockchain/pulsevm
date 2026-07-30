@@ -1,5 +1,5 @@
 use std::any::TypeId;
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ops::Bound;
 
 use crate::object::{ArenaObject, BlobRef, IndexedBy, KeyIndex, ObjectId, SecondaryIndex};
@@ -32,6 +32,14 @@ struct UndoState<T> {
     /// Blob-arena length when the session started; undo truncates back to it,
     /// dropping every blob appended during the session.
     old_blob_len: usize,
+    /// Committed blob spans this session freed (a modify/remove abandoned them).
+    /// They only become reusable when the session commits — until then undo may
+    /// restore a row that still points at them — so they are held here and moved
+    /// to the free list on commit, or discarded on undo.
+    freed: Vec<BlobRef>,
+    /// Free spans this session's allocations consumed. On undo the allocations
+    /// are reverted, so the spans go back to the free list.
+    reused: Vec<BlobRef>,
 }
 
 /// A table of `T` stored in an index-addressed arena: rows live in a
@@ -51,9 +59,24 @@ pub struct Table<T: ArenaObject> {
     undo_stack: VecDeque<UndoState<T>>,
     row_count: usize,
     revision: i64,
-    /// Ids touched since the last incremental flush; drives the delta log so
-    /// persistence is O(changed), not O(total state).
-    dirty: BTreeSet<i64>,
+    /// Ids touched since the last incremental flush, in touch order, each at
+    /// most once (deduped by `in_dirty`). Drives the delta log so persistence is
+    /// O(changed). A plain `Vec` + membership flag instead of a `BTreeSet` keeps
+    /// the write path O(1) — the delta record is order-independent, so no sort is
+    /// needed.
+    dirty: Vec<i64>,
+    in_dirty: Vec<bool>,
+    /// Reusable blob spans, keyed by exact length, that earlier committed
+    /// modifies/removes abandoned. `alloc_blob` reuses one instead of appending,
+    /// so repeatedly rewriting a blob field (e.g. a contract row's value on every
+    /// transfer) does not grow the arena. Exact-length only: fixed-layout contract
+    /// rows re-fill their own slot; a differently-sized value just appends.
+    free: HashMap<u32, Vec<u32>>,
+    /// Blob spans reused (written in place) below `flushed_blob_len` since the
+    /// last flush. The delta log records the tail beyond `flushed_blob_len`; a
+    /// reuse writes *inside* the already-flushed region, so it must also be
+    /// logged as a patch or a WAL replay would miss it.
+    blob_patches: Vec<BlobRef>,
     /// Blob bytes already written to the log; the tail beyond this is new.
     flushed_blob_len: usize,
 }
@@ -85,7 +108,10 @@ impl<T: ArenaObject> Table<T> {
             undo_stack: VecDeque::new(),
             row_count: 0,
             revision: 0,
-            dirty: BTreeSet::new(),
+            dirty: Vec::new(),
+            in_dirty: Vec::new(),
+            free: HashMap::new(),
+            blob_patches: Vec::new(),
             flushed_blob_len: 0,
         }
     }
@@ -97,12 +123,49 @@ impl<T: ArenaObject> Table<T> {
         if bytes.is_empty() {
             return BlobRef::default();
         }
+        let len = bytes.len() as u32;
+        // Reuse an abandoned span of the exact size before growing the arena.
+        if let Some(off) = self.free.get_mut(&len).and_then(|offs| offs.pop()) {
+            let start = off as usize;
+            self.blobs[start..start + bytes.len()].copy_from_slice(bytes);
+            let r = BlobRef { off, len };
+            // This overwrote bytes inside the already-flushed region; log it so a
+            // WAL replay reproduces them (the tail-only delta would not).
+            if (off as usize) < self.flushed_blob_len {
+                self.blob_patches.push(r);
+            }
+            // If a session is open the allocation can be undone, so remember to
+            // hand the span back to the free list then.
+            if let Some(state) = self.undo_stack.back_mut() {
+                state.reused.push(r);
+            }
+            return r;
+        }
         let off = self.blobs.len() as u32;
         self.blobs.extend_from_slice(bytes);
-        BlobRef {
-            off,
-            len: bytes.len() as u32,
+        BlobRef { off, len }
+    }
+
+    /// Marks the span a [`BlobRef`] points at as abandoned so a later
+    /// [`alloc_blob`] of the same size can reuse it. Call when a blob field is
+    /// overwritten or its row removed. While a session is open the span is held
+    /// until the session commits (undo may restore a row that still points at
+    /// it); with no session it is reusable at once.
+    pub fn free_blob(&mut self, r: BlobRef) {
+        if r.len == 0 {
+            return;
         }
+        if let Some(state) = self.undo_stack.back_mut() {
+            state.freed.push(r);
+        } else {
+            self.free.entry(r.len).or_default().push(r.off);
+        }
+    }
+
+    /// Frees `old` and allocates `bytes` in one call — the blob-field update path.
+    pub fn realloc_blob(&mut self, old: BlobRef, bytes: &[u8]) -> BlobRef {
+        self.free_blob(old);
+        self.alloc_blob(bytes)
     }
 
     /// Resolves a [`BlobRef`] to its bytes.
@@ -111,8 +174,29 @@ impl<T: ArenaObject> Table<T> {
         &self.blobs[start..start + r.len as usize]
     }
 
+    /// Total bytes in the blob arena (live + not-yet-reused free spans). Used to
+    /// check that repeatedly rewriting a blob field does not grow it unbounded.
+    pub fn blob_arena_len(&self) -> usize {
+        self.blobs.len()
+    }
+
     fn next_id(&self) -> i64 {
         self.primary.len() as i64
+    }
+
+    /// Records `id` in the dirty set for the next delta flush, at most once per
+    /// epoch. Ids can be reused after an undo truncates the slab; the flag stays
+    /// set across that (the reused row is still pending), so the id is not pushed
+    /// twice and the flush writes its current state.
+    fn mark_dirty(&mut self, id: i64) {
+        let idx = id as usize;
+        if idx >= self.in_dirty.len() {
+            self.in_dirty.resize(idx + 1, false);
+        }
+        if !self.in_dirty[idx] {
+            self.in_dirty[idx] = true;
+            self.dirty.push(id);
+        }
     }
 
     /// Inserts a new object constructed by `f`. The id is assigned by the table
@@ -129,7 +213,7 @@ impl<T: ArenaObject> Table<T> {
         // A fresh id needs no undo record; `old_next_id` marks it as new.
         self.primary.push(Some(obj));
         self.row_count += 1;
-        self.dirty.insert(id);
+        self.mark_dirty(id);
         Ok(self.primary[id as usize].as_ref().unwrap())
     }
 
@@ -174,7 +258,7 @@ impl<T: ArenaObject> Table<T> {
         let slot = self.primary[raw as usize].as_mut().unwrap();
         let old = std::mem::replace(slot, updated);
         self.on_modify(raw, old);
-        self.dirty.insert(raw);
+        self.mark_dirty(raw);
         Ok(())
     }
 
@@ -190,7 +274,7 @@ impl<T: ArenaObject> Table<T> {
                 id: raw,
             })?;
         self.row_count -= 1;
-        self.dirty.insert(raw);
+        self.mark_dirty(raw);
         for index in &mut self.secondaries {
             index.erase(&obj);
         }
@@ -281,6 +365,8 @@ impl<T: ArenaObject> Table<T> {
             removed_values: HashMap::new(),
             old_next_id: self.next_id(),
             old_blob_len: self.blobs.len(),
+            freed: Vec::new(),
+            reused: Vec::new(),
         });
         self.revision += 1;
         self.revision
@@ -321,15 +407,25 @@ impl<T: ArenaObject> Table<T> {
             removed_values,
             old_next_id,
             old_blob_len,
+            freed,
+            reused,
         } = state;
         // Drop every blob appended during the session; restored objects only
         // reference bytes from before it started.
         self.blobs.truncate(old_blob_len);
+        // The session's allocations are reverted, so its reused spans are free
+        // again; the spans it abandoned stay live (their rows are being restored).
+        for r in reused {
+            if (r.off as usize) < old_blob_len {
+                self.free.entry(r.len).or_default().push(r.off);
+            }
+        }
+        drop(freed);
 
         // Erase everything created during the session (ids >= old_next_id) and
         // drop those slots.
         for id in old_next_id as usize..self.primary.len() {
-            self.dirty.insert(id as i64);
+            self.mark_dirty(id as i64);
             if let Some(obj) = &self.primary[id] {
                 for index in &mut self.secondaries {
                     index.erase(obj);
@@ -370,7 +466,7 @@ impl<T: ArenaObject> Table<T> {
             if was_absent {
                 self.row_count += 1;
             }
-            self.dirty.insert(id);
+            self.mark_dirty(id);
         }
 
         self.revision -= 1;
@@ -384,14 +480,24 @@ impl<T: ArenaObject> Table<T> {
 
     /// Combines the top two states on the undo stack.
     pub fn squash(&mut self) {
-        let Some(top) = self.undo_stack.pop_back() else {
+        let Some(mut top) = self.undo_stack.pop_back() else {
             return;
         };
         self.revision -= 1;
+        let freed = std::mem::take(&mut top.freed);
+        let reused = std::mem::take(&mut top.reused);
         let Some(previous) = self.undo_stack.back_mut() else {
-            // Squashing the only session makes its changes permanent.
+            // Squashing the only session makes its changes permanent: its freed
+            // spans become reusable now.
+            for r in freed {
+                self.free.entry(r.len).or_default().push(r.off);
+            }
             return;
         };
+        // The blob spans this session freed/reused now belong to the parent
+        // session, undone or committed with it.
+        previous.freed.extend(freed);
+        previous.reused.extend(reused);
         for (id, old) in top.old_values {
             if id < previous.old_next_id {
                 previous.old_values.entry(id).or_insert(old);
@@ -407,13 +513,20 @@ impl<T: ArenaObject> Table<T> {
     /// Discards all undo history at or before `revision`.
     pub fn commit(&mut self, revision: i64) {
         let revision = revision.min(self.revision);
-        if revision == self.revision {
-            self.undo_stack.clear();
+        let drop_count = if revision == self.revision {
+            self.undo_stack.len()
         } else if self.revision - revision < self.undo_stack.len() as i64 {
-            let keep = (self.revision - revision) as usize;
-            let drop_count = self.undo_stack.len() - keep;
-            for _ in 0..drop_count {
-                self.undo_stack.pop_front();
+            self.undo_stack.len() - (self.revision - revision) as usize
+        } else {
+            0
+        };
+        // Committing a session makes it permanent, so the spans it abandoned are
+        // now unreferenced and reusable.
+        for _ in 0..drop_count {
+            if let Some(state) = self.undo_stack.pop_front() {
+                for r in state.freed {
+                    self.free.entry(r.len).or_default().push(r.off);
+                }
             }
         }
     }
@@ -510,6 +623,23 @@ impl<T: ArenaObject> Table<T> {
                 None => out.push(0),
             }
         }
+        // In-place patches into the already-flushed region: dedup by offset
+        // (the current bytes reflect the last write), then the appended tail.
+        let mut seen = std::collections::HashSet::new();
+        let patches: Vec<BlobRef> = self
+            .blob_patches
+            .iter()
+            .rev()
+            .filter(|r| (r.off as usize) < self.flushed_blob_len && seen.insert(r.off))
+            .copied()
+            .collect();
+        out.extend_from_slice(&(patches.len() as u64).to_le_bytes());
+        for r in patches {
+            out.extend_from_slice(&(r.off as u64).to_le_bytes());
+            out.extend_from_slice(&(r.len as u64).to_le_bytes());
+            let start = r.off as usize;
+            out.extend_from_slice(&self.blobs[start..start + r.len as usize]);
+        }
         let tail = &self.blobs[self.flushed_blob_len..];
         out.extend_from_slice(&(tail.len() as u64).to_le_bytes());
         out.extend_from_slice(tail);
@@ -554,6 +684,21 @@ impl<T: ArenaObject> Table<T> {
                 self.row_count += 1;
             }
         }
+        // In-place patches (into bytes appended by earlier frames), then the tail.
+        let patch_count = read_u64(bytes, &mut pos)?;
+        for _ in 0..patch_count {
+            let off = read_u64(bytes, &mut pos)? as usize;
+            let len = read_u64(bytes, &mut pos)? as usize;
+            let end = pos
+                .checked_add(len)
+                .filter(|end| *end <= bytes.len())
+                .ok_or(TableError::Corrupted("delta patch extends past record"))?;
+            if off + len > self.blobs.len() {
+                return Err(TableError::Corrupted("delta patch out of range"));
+            }
+            self.blobs[off..off + len].copy_from_slice(&bytes[pos..end]);
+            pos = end;
+        }
         let blob_len = read_u64(bytes, &mut pos)? as usize;
         let end = pos
             .checked_add(blob_len)
@@ -569,7 +714,11 @@ impl<T: ArenaObject> Table<T> {
     }
 
     pub(crate) fn mark_flushed(&mut self) {
+        for &id in &self.dirty {
+            self.in_dirty[id as usize] = false;
+        }
         self.dirty.clear();
+        self.blob_patches.clear();
         self.flushed_blob_len = self.blobs.len();
     }
 

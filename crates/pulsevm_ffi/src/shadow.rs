@@ -2864,11 +2864,13 @@ impl ArenaShadow {
         else {
             return Ok(());
         };
-        let id = db
+        let found = db
             .find_by::<ContractKeyValueRow, ContractKvByScopePrimary>(&(t_id, primary_key))?
-            .map(|k| k.id());
-        if let Some(id) = id {
-            let blob = db.alloc_blob::<ContractKeyValueRow>(value)?;
+            .map(|k| (k.id(), k.value));
+        if let Some((id, old_value)) = found {
+            // Reuse the row's previous value span instead of leaking it — this is
+            // the hot path (a contract row's value is rewritten on every update).
+            let blob = db.realloc_blob::<ContractKeyValueRow>(old_value, value)?;
             db.modify::<ContractKeyValueRow>(id, |k| {
                 k.value = blob;
                 k.payer = payer;
@@ -2893,9 +2895,10 @@ impl ArenaShadow {
         };
         let found = db
             .find_by::<ContractKeyValueRow, ContractKvByScopePrimary>(&(t_id, primary_key))?
-            .map(|k| k.id());
-        if let Some(id) = found {
+            .map(|k| (k.id(), k.value));
+        if let Some((id, value)) = found {
             db.remove::<ContractKeyValueRow>(id)?;
+            db.free_blob::<ContractKeyValueRow>(value)?; // reclaim the removed row's value span
             contract_table_decr(&mut db, t_id)?;
         }
         Ok(())
