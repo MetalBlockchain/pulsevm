@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     num::NonZeroUsize,
     sync::{Arc, RwLock},
 };
@@ -8,8 +9,8 @@ use pulsevm_crypto::Bytes;
 use pulsevm_error::ChainError;
 use pulsevm_ffi::{BlockTimestamp, CxxDigest, Database};
 use wasmer::{
-    Engine, Function, FunctionEnv, Instance, Memory, Module, Store, imports, sys::CompilerConfig,
-    wasmparser::Operator,
+    Engine, Function, FunctionEnv, Imports, Instance, Memory, Module, Store, imports,
+    sys::CompilerConfig, wasmparser::Operator,
 };
 use wasmer_compiler_llvm::{LLVM, LLVMOptLevel};
 use wasmer_middlewares::{
@@ -134,6 +135,42 @@ struct CachedModule {
     engine: Engine,
 }
 
+/// A store with its host-import table already wired up, kept warm so it can be
+/// reused across many contract invocations.
+///
+/// Building the ~150 host functions costs roughly two thirds of the per-action
+/// setup time, and that work is identical for every call, so we pay it once and
+/// then instantiate against the same store. The env is swapped in place before
+/// each call; a fresh `Instance` is still created every time so linear memory
+/// and metering behave exactly as they would with a throwaway store.
+///
+/// A store's object slab only grows, so each new instance leaks a linear memory
+/// into it. `uses` tracks how many instances we've spun up; once it hits
+/// `MAX_INSTANCES_PER_STORE` the bundle is dropped instead of returned to the
+/// pool, reclaiming the slab.
+struct WarmStore {
+    store: Store,
+    env: FunctionEnv<WasmContext>,
+    imports: Imports,
+    uses: u32,
+}
+
+/// How many instances to spin up on a warm store before recycling it. Larger
+/// amortizes the import build further; the ceiling is there only to reclaim the
+/// store's ever-growing object slab. Contract memories declare no maximum, so
+/// wasmer allocates them dynamically (a small guard plus committed pages rather
+/// than a 4 GiB reservation), which keeps an idle store cheap even at this count.
+const MAX_INSTANCES_PER_STORE: u32 = 64;
+
+// A warm store owns raw VM pointers and so is neither `Send` nor `Sync`; it
+// cannot live in the shared runtime state. Keep the pool thread-local instead —
+// block application is sequential on a given thread, so a warm store is only
+// ever touched by the thread that built it, and no synchronization is needed.
+thread_local! {
+    static STORE_POOL: RefCell<LruCache<Id, WarmStore>> =
+        RefCell::new(LruCache::new(NonZeroUsize::new(1024).unwrap()));
+}
+
 struct InnerWasmRuntime {
     code_cache: LruCache<Id, CachedModule>,
 }
@@ -236,17 +273,37 @@ impl WasmRuntime {
 
             inner.code_cache.get(&id).unwrap().clone()
         };
+        let pooled = STORE_POOL.with(|pool| pool.borrow_mut().pop(&id));
 
-        let mut store = Store::new(module.engine.clone());
-        let wasm_context = WasmContext::new(
-            receiver.clone(),
-            action.clone(),
-            apply_context.pending_block_timestamp().clone(),
-            apply_context.clone(),
-            db.clone(),
-        );
-        let env = FunctionEnv::new(&mut store, wasm_context);
-        let import_object = imports! {
+        // Reuse a warm store if one is idle in the pool, otherwise build one.
+        // Reuse only swaps the env's context; a fresh build pays for the whole
+        // import table. The pool is keyed by code hash but shared across every
+        // runtime on the thread, and a module can be recompiled onto a new
+        // engine after a cache eviction, so only reuse a store whose engine
+        // still matches this module — otherwise instantiation would mismatch.
+        let pooled = pooled.filter(|warm| warm.store.engine().id() == module.engine.id());
+        let mut warm = if let Some(mut warm) = pooled {
+            *warm.env.as_mut(&mut warm.store) = WasmContext::new(
+                receiver.clone(),
+                action.clone(),
+                apply_context.pending_block_timestamp().clone(),
+                apply_context.clone(),
+                db.clone(),
+            );
+            warm
+        } else {
+            let mut store = Store::new(module.engine.clone());
+            let env = FunctionEnv::new(
+                &mut store,
+                WasmContext::new(
+                    receiver.clone(),
+                    action.clone(),
+                    apply_context.pending_block_timestamp().clone(),
+                    apply_context.clone(),
+                    db.clone(),
+                ),
+            );
+            let imports = imports! {
             "env" => {
                 // Memory functions
                 "memcpy" => Function::new_typed_with_env(&mut store, &env, memcpy),
@@ -434,15 +491,23 @@ impl WasmRuntime {
                 // Producer functions
                 "get_active_producers" => Function::new_typed_with_env(&mut store, &env, get_active_producers),
             }
+            };
+            WarmStore {
+                store,
+                env,
+                imports,
+                uses: 0,
+            }
         };
-        let instance = Instance::new(&mut store, &module.module, &import_object).map_err(|e| {
-            ChainError::WasmRuntimeError(format!("failed to create wasm instance: {}", e))
-        })?;
+
+        let instance =
+            Instance::new(&mut warm.store, &module.module, &warm.imports).map_err(|e| {
+                ChainError::WasmRuntimeError(format!("failed to create wasm instance: {}", e))
+            })?;
 
         match instance.exports.get_memory("memory") {
             Ok(mem) => {
-                let ctx = env.as_mut(&mut store);
-                ctx.memory = Some(mem.clone());
+                warm.env.as_mut(&mut warm.store).memory = Some(mem.clone());
             }
             Err(_) => {
                 return Err(ChainError::WasmRuntimeError(
@@ -459,11 +524,11 @@ impl WasmRuntime {
         };
 
         // Set initial metering points based on resource limits
-        set_remaining_points(&mut store, &instance, cpu_limit);
+        set_remaining_points(&mut warm.store, &instance, cpu_limit);
 
         let apply_func = instance
             .exports
-            .get_typed_function::<(i64, i64, i64), ()>(&store, "apply")
+            .get_typed_function::<(i64, i64, i64), ()>(&warm.store, "apply")
             .map_err(|_| ChainError::WasmRuntimeError(format!("failed to find apply function")))?;
 
         // Resume timer
@@ -471,7 +536,7 @@ impl WasmRuntime {
 
         let result = apply_func
             .call(
-                &mut store,
+                &mut warm.store,
                 receiver.as_u64() as i64,
                 action.account().as_u64() as i64,
                 action.name().as_u64() as i64,
@@ -485,7 +550,16 @@ impl WasmRuntime {
                 // Otherwise wrap it
                 ChainError::ApplyError(format!("{}", e.message()))
             });
-        let remaining_points: MeteringPoints = get_remaining_points(&mut store, &instance);
+        let remaining_points: MeteringPoints = get_remaining_points(&mut warm.store, &instance);
+
+        // Return the warm store to the pool for reuse, unless it has spun up
+        // enough instances that its object slab is worth reclaiming. A trapped
+        // apply leaves nothing behind on the store itself, so a used-up bundle
+        // is safe to keep either way.
+        warm.uses += 1;
+        if warm.uses < MAX_INSTANCES_PER_STORE {
+            STORE_POOL.with(|pool| pool.borrow_mut().put(id, warm));
+        }
 
         match remaining_points {
             MeteringPoints::Remaining(points) => {
