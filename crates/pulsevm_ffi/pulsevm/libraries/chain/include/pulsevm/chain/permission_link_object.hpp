@@ -36,6 +36,8 @@ namespace pulsevm { namespace chain {
       /// The permission level which @ref account requires for the specified message types
       /// all of the above fields should not be changed within a chainbase modifier lambda
       name    required_permission;
+
+      uint64_t get_required_permission() const { return required_permission.to_uint64_t(); }
    };
 
    struct by_action_name;

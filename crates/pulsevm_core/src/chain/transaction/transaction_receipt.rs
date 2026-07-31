@@ -27,6 +27,17 @@ impl TransactionReceipt {
         &self.trx
     }
 
+    /// Block-recorded CPU (µs) for this transaction — used to bill the recorded
+    /// usage on replay instead of re-measuring.
+    pub fn cpu_usage_us(&self) -> u32 {
+        self.header.cpu_usage_us
+    }
+
+    /// Block-recorded NET (words) for this transaction.
+    pub fn net_usage_words(&self) -> u32 {
+        self.header.net_usage_words.0
+    }
+
     pub fn digest(&self) -> Result<Digest, WriteError> {
         Ok(Digest::hash(self.pack()?))
     }

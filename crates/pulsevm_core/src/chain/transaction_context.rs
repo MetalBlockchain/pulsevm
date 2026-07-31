@@ -39,6 +39,11 @@ struct TransactionContextInner {
     bill_to_account: Option<Name>,
     validate_ram_usage: BTreeSet<Name>,
     explicit_billed_cpu_time: bool,
+    // On light/replay validation these carry the block-recorded cpu (µs) and net
+    // (words) so the receipt and billing use the recorded values instead of
+    // re-measuring, and the objective limit checks are skipped.
+    explicit_cpu_us: u32,
+    explicit_net_words: u32,
     billing: Billing,
     pending_block_timestamp: BlockTimestamp,
     cpu_limit: i64,
@@ -80,6 +85,8 @@ impl TransactionContext {
                 bill_to_account: None,
                 validate_ram_usage: BTreeSet::new(),
                 explicit_billed_cpu_time: false,
+                explicit_cpu_us: 0,
+                explicit_net_words: 0,
                 billing: Billing {
                     paused_time: TimePoint::default(),
                     pseudo_start: TimePoint::now(),
@@ -370,8 +377,26 @@ impl TransactionContext {
         Ok(inner.pending_block_timestamp.clone())
     }
 
+    /// Bill the block-recorded cpu (µs) and net (words) for this transaction
+    /// rather than the re-measured amounts, and skip the objective limit checks —
+    /// the Antelope light/replay validation path for an already-accepted block.
+    pub fn set_explicit_billed(&self, cpu_us: u32, net_words: u32) -> Result<(), ChainError> {
+        let mut inner = self.inner.write()?;
+        inner.explicit_billed_cpu_time = true;
+        inner.explicit_cpu_us = cpu_us;
+        inner.explicit_net_words = net_words;
+        Ok(())
+    }
+
     pub fn finalize(mut self) -> Result<TransactionResult, ChainError> {
         let mut inner = self.inner.write()?;
+        // On replay use the recorded usage: override the re-measured amounts so
+        // the receipt (and its merkle root) and the billed accumulators match
+        // the block exactly.
+        if inner.explicit_billed_cpu_time {
+            inner.trace.receipt.cpu_usage_us = inner.explicit_cpu_us;
+            inner.trace.net_usage = inner.explicit_net_words as u64 * 8;
+        }
         let billed_cpu_time_us = inner.trace.receipt.cpu_usage_us;
         inner.trace.net_usage = ((inner.trace.net_usage + 7) / 8) * 8; // Round up to nearest multiple of word size (8 bytes)
         inner.trace.receipt.status = TransactionStatus::Executed;
@@ -409,6 +434,7 @@ impl TransactionContext {
                 billed_cpu_time_us as u64,
                 inner.trace.net_usage as u64,
                 inner.pending_block_timestamp.slot(),
+                !inner.explicit_billed_cpu_time,
             )?;
         }
 

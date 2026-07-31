@@ -1,4 +1,8 @@
 #include "database.hpp"
+#include <algorithm>
+#include <tuple>
+#include <vector>
+#include <string>
 #include <pulsevm_ffi/src/bridge.rs.h>
 #include <pulsevm/state_history/create_deltas.hpp>
 #include <fc/reflect/reflect.hpp>
@@ -335,6 +339,208 @@ void database_wrapper::set_block_parameters(const ElasticLimitParameters& cpu_li
         c.net_limit_parameters.expand_rate.numerator = net_limit_parameters.expand_rate.numerator;
         c.net_limit_parameters.expand_rate.denominator = net_limit_parameters.expand_rate.denominator;
     });
+}
+
+ElasticLimitParameters database_wrapper::get_cpu_limit_parameters() const {
+    const auto& p = this->get<resource_limits::resource_limits_config_object>().cpu_limit_parameters;
+    return ElasticLimitParameters{
+        p.target, p.max, p.periods, p.max_multiplier,
+        Ratio{ p.contract_rate.numerator, p.contract_rate.denominator },
+        Ratio{ p.expand_rate.numerator, p.expand_rate.denominator }
+    };
+}
+
+ElasticLimitParameters database_wrapper::get_net_limit_parameters() const {
+    const auto& p = this->get<resource_limits::resource_limits_config_object>().net_limit_parameters;
+    return ElasticLimitParameters{
+        p.target, p.max, p.periods, p.max_multiplier,
+        Ratio{ p.contract_rate.numerator, p.contract_rate.denominator },
+        Ratio{ p.expand_rate.numerator, p.expand_rate.denominator }
+    };
+}
+
+rust::Vec<uint8_t> database_wrapper::account_metadata_state_bytes() const {
+    rust::Vec<uint8_t> out;
+    auto put_u64 = [&](uint64_t v){ for (int i = 0; i < 8; ++i) out.push_back(static_cast<uint8_t>(v >> (8 * i))); };
+    const auto& idx = this->get_index<account_metadata_index, by_name>();
+    for (const auto& o : idx) {
+        put_u64(o.name.to_uint64_t());
+        out.push_back(o.is_privileged() ? 1 : 0);
+        put_u64(o.get_recv_sequence());
+        put_u64(o.get_auth_sequence());
+        put_u64(o.get_code_sequence());
+        put_u64(o.get_abi_sequence());
+        const char* hd = o.get_code_hash().data();
+        for (size_t i = 0; i < 32; ++i) out.push_back(static_cast<uint8_t>(hd[i]));
+        out.push_back(o.get_vm_type());
+        out.push_back(o.get_vm_version());
+    }
+    return out;
+}
+
+rust::Vec<uint8_t> database_wrapper::account_state_bytes() const {
+    rust::Vec<uint8_t> out;
+    auto put_u64 = [&](uint64_t v){ for (int i = 0; i < 8; ++i) out.push_back(static_cast<uint8_t>(v >> (8 * i))); };
+    auto put_u32 = [&](uint32_t v){ for (int i = 0; i < 4; ++i) out.push_back(static_cast<uint8_t>(v >> (8 * i))); };
+    const auto& idx = this->get_index<account_index, by_name>();
+    for (const auto& o : idx) {
+        put_u64(o.name.to_uint64_t());
+        put_u32(o.get_creation_date().get_slot());
+        const auto& abi = o.get_abi();
+        put_u32(static_cast<uint32_t>(abi.size()));
+        for (size_t i = 0; i < abi.size(); ++i) out.push_back(static_cast<uint8_t>(abi.data()[i]));
+    }
+    return out;
+}
+
+rust::Vec<uint8_t> database_wrapper::permission_keys_bytes() const {
+    rust::Vec<uint8_t> out;
+    auto put_u64 = [&](uint64_t v){ for (int i = 0; i < 8; ++i) out.push_back(static_cast<uint8_t>(v >> (8 * i))); };
+    const auto& idx = this->get_index<permission_index, by_owner>();
+    for (const auto& o : idx) {
+        uint64_t owner = o.owner.to_uint64_t();
+        if (owner == 0) continue; // reserved perm 0
+        put_u64(owner);
+        put_u64(o.perm_name.to_uint64_t());
+        put_u64(static_cast<uint64_t>(o.get_parent_id()));
+        // last_used from the linked permission_usage_object (µs since epoch).
+        const auto& usage = this->get<permission_usage_object>(o.usage_id);
+        put_u64(static_cast<uint64_t>(usage.last_used.time_since_epoch().count()));
+    }
+    return out;
+}
+
+rust::Vec<uint8_t> database_wrapper::permission_link_state_bytes() const {
+    rust::Vec<uint8_t> out;
+    auto put_u64 = [&](uint64_t v){ for (int i = 0; i < 8; ++i) out.push_back(static_cast<uint8_t>(v >> (8 * i))); };
+    const auto& idx = this->get_index<permission_link_index, by_action_name>();
+    for (const auto& o : idx) {
+        put_u64(o.account.to_uint64_t());
+        put_u64(o.code.to_uint64_t());
+        put_u64(o.message_type.to_uint64_t());
+        put_u64(o.required_permission.to_uint64_t());
+    }
+    return out;
+}
+
+rust::Vec<uint8_t> database_wrapper::code_state_bytes() const {
+    rust::Vec<uint8_t> out;
+    auto put_u64 = [&](uint64_t v){ for (int i = 0; i < 8; ++i) out.push_back(static_cast<uint8_t>(v >> (8 * i))); };
+    auto put_u32 = [&](uint32_t v){ for (int i = 0; i < 4; ++i) out.push_back(static_cast<uint8_t>(v >> (8 * i))); };
+    const auto& idx = this->get_index<code_index, by_code_hash>();
+    for (const auto& o : idx) {
+        const char* hd = o.get_code_hash().data();
+        for (size_t i = 0; i < 32; ++i) out.push_back(static_cast<uint8_t>(hd[i]));
+        out.push_back(o.vm_type);
+        out.push_back(o.vm_version);
+        put_u64(o.code_ref_count);
+        put_u32(o.first_block_used);
+        const auto& code = o.get_code();
+        put_u32(static_cast<uint32_t>(code.size()));
+        for (size_t i = 0; i < code.size(); ++i) out.push_back(static_cast<uint8_t>(code.data()[i]));
+    }
+    return out;
+}
+
+rust::Vec<uint8_t> database_wrapper::transaction_state_bytes() const {
+    rust::Vec<uint8_t> out;
+    auto put_u32 = [&](uint32_t v){ for (int i = 0; i < 4; ++i) out.push_back(static_cast<uint8_t>(v >> (8 * i))); };
+    const auto& idx = this->get_index<transaction_multi_index, by_trx_id>();
+    for (const auto& o : idx) {
+        const char* td = o.trx_id.data();
+        for (size_t i = 0; i < 32; ++i) out.push_back(static_cast<uint8_t>(td[i]));
+        put_u32(o.expiration.sec_since_epoch());
+    }
+    return out;
+}
+
+rust::Vec<uint8_t> database_wrapper::resource_usage_state_bytes() const {
+    rust::Vec<uint8_t> out;
+    auto put_u64 = [&](uint64_t v){ for (int i = 0; i < 8; ++i) out.push_back(static_cast<uint8_t>(v >> (8 * i))); };
+    auto put_u32 = [&](uint32_t v){ for (int i = 0; i < 4; ++i) out.push_back(static_cast<uint8_t>(v >> (8 * i))); };
+    auto put_acc = [&](const resource_limits::usage_accumulator& a){ put_u64(a.value_ex); put_u64(a.consumed); put_u32(a.last_ordinal); };
+    const auto& idx = this->get_index<resource_limits::resource_usage_index, resource_limits::by_owner>();
+    for (const auto& o : idx) {
+        put_u64(o.owner.to_uint64_t());
+        put_u64(o.ram_usage);
+        put_acc(o.net_usage);
+        put_acc(o.cpu_usage);
+    }
+    return out;
+}
+
+rust::Vec<uint8_t> database_wrapper::account_limits_state_bytes() const {
+    rust::Vec<uint8_t> out;
+    auto put_u64 = [&](uint64_t v){ for (int i = 0; i < 8; ++i) out.push_back(static_cast<uint8_t>(v >> (8 * i))); };
+    const auto& idx = this->get_index<resource_limits::resource_limits_index, resource_limits::by_owner>();
+    for (const auto& o : idx) {
+        out.push_back(o.pending ? 1 : 0);
+        put_u64(o.owner.to_uint64_t());
+        put_u64(static_cast<uint64_t>(o.ram_bytes));
+        put_u64(static_cast<uint64_t>(o.net_weight));
+        put_u64(static_cast<uint64_t>(o.cpu_weight));
+    }
+    return out;
+}
+
+rust::Vec<uint8_t> database_wrapper::resource_state_bytes() const {
+    rust::Vec<uint8_t> out;
+    auto put_u64 = [&](uint64_t v){ for (int i = 0; i < 8; ++i) out.push_back(static_cast<uint8_t>(v >> (8 * i))); };
+    auto put_u32 = [&](uint32_t v){ for (int i = 0; i < 4; ++i) out.push_back(static_cast<uint8_t>(v >> (8 * i))); };
+    auto put_acc = [&](const resource_limits::usage_accumulator& a){ put_u64(a.value_ex); put_u64(a.consumed); put_u32(a.last_ordinal); };
+    const auto& s = this->get<resource_limits::resource_limits_state_object>();
+    put_acc(s.average_block_net_usage);
+    put_acc(s.average_block_cpu_usage);
+    put_u64(s.pending_net_usage);
+    put_u64(s.pending_cpu_usage);
+    put_u64(s.total_net_weight);
+    put_u64(s.total_cpu_weight);
+    put_u64(s.total_ram_bytes);
+    put_u64(s.virtual_net_limit);
+    put_u64(s.virtual_cpu_limit);
+    return out;
+}
+
+rust::Vec<uint8_t> database_wrapper::contract_table_state_bytes() const {
+    rust::Vec<uint8_t> out;
+    auto put_u64 = [&](uint64_t v){ for (int i = 0; i < 8; ++i) out.push_back(static_cast<uint8_t>(v >> (8 * i))); };
+    auto put_u32 = [&](uint32_t v){ for (int i = 0; i < 4; ++i) out.push_back(static_cast<uint8_t>(v >> (8 * i))); };
+    const auto& idx = this->get_index<table_id_multi_index, by_code_scope_table>();
+    for (const auto& o : idx) {
+        put_u64(o.code.to_uint64_t());
+        put_u64(o.scope.to_uint64_t());
+        put_u64(o.table.to_uint64_t());
+        put_u64(o.payer.to_uint64_t());
+        put_u32(o.count);
+    }
+    return out;
+}
+
+rust::Vec<uint8_t> database_wrapper::contract_kv_state_bytes() const {
+    rust::Vec<uint8_t> out;
+    auto put_u64 = [&](uint64_t v){ for (int i = 0; i < 8; ++i) out.push_back(static_cast<uint8_t>(v >> (8 * i))); };
+    auto put_u32 = [&](uint32_t v){ for (int i = 0; i < 4; ++i) out.push_back(static_cast<uint8_t>(v >> (8 * i))); };
+    // Collect and sort by (code, scope, table, primary) — the arena's key order.
+    // The by_scope_primary index is (t_id, primary), and t_id (creation order)
+    // does not match code/scope/table across multiple tables.
+    struct Row { uint64_t code, scope, table, primary, payer; std::string value; };
+    std::vector<Row> rows;
+    const auto& idx = this->get_index<key_value_index, by_scope_primary>();
+    for (const auto& o : idx) {
+        const auto& t = this->get<table_id_object>(o.t_id);
+        rows.push_back(Row{ t.code.to_uint64_t(), t.scope.to_uint64_t(), t.table.to_uint64_t(),
+                            o.primary_key, o.payer.to_uint64_t(),
+                            std::string(o.get_value().data(), o.get_value().size()) });
+    }
+    std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b){
+        return std::tie(a.code, a.scope, a.table, a.primary) < std::tie(b.code, b.scope, b.table, b.primary);
+    });
+    for (const auto& r : rows) {
+        put_u64(r.code); put_u64(r.scope); put_u64(r.table); put_u64(r.primary); put_u64(r.payer);
+        put_u32(static_cast<uint32_t>(r.value.size()));
+        for (char c : r.value) out.push_back(static_cast<uint8_t>(c));
+    }
+    return out;
 }
 
 rust::Vec<uint8_t> database_wrapper::pack_deltas(bool full_snapshot) const {

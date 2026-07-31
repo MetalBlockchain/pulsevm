@@ -176,6 +176,7 @@ pub mod ffi {
 
         #[cxx_name = "account_metadata_object"]
         type AccountMetadataObject;
+        pub fn get_name(self: &AccountMetadataObject) -> u64;
         pub fn get_code_hash(self: &AccountMetadataObject) -> &CxxDigest;
         pub fn get_recv_sequence(self: &AccountMetadataObject) -> u64;
         pub fn get_auth_sequence(self: &AccountMetadataObject) -> u64;
@@ -199,6 +200,7 @@ pub mod ffi {
 
         #[cxx_name = "permission_link_object"]
         type PermissionLinkObject;
+        pub fn get_required_permission(self: &PermissionLinkObject) -> u64;
 
         #[cxx_name = "code_object"]
         type CodeObject;
@@ -223,6 +225,7 @@ pub mod ffi {
         #[cxx_name = "key_value_object"]
         type KeyValueObject;
         pub fn get_table_id(self: &KeyValueObject) -> &TableId;
+        pub fn get_table_by_kv(self: &Database, kv: &KeyValueObject) -> &TableObject;
         pub fn get_primary_key(self: &KeyValueObject) -> u64;
         pub fn get_payer(self: &KeyValueObject) -> &CxxName;
         pub fn get_value(self: &KeyValueObject) -> &CxxSharedBlob;
@@ -336,6 +339,7 @@ pub mod ffi {
             cpu_usage: u64,
             net_usage: u64,
             time_slot: u32,
+            validate: bool,
         ) -> Result<()>;
         pub fn add_pending_ram_usage(
             self: Pin<&mut Database>,
@@ -344,6 +348,25 @@ pub mod ffi {
         ) -> Result<()>;
         pub fn verify_account_ram_usage(self: Pin<&mut Database>, account_name: u64) -> Result<()>;
         pub fn get_account_ram_usage(self: &Database, account_name: u64) -> Result<i64>;
+        pub fn get_account_net_usage_average_window(self: &Database) -> Result<u32>;
+        pub fn get_account_cpu_usage_average_window(self: &Database) -> Result<u32>;
+        pub fn get_account_net_usage_value_ex(self: &Database, account_name: u64) -> Result<u64>;
+        pub fn get_account_cpu_usage_value_ex(self: &Database, account_name: u64) -> Result<u64>;
+        pub fn get_virtual_cpu_limit(self: &Database) -> Result<u64>;
+        pub fn get_virtual_net_limit(self: &Database) -> Result<u64>;
+        pub fn get_cpu_limit_parameters(self: &Database) -> Result<ElasticLimitParameters>;
+        pub fn get_net_limit_parameters(self: &Database) -> Result<ElasticLimitParameters>;
+        pub fn account_metadata_state_bytes(self: &Database) -> Result<Vec<u8>>;
+        pub fn account_state_bytes(self: &Database) -> Result<Vec<u8>>;
+        pub fn permission_keys_bytes(self: &Database) -> Result<Vec<u8>>;
+        pub fn permission_link_state_bytes(self: &Database) -> Result<Vec<u8>>;
+        pub fn code_state_bytes(self: &Database) -> Result<Vec<u8>>;
+        pub fn transaction_state_bytes(self: &Database) -> Result<Vec<u8>>;
+        pub fn resource_usage_state_bytes(self: &Database) -> Result<Vec<u8>>;
+        pub fn account_limits_state_bytes(self: &Database) -> Result<Vec<u8>>;
+        pub fn resource_state_bytes(self: &Database) -> Result<Vec<u8>>;
+        pub fn contract_table_state_bytes(self: &Database) -> Result<Vec<u8>>;
+        pub fn contract_kv_state_bytes(self: &Database) -> Result<Vec<u8>>;
         pub fn set_account_limits(
             self: Pin<&mut Database>,
             account_name: u64,
@@ -458,6 +481,12 @@ pub mod ffi {
             actor: u64,
             permission: u64,
         ) -> Result<*const PermissionObject>;
+        pub fn find_permission_link(
+            self: &Database,
+            account_name: u64,
+            code_name: u64,
+            message_type: u64,
+        ) -> Result<*const PermissionLinkObject>;
         pub fn delete_auth(
             self: Pin<&mut Database>,
             account: u64,
@@ -482,6 +511,7 @@ pub mod ffi {
         ) -> Result<u64>;
         pub fn next_auth_sequence(self: Pin<&mut Database>, actor: u64) -> Result<u64>;
         pub fn next_global_sequence(self: Pin<&mut Database>) -> Result<u64>;
+        pub fn get_global_action_sequence(self: &Database) -> Result<u64>;
         pub fn db_remove_i64(
             self: Pin<&mut Database>,
             keyval_cache: Pin<&mut CxxKeyValueIteratorCache>,

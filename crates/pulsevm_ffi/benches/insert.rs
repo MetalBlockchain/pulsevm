@@ -1,24 +1,40 @@
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use pulsevm_ffi::{Database, Name, string_to_name};
+use criterion::{Criterion, criterion_group, criterion_main};
+use pulsevm_ffi::Database;
 use std::hint::black_box;
-use tempfile::{env::temp_dir, tempdir, tempfile};
+use tempfile::{TempDir, tempdir};
 
-fn bench(db: &mut Database, n: &mut u64) {
-    db.create_account(black_box(*n), 0).unwrap();
-    *n += 1;
+const DB_SIZE: u64 = 1024 * 1024 * 1024;
+// Recycle the store before the fixed-size mmap fills; amortized over this many
+// inserts the recreation cost is negligible, and inserts still land in a
+// non-trivially populated table.
+const RECYCLE_EVERY: u64 = 200_000;
+
+fn fresh() -> (TempDir, Database) {
+    let dir = tempdir().unwrap();
+    let mut db = Database::new(dir.path().to_str().unwrap(), DB_SIZE).unwrap();
+    db.add_indices().unwrap();
+    (dir, db)
 }
 
 fn criterion_benchmark(c: &mut Criterion) {
-    let temp_dir = tempdir().unwrap();
-    let mut db = Database::new(temp_dir.path().to_str().unwrap()).unwrap();
+    let (mut _dir, mut db) = fresh();
     let mut val = 0u64;
-    db.add_indices().unwrap();
-    c.bench_function("insert", |b| b.iter(|| bench(&mut db, &mut val)));
+    c.bench_function("insert", |b| {
+        b.iter(|| {
+            if val >= RECYCLE_EVERY {
+                let (d, fresh_db) = fresh();
+                _dir = d;
+                db = fresh_db;
+                val = 0;
+            }
+            db.create_account(black_box(val), 0).unwrap();
+            val += 1;
+        })
+    });
 }
 
 criterion_group! {
     name = benches;
-    // This can be any expression that returns a `Criterion` object.
     config = Criterion::default().significance_level(0.1).sample_size(500);
     targets = criterion_benchmark
 }

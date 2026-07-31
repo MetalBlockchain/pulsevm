@@ -41,8 +41,9 @@ impl ResourceLimitsManager {
         cpu_usage: u64,
         net_usage: u64,
         time_slot: u32,
+        validate: bool,
     ) -> Result<(), ChainError> {
-        db.add_transaction_usage(account, cpu_usage, net_usage, time_slot)
+        db.add_transaction_usage(account, cpu_usage, net_usage, time_slot, validate)
             .map_err(|e| {
                 ChainError::DatabaseError(format!(
                     "failed to add transaction usage for account {}: {}",

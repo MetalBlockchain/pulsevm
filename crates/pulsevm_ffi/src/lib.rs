@@ -2,6 +2,8 @@ mod bridge;
 mod database;
 mod iterator_cache;
 mod objects;
+#[cfg(feature = "arena-shadow")]
+mod shadow;
 mod types;
 
 pub use crate::bridge::ffi::DatabaseOpenFlags;

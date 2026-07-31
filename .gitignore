@@ -8,4 +8,4 @@ tmpnet/
 CMakeCache.txt
 CMakeFiles
 install/
-plugins/
+plugins/build/

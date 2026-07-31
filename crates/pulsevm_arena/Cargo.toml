@@ -1,0 +1,19 @@
+[package]
+name = "pulsevm_arena"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+zerocopy = { version = "0.8", features = ["derive"] }
+pulsevm_arena_derive = { path = "../pulsevm_arena_derive" }
+sha2 = "0.10"
+
+[dev-dependencies]
+zerocopy = { version = "0.8", features = ["derive"] }
+tempfile = "3"
+criterion = { version = "0.5" }
+proptest = "1"
+
+[[bench]]
+name = "arena"
+harness = false

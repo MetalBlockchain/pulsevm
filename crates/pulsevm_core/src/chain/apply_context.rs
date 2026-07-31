@@ -580,7 +580,35 @@ impl ApplyContext {
     ) -> Result<i32, ChainError> {
         let inner = self.inner.read()?;
         let obj = inner.keyval_cache.get(iterator)?;
-        let s = obj.get_value().size();
+
+        // Inline read cross-check: the arena must serve this contract read — the
+        // exact bytes at the exact key, at this point mid-execution (speculative,
+        // pre-commit) — identically to chainbase. Stronger than the block-boundary
+        // root diff, which only sees committed state. When the cutover switch is
+        // on, the value the contract receives comes FROM the arena.
+        #[cfg(feature = "arena-shadow")]
+        let arena_value: Option<Vec<u8>> = {
+            let table_obj = inner.keyval_cache.get_table(obj.get_table_id())?;
+            let code = table_obj.get_code().to_uint64_t();
+            let scope = table_obj.get_scope().to_uint64_t();
+            let table = table_obj.get_table().to_uint64_t();
+            let primary = obj.get_primary_key();
+            self.db
+                .arena_crosscheck_kv(code, scope, table, primary, obj.get_value().as_slice());
+            if self.db.arena_reads_enabled() {
+                self.db.arena_kv_get(code, scope, table, primary)
+            } else {
+                None
+            }
+        };
+
+        let cb_value = obj.get_value();
+        #[cfg(feature = "arena-shadow")]
+        let source: &[u8] = arena_value.as_deref().unwrap_or_else(|| cb_value.as_slice());
+        #[cfg(not(feature = "arena-shadow"))]
+        let source: &[u8] = cb_value.as_slice();
+
+        let s = source.len();
         if buffer_size == 0 {
             return Ok(s as i32);
         }
@@ -588,7 +616,7 @@ impl ApplyContext {
         if buffer.len() < copy_size {
             buffer.resize(copy_size, 0);
         }
-        buffer[..copy_size].copy_from_slice(&obj.get_value().as_slice()[..copy_size]);
+        buffer[..copy_size].copy_from_slice(&source[..copy_size]);
         Ok(copy_size as i32)
     }
 
@@ -608,14 +636,69 @@ impl ApplyContext {
 
     pub fn db_next_i64(&mut self, iterator: i32, primary: &mut u64) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        self.db
-            .db_next_i64(&mut inner.keyval_cache, iterator, primary)
+
+        // The cursor's current key, for the arena successor cross-check. `None`
+        // if `iterator` is an end iterator (no backing row) — then we leave
+        // chainbase's answer untouched.
+        #[cfg(feature = "arena-shadow")]
+        let cur = current_iter_key(&inner.keyval_cache, iterator);
+
+        let res = self
+            .db
+            .db_next_i64(&mut inner.keyval_cache, iterator, primary)?;
+
+        // db_next advances to the smallest primary > current: the arena's
+        // upper_bound of the current key. res < 0 means chainbase hit the end,
+        // so the arena must have no successor. Serve the arena's primary when
+        // the cutover switch is on.
+        #[cfg(feature = "arena-shadow")]
+        if let Some((code, scope, table, cur_pk)) = cur {
+            let arena_next = self.db.arena_kv_upper_bound(code, scope, table, cur_pk);
+            let ffi_next = if res >= 0 { Some(*primary) } else { None };
+            self.db.arena_note_pos(arena_next == ffi_next);
+            if self.db.arena_reads_enabled()
+                && res >= 0
+                && let Some(an) = arena_next
+            {
+                *primary = an;
+            }
+        }
+
+        Ok(res)
     }
 
     pub fn db_previous_i64(&mut self, iterator: i32, primary: &mut u64) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        self.db
-            .db_previous_i64(&mut inner.keyval_cache, iterator, primary)
+
+        // From a live row: predecessor = arena `prev` of its key. From an end
+        // iterator (the db_end -> db_previous backward-iteration entry): the
+        // table's last row = arena `kv_last`.
+        #[cfg(feature = "arena-shadow")]
+        let arena_prev = match current_iter_key(&inner.keyval_cache, iterator) {
+            Some((code, scope, table, cur_pk)) => {
+                Some(self.db.arena_kv_prev(code, scope, table, cur_pk))
+            }
+            None => end_iter_table(&inner.keyval_cache, iterator)
+                .map(|(code, scope, table)| self.db.arena_kv_last(code, scope, table)),
+        };
+
+        let res = self
+            .db
+            .db_previous_i64(&mut inner.keyval_cache, iterator, primary)?;
+
+        #[cfg(feature = "arena-shadow")]
+        if let Some(arena_prev) = arena_prev {
+            let ffi_prev = if res >= 0 { Some(*primary) } else { None };
+            self.db.arena_note_pos(arena_prev == ffi_prev);
+            if self.db.arena_reads_enabled()
+                && res >= 0
+                && let Some(ap) = arena_prev
+            {
+                *primary = ap;
+            }
+        }
+
+        Ok(res)
     }
 
     pub fn db_end_i64(&mut self, code: u64, scope: u64, table: u64) -> Result<i32, ChainError> {
@@ -632,8 +715,20 @@ impl ApplyContext {
         primary: u64,
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        self.db
-            .db_lowerbound_i64(&mut inner.keyval_cache, code, scope, table, primary)
+        let res =
+            self.db
+                .db_lowerbound_i64(&mut inner.keyval_cache, code, scope, table, primary)?;
+
+        // The iterator handle is chainbase's, but the primary it lands on is
+        // consensus-observable: cross-check it against the arena's lower_bound.
+        #[cfg(feature = "arena-shadow")]
+        {
+            let ffi_landing = landing_primary(&inner.keyval_cache, res);
+            let arena_landing = self.db.arena_kv_lower_bound(code, scope, table, primary);
+            self.db.arena_note_pos(ffi_landing == arena_landing);
+        }
+
+        Ok(res)
     }
 
     pub fn db_upperbound_i64(
@@ -644,8 +739,18 @@ impl ApplyContext {
         primary: u64,
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        self.db
-            .db_upperbound_i64(&mut inner.keyval_cache, code, scope, table, primary)
+        let res =
+            self.db
+                .db_upperbound_i64(&mut inner.keyval_cache, code, scope, table, primary)?;
+
+        #[cfg(feature = "arena-shadow")]
+        {
+            let ffi_landing = landing_primary(&inner.keyval_cache, res);
+            let arena_landing = self.db.arena_kv_upper_bound(code, scope, table, primary);
+            self.db.arena_note_pos(ffi_landing == arena_landing);
+        }
+
+        Ok(res)
     }
 
     pub fn db_idx64_store(
@@ -739,14 +844,32 @@ impl ApplyContext {
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        self.db.db_idx64_find_secondary(
+        let res = self.db.db_idx64_find_secondary(
             &mut inner.index64_cache,
             code,
             scope,
             table,
             secondary,
             primary,
-        )
+        )?;
+
+        // Arena answers the same secondary lookup: found -> the same primary,
+        // not-found -> both agree there's no match. Serve the primary when the
+        // cutover switch is on.
+        #[cfg(feature = "arena-shadow")]
+        {
+            let arena = self.db.arena_idx64_find_secondary(code, scope, table, secondary);
+            let ffi = if res >= 0 { Some(*primary) } else { None };
+            self.db.arena_note_pos(arena == ffi);
+            if self.db.arena_reads_enabled()
+                && res >= 0
+                && let Some(p) = arena
+            {
+                *primary = p;
+            }
+        }
+
+        Ok(res)
     }
 
     pub fn db_idx64_find_primary(
@@ -758,14 +881,29 @@ impl ApplyContext {
         primary: u64,
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        self.db.db_idx64_find_primary(
+        let res = self.db.db_idx64_find_primary(
             &mut inner.index64_cache,
             code,
             scope,
             table,
             secondary,
             primary,
-        )
+        )?;
+
+        #[cfg(feature = "arena-shadow")]
+        {
+            let arena = self.db.arena_idx64_find_primary(code, scope, table, primary);
+            let ffi = if res >= 0 { Some(*secondary) } else { None };
+            self.db.arena_note_pos(arena == ffi);
+            if self.db.arena_reads_enabled()
+                && res >= 0
+                && let Some(s) = arena
+            {
+                *secondary = s;
+            }
+        }
+
+        Ok(res)
     }
 
     pub fn db_idx64_lowerbound(
@@ -776,15 +914,37 @@ impl ApplyContext {
         secondary: &mut u64,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
+        // `secondary` is the search key on the way in and the landing key on the
+        // way out, so capture it before the FFI overwrites it.
+        #[cfg(feature = "arena-shadow")]
+        let search = *secondary;
         let mut inner = self.inner.write()?;
-        self.db.db_idx64_lowerbound(
+        let res = self.db.db_idx64_lowerbound(
             &mut inner.index64_cache,
             code,
             scope,
             table,
             secondary,
             primary,
-        )
+        )?;
+
+        // lowerbound/upperbound land on a row and write BOTH its secondary and
+        // primary; the arena must reproduce the pair (or agree on the end).
+        #[cfg(feature = "arena-shadow")]
+        {
+            let arena = self.db.arena_idx64_lower_bound(code, scope, table, search);
+            let ffi = if res >= 0 { Some((*primary, *secondary)) } else { None };
+            self.db.arena_note_pos(arena == ffi);
+            if self.db.arena_reads_enabled()
+                && res >= 0
+                && let Some((p, s)) = arena
+            {
+                *primary = p;
+                *secondary = s;
+            }
+        }
+
+        Ok(res)
     }
 
     pub fn db_idx64_upperbound(
@@ -795,15 +955,33 @@ impl ApplyContext {
         secondary: &mut u64,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        let search = *secondary;
         let mut inner = self.inner.write()?;
-        self.db.db_idx64_upperbound(
+        let res = self.db.db_idx64_upperbound(
             &mut inner.index64_cache,
             code,
             scope,
             table,
             secondary,
             primary,
-        )
+        )?;
+
+        #[cfg(feature = "arena-shadow")]
+        {
+            let arena = self.db.arena_idx64_upper_bound(code, scope, table, search);
+            let ffi = if res >= 0 { Some((*primary, *secondary)) } else { None };
+            self.db.arena_note_pos(arena == ffi);
+            if self.db.arena_reads_enabled()
+                && res >= 0
+                && let Some((p, s)) = arena
+            {
+                *primary = p;
+                *secondary = s;
+            }
+        }
+
+        Ok(res)
     }
 
     pub fn db_idx64_end(&mut self, code: u64, scope: u64, table: u64) -> Result<i32, ChainError> {
@@ -1748,4 +1926,40 @@ impl ApplyContext {
         self.db.set_global_properties(cfg)?;
         Ok(())
     }
+}
+
+/// The `(code, scope, table, primary)` a live iterator points at, or `None` for
+/// an end iterator (no backing row). Used to seed the arena positioning checks.
+#[cfg(feature = "arena-shadow")]
+fn current_iter_key(cache: &KeyValueIteratorCache, iterator: i32) -> Option<(u64, u64, u64, u64)> {
+    let obj = cache.get(iterator).ok()?;
+    let table = cache.get_table(obj.get_table_id()).ok()?;
+    Some((
+        table.get_code().to_uint64_t(),
+        table.get_scope().to_uint64_t(),
+        table.get_table().to_uint64_t(),
+        obj.get_primary_key(),
+    ))
+}
+
+/// The primary key iterator `res` lands on, or `None` for an end iterator.
+#[cfg(feature = "arena-shadow")]
+fn landing_primary(cache: &KeyValueIteratorCache, res: i32) -> Option<u64> {
+    if res < 0 {
+        return None;
+    }
+    cache.get(res).ok().map(|o| o.get_primary_key())
+}
+
+/// The `(code, scope, table)` an end iterator belongs to, so a step back from
+/// the end can be positioned against the arena. `None` if `iterator` isn't a
+/// known end iterator.
+#[cfg(feature = "arena-shadow")]
+fn end_iter_table(cache: &KeyValueIteratorCache, iterator: i32) -> Option<(u64, u64, u64)> {
+    let table = cache.find_table_by_end_iterator(iterator).ok().flatten()?;
+    Some((
+        table.get_code().to_uint64_t(),
+        table.get_scope().to_uint64_t(),
+        table.get_table().to_uint64_t(),
+    ))
 }
