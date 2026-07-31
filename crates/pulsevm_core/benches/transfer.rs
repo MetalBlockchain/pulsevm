@@ -50,6 +50,7 @@ fn bench(
     pending_block_timestamp: &BlockTimestamp,
     block_status: &BlockStatus,
     private_key: &PrivateKey,
+    nonce: u64,
 ) {
     controller
         .execute_transaction(
@@ -64,7 +65,9 @@ fn bench(
                         amount: 1,
                         symbol: Symbol::from_str("4,EOS").unwrap(),
                     },
-                    memo: "Initial transfer".to_string(),
+                    // Vary the memo so each signed transaction has a distinct id;
+                    // otherwise the dedup table rejects the replay.
+                    memo: format!("t{nonce}"),
                 },
                 controller.chain_id().clone(),
                 vec![PermissionLevel::new(
@@ -246,13 +249,16 @@ fn criterion_benchmark(c: &mut Criterion) {
         )
         .unwrap();
 
+    let mut nonce = 0u64;
     c.bench_function("transfer", |b| {
         b.iter(|| {
+            nonce += 1;
             bench(
                 &mut controller,
                 &pending_block_timestamp,
                 &block_status,
                 &private_key,
+                nonce,
             )
         })
     });
@@ -392,7 +398,7 @@ fn generate_genesis(private_key: &PrivateKey) -> Vec<u8> {
             "target_block_cpu_usage_pct": 2500,
             "max_transaction_cpu_usage": 150000,
             "min_transaction_cpu_usage": 100,
-            "max_transaction_lifetime": 3600,
+            "max_transaction_lifetime": 4294967295u32,
             "max_inline_action_size": 4096,
             "max_inline_action_depth": 6,
             "max_authority_depth": 6,
