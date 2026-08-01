@@ -1,8 +1,8 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
-    sync::{Arc, RwLock},
+    cmp::min, collections::{BTreeMap, BTreeSet, VecDeque}, sync::{Arc, RwLock},
 };
 
+use pulsevm_constants::MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER;
 use pulsevm_crypto::Digest;
 use pulsevm_error::ChainError;
 use pulsevm_ffi::{BlockTimestamp, Database, Microseconds, TimePoint, seconds};
@@ -44,9 +44,15 @@ struct TransactionContextInner {
     // re-measuring, and the objective limit checks are skipped.
     explicit_cpu_us: u32,
     explicit_net_words: u32,
+    eager_net_limit: u64,
+    net_limit: u64,
+    net_limit_due_to_greylist: bool,
+    net_limit_due_to_block: bool,
     billing: Billing,
     pending_block_timestamp: BlockTimestamp,
     cpu_limit: i64,
+    cpu_limit_due_to_greylist: bool,
+    cpu_limit_due_to_block: bool,
     executed_action_receipt_digests: VecDeque<Digest>,
     is_input: bool,
 }
@@ -87,6 +93,10 @@ impl TransactionContext {
                 explicit_billed_cpu_time: false,
                 explicit_cpu_us: 0,
                 explicit_net_words: 0,
+                eager_net_limit: 0,
+                net_limit: 0,
+                net_limit_due_to_greylist: false,
+                net_limit_due_to_block: true,
                 billing: Billing {
                     paused_time: TimePoint::default(),
                     pseudo_start: TimePoint::now(),
@@ -94,6 +104,8 @@ impl TransactionContext {
                 },
                 pending_block_timestamp,
                 cpu_limit: 0,
+                cpu_limit_due_to_greylist: false,
+                cpu_limit_due_to_block: true,
                 executed_action_receipt_digests: VecDeque::with_capacity(6),
                 is_input: false,
             })),
@@ -107,40 +119,78 @@ impl TransactionContext {
         first_authorizer: Option<u64>,
         is_input: bool,
     ) -> Result<(), ChainError> {
-        {
-            let mut inner = self.inner.write()?;
+        let mut inner = self.inner.write()?;
 
-            pulse_assert(
-                inner.initialized == false,
-                ChainError::TransactionError("cannot initialize twice".into()),
-            )?;
-            inner.initialized = true;
-            inner.is_input = is_input;
-        }
+        pulse_assert(
+            inner.initialized == false,
+            ChainError::TransactionError("cannot initialize twice".into()),
+        )?;
 
-        if initial_net_usage > 0 {
-            self.add_net_usage(initial_net_usage)?;
+        inner.initialized = true;
+        inner.is_input = is_input;
+        inner.net_limit = self.db.get_block_net_limit()?;
+
+        let net_usage_leeway = {
+            let cfg = Controller::get_global_properties(&self.db)?;
+
+            // Possibly lower net_limit to the maximum net usage a transaction is allowed to be billed
+            if cfg.get_chain_config().get_max_transaction_net_usage() as u64 <= inner.net_limit {
+                inner.net_limit = cfg.get_chain_config().get_max_transaction_net_usage() as u64;
+                inner.net_limit_due_to_block = false;
+            }
+
+            cfg.get_chain_config().get_net_usage_leeway() as u64
+        };
+
+        let trx = self.packed_transaction.get_transaction();
+        let trx_specified_net_usage_limit = trx.header.max_net_usage_words().0 as u64 * 8;
+
+        // Possibly lower net_limit to optional limit set in the transaction header
+        if trx_specified_net_usage_limit > 0 && trx_specified_net_usage_limit <= inner.net_limit {
+            inner.net_limit = trx_specified_net_usage_limit;
+            inner.net_limit_due_to_block = false;
         }
 
         // Record accounts to be billed for network and CPU usage
-        if let Some(authorizer) = first_authorizer {
-            let mut inner = self.inner.write()?;
-            let first_authorizer_name = Name::new(authorizer);
-            inner.bill_to_account = Some(first_authorizer_name.clone());
+        let Some(authorizer) = first_authorizer else {
+            return Err(ChainError::TransactionError(
+                "transaction has no authorizations".to_string(),
+            ));
+        };
+        let first_authorizer_name = Name::new(authorizer);
+        inner.bill_to_account = Some(first_authorizer_name.clone());
 
-            let (cpu_limit, _) = ResourceLimitsManager::get_account_cpu_limit(
-                &self.db,
-                &first_authorizer_name,
-                Some(1000),
-            )?;
-            inner.cpu_limit = cpu_limit;
+        // Update usage values of accounts to reflect new time
+        ResourceLimitsManager::update_account_usage(
+            &mut self.db,
+            &first_authorizer_name,
+            inner.pending_block_timestamp.slot(),
+        )?;
 
-            // Update usage values of accounts to reflect new time
-            ResourceLimitsManager::update_account_usage(
-                &mut self.db,
-                &first_authorizer_name,
-                inner.pending_block_timestamp.slot(),
-            )?;
+        // Calculate the highest network usage and CPU time that all of the billed accounts can afford to be billed
+        let (account_net_limit, account_cpu_limit, greylisted_net, greylisted_cpu) =
+            self.max_bandwidth_billed_account_can_pay(&first_authorizer_name)?;
+
+        inner.net_limit_due_to_greylist = greylisted_net;
+        inner.cpu_limit_due_to_greylist = greylisted_cpu;
+        inner.eager_net_limit = inner.net_limit;
+
+        let new_eager_net_limit = min(inner.eager_net_limit, (account_net_limit + net_usage_leeway as i64) as u64);
+
+        // Possibly lower eager_net_limit to what the billed account can pay plus some (objective) leeway
+        if new_eager_net_limit < inner.eager_net_limit {
+            inner.eager_net_limit = new_eager_net_limit;
+        }
+
+        inner.cpu_limit = account_cpu_limit;
+        inner.eager_net_limit = (inner.eager_net_limit / 8) * 8; // Round down to nearest multiple of word size (8 bytes)
+
+        // add_net_usage re-locks inner; the guard must be released first or the
+        // same thread deadlocks on its own write lock.
+        drop(inner);
+
+        if initial_net_usage > 0 {
+            self.add_net_usage(initial_net_usage)?;
         }
 
         Ok(())
@@ -422,15 +472,28 @@ impl TransactionContext {
             ResourceLimitsManager::verify_account_ram_usage(&mut self.db, account)?;
         }
 
+        let first_authorizer_name = inner.bill_to_account.clone().ok_or_else(|| {
+            ChainError::TransactionError("bill to account is not set".to_string())
+        })?;
+        let (account_net_limit, account_cpu_limit, greylisted_net, greylisted_cpu) =
+            self.max_bandwidth_billed_account_can_pay(&first_authorizer_name)?;
+        inner.net_limit_due_to_greylist = greylisted_net;
+        inner.cpu_limit_due_to_greylist = greylisted_cpu;
+
+        // Possibly lower net_limit to what the billed accounts can pay
+        if account_net_limit as u64 <= inner.net_limit {
+            inner.net_limit = account_net_limit as u64;
+            inner.net_limit_due_to_block = false;
+            inner.eager_net_limit = inner.net_limit;
+
+            Self::check_net_usage_locked(&inner)?;
+        }
+
         // During benchmarks this would throw an error because the accounts won't have enough CPU to cover the billed time, so we skip this step if we're benchmarking.
         if self.block_status != BlockStatus::Benchmarking {
-            let bill_to_account = inner.bill_to_account.clone().ok_or_else(|| {
-                ChainError::TransactionError("bill to account is not set".to_string())
-            })?;
-
             ResourceLimitsManager::add_transaction_usage(
                 &mut self.db,
-                &bill_to_account,
+                &first_authorizer_name,
                 billed_cpu_time_us as u64,
                 inner.trace.net_usage as u64,
                 inner.pending_block_timestamp.slot(),
@@ -464,12 +527,17 @@ impl TransactionContext {
     }
 
     pub fn add_net_usage(&self, net_usage: u64) -> Result<(), ChainError> {
-        let mut inner = self.inner.write()?;
-        inner.trace.net_usage = inner
-            .trace
-            .net_usage
-            .checked_add(net_usage)
-            .ok_or_else(|| ChainError::ActionValidationError("net usage overflow".to_string()))?;
+        {
+            let mut inner = self.inner.write()?;
+            inner.trace.net_usage = inner
+                .trace
+                .net_usage
+                .checked_add(net_usage)
+                .ok_or_else(|| ChainError::ActionValidationError("net usage overflow".to_string()))?;
+        }
+
+        self.check_net_usage()?;
+
         Ok(())
     }
 
@@ -615,6 +683,66 @@ impl TransactionContext {
             return Err(ChainError::TransactionError(format!(
                 "transaction must have at least one authorization"
             )));
+        }
+
+        Ok(())
+    }
+
+    fn max_bandwidth_billed_account_can_pay(&self, account: &Name) -> Result<(i64, i64, bool, bool), ChainError> {
+        let large_number_no_overflow = i64::MAX / 2;
+        let mut account_net_limit = large_number_no_overflow;
+        let mut account_cpu_limit = large_number_no_overflow;
+
+        let (net_limit, net_was_greylisted) = ResourceLimitsManager::get_account_net_limit(
+            &self.db,
+            account,
+            Some(MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER),
+        )?;
+
+        if net_limit >= 0 {
+            account_net_limit = min(account_net_limit, net_limit);
+        }
+
+        let (cpu_limit, cpu_was_greylisted) = ResourceLimitsManager::get_account_cpu_limit(
+            &self.db,
+            account,
+            Some(MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER),
+        )?;
+
+        if cpu_limit >= 0 {
+            account_cpu_limit = min(account_cpu_limit, cpu_limit);
+        }
+
+        Ok((account_net_limit, account_cpu_limit, net_was_greylisted, cpu_was_greylisted))
+    }
+
+    pub fn check_net_usage(&self) -> Result<(), ChainError> {
+        let inner = self.inner.read()?;
+        Self::check_net_usage_locked(&inner)
+    }
+
+    /// The check body, callable while already holding the `inner` guard —
+    /// calling `check_net_usage` there would deadlock on the re-lock.
+    fn check_net_usage_locked(inner: &TransactionContextInner) -> Result<(), ChainError> {
+        // TODO: Add unlikely hint here once it's stable
+        // https://github.com/rust-lang/rust/issues/151619
+        if inner.trace.net_usage > inner.eager_net_limit {
+            if inner.net_limit_due_to_block {
+                return Err(ChainError::TransactionError(format!(
+                    "not enough space left in block: {} > {}",
+                    inner.trace.net_usage, inner.eager_net_limit
+                )));
+            } else if inner.net_limit_due_to_greylist {
+                return Err(ChainError::TransactionError(format!(
+                    "greylisted transaction net usage is too high: {} > {}",
+                    inner.trace.net_usage, inner.eager_net_limit
+                )));
+            } else {
+                return Err(ChainError::TransactionError(format!(
+                    "transaction net usage is too high: {} > {}",
+                    inner.trace.net_usage, inner.eager_net_limit
+                )));
+            }
         }
 
         Ok(())
