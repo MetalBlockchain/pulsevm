@@ -48,6 +48,30 @@ mod net_tests {
         }
     }
 
+    fn assert_block_net_exceeded(result: Result<TransactionTrace, ChainError>) {
+        match result {
+            Ok(_) => panic!("expected block net limit error, got success"),
+            Err(ChainError::TransactionError(msg)) => assert!(
+                msg.contains("not enough space left in block"),
+                "unexpected error message: {msg}"
+            ),
+            Err(other) => panic!("expected block net limit error, got: {other:?}"),
+        }
+    }
+
+    /// Shrinks `net_limit_parameters.max` so that the block's remaining net
+    /// capacity (`max - pending_net_usage`) becomes exactly `remaining`.
+    fn set_block_net_remaining(chain: &mut Testing, remaining: u64) -> Result<(), ChainError> {
+        let mut db = chain.get_pending_block_state().db;
+        let cpu = db.get_cpu_limit_parameters()?;
+        let mut net = db.get_net_limit_parameters()?;
+        let pending = net.max - db.get_block_net_limit()?;
+        net.max = pending + remaining;
+        ResourceLimitsManager::set_block_parameters(&mut db, &cpu, &net)?;
+        assert_eq!(db.get_block_net_limit()?, remaining);
+        Ok(())
+    }
+
     /// Billed net usage lands in the trace, matches the receipt's word count,
     /// is word-aligned, and is deterministic for same-sized transactions.
     #[tokio::test]
@@ -170,6 +194,68 @@ mod net_tests {
 
         // bob owns nearly all of the weight and is unaffected.
         push_reqauth_with_net_words(&mut chain, bob, 0)?;
+        Ok(())
+    }
+
+    /// Every executed transaction's billed net usage is charged against the
+    /// block: the remaining block net capacity drops by exactly that amount.
+    #[tokio::test]
+    async fn test_block_net_limit_decreases_with_usage() -> Result<()> {
+        let mut chain = Testing::new().await;
+        let alice: Name = name!("alice").into();
+        chain.create_account(alice, PULSE_NAME.into(), false, true)?;
+
+        let db = chain.get_pending_block_state().db;
+        let before = db.get_block_net_limit()?;
+        let trace = push_reqauth_with_net_words(&mut chain, alice, 0)?;
+        assert_eq!(
+            db.get_block_net_limit()?,
+            before - trace.net_usage,
+            "block net capacity must drop by the billed usage"
+        );
+        Ok(())
+    }
+
+    /// When the block's remaining net capacity is below the transaction's
+    /// usage, the eager check in `init` rejects it with the block variant of
+    /// the error (retryable in a later block), not the transaction variant.
+    #[tokio::test]
+    async fn test_block_net_limit_exceeded() -> Result<()> {
+        let mut chain = Testing::new().await;
+        let alice: Name = name!("alice").into();
+        chain.create_account(alice, PULSE_NAME.into(), false, true)?;
+
+        let usage = push_reqauth_with_net_words(&mut chain, alice, 0)?.net_usage;
+
+        set_block_net_remaining(&mut chain, usage - 8)?;
+        assert_block_net_exceeded(push_reqauth_with_net_words(&mut chain, alice, 0));
+        Ok(())
+    }
+
+    /// Transactions fit while block space lasts and are rejected once it runs
+    /// out, with the remaining capacity ticking down in between.
+    #[tokio::test]
+    async fn test_block_net_limit_fills_up() -> Result<()> {
+        let mut chain = Testing::new().await;
+        let alice: Name = name!("alice").into();
+        chain.create_account(alice, PULSE_NAME.into(), false, true)?;
+
+        let usage = push_reqauth_with_net_words(&mut chain, alice, 0)?.net_usage;
+
+        // Room for exactly two more reqauths (plus one spare word).
+        set_block_net_remaining(&mut chain, 2 * usage + 8)?;
+        let db = chain.get_pending_block_state().db;
+
+        push_reqauth_with_net_words(&mut chain, alice, 0)?;
+        assert_eq!(db.get_block_net_limit()?, usage + 8);
+        push_reqauth_with_net_words(&mut chain, alice, 0)?;
+        assert_eq!(db.get_block_net_limit()?, 8);
+
+        // The block is effectively full: one word left, a reqauth needs more.
+        assert_block_net_exceeded(push_reqauth_with_net_words(&mut chain, alice, 0));
+
+        // Nothing was billed for the rejected transaction.
+        assert_eq!(db.get_block_net_limit()?, 8);
         Ok(())
     }
 }
