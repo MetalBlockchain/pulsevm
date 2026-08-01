@@ -9,6 +9,7 @@
 #include <vector>
 #include <optional>
 #include <memory>
+#include <shared_mutex>
 
 namespace chainbase {
 
@@ -68,6 +69,7 @@ class pinnable_mapped_file {
 
       template<typename T>
       static std::optional<allocator<T>> get_allocator(void *object) {
+         std::shared_lock lock(_statics_mutex);
          if (!_segment_manager_map.empty()) {
             auto it = _segment_manager_map.upper_bound(object);
             if(it == _segment_manager_map.begin())
@@ -116,6 +118,13 @@ class pinnable_mapped_file {
 
       using segment_manager_map_t = boost::container::flat_map<void*, void *>;
       static segment_manager_map_t                  _segment_manager_map;
+
+      // Guards _segment_manager_map and _instance_tracker: both statics are
+      // mutated by every constructor/destructor and read from allocation hot
+      // paths (get_allocator), so concurrent database opens on different
+      // threads corrupt them without it. Held exclusively for the whole
+      // constructor/destructor, shared in get_allocator.
+      static std::shared_mutex                      _statics_mutex;
 
       constexpr static unsigned                     _db_size_multiple_requirement = 1024*1024; //1MB
       constexpr static size_t                       _db_size_copy_increment       = 1024*1024*1024; //1GB

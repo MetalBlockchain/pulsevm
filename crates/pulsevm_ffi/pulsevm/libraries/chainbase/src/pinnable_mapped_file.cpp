@@ -25,6 +25,7 @@ namespace chainbase {
 
 std::vector<pinnable_mapped_file*> pinnable_mapped_file::_instance_tracker;
 pinnable_mapped_file::segment_manager_map_t  pinnable_mapped_file::_segment_manager_map;
+std::shared_mutex                  pinnable_mapped_file::_statics_mutex;
    
 const char* chainbase_error_category::name() const noexcept {
    return "chainbase";
@@ -84,6 +85,11 @@ pinnable_mapped_file::pinnable_mapped_file(const std::filesystem::path& dir, boo
    _writable(writable),
    _sharable(mode == mapped)
 {
+   // Exclusive: the constructor mutates _segment_manager_map and (via
+   // setup_copy_on_write_mapping) _instance_tracker. Declared before the
+   // scope_fail below so the rollback also runs under the lock.
+   std::unique_lock statics_lock(_statics_mutex);
+
    if(shared_file_size % _db_size_multiple_requirement) {
       std::string what_str("Database must be mulitple of " + std::to_string(_db_size_multiple_requirement) + " bytes");
       BOOST_THROW_EXCEPTION(std::system_error(make_error_code(db_error_code::bad_size), what_str));
@@ -446,6 +452,10 @@ pinnable_mapped_file& pinnable_mapped_file::operator=(pinnable_mapped_file&& o) 
 }
 
 pinnable_mapped_file::~pinnable_mapped_file() {
+   // Exclusive: erases from _segment_manager_map and _instance_tracker, and
+   // save_database_file reads _instance_tracker.
+   std::unique_lock statics_lock(_statics_mutex);
+
    if(_writable) {
       if(_non_file_mapped_mapping) { //in heap or locked mode
          save_database_file();
