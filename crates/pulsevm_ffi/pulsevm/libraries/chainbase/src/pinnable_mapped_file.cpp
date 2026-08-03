@@ -5,6 +5,8 @@
 #include <boost/asio/signal_set.hpp>
 #include <iostream>
 #include <fstream>
+#include <mutex>
+#include <shared_mutex>
 //#include <unistd.h>
 
 #ifdef __linux__
@@ -25,6 +27,7 @@ namespace chainbase {
 
 std::vector<pinnable_mapped_file*> pinnable_mapped_file::_instance_tracker;
 pinnable_mapped_file::segment_manager_map_t  pinnable_mapped_file::_segment_manager_map;
+std::shared_mutex                            pinnable_mapped_file::_statics_mutex;
    
 const char* chainbase_error_category::name() const noexcept {
    return "chainbase";
@@ -179,7 +182,10 @@ pinnable_mapped_file::pinnable_mapped_file(const std::filesystem::path& dir, boo
 
       if(_writable)
          set_mapped_file_db_dirty(false);
-      std::erase(_instance_tracker, this);
+      {
+         std::unique_lock registry_lock(_statics_mutex);
+         std::erase(_instance_tracker, this);
+      }
    });
 
    if(mode == mapped || mode == mapped_private) {
@@ -234,18 +240,28 @@ pinnable_mapped_file::pinnable_mapped_file(const std::filesystem::path& dir, boo
       _segment_manager = reinterpret_cast<segment_manager*>((char*)_non_file_mapped_mapping+header_size);
    }
    std::byte* start = (std::byte*)_segment_manager;
-   assert(_segment_manager_map.find(start) == _segment_manager_map.end());
-   _segment_manager_map[start] = start + _segment_manager->get_size();
+   {
+      std::unique_lock registry_lock(_statics_mutex);
+      assert(_segment_manager_map.find(start) == _segment_manager_map.end());
+      _segment_manager_map[start] = start + _segment_manager->get_size();
+   }
 }
 
 void pinnable_mapped_file::setup_copy_on_write_mapping() {
    // before we clear the Soft-Dirty bits for the whole process, make sure all writable,
    // non-sharable chainbase dbs using mapped mode are flushed to disk
    // ----------------------------------------------------------------------------------
-   for (auto pmm : _instance_tracker) {
+   // Snapshot the tracker under the lock, then flush outside it: save_database_file
+   // does I/O and must not hold the registry lock (nor block concurrent opens).
+   std::vector<pinnable_mapped_file*> instances;
+   {
+      std::shared_lock registry_lock(_statics_mutex);
+      instances = _instance_tracker;
+   }
+   for (auto pmm : instances) {
       // we only populate _instance_tracker if pagemap *is* supported
       assert(pagemap_accessor::pagemap_supported());
-      pmm->save_database_file(true); 
+      pmm->save_database_file(true);
    }
 
    _file_mapped_region = bip::mapped_region(_file_mapping, bip::copy_on_write);
@@ -257,6 +273,7 @@ void pinnable_mapped_file::setup_copy_on_write_mapping() {
    // ------------------------------
    pagemap_accessor pagemap;
    if (pagemap.check_pagemap_support_and_clear_refs()) {
+      std::unique_lock registry_lock(_statics_mutex);
       _instance_tracker.push_back(this); // so we can save dirty pages before another instance calls `clear_refs()`
    }
 }
@@ -390,7 +407,11 @@ void pinnable_mapped_file::save_database_file(bool flush /* = true */) {
    
    while(offset != sz) {
       size_t copy_size = std::min(_db_size_copy_increment,  sz - offset);
-      bool mapped_writable_instance = std::find(_instance_tracker.begin(), _instance_tracker.end(), this) != _instance_tracker.end();
+      bool mapped_writable_instance;
+      {
+         std::shared_lock registry_lock(_statics_mutex);
+         mapped_writable_instance = std::find(_instance_tracker.begin(), _instance_tracker.end(), this) != _instance_tracker.end();
+      }
       if (!mapped_writable_instance ||
           !pagemap.update_file_from_region({ src + offset, copy_size }, _file_mapping, offset, flush, written_pages)) {
          if (mapped_writable_instance)
@@ -459,16 +480,21 @@ pinnable_mapped_file::~pinnable_mapped_file() {
                std::cerr << "CHAINBASE: ERROR: syncing buffers failed" << '\n';
          } else {
             save_database_file(); // must be before `this` is removed from _instance_tracker
-            if (auto it = std::find(_instance_tracker.begin(), _instance_tracker.end(), this); it != _instance_tracker.end())
-               _instance_tracker.erase(it);
+            {
+               std::unique_lock registry_lock(_statics_mutex);
+               if (auto it = std::find(_instance_tracker.begin(), _instance_tracker.end(), this); it != _instance_tracker.end())
+                  _instance_tracker.erase(it);
+            }
             _file_mapped_region = bip::mapped_region();
             set_mapped_file_db_dirty(false);
          }
       }
       set_mapped_file_db_dirty(false);
    }
-   if (_segment_manager)
+   if (_segment_manager) {
+      std::unique_lock registry_lock(_statics_mutex);
       _segment_manager_map.erase(_segment_manager);
+   }
 }
 
 void pinnable_mapped_file::set_mapped_file_db_dirty(bool dirty) {

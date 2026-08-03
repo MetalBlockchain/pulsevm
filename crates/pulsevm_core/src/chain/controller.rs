@@ -6,15 +6,16 @@ use std::{
 };
 
 use crate::{
-    PULSE_NAME,
+    ACTIVE_NAME, PULSE_NAME,
     block::{BlockStatus, SignedBlock},
     chain::{
         apply_context::ApplyContext,
+        authority::PermissionLevel,
         authorization_manager::AuthorizationManager,
         block::BlockHeader,
         config::{
-            DELETEAUTH_NAME, LINKAUTH_NAME, NEWACCOUNT_NAME, SETABI_NAME, SETCODE_NAME,
-            UNLINKAUTH_NAME, UPDATEAUTH_NAME, eos_percent,
+            DELETEAUTH_NAME, LINKAUTH_NAME, NEWACCOUNT_NAME, ONBLOCK_NAME, SETABI_NAME,
+            SETCODE_NAME, UNLINKAUTH_NAME, UPDATEAUTH_NAME, eos_percent,
         },
         crypto::PublicKey,
         id::Id,
@@ -26,7 +27,10 @@ use crate::{
         },
         resource_limits::ResourceLimitsManager,
         state_history::StateHistoryLog,
-        transaction::{PackedTransaction, TransactionReceipt, TransactionTrace},
+        transaction::{
+            PackedTransaction, SignedTransaction, Transaction, TransactionHeader,
+            TransactionReceipt, TransactionTrace,
+        },
         transaction_context::{TransactionContext, TransactionResult},
         utils::make_ratio,
         wasm_runtime::WasmRuntime,
@@ -415,6 +419,18 @@ impl Controller {
         // The last producer schedule proposed by any transaction in this block,
         // activated when the block is accepted.
         let mut proposed_schedule: Option<Vec<ProducerKey>> = None;
+
+        // onblock heads the block, before any mempool transaction, so its action
+        // digests come first in the action merkle — matching what validators
+        // recompute in `execute_block`.
+        let producer = self.node_config.as_ref().unwrap().producer_name;
+        let previous = self.preferred_id;
+        action_receipt_digests.extend(self.run_onblock(
+            &timestamp,
+            producer,
+            previous,
+            &block_status,
+        )?);
 
         // Get transactions from the mempool
         while let Some(transaction) = mempool.pop_transaction() {
@@ -830,6 +846,90 @@ impl Controller {
         Ok(())
     }
 
+    // Build and run the implicit `pulse::onblock` action that heads every block,
+    // mirroring EOSIO. It is not a block transaction, so it never touches the
+    // transaction merkle; it only contributes its action-receipt digests to the
+    // action merkle, which the caller prepends ahead of the block's own actions.
+    //
+    // The action data is the pending block header with both merkle roots left at
+    // zero (they aren't known until the block is assembled). `build_block` and
+    // `execute_block` derive it from the same fields, so producer and validator
+    // feed byte-identical data into the action digest.
+    //
+    // onblock is billed to nobody, needs no signature, and must never halt the
+    // chain: it runs in its own child session that is discarded on failure, and
+    // a failure yields no digests (identical on every node, since it is
+    // deterministic), so the merkles still agree.
+    fn run_onblock(
+        &mut self,
+        timestamp: &BlockTimestamp,
+        producer: Name,
+        previous: Id,
+        block_status: &BlockStatus,
+    ) -> Result<VecDeque<Digest>, ChainError> {
+        let header = BlockHeader {
+            timestamp: timestamp.clone(),
+            producer,
+            confirmed: 0,
+            previous,
+            transaction_mroot: Digest::default(),
+            action_mroot: Digest::default(),
+            schedule_version: 0,
+            new_producers: None,
+            header_extensions: vec![],
+        };
+        let header_bytes = header.pack().map_err(|e| {
+            ChainError::SerializationError(format!("failed to pack onblock header: {}", e))
+        })?;
+
+        let action = Action::new(
+            PULSE_NAME,
+            ONBLOCK_NAME,
+            header_bytes,
+            vec![PermissionLevel::new(PULSE_NAME.as_u64(), ACTIVE_NAME.as_u64())],
+        );
+        let trx = Transaction::new(TransactionHeader::default(), vec![], vec![action]);
+        let packed = PackedTransaction::from_signed_transaction(SignedTransaction::new(
+            trx.clone(),
+            BTreeSet::new(),
+            vec![],
+        ))?;
+
+        let trx_id = *packed.id();
+        let mut session = self.db.create_undo_session(true)?;
+        let mut trx_context = TransactionContext::new(
+            self.db.clone(),
+            self.wasm_runtime.clone(),
+            self.last_accepted_block().block_num() + 1,
+            timestamp.clone(),
+            &trx_id,
+            *block_status,
+            packed,
+        );
+
+        let executed = (|| -> Result<VecDeque<Digest>, ChainError> {
+            trx_context.init_for_implicit_trx()?;
+            trx_context.exec(&trx)?;
+            Ok(trx_context.finalize()?.action_receipt_digests)
+        })();
+
+        match executed {
+            Ok(digests) => {
+                session.pin_mut().squash().map_err(|e| {
+                    ChainError::DatabaseError(format!("failed to commit onblock: {}", e))
+                })?;
+                Ok(digests)
+            }
+            Err(e) => {
+                warn!("onblock failed, skipping: {}", e);
+                session.pin_mut().undo().map_err(|e| {
+                    ChainError::DatabaseError(format!("failed to undo onblock: {}", e))
+                })?;
+                Ok(VecDeque::new())
+            }
+        }
+    }
+
     pub fn execute_block(
         &mut self,
         block: &SignedBlock,
@@ -845,6 +945,15 @@ impl Controller {
 
         self.db
             .clear_expired_input_transactions(&block.timestamp().to_time_point())?;
+
+        // onblock heads the block: its action digests precede every transaction's.
+        let header = &block.signed_block_header.header;
+        action_receipt_digests.extend(self.run_onblock(
+            &header.timestamp,
+            header.producer,
+            header.previous,
+            block_status,
+        )?);
 
         for receipt in &block.transactions {
             // Verify the transaction
@@ -4899,6 +5008,43 @@ mod tests {
         assert!(
             controller.build_block(&mut mempool).await.is_err(),
             "node must refuse to produce a block it cannot validly sign"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn onblock_runs_at_head_of_every_block() -> Result<(), ChainError> {
+        // onblock is an implicit action received by the system account. A block
+        // carrying a single newaccount transaction (also received by pulse) must
+        // advance pulse's received-action sequence by two — once for onblock,
+        // once for newaccount. Drop onblock from the block and the delta is one,
+        // so this pins the invocation, not just the build/verify merkle agreement.
+        let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
+        let mut mempool = Mempool::new();
+
+        let before = controller
+            .database()
+            .get_account_metadata(PULSE_NAME.as_u64())?
+            .get_recv_sequence();
+
+        mempool.add_transaction(create_account(
+            &private_key,
+            Name::from_str("testapi")?,
+            chain_id,
+        )?);
+        let block = controller.build_block(&mut mempool).await?;
+        controller.accept_block(&block.id()?, &mut mempool)?;
+
+        let after = controller
+            .database()
+            .get_account_metadata(PULSE_NAME.as_u64())?
+            .get_recv_sequence();
+
+        assert_eq!(
+            after - before,
+            2,
+            "expected onblock + newaccount to each advance pulse's recv sequence"
         );
 
         Ok(())
