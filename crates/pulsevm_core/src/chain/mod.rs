@@ -10,6 +10,7 @@ pub mod controller;
 pub mod crypto;
 pub mod id;
 pub mod mempool;
+pub mod producer_schedule;
 pub mod pulse_contract;
 pub mod resource;
 pub mod resource_limits;

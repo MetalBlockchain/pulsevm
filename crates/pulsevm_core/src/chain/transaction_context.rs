@@ -13,6 +13,7 @@ use crate::{
         apply_context::ApplyContext,
         id::Id,
         name::Name,
+        producer_schedule::ProducerKey,
         resource_limits::ResourceLimitsManager,
         transaction::{Action, ActionTrace, Transaction, TransactionStatus, TransactionTrace},
         utils::pulse_assert,
@@ -31,6 +32,9 @@ pub struct TransactionResult {
     pub trace: TransactionTrace,
     pub billed_cpu_time_us: u32,
     pub action_receipt_digests: VecDeque<Digest>,
+    // Set if a `set_proposed_producers` ran in this transaction; the controller
+    // activates it when the block is accepted.
+    pub proposed_schedule: Option<Vec<ProducerKey>>,
 }
 
 struct TransactionContextInner {
@@ -49,6 +53,7 @@ struct TransactionContextInner {
     cpu_limit: i64,
     executed_action_receipt_digests: VecDeque<Digest>,
     is_input: bool,
+    proposed_schedule: Option<Vec<ProducerKey>>,
 }
 
 #[derive(Clone)]
@@ -96,6 +101,7 @@ impl TransactionContext {
                 cpu_limit: 0,
                 executed_action_receipt_digests: VecDeque::with_capacity(6),
                 is_input: false,
+                proposed_schedule: None,
             })),
             packed_transaction,
         }
@@ -457,7 +463,16 @@ impl TransactionContext {
             trace: inner.trace.clone(),
             billed_cpu_time_us,
             action_receipt_digests: inner.executed_action_receipt_digests.clone(),
+            proposed_schedule: inner.proposed_schedule.clone(),
         })
+    }
+
+    // Record a producer schedule proposed by `set_proposed_producers` during this
+    // transaction. Surfaced in the TransactionResult; the controller activates it
+    // when the block is accepted.
+    pub fn set_proposed_producers(&self, producers: Vec<ProducerKey>) -> Result<(), ChainError> {
+        self.inner.write()?.proposed_schedule = Some(producers);
+        Ok(())
     }
 
     pub fn add_cpu_usage(&self, cpu_usage: u64) -> Result<(), ChainError> {
