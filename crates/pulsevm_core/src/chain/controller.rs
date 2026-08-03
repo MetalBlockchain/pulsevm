@@ -490,16 +490,31 @@ impl Controller {
             action_mroot,
         );
 
+        // Refuse to produce a block this node isn't authorized to sign: if our
+        // key isn't the active schedule's key for our producer, the block would
+        // fail verification everywhere (including here), so fail closed instead of
+        // emitting an unverifiable block after a schedule change.
+        let node = self.node_config.as_ref().unwrap();
+        let producer = node.producer_name;
+        let signing_key = node.producer_key.get_public_key();
+        match self.active_schedule.block_signing_key(&producer) {
+            Some(scheduled) if *scheduled == signing_key => {}
+            _ => {
+                block_session.pin_mut().undo().map_err(|e| {
+                    ChainError::DatabaseError(format!("failed to undo changes: {}", e))
+                })?;
+                return Err(ChainError::BlockError(format!(
+                    "node key is not the active schedule key for producer {}; refusing to produce",
+                    producer
+                )));
+            }
+        }
+
         // Sign the block with the producer's key so validators can authenticate
         // it against the active schedule.
         let sig_digest: crate::utils::Digest =
             block.signed_block_header.header.sig_digest()?.0.into();
-        block.signed_block_header.signature = self
-            .node_config
-            .as_ref()
-            .unwrap()
-            .producer_key
-            .sign(&sig_digest)?;
+        block.signed_block_header.signature = node.producer_key.sign(&sig_digest)?;
 
         // We built this block so no need to verify it again
         let block_id = block.id()?;
@@ -4861,6 +4876,29 @@ mod tests {
         assert_eq!(
             reopened.active_schedule.producers[0].block_signing_key,
             new_key.get_public_key()
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refuses_to_produce_with_unscheduled_key() -> Result<(), ChainError> {
+        // After the schedule rotates to a key this node does not hold, building a
+        // block would produce something no one (including this node) could verify,
+        // so build_block must fail closed rather than emit it.
+        let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
+        let other = PrivateKey::random();
+        controller.activate_producer_schedule(vec![ProducerKey {
+            producer_name: Name::from_str("pulse")?,
+            block_signing_key: other.get_public_key(),
+        }])?;
+
+        let mut mempool = Mempool::new();
+        mempool
+            .add_transaction(create_account(&private_key, Name::from_str("testapi")?, chain_id)?);
+        assert!(
+            controller.build_block(&mut mempool).await.is_err(),
+            "node must refuse to produce a block it cannot validly sign"
         );
 
         Ok(())
