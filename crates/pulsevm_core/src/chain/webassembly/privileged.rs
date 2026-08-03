@@ -1,12 +1,23 @@
+use std::collections::BTreeSet;
+
 use pulsevm_error::ChainError;
 use pulsevm_ffi::ChainConfigV0;
-use pulsevm_serialization::Read;
+use pulsevm_serialization::{Read, VarUint32};
 use wasmer::{FunctionEnvMut, RuntimeError, WasmPtr};
 
 use crate::chain::{
-    apply_context::ApplyContext, resource_limits::ResourceLimitsManager, utils::pulse_assert,
-    wasm_runtime::WasmContext, webassembly::context_aware_check,
+    apply_context::ApplyContext, producer_schedule::ProducerKey,
+    resource_limits::ResourceLimitsManager, utils::pulse_assert, wasm_runtime::WasmContext,
+    webassembly::context_aware_check,
 };
+
+// Matches EOSIO's producer ceiling. Bounds the schedule so a caller can't blow
+// up memory or the per-block work, and caps the buffer we read from wasm.
+const MAX_PRODUCERS: usize = 125;
+// A producer_key packs to a Name (8) plus a public key (34). Cap the input a
+// little above the largest legal schedule so an oversized `data_len` can't drive
+// a large host allocation before we even parse.
+const MAX_SCHEDULE_BYTES: u32 = (MAX_PRODUCERS as u32 + 1) * 64;
 
 fn privileged_check(context: &ApplyContext) -> Result<(), RuntimeError> {
     if !context.is_privileged()? {
@@ -19,14 +30,80 @@ fn privileged_check(context: &ApplyContext) -> Result<(), RuntimeError> {
 
 pub fn set_proposed_producers(
     mut env: FunctionEnvMut<WasmContext>,
-    _data_ptr: WasmPtr<u8>,
-    _data_len: u32,
+    data_ptr: WasmPtr<u8>,
+    data_len: u32,
 ) -> Result<i64, RuntimeError> {
-    context_aware_check(&env)?;
-    let context = env.data_mut().apply_context_mut();
-    privileged_check(context)?;
-    // TODO: Implement set_proposed_producers logic
-    Ok(0)
+    {
+        context_aware_check(&env)?;
+        let context = env.data_mut().apply_context_mut();
+        privileged_check(context)?;
+    }
+
+    // Reject an oversized buffer before copying it out of wasm.
+    pulse_assert(
+        data_len <= MAX_SCHEDULE_BYTES,
+        ChainError::TransactionError(format!(
+            "proposed producer schedule is too large ({} bytes, max {})",
+            data_len, MAX_SCHEDULE_BYTES
+        )),
+    )?;
+
+    let (env_data, store) = env.data_and_store_mut();
+    let memory = env_data
+        .memory()
+        .as_ref()
+        .expect("Wasm memory not initialized");
+    let view = memory.view(&store);
+    let slice = data_ptr.slice(&view, data_len)?;
+    let mut src_bytes = vec![0u8; data_len as usize];
+    slice.read_slice(&mut src_bytes)?;
+
+    // Validate the declared element count against the cap *before* the full
+    // decode. `Vec::read` reserves the declared count up front, so a bogus length
+    // prefix (a VarUint32, up to ~4.3 billion) would otherwise drive a huge
+    // pre-allocation regardless of how few bytes actually follow.
+    let declared = VarUint32::read(&src_bytes, &mut 0)
+        .map_err(|e| RuntimeError::new(format!("failed to read producer count: {}", e)))?
+        .0 as usize;
+    pulse_assert(
+        declared >= 1 && declared <= MAX_PRODUCERS,
+        ChainError::TransactionError(format!(
+            "proposed producer count {} out of range [1, {}]",
+            declared, MAX_PRODUCERS
+        )),
+    )?;
+
+    let producers = <Vec<ProducerKey>>::read(&src_bytes, &mut 0)
+        .map_err(|e| RuntimeError::new(format!("failed to read proposed producers: {}", e)))?;
+
+    // Every producer must be a real account, and no producer may appear twice —
+    // the schedule is a name->key map, so a duplicate would silently shadow, and
+    // the check must be deterministic across nodes.
+    let db = env_data.db().clone();
+    let mut seen = BTreeSet::new();
+    for producer in &producers {
+        pulse_assert(
+            seen.insert(producer.producer_name.as_u64()),
+            ChainError::TransactionError(format!(
+                "duplicate producer {} in proposed schedule",
+                producer.producer_name
+            )),
+        )?;
+        pulse_assert(
+            db.is_account(producer.producer_name.as_u64())?,
+            ChainError::TransactionError(format!(
+                "proposed producer {} is not an account",
+                producer.producer_name
+            )),
+        )?;
+    }
+
+    let count = producers.len() as i64;
+    let context = env_data.apply_context_mut();
+    context.set_proposed_producers(producers)?;
+    // EOSIO returns the version of the proposed schedule. We don't carry a header
+    // schedule version yet, so return the producer count as a non-negative ack.
+    Ok(count)
 }
 
 pub fn get_blockchain_parameters_packed(

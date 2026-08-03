@@ -35,6 +35,13 @@ impl BlockHeader {
         Ok(Digest::hash(&packed))
     }
 
+    /// The digest a producer signs (and a validator recovers the signer from).
+    /// The header commits to the producer, previous, merkle roots and schedule
+    /// version, but not to the signature itself, so signing it is well-defined.
+    pub fn sig_digest(&self) -> Result<Digest, ChainError> {
+        self.digest()
+    }
+
     fn block_num(&self) -> u32 {
         Self::num_from_id(&self.previous) + 1
     }
