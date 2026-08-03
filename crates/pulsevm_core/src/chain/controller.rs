@@ -376,17 +376,27 @@ impl Controller {
         // block's session rather than before it.
         db.clear_expired_input_transactions(&timestamp.into())?;
 
-        // onblock heads the block, before any mempool transaction, so its action
-        // digests come first in the action merkle — matching what validators
-        // recompute in `execute_block`.
-        let producer = self.node_config.as_ref().unwrap().producer_name;
-        let previous = self.preferred_id;
-        action_receipt_digests.extend(self.run_onblock(
-            &timestamp,
-            producer,
-            previous,
-            &block_status,
-        )?);
+        // onblock is a consensus rule: whether it runs changes the blocks every
+        // node must produce, so it can only be turned on network-wide, in
+        // lockstep. The reference chain does not run onblock yet, so we must not
+        // either — a per-node onblock stamps an extra action receipt into every
+        // block and forks us off the network. The machinery in `run_onblock`
+        // stays ready; flip this switch to enable it in step with the network.
+        // (Mirrored in `execute_block`.)
+        const ONBLOCK_ENABLED: bool = false;
+        if ONBLOCK_ENABLED {
+            // onblock heads the block, before any mempool transaction, so its
+            // action digests come first in the action merkle — matching what
+            // validators recompute in `execute_block`.
+            let producer = self.node_config.as_ref().unwrap().producer_name;
+            let previous = self.preferred_id;
+            action_receipt_digests.extend(self.run_onblock(
+                &timestamp,
+                producer,
+                previous,
+                &block_status,
+            )?);
+        }
 
         // Get transactions from the mempool
         while let Some(transaction) = mempool.pop_transaction() {
@@ -710,6 +720,11 @@ impl Controller {
     // chain: it runs in its own child session that is discarded on failure, and
     // a failure yields no digests (identical on every node, since it is
     // deterministic), so the merkles still agree.
+    //
+    // Currently gated off at both call sites (see `ONBLOCK_ENABLED`): the
+    // reference chain does not run onblock, so enabling it would fork us. Kept
+    // ready for the coordinated network upgrade that turns it on.
+    #[allow(dead_code)]
     fn run_onblock(
         &mut self,
         timestamp: &BlockTimestamp,
@@ -795,14 +810,19 @@ impl Controller {
         self.db
             .clear_expired_input_transactions(&block.timestamp().to_time_point())?;
 
-        // onblock heads the block: its action digests precede every transaction's.
-        let header = &block.signed_block_header.header;
-        action_receipt_digests.extend(self.run_onblock(
-            &header.timestamp,
-            header.producer,
-            header.previous,
-            block_status,
-        )?);
+        // onblock stays off until the network adopts it in lockstep — a per-node
+        // onblock forks the chain. See the switch in `build_block`.
+        const ONBLOCK_ENABLED: bool = false;
+        if ONBLOCK_ENABLED {
+            // onblock heads the block: its action digests precede every transaction's.
+            let header = &block.signed_block_header.header;
+            action_receipt_digests.extend(self.run_onblock(
+                &header.timestamp,
+                header.producer,
+                header.previous,
+                block_status,
+            )?);
+        }
 
         for receipt in &block.transactions {
             // Verify the transaction
@@ -4729,12 +4749,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn onblock_runs_at_head_of_every_block() -> Result<(), ChainError> {
-        // onblock is an implicit action received by the system account. A block
-        // carrying a single newaccount transaction (also received by pulse) must
-        // advance pulse's received-action sequence by two — once for onblock,
-        // once for newaccount. Drop onblock from the block and the delta is one,
-        // so this pins the invocation, not just the build/verify merkle agreement.
+    async fn onblock_is_not_run_while_gated_off() -> Result<(), ChainError> {
+        // onblock does not run: the reference chain emits no onblock receipt, so
+        // running one here would stamp an extra action into every block and fork
+        // us off the network (the 3631-block differential replay diverges at the
+        // first block if onblock runs). A block carrying a single newaccount
+        // transaction (received by pulse) must therefore advance pulse's
+        // received-action sequence by exactly one — the newaccount alone. If
+        // onblock were run, this would be two. This pins onblock as off until the
+        // network enables it in lockstep.
         let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
         let mut mempool = Mempool::new();
 
@@ -4758,8 +4781,8 @@ mod tests {
 
         assert_eq!(
             after - before,
-            2,
-            "expected onblock + newaccount to each advance pulse's recv sequence"
+            1,
+            "onblock must not run: only the newaccount transaction should advance pulse's recv sequence"
         );
 
         Ok(())
