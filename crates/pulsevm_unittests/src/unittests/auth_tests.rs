@@ -888,4 +888,110 @@ mod auth_tests {
         )?;
         Ok(())
     }
+
+    /// Regression for the re-entrant permission fix in #13.
+    ///
+    ///   alice@active = threshold 1, accounts[bob@active, carol@active]
+    ///   bob@active   = threshold 1, accounts[alice@active]  (back-edge)
+    ///   carol@active = default single-key authority
+    ///
+    /// Declaring alice@active signed by carol's key: bob@active sorts before
+    /// carol@active, so the bob branch is evaluated first and re-enters
+    /// alice@active while it is still `BeingEvaluated`. nodeos's
+    /// weight_tally_visitor tallies that re-entry as weight 0 and moves on to
+    /// the sibling carol branch, which satisfies the threshold — so the
+    /// transaction must succeed. Failing the whole authorization on the
+    /// back-edge instead rejects satisfiable multi-path authorities.
+    #[tokio::test]
+    async fn test_reentrant_permission_contributes_zero_weight() -> Result<()> {
+        let mut chain = Testing::new().await;
+        let alice: Name = name!("alice").into();
+        let bob: Name = name!("bob").into();
+        let carol: Name = name!("carol").into();
+        chain.create_accounts(vec![alice, bob, carol], false, true)?;
+
+        // bob@active = threshold 1, accounts[alice@active] — the back-edge.
+        chain.set_authority2(
+            bob,
+            ACTIVE_NAME.into(),
+            Authority::new(
+                1,
+                vec![],
+                vec![PermissionLevelWeight::new(
+                    PermissionLevel::new(alice.as_u64(), ACTIVE_NAME.as_u64()),
+                    1,
+                )],
+                vec![],
+            ),
+            OWNER_NAME.into(),
+        )?;
+
+        // alice@active = threshold 1, accounts[bob@active, carol@active].
+        let mut alice_accounts = vec![
+            PermissionLevelWeight::new(
+                PermissionLevel::new(bob.as_u64(), ACTIVE_NAME.as_u64()),
+                1,
+            ),
+            PermissionLevelWeight::new(
+                PermissionLevel::new(carol.as_u64(), ACTIVE_NAME.as_u64()),
+                1,
+            ),
+        ];
+        alice_accounts.sort_by(|a, b| a.permission.cmp(&b.permission));
+        chain.set_authority2(
+            alice,
+            ACTIVE_NAME.into(),
+            Authority::new(1, vec![], alice_accounts, vec![]),
+            OWNER_NAME.into(),
+        )?;
+
+        // Satisfied via alice@active -> carol@active -> carol's key; the
+        // re-entrant bob branch contributes 0 weight instead of failing.
+        chain.push_reqauth2(
+            alice,
+            vec![PermissionLevel::new(alice.as_u64(), ACTIVE_NAME.as_u64())],
+            vec![get_private_key(carol, "active")],
+        )?;
+        Ok(())
+    }
+
+    /// A genuinely unsatisfiable cycle — alice@active referencing only itself —
+    /// must surface as the ordinary missing-signature authorization failure,
+    /// exactly like any other unsatisfied authority, not as a special error.
+    #[tokio::test]
+    async fn test_true_permission_cycle_is_unsatisfied_not_error() -> Result<()> {
+        let mut chain = Testing::new().await;
+        let alice: Name = name!("alice").into();
+        chain.create_account(alice, PULSE_NAME.into(), false, true)?;
+
+        chain.set_authority2(
+            alice,
+            ACTIVE_NAME.into(),
+            Authority::new(
+                1,
+                vec![],
+                vec![PermissionLevelWeight::new(
+                    PermissionLevel::new(alice.as_u64(), ACTIVE_NAME.as_u64()),
+                    1,
+                )],
+                vec![],
+            ),
+            OWNER_NAME.into(),
+        )?;
+
+        assert_eq!(
+            chain
+                .push_reqauth2(
+                    alice,
+                    vec![PermissionLevel::new(alice.as_u64(), ACTIVE_NAME.as_u64())],
+                    vec![],
+                )
+                .err(),
+            Some(ChainError::AuthorizationError(
+                "transaction declares authority 'alice@active' but does not have signatures for it"
+                    .into()
+            ))
+        );
+        Ok(())
+    }
 }
