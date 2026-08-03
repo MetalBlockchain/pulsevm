@@ -4,8 +4,9 @@ use pulsevm_serialization::Read;
 use wasmer::{FunctionEnvMut, RuntimeError, WasmPtr};
 
 use crate::chain::{
-    apply_context::ApplyContext, resource_limits::ResourceLimitsManager, utils::pulse_assert,
-    wasm_runtime::WasmContext, webassembly::context_aware_check,
+    apply_context::ApplyContext, producer_schedule::ProducerKey,
+    resource_limits::ResourceLimitsManager, utils::pulse_assert, wasm_runtime::WasmContext,
+    webassembly::context_aware_check,
 };
 
 fn privileged_check(context: &ApplyContext) -> Result<(), RuntimeError> {
@@ -19,14 +20,37 @@ fn privileged_check(context: &ApplyContext) -> Result<(), RuntimeError> {
 
 pub fn set_proposed_producers(
     mut env: FunctionEnvMut<WasmContext>,
-    _data_ptr: WasmPtr<u8>,
-    _data_len: u32,
+    data_ptr: WasmPtr<u8>,
+    data_len: u32,
 ) -> Result<i64, RuntimeError> {
-    context_aware_check(&env)?;
-    let context = env.data_mut().apply_context_mut();
-    privileged_check(context)?;
-    // TODO: Implement set_proposed_producers logic
-    Ok(0)
+    {
+        context_aware_check(&env)?;
+        let context = env.data_mut().apply_context_mut();
+        privileged_check(context)?;
+    }
+
+    let (env_data, store) = env.data_and_store_mut();
+    let memory = env_data
+        .memory()
+        .as_ref()
+        .expect("Wasm memory not initialized");
+    let view = memory.view(&store);
+    let slice = data_ptr.slice(&view, data_len)?;
+    let mut src_bytes = vec![0u8; data_len as usize];
+    slice.read_slice(&mut src_bytes)?;
+    let producers = <Vec<ProducerKey>>::read(&src_bytes, &mut 0)
+        .map_err(|e| RuntimeError::new(format!("failed to read proposed producers: {}", e)))?;
+    pulse_assert(
+        !producers.is_empty(),
+        ChainError::TransactionError("cannot set an empty producer schedule".to_string()),
+    )?;
+
+    let count = producers.len() as i64;
+    let context = env_data.apply_context_mut();
+    context.set_proposed_producers(producers)?;
+    // EOSIO returns the version of the proposed schedule. We don't carry a header
+    // schedule version yet, so return the producer count as a non-negative ack.
+    Ok(count)
 }
 
 pub fn get_blockchain_parameters_packed(

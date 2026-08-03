@@ -1,6 +1,7 @@
 use core::fmt;
 use std::{
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
+    path::PathBuf,
     sync::LazyLock,
 };
 
@@ -86,6 +87,9 @@ pub struct Controller {
     // signed by the key its producer holds here. Seeded from genesis and updated
     // by `set_proposed_producers`.
     active_schedule: ProducerSchedule,
+    // The database directory, where the active schedule is persisted so a
+    // schedule change survives restart.
+    data_dir: Option<PathBuf>,
 
     // The chain of blocks that have been executed (during build or verify) but
     // not yet accepted, ordered oldest first. Their state is materialized on the
@@ -114,6 +118,10 @@ struct PendingBlock {
     // Transaction traces produced during execution, needed by `store_traces` at
     // accept time. Retaining them avoids recomputing via a second execution.
     traces: Vec<TransactionTrace>,
+    // A producer schedule proposed by a `set_proposed_producers` in this block,
+    // if any. Activated when the block is accepted, so a rejected/forked block
+    // never changes the schedule.
+    proposed_schedule: Option<Vec<ProducerKey>>,
 }
 
 impl Drop for Controller {
@@ -159,6 +167,7 @@ impl Controller {
             chain_state_log: None,
             node_config: None,
             active_schedule: ProducerSchedule::default(),
+            data_dir: None,
 
             pending_chain: Vec::new(),
             blocks_executed: 0,
@@ -250,6 +259,12 @@ impl Controller {
                 block_signing_key: initial_key,
             }],
         };
+        self.data_dir = Some(PathBuf::from(db_path));
+        // A schedule persisted by a past `set_proposed_producers` overrides the
+        // genesis seed on restart.
+        if let Some(schedule) = self.load_persisted_schedule() {
+            self.active_schedule = schedule;
+        }
         self.block_log = Some(
             StateHistoryLog::open_with_magic(&db_path, "block_log", 0).map_err(|e| {
                 ChainError::InternalError(format!("failed to open block log: {}", e))
@@ -397,6 +412,10 @@ impl Controller {
         // block's session rather than before it.
         db.clear_expired_input_transactions(&timestamp.into())?;
 
+        // The last producer schedule proposed by any transaction in this block,
+        // activated when the block is accepted.
+        let mut proposed_schedule: Option<Vec<ProducerKey>> = None;
+
         // Get transactions from the mempool
         while let Some(transaction) = mempool.pop_transaction() {
             if pending_tx_ids.contains(transaction.id()) {
@@ -424,6 +443,9 @@ impl Controller {
                     let receipt = TransactionReceipt::new(result.trace.receipt, transaction);
                     transaction_receipts.push_back(receipt);
                     action_receipt_digests.extend(result.action_receipt_digests);
+                    if result.proposed_schedule.is_some() {
+                        proposed_schedule = result.proposed_schedule;
+                    }
                 }
                 Err(e) => {
                     warn!(
@@ -495,9 +517,49 @@ impl Controller {
             parent: self.preferred_id,
             session: block_session,
             traces: transaction_traces,
+            proposed_schedule,
         });
 
         Ok(block)
+    }
+
+    fn schedule_path(&self) -> Option<PathBuf> {
+        self.data_dir
+            .as_ref()
+            .map(|d| d.join("producer_schedule.json"))
+    }
+
+    fn load_persisted_schedule(&self) -> Option<ProducerSchedule> {
+        let path = self.schedule_path()?;
+        let bytes = std::fs::read(&path).ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    // Make a proposed schedule the active one and persist it. Called from
+    // `accept_block`, so a schedule change only takes effect once its block is
+    // committed. The version bumps on every change; it is bookkeeping for now,
+    // since the block header does not yet carry a schedule version.
+    fn activate_producer_schedule(
+        &mut self,
+        producers: Vec<ProducerKey>,
+    ) -> Result<(), ChainError> {
+        self.active_schedule = ProducerSchedule {
+            version: self.active_schedule.version + 1,
+            producers,
+        };
+        if let Some(path) = self.schedule_path() {
+            let bytes = serde_json::to_vec(&self.active_schedule).map_err(|e| {
+                ChainError::InternalError(format!("failed to serialize producer schedule: {}", e))
+            })?;
+            std::fs::write(&path, bytes).map_err(|e| {
+                ChainError::InternalError(format!("failed to persist producer schedule: {}", e))
+            })?;
+        }
+        info!(
+            "activated producer schedule version {}",
+            self.active_schedule.version
+        );
+        Ok(())
     }
 
     // Authenticate a block against the active schedule: recover the signer from
@@ -578,7 +640,7 @@ impl Controller {
         // On any failure below, `block_session` drops and chainbase undoes it via
         // RAII; the arena has no such hook, so mirror the undo explicitly before
         // returning, keeping the two session stacks the same depth.
-        let (transaction_traces, transaction_mroot, action_mroot) =
+        let (transaction_traces, transaction_mroot, action_mroot, proposed_schedule) =
             match self.execute_block(block, &block_status, mempool) {
                 Ok(v) => v,
                 Err(e) => {
@@ -602,6 +664,7 @@ impl Controller {
             parent: parent_block_id,
             session: block_session,
             traces: transaction_traces,
+            proposed_schedule,
         });
 
         Ok(())
@@ -639,7 +702,7 @@ impl Controller {
             .map(|p| p.id == *block_id)
             .unwrap_or(false);
 
-        let (mut session, transaction_traces) = if front_matches {
+        let (mut session, transaction_traces, proposed_schedule) = if front_matches {
             let front = self.pending_chain.remove(0);
             // `execute_block` removes accepted transactions from the mempool as it
             // runs; the retained pass did not (build pops them while assembling,
@@ -647,7 +710,7 @@ impl Controller {
             for receipt in &block.transactions {
                 mempool.remove_transaction(receipt.trx().id());
             }
-            (front.session, front.traces)
+            (front.session, front.traces, front.proposed_schedule)
         } else {
             // Fallback: the block is not the retained front (e.g. a fork sibling
             // won, or nothing is pending). Discard the pending chain and execute
@@ -662,7 +725,7 @@ impl Controller {
             let session = self.db.create_undo_session(true)?;
             self.db.arena_start_undo_session(); // mirror the fallback accept session; committed below
             let block_status = BlockStatus::Accepting;
-            let (transaction_traces, _transaction_mroot, _action_mroot) = self
+            let (transaction_traces, _transaction_mroot, _action_mroot, proposed_schedule) = self
                 .execute_block(&block, &block_status, mempool)
                 .map_err(|e| {
                     ChainError::DatabaseError(format!(
@@ -670,7 +733,7 @@ impl Controller {
                         block_id, e
                     ))
                 })?;
-            (session, transaction_traces)
+            (session, transaction_traces, proposed_schedule)
         };
 
         session
@@ -686,6 +749,13 @@ impl Controller {
         self.last_accepted_block = block.clone();
         self.last_accepted_block_id = block.id()?;
         self.db.commit(block.block_num() as i64)?;
+
+        // Activate a schedule proposed by this block now that it is committed, so
+        // a rejected block never changes the producers. Subsequent blocks are then
+        // authenticated against the new keys.
+        if let Some(producers) = proposed_schedule {
+            self.activate_producer_schedule(producers)?;
+        }
 
         // Accept boundary: commit the arena mirror in lockstep and surface its
         // root. The full session lockstep across build/verify is still to come;
@@ -750,10 +820,11 @@ impl Controller {
         block: &SignedBlock,
         block_status: &BlockStatus,
         mempool: &mut Mempool,
-    ) -> Result<(Vec<TransactionTrace>, Digest, Digest), ChainError> {
+    ) -> Result<(Vec<TransactionTrace>, Digest, Digest, Option<Vec<ProducerKey>>), ChainError> {
         let mut transaction_traces: Vec<TransactionTrace> = Vec::new();
         let mut transaction_receipts: VecDeque<TransactionReceipt> = VecDeque::new();
         let mut action_receipt_digests: VecDeque<Digest> = VecDeque::new();
+        let mut proposed_schedule: Option<Vec<ProducerKey>> = None;
 
         self.blocks_executed += 1;
 
@@ -776,6 +847,9 @@ impl Controller {
                 receipt.trx().clone(),
             ));
             action_receipt_digests.extend(result.action_receipt_digests);
+            if result.proposed_schedule.is_some() {
+                proposed_schedule = result.proposed_schedule;
+            }
 
             // Remove from mempool if we have it
             if block_status == &BlockStatus::Accepting {
@@ -788,7 +862,12 @@ impl Controller {
 
         self.finalize_block_resources(block.block_num())?;
 
-        Ok((transaction_traces, transaction_mroot, action_mroot))
+        Ok((
+            transaction_traces,
+            transaction_mroot,
+            action_mroot,
+            proposed_schedule,
+        ))
     }
 
     // Apply the end-of-block resource-limit bookkeeping. This is part of the
@@ -1176,7 +1255,7 @@ impl Controller {
             );
             let session = self.db.create_undo_session(true)?;
             self.db.arena_start_undo_session(); // mirror the replayed block's session
-            let (traces, _transaction_mroot, _action_mroot) =
+            let (traces, _transaction_mroot, _action_mroot, proposed_schedule) =
                 match self.execute_block(block, block_status, mempool) {
                     Ok(v) => v,
                     Err(e) => {
@@ -1189,6 +1268,7 @@ impl Controller {
                 parent: block.previous_id().clone(),
                 session,
                 traces,
+                proposed_schedule,
             });
         }
 
@@ -4704,6 +4784,83 @@ mod tests {
         assert!(
             validator.verify_block(&block, &mut v_mempool).await.is_err(),
             "block with a signature over the wrong digest must be rejected"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn active_schedule_gates_block_verification() -> Result<(), ChainError> {
+        // A block signed by the genesis key must be rejected once the schedule is
+        // rotated to a different key, and accepted again when re-signed with the
+        // new key — proving verification follows the active schedule, not a fixed
+        // genesis key.
+        let (mut producer, private_key, chain_id, _p_temp) = init_test_controller()?;
+        let mut p_mempool = Mempool::new();
+        p_mempool
+            .add_transaction(create_account(&private_key, Name::from_str("testapi")?, chain_id)?);
+        let mut block = producer.build_block(&mut p_mempool).await?;
+
+        let (mut validator, _pk, _cid, _v_temp) = init_test_controller()?;
+        let new_key = PrivateKey::random();
+        validator.activate_producer_schedule(vec![ProducerKey {
+            producer_name: Name::from_str("pulse")?,
+            block_signing_key: new_key.get_public_key(),
+        }])?;
+        assert_eq!(validator.active_schedule.version, 1);
+
+        let mut v_mempool = Mempool::new();
+        assert!(
+            validator.verify_block(&block, &mut v_mempool).await.is_err(),
+            "genesis-key signature must be rejected under the rotated schedule"
+        );
+
+        let sig_digest: crate::utils::Digest =
+            block.signed_block_header.header.sig_digest()?.0.into();
+        block.signed_block_header.signature = new_key.sign(&sig_digest)?;
+        validator.verify_block(&block, &mut v_mempool).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn producer_schedule_persists_across_restart() -> Result<(), ChainError> {
+        // A schedule change must survive a restart: after activating a new
+        // schedule, reopening the database on the same directory restores it
+        // rather than re-seeding from genesis.
+        let chain_id = Id::from_str(
+            "c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6",
+        )
+        .unwrap();
+        let private_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let genesis_bytes = generate_genesis(&private_key);
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": private_key.to_string(),
+        })
+        .to_string()
+        .into_bytes();
+        let temp = get_temp_dir();
+        let path = temp.path().to_str().unwrap().to_string();
+        let new_key = PrivateKey::random();
+
+        {
+            let mut controller = Controller::new();
+            controller.initialize(&chain_id, &config_bytes, &genesis_bytes.to_vec(), &path)?;
+            controller.activate_producer_schedule(vec![ProducerKey {
+                producer_name: Name::from_str("pulse")?,
+                block_signing_key: new_key.get_public_key(),
+            }])?;
+            controller.shutdown()?;
+        }
+
+        let mut reopened = Controller::new();
+        reopened.initialize(&chain_id, &config_bytes, &genesis_bytes.to_vec(), &path)?;
+        assert_eq!(reopened.active_schedule.version, 1);
+        assert_eq!(
+            reopened.active_schedule.producers[0].block_signing_key,
+            new_key.get_public_key()
         );
 
         Ok(())

@@ -22,6 +22,7 @@ use crate::{
         authority::PermissionLevel,
         authorization_manager::AuthorizationManager,
         controller::Controller,
+        producer_schedule::ProducerKey,
         transaction::{Action, ActionReceipt, generate_action_digest},
         transaction_context::TransactionContext,
         utils::pulse_assert,
@@ -1925,6 +1926,13 @@ impl ApplyContext {
     pub fn set_global_properties(&mut self, cfg: &ChainConfigV0) -> Result<(), ChainError> {
         self.db.set_global_properties(cfg)?;
         Ok(())
+    }
+
+    pub fn set_proposed_producers(
+        &mut self,
+        producers: Vec<ProducerKey>,
+    ) -> Result<(), ChainError> {
+        self.trx_context.set_proposed_producers(producers)
     }
 }
 
