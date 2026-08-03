@@ -188,6 +188,19 @@ impl TransactionContext {
         Ok(())
     }
 
+    // Initialize for an implicit system transaction such as `onblock`. Unlike an
+    // input transaction it carries no signature, is not deduplicated, bills no
+    // account, and runs on behalf of the system account with no CPU ceiling —
+    // so we skip expiration/authorization/net accounting entirely.
+    pub fn init_for_implicit_trx(&mut self) -> Result<(), ChainError> {
+        {
+            let mut inner = self.inner.write()?;
+            inner.explicit_billed_cpu_time = true;
+            inner.cpu_limit = -1;
+        }
+        self.init(0, None, false)
+    }
+
     pub fn exec(&mut self, transaction: &Transaction) -> Result<(), ChainError> {
         // Reserve actions array
         {
@@ -428,8 +441,10 @@ impl TransactionContext {
             ResourceLimitsManager::verify_account_ram_usage(&mut self.db, account)?;
         }
 
-        // During benchmarks this would throw an error because the accounts won't have enough CPU to cover the billed time, so we skip this step if we're benchmarking.
-        if self.block_status != BlockStatus::Benchmarking {
+        // Implicit transactions (onblock) bill no account, so there is nothing to
+        // charge. During benchmarks the billing would fail because the accounts
+        // won't have staked CPU to cover the billed time, so we skip it there too.
+        if inner.is_input && self.block_status != BlockStatus::Benchmarking {
             let bill_to_account = inner.bill_to_account.clone().ok_or_else(|| {
                 ChainError::TransactionError("bill to account is not set".to_string())
             })?;
