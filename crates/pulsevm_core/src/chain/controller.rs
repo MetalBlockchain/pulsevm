@@ -15,9 +15,11 @@ use crate::{
             DELETEAUTH_NAME, LINKAUTH_NAME, NEWACCOUNT_NAME, SETABI_NAME, SETCODE_NAME,
             UNLINKAUTH_NAME, UPDATEAUTH_NAME, eos_percent,
         },
+        crypto::PublicKey,
         id::Id,
         mempool::Mempool,
         name::Name,
+        producer_schedule::{ProducerKey, ProducerSchedule},
         pulse_contract::{
             deleteauth, linkauth, newaccount, setabi, setcode, unlinkauth, updateauth,
         },
@@ -41,7 +43,7 @@ use pulsevm_error::ChainError;
 use cxx::UniquePtr;
 use pulsevm_ffi::{
     BlockTimestamp, CxxGenesisState, Database, ElasticLimitParameters, GlobalPropertyObject,
-    TimePoint, UndoSession, seconds,
+    TimePoint, UndoSession, parse_public_key, seconds,
 };
 use pulsevm_grpc::vm;
 use pulsevm_serialization::{Read, Write};
@@ -79,6 +81,11 @@ pub struct Controller {
     trace_log: Option<StateHistoryLog>,
     chain_state_log: Option<StateHistoryLog>,
     node_config: Option<NodeConfig>,
+
+    // Active block producers and their signing keys. A block validates only if
+    // signed by the key its producer holds here. Seeded from genesis and updated
+    // by `set_proposed_producers`.
+    active_schedule: ProducerSchedule,
 
     // The chain of blocks that have been executed (during build or verify) but
     // not yet accepted, ordered oldest first. Their state is materialized on the
@@ -151,6 +158,7 @@ impl Controller {
             trace_log: None,
             chain_state_log: None,
             node_config: None,
+            active_schedule: ProducerSchedule::default(),
 
             pending_chain: Vec::new(),
             blocks_executed: 0,
@@ -225,6 +233,23 @@ impl Controller {
             .map_err(|e| ChainError::ParseError(format!("failed to parse genesis: {}", e)))?;
         // TODO: Validate genesis state
         self.chain_id = chain_id.clone();
+
+        // Seed the active producer schedule from genesis: the sole producer is
+        // the configured producer_name, and it signs blocks with the genesis
+        // initial key. Re-seeding on every open is correct while the schedule is
+        // immutable; `set_proposed_producers` (and its persistence) will change
+        // that.
+        let initial_key = PublicKey::new(
+            parse_public_key(&genesis.get_initial_key().to_string_rust())
+                .map_err(|e| ChainError::GenesisError(format!("invalid genesis key: {}", e)))?,
+        );
+        self.active_schedule = ProducerSchedule {
+            version: 0,
+            producers: vec![ProducerKey {
+                producer_name: self.node_config.as_ref().unwrap().producer_name,
+                block_signing_key: initial_key,
+            }],
+        };
         self.block_log = Some(
             StateHistoryLog::open_with_magic(&db_path, "block_log", 0).map_err(|e| {
                 ChainError::InternalError(format!("failed to open block log: {}", e))
@@ -434,7 +459,7 @@ impl Controller {
         // Create a new block
         let transaction_mroot = self.calculate_trx_merkle(&transaction_receipts)?;
         let action_mroot = self.calculate_action_merkle(&mut action_receipt_digests)?;
-        let block = SignedBlock::new(
+        let mut block = SignedBlock::new(
             self.preferred_id,
             timestamp,
             self.node_config.as_ref().unwrap().producer_name, // Use producer name from config
@@ -442,6 +467,17 @@ impl Controller {
             transaction_mroot,
             action_mroot,
         );
+
+        // Sign the block with the producer's key so validators can authenticate
+        // it against the active schedule.
+        let sig_digest: crate::utils::Digest =
+            block.signed_block_header.header.sig_digest()?.0.into();
+        block.signed_block_header.signature = self
+            .node_config
+            .as_ref()
+            .unwrap()
+            .producer_key
+            .sign(&sig_digest)?;
 
         // We built this block so no need to verify it again
         let block_id = block.id()?;
@@ -462,6 +498,34 @@ impl Controller {
         });
 
         Ok(block)
+    }
+
+    // Authenticate a block against the active schedule: recover the signer from
+    // the producer signature over the header's sig digest and require it to be
+    // the block producer's scheduled key. Runs before execution, so a block is
+    // checked against the schedule active as of its parent.
+    fn verify_block_signature(&self, block: &SignedBlock) -> Result<(), ChainError> {
+        let header = &block.signed_block_header.header;
+        let expected = self
+            .active_schedule
+            .block_signing_key(&header.producer)
+            .ok_or_else(|| {
+                ChainError::BlockError(format!(
+                    "block producer {} is not in the active schedule",
+                    header.producer
+                ))
+            })?;
+        let digest: crate::utils::Digest = header.sig_digest()?.0.into();
+        let signer = block
+            .signed_block_header
+            .signature
+            .recover_public_key(&digest)?;
+        if &signer != expected {
+            return Err(ChainError::BlockError(
+                "block signature does not match the scheduled producer key".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub async fn verify_block(
@@ -497,6 +561,7 @@ impl Controller {
 
         // Verify the block
         block.validate_syntactically(&self.db)?;
+        self.verify_block_signature(block)?;
 
         let parent_block_id = block.previous_id().clone();
         let block_status = BlockStatus::Verifying;
@@ -4615,6 +4680,31 @@ mod tests {
         assert_eq!(validator.last_accepted_block_id, block.id()?);
 
         validator.verify_block(&block, &mut v_mempool).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_block_with_wrong_signature() -> Result<(), ChainError> {
+        // Build a valid block, then replace its signature with one made over a
+        // different digest. It is still a well-formed signature, but recovers to
+        // a key that isn't the producer's scheduled key, so verification must
+        // reject it. This proves the signature check is enforced, not a no-op.
+        let (mut producer, private_key, chain_id, _p_temp) = init_test_controller()?;
+        let mut p_mempool = Mempool::new();
+        p_mempool
+            .add_transaction(create_account(&private_key, Name::from_str("testapi")?, chain_id)?);
+        let mut block = producer.build_block(&mut p_mempool).await?;
+
+        let wrong_digest: crate::utils::Digest = [0u8; 32].into();
+        block.signed_block_header.signature = private_key.sign(&wrong_digest)?;
+
+        let (mut validator, _pk, _cid, _v_temp) = init_test_controller()?;
+        let mut v_mempool = Mempool::new();
+        assert!(
+            validator.verify_block(&block, &mut v_mempool).await.is_err(),
+            "block with a signature over the wrong digest must be rejected"
+        );
 
         Ok(())
     }
