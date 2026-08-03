@@ -5,8 +5,9 @@ use std::{
 use pulsevm_constants::MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER;
 use pulsevm_crypto::Digest;
 use pulsevm_error::ChainError;
-use pulsevm_ffi::{BlockTimestamp, Database, Microseconds, TimePoint, seconds};
+use pulsevm_ffi::{BlockTimestamp, Database, GlobalPropertyObject, Microseconds, TimePoint, seconds};
 use pulsevm_serialization::VarUint32;
+use spdlog::info;
 
 use crate::{
     authorization_manager::AuthorizationManager, block::BlockStatus, chain::{
@@ -128,6 +129,7 @@ impl TransactionContext {
 
         inner.initialized = true;
         inner.is_input = is_input;
+        inner.cpu_limit = self.db.get_block_cpu_limit()? as i64;
         inner.net_limit = self.db.get_block_net_limit()?;
 
         let net_usage_leeway = {
@@ -137,6 +139,12 @@ impl TransactionContext {
             if cfg.get_chain_config().get_max_transaction_net_usage() as u64 <= inner.net_limit {
                 inner.net_limit = cfg.get_chain_config().get_max_transaction_net_usage() as u64;
                 inner.net_limit_due_to_block = false;
+            }
+
+            // Possibly lower cpu_limit to the maximum cpu usage a transaction is allowed to be billed
+            if cfg.get_chain_config().get_max_transaction_cpu_usage() as u64 <= inner.cpu_limit as u64 {
+                inner.cpu_limit = cfg.get_chain_config().get_max_transaction_cpu_usage() as i64;
+                inner.cpu_limit_due_to_block = false;
             }
 
             cfg.get_chain_config().get_net_usage_leeway() as u64
@@ -149,6 +157,12 @@ impl TransactionContext {
         if trx_specified_net_usage_limit > 0 && trx_specified_net_usage_limit <= inner.net_limit {
             inner.net_limit = trx_specified_net_usage_limit;
             inner.net_limit_due_to_block = false;
+        }
+
+        // Possibly lower cpu_limit to optional limit set in the transaction header
+        if trx.header.max_cpu_usage() > 0 && trx.header.max_cpu_usage() as i64 <= inner.cpu_limit {
+            inner.cpu_limit = trx.header.max_cpu_usage() as i64;
+            inner.cpu_limit_due_to_block = false;
         }
 
         // Record accounts to be billed for network and CPU usage
@@ -182,7 +196,7 @@ impl TransactionContext {
             inner.eager_net_limit = new_eager_net_limit;
         }
 
-        inner.cpu_limit = account_cpu_limit;
+        inner.cpu_limit = min(inner.cpu_limit, account_cpu_limit);
         inner.eager_net_limit = (inner.eager_net_limit / 8) * 8; // Round down to nearest multiple of word size (8 bytes)
 
         // add_net_usage re-locks inner; the guard must be released first or the
@@ -447,7 +461,6 @@ impl TransactionContext {
             inner.trace.receipt.cpu_usage_us = inner.explicit_cpu_us;
             inner.trace.net_usage = inner.explicit_net_words as u64 * 8;
         }
-        let billed_cpu_time_us = inner.trace.receipt.cpu_usage_us;
         inner.trace.net_usage = ((inner.trace.net_usage + 7) / 8) * 8; // Round up to nearest multiple of word size (8 bytes)
         inner.trace.receipt.status = TransactionStatus::Executed;
         inner.trace.receipt.net_usage_words = VarUint32((inner.trace.net_usage / 8) as u32);
@@ -489,12 +502,20 @@ impl TransactionContext {
             Self::check_net_usage_locked(&inner)?;
         }
 
+        // Possibly lower cpu_limit to what the billed accounts can pay
+        if account_cpu_limit as i64 <= inner.cpu_limit {
+            inner.cpu_limit = account_cpu_limit as i64;
+            inner.cpu_limit_due_to_block = false;
+        }
+
+        Self::validate_cpu_usage_to_bill(&inner, &self.db, true)?;
+
         // During benchmarks this would throw an error because the accounts won't have enough CPU to cover the billed time, so we skip this step if we're benchmarking.
         if self.block_status != BlockStatus::Benchmarking {
             ResourceLimitsManager::add_transaction_usage(
                 &mut self.db,
                 &first_authorizer_name,
-                billed_cpu_time_us as u64,
+                inner.trace.receipt.cpu_usage_us as u64,
                 inner.trace.net_usage as u64,
                 inner.pending_block_timestamp.slot(),
                 !inner.explicit_billed_cpu_time,
@@ -503,7 +524,7 @@ impl TransactionContext {
 
         Ok(TransactionResult {
             trace: inner.trace.clone(),
-            billed_cpu_time_us,
+            billed_cpu_time_us: inner.trace.receipt.cpu_usage_us,
             action_receipt_digests: inner.executed_action_receipt_digests.clone(),
         })
     }
@@ -741,6 +762,44 @@ impl TransactionContext {
                 return Err(ChainError::TransactionError(format!(
                     "transaction net usage is too high: {} > {}",
                     inner.trace.net_usage, inner.eager_net_limit
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_cpu_usage_to_bill(inner: &TransactionContextInner, db: &Database, check_minimum: bool) -> Result<(), ChainError> {
+        if check_minimum {
+            let cfg = Controller::get_global_properties(&db)?;
+
+            if inner.trace.receipt.cpu_usage_us < cfg.get_chain_config().get_min_transaction_cpu_usage() {
+                return Err(ChainError::TransactionError(format!(
+                    "cannot bill CPU time less than the minimum of {}",
+                    cfg.get_chain_config().get_min_transaction_cpu_usage()
+                )));
+            }
+        }
+
+        Self::validate_account_cpu_usage(inner)
+    }
+
+    fn validate_account_cpu_usage(inner: &TransactionContextInner) -> Result<(), ChainError> {
+        if inner.trace.receipt.cpu_usage_us > inner.cpu_limit as u32 {
+            if inner.cpu_limit_due_to_block {
+                return Err(ChainError::TransactionError(format!(
+                    "not enough CPU left in block: {} > {}",
+                    inner.trace.receipt.cpu_usage_us, inner.cpu_limit
+                )));
+            } else if inner.cpu_limit_due_to_greylist {
+                return Err(ChainError::TransactionError(format!(
+                    "greylisted transaction CPU usage is too high: {} > {}",
+                    inner.trace.receipt.cpu_usage_us, inner.cpu_limit
+                )));
+            } else {
+                return Err(ChainError::TransactionError(format!(
+                    "transaction CPU usage is too high: {} > {}",
+                    inner.trace.receipt.cpu_usage_us, inner.cpu_limit
                 )));
             }
         }
