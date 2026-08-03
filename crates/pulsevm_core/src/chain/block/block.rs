@@ -9,7 +9,7 @@ use serde::{Serialize, ser::SerializeStruct};
 use spdlog::{info, warn};
 
 use crate::{
-    chain::{Name, id::Id, transaction::TransactionReceipt},
+    chain::{Name, id::Id, producer_schedule::ProducerSchedule, transaction::TransactionReceipt},
     crypto::Signature,
     utils::pulse_assert,
 };
@@ -36,10 +36,26 @@ impl BlockHeader {
     }
 
     /// The digest a producer signs (and a validator recovers the signer from).
-    /// The header commits to the producer, previous, merkle roots and schedule
-    /// version, but not to the signature itself, so signing it is well-defined.
+    /// The header commits to the producer, previous, merkle roots, schedule
+    /// version and any `new_producers`, but not to the signature itself, so
+    /// signing it is well-defined — and a schedule change rides inside it.
     pub fn sig_digest(&self) -> Result<Digest, ChainError> {
         self.digest()
+    }
+
+    /// The producer schedule this block activates, if it changes one. The change
+    /// travels in the signed header, so it is committed with the block and can be
+    /// reconstructed from the block log — the schedule is never trusted from an
+    /// out-of-band source.
+    pub fn new_schedule(&self) -> Result<Option<ProducerSchedule>, ChainError> {
+        match &self.new_producers {
+            None => Ok(None),
+            Some(bytes) => {
+                let schedule = ProducerSchedule::read_bounded(bytes)
+                    .map_err(|e| ChainError::BlockError(format!("invalid new_producers: {}", e)))?;
+                Ok(Some(schedule))
+            }
+        }
     }
 
     fn block_num(&self) -> u32 {
@@ -76,14 +92,30 @@ impl BlockHeader {
             self.confirmed == 0,
             ChainError::BlockError("confirmed count must be 0".into()),
         )?;
-        pulse_assert(
-            self.schedule_version == 0,
-            ChainError::BlockError("schedule version must be 0".into()),
-        )?;
-        pulse_assert(
-            self.new_producers.is_none(),
-            ChainError::BlockError("new producers should be none".into()),
-        )?;
+        // A block may change the producer schedule. When it does, the change is
+        // carried in `new_producers` and the header's `schedule_version` names the
+        // resulting version; the two must agree, and an empty `new_producers`
+        // implies version 0. `new_schedule()` bounds the decode. The signature and
+        // execution binding are checked by the controller; here we enforce only
+        // header self-consistency.
+        match self.new_schedule()? {
+            None => pulse_assert(
+                self.schedule_version == 0,
+                ChainError::BlockError("schedule version must be 0 without new producers".into()),
+            )?,
+            Some(schedule) => {
+                pulse_assert(
+                    !schedule.producers.is_empty(),
+                    ChainError::BlockError("new producer schedule is empty".into()),
+                )?;
+                pulse_assert(
+                    schedule.version == self.schedule_version,
+                    ChainError::BlockError(
+                        "schedule version does not match new_producers version".into(),
+                    ),
+                )?;
+            }
+        }
         pulse_assert(
             self.header_extensions.is_empty(),
             ChainError::BlockError("header extensions not supported".into()),
@@ -226,14 +258,46 @@ impl Serialize for SignedBlock {
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use pulsevm_serialization::{Read, Write};
 
+    use super::BlockHeader;
     use crate::block::SignedBlock;
+    use crate::chain::{
+        Name,
+        crypto::PrivateKey,
+        producer_schedule::{ProducerKey, ProducerSchedule},
+    };
 
     #[test]
     pub fn test_block_serialization() {
         let signed_block = SignedBlock::default();
         let packed = signed_block.pack().unwrap();
         let _ = SignedBlock::read(&packed, &mut 0).unwrap();
+    }
+
+    #[test]
+    fn new_schedule_round_trips_none_some_and_garbage() {
+        // No schedule change -> None.
+        assert!(BlockHeader::default().new_schedule().unwrap().is_none());
+
+        // A stamped header decodes back to the same schedule.
+        let schedule = ProducerSchedule {
+            version: 1,
+            producers: vec![ProducerKey {
+                producer_name: Name::from_str("pulse").unwrap(),
+                block_signing_key: PrivateKey::random().get_public_key(),
+            }],
+        };
+        let mut header = BlockHeader::default();
+        header.new_producers = Some(schedule.pack().unwrap());
+        header.schedule_version = 1;
+        assert_eq!(header.new_schedule().unwrap().unwrap(), schedule);
+
+        // Undecodable new_producers is an error, never a panic.
+        let mut header = BlockHeader::default();
+        header.new_producers = Some(vec![0xff, 0xff, 0xff, 0xff, 0xff]);
+        assert!(header.new_schedule().is_err());
     }
 }
