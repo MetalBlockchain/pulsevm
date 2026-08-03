@@ -246,6 +246,19 @@ impl TransactionContext {
         Ok(())
     }
 
+    // Initialize for an implicit system transaction such as `onblock`. Unlike an
+    // input transaction it carries no signature, is not deduplicated, bills no
+    // account, and runs on behalf of the system account with no CPU ceiling —
+    // so we skip expiration/authorization/net accounting entirely.
+    pub fn init_for_implicit_trx(&mut self) -> Result<(), ChainError> {
+        {
+            let mut inner = self.inner.write()?;
+            inner.explicit_billed_cpu_time = true;
+            inner.cpu_limit = -1;
+        }
+        self.init(0, None, false)
+    }
+
     pub fn exec(&mut self, transaction: &Transaction) -> Result<(), ChainError> {
         // Reserve actions array
         {
@@ -511,7 +524,7 @@ impl TransactionContext {
         Self::validate_cpu_usage_to_bill(&inner, &self.db, true)?;
 
         // During benchmarks this would throw an error because the accounts won't have enough CPU to cover the billed time, so we skip this step if we're benchmarking.
-        if self.block_status != BlockStatus::Benchmarking {
+        if inner.is_input && self.block_status != BlockStatus::Benchmarking {
             ResourceLimitsManager::add_transaction_usage(
                 &mut self.db,
                 &first_authorizer_name,

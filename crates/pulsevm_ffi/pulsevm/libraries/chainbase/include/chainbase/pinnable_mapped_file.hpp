@@ -69,7 +69,11 @@ class pinnable_mapped_file {
 
       template<typename T>
       static std::optional<allocator<T>> get_allocator(void *object) {
-         std::shared_lock lock(_statics_mutex);
+         // The segment-manager registry is process-global and mutated whenever a
+         // database is opened or closed. Reads (here) may run concurrently, but
+         // must be excluded while a map/close rewrites the flat_map, or the
+         // shared vector backing it is read mid-realloc. See _statics_mutex.
+         std::shared_lock registry_lock(_statics_mutex);
          if (!_segment_manager_map.empty()) {
             auto it = _segment_manager_map.upper_bound(object);
             if(it == _segment_manager_map.begin())
@@ -119,11 +123,11 @@ class pinnable_mapped_file {
       using segment_manager_map_t = boost::container::flat_map<void*, void *>;
       static segment_manager_map_t                  _segment_manager_map;
 
-      // Guards _segment_manager_map and _instance_tracker: both statics are
-      // mutated by every constructor/destructor and read from allocation hot
-      // paths (get_allocator), so concurrent database opens on different
-      // threads corrupt them without it. Held exclusively for the whole
-      // constructor/destructor, shared in get_allocator.
+      // Guards the two process-global registries above (_instance_tracker and
+      // _segment_manager_map). They are rewritten on database open/close but read
+      // on the hot allocator path, so opens/closes take a unique lock and
+      // get_allocator takes a shared one. Without it, opening databases on
+      // several threads (e.g. a parallel test run) corrupts the shared vectors.
       static std::shared_mutex                      _statics_mutex;
 
       constexpr static unsigned                     _db_size_multiple_requirement = 1024*1024; //1MB
