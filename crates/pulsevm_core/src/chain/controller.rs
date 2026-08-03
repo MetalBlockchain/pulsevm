@@ -758,7 +758,7 @@ impl Controller {
         );
 
         let executed = (|| -> Result<VecDeque<Digest>, ChainError> {
-            trx_context.init_for_implicit_trx()?;
+            trx_context.init_for_implicit_trx(&trx)?;
             trx_context.exec(&trx)?;
             Ok(trx_context.finalize()?.action_receipt_digests)
         })();

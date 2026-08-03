@@ -250,13 +250,15 @@ impl TransactionContext {
     // input transaction it carries no signature, is not deduplicated, bills no
     // account, and runs on behalf of the system account with no CPU ceiling —
     // so we skip expiration/authorization/net accounting entirely.
-    pub fn init_for_implicit_trx(&mut self) -> Result<(), ChainError> {
+    pub fn init_for_implicit_trx(&mut self, transaction: &Transaction) -> Result<(), ChainError> {
         {
+            let cfg = Controller::get_global_properties(&self.db)?;
             let mut inner = self.inner.write()?;
             inner.explicit_billed_cpu_time = true;
+            inner.explicit_cpu_us = cfg.get_chain_config().get_min_transaction_cpu_usage();
             inner.cpu_limit = -1;
         }
-        self.init(0, None, false)
+        self.init(0, transaction.first_authorizer(), false)
     }
 
     pub fn exec(&mut self, transaction: &Transaction) -> Result<(), ChainError> {
@@ -521,17 +523,18 @@ impl TransactionContext {
             inner.cpu_limit_due_to_block = false;
         }
 
+        Self::update_billed_cpu_time(&mut inner, &self.db)?;
         Self::validate_cpu_usage_to_bill(&inner, &self.db, true)?;
 
         // During benchmarks this would throw an error because the accounts won't have enough CPU to cover the billed time, so we skip this step if we're benchmarking.
-        if inner.is_input && self.block_status != BlockStatus::Benchmarking {
+        if self.block_status != BlockStatus::Benchmarking {
             ResourceLimitsManager::add_transaction_usage(
                 &mut self.db,
                 &first_authorizer_name,
                 inner.trace.receipt.cpu_usage_us as u64,
                 inner.trace.net_usage as u64,
                 inner.pending_block_timestamp.slot(),
-                !inner.explicit_billed_cpu_time,
+                true,
             )?;
         }
 
@@ -795,6 +798,22 @@ impl TransactionContext {
         }
 
         Self::validate_account_cpu_usage(inner)
+    }
+
+    fn update_billed_cpu_time(inner: &mut TransactionContextInner, db: &Database) -> Result<(), ChainError> {
+        if inner.explicit_billed_cpu_time {
+            inner.trace.receipt.cpu_usage_us = inner.explicit_cpu_us;
+            return Ok(());
+        }
+
+        let cfg = Controller::get_global_properties(&db)?;
+
+        inner.trace.receipt.cpu_usage_us = std::cmp::max(
+            inner.trace.receipt.cpu_usage_us,
+            cfg.get_chain_config().get_min_transaction_cpu_usage(),
+        );
+
+        Ok(())
     }
 
     fn validate_account_cpu_usage(inner: &TransactionContextInner) -> Result<(), ChainError> {
