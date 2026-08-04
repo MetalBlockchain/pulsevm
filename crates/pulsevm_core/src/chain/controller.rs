@@ -11,6 +11,9 @@ use std::{
 
 use crate::{
     ACTIVE_NAME,
+    MAJORITY_PRODUCERS_PERMISSION_NAME,
+    MINORITY_PRODUCERS_PERMISSION_NAME,
+    PRODS_NAME,
     PULSE_NAME,
     block::{
         BlockStatus,
@@ -83,11 +86,13 @@ use pulsevm_crypto::{
 };
 use pulsevm_error::ChainError;
 use pulsevm_ffi::{
+    Authority,
     BlockTimestamp,
     CxxGenesisState,
     Database,
     ElasticLimitParameters,
     GlobalPropertyObject,
+    PermissionLevelWeight,
     TimePoint,
     UndoSession,
     parse_public_key,
