@@ -3255,6 +3255,30 @@ impl Database {
             .ok_or_else(|| ChainError::InternalError("Database pointer is null".to_owned()))
     }
 
+    /// A permission's authority as an owned value, or `None` if it doesn't exist.
+    ///
+    /// Handing back an owned `Authority` rather than a database-bound reference is
+    /// what lets a caller read a permission, drop the read lock, edit the
+    /// authority, and write it back with [`Database::modify_permission`] — no
+    /// reference held across the mutation and no lock held while editing, so a
+    /// read-modify-write on one permission never has to nest a read inside a
+    /// write.
+    pub fn permission_authority(
+        &self,
+        actor: u64,
+        permission: u64,
+    ) -> Result<Option<Authority>, ChainError> {
+        let guard = self.inner.read()?;
+        let perm = guard
+            .find_permission_by_actor_and_permission(actor, permission)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        // The pointer is only dereferenced while the read guard is alive, and the
+        // authority is copied out before it is dropped.
+        let authority =
+            unsafe { perm.as_ref() }.map(|p| ffi::get_authority_from_shared_authority(p.get_authority()));
+        Ok(authority)
+    }
+
     pub fn modify_permission(
         &mut self,
         actor: u64,
