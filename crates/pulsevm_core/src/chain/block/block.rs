@@ -6,7 +6,6 @@ use pulsevm_ffi::{BlockTimestamp, Database};
 use pulsevm_proc_macros::{NumBytes, Read, Write};
 use pulsevm_serialization::Write;
 use serde::{Serialize, ser::SerializeStruct};
-use spdlog::{info, warn};
 
 use crate::{
     chain::{Name, id::Id, transaction::TransactionReceipt},

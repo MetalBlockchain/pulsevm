@@ -908,7 +908,7 @@ impl Controller {
         );
 
         let executed = (|| -> Result<VecDeque<Digest>, ChainError> {
-            trx_context.init_for_implicit_trx()?;
+            trx_context.init_for_implicit_trx(&trx)?;
             trx_context.exec(&trx)?;
             Ok(trx_context.finalize()?.action_receipt_digests)
         })();
@@ -1397,6 +1397,10 @@ impl Controller {
         }
 
         Ok(())
+    }
+
+    pub fn get_greylist_limit() -> Result<u32, ChainError> {
+        Ok(1000) // TODO: Implement greylist limit
     }
 }
 
@@ -5045,6 +5049,46 @@ mod tests {
             after - before,
             2,
             "expected onblock + newaccount to each advance pulse's recv sequence"
+        );
+
+        Ok(())
+    }
+
+    // onblock executes in microseconds but is billed the configured CPU floor:
+    // init_for_implicit_trx pins its explicit bill to min_transaction_cpu_usage,
+    // and finalize charges that against the block's pending CPU usage. The block
+    // CPU budget must drop by exactly that amount, and the net budget not at all.
+    #[tokio::test]
+    async fn onblock_consumes_min_transaction_cpu_usage() -> Result<(), ChainError> {
+        let (mut controller, _private_key, _chain_id, _temp) = init_test_controller()?;
+
+        let db = controller.database();
+        let min_cpu_us = Controller::get_global_properties(&db)?
+            .get_chain_config()
+            .get_min_transaction_cpu_usage() as u64;
+        assert!(min_cpu_us > 0, "genesis must set a non-zero CPU floor");
+
+        let cpu_before = db.get_block_cpu_limit()?;
+        let net_before = db.get_block_net_limit()?;
+
+        let timestamp: BlockTimestamp = TimePoint::now().into();
+        let previous = controller.preferred_id;
+        let digests =
+            controller.run_onblock(&timestamp, PULSE_NAME, previous, &BlockStatus::Building)?;
+        assert!(
+            !digests.is_empty(),
+            "onblock must have executed rather than been skipped"
+        );
+
+        assert_eq!(
+            db.get_block_cpu_limit()?,
+            cpu_before - min_cpu_us,
+            "onblock must consume exactly min_transaction_cpu_usage from the block CPU budget"
+        );
+        assert_eq!(
+            db.get_block_net_limit()?,
+            net_before,
+            "onblock must not consume any block net"
         );
 
         Ok(())
