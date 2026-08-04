@@ -48,6 +48,7 @@ arena-shadow = ["pulsevm_ffi/arena-shadow"]
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 proptest = "1"
+wat = "1"
 
 [[bench]]
 name = "transfer"

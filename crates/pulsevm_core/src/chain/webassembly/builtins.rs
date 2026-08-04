@@ -803,3 +803,52 @@ pub fn __unordtf2(
 ) -> Result<i32, RuntimeError> {
     Ok(unordtf2(la, ha, lb, hb))
 }
+
+#[cfg(test)]
+mod tests {
+    use pulsevm_ffi::{
+        Float128,
+        addtf3,
+        divtf3,
+        floatsitf,
+        multf3,
+        subtf3,
+        trunctfdf2,
+    };
+
+    fn f128(i: i32) -> Float128 {
+        floatsitf(i)
+    }
+    fn to_f64(x: Float128) -> f64 {
+        trunctfdf2(x.lo, x.hi)
+    }
+
+    // long double (binary128) math runs through Berkeley SoftFloat, not hardware,
+    // so it's bit-exact everywhere. Exact results checked directly; an inexact one
+    // and a NaN are checked to be stable (same bits every call).
+    #[test]
+    fn softfloat_128bit_math_is_exact_and_stable() {
+        let (one, two, three, four, ten) = (f128(1), f128(2), f128(3), f128(4), f128(10));
+
+        // Exact arithmetic.
+        assert_eq!(to_f64(multf3(two.lo, two.hi, three.lo, three.hi)), 6.0);
+        assert_eq!(to_f64(addtf3(three.lo, three.hi, four.lo, four.hi)), 7.0);
+        assert_eq!(to_f64(subtf3(ten.lo, ten.hi, three.lo, three.hi)), 7.0);
+        assert_eq!(to_f64(divtf3(one.lo, one.hi, four.lo, four.hi)), 0.25);
+
+        // 1/3 is inexact — the guarantee is that it is the *same* pattern every
+        // time (and numerically correct), not that it terminates.
+        let a = divtf3(one.lo, one.hi, three.lo, three.hi);
+        let b = divtf3(one.lo, one.hi, three.lo, three.hi);
+        assert_eq!((a.lo, a.hi), (b.lo, b.hi));
+        assert!((to_f64(a) - 1.0f64 / 3.0).abs() < 1e-15);
+
+        // NaN (0/0) propagates to a NaN, with a stable bit pattern.
+        let zero = f128(0);
+        let nan = divtf3(zero.lo, zero.hi, zero.lo, zero.hi);
+        let nan_bits = (nan.lo, nan.hi);
+        assert!(to_f64(nan).is_nan());
+        let nan_again = divtf3(zero.lo, zero.hi, zero.lo, zero.hi);
+        assert_eq!(nan_bits, (nan_again.lo, nan_again.hi));
+    }
+}
