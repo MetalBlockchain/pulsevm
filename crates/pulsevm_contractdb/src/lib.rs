@@ -16,11 +16,19 @@
 //! double), which share one shape — each with its own object table and iterator
 //! cache.
 
-use std::collections::HashMap;
-use std::ops::Bound;
+use std::{
+    collections::HashMap,
+    ops::Bound,
+};
 
 use pulsevm_arena::{
-    ArenaObject, BlobRef, Db, IndexedBy, ObjectId, SecondaryIndex, key_index,
+    ArenaObject,
+    BlobRef,
+    Db,
+    IndexedBy,
+    ObjectId,
+    SecondaryIndex,
+    key_index,
 };
 
 /// RAM overhead billed per row, matching EOS `config::billable_size_v<...>` —
@@ -38,7 +46,12 @@ const TABLE_OVERHEAD: i64 = 112; // billable_size_v<table_id_object>
 /// `(code, scope, table)`.
 #[repr(C)]
 #[derive(
-    Clone, Copy, Default, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable,
+    Clone,
+    Copy,
+    Default,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::Immutable,
     zerocopy::KnownLayout,
 )]
 pub struct TableIdObject {
@@ -74,7 +87,12 @@ impl ArenaObject for TableIdObject {
 /// `chainbase::key_value_object` — one row, keyed by `(t_id, primary_key)`.
 #[repr(C)]
 #[derive(
-    Clone, Copy, Default, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable,
+    Clone,
+    Copy,
+    Default,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::Immutable,
     zerocopy::KnownLayout,
 )]
 pub struct KeyValueObject {
@@ -111,7 +129,12 @@ impl ArenaObject for KeyValueObject {
 /// `key_value_object`.
 #[repr(C)]
 #[derive(
-    Clone, Copy, Default, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable,
+    Clone,
+    Copy,
+    Default,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::Immutable,
     zerocopy::KnownLayout,
 )]
 pub struct Index64Object {
@@ -158,7 +181,12 @@ impl ArenaObject for Index64Object {
 /// `zerocopy::IntoBytes` rejects); [`Index128Object::secondary_key`] rejoins them.
 #[repr(C)]
 #[derive(
-    Clone, Copy, Default, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable,
+    Clone,
+    Copy,
+    Default,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::Immutable,
     zerocopy::KnownLayout,
 )]
 pub struct Index128Object {
@@ -214,7 +242,12 @@ impl ArenaObject for Index128Object {
 /// by `(s0, s1)` so it matches the C++ comparison exactly.
 #[repr(C)]
 #[derive(
-    Clone, Copy, Default, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable,
+    Clone,
+    Copy,
+    Default,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::Immutable,
     zerocopy::KnownLayout,
 )]
 pub struct Index256Object {
@@ -310,7 +343,12 @@ impl Ord for DoubleKey {
 /// ordered by [`DoubleKey`] to match EOS's software-float comparison.
 #[repr(C)]
 #[derive(
-    Clone, Copy, Default, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable,
+    Clone,
+    Copy,
+    Default,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::Immutable,
     zerocopy::KnownLayout,
 )]
 pub struct IndexDoubleObject {
@@ -366,7 +404,12 @@ fn join_u128(lo: u64, hi: u64) -> u128 {
 /// consensus state and must roll back exactly like everything else.
 #[repr(C)]
 #[derive(
-    Clone, Copy, Default, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable,
+    Clone,
+    Copy,
+    Default,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::Immutable,
     zerocopy::KnownLayout,
 )]
 pub struct ResourceUsageObject {
@@ -557,7 +600,10 @@ impl ContractDb {
             .unwrap()
             .map(|u| u.id());
         match existing {
-            Some(id) => self.db.modify::<ResourceUsageObject>(id, |u| u.ram_bytes += delta).unwrap(),
+            Some(id) => self
+                .db
+                .modify::<ResourceUsageObject>(id, |u| u.ram_bytes += delta)
+                .unwrap(),
             None => {
                 self.db
                     .create::<ResourceUsageObject>(|u| {
@@ -707,7 +753,9 @@ impl ContractDb {
         let kv_id = self.cache.kv_of(itr);
         let kv = self.kv(kv_id);
         self.bill(kv.payer, -(kv.value.len as i64 + KV_OVERHEAD));
-        self.db.remove::<KeyValueObject>(ObjectId::new(kv_id)).unwrap();
+        self.db
+            .remove::<KeyValueObject>(ObjectId::new(kv_id))
+            .unwrap();
         self.db
             .modify::<TableIdObject>(ObjectId::new(kv.t_id), |t| t.count -= 1)
             .unwrap();

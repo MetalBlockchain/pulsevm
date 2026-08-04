@@ -1,13 +1,34 @@
 use std::fmt;
 
-use pulsevm_serialization::{NumBytes, Read, ReadError, Write, WriteError};
-use serde::{
-    Deserialize, Deserializer, Serialize, Serializer,
-    de::{self, Visitor},
+use pulsevm_serialization::{
+    NumBytes,
+    Read,
+    ReadError,
+    Write,
+    WriteError,
 };
-use time::{Duration, OffsetDateTime, PrimitiveDateTime, macros::format_description};
+use serde::{
+    Deserialize,
+    Deserializer,
+    Serialize,
+    Serializer,
+    de::{
+        self,
+        Visitor,
+    },
+};
+use time::{
+    Duration,
+    OffsetDateTime,
+    PrimitiveDateTime,
+    macros::format_description,
+};
 
-use crate::{CxxTimePoint, TimePoint, bridge::ffi::BlockTimestamp};
+use crate::{
+    CxxTimePoint,
+    TimePoint,
+    bridge::ffi::BlockTimestamp,
+};
 
 impl BlockTimestamp {
     pub const BLOCK_INTERVAL_MS: i32 = 500;

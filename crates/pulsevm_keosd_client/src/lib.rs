@@ -1,6 +1,9 @@
 use serde::Deserialize;
 use serde_json::Value;
-use std::path::{Path, PathBuf};
+use std::path::{
+    Path,
+    PathBuf,
+};
 use thiserror::Error;
 
 use crate::types::SignedKeosdTransaction;
@@ -135,8 +138,13 @@ async fn unix_post(
     path: &str,
     body: &Value,
 ) -> Result<(u16, Vec<u8>), ClientError> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::UnixStream;
+    use tokio::{
+        io::{
+            AsyncReadExt,
+            AsyncWriteExt,
+        },
+        net::UnixStream,
+    };
 
     let body_bytes = serde_json::to_vec(body)?;
     let request = format!(
@@ -159,8 +167,13 @@ async fn unix_post(
 /// Perform an HTTP GET over a Unix domain socket using raw I/O.
 #[cfg(unix)]
 async fn unix_get(socket_path: &Path, path: &str) -> Result<(u16, Vec<u8>), ClientError> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::UnixStream;
+    use tokio::{
+        io::{
+            AsyncReadExt,
+            AsyncWriteExt,
+        },
+        net::UnixStream,
+    };
 
     let request = format!(
         "GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",

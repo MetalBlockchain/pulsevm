@@ -1,8 +1,15 @@
-use std::{collections::BTreeMap, fmt};
+use std::{
+    collections::BTreeMap,
+    fmt,
+};
 
 use pulsevm_crypto::Digest;
 use pulsevm_error::ChainError;
-use pulsevm_proc_macros::{NumBytes, Read, Write};
+use pulsevm_proc_macros::{
+    NumBytes,
+    Read,
+    Write,
+};
 use pulsevm_serialization::Write;
 
 use crate::chain::name::Name;

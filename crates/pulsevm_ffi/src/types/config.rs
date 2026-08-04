@@ -1,5 +1,11 @@
 use pulsevm_error::ChainError;
-use pulsevm_serialization::{NumBytes, Read, ReadError, Write, WriteError};
+use pulsevm_serialization::{
+    NumBytes,
+    Read,
+    ReadError,
+    Write,
+    WriteError,
+};
 
 use crate::ChainConfigV0;
 

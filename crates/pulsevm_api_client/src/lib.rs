@@ -1,11 +1,27 @@
-use pulsevm_api_types::{AccountResponse, ChainInfoResponse, IssueTxResponse};
+use pulsevm_api_types::{
+    AccountResponse,
+    ChainInfoResponse,
+    IssueTxResponse,
+};
 use pulsevm_core::{
     name::Name,
-    transaction::{PackedTransaction, Transaction},
+    transaction::{
+        PackedTransaction,
+        Transaction,
+    },
 };
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
-use std::sync::atomic::{AtomicU64, Ordering};
+use serde::{
+    Deserialize,
+    Serialize,
+};
+use serde_json::{
+    Value,
+    json,
+};
+use std::sync::atomic::{
+    AtomicU64,
+    Ordering,
+};
 use thiserror::Error;
 
 // ---------------------------------------------------------------------------
@@ -221,9 +237,8 @@ impl PulseVmClient {
     ///
     /// let trx = Transaction::default();
     ///
-    /// let candidate_keys = vec![
-    ///     "PUB_K1_8fsJkG5ka4o1G1wBhySUavHuGqstcjtXMrquxiRWVcYw8ZvZLX".to_string(),
-    /// ];
+    /// let candidate_keys =
+    ///     vec!["PUB_K1_8fsJkG5ka4o1G1wBhySUavHuGqstcjtXMrquxiRWVcYw8ZvZLX".to_string()];
     ///
     /// let required = client.get_required_keys(&trx, &candidate_keys).await?;
     /// println!("Required keys: {:?}", required);

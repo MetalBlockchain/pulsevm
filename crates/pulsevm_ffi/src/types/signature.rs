@@ -1,6 +1,10 @@
 use crate::{
     CxxSignature,
-    bridge::ffi::{packed_signature_bytes, signature_num_bytes, signature_to_string},
+    bridge::ffi::{
+        packed_signature_bytes,
+        signature_num_bytes,
+        signature_to_string,
+    },
 };
 
 impl CxxSignature {

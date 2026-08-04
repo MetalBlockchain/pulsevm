@@ -1,17 +1,38 @@
 use std::{
     fmt,
-    ops::{Add, AddAssign},
+    ops::{
+        Add,
+        AddAssign,
+    },
     str::FromStr,
 };
 
-use pulsevm_serialization::{NumBytes, Read, Write};
-use serde::{
-    Deserialize, Deserializer, Serialize, Serializer,
-    de::{self, Visitor},
+use pulsevm_serialization::{
+    NumBytes,
+    Read,
+    Write,
 };
-use time::{OffsetDateTime, PrimitiveDateTime, macros::format_description};
+use serde::{
+    Deserialize,
+    Deserializer,
+    Serialize,
+    Serializer,
+    de::{
+        self,
+        Visitor,
+    },
+};
+use time::{
+    OffsetDateTime,
+    PrimitiveDateTime,
+    macros::format_description,
+};
 
-use crate::{TimePoint, bridge::ffi::TimePointSec, types::time::seconds};
+use crate::{
+    TimePoint,
+    bridge::ffi::TimePointSec,
+    types::time::seconds,
+};
 
 // Base EOS format (no 'Z')
 const EOS_FMT_NOZ: &[time::format_description::FormatItem<'_>] =

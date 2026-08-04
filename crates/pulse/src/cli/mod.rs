@@ -5,7 +5,10 @@ pub mod set;
 pub mod transfer;
 pub mod wallet;
 
-use clap::{Parser, Subcommand};
+use clap::{
+    Parser,
+    Subcommand,
+};
 
 use crate::logging::LogLevel;
 
@@ -72,7 +75,8 @@ pub enum Commands {
         /// The contract that controls the token, defaults to pulse.token
         #[arg(short, long, default_value = "pulse.token")]
         contract: String,
-        /// An account and permission level to authorize, as in 'account@permission' (defaults to 'sender@active')
+        /// An account and permission level to authorize, as in 'account@permission' (defaults to
+        /// 'sender@active')
         #[arg(short, long)]
         permission: Option<String>,
     },
@@ -93,7 +97,8 @@ pub enum CreateSubcommand {
     },
     /// Create a new keypair and print the public and private keys
     Key {
-        /// Name of file to write private/public key output to. (Must be set, unless "--to-console" is passed
+        /// Name of file to write private/public key output to. (Must be set, unless "--to-console"
+        /// is passed
         #[arg(short, long)]
         file: Option<String>,
         /// Print private/public keys to console

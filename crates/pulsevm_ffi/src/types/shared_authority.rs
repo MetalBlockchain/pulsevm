@@ -1,6 +1,9 @@
 use crate::{
     Authority,
-    bridge::ffi::{CxxSharedAuthority, get_authority_from_shared_authority},
+    bridge::ffi::{
+        CxxSharedAuthority,
+        get_authority_from_shared_authority,
+    },
 };
 
 impl CxxSharedAuthority {

@@ -1,8 +1,20 @@
-use std::{cmp::Ordering, fmt};
+use std::{
+    cmp::Ordering,
+    fmt,
+};
 
 use pulsevm_name::Name;
-use pulsevm_serialization::{NumBytes, Read, Write, WriteError};
-use serde::{Deserialize, Serialize, ser::SerializeStruct};
+use pulsevm_serialization::{
+    NumBytes,
+    Read,
+    Write,
+    WriteError,
+};
+use serde::{
+    Deserialize,
+    Serialize,
+    ser::SerializeStruct,
+};
 
 use crate::bridge::ffi::PermissionLevel;
 

@@ -1,5 +1,12 @@
-use criterion::{Criterion, criterion_group, criterion_main};
-use pulsevm_serialization::{Read, Write};
+use criterion::{
+    Criterion,
+    criterion_group,
+    criterion_main,
+};
+use pulsevm_serialization::{
+    Read,
+    Write,
+};
 use std::hint::black_box;
 
 fn bench(value: &Vec<u8>) {

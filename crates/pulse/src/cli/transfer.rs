@@ -1,14 +1,28 @@
-use std::{str::FromStr, sync::Arc};
+use std::{
+    str::FromStr,
+    sync::Arc,
+};
 
 use pulsevm_api_client::PulseVmClient;
 use pulsevm_core::{
-    ACTIVE_NAME, asset::Asset, authority::PermissionLevel, name::Name, transaction::Action,
+    ACTIVE_NAME,
+    asset::Asset,
+    authority::PermissionLevel,
+    name::Name,
+    transaction::Action,
 };
 use pulsevm_keosd_client::KeosdClient;
-use pulsevm_proc_macros::{NumBytes, Read, Write};
+use pulsevm_proc_macros::{
+    NumBytes,
+    Read,
+    Write,
+};
 use pulsevm_serialization::Write;
 
-use crate::{config::Config, utils::push_actions};
+use crate::{
+    config::Config,
+    utils::push_actions,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Read, Write, NumBytes)]
 pub struct Transfer {

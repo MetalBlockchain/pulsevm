@@ -12,13 +12,24 @@
 
 use std::collections::BTreeMap;
 
-use proptest::collection::vec;
-use proptest::prelude::*;
-use pulsevm_arena::{ArenaObject, ObjectId, Table};
+use proptest::{
+    collection::vec,
+    prelude::*,
+};
+use pulsevm_arena::{
+    ArenaObject,
+    ObjectId,
+    Table,
+};
 
 #[repr(C)]
 #[derive(
-    Clone, Copy, Default, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable,
+    Clone,
+    Copy,
+    Default,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::Immutable,
     zerocopy::KnownLayout,
 )]
 struct Row {

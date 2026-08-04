@@ -1,8 +1,13 @@
-use wasmer::{FunctionEnvMut, RuntimeError, WasmPtr};
+use wasmer::{
+    FunctionEnvMut,
+    RuntimeError,
+    WasmPtr,
+};
 
 use crate::wasm_runtime::WasmContext;
 
-// TODO: Implement console functions to log output from WASM modules. For now, these functions are no-ops to avoid unnecessary overhead in the current implementation.
+// TODO: Implement console functions to log output from WASM modules. For now, these functions are
+// no-ops to avoid unnecessary overhead in the current implementation.
 
 pub fn prints(
     _env: FunctionEnvMut<WasmContext>,

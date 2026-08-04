@@ -1,36 +1,68 @@
 use core::fmt;
 use std::{
-    collections::{BTreeSet, HashMap, HashSet, VecDeque},
+    collections::{
+        BTreeSet,
+        HashMap,
+        HashSet,
+        VecDeque,
+    },
     sync::LazyLock,
 };
 
 use crate::{
-    ACTIVE_NAME, PULSE_NAME,
-    block::{BlockStatus, SignedBlock},
+    ACTIVE_NAME,
+    PULSE_NAME,
+    block::{
+        BlockStatus,
+        SignedBlock,
+    },
     chain::{
         apply_context::ApplyContext,
         authority::PermissionLevel,
         authorization_manager::AuthorizationManager,
         block::BlockHeader,
         config::{
-            DELETEAUTH_NAME, LINKAUTH_NAME, NEWACCOUNT_NAME, ONBLOCK_NAME, SETABI_NAME,
-            SETCODE_NAME, UNLINKAUTH_NAME, UPDATEAUTH_NAME, eos_percent,
+            DELETEAUTH_NAME,
+            LINKAUTH_NAME,
+            NEWACCOUNT_NAME,
+            ONBLOCK_NAME,
+            SETABI_NAME,
+            SETCODE_NAME,
+            UNLINKAUTH_NAME,
+            UPDATEAUTH_NAME,
+            eos_percent,
         },
         crypto::PublicKey,
         id::Id,
         mempool::Mempool,
         name::Name,
-        producer_schedule::{ProducerKey, ProducerSchedule},
+        producer_schedule::{
+            ProducerKey,
+            ProducerSchedule,
+        },
         pulse_contract::{
-            deleteauth, linkauth, newaccount, setabi, setcode, unlinkauth, updateauth,
+            deleteauth,
+            linkauth,
+            newaccount,
+            setabi,
+            setcode,
+            unlinkauth,
+            updateauth,
         },
         resource_limits::ResourceLimitsManager,
         state_history::StateHistoryLog,
         transaction::{
-            PackedTransaction, SignedTransaction, Transaction, TransactionHeader,
-            TransactionReceipt, TransactionTrace,
+            PackedTransaction,
+            SignedTransaction,
+            Transaction,
+            TransactionHeader,
+            TransactionReceipt,
+            TransactionTrace,
         },
-        transaction_context::{TransactionContext, TransactionResult},
+        transaction_context::{
+            TransactionContext,
+            TransactionResult,
+        },
         utils::make_ratio,
         wasm_runtime::WasmRuntime,
     },
@@ -38,20 +70,40 @@ use crate::{
     transaction::Action,
 };
 
+use cxx::UniquePtr;
 use pulsevm_constants::{
-    BLOCK_CPU_USAGE_AVERAGE_WINDOW_MS, BLOCK_INTERVAL_MS, BLOCK_SIZE_AVERAGE_WINDOW_MS,
+    BLOCK_CPU_USAGE_AVERAGE_WINDOW_MS,
+    BLOCK_INTERVAL_MS,
+    BLOCK_SIZE_AVERAGE_WINDOW_MS,
     MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER,
 };
-use pulsevm_crypto::{Digest, merkle};
+use pulsevm_crypto::{
+    Digest,
+    merkle,
+};
 use pulsevm_error::ChainError;
-use cxx::UniquePtr;
 use pulsevm_ffi::{
-    BlockTimestamp, CxxGenesisState, Database, ElasticLimitParameters, GlobalPropertyObject,
-    TimePoint, UndoSession, parse_public_key, seconds,
+    BlockTimestamp,
+    CxxGenesisState,
+    Database,
+    ElasticLimitParameters,
+    GlobalPropertyObject,
+    TimePoint,
+    UndoSession,
+    parse_public_key,
+    seconds,
 };
 use pulsevm_grpc::vm;
-use pulsevm_serialization::{Read, Write};
-use spdlog::{debug, error, info, warn};
+use pulsevm_serialization::{
+    Read,
+    Write,
+};
+use spdlog::{
+    debug,
+    error,
+    info,
+    warn,
+};
 
 pub type ApplyHandlerFn = fn(&mut ApplyContext, &mut Database, &Action) -> Result<(), ChainError>;
 pub type ApplyHandlerMap = HashMap<
@@ -507,9 +559,10 @@ impl Controller {
 
         // Don't build a block if we have no transactions
         if transaction_receipts.len() == 0 {
-            block_session.pin_mut().undo().map_err(|e| {
-                ChainError::DatabaseError(format!("failed to undo changes: {}", e))
-            })?;
+            block_session
+                .pin_mut()
+                .undo()
+                .map_err(|e| ChainError::DatabaseError(format!("failed to undo changes: {}", e)))?;
             db.arena_undo(); // discard the empty block's session on both
             return Err(ChainError::NetworkError(format!(
                 "built block has no transactions"
@@ -654,12 +707,14 @@ impl Controller {
         schedule: &ProducerSchedule,
     ) -> Result<(), ChainError> {
         let header = &block.signed_block_header.header;
-        let expected = schedule.block_signing_key(&header.producer).ok_or_else(|| {
-            ChainError::BlockError(format!(
-                "block producer {} is not in the active schedule",
-                header.producer
-            ))
-        })?;
+        let expected = schedule
+            .block_signing_key(&header.producer)
+            .ok_or_else(|| {
+                ChainError::BlockError(format!(
+                    "block producer {} is not in the active schedule",
+                    header.producer
+                ))
+            })?;
         let digest: crate::utils::Digest = header.sig_digest()?.0.into();
         let signer = block
             .signed_block_header
@@ -993,7 +1048,10 @@ impl Controller {
             PULSE_NAME,
             ONBLOCK_NAME,
             header_bytes,
-            vec![PermissionLevel::new(PULSE_NAME.as_u64(), ACTIVE_NAME.as_u64())],
+            vec![PermissionLevel::new(
+                PULSE_NAME.as_u64(),
+                ACTIVE_NAME.as_u64(),
+            )],
         );
         let trx = Transaction::new(TransactionHeader::default(), vec![], vec![action]);
         let packed = PackedTransaction::from_signed_transaction(SignedTransaction::new(
@@ -1042,7 +1100,15 @@ impl Controller {
         block: &SignedBlock,
         block_status: &BlockStatus,
         mempool: &mut Mempool,
-    ) -> Result<(Vec<TransactionTrace>, Digest, Digest, Option<Vec<ProducerKey>>), ChainError> {
+    ) -> Result<
+        (
+            Vec<TransactionTrace>,
+            Digest,
+            Digest,
+            Option<Vec<ProducerKey>>,
+        ),
+        ChainError,
+    > {
         let mut transaction_traces: Vec<TransactionTrace> = Vec::new();
         let mut transaction_receipts: VecDeque<TransactionReceipt> = VecDeque::new();
         let mut action_receipt_digests: VecDeque<Digest> = VecDeque::new();
@@ -1169,7 +1235,12 @@ impl Controller {
         pending_block_timestamp: &BlockTimestamp,
         block_status: &BlockStatus,
     ) -> Result<TransactionResult, ChainError> {
-        self.execute_transaction_billed(packed_transaction, pending_block_timestamp, block_status, None)
+        self.execute_transaction_billed(
+            packed_transaction,
+            pending_block_timestamp,
+            block_status,
+            None,
+        )
     }
 
     /// As `execute_transaction`, but when `explicit_billed` is set (applying an
@@ -1513,26 +1584,55 @@ impl Controller {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path, str::FromStr, sync::Arc, vec};
+    use std::{
+        fs,
+        path::Path,
+        str::FromStr,
+        sync::Arc,
+        vec,
+    };
 
-    use pulsevm_ffi::{Authority, KeyWeight, TimePointSec};
-    use pulsevm_proc_macros::{NumBytes, Read, Write};
+    use pulsevm_ffi::{
+        Authority,
+        KeyWeight,
+        TimePointSec,
+    };
+    use pulsevm_proc_macros::{
+        NumBytes,
+        Read,
+        Write,
+    };
     use pulsevm_serialization::Write;
     use serde_json::json;
     use tempfile::TempDir;
-    use tokio::runtime;
-    use tokio::sync::RwLock;
+    use tokio::{
+        runtime,
+        sync::RwLock,
+    };
 
     use crate::{
         ACTIVE_NAME,
         chain::{
-            asset::{Asset, Symbol},
-            authority::PermissionLevel,
             abi::AbiDefinition,
-            pulse_contract::{
-                DeleteAuth, LinkAuth, NewAccount, SetAbi, SetCode, UnlinkAuth, UpdateAuth,
+            asset::{
+                Asset,
+                Symbol,
             },
-            transaction::{Action, Transaction, TransactionHeader},
+            authority::PermissionLevel,
+            pulse_contract::{
+                DeleteAuth,
+                LinkAuth,
+                NewAccount,
+                SetAbi,
+                SetCode,
+                UnlinkAuth,
+                UpdateAuth,
+            },
+            transaction::{
+                Action,
+                Transaction,
+                TransactionHeader,
+            },
         },
         crypto::PrivateKey,
     };
@@ -2003,7 +2103,9 @@ mod tests {
         )?);
         let block = controller.build_block(&mut mempool).await?;
         assert_eq!(
-            controller.database().arena_account_metadata_privileged(name),
+            controller
+                .database()
+                .arena_account_metadata_privileged(name),
             None,
             "build_block left a speculative account in the arena"
         );
@@ -2062,8 +2164,7 @@ mod tests {
             .unwrap()
             .parent()
             .unwrap();
-        let wasm =
-            fs::read(root.join(Path::new("reference_contracts/pulse_token.wasm"))).unwrap();
+        let wasm = fs::read(root.join(Path::new("reference_contracts/pulse_token.wasm"))).unwrap();
 
         // One block: create glenn, then set its code. Both must be committed by
         // accept_block for the metadata comparison to be against durable state.
@@ -2202,7 +2303,10 @@ mod tests {
             chain_perm.get_parent_id(),
             "mirrored permission parent id diverged from chainbase"
         );
-        assert_eq!(threshold, 1, "mirrored authority threshold did not round-trip");
+        assert_eq!(
+            threshold, 1,
+            "mirrored authority threshold did not round-trip"
+        );
         Ok(())
     }
 
@@ -2277,7 +2381,11 @@ mod tests {
             chain_link.get_required_permission(),
             "mirrored permission link required_permission diverged from chainbase"
         );
-        assert_eq!(required, perm.as_u64(), "link did not point at the new permission");
+        assert_eq!(
+            required,
+            perm.as_u64(),
+            "link did not point at the new permission"
+        );
         Ok(())
     }
 
@@ -2400,8 +2508,7 @@ mod tests {
             .unwrap()
             .parent()
             .unwrap();
-        let wasm =
-            fs::read(root.join(Path::new("reference_contracts/pulse_token.wasm"))).unwrap();
+        let wasm = fs::read(root.join(Path::new("reference_contracts/pulse_token.wasm"))).unwrap();
         let abi = AbiDefinition {
             version: "eosio::abi/1.2".to_string(),
             types: vec![],
@@ -2473,8 +2580,7 @@ mod tests {
             .unwrap()
             .parent()
             .unwrap();
-        let wasm =
-            fs::read(root.join(Path::new("reference_contracts/pulse_token.wasm"))).unwrap();
+        let wasm = fs::read(root.join(Path::new("reference_contracts/pulse_token.wasm"))).unwrap();
         let abi = AbiDefinition {
             version: "eosio::abi/1.2".to_string(),
             types: vec![],
@@ -2606,8 +2712,14 @@ mod tests {
         let arena_seq = db
             .arena_global_action_sequence()
             .expect("arena is missing the dynamic_global_property row");
-        assert_eq!(arena_seq, chain_seq, "mirrored global_action_sequence diverged");
-        assert!(chain_seq > 0, "expected applied actions to advance the sequence");
+        assert_eq!(
+            arena_seq, chain_seq,
+            "mirrored global_action_sequence diverged"
+        );
+        assert!(
+            chain_seq > 0,
+            "expected applied actions to advance the sequence"
+        );
         Ok(())
     }
 
@@ -2656,7 +2768,10 @@ mod tests {
         let arena = db
             .arena_virtual_limits()
             .expect("arena is missing the resource_limits state row");
-        assert_eq!(arena, chain, "mirrored virtual limits diverged from chainbase");
+        assert_eq!(
+            arena, chain,
+            "mirrored virtual limits diverged from chainbase"
+        );
         assert!(
             chain.0 > 0 && chain.1 > 0,
             "expected non-zero virtual limits after a block"
@@ -2758,8 +2873,7 @@ mod tests {
             .unwrap()
             .parent()
             .unwrap();
-        let wasm =
-            fs::read(root.join(Path::new("reference_contracts/pulse_token.wasm"))).unwrap();
+        let wasm = fs::read(root.join(Path::new("reference_contracts/pulse_token.wasm"))).unwrap();
         let abi = AbiDefinition {
             version: "eosio::abi/1.2".to_string(),
             types: vec![],
@@ -2778,8 +2892,22 @@ mod tests {
         mempool.add_transaction(create_tx);
         mempool.add_transaction(set_code(&private_key, glenn, wasm, chain_id)?);
         mempool.add_transaction(set_abi(&private_key, glenn, abi.pack().unwrap(), chain_id)?);
-        mempool.add_transaction(update_auth(&private_key, glenn, perm, ACTIVE_NAME, 1, chain_id)?);
-        mempool.add_transaction(link_auth(&private_key, glenn, glenn, msg_type, perm, chain_id)?);
+        mempool.add_transaction(update_auth(
+            &private_key,
+            glenn,
+            perm,
+            ACTIVE_NAME,
+            1,
+            chain_id,
+        )?);
+        mempool.add_transaction(link_auth(
+            &private_key,
+            glenn,
+            glenn,
+            msg_type,
+            perm,
+            chain_id,
+        )?);
         let block = controller.build_block(&mut mempool).await?;
         controller.accept_block(&block.id()?, &mut mempool)?;
 
@@ -2787,12 +2915,17 @@ mod tests {
         let name = glenn.as_u64();
 
         // account_object + account_metadata_object, field for field.
-        assert!(!db.find_account(name)?.is_null(), "chainbase account missing");
+        assert!(
+            !db.find_account(name)?.is_null(),
+            "chainbase account missing"
+        );
         assert!(db.arena_account_exists(name), "arena account missing");
         let ptr = db.find_account_metadata(name)?;
         assert!(!ptr.is_null());
         let meta = unsafe { &*ptr };
-        let arena_meta = db.arena_account_metadata(name).expect("arena metadata missing");
+        let arena_meta = db
+            .arena_account_metadata(name)
+            .expect("arena metadata missing");
         assert_eq!(arena_meta.privileged, meta.is_privileged());
         assert_eq!(arena_meta.recv_sequence, meta.get_recv_sequence());
         assert_eq!(arena_meta.auth_sequence, meta.get_auth_sequence());
@@ -2827,7 +2960,9 @@ mod tests {
         // permission + permission_link created by updateauth/linkauth.
         let perm_ptr = db.find_permission_by_actor_and_permission(name, perm.as_u64())?;
         assert!(!perm_ptr.is_null());
-        let (parent, _threshold) = db.arena_permission(name, perm.as_u64()).expect("arena perm");
+        let (parent, _threshold) = db
+            .arena_permission(name, perm.as_u64())
+            .expect("arena perm");
         assert_eq!(parent, unsafe { &*perm_ptr }.get_parent_id());
         let link_ptr = db.find_permission_link(name, name, msg_type.as_u64())?;
         assert!(!link_ptr.is_null());
@@ -2859,7 +2994,10 @@ mod tests {
     #[cfg(feature = "arena-shadow")]
     #[tokio::test]
     async fn oracle_cross_impl_account_metadata_root() -> Result<(), ChainError> {
-        use sha2::{Digest, Sha256};
+        use sha2::{
+            Digest,
+            Sha256,
+        };
 
         let chain_id =
             Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
@@ -2891,8 +3029,7 @@ mod tests {
             .unwrap()
             .parent()
             .unwrap();
-        let wasm =
-            fs::read(root.join(Path::new("reference_contracts/pulse_token.wasm"))).unwrap();
+        let wasm = fs::read(root.join(Path::new("reference_contracts/pulse_token.wasm"))).unwrap();
         let abi = AbiDefinition {
             version: "eosio::abi/1.2".to_string(),
             types: vec![],
@@ -2948,7 +3085,10 @@ mod tests {
     #[cfg(feature = "arena-shadow")]
     #[tokio::test]
     async fn oracle_cross_impl_account_root() -> Result<(), ChainError> {
-        use sha2::{Digest, Sha256};
+        use sha2::{
+            Digest,
+            Sha256,
+        };
 
         let chain_id =
             Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
@@ -3001,8 +3141,14 @@ mod tests {
         );
         let chain_root: [u8; 32] = Sha256::digest(&chain_bytes).into();
         let arena_root: [u8; 32] = Sha256::digest(&arena_bytes).into();
-        assert_eq!(chain_root, arena_root, "cross-impl account_object state root diverged");
-        assert!(chain_bytes.len() > 16, "expected multiple accounts with abi data");
+        assert_eq!(
+            chain_root, arena_root,
+            "cross-impl account_object state root diverged"
+        );
+        assert!(
+            chain_bytes.len() > 16,
+            "expected multiple accounts with abi data"
+        );
         Ok(())
     }
 
@@ -3016,7 +3162,10 @@ mod tests {
     #[cfg(feature = "arena-shadow")]
     #[tokio::test]
     async fn oracle_cross_impl_permission_root() -> Result<(), ChainError> {
-        use sha2::{Digest, Sha256};
+        use sha2::{
+            Digest,
+            Sha256,
+        };
 
         let chain_id =
             Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
@@ -3064,8 +3213,14 @@ mod tests {
         );
         let chain_root: [u8; 32] = Sha256::digest(&chain_bytes).into();
         let arena_root: [u8; 32] = Sha256::digest(&arena_bytes).into();
-        assert_eq!(chain_root, arena_root, "cross-impl permission state root diverged");
-        assert!(!chain_bytes.is_empty(), "expected permissions in the enumeration");
+        assert_eq!(
+            chain_root, arena_root,
+            "cross-impl permission state root diverged"
+        );
+        assert!(
+            !chain_bytes.is_empty(),
+            "expected permissions in the enumeration"
+        );
         Ok(())
     }
 
@@ -3079,7 +3234,10 @@ mod tests {
     #[cfg(feature = "arena-shadow")]
     #[tokio::test]
     async fn oracle_cross_impl_full_state_root() -> Result<(), ChainError> {
-        use sha2::{Digest, Sha256};
+        use sha2::{
+            Digest,
+            Sha256,
+        };
 
         let chain_id =
             Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
@@ -3113,8 +3271,7 @@ mod tests {
             .unwrap()
             .parent()
             .unwrap();
-        let wasm =
-            fs::read(root.join(Path::new("reference_contracts/pulse_token.wasm"))).unwrap();
+        let wasm = fs::read(root.join(Path::new("reference_contracts/pulse_token.wasm"))).unwrap();
         let abi = AbiDefinition {
             version: "eosio::abi/1.2".to_string(),
             types: vec![],
@@ -3131,24 +3288,81 @@ mod tests {
         mempool.add_transaction(create_account(&private_key, glenn, chain_id)?);
         mempool.add_transaction(set_code(&private_key, glenn, wasm, chain_id)?);
         mempool.add_transaction(set_abi(&private_key, glenn, abi.pack().unwrap(), chain_id)?);
-        mempool.add_transaction(update_auth(&private_key, glenn, perm, ACTIVE_NAME, 1, chain_id)?);
-        mempool.add_transaction(link_auth(&private_key, glenn, glenn, msg_type, perm, chain_id)?);
+        mempool.add_transaction(update_auth(
+            &private_key,
+            glenn,
+            perm,
+            ACTIVE_NAME,
+            1,
+            chain_id,
+        )?);
+        mempool.add_transaction(link_auth(
+            &private_key,
+            glenn,
+            glenn,
+            msg_type,
+            perm,
+            chain_id,
+        )?);
         let block = controller.build_block(&mut mempool).await?;
         controller.accept_block(&block.id()?, &mut mempool)?;
 
         let db = controller.database();
         // (table name, chainbase bytes, arena bytes)
         let tables: Vec<(&str, Vec<u8>, Vec<u8>)> = vec![
-            ("account_metadata", db.account_metadata_state_bytes()?, db.arena_account_metadata_state_bytes().unwrap()),
-            ("account", db.account_state_bytes()?, db.arena_account_state_bytes().unwrap()),
-            ("permission", db.permission_state_bytes()?, db.arena_permission_state_bytes().unwrap()),
-            ("permission_link", db.permission_link_state_bytes()?, db.arena_permission_link_state_bytes().unwrap()),
-            ("code", db.code_state_bytes()?, db.arena_code_state_bytes().unwrap()),
-            ("transaction", db.transaction_state_bytes()?, db.arena_transaction_state_bytes().unwrap()),
-            ("resource_usage", db.resource_usage_state_bytes()?, db.arena_resource_usage_state_bytes().unwrap()),
-            ("resource_limits", db.account_limits_state_bytes()?, db.arena_account_limits_state_bytes().unwrap()),
-            ("resource_state", db.resource_state_bytes()?, db.arena_resource_state_bytes().unwrap()),
-            ("dynamic_global_property", db.get_global_action_sequence()?.to_le_bytes().to_vec(), db.arena_global_action_sequence().unwrap().to_le_bytes().to_vec()),
+            (
+                "account_metadata",
+                db.account_metadata_state_bytes()?,
+                db.arena_account_metadata_state_bytes().unwrap(),
+            ),
+            (
+                "account",
+                db.account_state_bytes()?,
+                db.arena_account_state_bytes().unwrap(),
+            ),
+            (
+                "permission",
+                db.permission_state_bytes()?,
+                db.arena_permission_state_bytes().unwrap(),
+            ),
+            (
+                "permission_link",
+                db.permission_link_state_bytes()?,
+                db.arena_permission_link_state_bytes().unwrap(),
+            ),
+            (
+                "code",
+                db.code_state_bytes()?,
+                db.arena_code_state_bytes().unwrap(),
+            ),
+            (
+                "transaction",
+                db.transaction_state_bytes()?,
+                db.arena_transaction_state_bytes().unwrap(),
+            ),
+            (
+                "resource_usage",
+                db.resource_usage_state_bytes()?,
+                db.arena_resource_usage_state_bytes().unwrap(),
+            ),
+            (
+                "resource_limits",
+                db.account_limits_state_bytes()?,
+                db.arena_account_limits_state_bytes().unwrap(),
+            ),
+            (
+                "resource_state",
+                db.resource_state_bytes()?,
+                db.arena_resource_state_bytes().unwrap(),
+            ),
+            (
+                "dynamic_global_property",
+                db.get_global_action_sequence()?.to_le_bytes().to_vec(),
+                db.arena_global_action_sequence()
+                    .unwrap()
+                    .to_le_bytes()
+                    .to_vec(),
+            ),
         ];
 
         let mut chain_root = Sha256::new();
@@ -3165,10 +3379,19 @@ mod tests {
         }
         let chain_root: [u8; 32] = chain_root.finalize().into();
         let arena_root: [u8; 32] = arena_root.finalize().into();
-        assert_eq!(chain_root, arena_root, "full-state cross-impl root diverged");
+        assert_eq!(
+            chain_root, arena_root,
+            "full-state cross-impl root diverged"
+        );
 
         // Sanity: the populated tables are non-empty on both sides.
-        for name in ["account_metadata", "account", "permission", "code", "resource_usage"] {
+        for name in [
+            "account_metadata",
+            "account",
+            "permission",
+            "code",
+            "resource_usage",
+        ] {
             let (_, chain_bytes, _) = tables.iter().find(|t| t.0 == name).unwrap();
             assert!(!chain_bytes.is_empty(), "expected {name} to be populated");
         }
@@ -3188,7 +3411,10 @@ mod tests {
     #[cfg(feature = "arena-shadow")]
     #[tokio::test]
     async fn oracle_cross_impl_contract_root() -> Result<(), ChainError> {
-        use sha2::{Digest, Sha256};
+        use sha2::{
+            Digest,
+            Sha256,
+        };
 
         let chain_id =
             Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
@@ -3220,8 +3446,7 @@ mod tests {
             .unwrap()
             .parent()
             .unwrap();
-        let wasm =
-            fs::read(root.join(Path::new("reference_contracts/pulse_token.wasm"))).unwrap();
+        let wasm = fs::read(root.join(Path::new("reference_contracts/pulse_token.wasm"))).unwrap();
 
         mempool.add_transaction(create_account(&private_key, glenn, chain_id)?);
         mempool.add_transaction(set_code(&private_key, glenn, wasm, chain_id)?);
@@ -3240,13 +3465,24 @@ mod tests {
 
         let db = controller.database();
         let tables: Vec<(&str, Vec<u8>, Vec<u8>)> = vec![
-            ("table_id", db.contract_table_state_bytes()?, db.arena_contract_table_state_bytes().unwrap()),
-            ("key_value", db.contract_kv_state_bytes()?, db.arena_contract_kv_state_bytes().unwrap()),
+            (
+                "table_id",
+                db.contract_table_state_bytes()?,
+                db.arena_contract_table_state_bytes().unwrap(),
+            ),
+            (
+                "key_value",
+                db.contract_kv_state_bytes()?,
+                db.arena_contract_kv_state_bytes().unwrap(),
+            ),
         ];
         let mut chain_root = Sha256::new();
         let mut arena_root = Sha256::new();
         for (name, chain_bytes, arena_bytes) in &tables {
-            assert_eq!(chain_bytes, arena_bytes, "cross-impl contract state diverged for {name}");
+            assert_eq!(
+                chain_bytes, arena_bytes,
+                "cross-impl contract state diverged for {name}"
+            );
             chain_root.update(chain_bytes);
             arena_root.update(arena_bytes);
         }
@@ -3255,8 +3491,14 @@ mod tests {
             <[u8; 32]>::from(arena_root.finalize()),
             "cross-impl contract root diverged"
         );
-        assert!(!tables[0].1.is_empty(), "expected the create action to make a table");
-        assert!(!tables[1].1.is_empty(), "expected the create action to store a row");
+        assert!(
+            !tables[0].1.is_empty(),
+            "expected the create action to make a table"
+        );
+        assert!(
+            !tables[1].1.is_empty(),
+            "expected the create action to store a row"
+        );
         Ok(())
     }
 
@@ -3264,20 +3506,73 @@ mod tests {
     /// full-state root — the 10 block-populated tables plus the two contract
     /// primary tables (empty unless a contract wrote rows).
     #[cfg(feature = "arena-shadow")]
-    fn cross_impl_tables(db: &Database) -> Result<Vec<(&'static str, Vec<u8>, Vec<u8>)>, ChainError> {
+    fn cross_impl_tables(
+        db: &Database,
+    ) -> Result<Vec<(&'static str, Vec<u8>, Vec<u8>)>, ChainError> {
         Ok(vec![
-            ("account_metadata", db.account_metadata_state_bytes()?, db.arena_account_metadata_state_bytes().unwrap_or_default()),
-            ("account", db.account_state_bytes()?, db.arena_account_state_bytes().unwrap_or_default()),
-            ("permission", db.permission_state_bytes()?, db.arena_permission_state_bytes().unwrap_or_default()),
-            ("permission_link", db.permission_link_state_bytes()?, db.arena_permission_link_state_bytes().unwrap_or_default()),
-            ("code", db.code_state_bytes()?, db.arena_code_state_bytes().unwrap_or_default()),
-            ("transaction", db.transaction_state_bytes()?, db.arena_transaction_state_bytes().unwrap_or_default()),
-            ("resource_usage", db.resource_usage_state_bytes()?, db.arena_resource_usage_state_bytes().unwrap_or_default()),
-            ("resource_limits", db.account_limits_state_bytes()?, db.arena_account_limits_state_bytes().unwrap_or_default()),
-            ("resource_state", db.resource_state_bytes()?, db.arena_resource_state_bytes().unwrap_or_default()),
-            ("dynamic_global_property", db.get_global_action_sequence()?.to_le_bytes().to_vec(), db.arena_global_action_sequence().unwrap_or(0).to_le_bytes().to_vec()),
-            ("contract_table", db.contract_table_state_bytes()?, db.arena_contract_table_state_bytes().unwrap_or_default()),
-            ("contract_key_value", db.contract_kv_state_bytes()?, db.arena_contract_kv_state_bytes().unwrap_or_default()),
+            (
+                "account_metadata",
+                db.account_metadata_state_bytes()?,
+                db.arena_account_metadata_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "account",
+                db.account_state_bytes()?,
+                db.arena_account_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "permission",
+                db.permission_state_bytes()?,
+                db.arena_permission_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "permission_link",
+                db.permission_link_state_bytes()?,
+                db.arena_permission_link_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "code",
+                db.code_state_bytes()?,
+                db.arena_code_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "transaction",
+                db.transaction_state_bytes()?,
+                db.arena_transaction_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "resource_usage",
+                db.resource_usage_state_bytes()?,
+                db.arena_resource_usage_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "resource_limits",
+                db.account_limits_state_bytes()?,
+                db.arena_account_limits_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "resource_state",
+                db.resource_state_bytes()?,
+                db.arena_resource_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "dynamic_global_property",
+                db.get_global_action_sequence()?.to_le_bytes().to_vec(),
+                db.arena_global_action_sequence()
+                    .unwrap_or(0)
+                    .to_le_bytes()
+                    .to_vec(),
+            ),
+            (
+                "contract_table",
+                db.contract_table_state_bytes()?,
+                db.arena_contract_table_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "contract_key_value",
+                db.contract_kv_state_bytes()?,
+                db.arena_contract_kv_state_bytes().unwrap_or_default(),
+            ),
         ])
     }
 
@@ -3305,7 +3600,9 @@ mod tests {
             std::env::var("PULSEVM_REPLAY_GENESIS"),
             std::env::var("PULSEVM_REPLAY_CHAIN_ID"),
         ) else {
-            eprintln!("replay_local_block_log: set PULSEVM_REPLAY_{{BLOCK_LOG_DIR,GENESIS,CHAIN_ID}} to run");
+            eprintln!(
+                "replay_local_block_log: set PULSEVM_REPLAY_{{BLOCK_LOG_DIR,GENESIS,CHAIN_ID}} to run"
+            );
             return Ok(());
         };
 
@@ -3322,11 +3619,17 @@ mod tests {
         let mut mempool = mempool.write().await;
         let mut controller = Controller::new();
         let temp_path = get_temp_dir();
-        controller.initialize(&chain_id, &config_bytes, &genesis_bytes, temp_path.path().to_str().unwrap())?;
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &genesis_bytes,
+            temp_path.path().to_str().unwrap(),
+        )?;
 
         // Open the source node's block_log (separate from our fresh one).
-        let src = crate::chain::state_history::StateHistoryLog::open_with_magic(&src_dir, "block_log", 0)
-            .map_err(|e| ChainError::InternalError(format!("open source block_log: {e:?}")))?;
+        let src =
+            crate::chain::state_history::StateHistoryLog::open_with_magic(&src_dir, "block_log", 0)
+                .map_err(|e| ChainError::InternalError(format!("open source block_log: {e:?}")))?;
         let (log_start, log_end) = src
             .range()
             .ok_or_else(|| ChainError::InternalError("source block_log is empty".into()))?;
@@ -3381,8 +3684,7 @@ mod tests {
             .unwrap()
             .parent()
             .unwrap();
-        let wasm =
-            fs::read(root.join(Path::new("reference_contracts/pulse_token.wasm"))).unwrap();
+        let wasm = fs::read(root.join(Path::new("reference_contracts/pulse_token.wasm"))).unwrap();
         let glenn = Name::from_str("glenn")?;
 
         // Node A builds a rich block and packs it — the "fixture".
@@ -3391,7 +3693,12 @@ mod tests {
             let mut mempool = mempool.write().await;
             let mut a = Controller::new();
             let dir = get_temp_dir();
-            a.initialize(&chain_id, &config_bytes, &genesis, dir.path().to_str().unwrap())?;
+            a.initialize(
+                &chain_id,
+                &config_bytes,
+                &genesis,
+                dir.path().to_str().unwrap(),
+            )?;
             let cid = a.chain_id().clone();
             mempool.add_transaction(create_account(&private_key, glenn, cid)?);
             mempool.add_transaction(set_code(&private_key, glenn, wasm, cid)?);
@@ -3413,7 +3720,12 @@ mod tests {
         let mut mempool = mempool.write().await;
         let mut b = Controller::new();
         let dir = get_temp_dir();
-        b.initialize(&chain_id, &config_bytes, &genesis, dir.path().to_str().unwrap())?;
+        b.initialize(
+            &chain_id,
+            &config_bytes,
+            &genesis,
+            dir.path().to_str().unwrap(),
+        )?;
         let block = SignedBlock::read(packed.as_slice(), &mut 0)?;
         b.verify_block(&block, &mut mempool).await?;
         b.accept_block(&block.id()?, &mut mempool)?;
@@ -3458,7 +3770,12 @@ mod tests {
             let mut mempool = mempool.write().await;
             let mut a = Controller::new();
             let dir = get_temp_dir();
-            a.initialize(&chain_id, &config_bytes, &genesis, dir.path().to_str().unwrap())?;
+            a.initialize(
+                &chain_id,
+                &config_bytes,
+                &genesis,
+                dir.path().to_str().unwrap(),
+            )?;
             let cid = a.chain_id().clone();
             mempool.add_transaction(create_account(&private_key, glenn, cid)?);
             mempool.add_transaction(update_auth(
@@ -3486,13 +3803,21 @@ mod tests {
         let packed = src
             .read_block(end)
             .map_err(|e| ChainError::InternalError(format!("read_block: {e:?}")))?;
-        assert_eq!(packed, built_packed, "block_log round-trip corrupted the block");
+        assert_eq!(
+            packed, built_packed,
+            "block_log round-trip corrupted the block"
+        );
 
         let mempool = Arc::new(RwLock::new(Mempool::new()));
         let mut mempool = mempool.write().await;
         let mut b = Controller::new();
         let dir = get_temp_dir();
-        b.initialize(&chain_id, &config_bytes, &genesis, dir.path().to_str().unwrap())?;
+        b.initialize(
+            &chain_id,
+            &config_bytes,
+            &genesis,
+            dir.path().to_str().unwrap(),
+        )?;
         let block = SignedBlock::read(packed.as_slice(), &mut 0)?;
         assert_eq!(block.id()?, built_id, "read block id mismatch");
         b.verify_block(&block, &mut mempool).await?;
@@ -3535,11 +3860,13 @@ mod tests {
             header_extensions: vec![],
         };
         let got = header.calculate_id().unwrap();
-        let expected = Id::from_str(
-            "000000020aacb295ab19375a5c59dbdd5678f8287cdf7395bc42f73fcdc820b4",
-        )
-        .unwrap();
-        assert_eq!(got, expected, "reconstructed block 2 id mismatch: got {got}");
+        let expected =
+            Id::from_str("000000020aacb295ab19375a5c59dbdd5678f8287cdf7395bc42f73fcdc820b4")
+                .unwrap();
+        assert_eq!(
+            got, expected,
+            "reconstructed block 2 id mismatch: got {got}"
+        );
     }
 
     /// ISO block timestamp -> Antelope slot (500ms interval, 2000-01-01 epoch).
@@ -3564,15 +3891,23 @@ mod tests {
     /// the block re-derives the same merkle roots on replay.
     #[cfg(feature = "arena-shadow")]
     fn reconstruct_block(r: &serde_json::Value) -> Result<SignedBlock, ChainError> {
-        use crate::chain::block::SignedBlockHeader;
-        use crate::chain::crypto::Signature;
-        use crate::chain::transaction::{
-            PackedTransaction, TransactionCompression, TransactionReceipt,
-            TransactionReceiptHeader, TransactionStatus,
+        use crate::chain::{
+            block::SignedBlockHeader,
+            crypto::Signature,
+            transaction::{
+                PackedTransaction,
+                TransactionCompression,
+                TransactionReceipt,
+                TransactionReceiptHeader,
+                TransactionStatus,
+            },
         };
         use pulsevm_crypto::Bytes;
         use pulsevm_serialization::VarUint32;
-        use std::collections::{BTreeSet, VecDeque};
+        use std::collections::{
+            BTreeSet,
+            VecDeque,
+        };
 
         let hexd32 = |s: &str| -> [u8; 32] { hex::decode(s).unwrap().try_into().unwrap() };
         let header = BlockHeader {
@@ -3595,14 +3930,18 @@ mod tests {
             let status = match t["status"].as_str().unwrap() {
                 "executed" => TransactionStatus::Executed,
                 other => {
-                    return Err(ChainError::BlockError(format!("unhandled tx status {other}")));
+                    return Err(ChainError::BlockError(format!(
+                        "unhandled tx status {other}"
+                    )));
                 }
             };
             let cpu = t["cpu_usage_us"].as_u64().unwrap() as u32;
             let net = t["net_usage_words"].as_u64().unwrap() as u32;
             let trx = &t["trx"];
             if !trx.is_object() {
-                return Err(ChainError::BlockError("pruned transaction (id only)".into()));
+                return Err(ChainError::BlockError(
+                    "pruned transaction (id only)".into(),
+                ));
             }
             let mut sigs = BTreeSet::new();
             for s in trx["signatures"].as_array().unwrap() {
@@ -3616,7 +3955,9 @@ mod tests {
                 "zlib" | "1" => TransactionCompression::Zlib,
                 other => return Err(ChainError::BlockError(format!("compression: {other}"))),
             };
-            let packed_trx: Bytes = hex::decode(trx["packed_trx"].as_str().unwrap()).unwrap().into();
+            let packed_trx: Bytes = hex::decode(trx["packed_trx"].as_str().unwrap())
+                .unwrap()
+                .into();
             let cfd: Bytes = hex::decode(trx["packed_context_free_data"].as_str().unwrap())
                 .unwrap()
                 .into();
@@ -3649,11 +3990,14 @@ mod tests {
             eprintln!("set PULSEVM_RPC_BLOCKS_DIR (see scripts/fetch-blocks.sh) to run");
             return Ok(());
         };
-        let chain_id = Id::from_str(
-            "531a7002b4a4b67987f8706c01b965c76ffc3ad301608ac61a1f738cba6c3a9a",
-        )
-        .unwrap();
-        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+        let chain_id =
+            Id::from_str("531a7002b4a4b67987f8706c01b965c76ffc3ad301608ac61a1f738cba6c3a9a")
+                .unwrap();
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
         let config_bytes = json!({"producer_name":"pulse","producer_key":"PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez"})
             .to_string()
             .into_bytes();
@@ -3671,8 +4015,15 @@ mod tests {
         let b1: serde_json::Value =
             serde_json::from_slice(&fs::read(files.first().expect("no block fixtures")).unwrap())
                 .unwrap();
-        assert_eq!(b1["result"]["block_num"].as_u64(), Some(1), "first fixture must be block 1");
-        let ts = b1["result"]["timestamp"].as_str().unwrap().trim_end_matches(".000");
+        assert_eq!(
+            b1["result"]["block_num"].as_u64(),
+            Some(1),
+            "first fixture must be block 1"
+        );
+        let ts = b1["result"]["timestamp"]
+            .as_str()
+            .unwrap()
+            .trim_end_matches(".000");
         let mut g: serde_json::Value =
             serde_json::from_slice(&fs::read(repo_root.join("genesis.json")).unwrap()).unwrap();
         g["initial_timestamp"] = json!(ts);
@@ -3684,7 +4035,11 @@ mod tests {
         for f in &files {
             let v: serde_json::Value = serde_json::from_slice(&fs::read(f).unwrap()).unwrap();
             let r = &v["result"];
-            if r["transactions"].as_array().map(|a| !a.is_empty()).unwrap_or(false) {
+            if r["transactions"]
+                .as_array()
+                .map(|a| !a.is_empty())
+                .unwrap_or(false)
+            {
                 let b = reconstruct_block(r)?;
                 let keys = b.transactions[0]
                     .trx()
@@ -3702,7 +4057,12 @@ mod tests {
         let mut mempool = mempool.write().await;
         let mut controller = Controller::new();
         let temp = get_temp_dir();
-        controller.initialize(&chain_id, &config_bytes, &genesis_bytes, temp.path().to_str().unwrap())?;
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &genesis_bytes,
+            temp.path().to_str().unwrap(),
+        )?;
 
         // Cutover mode: when set, the node serves every contract read FROM the
         // arena (chainbase still takes the writes, and the inline cross-check
@@ -3731,9 +4091,8 @@ mod tests {
         // independent of the genesis account key) and re-sign each reconstructed
         // block with it below. Nothing in this fixture changes the schedule, so it
         // stays this single producer throughout.
-        let block_signer = PrivateKey::from_str(
-            "PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez",
-        )?;
+        let block_signer =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
         controller.active_schedule = ProducerSchedule {
             version: 0,
             producers: vec![ProducerKey {
@@ -3784,10 +4143,15 @@ mod tests {
                             let mut m = std::collections::BTreeMap::new();
                             let mut p = 0;
                             while p + 44 <= b.len() {
-                                let u = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
-                                let vlen = u32::from_le_bytes(b[p + 40..p + 44].try_into().unwrap()) as usize;
+                                let u =
+                                    |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+                                let vlen = u32::from_le_bytes(b[p + 40..p + 44].try_into().unwrap())
+                                    as usize;
                                 let key = (u(p), u(p + 8), u(p + 16), u(p + 24)); // code,scope,table,pk
-                                m.insert(key, (u(p + 32), b[p + 44..(p + 44 + vlen).min(b.len())].to_vec()));
+                                m.insert(
+                                    key,
+                                    (u(p + 32), b[p + 44..(p + 44 + vlen).min(b.len())].to_vec()),
+                                );
                                 p += 44 + vlen;
                             }
                             m
@@ -3795,24 +4159,47 @@ mod tests {
                         let (c, a) = (rows(&chain_bytes), rows(&arena_bytes));
                         for (k, cv) in &c {
                             match a.get(k) {
-                                None => eprintln!("  chain-only row {k:?} payer={} vlen={}", cv.0, cv.1.len()),
-                                Some(av) if av != cv => eprintln!("  DIFF row {k:?}: chain payer={} vlen={} | arena payer={} vlen={}", cv.0, cv.1.len(), av.0, av.1.len()),
+                                None => eprintln!(
+                                    "  chain-only row {k:?} payer={} vlen={}",
+                                    cv.0,
+                                    cv.1.len()
+                                ),
+                                Some(av) if av != cv => eprintln!(
+                                    "  DIFF row {k:?}: chain payer={} vlen={} | arena payer={} vlen={}",
+                                    cv.0,
+                                    cv.1.len(),
+                                    av.0,
+                                    av.1.len()
+                                ),
                                 _ => {}
                             }
                         }
                         for (k, av) in &a {
                             if !c.contains_key(k) {
-                                eprintln!("  arena-only row {k:?} payer={} vlen={}", av.0, av.1.len());
+                                eprintln!(
+                                    "  arena-only row {k:?} payer={} vlen={}",
+                                    av.0,
+                                    av.1.len()
+                                );
                             }
                         }
                     }
                     if name == "resource_state" && std::env::var("PULSEVM_KV_DEBUG").is_ok() {
                         let f = |b: &[u8]| {
-                            let u64a = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+                            let u64a =
+                                |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
                             // avg_net(20) avg_cpu(20) then 7 u64 scalars
                             format!(
                                 "pending_net={} pending_cpu={} tot_net={} tot_cpu={} tot_ram={} vnet={} vcpu={} avgnet_vex={} avgcpu_vex={}",
-                                u64a(40), u64a(48), u64a(56), u64a(64), u64a(72), u64a(80), u64a(88), u64a(0), u64a(20)
+                                u64a(40),
+                                u64a(48),
+                                u64a(56),
+                                u64a(64),
+                                u64a(72),
+                                u64a(80),
+                                u64a(88),
+                                u64a(0),
+                                u64a(20)
                             )
                         };
                         eprintln!("  chain: {}", f(&chain_bytes));
@@ -3823,7 +4210,9 @@ mod tests {
                 }
             }
             if let Some(name) = diverged {
-                eprintln!("cross-impl diverged at block {n}, table {name} (matched blocks up to {replayed})");
+                eprintln!(
+                    "cross-impl diverged at block {n}, table {name} (matched blocks up to {replayed})"
+                );
                 break;
             }
             replayed = n;
@@ -3908,20 +4297,29 @@ mod tests {
         // over every contract read the node actually served during execution
         // (including mid-transaction speculative reads). Must be all matches.
         let (read_ok, read_fail) = db.arena_read_crosscheck_counts();
-        assert_eq!(read_fail, 0, "arena served {read_fail} contract reads that diverged from chainbase mid-execution");
+        assert_eq!(
+            read_fail, 0,
+            "arena served {read_fail} contract reads that diverged from chainbase mid-execution"
+        );
 
         // Iterator-positioning cross-check tally: accumulated by the
         // db_next/previous/lowerbound/upperbound wrappers over every cursor move
         // during execution. The arena computed the same landing key as chainbase.
         let (pos_ok, pos_fail) = db.arena_pos_crosscheck_counts();
-        assert_eq!(pos_fail, 0, "arena positioned {pos_fail} iterator moves differently from chainbase");
+        assert_eq!(
+            pos_fail, 0,
+            "arena positioned {pos_fail} iterator moves differently from chainbase"
+        );
 
         // Non-contract read cross-check tally: accumulated by the account and
         // permission lookups the node ran during authorization and dispatch. The
         // arena answered each the same as chainbase (existence, parent, threshold,
         // privileged flag).
         let (nc_ok, nc_fail) = db.arena_noncontract_crosscheck_counts();
-        assert_eq!(nc_fail, 0, "arena answered {nc_fail} account/permission reads differently from chainbase");
+        assert_eq!(
+            nc_fail, 0,
+            "arena answered {nc_fail} account/permission reads differently from chainbase"
+        );
 
         // Persistence at real state size: checkpoint the mirror built from the
         // full history, reload it into a fresh mirror, and require a byte-
@@ -3930,7 +4328,10 @@ mod tests {
         let persist = db.arena_persistence_roundtrip(&ckpt)?;
         let persist_msg = match persist {
             Some((matched, size)) => {
-                assert!(matched, "arena state root changed across checkpoint save/load");
+                assert!(
+                    matched,
+                    "arena state root changed across checkpoint save/load"
+                );
                 format!("checkpoint {size} bytes reloaded with identical state root")
             }
             None => "persistence check skipped (shadow off)".to_string(),
@@ -3940,7 +4341,10 @@ mod tests {
         // from the per-block WAL and require the same state root as the live one.
         let wal_msg = match db.arena_wal_reload_matches(&wal)? {
             Some(matched) => {
-                assert!(matched, "arena state root changed when rebuilt from the WAL");
+                assert!(
+                    matched,
+                    "arena state root changed when rebuilt from the WAL"
+                );
                 let size = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
                 format!("{size}-byte per-block WAL replayed to identical state root")
             }
@@ -3948,12 +4352,18 @@ mod tests {
         };
 
         let restart_msg = if restarted {
-            format!("mirror restarted from disk at block {restart_block} and stayed in lockstep to {replayed}")
+            format!(
+                "mirror restarted from disk at block {restart_block} and stayed in lockstep to {replayed}"
+            )
         } else {
             "no mid-chain restart (run too short)".to_string()
         };
 
-        let read_source = if arena_reads { "the ARENA" } else { "chainbase" };
+        let read_source = if arena_reads {
+            "the ARENA"
+        } else {
+            "chainbase"
+        };
         eprintln!(
             "replayed real testnet blocks up to {replayed} serving contract reads from {read_source}; C++ chainbase and the Rust arena matched the cross-impl full-state root at every block; arena served {checked} point reads and {tables_scanned} table scans identical to chainbase; {read_ok} inline reads + {pos_ok} iterator positions + {nc_ok} account/permission reads cross-checked live, 0 divergences; {persist_msg}; {wal_msg}; {restart_msg}"
         );
@@ -4251,7 +4661,10 @@ mod tests {
         // The fast path consumed the retained state rather than leaving it live.
         assert!(controller.pending_chain.is_empty());
         assert_eq!(controller.last_accepted_block_id, block_id);
-        assert_eq!(controller.last_accepted_block().block_num(), base_block_num + 1);
+        assert_eq!(
+            controller.last_accepted_block().block_num(),
+            base_block_num + 1
+        );
 
         // The account created by the block is present in committed state, proving
         // the retained session was committed rather than discarded.
@@ -4306,10 +4719,18 @@ mod tests {
         // Producer builds two chained blocks (b3 on top of the still-pending b2).
         let (mut producer, private_key, chain_id, _p_temp) = init_test_controller()?;
         let mut p_mempool = Mempool::new();
-        p_mempool.add_transaction(create_account(&private_key, Name::from_str("aaa")?, chain_id)?);
+        p_mempool.add_transaction(create_account(
+            &private_key,
+            Name::from_str("aaa")?,
+            chain_id,
+        )?);
         let b2 = producer.build_block(&mut p_mempool).await?;
         producer.set_preferred_id(b2.id()?);
-        p_mempool.add_transaction(create_account(&private_key, Name::from_str("bbb")?, chain_id)?);
+        p_mempool.add_transaction(create_account(
+            &private_key,
+            Name::from_str("bbb")?,
+            chain_id,
+        )?);
         let b3 = producer.build_block(&mut p_mempool).await?;
         assert_eq!(b3.previous_id(), &b2.id()?);
 
@@ -4353,17 +4774,29 @@ mod tests {
         // Producer builds A, then two children of A: B and C (siblings).
         let (mut producer, private_key, chain_id, _p_temp) = init_test_controller()?;
         let mut p_mempool = Mempool::new();
-        p_mempool.add_transaction(create_account(&private_key, Name::from_str("aaa")?, chain_id)?);
+        p_mempool.add_transaction(create_account(
+            &private_key,
+            Name::from_str("aaa")?,
+            chain_id,
+        )?);
         let a = producer.build_block(&mut p_mempool).await?;
 
         producer.set_preferred_id(a.id()?);
-        p_mempool.add_transaction(create_account(&private_key, Name::from_str("bbb")?, chain_id)?);
+        p_mempool.add_transaction(create_account(
+            &private_key,
+            Name::from_str("bbb")?,
+            chain_id,
+        )?);
         let b = producer.build_block(&mut p_mempool).await?;
 
         // Re-prefer A so the next build reconciles back to A (unwinding B) and
         // builds C as B's sibling.
         producer.set_preferred_id(a.id()?);
-        p_mempool.add_transaction(create_account(&private_key, Name::from_str("ccc")?, chain_id)?);
+        p_mempool.add_transaction(create_account(
+            &private_key,
+            Name::from_str("ccc")?,
+            chain_id,
+        )?);
         let c = producer.build_block(&mut p_mempool).await?;
         assert_eq!(b.previous_id(), &a.id()?);
         assert_eq!(c.previous_id(), &a.id()?);
@@ -4406,10 +4839,18 @@ mod tests {
     async fn test_reject_unwinds_descendants() -> Result<(), ChainError> {
         let (mut producer, private_key, chain_id, _p_temp) = init_test_controller()?;
         let mut p_mempool = Mempool::new();
-        p_mempool.add_transaction(create_account(&private_key, Name::from_str("aaa")?, chain_id)?);
+        p_mempool.add_transaction(create_account(
+            &private_key,
+            Name::from_str("aaa")?,
+            chain_id,
+        )?);
         let a = producer.build_block(&mut p_mempool).await?;
         producer.set_preferred_id(a.id()?);
-        p_mempool.add_transaction(create_account(&private_key, Name::from_str("bbb")?, chain_id)?);
+        p_mempool.add_transaction(create_account(
+            &private_key,
+            Name::from_str("bbb")?,
+            chain_id,
+        )?);
         let b = producer.build_block(&mut p_mempool).await?;
 
         let (mut validator, _pk, _cid, _v_temp) = init_test_controller()?;
@@ -5002,8 +5443,11 @@ mod tests {
         // Build a valid block (with correct merkle roots) on a producer.
         let (mut producer, private_key, chain_id, _p_temp) = init_test_controller()?;
         let mut p_mempool = Mempool::new();
-        p_mempool
-            .add_transaction(create_account(&private_key, Name::from_str("testapi")?, chain_id)?);
+        p_mempool.add_transaction(create_account(
+            &private_key,
+            Name::from_str("testapi")?,
+            chain_id,
+        )?);
         let block = producer.build_block(&mut p_mempool).await?;
 
         // A validator verifies it, accepts it, then a repeat verify short-circuits
@@ -5031,8 +5475,11 @@ mod tests {
         // reject it. This proves the signature check is enforced, not a no-op.
         let (mut producer, private_key, chain_id, _p_temp) = init_test_controller()?;
         let mut p_mempool = Mempool::new();
-        p_mempool
-            .add_transaction(create_account(&private_key, Name::from_str("testapi")?, chain_id)?);
+        p_mempool.add_transaction(create_account(
+            &private_key,
+            Name::from_str("testapi")?,
+            chain_id,
+        )?);
         let mut block = producer.build_block(&mut p_mempool).await?;
 
         let wrong_digest: crate::utils::Digest = [0u8; 32].into();
@@ -5041,7 +5488,10 @@ mod tests {
         let (mut validator, _pk, _cid, _v_temp) = init_test_controller()?;
         let mut v_mempool = Mempool::new();
         assert!(
-            validator.verify_block(&block, &mut v_mempool).await.is_err(),
+            validator
+                .verify_block(&block, &mut v_mempool)
+                .await
+                .is_err(),
             "block with a signature over the wrong digest must be rejected"
         );
 
@@ -5056,8 +5506,11 @@ mod tests {
         // genesis key.
         let (mut producer, private_key, chain_id, _p_temp) = init_test_controller()?;
         let mut p_mempool = Mempool::new();
-        p_mempool
-            .add_transaction(create_account(&private_key, Name::from_str("testapi")?, chain_id)?);
+        p_mempool.add_transaction(create_account(
+            &private_key,
+            Name::from_str("testapi")?,
+            chain_id,
+        )?);
         let mut block = producer.build_block(&mut p_mempool).await?;
 
         let (mut validator, _pk, _cid, _v_temp) = init_test_controller()?;
@@ -5070,7 +5523,10 @@ mod tests {
 
         let mut v_mempool = Mempool::new();
         assert!(
-            validator.verify_block(&block, &mut v_mempool).await.is_err(),
+            validator
+                .verify_block(&block, &mut v_mempool)
+                .await
+                .is_err(),
             "genesis-key signature must be rejected under the rotated schedule"
         );
 
@@ -5087,10 +5543,9 @@ mod tests {
         // A schedule change rides in the signed block header, so it is recovered
         // from the block log on restart — there is no out-of-band file to lose,
         // and a chain that changed producers never silently reverts to genesis.
-        let chain_id = Id::from_str(
-            "c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6",
-        )
-        .unwrap();
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
         let private_key =
             PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
         let genesis_bytes = generate_genesis(&private_key);
@@ -5168,8 +5623,11 @@ mod tests {
         // chain never voted for.
         let (mut producer, private_key, chain_id, _p_temp) = init_test_controller()?;
         let mut p_mempool = Mempool::new();
-        p_mempool
-            .add_transaction(create_account(&private_key, Name::from_str("testapi")?, chain_id)?);
+        p_mempool.add_transaction(create_account(
+            &private_key,
+            Name::from_str("testapi")?,
+            chain_id,
+        )?);
         let mut block = producer.build_block(&mut p_mempool).await?;
 
         // Forge a non-zero schedule version with no matching new_producers, then
@@ -5182,7 +5640,10 @@ mod tests {
         let (mut validator, _pk, _cid, _v_temp) = init_test_controller()?;
         let mut v_mempool = Mempool::new();
         assert!(
-            validator.verify_block(&block, &mut v_mempool).await.is_err(),
+            validator
+                .verify_block(&block, &mut v_mempool)
+                .await
+                .is_err(),
             "a header schedule version with no new_producers must be rejected"
         );
 
@@ -5202,8 +5663,11 @@ mod tests {
         }])?;
 
         let mut mempool = Mempool::new();
-        mempool
-            .add_transaction(create_account(&private_key, Name::from_str("testapi")?, chain_id)?);
+        mempool.add_transaction(create_account(
+            &private_key,
+            Name::from_str("testapi")?,
+            chain_id,
+        )?);
         assert!(
             controller.build_block(&mut mempool).await.is_err(),
             "node must refuse to produce a block it cannot validly sign"

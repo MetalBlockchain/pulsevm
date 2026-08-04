@@ -1,6 +1,12 @@
-use wasmer::{FunctionEnvMut, RuntimeError};
+use wasmer::{
+    FunctionEnvMut,
+    RuntimeError,
+};
 
-use crate::chain::{wasm_runtime::WasmContext, webassembly::context_aware_check};
+use crate::chain::{
+    wasm_runtime::WasmContext,
+    webassembly::context_aware_check,
+};
 
 pub fn require_auth(env: FunctionEnvMut<WasmContext>, account: u64) -> Result<(), RuntimeError> {
     context_aware_check(&env)?;

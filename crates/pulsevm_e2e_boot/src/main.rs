@@ -13,27 +13,58 @@
 use std::{
     str::FromStr,
     sync::Arc,
-    time::{Duration, Instant},
+    time::{
+        Duration,
+        Instant,
+    },
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{
+    Context,
+    Result,
+    bail,
+};
 use pulsevm_api_client::PulseVmClient;
 use pulsevm_core::{
-    ACTIVE_NAME, PULSE_NAME,
+    ACTIVE_NAME,
+    PULSE_NAME,
     abi::AbiDefinition,
     asset::Asset,
-    authority::{Authority, KeyWeight, PermissionLevel},
-    config::{NEWACCOUNT_NAME, SETABI_NAME, SETCODE_NAME},
-    crypto::{PrivateKey, PublicKey},
+    authority::{
+        Authority,
+        KeyWeight,
+        PermissionLevel,
+    },
+    config::{
+        NEWACCOUNT_NAME,
+        SETABI_NAME,
+        SETCODE_NAME,
+    },
+    crypto::{
+        PrivateKey,
+        PublicKey,
+    },
     id::Id,
     name::Name,
-    pulse_contract::{NewAccount, SetAbi, SetCode},
+    pulse_contract::{
+        NewAccount,
+        SetAbi,
+        SetCode,
+    },
     time::TimePointSec,
-    transaction::{Action, PackedTransaction, Transaction},
+    transaction::{
+        Action,
+        PackedTransaction,
+        Transaction,
+    },
 };
 use pulsevm_crypto::Bytes;
 use pulsevm_name_macro::name;
-use pulsevm_proc_macros::{NumBytes, Read, Write};
+use pulsevm_proc_macros::{
+    NumBytes,
+    Read,
+    Write,
+};
 use pulsevm_serialization::Write as _;
 use tokio::time::sleep;
 
@@ -120,7 +151,9 @@ async fn push(
     txn.header.expiration = TimePointSec::now() + 300;
     txn.actions = actions;
 
-    let signed = txn.sign(key, chain_id).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let signed = txn
+        .sign(key, chain_id)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     let packed =
         PackedTransaction::from_signed_transaction(signed).map_err(|e| anyhow::anyhow!("{e}"))?;
     let response = client
@@ -238,14 +271,16 @@ async fn main() -> Result<()> {
         )
         .await
         .with_context(|| format!("creating account {account}"))?;
-        steps.push(serde_json::json!({ "step": "newaccount", "account": account.to_string(), "tx": tx }));
+        steps.push(
+            serde_json::json!({ "step": "newaccount", "account": account.to_string(), "tx": tx }),
+        );
     }
 
     // Only the code is deployed. The ABI exists to let clients translate JSON to
     // binary; this fixture packs binary directly, and the contract does not need
     // an ABI to execute.
-    let wasm = std::fs::read(&args.token_wasm)
-        .with_context(|| format!("reading {}", args.token_wasm))?;
+    let wasm =
+        std::fs::read(&args.token_wasm).with_context(|| format!("reading {}", args.token_wasm))?;
     let tx = push(
         &client,
         &chain_id,
@@ -279,7 +314,10 @@ async fn main() -> Result<()> {
         std::fs::read(&args.token_abi).with_context(|| format!("reading {}", args.token_abi))?;
     let abi: AbiDefinition =
         serde_json::from_slice(&abi_json).context("parsing token ABI as JSON")?;
-    let abi_bytes = Bytes::new(abi.pack().map_err(|e| anyhow::anyhow!("packing ABI: {e}"))?);
+    let abi_bytes = Bytes::new(
+        abi.pack()
+            .map_err(|e| anyhow::anyhow!("packing ABI: {e}"))?,
+    );
     let tx = push(
         &client,
         &chain_id,

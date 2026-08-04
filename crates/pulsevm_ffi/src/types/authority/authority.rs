@@ -1,16 +1,33 @@
 use std::fmt;
 
 use cxx::SharedPtr;
-use pulsevm_serialization::{NumBytes, Read, Write, WriteError};
+use pulsevm_serialization::{
+    NumBytes,
+    Read,
+    Write,
+    WriteError,
+};
 use serde::{
-    Deserialize, Serialize,
-    de::{self, MapAccess, SeqAccess, Visitor},
+    Deserialize,
+    Serialize,
+    de::{
+        self,
+        MapAccess,
+        SeqAccess,
+        Visitor,
+    },
     ser::SerializeStruct,
 };
 
 use crate::{
-    CxxPublicKey, PermissionLevel,
-    bridge::ffi::{Authority, KeyWeight, PermissionLevelWeight, WaitWeight},
+    CxxPublicKey,
+    PermissionLevel,
+    bridge::ffi::{
+        Authority,
+        KeyWeight,
+        PermissionLevelWeight,
+        WaitWeight,
+    },
 };
 
 impl Authority {

@@ -1,25 +1,51 @@
 use std::{
-    cmp::min, collections::{BTreeMap, BTreeSet, VecDeque}, sync::{Arc, RwLock},
+    cmp::min,
+    collections::{
+        BTreeMap,
+        BTreeSet,
+        VecDeque,
+    },
+    sync::{
+        Arc,
+        RwLock,
+    },
 };
 
 use pulsevm_constants::MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER;
 use pulsevm_crypto::Digest;
 use pulsevm_error::ChainError;
-use pulsevm_ffi::{BlockTimestamp, Database, GlobalPropertyObject, Microseconds, TimePoint, seconds};
+use pulsevm_ffi::{
+    BlockTimestamp,
+    Database,
+    GlobalPropertyObject,
+    Microseconds,
+    TimePoint,
+    seconds,
+};
 use pulsevm_serialization::VarUint32;
 use spdlog::info;
 
 use crate::{
-    authorization_manager::AuthorizationManager, block::BlockStatus, chain::{
+    authorization_manager::AuthorizationManager,
+    block::BlockStatus,
+    chain::{
         apply_context::ApplyContext,
         id::Id,
         name::Name,
         producer_schedule::ProducerKey,
         resource_limits::ResourceLimitsManager,
-        transaction::{Action, ActionTrace, Transaction, TransactionStatus, TransactionTrace},
+        transaction::{
+            Action,
+            ActionTrace,
+            Transaction,
+            TransactionStatus,
+            TransactionTrace,
+        },
         utils::pulse_assert,
         wasm_runtime::WasmRuntime,
-    }, controller::Controller, transaction::PackedTransaction,
+    },
+    controller::Controller,
+    transaction::PackedTransaction,
 };
 
 #[derive(Default, Clone)]
@@ -141,14 +167,18 @@ impl TransactionContext {
         let net_usage_leeway = {
             let cfg = Controller::get_global_properties(&self.db)?;
 
-            // Possibly lower net_limit to the maximum net usage a transaction is allowed to be billed
+            // Possibly lower net_limit to the maximum net usage a transaction is allowed to be
+            // billed
             if cfg.get_chain_config().get_max_transaction_net_usage() as u64 <= inner.net_limit {
                 inner.net_limit = cfg.get_chain_config().get_max_transaction_net_usage() as u64;
                 inner.net_limit_due_to_block = false;
             }
 
-            // Possibly lower cpu_limit to the maximum cpu usage a transaction is allowed to be billed
-            if cfg.get_chain_config().get_max_transaction_cpu_usage() as u64 <= inner.cpu_limit as u64 {
+            // Possibly lower cpu_limit to the maximum cpu usage a transaction is allowed to be
+            // billed
+            if cfg.get_chain_config().get_max_transaction_cpu_usage() as u64
+                <= inner.cpu_limit as u64
+            {
                 inner.cpu_limit = cfg.get_chain_config().get_max_transaction_cpu_usage() as i64;
                 inner.cpu_limit_due_to_block = false;
             }
@@ -187,7 +217,8 @@ impl TransactionContext {
             inner.pending_block_timestamp.slot(),
         )?;
 
-        // Calculate the highest network usage and CPU time that all of the billed accounts can afford to be billed
+        // Calculate the highest network usage and CPU time that all of the billed accounts can
+        // afford to be billed
         let (account_net_limit, account_cpu_limit, greylisted_net, greylisted_cpu) =
             self.max_bandwidth_billed_account_can_pay(&first_authorizer_name)?;
 
@@ -195,9 +226,13 @@ impl TransactionContext {
         inner.cpu_limit_due_to_greylist = greylisted_cpu;
         inner.eager_net_limit = inner.net_limit;
 
-        let new_eager_net_limit = min(inner.eager_net_limit, (account_net_limit + net_usage_leeway as i64) as u64);
+        let new_eager_net_limit = min(
+            inner.eager_net_limit,
+            (account_net_limit + net_usage_leeway as i64) as u64,
+        );
 
-        // Possibly lower eager_net_limit to what the billed account can pay plus some (objective) leeway
+        // Possibly lower eager_net_limit to what the billed account can pay plus some (objective)
+        // leeway
         if new_eager_net_limit < inner.eager_net_limit {
             inner.eager_net_limit = new_eager_net_limit;
         }
@@ -532,7 +567,8 @@ impl TransactionContext {
         Self::update_billed_cpu_time(&mut inner, &self.db)?;
         Self::validate_cpu_usage_to_bill(&inner, &self.db, true)?;
 
-        // During benchmarks this would throw an error because the accounts won't have enough CPU to cover the billed time, so we skip this step if we're benchmarking.
+        // During benchmarks this would throw an error because the accounts won't have enough CPU to
+        // cover the billed time, so we skip this step if we're benchmarking.
         if self.block_status != BlockStatus::Benchmarking {
             ResourceLimitsManager::add_transaction_usage(
                 &mut self.db,
@@ -569,9 +605,8 @@ impl TransactionContext {
             .checked_add(cpu_usage)
             .ok_or_else(|| ChainError::ActionValidationError("CPU usage overflow".to_string()))?;
 
-        let total = u32::try_from(total).map_err(|_| {
-            ChainError::ActionValidationError("CPU usage overflow".to_string())
-        })?;
+        let total = u32::try_from(total)
+            .map_err(|_| ChainError::ActionValidationError("CPU usage overflow".to_string()))?;
 
         inner.trace.receipt.cpu_usage_us = total;
 
@@ -581,11 +616,14 @@ impl TransactionContext {
     pub fn add_net_usage(&self, net_usage: u64) -> Result<(), ChainError> {
         {
             let mut inner = self.inner.write()?;
-            inner.trace.net_usage = inner
-                .trace
-                .net_usage
-                .checked_add(net_usage)
-                .ok_or_else(|| ChainError::ActionValidationError("net usage overflow".to_string()))?;
+            inner.trace.net_usage =
+                inner
+                    .trace
+                    .net_usage
+                    .checked_add(net_usage)
+                    .ok_or_else(|| {
+                        ChainError::ActionValidationError("net usage overflow".to_string())
+                    })?;
         }
 
         self.check_net_usage()?;
@@ -668,7 +706,10 @@ impl TransactionContext {
             ));
         }
 
-        if expiration > pending_block_timestamp + seconds(gpo.get_chain_config().get_max_transaction_lifetime() as i64) {
+        if expiration
+            > pending_block_timestamp
+                + seconds(gpo.get_chain_config().get_max_transaction_lifetime() as i64)
+        {
             return Err(ChainError::TransactionError(
                 "transaction has too long lifetime".to_string(),
             ));
@@ -740,7 +781,10 @@ impl TransactionContext {
         Ok(())
     }
 
-    fn max_bandwidth_billed_account_can_pay(&self, account: &Name) -> Result<(i64, i64, bool, bool), ChainError> {
+    fn max_bandwidth_billed_account_can_pay(
+        &self,
+        account: &Name,
+    ) -> Result<(i64, i64, bool, bool), ChainError> {
         let large_number_no_overflow = i64::MAX / 2;
         let mut account_net_limit = large_number_no_overflow;
         let mut account_cpu_limit = large_number_no_overflow;
@@ -765,7 +809,12 @@ impl TransactionContext {
             account_cpu_limit = min(account_cpu_limit, cpu_limit);
         }
 
-        Ok((account_net_limit, account_cpu_limit, net_was_greylisted, cpu_was_greylisted))
+        Ok((
+            account_net_limit,
+            account_cpu_limit,
+            net_was_greylisted,
+            cpu_was_greylisted,
+        ))
     }
 
     pub fn check_net_usage(&self) -> Result<(), ChainError> {
@@ -800,11 +849,17 @@ impl TransactionContext {
         Ok(())
     }
 
-    fn validate_cpu_usage_to_bill(inner: &TransactionContextInner, db: &Database, check_minimum: bool) -> Result<(), ChainError> {
+    fn validate_cpu_usage_to_bill(
+        inner: &TransactionContextInner,
+        db: &Database,
+        check_minimum: bool,
+    ) -> Result<(), ChainError> {
         if check_minimum {
             let cfg = Controller::get_global_properties(&db)?;
 
-            if inner.trace.receipt.cpu_usage_us < cfg.get_chain_config().get_min_transaction_cpu_usage() {
+            if inner.trace.receipt.cpu_usage_us
+                < cfg.get_chain_config().get_min_transaction_cpu_usage()
+            {
                 return Err(ChainError::TransactionError(format!(
                     "cannot bill CPU time less than the minimum of {}",
                     cfg.get_chain_config().get_min_transaction_cpu_usage()
@@ -815,7 +870,10 @@ impl TransactionContext {
         Self::validate_account_cpu_usage(inner)
     }
 
-    fn update_billed_cpu_time(inner: &mut TransactionContextInner, db: &Database) -> Result<(), ChainError> {
+    fn update_billed_cpu_time(
+        inner: &mut TransactionContextInner,
+        db: &Database,
+    ) -> Result<(), ChainError> {
         if inner.explicit_billed_cpu_time {
             inner.trace.receipt.cpu_usage_us = inner.explicit_cpu_us;
             return Ok(());

@@ -1,6 +1,10 @@
 use core::fmt;
 
-use pulsevm_serialization::{NumBytes, Read, Write};
+use pulsevm_serialization::{
+    NumBytes,
+    Read,
+    Write,
+};
 use serde::Serialize;
 use sha2::Digest;
 

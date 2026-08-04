@@ -51,7 +51,10 @@ fn find_secondary_returns_lowest_primary_for_that_key() {
     // A secondary key that isn't present gives the end iterator.
     let end = db.db_idx64_end(CODE, SCOPE, TABLE);
     let mut p = 0u64;
-    assert_eq!(db.db_idx64_find_secondary(CODE, SCOPE, TABLE, 999, &mut p), end);
+    assert_eq!(
+        db.db_idx64_find_secondary(CODE, SCOPE, TABLE, 999, &mut p),
+        end
+    );
 }
 
 #[test]

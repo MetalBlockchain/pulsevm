@@ -3,13 +3,33 @@
 
 use std::hint::black_box;
 
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{
+    BenchmarkId,
+    Criterion,
+    criterion_group,
+    criterion_main,
+};
 use pulsevm_arena::{
-    ArenaObject, Db, IndexedBy, ObjectId, SecondaryIndex, Table, hash_index, key_index,
+    ArenaObject,
+    Db,
+    IndexedBy,
+    ObjectId,
+    SecondaryIndex,
+    Table,
+    hash_index,
+    key_index,
 };
 
 #[repr(C)]
-#[derive(Clone, Copy, Default, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout)]
+#[derive(
+    Clone,
+    Copy,
+    Default,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::Immutable,
+    zerocopy::KnownLayout,
+)]
 struct Account {
     id: ObjectId<Account>,
     name: u64,
@@ -42,7 +62,15 @@ impl ArenaObject for Account {
 /// point-lookup latency in isolation (kept off `Account` so the insert/undo
 /// benches maintain a single realistic index, as chainbase's account does).
 #[repr(C)]
-#[derive(Clone, Copy, Default, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout)]
+#[derive(
+    Clone,
+    Copy,
+    Default,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::Immutable,
+    zerocopy::KnownLayout,
+)]
 struct HashAccount {
     id: ObjectId<HashAccount>,
     name: u64,
@@ -106,7 +134,10 @@ fn bench_hot_path(c: &mut Criterion) {
         let mut k = 0u64;
         find.bench_with_input(BenchmarkId::new("by_name", rows), &rows, |b, rows| {
             b.iter(|| {
-                let name = t.get_index::<ByName>().find(black_box(&(k % rows))).map(|a| a.name);
+                let name = t
+                    .get_index::<ByName>()
+                    .find(black_box(&(k % rows)))
+                    .map(|a| a.name);
                 k += 1;
                 black_box(name)
             })
@@ -114,8 +145,10 @@ fn bench_hot_path(c: &mut Criterion) {
         let mut h = 0u64;
         find.bench_with_input(BenchmarkId::new("by_name_hash", rows), &rows, |b, rows| {
             b.iter(|| {
-                let name =
-                    ht.get_hash_index::<HashByName>().find(black_box(&(h % rows))).map(|a| a.name);
+                let name = ht
+                    .get_hash_index::<HashByName>()
+                    .find(black_box(&(h % rows)))
+                    .map(|a| a.name);
                 h += 1;
                 black_box(name)
             })
@@ -123,7 +156,9 @@ fn bench_hot_path(c: &mut Criterion) {
         let mut m = 0i64;
         find.bench_with_input(BenchmarkId::new("by_id", rows), &rows, |b, rows| {
             b.iter(|| {
-                let v = t.find(ObjectId::new(black_box(m % *rows as i64))).map(|a| a.name);
+                let v = t
+                    .find(ObjectId::new(black_box(m % *rows as i64)))
+                    .map(|a| a.name);
                 m += 1;
                 black_box(v)
             })
@@ -182,7 +217,8 @@ fn bench_persistence(c: &mut Criterion) {
     group.bench_function(BenchmarkId::new("flush_delta_after_10", rows), |b| {
         b.iter(|| {
             for i in 0..10u64 {
-                db.modify::<Account>(ObjectId::new(i as i64), |a| a.name = rows + n + i).unwrap();
+                db.modify::<Account>(ObjectId::new(i as i64), |a| a.name = rows + n + i)
+                    .unwrap();
             }
             n += 10;
             db.flush_delta(&wal).unwrap();
@@ -242,5 +278,10 @@ fn bench_open_breakdown(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_hot_path, bench_persistence, bench_open_breakdown);
+criterion_group!(
+    benches,
+    bench_hot_path,
+    bench_persistence,
+    bench_open_breakdown
+);
 criterion_main!(benches);

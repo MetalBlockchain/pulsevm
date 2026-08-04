@@ -1,6 +1,13 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
-    sync::{Arc, RwLock},
+    collections::{
+        BTreeMap,
+        BTreeSet,
+        VecDeque,
+    },
+    sync::{
+        Arc,
+        RwLock,
+    },
     u64,
 };
 
@@ -9,10 +16,26 @@ use pulsevm_billable_size::billable_size_v;
 use pulsevm_crypto::Bytes;
 use pulsevm_error::ChainError;
 use pulsevm_ffi::{
-    AccountMetadataObject, BlockTimestamp, ChainConfigV0, Database, Float128, Index64IteratorCache,
-    Index64Object, Index128IteratorCache, Index128Object, Index256IteratorCache, Index256Object,
-    IndexDoubleIteratorCache, IndexDoubleObject, IndexLongDoubleIteratorCache,
-    IndexLongDoubleObject, KeyValueIteratorCache, KeyValueObject, Microseconds, TableObject, U256,
+    AccountMetadataObject,
+    BlockTimestamp,
+    ChainConfigV0,
+    Database,
+    Float128,
+    Index64IteratorCache,
+    Index64Object,
+    Index128IteratorCache,
+    Index128Object,
+    Index256IteratorCache,
+    Index256Object,
+    IndexDoubleIteratorCache,
+    IndexDoubleObject,
+    IndexLongDoubleIteratorCache,
+    IndexLongDoubleObject,
+    KeyValueIteratorCache,
+    KeyValueObject,
+    Microseconds,
+    TableObject,
+    U256,
 };
 use pulsevm_serialization::Write;
 
@@ -23,7 +46,11 @@ use crate::{
         authorization_manager::AuthorizationManager,
         controller::Controller,
         producer_schedule::ProducerKey,
-        transaction::{Action, ActionReceipt, generate_action_digest},
+        transaction::{
+            Action,
+            ActionReceipt,
+            generate_action_digest,
+        },
         transaction_context::TransactionContext,
         utils::pulse_assert,
         wasm_runtime::WasmRuntime,
@@ -76,7 +103,7 @@ impl ApplyContext {
         action_ordinal: u32,
         depth: u32,
         cpu_limit: i64,
-        context_free: bool
+        context_free: bool,
     ) -> Result<Self, ChainError> {
         let pending_block_timestamp = trx_context.pending_block_timestamp()?;
 
@@ -183,7 +210,9 @@ impl ApplyContext {
 
         // Does the receiver account have a contract deployed?
         if !receiver_account.get_code_hash().empty() {
-            // Separate context here because we need to release the lock on inner before executing the Wasm code, which may call back into the context and cause deadlock if we hold the lock.
+            // Separate context here because we need to release the lock on inner before executing
+            // the Wasm code, which may call back into the context and cause deadlock if we hold the
+            // lock.
             let cpu_limit = {
                 let inner = self.inner.read()?;
                 inner.cpu_limit
@@ -605,7 +634,9 @@ impl ApplyContext {
 
         let cb_value = obj.get_value();
         #[cfg(feature = "arena-shadow")]
-        let source: &[u8] = arena_value.as_deref().unwrap_or_else(|| cb_value.as_slice());
+        let source: &[u8] = arena_value
+            .as_deref()
+            .unwrap_or_else(|| cb_value.as_slice());
         #[cfg(not(feature = "arena-shadow"))]
         let source: &[u8] = cb_value.as_slice();
 
@@ -859,7 +890,9 @@ impl ApplyContext {
         // cutover switch is on.
         #[cfg(feature = "arena-shadow")]
         {
-            let arena = self.db.arena_idx64_find_secondary(code, scope, table, secondary);
+            let arena = self
+                .db
+                .arena_idx64_find_secondary(code, scope, table, secondary);
             let ffi = if res >= 0 { Some(*primary) } else { None };
             self.db.arena_note_pos(arena == ffi);
             if self.db.arena_reads_enabled()
@@ -893,7 +926,9 @@ impl ApplyContext {
 
         #[cfg(feature = "arena-shadow")]
         {
-            let arena = self.db.arena_idx64_find_primary(code, scope, table, primary);
+            let arena = self
+                .db
+                .arena_idx64_find_primary(code, scope, table, primary);
             let ffi = if res >= 0 { Some(*secondary) } else { None };
             self.db.arena_note_pos(arena == ffi);
             if self.db.arena_reads_enabled()
@@ -934,7 +969,11 @@ impl ApplyContext {
         #[cfg(feature = "arena-shadow")]
         {
             let arena = self.db.arena_idx64_lower_bound(code, scope, table, search);
-            let ffi = if res >= 0 { Some((*primary, *secondary)) } else { None };
+            let ffi = if res >= 0 {
+                Some((*primary, *secondary))
+            } else {
+                None
+            };
             self.db.arena_note_pos(arena == ffi);
             if self.db.arena_reads_enabled()
                 && res >= 0
@@ -971,7 +1010,11 @@ impl ApplyContext {
         #[cfg(feature = "arena-shadow")]
         {
             let arena = self.db.arena_idx64_upper_bound(code, scope, table, search);
-            let ffi = if res >= 0 { Some((*primary, *secondary)) } else { None };
+            let ffi = if res >= 0 {
+                Some((*primary, *secondary))
+            } else {
+                None
+            };
             self.db.arena_note_pos(arena == ffi);
             if self.db.arena_reads_enabled()
                 && res >= 0

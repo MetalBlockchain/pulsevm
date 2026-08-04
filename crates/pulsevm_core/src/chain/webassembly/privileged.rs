@@ -2,12 +2,23 @@ use std::collections::BTreeSet;
 
 use pulsevm_error::ChainError;
 use pulsevm_ffi::ChainConfigV0;
-use pulsevm_serialization::{Read, VarUint32};
-use wasmer::{FunctionEnvMut, RuntimeError, WasmPtr};
+use pulsevm_serialization::{
+    Read,
+    VarUint32,
+};
+use wasmer::{
+    FunctionEnvMut,
+    RuntimeError,
+    WasmPtr,
+};
 
 use crate::chain::{
     apply_context::ApplyContext,
-    producer_schedule::{MAX_PRODUCERS, MAX_SCHEDULE_BYTES, ProducerKey},
+    producer_schedule::{
+        MAX_PRODUCERS,
+        MAX_SCHEDULE_BYTES,
+        ProducerKey,
+    },
     resource_limits::ResourceLimitsManager,
     utils::pulse_assert,
     wasm_runtime::WasmContext,

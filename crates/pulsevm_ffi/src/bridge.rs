@@ -112,7 +112,8 @@ pub mod ffi {
     pub struct ChainConfigV0 {
         /// Maximum net usage (in instructions) for a block.
         pub max_block_net_usage: u64,
-        /// Target percent (1% == 100, 100% == 10,000) of max net usage; exceeding triggers congestion handling.
+        /// Target percent (1% == 100, 100% == 10,000) of max net usage; exceeding triggers
+        /// congestion handling.
         pub target_block_net_usage_pct: u32,
         /// Maximum objectively measured net usage the chain allows regardless of account limits.
         pub max_transaction_net_usage: u32,
@@ -126,14 +127,17 @@ pub mod ffi {
 
         /// Maximum billable cpu usage (microseconds) for a block.
         pub max_block_cpu_usage: u32,
-        /// Target percent (1% == 100, 100% == 10,000) of max cpu usage; exceeding triggers congestion handling.
+        /// Target percent (1% == 100, 100% == 10,000) of max cpu usage; exceeding triggers
+        /// congestion handling.
         pub target_block_cpu_usage_pct: u32,
-        /// Maximum billable cpu usage (microseconds) the chain allows regardless of account limits.
+        /// Maximum billable cpu usage (microseconds) the chain allows regardless of account
+        /// limits.
         pub max_transaction_cpu_usage: u32,
         /// Minimum billable cpu usage (microseconds) the chain requires.
         pub min_transaction_cpu_usage: u32,
 
-        /// Max seconds an input transaction's expiration can be ahead of its first-including block.
+        /// Max seconds an input transaction's expiration can be ahead of its first-including
+        /// block.
         pub max_transaction_lifetime: u32,
         /// Seconds after first-executable time until a deferred transaction expires.
         pub deferred_trx_expiration_window: u32,

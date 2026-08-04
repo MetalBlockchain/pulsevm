@@ -17,8 +17,17 @@
 //! | `apply(i64, i64, i64)` export     | required                    |
 
 use wasmparser::{
-    BinaryReaderError, Export, ExternalKind, FuncType, GlobalType, MemoryType, Operator, Parser,
-    Payload, TableType, ValType,
+    BinaryReaderError,
+    Export,
+    ExternalKind,
+    FuncType,
+    GlobalType,
+    MemoryType,
+    Operator,
+    Parser,
+    Payload,
+    TableType,
+    ValType,
 };
 
 // ---------------------------------------------------------------------------
@@ -1431,7 +1440,8 @@ mod tests {
 
     #[test]
     fn test_big_deserialization_many_functions_under_limit() {
-        // maximum_section_elements - 2 extra functions + 1 apply func = maximum_section_elements - 1 total
+        // maximum_section_elements - 2 extra functions + 1 apply func = maximum_section_elements -
+        // 1 total
         let mut wat = String::from(
             "(module \
          (export \"apply\" (func $apply)) \

@@ -2,15 +2,26 @@ use std::collections::BTreeSet;
 
 use pulsevm_crypto::Bytes;
 use pulsevm_error::ChainError;
-use pulsevm_proc_macros::{NumBytes, Read, Write};
+use pulsevm_proc_macros::{
+    NumBytes,
+    Read,
+    Write,
+};
 use pulsevm_serialization::Write;
 use serde::Serialize;
 use sha2::Digest as Sha2Digest;
 
-use crate::utils::Digest;
 use crate::{
-    chain::{id::Id, transaction::transaction::Transaction},
-    crypto::{PrivateKey, PublicKey, Signature},
+    chain::{
+        id::Id,
+        transaction::transaction::Transaction,
+    },
+    crypto::{
+        PrivateKey,
+        PublicKey,
+        Signature,
+    },
+    utils::Digest,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Read, Write, NumBytes, Serialize, Default)]
@@ -100,14 +111,21 @@ pub fn signing_digest(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeSet, str::FromStr};
+    use std::{
+        collections::BTreeSet,
+        str::FromStr,
+    };
 
     use pulsevm_ffi::TimePointSec;
 
     use crate::{
         crypto::PrivateKey,
         id::Id,
-        transaction::{SignedTransaction, Transaction, TransactionHeader},
+        transaction::{
+            SignedTransaction,
+            Transaction,
+            TransactionHeader,
+        },
     };
 
     #[test]

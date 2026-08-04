@@ -2,7 +2,10 @@ use std::ops::Mul;
 
 use pulsevm_error::ChainError;
 
-use crate::bridge::ffi::{ElasticLimitParameters, Ratio};
+use crate::bridge::ffi::{
+    ElasticLimitParameters,
+    Ratio,
+};
 
 impl ElasticLimitParameters {
     pub fn new(

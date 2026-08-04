@@ -1,5 +1,9 @@
 use pulsevm_ffi::TimePointSec;
-use pulsevm_proc_macros::{NumBytes, Read, Write};
+use pulsevm_proc_macros::{
+    NumBytes,
+    Read,
+    Write,
+};
 use pulsevm_serialization::VarUint32;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Read, Write, NumBytes, Default)]

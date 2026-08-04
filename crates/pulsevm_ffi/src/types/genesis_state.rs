@@ -2,7 +2,9 @@ use cxx::UniquePtr;
 use pulsevm_error::ChainError;
 
 use crate::bridge::ffi::{
-    CxxGenesisState, extract_chain_id_from_genesis_state, parse_genesis_state,
+    CxxGenesisState,
+    extract_chain_id_from_genesis_state,
+    parse_genesis_state,
 };
 
 impl CxxGenesisState {

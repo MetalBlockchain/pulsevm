@@ -1,8 +1,15 @@
 use std::fmt;
 
-use pulsevm_proc_macros::{NumBytes, Read, Write};
+use pulsevm_proc_macros::{
+    NumBytes,
+    Read,
+    Write,
+};
 
-use crate::chain::{asset::Asset, name::Name};
+use crate::chain::{
+    asset::Asset,
+    name::Name,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Read, Write, NumBytes)]
 pub struct ExtendedAsset {

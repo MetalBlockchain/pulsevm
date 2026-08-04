@@ -3,13 +3,27 @@
 //! the live state. This is what makes the incremental delta log trustworthy —
 //! any mismatch between "in memory" and "reloaded" shrinks to a minimal case.
 
-use proptest::collection::vec;
-use proptest::prelude::*;
-use pulsevm_arena::{ArenaObject, Db, IndexedBy, ObjectId, SecondaryIndex, key_index};
+use proptest::{
+    collection::vec,
+    prelude::*,
+};
+use pulsevm_arena::{
+    ArenaObject,
+    Db,
+    IndexedBy,
+    ObjectId,
+    SecondaryIndex,
+    key_index,
+};
 
 #[repr(C)]
 #[derive(
-    Clone, Copy, Default, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable,
+    Clone,
+    Copy,
+    Default,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::Immutable,
     zerocopy::KnownLayout,
 )]
 struct Account {

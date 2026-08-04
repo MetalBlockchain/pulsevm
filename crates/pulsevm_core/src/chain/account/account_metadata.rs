@@ -1,7 +1,14 @@
 use pulsevm_ffi::BlockTimestamp;
-use pulsevm_proc_macros::{NumBytes, Read, Write};
+use pulsevm_proc_macros::{
+    NumBytes,
+    Read,
+    Write,
+};
 
-use crate::chain::{Name, id::Id};
+use crate::chain::{
+    Name,
+    id::Id,
+};
 
 #[derive(Debug, Clone, Default, Read, Write, NumBytes)]
 pub struct AccountMetadata {

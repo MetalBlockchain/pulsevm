@@ -1,10 +1,17 @@
 use pulsevm_ffi::BlockTimestamp;
-use pulsevm_proc_macros::{NumBytes, Read, Write};
+use pulsevm_proc_macros::{
+    NumBytes,
+    Read,
+    Write,
+};
 
 use crate::chain::{
     account::AccountDelta,
     id::Id,
-    transaction::{ActionTrace, TransactionReceiptHeader},
+    transaction::{
+        ActionTrace,
+        TransactionReceiptHeader,
+    },
 };
 
 #[derive(Default, Clone, Read, Write, NumBytes)]

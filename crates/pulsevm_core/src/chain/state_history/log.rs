@@ -1,9 +1,23 @@
 use std::{
     collections::BTreeMap,
     fmt,
-    fs::{File, OpenOptions},
-    io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
-    path::{Path, PathBuf},
+    fs::{
+        File,
+        OpenOptions,
+    },
+    io::{
+        self,
+        BufReader,
+        BufWriter,
+        Read,
+        Seek,
+        SeekFrom,
+        Write,
+    },
+    path::{
+        Path,
+        PathBuf,
+    },
     sync::Mutex,
 };
 
@@ -641,7 +655,10 @@ fn scan_entries(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{
+        AtomicU32,
+        Ordering,
+    };
 
     /// Number of blocks the generated fixture contains. Several tests
     /// require at least 3 (open, prune); 5 leaves comfortable margin.

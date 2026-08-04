@@ -1,4 +1,8 @@
-use pulsevm_serialization::{NumBytes, Read, ReadError};
+use pulsevm_serialization::{
+    NumBytes,
+    Read,
+    ReadError,
+};
 
 pub enum RequestType {
     GetStatusRequestV0,

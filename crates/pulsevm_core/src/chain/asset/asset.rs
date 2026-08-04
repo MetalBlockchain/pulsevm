@@ -1,10 +1,27 @@
-use std::{fmt, str::FromStr};
+use std::{
+    fmt,
+    str::FromStr,
+};
 
-use pulsevm_proc_macros::{NumBytes, Write};
-use pulsevm_serialization::{Read, ReadError};
-use serde::{Deserialize, Serialize, de};
+use pulsevm_proc_macros::{
+    NumBytes,
+    Write,
+};
+use pulsevm_serialization::{
+    Read,
+    ReadError,
+};
+use serde::{
+    Deserialize,
+    Serialize,
+    de,
+};
 
-use crate::chain::asset::{MAX_PRECISION, Symbol, SymbolCode};
+use crate::chain::asset::{
+    MAX_PRECISION,
+    Symbol,
+    SymbolCode,
+};
 
 /// Matches nodeos `asset::max_amount`. Amounts are bounded well inside i64 so
 /// that addition of two valid assets cannot overflow.
@@ -40,7 +57,9 @@ impl Asset {
     pub fn try_new(amount: i64, symbol: Symbol) -> Result<Self, ParseAssetError> {
         let asset = Asset { amount, symbol };
         if !asset.is_amount_within_range() {
-            return Err(ParseAssetError("magnitude of asset amount must be less than 2^62".into()));
+            return Err(ParseAssetError(
+                "magnitude of asset amount must be less than 2^62".into(),
+            ));
         }
         if !asset.symbol.is_valid() {
             return Err(ParseAssetError("invalid symbol".into()));
@@ -242,7 +261,11 @@ mod tests {
             "1000000 USD",
             "0.1 CUR",
         ] {
-            assert_eq!(s.parse::<Asset>().unwrap().to_string(), s, "round trip: {s}");
+            assert_eq!(
+                s.parse::<Asset>().unwrap().to_string(),
+                s,
+                "round trip: {s}"
+            );
         }
     }
 

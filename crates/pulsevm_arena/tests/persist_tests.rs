@@ -3,11 +3,23 @@
 
 use std::io::Write;
 
-use pulsevm_arena::{ArenaObject, Db, IndexedBy, ObjectId, SecondaryIndex, key_index};
+use pulsevm_arena::{
+    ArenaObject,
+    Db,
+    IndexedBy,
+    ObjectId,
+    SecondaryIndex,
+    key_index,
+};
 
 #[repr(C)]
 #[derive(
-    Clone, Copy, Default, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable,
+    Clone,
+    Copy,
+    Default,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::Immutable,
     zerocopy::KnownLayout,
 )]
 struct Account {
@@ -55,7 +67,8 @@ fn checkpoint_plus_delta_round_trips() {
 
     // Changes after the checkpoint go only to the delta log.
     db.create::<Account>(|a| a.name = 100).unwrap();
-    db.modify::<Account>(ObjectId::new(50), |a| a.value = 999).unwrap();
+    db.modify::<Account>(ObjectId::new(50), |a| a.value = 999)
+        .unwrap();
     db.remove::<Account>(ObjectId::new(10)).unwrap();
     db.flush_delta(&wal).unwrap();
 
@@ -66,9 +79,19 @@ fn checkpoint_plus_delta_round_trips() {
     assert_eq!(r.table::<Account>().unwrap().len(), 100); // 100 + 1 - 1
     assert!(r.find::<Account>(ObjectId::new(10)).unwrap().is_none());
     assert_eq!(r.get::<Account>(ObjectId::new(50)).unwrap().value, 999);
-    assert_eq!(r.find_by::<Account, ByName>(&100).unwrap().unwrap().id.raw(), 100);
+    assert_eq!(
+        r.find_by::<Account, ByName>(&100)
+            .unwrap()
+            .unwrap()
+            .id
+            .raw(),
+        100
+    );
     // Next id continues past the tombstone.
-    assert_eq!(r.create::<Account>(|a| a.name = 5000).unwrap().id.raw(), 101);
+    assert_eq!(
+        r.create::<Account>(|a| a.name = 5000).unwrap().id.raw(),
+        101
+    );
 }
 
 #[test]
@@ -91,7 +114,10 @@ fn multiple_delta_frames_replay_in_order() {
     r.load(&snap).unwrap();
     r.replay_log(&wal).unwrap();
     assert_eq!(r.table::<Account>().unwrap().len(), 50);
-    assert_eq!(r.find_by::<Account, ByName>(&37).unwrap().unwrap().id.raw(), 37);
+    assert_eq!(
+        r.find_by::<Account, ByName>(&37).unwrap().unwrap().id.raw(),
+        37
+    );
 }
 
 #[test]
@@ -124,7 +150,8 @@ fn state_root_is_stable_across_reload_and_sensitive_to_change() {
         db.create::<Account>(|a| a.name = i).unwrap();
     }
     db.checkpoint(&snap).unwrap();
-    db.modify::<Account>(ObjectId::new(7), |a| a.value = 1).unwrap();
+    db.modify::<Account>(ObjectId::new(7), |a| a.value = 1)
+        .unwrap();
     db.remove::<Account>(ObjectId::new(3)).unwrap();
     db.flush_delta(&wal).unwrap();
     let root = db.state_root();
@@ -136,7 +163,8 @@ fn state_root_is_stable_across_reload_and_sensitive_to_change() {
     assert_eq!(r.state_root(), root);
 
     // Any change moves the root.
-    r.modify::<Account>(ObjectId::new(7), |a| a.value = 2).unwrap();
+    r.modify::<Account>(ObjectId::new(7), |a| a.value = 2)
+        .unwrap();
     assert_ne!(r.state_root(), root);
 }
 
@@ -163,5 +191,8 @@ fn torn_final_frame_is_ignored() {
     r.load(&snap).unwrap();
     r.replay_log(&wal).unwrap(); // must not error, must ignore the torn frame
     assert_eq!(r.table::<Account>().unwrap().len(), 1);
-    assert_eq!(r.find_by::<Account, ByName>(&1).unwrap().unwrap().id.raw(), 0);
+    assert_eq!(
+        r.find_by::<Account, ByName>(&1).unwrap().unwrap().id.raw(),
+        0
+    );
 }

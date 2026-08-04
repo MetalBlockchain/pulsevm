@@ -27,13 +27,22 @@ pub mod name {
 }
 pub mod authority {
     pub use pulsevm_ffi::{
-        Authority, KeyWeight, PermissionLevel, PermissionLevelWeight, WaitWeight,
+        Authority,
+        KeyWeight,
+        PermissionLevel,
+        PermissionLevelWeight,
+        WaitWeight,
     };
 }
 
 pub mod time {
     pub use pulsevm_ffi::{
-        Microseconds, TimePoint, TimePointSec, microseconds, milliseconds, seconds,
+        Microseconds,
+        TimePoint,
+        TimePointSec,
+        microseconds,
+        milliseconds,
+        seconds,
     };
 }
 

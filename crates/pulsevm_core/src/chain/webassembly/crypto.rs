@@ -1,10 +1,20 @@
-use pulsevm_serialization::{Read, Write};
+use pulsevm_serialization::{
+    Read,
+    Write,
+};
 use sha1::Digest as Sha1Digest;
-use wasmer::{FunctionEnvMut, RuntimeError, WasmPtr};
+use wasmer::{
+    FunctionEnvMut,
+    RuntimeError,
+    WasmPtr,
+};
 
 use crate::{
     chain::wasm_runtime::WasmContext,
-    crypto::{PublicKey, Signature},
+    crypto::{
+        PublicKey,
+        Signature,
+    },
     utils::Digest,
 };
 
