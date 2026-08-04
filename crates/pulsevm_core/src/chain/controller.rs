@@ -54,6 +54,7 @@ use crate::{
         },
         resource_limits::ResourceLimitsManager,
         state_history::StateHistoryLog,
+        state_sync,
         transaction::{
             PackedTransaction,
             SignedTransaction,
@@ -147,6 +148,11 @@ pub struct Controller {
     // accept can persist the synced producer schedule beside them.
     db_path: Option<String>,
 
+    // The snapshot last advertised via `produce_state_summary`, cached so this
+    // node can serve download chunks to a syncing peer. `None` until a summary
+    // is produced or after a sync is applied.
+    snapshot_cache: Option<CachedSnapshot>,
+
     // Active block producers and their signing keys. A block validates only if
     // signed by the key its producer holds here. Seeded from genesis, changed by
     // a block whose header carries `new_producers`, and reconstructed from the
@@ -210,9 +216,10 @@ impl fmt::Display for ControllerError {
 }
 
 /// An Avalanche state summary: a commitment the engine agrees on (`id`, the
-/// accepted block id, canonical across nodes) plus the opaque `bytes` a syncing
-/// node applies. For this file-copy sync the bytes carry the active schedule,
-/// the snapshot's block, and the physical arena snapshot, in that order.
+/// accepted block id, canonical across nodes) plus small `bytes` describing what
+/// to fetch — the active schedule, the snapshot's block, and the snapshot's
+/// length and hash. The snapshot payload itself is downloaded separately over
+/// AppRequest (see `crate::chain::state_sync`).
 pub struct StateSummary {
     pub id: Id,
     pub height: u64,
@@ -220,8 +227,16 @@ pub struct StateSummary {
 }
 
 /// The producer schedule in force at a synced snapshot, persisted beside the
-/// logs so a restart-after-sync can recover it (see `accept_state_summary`).
+/// logs so a restart-after-sync can recover it (see `apply_state_snapshot`).
 const SYNCED_SCHEDULE_FILE: &str = "synced_schedule.bin";
+
+/// The snapshot a node last advertised in a summary, kept so it can serve the
+/// download chunks without re-snapshotting the arena on every request.
+struct CachedSnapshot {
+    height: u32,
+    hash: [u8; 32],
+    envelope: Vec<u8>,
+}
 
 impl Controller {
     pub fn new() -> Self {
@@ -243,6 +258,7 @@ impl Controller {
             chain_state_log: None,
             node_config: None,
             db_path: None,
+            snapshot_cache: None,
             active_schedule: ProducerSchedule::default(),
 
             pending_chain: Vec::new(),
@@ -807,6 +823,20 @@ impl Controller {
         block: &SignedBlock,
         mempool: &mut Mempool,
     ) -> Result<(), ChainError> {
+        self.verify_block_inner(block, mempool, true).await
+    }
+
+    /// The verify path, with an escape hatch used only when replaying real
+    /// testnet blocks: `enforce_semantics = false` still executes and retains the
+    /// block but skips the action/transaction merkle-root comparison, which this
+    /// VM does not yet reproduce bit-for-bit (an onblock/sequence fidelity gap,
+    /// tracked separately). Production always passes `true`.
+    async fn verify_block_inner(
+        &mut self,
+        block: &SignedBlock,
+        mempool: &mut Mempool,
+        enforce_semantics: bool,
+    ) -> Result<(), ChainError> {
         if self.verified_blocks.contains_key(&block.id()?) {
             return Ok(());
         } else if let Some(block_log) = &self.block_log {
@@ -865,9 +895,11 @@ impl Controller {
                 }
             };
 
-        if let Err(e) = block.validate_semantically(transaction_mroot, action_mroot) {
-            self.db.arena_undo();
-            return Err(e);
+        if enforce_semantics {
+            if let Err(e) = block.validate_semantically(transaction_mroot, action_mroot) {
+                self.db.arena_undo();
+                return Err(e);
+            }
         }
 
         // The schedule change the header advertises must match what the block's
@@ -1359,59 +1391,113 @@ impl Controller {
     //
     // chainbase has no object serializer and its SHiP delta stream is lossy for
     // reconstruction, so state moves as a physical copy of the arena file (see
-    // `Database::snapshot_bytes`). The summary bytes carry everything a peer
-    // needs to adopt the tip: the active schedule, the snapshot's block, and the
-    // arena snapshot. Because there is no bulk P2P channel yet, the payload rides
-    // in the summary bytes themselves — workable for a controlled subnet, and the
-    // seam where an AppRequest-based transfer would slot in later.
+    // `Database::snapshot_bytes`). The summary itself is a small commitment; the
+    // snapshot payload is fetched separately, chunk by chunk, over the AppRequest
+    // channel (see `crate::chain::state_sync` and the node's sync manager). The
+    // producing side caches the snapshot it advertised so it can serve those
+    // chunks without re-snapshotting per request.
 
-    /// Produce a state summary for the last accepted block.
+    /// Produce a state summary for the last accepted block, caching the snapshot
+    /// it commits to so `serve_snapshot_chunk` can answer download requests.
     ///
-    /// Snapshots the live arena, so the caller must hold the controller
-    /// exclusively (no block being processed): `snapshot_bytes` briefly drops
-    /// and remaps the database.
-    pub fn produce_state_summary(&self) -> Result<StateSummary, ChainError> {
-        let block = &self.last_accepted_block;
-        let block_bytes = block
+    /// Snapshots the live arena when the cache is stale, so the caller must hold
+    /// the controller exclusively (no block being processed): `snapshot_bytes`
+    /// briefly drops and remaps the database.
+    pub fn produce_state_summary(&mut self) -> Result<StateSummary, ChainError> {
+        let height = self.last_accepted_block.block_num();
+
+        // Reuse the cached snapshot while it still commits to the tip; otherwise
+        // take a fresh one. Re-snapshotting scans the whole arena, so caching
+        // matters when a peer pulls many chunks for the same summary.
+        if self.snapshot_cache.as_ref().map(|c| c.height) != Some(height) {
+            let envelope = self.db.snapshot_bytes()?;
+            let hash = *Digest::hash(&envelope).as_bytes();
+            self.snapshot_cache = Some(CachedSnapshot {
+                height,
+                hash,
+                envelope,
+            });
+        }
+        let cache = self.snapshot_cache.as_ref().unwrap();
+
+        let block_bytes = self
+            .last_accepted_block
             .pack()
             .map_err(|e| ChainError::InternalError(format!("summary: pack block: {}", e)))?;
         let schedule_bytes = self
             .active_schedule
             .pack()
             .map_err(|e| ChainError::InternalError(format!("summary: pack schedule: {}", e)))?;
-        let snapshot = self.db.snapshot_bytes()?;
-
-        let mut bytes =
-            Vec::with_capacity(8 + schedule_bytes.len() + block_bytes.len() + snapshot.len());
-        bytes.extend_from_slice(&(schedule_bytes.len() as u32).to_le_bytes());
-        bytes.extend_from_slice(&schedule_bytes);
-        bytes.extend_from_slice(&(block_bytes.len() as u32).to_le_bytes());
-        bytes.extend_from_slice(&block_bytes);
-        bytes.extend_from_slice(&snapshot);
+        let bytes = state_sync::encode_summary_bytes(
+            &schedule_bytes,
+            &block_bytes,
+            cache.envelope.len() as u64,
+            &cache.hash,
+        );
 
         Ok(StateSummary {
             id: self.last_accepted_block_id.clone(),
-            height: block.block_num() as u64,
+            height: height as u64,
             bytes,
         })
     }
 
     /// Read a summary's id and height without applying it.
     pub fn parse_state_summary(bytes: &[u8]) -> Result<(Id, u64), ChainError> {
-        let (_schedule, block, _snapshot) = Self::split_summary(bytes)?;
-        Ok((block.id()?, block.block_num() as u64))
+        let target = state_sync::decode_summary_bytes(bytes)?;
+        Ok((target.block.id()?, target.height))
     }
 
-    /// Apply a received state summary: swap the arena to the snapshot, re-base
-    /// the block log to the snapshot's block, and adopt it as the tip.
+    /// Parse a summary into a [`SyncTarget`] the sync manager can drive a
+    /// download from.
+    pub fn sync_target_from_summary(bytes: &[u8]) -> Result<state_sync::SyncTarget, ChainError> {
+        state_sync::decode_summary_bytes(bytes)
+    }
+
+    /// Serve one slice of the snapshot a peer is downloading. Answered only when
+    /// the cached snapshot matches the requested `height` and `hash`; a stale or
+    /// absent cache is an error the caller turns into an AppRequest failure so the
+    /// peer retries elsewhere or re-fetches the summary.
+    pub fn serve_snapshot_chunk(
+        &self,
+        height: u64,
+        hash: &[u8; 32],
+        offset: u64,
+        len: u32,
+    ) -> Result<Vec<u8>, ChainError> {
+        let cache = self
+            .snapshot_cache
+            .as_ref()
+            .ok_or_else(|| ChainError::InternalError("serve chunk: no snapshot cached".into()))?;
+        if cache.height as u64 != height || &cache.hash != hash {
+            return Err(ChainError::InternalError(
+                "serve chunk: request does not match the cached snapshot".into(),
+            ));
+        }
+        let start = offset as usize;
+        let end = start
+            .checked_add(len as usize)
+            .filter(|&e| e <= cache.envelope.len())
+            .ok_or_else(|| ChainError::InternalError("serve chunk: out of range".into()))?;
+        Ok(cache.envelope[start..end].to_vec())
+    }
+
+    /// Apply a downloaded snapshot: swap the arena to it, re-base the block log to
+    /// the snapshot's block, and adopt it as the tip.
     ///
     /// State sync fast-forwards past blocks this node never downloaded, so the
     /// block log can't stay gapless from genesis — it is re-based to start at the
-    /// snapshot block, and the trace/chain-state logs are cleared to resume at
-    /// the next accepted block. The schedule in force at the snapshot rides in
-    /// the summary and is persisted so a later restart recovers it.
-    pub fn accept_state_summary(&mut self, bytes: &[u8]) -> Result<(), ChainError> {
-        let (schedule, block, snapshot) = Self::split_summary(bytes)?;
+    /// snapshot block, and the trace/chain-state logs are cleared to resume at the
+    /// next accepted block. The schedule in force at the snapshot is persisted so
+    /// a later restart recovers it. `envelope` has already been verified against
+    /// the summary hash by the download driver; `restore_from_bytes` re-checks its
+    /// internal checksum.
+    pub fn apply_state_snapshot(
+        &mut self,
+        block: SignedBlock,
+        schedule: ProducerSchedule,
+        envelope: &[u8],
+    ) -> Result<(), ChainError> {
         let block_id = block.id()?;
 
         // Drop speculative and cached blocks: after a sync the tip is the
@@ -1421,7 +1507,7 @@ impl Controller {
 
         // Swap chainbase to the snapshot's state; its revision becomes the
         // snapshot height.
-        self.db.restore_from_bytes(snapshot)?;
+        self.db.restore_from_bytes(envelope)?;
 
         // Re-base the logs. The block log starts again at the snapshot block so a
         // restart reconstructs the tip from here; the state-history logs have no
@@ -1454,38 +1540,9 @@ impl Controller {
         self.last_accepted_block = block;
         self.last_accepted_block_id = block_id.clone();
         self.preferred_id = block_id;
+        // The cache commits to the pre-sync tip; drop it.
+        self.snapshot_cache = None;
         Ok(())
-    }
-
-    /// Split a summary into (schedule, block, snapshot). The two length-prefixed
-    /// sections are the schedule and the block; the remainder is the snapshot
-    /// envelope, validated when it is applied.
-    fn split_summary(bytes: &[u8]) -> Result<(ProducerSchedule, SignedBlock, &[u8]), ChainError> {
-        fn section<'a>(bytes: &'a [u8], pos: &mut usize) -> Result<&'a [u8], ChainError> {
-            if *pos + 4 > bytes.len() {
-                return Err(ChainError::InternalError(
-                    "summary: truncated length".into(),
-                ));
-            }
-            let len = u32::from_le_bytes(bytes[*pos..*pos + 4].try_into().unwrap()) as usize;
-            *pos += 4;
-            if *pos + len > bytes.len() {
-                return Err(ChainError::InternalError(
-                    "summary: truncated section".into(),
-                ));
-            }
-            let s = &bytes[*pos..*pos + len];
-            *pos += len;
-            Ok(s)
-        }
-
-        let mut pos = 0usize;
-        let schedule = ProducerSchedule::read_bounded(section(bytes, &mut pos)?)
-            .map_err(|e| ChainError::InternalError(format!("summary: read schedule: {}", e)))?;
-        let block_bytes = section(bytes, &mut pos)?;
-        let block = SignedBlock::read(block_bytes, &mut 0)
-            .map_err(|e| ChainError::InternalError(format!("summary: read block: {}", e)))?;
-        Ok((schedule, block, &bytes[pos..]))
     }
 
     fn write_synced_schedule(&self, schedule: &ProducerSchedule) -> Result<(), ChainError> {
@@ -4115,7 +4172,6 @@ mod tests {
     }
 
     /// ISO block timestamp -> Antelope slot (500ms interval, 2000-01-01 epoch).
-    #[cfg(feature = "arena-shadow")]
     fn iso_to_slot(iso: &str) -> u32 {
         let fmt = if iso.contains('.') {
             "%Y-%m-%dT%H:%M:%S%.f"
@@ -4134,7 +4190,6 @@ mod tests {
     /// header (proven id-exact) plus every transaction rebuilt from its wire
     /// data (signatures, compression, packed_trx, packed_context_free_data), so
     /// the block re-derives the same merkle roots on replay.
-    #[cfg(feature = "arena-shadow")]
     fn reconstruct_block(r: &serde_json::Value) -> Result<SignedBlock, ChainError> {
         use crate::chain::{
             block::SignedBlockHeader,
@@ -6065,8 +6120,18 @@ mod tests {
         assert_eq!(parsed_id, summary.id);
         assert_eq!(parsed_height, producer_height as u64);
 
-        // Accept transfers state, tip, and schedule.
-        syncer.accept_state_summary(&summary.bytes)?;
+        // Download the snapshot chunk by chunk from the producer, exactly as the
+        // P2P driver does — here the fetch is a direct call, not an AppRequest.
+        let target = Controller::sync_target_from_summary(&summary.bytes)?;
+        let (hash, height) = (target.hash, target.height);
+        let envelope = crate::chain::state_sync::download_snapshot(&target, |off, len| {
+            let chunk = producer.serve_snapshot_chunk(height, &hash, off, len);
+            async move { chunk }
+        })
+        .await?;
+
+        // Apply transfers state, tip, and schedule.
+        syncer.apply_state_snapshot(target.block.clone(), target.schedule.clone(), &envelope)?;
         assert!(
             !syncer.database().find_account_metadata(name)?.is_null(),
             "state not transferred"
@@ -6089,6 +6154,219 @@ mod tests {
             restarted.active_schedule, producer_schedule,
             "synced schedule lost across restart"
         );
+
+        Ok(())
+    }
+
+    /// End-to-end state sync over REAL testnet blocks. Replays blocks fetched by
+    /// scripts/fetch-blocks.sh into a producer, then has a fresh node sync the
+    /// resulting state by downloading the snapshot chunk by chunk (the exact
+    /// driver the P2P AppRequest path uses) and applying it — then restarts the
+    /// synced node to prove the re-based log persists. Ignored by default; run:
+    ///   PULSEVM_RPC_BLOCKS_DIR=/tmp/rpcblocks cargo test -p pulsevm_core \
+    ///     state_sync_real_testnet_blocks -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn state_sync_real_testnet_blocks() -> Result<(), ChainError> {
+        let Ok(dir) = std::env::var("PULSEVM_RPC_BLOCKS_DIR") else {
+            eprintln!("set PULSEVM_RPC_BLOCKS_DIR (see scripts/fetch-blocks.sh) to run");
+            return Ok(());
+        };
+        let chain_id =
+            Id::from_str("531a7002b4a4b67987f8706c01b965c76ffc3ad301608ac61a1f738cba6c3a9a")
+                .unwrap();
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+
+        // Collect the block fixtures in order.
+        let mut files: Vec<_> = fs::read_dir(&dir)
+            .expect("blocks dir")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().map(|x| x == "json").unwrap_or(false))
+            .collect();
+        files.sort();
+
+        // Patch genesis so our block 1 matches the testnet's: the real initial
+        // timestamp (block 1's) and the real system-account key (recovered from
+        // the first signed transaction). Same procedure as replay_testnet_blocks.
+        let b1: serde_json::Value =
+            serde_json::from_slice(&fs::read(files.first().expect("no block fixtures")).unwrap())
+                .unwrap();
+        assert_eq!(b1["result"]["block_num"].as_u64(), Some(1));
+        let ts = b1["result"]["timestamp"]
+            .as_str()
+            .unwrap()
+            .trim_end_matches(".000");
+        let mut g: serde_json::Value =
+            serde_json::from_slice(&fs::read(repo_root.join("genesis.json")).unwrap()).unwrap();
+        g["initial_timestamp"] = json!(ts);
+        for f in &files {
+            let v: serde_json::Value = serde_json::from_slice(&fs::read(f).unwrap()).unwrap();
+            let r = &v["result"];
+            if r["transactions"]
+                .as_array()
+                .map(|a| !a.is_empty())
+                .unwrap_or(false)
+            {
+                let b = reconstruct_block(r)?;
+                let keys = b.transactions[0]
+                    .trx()
+                    .get_signed_transaction()
+                    .recovered_keys(&chain_id)?;
+                if let Some(k) = keys.iter().next() {
+                    g["initial_key"] = json!(k.to_string());
+                }
+                break;
+            }
+        }
+        // Some early system transactions are billed far above the default 150ms
+        // per-transaction cap (privileged eosio actions bypass CPU limits on the
+        // real chain; our VM still enforces them), so raise the limits for replay
+        // — we only need these blocks to execute and build state.
+        if let Some(cfg) = g.get_mut("initial_configuration") {
+            cfg["max_transaction_cpu_usage"] = json!(4_000_000_000u64);
+            cfg["max_block_cpu_usage"] = json!(4_000_000_000u64);
+        }
+        let genesis_bytes = serde_json::to_vec(&g).unwrap();
+        // A small arena keeps the snapshot copy cheap; the default is tens of GB.
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": "PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez",
+            "db_size": 512u64 * 1024 * 1024,
+        })
+        .to_string()
+        .into_bytes();
+        let init = |dir: &str| -> Result<Controller, ChainError> {
+            let mut c = Controller::new();
+            c.initialize(&chain_id, &config_bytes, &genesis_bytes, dir)?;
+            Ok(c)
+        };
+
+        // ---- Producer: replay the real blocks to build authentic state. ----
+        let producer_temp = get_temp_dir();
+        let mut producer = init(producer_temp.path().to_str().unwrap())?;
+        assert_eq!(
+            producer.last_accepted_block().id()?.to_string(),
+            b1["result"]["id"].as_str().unwrap(),
+            "our genesis block id != testnet block 1 — genesis mismatch"
+        );
+
+        // getBlock omits the producer signature, so re-sign each block with a key
+        // we hold and seed the schedule with it (as replay_testnet_blocks does).
+        let block_signer =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        producer.active_schedule = ProducerSchedule {
+            version: 0,
+            producers: vec![ProducerKey {
+                producer_name: Name::from_str("pulse")?,
+                block_signing_key: block_signer.get_public_key(),
+            }],
+        };
+
+        let start = producer.last_accepted_block().block_num() + 1;
+        let mut mempool = Mempool::new();
+        let mut replayed = 0u32;
+        for f in &files {
+            // Skip any fixture that didn't fetch cleanly (a transient RPC error
+            // can leave a non-JSON file).
+            let Ok(bytes) = fs::read(f) else { continue };
+            let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                continue;
+            };
+            if v.get("result").and_then(|r| r.get("block_num")).is_none() {
+                continue;
+            }
+            let r = &v["result"];
+            let n = r["block_num"].as_u64().unwrap_or(0) as u32;
+            if n < start {
+                continue;
+            }
+            let mut block = reconstruct_block(r)?;
+            let sig_digest: crate::utils::Digest =
+                block.signed_block_header.header.sig_digest()?.0.into();
+            block.signed_block_header.signature = block_signer.sign(&sig_digest)?;
+            // Execute the real block but don't enforce testnet's canonical merkle
+            // roots (this VM doesn't reproduce them yet — our ungated onblock adds
+            // an action receipt the real chain didn't have at this height); the
+            // point is to build real state to sync, not to prove re-execution
+            // fidelity.
+            if let Err(e) = producer
+                .verify_block_inner(&block, &mut mempool, false)
+                .await
+            {
+                eprintln!("replay stalled at block {n}: {e:?}");
+                break;
+            }
+            producer.accept_block(&block.id()?, &mut mempool)?;
+            producer.set_preferred_id(block.id()?);
+            replayed += 1;
+        }
+        let height = producer.last_accepted_block().block_num();
+        assert!(
+            replayed >= 50,
+            "replayed only {replayed} blocks — too few for a meaningful sync test"
+        );
+        eprintln!("replayed {replayed} real blocks, tip at height {height}");
+        // The system account exists in the real chain's state.
+        let pulse = Name::from_str("pulse")?.as_u64();
+        assert!(!producer.database().find_account(pulse)?.is_null());
+
+        // ---- Sync: a fresh node downloads and applies the snapshot. ----
+        let summary = producer.produce_state_summary()?;
+        let producer_tip_id = producer.last_accepted_block().id()?;
+
+        let syncer_temp = get_temp_dir();
+        let syncer_path = syncer_temp.path().to_str().unwrap().to_string();
+        let mut syncer = init(&syncer_path)?;
+        assert!(
+            syncer.database().find_account(pulse)?.is_null()
+                || syncer.last_accepted_block().block_num() == 1,
+            "syncer should start from genesis, not the producer's height"
+        );
+
+        let target = Controller::sync_target_from_summary(&summary.bytes)?;
+        assert_eq!(target.height, height as u64);
+        let (hash, th) = (target.hash, target.height);
+        let envelope = crate::chain::state_sync::download_snapshot(&target, |off, len| {
+            let chunk = producer.serve_snapshot_chunk(th, &hash, off, len);
+            async move { chunk }
+        })
+        .await?;
+        eprintln!(
+            "downloaded {} snapshot bytes in {}-byte chunks",
+            envelope.len(),
+            crate::chain::state_sync::SNAPSHOT_CHUNK_LEN
+        );
+
+        syncer.apply_state_snapshot(target.block.clone(), target.schedule.clone(), &envelope)?;
+
+        // The synced node now holds the producer's tip, revision and state.
+        assert_eq!(syncer.last_accepted_block().block_num(), height);
+        assert_eq!(syncer.last_accepted_block().id()?, producer_tip_id);
+        assert_eq!(syncer.database().revision(), height as i64);
+        assert!(
+            !syncer.database().find_account(pulse)?.is_null(),
+            "system account missing after sync"
+        );
+        // Faithfulness: re-snapshotting the synced arena reproduces the exact
+        // payload hash the producer advertised — the transfer was lossless.
+        let re = syncer.produce_state_summary()?;
+        let re_target = Controller::sync_target_from_summary(&re.bytes)?;
+        assert_eq!(
+            re_target.hash, target.hash,
+            "re-snapshot of synced state does not match the producer's snapshot"
+        );
+
+        // A restart reconstructs the synced tip from the re-based block log.
+        syncer.shutdown()?;
+        let restarted = init(&syncer_path)?;
+        assert_eq!(restarted.last_accepted_block().block_num(), height);
+        assert_eq!(restarted.last_accepted_block().id()?, producer_tip_id);
+        assert!(!restarted.database().find_account(pulse)?.is_null());
+        eprintln!("synced node restarted cleanly at height {height}");
 
         Ok(())
     }

@@ -44,6 +44,7 @@ use pulsevm_serialization::{
 };
 use spdlog::{
     debug,
+    error,
     info,
     warn,
 };
@@ -211,6 +212,9 @@ pub struct VirtualMachine {
     rpc_service: chain::RpcService,
     block_timer: Arc<RwLock<BlockTimer>>,
     ready_to_terminate: Arc<AtomicBool>,
+    // Fired when a background state sync finishes applying, so `wait_for_event`
+    // can report MESSAGE_STATE_SYNC_FINISHED to the engine.
+    sync_finished: Arc<tokio::sync::Notify>,
 }
 
 impl VirtualMachine {
@@ -230,6 +234,7 @@ impl VirtualMachine {
             rpc_service: rpc_service,
             block_timer,
             ready_to_terminate: Arc::new(AtomicBool::new(false)),
+            sync_finished: Arc::new(tokio::sync::Notify::new()),
         })
     }
 }
@@ -329,14 +334,22 @@ impl Vm for VirtualMachine {
         &self,
         _request: Request<()>,
     ) -> Result<tonic::Response<vm::WaitForEventResponse>, Status> {
-        debug!("wait_for_event called, waiting for block build event...");
+        debug!("wait_for_event called, waiting for the next event...");
         let block_timer = self.block_timer.clone();
         let block_timer = block_timer.read().await;
-        block_timer.wait_for_block_build().await;
-        debug!("block build event received, returning from wait_for_event");
+
+        // Wake on whichever comes first: a block is ready to build, or a
+        // background state sync just finished.
+        let message = tokio::select! {
+            _ = block_timer.wait_for_block_build() => vm::Message::BuildBlock,
+            _ = self.sync_finished.notified() => {
+                info!("state sync finished, notifying engine");
+                vm::Message::StateSyncFinished
+            }
+        };
 
         Ok(Response::new(vm::WaitForEventResponse {
-            message: vm::Message::BuildBlock.into(),
+            message: message.into(),
         }))
     }
 
@@ -621,22 +634,80 @@ impl Vm for VirtualMachine {
 
     async fn app_request(
         &self,
-        _request: Request<vm::AppRequestMsg>,
+        request: Request<vm::AppRequestMsg>,
     ) -> Result<tonic::Response<()>, Status> {
+        // A peer is syncing from us and asked for a snapshot chunk. Serve it from
+        // the cached snapshot, or return an AppError so the peer retries.
+        let msg = request.get_ref();
+        let node_id: NodeId = match msg.node_id.clone().try_into() {
+            Ok(id) => id,
+            Err(_) => return Ok(Response::new(())),
+        };
+        let request_id = msg.request_id;
+        let req = match pulsevm_core::state_sync::ChunkRequest::decode(&msg.request) {
+            Ok(req) => req,
+            Err(e) => {
+                let network = self.network_manager.clone();
+                let _ = chain::NetworkManager::send_app_error(
+                    &network,
+                    node_id,
+                    request_id,
+                    1,
+                    format!("bad chunk request: {}", e),
+                )
+                .await;
+                return Ok(Response::new(()));
+            }
+        };
+
+        let served = {
+            let controller = self.controller.read().await;
+            controller.serve_snapshot_chunk(req.height, &req.hash, req.offset, req.len)
+        };
+        let network = self.network_manager.clone();
+        match served {
+            Ok(chunk) => {
+                if let Err(e) =
+                    chain::NetworkManager::send_app_response(&network, node_id, request_id, chunk)
+                        .await
+                {
+                    warn!("failed to send snapshot chunk: {}", e);
+                }
+            }
+            Err(e) => {
+                let _ = chain::NetworkManager::send_app_error(
+                    &network,
+                    node_id,
+                    request_id,
+                    2,
+                    format!("cannot serve chunk: {}", e),
+                )
+                .await;
+            }
+        }
         Ok(Response::new(()))
     }
 
     async fn app_request_failed(
         &self,
-        _request: Request<vm::AppRequestFailedMsg>,
+        request: Request<vm::AppRequestFailedMsg>,
     ) -> Result<tonic::Response<()>, Status> {
+        let msg = request.get_ref();
+        let network = self.network_manager.read().await;
+        network.fail_request(
+            msg.request_id,
+            format!("peer error {}: {}", msg.error_code, msg.error_message),
+        );
         Ok(Response::new(()))
     }
 
     async fn app_response(
         &self,
-        _request: Request<vm::AppResponseMsg>,
+        request: Request<vm::AppResponseMsg>,
     ) -> Result<tonic::Response<()>, Status> {
+        let msg = request.get_ref();
+        let network = self.network_manager.read().await;
+        network.resolve_response(msg.request_id, msg.response.clone());
         Ok(Response::new(()))
     }
 
@@ -847,7 +918,7 @@ impl Vm for VirtualMachine {
         info!("received request: {:?}", request);
         // Exclusive: producing a summary snapshots the arena, which briefly drops
         // and remaps the database.
-        let controller = self.controller.write().await;
+        let mut controller = self.controller.write().await;
         let summary = controller
             .produce_state_summary()
             .map_err(|e| Status::internal(format!("could not produce state summary: {}", e)))?;
@@ -878,7 +949,7 @@ impl Vm for VirtualMachine {
     ) -> Result<tonic::Response<vm::GetStateSummaryResponse>, Status> {
         info!("received request: {:?}", request);
         let requested = request.get_ref().height;
-        let controller = self.controller.write().await;
+        let mut controller = self.controller.write().await;
         // Only the last accepted height can be served: chainbase keeps a single
         // live image, not per-height snapshots.
         if requested != controller.last_accepted_block().block_num() as u64 {
@@ -903,14 +974,59 @@ impl Vm for VirtualMachine {
         request: Request<vm::StateSummaryAcceptRequest>,
     ) -> Result<tonic::Response<vm::StateSummaryAcceptResponse>, Status> {
         info!("received state summary accept request");
-        let mut controller = self.controller.write().await;
-        controller
-            .accept_state_summary(&request.get_ref().bytes)
-            .map_err(|e| Status::internal(format!("could not accept state summary: {}", e)))?;
-        // The whole state is applied synchronously from the summary bytes, so the
-        // sync is complete on return — no asynchronous download follows.
+
+        // Parse the commitment up front so a malformed summary is rejected here,
+        // before we commit to the asynchronous DYNAMIC mode.
+        let target = Controller::sync_target_from_summary(&request.get_ref().bytes)
+            .map_err(|e| Status::invalid_argument(format!("invalid state summary: {}", e)))?;
+
+        // The snapshot payload is downloaded out of band over AppRequest, so the
+        // sync runs in the background and completes later; report DYNAMIC and
+        // signal `wait_for_event` when it finishes. Fetch each chunk from peers,
+        // verify the whole payload against the summary hash, then apply it.
+        let controller = self.controller.clone();
+        let network = self.network_manager.clone();
+        let sync_finished = self.sync_finished.clone();
+        tokio::spawn(async move {
+            let net = network.clone();
+            let height = target.height;
+            let hash = target.hash;
+            let download =
+                pulsevm_core::state_sync::download_snapshot(&target, move |offset, len| {
+                    let net = net.clone();
+                    async move {
+                        let req = pulsevm_core::state_sync::ChunkRequest {
+                            height,
+                            hash,
+                            offset,
+                            len,
+                        };
+                        chain::NetworkManager::request_chunk(&net, &req).await
+                    }
+                })
+                .await;
+
+            match download {
+                Ok(envelope) => {
+                    let mut controller = controller.write().await;
+                    match controller.apply_state_snapshot(
+                        target.block.clone(),
+                        target.schedule.clone(),
+                        &envelope,
+                    ) {
+                        Ok(()) => info!("state sync applied at height {}", height),
+                        Err(e) => error!("state sync apply failed: {}", e),
+                    }
+                }
+                Err(e) => error!("state sync download failed: {}", e),
+            }
+            // Wake the engine regardless: on failure it falls back to normal
+            // bootstrapping rather than hanging on wait_for_event.
+            sync_finished.notify_one();
+        });
+
         Ok(Response::new(vm::StateSummaryAcceptResponse {
-            mode: vm::state_summary_accept_response::Mode::Static as i32,
+            mode: vm::state_summary_accept_response::Mode::Dynamic as i32,
             err: 0,
         }))
     }
