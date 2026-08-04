@@ -334,13 +334,23 @@ where
     #[inline]
     fn read(bytes: &[u8], pos: &mut usize) -> Result<Self, ReadError> {
         let len = usize::read(bytes, pos)?;
-        let mut vec = Vec::with_capacity(len);
+        let mut vec = Vec::with_capacity(bounded_capacity::<T>(len, bytes, *pos));
         for _ in 0..len {
             let item = T::read(bytes, pos)?;
             vec.push(item);
         }
         Ok(vec)
     }
+}
+
+/// The capacity to pre-allocate for a length-prefixed collection whose declared
+/// element count came off the wire. Every element occupies at least one byte, so
+/// a count larger than the bytes remaining is already invalid; capping here stops
+/// a few bytes of length prefix from driving a multi-gigabyte reservation before
+/// the first element (which would then fail) is even read.
+#[inline]
+fn bounded_capacity<T>(len: usize, bytes: &[u8], pos: usize) -> usize {
+    len.min(bytes.len().saturating_sub(pos))
 }
 
 impl<T> Read for VecDeque<T>
@@ -350,7 +360,7 @@ where
     #[inline]
     fn read(bytes: &[u8], pos: &mut usize) -> Result<Self, ReadError> {
         let len = usize::read(bytes, pos)?;
-        let mut vec = VecDeque::with_capacity(len);
+        let mut vec = VecDeque::with_capacity(bounded_capacity::<T>(len, bytes, *pos));
         for _ in 0..len {
             let item = T::read(bytes, pos)?;
             vec.push_back(item);
@@ -393,7 +403,7 @@ impl<K: Read + Write + NumBytes + Ord + Hash, V: Read + Write + NumBytes> Read f
     #[inline]
     fn read(bytes: &[u8], pos: &mut usize) -> Result<Self, ReadError> {
         let len = usize::read(bytes, pos)?;
-        let mut map = HashMap::with_capacity(len);
+        let mut map = HashMap::with_capacity(bounded_capacity::<(K, V)>(len, bytes, *pos));
         for _ in 0..len {
             let key = K::read(bytes, pos)?;
             let value = V::read(bytes, pos)?;
@@ -722,5 +732,22 @@ mod tests {
     fn string_num_bytes() {
         assert_eq!("".to_string().num_bytes(), 1);
         assert_eq!("hello".to_string().num_bytes(), 6);
+    }
+
+    #[test]
+    fn vec_read_does_not_preallocate_from_declared_length() {
+        // A VarUint32 length prefix of ~4.29e9 followed by no elements. Reading
+        // must fail on the missing element, not try to reserve billions of slots.
+        let bytes = [0xFF, 0xFF, 0xFF, 0xFF, 0x0F];
+        let mut pos = 0;
+        assert!(Vec::<u32>::read(&bytes, &mut pos).is_err());
+    }
+
+    #[test]
+    fn bounded_capacity_caps_at_remaining_bytes() {
+        let bytes = [0u8; 8];
+        assert_eq!(bounded_capacity::<u32>(1_000_000, &bytes, 2), 6);
+        assert_eq!(bounded_capacity::<u32>(3, &bytes, 2), 3);
+        assert_eq!(bounded_capacity::<u32>(10, &bytes, 20), 0);
     }
 }
