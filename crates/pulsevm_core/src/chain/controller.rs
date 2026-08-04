@@ -143,6 +143,10 @@ pub struct Controller {
     chain_state_log: Option<StateHistoryLog>,
     node_config: Option<NodeConfig>,
 
+    // The data directory the database and logs live in. Retained so state-sync
+    // accept can persist the synced producer schedule beside them.
+    db_path: Option<String>,
+
     // Active block producers and their signing keys. A block validates only if
     // signed by the key its producer holds here. Seeded from genesis, changed by
     // a block whose header carries `new_producers`, and reconstructed from the
@@ -205,6 +209,20 @@ impl fmt::Display for ControllerError {
     }
 }
 
+/// An Avalanche state summary: a commitment the engine agrees on (`id`, the
+/// accepted block id, canonical across nodes) plus the opaque `bytes` a syncing
+/// node applies. For this file-copy sync the bytes carry the active schedule,
+/// the snapshot's block, and the physical arena snapshot, in that order.
+pub struct StateSummary {
+    pub id: Id,
+    pub height: u64,
+    pub bytes: Vec<u8>,
+}
+
+/// The producer schedule in force at a synced snapshot, persisted beside the
+/// logs so a restart-after-sync can recover it (see `accept_state_summary`).
+const SYNCED_SCHEDULE_FILE: &str = "synced_schedule.bin";
+
 impl Controller {
     pub fn new() -> Self {
         // Create a temporary database
@@ -224,6 +242,7 @@ impl Controller {
             trace_log: None,
             chain_state_log: None,
             node_config: None,
+            db_path: None,
             active_schedule: ProducerSchedule::default(),
 
             pending_chain: Vec::new(),
@@ -282,6 +301,8 @@ impl Controller {
                 e, config_json
             ))
         })?);
+
+        self.db_path = Some(db_path.to_string());
 
         // Initialize database
         self.db = Database::new(&db_path, self.node_config.as_ref().unwrap().db_size)
@@ -406,10 +427,20 @@ impl Controller {
                 self.last_accepted_block_id = self.last_accepted_block.id()?;
                 self.preferred_id = self.last_accepted_block.id()?;
 
+                // A state-synced node's schedule base isn't in its (re-based) log:
+                // the pre-sync block that set the schedule was never downloaded, so
+                // the log tip may not carry it. Accept persisted the schedule in
+                // force at the snapshot height beside the logs; load it as the base
+                // before reconstruct overlays any newer in-log change. Absent on a
+                // normally-grown chain, where the genesis seed is the base.
+                if let Some(synced) = Self::load_synced_schedule(db_path) {
+                    self.active_schedule = synced;
+                }
+
                 // Rebuild the active schedule from the committed chain rather than
                 // trusting an out-of-band file: the last block that carried a
                 // `new_producers` names the schedule in force, and if none did the
-                // genesis seed still stands.
+                // base above still stands.
                 self.reconstruct_schedule_from_log(start, end)?;
             }
         }
@@ -1322,6 +1353,156 @@ impl Controller {
         };
 
         return Ok(res);
+    }
+
+    // ----- state sync (Avalanche StateSyncableVM) -------------------------
+    //
+    // chainbase has no object serializer and its SHiP delta stream is lossy for
+    // reconstruction, so state moves as a physical copy of the arena file (see
+    // `Database::snapshot_bytes`). The summary bytes carry everything a peer
+    // needs to adopt the tip: the active schedule, the snapshot's block, and the
+    // arena snapshot. Because there is no bulk P2P channel yet, the payload rides
+    // in the summary bytes themselves — workable for a controlled subnet, and the
+    // seam where an AppRequest-based transfer would slot in later.
+
+    /// Produce a state summary for the last accepted block.
+    ///
+    /// Snapshots the live arena, so the caller must hold the controller
+    /// exclusively (no block being processed): `snapshot_bytes` briefly drops
+    /// and remaps the database.
+    pub fn produce_state_summary(&self) -> Result<StateSummary, ChainError> {
+        let block = &self.last_accepted_block;
+        let block_bytes = block
+            .pack()
+            .map_err(|e| ChainError::InternalError(format!("summary: pack block: {}", e)))?;
+        let schedule_bytes = self
+            .active_schedule
+            .pack()
+            .map_err(|e| ChainError::InternalError(format!("summary: pack schedule: {}", e)))?;
+        let snapshot = self.db.snapshot_bytes()?;
+
+        let mut bytes =
+            Vec::with_capacity(8 + schedule_bytes.len() + block_bytes.len() + snapshot.len());
+        bytes.extend_from_slice(&(schedule_bytes.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&schedule_bytes);
+        bytes.extend_from_slice(&(block_bytes.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&block_bytes);
+        bytes.extend_from_slice(&snapshot);
+
+        Ok(StateSummary {
+            id: self.last_accepted_block_id.clone(),
+            height: block.block_num() as u64,
+            bytes,
+        })
+    }
+
+    /// Read a summary's id and height without applying it.
+    pub fn parse_state_summary(bytes: &[u8]) -> Result<(Id, u64), ChainError> {
+        let (_schedule, block, _snapshot) = Self::split_summary(bytes)?;
+        Ok((block.id()?, block.block_num() as u64))
+    }
+
+    /// Apply a received state summary: swap the arena to the snapshot, re-base
+    /// the block log to the snapshot's block, and adopt it as the tip.
+    ///
+    /// State sync fast-forwards past blocks this node never downloaded, so the
+    /// block log can't stay gapless from genesis — it is re-based to start at the
+    /// snapshot block, and the trace/chain-state logs are cleared to resume at
+    /// the next accepted block. The schedule in force at the snapshot rides in
+    /// the summary and is persisted so a later restart recovers it.
+    pub fn accept_state_summary(&mut self, bytes: &[u8]) -> Result<(), ChainError> {
+        let (schedule, block, snapshot) = Self::split_summary(bytes)?;
+        let block_id = block.id()?;
+
+        // Drop speculative and cached blocks: after a sync the tip is the
+        // snapshot block, not anything we were building on.
+        self.clear_pending()?;
+        self.verified_blocks.clear();
+
+        // Swap chainbase to the snapshot's state; its revision becomes the
+        // snapshot height.
+        self.db.restore_from_bytes(snapshot)?;
+
+        // Re-base the logs. The block log starts again at the snapshot block so a
+        // restart reconstructs the tip from here; the state-history logs have no
+        // entries for a block this node never executed, so they are cleared.
+        let packed_block = block
+            .pack()
+            .map_err(|e| ChainError::InternalError(format!("accept: pack block: {}", e)))?;
+        self.block_log
+            .as_ref()
+            .ok_or_else(|| ChainError::InternalError("accept: no block log".into()))?
+            .reset_to(block_id.clone(), &packed_block)
+            .map_err(|e| ChainError::InternalError(format!("accept: rebase block log: {}", e)))?;
+        if let Some(log) = self.trace_log.as_ref() {
+            log.clear().map_err(|e| {
+                ChainError::InternalError(format!("accept: clear trace log: {}", e))
+            })?;
+        }
+        if let Some(log) = self.chain_state_log.as_ref() {
+            log.clear().map_err(|e| {
+                ChainError::InternalError(format!("accept: clear chain state log: {}", e))
+            })?;
+        }
+
+        // Persist the schedule in force at the snapshot before adopting it, so a
+        // restart-after-sync recovers it (the re-based log's tip may not carry a
+        // schedule change).
+        self.write_synced_schedule(&schedule)?;
+        self.active_schedule = schedule;
+
+        self.last_accepted_block = block;
+        self.last_accepted_block_id = block_id.clone();
+        self.preferred_id = block_id;
+        Ok(())
+    }
+
+    /// Split a summary into (schedule, block, snapshot). The two length-prefixed
+    /// sections are the schedule and the block; the remainder is the snapshot
+    /// envelope, validated when it is applied.
+    fn split_summary(bytes: &[u8]) -> Result<(ProducerSchedule, SignedBlock, &[u8]), ChainError> {
+        fn section<'a>(bytes: &'a [u8], pos: &mut usize) -> Result<&'a [u8], ChainError> {
+            if *pos + 4 > bytes.len() {
+                return Err(ChainError::InternalError(
+                    "summary: truncated length".into(),
+                ));
+            }
+            let len = u32::from_le_bytes(bytes[*pos..*pos + 4].try_into().unwrap()) as usize;
+            *pos += 4;
+            if *pos + len > bytes.len() {
+                return Err(ChainError::InternalError(
+                    "summary: truncated section".into(),
+                ));
+            }
+            let s = &bytes[*pos..*pos + len];
+            *pos += len;
+            Ok(s)
+        }
+
+        let mut pos = 0usize;
+        let schedule = ProducerSchedule::read_bounded(section(bytes, &mut pos)?)
+            .map_err(|e| ChainError::InternalError(format!("summary: read schedule: {}", e)))?;
+        let block_bytes = section(bytes, &mut pos)?;
+        let block = SignedBlock::read(block_bytes, &mut 0)
+            .map_err(|e| ChainError::InternalError(format!("summary: read block: {}", e)))?;
+        Ok((schedule, block, &bytes[pos..]))
+    }
+
+    fn write_synced_schedule(&self, schedule: &ProducerSchedule) -> Result<(), ChainError> {
+        let dir = self
+            .db_path
+            .as_ref()
+            .ok_or_else(|| ChainError::InternalError("accept: no db path".into()))?;
+        let packed = schedule
+            .pack()
+            .map_err(|e| ChainError::InternalError(format!("accept: pack schedule: {}", e)))?;
+        std::fs::write(std::path::Path::new(dir).join(SYNCED_SCHEDULE_FILE), packed)
+            .map_err(|e| ChainError::InternalError(format!("accept: write schedule: {}", e)))
+    }
+
+    fn load_synced_schedule(db_path: &str) -> Option<ProducerSchedule> {
+        let bytes = std::fs::read(std::path::Path::new(db_path).join(SYNCED_SCHEDULE_FILE)).ok()?;
+        ProducerSchedule::read_bounded(&bytes).ok()
     }
 
     pub fn get_block_id_for_num(&self, height: u32) -> Result<Option<Id>, ChainError> {
@@ -5815,6 +5996,99 @@ mod tests {
             block.signed_block_header.header.sig_digest()?.0.into();
         block.signed_block_header.signature = new_key.sign(&sig_digest)?;
         validator.verify_block(&block, &mut v_mempool).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn state_sync_transfers_state_tip_and_schedule() -> Result<(), ChainError> {
+        // End-to-end file-copy state sync, in process: a producer builds real
+        // state and a rotated schedule, a fresh node adopts it from the summary,
+        // and a restart of that node reconstructs the synced tip and schedule
+        // from the re-based block log plus the persisted schedule — never the
+        // stale genesis state it started from.
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
+        let private_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let genesis_bytes = generate_genesis(&private_key);
+        // A small arena keeps the snapshot copy cheap; the default is tens of GB.
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": private_key.to_string(),
+            "db_size": 128u64 * 1024 * 1024,
+        })
+        .to_string()
+        .into_bytes();
+        let init = |dir: &str| -> Result<Controller, ChainError> {
+            let mut c = Controller::new();
+            c.initialize(&chain_id, &config_bytes, &genesis_bytes.to_vec(), dir)?;
+            Ok(c)
+        };
+
+        let producer_temp = get_temp_dir();
+        let mut producer = init(producer_temp.path().to_str().unwrap())?;
+        let name = Name::from_str("glenn")?.as_u64();
+        let mut p_mempool = Mempool::new();
+        p_mempool.add_transaction(create_account(
+            &private_key,
+            Name::from_str("glenn")?,
+            chain_id,
+        )?);
+        let block = producer.build_block(&mut p_mempool).await?;
+        producer.accept_block(&block.id()?, &mut p_mempool)?;
+
+        // Rotate the schedule so it differs from the genesis seed — this is what
+        // the persisted-schedule path has to recover across a restart.
+        let rotated_key = PrivateKey::random();
+        producer.activate_producer_schedule(vec![ProducerKey {
+            producer_name: Name::from_str("pulse")?,
+            block_signing_key: rotated_key.get_public_key(),
+        }])?;
+        let producer_height = producer.last_accepted_block().block_num();
+        let producer_schedule = producer.active_schedule.clone();
+        assert_eq!(producer_schedule.version, 1);
+        assert!(!producer.database().find_account_metadata(name)?.is_null());
+
+        let summary = producer.produce_state_summary()?;
+        assert_eq!(summary.height, producer_height as u64);
+
+        // Syncing node: fresh genesis, so it has neither glenn nor the schedule.
+        let syncer_temp = get_temp_dir();
+        let syncer_path = syncer_temp.path().to_str().unwrap().to_string();
+        let mut syncer = init(&syncer_path)?;
+        assert!(syncer.database().find_account_metadata(name)?.is_null());
+
+        // Parse agrees with produce on the commitment.
+        let (parsed_id, parsed_height) = Controller::parse_state_summary(&summary.bytes)?;
+        assert_eq!(parsed_id, summary.id);
+        assert_eq!(parsed_height, producer_height as u64);
+
+        // Accept transfers state, tip, and schedule.
+        syncer.accept_state_summary(&summary.bytes)?;
+        assert!(
+            !syncer.database().find_account_metadata(name)?.is_null(),
+            "state not transferred"
+        );
+        assert_eq!(syncer.last_accepted_block().block_num(), producer_height);
+        assert_eq!(syncer.last_accepted_block().id()?, summary.id);
+        assert_eq!(syncer.database().revision(), producer_height as i64);
+        assert_eq!(syncer.active_schedule, producer_schedule);
+
+        // Restart the synced node from its data directory.
+        syncer.shutdown()?;
+        let restarted = init(&syncer_path)?;
+        assert!(
+            !restarted.database().find_account_metadata(name)?.is_null(),
+            "synced state lost across restart"
+        );
+        assert_eq!(restarted.last_accepted_block().block_num(), producer_height);
+        assert_eq!(restarted.last_accepted_block().id()?, summary.id);
+        assert_eq!(
+            restarted.active_schedule, producer_schedule,
+            "synced schedule lost across restart"
+        );
 
         Ok(())
     }

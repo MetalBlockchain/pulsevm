@@ -820,7 +820,7 @@ impl Vm for VirtualMachine {
         _request: Request<()>,
     ) -> Result<tonic::Response<vm::StateSyncEnabledResponse>, Status> {
         Ok(Response::new(vm::StateSyncEnabledResponse {
-            enabled: false,
+            enabled: true,
             err: 0,
         }))
     }
@@ -830,9 +830,14 @@ impl Vm for VirtualMachine {
         request: Request<()>,
     ) -> Result<tonic::Response<vm::GetOngoingSyncStateSummaryResponse>, Status> {
         info!("received request: {:?}", request);
-        Ok(Response::new(
-            vm::GetOngoingSyncStateSummaryResponse::default(),
-        ))
+        // No sync is resumed across restarts: a summary is produced fresh from
+        // the last accepted block on demand.
+        Ok(Response::new(vm::GetOngoingSyncStateSummaryResponse {
+            id: vec![],
+            height: 0,
+            bytes: vec![],
+            err: vm::Error::NotFound as i32,
+        }))
     }
 
     async fn get_last_state_summary(
@@ -840,15 +845,31 @@ impl Vm for VirtualMachine {
         request: Request<()>,
     ) -> Result<tonic::Response<vm::GetLastStateSummaryResponse>, Status> {
         info!("received request: {:?}", request);
-        Ok(Response::new(vm::GetLastStateSummaryResponse::default()))
+        // Exclusive: producing a summary snapshots the arena, which briefly drops
+        // and remaps the database.
+        let controller = self.controller.write().await;
+        let summary = controller
+            .produce_state_summary()
+            .map_err(|e| Status::internal(format!("could not produce state summary: {}", e)))?;
+        Ok(Response::new(vm::GetLastStateSummaryResponse {
+            id: summary.id.into(),
+            height: summary.height,
+            bytes: summary.bytes,
+            err: 0,
+        }))
     }
 
     async fn parse_state_summary(
         &self,
         request: Request<vm::ParseStateSummaryRequest>,
     ) -> Result<tonic::Response<vm::ParseStateSummaryResponse>, Status> {
-        info!("received request: {:?}", request);
-        Ok(Response::new(vm::ParseStateSummaryResponse::default()))
+        let (id, height) = Controller::parse_state_summary(&request.get_ref().bytes)
+            .map_err(|e| Status::invalid_argument(format!("invalid state summary: {}", e)))?;
+        Ok(Response::new(vm::ParseStateSummaryResponse {
+            id: id.into(),
+            height,
+            err: 0,
+        }))
     }
 
     async fn get_state_summary(
@@ -856,15 +877,42 @@ impl Vm for VirtualMachine {
         request: Request<vm::GetStateSummaryRequest>,
     ) -> Result<tonic::Response<vm::GetStateSummaryResponse>, Status> {
         info!("received request: {:?}", request);
-        Ok(Response::new(vm::GetStateSummaryResponse::default()))
+        let requested = request.get_ref().height;
+        let controller = self.controller.write().await;
+        // Only the last accepted height can be served: chainbase keeps a single
+        // live image, not per-height snapshots.
+        if requested != controller.last_accepted_block().block_num() as u64 {
+            return Ok(Response::new(vm::GetStateSummaryResponse {
+                id: vec![],
+                bytes: vec![],
+                err: vm::Error::NotFound as i32,
+            }));
+        }
+        let summary = controller
+            .produce_state_summary()
+            .map_err(|e| Status::internal(format!("could not produce state summary: {}", e)))?;
+        Ok(Response::new(vm::GetStateSummaryResponse {
+            id: summary.id.into(),
+            bytes: summary.bytes,
+            err: 0,
+        }))
     }
 
     async fn state_summary_accept(
         &self,
         request: Request<vm::StateSummaryAcceptRequest>,
     ) -> Result<tonic::Response<vm::StateSummaryAcceptResponse>, Status> {
-        info!("received request: {:?}", request);
-        Ok(Response::new(vm::StateSummaryAcceptResponse::default()))
+        info!("received state summary accept request");
+        let mut controller = self.controller.write().await;
+        controller
+            .accept_state_summary(&request.get_ref().bytes)
+            .map_err(|e| Status::internal(format!("could not accept state summary: {}", e)))?;
+        // The whole state is applied synchronously from the summary bytes, so the
+        // sync is complete on return — no asynchronous download follows.
+        Ok(Response::new(vm::StateSummaryAcceptResponse {
+            mode: vm::state_summary_accept_response::Mode::Static as i32,
+            err: 0,
+        }))
     }
 }
 
