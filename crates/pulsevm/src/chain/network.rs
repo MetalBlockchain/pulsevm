@@ -1,10 +1,27 @@
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::HashMap,
+    time::Duration,
+};
 
-use pulsevm_core::{ChainError, id::NodeId};
+use pulsevm_core::{
+    ChainError,
+    id::NodeId,
+};
 use pulsevm_crypto::Bytes;
-use pulsevm_grpc::appsender::{SendAppGossipMsg, app_sender_client::AppSenderClient};
-use pulsevm_proc_macros::{NumBytes, Read, Write};
-use pulsevm_serialization::{NumBytes, Read, Write};
+use pulsevm_grpc::appsender::{
+    SendAppGossipMsg,
+    app_sender_client::AppSenderClient,
+};
+use pulsevm_proc_macros::{
+    NumBytes,
+    Read,
+    Write,
+};
+use pulsevm_serialization::{
+    NumBytes,
+    Read,
+    Write,
+};
 use tonic::Request;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

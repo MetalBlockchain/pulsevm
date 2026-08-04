@@ -1,16 +1,35 @@
-use std::{collections::BTreeSet, io::Read as IoRead};
+use std::{
+    collections::BTreeSet,
+    io::Read as IoRead,
+};
 
 use flate2::read::ZlibDecoder;
-use pulsevm_constants::{FIXED_NET_OVERHEAD_OF_PACKED_TRX, MAX_UNCOMPRESSED_PACKED_TRX_SIZE};
+use pulsevm_constants::{
+    FIXED_NET_OVERHEAD_OF_PACKED_TRX,
+    MAX_UNCOMPRESSED_PACKED_TRX_SIZE,
+};
 use pulsevm_crypto::Bytes;
 use pulsevm_error::ChainError;
-use pulsevm_serialization::{NumBytes, Read, ReadError, Write, WriteError};
-use serde::{Serialize, ser::SerializeStruct};
+use pulsevm_serialization::{
+    NumBytes,
+    Read,
+    ReadError,
+    Write,
+    WriteError,
+};
+use serde::{
+    Serialize,
+    ser::SerializeStruct,
+};
 
 use crate::{
     chain::{
         id::Id,
-        transaction::{SignedTransaction, Transaction, TransactionCompression},
+        transaction::{
+            SignedTransaction,
+            Transaction,
+            TransactionCompression,
+        },
         utils::pulse_assert,
     },
     crypto::Signature,
@@ -214,7 +233,10 @@ fn maybe_decompress(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flate2::{Compression, write::ZlibEncoder};
+    use flate2::{
+        Compression,
+        write::ZlibEncoder,
+    };
     use std::io::Write as IoWrite;
 
     fn zlib_compress(data: &[u8]) -> Vec<u8> {

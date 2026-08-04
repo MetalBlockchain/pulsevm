@@ -32,12 +32,22 @@ mod producer;
 pub use producer::*;
 
 mod system;
-use pulsevm_ffi::{Float128, I128, U128, U256};
+use pulsevm_ffi::{
+    Float128,
+    I128,
+    U128,
+    U256,
+};
 pub use system::*;
 
 mod transaction;
 pub use transaction::*;
-use wasmer::{FunctionEnvMut, MemoryView, RuntimeError, WasmPtr};
+use wasmer::{
+    FunctionEnvMut,
+    MemoryView,
+    RuntimeError,
+    WasmPtr,
+};
 
 use crate::wasm_runtime::WasmContext;
 

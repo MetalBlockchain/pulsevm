@@ -1,6 +1,13 @@
-use wasmer::{FunctionEnvMut, RuntimeError, WasmPtr};
+use wasmer::{
+    FunctionEnvMut,
+    RuntimeError,
+    WasmPtr,
+};
 
-use crate::{chain::webassembly::context_free_check, wasm_runtime::WasmContext};
+use crate::{
+    chain::webassembly::context_free_check,
+    wasm_runtime::WasmContext,
+};
 
 pub fn get_context_free_data(
     mut env: FunctionEnvMut<WasmContext>,

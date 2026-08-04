@@ -2,7 +2,12 @@
 //! variable-length `abi` in the blob arena — exercised through create, read,
 //! undo, and snapshot. This is the shape the ~40 real tables take.
 
-use pulsevm_arena::{ArenaObject, BlobRef, Db, ObjectId};
+use pulsevm_arena::{
+    ArenaObject,
+    BlobRef,
+    Db,
+    ObjectId,
+};
 
 #[repr(C)]
 #[derive(

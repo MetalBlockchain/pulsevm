@@ -1,20 +1,44 @@
 use std::{
     fmt,
-    ops::{Add, AddAssign, Sub, SubAssign},
+    ops::{
+        Add,
+        AddAssign,
+        Sub,
+        SubAssign,
+    },
     str::FromStr,
 };
 
 use cxx::SharedPtr;
-use pulsevm_serialization::{NumBytes, Read, Write};
-use serde::{
-    Deserialize, Deserializer, Serialize, Serializer,
-    de::{self, Visitor},
+use pulsevm_serialization::{
+    NumBytes,
+    Read,
+    Write,
 };
-use time::{OffsetDateTime, PrimitiveDateTime, macros::format_description};
+use serde::{
+    Deserialize,
+    Deserializer,
+    Serialize,
+    Serializer,
+    de::{
+        self,
+        Visitor,
+    },
+};
+use time::{
+    OffsetDateTime,
+    PrimitiveDateTime,
+    macros::format_description,
+};
 
 use crate::{
     CxxTimePoint,
-    bridge::ffi::{Microseconds, TimePoint, make_time_point_from_i64, make_time_point_from_now},
+    bridge::ffi::{
+        Microseconds,
+        TimePoint,
+        make_time_point_from_i64,
+        make_time_point_from_now,
+    },
 };
 
 const EOS_FMT_MILLIS_NOZ: &[time::format_description::FormatItem<'_>] =
@@ -163,7 +187,10 @@ impl TimePoint {
 
     #[inline]
     pub fn now() -> Self {
-        use std::time::{SystemTime, UNIX_EPOCH};
+        use std::time::{
+            SystemTime,
+            UNIX_EPOCH,
+        };
 
         let dur = SystemTime::now()
             .duration_since(UNIX_EPOCH)

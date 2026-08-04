@@ -1,7 +1,11 @@
 //! With the derive, a table type is a declaration: no hand-written trait impl,
 //! no separate tag structs. This is what makes the ~40 PulseVM tables cheap.
 
-use pulsevm_arena::{ArenaObject, Db, ObjectId};
+use pulsevm_arena::{
+    ArenaObject,
+    Db,
+    ObjectId,
+};
 
 #[repr(C)]
 #[derive(

@@ -1,5 +1,8 @@
 use core::fmt;
-use std::{error::Error, usize};
+use std::{
+    error::Error,
+    usize,
+};
 
 mod varint;
 use pulsevm_error::ChainError;

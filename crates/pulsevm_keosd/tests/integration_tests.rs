@@ -1,4 +1,7 @@
-use actix_web::{App, web};
+use actix_web::{
+    App,
+    web,
+};
 use tempfile::TempDir;
 
 // ============================================================================
@@ -74,7 +77,10 @@ mod key_tests {
 // ============================================================================
 
 mod wallet_tests {
-    use pulsevm_keosd::{keys, wallet::Wallet};
+    use pulsevm_keosd::{
+        keys,
+        wallet::Wallet,
+    };
 
     use super::*;
 
@@ -331,7 +337,10 @@ mod wallet_tests {
 // ============================================================================
 
 mod manager_tests {
-    use pulsevm_keosd::{keys, manager::WalletManager};
+    use pulsevm_keosd::{
+        keys,
+        manager::WalletManager,
+    };
 
     use super::*;
 
@@ -593,8 +602,15 @@ mod manager_tests {
 
 mod api_tests {
     use super::*;
-    use actix_web::{http::StatusCode, test};
-    use pulsevm_keosd::{api, keys, manager::WalletManager};
+    use actix_web::{
+        http::StatusCode,
+        test,
+    };
+    use pulsevm_keosd::{
+        api,
+        keys,
+        manager::WalletManager,
+    };
     use std::sync::Mutex;
 
     /// Helper: create an actix-web test app with a fresh WalletManager.

@@ -1,9 +1,23 @@
-use std::any::{Any, TypeId};
-use std::collections::HashMap;
-use std::path::Path;
+use std::{
+    any::{
+        Any,
+        TypeId,
+    },
+    collections::HashMap,
+    path::Path,
+};
 
-use crate::object::{ArenaObject, BlobRef, IndexedBy};
-use crate::table::{Table, TableError};
+use crate::{
+    object::{
+        ArenaObject,
+        BlobRef,
+        IndexedBy,
+    },
+    table::{
+        Table,
+        TableError,
+    },
+};
 
 /// Errors from the database layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -516,7 +530,10 @@ impl Db {
     /// root (vs C++ chainbase) additionally needs blob refs resolved to their
     /// bytes per object — a small extension once the object schemas are wired.
     pub fn state_root(&self) -> [u8; 32] {
-        use sha2::{Digest, Sha256};
+        use sha2::{
+            Digest,
+            Sha256,
+        };
         let mut ordered: Vec<usize> = (0..self.tables.len()).collect();
         ordered.sort_by_key(|&pos| self.tables[pos].type_id_num());
         let mut hasher = Sha256::new();

@@ -2,24 +2,43 @@ use std::collections::BTreeSet;
 
 use pulsevm_error::ChainError;
 use pulsevm_ffi::{
-    Authority, Database, DbRead, Microseconds, PermissionObject, TimePoint, seconds,
+    Authority,
+    Database,
+    DbRead,
+    Microseconds,
+    PermissionObject,
+    TimePoint,
+    seconds,
 };
 
 use crate::{
     PULSE_NAME,
     chain::{
         name::Name,
-        pulse_contract::{DeleteAuth, LinkAuth, UnlinkAuth, UpdateAuth},
+        pulse_contract::{
+            DeleteAuth,
+            LinkAuth,
+            UnlinkAuth,
+            UpdateAuth,
+        },
         transaction::Action,
     },
-    config::{DELETEAUTH_NAME, LINKAUTH_NAME, UNLINKAUTH_NAME, UPDATEAUTH_NAME},
+    config::{
+        DELETEAUTH_NAME,
+        LINKAUTH_NAME,
+        UNLINKAUTH_NAME,
+        UPDATEAUTH_NAME,
+    },
     crypto::PublicKey,
     transaction::Transaction,
     utils::pulse_assert,
 };
 
 use super::{
-    ACTIVE_NAME, ANY_NAME, authority::PermissionLevel, authority_checker::AuthorityChecker,
+    ACTIVE_NAME,
+    ANY_NAME,
+    authority::PermissionLevel,
+    authority_checker::AuthorityChecker,
 };
 
 pub struct AuthorizationManager;
@@ -80,7 +99,8 @@ impl AuthorizationManager {
                     )?;
 
                     if let Some(min_permission_name) = min_permission_name {
-                        // since special cases were already handled, it should only be false if the permission is pulse.any
+                        // since special cases were already handled, it should only be false if the
+                        // permission is pulse.any
                         let min_permission = Self::get_permission(
                             &r,
                             declared_auth.actor,
@@ -449,7 +469,8 @@ impl AuthorizationManager {
         scope: &Name,
         act_name: &Name,
     ) -> Result<Option<Name>, ChainError> {
-        // Special case native actions cannot be linked to a minimum permission, so there is no need to check.
+        // Special case native actions cannot be linked to a minimum permission, so there is no need
+        // to check.
         if scope.as_u64() == PULSE_NAME {
             pulse_assert(
                 act_name.as_u64() != UPDATEAUTH_NAME

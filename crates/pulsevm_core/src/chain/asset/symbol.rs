@@ -1,9 +1,20 @@
 use core::fmt;
 use std::str::FromStr;
 
-use pulsevm_proc_macros::{NumBytes, Write};
-use pulsevm_serialization::{Read, ReadError};
-use serde::{Deserialize, Deserializer, Serialize, de};
+use pulsevm_proc_macros::{
+    NumBytes,
+    Write,
+};
+use pulsevm_serialization::{
+    Read,
+    ReadError,
+};
+use serde::{
+    Deserialize,
+    Deserializer,
+    Serialize,
+    de,
+};
 
 use crate::chain::asset::SymbolCode;
 

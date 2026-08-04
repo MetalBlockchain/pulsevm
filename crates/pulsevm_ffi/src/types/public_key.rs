@@ -1,7 +1,13 @@
 use core::fmt;
-use std::hash::{Hash, Hasher};
+use std::hash::{
+    Hash,
+    Hasher,
+};
 
-use crate::{CxxPublicKey, bridge::ffi};
+use crate::{
+    CxxPublicKey,
+    bridge::ffi,
+};
 
 impl CxxPublicKey {
     pub fn packed_bytes(&self) -> Vec<u8> {

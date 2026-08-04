@@ -2,10 +2,18 @@ use std::str::FromStr;
 
 use pulsevm_api_client::PulseVmClient;
 use pulsevm_core::{
-    ACTIVE_NAME, PULSE_NAME,
-    authority::{Authority, KeyWeight, PermissionLevel},
+    ACTIVE_NAME,
+    PULSE_NAME,
+    authority::{
+        Authority,
+        KeyWeight,
+        PermissionLevel,
+    },
     config::NEWACCOUNT_NAME,
-    crypto::{PrivateKey, PublicKey},
+    crypto::{
+        PrivateKey,
+        PublicKey,
+    },
     name::Name,
     pulse_contract::NewAccount,
     transaction::Action,
@@ -13,7 +21,10 @@ use pulsevm_core::{
 use pulsevm_keosd_client::KeosdClient;
 use spdlog::info;
 
-use crate::{cli::CreateSubcommand, utils::push_actions};
+use crate::{
+    cli::CreateSubcommand,
+    utils::push_actions,
+};
 
 pub async fn handle(
     api_client: &PulseVmClient,

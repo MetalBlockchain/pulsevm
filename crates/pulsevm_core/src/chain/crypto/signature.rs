@@ -1,17 +1,39 @@
 use std::{
-    fmt::{self, Debug, Display},
-    hash::{Hash, Hasher},
+    fmt::{
+        self,
+        Debug,
+        Display,
+    },
+    hash::{
+        Hash,
+        Hasher,
+    },
     str::FromStr,
 };
 
 use cxx::SharedPtr;
 use pulsevm_crypto::FixedBytes;
 use pulsevm_error::ChainError;
-use pulsevm_ffi::{CxxSignature, recover_public_key_from_signature};
-use pulsevm_serialization::{NumBytes, Read, ReadError, Write, WriteError};
-use serde::{Deserialize, Serialize};
+use pulsevm_ffi::{
+    CxxSignature,
+    recover_public_key_from_signature,
+};
+use pulsevm_serialization::{
+    NumBytes,
+    Read,
+    ReadError,
+    Write,
+    WriteError,
+};
+use serde::{
+    Deserialize,
+    Serialize,
+};
 
-use crate::{crypto::PublicKey, utils::Digest};
+use crate::{
+    crypto::PublicKey,
+    utils::Digest,
+};
 
 #[derive(Clone)]
 pub struct Signature {

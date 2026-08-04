@@ -1,24 +1,56 @@
 use chrono::Utc;
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{
+    Criterion,
+    criterion_group,
+    criterion_main,
+};
 use pulsevm_core::{
-    ACTIVE_NAME, ChainError, PULSE_NAME,
+    ACTIVE_NAME,
+    ChainError,
+    PULSE_NAME,
     abi::AbiDefinition,
-    asset::{Asset, Symbol},
-    block::{BlockStatus, BlockTimestamp},
+    asset::{
+        Asset,
+        Symbol,
+    },
+    block::{
+        BlockStatus,
+        BlockTimestamp,
+    },
     controller::Controller,
     crypto::PrivateKey,
     id::Id,
-    pulse_contract::{NewAccount, SetCode},
-    transaction::{Action, PackedTransaction, Transaction, TransactionHeader},
+    pulse_contract::{
+        NewAccount,
+        SetCode,
+    },
+    transaction::{
+        Action,
+        PackedTransaction,
+        Transaction,
+        TransactionHeader,
+    },
 };
-use pulsevm_ffi::{Authority, KeyWeight, PermissionLevel, TimePointSec};
+use pulsevm_ffi::{
+    Authority,
+    KeyWeight,
+    PermissionLevel,
+    TimePointSec,
+};
 use pulsevm_name::Name;
-use pulsevm_proc_macros::{NumBytes, Read, Write};
+use pulsevm_proc_macros::{
+    NumBytes,
+    Read,
+    Write,
+};
 use pulsevm_serialization::Write;
 use serde_json::json;
 use std::{
     fs,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
     str::FromStr,
     sync::Arc,
 };

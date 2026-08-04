@@ -1,5 +1,10 @@
-use std::env;
-use std::path::{Path, PathBuf};
+use std::{
+    env,
+    path::{
+        Path,
+        PathBuf,
+    },
+};
 
 fn build_libraries(root: &PathBuf) -> PathBuf {
     // Only run CMake if the build directory doesn't exist or if CMakeLists.txt changed

@@ -1,9 +1,20 @@
 use pulsevm_error::ChainError;
-use pulsevm_serialization::{NumBytes, Read, Write};
-use wasmer::{FunctionEnvMut, RuntimeError, WasmPtr};
+use pulsevm_serialization::{
+    NumBytes,
+    Read,
+    Write,
+};
+use wasmer::{
+    FunctionEnvMut,
+    RuntimeError,
+    WasmPtr,
+};
 
 use crate::chain::{
-    controller::Controller, transaction::Action, utils::pulse_assert, wasm_runtime::WasmContext,
+    controller::Controller,
+    transaction::Action,
+    utils::pulse_assert,
+    wasm_runtime::WasmContext,
     webassembly::context_aware_check,
 };
 

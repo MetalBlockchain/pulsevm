@@ -2,11 +2,21 @@ use core::fmt;
 use std::sync::Arc;
 
 use pulsevm_crypto::Digest as OurDigest;
-use pulsevm_serialization::{NumBytes, Read, Write};
-use serde::{Deserialize, Serialize};
+use pulsevm_serialization::{
+    NumBytes,
+    Read,
+    Write,
+};
+use serde::{
+    Deserialize,
+    Serialize,
+};
 use sha2::Digest;
 
-use crate::chain::{Name, authority::PermissionLevel};
+use crate::chain::{
+    Name,
+    authority::PermissionLevel,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize, Default)]
 pub struct Action {

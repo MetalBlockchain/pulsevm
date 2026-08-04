@@ -1,6 +1,13 @@
 use std::{
-    fmt::{self, Debug, Display},
-    hash::{Hash, Hasher},
+    fmt::{
+        self,
+        Debug,
+        Display,
+    },
+    hash::{
+        Hash,
+        Hasher,
+    },
     str::FromStr,
 };
 
@@ -8,8 +15,17 @@ use cxx::SharedPtr;
 use pulsevm_crypto::FixedBytes;
 use pulsevm_error::ChainError;
 use pulsevm_ffi::CxxPublicKey;
-use pulsevm_serialization::{NumBytes, Read, ReadError, Write, WriteError};
-use serde::{Deserialize, Serialize};
+use pulsevm_serialization::{
+    NumBytes,
+    Read,
+    ReadError,
+    Write,
+    WriteError,
+};
+use serde::{
+    Deserialize,
+    Serialize,
+};
 
 #[derive(Clone)]
 pub struct PublicKey {
@@ -132,7 +148,10 @@ impl FromStr for PublicKey {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, str::FromStr};
+    use std::{
+        collections::HashSet,
+        str::FromStr,
+    };
 
     use crate::crypto::PublicKey;
 

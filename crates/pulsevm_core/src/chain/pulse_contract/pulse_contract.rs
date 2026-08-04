@@ -1,18 +1,36 @@
 use pulsevm_billable_size::billable_size_v;
-use pulsevm_constants::{OVERHEAD_PER_ACCOUNT_RAM_BYTES, SETCODE_RAM_BYTES_MULTIPLIER};
+use pulsevm_constants::{
+    OVERHEAD_PER_ACCOUNT_RAM_BYTES,
+    SETCODE_RAM_BYTES_MULTIPLIER,
+};
 use pulsevm_error::ChainError;
-use pulsevm_ffi::{CxxDigest, Database, PermissionObject};
+use pulsevm_ffi::{
+    CxxDigest,
+    Database,
+    PermissionObject,
+};
 use pulsevm_serialization::Read;
 
 use crate::{
-    ACTIVE_NAME, CODE_NAME, OWNER_NAME,
+    ACTIVE_NAME,
+    CODE_NAME,
+    OWNER_NAME,
     chain::{
         abi::AbiDefinition,
         apply_context::ApplyContext,
-        authority::{Authority, PermissionLevel},
+        authority::{
+            Authority,
+            PermissionLevel,
+        },
         authorization_manager::AuthorizationManager,
         pulse_contract::pulse_contract_types::{
-            DeleteAuth, LinkAuth, NewAccount, SetAbi, SetCode, UnlinkAuth, UpdateAuth,
+            DeleteAuth,
+            LinkAuth,
+            NewAccount,
+            SetAbi,
+            SetCode,
+            UnlinkAuth,
+            UpdateAuth,
         },
         resource_limits::ResourceLimitsManager,
         utils::pulse_assert,

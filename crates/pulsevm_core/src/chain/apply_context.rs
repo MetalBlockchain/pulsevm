@@ -1,6 +1,13 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
-    sync::{Arc, RwLock},
+    collections::{
+        BTreeMap,
+        BTreeSet,
+        VecDeque,
+    },
+    sync::{
+        Arc,
+        RwLock,
+    },
     u64,
 };
 
@@ -9,10 +16,26 @@ use pulsevm_billable_size::billable_size_v;
 use pulsevm_crypto::Bytes;
 use pulsevm_error::ChainError;
 use pulsevm_ffi::{
-    AccountMetadataObject, BlockTimestamp, ChainConfigV0, Database, Float128, Index64IteratorCache,
-    Index64Object, Index128IteratorCache, Index128Object, Index256IteratorCache, Index256Object,
-    IndexDoubleIteratorCache, IndexDoubleObject, IndexLongDoubleIteratorCache,
-    IndexLongDoubleObject, KeyValueIteratorCache, KeyValueObject, Microseconds, TableObject, U256,
+    AccountMetadataObject,
+    BlockTimestamp,
+    ChainConfigV0,
+    Database,
+    Float128,
+    Index64IteratorCache,
+    Index64Object,
+    Index128IteratorCache,
+    Index128Object,
+    Index256IteratorCache,
+    Index256Object,
+    IndexDoubleIteratorCache,
+    IndexDoubleObject,
+    IndexLongDoubleIteratorCache,
+    IndexLongDoubleObject,
+    KeyValueIteratorCache,
+    KeyValueObject,
+    Microseconds,
+    TableObject,
+    U256,
 };
 use pulsevm_serialization::Write;
 
@@ -23,7 +46,11 @@ use crate::{
         authorization_manager::AuthorizationManager,
         controller::Controller,
         producer_schedule::ProducerKey,
-        transaction::{Action, ActionReceipt, generate_action_digest},
+        transaction::{
+            Action,
+            ActionReceipt,
+            generate_action_digest,
+        },
         transaction_context::TransactionContext,
         utils::pulse_assert,
         wasm_runtime::WasmRuntime,
@@ -183,7 +210,9 @@ impl ApplyContext {
 
         // Does the receiver account have a contract deployed?
         if !receiver_account.get_code_hash().empty() {
-            // Separate context here because we need to release the lock on inner before executing the Wasm code, which may call back into the context and cause deadlock if we hold the lock.
+            // Separate context here because we need to release the lock on inner before executing
+            // the Wasm code, which may call back into the context and cause deadlock if we hold the
+            // lock.
             let cpu_limit = {
                 let inner = self.inner.read()?;
                 inner.cpu_limit

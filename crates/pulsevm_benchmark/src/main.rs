@@ -1,7 +1,10 @@
 use std::{
     env::temp_dir,
     fs,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
     str::FromStr,
     sync::Arc,
     u32,
@@ -9,20 +12,42 @@ use std::{
 
 use chrono::Utc;
 use pulsevm_core::{
-    ACTIVE_NAME, ChainError, PULSE_NAME,
+    ACTIVE_NAME,
+    ChainError,
+    PULSE_NAME,
     abi::AbiDefinition,
-    asset::{Asset, Symbol},
-    authority::{Authority, KeyWeight, PermissionLevel},
+    asset::{
+        Asset,
+        Symbol,
+    },
+    authority::{
+        Authority,
+        KeyWeight,
+        PermissionLevel,
+    },
     block::BlockStatus,
     controller::Controller,
     crypto::PrivateKey,
     id::Id,
     name::Name,
-    pulse_contract::{NewAccount, SetAbi, SetCode},
+    pulse_contract::{
+        NewAccount,
+        SetAbi,
+        SetCode,
+    },
     time::TimePointSec,
-    transaction::{Action, PackedTransaction, Transaction, TransactionHeader},
+    transaction::{
+        Action,
+        PackedTransaction,
+        Transaction,
+        TransactionHeader,
+    },
 };
-use pulsevm_proc_macros::{NumBytes, Read, Write};
+use pulsevm_proc_macros::{
+    NumBytes,
+    Read,
+    Write,
+};
 use pulsevm_serialization::Write;
 use serde_json::json;
 use spdlog::info;

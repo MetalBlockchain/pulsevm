@@ -1,11 +1,25 @@
 use std::{
-    fmt::{self, Write},
+    fmt::{
+        self,
+        Write,
+    },
     str::FromStr,
 };
 
-use pulsevm_proc_macros::{NumBytes, Write};
-use pulsevm_serialization::{Read, ReadError};
-use serde::{Deserialize, Deserializer, Serialize, de};
+use pulsevm_proc_macros::{
+    NumBytes,
+    Write,
+};
+use pulsevm_serialization::{
+    Read,
+    ReadError,
+};
+use serde::{
+    Deserialize,
+    Deserializer,
+    Serialize,
+    de,
+};
 
 /// The maximum allowed length of EOSIO symbol codes.
 pub const SYMBOL_CODE_MAX_LEN: usize = 7;

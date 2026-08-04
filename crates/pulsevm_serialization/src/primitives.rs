@@ -1,10 +1,22 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
+    collections::{
+        BTreeMap,
+        BTreeSet,
+        HashMap,
+        VecDeque,
+    },
     hash::Hash,
     sync::Arc,
 };
 
-use crate::{NumBytes, Read, ReadError, VarUint32, Write, WriteError};
+use crate::{
+    NumBytes,
+    Read,
+    ReadError,
+    VarUint32,
+    Write,
+    WriteError,
+};
 
 #[inline]
 fn take<const N: usize>(bytes: &mut &[u8]) -> Result<[u8; N], ReadError> {

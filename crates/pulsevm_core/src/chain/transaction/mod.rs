@@ -5,7 +5,10 @@ mod action_trace;
 pub use action_trace::ActionTrace;
 
 mod action;
-pub use action::{Action, generate_action_digest};
+pub use action::{
+    Action,
+    generate_action_digest,
+};
 
 mod packed_transaction;
 pub use packed_transaction::PackedTransaction;
@@ -20,7 +23,10 @@ mod transaction_header;
 pub use transaction_header::TransactionHeader;
 
 mod transaction_receipt_header;
-pub use transaction_receipt_header::{TransactionReceiptHeader, TransactionStatus};
+pub use transaction_receipt_header::{
+    TransactionReceiptHeader,
+    TransactionStatus,
+};
 
 mod transaction_receipt;
 pub use transaction_receipt::TransactionReceipt;

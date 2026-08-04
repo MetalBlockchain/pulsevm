@@ -3,7 +3,14 @@
 
 use std::io::Write;
 
-use pulsevm_arena::{ArenaObject, Db, IndexedBy, ObjectId, SecondaryIndex, key_index};
+use pulsevm_arena::{
+    ArenaObject,
+    Db,
+    IndexedBy,
+    ObjectId,
+    SecondaryIndex,
+    key_index,
+};
 
 #[repr(C)]
 #[derive(

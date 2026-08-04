@@ -1,11 +1,25 @@
-use pulsevm_ffi::{Float128, U256};
-use wasmer::{FunctionEnvMut, RuntimeError, WasmPtr};
+use pulsevm_ffi::{
+    Float128,
+    U256,
+};
+use wasmer::{
+    FunctionEnvMut,
+    RuntimeError,
+    WasmPtr,
+};
 
 use crate::chain::{
     wasm_runtime::WasmContext,
     webassembly::{
-        context_aware_check, read_float128, read_u64, read_u128, read_u256, write_float128,
-        write_u64, write_u128, write_u256,
+        context_aware_check,
+        read_float128,
+        read_u64,
+        read_u128,
+        read_u256,
+        write_float128,
+        write_u64,
+        write_u128,
+        write_u256,
     },
 };
 

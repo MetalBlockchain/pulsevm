@@ -1,4 +1,12 @@
-use pulsevm_arena::{ArenaObject, Db, DbError, IndexedBy, ObjectId, SecondaryIndex, key_index};
+use pulsevm_arena::{
+    ArenaObject,
+    Db,
+    DbError,
+    IndexedBy,
+    ObjectId,
+    SecondaryIndex,
+    key_index,
+};
 
 #[repr(C)]
 #[derive(

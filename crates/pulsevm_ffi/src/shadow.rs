@@ -11,12 +11,27 @@
 //! access is already serialised by its own lock. Never hold the guard across an
 //! `.await`.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc,
+    Mutex,
+};
 
 use pulsevm_arena::{
-    ArenaObject, BlobRef, Db, DbError, IndexedBy, ObjectId, SecondaryIndex, key_index,
+    ArenaObject,
+    BlobRef,
+    Db,
+    DbError,
+    IndexedBy,
+    ObjectId,
+    SecondaryIndex,
+    key_index,
 };
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+use zerocopy::{
+    FromBytes,
+    Immutable,
+    IntoBytes,
+    KnownLayout,
+};
 
 /// Arena mirror of chainbase `account_metadata_object` — the first table ported.
 /// The trailing padding keeps the row free of implicit padding bytes so it

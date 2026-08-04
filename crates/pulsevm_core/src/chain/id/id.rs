@@ -1,12 +1,22 @@
 use core::fmt;
-use std::{error::Error, str::FromStr};
+use std::{
+    error::Error,
+    str::FromStr,
+};
 
 use cxx::UniquePtr;
 use pulsevm_crypto::FixedBytes;
 use pulsevm_error::ChainError;
 use pulsevm_ffi::CxxDigest;
-use pulsevm_proc_macros::{NumBytes, Read, Write};
-use serde::{Deserialize, Serialize};
+use pulsevm_proc_macros::{
+    NumBytes,
+    Read,
+    Write,
+};
+use serde::{
+    Deserialize,
+    Serialize,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, Read, Write, NumBytes)]
 pub struct Id(pub FixedBytes<32>);

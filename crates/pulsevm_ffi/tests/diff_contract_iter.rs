@@ -5,12 +5,23 @@
 //! traversal — must be identical. This is the real consensus check the earlier
 //! Rust-vs-reference fuzzers stand in for.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{
+    BTreeMap,
+    BTreeSet,
+    HashSet,
+};
 
-use proptest::collection::vec;
-use proptest::prelude::*;
+use proptest::{
+    collection::vec,
+    prelude::*,
+};
 use pulsevm_contractdb::ContractDb;
-use pulsevm_ffi::{Database, Index64IteratorCache, KeyValueIteratorCache, TableObject};
+use pulsevm_ffi::{
+    Database,
+    Index64IteratorCache,
+    KeyValueIteratorCache,
+    TableObject,
+};
 use tempfile::tempdir;
 
 const CODE: u64 = 1;

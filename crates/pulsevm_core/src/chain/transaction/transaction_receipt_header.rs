@@ -1,7 +1,18 @@
 use std::fmt;
 
-use pulsevm_proc_macros::{NumBytes, Read, Write};
-use pulsevm_serialization::{NumBytes, Read, ReadError, VarUint32, Write, WriteError};
+use pulsevm_proc_macros::{
+    NumBytes,
+    Read,
+    Write,
+};
+use pulsevm_serialization::{
+    NumBytes,
+    Read,
+    ReadError,
+    VarUint32,
+    Write,
+    WriteError,
+};
 use serde::Serialize;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

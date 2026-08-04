@@ -1,17 +1,40 @@
-use std::collections::BTreeMap;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{
+        Path,
+        PathBuf,
+    },
+};
 
 use aes::Aes256;
 use cbc::{
-    Decryptor, Encryptor,
-    cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit, block_padding::Pkcs7},
+    Decryptor,
+    Encryptor,
+    cipher::{
+        BlockDecryptMut,
+        BlockEncryptMut,
+        KeyIvInit,
+        block_padding::Pkcs7,
+    },
 };
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha512};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use serde::{
+    Deserialize,
+    Serialize,
+};
+use sha2::{
+    Digest,
+    Sha512,
+};
+use zeroize::{
+    Zeroize,
+    ZeroizeOnDrop,
+};
 
-use crate::keys::{self, KeyError};
+use crate::keys::{
+    self,
+    KeyError,
+};
 
 type Aes256CbcEnc = Encryptor<Aes256>;
 type Aes256CbcDec = Decryptor<Aes256>;

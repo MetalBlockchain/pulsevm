@@ -1,3 +1,9 @@
+# These are unstable rustfmt options, so they only take effect on nightly.
+# Format with the nightly CI pins (see .github/workflows/fmt.yml):
+#   rustup toolchain install nightly-2026-07-27 --component rustfmt
+#   cargo +nightly-2026-07-27 fmt
+# Running stable `cargo fmt` silently ignores everything below and will fight the
+# committed formatting.
 comment_width = 150
 format_code_in_doc_comments = true
 imports_granularity = "Crate"

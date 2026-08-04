@@ -1,6 +1,12 @@
-use core::fmt::{self, Display};
+use core::fmt::{
+    self,
+    Display,
+};
 
-use syn::{Ident, Path};
+use syn::{
+    Ident,
+    Path,
+};
 
 #[derive(Copy, Clone)]
 pub struct Symbol(&'static str);

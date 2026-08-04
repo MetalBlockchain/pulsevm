@@ -1,10 +1,27 @@
-use std::{fmt, str::FromStr};
+use std::{
+    fmt,
+    str::FromStr,
+};
 
-use pulsevm_proc_macros::{NumBytes, Write};
-use pulsevm_serialization::{Read, ReadError};
-use serde::{Deserialize, Serialize, de};
+use pulsevm_proc_macros::{
+    NumBytes,
+    Write,
+};
+use pulsevm_serialization::{
+    Read,
+    ReadError,
+};
+use serde::{
+    Deserialize,
+    Serialize,
+    de,
+};
 
-use crate::chain::asset::{MAX_PRECISION, Symbol, SymbolCode};
+use crate::chain::asset::{
+    MAX_PRECISION,
+    Symbol,
+    SymbolCode,
+};
 
 /// Matches nodeos `asset::max_amount`. Amounts are bounded well inside i64 so
 /// that addition of two valid assets cannot overflow.

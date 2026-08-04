@@ -3,41 +3,89 @@ mod chain;
 mod state_history;
 
 use pulsevm_core::{
-    config::{PLUGIN_VERSION, VERSION},
+    config::{
+        PLUGIN_VERSION,
+        VERSION,
+    },
     controller::Controller,
-    id::{Id, NodeId},
+    id::{
+        Id,
+        NodeId,
+    },
     mempool::Mempool,
     transaction::PackedTransaction,
 };
 use pulsevm_grpc::{
     http::{
-        self, Element,
-        http_server::{Http, HttpServer},
+        self,
+        Element,
+        http_server::{
+            Http,
+            HttpServer,
+        },
     },
     vm::{
-        self, Handler, ParseBlockResponse,
-        runtime::{InitializeRequest, runtime_client::RuntimeClient},
-        vm_server::{Vm, VmServer},
+        self,
+        Handler,
+        ParseBlockResponse,
+        runtime::{
+            InitializeRequest,
+            runtime_client::RuntimeClient,
+        },
+        vm_server::{
+            Vm,
+            VmServer,
+        },
     },
 };
-use pulsevm_serialization::{Read, Write};
-use spdlog::{debug, info, warn};
+use pulsevm_serialization::{
+    Read,
+    Write,
+};
+use spdlog::{
+    debug,
+    info,
+    warn,
+};
 use std::{
-    net::{SocketAddr, TcpListener},
-    sync::{Arc, atomic::AtomicBool},
-    time::{Duration, Instant},
+    net::{
+        SocketAddr,
+        TcpListener,
+    },
+    sync::{
+        Arc,
+        atomic::AtomicBool,
+    },
+    time::{
+        Duration,
+        Instant,
+    },
 };
 use tokio::{
     net::TcpListener as TokioTcpListener,
-    signal::unix::{SignalKind, signal},
+    signal::unix::{
+        SignalKind,
+        signal,
+    },
     sync::RwLock,
 };
 use tokio_util::sync::CancellationToken;
-use tonic::transport::server::TcpIncoming;
-use tonic::{Request, Response, Status, transport::Server};
+use tonic::{
+    Request,
+    Response,
+    Status,
+    transport::{
+        Server,
+        server::TcpIncoming,
+    },
+};
 
 use crate::{
-    chain::{BlockTimer, GossipType, Gossipable},
+    chain::{
+        BlockTimer,
+        GossipType,
+        Gossipable,
+    },
     state_history::StateHistoryServer,
 };
 

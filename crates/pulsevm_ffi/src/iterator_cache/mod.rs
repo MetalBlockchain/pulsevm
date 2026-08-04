@@ -1,15 +1,31 @@
-use std::{ops::Deref, pin::Pin};
+use std::{
+    ops::Deref,
+    pin::Pin,
+};
 
 use pulsevm_error::ChainError;
 
 use crate::{
-    Index64Object, KeyValueObject, TableId, TableObject,
+    Index64Object,
+    KeyValueObject,
+    TableId,
+    TableObject,
     bridge::ffi::{
-        CxxIndex64IteratorCache, CxxIndex128IteratorCache, CxxIndex256IteratorCache,
-        CxxIndexDoubleIteratorCache, CxxIndexLongDoubleIteratorCache, CxxKeyValueIteratorCache,
-        Index128Object, Index256Object, IndexDoubleObject, IndexLongDoubleObject,
-        new_index_double_iterator_cache, new_index_long_double_iterator_cache,
-        new_index64_iterator_cache, new_index128_iterator_cache, new_index256_iterator_cache,
+        CxxIndex64IteratorCache,
+        CxxIndex128IteratorCache,
+        CxxIndex256IteratorCache,
+        CxxIndexDoubleIteratorCache,
+        CxxIndexLongDoubleIteratorCache,
+        CxxKeyValueIteratorCache,
+        Index128Object,
+        Index256Object,
+        IndexDoubleObject,
+        IndexLongDoubleObject,
+        new_index_double_iterator_cache,
+        new_index_long_double_iterator_cache,
+        new_index64_iterator_cache,
+        new_index128_iterator_cache,
+        new_index256_iterator_cache,
         new_key_value_iterator_cache,
     },
 };

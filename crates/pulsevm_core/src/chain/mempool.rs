@@ -1,6 +1,12 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{
+    HashSet,
+    VecDeque,
+};
 
-use crate::chain::{id::Id, transaction::PackedTransaction};
+use crate::chain::{
+    id::Id,
+    transaction::PackedTransaction,
+};
 
 #[derive(Debug, Clone)]
 pub enum MempoolError {

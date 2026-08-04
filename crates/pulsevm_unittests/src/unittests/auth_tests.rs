@@ -4,16 +4,36 @@ mod auth_tests {
 
     use anyhow::Result;
     use pulsevm_core::{
-        ACTIVE_NAME, ChainError, OWNER_NAME, PULSE_NAME,
-        authority::{Authority, KeyWeight, PermissionLevel, PermissionLevelWeight},
+        ACTIVE_NAME,
+        ChainError,
+        OWNER_NAME,
+        PULSE_NAME,
+        authority::{
+            Authority,
+            KeyWeight,
+            PermissionLevel,
+            PermissionLevelWeight,
+        },
         authorization_manager::AuthorizationManager,
-        crypto::{PrivateKey, PublicKey},
+        crypto::{
+            PrivateKey,
+            PublicKey,
+        },
         name::Name,
-        transaction::{Action, SignedTransaction, Transaction, TransactionTrace},
+        transaction::{
+            Action,
+            SignedTransaction,
+            Transaction,
+            TransactionTrace,
+        },
     };
     use pulsevm_serialization::Write;
 
-    use crate::tests::{DEFAULT_EXPIRATION_DELTA, Testing, get_private_key};
+    use crate::tests::{
+        DEFAULT_EXPIRATION_DELTA,
+        Testing,
+        get_private_key,
+    };
     use pulsevm_name_macro::name;
 
     /// Guards the DB read-API soundness fix. `get_permission` now returns a
@@ -619,7 +639,8 @@ mod auth_tests {
             ))
         );
 
-        // Update trading parent to be spending, should fail since changing parent authority is not supported
+        // Update trading parent to be spending, should fail since changing parent authority is not
+        // supported
         assert_eq!(
             chain
                 .set_authority(
@@ -818,7 +839,8 @@ mod auth_tests {
             )],
             vec![scud_priv_key.clone()],
         )?;
-        // req auth action with alice's spending key should also be fine, since it is the parent of alice's scud key
+        // req auth action with alice's spending key should also be fine, since it is the parent of
+        // alice's scud key
         chain.push_reqauth2(
             name!("alice").into(),
             vec![PermissionLevel::new(

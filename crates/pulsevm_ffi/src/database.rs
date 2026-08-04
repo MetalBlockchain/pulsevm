@@ -1,21 +1,52 @@
-use std::pin::Pin;
-use std::sync::{Arc, RwLock, RwLockWriteGuard};
+use std::{
+    pin::Pin,
+    sync::{
+        Arc,
+        RwLock,
+        RwLockWriteGuard,
+    },
+};
 
 use cxx::UniquePtr;
 use pulsevm_error::ChainError;
 use pulsevm_name::Name;
 
 use crate::{
-    AccountMetadataObject, ChainConfigV0, Float128, Index64IteratorCache, Index128IteratorCache,
-    IndexDoubleIteratorCache, IndexLongDoubleIteratorCache, IndexLongDoubleObject, KeyValueObject,
+    AccountMetadataObject,
+    ChainConfigV0,
+    Float128,
+    Index64IteratorCache,
+    Index128IteratorCache,
+    IndexDoubleIteratorCache,
+    IndexLongDoubleIteratorCache,
+    IndexLongDoubleObject,
+    KeyValueObject,
     bridge::ffi::{
-        self, Authority, CxxDigest, CxxGenesisState, ElasticLimitParameters, Index64Object,
-        Index128Object, Index256Object, IndexDoubleObject, TableObject, TimePoint, U128, U256,
-        get_account_info_with_core_symbol, get_account_info_without_core_symbol,
-        get_currency_balance_with_symbol, get_currency_balance_without_symbol, get_currency_stats,
-        get_table_by_scope, get_table_rows,
+        self,
+        Authority,
+        CxxDigest,
+        CxxGenesisState,
+        ElasticLimitParameters,
+        Index64Object,
+        Index128Object,
+        Index256Object,
+        IndexDoubleObject,
+        TableObject,
+        TimePoint,
+        U128,
+        U256,
+        get_account_info_with_core_symbol,
+        get_account_info_without_core_symbol,
+        get_currency_balance_with_symbol,
+        get_currency_balance_without_symbol,
+        get_currency_stats,
+        get_table_by_scope,
+        get_table_rows,
     },
-    iterator_cache::{Index256IteratorCache, KeyValueIteratorCache},
+    iterator_cache::{
+        Index256IteratorCache,
+        KeyValueIteratorCache,
+    },
 };
 
 /// Field-for-field snapshot of an `account_metadata_object` read back from the

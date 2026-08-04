@@ -1,8 +1,14 @@
-use std::{collections::HashMap, str::FromStr};
+use std::{
+    collections::HashMap,
+    str::FromStr,
+};
 
 use pulsevm_api_client::PulseVmClient;
 use pulsevm_api_types::Permission;
-use pulsevm_core::{asset::Asset, name::Name};
+use pulsevm_core::{
+    asset::Asset,
+    name::Name,
+};
 use pulsevm_keosd_client::KeosdClient;
 
 use crate::cli::GetSubcommand;

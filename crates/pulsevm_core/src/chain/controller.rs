@@ -1,37 +1,68 @@
 use core::fmt;
 use std::{
-    collections::{BTreeSet, HashMap, HashSet, VecDeque},
+    collections::{
+        BTreeSet,
+        HashMap,
+        HashSet,
+        VecDeque,
+    },
     sync::LazyLock,
 };
 
 use crate::{
-    ACTIVE_NAME, MAJORITY_PRODUCERS_PERMISSION_NAME, MINORITY_PRODUCERS_PERMISSION_NAME,
-    PRODS_NAME, PULSE_NAME,
-    block::{BlockStatus, SignedBlock},
+    ACTIVE_NAME,
+    PULSE_NAME,
+    block::{
+        BlockStatus,
+        SignedBlock,
+    },
     chain::{
         apply_context::ApplyContext,
         authority::PermissionLevel,
         authorization_manager::AuthorizationManager,
         block::BlockHeader,
         config::{
-            DELETEAUTH_NAME, LINKAUTH_NAME, NEWACCOUNT_NAME, ONBLOCK_NAME, SETABI_NAME,
-            SETCODE_NAME, UNLINKAUTH_NAME, UPDATEAUTH_NAME, eos_percent,
+            DELETEAUTH_NAME,
+            LINKAUTH_NAME,
+            NEWACCOUNT_NAME,
+            ONBLOCK_NAME,
+            SETABI_NAME,
+            SETCODE_NAME,
+            UNLINKAUTH_NAME,
+            UPDATEAUTH_NAME,
+            eos_percent,
         },
         crypto::PublicKey,
         id::Id,
         mempool::Mempool,
         name::Name,
-        producer_schedule::{ProducerKey, ProducerSchedule},
+        producer_schedule::{
+            ProducerKey,
+            ProducerSchedule,
+        },
         pulse_contract::{
-            deleteauth, linkauth, newaccount, setabi, setcode, unlinkauth, updateauth,
+            deleteauth,
+            linkauth,
+            newaccount,
+            setabi,
+            setcode,
+            unlinkauth,
+            updateauth,
         },
         resource_limits::ResourceLimitsManager,
         state_history::StateHistoryLog,
         transaction::{
-            PackedTransaction, SignedTransaction, Transaction, TransactionHeader,
-            TransactionReceipt, TransactionTrace,
+            PackedTransaction,
+            SignedTransaction,
+            Transaction,
+            TransactionHeader,
+            TransactionReceipt,
+            TransactionTrace,
         },
-        transaction_context::{TransactionContext, TransactionResult},
+        transaction_context::{
+            TransactionContext,
+            TransactionResult,
+        },
         utils::make_ratio,
         wasm_runtime::WasmRuntime,
     },
@@ -41,19 +72,38 @@ use crate::{
 
 use cxx::UniquePtr;
 use pulsevm_constants::{
-    BLOCK_CPU_USAGE_AVERAGE_WINDOW_MS, BLOCK_INTERVAL_MS, BLOCK_SIZE_AVERAGE_WINDOW_MS,
+    BLOCK_CPU_USAGE_AVERAGE_WINDOW_MS,
+    BLOCK_INTERVAL_MS,
+    BLOCK_SIZE_AVERAGE_WINDOW_MS,
     MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER,
 };
-use pulsevm_crypto::{Digest, merkle};
+use pulsevm_crypto::{
+    Digest,
+    merkle,
+};
 use pulsevm_error::ChainError;
 use pulsevm_ffi::{
-    Authority, BlockTimestamp, CxxGenesisState, Database, DbWrite, ElasticLimitParameters,
-    GlobalPropertyObject, PermissionLevelWeight, PermissionObject, TimePoint, UndoSession,
-    parse_public_key, seconds,
+    BlockTimestamp,
+    CxxGenesisState,
+    Database,
+    ElasticLimitParameters,
+    GlobalPropertyObject,
+    TimePoint,
+    UndoSession,
+    parse_public_key,
+    seconds,
 };
 use pulsevm_grpc::vm;
-use pulsevm_serialization::{Read, Write};
-use spdlog::{debug, error, info, warn};
+use pulsevm_serialization::{
+    Read,
+    Write,
+};
+use spdlog::{
+    debug,
+    error,
+    info,
+    warn,
+};
 
 pub type ApplyHandlerFn = fn(&mut ApplyContext, &mut Database, &Action) -> Result<(), ChainError>;
 pub type ApplyHandlerMap = HashMap<
@@ -1593,26 +1643,55 @@ impl Controller {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path, str::FromStr, sync::Arc, vec};
+    use std::{
+        fs,
+        path::Path,
+        str::FromStr,
+        sync::Arc,
+        vec,
+    };
 
-    use pulsevm_ffi::{Authority, KeyWeight, TimePointSec};
-    use pulsevm_proc_macros::{NumBytes, Read, Write};
+    use pulsevm_ffi::{
+        Authority,
+        KeyWeight,
+        TimePointSec,
+    };
+    use pulsevm_proc_macros::{
+        NumBytes,
+        Read,
+        Write,
+    };
     use pulsevm_serialization::Write;
     use serde_json::json;
     use tempfile::TempDir;
-    use tokio::runtime;
-    use tokio::sync::RwLock;
+    use tokio::{
+        runtime,
+        sync::RwLock,
+    };
 
     use crate::{
         ACTIVE_NAME,
         chain::{
             abi::AbiDefinition,
-            asset::{Asset, Symbol},
+            asset::{
+                Asset,
+                Symbol,
+            },
             authority::PermissionLevel,
             pulse_contract::{
-                DeleteAuth, LinkAuth, NewAccount, SetAbi, SetCode, UnlinkAuth, UpdateAuth,
+                DeleteAuth,
+                LinkAuth,
+                NewAccount,
+                SetAbi,
+                SetCode,
+                UnlinkAuth,
+                UpdateAuth,
             },
-            transaction::{Action, Transaction, TransactionHeader},
+            transaction::{
+                Action,
+                Transaction,
+                TransactionHeader,
+            },
         },
         crypto::PrivateKey,
     };
@@ -2974,7 +3053,10 @@ mod tests {
     #[cfg(feature = "arena-shadow")]
     #[tokio::test]
     async fn oracle_cross_impl_account_metadata_root() -> Result<(), ChainError> {
-        use sha2::{Digest, Sha256};
+        use sha2::{
+            Digest,
+            Sha256,
+        };
 
         let chain_id =
             Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
@@ -3062,7 +3144,10 @@ mod tests {
     #[cfg(feature = "arena-shadow")]
     #[tokio::test]
     async fn oracle_cross_impl_account_root() -> Result<(), ChainError> {
-        use sha2::{Digest, Sha256};
+        use sha2::{
+            Digest,
+            Sha256,
+        };
 
         let chain_id =
             Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
@@ -3136,7 +3221,10 @@ mod tests {
     #[cfg(feature = "arena-shadow")]
     #[tokio::test]
     async fn oracle_cross_impl_permission_root() -> Result<(), ChainError> {
-        use sha2::{Digest, Sha256};
+        use sha2::{
+            Digest,
+            Sha256,
+        };
 
         let chain_id =
             Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
@@ -3205,7 +3293,10 @@ mod tests {
     #[cfg(feature = "arena-shadow")]
     #[tokio::test]
     async fn oracle_cross_impl_full_state_root() -> Result<(), ChainError> {
-        use sha2::{Digest, Sha256};
+        use sha2::{
+            Digest,
+            Sha256,
+        };
 
         let chain_id =
             Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
@@ -3379,7 +3470,10 @@ mod tests {
     #[cfg(feature = "arena-shadow")]
     #[tokio::test]
     async fn oracle_cross_impl_contract_root() -> Result<(), ChainError> {
-        use sha2::{Digest, Sha256};
+        use sha2::{
+            Digest,
+            Sha256,
+        };
 
         let chain_id =
             Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
@@ -3856,15 +3950,23 @@ mod tests {
     /// the block re-derives the same merkle roots on replay.
     #[cfg(feature = "arena-shadow")]
     fn reconstruct_block(r: &serde_json::Value) -> Result<SignedBlock, ChainError> {
-        use crate::chain::block::SignedBlockHeader;
-        use crate::chain::crypto::Signature;
-        use crate::chain::transaction::{
-            PackedTransaction, TransactionCompression, TransactionReceipt,
-            TransactionReceiptHeader, TransactionStatus,
+        use crate::chain::{
+            block::SignedBlockHeader,
+            crypto::Signature,
+            transaction::{
+                PackedTransaction,
+                TransactionCompression,
+                TransactionReceipt,
+                TransactionReceiptHeader,
+                TransactionStatus,
+            },
         };
         use pulsevm_crypto::Bytes;
         use pulsevm_serialization::VarUint32;
-        use std::collections::{BTreeSet, VecDeque};
+        use std::collections::{
+            BTreeSet,
+            VecDeque,
+        };
 
         let hexd32 = |s: &str| -> [u8; 32] { hex::decode(s).unwrap().try_into().unwrap() };
         let header = BlockHeader {

@@ -1,8 +1,14 @@
 use pulsevm_error::ChainError;
-use wasmer::{FunctionEnvMut, RuntimeError, WasmPtr};
+use wasmer::{
+    FunctionEnvMut,
+    RuntimeError,
+    WasmPtr,
+};
 
 use crate::chain::{
-    controller::Controller, utils::pulse_assert, wasm_runtime::WasmContext,
+    controller::Controller,
+    utils::pulse_assert,
+    wasm_runtime::WasmContext,
     webassembly::context_aware_check,
 };
 

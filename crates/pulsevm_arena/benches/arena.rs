@@ -3,9 +3,21 @@
 
 use std::hint::black_box;
 
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{
+    BenchmarkId,
+    Criterion,
+    criterion_group,
+    criterion_main,
+};
 use pulsevm_arena::{
-    ArenaObject, Db, IndexedBy, ObjectId, SecondaryIndex, Table, hash_index, key_index,
+    ArenaObject,
+    Db,
+    IndexedBy,
+    ObjectId,
+    SecondaryIndex,
+    Table,
+    hash_index,
+    key_index,
 };
 
 #[repr(C)]

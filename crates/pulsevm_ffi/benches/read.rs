@@ -1,4 +1,9 @@
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{
+    BenchmarkId,
+    Criterion,
+    criterion_group,
+    criterion_main,
+};
 use pulsevm_ffi::Database;
 use std::hint::black_box;
 use tempfile::tempdir;

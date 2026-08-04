@@ -8,4 +8,7 @@ mod symbol_code;
 pub use symbol_code::SymbolCode;
 
 mod symbol;
-pub use symbol::{MAX_PRECISION, Symbol};
+pub use symbol::{
+    MAX_PRECISION,
+    Symbol,
+};

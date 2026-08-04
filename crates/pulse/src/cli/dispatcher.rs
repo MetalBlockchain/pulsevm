@@ -4,7 +4,15 @@ use pulsevm_api_client::PulseVmClient;
 use pulsevm_keosd_client::KeosdClient;
 
 use crate::{
-    cli::{Cli, Commands, create, get, set, transfer, wallet},
+    cli::{
+        Cli,
+        Commands,
+        create,
+        get,
+        set,
+        transfer,
+        wallet,
+    },
     config::load_or_create_config,
 };
 

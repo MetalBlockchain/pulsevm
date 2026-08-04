@@ -5,11 +5,22 @@ mod logging;
 mod manager;
 mod wallet;
 
-use std::{path::PathBuf, sync::Mutex};
+use std::{
+    path::PathBuf,
+    sync::Mutex,
+};
 
-use actix_web::{App, HttpServer, middleware, web};
+use actix_web::{
+    App,
+    HttpServer,
+    middleware,
+    web,
+};
 use clap::Parser;
-use spdlog::{error, info};
+use spdlog::{
+    error,
+    info,
+};
 
 use crate::cli::Cli;
 

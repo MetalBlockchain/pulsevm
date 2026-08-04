@@ -1,0 +1,28 @@
+name: rustfmt
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  rustfmt:
+    name: cargo fmt --check
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      # rustfmt.toml relies on unstable options that only apply on nightly, so
+      # pin the nightly here: formatting is then identical for everyone and a
+      # rustfmt behaviour change can only land as a deliberate bump of this line.
+      - name: Install pinned nightly rustfmt
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-07-27
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo +nightly-2026-07-27 fmt --all --check

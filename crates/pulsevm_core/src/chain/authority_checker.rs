@@ -1,11 +1,22 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{
+    BTreeSet,
+    HashMap,
+};
 
 use pulsevm_error::ChainError;
-use pulsevm_ffi::{DbRead, Microseconds};
+use pulsevm_ffi::{
+    DbRead,
+    Microseconds,
+};
 
 use crate::crypto::PublicKey;
 
-use super::authority::{Authority, KeyWeight, PermissionLevel, PermissionLevelWeight};
+use super::authority::{
+    Authority,
+    KeyWeight,
+    PermissionLevel,
+    PermissionLevelWeight,
+};
 
 pub struct AuthorityChecker<'a> {
     recursion_depth_limit: u16,

@@ -1,20 +1,36 @@
 #[cfg(test)]
 mod auth_tests {
-    use std::{fs, path::Path, sync::Arc};
+    use std::{
+        fs,
+        path::Path,
+        sync::Arc,
+    };
 
     use anyhow::Result;
     use pulsevm_core::{
         authority::PermissionLevel,
-        transaction::{Action, SignedTransaction, Transaction},
+        transaction::{
+            Action,
+            SignedTransaction,
+            Transaction,
+        },
         wat2wasm,
     };
     use pulsevm_name_macro::name;
 
     use crate::{
-        tests::{DEFAULT_EXPIRATION_DELTA, Testing, get_private_key},
+        tests::{
+            DEFAULT_EXPIRATION_DELTA,
+            Testing,
+            get_private_key,
+        },
         unittests::contracts::{
-            ALIGNED_CONST_REF_WAST, ALIGNED_REF_WAST, ENTRY_WAST, ENTRY_WAST_2,
-            MISALIGNED_CONST_REF_WAST, MISALIGNED_REF_WAST,
+            ALIGNED_CONST_REF_WAST,
+            ALIGNED_REF_WAST,
+            ENTRY_WAST,
+            ENTRY_WAST_2,
+            MISALIGNED_CONST_REF_WAST,
+            MISALIGNED_REF_WAST,
         },
     };
 

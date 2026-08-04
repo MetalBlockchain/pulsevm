@@ -1,12 +1,26 @@
 use std::sync::Mutex;
 
-use actix_web::{HttpResponse, get, post, web};
-use pulsevm_core::{id::Id, transaction::Transaction};
-use serde::{Deserialize, Serialize};
+use actix_web::{
+    HttpResponse,
+    get,
+    post,
+    web,
+};
+use pulsevm_core::{
+    id::Id,
+    transaction::Transaction,
+};
+use serde::{
+    Deserialize,
+    Serialize,
+};
 use serde_json::Map;
 use spdlog::info;
 
-use crate::manager::{ManagerError, WalletManager};
+use crate::manager::{
+    ManagerError,
+    WalletManager,
+};
 
 /// Shared state for the HTTP server.
 pub struct AppState {

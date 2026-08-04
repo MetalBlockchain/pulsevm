@@ -1,8 +1,21 @@
-use std::any::TypeId;
-use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::ops::Bound;
+use std::{
+    any::TypeId,
+    collections::{
+        BTreeMap,
+        HashMap,
+        VecDeque,
+    },
+    ops::Bound,
+};
 
-use crate::object::{ArenaObject, BlobRef, IndexedBy, KeyIndex, ObjectId, SecondaryIndex};
+use crate::object::{
+    ArenaObject,
+    BlobRef,
+    IndexedBy,
+    KeyIndex,
+    ObjectId,
+    SecondaryIndex,
+};
 
 /// Errors from table operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,10 +41,10 @@ pub enum TableError {
 /// One entry of the undo stack (chainbase `undo_index::undo_state`).
 ///
 /// - a key is *new* if `id >= old_next_id`
-/// - a key is *modified* if it is in `old_values` (the value it had when the
-///   session started; oldest value wins on repeated modifies)
-/// - a key is *removed* if it is in `removed_values`; if it is also in
-///   `old_values`, undo restores the older value.
+/// - a key is *modified* if it is in `old_values` (the value it had when the session started;
+///   oldest value wins on repeated modifies)
+/// - a key is *removed* if it is in `removed_values`; if it is also in `old_values`, undo restores
+///   the older value.
 struct UndoState<T> {
     old_values: HashMap<i64, T>,
     removed_values: HashMap<i64, T>,

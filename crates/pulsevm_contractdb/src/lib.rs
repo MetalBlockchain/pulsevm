@@ -16,10 +16,20 @@
 //! double), which share one shape — each with its own object table and iterator
 //! cache.
 
-use std::collections::HashMap;
-use std::ops::Bound;
+use std::{
+    collections::HashMap,
+    ops::Bound,
+};
 
-use pulsevm_arena::{ArenaObject, BlobRef, Db, IndexedBy, ObjectId, SecondaryIndex, key_index};
+use pulsevm_arena::{
+    ArenaObject,
+    BlobRef,
+    Db,
+    IndexedBy,
+    ObjectId,
+    SecondaryIndex,
+    key_index,
+};
 
 /// RAM overhead billed per row, matching EOS `config::billable_size_v<...>` —
 /// the raw `value` from `contract_table_objects.hpp` aligned up to 16

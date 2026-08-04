@@ -1,5 +1,11 @@
 use pulsevm_arena::{
-    ArenaObject, IndexedBy, ObjectId, SecondaryIndex, Table, TableError, key_index,
+    ArenaObject,
+    IndexedBy,
+    ObjectId,
+    SecondaryIndex,
+    Table,
+    TableError,
+    key_index,
 };
 
 #[repr(C)]

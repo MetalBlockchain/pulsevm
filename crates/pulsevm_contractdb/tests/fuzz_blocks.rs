@@ -8,10 +8,15 @@
 //! is exactly its own effect. Point the reference at C++ and it is the
 //! Rust-vs-chainbase block check.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{
+    BTreeMap,
+    BTreeSet,
+};
 
-use proptest::collection::vec;
-use proptest::prelude::*;
+use proptest::{
+    collection::vec,
+    prelude::*,
+};
 use pulsevm_contractdb::ContractDb;
 
 const CODE: u64 = 10;
