@@ -105,6 +105,95 @@ fn bad(msg: String) -> ChainError {
     ChainError::InternalError(msg)
 }
 
+// ----- sparse payload ----------------------------------------------------
+//
+// chainbase preallocates its arena to the configured size (tens of GB by
+// default) and leaves the unused tail zeroed, so copying the raw file verbatim
+// would move tens of GB of zeros. The payload instead stores only the non-zero
+// regions, keyed by absolute offset — the same zero-skipping chainbase itself
+// does when it writes the file (`save_database_file`). This makes the payload
+// and the peak memory proportional to the live state, not the reservation.
+//
+// Layout: `[u64 logical_len]` then a sequence of runs `[u64 offset][u64 len][len
+// bytes]`, ascending. A run is emitted at block granularity, so a run may carry
+// a few zero bytes inside a partially-used block — harmless, and it keeps the
+// scan cheap.
+
+/// Granularity at which the sparse scan decides zero vs. non-zero. Matches a
+/// typical page so a partially-used page is copied whole.
+pub const SPARSE_BLOCK: usize = 4096;
+
+/// Begin a sparse payload for a file of `logical_len` bytes.
+pub fn sparse_begin(logical_len: u64) -> Vec<u8> {
+    logical_len.to_le_bytes().to_vec()
+}
+
+/// Append the non-zero runs of `chunk` — which begins at absolute offset `base`
+/// in the file — to `payload`. `base` must be block-aligned (callers feed
+/// block-aligned chunks except the final short one), so runs from consecutive
+/// chunks abut cleanly.
+pub fn sparse_append(payload: &mut Vec<u8>, base: u64, chunk: &[u8]) {
+    let mut i = 0;
+    while i < chunk.len() {
+        let block_end = (i + SPARSE_BLOCK).min(chunk.len());
+        if chunk[i..block_end].iter().any(|&b| b != 0) {
+            // Extend over consecutive non-zero blocks into one run.
+            let start = i;
+            let mut j = block_end;
+            while j < chunk.len() {
+                let next = (j + SPARSE_BLOCK).min(chunk.len());
+                if chunk[j..next].iter().any(|&b| b != 0) {
+                    j = next;
+                } else {
+                    break;
+                }
+            }
+            payload.extend_from_slice(&(base + start as u64).to_le_bytes());
+            payload.extend_from_slice(&((j - start) as u64).to_le_bytes());
+            payload.extend_from_slice(&chunk[start..j]);
+            i = j;
+        } else {
+            i = block_end;
+        }
+    }
+}
+
+/// Walk a sparse payload, calling `write_run(offset, data)` for each stored run,
+/// and return the logical length. Every run is bounds-checked against that
+/// length, so a malformed payload is rejected rather than writing out of range.
+pub fn sparse_expand(
+    payload: &[u8],
+    mut write_run: impl FnMut(u64, &[u8]) -> std::io::Result<()>,
+) -> Result<u64, ChainError> {
+    if payload.len() < 8 {
+        return Err(bad("sparse: missing length header".into()));
+    }
+    let logical_len = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+    let mut pos = 8usize;
+    while pos < payload.len() {
+        if pos + 16 > payload.len() {
+            return Err(bad("sparse: truncated run header".into()));
+        }
+        let offset = u64::from_le_bytes(payload[pos..pos + 8].try_into().unwrap());
+        let len = u64::from_le_bytes(payload[pos + 8..pos + 16].try_into().unwrap());
+        pos += 16;
+        let len_usize = len as usize;
+        if pos + len_usize > payload.len() {
+            return Err(bad("sparse: truncated run data".into()));
+        }
+        if offset
+            .checked_add(len)
+            .map_or(true, |end| end > logical_len)
+        {
+            return Err(bad("sparse: run out of bounds".into()));
+        }
+        write_run(offset, &payload[pos..pos + len_usize])
+            .map_err(|e| bad(format!("sparse: write run: {e}")))?;
+        pos += len_usize;
+    }
+    Ok(logical_len)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,5 +262,82 @@ mod tests {
         let peeked = peek_header(&bytes).unwrap();
         let (decoded, _) = decode(&bytes).unwrap();
         assert_eq!(peeked, decoded);
+    }
+
+    /// Encode `data` as a sparse payload and expand it back into a fresh buffer.
+    fn sparse_round_trip(data: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let mut payload = sparse_begin(data.len() as u64);
+        // Feed it in block-aligned chunks, as the file reader does.
+        let chunk = SPARSE_BLOCK * 3;
+        let mut off = 0;
+        while off < data.len() {
+            let end = (off + chunk).min(data.len());
+            sparse_append(&mut payload, off as u64, &data[off..end]);
+            off = end;
+        }
+        let mut out = vec![0u8; data.len()];
+        let logical = sparse_expand(&payload, |o, d| {
+            out[o as usize..o as usize + d.len()].copy_from_slice(d);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(logical, data.len() as u64);
+        (payload, out)
+    }
+
+    #[test]
+    fn sparse_round_trips_mixed_content() {
+        let mut data = vec![0u8; SPARSE_BLOCK * 10];
+        // Scatter non-zero content across a few blocks, leaving zero gaps.
+        data[10] = 1;
+        for b in &mut data[SPARSE_BLOCK * 4..SPARSE_BLOCK * 5] {
+            *b = 0xAB;
+        }
+        data[SPARSE_BLOCK * 9 + 7] = 0xFF;
+        let (_payload, out) = sparse_round_trip(&data);
+        assert_eq!(out, data);
+    }
+
+    #[test]
+    fn sparse_all_zeros_stores_no_runs() {
+        let data = vec![0u8; SPARSE_BLOCK * 8];
+        let (payload, out) = sparse_round_trip(&data);
+        // Only the 8-byte length header — a zeroed reservation costs nothing.
+        assert_eq!(payload.len(), 8);
+        assert_eq!(out, data);
+    }
+
+    #[test]
+    fn sparse_all_nonzero_round_trips() {
+        let data = vec![0x7u8; SPARSE_BLOCK * 3 + 123];
+        let (_payload, out) = sparse_round_trip(&data);
+        assert_eq!(out, data);
+    }
+
+    #[test]
+    fn sparse_empty_round_trips() {
+        let (payload, out) = sparse_round_trip(&[]);
+        assert_eq!(payload.len(), 8);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn sparse_expand_rejects_out_of_bounds_run() {
+        // logical_len = 16, but a run claims offset 8 len 100.
+        let mut payload = sparse_begin(16);
+        payload.extend_from_slice(&8u64.to_le_bytes());
+        payload.extend_from_slice(&100u64.to_le_bytes());
+        payload.extend_from_slice(&[1u8; 100]);
+        let r = sparse_expand(&payload, |_, _| Ok(()));
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn sparse_expand_rejects_truncated_run() {
+        let mut payload = sparse_begin(4096);
+        payload.extend_from_slice(&0u64.to_le_bytes());
+        payload.extend_from_slice(&64u64.to_le_bytes());
+        payload.extend_from_slice(&[1u8; 8]); // claims 64, only 8 present
+        assert!(sparse_expand(&payload, |_, _| Ok(())).is_err());
     }
 }
