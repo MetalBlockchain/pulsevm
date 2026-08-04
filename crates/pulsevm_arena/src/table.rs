@@ -7,13 +7,20 @@ use crate::object::{ArenaObject, BlobRef, IndexedBy, KeyIndex, ObjectId, Seconda
 /// Errors from table operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TableError {
-    NotFound { type_name: &'static str, id: i64 },
-    UnknownKey { type_name: &'static str },
+    NotFound {
+        type_name: &'static str,
+        id: i64,
+    },
+    UnknownKey {
+        type_name: &'static str,
+    },
     UniquenessViolation {
         type_name: &'static str,
         index_name: &'static str,
     },
-    IdChanged { type_name: &'static str },
+    IdChanged {
+        type_name: &'static str,
+    },
     Revision(&'static str),
     Corrupted(&'static str),
 }
@@ -219,11 +226,7 @@ impl<T: ArenaObject> Table<T> {
 
     /// Applies `m` to the stored object. On a uniqueness violation the object is
     /// left unchanged and an error is returned.
-    pub fn modify<F: FnOnce(&mut T)>(
-        &mut self,
-        id: ObjectId<T>,
-        m: F,
-    ) -> Result<(), TableError> {
+    pub fn modify<F: FnOnce(&mut T)>(&mut self, id: ObjectId<T>, m: F) -> Result<(), TableError> {
         let raw = id.raw();
         let Some(current) = self.primary.get(raw as usize).and_then(|s| s.as_ref()) else {
             return Err(TableError::NotFound {
@@ -301,13 +304,16 @@ impl<T: ArenaObject> Table<T> {
     /// Typed view of a secondary index (chainbase `indices().get<Tag>()`).
     /// Panics if `Tag` is not declared by [`ArenaObject::secondary_indices`].
     pub fn get_index<Tag: IndexedBy<T>>(&self) -> IndexView<'_, T, Tag> {
-        let pos = *self.tag_positions.get(&TypeId::of::<Tag>()).unwrap_or_else(|| {
-            panic!(
-                "index {} is not declared by {}",
-                std::any::type_name::<Tag>(),
-                T::type_name()
-            )
-        });
+        let pos = *self
+            .tag_positions
+            .get(&TypeId::of::<Tag>())
+            .unwrap_or_else(|| {
+                panic!(
+                    "index {} is not declared by {}",
+                    std::any::type_name::<Tag>(),
+                    T::type_name()
+                )
+            });
         let index = self.secondaries[pos]
             .as_any()
             .downcast_ref::<KeyIndex<T, Tag>>()
@@ -325,13 +331,16 @@ impl<T: ArenaObject> Table<T> {
     where
         Tag::Key: std::hash::Hash + Eq,
     {
-        let pos = *self.tag_positions.get(&TypeId::of::<Tag>()).unwrap_or_else(|| {
-            panic!(
-                "index {} is not declared by {}",
-                std::any::type_name::<Tag>(),
-                T::type_name()
-            )
-        });
+        let pos = *self
+            .tag_positions
+            .get(&TypeId::of::<Tag>())
+            .unwrap_or_else(|| {
+                panic!(
+                    "index {} is not declared by {}",
+                    std::any::type_name::<Tag>(),
+                    T::type_name()
+                )
+            });
         let index = self.secondaries[pos]
             .as_any()
             .downcast_ref::<crate::object::HashKeyIndex<T, Tag>>()
@@ -656,7 +665,9 @@ impl<T: ArenaObject> Table<T> {
         let count = read_u64(bytes, &mut pos)?;
         for _ in 0..count {
             let id = read_u64(bytes, &mut pos)? as usize;
-            let tag = *bytes.get(pos).ok_or(TableError::Corrupted("delta truncated"))?;
+            let tag = *bytes
+                .get(pos)
+                .ok_or(TableError::Corrupted("delta truncated"))?;
             pos += 1;
             if let Some(old) = self.primary.get_mut(id).and_then(|s| s.take()) {
                 for index in &mut self.secondaries {

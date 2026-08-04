@@ -76,7 +76,7 @@ impl ApplyContext {
         action_ordinal: u32,
         depth: u32,
         cpu_limit: i64,
-        context_free: bool
+        context_free: bool,
     ) -> Result<Self, ChainError> {
         let pending_block_timestamp = trx_context.pending_block_timestamp()?;
 
@@ -605,7 +605,9 @@ impl ApplyContext {
 
         let cb_value = obj.get_value();
         #[cfg(feature = "arena-shadow")]
-        let source: &[u8] = arena_value.as_deref().unwrap_or_else(|| cb_value.as_slice());
+        let source: &[u8] = arena_value
+            .as_deref()
+            .unwrap_or_else(|| cb_value.as_slice());
         #[cfg(not(feature = "arena-shadow"))]
         let source: &[u8] = cb_value.as_slice();
 
@@ -859,7 +861,9 @@ impl ApplyContext {
         // cutover switch is on.
         #[cfg(feature = "arena-shadow")]
         {
-            let arena = self.db.arena_idx64_find_secondary(code, scope, table, secondary);
+            let arena = self
+                .db
+                .arena_idx64_find_secondary(code, scope, table, secondary);
             let ffi = if res >= 0 { Some(*primary) } else { None };
             self.db.arena_note_pos(arena == ffi);
             if self.db.arena_reads_enabled()
@@ -893,7 +897,9 @@ impl ApplyContext {
 
         #[cfg(feature = "arena-shadow")]
         {
-            let arena = self.db.arena_idx64_find_primary(code, scope, table, primary);
+            let arena = self
+                .db
+                .arena_idx64_find_primary(code, scope, table, primary);
             let ffi = if res >= 0 { Some(*secondary) } else { None };
             self.db.arena_note_pos(arena == ffi);
             if self.db.arena_reads_enabled()
@@ -934,7 +940,11 @@ impl ApplyContext {
         #[cfg(feature = "arena-shadow")]
         {
             let arena = self.db.arena_idx64_lower_bound(code, scope, table, search);
-            let ffi = if res >= 0 { Some((*primary, *secondary)) } else { None };
+            let ffi = if res >= 0 {
+                Some((*primary, *secondary))
+            } else {
+                None
+            };
             self.db.arena_note_pos(arena == ffi);
             if self.db.arena_reads_enabled()
                 && res >= 0
@@ -971,7 +981,11 @@ impl ApplyContext {
         #[cfg(feature = "arena-shadow")]
         {
             let arena = self.db.arena_idx64_upper_bound(code, scope, table, search);
-            let ffi = if res >= 0 { Some((*primary, *secondary)) } else { None };
+            let ffi = if res >= 0 {
+                Some((*primary, *secondary))
+            } else {
+                None
+            };
             self.db.arena_note_pos(arena == ffi);
             if self.db.arena_reads_enabled()
                 && res >= 0

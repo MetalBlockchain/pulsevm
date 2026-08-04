@@ -52,8 +52,7 @@ mod auth_tests {
         // The reference is confined to this read scope and dropped at its end.
         let auth_before = {
             let r = db.read()?;
-            let perm =
-                AuthorizationManager::get_permission(&r, alice.as_u64(), name!("spending"))?;
+            let perm = AuthorizationManager::get_permission(&r, alice.as_u64(), name!("spending"))?;
             perm.get_authority().to_authority()
         };
 
@@ -67,8 +66,7 @@ mod auth_tests {
 
         let auth_after = {
             let r = db.read()?;
-            let perm =
-                AuthorizationManager::get_permission(&r, alice.as_u64(), name!("spending"))?;
+            let perm = AuthorizationManager::get_permission(&r, alice.as_u64(), name!("spending"))?;
             perm.get_authority().to_authority()
         };
 
@@ -114,8 +112,14 @@ mod auth_tests {
         push_multi_reqauth(
             &mut chain,
             vec![
-                (alice, PermissionLevel::new(alice.as_u64(), ACTIVE_NAME.as_u64())),
-                (bob, PermissionLevel::new(bob.as_u64(), ACTIVE_NAME.as_u64())),
+                (
+                    alice,
+                    PermissionLevel::new(alice.as_u64(), ACTIVE_NAME.as_u64()),
+                ),
+                (
+                    bob,
+                    PermissionLevel::new(bob.as_u64(), ACTIVE_NAME.as_u64()),
+                ),
             ],
             vec![
                 get_private_key(alice, "active"),
@@ -138,8 +142,14 @@ mod auth_tests {
             push_multi_reqauth(
                 &mut chain,
                 vec![
-                    (alice, PermissionLevel::new(alice.as_u64(), ACTIVE_NAME.as_u64())),
-                    (bob, PermissionLevel::new(bob.as_u64(), ACTIVE_NAME.as_u64())),
+                    (
+                        alice,
+                        PermissionLevel::new(alice.as_u64(), ACTIVE_NAME.as_u64())
+                    ),
+                    (
+                        bob,
+                        PermissionLevel::new(bob.as_u64(), ACTIVE_NAME.as_u64())
+                    ),
                 ],
                 vec![
                     get_private_key(alice, "active"),
@@ -190,7 +200,10 @@ mod auth_tests {
             ACTIVE_NAME.into(),
             Authority::new(
                 2,
-                bob_keys.iter().map(|k| KeyWeight::new(k.inner(), 1)).collect(),
+                bob_keys
+                    .iter()
+                    .map(|k| KeyWeight::new(k.inner(), 1))
+                    .collect(),
                 vec![],
                 vec![],
             ),
@@ -199,10 +212,7 @@ mod auth_tests {
 
         // alice@active = threshold 2, keys[K1], accounts[bob@active, carol@active]
         let mut alice_accounts = vec![
-            PermissionLevelWeight::new(
-                PermissionLevel::new(bob.as_u64(), ACTIVE_NAME.as_u64()),
-                1,
-            ),
+            PermissionLevelWeight::new(PermissionLevel::new(bob.as_u64(), ACTIVE_NAME.as_u64()), 1),
             PermissionLevelWeight::new(
                 PermissionLevel::new(carol.as_u64(), ACTIVE_NAME.as_u64()),
                 1,
@@ -305,9 +315,7 @@ mod auth_tests {
                     vec![get_private_key(name!("bob").into(), "active")],
                 )
                 .err(),
-            Some(ChainError::ApplyError(
-                "missing authority of alice".into()
-            ))
+            Some(ChainError::ApplyError("missing authority of alice".into()))
         );
         Ok(())
     }
@@ -928,10 +936,7 @@ mod auth_tests {
 
         // alice@active = threshold 1, accounts[bob@active, carol@active].
         let mut alice_accounts = vec![
-            PermissionLevelWeight::new(
-                PermissionLevel::new(bob.as_u64(), ACTIVE_NAME.as_u64()),
-                1,
-            ),
+            PermissionLevelWeight::new(PermissionLevel::new(bob.as_u64(), ACTIVE_NAME.as_u64()), 1),
             PermissionLevelWeight::new(
                 PermissionLevel::new(carol.as_u64(), ACTIVE_NAME.as_u64()),
                 1,

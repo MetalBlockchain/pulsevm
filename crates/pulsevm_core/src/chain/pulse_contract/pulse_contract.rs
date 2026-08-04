@@ -455,13 +455,17 @@ fn validate_authority_precondition(db: &mut Database, auth: &Authority) -> Resul
             continue; // virtual pulse.code permission does not really exist but is allowed
         }
 
-        AuthorizationManager::get_permission(&db.read()?, a.permission.actor, a.permission.permission)
-            .map_err(|_| {
-                ChainError::TransactionError(format!(
-                    "permission {}@{} does not exist",
-                    a.permission.actor, a.permission.permission
-                ))
-            })?;
+        AuthorizationManager::get_permission(
+            &db.read()?,
+            a.permission.actor,
+            a.permission.permission,
+        )
+        .map_err(|_| {
+            ChainError::TransactionError(format!(
+                "permission {}@{} does not exist",
+                a.permission.actor, a.permission.permission
+            ))
+        })?;
     }
     Ok(())
 }

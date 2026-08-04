@@ -20,7 +20,12 @@ use pulsevm_arena::{ArenaObject, ObjectId, Table};
 
 #[repr(C)]
 #[derive(
-    Clone, Copy, Default, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable,
+    Clone,
+    Copy,
+    Default,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::Immutable,
     zerocopy::KnownLayout,
 )]
 struct Row {
@@ -45,7 +50,11 @@ struct Model {
 }
 impl Model {
     fn new() -> Self {
-        Model { rows: BTreeMap::new(), next_id: 0, snaps: Vec::new() }
+        Model {
+            rows: BTreeMap::new(),
+            next_id: 0,
+            snaps: Vec::new(),
+        }
     }
     fn ids(&self) -> Vec<i64> {
         self.rows.keys().copied().collect()

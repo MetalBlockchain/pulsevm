@@ -40,7 +40,9 @@ impl Asset {
     pub fn try_new(amount: i64, symbol: Symbol) -> Result<Self, ParseAssetError> {
         let asset = Asset { amount, symbol };
         if !asset.is_amount_within_range() {
-            return Err(ParseAssetError("magnitude of asset amount must be less than 2^62".into()));
+            return Err(ParseAssetError(
+                "magnitude of asset amount must be less than 2^62".into(),
+            ));
         }
         if !asset.symbol.is_valid() {
             return Err(ParseAssetError("invalid symbol".into()));
@@ -242,7 +244,11 @@ mod tests {
             "1000000 USD",
             "0.1 CUR",
         ] {
-            assert_eq!(s.parse::<Asset>().unwrap().to_string(), s, "round trip: {s}");
+            assert_eq!(
+                s.parse::<Asset>().unwrap().to_string(),
+                s,
+                "round trip: {s}"
+            );
         }
     }
 

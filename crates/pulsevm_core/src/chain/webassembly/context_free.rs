@@ -24,11 +24,9 @@ pub fn get_context_free_data(
     // buffer_size == 0 is the size-query form: nodeos returns the packed size
     // without touching the buffer, so skip the range check entirely.
     if buffer_size > 0 {
-        buffer_ptr
-            .slice(&view, buffer_size)
-            .map_err(|e| {
-                RuntimeError::new(format!("get_context_free_data: invalid buffer range: {e}"))
-            })?;
+        buffer_ptr.slice(&view, buffer_size).map_err(|e| {
+            RuntimeError::new(format!("get_context_free_data: invalid buffer range: {e}"))
+        })?;
     }
 
     // Safe to allocate now: buffer_size is bounded by linear memory size.

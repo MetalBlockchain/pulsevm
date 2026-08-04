@@ -1,7 +1,17 @@
 use pulsevm_arena::{ArenaObject, Db, DbError, IndexedBy, ObjectId, SecondaryIndex, key_index};
 
 #[repr(C)]
-#[derive(Clone, Copy, Default, Debug, PartialEq, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout)]
+#[derive(
+    Clone,
+    Copy,
+    Default,
+    Debug,
+    PartialEq,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::Immutable,
+    zerocopy::KnownLayout,
+)]
 struct Account {
     id: ObjectId<Account>,
     name: u64,
@@ -27,7 +37,17 @@ impl ArenaObject for Account {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Default, Debug, PartialEq, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout)]
+#[derive(
+    Clone,
+    Copy,
+    Default,
+    Debug,
+    PartialEq,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::Immutable,
+    zerocopy::KnownLayout,
+)]
 struct Resource {
     id: ObjectId<Resource>,
     owner: u64,
@@ -60,7 +80,13 @@ fn cross_table_operations() {
     })
     .unwrap();
     assert_eq!(db.get::<Account>(a).unwrap().name, 5);
-    assert_eq!(db.find_by::<Account, AccountByName>(&5).unwrap().unwrap().id, a);
+    assert_eq!(
+        db.find_by::<Account, AccountByName>(&5)
+            .unwrap()
+            .unwrap()
+            .id,
+        a
+    );
     assert_eq!(db.table::<Resource>().unwrap().len(), 1);
 }
 
@@ -88,7 +114,8 @@ fn undo_session_spans_all_tables() {
     let rev = db.start_undo_session();
     assert_eq!(rev, 1);
     db.create::<Account>(|a| a.name = 2).unwrap();
-    db.modify::<Resource>(ObjectId::new(0), |r| r.ram = 999).unwrap();
+    db.modify::<Resource>(ObjectId::new(0), |r| r.ram = 999)
+        .unwrap();
     assert_eq!(db.table::<Account>().unwrap().len(), 2);
     assert_eq!(db.get::<Resource>(ObjectId::new(0)).unwrap().ram, 999);
 
@@ -142,16 +169,33 @@ fn snapshot_round_trips() {
     let mut restored = new_db();
     restored.load(&path).unwrap();
     assert_eq!(restored.table::<Account>().unwrap().len(), 999);
-    assert!(restored.find::<Account>(ObjectId::new(500)).unwrap().is_none());
-    assert_eq!(restored.get::<Account>(ObjectId::new(499)).unwrap().name, 499);
+    assert!(
+        restored
+            .find::<Account>(ObjectId::new(500))
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        restored.get::<Account>(ObjectId::new(499)).unwrap().name,
+        499
+    );
     // Secondary index was rebuilt.
     assert_eq!(
-        restored.find_by::<Account, AccountByName>(&777).unwrap().unwrap().id.raw(),
+        restored
+            .find_by::<Account, AccountByName>(&777)
+            .unwrap()
+            .unwrap()
+            .id
+            .raw(),
         777
     );
     assert_eq!(restored.get::<Resource>(ObjectId::new(0)).unwrap().ram, -7);
     // Next id continues past the tombstone, not reusing 500 or 1000.
-    let next = restored.create::<Account>(|a| a.name = 9999).unwrap().id.raw();
+    let next = restored
+        .create::<Account>(|a| a.name = 9999)
+        .unwrap()
+        .id
+        .raw();
     assert_eq!(next, 1000);
 }
 

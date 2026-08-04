@@ -63,7 +63,9 @@ fn compare(rows: &[u64]) {
     assert_eq!(fe, re, "end iterator differs for rows {rows:?}");
 
     // forward walk from lowerbound(0)
-    let mut fit = fdb.db_lowerbound_i64(&mut fc, CODE, SCOPE, TABLE, 0).unwrap();
+    let mut fit = fdb
+        .db_lowerbound_i64(&mut fc, CODE, SCOPE, TABLE, 0)
+        .unwrap();
     let mut rit = rdb.db_lowerbound_i64(CODE, SCOPE, TABLE, 0);
     assert_eq!(fit, rit, "lowerbound(0) handle differs for rows {rows:?}");
     let mut steps = 0;
@@ -71,23 +73,36 @@ fn compare(rows: &[u64]) {
         let (mut fp, mut rp) = (0u64, 0u64);
         let fnext = fdb.db_next_i64(&mut fc, fit, &mut fp).unwrap();
         let rnext = rdb.db_next_i64(rit, &mut rp);
-        assert_eq!(fp, rp, "next primary differs at step {steps} for rows {rows:?}");
-        assert_eq!(fnext, rnext, "next handle differs at step {steps} for rows {rows:?}");
+        assert_eq!(
+            fp, rp,
+            "next primary differs at step {steps} for rows {rows:?}"
+        );
+        assert_eq!(
+            fnext, rnext,
+            "next handle differs at step {steps} for rows {rows:?}"
+        );
         fit = fnext;
         rit = rnext;
         steps += 1;
         assert!(steps <= rows.len() + 1, "walk overran for rows {rows:?}");
     }
-    assert_eq!(fit, fe, "C++ walk did not terminate at end for rows {rows:?}");
+    assert_eq!(
+        fit, fe,
+        "C++ walk did not terminate at end for rows {rows:?}"
+    );
 
     // find: a present key and a missing one
     if let Some(&present) = rows.first() {
-        let f = fdb.db_find_i64(CODE, SCOPE, TABLE, present, &mut fc).unwrap();
+        let f = fdb
+            .db_find_i64(CODE, SCOPE, TABLE, present, &mut fc)
+            .unwrap();
         let r = rdb.db_find_i64(CODE, SCOPE, TABLE, present);
         assert_eq!(f, r, "find(present={present}) differs for rows {rows:?}");
     }
     let missing = rows.iter().max().copied().unwrap_or(0) + 1;
-    let f = fdb.db_find_i64(CODE, SCOPE, TABLE, missing, &mut fc).unwrap();
+    let f = fdb
+        .db_find_i64(CODE, SCOPE, TABLE, missing, &mut fc)
+        .unwrap();
     let r = rdb.db_find_i64(CODE, SCOPE, TABLE, missing);
     assert_eq!(f, r, "find(missing={missing}) differs for rows {rows:?}");
 
@@ -96,8 +111,14 @@ fn compare(rows: &[u64]) {
         let (mut fp, mut rp) = (0u64, 0u64);
         let fprev = fdb.db_previous_i64(&mut fc, fe, &mut fp).unwrap();
         let rprev = rdb.db_previous_i64(re, &mut rp);
-        assert_eq!(fp, rp, "previous-from-end primary differs for rows {rows:?}");
-        assert_eq!(fprev, rprev, "previous-from-end handle differs for rows {rows:?}");
+        assert_eq!(
+            fp, rp,
+            "previous-from-end primary differs for rows {rows:?}"
+        );
+        assert_eq!(
+            fprev, rprev,
+            "previous-from-end handle differs for rows {rows:?}"
+        );
     }
 }
 
@@ -130,9 +151,19 @@ proptest! {
 
 #[derive(Debug, Clone)]
 enum RamOp {
-    Store { scope: u64, payer: u64, value: Vec<u8> },
-    Update { sel: usize, payer: u64, value: Vec<u8> },
-    Remove { sel: usize },
+    Store {
+        scope: u64,
+        payer: u64,
+        value: Vec<u8>,
+    },
+    Update {
+        sel: usize,
+        payer: u64,
+        value: Vec<u8>,
+    },
+    Remove {
+        sel: usize,
+    },
 }
 
 /// Replays the same store/update/remove sequence against the arena (which bills
@@ -159,7 +190,11 @@ fn compare_ram(ops: &[RamOp]) {
 
     for op in ops {
         match op {
-            RamOp::Store { scope, payer, value } => {
+            RamOp::Store {
+                scope,
+                payer,
+                value,
+            } => {
                 let (scope, payer) = (*scope, *payer);
                 let pk = next_pk;
                 next_pk += 1;
@@ -182,7 +217,8 @@ fn compare_ram(ops: &[RamOp]) {
                 let old_bytes = old_len as i64 + KV_OVERHEAD;
                 let new_bytes = value.len() as i64 + KV_OVERHEAD;
                 if old_payer == *payer {
-                    fdb.add_pending_ram_usage(*payer, new_bytes - old_bytes).unwrap();
+                    fdb.add_pending_ram_usage(*payer, new_bytes - old_bytes)
+                        .unwrap();
                 } else {
                     fdb.add_pending_ram_usage(old_payer, -old_bytes).unwrap();
                     fdb.add_pending_ram_usage(*payer, new_bytes).unwrap();
@@ -197,7 +233,8 @@ fn compare_ram(ops: &[RamOp]) {
                 let (payer, len) = rows.remove(&key).unwrap();
                 let it = rdb.db_find_i64(CODE, key.0, TABLE, key.1);
                 rdb.db_remove_i64(it);
-                fdb.add_pending_ram_usage(payer, -(len as i64 + KV_OVERHEAD)).unwrap();
+                fdb.add_pending_ram_usage(payer, -(len as i64 + KV_OVERHEAD))
+                    .unwrap();
             }
         }
     }
@@ -221,9 +258,23 @@ fn ram_usage_matches_cpp() {
     compare_ram(&[]);
     compare_ram(&[s(0, 101, b"abcd")]);
     // Grow then shrink the same row (same payer): the delta tracks the value.
-    compare_ram(&[s(0, 101, b"aa"), RamOp::Update { sel: 0, payer: 101, value: b"aaaaaa".to_vec() }]);
+    compare_ram(&[
+        s(0, 101, b"aa"),
+        RamOp::Update {
+            sel: 0,
+            payer: 101,
+            value: b"aaaaaa".to_vec(),
+        },
+    ]);
     // Payer change moves the row's bytes off the old payer onto the new one.
-    compare_ram(&[s(0, 101, b"abcd"), RamOp::Update { sel: 0, payer: 102, value: b"abcd".to_vec() }]);
+    compare_ram(&[
+        s(0, 101, b"abcd"),
+        RamOp::Update {
+            sel: 0,
+            payer: 102,
+            value: b"abcd".to_vec(),
+        },
+    ]);
     // Remove refunds the row but leaves the table overhead on its first payer.
     compare_ram(&[s(0, 101, b"abcd"), RamOp::Remove { sel: 0 }]);
     // Two payers into one table: only the first store bills the table overhead.
@@ -295,21 +346,40 @@ fn compare_idx64(pairs: &[(u64, u64)]) {
         .db_idx64_lowerbound(&mut fc, CODE, SCOPE, TABLE, &mut fs, &mut fp)
         .unwrap();
     let mut rit = rdb.db_idx64_lowerbound(CODE, SCOPE, TABLE, &mut rs, &mut rp);
-    assert_eq!(fit, rit, "idx64 lowerbound(0) handle differs for pairs {pairs:?}");
-    assert_eq!((fs, fp), (rs, rp), "idx64 lowerbound(0) keys differ for pairs {pairs:?}");
+    assert_eq!(
+        fit, rit,
+        "idx64 lowerbound(0) handle differs for pairs {pairs:?}"
+    );
+    assert_eq!(
+        (fs, fp),
+        (rs, rp),
+        "idx64 lowerbound(0) keys differ for pairs {pairs:?}"
+    );
     let mut steps = 0;
     while rit != re {
         let (mut fnp, mut rnp) = (0u64, 0u64);
         let fnext = fdb.db_idx64_next(&mut fc, fit, &mut fnp).unwrap();
         let rnext = rdb.db_idx64_next(rit, &mut rnp);
-        assert_eq!(fnp, rnp, "idx64 next primary differs at step {steps} for pairs {pairs:?}");
-        assert_eq!(fnext, rnext, "idx64 next handle differs at step {steps} for pairs {pairs:?}");
+        assert_eq!(
+            fnp, rnp,
+            "idx64 next primary differs at step {steps} for pairs {pairs:?}"
+        );
+        assert_eq!(
+            fnext, rnext,
+            "idx64 next handle differs at step {steps} for pairs {pairs:?}"
+        );
         fit = fnext;
         rit = rnext;
         steps += 1;
-        assert!(steps <= pairs.len() + 1, "idx64 walk overran for pairs {pairs:?}");
+        assert!(
+            steps <= pairs.len() + 1,
+            "idx64 walk overran for pairs {pairs:?}"
+        );
     }
-    assert_eq!(fit, fe, "idx64 C++ walk did not terminate at end for pairs {pairs:?}");
+    assert_eq!(
+        fit, fe,
+        "idx64 C++ walk did not terminate at end for pairs {pairs:?}"
+    );
 
     // find_secondary / find_primary for a present key
     if let Some(&(present_primary, present_secondary)) = pairs.first() {
@@ -318,16 +388,28 @@ fn compare_idx64(pairs: &[(u64, u64)]) {
             .db_idx64_find_secondary(&mut fc, CODE, SCOPE, TABLE, present_secondary, &mut fpp)
             .unwrap();
         let r = rdb.db_idx64_find_secondary(CODE, SCOPE, TABLE, present_secondary, &mut rpp);
-        assert_eq!(f, r, "idx64 find_secondary(present) handle differs for pairs {pairs:?}");
-        assert_eq!(fpp, rpp, "idx64 find_secondary(present) primary differs for pairs {pairs:?}");
+        assert_eq!(
+            f, r,
+            "idx64 find_secondary(present) handle differs for pairs {pairs:?}"
+        );
+        assert_eq!(
+            fpp, rpp,
+            "idx64 find_secondary(present) primary differs for pairs {pairs:?}"
+        );
 
         let (mut fss, mut rss) = (0u64, 0u64);
         let f = fdb
             .db_idx64_find_primary(&mut fc, CODE, SCOPE, TABLE, &mut fss, present_primary)
             .unwrap();
         let r = rdb.db_idx64_find_primary(CODE, SCOPE, TABLE, &mut rss, present_primary);
-        assert_eq!(f, r, "idx64 find_primary(present) handle differs for pairs {pairs:?}");
-        assert_eq!(fss, rss, "idx64 find_primary(present) secondary differs for pairs {pairs:?}");
+        assert_eq!(
+            f, r,
+            "idx64 find_primary(present) handle differs for pairs {pairs:?}"
+        );
+        assert_eq!(
+            fss, rss,
+            "idx64 find_primary(present) secondary differs for pairs {pairs:?}"
+        );
     }
 
     let max_secondary = pairs.iter().map(|&(_, s)| s).max().unwrap_or(0);
@@ -339,16 +421,28 @@ fn compare_idx64(pairs: &[(u64, u64)]) {
         .db_idx64_find_secondary(&mut fc, CODE, SCOPE, TABLE, max_secondary + 1, &mut fpp)
         .unwrap();
     let r = rdb.db_idx64_find_secondary(CODE, SCOPE, TABLE, max_secondary + 1, &mut rpp);
-    assert_eq!(f, r, "idx64 find_secondary(missing) handle differs for pairs {pairs:?}");
-    assert_eq!(fpp, rpp, "idx64 find_secondary(missing) primary differs for pairs {pairs:?}");
+    assert_eq!(
+        f, r,
+        "idx64 find_secondary(missing) handle differs for pairs {pairs:?}"
+    );
+    assert_eq!(
+        fpp, rpp,
+        "idx64 find_secondary(missing) primary differs for pairs {pairs:?}"
+    );
 
     let (mut fss, mut rss) = (0u64, 0u64);
     let f = fdb
         .db_idx64_find_primary(&mut fc, CODE, SCOPE, TABLE, &mut fss, max_primary + 1)
         .unwrap();
     let r = rdb.db_idx64_find_primary(CODE, SCOPE, TABLE, &mut rss, max_primary + 1);
-    assert_eq!(f, r, "idx64 find_primary(missing) handle differs for pairs {pairs:?}");
-    assert_eq!(fss, rss, "idx64 find_primary(missing) secondary differs for pairs {pairs:?}");
+    assert_eq!(
+        f, r,
+        "idx64 find_primary(missing) handle differs for pairs {pairs:?}"
+    );
+    assert_eq!(
+        fss, rss,
+        "idx64 find_primary(missing) secondary differs for pairs {pairs:?}"
+    );
 
     // lower/upper bound at every query value in and just past the data
     for q in 0..=max_secondary + 1 {
@@ -358,8 +452,15 @@ fn compare_idx64(pairs: &[(u64, u64)]) {
             .db_idx64_lowerbound(&mut fc, CODE, SCOPE, TABLE, &mut fs, &mut fp)
             .unwrap();
         let rl = rdb.db_idx64_lowerbound(CODE, SCOPE, TABLE, &mut rs, &mut rp);
-        assert_eq!(fl, rl, "idx64 lowerbound({q}) handle differs for pairs {pairs:?}");
-        assert_eq!((fs, fp), (rs, rp), "idx64 lowerbound({q}) keys differ for pairs {pairs:?}");
+        assert_eq!(
+            fl, rl,
+            "idx64 lowerbound({q}) handle differs for pairs {pairs:?}"
+        );
+        assert_eq!(
+            (fs, fp),
+            (rs, rp),
+            "idx64 lowerbound({q}) keys differ for pairs {pairs:?}"
+        );
 
         let (mut fs, mut fp) = (q, 0u64);
         let (mut rs, mut rp) = (q, 0u64);
@@ -367,8 +468,15 @@ fn compare_idx64(pairs: &[(u64, u64)]) {
             .db_idx64_upperbound(&mut fc, CODE, SCOPE, TABLE, &mut fs, &mut fp)
             .unwrap();
         let ru = rdb.db_idx64_upperbound(CODE, SCOPE, TABLE, &mut rs, &mut rp);
-        assert_eq!(fu, ru, "idx64 upperbound({q}) handle differs for pairs {pairs:?}");
-        assert_eq!((fs, fp), (rs, rp), "idx64 upperbound({q}) keys differ for pairs {pairs:?}");
+        assert_eq!(
+            fu, ru,
+            "idx64 upperbound({q}) handle differs for pairs {pairs:?}"
+        );
+        assert_eq!(
+            (fs, fp),
+            (rs, rp),
+            "idx64 upperbound({q}) keys differ for pairs {pairs:?}"
+        );
     }
 
     // previous from the end iterator (only meaningful when the table exists)
@@ -376,8 +484,14 @@ fn compare_idx64(pairs: &[(u64, u64)]) {
         let (mut fp, mut rp) = (0u64, 0u64);
         let fprev = fdb.db_idx64_previous(&mut fc, fe, &mut fp).unwrap();
         let rprev = rdb.db_idx64_previous(re, &mut rp);
-        assert_eq!(fp, rp, "idx64 previous-from-end primary differs for pairs {pairs:?}");
-        assert_eq!(fprev, rprev, "idx64 previous-from-end handle differs for pairs {pairs:?}");
+        assert_eq!(
+            fp, rp,
+            "idx64 previous-from-end primary differs for pairs {pairs:?}"
+        );
+        assert_eq!(
+            fprev, rprev,
+            "idx64 previous-from-end handle differs for pairs {pairs:?}"
+        );
     }
 }
 

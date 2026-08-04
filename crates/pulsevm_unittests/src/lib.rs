@@ -272,7 +272,10 @@ mod tests {
             delay_sec: u32,
         ) {
             let pending_block_state = self.get_pending_block_state();
-            let base = pending_block_state.timestamp.to_time_point().sec_since_epoch();
+            let base = pending_block_state
+                .timestamp
+                .to_time_point()
+                .sec_since_epoch();
             self.expiration_nonce += 1;
             trx.header.max_net_usage_words = VarUint32(0); // No limit
             trx.header.max_cpu_usage = 0; // No limit

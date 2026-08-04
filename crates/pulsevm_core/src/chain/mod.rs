@@ -47,3 +47,6 @@ pub const OWNER_NAME: Name = Name::new(name!("owner"));
 pub const ACTIVE_NAME: Name = Name::new(name!("active"));
 pub const ANY_NAME: Name = Name::new(name!("pulse.any"));
 pub const CODE_NAME: Name = Name::new(name!("pulse.code"));
+pub const PRODS_NAME: Name = Name::new(name!("pulse.prods"));
+pub const MAJORITY_PRODUCERS_PERMISSION_NAME: Name = Name::new(name!("prod.major"));
+pub const MINORITY_PRODUCERS_PERMISSION_NAME: Name = Name::new(name!("prod.minor"));

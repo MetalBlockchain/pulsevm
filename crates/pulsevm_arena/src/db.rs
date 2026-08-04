@@ -8,8 +8,13 @@ use crate::table::{Table, TableError};
 /// Errors from the database layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DbError {
-    NotRegistered { type_name: &'static str },
-    TypeIdInUse { type_id: u16, type_name: &'static str },
+    NotRegistered {
+        type_name: &'static str,
+    },
+    TypeIdInUse {
+        type_id: u16,
+        type_name: &'static str,
+    },
     Corrupted(String),
     Io(String),
     Table(TableError),
@@ -234,10 +239,7 @@ impl Db {
 
     // ----- object operations (conveniences over the table) ------------------
 
-    pub fn create<T: ArenaObject>(
-        &mut self,
-        f: impl FnOnce(&mut T),
-    ) -> Result<&T, DbError> {
+    pub fn create<T: ArenaObject>(&mut self, f: impl FnOnce(&mut T)) -> Result<&T, DbError> {
         Ok(self.table_mut::<T>()?.emplace(f)?)
     }
 
@@ -253,10 +255,7 @@ impl Db {
         Ok(self.table_mut::<T>()?.remove(id)?)
     }
 
-    pub fn find<T: ArenaObject>(
-        &self,
-        id: crate::ObjectId<T>,
-    ) -> Result<Option<&T>, DbError> {
+    pub fn find<T: ArenaObject>(&self, id: crate::ObjectId<T>) -> Result<Option<&T>, DbError> {
         Ok(self.table::<T>()?.find(id))
     }
 

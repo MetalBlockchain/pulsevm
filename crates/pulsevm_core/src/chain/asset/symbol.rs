@@ -209,7 +209,10 @@ mod tests {
             Symbol::try_new_with_code(19, SymbolCode::new(EOS_CODE)),
             Err(SymbolError::InvalidPrecision)
         );
-        assert_eq!("19,EOS".parse::<Symbol>(), Err(SymbolError::InvalidPrecision));
+        assert_eq!(
+            "19,EOS".parse::<Symbol>(),
+            Err(SymbolError::InvalidPrecision)
+        );
     }
 
     #[test]
@@ -229,7 +232,10 @@ mod tests {
     #[test]
     fn from_str_errors_are_specific() {
         assert_eq!("EOS".parse::<Symbol>(), Err(SymbolError::MissingSeparator));
-        assert_eq!("x,EOS".parse::<Symbol>(), Err(SymbolError::InvalidPrecision));
+        assert_eq!(
+            "x,EOS".parse::<Symbol>(),
+            Err(SymbolError::InvalidPrecision)
+        );
         assert_eq!("4,eos".parse::<Symbol>(), Err(SymbolError::ParseError));
     }
 

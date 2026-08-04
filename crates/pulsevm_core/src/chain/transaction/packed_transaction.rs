@@ -240,16 +240,14 @@ mod tests {
     #[test]
     fn decompression_at_the_limit_succeeds() {
         let payload = vec![0u8; MAX_UNCOMPRESSED_PACKED_TRX_SIZE];
-        let out =
-            maybe_decompress(TransactionCompression::Zlib, &zlib_compress(&payload)).unwrap();
+        let out = maybe_decompress(TransactionCompression::Zlib, &zlib_compress(&payload)).unwrap();
         assert_eq!(out.len(), MAX_UNCOMPRESSED_PACKED_TRX_SIZE);
     }
 
     #[test]
     fn ordinary_payload_round_trips() {
         let payload = b"a normally sized transaction payload".to_vec();
-        let out =
-            maybe_decompress(TransactionCompression::Zlib, &zlib_compress(&payload)).unwrap();
+        let out = maybe_decompress(TransactionCompression::Zlib, &zlib_compress(&payload)).unwrap();
         assert_eq!(out, payload);
     }
 }

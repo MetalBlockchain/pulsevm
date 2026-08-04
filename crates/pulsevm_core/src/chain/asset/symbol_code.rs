@@ -1,4 +1,7 @@
-use std::{fmt::{self, Write}, str::FromStr};
+use std::{
+    fmt::{self, Write},
+    str::FromStr,
+};
 
 use pulsevm_proc_macros::{NumBytes, Write};
 use pulsevm_serialization::{Read, ReadError};
@@ -292,7 +295,10 @@ mod tests {
         for s in ["A", "EOS", "ABCDEFG", "XYZ"] {
             let code = SymbolCode::from_str(s).unwrap();
             assert_eq!(code.to_string(), s);
-            assert_eq!(serde_json::from_str::<SymbolCode>(&format!("\"{s}\"")).unwrap(), code);
+            assert_eq!(
+                serde_json::from_str::<SymbolCode>(&format!("\"{s}\"")).unwrap(),
+                code
+            );
         }
     }
 }

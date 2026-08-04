@@ -76,7 +76,10 @@ impl Wallet {
         // dots, so this is belt-and-suspenders.
         fs::create_dir_all(wallet_dir)?;
         let canonical_dir = wallet_dir.canonicalize()?;
-        if !canonical_dir.join(format!("{}.wallet", name)).starts_with(&canonical_dir) {
+        if !canonical_dir
+            .join(format!("{}.wallet", name))
+            .starts_with(&canonical_dir)
+        {
             return Err(WalletError::PathError("name rejected".to_string()));
         }
 

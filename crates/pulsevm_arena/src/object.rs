@@ -81,7 +81,9 @@ impl<T: ?Sized> From<i64> for ObjectId<T> {
 /// the table's byte arena, addressed by offset — still pointer-free, so the
 /// object stays POD. A default `BlobRef` is the empty slice.
 #[repr(C)]
-#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[derive(
+    Clone, Copy, Default, Debug, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
 pub struct BlobRef {
     pub off: u32,
     pub len: u32,

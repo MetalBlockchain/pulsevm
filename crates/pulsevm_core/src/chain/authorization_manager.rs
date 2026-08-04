@@ -1,7 +1,9 @@
 use std::collections::BTreeSet;
 
 use pulsevm_error::ChainError;
-use pulsevm_ffi::{Authority, Database, DbRead, Microseconds, PermissionObject, TimePoint, seconds};
+use pulsevm_ffi::{
+    Authority, Database, DbRead, Microseconds, PermissionObject, TimePoint, seconds,
+};
 
 use crate::{
     PULSE_NAME,

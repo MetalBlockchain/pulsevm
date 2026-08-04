@@ -32,8 +32,10 @@ mod net_tests {
         chain.set_transaction_headers(&mut trx, DEFAULT_EXPIRATION_DELTA, 0);
         trx.header.max_net_usage_words = VarUint32(max_net_usage_words);
 
-        let signed = SignedTransaction::new(trx, BTreeSet::new(), vec![])
-            .sign(&get_private_key(from, "active"), &chain.controller.chain_id())?;
+        let signed = SignedTransaction::new(trx, BTreeSet::new(), vec![]).sign(
+            &get_private_key(from, "active"),
+            &chain.controller.chain_id(),
+        )?;
         chain.push_transaction(signed)
     }
 

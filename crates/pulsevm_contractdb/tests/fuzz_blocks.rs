@@ -69,7 +69,8 @@ impl Model {
         }
     }
     fn session(&mut self) {
-        self.snaps.push((self.rows.clone(), self.tables.clone(), self.ram.clone()));
+        self.snaps
+            .push((self.rows.clone(), self.tables.clone(), self.ram.clone()));
     }
     fn undo(&mut self) {
         if let Some((r, t, m)) = self.snaps.pop() {
@@ -87,16 +88,31 @@ impl Model {
             .iter()
             .map(|(&(c, s, t, p), (payer, v))| (c, s, t, p, *payer, v.clone()))
             .collect();
-        let ram = self.ram.iter().filter(|(_, b)| **b != 0).map(|(a, b)| (*a, *b)).collect();
+        let ram = self
+            .ram
+            .iter()
+            .filter(|(_, b)| **b != 0)
+            .map(|(a, b)| (*a, *b))
+            .collect();
         (rows, ram)
     }
 }
 
 #[derive(Debug, Clone)]
 enum Op {
-    Store { scope: u8, payer: u8, value: Vec<u8> },
-    Update { sel: usize, payer: u8, value: Vec<u8> },
-    Remove { sel: usize },
+    Store {
+        scope: u8,
+        payer: u8,
+        value: Vec<u8>,
+    },
+    Update {
+        sel: usize,
+        payer: u8,
+        value: Vec<u8>,
+    },
+    Remove {
+        sel: usize,
+    },
 }
 
 fn op() -> impl Strategy<Value = Op> {
