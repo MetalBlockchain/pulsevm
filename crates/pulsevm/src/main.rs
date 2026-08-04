@@ -980,10 +980,39 @@ impl Vm for VirtualMachine {
         let target = Controller::sync_target_from_summary(&request.get_ref().bytes)
             .map_err(|e| Status::invalid_argument(format!("invalid state summary: {}", e)))?;
 
+        // Only sync forward. A validator that already has the summary's height
+        // gains nothing from applying it, and a single-node network is offered
+        // its own tip as a summary during bootstrap: accepting it would fire a
+        // stray StateSyncFinished after consensus has already started, wedging
+        // the wait_for_event stream so no block ever builds. Skip instead.
+        let last_accepted = self
+            .controller
+            .read()
+            .await
+            .last_accepted_block()
+            .block_num() as u64;
+        if target.height <= last_accepted {
+            info!(
+                "skipping state summary at height {} (already at {})",
+                target.height, last_accepted
+            );
+            return Ok(Response::new(vm::StateSummaryAcceptResponse {
+                mode: vm::state_summary_accept_response::Mode::Skipped as i32,
+                err: 0,
+            }));
+        }
+
         // The snapshot payload is downloaded out of band over AppRequest, so the
-        // sync runs in the background and completes later; report DYNAMIC and
-        // signal `wait_for_event` when it finishes. Fetch each chunk from peers,
-        // verify the whole payload against the summary hash, then apply it.
+        // sync runs in the background and completes later. Report STATIC, not
+        // DYNAMIC: DYNAMIC tells the engine to bootstrap the block chain forward
+        // from its current last-accepted (genesis) while the VM syncs, which
+        // assumes every block genesis..tip stays verifiable. A snapshot transfer
+        // rebases the block log onto the synced tip and drops the earlier blocks,
+        // so that walk can never resolve. STATIC instead makes the engine wait
+        // for our done-signal, then bootstrap from the synced height with nothing
+        // left to fetch. Signal `wait_for_event` when the background apply lands.
+        // Fetch each chunk from peers, verify the payload against the summary
+        // hash, then apply it.
         let controller = self.controller.clone();
         let network = self.network_manager.clone();
         let sync_finished = self.sync_finished.clone();
@@ -1026,7 +1055,7 @@ impl Vm for VirtualMachine {
         });
 
         Ok(Response::new(vm::StateSummaryAcceptResponse {
-            mode: vm::state_summary_accept_response::Mode::Dynamic as i32,
+            mode: vm::state_summary_accept_response::Mode::Static as i32,
             err: 0,
         }))
     }
