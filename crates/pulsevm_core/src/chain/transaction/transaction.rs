@@ -2,16 +2,34 @@ use std::collections::BTreeSet;
 
 use pulsevm_crypto::Bytes;
 use pulsevm_error::ChainError;
-use pulsevm_ffi::{BlockTimestamp, TimePointSec};
-use pulsevm_proc_macros::{NumBytes, Read, Write};
-use pulsevm_serialization::{VarUint32, Write};
-use serde::{Deserialize, Serialize, ser::SerializeStruct};
+use pulsevm_ffi::{
+    BlockTimestamp,
+    TimePointSec,
+};
+use pulsevm_proc_macros::{
+    NumBytes,
+    Read,
+    Write,
+};
+use pulsevm_serialization::{
+    VarUint32,
+    Write,
+};
+use serde::{
+    Deserialize,
+    Serialize,
+    ser::SerializeStruct,
+};
 use sha2::Digest;
 
 use crate::{
     chain::{
         id::Id,
-        transaction::{SignedTransaction, TransactionHeader, signed_transaction::signing_digest},
+        transaction::{
+            SignedTransaction,
+            TransactionHeader,
+            signed_transaction::signing_digest,
+        },
     },
     crypto::PrivateKey,
     utils::pulse_assert,

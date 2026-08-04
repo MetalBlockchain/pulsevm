@@ -1,4 +1,8 @@
-use wasmer::{FunctionEnvMut, RuntimeError, WasmPtr};
+use wasmer::{
+    FunctionEnvMut,
+    RuntimeError,
+    WasmPtr,
+};
 
 use crate::wasm_runtime::WasmContext;
 

@@ -1,18 +1,45 @@
 use std::collections::HashMap;
 
-use pulsevm_crypto::{Bytes, FixedBytes};
+use pulsevm_crypto::{
+    Bytes,
+    FixedBytes,
+};
 use pulsevm_error::ChainError;
-use pulsevm_ffi::{BlockTimestamp, TimePoint, TimePointSec};
-use pulsevm_serialization::{Read, ReadError, VarInt32, VarUint32};
-use serde_json::{Number, Value};
+use pulsevm_ffi::{
+    BlockTimestamp,
+    TimePoint,
+    TimePointSec,
+};
+use pulsevm_serialization::{
+    Read,
+    ReadError,
+    VarInt32,
+    VarUint32,
+};
+use serde_json::{
+    Number,
+    Value,
+};
 
 use crate::{
     chain::{
-        abi::{AbiDefinition, AbiStructDefinition, AbiVariantDefinition},
-        asset::{Asset, ExtendedAsset, Symbol, SymbolCode},
+        abi::{
+            AbiDefinition,
+            AbiStructDefinition,
+            AbiVariantDefinition,
+        },
+        asset::{
+            Asset,
+            ExtendedAsset,
+            Symbol,
+            SymbolCode,
+        },
         utils::pulse_assert,
     },
-    crypto::{PublicKey, Signature},
+    crypto::{
+        PublicKey,
+        Signature,
+    },
     name::Name,
 };
 

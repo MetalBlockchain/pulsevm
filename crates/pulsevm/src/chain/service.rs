@@ -1,28 +1,61 @@
-use std::{collections::BTreeSet, str::FromStr, sync::Arc};
+use std::{
+    collections::BTreeSet,
+    str::FromStr,
+    sync::Arc,
+};
 
-use jsonrpsee::{proc_macros::rpc, types::ErrorObjectOwned};
+use jsonrpsee::{
+    proc_macros::rpc,
+    types::ErrorObjectOwned,
+};
 use pulsevm_core::{
     abi::AbiDefinition,
     authorization_manager::AuthorizationManager,
     block::SignedBlock,
     controller::Controller,
-    crypto::{PublicKey, Signature},
+    crypto::{
+        PublicKey,
+        Signature,
+    },
     id::Id,
     mempool::Mempool,
     name::Name,
-    time::{TimePoint, seconds},
-    transaction::{PackedTransaction, Transaction, TransactionCompression},
-    utils::{Base64Bytes, I32Flex, StringFlex},
+    time::{
+        TimePoint,
+        seconds,
+    },
+    transaction::{
+        PackedTransaction,
+        Transaction,
+        TransactionCompression,
+    },
+    utils::{
+        Base64Bytes,
+        I32Flex,
+        StringFlex,
+    },
 };
-use pulsevm_crypto::{Bytes, Digest};
+use pulsevm_crypto::{
+    Bytes,
+    Digest,
+};
 use pulsevm_serialization::Read;
 use serde_json::Value;
 use tokio::sync::RwLock;
 use tonic::async_trait;
 
 use crate::{
-    api::{GetCodeHashResponse, GetInfoResponse, GetRawABIResponse, IssueTxResponse},
-    chain::{GossipType, Gossipable, NetworkManager},
+    api::{
+        GetCodeHashResponse,
+        GetInfoResponse,
+        GetRawABIResponse,
+        IssueTxResponse,
+    },
+    chain::{
+        GossipType,
+        Gossipable,
+        NetworkManager,
+    },
 };
 
 #[rpc(server)]
@@ -146,7 +179,8 @@ impl RpcService {
 
         // Run the request and return the response
         let (resp, mut _stream) = module.raw_json_request(request_body, 1).await?;
-        //let resp: ResponseSuccess<u64> = serde_json::from_str::<Response<u64>>(&resp).unwrap().try_into().unwrap();
+        //let resp: ResponseSuccess<u64> =
+        // serde_json::from_str::<Response<u64>>(&resp).unwrap().try_into().unwrap();
 
         Ok(resp)
     }

@@ -2,10 +2,16 @@ use std::{
     collections::BTreeMap,
     fs,
     path::PathBuf,
-    time::{Duration, Instant},
+    time::{
+        Duration,
+        Instant,
+    },
 };
 
-use crate::wallet::{Wallet, WalletError};
+use crate::wallet::{
+    Wallet,
+    WalletError,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ManagerError {

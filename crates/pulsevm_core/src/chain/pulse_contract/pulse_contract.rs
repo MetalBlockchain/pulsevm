@@ -1,18 +1,36 @@
 use pulsevm_billable_size::billable_size_v;
-use pulsevm_constants::{OVERHEAD_PER_ACCOUNT_RAM_BYTES, SETCODE_RAM_BYTES_MULTIPLIER};
+use pulsevm_constants::{
+    OVERHEAD_PER_ACCOUNT_RAM_BYTES,
+    SETCODE_RAM_BYTES_MULTIPLIER,
+};
 use pulsevm_error::ChainError;
-use pulsevm_ffi::{CxxDigest, Database, PermissionObject};
+use pulsevm_ffi::{
+    CxxDigest,
+    Database,
+    PermissionObject,
+};
 use pulsevm_serialization::Read;
 
 use crate::{
-    ACTIVE_NAME, CODE_NAME, OWNER_NAME,
+    ACTIVE_NAME,
+    CODE_NAME,
+    OWNER_NAME,
     chain::{
         abi::AbiDefinition,
         apply_context::ApplyContext,
-        authority::{Authority, PermissionLevel},
+        authority::{
+            Authority,
+            PermissionLevel,
+        },
         authorization_manager::AuthorizationManager,
         pulse_contract::pulse_contract_types::{
-            DeleteAuth, LinkAuth, NewAccount, SetAbi, SetCode, UnlinkAuth, UpdateAuth,
+            DeleteAuth,
+            LinkAuth,
+            NewAccount,
+            SetAbi,
+            SetCode,
+            UnlinkAuth,
+            UpdateAuth,
         },
         resource_limits::ResourceLimitsManager,
         utils::pulse_assert,
@@ -455,13 +473,17 @@ fn validate_authority_precondition(db: &mut Database, auth: &Authority) -> Resul
             continue; // virtual pulse.code permission does not really exist but is allowed
         }
 
-        AuthorizationManager::get_permission(&db.read()?, a.permission.actor, a.permission.permission)
-            .map_err(|_| {
-                ChainError::TransactionError(format!(
-                    "permission {}@{} does not exist",
-                    a.permission.actor, a.permission.permission
-                ))
-            })?;
+        AuthorizationManager::get_permission(
+            &db.read()?,
+            a.permission.actor,
+            a.permission.permission,
+        )
+        .map_err(|_| {
+            ChainError::TransactionError(format!(
+                "permission {}@{} does not exist",
+                a.permission.actor, a.permission.permission
+            ))
+        })?;
     }
     Ok(())
 }

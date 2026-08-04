@@ -35,7 +35,11 @@ fn account_metadata_writes_mirror_into_the_arena() {
 
     // ...and undoing the session reverts both mirrored rows.
     db.arena_undo();
-    assert_eq!(empty, db.arena_state_root().unwrap(), "undo did not revert the mirror");
+    assert_eq!(
+        empty,
+        db.arena_state_root().unwrap(),
+        "undo did not revert the mirror"
+    );
 
     // A committed session keeps its rows.
     db.arena_start_undo_session();
@@ -43,7 +47,11 @@ fn account_metadata_writes_mirror_into_the_arena() {
     let kept = db.arena_state_root().unwrap();
     assert_ne!(empty, kept);
     db.arena_commit(i64::MAX);
-    assert_eq!(kept, db.arena_state_root().unwrap(), "commit did not keep the mirror");
+    assert_eq!(
+        kept,
+        db.arena_state_root().unwrap(),
+        "commit did not keep the mirror"
+    );
 }
 
 /// The resource_limits pending/commit cycle has no action path in this chain,
@@ -63,7 +71,8 @@ fn account_limits_pending_and_commit_mirror() {
 
     let check = |db: &Database| {
         let (mut ram, mut net, mut cpu) = (0i64, 0i64, 0i64);
-        db.get_account_limits(acct, &mut ram, &mut net, &mut cpu).unwrap();
+        db.get_account_limits(acct, &mut ram, &mut net, &mut cpu)
+            .unwrap();
         assert_eq!(
             db.arena_account_limits(acct),
             Some((ram, net, cpu)),
@@ -88,5 +97,8 @@ fn account_limits_pending_and_commit_mirror() {
 fn shadow_is_absent_until_enabled() {
     let dir = tempdir().unwrap();
     let db = Database::new(dir.path().to_str().unwrap(), DB_SIZE).unwrap();
-    assert!(db.arena_state_root().is_none(), "no shadow before enable_shadow");
+    assert!(
+        db.arena_state_root().is_none(),
+        "no shadow before enable_shadow"
+    );
 }

@@ -6,7 +6,10 @@ use pulsevm_error::ChainError;
 use crate::{
     CxxDigest,
     bridge::ffi::{
-        get_digest_data, make_digest_from_data, make_digest_from_existing_hash, make_empty_digest,
+        get_digest_data,
+        make_digest_from_data,
+        make_digest_from_existing_hash,
+        make_empty_digest,
     },
 };
 

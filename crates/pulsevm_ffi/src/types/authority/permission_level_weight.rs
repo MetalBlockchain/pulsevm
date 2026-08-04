@@ -1,14 +1,28 @@
 use std::fmt;
 
 use pulsevm_billable_size::BillableSize;
-use pulsevm_serialization::{NumBytes, Read, Write, WriteError};
+use pulsevm_serialization::{
+    NumBytes,
+    Read,
+    Write,
+    WriteError,
+};
 use serde::{
-    Deserialize, Serialize,
-    de::{self, MapAccess, SeqAccess, Visitor},
+    Deserialize,
+    Serialize,
+    de::{
+        self,
+        MapAccess,
+        SeqAccess,
+        Visitor,
+    },
     ser::SerializeStruct,
 };
 
-use crate::bridge::ffi::{PermissionLevel, PermissionLevelWeight};
+use crate::bridge::ffi::{
+    PermissionLevel,
+    PermissionLevelWeight,
+};
 
 impl PermissionLevelWeight {
     pub fn new(permission: PermissionLevel, weight: u16) -> Self {

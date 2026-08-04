@@ -1,16 +1,42 @@
-use proc_macro2::{Literal, TokenStream};
+use proc_macro2::{
+    Literal,
+    TokenStream,
+};
 use pulsevm_error::ChainError;
-use pulsevm_proc_macros::{NumBytes, Read, Write};
-use quote::{ToTokens, TokenStreamExt};
-use serde::{Deserialize, Serialize};
-use std::{fmt, ops::Deref, str::FromStr};
+use pulsevm_proc_macros::{
+    NumBytes,
+    Read,
+    Write,
+};
+use quote::{
+    ToTokens,
+    TokenStreamExt,
+};
+use serde::{
+    Deserialize,
+    Serialize,
+};
+use std::{
+    fmt,
+    ops::Deref,
+    str::FromStr,
+};
 use syn::{
     LitStr,
-    parse::{Parse, ParseStream, Result as ParseResult},
+    parse::{
+        Parse,
+        ParseStream,
+        Result as ParseResult,
+    },
 };
 
 mod utils;
-pub use utils::{NAME_CHARS, NAME_MAX_LEN, name_from_bytes, name_to_bytes};
+pub use utils::{
+    NAME_CHARS,
+    NAME_MAX_LEN,
+    name_from_bytes,
+    name_to_bytes,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ParseNameError {

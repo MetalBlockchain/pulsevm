@@ -1,5 +1,12 @@
-use base64::{Engine, prelude::BASE64_STANDARD};
-use pulsevm_proc_macros::{NumBytes, Read, Write};
+use base64::{
+    Engine,
+    prelude::BASE64_STANDARD,
+};
+use pulsevm_proc_macros::{
+    NumBytes,
+    Read,
+    Write,
+};
 use serde::Serialize;
 
 #[derive(Clone, Default, NumBytes, Read, Write)]

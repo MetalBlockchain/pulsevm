@@ -47,7 +47,10 @@ fn forward_traversal_visits_rows_in_key_order_then_end() {
         seen.push(db.db_get_i64(it));
         it = db.db_next_i64(it, &mut primary);
     }
-    assert_eq!(seen, vec![b"v10".to_vec(), b"v20".to_vec(), b"v30".to_vec()]);
+    assert_eq!(
+        seen,
+        vec![b"v10".to_vec(), b"v20".to_vec(), b"v30".to_vec()]
+    );
     // next on the end iterator stays put.
     assert_eq!(db.db_next_i64(end, &mut primary), end);
 }

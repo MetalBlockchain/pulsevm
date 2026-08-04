@@ -1,9 +1,19 @@
 use pulsevm_crypto::Digest;
-use pulsevm_proc_macros::{NumBytes, Read, Write};
-use pulsevm_serialization::{Write, WriteError};
+use pulsevm_proc_macros::{
+    NumBytes,
+    Read,
+    Write,
+};
+use pulsevm_serialization::{
+    Write,
+    WriteError,
+};
 use serde::Serialize;
 
-use crate::chain::transaction::{PackedTransaction, TransactionReceiptHeader};
+use crate::chain::transaction::{
+    PackedTransaction,
+    TransactionReceiptHeader,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Read, Write, NumBytes, Serialize)]
 pub struct TransactionReceipt {

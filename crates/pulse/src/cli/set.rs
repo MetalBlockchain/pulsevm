@@ -1,20 +1,34 @@
-use std::{str::FromStr, sync::Arc};
+use std::{
+    str::FromStr,
+    sync::Arc,
+};
 
 use pulsevm_api_client::PulseVmClient;
 use pulsevm_core::{
-    ACTIVE_NAME, PULSE_NAME,
+    ACTIVE_NAME,
+    PULSE_NAME,
     abi::AbiDefinition,
     authority::PermissionLevel,
-    config::{SETABI_NAME, SETCODE_NAME},
+    config::{
+        SETABI_NAME,
+        SETCODE_NAME,
+    },
     name::Name,
-    pulse_contract::{SetAbi, SetCode},
+    pulse_contract::{
+        SetAbi,
+        SetCode,
+    },
     transaction::Action,
 };
 use pulsevm_crypto::Bytes;
 use pulsevm_keosd_client::KeosdClient;
 use pulsevm_serialization::Write;
 
-use crate::{cli::SetSubcommand, config::Config, utils::push_actions};
+use crate::{
+    cli::SetSubcommand,
+    config::Config,
+    utils::push_actions,
+};
 
 const BINARY_WASM_HEADER: &[u8] = b"\x00\x61\x73\x6d\x01\x00\x00\x00";
 

@@ -1,6 +1,13 @@
-use wasmer::{FunctionEnvMut, RuntimeError, WasmPtr};
+use wasmer::{
+    FunctionEnvMut,
+    RuntimeError,
+    WasmPtr,
+};
 
-use crate::{chain::webassembly::context_aware_check, wasm_runtime::WasmContext};
+use crate::{
+    chain::webassembly::context_aware_check,
+    wasm_runtime::WasmContext,
+};
 
 pub fn get_active_producers(
     env: FunctionEnvMut<WasmContext>,

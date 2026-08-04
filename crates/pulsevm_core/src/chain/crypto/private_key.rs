@@ -1,12 +1,21 @@
-use std::{fmt, str::FromStr};
+use std::{
+    fmt,
+    str::FromStr,
+};
 
 use cxx::SharedPtr;
 use pulsevm_error::ChainError;
-use pulsevm_ffi::{CxxPrivateKey, sign_digest_with_private_key};
+use pulsevm_ffi::{
+    CxxPrivateKey,
+    sign_digest_with_private_key,
+};
 use serde::Deserialize;
 
 use crate::{
-    crypto::{PublicKey, Signature},
+    crypto::{
+        PublicKey,
+        Signature,
+    },
     utils::Digest,
 };
 

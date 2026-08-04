@@ -1,12 +1,23 @@
 use std::collections::BTreeSet;
 
-use pulsevm_ffi::{PermissionLevel, microseconds, seconds};
+use pulsevm_ffi::{
+    PermissionLevel,
+    microseconds,
+    seconds,
+};
 use pulsevm_serialization::Read;
-use wasmer::{FunctionEnvMut, RuntimeError, WasmPtr};
+use wasmer::{
+    FunctionEnvMut,
+    RuntimeError,
+    WasmPtr,
+};
 
 use crate::{
-    authorization_manager::AuthorizationManager, chain::webassembly::context_aware_check,
-    crypto::PublicKey, transaction::Transaction, wasm_runtime::WasmContext,
+    authorization_manager::AuthorizationManager,
+    chain::webassembly::context_aware_check,
+    crypto::PublicKey,
+    transaction::Transaction,
+    wasm_runtime::WasmContext,
 };
 
 pub fn check_transaction_authorization(

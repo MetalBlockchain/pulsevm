@@ -1,10 +1,26 @@
-use std::any::{Any, TypeId};
-use std::collections::{BTreeMap, HashMap};
-use std::fmt;
-use std::hash::{Hash, Hasher};
-use std::marker::PhantomData;
+use std::{
+    any::{
+        Any,
+        TypeId,
+    },
+    collections::{
+        BTreeMap,
+        HashMap,
+    },
+    fmt,
+    hash::{
+        Hash,
+        Hasher,
+    },
+    marker::PhantomData,
+};
 
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+use zerocopy::{
+    FromBytes,
+    Immutable,
+    IntoBytes,
+    KnownLayout,
+};
 
 /// Typed primary key of a stored object, the equivalent of chainbase `oid<T>`.
 /// Ids are assigned sequentially by the table in insertion order and are never
@@ -81,7 +97,9 @@ impl<T: ?Sized> From<i64> for ObjectId<T> {
 /// the table's byte arena, addressed by offset — still pointer-free, so the
 /// object stays POD. A default `BlobRef` is the empty slice.
 #[repr(C)]
-#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[derive(
+    Clone, Copy, Default, Debug, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
 pub struct BlobRef {
     pub off: u32,
     pub len: u32,

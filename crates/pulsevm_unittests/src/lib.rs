@@ -3,30 +3,75 @@ mod unittests;
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeSet, fs, path::Path, str::FromStr, sync::Arc, u32, vec};
+    use std::{
+        collections::BTreeSet,
+        fs,
+        path::Path,
+        str::FromStr,
+        sync::Arc,
+        u32,
+        vec,
+    };
 
     use pulsevm_core::{
-        ACTIVE_NAME, CODE_NAME, ChainError, Database, OWNER_NAME, PULSE_NAME,
-        authority::{Authority, KeyWeight, PermissionLevel, PermissionLevelWeight},
-        block::{BlockStatus, BlockTimestamp},
+        ACTIVE_NAME,
+        CODE_NAME,
+        ChainError,
+        Database,
+        OWNER_NAME,
+        PULSE_NAME,
+        authority::{
+            Authority,
+            KeyWeight,
+            PermissionLevel,
+            PermissionLevelWeight,
+        },
+        block::{
+            BlockStatus,
+            BlockTimestamp,
+        },
         config::{
-            DELETEAUTH_NAME, LINKAUTH_NAME, NEWACCOUNT_NAME, SETCODE_NAME, UNLINKAUTH_NAME,
+            DELETEAUTH_NAME,
+            LINKAUTH_NAME,
+            NEWACCOUNT_NAME,
+            SETCODE_NAME,
+            UNLINKAUTH_NAME,
             UPDATEAUTH_NAME,
         },
         controller::Controller,
-        crypto::{PrivateKey, PublicKey},
+        crypto::{
+            PrivateKey,
+            PublicKey,
+        },
         id::Id,
         name::Name,
-        pulse_contract::{DeleteAuth, LinkAuth, NewAccount, SetCode, UnlinkAuth, UpdateAuth},
-        time::{TimePoint, TimePointSec},
+        pulse_contract::{
+            DeleteAuth,
+            LinkAuth,
+            NewAccount,
+            SetCode,
+            UnlinkAuth,
+            UpdateAuth,
+        },
+        time::{
+            TimePoint,
+            TimePointSec,
+        },
         transaction::{
-            Action, PackedTransaction, SignedTransaction, Transaction, TransactionTrace,
+            Action,
+            PackedTransaction,
+            SignedTransaction,
+            Transaction,
+            TransactionTrace,
         },
         utils::pulse_assert,
     };
     use pulsevm_crypto::Bytes;
     use pulsevm_name_macro::name;
-    use pulsevm_serialization::{VarUint32, Write};
+    use pulsevm_serialization::{
+        VarUint32,
+        Write,
+    };
     use serde_json::json;
 
     /// Tx expiration, in seconds past the pending block time.
@@ -272,7 +317,10 @@ mod tests {
             delay_sec: u32,
         ) {
             let pending_block_state = self.get_pending_block_state();
-            let base = pending_block_state.timestamp.to_time_point().sec_since_epoch();
+            let base = pending_block_state
+                .timestamp
+                .to_time_point()
+                .sec_since_epoch();
             self.expiration_nonce += 1;
             trx.header.max_net_usage_words = VarUint32(0); // No limit
             trx.header.max_cpu_usage = 0; // No limit

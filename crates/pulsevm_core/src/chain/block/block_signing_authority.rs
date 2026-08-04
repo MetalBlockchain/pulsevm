@@ -1,4 +1,8 @@
-use pulsevm_proc_macros::{NumBytes, Read, Write};
+use pulsevm_proc_macros::{
+    NumBytes,
+    Read,
+    Write,
+};
 
 use crate::crypto::PublicKey;
 

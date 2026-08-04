@@ -1,7 +1,15 @@
 use core::fmt;
 
-use pulsevm_serialization::{NumBytes, Read, ReadError, Write};
-use serde::{Deserialize, Serialize};
+use pulsevm_serialization::{
+    NumBytes,
+    Read,
+    ReadError,
+    Write,
+};
+use serde::{
+    Deserialize,
+    Serialize,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct Bytes(pub Vec<u8>);

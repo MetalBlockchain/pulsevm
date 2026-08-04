@@ -2,23 +2,46 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc,
-        atomic::{AtomicI64, Ordering},
+        atomic::{
+            AtomicI64,
+            Ordering,
+        },
     },
     time::Duration,
 };
 
-use anyhow::{Result, anyhow};
-use futures_util::{SinkExt, StreamExt};
+use anyhow::{
+    Result,
+    anyhow,
+};
+use futures_util::{
+    SinkExt,
+    StreamExt,
+};
 use pulsevm_core::{
-    controller::Controller, state_history::SHIP_ABI, transaction::TransactionTrace,
+    controller::Controller,
+    state_history::SHIP_ABI,
+    transaction::TransactionTrace,
 };
 use pulsevm_crypto::Bytes;
-use pulsevm_serialization::{Read, Write};
-use spdlog::{debug, error, info, warn};
+use pulsevm_serialization::{
+    Read,
+    Write,
+};
+use spdlog::{
+    debug,
+    error,
+    info,
+    warn,
+};
 use tokio::{
     sync::{
-        RwLock, mpsc,
-        watch::{self, Sender},
+        RwLock,
+        mpsc,
+        watch::{
+            self,
+            Sender,
+        },
     },
     task::JoinHandle,
 };
@@ -28,8 +51,12 @@ use tungstenite::Message;
 use crate::state_history::{
     request::RequestType,
     types::{
-        BlockPosition, GetBlocksAckRequestV0, GetBlocksRequestV0, GetBlocksResponseV0,
-        GetStatusResult, TransactionTraceV0,
+        BlockPosition,
+        GetBlocksAckRequestV0,
+        GetBlocksRequestV0,
+        GetBlocksResponseV0,
+        GetStatusResult,
+        TransactionTraceV0,
     },
 };
 

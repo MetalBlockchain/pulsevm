@@ -1,6 +1,15 @@
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize,
+    Serialize,
+};
 
-use crate::{NumBytes, Read, ReadError, Write, WriteError};
+use crate::{
+    NumBytes,
+    Read,
+    ReadError,
+    Write,
+    WriteError,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub struct VarUint32(pub u32);

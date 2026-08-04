@@ -1,7 +1,11 @@
 use std::sync::Arc;
 
 use pulsevm_crypto::Bytes;
-use pulsevm_proc_macros::{NumBytes, Read, Write};
+use pulsevm_proc_macros::{
+    NumBytes,
+    Read,
+    Write,
+};
 
 use crate::chain::id::Id;
 

@@ -4,16 +4,30 @@ mod net_tests {
 
     use anyhow::Result;
     use pulsevm_core::{
-        ACTIVE_NAME, ChainError, PULSE_NAME,
+        ACTIVE_NAME,
+        ChainError,
+        PULSE_NAME,
         authority::PermissionLevel,
         name::Name,
         resource_limits::ResourceLimitsManager,
-        transaction::{Action, SignedTransaction, Transaction, TransactionTrace},
+        transaction::{
+            Action,
+            SignedTransaction,
+            Transaction,
+            TransactionTrace,
+        },
     };
     use pulsevm_name_macro::name;
-    use pulsevm_serialization::{VarUint32, Write};
+    use pulsevm_serialization::{
+        VarUint32,
+        Write,
+    };
 
-    use crate::tests::{DEFAULT_EXPIRATION_DELTA, Testing, get_private_key};
+    use crate::tests::{
+        DEFAULT_EXPIRATION_DELTA,
+        Testing,
+        get_private_key,
+    };
 
     /// Pushes a `reqauth` from `from` with the given `max_net_usage_words`
     /// header value (0 = no transaction-specified limit).
@@ -32,8 +46,10 @@ mod net_tests {
         chain.set_transaction_headers(&mut trx, DEFAULT_EXPIRATION_DELTA, 0);
         trx.header.max_net_usage_words = VarUint32(max_net_usage_words);
 
-        let signed = SignedTransaction::new(trx, BTreeSet::new(), vec![])
-            .sign(&get_private_key(from, "active"), &chain.controller.chain_id())?;
+        let signed = SignedTransaction::new(trx, BTreeSet::new(), vec![]).sign(
+            &get_private_key(from, "active"),
+            &chain.controller.chain_id(),
+        )?;
         chain.push_transaction(signed)
     }
 

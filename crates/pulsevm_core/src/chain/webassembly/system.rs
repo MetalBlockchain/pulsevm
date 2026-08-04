@@ -1,6 +1,13 @@
-use wasmer::{FunctionEnvMut, RuntimeError, WasmPtr};
+use wasmer::{
+    FunctionEnvMut,
+    RuntimeError,
+    WasmPtr,
+};
 
-use crate::chain::{wasm_runtime::WasmContext, webassembly::context_aware_check};
+use crate::chain::{
+    wasm_runtime::WasmContext,
+    webassembly::context_aware_check,
+};
 
 const MAX_ASSERT_MESSAGE: usize = 1024;
 

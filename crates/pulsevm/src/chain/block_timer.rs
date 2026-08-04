@@ -1,8 +1,14 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::Duration,
+};
 
 use pulsevm_core::mempool::Mempool;
 use tokio::{
-    sync::{Notify, RwLock},
+    sync::{
+        Notify,
+        RwLock,
+    },
     task::JoinHandle,
     time::interval,
 };

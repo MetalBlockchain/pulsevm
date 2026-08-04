@@ -2,7 +2,12 @@
 //! variable-length `abi` in the blob arena — exercised through create, read,
 //! undo, and snapshot. This is the shape the ~40 real tables take.
 
-use pulsevm_arena::{ArenaObject, BlobRef, Db, ObjectId};
+use pulsevm_arena::{
+    ArenaObject,
+    BlobRef,
+    Db,
+    ObjectId,
+};
 
 #[repr(C)]
 #[derive(
@@ -47,7 +52,10 @@ fn stores_and_reads_variable_length_abi() {
     let mut db = new_db();
     let id = create_account(&mut db, 42, b"the-abi-bytes");
     let acct = *db.get::<AccountObject>(id).unwrap();
-    assert_eq!(db.blob::<AccountObject>(acct.abi).unwrap(), b"the-abi-bytes");
+    assert_eq!(
+        db.blob::<AccountObject>(acct.abi).unwrap(),
+        b"the-abi-bytes"
+    );
     // An account created with no abi reads back as an empty slice.
     let empty = create_account(&mut db, 43, b"");
     let acct = *db.get::<AccountObject>(empty).unwrap();
@@ -65,7 +73,11 @@ fn undo_drops_blobs_appended_in_the_session() {
 
     // The rejected account and its abi are gone; the next allocation reuses the
     // space, so the arena did not leak the discarded blob.
-    assert!(db.find_by::<AccountObject, AccountObjectByName>(&2).unwrap().is_none());
+    assert!(
+        db.find_by::<AccountObject, AccountObjectByName>(&2)
+            .unwrap()
+            .is_none()
+    );
     let reused = db.alloc_blob::<AccountObject>(b"x").unwrap();
     assert_eq!(reused.off, 4); // right after "kept" (4 bytes), not after the discarded blob
 }
@@ -84,9 +96,22 @@ fn snapshot_round_trips_blobs() {
     restored.load(&path).unwrap();
     let ra = *restored.get::<AccountObject>(a).unwrap();
     let rb = *restored.get::<AccountObject>(b).unwrap();
-    assert_eq!(restored.blob::<AccountObject>(ra.abi).unwrap(), b"first-abi");
-    assert_eq!(restored.blob::<AccountObject>(rb.abi).unwrap(), b"second-longer-abi");
-    assert_eq!(restored.find_by::<AccountObject, AccountObjectByName>(&2).unwrap().unwrap().id, b);
+    assert_eq!(
+        restored.blob::<AccountObject>(ra.abi).unwrap(),
+        b"first-abi"
+    );
+    assert_eq!(
+        restored.blob::<AccountObject>(rb.abi).unwrap(),
+        b"second-longer-abi"
+    );
+    assert_eq!(
+        restored
+            .find_by::<AccountObject, AccountObjectByName>(&2)
+            .unwrap()
+            .unwrap()
+            .id,
+        b
+    );
 }
 
 /// Rewriting a blob field of the same size in successive committed sessions
@@ -110,7 +135,10 @@ fn realloc_reuses_freed_blob_spans() {
 
     // Append-only would be ~8 KB; reuse keeps it to a couple of 8-byte slots.
     let grew = db.blob_arena_len::<AccountObject>().unwrap() - baseline;
-    assert!(grew <= 16, "blob arena grew {grew} bytes over 1000 same-size rewrites");
+    assert!(
+        grew <= 16,
+        "blob arena grew {grew} bytes over 1000 same-size rewrites"
+    );
     let abi = db.get::<AccountObject>(id).unwrap().abi;
     assert_eq!(db.blob::<AccountObject>(abi).unwrap(), b"BBBBBBBB");
 }
@@ -129,12 +157,14 @@ fn undo_after_realloc_restores_old_blob() {
     let new = db.realloc_blob::<AccountObject>(old, b"MODIFIED").unwrap();
     db.modify::<AccountObject>(id, |a| a.abi = new).unwrap();
     assert_eq!(
-        db.blob::<AccountObject>(db.get::<AccountObject>(id).unwrap().abi).unwrap(),
+        db.blob::<AccountObject>(db.get::<AccountObject>(id).unwrap().abi)
+            .unwrap(),
         b"MODIFIED"
     );
     db.undo();
     assert_eq!(
-        db.blob::<AccountObject>(db.get::<AccountObject>(id).unwrap().abi).unwrap(),
+        db.blob::<AccountObject>(db.get::<AccountObject>(id).unwrap().abi)
+            .unwrap(),
         b"ORIGINAL"
     );
 }

@@ -11,12 +11,27 @@
 //! access is already serialised by its own lock. Never hold the guard across an
 //! `.await`.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc,
+    Mutex,
+};
 
 use pulsevm_arena::{
-    ArenaObject, BlobRef, Db, DbError, IndexedBy, ObjectId, SecondaryIndex, key_index,
+    ArenaObject,
+    BlobRef,
+    Db,
+    DbError,
+    IndexedBy,
+    ObjectId,
+    SecondaryIndex,
+    key_index,
 };
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+use zerocopy::{
+    FromBytes,
+    Immutable,
+    IntoBytes,
+    KnownLayout,
+};
 
 /// Arena mirror of chainbase `account_metadata_object` — the first table ported.
 /// The trailing padding keeps the row free of implicit padding bytes so it
@@ -865,9 +880,7 @@ fn contract_table_incr(db: &mut Db, t_id: i64) -> Result<(), DbError> {
 /// Drops a table's child-row count and removes the table when it hits zero,
 /// mirroring the `--t.count` / `remove_table` chainbase does on every remove.
 fn contract_table_decr(db: &mut Db, t_id: i64) -> Result<(), DbError> {
-    db.modify::<ContractTableRow>(ObjectId::new(t_id), |t| {
-        t.count = t.count.saturating_sub(1)
-    })?;
+    db.modify::<ContractTableRow>(ObjectId::new(t_id), |t| t.count = t.count.saturating_sub(1))?;
     if db.get::<ContractTableRow>(ObjectId::new(t_id))?.count == 0 {
         db.remove::<ContractTableRow>(ObjectId::new(t_id))?;
     }
@@ -940,11 +953,13 @@ impl ArenaShadow {
 
     /// Route contract reads through the arena from now on (the cutover switch).
     pub fn enable_reads(&self) {
-        self.reads_enabled.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.reads_enabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn reads_enabled(&self) -> bool {
-        self.reads_enabled.load(std::sync::atomic::Ordering::Relaxed)
+        self.reads_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Db> {
@@ -973,7 +988,10 @@ impl ArenaShadow {
     /// (matches, mismatches) tallied by `crosscheck_kv` so far.
     pub fn read_crosscheck_counts(&self) -> (u64, u64) {
         use std::sync::atomic::Ordering;
-        (self.read_ok.load(Ordering::Relaxed), self.read_fail.load(Ordering::Relaxed))
+        (
+            self.read_ok.load(Ordering::Relaxed),
+            self.read_fail.load(Ordering::Relaxed),
+        )
     }
 
     pub fn set_revision(&self, revision: i64) -> Result<(), DbError> {
@@ -1247,7 +1265,8 @@ impl ArenaShadow {
         while pos + 16 <= bytes.len() {
             let name = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
             let creation_date = u32::from_le_bytes(bytes[pos + 8..pos + 12].try_into().unwrap());
-            let abi_len = u32::from_le_bytes(bytes[pos + 12..pos + 16].try_into().unwrap()) as usize;
+            let abi_len =
+                u32::from_le_bytes(bytes[pos + 12..pos + 16].try_into().unwrap()) as usize;
             pos += 16;
             if pos + abi_len > bytes.len() {
                 break;
@@ -1383,8 +1402,10 @@ impl ArenaShadow {
             let owner = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
             let perm_name = u64::from_le_bytes(bytes[pos + 8..pos + 16].try_into().unwrap());
             let parent = u64::from_le_bytes(bytes[pos + 16..pos + 24].try_into().unwrap()) as i64;
-            let last_used = u64::from_le_bytes(bytes[pos + 24..pos + 32].try_into().unwrap()) as i64;
-            let auth_len = u32::from_le_bytes(bytes[pos + 32..pos + 36].try_into().unwrap()) as usize;
+            let last_used =
+                u64::from_le_bytes(bytes[pos + 24..pos + 32].try_into().unwrap()) as i64;
+            let auth_len =
+                u32::from_le_bytes(bytes[pos + 32..pos + 36].try_into().unwrap()) as usize;
             pos += 36;
             if pos + auth_len > bytes.len() {
                 break;
@@ -1661,17 +1682,18 @@ impl ArenaShadow {
                 .collect(),
             Err(_) => return Vec::new(),
         };
-        let mut refs: Vec<(u64, u64, u64, u64, u64, BlobRef)> = match db.table::<ContractKeyValueRow>() {
-            Ok(t) => t
-                .iter()
-                .filter_map(|r| {
-                    table_key
-                        .get(&r.t_id)
-                        .map(|&(c, s, tb)| (c, s, tb, r.primary_key, r.payer, r.value))
-                })
-                .collect(),
-            Err(_) => return Vec::new(),
-        };
+        let mut refs: Vec<(u64, u64, u64, u64, u64, BlobRef)> =
+            match db.table::<ContractKeyValueRow>() {
+                Ok(t) => t
+                    .iter()
+                    .filter_map(|r| {
+                        table_key
+                            .get(&r.t_id)
+                            .map(|&(c, s, tb)| (c, s, tb, r.primary_key, r.payer, r.value))
+                    })
+                    .collect(),
+                Err(_) => return Vec::new(),
+            };
         refs.sort_by_key(|r| (r.0, r.1, r.2, r.3));
         let mut out = Vec::new();
         for (code, scope, table, primary, payer, value_ref) in refs {
@@ -1736,7 +1758,9 @@ impl ArenaShadow {
             .map(|l| l.id());
         match existing {
             Some(id) => {
-                db.modify::<PermissionLinkRow>(id, |l| l.required_permission = required_permission)?;
+                db.modify::<PermissionLinkRow>(id, |l| {
+                    l.required_permission = required_permission
+                })?;
             }
             None => {
                 db.create::<PermissionLinkRow>(|l| {
@@ -1959,14 +1983,20 @@ impl ArenaShadow {
             db.modify::<ResourceStateRow>(id, |s| {
                 s.average_block_cpu_usage
                     .add(s.pending_cpu_usage, block_num, cpu.periods);
-                s.virtual_cpu_limit =
-                    update_elastic_limit(s.virtual_cpu_limit, s.average_block_cpu_usage.average(), &cpu);
+                s.virtual_cpu_limit = update_elastic_limit(
+                    s.virtual_cpu_limit,
+                    s.average_block_cpu_usage.average(),
+                    &cpu,
+                );
                 s.pending_cpu_usage = 0;
 
                 s.average_block_net_usage
                     .add(s.pending_net_usage, block_num, net.periods);
-                s.virtual_net_limit =
-                    update_elastic_limit(s.virtual_net_limit, s.average_block_net_usage.average(), &net);
+                s.virtual_net_limit = update_elastic_limit(
+                    s.virtual_net_limit,
+                    s.average_block_net_usage.average(),
+                    &net,
+                );
                 s.pending_net_usage = 0;
             })?;
         }
@@ -2301,7 +2331,9 @@ impl ArenaShadow {
             .ok()
             .flatten()
             .map(|k| k.value)?;
-        db.blob::<ContractKeyValueRow>(value_ref).ok().map(|b| b.to_vec())
+        db.blob::<ContractKeyValueRow>(value_ref)
+            .ok()
+            .map(|b| b.to_vec())
     }
 
     /// Serve a contract-table forward scan from the arena: every row in
@@ -2349,7 +2381,10 @@ impl ArenaShadow {
         db.table::<ContractKeyValueRow>()
             .ok()?
             .get_index::<ContractKvByScopePrimary>()
-            .range((Bound::Included((t_id, key)), Bound::Included((t_id, u64::MAX))))
+            .range((
+                Bound::Included((t_id, key)),
+                Bound::Included((t_id, u64::MAX)),
+            ))
             .next()
             .map(|(&(_, p), _)| p)
     }
@@ -2361,7 +2396,10 @@ impl ArenaShadow {
         db.table::<ContractKeyValueRow>()
             .ok()?
             .get_index::<ContractKvByScopePrimary>()
-            .range((Bound::Excluded((t_id, key)), Bound::Included((t_id, u64::MAX))))
+            .range((
+                Bound::Excluded((t_id, key)),
+                Bound::Included((t_id, u64::MAX)),
+            ))
             .next()
             .map(|(&(_, p), _)| p)
     }
@@ -2373,7 +2411,10 @@ impl ArenaShadow {
         db.table::<ContractKeyValueRow>()
             .ok()?
             .get_index::<ContractKvByScopePrimary>()
-            .range((Bound::Included((t_id, u64::MIN)), Bound::Excluded((t_id, key))))
+            .range((
+                Bound::Included((t_id, u64::MIN)),
+                Bound::Excluded((t_id, key)),
+            ))
             .next_back()
             .map(|(&(_, p), _)| p)
     }
@@ -2387,7 +2428,10 @@ impl ArenaShadow {
         db.table::<ContractKeyValueRow>()
             .ok()?
             .get_index::<ContractKvByScopePrimary>()
-            .range((Bound::Included((t_id, u64::MIN)), Bound::Included((t_id, u64::MAX))))
+            .range((
+                Bound::Included((t_id, u64::MIN)),
+                Bound::Included((t_id, u64::MAX)),
+            ))
             .next_back()
             .map(|(&(_, p), _)| p)
     }
@@ -2708,7 +2752,10 @@ impl ArenaShadow {
         secondary: (u64, u64),
     ) -> Option<(u64, (u64, u64))> {
         use std::ops::Bound;
-        let key = LongDoubleKey { lo: secondary.0, hi: secondary.1 };
+        let key = LongDoubleKey {
+            lo: secondary.0,
+            hi: secondary.1,
+        };
         let db = self.lock();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         match db
@@ -2731,7 +2778,10 @@ impl ArenaShadow {
         secondary: (u64, u64),
     ) -> Option<(u64, (u64, u64))> {
         use std::ops::Bound;
-        let key = LongDoubleKey { lo: secondary.0, hi: secondary.1 };
+        let key = LongDoubleKey {
+            lo: secondary.0,
+            hi: secondary.1,
+        };
         let db = self.lock();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         match db
@@ -2753,7 +2803,10 @@ impl ArenaShadow {
         table: u64,
         secondary: (u64, u64),
     ) -> Option<u64> {
-        let want = LongDoubleKey { lo: secondary.0, hi: secondary.1 };
+        let want = LongDoubleKey {
+            lo: secondary.0,
+            hi: secondary.1,
+        };
         self.idx_long_double_lower_bound(code, scope, table, secondary)
             .filter(|&(_, (lo, hi))| LongDoubleKey { lo, hi } == want)
             .map(|(primary, _)| primary)
@@ -2794,7 +2847,10 @@ impl ArenaShadow {
     /// (matches, mismatches) tallied by iterator-positioning cross-checks.
     pub fn pos_crosscheck_counts(&self) -> (u64, u64) {
         use std::sync::atomic::Ordering;
-        (self.pos_ok.load(Ordering::Relaxed), self.pos_fail.load(Ordering::Relaxed))
+        (
+            self.pos_ok.load(Ordering::Relaxed),
+            self.pos_fail.load(Ordering::Relaxed),
+        )
     }
 
     /// Write a full checkpoint of the mirror's committed state to `path` (atomic).
@@ -2845,7 +2901,10 @@ impl ArenaShadow {
     /// (matches, mismatches) tallied by non-contract read cross-checks.
     pub fn noncontract_crosscheck_counts(&self) -> (u64, u64) {
         use std::sync::atomic::Ordering;
-        (self.nc_ok.load(Ordering::Relaxed), self.nc_fail.load(Ordering::Relaxed))
+        (
+            self.nc_ok.load(Ordering::Relaxed),
+            self.nc_fail.load(Ordering::Relaxed),
+        )
     }
 
     pub fn update_key_value_object(
@@ -3179,7 +3238,11 @@ mod tests {
         assert_eq!(s.kv_get(code, scope, table, 99), None);
 
         // Forward scan (db_lowerbound -> repeated db_next).
-        let scan: Vec<u64> = s.table_range(code, scope, table).into_iter().map(|(p, _)| p).collect();
+        let scan: Vec<u64> = s
+            .table_range(code, scope, table)
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
         assert_eq!(scan, vec![10, 20, 30, 40, 50]);
 
         // lower_bound: first primary >= key.
@@ -3250,9 +3313,18 @@ mod tests {
                 .unwrap();
         }
 
-        assert_eq!(s.idx128_lower_bound(code, scope, table, 150), Some((2, 200)));
-        assert_eq!(s.idx128_lower_bound(code, scope, table, big), Some((7, big)));
-        assert_eq!(s.idx128_upper_bound(code, scope, table, 200), Some((7, big)));
+        assert_eq!(
+            s.idx128_lower_bound(code, scope, table, 150),
+            Some((2, 200))
+        );
+        assert_eq!(
+            s.idx128_lower_bound(code, scope, table, big),
+            Some((7, big))
+        );
+        assert_eq!(
+            s.idx128_upper_bound(code, scope, table, 200),
+            Some((7, big))
+        );
         assert_eq!(s.idx128_upper_bound(code, scope, table, big), None);
         assert_eq!(s.idx128_find_secondary(code, scope, table, 200), Some(2));
         assert_eq!(s.idx128_find_secondary(code, scope, table, 199), None);
@@ -3275,11 +3347,23 @@ mod tests {
                 .unwrap();
         }
 
-        assert_eq!(s.idx256_lower_bound(code, scope, table, key(15)), Some((2, key(20))));
-        assert_eq!(s.idx256_lower_bound(code, scope, table, key(10)), Some((9, key(10))));
-        assert_eq!(s.idx256_upper_bound(code, scope, table, key(20)), Some((7, key(30))));
+        assert_eq!(
+            s.idx256_lower_bound(code, scope, table, key(15)),
+            Some((2, key(20)))
+        );
+        assert_eq!(
+            s.idx256_lower_bound(code, scope, table, key(10)),
+            Some((9, key(10)))
+        );
+        assert_eq!(
+            s.idx256_upper_bound(code, scope, table, key(20)),
+            Some((7, key(30)))
+        );
         assert_eq!(s.idx256_upper_bound(code, scope, table, key(30)), None);
-        assert_eq!(s.idx256_find_secondary(code, scope, table, key(20)), Some(2));
+        assert_eq!(
+            s.idx256_find_secondary(code, scope, table, key(20)),
+            Some(2)
+        );
         assert_eq!(s.idx256_find_secondary(code, scope, table, key(25)), None);
         assert_eq!(s.idx256_find_primary(code, scope, table, 5), Some(key(20)));
     }
@@ -3296,12 +3380,24 @@ mod tests {
         }
 
         // Order is: (3,-1.0) (9,1.0) (2,2.0) (5,2.0) (7,3.5).
-        assert_eq!(s.idx_double_lower_bound(code, scope, table, -2.0), Some((3, -1.0)));
-        assert_eq!(s.idx_double_lower_bound(code, scope, table, 1.5), Some((2, 2.0)));
+        assert_eq!(
+            s.idx_double_lower_bound(code, scope, table, -2.0),
+            Some((3, -1.0))
+        );
+        assert_eq!(
+            s.idx_double_lower_bound(code, scope, table, 1.5),
+            Some((2, 2.0))
+        );
         assert_eq!(s.idx_double_lower_bound(code, scope, table, 4.0), None);
-        assert_eq!(s.idx_double_upper_bound(code, scope, table, 2.0), Some((7, 3.5)));
+        assert_eq!(
+            s.idx_double_upper_bound(code, scope, table, 2.0),
+            Some((7, 3.5))
+        );
         assert_eq!(s.idx_double_upper_bound(code, scope, table, 3.5), None);
-        assert_eq!(s.idx_double_find_secondary(code, scope, table, 2.0), Some(2));
+        assert_eq!(
+            s.idx_double_find_secondary(code, scope, table, 2.0),
+            Some(2)
+        );
         assert_eq!(s.idx_double_find_secondary(code, scope, table, 2.5), None);
         assert_eq!(s.idx_double_find_primary(code, scope, table, 5), Some(2.0));
     }
@@ -3318,12 +3414,33 @@ mod tests {
         }
 
         // Order: (9,(0,1)) (2,(0,2)) (5,(0,2)) (7,(0,3)).
-        assert_eq!(s.idx_long_double_lower_bound(code, scope, table, (0, 1)), Some((9, (0, 1))));
-        assert_eq!(s.idx_long_double_lower_bound(code, scope, table, (0, 2)), Some((2, (0, 2))));
-        assert_eq!(s.idx_long_double_upper_bound(code, scope, table, (0, 2)), Some((7, (0, 3))));
-        assert_eq!(s.idx_long_double_upper_bound(code, scope, table, (0, 3)), None);
-        assert_eq!(s.idx_long_double_find_secondary(code, scope, table, (0, 2)), Some(2));
-        assert_eq!(s.idx_long_double_find_secondary(code, scope, table, (0, 4)), None);
-        assert_eq!(s.idx_long_double_find_primary(code, scope, table, 5), Some((0, 2)));
+        assert_eq!(
+            s.idx_long_double_lower_bound(code, scope, table, (0, 1)),
+            Some((9, (0, 1)))
+        );
+        assert_eq!(
+            s.idx_long_double_lower_bound(code, scope, table, (0, 2)),
+            Some((2, (0, 2)))
+        );
+        assert_eq!(
+            s.idx_long_double_upper_bound(code, scope, table, (0, 2)),
+            Some((7, (0, 3)))
+        );
+        assert_eq!(
+            s.idx_long_double_upper_bound(code, scope, table, (0, 3)),
+            None
+        );
+        assert_eq!(
+            s.idx_long_double_find_secondary(code, scope, table, (0, 2)),
+            Some(2)
+        );
+        assert_eq!(
+            s.idx_long_double_find_secondary(code, scope, table, (0, 4)),
+            None
+        );
+        assert_eq!(
+            s.idx_long_double_find_primary(code, scope, table, 5),
+            Some((0, 2))
+        );
     }
 }

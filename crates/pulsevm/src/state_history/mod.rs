@@ -2,16 +2,26 @@ mod request;
 mod session;
 mod types;
 
-use std::{io::ErrorKind, net::SocketAddr, sync::Arc};
+use std::{
+    io::ErrorKind,
+    net::SocketAddr,
+    sync::Arc,
+};
 
 use pulsevm_core::controller::Controller;
 use tokio::{
     net::TcpListener as TokioTcpListener,
-    sync::{RwLock, Semaphore},
+    sync::{
+        RwLock,
+        Semaphore,
+    },
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::{VirtualMachine, state_history::session::Session};
+use crate::{
+    VirtualMachine,
+    state_history::session::Session,
+};
 
 /// Rewrites a bind address to request an ephemeral port, preserving the host.
 /// Falls back to all interfaces if the host cannot be determined.

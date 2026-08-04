@@ -3,14 +3,30 @@ use std::fmt;
 use cxx::SharedPtr;
 use pulsevm_billable_size::BillableSize;
 use pulsevm_crypto::FixedBytes;
-use pulsevm_serialization::{NumBytes, Read, Write, WriteError};
+use pulsevm_serialization::{
+    NumBytes,
+    Read,
+    Write,
+    WriteError,
+};
 use serde::{
-    Deserialize, Serialize,
-    de::{self, MapAccess, SeqAccess, Visitor},
+    Deserialize,
+    Serialize,
+    de::{
+        self,
+        MapAccess,
+        SeqAccess,
+        Visitor,
+    },
     ser::SerializeStruct,
 };
 
-use crate::{CxxPublicKey, bridge::ffi::KeyWeight, parse_public_key, parse_public_key_from_bytes};
+use crate::{
+    CxxPublicKey,
+    bridge::ffi::KeyWeight,
+    parse_public_key,
+    parse_public_key_from_bytes,
+};
 
 impl KeyWeight {
     pub fn new(key: SharedPtr<CxxPublicKey>, weight: u16) -> Self {

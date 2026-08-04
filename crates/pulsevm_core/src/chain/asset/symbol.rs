@@ -1,9 +1,20 @@
 use core::fmt;
 use std::str::FromStr;
 
-use pulsevm_proc_macros::{NumBytes, Write};
-use pulsevm_serialization::{Read, ReadError};
-use serde::{Deserialize, Deserializer, Serialize, de};
+use pulsevm_proc_macros::{
+    NumBytes,
+    Write,
+};
+use pulsevm_serialization::{
+    Read,
+    ReadError,
+};
+use serde::{
+    Deserialize,
+    Deserializer,
+    Serialize,
+    de,
+};
 
 use crate::chain::asset::SymbolCode;
 
@@ -209,7 +220,10 @@ mod tests {
             Symbol::try_new_with_code(19, SymbolCode::new(EOS_CODE)),
             Err(SymbolError::InvalidPrecision)
         );
-        assert_eq!("19,EOS".parse::<Symbol>(), Err(SymbolError::InvalidPrecision));
+        assert_eq!(
+            "19,EOS".parse::<Symbol>(),
+            Err(SymbolError::InvalidPrecision)
+        );
     }
 
     #[test]
@@ -229,7 +243,10 @@ mod tests {
     #[test]
     fn from_str_errors_are_specific() {
         assert_eq!("EOS".parse::<Symbol>(), Err(SymbolError::MissingSeparator));
-        assert_eq!("x,EOS".parse::<Symbol>(), Err(SymbolError::InvalidPrecision));
+        assert_eq!(
+            "x,EOS".parse::<Symbol>(),
+            Err(SymbolError::InvalidPrecision)
+        );
         assert_eq!("4,eos".parse::<Symbol>(), Err(SymbolError::ParseError));
     }
 

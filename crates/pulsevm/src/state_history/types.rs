@@ -6,10 +6,21 @@ use pulsevm_core::{
     id::Id,
     name::Name,
     time::TimePointSec,
-    transaction::{Action, TransactionStatus, TransactionTrace},
+    transaction::{
+        Action,
+        TransactionStatus,
+        TransactionTrace,
+    },
 };
-use pulsevm_crypto::{Bytes, Digest};
-use pulsevm_proc_macros::{NumBytes, Read, Write};
+use pulsevm_crypto::{
+    Bytes,
+    Digest,
+};
+use pulsevm_proc_macros::{
+    NumBytes,
+    Read,
+    Write,
+};
 use pulsevm_serialization::VarUint32;
 
 #[derive(Debug, Clone, Read, Write, NumBytes)]

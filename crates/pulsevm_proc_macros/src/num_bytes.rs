@@ -1,8 +1,22 @@
 use proc_macro2::TokenStream;
-use quote::{ToTokens, quote, quote_spanned};
+use quote::{
+    ToTokens,
+    quote,
+    quote_spanned,
+};
 use syn::{
-    Data, DeriveInput, Fields, GenericParam, Generics, Ident, Index,
-    parse::{Parse, ParseStream, Result as ParseResult},
+    Data,
+    DeriveInput,
+    Fields,
+    GenericParam,
+    Generics,
+    Ident,
+    Index,
+    parse::{
+        Parse,
+        ParseStream,
+        Result as ParseResult,
+    },
     parse_quote,
     spanned::Spanned,
 };

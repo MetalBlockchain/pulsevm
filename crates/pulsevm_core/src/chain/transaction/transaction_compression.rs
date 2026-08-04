@@ -1,9 +1,20 @@
 use std::fmt;
 
-use pulsevm_serialization::{NumBytes, Read, ReadError, Write, WriteError};
+use pulsevm_serialization::{
+    NumBytes,
+    Read,
+    ReadError,
+    Write,
+    WriteError,
+};
 use serde::{
-    Deserialize, Deserializer, Serialize,
-    de::{self, Visitor},
+    Deserialize,
+    Deserializer,
+    Serialize,
+    de::{
+        self,
+        Visitor,
+    },
 };
 
 #[repr(u8)]

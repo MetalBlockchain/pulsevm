@@ -20,8 +20,17 @@
 //! `find_by::<Account, AccountByName>(..)`.
 
 use proc_macro::TokenStream;
-use quote::{format_ident, quote};
-use syn::{Data, DeriveInput, Fields, LitInt, parse_macro_input};
+use quote::{
+    format_ident,
+    quote,
+};
+use syn::{
+    Data,
+    DeriveInput,
+    Fields,
+    LitInt,
+    parse_macro_input,
+};
 
 #[proc_macro_derive(ArenaObject, attributes(arena))]
 pub fn derive_arena_object(input: TokenStream) -> TokenStream {

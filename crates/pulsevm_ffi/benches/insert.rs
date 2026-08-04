@@ -1,7 +1,14 @@
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{
+    Criterion,
+    criterion_group,
+    criterion_main,
+};
 use pulsevm_ffi::Database;
 use std::hint::black_box;
-use tempfile::{TempDir, tempdir};
+use tempfile::{
+    TempDir,
+    tempdir,
+};
 
 const DB_SIZE: u64 = 1024 * 1024 * 1024;
 // Recycle the store before the fixed-size mmap fills; amortized over this many

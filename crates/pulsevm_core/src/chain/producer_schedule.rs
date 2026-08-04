@@ -1,8 +1,22 @@
-use pulsevm_proc_macros::{NumBytes, Read, Write};
-use pulsevm_serialization::{Read as _, ReadError, VarUint32};
-use serde::{Deserialize, Serialize};
+use pulsevm_proc_macros::{
+    NumBytes,
+    Read,
+    Write,
+};
+use pulsevm_serialization::{
+    Read as _,
+    ReadError,
+    VarUint32,
+};
+use serde::{
+    Deserialize,
+    Serialize,
+};
 
-use crate::chain::{crypto::PublicKey, name::Name};
+use crate::chain::{
+    crypto::PublicKey,
+    name::Name,
+};
 
 /// Matches EOSIO's producer ceiling. Bounds the schedule so a caller can't blow
 /// up memory or the per-block work.
@@ -73,7 +87,10 @@ impl ProducerSchedule {
 mod tests {
     use std::str::FromStr;
 
-    use pulsevm_serialization::{VarUint32, Write};
+    use pulsevm_serialization::{
+        VarUint32,
+        Write,
+    };
 
     use super::*;
     use crate::chain::crypto::PrivateKey;

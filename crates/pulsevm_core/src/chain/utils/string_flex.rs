@@ -4,8 +4,14 @@
 
 use core::fmt;
 use serde::{
-    Deserialize, Deserializer, Serialize, Serializer,
-    de::{Error as DeError, Visitor},
+    Deserialize,
+    Deserializer,
+    Serialize,
+    Serializer,
+    de::{
+        Error as DeError,
+        Visitor,
+    },
 };
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]

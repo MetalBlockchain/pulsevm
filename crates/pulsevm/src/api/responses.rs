@@ -1,4 +1,9 @@
-use pulsevm_core::{block::BlockTimestamp, id::Id, name::Name, utils::Base64Bytes};
+use pulsevm_core::{
+    block::BlockTimestamp,
+    id::Id,
+    name::Name,
+    utils::Base64Bytes,
+};
 use pulsevm_crypto::Digest;
 use serde::Serialize;
 

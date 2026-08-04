@@ -1,21 +1,52 @@
-use std::pin::Pin;
-use std::sync::{Arc, RwLock, RwLockWriteGuard};
+use std::{
+    pin::Pin,
+    sync::{
+        Arc,
+        RwLock,
+        RwLockWriteGuard,
+    },
+};
 
 use cxx::UniquePtr;
 use pulsevm_error::ChainError;
 use pulsevm_name::Name;
 
 use crate::{
-    AccountMetadataObject, ChainConfigV0, Float128, Index64IteratorCache, Index128IteratorCache,
-    IndexDoubleIteratorCache, IndexLongDoubleIteratorCache, IndexLongDoubleObject, KeyValueObject,
+    AccountMetadataObject,
+    ChainConfigV0,
+    Float128,
+    Index64IteratorCache,
+    Index128IteratorCache,
+    IndexDoubleIteratorCache,
+    IndexLongDoubleIteratorCache,
+    IndexLongDoubleObject,
+    KeyValueObject,
     bridge::ffi::{
-        self, Authority, CxxDigest, CxxGenesisState, ElasticLimitParameters, Index64Object,
-        Index128Object, Index256Object, IndexDoubleObject, TableObject, TimePoint, U128, U256,
-        get_account_info_with_core_symbol, get_account_info_without_core_symbol,
-        get_currency_balance_with_symbol, get_currency_balance_without_symbol, get_currency_stats,
-        get_table_by_scope, get_table_rows,
+        self,
+        Authority,
+        CxxDigest,
+        CxxGenesisState,
+        ElasticLimitParameters,
+        Index64Object,
+        Index128Object,
+        Index256Object,
+        IndexDoubleObject,
+        TableObject,
+        TimePoint,
+        U128,
+        U256,
+        get_account_info_with_core_symbol,
+        get_account_info_without_core_symbol,
+        get_currency_balance_with_symbol,
+        get_currency_balance_without_symbol,
+        get_currency_stats,
+        get_table_by_scope,
+        get_table_rows,
     },
-    iterator_cache::{Index256IteratorCache, KeyValueIteratorCache},
+    iterator_cache::{
+        Index256IteratorCache,
+        KeyValueIteratorCache,
+    },
 };
 
 /// Field-for-field snapshot of an `account_metadata_object` read back from the
@@ -166,9 +197,11 @@ impl Database {
     pub fn arena_account_metadata(&self, name: u64) -> Option<ArenaAccountMetadata> {
         #[cfg(feature = "arena-shadow")]
         {
-            self.shadow.as_ref().and_then(|s| s.account_metadata(name)).map(
-                |(privileged, recv_sequence, auth_sequence, code_sequence, abi_sequence, code_hash, vm_type, vm_version)| {
-                    ArenaAccountMetadata {
+            self.shadow
+                .as_ref()
+                .and_then(|s| s.account_metadata(name))
+                .map(
+                    |(
                         privileged,
                         recv_sequence,
                         auth_sequence,
@@ -177,9 +210,19 @@ impl Database {
                         code_hash,
                         vm_type,
                         vm_version,
-                    }
-                },
-            )
+                    )| {
+                        ArenaAccountMetadata {
+                            privileged,
+                            recv_sequence,
+                            auth_sequence,
+                            code_sequence,
+                            abi_sequence,
+                            code_hash,
+                            vm_type,
+                            vm_version,
+                        }
+                    },
+                )
         }
         #[cfg(not(feature = "arena-shadow"))]
         {
@@ -387,7 +430,9 @@ impl Database {
     pub fn arena_permission_link_state_bytes(&self) -> Option<Vec<u8>> {
         #[cfg(feature = "arena-shadow")]
         {
-            self.shadow.as_ref().map(|s| s.permission_link_state_bytes())
+            self.shadow
+                .as_ref()
+                .map(|s| s.permission_link_state_bytes())
         }
         #[cfg(not(feature = "arena-shadow"))]
         {
@@ -499,7 +544,9 @@ impl Database {
     ) -> Option<Vec<u8>> {
         #[cfg(feature = "arena-shadow")]
         {
-            self.shadow.as_ref().and_then(|s| s.kv_get(code, scope, table, primary_key))
+            self.shadow
+                .as_ref()
+                .and_then(|s| s.kv_get(code, scope, table, primary_key))
         }
         #[cfg(not(feature = "arena-shadow"))]
         {
@@ -515,7 +562,10 @@ impl Database {
     pub fn arena_table_range(&self, code: u64, scope: u64, table: u64) -> Vec<(u64, Vec<u8>)> {
         #[cfg(feature = "arena-shadow")]
         {
-            self.shadow.as_ref().map(|s| s.table_range(code, scope, table)).unwrap_or_default()
+            self.shadow
+                .as_ref()
+                .map(|s| s.table_range(code, scope, table))
+                .unwrap_or_default()
         }
         #[cfg(not(feature = "arena-shadow"))]
         {
@@ -562,7 +612,10 @@ impl Database {
     pub fn arena_reads_enabled(&self) -> bool {
         #[cfg(feature = "arena-shadow")]
         {
-            self.shadow.as_ref().map(|s| s.reads_enabled()).unwrap_or(false)
+            self.shadow
+                .as_ref()
+                .map(|s| s.reads_enabled())
+                .unwrap_or(false)
         }
         #[cfg(not(feature = "arena-shadow"))]
         {
@@ -575,7 +628,10 @@ impl Database {
     pub fn arena_read_crosscheck_counts(&self) -> (u64, u64) {
         #[cfg(feature = "arena-shadow")]
         {
-            self.shadow.as_ref().map(|s| s.read_crosscheck_counts()).unwrap_or((0, 0))
+            self.shadow
+                .as_ref()
+                .map(|s| s.read_crosscheck_counts())
+                .unwrap_or((0, 0))
         }
         #[cfg(not(feature = "arena-shadow"))]
         {
@@ -590,7 +646,9 @@ impl Database {
     pub fn arena_kv_lower_bound(&self, code: u64, scope: u64, table: u64, key: u64) -> Option<u64> {
         #[cfg(feature = "arena-shadow")]
         {
-            self.shadow.as_ref().and_then(|s| s.kv_lower_bound(code, scope, table, key))
+            self.shadow
+                .as_ref()
+                .and_then(|s| s.kv_lower_bound(code, scope, table, key))
         }
         #[cfg(not(feature = "arena-shadow"))]
         {
@@ -602,7 +660,9 @@ impl Database {
     pub fn arena_kv_upper_bound(&self, code: u64, scope: u64, table: u64, key: u64) -> Option<u64> {
         #[cfg(feature = "arena-shadow")]
         {
-            self.shadow.as_ref().and_then(|s| s.kv_upper_bound(code, scope, table, key))
+            self.shadow
+                .as_ref()
+                .and_then(|s| s.kv_upper_bound(code, scope, table, key))
         }
         #[cfg(not(feature = "arena-shadow"))]
         {
@@ -614,7 +674,9 @@ impl Database {
     pub fn arena_kv_prev(&self, code: u64, scope: u64, table: u64, key: u64) -> Option<u64> {
         #[cfg(feature = "arena-shadow")]
         {
-            self.shadow.as_ref().and_then(|s| s.kv_prev(code, scope, table, key))
+            self.shadow
+                .as_ref()
+                .and_then(|s| s.kv_prev(code, scope, table, key))
         }
         #[cfg(not(feature = "arena-shadow"))]
         {
@@ -628,7 +690,9 @@ impl Database {
     pub fn arena_kv_last(&self, code: u64, scope: u64, table: u64) -> Option<u64> {
         #[cfg(feature = "arena-shadow")]
         {
-            self.shadow.as_ref().and_then(|s| s.kv_last(code, scope, table))
+            self.shadow
+                .as_ref()
+                .and_then(|s| s.kv_last(code, scope, table))
         }
         #[cfg(not(feature = "arena-shadow"))]
         {
@@ -651,7 +715,9 @@ impl Database {
     ) -> Option<u64> {
         #[cfg(feature = "arena-shadow")]
         {
-            self.shadow.as_ref().and_then(|s| s.idx64_find_secondary(code, scope, table, secondary))
+            self.shadow
+                .as_ref()
+                .and_then(|s| s.idx64_find_secondary(code, scope, table, secondary))
         }
         #[cfg(not(feature = "arena-shadow"))]
         {
@@ -669,7 +735,9 @@ impl Database {
     ) -> Option<(u64, u64)> {
         #[cfg(feature = "arena-shadow")]
         {
-            self.shadow.as_ref().and_then(|s| s.idx64_lower_bound(code, scope, table, secondary))
+            self.shadow
+                .as_ref()
+                .and_then(|s| s.idx64_lower_bound(code, scope, table, secondary))
         }
         #[cfg(not(feature = "arena-shadow"))]
         {
@@ -687,7 +755,9 @@ impl Database {
     ) -> Option<(u64, u64)> {
         #[cfg(feature = "arena-shadow")]
         {
-            self.shadow.as_ref().and_then(|s| s.idx64_upper_bound(code, scope, table, secondary))
+            self.shadow
+                .as_ref()
+                .and_then(|s| s.idx64_upper_bound(code, scope, table, secondary))
         }
         #[cfg(not(feature = "arena-shadow"))]
         {
@@ -705,7 +775,9 @@ impl Database {
     ) -> Option<u64> {
         #[cfg(feature = "arena-shadow")]
         {
-            self.shadow.as_ref().and_then(|s| s.idx64_find_primary(code, scope, table, primary))
+            self.shadow
+                .as_ref()
+                .and_then(|s| s.idx64_find_primary(code, scope, table, primary))
         }
         #[cfg(not(feature = "arena-shadow"))]
         {
@@ -732,7 +804,10 @@ impl Database {
     pub fn arena_pos_crosscheck_counts(&self) -> (u64, u64) {
         #[cfg(feature = "arena-shadow")]
         {
-            self.shadow.as_ref().map(|s| s.pos_crosscheck_counts()).unwrap_or((0, 0))
+            self.shadow
+                .as_ref()
+                .map(|s| s.pos_crosscheck_counts())
+                .unwrap_or((0, 0))
         }
         #[cfg(not(feature = "arena-shadow"))]
         {
@@ -793,7 +868,10 @@ impl Database {
     /// checkpoint), and return whether its state root matches the live mirror —
     /// the crash-recovery guarantee for the incremental path. `None` when
     /// shadowing is off.
-    pub fn arena_wal_reload_matches(&self, path: &std::path::Path) -> Result<Option<bool>, ChainError> {
+    pub fn arena_wal_reload_matches(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<Option<bool>, ChainError> {
         #[cfg(feature = "arena-shadow")]
         {
             let Some(cur) = &self.shadow else {
@@ -843,7 +921,10 @@ impl Database {
     pub fn arena_noncontract_crosscheck_counts(&self) -> (u64, u64) {
         #[cfg(feature = "arena-shadow")]
         {
-            self.shadow.as_ref().map(|s| s.noncontract_crosscheck_counts()).unwrap_or((0, 0))
+            self.shadow
+                .as_ref()
+                .map(|s| s.noncontract_crosscheck_counts())
+                .unwrap_or((0, 0))
         }
         #[cfg(not(feature = "arena-shadow"))]
         {
@@ -856,7 +937,10 @@ impl Database {
     pub fn arena_account_exists(&self, name: u64) -> bool {
         #[cfg(feature = "arena-shadow")]
         {
-            self.shadow.as_ref().map(|s| s.account_exists(name)).unwrap_or(false)
+            self.shadow
+                .as_ref()
+                .map(|s| s.account_exists(name))
+                .unwrap_or(false)
         }
         #[cfg(not(feature = "arena-shadow"))]
         {
@@ -1321,9 +1405,10 @@ impl Database {
         if self.shadow.is_none() {
             return;
         }
-        let windows = self
-            .get_account_net_usage_average_window()
-            .and_then(|nw| self.get_account_cpu_usage_average_window().map(|cw| (nw, cw)));
+        let windows = self.get_account_net_usage_average_window().and_then(|nw| {
+            self.get_account_cpu_usage_average_window()
+                .map(|cw| (nw, cw))
+        });
         let (net_window, cpu_window) = match windows {
             Ok(w) => w,
             Err(e) => {
@@ -1929,8 +2014,7 @@ impl Database {
         // required_permission is the requirement_name.
         #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
-            && let Err(e) =
-                s.link_auth(account_name, code_name, requirement_type, requirement_name)
+            && let Err(e) = s.link_auth(account_name, code_name, requirement_type, requirement_name)
         {
             eprintln!("arena mirror of link_auth diverged: {e:?}");
         }
@@ -2039,7 +2123,9 @@ impl Database {
     pub fn arena_global_action_sequence(&self) -> Option<u64> {
         #[cfg(feature = "arena-shadow")]
         {
-            self.shadow.as_ref().and_then(|s| s.global_action_sequence())
+            self.shadow
+                .as_ref()
+                .and_then(|s| s.global_action_sequence())
         }
         #[cfg(not(feature = "arena-shadow"))]
         {
@@ -2695,7 +2781,8 @@ impl Database {
         };
         #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
-            && let Err(e) = s.create_idx_double_object(key.0, key.1, key.2, payer, id, secondary_key)
+            && let Err(e) =
+                s.create_idx_double_object(key.0, key.1, key.2, payer, id, secondary_key)
         {
             eprintln!("arena mirror of create_idx_double_object diverged: {e:?}");
         }
@@ -3274,8 +3361,8 @@ impl Database {
             .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
         // The pointer is only dereferenced while the read guard is alive, and the
         // authority is copied out before it is dropped.
-        let authority =
-            unsafe { perm.as_ref() }.map(|p| ffi::get_authority_from_shared_authority(p.get_authority()));
+        let authority = unsafe { perm.as_ref() }
+            .map(|p| ffi::get_authority_from_shared_authority(p.get_authority()));
         Ok(authority)
     }
 
@@ -3750,7 +3837,10 @@ impl<'g> DbRead<'g> {
         Ok(unsafe { res.as_ref() })
     }
 
-    pub fn find_account(&self, account_name: u64) -> Result<Option<&ffi::AccountObject>, ChainError> {
+    pub fn find_account(
+        &self,
+        account_name: u64,
+    ) -> Result<Option<&ffi::AccountObject>, ChainError> {
         let res = self
             .db()
             .find_account(account_name)
@@ -3841,8 +3931,11 @@ impl<'g> DbRead<'g> {
             .lookup_linked_permission(account, code, requirement_type)
             .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
 
-        let linked =
-            if res.is_null() { None } else { Some(unsafe { &*res }.to_uint64_t()) };
+        let linked = if res.is_null() {
+            None
+        } else {
+            Some(unsafe { &*res }.to_uint64_t())
+        };
 
         // linkauth resolution feeds authorization: the arena must resolve the
         // same linked permission (or agree there's none).

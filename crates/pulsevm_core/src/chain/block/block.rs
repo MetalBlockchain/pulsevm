@@ -1,14 +1,32 @@
 use std::collections::VecDeque;
 
-use pulsevm_crypto::{Digest, FixedBytes};
+use pulsevm_crypto::{
+    Digest,
+    FixedBytes,
+};
 use pulsevm_error::ChainError;
-use pulsevm_ffi::{BlockTimestamp, Database};
-use pulsevm_proc_macros::{NumBytes, Read, Write};
+use pulsevm_ffi::{
+    BlockTimestamp,
+    Database,
+};
+use pulsevm_proc_macros::{
+    NumBytes,
+    Read,
+    Write,
+};
 use pulsevm_serialization::Write;
-use serde::{Serialize, ser::SerializeStruct};
+use serde::{
+    Serialize,
+    ser::SerializeStruct,
+};
 
 use crate::{
-    chain::{Name, id::Id, producer_schedule::ProducerSchedule, transaction::TransactionReceipt},
+    chain::{
+        Name,
+        id::Id,
+        producer_schedule::ProducerSchedule,
+        transaction::TransactionReceipt,
+    },
     crypto::Signature,
     utils::pulse_assert,
 };
@@ -23,7 +41,8 @@ pub struct BlockHeader {
     pub action_mroot: Digest,
     pub schedule_version: u32,
     pub new_producers: Option<Vec<u8>>, // Placeholder for new producers, we don't use this for now
-    pub header_extensions: Vec<(u16, Vec<u8>)>, // Placeholder for header extensions, we don't use this for now
+    pub header_extensions: Vec<(u16, Vec<u8>)>, /* Placeholder for header extensions, we don't
+                                                 * use this for now */
 }
 
 impl BlockHeader {
@@ -140,8 +159,10 @@ impl SignedBlockHeader {
 #[derive(Debug, Default, Clone, Read, Write, NumBytes)]
 pub struct SignedBlock {
     pub signed_block_header: SignedBlockHeader,
-    pub transactions: VecDeque<TransactionReceipt>, // Placeholder for transactions, we don't use this for now
-    pub block_extensions: Vec<(u16, Vec<u8>)>, // Placeholder for header extensions, we don't use this for now
+    pub transactions: VecDeque<TransactionReceipt>, /* Placeholder for transactions, we don't
+                                                     * use this for now */
+    pub block_extensions: Vec<(u16, Vec<u8>)>, /* Placeholder for header extensions, we don't
+                                                * use this for now */
 }
 
 impl SignedBlock {
@@ -259,14 +280,22 @@ impl Serialize for SignedBlock {
 mod tests {
     use std::str::FromStr;
 
-    use pulsevm_serialization::{Read, Write};
+    use pulsevm_serialization::{
+        Read,
+        Write,
+    };
 
     use super::BlockHeader;
-    use crate::block::SignedBlock;
-    use crate::chain::{
-        Name,
-        crypto::PrivateKey,
-        producer_schedule::{ProducerKey, ProducerSchedule},
+    use crate::{
+        block::SignedBlock,
+        chain::{
+            Name,
+            crypto::PrivateKey,
+            producer_schedule::{
+                ProducerKey,
+                ProducerSchedule,
+            },
+        },
     };
 
     #[test]

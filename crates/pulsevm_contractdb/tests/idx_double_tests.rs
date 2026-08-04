@@ -70,7 +70,10 @@ fn negative_and_positive_zero_are_the_same_key() {
     let mut primary = 0u64;
     let it = db.db_idx_double_find_secondary(CODE, SCOPE, TABLE, -0.0, &mut primary);
     assert!(it >= 0);
-    assert_eq!(primary, 1, "+0.0 and -0.0 collapse to one key, lowest primary");
+    assert_eq!(
+        primary, 1,
+        "+0.0 and -0.0 collapse to one key, lowest primary"
+    );
 
     // Both rows sit adjacent with equal secondary; primary orders them.
     assert_eq!(traversal(&mut db), vec![1, 2]);

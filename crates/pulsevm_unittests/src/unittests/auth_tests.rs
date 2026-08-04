@@ -4,16 +4,36 @@ mod auth_tests {
 
     use anyhow::Result;
     use pulsevm_core::{
-        ACTIVE_NAME, ChainError, OWNER_NAME, PULSE_NAME,
-        authority::{Authority, KeyWeight, PermissionLevel, PermissionLevelWeight},
+        ACTIVE_NAME,
+        ChainError,
+        OWNER_NAME,
+        PULSE_NAME,
+        authority::{
+            Authority,
+            KeyWeight,
+            PermissionLevel,
+            PermissionLevelWeight,
+        },
         authorization_manager::AuthorizationManager,
-        crypto::{PrivateKey, PublicKey},
+        crypto::{
+            PrivateKey,
+            PublicKey,
+        },
         name::Name,
-        transaction::{Action, SignedTransaction, Transaction, TransactionTrace},
+        transaction::{
+            Action,
+            SignedTransaction,
+            Transaction,
+            TransactionTrace,
+        },
     };
     use pulsevm_serialization::Write;
 
-    use crate::tests::{DEFAULT_EXPIRATION_DELTA, Testing, get_private_key};
+    use crate::tests::{
+        DEFAULT_EXPIRATION_DELTA,
+        Testing,
+        get_private_key,
+    };
     use pulsevm_name_macro::name;
 
     /// Guards the DB read-API soundness fix. `get_permission` now returns a
@@ -52,8 +72,7 @@ mod auth_tests {
         // The reference is confined to this read scope and dropped at its end.
         let auth_before = {
             let r = db.read()?;
-            let perm =
-                AuthorizationManager::get_permission(&r, alice.as_u64(), name!("spending"))?;
+            let perm = AuthorizationManager::get_permission(&r, alice.as_u64(), name!("spending"))?;
             perm.get_authority().to_authority()
         };
 
@@ -67,8 +86,7 @@ mod auth_tests {
 
         let auth_after = {
             let r = db.read()?;
-            let perm =
-                AuthorizationManager::get_permission(&r, alice.as_u64(), name!("spending"))?;
+            let perm = AuthorizationManager::get_permission(&r, alice.as_u64(), name!("spending"))?;
             perm.get_authority().to_authority()
         };
 
@@ -114,8 +132,14 @@ mod auth_tests {
         push_multi_reqauth(
             &mut chain,
             vec![
-                (alice, PermissionLevel::new(alice.as_u64(), ACTIVE_NAME.as_u64())),
-                (bob, PermissionLevel::new(bob.as_u64(), ACTIVE_NAME.as_u64())),
+                (
+                    alice,
+                    PermissionLevel::new(alice.as_u64(), ACTIVE_NAME.as_u64()),
+                ),
+                (
+                    bob,
+                    PermissionLevel::new(bob.as_u64(), ACTIVE_NAME.as_u64()),
+                ),
             ],
             vec![
                 get_private_key(alice, "active"),
@@ -138,8 +162,14 @@ mod auth_tests {
             push_multi_reqauth(
                 &mut chain,
                 vec![
-                    (alice, PermissionLevel::new(alice.as_u64(), ACTIVE_NAME.as_u64())),
-                    (bob, PermissionLevel::new(bob.as_u64(), ACTIVE_NAME.as_u64())),
+                    (
+                        alice,
+                        PermissionLevel::new(alice.as_u64(), ACTIVE_NAME.as_u64())
+                    ),
+                    (
+                        bob,
+                        PermissionLevel::new(bob.as_u64(), ACTIVE_NAME.as_u64())
+                    ),
                 ],
                 vec![
                     get_private_key(alice, "active"),
@@ -190,7 +220,10 @@ mod auth_tests {
             ACTIVE_NAME.into(),
             Authority::new(
                 2,
-                bob_keys.iter().map(|k| KeyWeight::new(k.inner(), 1)).collect(),
+                bob_keys
+                    .iter()
+                    .map(|k| KeyWeight::new(k.inner(), 1))
+                    .collect(),
                 vec![],
                 vec![],
             ),
@@ -199,10 +232,7 @@ mod auth_tests {
 
         // alice@active = threshold 2, keys[K1], accounts[bob@active, carol@active]
         let mut alice_accounts = vec![
-            PermissionLevelWeight::new(
-                PermissionLevel::new(bob.as_u64(), ACTIVE_NAME.as_u64()),
-                1,
-            ),
+            PermissionLevelWeight::new(PermissionLevel::new(bob.as_u64(), ACTIVE_NAME.as_u64()), 1),
             PermissionLevelWeight::new(
                 PermissionLevel::new(carol.as_u64(), ACTIVE_NAME.as_u64()),
                 1,
@@ -305,9 +335,7 @@ mod auth_tests {
                     vec![get_private_key(name!("bob").into(), "active")],
                 )
                 .err(),
-            Some(ChainError::ApplyError(
-                "missing authority of alice".into()
-            ))
+            Some(ChainError::ApplyError("missing authority of alice".into()))
         );
         Ok(())
     }
@@ -611,7 +639,8 @@ mod auth_tests {
             ))
         );
 
-        // Update trading parent to be spending, should fail since changing parent authority is not supported
+        // Update trading parent to be spending, should fail since changing parent authority is not
+        // supported
         assert_eq!(
             chain
                 .set_authority(
@@ -810,7 +839,8 @@ mod auth_tests {
             )],
             vec![scud_priv_key.clone()],
         )?;
-        // req auth action with alice's spending key should also be fine, since it is the parent of alice's scud key
+        // req auth action with alice's spending key should also be fine, since it is the parent of
+        // alice's scud key
         chain.push_reqauth2(
             name!("alice").into(),
             vec![PermissionLevel::new(
@@ -928,10 +958,7 @@ mod auth_tests {
 
         // alice@active = threshold 1, accounts[bob@active, carol@active].
         let mut alice_accounts = vec![
-            PermissionLevelWeight::new(
-                PermissionLevel::new(bob.as_u64(), ACTIVE_NAME.as_u64()),
-                1,
-            ),
+            PermissionLevelWeight::new(PermissionLevel::new(bob.as_u64(), ACTIVE_NAME.as_u64()), 1),
             PermissionLevelWeight::new(
                 PermissionLevel::new(carol.as_u64(), ACTIVE_NAME.as_u64()),
                 1,
