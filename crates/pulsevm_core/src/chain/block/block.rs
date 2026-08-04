@@ -40,9 +40,10 @@ pub struct BlockHeader {
     pub transaction_mroot: Digest,
     pub action_mroot: Digest,
     pub schedule_version: u32,
-    pub new_producers: Option<Vec<u8>>, // Placeholder for new producers, we don't use this for now
-    pub header_extensions: Vec<(u16, Vec<u8>)>, /* Placeholder for header extensions, we don't
-                                                 * use this for now */
+    // Placeholder for new producers, we don't use this for now
+    pub new_producers: Option<Vec<u8>>,
+    // Placeholder for header extensions, we don't use this for now
+    pub header_extensions: Vec<(u16, Vec<u8>)>,
 }
 
 impl BlockHeader {
@@ -159,10 +160,10 @@ impl SignedBlockHeader {
 #[derive(Debug, Default, Clone, Read, Write, NumBytes)]
 pub struct SignedBlock {
     pub signed_block_header: SignedBlockHeader,
-    pub transactions: VecDeque<TransactionReceipt>, /* Placeholder for transactions, we don't
-                                                     * use this for now */
-    pub block_extensions: Vec<(u16, Vec<u8>)>, /* Placeholder for header extensions, we don't
-                                                * use this for now */
+    // Placeholder for transactions, we don't use this for now
+    pub transactions: VecDeque<TransactionReceipt>,
+    // Placeholder for header extensions, we don't use this for now
+    pub block_extensions: Vec<(u16, Vec<u8>)>,
 }
 
 impl SignedBlock {
