@@ -6,18 +6,13 @@ use pulsevm_serialization::{Read, VarUint32};
 use wasmer::{FunctionEnvMut, RuntimeError, WasmPtr};
 
 use crate::chain::{
-    apply_context::ApplyContext, producer_schedule::ProducerKey,
-    resource_limits::ResourceLimitsManager, utils::pulse_assert, wasm_runtime::WasmContext,
+    apply_context::ApplyContext,
+    producer_schedule::{MAX_PRODUCERS, MAX_SCHEDULE_BYTES, ProducerKey},
+    resource_limits::ResourceLimitsManager,
+    utils::pulse_assert,
+    wasm_runtime::WasmContext,
     webassembly::context_aware_check,
 };
-
-// Matches EOSIO's producer ceiling. Bounds the schedule so a caller can't blow
-// up memory or the per-block work, and caps the buffer we read from wasm.
-const MAX_PRODUCERS: usize = 125;
-// A producer_key packs to a Name (8) plus a public key (34). Cap the input a
-// little above the largest legal schedule so an oversized `data_len` can't drive
-// a large host allocation before we even parse.
-const MAX_SCHEDULE_BYTES: u32 = (MAX_PRODUCERS as u32 + 1) * 64;
 
 fn privileged_check(context: &ApplyContext) -> Result<(), RuntimeError> {
     if !context.is_privileged()? {
