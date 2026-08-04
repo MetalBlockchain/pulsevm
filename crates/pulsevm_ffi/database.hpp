@@ -783,7 +783,11 @@ public:
         return false;
     }
 
+    // Internal helper: the object reference stays on the C++ side. Callers from
+    // Rust go through modify_permission_by_actor_and_permission below so the
+    // reference never crosses the boundary.
     void modify_permission( const permission_object& permission, const Authority& a, const TimePoint& pending_block_time );
+    bool modify_permission_by_actor_and_permission( uint64_t actor, uint64_t permission, const Authority& a, const TimePoint& pending_block_time );
     void update_permission_usage( const permission_object& permission, const TimePoint& pending_block_time );
     TimePoint get_permission_last_used( const permission_object& permission ) const;
 

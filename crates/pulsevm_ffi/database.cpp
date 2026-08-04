@@ -287,6 +287,17 @@ void database_wrapper::modify_permission( const permission_object& permission, c
     });
 }
 
+bool database_wrapper::modify_permission_by_actor_and_permission( uint64_t actor, uint64_t permission, const Authority& a, const TimePoint& pending_block_time ) {
+    const permission_object* po = find_permission_by_actor_and_permission( actor, permission );
+    if( po == nullptr ) {
+        return false;
+    }
+    // po and the modify both stay inside C++, so no database-owned reference is
+    // ever exposed to Rust across the mutation.
+    modify_permission( *po, a, pending_block_time );
+    return true;
+}
+
 void database_wrapper::update_permission_usage( const permission_object& permission, const TimePoint& pending_block_time ) {
     const auto& puo = this->get<permission_usage_object, by_id>( permission.usage_id );
     this->modify( puo, [&](permission_usage_object& p) {
