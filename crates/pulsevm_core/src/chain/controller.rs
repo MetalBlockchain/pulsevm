@@ -11,6 +11,9 @@ use std::{
 
 use crate::{
     ACTIVE_NAME,
+    MAJORITY_PRODUCERS_PERMISSION_NAME,
+    MINORITY_PRODUCERS_PERMISSION_NAME,
+    PRODS_NAME,
     PULSE_NAME,
     block::{
         BlockStatus,
@@ -83,11 +86,13 @@ use pulsevm_crypto::{
 };
 use pulsevm_error::ChainError;
 use pulsevm_ffi::{
+    Authority,
     BlockTimestamp,
     CxxGenesisState,
     Database,
     ElasticLimitParameters,
     GlobalPropertyObject,
+    PermissionLevelWeight,
     TimePoint,
     UndoSession,
     parse_public_key,
@@ -948,6 +953,9 @@ impl Controller {
         if let Some(schedule) = block.signed_block_header.header.new_schedule()? {
             info!("activated producer schedule version {}", schedule.version);
             self.active_schedule = schedule;
+
+            // Update the producer authority in the database to reflect the new schedule.
+            self.update_producers_authority(block.timestamp())?;
         }
 
         // Accept boundary: commit the arena mirror in lockstep and surface its
@@ -1579,6 +1587,62 @@ impl Controller {
 
     pub fn get_greylist_limit() -> Result<u32, ChainError> {
         Ok(1000) // TODO: Implement greylist limit
+    }
+
+    fn update_producers_authority(
+        &mut self,
+        pending_block_time: &BlockTimestamp,
+    ) -> Result<(), ChainError> {
+        let producers = &self.active_schedule.producers;
+        let num_producers = producers.len() as u32;
+
+        let update_permission = |db: &mut Database,
+                                 actor: Name,
+                                 permission: Name,
+                                 threshold: u32|
+         -> Result<(), ChainError> {
+            let mut auth = Authority::new(threshold, vec![], vec![], vec![]);
+
+            for producer in producers {
+                auth.accounts.push(PermissionLevelWeight::new(
+                    PermissionLevel::new(producer.producer_name.into(), ACTIVE_NAME.into()),
+                    1,
+                ));
+            }
+
+            db.modify_permission(
+                actor.into(),
+                permission.into(),
+                &auth,
+                &pending_block_time.to_time_point(),
+            )?;
+
+            Ok(())
+        };
+        let calculate_threshold = |numerator: u32, denominator: u32| -> u32 {
+            (num_producers * numerator) / denominator + 1
+        };
+
+        update_permission(
+            &mut self.db,
+            PRODS_NAME,
+            ACTIVE_NAME,
+            calculate_threshold(2, 3), // more than 2/3 of producers must sign
+        )?;
+        update_permission(
+            &mut self.db,
+            PRODS_NAME,
+            MAJORITY_PRODUCERS_PERMISSION_NAME,
+            calculate_threshold(1, 2), // more than 1/2 of producers must sign
+        )?;
+        update_permission(
+            &mut self.db,
+            PRODS_NAME,
+            MINORITY_PRODUCERS_PERMISSION_NAME,
+            calculate_threshold(1, 3), // more than 1/3 of producers must sign
+        )?;
+
+        Ok(())
     }
 }
 
@@ -5826,6 +5890,64 @@ mod tests {
             reopened.active_schedule, new_schedule,
             "schedule must be reconstructed from the block log header, not a side file"
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn schedule_change_updates_producers_authority() -> Result<(), ChainError> {
+        // When a new producer schedule takes effect, the pulse.prods permissions
+        // must be rewritten to require >2/3 (active), >1/2 (prod.major) and >1/3
+        // (prod.minor) of the scheduled producers, each counted through their
+        // active permission — so producer-gated authority follows the schedule
+        // instead of staying delegated to the genesis producer.
+        let (mut controller, _private_key, _chain_id, _temp) = init_test_controller()?;
+
+        let producers: Vec<ProducerKey> = ["alice", "bob", "carol", "dave", "erin"]
+            .iter()
+            .map(|producer| {
+                Ok(ProducerKey {
+                    producer_name: Name::from_str(producer)?,
+                    block_signing_key: PrivateKey::random().get_public_key(),
+                })
+            })
+            .collect::<Result<_, ChainError>>()?;
+        let expected_accounts: Vec<PermissionLevelWeight> = producers
+            .iter()
+            .map(|producer| {
+                PermissionLevelWeight::new(
+                    PermissionLevel::new(producer.producer_name.into(), ACTIVE_NAME.into()),
+                    1,
+                )
+            })
+            .collect();
+
+        controller.activate_producer_schedule(producers)?;
+        let timestamp = *controller.last_accepted_block.timestamp();
+        controller.update_producers_authority(&timestamp)?;
+
+        // With 5 producers the thresholds are all distinct: more than 2/3 → 4,
+        // more than 1/2 → 3, more than 1/3 → 2.
+        let expectations = [
+            (ACTIVE_NAME, 4u32),
+            (MAJORITY_PRODUCERS_PERMISSION_NAME, 3u32),
+            (MINORITY_PRODUCERS_PERMISSION_NAME, 2u32),
+        ];
+        let db = controller.db.read()?;
+        for (permission_name, threshold) in expectations {
+            let permission = AuthorizationManager::get_permission(
+                &db,
+                PRODS_NAME.into(),
+                permission_name.into(),
+            )?;
+            assert_eq!(
+                permission.get_authority().to_authority(),
+                Authority::new(threshold, vec![], expected_accounts.clone(), vec![]),
+                "pulse.prods@{} must require {} of the 5 scheduled producers",
+                permission_name,
+                threshold
+            );
+        }
 
         Ok(())
     }
