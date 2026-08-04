@@ -29,6 +29,12 @@ use crate::chain::{
 /// multi-MB snapshot.
 pub const SNAPSHOT_CHUNK_LEN: u32 = 256 * 1024;
 
+/// Hard ceiling on an advertised snapshot length. A summary names the payload
+/// size a syncing node will download; this refuses an absurd value up front so a
+/// misbehaving or corrupt peer can't point us at a multi-terabyte "snapshot".
+/// Well above any real arena (the default mmap DB is 20 GiB).
+pub const MAX_SNAPSHOT_LEN: u64 = 64 * 1024 * 1024 * 1024;
+
 /// What a syncing node learned from a state summary and now has to fetch: the
 /// tip block and schedule to adopt, and the length and hash of the snapshot
 /// payload to download and verify.
@@ -102,10 +108,22 @@ where
     F: FnMut(u64, u32) -> Fut,
     Fut: std::future::Future<Output = Result<Vec<u8>, ChainError>>,
 {
-    let mut buf: Vec<u8> = Vec::with_capacity(target.total_len as usize);
+    if target.total_len > MAX_SNAPSHOT_LEN {
+        return Err(ChainError::InternalError(format!(
+            "snapshot length {} exceeds the maximum of {} bytes",
+            target.total_len, MAX_SNAPSHOT_LEN
+        )));
+    }
+    // Grow as bytes arrive rather than reserving the advertised size up front: a
+    // peer only costs us the memory it actually delivers, and the length is
+    // already bounded above.
+    let mut buf: Vec<u8> = Vec::new();
     while (buf.len() as u64) < target.total_len {
         let offset = buf.len() as u64;
-        let len = SNAPSHOT_CHUNK_LEN.min((target.total_len - offset) as u32);
+        // Compute the remaining length in u64 and clamp before narrowing: a plain
+        // `(total_len - offset) as u32` truncates, and lands on exactly 0 when the
+        // remainder is a multiple of 2^32, which would stall the loop forever.
+        let len = (SNAPSHOT_CHUNK_LEN as u64).min(target.total_len - offset) as u32;
         let data = fetch(offset, len).await?;
         if data.len() != len as usize {
             return Err(ChainError::InternalError(format!(
@@ -242,6 +260,26 @@ mod tests {
         let r = download_snapshot(&target, |off, len| {
             let src = src.clone();
             async move { Ok(src[off as usize..off as usize + len as usize].to_vec()) }
+        })
+        .await;
+        assert!(r.is_err());
+    }
+
+    #[tokio::test]
+    async fn download_rejects_oversized_total_len() {
+        // An absurd advertised length is refused up front, before any fetch, so
+        // it can never drive a huge allocation.
+        let target = SyncTarget {
+            height: 1,
+            hash: [0u8; 32],
+            total_len: MAX_SNAPSHOT_LEN + 1,
+            block: SignedBlock::default(),
+            schedule: ProducerSchedule::default(),
+        };
+        let r = download_snapshot(&target, |_off, _len| async {
+            panic!("fetch must not be called for an oversized snapshot");
+            #[allow(unreachable_code)]
+            Ok(Vec::new())
         })
         .await;
         assert!(r.is_err());

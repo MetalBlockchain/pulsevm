@@ -1505,6 +1505,20 @@ impl Controller {
         self.clear_pending()?;
         self.verified_blocks.clear();
 
+        // The chainbase revision advances one per accepted block, so the
+        // snapshot's revision must equal the summary block's height. Check it
+        // from the header first: a mismatch means the summary paired a block with
+        // a snapshot of different state, and we reject it before the swap rather
+        // than half-adopt an inconsistent tip.
+        let header = pulsevm_ffi::peek_snapshot_header(envelope)?;
+        if header.revision as u64 != block.block_num() as u64 {
+            return Err(ChainError::InternalError(format!(
+                "snapshot revision {} does not match summary block height {}",
+                header.revision,
+                block.block_num()
+            )));
+        }
+
         // Swap chainbase to the snapshot's state; its revision becomes the
         // snapshot height.
         self.db.restore_from_bytes(envelope)?;
