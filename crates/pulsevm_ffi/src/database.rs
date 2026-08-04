@@ -1,4 +1,5 @@
-use std::sync::{Arc, RwLock};
+use std::pin::Pin;
+use std::sync::{Arc, RwLock, RwLockWriteGuard};
 
 use cxx::UniquePtr;
 use pulsevm_error::ChainError;
@@ -3244,6 +3245,40 @@ impl Database {
         Ok(res)
     }
 
+    /// Null-checked `Pin<&mut ffi::Database>` from a write guard. `UniquePtr::pin_mut`
+    /// panics on a null pointer; `as_mut` lets us return an error instead.
+    fn db_mut<'a>(
+        guard: &'a mut RwLockWriteGuard<'_, UniquePtr<ffi::Database>>,
+    ) -> Result<Pin<&'a mut ffi::Database>, ChainError> {
+        guard
+            .as_mut()
+            .ok_or_else(|| ChainError::InternalError("Database pointer is null".to_owned()))
+    }
+
+    /// A permission's authority as an owned value, or `None` if it doesn't exist.
+    ///
+    /// Handing back an owned `Authority` rather than a database-bound reference is
+    /// what lets a caller read a permission, drop the read lock, edit the
+    /// authority, and write it back with [`Database::modify_permission`] — no
+    /// reference held across the mutation and no lock held while editing, so a
+    /// read-modify-write on one permission never has to nest a read inside a
+    /// write.
+    pub fn permission_authority(
+        &self,
+        actor: u64,
+        permission: u64,
+    ) -> Result<Option<Authority>, ChainError> {
+        let guard = self.inner.read()?;
+        let perm = guard
+            .find_permission_by_actor_and_permission(actor, permission)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        // The pointer is only dereferenced while the read guard is alive, and the
+        // authority is copied out before it is dropped.
+        let authority =
+            unsafe { perm.as_ref() }.map(|p| ffi::get_authority_from_shared_authority(p.get_authority()));
+        Ok(authority)
+    }
+
     pub fn modify_permission(
         &mut self,
         actor: u64,
@@ -3253,24 +3288,22 @@ impl Database {
     ) -> Result<(), ChainError> {
         {
             let mut guard = self.inner.write()?;
-            // Resolve and modify under one write guard; the resolved pointer never
-            // escapes this method, so no shared reference is held across the mutation.
-            let perm = guard
-                .find_permission_by_actor_and_permission(actor, permission)
-                .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
-            if perm.is_null() {
-                return Err(ChainError::InternalError(format!(
-                    "permission not found for actor: {} permission: {}",
-                    Name::new(actor),
-                    Name::new(permission)
-                )));
+            // Lookup and mutation both happen inside C++, so no database-owned
+            // PermissionObject reference is held across the write.
+            let modified = Self::db_mut(&mut guard)?
+                .modify_permission_by_actor_and_permission(
+                    actor,
+                    permission,
+                    authority,
+                    pending_block_time,
+                )
+                .map_err(|e| ChainError::InternalError(e.to_string()))?;
+            if !modified {
+                return Err(ChainError::PermissionNotFound(
+                    Name::new(actor).to_string(),
+                    Name::new(permission).to_string(),
+                ));
             }
-            let perm = unsafe { &*perm };
-            let pinned = guard.pin_mut();
-
-            pinned
-                .modify_permission(perm, authority, pending_block_time)
-                .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
         }
         #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow {

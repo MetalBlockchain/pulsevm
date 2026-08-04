@@ -912,12 +912,17 @@ pub mod ffi {
             permission: &PermissionObject,
             required_permission: &PermissionObject,
         ) -> Result<bool>;
-        pub fn modify_permission(
+        // Look up the permission by (actor, permission) and modify it in one C++
+        // call so no database-owned PermissionObject reference crosses the FFI
+        // boundary while the database is mutated. Returns false if no such
+        // permission exists.
+        pub fn modify_permission_by_actor_and_permission(
             self: Pin<&mut Database>,
-            permission: &PermissionObject,
+            actor: u64,
+            permission: u64,
             authority: &Authority,
             pending_block_time: &TimePoint,
-        ) -> Result<()>;
+        ) -> Result<bool>;
         pub fn update_permission_usage(
             self: Pin<&mut Database>,
             permission: &PermissionObject,
