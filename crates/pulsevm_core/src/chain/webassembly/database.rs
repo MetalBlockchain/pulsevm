@@ -1,3 +1,4 @@
+use pulsevm_error::ChainError;
 use pulsevm_ffi::{
     Float128,
     U256,
@@ -22,6 +23,39 @@ use crate::chain::{
         write_u256,
     },
 };
+
+// A NaN is never a valid idx_double / idx_long_double secondary key. chainbase
+// orders these with a raw f64_lt / f128_lt (soft_double_less in
+// contract_table_objects.hpp); NaN compares false both ways, so it breaks the
+// strict-weak ordering boost's multi_index needs — UB. The arena mirror orders
+// by total_cmp (shadow.rs), which does give NaN a slot, so the same key would
+// sort differently there and fork. The reference intrinsics reject it too, so we
+// match them here, at the one boundary every contract key crosses. store/update/
+// find_secondary/lowerbound/upperbound check it; find_primary doesn't (secondary
+// is an output). Message text matches the reference.
+const SECONDARY_KEY_NAN_MSG: &str = "NaN is not an allowed value for a secondary key";
+
+/// Reject a NaN 64-bit (`f64` / `idx_double`) secondary key.
+fn reject_nan_f64(secondary: u64) -> Result<(), RuntimeError> {
+    if f64::from_bits(secondary).is_nan() {
+        return Err(ChainError::TransactionError(SECONDARY_KEY_NAN_MSG.into()).into());
+    }
+    Ok(())
+}
+
+/// Reject a NaN 128-bit (`long double` / `idx_long_double`) secondary key. No
+/// native f128, so classify from the bits.
+fn reject_nan_f128(secondary: &Float128) -> Result<(), RuntimeError> {
+    // binary128 = sign(1) | exponent(15) | mantissa(112). NaN is exponent all
+    // ones with a non-zero mantissa: exponent is bits 48..=62 of the high word,
+    // mantissa is the low 48 bits of hi plus all of lo.
+    let exponent = (secondary.hi >> 48) & 0x7FFF;
+    let mantissa_nonzero = (secondary.hi & 0x0000_FFFF_FFFF_FFFF) != 0 || secondary.lo != 0;
+    if exponent == 0x7FFF && mantissa_nonzero {
+        return Err(ChainError::TransactionError(SECONDARY_KEY_NAN_MSG.into()).into());
+    }
+    Ok(())
+}
 
 pub fn db_find_i64(
     mut env: FunctionEnvMut<WasmContext>,
@@ -993,6 +1027,7 @@ pub fn db_idx_double_store(
         .expect("Wasm memory not initialized");
     let view = memory.view(&store);
     let secondary: u64 = read_u64(&view, secondary_ptr)?;
+    reject_nan_f64(secondary)?;
     let context = env_data.apply_context_mut();
     let result = context.db_idx_double_store(scope, table, payer, id, secondary)?;
     Ok(result)
@@ -1012,6 +1047,7 @@ pub fn db_idx_double_update(
         .expect("Wasm memory not initialized");
     let view = memory.view(&store);
     let secondary: u64 = read_u64(&view, secondary_ptr)?;
+    reject_nan_f64(secondary)?;
 
     let context = env_data.apply_context_mut();
     context.db_idx_double_update(itr, &payer.into(), secondary)?;
@@ -1049,6 +1085,7 @@ pub fn db_idx_double_find_secondary(
     // Read input from Wasm memory
     let view = memory.view(&store);
     let secondary: u64 = read_u64(&view, secondary_ptr)?;
+    reject_nan_f64(secondary)?;
 
     // Now safe to borrow env_data mutably
     let mut primary: u64 = read_u64(&view, primary_ptr)?;
@@ -1125,6 +1162,7 @@ pub fn db_idx_double_lowerbound(
     let view = memory.view(&store);
     let mut primary: u64 = read_u64(&view, primary_ptr)?;
     let mut secondary: u64 = read_u64(&view, secondary_ptr)?;
+    reject_nan_f64(secondary)?;
 
     // Now safe to borrow env_data mutably
     let context = env_data.apply_context_mut();
@@ -1165,6 +1203,7 @@ pub fn db_idx_double_upperbound(
     let view = memory.view(&store);
     let mut primary: u64 = read_u64(&view, primary_ptr)?;
     let mut secondary: u64 = read_u64(&view, secondary_ptr)?;
+    reject_nan_f64(secondary)?;
 
     // Now safe to borrow env_data mutably
     let context = env_data.apply_context_mut();
@@ -1250,6 +1289,7 @@ pub fn db_idx_long_double_store(
         .expect("Wasm memory not initialized");
     let view = memory.view(&store);
     let secondary: Float128 = read_float128(&view, secondary_ptr)?;
+    reject_nan_f128(&secondary)?;
     let context = env_data.apply_context_mut();
     let result = context.db_idx_long_double_store(scope, table, payer, id, secondary)?;
     Ok(result)
@@ -1269,6 +1309,7 @@ pub fn db_idx_long_double_update(
         .expect("Wasm memory not initialized");
     let view = memory.view(&store);
     let secondary: Float128 = read_float128(&view, secondary_ptr)?;
+    reject_nan_f128(&secondary)?;
 
     let context = env_data.apply_context_mut();
     context.db_idx_long_double_update(itr, &payer.into(), secondary)?;
@@ -1306,6 +1347,7 @@ pub fn db_idx_long_double_find_secondary(
     // Read input from Wasm memory
     let view = memory.view(&store);
     let secondary: Float128 = read_float128(&view, secondary_ptr)?;
+    reject_nan_f128(&secondary)?;
 
     // Now safe to borrow env_data mutably
     let mut primary: u64 = read_u64(&view, primary_ptr)?;
@@ -1382,6 +1424,7 @@ pub fn db_idx_long_double_lowerbound(
     let view = memory.view(&store);
     let mut primary: u64 = read_u64(&view, primary_ptr)?;
     let mut secondary: Float128 = read_float128(&view, secondary_ptr)?;
+    reject_nan_f128(&secondary)?;
 
     // Now safe to borrow env_data mutably
     let context = env_data.apply_context_mut();
@@ -1422,6 +1465,7 @@ pub fn db_idx_long_double_upperbound(
     let view = memory.view(&store);
     let mut primary: u64 = read_u64(&view, primary_ptr)?;
     let mut secondary: Float128 = read_float128(&view, secondary_ptr)?;
+    reject_nan_f128(&secondary)?;
 
     // Now safe to borrow env_data mutably
     let context = env_data.apply_context_mut();
@@ -1489,4 +1533,56 @@ pub fn db_idx_long_double_previous(
     write_u64(&view, primary_ptr, next_primary)?;
 
     Ok(res)
+}
+
+#[cfg(test)]
+mod tests {
+    use pulsevm_ffi::Float128;
+
+    use super::{
+        reject_nan_f64,
+        reject_nan_f128,
+    };
+
+    #[test]
+    fn f64_secondary_rejects_nan_only() {
+        // NaN bit patterns are rejected.
+        assert!(reject_nan_f64(f64::NAN.to_bits()).is_err());
+        assert!(reject_nan_f64(0x7FF0_0000_0000_0001).is_err()); // signaling NaN
+        assert!(reject_nan_f64(0xFFF8_0000_0000_0000).is_err()); // negative quiet NaN
+
+        // Everything else is allowed, including both infinities and both zeros.
+        for v in [
+            0.0_f64,
+            -0.0,
+            1.5,
+            -1.5,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MAX,
+            f64::MIN_POSITIVE,
+        ] {
+            assert!(reject_nan_f64(v.to_bits()).is_ok(), "{v} must be allowed");
+        }
+    }
+
+    fn f128(lo: u64, hi: u64) -> Float128 {
+        Float128 { lo, hi }
+    }
+
+    #[test]
+    fn f128_secondary_rejects_nan_only() {
+        // Exponent all ones + non-zero mantissa = NaN (rejected).
+        assert!(reject_nan_f128(&f128(0, 0x7FFF_8000_0000_0000)).is_err()); // quiet NaN
+        assert!(reject_nan_f128(&f128(1, 0x7FFF_0000_0000_0000)).is_err()); // mantissa in low word
+        assert!(reject_nan_f128(&f128(0, 0xFFFF_0000_0000_0001)).is_err()); // negative NaN
+
+        // Infinities (exponent all ones, mantissa zero) are NOT NaN — allowed.
+        assert!(reject_nan_f128(&f128(0, 0x7FFF_0000_0000_0000)).is_ok());
+        assert!(reject_nan_f128(&f128(0, 0xFFFF_0000_0000_0000)).is_ok());
+
+        // Zero and an ordinary finite value.
+        assert!(reject_nan_f128(&f128(0, 0)).is_ok());
+        assert!(reject_nan_f128(&f128(0, 0x3FFF_0000_0000_0000)).is_ok());
+    }
 }

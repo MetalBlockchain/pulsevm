@@ -4872,6 +4872,223 @@ mod tests {
         Ok(())
     }
 
+    // Same action, same start state, byte-identical result. `pg` is a test_api
+    // routine that stores, iterates and reads a table with its own asserts, so a
+    // divergence in the db host fns traps outright; we also compare receipts. The
+    // two runs use separate databases but share the thread-local warm-store pool
+    // and module cache, so this also checks a stale pooled store doesn't leak into
+    // the next run.
+    #[tokio::test]
+    async fn contract_execution_is_reproducible() -> Result<(), ChainError> {
+        async fn run_pg() -> Result<VecDeque<Digest>, ChainError> {
+            let (mut controller, private_key, _cid, _temp) = init_test_controller()?;
+            let ts = controller.last_accepted_block().timestamp().clone();
+            let chain_id = controller.chain_id().clone();
+            let st = BlockStatus::Building;
+            controller.execute_transaction(
+                &create_account(&private_key, Name::from_str("testapi")?, chain_id)?,
+                &ts,
+                &st,
+            )?;
+            let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap();
+            let contract =
+                fs::read(root.join(Path::new("reference_contracts/test_api_db.wasm"))).unwrap();
+            controller.execute_transaction(
+                &set_code(&private_key, Name::from_str("testapi")?, contract, chain_id)?,
+                &ts,
+                &st,
+            )?;
+            let res = controller.execute_transaction(
+                &call_contract(
+                    &private_key,
+                    Name::from_str("testapi")?,
+                    Name::from_str("pg")?,
+                    &Vec::<u8>::new(),
+                    chain_id,
+                )?,
+                &ts,
+                &st,
+            )?;
+            Ok(res.action_receipt_digests)
+        }
+
+        let first = run_pg().await?;
+        let second = run_pg().await?;
+        assert_eq!(
+            first, second,
+            "identical execution must produce identical action receipts"
+        );
+
+        // first == second only proves same-machine reproducibility. CI runs this
+        // on amd64 and arm64 (test.yml), and both check the constant below, so
+        // matching it on each arch is the cross-arch gate for a full contract run.
+        // A deliberate change to pg or the receipt moves it — recompute and commit.
+        const PG_RECEIPT_GOLDEN: &str =
+            "74087ef5d3c7a33f952046415b2cefa57a84ddafc406b9f5f3e06984bbf9fd27";
+        let got: String = first
+            .iter()
+            .flat_map(|d| d.as_bytes().iter().map(|b| format!("{b:02x}")))
+            .collect();
+        assert_eq!(
+            got, PG_RECEIPT_GOLDEN,
+            "pg action-receipt digest drifted from the committed golden"
+        );
+
+        Ok(())
+    }
+
+    // The reject_nan_* tests pin the classifier; this pins the wiring — that
+    // every idx_double / idx_long_double intrinsic taking a key from a contract
+    // actually calls it. Each case is a tiny contract whose apply writes a NaN and
+    // calls one intrinsic; the guard runs before any table work, so it traps on an
+    // empty table and the transaction fails with the secondary-key message. Drop
+    // the guard from one site and that case stops trapping.
+    #[tokio::test]
+    async fn nan_secondary_key_rejected_through_host_boundary() -> Result<(), ChainError> {
+        // Minimal contract: import one host fn, export memory + apply, write a NaN
+        // and call the fn. apply's three params are ignored — any action reaches it.
+        fn contract(nan_writer: &str, import: &str, sig: &str, call: &str) -> Vec<u8> {
+            let wat = format!(
+                r#"
+                (module
+                  (import "env" "{import}" (func $f {sig}))
+                  (memory (export "memory") 1)
+                  (func (export "apply") (param i64 i64 i64)
+                    {nan_writer}
+                    {call}))
+                "#
+            );
+            wat::parse_str(wat).unwrap()
+        }
+
+        // f64: one word. binary128: lo=0, hi = exponent-all-ones + mantissa MSB,
+        // little-endian (lo at 0, hi at 8 — matches read_float128).
+        let nan_f64 = "(i64.store (i32.const 0) (i64.const 0x7ff8000000000000))";
+        let nan_f128 = "(i64.store (i32.const 0) (i64.const 0))\n\
+                        (i64.store (i32.const 8) (i64.const 0x7fff800000000000))";
+
+        // (label, import, signature, call). The secondary key is always at ptr 0
+        // (where the NaN was written); other pointers/ids/iterators are dummies
+        // the guard never reaches. `update` returns nothing; the rest return i32.
+        let store_sig = "(param i64 i64 i64 i64 i32) (result i32)";
+        let store_call = "(drop (call $f (i64.const 0) (i64.const 0) (i64.const 0) (i64.const 0) (i32.const 0)))";
+        let update_sig = "(param i32 i64 i32)";
+        let update_call = "(call $f (i32.const 0) (i64.const 0) (i32.const 0))";
+        let bound_sig = "(param i64 i64 i64 i32 i32) (result i32)";
+        let bound_call = "(drop (call $f (i64.const 0) (i64.const 0) (i64.const 0) (i32.const 0) (i32.const 16)))";
+
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            (
+                "db_idx_double_store",
+                contract(nan_f64, "db_idx_double_store", store_sig, store_call),
+            ),
+            (
+                "db_idx_double_update",
+                contract(nan_f64, "db_idx_double_update", update_sig, update_call),
+            ),
+            (
+                "db_idx_double_find_secondary",
+                contract(
+                    nan_f64,
+                    "db_idx_double_find_secondary",
+                    bound_sig,
+                    bound_call,
+                ),
+            ),
+            (
+                "db_idx_double_lowerbound",
+                contract(nan_f64, "db_idx_double_lowerbound", bound_sig, bound_call),
+            ),
+            (
+                "db_idx_double_upperbound",
+                contract(nan_f64, "db_idx_double_upperbound", bound_sig, bound_call),
+            ),
+            (
+                "db_idx_long_double_store",
+                contract(nan_f128, "db_idx_long_double_store", store_sig, store_call),
+            ),
+            (
+                "db_idx_long_double_update",
+                contract(
+                    nan_f128,
+                    "db_idx_long_double_update",
+                    update_sig,
+                    update_call,
+                ),
+            ),
+            (
+                "db_idx_long_double_find_secondary",
+                contract(
+                    nan_f128,
+                    "db_idx_long_double_find_secondary",
+                    bound_sig,
+                    bound_call,
+                ),
+            ),
+            (
+                "db_idx_long_double_lowerbound",
+                contract(
+                    nan_f128,
+                    "db_idx_long_double_lowerbound",
+                    bound_sig,
+                    bound_call,
+                ),
+            ),
+            (
+                "db_idx_long_double_upperbound",
+                contract(
+                    nan_f128,
+                    "db_idx_long_double_upperbound",
+                    bound_sig,
+                    bound_call,
+                ),
+            ),
+        ];
+
+        for (label, wasm) in cases {
+            let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
+            let ts = controller.last_accepted_block().timestamp().clone();
+            let chain_id = controller.chain_id().clone();
+            let st = BlockStatus::Building;
+            controller.execute_transaction(
+                &create_account(&private_key, Name::from_str("testapi")?, chain_id)?,
+                &ts,
+                &st,
+            )?;
+            controller.execute_transaction(
+                &set_code(&private_key, Name::from_str("testapi")?, wasm, chain_id)?,
+                &ts,
+                &st,
+            )?;
+            let res = controller.execute_transaction(
+                &call_contract(
+                    &private_key,
+                    Name::from_str("testapi")?,
+                    Name::from_str("run")?,
+                    &Vec::<u8>::new(),
+                    chain_id,
+                )?,
+                &ts,
+                &st,
+            );
+            let err = match res {
+                Ok(_) => panic!("{label} must reject a NaN secondary key"),
+                Err(e) => e,
+            };
+            assert!(
+                err.to_string()
+                    .contains("not an allowed value for a secondary key"),
+                "{label} failed for the wrong reason: {err}"
+            );
+        }
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_api_db() -> Result<(), ChainError> {
         let (mut controller, private_key, _chain_id, _temp) = init_test_controller()?;
