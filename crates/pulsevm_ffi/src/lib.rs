@@ -4,6 +4,7 @@ mod iterator_cache;
 mod objects;
 #[cfg(feature = "arena-shadow")]
 mod shadow;
+mod snapshot;
 mod types;
 
 pub use crate::{
@@ -106,6 +107,7 @@ pub use crate::{
         Database,
         DbRead,
         DbWrite,
+        restore_snapshot,
     },
     iterator_cache::{
         Index64IteratorCache,
@@ -114,6 +116,11 @@ pub use crate::{
         IndexDoubleIteratorCache,
         IndexLongDoubleIteratorCache,
         KeyValueIteratorCache,
+    },
+    snapshot::{
+        SNAPSHOT_VERSION,
+        SnapshotHeader,
+        peek_header as peek_snapshot_header,
     },
 };
 pub use types::*;
