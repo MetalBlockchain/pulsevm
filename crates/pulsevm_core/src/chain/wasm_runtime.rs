@@ -25,7 +25,11 @@ use wasmer::{
     Module,
     Store,
     imports,
-    sys::CompilerConfig,
+    sys::{
+        CompilerConfig,
+        EngineBuilder,
+        Features,
+    },
     wasmparser::Operator,
 };
 use wasmer_compiler_llvm::{
@@ -371,17 +375,50 @@ const COST_FUNCTION: fn(&Operator) -> u64 = |operator: &Operator| -> u64 {
 
 impl WasmRuntime {
     pub fn new() -> Result<Self, ChainError> {
-        let mut compiler = LLVM::default();
-
-        // Deterministic floating point operations
-        LLVM::canonicalize_nans(&mut compiler, true);
-        LLVM::opt_level(&mut compiler, LLVMOptLevel::Aggressive);
-
         Ok(Self {
             inner: Arc::new(RwLock::new(InnerWasmRuntime {
                 code_cache: LruCache::new(NonZeroUsize::new(1024).unwrap()),
             })),
         })
+    }
+
+    // The wasm feature set we pin contract execution to. Left implicit,
+    // Features::default() turns threads and simd on and could gain more on a
+    // wasmer bump — a silent consensus change. threads and relaxed_simd are
+    // nondeterministic by spec; simd isn't in the contract ABI. reference_types,
+    // bulk_memory, multi_value and extended_const are deterministic and the
+    // toolchain emits them (clang uses reference-types call_indirect and
+    // memory.copy), so turning them off rejects real contracts. Changing this is
+    // a consensus change.
+    fn deterministic_features() -> Features {
+        Features {
+            threads: false,
+            simd: false,
+            relaxed_simd: false,
+            tail_call: false,
+            module_linking: false,
+            multi_memory: false,
+            memory64: false,
+            exceptions: false,
+            wide_arithmetic: false,
+            reference_types: true,
+            bulk_memory: true,
+            multi_value: true,
+            extended_const: true,
+        }
+    }
+
+    // The one LLVM engine every contract compiles and runs on, so build, verify
+    // and replay share the same config: NaN canonicalization, aggressive opt, the
+    // metering middleware (seeded so a start fn can run) and the pinned features.
+    fn deterministic_engine() -> Engine {
+        let mut compiler = LLVM::default();
+        compiler.push_middleware(Arc::new(Metering::new(1_000, COST_FUNCTION)));
+        LLVM::canonicalize_nans(&mut compiler, true);
+        LLVM::opt_level(&mut compiler, LLVMOptLevel::Aggressive);
+        EngineBuilder::new(compiler)
+            .set_features(Some(Self::deterministic_features()))
+            .into()
     }
 
     pub fn run(
@@ -404,16 +441,9 @@ impl WasmRuntime {
                 let code_object = db.get_code_object_by_hash(code_hash, 0, 0)?;
                 let code_object = unsafe { &*code_object };
 
-                // Create a temporary store just for module compilation
-                let mut compiler = LLVM::default();
-
-                // Add initial limit of 1,000 so start function can run if present
-                let metering = Arc::new(Metering::new(1_000, COST_FUNCTION));
-                compiler.push_middleware(metering);
-                LLVM::canonicalize_nans(&mut compiler, true);
-                LLVM::opt_level(&mut compiler, LLVMOptLevel::Aggressive);
-
-                let temp_engine: Engine = compiler.into();
+                // Compile on a fresh engine carrying the pinned deterministic
+                // config (NaN canonicalization, metering, feature set).
+                let temp_engine = Self::deterministic_engine();
                 let temp_store = Store::new(temp_engine.clone());
 
                 let module = Module::new(temp_store.engine(), code_object.get_code().as_slice())
@@ -733,5 +763,94 @@ impl WasmRuntime {
                 cpu_limit
             ))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use wasmer::{
+        Instance,
+        Module,
+        Store,
+        TypedFunction,
+        imports,
+    };
+    use wasmer_middlewares::metering::set_remaining_points;
+
+    use super::WasmRuntime;
+
+    // Run a float op on the real deterministic_engine and feed it non-canonical
+    // NaNs; each must come back as the one wasm canonical NaN. Off, the input
+    // payload leaks through — a platform-dependent, consensus-visible value.
+    // Verified: fails with canonicalize_nans off.
+    #[test]
+    fn canonicalize_nans_masks_nan_payloads() {
+        // Reinterpret the i64 arg as f64, run x + 0.0 (kept with no fast-math,
+        // NaN-preserving) and return the bits.
+        let wasm = wat::parse_str(
+            r#"
+            (module
+              (func (export "canon") (param i64) (result i64)
+                (i64.reinterpret_f64
+                  (f64.add (f64.reinterpret_i64 (local.get 0)) (f64.const 0)))))
+            "#,
+        )
+        .unwrap();
+
+        let mut store = Store::new(WasmRuntime::deterministic_engine());
+        let module = Module::new(&store, &wasm).unwrap();
+        let instance = Instance::new(&mut store, &module, &imports! {}).unwrap();
+        set_remaining_points(&mut store, &instance, 1_000_000);
+        let canon: TypedFunction<i64, i64> = instance
+            .exports
+            .get_typed_function(&store, "canon")
+            .unwrap();
+
+        // Assorted non-canonical NaNs: quiet-with-payload, signaling, negative.
+        for input in [
+            0x7ff8_0000_dead_beef_u64,
+            0x7ff0_0000_0000_0001,
+            0xfff4_0000_0000_0000,
+        ] {
+            let out = canon.call(&mut store, input as i64).unwrap() as u64;
+            // Canonical NaN, ignoring the sign bit: exponent all ones, only the
+            // mantissa MSB set. The input payload must be gone.
+            assert_eq!(
+                out & 0x7fff_ffff_ffff_ffff,
+                0x7ff8_0000_0000_0000,
+                "NaN input {input:#018x} was not canonicalized (got {out:#018x})"
+            );
+        }
+
+        // A finite value is untouched: 1.0 + 0.0 == 1.0.
+        let one = 1.0_f64.to_bits() as i64;
+        assert_eq!(canon.call(&mut store, one).unwrap(), one);
+    }
+
+    // Locks the feature set. Flipping any of these is a consensus change, so it
+    // should be deliberate, not a silent default a wasmer bump drags in.
+    #[test]
+    fn pinned_features_stay_deterministic() {
+        let f = WasmRuntime::deterministic_features();
+
+        // Nondeterministic by spec, or unused by the contract toolchain: off.
+        assert!(
+            !f.threads,
+            "threads (shared memory + atomics) is nondeterministic"
+        );
+        assert!(!f.relaxed_simd, "relaxed-simd is nondeterministic by spec");
+        assert!(!f.simd, "simd is not part of the contract ABI");
+        assert!(!f.exceptions);
+        assert!(!f.tail_call);
+        assert!(!f.memory64);
+        assert!(!f.multi_memory);
+        assert!(!f.module_linking);
+        assert!(!f.wide_arithmetic);
+
+        // Deterministic, and emitted by compiled contracts: on.
+        assert!(f.reference_types);
+        assert!(f.bulk_memory);
+        assert!(f.multi_value);
+        assert!(f.extended_const);
     }
 }
