@@ -67,7 +67,7 @@ pub fn db_find_i64(
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_FIND)?;
     let context = env_data.apply_context_mut();
     let result = context.db_find_i64(code, scope, table, id)?;
     Ok(result)
@@ -84,7 +84,10 @@ pub fn db_store_i64(
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP + cost::per_byte(buffer_len as u64))?;
+    env_data.charge(
+        &mut store,
+        cost::DB_STORE + cost::db_value_per_byte(buffer_len as u64),
+    )?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -109,7 +112,10 @@ pub fn db_get_i64(
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP + cost::per_byte(buffer_len as u64))?;
+    env_data.charge(
+        &mut store,
+        cost::DB_ITERATE + cost::db_value_per_byte(buffer_len as u64),
+    )?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -132,7 +138,10 @@ pub fn db_update_i64(
 ) -> Result<(), RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP + cost::per_byte(buffer_len as u64))?;
+    env_data.charge(
+        &mut store,
+        cost::DB_STORE + cost::db_value_per_byte(buffer_len as u64),
+    )?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -152,7 +161,7 @@ pub fn db_update_i64(
 pub fn db_remove_i64(mut env: FunctionEnvMut<WasmContext>, itr: i32) -> Result<(), RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_STORE)?;
     let context = env_data.apply_context_mut();
     context.db_remove_i64(itr)?;
     Ok(())
@@ -165,7 +174,7 @@ pub fn db_next_i64(
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_ITERATE)?;
     let context = env_data.apply_context_mut();
     let mut next_primary = 0u64;
     let res = context.db_next_i64(itr, &mut next_primary)?;
@@ -192,7 +201,7 @@ pub fn db_previous_i64(
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_ITERATE)?;
     let context = env_data.apply_context_mut();
     let mut next_primary = 0u64;
     let res = context.db_previous_i64(itr, &mut next_primary)?;
@@ -221,7 +230,7 @@ pub fn db_lowerbound_i64(
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_FIND)?;
     let context = env_data.apply_context_mut();
     let res = context.db_lowerbound_i64(code.into(), scope.into(), table.into(), primary)?;
     Ok(res)
@@ -236,7 +245,7 @@ pub fn db_upperbound_i64(
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_FIND)?;
     let context = env_data.apply_context_mut();
     let res = context.db_upperbound_i64(code.into(), scope.into(), table.into(), primary)?;
     Ok(res)
@@ -250,7 +259,7 @@ pub fn db_end_i64(
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_FIND)?;
     let context = env_data.apply_context_mut();
     Ok(context.db_end_i64(code.into(), scope.into(), table.into())?)
 }
@@ -265,7 +274,7 @@ pub fn db_idx64_store(
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_STORE)?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -285,7 +294,7 @@ pub fn db_idx64_update(
 ) -> Result<(), RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_STORE)?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -301,7 +310,7 @@ pub fn db_idx64_update(
 pub fn db_idx64_remove(mut env: FunctionEnvMut<WasmContext>, itr: i32) -> Result<(), RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_STORE)?;
     let context = env_data.apply_context_mut();
     context.db_idx64_remove(itr)?;
     Ok(())
@@ -317,7 +326,7 @@ pub fn db_idx64_find_secondary(
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_FIND)?;
 
     // Clone the memory handle so the borrow on env_data is released
     let memory = env_data
@@ -357,7 +366,7 @@ pub fn db_idx64_find_primary(
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_FIND)?;
 
     // Clone the memory handle so the borrow on env_data is released
     let memory = env_data
@@ -394,7 +403,7 @@ pub fn db_idx64_lowerbound(
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_FIND)?;
 
     // Clone the memory handle so the borrow on env_data is released
     let memory = env_data
@@ -435,7 +444,7 @@ pub fn db_idx64_upperbound(
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_FIND)?;
 
     // Clone the memory handle so the borrow on env_data is released
     let memory = env_data
@@ -474,7 +483,7 @@ pub fn db_idx64_end(
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_FIND)?;
     let context = env_data.apply_context_mut();
     Ok(context.db_idx64_end(code.into(), scope.into(), table.into())?)
 }
@@ -486,7 +495,7 @@ pub fn db_idx64_next(
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_ITERATE)?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -507,7 +516,7 @@ pub fn db_idx64_previous(
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_ITERATE)?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -531,7 +540,7 @@ pub fn db_idx128_store(
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_STORE)?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -551,7 +560,7 @@ pub fn db_idx128_update(
 ) -> Result<(), RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_STORE)?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -570,7 +579,7 @@ pub fn db_idx128_remove(
 ) -> Result<(), RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_STORE)?;
     let context = env_data.apply_context_mut();
     context.db_idx128_remove(itr)?;
     Ok(())
@@ -586,7 +595,7 @@ pub fn db_idx128_find_secondary(
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_FIND)?;
 
     // Clone the memory handle so the borrow on env_data is released
     let memory = env_data
@@ -626,7 +635,7 @@ pub fn db_idx128_find_primary(
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_FIND)?;
 
     // Clone the memory handle so the borrow on env_data is released
     let memory = env_data
@@ -663,7 +672,7 @@ pub fn db_idx128_lowerbound(
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_FIND)?;
 
     // Clone the memory handle so the borrow on env_data is released
     let memory = env_data
@@ -704,7 +713,7 @@ pub fn db_idx128_upperbound(
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_FIND)?;
 
     // Clone the memory handle so the borrow on env_data is released
     let memory = env_data
@@ -743,7 +752,7 @@ pub fn db_idx128_end(
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_FIND)?;
     let context = env_data.apply_context_mut();
     Ok(context.db_idx128_end(code.into(), scope.into(), table.into())?)
 }
@@ -755,7 +764,7 @@ pub fn db_idx128_next(
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_ITERATE)?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -776,7 +785,7 @@ pub fn db_idx128_previous(
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_ITERATE)?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -801,7 +810,7 @@ pub fn db_idx256_store(
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_STORE)?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -822,7 +831,7 @@ pub fn db_idx256_update(
 ) -> Result<(), RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_STORE)?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -841,7 +850,7 @@ pub fn db_idx256_remove(
 ) -> Result<(), RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_STORE)?;
     let context = env_data.apply_context_mut();
     context.db_idx256_remove(itr)?;
     Ok(())
@@ -858,7 +867,7 @@ pub fn db_idx256_find_secondary(
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_FIND)?;
 
     // Clone the memory handle so the borrow on env_data is released
     let memory = env_data
@@ -899,7 +908,7 @@ pub fn db_idx256_find_primary(
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_FIND)?;
 
     // Clone the memory handle so the borrow on env_data is released
     let memory = env_data
@@ -937,7 +946,7 @@ pub fn db_idx256_lowerbound(
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_FIND)?;
 
     // Clone the memory handle so the borrow on env_data is released
     let memory = env_data
@@ -979,7 +988,7 @@ pub fn db_idx256_upperbound(
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_FIND)?;
 
     // Clone the memory handle so the borrow on env_data is released
     let memory = env_data
@@ -1018,7 +1027,7 @@ pub fn db_idx256_end(
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_FIND)?;
     let context = env_data.apply_context_mut();
     Ok(context.db_idx256_end(code.into(), scope.into(), table.into())?)
 }
@@ -1030,7 +1039,7 @@ pub fn db_idx256_next(
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_ITERATE)?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -1051,7 +1060,7 @@ pub fn db_idx256_previous(
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_ITERATE)?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -1075,7 +1084,7 @@ pub fn db_idx_double_store(
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_STORE)?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -1096,7 +1105,7 @@ pub fn db_idx_double_update(
 ) -> Result<(), RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_STORE)?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -1116,7 +1125,7 @@ pub fn db_idx_double_remove(
 ) -> Result<(), RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_STORE)?;
     let context = env_data.apply_context_mut();
     context.db_idx_double_remove(itr)?;
     Ok(())
@@ -1132,7 +1141,7 @@ pub fn db_idx_double_find_secondary(
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_FIND)?;
 
     // Clone the memory handle so the borrow on env_data is released
     let memory = env_data
@@ -1173,7 +1182,7 @@ pub fn db_idx_double_find_primary(
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_FIND)?;
 
     // Clone the memory handle so the borrow on env_data is released
     let memory = env_data
@@ -1210,7 +1219,7 @@ pub fn db_idx_double_lowerbound(
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_FIND)?;
 
     // Clone the memory handle so the borrow on env_data is released
     let memory = env_data
@@ -1252,7 +1261,7 @@ pub fn db_idx_double_upperbound(
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_FIND)?;
 
     // Clone the memory handle so the borrow on env_data is released
     let memory = env_data
@@ -1292,7 +1301,7 @@ pub fn db_idx_double_end(
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_FIND)?;
     let context = env_data.apply_context_mut();
     Ok(context.db_idx_double_end(code.into(), scope.into(), table.into())?)
 }
@@ -1304,7 +1313,7 @@ pub fn db_idx_double_next(
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_ITERATE)?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -1325,7 +1334,7 @@ pub fn db_idx_double_previous(
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_ITERATE)?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -1349,7 +1358,7 @@ pub fn db_idx_long_double_store(
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_STORE)?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -1370,7 +1379,7 @@ pub fn db_idx_long_double_update(
 ) -> Result<(), RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_STORE)?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -1390,7 +1399,7 @@ pub fn db_idx_long_double_remove(
 ) -> Result<(), RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_STORE)?;
     let context = env_data.apply_context_mut();
     context.db_idx_long_double_remove(itr)?;
     Ok(())
@@ -1406,7 +1415,7 @@ pub fn db_idx_long_double_find_secondary(
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_FIND)?;
 
     // Clone the memory handle so the borrow on env_data is released
     let memory = env_data
@@ -1447,7 +1456,7 @@ pub fn db_idx_long_double_find_primary(
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_FIND)?;
 
     // Clone the memory handle so the borrow on env_data is released
     let memory = env_data
@@ -1484,7 +1493,7 @@ pub fn db_idx_long_double_lowerbound(
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_FIND)?;
 
     // Clone the memory handle so the borrow on env_data is released
     let memory = env_data
@@ -1526,7 +1535,7 @@ pub fn db_idx_long_double_upperbound(
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_FIND)?;
 
     // Clone the memory handle so the borrow on env_data is released
     let memory = env_data
@@ -1566,7 +1575,7 @@ pub fn db_idx_long_double_end(
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_FIND)?;
     let context = env_data.apply_context_mut();
     Ok(context.db_idx_long_double_end(code.into(), scope.into(), table.into())?)
 }
@@ -1578,7 +1587,7 @@ pub fn db_idx_long_double_next(
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_ITERATE)?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -1599,7 +1608,7 @@ pub fn db_idx_long_double_previous(
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::DB_OP)?;
+    env_data.charge(&mut store, cost::DB_ITERATE)?;
     let memory = env_data
         .memory()
         .as_ref()

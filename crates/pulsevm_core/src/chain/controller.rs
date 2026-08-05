@@ -352,6 +352,20 @@ impl Controller {
             self.db.initialize_database(&genesis).map_err(|e| {
                 ChainError::GenesisError(format!("failed to initialize database: {}", e))
             })?;
+            // initialize_database seeds the resource-limits config from the C++
+            // struct defaults (default_max_block_cpu_usage), not from genesis, so
+            // the very first block would run under those tiny defaults until the
+            // end-of-block set_block_parameters first fires. Push the genesis-derived
+            // block parameters in now so block 1 already has the real CPU/NET
+            // ceilings — otherwise a genesis-configured budget silently doesn't
+            // apply to the block that bootstraps the chain.
+            let (cpu_elastic_parameters, net_elastic_parameters) =
+                self.block_elastic_parameters()?;
+            ResourceLimitsManager::set_block_parameters(
+                &mut self.db,
+                &cpu_elastic_parameters,
+                &net_elastic_parameters,
+            )?;
             self.db
                 .set_revision(self.last_accepted_block.block_num() as i64)?;
             info!("database initialized successfully");
@@ -1180,15 +1194,18 @@ impl Controller {
     // executed via `execute_block` (verify/accept) or assembled in `build_block`,
     // otherwise a retained build session would commit state that diverges from
     // what validators compute.
-    fn finalize_block_resources(&mut self, block_num: u32) -> Result<(), ChainError> {
+    // The elastic CPU/NET block parameters derived from the chain config: the
+    // per-block ceiling (max) and the target the elastic limit relaxes toward.
+    fn block_elastic_parameters(
+        &self,
+    ) -> Result<(ElasticLimitParameters, ElasticLimitParameters), ChainError> {
         let global_property = Controller::get_global_properties(&self.db)?;
         let chain_config = global_property.get_chain_config();
-        let cpu_target = eos_percent(
-            chain_config.get_max_block_cpu_usage() as u64,
-            chain_config.get_target_block_cpu_usage_pct(),
-        );
         let cpu_elastic_parameters = ElasticLimitParameters::new(
-            cpu_target,
+            eos_percent(
+                chain_config.get_max_block_cpu_usage() as u64,
+                chain_config.get_target_block_cpu_usage_pct(),
+            ),
             chain_config.get_max_block_cpu_usage() as u64,
             BLOCK_CPU_USAGE_AVERAGE_WINDOW_MS / BLOCK_INTERVAL_MS,
             MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER,
@@ -1206,6 +1223,11 @@ impl Controller {
             make_ratio(99, 100),
             make_ratio(1000, 999),
         );
+        Ok((cpu_elastic_parameters, net_elastic_parameters))
+    }
+
+    fn finalize_block_resources(&mut self, block_num: u32) -> Result<(), ChainError> {
+        let (cpu_elastic_parameters, net_elastic_parameters) = self.block_elastic_parameters()?;
         ResourceLimitsManager::process_account_limit_updates(&mut self.db)?;
         ResourceLimitsManager::set_block_parameters(
             &mut self.db,
@@ -1741,10 +1763,15 @@ mod tests {
                 "net_usage_leeway": 500,
                 "context_free_discount_net_usage_num": 20,
                 "context_free_discount_net_usage_den": 100,
-                "max_block_cpu_usage": 200000,
+                // Point-denominated budgets (see config::POINTS_PER_US): a row
+                // write costs ~16k points now that the db intrinsics are metered,
+                // and the multi-index reference contract does thousands of ops, so
+                // the old microsecond-scale 150k is far too small. Match the real
+                // chain's genesis.json so tests run under the deployed limits.
+                "max_block_cpu_usage": 3000000000u64,
                 "target_block_cpu_usage_pct": 2500,
-                "max_transaction_cpu_usage": 150000,
-                "min_transaction_cpu_usage": 100,
+                "max_transaction_cpu_usage": 1000000000,
+                "min_transaction_cpu_usage": 100000,
                 // The test transaction builders use TimePointSec::maximum() as the
                 // expiration ("never expires"); allow that by widening the lifetime
                 // window well past the default one hour.
@@ -6107,29 +6134,35 @@ mod tests {
         let chain_id = controller.chain_id().clone();
         let status = BlockStatus::Building;
 
-        // Burns well over a million metering points: far above the 150k
-        // max_transaction_cpu_usage of the test genesis, far below the
-        // unlimited budget. Only the onblock and burn actions loop — the
-        // setcode action deploying this very contract also reaches apply
-        // (the receiver's code hash is read through a live reference after
-        // the native handler ran) and must not burn.
+        // Burns well over the per-transaction CPU limit of the test genesis
+        // (~1e9 points), far below the unlimited budget. The loop body is packed
+        // with f64.sqrt (a metered ~110 points each) so it overshoots the limit in
+        // a few hundred thousand iterations rather than a billion cheap spins, which
+        // keeps the onblock path (which runs it to completion) fast. Only the
+        // onblock and burn actions loop — the setcode action deploying this very
+        // contract also reaches apply (the receiver's code hash is read through a
+        // live reference after the native handler ran) and must not burn.
         let onblock = ONBLOCK_NAME.as_u64() as i64;
         let burn = Name::from_str("burn")?.as_u64() as i64;
+        let sqrts =
+            "(local.set $acc (f64.sqrt (f64.add (local.get $acc) (f64.const 1))))\n".repeat(32);
         let wasm = wat::parse_str(&format!(
             r#"
             (module
               (memory (export "memory") 1)
               (func (export "apply") (param i64 i64 i64)
-                (local $i i32)
+                (local $i i32) (local $acc f64)
                 (block $skip
                   (br_if $skip
                     (i32.and
                       (i64.ne (local.get 2) (i64.const {onblock}))
                       (i64.ne (local.get 2) (i64.const {burn}))))
-                  (local.set $i (i32.const 100000))
+                  (local.set $acc (f64.const 3.14159265358979))
+                  (local.set $i (i32.const 400000))
                   (block $exit
                     (loop $spin
                       (br_if $exit (i32.eqz (local.get $i)))
+                      {sqrts}
                       (local.set $i (i32.sub (local.get $i) (i32.const 1)))
                       (br $spin))))))
             "#,

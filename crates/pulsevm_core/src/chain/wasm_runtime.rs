@@ -404,10 +404,7 @@ const COST_FUNCTION: fn(&Operator) -> u64 = |operator: &Operator| -> u64 {
         | Operator::GlobalSet { .. }
         | Operator::LocalGet { .. }
         | Operator::LocalSet { .. } => 3,
-        Operator::I32Mul { .. }
-        | Operator::I64Mul { .. }
-        | Operator::F32Mul { .. }
-        | Operator::F64Mul { .. } => 3,
+        Operator::I32Mul { .. } | Operator::I64Mul { .. } => 3,
         Operator::I32DivS { .. }
         | Operator::I32DivU { .. }
         | Operator::I32RemS { .. }
@@ -417,6 +414,18 @@ const COST_FUNCTION: fn(&Operator) -> u64 = |operator: &Operator| -> u64 {
         | Operator::I64RemS { .. }
         | Operator::I64RemU { .. } => 80,
         Operator::I32Clz { .. } | Operator::I64Clz { .. } => 105,
+        // Floating point priced from measurement (estimate_operator_costs): unlike
+        // the integer arithmetic above, IEEE ops aren't reorderable so LLVM can't
+        // fold a dependent chain, and the shipped defaults (1-3) under-charged them
+        // by 8-100x -- a division or sqrt costs as much as an integer divide, not a
+        // single cheap op. f32 shares the f64 price (an upper bound for it).
+        Operator::F32Add { .. }
+        | Operator::F64Add { .. }
+        | Operator::F32Sub { .. }
+        | Operator::F64Sub { .. } => 20,
+        Operator::F32Mul { .. } | Operator::F64Mul { .. } => 26,
+        Operator::F32Div { .. } | Operator::F64Div { .. } => 80,
+        Operator::F32Sqrt { .. } | Operator::F64Sqrt { .. } => 110,
         Operator::MemoryCopy { .. } | Operator::MemoryFill { .. } => 500,
         Operator::MemoryGrow { .. } => 1000, // Higher cost for memory growth
         _ => 1,                              // Default cost
@@ -756,12 +765,15 @@ impl WasmRuntime {
         // against the metering budget via WasmContext::charge.
         warm.env.as_mut(&mut warm.store).instance = Some(instance.clone());
 
-        // If CPU limit is -1, it means no limit, so we can set it to a very high value. Otherwise,
-        // use the provided limit.
+        // cpu_limit == -1 means no limit (only the system's own implicit
+        // transactions, e.g. onblock, get this). Seed the budget with u64::MAX so it
+        // is genuinely unbounded: the old 300M placeholder is now smaller than a
+        // normal transaction's budget once intrinsics are metered in points, which
+        // would wrongly trap a system action that a user transaction could afford.
         let cpu_limit = if cpu_limit >= 0 {
             cpu_limit as u64
         } else {
-            300_000_000
+            u64::MAX
         };
 
         // Set initial metering points based on resource limits
@@ -1159,5 +1171,450 @@ mod tests {
         let recover_pts = (recover_ns / ns_per_point * SAFETY).ceil();
         println!("\nrecover_key: {recover_ns:.0} ns -> {recover_pts:.0} pts (shipped 2000)");
         println!("=====================================================\n");
+    }
+
+    // ns per metering point on this machine, from a mixed integer compute loop run
+    // on the real metered engine (reading wall time and points consumed). Shared
+    // anchor for the calibration tools below and for estimate_intrinsic_costs'
+    // method; ties native measurements to the point unit the chain already bills.
+    #[cfg(test)]
+    fn anchor_ns_per_point() -> f64 {
+        use std::{
+            hint::black_box,
+            time::Instant,
+        };
+        const SEED: u64 = 200_000_000_000;
+        let src = "(module (func (export \"run\") (param $n i64) (result i64)\n\
+             (local $i i64) (local $acc i64)\n\
+             (local.set $acc (i64.const 2))\n\
+             (block $done (loop $l\n\
+             (br_if $done (i64.ge_u (local.get $i) (local.get $n)))\n\
+             (local.set $acc (i64.xor (i64.mul (local.get $acc) (i64.const 6364136223846793005))\
+             (i64.add (local.get $i) (i64.const 1442695040888963407))))\n\
+             (local.set $i (i64.add (local.get $i) (i64.const 1)))\n\
+             (br $l)))\n\
+             (local.get $acc)))";
+        let mut store = Store::new(WasmRuntime::deterministic_engine());
+        let module = Module::new(&store, src).unwrap();
+        let instance = Instance::new(&mut store, &module, &imports! {}).unwrap();
+        let f: TypedFunction<i64, i64> =
+            instance.exports.get_typed_function(&store, "run").unwrap();
+        for _ in 0..3 {
+            set_remaining_points(&mut store, &instance, SEED);
+            black_box(f.call(&mut store, 2_000_000).unwrap());
+        }
+        let (mut ns, mut pts) = (0.0f64, 0u64);
+        for _ in 0..20 {
+            set_remaining_points(&mut store, &instance, SEED);
+            let t = Instant::now();
+            black_box(f.call(&mut store, 2_000_000).unwrap());
+            ns += t.elapsed().as_nanos() as f64;
+            pts += match get_remaining_points(&mut store, &instance) {
+                MeteringPoints::Remaining(p) => SEED - p,
+                MeteringPoints::Exhausted => panic!("anchor exhausted"),
+            };
+        }
+        ns / pts as f64
+    }
+
+    // Recalibrate the *relative* weights in COST_FUNCTION against measurement,
+    // keeping the anchor fixed. Ignored: a calibration tool, run manually.
+    //
+    //   cargo test -p pulsevm_core --lib estimate_operator_costs \
+    //     -- --ignored --nocapture
+    //
+    // The point unit is pinned by integer metering: the cheapest operator has to
+    // cost >= 1 point, so we normalize everything to i64.add = 1 and read the rest
+    // off as multiples of it. That keeps POINTS_PER_US and the intrinsic table
+    // (which is denominated in this same unit) untouched, and only corrects
+    // operators whose hand-picked weight is wrong relative to add.
+    //
+    // Only the arithmetic and bulk-memory operators are re-measured. Control flow,
+    // calls, selects, and local/global access are left at their structural
+    // hand-values: at Aggressive opt LLVM inlines callees and folds branches, so a
+    // single operator's isolated wall-clock is dominated by pipelining and doesn't
+    // mean much -- measuring it would be false precision. The arithmetic ops are
+    // where the shipped table is actually wrong (clz at 105 is ~100x too high; a
+    // native lzcnt is a couple of cycles).
+    //
+    // Method: run a metered loop whose body is M copies of one dependent update to
+    // an accumulator, minus the empty loop, over N trips -> ns per operator. The
+    // operand comes from a runtime parameter (not a constant) so LLVM can't fold or
+    // strength-reduce the division; the accumulator feeds the next op so nothing is
+    // dead-code eliminated. Timing is on the real deterministic_engine, so the
+    // metering decrement each op pays is included, as it is on-chain.
+    #[test]
+    #[ignore = "calibration tool; run manually with --ignored --nocapture"]
+    fn estimate_operator_costs() {
+        use std::{
+            hint::black_box,
+            time::Instant,
+        };
+
+        const N: i64 = 300_000; // loop trips
+        const M: usize = 48; // op copies per trip
+        const SEED: u64 = 200_000_000_000; // metering budget; never exhausted here
+        const D: i64 = 0x9E3779B97F4A7C15u128 as i64; // runtime operand, defeats folding
+
+        // Build an i64-accumulator loop whose body is `unit` repeated `m` times.
+        let int_src = |unit: &str, m: usize| -> String {
+            let body = unit.repeat(m);
+            format!(
+                "(module (func (export \"run\") (param $n i64) (param $d i64) (result i64)\n\
+                 (local $i i64) (local $acc i64)\n\
+                 (local.set $acc (local.get $d))\n\
+                 (block $done (loop $l\n\
+                 (br_if $done (i64.ge_u (local.get $i) (local.get $n)))\n\
+                 {body}\n\
+                 (local.set $i (i64.add (local.get $i) (i64.const 1)))\n\
+                 (br $l)))\n\
+                 (local.get $acc)))"
+            )
+        };
+        let float_src = |unit: &str, m: usize| -> String {
+            let body = unit.repeat(m);
+            format!(
+                "(module (func (export \"run\") (param $n i64) (param $d f64) (result f64)\n\
+                 (local $i i64) (local $acc f64)\n\
+                 (local.set $acc (local.get $d))\n\
+                 (block $done (loop $l\n\
+                 (br_if $done (i64.ge_u (local.get $i) (local.get $n)))\n\
+                 {body}\n\
+                 (local.set $i (i64.add (local.get $i) (i64.const 1)))\n\
+                 (br $l)))\n\
+                 (local.get $acc)))"
+            )
+        };
+        let mem_src = |m: usize| -> String {
+            // Each unit copies 64 bytes; measured as a base per invocation (the
+            // length is a runtime operand on-chain, so the operator is flat-priced).
+            let body = "(memory.copy (i32.const 0) (i32.const 4096) (i32.const 64))\n".repeat(m);
+            format!(
+                "(module (memory 1)\n\
+                 (func (export \"run\") (param $n i64) (param $d i64) (result i64)\n\
+                 (local $i i64)\n\
+                 (block $done (loop $l\n\
+                 (br_if $done (i64.ge_u (local.get $i) (local.get $n)))\n\
+                 {body}\n\
+                 (local.set $i (i64.add (local.get $i) (i64.const 1)))\n\
+                 (br $l)))\n\
+                 (local.get $i)))"
+            )
+        };
+
+        // Best-of wall time (ns) for one compiled i64->i64 "run" module.
+        let best_i64 = |src: &str| -> f64 {
+            let mut store = Store::new(WasmRuntime::deterministic_engine());
+            let module = Module::new(&store, src).unwrap();
+            let instance = Instance::new(&mut store, &module, &imports! {}).unwrap();
+            let f: TypedFunction<(i64, i64), i64> =
+                instance.exports.get_typed_function(&store, "run").unwrap();
+            for _ in 0..3 {
+                set_remaining_points(&mut store, &instance, SEED);
+                black_box(f.call(&mut store, N, D).unwrap());
+            }
+            let mut best = f64::MAX;
+            for _ in 0..7 {
+                set_remaining_points(&mut store, &instance, SEED);
+                let t = Instant::now();
+                black_box(f.call(&mut store, N, D).unwrap());
+                best = best.min(t.elapsed().as_nanos() as f64);
+            }
+            best
+        };
+
+        // Anchor: ns per metering point on this machine. Operators are directly
+        // metered, so no safety multiplier -- a point already is the billed unit.
+        let ns_per_point = anchor_ns_per_point();
+
+        // Per-operator ns for an int-accumulator unit: (loop with M) - (empty loop),
+        // amortized over N*M.
+        let int_base = best_i64(&int_src("", 0));
+        let per_op_int = |unit: &str| -> f64 {
+            (best_i64(&int_src(unit, M)) - int_base) / (N as f64 * M as f64)
+        };
+
+        // Float uses its own empty-loop baseline (f64 local, same shape).
+        let f_src_base = {
+            let mut store = Store::new(WasmRuntime::deterministic_engine());
+            let module = Module::new(&store, &float_src("", 0)).unwrap();
+            let instance = Instance::new(&mut store, &module, &imports! {}).unwrap();
+            let f: TypedFunction<(i64, f64), f64> =
+                instance.exports.get_typed_function(&store, "run").unwrap();
+            for _ in 0..3 {
+                set_remaining_points(&mut store, &instance, SEED);
+                black_box(f.call(&mut store, N, 1.0000001f64).unwrap());
+            }
+            let mut best = f64::MAX;
+            for _ in 0..7 {
+                set_remaining_points(&mut store, &instance, SEED);
+                let t = Instant::now();
+                black_box(f.call(&mut store, N, 1.0000001f64).unwrap());
+                best = best.min(t.elapsed().as_nanos() as f64);
+            }
+            best
+        };
+        let per_op_float = |unit: &str| -> f64 {
+            let mut store = Store::new(WasmRuntime::deterministic_engine());
+            let module = Module::new(&store, &float_src(unit, M)).unwrap();
+            let instance = Instance::new(&mut store, &module, &imports! {}).unwrap();
+            let f: TypedFunction<(i64, f64), f64> =
+                instance.exports.get_typed_function(&store, "run").unwrap();
+            for _ in 0..3 {
+                set_remaining_points(&mut store, &instance, SEED);
+                black_box(f.call(&mut store, N, 1.0000001f64).unwrap());
+            }
+            let mut best = f64::MAX;
+            for _ in 0..7 {
+                set_remaining_points(&mut store, &instance, SEED);
+                let t = Instant::now();
+                black_box(f.call(&mut store, N, 1.0000001f64).unwrap());
+                best = best.min(t.elapsed().as_nanos() as f64);
+            }
+            (best - f_src_base) / (N as f64 * M as f64)
+        };
+
+        let mem_base = best_i64(&mem_src(0));
+        let per_op_mem = (best_i64(&mem_src(M)) - mem_base) / (N as f64 * M as f64);
+
+        // points = round(ns / ns_per_point). A measurement at or below the anchor
+        // floor (~ns_per_point) is flagged: LLVM folded the repeated op (scalar
+        // evolution solves linear recurrences over the accumulator), so its
+        // isolated cost is not observable and its structural weight is kept.
+        let floor = ns_per_point * 1.5;
+        let pts = |ns: f64| (ns / ns_per_point).round().max(1.0);
+
+        println!("\n==== operator cost estimate ====");
+        println!(
+            "anchor: {ns_per_point:.5} ns/point  (=> ~{:.0} points/us)",
+            1000.0 / ns_per_point
+        );
+        println!(
+            "{:<16} {:>10} {:>10} {:>8}  note",
+            "operator", "ns/op", "points", "shipped"
+        );
+
+        let mut row = |name: &str, ns: f64, shipped: u64| {
+            let note = if ns < floor {
+                "folded (kept)"
+            } else {
+                "measured"
+            };
+            println!(
+                "{name:<16} {ns:>10.4} {:>10.0} {shipped:>8}  {note}",
+                pts(ns)
+            );
+        };
+        row(
+            "i64.mul",
+            per_op_int("(local.set $acc (i64.mul (local.get $acc) (local.get $d)))"),
+            3,
+        );
+        row(
+            "i64.div_u",
+            per_op_int(
+                "(local.set $acc (i64.div_u (local.get $acc) (i64.or (local.get $d) (i64.const 1))))",
+            ),
+            80,
+        );
+        row(
+            "i64.rem_u",
+            per_op_int(
+                "(local.set $acc (i64.rem_u (local.get $acc) (i64.or (local.get $d) (i64.const 3))))",
+            ),
+            80,
+        );
+        row(
+            "i64.clz",
+            per_op_int("(local.set $acc (i64.add (i64.clz (local.get $acc)) (local.get $d)))"),
+            105,
+        );
+        row(
+            "i64.ctz",
+            per_op_int("(local.set $acc (i64.add (i64.ctz (local.get $acc)) (local.get $d)))"),
+            1,
+        );
+        row(
+            "i64.popcnt",
+            per_op_int("(local.set $acc (i64.add (i64.popcnt (local.get $acc)) (local.get $d)))"),
+            1,
+        );
+        row(
+            "i64.shl",
+            per_op_int("(local.set $acc (i64.shl (local.get $acc) (local.get $d)))"),
+            1,
+        );
+        row(
+            "f64.add",
+            per_op_float("(local.set $acc (f64.add (local.get $acc) (local.get $d)))"),
+            1,
+        );
+        row(
+            "f64.sub",
+            per_op_float("(local.set $acc (f64.sub (local.get $acc) (local.get $d)))"),
+            1,
+        );
+        row(
+            "f64.mul",
+            per_op_float("(local.set $acc (f64.mul (local.get $acc) (local.get $d)))"),
+            3,
+        );
+        row(
+            "f64.div",
+            per_op_float("(local.set $acc (f64.div (local.get $acc) (local.get $d)))"),
+            1,
+        );
+        row(
+            "f64.sqrt",
+            per_op_float("(local.set $acc (f64.sqrt (f64.abs (local.get $acc))))"),
+            1,
+        );
+        row("memory.copy/64", per_op_mem, 500);
+        println!("================================\n");
+    }
+
+    // Stateful estimator for the database intrinsics (cost::DB_OP and the value
+    // per-byte). Ignored: a calibration tool needing a real chainbase, run manually.
+    //
+    //   cargo test -p pulsevm_core --lib estimate_db_intrinsic_costs \
+    //     -- --ignored --nocapture
+    //
+    // The db intrinsics do native FFI/chainbase work invisible to wasm metering, so
+    // like the crypto intrinsics they bill themselves and get the same 3x safety
+    // multiplier. We time the real work directly on a populated table (Database +
+    // KeyValueIteratorCache, the same path db_find_i64/db_next_i64/db_store_i64
+    // reach through ApplyContext, minus the RwLock hop) and convert ns -> points via
+    // the shared anchor. This is the PROVISIONAL tier the intrinsic doc called out.
+    #[test]
+    #[ignore = "calibration tool; needs a chainbase, run manually with --ignored --nocapture"]
+    fn estimate_db_intrinsic_costs() {
+        use std::{
+            hint::black_box,
+            time::Instant,
+        };
+
+        use pulsevm_ffi::{
+            Database,
+            KeyValueIteratorCache,
+            TableObject,
+        };
+        use tempfile::tempdir;
+
+        // Native work is unmetered, so bias the price high, as the crypto table does.
+        const SAFETY: f64 = 3.0;
+        const DB_SIZE: u64 = 256 * 1024 * 1024;
+        const CODE: u64 = 1;
+        const SCOPE: u64 = 2;
+        const TABLE: u64 = 3;
+        const PAYER: u64 = 1;
+        const ROWS: u64 = 8192; // table population for the lookup/scan measurements
+
+        let ns_per_point = anchor_ns_per_point();
+        let pts = |ns: f64| (ns / ns_per_point * SAFETY).ceil();
+
+        // A populated table to measure find and forward iteration against.
+        let dir = tempdir().unwrap();
+        let mut db = Database::new(dir.path().to_str().unwrap(), DB_SIZE).unwrap();
+        db.add_indices().unwrap();
+        let mut cache = KeyValueIteratorCache::new();
+        let table_ptr = db.create_table(CODE, SCOPE, TABLE, PAYER).unwrap();
+        let table_ref: &TableObject = unsafe { &*table_ptr };
+        for pk in 0..ROWS {
+            db.create_key_value_object(table_ref, PAYER, pk, &pk.to_le_bytes())
+                .unwrap();
+        }
+        cache.cache_table(table_ref).unwrap();
+
+        // find: average over a full sweep of present keys, best of several sweeps.
+        let find_ns = {
+            for pk in 0..ROWS {
+                black_box(db.db_find_i64(CODE, SCOPE, TABLE, pk, &mut cache).unwrap());
+            }
+            let mut best = f64::MAX;
+            for _ in 0..7 {
+                let t = Instant::now();
+                for pk in 0..ROWS {
+                    black_box(db.db_find_i64(CODE, SCOPE, TABLE, pk, &mut cache).unwrap());
+                }
+                best = best.min(t.elapsed().as_nanos() as f64 / ROWS as f64);
+            }
+            best
+        };
+
+        // iterate: lowerbound(0) then next() to the end iterator, per step.
+        let iter_ns = {
+            let mut best = f64::MAX;
+            for _ in 0..7 {
+                let end = db.db_end_i64(&mut cache, CODE, SCOPE, TABLE).unwrap();
+                let t = Instant::now();
+                let mut it = db
+                    .db_lowerbound_i64(&mut cache, CODE, SCOPE, TABLE, 0)
+                    .unwrap();
+                let mut steps = 0u64;
+                while it != end && steps <= ROWS {
+                    let mut p = 0u64;
+                    it = db.db_next_i64(&mut cache, it, &mut p).unwrap();
+                    steps += 1;
+                }
+                best = best.min(t.elapsed().as_nanos() as f64 / steps.max(1) as f64);
+            }
+            best
+        };
+
+        // store: a fresh chainbase each run (create is destructive), per insert, at
+        // two value sizes so the per-byte slope of the value write falls out.
+        let store_ns = |val_len: usize| -> f64 {
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let dir = tempdir().unwrap();
+                let mut db = Database::new(dir.path().to_str().unwrap(), DB_SIZE).unwrap();
+                db.add_indices().unwrap();
+                let tp = db.create_table(CODE, SCOPE, TABLE, PAYER).unwrap();
+                let tr: &TableObject = unsafe { &*tp };
+                let val = vec![0xa5u8; val_len];
+                let t = Instant::now();
+                for pk in 0..ROWS {
+                    db.create_key_value_object(tr, PAYER, pk, &val).unwrap();
+                }
+                best = best.min(t.elapsed().as_nanos() as f64 / ROWS as f64);
+            }
+            best
+        };
+        let store_small = store_ns(8);
+        let store_large = store_ns(4096);
+        let value_per_byte_ns = ((store_large - store_small) / (4096.0 - 8.0)).max(0.0);
+
+        println!("\n==== db intrinsic cost estimate (3x safety) ====");
+        println!("anchor: {ns_per_point:.5} ns/point   table: {ROWS} rows");
+        println!(
+            "{:<20} {:>10} {:>10} {:>10}",
+            "op", "ns", "points", "shipped"
+        );
+        println!(
+            "{:<20} {find_ns:>10.1} {:>10.0} {:>10}",
+            "db_find_i64",
+            pts(find_ns),
+            "DB_OP=100"
+        );
+        println!(
+            "{:<20} {iter_ns:>10.1} {:>10.0} {:>10}",
+            "db_next_i64 (step)",
+            pts(iter_ns),
+            "DB_OP=100"
+        );
+        println!(
+            "{:<20} {store_small:>10.1} {:>10.0} {:>10}",
+            "db_store_i64 (8B)",
+            pts(store_small),
+            "DB_OP=100"
+        );
+        println!(
+            "{:<20} {:>10.4} {:>10.2} {:>10}",
+            "value per-byte",
+            value_per_byte_ns,
+            pts(value_per_byte_ns),
+            "1/byte"
+        );
+        println!("=================================================\n");
     }
 }

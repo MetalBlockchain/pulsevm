@@ -13,16 +13,16 @@
 //!
 //! Two tiers, by how the numbers were derived:
 //!
-//! - **MEASURED** — the cryptographic hashes, key recovery, and bulk memory ops. Derived from the
-//!   `estimate_intrinsic_costs` tool (an ignored test in `wasm_runtime`): native work benchmarked
-//!   across input sizes, fit as base + per-byte, times a 3x safety multiplier so a point is an
-//!   upper bound on real time. See `docs/intrinsic-cost-model.md`. These were the worst
-//!   under-charges (key recovery was ~800x too cheap).
-//! - **PROVISIONAL** — everything else (getters, builtins, auth, database, console, …). Still
-//!   hand-scaled to the operator table, NOT benchmarked. The database and authority intrinsics in
-//!   particular do real work (row I/O, authority walks) and are almost certainly under-charged;
-//!   measuring them needs a stateful harness and is the next estimator to build. Flagged here so
-//!   the mixed scale is explicit, not hidden.
+//! - **MEASURED** — the cryptographic hashes, key recovery, bulk memory ops (from
+//!   `estimate_intrinsic_costs`), and the database row operations (from
+//!   `estimate_db_intrinsic_costs`). Native work benchmarked across input sizes / table population,
+//!   fit as base + per-byte, times a 3x safety multiplier so a point is an upper bound on real
+//!   time. See `docs/intrinsic-cost-model.md`. These were the worst under-charges — key recovery
+//!   was ~800x too cheap, a row write ~160x.
+//! - **PROVISIONAL** — the rest (getters, builtins, the auth scans, console, …). Still hand-scaled
+//!   to the operator table, NOT benchmarked, but these are cheap fixed-cost paths (a host-boundary
+//!   crossing, a small vector scan, a bounded print), not the row-I/O and hashing paths that were
+//!   badly mispriced. Flagged here so the mixed scale is explicit, not hidden.
 //!
 //! [`WasmContext::charge`]: crate::chain::wasm_runtime::WasmContext::charge
 //! [`POINTS_PER_US`]: crate::config::POINTS_PER_US
@@ -85,16 +85,47 @@ pub const BUILTIN: u64 = 8;
 /// The heavier soft-float / int128 builtins — division, modulo, square root.
 pub const BUILTIN_DIV: u64 = 20;
 
-/// A permission / authorization check (`require_auth`, `has_auth`,
-/// `require_recipient`, …). PROVISIONAL and likely low: it walks an account's
-/// authority with database reads.
+/// A permission / authorization check on the action's own declared authorizations
+/// (`require_auth`, `require_auth2`, `has_auth`, `require_recipient`). This is a
+/// linear scan over that small vector — the recursive authority walk (keys,
+/// sub-permissions, chained accounts) happens at transaction-authorization time,
+/// before the contract runs, and is billed there, not here. So this stays a fixed
+/// small cost. `is_account`, which does a real chainbase lookup, is priced as
+/// [`DB_FIND`] instead.
 pub const AUTH: u64 = 40;
 
-/// The fixed part of one row-level database operation (`db_find_i64`,
-/// `db_get_i64`, `db_store_i64`, `db_next_i64`, the secondary-index variants,
-/// …). Value-sized reads and writes add [`per_byte`]. PROVISIONAL and likely
-/// low: row I/O and index lookups are real work not yet measured.
-pub const DB_OP: u64 = 100;
+// ---------------------------------------------------------------------------
+// MEASURED — database (estimate_db_intrinsic_costs, 3x safety)
+// ---------------------------------------------------------------------------
+//
+// Row I/O is native FFI/chainbase work invisible to wasm metering, and it was the
+// worst PROVISIONAL under-charge: a single flat `DB_OP = 100` billed a write, a
+// keyed lookup, and an iterator step all the same, when measurement puts them
+// 24-160x higher and 6x apart from each other. Split into the three tiers the
+// benchmark actually separates. Secondary/wide-key indexes (idx128/idx256/
+// idx_double/idx_long_double) reuse the primary-index prices plus the 3x safety;
+// pricing their wider key comparisons exactly is a refinement follow-up.
+
+/// A row write: `db_store_i64` / `db_update_i64` / `db_remove_i64` and the
+/// secondary-index store/update/remove. Object alloc/free plus index maintenance;
+/// value bytes add [`db_value_per_byte`].
+pub const DB_STORE: u64 = 16_000;
+
+/// A keyed lookup or bound: `db_find_i64`, `db_lowerbound_i64`,
+/// `db_upperbound_i64`, `db_end_i64`, the secondary find/bound variants, and
+/// `is_account`.
+pub const DB_FIND: u64 = 6_500;
+
+/// One iterator step: `db_next_i64` / `db_previous_i64` and the secondary-index
+/// variants. Cheaper than a fresh lookup — it advances from a cached position.
+pub const DB_ITERATE: u64 = 2_500;
+
+/// Per-byte surcharge for reading or writing a row value (`db_store_i64`,
+/// `db_update_i64`, `db_get_i64`): measured value-copy slope, 3x safety.
+#[inline]
+pub fn db_value_per_byte(len: u64) -> u64 {
+    11 * len
+}
 
 /// A privileged intrinsic (`set_resource_limits`, `set_privileged`,
 /// `set_proposed_producers`, …).
@@ -115,9 +146,9 @@ pub const TRANSACTION: u64 = 40;
 /// variable part is [`per_byte`] of the output.
 pub const CONSOLE: u64 = 10;
 
-/// Per-byte surcharge for a PROVISIONAL intrinsic whose work scales with a
-/// buffer (console output, serialized transactions, database values): one point
-/// per byte. The measured families above use their own per-byte slopes instead.
+/// Per-byte surcharge for a PROVISIONAL intrinsic whose work scales with a buffer
+/// (console output, serialized transactions): one point per byte. The measured
+/// families above (hashes, memory, database values) use their own per-byte slopes.
 #[inline]
 pub fn per_byte(len: u64) -> u64 {
     len
