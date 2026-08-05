@@ -11,10 +11,15 @@
 //! changed it. Treat it like the pinned wasm feature set: adjust only through a
 //! coordinated upgrade.
 //!
-//! The values are scaled to the operator table (a wasm `Call` is 2, a multiply
-//! 3), not to measured wall-clock. They are a coherent starting point, not a
-//! benchmarked truth; the size-dependent ones charge one point per byte, on the
-//! order of the single wasm op that would otherwise touch each byte.
+//! The values below are PROVISIONAL: hand-scaled to the operator table (a wasm
+//! `Call` is 2, a multiply 3), not benchmarked. The `estimate_intrinsic_costs`
+//! tool (an ignored test in `wasm_runtime`) measures the real per-intrinsic cost;
+//! it finds these under-charge the exploitable paths (hashes, key recovery) by
+//! 30-800x. They are kept provisional rather than replaced with the measured
+//! numbers because those magnitudes only make sense once the point-to-time anchor
+//! and the CPU limits are reconciled to the same scale -- see
+//! `docs/intrinsic-cost-model.md`. The ordering here is deliberately conservative;
+//! the magnitudes are not yet trustworthy.
 //!
 //! [`WasmContext::charge`]: crate::chain::wasm_runtime::WasmContext::charge
 

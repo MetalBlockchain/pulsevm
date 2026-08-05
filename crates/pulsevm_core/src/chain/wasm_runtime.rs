@@ -948,4 +948,216 @@ mod tests {
         assert!(f.multi_value);
         assert!(f.extended_const);
     }
+
+    // Parameter estimator for the host-intrinsic cost table (webassembly::cost).
+    // Ignored: it's a calibration tool, not an assertion, and it takes a few
+    // seconds. Run it to (re)derive the table:
+    //
+    //   cargo test -p pulsevm_core --lib estimate_intrinsic_costs \
+    //     -- --ignored --nocapture
+    //
+    // Method (a stripped-down NEAR runtime-params-estimator):
+    //   1. Anchor. Run a compute-bound wasm loop on the real metered LLVM engine and read BOTH wall
+    //      time and points consumed from the metering middleware. Their ratio is ns-per-point on
+    //      this machine -- it ties the intrinsic prices to the same scale the operator table
+    //      already bills in, without hand-computing any operator cost.
+    //   2. Measure. Time each intrinsic's native work across input sizes and least-squares fit ns =
+    //      base + slope*bytes.
+    //   3. Convert. points = ns / ns_per_point, times a conservative SAFETY multiplier so a point
+    //      is an UPPER bound on real time (an under-charge is a DoS hole; an over-charge only costs
+    //      fairness).
+    //
+    // The absolute numbers are hardware-specific; the ratios and the resulting
+    // table are what get pinned. Anchoring to the current operator table means
+    // the table inherits that table's own lack of ns-calibration -- documented
+    // limitation, absorbed by SAFETY; a full recalibration of operators too is
+    // the deeper follow-up.
+    #[test]
+    #[ignore = "calibration tool; run manually with --ignored --nocapture"]
+    fn estimate_intrinsic_costs() {
+        use std::{
+            hint::black_box,
+            str::FromStr,
+            time::Instant,
+        };
+
+        use sha2::Digest as _;
+
+        use crate::{
+            crypto::PrivateKey,
+            utils::Digest as CoreDigest,
+        };
+
+        // Points are an upper bound on real time; bias high. NEAR historically
+        // used ~3x. Under-charging is the only unsafe direction.
+        const SAFETY: f64 = 3.0;
+
+        fn time_ns(iters: u32, mut f: impl FnMut()) -> f64 {
+            for _ in 0..(iters / 8).max(2) {
+                f();
+            }
+            let t = Instant::now();
+            for _ in 0..iters {
+                f();
+            }
+            (t.elapsed().as_nanos() as f64) / (iters as f64)
+        }
+
+        // Least-squares fit of ns = base + slope*bytes; clamp both non-negative.
+        fn fit(pts: &[(f64, f64)]) -> (f64, f64) {
+            let n = pts.len() as f64;
+            let sx: f64 = pts.iter().map(|p| p.0).sum();
+            let sy: f64 = pts.iter().map(|p| p.1).sum();
+            let sxx: f64 = pts.iter().map(|p| p.0 * p.0).sum();
+            let sxy: f64 = pts.iter().map(|p| p.0 * p.1).sum();
+            let slope = (n * sxy - sx * sy) / (n * sxx - sx * sx);
+            let base = (sy - slope * sx) / n;
+            (base.max(0.0), slope.max(0.0))
+        }
+
+        // --- 1. anchor: ns per metering point on the real engine ---
+        let wasm = wat::parse_str(
+            r#"
+            (module
+              (func (export "work") (param $n i64) (result i64)
+                (local $i i64) (local $acc i64)
+                (local.set $acc (i64.const 2))
+                (block $done
+                  (loop $l
+                    (br_if $done (i64.ge_u (local.get $i) (local.get $n)))
+                    (local.set $acc
+                      (i64.xor
+                        (i64.mul (local.get $acc) (i64.const 6364136223846793005))
+                        (i64.add (local.get $i) (i64.const 1442695040888963407))))
+                    (local.set $i (i64.add (local.get $i) (i64.const 1)))
+                    (br $l)))
+                (local.get $acc)))
+            "#,
+        )
+        .unwrap();
+        let mut store = Store::new(WasmRuntime::deterministic_engine());
+        let module = Module::new(&store, &wasm).unwrap();
+        let instance = Instance::new(&mut store, &module, &imports! {}).unwrap();
+        let work: TypedFunction<i64, i64> =
+            instance.exports.get_typed_function(&store, "work").unwrap();
+
+        const SEED: u64 = 1_000_000_000_000;
+        let n = 2_000_000i64;
+        for _ in 0..3 {
+            set_remaining_points(&mut store, &instance, SEED);
+            black_box(work.call(&mut store, n).unwrap());
+        }
+        let (mut total_ns, mut total_pts) = (0.0f64, 0u64);
+        for _ in 0..20 {
+            set_remaining_points(&mut store, &instance, SEED);
+            let t = Instant::now();
+            black_box(work.call(&mut store, n).unwrap());
+            total_ns += t.elapsed().as_nanos() as f64;
+            total_pts += match get_remaining_points(&mut store, &instance) {
+                MeteringPoints::Remaining(p) => SEED - p,
+                MeteringPoints::Exhausted => panic!("anchor loop exhausted the budget"),
+            };
+        }
+        let ns_per_point = total_ns / total_pts as f64;
+
+        let sizes = [0usize, 64, 256, 1024, 4096, 16384, 65536, 262144];
+        let iters_for = |s: usize| -> u32 {
+            if s >= 65536 {
+                400
+            } else if s >= 4096 {
+                3000
+            } else {
+                20000
+            }
+        };
+
+        println!("\n==== intrinsic cost estimate (hardware-specific) ====");
+        println!("anchor: {ns_per_point:.4} ns/point  ({total_pts} pts over {total_ns:.0} ns)");
+        println!("safety multiplier: {SAFETY}x\n");
+        println!(
+            "{:<14} {:>10} {:>12} {:>12} {:>14}",
+            "intrinsic", "base_pts", "per_byte", "bytes/pt", "shipped(base/pB)"
+        );
+
+        // sweep a sized intrinsic, fit, and print its candidate constants.
+        let mut report_sized = |name: &str, shipped_base: u64, mut work: Box<dyn FnMut(&[u8])>| {
+            let data: Vec<(f64, f64)> = sizes
+                .iter()
+                .map(|&s| {
+                    let buf = vec![0xa5u8; s];
+                    (s as f64, time_ns(iters_for(s), || work(black_box(&buf))))
+                })
+                .collect();
+            // Base is the fixed overhead measured at size 0; slope is fit over the
+            // linear region (>= 1 KiB) so small-size noise doesn't distort the
+            // intercept.
+            let base_ns = data[0].1;
+            let linear: Vec<(f64, f64)> = data.iter().copied().filter(|p| p.0 >= 1024.0).collect();
+            let (_, slope_ns) = fit(&linear);
+            let base_pts = (base_ns / ns_per_point * SAFETY).ceil();
+            let per_byte = slope_ns / ns_per_point * SAFETY;
+            let bytes_per_pt = if per_byte > 0.0 {
+                1.0 / per_byte
+            } else {
+                f64::INFINITY
+            };
+            println!(
+                "{name:<14} {base_pts:>10.0} {per_byte:>12.4} {bytes_per_pt:>12.1} {:>14}",
+                format!("{shipped_base}/1")
+            );
+        };
+
+        report_sized(
+            "sha256",
+            30,
+            Box::new(|b| {
+                black_box(sha2::Sha256::digest(b));
+            }),
+        );
+        report_sized(
+            "sha512",
+            30,
+            Box::new(|b| {
+                black_box(sha2::Sha512::digest(b));
+            }),
+        );
+        report_sized(
+            "sha1",
+            30,
+            Box::new(|b| {
+                black_box(sha1::Sha1::digest(b));
+            }),
+        );
+        report_sized(
+            "ripemd160",
+            30,
+            Box::new(|b| {
+                black_box(ripemd::Ripemd160::digest(b));
+            }),
+        );
+        // memcpy intrinsic ~ one alloc + read guest->buf + write buf->guest.
+        report_sized(
+            "memcpy",
+            10,
+            Box::new(|b| {
+                let mut buf = vec![0u8; b.len()];
+                buf.copy_from_slice(b);
+                let mut out = vec![0u8; b.len()];
+                out.copy_from_slice(&buf);
+                black_box((buf, out));
+            }),
+        );
+
+        // --- recover_key: fixed, no size sweep ---
+        let key = PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")
+            .unwrap();
+        let digest = CoreDigest::from_data(b"pulsevm-intrinsic-cost-benchmark");
+        let sig = key.sign(&digest).unwrap();
+        let recover_ns = time_ns(300, || {
+            black_box(sig.recover_public_key(black_box(&digest)).unwrap());
+        });
+        let recover_pts = (recover_ns / ns_per_point * SAFETY).ceil();
+        println!("\nrecover_key: {recover_ns:.0} ns -> {recover_pts:.0} pts (shipped 2000)");
+        println!("=====================================================\n");
+    }
 }
