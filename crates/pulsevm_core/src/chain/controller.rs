@@ -6092,6 +6092,94 @@ mod tests {
         Ok(())
     }
 
+    // The implicit onblock transaction runs on behalf of the privileged pulse
+    // account with no CPU ceiling: init_for_implicit_trx pins cpu_limit to -1,
+    // which wasm_runtime::run treats as an unlimited metering budget. Pin that
+    // end to end by deploying a contract on pulse whose apply burns far more
+    // metering points than max_transaction_cpu_usage allows: a regular input
+    // transaction invoking it must exhaust its finite CPU limit, while onblock
+    // must run the very same code to completion — which can only happen if the
+    // wasm runtime received -1.
+    #[tokio::test]
+    async fn onblock_passes_unlimited_cpu_limit_to_wasm() -> Result<(), ChainError> {
+        let (mut controller, private_key, _chain_id, _temp) = init_test_controller()?;
+        let ts = controller.last_accepted_block().timestamp().clone();
+        let chain_id = controller.chain_id().clone();
+        let status = BlockStatus::Building;
+
+        // Burns well over a million metering points: far above the 150k
+        // max_transaction_cpu_usage of the test genesis, far below the
+        // unlimited budget. Only the onblock and burn actions loop — the
+        // setcode action deploying this very contract also reaches apply
+        // (the receiver's code hash is read through a live reference after
+        // the native handler ran) and must not burn.
+        let onblock = ONBLOCK_NAME.as_u64() as i64;
+        let burn = Name::from_str("burn")?.as_u64() as i64;
+        let wasm = wat::parse_str(&format!(
+            r#"
+            (module
+              (memory (export "memory") 1)
+              (func (export "apply") (param i64 i64 i64)
+                (local $i i32)
+                (block $skip
+                  (br_if $skip
+                    (i32.and
+                      (i64.ne (local.get 2) (i64.const {onblock}))
+                      (i64.ne (local.get 2) (i64.const {burn}))))
+                  (local.set $i (i32.const 100000))
+                  (block $exit
+                    (loop $spin
+                      (br_if $exit (i32.eqz (local.get $i)))
+                      (local.set $i (i32.sub (local.get $i) (i32.const 1)))
+                      (br $spin))))))
+            "#,
+        ))
+        .unwrap();
+        controller.execute_transaction(
+            &set_code(&private_key, PULSE_NAME, wasm, chain_id)?,
+            &ts,
+            &status,
+        )?;
+
+        // Sanity: under an input transaction the same code must blow through
+        // the finite limit, proving the burn is heavy enough that onblock
+        // below can only succeed on the unlimited budget.
+        let res = controller.execute_transaction(
+            &call_contract(
+                &private_key,
+                PULSE_NAME,
+                Name::from_str("burn")?,
+                &Vec::<u8>::new(),
+                chain_id,
+            )?,
+            &ts,
+            &status,
+        );
+        let err = match res {
+            Ok(_) => panic!("an input transaction must not get an unlimited CPU budget"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("exhausted"),
+            "input transaction failed for the wrong reason: {err}"
+        );
+
+        // onblock is received by pulse, so it now runs the same contract —
+        // with the implicit transaction's unlimited CPU budget. A finite
+        // budget would trap, onblock would be skipped, and no digests would
+        // come back.
+        let timestamp: BlockTimestamp = TimePoint::now().into();
+        let previous = controller.preferred_id;
+        let digests =
+            controller.run_onblock(&timestamp, PULSE_NAME, previous, &BlockStatus::Building)?;
+        assert!(
+            !digests.is_empty(),
+            "onblock must run the pulse contract to completion under a CPU limit of -1"
+        );
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_push_transaction() -> Result<(), ChainError> {
         let chain_id =
