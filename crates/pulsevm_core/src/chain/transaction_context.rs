@@ -161,7 +161,13 @@ impl TransactionContext {
 
         inner.initialized = true;
         inner.is_input = is_input;
-        inner.cpu_limit = self.db.get_block_cpu_limit()? as i64;
+
+        // Implicit transactions (onblock, etc.) have no CPU limit, but input transactions
+        // are limited to the block's CPU limit.
+        if inner.is_input {
+            inner.cpu_limit = self.db.get_block_cpu_limit()? as i64;
+        }
+
         inner.net_limit = self.db.get_block_net_limit()?;
 
         let net_usage_leeway = {
@@ -176,8 +182,9 @@ impl TransactionContext {
 
             // Possibly lower cpu_limit to the maximum cpu usage a transaction is allowed to be
             // billed
-            if cfg.get_chain_config().get_max_transaction_cpu_usage() as u64
-                <= inner.cpu_limit as u64
+            if inner.is_input
+                && cfg.get_chain_config().get_max_transaction_cpu_usage() as u64
+                    <= inner.cpu_limit as u64
             {
                 inner.cpu_limit = cfg.get_chain_config().get_max_transaction_cpu_usage() as i64;
                 inner.cpu_limit_due_to_block = false;
