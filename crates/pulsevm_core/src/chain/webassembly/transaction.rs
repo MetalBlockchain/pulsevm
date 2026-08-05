@@ -10,6 +10,7 @@ use wasmer::{
     WasmPtr,
 };
 
+use super::cost;
 use crate::chain::{
     controller::Controller,
     transaction::Action,
@@ -35,7 +36,11 @@ pub fn send_inline(
         )?;
     }
 
-    let (env_data, store) = env.data_and_store_mut();
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(
+        &mut store,
+        cost::TRANSACTION + cost::per_byte(length as u64),
+    )?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -69,7 +74,11 @@ pub fn send_context_free_inline(
         )?;
     }
 
-    let (env_data, store) = env.data_and_store_mut();
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(
+        &mut store,
+        cost::TRANSACTION + cost::per_byte(length as u64),
+    )?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -92,7 +101,11 @@ pub fn read_transaction(
     trx_ptr: WasmPtr<u8>,
     trx_length: u32,
 ) -> Result<u32, RuntimeError> {
-    let (env_data, store) = env.data_and_store_mut();
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(
+        &mut store,
+        cost::TRANSACTION + cost::per_byte(trx_length as u64),
+    )?;
 
     // Pack the (base) transaction — exact pack format is part of consensus.
     let packed = env_data
@@ -121,8 +134,9 @@ pub fn read_transaction(
     Ok(copy_size as u32)
 }
 
-pub fn transaction_size(env: FunctionEnvMut<WasmContext>) -> Result<u32, RuntimeError> {
-    let env_data = env.data();
+pub fn transaction_size(mut env: FunctionEnvMut<WasmContext>) -> Result<u32, RuntimeError> {
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BASE)?;
     let size = env_data
         .apply_context()
         .get_packed_transaction()
@@ -132,8 +146,9 @@ pub fn transaction_size(env: FunctionEnvMut<WasmContext>) -> Result<u32, Runtime
     Ok(size as u32)
 }
 
-pub fn expiration(env: FunctionEnvMut<WasmContext>) -> Result<u32, RuntimeError> {
-    let env_data = env.data();
+pub fn expiration(mut env: FunctionEnvMut<WasmContext>) -> Result<u32, RuntimeError> {
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BASE)?;
     let trx = env_data
         .apply_context()
         .get_packed_transaction()
@@ -143,8 +158,9 @@ pub fn expiration(env: FunctionEnvMut<WasmContext>) -> Result<u32, RuntimeError>
     Ok(expiration.sec_since_epoch())
 }
 
-pub fn tapos_block_num(env: FunctionEnvMut<WasmContext>) -> Result<u32, RuntimeError> {
-    let env_data = env.data();
+pub fn tapos_block_num(mut env: FunctionEnvMut<WasmContext>) -> Result<u32, RuntimeError> {
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BASE)?;
     let trx = env_data
         .apply_context()
         .get_packed_transaction()
@@ -154,8 +170,9 @@ pub fn tapos_block_num(env: FunctionEnvMut<WasmContext>) -> Result<u32, RuntimeE
     Ok(ref_block_num as u32)
 }
 
-pub fn tapos_block_prefix(env: FunctionEnvMut<WasmContext>) -> Result<u32, RuntimeError> {
-    let env_data = env.data();
+pub fn tapos_block_prefix(mut env: FunctionEnvMut<WasmContext>) -> Result<u32, RuntimeError> {
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BASE)?;
     let trx = env_data
         .apply_context()
         .get_packed_transaction()
@@ -172,7 +189,8 @@ pub fn get_action(
     buffer_ptr: WasmPtr<u8>,
     buffer_size: u32,
 ) -> Result<i32, RuntimeError> {
-    let (env_data, store) = env.data_and_store_mut();
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::TRANSACTION)?;
 
     let memory = env_data
         .memory()

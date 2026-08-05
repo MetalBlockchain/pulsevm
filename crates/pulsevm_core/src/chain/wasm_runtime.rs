@@ -16,6 +16,7 @@ use pulsevm_ffi::{
     Database,
 };
 use wasmer::{
+    AsStoreMut,
     Engine,
     Function,
     FunctionEnv,
@@ -23,6 +24,7 @@ use wasmer::{
     Instance,
     Memory,
     Module,
+    RuntimeError,
     Store,
     imports,
     sys::{
@@ -230,6 +232,9 @@ pub struct WasmContext {
     context: ApplyContext,
     db: Database,
     memory: Option<Memory>,
+    // The running instance, captured after instantiation so a host intrinsic can
+    // bill its own work against the same metering budget the wasm body spends.
+    instance: Option<Instance>,
     return_value: Option<Bytes>,
 }
 
@@ -248,8 +253,31 @@ impl WasmContext {
             context,
             db,
             memory: None,
+            instance: None,
             return_value: None,
         }
+    }
+
+    /// Deduct `amount` metering points for a host intrinsic's own work, so an
+    /// intrinsic's cost lands in the same budget (and the same billed CPU) as the
+    /// wasm operators around it. Traps like the metering middleware would if the
+    /// budget can't cover it, rather than letting the work run for free.
+    ///
+    /// The point unit is the one COST_FUNCTION uses for wasm operators; the
+    /// per-intrinsic amounts live in the webassembly::cost module. Changing any
+    /// amount changes billed CPU, which is committed to the block, so it is a
+    /// consensus rule — every node must run the identical table.
+    pub fn charge(&self, store: &mut impl AsStoreMut, amount: u64) -> Result<(), RuntimeError> {
+        // The instance is captured only after `Instance::new`, so an intrinsic
+        // reached from a module's start/initializer during instantiation has no
+        // budget handle yet. That phase isn't billed anyway -- `run` reseeds the
+        // metering points after instantiation and measures only the `apply`
+        // call -- so skip the charge rather than fail instantiation. During
+        // `apply`, where billing happens, the instance is always set.
+        let Some(instance) = self.instance.as_ref() else {
+            return Ok(());
+        };
+        charge_metering_points(store, instance, amount)
     }
 
     pub fn receiver(&self) -> u64 {
@@ -286,6 +314,28 @@ impl WasmContext {
 
     pub fn set_action_return_value(&mut self, return_value: Bytes) {
         self.return_value = Some(return_value);
+    }
+}
+
+/// Deduct `amount` metering points from a running instance, or trap if the
+/// budget can't cover it. Shared by [`WasmContext::charge`] and its test; kept
+/// free of `WasmContext` so it can be exercised against a bare metered instance.
+fn charge_metering_points(
+    store: &mut impl AsStoreMut,
+    instance: &Instance,
+    amount: u64,
+) -> Result<(), RuntimeError> {
+    match get_remaining_points(store, instance) {
+        MeteringPoints::Remaining(remaining) if remaining >= amount => {
+            set_remaining_points(store, instance, remaining - amount);
+            Ok(())
+        }
+        _ => {
+            set_remaining_points(store, instance, 0);
+            Err(RuntimeError::new(
+                "cpu usage limit exceeded while charging a host intrinsic",
+            ))
+        }
     }
 }
 
@@ -702,6 +752,10 @@ impl WasmRuntime {
             }
         }
 
+        // Hand the instance to the env so host intrinsics can bill their work
+        // against the metering budget via WasmContext::charge.
+        warm.env.as_mut(&mut warm.store).instance = Some(instance.clone());
+
         // If CPU limit is -1, it means no limit, so we can set it to a very high value. Otherwise,
         // use the provided limit.
         let cpu_limit = if cpu_limit >= 0 {
@@ -775,9 +829,50 @@ mod tests {
         TypedFunction,
         imports,
     };
-    use wasmer_middlewares::metering::set_remaining_points;
+    use wasmer_middlewares::metering::{
+        MeteringPoints,
+        get_remaining_points,
+        set_remaining_points,
+    };
 
-    use super::WasmRuntime;
+    use super::{
+        WasmRuntime,
+        charge_metering_points,
+    };
+
+    // A host intrinsic bills its own work out of the same metering budget the
+    // wasm body spends: each charge lowers the remaining points by exactly the
+    // amount, and a charge the budget can't cover traps (and zeroes the budget)
+    // instead of running for free. This is what makes the per-intrinsic cost
+    // table in `webassembly::cost` actually reach billed CPU.
+    #[test]
+    fn charging_a_host_intrinsic_spends_metering_points() {
+        // Any module compiled on the metered engine carries the remaining-points
+        // global; the body is irrelevant, we only move the budget.
+        let wasm = wat::parse_str("(module)").unwrap();
+        let mut store = Store::new(WasmRuntime::deterministic_engine());
+        let module = Module::new(&store, &wasm).unwrap();
+        let instance = Instance::new(&mut store, &module, &imports! {}).unwrap();
+
+        set_remaining_points(&mut store, &instance, 1_000);
+
+        // Two successive charges (as an intrinsic's base + per-byte would) each
+        // subtract exactly their amount.
+        charge_metering_points(&mut store, &instance, 100).unwrap();
+        charge_metering_points(&mut store, &instance, 250).unwrap();
+        match get_remaining_points(&mut store, &instance) {
+            MeteringPoints::Remaining(p) => assert_eq!(p, 650),
+            MeteringPoints::Exhausted => panic!("budget should not be exhausted yet"),
+        }
+
+        // A charge larger than what's left traps (Err) and zeroes the budget, so
+        // a subsequent wasm op also runs out rather than resuming for free.
+        assert!(charge_metering_points(&mut store, &instance, 10_000).is_err());
+        match get_remaining_points(&mut store, &instance) {
+            MeteringPoints::Remaining(p) => assert_eq!(p, 0),
+            MeteringPoints::Exhausted => {}
+        }
+    }
 
     // Run a float op on the real deterministic_engine and feed it non-canonical
     // NaNs; each must come back as the one wasm canonical NaN. Off, the input

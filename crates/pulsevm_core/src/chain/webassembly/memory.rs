@@ -4,6 +4,7 @@ use wasmer::{
     WasmPtr,
 };
 
+use super::cost;
 use crate::wasm_runtime::WasmContext;
 
 #[inline]
@@ -17,7 +18,8 @@ pub fn memmove(
         return Ok(dest_ptr);
     }
 
-    let (env_data, store) = env.data_and_store_mut();
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::MEMORY + cost::per_byte(src_size as u64))?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -63,7 +65,8 @@ pub fn memcpy(
         return Ok(dest_ptr);
     }
 
-    let (env_data, store) = env.data_and_store_mut();
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::MEMORY + cost::per_byte(src_size as u64))?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -100,7 +103,8 @@ pub fn memset(
         return Ok(dest_ptr);
     }
 
-    let (env_data, store) = env.data_and_store_mut();
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::MEMORY + cost::per_byte(size as u64))?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -133,7 +137,8 @@ pub fn memcmp(
         return Ok(0);
     }
 
-    let (env_data, store) = env.data_and_store_mut();
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::MEMORY + cost::per_byte(length as u64))?;
     let memory = env_data
         .memory()
         .as_ref()

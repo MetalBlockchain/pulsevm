@@ -4,6 +4,7 @@ use wasmer::{
     WasmPtr,
 };
 
+use super::cost;
 use crate::{
     chain::webassembly::context_free_check,
     wasm_runtime::WasmContext,
@@ -16,7 +17,8 @@ pub fn get_context_free_data(
     buffer_size: u32,
 ) -> Result<i32, RuntimeError> {
     context_free_check(&env)?;
-    let (env_data, store) = env.data_and_store_mut();
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BASE + cost::per_byte(buffer_size as u64))?;
 
     let memory = env_data
         .memory()

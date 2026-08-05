@@ -48,6 +48,8 @@ use crate::{
     wasm_runtime::WasmContext,
 };
 
+use super::cost;
+
 pub fn __ashlti3(
     mut env: FunctionEnvMut<WasmContext>,
     ret_ptr: WasmPtr<u8>,
@@ -61,7 +63,8 @@ pub fn __ashlti3(
     // NOT shift-masking like __ashrti3. checked_shl returns None at >= 128.
     let result = value.checked_shl(shift).unwrap_or(0);
 
-    let (env_data, store) = env.data_and_store_mut();
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BUILTIN)?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -89,7 +92,8 @@ pub fn __ashrti3(
     // branch tests bit 6) — see note below
     let result = value.wrapping_shr(shift);
 
-    let (env_data, store) = env.data_and_store_mut();
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BUILTIN)?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -114,7 +118,8 @@ pub fn __lshlti3(
     // Same fc::uint128 semantics as __ashlti3: shift >= 128 is defined as zero
     let result = value.checked_shl(shift).unwrap_or(0);
 
-    let (env_data, store) = env.data_and_store_mut();
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BUILTIN)?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -139,7 +144,8 @@ pub fn __lshrti3(
     // path: operator>>= explicitly defines shift >= 128 as zero
     let result = value.checked_shr(shift).unwrap_or(0);
 
-    let (env_data, store) = env.data_and_store_mut();
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BUILTIN)?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -172,7 +178,8 @@ pub fn __divti3(
     // sign-and-unsigned-divide implementation; a bare `/` would panic
     let result = lhs.wrapping_div(rhs);
 
-    let (env_data, store) = env.data_and_store_mut();
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BUILTIN_DIV)?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -203,7 +210,8 @@ pub fn __udivti3(
     // Unsigned: no MIN/-1 overflow case exists, plain division is total
     let result = lhs / rhs;
 
-    let (env_data, store) = env.data_and_store_mut();
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BUILTIN_DIV)?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -231,7 +239,8 @@ pub fn __multi3(
     // panic in debug builds on overflow.
     let result = lhs.wrapping_mul(rhs);
 
-    let (env_data, store) = env.data_and_store_mut();
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BUILTIN)?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -262,7 +271,8 @@ pub fn __modti3(
     // i128::MIN % -1 must yield 0 without panicking (the lone overflow case)
     let result = lhs.wrapping_rem(rhs);
 
-    let (env_data, store) = env.data_and_store_mut();
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BUILTIN_DIV)?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -293,7 +303,8 @@ pub fn __umodti3(
     // overflow case, bare % cannot panic
     let result = lhs % rhs;
 
-    let (env_data, store) = env.data_and_store_mut();
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BUILTIN_DIV)?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -314,7 +325,8 @@ pub fn __addtf3(
     hb: u64,
 ) -> Result<(), RuntimeError> {
     let result = addtf3(la, ha, lb, hb);
-    let (env_data, store) = env.data_and_store_mut();
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BUILTIN)?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -339,7 +351,8 @@ pub fn __subtf3(
     hb: u64,
 ) -> Result<(), RuntimeError> {
     let result = subtf3(la, ha, lb, hb);
-    let (env_data, store) = env.data_and_store_mut();
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BUILTIN)?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -364,7 +377,8 @@ pub fn __multf3(
     hb: u64,
 ) -> Result<(), RuntimeError> {
     let result = multf3(la, ha, lb, hb);
-    let (env_data, store) = env.data_and_store_mut();
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BUILTIN)?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -389,7 +403,8 @@ pub fn __divtf3(
     hb: u64,
 ) -> Result<(), RuntimeError> {
     let result = divtf3(la, ha, lb, hb);
-    let (env_data, store) = env.data_and_store_mut();
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BUILTIN_DIV)?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -413,7 +428,8 @@ pub fn __negtf2(
 ) -> Result<(), RuntimeError> {
     // Flip the sign bit (bit 63 of the high limb); low limb unchanged.
     let result = negtf2(la, ha);
-    let (env_data, store) = env.data_and_store_mut();
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BUILTIN)?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -435,7 +451,8 @@ pub fn __extendsftf2(
     f: f32,
 ) -> Result<(), RuntimeError> {
     let result = extendsftf2(f);
-    let (env_data, store) = env.data_and_store_mut();
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BUILTIN)?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -458,7 +475,8 @@ pub fn __extenddftf2(
     d: f64,
 ) -> Result<(), RuntimeError> {
     let result = extenddftf2(d);
-    let (env_data, store) = env.data_and_store_mut();
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BUILTIN)?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -475,26 +493,42 @@ pub fn __extenddftf2(
 }
 
 pub fn __trunctfdf2(
-    _env: FunctionEnvMut<WasmContext>,
+    mut env: FunctionEnvMut<WasmContext>,
     la: u64,
     ha: u64,
 ) -> Result<f64, RuntimeError> {
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BUILTIN)?;
     Ok(trunctfdf2(la, ha))
 }
 
 pub fn __trunctfsf2(
-    _env: FunctionEnvMut<WasmContext>,
+    mut env: FunctionEnvMut<WasmContext>,
     la: u64,
     ha: u64,
 ) -> Result<f32, RuntimeError> {
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BUILTIN)?;
     Ok(trunctfsf2(la, ha))
 }
 
-pub fn __fixtfsi(_env: FunctionEnvMut<WasmContext>, la: u64, ha: u64) -> Result<i32, RuntimeError> {
+pub fn __fixtfsi(
+    mut env: FunctionEnvMut<WasmContext>,
+    la: u64,
+    ha: u64,
+) -> Result<i32, RuntimeError> {
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BUILTIN)?;
     Ok(fixtfsi(la, ha))
 }
 
-pub fn __fixtfdi(_env: FunctionEnvMut<WasmContext>, la: u64, ha: u64) -> Result<i64, RuntimeError> {
+pub fn __fixtfdi(
+    mut env: FunctionEnvMut<WasmContext>,
+    la: u64,
+    ha: u64,
+) -> Result<i64, RuntimeError> {
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BUILTIN)?;
     Ok(fixtfdi(la, ha))
 }
 
@@ -505,7 +539,8 @@ pub fn __fixtfti(
     h: u64,
 ) -> Result<(), RuntimeError> {
     let result = fixtfti(l, h); // the f128 -> i128 core function ported earlier
-    let (env_data, store) = env.data_and_store_mut();
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BUILTIN)?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -517,18 +552,22 @@ pub fn __fixtfti(
 }
 
 pub fn __fixunstfsi(
-    _env: FunctionEnvMut<WasmContext>,
+    mut env: FunctionEnvMut<WasmContext>,
     la: u64,
     ha: u64,
 ) -> Result<u32, RuntimeError> {
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BUILTIN)?;
     Ok(fixunstfsi(la, ha))
 }
 
 pub fn __fixunstfdi(
-    _env: FunctionEnvMut<WasmContext>,
+    mut env: FunctionEnvMut<WasmContext>,
     la: u64,
     ha: u64,
 ) -> Result<u64, RuntimeError> {
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BUILTIN)?;
     Ok(fixunstfdi(la, ha))
 }
 
@@ -539,7 +578,8 @@ pub fn __fixunstfti(
     h: u64,
 ) -> Result<(), RuntimeError> {
     let result = fixunstfti(l, h); // the f128 -> u128 core function ported earlier
-    let (env_data, store) = env.data_and_store_mut();
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BUILTIN)?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -555,7 +595,8 @@ pub fn __fixsfti(
     a: f32,
 ) -> Result<(), RuntimeError> {
     let result = fixsfti(a);
-    let (env_data, store) = env.data_and_store_mut();
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BUILTIN)?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -571,7 +612,8 @@ pub fn __fixdfti(
     a: f64,
 ) -> Result<(), RuntimeError> {
     let result = fixdfti(a); // to_softfloat64 -> u64 bit pattern
-    let (env_data, store) = env.data_and_store_mut();
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BUILTIN)?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -587,7 +629,8 @@ pub fn __fixunssfti(
     a: f32,
 ) -> Result<(), RuntimeError> {
     let result = fixunssfti(a);
-    let (env_data, store) = env.data_and_store_mut();
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BUILTIN)?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -603,7 +646,8 @@ pub fn __fixunsdfti(
     a: f64,
 ) -> Result<(), RuntimeError> {
     let result = fixunsdfti(a);
-    let (env_data, store) = env.data_and_store_mut();
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BUILTIN)?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -613,7 +657,9 @@ pub fn __fixunsdfti(
     Ok(())
 }
 
-pub fn __floatsidf(_env: FunctionEnvMut<WasmContext>, i: i32) -> Result<f64, RuntimeError> {
+pub fn __floatsidf(mut env: FunctionEnvMut<WasmContext>, i: i32) -> Result<f64, RuntimeError> {
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BUILTIN)?;
     Ok(floatsidf(i))
 }
 
@@ -624,7 +670,8 @@ pub fn __floatsitf(
 ) -> Result<(), RuntimeError> {
     let result = floatsitf(i);
 
-    let (env_data, store) = env.data_and_store_mut();
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BUILTIN)?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -646,7 +693,8 @@ pub fn __floatditf(
     i: u64,
 ) -> Result<(), RuntimeError> {
     let result = floatditf(i);
-    let (env_data, store) = env.data_and_store_mut();
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BUILTIN)?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -669,7 +717,8 @@ pub fn __floatunsitf(
 ) -> Result<(), RuntimeError> {
     let result = floatunsitf(i);
 
-    let (env_data, store) = env.data_and_store_mut();
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BUILTIN)?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -692,7 +741,8 @@ pub fn __floatunditf(
 ) -> Result<(), RuntimeError> {
     let result = floatunditf(i);
 
-    let (env_data, store) = env.data_and_store_mut();
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BUILTIN)?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -709,98 +759,118 @@ pub fn __floatunditf(
 }
 
 pub fn __floattidf(
-    _env: FunctionEnvMut<WasmContext>,
+    mut env: FunctionEnvMut<WasmContext>,
     la: u64,
     ha: u64,
 ) -> Result<f64, RuntimeError> {
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BUILTIN)?;
     Ok(floattidf(la, ha))
 }
 
 pub fn __floatuntidf(
-    _env: FunctionEnvMut<WasmContext>,
+    mut env: FunctionEnvMut<WasmContext>,
     la: u64,
     ha: u64,
 ) -> Result<f64, RuntimeError> {
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BUILTIN)?;
     Ok(floatuntidf(la, ha))
 }
 
 pub fn __eqtf2(
-    _env: FunctionEnvMut<WasmContext>,
+    mut env: FunctionEnvMut<WasmContext>,
     la: u64,
     ha: u64,
     lb: u64,
     hb: u64,
 ) -> Result<i32, RuntimeError> {
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BUILTIN)?;
     Ok(eqtf2(la, ha, lb, hb))
 }
 
 pub fn __netf2(
-    _env: FunctionEnvMut<WasmContext>,
+    mut env: FunctionEnvMut<WasmContext>,
     la: u64,
     ha: u64,
     lb: u64,
     hb: u64,
 ) -> Result<i32, RuntimeError> {
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BUILTIN)?;
     Ok(netf2(la, ha, lb, hb))
 }
 
 pub fn __getf2(
-    _env: FunctionEnvMut<WasmContext>,
+    mut env: FunctionEnvMut<WasmContext>,
     la: u64,
     ha: u64,
     lb: u64,
     hb: u64,
 ) -> Result<i32, RuntimeError> {
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BUILTIN)?;
     Ok(getf2(la, ha, lb, hb))
 }
 
 pub fn __gttf2(
-    _env: FunctionEnvMut<WasmContext>,
+    mut env: FunctionEnvMut<WasmContext>,
     la: u64,
     ha: u64,
     lb: u64,
     hb: u64,
 ) -> Result<i32, RuntimeError> {
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BUILTIN)?;
     Ok(gttf2(la, ha, lb, hb))
 }
 
 pub fn __letf2(
-    _env: FunctionEnvMut<WasmContext>,
+    mut env: FunctionEnvMut<WasmContext>,
     la: u64,
     ha: u64,
     lb: u64,
     hb: u64,
 ) -> Result<i32, RuntimeError> {
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BUILTIN)?;
     Ok(letf2(la, ha, lb, hb))
 }
 
 pub fn __lttf2(
-    _env: FunctionEnvMut<WasmContext>,
+    mut env: FunctionEnvMut<WasmContext>,
     la: u64,
     ha: u64,
     lb: u64,
     hb: u64,
 ) -> Result<i32, RuntimeError> {
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BUILTIN)?;
     Ok(lttf2(la, ha, lb, hb))
 }
 
 pub fn __cmptf2(
-    _env: FunctionEnvMut<WasmContext>,
+    mut env: FunctionEnvMut<WasmContext>,
     la: u64,
     ha: u64,
     lb: u64,
     hb: u64,
 ) -> Result<i32, RuntimeError> {
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BUILTIN)?;
     Ok(cmptf2(la, ha, lb, hb))
 }
 
 pub fn __unordtf2(
-    _env: FunctionEnvMut<WasmContext>,
+    mut env: FunctionEnvMut<WasmContext>,
     la: u64,
     ha: u64,
     lb: u64,
     hb: u64,
 ) -> Result<i32, RuntimeError> {
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BUILTIN)?;
     Ok(unordtf2(la, ha, lb, hb))
 }
 
