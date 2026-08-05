@@ -19,7 +19,7 @@ pub fn memmove(
     }
 
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::MEMORY + cost::per_byte(src_size as u64))?;
+    env_data.charge(&mut store, cost::memory(src_size as u64))?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -66,7 +66,7 @@ pub fn memcpy(
     }
 
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::MEMORY + cost::per_byte(src_size as u64))?;
+    env_data.charge(&mut store, cost::memory(src_size as u64))?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -104,7 +104,7 @@ pub fn memset(
     }
 
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::MEMORY + cost::per_byte(size as u64))?;
+    env_data.charge(&mut store, cost::memory(size as u64))?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -138,7 +138,7 @@ pub fn memcmp(
     }
 
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::MEMORY + cost::per_byte(length as u64))?;
+    env_data.charge(&mut store, cost::memory(length as u64))?;
     let memory = env_data
         .memory()
         .as_ref()

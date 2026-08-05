@@ -76,28 +76,34 @@ So the intrinsic table can't be fixed in isolation. The three quantities —
 operator costs, intrinsic costs, and the CPU limits — must share one physical
 anchor.
 
-## Recommended calibration
+## Calibration applied (step "a")
 
-1. **Pin the point↔time anchor.** Keep the fine unit (forced by per-op metering)
-   and state it explicitly: ~37,900 points/µs on reference hardware, i.e.
-   `points ≈ µs × 37,900`. Equivalently, define a `POINTS_PER_US` constant so a
-   µs-denominated config translates deterministically.
-2. **Set the intrinsic table from the estimator** (this doc's numbers × safety),
-   rounded to stable integers. Replace the flat `per_byte = len` with per-family
-   coefficients — sha256 ≈ 35/byte, ripemd160 ≈ 275/byte, memcpy ≈ 10/byte — since
-   they differ by ~8×.
-3. **Reconcile the CPU limits** to the same anchor: genesis
-   `max_transaction_cpu_usage` / `max_block_cpu_usage` expressed in points
-   (µs × POINTS_PER_US), so a block's budget is a real wall-clock budget and the
-   metered limit doubles as a checktime bound (also closes the native-handler
-   checktime gap).
-4. **Guard against drift.** Re-run the estimator on a wasmer bump or a hashing-lib
-   change; a materially different ratio means the pinned table (a consensus value)
-   needs a deliberate revision.
+1. **Anchor pinned.** `config::POINTS_PER_US = 38_000` — the measured
+   points-per-µs on reference hardware, and the bridge from a µs intuition to a
+   point budget. Changing it rescales billed CPU, so it's a consensus value.
+2. **Measured table applied** for the benchmarked families: `cost::sha256`,
+   `sha512`, `sha1`, `ripemd160`, `memory` (base + their own per-byte slope, no
+   longer a flat `per_byte`), and `RECOVER_KEY`. Rounded to stable integers.
+3. **CPU limits reconciled** in `genesis.json` via the anchor:
+   `max_block_cpu_usage = 3e9` (~79 ms), `max_transaction_cpu_usage = 1e9`
+   (~26 ms), `min_transaction_cpu_usage = 1e5` — all under the u32 per-tx cap, and
+   large enough that a correctly-priced key recovery (~1.65M points) is
+   affordable. A block's budget is now a real wall-clock budget, so the metered
+   limit doubles as a checktime bound (which also addresses the native-handler
+   checktime gap). The *test* genesis is left at its small limits on purpose —
+   `onblock_passes_unlimited_cpu_limit_to_wasm` relies on a tight budget to prove
+   the unlimited-implicit-trx path.
+4. **Drift guard.** Re-run the estimator on a wasmer bump or a hashing-lib change;
+   a materially different ratio means the pinned table (a consensus value) needs a
+   deliberate revision.
 
-Until (1) and (3) are decided, `cost.rs` keeps its provisional hand-picked values
-— deliberately conservative *ordering* but wrong *magnitude* — rather than the
-measured numbers, which would be correct but unusable under the current limits.
+Still **provisional** (not benchmarked): the database, authority, builtin,
+console, and getter intrinsics — see `cost.rs`. The database and authority ones
+do real work (row I/O, authority walks) and are the next estimator to build (they
+need a stateful harness). Their prices sit on the old hand-scaled scale and are
+almost certainly low; the mixed scale is documented in `cost.rs`, not hidden. A
+full recalibration of the *operator* table against the same anchor (step "b") is
+the deeper follow-up.
 
 ## Caveats / not yet measured
 

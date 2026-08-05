@@ -103,7 +103,7 @@ pub fn sha1(
     out_ptr: WasmPtr<u8>,
 ) -> Result<(), RuntimeError> {
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::HASH + cost::per_byte(msg_size as u64))?;
+    env_data.charge(&mut store, cost::sha1(msg_size as u64))?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -127,7 +127,7 @@ pub fn sha224(
     out_ptr: WasmPtr<u8>,
 ) -> Result<(), RuntimeError> {
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::HASH + cost::per_byte(msg_size as u64))?;
+    env_data.charge(&mut store, cost::sha256(msg_size as u64))?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -151,7 +151,7 @@ pub fn sha256(
     out_ptr: WasmPtr<u8>,
 ) -> Result<(), RuntimeError> {
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::HASH + cost::per_byte(msg_size as u64))?;
+    env_data.charge(&mut store, cost::sha256(msg_size as u64))?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -175,7 +175,7 @@ pub fn sha512(
     out_ptr: WasmPtr<u8>,
 ) -> Result<(), RuntimeError> {
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::HASH + cost::per_byte(msg_size as u64))?;
+    env_data.charge(&mut store, cost::sha512(msg_size as u64))?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -199,7 +199,7 @@ pub fn ripemd160(
     out_ptr: WasmPtr<u8>,
 ) -> Result<(), RuntimeError> {
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::HASH + cost::per_byte(msg_size as u64))?;
+    env_data.charge(&mut store, cost::ripemd160(msg_size as u64))?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -223,7 +223,7 @@ pub fn assert_sha1(
     hash_val_ptr: WasmPtr<u8>,
 ) -> Result<(), RuntimeError> {
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::HASH + cost::per_byte(data_size as u64))?;
+    env_data.charge(&mut store, cost::sha1(data_size as u64))?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -264,7 +264,7 @@ pub fn assert_sha224(
     hash_val_ptr: WasmPtr<u8>,
 ) -> Result<(), RuntimeError> {
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::HASH + cost::per_byte(data_size as u64))?;
+    env_data.charge(&mut store, cost::sha256(data_size as u64))?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -305,7 +305,7 @@ pub fn assert_sha256(
     hash_val_ptr: WasmPtr<u8>,
 ) -> Result<(), RuntimeError> {
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::HASH + cost::per_byte(data_size as u64))?;
+    env_data.charge(&mut store, cost::sha256(data_size as u64))?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -346,7 +346,7 @@ pub fn assert_sha512(
     hash_val_ptr: WasmPtr<u8>,
 ) -> Result<(), RuntimeError> {
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::HASH + cost::per_byte(data_size as u64))?;
+    env_data.charge(&mut store, cost::sha512(data_size as u64))?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -387,7 +387,7 @@ pub fn assert_ripemd160(
     hash_val_ptr: WasmPtr<u8>,
 ) -> Result<(), RuntimeError> {
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::HASH + cost::per_byte(data_size as u64))?;
+    env_data.charge(&mut store, cost::ripemd160(data_size as u64))?;
     let memory = env_data
         .memory()
         .as_ref()
