@@ -153,3 +153,33 @@ pub const CONSOLE: u64 = 10;
 pub fn per_byte(len: u64) -> u64 {
     len
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // These amounts are consensus values: metered points become billed CPU that is
+    // committed to the block, so an accidental edit forks a network that didn't
+    // also change it. This test pins the numbers the estimators produced. If you
+    // change a cost deliberately (a coordinated upgrade), update the expected value
+    // here in the same commit; if it fails unexpectedly, a cost was edited by
+    // accident. See docs/intrinsic-cost-model.md.
+    #[test]
+    fn costs_are_pinned() {
+        // MEASURED crypto / memory: base at len 0, plus their own per-byte slope.
+        assert_eq!((sha256(0), sha256(1)), (2_000, 2_035));
+        assert_eq!(sha512(0), 5_800);
+        assert_eq!(sha1(0), 5_500);
+        assert_eq!((ripemd160(0), ripemd160(1)), (16_600, 16_876));
+        assert_eq!((memory(0), memory(1)), (300, 310));
+        assert_eq!(RECOVER_KEY, 1_650_000);
+
+        // MEASURED database tiers + value byte.
+        assert_eq!((DB_STORE, DB_FIND, DB_ITERATE), (16_000, 6_500, 2_500));
+        assert_eq!(db_value_per_byte(256), 11 * 256);
+
+        // PROVISIONAL fixed costs.
+        assert_eq!((BASE, AUTH), (5, 40));
+        assert_eq!(per_byte(100), 100);
+    }
+}

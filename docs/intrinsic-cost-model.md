@@ -152,8 +152,10 @@ genesis, and a contract doing a few dozen row writes exhausted it. `Controller::
 now pushes the genesis block parameters in at genesis, so block 1 uses the real
 ceiling. Related: the `cpu_limit == -1` "unlimited" path (system implicit
 transactions like onblock) seeded a 300M placeholder that is now *smaller* than a
-normal transaction's budget; it seeds `u64::MAX` instead, so a system action can't
-trap where a user transaction wouldn't.
+normal transaction's budget; it seeds `config::IMPLICIT_TX_CPU_BUDGET` instead — a
+large but finite ~1 s ceiling (`POINTS_PER_US * 1e6`, ~38x a full transaction), so
+a system action can't trap where a user transaction wouldn't, while a runaway loop
+still stops (there's no native-code checktime deadline yet).
 
 ## Caveats / not yet measured
 

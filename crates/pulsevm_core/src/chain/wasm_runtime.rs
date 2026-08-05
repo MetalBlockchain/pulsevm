@@ -765,15 +765,16 @@ impl WasmRuntime {
         // against the metering budget via WasmContext::charge.
         warm.env.as_mut(&mut warm.store).instance = Some(instance.clone());
 
-        // cpu_limit == -1 means no limit (only the system's own implicit
-        // transactions, e.g. onblock, get this). Seed the budget with u64::MAX so it
-        // is genuinely unbounded: the old 300M placeholder is now smaller than a
-        // normal transaction's budget once intrinsics are metered in points, which
-        // would wrongly trap a system action that a user transaction could afford.
+        // cpu_limit == -1 means no account/block limit (only the system's own
+        // implicit transactions, e.g. onblock, get this). Seed a large finite
+        // budget: the old 300M placeholder was smaller than a normal transaction
+        // once intrinsics are metered in points (so it could wrongly trap a system
+        // action a user tx could afford), but leaving it truly unbounded would let a
+        // buggy system contract spin forever. See config::IMPLICIT_TX_CPU_BUDGET.
         let cpu_limit = if cpu_limit >= 0 {
             cpu_limit as u64
         } else {
-            u64::MAX
+            crate::config::IMPLICIT_TX_CPU_BUDGET
         };
 
         // Set initial metering points based on resource limits
@@ -884,6 +885,28 @@ mod tests {
             MeteringPoints::Remaining(p) => assert_eq!(p, 0),
             MeteringPoints::Exhausted => {}
         }
+    }
+
+    // Operator prices are consensus values (they become billed CPU committed to the
+    // block), so pin the ones the estimator corrected. If you change COST_FUNCTION
+    // deliberately, update this in the same commit; an unexpected failure means an
+    // operator cost was edited by accident. See docs/intrinsic-cost-model.md.
+    #[test]
+    fn operator_costs_are_pinned() {
+        use wasmer::wasmparser::Operator;
+
+        use super::COST_FUNCTION;
+
+        // Floating point: the estimator's headline fix (shipped 1-3, measured 80/110/26/20).
+        assert_eq!(COST_FUNCTION(&Operator::F64Div), 80);
+        assert_eq!(COST_FUNCTION(&Operator::F64Sqrt), 110);
+        assert_eq!(COST_FUNCTION(&Operator::F64Mul), 26);
+        assert_eq!(COST_FUNCTION(&Operator::F64Add), 20);
+        assert_eq!(COST_FUNCTION(&Operator::F32Div), 80);
+        // Integer arithmetic kept its structural weights (folds under LLVM).
+        assert_eq!(COST_FUNCTION(&Operator::I64DivU), 80);
+        assert_eq!(COST_FUNCTION(&Operator::I64Mul), 3);
+        assert_eq!(COST_FUNCTION(&Operator::I64Add), 1); // default
     }
 
     // Run a float op on the real deterministic_engine and feed it non-canonical
