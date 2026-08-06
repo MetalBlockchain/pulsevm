@@ -721,6 +721,12 @@ impl WasmRuntime {
         // Resume timer
         apply_context.resume_billing_timer()?;
 
+        // Compilation ran inside the paused window above and can be a slow native
+        // window on a cache miss; the deadline measures raw wall-clock, so re-check
+        // it now — before the guest runs — to abandon a transaction that already
+        // blew its budget compiling rather than sink more time into execution.
+        apply_context.checktime()?;
+
         let result = apply_func
             .call(
                 &mut warm.store,

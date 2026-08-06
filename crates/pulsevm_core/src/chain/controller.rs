@@ -1078,6 +1078,7 @@ impl Controller {
             &trx_id,
             *block_status,
             packed,
+            self.max_transaction_time_ms(),
         );
 
         let executed = (|| -> Result<VecDeque<Digest>, ChainError> {
@@ -1254,6 +1255,16 @@ impl Controller {
     /// As `execute_transaction`, but when `explicit_billed` is set (applying an
     /// already-accepted block) it bills the block-recorded cpu/net and skips the
     /// objective resource-limit checks — Antelope light/replay validation.
+    // The node-local wall-clock ceiling for a single transaction (see
+    // NodeConfig::max_transaction_time_ms). Falls back to a generous default when
+    // no config is loaded (a bare test controller).
+    fn max_transaction_time_ms(&self) -> u32 {
+        self.node_config
+            .as_ref()
+            .map(|c| c.max_transaction_time_ms)
+            .unwrap_or(30_000)
+    }
+
     pub fn execute_transaction_billed(
         &mut self,
         packed_transaction: &PackedTransaction,
@@ -1286,6 +1297,7 @@ impl Controller {
             packed_transaction.id(),
             *block_status,
             packed_transaction.clone(),
+            self.max_transaction_time_ms(),
         );
 
         // Applying an already-accepted block: bill the recorded cpu/net and
@@ -1801,6 +1813,67 @@ mod tests {
                     ACTIVE_NAME.as_u64(),
                 )],
             )],
+        )
+        .sign(&private_key, &chain_id)?;
+        let packed_trx = PackedTransaction::from_signed_transaction(trx)?;
+        Ok(packed_trx)
+    }
+
+    // A distinct, valid account name for index `i` (prefix keeps it from starting
+    // with a digit; three base-26 letters give ~17k unique names).
+    fn nth_account_name(i: usize) -> Name {
+        let alphabet = b"abcdefghijklmnopqrstuvwxyz";
+        let mut n = i;
+        let mut bytes = vec![b'a'];
+        for _ in 0..3 {
+            bytes.push(alphabet[n % 26]);
+            n /= 26;
+        }
+        Name::from_str(std::str::from_utf8(&bytes).unwrap()).unwrap()
+    }
+
+    // One transaction that creates `count` accounts, i.e. `count` newaccount
+    // actions in a single transaction. Each action re-enters execute_action and so
+    // hits the wall-clock checktime at its head.
+    fn create_many_accounts(
+        private_key: &PrivateKey,
+        count: usize,
+        chain_id: Id,
+    ) -> Result<PackedTransaction, ChainError> {
+        let actions = (0..count)
+            .map(|i| {
+                Action::new(
+                    Name::from_str("pulse").unwrap(),
+                    Name::from_str("newaccount").unwrap(),
+                    NewAccount {
+                        creator: Name::from_str("pulse").unwrap(),
+                        name: nth_account_name(i),
+                        owner: Authority::new(
+                            1,
+                            vec![KeyWeight::new(private_key.get_public_key().into(), 1)],
+                            vec![],
+                            vec![],
+                        ),
+                        active: Authority::new(
+                            1,
+                            vec![KeyWeight::new(private_key.get_public_key().into(), 1)],
+                            vec![],
+                            vec![],
+                        ),
+                    }
+                    .pack()
+                    .unwrap(),
+                    vec![PermissionLevel::new(
+                        PULSE_NAME.as_u64(),
+                        ACTIVE_NAME.as_u64(),
+                    )],
+                )
+            })
+            .collect();
+        let trx = Transaction::new(
+            TransactionHeader::new(TimePointSec::maximum(), 0, 0, 0u32.into(), 0, 0u32.into()),
+            vec![],
+            actions,
         )
         .sign(&private_key, &chain_id)?;
         let packed_trx = PackedTransaction::from_signed_transaction(trx)?;
@@ -6178,6 +6251,144 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    // Wiring check for the wall-clock deadline: a node configured with a zero
+    // max_transaction_time gives every transaction no time to run, so the checktime
+    // call at the head of execute_action trips on the first action. Proves the
+    // guard is actually invoked on the execution path and surfaces as the subjective
+    // DeadlineError (not an objective CPU/apply failure).
+    #[tokio::test]
+    async fn zero_max_transaction_time_trips_checktime() -> Result<(), ChainError> {
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
+        let private_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let mut controller = Controller::new();
+        let genesis_bytes = generate_genesis(&private_key);
+        let temp_path = get_temp_dir();
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": private_key.to_string(),
+            "max_transaction_time_ms": 0,
+        })
+        .to_string()
+        .into_bytes();
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &genesis_bytes.to_vec(),
+            temp_path.path().to_str().unwrap(),
+        )?;
+        let ts = controller.last_accepted_block().timestamp().clone();
+        let chain_id = controller.chain_id().clone();
+        let status = BlockStatus::Building;
+
+        let result = controller.execute_transaction(
+            &create_account(&private_key, Name::from_str("glenn")?, chain_id)?,
+            &ts,
+            &status,
+        );
+        match result {
+            Err(ChainError::DeadlineError(_)) => Ok(()),
+            Err(e) => panic!("expected a DeadlineError, got a different error: {e}"),
+            Ok(_) => panic!("expected a DeadlineError, but the transaction succeeded"),
+        }
+    }
+
+    // The subjectivity guarantee: with the SAME zero max_transaction_time that trips
+    // a normal transaction above, the explicit-billing path — the one block
+    // validation/replay uses (execute_transaction_billed with recorded cpu/net) —
+    // must run to completion, never tripping the wall-clock deadline. Otherwise a
+    // slow validator would reject a block a faster producer made.
+    #[tokio::test]
+    async fn explicit_billing_is_exempt_from_checktime() -> Result<(), ChainError> {
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
+        let private_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let mut controller = Controller::new();
+        let genesis_bytes = generate_genesis(&private_key);
+        let temp_path = get_temp_dir();
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": private_key.to_string(),
+            "max_transaction_time_ms": 0,
+        })
+        .to_string()
+        .into_bytes();
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &genesis_bytes.to_vec(),
+            temp_path.path().to_str().unwrap(),
+        )?;
+        let ts = controller.last_accepted_block().timestamp().clone();
+        let chain_id = controller.chain_id().clone();
+        let status = BlockStatus::Building;
+
+        // Some(..) marks the transaction as explicitly billed, exactly as
+        // execute_block supplies the block-recorded cpu/net during validation.
+        let result = controller.execute_transaction_billed(
+            &create_account(&private_key, Name::from_str("glenn")?, chain_id)?,
+            &ts,
+            &status,
+            Some((200, 12)),
+        );
+        if let Err(ChainError::DeadlineError(_)) = result {
+            panic!("explicit-billed transaction must be exempt from the wall-clock deadline");
+        }
+        result.map(|_| ())
+    }
+
+    // The real accumulation case (as opposed to the degenerate zero-deadline trip
+    // above): one transaction whose many newaccount actions genuinely take longer
+    // than a 1 ms wall-clock ceiling to run. Each action re-enters execute_action
+    // and re-checks the deadline, so once the running total crosses 1 ms the
+    // transaction is abandoned mid-way with a DeadlineError — not a CPU/RAM trap
+    // (metering is per-action and no single newaccount is close to its limit).
+    //
+    // Two things make this stable rather than flaky. The ceiling is the smallest
+    // non-zero value the config allows (1 ms), and the action count is far larger
+    // than needed: execution stops after ~1 ms of work regardless of how many
+    // actions remain, so a big count is nearly free and only guarantees there is
+    // always more work queued than a fast machine can finish inside 1 ms.
+    #[tokio::test]
+    async fn slow_multi_action_transaction_trips_checktime() -> Result<(), ChainError> {
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
+        let private_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let mut controller = Controller::new();
+        let genesis_bytes = generate_genesis(&private_key);
+        let temp_path = get_temp_dir();
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": private_key.to_string(),
+            "max_transaction_time_ms": 1,
+        })
+        .to_string()
+        .into_bytes();
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &genesis_bytes.to_vec(),
+            temp_path.path().to_str().unwrap(),
+        )?;
+        let ts = controller.last_accepted_block().timestamp().clone();
+        let chain_id = controller.chain_id().clone();
+        let status = BlockStatus::Building;
+
+        let trx = create_many_accounts(&private_key, 1000, chain_id)?;
+        let result = controller.execute_transaction(&trx, &ts, &status);
+        match result {
+            Err(ChainError::DeadlineError(_)) => Ok(()),
+            Err(e) => panic!("expected a DeadlineError, got a different error: {e}"),
+            Ok(_) => panic!("expected a DeadlineError, but the transaction succeeded"),
+        }
     }
 
     #[tokio::test]
