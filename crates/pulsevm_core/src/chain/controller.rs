@@ -2300,15 +2300,12 @@ mod tests {
     /// (reference_contracts/pulse_system.wasm) on this node: deploy the token,
     /// create and issue the core token, create the fee/stake accounts the system
     /// contract hardcodes (pulse.ram/ramfee/rex/stake — decoded from the wasm),
-    /// deploy the 80KB privileged system contract onto `pulse`, and run `init`.
-    /// Getting through `init` proves the node can compile, instantiate, dispatch
-    /// into, and satisfy every host-function and precondition the system contract
-    /// needs — i.e. the resource-market/governance layer runs here.
+    /// deploy the 80KB privileged system contract onto `pulse`, run `init`, bring
+    /// the RAM market to life with `setram`, and settle a real `buyrambsys`
+    /// purchase — the full resource-market path runs on this node.
     ///
-    /// Driving the market/governance actions themselves (buyram, delegatebw,
-    /// regproducer, voteproducer) needs the system contract's ABI to pack their
-    /// args, which isn't shipped in-repo; the RAM purchase below is a best-effort
-    /// probe that dispatches into the contract but isn't asserted for that reason.
+    /// Action signatures match the Proton eosio.system source (our wasm is a
+    /// smaller build of it); args are packed directly here rather than via the ABI.
     #[tokio::test]
     async fn bootstrap_system_contract() -> Result<(), ChainError> {
         let chain_id =
@@ -2499,6 +2496,19 @@ mod tests {
             )?
         );
 
+        // alice was created by the native newaccount handler, which (like EOSIO)
+        // leaves her resource limits unlimited (-1). buyram grants the receiver
+        // `current_ram_limit + gift`, so on an unlimited account that underflows to
+        // a tiny value and the account can't cover the rows the purchase writes. On
+        // a real chain the system contract's own newaccount meters accounts first;
+        // this 80KB build doesn't expose setalimits, so provision alice directly
+        // through the node (the same effect) before buying.
+        let alice = Name::from_str("alice")?;
+        {
+            let mut db = controller.database();
+            db.set_account_limits(alice.as_u64(), 8 * 1024, 1_000_000, 1_000_000)?;
+        }
+
         // Drive the RAM market. Signatures confirmed against the Proton
         // eosio.system source (this wasm is a smaller build of that contract):
         // buyrambsys(name payer, name receiver, uint32 bytes) reserves a fixed
@@ -2509,19 +2519,9 @@ mod tests {
             receiver: Name,
             bytes: u32,
         }
-        // Probe (reported, not asserted): buy RAM for an ordinary account (alice),
-        // paid for by pulse. This drives the whole market pipeline — auth, the
-        // Proton permission check, the inline token transfer, bancor pricing, and
-        // the set_resource_limits grant. It currently fails the receiver's RAM
-        // verification because the market conversion yields ~0 bytes regardless of
-        // the purchase size (alice keeps only the ~1400-byte RAM gift), so the
-        // grant never covers the userres rows the purchase itself writes. The
-        // market's reserves/conversion aren't taking effect on this node (init
-        // liquidity + the setram delta, and/or inline-action effects on the
-        // rammarket table) — the next thing to debug for a fully settled purchase.
-        let alice = Name::from_str("alice")?;
-        let probe = controller.execute_transaction(
-            &call_contract(
+        step!(
+            "7 buyrambsys for alice",
+            call_contract(
                 &private_key,
                 pulse,
                 Name::from_str("buyrambsys")?,
@@ -2531,13 +2531,10 @@ mod tests {
                     bytes: 8192,
                 },
                 chain_id,
-            )?,
-            &ts,
-            &status,
+            )?
         );
-        eprintln!("BOOT probe (buyrambsys for alice): {}", fmt_res(&probe));
 
-        eprintln!("BOOT: system contract bootstrapped, initialized, RAM market live");
+        eprintln!("BOOT: system contract bootstrapped, initialized, and RAM purchased");
         Ok(())
     }
 
