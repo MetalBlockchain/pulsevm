@@ -12,6 +12,7 @@ use wasmer::{
     WasmPtr,
 };
 
+use super::cost;
 use crate::chain::{
     apply_context::ApplyContext,
     producer_schedule::{
@@ -54,7 +55,11 @@ pub fn set_proposed_producers(
         )),
     )?;
 
-    let (env_data, store) = env.data_and_store_mut();
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(
+        &mut store,
+        cost::PRIVILEGED + cost::per_byte(data_len as u64),
+    )?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -118,7 +123,12 @@ pub fn get_blockchain_parameters_packed(
     _data_len: u32,
 ) -> Result<u32, RuntimeError> {
     context_aware_check(&env)?;
-    let context = env.data_mut().apply_context_mut();
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(
+        &mut store,
+        cost::PRIVILEGED + cost::per_byte(_data_len as u64),
+    )?;
+    let context = env_data.apply_context_mut();
     privileged_check(context)?;
     Ok(0)
 }
@@ -134,7 +144,11 @@ pub fn set_blockchain_parameters_packed(
         privileged_check(context)?;
     }
 
-    let (env_data, store) = env.data_and_store_mut();
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(
+        &mut store,
+        cost::PRIVILEGED + cost::per_byte(data_len as u64),
+    )?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -156,9 +170,11 @@ pub fn is_privileged(
     account: u64,
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
-    let context = env.data_mut().apply_context_mut();
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::PRIVILEGED)?;
+    let context = env_data.apply_context_mut();
     privileged_check(context)?;
-    let db = env.data().db();
+    let db = env_data.db();
     let account = db.get_account_metadata(account)?;
 
     Ok(account.is_privileged() as i32)
@@ -170,7 +186,9 @@ pub fn set_privileged(
     is_priv: i32,
 ) -> Result<(), RuntimeError> {
     context_aware_check(&env)?;
-    let context = env.data_mut().apply_context_mut();
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::PRIVILEGED)?;
+    let context = env_data.apply_context_mut();
     privileged_check(context)?;
     context.set_privileged(account, is_priv == 1)?;
     Ok(())
@@ -184,6 +202,8 @@ pub fn set_resource_limits(
     cpu_weight: i64,
 ) -> Result<(), RuntimeError> {
     context_aware_check(&env)?;
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::PRIVILEGED)?;
     pulse_assert(
         ram_bytes >= -1,
         ChainError::WasmRuntimeError(format!(
@@ -202,9 +222,9 @@ pub fn set_resource_limits(
             "invalid value for cpu resource limit expected [-1,INT64_MAX]"
         )),
     )?;
-    let context = env.data_mut().apply_context_mut();
+    let context = env_data.apply_context_mut();
     privileged_check(context)?;
-    let mut db = env.data_mut().db_mut();
+    let mut db = env_data.db_mut();
     ResourceLimitsManager::set_account_limits(
         &mut db,
         &account.into(),
@@ -224,7 +244,8 @@ pub fn get_resource_limits(
     cpu_weight_ptr: WasmPtr<u8>,
 ) -> Result<(), RuntimeError> {
     context_aware_check(&env)?;
-    let (env_data, store) = env.data_and_store_mut();
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::PRIVILEGED)?;
     let context = env_data.apply_context_mut();
     privileged_check(context)?;
     let mut db = env_data.db_mut();

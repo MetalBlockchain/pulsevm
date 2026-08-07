@@ -12,9 +12,13 @@ use crate::chain::{
     webassembly::context_aware_check,
 };
 
+use super::cost;
+
 #[inline]
-pub fn action_data_size(env: FunctionEnvMut<WasmContext>) -> i32 {
-    env.data().action().data().len() as i32
+pub fn action_data_size(mut env: FunctionEnvMut<WasmContext>) -> Result<i32, RuntimeError> {
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BASE)?;
+    Ok(env_data.action().data().len() as i32)
 }
 
 #[inline]
@@ -23,7 +27,8 @@ pub fn read_action_data(
     buffer_ptr: WasmPtr<u8>,
     buffer_len: u32,
 ) -> Result<i32, RuntimeError> {
-    let (env_data, store) = env.data_and_store_mut();
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BASE + cost::per_byte(buffer_len as u64))?;
     let action_data = env_data.action().data();
     let total_len = action_data.len() as u32;
     let copy_size = buffer_len.min(total_len);
@@ -43,8 +48,10 @@ pub fn read_action_data(
 }
 
 #[inline]
-pub fn current_receiver(env: FunctionEnvMut<WasmContext>) -> u64 {
-    env.data().receiver()
+pub fn current_receiver(mut env: FunctionEnvMut<WasmContext>) -> Result<u64, RuntimeError> {
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BASE)?;
+    Ok(env_data.receiver())
 }
 
 #[inline]
@@ -55,7 +62,8 @@ pub fn set_action_return_value(
 ) -> Result<(), RuntimeError> {
     context_aware_check(&env)?;
 
-    let (env_data, store) = env.data_and_store_mut();
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BASE + cost::per_byte(buffer_len as u64))?;
 
     {
         let mut db = env_data.db_mut();

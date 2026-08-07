@@ -16,6 +16,7 @@ use pulsevm_ffi::{
     Database,
 };
 use wasmer::{
+    AsStoreMut,
     Engine,
     Function,
     FunctionEnv,
@@ -23,6 +24,7 @@ use wasmer::{
     Instance,
     Memory,
     Module,
+    RuntimeError,
     Store,
     imports,
     sys::{
@@ -230,6 +232,9 @@ pub struct WasmContext {
     context: ApplyContext,
     db: Database,
     memory: Option<Memory>,
+    // The running instance, captured after instantiation so a host intrinsic can
+    // bill its own work against the same metering budget the wasm body spends.
+    instance: Option<Instance>,
     return_value: Option<Bytes>,
 }
 
@@ -248,8 +253,31 @@ impl WasmContext {
             context,
             db,
             memory: None,
+            instance: None,
             return_value: None,
         }
+    }
+
+    /// Deduct `amount` metering points for a host intrinsic's own work, so an
+    /// intrinsic's cost lands in the same budget (and the same billed CPU) as the
+    /// wasm operators around it. Traps like the metering middleware would if the
+    /// budget can't cover it, rather than letting the work run for free.
+    ///
+    /// The point unit is the one COST_FUNCTION uses for wasm operators; the
+    /// per-intrinsic amounts live in the webassembly::cost module. Changing any
+    /// amount changes billed CPU, which is committed to the block, so it is a
+    /// consensus rule — every node must run the identical table.
+    pub fn charge(&self, store: &mut impl AsStoreMut, amount: u64) -> Result<(), RuntimeError> {
+        // The instance is captured only after `Instance::new`, so an intrinsic
+        // reached from a module's start/initializer during instantiation has no
+        // budget handle yet. That phase isn't billed anyway -- `run` reseeds the
+        // metering points after instantiation and measures only the `apply`
+        // call -- so skip the charge rather than fail instantiation. During
+        // `apply`, where billing happens, the instance is always set.
+        let Some(instance) = self.instance.as_ref() else {
+            return Ok(());
+        };
+        charge_metering_points(store, instance, amount)
     }
 
     pub fn receiver(&self) -> u64 {
@@ -286,6 +314,28 @@ impl WasmContext {
 
     pub fn set_action_return_value(&mut self, return_value: Bytes) {
         self.return_value = Some(return_value);
+    }
+}
+
+/// Deduct `amount` metering points from a running instance, or trap if the
+/// budget can't cover it. Shared by [`WasmContext::charge`] and its test; kept
+/// free of `WasmContext` so it can be exercised against a bare metered instance.
+fn charge_metering_points(
+    store: &mut impl AsStoreMut,
+    instance: &Instance,
+    amount: u64,
+) -> Result<(), RuntimeError> {
+    match get_remaining_points(store, instance) {
+        MeteringPoints::Remaining(remaining) if remaining >= amount => {
+            set_remaining_points(store, instance, remaining - amount);
+            Ok(())
+        }
+        _ => {
+            set_remaining_points(store, instance, 0);
+            Err(RuntimeError::new(
+                "cpu usage limit exceeded while charging a host intrinsic",
+            ))
+        }
     }
 }
 
@@ -354,10 +404,7 @@ const COST_FUNCTION: fn(&Operator) -> u64 = |operator: &Operator| -> u64 {
         | Operator::GlobalSet { .. }
         | Operator::LocalGet { .. }
         | Operator::LocalSet { .. } => 3,
-        Operator::I32Mul { .. }
-        | Operator::I64Mul { .. }
-        | Operator::F32Mul { .. }
-        | Operator::F64Mul { .. } => 3,
+        Operator::I32Mul { .. } | Operator::I64Mul { .. } => 3,
         Operator::I32DivS { .. }
         | Operator::I32DivU { .. }
         | Operator::I32RemS { .. }
@@ -367,6 +414,18 @@ const COST_FUNCTION: fn(&Operator) -> u64 = |operator: &Operator| -> u64 {
         | Operator::I64RemS { .. }
         | Operator::I64RemU { .. } => 80,
         Operator::I32Clz { .. } | Operator::I64Clz { .. } => 105,
+        // Floating point priced from measurement (estimate_operator_costs): unlike
+        // the integer arithmetic above, IEEE ops aren't reorderable so LLVM can't
+        // fold a dependent chain, and the shipped defaults (1-3) under-charged them
+        // by 8-100x -- a division or sqrt costs as much as an integer divide, not a
+        // single cheap op. f32 shares the f64 price (an upper bound for it).
+        Operator::F32Add { .. }
+        | Operator::F64Add { .. }
+        | Operator::F32Sub { .. }
+        | Operator::F64Sub { .. } => 20,
+        Operator::F32Mul { .. } | Operator::F64Mul { .. } => 26,
+        Operator::F32Div { .. } | Operator::F64Div { .. } => 80,
+        Operator::F32Sqrt { .. } | Operator::F64Sqrt { .. } => 110,
         Operator::MemoryCopy { .. } | Operator::MemoryFill { .. } => 500,
         Operator::MemoryGrow { .. } => 1000, // Higher cost for memory growth
         _ => 1,                              // Default cost
@@ -702,12 +761,20 @@ impl WasmRuntime {
             }
         }
 
-        // If CPU limit is -1, it means no limit, so we can set it to a very high value. Otherwise,
-        // use the provided limit.
+        // Hand the instance to the env so host intrinsics can bill their work
+        // against the metering budget via WasmContext::charge.
+        warm.env.as_mut(&mut warm.store).instance = Some(instance.clone());
+
+        // cpu_limit == -1 means no account/block limit (only the system's own
+        // implicit transactions, e.g. onblock, get this). Seed a large finite
+        // budget: the old 300M placeholder was smaller than a normal transaction
+        // once intrinsics are metered in points (so it could wrongly trap a system
+        // action a user tx could afford), but leaving it truly unbounded would let a
+        // buggy system contract spin forever. See config::IMPLICIT_TX_CPU_BUDGET.
         let cpu_limit = if cpu_limit >= 0 {
             cpu_limit as u64
         } else {
-            300_000_000
+            crate::config::IMPLICIT_TX_CPU_BUDGET
         };
 
         // Set initial metering points based on resource limits
@@ -775,9 +842,72 @@ mod tests {
         TypedFunction,
         imports,
     };
-    use wasmer_middlewares::metering::set_remaining_points;
+    use wasmer_middlewares::metering::{
+        MeteringPoints,
+        get_remaining_points,
+        set_remaining_points,
+    };
 
-    use super::WasmRuntime;
+    use super::{
+        WasmRuntime,
+        charge_metering_points,
+    };
+
+    // A host intrinsic bills its own work out of the same metering budget the
+    // wasm body spends: each charge lowers the remaining points by exactly the
+    // amount, and a charge the budget can't cover traps (and zeroes the budget)
+    // instead of running for free. This is what makes the per-intrinsic cost
+    // table in `webassembly::cost` actually reach billed CPU.
+    #[test]
+    fn charging_a_host_intrinsic_spends_metering_points() {
+        // Any module compiled on the metered engine carries the remaining-points
+        // global; the body is irrelevant, we only move the budget.
+        let wasm = wat::parse_str("(module)").unwrap();
+        let mut store = Store::new(WasmRuntime::deterministic_engine());
+        let module = Module::new(&store, &wasm).unwrap();
+        let instance = Instance::new(&mut store, &module, &imports! {}).unwrap();
+
+        set_remaining_points(&mut store, &instance, 1_000);
+
+        // Two successive charges (as an intrinsic's base + per-byte would) each
+        // subtract exactly their amount.
+        charge_metering_points(&mut store, &instance, 100).unwrap();
+        charge_metering_points(&mut store, &instance, 250).unwrap();
+        match get_remaining_points(&mut store, &instance) {
+            MeteringPoints::Remaining(p) => assert_eq!(p, 650),
+            MeteringPoints::Exhausted => panic!("budget should not be exhausted yet"),
+        }
+
+        // A charge larger than what's left traps (Err) and zeroes the budget, so
+        // a subsequent wasm op also runs out rather than resuming for free.
+        assert!(charge_metering_points(&mut store, &instance, 10_000).is_err());
+        match get_remaining_points(&mut store, &instance) {
+            MeteringPoints::Remaining(p) => assert_eq!(p, 0),
+            MeteringPoints::Exhausted => {}
+        }
+    }
+
+    // Operator prices are consensus values (they become billed CPU committed to the
+    // block), so pin the ones the estimator corrected. If you change COST_FUNCTION
+    // deliberately, update this in the same commit; an unexpected failure means an
+    // operator cost was edited by accident. See docs/intrinsic-cost-model.md.
+    #[test]
+    fn operator_costs_are_pinned() {
+        use wasmer::wasmparser::Operator;
+
+        use super::COST_FUNCTION;
+
+        // Floating point: the estimator's headline fix (shipped 1-3, measured 80/110/26/20).
+        assert_eq!(COST_FUNCTION(&Operator::F64Div), 80);
+        assert_eq!(COST_FUNCTION(&Operator::F64Sqrt), 110);
+        assert_eq!(COST_FUNCTION(&Operator::F64Mul), 26);
+        assert_eq!(COST_FUNCTION(&Operator::F64Add), 20);
+        assert_eq!(COST_FUNCTION(&Operator::F32Div), 80);
+        // Integer arithmetic kept its structural weights (folds under LLVM).
+        assert_eq!(COST_FUNCTION(&Operator::I64DivU), 80);
+        assert_eq!(COST_FUNCTION(&Operator::I64Mul), 3);
+        assert_eq!(COST_FUNCTION(&Operator::I64Add), 1); // default
+    }
 
     // Run a float op on the real deterministic_engine and feed it non-canonical
     // NaNs; each must come back as the one wasm canonical NaN. Off, the input
@@ -852,5 +982,662 @@ mod tests {
         assert!(f.bulk_memory);
         assert!(f.multi_value);
         assert!(f.extended_const);
+    }
+
+    // Parameter estimator for the host-intrinsic cost table (webassembly::cost).
+    // Ignored: it's a calibration tool, not an assertion, and it takes a few
+    // seconds. Run it to (re)derive the table:
+    //
+    //   cargo test -p pulsevm_core --lib estimate_intrinsic_costs \
+    //     -- --ignored --nocapture
+    //
+    // Method (a stripped-down NEAR runtime-params-estimator):
+    //   1. Anchor. Run a compute-bound wasm loop on the real metered LLVM engine and read BOTH wall
+    //      time and points consumed from the metering middleware. Their ratio is ns-per-point on
+    //      this machine -- it ties the intrinsic prices to the same scale the operator table
+    //      already bills in, without hand-computing any operator cost.
+    //   2. Measure. Time each intrinsic's native work across input sizes and least-squares fit ns =
+    //      base + slope*bytes.
+    //   3. Convert. points = ns / ns_per_point, times a conservative SAFETY multiplier so a point
+    //      is an UPPER bound on real time (an under-charge is a DoS hole; an over-charge only costs
+    //      fairness).
+    //
+    // The absolute numbers are hardware-specific; the ratios and the resulting
+    // table are what get pinned. Anchoring to the current operator table means
+    // the table inherits that table's own lack of ns-calibration -- documented
+    // limitation, absorbed by SAFETY; a full recalibration of operators too is
+    // the deeper follow-up.
+    #[test]
+    #[ignore = "calibration tool; run manually with --ignored --nocapture"]
+    fn estimate_intrinsic_costs() {
+        use std::{
+            hint::black_box,
+            str::FromStr,
+            time::Instant,
+        };
+
+        use sha2::Digest as _;
+
+        use crate::{
+            crypto::PrivateKey,
+            utils::Digest as CoreDigest,
+        };
+
+        // Points are an upper bound on real time; bias high. NEAR historically
+        // used ~3x. Under-charging is the only unsafe direction.
+        const SAFETY: f64 = 3.0;
+
+        fn time_ns(iters: u32, mut f: impl FnMut()) -> f64 {
+            for _ in 0..(iters / 8).max(2) {
+                f();
+            }
+            let t = Instant::now();
+            for _ in 0..iters {
+                f();
+            }
+            (t.elapsed().as_nanos() as f64) / (iters as f64)
+        }
+
+        // Least-squares fit of ns = base + slope*bytes; clamp both non-negative.
+        fn fit(pts: &[(f64, f64)]) -> (f64, f64) {
+            let n = pts.len() as f64;
+            let sx: f64 = pts.iter().map(|p| p.0).sum();
+            let sy: f64 = pts.iter().map(|p| p.1).sum();
+            let sxx: f64 = pts.iter().map(|p| p.0 * p.0).sum();
+            let sxy: f64 = pts.iter().map(|p| p.0 * p.1).sum();
+            let slope = (n * sxy - sx * sy) / (n * sxx - sx * sx);
+            let base = (sy - slope * sx) / n;
+            (base.max(0.0), slope.max(0.0))
+        }
+
+        // --- 1. anchor: ns per metering point on the real engine ---
+        let wasm = wat::parse_str(
+            r#"
+            (module
+              (func (export "work") (param $n i64) (result i64)
+                (local $i i64) (local $acc i64)
+                (local.set $acc (i64.const 2))
+                (block $done
+                  (loop $l
+                    (br_if $done (i64.ge_u (local.get $i) (local.get $n)))
+                    (local.set $acc
+                      (i64.xor
+                        (i64.mul (local.get $acc) (i64.const 6364136223846793005))
+                        (i64.add (local.get $i) (i64.const 1442695040888963407))))
+                    (local.set $i (i64.add (local.get $i) (i64.const 1)))
+                    (br $l)))
+                (local.get $acc)))
+            "#,
+        )
+        .unwrap();
+        let mut store = Store::new(WasmRuntime::deterministic_engine());
+        let module = Module::new(&store, &wasm).unwrap();
+        let instance = Instance::new(&mut store, &module, &imports! {}).unwrap();
+        let work: TypedFunction<i64, i64> =
+            instance.exports.get_typed_function(&store, "work").unwrap();
+
+        const SEED: u64 = 1_000_000_000_000;
+        let n = 2_000_000i64;
+        for _ in 0..3 {
+            set_remaining_points(&mut store, &instance, SEED);
+            black_box(work.call(&mut store, n).unwrap());
+        }
+        let (mut total_ns, mut total_pts) = (0.0f64, 0u64);
+        for _ in 0..20 {
+            set_remaining_points(&mut store, &instance, SEED);
+            let t = Instant::now();
+            black_box(work.call(&mut store, n).unwrap());
+            total_ns += t.elapsed().as_nanos() as f64;
+            total_pts += match get_remaining_points(&mut store, &instance) {
+                MeteringPoints::Remaining(p) => SEED - p,
+                MeteringPoints::Exhausted => panic!("anchor loop exhausted the budget"),
+            };
+        }
+        let ns_per_point = total_ns / total_pts as f64;
+
+        let sizes = [0usize, 64, 256, 1024, 4096, 16384, 65536, 262144];
+        let iters_for = |s: usize| -> u32 {
+            if s >= 65536 {
+                400
+            } else if s >= 4096 {
+                3000
+            } else {
+                20000
+            }
+        };
+
+        println!("\n==== intrinsic cost estimate (hardware-specific) ====");
+        println!("anchor: {ns_per_point:.4} ns/point  ({total_pts} pts over {total_ns:.0} ns)");
+        println!("safety multiplier: {SAFETY}x\n");
+        println!(
+            "{:<14} {:>10} {:>12} {:>12} {:>14}",
+            "intrinsic", "base_pts", "per_byte", "bytes/pt", "shipped(base/pB)"
+        );
+
+        // sweep a sized intrinsic, fit, and print its candidate constants.
+        let mut report_sized = |name: &str, shipped_base: u64, mut work: Box<dyn FnMut(&[u8])>| {
+            let data: Vec<(f64, f64)> = sizes
+                .iter()
+                .map(|&s| {
+                    let buf = vec![0xa5u8; s];
+                    (s as f64, time_ns(iters_for(s), || work(black_box(&buf))))
+                })
+                .collect();
+            // Base is the fixed overhead measured at size 0; slope is fit over the
+            // linear region (>= 1 KiB) so small-size noise doesn't distort the
+            // intercept.
+            let base_ns = data[0].1;
+            let linear: Vec<(f64, f64)> = data.iter().copied().filter(|p| p.0 >= 1024.0).collect();
+            let (_, slope_ns) = fit(&linear);
+            let base_pts = (base_ns / ns_per_point * SAFETY).ceil();
+            let per_byte = slope_ns / ns_per_point * SAFETY;
+            let bytes_per_pt = if per_byte > 0.0 {
+                1.0 / per_byte
+            } else {
+                f64::INFINITY
+            };
+            println!(
+                "{name:<14} {base_pts:>10.0} {per_byte:>12.4} {bytes_per_pt:>12.1} {:>14}",
+                format!("{shipped_base}/1")
+            );
+        };
+
+        report_sized(
+            "sha256",
+            30,
+            Box::new(|b| {
+                black_box(sha2::Sha256::digest(b));
+            }),
+        );
+        report_sized(
+            "sha512",
+            30,
+            Box::new(|b| {
+                black_box(sha2::Sha512::digest(b));
+            }),
+        );
+        report_sized(
+            "sha1",
+            30,
+            Box::new(|b| {
+                black_box(sha1::Sha1::digest(b));
+            }),
+        );
+        report_sized(
+            "ripemd160",
+            30,
+            Box::new(|b| {
+                black_box(ripemd::Ripemd160::digest(b));
+            }),
+        );
+        // memcpy intrinsic ~ one alloc + read guest->buf + write buf->guest.
+        report_sized(
+            "memcpy",
+            10,
+            Box::new(|b| {
+                let mut buf = vec![0u8; b.len()];
+                buf.copy_from_slice(b);
+                let mut out = vec![0u8; b.len()];
+                out.copy_from_slice(&buf);
+                black_box((buf, out));
+            }),
+        );
+
+        // --- recover_key: fixed, no size sweep ---
+        let key = PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")
+            .unwrap();
+        let digest = CoreDigest::from_data(b"pulsevm-intrinsic-cost-benchmark");
+        let sig = key.sign(&digest).unwrap();
+        let recover_ns = time_ns(300, || {
+            black_box(sig.recover_public_key(black_box(&digest)).unwrap());
+        });
+        let recover_pts = (recover_ns / ns_per_point * SAFETY).ceil();
+        println!("\nrecover_key: {recover_ns:.0} ns -> {recover_pts:.0} pts (shipped 2000)");
+        println!("=====================================================\n");
+    }
+
+    // ns per metering point on this machine, from a mixed integer compute loop run
+    // on the real metered engine (reading wall time and points consumed). Shared
+    // anchor for the calibration tools below and for estimate_intrinsic_costs'
+    // method; ties native measurements to the point unit the chain already bills.
+    #[cfg(test)]
+    fn anchor_ns_per_point() -> f64 {
+        use std::{
+            hint::black_box,
+            time::Instant,
+        };
+        const SEED: u64 = 200_000_000_000;
+        let src = "(module (func (export \"run\") (param $n i64) (result i64)\n\
+             (local $i i64) (local $acc i64)\n\
+             (local.set $acc (i64.const 2))\n\
+             (block $done (loop $l\n\
+             (br_if $done (i64.ge_u (local.get $i) (local.get $n)))\n\
+             (local.set $acc (i64.xor (i64.mul (local.get $acc) (i64.const 6364136223846793005))\
+             (i64.add (local.get $i) (i64.const 1442695040888963407))))\n\
+             (local.set $i (i64.add (local.get $i) (i64.const 1)))\n\
+             (br $l)))\n\
+             (local.get $acc)))";
+        let mut store = Store::new(WasmRuntime::deterministic_engine());
+        let module = Module::new(&store, src).unwrap();
+        let instance = Instance::new(&mut store, &module, &imports! {}).unwrap();
+        let f: TypedFunction<i64, i64> =
+            instance.exports.get_typed_function(&store, "run").unwrap();
+        for _ in 0..3 {
+            set_remaining_points(&mut store, &instance, SEED);
+            black_box(f.call(&mut store, 2_000_000).unwrap());
+        }
+        let (mut ns, mut pts) = (0.0f64, 0u64);
+        for _ in 0..20 {
+            set_remaining_points(&mut store, &instance, SEED);
+            let t = Instant::now();
+            black_box(f.call(&mut store, 2_000_000).unwrap());
+            ns += t.elapsed().as_nanos() as f64;
+            pts += match get_remaining_points(&mut store, &instance) {
+                MeteringPoints::Remaining(p) => SEED - p,
+                MeteringPoints::Exhausted => panic!("anchor exhausted"),
+            };
+        }
+        ns / pts as f64
+    }
+
+    // Recalibrate the *relative* weights in COST_FUNCTION against measurement,
+    // keeping the anchor fixed. Ignored: a calibration tool, run manually.
+    //
+    //   cargo test -p pulsevm_core --lib estimate_operator_costs \
+    //     -- --ignored --nocapture
+    //
+    // The point unit is pinned by integer metering: the cheapest operator has to
+    // cost >= 1 point, so we normalize everything to i64.add = 1 and read the rest
+    // off as multiples of it. That keeps POINTS_PER_US and the intrinsic table
+    // (which is denominated in this same unit) untouched, and only corrects
+    // operators whose hand-picked weight is wrong relative to add.
+    //
+    // Only the arithmetic and bulk-memory operators are re-measured. Control flow,
+    // calls, selects, and local/global access are left at their structural
+    // hand-values: at Aggressive opt LLVM inlines callees and folds branches, so a
+    // single operator's isolated wall-clock is dominated by pipelining and doesn't
+    // mean much -- measuring it would be false precision. The arithmetic ops are
+    // where the shipped table is actually wrong (clz at 105 is ~100x too high; a
+    // native lzcnt is a couple of cycles).
+    //
+    // Method: run a metered loop whose body is M copies of one dependent update to
+    // an accumulator, minus the empty loop, over N trips -> ns per operator. The
+    // operand comes from a runtime parameter (not a constant) so LLVM can't fold or
+    // strength-reduce the division; the accumulator feeds the next op so nothing is
+    // dead-code eliminated. Timing is on the real deterministic_engine, so the
+    // metering decrement each op pays is included, as it is on-chain.
+    #[test]
+    #[ignore = "calibration tool; run manually with --ignored --nocapture"]
+    fn estimate_operator_costs() {
+        use std::{
+            hint::black_box,
+            time::Instant,
+        };
+
+        const N: i64 = 300_000; // loop trips
+        const M: usize = 48; // op copies per trip
+        const SEED: u64 = 200_000_000_000; // metering budget; never exhausted here
+        const D: i64 = 0x9E3779B97F4A7C15u128 as i64; // runtime operand, defeats folding
+
+        // Build an i64-accumulator loop whose body is `unit` repeated `m` times.
+        let int_src = |unit: &str, m: usize| -> String {
+            let body = unit.repeat(m);
+            format!(
+                "(module (func (export \"run\") (param $n i64) (param $d i64) (result i64)\n\
+                 (local $i i64) (local $acc i64)\n\
+                 (local.set $acc (local.get $d))\n\
+                 (block $done (loop $l\n\
+                 (br_if $done (i64.ge_u (local.get $i) (local.get $n)))\n\
+                 {body}\n\
+                 (local.set $i (i64.add (local.get $i) (i64.const 1)))\n\
+                 (br $l)))\n\
+                 (local.get $acc)))"
+            )
+        };
+        let float_src = |unit: &str, m: usize| -> String {
+            let body = unit.repeat(m);
+            format!(
+                "(module (func (export \"run\") (param $n i64) (param $d f64) (result f64)\n\
+                 (local $i i64) (local $acc f64)\n\
+                 (local.set $acc (local.get $d))\n\
+                 (block $done (loop $l\n\
+                 (br_if $done (i64.ge_u (local.get $i) (local.get $n)))\n\
+                 {body}\n\
+                 (local.set $i (i64.add (local.get $i) (i64.const 1)))\n\
+                 (br $l)))\n\
+                 (local.get $acc)))"
+            )
+        };
+        let mem_src = |m: usize| -> String {
+            // Each unit copies 64 bytes; measured as a base per invocation (the
+            // length is a runtime operand on-chain, so the operator is flat-priced).
+            let body = "(memory.copy (i32.const 0) (i32.const 4096) (i32.const 64))\n".repeat(m);
+            format!(
+                "(module (memory 1)\n\
+                 (func (export \"run\") (param $n i64) (param $d i64) (result i64)\n\
+                 (local $i i64)\n\
+                 (block $done (loop $l\n\
+                 (br_if $done (i64.ge_u (local.get $i) (local.get $n)))\n\
+                 {body}\n\
+                 (local.set $i (i64.add (local.get $i) (i64.const 1)))\n\
+                 (br $l)))\n\
+                 (local.get $i)))"
+            )
+        };
+
+        // Best-of wall time (ns) for one compiled i64->i64 "run" module.
+        let best_i64 = |src: &str| -> f64 {
+            let mut store = Store::new(WasmRuntime::deterministic_engine());
+            let module = Module::new(&store, src).unwrap();
+            let instance = Instance::new(&mut store, &module, &imports! {}).unwrap();
+            let f: TypedFunction<(i64, i64), i64> =
+                instance.exports.get_typed_function(&store, "run").unwrap();
+            for _ in 0..3 {
+                set_remaining_points(&mut store, &instance, SEED);
+                black_box(f.call(&mut store, N, D).unwrap());
+            }
+            let mut best = f64::MAX;
+            for _ in 0..7 {
+                set_remaining_points(&mut store, &instance, SEED);
+                let t = Instant::now();
+                black_box(f.call(&mut store, N, D).unwrap());
+                best = best.min(t.elapsed().as_nanos() as f64);
+            }
+            best
+        };
+
+        // Anchor: ns per metering point on this machine. Operators are directly
+        // metered, so no safety multiplier -- a point already is the billed unit.
+        let ns_per_point = anchor_ns_per_point();
+
+        // Per-operator ns for an int-accumulator unit: (loop with M) - (empty loop),
+        // amortized over N*M.
+        let int_base = best_i64(&int_src("", 0));
+        let per_op_int = |unit: &str| -> f64 {
+            (best_i64(&int_src(unit, M)) - int_base) / (N as f64 * M as f64)
+        };
+
+        // Float uses its own empty-loop baseline (f64 local, same shape).
+        let f_src_base = {
+            let mut store = Store::new(WasmRuntime::deterministic_engine());
+            let module = Module::new(&store, &float_src("", 0)).unwrap();
+            let instance = Instance::new(&mut store, &module, &imports! {}).unwrap();
+            let f: TypedFunction<(i64, f64), f64> =
+                instance.exports.get_typed_function(&store, "run").unwrap();
+            for _ in 0..3 {
+                set_remaining_points(&mut store, &instance, SEED);
+                black_box(f.call(&mut store, N, 1.0000001f64).unwrap());
+            }
+            let mut best = f64::MAX;
+            for _ in 0..7 {
+                set_remaining_points(&mut store, &instance, SEED);
+                let t = Instant::now();
+                black_box(f.call(&mut store, N, 1.0000001f64).unwrap());
+                best = best.min(t.elapsed().as_nanos() as f64);
+            }
+            best
+        };
+        let per_op_float = |unit: &str| -> f64 {
+            let mut store = Store::new(WasmRuntime::deterministic_engine());
+            let module = Module::new(&store, &float_src(unit, M)).unwrap();
+            let instance = Instance::new(&mut store, &module, &imports! {}).unwrap();
+            let f: TypedFunction<(i64, f64), f64> =
+                instance.exports.get_typed_function(&store, "run").unwrap();
+            for _ in 0..3 {
+                set_remaining_points(&mut store, &instance, SEED);
+                black_box(f.call(&mut store, N, 1.0000001f64).unwrap());
+            }
+            let mut best = f64::MAX;
+            for _ in 0..7 {
+                set_remaining_points(&mut store, &instance, SEED);
+                let t = Instant::now();
+                black_box(f.call(&mut store, N, 1.0000001f64).unwrap());
+                best = best.min(t.elapsed().as_nanos() as f64);
+            }
+            (best - f_src_base) / (N as f64 * M as f64)
+        };
+
+        let mem_base = best_i64(&mem_src(0));
+        let per_op_mem = (best_i64(&mem_src(M)) - mem_base) / (N as f64 * M as f64);
+
+        // points = round(ns / ns_per_point). A measurement at or below the anchor
+        // floor (~ns_per_point) is flagged: LLVM folded the repeated op (scalar
+        // evolution solves linear recurrences over the accumulator), so its
+        // isolated cost is not observable and its structural weight is kept.
+        let floor = ns_per_point * 1.5;
+        let pts = |ns: f64| (ns / ns_per_point).round().max(1.0);
+
+        println!("\n==== operator cost estimate ====");
+        println!(
+            "anchor: {ns_per_point:.5} ns/point  (=> ~{:.0} points/us)",
+            1000.0 / ns_per_point
+        );
+        println!(
+            "{:<16} {:>10} {:>10} {:>8}  note",
+            "operator", "ns/op", "points", "shipped"
+        );
+
+        let mut row = |name: &str, ns: f64, shipped: u64| {
+            let note = if ns < floor {
+                "folded (kept)"
+            } else {
+                "measured"
+            };
+            println!(
+                "{name:<16} {ns:>10.4} {:>10.0} {shipped:>8}  {note}",
+                pts(ns)
+            );
+        };
+        row(
+            "i64.mul",
+            per_op_int("(local.set $acc (i64.mul (local.get $acc) (local.get $d)))"),
+            3,
+        );
+        row(
+            "i64.div_u",
+            per_op_int(
+                "(local.set $acc (i64.div_u (local.get $acc) (i64.or (local.get $d) (i64.const 1))))",
+            ),
+            80,
+        );
+        row(
+            "i64.rem_u",
+            per_op_int(
+                "(local.set $acc (i64.rem_u (local.get $acc) (i64.or (local.get $d) (i64.const 3))))",
+            ),
+            80,
+        );
+        row(
+            "i64.clz",
+            per_op_int("(local.set $acc (i64.add (i64.clz (local.get $acc)) (local.get $d)))"),
+            105,
+        );
+        row(
+            "i64.ctz",
+            per_op_int("(local.set $acc (i64.add (i64.ctz (local.get $acc)) (local.get $d)))"),
+            1,
+        );
+        row(
+            "i64.popcnt",
+            per_op_int("(local.set $acc (i64.add (i64.popcnt (local.get $acc)) (local.get $d)))"),
+            1,
+        );
+        row(
+            "i64.shl",
+            per_op_int("(local.set $acc (i64.shl (local.get $acc) (local.get $d)))"),
+            1,
+        );
+        row(
+            "f64.add",
+            per_op_float("(local.set $acc (f64.add (local.get $acc) (local.get $d)))"),
+            1,
+        );
+        row(
+            "f64.sub",
+            per_op_float("(local.set $acc (f64.sub (local.get $acc) (local.get $d)))"),
+            1,
+        );
+        row(
+            "f64.mul",
+            per_op_float("(local.set $acc (f64.mul (local.get $acc) (local.get $d)))"),
+            3,
+        );
+        row(
+            "f64.div",
+            per_op_float("(local.set $acc (f64.div (local.get $acc) (local.get $d)))"),
+            1,
+        );
+        row(
+            "f64.sqrt",
+            per_op_float("(local.set $acc (f64.sqrt (f64.abs (local.get $acc))))"),
+            1,
+        );
+        row("memory.copy/64", per_op_mem, 500);
+        println!("================================\n");
+    }
+
+    // Stateful estimator for the database intrinsics (cost::DB_OP and the value
+    // per-byte). Ignored: a calibration tool needing a real chainbase, run manually.
+    //
+    //   cargo test -p pulsevm_core --lib estimate_db_intrinsic_costs \
+    //     -- --ignored --nocapture
+    //
+    // The db intrinsics do native FFI/chainbase work invisible to wasm metering, so
+    // like the crypto intrinsics they bill themselves and get the same 3x safety
+    // multiplier. We time the real work directly on a populated table (Database +
+    // KeyValueIteratorCache, the same path db_find_i64/db_next_i64/db_store_i64
+    // reach through ApplyContext, minus the RwLock hop) and convert ns -> points via
+    // the shared anchor. This is the PROVISIONAL tier the intrinsic doc called out.
+    #[test]
+    #[ignore = "calibration tool; needs a chainbase, run manually with --ignored --nocapture"]
+    fn estimate_db_intrinsic_costs() {
+        use std::{
+            hint::black_box,
+            time::Instant,
+        };
+
+        use pulsevm_ffi::{
+            Database,
+            KeyValueIteratorCache,
+            TableObject,
+        };
+        use tempfile::tempdir;
+
+        // Native work is unmetered, so bias the price high, as the crypto table does.
+        const SAFETY: f64 = 3.0;
+        const DB_SIZE: u64 = 256 * 1024 * 1024;
+        const CODE: u64 = 1;
+        const SCOPE: u64 = 2;
+        const TABLE: u64 = 3;
+        const PAYER: u64 = 1;
+        const ROWS: u64 = 8192; // table population for the lookup/scan measurements
+
+        let ns_per_point = anchor_ns_per_point();
+        let pts = |ns: f64| (ns / ns_per_point * SAFETY).ceil();
+
+        // A populated table to measure find and forward iteration against.
+        let dir = tempdir().unwrap();
+        let mut db = Database::new(dir.path().to_str().unwrap(), DB_SIZE).unwrap();
+        db.add_indices().unwrap();
+        let mut cache = KeyValueIteratorCache::new();
+        let table_ptr = db.create_table(CODE, SCOPE, TABLE, PAYER).unwrap();
+        let table_ref: &TableObject = unsafe { &*table_ptr };
+        for pk in 0..ROWS {
+            db.create_key_value_object(table_ref, PAYER, pk, &pk.to_le_bytes())
+                .unwrap();
+        }
+        cache.cache_table(table_ref).unwrap();
+
+        // find: average over a full sweep of present keys, best of several sweeps.
+        let find_ns = {
+            for pk in 0..ROWS {
+                black_box(db.db_find_i64(CODE, SCOPE, TABLE, pk, &mut cache).unwrap());
+            }
+            let mut best = f64::MAX;
+            for _ in 0..7 {
+                let t = Instant::now();
+                for pk in 0..ROWS {
+                    black_box(db.db_find_i64(CODE, SCOPE, TABLE, pk, &mut cache).unwrap());
+                }
+                best = best.min(t.elapsed().as_nanos() as f64 / ROWS as f64);
+            }
+            best
+        };
+
+        // iterate: lowerbound(0) then next() to the end iterator, per step.
+        let iter_ns = {
+            let mut best = f64::MAX;
+            for _ in 0..7 {
+                let end = db.db_end_i64(&mut cache, CODE, SCOPE, TABLE).unwrap();
+                let t = Instant::now();
+                let mut it = db
+                    .db_lowerbound_i64(&mut cache, CODE, SCOPE, TABLE, 0)
+                    .unwrap();
+                let mut steps = 0u64;
+                while it != end && steps <= ROWS {
+                    let mut p = 0u64;
+                    it = db.db_next_i64(&mut cache, it, &mut p).unwrap();
+                    steps += 1;
+                }
+                best = best.min(t.elapsed().as_nanos() as f64 / steps.max(1) as f64);
+            }
+            best
+        };
+
+        // store: a fresh chainbase each run (create is destructive), per insert, at
+        // two value sizes so the per-byte slope of the value write falls out.
+        let store_ns = |val_len: usize| -> f64 {
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let dir = tempdir().unwrap();
+                let mut db = Database::new(dir.path().to_str().unwrap(), DB_SIZE).unwrap();
+                db.add_indices().unwrap();
+                let tp = db.create_table(CODE, SCOPE, TABLE, PAYER).unwrap();
+                let tr: &TableObject = unsafe { &*tp };
+                let val = vec![0xa5u8; val_len];
+                let t = Instant::now();
+                for pk in 0..ROWS {
+                    db.create_key_value_object(tr, PAYER, pk, &val).unwrap();
+                }
+                best = best.min(t.elapsed().as_nanos() as f64 / ROWS as f64);
+            }
+            best
+        };
+        let store_small = store_ns(8);
+        let store_large = store_ns(4096);
+        let value_per_byte_ns = ((store_large - store_small) / (4096.0 - 8.0)).max(0.0);
+
+        println!("\n==== db intrinsic cost estimate (3x safety) ====");
+        println!("anchor: {ns_per_point:.5} ns/point   table: {ROWS} rows");
+        println!(
+            "{:<20} {:>10} {:>10} {:>10}",
+            "op", "ns", "points", "shipped"
+        );
+        println!(
+            "{:<20} {find_ns:>10.1} {:>10.0} {:>10}",
+            "db_find_i64",
+            pts(find_ns),
+            "DB_OP=100"
+        );
+        println!(
+            "{:<20} {iter_ns:>10.1} {:>10.0} {:>10}",
+            "db_next_i64 (step)",
+            pts(iter_ns),
+            "DB_OP=100"
+        );
+        println!(
+            "{:<20} {store_small:>10.1} {:>10.0} {:>10}",
+            "db_store_i64 (8B)",
+            pts(store_small),
+            "DB_OP=100"
+        );
+        println!(
+            "{:<20} {:>10.4} {:>10.2} {:>10}",
+            "value per-byte",
+            value_per_byte_ns,
+            pts(value_per_byte_ns),
+            "1/byte"
+        );
+        println!("=================================================\n");
     }
 }

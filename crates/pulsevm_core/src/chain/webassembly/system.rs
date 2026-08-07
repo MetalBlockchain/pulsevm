@@ -4,6 +4,7 @@ use wasmer::{
     WasmPtr,
 };
 
+use super::cost;
 use crate::chain::{
     wasm_runtime::WasmContext,
     webassembly::context_aware_check,
@@ -16,6 +17,8 @@ pub fn eosio_assert(
     condition: u32,
     msg_ptr: WasmPtr<u8>,
 ) -> Result<(), RuntimeError> {
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::SYSTEM)?;
     if condition == 0 {
         if msg_ptr.is_null() {
             return Err(RuntimeError::new(
@@ -23,7 +26,6 @@ pub fn eosio_assert(
             ));
         }
 
-        let (env_data, store) = env.data_and_store_mut();
         let memory = env_data
             .memory()
             .as_ref()
@@ -58,6 +60,8 @@ pub fn pulse_assert(
     msg_ptr: WasmPtr<u8>,
     msg_len: u32,
 ) -> Result<(), RuntimeError> {
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::SYSTEM)?;
     if condition == 0 {
         if msg_len == 0 {
             return Err(RuntimeError::new(
@@ -65,7 +69,6 @@ pub fn pulse_assert(
             ));
         }
 
-        let (env_data, store) = env.data_and_store_mut();
         let memory = env_data
             .memory()
             .as_ref()
@@ -98,8 +101,9 @@ pub fn pulse_assert_message(
     msg_ptr: WasmPtr<u8>,
     msg_len: u32,
 ) -> Result<(), RuntimeError> {
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::SYSTEM + cost::per_byte(msg_len as u64))?;
     if condition == 0 {
-        let (env_data, store) = env.data_and_store_mut();
         let memory = env_data
             .memory()
             .as_ref()
@@ -126,10 +130,12 @@ pub fn pulse_assert_message(
 }
 
 pub fn pulse_assert_code(
-    _env: FunctionEnvMut<WasmContext>,
+    mut env: FunctionEnvMut<WasmContext>,
     condition: u32,
     error_code: u64,
 ) -> Result<(), RuntimeError> {
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::SYSTEM)?;
     if condition == 0 {
         return Err(RuntimeError::new(format!(
             "assertion failure with error code: {}",
@@ -140,21 +146,26 @@ pub fn pulse_assert_code(
     Ok(())
 }
 
-pub fn pulse_exit(_env: FunctionEnvMut<WasmContext>, code: u32) -> Result<(), RuntimeError> {
+pub fn pulse_exit(mut env: FunctionEnvMut<WasmContext>, code: u32) -> Result<(), RuntimeError> {
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::SYSTEM)?;
     return Err(RuntimeError::new(format!(
         "exit called with code: {}",
         code
     )));
 }
 
-pub fn abort(_env: FunctionEnvMut<WasmContext>) -> Result<(), RuntimeError> {
+pub fn abort(mut env: FunctionEnvMut<WasmContext>) -> Result<(), RuntimeError> {
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::SYSTEM)?;
     return Err(RuntimeError::new("abort called"));
 }
 
-pub fn current_time(env: FunctionEnvMut<WasmContext>) -> Result<u64, RuntimeError> {
+pub fn current_time(mut env: FunctionEnvMut<WasmContext>) -> Result<u64, RuntimeError> {
     context_aware_check(&env)?;
-    let result = env
-        .data()
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BASE)?;
+    let result = env_data
         .pending_block_timestamp()
         .to_time_point()
         .time_since_epoch()
