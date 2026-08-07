@@ -206,6 +206,11 @@ impl ApplyContext {
             Controller::find_apply_handler(&self.receiver, action.account(), action.name());
         if let Some(native) = native {
             native(self, &mut self.db.clone(), &action)?;
+            // The native handler runs unmetered Rust, so re-check the deadline now
+            // that it's done. Only needed when one actually ran — with no native
+            // handler, execute_action's entry check a few microseconds ago already
+            // covers this action.
+            self.trx_context.checktime()?;
         }
 
         // Does the receiver account have a contract deployed?
@@ -1910,6 +1915,10 @@ impl ApplyContext {
     pub fn resume_billing_timer(&self) -> Result<(), ChainError> {
         self.trx_context.resume_billing_timer()?;
         Ok(())
+    }
+
+    pub fn checktime(&self) -> Result<(), ChainError> {
+        self.trx_context.checktime()
     }
 
     pub fn get_head_block_num(&self) -> u32 {
