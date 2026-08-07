@@ -572,6 +572,105 @@ impl StateHistoryLog {
         Ok(())
     }
 
+    /// Discard the whole log and re-base it to a single entry — the block a
+    /// state snapshot was taken at.
+    ///
+    /// State sync fast-forwards past blocks this node never downloaded, so the
+    /// "gapless from genesis" invariant cannot be kept: the log must start again
+    /// at the snapshot height. Afterwards `range()` is `(N, N)` where `N` is
+    /// `block_id`'s height, so a restart reconstructs `last_accepted` from the
+    /// snapshot's block, and the next accepted block (`N + 1`) appends
+    /// contiguously. Uses the same tmp-write + atomic-rename as `prune_locked`,
+    /// so a crash mid-rebase leaves either the old log or the new one, never a
+    /// torn mix.
+    pub fn reset_to(&self, block_id: Id, payload: &[u8]) -> Result<(), ShLogError> {
+        let mut inner = self.inner.lock().unwrap();
+        let block_num = num_from_block_id(&block_id);
+
+        let tmp_log = tmp_path(&self.log_path);
+        let tmp_idx = tmp_path(&self.idx_path);
+        let out_log_file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_log)?;
+        let out_idx_file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_idx)?;
+        {
+            let mut out_log = BufWriter::new(&out_log_file);
+            let mut out_idx = BufWriter::new(&out_idx_file);
+
+            let header = StateHistoryLogHeader {
+                magic: self.magic,
+                block_id,
+                payload_size: payload.len() as u64,
+            };
+            header.write(&mut out_log)?;
+            out_log.write_all(payload)?;
+            out_idx.write_all(&block_num.to_le_bytes())?;
+            out_idx.write_all(&0u64.to_le_bytes())?;
+
+            out_log.flush()?;
+            out_idx.flush()?;
+        }
+        out_log_file.sync_all()?;
+        out_idx_file.sync_all()?;
+
+        std::fs::rename(&tmp_log, &self.log_path)?;
+        std::fs::rename(&tmp_idx, &self.idx_path)?;
+        fsync_parent_dir(&self.log_path)?;
+
+        let new_pos = StateHistoryLogHeader::SIZE + payload.len() as u64;
+        let mut new_map = BTreeMap::new();
+        new_map.insert(block_num, 0u64);
+
+        let log_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.log_path)?;
+        let idx_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.idx_path)?;
+        let mut log_w = BufWriter::new(log_file);
+        let mut idx_w = BufWriter::new(idx_file);
+        log_w.seek(SeekFrom::End(0))?;
+        idx_w.seek(SeekFrom::End(0))?;
+
+        inner.log = log_w;
+        inner.idx = idx_w;
+        inner.map = new_map;
+        inner.range = Some((block_num, block_num));
+        inner.log_len = new_pos;
+
+        Ok(())
+    }
+
+    /// Truncate the log to empty, so the next append starts a fresh contiguous
+    /// run at whatever height it carries.
+    ///
+    /// The trace and chain-state logs have no entries for a state-synced block,
+    /// so on sync they are cleared rather than re-based: the state-history stream
+    /// simply resumes at the first block accepted after the sync point.
+    pub fn clear(&self) -> Result<(), ShLogError> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.log.flush()?;
+        inner.idx.flush()?;
+        inner.log.get_ref().set_len(0)?;
+        inner.idx.get_ref().set_len(0)?;
+        inner.log.seek(SeekFrom::Start(0))?;
+        inner.idx.seek(SeekFrom::Start(0))?;
+        inner.log.get_ref().sync_data()?;
+        inner.idx.get_ref().sync_data()?;
+        inner.map.clear();
+        inner.range = None;
+        inner.log_len = 0;
+        Ok(())
+    }
+
     /* -------------------- getters -------------------- */
 
     /// Last appended block number, or 0 if the log is empty.
@@ -1058,5 +1157,60 @@ mod tests {
                 format!("payload-{n}").as_bytes()
             );
         }
+    }
+
+    #[test]
+    fn reset_to_rebases_log_to_snapshot_block() {
+        let (dir, magic) = setup("reset");
+        let log = StateHistoryLog::open_with_magic(dir.path(), "block_log", magic).unwrap();
+        assert_eq!(log.range().unwrap(), (1, FIXTURE_BLOCKS));
+
+        // Fast-forward to a block far past the tail — the height state sync
+        // would land on.
+        let payload = b"synced-block-100".to_vec();
+        log.reset_to(make_id(100, 7), &payload).unwrap();
+
+        assert_eq!(log.range().unwrap(), (100, 100));
+        assert_eq!(log.last_block(), 100);
+        assert_eq!(log.read_block(100).unwrap(), payload);
+        // The pre-sync blocks are gone.
+        assert!(matches!(log.read_block(3), Err(ShLogError::NotFound(3))));
+
+        // The next block appends contiguously at 101.
+        log.append(make_id(101, 8), b"post-sync-101").unwrap();
+        assert_eq!(log.range().unwrap(), (100, 101));
+        drop(log);
+
+        // A restart recovers the re-based range and the on-disk framing is
+        // clean (the independent parser agrees).
+        let log = StateHistoryLog::open_with_magic(dir.path(), "block_log", magic).unwrap();
+        assert_eq!(log.range().unwrap(), (100, 101));
+        let raw = parse_raw(&dir.log_path(), magic);
+        assert_eq!(
+            raw.iter().map(|(n, ..)| *n).collect::<Vec<_>>(),
+            vec![100, 101]
+        );
+        assert_eq!(log.read_block(100).unwrap(), payload);
+    }
+
+    #[test]
+    fn clear_empties_log_and_accepts_any_next_height() {
+        let (dir, magic) = setup("clear");
+        let log = StateHistoryLog::open_with_magic(dir.path(), "block_log", magic).unwrap();
+
+        log.clear().unwrap();
+        assert_eq!(log.range(), None);
+        assert_eq!(log.last_block(), 0);
+        assert!(matches!(log.read_block(1), Err(ShLogError::NotFound(1))));
+
+        // An empty log accepts any starting height, so the state-history stream
+        // can resume at the first post-sync block.
+        log.append(make_id(50, 9), b"resume-50").unwrap();
+        assert_eq!(log.range().unwrap(), (50, 50));
+        drop(log);
+
+        let log = StateHistoryLog::open_with_magic(dir.path(), "block_log", magic).unwrap();
+        assert_eq!(log.range().unwrap(), (50, 50));
+        assert_eq!(log.read_block(50).unwrap(), b"resume-50");
     }
 }
