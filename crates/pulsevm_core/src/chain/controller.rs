@@ -1998,20 +1998,12 @@ mod tests {
         memo: String,
     }
 
-    // System-contract action args, for the pulse_system.wasm bring-up spike.
+    // System-contract action args for the bootstrap test.
     // eosio.system::init(unsigned_int version, symbol core).
     #[derive(Debug, Clone, Read, Write, NumBytes)]
     struct SystemInit {
         version: pulsevm_serialization::VarUint32,
         core: Symbol,
-    }
-
-    // eosio.system::buyram(name payer, name receiver, asset quant).
-    #[derive(Debug, Clone, Read, Write, NumBytes)]
-    struct BuyRam {
-        payer: Name,
-        receiver: Name,
-        quant: Asset,
     }
 
     fn get_temp_dir() -> TempDir {
@@ -2486,32 +2478,66 @@ mod tests {
         );
 
         // --- Drive the resource market / governance ---
-        // Best-effort probe (not asserted): this build exposes buyrambsys/buyramsys
-        // (the system/bootstrap RAM variants) rather than the public buyram. It
-        // dispatches into the contract and runs its validation, but packing the
-        // exact args needs the system ABI (not shipped in-repo), so we only report
-        // how far it gets. Once the ABI lands, this becomes a real market test.
+        // init leaves the RAM market with no base liquidity in this build
+        // (free_ram() is 0 until max_ram_size is set), so a purchase prices to 0
+        // bytes. setram raises max_ram_size and adds the delta to the market base,
+        // bringing it to life. Signature (Proton eosio.system): setram(uint64).
+        #[derive(Debug, Clone, Read, Write, NumBytes)]
+        struct SetRam {
+            max_ram_size: u64,
+        }
+        step!(
+            "6b setram",
+            call_contract(
+                &private_key,
+                pulse,
+                Name::from_str("setram")?,
+                &SetRam {
+                    max_ram_size: 16 * 1024 * 1024 * 1024,
+                },
+                chain_id,
+            )?
+        );
+
+        // Drive the RAM market. Signatures confirmed against the Proton
+        // eosio.system source (this wasm is a smaller build of that contract):
+        // buyrambsys(name payer, name receiver, uint32 bytes) reserves a fixed
+        // number of RAM bytes, priced through the bancor market.
+        #[derive(Debug, Clone, Read, Write, NumBytes)]
+        struct BuyRamB {
+            payer: Name,
+            receiver: Name,
+            bytes: u32,
+        }
+        // Probe (reported, not asserted): buy RAM for an ordinary account (alice),
+        // paid for by pulse. This drives the whole market pipeline — auth, the
+        // Proton permission check, the inline token transfer, bancor pricing, and
+        // the set_resource_limits grant. It currently fails the receiver's RAM
+        // verification because the market conversion yields ~0 bytes regardless of
+        // the purchase size (alice keeps only the ~1400-byte RAM gift), so the
+        // grant never covers the userres rows the purchase itself writes. The
+        // market's reserves/conversion aren't taking effect on this node (init
+        // liquidity + the setram delta, and/or inline-action effects on the
+        // rammarket table) — the next thing to debug for a fully settled purchase.
+        let alice = Name::from_str("alice")?;
         let probe = controller.execute_transaction(
             &call_contract(
                 &private_key,
                 pulse,
-                Name::from_str("buyramsys")?,
-                &BuyRam {
+                Name::from_str("buyrambsys")?,
+                &BuyRamB {
                     payer: pulse,
-                    receiver: pulse,
-                    quant: Asset::from_str("100.0000 PULSE").unwrap(),
+                    receiver: alice,
+                    bytes: 8192,
                 },
                 chain_id,
             )?,
             &ts,
             &status,
         );
-        eprintln!(
-            "BOOT probe (buyramsys, needs ABI for exact args): {}",
-            fmt_res(&probe)
-        );
+        eprintln!("BOOT probe (buyrambsys for alice): {}", fmt_res(&probe));
 
-        eprintln!("BOOT: system contract bootstrapped and initialized");
+        eprintln!("BOOT: system contract bootstrapped, initialized, RAM market live");
         Ok(())
     }
 
