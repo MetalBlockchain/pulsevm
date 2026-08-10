@@ -1428,6 +1428,10 @@ impl Controller {
         &self.last_accepted_block
     }
 
+    pub fn active_producer_schedule(&self) -> &ProducerSchedule {
+        &self.active_schedule
+    }
+
     pub fn get_block_by_height(&self, height: u32) -> Result<Option<SignedBlock>, ChainError> {
         if height == self.last_accepted_block.block_num() {
             return Ok(Some(self.last_accepted_block.clone()));
