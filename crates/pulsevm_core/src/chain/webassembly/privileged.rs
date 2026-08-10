@@ -123,16 +123,19 @@ pub fn get_blockchain_parameters_packed(
     data_ptr: WasmPtr<u8>,
     data_len: u32,
 ) -> Result<u32, RuntimeError> {
-    context_aware_check(&env)?;
+    // Gate on privilege before charging, so a non-privileged caller isn't metered
+    // for work that is rejected anyway — matching set_blockchain_parameters_packed.
+    {
+        context_aware_check(&env)?;
+        let context = env.data_mut().apply_context_mut();
+        privileged_check(context)?;
+    }
+
     let (env_data, mut store) = env.data_and_store_mut();
     env_data.charge(
         &mut store,
         cost::PRIVILEGED + cost::per_byte(data_len as u64),
     )?;
-    {
-        let context = env_data.apply_context_mut();
-        privileged_check(context)?;
-    }
 
     // Read the active chain configuration and pack it in the same ChainConfigV0
     // wire format `set_blockchain_parameters_packed` consumes, so a contract can
