@@ -87,6 +87,11 @@ struct TransactionContextInner {
     executed_action_receipt_digests: VecDeque<Digest>,
     is_input: bool,
     proposed_schedule: Option<Vec<ProducerKey>>,
+    // The producer schedule in force for the block this transaction executes in
+    // (producers + version), so `get_active_producers` / `set_proposed_producers`
+    // can read the active set. Set by the controller right after construction.
+    active_producers: Vec<ProducerKey>,
+    active_schedule_version: u32,
 }
 
 #[derive(Clone)]
@@ -141,9 +146,33 @@ impl TransactionContext {
                 executed_action_receipt_digests: VecDeque::with_capacity(6),
                 is_input: false,
                 proposed_schedule: None,
+                active_producers: Vec::new(),
+                active_schedule_version: 0,
             })),
             packed_transaction,
         }
+    }
+
+    /// Record the producer schedule in force for the block this transaction runs
+    /// in. The controller sets this before execution so `get_active_producers`
+    /// and `set_proposed_producers` can read the active set and version.
+    pub fn set_active_schedule(
+        &self,
+        producers: Vec<ProducerKey>,
+        version: u32,
+    ) -> Result<(), ChainError> {
+        let mut inner = self.inner.write()?;
+        inner.active_producers = producers;
+        inner.active_schedule_version = version;
+        Ok(())
+    }
+
+    pub fn active_producers(&self) -> Result<Vec<ProducerKey>, ChainError> {
+        Ok(self.inner.read()?.active_producers.clone())
+    }
+
+    pub fn active_schedule_version(&self) -> Result<u32, ChainError> {
+        Ok(self.inner.read()?.active_schedule_version)
     }
 
     pub fn init(

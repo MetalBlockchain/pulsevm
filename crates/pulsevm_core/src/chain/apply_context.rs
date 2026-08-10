@@ -1868,6 +1868,16 @@ impl ApplyContext {
         Ok(())
     }
 
+    /// Record the value a contract set via `set_action_return_value` on this
+    /// action's trace. This is informational (history/RPC) only — the action
+    /// receipt digest is unchanged — so surfacing it does not affect consensus.
+    pub fn set_trace_return_value(&self, value: Vec<u8>) -> Result<(), ChainError> {
+        self.trx_context
+            .modify_action_trace(self.action_ordinal, |trace| {
+                trace.return_value = value;
+            })
+    }
+
     pub fn next_recv_sequence(
         &mut self,
         receiver_account: &AccountMetadataObject,
@@ -1976,6 +1986,14 @@ impl ApplyContext {
         producers: Vec<ProducerKey>,
     ) -> Result<(), ChainError> {
         self.trx_context.set_proposed_producers(producers)
+    }
+
+    pub fn active_producers(&self) -> Result<Vec<ProducerKey>, ChainError> {
+        self.trx_context.active_producers()
+    }
+
+    pub fn active_schedule_version(&self) -> Result<u32, ChainError> {
+        self.trx_context.active_schedule_version()
     }
 }
 
