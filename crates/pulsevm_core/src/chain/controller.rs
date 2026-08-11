@@ -6779,6 +6779,112 @@ mod tests {
         Ok(())
     }
 
+    // eosio_exit/pulse_exit ends the current action *successfully* — the reference
+    // chain keeps the state the action produced up to the exit. A contract on pulse
+    // writes a table row and then calls eosio_exit: the transaction must succeed and
+    // the row must persist (a later read finds it). A sibling action calling
+    // eosio_assert(false) still fails, proving a real trap is unaffected.
+    #[tokio::test]
+    async fn eosio_exit_ends_action_successfully_and_keeps_state() -> Result<(), ChainError> {
+        let (mut controller, private_key, _chain_id, _temp) = init_test_controller()?;
+        let ts = controller.last_accepted_block().timestamp().clone();
+        let chain_id = controller.chain_id().clone();
+        let status = BlockStatus::Building;
+
+        let pulse = PULSE_NAME.as_u64() as i64;
+        let tbl = Name::from_str("t")?.as_u64() as i64;
+        let storexit = Name::from_str("storexit")?.as_u64() as i64;
+        let check = Name::from_str("check")?.as_u64() as i64;
+        let boom = Name::from_str("boom")?.as_u64() as i64;
+        let wasm = wat::parse_str(&format!(
+            r#"
+            (module
+              (import "env" "db_store_i64"
+                (func $store (param i64 i64 i64 i64 i32 i32) (result i32)))
+              (import "env" "db_find_i64"
+                (func $find (param i64 i64 i64 i64) (result i32)))
+              (import "env" "eosio_exit" (func $exit (param i32)))
+              (import "env" "eosio_assert" (func $assert (param i32 i32)))
+              (memory (export "memory") 1)
+              (func (export "apply") (param i64 i64 i64)
+                (block $notstore
+                  (br_if $notstore (i64.ne (local.get 2) (i64.const {storexit})))
+                  (i32.store (i32.const 0) (i32.const 305419896))
+                  (drop (call $store (i64.const {pulse}) (i64.const {tbl})
+                                     (i64.const {pulse}) (i64.const 1)
+                                     (i32.const 0) (i32.const 4)))
+                  (call $exit (i32.const 0))
+                  (return))
+                (block $notcheck
+                  (br_if $notcheck (i64.ne (local.get 2) (i64.const {check})))
+                  (call $assert
+                    (i32.ge_s
+                      (call $find (i64.const {pulse}) (i64.const {pulse})
+                                  (i64.const {tbl}) (i64.const 1))
+                      (i32.const 0))
+                    (i32.const 0))
+                  (return))
+                (block $notboom
+                  (br_if $notboom (i64.ne (local.get 2) (i64.const {boom})))
+                  (call $assert (i32.const 0) (i32.const 0)))))
+            "#,
+        ))
+        .unwrap();
+        controller.execute_transaction(
+            &set_code(&private_key, PULSE_NAME, wasm, chain_id)?,
+            &ts,
+            &status,
+        )?;
+
+        // The action stores a row and then calls eosio_exit. Before the fix this
+        // surfaced as a trap and failed the transaction; now it must succeed.
+        controller.execute_transaction(
+            &call_contract(
+                &private_key,
+                PULSE_NAME,
+                Name::from_str("storexit")?,
+                &Vec::<u8>::new(),
+                chain_id,
+            )?,
+            &ts,
+            &status,
+        )?;
+
+        // The row written before the exit must have committed: this action asserts
+        // the row is found, so it only succeeds if the state survived the exit.
+        controller.execute_transaction(
+            &call_contract(
+                &private_key,
+                PULSE_NAME,
+                Name::from_str("check")?,
+                &Vec::<u8>::new(),
+                chain_id,
+            )?,
+            &ts,
+            &status,
+        )?;
+
+        // Control: a genuine eosio_assert(false) still fails the transaction, so the
+        // exit handling didn't turn every trap into a success.
+        let boom_res = controller.execute_transaction(
+            &call_contract(
+                &private_key,
+                PULSE_NAME,
+                Name::from_str("boom")?,
+                &Vec::<u8>::new(),
+                chain_id,
+            )?,
+            &ts,
+            &status,
+        );
+        assert!(
+            boom_res.is_err(),
+            "eosio_assert(false) must still fail the transaction"
+        );
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_push_transaction() -> Result<(), ChainError> {
         let chain_id =

@@ -225,6 +225,23 @@ use super::webassembly::{
     send_inline,
 };
 
+/// Sentinel raised by the `eosio_exit`/`pulse_exit` intrinsic. It reaches `run`
+/// as a wasm trap, but unlike a real trap it ends the current action
+/// *successfully* — the reference chain terminates the action and keeps the
+/// state it produced. `run` detects it and returns Ok.
+#[derive(Debug)]
+pub struct WasmExit {
+    pub code: i32,
+}
+
+impl std::fmt::Display for WasmExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "wasm exit with code {}", self.code)
+    }
+}
+
+impl std::error::Error for WasmExit {}
+
 pub struct WasmContext {
     receiver: u64,
     action: Action,
@@ -788,22 +805,14 @@ impl WasmRuntime {
         // Resume timer
         apply_context.resume_billing_timer()?;
 
-        let result = apply_func
-            .call(
-                &mut warm.store,
-                receiver.as_u64() as i64,
-                action.account().as_u64() as i64,
-                action.name().as_u64() as i64,
-            )
-            .map_err(|e| {
-                // If this was originally `Err(ChainError)`, restore it
-                if let Some(chain_err) = e.downcast_ref::<ChainError>() {
-                    return chain_err.clone();
-                }
-
-                // Otherwise wrap it
-                ChainError::ApplyError(format!("{}", e.message()))
-            });
+        // Keep the raw RuntimeError so an eosio_exit/pulse_exit trap (WasmExit) can
+        // be told apart from a real failure before it's flattened into a ChainError.
+        let result = apply_func.call(
+            &mut warm.store,
+            receiver.as_u64() as i64,
+            action.account().as_u64() as i64,
+            action.name().as_u64() as i64,
+        );
         let remaining_points: MeteringPoints = get_remaining_points(&mut warm.store, &instance);
 
         // Return the warm store to the pool for reuse, unless it has spun up
@@ -817,10 +826,16 @@ impl WasmRuntime {
 
         match remaining_points {
             MeteringPoints::Remaining(points) => {
-                // If the apply function returned an error, return it now that we've captured the
-                // remaining points
                 if let Err(e) = result {
-                    return Err(e);
+                    // eosio_exit/pulse_exit ends the action successfully; every
+                    // other trap is a real failure. Restore a ChainError raised by
+                    // a host fn, otherwise wrap the trap message.
+                    if e.downcast_ref::<WasmExit>().is_none() {
+                        if let Some(chain_err) = e.downcast_ref::<ChainError>() {
+                            return Err(chain_err.clone());
+                        }
+                        return Err(ChainError::ApplyError(format!("{}", e.message())));
+                    }
                 }
 
                 Ok(cpu_limit.saturating_sub(points) as u64)
