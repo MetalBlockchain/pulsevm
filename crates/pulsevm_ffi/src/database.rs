@@ -20,7 +20,6 @@ use pulsevm_error::ChainError;
 use pulsevm_name::Name;
 
 use crate::{
-    AccountMetadataObject,
     ChainConfigV0,
     Float128,
     Index64IteratorCache,
@@ -1331,6 +1330,13 @@ impl Database {
         Ok(account)
     }
 
+    /// Whether `account_name` exists, decided under the read guard so no pointer
+    /// escapes the lock. Prefer this to `find_account(..).is_null()` at call sites
+    /// that only need existence.
+    pub fn account_exists(&self, account_name: u64) -> Result<bool, ChainError> {
+        Ok(self.read()?.find_account(account_name)?.is_some())
+    }
+
     pub fn get_account(
         &self,
         account_name: u64,
@@ -1423,15 +1429,26 @@ impl Database {
 
     pub fn unlink_account_code(
         &mut self,
-        old_code_entry: &ffi::CodeObject,
+        code_hash: &CxxDigest,
+        vm_type: u8,
+        vm_version: u8,
     ) -> Result<(), ChainError> {
         #[cfg(feature = "arena-shadow")]
-        let hash = digest_to_array(old_code_entry.get_code_hash());
+        let hash = digest_to_array(code_hash);
         {
             let mut guard = self.inner.write()?;
-            let pinned = guard.pin_mut();
-            pinned
-                .unlink_account_code(old_code_entry)
+            // Resolve the code object under this guard, then drop the borrow to a
+            // raw pointer so its reference is confined to the C++ call rather than
+            // passed in by the caller.
+            let obj_ptr: *const ffi::CodeObject = {
+                let obj = guard
+                    .get_code_object_by_hash(code_hash, vm_type, vm_version)
+                    .map_err(|e| ChainError::ActionValidationError(format!("{}", e)))?;
+                obj as *const ffi::CodeObject
+            };
+            guard
+                .pin_mut()
+                .unlink_account_code(unsafe { &*obj_ptr })
                 .map_err(|e| ChainError::ActionValidationError(format!("{}", e)))?;
         }
         #[cfg(feature = "arena-shadow")]
@@ -1445,7 +1462,7 @@ impl Database {
 
     pub fn update_account_code(
         &mut self,
-        account: &ffi::AccountMetadataObject,
+        account_name: u64,
         new_code: &[u8],
         head_block_num: u32,
         pending_block_time: &TimePoint,
@@ -1455,10 +1472,19 @@ impl Database {
     ) -> Result<(), ChainError> {
         {
             let mut guard = self.inner.write()?;
-            let pinned = guard.pin_mut();
-            pinned
+            let obj = guard
+                .find_account_metadata(account_name)
+                .map_err(|e| ChainError::ActionValidationError(format!("{}", e)))?;
+            if obj.is_null() {
+                return Err(ChainError::ActionValidationError(format!(
+                    "account metadata not found for account: {}",
+                    account_name
+                )));
+            }
+            guard
+                .pin_mut()
                 .update_account_code(
-                    account,
+                    unsafe { &*obj },
                     new_code,
                     head_block_num,
                     pending_block_time,
@@ -1471,32 +1497,43 @@ impl Database {
         #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow {
             let hash = digest_to_array(code_hash);
-            let name = account.get_name();
-            if let Err(e) =
-                s.update_account_code(name, new_code, hash, head_block_num, vm_type, vm_version)
-            {
+            if let Err(e) = s.update_account_code(
+                account_name,
+                new_code,
+                hash,
+                head_block_num,
+                vm_type,
+                vm_version,
+            ) {
                 eprintln!("arena mirror of update_account_code diverged: {e:?}");
             }
         }
         Ok(())
     }
 
-    pub fn update_account_abi(
-        &mut self,
-        account: &ffi::AccountObject,
-        account_metadata: &ffi::AccountMetadataObject,
-        abi: &[u8],
-    ) -> Result<(), ChainError> {
+    pub fn update_account_abi(&mut self, account_name: u64, abi: &[u8]) -> Result<(), ChainError> {
         {
             let mut guard = self.inner.write()?;
-            let pinned = guard.pin_mut();
-            pinned
-                .update_account_abi(account, account_metadata, abi)
+            let account = guard
+                .find_account(account_name)
+                .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+            let account_metadata = guard
+                .find_account_metadata(account_name)
+                .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+            if account.is_null() || account_metadata.is_null() {
+                return Err(ChainError::InternalError(format!(
+                    "account not found: {}",
+                    account_name
+                )));
+            }
+            guard
+                .pin_mut()
+                .update_account_abi(unsafe { &*account }, unsafe { &*account_metadata }, abi)
                 .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
         }
         #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
-            && let Err(e) = s.update_account_abi(account_metadata.get_name(), abi)
+            && let Err(e) = s.update_account_abi(account_name, abi)
         {
             eprintln!("arena mirror of update_account_abi diverged: {e:?}");
         }
@@ -2241,20 +2278,29 @@ impl Database {
         Ok(res)
     }
 
-    pub fn next_recv_sequence(
-        &mut self,
-        receiver_account: &AccountMetadataObject,
-    ) -> Result<u64, ChainError> {
+    pub fn next_recv_sequence(&mut self, account_name: u64) -> Result<u64, ChainError> {
         let res = {
             let mut guard = self.inner.write()?;
-            let pinned = guard.pin_mut();
-            pinned
-                .next_recv_sequence(receiver_account)
+            // Look up the metadata object under this same guard and confine the
+            // reference to the C++ call, so no chainbase reference is handed in by
+            // (or escapes to) the caller.
+            let obj = guard
+                .find_account_metadata(account_name)
+                .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+            if obj.is_null() {
+                return Err(ChainError::InternalError(format!(
+                    "account metadata not found for account: {}",
+                    account_name
+                )));
+            }
+            guard
+                .pin_mut()
+                .next_recv_sequence(unsafe { &*obj })
                 .map_err(|e| ChainError::InternalError(format!("{}", e)))?
         };
         #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
-            && let Err(e) = s.next_recv_sequence(receiver_account.get_name())
+            && let Err(e) = s.next_recv_sequence(account_name)
         {
             eprintln!("arena mirror of next_recv_sequence diverged: {e:?}");
         }
@@ -4200,6 +4246,38 @@ impl<'g> DbRead<'g> {
             .get_global_properties()
             .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
         Ok(res)
+    }
+
+    /// Like [`find_account`] but errors when absent. The returned reference borrows
+    /// the held guard, so it cannot outlive the lock.
+    pub fn get_account(&self, account_name: u64) -> Result<&ffi::AccountObject, ChainError> {
+        self.find_account(account_name)?.ok_or_else(|| {
+            ChainError::InternalError(format!("account not found: {}", account_name))
+        })
+    }
+
+    /// Like [`find_account_metadata`] but errors when absent.
+    pub fn get_account_metadata(
+        &self,
+        account_name: u64,
+    ) -> Result<&ffi::AccountMetadataObject, ChainError> {
+        self.find_account_metadata(account_name)?.ok_or_else(|| {
+            ChainError::InternalError(format!(
+                "account metadata not found for account: {}",
+                account_name
+            ))
+        })
+    }
+
+    pub fn get_code_object_by_hash(
+        &self,
+        code_hash: &CxxDigest,
+        vm_type: u8,
+        vm_version: u8,
+    ) -> Result<&ffi::CodeObject, ChainError> {
+        self.db()
+            .get_code_object_by_hash(code_hash, vm_type, vm_version)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 
     /// Like [`find_permission_by_actor_and_permission`] but errors when absent.

@@ -497,8 +497,8 @@ impl WasmRuntime {
             let mut inner = self.inner.write()?;
 
             if !inner.code_cache.contains(&id) {
-                let code_object = db.get_code_object_by_hash(code_hash, 0, 0)?;
-                let code_object = unsafe { &*code_object };
+                let r = db.read()?;
+                let code_object = r.get_code_object_by_hash(code_hash, 0, 0)?;
 
                 // Compile on a fresh engine carrying the pinned deterministic
                 // config (NaN canonicalization, metering, feature set).

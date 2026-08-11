@@ -6,7 +6,6 @@ use wasmer::{
 };
 
 use crate::chain::{
-    controller::Controller,
     utils::pulse_assert,
     wasm_runtime::WasmContext,
     webassembly::context_aware_check,
@@ -66,8 +65,9 @@ pub fn set_action_return_value(
     env_data.charge(&mut store, cost::BASE + cost::per_byte(buffer_len as u64))?;
 
     {
-        let mut db = env_data.db_mut();
-        let gpo = Controller::get_global_properties(&mut db)?;
+        let db = env_data.db_mut();
+        let r = db.read()?;
+        let gpo = r.get_global_properties()?;
         pulse_assert(
             buffer_len <= gpo.get_chain_config().get_max_action_return_value_size(),
             ChainError::WasmRuntimeError(format!(

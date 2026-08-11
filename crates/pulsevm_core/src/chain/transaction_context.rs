@@ -17,7 +17,6 @@ use pulsevm_error::ChainError;
 use pulsevm_ffi::{
     BlockTimestamp,
     Database,
-    GlobalPropertyObject,
     Microseconds,
     TimePoint,
     seconds,
@@ -44,7 +43,6 @@ use crate::{
         utils::pulse_assert,
         wasm_runtime::WasmRuntime,
     },
-    controller::Controller,
     transaction::PackedTransaction,
 };
 
@@ -171,7 +169,8 @@ impl TransactionContext {
         inner.net_limit = self.db.get_block_net_limit()?;
 
         let net_usage_leeway = {
-            let cfg = Controller::get_global_properties(&self.db)?;
+            let r = self.db.read()?;
+            let cfg = r.get_global_properties()?;
 
             // Possibly lower net_limit to the maximum net usage a transaction is allowed to be
             // billed
@@ -265,21 +264,25 @@ impl TransactionContext {
         transaction: &Transaction,
     ) -> Result<(), ChainError> {
         let mut discounted_size_for_pruned_data = packed_trx_prunable_size;
-        let global_properties = unsafe { &*self.db.get_global_properties()? };
-        let chain_config = global_properties.get_chain_config();
-        if chain_config.get_context_free_discount_net_usage_den() > 0
-            && chain_config.get_context_free_discount_net_usage_num()
-                < chain_config.get_context_free_discount_net_usage_den()
-        {
-            discounted_size_for_pruned_data *=
-                chain_config.get_context_free_discount_net_usage_num() as u64;
-            discounted_size_for_pruned_data = (discounted_size_for_pruned_data
-                + chain_config.get_context_free_discount_net_usage_den() as u64
-                - 1)
-                / chain_config.get_context_free_discount_net_usage_den() as u64; // rounds up
+        // Copy the needed chain-config values out under a short read guard rather
+        // than holding a reference into the database.
+        let (cf_discount_num, cf_discount_den, base_per_transaction_net_usage) = {
+            let r = self.db.read()?;
+            let chain_config = r.get_global_properties()?.get_chain_config();
+            (
+                chain_config.get_context_free_discount_net_usage_num(),
+                chain_config.get_context_free_discount_net_usage_den(),
+                chain_config.get_base_per_transaction_net_usage(),
+            )
+        };
+        if cf_discount_den > 0 && cf_discount_num < cf_discount_den {
+            discounted_size_for_pruned_data *= cf_discount_num as u64;
+            discounted_size_for_pruned_data =
+                (discounted_size_for_pruned_data + cf_discount_den as u64 - 1)
+                    / cf_discount_den as u64; // rounds up
         }
 
-        let initial_net_usage: u64 = (chain_config.get_base_per_transaction_net_usage() as u64)
+        let initial_net_usage: u64 = (base_per_transaction_net_usage as u64)
             + packed_trx_unprunable_size
             + discounted_size_for_pruned_data;
         let first_authorizer = transaction.first_authorizer();
@@ -300,10 +303,17 @@ impl TransactionContext {
     // so we skip expiration/authorization/net accounting entirely.
     pub fn init_for_implicit_trx(&mut self, transaction: &Transaction) -> Result<(), ChainError> {
         {
-            let cfg = Controller::get_global_properties(&self.db)?;
+            // Copy the floor out before taking the inner write lock so the db read
+            // guard isn't held across it.
+            let min_transaction_cpu_usage = {
+                let r = self.db.read()?;
+                r.get_global_properties()?
+                    .get_chain_config()
+                    .get_min_transaction_cpu_usage()
+            };
             let mut inner = self.inner.write()?;
             inner.explicit_billed_cpu_time = true;
-            inner.explicit_cpu_us = cfg.get_chain_config().get_min_transaction_cpu_usage();
+            inner.explicit_cpu_us = min_transaction_cpu_usage;
             inner.cpu_limit = -1;
         }
         self.init(0, transaction.first_authorizer(), false)
@@ -705,7 +715,8 @@ impl TransactionContext {
         let inner = self.inner.read()?;
         let expiration: TimePoint = trx.header.expiration().into();
         let pending_block_timestamp: TimePoint = inner.pending_block_timestamp.into();
-        let gpo = Controller::get_global_properties(&self.db)?;
+        let r = self.db.read()?;
+        let gpo = r.get_global_properties()?;
 
         if expiration < pending_block_timestamp {
             return Err(ChainError::TransactionError(
@@ -728,9 +739,7 @@ impl TransactionContext {
     pub fn validate_referenced_accounts(&self, trx: &Transaction) -> Result<(), ChainError> {
         if !trx.context_free_actions.is_empty() {
             for action in trx.context_free_actions.iter() {
-                let code = self.db.find_account(action.account.as_u64())?;
-
-                if code.is_null() {
+                if !self.db.account_exists(action.account.as_u64())? {
                     return Err(ChainError::TransactionError(format!(
                         "context free action {} references non-existent account {}",
                         action.name(),
@@ -749,9 +758,7 @@ impl TransactionContext {
         let mut one_auth = false;
 
         for action in trx.actions.iter() {
-            let code = self.db.find_account(action.account.as_u64())?;
-
-            if code.is_null() {
+            if !self.db.account_exists(action.account.as_u64())? {
                 return Err(ChainError::TransactionError(format!(
                     "action {} references non-existent account {}",
                     action.name(),
@@ -761,9 +768,7 @@ impl TransactionContext {
 
             for auth in action.authorization().iter() {
                 one_auth = true;
-                let actor = self.db.find_account(auth.actor())?;
-
-                if actor.is_null() {
+                if !self.db.account_exists(auth.actor())? {
                     return Err(ChainError::TransactionError(format!(
                         "action's authorizing actor '{}' does not exist",
                         Name::new(auth.actor)
@@ -862,7 +867,8 @@ impl TransactionContext {
         check_minimum: bool,
     ) -> Result<(), ChainError> {
         if check_minimum {
-            let cfg = Controller::get_global_properties(&db)?;
+            let r = db.read()?;
+            let cfg = r.get_global_properties()?;
 
             if inner.trace.receipt.cpu_usage_us
                 < cfg.get_chain_config().get_min_transaction_cpu_usage()
@@ -886,7 +892,8 @@ impl TransactionContext {
             return Ok(());
         }
 
-        let cfg = Controller::get_global_properties(&db)?;
+        let r = db.read()?;
+        let cfg = r.get_global_properties()?;
 
         inner.trace.receipt.cpu_usage_us = std::cmp::max(
             inner.trace.receipt.cpu_usage_us,
