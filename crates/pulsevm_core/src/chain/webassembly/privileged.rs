@@ -238,7 +238,8 @@ pub fn is_privileged(
     let context = env_data.apply_context_mut();
     privileged_check(context)?;
     let db = env_data.db();
-    let account = db.get_account_metadata(account)?;
+    let r = db.read()?;
+    let account = r.get_account_metadata(account)?;
 
     Ok(account.is_privileged() as i32)
 }

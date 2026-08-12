@@ -16,9 +16,9 @@ use pulsevm_billable_size::billable_size_v;
 use pulsevm_crypto::Bytes;
 use pulsevm_error::ChainError;
 use pulsevm_ffi::{
-    AccountMetadataObject,
     BlockTimestamp,
     ChainConfigV0,
+    CxxDigest,
     Database,
     Float128,
     Index64IteratorCache,
@@ -172,7 +172,8 @@ impl ApplyContext {
         };
 
         if inline_actions.len() > 0 || context_free_inline_actions.len() > 0 {
-            let gpo = Controller::get_global_properties(&mut self.db)?;
+            let r = self.db.read()?;
+            let gpo = r.get_global_properties()?;
 
             pulse_assert(
                 recurse_depth < gpo.get_chain_config().get_max_inline_action_depth() as u32,
@@ -194,11 +195,18 @@ impl ApplyContext {
     }
 
     pub fn exec_one(&mut self) -> Result<u64, ChainError> {
-        let receiver_account = self.db.get_account_metadata(self.receiver.as_u64())?;
         let mut cpu_used = 100; // Base usage is always 100 instructions
+
+        // Read the receiver's privileged flag under a short-lived guard rather than
+        // holding a chainbase reference across the handlers below.
+        let is_privileged = {
+            let r = self.db.read()?;
+            r.get_account_metadata(self.receiver.as_u64())?
+                .is_privileged()
+        };
         let action = {
             let mut inner = self.inner.write()?;
-            inner.privileged = receiver_account.is_privileged();
+            inner.privileged = is_privileged;
             inner.action.clone()
         };
 
@@ -213,11 +221,18 @@ impl ApplyContext {
             self.trx_context.checktime()?;
         }
 
+        // Copy the (possibly just-updated) code hash out as an owned value: the wasm
+        // run re-locks the database, so no read guard or chainbase reference may be
+        // held across it. Read after the native handler so a self-setcode is seen,
+        // matching the previous live-reference behaviour.
+        let code_hash = {
+            let r = self.db.read()?;
+            let meta = r.get_account_metadata(self.receiver.as_u64())?;
+            CxxDigest::new_from_existing_hash(meta.get_code_hash().as_slice())?
+        };
+
         // Does the receiver account have a contract deployed?
-        if !receiver_account.get_code_hash().empty() {
-            // Separate context here because we need to release the lock on inner before executing
-            // the Wasm code, which may call back into the context and cause deadlock if we hold the
-            // lock.
+        if !code_hash.as_ref().map_or(true, |d| d.empty()) {
             let cpu_limit = {
                 let inner = self.inner.read()?;
                 inner.cpu_limit
@@ -228,7 +243,7 @@ impl ApplyContext {
                 action.clone(),
                 self.clone(),
                 self.db.clone(),
-                receiver_account.get_code_hash(),
+                code_hash.as_ref().unwrap(),
                 cpu_limit,
             )?;
         }
@@ -237,15 +252,22 @@ impl ApplyContext {
             let inner = self.inner.read()?;
             generate_action_digest(&action, inner.action_return_value.clone())
         };
-        let first_receiver_account = self.db.get_account_metadata(action.account().as_u64())?;
+        let (code_sequence, abi_sequence) = {
+            let r = self.db.read()?;
+            let meta = r.get_account_metadata(action.account().as_u64())?;
+            (
+                meta.get_code_sequence() as u32,
+                meta.get_abi_sequence() as u32,
+            )
+        };
         let mut receipt = ActionReceipt::new(
             self.receiver.clone(),
             act_digest,
             self.next_global_sequence()?,
-            self.next_recv_sequence(&receiver_account)?,
+            self.next_recv_sequence(self.receiver.as_u64())?,
             BTreeMap::new(),
-            first_receiver_account.get_code_sequence() as u32,
-            first_receiver_account.get_abi_sequence() as u32,
+            code_sequence,
+            abi_sequence,
         );
 
         for auth in action.clone().authorization().iter() {
@@ -355,9 +377,8 @@ impl ApplyContext {
         let inherit_parent_authorizations = send_to_self && &self.receiver == action.account();
 
         {
-            let code = self.db.find_account(a.account().as_u64())?;
             pulse_assert(
-                !code.is_null(),
+                self.db.account_exists(a.account().as_u64())?,
                 ChainError::TransactionError(format!(
                     "inline action's code account {} does not exist",
                     a.account()
@@ -367,9 +388,8 @@ impl ApplyContext {
             let mut inherited_authorizations: BTreeSet<PermissionLevel> = BTreeSet::new();
 
             for auth in a.authorization() {
-                let actor = self.db.find_account(auth.actor)?;
                 pulse_assert(
-                    !actor.is_null(),
+                    self.db.account_exists(auth.actor)?,
                     ChainError::TransactionError(format!(
                         "inline action's authorizing actor {} does not exist",
                         auth.actor
@@ -416,9 +436,8 @@ impl ApplyContext {
     }
 
     pub fn execute_context_free_inline(&mut self, a: &Action) -> Result<(), ChainError> {
-        let code = self.db.find_account(a.account().as_u64())?;
         pulse_assert(
-            !code.is_null(),
+            self.db.account_exists(a.account().as_u64())?,
             ChainError::TransactionError(format!(
                 "inline action's code account {} does not exist",
                 a.account()
@@ -1883,11 +1902,8 @@ impl ApplyContext {
             })
     }
 
-    pub fn next_recv_sequence(
-        &mut self,
-        receiver_account: &AccountMetadataObject,
-    ) -> Result<u64, ChainError> {
-        self.db.next_recv_sequence(receiver_account)
+    pub fn next_recv_sequence(&mut self, account_name: u64) -> Result<u64, ChainError> {
+        self.db.next_recv_sequence(account_name)
     }
 
     pub fn next_auth_sequence(&mut self, actor: u64) -> Result<u64, ChainError> {

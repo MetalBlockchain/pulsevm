@@ -92,7 +92,6 @@ use pulsevm_ffi::{
     CxxGenesisState,
     Database,
     ElasticLimitParameters,
-    GlobalPropertyObject,
     PermissionLevelWeight,
     TimePoint,
     UndoSession,
@@ -1282,8 +1281,8 @@ impl Controller {
     fn block_elastic_parameters(
         &self,
     ) -> Result<(ElasticLimitParameters, ElasticLimitParameters), ChainError> {
-        let global_property = Controller::get_global_properties(&self.db)?;
-        let chain_config = global_property.get_chain_config();
+        let r = self.db.read()?;
+        let chain_config = r.get_global_properties()?.get_chain_config();
         let cpu_elastic_parameters = ElasticLimitParameters::new(
             eos_percent(
                 chain_config.get_max_block_cpu_usage() as u64,
@@ -1676,14 +1675,6 @@ impl Controller {
 
     pub fn get_wasm_runtime(&self) -> &WasmRuntime {
         &self.wasm_runtime
-    }
-
-    pub fn get_global_properties(db: &Database) -> Result<&GlobalPropertyObject, ChainError> {
-        let res = db.get_global_properties().map_err(|e| {
-            ChainError::DatabaseError(format!("failed to get global properties: {}", e))
-        })?;
-
-        Ok(unsafe { &*res })
     }
 
     pub fn database(&self) -> Database {
@@ -7321,9 +7312,14 @@ mod tests {
         let (mut controller, _private_key, _chain_id, _temp) = init_test_controller()?;
 
         let db = controller.database();
-        let min_cpu_us = Controller::get_global_properties(&db)?
-            .get_chain_config()
-            .get_min_transaction_cpu_usage() as u64;
+        // Scoped: the guard must not still be held when `run_onblock` below asks
+        // the same lock for a write, which is a self-deadlock on one thread.
+        let min_cpu_us = {
+            let r = db.read()?;
+            r.get_global_properties()?
+                .get_chain_config()
+                .get_min_transaction_cpu_usage() as u64
+        };
         assert!(min_cpu_us > 0, "genesis must set a non-zero CPU floor");
 
         let cpu_before = db.get_block_cpu_limit()?;

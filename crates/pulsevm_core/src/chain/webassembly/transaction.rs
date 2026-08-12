@@ -12,7 +12,6 @@ use wasmer::{
 
 use super::cost;
 use crate::chain::{
-    controller::Controller,
     transaction::Action,
     utils::pulse_assert,
     wasm_runtime::WasmContext,
@@ -28,8 +27,9 @@ pub fn send_inline(
 
     {
         let (env_data, _) = env.data_and_store_mut();
-        let mut db = env_data.db_mut();
-        let gpo = Controller::get_global_properties(&mut db)?;
+        let db = env_data.db_mut();
+        let r = db.read()?;
+        let gpo = r.get_global_properties()?;
         pulse_assert(
             length < gpo.get_chain_config().get_max_inline_action_size(),
             ChainError::WasmRuntimeError(format!("inline action too big")),
@@ -66,8 +66,9 @@ pub fn send_context_free_inline(
     context_aware_check(&env)?;
     {
         let (env_data, _) = env.data_and_store_mut();
-        let mut db = env_data.db_mut();
-        let gpo = Controller::get_global_properties(&mut db)?;
+        let db = env_data.db_mut();
+        let r = db.read()?;
+        let gpo = r.get_global_properties()?;
         pulse_assert(
             length < gpo.get_chain_config().get_max_inline_action_size(),
             ChainError::WasmRuntimeError(format!("inline action too big")),

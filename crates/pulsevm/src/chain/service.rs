@@ -240,7 +240,8 @@ impl RpcServer for RpcService {
     async fn get_abi(&self, account_name: Name) -> Result<AbiDefinition, ErrorObjectOwned> {
         let controller = self.controller.read().await;
         let db = controller.database();
-        let code_account = db.get_account(account_name.as_u64())?;
+        let r = db.read()?;
+        let code_account = r.get_account(account_name.as_u64())?;
         let abi = AbiDefinition::read(code_account.get_abi().as_slice(), &mut 0).map_err(|e| {
             ErrorObjectOwned::owned(400, "abi_error", Some(format!("failed to read ABI: {}", e)))
         })?;
@@ -296,7 +297,8 @@ impl RpcServer for RpcService {
     ) -> Result<GetCodeHashResponse, ErrorObjectOwned> {
         let controller = self.controller.read().await;
         let db = controller.database();
-        let accnt_obj = db.get_account_metadata(account_name.as_u64())?;
+        let r = db.read()?;
+        let accnt_obj = r.get_account_metadata(account_name.as_u64())?;
         let code_hash = accnt_obj.get_code_hash();
         Ok(GetCodeHashResponse {
             account_name,
@@ -398,8 +400,9 @@ impl RpcServer for RpcService {
     async fn get_raw_abi(&self, account_name: Name) -> Result<GetRawABIResponse, ErrorObjectOwned> {
         let controller = self.controller.read().await;
         let db = controller.database();
-        let account = db.get_account(account_name.as_u64())?;
-        let account_metadata = db.get_account_metadata(account_name.as_u64())?;
+        let r = db.read()?;
+        let account = r.get_account(account_name.as_u64())?;
+        let account_metadata = r.get_account_metadata(account_name.as_u64())?;
 
         let mut abi_hash = Digest::default();
 
