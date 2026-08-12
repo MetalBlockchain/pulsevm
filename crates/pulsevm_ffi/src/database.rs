@@ -320,7 +320,7 @@ impl Database {
     /// by_name order — hash it to get a cross-implementation state root for the
     /// account set.
     pub fn account_metadata_state_bytes(&self) -> Result<Vec<u8>, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
         guard
             .account_metadata_state_bytes()
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
@@ -346,7 +346,7 @@ impl Database {
     /// by_name order — the account-table counterpart of
     /// `account_metadata_state_bytes`.
     pub fn account_state_bytes(&self) -> Result<Vec<u8>, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
         guard
             .account_state_bytes()
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
@@ -374,7 +374,7 @@ impl Database {
     /// `encode_authority`.
     #[cfg(feature = "arena-shadow")]
     pub fn permission_state_bytes(&self) -> Result<Vec<u8>, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
         let keys = guard
             .permission_keys_bytes()
             .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
@@ -417,42 +417,42 @@ impl Database {
     }
 
     pub fn permission_link_state_bytes(&self) -> Result<Vec<u8>, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
         guard
             .permission_link_state_bytes()
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 
     pub fn code_state_bytes(&self) -> Result<Vec<u8>, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
         guard
             .code_state_bytes()
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 
     pub fn transaction_state_bytes(&self) -> Result<Vec<u8>, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
         guard
             .transaction_state_bytes()
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 
     pub fn resource_usage_state_bytes(&self) -> Result<Vec<u8>, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
         guard
             .resource_usage_state_bytes()
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 
     pub fn account_limits_state_bytes(&self) -> Result<Vec<u8>, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
         guard
             .account_limits_state_bytes()
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 
     pub fn resource_state_bytes(&self) -> Result<Vec<u8>, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
         guard
             .resource_state_bytes()
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
@@ -530,14 +530,14 @@ impl Database {
     }
 
     pub fn contract_table_state_bytes(&self) -> Result<Vec<u8>, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
         guard
             .contract_table_state_bytes()
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 
     pub fn contract_kv_state_bytes(&self) -> Result<Vec<u8>, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
         guard
             .contract_kv_state_bytes()
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
@@ -1027,7 +1027,7 @@ impl Database {
 
     // Replace the inner database with null to call the destructors
     pub fn close(&self) -> Result<(), ChainError> {
-        let mut db = self.inner.write()?;
+        let mut db = self.locked_write()?;
         *db = UniquePtr::<ffi::Database>::null();
         Ok(())
     }
@@ -1047,7 +1047,7 @@ impl Database {
     /// Call this only at a quiescent point (no open undo session): the copy
     /// reflects whatever is committed to the arena at that instant.
     pub fn snapshot_bytes(&self) -> Result<Vec<u8>, ChainError> {
-        let mut guard = self.inner.write()?;
+        let mut guard = self.locked_write()?;
         if guard.is_null() {
             return Err(ChainError::InternalError(
                 "snapshot: database is not open".into(),
@@ -1150,7 +1150,7 @@ impl Database {
         let staged = dir.join("shared_memory.bin.restore-tmp");
         Self::write_sparse_snapshot(&staged, payload)?;
 
-        let mut guard = self.inner.write()?;
+        let mut guard = self.locked_write()?;
         if guard.is_null() {
             let _ = fs::remove_file(&staged);
             return Err(ChainError::InternalError(
@@ -1198,7 +1198,7 @@ impl Database {
     }
 
     pub fn revision(&self) -> i64 {
-        self.inner.read().unwrap().revision()
+        self.locked_read().unwrap().revision()
     }
 
     pub fn set_revision(&mut self, revision: i64) -> Result<(), ChainError> {
@@ -1210,13 +1210,13 @@ impl Database {
     }
 
     pub fn add_indices(&mut self) -> Result<(), ChainError> {
-        self.inner.write()?.pin_mut().add_indices();
+        self.locked_write()?.pin_mut().add_indices();
         Ok(())
     }
 
     pub fn initialize_database(&mut self, genesis: &CxxGenesisState) -> Result<(), ChainError> {
         {
-            let mut guard = self.inner.write()?;
+            let mut guard = self.locked_write()?;
             let pinned = guard.pin_mut();
             pinned
                 .initialize_database(genesis)
@@ -1305,7 +1305,7 @@ impl Database {
         creation_date: u32,
     ) -> Result<*const ffi::AccountObject, ChainError> {
         let res = {
-            let mut guard = self.inner.write()?;
+            let mut guard = self.locked_write()?;
             let pinned = guard.pin_mut();
             pinned
                 .create_account(account_name, creation_date)
@@ -1322,7 +1322,7 @@ impl Database {
     }
 
     pub fn find_account(&self, account_name: u64) -> Result<*const ffi::AccountObject, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
         let account = guard
             .find_account(account_name)
             .map_err(|e| ChainError::InternalError(format!("failed to get account: {}", e)))?;
@@ -1341,7 +1341,7 @@ impl Database {
         &self,
         account_name: u64,
     ) -> Result<&'static ffi::AccountObject, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
         let account = guard
             .find_account(account_name)
             .map_err(|e| ChainError::InternalError(format!("failed to get account: {}", e)))?;
@@ -1362,7 +1362,7 @@ impl Database {
         is_privileged: bool,
     ) -> Result<*const ffi::AccountMetadataObject, ChainError> {
         let res = {
-            let mut guard = self.inner.write()?;
+            let mut guard = self.locked_write()?;
             let pinned = guard.pin_mut();
             pinned
                 .create_account_metadata(account_name, is_privileged)
@@ -1384,7 +1384,7 @@ impl Database {
         &self,
         account_name: u64,
     ) -> Result<*const ffi::AccountMetadataObject, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
 
         guard.find_account_metadata(account_name).map_err(|e| {
             ChainError::InternalError(format!("failed to find account metadata: {}", e))
@@ -1393,7 +1393,7 @@ impl Database {
 
     pub fn set_privileged(&mut self, account: u64, is_privileged: bool) -> Result<(), ChainError> {
         {
-            let mut guard = self.inner.write()?;
+            let mut guard = self.locked_write()?;
             let pinned = guard.pin_mut();
             pinned
                 .set_privileged(account, is_privileged)
@@ -1412,7 +1412,7 @@ impl Database {
         &self,
         account_name: u64,
     ) -> Result<&'static ffi::AccountMetadataObject, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
         let res = guard.find_account_metadata(account_name).map_err(|e| {
             ChainError::InternalError(format!("failed to find account metadata: {}", e))
         })?;
@@ -1436,7 +1436,7 @@ impl Database {
         #[cfg(feature = "arena-shadow")]
         let hash = digest_to_array(code_hash);
         {
-            let mut guard = self.inner.write()?;
+            let mut guard = self.locked_write()?;
             // Resolve the code object under this guard, then drop the borrow to a
             // raw pointer so its reference is confined to the C++ call rather than
             // passed in by the caller.
@@ -1471,7 +1471,7 @@ impl Database {
         vm_version: u8,
     ) -> Result<(), ChainError> {
         {
-            let mut guard = self.inner.write()?;
+            let mut guard = self.locked_write()?;
             let obj = guard
                 .find_account_metadata(account_name)
                 .map_err(|e| ChainError::ActionValidationError(format!("{}", e)))?;
@@ -1513,7 +1513,7 @@ impl Database {
 
     pub fn update_account_abi(&mut self, account_name: u64, abi: &[u8]) -> Result<(), ChainError> {
         {
-            let mut guard = self.inner.write()?;
+            let mut guard = self.locked_write()?;
             let account = guard
                 .find_account(account_name)
                 .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
@@ -1544,7 +1544,7 @@ impl Database {
         &mut self,
         enabled: bool,
     ) -> Result<cxx::UniquePtr<ffi::UndoSession>, ChainError> {
-        let mut guard = self.inner.write()?;
+        let mut guard = self.locked_write()?;
         let pinned = guard.pin_mut();
 
         pinned
@@ -1553,7 +1553,7 @@ impl Database {
     }
 
     pub fn initialize_resource_limits(&mut self) -> Result<(), ChainError> {
-        let mut guard = self.inner.write()?;
+        let mut guard = self.locked_write()?;
         let pinned = guard.pin_mut();
 
         pinned
@@ -1566,7 +1566,7 @@ impl Database {
         account_name: u64,
     ) -> Result<(), ChainError> {
         {
-            let mut guard = self.inner.write()?;
+            let mut guard = self.locked_write()?;
             let pinned = guard.pin_mut();
             pinned
                 .initialize_account_resource_limits(account_name)
@@ -1587,7 +1587,7 @@ impl Database {
         time_slot: u32,
     ) -> Result<(), ChainError> {
         {
-            let mut guard = self.inner.write()?;
+            let mut guard = self.locked_write()?;
             let pinned = guard.pin_mut();
             pinned
                 .update_account_usage(account.as_u64(), time_slot)
@@ -1607,7 +1607,7 @@ impl Database {
         validate: bool,
     ) -> Result<(), ChainError> {
         {
-            let mut guard = self.inner.write()?;
+            let mut guard = self.locked_write()?;
             let pinned = guard.pin_mut();
             pinned
                 .add_transaction_usage(account.as_u64(), cpu_usage, net_usage, time_slot, validate)
@@ -1657,7 +1657,7 @@ impl Database {
         ram_bytes: i64,
     ) -> Result<(), ChainError> {
         {
-            let mut guard = self.inner.write()?;
+            let mut guard = self.locked_write()?;
             let pinned = guard.pin_mut();
             pinned
                 .add_pending_ram_usage(account_name, ram_bytes)
@@ -1673,7 +1673,7 @@ impl Database {
     }
 
     pub fn verify_account_ram_usage(&mut self, account_name: u64) -> Result<(), ChainError> {
-        let mut guard = self.inner.write()?;
+        let mut guard = self.locked_write()?;
         let pinned = guard.pin_mut();
 
         pinned
@@ -1682,7 +1682,7 @@ impl Database {
     }
 
     pub fn get_account_ram_usage(&self, account_name: u64) -> Result<i64, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
 
         guard
             .get_account_ram_usage(account_name)
@@ -1690,28 +1690,28 @@ impl Database {
     }
 
     pub fn get_account_net_usage_average_window(&self) -> Result<u32, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
         guard
             .get_account_net_usage_average_window()
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 
     pub fn get_account_cpu_usage_average_window(&self) -> Result<u32, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
         guard
             .get_account_cpu_usage_average_window()
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 
     pub fn get_account_net_usage_value_ex(&self, account_name: u64) -> Result<u64, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
         guard
             .get_account_net_usage_value_ex(account_name)
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 
     pub fn get_account_cpu_usage_value_ex(&self, account_name: u64) -> Result<u64, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
         guard
             .get_account_cpu_usage_value_ex(account_name)
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
@@ -1748,28 +1748,28 @@ impl Database {
     }
 
     pub fn get_virtual_cpu_limit(&self) -> Result<u64, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
         guard
             .get_virtual_cpu_limit()
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 
     pub fn get_virtual_net_limit(&self) -> Result<u64, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
         guard
             .get_virtual_net_limit()
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 
     pub fn get_cpu_limit_parameters(&self) -> Result<ElasticLimitParameters, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
         guard
             .get_cpu_limit_parameters()
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 
     pub fn get_net_limit_parameters(&self) -> Result<ElasticLimitParameters, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
         guard
             .get_net_limit_parameters()
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
@@ -1797,7 +1797,7 @@ impl Database {
         cpu_weight: i64,
     ) -> Result<bool, ChainError> {
         let res = {
-            let mut guard = self.inner.write()?;
+            let mut guard = self.locked_write()?;
             let pinned = guard.pin_mut();
             pinned
                 .set_account_limits(account_name, ram_bytes, net_weight, cpu_weight)
@@ -1819,7 +1819,7 @@ impl Database {
         net_weight: &mut i64,
         cpu_weight: &mut i64,
     ) -> Result<(), ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
 
         guard
             .get_account_limits(account_name, ram_bytes, net_weight, cpu_weight)
@@ -1827,7 +1827,7 @@ impl Database {
     }
 
     pub fn get_total_cpu_weight(&self) -> Result<u64, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
 
         guard
             .get_total_cpu_weight()
@@ -1835,7 +1835,7 @@ impl Database {
     }
 
     pub fn get_total_net_weight(&self) -> Result<u64, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
 
         guard
             .get_total_net_weight()
@@ -1847,7 +1847,7 @@ impl Database {
         name: u64,
         greylist_limit: u32,
     ) -> Result<ffi::NetLimitResult, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
 
         guard
             .get_account_net_limit(name, greylist_limit)
@@ -1859,7 +1859,7 @@ impl Database {
         name: u64,
         greylist_limit: u32,
     ) -> Result<ffi::CpuLimitResult, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
 
         guard
             .get_account_cpu_limit(name, greylist_limit)
@@ -1868,7 +1868,7 @@ impl Database {
 
     pub fn process_account_limit_updates(&mut self) -> Result<(), ChainError> {
         {
-            let mut guard = self.inner.write()?;
+            let mut guard = self.locked_write()?;
             let pinned = guard.pin_mut();
             pinned
                 .process_account_limit_updates()
@@ -1905,7 +1905,7 @@ impl Database {
         cpu_limit_parameters: &ElasticLimitParameters,
         net_limit_parameters: &ElasticLimitParameters,
     ) -> Result<(), ChainError> {
-        let mut guard = self.inner.write()?;
+        let mut guard = self.locked_write()?;
         let pinned = guard.pin_mut();
 
         pinned
@@ -1915,7 +1915,7 @@ impl Database {
 
     pub fn process_block_usage(&mut self, block_num: u32) -> Result<(), ChainError> {
         {
-            let mut guard = self.inner.write()?;
+            let mut guard = self.locked_write()?;
             let pinned = guard.pin_mut();
             pinned
                 .process_block_usage(block_num)
@@ -1947,7 +1947,7 @@ impl Database {
         scope: u64,
         table: u64,
     ) -> Result<*const TableObject, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
         let res = guard
             .find_table(code, scope, table)
             .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
@@ -1961,7 +1961,7 @@ impl Database {
         scope: u64,
         table: u64,
     ) -> Result<*const TableObject, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
         let res = guard
             .find_table(code, scope, table)
             .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
@@ -1984,7 +1984,7 @@ impl Database {
         payer: u64,
     ) -> Result<*const TableObject, ChainError> {
         let res = {
-            let mut guard = self.inner.write()?;
+            let mut guard = self.locked_write()?;
             let pinned = guard.pin_mut();
             pinned
                 .create_table(code, scope, table, payer)
@@ -2008,7 +2008,7 @@ impl Database {
         id: u64,
         keyval_cache: &mut KeyValueIteratorCache,
     ) -> Result<i32, ChainError> {
-        let mut guard = self.inner.write()?;
+        let mut guard = self.locked_write()?;
         let pinned = guard.pin_mut();
 
         { pinned.db_find_i64(code, scope, table, id, keyval_cache.pin_mut()) }
@@ -2025,7 +2025,7 @@ impl Database {
         #[cfg(feature = "arena-shadow")]
         let key = table_key(table);
         let res = {
-            let mut guard = self.inner.write()?;
+            let mut guard = self.locked_write()?;
             let pinned = guard.pin_mut();
             pinned
                 .create_key_value_object(table, payer, id, buffer)
@@ -2051,7 +2051,7 @@ impl Database {
         #[cfg(feature = "arena-shadow")]
         let key = table_key(table);
         let res = {
-            let mut guard = self.inner.write()?;
+            let mut guard = self.locked_write()?;
             let pinned = guard.pin_mut();
             pinned
                 .create_index64_object(table, payer, id, secondary_key)
@@ -2077,7 +2077,7 @@ impl Database {
         // so the arena mirror can locate the row the FFI reaches by opaque handle.
         #[cfg(feature = "arena-shadow")]
         let key = {
-            let guard = self.inner.read()?;
+            let guard = self.locked_read()?;
             let t = guard.get_table_by_kv(obj);
             (
                 t.get_code().to_uint64_t(),
@@ -2087,7 +2087,7 @@ impl Database {
             )
         };
         {
-            let mut guard = self.inner.write()?;
+            let mut guard = self.locked_write()?;
             let pinned = guard.pin_mut();
             pinned
                 .update_key_value_object(obj, payer, buffer)
@@ -2108,7 +2108,7 @@ impl Database {
         payer: u64,
         secondary_key: u64,
     ) -> Result<(), ChainError> {
-        let mut guard = self.inner.write()?;
+        let mut guard = self.locked_write()?;
         let pinned = guard.pin_mut();
 
         pinned
@@ -2121,7 +2121,7 @@ impl Database {
         #[cfg(feature = "arena-shadow")]
         let key = table_key(table);
         {
-            let mut guard = self.inner.write()?;
+            let mut guard = self.locked_write()?;
             let pinned = guard.pin_mut();
             pinned
                 .remove_table(table)
@@ -2137,7 +2137,7 @@ impl Database {
     }
 
     pub fn is_account(&self, account: u64) -> Result<bool, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
 
         guard
             .is_account(account)
@@ -2145,7 +2145,7 @@ impl Database {
     }
 
     pub fn find_permission(&self, id: i64) -> Result<*const ffi::PermissionObject, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
         let res = guard
             .find_permission(id)
             .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
@@ -2158,7 +2158,7 @@ impl Database {
         actor: u64,
         permission: u64,
     ) -> Result<*const ffi::PermissionObject, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
         let res = guard
             .find_permission_by_actor_and_permission(actor, permission)
             .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
@@ -2172,7 +2172,7 @@ impl Database {
         code_name: u64,
         message_type: u64,
     ) -> Result<*const ffi::PermissionLinkObject, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
         guard
             .find_permission_link(account_name, code_name, message_type)
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
@@ -2183,7 +2183,7 @@ impl Database {
         actor: u64,
         permission: u64,
     ) -> Result<*const ffi::PermissionObject, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
         let res = guard
             .find_permission_by_actor_and_permission(actor, permission)
             .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
@@ -2201,7 +2201,7 @@ impl Database {
 
     pub fn delete_auth(&mut self, account: u64, permission_name: u64) -> Result<i64, ChainError> {
         let res = {
-            let mut guard = self.inner.write()?;
+            let mut guard = self.locked_write()?;
             let pinned = guard.pin_mut();
             pinned
                 .delete_auth(account, permission_name)
@@ -2225,7 +2225,7 @@ impl Database {
         requirement_type: u64,
     ) -> Result<i64, ChainError> {
         let res = {
-            let mut guard = self.inner.write()?;
+            let mut guard = self.locked_write()?;
             let pinned = guard.pin_mut();
             pinned
                 .link_auth(account_name, code_name, requirement_name, requirement_type)
@@ -2249,7 +2249,7 @@ impl Database {
         requirement_type: u64,
     ) -> Result<i64, ChainError> {
         let res = {
-            let mut guard = self.inner.write()?;
+            let mut guard = self.locked_write()?;
             let pinned = guard.pin_mut();
             pinned
                 .unlink_auth(account_name, code_name, requirement_type)
@@ -2270,7 +2270,7 @@ impl Database {
         vm_type: u8,
         vm_version: u8,
     ) -> Result<*const ffi::CodeObject, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
         let res = guard
             .get_code_object_by_hash(code_hash, vm_type, vm_version)
             .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
@@ -2280,7 +2280,7 @@ impl Database {
 
     pub fn next_recv_sequence(&mut self, account_name: u64) -> Result<u64, ChainError> {
         let res = {
-            let mut guard = self.inner.write()?;
+            let mut guard = self.locked_write()?;
             // Look up the metadata object under this same guard and confine the
             // reference to the C++ call, so no chainbase reference is handed in by
             // (or escapes to) the caller.
@@ -2309,7 +2309,7 @@ impl Database {
 
     pub fn next_auth_sequence(&mut self, actor: u64) -> Result<u64, ChainError> {
         let res = {
-            let mut guard = self.inner.write()?;
+            let mut guard = self.locked_write()?;
             let pinned = guard.pin_mut();
             pinned
                 .next_auth_sequence(actor)
@@ -2326,7 +2326,7 @@ impl Database {
 
     pub fn next_global_sequence(&mut self) -> Result<u64, ChainError> {
         let res = {
-            let mut guard = self.inner.write()?;
+            let mut guard = self.locked_write()?;
             let pinned = guard.pin_mut();
             pinned
                 .next_global_sequence()
@@ -2342,7 +2342,7 @@ impl Database {
     }
 
     pub fn get_global_action_sequence(&self) -> Result<u64, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
         guard
             .get_global_action_sequence()
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
@@ -2380,7 +2380,7 @@ impl Database {
             Some((code, scope, table, obj.get_primary_key()))
         });
         let res = {
-            let mut guard = self.inner.write()?;
+            let mut guard = self.locked_write()?;
             let pinned = guard.pin_mut();
             pinned
                 .db_remove_i64(keyval_cache.pin_mut(), iterator, receiver)
@@ -2409,7 +2409,7 @@ impl Database {
             Some((code, scope, table, obj.get_primary_key()))
         });
         {
-            let mut guard = self.inner.write()?;
+            let mut guard = self.locked_write()?;
             let pinned = guard.pin_mut();
             pinned
                 .db_idx64_remove(keyval_cache.pin_mut(), iterator, receiver)
@@ -2433,7 +2433,7 @@ impl Database {
         secondary_key: u64,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
-        let mut guard = self.inner.write()?;
+        let mut guard = self.locked_write()?;
         let pinned = guard.pin_mut();
 
         pinned
@@ -2457,7 +2457,7 @@ impl Database {
         secondary: &mut u64,
         primary_key: u64,
     ) -> Result<i32, ChainError> {
-        let mut guard = self.inner.write()?;
+        let mut guard = self.locked_write()?;
         let pinned = guard.pin_mut();
 
         pinned
@@ -2481,7 +2481,7 @@ impl Database {
         secondary_key: &mut u64,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
-        let mut guard = self.inner.write()?;
+        let mut guard = self.locked_write()?;
         let pinned = guard.pin_mut();
 
         pinned
@@ -2505,7 +2505,7 @@ impl Database {
         secondary_key: &mut u64,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
-        let mut guard = self.inner.write()?;
+        let mut guard = self.locked_write()?;
         let pinned = guard.pin_mut();
 
         pinned
@@ -2527,7 +2527,7 @@ impl Database {
         scope: u64,
         table: u64,
     ) -> Result<i32, ChainError> {
-        let mut guard = self.inner.write()?;
+        let mut guard = self.locked_write()?;
         let pinned = guard.pin_mut();
 
         pinned
@@ -2541,7 +2541,7 @@ impl Database {
         iterator: i32,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
-        let mut guard = self.inner.write()?;
+        let mut guard = self.locked_write()?;
         let pinned = guard.pin_mut();
 
         pinned
@@ -2555,7 +2555,7 @@ impl Database {
         iterator: i32,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
-        let mut guard = self.inner.write()?;
+        let mut guard = self.locked_write()?;
         let pinned = guard.pin_mut();
 
         pinned
@@ -2573,7 +2573,7 @@ impl Database {
         #[cfg(feature = "arena-shadow")]
         let key = table_key(table);
         let res = {
-            let mut guard = self.inner.write()?;
+            let mut guard = self.locked_write()?;
             let pinned = guard.pin_mut();
             pinned
                 .create_index128_object(table, payer, id, secondary_key.into())
@@ -2595,7 +2595,7 @@ impl Database {
         payer: u64,
         secondary_key: u128,
     ) -> Result<(), ChainError> {
-        let mut guard = self.inner.write()?;
+        let mut guard = self.locked_write()?;
         let pinned = guard.pin_mut();
 
         pinned
@@ -2617,7 +2617,7 @@ impl Database {
             Some((code, scope, table, obj.get_primary_key()))
         });
         {
-            let mut guard = self.inner.write()?;
+            let mut guard = self.locked_write()?;
             let pinned = guard.pin_mut();
             pinned
                 .db_idx128_remove(keyval_cache.pin_mut(), iterator, receiver)
@@ -2641,7 +2641,7 @@ impl Database {
         secondary_key: u128,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
-        let mut guard = self.inner.write()?;
+        let mut guard = self.locked_write()?;
         let pinned = guard.pin_mut();
         let secondary_key_u128: U128 = secondary_key.into();
 
@@ -2667,7 +2667,7 @@ impl Database {
         secondary: &mut u128,
         primary_key: u64,
     ) -> Result<i32, ChainError> {
-        let mut guard = self.inner.write()?;
+        let mut guard = self.locked_write()?;
         let pinned = guard.pin_mut();
         let mut secondary_u128: U128 = (*secondary).into();
         let res = pinned
@@ -2693,7 +2693,7 @@ impl Database {
         secondary_key: &mut u128,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
-        let mut guard = self.inner.write()?;
+        let mut guard = self.locked_write()?;
         let pinned = guard.pin_mut();
         let mut secondary_key_u128: U128 = (*secondary_key).into();
 
@@ -2720,7 +2720,7 @@ impl Database {
         secondary_key: &mut u128,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
-        let mut guard = self.inner.write()?;
+        let mut guard = self.locked_write()?;
         let pinned = guard.pin_mut();
         let mut secondary_key_u128: U128 = (*secondary_key).into();
         let res = pinned
@@ -2744,7 +2744,7 @@ impl Database {
         scope: u64,
         table: u64,
     ) -> Result<i32, ChainError> {
-        let mut guard = self.inner.write()?;
+        let mut guard = self.locked_write()?;
         let pinned = guard.pin_mut();
 
         pinned
@@ -2758,7 +2758,7 @@ impl Database {
         iterator: i32,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
-        let mut guard = self.inner.write()?;
+        let mut guard = self.locked_write()?;
         let pinned = guard.pin_mut();
 
         pinned
@@ -2772,7 +2772,7 @@ impl Database {
         iterator: i32,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
-        let mut guard = self.inner.write()?;
+        let mut guard = self.locked_write()?;
         let pinned = guard.pin_mut();
 
         pinned
@@ -2792,7 +2792,7 @@ impl Database {
         #[cfg(feature = "arena-shadow")]
         let sec_bytes = secondary_key.value;
         let res = {
-            let mut guard = self.inner.write()?;
+            let mut guard = self.locked_write()?;
             let pinned = guard.pin_mut();
             pinned
                 .create_index256_object(table, payer, id, secondary_key)
@@ -2814,7 +2814,7 @@ impl Database {
         payer: u64,
         secondary_key: U256,
     ) -> Result<(), ChainError> {
-        let mut guard = self.inner.write()?;
+        let mut guard = self.locked_write()?;
         let pinned = guard.pin_mut();
 
         pinned
@@ -2836,7 +2836,7 @@ impl Database {
             Some((code, scope, table, obj.get_primary_key()))
         });
         {
-            let mut guard = self.inner.write()?;
+            let mut guard = self.locked_write()?;
             let pinned = guard.pin_mut();
             pinned
                 .db_idx256_remove(keyval_cache.pin_mut(), iterator, receiver)
@@ -2860,7 +2860,7 @@ impl Database {
         secondary_key: U256,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
-        let mut guard = self.inner.write()?;
+        let mut guard = self.locked_write()?;
         let pinned = guard.pin_mut();
 
         let res = pinned
@@ -2885,7 +2885,7 @@ impl Database {
         secondary: &mut U256,
         primary_key: u64,
     ) -> Result<i32, ChainError> {
-        let mut guard = self.inner.write()?;
+        let mut guard = self.locked_write()?;
         let pinned = guard.pin_mut();
         let res = pinned
             .db_idx256_find_primary(
@@ -2909,7 +2909,7 @@ impl Database {
         secondary_key: &mut U256,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
-        let mut guard = self.inner.write()?;
+        let mut guard = self.locked_write()?;
         let pinned = guard.pin_mut();
 
         let res = pinned
@@ -2934,7 +2934,7 @@ impl Database {
         secondary_key: &mut U256,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
-        let mut guard = self.inner.write()?;
+        let mut guard = self.locked_write()?;
         let pinned = guard.pin_mut();
         let res = pinned
             .db_idx256_upperbound(
@@ -2956,7 +2956,7 @@ impl Database {
         scope: u64,
         table: u64,
     ) -> Result<i32, ChainError> {
-        let mut guard = self.inner.write()?;
+        let mut guard = self.locked_write()?;
         let pinned = guard.pin_mut();
 
         pinned
@@ -2970,7 +2970,7 @@ impl Database {
         iterator: i32,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
-        let mut guard = self.inner.write()?;
+        let mut guard = self.locked_write()?;
         let pinned = guard.pin_mut();
 
         pinned
@@ -2984,7 +2984,7 @@ impl Database {
         iterator: i32,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
-        let mut guard = self.inner.write()?;
+        let mut guard = self.locked_write()?;
         let pinned = guard.pin_mut();
 
         pinned
@@ -3002,7 +3002,7 @@ impl Database {
         #[cfg(feature = "arena-shadow")]
         let key = table_key(table);
         let res = {
-            let mut guard = self.inner.write()?;
+            let mut guard = self.locked_write()?;
             let pinned = guard.pin_mut();
             pinned
                 .create_idx_double_object(table, payer, id, secondary_key)
@@ -3025,7 +3025,7 @@ impl Database {
         payer: u64,
         secondary_key: u64,
     ) -> Result<(), ChainError> {
-        let mut guard = self.inner.write()?;
+        let mut guard = self.locked_write()?;
         let pinned = guard.pin_mut();
 
         pinned
@@ -3047,7 +3047,7 @@ impl Database {
             Some((code, scope, table, obj.get_primary_key()))
         });
         {
-            let mut guard = self.inner.write()?;
+            let mut guard = self.locked_write()?;
             let pinned = guard.pin_mut();
             pinned
                 .db_idx_double_remove(keyval_cache.pin_mut(), iterator, receiver)
@@ -3071,7 +3071,7 @@ impl Database {
         secondary_key: u64,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
-        let mut guard = self.inner.write()?;
+        let mut guard = self.locked_write()?;
         let pinned = guard.pin_mut();
 
         let res = pinned
@@ -3096,7 +3096,7 @@ impl Database {
         secondary: &mut u64,
         primary_key: u64,
     ) -> Result<i32, ChainError> {
-        let mut guard = self.inner.write()?;
+        let mut guard = self.locked_write()?;
         let pinned = guard.pin_mut();
         let res = pinned
             .db_idx_double_find_primary(
@@ -3120,7 +3120,7 @@ impl Database {
         secondary_key: &mut u64,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
-        let mut guard = self.inner.write()?;
+        let mut guard = self.locked_write()?;
         let pinned = guard.pin_mut();
 
         let res = pinned
@@ -3145,7 +3145,7 @@ impl Database {
         secondary_key: &mut u64,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
-        let mut guard = self.inner.write()?;
+        let mut guard = self.locked_write()?;
         let pinned = guard.pin_mut();
         let res = pinned
             .db_idx_double_upperbound(
@@ -3167,7 +3167,7 @@ impl Database {
         scope: u64,
         table: u64,
     ) -> Result<i32, ChainError> {
-        let mut guard = self.inner.write()?;
+        let mut guard = self.locked_write()?;
         let pinned = guard.pin_mut();
 
         pinned
@@ -3181,7 +3181,7 @@ impl Database {
         iterator: i32,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
-        let mut guard = self.inner.write()?;
+        let mut guard = self.locked_write()?;
         let pinned = guard.pin_mut();
 
         pinned
@@ -3195,7 +3195,7 @@ impl Database {
         iterator: i32,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
-        let mut guard = self.inner.write()?;
+        let mut guard = self.locked_write()?;
         let pinned = guard.pin_mut();
 
         pinned
@@ -3215,7 +3215,7 @@ impl Database {
         #[cfg(feature = "arena-shadow")]
         let (sec_lo, sec_hi) = (secondary_key.lo, secondary_key.hi);
         let res = {
-            let mut guard = self.inner.write()?;
+            let mut guard = self.locked_write()?;
             let pinned = guard.pin_mut();
             pinned
                 .create_idx_long_double_object(table, payer, id, secondary_key)
@@ -3238,7 +3238,7 @@ impl Database {
         payer: u64,
         secondary_key: Float128,
     ) -> Result<(), ChainError> {
-        let mut guard = self.inner.write()?;
+        let mut guard = self.locked_write()?;
         let pinned = guard.pin_mut();
 
         pinned
@@ -3260,7 +3260,7 @@ impl Database {
             Some((code, scope, table, obj.get_primary_key()))
         });
         {
-            let mut guard = self.inner.write()?;
+            let mut guard = self.locked_write()?;
             let pinned = guard.pin_mut();
             pinned
                 .db_idx_long_double_remove(keyval_cache.pin_mut(), iterator, receiver)
@@ -3284,7 +3284,7 @@ impl Database {
         secondary_key: Float128,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
-        let mut guard = self.inner.write()?;
+        let mut guard = self.locked_write()?;
         let pinned = guard.pin_mut();
 
         let res = pinned
@@ -3309,7 +3309,7 @@ impl Database {
         secondary: &mut Float128,
         primary_key: u64,
     ) -> Result<i32, ChainError> {
-        let mut guard = self.inner.write()?;
+        let mut guard = self.locked_write()?;
         let pinned = guard.pin_mut();
         let res = pinned
             .db_idx_long_double_find_primary(
@@ -3333,7 +3333,7 @@ impl Database {
         secondary_key: &mut Float128,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
-        let mut guard = self.inner.write()?;
+        let mut guard = self.locked_write()?;
         let pinned = guard.pin_mut();
 
         let res = pinned
@@ -3358,7 +3358,7 @@ impl Database {
         secondary_key: &mut Float128,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
-        let mut guard = self.inner.write()?;
+        let mut guard = self.locked_write()?;
         let pinned = guard.pin_mut();
         let res = pinned
             .db_idx_long_double_upperbound(
@@ -3380,7 +3380,7 @@ impl Database {
         scope: u64,
         table: u64,
     ) -> Result<i32, ChainError> {
-        let mut guard = self.inner.write()?;
+        let mut guard = self.locked_write()?;
         let pinned = guard.pin_mut();
 
         pinned
@@ -3394,7 +3394,7 @@ impl Database {
         iterator: i32,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
-        let mut guard = self.inner.write()?;
+        let mut guard = self.locked_write()?;
         let pinned = guard.pin_mut();
 
         pinned
@@ -3408,7 +3408,7 @@ impl Database {
         iterator: i32,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
-        let mut guard = self.inner.write()?;
+        let mut guard = self.locked_write()?;
         let pinned = guard.pin_mut();
 
         pinned
@@ -3422,7 +3422,7 @@ impl Database {
         iterator: i32,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
-        let mut guard = self.inner.write()?;
+        let mut guard = self.locked_write()?;
         let pinned = guard.pin_mut();
 
         pinned
@@ -3436,7 +3436,7 @@ impl Database {
         iterator: i32,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
-        let mut guard = self.inner.write()?;
+        let mut guard = self.locked_write()?;
         let pinned = guard.pin_mut();
 
         pinned
@@ -3451,7 +3451,7 @@ impl Database {
         scope: u64,
         table: u64,
     ) -> Result<i32, ChainError> {
-        let mut guard = self.inner.write()?;
+        let mut guard = self.locked_write()?;
         let pinned = guard.pin_mut();
 
         pinned
@@ -3467,7 +3467,7 @@ impl Database {
         table: u64,
         id: u64,
     ) -> Result<i32, ChainError> {
-        let mut guard = self.inner.write()?;
+        let mut guard = self.locked_write()?;
         let pinned = guard.pin_mut();
 
         pinned
@@ -3483,7 +3483,7 @@ impl Database {
         table: u64,
         id: u64,
     ) -> Result<i32, ChainError> {
-        let mut guard = self.inner.write()?;
+        let mut guard = self.locked_write()?;
         let pinned = guard.pin_mut();
 
         pinned
@@ -3502,7 +3502,7 @@ impl Database {
             permission.get_name().to_uint64_t(),
         );
         {
-            let mut guard = self.inner.write()?;
+            let mut guard = self.locked_write()?;
             let pinned = guard.pin_mut();
             pinned
                 .remove_permission(permission)
@@ -3526,7 +3526,7 @@ impl Database {
         creation_time: &TimePoint,
     ) -> Result<*const ffi::PermissionObject, ChainError> {
         let res = {
-            let mut guard = self.inner.write()?;
+            let mut guard = self.locked_write()?;
             let pinned = guard.pin_mut();
             pinned
                 .create_permission(account, name, parent, auth, creation_time)
@@ -3554,7 +3554,7 @@ impl Database {
         permission: &ffi::PermissionObject,
         other_permission: &ffi::PermissionObject,
     ) -> Result<bool, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
         let res = guard
             .permission_satisfies_other_permission(permission, other_permission)
             .map_err(|e| ChainError::TransactionError(format!("{}", e)))?;
@@ -3585,7 +3585,7 @@ impl Database {
         actor: u64,
         permission: u64,
     ) -> Result<Option<Authority>, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
         let perm = guard
             .find_permission_by_actor_and_permission(actor, permission)
             .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
@@ -3604,7 +3604,7 @@ impl Database {
         pending_block_time: &TimePoint,
     ) -> Result<(), ChainError> {
         {
-            let mut guard = self.inner.write()?;
+            let mut guard = self.locked_write()?;
             // Lookup and mutation both happen inside C++, so no database-owned
             // PermissionObject reference is held across the write.
             let modified = Self::db_mut(&mut guard)?
@@ -3644,7 +3644,7 @@ impl Database {
         pending_block_time: &TimePoint,
     ) -> Result<(), ChainError> {
         {
-            let mut guard = self.inner.write()?;
+            let mut guard = self.locked_write()?;
             // Resolve and modify under one write guard; the resolved pointer never
             // escapes this method, so no shared reference is held across the mutation.
             let perm = guard
@@ -3678,7 +3678,7 @@ impl Database {
         &self,
         permission: &ffi::PermissionObject,
     ) -> Result<TimePoint, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
         let res = guard
             .get_permission_last_used(permission)
             .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
@@ -3692,7 +3692,7 @@ impl Database {
         code: u64,
         requirement_type: u64,
     ) -> Result<Option<u64>, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
         let res = guard
             .lookup_linked_permission(account, code, requirement_type)
             .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
@@ -3705,7 +3705,7 @@ impl Database {
     }
 
     pub fn get_global_properties(&self) -> Result<*const ffi::GlobalPropertyObject, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
         let res = guard
             .get_global_properties()
             .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
@@ -3714,7 +3714,7 @@ impl Database {
     }
 
     pub fn set_global_properties(&self, cfg: &ChainConfigV0) -> Result<(), ChainError> {
-        let mut guard = self.inner.write()?;
+        let mut guard = self.locked_write()?;
         let pinned = guard.pin_mut();
 
         pinned
@@ -3725,28 +3725,28 @@ impl Database {
     }
 
     pub fn get_virtual_block_cpu_limit(&self) -> Result<u64, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
         guard
             .get_virtual_block_cpu_limit()
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 
     pub fn get_virtual_block_net_limit(&self) -> Result<u64, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
         guard
             .get_virtual_block_net_limit()
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 
     pub fn get_block_cpu_limit(&self) -> Result<u64, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
         guard
             .get_block_cpu_limit()
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 
     pub fn get_block_net_limit(&self) -> Result<u64, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
         guard
             .get_block_net_limit()
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
@@ -3756,7 +3756,7 @@ impl Database {
         &self,
         trx_id: &ffi::CxxDigest,
     ) -> Result<bool, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
 
         guard
             .is_known_unexpired_transaction(trx_id)
@@ -3769,7 +3769,7 @@ impl Database {
         expiration: u32,
     ) -> Result<(), ChainError> {
         {
-            let mut guard = self.inner.write()?;
+            let mut guard = self.locked_write()?;
             let pinned = guard.pin_mut();
             pinned
                 .record_transaction(trx_id, expiration)
@@ -3808,7 +3808,7 @@ impl Database {
         cutoff: &TimePoint,
     ) -> Result<(), ChainError> {
         {
-            let mut guard = self.inner.write()?;
+            let mut guard = self.locked_write()?;
             let pinned = guard.pin_mut();
             pinned
                 .clear_expired_input_transactions(cutoff)
@@ -3829,7 +3829,7 @@ impl Database {
         account: u64,
         symbol: &str,
     ) -> Result<String, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
 
         get_currency_balance_with_symbol(guard.as_ref().unwrap(), code, account, symbol)
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
@@ -3840,14 +3840,14 @@ impl Database {
         code: u64,
         account: u64,
     ) -> Result<String, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
 
         get_currency_balance_without_symbol(guard.as_ref().unwrap(), code, account)
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 
     pub fn get_currency_stats(&self, code: u64, symbol: &str) -> Result<String, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
 
         get_currency_stats(guard.as_ref().unwrap(), code, symbol)
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
@@ -3862,7 +3862,7 @@ impl Database {
         limit: u32,
         reverse: bool,
     ) -> Result<String, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
 
         get_table_by_scope(
             guard.as_ref().unwrap(),
@@ -3892,7 +3892,7 @@ impl Database {
         reverse: bool,
         show_payer: bool,
     ) -> Result<String, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
 
         get_table_rows(
             guard.as_ref().unwrap(),
@@ -3919,7 +3919,7 @@ impl Database {
         head_block_num: u32,
         head_block_time: &TimePoint,
     ) -> Result<String, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
 
         get_account_info_without_core_symbol(
             guard.as_ref().unwrap(),
@@ -3937,7 +3937,7 @@ impl Database {
         head_block_num: u32,
         head_block_time: &TimePoint,
     ) -> Result<String, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
 
         get_account_info_with_core_symbol(
             guard.as_ref().unwrap(),
@@ -3950,7 +3950,7 @@ impl Database {
     }
 
     pub fn pack_deltas(&self, full_snapshot: bool) -> Result<Vec<u8>, ChainError> {
-        let guard = self.inner.read()?;
+        let guard = self.locked_read()?;
 
         guard
             .pack_deltas(full_snapshot)
@@ -3973,6 +3973,85 @@ mod tests {
         let mut db = Database::new(path, 1 * 1024 * 1024 * 1024).unwrap();
         let name = string_to_name("test").unwrap();
         db.add_indices();
+    }
+
+    // The hazard the guard API introduced, and the reason `check_reentry`
+    // exists. Binding chainbase references to a guard stops them dangling; it
+    // also means holding one across a call that locks again is a deadlock, not
+    // a compile error. `Database` is an `Arc` handle and `read(&self)` borrows
+    // immutably, so nothing in the type system objects — and the re-entry
+    // usually arrives through a call that never names the database.
+    //
+    // Without the check, each of these blocks forever. `onblock_consumes_min_
+    // transaction_cpu_usage` did exactly this and took CI to its six-hour limit
+    // on both architectures, twice, reporting nothing.
+    #[test]
+    fn a_write_while_holding_a_read_view_is_refused_rather_than_deadlocking() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().to_str().unwrap();
+        let mut db = Database::new(path, 1 * 1024 * 1024 * 1024).unwrap();
+        db.add_indices().unwrap();
+
+        // Through a *clone*, which is how this happens in practice and why the
+        // borrow checker does not catch it. `Database` is an `Arc` handle: the
+        // two values are distinct owners of one lock, so `&self` on one and
+        // `&mut self` on the other never conflict. In the real failure the
+        // clone was several frames away, inside `Controller`.
+        let mut other = db.clone();
+        let view = db.read().unwrap();
+        let err = match other.create_undo_session(true) {
+            Err(e) => e,
+            Ok(_) => panic!("a mutator under a held read view must be refused"),
+        };
+        assert!(
+            format!("{err:?}").contains("re-entered"),
+            "expected a re-entry refusal, got {err:?}"
+        );
+        drop(view);
+
+        // And the same call succeeds once the view is gone, so the check is
+        // refusing the pattern rather than the call.
+        assert!(other.create_undo_session(true).is_ok());
+    }
+
+    #[test]
+    fn a_second_view_while_holding_a_write_view_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().to_str().unwrap();
+        let mut db = Database::new(path, 1 * 1024 * 1024 * 1024).unwrap();
+        db.add_indices().unwrap();
+
+        let other = db.clone();
+        let view = db.write().unwrap();
+        assert!(
+            other.read().is_err(),
+            "a read under a held write view must be refused"
+        );
+        assert!(
+            other.write().is_err(),
+            "a second write view must be refused"
+        );
+        drop(view);
+
+        assert!(other.read().is_ok());
+    }
+
+    // Guards must stop counting when they drop, or the first one poisons every
+    // later acquisition on the thread and the check becomes the outage.
+    #[test]
+    fn the_count_is_released_with_the_view() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().to_str().unwrap();
+        let mut db = Database::new(path, 1 * 1024 * 1024 * 1024).unwrap();
+        db.add_indices().unwrap();
+
+        for _ in 0..3 {
+            let view = db.read().unwrap();
+            drop(view);
+            let view = db.write().unwrap();
+            drop(view);
+        }
+        assert!(db.create_undo_session(true).is_ok());
     }
 
     #[test]
@@ -4127,13 +4206,103 @@ mod tests {
     }
 }
 
+thread_local! {
+    /// Database guards this thread is currently holding, as `(reads, writes)`.
+    ///
+    /// Binding chainbase references to a guard removed one hazard and created
+    /// another. A raw `*const CodeObject` could dangle, which the guard fixes;
+    /// but a guard is a *held lock*, and `std::sync::RwLock` is not reentrant,
+    /// so code that keeps one alive across a call that locks again does not
+    /// fail — it stops, forever. The compiler cannot see it: `Database` is an
+    /// `Arc` handle, `read(&self)` borrows immutably, and the re-entry usually
+    /// arrives through something that never mentions the database at all
+    /// (`controller.run_onblock(..)`), holding its own clone of the handle.
+    ///
+    /// So the invariant is enforced here instead. Every acquisition checks what
+    /// this thread already holds and returns an error naming the problem rather
+    /// than blocking on a lock only this thread can release.
+    static HELD: std::cell::Cell<(u32, u32)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Counts one held guard for the thread, and uncounts it on drop.
+struct LockScope {
+    write: bool,
+}
+
+impl LockScope {
+    fn enter(write: bool) -> Self {
+        HELD.with(|held| {
+            let (r, w) = held.get();
+            held.set(if write { (r, w + 1) } else { (r + 1, w) });
+        });
+        LockScope { write }
+    }
+}
+
+impl Drop for LockScope {
+    fn drop(&mut self) {
+        HELD.with(|held| {
+            let (r, w) = held.get();
+            held.set(if self.write {
+                (r, w.saturating_sub(1))
+            } else {
+                (r.saturating_sub(1), w)
+            });
+        });
+    }
+}
+
+/// The two acquisitions that can only ever deadlock, refused up front.
+///
+/// Read-while-read is left alone: it is what the current code does on a single
+/// thread and it completes. It is not *safe* — a writer queued between the two
+/// reads blocks both, because this `RwLock` is fair — but rejecting it would
+/// reject working paths, so it is a known hazard rather than an error here.
+fn check_reentry(want_write: bool) -> Result<(), ChainError> {
+    let (reads, writes) = HELD.with(|held| held.get());
+    if writes > 0 || (want_write && reads > 0) {
+        return Err(ChainError::InternalError(format!(
+            "database lock re-entered on this thread: asking for a {} while holding {} read \
+             guard(s) and {} write guard(s). std::sync::RwLock is not reentrant, so this would \
+             deadlock rather than fail. Narrow the scope of the outer guard — take what you need \
+             out of it in a block, drop it, and only then call back into the database.",
+            if want_write { "write" } else { "read" },
+            reads,
+            writes,
+        )));
+    }
+    Ok(())
+}
+
 impl Database {
+    /// The write lock, refusing re-entry instead of hanging on it.
+    ///
+    /// Every `&mut self` method on `Database` goes through here, so a caller
+    /// holding a view and calling any mutator gets an error naming the call.
+    fn locked_write(
+        &self,
+    ) -> Result<std::sync::RwLockWriteGuard<'_, UniquePtr<ffi::Database>>, ChainError> {
+        check_reentry(true)?;
+        Ok(self.inner.write()?)
+    }
+
+    /// The read lock, refusing only the acquisition that cannot succeed: a read
+    /// taken while this thread holds the exclusive lock.
+    fn locked_read(
+        &self,
+    ) -> Result<std::sync::RwLockReadGuard<'_, UniquePtr<ffi::Database>>, ChainError> {
+        check_reentry(false)?;
+        Ok(self.inner.read()?)
+    }
+
     /// Acquire a read view. The lock is held for the lifetime of the returned
     /// `DbRead`, and every reference it hands out is bound to `&self`, so a
     /// chainbase reference can never outlive the lock or escape the view.
     pub fn read(&self) -> Result<DbRead<'_>, ChainError> {
+        let guard = self.locked_read()?;
         Ok(DbRead {
-            guard: self.inner.read()?,
+            guard,
+            _scope: LockScope::enter(false),
             #[cfg(feature = "arena-shadow")]
             shadow: self.shadow.clone(),
         })
@@ -4143,8 +4312,10 @@ impl Database {
     /// all under a single write lock, so reads and the mutations that depend on
     /// them share one guard instead of re-locking.
     pub fn write(&self) -> Result<DbWrite<'_>, ChainError> {
+        let guard = self.locked_write()?;
         Ok(DbWrite {
-            guard: self.inner.write()?,
+            guard,
+            _scope: LockScope::enter(true),
         })
     }
 }
@@ -4154,6 +4325,10 @@ impl Database {
 /// cannot outlive the held lock.
 pub struct DbRead<'g> {
     guard: std::sync::RwLockReadGuard<'g, UniquePtr<ffi::Database>>,
+    /// Counts this guard against the thread while it lives. Declared after
+    /// `guard` only for readability; drop order does not matter, since the
+    /// count and the lock are released in the same scope either way.
+    _scope: LockScope,
     // The arena mirror, so reads served here can be cross-checked against it
     // during execution. A cheap Arc clone; `None` when shadowing is off.
     #[cfg(feature = "arena-shadow")]
@@ -4347,6 +4522,7 @@ impl<'g> DbRead<'g> {
 /// same reads as [`DbRead`] (via [`DbWrite::reads`]) plus mutating operations.
 pub struct DbWrite<'g> {
     guard: std::sync::RwLockWriteGuard<'g, UniquePtr<ffi::Database>>,
+    _scope: LockScope,
 }
 
 impl<'g> DbWrite<'g> {
