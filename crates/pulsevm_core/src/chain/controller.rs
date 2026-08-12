@@ -1179,6 +1179,7 @@ impl Controller {
 
         let trx_id = *packed.id();
         let mut session = self.db.create_undo_session(true)?;
+        self.db.arena_start_undo_session(); // mirror the onblock session
         let mut trx_context = TransactionContext::new(
             self.db.clone(),
             self.wasm_runtime.clone(),
@@ -1202,6 +1203,7 @@ impl Controller {
                 session.pin_mut().squash().map_err(|e| {
                     ChainError::DatabaseError(format!("failed to commit onblock: {}", e))
                 })?;
+                self.db.arena_squash(); // fold onblock into the block on both
                 Ok((result.action_receipt_digests, result.proposed_schedule))
             }
             Err(e) => {
@@ -1209,6 +1211,7 @@ impl Controller {
                 session.pin_mut().undo().map_err(|e| {
                     ChainError::DatabaseError(format!("failed to undo onblock: {}", e))
                 })?;
+                self.db.arena_undo(); // a failed onblock leaves no trace on either
                 Ok((VecDeque::new(), None))
             }
         }
