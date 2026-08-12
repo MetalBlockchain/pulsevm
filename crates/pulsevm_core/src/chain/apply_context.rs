@@ -195,18 +195,11 @@ impl ApplyContext {
     }
 
     pub fn exec_one(&mut self) -> Result<u64, ChainError> {
+        let privileged = self.db.is_account_privileged(self.receiver.as_u64())?;
         let mut cpu_used = 100; // Base usage is always 100 instructions
-
-        // Read the receiver's privileged flag under a short-lived guard rather than
-        // holding a chainbase reference across the handlers below.
-        let is_privileged = {
-            let r = self.db.read()?;
-            r.get_account_metadata(self.receiver.as_u64())?
-                .is_privileged()
-        };
         let action = {
             let mut inner = self.inner.write()?;
-            inner.privileged = is_privileged;
+            inner.privileged = privileged;
             inner.action.clone()
         };
 
@@ -252,22 +245,17 @@ impl ApplyContext {
             let inner = self.inner.read()?;
             generate_action_digest(&action, inner.action_return_value.clone())
         };
-        let (code_sequence, abi_sequence) = {
-            let r = self.db.read()?;
-            let meta = r.get_account_metadata(action.account().as_u64())?;
-            (
-                meta.get_code_sequence() as u32,
-                meta.get_abi_sequence() as u32,
-            )
-        };
+        let (code_sequence, abi_sequence) = self
+            .db
+            .account_metadata_code_abi_sequence(action.account().as_u64())?;
         let mut receipt = ActionReceipt::new(
             self.receiver.clone(),
             act_digest,
             self.next_global_sequence()?,
             self.next_recv_sequence(self.receiver.as_u64())?,
             BTreeMap::new(),
-            code_sequence,
-            abi_sequence,
+            code_sequence as u32,
+            abi_sequence as u32,
         );
 
         for auth in action.clone().authorization().iter() {
