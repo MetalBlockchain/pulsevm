@@ -4326,6 +4326,14 @@ mod tests {
         assert_eq!(s.idx128_previous(code, scope, table, 2), Some(9));
         assert_eq!(s.idx128_previous(code, scope, table, 9), None);
         assert_eq!(s.idx128_last(code, scope, table), Some(7));
+
+        // update re-points a row's secondary (the u128 lo/hi split): move
+        // primary 9 from 100 to 250. The old key is gone, the new one resolves.
+        s.update_index128_object(code, scope, table, 9, payer, 250)
+            .unwrap();
+        assert_eq!(s.idx128_find_primary(code, scope, table, 9), Some(250));
+        assert_eq!(s.idx128_find_secondary(code, scope, table, 100), None);
+        assert_eq!(s.idx128_find_secondary(code, scope, table, 250), Some(9));
     }
 
     /// idx256 reads order by the 32-byte key's two little-endian words then
@@ -4371,6 +4379,17 @@ mod tests {
         assert_eq!(s.idx256_previous(code, scope, table, 2), Some(9));
         assert_eq!(s.idx256_previous(code, scope, table, 9), None);
         assert_eq!(s.idx256_last(code, scope, table), Some(7));
+
+        // update re-points a row's 32-byte key: move primary 9 from key(10) to
+        // key(25). The old key is gone, the new one resolves.
+        s.update_index256_object(code, scope, table, 9, payer, key(25))
+            .unwrap();
+        assert_eq!(s.idx256_find_primary(code, scope, table, 9), Some(key(25)));
+        assert_eq!(s.idx256_find_secondary(code, scope, table, key(10)), None);
+        assert_eq!(
+            s.idx256_find_secondary(code, scope, table, key(25)),
+            Some(9)
+        );
     }
 
     /// idx_double reads follow the software-float order (negatives before
@@ -4413,6 +4432,17 @@ mod tests {
         assert_eq!(s.idx_double_previous(code, scope, table, 9), Some(3));
         assert_eq!(s.idx_double_previous(code, scope, table, 3), None);
         assert_eq!(s.idx_double_last(code, scope, table), Some(7));
+
+        // update re-points a row's float key (bits -> from_bits): move primary 3
+        // from -1.0 to 5.0. The old key is gone, the new one resolves.
+        s.update_idx_double_object(code, scope, table, 3, payer, 5.0f64.to_bits())
+            .unwrap();
+        assert_eq!(s.idx_double_find_primary(code, scope, table, 3), Some(5.0));
+        assert_eq!(s.idx_double_find_secondary(code, scope, table, -1.0), None);
+        assert_eq!(
+            s.idx_double_find_secondary(code, scope, table, 5.0),
+            Some(3)
+        );
     }
 
     /// idx_long_double reads order by the 128-bit key then primary.
@@ -4463,5 +4493,22 @@ mod tests {
         assert_eq!(s.idx_long_double_previous(code, scope, table, 2), Some(9));
         assert_eq!(s.idx_long_double_previous(code, scope, table, 9), None);
         assert_eq!(s.idx_long_double_last(code, scope, table), Some(7));
+
+        // update re-points a row's (lo, hi) key: move primary 9 from (0,1) to
+        // (0,5). The old key is gone, the new one resolves.
+        s.update_idx_long_double_object(code, scope, table, 9, payer, (0, 5))
+            .unwrap();
+        assert_eq!(
+            s.idx_long_double_find_primary(code, scope, table, 9),
+            Some((0, 5))
+        );
+        assert_eq!(
+            s.idx_long_double_find_secondary(code, scope, table, (0, 1)),
+            None
+        );
+        assert_eq!(
+            s.idx_long_double_find_secondary(code, scope, table, (0, 5)),
+            Some(9)
+        );
     }
 }

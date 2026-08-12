@@ -6615,6 +6615,7 @@ mod tests {
   (import "env" "db_idx128_find_primary" (func $fp128 (param i64 i64 i64 i32 i64) (result i32)))
   (import "env" "db_idx128_next" (func $n128 (param i32 i32) (result i32)))
   (import "env" "db_idx128_previous" (func $p128 (param i32 i32) (result i32)))
+  (import "env" "db_idx128_update" (func $u128 (param i32 i64 i32)))
   (import "env" "db_idx_double_store" (func $sd (param i64 i64 i64 i64 i32) (result i32)))
   (import "env" "db_idx_double_end" (func $ed (param i64 i64 i64) (result i32)))
   (import "env" "db_idx_double_lowerbound" (func $lbd (param i64 i64 i64 i32 i32) (result i32)))
@@ -6656,6 +6657,18 @@ mod tests {
     (local.set $it (call $p128 (local.get $it) (i32.const 16)))
     (local.set $it (call $p128 (local.get $it) (i32.const 16)))
     (local.set $it (call $p128 (local.get $it) (i32.const 16)))
+
+    ;; update: re-point primary 10 from secondary 100 to 500, then the served
+    ;; finds must reflect the new key and lose the old (proves the update mirror
+    ;; reaches the arena — a stale arena would diverge here under reads).
+    (i64.store (i32.const 0) (i64.const 100))
+    (local.set $it (call $fs128 (local.get $receiver) (local.get $scope) (i64.const 300) (i32.const 0) (i32.const 16)))
+    (i64.store (i32.const 0) (i64.const 500))
+    (call $u128 (local.get $it) (local.get $receiver) (i32.const 0))
+    (i64.store (i32.const 0) (i64.const 500))
+    (drop (call $fs128 (local.get $receiver) (local.get $scope) (i64.const 300) (i32.const 0) (i32.const 16)))
+    (i64.store (i32.const 0) (i64.const 100))
+    (drop (call $fs128 (local.get $receiver) (local.get $scope) (i64.const 300) (i32.const 0) (i32.const 16)))
 
     ;; ---- idx_double (table 301), f64 bits at [24..32] ----
     (i64.store (i32.const 24) (i64.reinterpret_f64 (f64.const 1)))
