@@ -46,6 +46,7 @@ use pulsevm_core::{
     },
     id::Id,
     name::Name,
+    producer_schedule::ProducerKey,
     pulse_contract::{
         NewAccount,
         SetAbi,
@@ -213,6 +214,36 @@ fn new_account(creator: Name, account: Name, key: &PublicKey) -> Result<Action> 
         .try_into()
         .map_err(|e| anyhow::anyhow!("packing newaccount: {e}"))?,
     })
+}
+
+/// A minimal privileged contract that forwards the `setprods` action's data (a
+/// packed vector<producer_key>) to the set_proposed_producers host function. It
+/// guards on the action name, so onblock and native actions dispatched to the
+/// account it lives on are ignored — making it safe to deploy onto `pulse`, which
+/// is privileged at genesis (set_proposed_producers requires privilege). Built
+/// from WAT at runtime so no CDT toolchain is needed for the fixture.
+fn setprods_contract_wasm() -> Result<Vec<u8>> {
+    let setprods = Name::from_str("setprods")
+        .map_err(|e| anyhow::anyhow!("encoding setprods name: {e}"))?
+        .as_u64() as i64;
+    let wat = format!(
+        r#"
+        (module
+          (import "env" "action_data_size" (func $ads (result i32)))
+          (import "env" "read_action_data" (func $read (param i32 i32) (result i32)))
+          (import "env" "set_proposed_producers" (func $spp (param i32 i32) (result i64)))
+          (memory 1)
+          (export "memory" (memory 0))
+          (func (export "apply") (param $receiver i64) (param $code i64) (param $action i64)
+            (local $len i32)
+            (if (i64.eq (local.get $action) (i64.const {setprods}))
+              (then
+                (local.set $len (call $ads))
+                (drop (call $read (i32.const 0) (local.get $len)))
+                (drop (call $spp (i32.const 0) (local.get $len)))))))
+        "#
+    );
+    wat::parse_str(&wat).map_err(|e| anyhow::anyhow!("compiling setprods contract: {e}"))
 }
 
 /// Builds an action on a deployed contract, packing `data` to binary here so no
@@ -428,6 +459,78 @@ async fn main() -> Result<()> {
     .await
     .context("transferring tokens")?;
     steps.push(serde_json::json!({ "step": "transfer", "from": alice.to_string(), "to": bob.to_string(), "quantity": sent.to_string(), "tx": tx }));
+
+    // Producer election, end to end. Create a second producer account, deploy the
+    // setprods forwarder onto `pulse`, then propose a schedule that adds the new
+    // producer. The proposal keeps `pulse` (with the node's genesis key) so the
+    // single node can keep producing while the change activates on the next
+    // accepted block; getProducers then reflects the new set.
+    let producerb: Name = name!("producerb").into();
+    let tx = push(
+        &client,
+        &chain_id,
+        &key,
+        vec![new_account(system, producerb, &public_key)?],
+    )
+    .await
+    .context("creating producerb")?;
+    steps.push(
+        serde_json::json!({ "step": "newaccount", "account": producerb.to_string(), "tx": tx }),
+    );
+
+    let tx = push(
+        &client,
+        &chain_id,
+        &key,
+        vec![Action {
+            account: PULSE_NAME,
+            name: SETCODE_NAME,
+            authorization: vec![PermissionLevel {
+                actor: system.into(),
+                permission: ACTIVE_NAME.into(),
+            }],
+            data: SetCode {
+                account: system.into(),
+                vm_type: 0,
+                vm_version: 0,
+                code: Arc::new(Bytes::new(setprods_contract_wasm()?)),
+            }
+            .try_into()
+            .map_err(|e| anyhow::anyhow!("packing setcode: {e}"))?,
+        }],
+    )
+    .await
+    .context("deploying setprods contract to pulse")?;
+    steps.push(serde_json::json!({ "step": "setcode", "account": system.to_string(), "tx": tx }));
+
+    let proposed = vec![
+        ProducerKey {
+            producer_name: system,
+            block_signing_key: public_key.clone(),
+        },
+        ProducerKey {
+            producer_name: producerb,
+            block_signing_key: public_key.clone(),
+        },
+    ];
+    let tx = push(
+        &client,
+        &chain_id,
+        &key,
+        vec![contract_action(
+            system,
+            name!("setprods").into(),
+            system,
+            proposed.clone(),
+        )?],
+    )
+    .await
+    .context("submitting setprods")?;
+    steps.push(serde_json::json!({
+        "step": "setprods",
+        "tx": tx,
+        "proposed": proposed.iter().map(|p| p.producer_name.to_string()).collect::<Vec<_>>(),
+    }));
 
     println!(
         "{}",

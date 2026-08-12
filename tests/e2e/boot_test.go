@@ -20,12 +20,13 @@ const bootBinary = "pulsevm-e2e-boot"
 
 // bootStep is one entry of the helper's JSON report.
 type bootStep struct {
-	Step     string `json:"step"`
-	Account  string `json:"account"`
-	From     string `json:"from"`
-	To       string `json:"to"`
-	Quantity string `json:"quantity"`
-	Tx       string `json:"tx"`
+	Step     string   `json:"step"`
+	Account  string   `json:"account"`
+	From     string   `json:"from"`
+	To       string   `json:"to"`
+	Quantity string   `json:"quantity"`
+	Tx       string   `json:"tx"`
+	Proposed []string `json:"proposed"`
 }
 
 type bootReport struct {
@@ -168,4 +169,30 @@ func TestBootSequenceAndTransfer(t *testing.T) {
 		require.Equal(want.balance, balance, "balance of %s", want.account)
 		t.Logf("%-12s %s", want.account, balance)
 	}
+
+	// Producer election, end to end. The boot fixture deployed a privileged
+	// setprods forwarder onto pulse and proposed a schedule that adds producerb.
+	// The chain enforces the change on the accepting block, so getProducers must
+	// report the new set once it activates.
+	setprods, ok := byStep["setprods"]
+	require.True(ok, "boot sequence did not report a setprods step")
+	require.NotEmpty(setprods.Tx, "setprods step produced no transaction id")
+	require.Equal([]string{"pulse", "producerb"}, setprods.Proposed)
+
+	// Activation happens on the block that accepts the setprods transaction, so
+	// poll rather than assume it is visible the instant the fixture returns.
+	var producers ActiveProducers
+	require.Eventually(func() bool {
+		p, err := Producers(ctx, uri)
+		if err != nil {
+			t.Logf("getProducers: %v", err)
+			return false
+		}
+		producers = p
+		return p.ScheduleVersion >= 1
+	}, 30*time.Second, 500*time.Millisecond, "producer schedule never activated")
+
+	require.EqualValues(1, producers.ScheduleVersion)
+	require.Equal([]string{"pulse", "producerb"}, producers.ActiveProducers)
+	t.Logf("active producers v%d: %v", producers.ScheduleVersion, producers.ActiveProducers)
 }

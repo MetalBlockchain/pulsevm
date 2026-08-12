@@ -3439,6 +3439,7 @@ dependencies = [
  "pulsevm_serialization",
  "serde_json",
  "tokio",
+ "wat",
 ]
 
 [[package]]

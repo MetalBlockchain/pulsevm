@@ -49,6 +49,7 @@ use crate::{
     api::{
         GetCodeHashResponse,
         GetInfoResponse,
+        GetProducersResponse,
         GetRawABIResponse,
         IssueTxResponse,
     },
@@ -106,6 +107,9 @@ pub trait Rpc {
 
     #[method(name = "pulsevm.getInfo")]
     async fn get_info(&self) -> Result<GetInfoResponse, ErrorObjectOwned>;
+
+    #[method(name = "pulsevm.getProducers")]
+    async fn get_producers(&self) -> Result<GetProducersResponse, ErrorObjectOwned>;
 
     #[method(name = "pulsevm.getRawABI")]
     async fn get_raw_abi(&self, account_name: Name) -> Result<GetRawABIResponse, ErrorObjectOwned>;
@@ -379,6 +383,15 @@ impl RpcServer for RpcService {
             total_net_weight: db.get_total_net_weight()?,
             earliest_available_block_num: 1,
             last_irreversible_block_time: head_block.timestamp().clone(),
+        })
+    }
+
+    async fn get_producers(&self) -> Result<GetProducersResponse, ErrorObjectOwned> {
+        let controller = self.controller.read().await;
+        let schedule = controller.active_producer_schedule();
+        Ok(GetProducersResponse {
+            schedule_version: schedule.version,
+            active_producers: schedule.producers.iter().map(|p| p.producer_name).collect(),
         })
     }
 
