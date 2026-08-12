@@ -75,7 +75,11 @@ struct ApplyContextInner {
     index256_cache: Index256IteratorCache,   // Cache for index256 iterators
     index_double_cache: IndexDoubleIteratorCache, // Cache for index double iterators
     index_long_double_cache: IndexLongDoubleIteratorCache, // Cache for index long double iterators
-    cpu_limit: i64,                          // CPU limit for the current action
+    // Arena twin of keyval_cache, driven in lockstep so the arena mints the same
+    // key-value iterator handles chainbase does.
+    #[cfg(feature = "arena-shadow")]
+    arena_keyval_cache: ArenaIteratorCache,
+    cpu_limit: i64, // CPU limit for the current action
 }
 
 #[derive(Clone)]
@@ -134,6 +138,8 @@ impl ApplyContext {
                 index256_cache: Index256IteratorCache::new(),
                 index_double_cache: IndexDoubleIteratorCache::new(),
                 index_long_double_cache: IndexLongDoubleIteratorCache::new(),
+                #[cfg(feature = "arena-shadow")]
+                arena_keyval_cache: ArenaIteratorCache::default(),
                 cpu_limit,
             })),
         })
@@ -518,6 +524,26 @@ impl ApplyContext {
         Ok(copy_size as i32)
     }
 
+    /// Tally an arena iterator-handle cross-check (arena handle == chainbase's),
+    /// logging the operation and table on a mismatch when `PULSEVM_DBG_ITER` is set.
+    #[cfg(feature = "arena-shadow")]
+    fn note_iter_handle(
+        &self,
+        op: &str,
+        code: u64,
+        scope: u64,
+        table: u64,
+        arena_h: i32,
+        res: i32,
+    ) {
+        if arena_h != res && std::env::var("PULSEVM_DBG_ITER").is_ok() {
+            eprintln!(
+                "ITER MISMATCH {op} code={code} scope={scope} table={table} arena={arena_h} chain={res}"
+            );
+        }
+        self.db.arena_note_pos(arena_h == res);
+    }
+
     pub fn db_find_i64(
         &mut self,
         code: u64,
@@ -527,16 +553,34 @@ impl ApplyContext {
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
 
-        match self
+        let res = self
             .db
             .db_find_i64(code, scope, table, id, &mut inner.keyval_cache)
+            .map_err(|e| ChainError::DatabaseError(format!("failed to find i64 in db: {}", e)))?;
+
+        // Mirror the handle into the arena cache: a found row adds its logical
+        // key, a missing row (but present table) takes the table's end iterator,
+        // and a missing table is -1 on both. The row/table existence itself is
+        // cross-checked by the value reads; here we confirm the handle index.
+        #[cfg(feature = "arena-shadow")]
         {
-            Ok(itr) => Ok(itr),
-            Err(e) => Err(ChainError::DatabaseError(format!(
-                "failed to find i64 in db: {}",
-                e
-            ))),
+            // Chainbase caches the table (minting its end iterator) on every call
+            // before looking up the row, so mirror that unconditionally, then add
+            // the row on a hit.
+            let arena_h = if res == -1 {
+                -1
+            } else {
+                let end = inner.arena_keyval_cache.cache_table((code, scope, table));
+                if res >= 0 {
+                    inner.arena_keyval_cache.add((code, scope, table, id))
+                } else {
+                    end
+                }
+            };
+            self.note_iter_handle("find", code, scope, table, arena_h, res);
         }
+
+        Ok(res)
     }
 
     pub fn db_store_i64(
@@ -563,7 +607,20 @@ impl ApplyContext {
                     .create_key_value_object(table, payer, primary_key, &data.0.as_slice())?;
             let obj = unsafe { &*obj };
             inner.keyval_cache.cache_table(&table)?;
-            inner.keyval_cache.add(obj)?
+            let handle = inner.keyval_cache.add(obj)?;
+            #[cfg(feature = "arena-shadow")]
+            {
+                let key = (
+                    table.get_code().to_uint64_t(),
+                    table.get_scope().to_uint64_t(),
+                    table.get_table().to_uint64_t(),
+                    primary_key,
+                );
+                inner.arena_keyval_cache.cache_table((key.0, key.1, key.2));
+                let arena_handle = inner.arena_keyval_cache.add(key);
+                self.note_iter_handle("store", key.0, key.1, key.2, arena_handle, handle);
+            }
+            handle
         };
 
         let billable_size = data.len() as i64 + billable_size_v::<KeyValueObject>() as i64;
@@ -670,6 +727,8 @@ impl ApplyContext {
             let delta =
                 self.db
                     .db_remove_i64(&mut inner.keyval_cache, iterator, self.receiver.as_u64())?;
+            #[cfg(feature = "arena-shadow")]
+            inner.arena_keyval_cache.remove(iterator);
             delta
         };
 
@@ -700,6 +759,19 @@ impl ApplyContext {
             let arena_next = self.db.arena_kv_upper_bound(code, scope, table, cur_pk);
             let ffi_next = if res >= 0 { Some(*primary) } else { None };
             self.db.arena_note_pos(arena_next == ffi_next);
+
+            // The handle db_next lands on: the successor row's, or the table's
+            // end iterator when there is none.
+            let arena_h = if res >= 0 {
+                match arena_next {
+                    Some(pk) => inner.arena_keyval_cache.add((code, scope, table, pk)),
+                    None => res, // position check already flagged this divergence
+                }
+            } else {
+                inner.arena_keyval_cache.cache_table((code, scope, table))
+            };
+            self.note_iter_handle("iter", code, scope, table, arena_h, res);
+
             if self.db.arena_reads_enabled()
                 && res >= 0
                 && let Some(an) = arena_next
@@ -718,22 +790,43 @@ impl ApplyContext {
         // iterator (the db_end -> db_previous backward-iteration entry): the
         // table's last row = arena `kv_last`.
         #[cfg(feature = "arena-shadow")]
-        let arena_prev = match current_iter_key(&inner.keyval_cache, iterator) {
-            Some((code, scope, table, cur_pk)) => {
-                Some(self.db.arena_kv_prev(code, scope, table, cur_pk))
-            }
-            None => end_iter_table(&inner.keyval_cache, iterator)
-                .map(|(code, scope, table)| self.db.arena_kv_last(code, scope, table)),
-        };
+        let arena_ctx: Option<((u64, u64, u64), Option<u64>)> =
+            match current_iter_key(&inner.keyval_cache, iterator) {
+                Some((code, scope, table, cur_pk)) => Some((
+                    (code, scope, table),
+                    self.db.arena_kv_prev(code, scope, table, cur_pk),
+                )),
+                None => {
+                    end_iter_table(&inner.keyval_cache, iterator).map(|(code, scope, table)| {
+                        (
+                            (code, scope, table),
+                            self.db.arena_kv_last(code, scope, table),
+                        )
+                    })
+                }
+            };
 
         let res = self
             .db
             .db_previous_i64(&mut inner.keyval_cache, iterator, primary)?;
 
         #[cfg(feature = "arena-shadow")]
-        if let Some(arena_prev) = arena_prev {
+        if let Some(((code, scope, table), arena_prev)) = arena_ctx {
             let ffi_prev = if res >= 0 { Some(*primary) } else { None };
             self.db.arena_note_pos(arena_prev == ffi_prev);
+
+            // db_previous lands on the predecessor row, or -1 when there is none
+            // (it never returns an end iterator).
+            let arena_h = if res >= 0 {
+                match arena_prev {
+                    Some(pk) => inner.arena_keyval_cache.add((code, scope, table, pk)),
+                    None => res, // position check already flagged this divergence
+                }
+            } else {
+                -1
+            };
+            self.note_iter_handle("iter", code, scope, table, arena_h, res);
+
             if self.db.arena_reads_enabled()
                 && res >= 0
                 && let Some(ap) = arena_prev
@@ -747,8 +840,21 @@ impl ApplyContext {
 
     pub fn db_end_i64(&mut self, code: u64, scope: u64, table: u64) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        self.db
-            .db_end_i64(&mut inner.keyval_cache, code, scope, table)
+        let res = self
+            .db
+            .db_end_i64(&mut inner.keyval_cache, code, scope, table)?;
+
+        #[cfg(feature = "arena-shadow")]
+        {
+            let arena_h = if res == -1 {
+                -1
+            } else {
+                inner.arena_keyval_cache.cache_table((code, scope, table))
+            };
+            self.note_iter_handle("iter", code, scope, table, arena_h, res);
+        }
+
+        Ok(res)
     }
 
     pub fn db_lowerbound_i64(
@@ -763,13 +869,28 @@ impl ApplyContext {
             self.db
                 .db_lowerbound_i64(&mut inner.keyval_cache, code, scope, table, primary)?;
 
-        // The iterator handle is chainbase's, but the primary it lands on is
-        // consensus-observable: cross-check it against the arena's lower_bound.
+        // Cross-check both the primary the iterator lands on and the handle
+        // index the arena would mint for it.
         #[cfg(feature = "arena-shadow")]
         {
             let ffi_landing = landing_primary(&inner.keyval_cache, res);
             let arena_landing = self.db.arena_kv_lower_bound(code, scope, table, primary);
             self.db.arena_note_pos(ffi_landing == arena_landing);
+
+            let arena_h = if res == -1 {
+                -1
+            } else {
+                let end = inner.arena_keyval_cache.cache_table((code, scope, table));
+                if res >= 0 {
+                    match arena_landing {
+                        Some(pk) => inner.arena_keyval_cache.add((code, scope, table, pk)),
+                        None => res,
+                    }
+                } else {
+                    end
+                }
+            };
+            self.note_iter_handle("bound", code, scope, table, arena_h, res);
         }
 
         Ok(res)
@@ -792,6 +913,21 @@ impl ApplyContext {
             let ffi_landing = landing_primary(&inner.keyval_cache, res);
             let arena_landing = self.db.arena_kv_upper_bound(code, scope, table, primary);
             self.db.arena_note_pos(ffi_landing == arena_landing);
+
+            let arena_h = if res == -1 {
+                -1
+            } else {
+                let end = inner.arena_keyval_cache.cache_table((code, scope, table));
+                if res >= 0 {
+                    match arena_landing {
+                        Some(pk) => inner.arena_keyval_cache.add((code, scope, table, pk)),
+                        None => res,
+                    }
+                } else {
+                    end
+                }
+            };
+            self.note_iter_handle("bound", code, scope, table, arena_h, res);
         }
 
         Ok(res)
@@ -2383,4 +2519,72 @@ fn end_iter_table(cache: &KeyValueIteratorCache, iterator: i32) -> Option<(u64, 
         table.get_scope().to_uint64_t(),
         table.get_table().to_uint64_t(),
     ))
+}
+
+/// A pure-Rust twin of the chainbase `iterator_cache`, keyed on the logical row
+/// identity `(code, scope, table, primary)` and table identity `(code, scope,
+/// table)` instead of chainbase object pointers. Chainbase assigns a handle the
+/// first time it sees an object and reuses it thereafter; because a live row has
+/// exactly one object at a time, keying on its logical identity yields the same
+/// handle assignment — non-negative indices for rows in first-seen order, and
+/// `-(index + 2)` end iterators per table, matching
+/// `index_to_end_iterator`/`end_iterator_to_index`. Driven in lockstep with the
+/// chainbase cache so the arena can mint the identical handle for every
+/// contract iterator; cross-checked against chainbase's answer at each mint.
+#[cfg(feature = "arena-shadow")]
+#[derive(Default)]
+struct ArenaIteratorCache {
+    end_to_table: Vec<(u64, u64, u64)>,
+    table_to_end: std::collections::HashMap<(u64, u64, u64), i32>,
+    // `None` marks a slot whose row was removed — the index is never reused, so
+    // a later re-insert of the same key takes a fresh handle, as in chainbase.
+    iter_to_row: Vec<Option<(u64, u64, u64, u64)>>,
+    row_to_iter: std::collections::HashMap<(u64, u64, u64, u64), i32>,
+}
+
+#[cfg(feature = "arena-shadow")]
+impl ArenaIteratorCache {
+    /// End iterator for a table, minting one on first use.
+    fn cache_table(&mut self, t: (u64, u64, u64)) -> i32 {
+        if let Some(&ei) = self.table_to_end.get(&t) {
+            return ei;
+        }
+        let ei = -(self.end_to_table.len() as i32 + 2);
+        self.end_to_table.push(t);
+        self.table_to_end.insert(t, ei);
+        ei
+    }
+
+    /// Handle for a live row, minting one on first use (dedup on repeat).
+    fn add(&mut self, row: (u64, u64, u64, u64)) -> i32 {
+        if let Some(&h) = self.row_to_iter.get(&row) {
+            return h;
+        }
+        let h = self.iter_to_row.len() as i32;
+        self.iter_to_row.push(Some(row));
+        self.row_to_iter.insert(row, h);
+        h
+    }
+
+    /// The logical row a non-negative handle points at, or `None` for an end or
+    /// removed iterator.
+    fn row_of(&self, handle: i32) -> Option<(u64, u64, u64, u64)> {
+        if handle < 0 {
+            return None;
+        }
+        self.iter_to_row.get(handle as usize).copied().flatten()
+    }
+
+    /// Drop a row's handle (the slot stays as a tombstone so the index is never
+    /// reused), matching chainbase's `remove`.
+    fn remove(&mut self, handle: i32) {
+        if handle < 0 {
+            return;
+        }
+        if let Some(slot) = self.iter_to_row.get_mut(handle as usize)
+            && let Some(row) = slot.take()
+        {
+            self.row_to_iter.remove(&row);
+        }
+    }
 }
