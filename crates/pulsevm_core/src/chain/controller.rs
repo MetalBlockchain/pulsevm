@@ -6645,11 +6645,14 @@ mod tests {
         let (mut controller, _private_key, _chain_id, _temp) = init_test_controller()?;
 
         let db = controller.database();
-        let r = db.read()?;
-        let min_cpu_us = r
-            .get_global_properties()?
-            .get_chain_config()
-            .get_min_transaction_cpu_usage() as u64;
+        // Scoped: the guard must not still be held when `run_onblock` below asks
+        // the same lock for a write, which is a self-deadlock on one thread.
+        let min_cpu_us = {
+            let r = db.read()?;
+            r.get_global_properties()?
+                .get_chain_config()
+                .get_min_transaction_cpu_usage() as u64
+        };
         assert!(min_cpu_us > 0, "genesis must set a non-zero CPU floor");
 
         let cpu_before = db.get_block_cpu_limit()?;
