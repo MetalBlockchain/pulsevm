@@ -1350,6 +1350,227 @@ impl Database {
         }
     }
 
+    /// Secondary-order next/previous/last for iterator-handle minting on the
+    /// idx128/256/double/long_double families. `next`/`previous` return the
+    /// landing row's primary relative to the row keyed by `primary`; `last`
+    /// returns the table's last row (for a `previous` off an end iterator). All
+    /// `None` when there is no such row or shadowing is off.
+    pub fn arena_idx128_next(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary: u64,
+    ) -> Option<u64> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow
+                .as_ref()
+                .and_then(|s| s.idx128_next(code, scope, table, primary))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = (code, scope, table, primary);
+            None
+        }
+    }
+
+    pub fn arena_idx128_previous(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary: u64,
+    ) -> Option<u64> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow
+                .as_ref()
+                .and_then(|s| s.idx128_previous(code, scope, table, primary))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = (code, scope, table, primary);
+            None
+        }
+    }
+
+    pub fn arena_idx128_last(&self, code: u64, scope: u64, table: u64) -> Option<u64> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow
+                .as_ref()
+                .and_then(|s| s.idx128_last(code, scope, table))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = (code, scope, table);
+            None
+        }
+    }
+
+    pub fn arena_idx256_next(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary: u64,
+    ) -> Option<u64> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow
+                .as_ref()
+                .and_then(|s| s.idx256_next(code, scope, table, primary))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = (code, scope, table, primary);
+            None
+        }
+    }
+
+    pub fn arena_idx256_previous(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary: u64,
+    ) -> Option<u64> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow
+                .as_ref()
+                .and_then(|s| s.idx256_previous(code, scope, table, primary))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = (code, scope, table, primary);
+            None
+        }
+    }
+
+    pub fn arena_idx256_last(&self, code: u64, scope: u64, table: u64) -> Option<u64> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow
+                .as_ref()
+                .and_then(|s| s.idx256_last(code, scope, table))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = (code, scope, table);
+            None
+        }
+    }
+
+    pub fn arena_idx_double_next(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary: u64,
+    ) -> Option<u64> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow
+                .as_ref()
+                .and_then(|s| s.idx_double_next(code, scope, table, primary))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = (code, scope, table, primary);
+            None
+        }
+    }
+
+    pub fn arena_idx_double_previous(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary: u64,
+    ) -> Option<u64> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow
+                .as_ref()
+                .and_then(|s| s.idx_double_previous(code, scope, table, primary))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = (code, scope, table, primary);
+            None
+        }
+    }
+
+    pub fn arena_idx_double_last(&self, code: u64, scope: u64, table: u64) -> Option<u64> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow
+                .as_ref()
+                .and_then(|s| s.idx_double_last(code, scope, table))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = (code, scope, table);
+            None
+        }
+    }
+
+    pub fn arena_idx_long_double_next(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary: u64,
+    ) -> Option<u64> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow
+                .as_ref()
+                .and_then(|s| s.idx_long_double_next(code, scope, table, primary))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = (code, scope, table, primary);
+            None
+        }
+    }
+
+    pub fn arena_idx_long_double_previous(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary: u64,
+    ) -> Option<u64> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow
+                .as_ref()
+                .and_then(|s| s.idx_long_double_previous(code, scope, table, primary))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = (code, scope, table, primary);
+            None
+        }
+    }
+
+    pub fn arena_idx_long_double_last(&self, code: u64, scope: u64, table: u64) -> Option<u64> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow
+                .as_ref()
+                .and_then(|s| s.idx_long_double_last(code, scope, table))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = (code, scope, table);
+            None
+        }
+    }
+
     /// Tally an iterator-positioning cross-check (arena landing vs chainbase).
     pub fn arena_note_pos(&self, matched: bool) {
         #[cfg(feature = "arena-shadow")]

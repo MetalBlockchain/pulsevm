@@ -6498,6 +6498,148 @@ mod tests {
         Ok(())
     }
 
+    /// Secondary-index iterator-handle oracle for the wider-key families: the
+    /// idx64 walk covers the u64 machinery; this covers the two structural
+    /// variants — a u128 secondary (idx128) and an IEEE-754 float secondary
+    /// (idx_double, whose `last`/order use the software-float key). One contract
+    /// drives both surfaces off both ends; the arena must mint chainbase's handle
+    /// and land on chainbase's row at every step, served under arena reads.
+    #[cfg(feature = "arena-shadow")]
+    #[tokio::test]
+    async fn oracle_secondary_wide_key_handles_mint_and_serve() -> Result<(), ChainError> {
+        // idx128 table 300, idx_double table 301, scope 100. Rows (primary,
+        // secondary): (10,100/1.0) (20,200/2.0) (30,200/2.0) (40,300/3.0). The
+        // idx128 secondary is a u128 at [0..16] (hi word kept 0); the double
+        // secondary is the f64 bit pattern at [24..32]. Primary out cells are
+        // [16..24] and [32..40].
+        let wasm = wat::parse_str(
+            r#"(module
+  (import "env" "db_idx128_store" (func $s128 (param i64 i64 i64 i64 i32) (result i32)))
+  (import "env" "db_idx128_end" (func $e128 (param i64 i64 i64) (result i32)))
+  (import "env" "db_idx128_lowerbound" (func $lb128 (param i64 i64 i64 i32 i32) (result i32)))
+  (import "env" "db_idx128_upperbound" (func $ub128 (param i64 i64 i64 i32 i32) (result i32)))
+  (import "env" "db_idx128_find_secondary" (func $fs128 (param i64 i64 i64 i32 i32) (result i32)))
+  (import "env" "db_idx128_find_primary" (func $fp128 (param i64 i64 i64 i32 i64) (result i32)))
+  (import "env" "db_idx128_next" (func $n128 (param i32 i32) (result i32)))
+  (import "env" "db_idx128_previous" (func $p128 (param i32 i32) (result i32)))
+  (import "env" "db_idx_double_store" (func $sd (param i64 i64 i64 i64 i32) (result i32)))
+  (import "env" "db_idx_double_end" (func $ed (param i64 i64 i64) (result i32)))
+  (import "env" "db_idx_double_lowerbound" (func $lbd (param i64 i64 i64 i32 i32) (result i32)))
+  (import "env" "db_idx_double_upperbound" (func $ubd (param i64 i64 i64 i32 i32) (result i32)))
+  (import "env" "db_idx_double_find_secondary" (func $fsd (param i64 i64 i64 i32 i32) (result i32)))
+  (import "env" "db_idx_double_find_primary" (func $fpd (param i64 i64 i64 i32 i64) (result i32)))
+  (import "env" "db_idx_double_next" (func $nd (param i32 i32) (result i32)))
+  (import "env" "db_idx_double_previous" (func $pd (param i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (func (export "apply") (param $receiver i64) (param $code i64) (param $action i64)
+    (local $scope i64) (local $it i32) (local $e i32)
+    (local.set $scope (i64.const 100))
+
+    ;; ---- idx128 (table 300), u128 secondary at [0..16], hi word stays 0 ----
+    (i64.store (i32.const 8) (i64.const 0))
+    (i64.store (i32.const 0) (i64.const 100))
+    (drop (call $s128 (local.get $scope) (i64.const 300) (local.get $receiver) (i64.const 10) (i32.const 0)))
+    (i64.store (i32.const 0) (i64.const 200))
+    (drop (call $s128 (local.get $scope) (i64.const 300) (local.get $receiver) (i64.const 20) (i32.const 0)))
+    (i64.store (i32.const 0) (i64.const 200))
+    (drop (call $s128 (local.get $scope) (i64.const 300) (local.get $receiver) (i64.const 30) (i32.const 0)))
+    (i64.store (i32.const 0) (i64.const 300))
+    (drop (call $s128 (local.get $scope) (i64.const 300) (local.get $receiver) (i64.const 40) (i32.const 0)))
+
+    (local.set $e (call $e128 (local.get $receiver) (local.get $scope) (i64.const 300)))
+    (i64.store (i32.const 0) (i64.const 0))
+    (local.set $it (call $lb128 (local.get $receiver) (local.get $scope) (i64.const 300) (i32.const 0) (i32.const 16)))
+    (local.set $it (call $n128 (local.get $it) (i32.const 16)))
+    (local.set $it (call $n128 (local.get $it) (i32.const 16)))
+    (local.set $it (call $n128 (local.get $it) (i32.const 16)))
+    (local.set $it (call $n128 (local.get $it) (i32.const 16)))
+    (i64.store (i32.const 0) (i64.const 200))
+    (drop (call $fs128 (local.get $receiver) (local.get $scope) (i64.const 300) (i32.const 0) (i32.const 16)))
+    (drop (call $fp128 (local.get $receiver) (local.get $scope) (i64.const 300) (i32.const 0) (i64.const 30)))
+    (i64.store (i32.const 0) (i64.const 200))
+    (drop (call $ub128 (local.get $receiver) (local.get $scope) (i64.const 300) (i32.const 0) (i32.const 16)))
+    (local.set $it (call $p128 (local.get $e) (i32.const 16)))
+    (local.set $it (call $p128 (local.get $it) (i32.const 16)))
+    (local.set $it (call $p128 (local.get $it) (i32.const 16)))
+    (local.set $it (call $p128 (local.get $it) (i32.const 16)))
+    (local.set $it (call $p128 (local.get $it) (i32.const 16)))
+
+    ;; ---- idx_double (table 301), f64 bits at [24..32] ----
+    (i64.store (i32.const 24) (i64.reinterpret_f64 (f64.const 1)))
+    (drop (call $sd (local.get $scope) (i64.const 301) (local.get $receiver) (i64.const 10) (i32.const 24)))
+    (i64.store (i32.const 24) (i64.reinterpret_f64 (f64.const 2)))
+    (drop (call $sd (local.get $scope) (i64.const 301) (local.get $receiver) (i64.const 20) (i32.const 24)))
+    (i64.store (i32.const 24) (i64.reinterpret_f64 (f64.const 2)))
+    (drop (call $sd (local.get $scope) (i64.const 301) (local.get $receiver) (i64.const 30) (i32.const 24)))
+    (i64.store (i32.const 24) (i64.reinterpret_f64 (f64.const 3)))
+    (drop (call $sd (local.get $scope) (i64.const 301) (local.get $receiver) (i64.const 40) (i32.const 24)))
+
+    (local.set $e (call $ed (local.get $receiver) (local.get $scope) (i64.const 301)))
+    (i64.store (i32.const 24) (i64.reinterpret_f64 (f64.const -1)))
+    (local.set $it (call $lbd (local.get $receiver) (local.get $scope) (i64.const 301) (i32.const 24) (i32.const 32)))
+    (local.set $it (call $nd (local.get $it) (i32.const 32)))
+    (local.set $it (call $nd (local.get $it) (i32.const 32)))
+    (local.set $it (call $nd (local.get $it) (i32.const 32)))
+    (local.set $it (call $nd (local.get $it) (i32.const 32)))
+    (i64.store (i32.const 24) (i64.reinterpret_f64 (f64.const 2)))
+    (drop (call $fsd (local.get $receiver) (local.get $scope) (i64.const 301) (i32.const 24) (i32.const 32)))
+    (drop (call $fpd (local.get $receiver) (local.get $scope) (i64.const 301) (i32.const 24) (i64.const 30)))
+    (i64.store (i32.const 24) (i64.reinterpret_f64 (f64.const 2)))
+    (drop (call $ubd (local.get $receiver) (local.get $scope) (i64.const 301) (i32.const 24) (i32.const 32)))
+    (local.set $it (call $pd (local.get $e) (i32.const 32)))
+    (local.set $it (call $pd (local.get $it) (i32.const 32)))
+    (local.set $it (call $pd (local.get $it) (i32.const 32)))
+    (local.set $it (call $pd (local.get $it) (i32.const 32)))
+    (local.set $it (call $pd (local.get $it) (i32.const 32)))
+  )
+)"#,
+        )
+        .unwrap();
+
+        let (mut controller, private_key, _cid, _temp) = init_test_controller()?;
+        controller.database().enable_arena_reads();
+        let chain_id = controller.chain_id().clone();
+        let ts = controller.last_accepted_block().timestamp().clone();
+        let st = BlockStatus::Building;
+        let testapi = Name::from_str("testapi")?;
+
+        controller.execute_transaction(
+            &create_account(&private_key, testapi, chain_id)?,
+            &ts,
+            &st,
+        )?;
+        controller.execute_transaction(
+            &set_code(&private_key, testapi, wasm, chain_id)?,
+            &ts,
+            &st,
+        )?;
+
+        let (ok_before, fail_before) = controller.database().arena_pos_crosscheck_counts();
+        controller.execute_transaction(
+            &call_contract(
+                &private_key,
+                testapi,
+                Name::from_str("run")?,
+                &Vec::<u8>::new(),
+                chain_id,
+            )?,
+            &ts,
+            &st,
+        )?;
+        let (ok_after, fail_after) = controller.database().arena_pos_crosscheck_counts();
+
+        assert_eq!(
+            fail_after, fail_before,
+            "arena idx128/idx_double handles or positions diverged from chainbase"
+        );
+        assert!(
+            ok_after - ok_before >= 40,
+            "expected the idx128 + idx_double walks to cross-check many handles, saw {}",
+            ok_after - ok_before
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_api_db() -> Result<(), ChainError> {
         let (mut controller, private_key, _chain_id, _temp) = init_test_controller()?;

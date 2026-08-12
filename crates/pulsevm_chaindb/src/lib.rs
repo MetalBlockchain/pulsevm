@@ -3284,6 +3284,289 @@ impl ArenaShadow {
             .map(|r| (r.sec_lo, r.sec_hi))
     }
 
+    // Secondary-order next/previous/last for iterator-handle minting, one family
+    // per secondary-index type. Each returns the landing row's primary key: the
+    // successor/predecessor of the row keyed by `primary` in `(secondary,
+    // primary)` order within the same table, and the table's last row (for a
+    // `previous` off the end iterator). The `rt == t_id` guard reproduces the C++
+    // `itr->t_id != obj.t_id` check that stops iteration at a table boundary.
+
+    pub fn idx128_next(&self, code: u64, scope: u64, table: u64, primary: u64) -> Option<u64> {
+        use std::ops::Bound;
+        let db = self.lock();
+        let t_id = self.resolve_t_id(&db, code, scope, table)?;
+        let sec = db
+            .find_by::<ContractIndex128Row, ContractIdx128ByPrimary>(&(t_id, primary))
+            .ok()
+            .flatten()?
+            .secondary_key();
+        match db
+            .table::<ContractIndex128Row>()
+            .ok()?
+            .get_index::<ContractIdx128BySecondary>()
+            .range((Bound::Excluded((t_id, sec, primary)), Bound::Unbounded))
+            .next()
+        {
+            Some((&(rt, _, p), _)) if rt == t_id => Some(p),
+            _ => None,
+        }
+    }
+
+    pub fn idx128_previous(&self, code: u64, scope: u64, table: u64, primary: u64) -> Option<u64> {
+        use std::ops::Bound;
+        let db = self.lock();
+        let t_id = self.resolve_t_id(&db, code, scope, table)?;
+        let sec = db
+            .find_by::<ContractIndex128Row, ContractIdx128ByPrimary>(&(t_id, primary))
+            .ok()
+            .flatten()?
+            .secondary_key();
+        match db
+            .table::<ContractIndex128Row>()
+            .ok()?
+            .get_index::<ContractIdx128BySecondary>()
+            .range((Bound::Unbounded, Bound::Excluded((t_id, sec, primary))))
+            .next_back()
+        {
+            Some((&(rt, _, p), _)) if rt == t_id => Some(p),
+            _ => None,
+        }
+    }
+
+    pub fn idx128_last(&self, code: u64, scope: u64, table: u64) -> Option<u64> {
+        use std::ops::Bound;
+        let db = self.lock();
+        let t_id = self.resolve_t_id(&db, code, scope, table)?;
+        match db
+            .table::<ContractIndex128Row>()
+            .ok()?
+            .get_index::<ContractIdx128BySecondary>()
+            .range((
+                Bound::Unbounded,
+                Bound::Included((t_id, u128::MAX, u64::MAX)),
+            ))
+            .next_back()
+        {
+            Some((&(rt, _, p), _)) if rt == t_id => Some(p),
+            _ => None,
+        }
+    }
+
+    pub fn idx256_next(&self, code: u64, scope: u64, table: u64, primary: u64) -> Option<u64> {
+        use std::ops::Bound;
+        let db = self.lock();
+        let t_id = self.resolve_t_id(&db, code, scope, table)?;
+        let (w0, w1) = db
+            .find_by::<ContractIndex256Row, ContractIdx256ByPrimary>(&(t_id, primary))
+            .ok()
+            .flatten()?
+            .secondary_words();
+        match db
+            .table::<ContractIndex256Row>()
+            .ok()?
+            .get_index::<ContractIdx256BySecondary>()
+            .range((Bound::Excluded((t_id, w0, w1, primary)), Bound::Unbounded))
+            .next()
+        {
+            Some((&(rt, _, _, p), _)) if rt == t_id => Some(p),
+            _ => None,
+        }
+    }
+
+    pub fn idx256_previous(&self, code: u64, scope: u64, table: u64, primary: u64) -> Option<u64> {
+        use std::ops::Bound;
+        let db = self.lock();
+        let t_id = self.resolve_t_id(&db, code, scope, table)?;
+        let (w0, w1) = db
+            .find_by::<ContractIndex256Row, ContractIdx256ByPrimary>(&(t_id, primary))
+            .ok()
+            .flatten()?
+            .secondary_words();
+        match db
+            .table::<ContractIndex256Row>()
+            .ok()?
+            .get_index::<ContractIdx256BySecondary>()
+            .range((Bound::Unbounded, Bound::Excluded((t_id, w0, w1, primary))))
+            .next_back()
+        {
+            Some((&(rt, _, _, p), _)) if rt == t_id => Some(p),
+            _ => None,
+        }
+    }
+
+    pub fn idx256_last(&self, code: u64, scope: u64, table: u64) -> Option<u64> {
+        use std::ops::Bound;
+        let db = self.lock();
+        let t_id = self.resolve_t_id(&db, code, scope, table)?;
+        match db
+            .table::<ContractIndex256Row>()
+            .ok()?
+            .get_index::<ContractIdx256BySecondary>()
+            .range((
+                Bound::Unbounded,
+                Bound::Included((t_id, u128::MAX, u128::MAX, u64::MAX)),
+            ))
+            .next_back()
+        {
+            Some((&(rt, _, _, p), _)) if rt == t_id => Some(p),
+            _ => None,
+        }
+    }
+
+    pub fn idx_double_next(&self, code: u64, scope: u64, table: u64, primary: u64) -> Option<u64> {
+        use std::ops::Bound;
+        let db = self.lock();
+        let t_id = self.resolve_t_id(&db, code, scope, table)?;
+        let sec = db
+            .find_by::<ContractIndexDoubleRow, ContractIdxDoubleByPrimary>(&(t_id, primary))
+            .ok()
+            .flatten()?
+            .secondary_key;
+        match db
+            .table::<ContractIndexDoubleRow>()
+            .ok()?
+            .get_index::<ContractIdxDoubleBySecondary>()
+            .range((
+                Bound::Excluded((t_id, DoubleKey(sec), primary)),
+                Bound::Unbounded,
+            ))
+            .next()
+        {
+            Some((&(rt, _, p), _)) if rt == t_id => Some(p),
+            _ => None,
+        }
+    }
+
+    pub fn idx_double_previous(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary: u64,
+    ) -> Option<u64> {
+        use std::ops::Bound;
+        let db = self.lock();
+        let t_id = self.resolve_t_id(&db, code, scope, table)?;
+        let sec = db
+            .find_by::<ContractIndexDoubleRow, ContractIdxDoubleByPrimary>(&(t_id, primary))
+            .ok()
+            .flatten()?
+            .secondary_key;
+        match db
+            .table::<ContractIndexDoubleRow>()
+            .ok()?
+            .get_index::<ContractIdxDoubleBySecondary>()
+            .range((
+                Bound::Unbounded,
+                Bound::Excluded((t_id, DoubleKey(sec), primary)),
+            ))
+            .next_back()
+        {
+            Some((&(rt, _, p), _)) if rt == t_id => Some(p),
+            _ => None,
+        }
+    }
+
+    pub fn idx_double_last(&self, code: u64, scope: u64, table: u64) -> Option<u64> {
+        use std::ops::Bound;
+        let db = self.lock();
+        let t_id = self.resolve_t_id(&db, code, scope, table)?;
+        match db
+            .table::<ContractIndexDoubleRow>()
+            .ok()?
+            .get_index::<ContractIdxDoubleBySecondary>()
+            .range((
+                Bound::Unbounded,
+                Bound::Included((t_id, DoubleKey(f64::INFINITY), u64::MAX)),
+            ))
+            .next_back()
+        {
+            Some((&(rt, _, p), _)) if rt == t_id => Some(p),
+            _ => None,
+        }
+    }
+
+    pub fn idx_long_double_next(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary: u64,
+    ) -> Option<u64> {
+        use std::ops::Bound;
+        let db = self.lock();
+        let t_id = self.resolve_t_id(&db, code, scope, table)?;
+        let (lo, hi) = db
+            .find_by::<ContractIndexLongDoubleRow, ContractIdxLongDoubleByPrimary>(&(t_id, primary))
+            .ok()
+            .flatten()
+            .map(|r| (r.sec_lo, r.sec_hi))?;
+        match db
+            .table::<ContractIndexLongDoubleRow>()
+            .ok()?
+            .get_index::<ContractIdxLongDoubleBySecondary>()
+            .range((
+                Bound::Excluded((t_id, LongDoubleKey { lo, hi }, primary)),
+                Bound::Unbounded,
+            ))
+            .next()
+        {
+            Some((&(rt, _, p), _)) if rt == t_id => Some(p),
+            _ => None,
+        }
+    }
+
+    pub fn idx_long_double_previous(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary: u64,
+    ) -> Option<u64> {
+        use std::ops::Bound;
+        let db = self.lock();
+        let t_id = self.resolve_t_id(&db, code, scope, table)?;
+        let (lo, hi) = db
+            .find_by::<ContractIndexLongDoubleRow, ContractIdxLongDoubleByPrimary>(&(t_id, primary))
+            .ok()
+            .flatten()
+            .map(|r| (r.sec_lo, r.sec_hi))?;
+        match db
+            .table::<ContractIndexLongDoubleRow>()
+            .ok()?
+            .get_index::<ContractIdxLongDoubleBySecondary>()
+            .range((
+                Bound::Unbounded,
+                Bound::Excluded((t_id, LongDoubleKey { lo, hi }, primary)),
+            ))
+            .next_back()
+        {
+            Some((&(rt, _, p), _)) if rt == t_id => Some(p),
+            _ => None,
+        }
+    }
+
+    pub fn idx_long_double_last(&self, code: u64, scope: u64, table: u64) -> Option<u64> {
+        use std::ops::Bound;
+        let db = self.lock();
+        let t_id = self.resolve_t_id(&db, code, scope, table)?;
+        // +inf is the largest ordering key over valid (non-NaN) stored secondaries.
+        let max_key = LongDoubleKey {
+            lo: 0,
+            hi: 0x7FFF_0000_0000_0000,
+        };
+        match db
+            .table::<ContractIndexLongDoubleRow>()
+            .ok()?
+            .get_index::<ContractIdxLongDoubleBySecondary>()
+            .range((Bound::Unbounded, Bound::Included((t_id, max_key, u64::MAX))))
+            .next_back()
+        {
+            Some((&(rt, _, p), _)) if rt == t_id => Some(p),
+            _ => None,
+        }
+    }
+
     fn resolve_t_id(&self, db: &Db, code: u64, scope: u64, table: u64) -> Option<i64> {
         db.find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&(code, scope, table))
             .ok()
@@ -3798,6 +4081,14 @@ mod tests {
         assert_eq!(s.idx128_find_secondary(code, scope, table, 200), Some(2));
         assert_eq!(s.idx128_find_secondary(code, scope, table, 199), None);
         assert_eq!(s.idx128_find_primary(code, scope, table, 7), Some(big));
+
+        // Secondary order is 9, 2, 5, 7 (by secondary then primary).
+        assert_eq!(s.idx128_next(code, scope, table, 9), Some(2));
+        assert_eq!(s.idx128_next(code, scope, table, 5), Some(7));
+        assert_eq!(s.idx128_next(code, scope, table, 7), None);
+        assert_eq!(s.idx128_previous(code, scope, table, 2), Some(9));
+        assert_eq!(s.idx128_previous(code, scope, table, 9), None);
+        assert_eq!(s.idx128_last(code, scope, table), Some(7));
     }
 
     /// idx256 reads order by the 32-byte key's two little-endian words then
@@ -3835,6 +4126,14 @@ mod tests {
         );
         assert_eq!(s.idx256_find_secondary(code, scope, table, key(25)), None);
         assert_eq!(s.idx256_find_primary(code, scope, table, 5), Some(key(20)));
+
+        // Secondary order is 9, 2, 5, 7 (by key word then primary).
+        assert_eq!(s.idx256_next(code, scope, table, 9), Some(2));
+        assert_eq!(s.idx256_next(code, scope, table, 5), Some(7));
+        assert_eq!(s.idx256_next(code, scope, table, 7), None);
+        assert_eq!(s.idx256_previous(code, scope, table, 2), Some(9));
+        assert_eq!(s.idx256_previous(code, scope, table, 9), None);
+        assert_eq!(s.idx256_last(code, scope, table), Some(7));
     }
 
     /// idx_double reads follow the software-float order (negatives before
@@ -3869,6 +4168,14 @@ mod tests {
         );
         assert_eq!(s.idx_double_find_secondary(code, scope, table, 2.5), None);
         assert_eq!(s.idx_double_find_primary(code, scope, table, 5), Some(2.0));
+
+        // Secondary order is 3, 9, 2, 5, 7 (negatives first, ties by primary).
+        assert_eq!(s.idx_double_next(code, scope, table, 3), Some(9));
+        assert_eq!(s.idx_double_next(code, scope, table, 2), Some(5));
+        assert_eq!(s.idx_double_next(code, scope, table, 7), None);
+        assert_eq!(s.idx_double_previous(code, scope, table, 9), Some(3));
+        assert_eq!(s.idx_double_previous(code, scope, table, 3), None);
+        assert_eq!(s.idx_double_last(code, scope, table), Some(7));
     }
 
     /// idx_long_double reads order by the 128-bit key then primary.
@@ -3911,5 +4218,13 @@ mod tests {
             s.idx_long_double_find_primary(code, scope, table, 5),
             Some((0, 2))
         );
+
+        // Secondary order is 9, 2, 5, 7 (by 128-bit key then primary).
+        assert_eq!(s.idx_long_double_next(code, scope, table, 9), Some(2));
+        assert_eq!(s.idx_long_double_next(code, scope, table, 5), Some(7));
+        assert_eq!(s.idx_long_double_next(code, scope, table, 7), None);
+        assert_eq!(s.idx_long_double_previous(code, scope, table, 2), Some(9));
+        assert_eq!(s.idx_long_double_previous(code, scope, table, 9), None);
+        assert_eq!(s.idx_long_double_last(code, scope, table), Some(7));
     }
 }
