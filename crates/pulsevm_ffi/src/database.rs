@@ -65,6 +65,8 @@ use crate::{
     PermissionLevelWeight,
     WaitWeight,
 };
+#[cfg(feature = "arena-shadow")]
+use pulsevm_billable_size::billable_size_v;
 
 /// Field-for-field snapshot of an `account_metadata_object` read back from the
 /// arena mirror, matching the chainbase accessors used to diff it.
@@ -253,6 +255,54 @@ fn encode_authority(auth: &Authority) -> Vec<u8> {
         out.extend_from_slice(&w.weight.to_le_bytes());
     }
     out
+}
+
+/// `shared_authority::get_billable_size()` computed straight from the arena's
+/// stored auth blob, so the newaccount RAM accounting has no chainbase object in
+/// the loop. The per-key length prefix written by [`encode_authority`] is exactly
+/// `fc::raw::pack_size(key)`, so this reproduces the C++ sum
+/// (`authority.hpp::get_billable_size`): each key adds `billable_size_v<KeyWeight>`
+/// plus its packed size, each account adds `billable_size_v<PermissionLevelWeight>`,
+/// each wait adds `billable_size_v<WaitWeight>`. `None` if the blob is malformed.
+#[cfg(feature = "arena-shadow")]
+fn authority_blob_billable_size(blob: &[u8]) -> Option<i64> {
+    fn rd_u32(b: &[u8], pos: &mut usize) -> Option<usize> {
+        let end = pos.checked_add(4).filter(|e| *e <= b.len())?;
+        let v = u32::from_le_bytes(b[*pos..end].try_into().ok()?) as usize;
+        *pos = end;
+        Some(v)
+    }
+    fn skip(b: &[u8], pos: &mut usize, n: usize) -> Option<()> {
+        let end = pos.checked_add(n).filter(|e| *e <= b.len())?;
+        *pos = end;
+        Some(())
+    }
+
+    let mut pos = 0usize;
+    skip(blob, &mut pos, 4)?; // threshold
+    let mut total: i64 = 0;
+
+    let nkeys = rd_u32(blob, &mut pos)?;
+    for _ in 0..nkeys {
+        let key_len = rd_u32(blob, &mut pos)?;
+        skip(blob, &mut pos, key_len)?; // packed key bytes
+        skip(blob, &mut pos, 2)?; // weight
+        total += billable_size_v::<KeyWeight>() as i64 + key_len as i64;
+    }
+
+    let naccounts = rd_u32(blob, &mut pos)?;
+    for _ in 0..naccounts {
+        skip(blob, &mut pos, 18)?; // actor(8) + permission(8) + weight(2)
+        total += billable_size_v::<PermissionLevelWeight>() as i64;
+    }
+
+    let nwaits = rd_u32(blob, &mut pos)?;
+    for _ in 0..nwaits {
+        skip(blob, &mut pos, 6)?; // wait_sec(4) + weight(2)
+        total += billable_size_v::<WaitWeight>() as i64;
+    }
+
+    Some(total)
 }
 
 /// The `(code, scope, table)` triple of a contract table, packed into `u64`s for
@@ -5148,6 +5198,49 @@ mod tests {
         assert_eq!(decoded.waits[0].weight, 4);
     }
 
+    /// The blob billable-size parser reproduces `shared_authority::get_billable_size`
+    /// over all three components: a key (whose packed size it must skip exactly), an
+    /// account weight, and a wait. A wrong key-length skip would misalign the
+    /// account/wait parse and change the total, so this pins the offset math. The
+    /// per-key packed size is taken from `packed_public_key_bytes` — the same
+    /// `fc::raw::pack` the C++ `pack_size(key)` measures — and the weight constants
+    /// from `billable_size_v`. (End-to-end equality against chainbase's own
+    /// `get_billable_size` is covered under arena reads by the newaccount serve in
+    /// `oracle_permission_authority_serves_from_arena`.)
+    #[cfg(feature = "arena-shadow")]
+    #[test]
+    fn authority_blob_billable_size_matches_formula() {
+        let key =
+            ffi::parse_public_key("PUB_K1_5bbkxaLdB5bfVZW6DJY8M74vwT2m61PqwywNUa5azfkJTvYa5H")
+                .unwrap();
+        let key_len = ffi::packed_public_key_bytes(key.as_ref().unwrap()).len() as i64;
+        let auth = Authority {
+            threshold: 2,
+            keys: vec![KeyWeight { key, weight: 1 }],
+            accounts: vec![PermissionLevelWeight {
+                permission: PermissionLevel {
+                    actor: name_u64("bob"),
+                    permission: name_u64("active"),
+                },
+                weight: 1,
+            }],
+            waits: vec![WaitWeight {
+                wait_sec: 100,
+                weight: 1,
+            }],
+        };
+
+        let blob = encode_authority(&auth);
+        let got = authority_blob_billable_size(&blob).expect("well-formed blob");
+        let expected = (billable_size_v::<KeyWeight>() as i64 + key_len)
+            + billable_size_v::<PermissionLevelWeight>() as i64
+            + billable_size_v::<WaitWeight>() as i64;
+        assert_eq!(got, expected, "billable size formula mismatch");
+
+        // A truncated blob is rejected rather than under-counted.
+        assert_eq!(authority_blob_billable_size(&blob[..blob.len() - 3]), None);
+    }
+
     /// A truncated blob is rejected, not silently mis-decoded.
     #[cfg(feature = "arena-shadow")]
     #[test]
@@ -5478,6 +5571,59 @@ impl<'g> DbRead<'g> {
                     Some(blob) => Ok(Some(decode_authority(&blob)?)),
                     None => Ok(None),
                 };
+            }
+        }
+
+        Ok(chainbase)
+    }
+
+    /// The permission's chainbase id, served from the arena's `cb_id` under
+    /// `PULSEVM_ARENA_READS`. newaccount reads the owner permission's id here to
+    /// parent the active permission on it; the mirror stores that same id, so the
+    /// value it serves is identical.
+    pub fn permission_id(&self, owner: u64, perm_name: u64) -> Result<Option<i64>, ChainError> {
+        let chainbase = self
+            .db()
+            .find_permission_by_actor_and_permission(owner, perm_name)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        let chainbase = unsafe { chainbase.as_ref() }.map(|p| p.get_id());
+
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow {
+            let arena = s.permission_cb_id(owner, perm_name);
+            s.note_noncontract(arena == chainbase);
+            if s.reads_enabled() {
+                return Ok(arena);
+            }
+        }
+
+        Ok(chainbase)
+    }
+
+    /// The permission authority's `get_billable_size()` (the RAM a permission's
+    /// authority is charged), computed from the arena's stored auth blob and
+    /// served under `PULSEVM_ARENA_READS`. newaccount bills this for the new
+    /// owner/active permissions.
+    pub fn permission_authority_billable_size(
+        &self,
+        owner: u64,
+        perm_name: u64,
+    ) -> Result<Option<i64>, ChainError> {
+        let chainbase = self
+            .db()
+            .find_permission_by_actor_and_permission(owner, perm_name)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        let chainbase =
+            unsafe { chainbase.as_ref() }.map(|p| p.get_authority().get_billable_size() as i64);
+
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow {
+            let arena = s
+                .permission_auth_blob(owner, perm_name)
+                .and_then(|blob| authority_blob_billable_size(&blob));
+            s.note_noncontract(arena == chainbase);
+            if s.reads_enabled() {
+                return Ok(arena);
             }
         }
 

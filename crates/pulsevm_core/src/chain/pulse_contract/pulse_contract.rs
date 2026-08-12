@@ -100,13 +100,19 @@ pub fn newaccount(
         &create.owner.into(),
         &context.pending_block_timestamp().into(),
     )?;
-    // Re-read the created permission's id and size rather than holding the
-    // creation pointer across the next create.
+    // Re-read the created permission's id and authority billable size rather than
+    // holding the creation pointer across the next create. Both are served from
+    // the arena under PULSEVM_ARENA_READS (cross-checked against chainbase).
     let (owner_id, owner_size) = {
         let r = db.read()?;
-        let p =
-            AuthorizationManager::get_permission(&r, create.name.as_u64(), OWNER_NAME.as_u64())?;
-        (p.get_id(), p.get_authority().get_billable_size() as i64)
+        let name = create.name.as_u64();
+        let owner_id = r
+            .permission_id(name, OWNER_NAME.as_u64())?
+            .ok_or_else(|| ChainError::TransactionError("owner permission missing".to_string()))?;
+        let owner_size = r
+            .permission_authority_billable_size(name, OWNER_NAME.as_u64())?
+            .ok_or_else(|| ChainError::TransactionError("owner permission missing".to_string()))?;
+        (owner_id, owner_size)
     };
 
     AuthorizationManager::create_permission(
@@ -119,9 +125,8 @@ pub fn newaccount(
     )?;
     let active_size = {
         let r = db.read()?;
-        let p =
-            AuthorizationManager::get_permission(&r, create.name.as_u64(), ACTIVE_NAME.as_u64())?;
-        p.get_authority().get_billable_size() as i64
+        r.permission_authority_billable_size(create.name.as_u64(), ACTIVE_NAME.as_u64())?
+            .ok_or_else(|| ChainError::TransactionError("active permission missing".to_string()))?
     };
 
     ResourceLimitsManager::initialize_account(db, &create.name)?;

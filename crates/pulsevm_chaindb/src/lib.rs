@@ -1554,6 +1554,16 @@ impl ArenaShadow {
         Some((parent, threshold))
     }
 
+    /// The chainbase id a permission mirrors (`cb_id`), for serving `get_id` from
+    /// the arena. `None` if the permission is absent.
+    pub fn permission_cb_id(&self, owner: u64, perm_name: u64) -> Option<i64> {
+        let db = self.lock();
+        db.find_by::<PermissionRow, PermByOwner>(&(owner, perm_name))
+            .ok()
+            .flatten()
+            .map(|p| p.cb_id)
+    }
+
     /// The full encoded `shared_authority` blob for a permission (the same bytes
     /// the FFI seam stored via `encode_authority`), for serving the whole
     /// authority — not just the threshold — from the arena. `None` if absent.
