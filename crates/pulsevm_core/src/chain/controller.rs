@@ -6379,6 +6379,125 @@ mod tests {
         Ok(())
     }
 
+    /// Secondary-index iterator-handle oracle: a contract that drives the full
+    /// idx64 surface (store, end, lowerbound/upperbound, find_secondary/primary,
+    /// next/previous off both ends, remove) must see the arena mint the identical
+    /// iterator handle chainbase does at every call, and land on the identical
+    /// row. The testnet replay never touches secondary indices, so this WAT
+    /// contract is the only thing that exercises the path — assert the arena
+    /// positioning tally is non-empty (the path really ran) and clean (no
+    /// divergence), with arena reads serving every secondary value.
+    #[cfg(feature = "arena-shadow")]
+    #[tokio::test]
+    async fn oracle_idx64_iterator_handles_mint_and_serve() -> Result<(), ChainError> {
+        // scope=100, table=200; rows (primary, secondary): (10,100) (20,200)
+        // (30,200) (40,300). The duplicate secondary 200 forces the (secondary,
+        // primary) tie-break, and walking next/previous falls off both ends.
+        let wasm = wat::parse_str(
+            r#"(module
+  (import "env" "db_idx64_store" (func $store (param i64 i64 i64 i64 i32) (result i32)))
+  (import "env" "db_idx64_end" (func $end (param i64 i64 i64) (result i32)))
+  (import "env" "db_idx64_lowerbound" (func $lb (param i64 i64 i64 i32 i32) (result i32)))
+  (import "env" "db_idx64_upperbound" (func $ub (param i64 i64 i64 i32 i32) (result i32)))
+  (import "env" "db_idx64_find_secondary" (func $fs (param i64 i64 i64 i32 i32) (result i32)))
+  (import "env" "db_idx64_find_primary" (func $fp (param i64 i64 i64 i32 i64) (result i32)))
+  (import "env" "db_idx64_next" (func $next (param i32 i32) (result i32)))
+  (import "env" "db_idx64_previous" (func $prev (param i32 i32) (result i32)))
+  (import "env" "db_idx64_remove" (func $rm (param i32)))
+  (memory (export "memory") 1)
+  (func (export "apply") (param $receiver i64) (param $code i64) (param $action i64)
+    (local $scope i64) (local $table i64) (local $it i32) (local $e i32)
+    (local.set $scope (i64.const 100))
+    (local.set $table (i64.const 200))
+
+    ;; store the four rows, payer = receiver
+    (i64.store (i32.const 0) (i64.const 100))
+    (drop (call $store (local.get $scope) (local.get $table) (local.get $receiver) (i64.const 10) (i32.const 0)))
+    (i64.store (i32.const 0) (i64.const 200))
+    (drop (call $store (local.get $scope) (local.get $table) (local.get $receiver) (i64.const 20) (i32.const 0)))
+    (i64.store (i32.const 0) (i64.const 200))
+    (drop (call $store (local.get $scope) (local.get $table) (local.get $receiver) (i64.const 30) (i32.const 0)))
+    (i64.store (i32.const 0) (i64.const 300))
+    (drop (call $store (local.get $scope) (local.get $table) (local.get $receiver) (i64.const 40) (i32.const 0)))
+
+    ;; end iterator for the table
+    (local.set $e (call $end (local.get $receiver) (local.get $scope) (local.get $table)))
+
+    ;; lowerbound(0) lands on the first row, then next walks off the end
+    (i64.store (i32.const 0) (i64.const 0))
+    (local.set $it (call $lb (local.get $receiver) (local.get $scope) (local.get $table) (i32.const 0) (i32.const 8)))
+    (local.set $it (call $next (local.get $it) (i32.const 8)))
+    (local.set $it (call $next (local.get $it) (i32.const 8)))
+    (local.set $it (call $next (local.get $it) (i32.const 8)))
+    (local.set $it (call $next (local.get $it) (i32.const 8)))
+
+    ;; point lookups
+    (i64.store (i32.const 0) (i64.const 200))
+    (drop (call $fs (local.get $receiver) (local.get $scope) (local.get $table) (i32.const 0) (i32.const 8)))
+    (drop (call $fp (local.get $receiver) (local.get $scope) (local.get $table) (i32.const 0) (i64.const 30)))
+    (i64.store (i32.const 0) (i64.const 200))
+    (drop (call $ub (local.get $receiver) (local.get $scope) (local.get $table) (i32.const 0) (i32.const 8)))
+
+    ;; previous from the end iterator lands on the last row, then walks off the front
+    (local.set $it (call $prev (local.get $e) (i32.const 8)))
+    (local.set $it (call $prev (local.get $it) (i32.const 8)))
+    (local.set $it (call $prev (local.get $it) (i32.const 8)))
+    (local.set $it (call $prev (local.get $it) (i32.const 8)))
+    (local.set $it (call $prev (local.get $it) (i32.const 8)))
+
+    ;; remove the first row through a fresh handle
+    (i64.store (i32.const 0) (i64.const 0))
+    (local.set $it (call $lb (local.get $receiver) (local.get $scope) (local.get $table) (i32.const 0) (i32.const 8)))
+    (call $rm (local.get $it))
+  )
+)"#,
+        )
+        .unwrap();
+
+        let (mut controller, private_key, _cid, _temp) = init_test_controller()?;
+        controller.database().enable_arena_reads();
+        let chain_id = controller.chain_id().clone();
+        let ts = controller.last_accepted_block().timestamp().clone();
+        let st = BlockStatus::Building;
+        let testapi = Name::from_str("testapi")?;
+
+        controller.execute_transaction(
+            &create_account(&private_key, testapi, chain_id)?,
+            &ts,
+            &st,
+        )?;
+        controller.execute_transaction(
+            &set_code(&private_key, testapi, wasm, chain_id)?,
+            &ts,
+            &st,
+        )?;
+
+        let (ok_before, fail_before) = controller.database().arena_pos_crosscheck_counts();
+        controller.execute_transaction(
+            &call_contract(
+                &private_key,
+                testapi,
+                Name::from_str("run")?,
+                &Vec::<u8>::new(),
+                chain_id,
+            )?,
+            &ts,
+            &st,
+        )?;
+        let (ok_after, fail_after) = controller.database().arena_pos_crosscheck_counts();
+
+        assert_eq!(
+            fail_after, fail_before,
+            "arena secondary-index handles/positions diverged from chainbase during idx64 iteration"
+        );
+        assert!(
+            ok_after - ok_before >= 20,
+            "expected the idx64 walk to cross-check many handles, saw {}",
+            ok_after - ok_before
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_api_db() -> Result<(), ChainError> {
         let (mut controller, private_key, _chain_id, _temp) = init_test_controller()?;

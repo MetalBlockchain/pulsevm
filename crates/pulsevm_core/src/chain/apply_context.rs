@@ -79,6 +79,10 @@ struct ApplyContextInner {
     // key-value iterator handles chainbase does.
     #[cfg(feature = "arena-shadow")]
     arena_keyval_cache: ArenaIteratorCache,
+    // Arena twin of index64_cache — chainbase keeps a separate iterator cache per
+    // secondary-index type, so the arena mirrors each independently.
+    #[cfg(feature = "arena-shadow")]
+    arena_index64_cache: ArenaIteratorCache,
     cpu_limit: i64, // CPU limit for the current action
 }
 
@@ -140,6 +144,8 @@ impl ApplyContext {
                 index_long_double_cache: IndexLongDoubleIteratorCache::new(),
                 #[cfg(feature = "arena-shadow")]
                 arena_keyval_cache: ArenaIteratorCache::default(),
+                #[cfg(feature = "arena-shadow")]
+                arena_index64_cache: ArenaIteratorCache::default(),
                 cpu_limit,
             })),
         })
@@ -544,6 +550,34 @@ impl ApplyContext {
         self.db.arena_note_pos(arena_h == res);
     }
 
+    /// Mint the idx64 iterator handle for a find/bound result and cross-check it
+    /// against chainbase's `res`: `-1` when the table is absent, the landing row's
+    /// handle on a hit, otherwise the table's end iterator — mirroring
+    /// `cache_table` on every call then `add` on a hit, as the C++ oracle does.
+    #[cfg(feature = "arena-shadow")]
+    fn note_idx64_handle(
+        &self,
+        inner: &mut ApplyContextInner,
+        op: &str,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary: u64,
+        res: i32,
+    ) {
+        let arena_h = if res == -1 {
+            -1
+        } else {
+            let end = inner.arena_index64_cache.cache_table((code, scope, table));
+            if res >= 0 {
+                inner.arena_index64_cache.add((code, scope, table, primary))
+            } else {
+                end
+            }
+        };
+        self.note_iter_handle(op, code, scope, table, arena_h, res);
+    }
+
     pub fn db_find_i64(
         &mut self,
         code: u64,
@@ -941,6 +975,8 @@ impl ApplyContext {
         primary_key: u64,
         secondary_key: u64,
     ) -> Result<i32, ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        let table_name = table;
         let table = self.find_or_create_table(*self.receiver, scope, table, payer)?;
         let table = unsafe { &*table };
         pulse_assert(
@@ -957,7 +993,21 @@ impl ApplyContext {
                 .create_index64_object(table, payer, primary_key, secondary_key)?;
             let obj = unsafe { &*obj };
             inner.index64_cache.cache_table(&table)?;
-            inner.index64_cache.add(obj)?
+            let handle = inner.index64_cache.add(obj)?;
+
+            #[cfg(feature = "arena-shadow")]
+            {
+                let code = self.receiver.as_u64();
+                inner
+                    .arena_index64_cache
+                    .cache_table((code, scope, table_name));
+                let arena_h = inner
+                    .arena_index64_cache
+                    .add((code, scope, table_name, primary_key));
+                self.note_iter_handle("idx64:store", code, scope, table_name, arena_h, handle);
+            }
+
+            handle
         };
 
         let billable_size = billable_size_v::<Index64Object>() as i64;
@@ -1005,6 +1055,8 @@ impl ApplyContext {
             let mut inner = self.inner.write()?;
             self.db
                 .db_idx64_remove(&mut inner.index64_cache, iterator, self.receiver.as_u64())?;
+            #[cfg(feature = "arena-shadow")]
+            inner.arena_index64_cache.remove(iterator);
         }
 
         self.update_db_usage(
@@ -1049,6 +1101,15 @@ impl ApplyContext {
             {
                 *primary = p;
             }
+            self.note_idx64_handle(
+                &mut inner,
+                "idx64:find_sec",
+                code,
+                scope,
+                table,
+                *primary,
+                res,
+            );
         }
 
         Ok(res)
@@ -1085,6 +1146,15 @@ impl ApplyContext {
             {
                 *secondary = s;
             }
+            self.note_idx64_handle(
+                &mut inner,
+                "idx64:find_pri",
+                code,
+                scope,
+                table,
+                primary,
+                res,
+            );
         }
 
         Ok(res)
@@ -1130,6 +1200,7 @@ impl ApplyContext {
                 *primary = p;
                 *secondary = s;
             }
+            self.note_idx64_handle(&mut inner, "idx64:lb", code, scope, table, *primary, res);
         }
 
         Ok(res)
@@ -1171,6 +1242,7 @@ impl ApplyContext {
                 *primary = p;
                 *secondary = s;
             }
+            self.note_idx64_handle(&mut inner, "idx64:ub", code, scope, table, *primary, res);
         }
 
         Ok(res)
@@ -1178,14 +1250,56 @@ impl ApplyContext {
 
     pub fn db_idx64_end(&mut self, code: u64, scope: u64, table: u64) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        self.db
-            .db_idx64_end(&mut inner.index64_cache, code, scope, table)
+        let res = self
+            .db
+            .db_idx64_end(&mut inner.index64_cache, code, scope, table)?;
+
+        // The end iterator equals the table's cached end handle, or -1 when the
+        // table is absent.
+        #[cfg(feature = "arena-shadow")]
+        {
+            let arena_h = if res == -1 {
+                -1
+            } else {
+                inner.arena_index64_cache.cache_table((code, scope, table))
+            };
+            self.note_iter_handle("idx64:end", code, scope, table, arena_h, res);
+        }
+
+        Ok(res)
     }
 
     pub fn db_idx64_next(&mut self, iterator: i32, primary: &mut u64) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        self.db
-            .db_idx64_next(&mut inner.index64_cache, iterator, primary)
+        let res = self
+            .db
+            .db_idx64_next(&mut inner.index64_cache, iterator, primary)?;
+
+        // Advance the arena twin in secondary order: past-the-end stays -1, a
+        // successor in the same table adds its row handle, and falling off the end
+        // lands on the table's end iterator. The written primary is cross-checked
+        // against the arena's successor too.
+        #[cfg(feature = "arena-shadow")]
+        {
+            let arena_h = if iterator < -1 {
+                -1
+            } else if let Some((code, scope, table, cur)) =
+                inner.arena_index64_cache.row_of(iterator)
+            {
+                match self.db.arena_idx64_next(code, scope, table, cur) {
+                    Some((np, _)) => {
+                        self.db.arena_note_pos(res < 0 || np == *primary);
+                        inner.arena_index64_cache.add((code, scope, table, np))
+                    }
+                    None => inner.arena_index64_cache.cache_table((code, scope, table)),
+                }
+            } else {
+                res
+            };
+            self.note_iter_handle("idx64:next", 0, 0, 0, arena_h, res);
+        }
+
+        Ok(res)
     }
 
     pub fn db_idx64_previous(
@@ -1194,8 +1308,42 @@ impl ApplyContext {
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        self.db
-            .db_idx64_previous(&mut inner.index64_cache, iterator, primary)
+        let res = self
+            .db
+            .db_idx64_previous(&mut inner.index64_cache, iterator, primary)?;
+
+        // Retreat the arena twin: from an end iterator, land on the table's last
+        // row (or -1 if empty); from a live row, land on its predecessor (or -1 at
+        // the beginning). The written primary is cross-checked on a hit.
+        #[cfg(feature = "arena-shadow")]
+        {
+            let arena_h = if let Some((code, scope, table)) =
+                inner.arena_index64_cache.table_of_end(iterator)
+            {
+                match self.db.arena_idx64_last(code, scope, table) {
+                    Some((lp, _)) => {
+                        self.db.arena_note_pos(res < 0 || lp == *primary);
+                        inner.arena_index64_cache.add((code, scope, table, lp))
+                    }
+                    None => -1,
+                }
+            } else if let Some((code, scope, table, cur)) =
+                inner.arena_index64_cache.row_of(iterator)
+            {
+                match self.db.arena_idx64_previous(code, scope, table, cur) {
+                    Some((pp, _)) => {
+                        self.db.arena_note_pos(res < 0 || pp == *primary);
+                        inner.arena_index64_cache.add((code, scope, table, pp))
+                    }
+                    None => -1,
+                }
+            } else {
+                res
+            };
+            self.note_iter_handle("idx64:prev", 0, 0, 0, arena_h, res);
+        }
+
+        Ok(res)
     }
 
     pub fn db_idx128_store(
@@ -2573,6 +2721,17 @@ impl ArenaIteratorCache {
             return None;
         }
         self.iter_to_row.get(handle as usize).copied().flatten()
+    }
+
+    /// The table an end iterator (`-(index + 2)`) belongs to, or `None` if the
+    /// handle is not a minted end iterator. Mirrors
+    /// `find_table_by_end_iterator`.
+    fn table_of_end(&self, handle: i32) -> Option<(u64, u64, u64)> {
+        if handle >= -1 {
+            return None;
+        }
+        let idx = (-handle - 2) as usize;
+        self.end_to_table.get(idx).copied()
     }
 
     /// Drop a row's handle (the slot stays as a tombstone so the index is never

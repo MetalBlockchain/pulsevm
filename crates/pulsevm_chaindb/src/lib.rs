@@ -2896,6 +2896,81 @@ impl ArenaShadow {
             .map(|r| r.secondary_key)
     }
 
+    /// db_idx64_next: the row after the one keyed by `primary`, in
+    /// `(secondary, primary)` order within the same table. `None` when `primary`
+    /// is the last row (or absent). Returns `(primary, secondary)` of the landing.
+    pub fn idx64_next(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary: u64,
+    ) -> Option<(u64, u64)> {
+        use std::ops::Bound;
+        let db = self.lock();
+        let t_id = self.resolve_t_id(&db, code, scope, table)?;
+        let sec = db
+            .find_by::<ContractIndex64Row, ContractIdx64ByPrimary>(&(t_id, primary))
+            .ok()
+            .flatten()?
+            .secondary_key;
+        db.table::<ContractIndex64Row>()
+            .ok()?
+            .get_index::<ContractIdx64BySecondary>()
+            .range((
+                Bound::Excluded((t_id, sec, primary)),
+                Bound::Included((t_id, u64::MAX, u64::MAX)),
+            ))
+            .next()
+            .map(|(&(_, s, p), _)| (p, s))
+    }
+
+    /// db_idx64_previous: the row before the one keyed by `primary`, in
+    /// `(secondary, primary)` order within the same table. `None` when `primary`
+    /// is the first row (or absent). Returns `(primary, secondary)` of the landing.
+    pub fn idx64_previous(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary: u64,
+    ) -> Option<(u64, u64)> {
+        use std::ops::Bound;
+        let db = self.lock();
+        let t_id = self.resolve_t_id(&db, code, scope, table)?;
+        let sec = db
+            .find_by::<ContractIndex64Row, ContractIdx64ByPrimary>(&(t_id, primary))
+            .ok()
+            .flatten()?
+            .secondary_key;
+        db.table::<ContractIndex64Row>()
+            .ok()?
+            .get_index::<ContractIdx64BySecondary>()
+            .range((
+                Bound::Included((t_id, u64::MIN, u64::MIN)),
+                Bound::Excluded((t_id, sec, primary)),
+            ))
+            .next_back()
+            .map(|(&(_, s, p), _)| (p, s))
+    }
+
+    /// db_idx64_previous from an end iterator: the last row of the table in
+    /// `(secondary, primary)` order, or `None` when the index is empty.
+    pub fn idx64_last(&self, code: u64, scope: u64, table: u64) -> Option<(u64, u64)> {
+        use std::ops::Bound;
+        let db = self.lock();
+        let t_id = self.resolve_t_id(&db, code, scope, table)?;
+        db.table::<ContractIndex64Row>()
+            .ok()?
+            .get_index::<ContractIdx64BySecondary>()
+            .range((
+                Bound::Included((t_id, u64::MIN, u64::MIN)),
+                Bound::Included((t_id, u64::MAX, u64::MAX)),
+            ))
+            .next_back()
+            .map(|(&(_, s, p), _)| (p, s))
+    }
+
     /// idx128 secondary-index positioning, same semantics as the idx64 family but
     /// over a `u128` secondary key: `(primary, secondary)` of the landing row,
     /// in `(secondary, primary)` order.
@@ -3681,6 +3756,18 @@ mod tests {
         // find_primary: the secondary stored for a primary.
         assert_eq!(s.idx64_find_primary(code, scope, table, 5), Some(200));
         assert_eq!(s.idx64_find_primary(code, scope, table, 42), None);
+
+        // Secondary order is 9(100), 2(200), 5(200), 7(300); next/previous walk
+        // it and fall off the ends (the ties break by primary, so 2 precedes 5).
+        assert_eq!(s.idx64_next(code, scope, table, 9), Some((2, 200)));
+        assert_eq!(s.idx64_next(code, scope, table, 2), Some((5, 200)));
+        assert_eq!(s.idx64_next(code, scope, table, 5), Some((7, 300)));
+        assert_eq!(s.idx64_next(code, scope, table, 7), None);
+        assert_eq!(s.idx64_previous(code, scope, table, 7), Some((5, 200)));
+        assert_eq!(s.idx64_previous(code, scope, table, 5), Some((2, 200)));
+        assert_eq!(s.idx64_previous(code, scope, table, 2), Some((9, 100)));
+        assert_eq!(s.idx64_previous(code, scope, table, 9), None);
+        assert_eq!(s.idx64_last(code, scope, table), Some((7, 300)));
     }
 
     /// idx128 reads follow the same (secondary, primary) order over a u128 key,

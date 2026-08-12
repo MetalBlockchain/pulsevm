@@ -961,6 +961,64 @@ impl Database {
         }
     }
 
+    /// Secondary-order next/previous/last for idx64 iterator-handle minting:
+    /// `(primary, secondary)` of the row after/before the one keyed by `primary`,
+    /// and the last row of the table (for previous from an end iterator). `None`
+    /// when there is no such row or shadowing is off.
+    pub fn arena_idx64_next(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary: u64,
+    ) -> Option<(u64, u64)> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow
+                .as_ref()
+                .and_then(|s| s.idx64_next(code, scope, table, primary))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = (code, scope, table, primary);
+            None
+        }
+    }
+
+    pub fn arena_idx64_previous(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary: u64,
+    ) -> Option<(u64, u64)> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow
+                .as_ref()
+                .and_then(|s| s.idx64_previous(code, scope, table, primary))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = (code, scope, table, primary);
+            None
+        }
+    }
+
+    pub fn arena_idx64_last(&self, code: u64, scope: u64, table: u64) -> Option<(u64, u64)> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow
+                .as_ref()
+                .and_then(|s| s.idx64_last(code, scope, table))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = (code, scope, table);
+            None
+        }
+    }
+
     pub fn arena_idx128_find_secondary(
         &self,
         code: u64,
