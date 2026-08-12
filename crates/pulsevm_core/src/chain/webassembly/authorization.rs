@@ -8,9 +8,16 @@ use crate::chain::{
     webassembly::context_aware_check,
 };
 
-pub fn require_auth(env: FunctionEnvMut<WasmContext>, account: u64) -> Result<(), RuntimeError> {
+use super::cost;
+
+pub fn require_auth(
+    mut env: FunctionEnvMut<WasmContext>,
+    account: u64,
+) -> Result<(), RuntimeError> {
     context_aware_check(&env)?;
-    let context = env.data().apply_context();
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::AUTH)?;
+    let context = env_data.apply_context();
 
     if let Err(err) = context.require_authorization(&account.into(), None) {
         return Err(err.into());
@@ -19,9 +26,11 @@ pub fn require_auth(env: FunctionEnvMut<WasmContext>, account: u64) -> Result<()
     }
 }
 
-pub fn has_auth(env: FunctionEnvMut<WasmContext>, account: u64) -> Result<i32, RuntimeError> {
+pub fn has_auth(mut env: FunctionEnvMut<WasmContext>, account: u64) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
-    let context = env.data().apply_context();
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::AUTH)?;
+    let context = env_data.apply_context();
     let result = context.has_authorization(&account.into())?;
 
     if result { Ok(1) } else { Ok(0) }
@@ -33,7 +42,9 @@ pub fn require_auth2(
     permission: u64,
 ) -> Result<(), RuntimeError> {
     context_aware_check(&env)?;
-    let context = env.data_mut().apply_context_mut();
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::AUTH)?;
+    let context = env_data.apply_context_mut();
 
     if let Err(err) = context.require_authorization(&account.into(), Some(permission.into())) {
         return Err(err.into());
@@ -47,7 +58,9 @@ pub fn require_recipient(
     recipient: u64,
 ) -> Result<(), RuntimeError> {
     context_aware_check(&env)?;
-    let context = env.data_mut().apply_context_mut();
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::AUTH)?;
+    let context = env_data.apply_context_mut();
 
     if let Err(err) = context.require_recipient(&recipient.into()) {
         return Err(err.into());
@@ -56,9 +69,15 @@ pub fn require_recipient(
     }
 }
 
-pub fn is_account(env: FunctionEnvMut<WasmContext>, recipient: u64) -> Result<i32, RuntimeError> {
+pub fn is_account(
+    mut env: FunctionEnvMut<WasmContext>,
+    recipient: u64,
+) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
-    let context = env.data().apply_context();
+    let (env_data, mut store) = env.data_and_store_mut();
+    // is_account hits chainbase, unlike the auth scans above, so it's priced as a lookup.
+    env_data.charge(&mut store, cost::DB_FIND)?;
+    let context = env_data.apply_context();
     let result = context.is_account(&recipient.into())?;
 
     if result { Ok(1) } else { Ok(0) }

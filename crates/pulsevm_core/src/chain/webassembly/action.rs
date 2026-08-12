@@ -12,9 +12,13 @@ use crate::chain::{
     webassembly::context_aware_check,
 };
 
+use super::cost;
+
 #[inline]
-pub fn action_data_size(env: FunctionEnvMut<WasmContext>) -> i32 {
-    env.data().action().data().len() as i32
+pub fn action_data_size(mut env: FunctionEnvMut<WasmContext>) -> Result<i32, RuntimeError> {
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BASE)?;
+    Ok(env_data.action().data().len() as i32)
 }
 
 #[inline]
@@ -23,14 +27,20 @@ pub fn read_action_data(
     buffer_ptr: WasmPtr<u8>,
     buffer_len: u32,
 ) -> Result<i32, RuntimeError> {
-    let (env_data, store) = env.data_and_store_mut();
-    let action_data = env_data.action().data();
-    let total_len = action_data.len() as u32;
+    let (env_data, mut store) = env.data_and_store_mut();
+    // Charge for the bytes actually copied, not the guest-declared buffer: this
+    // intrinsic writes straight into guest memory (no host allocation to bound),
+    // and copies only min(buffer_len, data_len). A large buffer_len over small
+    // action data must not be billed for bytes it never touches.
+    let total_len = env_data.action().data().len() as u32;
     let copy_size = buffer_len.min(total_len);
+    env_data.charge(&mut store, cost::BASE + cost::per_byte(copy_size as u64))?;
 
     if copy_size == 0 {
         return Ok(total_len as i32);
     }
+
+    let action_data = env_data.action().data();
 
     let memory = env_data
         .memory()
@@ -43,8 +53,10 @@ pub fn read_action_data(
 }
 
 #[inline]
-pub fn current_receiver(env: FunctionEnvMut<WasmContext>) -> u64 {
-    env.data().receiver()
+pub fn current_receiver(mut env: FunctionEnvMut<WasmContext>) -> Result<u64, RuntimeError> {
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BASE)?;
+    Ok(env_data.receiver())
 }
 
 #[inline]
@@ -55,7 +67,8 @@ pub fn set_action_return_value(
 ) -> Result<(), RuntimeError> {
     context_aware_check(&env)?;
 
-    let (env_data, store) = env.data_and_store_mut();
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BASE + cost::per_byte(buffer_len as u64))?;
 
     {
         let mut db = env_data.db_mut();

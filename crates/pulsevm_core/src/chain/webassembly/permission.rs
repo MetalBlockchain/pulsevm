@@ -12,6 +12,7 @@ use wasmer::{
     WasmPtr,
 };
 
+use super::cost;
 use crate::{
     authorization_manager::AuthorizationManager,
     chain::webassembly::context_aware_check,
@@ -30,7 +31,8 @@ pub fn check_transaction_authorization(
     perms_length: u32,
 ) -> Result<u32, RuntimeError> {
     context_aware_check(&env)?;
-    let (env_data, store) = env.data_and_store_mut();
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::AUTH + cost::per_byte(trx_length as u64))?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -114,7 +116,14 @@ pub fn check_permission_authorization(
         return Err(RuntimeError::new("provided delay is too large"));
     }
 
-    let (env_data, store) = env.data_and_store_mut();
+    let (env_data, mut store) = env.data_and_store_mut();
+    // Widen the fields, not the argument: `pubkeys_size + perms_size` in u32
+    // would overflow (panic in debug, wrap in release) for guest-supplied sizes
+    // near u32::MAX, and this runs before the memory range is bounds-checked.
+    env_data.charge(
+        &mut store,
+        cost::AUTH + cost::per_byte(pubkeys_size as u64 + perms_size as u64),
+    )?;
     let memory = env_data
         .memory()
         .as_ref()
@@ -166,12 +175,13 @@ pub fn check_permission_authorization(
 }
 
 pub fn get_permission_last_used(
-    env: FunctionEnvMut<WasmContext>,
+    mut env: FunctionEnvMut<WasmContext>,
     account: u64,
     permission: u64,
 ) -> Result<i64, RuntimeError> {
     context_aware_check(&env)?;
-    let env_data = env.data();
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BASE)?;
     let db = env_data.db();
     let r = db.read()?;
     let permission = AuthorizationManager::get_permission(&r, account, permission)?;
@@ -180,11 +190,12 @@ pub fn get_permission_last_used(
 }
 
 pub fn get_account_creation_time(
-    env: FunctionEnvMut<WasmContext>,
+    mut env: FunctionEnvMut<WasmContext>,
     account: u64,
 ) -> Result<i64, RuntimeError> {
     context_aware_check(&env)?;
-    let env_data = env.data();
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BASE)?;
     let db = env_data.db();
     let account = db.get_account(account)?;
     Ok(account

@@ -11,7 +11,6 @@ mod auth_tests {
         authority::PermissionLevel,
         transaction::{
             Action,
-            SignedTransaction,
             Transaction,
         },
         wat2wasm,
@@ -70,52 +69,26 @@ mod auth_tests {
 
     #[tokio::test]
     async fn test_entry_behavior() -> Result<()> {
+        // A start section runs during instantiation, before apply is called and
+        // before the metering budget is seeded, so any host intrinsic it reaches
+        // (here `current_time`) would run unbilled. set_code must reject such a
+        // contract outright.
         let mut chain = Testing::new().await;
         chain.create_accounts(vec![name!("entrycheck").into()], false, true)?;
-        chain.set_code(name!("entrycheck").into(), wat2wasm(ENTRY_WAST)?.into())?;
-
-        let mut trx = Transaction::default();
-        chain.set_transaction_headers(&mut trx, DEFAULT_EXPIRATION_DELTA, 0);
-        trx.actions.push(Action {
-            account: name!("entrycheck").into(),
-            name: name!("").into(),
-            authorization: vec![PermissionLevel {
-                actor: name!("entrycheck").into(),
-                permission: name!("active").into(),
-            }],
-            data: Arc::from(vec![]),
-        });
-        let trx = trx.sign(
-            &get_private_key(name!("entrycheck").into(), "active"),
-            chain.controller.chain_id(),
-        )?;
-        chain.push_transaction(trx)?;
+        let result = chain.set_code(name!("entrycheck").into(), wat2wasm(ENTRY_WAST)?.into());
+        assert!(result.is_err());
 
         Ok(())
     }
 
     #[tokio::test]
     async fn test_entry_behavior_2() -> Result<()> {
+        // Same rule regardless of where the start section sits relative to the
+        // function bodies: a declared start section is rejected.
         let mut chain = Testing::new().await;
         chain.create_accounts(vec![name!("entrycheck").into()], false, true)?;
-        chain.set_code(name!("entrycheck").into(), wat2wasm(ENTRY_WAST_2)?.into())?;
-
-        let mut trx = Transaction::default();
-        chain.set_transaction_headers(&mut trx, DEFAULT_EXPIRATION_DELTA, 0);
-        trx.actions.push(Action {
-            account: name!("entrycheck").into(),
-            name: name!("").into(),
-            authorization: vec![PermissionLevel {
-                actor: name!("entrycheck").into(),
-                permission: name!("active").into(),
-            }],
-            data: Arc::from(vec![]),
-        });
-        let trx = trx.sign(
-            &get_private_key(name!("entrycheck").into(), "active"),
-            chain.controller.chain_id(),
-        )?;
-        chain.push_transaction(trx)?;
+        let result = chain.set_code(name!("entrycheck").into(), wat2wasm(ENTRY_WAST_2)?.into());
+        assert!(result.is_err());
 
         Ok(())
     }

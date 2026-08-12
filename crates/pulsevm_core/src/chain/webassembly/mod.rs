@@ -10,6 +10,8 @@ pub use builtins::*;
 mod console;
 pub use console::*;
 
+pub mod cost;
+
 mod context_free;
 pub use context_free::*;
 

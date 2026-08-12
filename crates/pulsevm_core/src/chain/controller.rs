@@ -54,6 +54,7 @@ use crate::{
         },
         resource_limits::ResourceLimitsManager,
         state_history::StateHistoryLog,
+        state_sync,
         transaction::{
             PackedTransaction,
             SignedTransaction,
@@ -143,6 +144,15 @@ pub struct Controller {
     chain_state_log: Option<StateHistoryLog>,
     node_config: Option<NodeConfig>,
 
+    // The data directory the database and logs live in. Retained so state-sync
+    // accept can persist the synced producer schedule beside them.
+    db_path: Option<String>,
+
+    // The snapshot last advertised via `produce_state_summary`, cached so this
+    // node can serve download chunks to a syncing peer. `None` until a summary
+    // is produced or after a sync is applied.
+    snapshot_cache: Option<CachedSnapshot>,
+
     // Active block producers and their signing keys. A block validates only if
     // signed by the key its producer holds here. Seeded from genesis, changed by
     // a block whose header carries `new_producers`, and reconstructed from the
@@ -205,6 +215,29 @@ impl fmt::Display for ControllerError {
     }
 }
 
+/// An Avalanche state summary: a commitment the engine agrees on (`id`, the
+/// accepted block id, canonical across nodes) plus small `bytes` describing what
+/// to fetch — the active schedule, the snapshot's block, and the snapshot's
+/// length and hash. The snapshot payload itself is downloaded separately over
+/// AppRequest (see `crate::chain::state_sync`).
+pub struct StateSummary {
+    pub id: Id,
+    pub height: u64,
+    pub bytes: Vec<u8>,
+}
+
+/// The producer schedule in force at a synced snapshot, persisted beside the
+/// logs so a restart-after-sync can recover it (see `apply_state_snapshot`).
+const SYNCED_SCHEDULE_FILE: &str = "synced_schedule.bin";
+
+/// The snapshot a node last advertised in a summary, kept so it can serve the
+/// download chunks without re-snapshotting the arena on every request.
+struct CachedSnapshot {
+    height: u32,
+    hash: [u8; 32],
+    envelope: Vec<u8>,
+}
+
 impl Controller {
     pub fn new() -> Self {
         // Create a temporary database
@@ -224,6 +257,8 @@ impl Controller {
             trace_log: None,
             chain_state_log: None,
             node_config: None,
+            db_path: None,
+            snapshot_cache: None,
             active_schedule: ProducerSchedule::default(),
 
             pending_chain: Vec::new(),
@@ -282,6 +317,8 @@ impl Controller {
                 e, config_json
             ))
         })?);
+
+        self.db_path = Some(db_path.to_string());
 
         // Initialize database
         self.db = Database::new(&db_path, self.node_config.as_ref().unwrap().db_size)
@@ -352,6 +389,20 @@ impl Controller {
             self.db.initialize_database(&genesis).map_err(|e| {
                 ChainError::GenesisError(format!("failed to initialize database: {}", e))
             })?;
+            // initialize_database seeds the resource-limits config from the C++
+            // struct defaults (default_max_block_cpu_usage), not from genesis, so
+            // the very first block would run under those tiny defaults until the
+            // end-of-block set_block_parameters first fires. Push the genesis-derived
+            // block parameters in now so block 1 already has the real CPU/NET
+            // ceilings — otherwise a genesis-configured budget silently doesn't
+            // apply to the block that bootstraps the chain.
+            let (cpu_elastic_parameters, net_elastic_parameters) =
+                self.block_elastic_parameters()?;
+            ResourceLimitsManager::set_block_parameters(
+                &mut self.db,
+                &cpu_elastic_parameters,
+                &net_elastic_parameters,
+            )?;
             self.db
                 .set_revision(self.last_accepted_block.block_num() as i64)?;
             info!("database initialized successfully");
@@ -406,10 +457,20 @@ impl Controller {
                 self.last_accepted_block_id = self.last_accepted_block.id()?;
                 self.preferred_id = self.last_accepted_block.id()?;
 
+                // A state-synced node's schedule base isn't in its (re-based) log:
+                // the pre-sync block that set the schedule was never downloaded, so
+                // the log tip may not carry it. Accept persisted the schedule in
+                // force at the snapshot height beside the logs; load it as the base
+                // before reconstruct overlays any newer in-log change. Absent on a
+                // normally-grown chain, where the genesis seed is the base.
+                if let Some(synced) = Self::load_synced_schedule(db_path) {
+                    self.active_schedule = synced;
+                }
+
                 // Rebuild the active schedule from the committed chain rather than
                 // trusting an out-of-band file: the last block that carried a
                 // `new_producers` names the schedule in force, and if none did the
-                // genesis seed still stands.
+                // base above still stands.
                 self.reconstruct_schedule_from_log(start, end)?;
             }
         }
@@ -771,6 +832,12 @@ impl Controller {
         }
     }
 
+    /// Verify a block against the schedule active as of its parent, execute it
+    /// speculatively, and require our re-derived action and transaction merkle
+    /// roots to match the ones the header commits to. The VM reproduces block
+    /// ids bit-for-bit (see `block_ids_replay_bit_for_bit_from_serialized_bytes`),
+    /// so a divergent re-execution is rejected here rather than silently
+    /// accepted — there is no path that skips the root check.
     pub async fn verify_block(
         &mut self,
         block: &SignedBlock,
@@ -1181,15 +1248,18 @@ impl Controller {
     // executed via `execute_block` (verify/accept) or assembled in `build_block`,
     // otherwise a retained build session would commit state that diverges from
     // what validators compute.
-    fn finalize_block_resources(&mut self, block_num: u32) -> Result<(), ChainError> {
+    // The elastic CPU/NET block parameters derived from the chain config: the
+    // per-block ceiling (max) and the target the elastic limit relaxes toward.
+    fn block_elastic_parameters(
+        &self,
+    ) -> Result<(ElasticLimitParameters, ElasticLimitParameters), ChainError> {
         let global_property = Controller::get_global_properties(&self.db)?;
         let chain_config = global_property.get_chain_config();
-        let cpu_target = eos_percent(
-            chain_config.get_max_block_cpu_usage() as u64,
-            chain_config.get_target_block_cpu_usage_pct(),
-        );
         let cpu_elastic_parameters = ElasticLimitParameters::new(
-            cpu_target,
+            eos_percent(
+                chain_config.get_max_block_cpu_usage() as u64,
+                chain_config.get_target_block_cpu_usage_pct(),
+            ),
             chain_config.get_max_block_cpu_usage() as u64,
             BLOCK_CPU_USAGE_AVERAGE_WINDOW_MS / BLOCK_INTERVAL_MS,
             MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER,
@@ -1207,6 +1277,11 @@ impl Controller {
             make_ratio(99, 100),
             make_ratio(1000, 999),
         );
+        Ok((cpu_elastic_parameters, net_elastic_parameters))
+    }
+
+    fn finalize_block_resources(&mut self, block_num: u32) -> Result<(), ChainError> {
+        let (cpu_elastic_parameters, net_elastic_parameters) = self.block_elastic_parameters()?;
         ResourceLimitsManager::process_account_limit_updates(&mut self.db)?;
         ResourceLimitsManager::set_block_parameters(
             &mut self.db,
@@ -1334,6 +1409,195 @@ impl Controller {
         };
 
         return Ok(res);
+    }
+
+    // ----- state sync (Avalanche StateSyncableVM) -------------------------
+    //
+    // chainbase has no object serializer and its SHiP delta stream is lossy for
+    // reconstruction, so state moves as a physical copy of the arena file (see
+    // `Database::snapshot_bytes`). The summary itself is a small commitment; the
+    // snapshot payload is fetched separately, chunk by chunk, over the AppRequest
+    // channel (see `crate::chain::state_sync` and the node's sync manager). The
+    // producing side caches the snapshot it advertised so it can serve those
+    // chunks without re-snapshotting per request.
+
+    /// Produce a state summary for the last accepted block, caching the snapshot
+    /// it commits to so `serve_snapshot_chunk` can answer download requests.
+    ///
+    /// Snapshots the live arena when the cache is stale, so the caller must hold
+    /// the controller exclusively (no block being processed): `snapshot_bytes`
+    /// briefly drops and remaps the database.
+    pub fn produce_state_summary(&mut self) -> Result<StateSummary, ChainError> {
+        let height = self.last_accepted_block.block_num();
+
+        // Reuse the cached snapshot while it still commits to the tip; otherwise
+        // take a fresh one. Re-snapshotting scans the whole arena, so caching
+        // matters when a peer pulls many chunks for the same summary.
+        if self.snapshot_cache.as_ref().map(|c| c.height) != Some(height) {
+            let envelope = self.db.snapshot_bytes()?;
+            let hash = *Digest::hash(&envelope).as_bytes();
+            self.snapshot_cache = Some(CachedSnapshot {
+                height,
+                hash,
+                envelope,
+            });
+        }
+        let cache = self.snapshot_cache.as_ref().unwrap();
+
+        let block_bytes = self
+            .last_accepted_block
+            .pack()
+            .map_err(|e| ChainError::InternalError(format!("summary: pack block: {}", e)))?;
+        let schedule_bytes = self
+            .active_schedule
+            .pack()
+            .map_err(|e| ChainError::InternalError(format!("summary: pack schedule: {}", e)))?;
+        let bytes = state_sync::encode_summary_bytes(
+            &schedule_bytes,
+            &block_bytes,
+            cache.envelope.len() as u64,
+            &cache.hash,
+        );
+
+        Ok(StateSummary {
+            id: self.last_accepted_block_id.clone(),
+            height: height as u64,
+            bytes,
+        })
+    }
+
+    /// Read a summary's id and height without applying it.
+    pub fn parse_state_summary(bytes: &[u8]) -> Result<(Id, u64), ChainError> {
+        let target = state_sync::decode_summary_bytes(bytes)?;
+        Ok((target.block.id()?, target.height))
+    }
+
+    /// Parse a summary into a [`SyncTarget`] the sync manager can drive a
+    /// download from.
+    pub fn sync_target_from_summary(bytes: &[u8]) -> Result<state_sync::SyncTarget, ChainError> {
+        state_sync::decode_summary_bytes(bytes)
+    }
+
+    /// Serve one slice of the snapshot a peer is downloading. Answered only when
+    /// the cached snapshot matches the requested `height` and `hash`; a stale or
+    /// absent cache is an error the caller turns into an AppRequest failure so the
+    /// peer retries elsewhere or re-fetches the summary.
+    pub fn serve_snapshot_chunk(
+        &self,
+        height: u64,
+        hash: &[u8; 32],
+        offset: u64,
+        len: u32,
+    ) -> Result<Vec<u8>, ChainError> {
+        let cache = self
+            .snapshot_cache
+            .as_ref()
+            .ok_or_else(|| ChainError::InternalError("serve chunk: no snapshot cached".into()))?;
+        if cache.height as u64 != height || &cache.hash != hash {
+            return Err(ChainError::InternalError(
+                "serve chunk: request does not match the cached snapshot".into(),
+            ));
+        }
+        let start = offset as usize;
+        let end = start
+            .checked_add(len as usize)
+            .filter(|&e| e <= cache.envelope.len())
+            .ok_or_else(|| ChainError::InternalError("serve chunk: out of range".into()))?;
+        Ok(cache.envelope[start..end].to_vec())
+    }
+
+    /// Apply a downloaded snapshot: swap the arena to it, re-base the block log to
+    /// the snapshot's block, and adopt it as the tip.
+    ///
+    /// State sync fast-forwards past blocks this node never downloaded, so the
+    /// block log can't stay gapless from genesis — it is re-based to start at the
+    /// snapshot block, and the trace/chain-state logs are cleared to resume at the
+    /// next accepted block. The schedule in force at the snapshot is persisted so
+    /// a later restart recovers it. `envelope` has already been verified against
+    /// the summary hash by the download driver; `restore_from_bytes` re-checks its
+    /// internal checksum.
+    pub fn apply_state_snapshot(
+        &mut self,
+        block: SignedBlock,
+        schedule: ProducerSchedule,
+        envelope: &[u8],
+    ) -> Result<(), ChainError> {
+        let block_id = block.id()?;
+
+        // Drop speculative and cached blocks: after a sync the tip is the
+        // snapshot block, not anything we were building on.
+        self.clear_pending()?;
+        self.verified_blocks.clear();
+
+        // The chainbase revision advances one per accepted block, so the
+        // snapshot's revision must equal the summary block's height. Check it
+        // from the header first: a mismatch means the summary paired a block with
+        // a snapshot of different state, and we reject it before the swap rather
+        // than half-adopt an inconsistent tip.
+        let header = pulsevm_ffi::peek_snapshot_header(envelope)?;
+        if header.revision as u64 != block.block_num() as u64 {
+            return Err(ChainError::InternalError(format!(
+                "snapshot revision {} does not match summary block height {}",
+                header.revision,
+                block.block_num()
+            )));
+        }
+
+        // Swap chainbase to the snapshot's state; its revision becomes the
+        // snapshot height.
+        self.db.restore_from_bytes(envelope)?;
+
+        // Re-base the logs. The block log starts again at the snapshot block so a
+        // restart reconstructs the tip from here; the state-history logs have no
+        // entries for a block this node never executed, so they are cleared.
+        let packed_block = block
+            .pack()
+            .map_err(|e| ChainError::InternalError(format!("accept: pack block: {}", e)))?;
+        self.block_log
+            .as_ref()
+            .ok_or_else(|| ChainError::InternalError("accept: no block log".into()))?
+            .reset_to(block_id.clone(), &packed_block)
+            .map_err(|e| ChainError::InternalError(format!("accept: rebase block log: {}", e)))?;
+        if let Some(log) = self.trace_log.as_ref() {
+            log.clear().map_err(|e| {
+                ChainError::InternalError(format!("accept: clear trace log: {}", e))
+            })?;
+        }
+        if let Some(log) = self.chain_state_log.as_ref() {
+            log.clear().map_err(|e| {
+                ChainError::InternalError(format!("accept: clear chain state log: {}", e))
+            })?;
+        }
+
+        // Persist the schedule in force at the snapshot before adopting it, so a
+        // restart-after-sync recovers it (the re-based log's tip may not carry a
+        // schedule change).
+        self.write_synced_schedule(&schedule)?;
+        self.active_schedule = schedule;
+
+        self.last_accepted_block = block;
+        self.last_accepted_block_id = block_id.clone();
+        self.preferred_id = block_id;
+        // The cache commits to the pre-sync tip; drop it.
+        self.snapshot_cache = None;
+        Ok(())
+    }
+
+    fn write_synced_schedule(&self, schedule: &ProducerSchedule) -> Result<(), ChainError> {
+        let dir = self
+            .db_path
+            .as_ref()
+            .ok_or_else(|| ChainError::InternalError("accept: no db path".into()))?;
+        let packed = schedule
+            .pack()
+            .map_err(|e| ChainError::InternalError(format!("accept: pack schedule: {}", e)))?;
+        std::fs::write(std::path::Path::new(dir).join(SYNCED_SCHEDULE_FILE), packed)
+            .map_err(|e| ChainError::InternalError(format!("accept: write schedule: {}", e)))
+    }
+
+    fn load_synced_schedule(db_path: &str) -> Option<ProducerSchedule> {
+        let bytes = std::fs::read(std::path::Path::new(db_path).join(SYNCED_SCHEDULE_FILE)).ok()?;
+        ProducerSchedule::read_bounded(&bytes).ok()
     }
 
     pub fn get_block_id_for_num(&self, height: u32) -> Result<Option<Id>, ChainError> {
@@ -1736,6 +2000,14 @@ mod tests {
         memo: String,
     }
 
+    // System-contract action args for the bootstrap test.
+    // eosio.system::init(unsigned_int version, symbol core).
+    #[derive(Debug, Clone, Read, Write, NumBytes)]
+    struct SystemInit {
+        version: pulsevm_serialization::VarUint32,
+        core: Symbol,
+    }
+
     fn get_temp_dir() -> TempDir {
         tempfile::tempdir().expect("failed to create temp dir")
     }
@@ -1753,10 +2025,15 @@ mod tests {
                 "net_usage_leeway": 500,
                 "context_free_discount_net_usage_num": 20,
                 "context_free_discount_net_usage_den": 100,
-                "max_block_cpu_usage": 200000,
+                // Point-denominated budgets (see config::POINTS_PER_US): a row
+                // write costs ~16k points now that the db intrinsics are metered,
+                // and the multi-index reference contract does thousands of ops, so
+                // the old microsecond-scale 150k is far too small. Match the real
+                // chain's genesis.json so tests run under the deployed limits.
+                "max_block_cpu_usage": 3000000000u64,
                 "target_block_cpu_usage_pct": 2500,
-                "max_transaction_cpu_usage": 150000,
-                "min_transaction_cpu_usage": 100,
+                "max_transaction_cpu_usage": 1000000000,
+                "min_transaction_cpu_usage": 100000,
                 // The test transaction builders use TimePointSec::maximum() as the
                 // expiration ("never expires"); allow that by widening the lifetime
                 // window well past the default one hour.
@@ -2068,6 +2345,284 @@ mod tests {
                 action,
                 action_data.pack().unwrap(),
                 vec![PermissionLevel::new(account.as_u64(), ACTIVE_NAME.as_u64())],
+            )],
+        )
+        .sign(&private_key, &chain_id)?;
+        let packed_trx = PackedTransaction::from_signed_transaction(trx)?;
+        Ok(packed_trx)
+    }
+
+    fn fmt_res(r: &Result<TransactionResult, ChainError>) -> String {
+        match r {
+            Ok(_) => "OK".to_string(),
+            Err(e) => format!("ERR: {e}"),
+        }
+    }
+
+    /// End-to-end bootstrap of the real system contract
+    /// (reference_contracts/pulse_system.wasm) on this node: deploy the token,
+    /// create and issue the core token, create the fee/stake accounts the system
+    /// contract hardcodes (pulse.ram/ramfee/rex/stake — decoded from the wasm),
+    /// deploy the 80KB privileged system contract onto `pulse`, run `init`, bring
+    /// the RAM market to life with `setram`, and settle a real `buyrambsys`
+    /// purchase — the full resource-market path runs on this node.
+    ///
+    /// Action signatures match the Proton eosio.system source (our wasm is a
+    /// smaller build of it); args are packed directly here rather than via the ABI.
+    #[tokio::test]
+    async fn bootstrap_system_contract() -> Result<(), ChainError> {
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
+        let private_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let mut controller = Controller::new();
+        // Realistic CPU/NET limits (the committed genesis.json values, tx 1e9 /
+        // block 3e9), not the deliberately-tiny test genesis whose 150000 tx CPU
+        // budget can't even afford to deploy an 80KB contract.
+        let genesis_bytes = json!({
+            "initial_timestamp": "2023-01-01T00:00:00",
+            "initial_key": private_key.get_public_key().to_string(),
+            "initial_configuration": {
+                "max_block_net_usage": 1048576,
+                "target_block_net_usage_pct": 1000,
+                "max_transaction_net_usage": 524288,
+                "base_per_transaction_net_usage": 12,
+                "net_usage_leeway": 500,
+                "context_free_discount_net_usage_num": 20,
+                "context_free_discount_net_usage_den": 100,
+                "max_block_cpu_usage": 3000000000u32,
+                "target_block_cpu_usage_pct": 2500,
+                "max_transaction_cpu_usage": 1000000000u32,
+                "min_transaction_cpu_usage": 100,
+                "max_transaction_lifetime": 4294967295u32,
+                "max_inline_action_size": 4096,
+                "max_inline_action_depth": 6,
+                "max_authority_depth": 6,
+                "max_action_return_value_size": 256
+            }
+        })
+        .to_string()
+        .into_bytes();
+        let temp_path = get_temp_dir();
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": private_key.to_string(),
+        })
+        .to_string()
+        .into_bytes();
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &genesis_bytes.to_vec(),
+            temp_path.path().to_str().unwrap(),
+        )?;
+        let chain_id = controller.chain_id().clone();
+        let status = BlockStatus::Building;
+
+        // On main, genesis CPU/NET limits only take effect from end-of-block
+        // (set_block_parameters runs in finalize, not initialize), so block 1 is
+        // capped at the C++ default ~2M and can't afford an 80KB setcode. Advance
+        // one block so the genesis limits are live before we deploy — the block
+        // needs at least one transaction (empty blocks are gated), so create an
+        // ordinary account to carry it.
+        {
+            let mempool = Arc::new(RwLock::new(Mempool::new()));
+            let mut mempool = mempool.write().await;
+            mempool.add_transaction(create_account(
+                &private_key,
+                Name::from_str("alice")?,
+                chain_id,
+            )?);
+            let block = controller.build_block(&mut mempool).await?;
+            controller.accept_block(&block.id()?, &mut mempool)?;
+            eprintln!("SPIKE: advanced to block {}", block.block_num());
+        }
+        let ts = controller.last_accepted_block().timestamp().clone();
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let system_wasm =
+            fs::read(root.join(Path::new("reference_contracts/pulse_system.wasm"))).unwrap();
+        let token_wasm =
+            fs::read(root.join(Path::new("reference_contracts/pulse_token.wasm"))).unwrap();
+
+        let pulse = Name::from_str("pulse")?;
+        let token = Name::from_str("pulse.token")?;
+        // The core symbol init() records must equal the one the token is created
+        // with; derive both from the same Asset so they can't drift.
+        let max_supply = Asset::from_str("1000000000.0000 PULSE").unwrap();
+        let core = max_supply.symbol;
+
+        // Run one boot action; each step is a precondition for the next, so any
+        // failure fails the test with the offending step named.
+        macro_rules! step {
+            ($label:expr, $trx:expr) => {{
+                let r = controller.execute_transaction(&$trx, &ts, &status);
+                eprintln!("BOOT {}: {}", $label, fmt_res(&r));
+                assert!(r.is_ok(), "boot step failed [{}]: {}", $label, fmt_res(&r));
+            }};
+        }
+
+        // --- Bootstrap the token ---
+        step!(
+            "1 newaccount pulse.token",
+            create_account(&private_key, token, chain_id)?
+        );
+        step!(
+            "2 setcode pulse_token",
+            set_code(&private_key, token, token_wasm, chain_id)?
+        );
+        // create() requires the token contract's own authority.
+        step!(
+            "3 token create",
+            call_contract(
+                &private_key,
+                token,
+                Name::from_str("create")?,
+                &Create {
+                    issuer: pulse,
+                    max_supply,
+                },
+                chain_id,
+            )?
+        );
+        // issue() requires the issuer's (pulse's) authority, not the contract's.
+        step!(
+            "4 token issue",
+            call_contract_as(
+                &private_key,
+                token,
+                Name::from_str("issue")?,
+                &Issue {
+                    to: pulse,
+                    quantity: Asset::from_str("1000000.0000 PULSE").unwrap(),
+                    memo: "spike".to_string(),
+                },
+                pulse,
+                chain_id,
+            )?
+        );
+
+        // The system contract hardcodes these fee/stake accounts (decoded straight
+        // from the wasm's embedded name constants); init and the resource market
+        // reference them, so they must exist before init runs.
+        for acct in ["pulse.ram", "pulse.ramfee", "pulse.rex", "pulse.stake"] {
+            step!(
+                format!("4b newaccount {acct}"),
+                create_account(&private_key, Name::from_str(acct)?, chain_id)?
+            );
+        }
+
+        // --- Deploy + initialize the system contract ---
+        eprintln!("SPIKE: pulse_system.wasm is {} bytes", system_wasm.len());
+        step!(
+            "5 setcode pulse_system onto pulse",
+            set_code(&private_key, pulse, system_wasm, chain_id)?
+        );
+        step!(
+            "6 system init",
+            call_contract(
+                &private_key,
+                pulse,
+                Name::from_str("init")?,
+                &SystemInit {
+                    version: pulsevm_serialization::VarUint32(0),
+                    core,
+                },
+                chain_id,
+            )?
+        );
+
+        // --- Drive the resource market / governance ---
+        // init leaves the RAM market with no base liquidity in this build
+        // (free_ram() is 0 until max_ram_size is set), so a purchase prices to 0
+        // bytes. setram raises max_ram_size and adds the delta to the market base,
+        // bringing it to life. Signature (Proton eosio.system): setram(uint64).
+        #[derive(Debug, Clone, Read, Write, NumBytes)]
+        struct SetRam {
+            max_ram_size: u64,
+        }
+        step!(
+            "6b setram",
+            call_contract(
+                &private_key,
+                pulse,
+                Name::from_str("setram")?,
+                &SetRam {
+                    max_ram_size: 16 * 1024 * 1024 * 1024,
+                },
+                chain_id,
+            )?
+        );
+
+        // alice was created by the native newaccount handler, which (like EOSIO)
+        // leaves her resource limits unlimited (-1). buyram grants the receiver
+        // `current_ram_limit + gift`, so on an unlimited account that underflows to
+        // a tiny value and the account can't cover the rows the purchase writes. On
+        // a real chain the system contract's own newaccount meters accounts first;
+        // this 80KB build doesn't expose setalimits, so provision alice directly
+        // through the node (the same effect) before buying.
+        let alice = Name::from_str("alice")?;
+        {
+            let mut db = controller.database();
+            db.set_account_limits(alice.as_u64(), 8 * 1024, 1_000_000, 1_000_000)?;
+        }
+
+        // Drive the RAM market. Signatures confirmed against the Proton
+        // eosio.system source (this wasm is a smaller build of that contract):
+        // buyrambsys(name payer, name receiver, uint32 bytes) reserves a fixed
+        // number of RAM bytes, priced through the bancor market.
+        #[derive(Debug, Clone, Read, Write, NumBytes)]
+        struct BuyRamB {
+            payer: Name,
+            receiver: Name,
+            bytes: u32,
+        }
+        step!(
+            "7 buyrambsys for alice",
+            call_contract(
+                &private_key,
+                pulse,
+                Name::from_str("buyrambsys")?,
+                &BuyRamB {
+                    payer: pulse,
+                    receiver: alice,
+                    bytes: 8192,
+                },
+                chain_id,
+            )?
+        );
+
+        eprintln!("BOOT: system contract bootstrapped, initialized, and RAM purchased");
+        Ok(())
+    }
+
+    // Like `call_contract`, but authorizes an arbitrary actor@active instead of the
+    // contract account — needed for actions whose required authority is the caller
+    // (e.g. token `issue`, authorized by the issuer) rather than the contract.
+    fn call_contract_as<T: Write>(
+        private_key: &PrivateKey,
+        contract: Name,
+        action: Name,
+        action_data: &T,
+        authorizer: Name,
+        chain_id: Id,
+    ) -> Result<PackedTransaction, ChainError> {
+        let trx = Transaction::new(
+            TransactionHeader::new(TimePointSec::maximum(), 0, 0, 0u32.into(), 0, 0u32.into()),
+            vec![],
+            vec![Action::new(
+                contract,
+                action,
+                action_data.pack().unwrap(),
+                vec![PermissionLevel::new(
+                    authorizer.as_u64(),
+                    ACTIVE_NAME.as_u64(),
+                )],
             )],
         )
         .sign(&private_key, &chain_id)?;
@@ -4007,7 +4562,6 @@ mod tests {
     }
 
     /// ISO block timestamp -> Antelope slot (500ms interval, 2000-01-01 epoch).
-    #[cfg(feature = "arena-shadow")]
     fn iso_to_slot(iso: &str) -> u32 {
         let fmt = if iso.contains('.') {
             "%Y-%m-%dT%H:%M:%S%.f"
@@ -4026,7 +4580,6 @@ mod tests {
     /// header (proven id-exact) plus every transaction rebuilt from its wire
     /// data (signatures, compression, packed_trx, packed_context_free_data), so
     /// the block re-derives the same merkle roots on replay.
-    #[cfg(feature = "arena-shadow")]
     fn reconstruct_block(r: &serde_json::Value) -> Result<SignedBlock, ChainError> {
         use crate::chain::{
             block::SignedBlockHeader,
@@ -4762,6 +5315,74 @@ mod tests {
             temp_path.path().to_str().unwrap(),
         )?;
         Ok((controller, private_key, chain_id, temp_path))
+    }
+
+    // Bit-for-bit block-id parity across serialization and re-execution. A
+    // producer builds a real chain — onblock runs at the head of every block,
+    // plus an account-creating transaction — and each block is round-tripped
+    // through the wire format. A fresh node (new database from the same genesis)
+    // then replays every block through the production verify path, which enforces
+    // the action and transaction merkle roots. Every replayed block id must equal
+    // the producer's, and the reconstructed state must agree. This is the
+    // property that lets any node re-execute the chain and arrive at identical
+    // block ids, with no escape hatch.
+    #[tokio::test]
+    async fn block_ids_replay_bit_for_bit_from_serialized_bytes() -> Result<(), ChainError> {
+        let (mut producer, private_key, chain_id, _p_temp) = init_test_controller()?;
+        let mut p_mempool = Mempool::new();
+
+        let names = ["aaa", "bbb", "ccc", "ddd", "eee"];
+        let mut wire_blocks: Vec<Vec<u8>> = Vec::new();
+        let mut expected_ids: Vec<Id> = Vec::new();
+
+        for name in names {
+            p_mempool.add_transaction(create_account(
+                &private_key,
+                Name::from_str(name)?,
+                chain_id,
+            )?);
+            let block = producer.build_block(&mut p_mempool).await?;
+            producer.accept_block(&block.id()?, &mut p_mempool)?;
+            producer.set_preferred_id(block.id()?);
+
+            expected_ids.push(block.id()?);
+            wire_blocks.push(block.pack()?);
+        }
+
+        // Fresh node, new database, same genesis and chain id.
+        let (mut validator, _pk, _cid, _v_temp) = init_test_controller()?;
+        let mut v_mempool = Mempool::new();
+
+        for (i, bytes) in wire_blocks.iter().enumerate() {
+            let block = SignedBlock::read(bytes.as_slice(), &mut 0)?;
+            // Serialization must preserve the id (which commits to both roots).
+            assert_eq!(
+                block.id()?,
+                expected_ids[i],
+                "serialized block {i} did not round-trip to the same id"
+            );
+            // verify_block re-derives and enforces the merkle roots; a divergent
+            // re-execution (onblock receipt, sequences, trx receipts) fails here.
+            validator.verify_block(&block, &mut v_mempool).await?;
+            validator.accept_block(&block.id()?, &mut v_mempool)?;
+            validator.set_preferred_id(block.id()?);
+        }
+
+        assert_eq!(
+            validator.last_accepted_block_id,
+            *expected_ids.last().unwrap(),
+            "validator tip does not match the producer tip"
+        );
+        // The chain re-executed into the same state: every account is present.
+        let db = validator.database();
+        for name in names {
+            assert!(
+                !db.find_account(Name::from_str(name)?.as_u64())?.is_null(),
+                "account {name} missing after replay"
+            );
+        }
+
+        Ok(())
     }
 
     // A block built directly on the last accepted block retains its executed
@@ -5893,6 +6514,320 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn state_sync_transfers_state_tip_and_schedule() -> Result<(), ChainError> {
+        // End-to-end file-copy state sync, in process: a producer builds real
+        // state and a rotated schedule, a fresh node adopts it from the summary,
+        // and a restart of that node reconstructs the synced tip and schedule
+        // from the re-based block log plus the persisted schedule — never the
+        // stale genesis state it started from.
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
+        let private_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let genesis_bytes = generate_genesis(&private_key);
+        // A small arena keeps the snapshot copy cheap; the default is tens of GB.
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": private_key.to_string(),
+            "db_size": 128u64 * 1024 * 1024,
+        })
+        .to_string()
+        .into_bytes();
+        let init = |dir: &str| -> Result<Controller, ChainError> {
+            let mut c = Controller::new();
+            c.initialize(&chain_id, &config_bytes, &genesis_bytes.to_vec(), dir)?;
+            Ok(c)
+        };
+
+        let producer_temp = get_temp_dir();
+        let mut producer = init(producer_temp.path().to_str().unwrap())?;
+        let name = Name::from_str("glenn")?.as_u64();
+        let mut p_mempool = Mempool::new();
+        p_mempool.add_transaction(create_account(
+            &private_key,
+            Name::from_str("glenn")?,
+            chain_id,
+        )?);
+        let block = producer.build_block(&mut p_mempool).await?;
+        producer.accept_block(&block.id()?, &mut p_mempool)?;
+
+        // Rotate the schedule so it differs from the genesis seed — this is what
+        // the persisted-schedule path has to recover across a restart.
+        let rotated_key = PrivateKey::random();
+        producer.activate_producer_schedule(vec![ProducerKey {
+            producer_name: Name::from_str("pulse")?,
+            block_signing_key: rotated_key.get_public_key(),
+        }])?;
+        let producer_height = producer.last_accepted_block().block_num();
+        let producer_schedule = producer.active_schedule.clone();
+        assert_eq!(producer_schedule.version, 1);
+        assert!(!producer.database().find_account_metadata(name)?.is_null());
+
+        let summary = producer.produce_state_summary()?;
+        assert_eq!(summary.height, producer_height as u64);
+
+        // Syncing node: fresh genesis, so it has neither glenn nor the schedule.
+        let syncer_temp = get_temp_dir();
+        let syncer_path = syncer_temp.path().to_str().unwrap().to_string();
+        let mut syncer = init(&syncer_path)?;
+        assert!(syncer.database().find_account_metadata(name)?.is_null());
+
+        // Parse agrees with produce on the commitment.
+        let (parsed_id, parsed_height) = Controller::parse_state_summary(&summary.bytes)?;
+        assert_eq!(parsed_id, summary.id);
+        assert_eq!(parsed_height, producer_height as u64);
+
+        // Download the snapshot chunk by chunk from the producer, exactly as the
+        // P2P driver does — here the fetch is a direct call, not an AppRequest.
+        let target = Controller::sync_target_from_summary(&summary.bytes)?;
+        let (hash, height) = (target.hash, target.height);
+        let envelope = crate::chain::state_sync::download_snapshot(&target, |off, len| {
+            let chunk = producer.serve_snapshot_chunk(height, &hash, off, len);
+            async move { chunk }
+        })
+        .await?;
+
+        // Apply transfers state, tip, and schedule.
+        syncer.apply_state_snapshot(target.block.clone(), target.schedule.clone(), &envelope)?;
+        assert!(
+            !syncer.database().find_account_metadata(name)?.is_null(),
+            "state not transferred"
+        );
+        assert_eq!(syncer.last_accepted_block().block_num(), producer_height);
+        assert_eq!(syncer.last_accepted_block().id()?, summary.id);
+        assert_eq!(syncer.database().revision(), producer_height as i64);
+        assert_eq!(syncer.active_schedule, producer_schedule);
+
+        // Restart the synced node from its data directory.
+        syncer.shutdown()?;
+        let restarted = init(&syncer_path)?;
+        assert!(
+            !restarted.database().find_account_metadata(name)?.is_null(),
+            "synced state lost across restart"
+        );
+        assert_eq!(restarted.last_accepted_block().block_num(), producer_height);
+        assert_eq!(restarted.last_accepted_block().id()?, summary.id);
+        assert_eq!(
+            restarted.active_schedule, producer_schedule,
+            "synced schedule lost across restart"
+        );
+
+        Ok(())
+    }
+
+    /// End-to-end state sync over REAL testnet blocks. Replays blocks fetched by
+    /// scripts/fetch-blocks.sh into a producer, then has a fresh node sync the
+    /// resulting state by downloading the snapshot chunk by chunk (the exact
+    /// driver the P2P AppRequest path uses) and applying it — then restarts the
+    /// synced node to prove the re-based log persists. Ignored by default; run:
+    ///   PULSEVM_RPC_BLOCKS_DIR=/tmp/rpcblocks cargo test -p pulsevm_core \
+    ///     state_sync_real_testnet_blocks -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn state_sync_real_testnet_blocks() -> Result<(), ChainError> {
+        let Ok(dir) = std::env::var("PULSEVM_RPC_BLOCKS_DIR") else {
+            eprintln!("set PULSEVM_RPC_BLOCKS_DIR (see scripts/fetch-blocks.sh) to run");
+            return Ok(());
+        };
+        let chain_id =
+            Id::from_str("531a7002b4a4b67987f8706c01b965c76ffc3ad301608ac61a1f738cba6c3a9a")
+                .unwrap();
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+
+        // Collect the block fixtures in order.
+        let mut files: Vec<_> = fs::read_dir(&dir)
+            .expect("blocks dir")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().map(|x| x == "json").unwrap_or(false))
+            .collect();
+        files.sort();
+
+        // Patch genesis so our block 1 matches the testnet's: the real initial
+        // timestamp (block 1's) and the real system-account key (recovered from
+        // the first signed transaction). Same procedure as replay_testnet_blocks.
+        let b1: serde_json::Value =
+            serde_json::from_slice(&fs::read(files.first().expect("no block fixtures")).unwrap())
+                .unwrap();
+        assert_eq!(b1["result"]["block_num"].as_u64(), Some(1));
+        let ts = b1["result"]["timestamp"]
+            .as_str()
+            .unwrap()
+            .trim_end_matches(".000");
+        let mut g: serde_json::Value =
+            serde_json::from_slice(&fs::read(repo_root.join("genesis.json")).unwrap()).unwrap();
+        g["initial_timestamp"] = json!(ts);
+        for f in &files {
+            let v: serde_json::Value = serde_json::from_slice(&fs::read(f).unwrap()).unwrap();
+            let r = &v["result"];
+            if r["transactions"]
+                .as_array()
+                .map(|a| !a.is_empty())
+                .unwrap_or(false)
+            {
+                let b = reconstruct_block(r)?;
+                let keys = b.transactions[0]
+                    .trx()
+                    .get_signed_transaction()
+                    .recovered_keys(&chain_id)?;
+                if let Some(k) = keys.iter().next() {
+                    g["initial_key"] = json!(k.to_string());
+                }
+                break;
+            }
+        }
+        // Some early system transactions are billed far above the default 150ms
+        // per-transaction cap (privileged eosio actions bypass CPU limits on the
+        // real chain; our VM still enforces them), so raise the limits for replay
+        // — we only need these blocks to execute and build state.
+        if let Some(cfg) = g.get_mut("initial_configuration") {
+            cfg["max_transaction_cpu_usage"] = json!(4_000_000_000u64);
+            cfg["max_block_cpu_usage"] = json!(4_000_000_000u64);
+        }
+        let genesis_bytes = serde_json::to_vec(&g).unwrap();
+        // A small arena keeps the snapshot copy cheap; the default is tens of GB.
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": "PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez",
+            "db_size": 512u64 * 1024 * 1024,
+        })
+        .to_string()
+        .into_bytes();
+        let init = |dir: &str| -> Result<Controller, ChainError> {
+            let mut c = Controller::new();
+            c.initialize(&chain_id, &config_bytes, &genesis_bytes, dir)?;
+            Ok(c)
+        };
+
+        // ---- Producer: replay the real blocks to build authentic state. ----
+        let producer_temp = get_temp_dir();
+        let mut producer = init(producer_temp.path().to_str().unwrap())?;
+        assert_eq!(
+            producer.last_accepted_block().id()?.to_string(),
+            b1["result"]["id"].as_str().unwrap(),
+            "our genesis block id != testnet block 1 — genesis mismatch"
+        );
+
+        // getBlock omits the producer signature, so re-sign each block with a key
+        // we hold and seed the schedule with it (as replay_testnet_blocks does).
+        let block_signer =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        producer.active_schedule = ProducerSchedule {
+            version: 0,
+            producers: vec![ProducerKey {
+                producer_name: Name::from_str("pulse")?,
+                block_signing_key: block_signer.get_public_key(),
+            }],
+        };
+
+        let start = producer.last_accepted_block().block_num() + 1;
+        let mut mempool = Mempool::new();
+        let mut replayed = 0u32;
+        for f in &files {
+            // Skip any fixture that didn't fetch cleanly (a transient RPC error
+            // can leave a non-JSON file).
+            let Ok(bytes) = fs::read(f) else { continue };
+            let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                continue;
+            };
+            if v.get("result").and_then(|r| r.get("block_num")).is_none() {
+                continue;
+            }
+            let r = &v["result"];
+            let n = r["block_num"].as_u64().unwrap_or(0) as u32;
+            if n < start {
+                continue;
+            }
+            let mut block = reconstruct_block(r)?;
+            let sig_digest: crate::utils::Digest =
+                block.signed_block_header.header.sig_digest()?.0.into();
+            block.signed_block_header.signature = block_signer.sign(&sig_digest)?;
+            // This foreign fixture predates onblock, so its canonical merkle roots
+            // won't match a chain that runs onblock every block — replay stops at
+            // the first block whose roots we (correctly) re-derive differently.
+            // The self-contained state-sync coverage lives in
+            // state_sync_transfers_state_tip_and_schedule, which builds its state
+            // from our own onblock-running blocks.
+            if let Err(e) = producer.verify_block(&block, &mut mempool).await {
+                eprintln!("replay stalled at block {n}: {e:?}");
+                break;
+            }
+            producer.accept_block(&block.id()?, &mut mempool)?;
+            producer.set_preferred_id(block.id()?);
+            replayed += 1;
+        }
+        let height = producer.last_accepted_block().block_num();
+        assert!(
+            replayed >= 50,
+            "replayed only {replayed} blocks — too few for a meaningful sync test"
+        );
+        eprintln!("replayed {replayed} real blocks, tip at height {height}");
+        // The system account exists in the real chain's state.
+        let pulse = Name::from_str("pulse")?.as_u64();
+        assert!(!producer.database().find_account(pulse)?.is_null());
+
+        // ---- Sync: a fresh node downloads and applies the snapshot. ----
+        let summary = producer.produce_state_summary()?;
+        let producer_tip_id = producer.last_accepted_block().id()?;
+
+        let syncer_temp = get_temp_dir();
+        let syncer_path = syncer_temp.path().to_str().unwrap().to_string();
+        let mut syncer = init(&syncer_path)?;
+        assert!(
+            syncer.database().find_account(pulse)?.is_null()
+                || syncer.last_accepted_block().block_num() == 1,
+            "syncer should start from genesis, not the producer's height"
+        );
+
+        let target = Controller::sync_target_from_summary(&summary.bytes)?;
+        assert_eq!(target.height, height as u64);
+        let (hash, th) = (target.hash, target.height);
+        let envelope = crate::chain::state_sync::download_snapshot(&target, |off, len| {
+            let chunk = producer.serve_snapshot_chunk(th, &hash, off, len);
+            async move { chunk }
+        })
+        .await?;
+        eprintln!(
+            "downloaded {} snapshot bytes in {}-byte chunks",
+            envelope.len(),
+            crate::chain::state_sync::SNAPSHOT_CHUNK_LEN
+        );
+
+        syncer.apply_state_snapshot(target.block.clone(), target.schedule.clone(), &envelope)?;
+
+        // The synced node now holds the producer's tip, revision and state.
+        assert_eq!(syncer.last_accepted_block().block_num(), height);
+        assert_eq!(syncer.last_accepted_block().id()?, producer_tip_id);
+        assert_eq!(syncer.database().revision(), height as i64);
+        assert!(
+            !syncer.database().find_account(pulse)?.is_null(),
+            "system account missing after sync"
+        );
+        // Faithfulness: re-snapshotting the synced arena reproduces the exact
+        // payload hash the producer advertised — the transfer was lossless.
+        let re = syncer.produce_state_summary()?;
+        let re_target = Controller::sync_target_from_summary(&re.bytes)?;
+        assert_eq!(
+            re_target.hash, target.hash,
+            "re-snapshot of synced state does not match the producer's snapshot"
+        );
+
+        // A restart reconstructs the synced tip from the re-based block log.
+        syncer.shutdown()?;
+        let restarted = init(&syncer_path)?;
+        assert_eq!(restarted.last_accepted_block().block_num(), height);
+        assert_eq!(restarted.last_accepted_block().id()?, producer_tip_id);
+        assert!(!restarted.database().find_account(pulse)?.is_null());
+        eprintln!("synced node restarted cleanly at height {height}");
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn producer_schedule_reconstructed_from_block_log() -> Result<(), ChainError> {
         // A schedule change rides in the signed block header, so it is recovered
         // from the block log on restart — there is no out-of-band file to lose,
@@ -6180,29 +7115,35 @@ mod tests {
         let chain_id = controller.chain_id().clone();
         let status = BlockStatus::Building;
 
-        // Burns well over a million metering points: far above the 150k
-        // max_transaction_cpu_usage of the test genesis, far below the
-        // unlimited budget. Only the onblock and burn actions loop — the
-        // setcode action deploying this very contract also reaches apply
-        // (the receiver's code hash is read through a live reference after
-        // the native handler ran) and must not burn.
+        // Burns well over the per-transaction CPU limit of the test genesis
+        // (~1e9 points), far below the unlimited budget. The loop body is packed
+        // with f64.sqrt (a metered ~110 points each) so it overshoots the limit in
+        // a few hundred thousand iterations rather than a billion cheap spins, which
+        // keeps the onblock path (which runs it to completion) fast. Only the
+        // onblock and burn actions loop — the setcode action deploying this very
+        // contract also reaches apply (the receiver's code hash is read through a
+        // live reference after the native handler ran) and must not burn.
         let onblock = ONBLOCK_NAME.as_u64() as i64;
         let burn = Name::from_str("burn")?.as_u64() as i64;
+        let sqrts =
+            "(local.set $acc (f64.sqrt (f64.add (local.get $acc) (f64.const 1))))\n".repeat(32);
         let wasm = wat::parse_str(&format!(
             r#"
             (module
               (memory (export "memory") 1)
               (func (export "apply") (param i64 i64 i64)
-                (local $i i32)
+                (local $i i32) (local $acc f64)
                 (block $skip
                   (br_if $skip
                     (i32.and
                       (i64.ne (local.get 2) (i64.const {onblock}))
                       (i64.ne (local.get 2) (i64.const {burn}))))
-                  (local.set $i (i32.const 100000))
+                  (local.set $acc (f64.const 3.14159265358979))
+                  (local.set $i (i32.const 400000))
                   (block $exit
                     (loop $spin
                       (br_if $exit (i32.eqz (local.get $i)))
+                      {sqrts}
                       (local.set $i (i32.sub (local.get $i) (i32.const 1)))
                       (br $spin))))))
             "#,
@@ -6331,11 +7272,17 @@ mod tests {
 
         // Some(..) marks the transaction as explicitly billed, exactly as
         // execute_block supplies the block-recorded cpu/net during validation.
+        //
+        // The cpu figure has to clear `min_transaction_cpu_usage`, which genesis
+        // now sets to 100,000 — `validate_cpu_usage_to_bill` rejects a bill below
+        // the floor whether or not it is explicit. The amount is incidental to
+        // what this test asserts; billing the floor keeps it realistic, since a
+        // producer's recorded cpu is never below it either.
         let result = controller.execute_transaction_billed(
             &create_account(&private_key, Name::from_str("glenn")?, chain_id)?,
             &ts,
             &status,
-            Some((200, 12)),
+            Some((100_000, 12)),
         );
         if let Err(ChainError::DeadlineError(_)) = result {
             panic!("explicit-billed transaction must be exempt from the wall-clock deadline");
@@ -6389,6 +7336,107 @@ mod tests {
             Err(e) => panic!("expected a DeadlineError, got a different error: {e}"),
             Ok(_) => panic!("expected a DeadlineError, but the transaction succeeded"),
         }
+    }
+
+    // set_resource_limits lowering an account's RAM allowance below what it is
+    // already using must fail the transaction: the host has to schedule a RAM
+    // re-check when the limit shrank, exactly as add_ram_usage does on a growth.
+    // A privileged contract on pulse drives set_resource_limits against a victim
+    // account with a real, non-trivial RAM footprint (created via newaccount).
+    // Dropping its limit to 1 byte must be rejected with "insufficient ram";
+    // raising it well above usage — which is still a decrease from the genesis
+    // unlimited (-1) default, so it runs the same check — must be accepted.
+    #[tokio::test]
+    async fn set_resource_limits_below_usage_is_rejected() -> Result<(), ChainError> {
+        let (mut controller, private_key, _chain_id, _temp) = init_test_controller()?;
+        let ts = controller.last_accepted_block().timestamp().clone();
+        let chain_id = controller.chain_id().clone();
+        let status = BlockStatus::Building;
+
+        let victim = Name::from_str("victim")?;
+        controller.execute_transaction(
+            &create_account(&private_key, victim, chain_id)?,
+            &ts,
+            &status,
+        )?;
+
+        // A freshly created account already carries hundreds of bytes of account
+        // and permission state, so a 1-byte limit is unambiguously below usage.
+        let usage = controller
+            .database()
+            .get_account_ram_usage(victim.as_u64())?;
+        assert!(usage > 1, "expected the new account to be using RAM");
+
+        let shrink = Name::from_str("shrink")?.as_u64() as i64;
+        let grow = Name::from_str("grow")?.as_u64() as i64;
+        let victim_id = victim.as_u64() as i64;
+        let wasm = wat::parse_str(&format!(
+            r#"
+            (module
+              (import "env" "set_resource_limits"
+                (func $set (param i64 i64 i64 i64)))
+              (memory (export "memory") 1)
+              (func (export "apply") (param i64 i64 i64)
+                (block $done
+                  (block $grow
+                    (br_if $grow (i64.eq (local.get 2) (i64.const {grow})))
+                    (br_if $done (i64.ne (local.get 2) (i64.const {shrink})))
+                    (call $set (i64.const {victim_id}) (i64.const 1)
+                              (i64.const -1) (i64.const -1))
+                    (br $done))
+                  (call $set (i64.const {victim_id}) (i64.const 100000000)
+                            (i64.const -1) (i64.const -1)))))
+            "#,
+        ))
+        .unwrap();
+        controller.execute_transaction(
+            &set_code(&private_key, PULSE_NAME, wasm, chain_id)?,
+            &ts,
+            &status,
+        )?;
+
+        let res = controller.execute_transaction(
+            &call_contract(
+                &private_key,
+                PULSE_NAME,
+                Name::from_str("shrink")?,
+                &Vec::<u8>::new(),
+                chain_id,
+            )?,
+            &ts,
+            &status,
+        );
+        let err = match res {
+            Ok(_) => panic!("lowering the RAM limit below usage must be rejected"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("insufficient ram"),
+            "rejected for the wrong reason: {err}"
+        );
+
+        // The rejected transaction rolled back, so the limit is still unlimited.
+        controller.execute_transaction(
+            &call_contract(
+                &private_key,
+                PULSE_NAME,
+                Name::from_str("grow")?,
+                &Vec::<u8>::new(),
+                chain_id,
+            )?,
+            &ts,
+            &status,
+        )?;
+        let (mut ram, mut net, mut cpu) = (0i64, 0i64, 0i64);
+        controller
+            .database()
+            .get_account_limits(victim.as_u64(), &mut ram, &mut net, &mut cpu)?;
+        assert_eq!(
+            ram, 100_000_000,
+            "the accepted limit change did not persist"
+        );
+
+        Ok(())
     }
 
     #[tokio::test]

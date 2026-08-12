@@ -1,4 +1,12 @@
 use std::{
+    fs,
+    io::{
+        Read,
+        Seek,
+        SeekFrom,
+        Write,
+    },
+    path::Path,
     pin::Pin,
     sync::{
         Arc,
@@ -135,11 +143,36 @@ fn table_key(table: &TableObject) -> (u64, u64, u64) {
 #[derive(Clone)]
 pub struct Database {
     inner: Arc<RwLock<UniquePtr<ffi::Database>>>,
+    /// The directory and size the arena was opened with, kept so a snapshot can
+    /// close the mapping, copy `shared_memory.bin`, and remap at the same path
+    /// without threading the config back down from the controller.
+    path: String,
+    size: u64,
     /// The native pulsevm_arena mirror, shared across clones. Carried here so
     /// writes reach it through the same handle every apply/transaction context
     /// already uses (see `shadow.rs`). Only present in arena-shadow builds.
     #[cfg(feature = "arena-shadow")]
     shadow: Option<crate::shadow::ArenaShadow>,
+}
+
+/// chainbase's single memory-mapped arena file, relative to the database dir.
+const SHARED_MEMORY_FILE: &str = "shared_memory.bin";
+
+/// Read until `buf` is full or EOF, so each snapshot chunk is a fixed,
+/// block-aligned size regardless of how the OS splits the underlying reads —
+/// which keeps the sparse run boundaries (and thus the snapshot bytes)
+/// deterministic. Returns the number of bytes read (< `buf.len()` only at EOF).
+fn fill(f: &mut fs::File, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut total = 0;
+    while total < buf.len() {
+        match f.read(&mut buf[total..]) {
+            Ok(0) => break,
+            Ok(n) => total += n,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(total)
 }
 
 impl Database {
@@ -151,6 +184,8 @@ impl Database {
         } else {
             Ok(Database {
                 inner: Arc::new(RwLock::new(db)),
+                path: path.to_string(),
+                size,
                 #[cfg(feature = "arena-shadow")]
                 shadow: None,
             })
@@ -996,6 +1031,155 @@ impl Database {
         let mut db = self.inner.write()?;
         *db = UniquePtr::<ffi::Database>::null();
         Ok(())
+    }
+
+    /// Capture a physical snapshot of the current arena, wrapped in the
+    /// transport envelope (see `snapshot`).
+    ///
+    /// There is no live msync in chainbase, so the only way to read a
+    /// self-consistent `shared_memory.bin` is to drop the mapping first: the
+    /// destructor flushes dirty pages and clears the on-disk dirty flag. We then
+    /// read the clean file and remap exactly as a restart would. The write lock
+    /// is held across the whole window, so no other thread ever observes the
+    /// database in its momentarily-closed state, and we always remap — even if
+    /// the read fails — so a snapshot error never leaves the node with a closed
+    /// database.
+    ///
+    /// Call this only at a quiescent point (no open undo session): the copy
+    /// reflects whatever is committed to the arena at that instant.
+    pub fn snapshot_bytes(&self) -> Result<Vec<u8>, ChainError> {
+        let mut guard = self.inner.write()?;
+        if guard.is_null() {
+            return Err(ChainError::InternalError(
+                "snapshot: database is not open".into(),
+            ));
+        }
+        let revision = guard.revision();
+
+        // Tear the mapping down: flushes and clears the dirty flag on disk.
+        *guard = UniquePtr::<ffi::Database>::null();
+
+        let file = Path::new(&self.path).join(SHARED_MEMORY_FILE);
+        let snapshot = Self::read_sparse_snapshot(&file, revision);
+
+        // Remap before propagating any read error, so the database is never
+        // left closed behind us.
+        let mut db = ffi::open_database(&self.path, ffi::DatabaseOpenFlags::ReadWrite, self.size);
+        if db.is_null() {
+            return Err(ChainError::InternalError(
+                "snapshot: failed to reopen database after copy".into(),
+            ));
+        }
+        db.pin_mut().add_indices();
+        *guard = db;
+
+        snapshot
+    }
+
+    /// Read `shared_memory.bin` into a sparse, envelope-wrapped snapshot without
+    /// ever holding the whole (mostly-zero) file in memory. Fixed-size,
+    /// block-aligned chunks keep the run boundaries deterministic, so re-reading
+    /// an unchanged file yields byte-identical output.
+    fn read_sparse_snapshot(file: &Path, revision: i64) -> Result<Vec<u8>, ChainError> {
+        let mut f = fs::File::open(file).map_err(|e| {
+            ChainError::InternalError(format!("snapshot: open {}: {e}", file.display()))
+        })?;
+        let len = f
+            .metadata()
+            .map_err(|e| ChainError::InternalError(format!("snapshot: stat: {e}")))?
+            .len();
+
+        let mut payload = crate::snapshot::sparse_begin(len);
+        // A multiple of SPARSE_BLOCK, so every full chunk starts block-aligned.
+        let mut buf = vec![0u8; 4 * 1024 * 1024];
+        let mut offset = 0u64;
+        loop {
+            let n = fill(&mut f, &mut buf)
+                .map_err(|e| ChainError::InternalError(format!("snapshot: read: {e}")))?;
+            if n == 0 {
+                break;
+            }
+            crate::snapshot::sparse_append(&mut payload, offset, &buf[..n]);
+            offset += n as u64;
+        }
+        Ok(crate::snapshot::encode(revision, &payload))
+    }
+
+    /// Expand a validated sparse payload into `file`: write each run at its
+    /// offset over a freshly-truncated file, then extend to the logical length so
+    /// the unwritten remainder stays a (zeroed) hole.
+    fn write_sparse_snapshot(file: &Path, payload: &[u8]) -> Result<(), ChainError> {
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(file)
+            .map_err(|e| {
+                ChainError::InternalError(format!("restore: create {}: {e}", file.display()))
+            })?;
+        let logical_len = crate::snapshot::sparse_expand(payload, |off, data| {
+            f.seek(SeekFrom::Start(off))?;
+            f.write_all(data)
+        })?;
+        f.set_len(logical_len).map_err(|e| {
+            ChainError::InternalError(format!("restore: size {}: {e}", file.display()))
+        })?;
+        f.sync_all().map_err(|e| {
+            ChainError::InternalError(format!("restore: sync {}: {e}", file.display()))
+        })?;
+        Ok(())
+    }
+
+    /// Replace the live arena with the state carried in `snapshot`, in place.
+    ///
+    /// This is the accept side of state sync, where the database is already
+    /// open. The envelope is validated and the payload staged to a sibling file
+    /// while the current mapping is still up, so a bad snapshot never disturbs
+    /// the running database. Only then is the write lock taken to drop the
+    /// mapping, swap the file in atomically, and remap — the same
+    /// lock-held-across-the-whole-window discipline as `snapshot_bytes`, and it
+    /// always remaps so a failure never leaves the database closed.
+    pub fn restore_from_bytes(
+        &self,
+        snapshot: &[u8],
+    ) -> Result<crate::snapshot::SnapshotHeader, ChainError> {
+        // Validate and locate the payload before touching the running database.
+        let (header, payload) = crate::snapshot::decode(snapshot)?;
+
+        let dir = Path::new(&self.path);
+        let dest = dir.join(SHARED_MEMORY_FILE);
+        let staged = dir.join("shared_memory.bin.restore-tmp");
+        Self::write_sparse_snapshot(&staged, payload)?;
+
+        let mut guard = self.inner.write()?;
+        if guard.is_null() {
+            let _ = fs::remove_file(&staged);
+            return Err(ChainError::InternalError(
+                "restore: database is not open".into(),
+            ));
+        }
+
+        // Close the mapping so the backing file can be replaced, then swap the
+        // staged snapshot in atomically.
+        *guard = UniquePtr::<ffi::Database>::null();
+        let swap = fs::rename(&staged, &dest);
+
+        // Remap before propagating any error, so the database is never left
+        // closed. On a failed swap the original file is untouched, so this
+        // reopens the pre-restore state.
+        let mut db = ffi::open_database(&self.path, ffi::DatabaseOpenFlags::ReadWrite, self.size);
+        if db.is_null() {
+            return Err(ChainError::InternalError(
+                "restore: failed to reopen database".into(),
+            ));
+        }
+        db.pin_mut().add_indices();
+        *guard = db;
+
+        swap.map_err(|e| {
+            ChainError::InternalError(format!("restore: swap into {}: {e}", dest.display()))
+        })?;
+        Ok(header)
     }
 
     pub fn commit(&mut self, revision: i64) -> Result<(), ChainError> {
@@ -3762,6 +3946,139 @@ mod tests {
             "0100076163636f756e7401010e00000000000090b1ca0000000000"
         );
     }
+
+    // 64 MiB is a multiple of chainbase's 1 MiB sizing requirement and leaves
+    // ample room for a handful of rows, while keeping the file cheap to copy in
+    // a test.
+    const TEST_DB_SIZE: u64 = 64 * 1024 * 1024;
+
+    fn name_u64(s: &str) -> u64 {
+        string_to_name(s).unwrap().to_uint64_t()
+    }
+
+    #[test]
+    fn snapshot_round_trips_state() {
+        let src = TempDir::new().unwrap();
+        let src_path = src.path().to_str().unwrap();
+
+        let mut db = Database::new(src_path, TEST_DB_SIZE).unwrap();
+        db.add_indices().unwrap();
+        // Stamp the revision before any undo activity — chainbase refuses to set
+        // it while an undo stack exists. Then write committed rows directly.
+        db.set_revision(7).unwrap();
+
+        let alice = name_u64("alice");
+        let bob = name_u64("bob");
+        db.create_account(alice, 1).unwrap();
+        db.create_account(bob, 2).unwrap();
+
+        let snap = db.snapshot_bytes().unwrap();
+        assert_eq!(crate::snapshot::peek_header(&snap).unwrap().revision, 7);
+
+        // The source database keeps working after the close/reopen cycle.
+        assert!(!db.find_account(alice).unwrap().is_null());
+
+        // Restore into a fresh directory and open it as a node would on restart.
+        let dst = TempDir::new().unwrap();
+        let dst_path = dst.path().to_str().unwrap();
+        let header = restore_snapshot(dst_path, &snap).unwrap();
+        assert_eq!(header.revision, 7);
+
+        let mut db2 = Database::new(dst_path, TEST_DB_SIZE).unwrap();
+        db2.add_indices().unwrap();
+        assert_eq!(db2.revision(), 7);
+        assert!(!db2.find_account(alice).unwrap().is_null());
+        assert!(!db2.find_account(bob).unwrap().is_null());
+        assert!(db2.find_account(name_u64("carol")).unwrap().is_null());
+
+        // A file copy is faithful, so restore -> snapshot is a fixpoint: the
+        // payload out of the restored arena matches the payload that went in.
+        let snap2 = db2.snapshot_bytes().unwrap();
+        let payload = &snap[crate::snapshot::HEADER_LEN..];
+        let payload2 = &snap2[crate::snapshot::HEADER_LEN..];
+        assert_eq!(payload, payload2);
+    }
+
+    #[test]
+    fn restore_rejects_corrupt_snapshot() {
+        let src = TempDir::new().unwrap();
+        let mut db = Database::new(src.path().to_str().unwrap(), TEST_DB_SIZE).unwrap();
+        db.add_indices().unwrap();
+
+        let mut snap = db.snapshot_bytes().unwrap();
+        let last = snap.len() - 1;
+        snap[last] ^= 0xFF;
+
+        let dst = TempDir::new().unwrap();
+        let dst_path = dst.path().to_str().unwrap();
+        assert!(restore_snapshot(dst_path, &snap).is_err());
+        // The envelope is validated before anything touches disk.
+        assert!(!Path::new(dst_path).join(SHARED_MEMORY_FILE).exists());
+    }
+
+    #[test]
+    fn snapshot_on_closed_db_errors() {
+        let db = Database::default();
+        assert!(db.snapshot_bytes().is_err());
+    }
+
+    #[test]
+    fn restore_from_bytes_swaps_live_state() {
+        // Source arena: revision 3 with alice.
+        let src = TempDir::new().unwrap();
+        let mut a = Database::new(src.path().to_str().unwrap(), TEST_DB_SIZE).unwrap();
+        a.add_indices().unwrap();
+        a.set_revision(3).unwrap();
+        let alice = name_u64("alice");
+        a.create_account(alice, 1).unwrap();
+        let snap = a.snapshot_bytes().unwrap();
+
+        // Target arena: different state (revision 9 with bob).
+        let dst = TempDir::new().unwrap();
+        let mut b = Database::new(dst.path().to_str().unwrap(), TEST_DB_SIZE).unwrap();
+        b.add_indices().unwrap();
+        b.set_revision(9).unwrap();
+        let bob = name_u64("bob");
+        b.create_account(bob, 2).unwrap();
+
+        // Restoring the source snapshot into the live target replaces its state.
+        let header = b.restore_from_bytes(&snap).unwrap();
+        assert_eq!(header.revision, 3);
+        assert_eq!(b.revision(), 3);
+        assert!(
+            !b.find_account(alice).unwrap().is_null(),
+            "alice not restored"
+        );
+        assert!(
+            b.find_account(bob).unwrap().is_null(),
+            "bob's state survived"
+        );
+
+        // The target is still a working database after the swap.
+        let carol = name_u64("carol");
+        b.create_account(carol, 3).unwrap();
+        assert!(!b.find_account(carol).unwrap().is_null());
+    }
+
+    #[test]
+    fn restore_from_bytes_rejects_corrupt_without_disturbing_db() {
+        let src = TempDir::new().unwrap();
+        let mut a = Database::new(src.path().to_str().unwrap(), TEST_DB_SIZE).unwrap();
+        a.add_indices().unwrap();
+        a.set_revision(5).unwrap();
+        let alice = name_u64("alice");
+        a.create_account(alice, 1).unwrap();
+
+        let mut snap = a.snapshot_bytes().unwrap();
+        let last = snap.len() - 1;
+        snap[last] ^= 0xFF;
+
+        // A corrupt snapshot is rejected up front; the running database is
+        // untouched and still holds its own state.
+        assert!(a.restore_from_bytes(&snap).is_err());
+        assert_eq!(a.revision(), 5);
+        assert!(!a.find_account(alice).unwrap().is_null());
+    }
 }
 
 impl Database {
@@ -3976,6 +4293,8 @@ impl Default for Database {
     fn default() -> Self {
         Self {
             inner: Arc::new(RwLock::new(UniquePtr::null())),
+            path: String::new(),
+            size: 0,
             #[cfg(feature = "arena-shadow")]
             shadow: None,
         }
@@ -3984,3 +4303,27 @@ impl Default for Database {
 
 unsafe impl Send for Database {}
 unsafe impl Sync for Database {}
+
+/// Install a physical snapshot into `db_path`, ready to be opened normally.
+///
+/// The envelope is validated (magic, version, checksum) before anything touches
+/// disk, so a corrupt transfer is rejected here rather than surfacing as a
+/// chainbase open failure. The payload is written verbatim as
+/// `shared_memory.bin`; the snapshot was taken from a cleanly-closed mapping, so
+/// its dirty flag is clear and the directory opens without `allow_dirty`.
+///
+/// The caller must hold no open handle to `db_path` — this replaces the arena
+/// file wholesale. It is meant to run during bootstrap, before the controller
+/// opens the database. Returns the decoded header (notably the revision) so the
+/// caller can reconcile its block logs against the restored state.
+pub fn restore_snapshot(
+    db_path: &str,
+    snapshot: &[u8],
+) -> Result<crate::snapshot::SnapshotHeader, ChainError> {
+    let (header, payload) = crate::snapshot::decode(snapshot)?;
+    fs::create_dir_all(db_path)
+        .map_err(|e| ChainError::InternalError(format!("restore: create {db_path}: {e}")))?;
+    let file = Path::new(db_path).join(SHARED_MEMORY_FILE);
+    Database::write_sparse_snapshot(&file, payload)?;
+    Ok(header)
+}

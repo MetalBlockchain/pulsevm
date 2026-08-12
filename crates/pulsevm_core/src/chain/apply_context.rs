@@ -1986,6 +1986,10 @@ impl ApplyContext {
     ) -> Result<(), ChainError> {
         self.trx_context.set_proposed_producers(producers)
     }
+
+    pub fn validate_ram_usage(&self, account: &Name) -> Result<(), ChainError> {
+        self.trx_context.validate_ram_usage(account)
+    }
 }
 
 /// The `(code, scope, table, primary)` a live iterator points at, or `None` for

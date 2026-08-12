@@ -57,10 +57,10 @@ cpu_ops = BASE_OPS
 
 | Constant | Value | Notes |
 |---|---|---|
-| `BASE_OPS` | 100 | Minimum charge for any transaction |
+| `BASE_OPS` | 100,000 | Minimum charge for any transaction (`min_transaction_cpu_usage`) |
 | `ACTION_OPS` | 100 | Per action in the transaction |
 
-The 100-op floor mirrors Antelope's `min_transaction_cpu_usage = 100`, keeping the constant recognisable even though the unit has changed from microseconds to ops.
+The floor is `min_transaction_cpu_usage`, now **100,000** ops. It was carried over from Antelope as `100` while the unit was still nominally microseconds, but once the op unit was pinned to real time (`POINTS_PER_US = 38,000`, i.e. ~26 ps per op — see [intrinsic-cost-model.md](./intrinsic-cost-model.md)) a `100`-op floor is ~2.6 ns, far below the cost of a single host intrinsic, so it stopped acting as a floor at all. `100,000` ops ≈ 2.6 µs of reference compute — a meaningful minimum, and small next to the `max_transaction_cpu_usage` of 1,000,000,000. (`ACTION_OPS` is not yet separately calibrated.)
 
 `action_count` should be defined explicitly as **actions dispatched**, not actions declared in the transaction body — i.e. inline actions generated during execution each add `ACTION_OPS`. Otherwise a contract can fan out arbitrarily many inline actions while paying the dispatch overhead only once.
 
@@ -150,15 +150,15 @@ Account CPU budgets follow the Antelope elastic model, with units changed to ops
 - Block-level virtual capacity expands and contracts elastically based on recent block fullness, bounded by `maximum_elastic_resource_multiplier`
 - Greylisting clamps the multiplier to 1 for the affected account on speculative blocks only
 
-The following configuration values need to be redenominated from microseconds to ops before launch:
+These configuration values are redenominated from microseconds to ops in `genesis.json` (an op is ~26 ps of reference compute, `POINTS_PER_US = 38,000`):
 
-| Parameter | Antelope default (µs) | PulseVM (ops) |
-|---|---|---|
-| `max_block_cpu_usage` | 200,000 | TBD |
-| `max_transaction_cpu_usage` | 150,000 | TBD |
-| `min_transaction_cpu_usage` | 100 | 100 |
+| Parameter | Antelope default (µs) | PulseVM (ops) | ≈ reference time |
+|---|---|---|---|
+| `max_block_cpu_usage` | 200,000 | 3,000,000,000 | ~79 ms |
+| `max_transaction_cpu_usage` | 150,000 | 1,000,000,000 | ~26 ms |
+| `min_transaction_cpu_usage` | 100 | 100,000 | ~2.6 µs |
 
-The ratio between `max_transaction_cpu_usage` and `min_transaction_cpu_usage` sets the maximum spam amplification factor and should be chosen deliberately rather than carried over by analogy.
+The op values are sized directly against measured intrinsic costs rather than converted from the µs defaults by a fixed factor: a row write is ~16,000 ops and a key recovery ~1,650,000, so a transaction budget of 1,000,000,000 ops affords real work while staying under the u32 `cpu_usage` receipt field (~4.29e9 ops ≈ 113 ms). The ratio between `max_transaction_cpu_usage` and `min_transaction_cpu_usage` sets the maximum spam amplification factor and is chosen deliberately, not carried over by analogy.
 
 ### 3.6 Wall-clock deadline (subjective)
 
@@ -389,7 +389,7 @@ ram       = delta from any state mutation, billed normally
 
 ## 8. Open questions
 
-1. What are the ops-denominated values for `max_block_cpu_usage` and `max_transaction_cpu_usage`?
+1. ~~What are the ops-denominated values for `max_block_cpu_usage` and `max_transaction_cpu_usage`?~~ Resolved: set in `genesis.json` (3,000,000,000 / 1,000,000,000 / `min` 100,000) — see §3.5.
 2. Does `action_count` include inline actions dispatched during execution? (Recommended: yes.)
 3. Are context-free actions supported, and do they receive separate CPU accounting?
 4. Is native floating point permitted, or are floats routed through softfloat? (§6.5)
