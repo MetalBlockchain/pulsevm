@@ -165,6 +165,13 @@ Everything that returns a **value** is already served from the arena under
 - Plain-value authorization reads — `is_account`, `is_account_privileged`,
   `lookup_linked_permission`. `find_account` is retired from execution entirely
   (every caller only tested existence); its object read survives only in tests.
+- Permission authority — `DbRead::permission_authority` decodes the stored blob
+  into an owned `Authority`; the whole satisfaction walk runs on it under reads
+  (`oracle_permission_authority_serves_from_arena`).
+- Account-metadata receipt fields — `is_account_privileged`,
+  `account_metadata_code_abi_sequence`, and the arena-owned `next_recv_sequence`.
+- Contract wasm image — `get_code_bytes_by_hash` serves the bytecode the VM
+  compiles and runs (`oracle_contract_code_serves_from_arena`).
 
 ## What still reads/writes C++ during execution
 
@@ -174,10 +181,12 @@ Everything that returns a **value** is already served from the arena under
    `&AccountMetadataObject` escaping into execution), and serves the incremented
    value from the arena. The receipt scalars — `is_privileged`, `code_sequence`,
    `abi_sequence` — are served too (`is_account_privileged`,
-   `account_metadata_code_abi_sequence`). The only field still taken off the
-   chainbase object is `code_hash`, which flows straight into the wasm runtime
-   (`Id::from` + the code-object lookup); it converts with the code-object read
-   surface, not here.
+   `account_metadata_code_abi_sequence`). The code-object read itself is now
+   served (`get_code_bytes_by_hash` — the VM compiles arena bytecode). The only
+   value still taken off the chainbase metadata object is the `code_hash`
+   *identifier*, which flows into the wasm runtime as a `&CxxDigest`
+   (`Id::from` cache key); serving that owned would change `wasm_runtime::run`'s
+   signature and is deferred with the wider metadata-view flip.
 
 2. **Permission reads needing the full authority.** *Authorization satisfaction
    is now served.* `DbRead::permission_authority` decodes `PermissionRow.auth`
