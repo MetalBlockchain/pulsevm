@@ -1058,6 +1058,113 @@ impl Database {
         }
     }
 
+    /// Mirror an idx64 secondary-key update into the arena (the FFI
+    /// `update_index64_object` only touches chainbase; the caller resolves the
+    /// row's `(code, scope, table, primary)` from the iterator cache).
+    pub fn arena_update_index64(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary: u64,
+        payer: u64,
+        secondary: u64,
+    ) {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && let Err(e) = s.update_index64_object(code, scope, table, primary, payer, secondary)
+        {
+            eprintln!("arena mirror of update_index64_object diverged: {e:?}");
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        let _ = (code, scope, table, primary, payer, secondary);
+    }
+
+    pub fn arena_update_index128(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary: u64,
+        payer: u64,
+        secondary: u128,
+    ) {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && let Err(e) = s.update_index128_object(code, scope, table, primary, payer, secondary)
+        {
+            eprintln!("arena mirror of update_index128_object diverged: {e:?}");
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        let _ = (code, scope, table, primary, payer, secondary);
+    }
+
+    pub fn arena_update_index256(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary: u64,
+        payer: u64,
+        secondary: &U256,
+    ) {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && let Err(e) =
+                s.update_index256_object(code, scope, table, primary, payer, secondary.value)
+        {
+            eprintln!("arena mirror of update_index256_object diverged: {e:?}");
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        let _ = (code, scope, table, primary, payer, secondary);
+    }
+
+    pub fn arena_update_idx_double(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary: u64,
+        payer: u64,
+        secondary: u64,
+    ) {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && let Err(e) =
+                s.update_idx_double_object(code, scope, table, primary, payer, secondary)
+        {
+            eprintln!("arena mirror of update_idx_double_object diverged: {e:?}");
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        let _ = (code, scope, table, primary, payer, secondary);
+    }
+
+    pub fn arena_update_idx_long_double(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary: u64,
+        payer: u64,
+        secondary: &Float128,
+    ) {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && let Err(e) = s.update_idx_long_double_object(
+                code,
+                scope,
+                table,
+                primary,
+                payer,
+                (secondary.lo, secondary.hi),
+            )
+        {
+            eprintln!("arena mirror of update_idx_long_double_object diverged: {e:?}");
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        let _ = (code, scope, table, primary, payer, secondary);
+    }
+
     pub fn arena_idx64_last(&self, code: u64, scope: u64, table: u64) -> Option<(u64, u64)> {
         #[cfg(feature = "arena-shadow")]
         {

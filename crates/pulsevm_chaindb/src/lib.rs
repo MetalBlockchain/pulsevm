@@ -1142,7 +1142,12 @@ impl ArenaShadow {
             pos_fail: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             nc_ok: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             nc_fail: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            reads_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            // Serve execution from the arena from the outset when the cutover
+            // switch is set in the environment, so a node (or a whole test run)
+            // executes on arena-served reads without an explicit enable call.
+            reads_enabled: Arc::new(std::sync::atomic::AtomicBool::new(
+                std::env::var("PULSEVM_ARENA_READS").is_ok(),
+            )),
         })
     }
 
@@ -3807,6 +3812,36 @@ impl ArenaShadow {
         Ok(())
     }
 
+    /// Mirror of `db.update_index64_object`: re-point the row's secondary key (and
+    /// payer). The row count is unchanged, so no table refcount adjustment.
+    pub fn update_index64_object(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary_key: u64,
+        payer: u64,
+        secondary_key: u64,
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let Some(t_id) = db
+            .find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&(code, scope, table))?
+            .map(|t| t.id().raw())
+        else {
+            return Ok(());
+        };
+        let id = db
+            .find_by::<ContractIndex64Row, ContractIdx64ByPrimary>(&(t_id, primary_key))?
+            .map(|e| e.id());
+        if let Some(id) = id {
+            db.modify::<ContractIndex64Row>(id, |e| {
+                e.secondary_key = secondary_key;
+                e.payer = payer;
+            })?;
+        }
+        Ok(())
+    }
+
     pub fn remove_index64_object(
         &self,
         code: u64,
@@ -3853,6 +3888,35 @@ impl ArenaShadow {
         Ok(())
     }
 
+    pub fn update_index128_object(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary_key: u64,
+        payer: u64,
+        secondary_key: u128,
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let Some(t_id) = db
+            .find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&(code, scope, table))?
+            .map(|t| t.id().raw())
+        else {
+            return Ok(());
+        };
+        let id = db
+            .find_by::<ContractIndex128Row, ContractIdx128ByPrimary>(&(t_id, primary_key))?
+            .map(|e| e.id());
+        if let Some(id) = id {
+            db.modify::<ContractIndex128Row>(id, |e| {
+                e.sec_lo = secondary_key as u64;
+                e.sec_hi = (secondary_key >> 64) as u64;
+                e.payer = payer;
+            })?;
+        }
+        Ok(())
+    }
+
     pub fn remove_index128_object(
         &self,
         code: u64,
@@ -3895,6 +3959,34 @@ impl ArenaShadow {
             e.payer = payer;
         })?;
         contract_table_incr(&mut db, t_id)?;
+        Ok(())
+    }
+
+    pub fn update_index256_object(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary_key: u64,
+        payer: u64,
+        secondary_key: [u8; 32],
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let Some(t_id) = db
+            .find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&(code, scope, table))?
+            .map(|t| t.id().raw())
+        else {
+            return Ok(());
+        };
+        let id = db
+            .find_by::<ContractIndex256Row, ContractIdx256ByPrimary>(&(t_id, primary_key))?
+            .map(|e| e.id());
+        if let Some(id) = id {
+            db.modify::<ContractIndex256Row>(id, |e| {
+                e.secondary_key = secondary_key;
+                e.payer = payer;
+            })?;
+        }
         Ok(())
     }
 
@@ -3945,6 +4037,35 @@ impl ArenaShadow {
         Ok(())
     }
 
+    /// `secondary_key` is the raw IEEE-754 bit pattern, reinterpreted not converted.
+    pub fn update_idx_double_object(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary_key: u64,
+        payer: u64,
+        secondary_key: u64,
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let Some(t_id) = db
+            .find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&(code, scope, table))?
+            .map(|t| t.id().raw())
+        else {
+            return Ok(());
+        };
+        let id = db
+            .find_by::<ContractIndexDoubleRow, ContractIdxDoubleByPrimary>(&(t_id, primary_key))?
+            .map(|e| e.id());
+        if let Some(id) = id {
+            db.modify::<ContractIndexDoubleRow>(id, |e| {
+                e.secondary_key = f64::from_bits(secondary_key);
+                e.payer = payer;
+            })?;
+        }
+        Ok(())
+    }
+
     pub fn remove_idx_double_object(
         &self,
         code: u64,
@@ -3989,6 +4110,39 @@ impl ArenaShadow {
             e.payer = payer;
         })?;
         contract_table_incr(&mut db, t_id)?;
+        Ok(())
+    }
+
+    /// `secondary` is the `float128_t` as its `(lo, hi)` `u64` words.
+    pub fn update_idx_long_double_object(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary_key: u64,
+        payer: u64,
+        secondary: (u64, u64),
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let Some(t_id) = db
+            .find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&(code, scope, table))?
+            .map(|t| t.id().raw())
+        else {
+            return Ok(());
+        };
+        let id = db
+            .find_by::<ContractIndexLongDoubleRow, ContractIdxLongDoubleByPrimary>(&(
+                t_id,
+                primary_key,
+            ))?
+            .map(|e| e.id());
+        if let Some(id) = id {
+            db.modify::<ContractIndexLongDoubleRow>(id, |e| {
+                e.sec_lo = secondary.0;
+                e.sec_hi = secondary.1;
+                e.payer = payer;
+            })?;
+        }
         Ok(())
     }
 
