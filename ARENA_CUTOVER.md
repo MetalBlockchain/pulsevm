@@ -66,9 +66,30 @@ Roughly a third of the way. Remaining, in dependency order:
 
 2. **Make the arena the write path**, not a mirror. Today every mutation is
    `chainbase-write → arena-replay` (`database.rs` calls into
-   `pulsevm_chaindb`). Flip ownership; ensure the ~18 tables cover *all*
-   chainbase tables (a few are still unmirrored, e.g. the global resource
-   total-weight object noted in `pulsevm_chaindb`).
+   `pulsevm_chaindb`). Flip ownership.
+
+   **Table coverage is now complete for every live table.** The two live,
+   mutable tables that were previously unmirrored are closed:
+   - `global_property_object` (static `chain_config`) — `GlobalPropertyRow`,
+     seeded from chainbase at genesis and updated by `set_global_properties`
+     (the `setparams` intrinsic). Verified by `oracle_global_property_mirrors_setparams`
+     and the `global_property` entry in `cross_impl_tables`.
+   - `resource_limits_config_object` — `ResourceConfigRow` (elastic cpu/net
+     params + the two averaging windows), seeded at genesis and updated by
+     `set_block_parameters` end-of-block. Verified by the `resource_limits_config`
+     entry in `cross_impl_tables` (exercised by `oracle_cross_impl_full_state_root`,
+     which builds a block).
+
+   The remaining three chainbase indices are **intentionally not mirrored** and
+   are safe to leave until the write flip (document, don't port blindly):
+   - `protocol_state_object` — genesis-only in C++, read-only thereafter
+     (activated protocol features / key-type count); PulseVM activates none, so
+     it never changes. Mirror it only if/when a protocol-feature activation path
+     lands.
+   - `database_header_object` — a genesis-only db-version sigil, not consensus
+     state (leap excludes it from comparison too).
+   - `account_ram_correction_object` — registered but **never written** in this
+     tree (deferred-trx RAM correction is unsupported); dead state.
 
 3. **Full session/undo integration in the controller.** The nested
    build/verify/accept session stack (`controller.rs`) must drive the arena

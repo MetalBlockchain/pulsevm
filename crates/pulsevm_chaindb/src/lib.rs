@@ -212,6 +212,45 @@ pub struct ElasticParams {
     pub expand: (u64, u64),
 }
 
+/// Canonical serialization of a `resource_limits_config` (elastic cpu/net params
+/// plus averaging windows), little endian. Shared by the arena mirror and the
+/// chainbase side of the cross-impl root so both serialise identically.
+pub fn serialize_resource_config(
+    cpu: &ElasticParams,
+    net: &ElasticParams,
+    cpu_window: u32,
+    net_window: u32,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(128);
+    for v in [
+        cpu.target,
+        cpu.max,
+        cpu.contract.0,
+        cpu.contract.1,
+        cpu.expand.0,
+        cpu.expand.1,
+        net.target,
+        net.max,
+        net.contract.0,
+        net.contract.1,
+        net.expand.0,
+        net.expand.1,
+    ] {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    for v in [
+        cpu.periods,
+        cpu.max_multiplier,
+        net.periods,
+        net.max_multiplier,
+        cpu_window,
+        net_window,
+    ] {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out
+}
+
 /// Port of chainbase `update_elastic_limit`: contract the limit when average
 /// usage is over target, expand it otherwise, then clamp to `[max, max *
 /// max_multiplier]`. The ratio multiply matches the C++ `value * ratio` (u64
@@ -404,6 +443,139 @@ impl ArenaObject for CodeRow {
 struct DynGlobalPropertyRow {
     id: ObjectId<DynGlobalPropertyRow>,
     global_action_sequence: u64,
+}
+
+/// Arena mirror of the STATIC chainbase `global_property_object`, holding the
+/// active `chain_config` (blockchain parameters). Genesis creates the chainbase
+/// row in C++, out of reach of the per-write hooks, so the mirror is seeded once
+/// from chainbase at init and then updated in lockstep by `set_global_properties`
+/// (the `setparams` intrinsic). Only the fields chainbase exposes and the
+/// `chain_config` wire format carries are stored: `deferred_trx_expiration_window`
+/// (no chainbase getter, always 0 in this build) and `max_action_return_value_size`
+/// (not carried by the params intrinsic) are deliberately omitted so the mirror and
+/// chainbase serialise identically. Field order matches `ChainConfigV0`.
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout, ArenaObject)]
+#[arena(type_id = 19)]
+struct GlobalPropertyRow {
+    id: ObjectId<GlobalPropertyRow>,
+    max_block_net_usage: u64,
+    target_block_net_usage_pct: u32,
+    max_transaction_net_usage: u32,
+    base_per_transaction_net_usage: u32,
+    net_usage_leeway: u32,
+    context_free_discount_net_usage_num: u32,
+    context_free_discount_net_usage_den: u32,
+    max_block_cpu_usage: u32,
+    target_block_cpu_usage_pct: u32,
+    max_transaction_cpu_usage: u32,
+    min_transaction_cpu_usage: u32,
+    max_transaction_lifetime: u32,
+    max_transaction_delay: u32,
+    max_inline_action_size: u32,
+    max_inline_action_depth: u16,
+    max_authority_depth: u16,
+}
+
+/// Arena mirror of the chainbase `resource_limits_config_object` singleton: the
+/// elastic cpu/net limit parameters plus the account usage averaging windows.
+/// Genesis creates the chainbase row in C++; the mirror is seeded once from
+/// chainbase and the elastic params are updated by `set_block_parameters`
+/// (end-of-block). Storing them lets the arena compute virtual limits without
+/// re-reading chainbase.
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout, ArenaObject)]
+#[arena(type_id = 20)]
+struct ResourceConfigRow {
+    id: ObjectId<ResourceConfigRow>,
+    cpu_target: u64,
+    cpu_max: u64,
+    cpu_contract_num: u64,
+    cpu_contract_den: u64,
+    cpu_expand_num: u64,
+    cpu_expand_den: u64,
+    net_target: u64,
+    net_max: u64,
+    net_contract_num: u64,
+    net_contract_den: u64,
+    net_expand_num: u64,
+    net_expand_den: u64,
+    cpu_periods: u32,
+    cpu_max_multiplier: u32,
+    net_periods: u32,
+    net_max_multiplier: u32,
+    account_cpu_usage_average_window: u32,
+    account_net_usage_average_window: u32,
+}
+
+/// The subset of `chain_config` the mirror tracks, passed from the FFI seam into
+/// [`ArenaShadow::set_global_properties`]. Mirrors [`GlobalPropertyRow`]'s fields.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ChainConfigParams {
+    pub max_block_net_usage: u64,
+    pub target_block_net_usage_pct: u32,
+    pub max_transaction_net_usage: u32,
+    pub base_per_transaction_net_usage: u32,
+    pub net_usage_leeway: u32,
+    pub context_free_discount_net_usage_num: u32,
+    pub context_free_discount_net_usage_den: u32,
+    pub max_block_cpu_usage: u32,
+    pub target_block_cpu_usage_pct: u32,
+    pub max_transaction_cpu_usage: u32,
+    pub min_transaction_cpu_usage: u32,
+    pub max_transaction_lifetime: u32,
+    pub max_transaction_delay: u32,
+    pub max_inline_action_size: u32,
+    pub max_inline_action_depth: u16,
+    pub max_authority_depth: u16,
+}
+
+impl ChainConfigParams {
+    /// Canonical serialization shared by the arena mirror and the chainbase side
+    /// of the cross-impl root: 16 fields, little endian, `ChainConfigV0` order.
+    pub fn to_state_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(64);
+        out.extend_from_slice(&self.max_block_net_usage.to_le_bytes());
+        out.extend_from_slice(&self.target_block_net_usage_pct.to_le_bytes());
+        out.extend_from_slice(&self.max_transaction_net_usage.to_le_bytes());
+        out.extend_from_slice(&self.base_per_transaction_net_usage.to_le_bytes());
+        out.extend_from_slice(&self.net_usage_leeway.to_le_bytes());
+        out.extend_from_slice(&self.context_free_discount_net_usage_num.to_le_bytes());
+        out.extend_from_slice(&self.context_free_discount_net_usage_den.to_le_bytes());
+        out.extend_from_slice(&self.max_block_cpu_usage.to_le_bytes());
+        out.extend_from_slice(&self.target_block_cpu_usage_pct.to_le_bytes());
+        out.extend_from_slice(&self.max_transaction_cpu_usage.to_le_bytes());
+        out.extend_from_slice(&self.min_transaction_cpu_usage.to_le_bytes());
+        out.extend_from_slice(&self.max_transaction_lifetime.to_le_bytes());
+        out.extend_from_slice(&self.max_transaction_delay.to_le_bytes());
+        out.extend_from_slice(&self.max_inline_action_size.to_le_bytes());
+        out.extend_from_slice(&self.max_inline_action_depth.to_le_bytes());
+        out.extend_from_slice(&self.max_authority_depth.to_le_bytes());
+        out
+    }
+}
+
+impl GlobalPropertyRow {
+    fn params(&self) -> ChainConfigParams {
+        ChainConfigParams {
+            max_block_net_usage: self.max_block_net_usage,
+            target_block_net_usage_pct: self.target_block_net_usage_pct,
+            max_transaction_net_usage: self.max_transaction_net_usage,
+            base_per_transaction_net_usage: self.base_per_transaction_net_usage,
+            net_usage_leeway: self.net_usage_leeway,
+            context_free_discount_net_usage_num: self.context_free_discount_net_usage_num,
+            context_free_discount_net_usage_den: self.context_free_discount_net_usage_den,
+            max_block_cpu_usage: self.max_block_cpu_usage,
+            target_block_cpu_usage_pct: self.target_block_cpu_usage_pct,
+            max_transaction_cpu_usage: self.max_transaction_cpu_usage,
+            min_transaction_cpu_usage: self.min_transaction_cpu_usage,
+            max_transaction_lifetime: self.max_transaction_lifetime,
+            max_transaction_delay: self.max_transaction_delay,
+            max_inline_action_size: self.max_inline_action_size,
+            max_inline_action_depth: self.max_inline_action_depth,
+            max_authority_depth: self.max_authority_depth,
+        }
+    }
 }
 
 /// Arena mirror of chainbase `transaction_object`, the per-block duplicate-trx
@@ -929,6 +1101,8 @@ fn build_registered_db() -> Result<Db, DbError> {
     db.add_table::<PermissionLinkRow>()?;
     db.add_table::<CodeRow>()?;
     db.add_table::<DynGlobalPropertyRow>()?;
+    db.add_table::<GlobalPropertyRow>()?;
+    db.add_table::<ResourceConfigRow>()?;
     db.add_table::<TransactionRow>()?;
     db.add_table::<ContractTableRow>()?;
     db.add_table::<ContractKeyValueRow>()?;
@@ -2220,6 +2394,168 @@ impl ArenaShadow {
             .iter()
             .next()
             .map(|r| r.global_action_sequence)
+    }
+
+    // ----- global_property_object (static chain_config) ---------------------
+
+    /// Mirrors a write to the static `global_property_object`: creates the
+    /// singleton `chain_config` row on first call (genesis seed) and modifies it
+    /// in place thereafter (`setparams`).
+    pub fn set_global_properties(&self, p: ChainConfigParams) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let apply = |r: &mut GlobalPropertyRow| {
+            r.max_block_net_usage = p.max_block_net_usage;
+            r.target_block_net_usage_pct = p.target_block_net_usage_pct;
+            r.max_transaction_net_usage = p.max_transaction_net_usage;
+            r.base_per_transaction_net_usage = p.base_per_transaction_net_usage;
+            r.net_usage_leeway = p.net_usage_leeway;
+            r.context_free_discount_net_usage_num = p.context_free_discount_net_usage_num;
+            r.context_free_discount_net_usage_den = p.context_free_discount_net_usage_den;
+            r.max_block_cpu_usage = p.max_block_cpu_usage;
+            r.target_block_cpu_usage_pct = p.target_block_cpu_usage_pct;
+            r.max_transaction_cpu_usage = p.max_transaction_cpu_usage;
+            r.min_transaction_cpu_usage = p.min_transaction_cpu_usage;
+            r.max_transaction_lifetime = p.max_transaction_lifetime;
+            r.max_transaction_delay = p.max_transaction_delay;
+            r.max_inline_action_size = p.max_inline_action_size;
+            r.max_inline_action_depth = p.max_inline_action_depth;
+            r.max_authority_depth = p.max_authority_depth;
+        };
+        let existing = db
+            .table::<GlobalPropertyRow>()?
+            .iter()
+            .next()
+            .map(|r| r.id());
+        match existing {
+            Some(id) => db.modify::<GlobalPropertyRow>(id, apply)?,
+            None => {
+                db.create::<GlobalPropertyRow>(apply)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Canonical serialization of the mirrored `chain_config` (16 fields, little
+    /// endian, `ChainConfigV0` order), or empty when the singleton has not been
+    /// seeded — byte-compatible with the chainbase `global_property_state_bytes`.
+    pub fn global_property_state_bytes(&self) -> Vec<u8> {
+        let db = self.lock();
+        match db
+            .table::<GlobalPropertyRow>()
+            .ok()
+            .and_then(|t| t.iter().next().copied())
+        {
+            Some(r) => r.params().to_state_bytes(),
+            None => Vec::new(),
+        }
+    }
+
+    // ----- resource_limits_config_object ------------------------------------
+
+    /// Seeds the singleton `resource_limits_config` mirror from chainbase at
+    /// genesis: elastic cpu/net params plus the two averaging windows.
+    pub fn seed_resource_config(
+        &self,
+        cpu: ElasticParams,
+        net: ElasticParams,
+        cpu_window: u32,
+        net_window: u32,
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let apply = |r: &mut ResourceConfigRow| {
+            Self::apply_elastic(r, &cpu, &net);
+            r.account_cpu_usage_average_window = cpu_window;
+            r.account_net_usage_average_window = net_window;
+        };
+        let existing = db
+            .table::<ResourceConfigRow>()?
+            .iter()
+            .next()
+            .map(|r| r.id());
+        match existing {
+            Some(id) => db.modify::<ResourceConfigRow>(id, apply)?,
+            None => {
+                db.create::<ResourceConfigRow>(apply)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Mirrors `set_block_parameters`: updates only the elastic cpu/net params of
+    /// the singleton (the averaging windows are genesis constants, left as seeded).
+    pub fn set_block_parameters(
+        &self,
+        cpu: ElasticParams,
+        net: ElasticParams,
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let apply = |r: &mut ResourceConfigRow| Self::apply_elastic(r, &cpu, &net);
+        let existing = db
+            .table::<ResourceConfigRow>()?
+            .iter()
+            .next()
+            .map(|r| r.id());
+        match existing {
+            Some(id) => db.modify::<ResourceConfigRow>(id, apply)?,
+            None => {
+                db.create::<ResourceConfigRow>(apply)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_elastic(r: &mut ResourceConfigRow, cpu: &ElasticParams, net: &ElasticParams) {
+        r.cpu_target = cpu.target;
+        r.cpu_max = cpu.max;
+        r.cpu_periods = cpu.periods;
+        r.cpu_max_multiplier = cpu.max_multiplier;
+        r.cpu_contract_num = cpu.contract.0;
+        r.cpu_contract_den = cpu.contract.1;
+        r.cpu_expand_num = cpu.expand.0;
+        r.cpu_expand_den = cpu.expand.1;
+        r.net_target = net.target;
+        r.net_max = net.max;
+        r.net_periods = net.periods;
+        r.net_max_multiplier = net.max_multiplier;
+        r.net_contract_num = net.contract.0;
+        r.net_contract_den = net.contract.1;
+        r.net_expand_num = net.expand.0;
+        r.net_expand_den = net.expand.1;
+    }
+
+    /// Canonical serialization of the mirrored `resource_limits_config`, or empty
+    /// when unseeded — byte-compatible with the chainbase `resource_config_state_bytes`.
+    pub fn resource_config_state_bytes(&self) -> Vec<u8> {
+        let db = self.lock();
+        let Some(r) = db
+            .table::<ResourceConfigRow>()
+            .ok()
+            .and_then(|t| t.iter().next().copied())
+        else {
+            return Vec::new();
+        };
+        let cpu = ElasticParams {
+            target: r.cpu_target,
+            max: r.cpu_max,
+            periods: r.cpu_periods,
+            max_multiplier: r.cpu_max_multiplier,
+            contract: (r.cpu_contract_num, r.cpu_contract_den),
+            expand: (r.cpu_expand_num, r.cpu_expand_den),
+        };
+        let net = ElasticParams {
+            target: r.net_target,
+            max: r.net_max,
+            periods: r.net_periods,
+            max_multiplier: r.net_max_multiplier,
+            contract: (r.net_contract_num, r.net_contract_den),
+            expand: (r.net_expand_num, r.net_expand_den),
+        };
+        serialize_resource_config(
+            &cpu,
+            &net,
+            r.account_cpu_usage_average_window,
+            r.account_net_usage_average_window,
+        )
     }
 
     // ----- transaction_object -----------------------------------------------

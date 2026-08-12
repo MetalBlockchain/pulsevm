@@ -96,6 +96,55 @@ fn to_elastic_params(p: &ElasticLimitParameters) -> crate::shadow::ElasticParams
     }
 }
 
+/// Reads the active `chain_config` from a chainbase `CxxChainConfig` into the
+/// plain params the arena mirror stores. Only the fields both sides carry (see
+/// [`crate::shadow::ChainConfigParams`]).
+#[cfg(feature = "arena-shadow")]
+fn chain_config_params_from_cxx(c: &ffi::CxxChainConfig) -> crate::shadow::ChainConfigParams {
+    crate::shadow::ChainConfigParams {
+        max_block_net_usage: c.get_max_block_net_usage(),
+        target_block_net_usage_pct: c.get_target_block_net_usage_pct(),
+        max_transaction_net_usage: c.get_max_transaction_net_usage(),
+        base_per_transaction_net_usage: c.get_base_per_transaction_net_usage(),
+        net_usage_leeway: c.get_net_usage_leeway(),
+        context_free_discount_net_usage_num: c.get_context_free_discount_net_usage_num(),
+        context_free_discount_net_usage_den: c.get_context_free_discount_net_usage_den(),
+        max_block_cpu_usage: c.get_max_block_cpu_usage(),
+        target_block_cpu_usage_pct: c.get_target_block_cpu_usage_pct(),
+        max_transaction_cpu_usage: c.get_max_transaction_cpu_usage(),
+        min_transaction_cpu_usage: c.get_min_transaction_cpu_usage(),
+        max_transaction_lifetime: c.get_max_transaction_lifetime(),
+        max_transaction_delay: c.get_max_transaction_delay(),
+        max_inline_action_size: c.get_max_inline_action_size(),
+        max_inline_action_depth: c.get_max_inline_action_depth(),
+        max_authority_depth: c.get_max_authority_depth(),
+    }
+}
+
+/// The same params from the `ChainConfigV0` a `setparams` intrinsic just wrote —
+/// so the mirror updates to exactly what chainbase was handed.
+#[cfg(feature = "arena-shadow")]
+fn chain_config_params_from_v0(cfg: &ChainConfigV0) -> crate::shadow::ChainConfigParams {
+    crate::shadow::ChainConfigParams {
+        max_block_net_usage: cfg.max_block_net_usage,
+        target_block_net_usage_pct: cfg.target_block_net_usage_pct,
+        max_transaction_net_usage: cfg.max_transaction_net_usage,
+        base_per_transaction_net_usage: cfg.base_per_transaction_net_usage,
+        net_usage_leeway: cfg.net_usage_leeway,
+        context_free_discount_net_usage_num: cfg.context_free_discount_net_usage_num,
+        context_free_discount_net_usage_den: cfg.context_free_discount_net_usage_den,
+        max_block_cpu_usage: cfg.max_block_cpu_usage,
+        target_block_cpu_usage_pct: cfg.target_block_cpu_usage_pct,
+        max_transaction_cpu_usage: cfg.max_transaction_cpu_usage,
+        min_transaction_cpu_usage: cfg.min_transaction_cpu_usage,
+        max_transaction_lifetime: cfg.max_transaction_lifetime,
+        max_transaction_delay: cfg.max_transaction_delay,
+        max_inline_action_size: cfg.max_inline_action_size,
+        max_inline_action_depth: cfg.max_inline_action_depth,
+        max_authority_depth: cfg.max_authority_depth,
+    }
+}
+
 /// Serializes an [`Authority`] into the deterministic byte layout the arena
 /// mirror stores for `permission_object::auth` (a `shared_authority`). The exact
 /// encoding is private to the mirror; it only has to be stable so equal
@@ -1295,6 +1344,42 @@ impl Database {
                 }
                 Err(e) => eprintln!("arena mirror could not read genesis resource_limits: {e:?}"),
             }
+            // Genesis creates the static global_property_object (chain_config) in
+            // C++, below the mirror hooks; seed it once from chainbase. Later
+            // setparams calls flow through the live path.
+            match self.read_chain_config_params() {
+                Ok(params) => {
+                    if let Some(s) = &self.shadow
+                        && let Err(e) = s.set_global_properties(params)
+                    {
+                        eprintln!("arena mirror could not seed genesis global_property: {e:?}");
+                    }
+                }
+                Err(e) => eprintln!("arena mirror could not read genesis global_property: {e:?}"),
+            }
+            // Genesis creates resource_limits_config_object (elastic cpu/net params
+            // + averaging windows) in C++; seed it once from chainbase. Later
+            // set_block_parameters updates the elastic params in lockstep.
+            match (
+                self.get_cpu_limit_parameters(),
+                self.get_net_limit_parameters(),
+                self.get_account_cpu_usage_average_window(),
+                self.get_account_net_usage_average_window(),
+            ) {
+                (Ok(cpu), Ok(net), Ok(cpu_w), Ok(net_w)) => {
+                    if let Some(s) = &self.shadow
+                        && let Err(e) = s.seed_resource_config(
+                            to_elastic_params(&cpu),
+                            to_elastic_params(&net),
+                            cpu_w,
+                            net_w,
+                        )
+                    {
+                        eprintln!("arena mirror could not seed genesis resource_config: {e:?}");
+                    }
+                }
+                _ => eprintln!("arena mirror could not read genesis resource_config params"),
+            }
         }
         Ok(())
     }
@@ -1905,12 +1990,55 @@ impl Database {
         cpu_limit_parameters: &ElasticLimitParameters,
         net_limit_parameters: &ElasticLimitParameters,
     ) -> Result<(), ChainError> {
-        let mut guard = self.locked_write()?;
-        let pinned = guard.pin_mut();
+        {
+            let mut guard = self.locked_write()?;
+            let pinned = guard.pin_mut();
 
-        pinned
-            .set_block_parameters(cpu_limit_parameters, net_limit_parameters)
-            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+            pinned
+                .set_block_parameters(cpu_limit_parameters, net_limit_parameters)
+                .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        }
+
+        // Mirror the elastic cpu/net params into the arena resource_limits_config
+        // (the averaging windows are genesis constants, left as seeded).
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && let Err(e) = s.set_block_parameters(
+                to_elastic_params(cpu_limit_parameters),
+                to_elastic_params(net_limit_parameters),
+            )
+        {
+            eprintln!("arena mirror of set_block_parameters diverged: {e:?}");
+        }
+
+        Ok(())
+    }
+
+    /// Canonical serialization of the chainbase `resource_limits_config_object` —
+    /// byte-compatible with the arena mirror's `resource_config_state_bytes`.
+    #[cfg(feature = "arena-shadow")]
+    pub fn resource_config_state_bytes(&self) -> Result<Vec<u8>, ChainError> {
+        let cpu = to_elastic_params(&self.get_cpu_limit_parameters()?);
+        let net = to_elastic_params(&self.get_net_limit_parameters()?);
+        let cpu_window = self.get_account_cpu_usage_average_window()?;
+        let net_window = self.get_account_net_usage_average_window()?;
+        Ok(crate::shadow::serialize_resource_config(
+            &cpu, &net, cpu_window, net_window,
+        ))
+    }
+
+    /// Arena mirror of resource_limits_config, `None` when shadowing is off.
+    pub fn arena_resource_config_state_bytes(&self) -> Option<Vec<u8>> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow
+                .as_ref()
+                .map(|s| s.resource_config_state_bytes())
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            None
+        }
     }
 
     pub fn process_block_usage(&mut self, block_num: u32) -> Result<(), ChainError> {
@@ -3714,14 +3842,58 @@ impl Database {
     }
 
     pub fn set_global_properties(&self, cfg: &ChainConfigV0) -> Result<(), ChainError> {
-        let mut guard = self.locked_write()?;
-        let pinned = guard.pin_mut();
+        {
+            let mut guard = self.locked_write()?;
+            let pinned = guard.pin_mut();
 
-        pinned
-            .set_global_properties(cfg)
-            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+            pinned
+                .set_global_properties(cfg)
+                .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        }
+
+        // Mirror the same chain_config into the arena (drops the chainbase lock
+        // first — the shadow takes its own).
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && let Err(e) = s.set_global_properties(chain_config_params_from_v0(cfg))
+        {
+            eprintln!("arena mirror of set_global_properties diverged: {e:?}");
+        }
 
         Ok(())
+    }
+
+    /// Reads the active chain_config from chainbase into the mirror's param form.
+    #[cfg(feature = "arena-shadow")]
+    fn read_chain_config_params(&self) -> Result<crate::shadow::ChainConfigParams, ChainError> {
+        let guard = self.inner.read()?;
+        let gpo = guard
+            .get_global_properties()
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        Ok(chain_config_params_from_cxx(gpo.get_chain_config()))
+    }
+
+    /// Canonical serialization of the chainbase static `global_property_object`
+    /// chain_config — byte-compatible with the arena mirror's
+    /// `global_property_state_bytes`, for the cross-impl root.
+    #[cfg(feature = "arena-shadow")]
+    pub fn global_property_state_bytes(&self) -> Result<Vec<u8>, ChainError> {
+        Ok(self.read_chain_config_params()?.to_state_bytes())
+    }
+
+    /// Arena mirror of the static global_property chain_config, `None` when
+    /// shadowing is off.
+    pub fn arena_global_property_state_bytes(&self) -> Option<Vec<u8>> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow
+                .as_ref()
+                .map(|s| s.global_property_state_bytes())
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            None
+        }
     }
 
     pub fn get_virtual_block_cpu_limit(&self) -> Result<u64, ChainError> {

@@ -3476,6 +3476,92 @@ mod tests {
         Ok(())
     }
 
+    /// Static global_property (chain_config) oracle. Genesis seeds the mirror from
+    /// chainbase (below the per-write hooks), and a `setparams`-style write must
+    /// then update both in lockstep. Assert the mirror equals chainbase at genesis
+    /// and again after a config change, and that the change is actually observed.
+    #[cfg(feature = "arena-shadow")]
+    #[tokio::test]
+    async fn oracle_global_property_mirrors_setparams() -> Result<(), ChainError> {
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
+        let private_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let mut controller = Controller::new();
+        let genesis_bytes = generate_genesis(&private_key);
+        let temp_path = get_temp_dir();
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": private_key.to_string(),
+        })
+        .to_string()
+        .into_bytes();
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &genesis_bytes.to_vec(),
+            temp_path.path().to_str().unwrap(),
+        )?;
+        let db = controller.database();
+
+        // Genesis: the mirror was seeded from chainbase, so both sides match and
+        // the config is non-empty.
+        let genesis_chain = db.global_property_state_bytes()?;
+        let genesis_arena = db
+            .arena_global_property_state_bytes()
+            .expect("arena is missing the global_property row after genesis");
+        assert!(
+            !genesis_chain.is_empty(),
+            "genesis chain_config serialized empty"
+        );
+        assert_eq!(
+            genesis_chain, genesis_arena,
+            "genesis-seeded global_property diverged from chainbase"
+        );
+
+        // Read the active config, change fields of both widths (u32 + u16), and
+        // write it back through the same path a setparams intrinsic uses.
+        let gpo = Controller::get_global_properties(&db)?;
+        let c = gpo.get_chain_config();
+        let cfg = pulsevm_ffi::ChainConfigV0 {
+            max_block_net_usage: c.get_max_block_net_usage(),
+            target_block_net_usage_pct: c.get_target_block_net_usage_pct(),
+            max_transaction_net_usage: c.get_max_transaction_net_usage(),
+            base_per_transaction_net_usage: c.get_base_per_transaction_net_usage(),
+            net_usage_leeway: c.get_net_usage_leeway(),
+            context_free_discount_net_usage_num: c.get_context_free_discount_net_usage_num(),
+            context_free_discount_net_usage_den: c.get_context_free_discount_net_usage_den(),
+            max_block_cpu_usage: c.get_max_block_cpu_usage(),
+            target_block_cpu_usage_pct: c.get_target_block_cpu_usage_pct(),
+            max_transaction_cpu_usage: c.get_max_transaction_cpu_usage(),
+            min_transaction_cpu_usage: c.get_min_transaction_cpu_usage(),
+            max_transaction_lifetime: c.get_max_transaction_lifetime(),
+            deferred_trx_expiration_window: 0,
+            max_transaction_delay: c.get_max_transaction_delay(),
+            max_inline_action_size: c.get_max_inline_action_size() + 4096,
+            max_inline_action_depth: c.get_max_inline_action_depth(),
+            max_authority_depth: c.get_max_authority_depth() + 1,
+        };
+        // `cfg` copied the values out; the borrow of the chainbase object (`gpo`/`c`)
+        // ends here under NLL, before the mutating write below.
+        db.set_global_properties(&cfg)?;
+
+        let after_chain = db.global_property_state_bytes()?;
+        let after_arena = db
+            .arena_global_property_state_bytes()
+            .expect("arena is missing the global_property row after setparams");
+        assert_eq!(
+            after_chain, after_arena,
+            "global_property diverged after a config change"
+        );
+        assert_ne!(
+            genesis_chain, after_chain,
+            "the config change was not observed on the chainbase side"
+        );
+        Ok(())
+    }
+
     /// Elastic virtual-limit oracle: process_block_usage recomputes the global
     /// virtual cpu/net limits every block from the block's pending usage and the
     /// windowed averages. After a block the mirrored virtual limits — produced by
@@ -4315,6 +4401,16 @@ mod tests {
                     .unwrap_or(0)
                     .to_le_bytes()
                     .to_vec(),
+            ),
+            (
+                "global_property",
+                db.global_property_state_bytes()?,
+                db.arena_global_property_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "resource_limits_config",
+                db.resource_config_state_bytes()?,
+                db.arena_resource_config_state_bytes().unwrap_or_default(),
             ),
             (
                 "contract_table",
