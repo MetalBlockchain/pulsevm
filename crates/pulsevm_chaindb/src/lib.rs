@@ -1099,8 +1099,24 @@ pub struct ArenaShadow {
     nc_ok: Arc<std::sync::atomic::AtomicU64>,
     nc_fail: Arc<std::sync::atomic::AtomicU64>,
     // When set, the node serves contract reads FROM the arena instead of
-    // chainbase — the staged cutover switch. Shared across clones. Off by default.
+    // chainbase. Shared across clones. On by default: the cutover is complete, so
+    // the arena is the primary read backend and chainbase runs only as the
+    // mirrored comparison oracle. A `PULSEVM_ARENA_READS` set to a falsey value is
+    // an explicit kill switch that reverts to serving from chainbase.
     reads_enabled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Whether the arena serves execution reads. Default on (the arena is primary);
+/// an explicit falsey `PULSEVM_ARENA_READS` (`0`, `false`, `off`, `no`) is the
+/// kill switch that falls back to chainbase. Any other value, or unset, is on.
+fn arena_reads_default() -> bool {
+    match std::env::var("PULSEVM_ARENA_READS") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        Err(_) => true,
+    }
 }
 
 /// Builds an empty `Db` with every mirrored table registered. Shared by
@@ -1142,12 +1158,10 @@ impl ArenaShadow {
             pos_fail: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             nc_ok: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             nc_fail: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            // Serve execution from the arena from the outset when the cutover
-            // switch is set in the environment, so a node (or a whole test run)
-            // executes on arena-served reads without an explicit enable call.
-            reads_enabled: Arc::new(std::sync::atomic::AtomicBool::new(
-                std::env::var("PULSEVM_ARENA_READS").is_ok(),
-            )),
+            // The arena is the primary read backend: execution serves from it
+            // from the outset, with chainbase kept only as the mirrored oracle.
+            // A falsey PULSEVM_ARENA_READS is the kill switch back to chainbase.
+            reads_enabled: Arc::new(std::sync::atomic::AtomicBool::new(arena_reads_default())),
         })
     }
 
