@@ -239,13 +239,37 @@ Everything that returns a **value** is already served from the arena under
    `193526980f523c07a567dda80f5f543e2356518ce1475cf3e03d98ca740b3f67`) with both
    backends live, asserting per-block `cross_impl_tables` equality end to end.
 
+## Acceptance gate — PASSED (full testnet history)
+
+`replay_testnet_blocks` now replays **all 1697 blocks** of the alpine testnet
+with the arena shadow live, in both modes:
+
+- **reads from chainbase** (mirror check) and **`PULSEVM_ARENA_READS=1`** (the node
+  running on arena-served reads) — both reach block 1697 with the per-block
+  `cross_impl_tables` full-state root matching every block.
+- 125,436 inline contract reads + 47 iterator positions + 33,909
+  account/permission reads cross-checked live, **0 divergences**; contract
+  point-reads and table scans served from the arena matched chainbase; the mirror
+  was checkpointed, dropped, and reloaded from disk mid-run (block 850) and stayed
+  in lockstep to 1697; the per-block WAL replayed to an identical state root.
+
+Getting there surfaced and fixed real parity bugs (each its own commit): the
+min-CPU floor was enforced on explicitly-billed replayed blocks; transaction
+signature authorization ran on replayed (already-authenticated) blocks; and a
+failed `onblock` was rolled back in chainbase but not mirrored to the arena,
+diverging `resource_usage`. The harness itself silently skipped every block on a
+fixture-shape mismatch and still passed — now hardened to accept both shapes and
+fail on a no-op run. (The alpine cluster is a load-test net that does not enforce
+transaction signatures, which is why the replay path skips that check.)
+
 ## The validation bar (unchanged, just widened)
 
 - `note_pos` / `note_noncontract`: every served read must equal chainbase, always.
 - `diff_contract_iter`: iterator-handle + key equality vs chainbase.
 - `cross_impl_tables`: whole-state per-block equality (now includes
   `global_property` and `resource_limits_config`).
-- Testnet replay: the end-to-end consensus-equivalence gate.
+- Testnet replay: the end-to-end consensus-equivalence gate — **green across all
+  1697 blocks, both read modes.**
 
 Nothing advances to "arena-primary" for a given surface until its cross-check has
 been green across a full testnet replay.
