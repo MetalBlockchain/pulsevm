@@ -2858,21 +2858,25 @@ mod tests {
         let chain_id = controller.chain_id().clone();
         let name = Name::from_str("glenn")?.as_u64();
 
-        // build_block produces a valid block (correct merkle roots) and undoes
-        // its speculative state, so afterwards the arena must not keep the
-        // account it created while building.
+        // build_block produces a valid block and retains its speculative session
+        // on the pending chain (committed on accept, undone if the chain unwinds
+        // past it), so the account it created stays visible on BOTH backends. The
+        // mirror invariant is that the arena agrees with chainbase, whatever the
+        // session policy — so compare the two rather than assume undo/retain.
         mempool.add_transaction(create_account(
             &private_key,
             Name::from_str("glenn")?,
             chain_id,
         )?);
         let block = controller.build_block(&mut mempool).await?;
+        let chain_has = !controller.database().find_account_metadata(name)?.is_null();
+        let arena_has = controller
+            .database()
+            .arena_account_metadata_privileged(name)
+            .is_some();
         assert_eq!(
-            controller
-                .database()
-                .arena_account_metadata_privileged(name),
-            None,
-            "build_block left a speculative account in the arena"
+            arena_has, chain_has,
+            "arena diverged from chainbase on the speculative account after build_block"
         );
 
         // accept_block commits: both sides must now hold the account.
