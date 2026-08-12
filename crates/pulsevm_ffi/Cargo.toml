@@ -23,11 +23,12 @@ zerocopy = "0.8.34"
 zerocopy-derive = "0.8.34"
 # Only pulled in for the arena-shadow differential-testing build.
 pulsevm_arena = { path = "../pulsevm_arena", optional = true }
+pulsevm_chaindb = { path = "../pulsevm_chaindb", optional = true }
 
 [features]
 # Mirrors ported state mutations into a native pulsevm_arena Db carried inside
 # Database, so a per-block arena state root can be checked against chainbase.
-arena-shadow = ["dep:pulsevm_arena"]
+arena-shadow = ["dep:pulsevm_arena", "dep:pulsevm_chaindb"]
 
 [build-dependencies]
 cc = "1.2.50"

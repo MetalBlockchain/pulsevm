@@ -3361,6 +3361,14 @@ name = "pulsevm_billable_size"
 version = "0.1.0"
 
 [[package]]
+name = "pulsevm_chaindb"
+version = "0.1.0"
+dependencies = [
+ "pulsevm_arena",
+ "zerocopy",
+]
+
+[[package]]
 name = "pulsevm_constants"
 version = "0.1.0"
 
@@ -3468,6 +3476,7 @@ dependencies = [
  "prost-types",
  "pulsevm_arena",
  "pulsevm_billable_size",
+ "pulsevm_chaindb",
  "pulsevm_constants",
  "pulsevm_contractdb",
  "pulsevm_crypto",
