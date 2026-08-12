@@ -6295,6 +6295,59 @@ mod tests {
         Ok(())
     }
 
+    /// Serve-path code oracle: with arena reads enabled, the VM fetches and
+    /// compiles the contract image from the arena (`get_code_bytes_by_hash`),
+    /// not from chainbase. Deploy a trivial contract and call it; the action
+    /// only succeeds if the arena served a byte-identical image the VM can
+    /// instantiate, and the system-object read cross-check must stay clean.
+    #[cfg(feature = "arena-shadow")]
+    #[tokio::test]
+    async fn oracle_contract_code_serves_from_arena() -> Result<(), ChainError> {
+        let wasm = wat::parse_str(
+            r#"(module (memory (export "memory") 1) (func (export "apply") (param i64 i64 i64)))"#,
+        )
+        .unwrap();
+
+        let (mut controller, private_key, _cid, _temp) = init_test_controller()?;
+        // Serve every system-object read from the arena for the rest of the test.
+        controller.database().enable_arena_reads();
+        let chain_id = controller.chain_id().clone();
+        let ts = controller.last_accepted_block().timestamp().clone();
+        let st = BlockStatus::Building;
+        let testapi = Name::from_str("testapi")?;
+
+        controller.execute_transaction(
+            &create_account(&private_key, testapi, chain_id)?,
+            &ts,
+            &st,
+        )?;
+        controller.execute_transaction(
+            &set_code(&private_key, testapi, wasm, chain_id)?,
+            &ts,
+            &st,
+        )?;
+        // Runs the contract: exec_one sees a non-empty code hash and asks the VM
+        // to run it, so the image is fetched from the arena and compiled here.
+        controller.execute_transaction(
+            &call_contract(
+                &private_key,
+                testapi,
+                Name::from_str("run")?,
+                &Vec::<u8>::new(),
+                chain_id,
+            )?,
+            &ts,
+            &st,
+        )?;
+
+        let (_ok, nc_fail) = controller.database().arena_noncontract_crosscheck_counts();
+        assert_eq!(
+            nc_fail, 0,
+            "arena served {nc_fail} system-object reads that diverged from chainbase"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_api_db() -> Result<(), ChainError> {
         let (mut controller, private_key, _chain_id, _temp) = init_test_controller()?;

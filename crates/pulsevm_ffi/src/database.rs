@@ -38,14 +38,10 @@ use crate::{
         Index128Object,
         Index256Object,
         IndexDoubleObject,
-        KeyWeight,
-        PermissionLevel,
-        PermissionLevelWeight,
         TableObject,
         TimePoint,
         U128,
         U256,
-        WaitWeight,
         get_account_info_with_core_symbol,
         get_account_info_without_core_symbol,
         get_currency_balance_with_symbol,
@@ -58,6 +54,16 @@ use crate::{
         Index256IteratorCache,
         KeyValueIteratorCache,
     },
+};
+
+// The bridge authority sub-types are only referenced by the arena authority
+// decoder (and its tests), which are compiled behind the shadow feature.
+#[cfg(feature = "arena-shadow")]
+use crate::{
+    KeyWeight,
+    PermissionLevel,
+    PermissionLevelWeight,
+    WaitWeight,
 };
 
 /// Field-for-field snapshot of an `account_metadata_object` read back from the
@@ -2904,6 +2910,42 @@ impl Database {
             .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
 
         Ok(res)
+    }
+
+    /// The wasm image for `(code_hash, vm_type, vm_version)` as owned bytes.
+    ///
+    /// This is the bytecode the VM compiles and runs. Returning it by value
+    /// (rather than a `*const CodeObject` whose `get_code()` borrows chainbase)
+    /// is what lets the arena own contract code: under `PULSEVM_ARENA_READS` the
+    /// image is served from the arena, cross-checked byte-for-byte against
+    /// chainbase's `code_object::code` every time.
+    pub fn get_code_bytes_by_hash(
+        &self,
+        code_hash: &CxxDigest,
+        vm_type: u8,
+        vm_version: u8,
+    ) -> Result<Vec<u8>, ChainError> {
+        let chainbase = {
+            let guard = self.locked_read()?;
+            // The bridge returns a reference (Err, never null, when absent).
+            let res = guard
+                .get_code_object_by_hash(code_hash, vm_type, vm_version)
+                .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+            res.get_code().as_slice().to_vec()
+        };
+
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow {
+            let arena = s.code_by_hash(digest_to_array(code_hash), vm_type, vm_version);
+            s.note_noncontract(arena.as_deref() == Some(chainbase.as_slice()));
+            if s.reads_enabled()
+                && let Some(bytes) = arena
+            {
+                return Ok(bytes);
+            }
+        }
+
+        Ok(chainbase)
     }
 
     /// Bump the receiver's `recv_sequence` and return the incremented value.

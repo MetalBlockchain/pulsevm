@@ -2356,6 +2356,25 @@ impl ArenaShadow {
         Ok(())
     }
 
+    /// The wasm image for `(code_hash, vm_type, vm_version)`, or `None` if the
+    /// code row is absent. This is the bytecode the VM compiles and runs, so
+    /// serving it from the arena is what puts contract execution on arena-owned
+    /// code; it must be byte-identical to chainbase's `code_object::code`.
+    pub fn code_by_hash(
+        &self,
+        code_hash: [u8; 32],
+        vm_type: u8,
+        vm_version: u8,
+    ) -> Option<Vec<u8>> {
+        let db = self.lock();
+        let code_ref = db
+            .find_by::<CodeRow, CodeByHash>(&(code_hash, vm_type, vm_version))
+            .ok()
+            .flatten()
+            .map(|c| c.code)?;
+        db.blob::<CodeRow>(code_ref).ok().map(|b| b.to_vec())
+    }
+
     /// Mirrors `unlink_account_code`: drops the ref count of the code row and
     /// removes it at zero. The FFI `code_object` exposes only its hash, not
     /// `vm_type`/`vm_version`, so the row is located by hash; a hash is unique

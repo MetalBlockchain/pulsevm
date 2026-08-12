@@ -514,15 +514,14 @@ impl WasmRuntime {
             let mut inner = self.inner.write()?;
 
             if !inner.code_cache.contains(&id) {
-                let r = db.read()?;
-                let code_object = r.get_code_object_by_hash(code_hash, 0, 0)?;
+                let code_bytes = db.get_code_bytes_by_hash(code_hash, 0, 0)?;
 
                 // Compile on a fresh engine carrying the pinned deterministic
                 // config (NaN canonicalization, metering, feature set).
                 let temp_engine = Self::deterministic_engine();
                 let temp_store = Store::new(temp_engine.clone());
 
-                let module = Module::new(temp_store.engine(), code_object.get_code().as_slice())
+                let module = Module::new(temp_store.engine(), code_bytes.as_slice())
                     .map_err(|e| ChainError::WasmRuntimeError(e.to_string()))?;
                 inner.code_cache.put(
                     id,
