@@ -28,8 +28,19 @@ gated behind two off-by-default switches:
 - `pulsevm_contractdb` — the full EOS contract-table API on the arena
   (`db_*_i64` + idx64/128/256/double/**long_double**), EOS-exact iterator
   handles, and RAM billing.
+- `pulsevm_chaindb` — the **whole** arena-backed chain database: every chain
+  table (accounts, account metadata, permissions, permission usage/links, code,
+  transactions, contract tables + all secondary indices, resource
+  limits/usage/state) and the create/modify/remove + read/positioning +
+  undo/commit + persistence surface over them. This was previously
+  `pulsevm_ffi/src/shadow.rs`, buildable only alongside the C++ tree; it is now
+  a standalone pure-Rust crate (`pulsevm_ffi` re-exports it as `crate::shadow`).
+  It is the single source of truth the cutover targets — the earlier
+  contractdb-vs-shadow duplication is resolved in its favour for the system
+  objects.
 
-`cargo test -p pulsevm_arena -p pulsevm_contractdb` → 80 tests green.
+`cargo test -p pulsevm_arena -p pulsevm_contractdb -p pulsevm_chaindb` →
+96 tests green, **no C++ toolchain required**.
 
 ### Added on this branch
 
@@ -54,9 +65,10 @@ Roughly a third of the way. Remaining, in dependency order:
    pattern (`database.rs` `arena_idx64_*` + `apply_context.rs` serve branches).
 
 2. **Make the arena the write path**, not a mirror. Today every mutation is
-   `chainbase-write → shadow-replay`. Flip ownership; ensure the ~18 mirrored
-   tables cover *all* chainbase tables (a few are still unmirrored, e.g. the
-   global resource total-weight object noted in `shadow.rs`).
+   `chainbase-write → arena-replay` (`database.rs` calls into
+   `pulsevm_chaindb`). Flip ownership; ensure the ~18 tables cover *all*
+   chainbase tables (a few are still unmirrored, e.g. the global resource
+   total-weight object noted in `pulsevm_chaindb`).
 
 3. **Full session/undo integration in the controller.** The nested
    build/verify/accept session stack (`controller.rs`) must drive the arena
@@ -86,7 +98,16 @@ Roughly a third of the way. Remaining, in dependency order:
    submodule, softfloat, the `chain` library), the cmake `build.rs`, and the
    `cxx` bridge — only after 1–6 are green.
 
-## Validating on a machine with the C++ toolchain
+## Validating
+
+The pure-Rust store needs no C++ and runs anywhere:
+
+```
+cargo test -p pulsevm_arena -p pulsevm_contractdb -p pulsevm_chaindb
+```
+
+The chainbase-equivalence checks need the C++ toolchain (boost + a C++20
+compiler):
 
 ```
 # build the C++ side needs boost checked out + a C++20 compiler
