@@ -168,11 +168,16 @@ Everything that returns a **value** is already served from the arena under
 
 ## What still reads/writes C++ during execution
 
-1. **`account_metadata` in `exec_one`** (`apply_context.rs`). The read
-   (`is_privileged`, `code_hash`, `code_sequence`, `abi_sequence`) is fused with
-   a write in the same breath: `next_recv_sequence(&receiver_account)` takes the
-   same `&AccountMetadataObject` and bumps `recv_sequence`. Read and write must
-   convert together.
+1. **`account_metadata` in `exec_one`** (`apply_context.rs`). *Mostly converted.*
+   The paired write is arena-owned: `next_recv_sequence` now takes the account
+   *name*, resolves and bumps `recv_sequence` inside the FFI layer (no
+   `&AccountMetadataObject` escaping into execution), and serves the incremented
+   value from the arena. The receipt scalars — `is_privileged`, `code_sequence`,
+   `abi_sequence` — are served too (`is_account_privileged`,
+   `account_metadata_code_abi_sequence`). The only field still taken off the
+   chainbase object is `code_hash`, which flows straight into the wasm runtime
+   (`Id::from` + the code-object lookup); it converts with the code-object read
+   surface, not here.
 
 2. **Permission reads needing the full authority.** *Authorization satisfaction
    is now served.* `DbRead::permission_authority` decodes `PermissionRow.auth`
@@ -201,10 +206,12 @@ Everything that returns a **value** is already served from the arena under
    permission-object reads (`get_id`/`get_name`/`get_billable_size`/`satisfies`)
    are fused with writes and convert with the write flip below.
 
-2. **Co-convert `account_metadata` read+write in `exec_one`.** Serve a metadata
-   view (`ArenaAccountMetadata` already carries every field) *and* route
-   `next_recv_sequence` as an arena-owned write. First place the arena owns a
-   read and its paired write together — the template for the write flip.
+2. **Co-convert `account_metadata` read+write in `exec_one`.** *Done bar the
+   wasm code hash.* `next_recv_sequence` is now name-based, arena-served, with no
+   chainbase reference escaping; `is_privileged`/`code_sequence`/`abi_sequence`
+   are served scalars. This is the first place the arena owns a read and its
+   paired write together — the template for the write flip. Only `code_hash`
+   remains, and it moves with the code-object read surface (step 3-adjacent).
 
 3. **Arena-owned iterator handles.** The largest piece. Mint handles matching
    chainbase's encoding; validate with `diff_contract_iter` (iterator-handle
