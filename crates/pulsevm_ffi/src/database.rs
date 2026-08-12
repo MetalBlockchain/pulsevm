@@ -2617,6 +2617,39 @@ impl Database {
         Ok(chainbase)
     }
 
+    /// Whether `name` is a privileged account. A plain bool read off
+    /// account_metadata (not the chainbase object reference), so it serves from
+    /// the arena under PULSEVM_ARENA_READS. Errors when the account has no
+    /// metadata, matching `get_account_metadata`.
+    pub fn is_account_privileged(&self, name: u64) -> Result<bool, ChainError> {
+        let chainbase = {
+            let guard = self.inner.read()?;
+            let res = guard.find_account_metadata(name).map_err(|e| {
+                ChainError::InternalError(format!("failed to find account metadata: {}", e))
+            })?;
+            if res.is_null() {
+                return Err(ChainError::InternalError(format!(
+                    "account metadata not found for account: {}",
+                    name
+                )));
+            }
+            unsafe { &*res }.is_privileged()
+        };
+
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow {
+            let arena = s.account_metadata_privileged(name);
+            s.note_noncontract(arena == Some(chainbase));
+            if s.reads_enabled()
+                && let Some(p) = arena
+            {
+                return Ok(p);
+            }
+        }
+
+        Ok(chainbase)
+    }
+
     pub fn find_permission(&self, id: i64) -> Result<*const ffi::PermissionObject, ChainError> {
         let guard = self.locked_read()?;
         let res = guard
