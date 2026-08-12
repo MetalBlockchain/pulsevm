@@ -378,7 +378,7 @@ impl ApplyContext {
 
         {
             pulse_assert(
-                self.db.account_exists(a.account().as_u64())?,
+                self.db.is_account(a.account().as_u64())?,
                 ChainError::TransactionError(format!(
                     "inline action's code account {} does not exist",
                     a.account()
@@ -389,7 +389,7 @@ impl ApplyContext {
 
             for auth in a.authorization() {
                 pulse_assert(
-                    self.db.account_exists(auth.actor)?,
+                self.db.is_account(auth.actor)?,
                     ChainError::TransactionError(format!(
                         "inline action's authorizing actor {} does not exist",
                         auth.actor
@@ -437,7 +437,7 @@ impl ApplyContext {
 
     pub fn execute_context_free_inline(&mut self, a: &Action) -> Result<(), ChainError> {
         pulse_assert(
-            self.db.account_exists(a.account().as_u64())?,
+                self.db.is_account(a.account().as_u64())?,
             ChainError::TransactionError(format!(
                 "inline action's code account {} does not exist",
                 a.account()
