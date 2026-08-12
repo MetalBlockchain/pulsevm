@@ -214,6 +214,11 @@ impl ApplyContext {
             Controller::find_apply_handler(&self.receiver, action.account(), action.name());
         if let Some(native) = native {
             native(self, &mut self.db.clone(), &action)?;
+            // The native handler runs unmetered Rust, so re-check the deadline now
+            // that it's done. Only needed when one actually ran — with no native
+            // handler, execute_action's entry check a few microseconds ago already
+            // covers this action.
+            self.trx_context.checktime()?;
         }
 
         // Copy the (possibly just-updated) code hash out as an owned value: the wasm
@@ -1887,6 +1892,16 @@ impl ApplyContext {
         Ok(())
     }
 
+    /// Record the value a contract set via `set_action_return_value` on this
+    /// action's trace. This is informational (history/RPC) only — the action
+    /// receipt digest is unchanged — so surfacing it does not affect consensus.
+    pub fn set_trace_return_value(&self, value: Vec<u8>) -> Result<(), ChainError> {
+        self.trx_context
+            .modify_action_trace(self.action_ordinal, |trace| {
+                trace.return_value = value;
+            })
+    }
+
     pub fn next_recv_sequence(&mut self, account_name: u64) -> Result<u64, ChainError> {
         self.db.next_recv_sequence(account_name)
     }
@@ -1926,6 +1941,10 @@ impl ApplyContext {
     pub fn resume_billing_timer(&self) -> Result<(), ChainError> {
         self.trx_context.resume_billing_timer()?;
         Ok(())
+    }
+
+    pub fn checktime(&self) -> Result<(), ChainError> {
+        self.trx_context.checktime()
     }
 
     pub fn get_head_block_num(&self) -> u32 {
@@ -1992,6 +2011,18 @@ impl ApplyContext {
         producers: Vec<ProducerKey>,
     ) -> Result<(), ChainError> {
         self.trx_context.set_proposed_producers(producers)
+    }
+
+    pub fn active_producers(&self) -> Result<Vec<ProducerKey>, ChainError> {
+        self.trx_context.active_producers()
+    }
+
+    pub fn active_schedule_version(&self) -> Result<u32, ChainError> {
+        self.trx_context.active_schedule_version()
+    }
+
+    pub fn validate_ram_usage(&self, account: &Name) -> Result<(), ChainError> {
+        self.trx_context.validate_ram_usage(account)
     }
 }
 

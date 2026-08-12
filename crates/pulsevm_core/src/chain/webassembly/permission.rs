@@ -117,9 +117,12 @@ pub fn check_permission_authorization(
     }
 
     let (env_data, mut store) = env.data_and_store_mut();
+    // Widen the fields, not the argument: `pubkeys_size + perms_size` in u32
+    // would overflow (panic in debug, wrap in release) for guest-supplied sizes
+    // near u32::MAX, and this runs before the memory range is bounds-checked.
     env_data.charge(
         &mut store,
-        cost::AUTH + cost::per_byte((pubkeys_size + perms_size) as u64),
+        cost::AUTH + cost::per_byte(pubkeys_size as u64 + perms_size as u64),
     )?;
     let memory = env_data
         .memory()

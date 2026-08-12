@@ -72,6 +72,20 @@ func RPCCall(ctx context.Context, uri, method string, params any, out any) error
 	return json.Unmarshal(decoded.Result, out)
 }
 
+// ActiveProducers is the on-chain producer schedule: its version and the ordered
+// producer account names.
+type ActiveProducers struct {
+	ScheduleVersion uint32   `json:"schedule_version"`
+	ActiveProducers []string `json:"active_producers"`
+}
+
+// Producers returns the active producer schedule the chain is enforcing.
+func Producers(ctx context.Context, uri string) (ActiveProducers, error) {
+	var out ActiveProducers
+	err := RPCCall(ctx, uri, "pulsevm.getProducers", nil, &out)
+	return out, err
+}
+
 // CurrencyBalance returns the balance `account` holds of `symbol` in the token
 // contract at `code`, e.g. "250.0000 PULSE". An account with no balance row
 // yields an empty string rather than an error, matching the chain's behaviour

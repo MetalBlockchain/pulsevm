@@ -3290,6 +3290,7 @@ dependencies = [
  "serde",
  "serde_json",
  "spdlog-rs",
+ "tempfile",
  "thiserror 2.0.19",
  "time",
  "tokio",
@@ -3438,6 +3439,7 @@ dependencies = [
  "pulsevm_serialization",
  "serde_json",
  "tokio",
+ "wat",
 ]
 
 [[package]]

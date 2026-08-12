@@ -39,6 +39,12 @@ pub struct IssueTxResponse {
 }
 
 #[derive(Serialize, Clone, Default)]
+pub struct GetProducersResponse {
+    pub schedule_version: u32,
+    pub active_producers: Vec<Name>,
+}
+
+#[derive(Serialize, Clone, Default)]
 pub struct GetCodeHashResponse {
     pub account_name: Name,
     pub code_hash: Id,

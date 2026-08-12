@@ -19,6 +19,7 @@ use pulsevm_ffi::{
     Database,
     Microseconds,
     TimePoint,
+    milliseconds,
     seconds,
 };
 use pulsevm_serialization::VarUint32;
@@ -78,6 +79,15 @@ struct TransactionContextInner {
     net_limit_due_to_greylist: bool,
     net_limit_due_to_block: bool,
     billing: Billing,
+    // Raw wall-clock at which this transaction started executing. Unlike the
+    // billing timer this never pauses, so it also covers native windows the billing
+    // timer excludes — notably wasm compilation. It's the basis for the subjective
+    // deadline (checktime), which is a watchdog and so must see that time.
+    start_time: TimePoint,
+    // Subjective wall-clock ceiling on execution time. When elapsed wall-clock time
+    // crosses this, checktime() abandons the transaction (a node-local guard, never
+    // consensus). Skipped when explicit_billed_cpu_time is set.
+    max_transaction_time: Microseconds,
     pending_block_timestamp: BlockTimestamp,
     cpu_limit: i64,
     cpu_limit_due_to_greylist: bool,
@@ -85,6 +95,11 @@ struct TransactionContextInner {
     executed_action_receipt_digests: VecDeque<Digest>,
     is_input: bool,
     proposed_schedule: Option<Vec<ProducerKey>>,
+    // The producer schedule in force for the block this transaction executes in
+    // (producers + version), so `get_active_producers` / `set_proposed_producers`
+    // can read the active set. Set by the controller right after construction.
+    active_producers: Vec<ProducerKey>,
+    active_schedule_version: u32,
 }
 
 #[derive(Clone)]
@@ -105,6 +120,7 @@ impl TransactionContext {
         transaction_id: &Id,
         block_status: BlockStatus,
         packed_transaction: PackedTransaction,
+        max_transaction_time_ms: u32,
     ) -> Self {
         let mut trace = TransactionTrace::default();
         trace.id = *transaction_id;
@@ -132,6 +148,8 @@ impl TransactionContext {
                     pseudo_start: TimePoint::now(),
                     billed_time: Microseconds::default(),
                 },
+                start_time: TimePoint::now(),
+                max_transaction_time: milliseconds(max_transaction_time_ms as i64),
                 pending_block_timestamp,
                 cpu_limit: 0,
                 cpu_limit_due_to_greylist: false,
@@ -139,9 +157,33 @@ impl TransactionContext {
                 executed_action_receipt_digests: VecDeque::with_capacity(6),
                 is_input: false,
                 proposed_schedule: None,
+                active_producers: Vec::new(),
+                active_schedule_version: 0,
             })),
             packed_transaction,
         }
+    }
+
+    /// Record the producer schedule in force for the block this transaction runs
+    /// in. The controller sets this before execution so `get_active_producers`
+    /// and `set_proposed_producers` can read the active set and version.
+    pub fn set_active_schedule(
+        &self,
+        producers: Vec<ProducerKey>,
+        version: u32,
+    ) -> Result<(), ChainError> {
+        let mut inner = self.inner.write()?;
+        inner.active_producers = producers;
+        inner.active_schedule_version = version;
+        Ok(())
+    }
+
+    pub fn active_producers(&self) -> Result<Vec<ProducerKey>, ChainError> {
+        Ok(self.inner.read()?.active_producers.clone())
+    }
+
+    pub fn active_schedule_version(&self) -> Result<u32, ChainError> {
+        Ok(self.inner.read()?.active_schedule_version)
     }
 
     pub fn init(
@@ -424,6 +466,11 @@ impl TransactionContext {
         action_ordinal: u32,
         recurse_depth: u32,
     ) -> Result<(), ChainError> {
+        // Every action — top-level, notified, and inline (which re-enters here) —
+        // passes through this point, so it's the one place a deadline check bounds
+        // action fan-out and deep inline recursion.
+        self.checktime()?;
+
         let (action, receiver, context_free) = self.with_action_trace(action_ordinal, |t| {
             (t.action().clone(), t.receiver().clone(), t.context_free())
         })?;
@@ -660,6 +707,16 @@ impl TransactionContext {
         Ok(())
     }
 
+    /// Flag `account` to have its RAM usage re-checked against its limit before
+    /// the transaction commits. Lowering an account's RAM limit can leave it over
+    /// quota without changing its usage, so the limit change alone won't schedule
+    /// the check that `add_ram_usage` schedules on an increase.
+    pub fn validate_ram_usage(&self, account: &Name) -> Result<(), ChainError> {
+        let mut inner = self.inner.write()?;
+        inner.validate_ram_usage.insert(account.clone());
+        Ok(())
+    }
+
     pub fn pause_billing_timer(&self) -> Result<(), ChainError> {
         let mut inner = self.inner.write()?;
         if inner.explicit_billed_cpu_time {
@@ -685,6 +742,52 @@ impl TransactionContext {
         let now = TimePoint::now();
         let _paused = now - inner.billing.paused_time; // if needed later
         inner.billing.pseudo_start = now - inner.billing.billed_time;
+        Ok(())
+    }
+
+    /// Abandon the transaction if it has spent longer than `max_transaction_time`
+    /// executing. This is the wall-clock backstop for native/host code paths that
+    /// the deterministic op metering can't see (a long native handler, a deep fan
+    /// out of actions, wasm compilation). It measures raw wall-clock since the
+    /// transaction started — deliberately NOT the billing timer, which pauses across
+    /// compilation and would blind the watchdog to exactly that native window. It is
+    /// SUBJECTIVE — it depends on this machine's speed, not on the transaction's
+    /// deterministic result — so it raises `DeadlineError`, which the caller drops
+    /// locally rather than blaming a block for, and it is skipped whenever billing
+    /// is explicit (replay and light validation, and the implicit onblock path).
+    /// Enforced cooperatively at execution boundaries; it can't interrupt a call
+    /// already in progress.
+    pub fn checktime(&self) -> Result<(), ChainError> {
+        let inner = self.inner.read()?;
+        Self::deadline_check(
+            inner.explicit_billed_cpu_time,
+            inner.start_time,
+            inner.max_transaction_time,
+            TimePoint::now(),
+        )
+    }
+
+    /// The pure decision behind [`checktime`]. Skips entirely when billing is
+    /// explicit; otherwise measures raw wall-clock elapsed since `start_time` (so
+    /// compilation and other native windows the billing timer pauses still count)
+    /// and fails once it passes the limit.
+    fn deadline_check(
+        explicit_billed: bool,
+        start_time: TimePoint,
+        max_transaction_time: Microseconds,
+        now: TimePoint,
+    ) -> Result<(), ChainError> {
+        if explicit_billed {
+            return Ok(());
+        }
+        let elapsed = now - start_time;
+        if elapsed.count() > max_transaction_time.count() {
+            return Err(ChainError::DeadlineError(format!(
+                "transaction ran for {} us, over the {} us limit",
+                elapsed.count(),
+                max_transaction_time.count()
+            )));
+        }
         Ok(())
     }
 
@@ -924,5 +1027,72 @@ impl TransactionContext {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pulsevm_error::ChainError;
+    use pulsevm_ffi::{
+        Microseconds,
+        TimePoint,
+    };
+
+    use super::TransactionContext;
+
+    fn tp(us: i64) -> TimePoint {
+        TimePoint::new(Microseconds::new(us))
+    }
+
+    #[test]
+    fn checktime_skips_when_billing_is_explicit() {
+        // Explicit billing (replay / light validation / implicit onblock) is never
+        // subject to the wall-clock deadline, even far past it — that keeps the
+        // check subjective and off the consensus path.
+        let r = TransactionContext::deadline_check(
+            true,
+            tp(1_000_000),
+            Microseconds::new(1),
+            tp(9_999_999),
+        );
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn checktime_passes_under_the_limit_and_trips_over_it() {
+        // elapsed = now - start_time.
+        let under = TransactionContext::deadline_check(
+            false,
+            tp(1_000_000),
+            Microseconds::new(1_000),
+            tp(1_000_500),
+        );
+        assert!(under.is_ok(), "500us is under the 1000us limit");
+
+        let over = TransactionContext::deadline_check(
+            false,
+            tp(1_000_000),
+            Microseconds::new(1_000),
+            tp(1_002_000),
+        );
+        assert!(
+            matches!(over, Err(ChainError::DeadlineError(_))),
+            "2000us must trip the 1000us limit"
+        );
+    }
+
+    #[test]
+    fn checktime_counts_wall_clock_not_billed_time() {
+        // The watchdog measures raw wall-clock from start_time, so a window the
+        // billing timer would pause (module compilation) still counts. Here the
+        // whole 5ms between start and now is over the 1ms limit even though none of
+        // it was billed execution.
+        let over =
+            TransactionContext::deadline_check(false, tp(0), Microseconds::new(1_000), tp(5_000));
+        assert!(matches!(over, Err(ChainError::DeadlineError(_))));
+
+        let under =
+            TransactionContext::deadline_check(false, tp(0), Microseconds::new(1_000), tp(500));
+        assert!(under.is_ok());
     }
 }

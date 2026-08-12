@@ -788,6 +788,12 @@ impl WasmRuntime {
         // Resume timer
         apply_context.resume_billing_timer()?;
 
+        // Compilation ran inside the paused window above and can be a slow native
+        // window on a cache miss; the deadline measures raw wall-clock, so re-check
+        // it now — before the guest runs — to abandon a transaction that already
+        // blew its budget compiling rather than sink more time into execution.
+        apply_context.checktime()?;
+
         let result = apply_func
             .call(
                 &mut warm.store,
@@ -804,6 +810,10 @@ impl WasmRuntime {
                 // Otherwise wrap it
                 ChainError::ApplyError(format!("{}", e.message()))
             });
+        // A value the contract set via set_action_return_value lives on the env;
+        // capture it before the warm store returns to the pool so it can be
+        // surfaced on the action trace (informational; not part of the digest).
+        let return_value = warm.env.as_ref(&warm.store).return_value.clone();
         let remaining_points: MeteringPoints = get_remaining_points(&mut warm.store, &instance);
 
         // Return the warm store to the pool for reuse, unless it has spun up
@@ -821,6 +831,10 @@ impl WasmRuntime {
                 // remaining points
                 if let Err(e) = result {
                     return Err(e);
+                }
+
+                if let Some(rv) = return_value {
+                    apply_context.set_trace_return_value(rv.0)?;
                 }
 
                 Ok(cpu_limit.saturating_sub(points) as u64)
