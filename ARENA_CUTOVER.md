@@ -174,14 +174,16 @@ Everything that returns a **value** is already served from the arena under
    same `&AccountMetadataObject` and bumps `recv_sequence`. Read and write must
    convert together.
 
-2. **Permission reads needing the full authority.** `arena_permission` exposes
-   only `(parent_id, threshold)`. The blockers are the reads that need more:
-   `.get_authority().to_authority()` (`authority_checker.rs`),
-   `.get_authority().get_billable_size()` and `.get_id()`
-   (`pulse_contract.rs` updateauth/linkauth), `.get_name()`
-   (`authorization_manager.rs`), and `.satisfies(other, db)` (a C++ method). The
-   shadow *stores* the whole authority (`PermissionRow.auth: BlobRef`) but has no
-   accessor that decodes it back.
+2. **Permission reads needing the full authority.** *Authorization satisfaction
+   is now served.* `DbRead::permission_authority` decodes `PermissionRow.auth`
+   back into an owned `Authority`, cross-checked on the canonical encoding, and
+   `authority_checker.rs` reads through it — so under `PULSEVM_ARENA_READS` the
+   whole satisfaction walk runs on arena-served authorities
+   (`oracle_permission_authority_serves_from_arena`). What remains are the
+   permission-object reads fused with a write: `.get_authority().get_billable_size()`
+   and `.get_id()` (`pulse_contract.rs` updateauth/linkauth), `.get_name()`
+   (`authorization_manager.rs`), and `.satisfies(other, db)` (a C++ method). These
+   convert with the write flip, not as standalone serve branches.
 
 3. **Iterator handles.** The `*IteratorCache` handles (including the end-iterator
    encoding) are minted by chainbase. Contracts observe and compare them, so the
@@ -193,9 +195,11 @@ Everything that returns a **value** is already served from the arena under
 
 ## Sequencing (each step stays behind the flag + cross-checks until green)
 
-1. **Arena authority decode.** Add a shadow accessor that decodes
-   `PermissionRow.auth` into the `Authority` the checker uses, plus name/id/parent
-   getters. Then serve the remaining `find_permission*` reads. Low risk, in-shadow.
+1. **Arena authority decode.** *Done.* `DbRead::permission_authority` decodes
+   `PermissionRow.auth` into the `Authority` the checker uses and serves it under
+   `PULSEVM_ARENA_READS`; `authority_checker.rs` reads through it. The remaining
+   permission-object reads (`get_id`/`get_name`/`get_billable_size`/`satisfies`)
+   are fused with writes and convert with the write flip below.
 
 2. **Co-convert `account_metadata` read+write in `exec_one`.** Serve a metadata
    view (`ArenaAccountMetadata` already carries every field) *and* route
