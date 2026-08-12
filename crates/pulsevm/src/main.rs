@@ -731,9 +731,30 @@ impl Vm for VirtualMachine {
                     return Ok(Response::new(()));
                 }
                 Ok(tx) => {
-                    let mempool = self.mempool.clone();
-                    let mut mempool = mempool.write().await;
-                    mempool.add_transaction(tx);
+                    // Validate before admitting: unlike the RPC path, a peer's
+                    // gossip is untrusted, so run it through the same admission
+                    // check rather than trusting the bytes into the mempool.
+                    match self.rpc_service.admit_transaction(tx.clone()).await {
+                        Err(e) => {
+                            warn!("rejecting gossiped transaction: {}", e);
+                        }
+                        // Already known: don't relay again, or gossip would loop.
+                        Ok(false) => {}
+                        // New and valid: relay onward so it reaches beyond one hop.
+                        Ok(true) => {
+                            let nm = self.network_manager.read().await;
+                            match Gossipable::new(GossipType::Transaction, tx) {
+                                Ok(msg) => {
+                                    if let Err(e) = nm.gossip(msg).await {
+                                        warn!("failed to relay gossiped transaction: {}", e);
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("failed to build relay gossip: {}", e);
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

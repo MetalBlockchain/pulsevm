@@ -133,6 +133,9 @@ pub enum ValidationError {
         constraints::MAXIMUM_FUNC_LOCAL_BYTES
     )]
     DataSegmentTooLarge,
+
+    #[error("Smart contract must not declare a start section")]
+    StartSectionNotAllowed,
 }
 
 pub type Result<T> = std::result::Result<T, ValidationError>;
@@ -773,6 +776,14 @@ pub fn validate_wasm(wasm: &[u8]) -> Result<()> {
                 }
             }
 
+            // A start section runs during instantiation, before apply is called
+            // and before the metering budget is seeded — host intrinsics reached
+            // from it would execute unbilled. EOSIO disallows start sections
+            // outright, so reject them here rather than admit unmetered work.
+            Payload::StartSection { .. } => {
+                return Err(ValidationError::StartSectionNotAllowed);
+            }
+
             _ => {}
         }
     }
@@ -845,6 +856,29 @@ mod tests {
     fn test_valid_module_passes() {
         let wasm = valid_module();
         assert!(validate_wasm(&wasm).is_ok());
+    }
+
+    #[test]
+    fn test_start_section_rejected() {
+        // A start section runs during instantiation, before metering is seeded,
+        // so host intrinsics reached from it would run unbilled. It must be
+        // rejected outright (EOSIO disallows start sections).
+        let wasm = wat::parse_str(
+            r#"
+            (module
+                (type (;0;) (func (param i64 i64 i64)))
+                (type (;1;) (func))
+                (func (;0;) (type 0))
+                (func (;1;) (type 1))
+                (memory (;0;) 1)
+                (export "apply" (func 0))
+                (start 1)
+            )
+            "#,
+        )
+        .expect("valid WAT");
+        let err = validate_wasm(&wasm).unwrap_err();
+        assert!(matches!(err, ValidationError::StartSectionNotAllowed));
     }
 
     #[test]

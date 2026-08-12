@@ -28,14 +28,19 @@ pub fn read_action_data(
     buffer_len: u32,
 ) -> Result<i32, RuntimeError> {
     let (env_data, mut store) = env.data_and_store_mut();
-    env_data.charge(&mut store, cost::BASE + cost::per_byte(buffer_len as u64))?;
-    let action_data = env_data.action().data();
-    let total_len = action_data.len() as u32;
+    // Charge for the bytes actually copied, not the guest-declared buffer: this
+    // intrinsic writes straight into guest memory (no host allocation to bound),
+    // and copies only min(buffer_len, data_len). A large buffer_len over small
+    // action data must not be billed for bytes it never touches.
+    let total_len = env_data.action().data().len() as u32;
     let copy_size = buffer_len.min(total_len);
+    env_data.charge(&mut store, cost::BASE + cost::per_byte(copy_size as u64))?;
 
     if copy_size == 0 {
         return Ok(total_len as i32);
     }
+
+    let action_data = env_data.action().data();
 
     let memory = env_data
         .memory()
