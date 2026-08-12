@@ -153,7 +153,7 @@ impl<'a> AuthorityChecker<'a> {
         }
 
         // not cached yet – fetch authority from DB
-        let auth = match db.find_permission_by_actor_and_permission(
+        let auth = match db.permission_authority(
             permission.permission.actor,
             permission.permission.permission,
         )? {
@@ -167,11 +167,7 @@ impl<'a> AuthorityChecker<'a> {
             PermissionCacheStatus::BeingEvaluated,
         );
 
-        let satisfied = self.satisfied(
-            db,
-            &auth.get_authority().to_authority(),
-            recursion_depth + 1,
-        )?;
+        let satisfied = self.satisfied(db, &auth, recursion_depth + 1)?;
 
         if satisfied {
             self.cached_permissions.insert(

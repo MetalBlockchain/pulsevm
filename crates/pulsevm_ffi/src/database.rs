@@ -5063,6 +5063,46 @@ impl<'g> DbRead<'g> {
         Ok(res)
     }
 
+    /// The full authority for `(actor, permission)` as an owned value, or `None`
+    /// if the permission doesn't exist.
+    ///
+    /// Authorization satisfaction reads the authority here, so unlike the raw
+    /// `find_permission_by_actor_and_permission` (which hands back a chainbase
+    /// object reference the arena can't produce), this returns an owned
+    /// `Authority` and is served from the arena under `PULSEVM_ARENA_READS`. The
+    /// cross-check is on the canonical encoding rather than on `SharedPtr`
+    /// identity: the mirror stored `encode_authority(auth)`, so re-encoding
+    /// chainbase's authority must reproduce the same bytes — and since
+    /// `decode_authority` is the inverse of `encode_authority`, serving
+    /// `decode_authority(arena_blob)` yields exactly chainbase's authority.
+    pub fn permission_authority(
+        &self,
+        actor: u64,
+        permission: u64,
+    ) -> Result<Option<Authority>, ChainError> {
+        let chainbase = self
+            .db()
+            .find_permission_by_actor_and_permission(actor, permission)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        let chainbase = unsafe { chainbase.as_ref() }
+            .map(|p| ffi::get_authority_from_shared_authority(p.get_authority()));
+
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow {
+            let arena_blob = s.permission_auth_blob(actor, permission);
+            let chainbase_blob = chainbase.as_ref().map(encode_authority);
+            s.note_noncontract(arena_blob == chainbase_blob);
+            if s.reads_enabled() {
+                return match arena_blob {
+                    Some(blob) => Ok(Some(decode_authority(&blob)?)),
+                    None => Ok(None),
+                };
+            }
+        }
+
+        Ok(chainbase)
+    }
+
     pub fn find_permission(&self, id: i64) -> Result<Option<&ffi::PermissionObject>, ChainError> {
         let res = self
             .db()
