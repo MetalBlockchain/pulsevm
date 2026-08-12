@@ -1371,16 +1371,22 @@ impl ArenaShadow {
     }
 
     /// Mirrors `next_recv_sequence`: bumps the receiver's account_metadata
-    /// recv_sequence by one, matching chainbase's per-call increment.
-    pub fn next_recv_sequence(&self, receiver: u64) -> Result<(), DbError> {
+    /// recv_sequence by one and returns the incremented value, matching
+    /// chainbase's `++recv_sequence; return recv_sequence`. `None` if the account
+    /// has no metadata row (chainbase takes a reference and can't be missing).
+    pub fn next_recv_sequence(&self, receiver: u64) -> Result<Option<u64>, DbError> {
         let mut db = self.lock();
-        let id = db
+        let Some(id) = db
             .find_by_hash::<AccountMetaRow, AccountMetaRowByName>(&receiver)?
-            .map(|r| r.id());
-        if let Some(id) = id {
-            db.modify::<AccountMetaRow>(id, |row| row.recv_sequence += 1)?;
-        }
-        Ok(())
+            .map(|r| r.id())
+        else {
+            return Ok(None);
+        };
+        db.modify::<AccountMetaRow>(id, |row| row.recv_sequence += 1)?;
+        let bumped = db
+            .find_by_hash::<AccountMetaRow, AccountMetaRowByName>(&receiver)?
+            .map(|r| r.recv_sequence);
+        Ok(bumped)
     }
 
     /// Mirrors `update_account_abi`: bumps the account_metadata abi_sequence and

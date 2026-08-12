@@ -2870,33 +2870,49 @@ impl Database {
         Ok(res)
     }
 
-    pub fn next_recv_sequence(&mut self, account_name: u64) -> Result<u64, ChainError> {
-        let res = {
+    /// Bump the receiver's `recv_sequence` and return the incremented value.
+    ///
+    /// Takes the account *name*, not a chainbase `&AccountMetadataObject`: the
+    /// object is resolved and mutated entirely inside this method, so no
+    /// database-bound reference escapes into execution (the caller held one
+    /// across the whole action, including the wasm run, only to hand it here).
+    /// The returned sequence lands in the `ActionReceipt` digest, so the arena
+    /// must produce the same value; under `PULSEVM_ARENA_READS` it is served
+    /// from the arena.
+    pub fn next_recv_sequence(&mut self, receiver: u64) -> Result<u64, ChainError> {
+        let chainbase = {
             let mut guard = self.locked_write()?;
-            // Look up the metadata object under this same guard and confine the
-            // reference to the C++ call, so no chainbase reference is handed in by
-            // (or escapes to) the caller.
-            let obj = guard
-                .find_account_metadata(account_name)
-                .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
-            if obj.is_null() {
+            let ptr = guard.find_account_metadata(receiver).map_err(|e| {
+                ChainError::InternalError(format!("failed to find account metadata: {}", e))
+            })?;
+            if ptr.is_null() {
                 return Err(ChainError::InternalError(format!(
                     "account metadata not found for account: {}",
-                    account_name
+                    Name::new(receiver)
                 )));
             }
-            guard
-                .pin_mut()
-                .next_recv_sequence(unsafe { &*obj })
+            // Non-null; the reference is used only under this guard and never escapes.
+            let obj = unsafe { &*ptr };
+            let pinned = guard.pin_mut();
+            pinned
+                .next_recv_sequence(obj)
                 .map_err(|e| ChainError::InternalError(format!("{}", e)))?
         };
         #[cfg(feature = "arena-shadow")]
-        if let Some(s) = &self.shadow
-            && let Err(e) = s.next_recv_sequence(account_name)
-        {
-            eprintln!("arena mirror of next_recv_sequence diverged: {e:?}");
+        if let Some(s) = &self.shadow {
+            match s.next_recv_sequence(receiver) {
+                Ok(arena) => {
+                    s.note_noncontract(arena == Some(chainbase));
+                    if s.reads_enabled()
+                        && let Some(v) = arena
+                    {
+                        return Ok(v);
+                    }
+                }
+                Err(e) => eprintln!("arena mirror of next_recv_sequence diverged: {e:?}"),
+            }
         }
-        Ok(res)
+        Ok(chainbase)
     }
 
     pub fn next_auth_sequence(&mut self, actor: u64) -> Result<u64, ChainError> {
