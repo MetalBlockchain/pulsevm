@@ -629,7 +629,12 @@ impl TransactionContext {
         }
 
         Self::update_billed_cpu_time(&mut inner, &self.db)?;
-        Self::validate_cpu_usage_to_bill(&inner, &self.db, true)?;
+        // Only enforce the minimum-CPU floor when we are the ones billing. On a
+        // block we're replaying, the CPU usage is taken verbatim from the block
+        // (explicit billing, above), so the producer already applied its own
+        // minimum; re-checking against this node's minimum would spuriously
+        // reject a valid block whenever the two configs differ.
+        Self::validate_cpu_usage_to_bill(&inner, &self.db, !inner.explicit_billed_cpu_time)?;
 
         // During benchmarks this would throw an error because the accounts won't have enough CPU to
         // cover the billed time, so we skip this step if we're benchmarking.
