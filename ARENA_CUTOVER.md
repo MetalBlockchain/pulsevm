@@ -56,13 +56,14 @@ gated behind two off-by-default switches:
 
 Roughly a third of the way. Remaining, in dependency order:
 
-1. **Finish the arena read surface.** Only idx64 + primary `db_get_i64` /
-   kv `next`/`previous` are served from the arena today. idx128/256/double/
-   long_double are mirrored in `shadow.rs` but have no `Database` accessor and
-   no serve branch in `apply_context.rs`; primary `db_lowerbound_i64` /
-   `db_upperbound_i64` and all non-contract account/permission/permission-link
-   authorization reads are cross-checked but never served. Mirror the idx64
-   pattern (`database.rs` `arena_idx64_*` + `apply_context.rs` serve branches).
+1. **Finish the arena read surface.** *Largely done — see "Layer 2" below.* All
+   value-returning reads are now served + validated: every contract secondary
+   index (idx64/128/256/double/long_double), primary rows, and the plain-value
+   authorization reads (`is_account`, `is_account_privileged`,
+   `lookup_linked_permission`). What remains are the reads that hand back a
+   chainbase object reference (permission full authority, the `exec_one`
+   account_metadata read fused with a write), which convert as part of the write
+   flip, not as standalone serve branches.
 
 2. **Make the arena the write path**, not a mirror. Today every mutation is
    `chainbase-write → arena-replay` (`database.rs` calls into
@@ -139,3 +140,92 @@ cargo test -p pulsevm_ffi --features arena-shadow --test diff_contract_iter
 
 The differential tests panic on any divergence from chainbase — that is the
 equivalence bar (RAM billing, id assignment, iteration order, state root).
+
+---
+
+# Layer 2 — taking C++ off the execution path (design & sequencing)
+
+Goal restated: the arena becomes the sole backend **execution reads and writes
+from**, while C++ chainbase stays compiled and runs in parallel purely as the
+comparison oracle (`note_pos` / `note_noncontract` / `cross_impl_tables`). The
+C++ source tree is *kept*, not deleted — deletion (step 7 above) is out of scope.
+
+## Where execution stands now
+
+Everything that returns a **value** is already served from the arena under
+`PULSEVM_ARENA_READS` and validated against chainbase:
+
+- Contract secondary indices — idx64/128/256/double/long_double
+  (`find_secondary`/`find_primary`/`lowerbound`/`upperbound`), each with a
+  Database `arena_idx*` accessor and an `apply_context` serve branch, proven by
+  the `idx*_read_accessors_match_chainbase` differential tests.
+- Primary rows — `db_get_i64`/`next`/`previous` serve; `db_lowerbound/upperbound`
+  cross-check the landing primary (the observable row flows through the served
+  `db_get_i64`).
+- Plain-value authorization reads — `is_account`, `is_account_privileged`,
+  `lookup_linked_permission`. `find_account` is retired from execution entirely
+  (every caller only tested existence); its object read survives only in tests.
+
+## What still reads/writes C++ during execution
+
+1. **`account_metadata` in `exec_one`** (`apply_context.rs`). The read
+   (`is_privileged`, `code_hash`, `code_sequence`, `abi_sequence`) is fused with
+   a write in the same breath: `next_recv_sequence(&receiver_account)` takes the
+   same `&AccountMetadataObject` and bumps `recv_sequence`. Read and write must
+   convert together.
+
+2. **Permission reads needing the full authority.** `arena_permission` exposes
+   only `(parent_id, threshold)`. The blockers are the reads that need more:
+   `.get_authority().to_authority()` (`authority_checker.rs`),
+   `.get_authority().get_billable_size()` and `.get_id()`
+   (`pulse_contract.rs` updateauth/linkauth), `.get_name()`
+   (`authorization_manager.rs`), and `.satisfies(other, db)` (a C++ method). The
+   shadow *stores* the whole authority (`PermissionRow.auth: BlobRef`) but has no
+   accessor that decodes it back.
+
+3. **Iterator handles.** The `*IteratorCache` handles (including the end-iterator
+   encoding) are minted by chainbase. Contracts observe and compare them, so the
+   arena must mint its own handles with the identical encoding before it can own
+   iteration.
+
+4. **Writes.** Every mutation is still `chainbase-write -> arena-replay`. The
+   arena is a mirror, not the source of truth.
+
+## Sequencing (each step stays behind the flag + cross-checks until green)
+
+1. **Arena authority decode.** Add a shadow accessor that decodes
+   `PermissionRow.auth` into the `Authority` the checker uses, plus name/id/parent
+   getters. Then serve the remaining `find_permission*` reads. Low risk, in-shadow.
+
+2. **Co-convert `account_metadata` read+write in `exec_one`.** Serve a metadata
+   view (`ArenaAccountMetadata` already carries every field) *and* route
+   `next_recv_sequence` as an arena-owned write. First place the arena owns a
+   read and its paired write together — the template for the write flip.
+
+3. **Arena-owned iterator handles.** The largest piece. Mint handles matching
+   chainbase's encoding; validate with `diff_contract_iter` (iterator-handle
+   equality is already its bar) extended past idx64.
+
+4. **Flip write-ownership.** Invert the mirror: the arena writes first and is the
+   source of truth; chainbase becomes the parallel shadow. Every create/modify/
+   remove already mirrors both ways, so this is inverting which side is
+   authoritative, table by table, cross-checked each block.
+
+5. **Controller drives the arena undo/session stack** directly, not in lockstep
+   behind chainbase's RAII sessions.
+
+6. **Default `PULSEVM_ARENA_READS` on.** C++ now runs only to compare. Acceptance
+   gate: replay the alpine testnet history (1697 blocks, chain-id
+   `193526980f523c07a567dda80f5f543e2356518ce1475cf3e03d98ca740b3f67`) with both
+   backends live, asserting per-block `cross_impl_tables` equality end to end.
+
+## The validation bar (unchanged, just widened)
+
+- `note_pos` / `note_noncontract`: every served read must equal chainbase, always.
+- `diff_contract_iter`: iterator-handle + key equality vs chainbase.
+- `cross_impl_tables`: whole-state per-block equality (now includes
+  `global_property` and `resource_limits_config`).
+- Testnet replay: the end-to-end consensus-equivalence gate.
+
+Nothing advances to "arena-primary" for a given surface until its cross-check has
+been green across a full testnet replay.
