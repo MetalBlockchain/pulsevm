@@ -39,6 +39,14 @@ pub enum ChainError {
     ActionValidationError(String),
     #[error("irrelevant authorization exception: {0}")]
     IrrelevantAuth(String),
+    /// Wall-clock deadline exceeded during execution. This is a SUBJECTIVE failure
+    /// — it depends on how fast this particular node is, not on the transaction's
+    /// deterministic result — so it must be handled by dropping the transaction
+    /// locally, never by rejecting a block another node produced. Distinct from the
+    /// objective op-metering exhaustion (`ApplyError`/`TransactionError`), which is
+    /// consensus.
+    #[error("deadline exceeded: {0}")]
+    DeadlineError(String),
 }
 
 impl From<Box<dyn Error>> for ChainError {
