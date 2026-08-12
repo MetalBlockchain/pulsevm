@@ -297,6 +297,11 @@ struct ResourceStateRow {
 #[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout)]
 struct PermissionRow {
     id: ObjectId<PermissionRow>,
+    // The chainbase `permission_object` id this row mirrors. The arena's own
+    // `id` is assigned in (owner, name) hydration order and does NOT track
+    // chainbase's creation-order ids, so parent links (which are chainbase ids)
+    // are navigated through `cb_id`, not `id`.
+    cb_id: i64,
     usage_id: i64,
     parent: i64,
     owner: u64,
@@ -309,7 +314,7 @@ struct PermByParent;
 impl IndexedBy<PermissionRow> for PermByParent {
     type Key = (i64, i64);
     fn key(o: &PermissionRow) -> Self::Key {
-        (o.parent, o.id.raw())
+        (o.parent, o.cb_id)
     }
 }
 struct PermByOwner;
@@ -323,7 +328,14 @@ struct PermByName;
 impl IndexedBy<PermissionRow> for PermByName {
     type Key = (u64, i64);
     fn key(o: &PermissionRow) -> Self::Key {
-        (o.perm_name, o.id.raw())
+        (o.perm_name, o.cb_id)
+    }
+}
+struct PermByCbId;
+impl IndexedBy<PermissionRow> for PermByCbId {
+    type Key = i64;
+    fn key(o: &PermissionRow) -> Self::Key {
+        o.cb_id
     }
 }
 impl ArenaObject for PermissionRow {
@@ -339,6 +351,7 @@ impl ArenaObject for PermissionRow {
             key_index::<Self, PermByParent>(),
             key_index::<Self, PermByOwner>(),
             key_index::<Self, PermByName>(),
+            key_index::<Self, PermByCbId>(),
         ]
     }
 }
@@ -1481,6 +1494,7 @@ impl ArenaShadow {
     /// stored on the permission, exactly as the C++ path does.
     pub fn create_permission(
         &self,
+        cb_id: i64,
         parent: i64,
         owner: u64,
         perm_name: u64,
@@ -1494,6 +1508,7 @@ impl ArenaShadow {
             .raw();
         let auth_blob = db.alloc_blob::<PermissionRow>(auth)?;
         db.create::<PermissionRow>(|p| {
+            p.cb_id = cb_id;
             p.usage_id = usage_id;
             p.parent = parent;
             p.owner = owner;
@@ -1552,15 +1567,70 @@ impl ArenaShadow {
         db.blob::<PermissionRow>(auth).ok().map(|b| b.to_vec())
     }
 
+    /// Arena mirror of `permission_satisfies_other_permission`: does permission
+    /// `(owner_a, name_a)` satisfy `(owner_b, name_b)` — i.e. is it that same
+    /// permission, its immediate parent, or an ancestor up its parent chain, with
+    /// a matching owner. Walks `other`'s parent chain by id exactly as the C++
+    /// does. `None` if either permission is absent from the mirror.
+    pub fn permission_satisfies(
+        &self,
+        owner_a: u64,
+        name_a: u64,
+        owner_b: u64,
+        name_b: u64,
+    ) -> Option<bool> {
+        let db = self.lock();
+        let (a_owner, a_id) = db
+            .find_by::<PermissionRow, PermByOwner>(&(owner_a, name_a))
+            .ok()
+            .flatten()
+            .map(|p| (p.owner, p.cb_id))?;
+        let (b_owner, b_id, b_parent) = db
+            .find_by::<PermissionRow, PermByOwner>(&(owner_b, name_b))
+            .ok()
+            .flatten()
+            .map(|p| (p.owner, p.cb_id, p.parent))?;
+
+        // Different owners can never satisfy each other.
+        if a_owner != b_owner {
+            return Some(false);
+        }
+        // `a` is `b`, or `a` is `b`'s immediate parent. Both sides are chainbase
+        // ids (`cb_id`), so this navigates the same id space chainbase does.
+        if a_id == b_id || a_id == b_parent {
+            return Some(true);
+        }
+        // Walk up `b`'s parent chain by chainbase id, looking for `a`.
+        let mut parent = db
+            .find_by::<PermissionRow, PermByCbId>(&b_parent)
+            .ok()
+            .flatten();
+        while let Some(par) = parent {
+            if a_id == par.parent {
+                return Some(true);
+            }
+            if par.parent == 0 {
+                return Some(false);
+            }
+            parent = db
+                .find_by::<PermissionRow, PermByCbId>(&par.parent)
+                .ok()
+                .flatten();
+        }
+        Some(false)
+    }
+
     /// Canonical serialization of the whole permission table in (owner, perm_name)
     /// order, matching `Database::permission_state_bytes`: per row owner u64 LE,
-    /// perm_name u64 LE, parent id u64 LE, then a u32 LE length-prefixed authority
-    /// blob (the arena stores the auth already in the shared encode form). The
-    /// reserved perm 0 (owner 0) is skipped. parent is the chainbase id, which the
-    /// mirror stores verbatim, so it compares directly.
+    /// perm_name u64 LE, cb_id u64 LE, parent id u64 LE, last_used u64 LE, then a
+    /// u32 LE length-prefixed authority blob (the arena stores the auth already in
+    /// the shared encode form). The reserved perm 0 (owner 0) is skipped. `cb_id`
+    /// and `parent` are chainbase ids the mirror stores verbatim, so they compare
+    /// directly and, on hydration, give the arena the chainbase id space its
+    /// permission-tree walk needs.
     pub fn permission_state_bytes(&self) -> Vec<u8> {
         let db = self.lock();
-        let mut refs: Vec<(u64, u64, i64, i64, BlobRef)> = match db.table::<PermissionRow>() {
+        let mut refs: Vec<(u64, u64, i64, i64, i64, BlobRef)> = match db.table::<PermissionRow>() {
             Ok(t) => t
                 .iter()
                 .filter(|p| p.owner != 0)
@@ -1572,16 +1642,17 @@ impl ArenaShadow {
                         .flatten()
                         .map(|u| u.last_used)
                         .unwrap_or(0);
-                    (p.owner, p.perm_name, p.parent, last_used, p.auth)
+                    (p.owner, p.perm_name, p.cb_id, p.parent, last_used, p.auth)
                 })
                 .collect(),
             Err(_) => return Vec::new(),
         };
         refs.sort_by_key(|r| (r.0, r.1));
         let mut out = Vec::new();
-        for (owner, perm_name, parent, last_used, auth_ref) in refs {
+        for (owner, perm_name, cb_id, parent, last_used, auth_ref) in refs {
             out.extend_from_slice(&owner.to_le_bytes());
             out.extend_from_slice(&perm_name.to_le_bytes());
+            out.extend_from_slice(&(cb_id as u64).to_le_bytes());
             out.extend_from_slice(&(parent as u64).to_le_bytes());
             out.extend_from_slice(&(last_used as u64).to_le_bytes());
             let auth = db.blob::<PermissionRow>(auth_ref).unwrap_or(&[]);
@@ -1599,15 +1670,16 @@ impl ArenaShadow {
     pub fn hydrate_permissions(&self, bytes: &[u8]) -> Result<(), DbError> {
         let mut db = self.lock();
         let mut pos = 0usize;
-        while pos + 36 <= bytes.len() {
+        while pos + 44 <= bytes.len() {
             let owner = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
             let perm_name = u64::from_le_bytes(bytes[pos + 8..pos + 16].try_into().unwrap());
-            let parent = u64::from_le_bytes(bytes[pos + 16..pos + 24].try_into().unwrap()) as i64;
+            let cb_id = u64::from_le_bytes(bytes[pos + 16..pos + 24].try_into().unwrap()) as i64;
+            let parent = u64::from_le_bytes(bytes[pos + 24..pos + 32].try_into().unwrap()) as i64;
             let last_used =
-                u64::from_le_bytes(bytes[pos + 24..pos + 32].try_into().unwrap()) as i64;
+                u64::from_le_bytes(bytes[pos + 32..pos + 40].try_into().unwrap()) as i64;
             let auth_len =
-                u32::from_le_bytes(bytes[pos + 32..pos + 36].try_into().unwrap()) as usize;
-            pos += 36;
+                u32::from_le_bytes(bytes[pos + 40..pos + 44].try_into().unwrap()) as usize;
+            pos += 44;
             if pos + auth_len > bytes.len() {
                 break;
             }
@@ -1625,6 +1697,7 @@ impl ArenaShadow {
                 .raw();
             let blob = db.alloc_blob::<PermissionRow>(auth)?;
             db.create::<PermissionRow>(|p| {
+                p.cb_id = cb_id;
                 p.usage_id = usage_id;
                 p.parent = parent;
                 p.owner = owner;

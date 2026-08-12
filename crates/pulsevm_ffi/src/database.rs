@@ -532,10 +532,13 @@ impl Database {
                 continue;
             }
             // Safe: non-null, read-only, no mutation between the find and read.
-            let auth = ffi::get_authority_from_shared_authority(unsafe { &*ptr }.get_authority());
+            let perm = unsafe { &*ptr };
+            let cb_id = perm.get_id() as u64;
+            let auth = ffi::get_authority_from_shared_authority(perm.get_authority());
             let auth_bytes = encode_authority(&auth);
             out.extend_from_slice(&owner.to_le_bytes());
             out.extend_from_slice(&perm_name.to_le_bytes());
+            out.extend_from_slice(&cb_id.to_le_bytes());
             out.extend_from_slice(&parent.to_le_bytes());
             out.extend_from_slice(&last_used.to_le_bytes());
             out.extend_from_slice(&(auth_bytes.len() as u32).to_le_bytes());
@@ -4501,7 +4504,12 @@ impl Database {
         #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow {
             let auth_bytes = encode_authority(auth);
+            // The new permission's own chainbase id, so the mirror navigates the
+            // parent tree in chainbase's id space (its own `ObjectId` does not
+            // track chainbase ids).
+            let cb_id = unsafe { res.as_ref() }.map(|p| p.get_id()).unwrap_or(0);
             if let Err(e) = s.create_permission(
+                cb_id,
                 parent as i64,
                 account,
                 name,
@@ -5585,9 +5593,33 @@ impl<'g> DbRead<'g> {
         permission: &ffi::PermissionObject,
         other_permission: &ffi::PermissionObject,
     ) -> Result<bool, ChainError> {
-        self.db()
+        let chainbase = self
+            .db()
             .permission_satisfies_other_permission(permission, other_permission)
-            .map_err(|e| ChainError::TransactionError(format!("{}", e)))
+            .map_err(|e| ChainError::TransactionError(format!("{}", e)))?;
+
+        // The arena walks the same owner/id/parent tree. The two `PermissionObject`
+        // refs are only used to name the permissions — `(owner, name)` — so the
+        // arena can answer without a chainbase object reference and, under
+        // `PULSEVM_ARENA_READS`, this consensus-critical authorization check is
+        // served from it.
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow {
+            let arena = s.permission_satisfies(
+                permission.get_owner().to_uint64_t(),
+                permission.get_name().to_uint64_t(),
+                other_permission.get_owner().to_uint64_t(),
+                other_permission.get_name().to_uint64_t(),
+            );
+            s.note_noncontract(arena == Some(chainbase));
+            if s.reads_enabled()
+                && let Some(a) = arena
+            {
+                return Ok(a);
+            }
+        }
+
+        Ok(chainbase)
     }
 
     pub fn get_permission_last_used(

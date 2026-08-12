@@ -3151,6 +3151,95 @@ mod tests {
         Ok(())
     }
 
+    /// Serve-path satisfies oracle: the `permission_object::satisfies` check that
+    /// gates every updateauth walks the owner/id/parent tree. Build a chain
+    /// active -> a -> b -> c -> d; creating each child requires the authorizing
+    /// permission (active) to satisfy the new permission's parent, which for the
+    /// deeper links means walking up several parents. With arena reads enabled the
+    /// walk is served from the arena — a wrong walk (e.g. a permission-id space
+    /// that didn't track chainbase) would reject the updateauth and fail
+    /// build_block, and the read cross-check must stay clean. This is also the
+    /// end-to-end proof that arena permission ids match chainbase's.
+    #[cfg(feature = "arena-shadow")]
+    #[tokio::test]
+    async fn oracle_permission_satisfies_serves_from_arena() -> Result<(), ChainError> {
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
+        let private_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let mempool = Arc::new(RwLock::new(Mempool::new()));
+        let mut mempool = mempool.write().await;
+        let mut controller = Controller::new();
+        let genesis_bytes = generate_genesis(&private_key);
+        let temp_path = get_temp_dir();
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": private_key.to_string(),
+        })
+        .to_string()
+        .into_bytes();
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &genesis_bytes.to_vec(),
+            temp_path.path().to_str().unwrap(),
+        )?;
+        controller.database().enable_arena_reads();
+
+        let chain_id = controller.chain_id().clone();
+        let glenn = Name::from_str("glenn")?;
+        let (pa, pb, pc, pd) = (
+            Name::from_str("perma")?,
+            Name::from_str("permb")?,
+            Name::from_str("permc")?,
+            Name::from_str("permd")?,
+        );
+
+        mempool.add_transaction(create_account(&private_key, glenn, chain_id)?);
+        // active -> perma -> permb -> permc -> permd. Creating permc requires
+        // active to satisfy permb (one parent hop); permd requires active to
+        // satisfy permc (two hops) — the walk, not just the immediate-parent case.
+        mempool.add_transaction(update_auth(
+            &private_key,
+            glenn,
+            pa,
+            ACTIVE_NAME,
+            1,
+            chain_id,
+        )?);
+        mempool.add_transaction(update_auth(&private_key, glenn, pb, pa, 1, chain_id)?);
+        mempool.add_transaction(update_auth(&private_key, glenn, pc, pb, 1, chain_id)?);
+        mempool.add_transaction(update_auth(&private_key, glenn, pd, pc, 1, chain_id)?);
+        // Each updateauth authorizes through the arena-served satisfies walk; a
+        // wrong walk would reject one of these and fail build_block.
+        let block = controller.build_block(&mut mempool).await?;
+        controller.accept_block(&block.id()?, &mut mempool)?;
+
+        let db = controller.database();
+        let (_ok, nc_fail) = db.arena_noncontract_crosscheck_counts();
+        assert_eq!(
+            nc_fail, 0,
+            "arena served {nc_fail} authorization reads/satisfies checks that diverged from chainbase"
+        );
+
+        // Directly confirm the served walk: active satisfies the two-hop
+        // descendant permc, and permb does not satisfy its ancestor active.
+        let r = db.read()?;
+        let active_perm =
+            AuthorizationManager::get_permission(&r, glenn.as_u64(), ACTIVE_NAME.as_u64())?;
+        let permc = AuthorizationManager::get_permission(&r, glenn.as_u64(), pc.as_u64())?;
+        assert!(
+            active_perm.satisfies(permc, &r)?,
+            "active must satisfy its descendant permc"
+        );
+        assert!(
+            !permc.satisfies(active_perm, &r)?,
+            "a descendant must not satisfy its ancestor"
+        );
+        Ok(())
+    }
+
     /// Permission-link oracle: linkauth binding an action to a permission must
     /// mirror into the arena. The link is keyed by (account, code, message_type)
     /// and the mirrored required_permission must equal chainbase's, read back

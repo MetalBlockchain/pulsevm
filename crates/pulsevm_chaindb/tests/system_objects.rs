@@ -40,7 +40,7 @@ fn accounts_and_metadata_create_and_read_back() {
 #[test]
 fn permission_create_modify_remove() {
     let s = db();
-    s.create_permission(-1, 1, 100, 0, &auth(1)).unwrap();
+    s.create_permission(5, -1, 1, 100, 0, &auth(1)).unwrap();
     // permission() -> (parent, threshold)
     assert_eq!(s.permission(1, 100), Some((-1, 1)));
 
@@ -49,6 +49,30 @@ fn permission_create_modify_remove() {
 
     s.remove_permission(1, 100).unwrap();
     assert_eq!(s.permission(1, 100), None);
+}
+
+#[test]
+fn permission_satisfies_walks_parent_chain() {
+    let s = db();
+    // A tree for owner 1: a(id 1, root) -> b(id 2) -> c(id 3). Parent links are
+    // chainbase ids; the root's parent is 0.
+    let (a, b, c) = (100u64, 101u64, 102u64);
+    s.create_permission(1, 0, 1, a, 0, &auth(1)).unwrap();
+    s.create_permission(2, 1, 1, b, 0, &auth(1)).unwrap();
+    s.create_permission(3, 2, 1, c, 0, &auth(1)).unwrap();
+
+    // Self and immediate parent.
+    assert_eq!(s.permission_satisfies(1, a, 1, a), Some(true));
+    assert_eq!(s.permission_satisfies(1, b, 1, c), Some(true));
+    // Ancestor two hops up (the walk).
+    assert_eq!(s.permission_satisfies(1, a, 1, c), Some(true));
+    // A descendant does not satisfy its ancestor.
+    assert_eq!(s.permission_satisfies(1, c, 1, a), Some(false));
+    assert_eq!(s.permission_satisfies(1, c, 1, b), Some(false));
+    // A different owner never satisfies.
+    assert_eq!(s.permission_satisfies(2, a, 1, c), None);
+    // Absent permissions read back as None.
+    assert_eq!(s.permission_satisfies(1, a, 1, 999), None);
 }
 
 #[test]
@@ -129,7 +153,7 @@ fn undo_reverts_a_whole_session_across_tables() {
     // A session that touches several tables.
     s.start_undo_session();
     s.create_account(2, 100).unwrap();
-    s.create_permission(-1, 2, 100, 0, &auth(1)).unwrap();
+    s.create_permission(6, -1, 2, 100, 0, &auth(1)).unwrap();
     s.set_privileged(1, true).unwrap();
     assert!(s.account_exists(2));
     assert_eq!(s.permission(2, 100), Some((-1, 1)));
@@ -170,7 +194,7 @@ fn checkpoint_and_reload_preserve_state_root() {
     let s = db();
     s.create_account(1, 100).unwrap();
     s.create_account_metadata(1, false).unwrap();
-    s.create_permission(-1, 1, 100, 0, &auth(2)).unwrap();
+    s.create_permission(7, -1, 1, 100, 0, &auth(2)).unwrap();
     s.initialize_account_resource_limits(1).unwrap();
     s.set_account_limits(1, 4096, 5, 6).unwrap();
     let root = s.state_root();
