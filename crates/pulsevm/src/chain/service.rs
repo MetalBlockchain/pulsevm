@@ -9,6 +9,7 @@ use jsonrpsee::{
     types::ErrorObjectOwned,
 };
 use pulsevm_core::{
+    ChainError,
     abi::AbiDefinition,
     authorization_manager::AuthorizationManager,
     block::SignedBlock,
@@ -183,6 +184,50 @@ impl RpcService {
         // serde_json::from_str::<Response<u64>>(&resp).unwrap().try_into().unwrap();
 
         Ok(resp)
+    }
+
+    /// Validate a packed transaction and admit it to the mempool. Returns
+    /// `Ok(true)` if it was newly added, `Ok(false)` if it was already known (or
+    /// the mempool is full), and `Err` if it failed validation and must not be
+    /// propagated. Shared by the RPC issue path and the peer-gossip path so both
+    /// apply the same admission rules — a transaction only enters the mempool
+    /// after it executes cleanly, and the newly-added flag lets the caller relay
+    /// exactly once, which stops gossip from looping.
+    pub async fn admit_transaction(
+        &self,
+        packed_trx: PackedTransaction,
+    ) -> Result<bool, ChainError> {
+        // Fast path: a transaction we already hold has been validated and
+        // relayed once already, so skip the expensive execute-and-revert and
+        // report it as not newly added. This is what absorbs re-gossip of a
+        // transaction already in flight.
+        if self.mempool.read().await.contains(packed_trx.id()) {
+            return Ok(false);
+        }
+
+        // Execution is synchronous, blocking FFI/wasm work with no await points,
+        // so run it on the blocking pool and take the lock with blocking_write()
+        // instead of holding the async lock on a runtime worker, which would
+        // stall every other handler. push_transaction reverts the database, so
+        // this is validation only — nothing is committed.
+        let controller = self.controller.clone();
+        let trx_for_exec = packed_trx.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut controller = controller.blocking_write();
+            let pending_block_timestamp = TimePoint::now().into();
+            controller.push_transaction(
+                &trx_for_exec,
+                &pending_block_timestamp,
+                &pulsevm_core::block::BlockStatus::Verifying,
+            )
+        })
+        .await
+        .map_err(|e| {
+            ChainError::InternalError(format!("transaction execution task failed: {e}"))
+        })??;
+
+        let mut mempool = self.mempool.write().await;
+        Ok(mempool.add_transaction(packed_trx))
     }
 }
 
@@ -413,42 +458,13 @@ impl RpcServer for RpcService {
             packed_trx,
         )?;
 
-        // Run transaction and revert it. Execution is synchronous, blocking
-        // FFI/wasm work with no await points, so run it on the blocking pool
-        // and take the lock with blocking_write() instead of holding the async
-        // lock on a runtime worker, which would stall every other RPC handler.
-        {
-            let controller = self.controller.clone();
-            let trx_for_exec = packed_trx.clone();
-            tokio::task::spawn_blocking(move || {
-                let mut controller = controller.blocking_write();
-                let pending_block_timestamp = TimePoint::now().into();
-                controller.push_transaction(
-                    &trx_for_exec,
-                    &pending_block_timestamp,
-                    &pulsevm_core::block::BlockStatus::Verifying,
-                )
-            })
-            .await
-            .map_err(|e| {
-                ErrorObjectOwned::owned(
-                    -32000,
-                    format!("transaction execution task failed: {e}"),
-                    None::<()>,
-                )
-            })??;
+        // Validate and admit; only gossip a transaction we hadn't already seen.
+        let newly_added = self.admit_transaction(packed_trx.clone()).await?;
+        if newly_added {
+            let nm = self.network_manager.read().await;
+            let gossipable_msg = Gossipable::new(GossipType::Transaction, packed_trx.clone())?;
+            nm.gossip(gossipable_msg).await?;
         }
-
-        // Add to mempool
-        {
-            let mut mempool = self.mempool.write().await;
-            mempool.add_transaction(packed_trx.clone());
-        }
-
-        // Gossip
-        let nm = self.network_manager.read().await;
-        let gossipable_msg = Gossipable::new(GossipType::Transaction, packed_trx.clone())?;
-        nm.gossip(gossipable_msg).await?;
 
         // Return a simple response
         Ok(IssueTxResponse {
@@ -540,5 +556,175 @@ impl RpcServer for RpcService {
         })?;
 
         Ok(rows)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pulsevm_core::{
+        authority::{
+            Authority,
+            KeyWeight,
+            PermissionLevel,
+        },
+        crypto::PrivateKey,
+        pulse_contract::NewAccount,
+        time::TimePointSec,
+        transaction::{
+            Action,
+            TransactionHeader,
+        },
+    };
+    use pulsevm_serialization::Write;
+    use serde_json::json;
+
+    const GENESIS_KEY: &str = "PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez";
+    const CHAIN_ID: &str = "c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6";
+
+    fn genesis_bytes(key: &PrivateKey) -> Vec<u8> {
+        // Mirrors the controller test genesis: point-denominated CPU budgets and a
+        // wide transaction lifetime so the builders' "never expires" expiration is
+        // accepted.
+        json!({
+            "initial_timestamp": "2023-01-01T00:00:00",
+            "initial_key": key.get_public_key().to_string(),
+            "initial_configuration": {
+                "max_block_net_usage": 1048576,
+                "target_block_net_usage_pct": 1000,
+                "max_transaction_net_usage": 524288,
+                "base_per_transaction_net_usage": 12,
+                "net_usage_leeway": 500,
+                "context_free_discount_net_usage_num": 20,
+                "context_free_discount_net_usage_den": 100,
+                "max_block_cpu_usage": 3000000000u64,
+                "target_block_cpu_usage_pct": 2500,
+                "max_transaction_cpu_usage": 1000000000,
+                "min_transaction_cpu_usage": 100000,
+                "max_transaction_lifetime": 4294967295u32,
+                "max_inline_action_size": 4096,
+                "max_inline_action_depth": 6,
+                "max_authority_depth": 6,
+                "max_action_return_value_size": 256
+            }
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    // A newaccount transaction whose new account is controlled by `auth_key`,
+    // signed by `signer`. Passing a `signer` other than the genesis key models
+    // untrusted gossip: the signature can't satisfy pulse@active, so validation
+    // must reject it.
+    fn newaccount_tx(
+        auth_key: &PrivateKey,
+        signer: &PrivateKey,
+        account: &str,
+        chain_id: &Id,
+    ) -> PackedTransaction {
+        let authority = Authority::new(
+            1,
+            vec![KeyWeight::new(auth_key.get_public_key().into(), 1)],
+            vec![],
+            vec![],
+        );
+        let action = Action::new(
+            Name::from_str("pulse").unwrap(),
+            Name::from_str("newaccount").unwrap(),
+            NewAccount {
+                creator: Name::from_str("pulse").unwrap(),
+                name: Name::from_str(account).unwrap(),
+                owner: authority.clone(),
+                active: authority,
+            }
+            .pack()
+            .unwrap(),
+            vec![PermissionLevel::new(
+                Name::from_str("pulse").unwrap().as_u64(),
+                Name::from_str("active").unwrap().as_u64(),
+            )],
+        );
+        let trx = Transaction::new(
+            TransactionHeader::new(TimePointSec::maximum(), 0, 0, 0u32.into(), 0, 0u32.into()),
+            vec![],
+            vec![action],
+        )
+        .sign(signer, chain_id)
+        .unwrap();
+        PackedTransaction::from_signed_transaction(trx).unwrap()
+    }
+
+    fn service_with_genesis() -> (
+        RpcService,
+        Arc<RwLock<Mempool>>,
+        PrivateKey,
+        Id,
+        tempfile::TempDir,
+    ) {
+        let genesis_key = PrivateKey::from_str(GENESIS_KEY).unwrap();
+        let chain_id = Id::from_str(CHAIN_ID).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+
+        let mut controller = Controller::new();
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": genesis_key.to_string(),
+        })
+        .to_string()
+        .into_bytes();
+        controller
+            .initialize(
+                &chain_id,
+                &config_bytes,
+                &genesis_bytes(&genesis_key),
+                temp.path().to_str().unwrap(),
+            )
+            .unwrap();
+
+        let mempool = Arc::new(RwLock::new(Mempool::new()));
+        let service = RpcService::new(
+            mempool.clone(),
+            Arc::new(RwLock::new(controller)),
+            Arc::new(RwLock::new(NetworkManager::new())),
+        );
+        (service, mempool, genesis_key, chain_id, temp)
+    }
+
+    // A correctly signed transaction is validated and admitted once; a second
+    // copy (re-gossip) is reported as already known so the caller doesn't relay
+    // it again.
+    #[tokio::test]
+    async fn admit_transaction_validates_and_dedups() {
+        let (service, mempool, genesis_key, chain_id, _temp) = service_with_genesis();
+
+        let good = newaccount_tx(&genesis_key, &genesis_key, "alice", &chain_id);
+        assert!(
+            service.admit_transaction(good.clone()).await.unwrap(),
+            "a valid transaction should be newly admitted"
+        );
+        assert!(mempool.read().await.contains(good.id()));
+
+        assert!(
+            !service.admit_transaction(good.clone()).await.unwrap(),
+            "a re-gossiped transaction should not be admitted (or relayed) twice"
+        );
+    }
+
+    // A transaction whose signature can't satisfy the required authority is the
+    // shape of untrusted gossip. It must be rejected and must never enter the
+    // mempool.
+    #[tokio::test]
+    async fn admit_transaction_rejects_unauthorized() {
+        let (service, mempool, genesis_key, chain_id, _temp) = service_with_genesis();
+
+        let forged = newaccount_tx(&genesis_key, &PrivateKey::random(), "mallory", &chain_id);
+        assert!(
+            service.admit_transaction(forged.clone()).await.is_err(),
+            "a transaction with an unsatisfiable authority must be rejected"
+        );
+        assert!(
+            !mempool.read().await.contains(forged.id()),
+            "a rejected transaction must not reach the mempool"
+        );
     }
 }
