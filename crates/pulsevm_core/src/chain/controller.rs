@@ -4944,21 +4944,30 @@ mod tests {
             .collect();
         files.sort();
 
+        // Fixtures may store the block under a JSON-RPC `result` wrapper (a raw
+        // getBlock response) or at the top level (just the block). Accept either,
+        // so a wrapper mismatch can't silently make every block parse as block 0
+        // and get skipped — which passes the test while replaying nothing.
+        fn block_body(v: &serde_json::Value) -> &serde_json::Value {
+            match v.get("result") {
+                Some(r) if !r.is_null() => r,
+                _ => v,
+            }
+        }
+
         // The genesis initial_timestamp is block 1's timestamp; the committed
         // genesis.json may carry a placeholder, so patch it to the real one so
         // our genesis block (and the genesis accounts' creation dates) match.
         let b1: serde_json::Value =
             serde_json::from_slice(&fs::read(files.first().expect("no block fixtures")).unwrap())
                 .unwrap();
+        let b1r = block_body(&b1);
         assert_eq!(
-            b1["result"]["block_num"].as_u64(),
+            b1r["block_num"].as_u64(),
             Some(1),
             "first fixture must be block 1"
         );
-        let ts = b1["result"]["timestamp"]
-            .as_str()
-            .unwrap()
-            .trim_end_matches(".000");
+        let ts = b1r["timestamp"].as_str().unwrap().trim_end_matches(".000");
         let mut g: serde_json::Value =
             serde_json::from_slice(&fs::read(repo_root.join("genesis.json")).unwrap()).unwrap();
         g["initial_timestamp"] = json!(ts);
@@ -4969,7 +4978,7 @@ mod tests {
         // won't have the key its transactions are signed with.
         for f in &files {
             let v: serde_json::Value = serde_json::from_slice(&fs::read(f).unwrap()).unwrap();
-            let r = &v["result"];
+            let r = block_body(&v);
             if r["transactions"]
                 .as_array()
                 .map(|a| !a.is_empty())
@@ -5014,7 +5023,7 @@ mod tests {
         let start = controller.last_accepted_block().block_num() + 1;
         assert_eq!(
             genesis_id.to_string(),
-            b1["result"]["id"].as_str().unwrap(),
+            b1r["id"].as_str().unwrap(),
             "our genesis block id != testnet block 1 id — genesis mismatch"
         );
 
@@ -5051,7 +5060,7 @@ mod tests {
         let mut replayed = 0u32;
         for f in &files {
             let v: serde_json::Value = serde_json::from_slice(&fs::read(f).unwrap()).unwrap();
-            let r = &v["result"];
+            let r = block_body(&v);
             let n = r["block_num"].as_u64().unwrap_or(0) as u32;
             if n < start {
                 continue;
@@ -5165,6 +5174,16 @@ mod tests {
                 restart_block = n;
             }
         }
+
+        // Guard against a silent no-op: if the harness ever parses no real blocks
+        // (a fixture-shape or numbering mismatch), `replayed` stays below the
+        // first block and the whole cross-check ran on nothing. Fail loudly rather
+        // than report a green run over zero blocks.
+        assert!(
+            replayed >= start,
+            "replay covered no blocks (replayed up to {replayed}, expected >= {start}) — \
+             fixture/harness mismatch"
+        );
 
         // Read-surface check: the cross-impl root proves the arena *holds* the
         // same rows as chainbase, but running as primary means the arena must
