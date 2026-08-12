@@ -1428,15 +1428,34 @@ impl ApplyContext {
         secondary: U256,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        let search = secondary.value;
         let mut inner = self.inner.write()?;
-        self.db.db_idx256_find_secondary(
+        let res = self.db.db_idx256_find_secondary(
             &mut inner.index256_cache,
             code,
             scope,
             table,
             secondary,
             primary,
-        )
+        )?;
+
+        #[cfg(feature = "arena-shadow")]
+        {
+            let arena = self
+                .db
+                .arena_idx256_find_secondary(code, scope, table, search);
+            let ffi = if res >= 0 { Some(*primary) } else { None };
+            self.db.arena_note_pos(arena == ffi);
+            if self.db.arena_reads_enabled()
+                && res >= 0
+                && let Some(p) = arena
+            {
+                *primary = p;
+            }
+        }
+
+        Ok(res)
     }
 
     pub fn db_idx256_find_primary(
@@ -1448,14 +1467,35 @@ impl ApplyContext {
         primary: u64,
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        self.db.db_idx256_find_primary(
+        let res = self.db.db_idx256_find_primary(
             &mut inner.index256_cache,
             code,
             scope,
             table,
             secondary,
             primary,
-        )
+        )?;
+
+        #[cfg(feature = "arena-shadow")]
+        {
+            let arena = self
+                .db
+                .arena_idx256_find_primary(code, scope, table, primary);
+            let ffi = if res >= 0 {
+                Some(secondary.value)
+            } else {
+                None
+            };
+            self.db.arena_note_pos(arena == ffi);
+            if self.db.arena_reads_enabled()
+                && res >= 0
+                && let Some(b) = arena
+            {
+                secondary.value = b;
+            }
+        }
+
+        Ok(res)
     }
 
     pub fn db_idx256_lowerbound(
@@ -1466,15 +1506,37 @@ impl ApplyContext {
         secondary: &mut U256,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        let search = secondary.value;
         let mut inner = self.inner.write()?;
-        self.db.db_idx256_lowerbound(
+        let res = self.db.db_idx256_lowerbound(
             &mut inner.index256_cache,
             code,
             scope,
             table,
             secondary,
             primary,
-        )
+        )?;
+
+        #[cfg(feature = "arena-shadow")]
+        {
+            let arena = self.db.arena_idx256_lower_bound(code, scope, table, search);
+            let ffi = if res >= 0 {
+                Some((*primary, secondary.value))
+            } else {
+                None
+            };
+            self.db.arena_note_pos(arena == ffi);
+            if self.db.arena_reads_enabled()
+                && res >= 0
+                && let Some((p, b)) = arena
+            {
+                *primary = p;
+                secondary.value = b;
+            }
+        }
+
+        Ok(res)
     }
 
     pub fn db_idx256_upperbound(
@@ -1485,15 +1547,37 @@ impl ApplyContext {
         secondary: &mut U256,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        let search = secondary.value;
         let mut inner = self.inner.write()?;
-        self.db.db_idx256_upperbound(
+        let res = self.db.db_idx256_upperbound(
             &mut inner.index256_cache,
             code,
             scope,
             table,
             secondary,
             primary,
-        )
+        )?;
+
+        #[cfg(feature = "arena-shadow")]
+        {
+            let arena = self.db.arena_idx256_upper_bound(code, scope, table, search);
+            let ffi = if res >= 0 {
+                Some((*primary, secondary.value))
+            } else {
+                None
+            };
+            self.db.arena_note_pos(arena == ffi);
+            if self.db.arena_reads_enabled()
+                && res >= 0
+                && let Some((p, b)) = arena
+            {
+                *primary = p;
+                secondary.value = b;
+            }
+        }
+
+        Ok(res)
     }
 
     pub fn db_idx256_end(&mut self, code: u64, scope: u64, table: u64) -> Result<i32, ChainError> {
@@ -1613,14 +1697,31 @@ impl ApplyContext {
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        self.db.db_idx_double_find_secondary(
+        let res = self.db.db_idx_double_find_secondary(
             &mut inner.index_double_cache,
             code,
             scope,
             table,
             secondary,
             primary,
-        )
+        )?;
+
+        #[cfg(feature = "arena-shadow")]
+        {
+            let arena = self
+                .db
+                .arena_idx_double_find_secondary(code, scope, table, secondary);
+            let ffi = if res >= 0 { Some(*primary) } else { None };
+            self.db.arena_note_pos(arena == ffi);
+            if self.db.arena_reads_enabled()
+                && res >= 0
+                && let Some(p) = arena
+            {
+                *primary = p;
+            }
+        }
+
+        Ok(res)
     }
 
     pub fn db_idx_double_find_primary(
@@ -1632,14 +1733,31 @@ impl ApplyContext {
         primary: u64,
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        self.db.db_idx_double_find_primary(
+        let res = self.db.db_idx_double_find_primary(
             &mut inner.index_double_cache,
             code,
             scope,
             table,
             secondary,
             primary,
-        )
+        )?;
+
+        #[cfg(feature = "arena-shadow")]
+        {
+            let arena = self
+                .db
+                .arena_idx_double_find_primary(code, scope, table, primary);
+            let ffi = if res >= 0 { Some(*secondary) } else { None };
+            self.db.arena_note_pos(arena == ffi);
+            if self.db.arena_reads_enabled()
+                && res >= 0
+                && let Some(s) = arena
+            {
+                *secondary = s;
+            }
+        }
+
+        Ok(res)
     }
 
     pub fn db_idx_double_lowerbound(
@@ -1650,15 +1768,39 @@ impl ApplyContext {
         secondary: &mut u64,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        let search = *secondary;
         let mut inner = self.inner.write()?;
-        self.db.db_idx_double_lowerbound(
+        let res = self.db.db_idx_double_lowerbound(
             &mut inner.index_double_cache,
             code,
             scope,
             table,
             secondary,
             primary,
-        )
+        )?;
+
+        #[cfg(feature = "arena-shadow")]
+        {
+            let arena = self
+                .db
+                .arena_idx_double_lower_bound(code, scope, table, search);
+            let ffi = if res >= 0 {
+                Some((*primary, *secondary))
+            } else {
+                None
+            };
+            self.db.arena_note_pos(arena == ffi);
+            if self.db.arena_reads_enabled()
+                && res >= 0
+                && let Some((p, s)) = arena
+            {
+                *primary = p;
+                *secondary = s;
+            }
+        }
+
+        Ok(res)
     }
 
     pub fn db_idx_double_upperbound(
@@ -1669,15 +1811,39 @@ impl ApplyContext {
         secondary: &mut u64,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        let search = *secondary;
         let mut inner = self.inner.write()?;
-        self.db.db_idx_double_upperbound(
+        let res = self.db.db_idx_double_upperbound(
             &mut inner.index_double_cache,
             code,
             scope,
             table,
             secondary,
             primary,
-        )
+        )?;
+
+        #[cfg(feature = "arena-shadow")]
+        {
+            let arena = self
+                .db
+                .arena_idx_double_upper_bound(code, scope, table, search);
+            let ffi = if res >= 0 {
+                Some((*primary, *secondary))
+            } else {
+                None
+            };
+            self.db.arena_note_pos(arena == ffi);
+            if self.db.arena_reads_enabled()
+                && res >= 0
+                && let Some((p, s)) = arena
+            {
+                *primary = p;
+                *secondary = s;
+            }
+        }
+
+        Ok(res)
     }
 
     pub fn db_idx_double_end(
@@ -1807,15 +1973,34 @@ impl ApplyContext {
         secondary: Float128,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        let search = (secondary.lo, secondary.hi);
         let mut inner = self.inner.write()?;
-        self.db.db_idx_long_double_find_secondary(
+        let res = self.db.db_idx_long_double_find_secondary(
             &mut inner.index_long_double_cache,
             code,
             scope,
             table,
             secondary,
             primary,
-        )
+        )?;
+
+        #[cfg(feature = "arena-shadow")]
+        {
+            let arena = self
+                .db
+                .arena_idx_long_double_find_secondary(code, scope, table, search);
+            let ffi = if res >= 0 { Some(*primary) } else { None };
+            self.db.arena_note_pos(arena == ffi);
+            if self.db.arena_reads_enabled()
+                && res >= 0
+                && let Some(p) = arena
+            {
+                *primary = p;
+            }
+        }
+
+        Ok(res)
     }
 
     pub fn db_idx_long_double_find_primary(
@@ -1827,14 +2012,36 @@ impl ApplyContext {
         primary: u64,
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        self.db.db_idx_long_double_find_primary(
+        let res = self.db.db_idx_long_double_find_primary(
             &mut inner.index_long_double_cache,
             code,
             scope,
             table,
             secondary,
             primary,
-        )
+        )?;
+
+        #[cfg(feature = "arena-shadow")]
+        {
+            let arena = self
+                .db
+                .arena_idx_long_double_find_primary(code, scope, table, primary);
+            let ffi = if res >= 0 {
+                Some((secondary.lo, secondary.hi))
+            } else {
+                None
+            };
+            self.db.arena_note_pos(arena == ffi);
+            if self.db.arena_reads_enabled()
+                && res >= 0
+                && let Some((lo, hi)) = arena
+            {
+                secondary.lo = lo;
+                secondary.hi = hi;
+            }
+        }
+
+        Ok(res)
     }
 
     pub fn db_idx_long_double_lowerbound(
@@ -1845,15 +2052,40 @@ impl ApplyContext {
         secondary: &mut Float128,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        let search = (secondary.lo, secondary.hi);
         let mut inner = self.inner.write()?;
-        self.db.db_idx_long_double_lowerbound(
+        let res = self.db.db_idx_long_double_lowerbound(
             &mut inner.index_long_double_cache,
             code,
             scope,
             table,
             secondary,
             primary,
-        )
+        )?;
+
+        #[cfg(feature = "arena-shadow")]
+        {
+            let arena = self
+                .db
+                .arena_idx_long_double_lower_bound(code, scope, table, search);
+            let ffi = if res >= 0 {
+                Some((*primary, (secondary.lo, secondary.hi)))
+            } else {
+                None
+            };
+            self.db.arena_note_pos(arena == ffi);
+            if self.db.arena_reads_enabled()
+                && res >= 0
+                && let Some((p, (lo, hi))) = arena
+            {
+                *primary = p;
+                secondary.lo = lo;
+                secondary.hi = hi;
+            }
+        }
+
+        Ok(res)
     }
 
     pub fn db_idx_long_double_upperbound(
@@ -1864,15 +2096,40 @@ impl ApplyContext {
         secondary: &mut Float128,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        let search = (secondary.lo, secondary.hi);
         let mut inner = self.inner.write()?;
-        self.db.db_idx_long_double_upperbound(
+        let res = self.db.db_idx_long_double_upperbound(
             &mut inner.index_long_double_cache,
             code,
             scope,
             table,
             secondary,
             primary,
-        )
+        )?;
+
+        #[cfg(feature = "arena-shadow")]
+        {
+            let arena = self
+                .db
+                .arena_idx_long_double_upper_bound(code, scope, table, search);
+            let ffi = if res >= 0 {
+                Some((*primary, (secondary.lo, secondary.hi)))
+            } else {
+                None
+            };
+            self.db.arena_note_pos(arena == ffi);
+            if self.db.arena_reads_enabled()
+                && res >= 0
+                && let Some((p, (lo, hi))) = arena
+            {
+                *primary = p;
+                secondary.lo = lo;
+                secondary.hi = hi;
+            }
+        }
+
+        Ok(res)
     }
 
     pub fn db_idx_long_double_end(

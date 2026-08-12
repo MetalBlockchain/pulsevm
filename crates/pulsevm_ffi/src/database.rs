@@ -949,6 +949,257 @@ impl Database {
         }
     }
 
+    // idx_double: the intrinsic carries the float64 as its raw u64 bit pattern;
+    // the arena keys on f64, so convert at the boundary (bit-exact both ways).
+    pub fn arena_idx_double_find_secondary(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        secondary_bits: u64,
+    ) -> Option<u64> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow.as_ref().and_then(|s| {
+                s.idx_double_find_secondary(code, scope, table, f64::from_bits(secondary_bits))
+            })
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = (code, scope, table, secondary_bits);
+            None
+        }
+    }
+
+    pub fn arena_idx_double_find_primary(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary: u64,
+    ) -> Option<u64> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow
+                .as_ref()
+                .and_then(|s| s.idx_double_find_primary(code, scope, table, primary))
+                .map(|f| f.to_bits())
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = (code, scope, table, primary);
+            None
+        }
+    }
+
+    pub fn arena_idx_double_lower_bound(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        secondary_bits: u64,
+    ) -> Option<(u64, u64)> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow
+                .as_ref()
+                .and_then(|s| {
+                    s.idx_double_lower_bound(code, scope, table, f64::from_bits(secondary_bits))
+                })
+                .map(|(p, f)| (p, f.to_bits()))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = (code, scope, table, secondary_bits);
+            None
+        }
+    }
+
+    pub fn arena_idx_double_upper_bound(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        secondary_bits: u64,
+    ) -> Option<(u64, u64)> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow
+                .as_ref()
+                .and_then(|s| {
+                    s.idx_double_upper_bound(code, scope, table, f64::from_bits(secondary_bits))
+                })
+                .map(|(p, f)| (p, f.to_bits()))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = (code, scope, table, secondary_bits);
+            None
+        }
+    }
+
+    // idx256: the arena keys on the raw 32-byte value (U256.value).
+    pub fn arena_idx256_find_secondary(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        secondary: [u8; 32],
+    ) -> Option<u64> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow
+                .as_ref()
+                .and_then(|s| s.idx256_find_secondary(code, scope, table, secondary))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = (code, scope, table, secondary);
+            None
+        }
+    }
+
+    pub fn arena_idx256_find_primary(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary: u64,
+    ) -> Option<[u8; 32]> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow
+                .as_ref()
+                .and_then(|s| s.idx256_find_primary(code, scope, table, primary))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = (code, scope, table, primary);
+            None
+        }
+    }
+
+    pub fn arena_idx256_lower_bound(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        secondary: [u8; 32],
+    ) -> Option<(u64, [u8; 32])> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow
+                .as_ref()
+                .and_then(|s| s.idx256_lower_bound(code, scope, table, secondary))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = (code, scope, table, secondary);
+            None
+        }
+    }
+
+    pub fn arena_idx256_upper_bound(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        secondary: [u8; 32],
+    ) -> Option<(u64, [u8; 32])> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow
+                .as_ref()
+                .and_then(|s| s.idx256_upper_bound(code, scope, table, secondary))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = (code, scope, table, secondary);
+            None
+        }
+    }
+
+    // idx_long_double: the intrinsic carries the float128 as (lo, hi) u64 words.
+    pub fn arena_idx_long_double_find_secondary(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        secondary: (u64, u64),
+    ) -> Option<u64> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow
+                .as_ref()
+                .and_then(|s| s.idx_long_double_find_secondary(code, scope, table, secondary))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = (code, scope, table, secondary);
+            None
+        }
+    }
+
+    pub fn arena_idx_long_double_find_primary(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary: u64,
+    ) -> Option<(u64, u64)> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow
+                .as_ref()
+                .and_then(|s| s.idx_long_double_find_primary(code, scope, table, primary))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = (code, scope, table, primary);
+            None
+        }
+    }
+
+    pub fn arena_idx_long_double_lower_bound(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        secondary: (u64, u64),
+    ) -> Option<(u64, (u64, u64))> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow
+                .as_ref()
+                .and_then(|s| s.idx_long_double_lower_bound(code, scope, table, secondary))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = (code, scope, table, secondary);
+            None
+        }
+    }
+
+    pub fn arena_idx_long_double_upper_bound(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        secondary: (u64, u64),
+    ) -> Option<(u64, (u64, u64))> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow
+                .as_ref()
+                .and_then(|s| s.idx_long_double_upper_bound(code, scope, table, secondary))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = (code, scope, table, secondary);
+            None
+        }
+    }
+
     /// Tally an iterator-positioning cross-check (arena landing vs chainbase).
     pub fn arena_note_pos(&self, matched: bool) {
         #[cfg(feature = "arena-shadow")]
