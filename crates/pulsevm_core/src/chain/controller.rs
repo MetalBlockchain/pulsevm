@@ -1207,7 +1207,14 @@ impl Controller {
                 Ok((result.action_receipt_digests, result.proposed_schedule))
             }
             Err(e) => {
-                warn!("onblock failed, skipping: {}", e);
+                // A contract without an onblock handler rejects the implicit
+                // action as unknown. That is an expected no-op on such chains;
+                // other failures still deserve a warning.
+                if e.to_string().contains("unknown action") {
+                    debug!("onblock not implemented by the system contract, skipping");
+                } else {
+                    warn!("onblock failed, skipping: {}", e);
+                }
                 session.pin_mut().undo().map_err(|e| {
                     ChainError::DatabaseError(format!("failed to undo onblock: {}", e))
                 })?;
@@ -8392,6 +8399,63 @@ mod tests {
         assert!(
             !digests.is_empty(),
             "onblock must run the pulse contract to completion under a CPU limit of -1"
+        );
+
+        Ok(())
+    }
+
+    // A system contract that does not implement onblock must not break block
+    // production. The failed implicit action is undone and contributes neither
+    // a receipt nor CPU usage.
+    #[tokio::test]
+    async fn onblock_skipped_cleanly_when_contract_rejects_it() -> Result<(), ChainError> {
+        let (mut controller, private_key, _chain_id, _temp) = init_test_controller()?;
+        let ts = controller.last_accepted_block().timestamp().clone();
+        let chain_id = controller.chain_id().clone();
+        let status = BlockStatus::Building;
+
+        let onblock = ONBLOCK_NAME.as_u64() as i64;
+        let wasm = wat::parse_str(&format!(
+            r#"
+            (module
+              (import "env" "eosio_assert" (func $assert (param i32 i32)))
+              (memory (export "memory") 1)
+              (data (i32.const 8) "unknown action\00")
+              (func (export "apply") (param i64 i64 i64)
+                (block $skip
+                  (br_if $skip (i64.ne (local.get 2) (i64.const {onblock})))
+                  (call $assert (i32.const 0) (i32.const 8)))))
+            "#,
+        ))
+        .unwrap();
+        controller.execute_transaction(
+            &set_code(&private_key, PULSE_NAME, wasm, chain_id)?,
+            &ts,
+            &status,
+        )?;
+
+        let db = controller.database();
+        let recv_before = db
+            .get_account_metadata(PULSE_NAME.as_u64())?
+            .get_recv_sequence();
+        let cpu_before = db.get_block_cpu_limit()?;
+
+        let timestamp: BlockTimestamp = TimePoint::now().into();
+        let previous = controller.preferred_id;
+        let (digests, proposed_schedule) =
+            controller.run_onblock(&timestamp, PULSE_NAME, previous, &BlockStatus::Building)?;
+        assert!(digests.is_empty());
+        assert!(proposed_schedule.is_none());
+        assert_eq!(
+            db.get_account_metadata(PULSE_NAME.as_u64())?
+                .get_recv_sequence(),
+            recv_before,
+            "a skipped onblock must not advance pulse's receive sequence"
+        );
+        assert_eq!(
+            db.get_block_cpu_limit()?,
+            cpu_before,
+            "a skipped onblock must not consume block CPU"
         );
 
         Ok(())
