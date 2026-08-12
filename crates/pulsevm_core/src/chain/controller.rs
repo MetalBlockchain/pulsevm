@@ -1413,15 +1413,24 @@ impl Controller {
             .transaction()
             .validate(pending_block_timestamp)?;
 
-        // Verify authority
-        AuthorizationManager::check_authorization(
-            &mut self.db,
-            &signed_transaction.transaction().actions,
-            &signed_transaction.recovered_keys(&self.chain_id)?,
-            &BTreeSet::new(),
-            seconds(signed_transaction.transaction().header.delay_sec.into()),
-            &BTreeSet::new(),
-        )?;
+        // Verify authority — but only when this node is the one admitting the
+        // transaction (mempool/producing). When applying an already-accepted
+        // block (explicit_billed), signatures were authenticated by the producer,
+        // so this is Antelope light/replay validation: the authority check is
+        // skipped, exactly like the objective resource-limit checks below. It has
+        // no state effect (auth_sequence and permission-usage bumps happen during
+        // execution and finalize), so skipping it leaves the resulting state and
+        // receipts unchanged.
+        if explicit_billed.is_none() {
+            AuthorizationManager::check_authorization(
+                &mut self.db,
+                &signed_transaction.transaction().actions,
+                &signed_transaction.recovered_keys(&self.chain_id)?,
+                &BTreeSet::new(),
+                seconds(signed_transaction.transaction().header.delay_sec.into()),
+                &BTreeSet::new(),
+            )?;
+        }
 
         let mut trx_context = TransactionContext::new(
             self.db.clone(),
