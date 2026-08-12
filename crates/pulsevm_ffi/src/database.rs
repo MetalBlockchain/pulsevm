@@ -869,6 +869,86 @@ impl Database {
         }
     }
 
+    pub fn arena_idx128_find_secondary(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        secondary: u128,
+    ) -> Option<u64> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow
+                .as_ref()
+                .and_then(|s| s.idx128_find_secondary(code, scope, table, secondary))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = (code, scope, table, secondary);
+            None
+        }
+    }
+
+    pub fn arena_idx128_find_primary(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary: u64,
+    ) -> Option<u128> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow
+                .as_ref()
+                .and_then(|s| s.idx128_find_primary(code, scope, table, primary))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = (code, scope, table, primary);
+            None
+        }
+    }
+
+    pub fn arena_idx128_lower_bound(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        secondary: u128,
+    ) -> Option<(u64, u128)> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow
+                .as_ref()
+                .and_then(|s| s.idx128_lower_bound(code, scope, table, secondary))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = (code, scope, table, secondary);
+            None
+        }
+    }
+
+    pub fn arena_idx128_upper_bound(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        secondary: u128,
+    ) -> Option<(u64, u128)> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow
+                .as_ref()
+                .and_then(|s| s.idx128_upper_bound(code, scope, table, secondary))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = (code, scope, table, secondary);
+            None
+        }
+    }
+
     /// Tally an iterator-positioning cross-check (arena landing vs chainbase).
     pub fn arena_note_pos(&self, matched: bool) {
         #[cfg(feature = "arena-shadow")]

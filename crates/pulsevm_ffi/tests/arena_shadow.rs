@@ -9,7 +9,11 @@
 
 #![cfg(feature = "arena-shadow")]
 
-use pulsevm_ffi::Database;
+use pulsevm_ffi::{
+    Database,
+    Index128IteratorCache,
+    TableObject,
+};
 use tempfile::tempdir;
 
 const DB_SIZE: u64 = 8 * 1024 * 1024 * 1024;
@@ -91,6 +95,91 @@ fn account_limits_pending_and_commit_mirror() {
     // Commit merges pending into the committed row and drops the pending row.
     db.process_account_limit_updates().unwrap();
     assert_eq!(check(&db), (8192, 100, 200), "committed limits diverged");
+}
+
+/// The idx128 secondary-index read accessors the arena serves during execution
+/// must answer exactly as chainbase does. Drive the same stores through the
+/// Database (which mirrors them into the shadow), then compare the arena
+/// accessors against chainbase's db_idx128_* for hits, misses, and the
+/// lower/upper bound landing pair across the whole key range — including a
+/// duplicate secondary key, where ordering is by (secondary, primary).
+#[test]
+fn idx128_read_accessors_match_chainbase() {
+    const CODE: u64 = 1;
+    const SCOPE: u64 = 2;
+    const TABLE: u64 = 3;
+    const PAYER: u64 = 1;
+
+    let dir = tempdir().unwrap();
+    let mut db = Database::new(dir.path().to_str().unwrap(), DB_SIZE).unwrap();
+    db.add_indices().unwrap();
+    db.enable_shadow().unwrap();
+    db.arena_start_undo_session();
+
+    let table_ptr = db.create_table(CODE, SCOPE, TABLE, PAYER).unwrap();
+    let table_ref: &TableObject = unsafe { &*table_ptr };
+    // (primary, secondary) — 50 is deliberately shared by two primaries.
+    let pairs: [(u64, u128); 4] = [(10, 100), (20, 50), (30, 200), (40, 50)];
+    for &(pk, sk) in &pairs {
+        db.create_index128_object(table_ref, PAYER, pk, sk).unwrap();
+    }
+
+    let mut cache = Index128IteratorCache::new();
+
+    // find_secondary: every stored key, plus a missing one. On a shared
+    // secondary chainbase returns the lowest primary; the arena must match.
+    for sk in [50u128, 100, 200, 999] {
+        let mut fp = 0u64;
+        let res = db
+            .db_idx128_find_secondary(&mut cache, CODE, SCOPE, TABLE, sk, &mut fp)
+            .unwrap();
+        let ffi = (res >= 0).then_some(fp);
+        assert_eq!(
+            db.arena_idx128_find_secondary(CODE, SCOPE, TABLE, sk),
+            ffi,
+            "idx128 find_secondary mismatch at sk={sk}"
+        );
+    }
+
+    // find_primary: every stored primary, plus a missing one.
+    for pk in [10u64, 20, 30, 40, 999] {
+        let mut fs = 0u128;
+        let res = db
+            .db_idx128_find_primary(&mut cache, CODE, SCOPE, TABLE, &mut fs, pk)
+            .unwrap();
+        let ffi = (res >= 0).then_some(fs);
+        assert_eq!(
+            db.arena_idx128_find_primary(CODE, SCOPE, TABLE, pk),
+            ffi,
+            "idx128 find_primary mismatch at pk={pk}"
+        );
+    }
+
+    // lower/upper bound land on a row and return both its primary and secondary;
+    // sweep search keys below, on, between, and above the stored keys.
+    for search in [0u128, 50, 51, 100, 150, 200, 201] {
+        let (mut ls, mut lp) = (search, 0u64);
+        let res = db
+            .db_idx128_lowerbound(&mut cache, CODE, SCOPE, TABLE, &mut ls, &mut lp)
+            .unwrap();
+        let ffi = (res >= 0).then_some((lp, ls));
+        assert_eq!(
+            db.arena_idx128_lower_bound(CODE, SCOPE, TABLE, search),
+            ffi,
+            "idx128 lowerbound mismatch at search={search}"
+        );
+
+        let (mut us, mut up) = (search, 0u64);
+        let res = db
+            .db_idx128_upperbound(&mut cache, CODE, SCOPE, TABLE, &mut us, &mut up)
+            .unwrap();
+        let ffi = (res >= 0).then_some((up, us));
+        assert_eq!(
+            db.arena_idx128_upper_bound(CODE, SCOPE, TABLE, search),
+            ffi,
+            "idx128 upperbound mismatch at search={search}"
+        );
+    }
 }
 
 #[test]
