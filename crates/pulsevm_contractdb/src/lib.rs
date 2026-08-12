@@ -40,6 +40,7 @@ const IDX64_OVERHEAD: i64 = 128; // billable_size_v<index64_object>
 const IDX128_OVERHEAD: i64 = 144; // billable_size_v<index128_object>
 const IDX256_OVERHEAD: i64 = 160; // billable_size_v<index256_object>
 const IDX_DOUBLE_OVERHEAD: i64 = 128; // billable_size_v<index_double_object>
+const IDX_LONG_DOUBLE_OVERHEAD: i64 = 144; // billable_size_v<index_long_double_object>
 const TABLE_OVERHEAD: i64 = 112; // billable_size_v<table_id_object>
 
 /// `chainbase::table_id_object` — one contract table, identified by
@@ -389,6 +390,138 @@ impl ArenaObject for IndexDoubleObject {
     }
 }
 
+/// Total order over the idx_long_double secondary key matching chainbase
+/// `soft_long_double_less` (`f128_lt`): the IEEE binary128 numeric order, with
+/// `-0.0` and `+0.0` folded together. softfloat is not reachable from a BTree
+/// comparator, so this reproduces IEEE-754 total ordering on the 128-bit pattern
+/// the same way `f64::total_cmp` does for 64 bits — flip the sign bit for
+/// positives, flip all bits for negatives, then compare as a signed integer.
+/// That equals `f128_lt` on every non-NaN input, and (unlike `f128_lt`) still
+/// yields a valid total order if a NaN ever slips through instead of corrupting
+/// the BTree. The float128 pattern is carried as its two `u64` words.
+#[derive(Clone, Copy)]
+struct LongDoubleKey {
+    lo: u64,
+    hi: u64,
+}
+
+impl LongDoubleKey {
+    /// The binary128 `-inf` pattern — the smallest ordering key over any
+    /// non-NaN input, so a valid inclusive lower bound for a full-table scan.
+    const NEG_INF: LongDoubleKey = LongDoubleKey {
+        lo: 0,
+        hi: 0xFFFF_0000_0000_0000,
+    };
+    /// The binary128 `+inf` pattern — the largest ordering key over any non-NaN
+    /// input, so a valid inclusive upper bound for a full-table scan.
+    const POS_INF: LongDoubleKey = LongDoubleKey {
+        lo: 0,
+        hi: 0x7FFF_0000_0000_0000,
+    };
+
+    fn from_u128(v: u128) -> Self {
+        LongDoubleKey {
+            lo: v as u64,
+            hi: (v >> 64) as u64,
+        }
+    }
+
+    fn from_words(lo: u64, hi: u64) -> Self {
+        LongDoubleKey { lo, hi }
+    }
+
+    fn ordering_key(self) -> i128 {
+        let bits: u128 = ((self.hi as u128) << 64) | self.lo as u128;
+        let sign_mask: u128 = 1u128 << 127;
+        // Fold both zeros (exponent and mantissa all zero, either sign) onto
+        // `+0.0` so they compare equal, as `f128_lt` treats them.
+        let bits = if bits & !sign_mask == 0 { 0 } else { bits };
+        let mut key = bits as i128;
+        key ^= (((key >> 127) as u128) >> 1) as i128;
+        key
+    }
+}
+impl PartialEq for LongDoubleKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.ordering_key() == other.ordering_key()
+    }
+}
+impl Eq for LongDoubleKey {}
+impl PartialOrd for LongDoubleKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for LongDoubleKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.ordering_key().cmp(&other.ordering_key())
+    }
+}
+
+/// `chainbase::index_long_double_object` — a `float128_t` secondary-index entry.
+/// Rust has no stable 128-bit float, so the pattern is stored as two `u64` words
+/// (`zerocopy` needs 8-byte-aligned POD fields) and ordered by [`LongDoubleKey`]
+/// to match EOS's software-float comparison.
+#[repr(C)]
+#[derive(
+    Clone,
+    Copy,
+    Default,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::Immutable,
+    zerocopy::KnownLayout,
+)]
+pub struct IndexLongDoubleObject {
+    id: ObjectId<IndexLongDoubleObject>,
+    t_id: i64,
+    primary_key: u64,
+    sec_lo: u64,
+    sec_hi: u64,
+    payer: u64,
+}
+
+impl IndexLongDoubleObject {
+    /// Rejoins the two stored words into the raw 128-bit float pattern.
+    fn secondary_key(&self) -> u128 {
+        join_u128(self.sec_lo, self.sec_hi)
+    }
+}
+
+struct IdxLongDoubleByPrimary;
+impl IndexedBy<IndexLongDoubleObject> for IdxLongDoubleByPrimary {
+    type Key = (i64, u64);
+    fn key(o: &IndexLongDoubleObject) -> Self::Key {
+        (o.t_id, o.primary_key)
+    }
+}
+struct IdxLongDoubleBySecondary;
+impl IndexedBy<IndexLongDoubleObject> for IdxLongDoubleBySecondary {
+    type Key = (i64, LongDoubleKey, u64);
+    fn key(o: &IndexLongDoubleObject) -> Self::Key {
+        (
+            o.t_id,
+            LongDoubleKey::from_words(o.sec_lo, o.sec_hi),
+            o.primary_key,
+        )
+    }
+}
+impl ArenaObject for IndexLongDoubleObject {
+    const TYPE_ID: u16 = 7;
+    fn id(&self) -> ObjectId<Self> {
+        self.id
+    }
+    fn set_id(&mut self, id: ObjectId<Self>) {
+        self.id = id;
+    }
+    fn secondary_indices() -> Vec<Box<dyn SecondaryIndex<Self>>> {
+        vec![
+            key_index::<Self, IdxLongDoubleByPrimary>(),
+            key_index::<Self, IdxLongDoubleBySecondary>(),
+        ]
+    }
+}
+
 /// Splits a `u128` into `(low, high)` `u64` words.
 fn u128_words(v: u128) -> (u64, u64) {
     (v as u64, (v >> 64) as u64)
@@ -492,6 +625,7 @@ pub struct ContractDb {
     idx128_cache: IteratorCache,
     idx256_cache: IteratorCache,
     idx_double_cache: IteratorCache,
+    idx_long_double_cache: IteratorCache,
 }
 
 impl Default for ContractDb {
@@ -509,6 +643,7 @@ impl ContractDb {
         db.add_table::<Index128Object>().unwrap();
         db.add_table::<Index256Object>().unwrap();
         db.add_table::<IndexDoubleObject>().unwrap();
+        db.add_table::<IndexLongDoubleObject>().unwrap();
         db.add_table::<ResourceUsageObject>().unwrap();
         ContractDb {
             db,
@@ -517,6 +652,7 @@ impl ContractDb {
             idx128_cache: IteratorCache::default(),
             idx256_cache: IteratorCache::default(),
             idx_double_cache: IteratorCache::default(),
+            idx_long_double_cache: IteratorCache::default(),
         }
     }
 
@@ -527,6 +663,7 @@ impl ContractDb {
         self.idx128_cache = IteratorCache::default();
         self.idx256_cache = IteratorCache::default();
         self.idx_double_cache = IteratorCache::default();
+        self.idx_long_double_cache = IteratorCache::default();
     }
 
     // ----- block/transaction lifecycle --------------------------------------
@@ -1835,6 +1972,283 @@ impl ContractDb {
             Some(p) => {
                 *primary = p.primary_key;
                 self.idx_double_cache.add(p.id().raw())
+            }
+            None => -1,
+        }
+    }
+
+    // ----- idx_long_double (float128) ---------------------------------------
+
+    fn idx_long_double(&self, id: i64) -> IndexLongDoubleObject {
+        *self
+            .db
+            .get::<IndexLongDoubleObject>(ObjectId::new(id))
+            .unwrap()
+    }
+
+    fn idx_long_double_from(
+        &self,
+        t_id: i64,
+        sec: u128,
+        prim: u64,
+    ) -> Option<IndexLongDoubleObject> {
+        self.db
+            .table::<IndexLongDoubleObject>()
+            .unwrap()
+            .get_index::<IdxLongDoubleBySecondary>()
+            .range((
+                Bound::Included((t_id, LongDoubleKey::from_u128(sec), prim)),
+                Bound::Unbounded,
+            ))
+            .next()
+            .filter(|(k, _)| k.0 == t_id)
+            .map(|(_, o)| *o)
+    }
+
+    fn idx_long_double_above(&self, t_id: i64, sec: u128) -> Option<IndexLongDoubleObject> {
+        self.db
+            .table::<IndexLongDoubleObject>()
+            .unwrap()
+            .get_index::<IdxLongDoubleBySecondary>()
+            .range((
+                Bound::Excluded((t_id, LongDoubleKey::from_u128(sec), u64::MAX)),
+                Bound::Unbounded,
+            ))
+            .next()
+            .filter(|(k, _)| k.0 == t_id)
+            .map(|(_, o)| *o)
+    }
+
+    fn idx_long_double_after(
+        &self,
+        t_id: i64,
+        sec: u128,
+        prim: u64,
+    ) -> Option<IndexLongDoubleObject> {
+        self.db
+            .table::<IndexLongDoubleObject>()
+            .unwrap()
+            .get_index::<IdxLongDoubleBySecondary>()
+            .range((
+                Bound::Excluded((t_id, LongDoubleKey::from_u128(sec), prim)),
+                Bound::Unbounded,
+            ))
+            .next()
+            .filter(|(k, _)| k.0 == t_id)
+            .map(|(_, o)| *o)
+    }
+
+    fn idx_long_double_before(
+        &self,
+        t_id: i64,
+        sec: u128,
+        prim: u64,
+    ) -> Option<IndexLongDoubleObject> {
+        self.db
+            .table::<IndexLongDoubleObject>()
+            .unwrap()
+            .get_index::<IdxLongDoubleBySecondary>()
+            .range((
+                Bound::Unbounded,
+                Bound::Excluded((t_id, LongDoubleKey::from_u128(sec), prim)),
+            ))
+            .next_back()
+            .filter(|(k, _)| k.0 == t_id)
+            .map(|(_, o)| *o)
+    }
+
+    fn idx_long_double_last(&self, t_id: i64) -> Option<IndexLongDoubleObject> {
+        self.db
+            .table::<IndexLongDoubleObject>()
+            .unwrap()
+            .get_index::<IdxLongDoubleBySecondary>()
+            .range((
+                Bound::Included((t_id, LongDoubleKey::NEG_INF, u64::MIN)),
+                Bound::Included((t_id, LongDoubleKey::POS_INF, u64::MAX)),
+            ))
+            .next_back()
+            .map(|(_, o)| *o)
+    }
+
+    pub fn db_idx_long_double_store(
+        &mut self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        payer: u64,
+        primary: u64,
+        secondary: u128,
+    ) -> i32 {
+        let t_id = self.find_or_create_table(code, scope, table, payer);
+        let (lo, hi) = u128_words(secondary);
+        let id = self
+            .db
+            .create::<IndexLongDoubleObject>(|e| {
+                e.t_id = t_id;
+                e.primary_key = primary;
+                e.sec_lo = lo;
+                e.sec_hi = hi;
+                e.payer = payer;
+            })
+            .unwrap()
+            .id()
+            .raw();
+        self.bill(payer, IDX_LONG_DOUBLE_OVERHEAD);
+        self.idx_long_double_cache.cache_table(t_id);
+        self.idx_long_double_cache.add(id)
+    }
+
+    pub fn db_idx_long_double_update(&mut self, itr: i32, secondary: u128) {
+        let id = self.idx_long_double_cache.kv_of(itr);
+        let (lo, hi) = u128_words(secondary);
+        self.db
+            .modify::<IndexLongDoubleObject>(ObjectId::new(id), |e| {
+                e.sec_lo = lo;
+                e.sec_hi = hi;
+            })
+            .unwrap();
+    }
+
+    pub fn db_idx_long_double_remove(&mut self, itr: i32) {
+        let id = self.idx_long_double_cache.kv_of(itr);
+        let payer = self.idx_long_double(id).payer;
+        self.bill(payer, -IDX_LONG_DOUBLE_OVERHEAD);
+        self.db
+            .remove::<IndexLongDoubleObject>(ObjectId::new(id))
+            .unwrap();
+    }
+
+    pub fn db_idx_long_double_find_secondary(
+        &mut self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        secondary: u128,
+        primary: &mut u64,
+    ) -> i32 {
+        let Some(t_id) = self.find_table(code, scope, table) else {
+            return -1;
+        };
+        let end = self.idx_long_double_cache.cache_table(t_id);
+        match self.idx_long_double_from(t_id, secondary, 0) {
+            Some(e)
+                if LongDoubleKey::from_u128(e.secondary_key())
+                    == LongDoubleKey::from_u128(secondary) =>
+            {
+                *primary = e.primary_key;
+                self.idx_long_double_cache.add(e.id().raw())
+            }
+            _ => end,
+        }
+    }
+
+    pub fn db_idx_long_double_find_primary(
+        &mut self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        secondary: &mut u128,
+        primary: u64,
+    ) -> i32 {
+        let Some(t_id) = self.find_table(code, scope, table) else {
+            return -1;
+        };
+        let end = self.idx_long_double_cache.cache_table(t_id);
+        match self
+            .db
+            .find_by::<IndexLongDoubleObject, IdxLongDoubleByPrimary>(&(t_id, primary))
+            .unwrap()
+            .map(|e| (e.secondary_key(), e.id().raw()))
+        {
+            Some((sec, id)) => {
+                *secondary = sec;
+                self.idx_long_double_cache.add(id)
+            }
+            None => end,
+        }
+    }
+
+    pub fn db_idx_long_double_lowerbound(
+        &mut self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        secondary: &mut u128,
+        primary: &mut u64,
+    ) -> i32 {
+        let Some(t_id) = self.find_table(code, scope, table) else {
+            return -1;
+        };
+        let end = self.idx_long_double_cache.cache_table(t_id);
+        match self.idx_long_double_from(t_id, *secondary, 0) {
+            Some(e) => {
+                *secondary = e.secondary_key();
+                *primary = e.primary_key;
+                self.idx_long_double_cache.add(e.id().raw())
+            }
+            None => end,
+        }
+    }
+
+    pub fn db_idx_long_double_upperbound(
+        &mut self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        secondary: &mut u128,
+        primary: &mut u64,
+    ) -> i32 {
+        let Some(t_id) = self.find_table(code, scope, table) else {
+            return -1;
+        };
+        let end = self.idx_long_double_cache.cache_table(t_id);
+        match self.idx_long_double_above(t_id, *secondary) {
+            Some(e) => {
+                *secondary = e.secondary_key();
+                *primary = e.primary_key;
+                self.idx_long_double_cache.add(e.id().raw())
+            }
+            None => end,
+        }
+    }
+
+    pub fn db_idx_long_double_end(&mut self, code: u64, scope: u64, table: u64) -> i32 {
+        let Some(t_id) = self.find_table(code, scope, table) else {
+            return -1;
+        };
+        self.idx_long_double_cache.cache_table(t_id)
+    }
+
+    pub fn db_idx_long_double_next(&mut self, itr: i32, primary: &mut u64) -> i32 {
+        if itr < -1 {
+            return itr;
+        }
+        let e = self.idx_long_double(self.idx_long_double_cache.kv_of(itr));
+        match self.idx_long_double_after(e.t_id, e.secondary_key(), e.primary_key) {
+            Some(n) => {
+                *primary = n.primary_key;
+                self.idx_long_double_cache.add(n.id().raw())
+            }
+            None => self.idx_long_double_cache.end_iterator_of(e.t_id),
+        }
+    }
+
+    pub fn db_idx_long_double_previous(&mut self, itr: i32, primary: &mut u64) -> i32 {
+        if itr < -1 {
+            let t_id = self.idx_long_double_cache.table_of_end_iterator(itr);
+            return match self.idx_long_double_last(t_id) {
+                Some(e) => {
+                    *primary = e.primary_key;
+                    self.idx_long_double_cache.add(e.id().raw())
+                }
+                None => -1,
+            };
+        }
+        let e = self.idx_long_double(self.idx_long_double_cache.kv_of(itr));
+        match self.idx_long_double_before(e.t_id, e.secondary_key(), e.primary_key) {
+            Some(p) => {
+                *primary = p.primary_key;
+                self.idx_long_double_cache.add(p.id().raw())
             }
             None => -1,
         }
