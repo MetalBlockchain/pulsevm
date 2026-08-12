@@ -2596,11 +2596,25 @@ impl Database {
     }
 
     pub fn is_account(&self, account: u64) -> Result<bool, ChainError> {
-        let guard = self.locked_read()?;
+        let chainbase = {
+            let guard = self.locked_read()?;
+            guard
+                .is_account(account)
+                .map_err(|e| ChainError::InternalError(format!("{}", e)))?
+        };
 
-        guard
-            .is_account(account)
-            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+        // Existence gates authorization/dispatch and is a plain bool (not a
+        // chainbase object reference), so it can be served from the arena.
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow {
+            let arena = s.account_exists(account);
+            s.note_noncontract(arena == chainbase);
+            if s.reads_enabled() {
+                return Ok(arena);
+            }
+        }
+
+        Ok(chainbase)
     }
 
     pub fn find_permission(&self, id: i64) -> Result<*const ffi::PermissionObject, ChainError> {
@@ -5011,10 +5025,16 @@ impl<'g> DbRead<'g> {
         };
 
         // linkauth resolution feeds authorization: the arena must resolve the
-        // same linked permission (or agree there's none).
+        // same linked permission (or agree there's none). This read returns a
+        // plain permission name (not a chainbase object reference), so unlike the
+        // account/permission object reads it can be served from the arena.
         #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow {
-            s.note_noncontract(s.permission_link(account, code, requirement_type) == linked);
+            let arena = s.permission_link(account, code, requirement_type);
+            s.note_noncontract(arena == linked);
+            if s.reads_enabled() {
+                return Ok(arena);
+            }
         }
 
         Ok(linked)
