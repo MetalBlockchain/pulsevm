@@ -387,20 +387,14 @@ fn builtin_types() -> HashMap<TypeName, UnpackFunction> {
         Ok(serde_json::Value::Number(res.into()))
     });
     m.insert("int128".to_string(), |bytes, pos| {
-        // TODO: Fix this when we have a int128 implementation
-        let res = f64::read(bytes, pos)?;
-        match Number::from_f64(res) {
-            Some(n) => Ok(Value::Number(n)),
-            None => Err(ReadError::ParseError),
-        }
+        // 128-bit integers don't fit a JSON number, so the reference chain renders
+        // them as decimal strings.
+        let res = i128::read(bytes, pos)?;
+        Ok(Value::String(res.to_string()))
     });
     m.insert("uint128".to_string(), |bytes, pos| {
-        // TODO: Fix this when we have a uint128 implementation
-        let res = f64::read(bytes, pos)?;
-        match Number::from_f64(res) {
-            Some(n) => Ok(Value::Number(n)),
-            None => Err(ReadError::ParseError),
-        }
+        let res = u128::read(bytes, pos)?;
+        Ok(Value::String(res.to_string()))
     });
     m.insert("varint32".to_string(), |bytes, pos| {
         let res = VarInt32::read(bytes, pos)?;
@@ -426,12 +420,17 @@ fn builtin_types() -> HashMap<TypeName, UnpackFunction> {
         }
     });
     m.insert("float128".to_string(), |bytes, pos| {
-        // TODO: Fix this when we have a float128 implementation
-        let res = f64::read(bytes, pos)?;
-        match Number::from_f64(res) {
-            Some(n) => Ok(Value::Number(n)),
-            None => Err(ReadError::ParseError),
-        }
+        // There's no portable 128-bit float, so keep the raw 16 bytes as a hex
+        // string (as the reference chain does) rather than lose them through an
+        // 8-byte f64 read — which also left the cursor 8 bytes short, corrupting
+        // every field after it in the row.
+        let raw = u128::read(bytes, pos)?;
+        let hex: String = raw
+            .to_le_bytes()
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect();
+        Ok(Value::String(format!("0x{hex}")))
     });
 
     m.insert("time_point".to_string(), |bytes, pos| {
@@ -606,5 +605,55 @@ mod tests {
                 &mut 0,
             )
             .unwrap();
+    }
+
+    #[test]
+    fn decodes_128_bit_builtins_and_keeps_cursor_aligned() {
+        let abi: AbiDefinition = serde_json::from_str(PULSE_ABI).unwrap();
+        let serializer = AbiSerializer::from_abi(abi).unwrap();
+
+        // A value past 2^53 renders exactly as a decimal string; an f64 read would
+        // both lose precision and advance the cursor only 8 of the 16 bytes.
+        let big = (1u128 << 64) | 1;
+        let mut pos = 0usize;
+        let out = serializer
+            .binary_to_variant("uint128", &big.to_le_bytes(), &mut pos)
+            .unwrap();
+        assert_eq!(out, Value::String("18446744073709551617".to_string()));
+        assert_eq!(pos, 16, "uint128 must advance the cursor a full 16 bytes");
+
+        let mut pos = 0usize;
+        let out = serializer
+            .binary_to_variant("int128", &(-5i128).to_le_bytes(), &mut pos)
+            .unwrap();
+        assert_eq!(out, Value::String("-5".to_string()));
+        assert_eq!(pos, 16);
+
+        // The desync bug: a uint128 followed by another field. If the 128-bit read
+        // stops after 8 bytes, the trailing field decodes from the wrong offset.
+        let mut buf = 42u128.to_le_bytes().to_vec();
+        buf.push(7u8);
+        let mut pos = 0usize;
+        assert_eq!(
+            serializer
+                .binary_to_variant("uint128", &buf, &mut pos)
+                .unwrap(),
+            Value::String("42".to_string())
+        );
+        assert_eq!(
+            serializer
+                .binary_to_variant("uint8", &buf, &mut pos)
+                .unwrap(),
+            Value::Number(7u8.into())
+        );
+
+        // float128 has no portable Rust type; keep the raw 16 bytes as hex and
+        // still consume all 16.
+        let mut pos = 0usize;
+        let out = serializer
+            .binary_to_variant("float128", &[0xffu8; 16], &mut pos)
+            .unwrap();
+        assert_eq!(out, Value::String(format!("0x{}", "ff".repeat(16))));
+        assert_eq!(pos, 16);
     }
 }

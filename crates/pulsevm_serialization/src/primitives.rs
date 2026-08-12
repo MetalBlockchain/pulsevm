@@ -91,6 +91,20 @@ impl NumBytes for i64 {
     }
 }
 
+impl NumBytes for u128 {
+    #[inline]
+    fn num_bytes(&self) -> usize {
+        core::mem::size_of::<u128>()
+    }
+}
+
+impl NumBytes for i128 {
+    #[inline]
+    fn num_bytes(&self) -> usize {
+        core::mem::size_of::<u128>()
+    }
+}
+
 impl NumBytes for f32 {
     #[inline]
     fn num_bytes(&self) -> usize {
@@ -287,6 +301,24 @@ impl Read for i64 {
     fn read(bytes: &[u8], pos: &mut usize) -> Result<Self, ReadError> {
         let result = u64::read(bytes, pos)?;
         Ok(result as i64)
+    }
+}
+
+impl Read for u128 {
+    #[inline]
+    fn read(bytes: &[u8], pos: &mut usize) -> Result<Self, ReadError> {
+        let mut b = &bytes[*pos..];
+        let arr = take::<16>(&mut b)?;
+        *pos += 16;
+        Ok(u128::from_le_bytes(arr))
+    }
+}
+
+impl Read for i128 {
+    #[inline]
+    fn read(bytes: &[u8], pos: &mut usize) -> Result<Self, ReadError> {
+        let result = u128::read(bytes, pos)?;
+        Ok(result as i128)
     }
 }
 
@@ -582,6 +614,28 @@ impl Write for i64 {
     }
 }
 
+impl Write for u128 {
+    #[inline]
+    fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), WriteError> {
+        let out = self.to_le_bytes();
+        let start = *pos;
+        let end = start + 16;
+        if bytes.len() < end {
+            return Err(WriteError::NotEnoughSpace);
+        }
+        bytes[start..end].copy_from_slice(&out);
+        *pos = end;
+        Ok(())
+    }
+}
+
+impl Write for i128 {
+    #[inline]
+    fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), WriteError> {
+        (*self as u128).write(bytes, pos)
+    }
+}
+
 impl Write for f32 {
     #[inline]
     fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), WriteError> {
@@ -749,5 +803,25 @@ mod tests {
         assert_eq!(bounded_capacity::<u32>(1_000_000, &bytes, 2), 6);
         assert_eq!(bounded_capacity::<u32>(3, &bytes, 2), 3);
         assert_eq!(bounded_capacity::<u32>(10, &bytes, 20), 0);
+    }
+
+    #[test]
+    fn u128_i128_round_trip_16_bytes() {
+        for v in [0u128, 1, u64::MAX as u128 + 1, u128::MAX] {
+            assert_eq!(v.num_bytes(), 16);
+            let packed = v.pack().unwrap();
+            assert_eq!(packed.len(), 16);
+            let mut pos = 0;
+            assert_eq!(u128::read(&packed, &mut pos).unwrap(), v);
+            assert_eq!(pos, 16);
+        }
+        for v in [0i128, -1, i128::MIN, i128::MAX] {
+            assert_eq!(v.num_bytes(), 16);
+            let packed = v.pack().unwrap();
+            assert_eq!(packed.len(), 16);
+            let mut pos = 0;
+            assert_eq!(i128::read(&packed, &mut pos).unwrap(), v);
+            assert_eq!(pos, 16);
+        }
     }
 }

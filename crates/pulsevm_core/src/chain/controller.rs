@@ -7121,6 +7121,107 @@ mod tests {
         Ok(())
     }
 
+    // set_resource_limits lowering an account's RAM allowance below what it is
+    // already using must fail the transaction: the host has to schedule a RAM
+    // re-check when the limit shrank, exactly as add_ram_usage does on a growth.
+    // A privileged contract on pulse drives set_resource_limits against a victim
+    // account with a real, non-trivial RAM footprint (created via newaccount).
+    // Dropping its limit to 1 byte must be rejected with "insufficient ram";
+    // raising it well above usage — which is still a decrease from the genesis
+    // unlimited (-1) default, so it runs the same check — must be accepted.
+    #[tokio::test]
+    async fn set_resource_limits_below_usage_is_rejected() -> Result<(), ChainError> {
+        let (mut controller, private_key, _chain_id, _temp) = init_test_controller()?;
+        let ts = controller.last_accepted_block().timestamp().clone();
+        let chain_id = controller.chain_id().clone();
+        let status = BlockStatus::Building;
+
+        let victim = Name::from_str("victim")?;
+        controller.execute_transaction(
+            &create_account(&private_key, victim, chain_id)?,
+            &ts,
+            &status,
+        )?;
+
+        // A freshly created account already carries hundreds of bytes of account
+        // and permission state, so a 1-byte limit is unambiguously below usage.
+        let usage = controller
+            .database()
+            .get_account_ram_usage(victim.as_u64())?;
+        assert!(usage > 1, "expected the new account to be using RAM");
+
+        let shrink = Name::from_str("shrink")?.as_u64() as i64;
+        let grow = Name::from_str("grow")?.as_u64() as i64;
+        let victim_id = victim.as_u64() as i64;
+        let wasm = wat::parse_str(&format!(
+            r#"
+            (module
+              (import "env" "set_resource_limits"
+                (func $set (param i64 i64 i64 i64)))
+              (memory (export "memory") 1)
+              (func (export "apply") (param i64 i64 i64)
+                (block $done
+                  (block $grow
+                    (br_if $grow (i64.eq (local.get 2) (i64.const {grow})))
+                    (br_if $done (i64.ne (local.get 2) (i64.const {shrink})))
+                    (call $set (i64.const {victim_id}) (i64.const 1)
+                              (i64.const -1) (i64.const -1))
+                    (br $done))
+                  (call $set (i64.const {victim_id}) (i64.const 100000000)
+                            (i64.const -1) (i64.const -1)))))
+            "#,
+        ))
+        .unwrap();
+        controller.execute_transaction(
+            &set_code(&private_key, PULSE_NAME, wasm, chain_id)?,
+            &ts,
+            &status,
+        )?;
+
+        let res = controller.execute_transaction(
+            &call_contract(
+                &private_key,
+                PULSE_NAME,
+                Name::from_str("shrink")?,
+                &Vec::<u8>::new(),
+                chain_id,
+            )?,
+            &ts,
+            &status,
+        );
+        let err = match res {
+            Ok(_) => panic!("lowering the RAM limit below usage must be rejected"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("insufficient ram"),
+            "rejected for the wrong reason: {err}"
+        );
+
+        // The rejected transaction rolled back, so the limit is still unlimited.
+        controller.execute_transaction(
+            &call_contract(
+                &private_key,
+                PULSE_NAME,
+                Name::from_str("grow")?,
+                &Vec::<u8>::new(),
+                chain_id,
+            )?,
+            &ts,
+            &status,
+        )?;
+        let (mut ram, mut net, mut cpu) = (0i64, 0i64, 0i64);
+        controller
+            .database()
+            .get_account_limits(victim.as_u64(), &mut ram, &mut net, &mut cpu)?;
+        assert_eq!(
+            ram, 100_000_000,
+            "the accepted limit change did not persist"
+        );
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_push_transaction() -> Result<(), ChainError> {
         let chain_id =

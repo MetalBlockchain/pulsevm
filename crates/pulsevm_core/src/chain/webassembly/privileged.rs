@@ -15,6 +15,7 @@ use wasmer::{
 
 use super::cost;
 use crate::chain::{
+    Name,
     apply_context::ApplyContext,
     producer_schedule::{
         MAX_PRODUCERS,
@@ -279,17 +280,19 @@ pub fn set_resource_limits(
             "invalid value for cpu resource limit expected [-1,INT64_MAX]"
         )),
     )?;
+    let account: Name = account.into();
     let context = env_data.apply_context_mut();
     privileged_check(context)?;
     let mut db = env_data.db_mut();
-    ResourceLimitsManager::set_account_limits(
-        &mut db,
-        &account.into(),
-        net_weight,
-        cpu_weight,
-        ram_bytes,
+    let decreased = ResourceLimitsManager::set_account_limits(
+        &mut db, &account, net_weight, cpu_weight, ram_bytes,
     )?;
-    // TODO: Validate ram usage
+    // Lowering a limit doesn't touch usage, so if the account's allowance shrank
+    // it may now be over quota; schedule a RAM check before the transaction
+    // commits (an increase is checked via add_ram_usage instead).
+    if decreased {
+        env_data.apply_context_mut().validate_ram_usage(&account)?;
+    }
     Ok(())
 }
 
