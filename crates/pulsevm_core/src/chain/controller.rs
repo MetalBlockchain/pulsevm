@@ -832,24 +832,16 @@ impl Controller {
         }
     }
 
+    /// Verify a block against the schedule active as of its parent, execute it
+    /// speculatively, and require our re-derived action and transaction merkle
+    /// roots to match the ones the header commits to. The VM reproduces block
+    /// ids bit-for-bit (see `block_ids_replay_bit_for_bit_from_serialized_bytes`),
+    /// so a divergent re-execution is rejected here rather than silently
+    /// accepted — there is no path that skips the root check.
     pub async fn verify_block(
         &mut self,
         block: &SignedBlock,
         mempool: &mut Mempool,
-    ) -> Result<(), ChainError> {
-        self.verify_block_inner(block, mempool, true).await
-    }
-
-    /// The verify path, with an escape hatch used only when replaying real
-    /// testnet blocks: `enforce_semantics = false` still executes and retains the
-    /// block but skips the action/transaction merkle-root comparison, which this
-    /// VM does not yet reproduce bit-for-bit (an onblock/sequence fidelity gap,
-    /// tracked separately). Production always passes `true`.
-    async fn verify_block_inner(
-        &mut self,
-        block: &SignedBlock,
-        mempool: &mut Mempool,
-        enforce_semantics: bool,
     ) -> Result<(), ChainError> {
         if self.verified_blocks.contains_key(&block.id()?) {
             return Ok(());
@@ -909,11 +901,9 @@ impl Controller {
                 }
             };
 
-        if enforce_semantics {
-            if let Err(e) = block.validate_semantically(transaction_mroot, action_mroot) {
-                self.db.arena_undo();
-                return Err(e);
-            }
+        if let Err(e) = block.validate_semantically(transaction_mroot, action_mroot) {
+            self.db.arena_undo();
+            return Err(e);
         }
 
         // The schedule change the header advertises must match what the block's
@@ -5254,6 +5244,74 @@ mod tests {
         Ok((controller, private_key, chain_id, temp_path))
     }
 
+    // Bit-for-bit block-id parity across serialization and re-execution. A
+    // producer builds a real chain — onblock runs at the head of every block,
+    // plus an account-creating transaction — and each block is round-tripped
+    // through the wire format. A fresh node (new database from the same genesis)
+    // then replays every block through the production verify path, which enforces
+    // the action and transaction merkle roots. Every replayed block id must equal
+    // the producer's, and the reconstructed state must agree. This is the
+    // property that lets any node re-execute the chain and arrive at identical
+    // block ids, with no escape hatch.
+    #[tokio::test]
+    async fn block_ids_replay_bit_for_bit_from_serialized_bytes() -> Result<(), ChainError> {
+        let (mut producer, private_key, chain_id, _p_temp) = init_test_controller()?;
+        let mut p_mempool = Mempool::new();
+
+        let names = ["aaa", "bbb", "ccc", "ddd", "eee"];
+        let mut wire_blocks: Vec<Vec<u8>> = Vec::new();
+        let mut expected_ids: Vec<Id> = Vec::new();
+
+        for name in names {
+            p_mempool.add_transaction(create_account(
+                &private_key,
+                Name::from_str(name)?,
+                chain_id,
+            )?);
+            let block = producer.build_block(&mut p_mempool).await?;
+            producer.accept_block(&block.id()?, &mut p_mempool)?;
+            producer.set_preferred_id(block.id()?);
+
+            expected_ids.push(block.id()?);
+            wire_blocks.push(block.pack()?);
+        }
+
+        // Fresh node, new database, same genesis and chain id.
+        let (mut validator, _pk, _cid, _v_temp) = init_test_controller()?;
+        let mut v_mempool = Mempool::new();
+
+        for (i, bytes) in wire_blocks.iter().enumerate() {
+            let block = SignedBlock::read(bytes.as_slice(), &mut 0)?;
+            // Serialization must preserve the id (which commits to both roots).
+            assert_eq!(
+                block.id()?,
+                expected_ids[i],
+                "serialized block {i} did not round-trip to the same id"
+            );
+            // verify_block re-derives and enforces the merkle roots; a divergent
+            // re-execution (onblock receipt, sequences, trx receipts) fails here.
+            validator.verify_block(&block, &mut v_mempool).await?;
+            validator.accept_block(&block.id()?, &mut v_mempool)?;
+            validator.set_preferred_id(block.id()?);
+        }
+
+        assert_eq!(
+            validator.last_accepted_block_id,
+            *expected_ids.last().unwrap(),
+            "validator tip does not match the producer tip"
+        );
+        // The chain re-executed into the same state: every account is present.
+        let db = validator.database();
+        for name in names {
+            assert!(
+                !db.find_account(Name::from_str(name)?.as_u64())?.is_null(),
+                "account {name} missing after replay"
+            );
+        }
+
+        Ok(())
+    }
+
     // A block built directly on the last accepted block retains its executed
     // state, and accept_block commits that retained state without re-executing.
     #[tokio::test]
@@ -6615,15 +6673,13 @@ mod tests {
             let sig_digest: crate::utils::Digest =
                 block.signed_block_header.header.sig_digest()?.0.into();
             block.signed_block_header.signature = block_signer.sign(&sig_digest)?;
-            // Execute the real block but don't enforce testnet's canonical merkle
-            // roots (this VM doesn't reproduce them yet — our ungated onblock adds
-            // an action receipt the real chain didn't have at this height); the
-            // point is to build real state to sync, not to prove re-execution
-            // fidelity.
-            if let Err(e) = producer
-                .verify_block_inner(&block, &mut mempool, false)
-                .await
-            {
+            // This foreign fixture predates onblock, so its canonical merkle roots
+            // won't match a chain that runs onblock every block — replay stops at
+            // the first block whose roots we (correctly) re-derive differently.
+            // The self-contained state-sync coverage lives in
+            // state_sync_transfers_state_tip_and_schedule, which builds its state
+            // from our own onblock-running blocks.
+            if let Err(e) = producer.verify_block(&block, &mut mempool).await {
                 eprintln!("replay stalled at block {n}: {e:?}");
                 break;
             }
