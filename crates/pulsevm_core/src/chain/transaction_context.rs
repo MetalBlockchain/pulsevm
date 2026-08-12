@@ -679,6 +679,16 @@ impl TransactionContext {
         Ok(())
     }
 
+    /// Flag `account` to have its RAM usage re-checked against its limit before
+    /// the transaction commits. Lowering an account's RAM limit can leave it over
+    /// quota without changing its usage, so the limit change alone won't schedule
+    /// the check that `add_ram_usage` schedules on an increase.
+    pub fn validate_ram_usage(&self, account: &Name) -> Result<(), ChainError> {
+        let mut inner = self.inner.write()?;
+        inner.validate_ram_usage.insert(account.clone());
+        Ok(())
+    }
+
     pub fn pause_billing_timer(&self) -> Result<(), ChainError> {
         let mut inner = self.inner.write()?;
         if inner.explicit_billed_cpu_time {

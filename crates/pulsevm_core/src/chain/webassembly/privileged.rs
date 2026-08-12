@@ -5,6 +5,7 @@ use pulsevm_ffi::ChainConfigV0;
 use pulsevm_serialization::{
     Read,
     VarUint32,
+    Write,
 };
 use wasmer::{
     FunctionEnvMut,
@@ -14,6 +15,7 @@ use wasmer::{
 
 use super::cost;
 use crate::chain::{
+    Name,
     apply_context::ApplyContext,
     producer_schedule::{
         MAX_PRODUCERS,
@@ -124,18 +126,74 @@ pub fn set_proposed_producers(
 
 pub fn get_blockchain_parameters_packed(
     mut env: FunctionEnvMut<WasmContext>,
-    _data_ptr: WasmPtr<u8>,
-    _data_len: u32,
+    data_ptr: WasmPtr<u8>,
+    data_len: u32,
 ) -> Result<u32, RuntimeError> {
-    context_aware_check(&env)?;
+    // Gate on privilege before charging, so a non-privileged caller isn't metered
+    // for work that is rejected anyway — matching set_blockchain_parameters_packed.
+    {
+        context_aware_check(&env)?;
+        let context = env.data_mut().apply_context_mut();
+        privileged_check(context)?;
+    }
+
     let (env_data, mut store) = env.data_and_store_mut();
     env_data.charge(
         &mut store,
-        cost::PRIVILEGED + cost::per_byte(_data_len as u64),
+        cost::PRIVILEGED + cost::per_byte(data_len as u64),
     )?;
-    let context = env_data.apply_context_mut();
-    privileged_check(context)?;
-    Ok(0)
+
+    // Read the active chain configuration and pack it in the same ChainConfigV0
+    // wire format `set_blockchain_parameters_packed` consumes, so a contract can
+    // round-trip the parameters it sets.
+    // Safe: the global property object always exists after genesis and is not
+    // mutated across this read (same `unsafe { &*ptr }` pattern used elsewhere for
+    // chainbase objects).
+    let gpo = env_data.db().get_global_properties()?;
+    let c = unsafe { &*gpo }.get_chain_config();
+    let cfg = ChainConfigV0 {
+        max_block_net_usage: c.get_max_block_net_usage(),
+        target_block_net_usage_pct: c.get_target_block_net_usage_pct(),
+        max_transaction_net_usage: c.get_max_transaction_net_usage(),
+        base_per_transaction_net_usage: c.get_base_per_transaction_net_usage(),
+        net_usage_leeway: c.get_net_usage_leeway(),
+        context_free_discount_net_usage_num: c.get_context_free_discount_net_usage_num(),
+        context_free_discount_net_usage_den: c.get_context_free_discount_net_usage_den(),
+        max_block_cpu_usage: c.get_max_block_cpu_usage(),
+        target_block_cpu_usage_pct: c.get_target_block_cpu_usage_pct(),
+        max_transaction_cpu_usage: c.get_max_transaction_cpu_usage(),
+        min_transaction_cpu_usage: c.get_min_transaction_cpu_usage(),
+        max_transaction_lifetime: c.get_max_transaction_lifetime(),
+        // No stored field for this (deferred transactions are unsupported); the
+        // wire format still carries the slot, so report 0.
+        deferred_trx_expiration_window: 0,
+        max_transaction_delay: c.get_max_transaction_delay(),
+        max_inline_action_size: c.get_max_inline_action_size(),
+        max_inline_action_depth: c.get_max_inline_action_depth(),
+        max_authority_depth: c.get_max_authority_depth(),
+    };
+    let packed = cfg
+        .pack()
+        .map_err(|e| RuntimeError::new(format!("packing blockchain parameters: {e}")))?;
+    let size = packed.len() as u32;
+
+    // EOSIO semantics: a zero-length buffer is a size query; otherwise write only
+    // if the whole packed blob fits, and return 0 when it doesn't (a partial
+    // packed record is useless).
+    if data_len == 0 {
+        return Ok(size);
+    }
+    if size > data_len {
+        return Ok(0);
+    }
+    let memory = env_data
+        .memory()
+        .as_ref()
+        .expect("Wasm memory not initialized");
+    let view = memory.view(&store);
+    let slice = data_ptr.slice(&view, size)?;
+    slice.write_slice(&packed)?;
+    Ok(size)
 }
 
 pub fn set_blockchain_parameters_packed(
@@ -227,17 +285,19 @@ pub fn set_resource_limits(
             "invalid value for cpu resource limit expected [-1,INT64_MAX]"
         )),
     )?;
+    let account: Name = account.into();
     let context = env_data.apply_context_mut();
     privileged_check(context)?;
     let mut db = env_data.db_mut();
-    ResourceLimitsManager::set_account_limits(
-        &mut db,
-        &account.into(),
-        net_weight,
-        cpu_weight,
-        ram_bytes,
+    let decreased = ResourceLimitsManager::set_account_limits(
+        &mut db, &account, net_weight, cpu_weight, ram_bytes,
     )?;
-    // TODO: Validate ram usage
+    // Lowering a limit doesn't touch usage, so if the account's allowance shrank
+    // it may now be over quota; schedule a RAM check before the transaction
+    // commits (an increase is checked via add_ram_usage instead).
+    if decreased {
+        env_data.apply_context_mut().validate_ram_usage(&account)?;
+    }
     Ok(())
 }
 

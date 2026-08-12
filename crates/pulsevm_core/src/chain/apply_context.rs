@@ -1995,6 +1995,10 @@ impl ApplyContext {
     pub fn active_schedule_version(&self) -> Result<u32, ChainError> {
         self.trx_context.active_schedule_version()
     }
+
+    pub fn validate_ram_usage(&self, account: &Name) -> Result<(), ChainError> {
+        self.trx_context.validate_ram_usage(account)
+    }
 }
 
 /// The `(code, scope, table, primary)` a live iterator points at, or `None` for
