@@ -1533,6 +1533,19 @@ impl ArenaShadow {
         Some((parent, threshold))
     }
 
+    /// The full encoded `shared_authority` blob for a permission (the same bytes
+    /// the FFI seam stored via `encode_authority`), for serving the whole
+    /// authority — not just the threshold — from the arena. `None` if absent.
+    pub fn permission_auth_blob(&self, owner: u64, perm_name: u64) -> Option<Vec<u8>> {
+        let db = self.lock();
+        let auth = db
+            .find_by::<PermissionRow, PermByOwner>(&(owner, perm_name))
+            .ok()
+            .flatten()
+            .map(|p| p.auth)?;
+        db.blob::<PermissionRow>(auth).ok().map(|b| b.to_vec())
+    }
+
     /// Canonical serialization of the whole permission table in (owner, perm_name)
     /// order, matching `Database::permission_state_bytes`: per row owner u64 LE,
     /// perm_name u64 LE, parent id u64 LE, then a u32 LE length-prefixed authority

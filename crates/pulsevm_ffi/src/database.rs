@@ -38,10 +38,14 @@ use crate::{
         Index128Object,
         Index256Object,
         IndexDoubleObject,
+        KeyWeight,
+        PermissionLevel,
+        PermissionLevelWeight,
         TableObject,
         TimePoint,
         U128,
         U256,
+        WaitWeight,
         get_account_info_with_core_symbol,
         get_account_info_without_core_symbol,
         get_currency_balance_with_symbol,
@@ -143,6 +147,74 @@ fn chain_config_params_from_v0(cfg: &ChainConfigV0) -> crate::shadow::ChainConfi
         max_inline_action_depth: cfg.max_inline_action_depth,
         max_authority_depth: cfg.max_authority_depth,
     }
+}
+
+/// Reconstructs an [`Authority`] from the blob [`encode_authority`] produced and
+/// the arena stored — the exact inverse, so `decode_authority(encode_authority(a))`
+/// round-trips. This is what lets the arena serve the *whole* authority (not just
+/// the threshold) for authorization checks, which consume a bridge `Authority`
+/// via `CxxSharedAuthority::to_authority`.
+#[cfg(feature = "arena-shadow")]
+fn decode_authority(blob: &[u8]) -> Result<Authority, ChainError> {
+    fn take<'a>(b: &'a [u8], pos: &mut usize, n: usize) -> Result<&'a [u8], ChainError> {
+        let end = pos
+            .checked_add(n)
+            .filter(|e| *e <= b.len())
+            .ok_or_else(|| ChainError::InternalError("authority blob truncated".into()))?;
+        let s = &b[*pos..end];
+        *pos = end;
+        Ok(s)
+    }
+    fn rd_u16(b: &[u8], pos: &mut usize) -> Result<u16, ChainError> {
+        Ok(u16::from_le_bytes(take(b, pos, 2)?.try_into().unwrap()))
+    }
+    fn rd_u32(b: &[u8], pos: &mut usize) -> Result<u32, ChainError> {
+        Ok(u32::from_le_bytes(take(b, pos, 4)?.try_into().unwrap()))
+    }
+    fn rd_u64(b: &[u8], pos: &mut usize) -> Result<u64, ChainError> {
+        Ok(u64::from_le_bytes(take(b, pos, 8)?.try_into().unwrap()))
+    }
+
+    let mut pos = 0usize;
+    let threshold = rd_u32(blob, &mut pos)?;
+
+    let nkeys = rd_u32(blob, &mut pos)? as usize;
+    let mut keys = Vec::with_capacity(nkeys);
+    for _ in 0..nkeys {
+        let len = rd_u32(blob, &mut pos)? as usize;
+        let key_bytes = take(blob, &mut pos, len)?;
+        let key = ffi::parse_public_key_from_bytes(key_bytes)
+            .map_err(|e| ChainError::InternalError(format!("authority key decode: {e}")))?;
+        let weight = rd_u16(blob, &mut pos)?;
+        keys.push(KeyWeight { key, weight });
+    }
+
+    let naccounts = rd_u32(blob, &mut pos)? as usize;
+    let mut accounts = Vec::with_capacity(naccounts);
+    for _ in 0..naccounts {
+        let actor = rd_u64(blob, &mut pos)?;
+        let permission = rd_u64(blob, &mut pos)?;
+        let weight = rd_u16(blob, &mut pos)?;
+        accounts.push(PermissionLevelWeight {
+            permission: PermissionLevel { actor, permission },
+            weight,
+        });
+    }
+
+    let nwaits = rd_u32(blob, &mut pos)? as usize;
+    let mut waits = Vec::with_capacity(nwaits);
+    for _ in 0..nwaits {
+        let wait_sec = rd_u32(blob, &mut pos)?;
+        let weight = rd_u16(blob, &mut pos)?;
+        waits.push(WaitWeight { wait_sec, weight });
+    }
+
+    Ok(Authority {
+        threshold,
+        keys,
+        accounts,
+        waits,
+    })
 }
 
 /// Serializes an [`Authority`] into the deterministic byte layout the arena
@@ -329,6 +401,20 @@ impl Database {
             let _ = (owner, perm_name);
             None
         }
+    }
+
+    /// The full authority for `(owner, perm_name)` reconstructed from the arena's
+    /// stored `shared_authority` blob, or `None` when shadowing is off / the
+    /// permission is absent. This is the whole authority the authorization checker
+    /// consumes (threshold, keys, accounts, waits), not just the threshold, so it
+    /// can eventually replace the chainbase `PermissionObject::get_authority` read.
+    #[cfg(feature = "arena-shadow")]
+    pub fn arena_permission_authority(&self, owner: u64, perm_name: u64) -> Option<Authority> {
+        let blob = self
+            .shadow
+            .as_ref()
+            .and_then(|s| s.permission_auth_blob(owner, perm_name))?;
+        decode_authority(&blob).ok()
     }
 
     /// Required permission of the mirrored permission_link for `(account, code,
@@ -4629,6 +4715,66 @@ mod tests {
 
     fn name_u64(s: &str) -> u64 {
         string_to_name(s).unwrap().to_uint64_t()
+    }
+
+    /// The arena reconstructs the whole authority from its stored blob: encoding
+    /// an authority with a key, an account, and a wait, decoding it, and
+    /// re-encoding must reproduce the exact blob (value equality — keys pack to
+    /// their canonical bytes), and the decoded structure must match field for
+    /// field. This is what lets the arena serve `PermissionObject::get_authority`.
+    #[cfg(feature = "arena-shadow")]
+    #[test]
+    fn decode_authority_is_the_inverse_of_encode() {
+        let key =
+            ffi::parse_public_key("PUB_K1_5bbkxaLdB5bfVZW6DJY8M74vwT2m61PqwywNUa5azfkJTvYa5H")
+                .expect("parse pubkey");
+        let auth = Authority {
+            threshold: 2,
+            keys: vec![KeyWeight { key, weight: 1 }],
+            accounts: vec![PermissionLevelWeight {
+                permission: PermissionLevel {
+                    actor: name_u64("alice"),
+                    permission: name_u64("active"),
+                },
+                weight: 3,
+            }],
+            waits: vec![WaitWeight {
+                wait_sec: 604800,
+                weight: 4,
+            }],
+        };
+
+        let blob = encode_authority(&auth);
+        let decoded = decode_authority(&blob).expect("decode");
+        assert_eq!(
+            encode_authority(&decoded),
+            blob,
+            "decode∘encode is not the identity"
+        );
+
+        assert_eq!(decoded.threshold, 2);
+        assert_eq!(decoded.keys.len(), 1);
+        assert_eq!(decoded.keys[0].weight, 1);
+        assert_eq!(decoded.accounts.len(), 1);
+        assert_eq!(decoded.accounts[0].permission.actor, name_u64("alice"));
+        assert_eq!(
+            decoded.accounts[0].permission.permission,
+            name_u64("active")
+        );
+        assert_eq!(decoded.accounts[0].weight, 3);
+        assert_eq!(decoded.waits.len(), 1);
+        assert_eq!(decoded.waits[0].wait_sec, 604800);
+        assert_eq!(decoded.waits[0].weight, 4);
+    }
+
+    /// A truncated blob is rejected, not silently mis-decoded.
+    #[cfg(feature = "arena-shadow")]
+    #[test]
+    fn decode_authority_rejects_truncated_blob() {
+        // threshold + a key count of 1 but no key payload.
+        let mut blob = 1u32.to_le_bytes().to_vec();
+        blob.extend_from_slice(&1u32.to_le_bytes());
+        assert!(decode_authority(&blob).is_err());
     }
 
     #[test]
