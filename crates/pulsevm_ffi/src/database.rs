@@ -230,6 +230,39 @@ fn decode_authority(blob: &[u8]) -> Result<Authority, ChainError> {
 /// encoding is private to the mirror; it only has to be stable so equal
 /// authorities hash equal.
 #[cfg(feature = "arena-shadow")]
+/// Build an authority blob in the exact [`encode_authority`] layout from plain
+/// parts — used by the pure-Rust genesis, which has no FFI `Authority` object.
+/// `keys` are `(packed_public_key_bytes, weight)`, `accounts` are
+/// `(actor, permission, weight)`, `waits` are `(wait_sec, weight)`.
+#[cfg(feature = "arena-shadow")]
+fn build_auth_blob(
+    threshold: u32,
+    keys: &[(Vec<u8>, u16)],
+    accounts: &[(u64, u64, u16)],
+    waits: &[(u32, u16)],
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&threshold.to_le_bytes());
+    out.extend_from_slice(&(keys.len() as u32).to_le_bytes());
+    for (bytes, weight) in keys {
+        out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(bytes);
+        out.extend_from_slice(&weight.to_le_bytes());
+    }
+    out.extend_from_slice(&(accounts.len() as u32).to_le_bytes());
+    for (actor, permission, weight) in accounts {
+        out.extend_from_slice(&actor.to_le_bytes());
+        out.extend_from_slice(&permission.to_le_bytes());
+        out.extend_from_slice(&weight.to_le_bytes());
+    }
+    out.extend_from_slice(&(waits.len() as u32).to_le_bytes());
+    for (wait_sec, weight) in waits {
+        out.extend_from_slice(&wait_sec.to_le_bytes());
+        out.extend_from_slice(&weight.to_le_bytes());
+    }
+    out
+}
+
 fn encode_authority(auth: &Authority) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&auth.threshold.to_le_bytes());
@@ -877,6 +910,22 @@ impl Database {
             if let Some(s) = &self.shadow {
                 s.enable_standalone_writes();
             }
+        }
+    }
+
+    /// Whether genesis authors the arena directly instead of running C++ genesis
+    /// and hydrating from it. No-op false when shadowing is off.
+    pub fn arena_rust_genesis(&self) -> bool {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow
+                .as_ref()
+                .map(|s| s.rust_genesis())
+                .unwrap_or(false)
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            false
         }
     }
 
@@ -2186,6 +2235,13 @@ impl Database {
     }
 
     pub fn initialize_database(&mut self, genesis: &CxxGenesisState) -> Result<(), ChainError> {
+        // Pure-Rust genesis: author the arena directly and never touch chainbase —
+        // the last chainbase write removed. Gated while it is validated against
+        // block-1 golden roots (see `initialize_genesis_arena`).
+        #[cfg(feature = "arena-shadow")]
+        if self.arena_rust_genesis() {
+            return self.initialize_genesis_arena(genesis);
+        }
         {
             let mut guard = self.locked_write()?;
             let pinned = guard.pin_mut();
@@ -2304,6 +2360,191 @@ impl Database {
             }
         }
         Ok(())
+    }
+
+    /// Author the entire genesis state directly on the arena, reproducing C++
+    /// `initialize_database` (database.cpp) without a chainbase bootstrap. Every
+    /// value is derived from the genesis state or from the fixed genesis
+    /// constants, and the whole thing is pinned by the block-1 golden roots.
+    #[cfg(feature = "arena-shadow")]
+    fn initialize_genesis_arena(&self, genesis: &CxxGenesisState) -> Result<(), ChainError> {
+        use crate::shadow::ElasticParams;
+
+        let s = self.shadow_ref()?;
+
+        // Genesis timestamp: micros since the fc epoch (1970) for permission
+        // last_updated/last_used, and the block_timestamp slot for account
+        // creation_date (config::block_timestamp_epoch = 946684800000ms, 500ms
+        // slots).
+        let ts_us: i64 = genesis.get_initial_timestamp().time_since_epoch().count();
+        let creation_slot: u32 = (((ts_us / 1000) - 946_684_800_000i64) / 500i64).max(0) as u32;
+
+        // Genesis account / permission names (config.hpp), as name-encoded u64.
+        const PULSE: u64 = 12_584_048_018_849_792_000;
+        const PULSE_NULL: u64 = 12_584_048_029_495_738_368;
+        const PULSE_PRODS: u64 = 12_584_048_030_520_602_624;
+        const OWNER: u64 = 12_044_502_819_693_133_824;
+        const ACTIVE: u64 = 3_617_214_756_542_218_240;
+        const PROD_MAJOR: u64 = 12_531_424_605_554_196_480;
+        const PROD_MINOR: u64 = 12_531_424_609_916_272_640;
+
+        // 1. global_property (chain_config from the genesis configuration).
+        s.set_global_properties(chain_config_params_from_cxx(
+            genesis.get_initial_configuration(),
+        ))
+        .map_err(|e| ChainError::InternalError(format!("genesis global_property: {e:?}")))?;
+
+        // 2. resource_limits_config — the C++ struct defaults (config.hpp): target =
+        //    EOS_PERCENT(max, 10%), periods = 60_000ms/500ms = 120, max_multiplier 1000, contract
+        //    99/100, expand 1000/999; windows = 24h/500ms = 172_800.
+        let cpu = ElasticParams {
+            target: 200_000,
+            max: 2_000_000,
+            periods: 120,
+            max_multiplier: 1000,
+            contract: (99, 100),
+            expand: (1000, 999),
+        };
+        let net = ElasticParams {
+            target: 104_857,
+            max: 1_048_576,
+            periods: 120,
+            max_multiplier: 1000,
+            contract: (99, 100),
+            expand: (1000, 999),
+        };
+        s.seed_resource_config(cpu, net, 172_800, 172_800)
+            .map_err(|e| ChainError::InternalError(format!("genesis resource_config: {e:?}")))?;
+
+        // 3. resource_limits_state: virtual limits seeded to each resource's max (slow-start).
+        s.initialize_resource_state(2_000_000, 1_048_576)
+            .map_err(|e| ChainError::InternalError(format!("genesis resource_state: {e:?}")))?;
+
+        // 4. native accounts. system_auth carries the genesis key; the producers' active authority
+        //    delegates to pulse/active.
+        let key_bytes = ffi::packed_public_key_bytes(genesis.get_initial_key());
+        let system_auth = build_auth_blob(1, &[(key_bytes, 1)], &[], &[]);
+        let empty_auth = build_auth_blob(1, &[], &[], &[]);
+        let active_producers_auth = build_auth_blob(1, &[], &[(PULSE, ACTIVE, 1)], &[]);
+
+        self.genesis_native_account(
+            PULSE,
+            &system_auth,
+            &system_auth,
+            true,
+            creation_slot,
+            ts_us,
+            Some(pulsevm_chaindb::GENESIS_PULSE_ABI),
+            OWNER,
+            ACTIVE,
+        )?;
+        self.genesis_native_account(
+            PULSE_NULL,
+            &empty_auth,
+            &empty_auth,
+            false,
+            creation_slot,
+            ts_us,
+            None,
+            OWNER,
+            ACTIVE,
+        )?;
+        // The producers account's active permission is the parent of prod.major.
+        let prods_active_id = self.genesis_native_account(
+            PULSE_PRODS,
+            &empty_auth,
+            &active_producers_auth,
+            false,
+            creation_slot,
+            ts_us,
+            None,
+            OWNER,
+            ACTIVE,
+        )?;
+
+        // 5. prod.major (parent = producers active) then prod.minor (parent = prod.major), both
+        //    carrying the active-producers authority.
+        let major_id = self.genesis_permission(
+            PULSE_PRODS,
+            PROD_MAJOR,
+            prods_active_id,
+            &active_producers_auth,
+            ts_us,
+        )?;
+        self.genesis_permission(
+            PULSE_PRODS,
+            PROD_MINOR,
+            major_id,
+            &active_producers_auth,
+            ts_us,
+        )?;
+
+        Ok(())
+    }
+
+    /// Create one genesis permission in the arena (owner-authored cb_id from the
+    /// replicated counter), returning its cb_id for parent links.
+    #[cfg(feature = "arena-shadow")]
+    fn genesis_permission(
+        &self,
+        owner: u64,
+        perm_name: u64,
+        parent_cb_id: i64,
+        auth_blob: &[u8],
+        ts_us: i64,
+    ) -> Result<i64, ChainError> {
+        let s = self.shadow_ref()?;
+        let cb_id = s
+            .next_permission_id()
+            .map_err(|e| ChainError::InternalError(format!("genesis next_permission_id: {e:?}")))?;
+        s.create_permission(cb_id, parent_cb_id, owner, perm_name, ts_us, auth_blob)
+            .map_err(|e| ChainError::InternalError(format!("genesis create_permission: {e:?}")))?;
+        Ok(cb_id)
+    }
+
+    /// Reproduce C++ `create_native_account`: account + metadata + owner/active
+    /// permissions + resource-limit init + the fixed genesis RAM billing.
+    /// Returns the active permission's cb_id.
+    #[cfg(feature = "arena-shadow")]
+    fn genesis_native_account(
+        &self,
+        name: u64,
+        owner_auth: &[u8],
+        active_auth: &[u8],
+        privileged: bool,
+        creation_slot: u32,
+        ts_us: i64,
+        abi: Option<&[u8]>,
+        owner_name: u64,
+        active_name: u64,
+    ) -> Result<i64, ChainError> {
+        let s = self.shadow_ref()?;
+        s.create_account(name, creation_slot)
+            .map_err(|e| ChainError::InternalError(format!("genesis create_account: {e:?}")))?;
+        if let Some(abi) = abi {
+            s.set_account_abi_raw(name, abi)
+                .map_err(|e| ChainError::InternalError(format!("genesis set abi: {e:?}")))?;
+        }
+        s.create_account_metadata(name, privileged)
+            .map_err(|e| ChainError::InternalError(format!("genesis metadata: {e:?}")))?;
+
+        let _owner_id = self.genesis_permission(name, owner_name, 0, owner_auth, ts_us)?;
+        let active_id =
+            self.genesis_permission(name, active_name, _owner_id, active_auth, ts_us)?;
+
+        s.initialize_account_resource_limits(name)
+            .map_err(|e| ChainError::InternalError(format!("genesis init limits: {e:?}")))?;
+
+        // ram_delta = overhead_per_account_ram_bytes (2048) +
+        //   2 * billable_size_v<permission_object> + owner+active auth billable.
+        let ram_delta = 2048i64
+            + 2 * billable_size_v::<ffi::PermissionObject>() as i64
+            + authority_blob_billable_size(owner_auth).unwrap_or(0)
+            + authority_blob_billable_size(active_auth).unwrap_or(0);
+        s.add_pending_ram_usage(name, ram_delta)
+            .map_err(|e| ChainError::InternalError(format!("genesis ram: {e:?}")))?;
+        // verify_account_ram_usage is a no-op under standalone writes.
+        Ok(active_id)
     }
 
     pub fn create_account(

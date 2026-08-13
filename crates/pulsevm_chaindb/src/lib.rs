@@ -1198,6 +1198,7 @@ pub struct ArenaShadow {
     // run. Off by default; opt in with `PULSEVM_ARENA_ONLY` (which turns on the
     // whole standalone path, reads and writes together).
     standalone_writes: Arc<std::sync::atomic::AtomicBool>,
+    rust_genesis: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Whether execution resolves reads entirely from the arena (no chainbase on the
@@ -1217,6 +1218,20 @@ fn arena_standalone_default() -> bool {
 /// `PULSEVM_ARENA_ONLY` because skipping writes drops the live per-block oracle.
 fn arena_standalone_writes_default() -> bool {
     match std::env::var("PULSEVM_ARENA_STANDALONE_WRITES") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        Err(_) => false,
+    }
+}
+
+/// Whether genesis authors the arena directly instead of running C++ genesis and
+/// hydrating from it. Opt-in (`PULSEVM_ARENA_RUST_GENESIS`) while the pure-Rust
+/// genesis is validated against block-1 golden roots; folds into standalone
+/// writes once proven.
+fn arena_rust_genesis_default() -> bool {
+    match std::env::var("PULSEVM_ARENA_RUST_GENESIS") {
         Ok(v) => !matches!(
             v.trim().to_ascii_lowercase().as_str(),
             "0" | "false" | "off" | "no"
@@ -1320,7 +1335,16 @@ impl ArenaShadow {
             standalone_writes: Arc::new(std::sync::atomic::AtomicBool::new(
                 arena_standalone_writes_default(),
             )),
+            rust_genesis: Arc::new(std::sync::atomic::AtomicBool::new(
+                arena_rust_genesis_default(),
+            )),
         })
+    }
+
+    /// Whether genesis should be authored directly on the arena (no C++ genesis /
+    /// chainbase hydration). See [`arena_rust_genesis_default`].
+    pub fn rust_genesis(&self) -> bool {
+        self.rust_genesis.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Route contract reads through the arena from now on (the cutover switch).
@@ -1669,6 +1693,21 @@ impl ArenaShadow {
             row.name = name;
             row.creation_date = creation_date;
         })?;
+        Ok(())
+    }
+
+    /// Set an account's abi bytes directly, without bumping abi_sequence — the
+    /// genesis path installs the system account's abi inside `create<account_
+    /// object>` (below the metadata sequence), unlike setabi which increments it.
+    pub fn set_account_abi_raw(&self, name: u64, abi: &[u8]) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let acct_id = db
+            .find_by::<AccountRow, AccountRowByName>(&name)?
+            .map(|r| r.id());
+        if let Some(id) = acct_id {
+            let abi_blob = db.alloc_blob::<AccountRow>(abi)?;
+            db.modify::<AccountRow>(id, |row| row.abi = abi_blob)?;
+        }
         Ok(())
     }
 
