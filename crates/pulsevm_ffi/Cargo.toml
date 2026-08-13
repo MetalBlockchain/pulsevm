@@ -39,6 +39,7 @@ cmake = "0.1"
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 pulsevm_contractdb = { path = "../pulsevm_contractdb" }
 proptest = "1"
+secp256k1 = { version = "0.30", features = ["rand"] }
 
 [[bench]]
 name = "read"
