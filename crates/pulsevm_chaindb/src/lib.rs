@@ -2967,6 +2967,15 @@ impl ArenaShadow {
     /// db_previous_i64 step). `None` means the walk ran off the table's end. All
     /// three read the `(t_id, primary_key)` index directly, so the order is the
     /// index's, not one we impose.
+    /// Whether the contract table `(code, scope, table)` exists in the arena. Lets
+    /// the standalone read path distinguish "table absent" (chainbase returns -1)
+    /// from "row absent but table present" (an end iterator), matching the
+    /// db_find/lowerbound/end semantics.
+    pub fn kv_table_exists(&self, code: u64, scope: u64, table: u64) -> bool {
+        let db = self.lock();
+        self.resolve_t_id(&db, code, scope, table).is_some()
+    }
+
     pub fn kv_lower_bound(&self, code: u64, scope: u64, table: u64, key: u64) -> Option<u64> {
         use std::ops::Bound;
         let db = self.lock();

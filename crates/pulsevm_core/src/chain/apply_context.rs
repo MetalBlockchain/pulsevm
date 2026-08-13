@@ -605,6 +605,22 @@ impl ApplyContext {
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
 
+        // Arena-standalone: resolve the lookup against the arena cache only. A
+        // present row takes its handle; a missing row in a present table takes the
+        // table's end iterator; a missing table is -1 — matching chainbase's
+        // db_find_i64 (which caches the table's end iterator before the lookup).
+        #[cfg(feature = "arena-shadow")]
+        if self.db.arena_standalone_reads() {
+            let h = if !self.db.arena_kv_table_exists(code, scope, table) {
+                -1
+            } else if self.db.arena_kv_get(code, scope, table, id).is_some() {
+                inner.arena_keyval_cache.add((code, scope, table, id))
+            } else {
+                inner.arena_keyval_cache.cache_table((code, scope, table))
+            };
+            return Ok(h);
+        }
+
         let res = self
             .db
             .db_find_i64(code, scope, table, id, &mut inner.keyval_cache)
@@ -654,25 +670,46 @@ impl ApplyContext {
 
         let res = {
             let mut inner = self.inner.write()?;
+            // The chainbase row is still written (it mirrors into the arena and
+            // keeps the oracle's state), but in standalone mode the arena owns the
+            // iterator handle the contract receives.
             let obj =
                 self.db
                     .create_key_value_object(table, payer, primary_key, &data.0.as_slice())?;
-            let obj = unsafe { &*obj };
-            inner.keyval_cache.cache_table(&table)?;
-            let handle = inner.keyval_cache.add(obj)?;
-            #[cfg(feature = "arena-shadow")]
-            {
-                let key = (
-                    table.get_code().to_uint64_t(),
-                    table.get_scope().to_uint64_t(),
-                    table.get_table().to_uint64_t(),
-                    primary_key,
-                );
-                inner.arena_keyval_cache.cache_table((key.0, key.1, key.2));
-                let arena_handle = inner.arena_keyval_cache.add(key);
-                self.note_iter_handle("store", key.0, key.1, key.2, arena_handle, handle);
+            if self.db.arena_standalone_reads() {
+                #[cfg(feature = "arena-shadow")]
+                {
+                    let key = (
+                        table.get_code().to_uint64_t(),
+                        table.get_scope().to_uint64_t(),
+                        table.get_table().to_uint64_t(),
+                        primary_key,
+                    );
+                    inner.arena_keyval_cache.cache_table((key.0, key.1, key.2));
+                    inner.arena_keyval_cache.add(key)
+                }
+                #[cfg(not(feature = "arena-shadow"))]
+                {
+                    unreachable!("standalone reads require the arena-shadow feature")
+                }
+            } else {
+                let obj = unsafe { &*obj };
+                inner.keyval_cache.cache_table(&table)?;
+                let handle = inner.keyval_cache.add(obj)?;
+                #[cfg(feature = "arena-shadow")]
+                {
+                    let key = (
+                        table.get_code().to_uint64_t(),
+                        table.get_scope().to_uint64_t(),
+                        table.get_table().to_uint64_t(),
+                        primary_key,
+                    );
+                    inner.arena_keyval_cache.cache_table((key.0, key.1, key.2));
+                    let arena_handle = inner.arena_keyval_cache.add(key);
+                    self.note_iter_handle("store", key.0, key.1, key.2, arena_handle, handle);
+                }
+                handle
             }
-            handle
         };
 
         let billable_size = data.len() as i64 + billable_size_v::<KeyValueObject>() as i64;
@@ -689,6 +726,51 @@ impl ApplyContext {
     ) -> Result<(), ChainError> {
         let payer = payer.as_u64();
         let new_size = data.as_ref().len() as i64;
+
+        // Arena-standalone: the contract's handle is the arena's, so resolve the
+        // row's key from the arena cache and re-find the chainbase row by key to
+        // keep the oracle's state in sync (update_key_value_object mirrors into the
+        // arena). The access-violation check reads the code straight off the key.
+        #[cfg(feature = "arena-shadow")]
+        if self.db.arena_standalone_reads() {
+            let (old_size, old_payer, new_payer) = {
+                let mut inner = self.inner.write()?;
+                let (code, scope, table, primary) =
+                    inner.arena_keyval_cache.row_of(iterator).ok_or_else(|| {
+                        ChainError::InternalError(format!("invalid iterator {iterator}"))
+                    })?;
+                pulse_assert(
+                    code == self.receiver.as_u64(),
+                    ChainError::TransactionError(format!("db access violation")),
+                )?;
+                let cb_handle =
+                    self.db
+                        .db_find_i64(code, scope, table, primary, &mut inner.keyval_cache)?;
+                let obj = inner.keyval_cache.get(cb_handle)?;
+                let old_payer = obj.get_payer().to_uint64_t();
+                let new_payer = if payer == 0 {
+                    obj.get_payer().to_uint64_t()
+                } else {
+                    payer
+                };
+                let old_size = obj.get_value().size() as i64;
+                self.db
+                    .update_key_value_object(obj, new_payer, data.as_ref())?;
+                (old_size, old_payer, new_payer)
+            };
+
+            let overhead = billable_size_v::<KeyValueObject>() as i64;
+            let old_size = old_size + overhead;
+            let new_size = new_size + overhead;
+            if old_payer != new_payer {
+                self.update_db_usage(&Name::new(old_payer), -old_size)?;
+                self.update_db_usage(&Name::new(new_payer), new_size)?;
+            } else if old_size != new_size {
+                self.update_db_usage(&Name::new(new_payer), new_size - old_size)?;
+            }
+            return Ok(());
+        }
+
         let (old_size, old_payer, new_payer) = {
             let inner = self.inner.read()?;
             let obj = inner.keyval_cache.get(iterator)?;
@@ -807,12 +889,45 @@ impl ApplyContext {
     pub fn db_remove_i64(&mut self, iterator: i32) -> Result<(), ChainError> {
         let delta = {
             let mut inner = self.inner.write()?;
-            let delta =
-                self.db
-                    .db_remove_i64(&mut inner.keyval_cache, iterator, self.receiver.as_u64())?;
+
+            // Arena-standalone: the handle is the arena's, so resolve its key and
+            // re-find the chainbase row to remove it by chainbase handle (which
+            // mirrors the arena removal by key), then tombstone the arena handle.
             #[cfg(feature = "arena-shadow")]
-            inner.arena_keyval_cache.remove(iterator);
-            delta
+            let standalone_delta: Option<i64> = if self.db.arena_standalone_reads() {
+                let (code, scope, table, primary) =
+                    inner.arena_keyval_cache.row_of(iterator).ok_or_else(|| {
+                        ChainError::InternalError(format!("invalid iterator {iterator}"))
+                    })?;
+                let cb_handle =
+                    self.db
+                        .db_find_i64(code, scope, table, primary, &mut inner.keyval_cache)?;
+                let delta = self.db.db_remove_i64(
+                    &mut inner.keyval_cache,
+                    cb_handle,
+                    self.receiver.as_u64(),
+                )?;
+                inner.arena_keyval_cache.remove(iterator);
+                Some(delta)
+            } else {
+                None
+            };
+            #[cfg(not(feature = "arena-shadow"))]
+            let standalone_delta: Option<i64> = None;
+
+            match standalone_delta {
+                Some(d) => d,
+                None => {
+                    let delta = self.db.db_remove_i64(
+                        &mut inner.keyval_cache,
+                        iterator,
+                        self.receiver.as_u64(),
+                    )?;
+                    #[cfg(feature = "arena-shadow")]
+                    inner.arena_keyval_cache.remove(iterator);
+                    delta
+                }
+            }
         };
 
         self.update_db_usage(&Name::new(self.receiver.as_u64()), -delta)?;
@@ -822,6 +937,25 @@ impl ApplyContext {
 
     pub fn db_next_i64(&mut self, iterator: i32, primary: &mut u64) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
+
+        // Arena-standalone: advance to the successor via the arena's upper_bound of
+        // the current key; no successor lands on the table's end iterator.
+        #[cfg(feature = "arena-shadow")]
+        if self.db.arena_standalone_reads() {
+            if let Some((code, scope, table, cur_pk)) = inner.arena_keyval_cache.row_of(iterator) {
+                return Ok(
+                    match self.db.arena_kv_upper_bound(code, scope, table, cur_pk) {
+                        Some(pk) => {
+                            *primary = pk;
+                            inner.arena_keyval_cache.add((code, scope, table, pk))
+                        }
+                        None => inner.arena_keyval_cache.cache_table((code, scope, table)),
+                    },
+                );
+            }
+            // db_next from an end iterator has no successor: stay put.
+            return Ok(iterator);
+        }
 
         // The cursor's current key, for the arena successor cross-check. `None`
         // if `iterator` is an end iterator (no backing row) — then we leave
@@ -868,6 +1002,42 @@ impl ApplyContext {
 
     pub fn db_previous_i64(&mut self, iterator: i32, primary: &mut u64) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
+
+        // Arena-standalone: from a live row, step to its arena predecessor; from an
+        // end iterator, to the table's last row. No predecessor returns -1
+        // (db_previous never lands on an end iterator).
+        #[cfg(feature = "arena-shadow")]
+        if self.db.arena_standalone_reads() {
+            let landing =
+                match inner.arena_keyval_cache.row_of(iterator) {
+                    Some((code, scope, table, cur_pk)) => Some((
+                        code,
+                        scope,
+                        table,
+                        self.db.arena_kv_prev(code, scope, table, cur_pk),
+                    )),
+                    None => inner.arena_keyval_cache.table_of_end(iterator).map(
+                        |(code, scope, table)| {
+                            (
+                                code,
+                                scope,
+                                table,
+                                self.db.arena_kv_last(code, scope, table),
+                            )
+                        },
+                    ),
+                };
+            let Some((code, scope, table, prev)) = landing else {
+                return Ok(-1);
+            };
+            return Ok(match prev {
+                Some(pk) => {
+                    *primary = pk;
+                    inner.arena_keyval_cache.add((code, scope, table, pk))
+                }
+                None => -1,
+            });
+        }
 
         // From a live row: predecessor = arena `prev` of its key. From an end
         // iterator (the db_end -> db_previous backward-iteration entry): the
@@ -923,6 +1093,17 @@ impl ApplyContext {
 
     pub fn db_end_i64(&mut self, code: u64, scope: u64, table: u64) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
+
+        // Arena-standalone: a present table has an end iterator, an absent one is -1.
+        #[cfg(feature = "arena-shadow")]
+        if self.db.arena_standalone_reads() {
+            return Ok(if self.db.arena_kv_table_exists(code, scope, table) {
+                inner.arena_keyval_cache.cache_table((code, scope, table))
+            } else {
+                -1
+            });
+        }
+
         let res = self
             .db
             .db_end_i64(&mut inner.keyval_cache, code, scope, table)?;
@@ -948,6 +1129,22 @@ impl ApplyContext {
         primary: u64,
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
+
+        // Arena-standalone: smallest primary >= key from the arena; none lands on
+        // the end iterator; an absent table is -1.
+        #[cfg(feature = "arena-shadow")]
+        if self.db.arena_standalone_reads() {
+            if !self.db.arena_kv_table_exists(code, scope, table) {
+                return Ok(-1);
+            }
+            return Ok(
+                match self.db.arena_kv_lower_bound(code, scope, table, primary) {
+                    Some(pk) => inner.arena_keyval_cache.add((code, scope, table, pk)),
+                    None => inner.arena_keyval_cache.cache_table((code, scope, table)),
+                },
+            );
+        }
+
         let res =
             self.db
                 .db_lowerbound_i64(&mut inner.keyval_cache, code, scope, table, primary)?;
@@ -987,6 +1184,22 @@ impl ApplyContext {
         primary: u64,
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
+
+        // Arena-standalone: smallest primary > key from the arena; none lands on
+        // the end iterator; an absent table is -1.
+        #[cfg(feature = "arena-shadow")]
+        if self.db.arena_standalone_reads() {
+            if !self.db.arena_kv_table_exists(code, scope, table) {
+                return Ok(-1);
+            }
+            return Ok(
+                match self.db.arena_kv_upper_bound(code, scope, table, primary) {
+                    Some(pk) => inner.arena_keyval_cache.add((code, scope, table, pk)),
+                    None => inner.arena_keyval_cache.cache_table((code, scope, table)),
+                },
+            );
+        }
+
         let res =
             self.db
                 .db_upperbound_i64(&mut inner.keyval_cache, code, scope, table, primary)?;

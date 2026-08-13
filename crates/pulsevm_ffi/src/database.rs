@@ -902,6 +902,21 @@ impl Database {
         }
     }
 
+    pub fn arena_kv_table_exists(&self, code: u64, scope: u64, table: u64) -> bool {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow
+                .as_ref()
+                .map(|s| s.kv_table_exists(code, scope, table))
+                .unwrap_or(false)
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = (code, scope, table);
+            false
+        }
+    }
+
     pub fn arena_kv_upper_bound(&self, code: u64, scope: u64, table: u64, key: u64) -> Option<u64> {
         #[cfg(feature = "arena-shadow")]
         {
