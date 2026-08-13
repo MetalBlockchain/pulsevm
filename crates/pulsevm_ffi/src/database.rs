@@ -3159,6 +3159,12 @@ impl Database {
     }
 
     pub fn is_account(&self, account: u64) -> Result<bool, ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && s.standalone_reads()
+        {
+            return Ok(s.account_exists(account));
+        }
         let chainbase = {
             let guard = self.locked_read()?;
             guard
@@ -3186,6 +3192,17 @@ impl Database {
     /// feed the receipt digest, so the arena must agree. Errors when the account
     /// has no metadata, matching `get_account_metadata`.
     pub fn account_metadata_code_abi_sequence(&self, name: u64) -> Result<(u64, u64), ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && s.standalone_reads()
+        {
+            return s.account_metadata(name).map(|t| (t.3, t.4)).ok_or_else(|| {
+                ChainError::InternalError(format!(
+                    "account metadata not found for account: {}",
+                    name
+                ))
+            });
+        }
         let chainbase = {
             let guard = self.locked_read()?;
             let res = guard.find_account_metadata(name).map_err(|e| {
@@ -3221,6 +3238,17 @@ impl Database {
     /// the arena under PULSEVM_ARENA_READS. Errors when the account has no
     /// metadata, matching `get_account_metadata`.
     pub fn is_account_privileged(&self, name: u64) -> Result<bool, ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && s.standalone_reads()
+        {
+            return s.account_metadata_privileged(name).ok_or_else(|| {
+                ChainError::InternalError(format!(
+                    "account metadata not found for account: {}",
+                    name
+                ))
+            });
+        }
         let chainbase = {
             let guard = self.locked_read()?;
             let res = guard.find_account_metadata(name).map_err(|e| {
@@ -3396,6 +3424,14 @@ impl Database {
         vm_type: u8,
         vm_version: u8,
     ) -> Result<Vec<u8>, ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && s.standalone_reads()
+        {
+            return s
+                .code_by_hash(digest_to_array(code_hash), vm_type, vm_version)
+                .ok_or_else(|| ChainError::InternalError("code object not found".to_string()));
+        }
         let chainbase = {
             let guard = self.locked_read()?;
             // The bridge returns a reference (Err, never null, when absent).
@@ -5699,6 +5735,15 @@ impl<'g> DbRead<'g> {
         actor: u64,
         permission: u64,
     ) -> Result<Option<Authority>, ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && s.standalone_reads()
+        {
+            return match s.permission_auth_blob(actor, permission) {
+                Some(blob) => Ok(Some(decode_authority(&blob)?)),
+                None => Ok(None),
+            };
+        }
         let chainbase = self
             .db()
             .find_permission_by_actor_and_permission(actor, permission)
@@ -5727,6 +5772,12 @@ impl<'g> DbRead<'g> {
     /// parent the active permission on it; the mirror stores that same id, so the
     /// value it serves is identical.
     pub fn permission_id(&self, owner: u64, perm_name: u64) -> Result<Option<i64>, ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && s.standalone_reads()
+        {
+            return Ok(s.permission_cb_id(owner, perm_name));
+        }
         let chainbase = self
             .db()
             .find_permission_by_actor_and_permission(owner, perm_name)
@@ -5754,6 +5805,14 @@ impl<'g> DbRead<'g> {
         owner: u64,
         perm_name: u64,
     ) -> Result<Option<i64>, ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && s.standalone_reads()
+        {
+            return Ok(s
+                .permission_auth_blob(owner, perm_name)
+                .and_then(|blob| authority_blob_billable_size(&blob)));
+        }
         let chainbase = self
             .db()
             .find_permission_by_actor_and_permission(owner, perm_name)
@@ -5928,6 +5987,12 @@ impl<'g> DbRead<'g> {
         code: u64,
         requirement_type: u64,
     ) -> Result<Option<u64>, ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && s.standalone_reads()
+        {
+            return Ok(s.permission_link(account, code, requirement_type));
+        }
         let res = self
             .db()
             .lookup_linked_permission(account, code, requirement_type)
