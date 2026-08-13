@@ -266,6 +266,59 @@ fn update_elastic_limit(current: u64, average: u64, p: &ElasticParams) -> u64 {
     result.max(p.max).min(p.max * p.max_multiplier as u64)
 }
 
+/// `(num / den) + (num % den > 0)`, the exact chainbase `integer_divide_ceil`.
+fn integer_divide_ceil_u128(num: u128, den: u128) -> u128 {
+    (num / den) + if num % den > 0 { 1 } else { 0 }
+}
+
+/// The elastic per-account resource-limit math shared by `get_account_net_limit`
+/// and `get_account_cpu_limit` (chainbase, `current_time` = none). Returns
+/// `(available, greylisted)`. All arithmetic is done in `u128` to match the C++
+/// `uint128_t` intermediates exactly; `available` is `max_user_use - used`
+/// clamped at zero.
+fn elastic_account_limit(
+    weight: i64,
+    total_weight: u64,
+    virtual_limit: u64,
+    window: u32,
+    param_max: u64,
+    value_ex: u64,
+    greylist_limit: u32,
+) -> (i64, bool) {
+    // config::rate_limiting_precision / maximum_elastic_resource_multiplier.
+    const RATE_LIMITING_PRECISION: u128 = 1000 * 1000;
+    const MAX_ELASTIC_MULTIPLIER: u32 = 1000;
+
+    if weight < 0 || total_weight == 0 {
+        return (-1, false);
+    }
+
+    let window_size = window as u128;
+    let mut greylisted = false;
+    let mut capacity_in_window = window_size;
+    if greylist_limit < MAX_ELASTIC_MULTIPLIER {
+        // chainbase multiplies the max by greylist in u64 (may wrap); mirror it.
+        let greylisted_virtual = param_max.wrapping_mul(greylist_limit as u64);
+        if greylisted_virtual < virtual_limit {
+            capacity_in_window *= greylisted_virtual as u128;
+            greylisted = true;
+        } else {
+            capacity_in_window *= virtual_limit as u128;
+        }
+    } else {
+        capacity_in_window *= virtual_limit as u128;
+    }
+
+    let max_user_use = capacity_in_window * weight as u128 / total_weight as u128;
+    let used = integer_divide_ceil_u128(value_ex as u128 * window_size, RATE_LIMITING_PRECISION);
+    let available = if max_user_use <= used {
+        0
+    } else {
+        (max_user_use - used) as i64
+    };
+    (available, greylisted)
+}
+
 /// Arena mirror of chainbase `resource_limits::resource_limits_state_object` — a
 /// singleton. `average_block_{net,cpu}_usage` are windowed accumulators; the
 /// virtual limits are the elastic rate-limit ceilings recomputed each block by
@@ -2425,6 +2478,58 @@ impl ArenaShadow {
             .map(|r| (r.ram_bytes, r.net_weight, r.cpu_weight))
     }
 
+    /// Effective account NET limit `(available, greylisted)`, mirroring
+    /// chainbase's `get_account_net_limit` (`current_time` = none, so the
+    /// history-projection branch is skipped). Deterministic elastic math over the
+    /// mirrored config/state/usage. `None` when the account or state row is
+    /// absent. See [[arena-read-inversion-status]].
+    pub fn account_net_limit(&self, account: u64, greylist_limit: u32) -> Option<(i64, bool)> {
+        let (_ram, net_weight, _cpu) = self.account_limits(account)?;
+        let db = self.lock();
+        let state = db.table::<ResourceStateRow>().ok()?.iter().next()?;
+        let cfg = db.table::<ResourceConfigRow>().ok()?.iter().next()?;
+        let value_ex = db
+            .find_by::<ResourceUsageRow, ResourceUsageRowByOwner>(&account)
+            .ok()
+            .flatten()
+            .map(|r| r.net_usage.value_ex)
+            .unwrap_or(0);
+        Some(elastic_account_limit(
+            net_weight,
+            state.total_net_weight,
+            state.virtual_net_limit,
+            cfg.account_net_usage_average_window,
+            cfg.net_max,
+            value_ex,
+            greylist_limit,
+        ))
+    }
+
+    /// Effective account CPU limit `(available, greylisted)`, mirroring
+    /// chainbase's `get_account_cpu_limit` (`current_time` = none). See
+    /// [`account_net_limit`].
+    pub fn account_cpu_limit(&self, account: u64, greylist_limit: u32) -> Option<(i64, bool)> {
+        let (_ram, _net, cpu_weight) = self.account_limits(account)?;
+        let db = self.lock();
+        let state = db.table::<ResourceStateRow>().ok()?.iter().next()?;
+        let cfg = db.table::<ResourceConfigRow>().ok()?.iter().next()?;
+        let value_ex = db
+            .find_by::<ResourceUsageRow, ResourceUsageRowByOwner>(&account)
+            .ok()
+            .flatten()
+            .map(|r| r.cpu_usage.value_ex)
+            .unwrap_or(0);
+        Some(elastic_account_limit(
+            cpu_weight,
+            state.total_cpu_weight,
+            state.virtual_cpu_limit,
+            cfg.account_cpu_usage_average_window,
+            cfg.cpu_max,
+            value_ex,
+            greylist_limit,
+        ))
+    }
+
     // ----- resource_limits_state (block usage + elastic virtual limits) -----
 
     /// Mirrors the state singleton `initialize_database`/`initialize_resource_
@@ -3012,6 +3117,44 @@ impl ArenaShadow {
         db.blob::<ContractKeyValueRow>(value_ref)
             .ok()
             .map(|b| b.to_vec())
+    }
+
+    /// Whether a contract table `(code, scope, table)` exists in the arena. The
+    /// standalone-writes db_store path bills table-creation RAM only on the first
+    /// row, so it must decide table existence against the arena, not chainbase.
+    pub fn table_exists(&self, code: u64, scope: u64, table: u64) -> bool {
+        let db = self.lock();
+        db.find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&(code, scope, table))
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
+    /// The `(payer, value)` of a contract row, or `None` if absent. db_update /
+    /// db_remove reach the row by opaque handle; under standalone writes the
+    /// caller resolves the key from the arena cache and needs the old payer and
+    /// value size to author the RAM delta without a chainbase object.
+    pub fn kv_row(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary_key: u64,
+    ) -> Option<(u64, Vec<u8>)> {
+        let db = self.lock();
+        let t_id = db
+            .find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&(code, scope, table))
+            .ok()
+            .flatten()
+            .map(|t| t.id().raw())?;
+        let row = db
+            .find_by::<ContractKeyValueRow, ContractKvByScopePrimary>(&(t_id, primary_key))
+            .ok()
+            .flatten()?;
+        let payer = row.payer;
+        db.blob::<ContractKeyValueRow>(row.value)
+            .ok()
+            .map(|b| (payer, b.to_vec()))
     }
 
     /// Serve a contract-table forward scan from the arena: every row in

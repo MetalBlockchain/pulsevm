@@ -36,6 +36,7 @@ use pulsevm_ffi::{
     Microseconds,
     TableObject,
     U256,
+    make_shared_digest_from_existing_hash,
 };
 use pulsevm_serialization::Write;
 
@@ -242,29 +243,36 @@ impl ApplyContext {
             self.trx_context.checktime()?;
         }
 
-        // Copy the (possibly just-updated) code hash out as an owned value: the wasm
-        // run re-locks the database, so no read guard or chainbase reference may be
-        // held across it. Read after the native handler so a self-setcode is seen,
-        // matching the previous live-reference behaviour.
-        let code_hash = {
-            let r = self.db.read()?;
-            let meta = r.get_account_metadata(self.receiver.as_u64())?;
-            CxxDigest::new_from_existing_hash(meta.get_code_hash().as_slice())?
-        };
-
-        // Does the receiver account have a contract deployed?
-        if !code_hash.as_ref().map_or(true, |d| d.empty()) {
+        // Does the receiver account have a contract deployed? Read the deployed
+        // code hash from the arena rather than a chainbase metadata object: under
+        // standalone writes setcode's update lands in the arena only, so the
+        // chainbase object's hash is stale, and the run needs no chainbase
+        // reference held across it. An all-zero hash means no contract.
+        let (code_hash, _vm_type, _vm_version) =
+            self.db.account_code_hash_vm(self.receiver.as_u64())?;
+        if code_hash != [0u8; 32] {
+            // Separate context here because we need to release the lock on inner before executing
+            // the Wasm code, which may call back into the context and cause deadlock if we hold the
+            // lock.
             let cpu_limit = {
                 let inner = self.inner.read()?;
                 inner.cpu_limit
             };
+
+            // Rebuild the digest from the arena-served hash bytes (this does not
+            // re-hash — it wraps the existing 32 bytes) so wasm_runtime can locate
+            // and load the code image by hash.
+            let code_digest = make_shared_digest_from_existing_hash(&code_hash);
+            let code_digest = code_digest.as_ref().ok_or_else(|| {
+                ChainError::InternalError("null code digest for receiver".to_string())
+            })?;
 
             cpu_used += self.wasm_runtime.run(
                 self.receiver.clone(),
                 action.clone(),
                 self.clone(),
                 self.db.clone(),
-                code_hash.as_ref().unwrap(),
+                code_digest,
                 cpu_limit,
             )?;
         }
@@ -659,14 +667,48 @@ impl ApplyContext {
         primary_key: u64,
         data: Bytes,
     ) -> Result<i32, ChainError> {
-        let table = self.find_or_create_table(*self.receiver, scope, table, payer)?;
-        let table = unsafe { &*table };
         pulse_assert(
             payer != 0,
             ChainError::TransactionError(format!(
                 "must specify a valid account to pay for new record"
             )),
         )?;
+
+        // Arena-standalone writes: table existence, creation, the row insert and
+        // the RAM billing all resolve against the arena; chainbase is never
+        // touched. The contract receives the arena's iterator handle. This is the
+        // find_or_create_table + create_key_value_object path with no chainbase
+        // TableObject pointer in the middle.
+        #[cfg(feature = "arena-shadow")]
+        if self.db.arena_standalone_writes() {
+            let code = self.receiver.as_u64();
+            // find_or_create_table: bill the new table before the row, only when
+            // the table did not already exist.
+            if !self.db.arena_table_exists(code, scope, table) {
+                self.update_db_usage(&payer.into(), billable_size_v::<TableObject>() as i64)?;
+            }
+            self.db.create_key_value_object_standalone(
+                code,
+                scope,
+                table,
+                payer,
+                primary_key,
+                data.0.as_slice(),
+            )?;
+            let res = {
+                let mut inner = self.inner.write()?;
+                inner.arena_keyval_cache.cache_table((code, scope, table));
+                inner
+                    .arena_keyval_cache
+                    .add((code, scope, table, primary_key))
+            };
+            let billable_size = data.len() as i64 + billable_size_v::<KeyValueObject>() as i64;
+            self.update_db_usage(&payer.into(), billable_size)?;
+            return Ok(res);
+        }
+
+        let table = self.find_or_create_table(*self.receiver, scope, table, payer)?;
+        let table = unsafe { &*table };
 
         let res = {
             let mut inner = self.inner.write()?;
@@ -726,6 +768,55 @@ impl ApplyContext {
     ) -> Result<(), ChainError> {
         let payer = payer.as_u64();
         let new_size = data.as_ref().len() as i64;
+
+        // Arena-standalone writes: the handle is the arena's; resolve the row's
+        // key and old (payer, value) from the arena and rewrite it there alone.
+        // Chainbase is never touched, so the RAM delta is authored entirely from
+        // arena state.
+        #[cfg(feature = "arena-shadow")]
+        if self.db.arena_standalone_writes() {
+            let (old_size, old_payer, new_payer) = {
+                let inner = self.inner.read()?;
+                let (code, scope, table, primary) =
+                    inner.arena_keyval_cache.row_of(iterator).ok_or_else(|| {
+                        ChainError::InternalError(format!("invalid iterator {iterator}"))
+                    })?;
+                pulse_assert(
+                    code == self.receiver.as_u64(),
+                    ChainError::TransactionError(format!("db access violation")),
+                )?;
+                let (row_payer, value) = self
+                    .db
+                    .arena_kv_row(code, scope, table, primary)
+                    .ok_or_else(|| {
+                        ChainError::InternalError(format!(
+                            "arena has no row for iterator {iterator}"
+                        ))
+                    })?;
+                let new_payer = if payer == 0 { row_payer } else { payer };
+                let old_size = value.len() as i64;
+                self.db.update_key_value_object_standalone(
+                    code,
+                    scope,
+                    table,
+                    primary,
+                    new_payer,
+                    data.as_ref(),
+                )?;
+                (old_size, row_payer, new_payer)
+            };
+
+            let overhead = billable_size_v::<KeyValueObject>() as i64;
+            let old_size = old_size + overhead;
+            let new_size = new_size + overhead;
+            if old_payer != new_payer {
+                self.update_db_usage(&Name::new(old_payer), -old_size)?;
+                self.update_db_usage(&Name::new(new_payer), new_size)?;
+            } else if old_size != new_size {
+                self.update_db_usage(&Name::new(new_payer), new_size - old_size)?;
+            }
+            return Ok(());
+        }
 
         // Arena-standalone: the contract's handle is the arena's, so resolve the
         // row's key from the arena cache and re-find the chainbase row by key to
@@ -887,6 +978,40 @@ impl ApplyContext {
     }
 
     pub fn db_remove_i64(&mut self, iterator: i32) -> Result<(), ChainError> {
+        // Arena-standalone writes: resolve the row's key and value from the arena,
+        // remove it there alone (which auto-removes the table when it empties, as
+        // chainbase does), and reclaim the same RAM chainbase would. The delta
+        // matches the C++ db_remove_i64: -(value + key_value_object overhead).
+        #[cfg(feature = "arena-shadow")]
+        if self.db.arena_standalone_writes() {
+            let delta = {
+                let mut inner = self.inner.write()?;
+                let (code, scope, table, primary) =
+                    inner.arena_keyval_cache.row_of(iterator).ok_or_else(|| {
+                        ChainError::InternalError(format!("invalid iterator {iterator}"))
+                    })?;
+                pulse_assert(
+                    code == self.receiver.as_u64(),
+                    ChainError::TransactionError(format!("db access violation")),
+                )?;
+                let (_payer, value) = self
+                    .db
+                    .arena_kv_row(code, scope, table, primary)
+                    .ok_or_else(|| {
+                        ChainError::InternalError(format!(
+                            "arena has no row for iterator {iterator}"
+                        ))
+                    })?;
+                let delta = -(value.len() as i64 + billable_size_v::<KeyValueObject>() as i64);
+                self.db
+                    .remove_key_value_object_standalone(code, scope, table, primary)?;
+                inner.arena_keyval_cache.remove(iterator);
+                delta
+            };
+            self.update_db_usage(&Name::new(self.receiver.as_u64()), -delta)?;
+            return Ok(());
+        }
+
         let delta = {
             let mut inner = self.inner.write()?;
 

@@ -2962,6 +2962,18 @@ impl Database {
         net_weight: &mut i64,
         cpu_weight: &mut i64,
     ) -> Result<(), ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && s.standalone_reads()
+        {
+            let (r, n, c) = s.account_limits(account_name).ok_or_else(|| {
+                ChainError::InternalError(format!("resource limits not found: {account_name}"))
+            })?;
+            *ram_bytes = r;
+            *net_weight = n;
+            *cpu_weight = c;
+            return Ok(());
+        }
         let guard = self.locked_read()?;
 
         guard
@@ -2990,6 +3002,16 @@ impl Database {
         name: u64,
         greylist_limit: u32,
     ) -> Result<ffi::NetLimitResult, ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && s.standalone_reads()
+        {
+            let (limit, greylisted) =
+                s.account_net_limit(name, greylist_limit).ok_or_else(|| {
+                    ChainError::InternalError(format!("resource state not found for {name}"))
+                })?;
+            return Ok(ffi::NetLimitResult { limit, greylisted });
+        }
         let guard = self.locked_read()?;
 
         guard
@@ -3002,6 +3024,16 @@ impl Database {
         name: u64,
         greylist_limit: u32,
     ) -> Result<ffi::CpuLimitResult, ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && s.standalone_reads()
+        {
+            let (limit, greylisted) =
+                s.account_cpu_limit(name, greylist_limit).ok_or_else(|| {
+                    ChainError::InternalError(format!("resource state not found for {name}"))
+                })?;
+            return Ok(ffi::CpuLimitResult { limit, greylisted });
+        }
         let guard = self.locked_read()?;
 
         guard
@@ -3233,6 +3265,102 @@ impl Database {
             eprintln!("arena mirror of create_key_value_object diverged: {e:?}");
         }
         Ok(res)
+    }
+
+    /// Whether the contract table exists in the arena. Standalone-writes db_store
+    /// bills table-creation RAM only on the first row, so it decides existence
+    /// against the arena rather than dereferencing a chainbase table pointer.
+    pub fn arena_table_exists(&self, code: u64, scope: u64, table: u64) -> bool {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow
+                .as_ref()
+                .map(|s| s.table_exists(code, scope, table))
+                .unwrap_or(false)
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = (code, scope, table);
+            false
+        }
+    }
+
+    /// The `(payer, value)` of a contract row from the arena, or `None`. Under
+    /// standalone writes db_update/db_remove resolve the row's key from the arena
+    /// cache and need its old payer and value size to author the RAM delta.
+    pub fn arena_kv_row(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary_key: u64,
+    ) -> Option<(u64, Vec<u8>)> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow
+                .as_ref()
+                .and_then(|s| s.kv_row(code, scope, table, primary_key))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = (code, scope, table, primary_key);
+            None
+        }
+    }
+
+    /// Author a contract row in the arena alone (no chainbase). The arena's
+    /// create is find-or-create on the table, so it also creates the table if
+    /// absent, mirroring `create_key_value_object` + the implicit table create.
+    #[cfg(feature = "arena-shadow")]
+    pub fn create_key_value_object_standalone(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        payer: u64,
+        primary_key: u64,
+        buffer: &[u8],
+    ) -> Result<(), ChainError> {
+        let s = self.shadow.as_ref().ok_or_else(|| {
+            ChainError::InternalError("standalone writes require the arena shadow".into())
+        })?;
+        s.create_key_value_object(code, scope, table, payer, primary_key, buffer)
+            .map_err(|e| ChainError::InternalError(format!("arena create_key_value_object: {e:?}")))
+    }
+
+    /// Rewrite a contract row's value and payer in the arena alone (no chainbase).
+    #[cfg(feature = "arena-shadow")]
+    pub fn update_key_value_object_standalone(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary_key: u64,
+        payer: u64,
+        buffer: &[u8],
+    ) -> Result<(), ChainError> {
+        let s = self.shadow.as_ref().ok_or_else(|| {
+            ChainError::InternalError("standalone writes require the arena shadow".into())
+        })?;
+        s.update_key_value_object(code, scope, table, primary_key, payer, buffer)
+            .map_err(|e| ChainError::InternalError(format!("arena update_key_value_object: {e:?}")))
+    }
+
+    /// Remove a contract row in the arena alone (no chainbase). The arena drops
+    /// the row and auto-removes the table when it empties, matching chainbase.
+    #[cfg(feature = "arena-shadow")]
+    pub fn remove_key_value_object_standalone(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary_key: u64,
+    ) -> Result<(), ChainError> {
+        let s = self.shadow.as_ref().ok_or_else(|| {
+            ChainError::InternalError("standalone writes require the arena shadow".into())
+        })?;
+        s.remove_key_value_object(code, scope, table, primary_key)
+            .map_err(|e| ChainError::InternalError(format!("arena remove_key_value_object: {e:?}")))
     }
 
     pub fn create_index64_object(
