@@ -752,6 +752,14 @@ impl Database {
     }
 
     pub fn resource_state_bytes(&self) -> Result<Vec<u8>, ChainError> {
+        // With a Rust genesis chainbase is never initialized, so its singleton
+        // getters throw rather than return an empty row. The chainbase side of
+        // the cross-impl serialization is unused in that mode (the arena is the
+        // sole oracle), so hand back an empty blob instead.
+        #[cfg(feature = "arena-shadow")]
+        if self.arena_rust_genesis() {
+            return Ok(Vec::new());
+        }
         let guard = self.locked_read()?;
         guard
             .resource_state_bytes()
@@ -3539,6 +3547,11 @@ impl Database {
     /// byte-compatible with the arena mirror's `resource_config_state_bytes`.
     #[cfg(feature = "arena-shadow")]
     pub fn resource_config_state_bytes(&self) -> Result<Vec<u8>, ChainError> {
+        // Chainbase absent under a Rust genesis; its side of the cross-impl
+        // serialization is unused there (see resource_state_bytes).
+        if self.arena_rust_genesis() {
+            return Ok(Vec::new());
+        }
         let cpu = to_elastic_params(&self.chainbase_cpu_limit_parameters()?);
         let net = to_elastic_params(&self.chainbase_net_limit_parameters()?);
         let cpu_window = self.chainbase_account_cpu_usage_average_window()?;
@@ -4713,6 +4726,16 @@ impl Database {
     }
 
     pub fn get_global_action_sequence(&self) -> Result<u64, ChainError> {
+        // Chainbase absent under a Rust genesis; serve the arena's own counter so
+        // the cross-impl serialization has a value rather than a thrown singleton.
+        #[cfg(feature = "arena-shadow")]
+        if self.arena_rust_genesis() {
+            return Ok(self
+                .shadow
+                .as_ref()
+                .and_then(|s| s.global_action_sequence())
+                .unwrap_or(0));
+        }
         let guard = self.locked_read()?;
         guard
             .get_global_action_sequence()
@@ -6213,6 +6236,11 @@ impl Database {
     /// `global_property_state_bytes`, for the cross-impl root.
     #[cfg(feature = "arena-shadow")]
     pub fn global_property_state_bytes(&self) -> Result<Vec<u8>, ChainError> {
+        // Chainbase absent under a Rust genesis; its side of the cross-impl
+        // serialization is unused there (see resource_state_bytes).
+        if self.arena_rust_genesis() {
+            return Ok(Vec::new());
+        }
         Ok(self.read_chain_config_params()?.to_state_bytes())
     }
 

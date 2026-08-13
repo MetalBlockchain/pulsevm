@@ -459,10 +459,14 @@ pub fn unlinkauth(
 
 fn validate_authority_precondition(db: &mut Database, auth: &Authority) -> Result<(), ChainError> {
     for a in auth.accounts() {
-        pulse_assert(
-            db.account_exists(a.permission.actor)?,
-            ChainError::TransactionError(format!("account {} does not exist", a.permission.actor)),
-        )?;
+        // C++ does a throwing `get<account_object>` purely to assert existence;
+        // is_account is the same predicate and is served off the arena.
+        if !db.is_account(a.permission.actor)? {
+            return Err(ChainError::TransactionError(format!(
+                "account {} does not exist",
+                a.permission.actor
+            )));
+        }
 
         if a.permission.permission == OWNER_NAME || a.permission.permission == ACTIVE_NAME {
             continue; // account was already checked to exist, so its owner and active permissions should exist
