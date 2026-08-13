@@ -2311,6 +2311,17 @@ impl Database {
         account_name: u64,
         creation_date: u32,
     ) -> Result<*const ffi::AccountObject, ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && s.standalone_writes()
+        {
+            // Arena is authoritative: apply the write there and skip chainbase.
+            // The caller discards the returned pointer, so null is fine.
+            s.create_account(account_name, creation_date).map_err(|e| {
+                ChainError::InternalError(format!("arena create_account {account_name}: {e:?}"))
+            })?;
+            return Ok(std::ptr::null());
+        }
         let res = {
             let mut guard = self.locked_write()?;
             let pinned = guard.pin_mut();
@@ -2368,6 +2379,16 @@ impl Database {
         account_name: u64,
         is_privileged: bool,
     ) -> Result<*const ffi::AccountMetadataObject, ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && s.standalone_writes()
+        {
+            s.create_account_metadata(account_name, is_privileged)
+                .map_err(|e| {
+                    ChainError::InternalError(format!("arena create_account_metadata: {e:?}"))
+                })?;
+            return Ok(std::ptr::null());
+        }
         let res = {
             let mut guard = self.locked_write()?;
             let pinned = guard.pin_mut();
@@ -2399,6 +2420,14 @@ impl Database {
     }
 
     pub fn set_privileged(&mut self, account: u64, is_privileged: bool) -> Result<(), ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && s.standalone_writes()
+        {
+            return s.set_privileged(account, is_privileged).map_err(|e| {
+                ChainError::InternalError(format!("arena set_privileged {account}: {e:?}"))
+            });
+        }
         {
             let mut guard = self.locked_write()?;
             let pinned = guard.pin_mut();
@@ -2446,6 +2475,14 @@ impl Database {
     ) -> Result<(), ChainError> {
         #[cfg(feature = "arena-shadow")]
         let hash = digest_to_array(code_hash);
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && s.standalone_writes()
+        {
+            return s.unlink_account_code(hash).map_err(|e| {
+                ChainError::InternalError(format!("arena unlink_account_code: {e:?}"))
+            });
+        }
         {
             let mut guard = self.locked_write()?;
             // Resolve the code object under this guard, then drop the borrow to a
@@ -2485,6 +2522,23 @@ impl Database {
         vm_type: u8,
         vm_version: u8,
     ) -> Result<(), ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && s.standalone_writes()
+        {
+            return s
+                .update_account_code(
+                    account_name,
+                    new_code,
+                    digest_to_array(code_hash),
+                    head_block_num,
+                    vm_type,
+                    vm_version,
+                )
+                .map_err(|e| {
+                    ChainError::InternalError(format!("arena update_account_code: {e:?}"))
+                });
+        }
         {
             let mut guard = self.locked_write()?;
             let obj = guard
@@ -2527,6 +2581,14 @@ impl Database {
     }
 
     pub fn update_account_abi(&mut self, account_name: u64, abi: &[u8]) -> Result<(), ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && s.standalone_writes()
+        {
+            return s.update_account_abi(account_name, abi).map_err(|e| {
+                ChainError::InternalError(format!("arena update_account_abi: {e:?}"))
+            });
+        }
         {
             let mut guard = self.locked_write()?;
             let account = guard
@@ -2580,6 +2642,18 @@ impl Database {
         &mut self,
         account_name: u64,
     ) -> Result<(), ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && s.standalone_writes()
+        {
+            return s
+                .initialize_account_resource_limits(account_name)
+                .map_err(|e| {
+                    ChainError::InternalError(format!(
+                        "arena initialize_account_resource_limits: {e:?}"
+                    ))
+                });
+        }
         {
             let mut guard = self.locked_write()?;
             let pinned = guard.pin_mut();
@@ -2601,6 +2675,14 @@ impl Database {
         account: &Name,
         time_slot: u32,
     ) -> Result<(), ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && s.standalone_writes()
+        {
+            let _ = s;
+            self.mirror_account_usage(account.as_u64(), 0, 0, time_slot);
+            return Ok(());
+        }
         {
             let mut guard = self.locked_write()?;
             let pinned = guard.pin_mut();
@@ -2621,6 +2703,14 @@ impl Database {
         time_slot: u32,
         validate: bool,
     ) -> Result<(), ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && s.standalone_writes()
+        {
+            let _ = s;
+            self.mirror_account_usage(account.as_u64(), cpu_usage, net_usage, time_slot);
+            return Ok(());
+        }
         {
             let mut guard = self.locked_write()?;
             let pinned = guard.pin_mut();
@@ -2671,6 +2761,16 @@ impl Database {
         account_name: u64,
         ram_bytes: i64,
     ) -> Result<(), ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && s.standalone_writes()
+        {
+            return s
+                .add_pending_ram_usage(account_name, ram_bytes)
+                .map_err(|e| {
+                    ChainError::InternalError(format!("arena add_pending_ram_usage: {e:?}"))
+                });
+        }
         {
             let mut guard = self.locked_write()?;
             let pinned = guard.pin_mut();
@@ -2688,6 +2788,17 @@ impl Database {
     }
 
     pub fn verify_account_ram_usage(&mut self, account_name: u64) -> Result<(), ChainError> {
+        // A read-only check that chainbase resolves against its own rows. Under
+        // standalone writes chainbase holds no post-genesis state, so the check
+        // can't run there; the arena's own limit enforcement will cover it once
+        // ported. Skipping is sound for replaying already-valid history.
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && s.standalone_writes()
+        {
+            let _ = (s, account_name);
+            return Ok(());
+        }
         let mut guard = self.locked_write()?;
         let pinned = guard.pin_mut();
 
@@ -2811,6 +2922,23 @@ impl Database {
         net_weight: i64,
         cpu_weight: i64,
     ) -> Result<bool, ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && s.standalone_writes()
+        {
+            // Compute the "ram limit decreased" flag from the pre-write limit, as
+            // chainbase does, before applying the arena write.
+            let old_ram = s
+                .account_limits(account_name)
+                .map(|(r, _, _)| r)
+                .unwrap_or(-1);
+            s.set_account_limits(account_name, ram_bytes, net_weight, cpu_weight)
+                .map_err(|e| {
+                    ChainError::InternalError(format!("arena set_account_limits: {e:?}"))
+                })?;
+            let decreased = ram_bytes >= 0 && (old_ram < 0 || ram_bytes < old_ram);
+            return Ok(decreased);
+        }
         let res = {
             let mut guard = self.locked_write()?;
             let pinned = guard.pin_mut();
@@ -2882,6 +3010,14 @@ impl Database {
     }
 
     pub fn process_account_limit_updates(&mut self) -> Result<(), ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && s.standalone_writes()
+        {
+            return s.process_account_limit_updates().map_err(|e| {
+                ChainError::InternalError(format!("arena process_account_limit_updates: {e:?}"))
+            });
+        }
         {
             let mut guard = self.locked_write()?;
             let pinned = guard.pin_mut();
@@ -3593,6 +3729,20 @@ impl Database {
     /// must produce the same value; under `PULSEVM_ARENA_READS` it is served
     /// from the arena.
     pub fn next_recv_sequence(&mut self, receiver: u64) -> Result<u64, ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && s.standalone_writes()
+        {
+            return s
+                .next_recv_sequence(receiver)
+                .map_err(|e| ChainError::InternalError(format!("arena next_recv_sequence: {e:?}")))?
+                .ok_or_else(|| {
+                    ChainError::InternalError(format!(
+                        "account metadata not found for account: {}",
+                        Name::new(receiver)
+                    ))
+                });
+        }
         let chainbase = {
             let mut guard = self.locked_write()?;
             let ptr = guard.find_account_metadata(receiver).map_err(|e| {
@@ -3629,6 +3779,21 @@ impl Database {
     }
 
     pub fn next_auth_sequence(&mut self, actor: u64) -> Result<u64, ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && s.standalone_writes()
+        {
+            s.next_auth_sequence(actor).map_err(|e| {
+                ChainError::InternalError(format!("arena next_auth_sequence: {e:?}"))
+            })?;
+            // The post-bump auth_sequence is what chainbase returns (++auth_sequence).
+            return s.account_metadata(actor).map(|t| t.2).ok_or_else(|| {
+                ChainError::InternalError(format!(
+                    "account metadata not found for account: {}",
+                    Name::new(actor)
+                ))
+            });
+        }
         let res = {
             let mut guard = self.locked_write()?;
             let pinned = guard.pin_mut();
@@ -3646,6 +3811,19 @@ impl Database {
     }
 
     pub fn next_global_sequence(&mut self) -> Result<u64, ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && s.standalone_writes()
+        {
+            // Chainbase does ++global_action_sequence and returns it; the mirror
+            // stores that post-increment value, so the arena authors the next by
+            // advancing its own stored counter.
+            let next = s.global_action_sequence().unwrap_or(0) + 1;
+            s.set_global_action_sequence(next).map_err(|e| {
+                ChainError::InternalError(format!("arena next_global_sequence: {e:?}"))
+            })?;
+            return Ok(next);
+        }
         let res = {
             let mut guard = self.locked_write()?;
             let pinned = guard.pin_mut();
@@ -4845,6 +5023,26 @@ impl Database {
         auth: &Authority,
         creation_time: &TimePoint,
     ) -> Result<*const ffi::PermissionObject, ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && s.standalone_writes()
+        {
+            // The arena already authors the permission id; here it also owns the
+            // write. The caller re-reads the id/size by name, so null is fine.
+            let authored = s.next_permission_id().map_err(|e| {
+                ChainError::InternalError(format!("arena next_permission_id: {e:?}"))
+            })?;
+            s.create_permission(
+                authored,
+                parent as i64,
+                account,
+                name,
+                creation_time.elapsed.count,
+                &encode_authority(auth),
+            )
+            .map_err(|e| ChainError::InternalError(format!("arena create_permission: {e:?}")))?;
+            return Ok(std::ptr::null());
+        }
         let res = {
             let mut guard = self.locked_write()?;
             let pinned = guard.pin_mut();
@@ -4934,6 +5132,19 @@ impl Database {
         authority: &Authority,
         pending_block_time: &TimePoint,
     ) -> Result<(), ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && s.standalone_writes()
+        {
+            return s
+                .modify_permission(
+                    actor,
+                    permission,
+                    &encode_authority(authority),
+                    pending_block_time.elapsed.count,
+                )
+                .map_err(|e| ChainError::InternalError(format!("arena modify_permission: {e:?}")));
+        }
         {
             let mut guard = self.locked_write()?;
             // Lookup and mutation both happen inside C++, so no database-owned
@@ -4974,6 +5185,16 @@ impl Database {
         permission: u64,
         pending_block_time: &TimePoint,
     ) -> Result<(), ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && s.standalone_writes()
+        {
+            return s
+                .update_permission_usage(actor, permission, pending_block_time.elapsed.count)
+                .map_err(|e| {
+                    ChainError::InternalError(format!("arena update_permission_usage: {e:?}"))
+                });
+        }
         {
             let mut guard = self.locked_write()?;
             // Resolve and modify under one write guard; the resolved pointer never

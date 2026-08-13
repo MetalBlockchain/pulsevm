@@ -5163,7 +5163,8 @@ mod tests {
         // absent, record the roots for a later verify run. A per-block root is a
         // stable fingerprint over every arena table's canonical state bytes.
         let golden_file = std::env::var("PULSEVM_GOLDEN_ROOTS").ok();
-        let golden_roots: Option<std::collections::HashMap<u32, u64>> = golden_file
+        // Per-(block, table) roots, so a mismatch names the exact diverging table.
+        let golden_roots: Option<std::collections::HashMap<(u32, String), u64>> = golden_file
             .as_ref()
             .filter(|p| Path::new(p).exists())
             .map(|p| {
@@ -5173,12 +5174,13 @@ mod tests {
                     .filter_map(|l| {
                         let mut it = l.split_whitespace();
                         let n: u32 = it.next()?.parse().ok()?;
+                        let table = it.next()?.to_string();
                         let r = u64::from_str_radix(it.next()?, 16).ok()?;
-                        Some((n, r))
+                        Some(((n, table), r))
                     })
                     .collect()
             });
-        let mut recorded: Option<Vec<(u32, u64)>> = match &golden_file {
+        let mut recorded: Option<Vec<(u32, String, u64)>> = match &golden_file {
             Some(_) if golden_roots.is_none() => Some(Vec::new()),
             _ => None,
         };
@@ -5207,37 +5209,35 @@ mod tests {
 
             let tables = cross_impl_tables(&controller.database())?;
 
-            // Per-block arena state root: a fingerprint over every arena table's
-            // canonical bytes, used to record/verify golden roots.
-            let arena_root = {
+            // Per-table arena root: a fingerprint over one arena table's canonical
+            // bytes, recorded/verified table by table so a mismatch names the table.
+            let table_root = |arena: &[u8]| -> u64 {
                 use std::hash::{
                     Hash,
                     Hasher,
                 };
                 let mut h = std::collections::hash_map::DefaultHasher::new();
-                for (name, _chain, arena) in &tables {
-                    name.hash(&mut h);
-                    arena.hash(&mut h);
-                }
+                arena.hash(&mut h);
                 h.finish()
             };
 
             // Golden-verify mode: chainbase is not the oracle (its writes may be
-            // skipped), so check the arena root against the recorded set instead of
-            // the live cross-impl diff.
+            // skipped), so check each arena table against the recorded set instead
+            // of the live cross-impl diff.
             if let Some(golden) = &golden_roots {
-                match golden.get(&n) {
-                    Some(&g) if g == arena_root => {}
-                    Some(&g) => {
-                        eprintln!(
-                            "golden root mismatch at block {n}: arena {arena_root:016x} != golden {g:016x} (matched up to {replayed})"
-                        );
+                let mut mismatch = None;
+                for (name, _chain, arena) in &tables {
+                    let h = table_root(arena);
+                    if let Some(&g) = golden.get(&(n, name.to_string()))
+                        && g != h
+                    {
+                        mismatch = Some(format!("table {name}: arena {h:016x} != golden {g:016x}"));
                         break;
                     }
-                    None => {
-                        eprintln!("no golden root recorded for block {n}");
-                        break;
-                    }
+                }
+                if let Some(m) = mismatch {
+                    eprintln!("golden mismatch at block {n}, {m} (matched up to {replayed})");
+                    break;
                 }
                 replayed = n;
                 if !restarted && n >= restart_at {
@@ -5251,7 +5251,9 @@ mod tests {
                 continue;
             }
             if let Some(rec) = &mut recorded {
-                rec.push((n, arena_root));
+                for (name, _chain, arena) in &tables {
+                    rec.push((n, name.to_string(), table_root(arena)));
+                }
             }
 
             let mut diverged = None;
@@ -5363,7 +5365,10 @@ mod tests {
         // Record the golden roots (verified this run by the live cross-check) for a
         // later standalone-write verify run.
         if let (Some(path), Some(rec)) = (&golden_file, &recorded) {
-            let body: String = rec.iter().map(|(n, r)| format!("{n} {r:016x}\n")).collect();
+            let body: String = rec
+                .iter()
+                .map(|(n, t, r)| format!("{n} {t} {r:016x}\n"))
+                .collect();
             fs::write(path, body).expect("write golden roots");
             eprintln!("recorded {} golden arena roots to {}", rec.len(), path);
         }

@@ -238,6 +238,13 @@ pub fn setabi(
     let old_size: i64 = db.account_abi_size(act.account.as_u64())? as i64;
     let new_size: i64 = act.abi.len() as i64;
 
+    if std::env::var("PULSEVM_DUMP_RU").is_ok() {
+        eprintln!(
+            "SETABI acct={} old_abi_size={} new_abi_size={}",
+            act.account, old_size, new_size
+        );
+    }
+
     db.update_account_abi(act.account.as_u64(), act.abi.as_slice())?;
 
     if new_size != old_size {
