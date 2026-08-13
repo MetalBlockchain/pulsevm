@@ -3502,10 +3502,9 @@ impl Database {
         cpu_limit_parameters: &ElasticLimitParameters,
         net_limit_parameters: &ElasticLimitParameters,
     ) -> Result<(), ChainError> {
-        // Only when chainbase is truly absent (Rust genesis) is the chainbase
-        // write skipped: the existing standalone-writes path still reads chainbase
-        // resource-state (process_block_usage / get_block_cpu_limit are not
-        // inverted), so it must keep writing chainbase here.
+        // Chainbase-free (standalone writes / Rust genesis): the resource-state
+        // read and write paths are all arena-served now, so update the arena
+        // config alone and skip the chainbase write.
         #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && s.rust_genesis()

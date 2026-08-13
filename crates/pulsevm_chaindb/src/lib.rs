@@ -1342,9 +1342,11 @@ impl ArenaShadow {
     }
 
     /// Whether genesis should be authored directly on the arena (no C++ genesis /
-    /// chainbase hydration). See [`arena_rust_genesis_default`].
+    /// chainbase hydration). Implied by `standalone_writes`: a chainbase-free node
+    /// authors its own genesis, so the single write flag is enough (mirrors how
+    /// [`standalone_reads`](Self::standalone_reads) folds in the write flag).
     pub fn rust_genesis(&self) -> bool {
-        self.rust_genesis.load(std::sync::atomic::Ordering::Relaxed)
+        self.rust_genesis.load(std::sync::atomic::Ordering::Relaxed) || self.standalone_writes()
     }
 
     /// Route contract reads through the arena from now on (the cutover switch).
