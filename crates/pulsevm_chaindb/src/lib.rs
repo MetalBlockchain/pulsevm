@@ -1581,23 +1581,20 @@ impl ArenaShadow {
             p.last_updated = creation_time_us;
             p.auth = auth_blob;
         })?;
-        // Stage 1 (verify-first): confirm the arena could author this permission's
-        // id identically to chainbase before anything consumes the arena's value.
-        // The counter is kept in lockstep with chainbase (resynced to cb_id + 1),
-        // so every create is checked independently against chainbase's assignment
-        // rather than a single divergence cascading, and the resync is undo-tracked
-        // so it rolls back with the create. Skipped until the counter is seeded at
-        // hydration. When this stays silent across the full replay (genesis, forks,
-        // undo, snapshot reload), the arena is proven able to author the id itself.
-        if let Some((_, expected)) = perm_seq_peek(&db)? {
-            if expected != cb_id {
-                eprintln!(
-                    "arena permission-id authoring diverged: computed {expected} != chainbase {cb_id} (owner {owner}, name {perm_name})"
-                );
-            }
-        }
-        perm_seq_set(&mut db, cb_id + 1)?;
         Ok(())
+    }
+
+    /// Authors the next permission id from the arena's replicated counter and
+    /// advances it (undo-tracked, so it rolls back with the create it accompanies).
+    /// This is the arena taking authority over the one consensus-visible id it used
+    /// to copy from chainbase: the ffi layer draws the id here, feeds it back as the
+    /// create's `cb_id`, and checks chainbase assigns the same. Lazily seeds to 1
+    /// (chainbase reserves permission id 0) if hydration has not run.
+    pub fn next_permission_id(&self) -> Result<i64, DbError> {
+        let mut db = self.lock();
+        let cur = perm_seq_peek(&db)?.map(|(_, n)| n).unwrap_or(1);
+        perm_seq_set(&mut db, cur + 1)?;
+        Ok(cur)
     }
 
     pub fn modify_permission(

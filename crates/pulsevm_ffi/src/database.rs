@@ -4661,12 +4661,18 @@ impl Database {
         #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow {
             let auth_bytes = encode_authority(auth);
-            // The new permission's own chainbase id, so the mirror navigates the
-            // parent tree in chainbase's id space (its own `ObjectId` does not
-            // track chainbase ids).
-            let cb_id = unsafe { res.as_ref() }.map(|p| p.get_id()).unwrap_or(0);
+            // Authority flip: the arena authors the permission id from its own
+            // replicated counter, and chainbase only verifies it assigned the same.
+            // The id is what the mirror stores and what execution consumes (parent
+            // links, get_id, satisfies), so it now originates in the arena rather
+            // than being copied from chainbase's `res.get_id()`.
+            let authored = s.next_permission_id().unwrap_or(0);
+            let chainbase_id = unsafe { res.as_ref() }.map(|p| p.get_id()).unwrap_or(0);
+            if authored != chainbase_id {
+                eprintln!("arena-authored permission id {authored} != chainbase {chainbase_id}");
+            }
             if let Err(e) = s.create_permission(
-                cb_id,
+                authored,
                 parent as i64,
                 account,
                 name,
