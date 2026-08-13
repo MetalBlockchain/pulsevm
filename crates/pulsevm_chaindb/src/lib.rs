@@ -4532,6 +4532,96 @@ impl ArenaShadow {
         }
         Ok(())
     }
+
+    // ----- secondary-index row payer (standalone-write billing) --------------
+    // db_idxN_update bills the payer-change delta off the row's *old* payer.
+    // Under standalone writes the chainbase object is never created, so the
+    // payer is resolved from the arena row by `(code, scope, table, primary)`.
+
+    /// The payer of an idx64 row, or `None` if absent.
+    pub fn idx64_payer(&self, code: u64, scope: u64, table: u64, primary_key: u64) -> Option<u64> {
+        let db = self.lock();
+        let t_id = db
+            .find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&(code, scope, table))
+            .ok()
+            .flatten()
+            .map(|t| t.id().raw())?;
+        db.find_by::<ContractIndex64Row, ContractIdx64ByPrimary>(&(t_id, primary_key))
+            .ok()
+            .flatten()
+            .map(|e| e.payer)
+    }
+
+    /// The payer of an idx128 row, or `None` if absent.
+    pub fn idx128_payer(&self, code: u64, scope: u64, table: u64, primary_key: u64) -> Option<u64> {
+        let db = self.lock();
+        let t_id = db
+            .find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&(code, scope, table))
+            .ok()
+            .flatten()
+            .map(|t| t.id().raw())?;
+        db.find_by::<ContractIndex128Row, ContractIdx128ByPrimary>(&(t_id, primary_key))
+            .ok()
+            .flatten()
+            .map(|e| e.payer)
+    }
+
+    /// The payer of an idx256 row, or `None` if absent.
+    pub fn idx256_payer(&self, code: u64, scope: u64, table: u64, primary_key: u64) -> Option<u64> {
+        let db = self.lock();
+        let t_id = db
+            .find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&(code, scope, table))
+            .ok()
+            .flatten()
+            .map(|t| t.id().raw())?;
+        db.find_by::<ContractIndex256Row, ContractIdx256ByPrimary>(&(t_id, primary_key))
+            .ok()
+            .flatten()
+            .map(|e| e.payer)
+    }
+
+    /// The payer of an idx_double row, or `None` if absent.
+    pub fn idx_double_payer(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary_key: u64,
+    ) -> Option<u64> {
+        let db = self.lock();
+        let t_id = db
+            .find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&(code, scope, table))
+            .ok()
+            .flatten()
+            .map(|t| t.id().raw())?;
+        db.find_by::<ContractIndexDoubleRow, ContractIdxDoubleByPrimary>(&(t_id, primary_key))
+            .ok()
+            .flatten()
+            .map(|e| e.payer)
+    }
+
+    /// The payer of an idx_long_double row, or `None` if absent.
+    pub fn idx_long_double_payer(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary_key: u64,
+    ) -> Option<u64> {
+        let db = self.lock();
+        let t_id = db
+            .find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&(code, scope, table))
+            .ok()
+            .flatten()
+            .map(|t| t.id().raw())?;
+        db.find_by::<ContractIndexLongDoubleRow, ContractIdxLongDoubleByPrimary>(&(
+            t_id,
+            primary_key,
+        ))
+        .ok()
+        .flatten()
+        .map(|e| e.payer)
+    }
 }
 
 /// Split a 32-byte idx256 key into its two little-endian `u128` words, the same
@@ -4870,5 +4960,72 @@ mod tests {
             s.idx_long_double_find_secondary(code, scope, table, (0, 5)),
             Some(9)
         );
+    }
+
+    /// The standalone-write path bills db_idxN_update off the row's old payer and
+    /// removes the row (and its table, when it empties) without a chainbase
+    /// object. Exercise the arena create -> payer -> update(payer) -> remove
+    /// round-trip that path relies on, for every secondary-index family.
+    #[test]
+    fn idx_standalone_payer_roundtrip_all_families() {
+        let s = ArenaShadow::new().unwrap();
+        let (code, scope, table) = (1u64, 2u64, 3u64);
+        let (p0, p1) = (9u64, 11u64);
+
+        // idx64
+        s.create_index64_object(code, scope, table, p0, 5, 100)
+            .unwrap();
+        assert_eq!(s.idx64_payer(code, scope, table, 5), Some(p0));
+        s.update_index64_object(code, scope, table, 5, p1, 101)
+            .unwrap();
+        assert_eq!(s.idx64_payer(code, scope, table, 5), Some(p1));
+        assert_eq!(s.idx64_find_primary(code, scope, table, 5), Some(101));
+        s.remove_index64_object(code, scope, table, 5).unwrap();
+        assert_eq!(s.idx64_payer(code, scope, table, 5), None);
+        // Last row gone -> the table is gone too (chainbase auto-removes it).
+        assert!(!s.table_exists(code, scope, table));
+
+        // idx128
+        s.create_index128_object(code, scope, table, p0, 5, 100)
+            .unwrap();
+        assert_eq!(s.idx128_payer(code, scope, table, 5), Some(p0));
+        s.update_index128_object(code, scope, table, 5, p1, 101)
+            .unwrap();
+        assert_eq!(s.idx128_payer(code, scope, table, 5), Some(p1));
+        s.remove_index128_object(code, scope, table, 5).unwrap();
+        assert_eq!(s.idx128_payer(code, scope, table, 5), None);
+
+        // idx256
+        let key = [7u8; 32];
+        s.create_index256_object(code, scope, table, p0, 5, key)
+            .unwrap();
+        assert_eq!(s.idx256_payer(code, scope, table, 5), Some(p0));
+        s.update_index256_object(code, scope, table, 5, p1, key)
+            .unwrap();
+        assert_eq!(s.idx256_payer(code, scope, table, 5), Some(p1));
+        s.remove_index256_object(code, scope, table, 5).unwrap();
+        assert_eq!(s.idx256_payer(code, scope, table, 5), None);
+
+        // idx_double (secondary carried as raw f64 bits)
+        s.create_idx_double_object(code, scope, table, p0, 5, 1.0f64.to_bits())
+            .unwrap();
+        assert_eq!(s.idx_double_payer(code, scope, table, 5), Some(p0));
+        s.update_idx_double_object(code, scope, table, 5, p1, 2.0f64.to_bits())
+            .unwrap();
+        assert_eq!(s.idx_double_payer(code, scope, table, 5), Some(p1));
+        s.remove_idx_double_object(code, scope, table, 5).unwrap();
+        assert_eq!(s.idx_double_payer(code, scope, table, 5), None);
+
+        // idx_long_double (secondary as (lo, hi) words)
+        s.create_idx_long_double_object(code, scope, table, p0, 5, (0, 1))
+            .unwrap();
+        assert_eq!(s.idx_long_double_payer(code, scope, table, 5), Some(p0));
+        s.update_idx_long_double_object(code, scope, table, 5, p1, (0, 2))
+            .unwrap();
+        assert_eq!(s.idx_long_double_payer(code, scope, table, 5), Some(p1));
+        s.remove_idx_long_double_object(code, scope, table, 5)
+            .unwrap();
+        assert_eq!(s.idx_long_double_payer(code, scope, table, 5), None);
+        assert!(!s.table_exists(code, scope, table));
     }
 }

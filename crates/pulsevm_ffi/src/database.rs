@@ -3389,6 +3389,314 @@ impl Database {
         Ok(res)
     }
 
+    // ----- secondary-index writes to the arena alone (standalone writes) -----
+    // These mirror create/update/remove_indexN_object but touch only the arena,
+    // taking the row's `(code, scope, table, primary)` scalars instead of a
+    // chainbase `&IndexNObject` pointer. The secondary key is converted to the
+    // arena's stored form exactly as the mirroring FFI paths do. `arena_idxN_
+    // payer` serves the old payer db_idxN_update needs for its billing delta.
+
+    #[cfg(feature = "arena-shadow")]
+    fn shadow_ref(&self) -> Result<&crate::shadow::ArenaShadow, ChainError> {
+        self.shadow.as_ref().ok_or_else(|| {
+            ChainError::InternalError("standalone writes require the arena shadow".into())
+        })
+    }
+
+    #[cfg(feature = "arena-shadow")]
+    pub fn create_index64_object_standalone(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        payer: u64,
+        primary_key: u64,
+        secondary_key: u64,
+    ) -> Result<(), ChainError> {
+        self.shadow_ref()?
+            .create_index64_object(code, scope, table, payer, primary_key, secondary_key)
+            .map_err(|e| ChainError::InternalError(format!("arena create_index64: {e:?}")))
+    }
+
+    #[cfg(feature = "arena-shadow")]
+    pub fn update_index64_object_standalone(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary_key: u64,
+        payer: u64,
+        secondary_key: u64,
+    ) -> Result<(), ChainError> {
+        self.shadow_ref()?
+            .update_index64_object(code, scope, table, primary_key, payer, secondary_key)
+            .map_err(|e| ChainError::InternalError(format!("arena update_index64: {e:?}")))
+    }
+
+    #[cfg(feature = "arena-shadow")]
+    pub fn remove_index64_object_standalone(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary_key: u64,
+    ) -> Result<(), ChainError> {
+        self.shadow_ref()?
+            .remove_index64_object(code, scope, table, primary_key)
+            .map_err(|e| ChainError::InternalError(format!("arena remove_index64: {e:?}")))
+    }
+
+    #[cfg(feature = "arena-shadow")]
+    pub fn arena_idx64_payer(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary: u64,
+    ) -> Option<u64> {
+        self.shadow
+            .as_ref()
+            .and_then(|s| s.idx64_payer(code, scope, table, primary))
+    }
+
+    #[cfg(feature = "arena-shadow")]
+    pub fn create_index128_object_standalone(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        payer: u64,
+        primary_key: u64,
+        secondary_key: u128,
+    ) -> Result<(), ChainError> {
+        self.shadow_ref()?
+            .create_index128_object(code, scope, table, payer, primary_key, secondary_key)
+            .map_err(|e| ChainError::InternalError(format!("arena create_index128: {e:?}")))
+    }
+
+    #[cfg(feature = "arena-shadow")]
+    pub fn update_index128_object_standalone(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary_key: u64,
+        payer: u64,
+        secondary_key: u128,
+    ) -> Result<(), ChainError> {
+        self.shadow_ref()?
+            .update_index128_object(code, scope, table, primary_key, payer, secondary_key)
+            .map_err(|e| ChainError::InternalError(format!("arena update_index128: {e:?}")))
+    }
+
+    #[cfg(feature = "arena-shadow")]
+    pub fn remove_index128_object_standalone(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary_key: u64,
+    ) -> Result<(), ChainError> {
+        self.shadow_ref()?
+            .remove_index128_object(code, scope, table, primary_key)
+            .map_err(|e| ChainError::InternalError(format!("arena remove_index128: {e:?}")))
+    }
+
+    #[cfg(feature = "arena-shadow")]
+    pub fn arena_idx128_payer(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary: u64,
+    ) -> Option<u64> {
+        self.shadow
+            .as_ref()
+            .and_then(|s| s.idx128_payer(code, scope, table, primary))
+    }
+
+    #[cfg(feature = "arena-shadow")]
+    pub fn create_index256_object_standalone(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        payer: u64,
+        primary_key: u64,
+        secondary_key: U256,
+    ) -> Result<(), ChainError> {
+        self.shadow_ref()?
+            .create_index256_object(code, scope, table, payer, primary_key, secondary_key.value)
+            .map_err(|e| ChainError::InternalError(format!("arena create_index256: {e:?}")))
+    }
+
+    #[cfg(feature = "arena-shadow")]
+    pub fn update_index256_object_standalone(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary_key: u64,
+        payer: u64,
+        secondary_key: U256,
+    ) -> Result<(), ChainError> {
+        self.shadow_ref()?
+            .update_index256_object(code, scope, table, primary_key, payer, secondary_key.value)
+            .map_err(|e| ChainError::InternalError(format!("arena update_index256: {e:?}")))
+    }
+
+    #[cfg(feature = "arena-shadow")]
+    pub fn remove_index256_object_standalone(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary_key: u64,
+    ) -> Result<(), ChainError> {
+        self.shadow_ref()?
+            .remove_index256_object(code, scope, table, primary_key)
+            .map_err(|e| ChainError::InternalError(format!("arena remove_index256: {e:?}")))
+    }
+
+    #[cfg(feature = "arena-shadow")]
+    pub fn arena_idx256_payer(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary: u64,
+    ) -> Option<u64> {
+        self.shadow
+            .as_ref()
+            .and_then(|s| s.idx256_payer(code, scope, table, primary))
+    }
+
+    #[cfg(feature = "arena-shadow")]
+    pub fn create_idx_double_object_standalone(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        payer: u64,
+        primary_key: u64,
+        secondary_key: u64,
+    ) -> Result<(), ChainError> {
+        self.shadow_ref()?
+            .create_idx_double_object(code, scope, table, payer, primary_key, secondary_key)
+            .map_err(|e| ChainError::InternalError(format!("arena create_idx_double: {e:?}")))
+    }
+
+    #[cfg(feature = "arena-shadow")]
+    pub fn update_idx_double_object_standalone(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary_key: u64,
+        payer: u64,
+        secondary_key: u64,
+    ) -> Result<(), ChainError> {
+        self.shadow_ref()?
+            .update_idx_double_object(code, scope, table, primary_key, payer, secondary_key)
+            .map_err(|e| ChainError::InternalError(format!("arena update_idx_double: {e:?}")))
+    }
+
+    #[cfg(feature = "arena-shadow")]
+    pub fn remove_idx_double_object_standalone(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary_key: u64,
+    ) -> Result<(), ChainError> {
+        self.shadow_ref()?
+            .remove_idx_double_object(code, scope, table, primary_key)
+            .map_err(|e| ChainError::InternalError(format!("arena remove_idx_double: {e:?}")))
+    }
+
+    #[cfg(feature = "arena-shadow")]
+    pub fn arena_idx_double_payer(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary: u64,
+    ) -> Option<u64> {
+        self.shadow
+            .as_ref()
+            .and_then(|s| s.idx_double_payer(code, scope, table, primary))
+    }
+
+    #[cfg(feature = "arena-shadow")]
+    pub fn create_idx_long_double_object_standalone(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        payer: u64,
+        primary_key: u64,
+        secondary_key: Float128,
+    ) -> Result<(), ChainError> {
+        self.shadow_ref()?
+            .create_idx_long_double_object(
+                code,
+                scope,
+                table,
+                payer,
+                primary_key,
+                (secondary_key.lo, secondary_key.hi),
+            )
+            .map_err(|e| ChainError::InternalError(format!("arena create_idx_long_double: {e:?}")))
+    }
+
+    #[cfg(feature = "arena-shadow")]
+    pub fn update_idx_long_double_object_standalone(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary_key: u64,
+        payer: u64,
+        secondary_key: Float128,
+    ) -> Result<(), ChainError> {
+        self.shadow_ref()?
+            .update_idx_long_double_object(
+                code,
+                scope,
+                table,
+                primary_key,
+                payer,
+                (secondary_key.lo, secondary_key.hi),
+            )
+            .map_err(|e| ChainError::InternalError(format!("arena update_idx_long_double: {e:?}")))
+    }
+
+    #[cfg(feature = "arena-shadow")]
+    pub fn remove_idx_long_double_object_standalone(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary_key: u64,
+    ) -> Result<(), ChainError> {
+        self.shadow_ref()?
+            .remove_idx_long_double_object(code, scope, table, primary_key)
+            .map_err(|e| ChainError::InternalError(format!("arena remove_idx_long_double: {e:?}")))
+    }
+
+    #[cfg(feature = "arena-shadow")]
+    pub fn arena_idx_long_double_payer(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary: u64,
+    ) -> Option<u64> {
+        self.shadow
+            .as_ref()
+            .and_then(|s| s.idx_long_double_payer(code, scope, table, primary))
+    }
+
     pub fn update_key_value_object(
         &mut self,
         obj: &KeyValueObject,

@@ -1364,6 +1364,40 @@ impl ApplyContext {
     ) -> Result<i32, ChainError> {
         #[cfg(feature = "arena-shadow")]
         let table_name = table;
+
+        // Arena-standalone writes: author the table (billing it if new) and the
+        // index row in the arena alone, no chainbase IndexObject pointer.
+        #[cfg(feature = "arena-shadow")]
+        if self.db.arena_standalone_writes() {
+            pulse_assert(
+                payer != 0,
+                ChainError::TransactionError(format!(
+                    "must specify a valid account to pay for new record"
+                )),
+            )?;
+            let code = self.receiver.as_u64();
+            if !self.db.arena_table_exists(code, scope, table) {
+                self.update_db_usage(&payer.into(), billable_size_v::<TableObject>() as i64)?;
+            }
+            self.db.create_index64_object_standalone(
+                code,
+                scope,
+                table,
+                payer,
+                primary_key,
+                secondary_key,
+            )?;
+            let res = {
+                let mut inner = self.inner.write()?;
+                inner.arena_index64_cache.cache_table((code, scope, table));
+                inner
+                    .arena_index64_cache
+                    .add((code, scope, table, primary_key))
+            };
+            self.update_db_usage(&payer.into(), billable_size_v::<Index64Object>() as i64)?;
+            return Ok(res);
+        }
+
         let table = self.find_or_create_table(*self.receiver, scope, table, payer)?;
         let table = unsafe { &*table };
         pulse_assert(
@@ -1411,6 +1445,40 @@ impl ApplyContext {
     ) -> Result<(), ChainError> {
         let payer = payer.as_u64();
         let billing_size = billable_size_v::<Index64Object>() as i64;
+
+        // Arena-standalone writes: resolve the row and old payer from the arena
+        // and re-point it there alone.
+        #[cfg(feature = "arena-shadow")]
+        if self.db.arena_standalone_writes() {
+            let (old_payer, new_payer) = {
+                let inner = self.inner.read()?;
+                let (code, scope, table, primary) =
+                    inner.arena_index64_cache.row_of(iterator).ok_or_else(|| {
+                        ChainError::InternalError(format!("invalid iterator {iterator}"))
+                    })?;
+                pulse_assert(
+                    code == self.receiver.as_u64(),
+                    ChainError::TransactionError(format!("db access violation")),
+                )?;
+                let old_payer = self
+                    .db
+                    .arena_idx64_payer(code, scope, table, primary)
+                    .ok_or_else(|| {
+                        ChainError::InternalError(format!("arena has no idx64 row for {iterator}"))
+                    })?;
+                let new_payer = if payer == 0 { old_payer } else { payer };
+                self.db.update_index64_object_standalone(
+                    code, scope, table, primary, new_payer, secondary,
+                )?;
+                (old_payer, new_payer)
+            };
+            if old_payer != new_payer {
+                self.update_db_usage(&Name::new(old_payer), -billing_size)?;
+                self.update_db_usage(&Name::new(new_payer), billing_size)?;
+            }
+            return Ok(());
+        }
+
         let (old_payer, new_payer) = {
             let inner = self.inner.read()?;
             let obj = inner.index64_cache.get(iterator)?;
@@ -1449,6 +1517,29 @@ impl ApplyContext {
     }
 
     pub fn db_idx64_remove(&mut self, iterator: i32) -> Result<(), ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        if self.db.arena_standalone_writes() {
+            {
+                let mut inner = self.inner.write()?;
+                let (code, scope, table, primary) =
+                    inner.arena_index64_cache.row_of(iterator).ok_or_else(|| {
+                        ChainError::InternalError(format!("invalid iterator {iterator}"))
+                    })?;
+                pulse_assert(
+                    code == self.receiver.as_u64(),
+                    ChainError::TransactionError(format!("db access violation")),
+                )?;
+                self.db
+                    .remove_index64_object_standalone(code, scope, table, primary)?;
+                inner.arena_index64_cache.remove(iterator);
+            }
+            self.update_db_usage(
+                &Name::new(self.receiver.as_u64()),
+                -(billable_size_v::<Index64Object>() as i64),
+            )?;
+            return Ok(());
+        }
+
         {
             let mut inner = self.inner.write()?;
             self.db
@@ -1770,6 +1861,38 @@ impl ApplyContext {
     ) -> Result<i32, ChainError> {
         #[cfg(feature = "arena-shadow")]
         let table_name = table;
+
+        #[cfg(feature = "arena-shadow")]
+        if self.db.arena_standalone_writes() {
+            pulse_assert(
+                payer != 0,
+                ChainError::TransactionError(format!(
+                    "must specify a valid account to pay for new record"
+                )),
+            )?;
+            let code = self.receiver.as_u64();
+            if !self.db.arena_table_exists(code, scope, table) {
+                self.update_db_usage(&payer.into(), billable_size_v::<TableObject>() as i64)?;
+            }
+            self.db.create_index128_object_standalone(
+                code,
+                scope,
+                table,
+                payer,
+                primary_key,
+                secondary_key,
+            )?;
+            let res = {
+                let mut inner = self.inner.write()?;
+                inner.arena_index128_cache.cache_table((code, scope, table));
+                inner
+                    .arena_index128_cache
+                    .add((code, scope, table, primary_key))
+            };
+            self.update_db_usage(&payer.into(), billable_size_v::<Index128Object>() as i64)?;
+            return Ok(res);
+        }
+
         let table = self.find_or_create_table(*self.receiver, scope, table, payer)?;
         let table = unsafe { &*table };
         pulse_assert(
@@ -1818,6 +1941,38 @@ impl ApplyContext {
     ) -> Result<(), ChainError> {
         let payer = payer.as_u64();
         let billing_size = billable_size_v::<Index128Object>() as i64;
+
+        #[cfg(feature = "arena-shadow")]
+        if self.db.arena_standalone_writes() {
+            let (old_payer, new_payer) = {
+                let inner = self.inner.read()?;
+                let (code, scope, table, primary) =
+                    inner.arena_index128_cache.row_of(iterator).ok_or_else(|| {
+                        ChainError::InternalError(format!("invalid iterator {iterator}"))
+                    })?;
+                pulse_assert(
+                    code == self.receiver.as_u64(),
+                    ChainError::TransactionError(format!("db access violation")),
+                )?;
+                let old_payer = self
+                    .db
+                    .arena_idx128_payer(code, scope, table, primary)
+                    .ok_or_else(|| {
+                        ChainError::InternalError(format!("arena has no idx128 row for {iterator}"))
+                    })?;
+                let new_payer = if payer == 0 { old_payer } else { payer };
+                self.db.update_index128_object_standalone(
+                    code, scope, table, primary, new_payer, secondary,
+                )?;
+                (old_payer, new_payer)
+            };
+            if old_payer != new_payer {
+                self.update_db_usage(&Name::new(old_payer), -billing_size)?;
+                self.update_db_usage(&Name::new(new_payer), billing_size)?;
+            }
+            return Ok(());
+        }
+
         let (old_payer, new_payer) = {
             let inner = self.inner.read()?;
             let obj = inner.index128_cache.get(iterator)?;
@@ -1854,6 +2009,29 @@ impl ApplyContext {
     }
 
     pub fn db_idx128_remove(&mut self, iterator: i32) -> Result<(), ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        if self.db.arena_standalone_writes() {
+            {
+                let mut inner = self.inner.write()?;
+                let (code, scope, table, primary) =
+                    inner.arena_index128_cache.row_of(iterator).ok_or_else(|| {
+                        ChainError::InternalError(format!("invalid iterator {iterator}"))
+                    })?;
+                pulse_assert(
+                    code == self.receiver.as_u64(),
+                    ChainError::TransactionError(format!("db access violation")),
+                )?;
+                self.db
+                    .remove_index128_object_standalone(code, scope, table, primary)?;
+                inner.arena_index128_cache.remove(iterator);
+            }
+            self.update_db_usage(
+                &Name::new(self.receiver.as_u64()),
+                -(billable_size_v::<Index128Object>() as i64),
+            )?;
+            return Ok(());
+        }
+
         {
             let mut inner = self.inner.write()?;
             self.db.db_idx128_remove(
@@ -2156,6 +2334,38 @@ impl ApplyContext {
     ) -> Result<i32, ChainError> {
         #[cfg(feature = "arena-shadow")]
         let table_name = table;
+
+        #[cfg(feature = "arena-shadow")]
+        if self.db.arena_standalone_writes() {
+            pulse_assert(
+                payer != 0,
+                ChainError::TransactionError(format!(
+                    "must specify a valid account to pay for new record"
+                )),
+            )?;
+            let code = self.receiver.as_u64();
+            if !self.db.arena_table_exists(code, scope, table) {
+                self.update_db_usage(&payer.into(), billable_size_v::<TableObject>() as i64)?;
+            }
+            self.db.create_index256_object_standalone(
+                code,
+                scope,
+                table,
+                payer,
+                primary_key,
+                secondary_key,
+            )?;
+            let res = {
+                let mut inner = self.inner.write()?;
+                inner.arena_index256_cache.cache_table((code, scope, table));
+                inner
+                    .arena_index256_cache
+                    .add((code, scope, table, primary_key))
+            };
+            self.update_db_usage(&payer.into(), billable_size_v::<Index256Object>() as i64)?;
+            return Ok(res);
+        }
+
         let table = self.find_or_create_table(*self.receiver, scope, table, payer)?;
         let table = unsafe { &*table };
         pulse_assert(
@@ -2204,6 +2414,38 @@ impl ApplyContext {
     ) -> Result<(), ChainError> {
         let payer = payer.as_u64();
         let billing_size = billable_size_v::<Index256Object>() as i64;
+
+        #[cfg(feature = "arena-shadow")]
+        if self.db.arena_standalone_writes() {
+            let (old_payer, new_payer) = {
+                let inner = self.inner.read()?;
+                let (code, scope, table, primary) =
+                    inner.arena_index256_cache.row_of(iterator).ok_or_else(|| {
+                        ChainError::InternalError(format!("invalid iterator {iterator}"))
+                    })?;
+                pulse_assert(
+                    code == self.receiver.as_u64(),
+                    ChainError::TransactionError(format!("db access violation")),
+                )?;
+                let old_payer = self
+                    .db
+                    .arena_idx256_payer(code, scope, table, primary)
+                    .ok_or_else(|| {
+                        ChainError::InternalError(format!("arena has no idx256 row for {iterator}"))
+                    })?;
+                let new_payer = if payer == 0 { old_payer } else { payer };
+                self.db.update_index256_object_standalone(
+                    code, scope, table, primary, new_payer, secondary,
+                )?;
+                (old_payer, new_payer)
+            };
+            if old_payer != new_payer {
+                self.update_db_usage(&Name::new(old_payer), -billing_size)?;
+                self.update_db_usage(&Name::new(new_payer), billing_size)?;
+            }
+            return Ok(());
+        }
+
         let (old_payer, new_payer) = {
             let inner = self.inner.read()?;
             let obj = inner.index256_cache.get(iterator)?;
@@ -2242,6 +2484,29 @@ impl ApplyContext {
     }
 
     pub fn db_idx256_remove(&mut self, iterator: i32) -> Result<(), ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        if self.db.arena_standalone_writes() {
+            {
+                let mut inner = self.inner.write()?;
+                let (code, scope, table, primary) =
+                    inner.arena_index256_cache.row_of(iterator).ok_or_else(|| {
+                        ChainError::InternalError(format!("invalid iterator {iterator}"))
+                    })?;
+                pulse_assert(
+                    code == self.receiver.as_u64(),
+                    ChainError::TransactionError(format!("db access violation")),
+                )?;
+                self.db
+                    .remove_index256_object_standalone(code, scope, table, primary)?;
+                inner.arena_index256_cache.remove(iterator);
+            }
+            self.update_db_usage(
+                &Name::new(self.receiver.as_u64()),
+                -(billable_size_v::<Index256Object>() as i64),
+            )?;
+            return Ok(());
+        }
+
         {
             let mut inner = self.inner.write()?;
             self.db.db_idx256_remove(
@@ -2550,6 +2815,40 @@ impl ApplyContext {
     ) -> Result<i32, ChainError> {
         #[cfg(feature = "arena-shadow")]
         let table_name = table;
+
+        #[cfg(feature = "arena-shadow")]
+        if self.db.arena_standalone_writes() {
+            pulse_assert(
+                payer != 0,
+                ChainError::TransactionError(format!(
+                    "must specify a valid account to pay for new record"
+                )),
+            )?;
+            let code = self.receiver.as_u64();
+            if !self.db.arena_table_exists(code, scope, table) {
+                self.update_db_usage(&payer.into(), billable_size_v::<TableObject>() as i64)?;
+            }
+            self.db.create_idx_double_object_standalone(
+                code,
+                scope,
+                table,
+                payer,
+                primary_key,
+                secondary_key,
+            )?;
+            let res = {
+                let mut inner = self.inner.write()?;
+                inner
+                    .arena_index_double_cache
+                    .cache_table((code, scope, table));
+                inner
+                    .arena_index_double_cache
+                    .add((code, scope, table, primary_key))
+            };
+            self.update_db_usage(&payer.into(), billable_size_v::<IndexDoubleObject>() as i64)?;
+            return Ok(res);
+        }
+
         let table = self.find_or_create_table(*self.receiver, scope, table, payer)?;
         let table = unsafe { &*table };
         pulse_assert(
@@ -2598,6 +2897,42 @@ impl ApplyContext {
     ) -> Result<(), ChainError> {
         let payer = payer.as_u64();
         let billing_size = billable_size_v::<IndexDoubleObject>() as i64;
+
+        #[cfg(feature = "arena-shadow")]
+        if self.db.arena_standalone_writes() {
+            let (old_payer, new_payer) = {
+                let inner = self.inner.read()?;
+                let (code, scope, table, primary) = inner
+                    .arena_index_double_cache
+                    .row_of(iterator)
+                    .ok_or_else(|| {
+                        ChainError::InternalError(format!("invalid iterator {iterator}"))
+                    })?;
+                pulse_assert(
+                    code == self.receiver.as_u64(),
+                    ChainError::TransactionError(format!("db access violation")),
+                )?;
+                let old_payer = self
+                    .db
+                    .arena_idx_double_payer(code, scope, table, primary)
+                    .ok_or_else(|| {
+                        ChainError::InternalError(format!(
+                            "arena has no idx_double row for {iterator}"
+                        ))
+                    })?;
+                let new_payer = if payer == 0 { old_payer } else { payer };
+                self.db.update_idx_double_object_standalone(
+                    code, scope, table, primary, new_payer, secondary,
+                )?;
+                (old_payer, new_payer)
+            };
+            if old_payer != new_payer {
+                self.update_db_usage(&Name::new(old_payer), -billing_size)?;
+                self.update_db_usage(&Name::new(new_payer), billing_size)?;
+            }
+            return Ok(());
+        }
+
         let (old_payer, new_payer) = {
             let inner = self.inner.read()?;
             let obj = inner.index_double_cache.get(iterator)?;
@@ -2635,6 +2970,31 @@ impl ApplyContext {
     }
 
     pub fn db_idx_double_remove(&mut self, iterator: i32) -> Result<(), ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        if self.db.arena_standalone_writes() {
+            {
+                let mut inner = self.inner.write()?;
+                let (code, scope, table, primary) = inner
+                    .arena_index_double_cache
+                    .row_of(iterator)
+                    .ok_or_else(|| {
+                        ChainError::InternalError(format!("invalid iterator {iterator}"))
+                    })?;
+                pulse_assert(
+                    code == self.receiver.as_u64(),
+                    ChainError::TransactionError(format!("db access violation")),
+                )?;
+                self.db
+                    .remove_idx_double_object_standalone(code, scope, table, primary)?;
+                inner.arena_index_double_cache.remove(iterator);
+            }
+            self.update_db_usage(
+                &Name::new(self.receiver.as_u64()),
+                -(billable_size_v::<IndexDoubleObject>() as i64),
+            )?;
+            return Ok(());
+        }
+
         {
             let mut inner = self.inner.write()?;
             self.db.db_idx_double_remove(
@@ -2954,6 +3314,43 @@ impl ApplyContext {
     ) -> Result<i32, ChainError> {
         #[cfg(feature = "arena-shadow")]
         let table_name = table;
+
+        #[cfg(feature = "arena-shadow")]
+        if self.db.arena_standalone_writes() {
+            pulse_assert(
+                payer != 0,
+                ChainError::TransactionError(format!(
+                    "must specify a valid account to pay for new record"
+                )),
+            )?;
+            let code = self.receiver.as_u64();
+            if !self.db.arena_table_exists(code, scope, table) {
+                self.update_db_usage(&payer.into(), billable_size_v::<TableObject>() as i64)?;
+            }
+            self.db.create_idx_long_double_object_standalone(
+                code,
+                scope,
+                table,
+                payer,
+                primary_key,
+                secondary_key,
+            )?;
+            let res = {
+                let mut inner = self.inner.write()?;
+                inner
+                    .arena_index_long_double_cache
+                    .cache_table((code, scope, table));
+                inner
+                    .arena_index_long_double_cache
+                    .add((code, scope, table, primary_key))
+            };
+            self.update_db_usage(
+                &payer.into(),
+                billable_size_v::<IndexLongDoubleObject>() as i64,
+            )?;
+            return Ok(res);
+        }
+
         let table = self.find_or_create_table(*self.receiver, scope, table, payer)?;
         let table = unsafe { &*table };
         pulse_assert(
@@ -3002,6 +3399,42 @@ impl ApplyContext {
     ) -> Result<(), ChainError> {
         let payer = payer.as_u64();
         let billing_size = billable_size_v::<IndexLongDoubleObject>() as i64;
+
+        #[cfg(feature = "arena-shadow")]
+        if self.db.arena_standalone_writes() {
+            let (old_payer, new_payer) = {
+                let inner = self.inner.read()?;
+                let (code, scope, table, primary) = inner
+                    .arena_index_long_double_cache
+                    .row_of(iterator)
+                    .ok_or_else(|| {
+                        ChainError::InternalError(format!("invalid iterator {iterator}"))
+                    })?;
+                pulse_assert(
+                    code == self.receiver.as_u64(),
+                    ChainError::TransactionError(format!("db access violation")),
+                )?;
+                let old_payer = self
+                    .db
+                    .arena_idx_long_double_payer(code, scope, table, primary)
+                    .ok_or_else(|| {
+                        ChainError::InternalError(format!(
+                            "arena has no idx_long_double row for {iterator}"
+                        ))
+                    })?;
+                let new_payer = if payer == 0 { old_payer } else { payer };
+                self.db.update_idx_long_double_object_standalone(
+                    code, scope, table, primary, new_payer, secondary,
+                )?;
+                (old_payer, new_payer)
+            };
+            if old_payer != new_payer {
+                self.update_db_usage(&Name::new(old_payer), -billing_size)?;
+                self.update_db_usage(&Name::new(new_payer), billing_size)?;
+            }
+            return Ok(());
+        }
+
         let (old_payer, new_payer) = {
             let inner = self.inner.read()?;
             let obj = inner.index_long_double_cache.get(iterator)?;
@@ -3043,6 +3476,31 @@ impl ApplyContext {
     }
 
     pub fn db_idx_long_double_remove(&mut self, iterator: i32) -> Result<(), ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        if self.db.arena_standalone_writes() {
+            {
+                let mut inner = self.inner.write()?;
+                let (code, scope, table, primary) = inner
+                    .arena_index_long_double_cache
+                    .row_of(iterator)
+                    .ok_or_else(|| {
+                        ChainError::InternalError(format!("invalid iterator {iterator}"))
+                    })?;
+                pulse_assert(
+                    code == self.receiver.as_u64(),
+                    ChainError::TransactionError(format!("db access violation")),
+                )?;
+                self.db
+                    .remove_idx_long_double_object_standalone(code, scope, table, primary)?;
+                inner.arena_index_long_double_cache.remove(iterator);
+            }
+            self.update_db_usage(
+                &Name::new(self.receiver.as_u64()),
+                -(billable_size_v::<IndexLongDoubleObject>() as i64),
+            )?;
+            return Ok(());
+        }
+
         {
             let mut inner = self.inner.write()?;
             self.db.db_idx_long_double_remove(
