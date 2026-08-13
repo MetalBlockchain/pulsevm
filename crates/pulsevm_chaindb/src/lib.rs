@@ -1129,12 +1129,34 @@ pub struct ArenaShadow {
     // full-state root check rather than the per-read comparison. Off by default
     // (verify mode); opt in with `PULSEVM_ARENA_ONLY`.
     standalone_reads: Arc<std::sync::atomic::AtomicBool>,
+    // When set, execution applies state mutations to the arena ONLY and does not
+    // write chainbase at all — the arena is the authoritative write backend, not
+    // a mirror. This is the write-side counterpart of `standalone_reads`: with
+    // both on, chainbase is never touched, so it can no longer serve as the live
+    // per-block oracle. Correctness is instead pinned by comparing the arena's
+    // per-block state roots to a golden set recorded from a verified cross-check
+    // run. Off by default; opt in with `PULSEVM_ARENA_ONLY` (which turns on the
+    // whole standalone path, reads and writes together).
+    standalone_writes: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Whether execution resolves reads entirely from the arena (no chainbase on the
 /// read path). Off unless `PULSEVM_ARENA_ONLY` is set to a truthy/empty value.
 fn arena_standalone_default() -> bool {
     match std::env::var("PULSEVM_ARENA_ONLY") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        Err(_) => false,
+    }
+}
+
+/// Whether execution writes the arena only, skipping chainbase entirely. Off
+/// unless `PULSEVM_ARENA_STANDALONE_WRITES` is set truthy. Separate from
+/// `PULSEVM_ARENA_ONLY` because skipping writes drops the live per-block oracle.
+fn arena_standalone_writes_default() -> bool {
+    match std::env::var("PULSEVM_ARENA_STANDALONE_WRITES") {
         Ok(v) => !matches!(
             v.trim().to_ascii_lowercase().as_str(),
             "0" | "false" | "off" | "no"
@@ -1230,6 +1252,14 @@ impl ArenaShadow {
             standalone_reads: Arc::new(std::sync::atomic::AtomicBool::new(
                 arena_standalone_default(),
             )),
+            // Off unless explicitly opted in: skipping chainbase writes removes the
+            // live oracle, so it is only sound once the arena's per-block roots are
+            // pinned against a recorded golden set. Kept independent of
+            // PULSEVM_ARENA_ONLY so the standalone READ replay keeps chainbase's
+            // writes (and thus the live cross-check) until write inversion lands.
+            standalone_writes: Arc::new(std::sync::atomic::AtomicBool::new(
+                arena_standalone_writes_default(),
+            )),
         })
     }
 
@@ -1257,6 +1287,20 @@ impl ArenaShadow {
     /// meaningful when `reads_enabled` (the arena is already the served value).
     pub fn standalone_reads(&self) -> bool {
         self.standalone_reads
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Apply state mutations to the arena only from now on, never writing
+    /// chainbase. The arena becomes the authoritative write backend; correctness
+    /// is pinned by the golden per-block roots rather than the live oracle.
+    pub fn enable_standalone_writes(&self) {
+        self.standalone_writes
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether execution should apply writes to the arena only, skipping chainbase.
+    pub fn standalone_writes(&self) -> bool {
+        self.standalone_writes
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 

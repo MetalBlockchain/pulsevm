@@ -868,6 +868,34 @@ impl Database {
         }
     }
 
+    /// Apply writes to the arena only from now on, never touching chainbase. The
+    /// arena becomes the authoritative write backend (no live oracle). No-op when
+    /// shadowing is off.
+    pub fn enable_arena_standalone_writes(&self) {
+        #[cfg(feature = "arena-shadow")]
+        {
+            if let Some(s) = &self.shadow {
+                s.enable_standalone_writes();
+            }
+        }
+    }
+
+    /// Whether execution should apply writes to the arena only, skipping the
+    /// chainbase write. No-op false when shadowing is off.
+    pub fn arena_standalone_writes(&self) -> bool {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow
+                .as_ref()
+                .map(|s| s.standalone_writes())
+                .unwrap_or(false)
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            false
+        }
+    }
+
     /// (matches, mismatches) tallied by the inline read cross-check, or (0, 0)
     /// when shadowing is off.
     pub fn arena_read_crosscheck_counts(&self) -> (u64, u64) {
