@@ -458,6 +458,24 @@ struct DynGlobalPropertyRow {
     global_action_sequence: u64,
 }
 
+/// Arena-internal bookkeeping — NOT part of any consensus state and never
+/// serialized into a `*_state_bytes` root. Holds the next permission id the
+/// arena will assign, replicating chainbase's per-index `undo_index::_next_id`
+/// for the permission table. It lives in its own undo-tracked singleton table so
+/// the Db's session machinery snapshots and restores it on undo/squash/commit
+/// exactly as chainbase restores `old_next_id`, keeping the arena's authored id
+/// in lockstep with chainbase's across forks. Seeded after permission hydration
+/// to `max(cb_id) + 1` (chainbase reserves permission id 0 and numbers genesis
+/// permissions contiguously) and advanced on every `create_permission`. type_id
+/// 200 is out of chainbase's object-type range to flag that it mirrors none.
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout, ArenaObject)]
+#[arena(type_id = 200)]
+struct PermSeqRow {
+    id: ObjectId<PermSeqRow>,
+    next_id: i64,
+}
+
 /// Arena mirror of the STATIC chainbase `global_property_object`, holding the
 /// active `chain_config` (blockchain parameters). Genesis creates the chainbase
 /// row in C++, out of reach of the per-write hooks, so the mirror is seeded once
@@ -1130,6 +1148,7 @@ fn build_registered_db() -> Result<Db, DbError> {
     db.add_table::<PermissionLinkRow>()?;
     db.add_table::<CodeRow>()?;
     db.add_table::<DynGlobalPropertyRow>()?;
+    db.add_table::<PermSeqRow>()?;
     db.add_table::<GlobalPropertyRow>()?;
     db.add_table::<ResourceConfigRow>()?;
     db.add_table::<TransactionRow>()?;
@@ -1144,6 +1163,33 @@ fn build_registered_db() -> Result<Db, DbError> {
     db.add_table::<ResourceLimitsRow>()?;
     db.add_table::<ResourceStateRow>()?;
     Ok(db)
+}
+
+/// The arena's replicated permission-id counter (`PermSeqRow` singleton):
+/// `(row id, the next permission id to assign)`, or `None` before it is seeded.
+fn perm_seq_peek(db: &Db) -> Result<Option<(ObjectId<PermSeqRow>, i64)>, DbError> {
+    Ok(db
+        .table::<PermSeqRow>()?
+        .iter()
+        .next()
+        .map(|r| (r.id(), r.next_id)))
+}
+
+/// Sets the arena's permission-id counter, creating the singleton if absent. The
+/// write goes through the live Db, so it participates in the active undo session
+/// and rolls back with the permission create it accompanies.
+fn perm_seq_set(db: &mut Db, next: i64) -> Result<(), DbError> {
+    // Bind the lookup to a local so the immutable borrow from `table().iter()`
+    // ends here; a match scrutinee would hold it through the arms and collide
+    // with the mutable `modify`/`create` below.
+    let existing = db.table::<PermSeqRow>()?.iter().next().map(|r| r.id());
+    match existing {
+        Some(id) => db.modify::<PermSeqRow>(id, |r| r.next_id = next)?,
+        None => {
+            db.create::<PermSeqRow>(|r| r.next_id = next)?;
+        }
+    }
+    Ok(())
 }
 
 impl ArenaShadow {
@@ -1535,6 +1581,22 @@ impl ArenaShadow {
             p.last_updated = creation_time_us;
             p.auth = auth_blob;
         })?;
+        // Stage 1 (verify-first): confirm the arena could author this permission's
+        // id identically to chainbase before anything consumes the arena's value.
+        // The counter is kept in lockstep with chainbase (resynced to cb_id + 1),
+        // so every create is checked independently against chainbase's assignment
+        // rather than a single divergence cascading, and the resync is undo-tracked
+        // so it rolls back with the create. Skipped until the counter is seeded at
+        // hydration. When this stays silent across the full replay (genesis, forks,
+        // undo, snapshot reload), the arena is proven able to author the id itself.
+        if let Some((_, expected)) = perm_seq_peek(&db)? {
+            if expected != cb_id {
+                eprintln!(
+                    "arena permission-id authoring diverged: computed {expected} != chainbase {cb_id} (owner {owner}, name {perm_name})"
+                );
+            }
+        }
+        perm_seq_set(&mut db, cb_id + 1)?;
         Ok(())
     }
 
@@ -1735,6 +1797,18 @@ impl ArenaShadow {
                 p.auth = blob;
             })?;
         }
+        // Seed the replicated permission-id counter to chainbase's post-hydration
+        // `_next_id`. Genesis numbers permissions contiguously from 1 (id 0 is
+        // reserved), so that is max(cb_id) + 1 over the rows now present. Re-run on
+        // every hydration (genesis and snapshot restore) since the arena is rebuilt
+        // fresh each time.
+        let max_cb = db
+            .table::<PermissionRow>()?
+            .iter()
+            .map(|p| p.cb_id)
+            .max()
+            .unwrap_or(0);
+        perm_seq_set(&mut db, max_cb + 1)?;
         Ok(())
     }
 
