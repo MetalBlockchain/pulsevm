@@ -8,6 +8,7 @@ use pulsevm_ffi::{
     CxxDigest,
     Database,
     PermissionObject,
+    make_shared_digest_from_existing_hash,
 };
 use pulsevm_serialization::Read;
 
@@ -172,18 +173,9 @@ pub fn setcode(
         })?;
     }
 
-    // Read the current code identity under a short guard; owning the hash lets the
-    // mutations below run without a chainbase reference held across them.
-    let (existing_code, cur_code_hash, cur_vm_type, cur_vm_version) = {
-        let r = db.read()?;
-        let account = r.get_account_metadata(act.account.as_u64())?;
-        (
-            !account.get_code_hash().empty(),
-            CxxDigest::new_from_existing_hash(account.get_code_hash().as_slice())?,
-            account.get_vm_type(),
-            account.get_vm_version(),
-        )
-    };
+    let (cur_code_hash, cur_vm_type, cur_vm_version) =
+        db.account_code_hash_vm(act.account.as_u64())?;
+    let existing_code = cur_code_hash != [0u8; 32];
 
     pulse_assert(
         code_size > 0 || existing_code,
@@ -194,25 +186,21 @@ pub fn setcode(
     let new_size: i64 = code_size as i64 * SETCODE_RAM_BYTES_MULTIPLIER as i64;
 
     if existing_code {
-        let old_code_bytes = {
-            let r = db.read()?;
-            let old_code_entry = r.get_code_object_by_hash(
-                cur_code_hash.as_ref().unwrap(),
-                cur_vm_type,
-                cur_vm_version,
-            )?;
-            pulse_assert(
-                old_code_entry.get_code_hash() != code_hash.as_ref().unwrap(),
-                ChainError::TransactionError(format!(
-                    "contract is already running this version of code"
-                )),
-            )?;
-            old_code_entry.get_code().size() as i64
-        };
+        // Rebuild the deployed code's digest from the arena-served hash so the old
+        // code image can be read and unlinked without holding a chainbase object.
+        let old_hash = make_shared_digest_from_existing_hash(&cur_code_hash);
+        let old_hash = old_hash.as_ref().unwrap();
+        pulse_assert(
+            old_hash != code_hash.as_ref().unwrap(),
+            ChainError::TransactionError(format!(
+                "contract is already running this version of code"
+            )),
+        )?;
 
-        old_size = old_code_bytes * SETCODE_RAM_BYTES_MULTIPLIER as i64;
+        let old_code = db.get_code_bytes_by_hash(old_hash, cur_vm_type, cur_vm_version)?;
+        old_size = old_code.len() as i64 * SETCODE_RAM_BYTES_MULTIPLIER as i64;
 
-        db.unlink_account_code(cur_code_hash.as_ref().unwrap(), cur_vm_type, cur_vm_version)?;
+        db.unlink_account_code(old_hash, cur_vm_type, cur_vm_version)?;
     }
 
     db.update_account_code(
@@ -247,10 +235,7 @@ pub fn setabi(
         ChainError::TransactionError(format!("failed to deserialize ABI definition: {}", e))
     })?;
 
-    let old_size: i64 = {
-        let r = db.read()?;
-        r.get_account(act.account.as_u64())?.get_abi().size() as i64
-    };
+    let old_size: i64 = db.account_abi_size(act.account.as_u64())? as i64;
     let new_size: i64 = act.abi.len() as i64;
 
     db.update_account_abi(act.account.as_u64(), act.abi.as_slice())?;

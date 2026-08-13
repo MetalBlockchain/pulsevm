@@ -2406,6 +2406,10 @@ impl Database {
         Ok(unsafe { &*res })
     }
 
+    /// Decrement the code_object refcount for `(code_hash, vm_type, vm_version)`.
+    /// Takes the hash and vm fields, not a chainbase `&CodeObject`: the object is
+    /// re-found and unlinked inside the write scope, so setcode no longer holds a
+    /// database reference across the update that follows.
     pub fn unlink_account_code(
         &mut self,
         code_hash: &CxxDigest,
@@ -2439,6 +2443,10 @@ impl Database {
         Ok(())
     }
 
+    /// Set (or clear) an account's contract code. Takes the account *name*, not a
+    /// chainbase `&AccountMetadataObject`: the metadata object is re-found and
+    /// mutated entirely inside the write scope, so no database-owned reference
+    /// escapes to the caller (setcode used to hold one across validation).
     pub fn update_account_code(
         &mut self,
         account_name: u64,
@@ -3271,6 +3279,98 @@ impl Database {
                 && let Some(p) = arena
             {
                 return Ok(p);
+            }
+        }
+
+        Ok(chainbase)
+    }
+
+    /// The account's current `(code_hash, vm_type, vm_version)` — the fields
+    /// setcode reads off `account_metadata` to decide whether code is deployed
+    /// and to locate the old code object. Served from the arena under
+    /// PULSEVM_ARENA_READS (cross-checked), so setcode needs no chainbase object.
+    pub fn account_code_hash_vm(&self, name: u64) -> Result<([u8; 32], u8, u8), ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && s.standalone_reads()
+        {
+            return s
+                .account_metadata(name)
+                .map(|t| (t.5, t.6, t.7))
+                .ok_or_else(|| {
+                    ChainError::InternalError(format!(
+                        "account metadata not found for account: {}",
+                        name
+                    ))
+                });
+        }
+        let chainbase = {
+            let guard = self.locked_read()?;
+            let res = guard.find_account_metadata(name).map_err(|e| {
+                ChainError::InternalError(format!("failed to find account metadata: {}", e))
+            })?;
+            if res.is_null() {
+                return Err(ChainError::InternalError(format!(
+                    "account metadata not found for account: {}",
+                    name
+                )));
+            }
+            let m = unsafe { &*res };
+            (
+                digest_to_array(m.get_code_hash()),
+                m.get_vm_type(),
+                m.get_vm_version(),
+            )
+        };
+
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow {
+            let arena = s.account_metadata(name).map(|t| (t.5, t.6, t.7));
+            s.note_noncontract(arena == Some(chainbase));
+            if s.reads_enabled()
+                && let Some(v) = arena
+            {
+                return Ok(v);
+            }
+        }
+
+        Ok(chainbase)
+    }
+
+    /// The byte size of the account's stored ABI — what setabi bills RAM against.
+    /// A plain length read off the account_object, served from the arena under
+    /// PULSEVM_ARENA_READS (cross-checked) so setabi needs no chainbase object.
+    pub fn account_abi_size(&self, name: u64) -> Result<usize, ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && s.standalone_reads()
+        {
+            return s
+                .account_abi_size(name)
+                .ok_or_else(|| ChainError::InternalError(format!("account not found: {}", name)));
+        }
+        let chainbase = {
+            let guard = self.locked_read()?;
+            let res = guard
+                .find_account(name)
+                .map_err(|e| ChainError::InternalError(format!("failed to get account: {}", e)))?;
+            if res.is_null() {
+                return Err(ChainError::InternalError(format!(
+                    "account not found: {}",
+                    name
+                )));
+            }
+            unsafe { &*res }.get_abi().size()
+        };
+
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow {
+            let arena = s.account_abi_size(name);
+            s.note_noncontract(arena == Some(chainbase));
+            if s.reads_enabled()
+                && let Some(v) = arena
+            {
+                return Ok(v);
             }
         }
 
@@ -4709,7 +4809,6 @@ impl Database {
         }
         Ok(())
     }
-
     pub fn create_permission(
         &mut self,
         account: u64,

@@ -1455,6 +1455,30 @@ impl ArenaShadow {
             .is_some()
     }
 
+    /// The account's creation date (seconds since epoch, as chainbase stores it),
+    /// for serving `AccountObject::get_creation_date` from the arena. `None` if
+    /// the account is absent.
+    pub fn account_creation_date(&self, name: u64) -> Option<u32> {
+        self.lock()
+            .find_by::<AccountRow, AccountRowByName>(&name)
+            .ok()
+            .flatten()
+            .map(|r| r.creation_date)
+    }
+
+    /// The byte length of the account's stored ABI blob, for serving
+    /// `AccountObject::get_abi().size()` from the arena (setabi bills RAM on it).
+    /// `None` if the account is absent.
+    pub fn account_abi_size(&self, name: u64) -> Option<usize> {
+        let db = self.lock();
+        let abi_ref = db
+            .find_by::<AccountRow, AccountRowByName>(&name)
+            .ok()
+            .flatten()
+            .map(|r| r.abi)?;
+        Some(db.blob::<AccountRow>(abi_ref).map(|b| b.len()).unwrap_or(0))
+    }
+
     pub fn set_privileged(&self, name: u64, privileged: bool) -> Result<(), DbError> {
         let mut db = self.lock();
         let id = db

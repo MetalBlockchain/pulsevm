@@ -533,13 +533,6 @@ impl AuthorizationManager {
         db.modify_permission(actor, permission, auth, pending_block_time)
     }
 
-    pub fn remove_permission(
-        db: &mut Database,
-        permission: &PermissionObject,
-    ) -> Result<(), ChainError> {
-        db.remove_permission(permission)
-    }
-
     pub fn update_permission_usage(
         db: &mut Database,
         actor: u64,
