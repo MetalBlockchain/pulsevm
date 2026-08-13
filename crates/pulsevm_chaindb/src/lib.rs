@@ -1338,9 +1338,15 @@ impl ArenaShadow {
 
     /// Whether execution should resolve reads without consulting chainbase. Only
     /// meaningful when `reads_enabled` (the arena is already the served value).
+    ///
+    /// Standalone writes imply standalone reads: once writes stop landing in
+    /// chainbase, reading it back would serve stale (or missing) state, so the
+    /// read path must come off chainbase too. This lets a chainbase-free node run
+    /// from the single write switch, and closes the writes-on/reads-off footgun.
     pub fn standalone_reads(&self) -> bool {
         self.standalone_reads
             .load(std::sync::atomic::Ordering::Relaxed)
+            || self.standalone_writes()
     }
 
     /// Apply state mutations to the arena only from now on, never writing
