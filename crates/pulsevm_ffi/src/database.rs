@@ -108,6 +108,27 @@ fn to_elastic_params(p: &ElasticLimitParameters) -> crate::shadow::ElasticParams
     }
 }
 
+/// Reverse of [`to_elastic_params`]: rebuilds the FFI `ElasticLimitParameters`
+/// from the arena's plain params, so the resource-limit getters can serve the
+/// config off the arena when chainbase is absent.
+#[cfg(feature = "arena-shadow")]
+fn from_elastic_params(p: &crate::shadow::ElasticParams) -> ElasticLimitParameters {
+    ElasticLimitParameters {
+        target: p.target,
+        max: p.max,
+        periods: p.periods,
+        max_multiplier: p.max_multiplier,
+        contract_rate: ffi::Ratio {
+            numerator: p.contract.0,
+            denominator: p.contract.1,
+        },
+        expand_rate: ffi::Ratio {
+            numerator: p.expand.0,
+            denominator: p.expand.1,
+        },
+    }
+}
+
 /// Reads the active `chain_config` from a chainbase `CxxChainConfig` into the
 /// plain params the arena mirror stores. Only the fields both sides carry (see
 /// [`crate::shadow::ChainConfigParams`]).
@@ -2307,8 +2328,8 @@ impl Database {
         #[cfg(feature = "arena-shadow")]
         if self.shadow.is_some() {
             match (
-                self.get_cpu_limit_parameters(),
-                self.get_net_limit_parameters(),
+                self.chainbase_cpu_limit_parameters(),
+                self.chainbase_net_limit_parameters(),
             ) {
                 (Ok(cpu), Ok(net)) => {
                     if let Some(s) = &self.shadow
@@ -2391,10 +2412,10 @@ impl Database {
             // + averaging windows) in C++; seed it once from chainbase. Later
             // set_block_parameters updates the elastic params in lockstep.
             match (
-                self.get_cpu_limit_parameters(),
-                self.get_net_limit_parameters(),
-                self.get_account_cpu_usage_average_window(),
-                self.get_account_net_usage_average_window(),
+                self.chainbase_cpu_limit_parameters(),
+                self.chainbase_net_limit_parameters(),
+                self.chainbase_account_cpu_usage_average_window(),
+                self.chainbase_account_net_usage_average_window(),
             ) {
                 (Ok(cpu), Ok(net), Ok(cpu_w), Ok(net_w)) => {
                     if let Some(s) = &self.shadow
@@ -3109,6 +3130,15 @@ impl Database {
     }
 
     pub fn get_account_net_usage_average_window(&self) -> Result<u32, ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && s.standalone_reads()
+        {
+            return s
+                .usage_average_windows()
+                .map(|(net, _cpu)| net)
+                .ok_or_else(|| ChainError::InternalError("resource config not found".into()));
+        }
         let guard = self.locked_read()?;
         guard
             .get_account_net_usage_average_window()
@@ -3116,6 +3146,15 @@ impl Database {
     }
 
     pub fn get_account_cpu_usage_average_window(&self) -> Result<u32, ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && s.standalone_reads()
+        {
+            return s
+                .usage_average_windows()
+                .map(|(_net, cpu)| cpu)
+                .ok_or_else(|| ChainError::InternalError("resource config not found".into()));
+        }
         let guard = self.locked_read()?;
         guard
             .get_account_cpu_usage_average_window()
@@ -3181,6 +3220,15 @@ impl Database {
     }
 
     pub fn get_cpu_limit_parameters(&self) -> Result<ElasticLimitParameters, ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && s.standalone_reads()
+        {
+            return s
+                .resource_config_elastic()
+                .map(|(cpu, _net)| from_elastic_params(&cpu))
+                .ok_or_else(|| ChainError::InternalError("resource config not found".into()));
+        }
         let guard = self.locked_read()?;
         guard
             .get_cpu_limit_parameters()
@@ -3188,9 +3236,56 @@ impl Database {
     }
 
     pub fn get_net_limit_parameters(&self) -> Result<ElasticLimitParameters, ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && s.standalone_reads()
+        {
+            return s
+                .resource_config_elastic()
+                .map(|(_cpu, net)| from_elastic_params(&net))
+                .ok_or_else(|| ChainError::InternalError("resource config not found".into()));
+        }
         let guard = self.locked_read()?;
         guard
             .get_net_limit_parameters()
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
+    /// Chainbase-direct reads of the resource-limits config, bypassing the
+    /// standalone arena inversion in the public getters. Used only by the
+    /// genesis-time mirror seeding, which copies the freshly-built chainbase
+    /// config *into* the arena — the arena isn't populated yet, so the public
+    /// getters (which would read the arena under standalone_reads) must not be
+    /// used there.
+    #[cfg(feature = "arena-shadow")]
+    fn chainbase_cpu_limit_parameters(&self) -> Result<ElasticLimitParameters, ChainError> {
+        let guard = self.inner.read()?;
+        guard
+            .get_cpu_limit_parameters()
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
+    #[cfg(feature = "arena-shadow")]
+    fn chainbase_net_limit_parameters(&self) -> Result<ElasticLimitParameters, ChainError> {
+        let guard = self.inner.read()?;
+        guard
+            .get_net_limit_parameters()
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
+    #[cfg(feature = "arena-shadow")]
+    fn chainbase_account_cpu_usage_average_window(&self) -> Result<u32, ChainError> {
+        let guard = self.inner.read()?;
+        guard
+            .get_account_cpu_usage_average_window()
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
+    #[cfg(feature = "arena-shadow")]
+    fn chainbase_account_net_usage_average_window(&self) -> Result<u32, ChainError> {
+        let guard = self.inner.read()?;
+        guard
+            .get_account_net_usage_average_window()
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 
@@ -3275,6 +3370,15 @@ impl Database {
     }
 
     pub fn get_total_cpu_weight(&self) -> Result<u64, ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && s.standalone_reads()
+        {
+            return s
+                .state_total_weights()
+                .map(|(cpu, _net)| cpu)
+                .ok_or_else(|| ChainError::InternalError("resource state not found".into()));
+        }
         let guard = self.locked_read()?;
 
         guard
@@ -3283,6 +3387,15 @@ impl Database {
     }
 
     pub fn get_total_net_weight(&self) -> Result<u64, ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && s.standalone_reads()
+        {
+            return s
+                .state_total_weights()
+                .map(|(_cpu, net)| net)
+                .ok_or_else(|| ChainError::InternalError("resource state not found".into()));
+        }
         let guard = self.locked_read()?;
 
         guard
@@ -3426,10 +3539,10 @@ impl Database {
     /// byte-compatible with the arena mirror's `resource_config_state_bytes`.
     #[cfg(feature = "arena-shadow")]
     pub fn resource_config_state_bytes(&self) -> Result<Vec<u8>, ChainError> {
-        let cpu = to_elastic_params(&self.get_cpu_limit_parameters()?);
-        let net = to_elastic_params(&self.get_net_limit_parameters()?);
-        let cpu_window = self.get_account_cpu_usage_average_window()?;
-        let net_window = self.get_account_net_usage_average_window()?;
+        let cpu = to_elastic_params(&self.chainbase_cpu_limit_parameters()?);
+        let net = to_elastic_params(&self.chainbase_net_limit_parameters()?);
+        let cpu_window = self.chainbase_account_cpu_usage_average_window()?;
+        let net_window = self.chainbase_account_net_usage_average_window()?;
         Ok(crate::shadow::serialize_resource_config(
             &cpu, &net, cpu_window, net_window,
         ))
@@ -3450,6 +3563,19 @@ impl Database {
     }
 
     pub fn process_block_usage(&mut self, block_num: u32) -> Result<(), ChainError> {
+        // Chainbase absent: fold the block usage on the arena alone, sourcing the
+        // elastic params from the arena config rather than the (empty) chainbase.
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && s.standalone_writes()
+        {
+            let (cpu, net) = s.resource_config_elastic().ok_or_else(|| {
+                ChainError::InternalError("resource config not found for block usage".into())
+            })?;
+            return s.process_block_usage(block_num, cpu, net).map_err(|e| {
+                ChainError::InternalError(format!("arena process_block_usage: {e:?}"))
+            });
+        }
         {
             let mut guard = self.locked_write()?;
             let pinned = guard.pin_mut();
@@ -6106,6 +6232,15 @@ impl Database {
     }
 
     pub fn get_virtual_block_cpu_limit(&self) -> Result<u64, ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && s.standalone_reads()
+        {
+            return s
+                .state_virtual_limits()
+                .map(|(cpu, _net)| cpu)
+                .ok_or_else(|| ChainError::InternalError("resource state not found".into()));
+        }
         let guard = self.locked_read()?;
         guard
             .get_virtual_block_cpu_limit()
@@ -6113,6 +6248,15 @@ impl Database {
     }
 
     pub fn get_virtual_block_net_limit(&self) -> Result<u64, ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && s.standalone_reads()
+        {
+            return s
+                .state_virtual_limits()
+                .map(|(_cpu, net)| net)
+                .ok_or_else(|| ChainError::InternalError("resource state not found".into()));
+        }
         let guard = self.locked_read()?;
         guard
             .get_virtual_block_net_limit()
@@ -6120,6 +6264,15 @@ impl Database {
     }
 
     pub fn get_block_cpu_limit(&self) -> Result<u64, ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && s.standalone_reads()
+        {
+            return s
+                .block_limits()
+                .map(|(cpu, _net)| cpu)
+                .ok_or_else(|| ChainError::InternalError("resource state not found".into()));
+        }
         let guard = self.locked_read()?;
         guard
             .get_block_cpu_limit()
@@ -6127,6 +6280,15 @@ impl Database {
     }
 
     pub fn get_block_net_limit(&self) -> Result<u64, ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && s.standalone_reads()
+        {
+            return s
+                .block_limits()
+                .map(|(_cpu, net)| net)
+                .ok_or_else(|| ChainError::InternalError("resource state not found".into()));
+        }
         let guard = self.locked_read()?;
         guard
             .get_block_net_limit()

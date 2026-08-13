@@ -2668,6 +2668,82 @@ impl ArenaShadow {
             .map(|s| (s.virtual_cpu_limit, s.virtual_net_limit))
     }
 
+    /// Mirrored `(total_cpu_weight, total_net_weight)` from the state singleton,
+    /// or `None` if the row is absent — serves `get_total_cpu_weight` /
+    /// `get_total_net_weight` when execution is off chainbase.
+    pub fn state_total_weights(&self) -> Option<(u64, u64)> {
+        self.lock()
+            .table::<ResourceStateRow>()
+            .ok()?
+            .iter()
+            .next()
+            .map(|s| (s.total_cpu_weight, s.total_net_weight))
+    }
+
+    /// The per-block cpu/net limit still available this block:
+    /// `config.max - state.pending_usage`, matching chainbase's
+    /// `get_block_cpu_limit` / `get_block_net_limit`. `None` if either singleton
+    /// is absent.
+    pub fn block_limits(&self) -> Option<(u64, u64)> {
+        let db = self.lock();
+        let cfg = db.table::<ResourceConfigRow>().ok()?.iter().next()?;
+        let state = db.table::<ResourceStateRow>().ok()?.iter().next()?;
+        Some((
+            cfg.cpu_max.saturating_sub(state.pending_cpu_usage),
+            cfg.net_max.saturating_sub(state.pending_net_usage),
+        ))
+    }
+
+    /// The elastic `(cpu, net)` limit parameters from the config singleton, in the
+    /// same shape [`set_block_parameters`] takes — so `process_block_usage` can be
+    /// driven off the arena alone, without the chainbase config. `None` if the
+    /// config row is absent.
+    pub fn resource_config_elastic(&self) -> Option<(ElasticParams, ElasticParams)> {
+        self.lock()
+            .table::<ResourceConfigRow>()
+            .ok()?
+            .iter()
+            .next()
+            .map(|c| {
+                (
+                    ElasticParams {
+                        target: c.cpu_target,
+                        max: c.cpu_max,
+                        periods: c.cpu_periods,
+                        max_multiplier: c.cpu_max_multiplier,
+                        contract: (c.cpu_contract_num, c.cpu_contract_den),
+                        expand: (c.cpu_expand_num, c.cpu_expand_den),
+                    },
+                    ElasticParams {
+                        target: c.net_target,
+                        max: c.net_max,
+                        periods: c.net_periods,
+                        max_multiplier: c.net_max_multiplier,
+                        contract: (c.net_contract_num, c.net_contract_den),
+                        expand: (c.net_expand_num, c.net_expand_den),
+                    },
+                )
+            })
+    }
+
+    /// The `(net, cpu)` account-usage averaging windows from the config singleton,
+    /// serving `get_account_net_usage_average_window` /
+    /// `get_account_cpu_usage_average_window` off chainbase. `None` if the config
+    /// row is absent.
+    pub fn usage_average_windows(&self) -> Option<(u32, u32)> {
+        self.lock()
+            .table::<ResourceConfigRow>()
+            .ok()?
+            .iter()
+            .next()
+            .map(|c| {
+                (
+                    c.account_net_usage_average_window,
+                    c.account_cpu_usage_average_window,
+                )
+            })
+    }
+
     /// Mirrors `add_pending_ram_usage`: applies the externally-computed byte
     /// delta to the account's mirrored ram_usage. Chainbase guards against
     /// over/underflow before this runs, so the signed accumulation is safe.
