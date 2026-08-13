@@ -41,6 +41,13 @@ use zerocopy::{
     KnownLayout,
 };
 
+/// The initial `pulse` system-account ABI, byte-for-byte as chainbase genesis
+/// installs it (`pulsevm_abi_bin`, a 2132-byte consensus constant — differing
+/// bytes across nodes would fork). Extracted from the C++ source so a pure-Rust
+/// genesis can author the system account's abi without a chainbase bootstrap;
+/// the account state root commits to these bytes, so they must match exactly.
+pub const GENESIS_PULSE_ABI: &[u8] = include_bytes!("genesis_pulse_abi.bin");
+
 /// Arena mirror of chainbase `account_metadata_object` — the first table ported.
 /// The trailing padding keeps the row free of implicit padding bytes so it
 /// round-trips through the arena's zero-copy layout.
@@ -4966,6 +4973,18 @@ mod tests {
             s.idx_long_double_find_secondary(code, scope, table, (0, 5)),
             Some(9)
         );
+    }
+
+    /// The embedded genesis ABI is the exact 2132-byte consensus blob: the
+    /// EOSIO-ABI magic header and the trailing reserved bytes pin both ends, so a
+    /// truncated or re-encoded extraction is caught before it can fork block 1.
+    #[test]
+    fn genesis_pulse_abi_is_the_exact_consensus_blob() {
+        assert_eq!(GENESIS_PULSE_ABI.len(), 2132);
+        // Length-prefixed "eosio::abi/1.0": 0x0e then the ascii.
+        assert_eq!(GENESIS_PULSE_ABI[0], 0x0e);
+        assert_eq!(&GENESIS_PULSE_ABI[1..15], b"eosio::abi/1.0");
+        assert_eq!(&GENESIS_PULSE_ABI[2128..2132], &[0, 0, 0, 0]);
     }
 
     /// The standalone-write path bills db_idxN_update off the row's old payer and
