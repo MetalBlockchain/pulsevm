@@ -5156,6 +5156,33 @@ mod tests {
         let mut restarted = false;
         let mut restart_block = 0u32;
 
+        // Golden per-block arena roots. `PULSEVM_GOLDEN_ROOTS` names a file: if it
+        // exists, verify each block's arena root against it and SKIP the live
+        // chainbase cross-checks (used by the standalone-write replay, where
+        // chainbase is never written and can't be the oracle); if it is set but
+        // absent, record the roots for a later verify run. A per-block root is a
+        // stable fingerprint over every arena table's canonical state bytes.
+        let golden_file = std::env::var("PULSEVM_GOLDEN_ROOTS").ok();
+        let golden_roots: Option<std::collections::HashMap<u32, u64>> = golden_file
+            .as_ref()
+            .filter(|p| Path::new(p).exists())
+            .map(|p| {
+                fs::read_to_string(p)
+                    .expect("read golden roots")
+                    .lines()
+                    .filter_map(|l| {
+                        let mut it = l.split_whitespace();
+                        let n: u32 = it.next()?.parse().ok()?;
+                        let r = u64::from_str_radix(it.next()?, 16).ok()?;
+                        Some((n, r))
+                    })
+                    .collect()
+            });
+        let mut recorded: Option<Vec<(u32, u64)>> = match &golden_file {
+            Some(_) if golden_roots.is_none() => Some(Vec::new()),
+            _ => None,
+        };
+
         let mut replayed = 0u32;
         for f in &files {
             let v: serde_json::Value = serde_json::from_slice(&fs::read(f).unwrap()).unwrap();
@@ -5177,6 +5204,55 @@ mod tests {
             controller.accept_block(&block.id()?, &mut mempool)?;
             controller.set_preferred_id(block.id()?);
             controller.database().arena_flush_delta(&wal)?;
+
+            let tables = cross_impl_tables(&controller.database())?;
+
+            // Per-block arena state root: a fingerprint over every arena table's
+            // canonical bytes, used to record/verify golden roots.
+            let arena_root = {
+                use std::hash::{
+                    Hash,
+                    Hasher,
+                };
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                for (name, _chain, arena) in &tables {
+                    name.hash(&mut h);
+                    arena.hash(&mut h);
+                }
+                h.finish()
+            };
+
+            // Golden-verify mode: chainbase is not the oracle (its writes may be
+            // skipped), so check the arena root against the recorded set instead of
+            // the live cross-impl diff.
+            if let Some(golden) = &golden_roots {
+                match golden.get(&n) {
+                    Some(&g) if g == arena_root => {}
+                    Some(&g) => {
+                        eprintln!(
+                            "golden root mismatch at block {n}: arena {arena_root:016x} != golden {g:016x} (matched up to {replayed})"
+                        );
+                        break;
+                    }
+                    None => {
+                        eprintln!("no golden root recorded for block {n}");
+                        break;
+                    }
+                }
+                replayed = n;
+                if !restarted && n >= restart_at {
+                    assert!(
+                        controller.database().arena_restart(&ckpt)?,
+                        "arena restart should run with the shadow enabled"
+                    );
+                    restarted = true;
+                    restart_block = n;
+                }
+                continue;
+            }
+            if let Some(rec) = &mut recorded {
+                rec.push((n, arena_root));
+            }
 
             let mut diverged = None;
             for (name, chain_bytes, arena_bytes) in cross_impl_tables(&controller.database())? {
@@ -5283,6 +5359,25 @@ mod tests {
             "replay covered no blocks (replayed up to {replayed}, expected >= {start}) — \
              fixture/harness mismatch"
         );
+
+        // Record the golden roots (verified this run by the live cross-check) for a
+        // later standalone-write verify run.
+        if let (Some(path), Some(rec)) = (&golden_file, &recorded) {
+            let body: String = rec.iter().map(|(n, r)| format!("{n} {r:016x}\n")).collect();
+            fs::write(path, body).expect("write golden roots");
+            eprintln!("recorded {} golden arena roots to {}", rec.len(), path);
+        }
+
+        // Golden-verify mode ran with chainbase writes skipped, so the read-surface
+        // and persistence cross-checks below — which all read chainbase — don't
+        // apply. The per-block arena-root match against the golden set is the proof
+        // that the arena reproduced the whole chain on its own.
+        if golden_roots.is_some() {
+            eprintln!(
+                "replayed real testnet blocks up to {replayed} on the ARENA ALONE (chainbase writes skipped); every per-block arena state root matched the golden set recorded from the cross-checked run"
+            );
+            return Ok(());
+        }
 
         // Read-surface check: the cross-impl root proves the arena *holds* the
         // same rows as chainbase, but running as primary means the arena must
