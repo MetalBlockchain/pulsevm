@@ -1122,6 +1122,25 @@ pub struct ArenaShadow {
     // mirrored comparison oracle. A `PULSEVM_ARENA_READS` set to a falsey value is
     // an explicit kill switch that reverts to serving from chainbase.
     reads_enabled: Arc<std::sync::atomic::AtomicBool>,
+    // When set, execution resolves reads ENTIRELY from the arena and does not
+    // consult chainbase at all on the read path — no object fetch, no per-read
+    // cross-check. This is the arena-standalone read mode: the step that removes
+    // chainbase's double-work from the hot path, guarded by the block-boundary
+    // full-state root check rather than the per-read comparison. Off by default
+    // (verify mode); opt in with `PULSEVM_ARENA_ONLY`.
+    standalone_reads: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Whether execution resolves reads entirely from the arena (no chainbase on the
+/// read path). Off unless `PULSEVM_ARENA_ONLY` is set to a truthy/empty value.
+fn arena_standalone_default() -> bool {
+    match std::env::var("PULSEVM_ARENA_ONLY") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        Err(_) => false,
+    }
 }
 
 /// Whether the arena serves execution reads. Default on (the arena is primary);
@@ -1208,6 +1227,9 @@ impl ArenaShadow {
             // from the outset, with chainbase kept only as the mirrored oracle.
             // A falsey PULSEVM_ARENA_READS is the kill switch back to chainbase.
             reads_enabled: Arc::new(std::sync::atomic::AtomicBool::new(arena_reads_default())),
+            standalone_reads: Arc::new(std::sync::atomic::AtomicBool::new(
+                arena_standalone_default(),
+            )),
         })
     }
 
@@ -1219,6 +1241,22 @@ impl ArenaShadow {
 
     pub fn reads_enabled(&self) -> bool {
         self.reads_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Serve reads entirely from the arena from now on (no chainbase on the read
+    /// path). Implies `reads_enabled`.
+    pub fn enable_standalone_reads(&self) {
+        self.reads_enabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.standalone_reads
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether execution should resolve reads without consulting chainbase. Only
+    /// meaningful when `reads_enabled` (the arena is already the served value).
+    pub fn standalone_reads(&self) -> bool {
+        self.standalone_reads
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 

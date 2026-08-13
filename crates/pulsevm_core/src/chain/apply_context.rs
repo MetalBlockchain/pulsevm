@@ -730,6 +730,37 @@ impl ApplyContext {
         buffer_size: usize,
     ) -> Result<i32, ChainError> {
         let inner = self.inner.read()?;
+
+        // Arena-standalone read path: resolve the value entirely from the arena,
+        // never touching chainbase's keyval_cache or the per-read cross-check. The
+        // arena mints the same iterator handles as chainbase (verified in the
+        // default mode), so the contract's handle resolves directly against the
+        // arena cache. Correctness here rests on the block-boundary full-state root
+        // check rather than the inline comparison.
+        #[cfg(feature = "arena-shadow")]
+        if self.db.arena_standalone_reads() {
+            let (code, scope, table, primary) = inner
+                .arena_keyval_cache
+                .row_of(iterator)
+                .ok_or_else(|| ChainError::InternalError(format!("invalid iterator {iterator}")))?;
+            let value = self
+                .db
+                .arena_kv_get(code, scope, table, primary)
+                .ok_or_else(|| {
+                    ChainError::InternalError(format!("arena has no row for iterator {iterator}"))
+                })?;
+            let s = value.len();
+            if buffer_size == 0 {
+                return Ok(s as i32);
+            }
+            let copy_size = core::cmp::min(buffer_size, s);
+            if buffer.len() < copy_size {
+                buffer.resize(copy_size, 0);
+            }
+            buffer[..copy_size].copy_from_slice(&value[..copy_size]);
+            return Ok(copy_size as i32);
+        }
+
         let obj = inner.keyval_cache.get(iterator)?;
 
         // Inline read cross-check: the arena must serve this contract read — the

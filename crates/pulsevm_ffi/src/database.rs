@@ -851,6 +851,23 @@ impl Database {
         }
     }
 
+    /// Whether execution should resolve reads entirely from the arena, without
+    /// consulting chainbase on the read path (arena-standalone mode). No-op false
+    /// when shadowing is off.
+    pub fn arena_standalone_reads(&self) -> bool {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow
+                .as_ref()
+                .map(|s| s.standalone_reads())
+                .unwrap_or(false)
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            false
+        }
+    }
+
     /// (matches, mismatches) tallied by the inline read cross-check, or (0, 0)
     /// when shadowing is off.
     pub fn arena_read_crosscheck_counts(&self) -> (u64, u64) {
