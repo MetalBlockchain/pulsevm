@@ -1680,6 +1680,23 @@ impl ArenaShadow {
             .map(|p| p.cb_id)
     }
 
+    /// The `last_used` timestamp (microseconds since epoch) of a permission,
+    /// read off its linked `permission_usage` row exactly as
+    /// `permission_state_bytes` does — for serving `get_permission_last_used`
+    /// from the arena. `None` if the permission is absent.
+    pub fn permission_last_used(&self, owner: u64, perm_name: u64) -> Option<i64> {
+        let db = self.lock();
+        let usage_id = db
+            .find_by::<PermissionRow, PermByOwner>(&(owner, perm_name))
+            .ok()
+            .flatten()
+            .map(|p| p.usage_id)?;
+        db.find::<PermissionUsageRow>(ObjectId::new(usage_id))
+            .ok()
+            .flatten()
+            .map(|u| u.last_used)
+    }
+
     /// The full encoded `shared_authority` blob for a permission (the same bytes
     /// the FFI seam stored via `encode_authority`), for serving the whole
     /// authority — not just the threshold — from the arena. `None` if absent.

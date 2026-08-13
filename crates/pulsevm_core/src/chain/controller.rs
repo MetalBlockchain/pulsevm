@@ -3241,11 +3241,11 @@ mod tests {
             AuthorizationManager::get_permission(&r, glenn.as_u64(), ACTIVE_NAME.as_u64())?;
         let permc = AuthorizationManager::get_permission(&r, glenn.as_u64(), pc.as_u64())?;
         assert!(
-            active_perm.satisfies(permc, &r)?,
+            active_perm.satisfies(&permc, &r)?,
             "active must satisfy its descendant permc"
         );
         assert!(
-            !permc.satisfies(active_perm, &r)?,
+            !permc.satisfies(&active_perm, &r)?,
             "a descendant must not satisfy its ancestor"
         );
         Ok(())
@@ -7848,13 +7848,14 @@ mod tests {
         ];
         let db = controller.db.read()?;
         for (permission_name, threshold) in expectations {
-            let permission = AuthorizationManager::get_permission(
-                &db,
-                PRODS_NAME.into(),
-                permission_name.into(),
-            )?;
+            // Confirm the permission exists, then read its authority by name
+            // (owned, arena-served) rather than off a chainbase object.
+            AuthorizationManager::get_permission(&db, PRODS_NAME.into(), permission_name.into())?;
+            let authority = db
+                .permission_authority(PRODS_NAME.into(), permission_name.into())?
+                .expect("pulse.prods permission must have an authority");
             assert_eq!(
-                permission.get_authority().to_authority(),
+                authority,
                 Authority::new(threshold, vec![], expected_accounts.clone(), vec![]),
                 "pulse.prods@{} must require {} of the 5 scheduled producers",
                 permission_name,

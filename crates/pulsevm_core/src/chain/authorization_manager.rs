@@ -6,6 +6,7 @@ use pulsevm_ffi::{
     Database,
     DbRead,
     Microseconds,
+    PermissionInfo,
     PermissionObject,
     TimePoint,
     seconds,
@@ -116,10 +117,7 @@ impl AuthorizationManager {
                             ChainError::IrrelevantAuth(format!(
                                 "action declares irrelevant authority '{}'; minimum authority is {}",
                                 declared_auth,
-                                PermissionLevel::new(
-                                    min_permission.get_owner().to_uint64_t(),
-                                    min_permission.get_name().to_uint64_t()
-                                )
+                                PermissionLevel::new(min_permission.owner(), min_permission.name())
                             )),
                         )?;
                     }
@@ -266,10 +264,7 @@ impl AuthorizationManager {
             ChainError::IrrelevantAuth(format!(
                 "updateauth action declares irrelevant authority '{}'; minimum authority is {}",
                 auth,
-                PermissionLevel::new(
-                    update.account.as_u64(),
-                    min_permission.get_name().to_uint64_t()
-                )
+                PermissionLevel::new(update.account.as_u64(), min_permission.name())
             )),
         )?;
 
@@ -299,10 +294,7 @@ impl AuthorizationManager {
             ChainError::AuthorizationError(format!(
                 "deleteauth action declares irrelevant authority '{}'; minimum authority is {}",
                 auth,
-                PermissionLevel::new(
-                    min_permission.get_owner().to_uint64_t(),
-                    min_permission.get_name().to_uint64_t()
-                )
+                PermissionLevel::new(min_permission.owner(), min_permission.name())
             )),
         )?;
         Ok(())
@@ -433,34 +425,33 @@ impl AuthorizationManager {
         Ok(())
     }
 
-    pub fn find_permission<'a>(
-        db: &'a DbRead<'_>,
+    pub fn find_permission(
+        db: &DbRead<'_>,
         level: &PermissionLevel,
-    ) -> Result<Option<&'a PermissionObject>, ChainError> {
+    ) -> Result<Option<PermissionInfo>, ChainError> {
         pulse_assert(
             level.actor != 0 && level.permission != 0,
             ChainError::AuthorizationError("invalid permission".to_string()),
         )?;
-        db.find_permission_by_actor_and_permission(level.actor, level.permission)
+        db.find_permission_info(level.actor, level.permission)
     }
 
-    pub fn get_permission<'a>(
-        db: &'a DbRead<'_>,
+    pub fn get_permission(
+        db: &DbRead<'_>,
         actor: u64,
         permission: u64,
-    ) -> Result<&'a PermissionObject, ChainError> {
+    ) -> Result<PermissionInfo, ChainError> {
         pulse_assert(
             actor != 0 && permission != 0,
             ChainError::AuthorizationError("invalid permission".to_string()),
         )?;
-        db.find_permission_by_actor_and_permission(actor, permission)?
-            .ok_or_else(|| {
-                ChainError::AuthorizationError(format!(
-                    "permission {}/{} does not exist",
-                    Name::new(actor),
-                    Name::new(permission)
-                ))
-            })
+        db.find_permission_info(actor, permission)?.ok_or_else(|| {
+            ChainError::AuthorizationError(format!(
+                "permission {}/{} does not exist",
+                Name::new(actor),
+                Name::new(permission)
+            ))
+        })
     }
 
     fn lookup_minimum_permission(

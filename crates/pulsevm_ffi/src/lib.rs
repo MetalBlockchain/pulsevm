@@ -107,6 +107,7 @@ pub use crate::{
         Database,
         DbRead,
         DbWrite,
+        PermissionInfo,
         restore_snapshot,
     },
     iterator_cache::{

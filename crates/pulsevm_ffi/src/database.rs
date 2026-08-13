@@ -5686,6 +5686,53 @@ pub struct DbRead<'g> {
     shadow: Option<crate::shadow::ArenaShadow>,
 }
 
+/// An owned snapshot of the consensus-visible fields execution reads off a
+/// permission, standing in for a chainbase `&PermissionObject` reference the
+/// arena can't hand back. Everything a caller used to pull off the object —
+/// its id, parent id, authority billable size, and the `(owner, name)` needed
+/// to name it and walk the satisfies tree — is captured here, so the read path
+/// no longer borrows into chainbase memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PermissionInfo {
+    owner: u64,
+    name: u64,
+    id: i64,
+    parent_id: i64,
+    auth_billable_size: i64,
+}
+
+impl PermissionInfo {
+    pub fn owner(&self) -> u64 {
+        self.owner
+    }
+
+    pub fn name(&self) -> u64 {
+        self.name
+    }
+
+    pub fn get_id(&self) -> i64 {
+        self.id
+    }
+
+    pub fn get_parent_id(&self) -> i64 {
+        self.parent_id
+    }
+
+    /// The RAM the permission's authority is billed — what
+    /// `get_authority().get_billable_size()` returned off the chainbase object.
+    pub fn authority_billable_size(&self) -> i64 {
+        self.auth_billable_size
+    }
+
+    /// Does this permission satisfy `other` — is it that same permission, its
+    /// immediate parent, or an ancestor up its parent chain. Resolved by name so
+    /// no chainbase object reference is required; see
+    /// [`DbRead::permission_satisfies_by_name`].
+    pub fn satisfies(&self, other: &PermissionInfo, db: &DbRead<'_>) -> Result<bool, ChainError> {
+        db.permission_satisfies_by_name(self.owner, self.name, other.owner, other.name)
+    }
+}
+
 impl<'g> DbRead<'g> {
     fn db(&self) -> &ffi::Database {
         &self.guard
@@ -5828,6 +5875,163 @@ impl<'g> DbRead<'g> {
             s.note_noncontract(arena == chainbase);
             if s.reads_enabled() {
                 return Ok(arena);
+            }
+        }
+
+        Ok(chainbase)
+    }
+
+    /// Resolve a permission to the owned [`PermissionInfo`] execution reads,
+    /// replacing the chainbase `&PermissionObject` reference. In the default
+    /// build chainbase stays authoritative and every field is cross-checked
+    /// against the arena; under `PULSEVM_ARENA_READS` the arena's value is
+    /// served, and under `PULSEVM_ARENA_ONLY` chainbase is never consulted.
+    pub fn find_permission_info(
+        &self,
+        actor: u64,
+        permission: u64,
+    ) -> Result<Option<PermissionInfo>, ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && s.standalone_reads()
+        {
+            return Ok(Self::arena_permission_info(s, actor, permission));
+        }
+
+        let chainbase = self
+            .db()
+            .find_permission_by_actor_and_permission(actor, permission)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        let chainbase = unsafe { chainbase.as_ref() }.map(|p| PermissionInfo {
+            owner: actor,
+            name: permission,
+            id: p.get_id(),
+            parent_id: p.get_parent_id(),
+            auth_billable_size: p.get_authority().get_billable_size() as i64,
+        });
+
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow {
+            let arena = Self::arena_permission_info(s, actor, permission);
+            s.note_noncontract(arena == chainbase);
+            if s.reads_enabled() {
+                return Ok(arena);
+            }
+        }
+
+        Ok(chainbase)
+    }
+
+    /// Build a [`PermissionInfo`] purely from the arena mirror, or `None` if the
+    /// permission is absent. Each field comes from the same arena accessor the
+    /// value-based reads already use, so the snapshot is consistent with them.
+    #[cfg(feature = "arena-shadow")]
+    fn arena_permission_info(
+        s: &crate::shadow::ArenaShadow,
+        owner: u64,
+        name: u64,
+    ) -> Option<PermissionInfo> {
+        let id = s.permission_cb_id(owner, name)?;
+        let (parent_id, _threshold) = s.permission(owner, name)?;
+        let auth_billable_size = s
+            .permission_auth_blob(owner, name)
+            .and_then(|blob| authority_blob_billable_size(&blob))?;
+        Some(PermissionInfo {
+            owner,
+            name,
+            id,
+            parent_id,
+            auth_billable_size,
+        })
+    }
+
+    /// Does permission `(owner_a, name_a)` satisfy `(owner_b, name_b)`. Named
+    /// counterpart to [`permission_satisfies_other_permission`] that needs no
+    /// chainbase object references: in the default build it re-finds the two
+    /// objects and defers to the object-based check (which itself cross-checks
+    /// the arena); under `PULSEVM_ARENA_ONLY` it walks the arena's permission
+    /// tree directly.
+    pub fn permission_satisfies_by_name(
+        &self,
+        owner_a: u64,
+        name_a: u64,
+        owner_b: u64,
+        name_b: u64,
+    ) -> Result<bool, ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && s.standalone_reads()
+        {
+            return s
+                .permission_satisfies(owner_a, name_a, owner_b, name_b)
+                .ok_or_else(|| {
+                    ChainError::InternalError(
+                        "permission_satisfies: permission absent from arena".to_string(),
+                    )
+                });
+        }
+
+        let a = self
+            .db()
+            .find_permission_by_actor_and_permission(owner_a, name_a)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        let b = self
+            .db()
+            .find_permission_by_actor_and_permission(owner_b, name_b)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        let a = unsafe { a.as_ref() }.ok_or_else(|| {
+            ChainError::InternalError(format!(
+                "permission_satisfies: permission {}/{} not found",
+                Name::new(owner_a),
+                Name::new(name_a)
+            ))
+        })?;
+        let b = unsafe { b.as_ref() }.ok_or_else(|| {
+            ChainError::InternalError(format!(
+                "permission_satisfies: permission {}/{} not found",
+                Name::new(owner_b),
+                Name::new(name_b)
+            ))
+        })?;
+        self.permission_satisfies_other_permission(a, b)
+    }
+
+    /// The `last_used` microsecond timestamp of a permission, by name. Default
+    /// build reads it off the chainbase object and cross-checks the arena; under
+    /// `PULSEVM_ARENA_ONLY` the arena's usage row answers directly.
+    pub fn permission_last_used_by_name(&self, owner: u64, name: u64) -> Result<i64, ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && s.standalone_reads()
+        {
+            return s.permission_last_used(owner, name).ok_or_else(|| {
+                ChainError::InternalError(
+                    "permission_last_used: permission absent from arena".to_string(),
+                )
+            });
+        }
+
+        let ptr = self
+            .db()
+            .find_permission_by_actor_and_permission(owner, name)
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        let p = unsafe { ptr.as_ref() }.ok_or_else(|| {
+            ChainError::InternalError(format!(
+                "permission_last_used: permission {}/{} not found",
+                Name::new(owner),
+                Name::new(name)
+            ))
+        })?;
+        let chainbase = self.get_permission_last_used(p)?.time_since_epoch().count();
+
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow {
+            let arena = s.permission_last_used(owner, name);
+            s.note_noncontract(arena == Some(chainbase));
+            if s.reads_enabled()
+                && let Some(us) = arena
+            {
+                return Ok(us);
             }
         }
 

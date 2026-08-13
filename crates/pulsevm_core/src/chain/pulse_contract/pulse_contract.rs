@@ -342,7 +342,7 @@ pub fn updateauth(
                     )),
                 )?;
                 let old_size = billable_size_v::<PermissionObject>() as i64
-                    + permission.get_authority().get_billable_size() as i64;
+                    + permission.authority_billable_size();
                 (true, parent_id, old_size)
             }
             None => (false, parent_id, 0i64),
@@ -366,8 +366,7 @@ pub fn updateauth(
                 update.account.as_u64(),
                 update.permission.as_u64(),
             )?;
-            billable_size_v::<PermissionObject>() as i64
-                + permission.get_authority().get_billable_size() as i64
+            billable_size_v::<PermissionObject>() as i64 + permission.authority_billable_size()
         };
 
         context.add_ram_usage(&update.account, new_size - old_size)?;
@@ -388,8 +387,7 @@ pub fn updateauth(
                 update.account.as_u64(),
                 update.permission.as_u64(),
             )?;
-            billable_size_v::<PermissionObject>() as i64
-                + permission.get_authority().get_billable_size() as i64
+            billable_size_v::<PermissionObject>() as i64 + permission.authority_billable_size()
         };
 
         context.add_ram_usage(&update.account, new_size)?;
