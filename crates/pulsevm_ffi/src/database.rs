@@ -133,6 +133,58 @@ fn chain_config_params_from_cxx(c: &ffi::CxxChainConfig) -> crate::shadow::Chain
     }
 }
 
+/// The runtime `chain_config` (as a `ChainConfigV0`) read straight off the
+/// chainbase `global_property_object`. `deferred_trx_expiration_window` has no
+/// stored field (deferred transactions are unsupported) and no consumer, so it
+/// reports 0 — matching the `get_parameters_packed` intrinsic.
+fn chain_config_v0_from_cxx(c: &ffi::CxxChainConfig) -> ChainConfigV0 {
+    ChainConfigV0 {
+        max_block_net_usage: c.get_max_block_net_usage(),
+        target_block_net_usage_pct: c.get_target_block_net_usage_pct(),
+        max_transaction_net_usage: c.get_max_transaction_net_usage(),
+        base_per_transaction_net_usage: c.get_base_per_transaction_net_usage(),
+        net_usage_leeway: c.get_net_usage_leeway(),
+        context_free_discount_net_usage_num: c.get_context_free_discount_net_usage_num(),
+        context_free_discount_net_usage_den: c.get_context_free_discount_net_usage_den(),
+        max_block_cpu_usage: c.get_max_block_cpu_usage(),
+        target_block_cpu_usage_pct: c.get_target_block_cpu_usage_pct(),
+        max_transaction_cpu_usage: c.get_max_transaction_cpu_usage(),
+        min_transaction_cpu_usage: c.get_min_transaction_cpu_usage(),
+        max_transaction_lifetime: c.get_max_transaction_lifetime(),
+        deferred_trx_expiration_window: 0,
+        max_transaction_delay: c.get_max_transaction_delay(),
+        max_inline_action_size: c.get_max_inline_action_size(),
+        max_inline_action_depth: c.get_max_inline_action_depth(),
+        max_authority_depth: c.get_max_authority_depth(),
+    }
+}
+
+/// The runtime `chain_config` rebuilt from the arena's mirrored params — the same
+/// 16 fields, `deferred_trx_expiration_window` reported 0 as above. Lets the
+/// per-tx/per-block config reads serve off the arena with no chainbase object.
+#[cfg(feature = "arena-shadow")]
+fn chain_config_v0_from_params(p: &crate::shadow::ChainConfigParams) -> ChainConfigV0 {
+    ChainConfigV0 {
+        max_block_net_usage: p.max_block_net_usage,
+        target_block_net_usage_pct: p.target_block_net_usage_pct,
+        max_transaction_net_usage: p.max_transaction_net_usage,
+        base_per_transaction_net_usage: p.base_per_transaction_net_usage,
+        net_usage_leeway: p.net_usage_leeway,
+        context_free_discount_net_usage_num: p.context_free_discount_net_usage_num,
+        context_free_discount_net_usage_den: p.context_free_discount_net_usage_den,
+        max_block_cpu_usage: p.max_block_cpu_usage,
+        target_block_cpu_usage_pct: p.target_block_cpu_usage_pct,
+        max_transaction_cpu_usage: p.max_transaction_cpu_usage,
+        min_transaction_cpu_usage: p.min_transaction_cpu_usage,
+        max_transaction_lifetime: p.max_transaction_lifetime,
+        deferred_trx_expiration_window: 0,
+        max_transaction_delay: p.max_transaction_delay,
+        max_inline_action_size: p.max_inline_action_size,
+        max_inline_action_depth: p.max_inline_action_depth,
+        max_authority_depth: p.max_authority_depth,
+    }
+}
+
 /// The same params from the `ChainConfigV0` a `setparams` intrinsic just wrote —
 /// so the mirror updates to exactly what chainbase was handed.
 #[cfg(feature = "arena-shadow")]
@@ -3329,6 +3381,23 @@ impl Database {
         cpu_limit_parameters: &ElasticLimitParameters,
         net_limit_parameters: &ElasticLimitParameters,
     ) -> Result<(), ChainError> {
+        // Only when chainbase is truly absent (Rust genesis) is the chainbase
+        // write skipped: the existing standalone-writes path still reads chainbase
+        // resource-state (process_block_usage / get_block_cpu_limit are not
+        // inverted), so it must keep writing chainbase here.
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && s.rust_genesis()
+        {
+            return s
+                .set_block_parameters(
+                    to_elastic_params(cpu_limit_parameters),
+                    to_elastic_params(net_limit_parameters),
+                )
+                .map_err(|e| {
+                    ChainError::InternalError(format!("arena set_block_parameters: {e:?}"))
+                });
+        }
         {
             let mut guard = self.locked_write()?;
             let pinned = guard.pin_mut();
@@ -5972,6 +6041,45 @@ impl Database {
             .get_global_properties()
             .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
         Ok(chain_config_params_from_cxx(gpo.get_chain_config()))
+    }
+
+    /// `max_action_return_value_size` — a genesis build constant (256) that
+    /// `setparams` never carries, so the arena mirror does not store it. Served as
+    /// the constant when off chainbase, else read from the chainbase config.
+    pub fn max_action_return_value_size(&self) -> Result<u32, ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && s.standalone_reads()
+        {
+            return Ok(256);
+        }
+        let guard = self.inner.read()?;
+        let gpo = guard
+            .get_global_properties()
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        Ok(gpo.get_chain_config().get_max_action_return_value_size())
+    }
+
+    /// The active runtime `chain_config`, served from the arena when execution is
+    /// off chainbase (standalone reads) and from the chainbase `global_property_
+    /// object` otherwise. This is the owned-value replacement for
+    /// `get_global_properties()?.get_chain_config()` on the per-tx/per-block hot
+    /// paths, so those callers hold no chainbase object.
+    pub fn chain_config(&self) -> Result<ChainConfigV0, ChainError> {
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow
+            && s.standalone_reads()
+        {
+            let p = s
+                .chain_config_params()
+                .ok_or_else(|| ChainError::InternalError("arena chain_config not seeded".into()))?;
+            return Ok(chain_config_v0_from_params(&p));
+        }
+        let guard = self.inner.read()?;
+        let gpo = guard
+            .get_global_properties()
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        Ok(chain_config_v0_from_cxx(gpo.get_chain_config()))
     }
 
     /// Canonical serialization of the chainbase static `global_property_object`

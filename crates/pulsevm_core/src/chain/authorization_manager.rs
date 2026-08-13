@@ -53,18 +53,19 @@ impl AuthorizationManager {
         provided_delay: Microseconds,
         satisfied_authorizations: &BTreeSet<PermissionLevel>,
     ) -> Result<(), ChainError> {
+        // Config served as owned values (arena when off chainbase), so no config
+        // object is held across the pass.
+        let chain_config = db.chain_config()?;
         // Single read view for the whole (read-only) authorization pass: every
         // chainbase reference below is bound to this guard and cannot escape it.
         let r = db.read()?;
-        let global_properties = r.get_global_properties()?;
-        let chain_config = global_properties.get_chain_config();
-        let delay_max_limit = seconds(chain_config.get_max_transaction_delay() as i64);
+        let delay_max_limit = seconds(chain_config.max_transaction_delay as i64);
         let effective_provided_delay = if provided_delay >= delay_max_limit {
             Microseconds::maximum()
         } else {
             provided_delay
         };
-        let max_authority_depth = chain_config.get_max_authority_depth();
+        let max_authority_depth = chain_config.max_authority_depth;
         let mut permissions_to_satisfy = BTreeSet::<PermissionLevel>::new();
         let mut authority_checker = AuthorityChecker::new(
             max_authority_depth,
@@ -161,12 +162,11 @@ impl AuthorizationManager {
         allow_unused_keys: bool,
     ) -> Result<(), ChainError> {
         let auth = Authority::new_from_permission_level(&permission);
+        let chain_config = db.chain_config()?;
         let r = db.read()?;
-        let global_properties = r.get_global_properties()?;
-        let chain_config = global_properties.get_chain_config();
-        let delay_max_limit = seconds(chain_config.get_max_transaction_delay() as i64);
+        let delay_max_limit = seconds(chain_config.max_transaction_delay as i64);
         let mut authority_checker = AuthorityChecker::new(
-            chain_config.get_max_authority_depth(),
+            chain_config.max_authority_depth,
             provided_keys,
             provided_permissions,
             if provided_delay >= delay_max_limit {
@@ -199,12 +199,11 @@ impl AuthorizationManager {
         candidate_keys: &BTreeSet<PublicKey>,
         provided_delay: Microseconds,
     ) -> Result<BTreeSet<PublicKey>, ChainError> {
+        let chain_config = db.chain_config()?;
         let r = db.read()?;
-        let global_properties = r.get_global_properties()?;
-        let chain_config = global_properties.get_chain_config();
         let provided_permissions = BTreeSet::<PermissionLevel>::new();
         let mut authority_checker = AuthorityChecker::new(
-            chain_config.get_max_authority_depth(),
+            chain_config.max_authority_depth,
             candidate_keys,
             &provided_permissions,
             provided_delay,

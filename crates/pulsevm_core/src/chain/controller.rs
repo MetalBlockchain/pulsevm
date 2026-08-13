@@ -1319,14 +1319,13 @@ impl Controller {
     fn block_elastic_parameters(
         &self,
     ) -> Result<(ElasticLimitParameters, ElasticLimitParameters), ChainError> {
-        let r = self.db.read()?;
-        let chain_config = r.get_global_properties()?.get_chain_config();
+        let chain_config = self.db.chain_config()?;
         let cpu_elastic_parameters = ElasticLimitParameters::new(
             eos_percent(
-                chain_config.get_max_block_cpu_usage() as u64,
-                chain_config.get_target_block_cpu_usage_pct(),
+                chain_config.max_block_cpu_usage as u64,
+                chain_config.target_block_cpu_usage_pct,
             ),
-            chain_config.get_max_block_cpu_usage() as u64,
+            chain_config.max_block_cpu_usage as u64,
             BLOCK_CPU_USAGE_AVERAGE_WINDOW_MS / BLOCK_INTERVAL_MS,
             MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER,
             make_ratio(99, 100),
@@ -1334,10 +1333,10 @@ impl Controller {
         );
         let net_elastic_parameters = ElasticLimitParameters::new(
             eos_percent(
-                chain_config.get_max_block_net_usage() as u64,
-                chain_config.get_target_block_net_usage_pct(),
+                chain_config.max_block_net_usage,
+                chain_config.target_block_net_usage_pct,
             ),
-            chain_config.get_max_block_net_usage() as u64,
+            chain_config.max_block_net_usage,
             BLOCK_SIZE_AVERAGE_WINDOW_MS / BLOCK_INTERVAL_MS,
             MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER,
             make_ratio(99, 100),

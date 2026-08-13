@@ -211,27 +211,23 @@ impl TransactionContext {
         inner.net_limit = self.db.get_block_net_limit()?;
 
         let net_usage_leeway = {
-            let r = self.db.read()?;
-            let cfg = r.get_global_properties()?;
+            let cfg = self.db.chain_config()?;
 
             // Possibly lower net_limit to the maximum net usage a transaction is allowed to be
             // billed
-            if cfg.get_chain_config().get_max_transaction_net_usage() as u64 <= inner.net_limit {
-                inner.net_limit = cfg.get_chain_config().get_max_transaction_net_usage() as u64;
+            if cfg.max_transaction_net_usage as u64 <= inner.net_limit {
+                inner.net_limit = cfg.max_transaction_net_usage as u64;
                 inner.net_limit_due_to_block = false;
             }
 
             // Possibly lower cpu_limit to the maximum cpu usage a transaction is allowed to be
             // billed
-            if inner.is_input
-                && cfg.get_chain_config().get_max_transaction_cpu_usage() as u64
-                    <= inner.cpu_limit as u64
-            {
-                inner.cpu_limit = cfg.get_chain_config().get_max_transaction_cpu_usage() as i64;
+            if inner.is_input && cfg.max_transaction_cpu_usage as u64 <= inner.cpu_limit as u64 {
+                inner.cpu_limit = cfg.max_transaction_cpu_usage as i64;
                 inner.cpu_limit_due_to_block = false;
             }
 
-            cfg.get_chain_config().get_net_usage_leeway() as u64
+            cfg.net_usage_leeway as u64
         };
 
         let trx = self.packed_transaction.get_transaction();
@@ -306,25 +302,20 @@ impl TransactionContext {
         transaction: &Transaction,
     ) -> Result<(), ChainError> {
         let mut discounted_size_for_pruned_data = packed_trx_prunable_size;
-        // Copy the needed chain-config values out under a short read guard rather
-        // than holding a reference into the database.
-        let (cf_discount_num, cf_discount_den, base_per_transaction_net_usage) = {
-            let r = self.db.read()?;
-            let chain_config = r.get_global_properties()?.get_chain_config();
-            (
-                chain_config.get_context_free_discount_net_usage_num(),
-                chain_config.get_context_free_discount_net_usage_den(),
-                chain_config.get_base_per_transaction_net_usage(),
-            )
-        };
-        if cf_discount_den > 0 && cf_discount_num < cf_discount_den {
-            discounted_size_for_pruned_data *= cf_discount_num as u64;
-            discounted_size_for_pruned_data =
-                (discounted_size_for_pruned_data + cf_discount_den as u64 - 1)
-                    / cf_discount_den as u64; // rounds up
+        let chain_config = self.db.chain_config()?;
+        if chain_config.context_free_discount_net_usage_den > 0
+            && chain_config.context_free_discount_net_usage_num
+                < chain_config.context_free_discount_net_usage_den
+        {
+            discounted_size_for_pruned_data *=
+                chain_config.context_free_discount_net_usage_num as u64;
+            discounted_size_for_pruned_data = (discounted_size_for_pruned_data
+                + chain_config.context_free_discount_net_usage_den as u64
+                - 1)
+                / chain_config.context_free_discount_net_usage_den as u64; // rounds up
         }
 
-        let initial_net_usage: u64 = (base_per_transaction_net_usage as u64)
+        let initial_net_usage: u64 = (chain_config.base_per_transaction_net_usage as u64)
             + packed_trx_unprunable_size
             + discounted_size_for_pruned_data;
         let first_authorizer = transaction.first_authorizer();
@@ -345,17 +336,10 @@ impl TransactionContext {
     // so we skip expiration/authorization/net accounting entirely.
     pub fn init_for_implicit_trx(&mut self, transaction: &Transaction) -> Result<(), ChainError> {
         {
-            // Copy the floor out before taking the inner write lock so the db read
-            // guard isn't held across it.
-            let min_transaction_cpu_usage = {
-                let r = self.db.read()?;
-                r.get_global_properties()?
-                    .get_chain_config()
-                    .get_min_transaction_cpu_usage()
-            };
+            let min_cpu = self.db.chain_config()?.min_transaction_cpu_usage;
             let mut inner = self.inner.write()?;
             inner.explicit_billed_cpu_time = true;
-            inner.explicit_cpu_us = min_transaction_cpu_usage;
+            inner.explicit_cpu_us = min_cpu;
             inner.cpu_limit = -1;
         }
         self.init(0, transaction.first_authorizer(), false)
@@ -823,8 +807,7 @@ impl TransactionContext {
         let inner = self.inner.read()?;
         let expiration: TimePoint = trx.header.expiration().into();
         let pending_block_timestamp: TimePoint = inner.pending_block_timestamp.into();
-        let r = self.db.read()?;
-        let gpo = r.get_global_properties()?;
+        let max_transaction_lifetime = self.db.chain_config()?.max_transaction_lifetime;
 
         if expiration < pending_block_timestamp {
             return Err(ChainError::TransactionError(
@@ -832,10 +815,7 @@ impl TransactionContext {
             ));
         }
 
-        if expiration
-            > pending_block_timestamp
-                + seconds(gpo.get_chain_config().get_max_transaction_lifetime() as i64)
-        {
+        if expiration > pending_block_timestamp + seconds(max_transaction_lifetime as i64) {
             return Err(ChainError::TransactionError(
                 "transaction has too long lifetime".to_string(),
             ));
@@ -975,15 +955,12 @@ impl TransactionContext {
         check_minimum: bool,
     ) -> Result<(), ChainError> {
         if check_minimum {
-            let r = db.read()?;
-            let cfg = r.get_global_properties()?;
+            let min_cpu = db.chain_config()?.min_transaction_cpu_usage;
 
-            if inner.trace.receipt.cpu_usage_us
-                < cfg.get_chain_config().get_min_transaction_cpu_usage()
-            {
+            if inner.trace.receipt.cpu_usage_us < min_cpu {
                 return Err(ChainError::TransactionError(format!(
                     "cannot bill CPU time less than the minimum of {}",
-                    cfg.get_chain_config().get_min_transaction_cpu_usage()
+                    min_cpu
                 )));
             }
         }
@@ -1000,13 +977,9 @@ impl TransactionContext {
             return Ok(());
         }
 
-        let r = db.read()?;
-        let cfg = r.get_global_properties()?;
+        let min_cpu = db.chain_config()?.min_transaction_cpu_usage;
 
-        inner.trace.receipt.cpu_usage_us = std::cmp::max(
-            inner.trace.receipt.cpu_usage_us,
-            cfg.get_chain_config().get_min_transaction_cpu_usage(),
-        );
+        inner.trace.receipt.cpu_usage_us = std::cmp::max(inner.trace.receipt.cpu_usage_us, min_cpu);
 
         Ok(())
     }

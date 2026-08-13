@@ -201,11 +201,10 @@ impl ApplyContext {
         };
 
         if inline_actions.len() > 0 || context_free_inline_actions.len() > 0 {
-            let r = self.db.read()?;
-            let gpo = r.get_global_properties()?;
+            let max_inline_action_depth = self.db.chain_config()?.max_inline_action_depth;
 
             pulse_assert(
-                recurse_depth < gpo.get_chain_config().get_max_inline_action_depth() as u32,
+                recurse_depth < max_inline_action_depth as u32,
                 ChainError::TransactionError(
                     "max inline action depth per transaction reached".to_string(),
                 ),

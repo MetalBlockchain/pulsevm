@@ -2926,6 +2926,33 @@ impl ArenaShadow {
         Ok(())
     }
 
+    /// The mirrored `chain_config` as owned params, or `None` if the singleton
+    /// has not been seeded. Serves the per-tx/per-block config reads (elastic
+    /// block params, tx net/cpu limits, delays, action depths) off the arena so
+    /// execution needs no chainbase `global_property_object`.
+    pub fn chain_config_params(&self) -> Option<ChainConfigParams> {
+        let db = self.lock();
+        let r = db.table::<GlobalPropertyRow>().ok()?.iter().next()?;
+        Some(ChainConfigParams {
+            max_block_net_usage: r.max_block_net_usage,
+            target_block_net_usage_pct: r.target_block_net_usage_pct,
+            max_transaction_net_usage: r.max_transaction_net_usage,
+            base_per_transaction_net_usage: r.base_per_transaction_net_usage,
+            net_usage_leeway: r.net_usage_leeway,
+            context_free_discount_net_usage_num: r.context_free_discount_net_usage_num,
+            context_free_discount_net_usage_den: r.context_free_discount_net_usage_den,
+            max_block_cpu_usage: r.max_block_cpu_usage,
+            target_block_cpu_usage_pct: r.target_block_cpu_usage_pct,
+            max_transaction_cpu_usage: r.max_transaction_cpu_usage,
+            min_transaction_cpu_usage: r.min_transaction_cpu_usage,
+            max_transaction_lifetime: r.max_transaction_lifetime,
+            max_transaction_delay: r.max_transaction_delay,
+            max_inline_action_size: r.max_inline_action_size,
+            max_inline_action_depth: r.max_inline_action_depth,
+            max_authority_depth: r.max_authority_depth,
+        })
+    }
+
     /// Canonical serialization of the mirrored `chain_config` (16 fields, little
     /// endian, `ChainConfigV0` order), or empty when the singleton has not been
     /// seeded — byte-compatible with the chainbase `global_property_state_bytes`.
