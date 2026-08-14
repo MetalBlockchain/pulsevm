@@ -4652,25 +4652,42 @@ mod tests {
         let parse = |s: &str| -> serde_json::Value { serde_json::from_str(s).expect("json") };
 
         let mut checked = 0u64;
+        let mut mismatches = 0u64;
         let mut by_kind: std::collections::BTreeMap<String, u64> =
             std::collections::BTreeMap::new();
         for r in &records {
             let kind = r["kind"].as_str().unwrap();
             let expected = r.get("output").map(|o| parse(o.as_str().unwrap()));
             let got = match kind {
-                "table_rows_json" => Some(db.rpc_get_table_rows(
+                "table_rows_json" => Some(db.get_table_rows(
                     true,
                     as_u64(r, "code"),
-                    as_u64(r, "scope"),
+                    &as_u64(r, "scope").to_string(),
                     as_u64(r, "table"),
+                    "",
+                    "",
+                    "",
                     100,
+                    "i64",
+                    "1",
+                    "dec",
+                    false,
+                    true,
                 )?),
-                "table_rows_raw" => Some(db.rpc_get_table_rows(
+                "table_rows_raw" => Some(db.get_table_rows(
                     false,
                     as_u64(r, "code"),
-                    as_u64(r, "scope"),
+                    &as_u64(r, "scope").to_string(),
                     as_u64(r, "table"),
+                    "",
+                    "",
+                    "",
                     100,
+                    "i64",
+                    "1",
+                    "dec",
+                    false,
+                    true,
                 )?),
                 "currency_balance" => {
                     Some(db.rpc_get_currency_balance(as_u64(r, "code"), as_u64(r, "account"))?)
@@ -4681,19 +4698,40 @@ mod tests {
                 "table_by_scope" => {
                     Some(db.rpc_get_table_by_scope(as_u64(r, "code"), as_u64(r, "table"), 100)?)
                 }
+                "account_info" => {
+                    let out = expected.as_ref().unwrap();
+                    let head_num = out["head_block_num"].as_u64().unwrap() as u32;
+                    Some(db.get_account_info_without_core_symbol(
+                        as_u64(r, "account"),
+                        head_num,
+                        &controller.last_accepted_block().timestamp().to_time_point(),
+                    )?)
+                }
                 _ => None,
             };
             if let (Some(got), Some(expected)) = (got, expected) {
                 let got = parse(&got);
-                assert_eq!(
-                    got, expected,
-                    "RPC {kind} mismatch for {r}\n got:  {got}\n want: {expected}"
-                );
+                if got != expected {
+                    mismatches += 1;
+                    eprintln!("RPC {kind} mismatch:");
+                    match (got.as_object(), expected.as_object()) {
+                        (Some(g), Some(w)) => {
+                            for (k, wv) in w {
+                                if g.get(k) != Some(wv) {
+                                    eprintln!("  field {k}: got {:?} want {wv}", g.get(k));
+                                }
+                            }
+                        }
+                        _ => eprintln!("  got {got}\n  want {expected}"),
+                    }
+                    continue;
+                }
                 checked += 1;
                 *by_kind.entry(kind.to_string()).or_default() += 1;
             }
         }
         assert!(checked > 0, "verified no RPC records");
+        assert_eq!(mismatches, 0, "{mismatches} RPC formatter outputs diverged");
         eprintln!("RPC verify: {checked} arena formatter outputs match the C++ golden {by_kind:?}");
         Ok(())
     }

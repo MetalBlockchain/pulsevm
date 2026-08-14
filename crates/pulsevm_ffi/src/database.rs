@@ -416,6 +416,133 @@ fn symbol_code_from_str(s: &str) -> u64 {
     raw
 }
 
+/// fc's `block_timestamp` epoch (2000-01-01T00:00:00) in microseconds.
+const BLOCK_TIMESTAMP_EPOCH_MICROS: i64 = 946_684_800_000_000;
+
+/// A `block_timestamp` slot (500ms since the epoch) to fc microseconds — the
+/// account creation date the RPC formatter renders.
+fn block_slot_to_micros(slot: u32) -> i64 {
+    BLOCK_TIMESTAMP_EPOCH_MICROS + slot as i64 * 500_000
+}
+
+/// An fc time point to its containing 500ms block-timestamp slot.
+fn micros_to_block_slot(micros: i64) -> u32 {
+    micros
+        .saturating_sub(BLOCK_TIMESTAMP_EPOCH_MICROS)
+        .div_euclid(500_000)
+        .clamp(0, u32::MAX as i64) as u32
+}
+
+/// Parse a symbol string (`"4,SYS"`, or a bare code) to its packed form
+/// (precision in the low byte, ASCII code above). Used only when the RPC caller
+/// supplies an expected core symbol.
+fn symbol_from_str(s: &str) -> Option<u64> {
+    let (precision, code) = match s.split_once(',') {
+        Some((p, c)) => (p.trim().parse::<u64>().ok()?, c.trim()),
+        None => (0, s.trim()),
+    };
+    Some((symbol_code_from_str(code) << 8) | (precision & 0xff))
+}
+
+/// C++ `convert_to_type<uint64_t>` compatibility for RPC scopes and i64 keys:
+/// decimal first, then an EOSIO name, then a symbol (with optional precision).
+fn rpc_u64(s: &str, description: &str) -> Result<u64, ChainError> {
+    use std::str::FromStr;
+
+    if let Ok(value) = s.parse::<u64>() {
+        return Ok(value);
+    }
+    if let Ok(name) = Name::from_str(s.trim()) {
+        return Ok(name.as_u64());
+    }
+    let symbol = if s.contains(',') {
+        symbol_from_str(s)
+    } else {
+        // `string_to_symbol(0, s) >> 8` returns the bare symbol_code.
+        Some(symbol_code_from_str(s))
+    };
+    symbol.ok_or_else(|| {
+        ChainError::InternalError(format!("could not convert {description} {s:?} to uint64"))
+    })
+}
+
+fn rpc_bound(s: &str, key_type: &str, description: &str) -> Result<u64, ChainError> {
+    if key_type == "name" {
+        name_u64(s)
+    } else {
+        rpc_u64(s, description)
+    }
+}
+
+/// Return `(primary, physical index table)`, matching nodeos' accepted numeric
+/// and ordinal spellings for `index_position`.
+fn rpc_table_index(table: u64, position: &str) -> Result<(bool, u64), ChainError> {
+    if table & 0x0f != 0 {
+        return Err(ChainError::InternalError(format!(
+            "unsupported table name {}",
+            Name::new(table)
+        )));
+    }
+    let primary = position.is_empty()
+        || matches!(position, "first" | "primary" | "one")
+        || position.parse::<u64>().is_ok_and(|p| p < 2);
+    if primary {
+        return Ok((true, table));
+    }
+    let pos = if position.starts_with("sec") || position == "two" {
+        0
+    } else if position.starts_with("ter") || position.starts_with("th") {
+        1
+    } else if position.starts_with("fou") {
+        2
+    } else if position.starts_with("fi") {
+        3
+    } else if position.starts_with("six") {
+        4
+    } else if position.starts_with("sev") {
+        5
+    } else if position.starts_with("eig") {
+        6
+    } else if position.starts_with("nin") {
+        7
+    } else if position.starts_with("ten") {
+        8
+    } else {
+        position.parse::<u64>().map_err(|_| {
+            ChainError::InternalError(format!("invalid index_position {position:?}"))
+        })? - 2
+    };
+    Ok((false, table | (pos & 0x0f)))
+}
+
+type RpcPositionedRow = (u64, u64, Vec<u8>);
+
+/// Apply the common inclusive-bound, direction, and pagination rules after a
+/// primary or secondary index has produced rows in ascending key order.
+fn rpc_table_page(
+    rows: impl IntoIterator<Item = RpcPositionedRow>,
+    lower: u64,
+    upper: u64,
+    reverse: bool,
+    limit: u32,
+) -> (Vec<RpcPositionedRow>, bool, String) {
+    let mut rows: Vec<_> = rows
+        .into_iter()
+        .filter(|(key, _, _)| *key >= lower && *key <= upper)
+        .collect();
+    if reverse {
+        rows.reverse();
+    }
+    let limit = limit.min(1000) as usize;
+    let more = rows.len() > limit;
+    let next_key = rows
+        .get(limit)
+        .map(|(key, _, _)| key.to_string())
+        .unwrap_or_default();
+    rows.truncate(limit);
+    (rows, more, next_key)
+}
+
 /// Reconstructs an [`Authority`] from the blob [`encode_authority`] produced and
 /// the arena stored — the exact inverse, so `decode_authority(encode_authority(a))`
 /// round-trips. This is what lets the arena serve the *whole* authority (not just
@@ -762,6 +889,24 @@ impl Database {
         decode_authority(&blob).ok()
     }
 
+    /// Every permission of `owner` as `(perm_name, parent_perm_name, authority)`
+    /// in `(owner, perm_name)` order, for the RPC account formatter. Empty when
+    /// shadowing is off.
+    #[cfg(feature = "arena-shadow")]
+    pub fn arena_permissions_of(&self, owner: u64) -> Vec<(u64, u64, Authority)> {
+        let Some(s) = self.shadow.as_ref() else {
+            return Vec::new();
+        };
+        s.permissions_of(owner)
+            .into_iter()
+            .filter_map(|(perm_name, parent_name, blob)| {
+                decode_authority(&blob)
+                    .ok()
+                    .map(|auth| (perm_name, parent_name, auth))
+            })
+            .collect()
+    }
+
     /// Required permission of the mirrored permission_link for `(account, code,
     /// message_type)`, or `None` when shadowing is off / the link is absent — for
     /// diffing against chainbase's `find_permission_link`.
@@ -809,6 +954,28 @@ impl Database {
             self.shadow
                 .as_ref()
                 .map(|s| s.table_range_with_payer(code, scope, table))
+                .unwrap_or_default()
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = (code, scope, table);
+            Vec::new()
+        }
+    }
+
+    /// An idx64 table's rows as `(secondary_key, primary_key, payer)`, ordered
+    /// by secondary then primary. Empty when shadowing is off.
+    pub fn arena_idx64_range_with_payer(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+    ) -> Vec<(u64, u64, u64)> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow
+                .as_ref()
+                .map(|s| s.idx64_range_with_payer(code, scope, table))
                 .unwrap_or_default()
         }
         #[cfg(not(feature = "arena-shadow"))]
@@ -3116,6 +3283,7 @@ impl Database {
                     new_code,
                     digest_to_array(code_hash),
                     head_block_num,
+                    pending_block_time.time_since_epoch().count(),
                     vm_type,
                     vm_version,
                 )
@@ -3155,6 +3323,7 @@ impl Database {
                 new_code,
                 hash,
                 head_block_num,
+                pending_block_time.time_since_epoch().count(),
                 vm_type,
                 vm_version,
             ) {
@@ -6741,25 +6910,67 @@ impl Database {
         reverse: bool,
         show_payer: bool,
     ) -> Result<String, ChainError> {
-        let guard = self.locked_read()?;
-
-        get_table_rows(
-            guard.as_ref().unwrap(),
-            json,
-            code,
-            scope,
-            table,
-            table_key,
-            lower_bound,
-            upper_bound,
-            limit,
-            key_type,
-            index_position,
-            encode_type,
-            reverse,
-            show_payer,
-        )
-        .map_err(|e| ChainError::InternalError(format!("{}", e)))
+        #[cfg(feature = "arena-shadow")]
+        if self.arena_standalone_reads() {
+            return self.rpc_get_table_rows(
+                json,
+                code,
+                scope,
+                table,
+                lower_bound,
+                upper_bound,
+                limit,
+                key_type,
+                index_position,
+                reverse,
+                show_payer,
+            );
+        }
+        let chainbase = {
+            let guard = self.locked_read()?;
+            get_table_rows(
+                guard.as_ref().unwrap(),
+                json,
+                code,
+                scope,
+                table,
+                table_key,
+                lower_bound,
+                upper_bound,
+                limit,
+                key_type,
+                index_position,
+                encode_type,
+                reverse,
+                show_payer,
+            )
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))?
+        };
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow {
+            let arena = self.rpc_get_table_rows(
+                json,
+                code,
+                scope,
+                table,
+                lower_bound,
+                upper_bound,
+                limit,
+                key_type,
+                index_position,
+                reverse,
+                show_payer,
+            );
+            let matches = arena.as_ref().ok().is_some_and(|value| {
+                serde_json::from_str::<serde_json::Value>(value).ok()
+                    == serde_json::from_str::<serde_json::Value>(&chainbase).ok()
+            });
+            s.note_noncontract(matches);
+            if s.reads_enabled() {
+                return arena;
+            }
+        }
+        Ok(chainbase)
     }
 
     pub fn get_account_info_without_core_symbol(
@@ -6768,15 +6979,43 @@ impl Database {
         head_block_num: u32,
         head_block_time: &TimePoint,
     ) -> Result<String, ChainError> {
-        let guard = self.locked_read()?;
-
-        get_account_info_without_core_symbol(
-            guard.as_ref().unwrap(),
-            account,
-            head_block_num,
-            &cxx_time_point(head_block_time),
-        )
-        .map_err(|e| ChainError::InternalError(format!("{}", e)))
+        #[cfg(feature = "arena-shadow")]
+        if self.arena_standalone_reads() {
+            return self.rpc_get_account_info(
+                account,
+                head_block_num,
+                head_block_time.time_since_epoch().count(),
+                None,
+            );
+        }
+        let chainbase = {
+            let guard = self.locked_read()?;
+            get_account_info_without_core_symbol(
+                guard.as_ref().unwrap(),
+                account,
+                head_block_num,
+                &cxx_time_point(head_block_time),
+            )
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))?
+        };
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow {
+            let arena = self.rpc_get_account_info(
+                account,
+                head_block_num,
+                head_block_time.time_since_epoch().count(),
+                None,
+            );
+            let matches = arena.as_ref().ok().is_some_and(|value| {
+                serde_json::from_str::<serde_json::Value>(value).ok()
+                    == serde_json::from_str::<serde_json::Value>(&chainbase).ok()
+            });
+            s.note_noncontract(matches);
+            if s.reads_enabled() {
+                return arena;
+            }
+        }
+        Ok(chainbase)
     }
 
     pub fn get_account_info_with_core_symbol(
@@ -6786,16 +7025,44 @@ impl Database {
         head_block_num: u32,
         head_block_time: &TimePoint,
     ) -> Result<String, ChainError> {
-        let guard = self.locked_read()?;
-
-        get_account_info_with_core_symbol(
-            guard.as_ref().unwrap(),
-            account,
-            expected_core_symbol,
-            head_block_num,
-            &cxx_time_point(head_block_time),
-        )
-        .map_err(|e| ChainError::InternalError(format!("{}", e)))
+        #[cfg(feature = "arena-shadow")]
+        if self.arena_standalone_reads() {
+            return self.rpc_get_account_info(
+                account,
+                head_block_num,
+                head_block_time.time_since_epoch().count(),
+                Some(expected_core_symbol),
+            );
+        }
+        let chainbase = {
+            let guard = self.locked_read()?;
+            get_account_info_with_core_symbol(
+                guard.as_ref().unwrap(),
+                account,
+                expected_core_symbol,
+                head_block_num,
+                &cxx_time_point(head_block_time),
+            )
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))?
+        };
+        #[cfg(feature = "arena-shadow")]
+        if let Some(s) = &self.shadow {
+            let arena = self.rpc_get_account_info(
+                account,
+                head_block_num,
+                head_block_time.time_since_epoch().count(),
+                Some(expected_core_symbol),
+            );
+            let matches = arena.as_ref().ok().is_some_and(|value| {
+                serde_json::from_str::<serde_json::Value>(value).ok()
+                    == serde_json::from_str::<serde_json::Value>(&chainbase).ok()
+            });
+            s.note_noncontract(matches);
+            if s.reads_enabled() {
+                return arena;
+            }
+        }
+        Ok(chainbase)
     }
 
     // ---- Arena-backed RPC formatters ----------------------------------------
@@ -6812,34 +7079,108 @@ impl Database {
         &self,
         json: bool,
         code: u64,
-        scope: u64,
+        scope: &str,
         table: u64,
+        lower_bound: &str,
+        upper_bound: &str,
         limit: u32,
+        key_type: &str,
+        index_position: &str,
+        reverse: bool,
+        show_payer: bool,
     ) -> Result<String, ChainError> {
-        let all = self.arena_table_range_with_payer(code, scope, table);
-        let more = all.len() > limit as usize;
-        let rows: Vec<pulsevm_rpc::TableRow> = all
+        let scope = rpc_u64(scope, "scope")?;
+        let (primary, index_table) = rpc_table_index(table, index_position)?;
+        if !primary && key_type.is_empty() {
+            return Err(ChainError::InternalError(
+                "key type required for non-primary index".into(),
+            ));
+        }
+        if !primary && !matches!(key_type, "i64" | "name") {
+            return Err(ChainError::InternalError(format!(
+                "unsupported secondary index type {key_type:?}"
+            )));
+        }
+
+        // C++ constructs and validates the ABI even for raw output and empty
+        // tables, including checking that the requested table is declared.
+        let abi_bytes = self.arena_account_abi_bytes(code).ok_or_else(|| {
+            ChainError::InternalError(format!(
+                "failed to retrieve account for {}",
+                Name::new(code)
+            ))
+        })?;
+        let abi = pulsevm_abi::Abi::from_bytes(&abi_bytes)
+            .map_err(|e| ChainError::InternalError(format!("abi decode: {e}")))?;
+        let row_type = abi.table_row_type(table).ok_or_else(|| {
+            ChainError::InternalError(format!(
+                "table {} is not specified in the ABI",
+                Name::new(table)
+            ))
+        })?;
+        if primary
+            && abi.table_index_type(table) != Some("i64")
+            && !matches!(key_type, "i64" | "name")
+        {
+            return Err(ChainError::InternalError(format!(
+                "invalid table index type {:?}",
+                abi.table_index_type(table)
+            )));
+        }
+
+        let lower = if lower_bound.is_empty() {
+            u64::MIN
+        } else {
+            rpc_bound(lower_bound, key_type, "lower_bound")?
+        };
+        let upper = if upper_bound.is_empty() {
+            u64::MAX
+        } else {
+            rpc_bound(upper_bound, key_type, "upper_bound")?
+        };
+        if upper < lower {
+            let value = pulsevm_rpc::format_table_rows(
+                json,
+                Some(&abi),
+                &row_type,
+                &[],
+                false,
+                "",
+                show_payer,
+            )
+            .map_err(|e| ChainError::InternalError(format!("format table_rows: {e}")))?;
+            return Ok(serde_json::to_string(&value).unwrap());
+        }
+
+        let positioned: Vec<RpcPositionedRow> = if primary {
+            self.arena_table_range_with_payer(code, scope, table)
+                .into_iter()
+                .collect()
+        } else {
+            self.arena_idx64_range_with_payer(code, scope, index_table)
+                .into_iter()
+                .filter_map(|(secondary, primary, payer)| {
+                    self.arena_kv_get(code, scope, table, primary)
+                        .map(|data| (secondary, payer, data))
+                })
+                .collect()
+        };
+        let (positioned, more, next_key) = rpc_table_page(positioned, lower, upper, reverse, limit);
+        let rows: Vec<pulsevm_rpc::TableRow> = positioned
             .into_iter()
-            .take(limit as usize)
-            .map(|(_pk, payer, value)| pulsevm_rpc::TableRow { payer, data: value })
+            .map(|(_, payer, data)| pulsevm_rpc::TableRow { payer, data })
             .collect();
 
-        let abi = if json {
-            let bytes = self.arena_account_abi_bytes(code).unwrap_or_default();
-            Some(
-                pulsevm_abi::Abi::from_bytes(&bytes)
-                    .map_err(|e| ChainError::InternalError(format!("abi decode: {e}")))?,
-            )
-        } else {
-            None
-        };
-        let row_type = abi
-            .as_ref()
-            .and_then(|a| a.table_row_type(table))
-            .unwrap_or_default();
-
-        let value = pulsevm_rpc::format_table_rows(json, abi.as_ref(), &row_type, &rows, more, "")
-            .map_err(|e| ChainError::InternalError(format!("format table_rows: {e}")))?;
+        let value = pulsevm_rpc::format_table_rows(
+            json,
+            Some(&abi),
+            &row_type,
+            &rows,
+            more,
+            &next_key,
+            show_payer,
+        )
+        .map_err(|e| ChainError::InternalError(format!("format table_rows: {e}")))?;
         Ok(serde_json::to_string(&value).unwrap())
     }
 
@@ -6902,6 +7243,232 @@ impl Database {
         rows.truncate(limit as usize);
         let value = pulsevm_rpc::format_table_by_scope(&rows, "");
         Ok(serde_json::to_string(&value).unwrap())
+    }
+
+    /// `get_account`: the account's metadata, permissions, core-token balance and
+    /// the system-contract sub-objects, composed from the arena. `expected_core_
+    /// symbol` overrides the auto-detected core symbol (`None` = detect it from
+    /// the system contract's rammarket).
+    #[cfg(feature = "arena-shadow")]
+    pub fn rpc_get_account_info(
+        &self,
+        account: u64,
+        head_block_num: u32,
+        head_block_time_micros: i64,
+        expected_core_symbol: Option<&str>,
+    ) -> Result<String, ChainError> {
+        use pulsevm_rpc::{
+            AccountInfo,
+            KeyWeight,
+            LinkedAction,
+            Permission,
+            PermissionLevelWeight,
+            ResourceLimit,
+            WaitWeight,
+        };
+
+        let created_slot = self.arena_account_creation_date(account).ok_or_else(|| {
+            ChainError::InternalError(format!("account not found for get_account: {account}"))
+        })?;
+        let privileged = self
+            .arena_account_metadata_privileged(account)
+            .unwrap_or(false);
+        let last_code_update = self.arena_account_last_code_update(account).unwrap_or(0);
+        let created = block_slot_to_micros(created_slot);
+        let ram_usage = self
+            .arena_account_ram_usage(account)
+            .map(|u| u as i64)
+            .unwrap_or(0);
+        let (ram_quota, net_weight, cpu_weight) =
+            self.arena_account_limits(account).unwrap_or((-1, -1, -1));
+
+        // Resource windows come wholly from the arena and project `current_used`
+        // to the head-block slot. A never-used accumulator (slot 0) is reported
+        // at the account creation time, matching nodeos.
+        let usage_time = |slot: u32| {
+            if slot == 0 {
+                created
+            } else {
+                block_slot_to_micros(slot)
+            }
+        };
+        let to_rpc_limit = |limit: pulsevm_chaindb::AccountResourceLimit| ResourceLimit {
+            used: limit.used,
+            available: limit.available,
+            max: limit.max,
+            last_usage_update_time: usage_time(limit.last_ordinal),
+            current_used: limit.current_used,
+        };
+        let current_slot = micros_to_block_slot(head_block_time_micros);
+        let default_limit = pulsevm_chaindb::AccountResourceLimit {
+            used: -1,
+            available: -1,
+            max: -1,
+            last_ordinal: 0,
+            current_used: -1,
+        };
+        let (net_limit, cpu_limit) = match self.shadow.as_ref() {
+            Some(s) => (
+                s.account_net_limit_info(account, 1000, Some(current_slot))
+                    .map(|v| v.0)
+                    .unwrap_or(default_limit),
+                s.account_cpu_limit_info(account, 1000, Some(current_slot))
+                    .map(|v| v.0)
+                    .unwrap_or(default_limit),
+            ),
+            None => (default_limit, default_limit),
+        };
+        let net_limit = to_rpc_limit(net_limit);
+        let cpu_limit = to_rpc_limit(cpu_limit);
+
+        let mut links_by_permission: std::collections::BTreeMap<u64, Vec<LinkedAction>> = self
+            .shadow
+            .as_ref()
+            .map(|s| s.permission_links_of(account))
+            .unwrap_or_default()
+            .into_iter()
+            .fold(
+                std::collections::BTreeMap::new(),
+                |mut links, (required, code, action)| {
+                    links.entry(required).or_default().push(LinkedAction {
+                        account: code,
+                        action: (action != 0).then_some(action),
+                    });
+                    links
+                },
+            );
+        let permissions = self
+            .arena_permissions_of(account)
+            .into_iter()
+            .map(|(perm_name, parent, auth)| Permission {
+                perm_name,
+                parent,
+                required_auth: pulsevm_rpc::Authority {
+                    threshold: auth.threshold,
+                    keys: auth
+                        .keys
+                        .iter()
+                        .map(|k| KeyWeight {
+                            key: k.key.to_string(),
+                            weight: k.weight,
+                        })
+                        .collect(),
+                    accounts: auth
+                        .accounts
+                        .iter()
+                        .map(|a| PermissionLevelWeight {
+                            actor: a.permission.actor,
+                            permission: a.permission.permission,
+                            weight: a.weight,
+                        })
+                        .collect(),
+                    waits: auth
+                        .waits
+                        .iter()
+                        .map(|w| WaitWeight {
+                            wait_sec: w.wait_sec,
+                            weight: w.weight,
+                        })
+                        .collect(),
+                },
+                linked_actions: links_by_permission.remove(&perm_name).unwrap_or_default(),
+            })
+            .collect();
+
+        // Core-token liquid balance: the row keyed by the core symbol's code in
+        // the token contract's `accounts` table scoped to the account.
+        let core_symbol_packed =
+            match expected_core_symbol {
+                Some(s) => Some(symbol_from_str(s).ok_or_else(|| {
+                    ChainError::InternalError(format!("invalid core symbol: {s}"))
+                })?),
+                None => self.extract_core_symbol(),
+            };
+        let core_liquid_balance = core_symbol_packed.and_then(|sym| {
+            let token = name_u64("pulse.token").ok()?;
+            let accounts = name_u64("accounts").ok()?;
+            let row = self.arena_kv_get(token, account, accounts, sym >> 8)?;
+            if row.len() < 16 || u64::from_le_bytes(row[8..16].try_into().ok()?) != sym {
+                return None;
+            }
+            let arr = pulsevm_rpc::format_currency_balance(&[row]).ok()?;
+            arr.as_array()?.first()?.as_str().map(|s| s.to_string())
+        });
+
+        // System-contract sub-objects, decoded against the system contract's ABI.
+        let system = name_u64("pulse")?;
+        let system_abi = self
+            .arena_account_abi_bytes(system)
+            .and_then(|b| pulsevm_abi::Abi::from_bytes(&b).ok());
+        let decode_row = |scope: u64, table: &str, ty: &str| -> serde_json::Value {
+            let Some(abi) = system_abi.as_ref() else {
+                return serde_json::Value::Null;
+            };
+            let Ok(table) = name_u64(table) else {
+                return serde_json::Value::Null;
+            };
+            match self.arena_kv_get(system, scope, table, account) {
+                Some(bytes) => abi
+                    .bin_to_json(ty, &mut &bytes[..])
+                    .unwrap_or(serde_json::Value::Null),
+                None => serde_json::Value::Null,
+            }
+        };
+
+        let info = AccountInfo {
+            account_name: account,
+            head_block_num,
+            head_block_time: head_block_time_micros,
+            privileged,
+            last_code_update,
+            created,
+            core_liquid_balance,
+            ram_quota,
+            net_weight,
+            cpu_weight,
+            net_limit,
+            cpu_limit,
+            ram_usage,
+            permissions,
+            total_resources: serde_json::Value::Null,
+            self_delegated_bandwidth: decode_row(account, "delband", "DelegatedBandwidth"),
+            refund_request: decode_row(account, "refunds", "RefundRequest"),
+            voter_info: decode_row(system, "voters", "VoterInfo"),
+            rex_info: decode_row(system, "rexbal", "RexBalance"),
+            // A fixed default (fc's time_point epoch, 2000-01-01), matching nodeos.
+            subjective_cpu_bill_limit: ResourceLimit {
+                used: 0,
+                available: 0,
+                max: 0,
+                last_usage_update_time: BLOCK_TIMESTAMP_EPOCH_MICROS,
+                current_used: 0,
+            },
+            eosio_any_linked_actions: name_u64("pulse.any")
+                .ok()
+                .and_then(|any| links_by_permission.remove(&any))
+                .unwrap_or_default(),
+        };
+
+        Ok(serde_json::to_string(&pulsevm_rpc::format_account_info(&info)).unwrap())
+    }
+
+    /// The system contract's core symbol (precision in the low byte, code above),
+    /// read from its `rammarket` `RAMCORE` row. `None` if the market is absent.
+    #[cfg(feature = "arena-shadow")]
+    fn extract_core_symbol(&self) -> Option<u64> {
+        let system = name_u64("pulse").ok()?;
+        let rammarket = name_u64("rammarket").ok()?;
+        // The RAMCORE row's primary key is string_to_symbol(4, "RAMCORE").
+        let pk = (symbol_code_from_str("RAMCORE") << 8) | 4;
+        let bytes = self.arena_kv_get(system, system, rammarket, pk)?;
+        // ram_market_exchange_state: asset, asset, double, asset core_symbol,
+        // double — the core symbol sits in the third asset's symbol half (offset
+        // 16 + 16 + 8 amount = 40, symbol at 48).
+        if bytes.len() >= 56 {
+            Some(u64::from_le_bytes(bytes[48..56].try_into().ok()?))
+        } else {
+            None
+        }
     }
 
     pub fn pack_deltas(&self, full_snapshot: bool) -> Result<Vec<u8>, ChainError> {
@@ -7034,6 +7601,45 @@ mod tests {
 
     fn name_u64(s: &str) -> u64 {
         string_to_name(s).unwrap().to_uint64_t()
+    }
+
+    #[test]
+    fn rpc_table_page_matches_inclusive_cpp_pagination() {
+        let rows = [1u64, 2, 3, 4]
+            .into_iter()
+            .map(|key| (key, 9, vec![key as u8]));
+        let (page, more, next) = rpc_table_page(rows, 2, 4, false, 2);
+        assert_eq!(page.iter().map(|r| r.0).collect::<Vec<_>>(), [2, 3]);
+        assert!(more);
+        assert_eq!(next, "4");
+
+        let rows = [1u64, 2, 3, 4]
+            .into_iter()
+            .map(|key| (key, 9, vec![key as u8]));
+        let (page, more, next) = rpc_table_page(rows, 2, 4, true, 2);
+        assert_eq!(page.iter().map(|r| r.0).collect::<Vec<_>>(), [4, 3]);
+        assert!(more);
+        assert_eq!(next, "2");
+
+        let rows = [(7, 9, vec![])];
+        let (page, more, next) = rpc_table_page(rows, 0, u64::MAX, false, 0);
+        assert!(page.is_empty());
+        assert!(more);
+        assert_eq!(next, "7");
+    }
+
+    #[test]
+    fn rpc_table_key_parsing_matches_cpp_forms() {
+        assert_eq!(rpc_u64("42", "key").unwrap(), 42);
+        assert_eq!(rpc_u64("alice", "key").unwrap(), name_u64("alice"));
+        let eos = symbol_code_from_str("EOS");
+        assert_eq!(rpc_u64("EOS", "key").unwrap(), eos);
+        assert_eq!(rpc_u64("4,EOS", "key").unwrap(), (eos << 8) | 4);
+
+        let table = name_u64("accounts");
+        assert_eq!(rpc_table_index(table, "primary").unwrap(), (true, table));
+        assert_eq!(rpc_table_index(table, "2").unwrap(), (false, table));
+        assert_eq!(rpc_table_index(table, "third").unwrap(), (false, table | 1));
     }
 
     /// The arena reconstructs the whole authority from its stored blob: encoding

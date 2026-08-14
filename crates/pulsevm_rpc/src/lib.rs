@@ -66,6 +66,7 @@ pub fn format_table_rows(
     rows: &[TableRow],
     more: bool,
     next_key: &str,
+    show_payer: bool,
 ) -> Result<Value, RpcError> {
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
@@ -75,10 +76,14 @@ pub fn format_table_rows(
         } else {
             Value::String(hex::encode(&row.data))
         };
-        out.push(json!({
-            "data": data,
-            "payer": Name::new(row.payer).to_string(),
-        }));
+        if show_payer {
+            out.push(json!({
+                "data": data,
+                "payer": Name::new(row.payer).to_string(),
+            }));
+        } else {
+            out.push(data);
+        }
     }
 
     Ok(json!({
@@ -192,6 +197,13 @@ pub struct Permission {
     /// Parent permission name; the root (`owner`) has `0`, which prints as `""`.
     pub parent: u64,
     pub required_auth: Authority,
+    pub linked_actions: Vec<LinkedAction>,
+}
+
+pub struct LinkedAction {
+    pub account: u64,
+    /// An empty action name is represented by an absent fc optional.
+    pub action: Option<u64>,
 }
 
 /// A resource (net/cpu) usage window as `get_account` reports it.
@@ -231,24 +243,25 @@ pub struct AccountInfo {
     pub rex_info: Value,
     pub subjective_cpu_bill_limit: ResourceLimit,
     /// Actions linked to `eosio.any`; empty unless the caller fills it in.
-    pub eosio_any_linked_actions: Vec<Value>,
+    pub eosio_any_linked_actions: Vec<LinkedAction>,
 }
 
 /// `get_account`: assemble the full account response object.
 pub fn format_account_info(info: &AccountInfo) -> Value {
     let permissions: Vec<Value> = info.permissions.iter().map(format_permission).collect();
+    let eosio_any_linked_actions: Vec<Value> = info
+        .eosio_any_linked_actions
+        .iter()
+        .map(format_linked_action)
+        .collect();
 
-    json!({
+    let mut value = json!({
         "account_name": Name::new(info.account_name).to_string(),
         "head_block_num": info.head_block_num,
         "head_block_time": format_time_point_micros(info.head_block_time),
         "privileged": info.privileged,
         "last_code_update": format_time_point_micros(info.last_code_update),
         "created": format_time_point_micros(info.created),
-        "core_liquid_balance": match &info.core_liquid_balance {
-            Some(b) => Value::String(b.clone()),
-            None => Value::Null,
-        },
         "ram_quota": info.ram_quota,
         "net_weight": info.net_weight,
         "cpu_weight": info.cpu_weight,
@@ -262,8 +275,17 @@ pub fn format_account_info(info: &AccountInfo) -> Value {
         "voter_info": info.voter_info,
         "rex_info": info.rex_info,
         "subjective_cpu_bill_limit": format_resource_limit(&info.subjective_cpu_bill_limit),
-        "eosio_any_linked_actions": info.eosio_any_linked_actions,
-    })
+        "eosio_any_linked_actions": eosio_any_linked_actions,
+    });
+    // `core_liquid_balance` is an fc optional: nodeos omits the property when
+    // the token-contract row is absent instead of serializing it as null.
+    if let Some(balance) = &info.core_liquid_balance {
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("core_liquid_balance".into(), Value::String(balance.clone()));
+    }
+    value
 }
 
 fn format_permission(p: &Permission) -> Value {
@@ -303,18 +325,40 @@ fn format_permission(p: &Permission) -> Value {
             "accounts": accounts,
             "waits": waits,
         },
-        "linked_actions": [],
+        "linked_actions": p.linked_actions.iter().map(format_linked_action).collect::<Vec<_>>(),
     })
+}
+
+fn format_linked_action(link: &LinkedAction) -> Value {
+    let mut value = json!({
+        "account": Name::new(link.account).to_string(),
+    });
+    if let Some(action) = link.action {
+        value.as_object_mut().unwrap().insert(
+            "action".into(),
+            Value::String(Name::new(action).to_string()),
+        );
+    }
+    value
 }
 
 fn format_resource_limit(r: &ResourceLimit) -> Value {
     json!({
-        "used": r.used,
-        "available": r.available,
-        "max": r.max,
+        "used": json_i64(r.used),
+        "available": json_i64(r.available),
+        "max": json_i64(r.max),
         "last_usage_update_time": format_time_point_micros(r.last_usage_update_time),
-        "current_used": r.current_used,
+        "current_used": json_i64(r.current_used),
     })
+}
+
+/// fc quotes 64-bit values outside the int32 range in JSON.
+fn json_i64(value: i64) -> Value {
+    if value > i32::MAX as i64 || value < i32::MIN as i64 {
+        Value::String(value.to_string())
+    } else {
+        Value::Number(value.into())
+    }
 }
 
 /// Split a 16-byte `asset` into `(amount, packed_symbol)`.

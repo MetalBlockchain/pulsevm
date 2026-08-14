@@ -80,10 +80,17 @@ fn auth_links_link_and_unlink() {
     let s = db();
     // link_auth(account, code, message_type, required_permission)
     s.link_auth(1, 200, 300, 400).unwrap();
+    s.link_auth(1, 100, 500, 300).unwrap();
+    s.link_auth(2, 999, 999, 300).unwrap();
     assert_eq!(s.permission_link(1, 200, 300), Some(400));
+    assert_eq!(
+        s.permission_links_of(1),
+        vec![(300, 100, 500), (400, 200, 300)]
+    );
 
     s.unlink_auth(1, 200, 300).unwrap();
     assert_eq!(s.permission_link(1, 200, 300), None);
+    assert_eq!(s.permission_links_of(1), vec![(300, 100, 500)]);
 }
 
 #[test]

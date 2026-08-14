@@ -89,11 +89,11 @@ fn table_rows_match_golden() {
         let next_key = raw_out["next_key"].as_str().unwrap();
 
         let got_raw =
-            format_table_rows(false, Some(abi), &row_type, &rows, more, next_key).unwrap();
+            format_table_rows(false, Some(abi), &row_type, &rows, more, next_key, true).unwrap();
         assert_eq!(got_raw, raw_out, "raw rows for table {table}");
 
         let got_json =
-            format_table_rows(true, Some(abi), &row_type, &rows, more, next_key).unwrap();
+            format_table_rows(true, Some(abi), &row_type, &rows, more, next_key, true).unwrap();
         assert_eq!(
             got_json,
             output_value(json_rec),
@@ -108,6 +108,18 @@ fn table_rows_match_golden() {
     assert!(rows_checked > 0, "no rows were checked");
     // The golden pairs a raw+json record for every table it captures.
     assert_eq!(tables_checked, 26);
+}
+
+#[test]
+fn table_rows_without_payer_are_bare_values() {
+    let rows = [TableRow {
+        payer: name("alice"),
+        data: vec![0xde, 0xad],
+    }];
+    let got = format_table_rows(false, None, "", &rows, true, "7", false).unwrap();
+    assert_eq!(got["rows"], serde_json::json!(["dead"]));
+    assert_eq!(got["more"], true);
+    assert_eq!(got["next_key"], "7");
 }
 
 #[test]
@@ -282,11 +294,16 @@ fn account_info_shape() {
                 perm_name: name("active"),
                 parent: name("owner"),
                 required_auth: auth(),
+                linked_actions: vec![LinkedAction {
+                    account: name("pulse.token"),
+                    action: Some(name("transfer")),
+                }],
             },
             Permission {
                 perm_name: name("owner"),
                 parent: 0,
                 required_auth: auth(),
+                linked_actions: vec![],
             },
         ],
         total_resources: Value::Null,
@@ -301,7 +318,10 @@ fn account_info_shape() {
             last_usage_update_time: 946_684_800_000_000,
             current_used: 0,
         },
-        eosio_any_linked_actions: vec![],
+        eosio_any_linked_actions: vec![LinkedAction {
+            account: name("pulse"),
+            action: None,
+        }],
     };
 
     let unlimited_json = serde_json::json!({
@@ -311,7 +331,7 @@ fn account_info_shape() {
         "last_usage_update_time": "2026-08-05T10:20:27.000",
         "current_used": -1
     });
-    let perm = |name_: &str, parent: &str| {
+    let perm = |name_: &str, parent: &str, linked_actions: Value| {
         serde_json::json!({
             "perm_name": name_,
             "parent": parent,
@@ -321,7 +341,7 @@ fn account_info_shape() {
                 "accounts": [],
                 "waits": []
             },
-            "linked_actions": []
+            "linked_actions": linked_actions
         })
     };
 
@@ -339,7 +359,12 @@ fn account_info_shape() {
         "net_limit": unlimited_json,
         "cpu_limit": unlimited_json,
         "ram_usage": 817593,
-        "permissions": [perm("active", "owner"), perm("owner", "")],
+        "permissions": [
+            perm("active", "owner", serde_json::json!([{
+                "account": "pulse.token", "action": "transfer"
+            }])),
+            perm("owner", "", serde_json::json!([]))
+        ],
         "total_resources": Value::Null,
         "self_delegated_bandwidth": Value::Null,
         "refund_request": Value::Null,
@@ -352,8 +377,21 @@ fn account_info_shape() {
             "last_usage_update_time": "2000-01-01T00:00:00.000",
             "current_used": 0
         },
-        "eosio_any_linked_actions": []
+        "eosio_any_linked_actions": [{ "account": "pulse" }]
     });
 
     assert_eq!(format_account_info(&info), expected);
+
+    // fc omits an empty optional core balance; it does not emit JSON null.
+    let mut without_balance = info;
+    without_balance.core_liquid_balance = None;
+    without_balance.net_limit.max = i32::MAX as i64 + 1;
+    let formatted = format_account_info(&without_balance);
+    assert!(
+        !formatted
+            .as_object()
+            .unwrap()
+            .contains_key("core_liquid_balance")
+    );
+    assert_eq!(formatted["net_limit"]["max"], "2147483648");
 }

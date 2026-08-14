@@ -136,9 +136,10 @@ struct VariantDef {
     types: Vec<String>,
 }
 
-/// A table's declaration; we only need the name and the row struct type.
+/// The portion of a table declaration needed by RPC row queries.
 struct TableDef {
     name: u64,
+    index_type: String,
     ty: String,
 }
 
@@ -185,7 +186,7 @@ impl Abi {
         let mut tables = Vec::new();
         for _ in 0..read_varuint32(&mut c)? {
             let name = read_u64(&mut c)?;
-            let _index_type = read_string(&mut c)?;
+            let index_type = read_string(&mut c)?;
             for _ in 0..read_varuint32(&mut c)? {
                 let _key_name = read_string(&mut c)?;
             }
@@ -193,7 +194,11 @@ impl Abi {
                 let _key_type = read_string(&mut c)?;
             }
             let ty = read_string(&mut c)?;
-            tables.push(TableDef { name, ty });
+            tables.push(TableDef {
+                name,
+                index_type,
+                ty,
+            });
         }
 
         // ricardian_clauses: id + body
@@ -252,6 +257,14 @@ impl Abi {
             .iter()
             .find(|t| t.name == table_name)
             .map(|t| t.ty.clone())
+    }
+
+    /// The ABI-declared primary index type for a table (normally `i64`).
+    pub fn table_index_type(&self, table_name: u64) -> Option<&str> {
+        self.tables
+            .iter()
+            .find(|t| t.name == table_name)
+            .map(|t| t.index_type.as_str())
     }
 
     /// Decode one value of `type_name`, advancing `data` past the bytes read.

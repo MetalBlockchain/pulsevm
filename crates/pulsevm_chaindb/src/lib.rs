@@ -278,26 +278,44 @@ fn integer_divide_ceil_u128(num: u128, den: u128) -> u128 {
     (num / den) + if num % den > 0 { 1 } else { 0 }
 }
 
-/// The elastic per-account resource-limit math shared by `get_account_net_limit`
-/// and `get_account_cpu_limit` (chainbase, `current_time` = none). Returns
-/// `(available, greylisted)`. All arithmetic is done in `u128` to match the C++
-/// `uint128_t` intermediates exactly; `available` is `max_user_use - used`
-/// clamped at zero.
-fn elastic_account_limit(
+/// Full per-account resource window returned by nodeos' `get_account`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AccountResourceLimit {
+    pub used: i64,
+    pub available: i64,
+    pub max: i64,
+    pub last_ordinal: u32,
+    pub current_used: i64,
+}
+
+/// Elastic per-account resource-limit math shared by NET and CPU. All arithmetic
+/// uses `u128` to match the C++ intermediates; `current_slot` applies the same
+/// zero-usage decay projection used by nodeos' `get_account`.
+fn elastic_account_limit_info(
     weight: i64,
     total_weight: u64,
     virtual_limit: u64,
     window: u32,
     param_max: u64,
-    value_ex: u64,
+    usage: UsageAccumulator,
     greylist_limit: u32,
-) -> (i64, bool) {
+    current_slot: Option<u32>,
+) -> (AccountResourceLimit, bool) {
     // config::rate_limiting_precision / maximum_elastic_resource_multiplier.
     const RATE_LIMITING_PRECISION: u128 = 1000 * 1000;
     const MAX_ELASTIC_MULTIPLIER: u32 = 1000;
 
     if weight < 0 || total_weight == 0 {
-        return (-1, false);
+        return (
+            AccountResourceLimit {
+                used: -1,
+                available: -1,
+                max: -1,
+                last_ordinal: usage.last_ordinal,
+                current_used: -1,
+            },
+            false,
+        );
     }
 
     let window_size = window as u128;
@@ -317,13 +335,36 @@ fn elastic_account_limit(
     }
 
     let max_user_use = capacity_in_window * weight as u128 / total_weight as u128;
-    let used = integer_divide_ceil_u128(value_ex as u128 * window_size, RATE_LIMITING_PRECISION);
+    let used = integer_divide_ceil_u128(
+        usage.value_ex as u128 * window_size,
+        RATE_LIMITING_PRECISION,
+    );
     let available = if max_user_use <= used {
         0
     } else {
         (max_user_use - used) as i64
     };
-    (available, greylisted)
+    let mut current_used = used;
+    if let Some(slot) = current_slot
+        && slot > usage.last_ordinal
+    {
+        let mut projected = usage;
+        projected.add(0, slot, window);
+        current_used = integer_divide_ceil_u128(
+            projected.value_ex as u128 * window_size,
+            RATE_LIMITING_PRECISION,
+        );
+    }
+    (
+        AccountResourceLimit {
+            used: used as i64,
+            available,
+            max: max_user_use as i64,
+            last_ordinal: usage.last_ordinal,
+            current_used: current_used as i64,
+        },
+        greylisted,
+    )
 }
 
 /// Arena mirror of chainbase `resource_limits::resource_limits_state_object` — a
@@ -1872,6 +1913,44 @@ impl ArenaShadow {
         Some((parent, threshold))
     }
 
+    /// Every permission of `owner` as `(perm_name, parent_perm_name, auth_blob)`
+    /// in `(owner, perm_name)` order — what the RPC account formatter lists.
+    /// `parent_perm_name` is resolved from the parent's `cb_id` (0 for a root
+    /// permission); the auth blob is decoded by the caller.
+    pub fn permissions_of(&self, owner: u64) -> Vec<(u64, u64, Vec<u8>)> {
+        use std::ops::Bound;
+        let db = self.lock();
+        let raw: Vec<(u64, i64, BlobRef)> = match db.table::<PermissionRow>() {
+            Ok(tbl) => tbl
+                .get_index::<PermByOwner>()
+                .range((
+                    Bound::Included((owner, u64::MIN)),
+                    Bound::Included((owner, u64::MAX)),
+                ))
+                .map(|(_, r)| (r.perm_name, r.parent, r.auth))
+                .collect(),
+            Err(_) => return Vec::new(),
+        };
+        raw.into_iter()
+            .map(|(perm_name, parent_cb, auth)| {
+                let parent_name = if parent_cb == 0 {
+                    0
+                } else {
+                    db.find_by::<PermissionRow, PermByCbId>(&parent_cb)
+                        .ok()
+                        .flatten()
+                        .map(|p| p.perm_name)
+                        .unwrap_or(0)
+                };
+                let blob = db
+                    .blob::<PermissionRow>(auth)
+                    .map(|b| b.to_vec())
+                    .unwrap_or_default();
+                (perm_name, parent_name, blob)
+            })
+            .collect()
+    }
+
     /// The chainbase id a permission mirrors (`cb_id`), for serving `get_id` from
     /// the arena. `None` if the permission is absent.
     pub fn permission_cb_id(&self, owner: u64, perm_name: u64) -> Option<i64> {
@@ -2427,6 +2506,24 @@ impl ArenaShadow {
             .map(|l| l.required_permission)
     }
 
+    /// Every authorization link owned by `account`, in chainbase's
+    /// `by_permission_name` order, as `(required_permission, code, action)`.
+    pub fn permission_links_of(&self, account: u64) -> Vec<(u64, u64, u64)> {
+        use std::ops::Bound;
+        let db = self.lock();
+        match db.table::<PermissionLinkRow>() {
+            Ok(tbl) => tbl
+                .get_index::<LinkByPermissionName>()
+                .range((
+                    Bound::Included((account, u64::MIN, i64::MIN)),
+                    Bound::Included((account, u64::MAX, i64::MAX)),
+                ))
+                .map(|(_, row)| (row.required_permission, row.code, row.message_type))
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     // ----- resource_usage (RAM) ---------------------------------------------
 
     /// Mirrors `initialize_account_resource_limits`: creates the account's
@@ -2565,24 +2662,36 @@ impl ArenaShadow {
     /// mirrored config/state/usage. `None` when the account or state row is
     /// absent. See [[arena-read-inversion-status]].
     pub fn account_net_limit(&self, account: u64, greylist_limit: u32) -> Option<(i64, bool)> {
+        self.account_net_limit_info(account, greylist_limit, None)
+            .map(|(limit, greylisted)| (limit.available, greylisted))
+    }
+
+    /// Full NET resource window for `get_account`, optionally projected to the
+    /// current block-timestamp slot for `current_used`.
+    pub fn account_net_limit_info(
+        &self,
+        account: u64,
+        greylist_limit: u32,
+        current_slot: Option<u32>,
+    ) -> Option<(AccountResourceLimit, bool)> {
         let (_ram, net_weight, _cpu) = self.account_limits(account)?;
         let db = self.lock();
         let state = db.table::<ResourceStateRow>().ok()?.iter().next()?;
         let cfg = db.table::<ResourceConfigRow>().ok()?.iter().next()?;
-        let value_ex = db
+        let usage = db
             .find_by::<ResourceUsageRow, ResourceUsageRowByOwner>(&account)
             .ok()
-            .flatten()
-            .map(|r| r.net_usage.value_ex)
-            .unwrap_or(0);
-        Some(elastic_account_limit(
+            .flatten()?
+            .net_usage;
+        Some(elastic_account_limit_info(
             net_weight,
             state.total_net_weight,
             state.virtual_net_limit,
             cfg.account_net_usage_average_window,
             cfg.net_max,
-            value_ex,
+            usage,
             greylist_limit,
+            current_slot,
         ))
     }
 
@@ -2590,24 +2699,36 @@ impl ArenaShadow {
     /// chainbase's `get_account_cpu_limit` (`current_time` = none). See
     /// [`account_net_limit`].
     pub fn account_cpu_limit(&self, account: u64, greylist_limit: u32) -> Option<(i64, bool)> {
+        self.account_cpu_limit_info(account, greylist_limit, None)
+            .map(|(limit, greylisted)| (limit.available, greylisted))
+    }
+
+    /// Full CPU resource window for `get_account`, optionally projected to the
+    /// current block-timestamp slot for `current_used`.
+    pub fn account_cpu_limit_info(
+        &self,
+        account: u64,
+        greylist_limit: u32,
+        current_slot: Option<u32>,
+    ) -> Option<(AccountResourceLimit, bool)> {
         let (_ram, _net, cpu_weight) = self.account_limits(account)?;
         let db = self.lock();
         let state = db.table::<ResourceStateRow>().ok()?.iter().next()?;
         let cfg = db.table::<ResourceConfigRow>().ok()?.iter().next()?;
-        let value_ex = db
+        let usage = db
             .find_by::<ResourceUsageRow, ResourceUsageRowByOwner>(&account)
             .ok()
-            .flatten()
-            .map(|r| r.cpu_usage.value_ex)
-            .unwrap_or(0);
-        Some(elastic_account_limit(
+            .flatten()?
+            .cpu_usage;
+        Some(elastic_account_limit_info(
             cpu_weight,
             state.total_cpu_weight,
             state.virtual_cpu_limit,
             cfg.account_cpu_usage_average_window,
             cfg.cpu_max,
-            value_ex,
+            usage,
             greylist_limit,
+            current_slot,
         ))
     }
 
@@ -2873,6 +2994,7 @@ impl ArenaShadow {
         code: &[u8],
         code_hash: [u8; 32],
         head_block_num: u32,
+        last_code_update: i64,
         vm_type: u8,
         vm_version: u8,
     ) -> Result<(), DbError> {
@@ -2887,7 +3009,9 @@ impl ArenaShadow {
                 row.code_sequence += 1;
                 row.vm_type = vm_type;
                 row.vm_version = vm_version;
-                row.last_code_update = head_block_num as i64;
+                // The block time in fc microseconds, matching chainbase's
+                // account_metadata_object::last_code_update (a time_point).
+                row.last_code_update = last_code_update;
             })?;
         }
 
@@ -3615,6 +3739,32 @@ impl ArenaShadow {
             ))
             .next_back()
             .map(|(&(_, s, p), _)| (p, s))
+    }
+
+    /// Every idx64 row in `(secondary_key, primary_key)` order, including the
+    /// secondary row's RAM payer. This is the ordered source used by the
+    /// arena-backed `get_table_rows` secondary-index path.
+    pub fn idx64_range_with_payer(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+    ) -> Vec<(u64, u64, u64)> {
+        use std::ops::Bound;
+        let db = self.lock();
+        let Some(t_id) = self.resolve_t_id(&db, code, scope, table) else {
+            return Vec::new();
+        };
+        let Ok(tbl) = db.table::<ContractIndex64Row>() else {
+            return Vec::new();
+        };
+        tbl.get_index::<ContractIdx64BySecondary>()
+            .range((
+                Bound::Included((t_id, u64::MIN, u64::MIN)),
+                Bound::Included((t_id, u64::MAX, u64::MAX)),
+            ))
+            .map(|(&(_, secondary, primary), row)| (secondary, primary, row.payer))
+            .collect()
     }
 
     /// idx128 secondary-index positioning, same semantics as the idx64 family but
@@ -4936,6 +5086,15 @@ mod tests {
         assert_eq!(s.idx64_previous(code, scope, table, 2), Some((9, 100)));
         assert_eq!(s.idx64_previous(code, scope, table, 9), None);
         assert_eq!(s.idx64_last(code, scope, table), Some((7, 300)));
+        assert_eq!(
+            s.idx64_range_with_payer(code, scope, table),
+            vec![
+                (100, 9, payer),
+                (200, 2, payer),
+                (200, 5, payer),
+                (300, 7, payer)
+            ]
+        );
     }
 
     /// idx128 reads follow the same (secondary, primary) order over a u128 key,
@@ -5170,6 +5329,28 @@ mod tests {
         assert_eq!(GENESIS_PULSE_ABI[0], 0x0e);
         assert_eq!(&GENESIS_PULSE_ABI[1..15], b"eosio::abi/1.0");
         assert_eq!(&GENESIS_PULSE_ABI[2128..2132], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn account_resource_limit_projects_current_usage() {
+        let usage = UsageAccumulator {
+            value_ex: RATE_LIMITING_PRECISION,
+            last_ordinal: 10,
+            ..Default::default()
+        };
+        let (limit, greylisted) =
+            elastic_account_limit_info(1, 2, 100, 10, 100, usage, 1000, Some(15));
+        assert!(!greylisted);
+        assert_eq!(
+            limit,
+            AccountResourceLimit {
+                used: 10,
+                available: 490,
+                max: 500,
+                last_ordinal: 10,
+                current_used: 5,
+            }
+        );
     }
 
     /// The standalone-write path bills db_idxN_update off the row's old payer and
