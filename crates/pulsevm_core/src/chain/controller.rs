@@ -1835,6 +1835,14 @@ impl Controller {
     }
 
     pub fn store_chain_state(&mut self, block_id: &Id) -> Result<(), ChainError> {
+        // SHiP chain-state deltas are packed from chainbase. When the arena is the
+        // sole writer, chainbase carries only genesis and is not the authoritative
+        // state, so there is nothing meaningful to pack; skip it (delta-packing
+        // over the arena is a follow-up). This keeps accept_block from depending
+        // on chainbase on the arena-only path.
+        if self.db.arena_standalone_writes() {
+            return Ok(());
+        }
         match &self.chain_state_log {
             None => {
                 return Err(ChainError::InternalError(
@@ -4535,6 +4543,72 @@ mod tests {
         Ok(())
     }
 
+    /// Every full-state table as `(name, arena bytes)`, read from the arena
+    /// alone. This is the golden-mode oracle: it consults no chainbase, so it is
+    /// the builder that outlives the bridge. `cross_impl_tables` pairs these same
+    /// bytes with the chainbase side for the live cross-check.
+    #[cfg(feature = "arena-shadow")]
+    fn arena_impl_tables(db: &Database) -> Result<Vec<(&'static str, Vec<u8>)>, ChainError> {
+        Ok(vec![
+            (
+                "account_metadata",
+                db.arena_account_metadata_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "account",
+                db.arena_account_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "permission",
+                db.arena_permission_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "permission_link",
+                db.arena_permission_link_state_bytes().unwrap_or_default(),
+            ),
+            ("code", db.arena_code_state_bytes().unwrap_or_default()),
+            (
+                "transaction",
+                db.arena_transaction_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "resource_usage",
+                db.arena_resource_usage_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "resource_limits",
+                db.arena_account_limits_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "resource_state",
+                db.arena_resource_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "dynamic_global_property",
+                db.arena_global_action_sequence()
+                    .unwrap_or(0)
+                    .to_le_bytes()
+                    .to_vec(),
+            ),
+            (
+                "global_property",
+                db.arena_global_property_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "resource_limits_config",
+                db.arena_resource_config_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "contract_table",
+                db.arena_contract_table_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "contract_key_value",
+                db.arena_contract_kv_state_bytes().unwrap_or_default(),
+            ),
+        ])
+    }
+
     /// Every cross-impl table as `(name, chainbase bytes, arena bytes)` for the
     /// full-state root — the 10 block-populated tables plus the two contract
     /// primary tables (empty unless a contract wrote rows).
@@ -5212,7 +5286,10 @@ mod tests {
             controller.set_preferred_id(block.id()?);
             controller.database().arena_flush_delta(&wal)?;
 
-            let tables = cross_impl_tables(&controller.database())?;
+            // Golden-mode roots read the arena alone (chainbase writes may be
+            // skipped and it is not the oracle here), so build the arena-only
+            // tables — the path that survives the bridge removal.
+            let tables = arena_impl_tables(&controller.database())?;
 
             // Per-table arena root: a fingerprint over one arena table's canonical
             // bytes, recorded/verified table by table so a mismatch names the table.
@@ -5231,7 +5308,7 @@ mod tests {
             // of the live cross-impl diff.
             if let Some(golden) = &golden_roots {
                 let mut mismatch = None;
-                for (name, _chain, arena) in &tables {
+                for (name, arena) in &tables {
                     let h = table_root(arena);
                     if let Some(&g) = golden.get(&(n, name.to_string()))
                         && g != h
@@ -5256,7 +5333,7 @@ mod tests {
                 continue;
             }
             if let Some(rec) = &mut recorded {
-                for (name, _chain, arena) in &tables {
+                for (name, arena) in &tables {
                     rec.push((n, name.to_string(), table_root(arena)));
                 }
             }
