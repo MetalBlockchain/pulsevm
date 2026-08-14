@@ -3365,6 +3365,7 @@ name = "pulsevm_chain_types"
 version = "0.1.0"
 dependencies = [
  "prost-types",
+ "pulsevm_error",
  "pulsevm_serialization",
  "serde",
  "serde_json",

@@ -2,10 +2,21 @@ use std::ops::Mul;
 
 use pulsevm_error::ChainError;
 
-use crate::bridge::ffi::{
-    ElasticLimitParameters,
-    Ratio,
-};
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ratio {
+    pub numerator: u64,
+    pub denominator: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ElasticLimitParameters {
+    pub target: u64,
+    pub max: u64,
+    pub periods: u32,
+    pub max_multiplier: u32,
+    pub contract_rate: Ratio,
+    pub expand_rate: Ratio,
+}
 
 impl ElasticLimitParameters {
     pub fn new(

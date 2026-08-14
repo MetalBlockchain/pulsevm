@@ -21,6 +21,7 @@ use pulsevm_name::Name;
 
 use crate::{
     ChainConfigV0,
+    ElasticLimitParameters,
     Float128,
     Index64IteratorCache,
     Index128IteratorCache,
@@ -28,12 +29,12 @@ use crate::{
     IndexLongDoubleIteratorCache,
     IndexLongDoubleObject,
     KeyValueObject,
+    Ratio,
     bridge::ffi::{
         self,
         Authority,
         CxxDigest,
         CxxGenesisState,
-        ElasticLimitParameters,
         Index64Object,
         Index128Object,
         Index256Object,
@@ -75,6 +76,69 @@ fn native_time_point(t: ffi::TimePoint) -> TimePoint {
         elapsed: pulsevm_chain_types::Microseconds {
             count: t.elapsed.count,
         },
+    }
+}
+
+/// Rebuild the cxx-bridge `ElasticLimitParameters` from the pure-Rust one for a
+/// C++ call.
+#[inline]
+fn cxx_elastic(p: &ElasticLimitParameters) -> ffi::ElasticLimitParameters {
+    ffi::ElasticLimitParameters {
+        target: p.target,
+        max: p.max,
+        periods: p.periods,
+        max_multiplier: p.max_multiplier,
+        contract_rate: ffi::Ratio {
+            numerator: p.contract_rate.numerator,
+            denominator: p.contract_rate.denominator,
+        },
+        expand_rate: ffi::Ratio {
+            numerator: p.expand_rate.numerator,
+            denominator: p.expand_rate.denominator,
+        },
+    }
+}
+
+/// The inverse: a bridge `ElasticLimitParameters` from C++ into the pure-Rust one.
+#[inline]
+fn native_elastic(p: ffi::ElasticLimitParameters) -> ElasticLimitParameters {
+    ElasticLimitParameters {
+        target: p.target,
+        max: p.max,
+        periods: p.periods,
+        max_multiplier: p.max_multiplier,
+        contract_rate: Ratio {
+            numerator: p.contract_rate.numerator,
+            denominator: p.contract_rate.denominator,
+        },
+        expand_rate: Ratio {
+            numerator: p.expand_rate.numerator,
+            denominator: p.expand_rate.denominator,
+        },
+    }
+}
+
+/// Rebuild the cxx-bridge `ChainConfigV0` from the pure-Rust one for a C++ call.
+#[inline]
+fn cxx_chain_config(c: &ChainConfigV0) -> ffi::ChainConfigV0 {
+    ffi::ChainConfigV0 {
+        max_block_net_usage: c.max_block_net_usage,
+        target_block_net_usage_pct: c.target_block_net_usage_pct,
+        max_transaction_net_usage: c.max_transaction_net_usage,
+        base_per_transaction_net_usage: c.base_per_transaction_net_usage,
+        net_usage_leeway: c.net_usage_leeway,
+        context_free_discount_net_usage_num: c.context_free_discount_net_usage_num,
+        context_free_discount_net_usage_den: c.context_free_discount_net_usage_den,
+        max_block_cpu_usage: c.max_block_cpu_usage,
+        target_block_cpu_usage_pct: c.target_block_cpu_usage_pct,
+        max_transaction_cpu_usage: c.max_transaction_cpu_usage,
+        min_transaction_cpu_usage: c.min_transaction_cpu_usage,
+        max_transaction_lifetime: c.max_transaction_lifetime,
+        deferred_trx_expiration_window: c.deferred_trx_expiration_window,
+        max_transaction_delay: c.max_transaction_delay,
+        max_inline_action_size: c.max_inline_action_size,
+        max_inline_action_depth: c.max_inline_action_depth,
+        max_authority_depth: c.max_authority_depth,
     }
 }
 
@@ -139,11 +203,11 @@ fn from_elastic_params(p: &crate::shadow::ElasticParams) -> ElasticLimitParamete
         max: p.max,
         periods: p.periods,
         max_multiplier: p.max_multiplier,
-        contract_rate: ffi::Ratio {
+        contract_rate: Ratio {
             numerator: p.contract.0,
             denominator: p.contract.1,
         },
-        expand_rate: ffi::Ratio {
+        expand_rate: Ratio {
             numerator: p.expand.0,
             denominator: p.expand.1,
         },
@@ -3261,6 +3325,7 @@ impl Database {
         let guard = self.locked_read()?;
         guard
             .get_cpu_limit_parameters()
+            .map(native_elastic)
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 
@@ -3277,6 +3342,7 @@ impl Database {
         let guard = self.locked_read()?;
         guard
             .get_net_limit_parameters()
+            .map(native_elastic)
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 
@@ -3291,6 +3357,7 @@ impl Database {
         let guard = self.inner.read()?;
         guard
             .get_cpu_limit_parameters()
+            .map(native_elastic)
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 
@@ -3299,6 +3366,7 @@ impl Database {
         let guard = self.inner.read()?;
         guard
             .get_net_limit_parameters()
+            .map(native_elastic)
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 
@@ -3544,7 +3612,10 @@ impl Database {
             let pinned = guard.pin_mut();
 
             pinned
-                .set_block_parameters(cpu_limit_parameters, net_limit_parameters)
+                .set_block_parameters(
+                    &cxx_elastic(cpu_limit_parameters),
+                    &cxx_elastic(net_limit_parameters),
+                )
                 .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
         }
 
@@ -6186,7 +6257,7 @@ impl Database {
             let pinned = guard.pin_mut();
 
             pinned
-                .set_global_properties(cfg)
+                .set_global_properties(&cxx_chain_config(cfg))
                 .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
         }
 

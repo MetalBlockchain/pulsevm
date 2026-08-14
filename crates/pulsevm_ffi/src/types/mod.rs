@@ -1,7 +1,5 @@
 mod authority;
-mod config;
 mod digest;
-mod elastic_limit_parameters;
 mod genesis_state;
 mod name;
 mod private_key;
