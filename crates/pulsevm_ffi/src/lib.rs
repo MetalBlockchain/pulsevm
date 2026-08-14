@@ -126,6 +126,7 @@ pub use pulsevm_chain_types::{
     BlockTimestamp,
     ChainConfigV0,
     ElasticLimitParameters,
+    GenesisState,
     KeyWeight,
     Microseconds,
     PermissionLevel,

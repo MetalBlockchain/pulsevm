@@ -2482,13 +2482,18 @@ impl Database {
         Ok(())
     }
 
-    pub fn initialize_database(&mut self, genesis: &CxxGenesisState) -> Result<(), ChainError> {
+    #[cfg_attr(not(feature = "arena-shadow"), allow(unused_variables))]
+    pub fn initialize_database(
+        &mut self,
+        genesis: &CxxGenesisState,
+        rust_genesis: &pulsevm_chain_types::GenesisState,
+    ) -> Result<(), ChainError> {
         // Pure-Rust genesis: author the arena directly and never touch chainbase —
         // the last chainbase write removed. Gated while it is validated against
         // block-1 golden roots (see `initialize_genesis_arena`).
         #[cfg(feature = "arena-shadow")]
         if self.arena_rust_genesis() {
-            return self.initialize_genesis_arena(genesis);
+            return self.initialize_genesis_arena(rust_genesis);
         }
         {
             let mut guard = self.locked_write()?;
@@ -2615,7 +2620,10 @@ impl Database {
     /// value is derived from the genesis state or from the fixed genesis
     /// constants, and the whole thing is pinned by the block-1 golden roots.
     #[cfg(feature = "arena-shadow")]
-    fn initialize_genesis_arena(&self, genesis: &CxxGenesisState) -> Result<(), ChainError> {
+    fn initialize_genesis_arena(
+        &self,
+        genesis: &pulsevm_chain_types::GenesisState,
+    ) -> Result<(), ChainError> {
         use crate::shadow::ElasticParams;
 
         let s = self.shadow_ref()?;
@@ -2624,7 +2632,7 @@ impl Database {
         // last_updated/last_used, and the block_timestamp slot for account
         // creation_date (config::block_timestamp_epoch = 946684800000ms, 500ms
         // slots).
-        let ts_us: i64 = genesis.get_initial_timestamp().time_since_epoch().count();
+        let ts_us: i64 = genesis.initial_timestamp_micros;
         let creation_slot: u32 = (((ts_us / 1000) - 946_684_800_000i64) / 500i64).max(0) as u32;
 
         // Genesis account / permission names (config.hpp), as name-encoded u64.
@@ -2637,10 +2645,8 @@ impl Database {
         const PROD_MINOR: u64 = 12_531_424_609_916_272_640;
 
         // 1. global_property (chain_config from the genesis configuration).
-        s.set_global_properties(chain_config_params_from_cxx(
-            genesis.get_initial_configuration(),
-        ))
-        .map_err(|e| ChainError::InternalError(format!("genesis global_property: {e:?}")))?;
+        s.set_global_properties(chain_config_params_from_v0(&genesis.initial_configuration))
+            .map_err(|e| ChainError::InternalError(format!("genesis global_property: {e:?}")))?;
 
         // 2. resource_limits_config — the C++ struct defaults (config.hpp): target =
         //    EOS_PERCENT(max, 10%), periods = 60_000ms/500ms = 120, max_multiplier 1000, contract
@@ -2670,7 +2676,7 @@ impl Database {
 
         // 4. native accounts. system_auth carries the genesis key; the producers' active authority
         //    delegates to pulse/active.
-        let key_bytes = ffi::packed_public_key_bytes(genesis.get_initial_key());
+        let key_bytes = genesis.initial_key_packed().to_vec();
         let system_auth = build_auth_blob(1, &[(key_bytes, 1)], &[], &[]);
         let empty_auth = build_auth_blob(1, &[], &[], &[]);
         let active_producers_auth = build_auth_blob(1, &[], &[(PULSE, ACTIVE, 1)], &[]);

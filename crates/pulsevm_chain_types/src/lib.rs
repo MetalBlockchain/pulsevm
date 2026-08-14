@@ -9,6 +9,7 @@ mod authority;
 mod block_timestamp;
 mod config;
 mod elastic_limit_parameters;
+mod genesis;
 mod time;
 mod time_point_sec;
 
@@ -31,6 +32,7 @@ pub use elastic_limit_parameters::{
     ElasticLimitParameters,
     Ratio,
 };
+pub use genesis::GenesisState;
 pub use time::{
     Microseconds,
     TimePoint,

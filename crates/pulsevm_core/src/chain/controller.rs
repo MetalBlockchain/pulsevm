@@ -342,16 +342,18 @@ impl Controller {
         })?;
         let genesis = CxxGenesisState::new(genesis_json)
             .map_err(|e| ChainError::ParseError(format!("failed to parse genesis: {}", e)))?;
-        // TODO: Validate genesis state
+        // Pure-Rust view of the same genesis: the arena is authored from this,
+        // and the schedule/timestamp below are read from it so the initial state
+        // never routes through C++. The bridge copy still feeds the chainbase
+        // genesis path while that path remains as the parity oracle.
+        let rust_genesis = pulsevm_ffi::GenesisState::from_bytes(genesis_bytes)?;
         self.chain_id = chain_id.clone();
 
         // Seed the active producer schedule from genesis: the sole producer is
         // the configured producer_name, and it signs blocks with the genesis
         // initial key. On restart this is the base the block log is replayed onto
         // (see `reconstruct_schedule_from_log` below).
-        let initial_key =
-            <PublicKey as std::str::FromStr>::from_str(&genesis.get_initial_key().to_string_rust())
-                .map_err(|e| ChainError::GenesisError(format!("invalid genesis key: {}", e)))?;
+        let initial_key = PublicKey::new(rust_genesis.initial_key);
         self.active_schedule = ProducerSchedule {
             version: 0,
             producers: vec![ProducerKey {
@@ -378,10 +380,10 @@ impl Controller {
         // Set our last accepted block to the genesis block
         self.last_accepted_block = SignedBlock::new(
             Id::default(),
-            // The genesis timestamp lives in C++; read its microsecond count and
-            // rebuild the block timestamp through the pure-Rust conversion.
+            // Rebuild the genesis block timestamp from the parsed micro count
+            // through the pure-Rust conversion.
             BlockTimestamp::from(TimePoint::new(Microseconds::new(
-                genesis.get_initial_timestamp().time_since_epoch().count(),
+                rust_genesis.initial_timestamp_micros,
             ))),
             PULSE_NAME, // Use the provided producer name from genesis
             VecDeque::new(),
@@ -397,9 +399,11 @@ impl Controller {
         if revision <= 0 {
             // Initialize the database with the genesis state
             info!("initializing database with genesis state");
-            self.db.initialize_database(&genesis).map_err(|e| {
-                ChainError::GenesisError(format!("failed to initialize database: {}", e))
-            })?;
+            self.db
+                .initialize_database(&genesis, &rust_genesis)
+                .map_err(|e| {
+                    ChainError::GenesisError(format!("failed to initialize database: {}", e))
+                })?;
             // initialize_database seeds the resource-limits config from the C++
             // struct defaults (default_max_block_cpu_usage), not from genesis, so
             // the very first block would run under those tiny defaults until the
