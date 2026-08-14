@@ -2741,7 +2741,6 @@ mod tests {
     /// account's metadata. Executing the action drives the same `create_account`
     /// / `create_account_metadata` paths that carry the mirror hooks. This is the
     /// feedback loop the session-lockstep work is built against.
-    #[cfg(feature = "arena-shadow")]
     #[tokio::test]
     async fn oracle_newaccount_mirrors_into_arena() -> Result<(), ChainError> {
         let chain_id =
@@ -2796,7 +2795,6 @@ mod tests {
     /// Omitting the `arena_*` lockstep calls makes the final assert fail (the
     /// arena keeps a row chainbase discarded), which is the divergence the full
     /// controller wiring must avoid.
-    #[cfg(feature = "arena-shadow")]
     #[tokio::test]
     async fn oracle_undone_tx_leaves_no_trace_in_arena() -> Result<(), ChainError> {
         let chain_id =
@@ -2863,7 +2861,6 @@ mod tests {
     /// block's writes; accept_block commits, so the arena must then match
     /// chainbase. This exercises the arena session lockstep wired into
     /// build/verify/accept.
-    #[cfg(feature = "arena-shadow")]
     #[tokio::test]
     async fn oracle_block_accept_mirrors_into_arena() -> Result<(), ChainError> {
         let chain_id =
@@ -2933,7 +2930,6 @@ mod tests {
     /// (setcode), abi_sequence (setabi) and auth_sequence (glenn authorizes all
     /// three actions) each advance through a path the mirror drives via the
     /// get_name accessor added to the FFI.
-    #[cfg(feature = "arena-shadow")]
     #[tokio::test]
     async fn oracle_setcode_mirrors_account_metadata_fields() -> Result<(), ChainError> {
         let chain_id =
@@ -3045,7 +3041,6 @@ mod tests {
     /// (owner, name) — no opaque handle — so the check is presence plus the
     /// stored parent id (must equal chainbase's) and the authority threshold
     /// (must equal what the action set, proving the auth blob round-trips).
-    #[cfg(feature = "arena-shadow")]
     #[tokio::test]
     async fn oracle_updateauth_mirrors_permission() -> Result<(), ChainError> {
         let chain_id =
@@ -3119,7 +3114,6 @@ mod tests {
     /// arena-served authority satisfies the signature — the real end-to-end proof
     /// the served authority is correct. Afterwards the served value is read back
     /// directly and the read cross-check must show zero divergences.
-    #[cfg(feature = "arena-shadow")]
     #[tokio::test]
     async fn oracle_permission_authority_serves_from_arena() -> Result<(), ChainError> {
         let chain_id =
@@ -3197,7 +3191,6 @@ mod tests {
     /// that didn't track chainbase) would reject the updateauth and fail
     /// build_block, and the read cross-check must stay clean. This is also the
     /// end-to-end proof that arena permission ids match chainbase's.
-    #[cfg(feature = "arena-shadow")]
     #[tokio::test]
     async fn oracle_permission_satisfies_serves_from_arena() -> Result<(), ChainError> {
         let chain_id =
@@ -3281,7 +3274,6 @@ mod tests {
     /// mirror into the arena. The link is keyed by (account, code, message_type)
     /// and the mirrored required_permission must equal chainbase's, read back
     /// through the find_permission_link accessor added to the FFI.
-    #[cfg(feature = "arena-shadow")]
     #[tokio::test]
     async fn oracle_linkauth_mirrors_permission_link() -> Result<(), ChainError> {
         let chain_id =
@@ -3360,7 +3352,6 @@ mod tests {
     /// step with chainbase. A permission cannot be deleted while a link points at
     /// it, so the link is removed first. Afterwards both the link and the
     /// permission must be absent on both sides.
-    #[cfg(feature = "arena-shadow")]
     #[tokio::test]
     async fn oracle_unlink_and_delete_auth_remove_from_arena() -> Result<(), ChainError> {
         let chain_id =
@@ -3442,7 +3433,6 @@ mod tests {
     /// RAM delta funnels through add_pending_ram_usage, which the mirror
     /// accumulates, so this exercises the whole billing path end to end without
     /// duplicating any billing rules — the mirror only replays the same deltas.
-    #[cfg(feature = "arena-shadow")]
     #[tokio::test]
     async fn oracle_ram_usage_mirrors_chainbase() -> Result<(), ChainError> {
         let chain_id =
@@ -3514,7 +3504,6 @@ mod tests {
     /// the mirrored accumulator value_ex (the pre-multiplied state, the exact
     /// thing that persists) must equal chainbase's — proving the ported EMA
     /// accumulator math and the config-window plumbing match bit for bit.
-    #[cfg(feature = "arena-shadow")]
     #[tokio::test]
     async fn oracle_net_cpu_usage_mirrors_chainbase() -> Result<(), ChainError> {
         let chain_id =
@@ -3592,7 +3581,6 @@ mod tests {
     /// equal chainbase's get_account_limits after a newaccount block. (The
     /// pending/commit cycle is exercised at the Database boundary in the ffi
     /// arena_shadow tests, since no action in this chain calls set_account_limits.)
-    #[cfg(feature = "arena-shadow")]
     #[tokio::test]
     async fn oracle_account_limits_mirror_defaults() -> Result<(), ChainError> {
         let chain_id =
@@ -3639,7 +3627,6 @@ mod tests {
     /// Dynamic-global-property oracle: every applied action advances the
     /// global_action_sequence on the singleton dynamic_global_property_object.
     /// After a newaccount block the mirrored sequence must equal chainbase's.
-    #[cfg(feature = "arena-shadow")]
     #[tokio::test]
     async fn oracle_global_action_sequence_mirrors() -> Result<(), ChainError> {
         let chain_id =
@@ -3694,7 +3681,6 @@ mod tests {
     /// chainbase (below the per-write hooks), and a `setparams`-style write must
     /// then update both in lockstep. Assert the mirror equals chainbase at genesis
     /// and again after a config change, and that the change is actually observed.
-    #[cfg(feature = "arena-shadow")]
     #[tokio::test]
     async fn oracle_global_property_mirrors_setparams() -> Result<(), ChainError> {
         let chain_id =
@@ -3781,7 +3767,6 @@ mod tests {
     /// windowed averages. After a block the mirrored virtual limits — produced by
     /// the ported EMA plus update_elastic_limit, fed the same config parameters —
     /// must equal chainbase's exactly.
-    #[cfg(feature = "arena-shadow")]
     #[tokio::test]
     async fn oracle_virtual_limits_mirror_chainbase() -> Result<(), ChainError> {
         let chain_id =
@@ -3836,7 +3821,6 @@ mod tests {
     /// per-block dedupe set (transaction_object). After the block the mirror must
     /// agree with chainbase's is_known_unexpired_transaction — present for the
     /// applied trx id, absent for an unrelated one.
-    #[cfg(feature = "arena-shadow")]
     #[tokio::test]
     async fn oracle_transaction_dedupe_mirrors() -> Result<(), ChainError> {
         let chain_id =
@@ -3891,7 +3875,6 @@ mod tests {
     /// in isolation. This is the closest thing to a full-state diff over the
     /// surface the FFI exposes reads for, and it guards against cross-table
     /// interactions the per-table oracles miss.
-    #[cfg(feature = "arena-shadow")]
     #[tokio::test]
     async fn oracle_full_state_cross_check() -> Result<(), ChainError> {
         let chain_id =
@@ -4044,7 +4027,6 @@ mod tests {
     /// match. Unlike the per-account point-read oracles, this enumerates the
     /// entire table — every genesis account plus the ones this block creates — so
     /// a missed or mis-serialized row anywhere is caught.
-    #[cfg(feature = "arena-shadow")]
     #[tokio::test]
     async fn oracle_cross_impl_account_metadata_root() -> Result<(), ChainError> {
         use sha2::{
@@ -4135,7 +4117,6 @@ mod tests {
     /// system account's non-empty genesis abi and glenn's abi from setabi) must
     /// serialize identically on both sides and hash to the same root. Exercises
     /// the blob path of the cross-impl mechanism.
-    #[cfg(feature = "arena-shadow")]
     #[tokio::test]
     async fn oracle_cross_impl_account_root() -> Result<(), ChainError> {
         use sha2::{
@@ -4212,7 +4193,6 @@ mod tests {
     /// hash equal over the full set: genesis permissions (owner/active for the
     /// native accounts plus the producer permissions, all hydrated) and glenn's
     /// owner/active/claude created live by newaccount and updateauth.
-    #[cfg(feature = "arena-shadow")]
     #[tokio::test]
     async fn oracle_cross_impl_permission_root() -> Result<(), ChainError> {
         use sha2::{
@@ -4284,7 +4264,6 @@ mod tests {
     /// SHA-256 over all of them — the full-state root — must match. The seven
     /// contract tables are empty in this flow (no WASM db writes) and are covered
     /// against chainbase separately in diff_contract_iter.
-    #[cfg(feature = "arena-shadow")]
     #[tokio::test]
     async fn oracle_cross_impl_full_state_root() -> Result<(), ChainError> {
         use sha2::{
@@ -4461,7 +4440,6 @@ mod tests {
     /// table id is not resolvable through the FFI — so this covers the create
     /// path only; the full contract db is separately diff-tested vs C++ in
     /// diff_contract_iter.
-    #[cfg(feature = "arena-shadow")]
     #[tokio::test]
     async fn oracle_cross_impl_contract_root() -> Result<(), ChainError> {
         use sha2::{
@@ -4559,7 +4537,6 @@ mod tests {
     /// alone. This is the golden-mode oracle: it consults no chainbase, so it is
     /// the builder that outlives the bridge. `cross_impl_tables` pairs these same
     /// bytes with the chainbase side for the live cross-check.
-    #[cfg(feature = "arena-shadow")]
     fn arena_impl_tables(db: &Database) -> Result<Vec<(&'static str, Vec<u8>)>, ChainError> {
         Ok(vec![
             (
@@ -4623,7 +4600,6 @@ mod tests {
 
     /// Decode a symbol_code (the raw `u64` a token contract uses as the `stat`
     /// table scope) back to its ticker string: ASCII chars packed low byte first.
-    #[cfg(feature = "arena-shadow")]
     fn symbol_code_to_string(mut code: u64) -> String {
         let mut s = String::new();
         while code != 0 {
@@ -4641,7 +4617,6 @@ mod tests {
     /// reproduce the frozen C++ output (semantic JSON equality). Covers the
     /// arena-backed formatters wired so far; account_info records are skipped
     /// until it is wired.
-    #[cfg(feature = "arena-shadow")]
     fn verify_rpc_golden(controller: &Controller, golden_path: &str) -> Result<(), ChainError> {
         let db = controller.database();
         let text = fs::read_to_string(golden_path).expect("read rpc golden");
@@ -4743,7 +4718,6 @@ mod tests {
     /// JSON and raw form, `get_table_by_scope`, `get_currency_balance` /
     /// `get_currency_stats` for token tables, `get_account_info`, and each code's
     /// raw ABI (so the serializer has the definition its rows decode against).
-    #[cfg(feature = "arena-shadow")]
     fn capture_rpc_golden(controller: &Controller, out_path: &str) -> Result<(), ChainError> {
         use serde_json::json;
 
@@ -4873,7 +4847,6 @@ mod tests {
     /// Every cross-impl table as `(name, chainbase bytes, arena bytes)` for the
     /// full-state root — the 10 block-populated tables plus the two contract
     /// primary tables (empty unless a contract wrote rows).
-    #[cfg(feature = "arena-shadow")]
     fn cross_impl_tables(
         db: &Database,
     ) -> Result<Vec<(&'static str, Vec<u8>, Vec<u8>)>, ChainError> {
@@ -4969,7 +4942,6 @@ mod tests {
     /// asserts the cross-impl full-state root — reporting the first block/table
     /// that diverges. Requires our node to be able to execute every real block;
     /// a replay failure there is a node-completeness gap, not a mirror gap.
-    #[cfg(feature = "arena-shadow")]
     #[tokio::test]
     #[ignore]
     async fn replay_local_block_log() -> Result<(), ChainError> {
@@ -5041,7 +5013,6 @@ mod tests {
     /// replaying node must re-derive the full state so its arena and chainbase
     /// agree on the cross-impl root. This proves the replay path end to end
     /// without a live node; real testnet blocks drop into replay_local_block_log.
-    #[cfg(feature = "arena-shadow")]
     #[tokio::test]
     async fn replay_packed_block_keeps_shadow_in_sync() -> Result<(), ChainError> {
         let chain_id =
@@ -5122,7 +5093,6 @@ mod tests {
     /// and replay. This exercises the exact open_with_magic/append/range/read_block
     /// path that replay_local_block_log uses against a node's block_log, so it
     /// de-risks that harness independently of the (fixture-less) log unit tests.
-    #[cfg(feature = "arena-shadow")]
     #[tokio::test]
     async fn replay_via_block_log_keeps_shadow_in_sync() -> Result<(), ChainError> {
         use crate::chain::state_history::StateHistoryLog;
@@ -5358,7 +5328,6 @@ mod tests {
     /// vs the Rust arena — over all twelve tables. Ignored by default; reports
     /// exactly how far it stays 1:1 and the first divergence (mirror mismatch,
     /// merkle-root mismatch, or an unexecutable tx) if any.
-    #[cfg(feature = "arena-shadow")]
     #[tokio::test]
     #[ignore]
     async fn replay_testnet_blocks() -> Result<(), ChainError> {
@@ -5894,7 +5863,6 @@ mod tests {
     /// stresses the session lockstep (speculative build/discard, accept/commit,
     /// revision advancing across blocks) under random inputs — chainbase is the
     /// C++ oracle.
-    #[cfg(feature = "arena-shadow")]
     #[test]
     fn fuzz_block_sequence_keeps_arena_in_sync() {
         use std::collections::HashSet;
@@ -6893,7 +6861,6 @@ mod tests {
     /// not from chainbase. Deploy a trivial contract and call it; the action
     /// only succeeds if the arena served a byte-identical image the VM can
     /// instantiate, and the system-object read cross-check must stay clean.
-    #[cfg(feature = "arena-shadow")]
     #[tokio::test]
     async fn oracle_contract_code_serves_from_arena() -> Result<(), ChainError> {
         let wasm = wat::parse_str(
@@ -6949,7 +6916,6 @@ mod tests {
     /// contract is the only thing that exercises the path — assert the arena
     /// positioning tally is non-empty (the path really ran) and clean (no
     /// divergence), with arena reads serving every secondary value.
-    #[cfg(feature = "arena-shadow")]
     #[tokio::test]
     async fn oracle_idx64_iterator_handles_mint_and_serve() -> Result<(), ChainError> {
         // scope=100, table=200; rows (primary, secondary): (10,100) (20,200)
@@ -7066,7 +7032,6 @@ mod tests {
     /// (idx_double, whose `last`/order use the software-float key). One contract
     /// drives both surfaces off both ends; the arena must mint chainbase's handle
     /// and land on chainbase's row at every step, served under arena reads.
-    #[cfg(feature = "arena-shadow")]
     #[tokio::test]
     async fn oracle_secondary_wide_key_handles_mint_and_serve() -> Result<(), ChainError> {
         // idx128 table 300, idx_double table 301, scope 100. Rows (primary,

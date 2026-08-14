@@ -41,11 +41,6 @@ pulsevm_softfloat = { path = "../pulsevm_softfloat" }
 pulsevm_ffi = { path = "../pulsevm_ffi" }
 pulsevm_wasm_validation = { path = "../pulsevm_wasm_validation" }
 
-[features]
-# Mirrors state mutations into the native pulsevm_arena Db that pulsevm_ffi's
-# Database carries, so the two can be compared per block. Off in normal builds.
-arena-shadow = ["pulsevm_ffi/arena-shadow"]
-
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 proptest = "1"

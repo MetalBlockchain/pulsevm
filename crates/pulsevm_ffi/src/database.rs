@@ -233,7 +233,6 @@ use crate::{
     PermissionLevelWeight,
     WaitWeight,
 };
-#[cfg(feature = "arena-shadow")]
 use pulsevm_billable_size::billable_size_v;
 use pulsevm_crypto::k1::K1PublicKey;
 
@@ -264,7 +263,6 @@ fn digest_to_array(digest: &CxxDigest) -> [u8; 32] {
 
 /// Converts the FFI elastic-limit parameters into the plain form the arena
 /// mirror needs to run its own `update_elastic_limit`.
-#[cfg(feature = "arena-shadow")]
 fn to_elastic_params(p: &ElasticLimitParameters) -> crate::shadow::ElasticParams {
     crate::shadow::ElasticParams {
         target: p.target,
@@ -279,7 +277,6 @@ fn to_elastic_params(p: &ElasticLimitParameters) -> crate::shadow::ElasticParams
 /// Reverse of [`to_elastic_params`]: rebuilds the FFI `ElasticLimitParameters`
 /// from the arena's plain params, so the resource-limit getters can serve the
 /// config off the arena when chainbase is absent.
-#[cfg(feature = "arena-shadow")]
 fn from_elastic_params(p: &crate::shadow::ElasticParams) -> ElasticLimitParameters {
     ElasticLimitParameters {
         target: p.target,
@@ -300,7 +297,6 @@ fn from_elastic_params(p: &crate::shadow::ElasticParams) -> ElasticLimitParamete
 /// Reads the active `chain_config` from a chainbase `CxxChainConfig` into the
 /// plain params the arena mirror stores. Only the fields both sides carry (see
 /// [`crate::shadow::ChainConfigParams`]).
-#[cfg(feature = "arena-shadow")]
 fn chain_config_params_from_cxx(c: &ffi::CxxChainConfig) -> crate::shadow::ChainConfigParams {
     crate::shadow::ChainConfigParams {
         max_block_net_usage: c.get_max_block_net_usage(),
@@ -351,7 +347,6 @@ fn chain_config_v0_from_cxx(c: &ffi::CxxChainConfig) -> ChainConfigV0 {
 /// The runtime `chain_config` rebuilt from the arena's mirrored params — the same
 /// 16 fields, `deferred_trx_expiration_window` reported 0 as above. Lets the
 /// per-tx/per-block config reads serve off the arena with no chainbase object.
-#[cfg(feature = "arena-shadow")]
 fn chain_config_v0_from_params(p: &crate::shadow::ChainConfigParams) -> ChainConfigV0 {
     ChainConfigV0 {
         max_block_net_usage: p.max_block_net_usage,
@@ -376,7 +371,6 @@ fn chain_config_v0_from_params(p: &crate::shadow::ChainConfigParams) -> ChainCon
 
 /// The same params from the `ChainConfigV0` a `setparams` intrinsic just wrote —
 /// so the mirror updates to exactly what chainbase was handed.
-#[cfg(feature = "arena-shadow")]
 fn chain_config_params_from_v0(cfg: &ChainConfigV0) -> crate::shadow::ChainConfigParams {
     crate::shadow::ChainConfigParams {
         max_block_net_usage: cfg.max_block_net_usage,
@@ -548,7 +542,6 @@ fn rpc_table_page(
 /// round-trips. This is what lets the arena serve the *whole* authority (not just
 /// the threshold) for authorization checks, which consume a bridge `Authority`
 /// via `CxxSharedAuthority::to_authority`.
-#[cfg(feature = "arena-shadow")]
 fn decode_authority(blob: &[u8]) -> Result<Authority, ChainError> {
     fn take<'a>(b: &'a [u8], pos: &mut usize, n: usize) -> Result<&'a [u8], ChainError> {
         let end = pos
@@ -615,12 +608,10 @@ fn decode_authority(blob: &[u8]) -> Result<Authority, ChainError> {
 /// mirror stores for `permission_object::auth` (a `shared_authority`). The exact
 /// encoding is private to the mirror; it only has to be stable so equal
 /// authorities hash equal.
-#[cfg(feature = "arena-shadow")]
 /// Build an authority blob in the exact [`encode_authority`] layout from plain
 /// parts — used by the pure-Rust genesis, which has no FFI `Authority` object.
 /// `keys` are `(packed_public_key_bytes, weight)`, `accounts` are
 /// `(actor, permission, weight)`, `waits` are `(wait_sec, weight)`.
-#[cfg(feature = "arena-shadow")]
 fn build_auth_blob(
     threshold: u32,
     keys: &[(Vec<u8>, u16)],
@@ -680,7 +671,6 @@ fn encode_authority(auth: &Authority) -> Vec<u8> {
 /// (`authority.hpp::get_billable_size`): each key adds `billable_size_v<KeyWeight>`
 /// plus its packed size, each account adds `billable_size_v<PermissionLevelWeight>`,
 /// each wait adds `billable_size_v<WaitWeight>`. `None` if the blob is malformed.
-#[cfg(feature = "arena-shadow")]
 fn authority_blob_billable_size(blob: &[u8]) -> Option<i64> {
     fn rd_u32(b: &[u8], pos: &mut usize) -> Option<usize> {
         let end = pos.checked_add(4).filter(|e| *e <= b.len())?;
@@ -723,7 +713,6 @@ fn authority_blob_billable_size(blob: &[u8]) -> Option<i64> {
 
 /// The `(code, scope, table)` triple of a contract table, packed into `u64`s for
 /// the arena mirror, which keys its contract-table rows by this triple.
-#[cfg(feature = "arena-shadow")]
 fn table_key(table: &TableObject) -> (u64, u64, u64) {
     (
         table.get_code().to_uint64_t(),
@@ -743,7 +732,6 @@ pub struct Database {
     /// The native pulsevm_arena mirror, shared across clones. Carried here so
     /// writes reach it through the same handle every apply/transaction context
     /// already uses (see `shadow.rs`). Only present in arena-shadow builds.
-    #[cfg(feature = "arena-shadow")]
     shadow: Option<crate::shadow::ArenaShadow>,
 }
 
@@ -778,7 +766,6 @@ impl Database {
                 inner: Arc::new(RwLock::new(db)),
                 path: path.to_string(),
                 size,
-                #[cfg(feature = "arena-shadow")]
                 shadow: None,
             })
         }
@@ -789,7 +776,6 @@ impl Database {
     /// Attaches a fresh arena mirror at chainbase's current revision. Every
     /// clone of this handle then shares it, so ported writes are mirrored.
     pub fn enable_shadow(&mut self) -> Result<(), ChainError> {
-        #[cfg(feature = "arena-shadow")]
         {
             let shadow = crate::shadow::ArenaShadow::new()
                 .map_err(|e| ChainError::InternalError(format!("arena shadow init: {e:?}")))?;
@@ -805,16 +791,10 @@ impl Database {
     /// `None` if the mirror has no such row / shadowing is off — for diffing
     /// against chainbase's `find_account_metadata`.
     pub fn arena_account_metadata_privileged(&self, name: u64) -> Option<bool> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .and_then(|s| s.account_metadata_privileged(name))
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = name;
-            None
         }
     }
 
@@ -822,7 +802,6 @@ impl Database {
     /// is off / the row is absent — for field-for-field diffing against the
     /// chainbase `account_metadata_object` accessors.
     pub fn arena_account_metadata(&self, name: u64) -> Option<ArenaAccountMetadata> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
@@ -851,27 +830,16 @@ impl Database {
                     },
                 )
         }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = name;
-            None
-        }
     }
 
     /// Permission snapshot `(parent id, authority threshold)` from the mirror, or
     /// `None` when shadowing is off / the permission is absent — for diffing
     /// against chainbase's `find_permission_by_actor_and_permission`.
     pub fn arena_permission(&self, owner: u64, perm_name: u64) -> Option<(i64, u32)> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .and_then(|s| s.permission(owner, perm_name))
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = (owner, perm_name);
-            None
         }
     }
 
@@ -880,7 +848,6 @@ impl Database {
     /// permission is absent. This is the whole authority the authorization checker
     /// consumes (threshold, keys, accounts, waits), not just the threshold, so it
     /// can eventually replace the chainbase `PermissionObject::get_authority` read.
-    #[cfg(feature = "arena-shadow")]
     pub fn arena_permission_authority(&self, owner: u64, perm_name: u64) -> Option<Authority> {
         let blob = self
             .shadow
@@ -892,7 +859,6 @@ impl Database {
     /// Every permission of `owner` as `(perm_name, parent_perm_name, authority)`
     /// in `(owner, perm_name)` order, for the RPC account formatter. Empty when
     /// shadowing is off.
-    #[cfg(feature = "arena-shadow")]
     pub fn arena_permissions_of(&self, owner: u64) -> Vec<(u64, u64, Authority)> {
         let Some(s) = self.shadow.as_ref() else {
             return Vec::new();
@@ -911,16 +877,10 @@ impl Database {
     /// message_type)`, or `None` when shadowing is off / the link is absent — for
     /// diffing against chainbase's `find_permission_link`.
     pub fn arena_permission_link(&self, account: u64, code: u64, message_type: u64) -> Option<u64> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .and_then(|s| s.permission_link(account, code, message_type))
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = (account, code, message_type);
-            None
         }
     }
 
@@ -928,16 +888,10 @@ impl Database {
     /// the account is absent — for diffing against chainbase's
     /// `get_account_ram_usage`.
     pub fn arena_account_ram_usage(&self, account_name: u64) -> Option<u64> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .and_then(|s| s.account_ram_usage(account_name))
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = account_name;
-            None
         }
     }
 
@@ -949,17 +903,11 @@ impl Database {
         scope: u64,
         table: u64,
     ) -> Vec<(u64, u64, Vec<u8>)> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .map(|s| s.table_range_with_payer(code, scope, table))
                 .unwrap_or_default()
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = (code, scope, table);
-            Vec::new()
         }
     }
 
@@ -971,33 +919,21 @@ impl Database {
         scope: u64,
         table: u64,
     ) -> Vec<(u64, u64, u64)> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .map(|s| s.idx64_range_with_payer(code, scope, table))
                 .unwrap_or_default()
         }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = (code, scope, table);
-            Vec::new()
-        }
     }
 
     /// The account's creation-date block-timestamp slot, for the RPC account
     /// formatter's `created` field. `None` when shadowing is off / absent.
     pub fn arena_account_creation_date(&self, account_name: u64) -> Option<u32> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .and_then(|s| s.account_creation_date(account_name))
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = account_name;
-            None
         }
     }
 
@@ -1005,32 +941,20 @@ impl Database {
     /// contract rows the RPC formatters return. `None` when shadowing is off /
     /// the account is absent.
     pub fn arena_account_abi_bytes(&self, account_name: u64) -> Option<Vec<u8>> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .and_then(|s| s.account_abi_bytes(account_name))
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = account_name;
-            None
         }
     }
 
     /// The account's `last_code_update` (fc microseconds), for the RPC account
     /// formatter. `None` when shadowing is off / the metadata is absent.
     pub fn arena_account_last_code_update(&self, account_name: u64) -> Option<i64> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .and_then(|s| s.account_last_code_update(account_name))
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = account_name;
-            None
         }
     }
 
@@ -1048,15 +972,10 @@ impl Database {
     /// when shadowing is off — byte-compatible with `account_metadata_state_bytes`
     /// so their hashes match iff the tables hold the same state.
     pub fn arena_account_metadata_state_bytes(&self) -> Option<Vec<u8>> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .map(|s| s.account_metadata_state_bytes())
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            None
         }
     }
 
@@ -1073,14 +992,7 @@ impl Database {
     /// The arena mirror's canonical account_object serialization, or `None` when
     /// shadowing is off.
     pub fn arena_account_state_bytes(&self) -> Option<Vec<u8>> {
-        #[cfg(feature = "arena-shadow")]
-        {
-            self.shadow.as_ref().map(|s| s.account_state_bytes())
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            None
-        }
+        { self.shadow.as_ref().map(|s| s.account_state_bytes()) }
     }
 
     /// Canonical serialization of chainbase's whole permission table in
@@ -1090,7 +1002,6 @@ impl Database {
     /// reimplementing the encoding in C++. Reserved perm 0 is skipped by the
     /// C++ key enumerator. Gated on the mirror feature since it reuses
     /// `encode_authority`.
-    #[cfg(feature = "arena-shadow")]
     pub fn permission_state_bytes(&self) -> Result<Vec<u8>, ChainError> {
         let guard = self.locked_read()?;
         let keys = guard
@@ -1129,14 +1040,7 @@ impl Database {
     /// The arena mirror's canonical permission serialization, or `None` when
     /// shadowing is off.
     pub fn arena_permission_state_bytes(&self) -> Option<Vec<u8>> {
-        #[cfg(feature = "arena-shadow")]
-        {
-            self.shadow.as_ref().map(|s| s.permission_state_bytes())
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            None
-        }
+        { self.shadow.as_ref().map(|s| s.permission_state_bytes()) }
     }
 
     pub fn permission_link_state_bytes(&self) -> Result<Vec<u8>, ChainError> {
@@ -1179,7 +1083,6 @@ impl Database {
         // getters throw rather than return an empty row. The chainbase side of
         // the cross-impl serialization is unused in that mode (the arena is the
         // sole oracle), so hand back an empty blob instead.
-        #[cfg(feature = "arena-shadow")]
         if self.arena_rust_genesis() {
             return Ok(Vec::new());
         }
@@ -1193,71 +1096,31 @@ impl Database {
     /// when shadowing is off — each byte-compatible with the chainbase method of
     /// the same name for the cross-impl root.
     pub fn arena_permission_link_state_bytes(&self) -> Option<Vec<u8>> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .map(|s| s.permission_link_state_bytes())
         }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            None
-        }
     }
 
     pub fn arena_code_state_bytes(&self) -> Option<Vec<u8>> {
-        #[cfg(feature = "arena-shadow")]
-        {
-            self.shadow.as_ref().map(|s| s.code_state_bytes())
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            None
-        }
+        { self.shadow.as_ref().map(|s| s.code_state_bytes()) }
     }
 
     pub fn arena_transaction_state_bytes(&self) -> Option<Vec<u8>> {
-        #[cfg(feature = "arena-shadow")]
-        {
-            self.shadow.as_ref().map(|s| s.transaction_state_bytes())
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            None
-        }
+        { self.shadow.as_ref().map(|s| s.transaction_state_bytes()) }
     }
 
     pub fn arena_resource_usage_state_bytes(&self) -> Option<Vec<u8>> {
-        #[cfg(feature = "arena-shadow")]
-        {
-            self.shadow.as_ref().map(|s| s.resource_usage_state_bytes())
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            None
-        }
+        { self.shadow.as_ref().map(|s| s.resource_usage_state_bytes()) }
     }
 
     pub fn arena_account_limits_state_bytes(&self) -> Option<Vec<u8>> {
-        #[cfg(feature = "arena-shadow")]
-        {
-            self.shadow.as_ref().map(|s| s.account_limits_state_bytes())
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            None
-        }
+        { self.shadow.as_ref().map(|s| s.account_limits_state_bytes()) }
     }
 
     pub fn arena_resource_state_bytes(&self) -> Option<Vec<u8>> {
-        #[cfg(feature = "arena-shadow")]
-        {
-            self.shadow.as_ref().map(|s| s.resource_state_bytes())
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            None
-        }
+        { self.shadow.as_ref().map(|s| s.resource_state_bytes()) }
     }
 
     pub fn contract_table_state_bytes(&self) -> Result<Vec<u8>, ChainError> {
@@ -1275,25 +1138,11 @@ impl Database {
     }
 
     pub fn arena_contract_table_state_bytes(&self) -> Option<Vec<u8>> {
-        #[cfg(feature = "arena-shadow")]
-        {
-            self.shadow.as_ref().map(|s| s.contract_table_state_bytes())
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            None
-        }
+        { self.shadow.as_ref().map(|s| s.contract_table_state_bytes()) }
     }
 
     pub fn arena_contract_kv_state_bytes(&self) -> Option<Vec<u8>> {
-        #[cfg(feature = "arena-shadow")]
-        {
-            self.shadow.as_ref().map(|s| s.contract_kv_state_bytes())
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            None
-        }
+        { self.shadow.as_ref().map(|s| s.contract_kv_state_bytes()) }
     }
 
     /// Serve a raw contract-db read from the arena: the value stored at
@@ -1307,16 +1156,10 @@ impl Database {
         table: u64,
         primary_key: u64,
     ) -> Option<Vec<u8>> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .and_then(|s| s.kv_get(code, scope, table, primary_key))
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = (code, scope, table, primary_key);
-            None
         }
     }
 
@@ -1325,17 +1168,11 @@ impl Database {
     /// a contract sees walking db_lowerbound_i64 -> db_next_i64. Empty when the
     /// table is absent or shadowing is off.
     pub fn arena_table_range(&self, code: u64, scope: u64, table: u64) -> Vec<(u64, Vec<u8>)> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .map(|s| s.table_range(code, scope, table))
                 .unwrap_or_default()
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = (code, scope, table);
-            Vec::new()
         }
     }
 
@@ -1351,22 +1188,16 @@ impl Database {
         primary: u64,
         expected: &[u8],
     ) {
-        #[cfg(feature = "arena-shadow")]
         {
             if let Some(s) = &self.shadow {
                 s.crosscheck_kv(code, scope, table, primary, expected);
             }
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = (code, scope, table, primary, expected);
         }
     }
 
     /// Route contract reads through the arena instead of chainbase (the staged
     /// cutover switch). No-op when shadowing is off.
     pub fn enable_arena_reads(&self) {
-        #[cfg(feature = "arena-shadow")]
         {
             if let Some(s) = &self.shadow {
                 s.enable_reads();
@@ -1375,16 +1206,11 @@ impl Database {
     }
 
     pub fn arena_reads_enabled(&self) -> bool {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .map(|s| s.reads_enabled())
                 .unwrap_or(false)
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            false
         }
     }
 
@@ -1392,16 +1218,11 @@ impl Database {
     /// consulting chainbase on the read path (arena-standalone mode). No-op false
     /// when shadowing is off.
     pub fn arena_standalone_reads(&self) -> bool {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .map(|s| s.standalone_reads())
                 .unwrap_or(false)
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            false
         }
     }
 
@@ -1409,7 +1230,6 @@ impl Database {
     /// arena becomes the authoritative write backend (no live oracle). No-op when
     /// shadowing is off.
     pub fn enable_arena_standalone_writes(&self) {
-        #[cfg(feature = "arena-shadow")]
         {
             if let Some(s) = &self.shadow {
                 s.enable_standalone_writes();
@@ -1420,48 +1240,33 @@ impl Database {
     /// Whether genesis authors the arena directly instead of running C++ genesis
     /// and hydrating from it. No-op false when shadowing is off.
     pub fn arena_rust_genesis(&self) -> bool {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .map(|s| s.rust_genesis())
                 .unwrap_or(false)
         }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            false
-        }
     }
 
     /// Whether execution should apply writes to the arena only, skipping the
     /// chainbase write. No-op false when shadowing is off.
     pub fn arena_standalone_writes(&self) -> bool {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .map(|s| s.standalone_writes())
                 .unwrap_or(false)
         }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            false
-        }
     }
 
     /// (matches, mismatches) tallied by the inline read cross-check, or (0, 0)
     /// when shadowing is off.
     pub fn arena_read_crosscheck_counts(&self) -> (u64, u64) {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .map(|s| s.read_crosscheck_counts())
                 .unwrap_or((0, 0))
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            (0, 0)
         }
     }
 
@@ -1470,75 +1275,45 @@ impl Database {
     /// db_next successor), `prev` = last primary < key. `None` = off the end.
     /// All return `None` when shadowing is off.
     pub fn arena_kv_lower_bound(&self, code: u64, scope: u64, table: u64, key: u64) -> Option<u64> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .and_then(|s| s.kv_lower_bound(code, scope, table, key))
         }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = (code, scope, table, key);
-            None
-        }
     }
 
     pub fn arena_kv_table_exists(&self, code: u64, scope: u64, table: u64) -> bool {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .map(|s| s.kv_table_exists(code, scope, table))
                 .unwrap_or(false)
         }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = (code, scope, table);
-            false
-        }
     }
 
     pub fn arena_kv_upper_bound(&self, code: u64, scope: u64, table: u64, key: u64) -> Option<u64> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .and_then(|s| s.kv_upper_bound(code, scope, table, key))
         }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = (code, scope, table, key);
-            None
-        }
     }
 
     pub fn arena_kv_prev(&self, code: u64, scope: u64, table: u64, key: u64) -> Option<u64> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .and_then(|s| s.kv_prev(code, scope, table, key))
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = (code, scope, table, key);
-            None
         }
     }
 
     /// Largest primary in the table — db_previous_i64's landing when stepping
     /// back from the end iterator. `None` if empty or shadowing is off.
     pub fn arena_kv_last(&self, code: u64, scope: u64, table: u64) -> Option<u64> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .and_then(|s| s.kv_last(code, scope, table))
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = (code, scope, table);
-            None
         }
     }
 
@@ -1554,16 +1329,10 @@ impl Database {
         table: u64,
         secondary: u64,
     ) -> Option<u64> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .and_then(|s| s.idx64_find_secondary(code, scope, table, secondary))
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = (code, scope, table, secondary);
-            None
         }
     }
 
@@ -1574,16 +1343,10 @@ impl Database {
         table: u64,
         secondary: u64,
     ) -> Option<(u64, u64)> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .and_then(|s| s.idx64_lower_bound(code, scope, table, secondary))
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = (code, scope, table, secondary);
-            None
         }
     }
 
@@ -1594,16 +1357,10 @@ impl Database {
         table: u64,
         secondary: u64,
     ) -> Option<(u64, u64)> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .and_then(|s| s.idx64_upper_bound(code, scope, table, secondary))
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = (code, scope, table, secondary);
-            None
         }
     }
 
@@ -1614,16 +1371,10 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<u64> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .and_then(|s| s.idx64_find_primary(code, scope, table, primary))
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = (code, scope, table, primary);
-            None
         }
     }
 
@@ -1638,16 +1389,10 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<(u64, u64)> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .and_then(|s| s.idx64_next(code, scope, table, primary))
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = (code, scope, table, primary);
-            None
         }
     }
 
@@ -1658,16 +1403,10 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<(u64, u64)> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .and_then(|s| s.idx64_previous(code, scope, table, primary))
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = (code, scope, table, primary);
-            None
         }
     }
 
@@ -1683,14 +1422,11 @@ impl Database {
         payer: u64,
         secondary: u64,
     ) {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && let Err(e) = s.update_index64_object(code, scope, table, primary, payer, secondary)
         {
             eprintln!("arena mirror of update_index64_object diverged: {e:?}");
         }
-        #[cfg(not(feature = "arena-shadow"))]
-        let _ = (code, scope, table, primary, payer, secondary);
     }
 
     pub fn arena_update_index128(
@@ -1702,14 +1438,11 @@ impl Database {
         payer: u64,
         secondary: u128,
     ) {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && let Err(e) = s.update_index128_object(code, scope, table, primary, payer, secondary)
         {
             eprintln!("arena mirror of update_index128_object diverged: {e:?}");
         }
-        #[cfg(not(feature = "arena-shadow"))]
-        let _ = (code, scope, table, primary, payer, secondary);
     }
 
     pub fn arena_update_index256(
@@ -1721,15 +1454,12 @@ impl Database {
         payer: u64,
         secondary: &U256,
     ) {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && let Err(e) =
                 s.update_index256_object(code, scope, table, primary, payer, secondary.value)
         {
             eprintln!("arena mirror of update_index256_object diverged: {e:?}");
         }
-        #[cfg(not(feature = "arena-shadow"))]
-        let _ = (code, scope, table, primary, payer, secondary);
     }
 
     pub fn arena_update_idx_double(
@@ -1741,15 +1471,12 @@ impl Database {
         payer: u64,
         secondary: u64,
     ) {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && let Err(e) =
                 s.update_idx_double_object(code, scope, table, primary, payer, secondary)
         {
             eprintln!("arena mirror of update_idx_double_object diverged: {e:?}");
         }
-        #[cfg(not(feature = "arena-shadow"))]
-        let _ = (code, scope, table, primary, payer, secondary);
     }
 
     pub fn arena_update_idx_long_double(
@@ -1761,7 +1488,6 @@ impl Database {
         payer: u64,
         secondary: &Float128,
     ) {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && let Err(e) = s.update_idx_long_double_object(
                 code,
@@ -1774,21 +1500,13 @@ impl Database {
         {
             eprintln!("arena mirror of update_idx_long_double_object diverged: {e:?}");
         }
-        #[cfg(not(feature = "arena-shadow"))]
-        let _ = (code, scope, table, primary, payer, secondary);
     }
 
     pub fn arena_idx64_last(&self, code: u64, scope: u64, table: u64) -> Option<(u64, u64)> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .and_then(|s| s.idx64_last(code, scope, table))
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = (code, scope, table);
-            None
         }
     }
 
@@ -1799,16 +1517,10 @@ impl Database {
         table: u64,
         secondary: u128,
     ) -> Option<u64> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .and_then(|s| s.idx128_find_secondary(code, scope, table, secondary))
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = (code, scope, table, secondary);
-            None
         }
     }
 
@@ -1819,16 +1531,10 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<u128> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .and_then(|s| s.idx128_find_primary(code, scope, table, primary))
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = (code, scope, table, primary);
-            None
         }
     }
 
@@ -1839,16 +1545,10 @@ impl Database {
         table: u64,
         secondary: u128,
     ) -> Option<(u64, u128)> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .and_then(|s| s.idx128_lower_bound(code, scope, table, secondary))
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = (code, scope, table, secondary);
-            None
         }
     }
 
@@ -1859,16 +1559,10 @@ impl Database {
         table: u64,
         secondary: u128,
     ) -> Option<(u64, u128)> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .and_then(|s| s.idx128_upper_bound(code, scope, table, secondary))
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = (code, scope, table, secondary);
-            None
         }
     }
 
@@ -1881,16 +1575,10 @@ impl Database {
         table: u64,
         secondary_bits: u64,
     ) -> Option<u64> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow.as_ref().and_then(|s| {
                 s.idx_double_find_secondary(code, scope, table, f64::from_bits(secondary_bits))
             })
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = (code, scope, table, secondary_bits);
-            None
         }
     }
 
@@ -1901,17 +1589,11 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<u64> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .and_then(|s| s.idx_double_find_primary(code, scope, table, primary))
                 .map(|f| f.to_bits())
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = (code, scope, table, primary);
-            None
         }
     }
 
@@ -1922,7 +1604,6 @@ impl Database {
         table: u64,
         secondary_bits: u64,
     ) -> Option<(u64, u64)> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
@@ -1930,11 +1611,6 @@ impl Database {
                     s.idx_double_lower_bound(code, scope, table, f64::from_bits(secondary_bits))
                 })
                 .map(|(p, f)| (p, f.to_bits()))
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = (code, scope, table, secondary_bits);
-            None
         }
     }
 
@@ -1945,7 +1621,6 @@ impl Database {
         table: u64,
         secondary_bits: u64,
     ) -> Option<(u64, u64)> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
@@ -1953,11 +1628,6 @@ impl Database {
                     s.idx_double_upper_bound(code, scope, table, f64::from_bits(secondary_bits))
                 })
                 .map(|(p, f)| (p, f.to_bits()))
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = (code, scope, table, secondary_bits);
-            None
         }
     }
 
@@ -1969,16 +1639,10 @@ impl Database {
         table: u64,
         secondary: [u8; 32],
     ) -> Option<u64> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .and_then(|s| s.idx256_find_secondary(code, scope, table, secondary))
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = (code, scope, table, secondary);
-            None
         }
     }
 
@@ -1989,16 +1653,10 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<[u8; 32]> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .and_then(|s| s.idx256_find_primary(code, scope, table, primary))
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = (code, scope, table, primary);
-            None
         }
     }
 
@@ -2009,16 +1667,10 @@ impl Database {
         table: u64,
         secondary: [u8; 32],
     ) -> Option<(u64, [u8; 32])> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .and_then(|s| s.idx256_lower_bound(code, scope, table, secondary))
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = (code, scope, table, secondary);
-            None
         }
     }
 
@@ -2029,16 +1681,10 @@ impl Database {
         table: u64,
         secondary: [u8; 32],
     ) -> Option<(u64, [u8; 32])> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .and_then(|s| s.idx256_upper_bound(code, scope, table, secondary))
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = (code, scope, table, secondary);
-            None
         }
     }
 
@@ -2050,16 +1696,10 @@ impl Database {
         table: u64,
         secondary: (u64, u64),
     ) -> Option<u64> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .and_then(|s| s.idx_long_double_find_secondary(code, scope, table, secondary))
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = (code, scope, table, secondary);
-            None
         }
     }
 
@@ -2070,16 +1710,10 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<(u64, u64)> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .and_then(|s| s.idx_long_double_find_primary(code, scope, table, primary))
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = (code, scope, table, primary);
-            None
         }
     }
 
@@ -2090,16 +1724,10 @@ impl Database {
         table: u64,
         secondary: (u64, u64),
     ) -> Option<(u64, (u64, u64))> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .and_then(|s| s.idx_long_double_lower_bound(code, scope, table, secondary))
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = (code, scope, table, secondary);
-            None
         }
     }
 
@@ -2110,16 +1738,10 @@ impl Database {
         table: u64,
         secondary: (u64, u64),
     ) -> Option<(u64, (u64, u64))> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .and_then(|s| s.idx_long_double_upper_bound(code, scope, table, secondary))
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = (code, scope, table, secondary);
-            None
         }
     }
 
@@ -2135,16 +1757,10 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<u64> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .and_then(|s| s.idx128_next(code, scope, table, primary))
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = (code, scope, table, primary);
-            None
         }
     }
 
@@ -2155,30 +1771,18 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<u64> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .and_then(|s| s.idx128_previous(code, scope, table, primary))
         }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = (code, scope, table, primary);
-            None
-        }
     }
 
     pub fn arena_idx128_last(&self, code: u64, scope: u64, table: u64) -> Option<u64> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .and_then(|s| s.idx128_last(code, scope, table))
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = (code, scope, table);
-            None
         }
     }
 
@@ -2189,16 +1793,10 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<u64> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .and_then(|s| s.idx256_next(code, scope, table, primary))
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = (code, scope, table, primary);
-            None
         }
     }
 
@@ -2209,30 +1807,18 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<u64> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .and_then(|s| s.idx256_previous(code, scope, table, primary))
         }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = (code, scope, table, primary);
-            None
-        }
     }
 
     pub fn arena_idx256_last(&self, code: u64, scope: u64, table: u64) -> Option<u64> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .and_then(|s| s.idx256_last(code, scope, table))
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = (code, scope, table);
-            None
         }
     }
 
@@ -2243,16 +1829,10 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<u64> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .and_then(|s| s.idx_double_next(code, scope, table, primary))
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = (code, scope, table, primary);
-            None
         }
     }
 
@@ -2263,30 +1843,18 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<u64> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .and_then(|s| s.idx_double_previous(code, scope, table, primary))
         }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = (code, scope, table, primary);
-            None
-        }
     }
 
     pub fn arena_idx_double_last(&self, code: u64, scope: u64, table: u64) -> Option<u64> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .and_then(|s| s.idx_double_last(code, scope, table))
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = (code, scope, table);
-            None
         }
     }
 
@@ -2297,16 +1865,10 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<u64> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .and_then(|s| s.idx_long_double_next(code, scope, table, primary))
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = (code, scope, table, primary);
-            None
         }
     }
 
@@ -2317,59 +1879,37 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<u64> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .and_then(|s| s.idx_long_double_previous(code, scope, table, primary))
         }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = (code, scope, table, primary);
-            None
-        }
     }
 
     pub fn arena_idx_long_double_last(&self, code: u64, scope: u64, table: u64) -> Option<u64> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .and_then(|s| s.idx_long_double_last(code, scope, table))
         }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = (code, scope, table);
-            None
-        }
     }
 
     /// Tally an iterator-positioning cross-check (arena landing vs chainbase).
     pub fn arena_note_pos(&self, matched: bool) {
-        #[cfg(feature = "arena-shadow")]
         {
             if let Some(s) = &self.shadow {
                 s.note_pos(matched);
             }
         }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = matched;
-        }
     }
 
     /// (matches, mismatches) tallied by iterator-positioning cross-checks.
     pub fn arena_pos_crosscheck_counts(&self) -> (u64, u64) {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .map(|s| s.pos_crosscheck_counts())
                 .unwrap_or((0, 0))
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            (0, 0)
         }
     }
 
@@ -2382,7 +1922,6 @@ impl Database {
         &self,
         path: &std::path::Path,
     ) -> Result<Option<(bool, u64)>, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         {
             let Some(cur) = &self.shadow else {
                 return Ok(None);
@@ -2397,27 +1936,17 @@ impl Database {
                 .map_err(|e| ChainError::InternalError(format!("arena load: {e:?}")))?;
             Ok(Some((cur.state_root() == fresh.state_root(), size)))
         }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = path;
-            Ok(None)
-        }
     }
 
     /// Append the mirror's committed delta since the last flush to the WAL at
     /// `path`. Call once per accepted block for incremental durability. No-op
     /// when shadowing is off.
     pub fn arena_flush_delta(&self, path: &std::path::Path) -> Result<(), ChainError> {
-        #[cfg(feature = "arena-shadow")]
         {
             if let Some(s) = &self.shadow {
                 s.flush_delta(path)
                     .map_err(|e| ChainError::InternalError(format!("arena flush_delta: {e:?}")))?;
             }
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = path;
         }
         Ok(())
     }
@@ -2430,7 +1959,6 @@ impl Database {
         &self,
         path: &std::path::Path,
     ) -> Result<Option<bool>, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         {
             let Some(cur) = &self.shadow else {
                 return Ok(None);
@@ -2442,11 +1970,6 @@ impl Database {
                 .map_err(|e| ChainError::InternalError(format!("arena replay_log: {e:?}")))?;
             Ok(Some(cur.state_root() == fresh.state_root()))
         }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = path;
-            Ok(None)
-        }
     }
 
     /// Simulate a node restart: checkpoint the live mirror to `path`, then
@@ -2456,7 +1979,6 @@ impl Database {
     /// mirror stays in lockstep with chainbase across the restart. `Ok(false)`
     /// when shadowing is off.
     pub fn arena_restart(&self, path: &std::path::Path) -> Result<bool, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         {
             let Some(cur) = &self.shadow else {
                 return Ok(false);
@@ -2467,86 +1989,57 @@ impl Database {
                 .map_err(|e| ChainError::InternalError(format!("arena reload: {e:?}")))?;
             Ok(true)
         }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = path;
-            Ok(false)
-        }
     }
 
     /// (matches, mismatches) tallied by non-contract read cross-checks
     /// (accounts/permissions read during authorization and dispatch).
     pub fn arena_noncontract_crosscheck_counts(&self) -> (u64, u64) {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .map(|s| s.noncontract_crosscheck_counts())
                 .unwrap_or((0, 0))
         }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            (0, 0)
-        }
     }
 
     /// Whether the arena mirror holds an account_object for `name` — for diffing
     /// against chainbase's `find_account`.
     pub fn arena_account_exists(&self, name: u64) -> bool {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .map(|s| s.account_exists(name))
                 .unwrap_or(false)
         }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = name;
-            false
-        }
     }
 
     /// State root of the mirrored subset, or `None` when shadowing is off. Only
     /// ported tables contribute, so it is comparable to chainbase for those.
     pub fn arena_state_root(&self) -> Option<[u8; 32]> {
-        #[cfg(feature = "arena-shadow")]
-        {
-            self.shadow.as_ref().map(|s| s.state_root())
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            None
-        }
+        { self.shadow.as_ref().map(|s| s.state_root()) }
     }
 
     /// Arena undo-session lifecycle, driven by the controller in lockstep with
     /// the chainbase session boundaries.
     pub fn arena_start_undo_session(&self) {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow {
             s.start_undo_session();
         }
     }
     pub fn arena_squash(&self) {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow {
             s.squash();
         }
     }
     pub fn arena_undo(&self) {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow {
             s.undo();
         }
     }
     pub fn arena_commit(&self, revision: i64) {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow {
             s.commit(revision);
         }
-        #[cfg(not(feature = "arena-shadow"))]
-        let _ = revision;
     }
 
     // Replace the inner database with null to call the destructors
@@ -2738,7 +2231,6 @@ impl Database {
         Ok(())
     }
 
-    #[cfg_attr(not(feature = "arena-shadow"), allow(unused_variables))]
     pub fn initialize_database(
         &mut self,
         genesis: &CxxGenesisState,
@@ -2747,7 +2239,6 @@ impl Database {
         // Pure-Rust genesis: author the arena directly and never touch chainbase —
         // the last chainbase write removed. Gated while it is validated against
         // block-1 golden roots (see `initialize_genesis_arena`).
-        #[cfg(feature = "arena-shadow")]
         if self.arena_rust_genesis() {
             return self.initialize_genesis_arena(rust_genesis);
         }
@@ -2761,7 +2252,6 @@ impl Database {
         // Genesis creates the resource_limits state singleton inside C++, out of
         // reach of the per-write mirror hooks, so seed the mirror's copy here
         // with the same slow-start virtual limits (each resource's max).
-        #[cfg(feature = "arena-shadow")]
         if self.shadow.is_some() {
             match (
                 self.chainbase_cpu_limit_parameters(),
@@ -2875,7 +2365,6 @@ impl Database {
     /// `initialize_database` (database.cpp) without a chainbase bootstrap. Every
     /// value is derived from the genesis state or from the fixed genesis
     /// constants, and the whole thing is pinned by the block-1 golden roots.
-    #[cfg(feature = "arena-shadow")]
     fn initialize_genesis_arena(
         &self,
         genesis: &pulsevm_chain_types::GenesisState,
@@ -2994,7 +2483,6 @@ impl Database {
 
     /// Create one genesis permission in the arena (owner-authored cb_id from the
     /// replicated counter), returning its cb_id for parent links.
-    #[cfg(feature = "arena-shadow")]
     fn genesis_permission(
         &self,
         owner: u64,
@@ -3015,7 +2503,6 @@ impl Database {
     /// Reproduce C++ `create_native_account`: account + metadata + owner/active
     /// permissions + resource-limit init + the fixed genesis RAM billing.
     /// Returns the active permission's cb_id.
-    #[cfg(feature = "arena-shadow")]
     fn genesis_native_account(
         &self,
         name: u64,
@@ -3062,7 +2549,6 @@ impl Database {
         account_name: u64,
         creation_date: u32,
     ) -> Result<*const ffi::AccountObject, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && s.standalone_writes()
         {
@@ -3081,7 +2567,6 @@ impl Database {
                 .map_err(|e| ChainError::InternalError(format!("{}", e)))?
                 as *const ffi::AccountObject
         };
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && let Err(e) = s.create_account(account_name, creation_date)
         {
@@ -3130,7 +2615,6 @@ impl Database {
         account_name: u64,
         is_privileged: bool,
     ) -> Result<*const ffi::AccountMetadataObject, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && s.standalone_writes()
         {
@@ -3150,7 +2634,6 @@ impl Database {
         };
         // Mirror after releasing the chainbase lock, so the two locks are never
         // held at once. Chainbase is authoritative; a mirror error is logged.
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && let Err(e) = s.create_account_metadata(account_name, is_privileged)
         {
@@ -3171,7 +2654,6 @@ impl Database {
     }
 
     pub fn set_privileged(&mut self, account: u64, is_privileged: bool) -> Result<(), ChainError> {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && s.standalone_writes()
         {
@@ -3186,7 +2668,6 @@ impl Database {
                 .set_privileged(account, is_privileged)
                 .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
         }
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && let Err(e) = s.set_privileged(account, is_privileged)
         {
@@ -3224,9 +2705,7 @@ impl Database {
         vm_type: u8,
         vm_version: u8,
     ) -> Result<(), ChainError> {
-        #[cfg(feature = "arena-shadow")]
         let hash = digest_to_array(code_hash);
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && s.standalone_writes()
         {
@@ -3250,7 +2729,6 @@ impl Database {
                 .unlink_account_code(unsafe { &*obj_ptr })
                 .map_err(|e| ChainError::ActionValidationError(format!("{}", e)))?;
         }
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && let Err(e) = s.unlink_account_code(hash)
         {
@@ -3273,7 +2751,6 @@ impl Database {
         vm_type: u8,
         vm_version: u8,
     ) -> Result<(), ChainError> {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && s.standalone_writes()
         {
@@ -3315,7 +2792,6 @@ impl Database {
                 )
                 .map_err(|e| ChainError::ActionValidationError(format!("{}", e)))?;
         }
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow {
             let hash = digest_to_array(code_hash);
             if let Err(e) = s.update_account_code(
@@ -3334,7 +2810,6 @@ impl Database {
     }
 
     pub fn update_account_abi(&mut self, account_name: u64, abi: &[u8]) -> Result<(), ChainError> {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && s.standalone_writes()
         {
@@ -3361,7 +2836,6 @@ impl Database {
                 .update_account_abi(unsafe { &*account }, unsafe { &*account_metadata }, abi)
                 .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
         }
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && let Err(e) = s.update_account_abi(account_name, abi)
         {
@@ -3395,7 +2869,6 @@ impl Database {
         &mut self,
         account_name: u64,
     ) -> Result<(), ChainError> {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && s.standalone_writes()
         {
@@ -3414,7 +2887,6 @@ impl Database {
                 .initialize_account_resource_limits(account_name)
                 .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
         }
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && let Err(e) = s.initialize_account_resource_limits(account_name)
         {
@@ -3428,7 +2900,6 @@ impl Database {
         account: &Name,
         time_slot: u32,
     ) -> Result<(), ChainError> {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && s.standalone_writes()
         {
@@ -3443,7 +2914,6 @@ impl Database {
                 .update_account_usage(account.as_u64(), time_slot)
                 .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
         }
-        #[cfg(feature = "arena-shadow")]
         self.mirror_account_usage(account.as_u64(), 0, 0, time_slot);
         Ok(())
     }
@@ -3456,7 +2926,6 @@ impl Database {
         time_slot: u32,
         validate: bool,
     ) -> Result<(), ChainError> {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && s.standalone_writes()
         {
@@ -3471,7 +2940,6 @@ impl Database {
                 .add_transaction_usage(account.as_u64(), cpu_usage, net_usage, time_slot, validate)
                 .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
         }
-        #[cfg(feature = "arena-shadow")]
         self.mirror_account_usage(account.as_u64(), cpu_usage, net_usage, time_slot);
         Ok(())
     }
@@ -3479,7 +2947,6 @@ impl Database {
     /// Replays a net/cpu usage advance onto the arena mirror, pulling the average
     /// windows from chainbase config so the accumulator decay matches. Best
     /// effort: a divergence is logged, never propagated.
-    #[cfg(feature = "arena-shadow")]
     fn mirror_account_usage(&self, account: u64, cpu_usage: u64, net_usage: u64, time_slot: u32) {
         if self.shadow.is_none() {
             return;
@@ -3514,7 +2981,6 @@ impl Database {
         account_name: u64,
         ram_bytes: i64,
     ) -> Result<(), ChainError> {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && s.standalone_writes()
         {
@@ -3531,7 +2997,6 @@ impl Database {
                 .add_pending_ram_usage(account_name, ram_bytes)
                 .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
         }
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && let Err(e) = s.add_pending_ram_usage(account_name, ram_bytes)
         {
@@ -3545,7 +3010,6 @@ impl Database {
         // standalone writes chainbase holds no post-genesis state, so the check
         // can't run there; the arena's own limit enforcement will cover it once
         // ported. Skipping is sound for replaying already-valid history.
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && s.standalone_writes()
         {
@@ -3569,7 +3033,6 @@ impl Database {
     }
 
     pub fn get_account_net_usage_average_window(&self) -> Result<u32, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && s.standalone_reads()
         {
@@ -3585,7 +3048,6 @@ impl Database {
     }
 
     pub fn get_account_cpu_usage_average_window(&self) -> Result<u32, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && s.standalone_reads()
         {
@@ -3617,30 +3079,18 @@ impl Database {
     /// Mirrored net/cpu usage `value_ex` for `account_name`, or `None` when
     /// shadowing is off / the account is absent — for diffing against chainbase.
     pub fn arena_account_net_usage_value_ex(&self, account_name: u64) -> Option<u64> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .and_then(|s| s.account_net_usage_value_ex(account_name))
         }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = account_name;
-            None
-        }
     }
 
     pub fn arena_account_cpu_usage_value_ex(&self, account_name: u64) -> Option<u64> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .and_then(|s| s.account_cpu_usage_value_ex(account_name))
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = account_name;
-            None
         }
     }
 
@@ -3659,7 +3109,6 @@ impl Database {
     }
 
     pub fn get_cpu_limit_parameters(&self) -> Result<ElasticLimitParameters, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && s.standalone_reads()
         {
@@ -3676,7 +3125,6 @@ impl Database {
     }
 
     pub fn get_net_limit_parameters(&self) -> Result<ElasticLimitParameters, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && s.standalone_reads()
         {
@@ -3698,7 +3146,6 @@ impl Database {
     /// config *into* the arena — the arena isn't populated yet, so the public
     /// getters (which would read the arena under standalone_reads) must not be
     /// used there.
-    #[cfg(feature = "arena-shadow")]
     fn chainbase_cpu_limit_parameters(&self) -> Result<ElasticLimitParameters, ChainError> {
         let guard = self.inner.read()?;
         guard
@@ -3707,7 +3154,6 @@ impl Database {
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 
-    #[cfg(feature = "arena-shadow")]
     fn chainbase_net_limit_parameters(&self) -> Result<ElasticLimitParameters, ChainError> {
         let guard = self.inner.read()?;
         guard
@@ -3716,7 +3162,6 @@ impl Database {
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 
-    #[cfg(feature = "arena-shadow")]
     fn chainbase_account_cpu_usage_average_window(&self) -> Result<u32, ChainError> {
         let guard = self.inner.read()?;
         guard
@@ -3724,7 +3169,6 @@ impl Database {
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 
-    #[cfg(feature = "arena-shadow")]
     fn chainbase_account_net_usage_average_window(&self) -> Result<u32, ChainError> {
         let guard = self.inner.read()?;
         guard
@@ -3736,14 +3180,7 @@ impl Database {
     /// shadowing is off / the state row is absent — for diffing against
     /// chainbase's `get_virtual_cpu_limit`/`get_virtual_net_limit`.
     pub fn arena_virtual_limits(&self) -> Option<(u64, u64)> {
-        #[cfg(feature = "arena-shadow")]
-        {
-            self.shadow.as_ref().and_then(|s| s.state_virtual_limits())
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            None
-        }
+        { self.shadow.as_ref().and_then(|s| s.state_virtual_limits()) }
     }
 
     pub fn set_account_limits(
@@ -3753,7 +3190,6 @@ impl Database {
         net_weight: i64,
         cpu_weight: i64,
     ) -> Result<bool, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && s.standalone_writes()
         {
@@ -3777,7 +3213,6 @@ impl Database {
                 .set_account_limits(account_name, ram_bytes, net_weight, cpu_weight)
                 .map_err(|e| ChainError::InternalError(format!("{}", e)))?
         };
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && let Err(e) = s.set_account_limits(account_name, ram_bytes, net_weight, cpu_weight)
         {
@@ -3793,7 +3228,6 @@ impl Database {
         net_weight: &mut i64,
         cpu_weight: &mut i64,
     ) -> Result<(), ChainError> {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && s.standalone_reads()
         {
@@ -3813,7 +3247,6 @@ impl Database {
     }
 
     pub fn get_total_cpu_weight(&self) -> Result<u64, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && s.standalone_reads()
         {
@@ -3830,7 +3263,6 @@ impl Database {
     }
 
     pub fn get_total_net_weight(&self) -> Result<u64, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && s.standalone_reads()
         {
@@ -3851,7 +3283,6 @@ impl Database {
         name: u64,
         greylist_limit: u32,
     ) -> Result<ffi::NetLimitResult, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && s.standalone_reads()
         {
@@ -3873,7 +3304,6 @@ impl Database {
         name: u64,
         greylist_limit: u32,
     ) -> Result<ffi::CpuLimitResult, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && s.standalone_reads()
         {
@@ -3891,7 +3321,6 @@ impl Database {
     }
 
     pub fn process_account_limit_updates(&mut self) -> Result<(), ChainError> {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && s.standalone_writes()
         {
@@ -3906,7 +3335,6 @@ impl Database {
                 .process_account_limit_updates()
                 .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
         }
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && let Err(e) = s.process_account_limit_updates()
         {
@@ -3919,16 +3347,10 @@ impl Database {
     /// `account_name`, or `None` when shadowing is off / the account is absent —
     /// for diffing against chainbase's `get_account_limits`.
     pub fn arena_account_limits(&self, account_name: u64) -> Option<(i64, i64, i64)> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .and_then(|s| s.account_limits(account_name))
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = account_name;
-            None
         }
     }
 
@@ -3940,7 +3362,6 @@ impl Database {
         // Chainbase-free (standalone writes / Rust genesis): the resource-state
         // read and write paths are all arena-served now, so update the arena
         // config alone and skip the chainbase write.
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && s.rust_genesis()
         {
@@ -3967,7 +3388,6 @@ impl Database {
 
         // Mirror the elastic cpu/net params into the arena resource_limits_config
         // (the averaging windows are genesis constants, left as seeded).
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && let Err(e) = s.set_block_parameters(
                 to_elastic_params(cpu_limit_parameters),
@@ -3982,7 +3402,6 @@ impl Database {
 
     /// Canonical serialization of the chainbase `resource_limits_config_object` —
     /// byte-compatible with the arena mirror's `resource_config_state_bytes`.
-    #[cfg(feature = "arena-shadow")]
     pub fn resource_config_state_bytes(&self) -> Result<Vec<u8>, ChainError> {
         // Chainbase absent under a Rust genesis; its side of the cross-impl
         // serialization is unused there (see resource_state_bytes).
@@ -4000,22 +3419,16 @@ impl Database {
 
     /// Arena mirror of resource_limits_config, `None` when shadowing is off.
     pub fn arena_resource_config_state_bytes(&self) -> Option<Vec<u8>> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .map(|s| s.resource_config_state_bytes())
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            None
         }
     }
 
     pub fn process_block_usage(&mut self, block_num: u32) -> Result<(), ChainError> {
         // Chainbase absent: fold the block usage on the arena alone, sourcing the
         // elastic params from the arena config rather than the (empty) chainbase.
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && s.standalone_writes()
         {
@@ -4033,7 +3446,6 @@ impl Database {
                 .process_block_usage(block_num)
                 .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
         }
-        #[cfg(feature = "arena-shadow")]
         if self.shadow.is_some() {
             match (
                 self.get_cpu_limit_parameters(),
@@ -4103,7 +3515,6 @@ impl Database {
                 .map_err(|e| ChainError::InternalError(format!("{}", e)))?
                 as *const TableObject
         };
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && let Err(e) = s.create_table(code, scope, table, payer)
         {
@@ -4134,7 +3545,6 @@ impl Database {
         id: u64,
         buffer: &[u8],
     ) -> Result<*const KeyValueObject, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         let key = table_key(table);
         let res = {
             let mut guard = self.locked_write()?;
@@ -4144,7 +3554,6 @@ impl Database {
                 .map_err(|e| ChainError::InternalError(format!("{}", e)))?
                 as *const KeyValueObject
         };
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && let Err(e) = s.create_key_value_object(key.0, key.1, key.2, payer, id, buffer)
         {
@@ -4157,17 +3566,11 @@ impl Database {
     /// bills table-creation RAM only on the first row, so it decides existence
     /// against the arena rather than dereferencing a chainbase table pointer.
     pub fn arena_table_exists(&self, code: u64, scope: u64, table: u64) -> bool {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .map(|s| s.table_exists(code, scope, table))
                 .unwrap_or(false)
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = (code, scope, table);
-            false
         }
     }
 
@@ -4181,23 +3584,16 @@ impl Database {
         table: u64,
         primary_key: u64,
     ) -> Option<(u64, Vec<u8>)> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .and_then(|s| s.kv_row(code, scope, table, primary_key))
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = (code, scope, table, primary_key);
-            None
         }
     }
 
     /// Author a contract row in the arena alone (no chainbase). The arena's
     /// create is find-or-create on the table, so it also creates the table if
     /// absent, mirroring `create_key_value_object` + the implicit table create.
-    #[cfg(feature = "arena-shadow")]
     pub fn create_key_value_object_standalone(
         &self,
         code: u64,
@@ -4215,7 +3611,6 @@ impl Database {
     }
 
     /// Rewrite a contract row's value and payer in the arena alone (no chainbase).
-    #[cfg(feature = "arena-shadow")]
     pub fn update_key_value_object_standalone(
         &self,
         code: u64,
@@ -4234,7 +3629,6 @@ impl Database {
 
     /// Remove a contract row in the arena alone (no chainbase). The arena drops
     /// the row and auto-removes the table when it empties, matching chainbase.
-    #[cfg(feature = "arena-shadow")]
     pub fn remove_key_value_object_standalone(
         &self,
         code: u64,
@@ -4256,7 +3650,6 @@ impl Database {
         id: u64,
         secondary_key: u64,
     ) -> Result<*const Index64Object, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         let key = table_key(table);
         let res = {
             let mut guard = self.locked_write()?;
@@ -4266,7 +3659,6 @@ impl Database {
                 .map_err(|e| ChainError::InternalError(format!("{}", e)))?
                 as *const Index64Object
         };
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && let Err(e) = s.create_index64_object(key.0, key.1, key.2, payer, id, secondary_key)
         {
@@ -4282,14 +3674,12 @@ impl Database {
     // arena's stored form exactly as the mirroring FFI paths do. `arena_idxN_
     // payer` serves the old payer db_idxN_update needs for its billing delta.
 
-    #[cfg(feature = "arena-shadow")]
     fn shadow_ref(&self) -> Result<&crate::shadow::ArenaShadow, ChainError> {
         self.shadow.as_ref().ok_or_else(|| {
             ChainError::InternalError("standalone writes require the arena shadow".into())
         })
     }
 
-    #[cfg(feature = "arena-shadow")]
     pub fn create_index64_object_standalone(
         &self,
         code: u64,
@@ -4304,7 +3694,6 @@ impl Database {
             .map_err(|e| ChainError::InternalError(format!("arena create_index64: {e:?}")))
     }
 
-    #[cfg(feature = "arena-shadow")]
     pub fn update_index64_object_standalone(
         &self,
         code: u64,
@@ -4319,7 +3708,6 @@ impl Database {
             .map_err(|e| ChainError::InternalError(format!("arena update_index64: {e:?}")))
     }
 
-    #[cfg(feature = "arena-shadow")]
     pub fn remove_index64_object_standalone(
         &self,
         code: u64,
@@ -4332,7 +3720,6 @@ impl Database {
             .map_err(|e| ChainError::InternalError(format!("arena remove_index64: {e:?}")))
     }
 
-    #[cfg(feature = "arena-shadow")]
     pub fn arena_idx64_payer(
         &self,
         code: u64,
@@ -4345,7 +3732,6 @@ impl Database {
             .and_then(|s| s.idx64_payer(code, scope, table, primary))
     }
 
-    #[cfg(feature = "arena-shadow")]
     pub fn create_index128_object_standalone(
         &self,
         code: u64,
@@ -4360,7 +3746,6 @@ impl Database {
             .map_err(|e| ChainError::InternalError(format!("arena create_index128: {e:?}")))
     }
 
-    #[cfg(feature = "arena-shadow")]
     pub fn update_index128_object_standalone(
         &self,
         code: u64,
@@ -4375,7 +3760,6 @@ impl Database {
             .map_err(|e| ChainError::InternalError(format!("arena update_index128: {e:?}")))
     }
 
-    #[cfg(feature = "arena-shadow")]
     pub fn remove_index128_object_standalone(
         &self,
         code: u64,
@@ -4388,7 +3772,6 @@ impl Database {
             .map_err(|e| ChainError::InternalError(format!("arena remove_index128: {e:?}")))
     }
 
-    #[cfg(feature = "arena-shadow")]
     pub fn arena_idx128_payer(
         &self,
         code: u64,
@@ -4401,7 +3784,6 @@ impl Database {
             .and_then(|s| s.idx128_payer(code, scope, table, primary))
     }
 
-    #[cfg(feature = "arena-shadow")]
     pub fn create_index256_object_standalone(
         &self,
         code: u64,
@@ -4416,7 +3798,6 @@ impl Database {
             .map_err(|e| ChainError::InternalError(format!("arena create_index256: {e:?}")))
     }
 
-    #[cfg(feature = "arena-shadow")]
     pub fn update_index256_object_standalone(
         &self,
         code: u64,
@@ -4431,7 +3812,6 @@ impl Database {
             .map_err(|e| ChainError::InternalError(format!("arena update_index256: {e:?}")))
     }
 
-    #[cfg(feature = "arena-shadow")]
     pub fn remove_index256_object_standalone(
         &self,
         code: u64,
@@ -4444,7 +3824,6 @@ impl Database {
             .map_err(|e| ChainError::InternalError(format!("arena remove_index256: {e:?}")))
     }
 
-    #[cfg(feature = "arena-shadow")]
     pub fn arena_idx256_payer(
         &self,
         code: u64,
@@ -4457,7 +3836,6 @@ impl Database {
             .and_then(|s| s.idx256_payer(code, scope, table, primary))
     }
 
-    #[cfg(feature = "arena-shadow")]
     pub fn create_idx_double_object_standalone(
         &self,
         code: u64,
@@ -4472,7 +3850,6 @@ impl Database {
             .map_err(|e| ChainError::InternalError(format!("arena create_idx_double: {e:?}")))
     }
 
-    #[cfg(feature = "arena-shadow")]
     pub fn update_idx_double_object_standalone(
         &self,
         code: u64,
@@ -4487,7 +3864,6 @@ impl Database {
             .map_err(|e| ChainError::InternalError(format!("arena update_idx_double: {e:?}")))
     }
 
-    #[cfg(feature = "arena-shadow")]
     pub fn remove_idx_double_object_standalone(
         &self,
         code: u64,
@@ -4500,7 +3876,6 @@ impl Database {
             .map_err(|e| ChainError::InternalError(format!("arena remove_idx_double: {e:?}")))
     }
 
-    #[cfg(feature = "arena-shadow")]
     pub fn arena_idx_double_payer(
         &self,
         code: u64,
@@ -4513,7 +3888,6 @@ impl Database {
             .and_then(|s| s.idx_double_payer(code, scope, table, primary))
     }
 
-    #[cfg(feature = "arena-shadow")]
     pub fn create_idx_long_double_object_standalone(
         &self,
         code: u64,
@@ -4535,7 +3909,6 @@ impl Database {
             .map_err(|e| ChainError::InternalError(format!("arena create_idx_long_double: {e:?}")))
     }
 
-    #[cfg(feature = "arena-shadow")]
     pub fn update_idx_long_double_object_standalone(
         &self,
         code: u64,
@@ -4557,7 +3930,6 @@ impl Database {
             .map_err(|e| ChainError::InternalError(format!("arena update_idx_long_double: {e:?}")))
     }
 
-    #[cfg(feature = "arena-shadow")]
     pub fn remove_idx_long_double_object_standalone(
         &self,
         code: u64,
@@ -4570,7 +3942,6 @@ impl Database {
             .map_err(|e| ChainError::InternalError(format!("arena remove_idx_long_double: {e:?}")))
     }
 
-    #[cfg(feature = "arena-shadow")]
     pub fn arena_idx_long_double_payer(
         &self,
         code: u64,
@@ -4591,7 +3962,6 @@ impl Database {
     ) -> Result<(), ChainError> {
         // Resolve the row's table (code, scope, table) + primary before the write,
         // so the arena mirror can locate the row the FFI reaches by opaque handle.
-        #[cfg(feature = "arena-shadow")]
         let key = {
             let guard = self.locked_read()?;
             let t = guard.get_table_by_kv(obj);
@@ -4609,7 +3979,6 @@ impl Database {
                 .update_key_value_object(obj, payer, buffer)
                 .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
         }
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && let Err(e) = s.update_key_value_object(key.0, key.1, key.2, key.3, payer, buffer)
         {
@@ -4634,7 +4003,6 @@ impl Database {
 
     pub fn remove_table(&mut self, table: &TableObject) -> Result<(), ChainError> {
         // Read the key before removal, while the object is still valid.
-        #[cfg(feature = "arena-shadow")]
         let key = table_key(table);
         {
             let mut guard = self.locked_write()?;
@@ -4643,7 +4011,6 @@ impl Database {
                 .remove_table(table)
                 .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
         }
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && let Err(e) = s.remove_table(key.0, key.1, key.2)
         {
@@ -4653,7 +4020,6 @@ impl Database {
     }
 
     pub fn is_account(&self, account: u64) -> Result<bool, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && s.standalone_reads()
         {
@@ -4668,7 +4034,6 @@ impl Database {
 
         // Existence gates authorization/dispatch and is a plain bool (not a
         // chainbase object reference), so it can be served from the arena.
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow {
             let arena = s.account_exists(account);
             s.note_noncontract(arena == chainbase);
@@ -4686,7 +4051,6 @@ impl Database {
     /// feed the receipt digest, so the arena must agree. Errors when the account
     /// has no metadata, matching `get_account_metadata`.
     pub fn account_metadata_code_abi_sequence(&self, name: u64) -> Result<(u64, u64), ChainError> {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && s.standalone_reads()
         {
@@ -4712,7 +4076,6 @@ impl Database {
             (m.get_code_sequence(), m.get_abi_sequence())
         };
 
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow {
             // account_metadata tuple: (priv, recv, auth, code_seq, abi_seq, ...).
             let arena = s.account_metadata(name).map(|t| (t.3, t.4));
@@ -4732,7 +4095,6 @@ impl Database {
     /// the arena under PULSEVM_ARENA_READS. Errors when the account has no
     /// metadata, matching `get_account_metadata`.
     pub fn is_account_privileged(&self, name: u64) -> Result<bool, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && s.standalone_reads()
         {
@@ -4757,7 +4119,6 @@ impl Database {
             unsafe { &*res }.is_privileged()
         };
 
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow {
             let arena = s.account_metadata_privileged(name);
             s.note_noncontract(arena == Some(chainbase));
@@ -4776,7 +4137,6 @@ impl Database {
     /// and to locate the old code object. Served from the arena under
     /// PULSEVM_ARENA_READS (cross-checked), so setcode needs no chainbase object.
     pub fn account_code_hash_vm(&self, name: u64) -> Result<([u8; 32], u8, u8), ChainError> {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && s.standalone_reads()
         {
@@ -4809,7 +4169,6 @@ impl Database {
             )
         };
 
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow {
             let arena = s.account_metadata(name).map(|t| (t.5, t.6, t.7));
             s.note_noncontract(arena == Some(chainbase));
@@ -4827,7 +4186,6 @@ impl Database {
     /// A plain length read off the account_object, served from the arena under
     /// PULSEVM_ARENA_READS (cross-checked) so setabi needs no chainbase object.
     pub fn account_abi_size(&self, name: u64) -> Result<usize, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && s.standalone_reads()
         {
@@ -4849,7 +4207,6 @@ impl Database {
             unsafe { &*res }.get_abi().size()
         };
 
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow {
             let arena = s.account_abi_size(name);
             s.note_noncontract(arena == Some(chainbase));
@@ -4927,7 +4284,6 @@ impl Database {
                 .map_err(|e| ChainError::InternalError(format!("{}", e)))?
         };
         // delete_auth removes the permission (and its usage row) in C++.
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && let Err(e) = s.remove_permission(account, permission_name)
         {
@@ -4952,7 +4308,6 @@ impl Database {
         };
         // In C++ the link's message_type is the requirement_type and its
         // required_permission is the requirement_name.
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && let Err(e) = s.link_auth(account_name, code_name, requirement_type, requirement_name)
         {
@@ -4974,7 +4329,6 @@ impl Database {
                 .unlink_auth(account_name, code_name, requirement_type)
                 .map_err(|e| ChainError::InternalError(format!("{}", e)))?
         };
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && let Err(e) = s.unlink_auth(account_name, code_name, requirement_type)
         {
@@ -5010,7 +4364,6 @@ impl Database {
         vm_type: u8,
         vm_version: u8,
     ) -> Result<Vec<u8>, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && s.standalone_reads()
         {
@@ -5027,7 +4380,6 @@ impl Database {
             res.get_code().as_slice().to_vec()
         };
 
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow {
             let arena = s.code_by_hash(digest_to_array(code_hash), vm_type, vm_version);
             s.note_noncontract(arena.as_deref() == Some(chainbase.as_slice()));
@@ -5051,7 +4403,6 @@ impl Database {
     /// must produce the same value; under `PULSEVM_ARENA_READS` it is served
     /// from the arena.
     pub fn next_recv_sequence(&mut self, receiver: u64) -> Result<u64, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && s.standalone_writes()
         {
@@ -5083,7 +4434,6 @@ impl Database {
                 .next_recv_sequence(obj)
                 .map_err(|e| ChainError::InternalError(format!("{}", e)))?
         };
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow {
             match s.next_recv_sequence(receiver) {
                 Ok(arena) => {
@@ -5101,7 +4451,6 @@ impl Database {
     }
 
     pub fn next_auth_sequence(&mut self, actor: u64) -> Result<u64, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && s.standalone_writes()
         {
@@ -5123,7 +4472,6 @@ impl Database {
                 .next_auth_sequence(actor)
                 .map_err(|e| ChainError::InternalError(format!("{}", e)))?
         };
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && let Err(e) = s.next_auth_sequence(actor)
         {
@@ -5133,7 +4481,6 @@ impl Database {
     }
 
     pub fn next_global_sequence(&mut self) -> Result<u64, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && s.standalone_writes()
         {
@@ -5153,7 +4500,6 @@ impl Database {
                 .next_global_sequence()
                 .map_err(|e| ChainError::InternalError(format!("{}", e)))?
         };
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && let Err(e) = s.set_global_action_sequence(res)
         {
@@ -5165,7 +4511,6 @@ impl Database {
     pub fn get_global_action_sequence(&self) -> Result<u64, ChainError> {
         // Chainbase absent under a Rust genesis; serve the arena's own counter so
         // the cross-impl serialization has a value rather than a thrown singleton.
-        #[cfg(feature = "arena-shadow")]
         if self.arena_rust_genesis() {
             return Ok(self
                 .shadow
@@ -5182,15 +4527,10 @@ impl Database {
     /// Mirrored `global_action_sequence`, or `None` when shadowing is off / the
     /// singleton row is unwritten — for diffing against chainbase.
     pub fn arena_global_action_sequence(&self) -> Option<u64> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .and_then(|s| s.global_action_sequence())
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            None
         }
     }
 
@@ -5203,7 +4543,6 @@ impl Database {
         // Resolve the row's (code, scope, table, primary) through the cache
         // before it is deleted; a mirror-resolution error must never abort the
         // authoritative removal, so it is swallowed to `None`.
-        #[cfg(feature = "arena-shadow")]
         let mirror_key = self.shadow.as_ref().and_then(|_| {
             let obj = keyval_cache.get(iterator).ok()?;
             let tbl = keyval_cache.get_table(obj.get_table_id()).ok()?;
@@ -5217,7 +4556,6 @@ impl Database {
                 .db_remove_i64(keyval_cache.pin_mut(), iterator, receiver)
                 .map_err(|e| ChainError::InternalError(format!("{}", e)))?
         };
-        #[cfg(feature = "arena-shadow")]
         if let (Some(s), Some((code, scope, table, primary))) = (&self.shadow, mirror_key)
             && let Err(e) = s.remove_key_value_object(code, scope, table, primary)
         {
@@ -5232,7 +4570,6 @@ impl Database {
         iterator: i32,
         receiver: u64,
     ) -> Result<(), ChainError> {
-        #[cfg(feature = "arena-shadow")]
         let mirror_key = self.shadow.as_ref().and_then(|_| {
             let obj = keyval_cache.get(iterator).ok()?;
             let tbl = keyval_cache.get_table(obj.get_table_id()).ok()?;
@@ -5246,7 +4583,6 @@ impl Database {
                 .db_idx64_remove(keyval_cache.pin_mut(), iterator, receiver)
                 .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
         }
-        #[cfg(feature = "arena-shadow")]
         if let (Some(s), Some((code, scope, table, primary))) = (&self.shadow, mirror_key)
             && let Err(e) = s.remove_index64_object(code, scope, table, primary)
         {
@@ -5401,7 +4737,6 @@ impl Database {
         id: u64,
         secondary_key: u128,
     ) -> Result<*const Index128Object, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         let key = table_key(table);
         let res = {
             let mut guard = self.locked_write()?;
@@ -5411,7 +4746,6 @@ impl Database {
                 .map_err(|e| ChainError::InternalError(format!("{}", e)))?
                 as *const Index128Object
         };
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && let Err(e) = s.create_index128_object(key.0, key.1, key.2, payer, id, secondary_key)
         {
@@ -5440,7 +4774,6 @@ impl Database {
         iterator: i32,
         receiver: u64,
     ) -> Result<(), ChainError> {
-        #[cfg(feature = "arena-shadow")]
         let mirror_key = self.shadow.as_ref().and_then(|_| {
             let obj = keyval_cache.get(iterator).ok()?;
             let tbl = keyval_cache.get_table(obj.get_table_id()).ok()?;
@@ -5454,7 +4787,6 @@ impl Database {
                 .db_idx128_remove(keyval_cache.pin_mut(), iterator, receiver)
                 .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
         }
-        #[cfg(feature = "arena-shadow")]
         if let (Some(s), Some((code, scope, table, primary))) = (&self.shadow, mirror_key)
             && let Err(e) = s.remove_index128_object(code, scope, table, primary)
         {
@@ -5618,9 +4950,7 @@ impl Database {
         id: u64,
         secondary_key: U256,
     ) -> Result<*const Index256Object, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         let key = table_key(table);
-        #[cfg(feature = "arena-shadow")]
         let sec_bytes = secondary_key.value;
         let res = {
             let mut guard = self.locked_write()?;
@@ -5630,7 +4960,6 @@ impl Database {
                 .map_err(|e| ChainError::InternalError(format!("{}", e)))?
                 as *const Index256Object
         };
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && let Err(e) = s.create_index256_object(key.0, key.1, key.2, payer, id, sec_bytes)
         {
@@ -5659,7 +4988,6 @@ impl Database {
         iterator: i32,
         receiver: u64,
     ) -> Result<(), ChainError> {
-        #[cfg(feature = "arena-shadow")]
         let mirror_key = self.shadow.as_ref().and_then(|_| {
             let obj = keyval_cache.get(iterator).ok()?;
             let tbl = keyval_cache.get_table(obj.get_table_id()).ok()?;
@@ -5673,7 +5001,6 @@ impl Database {
                 .db_idx256_remove(keyval_cache.pin_mut(), iterator, receiver)
                 .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
         }
-        #[cfg(feature = "arena-shadow")]
         if let (Some(s), Some((code, scope, table, primary))) = (&self.shadow, mirror_key)
             && let Err(e) = s.remove_index256_object(code, scope, table, primary)
         {
@@ -5830,7 +5157,6 @@ impl Database {
         id: u64,
         secondary_key: u64,
     ) -> Result<*const IndexDoubleObject, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         let key = table_key(table);
         let res = {
             let mut guard = self.locked_write()?;
@@ -5840,7 +5166,6 @@ impl Database {
                 .map_err(|e| ChainError::InternalError(format!("{}", e)))?
                 as *const IndexDoubleObject
         };
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && let Err(e) =
                 s.create_idx_double_object(key.0, key.1, key.2, payer, id, secondary_key)
@@ -5870,7 +5195,6 @@ impl Database {
         iterator: i32,
         receiver: u64,
     ) -> Result<(), ChainError> {
-        #[cfg(feature = "arena-shadow")]
         let mirror_key = self.shadow.as_ref().and_then(|_| {
             let obj = keyval_cache.get(iterator).ok()?;
             let tbl = keyval_cache.get_table(obj.get_table_id()).ok()?;
@@ -5884,7 +5208,6 @@ impl Database {
                 .db_idx_double_remove(keyval_cache.pin_mut(), iterator, receiver)
                 .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
         }
-        #[cfg(feature = "arena-shadow")]
         if let (Some(s), Some((code, scope, table, primary))) = (&self.shadow, mirror_key)
             && let Err(e) = s.remove_idx_double_object(code, scope, table, primary)
         {
@@ -6041,9 +5364,7 @@ impl Database {
         id: u64,
         secondary_key: Float128,
     ) -> Result<*const IndexLongDoubleObject, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         let key = table_key(table);
-        #[cfg(feature = "arena-shadow")]
         let (sec_lo, sec_hi) = (secondary_key.lo, secondary_key.hi);
         let res = {
             let mut guard = self.locked_write()?;
@@ -6053,7 +5374,6 @@ impl Database {
                 .map_err(|e| ChainError::InternalError(format!("{}", e)))?
                 as *const IndexLongDoubleObject
         };
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && let Err(e) =
                 s.create_idx_long_double_object(key.0, key.1, key.2, payer, id, (sec_lo, sec_hi))
@@ -6083,7 +5403,6 @@ impl Database {
         iterator: i32,
         receiver: u64,
     ) -> Result<(), ChainError> {
-        #[cfg(feature = "arena-shadow")]
         let mirror_key = self.shadow.as_ref().and_then(|_| {
             let obj = keyval_cache.get(iterator).ok()?;
             let tbl = keyval_cache.get_table(obj.get_table_id()).ok()?;
@@ -6097,7 +5416,6 @@ impl Database {
                 .db_idx_long_double_remove(keyval_cache.pin_mut(), iterator, receiver)
                 .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
         }
-        #[cfg(feature = "arena-shadow")]
         if let (Some(s), Some((code, scope, table, primary))) = (&self.shadow, mirror_key)
             && let Err(e) = s.remove_idx_long_double_object(code, scope, table, primary)
         {
@@ -6355,7 +5673,6 @@ impl Database {
         auth: &Authority,
         creation_time: &TimePoint,
     ) -> Result<*const ffi::PermissionObject, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && s.standalone_writes()
         {
@@ -6389,7 +5706,6 @@ impl Database {
                 .map_err(|e| ChainError::InternalError(format!("{}", e)))?
                 as *const ffi::PermissionObject
         };
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow {
             let auth_bytes = encode_authority(auth);
             // Authority flip: the arena authors the permission id from its own
@@ -6474,7 +5790,6 @@ impl Database {
         authority: &Authority,
         pending_block_time: &TimePoint,
     ) -> Result<(), ChainError> {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && s.standalone_writes()
         {
@@ -6506,7 +5821,6 @@ impl Database {
                 ));
             }
         }
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow {
             let auth_bytes = encode_authority(authority);
             if let Err(e) = s.modify_permission(
@@ -6527,7 +5841,6 @@ impl Database {
         permission: u64,
         pending_block_time: &TimePoint,
     ) -> Result<(), ChainError> {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && s.standalone_writes()
         {
@@ -6558,7 +5871,6 @@ impl Database {
                 .update_permission_usage(perm, &cxx_time_point(pending_block_time))
                 .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
         }
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && let Err(e) =
                 s.update_permission_usage(actor, permission, pending_block_time.elapsed.count)
@@ -6619,7 +5931,6 @@ impl Database {
 
         // Mirror the same chain_config into the arena (drops the chainbase lock
         // first — the shadow takes its own).
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && let Err(e) = s.set_global_properties(chain_config_params_from_v0(cfg))
         {
@@ -6630,7 +5941,6 @@ impl Database {
     }
 
     /// Reads the active chain_config from chainbase into the mirror's param form.
-    #[cfg(feature = "arena-shadow")]
     fn read_chain_config_params(&self) -> Result<crate::shadow::ChainConfigParams, ChainError> {
         let guard = self.locked_read()?;
         let gpo = guard
@@ -6643,7 +5953,6 @@ impl Database {
     /// `setparams` never carries, so the arena mirror does not store it. Served as
     /// the constant when off chainbase, else read from the chainbase config.
     pub fn max_action_return_value_size(&self) -> Result<u32, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && s.standalone_reads()
         {
@@ -6662,7 +5971,6 @@ impl Database {
     /// `get_global_properties()?.get_chain_config()` on the per-tx/per-block hot
     /// paths, so those callers hold no chainbase object.
     pub fn chain_config(&self) -> Result<ChainConfigV0, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && s.standalone_reads()
         {
@@ -6681,7 +5989,6 @@ impl Database {
     /// Canonical serialization of the chainbase static `global_property_object`
     /// chain_config — byte-compatible with the arena mirror's
     /// `global_property_state_bytes`, for the cross-impl root.
-    #[cfg(feature = "arena-shadow")]
     pub fn global_property_state_bytes(&self) -> Result<Vec<u8>, ChainError> {
         // Chainbase absent under a Rust genesis; its side of the cross-impl
         // serialization is unused there (see resource_state_bytes).
@@ -6694,20 +6001,14 @@ impl Database {
     /// Arena mirror of the static global_property chain_config, `None` when
     /// shadowing is off.
     pub fn arena_global_property_state_bytes(&self) -> Option<Vec<u8>> {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .map(|s| s.global_property_state_bytes())
         }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            None
-        }
     }
 
     pub fn get_virtual_block_cpu_limit(&self) -> Result<u64, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && s.standalone_reads()
         {
@@ -6723,7 +6024,6 @@ impl Database {
     }
 
     pub fn get_virtual_block_net_limit(&self) -> Result<u64, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && s.standalone_reads()
         {
@@ -6739,7 +6039,6 @@ impl Database {
     }
 
     pub fn get_block_cpu_limit(&self) -> Result<u64, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && s.standalone_reads()
         {
@@ -6755,7 +6054,6 @@ impl Database {
     }
 
     pub fn get_block_net_limit(&self) -> Result<u64, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && s.standalone_reads()
         {
@@ -6793,7 +6091,6 @@ impl Database {
                 .record_transaction(trx_id, expiration)
                 .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
         }
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow {
             let id = digest_to_array(trx_id);
             if let Err(e) = s.record_transaction(id, expiration) {
@@ -6807,17 +6104,11 @@ impl Database {
     /// against chainbase's `is_known_unexpired_transaction`. Uses the same
     /// digest-to-bytes conversion `record_transaction` mirrors with.
     pub fn arena_transaction_exists(&self, trx_id: &ffi::CxxDigest) -> bool {
-        #[cfg(feature = "arena-shadow")]
         {
             self.shadow
                 .as_ref()
                 .map(|s| s.transaction_exists(digest_to_array(trx_id)))
                 .unwrap_or(false)
-        }
-        #[cfg(not(feature = "arena-shadow"))]
-        {
-            let _ = trx_id;
-            false
         }
     }
 
@@ -6832,7 +6123,6 @@ impl Database {
                 .clear_expired_input_transactions(&cxx_time_point(cutoff))
                 .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
         }
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && let Err(e) = s.clear_expired_input_transactions(cutoff.elapsed.count)
         {
@@ -6910,7 +6200,6 @@ impl Database {
         reverse: bool,
         show_payer: bool,
     ) -> Result<String, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         if self.arena_standalone_reads() {
             return self.rpc_get_table_rows(
                 json,
@@ -6946,7 +6235,6 @@ impl Database {
             )
             .map_err(|e| ChainError::InternalError(format!("{}", e)))?
         };
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow {
             let arena = self.rpc_get_table_rows(
                 json,
@@ -6979,7 +6267,6 @@ impl Database {
         head_block_num: u32,
         head_block_time: &TimePoint,
     ) -> Result<String, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         if self.arena_standalone_reads() {
             return self.rpc_get_account_info(
                 account,
@@ -6998,7 +6285,6 @@ impl Database {
             )
             .map_err(|e| ChainError::InternalError(format!("{}", e)))?
         };
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow {
             let arena = self.rpc_get_account_info(
                 account,
@@ -7025,7 +6311,6 @@ impl Database {
         head_block_num: u32,
         head_block_time: &TimePoint,
     ) -> Result<String, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         if self.arena_standalone_reads() {
             return self.rpc_get_account_info(
                 account,
@@ -7045,7 +6330,6 @@ impl Database {
             )
             .map_err(|e| ChainError::InternalError(format!("{}", e)))?
         };
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow {
             let arena = self.rpc_get_account_info(
                 account,
@@ -7249,7 +6533,6 @@ impl Database {
     /// the system-contract sub-objects, composed from the arena. `expected_core_
     /// symbol` overrides the auto-detected core symbol (`None` = detect it from
     /// the system contract's rammarket).
-    #[cfg(feature = "arena-shadow")]
     pub fn rpc_get_account_info(
         &self,
         account: u64,
@@ -7454,7 +6737,6 @@ impl Database {
 
     /// The system contract's core symbol (precision in the low byte, code above),
     /// read from its `rammarket` `RAMCORE` row. `None` if the market is absent.
-    #[cfg(feature = "arena-shadow")]
     fn extract_core_symbol(&self) -> Option<u64> {
         let system = name_u64("pulse").ok()?;
         let rammarket = name_u64("rammarket").ok()?;
@@ -7647,7 +6929,6 @@ mod tests {
     /// re-encoding must reproduce the exact blob (value equality — keys pack to
     /// their canonical bytes), and the decoded structure must match field for
     /// field. This is what lets the arena serve `PermissionObject::get_authority`.
-    #[cfg(feature = "arena-shadow")]
     #[test]
     fn decode_authority_is_the_inverse_of_encode() {
         let key =
@@ -7701,7 +6982,6 @@ mod tests {
     /// from `billable_size_v`. (End-to-end equality against chainbase's own
     /// `get_billable_size` is covered under arena reads by the newaccount serve in
     /// `oracle_permission_authority_serves_from_arena`.)
-    #[cfg(feature = "arena-shadow")]
     #[test]
     fn authority_blob_billable_size_matches_formula() {
         let key =
@@ -7736,7 +7016,6 @@ mod tests {
     }
 
     /// A truncated blob is rejected, not silently mis-decoded.
-    #[cfg(feature = "arena-shadow")]
     #[test]
     fn decode_authority_rejects_truncated_blob() {
         // threshold + a key count of 1 but no key payload.
@@ -7967,7 +7246,6 @@ impl Database {
         Ok(DbRead {
             guard,
             _scope: LockScope::enter(false),
-            #[cfg(feature = "arena-shadow")]
             shadow: self.shadow.clone(),
         })
     }
@@ -7995,7 +7273,6 @@ pub struct DbRead<'g> {
     _scope: LockScope,
     // The arena mirror, so reads served here can be cross-checked against it
     // during execution. A cheap Arc clone; `None` when shadowing is off.
-    #[cfg(feature = "arena-shadow")]
     shadow: Option<crate::shadow::ArenaShadow>,
 }
 
@@ -8065,7 +7342,6 @@ impl<'g> DbRead<'g> {
         // The arena must answer this authorization read the same way: same
         // existence, same parent in the permission tree, same authority
         // threshold. Consensus depends on it — every transaction authorizes here.
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow {
             let chainbase = res.map(|p| {
                 let threshold =
@@ -8095,7 +7371,6 @@ impl<'g> DbRead<'g> {
         actor: u64,
         permission: u64,
     ) -> Result<Option<Authority>, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && s.standalone_reads()
         {
@@ -8115,7 +7390,6 @@ impl<'g> DbRead<'g> {
             None => None,
         };
 
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow {
             let arena_blob = s.permission_auth_blob(actor, permission);
             let chainbase_blob = chainbase.as_ref().map(encode_authority);
@@ -8136,7 +7410,6 @@ impl<'g> DbRead<'g> {
     /// parent the active permission on it; the mirror stores that same id, so the
     /// value it serves is identical.
     pub fn permission_id(&self, owner: u64, perm_name: u64) -> Result<Option<i64>, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && s.standalone_reads()
         {
@@ -8148,7 +7421,6 @@ impl<'g> DbRead<'g> {
             .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
         let chainbase = unsafe { chainbase.as_ref() }.map(|p| p.get_id());
 
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow {
             let arena = s.permission_cb_id(owner, perm_name);
             s.note_noncontract(arena == chainbase);
@@ -8169,7 +7441,6 @@ impl<'g> DbRead<'g> {
         owner: u64,
         perm_name: u64,
     ) -> Result<Option<i64>, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && s.standalone_reads()
         {
@@ -8184,7 +7455,6 @@ impl<'g> DbRead<'g> {
         let chainbase =
             unsafe { chainbase.as_ref() }.map(|p| p.get_authority().get_billable_size() as i64);
 
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow {
             let arena = s
                 .permission_auth_blob(owner, perm_name)
@@ -8208,7 +7478,6 @@ impl<'g> DbRead<'g> {
         actor: u64,
         permission: u64,
     ) -> Result<Option<PermissionInfo>, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && s.standalone_reads()
         {
@@ -8227,7 +7496,6 @@ impl<'g> DbRead<'g> {
             auth_billable_size: p.get_authority().get_billable_size() as i64,
         });
 
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow {
             let arena = Self::arena_permission_info(s, actor, permission);
             s.note_noncontract(arena == chainbase);
@@ -8242,7 +7510,6 @@ impl<'g> DbRead<'g> {
     /// Build a [`PermissionInfo`] purely from the arena mirror, or `None` if the
     /// permission is absent. Each field comes from the same arena accessor the
     /// value-based reads already use, so the snapshot is consistent with them.
-    #[cfg(feature = "arena-shadow")]
     fn arena_permission_info(
         s: &crate::shadow::ArenaShadow,
         owner: u64,
@@ -8275,7 +7542,6 @@ impl<'g> DbRead<'g> {
         owner_b: u64,
         name_b: u64,
     ) -> Result<bool, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && s.standalone_reads()
         {
@@ -8317,7 +7583,6 @@ impl<'g> DbRead<'g> {
     /// build reads it off the chainbase object and cross-checks the arena; under
     /// `PULSEVM_ARENA_ONLY` the arena's usage row answers directly.
     pub fn permission_last_used_by_name(&self, owner: u64, name: u64) -> Result<i64, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && s.standalone_reads()
         {
@@ -8341,7 +7606,6 @@ impl<'g> DbRead<'g> {
         })?;
         let chainbase = self.get_permission_last_used(p)?.time_since_epoch().count();
 
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow {
             let arena = s.permission_last_used(owner, name);
             s.note_noncontract(arena == Some(chainbase));
@@ -8375,7 +7639,6 @@ impl<'g> DbRead<'g> {
 
         // Account existence gates authorization and dispatch; the arena must
         // agree on whether the account is there.
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow {
             s.note_noncontract(s.account_exists(account_name) == res.is_some());
         }
@@ -8394,7 +7657,6 @@ impl<'g> DbRead<'g> {
 
         // The privileged flag changes execution (privileged contracts skip some
         // checks), so the arena must reproduce it (and existence).
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow {
             let chainbase = res.map(|m| m.is_privileged());
             s.note_noncontract(s.account_metadata_privileged(account_name) == chainbase);
@@ -8474,7 +7736,6 @@ impl<'g> DbRead<'g> {
         // arena can answer without a chainbase object reference and, under
         // `PULSEVM_ARENA_READS`, this consensus-critical authorization check is
         // served from it.
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow {
             let arena = s.permission_satisfies(
                 permission.get_owner().to_uint64_t(),
@@ -8509,7 +7770,6 @@ impl<'g> DbRead<'g> {
         code: u64,
         requirement_type: u64,
     ) -> Result<Option<u64>, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow
             && s.standalone_reads()
         {
@@ -8530,7 +7790,6 @@ impl<'g> DbRead<'g> {
         // same linked permission (or agree there's none). This read returns a
         // plain permission name (not a chainbase object reference), so unlike the
         // account/permission object reads it can be served from the arena.
-        #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow {
             let arena = s.permission_link(account, code, requirement_type);
             s.note_noncontract(arena == linked);
@@ -8574,7 +7833,6 @@ impl Default for Database {
             inner: Arc::new(RwLock::new(UniquePtr::null())),
             path: String::new(),
             size: 0,
-            #[cfg(feature = "arena-shadow")]
             shadow: None,
         }
     }

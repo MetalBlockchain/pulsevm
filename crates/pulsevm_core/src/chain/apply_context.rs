@@ -78,19 +78,13 @@ struct ApplyContextInner {
     index_long_double_cache: IndexLongDoubleIteratorCache, // Cache for index long double iterators
     // Arena twin of keyval_cache, driven in lockstep so the arena mints the same
     // key-value iterator handles chainbase does.
-    #[cfg(feature = "arena-shadow")]
     arena_keyval_cache: ArenaIteratorCache,
     // Arena twin of index64_cache — chainbase keeps a separate iterator cache per
     // secondary-index type, so the arena mirrors each independently.
-    #[cfg(feature = "arena-shadow")]
     arena_index64_cache: ArenaIteratorCache,
-    #[cfg(feature = "arena-shadow")]
     arena_index128_cache: ArenaIteratorCache,
-    #[cfg(feature = "arena-shadow")]
     arena_index256_cache: ArenaIteratorCache,
-    #[cfg(feature = "arena-shadow")]
     arena_index_double_cache: ArenaIteratorCache,
-    #[cfg(feature = "arena-shadow")]
     arena_index_long_double_cache: ArenaIteratorCache,
     cpu_limit: i64, // CPU limit for the current action
 }
@@ -151,17 +145,11 @@ impl ApplyContext {
                 index256_cache: Index256IteratorCache::new(),
                 index_double_cache: IndexDoubleIteratorCache::new(),
                 index_long_double_cache: IndexLongDoubleIteratorCache::new(),
-                #[cfg(feature = "arena-shadow")]
                 arena_keyval_cache: ArenaIteratorCache::default(),
-                #[cfg(feature = "arena-shadow")]
                 arena_index64_cache: ArenaIteratorCache::default(),
-                #[cfg(feature = "arena-shadow")]
                 arena_index128_cache: ArenaIteratorCache::default(),
-                #[cfg(feature = "arena-shadow")]
                 arena_index256_cache: ArenaIteratorCache::default(),
-                #[cfg(feature = "arena-shadow")]
                 arena_index_double_cache: ArenaIteratorCache::default(),
-                #[cfg(feature = "arena-shadow")]
                 arena_index_long_double_cache: ArenaIteratorCache::default(),
                 cpu_limit,
             })),
@@ -555,7 +543,6 @@ impl ApplyContext {
 
     /// Tally an arena iterator-handle cross-check (arena handle == chainbase's),
     /// logging the operation and table on a mismatch when `PULSEVM_DBG_ITER` is set.
-    #[cfg(feature = "arena-shadow")]
     fn note_iter_handle(
         &self,
         op: &str,
@@ -579,7 +566,6 @@ impl ApplyContext {
     /// mirroring `cache_table` on every call then `add` on a hit, as the C++
     /// oracle does. `cache` is the arena twin of the chainbase iterator cache for
     /// this secondary-index type.
-    #[cfg(feature = "arena-shadow")]
     fn note_secondary_handle(
         &self,
         cache: &mut ArenaIteratorCache,
@@ -616,7 +602,6 @@ impl ApplyContext {
         // present row takes its handle; a missing row in a present table takes the
         // table's end iterator; a missing table is -1 — matching chainbase's
         // db_find_i64 (which caches the table's end iterator before the lookup).
-        #[cfg(feature = "arena-shadow")]
         if self.db.arena_standalone_reads() {
             let h = if !self.db.arena_kv_table_exists(code, scope, table) {
                 -1
@@ -637,7 +622,6 @@ impl ApplyContext {
         // key, a missing row (but present table) takes the table's end iterator,
         // and a missing table is -1 on both. The row/table existence itself is
         // cross-checked by the value reads; here we confirm the handle index.
-        #[cfg(feature = "arena-shadow")]
         {
             // Chainbase caches the table (minting its end iterator) on every call
             // before looking up the row, so mirror that unconditionally, then add
@@ -678,7 +662,6 @@ impl ApplyContext {
         // touched. The contract receives the arena's iterator handle. This is the
         // find_or_create_table + create_key_value_object path with no chainbase
         // TableObject pointer in the middle.
-        #[cfg(feature = "arena-shadow")]
         if self.db.arena_standalone_writes() {
             let code = self.receiver.as_u64();
             // find_or_create_table: bill the new table before the row, only when
@@ -718,7 +701,6 @@ impl ApplyContext {
                 self.db
                     .create_key_value_object(table, payer, primary_key, &data.0.as_slice())?;
             if self.db.arena_standalone_reads() {
-                #[cfg(feature = "arena-shadow")]
                 {
                     let key = (
                         table.get_code().to_uint64_t(),
@@ -729,15 +711,10 @@ impl ApplyContext {
                     inner.arena_keyval_cache.cache_table((key.0, key.1, key.2));
                     inner.arena_keyval_cache.add(key)
                 }
-                #[cfg(not(feature = "arena-shadow"))]
-                {
-                    unreachable!("standalone reads require the arena-shadow feature")
-                }
             } else {
                 let obj = unsafe { &*obj };
                 inner.keyval_cache.cache_table(&table)?;
                 let handle = inner.keyval_cache.add(obj)?;
-                #[cfg(feature = "arena-shadow")]
                 {
                     let key = (
                         table.get_code().to_uint64_t(),
@@ -772,7 +749,6 @@ impl ApplyContext {
         // key and old (payer, value) from the arena and rewrite it there alone.
         // Chainbase is never touched, so the RAM delta is authored entirely from
         // arena state.
-        #[cfg(feature = "arena-shadow")]
         if self.db.arena_standalone_writes() {
             let (old_size, old_payer, new_payer) = {
                 let inner = self.inner.read()?;
@@ -821,7 +797,6 @@ impl ApplyContext {
         // row's key from the arena cache and re-find the chainbase row by key to
         // keep the oracle's state in sync (update_key_value_object mirrors into the
         // arena). The access-violation check reads the code straight off the key.
-        #[cfg(feature = "arena-shadow")]
         if self.db.arena_standalone_reads() {
             let (old_size, old_payer, new_payer) = {
                 let mut inner = self.inner.write()?;
@@ -909,7 +884,6 @@ impl ApplyContext {
         // default mode), so the contract's handle resolves directly against the
         // arena cache. Correctness here rests on the block-boundary full-state root
         // check rather than the inline comparison.
-        #[cfg(feature = "arena-shadow")]
         if self.db.arena_standalone_reads() {
             let (code, scope, table, primary) = inner
                 .arena_keyval_cache
@@ -940,7 +914,6 @@ impl ApplyContext {
         // pre-commit) — identically to chainbase. Stronger than the block-boundary
         // root diff, which only sees committed state. When the cutover switch is
         // on, the value the contract receives comes FROM the arena.
-        #[cfg(feature = "arena-shadow")]
         let arena_value: Option<Vec<u8>> = {
             let table_obj = inner.keyval_cache.get_table(obj.get_table_id())?;
             let code = table_obj.get_code().to_uint64_t();
@@ -957,12 +930,9 @@ impl ApplyContext {
         };
 
         let cb_value = obj.get_value();
-        #[cfg(feature = "arena-shadow")]
         let source: &[u8] = arena_value
             .as_deref()
             .unwrap_or_else(|| cb_value.as_slice());
-        #[cfg(not(feature = "arena-shadow"))]
-        let source: &[u8] = cb_value.as_slice();
 
         let s = source.len();
         if buffer_size == 0 {
@@ -981,7 +951,6 @@ impl ApplyContext {
         // remove it there alone (which auto-removes the table when it empties, as
         // chainbase does), and reclaim the same RAM chainbase would. The delta
         // matches the C++ db_remove_i64: -(value + key_value_object overhead).
-        #[cfg(feature = "arena-shadow")]
         if self.db.arena_standalone_writes() {
             let delta = {
                 let mut inner = self.inner.write()?;
@@ -1017,7 +986,6 @@ impl ApplyContext {
             // Arena-standalone: the handle is the arena's, so resolve its key and
             // re-find the chainbase row to remove it by chainbase handle (which
             // mirrors the arena removal by key), then tombstone the arena handle.
-            #[cfg(feature = "arena-shadow")]
             let standalone_delta: Option<i64> = if self.db.arena_standalone_reads() {
                 let (code, scope, table, primary) =
                     inner.arena_keyval_cache.row_of(iterator).ok_or_else(|| {
@@ -1036,8 +1004,6 @@ impl ApplyContext {
             } else {
                 None
             };
-            #[cfg(not(feature = "arena-shadow"))]
-            let standalone_delta: Option<i64> = None;
 
             match standalone_delta {
                 Some(d) => d,
@@ -1047,7 +1013,6 @@ impl ApplyContext {
                         iterator,
                         self.receiver.as_u64(),
                     )?;
-                    #[cfg(feature = "arena-shadow")]
                     inner.arena_keyval_cache.remove(iterator);
                     delta
                 }
@@ -1064,7 +1029,6 @@ impl ApplyContext {
 
         // Arena-standalone: advance to the successor via the arena's upper_bound of
         // the current key; no successor lands on the table's end iterator.
-        #[cfg(feature = "arena-shadow")]
         if self.db.arena_standalone_reads() {
             if let Some((code, scope, table, cur_pk)) = inner.arena_keyval_cache.row_of(iterator) {
                 return Ok(
@@ -1084,7 +1048,6 @@ impl ApplyContext {
         // The cursor's current key, for the arena successor cross-check. `None`
         // if `iterator` is an end iterator (no backing row) — then we leave
         // chainbase's answer untouched.
-        #[cfg(feature = "arena-shadow")]
         let cur = current_iter_key(&inner.keyval_cache, iterator);
 
         let res = self
@@ -1095,7 +1058,6 @@ impl ApplyContext {
         // upper_bound of the current key. res < 0 means chainbase hit the end,
         // so the arena must have no successor. Serve the arena's primary when
         // the cutover switch is on.
-        #[cfg(feature = "arena-shadow")]
         if let Some((code, scope, table, cur_pk)) = cur {
             let arena_next = self.db.arena_kv_upper_bound(code, scope, table, cur_pk);
             let ffi_next = if res >= 0 { Some(*primary) } else { None };
@@ -1130,7 +1092,6 @@ impl ApplyContext {
         // Arena-standalone: from a live row, step to its arena predecessor; from an
         // end iterator, to the table's last row. No predecessor returns -1
         // (db_previous never lands on an end iterator).
-        #[cfg(feature = "arena-shadow")]
         if self.db.arena_standalone_reads() {
             let landing =
                 match inner.arena_keyval_cache.row_of(iterator) {
@@ -1166,7 +1127,6 @@ impl ApplyContext {
         // From a live row: predecessor = arena `prev` of its key. From an end
         // iterator (the db_end -> db_previous backward-iteration entry): the
         // table's last row = arena `kv_last`.
-        #[cfg(feature = "arena-shadow")]
         let arena_ctx: Option<((u64, u64, u64), Option<u64>)> =
             match current_iter_key(&inner.keyval_cache, iterator) {
                 Some((code, scope, table, cur_pk)) => Some((
@@ -1187,7 +1147,6 @@ impl ApplyContext {
             .db
             .db_previous_i64(&mut inner.keyval_cache, iterator, primary)?;
 
-        #[cfg(feature = "arena-shadow")]
         if let Some(((code, scope, table), arena_prev)) = arena_ctx {
             let ffi_prev = if res >= 0 { Some(*primary) } else { None };
             self.db.arena_note_pos(arena_prev == ffi_prev);
@@ -1219,7 +1178,6 @@ impl ApplyContext {
         let mut inner = self.inner.write()?;
 
         // Arena-standalone: a present table has an end iterator, an absent one is -1.
-        #[cfg(feature = "arena-shadow")]
         if self.db.arena_standalone_reads() {
             return Ok(if self.db.arena_kv_table_exists(code, scope, table) {
                 inner.arena_keyval_cache.cache_table((code, scope, table))
@@ -1232,7 +1190,6 @@ impl ApplyContext {
             .db
             .db_end_i64(&mut inner.keyval_cache, code, scope, table)?;
 
-        #[cfg(feature = "arena-shadow")]
         {
             let arena_h = if res == -1 {
                 -1
@@ -1256,7 +1213,6 @@ impl ApplyContext {
 
         // Arena-standalone: smallest primary >= key from the arena; none lands on
         // the end iterator; an absent table is -1.
-        #[cfg(feature = "arena-shadow")]
         if self.db.arena_standalone_reads() {
             if !self.db.arena_kv_table_exists(code, scope, table) {
                 return Ok(-1);
@@ -1275,7 +1231,6 @@ impl ApplyContext {
 
         // Cross-check both the primary the iterator lands on and the handle
         // index the arena would mint for it.
-        #[cfg(feature = "arena-shadow")]
         {
             let ffi_landing = landing_primary(&inner.keyval_cache, res);
             let arena_landing = self.db.arena_kv_lower_bound(code, scope, table, primary);
@@ -1311,7 +1266,6 @@ impl ApplyContext {
 
         // Arena-standalone: smallest primary > key from the arena; none lands on
         // the end iterator; an absent table is -1.
-        #[cfg(feature = "arena-shadow")]
         if self.db.arena_standalone_reads() {
             if !self.db.arena_kv_table_exists(code, scope, table) {
                 return Ok(-1);
@@ -1328,7 +1282,6 @@ impl ApplyContext {
             self.db
                 .db_upperbound_i64(&mut inner.keyval_cache, code, scope, table, primary)?;
 
-        #[cfg(feature = "arena-shadow")]
         {
             let ffi_landing = landing_primary(&inner.keyval_cache, res);
             let arena_landing = self.db.arena_kv_upper_bound(code, scope, table, primary);
@@ -1361,12 +1314,10 @@ impl ApplyContext {
         primary_key: u64,
         secondary_key: u64,
     ) -> Result<i32, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         let table_name = table;
 
         // Arena-standalone writes: author the table (billing it if new) and the
         // index row in the arena alone, no chainbase IndexObject pointer.
-        #[cfg(feature = "arena-shadow")]
         if self.db.arena_standalone_writes() {
             pulse_assert(
                 payer != 0,
@@ -1415,7 +1366,6 @@ impl ApplyContext {
             inner.index64_cache.cache_table(&table)?;
             let handle = inner.index64_cache.add(obj)?;
 
-            #[cfg(feature = "arena-shadow")]
             {
                 let code = self.receiver.as_u64();
                 inner
@@ -1447,7 +1397,6 @@ impl ApplyContext {
 
         // Arena-standalone writes: resolve the row and old payer from the arena
         // and re-point it there alone.
-        #[cfg(feature = "arena-shadow")]
         if self.db.arena_standalone_writes() {
             let (old_payer, new_payer) = {
                 let inner = self.inner.read()?;
@@ -1495,7 +1444,6 @@ impl ApplyContext {
             self.db.update_index64_object(obj, new_payer, secondary)?;
             // Re-point the arena row's secondary/payer too; the FFI update only
             // touches chainbase, so an arena-served read would otherwise be stale.
-            #[cfg(feature = "arena-shadow")]
             self.db.arena_update_index64(
                 table_obj.get_code().to_uint64_t(),
                 table_obj.get_scope().to_uint64_t(),
@@ -1516,7 +1464,6 @@ impl ApplyContext {
     }
 
     pub fn db_idx64_remove(&mut self, iterator: i32) -> Result<(), ChainError> {
-        #[cfg(feature = "arena-shadow")]
         if self.db.arena_standalone_writes() {
             {
                 let mut inner = self.inner.write()?;
@@ -1543,7 +1490,6 @@ impl ApplyContext {
             let mut inner = self.inner.write()?;
             self.db
                 .db_idx64_remove(&mut inner.index64_cache, iterator, self.receiver.as_u64())?;
-            #[cfg(feature = "arena-shadow")]
             inner.arena_index64_cache.remove(iterator);
         }
 
@@ -1576,7 +1522,6 @@ impl ApplyContext {
         // Arena answers the same secondary lookup: found -> the same primary,
         // not-found -> both agree there's no match. Serve the primary when the
         // cutover switch is on.
-        #[cfg(feature = "arena-shadow")]
         {
             let arena = self
                 .db
@@ -1621,7 +1566,6 @@ impl ApplyContext {
             primary,
         )?;
 
-        #[cfg(feature = "arena-shadow")]
         {
             let arena = self
                 .db
@@ -1658,7 +1602,6 @@ impl ApplyContext {
     ) -> Result<i32, ChainError> {
         // `secondary` is the search key on the way in and the landing key on the
         // way out, so capture it before the FFI overwrites it.
-        #[cfg(feature = "arena-shadow")]
         let search = *secondary;
         let mut inner = self.inner.write()?;
         let res = self.db.db_idx64_lowerbound(
@@ -1672,7 +1615,6 @@ impl ApplyContext {
 
         // lowerbound/upperbound land on a row and write BOTH its secondary and
         // primary; the arena must reproduce the pair (or agree on the end).
-        #[cfg(feature = "arena-shadow")]
         {
             let arena = self.db.arena_idx64_lower_bound(code, scope, table, search);
             let ffi = if res >= 0 {
@@ -1710,7 +1652,6 @@ impl ApplyContext {
         secondary: &mut u64,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         let search = *secondary;
         let mut inner = self.inner.write()?;
         let res = self.db.db_idx64_upperbound(
@@ -1722,7 +1663,6 @@ impl ApplyContext {
             primary,
         )?;
 
-        #[cfg(feature = "arena-shadow")]
         {
             let arena = self.db.arena_idx64_upper_bound(code, scope, table, search);
             let ffi = if res >= 0 {
@@ -1760,7 +1700,6 @@ impl ApplyContext {
 
         // The end iterator equals the table's cached end handle, or -1 when the
         // table is absent.
-        #[cfg(feature = "arena-shadow")]
         {
             let arena_h = if res == -1 {
                 -1
@@ -1783,7 +1722,6 @@ impl ApplyContext {
         // successor in the same table adds its row handle, and falling off the end
         // lands on the table's end iterator. The written primary is cross-checked
         // against the arena's successor too.
-        #[cfg(feature = "arena-shadow")]
         {
             let arena_h = if iterator < -1 {
                 -1
@@ -1819,7 +1757,6 @@ impl ApplyContext {
         // Retreat the arena twin: from an end iterator, land on the table's last
         // row (or -1 if empty); from a live row, land on its predecessor (or -1 at
         // the beginning). The written primary is cross-checked on a hit.
-        #[cfg(feature = "arena-shadow")]
         {
             let arena_h = if let Some((code, scope, table)) =
                 inner.arena_index64_cache.table_of_end(iterator)
@@ -1858,10 +1795,8 @@ impl ApplyContext {
         primary_key: u64,
         secondary_key: u128,
     ) -> Result<i32, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         let table_name = table;
 
-        #[cfg(feature = "arena-shadow")]
         if self.db.arena_standalone_writes() {
             pulse_assert(
                 payer != 0,
@@ -1910,7 +1845,6 @@ impl ApplyContext {
             inner.index128_cache.cache_table(&table)?;
             let handle = inner.index128_cache.add(obj)?;
 
-            #[cfg(feature = "arena-shadow")]
             {
                 let code = self.receiver.as_u64();
                 inner
@@ -1941,7 +1875,6 @@ impl ApplyContext {
         let payer = payer.as_u64();
         let billing_size = billable_size_v::<Index128Object>() as i64;
 
-        #[cfg(feature = "arena-shadow")]
         if self.db.arena_standalone_writes() {
             let (old_payer, new_payer) = {
                 let inner = self.inner.read()?;
@@ -1987,7 +1920,6 @@ impl ApplyContext {
                 payer
             };
             self.db.update_index128_object(obj, new_payer, secondary)?;
-            #[cfg(feature = "arena-shadow")]
             self.db.arena_update_index128(
                 table_obj.get_code().to_uint64_t(),
                 table_obj.get_scope().to_uint64_t(),
@@ -2008,7 +1940,6 @@ impl ApplyContext {
     }
 
     pub fn db_idx128_remove(&mut self, iterator: i32) -> Result<(), ChainError> {
-        #[cfg(feature = "arena-shadow")]
         if self.db.arena_standalone_writes() {
             {
                 let mut inner = self.inner.write()?;
@@ -2038,7 +1969,6 @@ impl ApplyContext {
                 iterator,
                 self.receiver.as_u64(),
             )?;
-            #[cfg(feature = "arena-shadow")]
             inner.arena_index128_cache.remove(iterator);
         }
 
@@ -2068,7 +1998,6 @@ impl ApplyContext {
             primary,
         )?;
 
-        #[cfg(feature = "arena-shadow")]
         {
             let arena = self
                 .db
@@ -2113,7 +2042,6 @@ impl ApplyContext {
             primary,
         )?;
 
-        #[cfg(feature = "arena-shadow")]
         {
             let arena = self
                 .db
@@ -2148,7 +2076,6 @@ impl ApplyContext {
         secondary: &mut u128,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         let search = *secondary;
         let mut inner = self.inner.write()?;
         let res = self.db.db_idx128_lowerbound(
@@ -2160,7 +2087,6 @@ impl ApplyContext {
             primary,
         )?;
 
-        #[cfg(feature = "arena-shadow")]
         {
             let arena = self.db.arena_idx128_lower_bound(code, scope, table, search);
             let ffi = if res >= 0 {
@@ -2198,7 +2124,6 @@ impl ApplyContext {
         secondary: &mut u128,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         let search = *secondary;
         let mut inner = self.inner.write()?;
         let res = self.db.db_idx128_upperbound(
@@ -2210,7 +2135,6 @@ impl ApplyContext {
             primary,
         )?;
 
-        #[cfg(feature = "arena-shadow")]
         {
             let arena = self.db.arena_idx128_upper_bound(code, scope, table, search);
             let ffi = if res >= 0 {
@@ -2245,7 +2169,6 @@ impl ApplyContext {
         let res = self
             .db
             .db_idx128_end(&mut inner.index128_cache, code, scope, table)?;
-        #[cfg(feature = "arena-shadow")]
         {
             let arena_h = if res == -1 {
                 -1
@@ -2262,7 +2185,6 @@ impl ApplyContext {
         let res = self
             .db
             .db_idx128_next(&mut inner.index128_cache, iterator, primary)?;
-        #[cfg(feature = "arena-shadow")]
         {
             let arena_h = if iterator < -1 {
                 -1
@@ -2293,7 +2215,6 @@ impl ApplyContext {
         let res = self
             .db
             .db_idx128_previous(&mut inner.index128_cache, iterator, primary)?;
-        #[cfg(feature = "arena-shadow")]
         {
             let arena_h = if let Some((code, scope, table)) =
                 inner.arena_index128_cache.table_of_end(iterator)
@@ -2331,10 +2252,8 @@ impl ApplyContext {
         primary_key: u64,
         secondary_key: U256,
     ) -> Result<i32, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         let table_name = table;
 
-        #[cfg(feature = "arena-shadow")]
         if self.db.arena_standalone_writes() {
             pulse_assert(
                 payer != 0,
@@ -2383,7 +2302,6 @@ impl ApplyContext {
             inner.index256_cache.cache_table(&table)?;
             let handle = inner.index256_cache.add(obj)?;
 
-            #[cfg(feature = "arena-shadow")]
             {
                 let code = self.receiver.as_u64();
                 inner
@@ -2414,7 +2332,6 @@ impl ApplyContext {
         let payer = payer.as_u64();
         let billing_size = billable_size_v::<Index256Object>() as i64;
 
-        #[cfg(feature = "arena-shadow")]
         if self.db.arena_standalone_writes() {
             let (old_payer, new_payer) = {
                 let inner = self.inner.read()?;
@@ -2461,7 +2378,6 @@ impl ApplyContext {
             };
             // Mirror before the FFI update moves `secondary` (U256 is not Copy);
             // the two writes are independent so order does not matter.
-            #[cfg(feature = "arena-shadow")]
             self.db.arena_update_index256(
                 table_obj.get_code().to_uint64_t(),
                 table_obj.get_scope().to_uint64_t(),
@@ -2483,7 +2399,6 @@ impl ApplyContext {
     }
 
     pub fn db_idx256_remove(&mut self, iterator: i32) -> Result<(), ChainError> {
-        #[cfg(feature = "arena-shadow")]
         if self.db.arena_standalone_writes() {
             {
                 let mut inner = self.inner.write()?;
@@ -2513,7 +2428,6 @@ impl ApplyContext {
                 iterator,
                 self.receiver.as_u64(),
             )?;
-            #[cfg(feature = "arena-shadow")]
             inner.arena_index256_cache.remove(iterator);
         }
 
@@ -2533,7 +2447,6 @@ impl ApplyContext {
         secondary: U256,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         let search = secondary.value;
         let mut inner = self.inner.write()?;
         let res = self.db.db_idx256_find_secondary(
@@ -2545,7 +2458,6 @@ impl ApplyContext {
             primary,
         )?;
 
-        #[cfg(feature = "arena-shadow")]
         {
             let arena = self
                 .db
@@ -2590,7 +2502,6 @@ impl ApplyContext {
             primary,
         )?;
 
-        #[cfg(feature = "arena-shadow")]
         {
             let arena = self
                 .db
@@ -2629,7 +2540,6 @@ impl ApplyContext {
         secondary: &mut U256,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         let search = secondary.value;
         let mut inner = self.inner.write()?;
         let res = self.db.db_idx256_lowerbound(
@@ -2641,7 +2551,6 @@ impl ApplyContext {
             primary,
         )?;
 
-        #[cfg(feature = "arena-shadow")]
         {
             let arena = self.db.arena_idx256_lower_bound(code, scope, table, search);
             let ffi = if res >= 0 {
@@ -2679,7 +2588,6 @@ impl ApplyContext {
         secondary: &mut U256,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         let search = secondary.value;
         let mut inner = self.inner.write()?;
         let res = self.db.db_idx256_upperbound(
@@ -2691,7 +2599,6 @@ impl ApplyContext {
             primary,
         )?;
 
-        #[cfg(feature = "arena-shadow")]
         {
             let arena = self.db.arena_idx256_upper_bound(code, scope, table, search);
             let ffi = if res >= 0 {
@@ -2726,7 +2633,6 @@ impl ApplyContext {
         let res = self
             .db
             .db_idx256_end(&mut inner.index256_cache, code, scope, table)?;
-        #[cfg(feature = "arena-shadow")]
         {
             let arena_h = if res == -1 {
                 -1
@@ -2743,7 +2649,6 @@ impl ApplyContext {
         let res = self
             .db
             .db_idx256_next(&mut inner.index256_cache, iterator, primary)?;
-        #[cfg(feature = "arena-shadow")]
         {
             let arena_h = if iterator < -1 {
                 -1
@@ -2774,7 +2679,6 @@ impl ApplyContext {
         let res = self
             .db
             .db_idx256_previous(&mut inner.index256_cache, iterator, primary)?;
-        #[cfg(feature = "arena-shadow")]
         {
             let arena_h = if let Some((code, scope, table)) =
                 inner.arena_index256_cache.table_of_end(iterator)
@@ -2812,10 +2716,8 @@ impl ApplyContext {
         primary_key: u64,
         secondary_key: u64,
     ) -> Result<i32, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         let table_name = table;
 
-        #[cfg(feature = "arena-shadow")]
         if self.db.arena_standalone_writes() {
             pulse_assert(
                 payer != 0,
@@ -2866,7 +2768,6 @@ impl ApplyContext {
             inner.index_double_cache.cache_table(&table)?;
             let handle = inner.index_double_cache.add(obj)?;
 
-            #[cfg(feature = "arena-shadow")]
             {
                 let code = self.receiver.as_u64();
                 inner
@@ -2897,7 +2798,6 @@ impl ApplyContext {
         let payer = payer.as_u64();
         let billing_size = billable_size_v::<IndexDoubleObject>() as i64;
 
-        #[cfg(feature = "arena-shadow")]
         if self.db.arena_standalone_writes() {
             let (old_payer, new_payer) = {
                 let inner = self.inner.read()?;
@@ -2948,7 +2848,6 @@ impl ApplyContext {
             };
             self.db
                 .update_idx_double_object(obj, new_payer, secondary)?;
-            #[cfg(feature = "arena-shadow")]
             self.db.arena_update_idx_double(
                 table_obj.get_code().to_uint64_t(),
                 table_obj.get_scope().to_uint64_t(),
@@ -2969,7 +2868,6 @@ impl ApplyContext {
     }
 
     pub fn db_idx_double_remove(&mut self, iterator: i32) -> Result<(), ChainError> {
-        #[cfg(feature = "arena-shadow")]
         if self.db.arena_standalone_writes() {
             {
                 let mut inner = self.inner.write()?;
@@ -3001,7 +2899,6 @@ impl ApplyContext {
                 iterator,
                 self.receiver.as_u64(),
             )?;
-            #[cfg(feature = "arena-shadow")]
             inner.arena_index_double_cache.remove(iterator);
         }
 
@@ -3031,7 +2928,6 @@ impl ApplyContext {
             primary,
         )?;
 
-        #[cfg(feature = "arena-shadow")]
         {
             let arena = self
                 .db
@@ -3076,7 +2972,6 @@ impl ApplyContext {
             primary,
         )?;
 
-        #[cfg(feature = "arena-shadow")]
         {
             let arena = self
                 .db
@@ -3111,7 +3006,6 @@ impl ApplyContext {
         secondary: &mut u64,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         let search = *secondary;
         let mut inner = self.inner.write()?;
         let res = self.db.db_idx_double_lowerbound(
@@ -3123,7 +3017,6 @@ impl ApplyContext {
             primary,
         )?;
 
-        #[cfg(feature = "arena-shadow")]
         {
             let arena = self
                 .db
@@ -3163,7 +3056,6 @@ impl ApplyContext {
         secondary: &mut u64,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         let search = *secondary;
         let mut inner = self.inner.write()?;
         let res = self.db.db_idx_double_upperbound(
@@ -3175,7 +3067,6 @@ impl ApplyContext {
             primary,
         )?;
 
-        #[cfg(feature = "arena-shadow")]
         {
             let arena = self
                 .db
@@ -3217,7 +3108,6 @@ impl ApplyContext {
         let res = self
             .db
             .db_idx_double_end(&mut inner.index_double_cache, code, scope, table)?;
-        #[cfg(feature = "arena-shadow")]
         {
             let arena_h = if res == -1 {
                 -1
@@ -3240,7 +3130,6 @@ impl ApplyContext {
         let res = self
             .db
             .db_idx_double_next(&mut inner.index_double_cache, iterator, primary)?;
-        #[cfg(feature = "arena-shadow")]
         {
             let arena_h = if iterator < -1 {
                 -1
@@ -3273,7 +3162,6 @@ impl ApplyContext {
         let res =
             self.db
                 .db_idx_double_previous(&mut inner.index_double_cache, iterator, primary)?;
-        #[cfg(feature = "arena-shadow")]
         {
             let arena_h = if let Some((code, scope, table)) =
                 inner.arena_index_double_cache.table_of_end(iterator)
@@ -3311,10 +3199,8 @@ impl ApplyContext {
         primary_key: u64,
         secondary_key: Float128,
     ) -> Result<i32, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         let table_name = table;
 
-        #[cfg(feature = "arena-shadow")]
         if self.db.arena_standalone_writes() {
             pulse_assert(
                 payer != 0,
@@ -3368,7 +3254,6 @@ impl ApplyContext {
             inner.index_long_double_cache.cache_table(&table)?;
             let handle = inner.index_long_double_cache.add(obj)?;
 
-            #[cfg(feature = "arena-shadow")]
             {
                 let code = self.receiver.as_u64();
                 inner
@@ -3399,7 +3284,6 @@ impl ApplyContext {
         let payer = payer.as_u64();
         let billing_size = billable_size_v::<IndexLongDoubleObject>() as i64;
 
-        #[cfg(feature = "arena-shadow")]
         if self.db.arena_standalone_writes() {
             let (old_payer, new_payer) = {
                 let inner = self.inner.read()?;
@@ -3452,7 +3336,6 @@ impl ApplyContext {
             };
             // Mirror before the FFI update moves `secondary` (Float128 is not
             // Copy); the two writes are independent so order does not matter.
-            #[cfg(feature = "arena-shadow")]
             self.db.arena_update_idx_long_double(
                 table_obj.get_code().to_uint64_t(),
                 table_obj.get_scope().to_uint64_t(),
@@ -3475,7 +3358,6 @@ impl ApplyContext {
     }
 
     pub fn db_idx_long_double_remove(&mut self, iterator: i32) -> Result<(), ChainError> {
-        #[cfg(feature = "arena-shadow")]
         if self.db.arena_standalone_writes() {
             {
                 let mut inner = self.inner.write()?;
@@ -3507,7 +3389,6 @@ impl ApplyContext {
                 iterator,
                 self.receiver.as_u64(),
             )?;
-            #[cfg(feature = "arena-shadow")]
             inner.arena_index_long_double_cache.remove(iterator);
         }
 
@@ -3527,7 +3408,6 @@ impl ApplyContext {
         secondary: Float128,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         let search = (secondary.lo, secondary.hi);
         let mut inner = self.inner.write()?;
         let res = self.db.db_idx_long_double_find_secondary(
@@ -3539,7 +3419,6 @@ impl ApplyContext {
             primary,
         )?;
 
-        #[cfg(feature = "arena-shadow")]
         {
             let arena = self
                 .db
@@ -3584,7 +3463,6 @@ impl ApplyContext {
             primary,
         )?;
 
-        #[cfg(feature = "arena-shadow")]
         {
             let arena = self
                 .db
@@ -3624,7 +3502,6 @@ impl ApplyContext {
         secondary: &mut Float128,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         let search = (secondary.lo, secondary.hi);
         let mut inner = self.inner.write()?;
         let res = self.db.db_idx_long_double_lowerbound(
@@ -3636,7 +3513,6 @@ impl ApplyContext {
             primary,
         )?;
 
-        #[cfg(feature = "arena-shadow")]
         {
             let arena = self
                 .db
@@ -3677,7 +3553,6 @@ impl ApplyContext {
         secondary: &mut Float128,
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
-        #[cfg(feature = "arena-shadow")]
         let search = (secondary.lo, secondary.hi);
         let mut inner = self.inner.write()?;
         let res = self.db.db_idx_long_double_upperbound(
@@ -3689,7 +3564,6 @@ impl ApplyContext {
             primary,
         )?;
 
-        #[cfg(feature = "arena-shadow")]
         {
             let arena = self
                 .db
@@ -3735,7 +3609,6 @@ impl ApplyContext {
             scope,
             table,
         )?;
-        #[cfg(feature = "arena-shadow")]
         {
             let arena_h = if res == -1 {
                 -1
@@ -3760,7 +3633,6 @@ impl ApplyContext {
             iterator,
             primary,
         )?;
-        #[cfg(feature = "arena-shadow")]
         {
             let arena_h = if iterator < -1 {
                 -1
@@ -3797,7 +3669,6 @@ impl ApplyContext {
             iterator,
             primary,
         )?;
-        #[cfg(feature = "arena-shadow")]
         {
             let arena_h = if let Some((code, scope, table)) =
                 inner.arena_index_long_double_cache.table_of_end(iterator)
@@ -4034,7 +3905,6 @@ impl ApplyContext {
 
 /// The `(code, scope, table, primary)` a live iterator points at, or `None` for
 /// an end iterator (no backing row). Used to seed the arena positioning checks.
-#[cfg(feature = "arena-shadow")]
 fn current_iter_key(cache: &KeyValueIteratorCache, iterator: i32) -> Option<(u64, u64, u64, u64)> {
     let obj = cache.get(iterator).ok()?;
     let table = cache.get_table(obj.get_table_id()).ok()?;
@@ -4047,7 +3917,6 @@ fn current_iter_key(cache: &KeyValueIteratorCache, iterator: i32) -> Option<(u64
 }
 
 /// The primary key iterator `res` lands on, or `None` for an end iterator.
-#[cfg(feature = "arena-shadow")]
 fn landing_primary(cache: &KeyValueIteratorCache, res: i32) -> Option<u64> {
     if res < 0 {
         return None;
@@ -4058,7 +3927,6 @@ fn landing_primary(cache: &KeyValueIteratorCache, res: i32) -> Option<u64> {
 /// The `(code, scope, table)` an end iterator belongs to, so a step back from
 /// the end can be positioned against the arena. `None` if `iterator` isn't a
 /// known end iterator.
-#[cfg(feature = "arena-shadow")]
 fn end_iter_table(cache: &KeyValueIteratorCache, iterator: i32) -> Option<(u64, u64, u64)> {
     let table = cache.find_table_by_end_iterator(iterator).ok().flatten()?;
     Some((
@@ -4078,7 +3946,6 @@ fn end_iter_table(cache: &KeyValueIteratorCache, iterator: i32) -> Option<(u64, 
 /// `index_to_end_iterator`/`end_iterator_to_index`. Driven in lockstep with the
 /// chainbase cache so the arena can mint the identical handle for every
 /// contract iterator; cross-checked against chainbase's answer at each mint.
-#[cfg(feature = "arena-shadow")]
 #[derive(Default)]
 struct ArenaIteratorCache {
     end_to_table: Vec<(u64, u64, u64)>,
@@ -4089,7 +3956,6 @@ struct ArenaIteratorCache {
     row_to_iter: std::collections::HashMap<(u64, u64, u64, u64), i32>,
 }
 
-#[cfg(feature = "arena-shadow")]
 impl ArenaIteratorCache {
     /// End iterator for a table, minting one on first use.
     fn cache_table(&mut self, t: (u64, u64, u64)) -> i32 {

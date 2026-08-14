@@ -2,7 +2,6 @@ mod bridge;
 mod database;
 mod iterator_cache;
 mod objects;
-#[cfg(feature = "arena-shadow")]
 mod shadow;
 mod snapshot;
 mod types;
