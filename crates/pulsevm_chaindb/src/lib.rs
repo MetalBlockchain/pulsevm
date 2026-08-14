@@ -1615,6 +1615,33 @@ impl ArenaShadow {
         Some(db.blob::<AccountRow>(abi_ref).map(|b| b.len()).unwrap_or(0))
     }
 
+    /// The account's stored ABI bytes, which the RPC `get_table_rows`/account
+    /// formatters decode contract rows against. `None` if the account is absent
+    /// (an account with no ABI yields an empty vec).
+    pub fn account_abi_bytes(&self, name: u64) -> Option<Vec<u8>> {
+        let db = self.lock();
+        let abi_ref = db
+            .find_by::<AccountRow, AccountRowByName>(&name)
+            .ok()
+            .flatten()
+            .map(|r| r.abi)?;
+        Some(
+            db.blob::<AccountRow>(abi_ref)
+                .map(|b| b.to_vec())
+                .unwrap_or_default(),
+        )
+    }
+
+    /// The account's `last_code_update` (fc microseconds), for the RPC account
+    /// formatter. `None` if the account_metadata row is absent.
+    pub fn account_last_code_update(&self, name: u64) -> Option<i64> {
+        self.lock()
+            .find_by_hash::<AccountMetaRow, AccountMetaRowByName>(&name)
+            .ok()
+            .flatten()
+            .map(|r| r.last_code_update)
+    }
+
     pub fn set_privileged(&self, name: u64, privileged: bool) -> Result<(), DbError> {
         let mut db = self.lock();
         let id = db
@@ -3320,6 +3347,20 @@ impl ArenaShadow {
     /// db_next_i64. The order comes from the `by (t_id, primary_key)` index, not
     /// a sort we impose, so it exercises the same ordered structure the reads use.
     pub fn table_range(&self, code: u64, scope: u64, table: u64) -> Vec<(u64, Vec<u8>)> {
+        self.table_range_with_payer(code, scope, table)
+            .into_iter()
+            .map(|(primary, _payer, value)| (primary, value))
+            .collect()
+    }
+
+    /// Like [`table_range`] but also yields each row's `payer`, which the RPC
+    /// `get_table_rows` response reports per row.
+    pub fn table_range_with_payer(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+    ) -> Vec<(u64, u64, Vec<u8>)> {
         use std::ops::Bound;
         let db = self.lock();
         let Some(t_id) = db
@@ -3340,7 +3381,7 @@ impl ArenaShadow {
             ))
             .map(|(&(_, primary), row)| {
                 let value = tbl.blob(row.value).to_vec();
-                (primary, value)
+                (primary, row.payer, value)
             })
             .collect()
     }

@@ -398,6 +398,24 @@ fn chain_config_params_from_v0(cfg: &ChainConfigV0) -> crate::shadow::ChainConfi
     }
 }
 
+/// Name-encode a table/scope identifier for the RPC formatters.
+fn name_u64(s: &str) -> Result<u64, ChainError> {
+    use std::str::FromStr;
+    pulsevm_name::Name::from_str(s)
+        .map(|n| n.as_u64())
+        .map_err(|e| ChainError::InternalError(format!("bad name {s:?}: {e:?}")))
+}
+
+/// The raw `symbol_code` form of a ticker: its ASCII bytes packed low byte first
+/// (a token contract's `stat` table is scoped by this).
+fn symbol_code_from_str(s: &str) -> u64 {
+    let mut raw = 0u64;
+    for (i, b) in s.bytes().take(7).enumerate() {
+        raw |= (b as u64) << (8 * i);
+    }
+    raw
+}
+
 /// Reconstructs an [`Authority`] from the blob [`encode_authority`] produced and
 /// the arena stored — the exact inverse, so `decode_authority(encode_authority(a))`
 /// round-trips. This is what lets the arena serve the *whole* authority (not just
@@ -770,6 +788,77 @@ impl Database {
             self.shadow
                 .as_ref()
                 .and_then(|s| s.account_ram_usage(account_name))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = account_name;
+            None
+        }
+    }
+
+    /// A contract table's rows as `(primary_key, payer, value)` in primary order,
+    /// the read behind the RPC `get_table_rows`. Empty when shadowing is off.
+    pub fn arena_table_range_with_payer(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+    ) -> Vec<(u64, u64, Vec<u8>)> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow
+                .as_ref()
+                .map(|s| s.table_range_with_payer(code, scope, table))
+                .unwrap_or_default()
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = (code, scope, table);
+            Vec::new()
+        }
+    }
+
+    /// The account's creation-date block-timestamp slot, for the RPC account
+    /// formatter's `created` field. `None` when shadowing is off / absent.
+    pub fn arena_account_creation_date(&self, account_name: u64) -> Option<u32> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow
+                .as_ref()
+                .and_then(|s| s.account_creation_date(account_name))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = account_name;
+            None
+        }
+    }
+
+    /// The account's stored ABI bytes (empty if it has none), for decoding the
+    /// contract rows the RPC formatters return. `None` when shadowing is off /
+    /// the account is absent.
+    pub fn arena_account_abi_bytes(&self, account_name: u64) -> Option<Vec<u8>> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow
+                .as_ref()
+                .and_then(|s| s.account_abi_bytes(account_name))
+        }
+        #[cfg(not(feature = "arena-shadow"))]
+        {
+            let _ = account_name;
+            None
+        }
+    }
+
+    /// The account's `last_code_update` (fc microseconds), for the RPC account
+    /// formatter. `None` when shadowing is off / the metadata is absent.
+    pub fn arena_account_last_code_update(&self, account_name: u64) -> Option<i64> {
+        #[cfg(feature = "arena-shadow")]
+        {
+            self.shadow
+                .as_ref()
+                .and_then(|s| s.account_last_code_update(account_name))
         }
         #[cfg(not(feature = "arena-shadow"))]
         {
@@ -6707,6 +6796,112 @@ impl Database {
             &cxx_time_point(head_block_time),
         )
         .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
+    // ---- Arena-backed RPC formatters ----------------------------------------
+    //
+    // These serve the read-only RPC endpoints off the arena, formatting through
+    // pulsevm_rpc (and pulsevm_abi for the decoded row paths) so the responses
+    // match nodeos without the C++ api.cpp. They replace the get_* formatters
+    // above when the bridge is removed.
+
+    /// `get_table_rows`: the rows of `(code, scope, table)` in primary order (up
+    /// to `limit`), decoded through the contract's ABI in `json` mode or hex
+    /// otherwise.
+    pub fn rpc_get_table_rows(
+        &self,
+        json: bool,
+        code: u64,
+        scope: u64,
+        table: u64,
+        limit: u32,
+    ) -> Result<String, ChainError> {
+        let all = self.arena_table_range_with_payer(code, scope, table);
+        let more = all.len() > limit as usize;
+        let rows: Vec<pulsevm_rpc::TableRow> = all
+            .into_iter()
+            .take(limit as usize)
+            .map(|(_pk, payer, value)| pulsevm_rpc::TableRow { payer, data: value })
+            .collect();
+
+        let abi = if json {
+            let bytes = self.arena_account_abi_bytes(code).unwrap_or_default();
+            Some(
+                pulsevm_abi::Abi::from_bytes(&bytes)
+                    .map_err(|e| ChainError::InternalError(format!("abi decode: {e}")))?,
+            )
+        } else {
+            None
+        };
+        let row_type = abi
+            .as_ref()
+            .and_then(|a| a.table_row_type(table))
+            .unwrap_or_default();
+
+        let value = pulsevm_rpc::format_table_rows(json, abi.as_ref(), &row_type, &rows, more, "")
+            .map_err(|e| ChainError::InternalError(format!("format table_rows: {e}")))?;
+        Ok(serde_json::to_string(&value).unwrap())
+    }
+
+    /// `get_currency_balance`: every balance the token contract `code` holds for
+    /// `account` (its `accounts` table rows, each a single asset).
+    pub fn rpc_get_currency_balance(&self, code: u64, account: u64) -> Result<String, ChainError> {
+        let accounts = name_u64("accounts")?;
+        let rows: Vec<Vec<u8>> = self
+            .arena_table_range(code, account, accounts)
+            .into_iter()
+            .map(|(_pk, value)| value)
+            .collect();
+        let value = pulsevm_rpc::format_currency_balance(&rows)
+            .map_err(|e| ChainError::InternalError(format!("format currency_balance: {e}")))?;
+        Ok(serde_json::to_string(&value).unwrap())
+    }
+
+    /// `get_currency_stats`: the `stat` row for `symbol` under token contract
+    /// `code` (supply, max_supply, issuer).
+    pub fn rpc_get_currency_stats(&self, code: u64, symbol: &str) -> Result<String, ChainError> {
+        let stat = name_u64("stat")?;
+        let scope = symbol_code_from_str(symbol);
+        let rows: Vec<Vec<u8>> = self
+            .arena_table_range(code, scope, stat)
+            .into_iter()
+            .map(|(_pk, value)| value)
+            .collect();
+        let value = pulsevm_rpc::format_currency_stats(&rows)
+            .map_err(|e| ChainError::InternalError(format!("format currency_stats: {e}")))?;
+        Ok(serde_json::to_string(&value).unwrap())
+    }
+
+    /// `get_table_by_scope`: every scope of contract `code` (optionally a single
+    /// `table`, or all tables when `table == 0`), up to `limit`.
+    pub fn rpc_get_table_by_scope(
+        &self,
+        code: u64,
+        table: u64,
+        limit: u32,
+    ) -> Result<String, ChainError> {
+        let bytes = self.arena_contract_table_state_bytes().unwrap_or_default();
+        let mut rows: Vec<pulsevm_rpc::ScopeRow> = Vec::new();
+        let mut p = 0;
+        while p + 36 <= bytes.len() {
+            let u = |o: usize| u64::from_le_bytes(bytes[o..o + 8].try_into().unwrap());
+            let (rcode, rscope, rtable) = (u(p), u(p + 8), u(p + 16));
+            let rpayer = u(p + 24);
+            let rcount = u32::from_le_bytes(bytes[p + 32..p + 36].try_into().unwrap());
+            p += 36;
+            if rcode == code && (table == 0 || rtable == table) {
+                rows.push(pulsevm_rpc::ScopeRow {
+                    code: rcode,
+                    scope: rscope,
+                    table: rtable,
+                    payer: rpayer,
+                    count: rcount,
+                });
+            }
+        }
+        rows.truncate(limit as usize);
+        let value = pulsevm_rpc::format_table_by_scope(&rows, "");
+        Ok(serde_json::to_string(&value).unwrap())
     }
 
     pub fn pack_deltas(&self, full_snapshot: bool) -> Result<Vec<u8>, ChainError> {

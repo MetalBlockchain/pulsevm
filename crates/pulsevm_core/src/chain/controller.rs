@@ -4637,6 +4637,67 @@ mod tests {
         s
     }
 
+    /// Re-serve each captured RPC formatter query off the arena and require it to
+    /// reproduce the frozen C++ output (semantic JSON equality). Covers the
+    /// arena-backed formatters wired so far; account_info records are skipped
+    /// until it is wired.
+    #[cfg(feature = "arena-shadow")]
+    fn verify_rpc_golden(controller: &Controller, golden_path: &str) -> Result<(), ChainError> {
+        let db = controller.database();
+        let text = fs::read_to_string(golden_path).expect("read rpc golden");
+        let records: Vec<serde_json::Value> =
+            serde_json::from_str(&text).expect("parse rpc golden");
+
+        let as_u64 = |v: &serde_json::Value, k: &str| v[k].as_u64().unwrap();
+        let parse = |s: &str| -> serde_json::Value { serde_json::from_str(s).expect("json") };
+
+        let mut checked = 0u64;
+        let mut by_kind: std::collections::BTreeMap<String, u64> =
+            std::collections::BTreeMap::new();
+        for r in &records {
+            let kind = r["kind"].as_str().unwrap();
+            let expected = r.get("output").map(|o| parse(o.as_str().unwrap()));
+            let got = match kind {
+                "table_rows_json" => Some(db.rpc_get_table_rows(
+                    true,
+                    as_u64(r, "code"),
+                    as_u64(r, "scope"),
+                    as_u64(r, "table"),
+                    100,
+                )?),
+                "table_rows_raw" => Some(db.rpc_get_table_rows(
+                    false,
+                    as_u64(r, "code"),
+                    as_u64(r, "scope"),
+                    as_u64(r, "table"),
+                    100,
+                )?),
+                "currency_balance" => {
+                    Some(db.rpc_get_currency_balance(as_u64(r, "code"), as_u64(r, "account"))?)
+                }
+                "currency_stats" => Some(
+                    db.rpc_get_currency_stats(as_u64(r, "code"), r["symbol"].as_str().unwrap())?,
+                ),
+                "table_by_scope" => {
+                    Some(db.rpc_get_table_by_scope(as_u64(r, "code"), as_u64(r, "table"), 100)?)
+                }
+                _ => None,
+            };
+            if let (Some(got), Some(expected)) = (got, expected) {
+                let got = parse(&got);
+                assert_eq!(
+                    got, expected,
+                    "RPC {kind} mismatch for {r}\n got:  {got}\n want: {expected}"
+                );
+                checked += 1;
+                *by_kind.entry(kind.to_string()).or_default() += 1;
+            }
+        }
+        assert!(checked > 0, "verified no RPC records");
+        eprintln!("RPC verify: {checked} arena formatter outputs match the C++ golden {by_kind:?}");
+        Ok(())
+    }
+
     /// Freeze the C++ RPC formatter outputs over the real replayed contract state
     /// into a JSON file, so the arena reimplementation and the Rust ABI serializer
     /// can be built and validated against a C++-attested oracle after the bridge is
@@ -5614,6 +5675,15 @@ mod tests {
         // checks below.
         if let Ok(out) = std::env::var("PULSEVM_CAPTURE_RPC") {
             capture_rpc_golden(&controller, &out)?;
+            return Ok(());
+        }
+
+        // RPC verify: re-serve each captured formatter query off the arena and
+        // require it to reproduce the frozen C++ output (semantic JSON equality).
+        // This proves the arena-backed formatters, end to end, before the bridge
+        // is removed.
+        if let Ok(golden) = std::env::var("PULSEVM_VERIFY_RPC") {
+            verify_rpc_golden(&controller, &golden)?;
             return Ok(());
         }
 
