@@ -514,8 +514,8 @@ impl WasmRuntime {
             let mut inner = self.inner.write()?;
 
             if !inner.code_cache.contains(&id) {
-                let code_object = db.get_code_object_by_hash(code_hash, 0, 0)?;
-                let code_object = unsafe { &*code_object };
+                let r = db.read()?;
+                let code_object = r.get_code_object_by_hash(code_hash, 0, 0)?;
 
                 // Compile on a fresh engine carrying the pinned deterministic
                 // config (NaN canonicalization, metering, feature set).
@@ -805,14 +805,25 @@ impl WasmRuntime {
         // Resume timer
         apply_context.resume_billing_timer()?;
 
+        // Compilation ran inside the paused window above and can be a slow native
+        // window on a cache miss; the deadline measures raw wall-clock, so re-check
+        // it now — before the guest runs — to abandon a transaction that already
+        // blew its budget compiling rather than sink more time into execution.
+        apply_context.checktime()?;
+
         // Keep the raw RuntimeError so an eosio_exit/pulse_exit trap (WasmExit) can
-        // be told apart from a real failure before it's flattened into a ChainError.
+        // be told apart from a real failure before it's flattened into a ChainError
+        // (the WasmExit-aware match below does that flattening).
         let result = apply_func.call(
             &mut warm.store,
             receiver.as_u64() as i64,
             action.account().as_u64() as i64,
             action.name().as_u64() as i64,
         );
+        // A value the contract set via set_action_return_value lives on the env;
+        // capture it before the warm store returns to the pool so it can be
+        // surfaced on the action trace (informational; not part of the digest).
+        let return_value = warm.env.as_ref(&warm.store).return_value.clone();
         let remaining_points: MeteringPoints = get_remaining_points(&mut warm.store, &instance);
 
         // Return the warm store to the pool for reuse, unless it has spun up
@@ -836,6 +847,10 @@ impl WasmRuntime {
                         }
                         return Err(ChainError::ApplyError(format!("{}", e.message())));
                     }
+                }
+
+                if let Some(rv) = return_value {
+                    apply_context.set_trace_return_value(rv.0)?;
                 }
 
                 Ok(cpu_limit.saturating_sub(points) as u64)

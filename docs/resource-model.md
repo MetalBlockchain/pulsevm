@@ -160,6 +160,20 @@ These configuration values are redenominated from microseconds to ops in `genesi
 
 The op values are sized directly against measured intrinsic costs rather than converted from the µs defaults by a fixed factor: a row write is ~16,000 ops and a key recovery ~1,650,000, so a transaction budget of 1,000,000,000 ops affords real work while staying under the u32 `cpu_usage` receipt field (~4.29e9 ops ≈ 113 ms). The ratio between `max_transaction_cpu_usage` and `min_transaction_cpu_usage` sets the maximum spam amplification factor and is chosen deliberately, not carried over by analogy.
 
+### 3.6 Wall-clock deadline (subjective)
+
+The op metering in §3.2–§3.4 bounds the **guest** deterministically, but a transaction also runs native Rust the metering can't see: the native action handlers, the ~150 host intrinsics, and the wasm the guest triggers. None of those are op-counted, so on their own they have no time bound — a slow or pathological native path could tie up a node.
+
+On top of the objective op budget, each transaction therefore carries a **subjective** wall-clock ceiling, `max_transaction_time` (a node-local config in milliseconds, `NodeConfig::max_transaction_time_ms`, generous by default and tuned down by producers). `TransactionContext::checktime()` measures **raw wall-clock** elapsed since the transaction started and abandons it with a `DeadlineError` once it crosses the ceiling. It deliberately does *not* use the billing timer: that timer pauses across module compilation, which is itself a native window this guard exists to bound, so a watchdog hung off it would be blind to exactly the code it is meant to catch. Compilation is lazy (first execution of a contract), so this is a real window — bounded a priori by the `set_code` validation limits (§ code size etc.) but still charged in full against the deadline.
+
+This is deliberately *not* consensus:
+
+- It depends on how fast this particular machine is, so it must never decide whether a block is valid. It is **skipped whenever billing is explicit** (`explicit_billed_cpu_time`), and every path that *applies an existing block* bills explicitly: `execute_block` unconditionally passes the block-recorded cpu/net to `execute_transaction_billed`, so block verification, acceptance, pending-chain reorg replay and replay from the block log all take the exempt path, as does the implicit `onblock`. Only block production and speculative/RPC execution — where this node decides what to run rather than checking what someone else already ran — are subject to it. A slow validator applying a block another producer made never trips it. (Unlike EOSIO there is no separate "full validation" mode that re-derives billing; pulsevm always validates against the producer's recorded numbers, so there is no second, non-exempt validation path.)
+- A `DeadlineError` is subjective: block production drops the offending transaction and keeps going; it never fails the block. Contrast the op-metering exhaustion in §3.3, which is objective (`tx_cpu_usage_exceeded`-style) and consensus.
+- The corollary is worth stating plainly: a node applying someone else's block has **no wall-clock bound at all**. The native work this section exists to bound — handlers, host intrinsics, lazy compilation — is just as uncounted during validation as during production, so a block full of first-execution contracts imposes unbounded native work on every validator. That is the deliberate trade, because a subjective timer must not decide validity, but it means the protection here is against *this* node wasting its own time, not against a block that is expensive to apply.
+
+The check is cooperative, enforced at execution boundaries — the head of every `execute_action` (so it bounds action fan-out and deep inline recursion), after a native handler before control passes to the metered wasm, and once more right after a module is compiled (before the guest runs, so a slow compile is caught before more time is sunk into execution). It cannot interrupt a single call already in progress; a long *guest* run is still bounded by op metering, and interrupting a long native call or compilation mid-flight (an epoch/watchdog timer, EOSIO's `platform_timer` — note epoch bounds execution, not compilation) is a follow-up.
+
 ---
 
 ## 4. NET
@@ -381,4 +395,4 @@ ram       = delta from any state mutation, billed normally
 4. Is native floating point permitted, or are floats routed through softfloat? (§6.5)
 5. What is the protocol-feature mechanism for revising the cost function post-launch, and how are cached compiled modules invalidated on activation?
 6. Are deferred transactions supported? If not, the `TRANSACTION_ID_NET_USAGE` surcharge and the delayed-transaction NET path can be removed entirely.
-7. Is there a subjective CPU/NET billing path for failed transactions, and how does it interact with deterministic op counting?
+7. Is there a subjective CPU/NET billing path for failed transactions, and how does it interact with deterministic op counting? (Partly answered: the wall-clock `checktime` deadline in §3.6 is the subjective time guard, layered over the objective op count. Subjective *billing* of failed transactions is still open.)

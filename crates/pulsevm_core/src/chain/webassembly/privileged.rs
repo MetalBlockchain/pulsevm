@@ -111,12 +111,17 @@ pub fn set_proposed_producers(
         )?;
     }
 
-    let count = producers.len() as i64;
+    // EOSIO returns the proposed schedule's version, or -1 when the proposal is a
+    // no-op — identical to what is already active (this build has no separate
+    // pending schedule to also compare against). A no-op records nothing.
+    let context = env_data.apply_context();
+    if producers == context.active_producers()? {
+        return Ok(-1);
+    }
+    let new_version = context.active_schedule_version()? as i64 + 1;
     let context = env_data.apply_context_mut();
     context.set_proposed_producers(producers)?;
-    // EOSIO returns the version of the proposed schedule. We don't carry a header
-    // schedule version yet, so return the producer count as a non-negative ack.
-    Ok(count)
+    Ok(new_version)
 }
 
 pub fn get_blockchain_parameters_packed(
@@ -233,7 +238,8 @@ pub fn is_privileged(
     let context = env_data.apply_context_mut();
     privileged_check(context)?;
     let db = env_data.db();
-    let account = db.get_account_metadata(account)?;
+    let r = db.read()?;
+    let account = r.get_account_metadata(account)?;
 
     Ok(account.is_privileged() as i32)
 }

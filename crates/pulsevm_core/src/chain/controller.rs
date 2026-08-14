@@ -92,7 +92,6 @@ use pulsevm_ffi::{
     CxxGenesisState,
     Database,
     ElasticLimitParameters,
-    GlobalPropertyObject,
     PermissionLevelWeight,
     TimePoint,
     UndoSession,
@@ -158,6 +157,13 @@ pub struct Controller {
     // a block whose header carries `new_producers`, and reconstructed from the
     // block log on restart — it is never read from an out-of-band source.
     active_schedule: ProducerSchedule,
+
+    // The producer schedule in force for the block currently being executed —
+    // the schedule active as of that block's parent. Set at the top of the build,
+    // verify, and standalone push paths so a transaction's `get_active_producers`
+    // / `set_proposed_producers` see the same active set the block is signed
+    // against. Not persisted; a per-execution scratch value.
+    block_active_schedule: ProducerSchedule,
 
     // The chain of blocks that have been executed (during build or verify) but
     // not yet accepted, ordered oldest first. Their state is materialized on the
@@ -260,6 +266,7 @@ impl Controller {
             db_path: None,
             snapshot_cache: None,
             active_schedule: ProducerSchedule::default(),
+            block_active_schedule: ProducerSchedule::default(),
 
             pending_chain: Vec::new(),
             blocks_executed: 0,
@@ -559,6 +566,11 @@ impl Controller {
         // The last producer schedule proposed by any transaction in this block,
         // activated when the block is accepted.
         let mut proposed_schedule: Option<Vec<ProducerKey>> = None;
+
+        // The schedule active for this block (as of its parent) governs what
+        // onblock and every transaction see through get_active_producers, and the
+        // version set_proposed_producers reports.
+        self.block_active_schedule = self.schedule_active_for_parent(&self.preferred_id)?;
 
         // onblock heads the block, before any mempool transaction, so its action
         // digests come first in the action merkle — matching what validators
@@ -876,6 +888,8 @@ impl Controller {
         block.validate_syntactically(&self.db)?;
         let parent_schedule = self.schedule_active_for_parent(block.previous_id())?;
         self.verify_block_signature(block, &parent_schedule)?;
+        // Contracts in this block see the schedule active as of its parent.
+        self.block_active_schedule = parent_schedule.clone();
 
         let parent_block_id = block.previous_id().clone();
         let block_status = BlockStatus::Verifying;
@@ -1097,6 +1111,19 @@ impl Controller {
     // chain: it runs in its own child session that is discarded on failure, and
     // a failure yields no digests (identical on every node, since it is
     // deterministic), so the merkles still agree.
+    // Hand the transaction context the producer schedule in force for this block
+    // (names + version), so `get_active_producers` returns the active set and
+    // `set_proposed_producers` reports the right next version.
+    fn set_context_active_schedule(
+        &self,
+        trx_context: &TransactionContext,
+    ) -> Result<(), ChainError> {
+        trx_context.set_active_schedule(
+            self.block_active_schedule.producers.clone(),
+            self.block_active_schedule.version,
+        )
+    }
+
     fn run_onblock(
         &mut self,
         timestamp: &BlockTimestamp,
@@ -1145,7 +1172,9 @@ impl Controller {
             &trx_id,
             *block_status,
             packed,
+            self.max_transaction_time_ms(),
         );
+        self.set_context_active_schedule(&trx_context)?;
 
         let executed = (|| -> Result<VecDeque<Digest>, ChainError> {
             trx_context.init_for_implicit_trx(&trx)?;
@@ -1252,8 +1281,8 @@ impl Controller {
     fn block_elastic_parameters(
         &self,
     ) -> Result<(ElasticLimitParameters, ElasticLimitParameters), ChainError> {
-        let global_property = Controller::get_global_properties(&self.db)?;
-        let chain_config = global_property.get_chain_config();
+        let r = self.db.read()?;
+        let chain_config = r.get_global_properties()?.get_chain_config();
         let cpu_elastic_parameters = ElasticLimitParameters::new(
             eos_percent(
                 chain_config.get_max_block_cpu_usage() as u64,
@@ -1300,6 +1329,9 @@ impl Controller {
         pending_block_timestamp: &BlockTimestamp,
         block_status: &BlockStatus,
     ) -> Result<TransactionResult, ChainError> {
+        // Standalone (mempool) validation runs against the head schedule; there is
+        // no pending block, so the active set a contract reads is the accepted one.
+        self.block_active_schedule = self.active_schedule.clone();
         let mut db = self.db.clone();
         let _undo_session = db.create_undo_session(true)?;
         db.arena_start_undo_session();
@@ -1329,6 +1361,16 @@ impl Controller {
     /// As `execute_transaction`, but when `explicit_billed` is set (applying an
     /// already-accepted block) it bills the block-recorded cpu/net and skips the
     /// objective resource-limit checks — Antelope light/replay validation.
+    // The node-local wall-clock ceiling for a single transaction (see
+    // NodeConfig::max_transaction_time_ms). Falls back to a generous default when
+    // no config is loaded (a bare test controller).
+    fn max_transaction_time_ms(&self) -> u32 {
+        self.node_config
+            .as_ref()
+            .map(|c| c.max_transaction_time_ms)
+            .unwrap_or(30_000)
+    }
+
     pub fn execute_transaction_billed(
         &mut self,
         packed_transaction: &PackedTransaction,
@@ -1361,7 +1403,9 @@ impl Controller {
             packed_transaction.id(),
             *block_status,
             packed_transaction.clone(),
+            self.max_transaction_time_ms(),
         );
+        self.set_context_active_schedule(&trx_context)?;
 
         // Applying an already-accepted block: bill the recorded cpu/net and
         // skip the objective limit checks (Antelope light/replay validation).
@@ -1383,6 +1427,10 @@ impl Controller {
 
     pub fn last_accepted_block(&self) -> &SignedBlock {
         &self.last_accepted_block
+    }
+
+    pub fn active_producer_schedule(&self) -> &ProducerSchedule {
+        &self.active_schedule
     }
 
     pub fn get_block_by_height(&self, height: u32) -> Result<Option<SignedBlock>, ChainError> {
@@ -1627,14 +1675,6 @@ impl Controller {
 
     pub fn get_wasm_runtime(&self) -> &WasmRuntime {
         &self.wasm_runtime
-    }
-
-    pub fn get_global_properties(db: &Database) -> Result<&GlobalPropertyObject, ChainError> {
-        let res = db.get_global_properties().map_err(|e| {
-            ChainError::DatabaseError(format!("failed to get global properties: {}", e))
-        })?;
-
-        Ok(unsafe { &*res })
     }
 
     pub fn database(&self) -> Database {
@@ -2078,6 +2118,67 @@ mod tests {
                     ACTIVE_NAME.as_u64(),
                 )],
             )],
+        )
+        .sign(&private_key, &chain_id)?;
+        let packed_trx = PackedTransaction::from_signed_transaction(trx)?;
+        Ok(packed_trx)
+    }
+
+    // A distinct, valid account name for index `i` (prefix keeps it from starting
+    // with a digit; three base-26 letters give ~17k unique names).
+    fn nth_account_name(i: usize) -> Name {
+        let alphabet = b"abcdefghijklmnopqrstuvwxyz";
+        let mut n = i;
+        let mut bytes = vec![b'a'];
+        for _ in 0..3 {
+            bytes.push(alphabet[n % 26]);
+            n /= 26;
+        }
+        Name::from_str(std::str::from_utf8(&bytes).unwrap()).unwrap()
+    }
+
+    // One transaction that creates `count` accounts, i.e. `count` newaccount
+    // actions in a single transaction. Each action re-enters execute_action and so
+    // hits the wall-clock checktime at its head.
+    fn create_many_accounts(
+        private_key: &PrivateKey,
+        count: usize,
+        chain_id: Id,
+    ) -> Result<PackedTransaction, ChainError> {
+        let actions = (0..count)
+            .map(|i| {
+                Action::new(
+                    Name::from_str("pulse").unwrap(),
+                    Name::from_str("newaccount").unwrap(),
+                    NewAccount {
+                        creator: Name::from_str("pulse").unwrap(),
+                        name: nth_account_name(i),
+                        owner: Authority::new(
+                            1,
+                            vec![KeyWeight::new(private_key.get_public_key().into(), 1)],
+                            vec![],
+                            vec![],
+                        ),
+                        active: Authority::new(
+                            1,
+                            vec![KeyWeight::new(private_key.get_public_key().into(), 1)],
+                            vec![],
+                            vec![],
+                        ),
+                    }
+                    .pack()
+                    .unwrap(),
+                    vec![PermissionLevel::new(
+                        PULSE_NAME.as_u64(),
+                        ACTIVE_NAME.as_u64(),
+                    )],
+                )
+            })
+            .collect();
+        let trx = Transaction::new(
+            TransactionHeader::new(TimePointSec::maximum(), 0, 0, 0u32.into(), 0, 0u32.into()),
+            vec![],
+            actions,
         )
         .sign(&private_key, &chain_id)?;
         let packed_trx = PackedTransaction::from_signed_transaction(trx)?;
@@ -5244,6 +5345,221 @@ mod tests {
         Ok((controller, private_key, chain_id, temp_path))
     }
 
+    // A privileged contract that reads the action data as a packed
+    // vector<producer_key>, calls set_proposed_producers, and returns the i64
+    // result (the new schedule version, or -1) via set_action_return_value.
+    const PROPOSE_PRODUCERS_WAT: &str = r#"
+        (module
+          (import "env" "action_data_size" (func $ads (result i32)))
+          (import "env" "read_action_data" (func $read (param i32 i32) (result i32)))
+          (import "env" "set_proposed_producers" (func $spp (param i32 i32) (result i64)))
+          (import "env" "set_action_return_value" (func $sarv (param i32 i32)))
+          (memory 1)
+          (export "memory" (memory 0))
+          (func (export "apply") (param i64 i64 i64)
+            (local $len i32)
+            (local $ret i64)
+            (local.set $len (call $ads))
+            (drop (call $read (i32.const 0) (local.get $len)))
+            (local.set $ret (call $spp (i32.const 0) (local.get $len)))
+            (i64.store (i32.const 1024) (local.get $ret))
+            (call $sarv (i32.const 1024) (i32.const 8))))
+    "#;
+
+    // A contract that copies the active producer set into the return value.
+    const READ_PRODUCERS_WAT: &str = r#"
+        (module
+          (import "env" "get_active_producers" (func $gap (param i32 i32) (result i32)))
+          (import "env" "set_action_return_value" (func $sarv (param i32 i32)))
+          (memory 1)
+          (export "memory" (memory 0))
+          (func (export "apply") (param i64 i64 i64)
+            (local $n i32)
+            (local.set $n (call $gap (i32.const 0) (i32.const 256)))
+            (call $sarv (i32.const 0) (local.get $n))))
+    "#;
+
+    // Build a signed transaction carrying a single action to `account`, with the
+    // account's own active permission (self-authorized contract call).
+    fn push_action(
+        key: &PrivateKey,
+        account: Name,
+        action: Name,
+        data: Vec<u8>,
+        chain_id: Id,
+    ) -> Result<PackedTransaction, ChainError> {
+        let trx = Transaction::new(
+            TransactionHeader::new(TimePointSec::maximum(), 0, 0, 0u32.into(), 0, 0u32.into()),
+            vec![],
+            vec![Action::new(
+                account,
+                action,
+                data,
+                vec![PermissionLevel::new(account.as_u64(), ACTIVE_NAME.as_u64())],
+            )],
+        )
+        .sign(key, &chain_id)?;
+        PackedTransaction::from_signed_transaction(trx)
+    }
+
+    // Pull the return value set by the first action that produced one.
+    fn action_return_value(result: &TransactionResult) -> Vec<u8> {
+        result
+            .trace
+            .action_traces
+            .iter()
+            .find(|t| !t.return_value.is_empty())
+            .map(|t| t.return_value.clone())
+            .unwrap_or_default()
+    }
+
+    fn decode_producer_names(bytes: &[u8]) -> Vec<Name> {
+        assert_eq!(
+            bytes.len() % 8,
+            0,
+            "producer name array must be 8-byte aligned"
+        );
+        bytes
+            .chunks_exact(8)
+            .map(|c| Name::new(u64::from_le_bytes(c.try_into().unwrap())))
+            .collect()
+    }
+
+    // set_proposed_producers reports the new schedule version, and -1 when the
+    // proposal matches the active set. Driven through a real privileged contract
+    // and the wasm host boundary; push_transaction reverts, so only the return
+    // value is under test here.
+    #[tokio::test]
+    async fn set_proposed_producers_reports_version_and_noop() -> Result<(), ChainError> {
+        let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
+        let mut mempool = Mempool::new();
+
+        let admin = Name::from_str("prodadmin")?;
+        let producera = Name::from_str("producera")?;
+        mempool.add_transaction(create_account(&private_key, admin, chain_id)?);
+        mempool.add_transaction(create_account(&private_key, producera, chain_id)?);
+        mempool.add_transaction(set_code(
+            &private_key,
+            admin,
+            crate::wat2wasm(PROPOSE_PRODUCERS_WAT).expect("valid WAT"),
+            chain_id,
+        )?);
+        let block = controller.build_block(&mut mempool).await?;
+        controller.accept_block(&block.id()?, &mut mempool)?;
+
+        // set_proposed_producers is privileged; make the contract account so.
+        controller.database().set_privileged(admin.as_u64(), true)?;
+
+        let genesis_key = private_key.get_public_key();
+        let ts: BlockTimestamp = TimePoint::now().into();
+
+        // Proposing exactly the active set (genesis: pulse alone) is a no-op → -1.
+        let same = vec![ProducerKey {
+            producer_name: PULSE_NAME,
+            block_signing_key: genesis_key.clone(),
+        }];
+        let r = controller.push_transaction(
+            &push_action(
+                &private_key,
+                admin,
+                Name::from_str("run")?,
+                same.pack().unwrap(),
+                chain_id,
+            )?,
+            &ts,
+            &BlockStatus::Verifying,
+        )?;
+        assert_eq!(
+            i64::from_le_bytes(action_return_value(&r).try_into().unwrap()),
+            -1,
+            "proposing the active set must return -1"
+        );
+
+        // A genuinely new set returns the next version (active is version 0 → 1).
+        let changed = vec![
+            ProducerKey {
+                producer_name: PULSE_NAME,
+                block_signing_key: genesis_key.clone(),
+            },
+            ProducerKey {
+                producer_name: producera,
+                block_signing_key: genesis_key.clone(),
+            },
+        ];
+        let r = controller.push_transaction(
+            &push_action(
+                &private_key,
+                admin,
+                Name::from_str("run")?,
+                changed.pack().unwrap(),
+                chain_id,
+            )?,
+            &ts,
+            &BlockStatus::Verifying,
+        )?;
+        assert_eq!(
+            i64::from_le_bytes(action_return_value(&r).try_into().unwrap()),
+            1,
+            "proposing a changed set must return the next version"
+        );
+
+        Ok(())
+    }
+
+    // get_active_producers copies the active producer names (raw 8-byte name
+    // array) into the guest buffer, and tracks the active schedule.
+    #[tokio::test]
+    async fn get_active_producers_reflects_active_schedule() -> Result<(), ChainError> {
+        let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
+        let mut mempool = Mempool::new();
+
+        let glenn = Name::from_str("glenn")?;
+        mempool.add_transaction(create_account(&private_key, glenn, chain_id)?);
+        mempool.add_transaction(set_code(
+            &private_key,
+            glenn,
+            crate::wat2wasm(READ_PRODUCERS_WAT).expect("valid WAT"),
+            chain_id,
+        )?);
+        let block = controller.build_block(&mut mempool).await?;
+        controller.accept_block(&block.id()?, &mut mempool)?;
+
+        let ts: BlockTimestamp = TimePoint::now().into();
+        let read = |c: &mut Controller| -> Result<Vec<Name>, ChainError> {
+            let r = c.push_transaction(
+                &push_action(
+                    &private_key,
+                    glenn,
+                    Name::from_str("run")?,
+                    vec![],
+                    chain_id,
+                )?,
+                &ts,
+                &BlockStatus::Verifying,
+            )?;
+            Ok(decode_producer_names(&action_return_value(&r)))
+        };
+
+        // Genesis: the sole producer is pulse.
+        assert_eq!(read(&mut controller)?, vec![PULSE_NAME]);
+
+        // After a schedule change, the read tracks the new active set.
+        let producera = Name::from_str("producera")?;
+        controller.activate_producer_schedule(vec![
+            ProducerKey {
+                producer_name: PULSE_NAME,
+                block_signing_key: private_key.get_public_key(),
+            },
+            ProducerKey {
+                producer_name: producera,
+                block_signing_key: private_key.get_public_key(),
+            },
+        ])?;
+        assert_eq!(read(&mut controller)?, vec![PULSE_NAME, producera]);
+
+        Ok(())
+    }
+
     // Bit-for-bit block-id parity across serialization and re-execution. A
     // producer builds a real chain — onblock runs at the head of every block,
     // plus an account-creating transaction — and each block is round-tripped
@@ -6996,9 +7312,14 @@ mod tests {
         let (mut controller, _private_key, _chain_id, _temp) = init_test_controller()?;
 
         let db = controller.database();
-        let min_cpu_us = Controller::get_global_properties(&db)?
-            .get_chain_config()
-            .get_min_transaction_cpu_usage() as u64;
+        // Scoped: the guard must not still be held when `run_onblock` below asks
+        // the same lock for a write, which is a self-deadlock on one thread.
+        let min_cpu_us = {
+            let r = db.read()?;
+            r.get_global_properties()?
+                .get_chain_config()
+                .get_min_transaction_cpu_usage() as u64
+        };
         assert!(min_cpu_us > 0, "genesis must set a non-zero CPU floor");
 
         let cpu_before = db.get_block_cpu_limit()?;
@@ -7121,6 +7442,7 @@ mod tests {
         Ok(())
     }
 
+
     // eosio_exit/pulse_exit ends the current action *successfully* — the reference
     // chain keeps the state the action produced up to the exit. A contract on pulse
     // writes a table row and then calls eosio_exit: the transaction must succeed and
@@ -7225,6 +7547,150 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    // Wiring check for the wall-clock deadline: a node configured with a zero
+    // max_transaction_time gives every transaction no time to run, so the checktime
+    // call at the head of execute_action trips on the first action. Proves the
+    // guard is actually invoked on the execution path and surfaces as the subjective
+    // DeadlineError (not an objective CPU/apply failure).
+    #[tokio::test]
+    async fn zero_max_transaction_time_trips_checktime() -> Result<(), ChainError> {
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
+        let private_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let mut controller = Controller::new();
+        let genesis_bytes = generate_genesis(&private_key);
+        let temp_path = get_temp_dir();
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": private_key.to_string(),
+            "max_transaction_time_ms": 0,
+        })
+        .to_string()
+        .into_bytes();
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &genesis_bytes.to_vec(),
+            temp_path.path().to_str().unwrap(),
+        )?;
+        let ts = controller.last_accepted_block().timestamp().clone();
+        let chain_id = controller.chain_id().clone();
+        let status = BlockStatus::Building;
+
+        let result = controller.execute_transaction(
+            &create_account(&private_key, Name::from_str("glenn")?, chain_id)?,
+            &ts,
+            &status,
+        );
+        match result {
+            Err(ChainError::DeadlineError(_)) => Ok(()),
+            Err(e) => panic!("expected a DeadlineError, got a different error: {e}"),
+            Ok(_) => panic!("expected a DeadlineError, but the transaction succeeded"),
+        }
+    }
+
+    // The subjectivity guarantee: with the SAME zero max_transaction_time that trips
+    // a normal transaction above, the explicit-billing path — the one block
+    // validation/replay uses (execute_transaction_billed with recorded cpu/net) —
+    // must run to completion, never tripping the wall-clock deadline. Otherwise a
+    // slow validator would reject a block a faster producer made.
+    #[tokio::test]
+    async fn explicit_billing_is_exempt_from_checktime() -> Result<(), ChainError> {
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
+        let private_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let mut controller = Controller::new();
+        let genesis_bytes = generate_genesis(&private_key);
+        let temp_path = get_temp_dir();
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": private_key.to_string(),
+            "max_transaction_time_ms": 0,
+        })
+        .to_string()
+        .into_bytes();
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &genesis_bytes.to_vec(),
+            temp_path.path().to_str().unwrap(),
+        )?;
+        let ts = controller.last_accepted_block().timestamp().clone();
+        let chain_id = controller.chain_id().clone();
+        let status = BlockStatus::Building;
+
+        // Some(..) marks the transaction as explicitly billed, exactly as
+        // execute_block supplies the block-recorded cpu/net during validation.
+        //
+        // The cpu figure has to clear `min_transaction_cpu_usage`, which genesis
+        // now sets to 100,000 — `validate_cpu_usage_to_bill` rejects a bill below
+        // the floor whether or not it is explicit. The amount is incidental to
+        // what this test asserts; billing the floor keeps it realistic, since a
+        // producer's recorded cpu is never below it either.
+        let result = controller.execute_transaction_billed(
+            &create_account(&private_key, Name::from_str("glenn")?, chain_id)?,
+            &ts,
+            &status,
+            Some((100_000, 12)),
+        );
+        if let Err(ChainError::DeadlineError(_)) = result {
+            panic!("explicit-billed transaction must be exempt from the wall-clock deadline");
+        }
+        result.map(|_| ())
+    }
+
+    // The real accumulation case (as opposed to the degenerate zero-deadline trip
+    // above): one transaction whose many newaccount actions genuinely take longer
+    // than a 1 ms wall-clock ceiling to run. Each action re-enters execute_action
+    // and re-checks the deadline, so once the running total crosses 1 ms the
+    // transaction is abandoned mid-way with a DeadlineError — not a CPU/RAM trap
+    // (metering is per-action and no single newaccount is close to its limit).
+    //
+    // Two things make this stable rather than flaky. The ceiling is the smallest
+    // non-zero value the config allows (1 ms), and the action count is far larger
+    // than needed: execution stops after ~1 ms of work regardless of how many
+    // actions remain, so a big count is nearly free and only guarantees there is
+    // always more work queued than a fast machine can finish inside 1 ms.
+    #[tokio::test]
+    async fn slow_multi_action_transaction_trips_checktime() -> Result<(), ChainError> {
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
+        let private_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let mut controller = Controller::new();
+        let genesis_bytes = generate_genesis(&private_key);
+        let temp_path = get_temp_dir();
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": private_key.to_string(),
+            "max_transaction_time_ms": 1,
+        })
+        .to_string()
+        .into_bytes();
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &genesis_bytes.to_vec(),
+            temp_path.path().to_str().unwrap(),
+        )?;
+        let ts = controller.last_accepted_block().timestamp().clone();
+        let chain_id = controller.chain_id().clone();
+        let status = BlockStatus::Building;
+
+        let trx = create_many_accounts(&private_key, 1000, chain_id)?;
+        let result = controller.execute_transaction(&trx, &ts, &status);
+        match result {
+            Err(ChainError::DeadlineError(_)) => Ok(()),
+            Err(e) => panic!("expected a DeadlineError, got a different error: {e}"),
+            Ok(_) => panic!("expected a DeadlineError, but the transaction succeeded"),
+        }
     }
 
     // set_resource_limits lowering an account's RAM allowance below what it is
