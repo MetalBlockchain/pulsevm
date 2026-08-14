@@ -7442,7 +7442,6 @@ mod tests {
         Ok(())
     }
 
-
     // eosio_exit/pulse_exit ends the current action *successfully* — the reference
     // chain keeps the state the action produced up to the exit. A contract on pulse
     // writes a table row and then calls eosio_exit: the transaction must succeed and
