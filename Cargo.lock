@@ -3301,6 +3301,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pulsevm_abi"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "pulsevm_crypto",
+ "pulsevm_name",
+ "serde_json",
+]
+
+[[package]]
 name = "pulsevm_api_client"
 version = "0.1.0"
 dependencies = [
