@@ -18,6 +18,10 @@ use serde::Deserialize;
 
 use crate::config::ChainConfigV0;
 
+/// The default `max_action_return_value_size` (config.hpp), used when the field
+/// is absent — matching the `genesis_state` aggregate initialiser, which sets it.
+const DEFAULT_MAX_ACTION_RETURN_VALUE_SIZE: u32 = 256;
+
 /// The subset of `genesis_state` the chain actually consumes at initialization.
 #[derive(Clone, Debug)]
 pub struct GenesisState {
@@ -27,6 +31,10 @@ pub struct GenesisState {
     pub initial_key: K1PublicKey,
     /// The initial chain configuration.
     pub initial_configuration: ChainConfigV0,
+    /// `max_action_return_value_size`: not part of `ChainConfigV0` (the runtime
+    /// does not track it), but part of the genesis serialization the chain id is
+    /// computed over, so it is carried here.
+    pub max_action_return_value_size: u32,
 }
 
 impl GenesisState {
@@ -43,18 +51,54 @@ impl GenesisState {
         let initial_timestamp_micros = iso_to_micros(&raw.initial_timestamp)?;
         let initial_key = K1PublicKey::from_string(&raw.initial_key)
             .map_err(|e| ChainError::GenesisError(format!("invalid genesis key: {e:?}")))?;
+        let max_action_return_value_size = raw.initial_configuration.max_action_return_value_size;
         let initial_configuration = raw.initial_configuration.into();
 
         Ok(GenesisState {
             initial_timestamp_micros,
             initial_key,
             initial_configuration,
+            max_action_return_value_size,
         })
     }
 
     /// The initial key packed to its 34-byte on-chain form.
     pub fn initial_key_packed(&self) -> [u8; 34] {
         self.initial_key.to_packed()
+    }
+
+    /// The chain id: `sha256(fc::raw::pack(genesis_state))`, reproducing
+    /// `genesis_state::compute_chain_id`. fc packs the reflected members in
+    /// declaration order — the timestamp as an i64 microsecond count, the key in
+    /// its 34-byte form, then each `chain_config` field as its little-endian
+    /// integer (ending with `max_action_return_value_size`).
+    pub fn compute_chain_id(&self) -> [u8; 32] {
+        let mut buf: Vec<u8> = Vec::with_capacity(34 + 8 + 19 * 4);
+        let c = &self.initial_configuration;
+
+        buf.extend_from_slice(&self.initial_timestamp_micros.to_le_bytes());
+        buf.extend_from_slice(&self.initial_key.to_packed());
+
+        buf.extend_from_slice(&c.max_block_net_usage.to_le_bytes());
+        buf.extend_from_slice(&c.target_block_net_usage_pct.to_le_bytes());
+        buf.extend_from_slice(&c.max_transaction_net_usage.to_le_bytes());
+        buf.extend_from_slice(&c.base_per_transaction_net_usage.to_le_bytes());
+        buf.extend_from_slice(&c.net_usage_leeway.to_le_bytes());
+        buf.extend_from_slice(&c.context_free_discount_net_usage_num.to_le_bytes());
+        buf.extend_from_slice(&c.context_free_discount_net_usage_den.to_le_bytes());
+        buf.extend_from_slice(&c.max_block_cpu_usage.to_le_bytes());
+        buf.extend_from_slice(&c.target_block_cpu_usage_pct.to_le_bytes());
+        buf.extend_from_slice(&c.max_transaction_cpu_usage.to_le_bytes());
+        buf.extend_from_slice(&c.min_transaction_cpu_usage.to_le_bytes());
+        buf.extend_from_slice(&c.max_transaction_lifetime.to_le_bytes());
+        buf.extend_from_slice(&c.deferred_trx_expiration_window.to_le_bytes());
+        buf.extend_from_slice(&c.max_transaction_delay.to_le_bytes());
+        buf.extend_from_slice(&c.max_inline_action_size.to_le_bytes());
+        buf.extend_from_slice(&c.max_inline_action_depth.to_le_bytes());
+        buf.extend_from_slice(&c.max_authority_depth.to_le_bytes());
+        buf.extend_from_slice(&self.max_action_return_value_size.to_le_bytes());
+
+        pulsevm_crypto::Digest::hash(&buf).0
     }
 }
 
@@ -90,6 +134,12 @@ struct RawConfig {
     max_inline_action_size: u32,
     max_inline_action_depth: u16,
     max_authority_depth: u16,
+    #[serde(default = "default_max_action_return_value_size")]
+    max_action_return_value_size: u32,
+}
+
+fn default_max_action_return_value_size() -> u32 {
+    DEFAULT_MAX_ACTION_RETURN_VALUE_SIZE
 }
 
 impl From<RawConfig> for ChainConfigV0 {
@@ -207,6 +257,44 @@ mod tests {
         assert!(iso_to_micros("not-a-date").is_err());
         assert!(iso_to_micros("2023-13-01T00:00:00").is_err());
         assert!(iso_to_micros("2023-01-01T25:00:00").is_err());
+    }
+
+    /// Known-answer for `compute_chain_id`, frozen from the C++
+    /// `genesis_state::compute_chain_id` oracle (see
+    /// `pulsevm_ffi/tests/genesis_chain_id_cross_validation.rs`). Guards the
+    /// fc-pack layout after the bridge is gone.
+    #[test]
+    fn chain_id_matches_frozen_oracle() {
+        let json = r#"{
+            "initial_timestamp": "2023-01-01T00:00:00",
+            "initial_key": "PUB_K1_8fsJkG5ka4o1G1wBhySUavHuGqstcjtXMrquxiRWVcYw8ZvZLX",
+            "initial_configuration": {
+                "max_block_net_usage": 1048576,
+                "target_block_net_usage_pct": 1000,
+                "max_transaction_net_usage": 524288,
+                "base_per_transaction_net_usage": 12,
+                "net_usage_leeway": 500,
+                "context_free_discount_net_usage_num": 20,
+                "context_free_discount_net_usage_den": 100,
+                "max_block_cpu_usage": 3000000000,
+                "target_block_cpu_usage_pct": 2500,
+                "max_transaction_cpu_usage": 1000000000,
+                "min_transaction_cpu_usage": 100000,
+                "max_transaction_lifetime": 3600,
+                "deferred_trx_expiration_window": 600,
+                "max_transaction_delay": 3888000,
+                "max_inline_action_size": 4096,
+                "max_inline_action_depth": 6,
+                "max_authority_depth": 6,
+                "max_action_return_value_size": 256
+            }
+        }"#;
+        let id = GenesisState::from_json(json).unwrap().compute_chain_id();
+        let hex: String = id.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex,
+            "0c880c391f7d695f3d64e57e1ee396c9b26b8e089f440d917493d83a2df9c306"
+        );
     }
 
     #[test]

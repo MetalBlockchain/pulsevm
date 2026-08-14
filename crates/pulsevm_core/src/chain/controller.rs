@@ -349,6 +349,18 @@ impl Controller {
         let rust_genesis = pulsevm_ffi::GenesisState::from_bytes(genesis_bytes)?;
         self.chain_id = chain_id.clone();
 
+        // The chain id is sha256(fc::raw::pack(genesis)); derive it from the
+        // parsed genesis and check it against the id AvalancheGo handed us. They
+        // must agree, or the genesis blob and the chain it is meant to bring up
+        // have diverged — surface that rather than run under a silent mismatch.
+        let derived_chain_id = Id::new(rust_genesis.compute_chain_id());
+        if &derived_chain_id != chain_id {
+            warn!(
+                "genesis-derived chain id {} does not match the configured chain id {}",
+                derived_chain_id, chain_id
+            );
+        }
+
         // Seed the active producer schedule from genesis: the sole producer is
         // the configured producer_name, and it signs blocks with the genesis
         // initial key. On restart this is the base the block log is replayed onto
