@@ -3605,6 +3605,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pulsevm_rpc"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "pulsevm_abi",
+ "pulsevm_name",
+ "serde_json",
+]
+
+[[package]]
 name = "pulsevm_serialization"
 version = "0.1.0"
 dependencies = [
