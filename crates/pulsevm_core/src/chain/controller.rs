@@ -4621,6 +4621,156 @@ mod tests {
         ])
     }
 
+    /// Decode a symbol_code (the raw `u64` a token contract uses as the `stat`
+    /// table scope) back to its ticker string: ASCII chars packed low byte first.
+    #[cfg(feature = "arena-shadow")]
+    fn symbol_code_to_string(mut code: u64) -> String {
+        let mut s = String::new();
+        while code != 0 {
+            let c = (code & 0xFF) as u8;
+            if !c.is_ascii_uppercase() {
+                return String::new();
+            }
+            s.push(c as char);
+            code >>= 8;
+        }
+        s
+    }
+
+    /// Freeze the C++ RPC formatter outputs over the real replayed contract state
+    /// into a JSON file, so the arena reimplementation and the Rust ABI serializer
+    /// can be built and validated against a C++-attested oracle after the bridge is
+    /// removed. Records, per real `(code, scope, table)`: `get_table_rows` in both
+    /// JSON and raw form, `get_table_by_scope`, `get_currency_balance` /
+    /// `get_currency_stats` for token tables, `get_account_info`, and each code's
+    /// raw ABI (so the serializer has the definition its rows decode against).
+    #[cfg(feature = "arena-shadow")]
+    fn capture_rpc_golden(controller: &Controller, out_path: &str) -> Result<(), ChainError> {
+        use serde_json::json;
+
+        let db = controller.database();
+        let head_num = controller.last_accepted_block().block_num();
+        let head_time = controller.last_accepted_block().timestamp().to_time_point();
+
+        // Enumerate every real (code, scope, table) from the arena's contract-table
+        // state (36-byte records: code, scope, table, payer as u64 LE, count u32 LE).
+        let table_bytes = db.arena_contract_table_state_bytes().unwrap_or_default();
+        let mut tables: Vec<(u64, u64, u64)> = Vec::new();
+        let mut p = 0;
+        while p + 36 <= table_bytes.len() {
+            let u = |o: usize| u64::from_le_bytes(table_bytes[o..o + 8].try_into().unwrap());
+            tables.push((u(p), u(p + 8), u(p + 16)));
+            p += 36;
+        }
+
+        let accounts_table = Name::from_str("accounts")?.as_u64();
+        let stat_table = Name::from_str("stat")?.as_u64();
+
+        let mut records: Vec<serde_json::Value> = Vec::new();
+
+        // Each distinct code's ABI (the definition the row decoder needs), and a
+        // set of accounts to query get_account_info for.
+        let mut codes: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+        let mut accounts: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+        for &(code, scope, table) in &tables {
+            codes.insert(code);
+            if table == accounts_table {
+                accounts.insert(scope);
+            }
+        }
+        for name in ["pulse", "pulse.token", "pulse.msig", "pulse.ram"] {
+            if let Ok(n) = Name::from_str(name) {
+                accounts.insert(n.as_u64());
+            }
+        }
+
+        for &code in &codes {
+            if let Ok(account) = db.get_account(code) {
+                let abi = account.get_abi().as_slice();
+                records.push(json!({"kind": "abi", "code": code, "abi_hex": hex::encode(abi)}));
+            }
+        }
+
+        let mut core_symbol: Option<String> = None;
+        for &(code, scope, table) in &tables {
+            let scope_str = Name::new(scope).to_string();
+            for json_mode in [true, false] {
+                if let Ok(output) = db.get_table_rows(
+                    json_mode, code, &scope_str, table, "", "", "", 100, "", "", "", false, true,
+                ) {
+                    records.push(json!({
+                        "kind": if json_mode { "table_rows_json" } else { "table_rows_raw" },
+                        "code": code, "scope": scope, "table": table, "output": output,
+                    }));
+                }
+            }
+            if table == accounts_table
+                && let Ok(output) = db.get_currency_balance_without_symbol(code, scope)
+            {
+                records.push(json!({
+                    "kind": "currency_balance", "code": code, "account": scope, "output": output,
+                }));
+            }
+            if table == stat_table {
+                let symbol = symbol_code_to_string(scope);
+                if !symbol.is_empty() {
+                    if core_symbol.is_none() {
+                        core_symbol = Some(symbol.clone());
+                    }
+                    if let Ok(output) = db.get_currency_stats(code, &symbol) {
+                        records.push(json!({
+                            "kind": "currency_stats", "code": code, "symbol": symbol, "output": output,
+                        }));
+                    }
+                }
+            }
+        }
+
+        // get_table_by_scope for each distinct (code, table).
+        let mut code_table: std::collections::BTreeSet<(u64, u64)> =
+            std::collections::BTreeSet::new();
+        for &(code, _scope, table) in &tables {
+            code_table.insert((code, table));
+        }
+        for (code, table) in code_table {
+            if let Ok(output) = db.get_table_by_scope(code, table, "", "", 100, false) {
+                records.push(json!({
+                    "kind": "table_by_scope", "code": code, "table": table, "output": output,
+                }));
+            }
+        }
+
+        // get_account_info (auto core symbol, and — for a real core symbol — the
+        // expected-core-symbol variant, which decodes the system-contract structs).
+        for &account in &accounts {
+            if let Ok(output) =
+                db.get_account_info_without_core_symbol(account, head_num, &head_time)
+            {
+                records.push(json!({
+                    "kind": "account_info", "account": account, "output": output,
+                }));
+            }
+            if let Some(sym) = &core_symbol
+                && let Ok(output) =
+                    db.get_account_info_with_core_symbol(account, sym, head_num, &head_time)
+            {
+                records.push(json!({
+                    "kind": "account_info_core", "account": account, "symbol": sym, "output": output,
+                }));
+            }
+        }
+
+        let body = serde_json::to_string_pretty(&records)
+            .map_err(|e| ChainError::InternalError(format!("serialize rpc golden: {e}")))?;
+        std::fs::write(out_path, body)
+            .map_err(|e| ChainError::InternalError(format!("write rpc golden: {e}")))?;
+        eprintln!(
+            "captured {} RPC golden records to {out_path}",
+            records.len()
+        );
+        Ok(())
+    }
+
     /// Every cross-impl table as `(name, chainbase bytes, arena bytes)` for the
     /// full-state root — the 10 block-populated tables plus the two contract
     /// primary tables (empty unless a contract wrote rows).
@@ -5455,6 +5605,17 @@ mod tests {
             "replay covered no blocks (replayed up to {replayed}, expected >= {start}) — \
              fixture/harness mismatch"
         );
+
+        // RPC golden capture: with both backends populated by the cross-check run,
+        // freeze the C++ RPC formatter outputs (and the raw rows + ABIs) over the
+        // real contract state, so the arena reimplementation and the Rust ABI
+        // serializer can be built and validated against them once the bridge is
+        // gone. Opt-in and terminal — it does not touch the read/persistence
+        // checks below.
+        if let Ok(out) = std::env::var("PULSEVM_CAPTURE_RPC") {
+            capture_rpc_golden(&controller, &out)?;
+            return Ok(());
+        }
 
         // Record the golden roots (verified this run by the live cross-check) for a
         // later standalone-write verify run.
