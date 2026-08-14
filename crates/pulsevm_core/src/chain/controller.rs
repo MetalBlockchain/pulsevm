@@ -92,6 +92,8 @@ use pulsevm_ffi::{
     CxxGenesisState,
     Database,
     ElasticLimitParameters,
+    GlobalPropertyObject,
+    Microseconds,
     PermissionLevelWeight,
     TimePoint,
     UndoSession,
@@ -376,7 +378,11 @@ impl Controller {
         // Set our last accepted block to the genesis block
         self.last_accepted_block = SignedBlock::new(
             Id::default(),
-            genesis.get_initial_timestamp().into(),
+            // The genesis timestamp lives in C++; read its microsecond count and
+            // rebuild the block timestamp through the pure-Rust conversion.
+            BlockTimestamp::from(TimePoint::new(Microseconds::new(
+                genesis.get_initial_timestamp().time_since_epoch().count(),
+            ))),
             PULSE_NAME, // Use the provided producer name from genesis
             VecDeque::new(),
             Digest::default(),

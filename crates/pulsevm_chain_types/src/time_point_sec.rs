@@ -28,11 +28,15 @@ use time::{
     macros::format_description,
 };
 
-use crate::{
+use crate::time::{
     TimePoint,
-    bridge::ffi::TimePointSec,
-    types::time::seconds,
+    seconds,
 };
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default, Debug)]
+pub struct TimePointSec {
+    pub utc_seconds: u32,
+}
 
 // Base EOS format (no 'Z')
 const EOS_FMT_NOZ: &[time::format_description::FormatItem<'_>] =

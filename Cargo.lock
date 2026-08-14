@@ -3361,6 +3361,17 @@ name = "pulsevm_billable_size"
 version = "0.1.0"
 
 [[package]]
+name = "pulsevm_chain_types"
+version = "0.1.0"
+dependencies = [
+ "prost-types",
+ "pulsevm_serialization",
+ "serde",
+ "serde_json",
+ "time",
+]
+
+[[package]]
 name = "pulsevm_chaindb"
 version = "0.1.0"
 dependencies = [
@@ -3480,6 +3491,7 @@ dependencies = [
  "prost-types",
  "pulsevm_arena",
  "pulsevm_billable_size",
+ "pulsevm_chain_types",
  "pulsevm_chaindb",
  "pulsevm_constants",
  "pulsevm_contractdb",

@@ -24,11 +24,15 @@ use time::{
     macros::format_description,
 };
 
-use crate::{
-    CxxTimePoint,
+use crate::time::{
+    Microseconds,
     TimePoint,
-    bridge::ffi::BlockTimestamp,
 };
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default, Debug)]
+pub struct BlockTimestamp {
+    pub slot: u32,
+}
 
 impl BlockTimestamp {
     pub const BLOCK_INTERVAL_MS: i32 = 500;
@@ -70,7 +74,7 @@ impl BlockTimestamp {
             + Self::BLOCK_TIMESTAMP_EPOCH_MS;
 
         let secs = total_ms.div_euclid(1000);
-        let rem_ms = (total_ms.rem_euclid(1000)) as i64;
+        let rem_ms = total_ms.rem_euclid(1000);
 
         let mut dt =
             OffsetDateTime::from_unix_timestamp(secs).expect("valid timestamp for BlockTimestamp");
@@ -81,8 +85,7 @@ impl BlockTimestamp {
             "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]"
         );
 
-        let s = dt.format(FMT).expect("formatting never fails");
-        s
+        dt.format(FMT).expect("formatting never fails")
     }
 }
 
@@ -91,7 +94,7 @@ impl From<&BlockTimestamp> for TimePoint {
     fn from(ts: &BlockTimestamp) -> TimePoint {
         let msec = (ts.slot() as i64) * (BlockTimestamp::BLOCK_INTERVAL_MS as i64)
             + BlockTimestamp::BLOCK_TIMESTAMP_EPOCH_MS;
-        TimePoint::new(crate::Microseconds::new(msec * 1000))
+        TimePoint::new(Microseconds::new(msec * 1000))
     }
 }
 
@@ -100,18 +103,7 @@ impl From<BlockTimestamp> for TimePoint {
     fn from(ts: BlockTimestamp) -> TimePoint {
         let msec = (ts.slot() as i64) * (BlockTimestamp::BLOCK_INTERVAL_MS as i64)
             + BlockTimestamp::BLOCK_TIMESTAMP_EPOCH_MS;
-        TimePoint::new(crate::Microseconds::new(msec * 1000))
-    }
-}
-
-impl From<&CxxTimePoint> for BlockTimestamp {
-    #[inline]
-    fn from(ts: &CxxTimePoint) -> BlockTimestamp {
-        let micro_since_epoch = ts.time_since_epoch().count();
-        let msec_since_epoch = micro_since_epoch / 1000;
-        let slot = (msec_since_epoch - BlockTimestamp::BLOCK_TIMESTAMP_EPOCH_MS)
-            / (BlockTimestamp::BLOCK_INTERVAL_MS as i64);
-        BlockTimestamp::new(slot as u32)
+        TimePoint::new(Microseconds::new(msec * 1000))
     }
 }
 

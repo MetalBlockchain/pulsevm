@@ -39,7 +39,6 @@ use crate::{
         Index256Object,
         IndexDoubleObject,
         TableObject,
-        TimePoint,
         U128,
         U256,
         get_account_info_with_core_symbol,
@@ -55,6 +54,29 @@ use crate::{
         KeyValueIteratorCache,
     },
 };
+// The public `Database` methods speak the pure-Rust TimePoint; only the calls
+// that actually descend into C++ (below) rebuild the bridge struct from it.
+use pulsevm_chain_types::TimePoint;
+
+/// Rebuild the cxx-bridge `TimePoint` from the pure-Rust one at a C++ boundary.
+#[inline]
+fn cxx_time_point(t: &TimePoint) -> ffi::TimePoint {
+    ffi::TimePoint {
+        elapsed: ffi::Microseconds {
+            count: t.elapsed.count,
+        },
+    }
+}
+
+/// The inverse: a bridge `TimePoint` returned from C++ back into the pure-Rust one.
+#[inline]
+fn native_time_point(t: ffi::TimePoint) -> TimePoint {
+    TimePoint {
+        elapsed: pulsevm_chain_types::Microseconds {
+            count: t.elapsed.count,
+        },
+    }
+}
 
 // The bridge authority sub-types are only referenced by the arena authority
 // decoder (and its tests), which are compiled behind the shadow feature.
@@ -2877,7 +2899,7 @@ impl Database {
                     unsafe { &*obj },
                     new_code,
                     head_block_num,
-                    pending_block_time,
+                    &cxx_time_point(pending_block_time),
                     code_hash,
                     vm_type,
                     vm_version,
@@ -5940,7 +5962,7 @@ impl Database {
             let mut guard = self.locked_write()?;
             let pinned = guard.pin_mut();
             pinned
-                .create_permission(account, name, parent, auth, creation_time)
+                .create_permission(account, name, parent, auth, &cxx_time_point(creation_time))
                 .map_err(|e| ChainError::InternalError(format!("{}", e)))?
                 as *const ffi::PermissionObject
         };
@@ -6047,7 +6069,7 @@ impl Database {
                     actor,
                     permission,
                     authority,
-                    pending_block_time,
+                    &cxx_time_point(pending_block_time),
                 )
                 .map_err(|e| ChainError::InternalError(e.to_string()))?;
             if !modified {
@@ -6106,7 +6128,7 @@ impl Database {
             let pinned = guard.pin_mut();
 
             pinned
-                .update_permission_usage(perm, pending_block_time)
+                .update_permission_usage(perm, &cxx_time_point(pending_block_time))
                 .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
         }
         #[cfg(feature = "arena-shadow")]
@@ -6128,7 +6150,7 @@ impl Database {
             .get_permission_last_used(permission)
             .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
 
-        Ok(res)
+        Ok(native_time_point(res))
     }
 
     pub fn lookup_linked_permission(
@@ -6380,7 +6402,7 @@ impl Database {
             let mut guard = self.locked_write()?;
             let pinned = guard.pin_mut();
             pinned
-                .clear_expired_input_transactions(cutoff)
+                .clear_expired_input_transactions(&cxx_time_point(cutoff))
                 .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
         }
         #[cfg(feature = "arena-shadow")]
@@ -6494,7 +6516,7 @@ impl Database {
             guard.as_ref().unwrap(),
             account,
             head_block_num,
-            head_block_time,
+            &cxx_time_point(head_block_time),
         )
         .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
@@ -6513,7 +6535,7 @@ impl Database {
             account,
             expected_core_symbol,
             head_block_num,
-            head_block_time,
+            &cxx_time_point(head_block_time),
         )
         .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
@@ -7503,6 +7525,7 @@ impl<'g> DbRead<'g> {
     ) -> Result<TimePoint, ChainError> {
         self.db()
             .get_permission_last_used(permission)
+            .map(native_time_point)
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 

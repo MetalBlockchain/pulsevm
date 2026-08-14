@@ -9,7 +9,6 @@ use std::{
     str::FromStr,
 };
 
-use cxx::SharedPtr;
 use pulsevm_serialization::{
     NumBytes,
     Read,
@@ -31,15 +30,15 @@ use time::{
     macros::format_description,
 };
 
-use crate::{
-    CxxTimePoint,
-    bridge::ffi::{
-        Microseconds,
-        TimePoint,
-        make_time_point_from_i64,
-        make_time_point_from_now,
-    },
-};
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default, Debug, PartialOrd, Ord)]
+pub struct Microseconds {
+    pub count: i64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default, Debug)]
+pub struct TimePoint {
+    pub elapsed: Microseconds,
+}
 
 const EOS_FMT_MILLIS_NOZ: &[time::format_description::FormatItem<'_>] =
     format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]");
@@ -49,16 +48,6 @@ const EOS_FMT_MILLIS_Z: &[time::format_description::FormatItem<'_>] =
 
 const EOS_FMT_SECS_NOZ: &[time::format_description::FormatItem<'_>] =
     format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]");
-
-impl CxxTimePoint {
-    pub fn new(microseconds: i64) -> SharedPtr<CxxTimePoint> {
-        make_time_point_from_i64(microseconds)
-    }
-
-    pub fn now() -> SharedPtr<CxxTimePoint> {
-        make_time_point_from_now()
-    }
-}
 
 impl Microseconds {
     #[inline]

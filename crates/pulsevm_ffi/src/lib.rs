@@ -12,7 +12,6 @@ pub use crate::{
         AccountMetadataObject,
         AccountObject,
         Authority,
-        BlockTimestamp,
         ChainConfigV0,
         CodeObject,
         CxxBlockTimestamp,
@@ -37,7 +36,6 @@ pub use crate::{
         IndexLongDoubleObject,
         KeyValueObject,
         KeyWeight,
-        Microseconds,
         PermissionLevel,
         PermissionLevelWeight,
         PermissionLinkObject,
@@ -46,8 +44,6 @@ pub use crate::{
         Ratio,
         TableId,
         TableObject,
-        TimePoint,
-        TimePointSec,
         U128,
         U256,
         UndoSession,
@@ -130,4 +126,18 @@ pub use crate::{
         peek_header as peek_snapshot_header,
     },
 };
-pub use types::*;
+// The time value types moved to pulsevm_chain_types (no C++ dependency); re-export
+// them so existing `pulsevm_ffi::TimePoint`-style paths keep resolving during the
+// transition. database.rs converts these to the bridge structs at the C++ edge.
+pub use pulsevm_chain_types::{
+    BlockTimestamp,
+    Microseconds,
+    TimePoint,
+    TimePointSec,
+    days,
+    hours,
+    microseconds,
+    milliseconds,
+    minutes,
+    seconds,
+};
