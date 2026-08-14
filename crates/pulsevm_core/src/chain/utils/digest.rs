@@ -18,6 +18,16 @@ impl Digest {
         let cxx_digest = pulsevm_ffi::make_shared_digest_from_existing_hash(data);
         Digest { inner: cxx_digest }
     }
+
+    /// The raw 32 hash bytes — used to feed the pure-Rust K1 sign/recover, which
+    /// work over a plain `[u8; 32]`.
+    pub fn as_bytes(&self) -> [u8; 32] {
+        let data = pulsevm_ffi::get_digest_data(&self.inner);
+        let mut out = [0u8; 32];
+        let n = data.len().min(32);
+        out[..n].copy_from_slice(&data[..n]);
+        out
+    }
 }
 
 impl Deref for Digest {

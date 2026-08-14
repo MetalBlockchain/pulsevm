@@ -12,7 +12,10 @@ use std::{
 };
 
 use cxx::SharedPtr;
-use pulsevm_crypto::FixedBytes;
+use pulsevm_crypto::{
+    FixedBytes,
+    K1PublicKey,
+};
 use pulsevm_error::ChainError;
 use pulsevm_ffi::CxxPublicKey;
 use pulsevm_serialization::{
@@ -27,41 +30,50 @@ use serde::{
     Serialize,
 };
 
-#[derive(Clone)]
+/// A secp256k1 (`K1`) public key. Pure Rust: parsing, packing, string encoding
+/// and equality all run through [`K1PublicKey`], not the C++ crypto.
+///
+/// The `Cxx*` conversions here are transitional — the only place a `CxxPublicKey`
+/// still crosses into this type is the authority path, whose `KeyWeight` still
+/// carries a C++ key until the authority struct is salvaged off chainbase.
+#[derive(Clone, Copy)]
 pub struct PublicKey {
-    inner: SharedPtr<CxxPublicKey>,
+    inner: K1PublicKey,
 }
 
 impl PublicKey {
-    pub fn new(inner: SharedPtr<CxxPublicKey>) -> Self {
+    pub fn new(inner: K1PublicKey) -> Self {
         PublicKey { inner }
     }
 
-    pub fn new_unknown() -> Self {
-        let cxx_key = pulsevm_ffi::make_unknown_public_key();
-        PublicKey { inner: cxx_key }
+    pub fn k1(&self) -> &K1PublicKey {
+        &self.inner
     }
 
-    pub fn inner(&self) -> SharedPtr<CxxPublicKey> {
-        self.inner.clone()
+    /// Bridge a C++ key into this type via its packed bytes. Used where a key is
+    /// read out of a still-C++ `Authority`/`KeyWeight`.
+    pub fn from_cxx(key: &CxxPublicKey) -> Result<Self, ChainError> {
+        let k1 = K1PublicKey::from_packed(&key.packed_bytes())
+            .map_err(|e| ChainError::ParseError(format!("invalid public key bytes: {e}")))?;
+        Ok(PublicKey { inner: k1 })
     }
 }
 
 impl Debug for PublicKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.inner.to_string_rust())
+        write!(f, "{}", self.inner.to_string())
     }
 }
 
 impl Display for PublicKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.inner.to_string_rust())
+        write!(f, "{}", self.inner.to_string())
     }
 }
 
 impl PartialEq for PublicKey {
     fn eq(&self, other: &Self) -> bool {
-        self.inner.packed_bytes() == other.inner.packed_bytes()
+        self.inner.compressed() == other.inner.compressed()
     }
 }
 
@@ -69,13 +81,13 @@ impl Eq for PublicKey {}
 
 impl Hash for PublicKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.inner.packed_bytes().hash(state);
+        self.inner.compressed().hash(state);
     }
 }
 
 impl Ord for PublicKey {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.inner.packed_bytes().cmp(&other.inner.packed_bytes())
+        self.inner.compressed().cmp(&other.inner.compressed())
     }
 }
 
@@ -91,9 +103,9 @@ impl<'de> Deserialize<'de> for PublicKey {
         D: serde::Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
-        let cxx_key = pulsevm_ffi::parse_public_key(&s)
+        let k1 = K1PublicKey::from_string(&s)
             .map_err(|e| serde::de::Error::custom(format!("Failed to parse public key: {}", e)))?;
-        Ok(PublicKey { inner: cxx_key })
+        Ok(PublicKey { inner: k1 })
     }
 }
 
@@ -102,7 +114,7 @@ impl Serialize for PublicKey {
     where
         S: serde::Serializer,
     {
-        serializer.serialize_str(&self.inner.to_string_rust())
+        serializer.serialize_str(&self.inner.to_string())
     }
 }
 
@@ -115,24 +127,25 @@ impl NumBytes for PublicKey {
 impl Read for PublicKey {
     fn read(bytes: &[u8], pos: &mut usize) -> Result<Self, ReadError> {
         let packed = FixedBytes::<34>::read(bytes, pos)?;
-        let cxx_key = pulsevm_ffi::parse_public_key_from_bytes(packed.as_ref())
+        let k1 = K1PublicKey::from_packed(packed.as_ref())
             .map_err(|e| ReadError::CustomError(e.to_string()))?;
-        Ok(PublicKey { inner: cxx_key })
+        Ok(PublicKey { inner: k1 })
     }
 }
 
 impl Write for PublicKey {
     fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), WriteError> {
-        let packed: FixedBytes<34> = self.inner.packed_bytes().try_into().map_err(|_| {
-            WriteError::CustomError("Failed to convert packed public key to FixedBytes<34>".into())
-        })?;
+        let packed = FixedBytes::<34>(self.inner.to_packed());
         packed.write(bytes, pos)
     }
 }
 
 impl From<PublicKey> for SharedPtr<CxxPublicKey> {
+    /// Transitional bridge back into C++ (used by test transaction builders that
+    /// still assemble a C++ `KeyWeight`). Round-trips through the packed bytes.
     fn from(value: PublicKey) -> Self {
-        value.inner()
+        pulsevm_ffi::parse_public_key_from_bytes(&value.inner.to_packed())
+            .expect("a packed K1 key is always valid C++ input")
     }
 }
 
@@ -140,9 +153,8 @@ impl FromStr for PublicKey {
     type Err = ChainError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let cxx_key =
-            pulsevm_ffi::parse_public_key(s).map_err(|e| ChainError::ParseError(e.to_string()))?;
-        Ok(PublicKey { inner: cxx_key })
+        let k1 = K1PublicKey::from_string(s).map_err(|e| ChainError::ParseError(e.to_string()))?;
+        Ok(PublicKey { inner: k1 })
     }
 }
 
@@ -157,7 +169,6 @@ mod tests {
 
     #[test]
     fn test_public_key_display() {
-        use std::str::FromStr;
         let key_str = "PUB_K1_5bbkxaLdB5bfVZW6DJY8M74vwT2m61PqwywNUa5azfkJTvYa5H";
         let public_key = PublicKey::from_str(key_str).unwrap();
         assert_eq!(public_key.to_string(), key_str);

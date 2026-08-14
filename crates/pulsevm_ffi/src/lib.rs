@@ -75,6 +75,7 @@ pub use crate::{
         floatunditf,
         floatunsitf,
         floatuntidf,
+        get_digest_data,
         get_public_key_from_private_key,
         getf2,
         gttf2,

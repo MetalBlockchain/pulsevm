@@ -85,7 +85,6 @@ pub struct ArenaAccountMetadata {
 /// Copies a chainbase `digest_type` (sha256) into a fixed 32-byte array for the
 /// arena mirror. A digest that is not 32 bytes is zero-padded/truncated, which
 /// only degrades the mirror's fidelity, never chainbase.
-#[cfg(feature = "arena-shadow")]
 fn digest_to_array(digest: &CxxDigest) -> [u8; 32] {
     let data = ffi::get_digest_data(digest);
     let mut out = [0u8; 32];

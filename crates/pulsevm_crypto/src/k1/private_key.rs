@@ -53,6 +53,12 @@ impl K1PrivateKey {
         self.secret.secret_bytes()
     }
 
+    /// A freshly-generated random K1 key (OS entropy). For tests and tooling.
+    pub fn random() -> Self {
+        let (secret, _public) = SECP256K1.generate_keypair(&mut secp256k1::rand::thread_rng());
+        K1PrivateKey { secret }
+    }
+
     /// fc `make_k1_private_key(make_shared_digest_from_string(s))`:
     /// deterministically derive a key from a seed string by taking the sha256
     /// of the UTF-8 bytes as the scalar.

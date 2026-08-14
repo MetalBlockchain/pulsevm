@@ -86,11 +86,13 @@ pub async fn handle(
             to_console,
             r1,
         } => {
-            let private_key = if r1 {
-                PrivateKey::random_r1()
-            } else {
-                PrivateKey::random()
-            };
+            if r1 {
+                return Err(
+                    "R1 (secp256r1) keys are not supported by the pure-Rust build; use a K1 key"
+                        .into(),
+                );
+            }
+            let private_key = PrivateKey::random();
 
             match file {
                 Some(path) => {

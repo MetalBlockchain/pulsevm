@@ -95,7 +95,6 @@ use pulsevm_ffi::{
     PermissionLevelWeight,
     TimePoint,
     UndoSession,
-    parse_public_key,
     seconds,
 };
 use pulsevm_grpc::vm;
@@ -348,10 +347,9 @@ impl Controller {
         // the configured producer_name, and it signs blocks with the genesis
         // initial key. On restart this is the base the block log is replayed onto
         // (see `reconstruct_schedule_from_log` below).
-        let initial_key = PublicKey::new(
-            parse_public_key(&genesis.get_initial_key().to_string_rust())
-                .map_err(|e| ChainError::GenesisError(format!("invalid genesis key: {}", e)))?,
-        );
+        let initial_key =
+            <PublicKey as std::str::FromStr>::from_str(&genesis.get_initial_key().to_string_rust())
+                .map_err(|e| ChainError::GenesisError(format!("invalid genesis key: {}", e)))?;
         self.active_schedule = ProducerSchedule {
             version: 0,
             producers: vec![ProducerKey {
