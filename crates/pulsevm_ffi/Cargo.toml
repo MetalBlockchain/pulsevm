@@ -38,6 +38,7 @@ cmake = "0.1"
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 pulsevm_contractdb = { path = "../pulsevm_contractdb" }
+pulsevm_softfloat = { path = "../pulsevm_softfloat" }
 proptest = "1"
 secp256k1 = { version = "0.30", features = ["rand"] }
 

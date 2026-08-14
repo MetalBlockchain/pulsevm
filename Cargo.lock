@@ -3487,6 +3487,7 @@ dependencies = [
  "pulsevm_name",
  "pulsevm_proc_macros",
  "pulsevm_serialization",
+ "pulsevm_softfloat",
  "secp256k1",
  "serde",
  "serde_json",
@@ -3583,6 +3584,13 @@ dependencies = [
  "pulsevm_error",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "pulsevm_softfloat"
+version = "0.1.0"
+dependencies = [
+ "rustc_apfloat",
 ]
 
 [[package]]
@@ -3995,6 +4003,16 @@ name = "rustc-hash"
 version = "2.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d"
+
+[[package]]
+name = "rustc_apfloat"
+version = "0.2.3+llvm-462a31f5a5ab"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "486c2179b4796f65bfe2ee33679acf0927ac83ecf583ad6c91c3b4570911b9ad"
+dependencies = [
+ "bitflags 2.13.1",
+ "smallvec",
+]
 
 [[package]]
 name = "rustc_version"
