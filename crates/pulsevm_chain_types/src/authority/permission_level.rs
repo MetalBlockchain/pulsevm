@@ -1,6 +1,7 @@
 use std::{
     cmp::Ordering,
     fmt,
+    str::FromStr,
 };
 
 use pulsevm_name::Name;
@@ -16,7 +17,11 @@ use serde::{
     ser::SerializeStruct,
 };
 
-use crate::bridge::ffi::PermissionLevel;
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PermissionLevel {
+    pub actor: u64,
+    pub permission: u64,
+}
 
 impl PermissionLevel {
     pub fn new(actor: u64, permission: u64) -> Self {
@@ -126,8 +131,6 @@ impl PartialOrd for PermissionLevel {
         Some(self.cmp(other))
     }
 }
-
-use std::str::FromStr;
 
 #[derive(Debug)]
 pub struct ParsePermissionLevelError(String);

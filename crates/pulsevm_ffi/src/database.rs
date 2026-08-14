@@ -20,6 +20,7 @@ use pulsevm_error::ChainError;
 use pulsevm_name::Name;
 
 use crate::{
+    Authority,
     ChainConfigV0,
     ElasticLimitParameters,
     Float128,
@@ -32,7 +33,6 @@ use crate::{
     Ratio,
     bridge::ffi::{
         self,
-        Authority,
         CxxDigest,
         CxxGenesisState,
         Index64Object,
@@ -142,9 +142,91 @@ fn cxx_chain_config(c: &ChainConfigV0) -> ffi::ChainConfigV0 {
     }
 }
 
-// The bridge authority sub-types are only referenced by the arena authority
-// decoder (and its tests), which are compiled behind the shadow feature.
-#[cfg(feature = "arena-shadow")]
+/// Rebuild the cxx-bridge `Authority` from the pure-Rust one for a C++ call. Each
+/// native `K1PublicKey` is repacked into a `CxxPublicKey`; the packed bytes are
+/// identical, so this is a lossless re-parse (only fails on a corrupt key).
+fn cxx_authority(auth: &Authority) -> Result<ffi::Authority, ChainError> {
+    let mut keys = Vec::with_capacity(auth.keys.len());
+    for k in &auth.keys {
+        let key = ffi::parse_public_key_from_bytes(&k.key.to_packed())
+            .map_err(|e| ChainError::InternalError(format!("authority key encode: {e}")))?;
+        keys.push(ffi::KeyWeight {
+            key,
+            weight: k.weight,
+        });
+    }
+    let accounts = auth
+        .accounts
+        .iter()
+        .map(|a| ffi::PermissionLevelWeight {
+            permission: ffi::PermissionLevel {
+                actor: a.permission.actor,
+                permission: a.permission.permission,
+            },
+            weight: a.weight,
+        })
+        .collect();
+    let waits = auth
+        .waits
+        .iter()
+        .map(|w| ffi::WaitWeight {
+            wait_sec: w.wait_sec,
+            weight: w.weight,
+        })
+        .collect();
+    Ok(ffi::Authority {
+        threshold: auth.threshold,
+        keys,
+        accounts,
+        waits,
+    })
+}
+
+/// The inverse: a bridge `Authority` (read out of chainbase) into the pure-Rust
+/// one core consumes.
+pub(crate) fn native_authority(auth: &ffi::Authority) -> Result<Authority, ChainError> {
+    let mut keys = Vec::with_capacity(auth.keys.len());
+    for k in &auth.keys {
+        let packed = match k.key.as_ref() {
+            Some(pk) => ffi::packed_public_key_bytes(pk),
+            None => Vec::new(),
+        };
+        let key = K1PublicKey::from_packed(&packed)
+            .map_err(|e| ChainError::InternalError(format!("authority key decode: {e}")))?;
+        keys.push(KeyWeight {
+            key,
+            weight: k.weight,
+        });
+    }
+    let accounts = auth
+        .accounts
+        .iter()
+        .map(|a| PermissionLevelWeight {
+            permission: PermissionLevel {
+                actor: a.permission.actor,
+                permission: a.permission.permission,
+            },
+            weight: a.weight,
+        })
+        .collect();
+    let waits = auth
+        .waits
+        .iter()
+        .map(|w| WaitWeight {
+            wait_sec: w.wait_sec,
+            weight: w.weight,
+        })
+        .collect();
+    Ok(Authority {
+        threshold: auth.threshold,
+        keys,
+        accounts,
+        waits,
+    })
+}
+
+// The pure-Rust authority sub-types back both the arena authority decoder and
+// the native<->bridge Authority conversion the chainbase read/write path uses.
 use crate::{
     KeyWeight,
     PermissionLevel,
@@ -153,6 +235,7 @@ use crate::{
 };
 #[cfg(feature = "arena-shadow")]
 use pulsevm_billable_size::billable_size_v;
+use pulsevm_crypto::k1::K1PublicKey;
 
 /// Field-for-field snapshot of an `account_metadata_object` read back from the
 /// arena mirror, matching the chainbase accessors used to diff it.
@@ -349,7 +432,7 @@ fn decode_authority(blob: &[u8]) -> Result<Authority, ChainError> {
     for _ in 0..nkeys {
         let len = rd_u32(blob, &mut pos)? as usize;
         let key_bytes = take(blob, &mut pos, len)?;
-        let key = ffi::parse_public_key_from_bytes(key_bytes)
+        let key = K1PublicKey::from_packed(key_bytes)
             .map_err(|e| ChainError::InternalError(format!("authority key decode: {e}")))?;
         let weight = rd_u16(blob, &mut pos)?;
         keys.push(KeyWeight { key, weight });
@@ -426,10 +509,7 @@ fn encode_authority(auth: &Authority) -> Vec<u8> {
     out.extend_from_slice(&auth.threshold.to_le_bytes());
     out.extend_from_slice(&(auth.keys.len() as u32).to_le_bytes());
     for k in &auth.keys {
-        let bytes = match k.key.as_ref() {
-            Some(pk) => ffi::packed_public_key_bytes(pk),
-            None => Vec::new(),
-        };
+        let bytes = k.key.to_packed();
         out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
         out.extend_from_slice(&bytes);
         out.extend_from_slice(&k.weight.to_le_bytes());
@@ -775,7 +855,9 @@ impl Database {
             // Safe: non-null, read-only, no mutation between the find and read.
             let perm = unsafe { &*ptr };
             let cb_id = perm.get_id() as u64;
-            let auth = ffi::get_authority_from_shared_authority(perm.get_authority());
+            let auth = native_authority(&ffi::get_authority_from_shared_authority(
+                perm.get_authority(),
+            ))?;
             let auth_bytes = encode_authority(&auth);
             out.extend_from_slice(&owner.to_le_bytes());
             out.extend_from_slice(&perm_name.to_le_bytes());
@@ -6033,7 +6115,13 @@ impl Database {
             let mut guard = self.locked_write()?;
             let pinned = guard.pin_mut();
             pinned
-                .create_permission(account, name, parent, auth, &cxx_time_point(creation_time))
+                .create_permission(
+                    account,
+                    name,
+                    parent,
+                    &cxx_authority(auth)?,
+                    &cxx_time_point(creation_time),
+                )
                 .map_err(|e| ChainError::InternalError(format!("{}", e)))?
                 as *const ffi::PermissionObject
         };
@@ -6106,8 +6194,12 @@ impl Database {
             .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
         // The pointer is only dereferenced while the read guard is alive, and the
         // authority is copied out before it is dropped.
-        let authority = unsafe { perm.as_ref() }
-            .map(|p| ffi::get_authority_from_shared_authority(p.get_authority()));
+        let authority = match unsafe { perm.as_ref() } {
+            Some(p) => Some(native_authority(
+                &ffi::get_authority_from_shared_authority(p.get_authority()),
+            )?),
+            None => None,
+        };
         Ok(authority)
     }
 
@@ -6139,7 +6231,7 @@ impl Database {
                 .modify_permission_by_actor_and_permission(
                     actor,
                     permission,
-                    authority,
+                    &cxx_authority(authority)?,
                     &cxx_time_point(pending_block_time),
                 )
                 .map_err(|e| ChainError::InternalError(e.to_string()))?;
@@ -6752,7 +6844,7 @@ mod tests {
     #[test]
     fn decode_authority_is_the_inverse_of_encode() {
         let key =
-            ffi::parse_public_key("PUB_K1_5bbkxaLdB5bfVZW6DJY8M74vwT2m61PqwywNUa5azfkJTvYa5H")
+            K1PublicKey::from_string("PUB_K1_5bbkxaLdB5bfVZW6DJY8M74vwT2m61PqwywNUa5azfkJTvYa5H")
                 .expect("parse pubkey");
         let auth = Authority {
             threshold: 2,
@@ -6806,9 +6898,9 @@ mod tests {
     #[test]
     fn authority_blob_billable_size_matches_formula() {
         let key =
-            ffi::parse_public_key("PUB_K1_5bbkxaLdB5bfVZW6DJY8M74vwT2m61PqwywNUa5azfkJTvYa5H")
+            K1PublicKey::from_string("PUB_K1_5bbkxaLdB5bfVZW6DJY8M74vwT2m61PqwywNUa5azfkJTvYa5H")
                 .unwrap();
-        let key_len = ffi::packed_public_key_bytes(key.as_ref().unwrap()).len() as i64;
+        let key_len = key.to_packed().len() as i64;
         let auth = Authority {
             threshold: 2,
             keys: vec![KeyWeight { key, weight: 1 }],
@@ -7209,8 +7301,12 @@ impl<'g> DbRead<'g> {
             .db()
             .find_permission_by_actor_and_permission(actor, permission)
             .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
-        let chainbase = unsafe { chainbase.as_ref() }
-            .map(|p| ffi::get_authority_from_shared_authority(p.get_authority()));
+        let chainbase = match unsafe { chainbase.as_ref() } {
+            Some(p) => Some(native_authority(
+                &ffi::get_authority_from_shared_authority(p.get_authority()),
+            )?),
+            None => None,
+        };
 
         #[cfg(feature = "arena-shadow")]
         if let Some(s) = &self.shadow {

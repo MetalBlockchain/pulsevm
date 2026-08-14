@@ -5,12 +5,21 @@
 //! They are pure data with pure-Rust behaviour; `pulsevm_ffi` converts them to
 //! its bridge structs only where a value actually crosses into C++.
 
+mod authority;
 mod block_timestamp;
 mod config;
 mod elastic_limit_parameters;
 mod time;
 mod time_point_sec;
 
+pub use authority::{
+    Authority,
+    KeyWeight,
+    ParsePermissionLevelError,
+    PermissionLevel,
+    PermissionLevelWeight,
+    WaitWeight,
+};
 pub use block_timestamp::BlockTimestamp;
 pub use config::{
     ChainConfigV0,

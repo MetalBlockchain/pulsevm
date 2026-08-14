@@ -1,6 +1,6 @@
 use std::fmt;
 
-use cxx::SharedPtr;
+use pulsevm_crypto::k1::K1PublicKey;
 use pulsevm_serialization::{
     NumBytes,
     Read,
@@ -19,16 +19,20 @@ use serde::{
     ser::SerializeStruct,
 };
 
-use crate::{
-    CxxPublicKey,
-    PermissionLevel,
-    bridge::ffi::{
-        Authority,
-        KeyWeight,
-        PermissionLevelWeight,
-        WaitWeight,
-    },
+use super::{
+    key_weight::KeyWeight,
+    permission_level::PermissionLevel,
+    permission_level_weight::PermissionLevelWeight,
+    wait_weight::WaitWeight,
 };
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct Authority {
+    pub threshold: u32,
+    pub keys: Vec<KeyWeight>,
+    pub accounts: Vec<PermissionLevelWeight>,
+    pub waits: Vec<WaitWeight>,
+}
 
 impl Authority {
     pub fn new(
@@ -45,7 +49,7 @@ impl Authority {
         }
     }
 
-    pub fn new_from_public_key(key: SharedPtr<CxxPublicKey>) -> Self {
+    pub fn new_from_public_key(key: K1PublicKey) -> Self {
         Authority {
             threshold: 1,
             keys: vec![KeyWeight::new(key, 1)],
@@ -58,7 +62,7 @@ impl Authority {
         Authority {
             threshold: 1,
             keys: Vec::new(),
-            accounts: vec![PermissionLevelWeight::new(permission_level.clone(), 1)],
+            accounts: vec![PermissionLevelWeight::new(*permission_level, 1)],
             waits: Vec::new(),
         }
     }
@@ -92,11 +96,14 @@ impl Authority {
 
         let mut total_weight: u32 = 0;
 
-        // Keys must be strictly ascending by public key.
+        // Keys must be strictly ascending by public key. The ordering is the
+        // 34-byte packed key compared as unsigned bytes, which is byte-for-byte
+        // the same as the C++ `public_key_type::cmp` (cross-checked in
+        // pulsevm_ffi/tests/pubkey_order_cross_validation.rs).
         let mut prev_key: Option<&KeyWeight> = None;
         for k in &self.keys {
             if let Some(prev) = prev_key {
-                if prev.key.cmp(&k.key) >= 0 {
+                if prev.key.to_packed() >= k.key.to_packed() {
                     return false;
                 }
             }

@@ -2154,13 +2154,13 @@ mod tests {
                     name: account,
                     owner: Authority::new(
                         1,
-                        vec![KeyWeight::new(private_key.get_public_key().into(), 1)],
+                        vec![KeyWeight::new(private_key.get_public_key().into_k1(), 1)],
                         vec![],
                         vec![],
                     ),
                     active: Authority::new(
                         1,
-                        vec![KeyWeight::new(private_key.get_public_key().into(), 1)],
+                        vec![KeyWeight::new(private_key.get_public_key().into_k1(), 1)],
                         vec![],
                         vec![],
                     ),
@@ -2313,7 +2313,7 @@ mod tests {
                     parent,
                     auth: Authority::new(
                         threshold,
-                        vec![KeyWeight::new(private_key.get_public_key().into(), 1)],
+                        vec![KeyWeight::new(private_key.get_public_key().into_k1(), 1)],
                         vec![],
                         vec![],
                     ),

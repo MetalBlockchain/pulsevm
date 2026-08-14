@@ -50,6 +50,12 @@ impl PublicKey {
         &self.inner
     }
 
+    /// Consume this wrapper into the underlying pure-Rust key — for building a
+    /// `KeyWeight`, which stores the `K1PublicKey` directly.
+    pub fn into_k1(self) -> K1PublicKey {
+        self.inner
+    }
+
     /// Bridge a C++ key into this type via its packed bytes. Used where a key is
     /// read out of a still-C++ `Authority`/`KeyWeight`.
     pub fn from_cxx(key: &CxxPublicKey) -> Result<Self, ChainError> {

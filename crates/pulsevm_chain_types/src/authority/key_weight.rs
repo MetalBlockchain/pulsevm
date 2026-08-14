@@ -1,8 +1,10 @@
 use std::fmt;
 
-use cxx::SharedPtr;
 use pulsevm_billable_size::BillableSize;
-use pulsevm_crypto::FixedBytes;
+use pulsevm_crypto::{
+    FixedBytes,
+    k1::K1PublicKey,
+};
 use pulsevm_serialization::{
     NumBytes,
     Read,
@@ -21,15 +23,14 @@ use serde::{
     ser::SerializeStruct,
 };
 
-use crate::{
-    CxxPublicKey,
-    bridge::ffi::KeyWeight,
-    parse_public_key,
-    parse_public_key_from_bytes,
-};
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct KeyWeight {
+    pub key: K1PublicKey,
+    pub weight: u16,
+}
 
 impl KeyWeight {
-    pub fn new(key: SharedPtr<CxxPublicKey>, weight: u16) -> Self {
+    pub fn new(key: K1PublicKey, weight: u16) -> Self {
         KeyWeight { key, weight }
     }
 }
@@ -37,7 +38,7 @@ impl KeyWeight {
 impl fmt::Debug for KeyWeight {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("KeyWeight")
-            .field("key", &self.key.to_string_rust())
+            .field("key", &self.key.to_string())
             .field("weight", &self.weight)
             .finish()
     }
@@ -53,7 +54,7 @@ impl NumBytes for KeyWeight {
 impl Read for KeyWeight {
     fn read(bytes: &[u8], pos: &mut usize) -> Result<Self, pulsevm_serialization::ReadError> {
         let packed_key = FixedBytes::<34>::read(bytes, pos)?;
-        let key = parse_public_key_from_bytes(packed_key.as_ref()).map_err(|e| {
+        let key = K1PublicKey::from_packed(packed_key.as_ref()).map_err(|e| {
             pulsevm_serialization::ReadError::CustomError(format!(
                 "failed to parse public key in KeyWeight: {}",
                 e
@@ -66,9 +67,7 @@ impl Read for KeyWeight {
 
 impl Write for KeyWeight {
     fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), WriteError> {
-        let packed_key: FixedBytes<34> = self.key.packed_bytes().try_into().map_err(|_| {
-            WriteError::CustomError("Failed to convert packed public key to FixedBytes<34>".into())
-        })?;
+        let packed_key = FixedBytes::<34>(self.key.to_packed());
         packed_key.write(bytes, pos)?;
         self.weight.write(bytes, pos)?;
         Ok(())
@@ -81,7 +80,7 @@ impl Serialize for KeyWeight {
         S: serde::Serializer,
     {
         let mut state = serializer.serialize_struct("KeyWeight", 2)?;
-        state.serialize_field("key", &self.key.to_string_rust())?;
+        state.serialize_field("key", &self.key.to_string())?;
         state.serialize_field("weight", &self.weight)?;
         state.end()
     }
@@ -143,7 +142,7 @@ impl<'de> Deserialize<'de> for KeyWeight {
                     .next_element()?
                     .ok_or_else(|| de::Error::invalid_length(1, &self))?;
 
-                let key = parse_public_key(&key_str)
+                let key = K1PublicKey::from_string(&key_str)
                     .map_err(|e| de::Error::custom(format!("invalid public key: {}", e)))?;
 
                 Ok(KeyWeight { key, weight })
@@ -171,7 +170,7 @@ impl<'de> Deserialize<'de> for KeyWeight {
                 }
 
                 let key_str = key.ok_or_else(|| de::Error::missing_field("key"))?;
-                let key = parse_public_key(&key_str)
+                let key = K1PublicKey::from_string(&key_str)
                     .map_err(|e| de::Error::custom(format!("invalid public key: {}", e)))?;
                 let weight = weight.ok_or_else(|| de::Error::missing_field("weight"))?;
 

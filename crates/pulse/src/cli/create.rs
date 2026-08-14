@@ -59,7 +59,7 @@ pub async fn handle(
                         owner: Authority {
                             threshold: 1,
                             keys: vec![KeyWeight {
-                                key: PublicKey::from_str(&owner_key)?.into(),
+                                key: PublicKey::from_str(&owner_key)?.into_k1(),
                                 weight: 1,
                             }],
                             accounts: vec![],
@@ -68,7 +68,7 @@ pub async fn handle(
                         active: Authority {
                             threshold: 1,
                             keys: vec![KeyWeight {
-                                key: PublicKey::from_str(&active_key)?.into(),
+                                key: PublicKey::from_str(&active_key)?.into_k1(),
                                 weight: 1,
                             }],
                             accounts: vec![],

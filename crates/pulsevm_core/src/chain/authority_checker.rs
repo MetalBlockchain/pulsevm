@@ -113,9 +113,8 @@ impl<'a> AuthorityChecker<'a> {
     }
 
     pub fn visit_key_weight(&mut self, key: &KeyWeight) -> Result<u16, ChainError> {
-        // The KeyWeight still carries a C++ key (it is a cxx bridge struct until
-        // the authority type is salvaged); bridge it into the pure-Rust key.
-        let pub_key = PublicKey::from_cxx(&key.key)?;
+        // KeyWeight now carries the pure-Rust K1 key directly.
+        let pub_key = PublicKey::new(key.key);
 
         if self.provided_keys.contains(&pub_key) {
             self.used_keys.insert(pub_key);

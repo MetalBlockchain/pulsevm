@@ -19,69 +19,70 @@ use serde::{
     ser::SerializeStruct,
 };
 
-use crate::bridge::ffi::{
-    PermissionLevel,
-    PermissionLevelWeight,
-};
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct WaitWeight {
+    pub wait_sec: u32,
+    pub weight: u16,
+}
 
-impl PermissionLevelWeight {
-    pub fn new(permission: PermissionLevel, weight: u16) -> Self {
-        PermissionLevelWeight { permission, weight }
+impl WaitWeight {
+    pub fn new(wait_sec: u32, weight: u16) -> Self {
+        WaitWeight { wait_sec, weight }
     }
 }
 
-impl fmt::Debug for PermissionLevelWeight {
+impl fmt::Debug for WaitWeight {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("PermissionLevelWeight")
-            .field("permission", &self.permission)
+        f.debug_struct("WaitWeight")
+            .field("wait_sec", &self.wait_sec)
             .field("weight", &self.weight)
             .finish()
     }
 }
 
-impl NumBytes for PermissionLevelWeight {
+impl NumBytes for WaitWeight {
     fn num_bytes(&self) -> usize {
-        self.permission.num_bytes() + self.weight.num_bytes()
+        self.wait_sec.num_bytes() + self.weight.num_bytes()
     }
 }
 
-impl Read for PermissionLevelWeight {
+impl Read for WaitWeight {
     fn read(bytes: &[u8], pos: &mut usize) -> Result<Self, pulsevm_serialization::ReadError> {
-        let permission = PermissionLevel::read(bytes, pos)?;
+        let wait_sec = u32::read(bytes, pos)?;
         let weight = u16::read(bytes, pos)?;
-        Ok(PermissionLevelWeight { permission, weight })
+        Ok(WaitWeight { wait_sec, weight })
     }
 }
 
-impl Write for PermissionLevelWeight {
+impl Write for WaitWeight {
     fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), WriteError> {
-        self.permission.write(bytes, pos)?;
+        self.wait_sec.write(bytes, pos)?;
         self.weight.write(bytes, pos)?;
         Ok(())
     }
 }
 
-impl Serialize for PermissionLevelWeight {
+impl Serialize for WaitWeight {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
-        let mut state = serializer.serialize_struct("PermissionLevelWeight", 2)?;
-        state.serialize_field("permission", &self.permission)?;
+        let mut state = serializer.serialize_struct("WaitWeight", 2)?;
+        state.serialize_field("wait_sec", &self.wait_sec)?;
         state.serialize_field("weight", &self.weight)?;
         state.end()
     }
 }
 
-impl<'de> Deserialize<'de> for PermissionLevelWeight {
+impl<'de> Deserialize<'de> for WaitWeight {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        const FIELDS: &[&str] = &["permission", "weight"];
+        const FIELDS: &[&str] = &["wait_sec", "weight"];
 
         enum Field {
-            Permission,
+            WaitSec,
             Weight,
         }
 
@@ -96,12 +97,12 @@ impl<'de> Deserialize<'de> for PermissionLevelWeight {
                     type Value = Field;
 
                     fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                        f.write_str("`permission` or `weight`")
+                        f.write_str("`wait_sec` or `weight`")
                     }
 
                     fn visit_str<E: de::Error>(self, value: &str) -> Result<Field, E> {
                         match value {
-                            "permission" => Ok(Field::Permission),
+                            "wait_sec" => Ok(Field::WaitSec),
                             "weight" => Ok(Field::Weight),
                             _ => Err(de::Error::unknown_field(value, FIELDS)),
                         }
@@ -112,36 +113,36 @@ impl<'de> Deserialize<'de> for PermissionLevelWeight {
             }
         }
 
-        struct PermissionLevelWeightVisitor;
+        struct WaitWeightVisitor;
 
-        impl<'de> Visitor<'de> for PermissionLevelWeightVisitor {
-            type Value = PermissionLevelWeight;
+        impl<'de> Visitor<'de> for WaitWeightVisitor {
+            type Value = WaitWeight;
 
             fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                f.write_str("struct PermissionLevelWeight")
+                f.write_str("struct WaitWeight")
             }
 
             fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-                let permission = seq
+                let wait_sec = seq
                     .next_element()?
                     .ok_or_else(|| de::Error::invalid_length(0, &self))?;
                 let weight = seq
                     .next_element()?
                     .ok_or_else(|| de::Error::invalid_length(1, &self))?;
-                Ok(PermissionLevelWeight { permission, weight })
+                Ok(WaitWeight { wait_sec, weight })
             }
 
             fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-                let mut permission = None;
+                let mut wait_sec = None;
                 let mut weight = None;
 
                 while let Some(field) = map.next_key()? {
                     match field {
-                        Field::Permission => {
-                            if permission.is_some() {
-                                return Err(de::Error::duplicate_field("permission"));
+                        Field::WaitSec => {
+                            if wait_sec.is_some() {
+                                return Err(de::Error::duplicate_field("wait_sec"));
                             }
-                            permission = Some(map.next_value()?);
+                            wait_sec = Some(map.next_value()?);
                         }
                         Field::Weight => {
                             if weight.is_some() {
@@ -152,22 +153,18 @@ impl<'de> Deserialize<'de> for PermissionLevelWeight {
                     }
                 }
 
-                Ok(PermissionLevelWeight {
-                    permission: permission.ok_or_else(|| de::Error::missing_field("permission"))?,
+                Ok(WaitWeight {
+                    wait_sec: wait_sec.ok_or_else(|| de::Error::missing_field("wait_sec"))?,
                     weight: weight.ok_or_else(|| de::Error::missing_field("weight"))?,
                 })
             }
         }
 
-        deserializer.deserialize_struct(
-            "PermissionLevelWeight",
-            FIELDS,
-            PermissionLevelWeightVisitor,
-        )
+        deserializer.deserialize_struct("WaitWeight", FIELDS, WaitWeightVisitor)
     }
 }
 
-impl BillableSize for PermissionLevelWeight {
+impl BillableSize for WaitWeight {
     const OVERHEAD: u64 = 0;
-    const VALUE: u64 = 24;
+    const VALUE: u64 = 16;
 }

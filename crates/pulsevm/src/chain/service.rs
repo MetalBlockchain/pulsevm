@@ -640,7 +640,7 @@ mod tests {
     ) -> PackedTransaction {
         let authority = Authority::new(
             1,
-            vec![KeyWeight::new(auth_key.get_public_key().into(), 1)],
+            vec![KeyWeight::new(auth_key.get_public_key().into_k1(), 1)],
             vec![],
             vec![],
         );
