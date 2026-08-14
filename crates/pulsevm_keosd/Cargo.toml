@@ -26,6 +26,7 @@ thiserror = "2"
 zeroize = { version = "1.8.2", features = ["derive"] }
 
 pulsevm_core = { path = "../pulsevm_core" }
+pulsevm_crypto = { path = "../pulsevm_crypto" }
 
 [dev-dependencies]
 actix-rt = "2"

@@ -3534,6 +3534,7 @@ dependencies = [
  "hex",
  "k256",
  "pulsevm_core",
+ "pulsevm_crypto",
  "rand 0.9.5",
  "ripemd",
  "serde",
