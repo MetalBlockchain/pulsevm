@@ -698,8 +698,7 @@ impl Controller {
 
         // Sign the block with the producer's key over the full header — including
         // any schedule change — so validators authenticate it against the schedule.
-        let sig_digest: crate::utils::Digest =
-            block.signed_block_header.header.sig_digest()?.0.into();
+        let sig_digest = block.signed_block_header.header.sig_digest()?;
         block.signed_block_header.signature = node.producer_key.sign(&sig_digest)?;
 
         // We built this block so no need to verify it again
@@ -800,7 +799,7 @@ impl Controller {
                     header.producer
                 ))
             })?;
-        let digest: crate::utils::Digest = header.sig_digest()?.0.into();
+        let digest = header.sig_digest()?;
         let signer = block
             .signed_block_header
             .signature
@@ -5193,8 +5192,7 @@ mod tests {
             let mut block = reconstruct_block(r)?;
             // Sign with the scheduled key so verify_block authenticates it (see
             // the block_signer note above).
-            let sig_digest: crate::utils::Digest =
-                block.signed_block_header.header.sig_digest()?.0.into();
+            let sig_digest = block.signed_block_header.header.sig_digest()?;
             block.signed_block_header.signature = block_signer.sign(&sig_digest)?;
             if let Err(e) = controller.verify_block(&block, &mut mempool).await {
                 eprintln!("stalled applying block {n}: {e:?}");
@@ -7459,7 +7457,7 @@ mod tests {
         )?);
         let mut block = producer.build_block(&mut p_mempool).await?;
 
-        let wrong_digest: crate::utils::Digest = [0u8; 32].into();
+        let wrong_digest = pulsevm_crypto::Digest([0u8; 32]);
         block.signed_block_header.signature = private_key.sign(&wrong_digest)?;
 
         let (mut validator, _pk, _cid, _v_temp) = init_test_controller()?;
@@ -7507,8 +7505,7 @@ mod tests {
             "genesis-key signature must be rejected under the rotated schedule"
         );
 
-        let sig_digest: crate::utils::Digest =
-            block.signed_block_header.header.sig_digest()?.0.into();
+        let sig_digest = block.signed_block_header.header.sig_digest()?;
         block.signed_block_header.signature = new_key.sign(&sig_digest)?;
         validator.verify_block(&block, &mut v_mempool).await?;
 
@@ -7745,8 +7742,7 @@ mod tests {
                 continue;
             }
             let mut block = reconstruct_block(r)?;
-            let sig_digest: crate::utils::Digest =
-                block.signed_block_header.header.sig_digest()?.0.into();
+            let sig_digest = block.signed_block_header.header.sig_digest()?;
             block.signed_block_header.signature = block_signer.sign(&sig_digest)?;
             // This foreign fixture predates onblock, so its canonical merkle roots
             // won't match a chain that runs onblock every block — replay stops at
@@ -7878,8 +7874,7 @@ mod tests {
                     .map_err(|e| ChainError::SerializationError(e.to_string()))?,
             );
             block.signed_block_header.header.schedule_version = new_schedule.version;
-            let sig_digest: crate::utils::Digest =
-                block.signed_block_header.header.sig_digest()?.0.into();
+            let sig_digest = block.signed_block_header.header.sig_digest()?;
             block.signed_block_header.signature = private_key.sign(&sig_digest)?;
 
             let packed = block
@@ -8282,8 +8277,7 @@ mod tests {
         // Forge a non-zero schedule version with no matching new_producers, then
         // re-sign so this is a validity failure, not a signature failure.
         block.signed_block_header.header.schedule_version = 5;
-        let sig_digest: crate::utils::Digest =
-            block.signed_block_header.header.sig_digest()?.0.into();
+        let sig_digest = block.signed_block_header.header.sig_digest()?;
         block.signed_block_header.signature = private_key.sign(&sig_digest)?;
 
         let (mut validator, _pk, _cid, _v_temp) = init_test_controller()?;

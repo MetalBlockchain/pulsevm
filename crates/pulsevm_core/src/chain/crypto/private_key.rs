@@ -3,16 +3,16 @@ use std::{
     str::FromStr,
 };
 
-use pulsevm_crypto::K1PrivateKey;
+use pulsevm_crypto::{
+    Digest,
+    K1PrivateKey,
+};
 use pulsevm_error::ChainError;
 use serde::Deserialize;
 
-use crate::{
-    crypto::{
-        PublicKey,
-        Signature,
-    },
-    utils::Digest,
+use crate::crypto::{
+    PublicKey,
+    Signature,
 };
 
 /// A secp256k1 (`K1`) private key. Pure Rust throughout — parsing, string
@@ -27,7 +27,7 @@ pub struct PrivateKey {
 
 impl PrivateKey {
     pub fn sign(&self, digest: &Digest) -> Result<Signature, ChainError> {
-        Ok(Signature::new(self.inner.sign(&digest.as_bytes())))
+        Ok(Signature::new(self.inner.sign(digest.as_bytes())))
     }
 
     pub fn new_k1_from_string(s: &str) -> Result<Self, ChainError> {

@@ -12,6 +12,7 @@ use std::{
 };
 
 use pulsevm_crypto::{
+    Digest,
     FixedBytes,
     K1Signature,
 };
@@ -28,10 +29,7 @@ use serde::{
     Serialize,
 };
 
-use crate::{
-    crypto::PublicKey,
-    utils::Digest,
-};
+use crate::crypto::PublicKey;
 
 /// A recoverable secp256k1 (`K1`) signature. Pure Rust: parse, pack, recover and
 /// string encoding all run through [`K1Signature`].
@@ -48,7 +46,7 @@ impl Signature {
     pub fn recover_public_key(&self, digest: &Digest) -> Result<PublicKey, ChainError> {
         let key = self
             .inner
-            .recover(&digest.as_bytes())
+            .recover(digest.as_bytes())
             .map_err(|e| ChainError::TransactionError(e.to_string()))?;
         Ok(PublicKey::new(key))
     }

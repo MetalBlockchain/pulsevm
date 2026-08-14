@@ -1047,10 +1047,7 @@ mod tests {
 
         use sha2::Digest as _;
 
-        use crate::{
-            crypto::PrivateKey,
-            utils::Digest as CoreDigest,
-        };
+        use crate::crypto::PrivateKey;
 
         // Points are an upper bound on real time; bias high. NEAR historically
         // used ~3x. Under-charging is the only unsafe direction.
@@ -1215,7 +1212,7 @@ mod tests {
         // --- recover_key: fixed, no size sweep ---
         let key = PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")
             .unwrap();
-        let digest = CoreDigest::from_data(b"pulsevm-intrinsic-cost-benchmark");
+        let digest = pulsevm_crypto::Digest::hash(b"pulsevm-intrinsic-cost-benchmark");
         let sig = key.sign(&digest).unwrap();
         let recover_ns = time_ns(300, || {
             black_box(sig.recover_public_key(black_box(&digest)).unwrap());

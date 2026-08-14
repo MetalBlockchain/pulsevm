@@ -16,7 +16,6 @@ use crate::{
         PublicKey,
         Signature,
     },
-    utils::Digest,
 };
 
 pub fn assert_recover_key(
@@ -43,7 +42,12 @@ pub fn assert_recover_key(
     let digest_slice = digest_ptr.slice(&view, 32)?;
     let mut digest_bytes = vec![0u8; 32];
     digest_slice.read_slice(&mut digest_bytes)?;
-    let digest: Digest = Digest::from_data(&digest_bytes);
+    let digest = pulsevm_crypto::Digest(
+        digest_bytes
+            .as_slice()
+            .try_into()
+            .expect("digest buffer is exactly 32 bytes"),
+    );
     let pub_slice = pub_ptr.slice(&view, pub_len)?;
     let mut pubkey_bytes = vec![0u8; pub_len as usize];
     pub_slice.read_slice(&mut pubkey_bytes)?;
@@ -85,7 +89,12 @@ pub fn recover_key(
     let digest_slice = digest_ptr.slice(&view, 32)?;
     let mut digest_bytes = vec![0u8; 32];
     digest_slice.read_slice(&mut digest_bytes)?;
-    let digest: Digest = Digest::from_data(&digest_bytes);
+    let digest = pulsevm_crypto::Digest(
+        digest_bytes
+            .as_slice()
+            .try_into()
+            .expect("digest buffer is exactly 32 bytes"),
+    );
     let public_key = signature.recover_public_key(&digest)?;
     let packed_public_key = public_key
         .pack()
