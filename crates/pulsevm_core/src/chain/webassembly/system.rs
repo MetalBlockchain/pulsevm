@@ -6,7 +6,10 @@ use wasmer::{
 
 use super::cost;
 use crate::chain::{
-    wasm_runtime::WasmContext,
+    wasm_runtime::{
+        WasmContext,
+        WasmExit,
+    },
     webassembly::context_aware_check,
 };
 
@@ -146,13 +149,13 @@ pub fn pulse_assert_code(
     Ok(())
 }
 
-pub fn pulse_exit(mut env: FunctionEnvMut<WasmContext>, code: u32) -> Result<(), RuntimeError> {
+pub fn pulse_exit(mut env: FunctionEnvMut<WasmContext>, code: i32) -> Result<(), RuntimeError> {
     let (env_data, mut store) = env.data_and_store_mut();
     env_data.charge(&mut store, cost::SYSTEM)?;
-    return Err(RuntimeError::new(format!(
-        "exit called with code: {}",
-        code
-    )));
+    // Not a failure: eosio_exit/pulse_exit ends the current action successfully.
+    // WasmExit rides back as a trap that `run` recognizes and turns into Ok, so
+    // the state this action already produced is kept.
+    Err(RuntimeError::user(Box::new(WasmExit { code })))
 }
 
 pub fn abort(mut env: FunctionEnvMut<WasmContext>) -> Result<(), RuntimeError> {
