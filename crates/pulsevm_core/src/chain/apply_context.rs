@@ -892,7 +892,9 @@ impl ApplyContext {
     }
 
     pub fn db_idx64_remove(&mut self, iterator: i32) -> Result<(), ChainError> {
-        {
+        // Refund the secondary row's stored payer (matching EOSIO and the
+        // idxN_update billing), not self.receiver.
+        let payer = {
             let mut inner = self.inner.write()?;
             let (code, scope, table, primary) = inner
                 .arena_index64_cache
@@ -902,12 +904,17 @@ impl ApplyContext {
                 code == self.receiver.as_u64(),
                 ChainError::TransactionError(format!("db access violation")),
             )?;
+            let payer = self
+                .db
+                .arena_idx64_payer(code, scope, table, primary)
+                .unwrap_or(self.receiver.as_u64());
             self.db
                 .remove_index64_object_standalone(code, scope, table, primary)?;
             inner.arena_index64_cache.remove(iterator);
-        }
+            payer
+        };
         self.update_db_usage(
-            &Name::new(self.receiver.as_u64()),
+            &Name::new(payer),
             -(billable_size_v::<Index64Object>() as i64),
         )?;
         Ok(())
@@ -1161,7 +1168,8 @@ impl ApplyContext {
     }
 
     pub fn db_idx128_remove(&mut self, iterator: i32) -> Result<(), ChainError> {
-        {
+        // Refund the secondary row's stored payer, not self.receiver.
+        let payer = {
             let mut inner = self.inner.write()?;
             let (code, scope, table, primary) = inner
                 .arena_index128_cache
@@ -1171,12 +1179,17 @@ impl ApplyContext {
                 code == self.receiver.as_u64(),
                 ChainError::TransactionError(format!("db access violation")),
             )?;
+            let payer = self
+                .db
+                .arena_idx128_payer(code, scope, table, primary)
+                .unwrap_or(self.receiver.as_u64());
             self.db
                 .remove_index128_object_standalone(code, scope, table, primary)?;
             inner.arena_index128_cache.remove(iterator);
-        }
+            payer
+        };
         self.update_db_usage(
-            &Name::new(self.receiver.as_u64()),
+            &Name::new(payer),
             -(billable_size_v::<Index128Object>() as i64),
         )?;
         Ok(())
@@ -1424,7 +1437,8 @@ impl ApplyContext {
     }
 
     pub fn db_idx256_remove(&mut self, iterator: i32) -> Result<(), ChainError> {
-        {
+        // Refund the secondary row's stored payer, not self.receiver.
+        let payer = {
             let mut inner = self.inner.write()?;
             let (code, scope, table, primary) = inner
                 .arena_index256_cache
@@ -1434,12 +1448,17 @@ impl ApplyContext {
                 code == self.receiver.as_u64(),
                 ChainError::TransactionError(format!("db access violation")),
             )?;
+            let payer = self
+                .db
+                .arena_idx256_payer(code, scope, table, primary)
+                .unwrap_or(self.receiver.as_u64());
             self.db
                 .remove_index256_object_standalone(code, scope, table, primary)?;
             inner.arena_index256_cache.remove(iterator);
-        }
+            payer
+        };
         self.update_db_usage(
-            &Name::new(self.receiver.as_u64()),
+            &Name::new(payer),
             -(billable_size_v::<Index256Object>() as i64),
         )?;
         Ok(())
@@ -1690,7 +1709,8 @@ impl ApplyContext {
     }
 
     pub fn db_idx_double_remove(&mut self, iterator: i32) -> Result<(), ChainError> {
-        {
+        // Refund the secondary row's stored payer, not self.receiver.
+        let payer = {
             let mut inner = self.inner.write()?;
             let (code, scope, table, primary) = inner
                 .arena_index_double_cache
@@ -1700,12 +1720,17 @@ impl ApplyContext {
                 code == self.receiver.as_u64(),
                 ChainError::TransactionError(format!("db access violation")),
             )?;
+            let payer = self
+                .db
+                .arena_idx_double_payer(code, scope, table, primary)
+                .unwrap_or(self.receiver.as_u64());
             self.db
                 .remove_idx_double_object_standalone(code, scope, table, primary)?;
             inner.arena_index_double_cache.remove(iterator);
-        }
+            payer
+        };
         self.update_db_usage(
-            &Name::new(self.receiver.as_u64()),
+            &Name::new(payer),
             -(billable_size_v::<IndexDoubleObject>() as i64),
         )?;
         Ok(())
@@ -1987,7 +2012,8 @@ impl ApplyContext {
     }
 
     pub fn db_idx_long_double_remove(&mut self, iterator: i32) -> Result<(), ChainError> {
-        {
+        // Refund the secondary row's stored payer, not self.receiver.
+        let payer = {
             let mut inner = self.inner.write()?;
             let (code, scope, table, primary) = inner
                 .arena_index_long_double_cache
@@ -1997,12 +2023,17 @@ impl ApplyContext {
                 code == self.receiver.as_u64(),
                 ChainError::TransactionError(format!("db access violation")),
             )?;
+            let payer = self
+                .db
+                .arena_idx_long_double_payer(code, scope, table, primary)
+                .unwrap_or(self.receiver.as_u64());
             self.db
                 .remove_idx_long_double_object_standalone(code, scope, table, primary)?;
             inner.arena_index_long_double_cache.remove(iterator);
-        }
+            payer
+        };
         self.update_db_usage(
-            &Name::new(self.receiver.as_u64()),
+            &Name::new(payer),
             -(billable_size_v::<IndexLongDoubleObject>() as i64),
         )?;
         Ok(())
