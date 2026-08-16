@@ -5,10 +5,8 @@ use pulsevm_constants::{
 };
 use pulsevm_error::ChainError;
 use pulsevm_ffi::{
-    CxxDigest,
     Database,
     PermissionObject,
-    make_shared_digest_from_existing_hash,
 };
 use pulsevm_serialization::Read;
 
@@ -161,17 +159,16 @@ pub fn setcode(
         ChainError::TransactionError(format!("version should be 0")),
     )?;
 
-    let mut code_hash = CxxDigest::new_empty();
     let code_size = act.code.len() as u64;
-
-    if code_size > 0 {
-        code_hash = CxxDigest::hash(act.code.as_slice())?;
-
+    let code_hash: [u8; 32] = if code_size > 0 {
         // Validate the code before accepting it
         pulsevm_wasm_validation::validate_wasm(act.code.as_slice()).map_err(|e| {
             ChainError::TransactionError(format!("contract code failed validation: {}", e))
         })?;
-    }
+        pulsevm_crypto::Digest::hash(act.code.as_slice()).0
+    } else {
+        [0u8; 32]
+    };
 
     let (cur_code_hash, cur_vm_type, cur_vm_version) =
         db.account_code_hash_vm(act.account.as_u64())?;
@@ -186,21 +183,17 @@ pub fn setcode(
     let new_size: i64 = code_size as i64 * SETCODE_RAM_BYTES_MULTIPLIER as i64;
 
     if existing_code {
-        // Rebuild the deployed code's digest from the arena-served hash so the old
-        // code image can be read and unlinked without holding a chainbase object.
-        let old_hash = make_shared_digest_from_existing_hash(&cur_code_hash);
-        let old_hash = old_hash.as_ref().unwrap();
         pulse_assert(
-            old_hash != code_hash.as_ref().unwrap(),
+            cur_code_hash != code_hash,
             ChainError::TransactionError(format!(
                 "contract is already running this version of code"
             )),
         )?;
 
-        let old_code = db.get_code_bytes_by_hash(old_hash, cur_vm_type, cur_vm_version)?;
+        let old_code = db.get_code_bytes_by_hash(&cur_code_hash, cur_vm_type, cur_vm_version)?;
         old_size = old_code.len() as i64 * SETCODE_RAM_BYTES_MULTIPLIER as i64;
 
-        db.unlink_account_code(old_hash, cur_vm_type, cur_vm_version)?;
+        db.unlink_account_code(&cur_code_hash, cur_vm_type, cur_vm_version)?;
     }
 
     db.update_account_code(
@@ -208,7 +201,7 @@ pub fn setcode(
         act.code.as_slice(),
         context.get_head_block_num() + 1,
         &context.get_pending_block_time().into(),
-        code_hash.as_ref().unwrap(),
+        &code_hash,
         act.vm_type,
         act.vm_version,
     )?;
@@ -273,7 +266,7 @@ pub fn updateauth(
     )?;
 
     pulse_assert(
-        db.account_exists(update.account.as_u64())?,
+        db.is_account(update.account.as_u64())?,
         ChainError::TransactionError(format!("failed to find account {}", update.account)),
     )?;
 

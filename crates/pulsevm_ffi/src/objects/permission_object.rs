@@ -13,7 +13,12 @@ use crate::{
 
 impl PermissionObject {
     pub fn satisfies(&self, other: &PermissionObject, db: &DbRead<'_>) -> Result<bool, ChainError> {
-        db.permission_satisfies_other_permission(self, other)
+        db.permission_satisfies_by_name(
+            self.get_owner().to_uint64_t(),
+            self.get_name().to_uint64_t(),
+            other.get_owner().to_uint64_t(),
+            other.get_name().to_uint64_t(),
+        )
     }
 }
 

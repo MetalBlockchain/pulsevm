@@ -12,7 +12,6 @@ use pulsevm_crypto::Bytes;
 use pulsevm_error::ChainError;
 use pulsevm_ffi::{
     BlockTimestamp,
-    CxxDigest,
     Database,
 };
 use wasmer::{
@@ -503,13 +502,13 @@ impl WasmRuntime {
         action: Action,
         apply_context: ApplyContext,
         db: Database,
-        code_hash: &CxxDigest,
+        code_hash: &[u8; 32],
         cpu_limit: i64,
     ) -> Result<u64, ChainError> {
         // Pause timer
         apply_context.pause_billing_timer()?;
 
-        let id = Id::from(code_hash);
+        let id = Id::new(*code_hash);
         let module = {
             let mut inner = self.inner.write()?;
 
@@ -1534,136 +1533,4 @@ mod tests {
     // KeyValueIteratorCache, the same path db_find_i64/db_next_i64/db_store_i64
     // reach through ApplyContext, minus the RwLock hop) and convert ns -> points via
     // the shared anchor. This is the PROVISIONAL tier the intrinsic doc called out.
-    #[test]
-    #[ignore = "calibration tool; needs a chainbase, run manually with --ignored --nocapture"]
-    fn estimate_db_intrinsic_costs() {
-        use std::{
-            hint::black_box,
-            time::Instant,
-        };
-
-        use pulsevm_ffi::{
-            Database,
-            KeyValueIteratorCache,
-            TableObject,
-        };
-        use tempfile::tempdir;
-
-        // Native work is unmetered, so bias the price high, as the crypto table does.
-        const SAFETY: f64 = 3.0;
-        const DB_SIZE: u64 = 256 * 1024 * 1024;
-        const CODE: u64 = 1;
-        const SCOPE: u64 = 2;
-        const TABLE: u64 = 3;
-        const PAYER: u64 = 1;
-        const ROWS: u64 = 8192; // table population for the lookup/scan measurements
-
-        let ns_per_point = anchor_ns_per_point();
-        let pts = |ns: f64| (ns / ns_per_point * SAFETY).ceil();
-
-        // A populated table to measure find and forward iteration against.
-        let dir = tempdir().unwrap();
-        let mut db = Database::new(dir.path().to_str().unwrap(), DB_SIZE).unwrap();
-        db.add_indices().unwrap();
-        let mut cache = KeyValueIteratorCache::new();
-        let table_ptr = db.create_table(CODE, SCOPE, TABLE, PAYER).unwrap();
-        let table_ref: &TableObject = unsafe { &*table_ptr };
-        for pk in 0..ROWS {
-            db.create_key_value_object(table_ref, PAYER, pk, &pk.to_le_bytes())
-                .unwrap();
-        }
-        cache.cache_table(table_ref).unwrap();
-
-        // find: average over a full sweep of present keys, best of several sweeps.
-        let find_ns = {
-            for pk in 0..ROWS {
-                black_box(db.db_find_i64(CODE, SCOPE, TABLE, pk, &mut cache).unwrap());
-            }
-            let mut best = f64::MAX;
-            for _ in 0..7 {
-                let t = Instant::now();
-                for pk in 0..ROWS {
-                    black_box(db.db_find_i64(CODE, SCOPE, TABLE, pk, &mut cache).unwrap());
-                }
-                best = best.min(t.elapsed().as_nanos() as f64 / ROWS as f64);
-            }
-            best
-        };
-
-        // iterate: lowerbound(0) then next() to the end iterator, per step.
-        let iter_ns = {
-            let mut best = f64::MAX;
-            for _ in 0..7 {
-                let end = db.db_end_i64(&mut cache, CODE, SCOPE, TABLE).unwrap();
-                let t = Instant::now();
-                let mut it = db
-                    .db_lowerbound_i64(&mut cache, CODE, SCOPE, TABLE, 0)
-                    .unwrap();
-                let mut steps = 0u64;
-                while it != end && steps <= ROWS {
-                    let mut p = 0u64;
-                    it = db.db_next_i64(&mut cache, it, &mut p).unwrap();
-                    steps += 1;
-                }
-                best = best.min(t.elapsed().as_nanos() as f64 / steps.max(1) as f64);
-            }
-            best
-        };
-
-        // store: a fresh chainbase each run (create is destructive), per insert, at
-        // two value sizes so the per-byte slope of the value write falls out.
-        let store_ns = |val_len: usize| -> f64 {
-            let mut best = f64::MAX;
-            for _ in 0..3 {
-                let dir = tempdir().unwrap();
-                let mut db = Database::new(dir.path().to_str().unwrap(), DB_SIZE).unwrap();
-                db.add_indices().unwrap();
-                let tp = db.create_table(CODE, SCOPE, TABLE, PAYER).unwrap();
-                let tr: &TableObject = unsafe { &*tp };
-                let val = vec![0xa5u8; val_len];
-                let t = Instant::now();
-                for pk in 0..ROWS {
-                    db.create_key_value_object(tr, PAYER, pk, &val).unwrap();
-                }
-                best = best.min(t.elapsed().as_nanos() as f64 / ROWS as f64);
-            }
-            best
-        };
-        let store_small = store_ns(8);
-        let store_large = store_ns(4096);
-        let value_per_byte_ns = ((store_large - store_small) / (4096.0 - 8.0)).max(0.0);
-
-        println!("\n==== db intrinsic cost estimate (3x safety) ====");
-        println!("anchor: {ns_per_point:.5} ns/point   table: {ROWS} rows");
-        println!(
-            "{:<20} {:>10} {:>10} {:>10}",
-            "op", "ns", "points", "shipped"
-        );
-        println!(
-            "{:<20} {find_ns:>10.1} {:>10.0} {:>10}",
-            "db_find_i64",
-            pts(find_ns),
-            "DB_OP=100"
-        );
-        println!(
-            "{:<20} {iter_ns:>10.1} {:>10.0} {:>10}",
-            "db_next_i64 (step)",
-            pts(iter_ns),
-            "DB_OP=100"
-        );
-        println!(
-            "{:<20} {store_small:>10.1} {:>10.0} {:>10}",
-            "db_store_i64 (8B)",
-            pts(store_small),
-            "DB_OP=100"
-        );
-        println!(
-            "{:<20} {:>10.4} {:>10.2} {:>10}",
-            "value per-byte",
-            value_per_byte_ns,
-            pts(value_per_byte_ns),
-            "1/byte"
-        );
-        println!("=================================================\n");
-    }
 }

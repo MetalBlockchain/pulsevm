@@ -7,7 +7,6 @@ use pulsevm_ffi::{
     DbRead,
     Microseconds,
     PermissionInfo,
-    PermissionObject,
     TimePoint,
     seconds,
 };
@@ -512,7 +511,7 @@ impl AuthorizationManager {
         parent: u64,
         auth: &Authority,
         pending_block_time: &TimePoint,
-    ) -> Result<*const PermissionObject, ChainError> {
+    ) -> Result<(), ChainError> {
         db.create_permission(
             account.as_u64(),
             name.as_u64(),

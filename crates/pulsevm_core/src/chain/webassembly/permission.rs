@@ -198,11 +198,5 @@ pub fn get_account_creation_time(
     let (env_data, mut store) = env.data_and_store_mut();
     env_data.charge(&mut store, cost::BASE)?;
     let db = env_data.db();
-    let r = db.read()?;
-    let account = r.get_account(account)?;
-    Ok(account
-        .get_creation_date()
-        .to_time_point()
-        .time_since_epoch()
-        .count())
+    Ok(db.account_creation_time_micros(account)?)
 }

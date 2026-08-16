@@ -2,9 +2,17 @@ mod bridge;
 mod database;
 mod iterator_cache;
 mod objects;
+mod pod;
 mod shadow;
 mod snapshot;
 mod types;
+
+pub use crate::pod::{
+    CpuLimitResult,
+    Float128,
+    NetLimitResult,
+    U256,
+};
 
 pub use crate::{
     bridge::ffi::{
@@ -22,7 +30,6 @@ pub use crate::{
         CxxSignature,
         CxxTimePoint,
         DatabaseOpenFlags,
-        Float128,
         GlobalPropertyObject,
         I128,
         Index64Object,
@@ -37,7 +44,6 @@ pub use crate::{
         TableId,
         TableObject,
         U128,
-        U256,
         UndoSession,
         addtf3,
         cmptf2,

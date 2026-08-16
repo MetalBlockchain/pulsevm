@@ -1473,6 +1473,13 @@ impl ArenaShadow {
         self.lock().set_revision(revision)
     }
 
+    /// The arena's current revision (the accepted block height it is committed
+    /// to). Drives the controller's genesis-vs-resume decision now that the arena
+    /// is the sole backend.
+    pub fn revision(&self) -> i64 {
+        self.lock().revision()
+    }
+
     // Lifecycle, driven from the controller in lockstep with the chainbase
     // undo-session boundaries.
     pub fn start_undo_session(&self) {

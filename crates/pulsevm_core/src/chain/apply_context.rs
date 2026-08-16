@@ -36,7 +36,6 @@ use pulsevm_ffi::{
     Microseconds,
     TableObject,
     U256,
-    make_shared_digest_from_existing_hash,
 };
 use pulsevm_serialization::Write;
 
@@ -246,20 +245,12 @@ impl ApplyContext {
                 inner.cpu_limit
             };
 
-            // Rebuild the digest from the arena-served hash bytes (this does not
-            // re-hash — it wraps the existing 32 bytes) so wasm_runtime can locate
-            // and load the code image by hash.
-            let code_digest = make_shared_digest_from_existing_hash(&code_hash);
-            let code_digest = code_digest.as_ref().ok_or_else(|| {
-                ChainError::InternalError("null code digest for receiver".to_string())
-            })?;
-
             cpu_used += self.wasm_runtime.run(
                 self.receiver.clone(),
                 action.clone(),
                 self.clone(),
                 self.db.clone(),
-                code_digest,
+                &code_hash,
                 cpu_limit,
             )?;
         }
@@ -541,54 +532,6 @@ impl ApplyContext {
         Ok(copy_size as i32)
     }
 
-    /// Tally an arena iterator-handle cross-check (arena handle == chainbase's),
-    /// logging the operation and table on a mismatch when `PULSEVM_DBG_ITER` is set.
-    fn note_iter_handle(
-        &self,
-        op: &str,
-        code: u64,
-        scope: u64,
-        table: u64,
-        arena_h: i32,
-        res: i32,
-    ) {
-        if arena_h != res && std::env::var("PULSEVM_DBG_ITER").is_ok() {
-            eprintln!(
-                "ITER MISMATCH {op} code={code} scope={scope} table={table} arena={arena_h} chain={res}"
-            );
-        }
-        self.db.arena_note_pos(arena_h == res);
-    }
-
-    /// Mint the secondary-index iterator handle for a find/bound result and
-    /// cross-check it against chainbase's `res`: `-1` when the table is absent,
-    /// the landing row's handle on a hit, otherwise the table's end iterator —
-    /// mirroring `cache_table` on every call then `add` on a hit, as the C++
-    /// oracle does. `cache` is the arena twin of the chainbase iterator cache for
-    /// this secondary-index type.
-    fn note_secondary_handle(
-        &self,
-        cache: &mut ArenaIteratorCache,
-        op: &str,
-        code: u64,
-        scope: u64,
-        table: u64,
-        primary: u64,
-        res: i32,
-    ) {
-        let arena_h = if res == -1 {
-            -1
-        } else {
-            let end = cache.cache_table((code, scope, table));
-            if res >= 0 {
-                cache.add((code, scope, table, primary))
-            } else {
-                end
-            }
-        };
-        self.note_iter_handle(op, code, scope, table, arena_h, res);
-    }
-
     pub fn db_find_i64(
         &mut self,
         code: u64,
@@ -598,48 +541,18 @@ impl ApplyContext {
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
 
-        // Arena-standalone: resolve the lookup against the arena cache only. A
-        // present row takes its handle; a missing row in a present table takes the
-        // table's end iterator; a missing table is -1 — matching chainbase's
-        // db_find_i64 (which caches the table's end iterator before the lookup).
-        if self.db.arena_standalone_reads() {
-            let h = if !self.db.arena_kv_table_exists(code, scope, table) {
-                -1
-            } else if self.db.arena_kv_get(code, scope, table, id).is_some() {
-                inner.arena_keyval_cache.add((code, scope, table, id))
-            } else {
-                inner.arena_keyval_cache.cache_table((code, scope, table))
-            };
-            return Ok(h);
-        }
-
-        let res = self
-            .db
-            .db_find_i64(code, scope, table, id, &mut inner.keyval_cache)
-            .map_err(|e| ChainError::DatabaseError(format!("failed to find i64 in db: {}", e)))?;
-
-        // Mirror the handle into the arena cache: a found row adds its logical
-        // key, a missing row (but present table) takes the table's end iterator,
-        // and a missing table is -1 on both. The row/table existence itself is
-        // cross-checked by the value reads; here we confirm the handle index.
-        {
-            // Chainbase caches the table (minting its end iterator) on every call
-            // before looking up the row, so mirror that unconditionally, then add
-            // the row on a hit.
-            let arena_h = if res == -1 {
-                -1
-            } else {
-                let end = inner.arena_keyval_cache.cache_table((code, scope, table));
-                if res >= 0 {
-                    inner.arena_keyval_cache.add((code, scope, table, id))
-                } else {
-                    end
-                }
-            };
-            self.note_iter_handle("find", code, scope, table, arena_h, res);
-        }
-
-        Ok(res)
+        // Resolve the lookup against the arena only. A present row takes its
+        // handle; a missing row in a present table takes the table's end iterator;
+        // a missing table is -1 — matching chainbase's db_find_i64 (which caches
+        // the table's end iterator before the lookup).
+        let h = if !self.db.arena_kv_table_exists(code, scope, table) {
+            -1
+        } else if self.db.arena_kv_get(code, scope, table, id).is_some() {
+            inner.arena_keyval_cache.add((code, scope, table, id))
+        } else {
+            inner.arena_keyval_cache.cache_table((code, scope, table))
+        };
+        Ok(h)
     }
 
     pub fn db_store_i64(
@@ -657,82 +570,33 @@ impl ApplyContext {
             )),
         )?;
 
-        // Arena-standalone writes: table existence, creation, the row insert and
-        // the RAM billing all resolve against the arena; chainbase is never
-        // touched. The contract receives the arena's iterator handle. This is the
-        // find_or_create_table + create_key_value_object path with no chainbase
-        // TableObject pointer in the middle.
-        if self.db.arena_standalone_writes() {
-            let code = self.receiver.as_u64();
-            // find_or_create_table: bill the new table before the row, only when
-            // the table did not already exist.
-            if !self.db.arena_table_exists(code, scope, table) {
-                self.update_db_usage(&payer.into(), billable_size_v::<TableObject>() as i64)?;
-            }
-            self.db.create_key_value_object_standalone(
-                code,
-                scope,
-                table,
-                payer,
-                primary_key,
-                data.0.as_slice(),
-            )?;
-            let res = {
-                let mut inner = self.inner.write()?;
-                inner.arena_keyval_cache.cache_table((code, scope, table));
-                inner
-                    .arena_keyval_cache
-                    .add((code, scope, table, primary_key))
-            };
-            let billable_size = data.len() as i64 + billable_size_v::<KeyValueObject>() as i64;
-            self.update_db_usage(&payer.into(), billable_size)?;
-            return Ok(res);
+        // Table existence, creation, the row insert and the RAM billing all
+        // resolve against the arena. The contract receives the arena's iterator
+        // handle. This is the find_or_create_table + create_key_value_object path
+        // with no chainbase TableObject pointer in the middle.
+        let code = self.receiver.as_u64();
+        // find_or_create_table: bill the new table before the row, only when the
+        // table did not already exist.
+        if !self.db.arena_table_exists(code, scope, table) {
+            self.update_db_usage(&payer.into(), billable_size_v::<TableObject>() as i64)?;
         }
-
-        let table = self.find_or_create_table(*self.receiver, scope, table, payer)?;
-        let table = unsafe { &*table };
-
+        self.db.create_key_value_object_standalone(
+            code,
+            scope,
+            table,
+            payer,
+            primary_key,
+            data.0.as_slice(),
+        )?;
         let res = {
             let mut inner = self.inner.write()?;
-            // The chainbase row is still written (it mirrors into the arena and
-            // keeps the oracle's state), but in standalone mode the arena owns the
-            // iterator handle the contract receives.
-            let obj =
-                self.db
-                    .create_key_value_object(table, payer, primary_key, &data.0.as_slice())?;
-            if self.db.arena_standalone_reads() {
-                {
-                    let key = (
-                        table.get_code().to_uint64_t(),
-                        table.get_scope().to_uint64_t(),
-                        table.get_table().to_uint64_t(),
-                        primary_key,
-                    );
-                    inner.arena_keyval_cache.cache_table((key.0, key.1, key.2));
-                    inner.arena_keyval_cache.add(key)
-                }
-            } else {
-                let obj = unsafe { &*obj };
-                inner.keyval_cache.cache_table(&table)?;
-                let handle = inner.keyval_cache.add(obj)?;
-                {
-                    let key = (
-                        table.get_code().to_uint64_t(),
-                        table.get_scope().to_uint64_t(),
-                        table.get_table().to_uint64_t(),
-                        primary_key,
-                    );
-                    inner.arena_keyval_cache.cache_table((key.0, key.1, key.2));
-                    let arena_handle = inner.arena_keyval_cache.add(key);
-                    self.note_iter_handle("store", key.0, key.1, key.2, arena_handle, handle);
-                }
-                handle
-            }
+            inner.arena_keyval_cache.cache_table((code, scope, table));
+            inner
+                .arena_keyval_cache
+                .add((code, scope, table, primary_key))
         };
-
         let billable_size = data.len() as i64 + billable_size_v::<KeyValueObject>() as i64;
         self.update_db_usage(&payer.into(), billable_size)?;
-
         Ok(res)
     }
 
@@ -745,128 +609,47 @@ impl ApplyContext {
         let payer = payer.as_u64();
         let new_size = data.as_ref().len() as i64;
 
-        // Arena-standalone writes: the handle is the arena's; resolve the row's
-        // key and old (payer, value) from the arena and rewrite it there alone.
-        // Chainbase is never touched, so the RAM delta is authored entirely from
-        // arena state.
-        if self.db.arena_standalone_writes() {
-            let (old_size, old_payer, new_payer) = {
-                let inner = self.inner.read()?;
-                let (code, scope, table, primary) =
-                    inner.arena_keyval_cache.row_of(iterator).ok_or_else(|| {
-                        ChainError::InternalError(format!("invalid iterator {iterator}"))
-                    })?;
-                pulse_assert(
-                    code == self.receiver.as_u64(),
-                    ChainError::TransactionError(format!("db access violation")),
-                )?;
-                let (row_payer, value) = self
-                    .db
-                    .arena_kv_row(code, scope, table, primary)
-                    .ok_or_else(|| {
-                        ChainError::InternalError(format!(
-                            "arena has no row for iterator {iterator}"
-                        ))
-                    })?;
-                let new_payer = if payer == 0 { row_payer } else { payer };
-                let old_size = value.len() as i64;
-                self.db.update_key_value_object_standalone(
-                    code,
-                    scope,
-                    table,
-                    primary,
-                    new_payer,
-                    data.as_ref(),
-                )?;
-                (old_size, row_payer, new_payer)
-            };
-
-            let overhead = billable_size_v::<KeyValueObject>() as i64;
-            let old_size = old_size + overhead;
-            let new_size = new_size + overhead;
-            if old_payer != new_payer {
-                self.update_db_usage(&Name::new(old_payer), -old_size)?;
-                self.update_db_usage(&Name::new(new_payer), new_size)?;
-            } else if old_size != new_size {
-                self.update_db_usage(&Name::new(new_payer), new_size - old_size)?;
-            }
-            return Ok(());
-        }
-
-        // Arena-standalone: the contract's handle is the arena's, so resolve the
-        // row's key from the arena cache and re-find the chainbase row by key to
-        // keep the oracle's state in sync (update_key_value_object mirrors into the
-        // arena). The access-violation check reads the code straight off the key.
-        if self.db.arena_standalone_reads() {
-            let (old_size, old_payer, new_payer) = {
-                let mut inner = self.inner.write()?;
-                let (code, scope, table, primary) =
-                    inner.arena_keyval_cache.row_of(iterator).ok_or_else(|| {
-                        ChainError::InternalError(format!("invalid iterator {iterator}"))
-                    })?;
-                pulse_assert(
-                    code == self.receiver.as_u64(),
-                    ChainError::TransactionError(format!("db access violation")),
-                )?;
-                let cb_handle =
-                    self.db
-                        .db_find_i64(code, scope, table, primary, &mut inner.keyval_cache)?;
-                let obj = inner.keyval_cache.get(cb_handle)?;
-                let old_payer = obj.get_payer().to_uint64_t();
-                let new_payer = if payer == 0 {
-                    obj.get_payer().to_uint64_t()
-                } else {
-                    payer
-                };
-                let old_size = obj.get_value().size() as i64;
-                self.db
-                    .update_key_value_object(obj, new_payer, data.as_ref())?;
-                (old_size, old_payer, new_payer)
-            };
-
-            let overhead = billable_size_v::<KeyValueObject>() as i64;
-            let old_size = old_size + overhead;
-            let new_size = new_size + overhead;
-            if old_payer != new_payer {
-                self.update_db_usage(&Name::new(old_payer), -old_size)?;
-                self.update_db_usage(&Name::new(new_payer), new_size)?;
-            } else if old_size != new_size {
-                self.update_db_usage(&Name::new(new_payer), new_size - old_size)?;
-            }
-            return Ok(());
-        }
-
+        // The handle is the arena's; resolve the row's key and old (payer, value)
+        // from the arena and rewrite it there alone. The RAM delta is authored
+        // entirely from arena state.
         let (old_size, old_payer, new_payer) = {
             let inner = self.inner.read()?;
-            let obj = inner.keyval_cache.get(iterator)?;
-            let table_obj = inner.keyval_cache.get_table(obj.get_table_id())?;
+            let (code, scope, table, primary) = inner
+                .arena_keyval_cache
+                .row_of(iterator)
+                .ok_or_else(|| ChainError::InternalError(format!("invalid iterator {iterator}")))?;
             pulse_assert(
-                table_obj.get_code().to_uint64_t() == self.receiver.as_u64(),
-                ChainError::TransactionError(format!("db access violation",)),
+                code == self.receiver.as_u64(),
+                ChainError::TransactionError(format!("db access violation")),
             )?;
-            let old_payer = obj.get_payer().to_uint64_t();
-            let new_payer = if payer == 0 {
-                obj.get_payer().to_uint64_t()
-            } else {
-                payer
-            };
-            let old_size = obj.get_value().size() as i64;
-            self.db
-                .update_key_value_object(obj, new_payer, data.as_ref())?;
-            (old_size, old_payer, new_payer)
+            let (row_payer, value) = self
+                .db
+                .arena_kv_row(code, scope, table, primary)
+                .ok_or_else(|| {
+                    ChainError::InternalError(format!("arena has no row for iterator {iterator}"))
+                })?;
+            let new_payer = if payer == 0 { row_payer } else { payer };
+            let old_size = value.len() as i64;
+            self.db.update_key_value_object_standalone(
+                code,
+                scope,
+                table,
+                primary,
+                new_payer,
+                data.as_ref(),
+            )?;
+            (old_size, row_payer, new_payer)
         };
 
         let overhead = billable_size_v::<KeyValueObject>() as i64;
         let old_size = old_size + overhead;
         let new_size = new_size + overhead;
-
         if old_payer != new_payer {
             self.update_db_usage(&Name::new(old_payer), -old_size)?;
             self.update_db_usage(&Name::new(new_payer), new_size)?;
         } else if old_size != new_size {
             self.update_db_usage(&Name::new(new_payer), new_size - old_size)?;
         }
-
         Ok(())
     }
 
@@ -878,63 +661,20 @@ impl ApplyContext {
     ) -> Result<i32, ChainError> {
         let inner = self.inner.read()?;
 
-        // Arena-standalone read path: resolve the value entirely from the arena,
-        // never touching chainbase's keyval_cache or the per-read cross-check. The
-        // arena mints the same iterator handles as chainbase (verified in the
-        // default mode), so the contract's handle resolves directly against the
-        // arena cache. Correctness here rests on the block-boundary full-state root
-        // check rather than the inline comparison.
-        if self.db.arena_standalone_reads() {
-            let (code, scope, table, primary) = inner
-                .arena_keyval_cache
-                .row_of(iterator)
-                .ok_or_else(|| ChainError::InternalError(format!("invalid iterator {iterator}")))?;
-            let value = self
-                .db
-                .arena_kv_get(code, scope, table, primary)
-                .ok_or_else(|| {
-                    ChainError::InternalError(format!("arena has no row for iterator {iterator}"))
-                })?;
-            let s = value.len();
-            if buffer_size == 0 {
-                return Ok(s as i32);
-            }
-            let copy_size = core::cmp::min(buffer_size, s);
-            if buffer.len() < copy_size {
-                buffer.resize(copy_size, 0);
-            }
-            buffer[..copy_size].copy_from_slice(&value[..copy_size]);
-            return Ok(copy_size as i32);
-        }
-
-        let obj = inner.keyval_cache.get(iterator)?;
-
-        // Inline read cross-check: the arena must serve this contract read — the
-        // exact bytes at the exact key, at this point mid-execution (speculative,
-        // pre-commit) — identically to chainbase. Stronger than the block-boundary
-        // root diff, which only sees committed state. When the cutover switch is
-        // on, the value the contract receives comes FROM the arena.
-        let arena_value: Option<Vec<u8>> = {
-            let table_obj = inner.keyval_cache.get_table(obj.get_table_id())?;
-            let code = table_obj.get_code().to_uint64_t();
-            let scope = table_obj.get_scope().to_uint64_t();
-            let table = table_obj.get_table().to_uint64_t();
-            let primary = obj.get_primary_key();
-            self.db
-                .arena_crosscheck_kv(code, scope, table, primary, obj.get_value().as_slice());
-            if self.db.arena_reads_enabled() {
-                self.db.arena_kv_get(code, scope, table, primary)
-            } else {
-                None
-            }
-        };
-
-        let cb_value = obj.get_value();
-        let source: &[u8] = arena_value
-            .as_deref()
-            .unwrap_or_else(|| cb_value.as_slice());
-
-        let s = source.len();
+        // Resolve the value entirely from the arena. The arena mints the same
+        // iterator handles chainbase did, so the contract's handle resolves
+        // directly against the arena cache.
+        let (code, scope, table, primary) = inner
+            .arena_keyval_cache
+            .row_of(iterator)
+            .ok_or_else(|| ChainError::InternalError(format!("invalid iterator {iterator}")))?;
+        let value = self
+            .db
+            .arena_kv_get(code, scope, table, primary)
+            .ok_or_else(|| {
+                ChainError::InternalError(format!("arena has no row for iterator {iterator}"))
+            })?;
+        let s = value.len();
         if buffer_size == 0 {
             return Ok(s as i32);
         }
@@ -942,264 +682,107 @@ impl ApplyContext {
         if buffer.len() < copy_size {
             buffer.resize(copy_size, 0);
         }
-        buffer[..copy_size].copy_from_slice(&source[..copy_size]);
+        buffer[..copy_size].copy_from_slice(&value[..copy_size]);
         Ok(copy_size as i32)
     }
 
     pub fn db_remove_i64(&mut self, iterator: i32) -> Result<(), ChainError> {
-        // Arena-standalone writes: resolve the row's key and value from the arena,
-        // remove it there alone (which auto-removes the table when it empties, as
-        // chainbase does), and reclaim the same RAM chainbase would. The delta
-        // matches the C++ db_remove_i64: -(value + key_value_object overhead).
-        if self.db.arena_standalone_writes() {
-            let delta = {
-                let mut inner = self.inner.write()?;
-                let (code, scope, table, primary) =
-                    inner.arena_keyval_cache.row_of(iterator).ok_or_else(|| {
-                        ChainError::InternalError(format!("invalid iterator {iterator}"))
-                    })?;
-                pulse_assert(
-                    code == self.receiver.as_u64(),
-                    ChainError::TransactionError(format!("db access violation")),
-                )?;
-                let (_payer, value) = self
-                    .db
-                    .arena_kv_row(code, scope, table, primary)
-                    .ok_or_else(|| {
-                        ChainError::InternalError(format!(
-                            "arena has no row for iterator {iterator}"
-                        ))
-                    })?;
-                let delta = -(value.len() as i64 + billable_size_v::<KeyValueObject>() as i64);
-                self.db
-                    .remove_key_value_object_standalone(code, scope, table, primary)?;
-                inner.arena_keyval_cache.remove(iterator);
-                delta
-            };
-            self.update_db_usage(&Name::new(self.receiver.as_u64()), -delta)?;
-            return Ok(());
-        }
-
+        // Resolve the row's key and value from the arena, remove it there alone
+        // (which auto-removes the table when it empties, as chainbase did), and
+        // reclaim the same RAM. The delta matches the C++ db_remove_i64:
+        // -(value + key_value_object overhead).
         let delta = {
             let mut inner = self.inner.write()?;
-
-            // Arena-standalone: the handle is the arena's, so resolve its key and
-            // re-find the chainbase row to remove it by chainbase handle (which
-            // mirrors the arena removal by key), then tombstone the arena handle.
-            let standalone_delta: Option<i64> = if self.db.arena_standalone_reads() {
-                let (code, scope, table, primary) =
-                    inner.arena_keyval_cache.row_of(iterator).ok_or_else(|| {
-                        ChainError::InternalError(format!("invalid iterator {iterator}"))
-                    })?;
-                let cb_handle =
-                    self.db
-                        .db_find_i64(code, scope, table, primary, &mut inner.keyval_cache)?;
-                let delta = self.db.db_remove_i64(
-                    &mut inner.keyval_cache,
-                    cb_handle,
-                    self.receiver.as_u64(),
-                )?;
-                inner.arena_keyval_cache.remove(iterator);
-                Some(delta)
-            } else {
-                None
-            };
-
-            match standalone_delta {
-                Some(d) => d,
-                None => {
-                    let delta = self.db.db_remove_i64(
-                        &mut inner.keyval_cache,
-                        iterator,
-                        self.receiver.as_u64(),
-                    )?;
-                    inner.arena_keyval_cache.remove(iterator);
-                    delta
-                }
-            }
+            let (code, scope, table, primary) = inner
+                .arena_keyval_cache
+                .row_of(iterator)
+                .ok_or_else(|| ChainError::InternalError(format!("invalid iterator {iterator}")))?;
+            pulse_assert(
+                code == self.receiver.as_u64(),
+                ChainError::TransactionError(format!("db access violation")),
+            )?;
+            let (_payer, value) = self
+                .db
+                .arena_kv_row(code, scope, table, primary)
+                .ok_or_else(|| {
+                    ChainError::InternalError(format!("arena has no row for iterator {iterator}"))
+                })?;
+            let delta = -(value.len() as i64 + billable_size_v::<KeyValueObject>() as i64);
+            self.db
+                .remove_key_value_object_standalone(code, scope, table, primary)?;
+            inner.arena_keyval_cache.remove(iterator);
+            delta
         };
-
         self.update_db_usage(&Name::new(self.receiver.as_u64()), -delta)?;
-
         Ok(())
     }
 
     pub fn db_next_i64(&mut self, iterator: i32, primary: &mut u64) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
 
-        // Arena-standalone: advance to the successor via the arena's upper_bound of
-        // the current key; no successor lands on the table's end iterator.
-        if self.db.arena_standalone_reads() {
-            if let Some((code, scope, table, cur_pk)) = inner.arena_keyval_cache.row_of(iterator) {
-                return Ok(
-                    match self.db.arena_kv_upper_bound(code, scope, table, cur_pk) {
-                        Some(pk) => {
-                            *primary = pk;
-                            inner.arena_keyval_cache.add((code, scope, table, pk))
-                        }
-                        None => inner.arena_keyval_cache.cache_table((code, scope, table)),
-                    },
-                );
-            }
-            // db_next from an end iterator has no successor: stay put.
-            return Ok(iterator);
+        // Advance to the successor via the arena's upper_bound of the current key;
+        // no successor lands on the table's end iterator.
+        if let Some((code, scope, table, cur_pk)) = inner.arena_keyval_cache.row_of(iterator) {
+            return Ok(
+                match self.db.arena_kv_upper_bound(code, scope, table, cur_pk) {
+                    Some(pk) => {
+                        *primary = pk;
+                        inner.arena_keyval_cache.add((code, scope, table, pk))
+                    }
+                    None => inner.arena_keyval_cache.cache_table((code, scope, table)),
+                },
+            );
         }
-
-        // The cursor's current key, for the arena successor cross-check. `None`
-        // if `iterator` is an end iterator (no backing row) — then we leave
-        // chainbase's answer untouched.
-        let cur = current_iter_key(&inner.keyval_cache, iterator);
-
-        let res = self
-            .db
-            .db_next_i64(&mut inner.keyval_cache, iterator, primary)?;
-
-        // db_next advances to the smallest primary > current: the arena's
-        // upper_bound of the current key. res < 0 means chainbase hit the end,
-        // so the arena must have no successor. Serve the arena's primary when
-        // the cutover switch is on.
-        if let Some((code, scope, table, cur_pk)) = cur {
-            let arena_next = self.db.arena_kv_upper_bound(code, scope, table, cur_pk);
-            let ffi_next = if res >= 0 { Some(*primary) } else { None };
-            self.db.arena_note_pos(arena_next == ffi_next);
-
-            // The handle db_next lands on: the successor row's, or the table's
-            // end iterator when there is none.
-            let arena_h = if res >= 0 {
-                match arena_next {
-                    Some(pk) => inner.arena_keyval_cache.add((code, scope, table, pk)),
-                    None => res, // position check already flagged this divergence
-                }
-            } else {
-                inner.arena_keyval_cache.cache_table((code, scope, table))
-            };
-            self.note_iter_handle("iter", code, scope, table, arena_h, res);
-
-            if self.db.arena_reads_enabled()
-                && res >= 0
-                && let Some(an) = arena_next
-            {
-                *primary = an;
-            }
-        }
-
-        Ok(res)
+        // db_next from an end iterator has no successor: stay put.
+        Ok(iterator)
     }
 
     pub fn db_previous_i64(&mut self, iterator: i32, primary: &mut u64) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
 
-        // Arena-standalone: from a live row, step to its arena predecessor; from an
-        // end iterator, to the table's last row. No predecessor returns -1
-        // (db_previous never lands on an end iterator).
-        if self.db.arena_standalone_reads() {
-            let landing =
-                match inner.arena_keyval_cache.row_of(iterator) {
-                    Some((code, scope, table, cur_pk)) => Some((
+        // From a live row, step to its arena predecessor; from an end iterator, to
+        // the table's last row. No predecessor returns -1 (db_previous never lands
+        // on an end iterator).
+        let landing = match inner.arena_keyval_cache.row_of(iterator) {
+            Some((code, scope, table, cur_pk)) => Some((
+                code,
+                scope,
+                table,
+                self.db.arena_kv_prev(code, scope, table, cur_pk),
+            )),
+            None => inner
+                .arena_keyval_cache
+                .table_of_end(iterator)
+                .map(|(code, scope, table)| {
+                    (
                         code,
                         scope,
                         table,
-                        self.db.arena_kv_prev(code, scope, table, cur_pk),
-                    )),
-                    None => inner.arena_keyval_cache.table_of_end(iterator).map(
-                        |(code, scope, table)| {
-                            (
-                                code,
-                                scope,
-                                table,
-                                self.db.arena_kv_last(code, scope, table),
-                            )
-                        },
-                    ),
-                };
-            let Some((code, scope, table, prev)) = landing else {
-                return Ok(-1);
-            };
-            return Ok(match prev {
-                Some(pk) => {
-                    *primary = pk;
-                    inner.arena_keyval_cache.add((code, scope, table, pk))
-                }
-                None => -1,
-            });
-        }
-
-        // From a live row: predecessor = arena `prev` of its key. From an end
-        // iterator (the db_end -> db_previous backward-iteration entry): the
-        // table's last row = arena `kv_last`.
-        let arena_ctx: Option<((u64, u64, u64), Option<u64>)> =
-            match current_iter_key(&inner.keyval_cache, iterator) {
-                Some((code, scope, table, cur_pk)) => Some((
-                    (code, scope, table),
-                    self.db.arena_kv_prev(code, scope, table, cur_pk),
-                )),
-                None => {
-                    end_iter_table(&inner.keyval_cache, iterator).map(|(code, scope, table)| {
-                        (
-                            (code, scope, table),
-                            self.db.arena_kv_last(code, scope, table),
-                        )
-                    })
-                }
-            };
-
-        let res = self
-            .db
-            .db_previous_i64(&mut inner.keyval_cache, iterator, primary)?;
-
-        if let Some(((code, scope, table), arena_prev)) = arena_ctx {
-            let ffi_prev = if res >= 0 { Some(*primary) } else { None };
-            self.db.arena_note_pos(arena_prev == ffi_prev);
-
-            // db_previous lands on the predecessor row, or -1 when there is none
-            // (it never returns an end iterator).
-            let arena_h = if res >= 0 {
-                match arena_prev {
-                    Some(pk) => inner.arena_keyval_cache.add((code, scope, table, pk)),
-                    None => res, // position check already flagged this divergence
-                }
-            } else {
-                -1
-            };
-            self.note_iter_handle("iter", code, scope, table, arena_h, res);
-
-            if self.db.arena_reads_enabled()
-                && res >= 0
-                && let Some(ap) = arena_prev
-            {
-                *primary = ap;
+                        self.db.arena_kv_last(code, scope, table),
+                    )
+                }),
+        };
+        let Some((code, scope, table, prev)) = landing else {
+            return Ok(-1);
+        };
+        Ok(match prev {
+            Some(pk) => {
+                *primary = pk;
+                inner.arena_keyval_cache.add((code, scope, table, pk))
             }
-        }
-
-        Ok(res)
+            None => -1,
+        })
     }
 
     pub fn db_end_i64(&mut self, code: u64, scope: u64, table: u64) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
 
-        // Arena-standalone: a present table has an end iterator, an absent one is -1.
-        if self.db.arena_standalone_reads() {
-            return Ok(if self.db.arena_kv_table_exists(code, scope, table) {
-                inner.arena_keyval_cache.cache_table((code, scope, table))
-            } else {
-                -1
-            });
-        }
-
-        let res = self
-            .db
-            .db_end_i64(&mut inner.keyval_cache, code, scope, table)?;
-
-        {
-            let arena_h = if res == -1 {
-                -1
-            } else {
-                inner.arena_keyval_cache.cache_table((code, scope, table))
-            };
-            self.note_iter_handle("iter", code, scope, table, arena_h, res);
-        }
-
-        Ok(res)
+        // A present table has an end iterator, an absent one is -1.
+        Ok(if self.db.arena_kv_table_exists(code, scope, table) {
+            inner.arena_keyval_cache.cache_table((code, scope, table))
+        } else {
+            -1
+        })
     }
 
     pub fn db_lowerbound_i64(
@@ -1211,48 +794,17 @@ impl ApplyContext {
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
 
-        // Arena-standalone: smallest primary >= key from the arena; none lands on
-        // the end iterator; an absent table is -1.
-        if self.db.arena_standalone_reads() {
-            if !self.db.arena_kv_table_exists(code, scope, table) {
-                return Ok(-1);
-            }
-            return Ok(
-                match self.db.arena_kv_lower_bound(code, scope, table, primary) {
-                    Some(pk) => inner.arena_keyval_cache.add((code, scope, table, pk)),
-                    None => inner.arena_keyval_cache.cache_table((code, scope, table)),
-                },
-            );
+        // Smallest primary >= key from the arena; none lands on the end iterator;
+        // an absent table is -1.
+        if !self.db.arena_kv_table_exists(code, scope, table) {
+            return Ok(-1);
         }
-
-        let res =
-            self.db
-                .db_lowerbound_i64(&mut inner.keyval_cache, code, scope, table, primary)?;
-
-        // Cross-check both the primary the iterator lands on and the handle
-        // index the arena would mint for it.
-        {
-            let ffi_landing = landing_primary(&inner.keyval_cache, res);
-            let arena_landing = self.db.arena_kv_lower_bound(code, scope, table, primary);
-            self.db.arena_note_pos(ffi_landing == arena_landing);
-
-            let arena_h = if res == -1 {
-                -1
-            } else {
-                let end = inner.arena_keyval_cache.cache_table((code, scope, table));
-                if res >= 0 {
-                    match arena_landing {
-                        Some(pk) => inner.arena_keyval_cache.add((code, scope, table, pk)),
-                        None => res,
-                    }
-                } else {
-                    end
-                }
-            };
-            self.note_iter_handle("bound", code, scope, table, arena_h, res);
-        }
-
-        Ok(res)
+        Ok(
+            match self.db.arena_kv_lower_bound(code, scope, table, primary) {
+                Some(pk) => inner.arena_keyval_cache.add((code, scope, table, pk)),
+                None => inner.arena_keyval_cache.cache_table((code, scope, table)),
+            },
+        )
     }
 
     pub fn db_upperbound_i64(
@@ -1264,46 +816,17 @@ impl ApplyContext {
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
 
-        // Arena-standalone: smallest primary > key from the arena; none lands on
-        // the end iterator; an absent table is -1.
-        if self.db.arena_standalone_reads() {
-            if !self.db.arena_kv_table_exists(code, scope, table) {
-                return Ok(-1);
-            }
-            return Ok(
-                match self.db.arena_kv_upper_bound(code, scope, table, primary) {
-                    Some(pk) => inner.arena_keyval_cache.add((code, scope, table, pk)),
-                    None => inner.arena_keyval_cache.cache_table((code, scope, table)),
-                },
-            );
+        // Smallest primary > key from the arena; none lands on the end iterator;
+        // an absent table is -1.
+        if !self.db.arena_kv_table_exists(code, scope, table) {
+            return Ok(-1);
         }
-
-        let res =
-            self.db
-                .db_upperbound_i64(&mut inner.keyval_cache, code, scope, table, primary)?;
-
-        {
-            let ffi_landing = landing_primary(&inner.keyval_cache, res);
-            let arena_landing = self.db.arena_kv_upper_bound(code, scope, table, primary);
-            self.db.arena_note_pos(ffi_landing == arena_landing);
-
-            let arena_h = if res == -1 {
-                -1
-            } else {
-                let end = inner.arena_keyval_cache.cache_table((code, scope, table));
-                if res >= 0 {
-                    match arena_landing {
-                        Some(pk) => inner.arena_keyval_cache.add((code, scope, table, pk)),
-                        None => res,
-                    }
-                } else {
-                    end
-                }
-            };
-            self.note_iter_handle("bound", code, scope, table, arena_h, res);
-        }
-
-        Ok(res)
+        Ok(
+            match self.db.arena_kv_upper_bound(code, scope, table, primary) {
+                Some(pk) => inner.arena_keyval_cache.add((code, scope, table, pk)),
+                None => inner.arena_keyval_cache.cache_table((code, scope, table)),
+            },
+        )
     }
 
     pub fn db_idx64_store(
@@ -1314,75 +837,34 @@ impl ApplyContext {
         primary_key: u64,
         secondary_key: u64,
     ) -> Result<i32, ChainError> {
-        let table_name = table;
-
-        // Arena-standalone writes: author the table (billing it if new) and the
-        // index row in the arena alone, no chainbase IndexObject pointer.
-        if self.db.arena_standalone_writes() {
-            pulse_assert(
-                payer != 0,
-                ChainError::TransactionError(format!(
-                    "must specify a valid account to pay for new record"
-                )),
-            )?;
-            let code = self.receiver.as_u64();
-            if !self.db.arena_table_exists(code, scope, table) {
-                self.update_db_usage(&payer.into(), billable_size_v::<TableObject>() as i64)?;
-            }
-            self.db.create_index64_object_standalone(
-                code,
-                scope,
-                table,
-                payer,
-                primary_key,
-                secondary_key,
-            )?;
-            let res = {
-                let mut inner = self.inner.write()?;
-                inner.arena_index64_cache.cache_table((code, scope, table));
-                inner
-                    .arena_index64_cache
-                    .add((code, scope, table, primary_key))
-            };
-            self.update_db_usage(&payer.into(), billable_size_v::<Index64Object>() as i64)?;
-            return Ok(res);
-        }
-
-        let table = self.find_or_create_table(*self.receiver, scope, table, payer)?;
-        let table = unsafe { &*table };
         pulse_assert(
             payer != 0,
             ChainError::TransactionError(format!(
                 "must specify a valid account to pay for new record"
             )),
         )?;
-
+        // Author the table (billing it if new) and the index row in the arena
+        // alone, no chainbase IndexObject pointer.
+        let code = self.receiver.as_u64();
+        if !self.db.arena_table_exists(code, scope, table) {
+            self.update_db_usage(&payer.into(), billable_size_v::<TableObject>() as i64)?;
+        }
+        self.db.create_index64_object_standalone(
+            code,
+            scope,
+            table,
+            payer,
+            primary_key,
+            secondary_key,
+        )?;
         let res = {
             let mut inner = self.inner.write()?;
-            let obj = self
-                .db
-                .create_index64_object(table, payer, primary_key, secondary_key)?;
-            let obj = unsafe { &*obj };
-            inner.index64_cache.cache_table(&table)?;
-            let handle = inner.index64_cache.add(obj)?;
-
-            {
-                let code = self.receiver.as_u64();
-                inner
-                    .arena_index64_cache
-                    .cache_table((code, scope, table_name));
-                let arena_h = inner
-                    .arena_index64_cache
-                    .add((code, scope, table_name, primary_key));
-                self.note_iter_handle("idx64:store", code, scope, table_name, arena_h, handle);
-            }
-
-            handle
+            inner.arena_index64_cache.cache_table((code, scope, table));
+            inner
+                .arena_index64_cache
+                .add((code, scope, table, primary_key))
         };
-
-        let billable_size = billable_size_v::<Index64Object>() as i64;
-        self.update_db_usage(&payer.into(), billable_size)?;
-
+        self.update_db_usage(&payer.into(), billable_size_v::<Index64Object>() as i64)?;
         Ok(res)
     }
 
@@ -1395,109 +877,55 @@ impl ApplyContext {
         let payer = payer.as_u64();
         let billing_size = billable_size_v::<Index64Object>() as i64;
 
-        // Arena-standalone writes: resolve the row and old payer from the arena
-        // and re-point it there alone.
-        if self.db.arena_standalone_writes() {
-            let (old_payer, new_payer) = {
-                let inner = self.inner.read()?;
-                let (code, scope, table, primary) =
-                    inner.arena_index64_cache.row_of(iterator).ok_or_else(|| {
-                        ChainError::InternalError(format!("invalid iterator {iterator}"))
-                    })?;
-                pulse_assert(
-                    code == self.receiver.as_u64(),
-                    ChainError::TransactionError(format!("db access violation")),
-                )?;
-                let old_payer = self
-                    .db
-                    .arena_idx64_payer(code, scope, table, primary)
-                    .ok_or_else(|| {
-                        ChainError::InternalError(format!("arena has no idx64 row for {iterator}"))
-                    })?;
-                let new_payer = if payer == 0 { old_payer } else { payer };
-                self.db.update_index64_object_standalone(
-                    code, scope, table, primary, new_payer, secondary,
-                )?;
-                (old_payer, new_payer)
-            };
-            if old_payer != new_payer {
-                self.update_db_usage(&Name::new(old_payer), -billing_size)?;
-                self.update_db_usage(&Name::new(new_payer), billing_size)?;
-            }
-            return Ok(());
-        }
-
+        // Resolve the row and old payer from the arena and re-point it there alone.
         let (old_payer, new_payer) = {
             let inner = self.inner.read()?;
-            let obj = inner.index64_cache.get(iterator)?;
-            let table_obj = inner.index64_cache.get_table(obj.get_table_id())?;
+            let (code, scope, table, primary) = inner
+                .arena_index64_cache
+                .row_of(iterator)
+                .ok_or_else(|| ChainError::InternalError(format!("invalid iterator {iterator}")))?;
             pulse_assert(
-                table_obj.get_code().to_uint64_t() == self.receiver.as_u64(),
-                ChainError::TransactionError(format!("db access violation",)),
+                code == self.receiver.as_u64(),
+                ChainError::TransactionError(format!("db access violation")),
             )?;
-            let old_payer = obj.get_payer().to_uint64_t();
-            let new_payer = if payer == 0 {
-                obj.get_payer().to_uint64_t()
-            } else {
-                payer
-            };
-            self.db.update_index64_object(obj, new_payer, secondary)?;
-            // Re-point the arena row's secondary/payer too; the FFI update only
-            // touches chainbase, so an arena-served read would otherwise be stale.
-            self.db.arena_update_index64(
-                table_obj.get_code().to_uint64_t(),
-                table_obj.get_scope().to_uint64_t(),
-                table_obj.get_table().to_uint64_t(),
-                obj.get_primary_key(),
-                new_payer,
-                secondary,
-            );
+            let old_payer = self
+                .db
+                .arena_idx64_payer(code, scope, table, primary)
+                .ok_or_else(|| {
+                    ChainError::InternalError(format!("arena has no idx64 row for {iterator}"))
+                })?;
+            let new_payer = if payer == 0 { old_payer } else { payer };
+            self.db.update_index64_object_standalone(
+                code, scope, table, primary, new_payer, secondary,
+            )?;
             (old_payer, new_payer)
         };
-
         if old_payer != new_payer {
             self.update_db_usage(&Name::new(old_payer), -billing_size)?;
             self.update_db_usage(&Name::new(new_payer), billing_size)?;
         }
-
         Ok(())
     }
 
     pub fn db_idx64_remove(&mut self, iterator: i32) -> Result<(), ChainError> {
-        if self.db.arena_standalone_writes() {
-            {
-                let mut inner = self.inner.write()?;
-                let (code, scope, table, primary) =
-                    inner.arena_index64_cache.row_of(iterator).ok_or_else(|| {
-                        ChainError::InternalError(format!("invalid iterator {iterator}"))
-                    })?;
-                pulse_assert(
-                    code == self.receiver.as_u64(),
-                    ChainError::TransactionError(format!("db access violation")),
-                )?;
-                self.db
-                    .remove_index64_object_standalone(code, scope, table, primary)?;
-                inner.arena_index64_cache.remove(iterator);
-            }
-            self.update_db_usage(
-                &Name::new(self.receiver.as_u64()),
-                -(billable_size_v::<Index64Object>() as i64),
-            )?;
-            return Ok(());
-        }
-
         {
             let mut inner = self.inner.write()?;
+            let (code, scope, table, primary) = inner
+                .arena_index64_cache
+                .row_of(iterator)
+                .ok_or_else(|| ChainError::InternalError(format!("invalid iterator {iterator}")))?;
+            pulse_assert(
+                code == self.receiver.as_u64(),
+                ChainError::TransactionError(format!("db access violation")),
+            )?;
             self.db
-                .db_idx64_remove(&mut inner.index64_cache, iterator, self.receiver.as_u64())?;
+                .remove_index64_object_standalone(code, scope, table, primary)?;
             inner.arena_index64_cache.remove(iterator);
         }
-
         self.update_db_usage(
             &Name::new(self.receiver.as_u64()),
             -(billable_size_v::<Index64Object>() as i64),
         )?;
-
         Ok(())
     }
 
@@ -1510,41 +938,20 @@ impl ApplyContext {
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        let res = self.db.db_idx64_find_secondary(
-            &mut inner.index64_cache,
-            code,
-            scope,
-            table,
-            secondary,
-            primary,
-        )?;
-
-        // Arena answers the same secondary lookup: found -> the same primary,
-        // not-found -> both agree there's no match. Serve the primary when the
-        // cutover switch is on.
-        {
-            let arena = self
-                .db
-                .arena_idx64_find_secondary(code, scope, table, secondary);
-            let ffi = if res >= 0 { Some(*primary) } else { None };
-            self.db.arena_note_pos(arena == ffi);
-            if self.db.arena_reads_enabled()
-                && res >= 0
-                && let Some(p) = arena
-            {
+        let arena = self
+            .db
+            .arena_idx64_find_secondary(code, scope, table, secondary);
+        let res = match arena {
+            Some(p) => {
                 *primary = p;
+                inner.arena_index64_cache.cache_table((code, scope, table));
+                inner.arena_index64_cache.add((code, scope, table, p))
             }
-            self.note_secondary_handle(
-                &mut inner.arena_index64_cache,
-                "idx64:find_sec",
-                code,
-                scope,
-                table,
-                *primary,
-                res,
-            );
-        }
-
+            None if self.db.arena_table_exists(code, scope, table) => {
+                inner.arena_index64_cache.cache_table((code, scope, table))
+            }
+            None => -1,
+        };
         Ok(res)
     }
 
@@ -1557,38 +964,20 @@ impl ApplyContext {
         primary: u64,
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        let res = self.db.db_idx64_find_primary(
-            &mut inner.index64_cache,
-            code,
-            scope,
-            table,
-            secondary,
-            primary,
-        )?;
-
-        {
-            let arena = self
-                .db
-                .arena_idx64_find_primary(code, scope, table, primary);
-            let ffi = if res >= 0 { Some(*secondary) } else { None };
-            self.db.arena_note_pos(arena == ffi);
-            if self.db.arena_reads_enabled()
-                && res >= 0
-                && let Some(s) = arena
-            {
+        let arena = self
+            .db
+            .arena_idx64_find_primary(code, scope, table, primary);
+        let res = match arena {
+            Some(s) => {
                 *secondary = s;
+                inner.arena_index64_cache.cache_table((code, scope, table));
+                inner.arena_index64_cache.add((code, scope, table, primary))
             }
-            self.note_secondary_handle(
-                &mut inner.arena_index64_cache,
-                "idx64:find_pri",
-                code,
-                scope,
-                table,
-                primary,
-                res,
-            );
-        }
-
+            None if self.db.arena_table_exists(code, scope, table) => {
+                inner.arena_index64_cache.cache_table((code, scope, table))
+            }
+            None => -1,
+        };
         Ok(res)
     }
 
@@ -1604,43 +993,19 @@ impl ApplyContext {
         // way out, so capture it before the FFI overwrites it.
         let search = *secondary;
         let mut inner = self.inner.write()?;
-        let res = self.db.db_idx64_lowerbound(
-            &mut inner.index64_cache,
-            code,
-            scope,
-            table,
-            secondary,
-            primary,
-        )?;
-
-        // lowerbound/upperbound land on a row and write BOTH its secondary and
-        // primary; the arena must reproduce the pair (or agree on the end).
-        {
-            let arena = self.db.arena_idx64_lower_bound(code, scope, table, search);
-            let ffi = if res >= 0 {
-                Some((*primary, *secondary))
-            } else {
-                None
-            };
-            self.db.arena_note_pos(arena == ffi);
-            if self.db.arena_reads_enabled()
-                && res >= 0
-                && let Some((p, s)) = arena
-            {
+        let arena = self.db.arena_idx64_lower_bound(code, scope, table, search);
+        let res = match arena {
+            Some((p, s)) => {
                 *primary = p;
                 *secondary = s;
+                inner.arena_index64_cache.cache_table((code, scope, table));
+                inner.arena_index64_cache.add((code, scope, table, p))
             }
-            self.note_secondary_handle(
-                &mut inner.arena_index64_cache,
-                "idx64:lb",
-                code,
-                scope,
-                table,
-                *primary,
-                res,
-            );
-        }
-
+            None if self.db.arena_table_exists(code, scope, table) => {
+                inner.arena_index64_cache.cache_table((code, scope, table))
+            }
+            None => -1,
+        };
         Ok(res)
     }
 
@@ -1654,93 +1019,52 @@ impl ApplyContext {
     ) -> Result<i32, ChainError> {
         let search = *secondary;
         let mut inner = self.inner.write()?;
-        let res = self.db.db_idx64_upperbound(
-            &mut inner.index64_cache,
-            code,
-            scope,
-            table,
-            secondary,
-            primary,
-        )?;
-
-        {
-            let arena = self.db.arena_idx64_upper_bound(code, scope, table, search);
-            let ffi = if res >= 0 {
-                Some((*primary, *secondary))
-            } else {
-                None
-            };
-            self.db.arena_note_pos(arena == ffi);
-            if self.db.arena_reads_enabled()
-                && res >= 0
-                && let Some((p, s)) = arena
-            {
+        let arena = self.db.arena_idx64_upper_bound(code, scope, table, search);
+        let res = match arena {
+            Some((p, s)) => {
                 *primary = p;
                 *secondary = s;
+                inner.arena_index64_cache.cache_table((code, scope, table));
+                inner.arena_index64_cache.add((code, scope, table, p))
             }
-            self.note_secondary_handle(
-                &mut inner.arena_index64_cache,
-                "idx64:ub",
-                code,
-                scope,
-                table,
-                *primary,
-                res,
-            );
-        }
-
+            None if self.db.arena_table_exists(code, scope, table) => {
+                inner.arena_index64_cache.cache_table((code, scope, table))
+            }
+            None => -1,
+        };
         Ok(res)
     }
 
     pub fn db_idx64_end(&mut self, code: u64, scope: u64, table: u64) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        let res = self
-            .db
-            .db_idx64_end(&mut inner.index64_cache, code, scope, table)?;
-
         // The end iterator equals the table's cached end handle, or -1 when the
         // table is absent.
-        {
-            let arena_h = if res == -1 {
-                -1
-            } else {
-                inner.arena_index64_cache.cache_table((code, scope, table))
-            };
-            self.note_iter_handle("idx64:end", code, scope, table, arena_h, res);
-        }
-
+        let res = if self.db.arena_table_exists(code, scope, table) {
+            inner.arena_index64_cache.cache_table((code, scope, table))
+        } else {
+            -1
+        };
         Ok(res)
     }
 
     pub fn db_idx64_next(&mut self, iterator: i32, primary: &mut u64) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        let res = self
-            .db
-            .db_idx64_next(&mut inner.index64_cache, iterator, primary)?;
-
-        // Advance the arena twin in secondary order: past-the-end stays -1, a
-        // successor in the same table adds its row handle, and falling off the end
-        // lands on the table's end iterator. The written primary is cross-checked
-        // against the arena's successor too.
-        {
-            let arena_h = if iterator < -1 {
-                -1
-            } else if let Some((code, scope, table, cur)) =
-                inner.arena_index64_cache.row_of(iterator)
-            {
-                match self.db.arena_idx64_next(code, scope, table, cur) {
-                    Some((np, _)) => {
-                        self.db.arena_note_pos(res < 0 || np == *primary);
-                        inner.arena_index64_cache.add((code, scope, table, np))
-                    }
-                    None => inner.arena_index64_cache.cache_table((code, scope, table)),
+        // Advance in secondary order: past-the-end stays -1, a successor in the
+        // same table adds its row handle, and falling off the end lands on the
+        // table's end iterator.
+        let res = if iterator < -1 {
+            -1
+        } else if let Some((code, scope, table, cur)) = inner.arena_index64_cache.row_of(iterator) {
+            match self.db.arena_idx64_next(code, scope, table, cur) {
+                Some((np, _)) => {
+                    *primary = np;
+                    inner.arena_index64_cache.add((code, scope, table, np))
                 }
-            } else {
-                res
-            };
-            self.note_iter_handle("idx64:next", 0, 0, 0, arena_h, res);
-        }
-
+                None => inner.arena_index64_cache.cache_table((code, scope, table)),
+            }
+        } else {
+            -1
+        };
         Ok(res)
     }
 
@@ -1750,40 +1074,30 @@ impl ApplyContext {
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        let res = self
-            .db
-            .db_idx64_previous(&mut inner.index64_cache, iterator, primary)?;
-
-        // Retreat the arena twin: from an end iterator, land on the table's last
-        // row (or -1 if empty); from a live row, land on its predecessor (or -1 at
-        // the beginning). The written primary is cross-checked on a hit.
+        // Retreat in secondary order: from an end iterator, land on the table's
+        // last row (or -1 if empty); from a live row, land on its predecessor (or
+        // -1 at the beginning).
+        let res = if let Some((code, scope, table)) =
+            inner.arena_index64_cache.table_of_end(iterator)
         {
-            let arena_h = if let Some((code, scope, table)) =
-                inner.arena_index64_cache.table_of_end(iterator)
-            {
-                match self.db.arena_idx64_last(code, scope, table) {
-                    Some((lp, _)) => {
-                        self.db.arena_note_pos(res < 0 || lp == *primary);
-                        inner.arena_index64_cache.add((code, scope, table, lp))
-                    }
-                    None => -1,
+            match self.db.arena_idx64_last(code, scope, table) {
+                Some((lp, _)) => {
+                    *primary = lp;
+                    inner.arena_index64_cache.add((code, scope, table, lp))
                 }
-            } else if let Some((code, scope, table, cur)) =
-                inner.arena_index64_cache.row_of(iterator)
-            {
-                match self.db.arena_idx64_previous(code, scope, table, cur) {
-                    Some((pp, _)) => {
-                        self.db.arena_note_pos(res < 0 || pp == *primary);
-                        inner.arena_index64_cache.add((code, scope, table, pp))
-                    }
-                    None => -1,
+                None => -1,
+            }
+        } else if let Some((code, scope, table, cur)) = inner.arena_index64_cache.row_of(iterator) {
+            match self.db.arena_idx64_previous(code, scope, table, cur) {
+                Some((pp, _)) => {
+                    *primary = pp;
+                    inner.arena_index64_cache.add((code, scope, table, pp))
                 }
-            } else {
-                res
-            };
-            self.note_iter_handle("idx64:prev", 0, 0, 0, arena_h, res);
-        }
-
+                None => -1,
+            }
+        } else {
+            -1
+        };
         Ok(res)
     }
 
@@ -1795,74 +1109,32 @@ impl ApplyContext {
         primary_key: u64,
         secondary_key: u128,
     ) -> Result<i32, ChainError> {
-        let table_name = table;
-
-        if self.db.arena_standalone_writes() {
-            pulse_assert(
-                payer != 0,
-                ChainError::TransactionError(format!(
-                    "must specify a valid account to pay for new record"
-                )),
-            )?;
-            let code = self.receiver.as_u64();
-            if !self.db.arena_table_exists(code, scope, table) {
-                self.update_db_usage(&payer.into(), billable_size_v::<TableObject>() as i64)?;
-            }
-            self.db.create_index128_object_standalone(
-                code,
-                scope,
-                table,
-                payer,
-                primary_key,
-                secondary_key,
-            )?;
-            let res = {
-                let mut inner = self.inner.write()?;
-                inner.arena_index128_cache.cache_table((code, scope, table));
-                inner
-                    .arena_index128_cache
-                    .add((code, scope, table, primary_key))
-            };
-            self.update_db_usage(&payer.into(), billable_size_v::<Index128Object>() as i64)?;
-            return Ok(res);
-        }
-
-        let table = self.find_or_create_table(*self.receiver, scope, table, payer)?;
-        let table = unsafe { &*table };
         pulse_assert(
             payer != 0,
             ChainError::TransactionError(format!(
                 "must specify a valid account to pay for new record"
             )),
         )?;
-
+        let code = self.receiver.as_u64();
+        if !self.db.arena_table_exists(code, scope, table) {
+            self.update_db_usage(&payer.into(), billable_size_v::<TableObject>() as i64)?;
+        }
+        self.db.create_index128_object_standalone(
+            code,
+            scope,
+            table,
+            payer,
+            primary_key,
+            secondary_key,
+        )?;
         let res = {
             let mut inner = self.inner.write()?;
-            let obj = self
-                .db
-                .create_index128_object(table, payer, primary_key, secondary_key)?;
-            let obj = unsafe { &*obj };
-            inner.index128_cache.cache_table(&table)?;
-            let handle = inner.index128_cache.add(obj)?;
-
-            {
-                let code = self.receiver.as_u64();
-                inner
-                    .arena_index128_cache
-                    .cache_table((code, scope, table_name));
-                let arena_h =
-                    inner
-                        .arena_index128_cache
-                        .add((code, scope, table_name, primary_key));
-                self.note_iter_handle("idx128:store", code, scope, table_name, arena_h, handle);
-            }
-
-            handle
+            inner.arena_index128_cache.cache_table((code, scope, table));
+            inner
+                .arena_index128_cache
+                .add((code, scope, table, primary_key))
         };
-
-        let billable_size = billable_size_v::<Index128Object>() as i64;
-        self.update_db_usage(&payer.into(), billable_size)?;
-
+        self.update_db_usage(&payer.into(), billable_size_v::<Index128Object>() as i64)?;
         Ok(res)
     }
 
@@ -1875,108 +1147,54 @@ impl ApplyContext {
         let payer = payer.as_u64();
         let billing_size = billable_size_v::<Index128Object>() as i64;
 
-        if self.db.arena_standalone_writes() {
-            let (old_payer, new_payer) = {
-                let inner = self.inner.read()?;
-                let (code, scope, table, primary) =
-                    inner.arena_index128_cache.row_of(iterator).ok_or_else(|| {
-                        ChainError::InternalError(format!("invalid iterator {iterator}"))
-                    })?;
-                pulse_assert(
-                    code == self.receiver.as_u64(),
-                    ChainError::TransactionError(format!("db access violation")),
-                )?;
-                let old_payer = self
-                    .db
-                    .arena_idx128_payer(code, scope, table, primary)
-                    .ok_or_else(|| {
-                        ChainError::InternalError(format!("arena has no idx128 row for {iterator}"))
-                    })?;
-                let new_payer = if payer == 0 { old_payer } else { payer };
-                self.db.update_index128_object_standalone(
-                    code, scope, table, primary, new_payer, secondary,
-                )?;
-                (old_payer, new_payer)
-            };
-            if old_payer != new_payer {
-                self.update_db_usage(&Name::new(old_payer), -billing_size)?;
-                self.update_db_usage(&Name::new(new_payer), billing_size)?;
-            }
-            return Ok(());
-        }
-
         let (old_payer, new_payer) = {
             let inner = self.inner.read()?;
-            let obj = inner.index128_cache.get(iterator)?;
-            let table_obj = inner.index128_cache.get_table(obj.get_table_id())?;
+            let (code, scope, table, primary) = inner
+                .arena_index128_cache
+                .row_of(iterator)
+                .ok_or_else(|| ChainError::InternalError(format!("invalid iterator {iterator}")))?;
             pulse_assert(
-                table_obj.get_code().to_uint64_t() == self.receiver.as_u64(),
-                ChainError::TransactionError(format!("db access violation",)),
+                code == self.receiver.as_u64(),
+                ChainError::TransactionError(format!("db access violation")),
             )?;
-            let old_payer = obj.get_payer().to_uint64_t();
-            let new_payer = if payer == 0 {
-                obj.get_payer().to_uint64_t()
-            } else {
-                payer
-            };
-            self.db.update_index128_object(obj, new_payer, secondary)?;
-            self.db.arena_update_index128(
-                table_obj.get_code().to_uint64_t(),
-                table_obj.get_scope().to_uint64_t(),
-                table_obj.get_table().to_uint64_t(),
-                obj.get_primary_key(),
-                new_payer,
-                secondary,
-            );
+            let old_payer = self
+                .db
+                .arena_idx128_payer(code, scope, table, primary)
+                .ok_or_else(|| {
+                    ChainError::InternalError(format!("arena has no idx128 row for {iterator}"))
+                })?;
+            let new_payer = if payer == 0 { old_payer } else { payer };
+            self.db.update_index128_object_standalone(
+                code, scope, table, primary, new_payer, secondary,
+            )?;
             (old_payer, new_payer)
         };
-
         if old_payer != new_payer {
             self.update_db_usage(&Name::new(old_payer), -billing_size)?;
             self.update_db_usage(&Name::new(new_payer), billing_size)?;
         }
-
         Ok(())
     }
 
     pub fn db_idx128_remove(&mut self, iterator: i32) -> Result<(), ChainError> {
-        if self.db.arena_standalone_writes() {
-            {
-                let mut inner = self.inner.write()?;
-                let (code, scope, table, primary) =
-                    inner.arena_index128_cache.row_of(iterator).ok_or_else(|| {
-                        ChainError::InternalError(format!("invalid iterator {iterator}"))
-                    })?;
-                pulse_assert(
-                    code == self.receiver.as_u64(),
-                    ChainError::TransactionError(format!("db access violation")),
-                )?;
-                self.db
-                    .remove_index128_object_standalone(code, scope, table, primary)?;
-                inner.arena_index128_cache.remove(iterator);
-            }
-            self.update_db_usage(
-                &Name::new(self.receiver.as_u64()),
-                -(billable_size_v::<Index128Object>() as i64),
-            )?;
-            return Ok(());
-        }
-
         {
             let mut inner = self.inner.write()?;
-            self.db.db_idx128_remove(
-                &mut inner.index128_cache,
-                iterator,
-                self.receiver.as_u64(),
+            let (code, scope, table, primary) = inner
+                .arena_index128_cache
+                .row_of(iterator)
+                .ok_or_else(|| ChainError::InternalError(format!("invalid iterator {iterator}")))?;
+            pulse_assert(
+                code == self.receiver.as_u64(),
+                ChainError::TransactionError(format!("db access violation")),
             )?;
+            self.db
+                .remove_index128_object_standalone(code, scope, table, primary)?;
             inner.arena_index128_cache.remove(iterator);
         }
-
         self.update_db_usage(
             &Name::new(self.receiver.as_u64()),
             -(billable_size_v::<Index128Object>() as i64),
         )?;
-
         Ok(())
     }
 
@@ -1989,38 +1207,20 @@ impl ApplyContext {
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        let res = self.db.db_idx128_find_secondary(
-            &mut inner.index128_cache,
-            code,
-            scope,
-            table,
-            secondary,
-            primary,
-        )?;
-
-        {
-            let arena = self
-                .db
-                .arena_idx128_find_secondary(code, scope, table, secondary);
-            let ffi = if res >= 0 { Some(*primary) } else { None };
-            self.db.arena_note_pos(arena == ffi);
-            if self.db.arena_reads_enabled()
-                && res >= 0
-                && let Some(p) = arena
-            {
+        let arena = self
+            .db
+            .arena_idx128_find_secondary(code, scope, table, secondary);
+        let res = match arena {
+            Some(p) => {
                 *primary = p;
+                inner.arena_index128_cache.cache_table((code, scope, table));
+                inner.arena_index128_cache.add((code, scope, table, p))
             }
-            self.note_secondary_handle(
-                &mut inner.arena_index128_cache,
-                "idx128:find_sec",
-                code,
-                scope,
-                table,
-                *primary,
-                res,
-            );
-        }
-
+            None if self.db.arena_table_exists(code, scope, table) => {
+                inner.arena_index128_cache.cache_table((code, scope, table))
+            }
+            None => -1,
+        };
         Ok(res)
     }
 
@@ -2033,38 +1233,22 @@ impl ApplyContext {
         primary: u64,
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        let res = self.db.db_idx128_find_primary(
-            &mut inner.index128_cache,
-            code,
-            scope,
-            table,
-            secondary,
-            primary,
-        )?;
-
-        {
-            let arena = self
-                .db
-                .arena_idx128_find_primary(code, scope, table, primary);
-            let ffi = if res >= 0 { Some(*secondary) } else { None };
-            self.db.arena_note_pos(arena == ffi);
-            if self.db.arena_reads_enabled()
-                && res >= 0
-                && let Some(s) = arena
-            {
+        let arena = self
+            .db
+            .arena_idx128_find_primary(code, scope, table, primary);
+        let res = match arena {
+            Some(s) => {
                 *secondary = s;
+                inner.arena_index128_cache.cache_table((code, scope, table));
+                inner
+                    .arena_index128_cache
+                    .add((code, scope, table, primary))
             }
-            self.note_secondary_handle(
-                &mut inner.arena_index128_cache,
-                "idx128:find_pri",
-                code,
-                scope,
-                table,
-                primary,
-                res,
-            );
-        }
-
+            None if self.db.arena_table_exists(code, scope, table) => {
+                inner.arena_index128_cache.cache_table((code, scope, table))
+            }
+            None => -1,
+        };
         Ok(res)
     }
 
@@ -2078,41 +1262,19 @@ impl ApplyContext {
     ) -> Result<i32, ChainError> {
         let search = *secondary;
         let mut inner = self.inner.write()?;
-        let res = self.db.db_idx128_lowerbound(
-            &mut inner.index128_cache,
-            code,
-            scope,
-            table,
-            secondary,
-            primary,
-        )?;
-
-        {
-            let arena = self.db.arena_idx128_lower_bound(code, scope, table, search);
-            let ffi = if res >= 0 {
-                Some((*primary, *secondary))
-            } else {
-                None
-            };
-            self.db.arena_note_pos(arena == ffi);
-            if self.db.arena_reads_enabled()
-                && res >= 0
-                && let Some((p, s)) = arena
-            {
+        let arena = self.db.arena_idx128_lower_bound(code, scope, table, search);
+        let res = match arena {
+            Some((p, s)) => {
                 *primary = p;
                 *secondary = s;
+                inner.arena_index128_cache.cache_table((code, scope, table));
+                inner.arena_index128_cache.add((code, scope, table, p))
             }
-            self.note_secondary_handle(
-                &mut inner.arena_index128_cache,
-                "idx128:lb",
-                code,
-                scope,
-                table,
-                *primary,
-                res,
-            );
-        }
-
+            None if self.db.arena_table_exists(code, scope, table) => {
+                inner.arena_index128_cache.cache_table((code, scope, table))
+            }
+            None => -1,
+        };
         Ok(res)
     }
 
@@ -2126,83 +1288,48 @@ impl ApplyContext {
     ) -> Result<i32, ChainError> {
         let search = *secondary;
         let mut inner = self.inner.write()?;
-        let res = self.db.db_idx128_upperbound(
-            &mut inner.index128_cache,
-            code,
-            scope,
-            table,
-            secondary,
-            primary,
-        )?;
-
-        {
-            let arena = self.db.arena_idx128_upper_bound(code, scope, table, search);
-            let ffi = if res >= 0 {
-                Some((*primary, *secondary))
-            } else {
-                None
-            };
-            self.db.arena_note_pos(arena == ffi);
-            if self.db.arena_reads_enabled()
-                && res >= 0
-                && let Some((p, s)) = arena
-            {
+        let arena = self.db.arena_idx128_upper_bound(code, scope, table, search);
+        let res = match arena {
+            Some((p, s)) => {
                 *primary = p;
                 *secondary = s;
+                inner.arena_index128_cache.cache_table((code, scope, table));
+                inner.arena_index128_cache.add((code, scope, table, p))
             }
-            self.note_secondary_handle(
-                &mut inner.arena_index128_cache,
-                "idx128:ub",
-                code,
-                scope,
-                table,
-                *primary,
-                res,
-            );
-        }
-
+            None if self.db.arena_table_exists(code, scope, table) => {
+                inner.arena_index128_cache.cache_table((code, scope, table))
+            }
+            None => -1,
+        };
         Ok(res)
     }
 
     pub fn db_idx128_end(&mut self, code: u64, scope: u64, table: u64) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        let res = self
-            .db
-            .db_idx128_end(&mut inner.index128_cache, code, scope, table)?;
-        {
-            let arena_h = if res == -1 {
-                -1
-            } else {
-                inner.arena_index128_cache.cache_table((code, scope, table))
-            };
-            self.note_iter_handle("idx128:end", code, scope, table, arena_h, res);
-        }
+        let res = if self.db.arena_table_exists(code, scope, table) {
+            inner.arena_index128_cache.cache_table((code, scope, table))
+        } else {
+            -1
+        };
         Ok(res)
     }
 
     pub fn db_idx128_next(&mut self, iterator: i32, primary: &mut u64) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        let res = self
-            .db
-            .db_idx128_next(&mut inner.index128_cache, iterator, primary)?;
+        let res = if iterator < -1 {
+            -1
+        } else if let Some((code, scope, table, cur)) = inner.arena_index128_cache.row_of(iterator)
         {
-            let arena_h = if iterator < -1 {
-                -1
-            } else if let Some((code, scope, table, cur)) =
-                inner.arena_index128_cache.row_of(iterator)
-            {
-                match self.db.arena_idx128_next(code, scope, table, cur) {
-                    Some(np) => {
-                        self.db.arena_note_pos(res < 0 || np == *primary);
-                        inner.arena_index128_cache.add((code, scope, table, np))
-                    }
-                    None => inner.arena_index128_cache.cache_table((code, scope, table)),
+            match self.db.arena_idx128_next(code, scope, table, cur) {
+                Some(np) => {
+                    *primary = np;
+                    inner.arena_index128_cache.add((code, scope, table, np))
                 }
-            } else {
-                res
-            };
-            self.note_iter_handle("idx128:next", 0, 0, 0, arena_h, res);
-        }
+                None => inner.arena_index128_cache.cache_table((code, scope, table)),
+            }
+        } else {
+            -1
+        };
         Ok(res)
     }
 
@@ -2212,35 +1339,28 @@ impl ApplyContext {
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        let res = self
-            .db
-            .db_idx128_previous(&mut inner.index128_cache, iterator, primary)?;
+        let res = if let Some((code, scope, table)) =
+            inner.arena_index128_cache.table_of_end(iterator)
         {
-            let arena_h = if let Some((code, scope, table)) =
-                inner.arena_index128_cache.table_of_end(iterator)
-            {
-                match self.db.arena_idx128_last(code, scope, table) {
-                    Some(lp) => {
-                        self.db.arena_note_pos(res < 0 || lp == *primary);
-                        inner.arena_index128_cache.add((code, scope, table, lp))
-                    }
-                    None => -1,
+            match self.db.arena_idx128_last(code, scope, table) {
+                Some(lp) => {
+                    *primary = lp;
+                    inner.arena_index128_cache.add((code, scope, table, lp))
                 }
-            } else if let Some((code, scope, table, cur)) =
-                inner.arena_index128_cache.row_of(iterator)
-            {
-                match self.db.arena_idx128_previous(code, scope, table, cur) {
-                    Some(pp) => {
-                        self.db.arena_note_pos(res < 0 || pp == *primary);
-                        inner.arena_index128_cache.add((code, scope, table, pp))
-                    }
-                    None => -1,
+                None => -1,
+            }
+        } else if let Some((code, scope, table, cur)) = inner.arena_index128_cache.row_of(iterator)
+        {
+            match self.db.arena_idx128_previous(code, scope, table, cur) {
+                Some(pp) => {
+                    *primary = pp;
+                    inner.arena_index128_cache.add((code, scope, table, pp))
                 }
-            } else {
-                res
-            };
-            self.note_iter_handle("idx128:prev", 0, 0, 0, arena_h, res);
-        }
+                None => -1,
+            }
+        } else {
+            -1
+        };
         Ok(res)
     }
 
@@ -2252,74 +1372,32 @@ impl ApplyContext {
         primary_key: u64,
         secondary_key: U256,
     ) -> Result<i32, ChainError> {
-        let table_name = table;
-
-        if self.db.arena_standalone_writes() {
-            pulse_assert(
-                payer != 0,
-                ChainError::TransactionError(format!(
-                    "must specify a valid account to pay for new record"
-                )),
-            )?;
-            let code = self.receiver.as_u64();
-            if !self.db.arena_table_exists(code, scope, table) {
-                self.update_db_usage(&payer.into(), billable_size_v::<TableObject>() as i64)?;
-            }
-            self.db.create_index256_object_standalone(
-                code,
-                scope,
-                table,
-                payer,
-                primary_key,
-                secondary_key,
-            )?;
-            let res = {
-                let mut inner = self.inner.write()?;
-                inner.arena_index256_cache.cache_table((code, scope, table));
-                inner
-                    .arena_index256_cache
-                    .add((code, scope, table, primary_key))
-            };
-            self.update_db_usage(&payer.into(), billable_size_v::<Index256Object>() as i64)?;
-            return Ok(res);
-        }
-
-        let table = self.find_or_create_table(*self.receiver, scope, table, payer)?;
-        let table = unsafe { &*table };
         pulse_assert(
             payer != 0,
             ChainError::TransactionError(format!(
                 "must specify a valid account to pay for new record"
             )),
         )?;
-
+        let code = self.receiver.as_u64();
+        if !self.db.arena_table_exists(code, scope, table) {
+            self.update_db_usage(&payer.into(), billable_size_v::<TableObject>() as i64)?;
+        }
+        self.db.create_index256_object_standalone(
+            code,
+            scope,
+            table,
+            payer,
+            primary_key,
+            secondary_key,
+        )?;
         let res = {
             let mut inner = self.inner.write()?;
-            let obj = self
-                .db
-                .create_index256_object(table, payer, primary_key, secondary_key)?;
-            let obj = unsafe { &*obj };
-            inner.index256_cache.cache_table(&table)?;
-            let handle = inner.index256_cache.add(obj)?;
-
-            {
-                let code = self.receiver.as_u64();
-                inner
-                    .arena_index256_cache
-                    .cache_table((code, scope, table_name));
-                let arena_h =
-                    inner
-                        .arena_index256_cache
-                        .add((code, scope, table_name, primary_key));
-                self.note_iter_handle("idx256:store", code, scope, table_name, arena_h, handle);
-            }
-
-            handle
+            inner.arena_index256_cache.cache_table((code, scope, table));
+            inner
+                .arena_index256_cache
+                .add((code, scope, table, primary_key))
         };
-
-        let billable_size = billable_size_v::<Index256Object>() as i64;
-        self.update_db_usage(&payer.into(), billable_size)?;
-
+        self.update_db_usage(&payer.into(), billable_size_v::<Index256Object>() as i64)?;
         Ok(res)
     }
 
@@ -2332,110 +1410,54 @@ impl ApplyContext {
         let payer = payer.as_u64();
         let billing_size = billable_size_v::<Index256Object>() as i64;
 
-        if self.db.arena_standalone_writes() {
-            let (old_payer, new_payer) = {
-                let inner = self.inner.read()?;
-                let (code, scope, table, primary) =
-                    inner.arena_index256_cache.row_of(iterator).ok_or_else(|| {
-                        ChainError::InternalError(format!("invalid iterator {iterator}"))
-                    })?;
-                pulse_assert(
-                    code == self.receiver.as_u64(),
-                    ChainError::TransactionError(format!("db access violation")),
-                )?;
-                let old_payer = self
-                    .db
-                    .arena_idx256_payer(code, scope, table, primary)
-                    .ok_or_else(|| {
-                        ChainError::InternalError(format!("arena has no idx256 row for {iterator}"))
-                    })?;
-                let new_payer = if payer == 0 { old_payer } else { payer };
-                self.db.update_index256_object_standalone(
-                    code, scope, table, primary, new_payer, secondary,
-                )?;
-                (old_payer, new_payer)
-            };
-            if old_payer != new_payer {
-                self.update_db_usage(&Name::new(old_payer), -billing_size)?;
-                self.update_db_usage(&Name::new(new_payer), billing_size)?;
-            }
-            return Ok(());
-        }
-
         let (old_payer, new_payer) = {
             let inner = self.inner.read()?;
-            let obj = inner.index256_cache.get(iterator)?;
-            let table_obj = inner.index256_cache.get_table(obj.get_table_id())?;
+            let (code, scope, table, primary) = inner
+                .arena_index256_cache
+                .row_of(iterator)
+                .ok_or_else(|| ChainError::InternalError(format!("invalid iterator {iterator}")))?;
             pulse_assert(
-                table_obj.get_code().to_uint64_t() == self.receiver.as_u64(),
-                ChainError::TransactionError(format!("db access violation",)),
+                code == self.receiver.as_u64(),
+                ChainError::TransactionError(format!("db access violation")),
             )?;
-            let old_payer = obj.get_payer().to_uint64_t();
-            let new_payer = if payer == 0 {
-                obj.get_payer().to_uint64_t()
-            } else {
-                payer
-            };
-            // Mirror before the FFI update moves `secondary` (U256 is not Copy);
-            // the two writes are independent so order does not matter.
-            self.db.arena_update_index256(
-                table_obj.get_code().to_uint64_t(),
-                table_obj.get_scope().to_uint64_t(),
-                table_obj.get_table().to_uint64_t(),
-                obj.get_primary_key(),
-                new_payer,
-                &secondary,
-            );
-            self.db.update_index256_object(obj, new_payer, secondary)?;
+            let old_payer = self
+                .db
+                .arena_idx256_payer(code, scope, table, primary)
+                .ok_or_else(|| {
+                    ChainError::InternalError(format!("arena has no idx256 row for {iterator}"))
+                })?;
+            let new_payer = if payer == 0 { old_payer } else { payer };
+            self.db.update_index256_object_standalone(
+                code, scope, table, primary, new_payer, secondary,
+            )?;
             (old_payer, new_payer)
         };
-
         if old_payer != new_payer {
             self.update_db_usage(&Name::new(old_payer), -billing_size)?;
             self.update_db_usage(&Name::new(new_payer), billing_size)?;
         }
-
         Ok(())
     }
 
     pub fn db_idx256_remove(&mut self, iterator: i32) -> Result<(), ChainError> {
-        if self.db.arena_standalone_writes() {
-            {
-                let mut inner = self.inner.write()?;
-                let (code, scope, table, primary) =
-                    inner.arena_index256_cache.row_of(iterator).ok_or_else(|| {
-                        ChainError::InternalError(format!("invalid iterator {iterator}"))
-                    })?;
-                pulse_assert(
-                    code == self.receiver.as_u64(),
-                    ChainError::TransactionError(format!("db access violation")),
-                )?;
-                self.db
-                    .remove_index256_object_standalone(code, scope, table, primary)?;
-                inner.arena_index256_cache.remove(iterator);
-            }
-            self.update_db_usage(
-                &Name::new(self.receiver.as_u64()),
-                -(billable_size_v::<Index256Object>() as i64),
-            )?;
-            return Ok(());
-        }
-
         {
             let mut inner = self.inner.write()?;
-            self.db.db_idx256_remove(
-                &mut inner.index256_cache,
-                iterator,
-                self.receiver.as_u64(),
+            let (code, scope, table, primary) = inner
+                .arena_index256_cache
+                .row_of(iterator)
+                .ok_or_else(|| ChainError::InternalError(format!("invalid iterator {iterator}")))?;
+            pulse_assert(
+                code == self.receiver.as_u64(),
+                ChainError::TransactionError(format!("db access violation")),
             )?;
+            self.db
+                .remove_index256_object_standalone(code, scope, table, primary)?;
             inner.arena_index256_cache.remove(iterator);
         }
-
         self.update_db_usage(
             &Name::new(self.receiver.as_u64()),
             -(billable_size_v::<Index256Object>() as i64),
         )?;
-
         Ok(())
     }
 
@@ -2449,38 +1471,20 @@ impl ApplyContext {
     ) -> Result<i32, ChainError> {
         let search = secondary.value;
         let mut inner = self.inner.write()?;
-        let res = self.db.db_idx256_find_secondary(
-            &mut inner.index256_cache,
-            code,
-            scope,
-            table,
-            secondary,
-            primary,
-        )?;
-
-        {
-            let arena = self
-                .db
-                .arena_idx256_find_secondary(code, scope, table, search);
-            let ffi = if res >= 0 { Some(*primary) } else { None };
-            self.db.arena_note_pos(arena == ffi);
-            if self.db.arena_reads_enabled()
-                && res >= 0
-                && let Some(p) = arena
-            {
+        let arena = self
+            .db
+            .arena_idx256_find_secondary(code, scope, table, search);
+        let res = match arena {
+            Some(p) => {
                 *primary = p;
+                inner.arena_index256_cache.cache_table((code, scope, table));
+                inner.arena_index256_cache.add((code, scope, table, p))
             }
-            self.note_secondary_handle(
-                &mut inner.arena_index256_cache,
-                "idx256:find_sec",
-                code,
-                scope,
-                table,
-                *primary,
-                res,
-            );
-        }
-
+            None if self.db.arena_table_exists(code, scope, table) => {
+                inner.arena_index256_cache.cache_table((code, scope, table))
+            }
+            None => -1,
+        };
         Ok(res)
     }
 
@@ -2493,42 +1497,22 @@ impl ApplyContext {
         primary: u64,
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        let res = self.db.db_idx256_find_primary(
-            &mut inner.index256_cache,
-            code,
-            scope,
-            table,
-            secondary,
-            primary,
-        )?;
-
-        {
-            let arena = self
-                .db
-                .arena_idx256_find_primary(code, scope, table, primary);
-            let ffi = if res >= 0 {
-                Some(secondary.value)
-            } else {
-                None
-            };
-            self.db.arena_note_pos(arena == ffi);
-            if self.db.arena_reads_enabled()
-                && res >= 0
-                && let Some(b) = arena
-            {
+        let arena = self
+            .db
+            .arena_idx256_find_primary(code, scope, table, primary);
+        let res = match arena {
+            Some(b) => {
                 secondary.value = b;
+                inner.arena_index256_cache.cache_table((code, scope, table));
+                inner
+                    .arena_index256_cache
+                    .add((code, scope, table, primary))
             }
-            self.note_secondary_handle(
-                &mut inner.arena_index256_cache,
-                "idx256:find_pri",
-                code,
-                scope,
-                table,
-                primary,
-                res,
-            );
-        }
-
+            None if self.db.arena_table_exists(code, scope, table) => {
+                inner.arena_index256_cache.cache_table((code, scope, table))
+            }
+            None => -1,
+        };
         Ok(res)
     }
 
@@ -2542,41 +1526,19 @@ impl ApplyContext {
     ) -> Result<i32, ChainError> {
         let search = secondary.value;
         let mut inner = self.inner.write()?;
-        let res = self.db.db_idx256_lowerbound(
-            &mut inner.index256_cache,
-            code,
-            scope,
-            table,
-            secondary,
-            primary,
-        )?;
-
-        {
-            let arena = self.db.arena_idx256_lower_bound(code, scope, table, search);
-            let ffi = if res >= 0 {
-                Some((*primary, secondary.value))
-            } else {
-                None
-            };
-            self.db.arena_note_pos(arena == ffi);
-            if self.db.arena_reads_enabled()
-                && res >= 0
-                && let Some((p, b)) = arena
-            {
+        let arena = self.db.arena_idx256_lower_bound(code, scope, table, search);
+        let res = match arena {
+            Some((p, b)) => {
                 *primary = p;
                 secondary.value = b;
+                inner.arena_index256_cache.cache_table((code, scope, table));
+                inner.arena_index256_cache.add((code, scope, table, p))
             }
-            self.note_secondary_handle(
-                &mut inner.arena_index256_cache,
-                "idx256:lb",
-                code,
-                scope,
-                table,
-                *primary,
-                res,
-            );
-        }
-
+            None if self.db.arena_table_exists(code, scope, table) => {
+                inner.arena_index256_cache.cache_table((code, scope, table))
+            }
+            None => -1,
+        };
         Ok(res)
     }
 
@@ -2590,83 +1552,48 @@ impl ApplyContext {
     ) -> Result<i32, ChainError> {
         let search = secondary.value;
         let mut inner = self.inner.write()?;
-        let res = self.db.db_idx256_upperbound(
-            &mut inner.index256_cache,
-            code,
-            scope,
-            table,
-            secondary,
-            primary,
-        )?;
-
-        {
-            let arena = self.db.arena_idx256_upper_bound(code, scope, table, search);
-            let ffi = if res >= 0 {
-                Some((*primary, secondary.value))
-            } else {
-                None
-            };
-            self.db.arena_note_pos(arena == ffi);
-            if self.db.arena_reads_enabled()
-                && res >= 0
-                && let Some((p, b)) = arena
-            {
+        let arena = self.db.arena_idx256_upper_bound(code, scope, table, search);
+        let res = match arena {
+            Some((p, b)) => {
                 *primary = p;
                 secondary.value = b;
+                inner.arena_index256_cache.cache_table((code, scope, table));
+                inner.arena_index256_cache.add((code, scope, table, p))
             }
-            self.note_secondary_handle(
-                &mut inner.arena_index256_cache,
-                "idx256:ub",
-                code,
-                scope,
-                table,
-                *primary,
-                res,
-            );
-        }
-
+            None if self.db.arena_table_exists(code, scope, table) => {
+                inner.arena_index256_cache.cache_table((code, scope, table))
+            }
+            None => -1,
+        };
         Ok(res)
     }
 
     pub fn db_idx256_end(&mut self, code: u64, scope: u64, table: u64) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        let res = self
-            .db
-            .db_idx256_end(&mut inner.index256_cache, code, scope, table)?;
-        {
-            let arena_h = if res == -1 {
-                -1
-            } else {
-                inner.arena_index256_cache.cache_table((code, scope, table))
-            };
-            self.note_iter_handle("idx256:end", code, scope, table, arena_h, res);
-        }
+        let res = if self.db.arena_table_exists(code, scope, table) {
+            inner.arena_index256_cache.cache_table((code, scope, table))
+        } else {
+            -1
+        };
         Ok(res)
     }
 
     pub fn db_idx256_next(&mut self, iterator: i32, primary: &mut u64) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        let res = self
-            .db
-            .db_idx256_next(&mut inner.index256_cache, iterator, primary)?;
+        let res = if iterator < -1 {
+            -1
+        } else if let Some((code, scope, table, cur)) = inner.arena_index256_cache.row_of(iterator)
         {
-            let arena_h = if iterator < -1 {
-                -1
-            } else if let Some((code, scope, table, cur)) =
-                inner.arena_index256_cache.row_of(iterator)
-            {
-                match self.db.arena_idx256_next(code, scope, table, cur) {
-                    Some(np) => {
-                        self.db.arena_note_pos(res < 0 || np == *primary);
-                        inner.arena_index256_cache.add((code, scope, table, np))
-                    }
-                    None => inner.arena_index256_cache.cache_table((code, scope, table)),
+            match self.db.arena_idx256_next(code, scope, table, cur) {
+                Some(np) => {
+                    *primary = np;
+                    inner.arena_index256_cache.add((code, scope, table, np))
                 }
-            } else {
-                res
-            };
-            self.note_iter_handle("idx256:next", 0, 0, 0, arena_h, res);
-        }
+                None => inner.arena_index256_cache.cache_table((code, scope, table)),
+            }
+        } else {
+            -1
+        };
         Ok(res)
     }
 
@@ -2676,35 +1603,28 @@ impl ApplyContext {
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        let res = self
-            .db
-            .db_idx256_previous(&mut inner.index256_cache, iterator, primary)?;
+        let res = if let Some((code, scope, table)) =
+            inner.arena_index256_cache.table_of_end(iterator)
         {
-            let arena_h = if let Some((code, scope, table)) =
-                inner.arena_index256_cache.table_of_end(iterator)
-            {
-                match self.db.arena_idx256_last(code, scope, table) {
-                    Some(lp) => {
-                        self.db.arena_note_pos(res < 0 || lp == *primary);
-                        inner.arena_index256_cache.add((code, scope, table, lp))
-                    }
-                    None => -1,
+            match self.db.arena_idx256_last(code, scope, table) {
+                Some(lp) => {
+                    *primary = lp;
+                    inner.arena_index256_cache.add((code, scope, table, lp))
                 }
-            } else if let Some((code, scope, table, cur)) =
-                inner.arena_index256_cache.row_of(iterator)
-            {
-                match self.db.arena_idx256_previous(code, scope, table, cur) {
-                    Some(pp) => {
-                        self.db.arena_note_pos(res < 0 || pp == *primary);
-                        inner.arena_index256_cache.add((code, scope, table, pp))
-                    }
-                    None => -1,
+                None => -1,
+            }
+        } else if let Some((code, scope, table, cur)) = inner.arena_index256_cache.row_of(iterator)
+        {
+            match self.db.arena_idx256_previous(code, scope, table, cur) {
+                Some(pp) => {
+                    *primary = pp;
+                    inner.arena_index256_cache.add((code, scope, table, pp))
                 }
-            } else {
-                res
-            };
-            self.note_iter_handle("idx256:prev", 0, 0, 0, arena_h, res);
-        }
+                None => -1,
+            }
+        } else {
+            -1
+        };
         Ok(res)
     }
 
@@ -2716,76 +1636,34 @@ impl ApplyContext {
         primary_key: u64,
         secondary_key: u64,
     ) -> Result<i32, ChainError> {
-        let table_name = table;
-
-        if self.db.arena_standalone_writes() {
-            pulse_assert(
-                payer != 0,
-                ChainError::TransactionError(format!(
-                    "must specify a valid account to pay for new record"
-                )),
-            )?;
-            let code = self.receiver.as_u64();
-            if !self.db.arena_table_exists(code, scope, table) {
-                self.update_db_usage(&payer.into(), billable_size_v::<TableObject>() as i64)?;
-            }
-            self.db.create_idx_double_object_standalone(
-                code,
-                scope,
-                table,
-                payer,
-                primary_key,
-                secondary_key,
-            )?;
-            let res = {
-                let mut inner = self.inner.write()?;
-                inner
-                    .arena_index_double_cache
-                    .cache_table((code, scope, table));
-                inner
-                    .arena_index_double_cache
-                    .add((code, scope, table, primary_key))
-            };
-            self.update_db_usage(&payer.into(), billable_size_v::<IndexDoubleObject>() as i64)?;
-            return Ok(res);
-        }
-
-        let table = self.find_or_create_table(*self.receiver, scope, table, payer)?;
-        let table = unsafe { &*table };
         pulse_assert(
             payer != 0,
             ChainError::TransactionError(format!(
                 "must specify a valid account to pay for new record"
             )),
         )?;
-
+        let code = self.receiver.as_u64();
+        if !self.db.arena_table_exists(code, scope, table) {
+            self.update_db_usage(&payer.into(), billable_size_v::<TableObject>() as i64)?;
+        }
+        self.db.create_idx_double_object_standalone(
+            code,
+            scope,
+            table,
+            payer,
+            primary_key,
+            secondary_key,
+        )?;
         let res = {
             let mut inner = self.inner.write()?;
-            let obj = self
-                .db
-                .create_idx_double_object(table, payer, primary_key, secondary_key)?;
-            let obj = unsafe { &*obj };
-            inner.index_double_cache.cache_table(&table)?;
-            let handle = inner.index_double_cache.add(obj)?;
-
-            {
-                let code = self.receiver.as_u64();
-                inner
-                    .arena_index_double_cache
-                    .cache_table((code, scope, table_name));
-                let arena_h =
-                    inner
-                        .arena_index_double_cache
-                        .add((code, scope, table_name, primary_key));
-                self.note_iter_handle("idxdbl:store", code, scope, table_name, arena_h, handle);
-            }
-
-            handle
+            inner
+                .arena_index_double_cache
+                .cache_table((code, scope, table));
+            inner
+                .arena_index_double_cache
+                .add((code, scope, table, primary_key))
         };
-
-        let billable_size = billable_size_v::<IndexDoubleObject>() as i64;
-        self.update_db_usage(&payer.into(), billable_size)?;
-
+        self.update_db_usage(&payer.into(), billable_size_v::<IndexDoubleObject>() as i64)?;
         Ok(res)
     }
 
@@ -2798,115 +1676,54 @@ impl ApplyContext {
         let payer = payer.as_u64();
         let billing_size = billable_size_v::<IndexDoubleObject>() as i64;
 
-        if self.db.arena_standalone_writes() {
-            let (old_payer, new_payer) = {
-                let inner = self.inner.read()?;
-                let (code, scope, table, primary) = inner
-                    .arena_index_double_cache
-                    .row_of(iterator)
-                    .ok_or_else(|| {
-                        ChainError::InternalError(format!("invalid iterator {iterator}"))
-                    })?;
-                pulse_assert(
-                    code == self.receiver.as_u64(),
-                    ChainError::TransactionError(format!("db access violation")),
-                )?;
-                let old_payer = self
-                    .db
-                    .arena_idx_double_payer(code, scope, table, primary)
-                    .ok_or_else(|| {
-                        ChainError::InternalError(format!(
-                            "arena has no idx_double row for {iterator}"
-                        ))
-                    })?;
-                let new_payer = if payer == 0 { old_payer } else { payer };
-                self.db.update_idx_double_object_standalone(
-                    code, scope, table, primary, new_payer, secondary,
-                )?;
-                (old_payer, new_payer)
-            };
-            if old_payer != new_payer {
-                self.update_db_usage(&Name::new(old_payer), -billing_size)?;
-                self.update_db_usage(&Name::new(new_payer), billing_size)?;
-            }
-            return Ok(());
-        }
-
         let (old_payer, new_payer) = {
             let inner = self.inner.read()?;
-            let obj = inner.index_double_cache.get(iterator)?;
-            let table_obj = inner.index_double_cache.get_table(obj.get_table_id())?;
+            let (code, scope, table, primary) = inner
+                .arena_index_double_cache
+                .row_of(iterator)
+                .ok_or_else(|| ChainError::InternalError(format!("invalid iterator {iterator}")))?;
             pulse_assert(
-                table_obj.get_code().to_uint64_t() == self.receiver.as_u64(),
-                ChainError::TransactionError(format!("db access violation",)),
+                code == self.receiver.as_u64(),
+                ChainError::TransactionError(format!("db access violation")),
             )?;
-            let old_payer = obj.get_payer().to_uint64_t();
-            let new_payer = if payer == 0 {
-                obj.get_payer().to_uint64_t()
-            } else {
-                payer
-            };
-            self.db
-                .update_idx_double_object(obj, new_payer, secondary)?;
-            self.db.arena_update_idx_double(
-                table_obj.get_code().to_uint64_t(),
-                table_obj.get_scope().to_uint64_t(),
-                table_obj.get_table().to_uint64_t(),
-                obj.get_primary_key(),
-                new_payer,
-                secondary,
-            );
+            let old_payer = self
+                .db
+                .arena_idx_double_payer(code, scope, table, primary)
+                .ok_or_else(|| {
+                    ChainError::InternalError(format!("arena has no idx_double row for {iterator}"))
+                })?;
+            let new_payer = if payer == 0 { old_payer } else { payer };
+            self.db.update_idx_double_object_standalone(
+                code, scope, table, primary, new_payer, secondary,
+            )?;
             (old_payer, new_payer)
         };
-
         if old_payer != new_payer {
             self.update_db_usage(&Name::new(old_payer), -billing_size)?;
             self.update_db_usage(&Name::new(new_payer), billing_size)?;
         }
-
         Ok(())
     }
 
     pub fn db_idx_double_remove(&mut self, iterator: i32) -> Result<(), ChainError> {
-        if self.db.arena_standalone_writes() {
-            {
-                let mut inner = self.inner.write()?;
-                let (code, scope, table, primary) = inner
-                    .arena_index_double_cache
-                    .row_of(iterator)
-                    .ok_or_else(|| {
-                        ChainError::InternalError(format!("invalid iterator {iterator}"))
-                    })?;
-                pulse_assert(
-                    code == self.receiver.as_u64(),
-                    ChainError::TransactionError(format!("db access violation")),
-                )?;
-                self.db
-                    .remove_idx_double_object_standalone(code, scope, table, primary)?;
-                inner.arena_index_double_cache.remove(iterator);
-            }
-            self.update_db_usage(
-                &Name::new(self.receiver.as_u64()),
-                -(billable_size_v::<IndexDoubleObject>() as i64),
-            )?;
-            return Ok(());
-        }
-
         {
             let mut inner = self.inner.write()?;
-            self.db.db_idx_double_remove(
-                &mut inner.index_double_cache,
-                iterator,
-                self.receiver.as_u64(),
+            let (code, scope, table, primary) = inner
+                .arena_index_double_cache
+                .row_of(iterator)
+                .ok_or_else(|| ChainError::InternalError(format!("invalid iterator {iterator}")))?;
+            pulse_assert(
+                code == self.receiver.as_u64(),
+                ChainError::TransactionError(format!("db access violation")),
             )?;
+            self.db
+                .remove_idx_double_object_standalone(code, scope, table, primary)?;
             inner.arena_index_double_cache.remove(iterator);
         }
-
         self.update_db_usage(
             &Name::new(self.receiver.as_u64()),
             -(billable_size_v::<IndexDoubleObject>() as i64),
         )?;
-
         Ok(())
     }
 
@@ -2919,38 +1736,22 @@ impl ApplyContext {
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        let res = self.db.db_idx_double_find_secondary(
-            &mut inner.index_double_cache,
-            code,
-            scope,
-            table,
-            secondary,
-            primary,
-        )?;
-
-        {
-            let arena = self
-                .db
-                .arena_idx_double_find_secondary(code, scope, table, secondary);
-            let ffi = if res >= 0 { Some(*primary) } else { None };
-            self.db.arena_note_pos(arena == ffi);
-            if self.db.arena_reads_enabled()
-                && res >= 0
-                && let Some(p) = arena
-            {
+        let arena = self
+            .db
+            .arena_idx_double_find_secondary(code, scope, table, secondary);
+        let res = match arena {
+            Some(p) => {
                 *primary = p;
+                inner
+                    .arena_index_double_cache
+                    .cache_table((code, scope, table));
+                inner.arena_index_double_cache.add((code, scope, table, p))
             }
-            self.note_secondary_handle(
-                &mut inner.arena_index_double_cache,
-                "idxdbl:find_sec",
-                code,
-                scope,
-                table,
-                *primary,
-                res,
-            );
-        }
-
+            None if self.db.arena_table_exists(code, scope, table) => inner
+                .arena_index_double_cache
+                .cache_table((code, scope, table)),
+            None => -1,
+        };
         Ok(res)
     }
 
@@ -2963,38 +1764,24 @@ impl ApplyContext {
         primary: u64,
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        let res = self.db.db_idx_double_find_primary(
-            &mut inner.index_double_cache,
-            code,
-            scope,
-            table,
-            secondary,
-            primary,
-        )?;
-
-        {
-            let arena = self
-                .db
-                .arena_idx_double_find_primary(code, scope, table, primary);
-            let ffi = if res >= 0 { Some(*secondary) } else { None };
-            self.db.arena_note_pos(arena == ffi);
-            if self.db.arena_reads_enabled()
-                && res >= 0
-                && let Some(s) = arena
-            {
+        let arena = self
+            .db
+            .arena_idx_double_find_primary(code, scope, table, primary);
+        let res = match arena {
+            Some(s) => {
                 *secondary = s;
+                inner
+                    .arena_index_double_cache
+                    .cache_table((code, scope, table));
+                inner
+                    .arena_index_double_cache
+                    .add((code, scope, table, primary))
             }
-            self.note_secondary_handle(
-                &mut inner.arena_index_double_cache,
-                "idxdbl:find_pri",
-                code,
-                scope,
-                table,
-                primary,
-                res,
-            );
-        }
-
+            None if self.db.arena_table_exists(code, scope, table) => inner
+                .arena_index_double_cache
+                .cache_table((code, scope, table)),
+            None => -1,
+        };
         Ok(res)
     }
 
@@ -3008,43 +1795,23 @@ impl ApplyContext {
     ) -> Result<i32, ChainError> {
         let search = *secondary;
         let mut inner = self.inner.write()?;
-        let res = self.db.db_idx_double_lowerbound(
-            &mut inner.index_double_cache,
-            code,
-            scope,
-            table,
-            secondary,
-            primary,
-        )?;
-
-        {
-            let arena = self
-                .db
-                .arena_idx_double_lower_bound(code, scope, table, search);
-            let ffi = if res >= 0 {
-                Some((*primary, *secondary))
-            } else {
-                None
-            };
-            self.db.arena_note_pos(arena == ffi);
-            if self.db.arena_reads_enabled()
-                && res >= 0
-                && let Some((p, s)) = arena
-            {
+        let arena = self
+            .db
+            .arena_idx_double_lower_bound(code, scope, table, search);
+        let res = match arena {
+            Some((p, s)) => {
                 *primary = p;
                 *secondary = s;
+                inner
+                    .arena_index_double_cache
+                    .cache_table((code, scope, table));
+                inner.arena_index_double_cache.add((code, scope, table, p))
             }
-            self.note_secondary_handle(
-                &mut inner.arena_index_double_cache,
-                "idxdbl:lb",
-                code,
-                scope,
-                table,
-                *primary,
-                res,
-            );
-        }
-
+            None if self.db.arena_table_exists(code, scope, table) => inner
+                .arena_index_double_cache
+                .cache_table((code, scope, table)),
+            None => -1,
+        };
         Ok(res)
     }
 
@@ -3058,43 +1825,23 @@ impl ApplyContext {
     ) -> Result<i32, ChainError> {
         let search = *secondary;
         let mut inner = self.inner.write()?;
-        let res = self.db.db_idx_double_upperbound(
-            &mut inner.index_double_cache,
-            code,
-            scope,
-            table,
-            secondary,
-            primary,
-        )?;
-
-        {
-            let arena = self
-                .db
-                .arena_idx_double_upper_bound(code, scope, table, search);
-            let ffi = if res >= 0 {
-                Some((*primary, *secondary))
-            } else {
-                None
-            };
-            self.db.arena_note_pos(arena == ffi);
-            if self.db.arena_reads_enabled()
-                && res >= 0
-                && let Some((p, s)) = arena
-            {
+        let arena = self
+            .db
+            .arena_idx_double_upper_bound(code, scope, table, search);
+        let res = match arena {
+            Some((p, s)) => {
                 *primary = p;
                 *secondary = s;
+                inner
+                    .arena_index_double_cache
+                    .cache_table((code, scope, table));
+                inner.arena_index_double_cache.add((code, scope, table, p))
             }
-            self.note_secondary_handle(
-                &mut inner.arena_index_double_cache,
-                "idxdbl:ub",
-                code,
-                scope,
-                table,
-                *primary,
-                res,
-            );
-        }
-
+            None if self.db.arena_table_exists(code, scope, table) => inner
+                .arena_index_double_cache
+                .cache_table((code, scope, table)),
+            None => -1,
+        };
         Ok(res)
     }
 
@@ -3105,19 +1852,13 @@ impl ApplyContext {
         table: u64,
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        let res = self
-            .db
-            .db_idx_double_end(&mut inner.index_double_cache, code, scope, table)?;
-        {
-            let arena_h = if res == -1 {
-                -1
-            } else {
-                inner
-                    .arena_index_double_cache
-                    .cache_table((code, scope, table))
-            };
-            self.note_iter_handle("idxdbl:end", code, scope, table, arena_h, res);
-        }
+        let res = if self.db.arena_table_exists(code, scope, table) {
+            inner
+                .arena_index_double_cache
+                .cache_table((code, scope, table))
+        } else {
+            -1
+        };
         Ok(res)
     }
 
@@ -3127,29 +1868,23 @@ impl ApplyContext {
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        let res = self
-            .db
-            .db_idx_double_next(&mut inner.index_double_cache, iterator, primary)?;
+        let res = if iterator < -1 {
+            -1
+        } else if let Some((code, scope, table, cur)) =
+            inner.arena_index_double_cache.row_of(iterator)
         {
-            let arena_h = if iterator < -1 {
-                -1
-            } else if let Some((code, scope, table, cur)) =
-                inner.arena_index_double_cache.row_of(iterator)
-            {
-                match self.db.arena_idx_double_next(code, scope, table, cur) {
-                    Some(np) => {
-                        self.db.arena_note_pos(res < 0 || np == *primary);
-                        inner.arena_index_double_cache.add((code, scope, table, np))
-                    }
-                    None => inner
-                        .arena_index_double_cache
-                        .cache_table((code, scope, table)),
+            match self.db.arena_idx_double_next(code, scope, table, cur) {
+                Some(np) => {
+                    *primary = np;
+                    inner.arena_index_double_cache.add((code, scope, table, np))
                 }
-            } else {
-                res
-            };
-            self.note_iter_handle("idxdbl:next", 0, 0, 0, arena_h, res);
-        }
+                None => inner
+                    .arena_index_double_cache
+                    .cache_table((code, scope, table)),
+            }
+        } else {
+            -1
+        };
         Ok(res)
     }
 
@@ -3159,35 +1894,29 @@ impl ApplyContext {
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        let res =
-            self.db
-                .db_idx_double_previous(&mut inner.index_double_cache, iterator, primary)?;
+        let res = if let Some((code, scope, table)) =
+            inner.arena_index_double_cache.table_of_end(iterator)
         {
-            let arena_h = if let Some((code, scope, table)) =
-                inner.arena_index_double_cache.table_of_end(iterator)
-            {
-                match self.db.arena_idx_double_last(code, scope, table) {
-                    Some(lp) => {
-                        self.db.arena_note_pos(res < 0 || lp == *primary);
-                        inner.arena_index_double_cache.add((code, scope, table, lp))
-                    }
-                    None => -1,
+            match self.db.arena_idx_double_last(code, scope, table) {
+                Some(lp) => {
+                    *primary = lp;
+                    inner.arena_index_double_cache.add((code, scope, table, lp))
                 }
-            } else if let Some((code, scope, table, cur)) =
-                inner.arena_index_double_cache.row_of(iterator)
-            {
-                match self.db.arena_idx_double_previous(code, scope, table, cur) {
-                    Some(pp) => {
-                        self.db.arena_note_pos(res < 0 || pp == *primary);
-                        inner.arena_index_double_cache.add((code, scope, table, pp))
-                    }
-                    None => -1,
+                None => -1,
+            }
+        } else if let Some((code, scope, table, cur)) =
+            inner.arena_index_double_cache.row_of(iterator)
+        {
+            match self.db.arena_idx_double_previous(code, scope, table, cur) {
+                Some(pp) => {
+                    *primary = pp;
+                    inner.arena_index_double_cache.add((code, scope, table, pp))
                 }
-            } else {
-                res
-            };
-            self.note_iter_handle("idxdbl:prev", 0, 0, 0, arena_h, res);
-        }
+                None => -1,
+            }
+        } else {
+            -1
+        };
         Ok(res)
     }
 
@@ -3199,79 +1928,37 @@ impl ApplyContext {
         primary_key: u64,
         secondary_key: Float128,
     ) -> Result<i32, ChainError> {
-        let table_name = table;
-
-        if self.db.arena_standalone_writes() {
-            pulse_assert(
-                payer != 0,
-                ChainError::TransactionError(format!(
-                    "must specify a valid account to pay for new record"
-                )),
-            )?;
-            let code = self.receiver.as_u64();
-            if !self.db.arena_table_exists(code, scope, table) {
-                self.update_db_usage(&payer.into(), billable_size_v::<TableObject>() as i64)?;
-            }
-            self.db.create_idx_long_double_object_standalone(
-                code,
-                scope,
-                table,
-                payer,
-                primary_key,
-                secondary_key,
-            )?;
-            let res = {
-                let mut inner = self.inner.write()?;
-                inner
-                    .arena_index_long_double_cache
-                    .cache_table((code, scope, table));
-                inner
-                    .arena_index_long_double_cache
-                    .add((code, scope, table, primary_key))
-            };
-            self.update_db_usage(
-                &payer.into(),
-                billable_size_v::<IndexLongDoubleObject>() as i64,
-            )?;
-            return Ok(res);
-        }
-
-        let table = self.find_or_create_table(*self.receiver, scope, table, payer)?;
-        let table = unsafe { &*table };
         pulse_assert(
             payer != 0,
             ChainError::TransactionError(format!(
                 "must specify a valid account to pay for new record"
             )),
         )?;
-
+        let code = self.receiver.as_u64();
+        if !self.db.arena_table_exists(code, scope, table) {
+            self.update_db_usage(&payer.into(), billable_size_v::<TableObject>() as i64)?;
+        }
+        self.db.create_idx_long_double_object_standalone(
+            code,
+            scope,
+            table,
+            payer,
+            primary_key,
+            secondary_key,
+        )?;
         let res = {
             let mut inner = self.inner.write()?;
-            let obj =
-                self.db
-                    .create_idx_long_double_object(table, payer, primary_key, secondary_key)?;
-            let obj = unsafe { &*obj };
-            inner.index_long_double_cache.cache_table(&table)?;
-            let handle = inner.index_long_double_cache.add(obj)?;
-
-            {
-                let code = self.receiver.as_u64();
-                inner
-                    .arena_index_long_double_cache
-                    .cache_table((code, scope, table_name));
-                let arena_h =
-                    inner
-                        .arena_index_long_double_cache
-                        .add((code, scope, table_name, primary_key));
-                self.note_iter_handle("idxldbl:store", code, scope, table_name, arena_h, handle);
-            }
-
-            handle
+            inner
+                .arena_index_long_double_cache
+                .cache_table((code, scope, table));
+            inner
+                .arena_index_long_double_cache
+                .add((code, scope, table, primary_key))
         };
-
-        let billable_size = billable_size_v::<IndexLongDoubleObject>() as i64;
-        self.update_db_usage(&payer.into(), billable_size)?;
-
+        self.update_db_usage(
+            &payer.into(),
+            billable_size_v::<IndexLongDoubleObject>() as i64,
+        )?;
         Ok(res)
     }
 
@@ -3284,119 +1971,56 @@ impl ApplyContext {
         let payer = payer.as_u64();
         let billing_size = billable_size_v::<IndexLongDoubleObject>() as i64;
 
-        if self.db.arena_standalone_writes() {
-            let (old_payer, new_payer) = {
-                let inner = self.inner.read()?;
-                let (code, scope, table, primary) = inner
-                    .arena_index_long_double_cache
-                    .row_of(iterator)
-                    .ok_or_else(|| {
-                        ChainError::InternalError(format!("invalid iterator {iterator}"))
-                    })?;
-                pulse_assert(
-                    code == self.receiver.as_u64(),
-                    ChainError::TransactionError(format!("db access violation")),
-                )?;
-                let old_payer = self
-                    .db
-                    .arena_idx_long_double_payer(code, scope, table, primary)
-                    .ok_or_else(|| {
-                        ChainError::InternalError(format!(
-                            "arena has no idx_long_double row for {iterator}"
-                        ))
-                    })?;
-                let new_payer = if payer == 0 { old_payer } else { payer };
-                self.db.update_idx_long_double_object_standalone(
-                    code, scope, table, primary, new_payer, secondary,
-                )?;
-                (old_payer, new_payer)
-            };
-            if old_payer != new_payer {
-                self.update_db_usage(&Name::new(old_payer), -billing_size)?;
-                self.update_db_usage(&Name::new(new_payer), billing_size)?;
-            }
-            return Ok(());
-        }
-
         let (old_payer, new_payer) = {
             let inner = self.inner.read()?;
-            let obj = inner.index_long_double_cache.get(iterator)?;
-            let table_obj = inner
-                .index_long_double_cache
-                .get_table(obj.get_table_id())?;
+            let (code, scope, table, primary) = inner
+                .arena_index_long_double_cache
+                .row_of(iterator)
+                .ok_or_else(|| ChainError::InternalError(format!("invalid iterator {iterator}")))?;
             pulse_assert(
-                table_obj.get_code().to_uint64_t() == self.receiver.as_u64(),
-                ChainError::TransactionError(format!("db access violation",)),
+                code == self.receiver.as_u64(),
+                ChainError::TransactionError(format!("db access violation")),
             )?;
-            let old_payer = obj.get_payer().to_uint64_t();
-            let new_payer = if payer == 0 {
-                obj.get_payer().to_uint64_t()
-            } else {
-                payer
-            };
-            // Mirror before the FFI update moves `secondary` (Float128 is not
-            // Copy); the two writes are independent so order does not matter.
-            self.db.arena_update_idx_long_double(
-                table_obj.get_code().to_uint64_t(),
-                table_obj.get_scope().to_uint64_t(),
-                table_obj.get_table().to_uint64_t(),
-                obj.get_primary_key(),
-                new_payer,
-                &secondary,
-            );
-            self.db
-                .update_idx_long_double_object(obj, new_payer, secondary)?;
+            let old_payer = self
+                .db
+                .arena_idx_long_double_payer(code, scope, table, primary)
+                .ok_or_else(|| {
+                    ChainError::InternalError(format!(
+                        "arena has no idx_long_double row for {iterator}"
+                    ))
+                })?;
+            let new_payer = if payer == 0 { old_payer } else { payer };
+            self.db.update_idx_long_double_object_standalone(
+                code, scope, table, primary, new_payer, secondary,
+            )?;
             (old_payer, new_payer)
         };
-
         if old_payer != new_payer {
             self.update_db_usage(&Name::new(old_payer), -billing_size)?;
             self.update_db_usage(&Name::new(new_payer), billing_size)?;
         }
-
         Ok(())
     }
 
     pub fn db_idx_long_double_remove(&mut self, iterator: i32) -> Result<(), ChainError> {
-        if self.db.arena_standalone_writes() {
-            {
-                let mut inner = self.inner.write()?;
-                let (code, scope, table, primary) = inner
-                    .arena_index_long_double_cache
-                    .row_of(iterator)
-                    .ok_or_else(|| {
-                        ChainError::InternalError(format!("invalid iterator {iterator}"))
-                    })?;
-                pulse_assert(
-                    code == self.receiver.as_u64(),
-                    ChainError::TransactionError(format!("db access violation")),
-                )?;
-                self.db
-                    .remove_idx_long_double_object_standalone(code, scope, table, primary)?;
-                inner.arena_index_long_double_cache.remove(iterator);
-            }
-            self.update_db_usage(
-                &Name::new(self.receiver.as_u64()),
-                -(billable_size_v::<IndexLongDoubleObject>() as i64),
-            )?;
-            return Ok(());
-        }
-
         {
             let mut inner = self.inner.write()?;
-            self.db.db_idx_long_double_remove(
-                &mut inner.index_long_double_cache,
-                iterator,
-                self.receiver.as_u64(),
+            let (code, scope, table, primary) = inner
+                .arena_index_long_double_cache
+                .row_of(iterator)
+                .ok_or_else(|| ChainError::InternalError(format!("invalid iterator {iterator}")))?;
+            pulse_assert(
+                code == self.receiver.as_u64(),
+                ChainError::TransactionError(format!("db access violation")),
             )?;
+            self.db
+                .remove_idx_long_double_object_standalone(code, scope, table, primary)?;
             inner.arena_index_long_double_cache.remove(iterator);
         }
-
         self.update_db_usage(
             &Name::new(self.receiver.as_u64()),
             -(billable_size_v::<IndexLongDoubleObject>() as i64),
         )?;
-
         Ok(())
     }
 
@@ -3410,38 +2034,24 @@ impl ApplyContext {
     ) -> Result<i32, ChainError> {
         let search = (secondary.lo, secondary.hi);
         let mut inner = self.inner.write()?;
-        let res = self.db.db_idx_long_double_find_secondary(
-            &mut inner.index_long_double_cache,
-            code,
-            scope,
-            table,
-            secondary,
-            primary,
-        )?;
-
-        {
-            let arena = self
-                .db
-                .arena_idx_long_double_find_secondary(code, scope, table, search);
-            let ffi = if res >= 0 { Some(*primary) } else { None };
-            self.db.arena_note_pos(arena == ffi);
-            if self.db.arena_reads_enabled()
-                && res >= 0
-                && let Some(p) = arena
-            {
+        let arena = self
+            .db
+            .arena_idx_long_double_find_secondary(code, scope, table, search);
+        let res = match arena {
+            Some(p) => {
                 *primary = p;
+                inner
+                    .arena_index_long_double_cache
+                    .cache_table((code, scope, table));
+                inner
+                    .arena_index_long_double_cache
+                    .add((code, scope, table, p))
             }
-            self.note_secondary_handle(
-                &mut inner.arena_index_long_double_cache,
-                "idxldbl:find_sec",
-                code,
-                scope,
-                table,
-                *primary,
-                res,
-            );
-        }
-
+            None if self.db.arena_table_exists(code, scope, table) => inner
+                .arena_index_long_double_cache
+                .cache_table((code, scope, table)),
+            None => -1,
+        };
         Ok(res)
     }
 
@@ -3454,43 +2064,25 @@ impl ApplyContext {
         primary: u64,
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        let res = self.db.db_idx_long_double_find_primary(
-            &mut inner.index_long_double_cache,
-            code,
-            scope,
-            table,
-            secondary,
-            primary,
-        )?;
-
-        {
-            let arena = self
-                .db
-                .arena_idx_long_double_find_primary(code, scope, table, primary);
-            let ffi = if res >= 0 {
-                Some((secondary.lo, secondary.hi))
-            } else {
-                None
-            };
-            self.db.arena_note_pos(arena == ffi);
-            if self.db.arena_reads_enabled()
-                && res >= 0
-                && let Some((lo, hi)) = arena
-            {
+        let arena = self
+            .db
+            .arena_idx_long_double_find_primary(code, scope, table, primary);
+        let res = match arena {
+            Some((lo, hi)) => {
                 secondary.lo = lo;
                 secondary.hi = hi;
+                inner
+                    .arena_index_long_double_cache
+                    .cache_table((code, scope, table));
+                inner
+                    .arena_index_long_double_cache
+                    .add((code, scope, table, primary))
             }
-            self.note_secondary_handle(
-                &mut inner.arena_index_long_double_cache,
-                "idxldbl:find_pri",
-                code,
-                scope,
-                table,
-                primary,
-                res,
-            );
-        }
-
+            None if self.db.arena_table_exists(code, scope, table) => inner
+                .arena_index_long_double_cache
+                .cache_table((code, scope, table)),
+            None => -1,
+        };
         Ok(res)
     }
 
@@ -3504,44 +2096,26 @@ impl ApplyContext {
     ) -> Result<i32, ChainError> {
         let search = (secondary.lo, secondary.hi);
         let mut inner = self.inner.write()?;
-        let res = self.db.db_idx_long_double_lowerbound(
-            &mut inner.index_long_double_cache,
-            code,
-            scope,
-            table,
-            secondary,
-            primary,
-        )?;
-
-        {
-            let arena = self
-                .db
-                .arena_idx_long_double_lower_bound(code, scope, table, search);
-            let ffi = if res >= 0 {
-                Some((*primary, (secondary.lo, secondary.hi)))
-            } else {
-                None
-            };
-            self.db.arena_note_pos(arena == ffi);
-            if self.db.arena_reads_enabled()
-                && res >= 0
-                && let Some((p, (lo, hi))) = arena
-            {
+        let arena = self
+            .db
+            .arena_idx_long_double_lower_bound(code, scope, table, search);
+        let res = match arena {
+            Some((p, (lo, hi))) => {
                 *primary = p;
                 secondary.lo = lo;
                 secondary.hi = hi;
+                inner
+                    .arena_index_long_double_cache
+                    .cache_table((code, scope, table));
+                inner
+                    .arena_index_long_double_cache
+                    .add((code, scope, table, p))
             }
-            self.note_secondary_handle(
-                &mut inner.arena_index_long_double_cache,
-                "idxldbl:lb",
-                code,
-                scope,
-                table,
-                *primary,
-                res,
-            );
-        }
-
+            None if self.db.arena_table_exists(code, scope, table) => inner
+                .arena_index_long_double_cache
+                .cache_table((code, scope, table)),
+            None => -1,
+        };
         Ok(res)
     }
 
@@ -3555,44 +2129,26 @@ impl ApplyContext {
     ) -> Result<i32, ChainError> {
         let search = (secondary.lo, secondary.hi);
         let mut inner = self.inner.write()?;
-        let res = self.db.db_idx_long_double_upperbound(
-            &mut inner.index_long_double_cache,
-            code,
-            scope,
-            table,
-            secondary,
-            primary,
-        )?;
-
-        {
-            let arena = self
-                .db
-                .arena_idx_long_double_upper_bound(code, scope, table, search);
-            let ffi = if res >= 0 {
-                Some((*primary, (secondary.lo, secondary.hi)))
-            } else {
-                None
-            };
-            self.db.arena_note_pos(arena == ffi);
-            if self.db.arena_reads_enabled()
-                && res >= 0
-                && let Some((p, (lo, hi))) = arena
-            {
+        let arena = self
+            .db
+            .arena_idx_long_double_upper_bound(code, scope, table, search);
+        let res = match arena {
+            Some((p, (lo, hi))) => {
                 *primary = p;
                 secondary.lo = lo;
                 secondary.hi = hi;
+                inner
+                    .arena_index_long_double_cache
+                    .cache_table((code, scope, table));
+                inner
+                    .arena_index_long_double_cache
+                    .add((code, scope, table, p))
             }
-            self.note_secondary_handle(
-                &mut inner.arena_index_long_double_cache,
-                "idxldbl:ub",
-                code,
-                scope,
-                table,
-                *primary,
-                res,
-            );
-        }
-
+            None if self.db.arena_table_exists(code, scope, table) => inner
+                .arena_index_long_double_cache
+                .cache_table((code, scope, table)),
+            None => -1,
+        };
         Ok(res)
     }
 
@@ -3603,22 +2159,13 @@ impl ApplyContext {
         table: u64,
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        let res = self.db.db_idx_long_double_end(
-            &mut inner.index_long_double_cache,
-            code,
-            scope,
-            table,
-        )?;
-        {
-            let arena_h = if res == -1 {
-                -1
-            } else {
-                inner
-                    .arena_index_long_double_cache
-                    .cache_table((code, scope, table))
-            };
-            self.note_iter_handle("idxldbl:end", code, scope, table, arena_h, res);
-        }
+        let res = if self.db.arena_table_exists(code, scope, table) {
+            inner
+                .arena_index_long_double_cache
+                .cache_table((code, scope, table))
+        } else {
+            -1
+        };
         Ok(res)
     }
 
@@ -3628,33 +2175,25 @@ impl ApplyContext {
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        let res = self.db.db_idx_long_double_next(
-            &mut inner.index_long_double_cache,
-            iterator,
-            primary,
-        )?;
+        let res = if iterator < -1 {
+            -1
+        } else if let Some((code, scope, table, cur)) =
+            inner.arena_index_long_double_cache.row_of(iterator)
         {
-            let arena_h = if iterator < -1 {
-                -1
-            } else if let Some((code, scope, table, cur)) =
-                inner.arena_index_long_double_cache.row_of(iterator)
-            {
-                match self.db.arena_idx_long_double_next(code, scope, table, cur) {
-                    Some(np) => {
-                        self.db.arena_note_pos(res < 0 || np == *primary);
-                        inner
-                            .arena_index_long_double_cache
-                            .add((code, scope, table, np))
-                    }
-                    None => inner
+            match self.db.arena_idx_long_double_next(code, scope, table, cur) {
+                Some(np) => {
+                    *primary = np;
+                    inner
                         .arena_index_long_double_cache
-                        .cache_table((code, scope, table)),
+                        .add((code, scope, table, np))
                 }
-            } else {
-                res
-            };
-            self.note_iter_handle("idxldbl:next", 0, 0, 0, arena_h, res);
-        }
+                None => inner
+                    .arena_index_long_double_cache
+                    .cache_table((code, scope, table)),
+            }
+        } else {
+            -1
+        };
         Ok(res)
     }
 
@@ -3664,81 +2203,37 @@ impl ApplyContext {
         primary: &mut u64,
     ) -> Result<i32, ChainError> {
         let mut inner = self.inner.write()?;
-        let res = self.db.db_idx_long_double_previous(
-            &mut inner.index_long_double_cache,
-            iterator,
-            primary,
-        )?;
+        let res = if let Some((code, scope, table)) =
+            inner.arena_index_long_double_cache.table_of_end(iterator)
         {
-            let arena_h = if let Some((code, scope, table)) =
-                inner.arena_index_long_double_cache.table_of_end(iterator)
-            {
-                match self.db.arena_idx_long_double_last(code, scope, table) {
-                    Some(lp) => {
-                        self.db.arena_note_pos(res < 0 || lp == *primary);
-                        inner
-                            .arena_index_long_double_cache
-                            .add((code, scope, table, lp))
-                    }
-                    None => -1,
+            match self.db.arena_idx_long_double_last(code, scope, table) {
+                Some(lp) => {
+                    *primary = lp;
+                    inner
+                        .arena_index_long_double_cache
+                        .add((code, scope, table, lp))
                 }
-            } else if let Some((code, scope, table, cur)) =
-                inner.arena_index_long_double_cache.row_of(iterator)
+                None => -1,
+            }
+        } else if let Some((code, scope, table, cur)) =
+            inner.arena_index_long_double_cache.row_of(iterator)
+        {
+            match self
+                .db
+                .arena_idx_long_double_previous(code, scope, table, cur)
             {
-                match self
-                    .db
-                    .arena_idx_long_double_previous(code, scope, table, cur)
-                {
-                    Some(pp) => {
-                        self.db.arena_note_pos(res < 0 || pp == *primary);
-                        inner
-                            .arena_index_long_double_cache
-                            .add((code, scope, table, pp))
-                    }
-                    None => -1,
+                Some(pp) => {
+                    *primary = pp;
+                    inner
+                        .arena_index_long_double_cache
+                        .add((code, scope, table, pp))
                 }
-            } else {
-                res
-            };
-            self.note_iter_handle("idxldbl:prev", 0, 0, 0, arena_h, res);
-        }
-        Ok(res)
-    }
-
-    pub fn find_table(
-        &self,
-        code: u64,
-        scope: u64,
-        table: u64,
-    ) -> Result<*const TableObject, ChainError> {
-        self.db.find_table(code, scope, table)
-    }
-
-    pub fn find_or_create_table(
-        &mut self,
-        code: u64,
-        scope: u64,
-        table_name: u64,
-        payer: u64,
-    ) -> Result<*const TableObject, ChainError> {
-        let table = self.find_table(code, scope, table_name)?;
-
-        if table.is_null() {
-            self.update_db_usage(&payer.into(), billable_size_v::<TableObject>() as i64)?;
-
-            return self.db.create_table(code, scope, table_name, payer);
+                None => -1,
+            }
         } else {
-            Ok(table)
-        }
-    }
-
-    pub fn remove_table(&mut self, table: &TableObject) -> Result<(), ChainError> {
-        self.update_db_usage(
-            &table.get_payer().to_uint64_t().into(),
-            -(billable_size_v::<TableObject>() as i64),
-        )?;
-        self.db.remove_table(table)?;
-        Ok(())
+            -1
+        };
+        Ok(res)
     }
 
     pub fn update_db_usage(&mut self, payer: &Name, delta: i64) -> Result<(), ChainError> {
@@ -3901,39 +2396,6 @@ impl ApplyContext {
     pub fn validate_ram_usage(&self, account: &Name) -> Result<(), ChainError> {
         self.trx_context.validate_ram_usage(account)
     }
-}
-
-/// The `(code, scope, table, primary)` a live iterator points at, or `None` for
-/// an end iterator (no backing row). Used to seed the arena positioning checks.
-fn current_iter_key(cache: &KeyValueIteratorCache, iterator: i32) -> Option<(u64, u64, u64, u64)> {
-    let obj = cache.get(iterator).ok()?;
-    let table = cache.get_table(obj.get_table_id()).ok()?;
-    Some((
-        table.get_code().to_uint64_t(),
-        table.get_scope().to_uint64_t(),
-        table.get_table().to_uint64_t(),
-        obj.get_primary_key(),
-    ))
-}
-
-/// The primary key iterator `res` lands on, or `None` for an end iterator.
-fn landing_primary(cache: &KeyValueIteratorCache, res: i32) -> Option<u64> {
-    if res < 0 {
-        return None;
-    }
-    cache.get(res).ok().map(|o| o.get_primary_key())
-}
-
-/// The `(code, scope, table)` an end iterator belongs to, so a step back from
-/// the end can be positioned against the arena. `None` if `iterator` isn't a
-/// known end iterator.
-fn end_iter_table(cache: &KeyValueIteratorCache, iterator: i32) -> Option<(u64, u64, u64)> {
-    let table = cache.find_table_by_end_iterator(iterator).ok().flatten()?;
-    Some((
-        table.get_code().to_uint64_t(),
-        table.get_scope().to_uint64_t(),
-        table.get_table().to_uint64_t(),
-    ))
 }
 
 /// A pure-Rust twin of the chainbase `iterator_cache`, keyed on the logical row

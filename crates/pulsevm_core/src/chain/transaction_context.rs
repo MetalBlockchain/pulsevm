@@ -786,10 +786,8 @@ impl TransactionContext {
     }
 
     pub fn record_transaction(&mut self, id: &Id, expiration: u32) -> Result<(), ChainError> {
-        let id_digest = id.to_digest()?;
-
         self.db
-            .record_transaction(&id_digest, expiration)
+            .record_transaction(&id.0.0, expiration)
             .map_err(|e| ChainError::DatabaseError(format!("duplicate tx: {}", e)))
     }
 

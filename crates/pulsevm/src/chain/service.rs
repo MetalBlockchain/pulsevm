@@ -240,9 +240,16 @@ impl RpcServer for RpcService {
     async fn get_abi(&self, account_name: Name) -> Result<AbiDefinition, ErrorObjectOwned> {
         let controller = self.controller.read().await;
         let db = controller.database();
-        let r = db.read()?;
-        let code_account = r.get_account(account_name.as_u64())?;
-        let abi = AbiDefinition::read(code_account.get_abi().as_slice(), &mut 0).map_err(|e| {
+        let abi_bytes = db
+            .arena_account_abi_bytes(account_name.as_u64())
+            .ok_or_else(|| {
+                ErrorObjectOwned::owned(
+                    404,
+                    "account_error",
+                    Some(format!("account {} not found", account_name)),
+                )
+            })?;
+        let abi = AbiDefinition::read(abi_bytes.as_slice(), &mut 0).map_err(|e| {
             ErrorObjectOwned::owned(400, "abi_error", Some(format!("failed to read ABI: {}", e)))
         })?;
         Ok(abi)
@@ -297,12 +304,12 @@ impl RpcServer for RpcService {
     ) -> Result<GetCodeHashResponse, ErrorObjectOwned> {
         let controller = self.controller.read().await;
         let db = controller.database();
-        let r = db.read()?;
-        let accnt_obj = r.get_account_metadata(account_name.as_u64())?;
-        let code_hash = accnt_obj.get_code_hash();
+        let (code_hash, _vm_type, _vm_version) = db
+            .account_code_hash_vm(account_name.as_u64())
+            .map_err(|e| ErrorObjectOwned::owned(404, "account_error", Some(format!("{}", e))))?;
         Ok(GetCodeHashResponse {
             account_name,
-            code_hash: code_hash.into(),
+            code_hash: Id::new(code_hash),
         })
     }
 
@@ -400,21 +407,23 @@ impl RpcServer for RpcService {
     async fn get_raw_abi(&self, account_name: Name) -> Result<GetRawABIResponse, ErrorObjectOwned> {
         let controller = self.controller.read().await;
         let db = controller.database();
-        let r = db.read()?;
-        let account = r.get_account(account_name.as_u64())?;
-        let account_metadata = r.get_account_metadata(account_name.as_u64())?;
+        let abi_bytes = db
+            .arena_account_abi_bytes(account_name.as_u64())
+            .unwrap_or_default();
+        let (code_hash, _vm_type, _vm_version) = db
+            .account_code_hash_vm(account_name.as_u64())
+            .map_err(|e| ErrorObjectOwned::owned(404, "account_error", Some(format!("{}", e))))?;
 
         let mut abi_hash = Digest::default();
-
-        if account.get_abi().size() > 0 {
-            abi_hash = Digest::hash(account.get_abi().as_slice());
+        if !abi_bytes.is_empty() {
+            abi_hash = Digest::hash(abi_bytes.as_slice());
         }
 
         Ok(GetRawABIResponse {
             account_name,
-            code_hash: account_metadata.get_code_hash().into(),
+            code_hash: Id::new(code_hash),
             abi_hash,
-            abi: Base64Bytes::new(account.get_abi().as_slice().to_vec()),
+            abi: Base64Bytes::new(abi_bytes),
         })
     }
 

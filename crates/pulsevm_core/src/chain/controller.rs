@@ -89,14 +89,11 @@ use pulsevm_error::ChainError;
 use pulsevm_ffi::{
     Authority,
     BlockTimestamp,
-    CxxGenesisState,
     Database,
     ElasticLimitParameters,
-    GlobalPropertyObject,
     Microseconds,
     PermissionLevelWeight,
     TimePoint,
-    UndoSession,
     seconds,
 };
 use pulsevm_grpc::vm;
@@ -186,10 +183,9 @@ struct PendingBlock {
     // Parent block id. For the front of the chain this equals the last accepted
     // block; for later entries it is the previous entry's id.
     parent: Id,
-    // Live chainbase undo session holding this block's state mutations. Kept
-    // alive (neither pushed nor undone) so the state stays applied; accepting the
-    // block pushes+commits it, unwinding undoes it.
-    session: UniquePtr<UndoSession>,
+    // The block's mutations live on the arena's undo stack (an
+    // `arena_start_undo_session` was opened when this entry was pushed). Accepting
+    // the block commits that level; unwinding past it undoes it.
     // Transaction traces produced during execution, needed by `store_traces` at
     // accept time. Retaining them avoids recomputing via a second execution.
     traces: Vec<TransactionTrace>,
@@ -201,11 +197,11 @@ struct PendingBlock {
 
 impl Drop for Controller {
     fn drop(&mut self) {
-        // The pending sessions form a chainbase undo stack and must be released in
-        // reverse (LIFO) order. Letting the `Vec<PendingBlock>` drop naturally would
-        // destroy them oldest-first, undoing the stack out of order and corrupting
-        // it. Pop from the tip so each session's destructor undoes the top state.
-        while self.pending_chain.pop().is_some() {}
+        // The pending blocks form the arena's undo stack and must be released in
+        // reverse (LIFO) order, undoing each speculative level from the tip down.
+        while self.pending_chain.pop().is_some() {
+            self.db.arena_undo();
+        }
     }
 }
 
@@ -288,14 +284,8 @@ impl Controller {
     // reverse order to respect chainbase's LIFO undo stack.
     fn unwind_pending_to(&mut self, len: usize) -> Result<(), ChainError> {
         while self.pending_chain.len() > len {
-            let mut entry = self.pending_chain.pop().unwrap();
-            entry.session.pin_mut().undo().map_err(|e| {
-                ChainError::DatabaseError(format!(
-                    "failed to undo pending block {}: {}",
-                    entry.id, e
-                ))
-            })?;
-            self.db.arena_undo(); // pop the mirror's matching session in lockstep
+            let _entry = self.pending_chain.pop().unwrap();
+            self.db.arena_undo(); // pop the matching arena session
         }
         Ok(())
     }
@@ -336,16 +326,9 @@ impl Controller {
         // mutation is reflected. A no-op unless the arena-shadow feature is on.
         self.db.enable_shadow()?;
 
-        // Parse genesis bytes
-        let genesis_json = std::str::from_utf8(genesis_bytes).map_err(|e| {
-            ChainError::ParseError(format!("failed to parse genesis bytes as UTF-8: {}", e))
-        })?;
-        let genesis = CxxGenesisState::new(genesis_json)
-            .map_err(|e| ChainError::ParseError(format!("failed to parse genesis: {}", e)))?;
-        // Pure-Rust view of the same genesis: the arena is authored from this,
-        // and the schedule/timestamp below are read from it so the initial state
-        // never routes through C++. The bridge copy still feeds the chainbase
-        // genesis path while that path remains as the parity oracle.
+        // Pure-Rust view of the genesis: the arena is authored directly from this,
+        // and the schedule/timestamp below are read from it, so the initial state
+        // never routes through C++.
         let rust_genesis = pulsevm_ffi::GenesisState::from_bytes(genesis_bytes)?;
         self.chain_id = chain_id.clone();
 
@@ -411,11 +394,9 @@ impl Controller {
         if revision <= 0 {
             // Initialize the database with the genesis state
             info!("initializing database with genesis state");
-            self.db
-                .initialize_database(&genesis, &rust_genesis)
-                .map_err(|e| {
-                    ChainError::GenesisError(format!("failed to initialize database: {}", e))
-                })?;
+            self.db.initialize_database(&rust_genesis).map_err(|e| {
+                ChainError::GenesisError(format!("failed to initialize database: {}", e))
+            })?;
             // initialize_database seeds the resource-limits config from the C++
             // struct defaults (default_max_block_cpu_usage), not from genesis, so
             // the very first block would run under those tiny defaults until the
@@ -576,8 +557,7 @@ impl Controller {
         self.replay_accepted_state_to(self.preferred_id, &block_status, mempool)?;
 
         let mut db = self.db.clone();
-        let mut block_session = db.create_undo_session(true)?;
-        db.arena_start_undo_session(); // mirror the block session; retained on the pending chain
+        db.arena_start_undo_session(); // the block session; retained on the pending chain
 
         // Expiry clearing is part of the block's state, so it belongs inside the
         // block's session rather than before it.
@@ -611,20 +591,13 @@ impl Controller {
                 continue;
             }
 
-            let mut child_session = db.create_undo_session(true)?;
-            db.arena_start_undo_session(); // mirror the per-transaction session
+            db.arena_start_undo_session(); // open the per-transaction session
             let transaction_result =
                 self.execute_transaction(&transaction, &timestamp, &block_status);
 
             match transaction_result {
                 Ok(result) => {
-                    child_session.pin_mut().squash().map_err(|e| {
-                        ChainError::DatabaseError(format!(
-                            "failed to commit transaction changes: {}",
-                            e
-                        ))
-                    })?; // Push changes to upstream session
-                    db.arena_squash(); // fold the tx into the block on both
+                    db.arena_squash(); // fold the tx into the block
 
                     // Add the transaction to the block
                     transaction_traces.push(result.trace.clone());
@@ -642,10 +615,7 @@ impl Controller {
                         e
                     );
 
-                    child_session.pin_mut().undo().map_err(|e| {
-                        ChainError::DatabaseError(format!("failed to undo changes: {}", e))
-                    })?; // Revert changes made during this transaction
-                    db.arena_undo(); // a failed tx leaves no trace on either
+                    db.arena_undo(); // a failed tx leaves no trace
                 }
             }
         }
@@ -657,11 +627,7 @@ impl Controller {
 
         // Don't build a block if we have no transactions
         if transaction_receipts.len() == 0 {
-            block_session
-                .pin_mut()
-                .undo()
-                .map_err(|e| ChainError::DatabaseError(format!("failed to undo changes: {}", e)))?;
-            db.arena_undo(); // discard the empty block's session on both
+            db.arena_undo(); // discard the empty block's session
             return Err(ChainError::NetworkError(format!(
                 "built block has no transactions"
             )));
@@ -692,9 +658,7 @@ impl Controller {
         match parent_schedule.block_signing_key(&producer) {
             Some(scheduled) if *scheduled == signing_key => {}
             _ => {
-                block_session.pin_mut().undo().map_err(|e| {
-                    ChainError::DatabaseError(format!("failed to undo changes: {}", e))
-                })?;
+                db.arena_undo(); // discard this block's session
                 return Err(ChainError::BlockError(format!(
                     "node key is not the active schedule key for producer {}; refusing to produce",
                     producer
@@ -746,7 +710,6 @@ impl Controller {
         self.pending_chain.push(PendingBlock {
             id: block_id,
             parent: self.preferred_id,
-            session: block_session,
             traces: transaction_traces,
             proposed_schedule,
         });
@@ -926,14 +889,12 @@ impl Controller {
         self.replay_accepted_state_to(parent_block_id.clone(), &block_status, mempool)?;
 
         // This block's own session sits on top of the reconciled parent state. If
-        // execution or validation below fails, `?` drops the session and chainbase
-        // undoes it, leaving the pending chain at the parent.
-        let block_session = self.db.create_undo_session(true)?;
-        self.db.arena_start_undo_session(); // mirror the block session; retained on the pending chain
+        // execution or validation below fails, each early return undoes the arena
+        // session explicitly, leaving the pending chain at the parent.
+        self.db.arena_start_undo_session(); // the block session; retained on the pending chain
 
-        // On any failure below, `block_session` drops and chainbase undoes it via
-        // RAII; the arena has no such hook, so mirror the undo explicitly before
-        // returning, keeping the two session stacks the same depth.
+        // The arena has no RAII undo hook, so every failure path below mirrors the
+        // undo explicitly before returning, keeping the session stack depth right.
         let (transaction_traces, transaction_mroot, action_mroot, proposed_schedule) =
             match self.execute_block(block, &block_status, mempool) {
                 Ok(v) => v,
@@ -965,7 +926,6 @@ impl Controller {
         self.pending_chain.push(PendingBlock {
             id: block_id,
             parent: parent_block_id,
-            session: block_session,
             traces: transaction_traces,
             proposed_schedule,
         });
@@ -1005,7 +965,7 @@ impl Controller {
             .map(|p| p.id == *block_id)
             .unwrap_or(false);
 
-        let (mut session, transaction_traces) = if front_matches {
+        let transaction_traces = if front_matches {
             let front = self.pending_chain.remove(0);
             // `execute_block` removes accepted transactions from the mempool as it
             // runs; the retained pass did not (build pops them while assembling,
@@ -1013,7 +973,7 @@ impl Controller {
             for receipt in &block.transactions {
                 mempool.remove_transaction(receipt.trx().id());
             }
-            (front.session, front.traces)
+            front.traces
         } else {
             // Fallback: the block is not the retained front (e.g. a fork sibling
             // won, or nothing is pending). Discard the pending chain and execute
@@ -1025,24 +985,22 @@ impl Controller {
                 )));
             }
             self.clear_pending()?;
-            let session = self.db.create_undo_session(true)?;
-            self.db.arena_start_undo_session(); // mirror the fallback accept session; committed below
+            self.db.arena_start_undo_session(); // the fallback accept session; committed below
             let block_status = BlockStatus::Accepting;
-            let (transaction_traces, _transaction_mroot, _action_mroot, _proposed_schedule) = self
-                .execute_block(&block, &block_status, mempool)
-                .map_err(|e| {
-                    ChainError::DatabaseError(format!(
+            match self.execute_block(&block, &block_status, mempool) {
+                Ok((transaction_traces, _, _, _)) => transaction_traces,
+                Err(e) => {
+                    self.db.arena_undo();
+                    return Err(ChainError::DatabaseError(format!(
                         "failed to execute block {}: {}",
                         block_id, e
-                    ))
-                })?;
-            (session, transaction_traces)
+                    )));
+                }
+            }
         };
 
-        session
-            .pin_mut()
-            .push()
-            .map_err(|e| ChainError::TransactionError(format!("failed to commit block: {}", e)))?;
+        // The block's arena session is retained (not undone); the commit below
+        // collapses it into the accepted state.
         self.block_log
             .as_ref()
             .map(|log| log.append(block_id.clone(), &packed_block));
@@ -1197,8 +1155,7 @@ impl Controller {
         ))?;
 
         let trx_id = *packed.id();
-        let mut session = self.db.create_undo_session(true)?;
-        self.db.arena_start_undo_session(); // mirror the onblock session
+        self.db.arena_start_undo_session(); // the onblock session
         let mut trx_context = TransactionContext::new(
             self.db.clone(),
             self.wasm_runtime.clone(),
@@ -1219,10 +1176,7 @@ impl Controller {
 
         match executed {
             Ok(result) => {
-                session.pin_mut().squash().map_err(|e| {
-                    ChainError::DatabaseError(format!("failed to commit onblock: {}", e))
-                })?;
-                self.db.arena_squash(); // fold onblock into the block on both
+                self.db.arena_squash(); // fold onblock into the block
                 Ok((result.action_receipt_digests, result.proposed_schedule))
             }
             Err(e) => {
@@ -1234,10 +1188,7 @@ impl Controller {
                 } else {
                     warn!("onblock failed, skipping: {}", e);
                 }
-                session.pin_mut().undo().map_err(|e| {
-                    ChainError::DatabaseError(format!("failed to undo onblock: {}", e))
-                })?;
-                self.db.arena_undo(); // a failed onblock leaves no trace on either
+                self.db.arena_undo(); // a failed onblock leaves no trace
                 Ok((VecDeque::new(), None))
             }
         }
@@ -1389,11 +1340,10 @@ impl Controller {
         // no pending block, so the active set a contract reads is the accepted one.
         self.block_active_schedule = self.active_schedule.clone();
         let mut db = self.db.clone();
-        let _undo_session = db.create_undo_session(true)?;
         db.arena_start_undo_session();
         let result = self.execute_transaction(transaction, pending_block_timestamp, block_status);
-        // Mempool admission is advisory: `_undo_session` reverts chainbase when
-        // it drops, so revert the arena in lockstep on both the ok and err path.
+        // Mempool admission is advisory: revert the arena session on both the ok
+        // and err path.
         db.arena_undo();
         result
     }
@@ -1846,37 +1796,11 @@ impl Controller {
         }
     }
 
-    pub fn store_chain_state(&mut self, block_id: &Id) -> Result<(), ChainError> {
-        // SHiP chain-state deltas are packed from chainbase. When the arena is the
-        // sole writer, chainbase carries only genesis and is not the authoritative
-        // state, so there is nothing meaningful to pack; skip it (delta-packing
-        // over the arena is a follow-up). This keeps accept_block from depending
-        // on chainbase on the arena-only path.
-        if self.db.arena_standalone_writes() {
-            return Ok(());
-        }
-        match &self.chain_state_log {
-            None => {
-                return Err(ChainError::InternalError(
-                    "chain state log not initialized".to_string(),
-                ));
-            }
-            Some(chain_state_log) => {
-                let fresh = chain_state_log.range().is_none();
-                let chain_state = self.db.pack_deltas(fresh)?;
-
-                chain_state_log
-                    .append(block_id.clone(), &chain_state)
-                    .map_err(|e| {
-                        ChainError::InternalError(format!(
-                            "failed to append to chain state log: {}",
-                            e
-                        ))
-                    })?;
-
-                return Ok(());
-            }
-        }
+    pub fn store_chain_state(&mut self, _block_id: &Id) -> Result<(), ChainError> {
+        // SHiP chain-state deltas were packed from chainbase. The arena is now the
+        // sole writer and does not yet emit deltas, so there is nothing to pack
+        // here (delta-packing over the arena is a follow-up).
+        Ok(())
     }
 
     pub fn set_state(&mut self, state: vm::State) {
@@ -1940,20 +1864,18 @@ impl Controller {
                 block.id()?,
                 self.pending_tip_id()
             );
-            let session = self.db.create_undo_session(true)?;
-            self.db.arena_start_undo_session(); // mirror the replayed block's session
+            self.db.arena_start_undo_session(); // the replayed block's session
             let (traces, _transaction_mroot, _action_mroot, proposed_schedule) =
                 match self.execute_block(block, block_status, mempool) {
                     Ok(v) => v,
                     Err(e) => {
-                        self.db.arena_undo(); // session drops on the error; mirror the undo
+                        self.db.arena_undo(); // undo the session on the error
                         return Err(e);
                     }
                 };
             self.pending_chain.push(PendingBlock {
                 id: block.id()?,
                 parent: block.previous_id().clone(),
-                session,
                 traces,
                 proposed_schedule,
             });
@@ -2735,1869 +2657,6 @@ mod tests {
         let packed_trx = PackedTransaction::from_signed_transaction(trx)?;
         Ok(packed_trx)
     }
-
-    /// Oracle harness (step 1): run a real newaccount transaction through the
-    /// controller and check the arena mirror agrees with chainbase on the new
-    /// account's metadata. Executing the action drives the same `create_account`
-    /// / `create_account_metadata` paths that carry the mirror hooks. This is the
-    /// feedback loop the session-lockstep work is built against.
-    #[tokio::test]
-    async fn oracle_newaccount_mirrors_into_arena() -> Result<(), ChainError> {
-        let chain_id =
-            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
-                .unwrap();
-        let private_key =
-            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
-        let mut controller = Controller::new();
-        let genesis_bytes = generate_genesis(&private_key);
-        let temp_path = get_temp_dir();
-        let config_bytes = json!({
-            "producer_name": "pulse",
-            "producer_key": private_key.to_string(),
-        })
-        .to_string()
-        .into_bytes();
-        controller.initialize(
-            &chain_id,
-            &config_bytes,
-            &genesis_bytes.to_vec(),
-            temp_path.path().to_str().unwrap(),
-        )?;
-        let ts = controller.last_accepted_block().timestamp().clone();
-        let chain_id = controller.chain_id().clone();
-        let status = BlockStatus::Building;
-
-        controller.execute_transaction(
-            &create_account(&private_key, Name::from_str("glenn")?, chain_id)?,
-            &ts,
-            &status,
-        )?;
-
-        let db = controller.database();
-        let name = Name::from_str("glenn")?.as_u64();
-        // chainbase created the account_metadata...
-        assert!(
-            !db.find_account_metadata(name)?.is_null(),
-            "chainbase is missing glenn's account_metadata"
-        );
-        // ...and the arena mirror must carry the same row.
-        assert_eq!(
-            db.arena_account_metadata_privileged(name),
-            Some(false),
-            "arena did not mirror glenn's account_metadata"
-        );
-        Ok(())
-    }
-
-    /// Oracle harness (step 2): the arena's undo session must track chainbase's.
-    /// Run a newaccount inside an undo session, mirror the session on the arena,
-    /// then undo both — chainbase discards the account and the arena must too.
-    /// Omitting the `arena_*` lockstep calls makes the final assert fail (the
-    /// arena keeps a row chainbase discarded), which is the divergence the full
-    /// controller wiring must avoid.
-    #[tokio::test]
-    async fn oracle_undone_tx_leaves_no_trace_in_arena() -> Result<(), ChainError> {
-        let chain_id =
-            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
-                .unwrap();
-        let private_key =
-            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
-        let mut controller = Controller::new();
-        let genesis_bytes = generate_genesis(&private_key);
-        let temp_path = get_temp_dir();
-        let config_bytes = json!({
-            "producer_name": "pulse",
-            "producer_key": private_key.to_string(),
-        })
-        .to_string()
-        .into_bytes();
-        controller.initialize(
-            &chain_id,
-            &config_bytes,
-            &genesis_bytes.to_vec(),
-            temp_path.path().to_str().unwrap(),
-        )?;
-        let ts = controller.last_accepted_block().timestamp().clone();
-        let chain_id = controller.chain_id().clone();
-        let status = BlockStatus::Building;
-        let name = Name::from_str("glenn")?.as_u64();
-
-        // A clone shares the same chainbase and the same arena mirror.
-        let mut db = controller.database();
-        let mut session = db.create_undo_session(true)?;
-        db.arena_start_undo_session();
-
-        controller.execute_transaction(
-            &create_account(&private_key, Name::from_str("glenn")?, chain_id)?,
-            &ts,
-            &status,
-        )?;
-        // Inside the session, both sides have the account.
-        assert!(!db.find_account_metadata(name)?.is_null());
-        assert_eq!(db.arena_account_metadata_privileged(name), Some(false));
-
-        // Undo the session on both.
-        session
-            .pin_mut()
-            .undo()
-            .map_err(|e| ChainError::DatabaseError(format!("{}", e)))?;
-        db.arena_undo();
-
-        // Both must now agree the account is gone.
-        assert!(
-            db.find_account_metadata(name)?.is_null(),
-            "chainbase kept the undone account"
-        );
-        assert_eq!(
-            db.arena_account_metadata_privileged(name),
-            None,
-            "arena kept a row chainbase undid — session desync"
-        );
-        Ok(())
-    }
-
-    /// Oracle harness (step 3): the real block path. verify_block executes a
-    /// block speculatively and undoes it, so the arena must not retain the
-    /// block's writes; accept_block commits, so the arena must then match
-    /// chainbase. This exercises the arena session lockstep wired into
-    /// build/verify/accept.
-    #[tokio::test]
-    async fn oracle_block_accept_mirrors_into_arena() -> Result<(), ChainError> {
-        let chain_id =
-            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
-                .unwrap();
-        let private_key =
-            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
-        let mempool = Arc::new(RwLock::new(Mempool::new()));
-        let mut mempool = mempool.write().await;
-        let mut controller = Controller::new();
-        let genesis_bytes = generate_genesis(&private_key);
-        let temp_path = get_temp_dir();
-        let config_bytes = json!({
-            "producer_name": "pulse",
-            "producer_key": private_key.to_string(),
-        })
-        .to_string()
-        .into_bytes();
-        controller.initialize(
-            &chain_id,
-            &config_bytes,
-            &genesis_bytes.to_vec(),
-            temp_path.path().to_str().unwrap(),
-        )?;
-        let chain_id = controller.chain_id().clone();
-        let name = Name::from_str("glenn")?.as_u64();
-
-        // build_block produces a valid block and retains its speculative session
-        // on the pending chain (committed on accept, undone if the chain unwinds
-        // past it), so the account it created stays visible on BOTH backends. The
-        // mirror invariant is that the arena agrees with chainbase, whatever the
-        // session policy — so compare the two rather than assume undo/retain.
-        mempool.add_transaction(create_account(
-            &private_key,
-            Name::from_str("glenn")?,
-            chain_id,
-        )?);
-        let block = controller.build_block(&mut mempool).await?;
-        let chain_has = !controller.database().find_account_metadata(name)?.is_null();
-        let arena_has = controller
-            .database()
-            .arena_account_metadata_privileged(name)
-            .is_some();
-        assert_eq!(
-            arena_has, chain_has,
-            "arena diverged from chainbase on the speculative account after build_block"
-        );
-
-        // accept_block commits: both sides must now hold the account.
-        controller.accept_block(&block.id()?, &mut mempool)?;
-        let db = controller.database();
-        assert!(
-            !db.find_account_metadata(name)?.is_null(),
-            "chainbase is missing the accepted account"
-        );
-        assert_eq!(
-            db.arena_account_metadata_privileged(name),
-            Some(false),
-            "accept_block did not commit the account into the arena"
-        );
-        Ok(())
-    }
-
-    /// Full-field oracle for account_metadata: a block that creates an account,
-    /// sets its code, then sets its abi must leave the arena's
-    /// account_metadata_object matching chainbase field-for-field. code_sequence
-    /// (setcode), abi_sequence (setabi) and auth_sequence (glenn authorizes all
-    /// three actions) each advance through a path the mirror drives via the
-    /// get_name accessor added to the FFI.
-    #[tokio::test]
-    async fn oracle_setcode_mirrors_account_metadata_fields() -> Result<(), ChainError> {
-        let chain_id =
-            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
-                .unwrap();
-        let private_key =
-            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
-        let mempool = Arc::new(RwLock::new(Mempool::new()));
-        let mut mempool = mempool.write().await;
-        let mut controller = Controller::new();
-        let genesis_bytes = generate_genesis(&private_key);
-        let temp_path = get_temp_dir();
-        let config_bytes = json!({
-            "producer_name": "pulse",
-            "producer_key": private_key.to_string(),
-        })
-        .to_string()
-        .into_bytes();
-        controller.initialize(
-            &chain_id,
-            &config_bytes,
-            &genesis_bytes.to_vec(),
-            temp_path.path().to_str().unwrap(),
-        )?;
-        let chain_id = controller.chain_id().clone();
-        let name = Name::from_str("glenn")?.as_u64();
-
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap();
-        let wasm = fs::read(root.join(Path::new("reference_contracts/pulse_token.wasm"))).unwrap();
-
-        // One block: create glenn, then set its code. Both must be committed by
-        // accept_block for the metadata comparison to be against durable state.
-        mempool.add_transaction(create_account(
-            &private_key,
-            Name::from_str("glenn")?,
-            chain_id,
-        )?);
-        mempool.add_transaction(set_code(
-            &private_key,
-            Name::from_str("glenn")?,
-            wasm,
-            chain_id,
-        )?);
-        // A minimal but valid ABI — setabi parses it before storing, so an empty
-        // blob would be rejected. The mirror only has to track the sequence bump
-        // and the stored bytes, not the ABI's meaning.
-        let abi = AbiDefinition {
-            version: "eosio::abi/1.2".to_string(),
-            types: vec![],
-            structs: vec![],
-            actions: vec![],
-            tables: vec![],
-            ricardian_clauses: vec![],
-            error_messages: vec![],
-            abi_extensions: vec![],
-            variants: vec![],
-            action_results: vec![],
-        };
-        mempool.add_transaction(set_abi(
-            &private_key,
-            Name::from_str("glenn")?,
-            abi.pack().unwrap(),
-            chain_id,
-        )?);
-        let block = controller.build_block(&mut mempool).await?;
-        controller.accept_block(&block.id()?, &mut mempool)?;
-
-        let db = controller.database();
-        let ptr = db.find_account_metadata(name)?;
-        assert!(
-            !ptr.is_null(),
-            "chainbase is missing the account after setcode"
-        );
-        // Safe: the pointer is non-null and the metadata object outlives this
-        // read (no mutation happens between the find and the accessor calls).
-        let chain_meta = unsafe { &*ptr };
-        let arena = db
-            .arena_account_metadata(name)
-            .expect("arena is missing the account after setcode");
-
-        assert_eq!(arena.privileged, chain_meta.is_privileged());
-        assert_eq!(arena.code_sequence, chain_meta.get_code_sequence());
-        assert_eq!(arena.abi_sequence, chain_meta.get_abi_sequence());
-        assert_eq!(arena.recv_sequence, chain_meta.get_recv_sequence());
-        assert_eq!(arena.auth_sequence, chain_meta.get_auth_sequence());
-        assert_eq!(arena.vm_type, chain_meta.get_vm_type());
-        assert_eq!(arena.vm_version, chain_meta.get_vm_version());
-        assert!(
-            arena.code_sequence >= 1,
-            "setcode did not advance code_sequence in the mirror"
-        );
-        assert!(
-            arena.abi_sequence >= 1,
-            "setabi did not advance abi_sequence in the mirror"
-        );
-        assert!(
-            arena.auth_sequence >= 1,
-            "authorizing the actions did not advance auth_sequence in the mirror"
-        );
-        Ok(())
-    }
-
-    /// Permission oracle: updateauth creating a new named permission under an
-    /// existing account must mirror into the arena. The permission is keyed by
-    /// (owner, name) — no opaque handle — so the check is presence plus the
-    /// stored parent id (must equal chainbase's) and the authority threshold
-    /// (must equal what the action set, proving the auth blob round-trips).
-    #[tokio::test]
-    async fn oracle_updateauth_mirrors_permission() -> Result<(), ChainError> {
-        let chain_id =
-            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
-                .unwrap();
-        let private_key =
-            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
-        let mempool = Arc::new(RwLock::new(Mempool::new()));
-        let mut mempool = mempool.write().await;
-        let mut controller = Controller::new();
-        let genesis_bytes = generate_genesis(&private_key);
-        let temp_path = get_temp_dir();
-        let config_bytes = json!({
-            "producer_name": "pulse",
-            "producer_key": private_key.to_string(),
-        })
-        .to_string()
-        .into_bytes();
-        controller.initialize(
-            &chain_id,
-            &config_bytes,
-            &genesis_bytes.to_vec(),
-            temp_path.path().to_str().unwrap(),
-        )?;
-        let chain_id = controller.chain_id().clone();
-        let glenn = Name::from_str("glenn")?;
-        let perm = Name::from_str("claude")?;
-
-        mempool.add_transaction(create_account(&private_key, glenn, chain_id)?);
-        // A new "claude" permission parented on active. Threshold 1 with the one
-        // available key keeps the authority satisfiable (updateauth rejects an
-        // authority whose threshold exceeds its total key weight).
-        mempool.add_transaction(update_auth(
-            &private_key,
-            glenn,
-            perm,
-            ACTIVE_NAME,
-            1,
-            chain_id,
-        )?);
-        let block = controller.build_block(&mut mempool).await?;
-        controller.accept_block(&block.id()?, &mut mempool)?;
-
-        let db = controller.database();
-        let owner = glenn.as_u64();
-        let perm_u = perm.as_u64();
-        let ptr = db.find_permission_by_actor_and_permission(owner, perm_u)?;
-        assert!(!ptr.is_null(), "chainbase is missing the new permission");
-        // Safe: non-null, and no mutation happens before the accessor read.
-        let chain_perm = unsafe { &*ptr };
-        let (parent, threshold) = db
-            .arena_permission(owner, perm_u)
-            .expect("arena is missing the new permission");
-
-        assert_eq!(
-            parent,
-            chain_perm.get_parent_id(),
-            "mirrored permission parent id diverged from chainbase"
-        );
-        assert_eq!(
-            threshold, 1,
-            "mirrored authority threshold did not round-trip"
-        );
-        Ok(())
-    }
-
-    /// Serve-path permission oracle: with arena reads enabled, authorization
-    /// resolves each permission's full authority from the arena
-    /// (`DbRead::permission_authority`), not from chainbase. Both transactions
-    /// here authorize before they execute, so build_block only succeeds if the
-    /// arena-served authority satisfies the signature — the real end-to-end proof
-    /// the served authority is correct. Afterwards the served value is read back
-    /// directly and the read cross-check must show zero divergences.
-    #[tokio::test]
-    async fn oracle_permission_authority_serves_from_arena() -> Result<(), ChainError> {
-        let chain_id =
-            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
-                .unwrap();
-        let private_key =
-            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
-        let mempool = Arc::new(RwLock::new(Mempool::new()));
-        let mut mempool = mempool.write().await;
-        let mut controller = Controller::new();
-        let genesis_bytes = generate_genesis(&private_key);
-        let temp_path = get_temp_dir();
-        let config_bytes = json!({
-            "producer_name": "pulse",
-            "producer_key": private_key.to_string(),
-        })
-        .to_string()
-        .into_bytes();
-        controller.initialize(
-            &chain_id,
-            &config_bytes,
-            &genesis_bytes.to_vec(),
-            temp_path.path().to_str().unwrap(),
-        )?;
-        // Serve authorization reads from the arena for the rest of this test.
-        controller.database().enable_arena_reads();
-
-        let chain_id = controller.chain_id().clone();
-        let glenn = Name::from_str("glenn")?;
-        let perm = Name::from_str("claude")?;
-
-        mempool.add_transaction(create_account(&private_key, glenn, chain_id)?);
-        mempool.add_transaction(update_auth(
-            &private_key,
-            glenn,
-            perm,
-            ACTIVE_NAME,
-            1,
-            chain_id,
-        )?);
-        // Authorization for both transactions runs through the arena-served
-        // authority; a wrong serve would fail the signature check here.
-        let block = controller.build_block(&mut mempool).await?;
-        controller.accept_block(&block.id()?, &mut mempool)?;
-
-        let db = controller.database();
-        let owner = glenn.as_u64();
-        let perm_u = perm.as_u64();
-
-        // Read the served authority back and confirm it is the arena's decoded
-        // value (threshold and one key, matching what updateauth set).
-        let served = db
-            .read()?
-            .permission_authority(owner, perm_u)?
-            .expect("arena did not serve the new permission's authority");
-        assert_eq!(served.threshold, 1, "served authority threshold is wrong");
-        assert_eq!(served.keys.len(), 1, "served authority key count is wrong");
-
-        // Every authorization read served during the two transactions matched
-        // chainbase byte-for-byte.
-        let (_ok, nc_fail) = db.arena_noncontract_crosscheck_counts();
-        assert_eq!(
-            nc_fail, 0,
-            "arena served {nc_fail} authorization reads that diverged from chainbase"
-        );
-        Ok(())
-    }
-
-    /// Serve-path satisfies oracle: the `permission_object::satisfies` check that
-    /// gates every updateauth walks the owner/id/parent tree. Build a chain
-    /// active -> a -> b -> c -> d; creating each child requires the authorizing
-    /// permission (active) to satisfy the new permission's parent, which for the
-    /// deeper links means walking up several parents. With arena reads enabled the
-    /// walk is served from the arena — a wrong walk (e.g. a permission-id space
-    /// that didn't track chainbase) would reject the updateauth and fail
-    /// build_block, and the read cross-check must stay clean. This is also the
-    /// end-to-end proof that arena permission ids match chainbase's.
-    #[tokio::test]
-    async fn oracle_permission_satisfies_serves_from_arena() -> Result<(), ChainError> {
-        let chain_id =
-            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
-                .unwrap();
-        let private_key =
-            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
-        let mempool = Arc::new(RwLock::new(Mempool::new()));
-        let mut mempool = mempool.write().await;
-        let mut controller = Controller::new();
-        let genesis_bytes = generate_genesis(&private_key);
-        let temp_path = get_temp_dir();
-        let config_bytes = json!({
-            "producer_name": "pulse",
-            "producer_key": private_key.to_string(),
-        })
-        .to_string()
-        .into_bytes();
-        controller.initialize(
-            &chain_id,
-            &config_bytes,
-            &genesis_bytes.to_vec(),
-            temp_path.path().to_str().unwrap(),
-        )?;
-        controller.database().enable_arena_reads();
-
-        let chain_id = controller.chain_id().clone();
-        let glenn = Name::from_str("glenn")?;
-        let (pa, pb, pc, pd) = (
-            Name::from_str("perma")?,
-            Name::from_str("permb")?,
-            Name::from_str("permc")?,
-            Name::from_str("permd")?,
-        );
-
-        mempool.add_transaction(create_account(&private_key, glenn, chain_id)?);
-        // active -> perma -> permb -> permc -> permd. Creating permc requires
-        // active to satisfy permb (one parent hop); permd requires active to
-        // satisfy permc (two hops) — the walk, not just the immediate-parent case.
-        mempool.add_transaction(update_auth(
-            &private_key,
-            glenn,
-            pa,
-            ACTIVE_NAME,
-            1,
-            chain_id,
-        )?);
-        mempool.add_transaction(update_auth(&private_key, glenn, pb, pa, 1, chain_id)?);
-        mempool.add_transaction(update_auth(&private_key, glenn, pc, pb, 1, chain_id)?);
-        mempool.add_transaction(update_auth(&private_key, glenn, pd, pc, 1, chain_id)?);
-        // Each updateauth authorizes through the arena-served satisfies walk; a
-        // wrong walk would reject one of these and fail build_block.
-        let block = controller.build_block(&mut mempool).await?;
-        controller.accept_block(&block.id()?, &mut mempool)?;
-
-        let db = controller.database();
-        let (_ok, nc_fail) = db.arena_noncontract_crosscheck_counts();
-        assert_eq!(
-            nc_fail, 0,
-            "arena served {nc_fail} authorization reads/satisfies checks that diverged from chainbase"
-        );
-
-        // Directly confirm the served walk: active satisfies the two-hop
-        // descendant permc, and permb does not satisfy its ancestor active.
-        let r = db.read()?;
-        let active_perm =
-            AuthorizationManager::get_permission(&r, glenn.as_u64(), ACTIVE_NAME.as_u64())?;
-        let permc = AuthorizationManager::get_permission(&r, glenn.as_u64(), pc.as_u64())?;
-        assert!(
-            active_perm.satisfies(&permc, &r)?,
-            "active must satisfy its descendant permc"
-        );
-        assert!(
-            !permc.satisfies(&active_perm, &r)?,
-            "a descendant must not satisfy its ancestor"
-        );
-        Ok(())
-    }
-
-    /// Permission-link oracle: linkauth binding an action to a permission must
-    /// mirror into the arena. The link is keyed by (account, code, message_type)
-    /// and the mirrored required_permission must equal chainbase's, read back
-    /// through the find_permission_link accessor added to the FFI.
-    #[tokio::test]
-    async fn oracle_linkauth_mirrors_permission_link() -> Result<(), ChainError> {
-        let chain_id =
-            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
-                .unwrap();
-        let private_key =
-            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
-        let mempool = Arc::new(RwLock::new(Mempool::new()));
-        let mut mempool = mempool.write().await;
-        let mut controller = Controller::new();
-        let genesis_bytes = generate_genesis(&private_key);
-        let temp_path = get_temp_dir();
-        let config_bytes = json!({
-            "producer_name": "pulse",
-            "producer_key": private_key.to_string(),
-        })
-        .to_string()
-        .into_bytes();
-        controller.initialize(
-            &chain_id,
-            &config_bytes,
-            &genesis_bytes.to_vec(),
-            temp_path.path().to_str().unwrap(),
-        )?;
-        let chain_id = controller.chain_id().clone();
-        let glenn = Name::from_str("glenn")?;
-        let perm = Name::from_str("claude")?;
-        let msg_type = Name::from_str("transfer")?;
-
-        mempool.add_transaction(create_account(&private_key, glenn, chain_id)?);
-        // Create the target permission, then link glenn's "transfer" actions on
-        // its own scope to require it.
-        mempool.add_transaction(update_auth(
-            &private_key,
-            glenn,
-            perm,
-            ACTIVE_NAME,
-            1,
-            chain_id,
-        )?);
-        mempool.add_transaction(link_auth(
-            &private_key,
-            glenn,
-            glenn,
-            msg_type,
-            perm,
-            chain_id,
-        )?);
-        let block = controller.build_block(&mut mempool).await?;
-        controller.accept_block(&block.id()?, &mut mempool)?;
-
-        let db = controller.database();
-        let (account, code, mtype) = (glenn.as_u64(), glenn.as_u64(), msg_type.as_u64());
-        let ptr = db.find_permission_link(account, code, mtype)?;
-        assert!(!ptr.is_null(), "chainbase is missing the permission link");
-        // Safe: non-null, and no mutation happens before the accessor read.
-        let chain_link = unsafe { &*ptr };
-        let required = db
-            .arena_permission_link(account, code, mtype)
-            .expect("arena is missing the permission link");
-
-        assert_eq!(
-            required,
-            chain_link.get_required_permission(),
-            "mirrored permission link required_permission diverged from chainbase"
-        );
-        assert_eq!(
-            required,
-            perm.as_u64(),
-            "link did not point at the new permission"
-        );
-        Ok(())
-    }
-
-    /// Removal oracle: unlinkauth then deleteauth must drop the mirrored rows in
-    /// step with chainbase. A permission cannot be deleted while a link points at
-    /// it, so the link is removed first. Afterwards both the link and the
-    /// permission must be absent on both sides.
-    #[tokio::test]
-    async fn oracle_unlink_and_delete_auth_remove_from_arena() -> Result<(), ChainError> {
-        let chain_id =
-            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
-                .unwrap();
-        let private_key =
-            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
-        let mempool = Arc::new(RwLock::new(Mempool::new()));
-        let mut mempool = mempool.write().await;
-        let mut controller = Controller::new();
-        let genesis_bytes = generate_genesis(&private_key);
-        let temp_path = get_temp_dir();
-        let config_bytes = json!({
-            "producer_name": "pulse",
-            "producer_key": private_key.to_string(),
-        })
-        .to_string()
-        .into_bytes();
-        controller.initialize(
-            &chain_id,
-            &config_bytes,
-            &genesis_bytes.to_vec(),
-            temp_path.path().to_str().unwrap(),
-        )?;
-        let chain_id = controller.chain_id().clone();
-        let glenn = Name::from_str("glenn")?;
-        let perm = Name::from_str("claude")?;
-        let msg_type = Name::from_str("transfer")?;
-
-        mempool.add_transaction(create_account(&private_key, glenn, chain_id)?);
-        mempool.add_transaction(update_auth(
-            &private_key,
-            glenn,
-            perm,
-            ACTIVE_NAME,
-            1,
-            chain_id,
-        )?);
-        mempool.add_transaction(link_auth(
-            &private_key,
-            glenn,
-            glenn,
-            msg_type,
-            perm,
-            chain_id,
-        )?);
-        mempool.add_transaction(unlink_auth(&private_key, glenn, glenn, msg_type, chain_id)?);
-        mempool.add_transaction(delete_auth(&private_key, glenn, perm, chain_id)?);
-        let block = controller.build_block(&mut mempool).await?;
-        controller.accept_block(&block.id()?, &mut mempool)?;
-
-        let db = controller.database();
-        let (account, code, mtype) = (glenn.as_u64(), glenn.as_u64(), msg_type.as_u64());
-
-        assert!(
-            db.find_permission_link(account, code, mtype)?.is_null(),
-            "chainbase kept the unlinked permission link"
-        );
-        assert_eq!(
-            db.arena_permission_link(account, code, mtype),
-            None,
-            "arena kept the unlinked permission link"
-        );
-        assert!(
-            db.find_permission_by_actor_and_permission(account, perm.as_u64())?
-                .is_null(),
-            "chainbase kept the deleted permission"
-        );
-        assert_eq!(
-            db.arena_permission(account, perm.as_u64()),
-            None,
-            "arena kept the deleted permission"
-        );
-        Ok(())
-    }
-
-    /// RAM oracle: after a block that creates an account and sets its code and
-    /// abi, the mirrored resource_usage.ram_usage must equal chainbase's. Every
-    /// RAM delta funnels through add_pending_ram_usage, which the mirror
-    /// accumulates, so this exercises the whole billing path end to end without
-    /// duplicating any billing rules — the mirror only replays the same deltas.
-    #[tokio::test]
-    async fn oracle_ram_usage_mirrors_chainbase() -> Result<(), ChainError> {
-        let chain_id =
-            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
-                .unwrap();
-        let private_key =
-            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
-        let mempool = Arc::new(RwLock::new(Mempool::new()));
-        let mut mempool = mempool.write().await;
-        let mut controller = Controller::new();
-        let genesis_bytes = generate_genesis(&private_key);
-        let temp_path = get_temp_dir();
-        let config_bytes = json!({
-            "producer_name": "pulse",
-            "producer_key": private_key.to_string(),
-        })
-        .to_string()
-        .into_bytes();
-        controller.initialize(
-            &chain_id,
-            &config_bytes,
-            &genesis_bytes.to_vec(),
-            temp_path.path().to_str().unwrap(),
-        )?;
-        let chain_id = controller.chain_id().clone();
-        let glenn = Name::from_str("glenn")?;
-
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap();
-        let wasm = fs::read(root.join(Path::new("reference_contracts/pulse_token.wasm"))).unwrap();
-        let abi = AbiDefinition {
-            version: "eosio::abi/1.2".to_string(),
-            types: vec![],
-            structs: vec![],
-            actions: vec![],
-            tables: vec![],
-            ricardian_clauses: vec![],
-            error_messages: vec![],
-            abi_extensions: vec![],
-            variants: vec![],
-            action_results: vec![],
-        };
-
-        mempool.add_transaction(create_account(&private_key, glenn, chain_id)?);
-        mempool.add_transaction(set_code(&private_key, glenn, wasm, chain_id)?);
-        mempool.add_transaction(set_abi(&private_key, glenn, abi.pack().unwrap(), chain_id)?);
-        let block = controller.build_block(&mut mempool).await?;
-        controller.accept_block(&block.id()?, &mut mempool)?;
-
-        let db = controller.database();
-        let name = glenn.as_u64();
-        let chain_ram = db.get_account_ram_usage(name)?;
-        let arena_ram = db
-            .arena_account_ram_usage(name)
-            .expect("arena is missing the resource_usage row");
-        assert_eq!(
-            arena_ram as i64, chain_ram,
-            "mirrored ram_usage diverged from chainbase"
-        );
-        assert!(chain_ram > 0, "expected the block to charge RAM");
-        Ok(())
-    }
-
-    /// Net/CPU usage oracle: authorizing transactions bills the account's
-    /// windowed net/cpu usage accumulators. After a create+setcode+setabi block
-    /// the mirrored accumulator value_ex (the pre-multiplied state, the exact
-    /// thing that persists) must equal chainbase's — proving the ported EMA
-    /// accumulator math and the config-window plumbing match bit for bit.
-    #[tokio::test]
-    async fn oracle_net_cpu_usage_mirrors_chainbase() -> Result<(), ChainError> {
-        let chain_id =
-            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
-                .unwrap();
-        let private_key =
-            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
-        let mempool = Arc::new(RwLock::new(Mempool::new()));
-        let mut mempool = mempool.write().await;
-        let mut controller = Controller::new();
-        let genesis_bytes = generate_genesis(&private_key);
-        let temp_path = get_temp_dir();
-        let config_bytes = json!({
-            "producer_name": "pulse",
-            "producer_key": private_key.to_string(),
-        })
-        .to_string()
-        .into_bytes();
-        controller.initialize(
-            &chain_id,
-            &config_bytes,
-            &genesis_bytes.to_vec(),
-            temp_path.path().to_str().unwrap(),
-        )?;
-        let chain_id = controller.chain_id().clone();
-        let glenn = Name::from_str("glenn")?;
-
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap();
-        let wasm = fs::read(root.join(Path::new("reference_contracts/pulse_token.wasm"))).unwrap();
-        let abi = AbiDefinition {
-            version: "eosio::abi/1.2".to_string(),
-            types: vec![],
-            structs: vec![],
-            actions: vec![],
-            tables: vec![],
-            ricardian_clauses: vec![],
-            error_messages: vec![],
-            abi_extensions: vec![],
-            variants: vec![],
-            action_results: vec![],
-        };
-
-        mempool.add_transaction(create_account(&private_key, glenn, chain_id)?);
-        mempool.add_transaction(set_code(&private_key, glenn, wasm, chain_id)?);
-        mempool.add_transaction(set_abi(&private_key, glenn, abi.pack().unwrap(), chain_id)?);
-        let block = controller.build_block(&mut mempool).await?;
-        controller.accept_block(&block.id()?, &mut mempool)?;
-
-        let db = controller.database();
-        let name = glenn.as_u64();
-        let chain_net = db.get_account_net_usage_value_ex(name)?;
-        let chain_cpu = db.get_account_cpu_usage_value_ex(name)?;
-        let arena_net = db
-            .arena_account_net_usage_value_ex(name)
-            .expect("arena is missing net usage");
-        let arena_cpu = db
-            .arena_account_cpu_usage_value_ex(name)
-            .expect("arena is missing cpu usage");
-
-        assert_eq!(arena_net, chain_net, "mirrored net_usage value_ex diverged");
-        assert_eq!(arena_cpu, chain_cpu, "mirrored cpu_usage value_ex diverged");
-        assert!(
-            chain_cpu > 0 && chain_net > 0,
-            "expected the block to bill net and cpu"
-        );
-        Ok(())
-    }
-
-    /// Resource-limits oracle: creating an account initializes its committed
-    /// resource_limits row to unlimited (-1). The mirrored effective limits must
-    /// equal chainbase's get_account_limits after a newaccount block. (The
-    /// pending/commit cycle is exercised at the Database boundary in the ffi
-    /// arena_shadow tests, since no action in this chain calls set_account_limits.)
-    #[tokio::test]
-    async fn oracle_account_limits_mirror_defaults() -> Result<(), ChainError> {
-        let chain_id =
-            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
-                .unwrap();
-        let private_key =
-            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
-        let mempool = Arc::new(RwLock::new(Mempool::new()));
-        let mut mempool = mempool.write().await;
-        let mut controller = Controller::new();
-        let genesis_bytes = generate_genesis(&private_key);
-        let temp_path = get_temp_dir();
-        let config_bytes = json!({
-            "producer_name": "pulse",
-            "producer_key": private_key.to_string(),
-        })
-        .to_string()
-        .into_bytes();
-        controller.initialize(
-            &chain_id,
-            &config_bytes,
-            &genesis_bytes.to_vec(),
-            temp_path.path().to_str().unwrap(),
-        )?;
-        let chain_id = controller.chain_id().clone();
-        let glenn = Name::from_str("glenn")?;
-
-        mempool.add_transaction(create_account(&private_key, glenn, chain_id)?);
-        let block = controller.build_block(&mut mempool).await?;
-        controller.accept_block(&block.id()?, &mut mempool)?;
-
-        let db = controller.database();
-        let name = glenn.as_u64();
-        let (mut ram, mut net, mut cpu) = (0i64, 0i64, 0i64);
-        db.get_account_limits(name, &mut ram, &mut net, &mut cpu)?;
-        let arena = db
-            .arena_account_limits(name)
-            .expect("arena is missing the resource_limits row");
-        assert_eq!(arena, (ram, net, cpu), "mirrored account limits diverged");
-        assert_eq!(arena, (-1, -1, -1), "expected unlimited defaults at init");
-        Ok(())
-    }
-
-    /// Dynamic-global-property oracle: every applied action advances the
-    /// global_action_sequence on the singleton dynamic_global_property_object.
-    /// After a newaccount block the mirrored sequence must equal chainbase's.
-    #[tokio::test]
-    async fn oracle_global_action_sequence_mirrors() -> Result<(), ChainError> {
-        let chain_id =
-            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
-                .unwrap();
-        let private_key =
-            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
-        let mempool = Arc::new(RwLock::new(Mempool::new()));
-        let mut mempool = mempool.write().await;
-        let mut controller = Controller::new();
-        let genesis_bytes = generate_genesis(&private_key);
-        let temp_path = get_temp_dir();
-        let config_bytes = json!({
-            "producer_name": "pulse",
-            "producer_key": private_key.to_string(),
-        })
-        .to_string()
-        .into_bytes();
-        controller.initialize(
-            &chain_id,
-            &config_bytes,
-            &genesis_bytes.to_vec(),
-            temp_path.path().to_str().unwrap(),
-        )?;
-        let chain_id = controller.chain_id().clone();
-
-        mempool.add_transaction(create_account(
-            &private_key,
-            Name::from_str("glenn")?,
-            chain_id,
-        )?);
-        let block = controller.build_block(&mut mempool).await?;
-        controller.accept_block(&block.id()?, &mut mempool)?;
-
-        let db = controller.database();
-        let chain_seq = db.get_global_action_sequence()?;
-        let arena_seq = db
-            .arena_global_action_sequence()
-            .expect("arena is missing the dynamic_global_property row");
-        assert_eq!(
-            arena_seq, chain_seq,
-            "mirrored global_action_sequence diverged"
-        );
-        assert!(
-            chain_seq > 0,
-            "expected applied actions to advance the sequence"
-        );
-        Ok(())
-    }
-
-    /// Static global_property (chain_config) oracle. Genesis seeds the mirror from
-    /// chainbase (below the per-write hooks), and a `setparams`-style write must
-    /// then update both in lockstep. Assert the mirror equals chainbase at genesis
-    /// and again after a config change, and that the change is actually observed.
-    #[tokio::test]
-    async fn oracle_global_property_mirrors_setparams() -> Result<(), ChainError> {
-        let chain_id =
-            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
-                .unwrap();
-        let private_key =
-            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
-        let mut controller = Controller::new();
-        let genesis_bytes = generate_genesis(&private_key);
-        let temp_path = get_temp_dir();
-        let config_bytes = json!({
-            "producer_name": "pulse",
-            "producer_key": private_key.to_string(),
-        })
-        .to_string()
-        .into_bytes();
-        controller.initialize(
-            &chain_id,
-            &config_bytes,
-            &genesis_bytes.to_vec(),
-            temp_path.path().to_str().unwrap(),
-        )?;
-        let db = controller.database();
-
-        // Genesis: the mirror was seeded from chainbase, so both sides match and
-        // the config is non-empty.
-        let genesis_chain = db.global_property_state_bytes()?;
-        let genesis_arena = db
-            .arena_global_property_state_bytes()
-            .expect("arena is missing the global_property row after genesis");
-        assert!(
-            !genesis_chain.is_empty(),
-            "genesis chain_config serialized empty"
-        );
-        assert_eq!(
-            genesis_chain, genesis_arena,
-            "genesis-seeded global_property diverged from chainbase"
-        );
-
-        // Read the active config, change fields of both widths (u32 + u16), and
-        // write it back through the same path a setparams intrinsic uses.
-        let gpo = Controller::get_global_properties(&db)?;
-        let c = gpo.get_chain_config();
-        let cfg = pulsevm_ffi::ChainConfigV0 {
-            max_block_net_usage: c.get_max_block_net_usage(),
-            target_block_net_usage_pct: c.get_target_block_net_usage_pct(),
-            max_transaction_net_usage: c.get_max_transaction_net_usage(),
-            base_per_transaction_net_usage: c.get_base_per_transaction_net_usage(),
-            net_usage_leeway: c.get_net_usage_leeway(),
-            context_free_discount_net_usage_num: c.get_context_free_discount_net_usage_num(),
-            context_free_discount_net_usage_den: c.get_context_free_discount_net_usage_den(),
-            max_block_cpu_usage: c.get_max_block_cpu_usage(),
-            target_block_cpu_usage_pct: c.get_target_block_cpu_usage_pct(),
-            max_transaction_cpu_usage: c.get_max_transaction_cpu_usage(),
-            min_transaction_cpu_usage: c.get_min_transaction_cpu_usage(),
-            max_transaction_lifetime: c.get_max_transaction_lifetime(),
-            deferred_trx_expiration_window: 0,
-            max_transaction_delay: c.get_max_transaction_delay(),
-            max_inline_action_size: c.get_max_inline_action_size() + 4096,
-            max_inline_action_depth: c.get_max_inline_action_depth(),
-            max_authority_depth: c.get_max_authority_depth() + 1,
-        };
-        // `cfg` copied the values out; the borrow of the chainbase object (`gpo`/`c`)
-        // ends here under NLL, before the mutating write below.
-        db.set_global_properties(&cfg)?;
-
-        let after_chain = db.global_property_state_bytes()?;
-        let after_arena = db
-            .arena_global_property_state_bytes()
-            .expect("arena is missing the global_property row after setparams");
-        assert_eq!(
-            after_chain, after_arena,
-            "global_property diverged after a config change"
-        );
-        assert_ne!(
-            genesis_chain, after_chain,
-            "the config change was not observed on the chainbase side"
-        );
-        Ok(())
-    }
-
-    /// Elastic virtual-limit oracle: process_block_usage recomputes the global
-    /// virtual cpu/net limits every block from the block's pending usage and the
-    /// windowed averages. After a block the mirrored virtual limits — produced by
-    /// the ported EMA plus update_elastic_limit, fed the same config parameters —
-    /// must equal chainbase's exactly.
-    #[tokio::test]
-    async fn oracle_virtual_limits_mirror_chainbase() -> Result<(), ChainError> {
-        let chain_id =
-            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
-                .unwrap();
-        let private_key =
-            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
-        let mempool = Arc::new(RwLock::new(Mempool::new()));
-        let mut mempool = mempool.write().await;
-        let mut controller = Controller::new();
-        let genesis_bytes = generate_genesis(&private_key);
-        let temp_path = get_temp_dir();
-        let config_bytes = json!({
-            "producer_name": "pulse",
-            "producer_key": private_key.to_string(),
-        })
-        .to_string()
-        .into_bytes();
-        controller.initialize(
-            &chain_id,
-            &config_bytes,
-            &genesis_bytes.to_vec(),
-            temp_path.path().to_str().unwrap(),
-        )?;
-        let chain_id = controller.chain_id().clone();
-
-        mempool.add_transaction(create_account(
-            &private_key,
-            Name::from_str("glenn")?,
-            chain_id,
-        )?);
-        let block = controller.build_block(&mut mempool).await?;
-        controller.accept_block(&block.id()?, &mut mempool)?;
-
-        let db = controller.database();
-        let chain = (db.get_virtual_cpu_limit()?, db.get_virtual_net_limit()?);
-        let arena = db
-            .arena_virtual_limits()
-            .expect("arena is missing the resource_limits state row");
-        assert_eq!(
-            arena, chain,
-            "mirrored virtual limits diverged from chainbase"
-        );
-        assert!(
-            chain.0 > 0 && chain.1 > 0,
-            "expected non-zero virtual limits after a block"
-        );
-        Ok(())
-    }
-
-    /// Transaction-dedupe oracle: applying a transaction records it in the
-    /// per-block dedupe set (transaction_object). After the block the mirror must
-    /// agree with chainbase's is_known_unexpired_transaction — present for the
-    /// applied trx id, absent for an unrelated one.
-    #[tokio::test]
-    async fn oracle_transaction_dedupe_mirrors() -> Result<(), ChainError> {
-        let chain_id =
-            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
-                .unwrap();
-        let private_key =
-            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
-        let mempool = Arc::new(RwLock::new(Mempool::new()));
-        let mut mempool = mempool.write().await;
-        let mut controller = Controller::new();
-        let genesis_bytes = generate_genesis(&private_key);
-        let temp_path = get_temp_dir();
-        let config_bytes = json!({
-            "producer_name": "pulse",
-            "producer_key": private_key.to_string(),
-        })
-        .to_string()
-        .into_bytes();
-        controller.initialize(
-            &chain_id,
-            &config_bytes,
-            &genesis_bytes.to_vec(),
-            temp_path.path().to_str().unwrap(),
-        )?;
-        let chain_id = controller.chain_id().clone();
-
-        let tx = create_account(&private_key, Name::from_str("glenn")?, chain_id)?;
-        let trx_digest = tx.id().to_digest()?;
-        mempool.add_transaction(tx);
-        let block = controller.build_block(&mut mempool).await?;
-        controller.accept_block(&block.id()?, &mut mempool)?;
-
-        let db = controller.database();
-        assert!(
-            db.is_known_unexpired_transaction(&trx_digest)?,
-            "chainbase is missing the dedupe record"
-        );
-        assert!(
-            db.arena_transaction_exists(&trx_digest),
-            "arena is missing the dedupe record"
-        );
-        // Negative control: an unrelated id is absent on both sides.
-        let unknown = Id::default().to_digest()?;
-        assert!(!db.is_known_unexpired_transaction(&unknown)?);
-        assert!(!db.arena_transaction_exists(&unknown));
-        Ok(())
-    }
-
-    /// Full-state cross-check: one block exercising the whole write surface
-    /// (newaccount, setcode, setabi, updateauth, linkauth) must leave every
-    /// mirrored table agreeing with chainbase at once — not just table by table
-    /// in isolation. This is the closest thing to a full-state diff over the
-    /// surface the FFI exposes reads for, and it guards against cross-table
-    /// interactions the per-table oracles miss.
-    #[tokio::test]
-    async fn oracle_full_state_cross_check() -> Result<(), ChainError> {
-        let chain_id =
-            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
-                .unwrap();
-        let private_key =
-            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
-        let mempool = Arc::new(RwLock::new(Mempool::new()));
-        let mut mempool = mempool.write().await;
-        let mut controller = Controller::new();
-        let genesis_bytes = generate_genesis(&private_key);
-        let temp_path = get_temp_dir();
-        let config_bytes = json!({
-            "producer_name": "pulse",
-            "producer_key": private_key.to_string(),
-        })
-        .to_string()
-        .into_bytes();
-        controller.initialize(
-            &chain_id,
-            &config_bytes,
-            &genesis_bytes.to_vec(),
-            temp_path.path().to_str().unwrap(),
-        )?;
-        let chain_id = controller.chain_id().clone();
-        let glenn = Name::from_str("glenn")?;
-        let perm = Name::from_str("claude")?;
-        let msg_type = Name::from_str("transfer")?;
-
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap();
-        let wasm = fs::read(root.join(Path::new("reference_contracts/pulse_token.wasm"))).unwrap();
-        let abi = AbiDefinition {
-            version: "eosio::abi/1.2".to_string(),
-            types: vec![],
-            structs: vec![],
-            actions: vec![],
-            tables: vec![],
-            ricardian_clauses: vec![],
-            error_messages: vec![],
-            abi_extensions: vec![],
-            variants: vec![],
-            action_results: vec![],
-        };
-
-        let create_tx = create_account(&private_key, glenn, chain_id)?;
-        let create_digest = create_tx.id().to_digest()?;
-        mempool.add_transaction(create_tx);
-        mempool.add_transaction(set_code(&private_key, glenn, wasm, chain_id)?);
-        mempool.add_transaction(set_abi(&private_key, glenn, abi.pack().unwrap(), chain_id)?);
-        mempool.add_transaction(update_auth(
-            &private_key,
-            glenn,
-            perm,
-            ACTIVE_NAME,
-            1,
-            chain_id,
-        )?);
-        mempool.add_transaction(link_auth(
-            &private_key,
-            glenn,
-            glenn,
-            msg_type,
-            perm,
-            chain_id,
-        )?);
-        let block = controller.build_block(&mut mempool).await?;
-        controller.accept_block(&block.id()?, &mut mempool)?;
-
-        let db = controller.database();
-        let name = glenn.as_u64();
-
-        // account_object + account_metadata_object, field for field.
-        assert!(
-            !db.find_account(name)?.is_null(),
-            "chainbase account missing"
-        );
-        assert!(db.arena_account_exists(name), "arena account missing");
-        let ptr = db.find_account_metadata(name)?;
-        assert!(!ptr.is_null());
-        let meta = unsafe { &*ptr };
-        let arena_meta = db
-            .arena_account_metadata(name)
-            .expect("arena metadata missing");
-        assert_eq!(arena_meta.privileged, meta.is_privileged());
-        assert_eq!(arena_meta.recv_sequence, meta.get_recv_sequence());
-        assert_eq!(arena_meta.auth_sequence, meta.get_auth_sequence());
-        assert_eq!(arena_meta.code_sequence, meta.get_code_sequence());
-        assert_eq!(arena_meta.abi_sequence, meta.get_abi_sequence());
-        assert_eq!(arena_meta.vm_type, meta.get_vm_type());
-        assert_eq!(arena_meta.vm_version, meta.get_vm_version());
-
-        // resource_usage: RAM + net/cpu accumulators.
-        assert_eq!(
-            db.arena_account_ram_usage(name).map(|r| r as i64),
-            Some(db.get_account_ram_usage(name)?),
-        );
-        assert_eq!(
-            db.arena_account_net_usage_value_ex(name),
-            Some(db.get_account_net_usage_value_ex(name)?),
-        );
-        assert_eq!(
-            db.arena_account_cpu_usage_value_ex(name),
-            Some(db.get_account_cpu_usage_value_ex(name)?),
-        );
-
-        // resource_limits + global elastic virtual limits.
-        let (mut ram, mut net, mut cpu) = (0i64, 0i64, 0i64);
-        db.get_account_limits(name, &mut ram, &mut net, &mut cpu)?;
-        assert_eq!(db.arena_account_limits(name), Some((ram, net, cpu)));
-        assert_eq!(
-            db.arena_virtual_limits(),
-            Some((db.get_virtual_cpu_limit()?, db.get_virtual_net_limit()?)),
-        );
-
-        // permission + permission_link created by updateauth/linkauth.
-        let perm_ptr = db.find_permission_by_actor_and_permission(name, perm.as_u64())?;
-        assert!(!perm_ptr.is_null());
-        let (parent, _threshold) = db
-            .arena_permission(name, perm.as_u64())
-            .expect("arena perm");
-        assert_eq!(parent, unsafe { &*perm_ptr }.get_parent_id());
-        let link_ptr = db.find_permission_link(name, name, msg_type.as_u64())?;
-        assert!(!link_ptr.is_null());
-        assert_eq!(
-            db.arena_permission_link(name, name, msg_type.as_u64()),
-            Some(unsafe { &*link_ptr }.get_required_permission()),
-        );
-
-        // dynamic_global_property + transaction dedupe.
-        assert_eq!(
-            db.arena_global_action_sequence(),
-            Some(db.get_global_action_sequence()?),
-        );
-        assert!(db.is_known_unexpired_transaction(&create_digest)?);
-        assert!(db.arena_transaction_exists(&create_digest));
-
-        // The mirrored state has a populated root.
-        let root_hash = db.arena_state_root().expect("state root");
-        assert_ne!(root_hash, [0u8; 32], "arena state root is empty");
-        Ok(())
-    }
-
-    /// True cross-implementation state root for account_metadata: both the arena
-    /// mirror and chainbase serialize the whole table into the same canonical
-    /// byte layout in name order, independently, and their SHA-256 roots must
-    /// match. Unlike the per-account point-read oracles, this enumerates the
-    /// entire table — every genesis account plus the ones this block creates — so
-    /// a missed or mis-serialized row anywhere is caught.
-    #[tokio::test]
-    async fn oracle_cross_impl_account_metadata_root() -> Result<(), ChainError> {
-        use sha2::{
-            Digest,
-            Sha256,
-        };
-
-        let chain_id =
-            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
-                .unwrap();
-        let private_key =
-            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
-        let mempool = Arc::new(RwLock::new(Mempool::new()));
-        let mut mempool = mempool.write().await;
-        let mut controller = Controller::new();
-        let genesis_bytes = generate_genesis(&private_key);
-        let temp_path = get_temp_dir();
-        let config_bytes = json!({
-            "producer_name": "pulse",
-            "producer_key": private_key.to_string(),
-        })
-        .to_string()
-        .into_bytes();
-        controller.initialize(
-            &chain_id,
-            &config_bytes,
-            &genesis_bytes.to_vec(),
-            temp_path.path().to_str().unwrap(),
-        )?;
-        let chain_id = controller.chain_id().clone();
-        let glenn = Name::from_str("glenn")?;
-
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap();
-        let wasm = fs::read(root.join(Path::new("reference_contracts/pulse_token.wasm"))).unwrap();
-        let abi = AbiDefinition {
-            version: "eosio::abi/1.2".to_string(),
-            types: vec![],
-            structs: vec![],
-            actions: vec![],
-            tables: vec![],
-            ricardian_clauses: vec![],
-            error_messages: vec![],
-            abi_extensions: vec![],
-            variants: vec![],
-            action_results: vec![],
-        };
-
-        mempool.add_transaction(create_account(&private_key, glenn, chain_id)?);
-        mempool.add_transaction(set_code(&private_key, glenn, wasm, chain_id)?);
-        mempool.add_transaction(set_abi(&private_key, glenn, abi.pack().unwrap(), chain_id)?);
-        let block = controller.build_block(&mut mempool).await?;
-        controller.accept_block(&block.id()?, &mut mempool)?;
-
-        let db = controller.database();
-        let chain_bytes = db.account_metadata_state_bytes()?;
-        let arena_bytes = db
-            .arena_account_metadata_state_bytes()
-            .expect("shadow enabled");
-
-        // Byte-for-byte first (pinpoints any diverging row/field), then the root.
-        assert_eq!(
-            chain_bytes, arena_bytes,
-            "canonical account_metadata serialization diverged between chainbase and the mirror"
-        );
-        let chain_root: [u8; 32] = Sha256::digest(&chain_bytes).into();
-        let arena_root: [u8; 32] = Sha256::digest(&arena_bytes).into();
-        assert_eq!(
-            chain_root, arena_root,
-            "cross-impl account_metadata state root diverged"
-        );
-
-        // 75 bytes per row; the block enumerates more than just glenn (genesis
-        // accounts are covered too).
-        const ROW: usize = 75;
-        assert_eq!(chain_bytes.len() % ROW, 0, "unexpected canonical row size");
-        assert!(
-            chain_bytes.len() / ROW >= 2,
-            "expected genesis accounts plus glenn in the enumeration"
-        );
-        Ok(())
-    }
-
-    /// Cross-impl state root for account_object: the whole table (including the
-    /// system account's non-empty genesis abi and glenn's abi from setabi) must
-    /// serialize identically on both sides and hash to the same root. Exercises
-    /// the blob path of the cross-impl mechanism.
-    #[tokio::test]
-    async fn oracle_cross_impl_account_root() -> Result<(), ChainError> {
-        use sha2::{
-            Digest,
-            Sha256,
-        };
-
-        let chain_id =
-            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
-                .unwrap();
-        let private_key =
-            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
-        let mempool = Arc::new(RwLock::new(Mempool::new()));
-        let mut mempool = mempool.write().await;
-        let mut controller = Controller::new();
-        let genesis_bytes = generate_genesis(&private_key);
-        let temp_path = get_temp_dir();
-        let config_bytes = json!({
-            "producer_name": "pulse",
-            "producer_key": private_key.to_string(),
-        })
-        .to_string()
-        .into_bytes();
-        controller.initialize(
-            &chain_id,
-            &config_bytes,
-            &genesis_bytes.to_vec(),
-            temp_path.path().to_str().unwrap(),
-        )?;
-        let chain_id = controller.chain_id().clone();
-        let glenn = Name::from_str("glenn")?;
-        let abi = AbiDefinition {
-            version: "eosio::abi/1.2".to_string(),
-            types: vec![],
-            structs: vec![],
-            actions: vec![],
-            tables: vec![],
-            ricardian_clauses: vec![],
-            error_messages: vec![],
-            abi_extensions: vec![],
-            variants: vec![],
-            action_results: vec![],
-        };
-
-        mempool.add_transaction(create_account(&private_key, glenn, chain_id)?);
-        mempool.add_transaction(set_abi(&private_key, glenn, abi.pack().unwrap(), chain_id)?);
-        let block = controller.build_block(&mut mempool).await?;
-        controller.accept_block(&block.id()?, &mut mempool)?;
-
-        let db = controller.database();
-        let chain_bytes = db.account_state_bytes()?;
-        let arena_bytes = db.arena_account_state_bytes().expect("shadow enabled");
-        assert_eq!(
-            chain_bytes, arena_bytes,
-            "canonical account_object serialization diverged between chainbase and the mirror"
-        );
-        let chain_root: [u8; 32] = Sha256::digest(&chain_bytes).into();
-        let arena_root: [u8; 32] = Sha256::digest(&arena_bytes).into();
-        assert_eq!(
-            chain_root, arena_root,
-            "cross-impl account_object state root diverged"
-        );
-        assert!(
-            chain_bytes.len() > 16,
-            "expected multiple accounts with abi data"
-        );
-        Ok(())
-    }
-
-    /// Cross-impl state root for the permission table — the hardest one:
-    /// composite (owner, perm_name) key, a variable authority blob, and a parent
-    /// id reference. Both sides serialize owner + perm_name + parent id +
-    /// length-prefixed authority (re-encoded identically) in key order and must
-    /// hash equal over the full set: genesis permissions (owner/active for the
-    /// native accounts plus the producer permissions, all hydrated) and glenn's
-    /// owner/active/claude created live by newaccount and updateauth.
-    #[tokio::test]
-    async fn oracle_cross_impl_permission_root() -> Result<(), ChainError> {
-        use sha2::{
-            Digest,
-            Sha256,
-        };
-
-        let chain_id =
-            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
-                .unwrap();
-        let private_key =
-            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
-        let mempool = Arc::new(RwLock::new(Mempool::new()));
-        let mut mempool = mempool.write().await;
-        let mut controller = Controller::new();
-        let genesis_bytes = generate_genesis(&private_key);
-        let temp_path = get_temp_dir();
-        let config_bytes = json!({
-            "producer_name": "pulse",
-            "producer_key": private_key.to_string(),
-        })
-        .to_string()
-        .into_bytes();
-        controller.initialize(
-            &chain_id,
-            &config_bytes,
-            &genesis_bytes.to_vec(),
-            temp_path.path().to_str().unwrap(),
-        )?;
-        let chain_id = controller.chain_id().clone();
-        let glenn = Name::from_str("glenn")?;
-
-        mempool.add_transaction(create_account(&private_key, glenn, chain_id)?);
-        mempool.add_transaction(update_auth(
-            &private_key,
-            glenn,
-            Name::from_str("claude")?,
-            ACTIVE_NAME,
-            1,
-            chain_id,
-        )?);
-        let block = controller.build_block(&mut mempool).await?;
-        controller.accept_block(&block.id()?, &mut mempool)?;
-
-        let db = controller.database();
-        let chain_bytes = db.permission_state_bytes()?;
-        let arena_bytes = db.arena_permission_state_bytes().expect("shadow enabled");
-        assert_eq!(
-            chain_bytes, arena_bytes,
-            "canonical permission serialization diverged between chainbase and the mirror"
-        );
-        let chain_root: [u8; 32] = Sha256::digest(&chain_bytes).into();
-        let arena_root: [u8; 32] = Sha256::digest(&arena_bytes).into();
-        assert_eq!(
-            chain_root, arena_root,
-            "cross-impl permission state root diverged"
-        );
-        assert!(
-            !chain_bytes.is_empty(),
-            "expected permissions in the enumeration"
-        );
-        Ok(())
-    }
-
-    /// Unified full-state cross-impl root across every mirrored table that a
-    /// normal block populates. A rich block (create, setcode, setabi, updateauth,
-    /// linkauth) exercises each table, then each table's canonical serialization
-    /// is compared byte-for-byte (so a mismatch names the table) and a single
-    /// SHA-256 over all of them — the full-state root — must match. The seven
-    /// contract tables are empty in this flow (no WASM db writes) and are covered
-    /// against chainbase separately in diff_contract_iter.
-    #[tokio::test]
-    async fn oracle_cross_impl_full_state_root() -> Result<(), ChainError> {
-        use sha2::{
-            Digest,
-            Sha256,
-        };
-
-        let chain_id =
-            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
-                .unwrap();
-        let private_key =
-            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
-        let mempool = Arc::new(RwLock::new(Mempool::new()));
-        let mut mempool = mempool.write().await;
-        let mut controller = Controller::new();
-        let genesis_bytes = generate_genesis(&private_key);
-        let temp_path = get_temp_dir();
-        let config_bytes = json!({
-            "producer_name": "pulse",
-            "producer_key": private_key.to_string(),
-        })
-        .to_string()
-        .into_bytes();
-        controller.initialize(
-            &chain_id,
-            &config_bytes,
-            &genesis_bytes.to_vec(),
-            temp_path.path().to_str().unwrap(),
-        )?;
-        let chain_id = controller.chain_id().clone();
-        let glenn = Name::from_str("glenn")?;
-        let perm = Name::from_str("claude")?;
-        let msg_type = Name::from_str("transfer")?;
-
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap();
-        let wasm = fs::read(root.join(Path::new("reference_contracts/pulse_token.wasm"))).unwrap();
-        let abi = AbiDefinition {
-            version: "eosio::abi/1.2".to_string(),
-            types: vec![],
-            structs: vec![],
-            actions: vec![],
-            tables: vec![],
-            ricardian_clauses: vec![],
-            error_messages: vec![],
-            abi_extensions: vec![],
-            variants: vec![],
-            action_results: vec![],
-        };
-
-        mempool.add_transaction(create_account(&private_key, glenn, chain_id)?);
-        mempool.add_transaction(set_code(&private_key, glenn, wasm, chain_id)?);
-        mempool.add_transaction(set_abi(&private_key, glenn, abi.pack().unwrap(), chain_id)?);
-        mempool.add_transaction(update_auth(
-            &private_key,
-            glenn,
-            perm,
-            ACTIVE_NAME,
-            1,
-            chain_id,
-        )?);
-        mempool.add_transaction(link_auth(
-            &private_key,
-            glenn,
-            glenn,
-            msg_type,
-            perm,
-            chain_id,
-        )?);
-        let block = controller.build_block(&mut mempool).await?;
-        controller.accept_block(&block.id()?, &mut mempool)?;
-
-        let db = controller.database();
-        // (table name, chainbase bytes, arena bytes)
-        let tables: Vec<(&str, Vec<u8>, Vec<u8>)> = vec![
-            (
-                "account_metadata",
-                db.account_metadata_state_bytes()?,
-                db.arena_account_metadata_state_bytes().unwrap(),
-            ),
-            (
-                "account",
-                db.account_state_bytes()?,
-                db.arena_account_state_bytes().unwrap(),
-            ),
-            (
-                "permission",
-                db.permission_state_bytes()?,
-                db.arena_permission_state_bytes().unwrap(),
-            ),
-            (
-                "permission_link",
-                db.permission_link_state_bytes()?,
-                db.arena_permission_link_state_bytes().unwrap(),
-            ),
-            (
-                "code",
-                db.code_state_bytes()?,
-                db.arena_code_state_bytes().unwrap(),
-            ),
-            (
-                "transaction",
-                db.transaction_state_bytes()?,
-                db.arena_transaction_state_bytes().unwrap(),
-            ),
-            (
-                "resource_usage",
-                db.resource_usage_state_bytes()?,
-                db.arena_resource_usage_state_bytes().unwrap(),
-            ),
-            (
-                "resource_limits",
-                db.account_limits_state_bytes()?,
-                db.arena_account_limits_state_bytes().unwrap(),
-            ),
-            (
-                "resource_state",
-                db.resource_state_bytes()?,
-                db.arena_resource_state_bytes().unwrap(),
-            ),
-            (
-                "dynamic_global_property",
-                db.get_global_action_sequence()?.to_le_bytes().to_vec(),
-                db.arena_global_action_sequence()
-                    .unwrap()
-                    .to_le_bytes()
-                    .to_vec(),
-            ),
-        ];
-
-        let mut chain_root = Sha256::new();
-        let mut arena_root = Sha256::new();
-        for (name, chain_bytes, arena_bytes) in &tables {
-            assert_eq!(
-                chain_bytes, arena_bytes,
-                "cross-impl state diverged for table {name}"
-            );
-            chain_root.update(name.as_bytes());
-            chain_root.update(chain_bytes);
-            arena_root.update(name.as_bytes());
-            arena_root.update(arena_bytes);
-        }
-        let chain_root: [u8; 32] = chain_root.finalize().into();
-        let arena_root: [u8; 32] = arena_root.finalize().into();
-        assert_eq!(
-            chain_root, arena_root,
-            "full-state cross-impl root diverged"
-        );
-
-        // Sanity: the populated tables are non-empty on both sides.
-        for name in [
-            "account_metadata",
-            "account",
-            "permission",
-            "code",
-            "resource_usage",
-        ] {
-            let (_, chain_bytes, _) = tables.iter().find(|t| t.0 == name).unwrap();
-            assert!(!chain_bytes.is_empty(), "expected {name} to be populated");
-        }
-        Ok(())
-    }
-
-    /// Cross-impl root for the contract primary tables. A block deploys the
-    /// token contract and runs its `create` action, which stores a currency-stats
-    /// row — populating table_id_object and key_value_object through the mirrored
-    /// create path. Both sides serialize the two tables (the arena resolves the
-    /// table identity from t_id so its own ids never leak into the bytes) and the
-    /// roots must match. Contract row UPDATES (issue/transfer) are not mirrored
-    /// yet — update_key_value_object reaches the row by an opaque handle whose
-    /// table id is not resolvable through the FFI — so this covers the create
-    /// path only; the full contract db is separately diff-tested vs C++ in
-    /// diff_contract_iter.
-    #[tokio::test]
-    async fn oracle_cross_impl_contract_root() -> Result<(), ChainError> {
-        use sha2::{
-            Digest,
-            Sha256,
-        };
-
-        let chain_id =
-            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
-                .unwrap();
-        let private_key =
-            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
-        let mempool = Arc::new(RwLock::new(Mempool::new()));
-        let mut mempool = mempool.write().await;
-        let mut controller = Controller::new();
-        let genesis_bytes = generate_genesis(&private_key);
-        let temp_path = get_temp_dir();
-        let config_bytes = json!({
-            "producer_name": "pulse",
-            "producer_key": private_key.to_string(),
-        })
-        .to_string()
-        .into_bytes();
-        controller.initialize(
-            &chain_id,
-            &config_bytes,
-            &genesis_bytes.to_vec(),
-            temp_path.path().to_str().unwrap(),
-        )?;
-        let chain_id = controller.chain_id().clone();
-        let glenn = Name::from_str("glenn")?;
-
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap();
-        let wasm = fs::read(root.join(Path::new("reference_contracts/pulse_token.wasm"))).unwrap();
-
-        mempool.add_transaction(create_account(&private_key, glenn, chain_id)?);
-        mempool.add_transaction(set_code(&private_key, glenn, wasm, chain_id)?);
-        mempool.add_transaction(call_contract(
-            &private_key,
-            glenn,
-            Name::from_str("create")?,
-            &Create {
-                issuer: glenn,
-                max_supply: Asset::new(1000000, Symbol(1162826500)),
-            },
-            chain_id,
-        )?);
-        let block = controller.build_block(&mut mempool).await?;
-        controller.accept_block(&block.id()?, &mut mempool)?;
-
-        let db = controller.database();
-        let tables: Vec<(&str, Vec<u8>, Vec<u8>)> = vec![
-            (
-                "table_id",
-                db.contract_table_state_bytes()?,
-                db.arena_contract_table_state_bytes().unwrap(),
-            ),
-            (
-                "key_value",
-                db.contract_kv_state_bytes()?,
-                db.arena_contract_kv_state_bytes().unwrap(),
-            ),
-        ];
-        let mut chain_root = Sha256::new();
-        let mut arena_root = Sha256::new();
-        for (name, chain_bytes, arena_bytes) in &tables {
-            assert_eq!(
-                chain_bytes, arena_bytes,
-                "cross-impl contract state diverged for {name}"
-            );
-            chain_root.update(chain_bytes);
-            arena_root.update(arena_bytes);
-        }
-        assert_eq!(
-            <[u8; 32]>::from(chain_root.finalize()),
-            <[u8; 32]>::from(arena_root.finalize()),
-            "cross-impl contract root diverged"
-        );
-        assert!(
-            !tables[0].1.is_empty(),
-            "expected the create action to make a table"
-        );
-        assert!(
-            !tables[1].1.is_empty(),
-            "expected the create action to store a row"
-        );
-        Ok(())
-    }
-
-    /// Every full-state table as `(name, arena bytes)`, read from the arena
-    /// alone. This is the golden-mode oracle: it consults no chainbase, so it is
-    /// the builder that outlives the bridge. `cross_impl_tables` pairs these same
-    /// bytes with the chainbase side for the live cross-check.
-    fn arena_impl_tables(db: &Database) -> Result<Vec<(&'static str, Vec<u8>)>, ChainError> {
-        Ok(vec![
-            (
-                "account_metadata",
-                db.arena_account_metadata_state_bytes().unwrap_or_default(),
-            ),
-            (
-                "account",
-                db.arena_account_state_bytes().unwrap_or_default(),
-            ),
-            (
-                "permission",
-                db.arena_permission_state_bytes().unwrap_or_default(),
-            ),
-            (
-                "permission_link",
-                db.arena_permission_link_state_bytes().unwrap_or_default(),
-            ),
-            ("code", db.arena_code_state_bytes().unwrap_or_default()),
-            (
-                "transaction",
-                db.arena_transaction_state_bytes().unwrap_or_default(),
-            ),
-            (
-                "resource_usage",
-                db.arena_resource_usage_state_bytes().unwrap_or_default(),
-            ),
-            (
-                "resource_limits",
-                db.arena_account_limits_state_bytes().unwrap_or_default(),
-            ),
-            (
-                "resource_state",
-                db.arena_resource_state_bytes().unwrap_or_default(),
-            ),
-            (
-                "dynamic_global_property",
-                db.arena_global_action_sequence()
-                    .unwrap_or(0)
-                    .to_le_bytes()
-                    .to_vec(),
-            ),
-            (
-                "global_property",
-                db.arena_global_property_state_bytes().unwrap_or_default(),
-            ),
-            (
-                "resource_limits_config",
-                db.arena_resource_config_state_bytes().unwrap_or_default(),
-            ),
-            (
-                "contract_table",
-                db.arena_contract_table_state_bytes().unwrap_or_default(),
-            ),
-            (
-                "contract_key_value",
-                db.arena_contract_kv_state_bytes().unwrap_or_default(),
-            ),
-        ])
-    }
-
     /// Decode a symbol_code (the raw `u64` a token contract uses as the `stat`
     /// table scope) back to its ticker string: ASCII chars packed low byte first.
     fn symbol_code_to_string(mut code: u64) -> String {
@@ -4758,9 +2817,8 @@ mod tests {
         }
 
         for &code in &codes {
-            if let Ok(account) = db.get_account(code) {
-                let abi = account.get_abi().as_slice();
-                records.push(json!({"kind": "abi", "code": code, "abi_hex": hex::encode(abi)}));
+            if let Some(abi) = db.arena_account_abi_bytes(code) {
+                records.push(json!({"kind": "abi", "code": code, "abi_hex": hex::encode(&abi)}));
             }
         }
 
@@ -4843,343 +2901,6 @@ mod tests {
         );
         Ok(())
     }
-
-    /// Every cross-impl table as `(name, chainbase bytes, arena bytes)` for the
-    /// full-state root — the 10 block-populated tables plus the two contract
-    /// primary tables (empty unless a contract wrote rows).
-    fn cross_impl_tables(
-        db: &Database,
-    ) -> Result<Vec<(&'static str, Vec<u8>, Vec<u8>)>, ChainError> {
-        Ok(vec![
-            (
-                "account_metadata",
-                db.account_metadata_state_bytes()?,
-                db.arena_account_metadata_state_bytes().unwrap_or_default(),
-            ),
-            (
-                "account",
-                db.account_state_bytes()?,
-                db.arena_account_state_bytes().unwrap_or_default(),
-            ),
-            (
-                "permission",
-                db.permission_state_bytes()?,
-                db.arena_permission_state_bytes().unwrap_or_default(),
-            ),
-            (
-                "permission_link",
-                db.permission_link_state_bytes()?,
-                db.arena_permission_link_state_bytes().unwrap_or_default(),
-            ),
-            (
-                "code",
-                db.code_state_bytes()?,
-                db.arena_code_state_bytes().unwrap_or_default(),
-            ),
-            (
-                "transaction",
-                db.transaction_state_bytes()?,
-                db.arena_transaction_state_bytes().unwrap_or_default(),
-            ),
-            (
-                "resource_usage",
-                db.resource_usage_state_bytes()?,
-                db.arena_resource_usage_state_bytes().unwrap_or_default(),
-            ),
-            (
-                "resource_limits",
-                db.account_limits_state_bytes()?,
-                db.arena_account_limits_state_bytes().unwrap_or_default(),
-            ),
-            (
-                "resource_state",
-                db.resource_state_bytes()?,
-                db.arena_resource_state_bytes().unwrap_or_default(),
-            ),
-            (
-                "dynamic_global_property",
-                db.get_global_action_sequence()?.to_le_bytes().to_vec(),
-                db.arena_global_action_sequence()
-                    .unwrap_or(0)
-                    .to_le_bytes()
-                    .to_vec(),
-            ),
-            (
-                "global_property",
-                db.global_property_state_bytes()?,
-                db.arena_global_property_state_bytes().unwrap_or_default(),
-            ),
-            (
-                "resource_limits_config",
-                db.resource_config_state_bytes()?,
-                db.arena_resource_config_state_bytes().unwrap_or_default(),
-            ),
-            (
-                "contract_table",
-                db.contract_table_state_bytes()?,
-                db.arena_contract_table_state_bytes().unwrap_or_default(),
-            ),
-            (
-                "contract_key_value",
-                db.contract_kv_state_bytes()?,
-                db.arena_contract_kv_state_bytes().unwrap_or_default(),
-            ),
-        ])
-    }
-
-    /// Replay a real node's block_log against the shadow. Ignored by default:
-    /// run a local pulsevm node (optionally bootstrapped from the testnet) to
-    /// produce a block_log, then point this at it —
-    ///
-    ///   PULSEVM_REPLAY_BLOCK_LOG_DIR=<node data dir with block_log> \
-    ///   PULSEVM_REPLAY_GENESIS=<genesis.json> \
-    ///   PULSEVM_REPLAY_CHAIN_ID=<hex chain id> \
-    ///   cargo test -p pulsevm_core --features arena-shadow \
-    ///     replay_local_block_log -- --ignored --nocapture
-    ///
-    /// It replays into a fresh db from genesis, so it re-derives state from the
-    /// block history with the shadow mirroring alongside, and after every block
-    /// asserts the cross-impl full-state root — reporting the first block/table
-    /// that diverges. Requires our node to be able to execute every real block;
-    /// a replay failure there is a node-completeness gap, not a mirror gap.
-    #[tokio::test]
-    #[ignore]
-    async fn replay_local_block_log() -> Result<(), ChainError> {
-        let (Ok(src_dir), Ok(genesis_path), Ok(chain_id_hex)) = (
-            std::env::var("PULSEVM_REPLAY_BLOCK_LOG_DIR"),
-            std::env::var("PULSEVM_REPLAY_GENESIS"),
-            std::env::var("PULSEVM_REPLAY_CHAIN_ID"),
-        ) else {
-            eprintln!(
-                "replay_local_block_log: set PULSEVM_REPLAY_{{BLOCK_LOG_DIR,GENESIS,CHAIN_ID}} to run"
-            );
-            return Ok(());
-        };
-
-        let chain_id = Id::from_str(&chain_id_hex).expect("PULSEVM_REPLAY_CHAIN_ID must be hex");
-        let genesis_bytes = fs::read(&genesis_path).expect("cannot read genesis file");
-        let config_bytes = json!({
-            "producer_name": "pulse",
-            "producer_key": "PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez",
-        })
-        .to_string()
-        .into_bytes();
-
-        let mempool = Arc::new(RwLock::new(Mempool::new()));
-        let mut mempool = mempool.write().await;
-        let mut controller = Controller::new();
-        let temp_path = get_temp_dir();
-        controller.initialize(
-            &chain_id,
-            &config_bytes,
-            &genesis_bytes,
-            temp_path.path().to_str().unwrap(),
-        )?;
-
-        // Open the source node's block_log (separate from our fresh one).
-        let src =
-            crate::chain::state_history::StateHistoryLog::open_with_magic(&src_dir, "block_log", 0)
-                .map_err(|e| ChainError::InternalError(format!("open source block_log: {e:?}")))?;
-        let (log_start, log_end) = src
-            .range()
-            .ok_or_else(|| ChainError::InternalError("source block_log is empty".into()))?;
-        let start = controller.last_accepted_block().block_num() + 1;
-        eprintln!("replaying blocks {start}..={log_end} (log range {log_start}..={log_end})");
-
-        for n in start..=log_end {
-            let packed = src
-                .read_block(n)
-                .map_err(|e| ChainError::InternalError(format!("read block {n}: {e:?}")))?;
-            let block = SignedBlock::read(packed.as_slice(), &mut 0)?;
-            controller.verify_block(&block, &mut mempool).await?;
-            controller.accept_block(&block.id()?, &mut mempool)?;
-            controller.set_preferred_id(block.id()?);
-
-            let tables = cross_impl_tables(&controller.database())?;
-            for (name, chain_bytes, arena_bytes) in &tables {
-                assert_eq!(
-                    chain_bytes, arena_bytes,
-                    "cross-impl state diverged at block {n}, table {name}"
-                );
-            }
-        }
-        eprintln!("replayed to block {log_end}; cross-impl full-state root matched every block");
-        Ok(())
-    }
-
-    /// Self-contained replay test: one node builds a rich block, and a fresh
-    /// node replays it from its packed bytes — the same pack → SignedBlock::read
-    /// → verify → accept path a block_log replay uses — with the shadow on. The
-    /// replaying node must re-derive the full state so its arena and chainbase
-    /// agree on the cross-impl root. This proves the replay path end to end
-    /// without a live node; real testnet blocks drop into replay_local_block_log.
-    #[tokio::test]
-    async fn replay_packed_block_keeps_shadow_in_sync() -> Result<(), ChainError> {
-        let chain_id =
-            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
-                .unwrap();
-        let private_key =
-            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
-        let config_bytes = json!({
-            "producer_name": "pulse",
-            "producer_key": private_key.to_string(),
-        })
-        .to_string()
-        .into_bytes();
-        let genesis = generate_genesis(&private_key);
-
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap();
-        let wasm = fs::read(root.join(Path::new("reference_contracts/pulse_token.wasm"))).unwrap();
-        let glenn = Name::from_str("glenn")?;
-
-        // Node A builds a rich block and packs it — the "fixture".
-        let packed = {
-            let mempool = Arc::new(RwLock::new(Mempool::new()));
-            let mut mempool = mempool.write().await;
-            let mut a = Controller::new();
-            let dir = get_temp_dir();
-            a.initialize(
-                &chain_id,
-                &config_bytes,
-                &genesis,
-                dir.path().to_str().unwrap(),
-            )?;
-            let cid = a.chain_id().clone();
-            mempool.add_transaction(create_account(&private_key, glenn, cid)?);
-            mempool.add_transaction(set_code(&private_key, glenn, wasm, cid)?);
-            mempool.add_transaction(update_auth(
-                &private_key,
-                glenn,
-                Name::from_str("claude")?,
-                ACTIVE_NAME,
-                1,
-                cid,
-            )?);
-            let block = a.build_block(&mut mempool).await?;
-            a.accept_block(&block.id()?, &mut mempool)?;
-            block.pack().unwrap()
-        };
-
-        // Node B replays the packed block from scratch and must match.
-        let mempool = Arc::new(RwLock::new(Mempool::new()));
-        let mut mempool = mempool.write().await;
-        let mut b = Controller::new();
-        let dir = get_temp_dir();
-        b.initialize(
-            &chain_id,
-            &config_bytes,
-            &genesis,
-            dir.path().to_str().unwrap(),
-        )?;
-        let block = SignedBlock::read(packed.as_slice(), &mut 0)?;
-        b.verify_block(&block, &mut mempool).await?;
-        b.accept_block(&block.id()?, &mut mempool)?;
-
-        for (name, chain_bytes, arena_bytes) in cross_impl_tables(&b.database())? {
-            assert_eq!(
-                chain_bytes, arena_bytes,
-                "replayed cross-impl state diverged for table {name}"
-            );
-        }
-        Ok(())
-    }
-
-    /// Same as the packed-block replay, but routed through a real StateHistoryLog
-    /// block_log on disk — append the built block, reopen the log, read it back,
-    /// and replay. This exercises the exact open_with_magic/append/range/read_block
-    /// path that replay_local_block_log uses against a node's block_log, so it
-    /// de-risks that harness independently of the (fixture-less) log unit tests.
-    #[tokio::test]
-    async fn replay_via_block_log_keeps_shadow_in_sync() -> Result<(), ChainError> {
-        use crate::chain::state_history::StateHistoryLog;
-
-        let chain_id =
-            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
-                .unwrap();
-        let private_key =
-            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
-        let config_bytes = json!({
-            "producer_name": "pulse",
-            "producer_key": private_key.to_string(),
-        })
-        .to_string()
-        .into_bytes();
-        let genesis = generate_genesis(&private_key);
-        let glenn = Name::from_str("glenn")?;
-
-        // Node A builds a block and writes it to a block_log on disk.
-        let log_dir = get_temp_dir();
-        let (built_id, built_packed) = {
-            let mempool = Arc::new(RwLock::new(Mempool::new()));
-            let mut mempool = mempool.write().await;
-            let mut a = Controller::new();
-            let dir = get_temp_dir();
-            a.initialize(
-                &chain_id,
-                &config_bytes,
-                &genesis,
-                dir.path().to_str().unwrap(),
-            )?;
-            let cid = a.chain_id().clone();
-            mempool.add_transaction(create_account(&private_key, glenn, cid)?);
-            mempool.add_transaction(update_auth(
-                &private_key,
-                glenn,
-                Name::from_str("claude")?,
-                ACTIVE_NAME,
-                1,
-                cid,
-            )?);
-            let block = a.build_block(&mut mempool).await?;
-            a.accept_block(&block.id()?, &mut mempool)?;
-
-            let log = StateHistoryLog::open_with_magic(log_dir.path(), "block_log", 0)
-                .map_err(|e| ChainError::InternalError(format!("open log: {e:?}")))?;
-            log.append(block.id()?, &block.pack().unwrap())
-                .map_err(|e| ChainError::InternalError(format!("append: {e:?}")))?;
-            (block.id()?, block.pack().unwrap())
-        };
-
-        // Reopen the log fresh, read the block back, and replay it on node B.
-        let src = StateHistoryLog::open_with_magic(log_dir.path(), "block_log", 0)
-            .map_err(|e| ChainError::InternalError(format!("reopen log: {e:?}")))?;
-        let (_start, end) = src.range().expect("block_log is empty after append");
-        let packed = src
-            .read_block(end)
-            .map_err(|e| ChainError::InternalError(format!("read_block: {e:?}")))?;
-        assert_eq!(
-            packed, built_packed,
-            "block_log round-trip corrupted the block"
-        );
-
-        let mempool = Arc::new(RwLock::new(Mempool::new()));
-        let mut mempool = mempool.write().await;
-        let mut b = Controller::new();
-        let dir = get_temp_dir();
-        b.initialize(
-            &chain_id,
-            &config_bytes,
-            &genesis,
-            dir.path().to_str().unwrap(),
-        )?;
-        let block = SignedBlock::read(packed.as_slice(), &mut 0)?;
-        assert_eq!(block.id()?, built_id, "read block id mismatch");
-        b.verify_block(&block, &mut mempool).await?;
-        b.accept_block(&block.id()?, &mut mempool)?;
-
-        for (name, chain_bytes, arena_bytes) in cross_impl_tables(&b.database())? {
-            assert_eq!(
-                chain_bytes, arena_bytes,
-                "block_log-replayed cross-impl state diverged for table {name}"
-            );
-        }
-        Ok(())
-    }
-
     /// Proves we can reconstruct a real testnet block header from the getBlock
     /// JSON: rebuild block 2's header from `a-chain-alpine-rpc` (timestamp slot =
     /// (unix_ms - 946684800000)/500, hex digests, defaults for the unused header
@@ -5320,6 +3041,71 @@ mod tests {
             transactions: txs,
             block_extensions: vec![],
         })
+    }
+
+    /// The arena-only canonical serialization of every state table, keyed by the
+    /// same table names the golden roots record. This is the golden-mode builder:
+    /// it reads the arena alone (no chainbase), so it is what the replay verifies
+    /// against the recorded roots.
+    fn arena_impl_tables(db: &Database) -> Result<Vec<(&'static str, Vec<u8>)>, ChainError> {
+        Ok(vec![
+            (
+                "account_metadata",
+                db.arena_account_metadata_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "account",
+                db.arena_account_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "permission",
+                db.arena_permission_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "permission_link",
+                db.arena_permission_link_state_bytes().unwrap_or_default(),
+            ),
+            ("code", db.arena_code_state_bytes().unwrap_or_default()),
+            (
+                "transaction",
+                db.arena_transaction_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "resource_usage",
+                db.arena_resource_usage_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "resource_limits",
+                db.arena_account_limits_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "resource_state",
+                db.arena_resource_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "dynamic_global_property",
+                db.arena_global_action_sequence()
+                    .unwrap_or(0)
+                    .to_le_bytes()
+                    .to_vec(),
+            ),
+            (
+                "global_property",
+                db.arena_global_property_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "resource_limits_config",
+                db.arena_resource_config_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "contract_table",
+                db.arena_contract_table_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "contract_key_value",
+                db.arena_contract_kv_state_bytes().unwrap_or_default(),
+            ),
+        ])
     }
 
     /// Replay real testnet blocks (fetched via scripts/fetch-blocks.sh into
@@ -5567,87 +3353,6 @@ mod tests {
                     rec.push((n, name.to_string(), table_root(arena)));
                 }
             }
-
-            let mut diverged = None;
-            for (name, chain_bytes, arena_bytes) in cross_impl_tables(&controller.database())? {
-                if chain_bytes != arena_bytes {
-                    if name == "contract_key_value" && std::env::var("PULSEVM_KV_DEBUG").is_ok() {
-                        let rows = |b: &[u8]| {
-                            let mut m = std::collections::BTreeMap::new();
-                            let mut p = 0;
-                            while p + 44 <= b.len() {
-                                let u =
-                                    |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
-                                let vlen = u32::from_le_bytes(b[p + 40..p + 44].try_into().unwrap())
-                                    as usize;
-                                let key = (u(p), u(p + 8), u(p + 16), u(p + 24)); // code,scope,table,pk
-                                m.insert(
-                                    key,
-                                    (u(p + 32), b[p + 44..(p + 44 + vlen).min(b.len())].to_vec()),
-                                );
-                                p += 44 + vlen;
-                            }
-                            m
-                        };
-                        let (c, a) = (rows(&chain_bytes), rows(&arena_bytes));
-                        for (k, cv) in &c {
-                            match a.get(k) {
-                                None => eprintln!(
-                                    "  chain-only row {k:?} payer={} vlen={}",
-                                    cv.0,
-                                    cv.1.len()
-                                ),
-                                Some(av) if av != cv => eprintln!(
-                                    "  DIFF row {k:?}: chain payer={} vlen={} | arena payer={} vlen={}",
-                                    cv.0,
-                                    cv.1.len(),
-                                    av.0,
-                                    av.1.len()
-                                ),
-                                _ => {}
-                            }
-                        }
-                        for (k, av) in &a {
-                            if !c.contains_key(k) {
-                                eprintln!(
-                                    "  arena-only row {k:?} payer={} vlen={}",
-                                    av.0,
-                                    av.1.len()
-                                );
-                            }
-                        }
-                    }
-                    if name == "resource_state" && std::env::var("PULSEVM_KV_DEBUG").is_ok() {
-                        let f = |b: &[u8]| {
-                            let u64a =
-                                |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
-                            // avg_net(20) avg_cpu(20) then 7 u64 scalars
-                            format!(
-                                "pending_net={} pending_cpu={} tot_net={} tot_cpu={} tot_ram={} vnet={} vcpu={} avgnet_vex={} avgcpu_vex={}",
-                                u64a(40),
-                                u64a(48),
-                                u64a(56),
-                                u64a(64),
-                                u64a(72),
-                                u64a(80),
-                                u64a(88),
-                                u64a(0),
-                                u64a(20)
-                            )
-                        };
-                        eprintln!("  chain: {}", f(&chain_bytes));
-                        eprintln!("  arena: {}", f(&arena_bytes));
-                    }
-                    diverged = Some(name);
-                    break;
-                }
-            }
-            if let Some(name) = diverged {
-                eprintln!(
-                    "cross-impl diverged at block {n}, table {name} (matched blocks up to {replayed})"
-                );
-                break;
-            }
             replayed = n;
 
             // Restart the mirror once, mid-chain: checkpoint it, drop the live
@@ -5715,266 +3420,8 @@ mod tests {
             );
             return Ok(());
         }
-
-        // Read-surface check: the cross-impl root proves the arena *holds* the
-        // same rows as chainbase, but running as primary means the arena must
-        // *serve* reads. Drive the arena's raw contract read (arena_kv_get — the
-        // primitive behind db_get_i64) from chainbase's own enumeration of every
-        // contract row, and require the arena to return the same value bytes.
-        // Chainbase enumerates, the arena point-reads independently, so a match
-        // is a real read-path agreement, not a serialization tautology.
-        let db = controller.database();
-        let chain_kv = db.contract_kv_state_bytes()?;
-        let mut checked = 0u64;
-        // chainbase's wire format is already sorted by (code,scope,table,primary),
-        // so rows for a table arrive contiguously and in ascending primary order —
-        // exactly the sequence a forward scan must reproduce. Collect that expected
-        // scan per table as we go, then diff it against the arena's own scan.
-        let mut cur_table: Option<(u64, u64, u64)> = None;
-        let mut expected_scan: Vec<(u64, Vec<u8>)> = Vec::new();
-        let mut tables_scanned = 0u64;
-        let flush = |t: (u64, u64, u64), rows: &[(u64, Vec<u8>)]| {
-            let got = db.arena_table_range(t.0, t.1, t.2);
-            assert_eq!(
-                got.as_slice(),
-                rows,
-                "arena_table_range({},{},{}) scan != chainbase forward scan",
-                t.0,
-                t.1,
-                t.2
-            );
-        };
-        let mut p = 0usize;
-        while p + 44 <= chain_kv.len() {
-            let u = |o: usize| u64::from_le_bytes(chain_kv[o..o + 8].try_into().unwrap());
-            let (code, scope, table, primary) = (u(p), u(p + 8), u(p + 16), u(p + 24));
-            let vlen = u32::from_le_bytes(chain_kv[p + 40..p + 44].try_into().unwrap()) as usize;
-            let value = chain_kv[p + 44..(p + 44 + vlen).min(chain_kv.len())].to_vec();
-
-            // Point read: the db_get_i64 primitive returns chainbase's value.
-            let got = db.arena_kv_get(code, scope, table, primary);
-            assert_eq!(
-                got.as_deref(),
-                Some(value.as_slice()),
-                "arena_kv_get({code},{scope},{table},{primary}) != chainbase value"
-            );
-            checked += 1;
-
-            // Accumulate this table's expected forward scan; flush at each boundary.
-            let key = (code, scope, table);
-            if cur_table != Some(key) {
-                if let Some(prev) = cur_table.take() {
-                    flush(prev, &expected_scan);
-                    tables_scanned += 1;
-                    expected_scan.clear();
-                }
-                cur_table = Some(key);
-            }
-            expected_scan.push((primary, value));
-            p += 44 + vlen;
-        }
-        if let Some(prev) = cur_table.take() {
-            flush(prev, &expected_scan);
-            tables_scanned += 1;
-        }
-
-        // Inline read cross-check tally: accumulated by apply_context::db_get_i64
-        // over every contract read the node actually served during execution
-        // (including mid-transaction speculative reads). Must be all matches.
-        let (read_ok, read_fail) = db.arena_read_crosscheck_counts();
-        assert_eq!(
-            read_fail, 0,
-            "arena served {read_fail} contract reads that diverged from chainbase mid-execution"
-        );
-
-        // Iterator-positioning cross-check tally: accumulated by the
-        // db_next/previous/lowerbound/upperbound wrappers over every cursor move
-        // during execution. The arena computed the same landing key as chainbase.
-        let (pos_ok, pos_fail) = db.arena_pos_crosscheck_counts();
-        assert_eq!(
-            pos_fail, 0,
-            "arena positioned {pos_fail} iterator moves differently from chainbase"
-        );
-
-        // Non-contract read cross-check tally: accumulated by the account and
-        // permission lookups the node ran during authorization and dispatch. The
-        // arena answered each the same as chainbase (existence, parent, threshold,
-        // privileged flag).
-        let (nc_ok, nc_fail) = db.arena_noncontract_crosscheck_counts();
-        assert_eq!(
-            nc_fail, 0,
-            "arena answered {nc_fail} account/permission reads differently from chainbase"
-        );
-
-        // Persistence at real state size: checkpoint the mirror built from the
-        // full history, reload it into a fresh mirror, and require a byte-
-        // identical state root. This is the durability the store needs to be
-        // primary — the state survives a save/load intact.
-        let persist = db.arena_persistence_roundtrip(&ckpt)?;
-        let persist_msg = match persist {
-            Some((matched, size)) => {
-                assert!(
-                    matched,
-                    "arena state root changed across checkpoint save/load"
-                );
-                format!("checkpoint {size} bytes reloaded with identical state root")
-            }
-            None => "persistence check skipped (shadow off)".to_string(),
-        };
-
-        // Crash recovery over the incremental path: rebuild a fresh mirror purely
-        // from the per-block WAL and require the same state root as the live one.
-        let wal_msg = match db.arena_wal_reload_matches(&wal)? {
-            Some(matched) => {
-                assert!(
-                    matched,
-                    "arena state root changed when rebuilt from the WAL"
-                );
-                let size = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
-                format!("{size}-byte per-block WAL replayed to identical state root")
-            }
-            None => "WAL check skipped (shadow off)".to_string(),
-        };
-
-        let restart_msg = if restarted {
-            format!(
-                "mirror restarted from disk at block {restart_block} and stayed in lockstep to {replayed}"
-            )
-        } else {
-            "no mid-chain restart (run too short)".to_string()
-        };
-
-        let read_source = if arena_reads {
-            "the ARENA"
-        } else {
-            "chainbase"
-        };
-        eprintln!(
-            "replayed real testnet blocks up to {replayed} serving contract reads from {read_source}; C++ chainbase and the Rust arena matched the cross-impl full-state root at every block; arena served {checked} point reads and {tables_scanned} table scans identical to chainbase; {read_ok} inline reads + {pos_ok} iterator positions + {nc_ok} account/permission reads cross-checked live, 0 divergences; {persist_msg}; {wal_msg}; {restart_msg}"
-        );
         Ok(())
     }
-
-    /// Block-sequence fuzzer: random sequences of blocks — each with a few
-    /// newaccount transactions, then either accepted or discarded — must keep
-    /// the arena mirror in step with chainbase. After every block, for every
-    /// account name used so far, the arena and chainbase must agree on whether
-    /// it exists, and that must match the set committed by accepted blocks. This
-    /// stresses the session lockstep (speculative build/discard, accept/commit,
-    /// revision advancing across blocks) under random inputs — chainbase is the
-    /// C++ oracle.
-    #[test]
-    fn fuzz_block_sequence_keeps_arena_in_sync() {
-        use std::collections::HashSet;
-
-        // A distinct, always-valid account name (6 lowercase letters) per index.
-        fn nth_name(i: usize) -> Name {
-            let mut s = String::from("z");
-            let mut n = i;
-            for _ in 0..5 {
-                s.push((b'a' + (n % 26) as u8) as char);
-                n /= 26;
-            }
-            Name::from_str(&s).unwrap()
-        }
-
-        proptest::proptest!(
-            proptest::prelude::ProptestConfig::with_cases(200),
-            |(specs in proptest::collection::vec((1usize..=2, proptest::prelude::any::<bool>()), 1..=5))| {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async {
-                let chain_id = Id::from_str(
-                    "c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6",
-                )
-                .unwrap();
-                let private_key = PrivateKey::from_str(
-                    "PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez",
-                )?;
-                let mempool = Arc::new(RwLock::new(Mempool::new()));
-                let mut mempool = mempool.write().await;
-                let mut controller = Controller::new();
-                let genesis_bytes = generate_genesis(&private_key);
-                let temp_path = get_temp_dir();
-                let config_bytes = json!({
-                    "producer_name": "pulse",
-                    "producer_key": private_key.to_string(),
-                })
-                .to_string()
-                .into_bytes();
-                controller.initialize(
-                    &chain_id,
-                    &config_bytes,
-                    &genesis_bytes.to_vec(),
-                    temp_path.path().to_str().unwrap(),
-                )?;
-                let chain_id = controller.chain_id().clone();
-
-                let mut expected: HashSet<u64> = HashSet::new();
-                let mut used: Vec<u64> = Vec::new();
-                let mut counter = 0usize;
-
-                for (n, accept) in specs {
-                    let mut names = Vec::new();
-                    for _ in 0..n {
-                        let nm = nth_name(counter);
-                        counter += 1;
-                        mempool.add_transaction(create_account(&private_key, nm, chain_id)?);
-                        names.push(nm.as_u64());
-                        used.push(nm.as_u64());
-                    }
-                    let block = controller.build_block(&mut mempool).await?;
-                    // The retained pending-chain model keeps the just-built block at
-                    // the tip, so chainbase's head shows its accounts whether or not
-                    // it is accepted; a non-accepted block is unwound at the next
-                    // build (which reconciles to the last accepted preferred). So the
-                    // expected head is the committed set plus this block's accounts.
-                    let head: HashSet<u64> =
-                        expected.iter().copied().chain(names.iter().copied()).collect();
-                    if accept {
-                        controller.accept_block(&block.id()?, &mut mempool)?;
-                        controller.set_preferred_id(block.id()?);
-                        expected.extend(names.iter().copied());
-                    }
-                    // After each block, arena and chainbase must agree, and match
-                    // the head (committed + the block now at the tip).
-                    let db = controller.database();
-                    for &u in &used {
-                        let want = head.contains(&u);
-                        // account_metadata table
-                        let meta_chain = !db.find_account_metadata(u)?.is_null();
-                        let meta_arena = db.arena_account_metadata_privileged(u);
-                        assert_eq!(meta_chain, want, "chainbase account_metadata disagrees with committed set");
-                        assert_eq!(
-                            meta_arena.is_some(),
-                            meta_chain,
-                            "arena account_metadata diverged from chainbase"
-                        );
-                        // account_object table
-                        let acct_chain = !db.find_account(u)?.is_null();
-                        let acct_arena = db.arena_account_exists(u);
-                        assert_eq!(acct_chain, want, "chainbase account disagrees with committed set");
-                        assert_eq!(acct_arena, acct_chain, "arena account table diverged from chainbase");
-                        // a committed account is never privileged when just created
-                        if want {
-                            assert_eq!(meta_arena, Some(false), "arena privileged flag diverged");
-                        }
-                    }
-                    // Cross-impl state root over the whole account_metadata table
-                    // after every block: the canonical serializations must stay
-                    // byte-identical through the speculative build/undo and commit
-                    // sessions, not just for the names this sequence touched.
-                    assert_eq!(
-                        db.account_metadata_state_bytes()?,
-                        db.arena_account_metadata_state_bytes().expect("shadow enabled"),
-                        "cross-impl account_metadata state diverged after a block"
-                    );
-                }
-                Ok::<(), ChainError>(())
-            })
-            .unwrap();
-        });
-    }
-
     #[tokio::test]
     async fn test_initialize() -> Result<(), ChainError> {
         let chain_id =
@@ -6386,7 +3833,7 @@ mod tests {
         let db = validator.database();
         for name in names {
             assert!(
-                !db.find_account(Name::from_str(name)?.as_u64())?.is_null(),
+                db.arena_account_exists(Name::from_str(name)?.as_u64()),
                 "account {name} missing after replay"
             );
         }
@@ -6435,9 +3882,8 @@ mod tests {
 
         // The account created by the block is present in committed state, proving
         // the retained session was committed rather than discarded.
-        let account = controller.database().find_account(glenn.as_u64())?;
         assert!(
-            !account.is_null(),
+            controller.database().arena_account_exists(glenn.as_u64()),
             "accepted account should exist in committed state"
         );
 
@@ -6469,9 +3915,8 @@ mod tests {
 
         assert!(controller.pending_chain.is_empty());
         assert_eq!(controller.last_accepted_block_id, base_block_id);
-        let account = controller.database().find_account(glenn.as_u64())?;
         assert!(
-            account.is_null(),
+            !controller.database().arena_account_exists(glenn.as_u64()),
             "rejected block's state must not persist in the database"
         );
 
@@ -6527,8 +3972,8 @@ mod tests {
 
         // Both accounts are present in committed state.
         let db = validator.database();
-        assert!(!db.find_account(Name::from_str("aaa")?.as_u64())?.is_null());
-        assert!(!db.find_account(Name::from_str("bbb")?.as_u64())?.is_null());
+        assert!(db.arena_account_exists(Name::from_str("aaa")?.as_u64()));
+        assert!(db.arena_account_exists(Name::from_str("bbb")?.as_u64()));
 
         Ok(())
     }
@@ -6593,9 +4038,9 @@ mod tests {
 
         // aaa and ccc are committed; bbb (the losing branch) is not.
         let db = validator.database();
-        assert!(!db.find_account(Name::from_str("aaa")?.as_u64())?.is_null());
-        assert!(!db.find_account(Name::from_str("ccc")?.as_u64())?.is_null());
-        assert!(db.find_account(Name::from_str("bbb")?.as_u64())?.is_null());
+        assert!(db.arena_account_exists(Name::from_str("aaa")?.as_u64()));
+        assert!(db.arena_account_exists(Name::from_str("ccc")?.as_u64()));
+        assert!(!db.arena_account_exists(Name::from_str("bbb")?.as_u64()));
 
         Ok(())
     }
@@ -6633,8 +4078,8 @@ mod tests {
         assert_eq!(validator.last_accepted_block_id, genesis_id);
 
         let db = validator.database();
-        assert!(db.find_account(Name::from_str("aaa")?.as_u64())?.is_null());
-        assert!(db.find_account(Name::from_str("bbb")?.as_u64())?.is_null());
+        assert!(!db.arena_account_exists(Name::from_str("aaa")?.as_u64()));
+        assert!(!db.arena_account_exists(Name::from_str("bbb")?.as_u64()));
 
         Ok(())
     }
@@ -6855,331 +4300,6 @@ mod tests {
 
         Ok(())
     }
-
-    /// Serve-path code oracle: with arena reads enabled, the VM fetches and
-    /// compiles the contract image from the arena (`get_code_bytes_by_hash`),
-    /// not from chainbase. Deploy a trivial contract and call it; the action
-    /// only succeeds if the arena served a byte-identical image the VM can
-    /// instantiate, and the system-object read cross-check must stay clean.
-    #[tokio::test]
-    async fn oracle_contract_code_serves_from_arena() -> Result<(), ChainError> {
-        let wasm = wat::parse_str(
-            r#"(module (memory (export "memory") 1) (func (export "apply") (param i64 i64 i64)))"#,
-        )
-        .unwrap();
-
-        let (mut controller, private_key, _cid, _temp) = init_test_controller()?;
-        // Serve every system-object read from the arena for the rest of the test.
-        controller.database().enable_arena_reads();
-        let chain_id = controller.chain_id().clone();
-        let ts = controller.last_accepted_block().timestamp().clone();
-        let st = BlockStatus::Building;
-        let testapi = Name::from_str("testapi")?;
-
-        controller.execute_transaction(
-            &create_account(&private_key, testapi, chain_id)?,
-            &ts,
-            &st,
-        )?;
-        controller.execute_transaction(
-            &set_code(&private_key, testapi, wasm, chain_id)?,
-            &ts,
-            &st,
-        )?;
-        // Runs the contract: exec_one sees a non-empty code hash and asks the VM
-        // to run it, so the image is fetched from the arena and compiled here.
-        controller.execute_transaction(
-            &call_contract(
-                &private_key,
-                testapi,
-                Name::from_str("run")?,
-                &Vec::<u8>::new(),
-                chain_id,
-            )?,
-            &ts,
-            &st,
-        )?;
-
-        let (_ok, nc_fail) = controller.database().arena_noncontract_crosscheck_counts();
-        assert_eq!(
-            nc_fail, 0,
-            "arena served {nc_fail} system-object reads that diverged from chainbase"
-        );
-        Ok(())
-    }
-
-    /// Secondary-index iterator-handle oracle: a contract that drives the full
-    /// idx64 surface (store, end, lowerbound/upperbound, find_secondary/primary,
-    /// next/previous off both ends, remove) must see the arena mint the identical
-    /// iterator handle chainbase does at every call, and land on the identical
-    /// row. The testnet replay never touches secondary indices, so this WAT
-    /// contract is the only thing that exercises the path — assert the arena
-    /// positioning tally is non-empty (the path really ran) and clean (no
-    /// divergence), with arena reads serving every secondary value.
-    #[tokio::test]
-    async fn oracle_idx64_iterator_handles_mint_and_serve() -> Result<(), ChainError> {
-        // scope=100, table=200; rows (primary, secondary): (10,100) (20,200)
-        // (30,200) (40,300). The duplicate secondary 200 forces the (secondary,
-        // primary) tie-break, and walking next/previous falls off both ends.
-        let wasm = wat::parse_str(
-            r#"(module
-  (import "env" "db_idx64_store" (func $store (param i64 i64 i64 i64 i32) (result i32)))
-  (import "env" "db_idx64_end" (func $end (param i64 i64 i64) (result i32)))
-  (import "env" "db_idx64_lowerbound" (func $lb (param i64 i64 i64 i32 i32) (result i32)))
-  (import "env" "db_idx64_upperbound" (func $ub (param i64 i64 i64 i32 i32) (result i32)))
-  (import "env" "db_idx64_find_secondary" (func $fs (param i64 i64 i64 i32 i32) (result i32)))
-  (import "env" "db_idx64_find_primary" (func $fp (param i64 i64 i64 i32 i64) (result i32)))
-  (import "env" "db_idx64_next" (func $next (param i32 i32) (result i32)))
-  (import "env" "db_idx64_previous" (func $prev (param i32 i32) (result i32)))
-  (import "env" "db_idx64_remove" (func $rm (param i32)))
-  (memory (export "memory") 1)
-  (func (export "apply") (param $receiver i64) (param $code i64) (param $action i64)
-    (local $scope i64) (local $table i64) (local $it i32) (local $e i32)
-    (local.set $scope (i64.const 100))
-    (local.set $table (i64.const 200))
-
-    ;; store the four rows, payer = receiver
-    (i64.store (i32.const 0) (i64.const 100))
-    (drop (call $store (local.get $scope) (local.get $table) (local.get $receiver) (i64.const 10) (i32.const 0)))
-    (i64.store (i32.const 0) (i64.const 200))
-    (drop (call $store (local.get $scope) (local.get $table) (local.get $receiver) (i64.const 20) (i32.const 0)))
-    (i64.store (i32.const 0) (i64.const 200))
-    (drop (call $store (local.get $scope) (local.get $table) (local.get $receiver) (i64.const 30) (i32.const 0)))
-    (i64.store (i32.const 0) (i64.const 300))
-    (drop (call $store (local.get $scope) (local.get $table) (local.get $receiver) (i64.const 40) (i32.const 0)))
-
-    ;; end iterator for the table
-    (local.set $e (call $end (local.get $receiver) (local.get $scope) (local.get $table)))
-
-    ;; lowerbound(0) lands on the first row, then next walks off the end
-    (i64.store (i32.const 0) (i64.const 0))
-    (local.set $it (call $lb (local.get $receiver) (local.get $scope) (local.get $table) (i32.const 0) (i32.const 8)))
-    (local.set $it (call $next (local.get $it) (i32.const 8)))
-    (local.set $it (call $next (local.get $it) (i32.const 8)))
-    (local.set $it (call $next (local.get $it) (i32.const 8)))
-    (local.set $it (call $next (local.get $it) (i32.const 8)))
-
-    ;; point lookups
-    (i64.store (i32.const 0) (i64.const 200))
-    (drop (call $fs (local.get $receiver) (local.get $scope) (local.get $table) (i32.const 0) (i32.const 8)))
-    (drop (call $fp (local.get $receiver) (local.get $scope) (local.get $table) (i32.const 0) (i64.const 30)))
-    (i64.store (i32.const 0) (i64.const 200))
-    (drop (call $ub (local.get $receiver) (local.get $scope) (local.get $table) (i32.const 0) (i32.const 8)))
-
-    ;; previous from the end iterator lands on the last row, then walks off the front
-    (local.set $it (call $prev (local.get $e) (i32.const 8)))
-    (local.set $it (call $prev (local.get $it) (i32.const 8)))
-    (local.set $it (call $prev (local.get $it) (i32.const 8)))
-    (local.set $it (call $prev (local.get $it) (i32.const 8)))
-    (local.set $it (call $prev (local.get $it) (i32.const 8)))
-
-    ;; remove the first row through a fresh handle
-    (i64.store (i32.const 0) (i64.const 0))
-    (local.set $it (call $lb (local.get $receiver) (local.get $scope) (local.get $table) (i32.const 0) (i32.const 8)))
-    (call $rm (local.get $it))
-  )
-)"#,
-        )
-        .unwrap();
-
-        let (mut controller, private_key, _cid, _temp) = init_test_controller()?;
-        controller.database().enable_arena_reads();
-        let chain_id = controller.chain_id().clone();
-        let ts = controller.last_accepted_block().timestamp().clone();
-        let st = BlockStatus::Building;
-        let testapi = Name::from_str("testapi")?;
-
-        controller.execute_transaction(
-            &create_account(&private_key, testapi, chain_id)?,
-            &ts,
-            &st,
-        )?;
-        controller.execute_transaction(
-            &set_code(&private_key, testapi, wasm, chain_id)?,
-            &ts,
-            &st,
-        )?;
-
-        let (ok_before, fail_before) = controller.database().arena_pos_crosscheck_counts();
-        controller.execute_transaction(
-            &call_contract(
-                &private_key,
-                testapi,
-                Name::from_str("run")?,
-                &Vec::<u8>::new(),
-                chain_id,
-            )?,
-            &ts,
-            &st,
-        )?;
-        let (ok_after, fail_after) = controller.database().arena_pos_crosscheck_counts();
-
-        assert_eq!(
-            fail_after, fail_before,
-            "arena secondary-index handles/positions diverged from chainbase during idx64 iteration"
-        );
-        assert!(
-            ok_after - ok_before >= 20,
-            "expected the idx64 walk to cross-check many handles, saw {}",
-            ok_after - ok_before
-        );
-        Ok(())
-    }
-
-    /// Secondary-index iterator-handle oracle for the wider-key families: the
-    /// idx64 walk covers the u64 machinery; this covers the two structural
-    /// variants — a u128 secondary (idx128) and an IEEE-754 float secondary
-    /// (idx_double, whose `last`/order use the software-float key). One contract
-    /// drives both surfaces off both ends; the arena must mint chainbase's handle
-    /// and land on chainbase's row at every step, served under arena reads.
-    #[tokio::test]
-    async fn oracle_secondary_wide_key_handles_mint_and_serve() -> Result<(), ChainError> {
-        // idx128 table 300, idx_double table 301, scope 100. Rows (primary,
-        // secondary): (10,100/1.0) (20,200/2.0) (30,200/2.0) (40,300/3.0). The
-        // idx128 secondary is a u128 at [0..16] (hi word kept 0); the double
-        // secondary is the f64 bit pattern at [24..32]. Primary out cells are
-        // [16..24] and [32..40].
-        let wasm = wat::parse_str(
-            r#"(module
-  (import "env" "db_idx128_store" (func $s128 (param i64 i64 i64 i64 i32) (result i32)))
-  (import "env" "db_idx128_end" (func $e128 (param i64 i64 i64) (result i32)))
-  (import "env" "db_idx128_lowerbound" (func $lb128 (param i64 i64 i64 i32 i32) (result i32)))
-  (import "env" "db_idx128_upperbound" (func $ub128 (param i64 i64 i64 i32 i32) (result i32)))
-  (import "env" "db_idx128_find_secondary" (func $fs128 (param i64 i64 i64 i32 i32) (result i32)))
-  (import "env" "db_idx128_find_primary" (func $fp128 (param i64 i64 i64 i32 i64) (result i32)))
-  (import "env" "db_idx128_next" (func $n128 (param i32 i32) (result i32)))
-  (import "env" "db_idx128_previous" (func $p128 (param i32 i32) (result i32)))
-  (import "env" "db_idx128_update" (func $u128 (param i32 i64 i32)))
-  (import "env" "db_idx_double_store" (func $sd (param i64 i64 i64 i64 i32) (result i32)))
-  (import "env" "db_idx_double_end" (func $ed (param i64 i64 i64) (result i32)))
-  (import "env" "db_idx_double_lowerbound" (func $lbd (param i64 i64 i64 i32 i32) (result i32)))
-  (import "env" "db_idx_double_upperbound" (func $ubd (param i64 i64 i64 i32 i32) (result i32)))
-  (import "env" "db_idx_double_find_secondary" (func $fsd (param i64 i64 i64 i32 i32) (result i32)))
-  (import "env" "db_idx_double_find_primary" (func $fpd (param i64 i64 i64 i32 i64) (result i32)))
-  (import "env" "db_idx_double_next" (func $nd (param i32 i32) (result i32)))
-  (import "env" "db_idx_double_previous" (func $pd (param i32 i32) (result i32)))
-  (memory (export "memory") 1)
-  (func (export "apply") (param $receiver i64) (param $code i64) (param $action i64)
-    (local $scope i64) (local $it i32) (local $e i32)
-    (local.set $scope (i64.const 100))
-
-    ;; ---- idx128 (table 300), u128 secondary at [0..16], hi word stays 0 ----
-    (i64.store (i32.const 8) (i64.const 0))
-    (i64.store (i32.const 0) (i64.const 100))
-    (drop (call $s128 (local.get $scope) (i64.const 300) (local.get $receiver) (i64.const 10) (i32.const 0)))
-    (i64.store (i32.const 0) (i64.const 200))
-    (drop (call $s128 (local.get $scope) (i64.const 300) (local.get $receiver) (i64.const 20) (i32.const 0)))
-    (i64.store (i32.const 0) (i64.const 200))
-    (drop (call $s128 (local.get $scope) (i64.const 300) (local.get $receiver) (i64.const 30) (i32.const 0)))
-    (i64.store (i32.const 0) (i64.const 300))
-    (drop (call $s128 (local.get $scope) (i64.const 300) (local.get $receiver) (i64.const 40) (i32.const 0)))
-
-    (local.set $e (call $e128 (local.get $receiver) (local.get $scope) (i64.const 300)))
-    (i64.store (i32.const 0) (i64.const 0))
-    (local.set $it (call $lb128 (local.get $receiver) (local.get $scope) (i64.const 300) (i32.const 0) (i32.const 16)))
-    (local.set $it (call $n128 (local.get $it) (i32.const 16)))
-    (local.set $it (call $n128 (local.get $it) (i32.const 16)))
-    (local.set $it (call $n128 (local.get $it) (i32.const 16)))
-    (local.set $it (call $n128 (local.get $it) (i32.const 16)))
-    (i64.store (i32.const 0) (i64.const 200))
-    (drop (call $fs128 (local.get $receiver) (local.get $scope) (i64.const 300) (i32.const 0) (i32.const 16)))
-    (drop (call $fp128 (local.get $receiver) (local.get $scope) (i64.const 300) (i32.const 0) (i64.const 30)))
-    (i64.store (i32.const 0) (i64.const 200))
-    (drop (call $ub128 (local.get $receiver) (local.get $scope) (i64.const 300) (i32.const 0) (i32.const 16)))
-    (local.set $it (call $p128 (local.get $e) (i32.const 16)))
-    (local.set $it (call $p128 (local.get $it) (i32.const 16)))
-    (local.set $it (call $p128 (local.get $it) (i32.const 16)))
-    (local.set $it (call $p128 (local.get $it) (i32.const 16)))
-    (local.set $it (call $p128 (local.get $it) (i32.const 16)))
-
-    ;; update: re-point primary 10 from secondary 100 to 500, then the served
-    ;; finds must reflect the new key and lose the old (proves the update mirror
-    ;; reaches the arena — a stale arena would diverge here under reads).
-    (i64.store (i32.const 0) (i64.const 100))
-    (local.set $it (call $fs128 (local.get $receiver) (local.get $scope) (i64.const 300) (i32.const 0) (i32.const 16)))
-    (i64.store (i32.const 0) (i64.const 500))
-    (call $u128 (local.get $it) (local.get $receiver) (i32.const 0))
-    (i64.store (i32.const 0) (i64.const 500))
-    (drop (call $fs128 (local.get $receiver) (local.get $scope) (i64.const 300) (i32.const 0) (i32.const 16)))
-    (i64.store (i32.const 0) (i64.const 100))
-    (drop (call $fs128 (local.get $receiver) (local.get $scope) (i64.const 300) (i32.const 0) (i32.const 16)))
-
-    ;; ---- idx_double (table 301), f64 bits at [24..32] ----
-    (i64.store (i32.const 24) (i64.reinterpret_f64 (f64.const 1)))
-    (drop (call $sd (local.get $scope) (i64.const 301) (local.get $receiver) (i64.const 10) (i32.const 24)))
-    (i64.store (i32.const 24) (i64.reinterpret_f64 (f64.const 2)))
-    (drop (call $sd (local.get $scope) (i64.const 301) (local.get $receiver) (i64.const 20) (i32.const 24)))
-    (i64.store (i32.const 24) (i64.reinterpret_f64 (f64.const 2)))
-    (drop (call $sd (local.get $scope) (i64.const 301) (local.get $receiver) (i64.const 30) (i32.const 24)))
-    (i64.store (i32.const 24) (i64.reinterpret_f64 (f64.const 3)))
-    (drop (call $sd (local.get $scope) (i64.const 301) (local.get $receiver) (i64.const 40) (i32.const 24)))
-
-    (local.set $e (call $ed (local.get $receiver) (local.get $scope) (i64.const 301)))
-    (i64.store (i32.const 24) (i64.reinterpret_f64 (f64.const -1)))
-    (local.set $it (call $lbd (local.get $receiver) (local.get $scope) (i64.const 301) (i32.const 24) (i32.const 32)))
-    (local.set $it (call $nd (local.get $it) (i32.const 32)))
-    (local.set $it (call $nd (local.get $it) (i32.const 32)))
-    (local.set $it (call $nd (local.get $it) (i32.const 32)))
-    (local.set $it (call $nd (local.get $it) (i32.const 32)))
-    (i64.store (i32.const 24) (i64.reinterpret_f64 (f64.const 2)))
-    (drop (call $fsd (local.get $receiver) (local.get $scope) (i64.const 301) (i32.const 24) (i32.const 32)))
-    (drop (call $fpd (local.get $receiver) (local.get $scope) (i64.const 301) (i32.const 24) (i64.const 30)))
-    (i64.store (i32.const 24) (i64.reinterpret_f64 (f64.const 2)))
-    (drop (call $ubd (local.get $receiver) (local.get $scope) (i64.const 301) (i32.const 24) (i32.const 32)))
-    (local.set $it (call $pd (local.get $e) (i32.const 32)))
-    (local.set $it (call $pd (local.get $it) (i32.const 32)))
-    (local.set $it (call $pd (local.get $it) (i32.const 32)))
-    (local.set $it (call $pd (local.get $it) (i32.const 32)))
-    (local.set $it (call $pd (local.get $it) (i32.const 32)))
-  )
-)"#,
-        )
-        .unwrap();
-
-        let (mut controller, private_key, _cid, _temp) = init_test_controller()?;
-        controller.database().enable_arena_reads();
-        let chain_id = controller.chain_id().clone();
-        let ts = controller.last_accepted_block().timestamp().clone();
-        let st = BlockStatus::Building;
-        let testapi = Name::from_str("testapi")?;
-
-        controller.execute_transaction(
-            &create_account(&private_key, testapi, chain_id)?,
-            &ts,
-            &st,
-        )?;
-        controller.execute_transaction(
-            &set_code(&private_key, testapi, wasm, chain_id)?,
-            &ts,
-            &st,
-        )?;
-
-        let (ok_before, fail_before) = controller.database().arena_pos_crosscheck_counts();
-        controller.execute_transaction(
-            &call_contract(
-                &private_key,
-                testapi,
-                Name::from_str("run")?,
-                &Vec::<u8>::new(),
-                chain_id,
-            )?,
-            &ts,
-            &st,
-        )?;
-        let (ok_after, fail_after) = controller.database().arena_pos_crosscheck_counts();
-
-        assert_eq!(
-            fail_after, fail_before,
-            "arena idx128/idx_double handles or positions diverged from chainbase"
-        );
-        assert!(
-            ok_after - ok_before >= 40,
-            "expected the idx128 + idx_double walks to cross-check many handles, saw {}",
-            ok_after - ok_before
-        );
-        Ok(())
-    }
-
     #[tokio::test]
     async fn test_api_db() -> Result<(), ChainError> {
         let (mut controller, private_key, _chain_id, _temp) = init_test_controller()?;
@@ -7894,7 +5014,7 @@ mod tests {
         let producer_height = producer.last_accepted_block().block_num();
         let producer_schedule = producer.active_schedule.clone();
         assert_eq!(producer_schedule.version, 1);
-        assert!(!producer.database().find_account_metadata(name)?.is_null());
+        assert!(producer.database().arena_account_metadata(name).is_some());
 
         let summary = producer.produce_state_summary()?;
         assert_eq!(summary.height, producer_height as u64);
@@ -7903,7 +5023,7 @@ mod tests {
         let syncer_temp = get_temp_dir();
         let syncer_path = syncer_temp.path().to_str().unwrap().to_string();
         let mut syncer = init(&syncer_path)?;
-        assert!(syncer.database().find_account_metadata(name)?.is_null());
+        assert!(syncer.database().arena_account_metadata(name).is_none());
 
         // Parse agrees with produce on the commitment.
         let (parsed_id, parsed_height) = Controller::parse_state_summary(&summary.bytes)?;
@@ -7923,7 +5043,7 @@ mod tests {
         // Apply transfers state, tip, and schedule.
         syncer.apply_state_snapshot(target.block.clone(), target.schedule.clone(), &envelope)?;
         assert!(
-            !syncer.database().find_account_metadata(name)?.is_null(),
+            syncer.database().arena_account_metadata(name).is_some(),
             "state not transferred"
         );
         assert_eq!(syncer.last_accepted_block().block_num(), producer_height);
@@ -7935,7 +5055,7 @@ mod tests {
         syncer.shutdown()?;
         let restarted = init(&syncer_path)?;
         assert!(
-            !restarted.database().find_account_metadata(name)?.is_null(),
+            restarted.database().arena_account_metadata(name).is_some(),
             "synced state lost across restart"
         );
         assert_eq!(restarted.last_accepted_block().block_num(), producer_height);
@@ -8099,7 +5219,7 @@ mod tests {
         eprintln!("replayed {replayed} real blocks, tip at height {height}");
         // The system account exists in the real chain's state.
         let pulse = Name::from_str("pulse")?.as_u64();
-        assert!(!producer.database().find_account(pulse)?.is_null());
+        assert!(producer.database().arena_account_exists(pulse));
 
         // ---- Sync: a fresh node downloads and applies the snapshot. ----
         let summary = producer.produce_state_summary()?;
@@ -8109,7 +5229,7 @@ mod tests {
         let syncer_path = syncer_temp.path().to_str().unwrap().to_string();
         let mut syncer = init(&syncer_path)?;
         assert!(
-            syncer.database().find_account(pulse)?.is_null()
+            !syncer.database().arena_account_exists(pulse)
                 || syncer.last_accepted_block().block_num() == 1,
             "syncer should start from genesis, not the producer's height"
         );
@@ -8135,7 +5255,7 @@ mod tests {
         assert_eq!(syncer.last_accepted_block().id()?, producer_tip_id);
         assert_eq!(syncer.database().revision(), height as i64);
         assert!(
-            !syncer.database().find_account(pulse)?.is_null(),
+            syncer.database().arena_account_exists(pulse),
             "system account missing after sync"
         );
         // Faithfulness: re-snapshotting the synced arena reproduces the exact
@@ -8152,7 +5272,7 @@ mod tests {
         let restarted = init(&syncer_path)?;
         assert_eq!(restarted.last_accepted_block().block_num(), height);
         assert_eq!(restarted.last_accepted_block().id()?, producer_tip_id);
-        assert!(!restarted.database().find_account(pulse)?.is_null());
+        assert!(restarted.database().arena_account_exists(pulse));
         eprintln!("synced node restarted cleanly at height {height}");
 
         Ok(())
@@ -8664,8 +5784,9 @@ mod tests {
 
         let before = controller
             .database()
-            .get_account_metadata(PULSE_NAME.as_u64())?
-            .get_recv_sequence();
+            .arena_account_metadata(PULSE_NAME.as_u64())
+            .unwrap()
+            .recv_sequence;
 
         mempool.add_transaction(create_account(
             &private_key,
@@ -8677,8 +5798,9 @@ mod tests {
 
         let after = controller
             .database()
-            .get_account_metadata(PULSE_NAME.as_u64())?
-            .get_recv_sequence();
+            .arena_account_metadata(PULSE_NAME.as_u64())
+            .unwrap()
+            .recv_sequence;
 
         assert_eq!(
             after - before,
@@ -8698,14 +5820,7 @@ mod tests {
         let (mut controller, _private_key, _chain_id, _temp) = init_test_controller()?;
 
         let db = controller.database();
-        // Scoped: the guard must not still be held when `run_onblock` below asks
-        // the same lock for a write, which is a self-deadlock on one thread.
-        let min_cpu_us = {
-            let r = db.read()?;
-            r.get_global_properties()?
-                .get_chain_config()
-                .get_min_transaction_cpu_usage() as u64
-        };
+        let min_cpu_us = db.chain_config()?.min_transaction_cpu_usage as u64;
         assert!(min_cpu_us > 0, "genesis must set a non-zero CPU floor");
 
         let cpu_before = db.get_block_cpu_limit()?;
@@ -8860,8 +5975,9 @@ mod tests {
 
         let db = controller.database();
         let recv_before = db
-            .get_account_metadata(PULSE_NAME.as_u64())?
-            .get_recv_sequence();
+            .arena_account_metadata(PULSE_NAME.as_u64())
+            .unwrap()
+            .recv_sequence;
         let cpu_before = db.get_block_cpu_limit()?;
 
         let timestamp: BlockTimestamp = TimePoint::now().into();
@@ -8871,8 +5987,9 @@ mod tests {
         assert!(digests.is_empty());
         assert!(proposed_schedule.is_none());
         assert_eq!(
-            db.get_account_metadata(PULSE_NAME.as_u64())?
-                .get_recv_sequence(),
+            db.arena_account_metadata(PULSE_NAME.as_u64())
+                .unwrap()
+                .recv_sequence,
             recv_before,
             "a skipped onblock must not advance pulse's receive sequence"
         );
@@ -9271,10 +6388,9 @@ mod tests {
             result.trace.receipt.status,
             crate::transaction::TransactionStatus::Executed
         );
-        let digest = result.trace.id.to_digest()?;
         let found = controller
             .database()
-            .is_known_unexpired_transaction(&digest)?;
+            .is_known_unexpired_transaction(&result.trace.id.0.0)?;
         assert!(!found);
 
         Ok(())
