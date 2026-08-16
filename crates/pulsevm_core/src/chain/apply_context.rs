@@ -672,7 +672,7 @@ impl ApplyContext {
         // (which auto-removes the table when it empties, as chainbase did), and
         // reclaim the same RAM. The delta matches the C++ db_remove_i64:
         // -(value + key_value_object overhead).
-        let delta = {
+        let (delta, payer) = {
             let mut inner = self.inner.write()?;
             let (code, scope, table, primary) = inner
                 .arena_keyval_cache
@@ -682,7 +682,7 @@ impl ApplyContext {
                 code == self.receiver.as_u64(),
                 ChainError::TransactionError(format!("db access violation")),
             )?;
-            let (_payer, value) = self
+            let (payer, value) = self
                 .db
                 .arena_kv_row(code, scope, table, primary)
                 .ok_or_else(|| {
@@ -692,9 +692,12 @@ impl ApplyContext {
             self.db
                 .remove_key_value_object_standalone(code, scope, table, primary)?;
             inner.arena_keyval_cache.remove(iterator);
-            delta
+            (delta, payer)
         };
-        self.update_db_usage(&Name::new(self.receiver.as_u64()), -delta)?;
+        // Refund the row's stored payer (matching EOSIO's db_remove_i64, which
+        // credits obj.payer). `delta` is already negative, so pass it straight
+        // through — negating it here would bill the payer for freeing the row.
+        self.update_db_usage(&Name::new(payer), delta)?;
         Ok(())
     }
 

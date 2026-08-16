@@ -1024,13 +1024,11 @@ impl Controller {
             self.active_schedule = schedule;
         }
 
-        // Accept boundary: commit the arena mirror in lockstep and surface its
-        // root. The full session lockstep across build/verify is still to come;
-        // for now this commits and logs the ported subset the shadow carries.
-        self.db.arena_commit(block.block_num() as i64);
+        // `commit` above already collapsed the arena's undo stack to this block;
+        // just surface the committed state root for debugging.
         if let Some(root) = self.db.arena_state_root() {
             debug!(
-                "arena shadow root at block {}: {}",
+                "arena state root at block {}: {}",
                 block.block_num(),
                 hex::encode(root)
             );
