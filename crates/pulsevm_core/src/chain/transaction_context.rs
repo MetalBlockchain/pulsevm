@@ -23,7 +23,6 @@ use pulsevm_ffi::{
     seconds,
 };
 use pulsevm_serialization::VarUint32;
-use spdlog::info;
 
 use crate::{
     authorization_manager::AuthorizationManager,

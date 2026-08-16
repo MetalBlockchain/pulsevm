@@ -3201,15 +3201,6 @@ mod tests {
             temp.path().to_str().unwrap(),
         )?;
 
-        // The arena is the primary read backend (see ArenaShadow): the node
-        // serves every contract read FROM the arena, chainbase still takes the
-        // writes, and the inline cross-check still runs. If the arena served a
-        // wrong byte, execution would diverge and the cross-impl root would break,
-        // so a clean full-history replay is the node running on arena-served reads.
-        // Reads are on by default; a falsey PULSEVM_ARENA_READS reverts to
-        // chainbase, so read the effective state rather than the raw env.
-        let arena_reads = controller.database().arena_reads_enabled();
-
         // Our genesis (block 1) must match the testnet's, or block 2 won't chain.
         let genesis_id = controller.last_accepted_block().id()?;
         let start = controller.last_accepted_block().block_num() + 1;

@@ -15,7 +15,6 @@ pub use crate::{
     database::{
         Database,
         DbRead,
-        DbWrite,
         PermissionInfo,
         restore_snapshot,
     },

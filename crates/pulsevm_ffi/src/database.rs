@@ -757,57 +757,6 @@ impl Database {
     /// value the node is handing a contract) for `(code, scope, table, primary)`.
     /// No-op when shadowing is off. Tallies match/mismatch; see
     /// `arena_read_crosscheck_counts`.
-    pub fn arena_crosscheck_kv(
-        &self,
-        code: u64,
-        scope: u64,
-        table: u64,
-        primary: u64,
-        expected: &[u8],
-    ) {
-        {
-            {
-                let s = &self.shadow;
-                s.crosscheck_kv(code, scope, table, primary, expected);
-            }
-        }
-    }
-
-    /// Route contract reads through the arena instead of chainbase (the staged
-    /// cutover switch). No-op when shadowing is off.
-    /// The arena is the sole backend, so reads are always served from it. Kept
-    /// as a no-op so the controller's cutover call sites still resolve.
-    pub fn enable_arena_reads(&self) {}
-
-    /// Always true: the arena is the only backend.
-    pub fn arena_reads_enabled(&self) -> bool {
-        true
-    }
-
-    /// Always true: reads resolve entirely from the arena.
-    pub fn arena_standalone_reads(&self) -> bool {
-        true
-    }
-
-    /// No-op: writes always go to the arena alone.
-    pub fn enable_arena_standalone_writes(&self) {}
-
-    /// Always true: genesis is authored directly on the arena.
-    pub fn arena_rust_genesis(&self) -> bool {
-        true
-    }
-
-    /// Always true: writes always go to the arena alone.
-    pub fn arena_standalone_writes(&self) -> bool {
-        true
-    }
-
-    /// (matches, mismatches) tallied by the inline read cross-check, or (0, 0)
-    /// when shadowing is off.
-    pub fn arena_read_crosscheck_counts(&self) -> (u64, u64) {
-        { self.shadow.read_crosscheck_counts() }
-    }
-
     /// Arena iterator positioning: the primary a cursor lands on. `lower_bound` =
     /// first primary >= key, `upper_bound` = first primary > key (also the
     /// db_next successor), `prev` = last primary < key. `None` = off the end.
@@ -1427,9 +1376,6 @@ impl Database {
     pub fn arena_undo(&self) {
         self.shadow.undo();
     }
-    pub fn arena_commit(&self, revision: i64) {
-        self.shadow.commit(revision);
-    }
 
     /// The arena lives in memory behind an `Arc`, so there is nothing to close;
     /// dropping the last handle releases it. Retained for the controller's
@@ -1869,10 +1815,8 @@ impl Database {
         account: &Name,
         time_slot: u32,
     ) -> Result<(), ChainError> {
-        let s = &self.shadow;
-        let _ = s;
-        self.mirror_account_usage(account.as_u64(), 0, 0, time_slot);
-        return Ok(());
+        self.account_usage(account.as_u64(), 0, 0, time_slot);
+        Ok(())
     }
 
     pub fn add_transaction_usage(
@@ -1881,18 +1825,20 @@ impl Database {
         cpu_usage: u64,
         net_usage: u64,
         time_slot: u32,
-        validate: bool,
+        // TODO(parity): when true this must enforce cpu/net against the account's
+        // limits and reject the transaction if exceeded, like EOSIO's
+        // add_transaction_usage. Enforcement is a tracked feature gap; today we
+        // only accumulate usage.
+        _validate: bool,
     ) -> Result<(), ChainError> {
-        let s = &self.shadow;
-        let _ = s;
-        self.mirror_account_usage(account.as_u64(), cpu_usage, net_usage, time_slot);
-        return Ok(());
+        self.account_usage(account.as_u64(), cpu_usage, net_usage, time_slot);
+        Ok(())
     }
 
-    /// Replays a net/cpu usage advance onto the arena mirror, pulling the average
-    /// windows from chainbase config so the accumulator decay matches. Best
-    /// effort: a divergence is logged, never propagated.
-    fn mirror_account_usage(&self, account: u64, cpu_usage: u64, net_usage: u64, time_slot: u32) {
+    /// Advance an account's net/cpu usage accumulators, decaying over the average
+    /// windows read from chain config. Best effort: a config read failure is
+    /// logged, never propagated.
+    fn account_usage(&self, account: u64, cpu_usage: u64, net_usage: u64, time_slot: u32) {
         let windows = self.get_account_net_usage_average_window().and_then(|nw| {
             self.get_account_cpu_usage_average_window()
                 .map(|cw| (nw, cw))
@@ -2885,13 +2831,15 @@ impl Database {
         code: u64,
         scope: &str,
         table: u64,
-        table_key: &str,
+        // Accepted for RPC signature compatibility; the arena query keys off
+        // key_type/index_position. table_key/encode_type honouring is a gap.
+        _table_key: &str,
         lower_bound: &str,
         upper_bound: &str,
         limit: u32,
         key_type: &str,
         index_position: &str,
-        encode_type: &str,
+        _encode_type: &str,
         reverse: bool,
         show_payer: bool,
     ) -> Result<String, ChainError> {
@@ -3584,12 +3532,6 @@ impl Database {
             _marker: std::marker::PhantomData,
         })
     }
-
-    /// Acquire a write view. The arena serves reads and writes through the same
-    /// handle, so this hands back the same cheap clone as [`Database::read`].
-    pub fn write(&self) -> Result<DbWrite, ChainError> {
-        Ok(DbWrite)
-    }
 }
 
 /// Read view over the arena. Holds a cheap clone of the arena handle; the `'g`
@@ -3776,11 +3718,6 @@ impl<'g> DbRead<'g> {
         return Ok(s.permission_link(account, code, requirement_type));
     }
 }
-
-/// Write view over the arena. The arena mutates through the shared handle the
-/// `Database` already holds, so this is a marker retained for source
-/// compatibility with call sites that acquire a write view.
-pub struct DbWrite;
 
 impl Default for Database {
     fn default() -> Self {
