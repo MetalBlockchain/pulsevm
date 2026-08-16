@@ -2085,6 +2085,12 @@ impl Database {
         }
     }
 
+    /// The payer to credit the table_id_object overhead when a table's last child
+    /// is removed, or `None` if the table is absent.
+    pub fn arena_table_payer(&self, code: u64, scope: u64, table: u64) -> Option<u64> {
+        self.shadow.table_payer(code, scope, table)
+    }
+
     /// The `(payer, value)` of a contract row from the arena, or `None`. Under
     /// standalone writes db_update/db_remove resolve the row's key from the arena
     /// cache and need its old payer and value size to author the RAM delta.

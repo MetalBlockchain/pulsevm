@@ -3445,6 +3445,19 @@ impl ArenaShadow {
             .is_some()
     }
 
+    /// The payer recorded on a table's `table_id` mirror, or `None` if the table
+    /// is absent. Removing a table's last child refunds the table_id_object
+    /// overhead to this account (chainbase does the same in `remove_table`). It is
+    /// the creation payer — see the note on `ContractTableRow`: the mirror cannot
+    /// observe chainbase reassigning it internally.
+    pub fn table_payer(&self, code: u64, scope: u64, table: u64) -> Option<u64> {
+        let db = self.lock();
+        db.find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&(code, scope, table))
+            .ok()
+            .flatten()
+            .map(|t| t.payer)
+    }
+
     /// The `(payer, value)` of a contract row, or `None` if absent. db_update /
     /// db_remove reach the row by opaque handle; under standalone writes the
     /// caller resolves the key from the arena cache and needs the old payer and

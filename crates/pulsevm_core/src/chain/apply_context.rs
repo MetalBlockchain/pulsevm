@@ -667,12 +667,34 @@ impl ApplyContext {
         Ok(copy_size as i32)
     }
 
+    /// Refund the table_id_object overhead to the table's payer when a remove has
+    /// just emptied the table, matching chainbase's `remove_table`. `table_payer`
+    /// is sampled before the remove, since emptying deletes the table_id row. A
+    /// no-op while the table still has children — the `count` a table tracks spans
+    /// its primary and every secondary row, so any of the six remove paths can be
+    /// the one that empties it.
+    fn refund_table_if_emptied(
+        &mut self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        table_payer: u64,
+    ) -> Result<(), ChainError> {
+        if !self.db.arena_table_exists(code, scope, table) {
+            self.update_db_usage(
+                &Name::new(table_payer),
+                -(billable_size_v::<TableObject>() as i64),
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn db_remove_i64(&mut self, iterator: i32) -> Result<(), ChainError> {
         // Resolve the row's key and value from the arena, remove it there alone
         // (which auto-removes the table when it empties, as chainbase did), and
         // reclaim the same RAM. The delta matches the C++ db_remove_i64:
         // -(value + key_value_object overhead).
-        let (delta, payer) = {
+        let (delta, payer, code, scope, table, table_payer) = {
             let mut inner = self.inner.write()?;
             let (code, scope, table, primary) = inner
                 .arena_keyval_cache
@@ -688,16 +710,21 @@ impl ApplyContext {
                 .ok_or_else(|| {
                     ChainError::InternalError(format!("arena has no row for iterator {iterator}"))
                 })?;
+            let table_payer = self
+                .db
+                .arena_table_payer(code, scope, table)
+                .unwrap_or(payer);
             let delta = -(value.len() as i64 + billable_size_v::<KeyValueObject>() as i64);
             self.db
                 .remove_key_value_object_standalone(code, scope, table, primary)?;
             inner.arena_keyval_cache.remove(iterator);
-            (delta, payer)
+            (delta, payer, code, scope, table, table_payer)
         };
         // Refund the row's stored payer (matching EOSIO's db_remove_i64, which
         // credits obj.payer). `delta` is already negative, so pass it straight
         // through — negating it here would bill the payer for freeing the row.
         self.update_db_usage(&Name::new(payer), delta)?;
+        self.refund_table_if_emptied(code, scope, table, table_payer)?;
         Ok(())
     }
 
@@ -894,7 +921,7 @@ impl ApplyContext {
     pub fn db_idx64_remove(&mut self, iterator: i32) -> Result<(), ChainError> {
         // Refund the secondary row's stored payer (matching EOSIO and the
         // idxN_update billing), not self.receiver.
-        let payer = {
+        let (payer, code, scope, table, table_payer) = {
             let mut inner = self.inner.write()?;
             let (code, scope, table, primary) = inner
                 .arena_index64_cache
@@ -908,15 +935,20 @@ impl ApplyContext {
                 .db
                 .arena_idx64_payer(code, scope, table, primary)
                 .unwrap_or(self.receiver.as_u64());
+            let table_payer = self
+                .db
+                .arena_table_payer(code, scope, table)
+                .unwrap_or(payer);
             self.db
                 .remove_index64_object_standalone(code, scope, table, primary)?;
             inner.arena_index64_cache.remove(iterator);
-            payer
+            (payer, code, scope, table, table_payer)
         };
         self.update_db_usage(
             &Name::new(payer),
             -(billable_size_v::<Index64Object>() as i64),
         )?;
+        self.refund_table_if_emptied(code, scope, table, table_payer)?;
         Ok(())
     }
 
@@ -1169,7 +1201,7 @@ impl ApplyContext {
 
     pub fn db_idx128_remove(&mut self, iterator: i32) -> Result<(), ChainError> {
         // Refund the secondary row's stored payer, not self.receiver.
-        let payer = {
+        let (payer, code, scope, table, table_payer) = {
             let mut inner = self.inner.write()?;
             let (code, scope, table, primary) = inner
                 .arena_index128_cache
@@ -1183,15 +1215,20 @@ impl ApplyContext {
                 .db
                 .arena_idx128_payer(code, scope, table, primary)
                 .unwrap_or(self.receiver.as_u64());
+            let table_payer = self
+                .db
+                .arena_table_payer(code, scope, table)
+                .unwrap_or(payer);
             self.db
                 .remove_index128_object_standalone(code, scope, table, primary)?;
             inner.arena_index128_cache.remove(iterator);
-            payer
+            (payer, code, scope, table, table_payer)
         };
         self.update_db_usage(
             &Name::new(payer),
             -(billable_size_v::<Index128Object>() as i64),
         )?;
+        self.refund_table_if_emptied(code, scope, table, table_payer)?;
         Ok(())
     }
 
@@ -1438,7 +1475,7 @@ impl ApplyContext {
 
     pub fn db_idx256_remove(&mut self, iterator: i32) -> Result<(), ChainError> {
         // Refund the secondary row's stored payer, not self.receiver.
-        let payer = {
+        let (payer, code, scope, table, table_payer) = {
             let mut inner = self.inner.write()?;
             let (code, scope, table, primary) = inner
                 .arena_index256_cache
@@ -1452,15 +1489,20 @@ impl ApplyContext {
                 .db
                 .arena_idx256_payer(code, scope, table, primary)
                 .unwrap_or(self.receiver.as_u64());
+            let table_payer = self
+                .db
+                .arena_table_payer(code, scope, table)
+                .unwrap_or(payer);
             self.db
                 .remove_index256_object_standalone(code, scope, table, primary)?;
             inner.arena_index256_cache.remove(iterator);
-            payer
+            (payer, code, scope, table, table_payer)
         };
         self.update_db_usage(
             &Name::new(payer),
             -(billable_size_v::<Index256Object>() as i64),
         )?;
+        self.refund_table_if_emptied(code, scope, table, table_payer)?;
         Ok(())
     }
 
@@ -1710,7 +1752,7 @@ impl ApplyContext {
 
     pub fn db_idx_double_remove(&mut self, iterator: i32) -> Result<(), ChainError> {
         // Refund the secondary row's stored payer, not self.receiver.
-        let payer = {
+        let (payer, code, scope, table, table_payer) = {
             let mut inner = self.inner.write()?;
             let (code, scope, table, primary) = inner
                 .arena_index_double_cache
@@ -1724,15 +1766,20 @@ impl ApplyContext {
                 .db
                 .arena_idx_double_payer(code, scope, table, primary)
                 .unwrap_or(self.receiver.as_u64());
+            let table_payer = self
+                .db
+                .arena_table_payer(code, scope, table)
+                .unwrap_or(payer);
             self.db
                 .remove_idx_double_object_standalone(code, scope, table, primary)?;
             inner.arena_index_double_cache.remove(iterator);
-            payer
+            (payer, code, scope, table, table_payer)
         };
         self.update_db_usage(
             &Name::new(payer),
             -(billable_size_v::<IndexDoubleObject>() as i64),
         )?;
+        self.refund_table_if_emptied(code, scope, table, table_payer)?;
         Ok(())
     }
 
@@ -2013,7 +2060,7 @@ impl ApplyContext {
 
     pub fn db_idx_long_double_remove(&mut self, iterator: i32) -> Result<(), ChainError> {
         // Refund the secondary row's stored payer, not self.receiver.
-        let payer = {
+        let (payer, code, scope, table, table_payer) = {
             let mut inner = self.inner.write()?;
             let (code, scope, table, primary) = inner
                 .arena_index_long_double_cache
@@ -2027,15 +2074,20 @@ impl ApplyContext {
                 .db
                 .arena_idx_long_double_payer(code, scope, table, primary)
                 .unwrap_or(self.receiver.as_u64());
+            let table_payer = self
+                .db
+                .arena_table_payer(code, scope, table)
+                .unwrap_or(payer);
             self.db
                 .remove_idx_long_double_object_standalone(code, scope, table, primary)?;
             inner.arena_index_long_double_cache.remove(iterator);
-            payer
+            (payer, code, scope, table, table_payer)
         };
         self.update_db_usage(
             &Name::new(payer),
             -(billable_size_v::<IndexLongDoubleObject>() as i64),
         )?;
+        self.refund_table_if_emptied(code, scope, table, table_payer)?;
         Ok(())
     }
 

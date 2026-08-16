@@ -35,12 +35,13 @@ mod ram_tests {
     // every case. Action-data layout: payer(u64 LE) | id(u64 LE) | op(u8), with
     // op = 0 store row, 1 remove row, 2 store idx64, 3 remove idx64.
     //
-    // Every store measured against a baseline first plants a "keeper" row so the
-    // contract table already exists. The table_id_object overhead is billed only
-    // when a table is first created and (in this VM) is not refunded when its last
-    // row leaves, so measuring against a pre-existing table isolates exactly the
-    // per-row cost (value + key_value_object / index64_object overhead) that a
-    // store bills and a remove must refund — the quantity both bugs corrupted.
+    // The per-row payer tests measure against a baseline that first plants a
+    // "keeper" row, so the contract table already exists and the measured
+    // store/remove carries no one-time table_id_object overhead — isolating
+    // exactly the per-row cost (value + key_value_object / index64_object) that a
+    // store bills and a remove must refund. The table overhead itself (billed on
+    // table creation, refunded when the last row leaves) is covered separately by
+    // removing_last_row_refunds_table_overhead.
     static RAM_WAST: &str = r#"(module
  (import "env" "read_action_data" (func $read_action_data (param i32 i32) (result i32)))
  (import "env" "db_store_i64" (func $db_store_i64 (param i64 i64 i64 i64 i32 i32) (result i32)))
@@ -258,6 +259,39 @@ mod ram_tests {
             ram(&mut chain, c),
             base_recv,
             "idx remove must not credit the receiver's RAM"
+        );
+        Ok(())
+    }
+
+    /// Table overhead: creating a table bills the table_id_object overhead, and
+    /// removing the table's last row must refund it — what chainbase does in
+    /// remove_table. Store the only row into a fresh table, then remove it: RAM
+    /// returns fully to baseline, table overhead included. Before the fix the
+    /// table overhead was stranded, leaving `baseline + table_id_object overhead`.
+    #[tokio::test]
+    async fn removing_last_row_refunds_table_overhead() -> Result<()> {
+        let mut chain = Testing::new().await;
+        let c: Name = name!("ramtest").into();
+        chain.create_accounts(vec![c], false, true)?;
+        chain.set_code(c, wat2wasm(RAM_WAST)?.into())?;
+
+        let baseline = ram(&mut chain, c);
+
+        // Store the sole row (id 7): creates table 1111, billing the row plus the
+        // one-time table overhead.
+        push_op(&mut chain, c, c, 7, OP_STORE, &[c])?;
+        assert!(
+            ram(&mut chain, c) > baseline,
+            "store must bill the row and the new table's overhead"
+        );
+
+        // Remove it: this empties the table, so both the row and the table
+        // overhead come back.
+        push_op(&mut chain, c, c, 7, OP_REMOVE, &[c])?;
+        assert_eq!(
+            ram(&mut chain, c),
+            baseline,
+            "removing a table's last row must refund the table_id overhead too"
         );
         Ok(())
     }
