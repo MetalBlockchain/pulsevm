@@ -492,11 +492,20 @@ impl AuthorizationManager {
         scope: &Name,
         act_name: &Name,
     ) -> Result<Option<Name>, ChainError> {
-        let res = db.lookup_linked_permission(
+        let mut res = db.lookup_linked_permission(
             authorizer_account.as_u64(),
             scope.as_u64(),
             act_name.as_u64(),
         )?;
+
+        // A link registered for every action of `scope` uses the empty message
+        // type (message_type 0); linkauth with an empty type records it. When no
+        // link matches the specific action, fall back to that catch-all link, as
+        // EOSIO's lookup_linked_permission does — otherwise a "link to any action"
+        // never takes effect.
+        if res.is_none() {
+            res = db.lookup_linked_permission(authorizer_account.as_u64(), scope.as_u64(), 0)?;
+        }
 
         match res {
             Some(name_ptr) => Ok(Some(Name::new(name_ptr))),
