@@ -1,11 +1,8 @@
-mod bridge;
 mod database;
-mod iterator_cache;
 mod objects;
 mod pod;
 mod shadow;
 mod snapshot;
-mod types;
 
 pub use crate::pod::{
     CpuLimitResult,
@@ -15,93 +12,6 @@ pub use crate::pod::{
 };
 
 pub use crate::{
-    bridge::ffi::{
-        AccountMetadataObject,
-        AccountObject,
-        CodeObject,
-        CxxBlockTimestamp,
-        CxxChainConfig,
-        CxxDigest,
-        CxxGenesisState,
-        CxxMicroseconds,
-        CxxName,
-        CxxPrivateKey,
-        CxxPublicKey,
-        CxxSignature,
-        CxxTimePoint,
-        DatabaseOpenFlags,
-        GlobalPropertyObject,
-        I128,
-        Index64Object,
-        Index128Object,
-        Index256Object,
-        IndexDoubleObject,
-        IndexLongDoubleObject,
-        KeyValueObject,
-        PermissionLinkObject,
-        PermissionObject,
-        PermissionUsageObject,
-        TableId,
-        TableObject,
-        U128,
-        UndoSession,
-        addtf3,
-        cmptf2,
-        divtf3,
-        eqtf2,
-        extenddftf2,
-        extendsftf2,
-        fixdfti,
-        fixsfti,
-        fixtfdi,
-        fixtfsi,
-        fixtfti,
-        fixunsdfti,
-        fixunssfti,
-        fixunstfdi,
-        fixunstfsi,
-        fixunstfti,
-        floatditf,
-        floatsidf,
-        floatsitf,
-        floattidf,
-        floatunditf,
-        floatunsitf,
-        floatuntidf,
-        get_public_key_from_private_key,
-        getf2,
-        gttf2,
-        letf2,
-        lttf2,
-        make_k1_private_key,
-        make_shared_digest_from_data,
-        make_shared_digest_from_existing_hash,
-        make_shared_digest_from_string,
-        make_unknown_public_key,
-        multf3,
-        negtf2,
-        netf2,
-        packed_public_key_bytes,
-        packed_signature_bytes,
-        parse_private_key,
-        parse_public_key,
-        parse_public_key_from_bytes,
-        parse_signature,
-        parse_signature_from_bytes,
-        private_key_to_string,
-        public_key_to_string,
-        random_private_key,
-        random_private_key_r1,
-        recover_public_key_from_signature,
-        sign_digest_with_private_key,
-        signature_to_string,
-        string_to_name,
-        subtf3,
-        trunctfdf2,
-        trunctfsf2,
-        u64_to_name,
-        unordtf2,
-    },
     database::{
         Database,
         DbRead,
@@ -109,13 +19,16 @@ pub use crate::{
         PermissionInfo,
         restore_snapshot,
     },
-    iterator_cache::{
-        Index64IteratorCache,
-        Index128IteratorCache,
-        Index256IteratorCache,
-        IndexDoubleIteratorCache,
-        IndexLongDoubleIteratorCache,
-        KeyValueIteratorCache,
+    objects::{
+        Index64Object,
+        Index128Object,
+        Index256Object,
+        IndexDoubleObject,
+        IndexLongDoubleObject,
+        KeyValueObject,
+        PermissionObject,
+        SharedAuthority,
+        TableObject,
     },
     snapshot::{
         SNAPSHOT_VERSION,
@@ -124,8 +37,7 @@ pub use crate::{
     },
 };
 // The time value types moved to pulsevm_chain_types (no C++ dependency); re-export
-// them so existing `pulsevm_ffi::TimePoint`-style paths keep resolving during the
-// transition. database.rs converts these to the bridge structs at the C++ edge.
+// them so existing `pulsevm_ffi::TimePoint`-style paths keep resolving.
 pub use pulsevm_chain_types::{
     Authority,
     BlockTimestamp,

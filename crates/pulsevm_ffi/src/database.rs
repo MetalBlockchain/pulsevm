@@ -3340,9 +3340,10 @@ impl Database {
 
 #[cfg(test)]
 mod tests {
-    use tempfile::TempDir;
+    use std::str::FromStr;
 
-    use crate::string_to_name;
+    use pulsevm_name::Name;
+    use tempfile::TempDir;
 
     use super::*;
 
@@ -3351,7 +3352,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().to_str().unwrap();
         let mut db = Database::new(path, 1 * 1024 * 1024 * 1024).unwrap();
-        let name = string_to_name("test").unwrap();
+        let _name = Name::from_str("test").unwrap();
         db.add_indices();
     }
 
@@ -3361,7 +3362,7 @@ mod tests {
     const TEST_DB_SIZE: u64 = 64 * 1024 * 1024;
 
     fn name_u64(s: &str) -> u64 {
-        string_to_name(s).unwrap().to_uint64_t()
+        Name::from_str(s).unwrap().as_u64()
     }
 
     #[test]

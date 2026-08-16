@@ -74,7 +74,6 @@ use crate::{
     transaction::Action,
 };
 
-use cxx::UniquePtr;
 use pulsevm_constants::{
     BLOCK_CPU_USAGE_AVERAGE_WINDOW_MS,
     BLOCK_INTERVAL_MS,

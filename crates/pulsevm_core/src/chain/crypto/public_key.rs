@@ -11,13 +11,11 @@ use std::{
     str::FromStr,
 };
 
-use cxx::SharedPtr;
 use pulsevm_crypto::{
     FixedBytes,
     K1PublicKey,
 };
 use pulsevm_error::ChainError;
-use pulsevm_ffi::CxxPublicKey;
 use pulsevm_serialization::{
     NumBytes,
     Read,
@@ -32,10 +30,6 @@ use serde::{
 
 /// A secp256k1 (`K1`) public key. Pure Rust: parsing, packing, string encoding
 /// and equality all run through [`K1PublicKey`], not the C++ crypto.
-///
-/// The `Cxx*` conversions here are transitional — the only place a `CxxPublicKey`
-/// still crosses into this type is the authority path, whose `KeyWeight` still
-/// carries a C++ key until the authority struct is salvaged off chainbase.
 #[derive(Clone, Copy)]
 pub struct PublicKey {
     inner: K1PublicKey,
@@ -54,14 +48,6 @@ impl PublicKey {
     /// `KeyWeight`, which stores the `K1PublicKey` directly.
     pub fn into_k1(self) -> K1PublicKey {
         self.inner
-    }
-
-    /// Bridge a C++ key into this type via its packed bytes. Used where a key is
-    /// read out of a still-C++ `Authority`/`KeyWeight`.
-    pub fn from_cxx(key: &CxxPublicKey) -> Result<Self, ChainError> {
-        let k1 = K1PublicKey::from_packed(&key.packed_bytes())
-            .map_err(|e| ChainError::ParseError(format!("invalid public key bytes: {e}")))?;
-        Ok(PublicKey { inner: k1 })
     }
 }
 
@@ -143,15 +129,6 @@ impl Write for PublicKey {
     fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), WriteError> {
         let packed = FixedBytes::<34>(self.inner.to_packed());
         packed.write(bytes, pos)
-    }
-}
-
-impl From<PublicKey> for SharedPtr<CxxPublicKey> {
-    /// Transitional bridge back into C++ (used by test transaction builders that
-    /// still assemble a C++ `KeyWeight`). Round-trips through the packed bytes.
-    fn from(value: PublicKey) -> Self {
-        pulsevm_ffi::parse_public_key_from_bytes(&value.inner.to_packed())
-            .expect("a packed K1 key is always valid C++ input")
     }
 }
 

@@ -21,17 +21,11 @@ use pulsevm_ffi::{
     CxxDigest,
     Database,
     Float128,
-    Index64IteratorCache,
     Index64Object,
-    Index128IteratorCache,
     Index128Object,
-    Index256IteratorCache,
     Index256Object,
-    IndexDoubleIteratorCache,
     IndexDoubleObject,
-    IndexLongDoubleIteratorCache,
     IndexLongDoubleObject,
-    KeyValueIteratorCache,
     KeyValueObject,
     Microseconds,
     TableObject,
@@ -69,17 +63,10 @@ struct ApplyContextInner {
     inline_actions: Vec<u32>,                // List of inline actions
     context_free_inline_actions: Vec<u32>,   // List of context-free inline actions
     recurse_depth: u32,                      // The current recursion depth
-    keyval_cache: KeyValueIteratorCache,     // Cache for key-value iterators
-    index64_cache: Index64IteratorCache,     // Cache for index64 iterators
-    index128_cache: Index128IteratorCache,   // Cache for index128 iterators
-    index256_cache: Index256IteratorCache,   // Cache for index256 iterators
-    index_double_cache: IndexDoubleIteratorCache, // Cache for index double iterators
-    index_long_double_cache: IndexLongDoubleIteratorCache, // Cache for index long double iterators
-    // Arena twin of keyval_cache, driven in lockstep so the arena mints the same
-    // key-value iterator handles chainbase does.
+    // The arena mints the key-value iterator handles a contract sees.
     arena_keyval_cache: ArenaIteratorCache,
-    // Arena twin of index64_cache — chainbase keeps a separate iterator cache per
-    // secondary-index type, so the arena mirrors each independently.
+    // The arena keeps a separate iterator cache per secondary-index type, mirroring
+    // each independently.
     arena_index64_cache: ArenaIteratorCache,
     arena_index128_cache: ArenaIteratorCache,
     arena_index256_cache: ArenaIteratorCache,
@@ -138,12 +125,6 @@ impl ApplyContext {
                 inline_actions: Vec::new(),
                 context_free_inline_actions: Vec::new(),
                 recurse_depth: depth,
-                keyval_cache: KeyValueIteratorCache::new(),
-                index64_cache: Index64IteratorCache::new(),
-                index128_cache: Index128IteratorCache::new(),
-                index256_cache: Index256IteratorCache::new(),
-                index_double_cache: IndexDoubleIteratorCache::new(),
-                index_long_double_cache: IndexLongDoubleIteratorCache::new(),
                 arena_keyval_cache: ArenaIteratorCache::default(),
                 arena_index64_cache: ArenaIteratorCache::default(),
                 arena_index128_cache: ArenaIteratorCache::default(),

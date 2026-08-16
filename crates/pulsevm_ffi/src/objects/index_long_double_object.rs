@@ -1,10 +1,10 @@
 use pulsevm_billable_size::BillableSize;
 use pulsevm_constants::OVERHEAD_PER_ROW_PER_INDEX_RAM_BYTES;
 
-use crate::{
-    KeyValueObject,
-    bridge::ffi::IndexLongDoubleObject,
-};
+use crate::KeyValueObject;
+
+/// Zero-sized billing marker for a `long double` secondary index row.
+pub struct IndexLongDoubleObject;
 
 impl BillableSize for IndexLongDoubleObject {
     const OVERHEAD: u64 = 3 * OVERHEAD_PER_ROW_PER_INDEX_RAM_BYTES as u64;
