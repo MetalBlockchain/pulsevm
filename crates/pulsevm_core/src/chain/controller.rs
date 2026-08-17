@@ -708,6 +708,15 @@ impl Controller {
         let block_id = block.id()?;
         self.verified_blocks.insert(block_id, block.clone());
 
+        // A schedule change is part of the block's own state: rewrite the
+        // pulse.prods producer permissions inside the block session, so the
+        // change is tracked by the block's undo state (unwinding with the block
+        // on a fork) and reaches the block's state-history deltas at accept.
+        // `execute_block` applies the same write at the same point.
+        if let Some(ref producers) = proposed_schedule {
+            self.update_producers_authority(producers, block.timestamp())?;
+        }
+
         // Match the end-of-block bookkeeping that `execute_block` applies at
         // verify/accept, so the retained state is identical to what a re-execution
         // would commit, then retain the block on the pending chain (it was built
@@ -1031,12 +1040,12 @@ impl Controller {
         // what a restart reconstructs — never an out-of-band value. A block that
         // is rejected or loses a fork is never accepted, so it never changes the
         // producers. `verify_block` has already bound the header to execution.
+        // Only the signer set flips here: the pulse.prods permission rewrite
+        // already rode inside the block's session (build_block/execute_block),
+        // so it was committed — and packed into the block's deltas — above.
         if let Some(schedule) = block.signed_block_header.header.new_schedule()? {
             info!("activated producer schedule version {}", schedule.version);
             self.active_schedule = schedule;
-
-            // Update the producer authority in the database to reflect the new schedule.
-            self.update_producers_authority(block.timestamp())?;
         }
 
         // Accept boundary: commit the arena mirror in lockstep and surface its
@@ -1271,6 +1280,14 @@ impl Controller {
 
         let transaction_mroot = self.calculate_trx_merkle(&transaction_receipts)?;
         let action_mroot = self.calculate_action_merkle(&mut action_receipt_digests)?;
+
+        // Mirror build_block: a schedule change rewrites the pulse.prods
+        // producer permissions inside the block's session, so verification
+        // commits the same state the producer built and the change reaches the
+        // block's state-history deltas at accept.
+        if let Some(ref producers) = proposed_schedule {
+            self.update_producers_authority(producers, block.timestamp())?;
+        }
 
         self.finalize_block_resources(block.block_num())?;
 
@@ -1904,11 +1921,16 @@ impl Controller {
         Ok(1000) // TODO: Implement greylist limit
     }
 
+    // Rewrite the pulse.prods producer permissions to require the given
+    // producer set. Runs inside the block's undo session (from `build_block` /
+    // `execute_block`, not at accept), so the writes are tracked with the block
+    // — they unwind with it on a fork and land in the block's state-history
+    // deltas, which are packed from the session's undo state at accept.
     fn update_producers_authority(
         &mut self,
+        producers: &[ProducerKey],
         pending_block_time: &BlockTimestamp,
     ) -> Result<(), ChainError> {
-        let producers = &self.active_schedule.producers;
         let num_producers = producers.len() as u32;
 
         let update_permission = |db: &mut Database,
@@ -7184,9 +7206,9 @@ mod tests {
             })
             .collect();
 
-        controller.activate_producer_schedule(producers)?;
+        controller.activate_producer_schedule(producers.clone())?;
         let timestamp = *controller.last_accepted_block.timestamp();
-        controller.update_producers_authority(&timestamp)?;
+        controller.update_producers_authority(&producers, &timestamp)?;
 
         // With 5 producers the thresholds are all distinct: more than 2/3 → 4,
         // more than 1/2 → 3, more than 1/3 → 2.
@@ -7301,13 +7323,15 @@ mod tests {
         assert_eq!(header_schedule.version, 1);
         assert_eq!(header_schedule.producers, proposed);
 
-        // Nothing has activated yet: the schedule and every pulse.prods
-        // permission still read exactly as they did before the proposal ran.
+        // The signer set has not flipped yet — activation is an accept-time
+        // effect — but the permission rewrite is part of the block's own state,
+        // so the live database (which includes the pending block's session)
+        // already shows it. It unwinds with the block if the chain forks.
         assert_eq!(controller.active_schedule.version, 0);
-        assert_eq!(
+        assert_ne!(
             read_authority(&controller, ACTIVE_NAME)?,
             genesis_authorities[0],
-            "pulse.prods@active must not change before the block is accepted"
+            "the pulse.prods rewrite must ride inside the block's session"
         );
 
         controller.accept_block(&block.id()?, &mut mempool)?;
@@ -7486,6 +7510,27 @@ mod tests {
                 threshold
             );
         }
+        drop(db);
+
+        // The rewrite must be visible to state history: the accepted block's
+        // packed deltas (what SHIP serves) must carry the updated pulse.prods
+        // rows. A rewrite applied after pack_deltas/commit would leave every
+        // SHIP consumer permanently showing the genesis authority.
+        let deltas = controller
+            .chain_state_log
+            .as_ref()
+            .expect("chain state log initialized")
+            .read_block(block.block_num())
+            .expect("deltas stored for the schedule block");
+        let contains = |needle: &[u8]| deltas.windows(needle.len()).any(|w| w == needle);
+        assert!(
+            contains(&PRODS_NAME.as_u64().to_le_bytes()),
+            "the schedule block's deltas must include the pulse.prods permission rows"
+        );
+        assert!(
+            contains(&electees[2].as_u64().to_le_bytes()),
+            "the rewritten authority (listing the elected producers) must be in the deltas"
+        );
 
         Ok(())
     }
