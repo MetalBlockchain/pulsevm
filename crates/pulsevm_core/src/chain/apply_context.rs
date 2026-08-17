@@ -17,7 +17,6 @@ use pulsevm_crypto::Bytes;
 use pulsevm_database::{
     BlockTimestamp,
     ChainConfigV0,
-    CxxDigest,
     Database,
     Float128,
     Index64Object,
@@ -203,10 +202,8 @@ impl ApplyContext {
             Controller::find_apply_handler(&self.receiver, action.account(), action.name());
         if let Some(native) = native {
             native(self, &mut self.db.clone(), &action)?;
-            // The native handler runs unmetered Rust, so re-check the deadline now
-            // that it's done. Only needed when one actually ran — with no native
-            // handler, execute_action's entry check a few microseconds ago already
-            // covers this action.
+            // Native handlers are outside deterministic Wasm metering, so give
+            // the subjective watchdog a cooperative boundary after they return.
             self.trx_context.checktime()?;
         }
 
@@ -369,7 +366,7 @@ impl ApplyContext {
 
             for auth in a.authorization() {
                 pulse_assert(
-                self.db.is_account(auth.actor)?,
+                    self.db.is_account(auth.actor)?,
                     ChainError::TransactionError(format!(
                         "inline action's authorizing actor {} does not exist",
                         auth.actor
@@ -417,7 +414,7 @@ impl ApplyContext {
 
     pub fn execute_context_free_inline(&mut self, a: &Action) -> Result<(), ChainError> {
         pulse_assert(
-                self.db.is_account(a.account().as_u64())?,
+            self.db.is_account(a.account().as_u64())?,
             ChainError::TransactionError(format!(
                 "inline action's code account {} does not exist",
                 a.account()
@@ -2328,9 +2325,6 @@ impl ApplyContext {
         Ok(())
     }
 
-    /// Record the value a contract set via `set_action_return_value` on this
-    /// action's trace. This is informational (history/RPC) only — the action
-    /// receipt digest is unchanged — so surfacing it does not affect consensus.
     pub fn set_trace_return_value(&self, value: Vec<u8>) -> Result<(), ChainError> {
         self.trx_context
             .modify_action_trace(self.action_ordinal, |trace| {
@@ -2338,8 +2332,8 @@ impl ApplyContext {
             })
     }
 
-    pub fn next_recv_sequence(&mut self, account_name: u64) -> Result<u64, ChainError> {
-        self.db.next_recv_sequence(account_name)
+    pub fn next_recv_sequence(&mut self, receiver: u64) -> Result<u64, ChainError> {
+        self.db.next_recv_sequence(receiver)
     }
 
     pub fn next_auth_sequence(&mut self, actor: u64) -> Result<u64, ChainError> {

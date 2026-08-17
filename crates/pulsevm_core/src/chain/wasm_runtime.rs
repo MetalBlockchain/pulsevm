@@ -224,10 +224,8 @@ use super::webassembly::{
     send_inline,
 };
 
-/// Sentinel raised by the `eosio_exit`/`pulse_exit` intrinsic. It reaches `run`
-/// as a wasm trap, but unlike a real trap it ends the current action
-/// *successfully* — the reference chain terminates the action and keeps the
-/// state it produced. `run` detects it and returns Ok.
+/// Sentinel raised by eosio_exit/pulse_exit. Wasmer transports it as a trap,
+/// but Antelope semantics treat it as successful termination of this action.
 #[derive(Debug)]
 pub struct WasmExit {
     pub code: i32,
@@ -803,24 +801,16 @@ impl WasmRuntime {
         // Resume timer
         apply_context.resume_billing_timer()?;
 
-        // Compilation ran inside the paused window above and can be a slow native
-        // window on a cache miss; the deadline measures raw wall-clock, so re-check
-        // it now — before the guest runs — to abandon a transaction that already
-        // blew its budget compiling rather than sink more time into execution.
+        // Compilation happens while billing is paused, but the subjective
+        // watchdog deliberately includes that native wall-clock window.
         apply_context.checktime()?;
 
-        // Keep the raw RuntimeError so an eosio_exit/pulse_exit trap (WasmExit) can
-        // be told apart from a real failure before it's flattened into a ChainError
-        // (the WasmExit-aware match below does that flattening).
         let result = apply_func.call(
             &mut warm.store,
             receiver.as_u64() as i64,
             action.account().as_u64() as i64,
             action.name().as_u64() as i64,
         );
-        // A value the contract set via set_action_return_value lives on the env;
-        // capture it before the warm store returns to the pool so it can be
-        // surfaced on the action trace (informational; not part of the digest).
         let return_value = warm.env.as_ref(&warm.store).return_value.clone();
         let remaining_points: MeteringPoints = get_remaining_points(&mut warm.store, &instance);
 
@@ -836,9 +826,6 @@ impl WasmRuntime {
         match remaining_points {
             MeteringPoints::Remaining(points) => {
                 if let Err(e) = result {
-                    // eosio_exit/pulse_exit ends the action successfully; every
-                    // other trap is a real failure. Restore a ChainError raised by
-                    // a host fn, otherwise wrap the trap message.
                     if e.downcast_ref::<WasmExit>().is_none() {
                         if let Some(chain_err) = e.downcast_ref::<ChainError>() {
                             return Err(chain_err.clone());
@@ -847,8 +834,8 @@ impl WasmRuntime {
                     }
                 }
 
-                if let Some(rv) = return_value {
-                    apply_context.set_trace_return_value(rv.0)?;
+                if let Some(value) = return_value {
+                    apply_context.set_trace_return_value(value.0)?;
                 }
 
                 Ok(cpu_limit.saturating_sub(points) as u64)

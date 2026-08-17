@@ -111,9 +111,6 @@ pub fn set_proposed_producers(
         )?;
     }
 
-    // EOSIO returns the proposed schedule's version, or -1 when the proposal is a
-    // no-op — identical to what is already active (this build has no separate
-    // pending schedule to also compare against). A no-op records nothing.
     let context = env_data.apply_context();
     if producers == context.active_producers()? {
         return Ok(-1);
@@ -214,6 +211,7 @@ pub fn is_privileged(
     let context = env_data.apply_context_mut();
     privileged_check(context)?;
     let db = env_data.db();
+
     Ok(db.is_account_privileged(account)? as i32)
 }
 

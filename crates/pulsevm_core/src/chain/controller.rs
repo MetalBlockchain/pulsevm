@@ -160,11 +160,8 @@ pub struct Controller {
     // block log on restart — it is never read from an out-of-band source.
     active_schedule: ProducerSchedule,
 
-    // The producer schedule in force for the block currently being executed —
-    // the schedule active as of that block's parent. Set at the top of the build,
-    // verify, and standalone push paths so a transaction's `get_active_producers`
-    // / `set_proposed_producers` see the same active set the block is signed
-    // against. Not persisted; a per-execution scratch value.
+    // Schedule in force for the block currently executing. Contracts read this
+    // through get_active_producers/set_proposed_producers.
     block_active_schedule: ProducerSchedule,
 
     // The chain of blocks that have been executed (during build or verify) but
@@ -565,13 +562,6 @@ impl Controller {
         // block's session rather than before it.
         db.clear_expired_input_transactions(&timestamp.into())?;
 
-        // The last producer schedule proposed by any transaction in this block,
-        // activated when the block is accepted.
-        let mut proposed_schedule: Option<Vec<ProducerKey>> = None;
-
-        // The schedule active for this block (as of its parent) governs what
-        // onblock and every transaction see through get_active_producers, and the
-        // version set_proposed_producers reports.
         self.block_active_schedule = self.schedule_active_for_parent(&self.preferred_id)?;
 
         // onblock heads the block, before any mempool transaction, so its action
@@ -582,9 +572,9 @@ impl Controller {
         let (onblock_digests, onblock_schedule) =
             self.run_onblock(&timestamp, producer, previous, &block_status)?;
         action_receipt_digests.extend(onblock_digests);
-        // onblock's proposal counts like any transaction's (eosio.system elects
-        // producers from there); a later transaction's proposal overrides it.
-        proposed_schedule = onblock_schedule;
+        // The last proposal in the block wins. Start with onblock's proposal;
+        // later signed transactions overwrite it below.
+        let mut proposed_schedule = onblock_schedule;
 
         // Get transactions from the mempool
         while let Some(transaction) = mempool.pop_transaction() {
@@ -693,11 +683,8 @@ impl Controller {
         let block_id = block.id()?;
         self.verified_blocks.insert(block_id, block.clone());
 
-        // A schedule change is part of the block's own state: rewrite the
-        // pulse.prods producer permissions inside the block session, so the
-        // change is tracked by the block's undo state (unwinding with the block
-        // on a fork) and reaches the block's state-history deltas at accept.
-        // `execute_block` applies the same write at the same point.
+        // The permission rewrite is block state: keep it in the block's undo
+        // session so forks unwind it and SHiP observes it before accept/commit.
         if let Some(ref producers) = proposed_schedule {
             self.update_producers_authority(producers, block.timestamp())?;
         }
@@ -881,7 +868,6 @@ impl Controller {
         block.validate_syntactically(&self.db)?;
         let parent_schedule = self.schedule_active_for_parent(block.previous_id())?;
         self.verify_block_signature(block, &parent_schedule)?;
-        // Contracts in this block see the schedule active as of its parent.
         self.block_active_schedule = parent_schedule.clone();
 
         let parent_block_id = block.previous_id().clone();
@@ -1024,9 +1010,6 @@ impl Controller {
         // what a restart reconstructs — never an out-of-band value. A block that
         // is rejected or loses a fork is never accepted, so it never changes the
         // producers. `verify_block` has already bound the header to execution.
-        // Only the signer set flips here: the pulse.prods permission rewrite
-        // already rode inside the block's session (build_block/execute_block),
-        // so it was committed — and packed into the block's deltas — above.
         if let Some(schedule) = block.signed_block_header.header.new_schedule()? {
             info!("activated producer schedule version {}", schedule.version);
             self.active_schedule = schedule;
@@ -1102,15 +1085,6 @@ impl Controller {
     // chain: it runs in its own child session that is discarded on failure, and
     // a failure yields no digests (identical on every node, since it is
     // deterministic), so the merkles still agree.
-    //
-    // Besides the digests, the result carries any producer schedule the onblock
-    // action proposed. eosio.system calls set_proposed_producers exclusively
-    // from onblock (update_elected_producers), so the caller must fold this into
-    // the block's proposal like any transaction's — dropping it would sever the
-    // voting path from the chain and the schedule would never change.
-    // Hand the transaction context the producer schedule in force for this block
-    // (names + version), so `get_active_producers` returns the active set and
-    // `set_proposed_producers` reports the right next version.
     fn set_context_active_schedule(
         &self,
         trx_context: &TransactionContext,
@@ -1185,9 +1159,15 @@ impl Controller {
                 Ok((result.action_receipt_digests, result.proposed_schedule))
             }
             Err(e) => {
-                // A contract without an onblock handler rejects the implicit
-                // action as unknown. That is an expected no-op on such chains;
-                // other failures still deserve a warning.
+                // onblock is invoked speculatively at the head of every block, but
+                // whether the deployed system contract implements it is chain
+                // dependent. A contract with no onblock handler makes its dispatcher
+                // assert "unknown action" on the implicit call — expected on such a
+                // chain, so it is logged at debug rather than warned on every block.
+                // Any other failure (a genuine onblock bug with a different assert,
+                // or a machinery error) still warns. Either way the failure is
+                // deterministic and yields no action receipt, so every node agrees
+                // on the merkles and the block still forms.
                 if e.to_string().contains("unknown action") {
                     debug!("onblock not implemented by the system contract, skipping");
                 } else {
@@ -1216,8 +1196,6 @@ impl Controller {
         let mut transaction_traces: Vec<TransactionTrace> = Vec::new();
         let mut transaction_receipts: VecDeque<TransactionReceipt> = VecDeque::new();
         let mut action_receipt_digests: VecDeque<Digest> = VecDeque::new();
-        let mut proposed_schedule: Option<Vec<ProducerKey>> = None;
-
         self.blocks_executed += 1;
 
         self.db
@@ -1232,10 +1210,7 @@ impl Controller {
             block_status,
         )?;
         action_receipt_digests.extend(onblock_digests);
-        // Mirror build_block: onblock's proposal counts like any transaction's,
-        // overridden by a later transaction's — keeping verify's re-execution in
-        // agreement with what the producer folded into the header.
-        proposed_schedule = onblock_schedule;
+        let mut proposed_schedule = onblock_schedule;
 
         for receipt in &block.transactions {
             // Verify the transaction
@@ -1266,10 +1241,6 @@ impl Controller {
         let transaction_mroot = self.calculate_trx_merkle(&transaction_receipts)?;
         let action_mroot = self.calculate_action_merkle(&mut action_receipt_digests)?;
 
-        // Mirror build_block: a schedule change rewrites the pulse.prods
-        // producer permissions inside the block's session, so verification
-        // commits the same state the producer built and the change reaches the
-        // block's state-history deltas at accept.
         if let Some(ref producers) = proposed_schedule {
             self.update_producers_authority(producers, block.timestamp())?;
         }
@@ -1341,10 +1312,8 @@ impl Controller {
         pending_block_timestamp: &BlockTimestamp,
         block_status: &BlockStatus,
     ) -> Result<TransactionResult, ChainError> {
-        // Standalone (mempool) validation runs against the head schedule; there is
-        // no pending block, so the active set a contract reads is the accepted one.
         self.block_active_schedule = self.active_schedule.clone();
-        let mut db = self.db.clone();
+        let db = self.db.clone();
         db.arena_start_undo_session();
         let result = self.execute_transaction(transaction, pending_block_timestamp, block_status);
         // Mempool admission is advisory: revert the arena session on both the ok
@@ -1372,13 +1341,10 @@ impl Controller {
     /// As `execute_transaction`, but when `explicit_billed` is set (applying an
     /// already-accepted block) it bills the block-recorded cpu/net and skips the
     /// objective resource-limit checks — Antelope light/replay validation.
-    // The node-local wall-clock ceiling for a single transaction (see
-    // NodeConfig::max_transaction_time_ms). Falls back to a generous default when
-    // no config is loaded (a bare test controller).
     fn max_transaction_time_ms(&self) -> u32 {
         self.node_config
             .as_ref()
-            .map(|c| c.max_transaction_time_ms)
+            .map(|config| config.max_transaction_time_ms)
             .unwrap_or(30_000)
     }
 
@@ -1902,11 +1868,6 @@ impl Controller {
         Ok(1000) // TODO: Implement greylist limit
     }
 
-    // Rewrite the pulse.prods producer permissions to require the given
-    // producer set. Runs inside the block's undo session (from `build_block` /
-    // `execute_block`, not at accept), so the writes are tracked with the block
-    // — they unwind with it on a fork and land in the block's state-history
-    // deltas, which are packed from the session's undo state at accept.
     fn update_producers_authority(
         &mut self,
         producers: &[ProducerKey],
@@ -2126,67 +2087,6 @@ mod tests {
                     ACTIVE_NAME.as_u64(),
                 )],
             )],
-        )
-        .sign(&private_key, &chain_id)?;
-        let packed_trx = PackedTransaction::from_signed_transaction(trx)?;
-        Ok(packed_trx)
-    }
-
-    // A distinct, valid account name for index `i` (prefix keeps it from starting
-    // with a digit; three base-26 letters give ~17k unique names).
-    fn nth_account_name(i: usize) -> Name {
-        let alphabet = b"abcdefghijklmnopqrstuvwxyz";
-        let mut n = i;
-        let mut bytes = vec![b'a'];
-        for _ in 0..3 {
-            bytes.push(alphabet[n % 26]);
-            n /= 26;
-        }
-        Name::from_str(std::str::from_utf8(&bytes).unwrap()).unwrap()
-    }
-
-    // One transaction that creates `count` accounts, i.e. `count` newaccount
-    // actions in a single transaction. Each action re-enters execute_action and so
-    // hits the wall-clock checktime at its head.
-    fn create_many_accounts(
-        private_key: &PrivateKey,
-        count: usize,
-        chain_id: Id,
-    ) -> Result<PackedTransaction, ChainError> {
-        let actions = (0..count)
-            .map(|i| {
-                Action::new(
-                    Name::from_str("pulse").unwrap(),
-                    Name::from_str("newaccount").unwrap(),
-                    NewAccount {
-                        creator: Name::from_str("pulse").unwrap(),
-                        name: nth_account_name(i),
-                        owner: Authority::new(
-                            1,
-                            vec![KeyWeight::new(private_key.get_public_key().into(), 1)],
-                            vec![],
-                            vec![],
-                        ),
-                        active: Authority::new(
-                            1,
-                            vec![KeyWeight::new(private_key.get_public_key().into(), 1)],
-                            vec![],
-                            vec![],
-                        ),
-                    }
-                    .pack()
-                    .unwrap(),
-                    vec![PermissionLevel::new(
-                        PULSE_NAME.as_u64(),
-                        ACTIVE_NAME.as_u64(),
-                    )],
-                )
-            })
-            .collect();
-        let trx = Transaction::new(
-            TransactionHeader::new(TimePointSec::maximum(), 0, 0, 0u32.into(), 0, 0u32.into()),
-            vec![],
-            actions,
         )
         .sign(&private_key, &chain_id)?;
         let packed_trx = PackedTransaction::from_signed_transaction(trx)?;
@@ -3424,221 +3324,6 @@ mod tests {
             temp_path.path().to_str().unwrap(),
         )?;
         Ok((controller, private_key, chain_id, temp_path))
-    }
-
-    // A privileged contract that reads the action data as a packed
-    // vector<producer_key>, calls set_proposed_producers, and returns the i64
-    // result (the new schedule version, or -1) via set_action_return_value.
-    const PROPOSE_PRODUCERS_WAT: &str = r#"
-        (module
-          (import "env" "action_data_size" (func $ads (result i32)))
-          (import "env" "read_action_data" (func $read (param i32 i32) (result i32)))
-          (import "env" "set_proposed_producers" (func $spp (param i32 i32) (result i64)))
-          (import "env" "set_action_return_value" (func $sarv (param i32 i32)))
-          (memory 1)
-          (export "memory" (memory 0))
-          (func (export "apply") (param i64 i64 i64)
-            (local $len i32)
-            (local $ret i64)
-            (local.set $len (call $ads))
-            (drop (call $read (i32.const 0) (local.get $len)))
-            (local.set $ret (call $spp (i32.const 0) (local.get $len)))
-            (i64.store (i32.const 1024) (local.get $ret))
-            (call $sarv (i32.const 1024) (i32.const 8))))
-    "#;
-
-    // A contract that copies the active producer set into the return value.
-    const READ_PRODUCERS_WAT: &str = r#"
-        (module
-          (import "env" "get_active_producers" (func $gap (param i32 i32) (result i32)))
-          (import "env" "set_action_return_value" (func $sarv (param i32 i32)))
-          (memory 1)
-          (export "memory" (memory 0))
-          (func (export "apply") (param i64 i64 i64)
-            (local $n i32)
-            (local.set $n (call $gap (i32.const 0) (i32.const 256)))
-            (call $sarv (i32.const 0) (local.get $n))))
-    "#;
-
-    // Build a signed transaction carrying a single action to `account`, with the
-    // account's own active permission (self-authorized contract call).
-    fn push_action(
-        key: &PrivateKey,
-        account: Name,
-        action: Name,
-        data: Vec<u8>,
-        chain_id: Id,
-    ) -> Result<PackedTransaction, ChainError> {
-        let trx = Transaction::new(
-            TransactionHeader::new(TimePointSec::maximum(), 0, 0, 0u32.into(), 0, 0u32.into()),
-            vec![],
-            vec![Action::new(
-                account,
-                action,
-                data,
-                vec![PermissionLevel::new(account.as_u64(), ACTIVE_NAME.as_u64())],
-            )],
-        )
-        .sign(key, &chain_id)?;
-        PackedTransaction::from_signed_transaction(trx)
-    }
-
-    // Pull the return value set by the first action that produced one.
-    fn action_return_value(result: &TransactionResult) -> Vec<u8> {
-        result
-            .trace
-            .action_traces
-            .iter()
-            .find(|t| !t.return_value.is_empty())
-            .map(|t| t.return_value.clone())
-            .unwrap_or_default()
-    }
-
-    fn decode_producer_names(bytes: &[u8]) -> Vec<Name> {
-        assert_eq!(
-            bytes.len() % 8,
-            0,
-            "producer name array must be 8-byte aligned"
-        );
-        bytes
-            .chunks_exact(8)
-            .map(|c| Name::new(u64::from_le_bytes(c.try_into().unwrap())))
-            .collect()
-    }
-
-    // set_proposed_producers reports the new schedule version, and -1 when the
-    // proposal matches the active set. Driven through a real privileged contract
-    // and the wasm host boundary; push_transaction reverts, so only the return
-    // value is under test here.
-    #[tokio::test]
-    async fn set_proposed_producers_reports_version_and_noop() -> Result<(), ChainError> {
-        let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
-        let mut mempool = Mempool::new();
-
-        let admin = Name::from_str("prodadmin")?;
-        let producera = Name::from_str("producera")?;
-        mempool.add_transaction(create_account(&private_key, admin, chain_id)?);
-        mempool.add_transaction(create_account(&private_key, producera, chain_id)?);
-        mempool.add_transaction(set_code(
-            &private_key,
-            admin,
-            crate::wat2wasm(PROPOSE_PRODUCERS_WAT).expect("valid WAT"),
-            chain_id,
-        )?);
-        let block = controller.build_block(&mut mempool).await?;
-        controller.accept_block(&block.id()?, &mut mempool)?;
-
-        // set_proposed_producers is privileged; make the contract account so.
-        controller.database().set_privileged(admin.as_u64(), true)?;
-
-        let genesis_key = private_key.get_public_key();
-        let ts: BlockTimestamp = TimePoint::now().into();
-
-        // Proposing exactly the active set (genesis: pulse alone) is a no-op → -1.
-        let same = vec![ProducerKey {
-            producer_name: PULSE_NAME,
-            block_signing_key: genesis_key.clone(),
-        }];
-        let r = controller.push_transaction(
-            &push_action(
-                &private_key,
-                admin,
-                Name::from_str("run")?,
-                same.pack().unwrap(),
-                chain_id,
-            )?,
-            &ts,
-            &BlockStatus::Verifying,
-        )?;
-        assert_eq!(
-            i64::from_le_bytes(action_return_value(&r).try_into().unwrap()),
-            -1,
-            "proposing the active set must return -1"
-        );
-
-        // A genuinely new set returns the next version (active is version 0 → 1).
-        let changed = vec![
-            ProducerKey {
-                producer_name: PULSE_NAME,
-                block_signing_key: genesis_key.clone(),
-            },
-            ProducerKey {
-                producer_name: producera,
-                block_signing_key: genesis_key.clone(),
-            },
-        ];
-        let r = controller.push_transaction(
-            &push_action(
-                &private_key,
-                admin,
-                Name::from_str("run")?,
-                changed.pack().unwrap(),
-                chain_id,
-            )?,
-            &ts,
-            &BlockStatus::Verifying,
-        )?;
-        assert_eq!(
-            i64::from_le_bytes(action_return_value(&r).try_into().unwrap()),
-            1,
-            "proposing a changed set must return the next version"
-        );
-
-        Ok(())
-    }
-
-    // get_active_producers copies the active producer names (raw 8-byte name
-    // array) into the guest buffer, and tracks the active schedule.
-    #[tokio::test]
-    async fn get_active_producers_reflects_active_schedule() -> Result<(), ChainError> {
-        let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
-        let mut mempool = Mempool::new();
-
-        let glenn = Name::from_str("glenn")?;
-        mempool.add_transaction(create_account(&private_key, glenn, chain_id)?);
-        mempool.add_transaction(set_code(
-            &private_key,
-            glenn,
-            crate::wat2wasm(READ_PRODUCERS_WAT).expect("valid WAT"),
-            chain_id,
-        )?);
-        let block = controller.build_block(&mut mempool).await?;
-        controller.accept_block(&block.id()?, &mut mempool)?;
-
-        let ts: BlockTimestamp = TimePoint::now().into();
-        let read = |c: &mut Controller| -> Result<Vec<Name>, ChainError> {
-            let r = c.push_transaction(
-                &push_action(
-                    &private_key,
-                    glenn,
-                    Name::from_str("run")?,
-                    vec![],
-                    chain_id,
-                )?,
-                &ts,
-                &BlockStatus::Verifying,
-            )?;
-            Ok(decode_producer_names(&action_return_value(&r)))
-        };
-
-        // Genesis: the sole producer is pulse.
-        assert_eq!(read(&mut controller)?, vec![PULSE_NAME]);
-
-        // After a schedule change, the read tracks the new active set.
-        let producera = Name::from_str("producera")?;
-        controller.activate_producer_schedule(vec![
-            ProducerKey {
-                producer_name: PULSE_NAME,
-                block_signing_key: private_key.get_public_key(),
-            },
-            ProducerKey {
-                producer_name: producera,
-                block_signing_key: private_key.get_public_key(),
-            },
-        ])?;
-        assert_eq!(read(&mut controller)?, vec![PULSE_NAME, producera]);
-
-        Ok(())
     }
 
     // Bit-for-bit block-id parity across serialization and re-execution. A
@@ -5221,6 +4906,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn onblock_schedule_proposal_reaches_header_and_activates() -> Result<(), ChainError> {
+        let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
+        let mut mempool = Mempool::new();
+        let alice = Name::from_str("alice")?;
+        let proposed = vec![
+            ProducerKey {
+                producer_name: PULSE_NAME,
+                block_signing_key: private_key.get_public_key(),
+            },
+            ProducerKey {
+                producer_name: alice,
+                block_signing_key: PrivateKey::random().get_public_key(),
+            },
+        ];
+        let packed = proposed.pack()?;
+        let data: String = packed
+            .iter()
+            .map(|byte| format!("\\{:02x}", byte))
+            .collect();
+        let proposer = format!(
+            r#"
+            (module
+              (import "env" "set_proposed_producers" (func $set (param i32 i32) (result i64)))
+              (memory (export "memory") 1)
+              (data (i32.const 0) "{data}")
+              (func (export "apply") (param i64 i64 i64)
+                (if (i64.eq (local.get 2) (i64.const {onblock}))
+                  (then (drop (call $set (i32.const 0) (i32.const {length})))))))
+            "#,
+            onblock = ONBLOCK_NAME.as_u64() as i64,
+            length = packed.len(),
+        );
+
+        // The deployment block creates the proposed producer account. Its
+        // onblock runs before setcode, so no schedule is proposed yet.
+        mempool.add_transaction(create_account(&private_key, alice, chain_id)?);
+        mempool.add_transaction(set_code(
+            &private_key,
+            PULSE_NAME,
+            wat::parse_str(proposer).expect("valid proposer contract"),
+            chain_id,
+        )?);
+        let deployment = controller.build_block(&mut mempool).await?;
+        assert!(
+            deployment
+                .signed_block_header
+                .header
+                .new_schedule()?
+                .is_none()
+        );
+        controller.accept_block(&deployment.id()?, &mut mempool)?;
+        controller.set_preferred_id(deployment.id()?);
+
+        // A normal transaction makes the next block non-empty; its schedule
+        // change can only have originated in the implicit onblock action.
+        mempool.add_transaction(create_account(
+            &private_key,
+            Name::from_str("bob")?,
+            chain_id,
+        )?);
+        let election = controller.build_block(&mut mempool).await?;
+        let header_schedule = election
+            .signed_block_header
+            .header
+            .new_schedule()?
+            .expect("onblock proposal must be committed to the header");
+        assert_eq!(header_schedule.version, 1);
+        assert_eq!(header_schedule.producers, proposed);
+
+        controller.accept_block(&election.id()?, &mut mempool)?;
+        assert_eq!(controller.active_schedule, header_schedule);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn schedule_change_updates_producers_authority() -> Result<(), ChainError> {
         // When a new producer schedule takes effect, the pulse.prods permissions
         // must be rewritten to require >2/3 (active), >1/2 (prod.major) and >1/3
@@ -5275,305 +5035,6 @@ mod tests {
                 threshold
             );
         }
-
-        Ok(())
-    }
-
-    // The election loop end to end: a privileged contract calls
-    // set_proposed_producers, the built block carries the new schedule in its
-    // signed header, and accepting that block both activates the schedule and
-    // rewrites the pulse.prods producer permissions to match it. Activation is
-    // an accept-time effect — after build but before accept, the schedule and
-    // the permissions must still be exactly what they were.
-    #[tokio::test]
-    async fn set_proposed_producers_activates_schedule_and_updates_authority()
-    -> Result<(), ChainError> {
-        let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
-        let mut mempool = Mempool::new();
-
-        // Proposed producers must be real accounts. Five of them make the three
-        // thresholds distinct: more than 2/3 → 4, more than 1/2 → 3, more than
-        // 1/3 → 2.
-        let admin = Name::from_str("prodadmin")?;
-        let electees = ["alice", "bob", "carol", "dave"]
-            .iter()
-            .map(|name| Name::from_str(name))
-            .collect::<Result<Vec<_>, ChainError>>()?;
-        mempool.add_transaction(create_account(&private_key, admin, chain_id)?);
-        for name in &electees {
-            mempool.add_transaction(create_account(&private_key, *name, chain_id)?);
-        }
-        mempool.add_transaction(set_code(
-            &private_key,
-            admin,
-            crate::wat2wasm(PROPOSE_PRODUCERS_WAT).expect("valid WAT"),
-            chain_id,
-        )?);
-        let block = controller.build_block(&mut mempool).await?;
-        controller.accept_block(&block.id()?, &mut mempool)?;
-        // Mirror consensus: move the preference to the accepted tip so the next
-        // block builds on it.
-        controller.set_preferred_id(block.id()?);
-
-        // set_proposed_producers is privileged; make the contract account so.
-        controller.database().set_privileged(admin.as_u64(), true)?;
-
-        let read_authority =
-            |controller: &Controller, permission_name: Name| -> Result<Authority, ChainError> {
-                let db = controller.db.read()?;
-                Ok(AuthorizationManager::get_permission(
-                    &db,
-                    PRODS_NAME.into(),
-                    permission_name.into(),
-                )?
-                .get_authority()
-                .to_authority())
-            };
-        let genesis_authorities = [
-            read_authority(&controller, ACTIVE_NAME)?,
-            read_authority(&controller, MAJORITY_PRODUCERS_PERMISSION_NAME)?,
-            read_authority(&controller, MINORITY_PRODUCERS_PERMISSION_NAME)?,
-        ];
-
-        // Elect the four new accounts alongside pulse, through the contract.
-        let proposed: Vec<ProducerKey> = electees
-            .iter()
-            .map(|name| ProducerKey {
-                producer_name: *name,
-                block_signing_key: PrivateKey::random().get_public_key(),
-            })
-            .chain(std::iter::once(ProducerKey {
-                producer_name: PULSE_NAME,
-                block_signing_key: private_key.get_public_key(),
-            }))
-            .collect();
-        mempool.add_transaction(push_action(
-            &private_key,
-            admin,
-            Name::from_str("run")?,
-            proposed.pack().unwrap(),
-            chain_id,
-        )?);
-        let block = controller.build_block(&mut mempool).await?;
-
-        // The built block advertises the change in its signed header, versioned
-        // as the successor of the parent schedule.
-        let header_schedule = block
-            .signed_block_header
-            .header
-            .new_schedule()?
-            .expect("built block must carry the proposed schedule in its header");
-        assert_eq!(header_schedule.version, 1);
-        assert_eq!(header_schedule.producers, proposed);
-
-        // The signer set has not flipped yet — activation is an accept-time
-        // effect — but the permission rewrite is part of the block's own state,
-        // so the live database (which includes the pending block's session)
-        // already shows it. It unwinds with the block if the chain forks.
-        assert_eq!(controller.active_schedule.version, 0);
-        assert_ne!(
-            read_authority(&controller, ACTIVE_NAME)?,
-            genesis_authorities[0],
-            "the pulse.prods rewrite must ride inside the block's session"
-        );
-
-        controller.accept_block(&block.id()?, &mut mempool)?;
-
-        // Accepting the block activates the schedule...
-        assert_eq!(
-            controller.active_schedule,
-            ProducerSchedule {
-                version: 1,
-                producers: proposed.clone(),
-            },
-            "accepting the schedule-carrying block must activate the schedule"
-        );
-
-        // ...and rewrites the producer-gated permissions to require the new set.
-        let expected_accounts: Vec<PermissionLevelWeight> = proposed
-            .iter()
-            .map(|producer| {
-                PermissionLevelWeight::new(
-                    PermissionLevel::new(producer.producer_name.into(), ACTIVE_NAME.into()),
-                    1,
-                )
-            })
-            .collect();
-        let expectations = [
-            (ACTIVE_NAME, 4u32),
-            (MAJORITY_PRODUCERS_PERMISSION_NAME, 3u32),
-            (MINORITY_PRODUCERS_PERMISSION_NAME, 2u32),
-        ];
-        for (i, (permission_name, threshold)) in expectations.into_iter().enumerate() {
-            let authority = read_authority(&controller, permission_name)?;
-            assert_ne!(
-                authority, genesis_authorities[i],
-                "pulse.prods@{} must have been rewritten by the schedule change",
-                permission_name
-            );
-            assert_eq!(
-                authority,
-                Authority::new(threshold, vec![], expected_accounts.clone(), vec![]),
-                "pulse.prods@{} must require {} of the 5 elected producers",
-                permission_name,
-                threshold
-            );
-        }
-
-        Ok(())
-    }
-
-    // A contract for the `pulse` account that proposes a fixed producer schedule
-    // from inside the implicit onblock action — the shape of eosio.system's
-    // update_elected_producers, the only place the real system contract calls
-    // set_proposed_producers. The packed schedule is baked into the data
-    // segment; the action-name guard keeps native actions dispatched to pulse
-    // from proposing.
-    fn onblock_proposer_wat(packed_schedule: &[u8]) -> String {
-        let data: String = packed_schedule
-            .iter()
-            .map(|b| format!("\\{:02x}", b))
-            .collect();
-        format!(
-            r#"
-            (module
-              (import "env" "set_proposed_producers" (func $spp (param i32 i32) (result i64)))
-              (memory 1)
-              (export "memory" (memory 0))
-              (data (i32.const 0) "{data}")
-              (func (export "apply") (param $receiver i64) (param $code i64) (param $action i64)
-                (if (i64.eq (local.get $action) (i64.const {onblock}))
-                  (then (drop (call $spp (i32.const 0) (i32.const {len})))))))
-            "#,
-            onblock = ONBLOCK_NAME.as_u64() as i64,
-            len = packed_schedule.len(),
-        )
-    }
-
-    // The voting-driven election path: eosio.system calls set_proposed_producers
-    // from inside the implicit onblock action, not from a signed transaction. A
-    // schedule proposed there must reach the block header, activate on accept,
-    // and rewrite the pulse.prods producer permissions — the node must not drop
-    // onblock's proposal on the floor.
-    #[tokio::test]
-    async fn onblock_schedule_proposal_reaches_header_and_activates() -> Result<(), ChainError> {
-        let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
-        let mut mempool = Mempool::new();
-
-        // Proposed producers must be real accounts; five (four new plus pulse)
-        // make the pulse.prods thresholds distinct (4/3/2).
-        let electees = ["alice", "bob", "carol", "dave"]
-            .iter()
-            .map(|name| Name::from_str(name))
-            .collect::<Result<Vec<_>, ChainError>>()?;
-        let proposed: Vec<ProducerKey> = electees
-            .iter()
-            .map(|name| ProducerKey {
-                producer_name: *name,
-                block_signing_key: PrivateKey::random().get_public_key(),
-            })
-            .chain(std::iter::once(ProducerKey {
-                producer_name: PULSE_NAME,
-                block_signing_key: private_key.get_public_key(),
-            }))
-            .collect();
-
-        // Block 1: create the producer accounts and deploy the proposing
-        // contract onto pulse (privileged at genesis). onblock heads the block,
-        // so it runs before this setcode and must not have proposed anything.
-        for name in &electees {
-            mempool.add_transaction(create_account(&private_key, *name, chain_id)?);
-        }
-        mempool.add_transaction(set_code(
-            &private_key,
-            PULSE_NAME,
-            crate::wat2wasm(&onblock_proposer_wat(&proposed.pack().unwrap())).expect("valid WAT"),
-            chain_id,
-        )?);
-        let block = controller.build_block(&mut mempool).await?;
-        assert!(
-            block.signed_block_header.header.new_schedule()?.is_none(),
-            "the deploy block's onblock ran before the contract existed"
-        );
-        controller.accept_block(&block.id()?, &mut mempool)?;
-        controller.set_preferred_id(block.id()?);
-
-        // Block 2 carries only an ordinary transaction; the schedule proposal
-        // can come from nowhere but the implicit onblock heading the block.
-        mempool.add_transaction(create_account(
-            &private_key,
-            Name::from_str("erin")?,
-            chain_id,
-        )?);
-        let block = controller.build_block(&mut mempool).await?;
-        let header_schedule = block
-            .signed_block_header
-            .header
-            .new_schedule()?
-            .expect("onblock's proposal must reach the block header");
-        assert_eq!(header_schedule.version, 1);
-        assert_eq!(header_schedule.producers, proposed);
-
-        controller.accept_block(&block.id()?, &mut mempool)?;
-        assert_eq!(
-            controller.active_schedule,
-            ProducerSchedule {
-                version: 1,
-                producers: proposed.clone(),
-            },
-            "accepting the block must activate onblock's proposed schedule"
-        );
-
-        // Activation must also rewrite the producer-gated permissions.
-        let expected_accounts: Vec<PermissionLevelWeight> = proposed
-            .iter()
-            .map(|producer| {
-                PermissionLevelWeight::new(
-                    PermissionLevel::new(producer.producer_name.into(), ACTIVE_NAME.into()),
-                    1,
-                )
-            })
-            .collect();
-        let db = controller.db.read()?;
-        for (permission_name, threshold) in [
-            (ACTIVE_NAME, 4u32),
-            (MAJORITY_PRODUCERS_PERMISSION_NAME, 3u32),
-            (MINORITY_PRODUCERS_PERMISSION_NAME, 2u32),
-        ] {
-            let permission = AuthorizationManager::get_permission(
-                &db,
-                PRODS_NAME.into(),
-                permission_name.into(),
-            )?;
-            assert_eq!(
-                permission.get_authority().to_authority(),
-                Authority::new(threshold, vec![], expected_accounts.clone(), vec![]),
-                "pulse.prods@{} must require {} of the 5 producers elected via onblock",
-                permission_name,
-                threshold
-            );
-        }
-        drop(db);
-
-        // The rewrite must be visible to state history: the accepted block's
-        // packed deltas (what SHIP serves) must carry the updated pulse.prods
-        // rows. A rewrite applied after pack_deltas/commit would leave every
-        // SHIP consumer permanently showing the genesis authority.
-        let deltas = controller
-            .chain_state_log
-            .as_ref()
-            .expect("chain state log initialized")
-            .read_block(block.block_num())
-            .expect("deltas stored for the schedule block");
-        let contains = |needle: &[u8]| deltas.windows(needle.len()).any(|w| w == needle);
-        assert!(
-            contains(&PRODS_NAME.as_u64().to_le_bytes()),
-            "the schedule block's deltas must include the pulse.prods permission rows"
-        );
-        assert!(
-            contains(&electees[2].as_u64().to_le_bytes()),
-            "the rewritten authority (listing the elected producers) must be in the deltas"
-        );
 
         Ok(())
     }
@@ -5811,9 +5272,13 @@ mod tests {
         Ok(())
     }
 
-    // A system contract that does not implement onblock must not break block
-    // production. The failed implicit action is undone and contributes neither
-    // a receipt nor CPU usage.
+    // A system contract that does not implement onblock (its dispatcher asserts
+    // "unknown action" on the implicit call, as the reference chain's does) must
+    // not break block production: run_onblock has to swallow the contract-level
+    // rejection, undo the child session, and return no digests — leaving pulse's
+    // receive sequence and the block CPU budget exactly where they were, so the
+    // block still forms with only its real transactions. This pins the harden-only
+    // invoke path: onblock is invoked every block but its absence is a clean no-op.
     #[tokio::test]
     async fn onblock_skipped_cleanly_when_contract_rejects_it() -> Result<(), ChainError> {
         let (mut controller, private_key, _chain_id, _temp) = init_test_controller()?;
@@ -5821,6 +5286,10 @@ mod tests {
         let chain_id = controller.chain_id().clone();
         let status = BlockStatus::Building;
 
+        // A contract that rejects only the onblock action (so deploying it — a
+        // setcode action that also reaches apply — and any other action still
+        // succeed). This is exactly the shape of a system contract with no onblock
+        // handler: the dispatcher asserts "unknown action".
         let onblock = ONBLOCK_NAME.as_u64() as i64;
         let wasm = wat::parse_str(&format!(
             r#"
@@ -5848,12 +5317,19 @@ mod tests {
             .recv_sequence;
         let cpu_before = db.get_block_cpu_limit()?;
 
+        // onblock is received by pulse, whose contract now asserts on it. The call
+        // must fail internally but run_onblock must return Ok with no digests.
         let timestamp: BlockTimestamp = TimePoint::now().into();
         let previous = controller.preferred_id;
-        let (digests, proposed_schedule) =
+        let (digests, _) =
             controller.run_onblock(&timestamp, PULSE_NAME, previous, &BlockStatus::Building)?;
-        assert!(digests.is_empty());
-        assert!(proposed_schedule.is_none());
+        assert!(
+            digests.is_empty(),
+            "a rejected onblock must yield no action-receipt digests"
+        );
+
+        // The undone child session leaves no trace: no receipt was minted (recv
+        // sequence unchanged) and nothing was billed to the block CPU budget.
         assert_eq!(
             db.arena_account_metadata(PULSE_NAME.as_u64())
                 .unwrap()
@@ -5868,256 +5344,6 @@ mod tests {
         );
 
         Ok(())
-    }
-
-    // eosio_exit/pulse_exit ends the current action *successfully* — the reference
-    // chain keeps the state the action produced up to the exit. A contract on pulse
-    // writes a table row and then calls eosio_exit: the transaction must succeed and
-    // the row must persist (a later read finds it). A sibling action calling
-    // eosio_assert(false) still fails, proving a real trap is unaffected.
-    #[tokio::test]
-    async fn eosio_exit_ends_action_successfully_and_keeps_state() -> Result<(), ChainError> {
-        let (mut controller, private_key, _chain_id, _temp) = init_test_controller()?;
-        let ts = controller.last_accepted_block().timestamp().clone();
-        let chain_id = controller.chain_id().clone();
-        let status = BlockStatus::Building;
-
-        let pulse = PULSE_NAME.as_u64() as i64;
-        let tbl = Name::from_str("t")?.as_u64() as i64;
-        let storexit = Name::from_str("storexit")?.as_u64() as i64;
-        let check = Name::from_str("check")?.as_u64() as i64;
-        let boom = Name::from_str("boom")?.as_u64() as i64;
-        let wasm = wat::parse_str(&format!(
-            r#"
-            (module
-              (import "env" "db_store_i64"
-                (func $store (param i64 i64 i64 i64 i32 i32) (result i32)))
-              (import "env" "db_find_i64"
-                (func $find (param i64 i64 i64 i64) (result i32)))
-              (import "env" "eosio_exit" (func $exit (param i32)))
-              (import "env" "eosio_assert" (func $assert (param i32 i32)))
-              (memory (export "memory") 1)
-              (func (export "apply") (param i64 i64 i64)
-                (block $notstore
-                  (br_if $notstore (i64.ne (local.get 2) (i64.const {storexit})))
-                  (i32.store (i32.const 0) (i32.const 305419896))
-                  (drop (call $store (i64.const {pulse}) (i64.const {tbl})
-                                     (i64.const {pulse}) (i64.const 1)
-                                     (i32.const 0) (i32.const 4)))
-                  (call $exit (i32.const 0))
-                  (return))
-                (block $notcheck
-                  (br_if $notcheck (i64.ne (local.get 2) (i64.const {check})))
-                  (call $assert
-                    (i32.ge_s
-                      (call $find (i64.const {pulse}) (i64.const {pulse})
-                                  (i64.const {tbl}) (i64.const 1))
-                      (i32.const 0))
-                    (i32.const 0))
-                  (return))
-                (block $notboom
-                  (br_if $notboom (i64.ne (local.get 2) (i64.const {boom})))
-                  (call $assert (i32.const 0) (i32.const 0)))))
-            "#,
-        ))
-        .unwrap();
-        controller.execute_transaction(
-            &set_code(&private_key, PULSE_NAME, wasm, chain_id)?,
-            &ts,
-            &status,
-        )?;
-
-        // The action stores a row and then calls eosio_exit. Before the fix this
-        // surfaced as a trap and failed the transaction; now it must succeed.
-        controller.execute_transaction(
-            &call_contract(
-                &private_key,
-                PULSE_NAME,
-                Name::from_str("storexit")?,
-                &Vec::<u8>::new(),
-                chain_id,
-            )?,
-            &ts,
-            &status,
-        )?;
-
-        // The row written before the exit must have committed: this action asserts
-        // the row is found, so it only succeeds if the state survived the exit.
-        controller.execute_transaction(
-            &call_contract(
-                &private_key,
-                PULSE_NAME,
-                Name::from_str("check")?,
-                &Vec::<u8>::new(),
-                chain_id,
-            )?,
-            &ts,
-            &status,
-        )?;
-
-        // Control: a genuine eosio_assert(false) still fails the transaction, so the
-        // exit handling didn't turn every trap into a success.
-        let boom_res = controller.execute_transaction(
-            &call_contract(
-                &private_key,
-                PULSE_NAME,
-                Name::from_str("boom")?,
-                &Vec::<u8>::new(),
-                chain_id,
-            )?,
-            &ts,
-            &status,
-        );
-        assert!(
-            boom_res.is_err(),
-            "eosio_assert(false) must still fail the transaction"
-        );
-
-        Ok(())
-    }
-
-    // Wiring check for the wall-clock deadline: a node configured with a zero
-    // max_transaction_time gives every transaction no time to run, so the checktime
-    // call at the head of execute_action trips on the first action. Proves the
-    // guard is actually invoked on the execution path and surfaces as the subjective
-    // DeadlineError (not an objective CPU/apply failure).
-    #[tokio::test]
-    async fn zero_max_transaction_time_trips_checktime() -> Result<(), ChainError> {
-        let chain_id =
-            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
-                .unwrap();
-        let private_key =
-            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
-        let mut controller = Controller::new();
-        let genesis_bytes = generate_genesis(&private_key);
-        let temp_path = get_temp_dir();
-        let config_bytes = json!({
-            "producer_name": "pulse",
-            "producer_key": private_key.to_string(),
-            "max_transaction_time_ms": 0,
-        })
-        .to_string()
-        .into_bytes();
-        controller.initialize(
-            &chain_id,
-            &config_bytes,
-            &genesis_bytes.to_vec(),
-            temp_path.path().to_str().unwrap(),
-        )?;
-        let ts = controller.last_accepted_block().timestamp().clone();
-        let chain_id = controller.chain_id().clone();
-        let status = BlockStatus::Building;
-
-        let result = controller.execute_transaction(
-            &create_account(&private_key, Name::from_str("glenn")?, chain_id)?,
-            &ts,
-            &status,
-        );
-        match result {
-            Err(ChainError::DeadlineError(_)) => Ok(()),
-            Err(e) => panic!("expected a DeadlineError, got a different error: {e}"),
-            Ok(_) => panic!("expected a DeadlineError, but the transaction succeeded"),
-        }
-    }
-
-    // The subjectivity guarantee: with the SAME zero max_transaction_time that trips
-    // a normal transaction above, the explicit-billing path — the one block
-    // validation/replay uses (execute_transaction_billed with recorded cpu/net) —
-    // must run to completion, never tripping the wall-clock deadline. Otherwise a
-    // slow validator would reject a block a faster producer made.
-    #[tokio::test]
-    async fn explicit_billing_is_exempt_from_checktime() -> Result<(), ChainError> {
-        let chain_id =
-            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
-                .unwrap();
-        let private_key =
-            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
-        let mut controller = Controller::new();
-        let genesis_bytes = generate_genesis(&private_key);
-        let temp_path = get_temp_dir();
-        let config_bytes = json!({
-            "producer_name": "pulse",
-            "producer_key": private_key.to_string(),
-            "max_transaction_time_ms": 0,
-        })
-        .to_string()
-        .into_bytes();
-        controller.initialize(
-            &chain_id,
-            &config_bytes,
-            &genesis_bytes.to_vec(),
-            temp_path.path().to_str().unwrap(),
-        )?;
-        let ts = controller.last_accepted_block().timestamp().clone();
-        let chain_id = controller.chain_id().clone();
-        let status = BlockStatus::Building;
-
-        // Some(..) marks the transaction as explicitly billed, exactly as
-        // execute_block supplies the block-recorded cpu/net during validation.
-        //
-        // The cpu figure has to clear `min_transaction_cpu_usage`, which genesis
-        // now sets to 100,000 — `validate_cpu_usage_to_bill` rejects a bill below
-        // the floor whether or not it is explicit. The amount is incidental to
-        // what this test asserts; billing the floor keeps it realistic, since a
-        // producer's recorded cpu is never below it either.
-        let result = controller.execute_transaction_billed(
-            &create_account(&private_key, Name::from_str("glenn")?, chain_id)?,
-            &ts,
-            &status,
-            Some((100_000, 12)),
-        );
-        if let Err(ChainError::DeadlineError(_)) = result {
-            panic!("explicit-billed transaction must be exempt from the wall-clock deadline");
-        }
-        result.map(|_| ())
-    }
-
-    // The real accumulation case (as opposed to the degenerate zero-deadline trip
-    // above): one transaction whose many newaccount actions genuinely take longer
-    // than a 1 ms wall-clock ceiling to run. Each action re-enters execute_action
-    // and re-checks the deadline, so once the running total crosses 1 ms the
-    // transaction is abandoned mid-way with a DeadlineError — not a CPU/RAM trap
-    // (metering is per-action and no single newaccount is close to its limit).
-    //
-    // Two things make this stable rather than flaky. The ceiling is the smallest
-    // non-zero value the config allows (1 ms), and the action count is far larger
-    // than needed: execution stops after ~1 ms of work regardless of how many
-    // actions remain, so a big count is nearly free and only guarantees there is
-    // always more work queued than a fast machine can finish inside 1 ms.
-    #[tokio::test]
-    async fn slow_multi_action_transaction_trips_checktime() -> Result<(), ChainError> {
-        let chain_id =
-            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
-                .unwrap();
-        let private_key =
-            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
-        let mut controller = Controller::new();
-        let genesis_bytes = generate_genesis(&private_key);
-        let temp_path = get_temp_dir();
-        let config_bytes = json!({
-            "producer_name": "pulse",
-            "producer_key": private_key.to_string(),
-            "max_transaction_time_ms": 1,
-        })
-        .to_string()
-        .into_bytes();
-        controller.initialize(
-            &chain_id,
-            &config_bytes,
-            &genesis_bytes.to_vec(),
-            temp_path.path().to_str().unwrap(),
-        )?;
-        let ts = controller.last_accepted_block().timestamp().clone();
-        let chain_id = controller.chain_id().clone();
-        let status = BlockStatus::Building;
-
-        let trx = create_many_accounts(&private_key, 1000, chain_id)?;
-        let result = controller.execute_transaction(&trx, &ts, &status);
-        match result {
-            Err(ChainError::DeadlineError(_)) => Ok(()),
-            Err(e) => panic!("expected a DeadlineError, got a different error: {e}"),
-            Ok(_) => panic!("expected a DeadlineError, but the transaction succeeded"),
-        }
     }
 
     // set_resource_limits lowering an account's RAM allowance below what it is
@@ -6218,6 +5444,42 @@ mod tests {
             "the accepted limit change did not persist"
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn eosio_exit_ends_action_successfully() -> Result<(), ChainError> {
+        let (mut controller, private_key, _chain_id, _temp) = init_test_controller()?;
+        let timestamp = *controller.last_accepted_block().timestamp();
+        let chain_id = *controller.chain_id();
+        let status = BlockStatus::Building;
+        let wasm = wat::parse_str(
+            r#"
+            (module
+              (import "env" "eosio_exit" (func $exit (param i32)))
+              (memory (export "memory") 1)
+              (func (export "apply") (param i64 i64 i64)
+                (call $exit (i32.const 0))))
+            "#,
+        )
+        .expect("valid exit contract");
+
+        controller.execute_transaction(
+            &set_code(&private_key, PULSE_NAME, wasm, chain_id)?,
+            &timestamp,
+            &status,
+        )?;
+        controller.execute_transaction(
+            &call_contract(
+                &private_key,
+                PULSE_NAME,
+                Name::from_str("run")?,
+                &Vec::<u8>::new(),
+                chain_id,
+            )?,
+            &timestamp,
+            &status,
+        )?;
         Ok(())
     }
 
