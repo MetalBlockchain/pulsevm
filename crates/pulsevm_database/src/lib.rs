@@ -1,7 +1,7 @@
+mod backend;
 mod database;
 mod objects;
 mod pod;
-mod shadow;
 mod snapshot;
 
 pub use crate::pod::{
@@ -35,8 +35,7 @@ pub use crate::{
         peek_header as peek_snapshot_header,
     },
 };
-// The time value types moved to pulsevm_chain_types (no C++ dependency); re-export
-// them so existing `pulsevm_ffi::TimePoint`-style paths keep resolving.
+// Re-export shared chain value types for the database facade's public API.
 pub use pulsevm_chain_types::{
     Authority,
     BlockTimestamp,

@@ -34,7 +34,7 @@ mod producer;
 pub use producer::*;
 
 mod system;
-use pulsevm_ffi::{
+use pulsevm_database::{
     Float128,
     U256,
 };

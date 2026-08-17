@@ -2,7 +2,7 @@
 //! patterns are implementation-defined (NaN payloads, integer saturation,
 //! round-to-nearest-even integer conversions, exact int->float packing).
 //!
-//! Sources (all under crates/pulsevm_ffi/pulsevm/libraries):
+//! Sources (all under crates/pulsevm_database/pulsevm/libraries):
 //!   * softfloat/source/{f128_to_i32,f128_to_i64,f128_to_ui32,f128_to_ui64}.c
 //!   * softfloat/source/{s_roundToI32,s_roundToI64,s_roundToUI32,s_roundToUI64}.c
 //!   * softfloat/source/{i32_to_f128,i64_to_f128,ui32_to_f128,ui64_to_f128,i32_to_f64}.c

@@ -14,8 +14,7 @@ use std::{
 use chrono::Utc;
 use pulsevm_billable_size::billable_size_v;
 use pulsevm_crypto::Bytes;
-use pulsevm_error::ChainError;
-use pulsevm_ffi::{
+use pulsevm_database::{
     BlockTimestamp,
     ChainConfigV0,
     CxxDigest,
@@ -31,6 +30,7 @@ use pulsevm_ffi::{
     TableObject,
     U256,
 };
+use pulsevm_error::ChainError;
 use pulsevm_serialization::Write;
 
 use crate::{
@@ -211,10 +211,7 @@ impl ApplyContext {
         }
 
         // Does the receiver account have a contract deployed? Read the deployed
-        // code hash from the arena rather than a chainbase metadata object: under
-        // standalone writes setcode's update lands in the arena only, so the
-        // chainbase object's hash is stale, and the run needs no chainbase
-        // reference held across it. An all-zero hash means no contract.
+        // code hash from the Rust database. An all-zero hash means no contract.
         let (code_hash, _vm_type, _vm_version) =
             self.db.account_code_hash_vm(self.receiver.as_u64())?;
         if code_hash != [0u8; 32] {

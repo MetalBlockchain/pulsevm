@@ -3,26 +3,21 @@
 //! resource limits, contract tables, …) as an [`pulsevm_arena::ArenaObject`] and
 //! implements the create/modify/remove and read/positioning surface over them.
 //!
-//! It is consumed by `pulsevm_ffi` (re-exported there as `crate::shadow`) under
-//! the `arena-shadow` feature, where — while the cutover is in progress — it runs
-//! as a mirror alongside chainbase: every ported mutation is replayed here so a
-//! per-block state root can be pulled off the arena and compared as tables come
-//! online one at a time. Once the cutover completes it becomes the sole backend.
-//! Being a standalone crate, it also builds and is unit-tested without the C++
-//! toolchain.
+//! It is the sole state backend used by the compatibility database facade. The
+//! original chainbase implementation and native bridge have been removed.
 //!
-//! The mirror lives in the `Database` wrapper (not in the controller) so that
+//! The database handle lives in the `Database` wrapper (not in the controller) so that
 //! every `Database` clone — and there is one per apply/transaction context —
 //! shares the same arena through an `Arc`, and writes reach it with no change at
 //! the call sites. The arena is single-threaded (`Db: !Sync`); the `Mutex`
-//! serialises the mirror calls, which loses no concurrency because chainbase
-//! access is already serialised by its own lock. Never hold the guard across an
-//! `.await`.
+//! serialises access. Never hold the guard across an `.await`.
 
 use std::sync::{
     Arc,
     Mutex,
 };
+
+mod history;
 
 use pulsevm_arena::{
     ArenaObject,
@@ -48,7 +43,7 @@ use zerocopy::{
 /// the account state root commits to these bytes, so they must match exactly.
 pub const GENESIS_PULSE_ABI: &[u8] = include_bytes!("genesis_pulse_abi.bin");
 
-/// Arena mirror of chainbase `account_metadata_object` — the first table ported.
+/// Rust representation of chainbase `account_metadata_object` — the first table ported.
 /// The trailing padding keeps the row free of implicit padding bytes so it
 /// round-trips through the arena's zero-copy layout.
 #[repr(C)]
@@ -73,7 +68,7 @@ struct AccountMetaRow {
     _pad: [u8; 2],
 }
 
-/// Arena mirror of chainbase `account_object`. `abi` is a `shared_blob`, so it
+/// Rust representation of chainbase `account_object`. `abi` is a `shared_blob`, so it
 /// lives in the table's blob arena and the row keeps only a `BlobRef`.
 #[repr(C)]
 #[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout, ArenaObject)]
@@ -93,7 +88,7 @@ const RATE_LIMITING_PRECISION: u64 = 1_000_000;
 
 /// `num` divided by `den`, rounded up — chainbase's `integer_divide_ceil`.
 fn integer_divide_ceil(num: u128, den: u128) -> u128 {
-    (num / den) + if num % den > 0 { 1 } else { 0 }
+    (num / den) + u128::from(!num.is_multiple_of(den))
 }
 
 /// Parses a 20-byte canonical usage accumulator (value_ex u64 LE, consumed u64
@@ -110,9 +105,9 @@ fn read_acc(b: &[u8]) -> UsageAccumulator {
 /// Port of chainbase `exponential_moving_average_accumulator` (the
 /// `usage_accumulator` used for net/cpu). The field order differs from the C++
 /// struct to keep the row free of implicit padding for the zero-copy layout, but
-/// the arithmetic in `add` matches bit for bit, so a mirrored accumulator tracks
+/// the arithmetic in `add` matches bit for bit, so a stored accumulator tracks
 /// chainbase exactly given the same units/ordinal/window inputs. The C++ range
-/// asserts are omitted: chainbase enforces them before the mirror runs, so any
+/// asserts are omitted: chainbase enforces them before the database runs, so any
 /// input reaching here already passed them.
 #[repr(C)]
 #[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout, PartialEq)]
@@ -152,7 +147,7 @@ impl UsageAccumulator {
     }
 }
 
-/// Arena mirror of chainbase `resource_limits::resource_usage_object`. `ram_usage`
+/// Rust representation of chainbase `resource_limits::resource_usage_object`. `ram_usage`
 /// accumulates every delta handed to `add_pending_ram_usage` — the same
 /// externally-computed deltas chainbase applies, so no billing logic is
 /// duplicated. `net_usage`/`cpu_usage` are the windowed-average accumulators,
@@ -170,11 +165,11 @@ struct ResourceUsageRow {
     cpu_usage: UsageAccumulator,
 }
 
-/// Arena mirror of chainbase `resource_limits::resource_limits_object`. Chainbase
+/// Rust representation of chainbase `resource_limits::resource_limits_object`. Chainbase
 /// keeps two rows per account keyed by `(pending, owner)`: the committed limits
 /// (`pending = false`) and, while a change is staged, a pending copy. -1 means
 /// unlimited. The global total-weight bookkeeping that `process_account_limit_
-/// updates` also touches lives in a separate object not mirrored here yet.
+/// updates` also touches lives in a separate object not stored here yet.
 #[repr(C)]
 #[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout)]
 struct ResourceLimitsRow {
@@ -208,7 +203,7 @@ impl ArenaObject for ResourceLimitsRow {
 }
 
 /// Chainbase `elastic_limit_parameters` for one resource, as plain values pulled
-/// from config so the mirror can run `update_elastic_limit` itself.
+/// from config so the database can run `update_elastic_limit` itself.
 #[derive(Clone, Copy)]
 pub struct ElasticParams {
     pub target: u64,
@@ -220,7 +215,7 @@ pub struct ElasticParams {
 }
 
 /// Canonical serialization of a `resource_limits_config` (elastic cpu/net params
-/// plus averaging windows), little endian. Shared by the arena mirror and the
+/// plus averaging windows), little endian. Shared by the arena database and the
 /// chainbase side of the cross-impl root so both serialise identically.
 pub fn serialize_resource_config(
     cpu: &ElasticParams,
@@ -275,7 +270,7 @@ fn update_elastic_limit(current: u64, average: u64, p: &ElasticParams) -> u64 {
 
 /// `(num / den) + (num % den > 0)`, the exact chainbase `integer_divide_ceil`.
 fn integer_divide_ceil_u128(num: u128, den: u128) -> u128 {
-    (num / den) + if num % den > 0 { 1 } else { 0 }
+    (num / den) + u128::from(!num.is_multiple_of(den))
 }
 
 /// Full per-account resource window returned by nodeos' `get_account`.
@@ -291,6 +286,7 @@ pub struct AccountResourceLimit {
 /// Elastic per-account resource-limit math shared by NET and CPU. All arithmetic
 /// uses `u128` to match the C++ intermediates; `current_slot` applies the same
 /// zero-usage decay projection used by nodeos' `get_account`.
+#[allow(clippy::too_many_arguments)]
 fn elastic_account_limit_info(
     weight: i64,
     total_weight: u64,
@@ -322,7 +318,7 @@ fn elastic_account_limit_info(
     let mut greylisted = false;
     let mut capacity_in_window = window_size;
     if greylist_limit < MAX_ELASTIC_MULTIPLIER {
-        // chainbase multiplies the max by greylist in u64 (may wrap); mirror it.
+        // chainbase multiplies the max by greylist in u64 (may wrap); match it.
         let greylisted_virtual = param_max.wrapping_mul(greylist_limit as u64);
         if greylisted_virtual < virtual_limit {
             capacity_in_window *= greylisted_virtual as u128;
@@ -367,11 +363,11 @@ fn elastic_account_limit_info(
     )
 }
 
-/// Arena mirror of chainbase `resource_limits::resource_limits_state_object` — a
+/// Rust representation of chainbase `resource_limits::resource_limits_state_object` — a
 /// singleton. `average_block_{net,cpu}_usage` are windowed accumulators; the
 /// virtual limits are the elastic rate-limit ceilings recomputed each block by
 /// `process_block_usage`. The total_* weights are only moved by
-/// `process_account_limit_updates` (which the mirror does not touch on the state
+/// `process_account_limit_updates` (which the database does not touch on the state
 /// object yet), so they stay at chainbase's genesis values in the default flow.
 #[repr(C)]
 #[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout, ArenaObject)]
@@ -389,7 +385,7 @@ struct ResourceStateRow {
     virtual_cpu_limit: u64,
 }
 
-/// Arena mirror of chainbase `permission_object`. `auth` (a `shared_authority`)
+/// Rust representation of chainbase `permission_object`. `auth` (a `shared_authority`)
 /// is variable-length, so it is encoded into the blob arena; the row holds the
 /// `BlobRef`. The three secondary indices reproduce chainbase's key ordering
 /// exactly: `by_parent` = `(parent, id)`, `by_owner` = `(owner, perm_name)`,
@@ -398,7 +394,7 @@ struct ResourceStateRow {
 #[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout)]
 struct PermissionRow {
     id: ObjectId<PermissionRow>,
-    // The chainbase `permission_object` id this row mirrors. The arena's own
+    // The chainbase `permission_object` id this row matches. The arena's own
     // `id` is assigned in (owner, name) hydration order and does NOT track
     // chainbase's creation-order ids, so parent links (which are chainbase ids)
     // are navigated through `cb_id`, not `id`.
@@ -457,7 +453,7 @@ impl ArenaObject for PermissionRow {
     }
 }
 
-/// Arena mirror of chainbase `permission_usage_object`. It has no secondary
+/// Rust representation of chainbase `permission_usage_object`. It has no secondary
 /// index and no dedicated mutation entry point; it is created, touched and
 /// removed only alongside a `permission_object`.
 #[repr(C)]
@@ -468,7 +464,7 @@ struct PermissionUsageRow {
     last_used: i64,
 }
 
-/// Arena mirror of chainbase `permission_link_object`. Secondary indices match
+/// Rust representation of chainbase `permission_link_object`. Secondary indices match
 /// chainbase: `by_action_name` = `(account, code, message_type)`,
 /// `by_permission_name` = `(account, required_permission, id)`.
 #[repr(C)]
@@ -511,7 +507,7 @@ impl ArenaObject for PermissionLinkRow {
     }
 }
 
-/// Arena mirror of chainbase `code_object`. `code` is a `shared_blob`. The
+/// Rust representation of chainbase `code_object`. `code` is a `shared_blob`. The
 /// `by_code_hash` index is composite `(code_hash, vm_type, vm_version)`, the
 /// same ordering chainbase uses.
 #[repr(C)]
@@ -547,10 +543,10 @@ impl ArenaObject for CodeRow {
     }
 }
 
-/// Arena mirror of chainbase `dynamic_global_property_object` — a singleton
+/// Rust representation of chainbase `dynamic_global_property_object` — a singleton
 /// carrying the monotonically increasing global action sequence. Genesis creates
-/// the chainbase row on the C++ side, which the mirror never observes, so the
-/// mirror creates its own row lazily the first time a sequence is drawn.
+/// the chainbase row on the C++ side, which the database never observes, so the
+/// database creates its own row lazily the first time a sequence is drawn.
 #[repr(C)]
 #[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout, ArenaObject)]
 #[arena(type_id = 14)]
@@ -568,7 +564,7 @@ struct DynGlobalPropertyRow {
 /// in lockstep with chainbase's across forks. Seeded after permission hydration
 /// to `max(cb_id) + 1` (chainbase reserves permission id 0 and numbers genesis
 /// permissions contiguously) and advanced on every `create_permission`. type_id
-/// 200 is out of chainbase's object-type range to flag that it mirrors none.
+/// 200 is out of chainbase's object-type range to flag that it matches none.
 #[repr(C)]
 #[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout, ArenaObject)]
 #[arena(type_id = 200)]
@@ -577,14 +573,14 @@ struct PermSeqRow {
     next_id: i64,
 }
 
-/// Arena mirror of the STATIC chainbase `global_property_object`, holding the
+/// Rust representation of the STATIC chainbase `global_property_object`, holding the
 /// active `chain_config` (blockchain parameters). Genesis creates the chainbase
-/// row in C++, out of reach of the per-write hooks, so the mirror is seeded once
+/// row in C++, out of reach of the per-write hooks, so the database is seeded once
 /// from chainbase at init and then updated in lockstep by `set_global_properties`
 /// (the `setparams` intrinsic). Only the fields chainbase exposes and the
 /// `chain_config` wire format carries are stored: `deferred_trx_expiration_window`
 /// (no chainbase getter, always 0 in this build) and `max_action_return_value_size`
-/// (not carried by the params intrinsic) are deliberately omitted so the mirror and
+/// (not carried by the params intrinsic) are deliberately omitted so the database and
 /// chainbase serialise identically. Field order matches `ChainConfigV0`.
 #[repr(C)]
 #[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout, ArenaObject)]
@@ -609,9 +605,9 @@ struct GlobalPropertyRow {
     max_authority_depth: u16,
 }
 
-/// Arena mirror of the chainbase `resource_limits_config_object` singleton: the
+/// Rust representation of the chainbase `resource_limits_config_object` singleton: the
 /// elastic cpu/net limit parameters plus the account usage averaging windows.
-/// Genesis creates the chainbase row in C++; the mirror is seeded once from
+/// Genesis creates the chainbase row in C++; the database is seeded once from
 /// chainbase and the elastic params are updated by `set_block_parameters`
 /// (end-of-block). Storing them lets the arena compute virtual limits without
 /// re-reading chainbase.
@@ -640,8 +636,8 @@ struct ResourceConfigRow {
     account_net_usage_average_window: u32,
 }
 
-/// The subset of `chain_config` the mirror tracks, passed from the FFI seam into
-/// [`ArenaShadow::set_global_properties`]. Mirrors [`GlobalPropertyRow`]'s fields.
+/// The subset of `chain_config` the database tracks, passed from the database facade into
+/// [`ChainDatabase::set_global_properties`]. Mirrors [`GlobalPropertyRow`]'s fields.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ChainConfigParams {
     pub max_block_net_usage: u64,
@@ -663,7 +659,7 @@ pub struct ChainConfigParams {
 }
 
 impl ChainConfigParams {
-    /// Canonical serialization shared by the arena mirror and the chainbase side
+    /// Canonical serialization shared by the arena database and the chainbase side
     /// of the cross-impl root: 16 fields, little endian, `ChainConfigV0` order.
     pub fn to_state_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(64);
@@ -710,7 +706,7 @@ impl GlobalPropertyRow {
     }
 }
 
-/// Arena mirror of chainbase `transaction_object`, the per-block duplicate-trx
+/// Rust representation of chainbase `transaction_object`, the per-block duplicate-trx
 /// dedupe set. Secondary indices reproduce chainbase's ordering: `by_trx_id` =
 /// `trx_id`, `by_expiration` = `(expiration, id)`.
 #[repr(C)]
@@ -754,7 +750,7 @@ impl ArenaObject for TransactionRow {
 
 // ----- contract tables + secondary indices ------------------------------
 //
-// These mirror chainbase's `table_id_object`, `key_value_object` and the five
+// These match chainbase's `table_id_object`, `key_value_object` and the five
 // `secondary_index<...>` tables. The row shapes and index orderings are copied
 // from the proven definitions in `pulsevm_contractdb`, so the arena's key
 // ordering matches chainbase's `boost::multi_index` comparators exactly. The
@@ -762,7 +758,7 @@ impl ArenaObject for TransactionRow {
 // contractdb dropped it) and the `index_long_double` table, which contractdb
 // does not model.
 //
-// `t_id` is the mirror's own `table_id` row id (an `i64` oid), assigned when the
+// `t_id` is the database's own `table_id` row id (an `i64` oid), assigned when the
 // table is first seen — it is not chainbase's oid, but every child row keys off
 // the same local value, so `(t_id, primary_key)` locates a row unambiguously.
 
@@ -770,7 +766,7 @@ impl ArenaObject for TransactionRow {
 /// (primary + every secondary), matching chainbase, which increments it on each
 /// child create and decrements it on each child remove, deleting the table when
 /// it reaches zero. `payer` is sampled at creation only; chainbase can reassign
-/// it internally with no FFI hook, so the mirror does not track that drift.
+/// it internally with no direct update hook, so the database does not track that drift.
 #[repr(C)]
 #[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout)]
 struct ContractTableRow {
@@ -1154,7 +1150,7 @@ fn join_u128(lo: u64, hi: u64) -> u128 {
     ((hi as u128) << 64) | lo as u128
 }
 
-/// Resolves the mirror-local `table_id` for `(code, scope, table)`, creating the
+/// Resolves the database-local `table_id` for `(code, scope, table)`, creating the
 /// table row (with `count == 0`) the first time it is seen. Matches chainbase's
 /// implicit `find_or_create_table` inside the child-store paths.
 fn contract_table_oid(
@@ -1183,14 +1179,14 @@ fn contract_table_oid(
     Ok(id)
 }
 
-/// Bumps a table's child-row count, mirroring the `++t.count` chainbase does on
+/// Bumps a table's child-row count, matching the `++t.count` chainbase does on
 /// every primary/secondary create.
 fn contract_table_incr(db: &mut Db, t_id: i64) -> Result<(), DbError> {
     db.modify::<ContractTableRow>(ObjectId::new(t_id), |t| t.count += 1)
 }
 
 /// Drops a table's child-row count and removes the table when it hits zero,
-/// mirroring the `--t.count` / `remove_table` chainbase does on every remove.
+/// matching the `--t.count` / `remove_table` chainbase does on every remove.
 fn contract_table_decr(db: &mut Db, t_id: i64) -> Result<(), DbError> {
     db.modify::<ContractTableRow>(ObjectId::new(t_id), |t| t.count = t.count.saturating_sub(1))?;
     if db.get::<ContractTableRow>(ObjectId::new(t_id))?.count == 0 {
@@ -1199,103 +1195,14 @@ fn contract_table_decr(db: &mut Db, t_id: i64) -> Result<(), DbError> {
     Ok(())
 }
 
-/// A cheaply cloned, `Send + Sync` handle to the shadow arena, held by
-/// `Database` and shared across its clones.
+/// A cheaply cloned, `Send + Sync` handle to the chain database.
 #[derive(Clone)]
-pub struct ArenaShadow {
+pub struct ChainDatabase {
     inner: Arc<Mutex<Db>>,
-    // Inline read cross-check tallies: every contract read the node serves
-    // (db_get_i64) is answered a second time by the arena and compared. Shared
-    // across Database clones so the totals are chain-wide. See `crosscheck_kv`.
-    read_ok: Arc<std::sync::atomic::AtomicU64>,
-    read_fail: Arc<std::sync::atomic::AtomicU64>,
-    // Iterator-positioning cross-check tallies (db_next/previous/lower/upper): the
-    // arena computes where the cursor lands and it's compared to chainbase.
-    pos_ok: Arc<std::sync::atomic::AtomicU64>,
-    pos_fail: Arc<std::sync::atomic::AtomicU64>,
-    // Non-contract read cross-check tallies (accounts/permissions the node reads
-    // during authorization and dispatch): the arena answers the same lookup.
-    nc_ok: Arc<std::sync::atomic::AtomicU64>,
-    nc_fail: Arc<std::sync::atomic::AtomicU64>,
-    // When set, the node serves contract reads FROM the arena instead of
-    // chainbase. Shared across clones. On by default: the cutover is complete, so
-    // the arena is the primary read backend and chainbase runs only as the
-    // mirrored comparison oracle. A `PULSEVM_ARENA_READS` set to a falsey value is
-    // an explicit kill switch that reverts to serving from chainbase.
-    reads_enabled: Arc<std::sync::atomic::AtomicBool>,
-    // When set, execution resolves reads ENTIRELY from the arena and does not
-    // consult chainbase at all on the read path — no object fetch, no per-read
-    // cross-check. This is the arena-standalone read mode: the step that removes
-    // chainbase's double-work from the hot path, guarded by the block-boundary
-    // full-state root check rather than the per-read comparison. Off by default
-    // (verify mode); opt in with `PULSEVM_ARENA_ONLY`.
-    standalone_reads: Arc<std::sync::atomic::AtomicBool>,
-    // When set, execution applies state mutations to the arena ONLY and does not
-    // write chainbase at all — the arena is the authoritative write backend, not
-    // a mirror. This is the write-side counterpart of `standalone_reads`: with
-    // both on, chainbase is never touched, so it can no longer serve as the live
-    // per-block oracle. Correctness is instead pinned by comparing the arena's
-    // per-block state roots to a golden set recorded from a verified cross-check
-    // run. Off by default; opt in with `PULSEVM_ARENA_ONLY` (which turns on the
-    // whole standalone path, reads and writes together).
-    standalone_writes: Arc<std::sync::atomic::AtomicBool>,
-    rust_genesis: Arc<std::sync::atomic::AtomicBool>,
 }
 
-/// Whether execution resolves reads entirely from the arena (no chainbase on the
-/// read path). Off unless `PULSEVM_ARENA_ONLY` is set to a truthy/empty value.
-fn arena_standalone_default() -> bool {
-    match std::env::var("PULSEVM_ARENA_ONLY") {
-        Ok(v) => !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off" | "no"
-        ),
-        Err(_) => false,
-    }
-}
-
-/// Whether execution writes the arena only, skipping chainbase entirely. Off
-/// unless `PULSEVM_ARENA_STANDALONE_WRITES` is set truthy. Separate from
-/// `PULSEVM_ARENA_ONLY` because skipping writes drops the live per-block oracle.
-fn arena_standalone_writes_default() -> bool {
-    match std::env::var("PULSEVM_ARENA_STANDALONE_WRITES") {
-        Ok(v) => !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off" | "no"
-        ),
-        Err(_) => false,
-    }
-}
-
-/// Whether genesis authors the arena directly instead of running C++ genesis and
-/// hydrating from it. Opt-in (`PULSEVM_ARENA_RUST_GENESIS`) while the pure-Rust
-/// genesis is validated against block-1 golden roots; folds into standalone
-/// writes once proven.
-fn arena_rust_genesis_default() -> bool {
-    match std::env::var("PULSEVM_ARENA_RUST_GENESIS") {
-        Ok(v) => !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off" | "no"
-        ),
-        Err(_) => false,
-    }
-}
-
-/// Whether the arena serves execution reads. Default on (the arena is primary);
-/// an explicit falsey `PULSEVM_ARENA_READS` (`0`, `false`, `off`, `no`) is the
-/// kill switch that falls back to chainbase. Any other value, or unset, is on.
-fn arena_reads_default() -> bool {
-    match std::env::var("PULSEVM_ARENA_READS") {
-        Ok(v) => !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off" | "no"
-        ),
-        Err(_) => true,
-    }
-}
-
-/// Builds an empty `Db` with every mirrored table registered. Shared by
-/// `ArenaShadow::new` and the restart path so both agree on the table set.
+/// Builds an empty `Db` with every chain table registered. Shared by
+/// `ChainDatabase::new` and the restart path so both agree on the table set.
 fn build_registered_db() -> Result<Db, DbError> {
     let mut db = Db::new();
     db.add_table::<AccountMetaRow>()?;
@@ -1349,124 +1256,29 @@ fn perm_seq_set(db: &mut Db, next: i64) -> Result<(), DbError> {
     Ok(())
 }
 
-impl ArenaShadow {
+impl ChainDatabase {
     /// Registers every ported table. Grows as tables come online.
     pub fn new() -> Result<Self, DbError> {
         let db = build_registered_db()?;
-        Ok(ArenaShadow {
+        Ok(ChainDatabase {
             inner: Arc::new(Mutex::new(db)),
-            read_ok: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            read_fail: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            pos_ok: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            pos_fail: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            nc_ok: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            nc_fail: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            // The arena is the primary read backend: execution serves from it
-            // from the outset, with chainbase kept only as the mirrored oracle.
-            // A falsey PULSEVM_ARENA_READS is the kill switch back to chainbase.
-            reads_enabled: Arc::new(std::sync::atomic::AtomicBool::new(arena_reads_default())),
-            standalone_reads: Arc::new(std::sync::atomic::AtomicBool::new(
-                arena_standalone_default(),
-            )),
-            // Off unless explicitly opted in: skipping chainbase writes removes the
-            // live oracle, so it is only sound once the arena's per-block roots are
-            // pinned against a recorded golden set. Kept independent of
-            // PULSEVM_ARENA_ONLY so the standalone READ replay keeps chainbase's
-            // writes (and thus the live cross-check) until write inversion lands.
-            standalone_writes: Arc::new(std::sync::atomic::AtomicBool::new(
-                arena_standalone_writes_default(),
-            )),
-            rust_genesis: Arc::new(std::sync::atomic::AtomicBool::new(
-                arena_rust_genesis_default(),
-            )),
         })
     }
 
-    /// Whether genesis should be authored directly on the arena (no C++ genesis /
-    /// chainbase hydration). Implied by `standalone_writes`: a chainbase-free node
-    /// authors its own genesis, so the single write flag is enough (mirrors how
-    /// [`standalone_reads`](Self::standalone_reads) folds in the write flag).
-    pub fn rust_genesis(&self) -> bool {
-        self.rust_genesis.load(std::sync::atomic::Ordering::Relaxed) || self.standalone_writes()
-    }
-
-    /// Route contract reads through the arena from now on (the cutover switch).
-    pub fn enable_reads(&self) {
-        self.reads_enabled
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    pub fn reads_enabled(&self) -> bool {
-        self.reads_enabled
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Serve reads entirely from the arena from now on (no chainbase on the read
-    /// path). Implies `reads_enabled`.
-    pub fn enable_standalone_reads(&self) {
-        self.reads_enabled
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        self.standalone_reads
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// Whether execution should resolve reads without consulting chainbase. Only
-    /// meaningful when `reads_enabled` (the arena is already the served value).
-    ///
-    /// Standalone writes imply standalone reads: once writes stop landing in
-    /// chainbase, reading it back would serve stale (or missing) state, so the
-    /// read path must come off chainbase too. This lets a chainbase-free node run
-    /// from the single write switch, and closes the writes-on/reads-off footgun.
-    pub fn standalone_reads(&self) -> bool {
-        self.standalone_reads
-            .load(std::sync::atomic::Ordering::Relaxed)
-            || self.standalone_writes()
-    }
-
-    /// Apply state mutations to the arena only from now on, never writing
-    /// chainbase. The arena becomes the authoritative write backend; correctness
-    /// is pinned by the golden per-block roots rather than the live oracle.
-    pub fn enable_standalone_writes(&self) {
-        self.standalone_writes
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// Whether execution should apply writes to the arena only, skipping chainbase.
-    pub fn standalone_writes(&self) -> bool {
-        self.standalone_writes
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
     fn lock(&self) -> std::sync::MutexGuard<'_, Db> {
-        self.inner.lock().expect("shadow arena mutex poisoned")
+        self.inner.lock().expect("chain database mutex poisoned")
     }
 
-    /// Inline read cross-check: given the value the node is about to hand a
-    /// contract for `(code, scope, table, primary)`, confirm the arena serves the
-    /// same bytes from its own state — including uncommitted, mid-transaction
-    /// speculative writes, which the block-boundary root diff never sees. Tallies
-    /// a match or mismatch (mismatches also print). Returns nothing; the counts
-    /// are asserted after replay via `read_crosscheck_counts`.
-    pub fn crosscheck_kv(&self, code: u64, scope: u64, table: u64, primary: u64, expected: &[u8]) {
-        use std::sync::atomic::Ordering;
-        if self.kv_get(code, scope, table, primary).as_deref() == Some(expected) {
-            self.read_ok.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.read_fail.fetch_add(1, Ordering::Relaxed);
-            eprintln!(
-                "arena read cross-check mismatch at ({code},{scope},{table},{primary}): expected {} bytes",
-                expected.len()
-            );
-        }
-    }
-
-    /// (matches, mismatches) tallied by `crosscheck_kv` so far.
-    pub fn read_crosscheck_counts(&self) -> (u64, u64) {
-        use std::sync::atomic::Ordering;
-        (
-            self.read_ok.load(Ordering::Relaxed),
-            self.read_fail.load(Ordering::Relaxed),
-        )
+    /// Serialize the block's SHiP chain-state `table_delta` stream over the
+    /// arena — the pure-Rust port of nodeos' `pack_deltas`. `full_snapshot`
+    /// emits every live row (the first appended block); otherwise the open undo
+    /// session's per-block changes. Must be called before the block's undo
+    /// session commits, so removed rows (and their held blobs) are still
+    /// resolvable. `chain_id` supplies the one `global_property` field the arena
+    /// does not store.
+    pub fn pack_deltas(&self, full_snapshot: bool, chain_id: &[u8; 32]) -> Vec<u8> {
+        let db = self.lock();
+        history::pack_deltas(&db, full_snapshot, chain_id)
     }
 
     pub fn set_revision(&self, revision: i64) -> Result<(), DbError> {
@@ -1509,7 +1321,7 @@ impl ArenaShadow {
         Ok(())
     }
 
-    /// Whether the mirror holds an account_metadata row for `name`, and its
+    /// Whether the database holds an account_metadata row for `name`, and its
     /// privileged flag — for diffing against chainbase.
     pub fn account_metadata_privileged(&self, name: u64) -> Option<bool> {
         self.lock()
@@ -1519,7 +1331,7 @@ impl ArenaShadow {
             .map(|row| row.flags & 1 != 0)
     }
 
-    /// Full account_metadata snapshot for `name`, mirroring the chainbase
+    /// Full account_metadata snapshot for `name`, matching the chainbase
     /// `account_metadata_object` accessors — for field-for-field diffing.
     /// Tuple: (privileged, recv_seq, auth_seq, code_seq, abi_seq, code_hash, vm_type, vm_version).
     #[allow(clippy::type_complexity)]
@@ -1552,6 +1364,7 @@ impl ArenaShadow {
     /// cross-implementation state-root check over the full account set.
     pub fn account_metadata_state_bytes(&self) -> Vec<u8> {
         let db = self.lock();
+        #[allow(clippy::type_complexity)]
         let mut rows: Vec<(u64, bool, u64, u64, u64, u64, [u8; 32], u8, u8)> =
             match db.table::<AccountMetaRow>() {
                 Ok(t) => t
@@ -1590,8 +1403,8 @@ impl ArenaShadow {
 
     /// Loads account_metadata rows from the canonical byte layout produced by
     /// `account_metadata_state_bytes`. Genesis creates its native accounts inside
-    /// C++ (`create_native_account`), below the per-write mirror hooks, so the
-    /// mirror seeds those rows here from chainbase once at init; rows created
+    /// C++ (`create_native_account`), below the per-write database hooks, so the
+    /// database seeds those rows here from chainbase once at init; rows created
     /// later by actions still flow through the live `create_account_metadata`
     /// path. A name already present is left untouched, so re-seeding is safe.
     pub fn hydrate_account_metadata(&self, bytes: &[u8]) -> Result<(), DbError> {
@@ -1629,7 +1442,7 @@ impl ArenaShadow {
         Ok(())
     }
 
-    /// Whether the mirror holds an account_object row for `name` — for diffing
+    /// Whether the database holds an account_object row for `name` — for diffing
     /// against chainbase's `find_account`.
     pub fn account_exists(&self, name: u64) -> bool {
         self.lock()
@@ -1811,7 +1624,7 @@ impl ArenaShadow {
 
     /// Seeds account_object rows from the canonical layout — the genesis
     /// counterpart to `hydrate_account_metadata`, since `create_native_account`
-    /// makes these below the mirror hooks (the system account even carries a
+    /// makes these below the database hooks (the system account even carries a
     /// non-empty abi). A name already present is left untouched.
     pub fn hydrate_accounts(&self, bytes: &[u8]) -> Result<(), DbError> {
         let mut db = self.lock();
@@ -1958,7 +1771,7 @@ impl ArenaShadow {
             .collect()
     }
 
-    /// The chainbase id a permission mirrors (`cb_id`), for serving `get_id` from
+    /// The chainbase id a permission matches (`cb_id`), for serving `get_id` from
     /// the arena. `None` if the permission is absent.
     pub fn permission_cb_id(&self, owner: u64, perm_name: u64) -> Option<i64> {
         let db = self.lock();
@@ -1986,7 +1799,7 @@ impl ArenaShadow {
     }
 
     /// The full encoded `shared_authority` blob for a permission (the same bytes
-    /// the FFI seam stored via `encode_authority`), for serving the whole
+    /// the database facade stored via `encode_authority`), for serving the whole
     /// authority — not just the threshold — from the arena. `None` if absent.
     pub fn permission_auth_blob(&self, owner: u64, perm_name: u64) -> Option<Vec<u8>> {
         let db = self.lock();
@@ -1998,11 +1811,11 @@ impl ArenaShadow {
         db.blob::<PermissionRow>(auth).ok().map(|b| b.to_vec())
     }
 
-    /// Arena mirror of `permission_satisfies_other_permission`: does permission
+    /// Rust representation of `permission_satisfies_other_permission`: does permission
     /// `(owner_a, name_a)` satisfy `(owner_b, name_b)` — i.e. is it that same
     /// permission, its immediate parent, or an ancestor up its parent chain, with
     /// a matching owner. Walks `other`'s parent chain by id exactly as the C++
-    /// does. `None` if either permission is absent from the mirror.
+    /// does. `None` if either permission is absent from the database.
     pub fn permission_satisfies(
         &self,
         owner_a: u64,
@@ -2056,7 +1869,7 @@ impl ArenaShadow {
     /// perm_name u64 LE, cb_id u64 LE, parent id u64 LE, last_used u64 LE, then a
     /// u32 LE length-prefixed authority blob (the arena stores the auth already in
     /// the shared encode form). The reserved perm 0 (owner 0) is skipped. `cb_id`
-    /// and `parent` are chainbase ids the mirror stores verbatim, so they compare
+    /// and `parent` are chainbase ids the database stores verbatim, so they compare
     /// directly and, on hydration, give the arena the chainbase id space its
     /// permission-tree walk needs.
     pub fn permission_state_bytes(&self) -> Vec<u8> {
@@ -2502,7 +2315,7 @@ impl ArenaShadow {
         Ok(())
     }
 
-    /// Required permission of the mirrored `permission_link_object` for
+    /// Required permission of the stored `permission_link_object` for
     /// `(account, code, message_type)`, or `None` when absent — for diffing
     /// against chainbase's `find_permission_link`.
     pub fn permission_link(&self, account: u64, code: u64, message_type: u64) -> Option<u64> {
@@ -2596,7 +2409,7 @@ impl ArenaShadow {
 
     /// Mirrors the account-row half of `process_account_limit_updates`: copies
     /// each pending row onto its committed row and drops the pending row. The
-    /// global total-weight bookkeeping is not mirrored (separate object).
+    /// global total-weight bookkeeping is not stored (separate object).
     pub fn process_account_limit_updates(&self) -> Result<(), DbError> {
         let mut db = self.lock();
         let pendings: Vec<(ObjectId<ResourceLimitsRow>, u64, i64, i64, i64)> = {
@@ -2646,7 +2459,7 @@ impl ArenaShadow {
     }
 
     /// Effective limits `(ram_bytes, net_weight, cpu_weight)` for `account` —
-    /// pending row if one is staged, else the committed row — mirroring
+    /// pending row if one is staged, else the committed row — matching
     /// chainbase's `get_account_limits`.
     pub fn account_limits(&self, account: u64) -> Option<(i64, i64, i64)> {
         let db = self.lock();
@@ -2663,10 +2476,10 @@ impl ArenaShadow {
             .map(|r| (r.ram_bytes, r.net_weight, r.cpu_weight))
     }
 
-    /// Effective account NET limit `(available, greylisted)`, mirroring
+    /// Effective account NET limit `(available, greylisted)`, matching
     /// chainbase's `get_account_net_limit` (`current_time` = none, so the
     /// history-projection branch is skipped). Deterministic elastic math over the
-    /// mirrored config/state/usage. `None` when the account or state row is
+    /// stored config/state/usage. `None` when the account or state row is
     /// absent. See [[arena-read-inversion-status]].
     pub fn account_net_limit(&self, account: u64, greylist_limit: u32) -> Option<(i64, bool)> {
         self.account_net_limit_info(account, greylist_limit, None)
@@ -2702,7 +2515,7 @@ impl ArenaShadow {
         ))
     }
 
-    /// Effective account CPU limit `(available, greylisted)`, mirroring
+    /// Effective account CPU limit `(available, greylisted)`, matching
     /// chainbase's `get_account_cpu_limit` (`current_time` = none). See
     /// [`account_net_limit`].
     pub fn account_cpu_limit(&self, account: u64, greylist_limit: u32) -> Option<(i64, bool)> {
@@ -2765,13 +2578,12 @@ impl ArenaShadow {
             .table::<ResourceStateRow>()?
             .iter()
             .next()
-            .map(|s| s.id());
-        if let Some(id) = id {
-            db.modify::<ResourceStateRow>(id, |s| {
-                s.pending_cpu_usage += cpu_usage;
-                s.pending_net_usage += net_usage;
-            })?;
-        }
+            .map(|s| s.id())
+            .ok_or_else(|| DbError::Corrupted("resource state row is missing".into()))?;
+        db.modify::<ResourceStateRow>(id, |s| {
+            s.pending_cpu_usage += cpu_usage;
+            s.pending_net_usage += net_usage;
+        })?;
         Ok(())
     }
 
@@ -2827,7 +2639,7 @@ impl ArenaShadow {
 
     /// Mirrored `(total_cpu_weight, total_net_weight)` from the state singleton,
     /// or `None` if the row is absent — serves `get_total_cpu_weight` /
-    /// `get_total_net_weight` when execution is off chainbase.
+    /// `get_total_net_weight` from the Rust database.
     pub fn state_total_weights(&self) -> Option<(u64, u64)> {
         self.lock()
             .table::<ResourceStateRow>()
@@ -2853,7 +2665,7 @@ impl ArenaShadow {
 
     /// The elastic `(cpu, net)` limit parameters from the config singleton, in the
     /// same shape [`set_block_parameters`] takes — so `process_block_usage` can be
-    /// driven off the arena alone, without the chainbase config. `None` if the
+    /// driven directly from the arena. `None` if the
     /// config row is absent.
     pub fn resource_config_elastic(&self) -> Option<(ElasticParams, ElasticParams)> {
         self.lock()
@@ -2885,7 +2697,7 @@ impl ArenaShadow {
 
     /// The `(net, cpu)` account-usage averaging windows from the config singleton,
     /// serving `get_account_net_usage_average_window` /
-    /// `get_account_cpu_usage_average_window` off chainbase. `None` if the config
+    /// `get_account_cpu_usage_average_window`. `None` if the config
     /// row is absent.
     pub fn usage_average_windows(&self) -> Option<(u32, u32)> {
         self.lock()
@@ -2902,7 +2714,7 @@ impl ArenaShadow {
     }
 
     /// Mirrors `add_pending_ram_usage`: applies the externally-computed byte
-    /// delta to the account's mirrored ram_usage. Chainbase guards against
+    /// delta to the account's stored ram_usage. Chainbase guards against
     /// over/underflow before this runs, so the signed accumulation is safe.
     pub fn add_pending_ram_usage(&self, owner: u64, ram_delta: i64) -> Result<(), DbError> {
         if ram_delta == 0 {
@@ -2945,13 +2757,14 @@ impl ArenaShadow {
         let mut db = self.lock();
         let id = db
             .find_by::<ResourceUsageRow, ResourceUsageRowByOwner>(&owner)?
-            .map(|r| r.id());
-        if let Some(id) = id {
-            db.modify::<ResourceUsageRow>(id, |r| {
-                r.net_usage.add(net_usage, time_slot, net_window);
-                r.cpu_usage.add(cpu_usage, time_slot, cpu_window);
+            .map(|r| r.id())
+            .ok_or_else(|| {
+                DbError::Corrupted(format!("resource usage row is missing for account {owner}"))
             })?;
-        }
+        db.modify::<ResourceUsageRow>(id, |r| {
+            r.net_usage.add(net_usage, time_slot, net_window);
+            r.cpu_usage.add(cpu_usage, time_slot, cpu_window);
+        })?;
         Ok(())
     }
 
@@ -2993,8 +2806,9 @@ impl ArenaShadow {
     /// fields for `name` (code_hash, code_sequence++, vm_type, vm_version,
     /// last_code_update) and the `code_object` ref count for a non-empty image.
     /// `name` comes from the metadata object's `get_name` accessor added to the
-    /// FFI, which is what lets the mirror locate the arena row that the C++ call
+    /// FFI, which is what lets the database locate the arena row that the C++ call
     /// reaches only by reference.
+    #[allow(clippy::too_many_arguments)]
     pub fn update_account_code(
         &self,
         name: u64,
@@ -3065,7 +2879,7 @@ impl ArenaShadow {
     }
 
     /// Mirrors `unlink_account_code`: drops the ref count of the code row and
-    /// removes it at zero. The FFI `code_object` exposes only its hash, not
+    /// removes it at zero. The former bridge `code_object` exposes only its hash, not
     /// `vm_type`/`vm_version`, so the row is located by hash; a hash is unique
     /// across the code table in practice.
     pub fn unlink_account_code(&self, code_hash: [u8; 32]) -> Result<(), DbError> {
@@ -3091,9 +2905,9 @@ impl ArenaShadow {
     // ----- dynamic_global_property_object -----------------------------------
 
     /// Mirrors `next_global_sequence`, which returns the post-increment global
-    /// action sequence. The mirror stores that value into its singleton row,
+    /// action sequence. The database stores that value into its singleton row,
     /// creating the row on first use (genesis creates the chainbase row on the
-    /// C++ side, so the mirror never sees its initial `0`).
+    /// C++ side, so the database never sees its initial `0`).
     pub fn set_global_action_sequence(&self, value: u64) -> Result<(), DbError> {
         let mut db = self.lock();
         let existing = db
@@ -3162,7 +2976,7 @@ impl ArenaShadow {
         Ok(())
     }
 
-    /// The mirrored `chain_config` as owned params, or `None` if the singleton
+    /// The stored `chain_config` as owned params, or `None` if the singleton
     /// has not been seeded. Serves the per-tx/per-block config reads (elastic
     /// block params, tx net/cpu limits, delays, action depths) off the arena so
     /// execution needs no chainbase `global_property_object`.
@@ -3189,7 +3003,7 @@ impl ArenaShadow {
         })
     }
 
-    /// Canonical serialization of the mirrored `chain_config` (16 fields, little
+    /// Canonical serialization of the stored `chain_config` (16 fields, little
     /// endian, `ChainConfigV0` order), or empty when the singleton has not been
     /// seeded — byte-compatible with the chainbase `global_property_state_bytes`.
     pub fn global_property_state_bytes(&self) -> Vec<u8> {
@@ -3206,7 +3020,7 @@ impl ArenaShadow {
 
     // ----- resource_limits_config_object ------------------------------------
 
-    /// Seeds the singleton `resource_limits_config` mirror from chainbase at
+    /// Seeds the singleton `resource_limits_config` database from chainbase at
     /// genesis: elastic cpu/net params plus the two averaging windows.
     pub fn seed_resource_config(
         &self,
@@ -3277,7 +3091,7 @@ impl ArenaShadow {
         r.net_expand_den = net.expand.1;
     }
 
-    /// Canonical serialization of the mirrored `resource_limits_config`, or empty
+    /// Canonical serialization of the stored `resource_limits_config`, or empty
     /// when unseeded — byte-compatible with the chainbase `resource_config_state_bytes`.
     pub fn resource_config_state_bytes(&self) -> Vec<u8> {
         let db = self.lock();
@@ -3324,7 +3138,7 @@ impl ArenaShadow {
         Ok(())
     }
 
-    /// Whether the mirror holds a dedupe row for `trx_id` — for diffing against
+    /// Whether the database holds a dedupe row for `trx_id` — for diffing against
     /// chainbase's `is_known_unexpired_transaction`.
     pub fn transaction_exists(&self, trx_id: [u8; 32]) -> bool {
         self.lock()
@@ -3354,12 +3168,12 @@ impl ArenaShadow {
 
     // ----- contract tables + secondary indices ------------------------------
     //
-    // The `update_*` chainbase paths are not mirrored: they take only an object
+    // The `update_*` chainbase paths are not stored: they take only an object
     // handle (`&key_value_object`, `&index64_object`, ...), whose `table_id` is
-    // opaque across the FFI, so the owning `(code, scope, table)` cannot be
+    // opaque across the former bridge, so the owning `(code, scope, table)` cannot be
     // recovered at the call site to locate the arena row. Creates carry the
     // `&table_id_object` (hence code/scope/table); removes are resolved through
-    // the iterator cache before deletion — so both are mirrored.
+    // the iterator cache before deletion — so both are stored.
 
     /// Mirrors `create_table`. Idempotent: chainbase also reaches a table
     /// lazily, so a row may already exist from a child-store path.
@@ -3411,7 +3225,7 @@ impl ArenaShadow {
     }
 
     /// Mirrors `update_key_value_object`: reassigns the value blob and payer of
-    /// the row at `(code, scope, table, primary_key)`. The FFI reaches the row by
+    /// the row at `(code, scope, table, primary_key)`. The former bridge reaches the row by
     /// an opaque handle, so the caller resolves the table key via `get_table_by_kv`.
     /// Serve the raw contract-db read `(code, scope, table, primary_key)` -> value
     /// from the arena — the primitive behind db_get_i64/db_find_i64. Returns the
@@ -3445,10 +3259,10 @@ impl ArenaShadow {
             .is_some()
     }
 
-    /// The payer recorded on a table's `table_id` mirror, or `None` if the table
+    /// The payer recorded on a table's `table_id` database, or `None` if the table
     /// is absent. Removing a table's last child refunds the table_id_object
     /// overhead to this account (chainbase does the same in `remove_table`). It is
-    /// the creation payer — see the note on `ContractTableRow`: the mirror cannot
+    /// the creation payer — see the note on `ContractTableRow`: the database cannot
     /// observe chainbase reassigning it internally.
     pub fn table_payer(&self, code: u64, scope: u64, table: u64) -> Option<u64> {
         let db = self.lock();
@@ -3459,9 +3273,8 @@ impl ArenaShadow {
     }
 
     /// The `(payer, value)` of a contract row, or `None` if absent. db_update /
-    /// db_remove reach the row by opaque handle; under standalone writes the
-    /// caller resolves the key from the arena cache and needs the old payer and
-    /// value size to author the RAM delta without a chainbase object.
+    /// db_remove reach the row by opaque handle, so the caller resolves its key
+    /// and old billing data from the arena cache.
     pub fn kv_row(
         &self,
         code: u64,
@@ -4390,31 +4203,12 @@ impl ArenaShadow {
             .map(|t| t.id().raw())
     }
 
-    /// Tally an iterator-positioning cross-check (arena landing == chainbase's).
-    pub fn note_pos(&self, matched: bool) {
-        use std::sync::atomic::Ordering;
-        if matched {
-            self.pos_ok.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.pos_fail.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    /// (matches, mismatches) tallied by iterator-positioning cross-checks.
-    pub fn pos_crosscheck_counts(&self) -> (u64, u64) {
-        use std::sync::atomic::Ordering;
-        (
-            self.pos_ok.load(Ordering::Relaxed),
-            self.pos_fail.load(Ordering::Relaxed),
-        )
-    }
-
-    /// Write a full checkpoint of the mirror's committed state to `path` (atomic).
+    /// Write a full checkpoint of the database's committed state to `path` (atomic).
     pub fn checkpoint(&self, path: &std::path::Path) -> Result<(), DbError> {
         self.lock().checkpoint(path)
     }
 
-    /// Load a checkpoint into this (freshly constructed, empty) mirror.
+    /// Load a checkpoint into this (freshly constructed, empty) database.
     pub fn load(&self, path: &std::path::Path) -> Result<(), DbError> {
         self.lock().load(path)
     }
@@ -4422,7 +4216,7 @@ impl ArenaShadow {
     /// Restart in place: discard the live `Db` and rebuild it from the checkpoint
     /// at `path`, exactly as a node would on reboot. The shared counters and the
     /// cutover switch survive (they live outside the `Db`), so the reloaded
-    /// mirror keeps serving. The restored revision must line up with chainbase's
+    /// database keeps serving. The restored revision must line up with chainbase's
     /// for the next block's undo session to match.
     pub fn reload_from(&self, path: &std::path::Path) -> Result<(), DbError> {
         let mut fresh = build_registered_db()?;
@@ -4438,29 +4232,10 @@ impl ArenaShadow {
         self.lock().flush_delta(path)
     }
 
-    /// Replay every complete frame in the log at `path` onto this mirror,
+    /// Replay every complete frame in the log at `path` onto this database,
     /// restoring the state a sequence of `flush_delta` calls recorded.
     pub fn replay_log(&self, path: &std::path::Path) -> Result<(), DbError> {
         self.lock().replay_log(path)
-    }
-
-    /// Tally a non-contract read cross-check (arena lookup == chainbase's).
-    pub fn note_noncontract(&self, matched: bool) {
-        use std::sync::atomic::Ordering;
-        if matched {
-            self.nc_ok.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.nc_fail.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    /// (matches, mismatches) tallied by non-contract read cross-checks.
-    pub fn noncontract_crosscheck_counts(&self) -> (u64, u64) {
-        use std::sync::atomic::Ordering;
-        (
-            self.nc_ok.load(Ordering::Relaxed),
-            self.nc_fail.load(Ordering::Relaxed),
-        )
     }
 
     pub fn update_key_value_object(
@@ -4742,7 +4517,7 @@ impl ArenaShadow {
         Ok(())
     }
 
-    /// `secondary_key` is the raw IEEE-754 bit pattern (the FFI carries the
+    /// `secondary_key` is the raw IEEE-754 bit pattern (the API carries the
     /// softfloat `float64_t` as a `u64`); it is reinterpreted, not converted.
     pub fn create_idx_double_object(
         &self,
@@ -4901,10 +4676,9 @@ impl ArenaShadow {
         Ok(())
     }
 
-    // ----- secondary-index row payer (standalone-write billing) --------------
+    // ----- secondary-index row payer billing ---------------------------------
     // db_idxN_update bills the payer-change delta off the row's *old* payer.
-    // Under standalone writes the chainbase object is never created, so the
-    // payer is resolved from the arena row by `(code, scope, table, primary)`.
+    // The payer is resolved from the arena row by `(code, scope, table, primary)`.
 
     /// The payer of an idx64 row, or `None` if absent.
     pub fn idx64_payer(&self, code: u64, scope: u64, table: u64, primary_key: u64) -> Option<u64> {
@@ -5020,7 +4794,7 @@ mod tests {
     /// primary-key order regardless of insertion order.
     #[test]
     fn contract_read_positioning_follows_index_order() {
-        let s = ArenaShadow::new().unwrap();
+        let s = ChainDatabase::new().unwrap();
         let (code, scope, table, payer) = (1u64, 2u64, 3u64, 9u64);
         // Insert out of order; the index, not insertion, decides traversal.
         for &pk in &[50u64, 10, 30, 20, 40] {
@@ -5067,7 +4841,7 @@ mod tests {
     /// primary; the next distinct secondary is upper_bound's landing).
     #[test]
     fn idx64_secondary_reads_follow_secondary_then_primary() {
-        let s = ArenaShadow::new().unwrap();
+        let s = ChainDatabase::new().unwrap();
         let (code, scope, table, payer) = (1u64, 2u64, 3u64, 9u64);
         // (primary, secondary) pairs, inserted out of order, with a duplicate
         // secondary (200) across primaries 5 and 2.
@@ -5121,7 +4895,7 @@ mod tests {
     /// including secondaries above u64::MAX that a narrower key would truncate.
     #[test]
     fn idx128_secondary_reads_follow_secondary_then_primary() {
-        let s = ArenaShadow::new().unwrap();
+        let s = ChainDatabase::new().unwrap();
         let (code, scope, table, payer) = (1u64, 2u64, 3u64, 9u64);
         let big = (1u128 << 96) + 7; // well beyond u64
         for &(primary, secondary) in &[(7u64, big), (5, 200u128), (2, 200), (9, 100)] {
@@ -5167,7 +4941,7 @@ mod tests {
     /// primary, and round-trip the key bytes unchanged.
     #[test]
     fn idx256_secondary_reads_order_by_key_words() {
-        let s = ArenaShadow::new().unwrap();
+        let s = ChainDatabase::new().unwrap();
         let (code, scope, table, payer) = (1u64, 2u64, 3u64, 9u64);
         let key = |n: u8| {
             let mut k = [0u8; 32];
@@ -5223,7 +4997,7 @@ mod tests {
     /// positives), tie-breaking equal secondaries by primary.
     #[test]
     fn idx_double_secondary_reads_follow_float_order() {
-        let s = ArenaShadow::new().unwrap();
+        let s = ChainDatabase::new().unwrap();
         let (code, scope, table, payer) = (1u64, 2u64, 3u64, 9u64);
         for &(primary, secondary) in &[(7u64, 3.5f64), (5, 2.0), (2, 2.0), (9, 1.0), (3, -1.0)] {
             s.create_idx_double_object(code, scope, table, payer, primary, secondary.to_bits())
@@ -5275,7 +5049,7 @@ mod tests {
     /// idx_long_double reads order by the 128-bit key then primary.
     #[test]
     fn idx_long_double_secondary_reads_order_by_key() {
-        let s = ArenaShadow::new().unwrap();
+        let s = ChainDatabase::new().unwrap();
         let (code, scope, table, payer) = (1u64, 2u64, 3u64, 9u64);
         // (lo, hi) words; with hi small positive the 128-bit key sorts by hi.
         for &(primary, sec) in &[(7u64, (0u64, 3u64)), (5, (0, 2)), (2, (0, 2)), (9, (0, 1))] {
@@ -5379,7 +5153,7 @@ mod tests {
     /// round-trip that path relies on, for every secondary-index family.
     #[test]
     fn idx_standalone_payer_roundtrip_all_families() {
-        let s = ArenaShadow::new().unwrap();
+        let s = ChainDatabase::new().unwrap();
         let (code, scope, table) = (1u64, 2u64, 3u64);
         let (p0, p1) = (9u64, 11u64);
 

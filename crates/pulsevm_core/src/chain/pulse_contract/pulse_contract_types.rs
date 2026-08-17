@@ -94,7 +94,7 @@ mod tests {
 
     use super::*;
     use pulsevm_crypto::k1::K1PublicKey;
-    use pulsevm_ffi::{
+    use pulsevm_database::{
         KeyWeight,
         PermissionLevel,
         PermissionLevelWeight,

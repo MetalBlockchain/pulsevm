@@ -13,8 +13,7 @@ use std::{
 
 use pulsevm_constants::MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER;
 use pulsevm_crypto::Digest;
-use pulsevm_error::ChainError;
-use pulsevm_ffi::{
+use pulsevm_database::{
     BlockTimestamp,
     Database,
     Microseconds,
@@ -22,6 +21,7 @@ use pulsevm_ffi::{
     milliseconds,
     seconds,
 };
+use pulsevm_error::ChainError;
 use pulsevm_serialization::VarUint32;
 
 use crate::{

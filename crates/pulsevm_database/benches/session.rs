@@ -4,7 +4,7 @@ use criterion::{
     criterion_group,
     criterion_main,
 };
-use pulsevm_ffi::Database;
+use pulsevm_database::Database;
 use std::hint::black_box;
 use tempfile::{
     TempDir,
@@ -24,8 +24,7 @@ fn populated() -> (TempDir, Database, u64) {
 }
 
 // Matches pulsevm_arena's `undo/session_100_creates_commit`: open an undo
-// session, create 100 accounts against a ~100k-row table, commit. Recycle the
-// store before the fixed mmap fills.
+// session, create 100 accounts against a ~100k-row table, then commit.
 fn bench_session(c: &mut Criterion) {
     let (mut _dir, mut db, mut next) = populated();
     let mut since_recycle = 0u64;
@@ -38,21 +37,18 @@ fn bench_session(c: &mut Criterion) {
                 next = p.2;
                 since_recycle = 0;
             }
-            let mut session = db.create_undo_session(true).unwrap();
+            db.arena_start_undo_session();
             for _ in 0..100 {
                 db.create_account(black_box(next), 0).unwrap();
                 next += 1;
             }
-            session.pin_mut().push().unwrap();
+            db.arena_squash();
             since_recycle += 100;
         })
     });
 }
 
-// The load equivalent: reopen a populated, closed database. chainbase mmaps the
-// segment (the boost multi_index lives in the mapping), so no index rebuild —
-// this is where its memory-mapped design genuinely beats a serialize-and-rebuild
-// load.
+// Reopen a populated, closed database and measure checkpoint restoration.
 fn bench_reopen(c: &mut Criterion) {
     let dir = tempdir().unwrap();
     let path = dir.path().to_str().unwrap().to_string();
@@ -66,7 +62,7 @@ fn bench_reopen(c: &mut Criterion) {
     }
     let mut group = c.benchmark_group("reopen");
     group.sample_size(50);
-    group.bench_function(BenchmarkId::new("mmap_open", 100_000), |b| {
+    group.bench_function(BenchmarkId::new("checkpoint_open", 100_000), |b| {
         b.iter(|| {
             let db = Database::new(&path, DB_SIZE).unwrap();
             black_box(&db);

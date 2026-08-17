@@ -1,7 +1,6 @@
 use std::collections::BTreeSet;
 
-use pulsevm_error::ChainError;
-use pulsevm_ffi::{
+use pulsevm_database::{
     Authority,
     Database,
     DbRead,
@@ -10,6 +9,7 @@ use pulsevm_ffi::{
     TimePoint,
     seconds,
 };
+use pulsevm_error::ChainError;
 
 use crate::{
     PULSE_NAME,
@@ -52,11 +52,10 @@ impl AuthorizationManager {
         provided_delay: Microseconds,
         satisfied_authorizations: &BTreeSet<PermissionLevel>,
     ) -> Result<(), ChainError> {
-        // Config served as owned values (arena when off chainbase), so no config
-        // object is held across the pass.
+        // Config is served as an owned value, so no database object is held
+        // across the pass.
         let chain_config = db.chain_config()?;
-        // Single read view for the whole (read-only) authorization pass: every
-        // chainbase reference below is bound to this guard and cannot escape it.
+        // Use one consistent read view for the whole authorization pass.
         let r = db.read()?;
         let delay_max_limit = seconds(chain_config.max_transaction_delay as i64);
         let effective_provided_delay = if provided_delay >= delay_max_limit {

@@ -1,8 +1,8 @@
-use pulsevm_error::ChainError;
-use pulsevm_ffi::{
+use pulsevm_database::{
     Database,
     ElasticLimitParameters,
 };
+use pulsevm_error::ChainError;
 
 use crate::name::Name;
 

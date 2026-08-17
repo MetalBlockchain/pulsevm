@@ -1,8 +1,8 @@
-use pulsevm_error::ChainError;
-use pulsevm_ffi::{
+use pulsevm_database::{
     Float128,
     U256,
 };
+use pulsevm_error::ChainError;
 use wasmer::{
     FunctionEnvMut,
     RuntimeError,
@@ -1624,7 +1624,7 @@ pub fn db_idx_long_double_previous(
 
 #[cfg(test)]
 mod tests {
-    use pulsevm_ffi::Float128;
+    use pulsevm_database::Float128;
 
     use super::{
         reject_nan_f64,

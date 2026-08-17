@@ -5,18 +5,20 @@ RUN apt-get update -y
 RUN apt-get install curl -y
 RUN curl --proto '=https' --tlsv1.3 -sSf https://sh.rustup.rs | sh -s -- -y
 
+# Wasmer's LLVM backend is pinned to LLVM 22.
+RUN curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | apt-key add - && \
+    echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" > /etc/apt/sources.list.d/llvm.list && \
+    apt-get update -y
+
 # Install dependencies
 RUN apt-get install -y \
     gcc-13 \
-    g++-13 \
     cmake \
-    libgmp-dev \
     zlib1g-dev \
     unzip \
     pkg-config \
-    libboost-all-dev \
-    libcurl4-openssl-dev \
-    llvm-18-dev \
+    llvm-22-dev \
+    libpolly-22-dev \
     file 
 
 # Add Rust to PATH
@@ -33,10 +35,6 @@ COPY Cargo.lock Cargo.lock
 COPY src src
 COPY crates crates
 
-ENV CXX=/usr/bin/g++-13
-ENV CC=/usr/bin/gcc-13
-ENV BOOST_LIB=/usr/lib/x86_64-linux-gnu
-ENV ZLIB_ROOT=/usr/lib/x86_64-linux-gnu
 ENV LLVM_SYS_221_PREFIX=/usr/lib/llvm-22
 
 RUN cargo build --release

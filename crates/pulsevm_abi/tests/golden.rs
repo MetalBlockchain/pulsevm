@@ -11,7 +11,7 @@ use pulsevm_abi::Abi;
 use serde_json::Value;
 
 fn golden_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../pulsevm_ffi/tests/rpc_golden.json")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../pulsevm_database/tests/rpc_golden.json")
 }
 
 /// The (code, scope, table) triple keys both raw and json row captures.

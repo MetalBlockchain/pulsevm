@@ -115,7 +115,7 @@ mod tests {
         str::FromStr,
     };
 
-    use pulsevm_ffi::TimePointSec;
+    use pulsevm_database::TimePointSec;
 
     use crate::{
         crypto::PrivateKey,

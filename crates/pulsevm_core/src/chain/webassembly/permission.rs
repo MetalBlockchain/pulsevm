@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use pulsevm_ffi::{
+use pulsevm_database::{
     PermissionLevel,
     microseconds,
     seconds,

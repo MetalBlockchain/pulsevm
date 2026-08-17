@@ -22,7 +22,7 @@ impl NumBytes for VarUint32 {
             return 1;
         }
         let bits = 32 - v.leading_zeros(); // number of significant bits
-        core::cmp::min((bits as usize + 6) / 7, 5)
+        core::cmp::min((bits as usize).div_ceil(7), 5)
     }
 }
 
@@ -155,8 +155,6 @@ mod tests {
 
     #[test]
     fn varuint_num_bytes() {
-        use core::u32;
-
         assert_eq!(VarUint32(0).num_bytes(), 1);
         assert_eq!(VarUint32(127).num_bytes(), 1);
         assert_eq!(VarUint32(128).num_bytes(), 2);

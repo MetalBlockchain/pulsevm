@@ -3,11 +3,11 @@ use pulsevm_constants::{
     OVERHEAD_PER_ACCOUNT_RAM_BYTES,
     SETCODE_RAM_BYTES_MULTIPLIER,
 };
-use pulsevm_error::ChainError;
-use pulsevm_ffi::{
+use pulsevm_database::{
     Database,
     PermissionObject,
 };
+use pulsevm_error::ChainError;
 use pulsevm_serialization::Read;
 
 use crate::{
@@ -101,7 +101,7 @@ pub fn newaccount(
     )?;
     // Re-read the created permission's id and authority billable size rather than
     // holding the creation pointer across the next create. Both are served from
-    // the arena under PULSEVM_ARENA_READS (cross-checked against chainbase).
+    // the arena.
     let (owner_id, owner_size) = {
         let r = db.read()?;
         let name = create.name.as_u64();

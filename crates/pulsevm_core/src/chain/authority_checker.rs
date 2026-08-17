@@ -3,11 +3,11 @@ use std::collections::{
     HashMap,
 };
 
-use pulsevm_error::ChainError;
-use pulsevm_ffi::{
+use pulsevm_database::{
     DbRead,
     Microseconds,
 };
+use pulsevm_error::ChainError;
 
 use crate::crypto::PublicKey;
 

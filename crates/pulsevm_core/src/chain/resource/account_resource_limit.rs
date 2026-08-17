@@ -1,4 +1,4 @@
-use pulsevm_ffi::BlockTimestamp;
+use pulsevm_database::BlockTimestamp;
 use serde::Serialize;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]

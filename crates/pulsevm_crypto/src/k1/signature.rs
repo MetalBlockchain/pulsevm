@@ -55,6 +55,7 @@ impl K1Signature {
         RecoveryId::try_from(recid).map_err(K1Error::Secp)
     }
 
+    #[allow(clippy::wrong_self_convention)]
     fn to_recoverable(&self) -> Result<RecoverableSignature, K1Error> {
         let recid = self.recovery_id()?;
         RecoverableSignature::from_compact(&self.compact[1..], recid).map_err(K1Error::Secp)
@@ -91,6 +92,7 @@ impl K1Signature {
     }
 
     /// The `SIG_K1_...` string form.
+    #[allow(clippy::inherent_to_string_shadow_display)]
     pub fn to_string(&self) -> String {
         format!("SIG_K1_{}", encode_b58_checked(&self.compact, K1_SUFFIX))
     }

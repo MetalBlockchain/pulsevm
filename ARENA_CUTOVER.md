@@ -1,275 +1,90 @@
-# Arena cutover — status & handoff
+# Pure-Rust chain database — completion status
 
-Goal: replace the C++ chainbase FFI (and, with it, boost) entirely with the
-pure-Rust arena, with every feature covered and consensus-equivalent.
+PulseVM's chain database is now implemented entirely in Rust. The arena is the
+sole execution, persistence, snapshot, and state-history backend. The former
+chainbase implementation, vendored C++ tree, Boost dependency, CMake build, and
+`cxx` bridge have been deleted.
 
-This note captures the state as of this branch so the remaining work — most of
-which needs a machine that can build the C++ side — can be picked up directly.
+## Runtime architecture
 
-## Where things stand
+- `pulsevm_arena` provides typed tables, ordered and hashed secondary indexes,
+  nested undo sessions, checkpoints, and incremental WAL persistence.
+- `pulsevm_chaindb` defines every chain object and implements contract tables,
+  permissions, resource accounting, transaction deduplication, genesis, and
+  SHiP delta serialization over the arena.
+- `pulsevm_database` is the public database facade used by `pulsevm_core`. The
+  name reflects its current role; it contains no native bridge.
+- `pulsevm_contractdb`, `pulsevm_crypto`, `pulsevm_softfloat`, `pulsevm_abi`,
+  and `pulsevm_rpc` contain the other functionality formerly supplied by the
+  native chain library.
 
-The pure-Rust store exists and is solid, but **C++ chainbase is still the sole
-backend in every real build.** The arena runs only as a cross-checking *shadow*,
-gated behind two off-by-default switches:
+There are no backend-selection feature flags or environment switches. Reads,
+writes, genesis, undo sessions, snapshots, and state-history logs always use the
+Rust implementation.
 
-- Cargo feature `arena-shadow` (`pulsevm_ffi`, forwarded by `pulsevm_core`) —
-  compiles the shadow in and mirrors writes into a `pulsevm_arena::Db`.
-- Env var `PULSEVM_ARENA_READS` — lets a *subset* of reads be served from the
-  arena instead of chainbase (flipped only on the tmpnet replay path,
-  `controller.rs`).
+## Equivalence evidence
 
-### Covered and verified in pure Rust (builds/tests without any C++ toolchain)
+The replacement was developed against frozen outputs from the removed C++
+implementation:
 
-- `pulsevm_arena` — index-addressed arena; chainbase-exact undo / `squash` /
-  `commit` / `revision`; ordered + hash secondary indices; session-safe blob
-  arena; snapshot + write-ahead-log persistence with crash recovery;
-  `#[derive(ArenaObject)]`. Model-based differential proptests for the undo
-  engine and the block/tx squash-on-commit / undo-on-failure pattern.
-- `pulsevm_contractdb` — the full EOS contract-table API on the arena
-  (`db_*_i64` + idx64/128/256/double/**long_double**), EOS-exact iterator
-  handles, and RAM billing.
-- `pulsevm_chaindb` — the **whole** arena-backed chain database: every chain
-  table (accounts, account metadata, permissions, permission usage/links, code,
-  transactions, contract tables + all secondary indices, resource
-  limits/usage/state) and the create/modify/remove + read/positioning +
-  undo/commit + persistence surface over them. This was previously
-  `pulsevm_ffi/src/shadow.rs`, buildable only alongside the C++ tree; it is now
-  a standalone pure-Rust crate (`pulsevm_ffi` re-exports it as `crate::shadow`).
-  It is the single source of truth the cutover targets — the earlier
-  contractdb-vs-shadow duplication is resolved in its favour for the system
-  objects.
+- The 1,697-block testnet replay matches every recorded per-table arena state
+  root.
+- All 1,696 post-genesis SHiP chain-state deltas match the frozen C++ output
+  byte-for-byte.
+- RPC JSON, ABI decoding, K1 crypto, and SoftFloat have committed known-answer
+  fixtures captured before removal.
+- Direct SHiP framing tests cover modified, removed, and created rows, repeated
+  touches, nested-session squash, chainbase's reverse touch order, and stable
+  full-snapshot ordering.
+- Resource-accounting tests prove account CPU and NET limits reject overages
+  before mutation and that missing/corrupt resource rows cannot fail open.
+- The arena's model-based tests cover create/modify/remove, nested
+  squash/undo/commit, secondary-index ordering, persistence, and torn WAL tails.
 
-`cargo test -p pulsevm_arena -p pulsevm_contractdb -p pulsevm_chaindb` →
-96 tests green, **no C++ toolchain required**.
+The full replay uses a frozen 1,697-block corpus. The runner validates its shape
+and, when given an archive, requires SHA-256
+`68bff604d1471d63aacc6bea7c997f5c97e53eddd6c9864238061083836d7572` before
+extracting anything. With an unpacked corpus in `target/replay`, run:
 
-### Added on this branch
-
-- `idx_long_double` (float128) secondary index in `pulsevm_contractdb`, closing
-  the last contract-table secondary-index parity gap (chainbase has
-  `index_long_double_object`; the crate stopped at `double`). Ordering matches
-  EOS `soft_long_double_less` (`f128_lt`); key crosses the API as the raw
-  128-bit pattern (`u128`); RAM billed at `billable_size_v` = 144. New test file
-  `tests/idx_long_double_tests.rs` (8 tests), including a sub-f64-ULP case that
-  proves the full 113-bit significand is retained.
-
-## What is NOT done (the cutover proper)
-
-Roughly a third of the way. Remaining, in dependency order:
-
-1. **Finish the arena read surface.** *Largely done — see "Layer 2" below.* All
-   value-returning reads are now served + validated: every contract secondary
-   index (idx64/128/256/double/long_double), primary rows, and the plain-value
-   authorization reads (`is_account`, `is_account_privileged`,
-   `lookup_linked_permission`). What remains are the reads that hand back a
-   chainbase object reference (permission full authority, the `exec_one`
-   account_metadata read fused with a write), which convert as part of the write
-   flip, not as standalone serve branches.
-
-2. **Make the arena the write path**, not a mirror. Today every mutation is
-   `chainbase-write → arena-replay` (`database.rs` calls into
-   `pulsevm_chaindb`). Flip ownership.
-
-   **Table coverage is now complete for every live table.** The two live,
-   mutable tables that were previously unmirrored are closed:
-   - `global_property_object` (static `chain_config`) — `GlobalPropertyRow`,
-     seeded from chainbase at genesis and updated by `set_global_properties`
-     (the `setparams` intrinsic). Verified by `oracle_global_property_mirrors_setparams`
-     and the `global_property` entry in `cross_impl_tables`.
-   - `resource_limits_config_object` — `ResourceConfigRow` (elastic cpu/net
-     params + the two averaging windows), seeded at genesis and updated by
-     `set_block_parameters` end-of-block. Verified by the `resource_limits_config`
-     entry in `cross_impl_tables` (exercised by `oracle_cross_impl_full_state_root`,
-     which builds a block).
-
-   The remaining three chainbase indices are **intentionally not mirrored** and
-   are safe to leave until the write flip (document, don't port blindly):
-   - `protocol_state_object` — genesis-only in C++, read-only thereafter
-     (activated protocol features / key-type count); PulseVM activates none, so
-     it never changes. Mirror it only if/when a protocol-feature activation path
-     lands.
-   - `database_header_object` — a genesis-only db-version sigil, not consensus
-     state (leap excludes it from comparison too).
-   - `account_ram_correction_object` — registered but **never written** in this
-     tree (deferred-trx RAM correction is unsupported); dead state.
-
-3. **Full session/undo integration in the controller.** The nested
-   build/verify/accept session stack (`controller.rs`) must drive the arena
-   transactionally on its own, not in lockstep behind chainbase.
-
-4. **Cross-implementation `state_root`.** `Db::state_root` (`pulsevm_arena/src/db.rs`)
-   currently hashes raw `BlobRef` (offset/len) and the whole blob arena — a
-   canonical fingerprint *within one arena*, but not comparable to C++. For
-   block-by-block equivalence it must hash blob *bytes* per object with blob
-   offsets normalized out. Needs a per-object "which fields are blobs" hook on
-   `ArenaObject` (+ the derive macro) and a rewrite of `Table::hash_state`.
-
-5. **Extend the C++ differential harness.** `pulsevm_ffi/tests/diff_contract_iter.rs`
-   drives contractdb and the FFI `Database` side by side, but only covers
-   primary, RAM, and idx64. Add `compare_idx128/256/double/long_double`,
-   mirroring `compare_idx64`, so the new secondary surfaces (incl. the
-   long_double added here) are validated against chainbase. **This needs the
-   C++ build** — it could not be compiled in the cloud session that wrote this.
-
-6. **Port the remaining non-DB C++** so boost can actually go: the crypto
-   wrappers (`CxxPublicKey`/signatures — a `pulsevm_crypto` crate already
-   exists), the softfloat float128 builtins used by the WASM VM, the JSON query
-   helpers (`get_table_rows`, `get_currency_*`, `get_account_info_*`,
-   `get_table_by_scope`), and `pack_deltas` (state history).
-
-7. **Delete the C++ tree**: `crates/pulsevm_ffi/pulsevm/**` (chainbase, boost
-   submodule, softfloat, the `chain` library), the cmake `build.rs`, and the
-   `cxx` bridge — only after 1–6 are green.
-
-## Validating
-
-The pure-Rust store needs no C++ and runs anywhere:
-
-```
-cargo test -p pulsevm_arena -p pulsevm_contractdb -p pulsevm_chaindb
+```sh
+scripts/run-replay-regression.sh
 ```
 
-The chainbase-equivalence checks need the C++ toolchain (boost + a C++20
-compiler):
+An archive can be passed directly:
 
-```
-# build the C++ side needs boost checked out + a C++20 compiler
-git submodule update --init --recursive
-cargo test -p pulsevm_ffi --features arena-shadow            # shadow write/diff seam
-cargo test -p pulsevm_ffi --features arena-shadow --test diff_contract_iter
+```sh
+scripts/run-replay-regression.sh /path/to/pulsevm-replay-fixtures.tar.gz
 ```
 
-The differential tests panic on any divergence from chainbase — that is the
-equivalence bar (RAM billing, id assignment, iteration order, state root).
+The ordinary pure-Rust database suites are:
 
----
+```sh
+cargo test -p pulsevm_arena -p pulsevm_contractdb -p pulsevm_chaindb -p pulsevm_database
+```
 
-# Layer 2 — taking C++ off the execution path (design & sequencing)
+Pull requests run the workspace tests, compile every target (including benches),
+and apply `-D warnings` Clippy to the pure-Rust database replacement stack on
+both amd64 and arm64. The consensus replay workflow uses the same two
+architectures. Set the repository variable `PULSEVM_REPLAY_FIXTURE_URL` to the
+published archive URL to make replay run on every push and pull request; it can
+also be supplied manually through `workflow_dispatch`.
 
-Goal restated: the arena becomes the sole backend **execution reads and writes
-from**, while C++ chainbase stays compiled and runs in parallel purely as the
-comparison oracle (`note_pos` / `note_noncontract` / `cross_impl_tables`). The
-C++ source tree is *kept*, not deleted — deletion (step 7 above) is out of scope.
+## Native dependencies that remain
 
-## Where execution stands now
+PulseVM still uses Wasmer's LLVM backend for deterministic WebAssembly
+compilation. Consequently builds require LLVM 22 and transitive Rust build
+dependencies may invoke a C compiler, CMake, bindgen, or native libraries. These
+are third-party runtime/toolchain requirements, not remnants of PulseVM's old
+C++ database.
 
-Everything that returns a **value** is already served from the arena under
-`PULSEVM_ARENA_READS` and validated against chainbase:
+Removing every native compiler dependency would be a separate WASM-engine
+migration. Any such change is consensus-sensitive and must repeat the
+cross-architecture determinism tests and full replay.
 
-- Contract secondary indices — idx64/128/256/double/long_double
-  (`find_secondary`/`find_primary`/`lowerbound`/`upperbound`), each with a
-  Database `arena_idx*` accessor and an `apply_context` serve branch, proven by
-  the `idx*_read_accessors_match_chainbase` differential tests.
-- Primary rows — `db_get_i64`/`next`/`previous` serve; `db_lowerbound/upperbound`
-  cross-check the landing primary (the observable row flows through the served
-  `db_get_i64`).
-- Plain-value authorization reads — `is_account`, `is_account_privileged`,
-  `lookup_linked_permission`. `find_account` is retired from execution entirely
-  (every caller only tested existence); its object read survives only in tests.
-- Permission authority — `DbRead::permission_authority` decodes the stored blob
-  into an owned `Authority`; the whole satisfaction walk runs on it under reads
-  (`oracle_permission_authority_serves_from_arena`).
-- Account-metadata receipt fields — `is_account_privileged`,
-  `account_metadata_code_abi_sequence`, and the arena-owned `next_recv_sequence`.
-- Contract wasm image — `get_code_bytes_by_hash` serves the bytecode the VM
-  compiles and runs (`oracle_contract_code_serves_from_arena`).
+## External fixture publication
 
-## What still reads/writes C++ during execution
-
-1. **`account_metadata` in `exec_one`** (`apply_context.rs`). *Mostly converted.*
-   The paired write is arena-owned: `next_recv_sequence` now takes the account
-   *name*, resolves and bumps `recv_sequence` inside the FFI layer (no
-   `&AccountMetadataObject` escaping into execution), and serves the incremented
-   value from the arena. The receipt scalars — `is_privileged`, `code_sequence`,
-   `abi_sequence` — are served too (`is_account_privileged`,
-   `account_metadata_code_abi_sequence`). The code-object read itself is now
-   served (`get_code_bytes_by_hash` — the VM compiles arena bytecode). The only
-   value still taken off the chainbase metadata object is the `code_hash`
-   *identifier*, which flows into the wasm runtime as a `&CxxDigest`
-   (`Id::from` cache key); serving that owned would change `wasm_runtime::run`'s
-   signature and is deferred with the wider metadata-view flip.
-
-2. **Permission reads needing the full authority.** *Authorization satisfaction
-   is now served.* `DbRead::permission_authority` decodes `PermissionRow.auth`
-   back into an owned `Authority`, cross-checked on the canonical encoding, and
-   `authority_checker.rs` reads through it — so under `PULSEVM_ARENA_READS` the
-   whole satisfaction walk runs on arena-served authorities
-   (`oracle_permission_authority_serves_from_arena`). What remains are the
-   permission-object reads fused with a write: `.get_authority().get_billable_size()`
-   and `.get_id()` (`pulse_contract.rs` updateauth/linkauth), `.get_name()`
-   (`authorization_manager.rs`), and `.satisfies(other, db)` (a C++ method). These
-   convert with the write flip, not as standalone serve branches.
-
-3. **Iterator handles.** The `*IteratorCache` handles (including the end-iterator
-   encoding) are minted by chainbase. Contracts observe and compare them, so the
-   arena must mint its own handles with the identical encoding before it can own
-   iteration.
-
-4. **Writes.** Every mutation is still `chainbase-write -> arena-replay`. The
-   arena is a mirror, not the source of truth.
-
-## Sequencing (each step stays behind the flag + cross-checks until green)
-
-1. **Arena authority decode.** *Done.* `DbRead::permission_authority` decodes
-   `PermissionRow.auth` into the `Authority` the checker uses and serves it under
-   `PULSEVM_ARENA_READS`; `authority_checker.rs` reads through it. The remaining
-   permission-object reads (`get_id`/`get_name`/`get_billable_size`/`satisfies`)
-   are fused with writes and convert with the write flip below.
-
-2. **Co-convert `account_metadata` read+write in `exec_one`.** *Done bar the
-   wasm code hash.* `next_recv_sequence` is now name-based, arena-served, with no
-   chainbase reference escaping; `is_privileged`/`code_sequence`/`abi_sequence`
-   are served scalars. This is the first place the arena owns a read and its
-   paired write together — the template for the write flip. Only `code_hash`
-   remains, and it moves with the code-object read surface (step 3-adjacent).
-
-3. **Arena-owned iterator handles.** The largest piece. Mint handles matching
-   chainbase's encoding; validate with `diff_contract_iter` (iterator-handle
-   equality is already its bar) extended past idx64.
-
-4. **Flip write-ownership.** Invert the mirror: the arena writes first and is the
-   source of truth; chainbase becomes the parallel shadow. Every create/modify/
-   remove already mirrors both ways, so this is inverting which side is
-   authoritative, table by table, cross-checked each block.
-
-5. **Controller drives the arena undo/session stack** directly, not in lockstep
-   behind chainbase's RAII sessions.
-
-6. **Default `PULSEVM_ARENA_READS` on.** C++ now runs only to compare. Acceptance
-   gate: replay the alpine testnet history (1697 blocks, chain-id
-   `193526980f523c07a567dda80f5f543e2356518ce1475cf3e03d98ca740b3f67`) with both
-   backends live, asserting per-block `cross_impl_tables` equality end to end.
-
-## Acceptance gate — PASSED (full testnet history)
-
-`replay_testnet_blocks` now replays **all 1697 blocks** of the alpine testnet
-with the arena shadow live, in both modes:
-
-- **reads from chainbase** (mirror check) and **`PULSEVM_ARENA_READS=1`** (the node
-  running on arena-served reads) — both reach block 1697 with the per-block
-  `cross_impl_tables` full-state root matching every block.
-- 125,436 inline contract reads + 47 iterator positions + 33,909
-  account/permission reads cross-checked live, **0 divergences**; contract
-  point-reads and table scans served from the arena matched chainbase; the mirror
-  was checkpointed, dropped, and reloaded from disk mid-run (block 850) and stayed
-  in lockstep to 1697; the per-block WAL replayed to an identical state root.
-
-Getting there surfaced and fixed real parity bugs (each its own commit): the
-min-CPU floor was enforced on explicitly-billed replayed blocks; transaction
-signature authorization ran on replayed (already-authenticated) blocks; and a
-failed `onblock` was rolled back in chainbase but not mirrored to the arena,
-diverging `resource_usage`. The harness itself silently skipped every block on a
-fixture-shape mismatch and still passed — now hardened to accept both shapes and
-fail on a no-op run. (The alpine cluster is a load-test net that does not enforce
-transaction signatures, which is why the replay path skips that check.)
-
-## The validation bar (unchanged, just widened)
-
-- `note_pos` / `note_noncontract`: every served read must equal chainbase, always.
-- `diff_contract_iter`: iterator-handle + key equality vs chainbase.
-- `cross_impl_tables`: whole-state per-block equality (now includes
-  `global_property` and `resource_limits_config`).
-- Testnet replay: the end-to-end consensus-equivalence gate — **green across all
-  1697 blocks, both read modes.**
-
-Nothing advances to "arena-primary" for a given surface until its cross-check has
-been green across a full testnet replay.
+The code-side replay automation is complete. The corpus itself remains outside
+Git because it consists of captured testnet RPC responses. To activate the
+push/PR replay job, publish the frozen archive and set its URL in the repository
+variable described above. Its digest is pinned in the runner, so moving or
+compromising the hosting location cannot silently change the consensus oracle.

@@ -9,7 +9,7 @@ use pulsevm_serialization::{
 };
 use std::hint::black_box;
 
-fn bench(value: &Vec<u8>) {
+fn bench(value: &[u8]) {
     let mut pos = 0;
     let _ = Vec::<u8>::read(value, &mut pos).unwrap();
 }

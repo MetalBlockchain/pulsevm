@@ -1,12 +1,8 @@
-//! Physical state snapshots of the chainbase arena.
+//! Physical state snapshots of the Rust arena.
 //!
-//! chainbase keeps all state in a single memory-mapped file
-//! (`shared_memory.bin`). There is no object serializer, so the only faithful
-//! way to capture a point-in-time copy is to take the file itself: drop the
-//! mapping (which flushes dirty pages and clears the dirty flag), read the
-//! clean bytes, and remap. This module owns the wire envelope that wraps those
-//! bytes — a small self-describing header plus a checksum so a transferred
-//! snapshot can be validated before it is installed.
+//! The arena checkpoint stores all registered tables in one file. This module
+//! owns the wire envelope around those bytes: a small self-describing header and
+//! checksum so a transferred snapshot can be validated before installation.
 //!
 //! The envelope is deliberately not the Avalanche state-summary commitment: the
 //! summary id a peer agrees on is the accepted block id (canonical across
@@ -32,7 +28,7 @@ pub const HEADER_LEN: usize = 4 + 2 + 2 + 8 + 8 + 32;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SnapshotHeader {
     pub version: u16,
-    /// The chainbase revision the snapshot was taken at — the accepted block
+    /// The database revision the snapshot was taken at — the accepted block
     /// number. The restore side re-reads it from the arena, but carrying it in
     /// the clear lets a receiver decide relevance without opening the payload.
     pub revision: i64,
@@ -40,7 +36,7 @@ pub struct SnapshotHeader {
     pub payload_sha256: [u8; 32],
 }
 
-/// Wrap raw `shared_memory.bin` bytes in the transport envelope.
+/// Wrap raw arena checkpoint bytes in the transport envelope.
 pub fn encode(revision: i64, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(HEADER_LEN + payload.len());
     out.extend_from_slice(&MAGIC);
@@ -84,7 +80,7 @@ pub fn peek_header(bytes: &[u8]) -> Result<SnapshotHeader, ChainError> {
 
 /// Validate the full envelope and return the header alongside the payload
 /// slice. The checksum is recomputed, so a truncated or tampered payload is
-/// rejected here rather than surfacing as chainbase corruption at open time.
+/// rejected here rather than surfacing as arena corruption at open time.
 pub fn decode(bytes: &[u8]) -> Result<(SnapshotHeader, &[u8]), ChainError> {
     let header = peek_header(bytes)?;
     let payload = &bytes[HEADER_LEN..];
@@ -107,12 +103,9 @@ fn bad(msg: String) -> ChainError {
 
 // ----- sparse payload ----------------------------------------------------
 //
-// chainbase preallocates its arena to the configured size (tens of GB by
-// default) and leaves the unused tail zeroed, so copying the raw file verbatim
-// would move tens of GB of zeros. The payload instead stores only the non-zero
-// regions, keyed by absolute offset — the same zero-skipping chainbase itself
-// does when it writes the file (`save_database_file`). This makes the payload
-// and the peak memory proportional to the live state, not the reservation.
+// Sparse framing remains part of snapshot version 1 for compatibility with
+// existing snapshots. It stores non-zero regions keyed by absolute offset, so
+// payload and peak memory stay proportional to live state.
 //
 // Layout: `[u64 logical_len]` then a sequence of runs `[u64 offset][u64 len][len
 // bytes]`, ascending. A run is emitted at block granularity, so a run may carry
@@ -170,26 +163,38 @@ pub fn sparse_expand(
     }
     let logical_len = u64::from_le_bytes(payload[0..8].try_into().unwrap());
     let mut pos = 8usize;
+    let mut previous_end = 0u64;
     while pos < payload.len() {
-        if pos + 16 > payload.len() {
-            return Err(bad("sparse: truncated run header".into()));
-        }
+        let header_end = pos
+            .checked_add(16)
+            .filter(|end| *end <= payload.len())
+            .ok_or_else(|| bad("sparse: truncated run header".into()))?;
         let offset = u64::from_le_bytes(payload[pos..pos + 8].try_into().unwrap());
         let len = u64::from_le_bytes(payload[pos + 8..pos + 16].try_into().unwrap());
-        pos += 16;
-        let len_usize = len as usize;
-        if pos + len_usize > payload.len() {
-            return Err(bad("sparse: truncated run data".into()));
+        pos = header_end;
+        if len == 0 {
+            return Err(bad("sparse: zero-length run".into()));
         }
-        if offset
+        let end = offset
             .checked_add(len)
-            .map_or(true, |end| end > logical_len)
-        {
+            .filter(|end| *end <= logical_len)
+            .ok_or_else(|| bad("sparse: run out of bounds".into()))?;
+        if offset < previous_end {
+            return Err(bad("sparse: runs overlap or are out of order".into()));
+        }
+        let len_usize = usize::try_from(len)
+            .map_err(|_| bad("sparse: run length does not fit this platform".into()))?;
+        let data_end = pos
+            .checked_add(len_usize)
+            .filter(|end| *end <= payload.len())
+            .ok_or_else(|| bad("sparse: truncated run data".into()))?;
+        if end > logical_len {
             return Err(bad("sparse: run out of bounds".into()));
         }
-        write_run(offset, &payload[pos..pos + len_usize])
+        write_run(offset, &payload[pos..data_end])
             .map_err(|e| bad(format!("sparse: write run: {e}")))?;
-        pos += len_usize;
+        pos = data_end;
+        previous_end = end;
     }
     Ok(logical_len)
 }
@@ -262,6 +267,28 @@ mod tests {
         let peeked = peek_header(&bytes).unwrap();
         let (decoded, _) = decode(&bytes).unwrap();
         assert_eq!(peeked, decoded);
+    }
+
+    #[test]
+    fn sparse_rejects_noncanonical_and_overflowing_runs() {
+        let mut zero_len = 8u64.to_le_bytes().to_vec();
+        zero_len.extend_from_slice(&0u64.to_le_bytes());
+        zero_len.extend_from_slice(&0u64.to_le_bytes());
+        assert!(sparse_expand(&zero_len, |_, _| Ok(())).is_err());
+
+        let mut overlapping = 16u64.to_le_bytes().to_vec();
+        for (offset, data) in [(4u64, &[1u8, 2][..]), (5, &[3u8][..])] {
+            overlapping.extend_from_slice(&offset.to_le_bytes());
+            overlapping.extend_from_slice(&(data.len() as u64).to_le_bytes());
+            overlapping.extend_from_slice(data);
+        }
+        assert!(sparse_expand(&overlapping, |_, _| Ok(())).is_err());
+
+        let mut overflowing = u64::MAX.to_le_bytes().to_vec();
+        overflowing.extend_from_slice(&u64::MAX.to_le_bytes());
+        overflowing.extend_from_slice(&2u64.to_le_bytes());
+        overflowing.extend_from_slice(&[1, 2]);
+        assert!(sparse_expand(&overflowing, |_, _| Ok(())).is_err());
     }
 
     /// Encode `data` as a sparse payload and expand it back into a fresh buffer.

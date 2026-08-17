@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
+use pulsevm_database::ChainConfigV0;
 use pulsevm_error::ChainError;
-use pulsevm_ffi::ChainConfigV0;
 use pulsevm_serialization::{
     Read,
     VarUint32,
@@ -146,7 +146,7 @@ pub fn get_blockchain_parameters_packed(
     // Read the active chain configuration and pack it in the same ChainConfigV0
     // wire format `set_blockchain_parameters_packed` consumes, so a contract can
     // round-trip the parameters it sets. Served as owned values (from the arena
-    // when execution is off chainbase).
+    // in the Rust database).
     let cfg = env_data.db().chain_config()?;
     let packed = cfg
         .pack()

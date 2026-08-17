@@ -117,7 +117,7 @@ impl From<TimePoint> for TimePointSec {
     #[inline]
     fn from(t: TimePoint) -> Self {
         // Truncate microseconds to whole seconds
-        let secs = (t.time_since_epoch().count() / 1_000_000) as i64;
+        let secs = t.time_since_epoch().count() / 1_000_000;
         Self {
             utc_seconds: secs as u32,
         } // C++ semantics: wrap on cast if negative/large

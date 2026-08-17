@@ -1,15 +1,15 @@
 //! Known-answer regression test for the pure-Rust `k1` implementation.
 //!
 //! `k1_kat.txt` was frozen from the C++ `fc::crypto` oracle (see
-//! `pulsevm_ffi/tests/capture_golden_kat.rs`). Each record's identity fields
+//! `pulsevm_database/tests/capture_golden_kat.rs`). Each record's identity fields
 //! (private/public key strings, packed public key) were asserted equal to C++
 //! at capture time, and C++ was made to recover the signer from the frozen
 //! (deterministic RFC6979) signature. Replaying it here keeps signing,
 //! recovery, the string/packed codecs, and the public-key ordering used by
 //! `Authority::validate` pinned after the C++ bridge is gone.
 //!
-//! Regenerate with `PULSEVM_CAPTURE_KAT=1 cargo test -p pulsevm_ffi
-//! --features arena-shadow --test capture_golden_kat` while the bridge exists.
+//! Regenerate with `PULSEVM_CAPTURE_KAT=1 cargo test -p pulsevm_database
+//! --test capture_golden_kat` while the bridge exists.
 
 use pulsevm_crypto::k1::{
     K1PrivateKey,
@@ -18,7 +18,7 @@ use pulsevm_crypto::k1::{
 };
 
 fn unhex(s: &str) -> Vec<u8> {
-    assert!(s.len() % 2 == 0, "odd hex {s:?}");
+    assert!(s.len().is_multiple_of(2), "odd hex {s:?}");
     (0..s.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex byte"))

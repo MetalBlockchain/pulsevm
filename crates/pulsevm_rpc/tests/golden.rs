@@ -15,7 +15,7 @@ use serde_json::Value;
 fn load_golden() -> Vec<Value> {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../pulsevm_ffi/tests/rpc_golden.json"
+        "/../pulsevm_database/tests/rpc_golden.json"
     );
     let text = std::fs::read_to_string(path).expect("read golden");
     serde_json::from_str(&text).expect("parse golden")

@@ -3,7 +3,7 @@ use criterion::{
     criterion_group,
     criterion_main,
 };
-use pulsevm_ffi::Database;
+use pulsevm_database::Database;
 use std::hint::black_box;
 use tempfile::{
     TempDir,

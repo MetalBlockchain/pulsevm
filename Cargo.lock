@@ -3341,8 +3341,8 @@ dependencies = [
  "pulsevm_billable_size",
  "pulsevm_constants",
  "pulsevm_crypto",
+ "pulsevm_database",
  "pulsevm_error",
- "pulsevm_ffi",
  "pulsevm_grpc",
  "pulsevm_name",
  "pulsevm_name_macro",
@@ -3381,33 +3381,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "pulsevm_e2e_boot"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "pulsevm_api_client",
- "pulsevm_core",
- "pulsevm_crypto",
- "pulsevm_name_macro",
- "pulsevm_proc_macros",
- "pulsevm_serialization",
- "serde_json",
- "tokio",
- "wat",
-]
-
-[[package]]
-name = "pulsevm_error"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "jsonrpsee",
- "thiserror 2.0.19",
- "wasmer",
-]
-
-[[package]]
-name = "pulsevm_ffi"
+name = "pulsevm_database"
 version = "0.1.0"
 dependencies = [
  "criterion",
@@ -3434,6 +3408,32 @@ dependencies = [
  "serde_json",
  "tempfile",
  "time",
+]
+
+[[package]]
+name = "pulsevm_e2e_boot"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "pulsevm_api_client",
+ "pulsevm_core",
+ "pulsevm_crypto",
+ "pulsevm_name_macro",
+ "pulsevm_proc_macros",
+ "pulsevm_serialization",
+ "serde_json",
+ "tokio",
+ "wat",
+]
+
+[[package]]
+name = "pulsevm_error"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "jsonrpsee",
+ "thiserror 2.0.19",
+ "wasmer",
 ]
 
 [[package]]

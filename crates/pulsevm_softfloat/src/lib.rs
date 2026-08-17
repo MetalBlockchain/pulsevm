@@ -2,8 +2,8 @@
 //! that back the WASM floating-point builtins.
 //!
 //! The vendored C reaches Berkeley SoftFloat (8086-SSE specialization) through
-//! `pulsevm_ffi`; these functions reproduce it bit-for-bit. The public API
-//! mirrors the `pulsevm_ffi` bridge signatures:
+//! `pulsevm_database`; these functions reproduce it bit-for-bit. The public API
+//! mirrors the `pulsevm_database` bridge signatures:
 //!
 //!   * A 128-bit float is passed as `(lo, hi)` u64 halves and returned as a `u128` holding the full
 //!     little-endian bit pattern (`(hi << 64) | lo`). Use [`f128_parts`] to split it back into
@@ -13,7 +13,7 @@
 //!   * Comparisons return the same `i32` codes the C `cmptf2_impl` yields.
 //!
 //! This is consensus-critical: it is validated bit-for-bit against the C++
-//! oracle in `crates/pulsevm_ffi/tests/softfloat_cross_validation.rs`.
+//! oracle in `crates/pulsevm_database/tests/softfloat_cross_validation.rs`.
 
 use rustc_apfloat::{
     Float,

@@ -99,13 +99,13 @@ impl Authority {
         // Keys must be strictly ascending by public key. The ordering is the
         // 34-byte packed key compared as unsigned bytes, which is byte-for-byte
         // the same as the C++ `public_key_type::cmp` (cross-checked in
-        // pulsevm_ffi/tests/pubkey_order_cross_validation.rs).
+        // pulsevm_database/tests/pubkey_order_cross_validation.rs).
         let mut prev_key: Option<&KeyWeight> = None;
         for k in &self.keys {
-            if let Some(prev) = prev_key {
-                if prev.key.to_packed() >= k.key.to_packed() {
-                    return false;
-                }
+            if let Some(prev) = prev_key
+                && prev.key.to_packed() >= k.key.to_packed()
+            {
+                return false;
             }
             total_weight += k.weight as u32;
             prev_key = Some(k);
@@ -114,10 +114,10 @@ impl Authority {
         // Accounts must be strictly ascending by permission level.
         let mut prev_account: Option<&PermissionLevelWeight> = None;
         for a in &self.accounts {
-            if let Some(prev) = prev_account {
-                if prev.permission >= a.permission {
-                    return false;
-                }
+            if let Some(prev) = prev_account
+                && prev.permission >= a.permission
+            {
+                return false;
             }
             total_weight += a.weight as u32;
             prev_account = Some(a);
@@ -129,10 +129,10 @@ impl Authority {
         }
         let mut prev_wait: Option<&WaitWeight> = None;
         for w in &self.waits {
-            if let Some(prev) = prev_wait {
-                if prev.wait_sec >= w.wait_sec {
-                    return false;
-                }
+            if let Some(prev) = prev_wait
+                && prev.wait_sec >= w.wait_sec
+            {
+                return false;
             }
             total_weight += w.weight as u32;
             prev_wait = Some(w);

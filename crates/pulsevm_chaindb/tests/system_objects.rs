@@ -1,15 +1,15 @@
 //! End-to-end tests of the chain-database system objects (accounts, account
 //! metadata, permissions, auth links, resource limits, RAM usage, transaction
-//! dedup, sequences) exercised through the public `ArenaShadow` API — the
-//! surface that, before this crate was split out of `pulsevm_ffi`, could only be
+//! dedup, sequences) exercised through the public `ChainDatabase` API — the
+//! surface that, before this crate was split out of `pulsevm_database`, could only be
 //! validated by the C++ differential harness. Here it is checked directly:
 //! writes land, reads reflect them, and — crucially for consensus — `undo`
 //! reverts and `commit` persists the whole set together.
 
-use pulsevm_chaindb::ArenaShadow;
+use pulsevm_chaindb::ChainDatabase;
 
-fn db() -> ArenaShadow {
-    ArenaShadow::new().unwrap()
+fn db() -> ChainDatabase {
+    ChainDatabase::new().unwrap()
 }
 
 /// A minimal authority blob whose first four little-endian bytes are the
@@ -208,7 +208,7 @@ fn checkpoint_and_reload_preserve_state_root() {
 
     s.checkpoint(&path).unwrap();
 
-    // A fresh mirror loads the checkpoint to an identical logical state.
+    // A fresh database loads the checkpoint to an identical logical state.
     let s2 = db();
     s2.load(&path).unwrap();
     assert_eq!(s2.state_root(), root);

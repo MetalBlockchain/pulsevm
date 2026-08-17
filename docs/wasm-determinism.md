@@ -73,9 +73,9 @@ Yes.
   reassociation/contraction.
 - **128-bit / `long double` (`float128`)** — not hardware. The `__addtf3`,
   `__multf3`, `__divtf3`, `__subtf3`, the `__float*`/`__fix*` conversions and the
-  `__eqtf2`/`__letf2`/… comparisons all route through FFI into **Berkeley
-  SoftFloat Release 3e** (`builtins.cpp` → `f128_add`/`f128_mul`/… via
-  `softfloat.hpp`). Bit-exact, identical to EOSIO's approach.
+  `__eqtf2`/`__letf2`/… comparisons use the pure-Rust `pulsevm_softfloat` port of
+  **Berkeley SoftFloat Release 3e**. Its output is pinned to vectors captured
+  from the removed reference implementation.
 - **128-bit integer builtins** (`__ashlti3`, `__multi3`, …) — pure Rust
   `u128`/`i128`, deterministic.
 
@@ -89,20 +89,17 @@ Float determinism isn't only about contract *math*; a contract can use an
 IEEE `double` / `long double` as a **secondary index key**, and the *ordering* of
 those keys must be identical everywhere. Two subtleties here:
 
-- **The comparator.** chainbase orders these indexes with a raw `f64_lt` /
-  `f128_lt` ([`contract_table_objects.hpp`](../crates/pulsevm_ffi/pulsevm/libraries/chain/include/pulsevm/chain/contract_table_objects.hpp),
-  `soft_double_less` / `soft_long_double_less`). The Rust arena mirror can't call
-  softfloat from a BTree comparator, so it reproduces the same order with an
+- **The comparator.** The reference implementation ordered these indexes with a
+  raw `f64_lt` / `f128_lt`. The Rust database reproduces that order with an
   IEEE-754 **total order** (`total_cmp`-style, `-0.0` folded onto `+0.0`) in
-  [`shadow.rs`](../crates/pulsevm_ffi/src/shadow.rs). These agree on every value
+  [`pulsevm_chaindb`](../crates/pulsevm_chaindb/src/lib.rs). These agree on every value
   **except NaN** — and NaN is where it bites.
 - **NaN is not a valid key, and nothing was stopping it.** `f*_lt(NaN, x)` and
   `f*_lt(x, NaN)` are both false, so a NaN key breaks the container's
-  strict-weak ordering (undefined behavior in the C++ boost index) and orders
-  differently from the arena's total order. The reference `db_idx_*` intrinsics
+  strict-weak ordering and orders differently from the arena's total order. The
+  reference `db_idx_*` intrinsics
   reject a NaN secondary key; that guard had not been ported, so a contract
-  could store one — diverging from the reference chain, corrupting the C++
-  index, and splitting C++ vs. arena. **Fixed on this branch:** `reject_nan_f64`
+  could store one and diverge from the reference chain. **Fixed on this branch:** `reject_nan_f64`
   / `reject_nan_f128` reject a NaN at the host boundary for every float-secondary
   intrinsic that takes a key from the contract (`store`, `update`,
   `find_secondary`, `lowerbound`, `upperbound`, both widths). With NaN kept out,
@@ -158,15 +155,15 @@ those keys must be identical everywhere. Two subtleties here:
   amd64 and arm64, so both arches checking the same constant is what actually
   gates *cross-architecture* determinism of a full contract run — a real
   divergence would land on one arch only.
-- The **3631-block differential replay** is the end-to-end check: C++ chainbase
-  vs. the Rust arena match the full-state root at every block. It is `#[ignore]`d
-  behind the `arena-shadow` feature and reads a block set from outside the repo
+- The **1,697-block golden replay** is the end-to-end check: the Rust database
+  matches the state roots captured while the reference backend was still
+  available. It is `#[ignore]`d and reads a block set from outside the repo
   (`PULSEVM_RPC_BLOCKS_DIR` / `PULSEVM_REPLAY_BLOCK_LOG_DIR`), so it is a manual
   gate, not a CI job — see below.
 
 ## Validation
 
-- **69/69 lib tests** pass, including the determinism tests above and real
+- The core library tests pass, including the determinism tests above and real
   CDT-compiled contract execution (`pulse_token`, `test_api_db`,
   `test_api_multi_index` — the last exercises the `idx_double`/`idx_long_double`
   paths with real keys) under the pinned engine.
@@ -176,8 +173,8 @@ those keys must be identical everywhere. Two subtleties here:
   NaN-guard classifier and wiring tests, and the golden receipt digest — is
   checked independently on each arch on every push and PR. Two arches agreeing on
   the same committed constants is the cross-architecture determinism gate.
-- **3631-block differential replay** (arena-shadow, C++ chainbase vs Rust arena
-  full-state root at every block): 1:1 with the pinned feature set — every real
+- **1,697-block golden replay** (Rust arena state root against the frozen
+  reference root at every block): 1:1 with the pinned feature set — every real
   contract on the chain (system contract, `pulse.token`) compiles and executes
   identically. _(Run with onblock gated and blocks re-signed, since this base
   carries block-signature verification but not the replay-harness re-sign — both
@@ -189,7 +186,7 @@ those keys must be identical everywhere. Two subtleties here:
   cross-arch, but the end-to-end 3631-block replay still needs a block set that
   lives outside the repo, so it can't run on a stock runner. To make it a CI job:
   commit a compact fixture block set (or fetch a pinned one), add a leg that
-  builds `--features arena-shadow` and runs the `#[ignore]`d replay against it,
+  runs the `#[ignore]`d replay against it,
   and — since the payoff is cross-arch — run that leg on both amd64 and arm64.
   This also automates "wasmer/LLVM bump = re-run the replay": a version drift that
   the feature test can't see would move a state root and fail the job.

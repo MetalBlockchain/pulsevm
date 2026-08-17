@@ -209,7 +209,7 @@ impl RpcService {
             return Ok(false);
         }
 
-        // Execution is synchronous, blocking FFI/wasm work with no await points,
+        // Execution is synchronous, with blocking database/wasm work and no await points,
         // so run it on the blocking pool and take the lock with blocking_write()
         // instead of holding the async lock on a runtime worker, which would
         // stall every other handler. push_transaction reverts the database, so

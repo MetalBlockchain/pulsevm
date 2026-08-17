@@ -1,11 +1,12 @@
-# SHiP chain-state delta (`pack_deltas`) port blueprint
+# SHiP chain-state delta (`pack_deltas`) pure-Rust port
 
-Reimplement the nodeos state-history per-block delta serializer in pure Rust over
-the arena, so `store_chain_state` (currently a no-op) emits chain-state deltas.
+The nodeos state-history per-block delta serializer is implemented in pure Rust
+over the arena, and `store_chain_state` appends its output to the chain-state
+log.
 Everything below is reverse-engineered from the C++ (git `782d9a47`:
-`crates/pulsevm_ffi/pulsevm/libraries/state_history/{create_deltas.cpp,include/.../serialization.hpp}`)
+`crates/pulsevm_database/pulsevm/libraries/state_history/{create_deltas.cpp,include/.../serialization.hpp}`)
 and **verified byte-for-byte against the frozen golden**
-(`crates/pulsevm_ffi/tests/ship_golden.txt.gz`, `<block_num> <hex>`, blocks 2..1697).
+(`crates/pulsevm_database/tests/ship_golden.txt.gz`, `<block_num> <hex>`, blocks 2..1697).
 
 ## fc encodings used everywhere
 - `uvar` = `fc::unsigned_int` LEB128 (7 bits/byte, high bit = continue).
@@ -38,6 +39,11 @@ delta (later blocks): from the arena `UndoState` of the block's open undo sessio
   created:  ids new this session → present=true.
 `include_delta` = "any change" for all tables except `protocol_state` (compares
 `activated_protocol_features`; the arena has none yet, so it never emits a delta).
+
+Within a delta, modified rows are emitted first, then removed rows, then new
+rows. chainbase stores the first two groups in intrusive singly linked lists and
+uses `push_front`, so they are in reverse first-touch order. New rows are read
+from the primary index in ascending id order.
 
 ## Per-row history serializers — every one starts with `uvar(0)` version unless noted.
 Sizes below are the golden's block-2 first-row lengths (all verified).
@@ -102,15 +108,19 @@ Sizes below are the golden's block-2 first-row lengths (all verified).
     net_target, net_max, net_contract_num/den, net_expand_num/den, ... windows, periods, multiplier }`.
     (periods/max_multiplier may be constants — check ResourceConfigRow / genesis.)
 
-## Implementation plan
-1. `ArenaShadow::pack_deltas(full_snapshot: bool) -> Vec<u8>` in pulsevm_chaindb. Reuse the
-   `*_state_bytes` iteration for full snapshots; add an accessor exposing each Table's
-   open `UndoState` (old/removed) + created ids for the delta path.
-2. `Database::pack_deltas` in pulsevm_ffi; `store_chain_state` calls it + appends to chain_state_log
-   (drop the `Ok(())` no-op; no-op only when the log is absent).
-3. Validate: replay to block 2, compare pack_deltas(true) per-table against the golden's
-   block-2 slice (decode the golden with the uvar reader above), byte-for-byte; then the
-   delta path on later blocks. Test asserts equality for all 1696 blocks
-   (`PULSEVM_SHIP_VERIFY=<gunzipped golden>`), env `PULSEVM_ARENA_ONLY=1
-   PULSEVM_ARENA_STANDALONE_WRITES=1 PULSEVM_RPC_BLOCKS_DIR=target/replay/rpcblocks`.
-   Must NOT regress the 23,744-root replay or the suite.
+## Verification
+
+The replay harness compares every generated delta against the frozen C++ oracle.
+The completed port matches all 1,696 post-genesis blocks byte-for-byte and keeps
+all 1,697 per-block arena state roots unchanged. Focused arena tests pin
+chainbase's reverse-first-touch undo ordering, including nested squashes; the
+chaindb tests also pin the empty delta and protocol-state-only snapshot framing.
+
+Run the full replay with:
+
+```sh
+PULSEVM_RPC_BLOCKS_DIR=target/replay/rpcblocks \
+PULSEVM_GOLDEN_ROOTS=target/replay/golden_roots.txt \
+PULSEVM_SHIP_VERIFY=target/replay/ship_golden.txt \
+cargo test -p pulsevm_core --lib replay_testnet_blocks -- --ignored --nocapture --test-threads=1
+```

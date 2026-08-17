@@ -84,8 +84,7 @@ use pulsevm_crypto::{
     Digest,
     merkle,
 };
-use pulsevm_error::ChainError;
-use pulsevm_ffi::{
+use pulsevm_database::{
     Authority,
     BlockTimestamp,
     Database,
@@ -95,6 +94,7 @@ use pulsevm_ffi::{
     TimePoint,
     seconds,
 };
+use pulsevm_error::ChainError;
 use pulsevm_grpc::vm;
 use pulsevm_serialization::{
     Read,
@@ -133,6 +133,11 @@ pub struct Controller {
     db: Database,
     verified_blocks: HashMap<Id, SignedBlock>,
     chain_id: Id,
+    // The genesis-derived chain id (`sha256(pack(genesis))`), which is what the
+    // `global_property` state-history record commits to — distinct from
+    // `chain_id`, the id AvalancheGo configured the node with (equal in
+    // production; the replay test deliberately runs them apart).
+    genesis_chain_id: Id,
     state: vm::State,
 
     block_log: Option<StateHistoryLog>,
@@ -164,7 +169,7 @@ pub struct Controller {
 
     // The chain of blocks that have been executed (during build or verify) but
     // not yet accepted, ordered oldest first. Their state is materialized on the
-    // live database as a stack of chainbase undo sessions on top of
+    // live database as a stack of arena undo sessions on top of
     // `last_accepted_block_id`: `pending_chain[0].parent == last_accepted_block_id`
     // and `pending_chain[i].parent == pending_chain[i-1].id`. Retaining these lets
     // `replay_accepted_state_to` reuse an already-executed prefix instead of
@@ -181,6 +186,7 @@ struct PendingBlock {
     id: Id,
     // Parent block id. For the front of the chain this equals the last accepted
     // block; for later entries it is the previous entry's id.
+    #[allow(dead_code)] // Asserted by pending-chain invariant tests.
     parent: Id,
     // The block's mutations live on the arena's undo stack (an
     // `arena_start_undo_session` was opened when this entry was pushed). Accepting
@@ -253,6 +259,7 @@ impl Controller {
             db: Database::default(),
             verified_blocks: HashMap::new(),
             chain_id: Id::default(),
+            genesis_chain_id: Id::default(),
             state: vm::State::Unspecified,
 
             block_log: None,
@@ -321,14 +328,11 @@ impl Controller {
         self.db = Database::new(&db_path, self.node_config.as_ref().unwrap().db_size)
             .map_err(|e| ChainError::InternalError(format!("failed to open database: {}", e)))?;
         self.db.add_indices()?;
-        // Bring up the arena mirror now, before any write, so every ported
-        // mutation is reflected. A no-op unless the arena-shadow feature is on.
-        self.db.enable_shadow()?;
 
         // Pure-Rust view of the genesis: the arena is authored directly from this,
         // and the schedule/timestamp below are read from it, so the initial state
         // never routes through C++.
-        let rust_genesis = pulsevm_ffi::GenesisState::from_bytes(genesis_bytes)?;
+        let rust_genesis = pulsevm_database::GenesisState::from_bytes(genesis_bytes)?;
         self.chain_id = chain_id.clone();
 
         // The chain id is sha256(fc::raw::pack(genesis)); derive it from the
@@ -336,6 +340,7 @@ impl Controller {
         // must agree, or the genesis blob and the chain it is meant to bring up
         // have diverged — surface that rather than run under a silent mismatch.
         let derived_chain_id = Id::new(rust_genesis.compute_chain_id());
+        self.genesis_chain_id = derived_chain_id.clone();
         if &derived_chain_id != chain_id {
             warn!(
                 "genesis-derived chain id {} does not match the configured chain id {}",
@@ -513,10 +518,8 @@ impl Controller {
     }
 
     pub fn shutdown(&mut self) -> Result<(), ChainError> {
-        // Release the pending chain's live undo sessions before the database is
-        // torn down. `close()` destroys the chainbase indices the sessions point
-        // into, so leaving them live would make their destructors (and `Drop`)
-        // touch freed memory.
+        // Release the pending chain's live undo sessions before closing the
+        // database so shutdown leaves no speculative state behind.
         self.clear_pending()?;
 
         // Explicitly close the database
@@ -1000,9 +1003,14 @@ impl Controller {
 
         // The block's arena session is retained (not undone); the commit below
         // collapses it into the accepted state.
-        self.block_log
-            .as_ref()
-            .map(|log| log.append(block_id.clone(), &packed_block));
+        if let Some(log) = self.block_log.as_ref() {
+            log.append(block_id.clone(), &packed_block).map_err(|e| {
+                ChainError::InternalError(format!(
+                    "failed to append block {} to block log: {}",
+                    block_id, e
+                ))
+            })?;
+        }
         self.store_traces(block_id, &transaction_traces)?;
         self.store_chain_state(block_id)?;
         self.verified_blocks.remove(block_id);
@@ -1461,8 +1469,7 @@ impl Controller {
 
     // ----- state sync (Avalanche StateSyncableVM) -------------------------
     //
-    // chainbase has no object serializer and its SHiP delta stream is lossy for
-    // reconstruction, so state moves as a physical copy of the arena file (see
+    // The arena checkpoint is the canonical physical state payload (see
     // `Database::snapshot_bytes`). The summary itself is a small commitment; the
     // snapshot payload is fetched separately, chunk by chunk, over the AppRequest
     // channel (see `crate::chain::state_sync` and the node's sync manager). The
@@ -1577,12 +1584,12 @@ impl Controller {
         self.clear_pending()?;
         self.verified_blocks.clear();
 
-        // The chainbase revision advances one per accepted block, so the
+        // The database revision advances one per accepted block, so the
         // snapshot's revision must equal the summary block's height. Check it
         // from the header first: a mismatch means the summary paired a block with
         // a snapshot of different state, and we reject it before the swap rather
         // than half-adopt an inconsistent tip.
-        let header = pulsevm_ffi::peek_snapshot_header(envelope)?;
+        let header = pulsevm_database::peek_snapshot_header(envelope)?;
         if header.revision as u64 != block.block_num() as u64 {
             return Err(ChainError::InternalError(format!(
                 "snapshot revision {} does not match summary block height {}",
@@ -1591,7 +1598,7 @@ impl Controller {
             )));
         }
 
-        // Swap chainbase to the snapshot's state; its revision becomes the
+        // Restore the arena to the snapshot state; its revision becomes the
         // snapshot height.
         self.db.restore_from_bytes(envelope)?;
 
@@ -1793,10 +1800,20 @@ impl Controller {
         }
     }
 
-    pub fn store_chain_state(&mut self, _block_id: &Id) -> Result<(), ChainError> {
-        // SHiP chain-state deltas were packed from chainbase. The arena is now the
-        // sole writer and does not yet emit deltas, so there is nothing to pack
-        // here (delta-packing over the arena is a follow-up).
+    pub fn store_chain_state(&mut self, block_id: &Id) -> Result<(), ChainError> {
+        let Some(log) = self.chain_state_log.as_ref() else {
+            // No-op only when the state-history log is absent.
+            return Ok(());
+        };
+        // The first appended block gets a full snapshot; later blocks get the
+        // per-block delta from the still-open undo session. Called before
+        // `db.commit`, so removed rows are still resolvable.
+        let full_snapshot = log.range().is_none();
+        let chain_id = self.genesis_chain_id.0.0;
+        let deltas = self.db.pack_deltas(full_snapshot, &chain_id);
+        log.append(block_id.clone(), &deltas).map_err(|e| {
+            ChainError::InternalError(format!("failed to append to chain state log: {}", e))
+        })?;
         Ok(())
     }
 
@@ -1957,7 +1974,7 @@ mod tests {
         vec,
     };
 
-    use pulsevm_ffi::{
+    use pulsevm_database::{
         Authority,
         KeyWeight,
         TimePointSec,
@@ -1978,20 +1995,14 @@ mod tests {
     use crate::{
         ACTIVE_NAME,
         chain::{
-            abi::AbiDefinition,
             asset::{
                 Asset,
                 Symbol,
             },
             authority::PermissionLevel,
             pulse_contract::{
-                DeleteAuth,
-                LinkAuth,
                 NewAccount,
-                SetAbi,
                 SetCode,
-                UnlinkAuth,
-                UpdateAuth,
             },
             transaction::{
                 Action,
@@ -2199,151 +2210,6 @@ mod tests {
                     vm_type: 0,
                     vm_version: 0,
                     code: Arc::new(wasm_bytes.into()),
-                }
-                .pack()
-                .unwrap(),
-                vec![PermissionLevel::new(account.as_u64(), ACTIVE_NAME.as_u64())],
-            )],
-        )
-        .sign(&private_key, &chain_id)?;
-        let packed_trx = PackedTransaction::from_signed_transaction(trx)?;
-        Ok(packed_trx)
-    }
-
-    fn set_abi(
-        private_key: &PrivateKey,
-        account: Name,
-        abi_bytes: Vec<u8>,
-        chain_id: Id,
-    ) -> Result<PackedTransaction, ChainError> {
-        let trx = Transaction::new(
-            TransactionHeader::new(TimePointSec::maximum(), 0, 0, 0u32.into(), 0, 0u32.into()),
-            vec![],
-            vec![Action::new(
-                Name::from_str("pulse").unwrap(),
-                Name::from_str("setabi").unwrap(),
-                SetAbi {
-                    account,
-                    abi: Arc::new(abi_bytes.into()),
-                }
-                .pack()
-                .unwrap(),
-                vec![PermissionLevel::new(account.as_u64(), ACTIVE_NAME.as_u64())],
-            )],
-        )
-        .sign(&private_key, &chain_id)?;
-        let packed_trx = PackedTransaction::from_signed_transaction(trx)?;
-        Ok(packed_trx)
-    }
-
-    fn update_auth(
-        private_key: &PrivateKey,
-        account: Name,
-        permission: Name,
-        parent: Name,
-        threshold: u32,
-        chain_id: Id,
-    ) -> Result<PackedTransaction, ChainError> {
-        let trx = Transaction::new(
-            TransactionHeader::new(TimePointSec::maximum(), 0, 0, 0u32.into(), 0, 0u32.into()),
-            vec![],
-            vec![Action::new(
-                Name::from_str("pulse").unwrap(),
-                Name::from_str("updateauth").unwrap(),
-                UpdateAuth {
-                    account,
-                    permission,
-                    parent,
-                    auth: Authority::new(
-                        threshold,
-                        vec![KeyWeight::new(private_key.get_public_key().into_k1(), 1)],
-                        vec![],
-                        vec![],
-                    ),
-                }
-                .pack()
-                .unwrap(),
-                vec![PermissionLevel::new(account.as_u64(), ACTIVE_NAME.as_u64())],
-            )],
-        )
-        .sign(&private_key, &chain_id)?;
-        let packed_trx = PackedTransaction::from_signed_transaction(trx)?;
-        Ok(packed_trx)
-    }
-
-    fn link_auth(
-        private_key: &PrivateKey,
-        account: Name,
-        code: Name,
-        message_type: Name,
-        requirement: Name,
-        chain_id: Id,
-    ) -> Result<PackedTransaction, ChainError> {
-        let trx = Transaction::new(
-            TransactionHeader::new(TimePointSec::maximum(), 0, 0, 0u32.into(), 0, 0u32.into()),
-            vec![],
-            vec![Action::new(
-                Name::from_str("pulse").unwrap(),
-                Name::from_str("linkauth").unwrap(),
-                LinkAuth {
-                    account,
-                    code,
-                    message_type,
-                    requirement,
-                }
-                .pack()
-                .unwrap(),
-                vec![PermissionLevel::new(account.as_u64(), ACTIVE_NAME.as_u64())],
-            )],
-        )
-        .sign(&private_key, &chain_id)?;
-        let packed_trx = PackedTransaction::from_signed_transaction(trx)?;
-        Ok(packed_trx)
-    }
-
-    fn unlink_auth(
-        private_key: &PrivateKey,
-        account: Name,
-        code: Name,
-        message_type: Name,
-        chain_id: Id,
-    ) -> Result<PackedTransaction, ChainError> {
-        let trx = Transaction::new(
-            TransactionHeader::new(TimePointSec::maximum(), 0, 0, 0u32.into(), 0, 0u32.into()),
-            vec![],
-            vec![Action::new(
-                Name::from_str("pulse").unwrap(),
-                Name::from_str("unlinkauth").unwrap(),
-                UnlinkAuth {
-                    account,
-                    code,
-                    message_type,
-                }
-                .pack()
-                .unwrap(),
-                vec![PermissionLevel::new(account.as_u64(), ACTIVE_NAME.as_u64())],
-            )],
-        )
-        .sign(&private_key, &chain_id)?;
-        let packed_trx = PackedTransaction::from_signed_transaction(trx)?;
-        Ok(packed_trx)
-    }
-
-    fn delete_auth(
-        private_key: &PrivateKey,
-        account: Name,
-        permission: Name,
-        chain_id: Id,
-    ) -> Result<PackedTransaction, ChainError> {
-        let trx = Transaction::new(
-            TransactionHeader::new(TimePointSec::maximum(), 0, 0, 0u32.into(), 0, 0u32.into()),
-            vec![],
-            vec![Action::new(
-                Name::from_str("pulse").unwrap(),
-                Name::from_str("deleteauth").unwrap(),
-                DeleteAuth {
-                    account,
-                    permission,
                 }
                 .pack()
                 .unwrap(),
@@ -2908,7 +2774,7 @@ mod tests {
     fn reconstruct_testnet_block2_header_id() {
         let hexd = |s: &str| -> [u8; 32] { hex::decode(s).unwrap().try_into().unwrap() };
         let header = BlockHeader {
-            timestamp: pulsevm_ffi::BlockTimestamp { slot: 1676935919 },
+            timestamp: pulsevm_database::BlockTimestamp { slot: 1676935919 },
             producer: Name::from_str("pulse").unwrap(),
             confirmed: 0,
             previous: Id::from_str(
@@ -2975,7 +2841,7 @@ mod tests {
 
         let hexd32 = |s: &str| -> [u8; 32] { hex::decode(s).unwrap().try_into().unwrap() };
         let header = BlockHeader {
-            timestamp: pulsevm_ffi::BlockTimestamp {
+            timestamp: pulsevm_database::BlockTimestamp {
                 slot: iso_to_slot(r["timestamp"].as_str().unwrap()),
             },
             producer: Name::from_str(r["producer"].as_str().unwrap())?,
@@ -3106,11 +2972,10 @@ mod tests {
     }
 
     /// Replay real testnet blocks (fetched via scripts/fetch-blocks.sh into
-    /// PULSEVM_RPC_BLOCKS_DIR) into a fresh node with the arena shadow on, and
-    /// after every block assert the cross-impl full-state root — C++ chainbase
-    /// vs the Rust arena — over all twelve tables. Ignored by default; reports
-    /// exactly how far it stays 1:1 and the first divergence (mirror mismatch,
-    /// merkle-root mismatch, or an unexecutable tx) if any.
+    /// PULSEVM_RPC_BLOCKS_DIR) into a fresh node. When
+    /// `PULSEVM_GOLDEN_ROOTS` is set, every table's state root must match the
+    /// frozen reference value. Ignored by default because the block corpus is
+    /// external to the repository.
     #[tokio::test]
     #[ignore]
     async fn replay_testnet_blocks() -> Result<(), ChainError> {
@@ -3228,30 +3093,24 @@ mod tests {
             }],
         };
 
-        // Incremental durability: append the mirror's delta to a WAL after every
+        // Incremental durability: append the database delta to a WAL after every
         // accepted block, exactly as a running node would, so the crash-recovery
         // reconstruction at the end runs over a real per-block flush cadence.
         let wal = temp.path().join("arena.wal");
         let ckpt = temp.path().join("arena_checkpoint.bin");
 
-        // Restart the mirror once around the middle of the run to prove it
-        // resumes from disk and keeps matching chainbase afterward.
+        // Restart the database once around the middle of the run to prove it
+        // resumes from disk and continues replaying afterward.
         let restart_at = start + (files.len() as u32) / 2;
         let mut restarted = false;
-        let mut restart_block = 0u32;
 
-        // Golden per-block arena roots. `PULSEVM_GOLDEN_ROOTS` names a file: if it
-        // exists, verify each block's arena root against it and SKIP the live
-        // chainbase cross-checks (used by the standalone-write replay, where
-        // chainbase is never written and can't be the oracle); if it is set but
-        // absent, record the roots for a later verify run. A per-block root is a
-        // stable fingerprint over every arena table's canonical state bytes.
+        // Golden per-block arena roots. `PULSEVM_GOLDEN_ROOTS` names a frozen
+        // reference file. A per-block root is a stable fingerprint over every
+        // arena table's canonical state bytes.
         let golden_file = std::env::var("PULSEVM_GOLDEN_ROOTS").ok();
         // Per-(block, table) roots, so a mismatch names the exact diverging table.
-        let golden_roots: Option<std::collections::HashMap<(u32, String), u64>> = golden_file
-            .as_ref()
-            .filter(|p| Path::new(p).exists())
-            .map(|p| {
+        let golden_roots: Option<std::collections::HashMap<(u32, String), u64>> =
+            golden_file.as_ref().map(|p| {
                 fs::read_to_string(p)
                     .expect("read golden roots")
                     .lines()
@@ -3264,10 +3123,24 @@ mod tests {
                     })
                     .collect()
             });
-        let mut recorded: Option<Vec<(u32, String, u64)>> = match &golden_file {
-            Some(_) if golden_roots.is_none() => Some(Vec::new()),
-            _ => None,
-        };
+        // SHiP delta verify: `PULSEVM_SHIP_VERIFY` names the gunzipped golden
+        // (`<block_num> <hex>` per line, captured from the C++ `pack_deltas`).
+        // Each block's chain-state deltas, read back out of the log after accept,
+        // must reproduce the golden line byte-for-byte.
+        let ship_golden: Option<std::collections::HashMap<u32, Vec<u8>>> =
+            std::env::var("PULSEVM_SHIP_VERIFY").ok().map(|p| {
+                fs::read_to_string(&p)
+                    .expect("read ship golden")
+                    .lines()
+                    .filter_map(|l| {
+                        let mut it = l.split_whitespace();
+                        let n: u32 = it.next()?.parse().ok()?;
+                        let bytes = hex::decode(it.next()?).ok()?;
+                        Some((n, bytes))
+                    })
+                    .collect()
+            });
+        let mut ship_verified = 0u32;
 
         let mut replayed = 0u32;
         for f in &files {
@@ -3290,9 +3163,37 @@ mod tests {
             controller.set_preferred_id(block.id()?);
             controller.database().arena_flush_delta(&wal)?;
 
-            // Golden-mode roots read the arena alone (chainbase writes may be
-            // skipped and it is not the oracle here), so build the arena-only
-            // tables — the path that survives the bridge removal.
+            // Read this block's chain-state deltas back out of the log and check
+            // them against the C++ golden, byte-for-byte.
+            if let Some(golden) = &ship_golden {
+                let got = controller
+                    .chain_state_log()
+                    .expect("chain state log")
+                    .read_block(n)
+                    .unwrap_or_else(|e| panic!("read chain_state_log block {n}: {e:?}"));
+                match golden.get(&n) {
+                    Some(want) if want == &got => ship_verified += 1,
+                    Some(want) => {
+                        let at = got
+                            .iter()
+                            .zip(want.iter())
+                            .position(|(a, b)| a != b)
+                            .unwrap_or(want.len().min(got.len()));
+                        let lo = at.saturating_sub(8);
+                        panic!(
+                            "SHiP delta mismatch at block {n}: got {} bytes, want {} bytes; \
+                             first diff at offset {at}\n  got : {}\n  want: {}",
+                            got.len(),
+                            want.len(),
+                            hex::encode(&got[lo..(at + 16).min(got.len())]),
+                            hex::encode(&want[lo..(at + 16).min(want.len())]),
+                        );
+                    }
+                    None => panic!("SHiP golden has no entry for block {n}"),
+                }
+            }
+
+            // Build the canonical bytes for every arena table.
             let tables = arena_impl_tables(&controller.database())?;
 
             // Per-table arena root: a fingerprint over one arena table's canonical
@@ -3307,9 +3208,7 @@ mod tests {
                 h.finish()
             };
 
-            // Golden-verify mode: chainbase is not the oracle (its writes may be
-            // skipped), so check each arena table against the recorded set instead
-            // of the live cross-impl diff.
+            // Check each arena table against the frozen reference set.
             if let Some(golden) = &golden_roots {
                 let mut mismatch = None;
                 for (name, arena) in &tables {
@@ -3329,31 +3228,22 @@ mod tests {
                 if !restarted && n >= restart_at {
                     assert!(
                         controller.database().arena_restart(&ckpt)?,
-                        "arena restart should run with the shadow enabled"
+                        "arena restart should reload the database"
                     );
                     restarted = true;
-                    restart_block = n;
                 }
                 continue;
             }
-            if let Some(rec) = &mut recorded {
-                for (name, arena) in &tables {
-                    rec.push((n, name.to_string(), table_root(arena)));
-                }
-            }
             replayed = n;
 
-            // Restart the mirror once, mid-chain: checkpoint it, drop the live
-            // state, reload from disk, and keep going. Every following block still
-            // has to match chainbase, which only holds if the reloaded revision
-            // and rows line up exactly — the node-reboot guarantee.
+            // Restart once, mid-chain: checkpoint, drop the live state, reload
+            // from disk, and keep going.
             if !restarted && n >= restart_at {
                 assert!(
                     controller.database().arena_restart(&ckpt)?,
-                    "arena restart should run with the shadow enabled"
+                    "arena restart should reload the database"
                 );
                 restarted = true;
-                restart_block = n;
             }
         }
 
@@ -3367,44 +3257,34 @@ mod tests {
              fixture/harness mismatch"
         );
 
-        // RPC golden capture: with both backends populated by the cross-check run,
-        // freeze the C++ RPC formatter outputs (and the raw rows + ABIs) over the
-        // real contract state, so the arena reimplementation and the Rust ABI
-        // serializer can be built and validated against them once the bridge is
-        // gone. Opt-in and terminal — it does not touch the read/persistence
-        // checks below.
+        if let Some(golden) = &ship_golden {
+            assert!(
+                ship_verified > 0,
+                "SHiP verify was requested but no blocks were checked"
+            );
+            eprintln!(
+                "SHiP chain-state deltas matched the C++ golden byte-for-byte for {ship_verified} blocks \
+                 (golden has {} entries)",
+                golden.len()
+            );
+        }
+
+        // RPC fixture capture is opt-in and terminal.
         if let Ok(out) = std::env::var("PULSEVM_CAPTURE_RPC") {
             capture_rpc_golden(&controller, &out)?;
             return Ok(());
         }
 
-        // RPC verify: re-serve each captured formatter query off the arena and
-        // require it to reproduce the frozen C++ output (semantic JSON equality).
-        // This proves the arena-backed formatters, end to end, before the bridge
-        // is removed.
+        // Re-serve each captured formatter query and require semantic equality
+        // with the frozen reference output.
         if let Ok(golden) = std::env::var("PULSEVM_VERIFY_RPC") {
             verify_rpc_golden(&controller, &golden)?;
             return Ok(());
         }
 
-        // Record the golden roots (verified this run by the live cross-check) for a
-        // later standalone-write verify run.
-        if let (Some(path), Some(rec)) = (&golden_file, &recorded) {
-            let body: String = rec
-                .iter()
-                .map(|(n, t, r)| format!("{n} {t} {r:016x}\n"))
-                .collect();
-            fs::write(path, body).expect("write golden roots");
-            eprintln!("recorded {} golden arena roots to {}", rec.len(), path);
-        }
-
-        // Golden-verify mode ran with chainbase writes skipped, so the read-surface
-        // and persistence cross-checks below — which all read chainbase — don't
-        // apply. The per-block arena-root match against the golden set is the proof
-        // that the arena reproduced the whole chain on its own.
         if golden_roots.is_some() {
             eprintln!(
-                "replayed real testnet blocks up to {replayed} on the ARENA ALONE (chainbase writes skipped); every per-block arena state root matched the golden set recorded from the cross-checked run"
+                "replayed real testnet blocks up to {replayed}; every per-block arena state root matched the frozen reference set"
             );
             return Ok(());
         }
@@ -4250,7 +4130,7 @@ mod tests {
         ];
 
         for (label, wasm) in cases {
-            let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
+            let (mut controller, private_key, _chain_id, _temp) = init_test_controller()?;
             let ts = controller.last_accepted_block().timestamp().clone();
             let chain_id = controller.chain_id().clone();
             let st = BlockStatus::Building;

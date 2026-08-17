@@ -103,8 +103,6 @@ mod tests {
 
     #[test]
     fn varint_num_bytes() {
-        use core::i32;
-
         // 1-byte window: [-64, 63]
         assert_eq!(VarInt32(0).num_bytes(), 1);
         assert_eq!(VarInt32(1).num_bytes(), 1);
@@ -190,12 +188,12 @@ mod tests {
         p = 0;
         assert_eq!(
             VarInt32::read(&[0xFF, 0xFF, 0xFF, 0xFF, 0x07], &mut p).unwrap(),
-            VarInt32(core::i32::MAX)
+            VarInt32(i32::MAX)
         );
         p = 0;
         assert_eq!(
             VarInt32::read(&[0x80, 0x80, 0x80, 0x80, 0x78], &mut p).unwrap(),
-            VarInt32(core::i32::MIN)
+            VarInt32(i32::MIN)
         );
     }
 

@@ -360,7 +360,7 @@ impl Vm for VirtualMachine {
         let mut controller = controller.write().await;
         controller
             .shutdown()
-            .map_err(|e| Status::internal(format!("could not shutdown controller: {}", e)));
+            .map_err(|e| Status::internal(format!("could not shutdown controller: {}", e)))?;
         Ok(Response::new(()))
     }
 

@@ -240,10 +240,9 @@ fn bench_open_breakdown(c: &mut Criterion) {
 
     // The part mmap removes: materialize the raw row slab (a bulk copy).
     let slab: Vec<Account> = (0..rows)
-        .map(|i| {
-            let mut a = Account::default();
-            a.name = i;
-            a
+        .map(|i| Account {
+            name: i,
+            ..Account::default()
         })
         .collect();
     group.bench_function(BenchmarkId::new("raw_row_copy", rows), |b| {

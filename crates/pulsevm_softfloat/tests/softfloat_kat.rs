@@ -1,13 +1,13 @@
 //! Known-answer regression test for the pure-Rust softfloat port.
 //!
 //! `softfloat_kat.txt` was frozen from the C++ Berkeley SoftFloat oracle (see
-//! `pulsevm_ffi/tests/capture_golden_kat.rs`); every vector was asserted equal
+//! `pulsevm_database/tests/capture_golden_kat.rs`); every vector was asserted equal
 //! between this port and C++ at capture time. This test replays the same inputs
 //! through the port and requires the recorded answers, so it keeps the
 //! consensus-critical softfloat routines pinned after the C++ bridge is gone.
 //!
-//! Regenerate with `PULSEVM_CAPTURE_KAT=1 cargo test -p pulsevm_ffi
-//! --features arena-shadow --test capture_golden_kat` while the bridge exists.
+//! Regenerate with `PULSEVM_CAPTURE_KAT=1 cargo test -p pulsevm_database
+//! --test capture_golden_kat` while the bridge exists.
 
 use pulsevm_softfloat as rs;
 

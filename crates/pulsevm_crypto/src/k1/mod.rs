@@ -2,7 +2,7 @@
 //! signature and private-key formats.
 //!
 //! This mirrors, byte-for-byte, the `fc::crypto` C++ implementation that the
-//! `pulsevm_ffi` cxx bridge currently wraps. It is consensus-critical: the
+//! `pulsevm_database` cxx bridge currently wraps. It is consensus-critical: the
 //! packed and string encodings, the recovered public keys and the canonical
 //! signature predicate must all match the C++ oracle exactly.
 //!

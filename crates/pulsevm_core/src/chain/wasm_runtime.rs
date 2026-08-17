@@ -9,11 +9,11 @@ use std::{
 
 use lru::LruCache;
 use pulsevm_crypto::Bytes;
-use pulsevm_error::ChainError;
-use pulsevm_ffi::{
+use pulsevm_database::{
     BlockTimestamp,
     Database,
 };
+use pulsevm_error::ChainError;
 use wasmer::{
     AsStoreMut,
     Engine,
@@ -1140,7 +1140,7 @@ mod tests {
         );
 
         // sweep a sized intrinsic, fit, and print its candidate constants.
-        let mut report_sized = |name: &str, shipped_base: u64, mut work: Box<dyn FnMut(&[u8])>| {
+        let report_sized = |name: &str, shipped_base: u64, mut work: Box<dyn FnMut(&[u8])>| {
             let data: Vec<(f64, f64)> = sizes
                 .iter()
                 .map(|&s| {
@@ -1442,7 +1442,7 @@ mod tests {
             "operator", "ns/op", "points", "shipped"
         );
 
-        let mut row = |name: &str, ns: f64, shipped: u64| {
+        let row = |name: &str, ns: f64, shipped: u64| {
             let note = if ns < floor {
                 "folded (kept)"
             } else {
@@ -1527,7 +1527,7 @@ mod tests {
     //   cargo test -p pulsevm_core --lib estimate_db_intrinsic_costs \
     //     -- --ignored --nocapture
     //
-    // The db intrinsics do native FFI/chainbase work invisible to wasm metering, so
+    // The db intrinsics do native database work invisible to wasm metering, so
     // like the crypto intrinsics they bill themselves and get the same 3x safety
     // multiplier. We time the real work directly on a populated table (Database +
     // KeyValueIteratorCache, the same path db_find_i64/db_next_i64/db_store_i64

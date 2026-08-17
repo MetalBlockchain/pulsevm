@@ -68,6 +68,7 @@ impl K1PublicKey {
     }
 
     /// The `PUB_K1_...` string form.
+    #[allow(clippy::inherent_to_string_shadow_display)]
     pub fn to_string(&self) -> String {
         format!("PUB_K1_{}", encode_b58_checked(&self.compressed, K1_SUFFIX))
     }

@@ -78,6 +78,7 @@ impl K1PrivateKey {
     }
 
     /// The modern `PVT_K1_...` string form.
+    #[allow(clippy::inherent_to_string)]
     pub fn to_string(&self) -> String {
         let scalar = self.scalar();
         format!("PVT_K1_{}", encode_b58_checked(&scalar, K1_SUFFIX))

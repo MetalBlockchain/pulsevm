@@ -261,7 +261,7 @@ mod tests {
 
     /// Known-answer for `compute_chain_id`, frozen from the C++
     /// `genesis_state::compute_chain_id` oracle (see
-    /// `pulsevm_ffi/tests/genesis_chain_id_cross_validation.rs`). Guards the
+    /// `pulsevm_database/tests/genesis_chain_id_cross_validation.rs`). Guards the
     /// fc-pack layout after the bridge is gone.
     #[test]
     fn chain_id_matches_frozen_oracle() {
