@@ -577,12 +577,12 @@ impl Controller {
         // recompute in `execute_block`.
         let producer = self.node_config.as_ref().unwrap().producer_name;
         let previous = self.preferred_id;
-        action_receipt_digests.extend(self.run_onblock(
-            &timestamp,
-            producer,
-            previous,
-            &block_status,
-        )?);
+        let (onblock_digests, onblock_schedule) =
+            self.run_onblock(&timestamp, producer, previous, &block_status)?;
+        action_receipt_digests.extend(onblock_digests);
+        // onblock's proposal counts like any transaction's (eosio.system elects
+        // producers from there); a later transaction's proposal overrides it.
+        proposed_schedule = onblock_schedule;
 
         // Get transactions from the mempool
         while let Some(transaction) = mempool.pop_transaction() {
@@ -1111,6 +1111,12 @@ impl Controller {
     // chain: it runs in its own child session that is discarded on failure, and
     // a failure yields no digests (identical on every node, since it is
     // deterministic), so the merkles still agree.
+    //
+    // Besides the digests, the result carries any producer schedule the onblock
+    // action proposed. eosio.system calls set_proposed_producers exclusively
+    // from onblock (update_elected_producers), so the caller must fold this into
+    // the block's proposal like any transaction's — dropping it would sever the
+    // voting path from the chain and the schedule would never change.
     // Hand the transaction context the producer schedule in force for this block
     // (names + version), so `get_active_producers` returns the active set and
     // `set_proposed_producers` reports the right next version.
@@ -1130,7 +1136,7 @@ impl Controller {
         producer: Name,
         previous: Id,
         block_status: &BlockStatus,
-    ) -> Result<VecDeque<Digest>, ChainError> {
+    ) -> Result<(VecDeque<Digest>, Option<Vec<ProducerKey>>), ChainError> {
         let header = BlockHeader {
             timestamp: timestamp.clone(),
             producer,
@@ -1176,25 +1182,25 @@ impl Controller {
         );
         self.set_context_active_schedule(&trx_context)?;
 
-        let executed = (|| -> Result<VecDeque<Digest>, ChainError> {
+        let executed = (|| -> Result<TransactionResult, ChainError> {
             trx_context.init_for_implicit_trx(&trx)?;
             trx_context.exec(&trx)?;
-            Ok(trx_context.finalize()?.action_receipt_digests)
+            trx_context.finalize()
         })();
 
         match executed {
-            Ok(digests) => {
+            Ok(result) => {
                 session.pin_mut().squash().map_err(|e| {
                     ChainError::DatabaseError(format!("failed to commit onblock: {}", e))
                 })?;
-                Ok(digests)
+                Ok((result.action_receipt_digests, result.proposed_schedule))
             }
             Err(e) => {
                 warn!("onblock failed, skipping: {}", e);
                 session.pin_mut().undo().map_err(|e| {
                     ChainError::DatabaseError(format!("failed to undo onblock: {}", e))
                 })?;
-                Ok(VecDeque::new())
+                Ok((VecDeque::new(), None))
             }
         }
     }
@@ -1225,12 +1231,17 @@ impl Controller {
 
         // onblock heads the block: its action digests precede every transaction's.
         let header = &block.signed_block_header.header;
-        action_receipt_digests.extend(self.run_onblock(
+        let (onblock_digests, onblock_schedule) = self.run_onblock(
             &header.timestamp,
             header.producer,
             header.previous,
             block_status,
-        )?);
+        )?;
+        action_receipt_digests.extend(onblock_digests);
+        // Mirror build_block: onblock's proposal counts like any transaction's,
+        // overridden by a later transaction's — keeping verify's re-execution in
+        // agreement with what the producer folded into the header.
+        proposed_schedule = onblock_schedule;
 
         for receipt in &block.transactions {
             // Verify the transaction
@@ -7203,6 +7214,282 @@ mod tests {
         Ok(())
     }
 
+    // The election loop end to end: a privileged contract calls
+    // set_proposed_producers, the built block carries the new schedule in its
+    // signed header, and accepting that block both activates the schedule and
+    // rewrites the pulse.prods producer permissions to match it. Activation is
+    // an accept-time effect — after build but before accept, the schedule and
+    // the permissions must still be exactly what they were.
+    #[tokio::test]
+    async fn set_proposed_producers_activates_schedule_and_updates_authority()
+    -> Result<(), ChainError> {
+        let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
+        let mut mempool = Mempool::new();
+
+        // Proposed producers must be real accounts. Five of them make the three
+        // thresholds distinct: more than 2/3 → 4, more than 1/2 → 3, more than
+        // 1/3 → 2.
+        let admin = Name::from_str("prodadmin")?;
+        let electees = ["alice", "bob", "carol", "dave"]
+            .iter()
+            .map(|name| Name::from_str(name))
+            .collect::<Result<Vec<_>, ChainError>>()?;
+        mempool.add_transaction(create_account(&private_key, admin, chain_id)?);
+        for name in &electees {
+            mempool.add_transaction(create_account(&private_key, *name, chain_id)?);
+        }
+        mempool.add_transaction(set_code(
+            &private_key,
+            admin,
+            crate::wat2wasm(PROPOSE_PRODUCERS_WAT).expect("valid WAT"),
+            chain_id,
+        )?);
+        let block = controller.build_block(&mut mempool).await?;
+        controller.accept_block(&block.id()?, &mut mempool)?;
+        // Mirror consensus: move the preference to the accepted tip so the next
+        // block builds on it.
+        controller.set_preferred_id(block.id()?);
+
+        // set_proposed_producers is privileged; make the contract account so.
+        controller.database().set_privileged(admin.as_u64(), true)?;
+
+        let read_authority =
+            |controller: &Controller, permission_name: Name| -> Result<Authority, ChainError> {
+                let db = controller.db.read()?;
+                Ok(AuthorizationManager::get_permission(
+                    &db,
+                    PRODS_NAME.into(),
+                    permission_name.into(),
+                )?
+                .get_authority()
+                .to_authority())
+            };
+        let genesis_authorities = [
+            read_authority(&controller, ACTIVE_NAME)?,
+            read_authority(&controller, MAJORITY_PRODUCERS_PERMISSION_NAME)?,
+            read_authority(&controller, MINORITY_PRODUCERS_PERMISSION_NAME)?,
+        ];
+
+        // Elect the four new accounts alongside pulse, through the contract.
+        let proposed: Vec<ProducerKey> = electees
+            .iter()
+            .map(|name| ProducerKey {
+                producer_name: *name,
+                block_signing_key: PrivateKey::random().get_public_key(),
+            })
+            .chain(std::iter::once(ProducerKey {
+                producer_name: PULSE_NAME,
+                block_signing_key: private_key.get_public_key(),
+            }))
+            .collect();
+        mempool.add_transaction(push_action(
+            &private_key,
+            admin,
+            Name::from_str("run")?,
+            proposed.pack().unwrap(),
+            chain_id,
+        )?);
+        let block = controller.build_block(&mut mempool).await?;
+
+        // The built block advertises the change in its signed header, versioned
+        // as the successor of the parent schedule.
+        let header_schedule = block
+            .signed_block_header
+            .header
+            .new_schedule()?
+            .expect("built block must carry the proposed schedule in its header");
+        assert_eq!(header_schedule.version, 1);
+        assert_eq!(header_schedule.producers, proposed);
+
+        // Nothing has activated yet: the schedule and every pulse.prods
+        // permission still read exactly as they did before the proposal ran.
+        assert_eq!(controller.active_schedule.version, 0);
+        assert_eq!(
+            read_authority(&controller, ACTIVE_NAME)?,
+            genesis_authorities[0],
+            "pulse.prods@active must not change before the block is accepted"
+        );
+
+        controller.accept_block(&block.id()?, &mut mempool)?;
+
+        // Accepting the block activates the schedule...
+        assert_eq!(
+            controller.active_schedule,
+            ProducerSchedule {
+                version: 1,
+                producers: proposed.clone(),
+            },
+            "accepting the schedule-carrying block must activate the schedule"
+        );
+
+        // ...and rewrites the producer-gated permissions to require the new set.
+        let expected_accounts: Vec<PermissionLevelWeight> = proposed
+            .iter()
+            .map(|producer| {
+                PermissionLevelWeight::new(
+                    PermissionLevel::new(producer.producer_name.into(), ACTIVE_NAME.into()),
+                    1,
+                )
+            })
+            .collect();
+        let expectations = [
+            (ACTIVE_NAME, 4u32),
+            (MAJORITY_PRODUCERS_PERMISSION_NAME, 3u32),
+            (MINORITY_PRODUCERS_PERMISSION_NAME, 2u32),
+        ];
+        for (i, (permission_name, threshold)) in expectations.into_iter().enumerate() {
+            let authority = read_authority(&controller, permission_name)?;
+            assert_ne!(
+                authority, genesis_authorities[i],
+                "pulse.prods@{} must have been rewritten by the schedule change",
+                permission_name
+            );
+            assert_eq!(
+                authority,
+                Authority::new(threshold, vec![], expected_accounts.clone(), vec![]),
+                "pulse.prods@{} must require {} of the 5 elected producers",
+                permission_name,
+                threshold
+            );
+        }
+
+        Ok(())
+    }
+
+    // A contract for the `pulse` account that proposes a fixed producer schedule
+    // from inside the implicit onblock action — the shape of eosio.system's
+    // update_elected_producers, the only place the real system contract calls
+    // set_proposed_producers. The packed schedule is baked into the data
+    // segment; the action-name guard keeps native actions dispatched to pulse
+    // from proposing.
+    fn onblock_proposer_wat(packed_schedule: &[u8]) -> String {
+        let data: String = packed_schedule
+            .iter()
+            .map(|b| format!("\\{:02x}", b))
+            .collect();
+        format!(
+            r#"
+            (module
+              (import "env" "set_proposed_producers" (func $spp (param i32 i32) (result i64)))
+              (memory 1)
+              (export "memory" (memory 0))
+              (data (i32.const 0) "{data}")
+              (func (export "apply") (param $receiver i64) (param $code i64) (param $action i64)
+                (if (i64.eq (local.get $action) (i64.const {onblock}))
+                  (then (drop (call $spp (i32.const 0) (i32.const {len})))))))
+            "#,
+            onblock = ONBLOCK_NAME.as_u64() as i64,
+            len = packed_schedule.len(),
+        )
+    }
+
+    // The voting-driven election path: eosio.system calls set_proposed_producers
+    // from inside the implicit onblock action, not from a signed transaction. A
+    // schedule proposed there must reach the block header, activate on accept,
+    // and rewrite the pulse.prods producer permissions — the node must not drop
+    // onblock's proposal on the floor.
+    #[tokio::test]
+    async fn onblock_schedule_proposal_reaches_header_and_activates() -> Result<(), ChainError> {
+        let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
+        let mut mempool = Mempool::new();
+
+        // Proposed producers must be real accounts; five (four new plus pulse)
+        // make the pulse.prods thresholds distinct (4/3/2).
+        let electees = ["alice", "bob", "carol", "dave"]
+            .iter()
+            .map(|name| Name::from_str(name))
+            .collect::<Result<Vec<_>, ChainError>>()?;
+        let proposed: Vec<ProducerKey> = electees
+            .iter()
+            .map(|name| ProducerKey {
+                producer_name: *name,
+                block_signing_key: PrivateKey::random().get_public_key(),
+            })
+            .chain(std::iter::once(ProducerKey {
+                producer_name: PULSE_NAME,
+                block_signing_key: private_key.get_public_key(),
+            }))
+            .collect();
+
+        // Block 1: create the producer accounts and deploy the proposing
+        // contract onto pulse (privileged at genesis). onblock heads the block,
+        // so it runs before this setcode and must not have proposed anything.
+        for name in &electees {
+            mempool.add_transaction(create_account(&private_key, *name, chain_id)?);
+        }
+        mempool.add_transaction(set_code(
+            &private_key,
+            PULSE_NAME,
+            crate::wat2wasm(&onblock_proposer_wat(&proposed.pack().unwrap())).expect("valid WAT"),
+            chain_id,
+        )?);
+        let block = controller.build_block(&mut mempool).await?;
+        assert!(
+            block.signed_block_header.header.new_schedule()?.is_none(),
+            "the deploy block's onblock ran before the contract existed"
+        );
+        controller.accept_block(&block.id()?, &mut mempool)?;
+        controller.set_preferred_id(block.id()?);
+
+        // Block 2 carries only an ordinary transaction; the schedule proposal
+        // can come from nowhere but the implicit onblock heading the block.
+        mempool.add_transaction(create_account(
+            &private_key,
+            Name::from_str("erin")?,
+            chain_id,
+        )?);
+        let block = controller.build_block(&mut mempool).await?;
+        let header_schedule = block
+            .signed_block_header
+            .header
+            .new_schedule()?
+            .expect("onblock's proposal must reach the block header");
+        assert_eq!(header_schedule.version, 1);
+        assert_eq!(header_schedule.producers, proposed);
+
+        controller.accept_block(&block.id()?, &mut mempool)?;
+        assert_eq!(
+            controller.active_schedule,
+            ProducerSchedule {
+                version: 1,
+                producers: proposed.clone(),
+            },
+            "accepting the block must activate onblock's proposed schedule"
+        );
+
+        // Activation must also rewrite the producer-gated permissions.
+        let expected_accounts: Vec<PermissionLevelWeight> = proposed
+            .iter()
+            .map(|producer| {
+                PermissionLevelWeight::new(
+                    PermissionLevel::new(producer.producer_name.into(), ACTIVE_NAME.into()),
+                    1,
+                )
+            })
+            .collect();
+        let db = controller.db.read()?;
+        for (permission_name, threshold) in [
+            (ACTIVE_NAME, 4u32),
+            (MAJORITY_PRODUCERS_PERMISSION_NAME, 3u32),
+            (MINORITY_PRODUCERS_PERMISSION_NAME, 2u32),
+        ] {
+            let permission = AuthorizationManager::get_permission(
+                &db,
+                PRODS_NAME.into(),
+                permission_name.into(),
+            )?;
+            assert_eq!(
+                permission.get_authority().to_authority(),
+                Authority::new(threshold, vec![], expected_accounts.clone(), vec![]),
+                "pulse.prods@{} must require {} of the 5 producers elected via onblock",
+                permission_name,
+                threshold
+            );
+        }
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn rejects_header_schedule_change_that_execution_did_not_make() -> Result<(), ChainError>
     {
@@ -7327,7 +7614,7 @@ mod tests {
 
         let timestamp: BlockTimestamp = TimePoint::now().into();
         let previous = controller.preferred_id;
-        let digests =
+        let (digests, _) =
             controller.run_onblock(&timestamp, PULSE_NAME, previous, &BlockStatus::Building)?;
         assert!(
             !digests.is_empty(),
@@ -7432,7 +7719,7 @@ mod tests {
         // come back.
         let timestamp: BlockTimestamp = TimePoint::now().into();
         let previous = controller.preferred_id;
-        let digests =
+        let (digests, _) =
             controller.run_onblock(&timestamp, PULSE_NAME, previous, &BlockStatus::Building)?;
         assert!(
             !digests.is_empty(),
