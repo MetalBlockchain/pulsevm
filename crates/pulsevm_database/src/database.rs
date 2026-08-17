@@ -2861,12 +2861,26 @@ impl Database {
         // requested symbol so the response matches nodeos' single-symbol query.
         let want = symbol_from_str(symbol)
             .ok_or_else(|| ChainError::InternalError(format!("invalid symbol: {symbol}")))?;
+        let precision_is_explicit = symbol.contains(',');
         let accounts = name_u64("accounts")?;
         let rows: Vec<Vec<u8>> = self
             .arena_table_range(code, account, accounts)
             .into_iter()
             .map(|(_pk, value)| value)
-            .filter(|v| v.len() >= 16 && u64::from_le_bytes(v[8..16].try_into().unwrap()) == want)
+            .filter(|v| {
+                if v.len() < 16 {
+                    return false;
+                }
+                let stored = u64::from_le_bytes(v[8..16].try_into().unwrap());
+                if precision_is_explicit {
+                    stored == want
+                } else {
+                    // `get_currency_balance` accepts a bare symbol code (for
+                    // example `PULSE`). Its precision comes from the stored
+                    // asset, so it must not participate in row selection.
+                    stored >> 8 == want >> 8
+                }
+            })
             .collect();
         let value = pulsevm_rpc::format_currency_balance(&rows)
             .map_err(|e| ChainError::InternalError(format!("format currency_balance: {e}")))?;
@@ -3425,6 +3439,40 @@ mod tests {
         assert_eq!(rpc_table_index(table, "primary").unwrap(), (true, table));
         assert_eq!(rpc_table_index(table, "2").unwrap(), (false, table));
         assert_eq!(rpc_table_index(table, "third").unwrap(), (false, table | 1));
+    }
+
+    #[test]
+    fn currency_balance_bare_symbol_uses_stored_precision() {
+        let dir = TempDir::new().unwrap();
+        let mut db = Database::new(dir.path().to_str().unwrap(), TEST_DB_SIZE).unwrap();
+        db.add_indices().unwrap();
+
+        let code = name_u64("pulse.token");
+        let account = name_u64("alice");
+        let accounts = name_u64("accounts");
+        let symbol_code = symbol_code_from_str("PULSE");
+        let stored_symbol = (symbol_code << 8) | 4;
+        let mut row = Vec::with_capacity(16);
+        row.extend_from_slice(&5_000_000i64.to_le_bytes());
+        row.extend_from_slice(&stored_symbol.to_le_bytes());
+        db.create_key_value_object_standalone(code, account, accounts, account, symbol_code, &row)
+            .unwrap();
+
+        assert_eq!(
+            db.get_currency_balance_with_symbol(code, account, "PULSE")
+                .unwrap(),
+            r#"["500.0000 PULSE"]"#
+        );
+        assert_eq!(
+            db.get_currency_balance_with_symbol(code, account, "4,PULSE")
+                .unwrap(),
+            r#"["500.0000 PULSE"]"#
+        );
+        assert_eq!(
+            db.get_currency_balance_with_symbol(code, account, "2,PULSE")
+                .unwrap(),
+            "[]"
+        );
     }
 
     /// The arena reconstructs the whole authority from its stored blob: encoding
