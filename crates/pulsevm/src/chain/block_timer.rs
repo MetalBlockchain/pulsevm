@@ -52,10 +52,17 @@ impl BlockTimer {
     pub async fn check_block_build(&self) {
         // Do not wake the block builder for a pool containing only expired
         // transactions. This also reclaims entries when no new gossip arrives.
-        let has_transactions = {
+        let now = TimePoint::now();
+        let expires_present = {
+            let mempool = self.mempool.read().await;
+            mempool.has_expired(&now)
+        };
+        let has_transactions = if expires_present {
             let mut mempool = self.mempool.write().await;
-            mempool.prune_expired(&TimePoint::now());
+            mempool.prune_expired(&now);
             mempool.has_transactions()
+        } else {
+            self.mempool.read().await.has_transactions()
         };
 
         if has_transactions {

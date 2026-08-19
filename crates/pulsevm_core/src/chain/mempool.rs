@@ -27,6 +27,10 @@ impl std::fmt::Display for MempoolError {
 pub struct Mempool {
     transactions_list: VecDeque<PackedTransaction>,
     transactions_map: HashSet<Id>,
+    // Ids currently owned by a detached build/verification batch. Reservations
+    // keep the configured bound and duplicate suppression in force while the
+    // batch executes outside this mempool's async lock.
+    reserved_ids: HashSet<Id>,
     // The local removal deadline for each transaction. It is the earlier of
     // the signed expiration and the first-seen time plus the local TTL.
     expiration_by_id: HashMap<Id, u32>,
@@ -34,6 +38,21 @@ pub struct Mempool {
     // transaction during block building are both cheap even when many entries
     // share the same five-minute deadline.
     expiration_counts: BTreeMap<u32, usize>,
+}
+
+/// Transactions detached from the live pool for block construction or
+/// verification. `reservations` remains in the live pool until this batch is
+/// finished, so concurrent admission cannot overfill the pool or re-admit an
+/// in-flight transaction.
+pub struct MempoolBatch {
+    transactions: Mempool,
+    reservations: HashSet<Id>,
+}
+
+impl MempoolBatch {
+    pub fn transactions_mut(&mut self) -> &mut Mempool {
+        &mut self.transactions
+    }
 }
 
 pub const MAX_MEMPOOL_SIZE: usize = 10000;
@@ -44,6 +63,7 @@ impl Mempool {
         Self {
             transactions_list: VecDeque::new(),
             transactions_map: HashSet::new(),
+            reserved_ids: HashSet::new(),
             expiration_by_id: HashMap::new(),
             expiration_counts: BTreeMap::new(),
         }
@@ -58,10 +78,12 @@ impl Mempool {
         transaction: PackedTransaction,
         received_at: TimePointSec,
     ) -> bool {
-        if self.transactions_list.len() >= MAX_MEMPOOL_SIZE {
+        if self.transactions_list.len() + self.reserved_ids.len() >= MAX_MEMPOOL_SIZE {
             return false; // mempool is full
         }
-        if !self.transactions_map.insert(transaction.id().clone()) {
+        if self.reserved_ids.contains(transaction.id())
+            || !self.transactions_map.insert(transaction.id().clone())
+        {
             return false; // already present
         }
         let signed_expiration = transaction
@@ -110,7 +132,66 @@ impl Mempool {
     }
 
     pub fn contains(&self, tx_id: &Id) -> bool {
-        self.transactions_map.contains(tx_id)
+        self.transactions_map.contains(tx_id) || self.reserved_ids.contains(tx_id)
+    }
+
+    /// Whether any transaction has passed its effective local expiry. This is
+    /// intentionally read-only so routine admission and timer checks can share
+    /// the pool lock; callers only need an exclusive lock when this is true.
+    pub fn has_expired(&self, now: &TimePoint) -> bool {
+        self.expiration_counts
+            .first_key_value()
+            .is_some_and(|(expiration, _)| *expiration < now.sec_since_epoch())
+    }
+
+    /// Move the current queue into an independent batch. Producers and
+    /// validators can execute that batch without holding the shared mempool
+    /// lock, allowing new transactions to be admitted concurrently.
+    pub fn take_all(&mut self) -> MempoolBatch {
+        let transactions = Mempool {
+            transactions_list: std::mem::take(&mut self.transactions_list),
+            transactions_map: std::mem::take(&mut self.transactions_map),
+            reserved_ids: HashSet::new(),
+            expiration_by_id: std::mem::take(&mut self.expiration_by_id),
+            expiration_counts: std::mem::take(&mut self.expiration_counts),
+        };
+        let reservations = transactions.transactions_map.clone();
+        self.reserved_ids.extend(reservations.iter().cloned());
+        MempoolBatch {
+            transactions,
+            reservations,
+        }
+    }
+
+    /// Put transactions from an older, detached batch ahead of transactions
+    /// admitted while that batch was executing. Existing ids win, so a
+    /// re-gossiped transaction cannot be duplicated. The original local expiry
+    /// deadline is retained instead of extending its TTL on every merge.
+    fn prepend_missing(&mut self, mut older: Self) {
+        while let Some(transaction) = older.transactions_list.pop_back() {
+            let id = transaction.id().clone();
+            let expiration = older
+                .expiration_by_id
+                .remove(&id)
+                .expect("mempool transaction must have an expiry deadline");
+            if self.transactions_list.len() + self.reserved_ids.len() < MAX_MEMPOOL_SIZE
+                && self.transactions_map.insert(id)
+            {
+                self.transactions_list.push_front(transaction);
+                self.record_expiration(expiration);
+            }
+        }
+    }
+
+    /// Complete a detached batch. Releasing its reservations before merging
+    /// restores the capacity consumed by the same transactions, so deferred
+    /// entries return without being silently displaced by arrivals that occurred
+    /// during execution.
+    pub fn finish_batch(&mut self, batch: MempoolBatch) {
+        for id in &batch.reservations {
+            self.reserved_ids.remove(id);
+        }
+        self.prepend_missing(batch.transactions);
     }
 
     /// Remove transactions whose effective mempool lifetime is before `now`.
@@ -121,14 +202,10 @@ impl Mempool {
     /// holding capacity indefinitely. The comparison has second precision, so
     /// a transaction remains eligible for its entire expiration second.
     pub fn prune_expired(&mut self, now: &TimePoint) -> usize {
-        let now = now.sec_since_epoch();
-        if self
-            .expiration_counts
-            .first_key_value()
-            .map_or(true, |(expiration, _)| *expiration >= now)
-        {
+        if !self.has_expired(now) {
             return 0;
         }
+        let now = now.sec_since_epoch();
 
         let old_len = self.transactions_list.len();
         let expiration_by_id = &self.expiration_by_id;
@@ -309,6 +386,58 @@ mod tests {
             TimePointSec::new(101 + DEFAULT_MEMPOOL_TRANSACTION_TTL_SECS).into();
         assert_eq!(mempool.prune_expired(&after_ttl), 1);
         assert!(!mempool.contains(long_lived.id()));
+    }
+
+    #[test]
+    fn detached_batch_merges_before_new_arrivals_without_extending_ttl() {
+        let mut mempool = Mempool::new();
+        let older = tx_with_expiration(TimePointSec::maximum(), 12);
+        mempool.add_transaction_at(older.clone(), TimePointSec::new(100));
+
+        let detached = mempool.take_all();
+        assert!(!mempool.has_transactions());
+        assert!(mempool.contains(older.id()));
+
+        let newer = tx(13);
+        // The detached transaction still reserves capacity and its id, while
+        // unrelated arrivals consume only unused capacity.
+        assert!(mempool.add_transaction(newer.clone()));
+        mempool.finish_batch(detached);
+
+        assert_eq!(mempool.pop_transaction().unwrap().id(), older.id());
+        assert_eq!(mempool.pop_transaction().unwrap().id(), newer.id());
+
+        // The detached transaction's effective deadline was 400, not five
+        // minutes after it was merged back into the live pool.
+        let mut mempool = Mempool::new();
+        mempool.add_transaction_at(older.clone(), TimePointSec::new(100));
+        let detached = mempool.take_all();
+        mempool.finish_batch(detached);
+        let after_original_ttl: TimePoint =
+            TimePointSec::new(101 + DEFAULT_MEMPOOL_TRANSACTION_TTL_SECS).into();
+        assert_eq!(mempool.prune_expired(&after_original_ttl), 1);
+    }
+
+    #[test]
+    fn detached_batch_reserves_its_capacity_and_transaction_ids() {
+        let mut mempool = Mempool::new();
+        let detached_transaction = tx(0);
+        assert!(mempool.add_transaction(detached_transaction.clone()));
+        let batch = mempool.take_all();
+
+        // Re-gossip cannot re-admit a transaction that is currently being
+        // considered by the block builder.
+        assert!(!mempool.add_transaction(detached_transaction.clone()));
+        for index in 1..MAX_MEMPOOL_SIZE {
+            assert!(mempool.add_transaction(tx(index as u16)));
+        }
+        assert!(!mempool.add_transaction(tx(MAX_MEMPOOL_SIZE as u16)));
+
+        // Releasing the batch's reservation makes exactly enough space for its
+        // deferred transaction; it is not silently dropped or displaced.
+        mempool.finish_batch(batch);
+        assert!(mempool.contains(detached_transaction.id()));
+        assert!(!mempool.add_transaction(tx(MAX_MEMPOOL_SIZE as u16)));
     }
 
     #[test]

@@ -179,6 +179,105 @@ pub struct Controller {
     blocks_executed: u64,
 }
 
+/// Read-only state required for mempool admission. The database handle is
+/// internally synchronized, so this can validate advisory admission checks
+/// without taking the controller lock while a producer is executing a block.
+/// It intentionally observes the live state rather than a consensus snapshot:
+/// admission has no state effect and transactions are still executed and
+/// validated against the selected block state before inclusion.
+#[derive(Clone)]
+pub struct MempoolAdmissionState {
+    db: Database,
+    chain_id: Id,
+}
+
+impl MempoolAdmissionState {
+    pub fn validate_transaction(
+        &self,
+        packed_transaction: &PackedTransaction,
+        pending_block_timestamp: &BlockTimestamp,
+    ) -> Result<(), ChainError> {
+        let signed_transaction = packed_transaction.get_signed_transaction();
+        let transaction = signed_transaction.transaction();
+
+        transaction.validate(pending_block_timestamp)?;
+
+        let expiration: TimePoint = transaction.header.expiration().into();
+        let pending: TimePoint = (*pending_block_timestamp).into();
+        let max_lifetime = self.db.chain_config()?.max_transaction_lifetime;
+        if expiration < pending {
+            return Err(ChainError::TransactionError("transaction expired".into()));
+        }
+        if expiration > pending + seconds(max_lifetime as i64) {
+            return Err(ChainError::TransactionError(
+                "transaction has too long lifetime".into(),
+            ));
+        }
+
+        let mut has_authorization = false;
+        for action in &transaction.context_free_actions {
+            if !self.db.is_account(action.account.as_u64())? {
+                return Err(ChainError::TransactionError(format!(
+                    "context free action {} references non-existent account {}",
+                    action.name(),
+                    action.account()
+                )));
+            }
+            if !action.authorization.is_empty() {
+                return Err(ChainError::TransactionError(
+                    "context-free actions cannot have authorizations".into(),
+                ));
+            }
+        }
+        for action in &transaction.actions {
+            if !self.db.is_account(action.account.as_u64())? {
+                return Err(ChainError::TransactionError(format!(
+                    "action {} references non-existent account {}",
+                    action.name(),
+                    action.account()
+                )));
+            }
+            for authorization in action.authorization() {
+                has_authorization = true;
+                if !self.db.is_account(authorization.actor())? {
+                    return Err(ChainError::TransactionError(format!(
+                        "action's authorizing actor '{}' does not exist",
+                        Name::new(authorization.actor)
+                    )));
+                }
+                if AuthorizationManager::find_permission(&self.db.read()?, authorization)?.is_none()
+                {
+                    return Err(ChainError::TransactionError(format!(
+                        "action's authorizations include a non-existent permission: {}",
+                        authorization,
+                    )));
+                }
+            }
+        }
+        if !has_authorization {
+            return Err(ChainError::TransactionError(
+                "transaction must have at least one authorization".into(),
+            ));
+        }
+
+        if self
+            .db
+            .is_known_unexpired_transaction(&packed_transaction.id().0.0)?
+        {
+            return Err(ChainError::DatabaseError("duplicate tx".into()));
+        }
+
+        AuthorizationManager::check_authorization(
+            &self.db,
+            &transaction.actions,
+            &signed_transaction.recovered_keys(&self.chain_id)?,
+            &BTreeSet::new(),
+            seconds(transaction.header.delay_sec.into()),
+            &BTreeSet::new(),
+        )
+    }
+}
+
 struct PendingBlock {
     id: Id,
     // Parent block id. For the front of the chain this equals the last accepted
@@ -1323,84 +1422,18 @@ impl Controller {
         packed_transaction: &PackedTransaction,
         pending_block_timestamp: &BlockTimestamp,
     ) -> Result<(), ChainError> {
-        let signed_transaction = packed_transaction.get_signed_transaction();
-        let transaction = signed_transaction.transaction();
+        self.mempool_admission_state()
+            .validate_transaction(packed_transaction, pending_block_timestamp)
+    }
 
-        transaction.validate(pending_block_timestamp)?;
-
-        let expiration: TimePoint = transaction.header.expiration().into();
-        let pending: TimePoint = (*pending_block_timestamp).into();
-        let max_lifetime = self.db.chain_config()?.max_transaction_lifetime;
-        if expiration < pending {
-            return Err(ChainError::TransactionError("transaction expired".into()));
+    /// Clone the state handle used by advisory mempool preflight. It remains
+    /// valid across controller mutation because `Database` clones share the
+    /// synchronized arena backend.
+    pub fn mempool_admission_state(&self) -> MempoolAdmissionState {
+        MempoolAdmissionState {
+            db: self.db.clone(),
+            chain_id: self.chain_id.clone(),
         }
-        if expiration > pending + seconds(max_lifetime as i64) {
-            return Err(ChainError::TransactionError(
-                "transaction has too long lifetime".into(),
-            ));
-        }
-
-        let mut has_authorization = false;
-        for action in &transaction.context_free_actions {
-            if !self.db.is_account(action.account.as_u64())? {
-                return Err(ChainError::TransactionError(format!(
-                    "context free action {} references non-existent account {}",
-                    action.name(),
-                    action.account()
-                )));
-            }
-            if !action.authorization.is_empty() {
-                return Err(ChainError::TransactionError(
-                    "context-free actions cannot have authorizations".into(),
-                ));
-            }
-        }
-        for action in &transaction.actions {
-            if !self.db.is_account(action.account.as_u64())? {
-                return Err(ChainError::TransactionError(format!(
-                    "action {} references non-existent account {}",
-                    action.name(),
-                    action.account()
-                )));
-            }
-            for authorization in action.authorization() {
-                has_authorization = true;
-                if !self.db.is_account(authorization.actor())? {
-                    return Err(ChainError::TransactionError(format!(
-                        "action's authorizing actor '{}' does not exist",
-                        Name::new(authorization.actor)
-                    )));
-                }
-                if AuthorizationManager::find_permission(&self.db.read()?, authorization)?.is_none()
-                {
-                    return Err(ChainError::TransactionError(format!(
-                        "action's authorizations include a non-existent permission: {}",
-                        authorization,
-                    )));
-                }
-            }
-        }
-        if !has_authorization {
-            return Err(ChainError::TransactionError(
-                "transaction must have at least one authorization".into(),
-            ));
-        }
-
-        if self
-            .db
-            .is_known_unexpired_transaction(&packed_transaction.id().0.0)?
-        {
-            return Err(ChainError::DatabaseError("duplicate tx".into()));
-        }
-
-        AuthorizationManager::check_authorization(
-            &self.db,
-            &transaction.actions,
-            &signed_transaction.recovered_keys(&self.chain_id)?,
-            &BTreeSet::new(),
-            seconds(transaction.header.delay_sec.into()),
-            &BTreeSet::new(),
-        )
     }
 
     // This function will execute a transaction and roll it back instantly.

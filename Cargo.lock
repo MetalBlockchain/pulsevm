@@ -3191,6 +3191,7 @@ name = "pulsevm"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "criterion",
  "futures-util",
  "hex",
  "http-body-util",

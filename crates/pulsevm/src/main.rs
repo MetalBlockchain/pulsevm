@@ -262,6 +262,8 @@ impl Vm for VirtualMachine {
         controller
             .initialize(&chain_id, &config_bytes, &genesis_bytes, db_path.as_str())
             .map_err(|e| Status::internal(format!("could not initialize controller: {}", e)))?;
+        self.rpc_service
+            .set_admission_state(controller.mempool_admission_state());
 
         let network_manager = Arc::clone(&self.network_manager);
         let mut network_manager = network_manager.write().await;
@@ -413,13 +415,20 @@ impl Vm for VirtualMachine {
         _request: Request<vm::BuildBlockRequest>,
     ) -> Result<tonic::Response<vm::BuildBlockResponse>, Status> {
         debug!("build_block called, building block...");
-        let controller = self.controller.clone();
-        let mut controller = controller.write().await;
-        let mempool = self.mempool.clone();
-        let mut mempool = mempool.write().await;
-        let block = controller
-            .build_block(&mut mempool)
-            .await
+        // Detached batches keep the mempool lock out of the expensive WASM
+        // execution path. Transactions arriving during construction stay in the
+        // live pool; transactions deferred by the controller are merged back
+        // below with their original expiry deadlines.
+        let mut batch = {
+            let mut mempool = self.mempool.write().await;
+            mempool.take_all()
+        };
+        let block_result = {
+            let mut controller = self.controller.write().await;
+            controller.build_block(batch.transactions_mut()).await
+        };
+        self.mempool.write().await.finish_batch(batch);
+        let block = block_result
             .map_err(|e| Status::internal(format!("could not build block: {}", e)))?;
         let block_id = block
             .id()
@@ -511,9 +520,7 @@ impl Vm for VirtualMachine {
         request: Request<vm::BlockVerifyRequest>,
     ) -> Result<tonic::Response<vm::BlockVerifyResponse>, Status> {
         debug!("block_verify called, verifying block...");
-        let mut controller = self.controller.write().await;
-        let mut mempool = self.mempool.write().await;
-        let block = match controller.parse_block(&request.get_ref().bytes) {
+        let block = match self.controller.read().await.parse_block(&request.get_ref().bytes) {
             Ok(block) => block,
             Err(e) => {
                 warn!("failed parsing block for verification: {}", e);
@@ -522,8 +529,20 @@ impl Vm for VirtualMachine {
             }
         };
 
-        // Verify the block
-        match controller.verify_block(&block, &mut mempool).await {
+        // Block verification may execute every transaction. As with production,
+        // detach the mempool so transaction admission only contends with the
+        // controller's required state lock, not a second long-held pool lock.
+        let mut batch = {
+            let mut mempool = self.mempool.write().await;
+            mempool.take_all()
+        };
+        let verify_result = {
+            let mut controller = self.controller.write().await;
+            controller.verify_block(&block, batch.transactions_mut()).await
+        };
+        self.mempool.write().await.finish_batch(batch);
+
+        match verify_result {
             Ok(_) => {
                 debug!(
                     "block verified with id {}, returning from block_verify",

@@ -1,7 +1,15 @@
 use std::{
     collections::BTreeSet,
     str::FromStr,
-    sync::Arc,
+    sync::{
+        Arc,
+        RwLock as StdRwLock,
+        atomic::{
+            AtomicU64,
+            Ordering,
+        },
+    },
+    time::Instant,
 };
 
 use jsonrpsee::{
@@ -13,7 +21,10 @@ use pulsevm_core::{
     abi::AbiDefinition,
     authorization_manager::AuthorizationManager,
     block::SignedBlock,
-    controller::Controller,
+    controller::{
+        Controller,
+        MempoolAdmissionState,
+    },
     crypto::{
         PublicKey,
         Signature,
@@ -159,7 +170,50 @@ pub trait Rpc {
 pub struct RpcService {
     mempool: Arc<RwLock<Mempool>>,
     controller: Arc<RwLock<Controller>>,
+    admission_state: Arc<StdRwLock<Option<MempoolAdmissionState>>>,
+    admission_metrics: Arc<AdmissionMetrics>,
     network_manager: Arc<RwLock<NetworkManager>>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AdmissionMetricsSnapshot {
+    pub state_preflights: u64,
+    pub fallback_controller_preflights: u64,
+    pub controller_lock_wait_nanos: u64,
+    pub max_controller_lock_wait_nanos: u64,
+    pub mempool_lock_wait_nanos: u64,
+    pub max_mempool_lock_wait_nanos: u64,
+}
+
+#[derive(Default)]
+struct AdmissionMetrics {
+    state_preflights: AtomicU64,
+    fallback_controller_preflights: AtomicU64,
+    controller_lock_wait_nanos: AtomicU64,
+    max_controller_lock_wait_nanos: AtomicU64,
+    mempool_lock_wait_nanos: AtomicU64,
+    max_mempool_lock_wait_nanos: AtomicU64,
+}
+
+impl AdmissionMetrics {
+    fn record_mempool_wait(&self, started: Instant) {
+        let waited = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        self.mempool_lock_wait_nanos
+            .fetch_add(waited, Ordering::Relaxed);
+        self.max_mempool_lock_wait_nanos
+            .fetch_max(waited, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> AdmissionMetricsSnapshot {
+        AdmissionMetricsSnapshot {
+            state_preflights: self.state_preflights.load(Ordering::Relaxed),
+            fallback_controller_preflights: self.fallback_controller_preflights.load(Ordering::Relaxed),
+            controller_lock_wait_nanos: self.controller_lock_wait_nanos.load(Ordering::Relaxed),
+            max_controller_lock_wait_nanos: self.max_controller_lock_wait_nanos.load(Ordering::Relaxed),
+            mempool_lock_wait_nanos: self.mempool_lock_wait_nanos.load(Ordering::Relaxed),
+            max_mempool_lock_wait_nanos: self.max_mempool_lock_wait_nanos.load(Ordering::Relaxed),
+        }
+    }
 }
 
 impl RpcService {
@@ -171,8 +225,24 @@ impl RpcService {
         RpcService {
             mempool,
             controller,
+            admission_state: Arc::new(StdRwLock::new(None)),
+            admission_metrics: Arc::new(AdmissionMetrics::default()),
             network_manager,
         }
+    }
+
+    /// Install the current controller-backed preflight view after controller
+    /// initialization. Its database handle is internally synchronized, so
+    /// admission no longer waits for the controller's exclusive block lock.
+    pub fn set_admission_state(&self, state: MempoolAdmissionState) {
+        *self
+            .admission_state
+            .write()
+            .expect("admission state lock poisoned") = Some(state);
+    }
+
+    pub fn admission_metrics(&self) -> AdmissionMetricsSnapshot {
+        self.admission_metrics.snapshot()
     }
 
     pub async fn handle_api_request(
@@ -206,14 +276,26 @@ impl RpcService {
         // re-gossiped transaction look like a duplicate. Do this before the
         // membership check so a newly arrived transaction can reclaim stale
         // capacity immediately.
-        {
-            let mut mempool = self.mempool.write().await;
-            mempool.prune_expired(&TimePoint::now());
+        let now = TimePoint::now();
+        let expires_present = {
+            let lock_started = Instant::now();
+            let mempool = self.mempool.read().await;
+            self.admission_metrics.record_mempool_wait(lock_started);
 
             // Fast path: a transaction we already hold has been validated and
             // relayed once already, so skip preflight and report it as not newly
             // added. This is what absorbs re-gossip of a transaction already in
             // flight.
+            if mempool.contains(packed_trx.id()) {
+                return Ok(false);
+            }
+            mempool.has_expired(&now)
+        };
+        if expires_present {
+            let lock_started = Instant::now();
+            let mut mempool = self.mempool.write().await;
+            self.admission_metrics.record_mempool_wait(lock_started);
+            mempool.prune_expired(&now);
             if mempool.contains(packed_trx.id()) {
                 return Ok(false);
             }
@@ -223,19 +305,54 @@ impl RpcService {
         // recovery, and has no await points. Run it on the blocking pool rather
         // than holding an async read lock on a runtime worker. It does not
         // execute WASM or open an undo session.
+        let admission_state = self
+            .admission_state
+            .read()
+            .expect("admission state lock poisoned")
+            .clone();
         let controller = self.controller.clone();
+        let metrics = self.admission_metrics.clone();
         let trx_for_exec = packed_trx.clone();
         tokio::task::spawn_blocking(move || {
-            let controller = controller.blocking_read();
             let pending_block_timestamp = TimePoint::now().into();
-            controller.validate_transaction_for_mempool(&trx_for_exec, &pending_block_timestamp)
+            match admission_state {
+                Some(state) => {
+                    metrics.state_preflights.fetch_add(1, Ordering::Relaxed);
+                    state.validate_transaction(&trx_for_exec, &pending_block_timestamp)
+                }
+                // Tests and callers that construct RpcService before controller
+                // initialization retain the safe, serialized fallback until the
+                // controller installs its read-only admission state.
+                None => {
+                    metrics
+                        .fallback_controller_preflights
+                        .fetch_add(1, Ordering::Relaxed);
+                    let lock_started = Instant::now();
+                    let controller = controller.blocking_read();
+                    let waited = lock_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                    metrics
+                        .controller_lock_wait_nanos
+                        .fetch_add(waited, Ordering::Relaxed);
+                    metrics
+                        .max_controller_lock_wait_nanos
+                        .fetch_max(waited, Ordering::Relaxed);
+                    controller
+                        .validate_transaction_for_mempool(&trx_for_exec, &pending_block_timestamp)
+                }
+            }
         })
         .await
         .map_err(|e| {
             ChainError::InternalError(format!("transaction execution task failed: {e}"))
         })??;
 
+        let lock_started = Instant::now();
         let mut mempool = self.mempool.write().await;
+        self.admission_metrics.record_mempool_wait(lock_started);
+        let now = TimePoint::now();
+        if mempool.has_expired(&now) {
+            mempool.prune_expired(&now);
+        }
         Ok(mempool.add_transaction(packed_trx))
     }
 }
@@ -608,6 +725,8 @@ mod tests {
     };
     use pulsevm_serialization::Write;
     use serde_json::json;
+    use std::time::Duration;
+    use tokio::sync::oneshot;
 
     const GENESIS_KEY: &str = "PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez";
     const CHAIN_ID: &str = "c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6";
@@ -712,11 +831,13 @@ mod tests {
             .unwrap();
 
         let mempool = Arc::new(RwLock::new(Mempool::new()));
+        let admission_state = controller.mempool_admission_state();
         let service = RpcService::new(
             mempool.clone(),
             Arc::new(RwLock::new(controller)),
             Arc::new(RwLock::new(NetworkManager::new())),
         );
+        service.set_admission_state(admission_state);
         (service, mempool, genesis_key, chain_id, temp)
     }
 
@@ -794,5 +915,72 @@ mod tests {
                 .contains(invalid_at_execution.id()),
             "a transaction rejected during block production must not remain queued"
         );
+    }
+
+    // Admission uses the synchronized database handle installed at controller
+    // initialization rather than taking the controller RwLock. Holding that
+    // lock models the full duration of build_block/verify_block execution.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admission_progresses_while_controller_execution_lock_is_held() {
+        let (service, mempool, genesis_key, chain_id, _temp) = service_with_genesis();
+        let transaction = newaccount_tx(&genesis_key, &genesis_key, "alice", &chain_id);
+        let controller_guard = service.controller.write().await;
+
+        let (complete_tx, mut complete_rx) = oneshot::channel();
+        let admission_service = service.clone();
+        tokio::spawn(async move {
+            let _ = complete_tx.send(admission_service.admit_transaction(transaction).await);
+        });
+
+        let mut result = None;
+        for _ in 0..100 {
+            match complete_rx.try_recv() {
+                Ok(admission) => {
+                    result = Some(admission);
+                    break;
+                }
+                Err(oneshot::error::TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(1)),
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    panic!("admission task exited before returning a result")
+                }
+            }
+        }
+
+        assert!(
+            result
+                .expect("admission remained blocked on the controller execution lock")
+                .expect("admission failed")
+        );
+        assert!(mempool.read().await.has_transactions());
+        let metrics = service.admission_metrics();
+        assert_eq!(metrics.state_preflights, 1);
+        assert_eq!(metrics.fallback_controller_preflights, 0);
+        assert_eq!(metrics.controller_lock_wait_nanos, 0);
+        drop(controller_guard);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_ingress_progresses_during_controller_execution() {
+        let (service, mempool, genesis_key, chain_id, _temp) = service_with_genesis();
+        let controller_guard = service.controller.write().await;
+
+        let mut admissions = Vec::new();
+        for account in ["a1", "a2", "a3", "a4", "a5"] {
+            let transaction = newaccount_tx(&genesis_key, &genesis_key, account, &chain_id);
+            let admission_service = service.clone();
+            admissions.push(tokio::spawn(async move {
+                admission_service.admit_transaction(transaction).await
+            }));
+        }
+
+        for admission in admissions {
+            assert!(admission.await.unwrap().unwrap());
+        }
+        let metrics = service.admission_metrics();
+        assert_eq!(metrics.state_preflights, 5);
+        assert_eq!(metrics.fallback_controller_preflights, 0);
+        assert_eq!(metrics.controller_lock_wait_nanos, 0);
+        assert_eq!(mempool.read().await.has_transactions(), true);
+        drop(controller_guard);
     }
 }

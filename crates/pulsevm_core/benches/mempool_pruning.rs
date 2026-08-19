@@ -1,6 +1,12 @@
 use std::collections::BTreeSet;
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{
+    BatchSize,
+    Criterion,
+    black_box,
+    criterion_group,
+    criterion_main,
+};
 use pulsevm_core::{
     mempool::{Mempool, MAX_MEMPOOL_SIZE},
     time::{TimePoint, TimePointSec},
@@ -40,6 +46,31 @@ fn criterion_benchmark(c: &mut Criterion) {
     let mut mempool = full_unexpired_mempool();
     c.bench_function("mempool_pruning/full_unexpired_pool_10k", |b| {
         b.iter(|| black_box(mempool.prune_expired(black_box(&TimePoint::now()))))
+    });
+
+    // Both operations run while holding the async mempool write lock in the
+    // node. Their setup is intentionally outside the measured portion: this
+    // measures the lock hand-off/merge cost, not transaction construction.
+    c.bench_function("mempool_batch/take_all_full_pool_10k", |b| {
+        b.iter_batched(
+            full_unexpired_mempool,
+            |mut mempool| black_box(mempool.take_all()),
+            BatchSize::SmallInput,
+        )
+    });
+    c.bench_function("mempool_batch/merge_full_pool_10k", |b| {
+        b.iter_batched(
+            || {
+                let mut live = full_unexpired_mempool();
+                let batch = live.take_all();
+                (live, batch)
+            },
+            |(mut live, batch)| {
+                live.finish_batch(batch);
+                black_box(live)
+            },
+            BatchSize::SmallInput,
+        )
     });
 }
 
