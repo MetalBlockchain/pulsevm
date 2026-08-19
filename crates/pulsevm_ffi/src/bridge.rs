@@ -164,7 +164,7 @@ pub mod ffi {
             path: &str,
             flags: DatabaseOpenFlags,
             size: u64,
-        ) -> UniquePtr<Database>;
+        ) -> Result<UniquePtr<Database>>;
 
         #[cxx_name = "database_wrapper"]
         type Database;
@@ -272,7 +272,7 @@ pub mod ffi {
         pub fn commit(self: Pin<&mut Database>, revision: i64) -> Result<()>;
         pub fn revision(self: &Database) -> i64;
         pub fn set_revision(self: Pin<&mut Database>, revision: i64) -> Result<()>;
-        pub fn add_indices(self: Pin<&mut Database>);
+        pub fn add_indices(self: Pin<&mut Database>) -> Result<()>;
         pub fn create_undo_session(
             self: Pin<&mut Database>,
             enabled: bool,
@@ -371,6 +371,11 @@ pub mod ffi {
         pub fn resource_state_bytes(self: &Database) -> Result<Vec<u8>>;
         pub fn contract_table_state_bytes(self: &Database) -> Result<Vec<u8>>;
         pub fn contract_kv_state_bytes(self: &Database) -> Result<Vec<u8>>;
+        pub fn activated_protocol_features_bytes(self: &Database) -> Result<Vec<u8>>;
+        pub fn append_activated_protocol_feature(
+            self: Pin<&mut Database>,
+            record: &[u8],
+        ) -> Result<()>;
         pub fn set_account_limits(
             self: Pin<&mut Database>,
             account_name: u64,

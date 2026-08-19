@@ -157,6 +157,30 @@ pub struct Database {
 /// chainbase's single memory-mapped arena file, relative to the database dir.
 const SHARED_MEMORY_FILE: &str = "shared_memory.bin";
 
+/// Wire width used only at the CXX boundary: digest followed by a LE block
+/// number. The public API below immediately converts this into typed tuples.
+const ACTIVATED_PROTOCOL_FEATURE_RECORD_SIZE: usize = 32 + std::mem::size_of::<u32>();
+
+fn decode_activated_protocol_features(bytes: &[u8]) -> Result<Vec<([u8; 32], u32)>, ChainError> {
+    if bytes.len() % ACTIVATED_PROTOCOL_FEATURE_RECORD_SIZE != 0 {
+        return Err(ChainError::InternalError(format!(
+            "invalid activated protocol feature payload length {}; expected a multiple of {}",
+            bytes.len(),
+            ACTIVATED_PROTOCOL_FEATURE_RECORD_SIZE
+        )));
+    }
+
+    let mut features = Vec::with_capacity(bytes.len() / ACTIVATED_PROTOCOL_FEATURE_RECORD_SIZE);
+    for record in bytes.chunks_exact(ACTIVATED_PROTOCOL_FEATURE_RECORD_SIZE) {
+        let mut digest = [0u8; 32];
+        digest.copy_from_slice(&record[..32]);
+        let activation_block_num =
+            u32::from_le_bytes([record[32], record[33], record[34], record[35]]);
+        features.push((digest, activation_block_num));
+    }
+    Ok(features)
+}
+
 /// Read until `buf` is full or EOF, so each snapshot chunk is a fixed,
 /// block-aligned size regardless of how the OS splits the underlying reads —
 /// which keeps the sparse run boundaries (and thus the snapshot bytes)
@@ -174,9 +198,20 @@ fn fill(f: &mut fs::File, buf: &mut [u8]) -> std::io::Result<usize> {
     Ok(total)
 }
 
+/// Make an atomic rename durable. Syncing the file alone does not guarantee
+/// its containing directory entry survives a power loss on Unix.
+fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
 impl Database {
     pub fn new(path: &str, size: u64) -> Result<Self, String> {
-        let db = ffi::open_database(path, ffi::DatabaseOpenFlags::ReadWrite, size);
+        let db = ffi::open_database(path, ffi::DatabaseOpenFlags::ReadWrite, size)
+            .map_err(|e| format!("Failed to open database: {e}"))?;
 
         if db.is_null() {
             Err("Failed to open database".to_string())
@@ -189,6 +224,24 @@ impl Database {
                 shadow: None,
             })
         }
+    }
+
+    fn open_with_indices(
+        path: &str,
+        size: u64,
+        operation: &str,
+    ) -> Result<UniquePtr<ffi::Database>, ChainError> {
+        let mut db = ffi::open_database(path, ffi::DatabaseOpenFlags::ReadWrite, size)
+            .map_err(|e| ChainError::InternalError(format!("{operation}: open database: {e}")))?;
+        if db.is_null() {
+            return Err(ChainError::InternalError(format!(
+                "{operation}: open database returned null"
+            )));
+        }
+        db.pin_mut()
+            .add_indices()
+            .map_err(|e| ChainError::InternalError(format!("{operation}: add indices: {e}")))?;
+        Ok(db)
     }
 
     // ----- arena shadow (differential testing; no-ops without the feature) ---
@@ -540,6 +593,36 @@ impl Database {
         let guard = self.locked_read()?;
         guard
             .contract_kv_state_bytes()
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))
+    }
+
+    /// Activated protocol feature checkpoints in their chainbase insertion
+    /// order. Each tuple contains the persisted 32-byte digest and the block at
+    /// which it became active.
+    pub fn activated_protocol_features(&self) -> Result<Vec<([u8; 32], u32)>, ChainError> {
+        let guard = self.locked_read()?;
+        let bytes = guard
+            .activated_protocol_features_bytes()
+            .map_err(|e| ChainError::InternalError(format!("{}", e)))?;
+        decode_activated_protocol_features(&bytes)
+    }
+
+    /// Append one activated checkpoint to the protocol-state singleton. Call
+    /// this only after opening the candidate block's undo session. The C++ side
+    /// also refuses the write when chainbase has no undo state at all.
+    pub fn append_activated_protocol_feature(
+        &mut self,
+        digest: [u8; 32],
+        activation_block_num: u32,
+    ) -> Result<(), ChainError> {
+        let mut record = [0u8; ACTIVATED_PROTOCOL_FEATURE_RECORD_SIZE];
+        record[..32].copy_from_slice(&digest);
+        record[32..].copy_from_slice(&activation_block_num.to_le_bytes());
+
+        let mut guard = self.locked_write()?;
+        guard
+            .pin_mut()
+            .append_activated_protocol_feature(&record)
             .map_err(|e| ChainError::InternalError(format!("{}", e)))
     }
 
@@ -1063,14 +1146,14 @@ impl Database {
 
         // Remap before propagating any read error, so the database is never
         // left closed behind us.
-        let mut db = ffi::open_database(&self.path, ffi::DatabaseOpenFlags::ReadWrite, self.size);
-        if db.is_null() {
-            return Err(ChainError::InternalError(
-                "snapshot: failed to reopen database after copy".into(),
-            ));
+        match Self::open_with_indices(&self.path, self.size, "snapshot: reopen after copy") {
+            Ok(db) => *guard = db,
+            Err(error) => {
+                return Err(ChainError::fatal_consistency(format!(
+                    "snapshot creation closed the live database and could not reopen it: {error}"
+                )));
+            }
         }
-        db.pin_mut().add_indices();
-        *guard = db;
 
         snapshot
     }
@@ -1131,53 +1214,249 @@ impl Database {
 
     /// Replace the live arena with the state carried in `snapshot`, in place.
     ///
-    /// This is the accept side of state sync, where the database is already
-    /// open. The envelope is validated and the payload staged to a sibling file
-    /// while the current mapping is still up, so a bad snapshot never disturbs
-    /// the running database. Only then is the write lock taken to drop the
-    /// mapping, swap the file in atomically, and remap — the same
-    /// lock-held-across-the-whole-window discipline as `snapshot_bytes`, and it
-    /// always remaps so a failure never leaves the database closed.
+    /// The generic form retains the historical behavior. Consensus callers
+    /// should use [`Self::restore_from_bytes_validated`] to inspect staged state
+    /// before it can replace the live mapping.
     pub fn restore_from_bytes(
         &self,
         snapshot: &[u8],
     ) -> Result<crate::snapshot::SnapshotHeader, ChainError> {
+        self.restore_from_bytes_impl(snapshot, None, || Ok(()))
+    }
+
+    /// Stage, open, and validate a physical snapshot before atomically swapping
+    /// it into the live database.
+    ///
+    /// The staged arena is opened as a real chainbase database, so corrupt or
+    /// semantically incompatible state is rejected while the live mapping is
+    /// untouched. A hard-link backup keeps the old arena inode available during
+    /// the swap; if the replacement cannot be reopened, the old mapping is
+    /// restored before this method returns an error.
+    pub fn restore_from_bytes_validated<F>(
+        &self,
+        snapshot: &[u8],
+        expected_activated_protocol_features: &[([u8; 32], u32)],
+        before_swap: F,
+    ) -> Result<crate::snapshot::SnapshotHeader, ChainError>
+    where
+        F: FnOnce() -> Result<(), ChainError>,
+    {
+        self.restore_from_bytes_impl(
+            snapshot,
+            Some(expected_activated_protocol_features),
+            before_swap,
+        )
+    }
+
+    fn restore_from_bytes_impl<F>(
+        &self,
+        snapshot: &[u8],
+        expected_activated_protocol_features: Option<&[([u8; 32], u32)]>,
+        before_swap: F,
+    ) -> Result<crate::snapshot::SnapshotHeader, ChainError>
+    where
+        F: FnOnce() -> Result<(), ChainError>,
+    {
         // Validate and locate the payload before touching the running database.
         let (header, payload) = crate::snapshot::decode(snapshot)?;
 
         let dir = Path::new(&self.path);
         let dest = dir.join(SHARED_MEMORY_FILE);
-        let staged = dir.join("shared_memory.bin.restore-tmp");
+        let live_arena_len = fs::metadata(&dest)
+            .map_err(|e| {
+                ChainError::InternalError(format!(
+                    "restore: stat live arena {}: {e}",
+                    dest.display()
+                ))
+            })?
+            .len();
+        let snapshot_arena_len = crate::snapshot::sparse_logical_len(payload)?;
+        if snapshot_arena_len > live_arena_len {
+            return Err(ChainError::InternalError(format!(
+                "restore: snapshot arena size {snapshot_arena_len} exceeds local arena size {live_arena_len}"
+            )));
+        }
+        let staging_dir = tempfile::Builder::new()
+            .prefix(".pulsevm-snapshot-restore-")
+            .tempdir_in(dir)
+            .map_err(|e| {
+                ChainError::InternalError(format!("restore: create staging directory: {e}"))
+            })?;
+        let staged = staging_dir.path().join(SHARED_MEMORY_FILE);
+        let backup = staging_dir.path().join("previous-shared-memory.bin");
         Self::write_sparse_snapshot(&staged, payload)?;
+
+        // Opening the staged file catches chainbase-level corruption that the
+        // transport checksum cannot. Read consensus metadata from that opened
+        // arena and let the caller compare it with the summary/configuration.
+        let staged_features = {
+            let staged_path = staging_dir.path().to_str().ok_or_else(|| {
+                ChainError::InternalError("restore: staging path is not UTF-8".into())
+            })?;
+            // Opening with the target's current reservation grows a smaller
+            // source arena before installation. Chainbase supports this and it
+            // lets validators use different local `db_size` reservations while
+            // still refusing a snapshot too large for the receiver.
+            let staged_db = Self::open_with_indices(
+                staged_path,
+                live_arena_len,
+                "restore: validate staged arena",
+            )?;
+            let staged_revision = staged_db.revision();
+            if staged_revision != header.revision {
+                return Err(ChainError::InternalError(format!(
+                    "restore: staged arena revision {staged_revision} does not match snapshot header revision {}",
+                    header.revision
+                )));
+            }
+            let features = if expected_activated_protocol_features.is_some() {
+                let bytes = staged_db.activated_protocol_features_bytes().map_err(|e| {
+                    ChainError::InternalError(format!("restore: protocol state: {e}"))
+                })?;
+                Some(decode_activated_protocol_features(&bytes)?)
+            } else {
+                None
+            };
+            // Closing clears chainbase's dirty flag before the staged inode is
+            // installed as the live mapping.
+            drop(staged_db);
+            features
+        };
+        if let (Some(expected), Some(actual)) = (
+            expected_activated_protocol_features,
+            staged_features.as_deref(),
+        ) && actual != expected
+        {
+            let first_difference = actual
+                .iter()
+                .zip(expected)
+                .position(|(actual, expected)| actual != expected)
+                .unwrap_or_else(|| actual.len().min(expected.len()));
+            return Err(ChainError::InternalError(format!(
+                "restore: snapshot activation ledger does not match configured history (actual {} record(s), expected {}, first difference at index {first_difference})",
+                actual.len(),
+                expected.len()
+            )));
+        }
+
+        // `arena-shadow` is differential-test instrumentation, not a second
+        // durable snapshot backend. Installing chainbase state while retaining
+        // the old in-memory mirror would make every later comparison invalid,
+        // so fail before touching either live representation.
+        #[cfg(feature = "arena-shadow")]
+        if self.shadow.is_some() {
+            return Err(ChainError::InternalError(
+                "restore: physical state sync is unavailable while arena-shadow is enabled".into(),
+            ));
+        }
+
+        // Consensus callers use this hook to unwind speculative undo sessions.
+        // It deliberately runs only after every staged-state validation above,
+        // so a rejected snapshot does not disturb their live view.
+        before_swap()?;
 
         let mut guard = self.locked_write()?;
         if guard.is_null() {
-            let _ = fs::remove_file(&staged);
             return Err(ChainError::InternalError(
                 "restore: database is not open".into(),
             ));
         }
 
-        // Close the mapping so the backing file can be replaced, then swap the
-        // staged snapshot in atomically.
+        // Close the mapping, retain the old inode with a cheap same-filesystem
+        // hard link, then atomically replace the live path with the staged file.
         *guard = UniquePtr::<ffi::Database>::null();
-        let swap = fs::rename(&staged, &dest);
-
-        // Remap before propagating any error, so the database is never left
-        // closed. On a failed swap the original file is untouched, so this
-        // reopens the pre-restore state.
-        let mut db = ffi::open_database(&self.path, ffi::DatabaseOpenFlags::ReadWrite, self.size);
-        if db.is_null() {
-            return Err(ChainError::InternalError(
-                "restore: failed to reopen database".into(),
-            ));
+        if let Err(link_error) = fs::hard_link(&dest, &backup) {
+            let old = Self::open_with_indices(
+                &self.path,
+                self.size,
+                "restore: reopen after backup-link failure",
+            )
+            .map_err(|reopen_error| {
+                ChainError::fatal_consistency(format!(
+                    "restore: retaining the live database failed ({link_error}); reopening it also failed ({reopen_error})"
+                ))
+            })?;
+            *guard = old;
+            return Err(ChainError::InternalError(format!(
+                "restore: could not retain live database before swap: {link_error}"
+            )));
         }
-        db.pin_mut().add_indices();
-        *guard = db;
 
-        swap.map_err(|e| {
-            ChainError::InternalError(format!("restore: swap into {}: {e}", dest.display()))
-        })?;
+        if let Err(swap_error) = fs::rename(&staged, &dest) {
+            let old = Self::open_with_indices(
+                &self.path,
+                self.size,
+                "restore: reopen after swap failure",
+            )
+            .map_err(|reopen_error| {
+                ChainError::fatal_consistency(format!(
+                    "restore: swapping the staged database failed ({swap_error}); reopening the live database also failed ({reopen_error})"
+                ))
+            })?;
+            *guard = old;
+            return Err(ChainError::InternalError(format!(
+                "restore: swap into {} failed: {swap_error}",
+                dest.display()
+            )));
+        }
+
+        let replacement = sync_parent_dir(&dest)
+            .map_err(|error| {
+                ChainError::InternalError(format!(
+                    "restore: sync replacement database directory: {error}"
+                ))
+            })
+            .and_then(|_| {
+                Self::open_with_indices(&self.path, self.size, "restore: open replacement database")
+            });
+        let replacement = match replacement {
+            Ok(replacement) => replacement,
+            Err(install_error) => {
+                // Put the old inode back at the live path. `rename` replaces the bad
+                // staged inode atomically; the temporary directory owns its other
+                // files and cleans them up after the old mapping is safely reopened.
+                if let Err(rollback_error) = fs::rename(&backup, &dest) {
+                    // Keep the staging directory: it still contains the only
+                    // known-good link to the previous arena, so automatic temp
+                    // cleanup would turn a failed rollback into data loss.
+                    let preserved = staging_dir.keep();
+                    return Err(ChainError::fatal_consistency(format!(
+                        "{install_error}; restoring the previous database path also failed: {rollback_error}; recoverable files retained at {}",
+                        preserved.display()
+                    )));
+                }
+                if let Err(rollback_sync_error) = sync_parent_dir(&dest) {
+                    // Recreate a diagnostic/recovery link before consuming the
+                    // temp directory. Even if the directory sync failed, this
+                    // gives an operator another name for the old inode while
+                    // the process fail-stops.
+                    let _ = fs::hard_link(&dest, &backup);
+                    let preserved = staging_dir.keep();
+                    return Err(ChainError::fatal_consistency(format!(
+                        "{install_error}; the previous database path was restored but its directory entry could not be synced: {rollback_sync_error}; recoverable files retained at {}",
+                        preserved.display()
+                    )));
+                }
+                let old = Self::open_with_indices(
+                    &self.path,
+                    self.size,
+                    "restore: reopen rolled-back database",
+                )
+                .map_err(|rollback_open_error| {
+                    ChainError::fatal_consistency(format!(
+                        "{install_error}; the previous database path was restored but could not be reopened: {rollback_open_error}"
+                    ))
+                })?;
+                *guard = old;
+                return Err(ChainError::InternalError(format!(
+                    "{install_error}; live database was restored"
+                )));
+            }
+        };
+        *guard = replacement;
+
+        // The backup is inside `staging_dir`; dropping it unlinks the old inode.
+        // No fallible cleanup is allowed after the replacement becomes live.
         Ok(header)
     }
 
@@ -1210,8 +1489,10 @@ impl Database {
     }
 
     pub fn add_indices(&mut self) -> Result<(), ChainError> {
-        self.locked_write()?.pin_mut().add_indices();
-        Ok(())
+        self.locked_write()?
+            .pin_mut()
+            .add_indices()
+            .map_err(|e| ChainError::InternalError(format!("add indices: {e}")))
     }
 
     pub fn initialize_database(&mut self, genesis: &CxxGenesisState) -> Result<(), ChainError> {
@@ -3971,8 +4252,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().to_str().unwrap();
         let mut db = Database::new(path, 1 * 1024 * 1024 * 1024).unwrap();
-        let name = string_to_name("test").unwrap();
-        db.add_indices();
+        let _name = string_to_name("test").unwrap();
+        db.add_indices().unwrap();
     }
 
     // The hazard the guard API introduced, and the reason `check_reentry`
@@ -4069,6 +4350,49 @@ mod tests {
         assert_eq!(
             hex_deltas,
             "0100076163636f756e7401010e00000000000090b1ca0000000000"
+        );
+    }
+
+    #[test]
+    fn activated_protocol_features_are_typed_ordered_and_undoable() {
+        assert!(decode_activated_protocol_features(&[0u8; 35]).is_err());
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().to_str().unwrap();
+        let mut db = Database::new(path, 1 * 1024 * 1024 * 1024).unwrap();
+        db.add_indices().unwrap();
+        let genesis = CxxGenesisState::new(include_str!("../../../genesis.json")).unwrap();
+        db.initialize_database(&genesis).unwrap();
+
+        assert_eq!(db.activated_protocol_features().unwrap(), Vec::new());
+        assert!(db.append_activated_protocol_feature([1; 32], 7).is_err());
+
+        let mut session = db.create_undo_session(true).unwrap();
+        db.append_activated_protocol_feature([1; 32], 7).unwrap();
+        db.append_activated_protocol_feature([2; 32], 11).unwrap();
+        assert_eq!(
+            db.activated_protocol_features().unwrap(),
+            vec![([1; 32], 7), ([2; 32], 11)]
+        );
+        session.pin_mut().undo().unwrap();
+        assert_eq!(db.activated_protocol_features().unwrap(), Vec::new());
+
+        let mut malformed_session = db.create_undo_session(true).unwrap();
+        let mut guard = db.inner.write().unwrap();
+        let error = guard
+            .pin_mut()
+            .append_activated_protocol_feature(&[0u8; 35])
+            .unwrap_err();
+        assert!(error.what().contains("exactly 36 bytes"));
+        drop(guard);
+        malformed_session.pin_mut().undo().unwrap();
+
+        let mut committed_session = db.create_undo_session(true).unwrap();
+        db.append_activated_protocol_feature([3; 32], 13).unwrap();
+        committed_session.pin_mut().push().unwrap();
+        assert_eq!(
+            db.activated_protocol_features().unwrap(),
+            vec![([3; 32], 13)]
         );
     }
 
@@ -4203,6 +4527,159 @@ mod tests {
         assert!(a.restore_from_bytes(&snap).is_err());
         assert_eq!(a.revision(), 5);
         assert!(!a.find_account(alice).unwrap().is_null());
+    }
+
+    #[test]
+    fn validated_restore_rejects_wrong_protocol_ledger_before_swap() {
+        let src = TempDir::new().unwrap();
+        let mut source = Database::new(src.path().to_str().unwrap(), TEST_DB_SIZE).unwrap();
+        source.add_indices().unwrap();
+        let genesis = CxxGenesisState::new(include_str!("../../../genesis.json")).unwrap();
+        source.initialize_database(&genesis).unwrap();
+        let mut session = source.create_undo_session(true).unwrap();
+        source
+            .append_activated_protocol_feature([7; 32], 2)
+            .unwrap();
+        session.pin_mut().push().unwrap();
+        source.commit(source.revision()).unwrap();
+        let snapshot = source.snapshot_bytes().unwrap();
+
+        let dst = TempDir::new().unwrap();
+        let mut target = Database::new(dst.path().to_str().unwrap(), TEST_DB_SIZE).unwrap();
+        target.add_indices().unwrap();
+        target.initialize_database(&genesis).unwrap();
+        let keeper = name_u64("keeper");
+        target.create_account(keeper, 1).unwrap();
+        let revision_before = target.revision();
+        let before_swap_called = std::cell::Cell::new(false);
+
+        let error = target
+            .restore_from_bytes_validated(&snapshot, &[], || {
+                before_swap_called.set(true);
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("activation ledger"));
+        assert!(!before_swap_called.get());
+        assert_eq!(target.revision(), revision_before);
+        assert!(!target.find_account(keeper).unwrap().is_null());
+    }
+
+    #[test]
+    fn validated_restore_rejects_header_arena_revision_mismatch_before_swap() {
+        let src = TempDir::new().unwrap();
+        let mut source = Database::new(src.path().to_str().unwrap(), TEST_DB_SIZE).unwrap();
+        source.add_indices().unwrap();
+        source.set_revision(5).unwrap();
+        let snapshot = source.snapshot_bytes().unwrap();
+        let (header, payload) = crate::snapshot::decode(&snapshot).unwrap();
+        let mismatched = crate::snapshot::encode(header.revision + 1, payload);
+
+        let dst = TempDir::new().unwrap();
+        let mut target = Database::new(dst.path().to_str().unwrap(), TEST_DB_SIZE).unwrap();
+        target.add_indices().unwrap();
+        target.set_revision(9).unwrap();
+        let keeper = name_u64("keeper");
+        target.create_account(keeper, 1).unwrap();
+        let before_swap_called = std::cell::Cell::new(false);
+
+        let error = target
+            .restore_from_bytes_validated(&mismatched, &[], || {
+                before_swap_called.set(true);
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("does not match snapshot header"));
+        assert!(!before_swap_called.get());
+        assert_eq!(target.revision(), 9);
+        assert!(!target.find_account(keeper).unwrap().is_null());
+    }
+
+    #[test]
+    fn validated_restore_rejects_mismatched_arena_size_before_swap() {
+        let src = TempDir::new().unwrap();
+        let mut source = Database::new(src.path().to_str().unwrap(), TEST_DB_SIZE).unwrap();
+        source.add_indices().unwrap();
+        let snapshot = source.snapshot_bytes().unwrap();
+        let (header, payload) = crate::snapshot::decode(&snapshot).unwrap();
+        let mut wrong_size_payload = payload.to_vec();
+        wrong_size_payload[..8].copy_from_slice(&(TEST_DB_SIZE * 2).to_le_bytes());
+        let mismatched = crate::snapshot::encode(header.revision, &wrong_size_payload);
+
+        let dst = TempDir::new().unwrap();
+        let mut target = Database::new(dst.path().to_str().unwrap(), TEST_DB_SIZE).unwrap();
+        target.add_indices().unwrap();
+        target.set_revision(9).unwrap();
+        let keeper = name_u64("keeper");
+        target.create_account(keeper, 1).unwrap();
+        let before_swap_called = std::cell::Cell::new(false);
+
+        let error = target
+            .restore_from_bytes_validated(&mismatched, &[], || {
+                before_swap_called.set(true);
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("arena size"));
+        assert!(!before_swap_called.get());
+        assert_eq!(target.revision(), 9);
+        assert!(!target.find_account(keeper).unwrap().is_null());
+    }
+
+    #[test]
+    fn restore_grows_smaller_source_arena_to_target_reservation() {
+        let src = TempDir::new().unwrap();
+        let mut source = Database::new(src.path().to_str().unwrap(), TEST_DB_SIZE).unwrap();
+        source.add_indices().unwrap();
+        source.set_revision(3).unwrap();
+        let alice = name_u64("alice");
+        source.create_account(alice, 1).unwrap();
+        let snapshot = source.snapshot_bytes().unwrap();
+
+        let dst = TempDir::new().unwrap();
+        let target_size = TEST_DB_SIZE * 2;
+        let mut target = Database::new(dst.path().to_str().unwrap(), target_size).unwrap();
+        target.add_indices().unwrap();
+        target.set_revision(9).unwrap();
+        target.restore_from_bytes(&snapshot).unwrap();
+
+        assert_eq!(target.revision(), 3);
+        assert!(!target.find_account(alice).unwrap().is_null());
+        assert_eq!(
+            fs::metadata(dst.path().join(SHARED_MEMORY_FILE))
+                .unwrap()
+                .len(),
+            target_size
+        );
+    }
+
+    #[test]
+    fn validated_restore_catches_chainbase_open_failure_before_swap() {
+        // The transport envelope and sparse encoding are valid, but the
+        // expanded file is not a chainbase arena. CXX exceptions from opening
+        // staged state must cross the bridge as an error, never abort the VM or
+        // disturb the live database.
+        let malformed_payload = crate::snapshot::sparse_begin(TEST_DB_SIZE);
+        let malformed = crate::snapshot::encode(0, &malformed_payload);
+
+        let dst = TempDir::new().unwrap();
+        let mut target = Database::new(dst.path().to_str().unwrap(), TEST_DB_SIZE).unwrap();
+        target.add_indices().unwrap();
+        target.set_revision(9).unwrap();
+        let keeper = name_u64("keeper");
+        target.create_account(keeper, 1).unwrap();
+        let before_swap_called = std::cell::Cell::new(false);
+
+        let error = target
+            .restore_from_bytes_validated(&malformed, &[], || {
+                before_swap_called.set(true);
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("validate staged arena"));
+        assert!(!before_swap_called.get());
+        assert_eq!(target.revision(), 9);
+        assert!(!target.find_account(keeper).unwrap().is_null());
     }
 }
 

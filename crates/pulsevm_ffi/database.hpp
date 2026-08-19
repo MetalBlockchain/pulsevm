@@ -314,6 +314,13 @@ public:
     rust::Vec<uint8_t> contract_table_state_bytes() const;
     rust::Vec<uint8_t> contract_kv_state_bytes() const;
 
+    // The protocol-state singleton stores activated features in activation
+    // order. Expose them as fixed-width records so the CXX boundary does not
+    // need to mirror chainbase's allocator-aware types:
+    //   32 bytes feature digest || 4 bytes little-endian activation block.
+    rust::Vec<uint8_t> activated_protocol_features_bytes() const;
+    void append_activated_protocol_feature(rust::Slice<const uint8_t> record);
+
     bool set_account_limits( uint64_t account, int64_t ram_bytes, int64_t net_weight, int64_t cpu_weight) {
         auto find_or_create_pending_limits = [&]() -> const resource_limits::resource_limits_object& {
             const auto* pending_limits = this->find<resource_limits::resource_limits_object, resource_limits::by_owner>( boost::make_tuple(true, name(account)) );

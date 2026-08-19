@@ -3,6 +3,7 @@ mod chain;
 mod state_history;
 
 use pulsevm_core::{
+    ChainError,
     config::{
         PLUGIN_VERSION,
         VERSION,
@@ -93,6 +94,24 @@ use crate::{
 /// Default bind address for the state history WebSocket API. Used when WS_BIND
 /// is unset, in which case a busy port is tolerated (see run_ws_server).
 const DEFAULT_WS_BIND: &str = "0.0.0.0:9090";
+
+/// Stop without running destructors when persistence reports that consensus
+/// state may be only partly published. In particular, leaving chainbase dirty
+/// makes a subsequent startup fail closed instead of silently using mismatched
+/// arena and metadata files.
+#[cold]
+pub(crate) fn abort_on_fatal_consistency(operation: &str, error: &ChainError) -> ! {
+    error!(
+        "fatal consistency failure during {}: {}; aborting VM before it can resume consensus",
+        operation, error
+    );
+    // `abort` skips logger teardown; write the same diagnostic directly so an
+    // operator still has a recovery breadcrumb if the configured sink buffers.
+    eprintln!(
+        "FATAL: consistency failure during {operation}: {error}; aborting VM before it can resume consensus"
+    );
+    std::process::abort()
+}
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 10)]
 async fn main() {
@@ -247,6 +266,7 @@ impl Vm for VirtualMachine {
     ) -> Result<tonic::Response<vm::InitializeResponse>, Status> {
         let config_bytes = request.get_ref().config_bytes.clone();
         let genesis_bytes = request.get_ref().genesis_bytes.clone();
+        let upgrade_bytes = request.get_ref().upgrade_bytes.clone();
         let db_path = request.get_ref().chain_data_dir.clone();
         let server_addr = request.get_ref().server_addr.clone();
         let chain_id: Id = request
@@ -259,9 +279,20 @@ impl Vm for VirtualMachine {
         let mut controller = controller.write().await;
 
         // Initialize the controller with the genesis bytes
-        controller
-            .initialize(&chain_id, &config_bytes, &genesis_bytes, db_path.as_str())
-            .map_err(|e| Status::internal(format!("could not initialize controller: {}", e)))?;
+        if let Err(error) = controller.initialize_with_protocol_upgrades(
+            &chain_id,
+            &config_bytes,
+            &genesis_bytes,
+            &upgrade_bytes,
+            db_path.as_str(),
+        ) {
+            if error.is_fatal_consistency() {
+                abort_on_fatal_consistency("controller initialization", &error);
+            }
+            return Err(Status::internal(format!(
+                "could not initialize controller: {error}"
+            )));
+        }
 
         let network_manager = Arc::clone(&self.network_manager);
         let mut network_manager = network_manager.write().await;
@@ -358,9 +389,14 @@ impl Vm for VirtualMachine {
         ready_to_terminate.store(true, std::sync::atomic::Ordering::Relaxed);
         let controller = self.controller.clone();
         let mut controller = controller.write().await;
-        controller
-            .shutdown()
-            .map_err(|e| Status::internal(format!("could not shutdown controller: {}", e)));
+        if let Err(error) = controller.shutdown() {
+            if error.is_fatal_consistency() {
+                abort_on_fatal_consistency("controller shutdown", &error);
+            }
+            return Err(Status::internal(format!(
+                "could not shutdown controller: {error}"
+            )));
+        }
         Ok(Response::new(()))
     }
 
@@ -417,10 +453,15 @@ impl Vm for VirtualMachine {
         let mut controller = controller.write().await;
         let mempool = self.mempool.clone();
         let mut mempool = mempool.write().await;
-        let block = controller
-            .build_block(&mut mempool)
-            .await
-            .map_err(|e| Status::internal(format!("could not build block: {}", e)))?;
+        let block = match controller.build_block(&mut mempool).await {
+            Ok(block) => block,
+            Err(error) if error.is_fatal_consistency() => {
+                abort_on_fatal_consistency("block building", &error)
+            }
+            Err(error) => {
+                return Err(Status::internal(format!("could not build block: {error}")));
+            }
+        };
         let block_id = block
             .id()
             .map_err(|e| Status::internal(format!("could not get block id: {}", e)))?;
@@ -531,6 +572,9 @@ impl Vm for VirtualMachine {
                 );
             }
             Err(e) => {
+                if e.is_fatal_consistency() {
+                    abort_on_fatal_consistency("block verification", &e);
+                }
                 warn!(
                     "could not verify block with id {} and height {}: {:?}",
                     block.id().unwrap_or_default(),
@@ -564,9 +608,12 @@ impl Vm for VirtualMachine {
             .clone()
             .try_into()
             .map_err(|_| Status::invalid_argument("invalid block id"))?;
-        controller
-            .accept_block(&block_id, &mut mempool)
-            .map_err(|e| Status::internal(format!("could not accept block: {}", e)))?;
+        if let Err(e) = controller.accept_block(&block_id, &mut mempool) {
+            if e.is_fatal_consistency() {
+                abort_on_fatal_consistency("block acceptance", &e);
+            }
+            return Err(Status::internal(format!("could not accept block: {}", e)));
+        }
         debug!(
             "block accepted with id {}, returning from block_accept",
             block_id
@@ -588,9 +635,12 @@ impl Vm for VirtualMachine {
             .clone()
             .try_into()
             .map_err(|_| Status::invalid_argument("invalid block id"))?;
-        controller
-            .reject_block(&block_id, &mut mempool)
-            .map_err(|e| Status::internal(format!("could not reject block: {}", e)))?;
+        if let Err(error) = controller.reject_block(&block_id, &mut mempool) {
+            if error.is_fatal_consistency() {
+                abort_on_fatal_consistency("block rejection", &error);
+            }
+            return Err(Status::internal(format!("could not reject block: {error}")));
+        }
         warn!("block rejected: {}", block_id);
         Ok(Response::new(()))
     }
@@ -940,9 +990,17 @@ impl Vm for VirtualMachine {
         // Exclusive: producing a summary snapshots the arena, which briefly drops
         // and remaps the database.
         let mut controller = self.controller.write().await;
-        let summary = controller
-            .produce_state_summary()
-            .map_err(|e| Status::internal(format!("could not produce state summary: {}", e)))?;
+        let summary = match controller.produce_state_summary() {
+            Ok(summary) => summary,
+            Err(error) if error.is_fatal_consistency() => {
+                abort_on_fatal_consistency("state-summary creation", &error)
+            }
+            Err(error) => {
+                return Err(Status::internal(format!(
+                    "could not produce state summary: {error}"
+                )));
+            }
+        };
         Ok(Response::new(vm::GetLastStateSummaryResponse {
             id: summary.id.into(),
             height: summary.height,
@@ -980,9 +1038,17 @@ impl Vm for VirtualMachine {
                 err: vm::Error::NotFound as i32,
             }));
         }
-        let summary = controller
-            .produce_state_summary()
-            .map_err(|e| Status::internal(format!("could not produce state summary: {}", e)))?;
+        let summary = match controller.produce_state_summary() {
+            Ok(summary) => summary,
+            Err(error) if error.is_fatal_consistency() => {
+                abort_on_fatal_consistency("state-summary creation", &error)
+            }
+            Err(error) => {
+                return Err(Status::internal(format!(
+                    "could not produce state summary: {error}"
+                )));
+            }
+        };
         Ok(Response::new(vm::GetStateSummaryResponse {
             id: summary.id.into(),
             bytes: summary.bytes,
@@ -1023,6 +1089,15 @@ impl Vm for VirtualMachine {
             }));
         }
 
+        // Refuse a schedule/version mismatch before downloading tens of MB or
+        // entering asynchronous state-sync mode. Apply revalidates this again
+        // immediately before the database swap.
+        self.controller
+            .read()
+            .await
+            .validate_state_sync_target(&target)
+            .map_err(|e| Status::failed_precondition(format!("invalid state summary: {e}")))?;
+
         // The snapshot payload is downloaded out of band over AppRequest, so the
         // sync runs in the background and completes later. Report STATIC, not
         // DYNAMIC: DYNAMIC tells the engine to bootstrap the block chain forward
@@ -1062,16 +1137,24 @@ impl Vm for VirtualMachine {
                     match controller.apply_state_snapshot(
                         target.block.clone(),
                         target.schedule.clone(),
+                        target.protocol_commitment,
                         &envelope,
                     ) {
                         Ok(()) => info!("state sync applied at height {}", height),
+                        Err(e) if e.is_fatal_consistency() => {
+                            // The arena or its companion metadata crossed a
+                            // publication boundary. Never wake MetalGo to fall
+                            // back on a view that may now be internally split.
+                            abort_on_fatal_consistency("state-sync apply", &e)
+                        }
                         Err(e) => error!("state sync apply failed: {}", e),
                     }
                 }
                 Err(e) => error!("state sync download failed: {}", e),
             }
-            // Wake the engine regardless: on failure it falls back to normal
-            // bootstrapping rather than hanging on wait_for_event.
+            // Safe rejection/download failures fall back to normal
+            // bootstrapping. Fatal consistency failures abort in the match above
+            // and can never reach this notification.
             sync_finished.notify_one();
         });
 

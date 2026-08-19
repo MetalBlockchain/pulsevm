@@ -7,6 +7,8 @@
 #include <pulsevm/state_history/create_deltas.hpp>
 #include <fc/reflect/reflect.hpp>
 #include <filesystem>
+#include <limits>
+#include <stdexcept>
 
 namespace pulsevm::chain {
 
@@ -368,6 +370,55 @@ ElasticLimitParameters database_wrapper::get_net_limit_parameters() const {
         Ratio{ p.contract_rate.numerator, p.contract_rate.denominator },
         Ratio{ p.expand_rate.numerator, p.expand_rate.denominator }
     };
+}
+
+namespace {
+constexpr size_t protocol_feature_digest_size = 32;
+constexpr size_t activated_protocol_feature_record_size = protocol_feature_digest_size + 4;
+}
+
+rust::Vec<uint8_t> database_wrapper::activated_protocol_features_bytes() const {
+    const auto& protocol_state = this->get<protocol_state_object>();
+    const auto& features = protocol_state.activated_protocol_features;
+    if (features.size() > std::numeric_limits<size_t>::max() / activated_protocol_feature_record_size) {
+        throw std::length_error("activated protocol feature serialization is too large");
+    }
+
+    rust::Vec<uint8_t> out;
+    out.reserve(features.size() * activated_protocol_feature_record_size);
+    for (const auto& feature : features) {
+        if (feature.feature_digest.data_size() != protocol_feature_digest_size) {
+            throw std::runtime_error("activated protocol feature digest must be 32 bytes");
+        }
+        const auto* digest = reinterpret_cast<const uint8_t*>(feature.feature_digest.data());
+        for (size_t i = 0; i < protocol_feature_digest_size; ++i) {
+            out.push_back(digest[i]);
+        }
+        for (size_t i = 0; i < 4; ++i) {
+            out.push_back(static_cast<uint8_t>(feature.activation_block_num >> (8 * i)));
+        }
+    }
+    return out;
+}
+
+void database_wrapper::append_activated_protocol_feature(rust::Slice<const uint8_t> record) {
+    if (record.size() != activated_protocol_feature_record_size) {
+        throw std::invalid_argument("activated protocol feature record must be exactly 36 bytes");
+    }
+    if (!this->get_index<protocol_state_multi_index>().has_undo_session()) {
+        throw std::logic_error("appending an activated protocol feature requires an active undo session");
+    }
+
+    const digest_type digest(reinterpret_cast<const char*>(record.data()), protocol_feature_digest_size);
+    uint32_t activation_block_num = 0;
+    for (size_t i = 0; i < 4; ++i) {
+        activation_block_num |= static_cast<uint32_t>(record[protocol_feature_digest_size + i]) << (8 * i);
+    }
+
+    const auto& protocol_state = this->get<protocol_state_object>();
+    this->modify(protocol_state, [&](auto& state) {
+        state.activated_protocol_features.emplace_back(digest, activation_block_num);
+    });
 }
 
 rust::Vec<uint8_t> database_wrapper::account_metadata_state_bytes() const {

@@ -53,3 +53,15 @@ jobs:
 
       - name: Run tests
         run: CXX=/usr/bin/g++-13 CC=/usr/bin/gcc-13 LLVM_SYS_221_PREFIX=/usr/lib/llvm-22 cargo test
+
+      # `nightly` is a Cargo feature for preview protocol implementations, not
+      # the Rust nightly toolchain. Keep this separate from --all-features,
+      # which also enables unrelated arena-shadow instrumentation.
+      - name: Check nightly protocol profile
+        env:
+          CC: /usr/bin/gcc-13
+          CXX: /usr/bin/g++-13
+          LLVM_SYS_221_PREFIX: /usr/lib/llvm-22
+        run: |
+          cargo test -p pulsevm_core --locked --lib --features nightly
+          cargo check -p pulsevm --locked --features nightly
