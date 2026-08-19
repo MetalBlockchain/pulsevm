@@ -355,6 +355,39 @@ impl RpcService {
         }
         Ok(mempool.add_transaction(packed_trx))
     }
+
+    /// Build a candidate from a detached mempool batch. Keeping this orchestration
+    /// beside admission makes the lock boundary explicit: controller execution is
+    /// exclusive, but the live pool is available again before that execution
+    /// starts.
+    pub async fn build_block(&self) -> Result<SignedBlock, ChainError> {
+        let mut batch = {
+            let mut mempool = self.mempool.write().await;
+            mempool.take_all()
+        };
+        let result = {
+            let mut controller = self.controller.write().await;
+            controller.build_block(batch.transactions_mut()).await
+        };
+        self.mempool.write().await.finish_batch(batch);
+        result
+    }
+
+    /// Verify a candidate using the same detached-batch policy as production.
+    /// Transactions that arrived while verification ran remain in the live pool;
+    /// deferred older entries are restored when the batch finishes.
+    pub async fn verify_block(&self, block: &SignedBlock) -> Result<(), ChainError> {
+        let mut batch = {
+            let mut mempool = self.mempool.write().await;
+            mempool.take_all()
+        };
+        let result = {
+            let mut controller = self.controller.write().await;
+            controller.verify_block(block, batch.transactions_mut()).await
+        };
+        self.mempool.write().await.finish_batch(batch);
+        result
+    }
 }
 
 #[async_trait]
@@ -726,7 +759,10 @@ mod tests {
     use pulsevm_serialization::Write;
     use serde_json::json;
     use std::time::Duration;
-    use tokio::sync::oneshot;
+    use tokio::{
+        sync::oneshot,
+        time::{sleep, timeout},
+    };
 
     const GENESIS_KEY: &str = "PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez";
     const CHAIN_ID: &str = "c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6";
@@ -841,6 +877,16 @@ mod tests {
         (service, mempool, genesis_key, chain_id, temp)
     }
 
+    async fn wait_for_batch_detach(mempool: &Arc<RwLock<Mempool>>) {
+        timeout(Duration::from_secs(1), async {
+            while mempool.read().await.has_transactions() {
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("producer did not detach the mempool batch before waiting for the controller");
+    }
+
     // A correctly signed transaction is validated and admitted once; a second
     // copy (re-gossip) is reported as already known so the caller doesn't relay
     // it again.
@@ -899,11 +945,7 @@ mod tests {
         );
         assert!(mempool.read().await.contains(invalid_at_execution.id()));
 
-        let build_result = {
-            let mut controller = service.controller.write().await;
-            let mut mempool = mempool.write().await;
-            controller.build_block(&mut mempool).await
-        };
+        let build_result = service.build_block().await;
         assert!(
             build_result.is_err(),
             "the unexecutable transaction should be discarded while building"
@@ -982,5 +1024,144 @@ mod tests {
         assert_eq!(metrics.controller_lock_wait_nanos, 0);
         assert_eq!(mempool.read().await.has_transactions(), true);
         drop(controller_guard);
+    }
+
+    // This exercises the exact path called by Vm::build_block. The controller
+    // writer is deliberately held before the producer starts: that makes the
+    // test deterministic while proving the producer detaches the batch before
+    // it waits for exclusive execution, and that ingress remains live during
+    // the whole interval.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ingress_survives_actual_build_block_pipeline() {
+        let (service, mempool, genesis_key, chain_id, _temp) = service_with_genesis();
+        let selected = newaccount_tx(&genesis_key, &genesis_key, "alice", &chain_id);
+        assert!(service.admit_transaction(selected.clone()).await.unwrap());
+
+        let controller_guard = service.controller.write().await;
+        let producer = service.clone();
+        let build = tokio::spawn(async move { producer.build_block().await });
+        wait_for_batch_detach(&mempool).await;
+
+        let late_transactions: Vec<_> = ["b1", "b2", "b3", "b4", "b5"]
+            .into_iter()
+            .map(|account| newaccount_tx(&genesis_key, &genesis_key, account, &chain_id))
+            .collect();
+        let admissions: Vec<_> = late_transactions
+            .iter()
+            .cloned()
+            .map(|transaction| {
+                let service = service.clone();
+                tokio::spawn(async move { service.admit_transaction(transaction).await })
+            })
+            .collect();
+        for admission in admissions {
+            assert!(admission.await.unwrap().unwrap());
+        }
+        let live_mempool = mempool.read().await;
+        assert!(
+            late_transactions
+                .iter()
+                .all(|transaction| live_mempool.contains(transaction.id())),
+            "ingress must remain visible while production is waiting for the controller"
+        );
+        drop(live_mempool);
+        let metrics = service.admission_metrics();
+        assert_eq!(metrics.state_preflights, 6);
+        assert_eq!(metrics.fallback_controller_preflights, 0);
+        assert_eq!(metrics.controller_lock_wait_nanos, 0);
+
+        drop(controller_guard);
+        let block = build.await.unwrap().unwrap();
+        assert_eq!(
+            block.transactions.len(),
+            1,
+            "only the detached transaction is built"
+        );
+        let mempool = mempool.read().await;
+        assert!(
+            !mempool.contains(selected.id()),
+            "a transaction selected for the built block must not be restored"
+        );
+        assert!(
+            late_transactions
+                .iter()
+                .all(|transaction| mempool.contains(transaction.id())),
+            "transactions admitted during production must remain queued for the next block"
+        );
+    }
+
+    // Verify uses the same production batch handoff. Produce the block on an
+    // independent node, then hold the verifier's controller lock long enough
+    // to prove incoming RPCs do not wait on it and survive verification.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ingress_survives_actual_block_verify_pipeline() {
+        let (producer, _producer_pool, producer_key, producer_chain_id, _producer_temp) =
+            service_with_genesis();
+        let included = newaccount_tx(&producer_key, &producer_key, "alice", &producer_chain_id);
+        assert!(producer.admit_transaction(included).await.unwrap());
+        let block = producer.build_block().await.unwrap();
+
+        let (verifier, verifier_pool, verifier_key, verifier_chain_id, _verifier_temp) =
+            service_with_genesis();
+        let queued = newaccount_tx(&verifier_key, &verifier_key, "bob", &verifier_chain_id);
+        assert!(verifier.admit_transaction(queued.clone()).await.unwrap());
+
+        let controller_guard = verifier.controller.write().await;
+        let verifying_service = verifier.clone();
+        let verifying_block = block.clone();
+        let verify =
+            tokio::spawn(async move { verifying_service.verify_block(&verifying_block).await });
+        wait_for_batch_detach(&verifier_pool).await;
+
+        let late = newaccount_tx(&verifier_key, &verifier_key, "carol", &verifier_chain_id);
+        assert!(verifier.admit_transaction(late.clone()).await.unwrap());
+        assert!(verifier_pool.read().await.contains(late.id()));
+        let metrics = verifier.admission_metrics();
+        assert_eq!(metrics.state_preflights, 2);
+        assert_eq!(metrics.fallback_controller_preflights, 0);
+        assert_eq!(metrics.controller_lock_wait_nanos, 0);
+
+        drop(controller_guard);
+        verify.await.unwrap().unwrap();
+        let mempool = verifier_pool.read().await;
+        assert!(mempool.contains(queued.id()));
+        assert!(mempool.contains(late.id()));
+    }
+
+    // Admission is intentionally optimistic, so multiple concurrent copies can
+    // preflight. The final pool insertion remains the single deduplication
+    // point, even while a producer has reservations outstanding.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_duplicate_ingress_is_exactly_once_during_build_handoff() {
+        let (service, mempool, genesis_key, chain_id, _temp) = service_with_genesis();
+        let selected = newaccount_tx(&genesis_key, &genesis_key, "alice", &chain_id);
+        assert!(service.admit_transaction(selected).await.unwrap());
+
+        let controller_guard = service.controller.write().await;
+        let producer = service.clone();
+        let build = tokio::spawn(async move { producer.build_block().await });
+        wait_for_batch_detach(&mempool).await;
+
+        let duplicate = newaccount_tx(&genesis_key, &genesis_key, "bob", &chain_id);
+        let admissions: Vec<_> = (0..32)
+            .map(|_| {
+                let service = service.clone();
+                let duplicate = duplicate.clone();
+                tokio::spawn(async move { service.admit_transaction(duplicate).await })
+            })
+            .collect();
+        let mut newly_admitted = 0;
+        for admission in admissions {
+            newly_admitted += admission.await.unwrap().unwrap() as usize;
+        }
+        assert_eq!(
+            newly_admitted, 1,
+            "exactly one concurrent duplicate may enter the pool"
+        );
+        assert!(mempool.read().await.contains(duplicate.id()));
+
+        drop(controller_guard);
+        build.await.unwrap().unwrap();
+        assert!(mempool.read().await.contains(duplicate.id()));
     }
 }

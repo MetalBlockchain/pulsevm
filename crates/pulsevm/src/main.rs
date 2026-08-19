@@ -415,20 +415,7 @@ impl Vm for VirtualMachine {
         _request: Request<vm::BuildBlockRequest>,
     ) -> Result<tonic::Response<vm::BuildBlockResponse>, Status> {
         debug!("build_block called, building block...");
-        // Detached batches keep the mempool lock out of the expensive WASM
-        // execution path. Transactions arriving during construction stay in the
-        // live pool; transactions deferred by the controller are merged back
-        // below with their original expiry deadlines.
-        let mut batch = {
-            let mut mempool = self.mempool.write().await;
-            mempool.take_all()
-        };
-        let block_result = {
-            let mut controller = self.controller.write().await;
-            controller.build_block(batch.transactions_mut()).await
-        };
-        self.mempool.write().await.finish_batch(batch);
-        let block = block_result
+        let block = self.rpc_service.build_block().await
             .map_err(|e| Status::internal(format!("could not build block: {}", e)))?;
         let block_id = block
             .id()
@@ -529,18 +516,7 @@ impl Vm for VirtualMachine {
             }
         };
 
-        // Block verification may execute every transaction. As with production,
-        // detach the mempool so transaction admission only contends with the
-        // controller's required state lock, not a second long-held pool lock.
-        let mut batch = {
-            let mut mempool = self.mempool.write().await;
-            mempool.take_all()
-        };
-        let verify_result = {
-            let mut controller = self.controller.write().await;
-            controller.verify_block(&block, batch.transactions_mut()).await
-        };
-        self.mempool.write().await.finish_batch(batch);
+        let verify_result = self.rpc_service.verify_block(&block).await;
 
         match verify_result {
             Ok(_) => {
