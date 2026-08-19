@@ -3,7 +3,10 @@ use std::{
     time::Duration,
 };
 
-use pulsevm_core::mempool::Mempool;
+use pulsevm_core::{
+    mempool::Mempool,
+    time::TimePoint,
+};
 use tokio::{
     sync::{
         Notify,
@@ -47,9 +50,15 @@ impl BlockTimer {
     }
 
     pub async fn check_block_build(&self) {
-        let mempool = self.mempool.read().await;
+        // Do not wake the block builder for a pool containing only expired
+        // transactions. This also reclaims entries when no new gossip arrives.
+        let has_transactions = {
+            let mut mempool = self.mempool.write().await;
+            mempool.prune_expired(&TimePoint::now());
+            mempool.has_transactions()
+        };
 
-        if mempool.has_transactions() {
+        if has_transactions {
             self.request_block_build().await;
         }
     }

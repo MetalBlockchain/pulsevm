@@ -45,6 +45,7 @@ use pulsevm_core::{
         PublicKey,
     },
     id::Id,
+    mempool::DEFAULT_MEMPOOL_TRANSACTION_TTL_SECS,
     name::Name,
     producer_schedule::ProducerKey,
     pulse_contract::{
@@ -149,7 +150,7 @@ async fn push(
         .head_block_num;
 
     let mut txn = Transaction::default();
-    txn.header.expiration = TimePointSec::now() + 300;
+    txn.header.expiration = TimePointSec::now() + DEFAULT_MEMPOOL_TRANSACTION_TTL_SECS;
     txn.actions = actions;
 
     let signed = txn

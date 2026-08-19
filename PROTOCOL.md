@@ -135,7 +135,7 @@ Even though Pulse is based on EOS, there are quite some differences when it come
 
 Contrary to EOS, Pulse uses the JsonRPC specification to expose its API. The following methods will be available:
 
-- `pulse.issueTx`: submits a transaction, executes it locally and broadcasts it to the network upon succesful execution
+- `pulse.issueTx`: submits a transaction, validates its lifetime, referenced accounts, and authorization, then queues and broadcasts it; actions execute when a producer includes it in a block
 - `pulse.getAccount`: retrieves information about an account
 - `pulse.getAccountBalance`: retrieves an account's balance of a specific token
 - `pulse.getBlock`: retrieves information about a block

@@ -194,36 +194,41 @@ impl RpcService {
     /// `Ok(true)` if it was newly added, `Ok(false)` if it was already known (or
     /// the mempool is full), and `Err` if it failed validation and must not be
     /// propagated. Shared by the RPC issue path and the peer-gossip path so both
-    /// apply the same admission rules — a transaction only enters the mempool
-    /// after it executes cleanly, and the newly-added flag lets the caller relay
+    /// apply the same admission rules. Admission validates transaction shape,
+    /// lifetime, referenced accounts, and authorization, but defers action
+    /// execution to block production. The newly-added flag lets the caller relay
     /// exactly once, which stops gossip from looping.
     pub async fn admit_transaction(
         &self,
         packed_trx: PackedTransaction,
     ) -> Result<bool, ChainError> {
-        // Fast path: a transaction we already hold has been validated and
-        // relayed once already, so skip the expensive execute-and-revert and
-        // report it as not newly added. This is what absorbs re-gossip of a
-        // transaction already in flight.
-        if self.mempool.read().await.contains(packed_trx.id()) {
-            return Ok(false);
+        // Expired transactions must not occupy a bounded mempool or make a
+        // re-gossiped transaction look like a duplicate. Do this before the
+        // membership check so a newly arrived transaction can reclaim stale
+        // capacity immediately.
+        {
+            let mut mempool = self.mempool.write().await;
+            mempool.prune_expired(&TimePoint::now());
+
+            // Fast path: a transaction we already hold has been validated and
+            // relayed once already, so skip preflight and report it as not newly
+            // added. This is what absorbs re-gossip of a transaction already in
+            // flight.
+            if mempool.contains(packed_trx.id()) {
+                return Ok(false);
+            }
         }
 
-        // Execution is synchronous, with blocking database/wasm work and no await points,
-        // so run it on the blocking pool and take the lock with blocking_write()
-        // instead of holding the async lock on a runtime worker, which would
-        // stall every other handler. push_transaction reverts the database, so
-        // this is validation only — nothing is committed.
+        // Preflight is synchronous, performs database reads and signature
+        // recovery, and has no await points. Run it on the blocking pool rather
+        // than holding an async read lock on a runtime worker. It does not
+        // execute WASM or open an undo session.
         let controller = self.controller.clone();
         let trx_for_exec = packed_trx.clone();
         tokio::task::spawn_blocking(move || {
-            let mut controller = controller.blocking_write();
+            let controller = controller.blocking_read();
             let pending_block_timestamp = TimePoint::now().into();
-            controller.push_transaction(
-                &trx_for_exec,
-                &pending_block_timestamp,
-                &pulsevm_core::block::BlockStatus::Verifying,
-            )
+            controller.validate_transaction_for_mempool(&trx_for_exec, &pending_block_timestamp)
         })
         .await
         .map_err(|e| {
@@ -750,6 +755,44 @@ mod tests {
         assert!(
             !mempool.read().await.contains(forged.id()),
             "a rejected transaction must not reach the mempool"
+        );
+    }
+
+    // Admission intentionally does not execute actions. This transaction has a
+    // valid lifetime, account references, and signature, but attempts to create
+    // the already-existing `pulse` account and therefore fails only when the
+    // producer attempts to build a block. Keeping this distinction prevents
+    // every successfully produced transaction from paying for a speculative
+    // execute-and-revert first.
+    #[tokio::test]
+    async fn admit_transaction_defers_action_execution_to_block_production() {
+        let (service, mempool, genesis_key, chain_id, _temp) = service_with_genesis();
+        let invalid_at_execution = newaccount_tx(&genesis_key, &genesis_key, "pulse", &chain_id);
+
+        assert!(
+            service
+                .admit_transaction(invalid_at_execution.clone())
+                .await
+                .unwrap(),
+            "static preflight should admit a transaction without executing its action"
+        );
+        assert!(mempool.read().await.contains(invalid_at_execution.id()));
+
+        let build_result = {
+            let mut controller = service.controller.write().await;
+            let mut mempool = mempool.write().await;
+            controller.build_block(&mut mempool).await
+        };
+        assert!(
+            build_result.is_err(),
+            "the unexecutable transaction should be discarded while building"
+        );
+        assert!(
+            !mempool
+                .read()
+                .await
+                .contains(invalid_at_execution.id()),
+            "a transaction rejected during block production must not remain queued"
         );
     }
 }
