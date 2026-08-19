@@ -21,6 +21,7 @@ use pulsevm_core::{
     id::Id,
     mempool::Mempool,
     name::Name,
+    protocol_features::PROTOCOL_VERSION,
     time::{
         TimePoint,
         seconds,
@@ -216,7 +217,7 @@ impl RpcService {
         // this is validation only — nothing is committed.
         let controller = self.controller.clone();
         let trx_for_exec = packed_trx.clone();
-        tokio::task::spawn_blocking(move || {
+        let execution = tokio::task::spawn_blocking(move || {
             let mut controller = controller.blocking_write();
             let pending_block_timestamp = TimePoint::now().into();
             controller.push_transaction(
@@ -228,7 +229,14 @@ impl RpcService {
         .await
         .map_err(|e| {
             ChainError::InternalError(format!("transaction execution task failed: {e}"))
-        })??;
+        })?;
+        match execution {
+            Ok(_) => {}
+            Err(error) if error.is_fatal_consistency() => {
+                crate::abort_on_fatal_consistency("transaction admission", &error)
+            }
+            Err(error) => return Err(error),
+        }
 
         let mut mempool = self.mempool.write().await;
         Ok(mempool.add_transaction(packed_trx))
@@ -371,6 +379,17 @@ impl RpcServer for RpcService {
 
         Ok(GetInfoResponse {
             server_version: "d133c641".to_owned(),
+            protocol_version: controller.protocol_version(head_block.block_num()),
+            supported_protocol_version: PROTOCOL_VERSION,
+            protocol_upgrade_schedule_hash: hex::encode(
+                controller.protocol_upgrade_schedule_hash(),
+            ),
+            next_protocol_upgrade: controller
+                .next_protocol_upgrade(head_block.block_num())
+                .map(|upgrade| crate::api::ProtocolUpgradeInfo {
+                    protocol_version: upgrade.protocol_version,
+                    activation_height: upgrade.activation_height,
+                }),
             server_time: TimePoint::now().into(),
             chain_id: controller.chain_id().clone(),
             head_block_num: head_block.block_num(),
@@ -606,6 +625,8 @@ mod tests {
 
     const GENESIS_KEY: &str = "PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez";
     const CHAIN_ID: &str = "c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6";
+    const EMPTY_PROTOCOL_SCHEDULE_HASH: &str =
+        "bd592e76c0fd69a5a57fe16bb4db1a26d80d7b66c16b760e44207008c07d5d7c";
 
     fn genesis_bytes(key: &PrivateKey) -> Vec<u8> {
         // Mirrors the controller test genesis: point-denominated CPU budgets and a
@@ -713,6 +734,30 @@ mod tests {
             Arc::new(RwLock::new(NetworkManager::new())),
         );
         (service, mempool, genesis_key, chain_id, temp)
+    }
+
+    #[tokio::test]
+    async fn get_info_reports_and_serializes_accepted_protocol_state() {
+        let (service, _mempool, _genesis_key, _chain_id, _temp) = service_with_genesis();
+
+        let response = service.get_info().await.unwrap();
+        assert_eq!(response.protocol_version, 1);
+        assert_eq!(response.supported_protocol_version, PROTOCOL_VERSION);
+        assert_eq!(
+            response.protocol_upgrade_schedule_hash,
+            EMPTY_PROTOCOL_SCHEDULE_HASH
+        );
+        assert!(response.next_protocol_upgrade.is_none());
+        assert_eq!(response.head_block_num, 1);
+
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["protocol_version"], json!(1));
+        assert_eq!(json["supported_protocol_version"], json!(PROTOCOL_VERSION));
+        assert_eq!(
+            json["protocol_upgrade_schedule_hash"],
+            json!(EMPTY_PROTOCOL_SCHEDULE_HASH)
+        );
+        assert_eq!(json["next_protocol_upgrade"], serde_json::Value::Null);
     }
 
     // A correctly signed transaction is validated and admitted once; a second

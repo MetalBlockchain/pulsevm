@@ -1,0 +1,34 @@
+name: Set up protoc
+description: Download a pinned protoc release without using the GitHub API
+
+inputs:
+  version:
+    description: Protobuf compiler version to install
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Download protoc
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        case "$(uname -m)" in
+          x86_64) protoc_arch=x86_64 ;;
+          aarch64) protoc_arch=aarch_64 ;;
+          *)
+            echo "Unsupported architecture: $(uname -m)" >&2
+            exit 1
+            ;;
+        esac
+
+        protoc_version="${{ inputs.version }}"
+        protoc_dir="$RUNNER_TEMP/protoc-${protoc_version}-${protoc_arch}"
+        archive="$RUNNER_TEMP/protoc-${protoc_version}-${protoc_arch}.zip"
+        url="https://github.com/protocolbuffers/protobuf/releases/download/v${protoc_version}/protoc-${protoc_version}-linux-${protoc_arch}.zip"
+
+        curl --fail --location --retry 5 --retry-all-errors --output "$archive" "$url"
+        unzip -q "$archive" -d "$protoc_dir"
+        echo "$protoc_dir/bin" >> "$GITHUB_PATH"
+        "$protoc_dir/bin/protoc" --version

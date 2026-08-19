@@ -47,7 +47,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install Protobuf (protoc)
-        uses: arduino/setup-protoc@v2
+        uses: ./.github/actions/setup-protoc
         with:
           version: '27.1'
 

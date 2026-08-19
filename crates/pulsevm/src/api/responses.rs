@@ -10,6 +10,10 @@ use serde::Serialize;
 #[derive(Serialize, Clone, Default)]
 pub struct GetInfoResponse {
     pub server_version: String,
+    pub protocol_version: u32,
+    pub supported_protocol_version: u32,
+    pub protocol_upgrade_schedule_hash: String,
+    pub next_protocol_upgrade: Option<ProtocolUpgradeInfo>,
     pub server_time: BlockTimestamp,
     pub chain_id: Id,
     pub head_block_num: u32,
@@ -30,6 +34,12 @@ pub struct GetInfoResponse {
     pub total_net_weight: u64,
     pub earliest_available_block_num: u32,
     pub last_irreversible_block_time: BlockTimestamp,
+}
+
+#[derive(Serialize, Clone, Copy, Default)]
+pub struct ProtocolUpgradeInfo {
+    pub protocol_version: u32,
+    pub activation_height: u32,
 }
 
 #[derive(Serialize, Clone)]

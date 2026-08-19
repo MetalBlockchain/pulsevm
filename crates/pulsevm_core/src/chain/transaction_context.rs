@@ -11,18 +11,6 @@ use std::{
     },
 };
 
-use pulsevm_constants::MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER;
-use pulsevm_crypto::Digest;
-use pulsevm_database::{
-    BlockTimestamp,
-    Database,
-    Microseconds,
-    TimePoint,
-    seconds,
-};
-use pulsevm_error::ChainError;
-use pulsevm_serialization::VarUint32;
-
 use crate::{
     authorization_manager::AuthorizationManager,
     block::BlockStatus,
@@ -31,6 +19,11 @@ use crate::{
         id::Id,
         name::Name,
         producer_schedule::ProducerKey,
+        protocol_features::{
+            ProtocolExecutionContext,
+            ProtocolFeature,
+            ProtocolVersion,
+        },
         resource_limits::ResourceLimitsManager,
         transaction::{
             Action,
@@ -44,7 +37,17 @@ use crate::{
     },
     transaction::PackedTransaction,
 };
-
+use pulsevm_constants::MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER;
+use pulsevm_crypto::Digest;
+use pulsevm_database::{
+    BlockTimestamp,
+    Database,
+    Microseconds,
+    TimePoint,
+    seconds,
+};
+use pulsevm_error::ChainError;
+use pulsevm_serialization::VarUint32;
 #[derive(Default, Clone)]
 struct Billing {
     paused_time: TimePoint,
@@ -97,6 +100,11 @@ pub struct TransactionContext {
     db: Database,
     wasm_runtime: WasmRuntime,
     block_status: BlockStatus,
+    // Consensus context selected and support-checked by the controller for the
+    // exact block this transaction is executing in. Keeping it immutable and
+    // carrying it through every clone prevents descendant/replay execution from
+    // falling back to `last_accepted + 1`.
+    protocol_context: ProtocolExecutionContext,
     packed_transaction: PackedTransaction,
     inner: Arc<RwLock<TransactionContextInner>>,
 }
@@ -105,7 +113,7 @@ impl TransactionContext {
     pub fn new(
         db: Database,
         wasm_runtime: WasmRuntime,
-        block_num: u32,
+        protocol_context: ProtocolExecutionContext,
         pending_block_timestamp: BlockTimestamp,
         transaction_id: &Id,
         block_status: BlockStatus,
@@ -114,13 +122,14 @@ impl TransactionContext {
     ) -> Self {
         let mut trace = TransactionTrace::default();
         trace.id = *transaction_id;
-        trace.block_num = block_num;
+        trace.block_num = protocol_context.block_height();
         trace.block_time = pending_block_timestamp.clone();
 
         Self {
             db,
             wasm_runtime,
             block_status,
+            protocol_context,
             inner: Arc::new(RwLock::new(TransactionContextInner {
                 initialized: false,
                 trace,
@@ -154,6 +163,29 @@ impl TransactionContext {
         }
     }
 
+    /// Validated consensus context for the block containing this transaction.
+    pub fn protocol_context(&self) -> ProtocolExecutionContext {
+        self.protocol_context
+    }
+
+    /// Number of the block containing this transaction.
+    pub fn block_num(&self) -> u32 {
+        self.protocol_context.block_height()
+    }
+
+    /// Consensus protocol version selected for this transaction's block.
+    pub fn protocol_version(&self) -> ProtocolVersion {
+        self.protocol_context.protocol_version()
+    }
+
+    /// Query a feature against the already support-checked block context.
+    pub fn protocol_feature_enabled(&self, feature: ProtocolFeature) -> bool {
+        self.protocol_context.feature_enabled(feature)
+    }
+
+    /// Record the producer schedule in force for the block this transaction runs
+    /// in. The controller sets this before execution so `get_active_producers`
+    /// and `set_proposed_producers` can read the active set and version.
     pub fn set_active_schedule(
         &self,
         producers: Vec<ProducerKey>,

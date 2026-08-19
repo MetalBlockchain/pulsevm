@@ -40,7 +40,7 @@ jobs:
           components: clippy
 
       - name: Install Protobuf (protoc)
-        uses: arduino/setup-protoc@v2
+        uses: ./.github/actions/setup-protoc
         with:
           version: '27.1'
 
@@ -63,3 +63,10 @@ jobs:
       # with the older pulsevm_core-wide Clippy backlog.
       - name: Clippy pure-Rust database stack
         run: cargo clippy -p pulsevm_arena -p pulsevm_chaindb -p pulsevm_database --all-targets --all-features --locked -- -D warnings
+
+      # `nightly` is a Cargo feature for preview protocol implementations, not
+      # the Rust nightly toolchain.
+      - name: Check nightly protocol profile
+        run: |
+          cargo test -p pulsevm_core --locked --lib --features nightly
+          cargo check -p pulsevm --locked --features nightly

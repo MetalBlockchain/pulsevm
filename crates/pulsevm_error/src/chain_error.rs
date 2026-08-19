@@ -5,6 +5,12 @@ use wasmer::RuntimeError;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ChainError {
+    /// A fallible persistence operation crossed its publication boundary and
+    /// could not restore the previously live state. Continuing to process
+    /// consensus messages could build on a partially published view, so callers
+    /// at the process boundary must fail-stop instead of returning to the engine.
+    #[error("fatal consistency error: {0}")]
+    FatalConsistency(String),
     #[error("internal error: {0:?}")]
     InternalError(String),
     #[error("block error: {0}")]
@@ -49,6 +55,19 @@ pub enum ChainError {
     DeadlineError(String),
 }
 
+impl ChainError {
+    /// Construct an error that requires the VM process to fail-stop.
+    pub fn fatal_consistency(message: impl Into<String>) -> Self {
+        Self::FatalConsistency(message.into())
+    }
+
+    /// Whether continuing in this process could expose partially published
+    /// consensus state.
+    pub const fn is_fatal_consistency(&self) -> bool {
+        matches!(self, Self::FatalConsistency(_))
+    }
+}
+
 impl From<Box<dyn Error>> for ChainError {
     fn from(_: Box<dyn Error>) -> Self {
         ChainError::InternalError("internal error".into())
@@ -76,5 +95,21 @@ impl From<ChainError> for RuntimeError {
 impl From<ChainError> for ErrorObjectOwned {
     fn from(err: ChainError) -> Self {
         ErrorObjectOwned::owned(-32000, err.to_string(), None::<()>)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ChainError;
+
+    #[test]
+    fn fatal_consistency_is_explicitly_classified() {
+        let fatal = ChainError::fatal_consistency("published only half the state");
+        assert!(fatal.is_fatal_consistency());
+        assert_eq!(
+            fatal.to_string(),
+            "fatal consistency error: published only half the state"
+        );
+        assert!(!ChainError::InternalError("retryable".into()).is_fatal_consistency());
     }
 }
