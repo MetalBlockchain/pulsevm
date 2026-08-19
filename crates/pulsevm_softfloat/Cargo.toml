@@ -1,0 +1,16 @@
+[package]
+name = "pulsevm_softfloat"
+version = "0.1.0"
+edition = "2024"
+
+# Pure-Rust port of the EOSIO/Antelope 128-bit softfloat compiler-rt routines
+# used by the WASM float builtins. Bit-exact against the vendored Berkeley
+# SoftFloat (8086-SSE specialization) reached through pulsevm_database. See the
+# cross-validation harness in crates/pulsevm_database/tests/softfloat_cross_validation.rs.
+
+[dependencies]
+# APFloat is the pure-Rust IEEE-754 implementation rustc itself uses for
+# const-eval. We lean on it only for the correctly-rounded core arithmetic and
+# for widen/narrow rounding; every NaN/overflow/saturation path is a direct
+# port of the vendored C so the returned bit patterns match exactly.
+rustc_apfloat = "0.2.3"

@@ -12,6 +12,8 @@ jobs:
   test:
     name: linux-${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
+    env:
+      LLVM_SYS_221_PREFIX: /usr/lib/llvm-22
 
     strategy:
       fail-fast: false
@@ -27,15 +29,15 @@ jobs:
         run: wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key|sudo apt-key add - && sudo echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" | sudo tee /etc/apt/sources.list.d/llvm.list
 
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y gcc-13 g++-13 cmake libgmp-dev zlib1g-dev pkg-config libcurl4-openssl-dev libboost-all-dev llvm-22-dev libpolly-22-dev
+        run: sudo apt-get update && sudo apt-get install -y gcc-13 cmake zlib1g-dev pkg-config llvm-22-dev libpolly-22-dev
 
       - name: Checkout source code
         uses: actions/checkout@v4
-        with:
-          submodules: 'recursive'
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
 
       - name: Install Protobuf (protoc)
         uses: arduino/setup-protoc@v2
@@ -43,7 +45,7 @@ jobs:
           version: '27.1'
 
       - name: Cache cargo registry
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
@@ -51,5 +53,13 @@ jobs:
             target
           key: ${{ runner.os }}-${{ matrix.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Run tests
-        run: CXX=/usr/bin/g++-13 CC=/usr/bin/gcc-13 LLVM_SYS_221_PREFIX=/usr/lib/llvm-22 cargo test
+      - name: Run workspace tests
+        run: cargo test --workspace --locked
+
+      - name: Compile every target
+        run: cargo test --workspace --all-targets --locked --no-run
+
+      # Keep the cutover crates warning-free without conflating this migration
+      # with the older pulsevm_core-wide Clippy backlog.
+      - name: Clippy pure-Rust database stack
+        run: cargo clippy -p pulsevm_arena -p pulsevm_chaindb -p pulsevm_database --all-targets --all-features --locked -- -D warnings

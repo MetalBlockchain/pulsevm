@@ -6,9 +6,7 @@
 //! generates the sequences and shrinks any failure to a minimal reproducer.
 //!
 //! The reference here is a full-snapshot model — session start clones the whole
-//! state, undo restores the clone — which is trivially correct but slow. Swap it
-//! for the C++ FFI chainbase and the same harness becomes the consensus
-//! equivalence check.
+//! state and undo restores the clone — which is trivially correct but slow.
 
 use std::collections::BTreeMap;
 

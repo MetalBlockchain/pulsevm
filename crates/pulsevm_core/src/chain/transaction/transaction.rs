@@ -1,11 +1,11 @@
 use std::collections::BTreeSet;
 
 use pulsevm_crypto::Bytes;
-use pulsevm_error::ChainError;
-use pulsevm_ffi::{
+use pulsevm_database::{
     BlockTimestamp,
     TimePointSec,
 };
+use pulsevm_error::ChainError;
 use pulsevm_proc_macros::{
     NumBytes,
     Read,

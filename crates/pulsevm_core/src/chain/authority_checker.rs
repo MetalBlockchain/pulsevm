@@ -3,11 +3,11 @@ use std::collections::{
     HashMap,
 };
 
-use pulsevm_error::ChainError;
-use pulsevm_ffi::{
+use pulsevm_database::{
     DbRead,
     Microseconds,
 };
+use pulsevm_error::ChainError;
 
 use crate::crypto::PublicKey;
 
@@ -113,7 +113,8 @@ impl<'a> AuthorityChecker<'a> {
     }
 
     pub fn visit_key_weight(&mut self, key: &KeyWeight) -> Result<u16, ChainError> {
-        let pub_key = PublicKey::new(key.key.clone());
+        // KeyWeight now carries the pure-Rust K1 key directly.
+        let pub_key = PublicKey::new(key.key);
 
         if self.provided_keys.contains(&pub_key) {
             self.used_keys.insert(pub_key);
@@ -153,7 +154,7 @@ impl<'a> AuthorityChecker<'a> {
         }
 
         // not cached yet – fetch authority from DB
-        let auth = match db.find_permission_by_actor_and_permission(
+        let auth = match db.permission_authority(
             permission.permission.actor,
             permission.permission.permission,
         )? {
@@ -167,11 +168,7 @@ impl<'a> AuthorityChecker<'a> {
             PermissionCacheStatus::BeingEvaluated,
         );
 
-        let satisfied = self.satisfied(
-            db,
-            &auth.get_authority().to_authority(),
-            recursion_depth + 1,
-        )?;
+        let satisfied = self.satisfied(db, &auth, recursion_depth + 1)?;
 
         if satisfied {
             self.cached_permissions.insert(

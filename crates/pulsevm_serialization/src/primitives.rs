@@ -366,7 +366,7 @@ where
     #[inline]
     fn read(bytes: &[u8], pos: &mut usize) -> Result<Self, ReadError> {
         let len = usize::read(bytes, pos)?;
-        let mut vec = Vec::with_capacity(bounded_capacity::<T>(len, bytes, *pos));
+        let mut vec = Vec::with_capacity(bounded_capacity(len, bytes, *pos));
         for _ in 0..len {
             let item = T::read(bytes, pos)?;
             vec.push(item);
@@ -381,7 +381,7 @@ where
 /// a few bytes of length prefix from driving a multi-gigabyte reservation before
 /// the first element (which would then fail) is even read.
 #[inline]
-fn bounded_capacity<T>(len: usize, bytes: &[u8], pos: usize) -> usize {
+fn bounded_capacity(len: usize, bytes: &[u8], pos: usize) -> usize {
     len.min(bytes.len().saturating_sub(pos))
 }
 
@@ -392,7 +392,7 @@ where
     #[inline]
     fn read(bytes: &[u8], pos: &mut usize) -> Result<Self, ReadError> {
         let len = usize::read(bytes, pos)?;
-        let mut vec = VecDeque::with_capacity(bounded_capacity::<T>(len, bytes, *pos));
+        let mut vec = VecDeque::with_capacity(bounded_capacity(len, bytes, *pos));
         for _ in 0..len {
             let item = T::read(bytes, pos)?;
             vec.push_back(item);
@@ -435,7 +435,7 @@ impl<K: Read + Write + NumBytes + Ord + Hash, V: Read + Write + NumBytes> Read f
     #[inline]
     fn read(bytes: &[u8], pos: &mut usize) -> Result<Self, ReadError> {
         let len = usize::read(bytes, pos)?;
-        let mut map = HashMap::with_capacity(bounded_capacity::<(K, V)>(len, bytes, *pos));
+        let mut map = HashMap::with_capacity(bounded_capacity(len, bytes, *pos));
         for _ in 0..len {
             let key = K::read(bytes, pos)?;
             let value = V::read(bytes, pos)?;
@@ -650,7 +650,7 @@ impl Write for f64 {
     }
 }
 
-impl<'a> Write for String {
+impl Write for String {
     #[inline]
     fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), WriteError> {
         self.len().write(bytes, pos)?;
@@ -800,9 +800,9 @@ mod tests {
     #[test]
     fn bounded_capacity_caps_at_remaining_bytes() {
         let bytes = [0u8; 8];
-        assert_eq!(bounded_capacity::<u32>(1_000_000, &bytes, 2), 6);
-        assert_eq!(bounded_capacity::<u32>(3, &bytes, 2), 3);
-        assert_eq!(bounded_capacity::<u32>(10, &bytes, 20), 0);
+        assert_eq!(bounded_capacity(1_000_000, &bytes, 2), 6);
+        assert_eq!(bounded_capacity(3, &bytes, 2), 3);
+        assert_eq!(bounded_capacity(10, &bytes, 20), 0);
     }
 
     #[test]

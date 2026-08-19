@@ -8,7 +8,6 @@ use pulsevm_core::{
     ACTIVE_NAME,
     ChainError,
     PULSE_NAME,
-    abi::AbiDefinition,
     asset::{
         Asset,
         Symbol,
@@ -31,7 +30,7 @@ use pulsevm_core::{
         TransactionHeader,
     },
 };
-use pulsevm_ffi::{
+use pulsevm_database::{
     Authority,
     KeyWeight,
     PermissionLevel,
@@ -126,7 +125,7 @@ fn criterion_benchmark(c: &mut Criterion) {
     })
     .to_string()
     .into_bytes();
-    let genesis_bytes = generate_genesis(&private_key);
+    let genesis_bytes = generate_genesis();
     let temp_path = get_temp_dir().to_str().unwrap().to_string();
     controller
         .initialize(
@@ -188,10 +187,6 @@ fn criterion_benchmark(c: &mut Criterion) {
         .unwrap();
     let pulse_token_contract =
         fs::read(root.join(Path::new("reference_contracts/pulse_token.wasm"))).unwrap();
-    let pulse_token_abi =
-        fs::read(root.join(Path::new("reference_contracts/pulse_token.abi"))).unwrap();
-    let packed_abi: AbiDefinition = serde_json::from_slice(&pulse_token_abi).unwrap();
-    let packed_abi_bytes = packed_abi.pack().unwrap();
     controller
         .execute_transaction(
             &set_code(
@@ -333,10 +328,7 @@ fn create_account(
 ) -> Result<PackedTransaction, ChainError> {
     let authority = Authority::new(
         1,
-        vec![KeyWeight::new(
-            private_key.get_public_key().inner().clone(),
-            1,
-        )],
+        vec![KeyWeight::new(private_key.get_public_key().into_k1(), 1)],
         vec![],
         vec![],
     );
@@ -410,10 +402,11 @@ fn set_code(
 fn get_temp_dir() -> PathBuf {
     let temp_dir_name = format!("db_{}.pulsevm", Utc::now().format("%Y%m%d%H%M%S"));
     let res = temp_dir().join(Path::new(&temp_dir_name));
+    fs::create_dir_all(&res).unwrap();
     res
 }
 
-fn generate_genesis(private_key: &PrivateKey) -> Vec<u8> {
+fn generate_genesis() -> Vec<u8> {
     let genesis = json!(
     {
         "initial_timestamp": "2023-01-01T00:00:00",

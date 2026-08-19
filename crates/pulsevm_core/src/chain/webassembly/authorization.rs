@@ -75,7 +75,7 @@ pub fn is_account(
 ) -> Result<i32, RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();
-    // is_account hits chainbase, unlike the auth scans above, so it's priced as a lookup.
+    // is_account hits the database, unlike the auth scans above, so it is priced as a lookup.
     env_data.charge(&mut store, cost::DB_FIND)?;
     let context = env_data.apply_context();
     let result = context.is_account(&recipient.into())?;

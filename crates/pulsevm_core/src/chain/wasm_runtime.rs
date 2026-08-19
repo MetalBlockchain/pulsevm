@@ -9,12 +9,11 @@ use std::{
 
 use lru::LruCache;
 use pulsevm_crypto::Bytes;
-use pulsevm_error::ChainError;
-use pulsevm_ffi::{
+use pulsevm_database::{
     BlockTimestamp,
-    CxxDigest,
     Database,
 };
+use pulsevm_error::ChainError;
 use wasmer::{
     AsStoreMut,
     Engine,
@@ -225,10 +224,8 @@ use super::webassembly::{
     send_inline,
 };
 
-/// Sentinel raised by the `eosio_exit`/`pulse_exit` intrinsic. It reaches `run`
-/// as a wasm trap, but unlike a real trap it ends the current action
-/// *successfully* — the reference chain terminates the action and keeps the
-/// state it produced. `run` detects it and returns Ok.
+/// Sentinel raised by eosio_exit/pulse_exit. Wasmer transports it as a trap,
+/// but Antelope semantics treat it as successful termination of this action.
 #[derive(Debug)]
 pub struct WasmExit {
     pub code: i32,
@@ -503,26 +500,25 @@ impl WasmRuntime {
         action: Action,
         apply_context: ApplyContext,
         db: Database,
-        code_hash: &CxxDigest,
+        code_hash: &[u8; 32],
         cpu_limit: i64,
     ) -> Result<u64, ChainError> {
         // Pause timer
         apply_context.pause_billing_timer()?;
 
-        let id = Id::from(code_hash);
+        let id = Id::new(*code_hash);
         let module = {
             let mut inner = self.inner.write()?;
 
             if !inner.code_cache.contains(&id) {
-                let r = db.read()?;
-                let code_object = r.get_code_object_by_hash(code_hash, 0, 0)?;
+                let code_bytes = db.get_code_bytes_by_hash(code_hash, 0, 0)?;
 
                 // Compile on a fresh engine carrying the pinned deterministic
                 // config (NaN canonicalization, metering, feature set).
                 let temp_engine = Self::deterministic_engine();
                 let temp_store = Store::new(temp_engine.clone());
 
-                let module = Module::new(temp_store.engine(), code_object.get_code().as_slice())
+                let module = Module::new(temp_store.engine(), code_bytes.as_slice())
                     .map_err(|e| ChainError::WasmRuntimeError(e.to_string()))?;
                 inner.code_cache.put(
                     id,
@@ -805,24 +801,16 @@ impl WasmRuntime {
         // Resume timer
         apply_context.resume_billing_timer()?;
 
-        // Compilation ran inside the paused window above and can be a slow native
-        // window on a cache miss; the deadline measures raw wall-clock, so re-check
-        // it now — before the guest runs — to abandon a transaction that already
-        // blew its budget compiling rather than sink more time into execution.
+        // Compilation happens while billing is paused, but the subjective
+        // watchdog deliberately includes that native wall-clock window.
         apply_context.checktime()?;
 
-        // Keep the raw RuntimeError so an eosio_exit/pulse_exit trap (WasmExit) can
-        // be told apart from a real failure before it's flattened into a ChainError
-        // (the WasmExit-aware match below does that flattening).
         let result = apply_func.call(
             &mut warm.store,
             receiver.as_u64() as i64,
             action.account().as_u64() as i64,
             action.name().as_u64() as i64,
         );
-        // A value the contract set via set_action_return_value lives on the env;
-        // capture it before the warm store returns to the pool so it can be
-        // surfaced on the action trace (informational; not part of the digest).
         let return_value = warm.env.as_ref(&warm.store).return_value.clone();
         let remaining_points: MeteringPoints = get_remaining_points(&mut warm.store, &instance);
 
@@ -838,9 +826,6 @@ impl WasmRuntime {
         match remaining_points {
             MeteringPoints::Remaining(points) => {
                 if let Err(e) = result {
-                    // eosio_exit/pulse_exit ends the action successfully; every
-                    // other trap is a real failure. Restore a ChainError raised by
-                    // a host fn, otherwise wrap the trap message.
                     if e.downcast_ref::<WasmExit>().is_none() {
                         if let Some(chain_err) = e.downcast_ref::<ChainError>() {
                             return Err(chain_err.clone());
@@ -849,8 +834,8 @@ impl WasmRuntime {
                     }
                 }
 
-                if let Some(rv) = return_value {
-                    apply_context.set_trace_return_value(rv.0)?;
+                if let Some(value) = return_value {
+                    apply_context.set_trace_return_value(value.0)?;
                 }
 
                 Ok(cpu_limit.saturating_sub(points) as u64)
@@ -1048,10 +1033,7 @@ mod tests {
 
         use sha2::Digest as _;
 
-        use crate::{
-            crypto::PrivateKey,
-            utils::Digest as CoreDigest,
-        };
+        use crate::crypto::PrivateKey;
 
         // Points are an upper bound on real time; bias high. NEAR historically
         // used ~3x. Under-charging is the only unsafe direction.
@@ -1145,7 +1127,7 @@ mod tests {
         );
 
         // sweep a sized intrinsic, fit, and print its candidate constants.
-        let mut report_sized = |name: &str, shipped_base: u64, mut work: Box<dyn FnMut(&[u8])>| {
+        let report_sized = |name: &str, shipped_base: u64, mut work: Box<dyn FnMut(&[u8])>| {
             let data: Vec<(f64, f64)> = sizes
                 .iter()
                 .map(|&s| {
@@ -1216,7 +1198,7 @@ mod tests {
         // --- recover_key: fixed, no size sweep ---
         let key = PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")
             .unwrap();
-        let digest = CoreDigest::from_data(b"pulsevm-intrinsic-cost-benchmark");
+        let digest = pulsevm_crypto::Digest::hash(b"pulsevm-intrinsic-cost-benchmark");
         let sig = key.sign(&digest).unwrap();
         let recover_ns = time_ns(300, || {
             black_box(sig.recover_public_key(black_box(&digest)).unwrap());
@@ -1447,7 +1429,7 @@ mod tests {
             "operator", "ns/op", "points", "shipped"
         );
 
-        let mut row = |name: &str, ns: f64, shipped: u64| {
+        let row = |name: &str, ns: f64, shipped: u64| {
             let note = if ns < floor {
                 "folded (kept)"
             } else {
@@ -1532,142 +1514,10 @@ mod tests {
     //   cargo test -p pulsevm_core --lib estimate_db_intrinsic_costs \
     //     -- --ignored --nocapture
     //
-    // The db intrinsics do native FFI/chainbase work invisible to wasm metering, so
+    // The db intrinsics do native database work invisible to wasm metering, so
     // like the crypto intrinsics they bill themselves and get the same 3x safety
     // multiplier. We time the real work directly on a populated table (Database +
     // KeyValueIteratorCache, the same path db_find_i64/db_next_i64/db_store_i64
     // reach through ApplyContext, minus the RwLock hop) and convert ns -> points via
     // the shared anchor. This is the PROVISIONAL tier the intrinsic doc called out.
-    #[test]
-    #[ignore = "calibration tool; needs a chainbase, run manually with --ignored --nocapture"]
-    fn estimate_db_intrinsic_costs() {
-        use std::{
-            hint::black_box,
-            time::Instant,
-        };
-
-        use pulsevm_ffi::{
-            Database,
-            KeyValueIteratorCache,
-            TableObject,
-        };
-        use tempfile::tempdir;
-
-        // Native work is unmetered, so bias the price high, as the crypto table does.
-        const SAFETY: f64 = 3.0;
-        const DB_SIZE: u64 = 256 * 1024 * 1024;
-        const CODE: u64 = 1;
-        const SCOPE: u64 = 2;
-        const TABLE: u64 = 3;
-        const PAYER: u64 = 1;
-        const ROWS: u64 = 8192; // table population for the lookup/scan measurements
-
-        let ns_per_point = anchor_ns_per_point();
-        let pts = |ns: f64| (ns / ns_per_point * SAFETY).ceil();
-
-        // A populated table to measure find and forward iteration against.
-        let dir = tempdir().unwrap();
-        let mut db = Database::new(dir.path().to_str().unwrap(), DB_SIZE).unwrap();
-        db.add_indices().unwrap();
-        let mut cache = KeyValueIteratorCache::new();
-        let table_ptr = db.create_table(CODE, SCOPE, TABLE, PAYER).unwrap();
-        let table_ref: &TableObject = unsafe { &*table_ptr };
-        for pk in 0..ROWS {
-            db.create_key_value_object(table_ref, PAYER, pk, &pk.to_le_bytes())
-                .unwrap();
-        }
-        cache.cache_table(table_ref).unwrap();
-
-        // find: average over a full sweep of present keys, best of several sweeps.
-        let find_ns = {
-            for pk in 0..ROWS {
-                black_box(db.db_find_i64(CODE, SCOPE, TABLE, pk, &mut cache).unwrap());
-            }
-            let mut best = f64::MAX;
-            for _ in 0..7 {
-                let t = Instant::now();
-                for pk in 0..ROWS {
-                    black_box(db.db_find_i64(CODE, SCOPE, TABLE, pk, &mut cache).unwrap());
-                }
-                best = best.min(t.elapsed().as_nanos() as f64 / ROWS as f64);
-            }
-            best
-        };
-
-        // iterate: lowerbound(0) then next() to the end iterator, per step.
-        let iter_ns = {
-            let mut best = f64::MAX;
-            for _ in 0..7 {
-                let end = db.db_end_i64(&mut cache, CODE, SCOPE, TABLE).unwrap();
-                let t = Instant::now();
-                let mut it = db
-                    .db_lowerbound_i64(&mut cache, CODE, SCOPE, TABLE, 0)
-                    .unwrap();
-                let mut steps = 0u64;
-                while it != end && steps <= ROWS {
-                    let mut p = 0u64;
-                    it = db.db_next_i64(&mut cache, it, &mut p).unwrap();
-                    steps += 1;
-                }
-                best = best.min(t.elapsed().as_nanos() as f64 / steps.max(1) as f64);
-            }
-            best
-        };
-
-        // store: a fresh chainbase each run (create is destructive), per insert, at
-        // two value sizes so the per-byte slope of the value write falls out.
-        let store_ns = |val_len: usize| -> f64 {
-            let mut best = f64::MAX;
-            for _ in 0..3 {
-                let dir = tempdir().unwrap();
-                let mut db = Database::new(dir.path().to_str().unwrap(), DB_SIZE).unwrap();
-                db.add_indices().unwrap();
-                let tp = db.create_table(CODE, SCOPE, TABLE, PAYER).unwrap();
-                let tr: &TableObject = unsafe { &*tp };
-                let val = vec![0xa5u8; val_len];
-                let t = Instant::now();
-                for pk in 0..ROWS {
-                    db.create_key_value_object(tr, PAYER, pk, &val).unwrap();
-                }
-                best = best.min(t.elapsed().as_nanos() as f64 / ROWS as f64);
-            }
-            best
-        };
-        let store_small = store_ns(8);
-        let store_large = store_ns(4096);
-        let value_per_byte_ns = ((store_large - store_small) / (4096.0 - 8.0)).max(0.0);
-
-        println!("\n==== db intrinsic cost estimate (3x safety) ====");
-        println!("anchor: {ns_per_point:.5} ns/point   table: {ROWS} rows");
-        println!(
-            "{:<20} {:>10} {:>10} {:>10}",
-            "op", "ns", "points", "shipped"
-        );
-        println!(
-            "{:<20} {find_ns:>10.1} {:>10.0} {:>10}",
-            "db_find_i64",
-            pts(find_ns),
-            "DB_OP=100"
-        );
-        println!(
-            "{:<20} {iter_ns:>10.1} {:>10.0} {:>10}",
-            "db_next_i64 (step)",
-            pts(iter_ns),
-            "DB_OP=100"
-        );
-        println!(
-            "{:<20} {store_small:>10.1} {:>10.0} {:>10}",
-            "db_store_i64 (8B)",
-            pts(store_small),
-            "DB_OP=100"
-        );
-        println!(
-            "{:<20} {:>10.4} {:>10.2} {:>10}",
-            "value per-byte",
-            value_per_byte_ns,
-            pts(value_per_byte_ns),
-            "1/byte"
-        );
-        println!("=================================================\n");
-    }
 }

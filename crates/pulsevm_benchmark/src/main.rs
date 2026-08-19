@@ -278,10 +278,7 @@ fn create_account(
 ) -> Result<PackedTransaction, ChainError> {
     let authority = Authority::new(
         1,
-        vec![KeyWeight::new(
-            private_key.get_public_key().inner().clone(),
-            1,
-        )],
+        vec![KeyWeight::new(private_key.get_public_key().into_k1(), 1)],
         vec![],
         vec![],
     );

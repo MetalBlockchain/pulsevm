@@ -13,17 +13,15 @@ use std::{
 
 use pulsevm_constants::MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER;
 use pulsevm_crypto::Digest;
-use pulsevm_error::ChainError;
-use pulsevm_ffi::{
+use pulsevm_database::{
     BlockTimestamp,
     Database,
     Microseconds,
     TimePoint,
-    milliseconds,
     seconds,
 };
+use pulsevm_error::ChainError;
 use pulsevm_serialization::VarUint32;
-use spdlog::info;
 
 use crate::{
     authorization_manager::AuthorizationManager,
@@ -79,14 +77,9 @@ struct TransactionContextInner {
     net_limit_due_to_greylist: bool,
     net_limit_due_to_block: bool,
     billing: Billing,
-    // Raw wall-clock at which this transaction started executing. Unlike the
-    // billing timer this never pauses, so it also covers native windows the billing
-    // timer excludes — notably wasm compilation. It's the basis for the subjective
-    // deadline (checktime), which is a watchdog and so must see that time.
+    // Raw wall-clock start for the subjective transaction watchdog. Unlike the
+    // billing timer, this intentionally includes paused native/compilation time.
     start_time: TimePoint,
-    // Subjective wall-clock ceiling on execution time. When elapsed wall-clock time
-    // crosses this, checktime() abandons the transaction (a node-local guard, never
-    // consensus). Skipped when explicit_billed_cpu_time is set.
     max_transaction_time: Microseconds,
     pending_block_timestamp: BlockTimestamp,
     cpu_limit: i64,
@@ -95,9 +88,6 @@ struct TransactionContextInner {
     executed_action_receipt_digests: VecDeque<Digest>,
     is_input: bool,
     proposed_schedule: Option<Vec<ProducerKey>>,
-    // The producer schedule in force for the block this transaction executes in
-    // (producers + version), so `get_active_producers` / `set_proposed_producers`
-    // can read the active set. Set by the controller right after construction.
     active_producers: Vec<ProducerKey>,
     active_schedule_version: u32,
 }
@@ -149,7 +139,7 @@ impl TransactionContext {
                     billed_time: Microseconds::default(),
                 },
                 start_time: TimePoint::now(),
-                max_transaction_time: milliseconds(max_transaction_time_ms as i64),
+                max_transaction_time: Microseconds::new(max_transaction_time_ms as i64 * 1_000),
                 pending_block_timestamp,
                 cpu_limit: 0,
                 cpu_limit_due_to_greylist: false,
@@ -164,9 +154,6 @@ impl TransactionContext {
         }
     }
 
-    /// Record the producer schedule in force for the block this transaction runs
-    /// in. The controller sets this before execution so `get_active_producers`
-    /// and `set_proposed_producers` can read the active set and version.
     pub fn set_active_schedule(
         &self,
         producers: Vec<ProducerKey>,
@@ -211,27 +198,23 @@ impl TransactionContext {
         inner.net_limit = self.db.get_block_net_limit()?;
 
         let net_usage_leeway = {
-            let r = self.db.read()?;
-            let cfg = r.get_global_properties()?;
+            let cfg = self.db.chain_config()?;
 
             // Possibly lower net_limit to the maximum net usage a transaction is allowed to be
             // billed
-            if cfg.get_chain_config().get_max_transaction_net_usage() as u64 <= inner.net_limit {
-                inner.net_limit = cfg.get_chain_config().get_max_transaction_net_usage() as u64;
+            if cfg.max_transaction_net_usage as u64 <= inner.net_limit {
+                inner.net_limit = cfg.max_transaction_net_usage as u64;
                 inner.net_limit_due_to_block = false;
             }
 
             // Possibly lower cpu_limit to the maximum cpu usage a transaction is allowed to be
             // billed
-            if inner.is_input
-                && cfg.get_chain_config().get_max_transaction_cpu_usage() as u64
-                    <= inner.cpu_limit as u64
-            {
-                inner.cpu_limit = cfg.get_chain_config().get_max_transaction_cpu_usage() as i64;
+            if inner.is_input && cfg.max_transaction_cpu_usage as u64 <= inner.cpu_limit as u64 {
+                inner.cpu_limit = cfg.max_transaction_cpu_usage as i64;
                 inner.cpu_limit_due_to_block = false;
             }
 
-            cfg.get_chain_config().get_net_usage_leeway() as u64
+            cfg.net_usage_leeway as u64
         };
 
         let trx = self.packed_transaction.get_transaction();
@@ -306,25 +289,20 @@ impl TransactionContext {
         transaction: &Transaction,
     ) -> Result<(), ChainError> {
         let mut discounted_size_for_pruned_data = packed_trx_prunable_size;
-        // Copy the needed chain-config values out under a short read guard rather
-        // than holding a reference into the database.
-        let (cf_discount_num, cf_discount_den, base_per_transaction_net_usage) = {
-            let r = self.db.read()?;
-            let chain_config = r.get_global_properties()?.get_chain_config();
-            (
-                chain_config.get_context_free_discount_net_usage_num(),
-                chain_config.get_context_free_discount_net_usage_den(),
-                chain_config.get_base_per_transaction_net_usage(),
-            )
-        };
-        if cf_discount_den > 0 && cf_discount_num < cf_discount_den {
-            discounted_size_for_pruned_data *= cf_discount_num as u64;
-            discounted_size_for_pruned_data =
-                (discounted_size_for_pruned_data + cf_discount_den as u64 - 1)
-                    / cf_discount_den as u64; // rounds up
+        let chain_config = self.db.chain_config()?;
+        if chain_config.context_free_discount_net_usage_den > 0
+            && chain_config.context_free_discount_net_usage_num
+                < chain_config.context_free_discount_net_usage_den
+        {
+            discounted_size_for_pruned_data *=
+                chain_config.context_free_discount_net_usage_num as u64;
+            discounted_size_for_pruned_data = (discounted_size_for_pruned_data
+                + chain_config.context_free_discount_net_usage_den as u64
+                - 1)
+                / chain_config.context_free_discount_net_usage_den as u64; // rounds up
         }
 
-        let initial_net_usage: u64 = (base_per_transaction_net_usage as u64)
+        let initial_net_usage: u64 = (chain_config.base_per_transaction_net_usage as u64)
             + packed_trx_unprunable_size
             + discounted_size_for_pruned_data;
         let first_authorizer = transaction.first_authorizer();
@@ -345,17 +323,10 @@ impl TransactionContext {
     // so we skip expiration/authorization/net accounting entirely.
     pub fn init_for_implicit_trx(&mut self, transaction: &Transaction) -> Result<(), ChainError> {
         {
-            // Copy the floor out before taking the inner write lock so the db read
-            // guard isn't held across it.
-            let min_transaction_cpu_usage = {
-                let r = self.db.read()?;
-                r.get_global_properties()?
-                    .get_chain_config()
-                    .get_min_transaction_cpu_usage()
-            };
+            let min_cpu = self.db.chain_config()?.min_transaction_cpu_usage;
             let mut inner = self.inner.write()?;
             inner.explicit_billed_cpu_time = true;
-            inner.explicit_cpu_us = min_transaction_cpu_usage;
+            inner.explicit_cpu_us = min_cpu;
             inner.cpu_limit = -1;
         }
         self.init(0, transaction.first_authorizer(), false)
@@ -466,9 +437,7 @@ impl TransactionContext {
         action_ordinal: u32,
         recurse_depth: u32,
     ) -> Result<(), ChainError> {
-        // Every action — top-level, notified, and inline (which re-enters here) —
-        // passes through this point, so it's the one place a deadline check bounds
-        // action fan-out and deep inline recursion.
+        // Every top-level, notified, and inline action crosses this boundary.
         self.checktime()?;
 
         let (action, receiver, context_free) = self.with_action_trace(action_ordinal, |t| {
@@ -629,7 +598,12 @@ impl TransactionContext {
         }
 
         Self::update_billed_cpu_time(&mut inner, &self.db)?;
-        Self::validate_cpu_usage_to_bill(&inner, &self.db, true)?;
+        // Only enforce the minimum-CPU floor when we are the ones billing. On a
+        // block we're replaying, the CPU usage is taken verbatim from the block
+        // (explicit billing, above), so the producer already applied its own
+        // minimum; re-checking against this node's minimum would spuriously
+        // reject a valid block whenever the two configs differ.
+        Self::validate_cpu_usage_to_bill(&inner, &self.db, !inner.explicit_billed_cpu_time)?;
 
         // During benchmarks this would throw an error because the accounts won't have enough CPU to
         // cover the billed time, so we skip this step if we're benchmarking.
@@ -745,18 +719,9 @@ impl TransactionContext {
         Ok(())
     }
 
-    /// Abandon the transaction if it has spent longer than `max_transaction_time`
-    /// executing. This is the wall-clock backstop for native/host code paths that
-    /// the deterministic op metering can't see (a long native handler, a deep fan
-    /// out of actions, wasm compilation). It measures raw wall-clock since the
-    /// transaction started — deliberately NOT the billing timer, which pauses across
-    /// compilation and would blind the watchdog to exactly that native window. It is
-    /// SUBJECTIVE — it depends on this machine's speed, not on the transaction's
-    /// deterministic result — so it raises `DeadlineError`, which the caller drops
-    /// locally rather than blaming a block for, and it is skipped whenever billing
-    /// is explicit (replay and light validation, and the implicit onblock path).
-    /// Enforced cooperatively at execution boundaries; it can't interrupt a call
-    /// already in progress.
+    /// Enforce the node-local wall-clock ceiling. Explicitly billed execution
+    /// (accepted-block replay/validation) is exempt because this check is
+    /// subjective and must never affect consensus validation.
     pub fn checktime(&self) -> Result<(), ChainError> {
         let inner = self.inner.read()?;
         Self::deadline_check(
@@ -767,10 +732,6 @@ impl TransactionContext {
         )
     }
 
-    /// The pure decision behind [`checktime`]. Skips entirely when billing is
-    /// explicit; otherwise measures raw wall-clock elapsed since `start_time` (so
-    /// compilation and other native windows the billing timer pauses still count)
-    /// and fails once it passes the limit.
     fn deadline_check(
         explicit_billed: bool,
         start_time: TimePoint,
@@ -797,10 +758,8 @@ impl TransactionContext {
     }
 
     pub fn record_transaction(&mut self, id: &Id, expiration: u32) -> Result<(), ChainError> {
-        let id_digest = id.to_digest()?;
-
         self.db
-            .record_transaction(&id_digest, expiration)
+            .record_transaction(&id.0.0, expiration)
             .map_err(|e| ChainError::DatabaseError(format!("duplicate tx: {}", e)))
     }
 
@@ -818,8 +777,7 @@ impl TransactionContext {
         let inner = self.inner.read()?;
         let expiration: TimePoint = trx.header.expiration().into();
         let pending_block_timestamp: TimePoint = inner.pending_block_timestamp.into();
-        let r = self.db.read()?;
-        let gpo = r.get_global_properties()?;
+        let max_transaction_lifetime = self.db.chain_config()?.max_transaction_lifetime;
 
         if expiration < pending_block_timestamp {
             return Err(ChainError::TransactionError(
@@ -827,10 +785,7 @@ impl TransactionContext {
             ));
         }
 
-        if expiration
-            > pending_block_timestamp
-                + seconds(gpo.get_chain_config().get_max_transaction_lifetime() as i64)
-        {
+        if expiration > pending_block_timestamp + seconds(max_transaction_lifetime as i64) {
             return Err(ChainError::TransactionError(
                 "transaction has too long lifetime".to_string(),
             ));
@@ -842,7 +797,7 @@ impl TransactionContext {
     pub fn validate_referenced_accounts(&self, trx: &Transaction) -> Result<(), ChainError> {
         if !trx.context_free_actions.is_empty() {
             for action in trx.context_free_actions.iter() {
-                if !self.db.account_exists(action.account.as_u64())? {
+                if !self.db.is_account(action.account.as_u64())? {
                     return Err(ChainError::TransactionError(format!(
                         "context free action {} references non-existent account {}",
                         action.name(),
@@ -861,7 +816,7 @@ impl TransactionContext {
         let mut one_auth = false;
 
         for action in trx.actions.iter() {
-            if !self.db.account_exists(action.account.as_u64())? {
+            if !self.db.is_account(action.account.as_u64())? {
                 return Err(ChainError::TransactionError(format!(
                     "action {} references non-existent account {}",
                     action.name(),
@@ -871,7 +826,7 @@ impl TransactionContext {
 
             for auth in action.authorization().iter() {
                 one_auth = true;
-                if !self.db.account_exists(auth.actor())? {
+                if !self.db.is_account(auth.actor())? {
                     return Err(ChainError::TransactionError(format!(
                         "action's authorizing actor '{}' does not exist",
                         Name::new(auth.actor)
@@ -970,15 +925,12 @@ impl TransactionContext {
         check_minimum: bool,
     ) -> Result<(), ChainError> {
         if check_minimum {
-            let r = db.read()?;
-            let cfg = r.get_global_properties()?;
+            let min_cpu = db.chain_config()?.min_transaction_cpu_usage;
 
-            if inner.trace.receipt.cpu_usage_us
-                < cfg.get_chain_config().get_min_transaction_cpu_usage()
-            {
+            if inner.trace.receipt.cpu_usage_us < min_cpu {
                 return Err(ChainError::TransactionError(format!(
                     "cannot bill CPU time less than the minimum of {}",
-                    cfg.get_chain_config().get_min_transaction_cpu_usage()
+                    min_cpu
                 )));
             }
         }
@@ -995,13 +947,9 @@ impl TransactionContext {
             return Ok(());
         }
 
-        let r = db.read()?;
-        let cfg = r.get_global_properties()?;
+        let min_cpu = db.chain_config()?.min_transaction_cpu_usage;
 
-        inner.trace.receipt.cpu_usage_us = std::cmp::max(
-            inner.trace.receipt.cpu_usage_us,
-            cfg.get_chain_config().get_min_transaction_cpu_usage(),
-        );
+        inner.trace.receipt.cpu_usage_us = std::cmp::max(inner.trace.receipt.cpu_usage_us, min_cpu);
 
         Ok(())
     }
@@ -1031,68 +979,59 @@ impl TransactionContext {
 }
 
 #[cfg(test)]
-mod tests {
-    use pulsevm_error::ChainError;
-    use pulsevm_ffi::{
+mod deadline_tests {
+    use pulsevm_database::{
         Microseconds,
         TimePoint,
     };
+    use pulsevm_error::ChainError;
 
     use super::TransactionContext;
 
-    fn tp(us: i64) -> TimePoint {
-        TimePoint::new(Microseconds::new(us))
+    fn tp(microseconds: i64) -> TimePoint {
+        TimePoint::new(Microseconds::new(microseconds))
     }
 
     #[test]
-    fn checktime_skips_when_billing_is_explicit() {
-        // Explicit billing (replay / light validation / implicit onblock) is never
-        // subject to the wall-clock deadline, even far past it — that keeps the
-        // check subjective and off the consensus path.
-        let r = TransactionContext::deadline_check(
-            true,
-            tp(1_000_000),
-            Microseconds::new(1),
-            tp(9_999_999),
-        );
-        assert!(r.is_ok());
-    }
-
-    #[test]
-    fn checktime_passes_under_the_limit_and_trips_over_it() {
-        // elapsed = now - start_time.
-        let under = TransactionContext::deadline_check(
-            false,
-            tp(1_000_000),
-            Microseconds::new(1_000),
-            tp(1_000_500),
-        );
-        assert!(under.is_ok(), "500us is under the 1000us limit");
-
-        let over = TransactionContext::deadline_check(
-            false,
-            tp(1_000_000),
-            Microseconds::new(1_000),
-            tp(1_002_000),
-        );
+    fn explicit_billing_is_exempt_from_subjective_deadline() {
         assert!(
-            matches!(over, Err(ChainError::DeadlineError(_))),
-            "2000us must trip the 1000us limit"
+            TransactionContext::deadline_check(
+                true,
+                tp(1_000_000),
+                Microseconds::new(1),
+                tp(9_999_999),
+            )
+            .is_ok()
         );
     }
 
     #[test]
-    fn checktime_counts_wall_clock_not_billed_time() {
-        // The watchdog measures raw wall-clock from start_time, so a window the
-        // billing timer would pause (module compilation) still counts. Here the
-        // whole 5ms between start and now is over the 1ms limit even though none of
-        // it was billed execution.
-        let over =
-            TransactionContext::deadline_check(false, tp(0), Microseconds::new(1_000), tp(5_000));
-        assert!(matches!(over, Err(ChainError::DeadlineError(_))));
+    fn deadline_passes_under_limit_and_trips_over_it() {
+        assert!(
+            TransactionContext::deadline_check(
+                false,
+                tp(1_000_000),
+                Microseconds::new(1_000),
+                tp(1_000_500),
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            TransactionContext::deadline_check(
+                false,
+                tp(1_000_000),
+                Microseconds::new(1_000),
+                tp(1_002_000),
+            ),
+            Err(ChainError::DeadlineError(_))
+        ));
+    }
 
-        let under =
-            TransactionContext::deadline_check(false, tp(0), Microseconds::new(1_000), tp(500));
-        assert!(under.is_ok());
+    #[test]
+    fn deadline_counts_paused_native_wall_clock() {
+        assert!(matches!(
+            TransactionContext::deadline_check(false, tp(0), Microseconds::new(1_000), tp(5_000),),
+            Err(ChainError::DeadlineError(_))
+        ));
     }
 }

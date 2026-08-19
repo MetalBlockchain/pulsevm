@@ -21,7 +21,6 @@ use crate::{
         PublicKey,
         Signature,
     },
-    utils::Digest,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Read, Write, NumBytes, Serialize, Default)]
@@ -64,7 +63,7 @@ impl SignedTransaction {
         let digest = self
             .transaction
             .signing_digest(chain_id, &self.context_free_data)?;
-        let digest: Digest = Digest::from_data(&digest);
+        let digest = pulsevm_crypto::Digest(digest);
 
         for signature in self.signatures.iter() {
             let public_key = signature.recover_public_key(&digest)?;
@@ -79,7 +78,7 @@ impl SignedTransaction {
         let digest = self
             .transaction
             .signing_digest(chain_id, &self.context_free_data)?;
-        let signature = private_key.sign(&digest.into())?;
+        let signature = private_key.sign(&pulsevm_crypto::Digest(digest))?;
         self.signatures.insert(signature);
         Ok(self)
     }
@@ -116,7 +115,7 @@ mod tests {
         str::FromStr,
     };
 
-    use pulsevm_ffi::TimePointSec;
+    use pulsevm_database::TimePointSec;
 
     use crate::{
         crypto::PrivateKey,

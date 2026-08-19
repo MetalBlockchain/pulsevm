@@ -3,54 +3,48 @@ use std::{
     str::FromStr,
 };
 
-use cxx::SharedPtr;
-use pulsevm_error::ChainError;
-use pulsevm_ffi::{
-    CxxPrivateKey,
-    sign_digest_with_private_key,
+use pulsevm_crypto::{
+    Digest,
+    K1PrivateKey,
 };
+use pulsevm_error::ChainError;
 use serde::Deserialize;
 
-use crate::{
-    crypto::{
-        PublicKey,
-        Signature,
-    },
-    utils::Digest,
+use crate::crypto::{
+    PublicKey,
+    Signature,
 };
 
+/// A secp256k1 (`K1`) private key. Pure Rust throughout — parsing, string
+/// encoding, public-key derivation and signing run through [`K1PrivateKey`].
+///
+/// Only `K1` is supported; the `R1` (secp256r1) suite is not reached on any
+/// replay or consensus path and is not ported.
 #[derive(Clone)]
 pub struct PrivateKey {
-    inner: SharedPtr<CxxPrivateKey>,
+    inner: K1PrivateKey,
 }
 
 impl PrivateKey {
     pub fn sign(&self, digest: &Digest) -> Result<Signature, ChainError> {
-        let cxx_sig = sign_digest_with_private_key(&digest, &self.inner)
-            .map_err(|e| ChainError::TransactionError(e.to_string()))?;
-        Ok(Signature::new(cxx_sig))
+        Ok(Signature::new(self.inner.sign(digest.as_bytes())))
     }
 
     pub fn new_k1_from_string(s: &str) -> Result<Self, ChainError> {
-        let hash = pulsevm_ffi::make_shared_digest_from_string(s);
-        let cxx_key = pulsevm_ffi::make_k1_private_key(&hash);
-        Ok(PrivateKey { inner: cxx_key })
+        let inner = K1PrivateKey::from_seed_string(s)
+            .map_err(|e| ChainError::TransactionError(e.to_string()))?;
+        Ok(PrivateKey { inner })
     }
 
     pub fn get_public_key(&self) -> PublicKey {
-        PublicKey::new(self.inner.get_public_key())
+        PublicKey::new(self.inner.public_key())
     }
 
     /// Generates a random K1 private key.
     pub fn random() -> Self {
-        let cxx_key = pulsevm_ffi::random_private_key();
-        PrivateKey { inner: cxx_key }
-    }
-
-    /// Generates a random R1 private key.
-    pub fn random_r1() -> Self {
-        let cxx_key = pulsevm_ffi::random_private_key_r1();
-        PrivateKey { inner: cxx_key }
+        PrivateKey {
+            inner: K1PrivateKey::random(),
+        }
     }
 }
 
@@ -58,9 +52,9 @@ impl FromStr for PrivateKey {
     type Err = ChainError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let cxx_key = pulsevm_ffi::parse_private_key(s)
+        let inner = K1PrivateKey::from_string(s)
             .map_err(|e| ChainError::TransactionError(e.to_string()))?;
-        Ok(PrivateKey { inner: cxx_key })
+        Ok(PrivateKey { inner })
     }
 }
 

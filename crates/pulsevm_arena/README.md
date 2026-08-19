@@ -1,8 +1,7 @@
 # pulsevm_arena
 
-A native Rust state store built to replace the C++ chainbase FFI, matching its
-performance — including cheap persistence — without living inside a
-memory-mapped segment full of `offset_ptr`s.
+A native Rust state store that replaced the C++ chainbase FFI while preserving
+its consensus-visible behavior.
 
 ## The idea
 
@@ -39,9 +38,9 @@ addresses. That buys chainbase's two wins in safe Rust:
 Tests: [`table_tests.rs`](tests/table_tests.rs), [`db_tests.rs`](tests/db_tests.rs).
 Benchmark: `cargo bench -p pulsevm_arena`.
 
-## Performance (this machine)
+## Historical performance snapshot
 
-| operation | arena | C++ chainbase (via FFI) |
+| operation | arena | former C++ baseline |
 |---|---|---|
 | insert | 57 ns | ~135 ns |
 | find by id, 100k rows | **2 ns** (O(1)) | ~58 ns |
@@ -50,21 +49,22 @@ Benchmark: `cargo bench -p pulsevm_arena`.
 | snapshot save, 100k | 1.9 ms (incl. disk) | — |
 | snapshot load, 100k | 4.1 ms | — |
 
-## Not done yet
+## Integration status
 
-This is the engine foundation, not the finished store. Ahead:
+The arena is the active PulseVM database engine. `pulsevm_chaindb` defines the
+chain tables and `pulsevm_database` exposes the controller-facing facade.
+Consensus equivalence is covered by unit/property tests and the 1,697-block
+testnet replay, including byte-for-byte SHiP delta comparison against the frozen
+reference output.
+
+Possible future optimizations include:
 
 - **mmap-backed arena** — O(dirty) flush / O(1) open; reuses this exact layout
   since it is already pointer-free.
 - **Variable-length fields** — a per-table blob arena addressed by `(offset,
   len)`, for objects that carry abi/code/KV bytes (POD objects are fixed-size).
-- **A `#[derive]` macro** to generate the `ArenaObject` impl (id accessors,
-  indices, and billable size from a schema) so the ~40 PulseVM tables are
-  declarations, not boilerplate.
-- **Integration + differential testing** — swap the controller off the FFI and
-  verify state-root equivalence against it block-by-block. This is consensus
-  state, so equivalence — RAM billing, id assignment, iteration order — is the
-  bar, and where most of the remaining work lives.
+- **A `#[derive]` macro** to reduce the boilerplate in `ArenaObject`
+  implementations.
 
 See `docs/rust-chainbase-arena-spike.md` for the investigation that motivated
 this and the fuller roadmap.

@@ -36,6 +36,7 @@ impl Bytes {
     }
 
     #[inline]
+    #[allow(clippy::should_implement_trait)]
     pub fn as_ref(&self) -> &[u8] {
         &self.0
     }

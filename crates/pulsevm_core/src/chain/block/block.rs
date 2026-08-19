@@ -4,11 +4,11 @@ use pulsevm_crypto::{
     Digest,
     FixedBytes,
 };
-use pulsevm_error::ChainError;
-use pulsevm_ffi::{
+use pulsevm_database::{
     BlockTimestamp,
     Database,
 };
+use pulsevm_error::ChainError;
 use pulsevm_proc_macros::{
     NumBytes,
     Read,

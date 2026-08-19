@@ -34,10 +34,8 @@ mod producer;
 pub use producer::*;
 
 mod system;
-use pulsevm_ffi::{
+use pulsevm_database::{
     Float128,
-    I128,
-    U128,
     U256,
 };
 pub use system::*;
@@ -98,22 +96,6 @@ fn write_u128(view: &MemoryView, ptr: WasmPtr<u128>, val: u128) -> Result<(), Ru
 
 fn write_u256(view: &MemoryView, ptr: WasmPtr<u8>, val: U256) -> Result<(), RuntimeError> {
     view.write(ptr.offset() as u64, &val.value)?;
-    Ok(())
-}
-
-fn write_u128_ffi(view: &MemoryView, ptr: WasmPtr<u128>, val: U128) -> Result<(), RuntimeError> {
-    let mut out = [0u8; 16];
-    out[0..8].copy_from_slice(&val.lo.to_le_bytes());
-    out[8..16].copy_from_slice(&val.hi.to_le_bytes());
-    view.write(ptr.offset() as u64, &out)?;
-    Ok(())
-}
-
-fn write_i128_ffi(view: &MemoryView, ptr: WasmPtr<i128>, val: I128) -> Result<(), RuntimeError> {
-    let mut out = [0u8; 16];
-    out[0..8].copy_from_slice(&val.lo.to_le_bytes());
-    out[8..16].copy_from_slice(&val.hi.to_le_bytes());
-    view.write(ptr.offset() as u64, &out)?;
     Ok(())
 }
 

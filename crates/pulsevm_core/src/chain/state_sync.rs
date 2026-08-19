@@ -99,7 +99,7 @@ impl ChunkRequest {
 /// `fetch(offset, len)` returns exactly `len` bytes or errors; how it gets them
 /// — a direct call in a test, an AppRequest round-trip in the node — is the
 /// caller's concern. The final hash check is what makes a truncated or wrong
-/// transfer fail here rather than as chainbase corruption at apply time.
+/// transfer fail here rather than as database corruption at apply time.
 pub async fn download_snapshot<F, Fut>(
     target: &SyncTarget,
     mut fetch: F,

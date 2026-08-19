@@ -7,7 +7,7 @@ use std::{
     u64,
 };
 
-use pulsevm_ffi::Ratio;
+use pulsevm_database::Ratio;
 
 pub fn make_ratio(n: u64, d: u64) -> Ratio {
     Ratio {

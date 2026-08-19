@@ -1,0 +1,67 @@
+name: Consensus replay
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      fixture_url:
+        description: URL of the frozen replay fixture archive
+        required: false
+        type: string
+
+# Set PULSEVM_REPLAY_FIXTURE_URL as a repository variable to make this a
+# required push/PR gate. A workflow-dispatch URL is useful while bootstrapping
+# or validating a newly mirrored copy of the content-addressed corpus.
+jobs:
+  replay:
+    if: ${{ inputs.fixture_url != '' || vars.PULSEVM_REPLAY_FIXTURE_URL != '' }}
+    name: replay-linux-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    env:
+      LLVM_SYS_221_PREFIX: /usr/lib/llvm-22
+      FIXTURE_URL: ${{ inputs.fixture_url || vars.PULSEVM_REPLAY_FIXTURE_URL }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - name: Configure LLVM APT repository
+        run: wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key|sudo apt-key add - && sudo echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" | sudo tee /etc/apt/sources.list.d/llvm.list
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y gcc-13 cmake zlib1g-dev pkg-config llvm-22-dev libpolly-22-dev
+
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Protobuf (protoc)
+        uses: arduino/setup-protoc@v2
+        with:
+          version: '27.1'
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.arch }}-replay-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Download frozen replay corpus
+        run: curl --fail --location --retry 3 --output /tmp/pulsevm-replay-fixtures.tar.gz "${FIXTURE_URL}"
+
+      - name: Verify state roots and SHiP bytes
+        run: scripts/run-replay-regression.sh /tmp/pulsevm-replay-fixtures.tar.gz

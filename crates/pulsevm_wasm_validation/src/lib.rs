@@ -185,7 +185,7 @@ fn val_type_byte_size(ty: &ValType) -> u32 {
 /// `memories_validation_visitor::validate`
 fn validate_memories(info: &ModuleInfo) -> Result<()> {
     if let Some(mem) = info.memories.first() {
-        let min_bytes = (mem.initial as u64) * constraints::WASM_PAGE_SIZE;
+        let min_bytes = mem.initial * constraints::WASM_PAGE_SIZE;
         if min_bytes > constraints::MAXIMUM_LINEAR_MEMORY {
             return Err(ValidationError::MemoryTooLarge);
         }
@@ -195,10 +195,10 @@ fn validate_memories(info: &ModuleInfo) -> Result<()> {
 
 /// `tables_validation_visitor::validate`
 fn validate_tables(info: &ModuleInfo) -> Result<()> {
-    if let Some(table) = info.tables.first() {
-        if (table.initial as u64) > constraints::MAXIMUM_TABLE_ELEMENTS {
-            return Err(ValidationError::TableTooLarge);
-        }
+    if let Some(table) = info.tables.first()
+        && table.initial > constraints::MAXIMUM_TABLE_ELEMENTS
+    {
+        return Err(ValidationError::TableTooLarge);
     }
     Ok(())
 }
@@ -319,10 +319,10 @@ fn validate_operator_offset(op: &Operator) -> Result<()> {
         _ => None,
     };
 
-    if let Some(off) = offset {
-        if off >= constraints::MAXIMUM_LINEAR_MEMORY {
-            return Err(ValidationError::LargeMemoryOffset);
-        }
+    if let Some(off) = offset
+        && off >= constraints::MAXIMUM_LINEAR_MEMORY
+    {
+        return Err(ValidationError::LargeMemoryOffset);
     }
     Ok(())
 }
@@ -336,11 +336,7 @@ fn validate_nesting(op: &Operator, depth: &mut u32) -> Result<()> {
                 return Err(ValidationError::NestedDepthExceeded);
             }
         }
-        Operator::End => {
-            if *depth > 0 {
-                *depth -= 1;
-            }
-        }
+        Operator::End if *depth > 0 => *depth -= 1,
         _ => {}
     }
     Ok(())
@@ -1535,7 +1531,7 @@ mod tests {
         // Data segment: offset=20, length=maximum_func_local_bytes-1 (8191)
         // Total end = 20 + 8191 = 8211 < 65536 (MAXIMUM_LINEAR_MEMORY_INIT), passes.
         let data_len = constraints::MAXIMUM_FUNC_LOCAL_BYTES as usize - 1;
-        let data_str: String = std::iter::repeat('a').take(data_len).collect();
+        let data_str = "a".repeat(data_len);
 
         let wat = format!(
             "(module \
@@ -1558,7 +1554,7 @@ mod tests {
         // check on data segment byte length, not the range check. This constraint
         // is not implemented in the Rust validator.
         let data_len = constraints::MAXIMUM_FUNC_LOCAL_BYTES as usize;
-        let data_str: String = std::iter::repeat('a').take(data_len).collect();
+        let data_str = "a".repeat(data_len);
 
         let wat = format!(
             "(module \

@@ -1,4 +1,4 @@
-use pulsevm_ffi::{
+use pulsevm_softfloat::{
     addtf3,
     cmptf2,
     divtf3,
@@ -40,13 +40,7 @@ use wasmer::{
     WasmPtr,
 };
 
-use crate::{
-    chain::webassembly::{
-        write_i128_ffi,
-        write_u128_ffi,
-    },
-    wasm_runtime::WasmContext,
-};
+use crate::wasm_runtime::WasmContext;
 
 use super::cost;
 
@@ -333,11 +327,7 @@ pub fn __addtf3(
         .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
 
-    let mut bytes = [0u8; 16];
-    bytes[0..8].copy_from_slice(&result.lo.to_le_bytes());
-    bytes[8..16].copy_from_slice(&result.hi.to_le_bytes());
-
-    view.write(ret_ptr.offset() as u64, &bytes)
+    view.write(ret_ptr.offset() as u64, &result.to_le_bytes())
         .map_err(|e| RuntimeError::new(e.to_string()))?;
     Ok(())
 }
@@ -359,11 +349,7 @@ pub fn __subtf3(
         .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
 
-    let mut bytes = [0u8; 16];
-    bytes[0..8].copy_from_slice(&result.lo.to_le_bytes());
-    bytes[8..16].copy_from_slice(&result.hi.to_le_bytes());
-
-    view.write(ret_ptr.offset() as u64, &bytes)
+    view.write(ret_ptr.offset() as u64, &result.to_le_bytes())
         .map_err(|e| RuntimeError::new(e.to_string()))?;
     Ok(())
 }
@@ -385,11 +371,7 @@ pub fn __multf3(
         .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
 
-    let mut bytes = [0u8; 16];
-    bytes[0..8].copy_from_slice(&result.lo.to_le_bytes());
-    bytes[8..16].copy_from_slice(&result.hi.to_le_bytes());
-
-    view.write(ret_ptr.offset() as u64, &bytes)
+    view.write(ret_ptr.offset() as u64, &result.to_le_bytes())
         .map_err(|e| RuntimeError::new(e.to_string()))?;
     Ok(())
 }
@@ -411,11 +393,7 @@ pub fn __divtf3(
         .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
 
-    let mut bytes = [0u8; 16];
-    bytes[0..8].copy_from_slice(&result.lo.to_le_bytes());
-    bytes[8..16].copy_from_slice(&result.hi.to_le_bytes());
-
-    view.write(ret_ptr.offset() as u64, &bytes)
+    view.write(ret_ptr.offset() as u64, &result.to_le_bytes())
         .map_err(|e| RuntimeError::new(e.to_string()))?;
     Ok(())
 }
@@ -436,11 +414,7 @@ pub fn __negtf2(
         .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
 
-    let mut bytes = [0u8; 16];
-    bytes[0..8].copy_from_slice(&result.lo.to_le_bytes());
-    bytes[8..16].copy_from_slice(&result.hi.to_le_bytes());
-
-    view.write(ret_ptr.offset() as u64, &bytes)
+    view.write(ret_ptr.offset() as u64, &result.to_le_bytes())
         .map_err(|e| RuntimeError::new(e.to_string()))?;
     Ok(())
 }
@@ -460,11 +434,7 @@ pub fn __extendsftf2(
     let view = memory.view(&store);
 
     // float128_t is two little-endian u64 limbs: lo (low) then hi (high).
-    let mut bytes = [0u8; 16];
-    bytes[0..8].copy_from_slice(&result.lo.to_le_bytes());
-    bytes[8..16].copy_from_slice(&result.hi.to_le_bytes());
-
-    view.write(ret_ptr.offset() as u64, &bytes)
+    view.write(ret_ptr.offset() as u64, &result.to_le_bytes())
         .map_err(|e| RuntimeError::new(e.to_string()))?;
     Ok(())
 }
@@ -483,11 +453,7 @@ pub fn __extenddftf2(
         .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
 
-    let mut bytes = [0u8; 16];
-    bytes[0..8].copy_from_slice(&result.lo.to_le_bytes());
-    bytes[8..16].copy_from_slice(&result.hi.to_le_bytes());
-
-    view.write(ret_ptr.offset() as u64, &bytes)
+    view.write(ret_ptr.offset() as u64, &result.to_le_bytes())
         .map_err(|e| RuntimeError::new(e.to_string()))?;
     Ok(())
 }
@@ -547,7 +513,8 @@ pub fn __fixtfti(
         .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
 
-    write_i128_ffi(&view, ret_ptr, result)?;
+    view.write(ret_ptr.offset() as u64, &result.to_le_bytes())
+        .map_err(|e| RuntimeError::new(e.to_string()))?;
     Ok(())
 }
 
@@ -585,7 +552,8 @@ pub fn __fixunstfti(
         .as_ref()
         .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
-    write_u128_ffi(&view, ret_ptr, result)?;
+    view.write(ret_ptr.offset() as u64, &result.to_le_bytes())
+        .map_err(|e| RuntimeError::new(e.to_string()))?;
     Ok(())
 }
 
@@ -602,7 +570,8 @@ pub fn __fixsfti(
         .as_ref()
         .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
-    write_i128_ffi(&view, ret_ptr, result)?;
+    view.write(ret_ptr.offset() as u64, &result.to_le_bytes())
+        .map_err(|e| RuntimeError::new(e.to_string()))?;
     Ok(())
 }
 
@@ -619,7 +588,8 @@ pub fn __fixdfti(
         .as_ref()
         .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
-    write_i128_ffi(&view, ret_ptr, result)?;
+    view.write(ret_ptr.offset() as u64, &result.to_le_bytes())
+        .map_err(|e| RuntimeError::new(e.to_string()))?;
     Ok(())
 }
 
@@ -636,7 +606,8 @@ pub fn __fixunssfti(
         .as_ref()
         .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
-    write_u128_ffi(&view, ret_ptr, result)?;
+    view.write(ret_ptr.offset() as u64, &result.to_le_bytes())
+        .map_err(|e| RuntimeError::new(e.to_string()))?;
     Ok(())
 }
 
@@ -653,7 +624,8 @@ pub fn __fixunsdfti(
         .as_ref()
         .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
-    write_u128_ffi(&view, ret_ptr, result)?;
+    view.write(ret_ptr.offset() as u64, &result.to_le_bytes())
+        .map_err(|e| RuntimeError::new(e.to_string()))?;
     Ok(())
 }
 
@@ -678,11 +650,7 @@ pub fn __floatsitf(
         .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
 
-    let mut bytes = [0u8; 16];
-    bytes[0..8].copy_from_slice(&result.lo.to_le_bytes());
-    bytes[8..16].copy_from_slice(&result.hi.to_le_bytes());
-
-    view.write(ret_ptr.offset() as u64, &bytes)
+    view.write(ret_ptr.offset() as u64, &result.to_le_bytes())
         .map_err(|e| RuntimeError::new(e.to_string()))?;
     Ok(())
 }
@@ -701,11 +669,7 @@ pub fn __floatditf(
         .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
 
-    let mut bytes = [0u8; 16];
-    bytes[0..8].copy_from_slice(&result.lo.to_le_bytes());
-    bytes[8..16].copy_from_slice(&result.hi.to_le_bytes());
-
-    view.write(ret_ptr.offset() as u64, &bytes)
+    view.write(ret_ptr.offset() as u64, &result.to_le_bytes())
         .map_err(|e| RuntimeError::new(e.to_string()))?;
     Ok(())
 }
@@ -725,11 +689,7 @@ pub fn __floatunsitf(
         .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
 
-    let mut bytes = [0u8; 16];
-    bytes[0..8].copy_from_slice(&result.lo.to_le_bytes());
-    bytes[8..16].copy_from_slice(&result.hi.to_le_bytes());
-
-    view.write(ret_ptr.offset() as u64, &bytes)
+    view.write(ret_ptr.offset() as u64, &result.to_le_bytes())
         .map_err(|e| RuntimeError::new(e.to_string()))?;
     Ok(())
 }
@@ -749,11 +709,7 @@ pub fn __floatunditf(
         .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
 
-    let mut bytes = [0u8; 16];
-    bytes[0..8].copy_from_slice(&result.lo.to_le_bytes());
-    bytes[8..16].copy_from_slice(&result.hi.to_le_bytes());
-
-    view.write(ret_ptr.offset() as u64, &bytes)
+    view.write(ret_ptr.offset() as u64, &result.to_le_bytes())
         .map_err(|e| RuntimeError::new(e.to_string()))?;
     Ok(())
 }
@@ -876,8 +832,7 @@ pub fn __unordtf2(
 
 #[cfg(test)]
 mod tests {
-    use pulsevm_ffi::{
-        Float128,
+    use pulsevm_softfloat::{
         addtf3,
         divtf3,
         floatsitf,
@@ -886,11 +841,13 @@ mod tests {
         trunctfdf2,
     };
 
-    fn f128(i: i32) -> Float128 {
-        floatsitf(i)
+    // The (lo, hi) limbs of a binary128 value built from a small integer.
+    fn f128(i: i32) -> (u64, u64) {
+        let bits = floatsitf(i);
+        (bits as u64, (bits >> 64) as u64)
     }
-    fn to_f64(x: Float128) -> f64 {
-        trunctfdf2(x.lo, x.hi)
+    fn to_f64(bits: u128) -> f64 {
+        trunctfdf2(bits as u64, (bits >> 64) as u64)
     }
 
     // long double (binary128) math runs through Berkeley SoftFloat, not hardware,
@@ -901,24 +858,23 @@ mod tests {
         let (one, two, three, four, ten) = (f128(1), f128(2), f128(3), f128(4), f128(10));
 
         // Exact arithmetic.
-        assert_eq!(to_f64(multf3(two.lo, two.hi, three.lo, three.hi)), 6.0);
-        assert_eq!(to_f64(addtf3(three.lo, three.hi, four.lo, four.hi)), 7.0);
-        assert_eq!(to_f64(subtf3(ten.lo, ten.hi, three.lo, three.hi)), 7.0);
-        assert_eq!(to_f64(divtf3(one.lo, one.hi, four.lo, four.hi)), 0.25);
+        assert_eq!(to_f64(multf3(two.0, two.1, three.0, three.1)), 6.0);
+        assert_eq!(to_f64(addtf3(three.0, three.1, four.0, four.1)), 7.0);
+        assert_eq!(to_f64(subtf3(ten.0, ten.1, three.0, three.1)), 7.0);
+        assert_eq!(to_f64(divtf3(one.0, one.1, four.0, four.1)), 0.25);
 
         // 1/3 is inexact — the guarantee is that it is the *same* pattern every
         // time (and numerically correct), not that it terminates.
-        let a = divtf3(one.lo, one.hi, three.lo, three.hi);
-        let b = divtf3(one.lo, one.hi, three.lo, three.hi);
-        assert_eq!((a.lo, a.hi), (b.lo, b.hi));
+        let a = divtf3(one.0, one.1, three.0, three.1);
+        let b = divtf3(one.0, one.1, three.0, three.1);
+        assert_eq!(a, b);
         assert!((to_f64(a) - 1.0f64 / 3.0).abs() < 1e-15);
 
         // NaN (0/0) propagates to a NaN, with a stable bit pattern.
         let zero = f128(0);
-        let nan = divtf3(zero.lo, zero.hi, zero.lo, zero.hi);
-        let nan_bits = (nan.lo, nan.hi);
+        let nan = divtf3(zero.0, zero.1, zero.0, zero.1);
         assert!(to_f64(nan).is_nan());
-        let nan_again = divtf3(zero.lo, zero.hi, zero.lo, zero.hi);
-        assert_eq!(nan_bits, (nan_again.lo, nan_again.hi));
+        let nan_again = divtf3(zero.0, zero.1, zero.0, zero.1);
+        assert_eq!(nan, nan_again);
     }
 }

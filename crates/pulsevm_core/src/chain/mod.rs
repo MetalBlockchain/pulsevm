@@ -27,7 +27,7 @@ pub mod name {
     pub use pulsevm_name::Name;
 }
 pub mod authority {
-    pub use pulsevm_ffi::{
+    pub use pulsevm_database::{
         Authority,
         KeyWeight,
         PermissionLevel,
@@ -37,7 +37,7 @@ pub mod authority {
 }
 
 pub mod time {
-    pub use pulsevm_ffi::{
+    pub use pulsevm_database::{
         Microseconds,
         TimePoint,
         TimePointSec,

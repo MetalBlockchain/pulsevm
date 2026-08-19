@@ -832,17 +832,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "codespan-reporting"
-version = "0.13.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af491d569909a7e4dee0ad7db7f5341fef5c614d5b8ec8cf765732aba3cff681"
-dependencies = [
- "serde",
- "termcolor",
- "unicode-width",
-]
-
-[[package]]
 name = "colorchoice"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1197,68 +1186,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce6e4c961d6cd6c9a86db418387425e8bdeaf05b3c8bc1411e6dca4c252f1453"
 dependencies = [
  "hybrid-array",
-]
-
-[[package]]
-name = "cxx"
-version = "1.0.198"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6fe442a792c7c736eea18b32a7f8a3b63cf8aafabda6760042dc2fdeda456291"
-dependencies = [
- "cc",
- "cxx-build",
- "cxxbridge-cmd",
- "cxxbridge-flags",
- "cxxbridge-macro",
- "foldhash 0.2.0",
- "link-cplusplus",
-]
-
-[[package]]
-name = "cxx-build"
-version = "1.0.198"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e3184a94384c663718698311a78a51ac00c484c10b4eeac06fb0a068c5f64fa2"
-dependencies = [
- "cc",
- "codespan-reporting",
- "indexmap 2.14.0",
- "proc-macro2",
- "quote",
- "scratch",
- "syn 3.0.3",
-]
-
-[[package]]
-name = "cxxbridge-cmd"
-version = "1.0.198"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0148d8fd1199329ddf1d157a5e134e51ceff37c6a7ddd38615c399d81cb05d8d"
-dependencies = [
- "clap",
- "codespan-reporting",
- "indexmap 2.14.0",
- "proc-macro2",
- "quote",
- "syn 3.0.3",
-]
-
-[[package]]
-name = "cxxbridge-flags"
-version = "1.0.198"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52850339faed2eaadd24e286dc1d8268cc6f8a7bd9524d713adc9099566b4c89"
-
-[[package]]
-name = "cxxbridge-macro"
-version = "1.0.198"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c77c856545d886c9bd5215409ebb63b925e262135248b50c79e5a5f194ee47c"
-dependencies = [
- "indexmap 2.14.0",
- "proc-macro2",
- "quote",
- "syn 3.0.3",
 ]
 
 [[package]]
@@ -2579,15 +2506,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c6639b70a7ce854b79c70d7e83f16b5dc0137cc914f3d7d03803b513ecc67ac"
 
 [[package]]
-name = "link-cplusplus"
-version = "1.0.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f78c730aaa7d0b9336a299029ea49f9ee53b0ed06e9202e8cb7db9bae7b8c82"
-dependencies = [
- "cc",
-]
-
-[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3301,6 +3219,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pulsevm_abi"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "pulsevm_crypto",
+ "pulsevm_name",
+ "serde_json",
+]
+
+[[package]]
 name = "pulsevm_api_client"
 version = "0.1.0"
 dependencies = [
@@ -3361,6 +3289,29 @@ name = "pulsevm_billable_size"
 version = "0.1.0"
 
 [[package]]
+name = "pulsevm_chain_types"
+version = "0.1.0"
+dependencies = [
+ "prost-types",
+ "pulsevm_billable_size",
+ "pulsevm_crypto",
+ "pulsevm_error",
+ "pulsevm_name",
+ "pulsevm_serialization",
+ "serde",
+ "serde_json",
+ "time",
+]
+
+[[package]]
+name = "pulsevm_chaindb"
+version = "0.1.0"
+dependencies = [
+ "pulsevm_arena",
+ "zerocopy",
+]
+
+[[package]]
 name = "pulsevm_constants"
 version = "0.1.0"
 
@@ -3381,7 +3332,6 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "criterion",
- "cxx",
  "flate2",
  "hex",
  "jsonrpsee",
@@ -3391,13 +3341,14 @@ dependencies = [
  "pulsevm_billable_size",
  "pulsevm_constants",
  "pulsevm_crypto",
+ "pulsevm_database",
  "pulsevm_error",
- "pulsevm_ffi",
  "pulsevm_grpc",
  "pulsevm_name",
  "pulsevm_name_macro",
  "pulsevm_proc_macros",
  "pulsevm_serialization",
+ "pulsevm_softfloat",
  "pulsevm_wasm_validation",
  "ripemd",
  "serde",
@@ -3419,11 +3370,44 @@ dependencies = [
 name = "pulsevm_crypto"
 version = "0.1.0"
 dependencies = [
+ "bs58",
  "hex",
  "pulsevm_proc_macros",
  "pulsevm_serialization",
+ "ripemd",
+ "secp256k1",
  "serde",
  "sha2 0.10.9",
+]
+
+[[package]]
+name = "pulsevm_database"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "hex",
+ "libc",
+ "proptest",
+ "prost-types",
+ "pulsevm_abi",
+ "pulsevm_arena",
+ "pulsevm_billable_size",
+ "pulsevm_chain_types",
+ "pulsevm_chaindb",
+ "pulsevm_constants",
+ "pulsevm_contractdb",
+ "pulsevm_crypto",
+ "pulsevm_error",
+ "pulsevm_name",
+ "pulsevm_proc_macros",
+ "pulsevm_rpc",
+ "pulsevm_serialization",
+ "pulsevm_softfloat",
+ "secp256k1",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "time",
 ]
 
 [[package]]
@@ -3447,40 +3431,9 @@ name = "pulsevm_error"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "cxx",
  "jsonrpsee",
  "thiserror 2.0.19",
  "wasmer",
-]
-
-[[package]]
-name = "pulsevm_ffi"
-version = "0.1.0"
-dependencies = [
- "cc",
- "cmake",
- "criterion",
- "cxx",
- "cxx-build",
- "hex",
- "libc",
- "proptest",
- "prost-types",
- "pulsevm_arena",
- "pulsevm_billable_size",
- "pulsevm_constants",
- "pulsevm_contractdb",
- "pulsevm_crypto",
- "pulsevm_error",
- "pulsevm_name",
- "pulsevm_proc_macros",
- "pulsevm_serialization",
- "serde",
- "serde_json",
- "tempfile",
- "time",
- "zerocopy",
- "zerocopy-derive",
 ]
 
 [[package]]
@@ -3507,6 +3460,7 @@ dependencies = [
  "hex",
  "k256",
  "pulsevm_core",
+ "pulsevm_crypto",
  "rand 0.9.5",
  "ripemd",
  "serde",
@@ -3563,6 +3517,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pulsevm_rpc"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "pulsevm_abi",
+ "pulsevm_name",
+ "serde_json",
+]
+
+[[package]]
 name = "pulsevm_serialization"
 version = "0.1.0"
 dependencies = [
@@ -3570,6 +3534,13 @@ dependencies = [
  "pulsevm_error",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "pulsevm_softfloat"
+version = "0.1.0"
+dependencies = [
+ "rustc_apfloat",
 ]
 
 [[package]]
@@ -3984,6 +3955,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d"
 
 [[package]]
+name = "rustc_apfloat"
+version = "0.2.3+llvm-462a31f5a5ab"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "486c2179b4796f65bfe2ee33679acf0927ac83ecf583ad6c91c3b4570911b9ad"
+dependencies = [
+ "bitflags 2.13.1",
+ "smallvec",
+]
+
+[[package]]
 name = "rustc_version"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4094,12 +4075,6 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
-
-[[package]]
-name = "scratch"
-version = "1.0.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d68f2ec51b097e4c1a75b681a8bec621909b5e91f15bb7b840c4f2f7b01148b2"
 
 [[package]]
 name = "sec1"
@@ -4637,15 +4612,6 @@ dependencies = [
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "termcolor"
-version = "1.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "06794f8f6c5c898b3275aebefa6b8a1cb24cd2c6c79397ab15774837a0bc5755"
-dependencies = [
- "winapi-util",
 ]
 
 [[package]]

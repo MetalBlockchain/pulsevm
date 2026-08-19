@@ -4,12 +4,12 @@ use pulsevm_crypto::{
     Bytes,
     FixedBytes,
 };
-use pulsevm_error::ChainError;
-use pulsevm_ffi::{
+use pulsevm_database::{
     BlockTimestamp,
     TimePoint,
     TimePointSec,
 };
+use pulsevm_error::ChainError;
 use pulsevm_serialization::{
     Read,
     ReadError,

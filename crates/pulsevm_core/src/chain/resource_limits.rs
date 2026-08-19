@@ -1,16 +1,18 @@
-use pulsevm_error::ChainError;
-use pulsevm_ffi::{
+use pulsevm_database::{
     Database,
     ElasticLimitParameters,
 };
+use pulsevm_error::ChainError;
 
 use crate::name::Name;
 
 pub struct ResourceLimitsManager;
 
 impl ResourceLimitsManager {
-    pub fn initialize_database(db: &mut Database) -> Result<(), ChainError> {
-        db.initialize_resource_limits()
+    pub fn initialize_database(_db: &mut Database) -> Result<(), ChainError> {
+        // The arena seeds the resource-limits state directly during genesis
+        // (`initialize_genesis_arena`), so there is nothing to do here.
+        Ok(())
     }
 
     pub fn initialize_account(db: &mut Database, account: &Name) -> Result<(), ChainError> {

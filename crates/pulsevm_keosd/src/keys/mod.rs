@@ -4,10 +4,8 @@ use k256::ecdsa::{
     SigningKey,
     VerifyingKey,
 };
-use pulsevm_core::{
-    crypto::PrivateKey,
-    utils::Digest as PulseDigest,
-};
+use pulsevm_core::crypto::PrivateKey;
+use pulsevm_crypto::Digest as PulseDigest;
 use ripemd::Ripemd160;
 use sha2::{
     Digest,
@@ -220,7 +218,12 @@ pub fn verifying_key_to_eos_string(vk: &VerifyingKey) -> String {
 pub fn sign_digest(signing_key: &SigningKey, digest: &[u8]) -> Result<String, KeyError> {
     let pk = private_key_to_wif(signing_key);
     let pk = PrivateKey::from_str(&pk).map_err(|e| KeyError::CryptoError(e.to_string()))?;
-    let digest = PulseDigest::from_data(&digest);
+    // `digest` is already a 32-byte SHA-256 hash; wrap it without re-hashing
+    // (the old utils::Digest::from_data was a from-existing-hash constructor).
+    let digest: [u8; 32] = digest
+        .try_into()
+        .map_err(|_| KeyError::CryptoError("expected a 32-byte SHA-256 digest".to_string()))?;
+    let digest = PulseDigest(digest);
     let sig = pk
         .sign(&digest)
         .map_err(|e| KeyError::CryptoError(e.to_string()))?;

@@ -1,3 +1,0 @@
-[submodule "crates/pulsevm_ffi/pulsevm/libraries/boost"]
-	path = crates/pulsevm_ffi/pulsevm/libraries/boost
-	url = https://github.com/boostorg/boost.git

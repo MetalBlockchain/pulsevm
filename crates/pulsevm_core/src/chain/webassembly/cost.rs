@@ -98,7 +98,7 @@ pub const AUTH: u64 = 40;
 // MEASURED — database (estimate_db_intrinsic_costs, 3x safety)
 // ---------------------------------------------------------------------------
 //
-// Row I/O is native FFI/chainbase work invisible to wasm metering, and it was the
+// Row I/O is native database work invisible to wasm metering, and it was the
 // worst PROVISIONAL under-charge: a single flat `DB_OP = 100` billed a write, a
 // keyed lookup, and an iterator step all the same, when measurement puts them
 // 24-160x higher and 6x apart from each other. Split into the three tiers the

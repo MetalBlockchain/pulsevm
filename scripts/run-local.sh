@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
 #
 # Spin up a local PulseVM cluster with metal-network-runner, so a real node
-# writes a real block_log we can replay against the arena shadow.
+# writes a real block_log we can replay against the Rust database.
 #
 # Prerequisites you must supply:
 #   * METALGO_EXEC_PATH  — a compiled `metalgo` binary whose rpcchainvm
 #     protocol version matches this VM's PLUGIN_VERSION (currently 43; see
 #     crates/pulsevm_core/src/chain/config/mod.rs). A mismatch fails the
 #     plugin handshake.
-#   * go, protoc, and the C++ toolchain env vars (LLVM_SYS_221_PREFIX,
-#     BOOST_HEADERS, BOOST_LIB, ZLIB_ROOT) for the plugin build.
+#   * go, protoc, and LLVM 22 (`LLVM_SYS_221_PREFIX`) for the plugin build.
 #
 # This script automates the deterministic setup (build + stage the plugin,
 # install metal-network-runner, start the cluster from genesis.json). Pulling
@@ -70,9 +69,9 @@ echo
 echo "       PULSEVM_REPLAY_BLOCK_LOG_DIR=<dir containing block_log.log> \\"
 echo "       PULSEVM_REPLAY_GENESIS=$REPO/genesis.json \\"
 echo "       PULSEVM_REPLAY_CHAIN_ID=<hex chain id from getInfo> \\"
-echo "       cargo test -p pulsevm_core --features arena-shadow \\"
+echo "       cargo test -p pulsevm_core \\"
 echo "         replay_local_block_log -- --ignored --nocapture"
 echo
-echo "That replays the real block_log into a fresh node with the arena shadow on"
-echo "and asserts the cross-impl full-state root after every block."
+echo "That replays the real block_log into a fresh node and checks the arena"
+echo "state root after every block."
 wait $ANR_PID

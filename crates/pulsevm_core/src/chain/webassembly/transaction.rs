@@ -28,10 +28,9 @@ pub fn send_inline(
     {
         let (env_data, _) = env.data_and_store_mut();
         let db = env_data.db_mut();
-        let r = db.read()?;
-        let gpo = r.get_global_properties()?;
+        let max_inline_action_size = db.chain_config()?.max_inline_action_size;
         pulse_assert(
-            length < gpo.get_chain_config().get_max_inline_action_size(),
+            length < max_inline_action_size,
             ChainError::WasmRuntimeError(format!("inline action too big")),
         )?;
     }
@@ -67,10 +66,9 @@ pub fn send_context_free_inline(
     {
         let (env_data, _) = env.data_and_store_mut();
         let db = env_data.db_mut();
-        let r = db.read()?;
-        let gpo = r.get_global_properties()?;
+        let max_inline_action_size = db.chain_config()?.max_inline_action_size;
         pulse_assert(
-            length < gpo.get_chain_config().get_max_inline_action_size(),
+            length < max_inline_action_size,
             ChainError::WasmRuntimeError(format!("inline action too big")),
         )?;
     }

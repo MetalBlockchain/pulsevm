@@ -1,0 +1,21 @@
+[package]
+name = "pulsevm_chain_types"
+version = "0.1.0"
+edition = "2024"
+
+# Plain-Rust chain value types (time, and later chain config / resource / authority)
+# that were previously declared inside the pulsevm_database cxx bridge. They carry no
+# Shared chain value types, independent of the database implementation.
+# boundary, and pulsevm_core uses them directly.
+
+[dependencies]
+pulsevm_serialization = { path = "../pulsevm_serialization" }
+pulsevm_error = { path = "../pulsevm_error" }
+pulsevm_crypto = { path = "../pulsevm_crypto" }
+pulsevm_name = { path = "../pulsevm_name" }
+pulsevm_billable_size = { path = "../pulsevm_billable_size" }
+time = { version = "0.3.41", features = ["formatting", "macros", "parsing"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# Only for the BlockTimestamp -> gRPC Timestamp conversion the node's RPC layer uses.
+prost-types = "0.12.3"
