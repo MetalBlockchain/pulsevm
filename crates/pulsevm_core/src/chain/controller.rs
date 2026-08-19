@@ -179,7 +179,9 @@ pub struct Controller {
     blocks_executed: u64,
 }
 
-/// Read-only state required for mempool admission. The database handle is
+/// Read-only state required for mempool admission. See
+/// `docs/mempool-admission.md` §2–4 for its shared-live-state semantics.
+/// The database handle is
 /// internally synchronized, so this can validate advisory admission checks
 /// without taking the controller lock while a producer is executing a block.
 /// It intentionally observes the live state rather than a consensus snapshot:

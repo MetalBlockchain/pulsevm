@@ -59,6 +59,7 @@ impl MempoolBatch {
 }
 
 pub const MAX_MEMPOOL_SIZE: usize = 10000;
+/// Local, non-consensus retention bound. See `docs/mempool-admission.md` §6.
 pub const DEFAULT_MEMPOOL_TRANSACTION_TTL_SECS: u32 = 300;
 
 impl Mempool {

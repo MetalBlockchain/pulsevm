@@ -10,6 +10,7 @@ These documents describe **how PulseVM works and why**, at a level of detail int
 
 | Document | Covers | Status |
 |---|---|---|
+| [mempool-admission.md](./mempool-admission.md) | Local admission preflight, shared-state concurrency, detached batches, expiry, capacity, and observability | Current behavior |
 | [resource-model.md](./resource-model.md) | CPU, NET, and RAM accounting; WASM metering cost function; input vs implicit transaction billing | Draft |
 
 ---
