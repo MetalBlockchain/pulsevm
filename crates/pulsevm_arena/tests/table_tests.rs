@@ -185,6 +185,52 @@ fn squash_merges_into_previous_session() {
 }
 
 #[test]
+fn undo_changes_match_chainbase_push_front_order() {
+    let mut t = mk();
+    for name in [10, 20, 30, 40] {
+        t.emplace(|a| a.name = name).unwrap();
+    }
+
+    t.start_undo_session();
+    t.modify(ObjectId::new(0), |a| a.value = 1).unwrap();
+    t.modify(ObjectId::new(2), |a| a.value = 2).unwrap();
+    // A repeated modification keeps the oldest value and its original touch
+    // position, just as chainbase's compressed undo list does.
+    t.modify(ObjectId::new(0), |a| a.value = 3).unwrap();
+    t.remove(ObjectId::new(1)).unwrap();
+    t.remove(ObjectId::new(3)).unwrap();
+
+    let changes = t.last_undo_session_changes().unwrap();
+    let modified: Vec<i64> = changes.old_values.iter().map(|(id, _)| *id).collect();
+    let removed: Vec<i64> = changes.removed_values.iter().map(|(id, _)| *id).collect();
+    assert_eq!(modified, vec![2, 0]);
+    assert_eq!(removed, vec![3, 1]);
+    assert_eq!(changes.old_values[1].1.value, 0);
+}
+
+#[test]
+fn squashed_undo_changes_keep_reverse_timeline_order() {
+    let mut t = mk();
+    for name in [10, 20, 30] {
+        t.emplace(|a| a.name = name).unwrap();
+    }
+
+    t.start_undo_session();
+    t.modify(ObjectId::new(0), |a| a.value = 1).unwrap();
+    t.start_undo_session();
+    t.modify(ObjectId::new(1), |a| a.value = 1).unwrap();
+    t.modify(ObjectId::new(0), |a| a.value = 2).unwrap();
+    t.modify(ObjectId::new(2), |a| a.value = 1).unwrap();
+    t.squash();
+
+    let changes = t.last_undo_session_changes().unwrap();
+    let modified: Vec<i64> = changes.old_values.iter().map(|(id, _)| *id).collect();
+    assert_eq!(modified, vec![2, 1, 0]);
+    // The parent session's pre-change value wins when both sessions touched it.
+    assert_eq!(changes.old_values[2].1.value, 0);
+}
+
+#[test]
 fn commit_drops_undo_history() {
     let mut t = mk();
     let r0 = t.start_undo_session();

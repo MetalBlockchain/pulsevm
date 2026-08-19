@@ -4,10 +4,8 @@ use std::{
     str::FromStr,
 };
 
-use cxx::UniquePtr;
 use pulsevm_crypto::FixedBytes;
 use pulsevm_error::ChainError;
-use pulsevm_ffi::CxxDigest;
 use pulsevm_proc_macros::{
     NumBytes,
     Read,
@@ -36,10 +34,6 @@ impl Id {
 
     pub fn zero() -> Self {
         Id(FixedBytes::default())
-    }
-
-    pub fn to_digest(&self) -> Result<UniquePtr<CxxDigest>, ChainError> {
-        CxxDigest::new_from_existing_hash(self.as_bytes())
     }
 }
 
@@ -121,14 +115,6 @@ impl TryFrom<Vec<u8>> for Id {
         let mut id = [0u8; 32];
         id.copy_from_slice(&value);
         Ok(Id(FixedBytes(id)))
-    }
-}
-
-impl From<&CxxDigest> for Id {
-    fn from(digest: &CxxDigest) -> Self {
-        let hash: &[u8] = digest.as_slice();
-        let hash32: &[u8; 32] = hash.try_into().unwrap();
-        Id(FixedBytes(*hash32))
     }
 }
 

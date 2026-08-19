@@ -3,12 +3,11 @@ use pulsevm_constants::{
     OVERHEAD_PER_ACCOUNT_RAM_BYTES,
     SETCODE_RAM_BYTES_MULTIPLIER,
 };
-use pulsevm_error::ChainError;
-use pulsevm_ffi::{
-    CxxDigest,
+use pulsevm_database::{
     Database,
     PermissionObject,
 };
+use pulsevm_error::ChainError;
 use pulsevm_serialization::Read;
 
 use crate::{
@@ -66,13 +65,7 @@ pub fn newaccount(
     )?;
 
     // Check if the creator is privileged
-    let creator_privileged = {
-        let r = db.read()?;
-        r.get_account_metadata(create.creator.as_u64())?
-            .is_privileged()
-    };
-
-    if !creator_privileged {
+    if !db.is_account_privileged(create.creator.as_u64())? {
         pulse_assert(
             !name_str.starts_with("pulse."),
             ChainError::TransactionError(
@@ -82,7 +75,7 @@ pub fn newaccount(
     }
 
     pulse_assert(
-        !db.account_exists(create.name.as_u64())?,
+        !db.is_account(create.name.as_u64())?,
         ChainError::TransactionError(format!(
             "cannot create account named {}, as that name is already taken",
             create.name
@@ -106,13 +99,19 @@ pub fn newaccount(
         &create.owner.into(),
         &context.pending_block_timestamp().into(),
     )?;
-    // Re-read the created permission's id and size rather than holding the
-    // creation pointer across the next create.
+    // Re-read the created permission's id and authority billable size rather than
+    // holding the creation pointer across the next create. Both are served from
+    // the arena.
     let (owner_id, owner_size) = {
         let r = db.read()?;
-        let p =
-            AuthorizationManager::get_permission(&r, create.name.as_u64(), OWNER_NAME.as_u64())?;
-        (p.get_id(), p.get_authority().get_billable_size() as i64)
+        let name = create.name.as_u64();
+        let owner_id = r
+            .permission_id(name, OWNER_NAME.as_u64())?
+            .ok_or_else(|| ChainError::TransactionError("owner permission missing".to_string()))?;
+        let owner_size = r
+            .permission_authority_billable_size(name, OWNER_NAME.as_u64())?
+            .ok_or_else(|| ChainError::TransactionError("owner permission missing".to_string()))?;
+        (owner_id, owner_size)
     };
 
     AuthorizationManager::create_permission(
@@ -125,9 +124,8 @@ pub fn newaccount(
     )?;
     let active_size = {
         let r = db.read()?;
-        let p =
-            AuthorizationManager::get_permission(&r, create.name.as_u64(), ACTIVE_NAME.as_u64())?;
-        p.get_authority().get_billable_size() as i64
+        r.permission_authority_billable_size(create.name.as_u64(), ACTIVE_NAME.as_u64())?
+            .ok_or_else(|| ChainError::TransactionError("active permission missing".to_string()))?
     };
 
     ResourceLimitsManager::initialize_account(db, &create.name)?;
@@ -161,30 +159,20 @@ pub fn setcode(
         ChainError::TransactionError(format!("version should be 0")),
     )?;
 
-    let mut code_hash = CxxDigest::new_empty();
     let code_size = act.code.len() as u64;
-
-    if code_size > 0 {
-        code_hash = CxxDigest::hash(act.code.as_slice())?;
-
+    let code_hash: [u8; 32] = if code_size > 0 {
         // Validate the code before accepting it
         pulsevm_wasm_validation::validate_wasm(act.code.as_slice()).map_err(|e| {
             ChainError::TransactionError(format!("contract code failed validation: {}", e))
         })?;
-    }
-
-    // Read the current code identity under a short guard; owning the hash lets the
-    // mutations below run without a chainbase reference held across them.
-    let (existing_code, cur_code_hash, cur_vm_type, cur_vm_version) = {
-        let r = db.read()?;
-        let account = r.get_account_metadata(act.account.as_u64())?;
-        (
-            !account.get_code_hash().empty(),
-            CxxDigest::new_from_existing_hash(account.get_code_hash().as_slice())?,
-            account.get_vm_type(),
-            account.get_vm_version(),
-        )
+        pulsevm_crypto::Digest::hash(act.code.as_slice()).0
+    } else {
+        [0u8; 32]
     };
+
+    let (cur_code_hash, cur_vm_type, cur_vm_version) =
+        db.account_code_hash_vm(act.account.as_u64())?;
+    let existing_code = cur_code_hash != [0u8; 32];
 
     pulse_assert(
         code_size > 0 || existing_code,
@@ -195,25 +183,17 @@ pub fn setcode(
     let new_size: i64 = code_size as i64 * SETCODE_RAM_BYTES_MULTIPLIER as i64;
 
     if existing_code {
-        let old_code_bytes = {
-            let r = db.read()?;
-            let old_code_entry = r.get_code_object_by_hash(
-                cur_code_hash.as_ref().unwrap(),
-                cur_vm_type,
-                cur_vm_version,
-            )?;
-            pulse_assert(
-                old_code_entry.get_code_hash() != code_hash.as_ref().unwrap(),
-                ChainError::TransactionError(format!(
-                    "contract is already running this version of code"
-                )),
-            )?;
-            old_code_entry.get_code().size() as i64
-        };
+        pulse_assert(
+            cur_code_hash != code_hash,
+            ChainError::TransactionError(format!(
+                "contract is already running this version of code"
+            )),
+        )?;
 
-        old_size = old_code_bytes * SETCODE_RAM_BYTES_MULTIPLIER as i64;
+        let old_code = db.get_code_bytes_by_hash(&cur_code_hash, cur_vm_type, cur_vm_version)?;
+        old_size = old_code.len() as i64 * SETCODE_RAM_BYTES_MULTIPLIER as i64;
 
-        db.unlink_account_code(cur_code_hash.as_ref().unwrap(), cur_vm_type, cur_vm_version)?;
+        db.unlink_account_code(&cur_code_hash, cur_vm_type, cur_vm_version)?;
     }
 
     db.update_account_code(
@@ -221,7 +201,7 @@ pub fn setcode(
         act.code.as_slice(),
         context.get_head_block_num() + 1,
         &context.get_pending_block_time().into(),
-        code_hash.as_ref().unwrap(),
+        &code_hash,
         act.vm_type,
         act.vm_version,
     )?;
@@ -248,10 +228,7 @@ pub fn setabi(
         ChainError::TransactionError(format!("failed to deserialize ABI definition: {}", e))
     })?;
 
-    let old_size: i64 = {
-        let r = db.read()?;
-        r.get_account(act.account.as_u64())?.get_abi().size() as i64
-    };
+    let old_size: i64 = db.account_abi_size(act.account.as_u64())? as i64;
     let new_size: i64 = act.abi.len() as i64;
 
     db.update_account_abi(act.account.as_u64(), act.abi.as_slice())?;
@@ -289,7 +266,7 @@ pub fn updateauth(
     )?;
 
     pulse_assert(
-        db.account_exists(update.account.as_u64())?,
+        db.is_account(update.account.as_u64())?,
         ChainError::TransactionError(format!("failed to find account {}", update.account)),
     )?;
 
@@ -343,7 +320,7 @@ pub fn updateauth(
                     )),
                 )?;
                 let old_size = billable_size_v::<PermissionObject>() as i64
-                    + permission.get_authority().get_billable_size() as i64;
+                    + permission.authority_billable_size();
                 (true, parent_id, old_size)
             }
             None => (false, parent_id, 0i64),
@@ -367,8 +344,7 @@ pub fn updateauth(
                 update.account.as_u64(),
                 update.permission.as_u64(),
             )?;
-            billable_size_v::<PermissionObject>() as i64
-                + permission.get_authority().get_billable_size() as i64
+            billable_size_v::<PermissionObject>() as i64 + permission.authority_billable_size()
         };
 
         context.add_ram_usage(&update.account, new_size - old_size)?;
@@ -389,8 +365,7 @@ pub fn updateauth(
                 update.account.as_u64(),
                 update.permission.as_u64(),
             )?;
-            billable_size_v::<PermissionObject>() as i64
-                + permission.get_authority().get_billable_size() as i64
+            billable_size_v::<PermissionObject>() as i64 + permission.authority_billable_size()
         };
 
         context.add_ram_usage(&update.account, new_size)?;
@@ -477,10 +452,14 @@ pub fn unlinkauth(
 
 fn validate_authority_precondition(db: &mut Database, auth: &Authority) -> Result<(), ChainError> {
     for a in auth.accounts() {
-        pulse_assert(
-            db.account_exists(a.permission.actor)?,
-            ChainError::TransactionError(format!("account {} does not exist", a.permission.actor)),
-        )?;
+        // C++ does a throwing `get<account_object>` purely to assert existence;
+        // is_account is the same predicate and is served off the arena.
+        if !db.is_account(a.permission.actor)? {
+            return Err(ChainError::TransactionError(format!(
+                "account {} does not exist",
+                a.permission.actor
+            )));
+        }
 
         if a.permission.permission == OWNER_NAME || a.permission.permission == ACTIVE_NAME {
             continue; // account was already checked to exist, so its owner and active permissions should exist

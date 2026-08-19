@@ -158,7 +158,10 @@ mod tests {
             self.set_transaction_headers(&mut trx, DEFAULT_EXPIRATION_DELTA, 0);
             let mut owner_auth = Authority::new(
                 1,
-                vec![KeyWeight::new(get_public_key(account, "owner").inner(), 1)],
+                vec![KeyWeight::new(
+                    get_public_key(account, "owner").k1().clone(),
+                    1,
+                )],
                 vec![],
                 vec![],
             );
@@ -166,7 +169,10 @@ mod tests {
             if multisig {
                 owner_auth = Authority::new(
                     2,
-                    vec![KeyWeight::new(get_public_key(account, "owner").inner(), 1)],
+                    vec![KeyWeight::new(
+                        get_public_key(account, "owner").k1().clone(),
+                        1,
+                    )],
                     vec![PermissionLevelWeight::new(
                         PermissionLevel::new(creator.as_u64(), ACTIVE_NAME.as_u64()),
                         1,
@@ -177,7 +183,10 @@ mod tests {
 
             let mut active_auth = Authority::new(
                 1,
-                vec![KeyWeight::new(get_public_key(account, "active").inner(), 1)],
+                vec![KeyWeight::new(
+                    get_public_key(account, "active").k1().clone(),
+                    1,
+                )],
                 vec![],
                 vec![],
             );

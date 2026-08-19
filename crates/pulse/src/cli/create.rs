@@ -59,7 +59,7 @@ pub async fn handle(
                         owner: Authority {
                             threshold: 1,
                             keys: vec![KeyWeight {
-                                key: PublicKey::from_str(&owner_key)?.into(),
+                                key: PublicKey::from_str(&owner_key)?.into_k1(),
                                 weight: 1,
                             }],
                             accounts: vec![],
@@ -68,7 +68,7 @@ pub async fn handle(
                         active: Authority {
                             threshold: 1,
                             keys: vec![KeyWeight {
-                                key: PublicKey::from_str(&active_key)?.into(),
+                                key: PublicKey::from_str(&active_key)?.into_k1(),
                                 weight: 1,
                             }],
                             accounts: vec![],
@@ -86,11 +86,13 @@ pub async fn handle(
             to_console,
             r1,
         } => {
-            let private_key = if r1 {
-                PrivateKey::random_r1()
-            } else {
-                PrivateKey::random()
-            };
+            if r1 {
+                return Err(
+                    "R1 (secp256r1) keys are not supported by the pure-Rust build; use a K1 key"
+                        .into(),
+                );
+            }
+            let private_key = PrivateKey::random();
 
             match file {
                 Some(path) => {

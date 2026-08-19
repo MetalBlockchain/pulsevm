@@ -5,6 +5,9 @@ pub trait BillableSize {
     const VALUE: u64;
 }
 
+#[allow(clippy::manual_div_ceil)]
 pub const fn billable_size_v<T: BillableSize>() -> u64 {
-    return ((T::VALUE + BILLABLE_ALIGNMENT - 1) / BILLABLE_ALIGNMENT) * BILLABLE_ALIGNMENT;
+    // Keep the historical add-before-divide overflow behavior: this value is
+    // consensus-visible RAM billing.
+    ((T::VALUE + BILLABLE_ALIGNMENT - 1) / BILLABLE_ALIGNMENT) * BILLABLE_ALIGNMENT
 }

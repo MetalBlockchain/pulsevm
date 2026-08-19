@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use pulsevm_ffi::{
+use pulsevm_database::{
     PermissionLevel,
     microseconds,
     seconds,
@@ -184,9 +184,10 @@ pub fn get_permission_last_used(
     env_data.charge(&mut store, cost::BASE)?;
     let db = env_data.db();
     let r = db.read()?;
-    let permission = AuthorizationManager::get_permission(&r, account, permission)?;
-    let last_used = r.get_permission_last_used(permission)?;
-    Ok(last_used.time_since_epoch().count())
+    // Resolve the permission (this validates existence and errors if absent),
+    // then read its last-used stamp by name so no chainbase object is needed.
+    let _permission = AuthorizationManager::get_permission(&r, account, permission)?;
+    Ok(r.permission_last_used_by_name(account, permission)?)
 }
 
 pub fn get_account_creation_time(
@@ -197,11 +198,5 @@ pub fn get_account_creation_time(
     let (env_data, mut store) = env.data_and_store_mut();
     env_data.charge(&mut store, cost::BASE)?;
     let db = env_data.db();
-    let r = db.read()?;
-    let account = r.get_account(account)?;
-    Ok(account
-        .get_creation_date()
-        .to_time_point()
-        .time_since_epoch()
-        .count())
+    Ok(db.account_creation_time_micros(account)?)
 }

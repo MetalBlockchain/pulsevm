@@ -48,6 +48,13 @@ pub enum TableError {
 struct UndoState<T> {
     old_values: HashMap<i64, T>,
     removed_values: HashMap<i64, T>,
+    // Insertion order of `old_values` / `removed_values` keys (first touch wins,
+    // matching the maps' first-write-wins values). chainbase pushes these onto
+    // the front of intrusive lists, so its state-history delta emits reverse
+    // first-touch order. The order is consensus-visible to a SHiP consumer and
+    // must be preserved here, not recovered by sorting on id.
+    old_order: Vec<i64>,
+    removed_order: Vec<i64>,
     old_next_id: i64,
     /// Blob-arena length when the session started; undo truncates back to it,
     /// dropping every blob appended during the session.
@@ -60,6 +67,20 @@ struct UndoState<T> {
     /// Free spans this session's allocations consumed. On undo the allocations
     /// are reverted, so the spans go back to the free list.
     reused: Vec<BlobRef>,
+}
+
+/// A copied-out view of the innermost open undo session's change-sets, for
+/// consumers (state-history delta packing) that need the block's modified and
+/// removed rows without reaching into the private undo stack. Rows are POD, so
+/// they are cloned out; the caller resolves current rows/blobs against the live
+/// table.
+pub struct UndoSessionChanges<T> {
+    /// Next id at session start: a live row with `id >= old_next_id` is new.
+    pub old_next_id: i64,
+    /// `(id, pre-session value)` for every row modified during the session.
+    pub old_values: Vec<(i64, T)>,
+    /// `(id, removed value)` for every row removed during the session.
+    pub removed_values: Vec<(i64, T)>,
 }
 
 /// A table of `T` stored in an index-addressed arena: rows live in a
@@ -297,6 +318,9 @@ impl<T: ArenaObject> Table<T> {
         if let Some(state) = self.undo_stack.back_mut() {
             // An object created in this session leaves no trace when removed.
             if raw < state.old_next_id {
+                if !state.removed_values.contains_key(&raw) {
+                    state.removed_order.push(raw);
+                }
                 state.removed_values.insert(raw, obj);
             }
         }
@@ -385,6 +409,8 @@ impl<T: ArenaObject> Table<T> {
         self.undo_stack.push_back(UndoState {
             old_values: HashMap::new(),
             removed_values: HashMap::new(),
+            old_order: Vec::new(),
+            removed_order: Vec::new(),
             old_next_id: self.next_id(),
             old_blob_len: self.blobs.len(),
             freed: Vec::new(),
@@ -419,6 +445,32 @@ impl<T: ArenaObject> Table<T> {
         !self.undo_stack.is_empty()
     }
 
+    /// Copies out the innermost open undo session's change-sets (chainbase
+    /// `last_undo_session`), for state-history delta packing. `None` if no
+    /// session is open. `old_values` and `removed_values` come back in reverse
+    /// first-touch order, matching chainbase's push-front intrusive lists. The
+    /// caller must not re-sort them.
+    pub fn last_undo_session_changes(&self) -> Option<UndoSessionChanges<T>>
+    where
+        T: Clone,
+    {
+        self.undo_stack.back().map(|state| UndoSessionChanges {
+            old_next_id: state.old_next_id,
+            old_values: state
+                .old_order
+                .iter()
+                .rev()
+                .map(|id| (*id, state.old_values[id]))
+                .collect(),
+            removed_values: state
+                .removed_order
+                .iter()
+                .rev()
+                .map(|id| (*id, state.removed_values[id]))
+                .collect(),
+        })
+    }
+
     /// Reverts to the state at the top of the undo stack.
     pub fn undo(&mut self) {
         let Some(state) = self.undo_stack.pop_back() else {
@@ -427,6 +479,8 @@ impl<T: ArenaObject> Table<T> {
         let UndoState {
             mut old_values,
             removed_values,
+            old_order: _,
+            removed_order: _,
             old_next_id,
             old_blob_len,
             freed,
@@ -520,13 +574,25 @@ impl<T: ArenaObject> Table<T> {
         // session, undone or committed with it.
         previous.freed.extend(freed);
         previous.reused.extend(reused);
-        for (id, old) in top.old_values {
-            if id < previous.old_next_id {
-                previous.old_values.entry(id).or_insert(old);
+        // Fold the child's change-sets into the parent in operation order. The
+        // accessor reverses the combined timeline to match chainbase's
+        // push-front lists. First-write wins for values, matching squash.
+        for id in top.old_order {
+            if id < previous.old_next_id
+                && !previous.old_values.contains_key(&id)
+                && let Some(old) = top.old_values.remove(&id)
+            {
+                previous.old_order.push(id);
+                previous.old_values.insert(id, old);
             }
         }
-        for (id, removed) in top.removed_values {
-            if id < previous.old_next_id {
+        for id in top.removed_order {
+            if id < previous.old_next_id
+                && let Some(removed) = top.removed_values.remove(&id)
+            {
+                if !previous.removed_values.contains_key(&id) {
+                    previous.removed_order.push(id);
+                }
                 previous.removed_values.insert(id, removed);
             }
         }
@@ -557,8 +623,9 @@ impl<T: ArenaObject> Table<T> {
         if let Some(state) = self.undo_stack.back_mut() {
             // Objects created during the session are dropped wholesale on undo;
             // only pre-existing objects need their first-seen value.
-            if id < state.old_next_id {
-                state.old_values.entry(id).or_insert(old);
+            if id < state.old_next_id && !state.old_values.contains_key(&id) {
+                state.old_order.push(id);
+                state.old_values.insert(id, old);
             }
         }
     }

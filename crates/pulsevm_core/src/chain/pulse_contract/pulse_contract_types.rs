@@ -93,12 +93,12 @@ mod tests {
     use std::str::FromStr;
 
     use super::*;
-    use pulsevm_ffi::{
+    use pulsevm_crypto::k1::K1PublicKey;
+    use pulsevm_database::{
         KeyWeight,
         PermissionLevel,
         PermissionLevelWeight,
         WaitWeight,
-        parse_public_key,
     };
     use pulsevm_name_macro::name;
     use pulsevm_serialization::{
@@ -114,7 +114,7 @@ mod tests {
             owner: Authority::new(
                 1,
                 vec![KeyWeight {
-                    key: parse_public_key(
+                    key: K1PublicKey::from_string(
                         "PUB_K1_5bbkxaLdB5bfVZW6DJY8M74vwT2m61PqwywNUa5azfkJTvYa5H",
                     )
                     .unwrap(),

@@ -101,7 +101,7 @@ anchor.
 
 The database intrinsics were the PROVISIONAL tier flagged above, and the worst
 remaining under-charge. `estimate_db_intrinsic_costs` (an ignored test, same anchor
-and 3× safety) times the real chainbase work directly — a `Database` +
+and 3× safety) times the real Rust database work directly — a `Database` +
 `KeyValueIteratorCache` over a populated table, which is the exact path
 `db_find_i64` / `db_next_i64` / `db_store_i64` reach through `ApplyContext` minus the
 lock hop:
@@ -121,7 +121,7 @@ cargo test --release -p pulsevm_core --lib estimate_db_intrinsic_costs \
 A single flat `DB_OP = 100` billed all three the same when they're 24–160× low and
 6× apart from each other, so the table now splits into `DB_STORE` / `DB_FIND` /
 `DB_ITERATE` + `db_value_per_byte`. `is_account` moves to `DB_FIND` (it does a
-chainbase lookup); the `require_auth`/`has_auth` scans stay a small fixed `AUTH`
+database lookup); the `require_auth`/`has_auth` scans stay a small fixed `AUTH`
 (the heavy authority walk runs at transaction-authorization time, not inside the
 contract). Secondary/wide-key indexes reuse the primary prices plus safety — pricing
 their wider key comparisons exactly is a refinement follow-up.
@@ -144,7 +144,7 @@ bulk-op metering middleware and is a follow-up.
 
 Honest db costs (~16k points/write) are large in the point unit, and they exposed
 that the *resource-limit* budgets were still on the legacy scale for the first
-block. `initialize_database` seeds the C++ resource-limits config from struct
+block. `initialize_database` seeds the resource-limits config from struct
 defaults (`default_max_block_cpu_usage = 2,000,000`), not from genesis, and the
 genesis-derived `set_block_parameters` only runs at end-of-block — so block 1 always
 ran under a ~2M-point ceiling regardless of the `max_block_cpu_usage = 3e9` in
@@ -170,6 +170,6 @@ still stops (there's no native-code checktime deadline yet).
 - Secondary/wide-key database indexes (`idx128`/`idx256`/`idx_double`/
   `idx_long_double`) reuse the primary-index prices; their wider key comparisons
   aren't separately measured.
-- CPU limits cross the Rust↔C++ boundary as `u32` (cap ~4.29e9 points ≈ 113 ms) and
-  the per-transaction billed CPU (`cpu_usage_us`) is `u32` too. The genesis 3e9/1e9
+- CPU limits remain `u32` (cap ~4.29e9 points ≈ 113 ms), and the
+  per-transaction billed CPU (`cpu_usage_us`) is `u32` too. The genesis 3e9/1e9
   values fit; a larger block budget would need those widened to 64-bit.

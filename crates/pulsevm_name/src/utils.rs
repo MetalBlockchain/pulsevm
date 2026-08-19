@@ -12,8 +12,8 @@ where
     let mut len = 0_u64;
 
     // Loop through up to 12 characters
-    while let Some(c) = iter.next() {
-        let v = char_to_value(c).ok_or_else(|| ParseNameError::BadChar(c))?;
+    for c in iter.by_ref() {
+        let v = char_to_value(c).ok_or(ParseNameError::BadChar(c))?;
         value <<= 5;
         value |= u64::from(v);
         len += 1;
@@ -31,7 +31,7 @@ where
 
     // Check if we have a 13th character
     if let Some(c) = iter.next() {
-        let v: u8 = char_to_value(c).ok_or_else(|| ParseNameError::BadChar(c))?;
+        let v: u8 = char_to_value(c).ok_or(ParseNameError::BadChar(c))?;
 
         // The 13th character can only be 4 bits, it has to be between letters
         // 'a' to 'j'
@@ -55,9 +55,9 @@ where
 fn char_to_value(c: u8) -> Option<u8> {
     if c == b'.' {
         Some(0)
-    } else if c >= b'1' && c <= b'5' {
+    } else if (b'1'..=b'5').contains(&c) {
         Some(c - b'1' + 1)
-    } else if c >= b'a' && c <= b'z' {
+    } else if c.is_ascii_lowercase() {
         Some(c - b'a' + 6)
     } else {
         None

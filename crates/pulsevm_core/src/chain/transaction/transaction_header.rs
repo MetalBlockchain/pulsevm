@@ -1,4 +1,4 @@
-use pulsevm_ffi::TimePointSec;
+use pulsevm_database::TimePointSec;
 use pulsevm_proc_macros::{
     NumBytes,
     Read,

@@ -87,7 +87,7 @@ impl Model {
     fn squash(&mut self) {
         self.snaps.pop();
     }
-    fn dump(&self) -> (Vec<(u64, u64, u64, u64, u64, Vec<u8>)>, Vec<(u64, i64)>) {
+    fn dump(&self) -> Dump {
         let rows = self
             .rows
             .iter()

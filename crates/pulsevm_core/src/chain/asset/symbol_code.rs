@@ -211,22 +211,6 @@ impl TryFrom<u64> for SymbolCode {
 }
 
 #[inline]
-#[must_use]
-#[allow(clippy::cast_possible_truncation)]
-pub fn symbol_code_to_bytes(value: u64) -> [u8; SYMBOL_CODE_MAX_LEN] {
-    let mut chars = [b' '; SYMBOL_CODE_MAX_LEN];
-    let mut v = value;
-    for c in &mut chars {
-        if v == 0 {
-            break;
-        }
-        *c = (v & 0xFF) as u8;
-        v >>= 8;
-    }
-    chars
-}
-
-#[inline]
 pub fn symbol_code_from_bytes<I>(iter: I) -> Result<u64, ParseSymbolCodeError>
 where
     I: Iterator<Item = u8> + ExactSizeIterator,

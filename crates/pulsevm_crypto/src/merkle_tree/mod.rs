@@ -39,7 +39,7 @@ pub fn merkle(ids: &mut VecDeque<Digest>) -> Digest {
     }
 
     while ids.len() > 1 {
-        if ids.len() % 2 != 0 {
+        if !ids.len().is_multiple_of(2) {
             ids.push_back(*ids.back().unwrap());
         }
 

@@ -7,4 +7,4 @@ pub use block_status::*;
 mod block;
 pub use block::*;
 
-pub use pulsevm_ffi::BlockTimestamp;
+pub use pulsevm_database::BlockTimestamp;

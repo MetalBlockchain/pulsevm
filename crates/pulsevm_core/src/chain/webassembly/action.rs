@@ -71,13 +71,12 @@ pub fn set_action_return_value(
 
     {
         let db = env_data.db_mut();
-        let r = db.read()?;
-        let gpo = r.get_global_properties()?;
+        let max_action_return_value_size = db.max_action_return_value_size()?;
         pulse_assert(
-            buffer_len <= gpo.get_chain_config().get_max_action_return_value_size(),
+            buffer_len <= max_action_return_value_size,
             ChainError::WasmRuntimeError(format!(
                 "action return value size must be less or equal to {} bytes",
-                gpo.get_chain_config().get_max_action_return_value_size()
+                max_action_return_value_size
             )),
         )?;
     }

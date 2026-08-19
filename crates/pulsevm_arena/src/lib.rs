@@ -37,6 +37,7 @@ pub use table::{
     IndexView,
     Table,
     TableError,
+    UndoSessionChanges,
 };
 
 /// `#[derive(ArenaObject)]` — generates the trait impl and secondary-index

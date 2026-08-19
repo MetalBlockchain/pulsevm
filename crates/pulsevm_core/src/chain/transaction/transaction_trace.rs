@@ -1,4 +1,4 @@
-use pulsevm_ffi::BlockTimestamp;
+use pulsevm_database::BlockTimestamp;
 use pulsevm_proc_macros::{
     NumBytes,
     Read,

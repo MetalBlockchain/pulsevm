@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Fetch a range of real testnet blocks from the PulseVM RPC into JSON fixture
-# files, one per block (NNNNNNNN.json), for replay against the arena shadow.
+# files, one per block (NNNNNNNN.json), for replay against the Rust database.
 #
 #   scripts/fetch-blocks.sh <from> <to> [out_dir] [rpc_url]
 #
 # Then run the replay:
 #   PULSEVM_RPC_BLOCKS_DIR=<out_dir> cargo test -p pulsevm_core \
-#     --features arena-shadow replay_testnet_blocks -- --ignored --nocapture
+#     replay_testnet_blocks -- --ignored --nocapture
 set -euo pipefail
 
 FROM="${1:?usage: fetch-blocks.sh <from> <to> [out_dir] [rpc_url]}"

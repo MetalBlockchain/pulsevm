@@ -9,8 +9,7 @@
 //! proptest generates random blocks of random transactions with random
 //! success/failure, runs them against the engine and an obviously-correct
 //! full-snapshot reference, and asserts identical state after every tx and
-//! every block. Swap the reference for the C++ FFI and this becomes the
-//! block-level Rust-vs-C++ equivalence check.
+//! every block.
 
 use std::collections::BTreeMap;
 

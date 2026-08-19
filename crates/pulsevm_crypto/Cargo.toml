@@ -7,5 +7,8 @@ edition = "2024"
 hex = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 sha2 = { version = "0.10", features = ["asm"] }
+secp256k1 = { version = "0.30", features = ["recovery", "global-context", "hashes", "rand"] }
+bs58 = "0.5"
+ripemd = "0.1"
 pulsevm_proc_macros = { path = "../pulsevm_proc_macros" }
 pulsevm_serialization = { path = "../pulsevm_serialization" }

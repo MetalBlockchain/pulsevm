@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
+use pulsevm_database::ChainConfigV0;
 use pulsevm_error::ChainError;
-use pulsevm_ffi::ChainConfigV0;
 use pulsevm_serialization::{
     Read,
     VarUint32,
@@ -111,9 +111,6 @@ pub fn set_proposed_producers(
         )?;
     }
 
-    // EOSIO returns the proposed schedule's version, or -1 when the proposal is a
-    // no-op — identical to what is already active (this build has no separate
-    // pending schedule to also compare against). A no-op records nothing.
     let context = env_data.apply_context();
     if producers == context.active_producers()? {
         return Ok(-1);
@@ -145,33 +142,9 @@ pub fn get_blockchain_parameters_packed(
 
     // Read the active chain configuration and pack it in the same ChainConfigV0
     // wire format `set_blockchain_parameters_packed` consumes, so a contract can
-    // round-trip the parameters it sets.
-    // Safe: the global property object always exists after genesis and is not
-    // mutated across this read (same `unsafe { &*ptr }` pattern used elsewhere for
-    // chainbase objects).
-    let gpo = env_data.db().get_global_properties()?;
-    let c = unsafe { &*gpo }.get_chain_config();
-    let cfg = ChainConfigV0 {
-        max_block_net_usage: c.get_max_block_net_usage(),
-        target_block_net_usage_pct: c.get_target_block_net_usage_pct(),
-        max_transaction_net_usage: c.get_max_transaction_net_usage(),
-        base_per_transaction_net_usage: c.get_base_per_transaction_net_usage(),
-        net_usage_leeway: c.get_net_usage_leeway(),
-        context_free_discount_net_usage_num: c.get_context_free_discount_net_usage_num(),
-        context_free_discount_net_usage_den: c.get_context_free_discount_net_usage_den(),
-        max_block_cpu_usage: c.get_max_block_cpu_usage(),
-        target_block_cpu_usage_pct: c.get_target_block_cpu_usage_pct(),
-        max_transaction_cpu_usage: c.get_max_transaction_cpu_usage(),
-        min_transaction_cpu_usage: c.get_min_transaction_cpu_usage(),
-        max_transaction_lifetime: c.get_max_transaction_lifetime(),
-        // No stored field for this (deferred transactions are unsupported); the
-        // wire format still carries the slot, so report 0.
-        deferred_trx_expiration_window: 0,
-        max_transaction_delay: c.get_max_transaction_delay(),
-        max_inline_action_size: c.get_max_inline_action_size(),
-        max_inline_action_depth: c.get_max_inline_action_depth(),
-        max_authority_depth: c.get_max_authority_depth(),
-    };
+    // round-trip the parameters it sets. Served as owned values (from the arena
+    // in the Rust database).
+    let cfg = env_data.db().chain_config()?;
     let packed = cfg
         .pack()
         .map_err(|e| RuntimeError::new(format!("packing blockchain parameters: {e}")))?;
@@ -238,10 +211,8 @@ pub fn is_privileged(
     let context = env_data.apply_context_mut();
     privileged_check(context)?;
     let db = env_data.db();
-    let r = db.read()?;
-    let account = r.get_account_metadata(account)?;
 
-    Ok(account.is_privileged() as i32)
+    Ok(db.is_account_privileged(account)? as i32)
 }
 
 pub fn set_privileged(

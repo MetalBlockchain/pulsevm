@@ -89,7 +89,7 @@ mod tests {
         TransactionCompression,
         TransactionHeader,
     };
-    use pulsevm_ffi::TimePointSec;
+    use pulsevm_database::TimePointSec;
     use pulsevm_serialization::Write;
 
     // A distinct, unsigned transaction per `seed`. The mempool keys on the
