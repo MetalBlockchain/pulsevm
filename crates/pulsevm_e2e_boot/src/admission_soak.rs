@@ -8,14 +8,26 @@
 use std::{
     str::FromStr,
     sync::Arc,
-    time::{Duration, Instant},
+    time::{
+        Duration,
+        Instant,
+    },
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{
+    Context,
+    Result,
+    bail,
+};
 use pulsevm_api_client::PulseVmClient;
 use pulsevm_core::{
-    ACTIVE_NAME, PULSE_NAME,
-    authority::{Authority, KeyWeight, PermissionLevel},
+    ACTIVE_NAME,
+    PULSE_NAME,
+    authority::{
+        Authority,
+        KeyWeight,
+        PermissionLevel,
+    },
     config::NEWACCOUNT_NAME,
     crypto::PrivateKey,
     id::Id,
@@ -23,7 +35,11 @@ use pulsevm_core::{
     name::Name,
     pulse_contract::NewAccount,
     time::TimePointSec,
-    transaction::{Action, PackedTransaction, Transaction},
+    transaction::{
+        Action,
+        PackedTransaction,
+        Transaction,
+    },
 };
 use pulsevm_serialization::Write;
 use tokio::task::JoinSet;

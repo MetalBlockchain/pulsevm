@@ -7,7 +7,10 @@ use std::collections::{
 
 use crate::chain::{
     id::Id,
-    time::{TimePoint, TimePointSec},
+    time::{
+        TimePoint,
+        TimePointSec,
+    },
     transaction::PackedTransaction,
 };
 
@@ -270,14 +273,7 @@ mod tests {
     // different id; no signing or execution is involved.
     fn tx_with_expiration(expiration: TimePointSec, seed: u16) -> PackedTransaction {
         let trx = Transaction::new(
-            TransactionHeader::new(
-                expiration,
-                seed,
-                0,
-                0u32.into(),
-                0,
-                0u32.into(),
-            ),
+            TransactionHeader::new(expiration, seed, 0, 0u32.into(), 0, 0u32.into()),
             vec![],
             vec![],
         );
@@ -379,7 +375,8 @@ mod tests {
         let long_lived = tx_with_expiration(TimePointSec::maximum(), 11);
         mempool.add_transaction_at(long_lived.clone(), TimePointSec::new(100));
 
-        let before_ttl: TimePoint = TimePointSec::new(100 + DEFAULT_MEMPOOL_TRANSACTION_TTL_SECS).into();
+        let before_ttl: TimePoint =
+            TimePointSec::new(100 + DEFAULT_MEMPOOL_TRANSACTION_TTL_SECS).into();
         assert_eq!(mempool.prune_expired(&before_ttl), 0);
 
         let after_ttl: TimePoint =

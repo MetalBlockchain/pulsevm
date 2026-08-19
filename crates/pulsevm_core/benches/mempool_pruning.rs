@@ -8,9 +8,20 @@ use criterion::{
     criterion_main,
 };
 use pulsevm_core::{
-    mempool::{Mempool, MAX_MEMPOOL_SIZE},
-    time::{TimePoint, TimePointSec},
-    transaction::{PackedTransaction, SignedTransaction, Transaction, TransactionHeader},
+    mempool::{
+        MAX_MEMPOOL_SIZE,
+        Mempool,
+    },
+    time::{
+        TimePoint,
+        TimePointSec,
+    },
+    transaction::{
+        PackedTransaction,
+        SignedTransaction,
+        Transaction,
+        TransactionHeader,
+    },
 };
 
 fn full_unexpired_mempool() -> Mempool {

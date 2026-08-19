@@ -1,7 +1,7 @@
 use chrono::Utc;
 use criterion::{
-    black_box,
     Criterion,
+    black_box,
     criterion_group,
     criterion_main,
 };

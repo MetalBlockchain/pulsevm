@@ -99,7 +99,10 @@ fn newaccount_tx(key: &PrivateKey, account: &str, chain_id: &Id) -> PackedTransa
             }
             .pack()
             .unwrap(),
-            vec![PermissionLevel::new(PULSE_NAME.as_u64(), ACTIVE_NAME.as_u64())],
+            vec![PermissionLevel::new(
+                PULSE_NAME.as_u64(),
+                ACTIVE_NAME.as_u64(),
+            )],
         )],
     )
     .sign(key, chain_id)
@@ -141,31 +144,34 @@ fn criterion_benchmark(c: &mut Criterion) {
         .build()
         .unwrap();
 
-    c.bench_function("admission_contention/five_ingress_during_controller_write", |b| {
-        b.to_async(&runtime).iter(|| {
-            let service = service.clone();
-            let controller = controller.clone();
-            let mempool = mempool.clone();
-            let transactions = transactions.clone();
-            async move {
-                // This guard models block execution. The benchmark verifies that
-                // state-backed preflight does not queue behind it.
-                let controller_guard = controller.write().await;
-                let results = join_all(
-                    transactions
-                        .into_iter()
-                        .map(|transaction| service.admit_transaction(transaction)),
-                )
-                .await;
-                drop(controller_guard);
-                for result in results {
-                    black_box(result.unwrap());
+    c.bench_function(
+        "admission_contention/five_ingress_during_controller_write",
+        |b| {
+            b.to_async(&runtime).iter(|| {
+                let service = service.clone();
+                let controller = controller.clone();
+                let mempool = mempool.clone();
+                let transactions = transactions.clone();
+                async move {
+                    // This guard models block execution. The benchmark verifies that
+                    // state-backed preflight does not queue behind it.
+                    let controller_guard = controller.write().await;
+                    let results = join_all(
+                        transactions
+                            .into_iter()
+                            .map(|transaction| service.admit_transaction(transaction)),
+                    )
+                    .await;
+                    drop(controller_guard);
+                    for result in results {
+                        black_box(result.unwrap());
+                    }
+                    *mempool.write().await = Mempool::new();
+                    black_box(service.admission_metrics())
                 }
-                *mempool.write().await = Mempool::new();
-                black_box(service.admission_metrics())
-            }
-        })
-    });
+            })
+        },
+    );
 }
 
 criterion_group!(benches, criterion_benchmark);

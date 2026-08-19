@@ -207,9 +207,13 @@ impl AdmissionMetrics {
     fn snapshot(&self) -> AdmissionMetricsSnapshot {
         AdmissionMetricsSnapshot {
             state_preflights: self.state_preflights.load(Ordering::Relaxed),
-            fallback_controller_preflights: self.fallback_controller_preflights.load(Ordering::Relaxed),
+            fallback_controller_preflights: self
+                .fallback_controller_preflights
+                .load(Ordering::Relaxed),
             controller_lock_wait_nanos: self.controller_lock_wait_nanos.load(Ordering::Relaxed),
-            max_controller_lock_wait_nanos: self.max_controller_lock_wait_nanos.load(Ordering::Relaxed),
+            max_controller_lock_wait_nanos: self
+                .max_controller_lock_wait_nanos
+                .load(Ordering::Relaxed),
             mempool_lock_wait_nanos: self.mempool_lock_wait_nanos.load(Ordering::Relaxed),
             max_mempool_lock_wait_nanos: self.max_mempool_lock_wait_nanos.load(Ordering::Relaxed),
         }
@@ -383,7 +387,9 @@ impl RpcService {
         };
         let result = {
             let mut controller = self.controller.write().await;
-            controller.verify_block(block, batch.transactions_mut()).await
+            controller
+                .verify_block(block, batch.transactions_mut())
+                .await
         };
         self.mempool.write().await.finish_batch(batch);
         result
@@ -761,7 +767,10 @@ mod tests {
     use std::time::Duration;
     use tokio::{
         sync::oneshot,
-        time::{sleep, timeout},
+        time::{
+            sleep,
+            timeout,
+        },
     };
 
     const GENESIS_KEY: &str = "PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez";
@@ -951,10 +960,7 @@ mod tests {
             "the unexecutable transaction should be discarded while building"
         );
         assert!(
-            !mempool
-                .read()
-                .await
-                .contains(invalid_at_execution.id()),
+            !mempool.read().await.contains(invalid_at_execution.id()),
             "a transaction rejected during block production must not remain queued"
         );
     }
@@ -981,7 +987,9 @@ mod tests {
                     result = Some(admission);
                     break;
                 }
-                Err(oneshot::error::TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(1)),
+                Err(oneshot::error::TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(1))
+                }
                 Err(oneshot::error::TryRecvError::Closed) => {
                     panic!("admission task exited before returning a result")
                 }

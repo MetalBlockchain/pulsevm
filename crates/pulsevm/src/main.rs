@@ -415,7 +415,10 @@ impl Vm for VirtualMachine {
         _request: Request<vm::BuildBlockRequest>,
     ) -> Result<tonic::Response<vm::BuildBlockResponse>, Status> {
         debug!("build_block called, building block...");
-        let block = self.rpc_service.build_block().await
+        let block = self
+            .rpc_service
+            .build_block()
+            .await
             .map_err(|e| Status::internal(format!("could not build block: {}", e)))?;
         let block_id = block
             .id()
@@ -507,7 +510,12 @@ impl Vm for VirtualMachine {
         request: Request<vm::BlockVerifyRequest>,
     ) -> Result<tonic::Response<vm::BlockVerifyResponse>, Status> {
         debug!("block_verify called, verifying block...");
-        let block = match self.controller.read().await.parse_block(&request.get_ref().bytes) {
+        let block = match self
+            .controller
+            .read()
+            .await
+            .parse_block(&request.get_ref().bytes)
+        {
             Ok(block) => block,
             Err(e) => {
                 warn!("failed parsing block for verification: {}", e);
