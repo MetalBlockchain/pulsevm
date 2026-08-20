@@ -496,12 +496,12 @@ impl Controller {
         let mut height = end;
         loop {
             if let Some(block) = self.get_block_by_height(height)? {
-                if let Some(schedule) = block.signed_block_header.header.new_schedule()? {
+                if let Some(schedule) = block.signed_block_header.header.new_schedule() {
                     info!(
                         "reconstructed producer schedule version {} from block {}",
                         schedule.version, height
                     );
-                    self.active_schedule = schedule;
+                    self.active_schedule = schedule.clone();
                     return Ok(());
                 }
             }
@@ -667,11 +667,8 @@ impl Controller {
                 version: parent_schedule.version + 1,
                 producers: producers.clone(),
             };
-            let packed = new_schedule
-                .pack()
-                .map_err(|e| ChainError::SerializationError(e.to_string()))?;
-            block.signed_block_header.header.new_producers = Some(packed);
             block.signed_block_header.header.schedule_version = new_schedule.version;
+            block.signed_block_header.header.new_producers = Some(new_schedule);
         }
 
         // Sign the block with the producer's key over the full header — including
@@ -798,7 +795,7 @@ impl Controller {
         executed: &Option<Vec<ProducerKey>>,
         parent_schedule: &ProducerSchedule,
     ) -> Result<(), ChainError> {
-        let header_schedule = block.signed_block_header.header.new_schedule()?;
+        let header_schedule = block.signed_block_header.header.new_schedule();
         match (header_schedule, executed) {
             (None, None) => Ok(()),
             (Some(_), None) => Err(ChainError::BlockError(
@@ -1010,9 +1007,9 @@ impl Controller {
         // what a restart reconstructs — never an out-of-band value. A block that
         // is rejected or loses a fork is never accepted, so it never changes the
         // producers. `verify_block` has already bound the header to execution.
-        if let Some(schedule) = block.signed_block_header.header.new_schedule()? {
+        if let Some(schedule) = block.signed_block_header.header.new_schedule() {
             info!("activated producer schedule version {}", schedule.version);
-            self.active_schedule = schedule;
+            self.active_schedule = schedule.clone();
         }
 
         // `commit` above already collapsed the arena's undo stack to this block;
@@ -4874,12 +4871,8 @@ mod tests {
                 chain_id,
             )?);
             let mut block = controller.build_block(&mut mempool).await?;
-            block.signed_block_header.header.new_producers = Some(
-                new_schedule
-                    .pack()
-                    .map_err(|e| ChainError::SerializationError(e.to_string()))?,
-            );
             block.signed_block_header.header.schedule_version = new_schedule.version;
+            block.signed_block_header.header.new_producers = Some(new_schedule.clone());
             let sig_digest = block.signed_block_header.header.sig_digest()?;
             block.signed_block_header.signature = private_key.sign(&sig_digest)?;
 
@@ -4953,7 +4946,7 @@ mod tests {
             deployment
                 .signed_block_header
                 .header
-                .new_schedule()?
+                .new_schedule()
                 .is_none()
         );
         controller.accept_block(&deployment.id()?, &mut mempool)?;
@@ -4970,13 +4963,14 @@ mod tests {
         let header_schedule = election
             .signed_block_header
             .header
-            .new_schedule()?
+            .new_schedule()
+            .as_ref()
             .expect("onblock proposal must be committed to the header");
         assert_eq!(header_schedule.version, 1);
         assert_eq!(header_schedule.producers, proposed);
 
         controller.accept_block(&election.id()?, &mut mempool)?;
-        assert_eq!(controller.active_schedule, header_schedule);
+        assert_eq!(controller.active_schedule, header_schedule.clone());
         Ok(())
     }
 
