@@ -2599,6 +2599,40 @@ impl ChainDatabase {
         Ok(())
     }
 
+    /// Replaces the singleton with a complete state-history hydration. Pending
+    /// per-block counters are not part of XPR's state-history row and therefore
+    /// begin at zero at the migration boundary.
+    #[allow(clippy::too_many_arguments)]
+    pub fn hydrate_resource_state(
+        &self,
+        net: (u64, u64, u32),
+        cpu: (u64, u64, u32),
+        total_net_weight: u64,
+        total_cpu_weight: u64,
+        total_ram_bytes: u64,
+        virtual_net_limit: u64,
+        virtual_cpu_limit: u64,
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let apply = |s: &mut ResourceStateRow| {
+            s.average_block_net_usage = UsageAccumulator { value_ex: net.0, consumed: net.1, last_ordinal: net.2, _pad: 0 };
+            s.average_block_cpu_usage = UsageAccumulator { value_ex: cpu.0, consumed: cpu.1, last_ordinal: cpu.2, _pad: 0 };
+            s.pending_net_usage = 0;
+            s.pending_cpu_usage = 0;
+            s.total_net_weight = total_net_weight;
+            s.total_cpu_weight = total_cpu_weight;
+            s.total_ram_bytes = total_ram_bytes;
+            s.virtual_net_limit = virtual_net_limit;
+            s.virtual_cpu_limit = virtual_cpu_limit;
+        };
+        let existing = db.table::<ResourceStateRow>()?.iter().next().map(|s| s.id());
+        match existing {
+            Some(id) => db.modify::<ResourceStateRow>(id, apply)?,
+            None => { db.create::<ResourceStateRow>(apply)?; }
+        }
+        Ok(())
+    }
+
     /// Mirrors the block-accounting half of `add_transaction_usage`: adds the
     /// billed units to the block's pending totals on the state singleton.
     pub fn add_block_usage(&self, cpu_usage: u64, net_usage: u64) -> Result<(), DbError> {

@@ -1927,6 +1927,32 @@ impl Database {
             .map_err(|e| ChainError::InternalError(format!("XPR import resource usage: {e:?}")))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn xpr_import_resource_state(
+        &self,
+        net: (u64, u64, u32),
+        cpu: (u64, u64, u32),
+        total_net_weight: u64,
+        total_cpu_weight: u64,
+        total_ram_bytes: u64,
+        virtual_net_limit: u64,
+        virtual_cpu_limit: u64,
+    ) -> Result<(), ChainError> {
+        self.backend.hydrate_resource_state(net, cpu, total_net_weight, total_cpu_weight, total_ram_bytes, virtual_net_limit, virtual_cpu_limit)
+            .map_err(|e| ChainError::InternalError(format!("XPR import resource state: {e:?}")))
+    }
+
+    pub(crate) fn xpr_import_resource_config(
+        &self,
+        cpu: crate::backend::ElasticParams,
+        net: crate::backend::ElasticParams,
+        cpu_window: u32,
+        net_window: u32,
+    ) -> Result<(), ChainError> {
+        self.backend.seed_resource_config(cpu, net, cpu_window, net_window)
+            .map_err(|e| ChainError::InternalError(format!("XPR import resource config: {e:?}")))
+    }
+
     pub fn initialize_account_resource_limits(
         &mut self,
         account_name: u64,

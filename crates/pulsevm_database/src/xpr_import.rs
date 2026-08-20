@@ -66,6 +66,8 @@ pub struct ImportSummary {
     pub permission_links: u64,
     pub resource_limits: u64,
     pub resource_usage: u64,
+    pub resource_states: u64,
+    pub resource_configs: u64,
     pub contract_tables: u64,
     pub contract_rows: u64,
     pub index64_rows: u64,
@@ -250,6 +252,19 @@ pub fn hydrate_full_state(
                 summary.resource_usage += 1;
             }
         }
+        for row in &rows {
+            if let PortableRow::ResourceState { net, cpu, total_net_weight, total_cpu_weight, total_ram_bytes, virtual_net_limit, virtual_cpu_limit } = row {
+                db.xpr_import_resource_state(
+                    (net.value_ex, net.consumed, net.last_ordinal), (cpu.value_ex, cpu.consumed, cpu.last_ordinal),
+                    *total_net_weight, *total_cpu_weight, *total_ram_bytes, *virtual_net_limit, *virtual_cpu_limit,
+                ).map_err(database_error)?;
+                summary.resource_states += 1;
+            }
+            if let PortableRow::ResourceConfig { cpu, net, cpu_window, net_window } = row {
+                db.xpr_import_resource_config(*cpu, *net, *cpu_window, *net_window).map_err(database_error)?;
+                summary.resource_configs += 1;
+            }
+        }
         for row in rows {
             match row {
                 PortableRow::Account { .. }
@@ -258,6 +273,8 @@ pub fn hydrate_full_state(
                 | PortableRow::PermissionLink { .. }
                 | PortableRow::ResourceLimits { .. }
                 | PortableRow::ResourceUsage { .. }
+                | PortableRow::ResourceState { .. }
+                | PortableRow::ResourceConfig { .. }
                 | PortableRow::AccountMetadata { .. }
                 | PortableRow::Code { .. }
                 | PortableRow::Permission { .. } => {}
@@ -403,6 +420,21 @@ enum PortableRow {
         net_usage: ImportUsage,
         cpu_usage: ImportUsage,
     },
+    ResourceState {
+        net: ImportUsage,
+        cpu: ImportUsage,
+        total_net_weight: u64,
+        total_cpu_weight: u64,
+        total_ram_bytes: u64,
+        virtual_net_limit: u64,
+        virtual_cpu_limit: u64,
+    },
+    ResourceConfig {
+        cpu: crate::backend::ElasticParams,
+        net: crate::backend::ElasticParams,
+        cpu_window: u32,
+        net_window: u32,
+    },
     Account {
         name: u64,
         creation_date: u32,
@@ -513,6 +545,8 @@ fn decode_portable_rows(entry: &StateHistoryEntry) -> Result<Vec<PortableRow>, X
                 "permission_link" => decode_permission_link(&row.data)?,
                 "resource_limits" => decode_resource_limits(&row.data)?,
                 "resource_usage" => decode_resource_usage(&row.data)?,
+                "resource_limits_state" => decode_resource_state(&row.data)?,
+                "resource_limits_config" => decode_resource_config(&row.data)?,
                 "account" => decode_account(&row.data)?,
                 "account_metadata" => decode_account_metadata(&row.data)?,
                 "code" => decode_code(&row.data)?,
@@ -734,6 +768,55 @@ fn decode_resource_usage(bytes: &[u8]) -> Result<PortableRow, XprImportError> {
     };
     row.finish()?;
     Ok(result)
+}
+
+fn decode_resource_state(bytes: &[u8]) -> Result<PortableRow, XprImportError> {
+    let mut row = RowCursor::new(bytes);
+    row.version()?;
+    let result = PortableRow::ResourceState {
+        net: decode_usage_accumulator(&mut row)?,
+        cpu: decode_usage_accumulator(&mut row)?,
+        total_net_weight: row.u64()?,
+        total_cpu_weight: row.u64()?,
+        total_ram_bytes: row.u64()?,
+        virtual_net_limit: row.u64()?,
+        virtual_cpu_limit: row.u64()?,
+    };
+    row.finish()?;
+    Ok(result)
+}
+
+fn decode_resource_config(bytes: &[u8]) -> Result<PortableRow, XprImportError> {
+    let mut row = RowCursor::new(bytes);
+    row.version()?;
+    let cpu = decode_elastic_params(&mut row)?;
+    let net = decode_elastic_params(&mut row)?;
+    let result = PortableRow::ResourceConfig {
+        cpu,
+        net,
+        cpu_window: row.u32()?,
+        net_window: row.u32()?,
+    };
+    row.finish()?;
+    Ok(result)
+}
+
+fn decode_elastic_params(
+    row: &mut RowCursor<'_>,
+) -> Result<crate::backend::ElasticParams, XprImportError> {
+    row.version()?;
+    let target = row.u64()?;
+    let max = row.u64()?;
+    let periods = row.u32()?;
+    let max_multiplier = row.u32()?;
+    let contract = decode_resource_ratio(row)?;
+    let expand = decode_resource_ratio(row)?;
+    Ok(crate::backend::ElasticParams { target, max, periods, max_multiplier, contract, expand })
+}
+
+fn decode_resource_ratio(row: &mut RowCursor<'_>) -> Result<(u64, u64), XprImportError> {
+    row.version()?;
+    Ok((row.u64()?, row.u64()?))
 }
 
 fn decode_account(bytes: &[u8]) -> Result<PortableRow, XprImportError> {
