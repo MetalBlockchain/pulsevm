@@ -1856,6 +1856,38 @@ impl Database {
             .map_err(|e| ChainError::InternalError(format!("XPR import code: {e:?}")))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn xpr_import_deferred_transaction(
+        &self,
+        sender: u64,
+        sender_id: u128,
+        payer: u64,
+        trx_id: [u8; 32],
+        delay_until: i64,
+        expiration: i64,
+        published: i64,
+        packed_trx: &[u8],
+    ) -> Result<(), ChainError> {
+        self.backend
+            .xpr_import_deferred_transaction(
+                sender,
+                sender_id,
+                payer,
+                trx_id,
+                delay_until,
+                expiration,
+                published,
+                packed_trx,
+            )
+            .map_err(|e| ChainError::InternalError(format!("XPR import deferred transaction: {e:?}")))
+    }
+
+    /// Pending migrated deferred transaction count. Controllers must only
+    /// allow these to boot after their scheduler/executor is available.
+    pub fn deferred_transaction_count(&self) -> usize {
+        self.backend.deferred_transaction_count()
+    }
+
     pub(crate) fn xpr_import_permission(
         &self,
         parent: i64,

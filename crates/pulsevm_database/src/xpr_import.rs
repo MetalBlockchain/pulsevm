@@ -70,6 +70,7 @@ pub struct ImportSummary {
     pub resource_usage: u64,
     pub resource_states: u64,
     pub resource_configs: u64,
+    pub deferred_transactions: u64,
     pub contract_tables: u64,
     pub contract_rows: u64,
     pub index64_rows: u64,
@@ -264,6 +265,23 @@ pub fn hydrate_full_state_with_deferred_transactions(
 
     db.arena_start_undo_session();
     let result = (|| {
+        if let Some(sidecar) = deferred_transactions {
+            for row in &sidecar.transactions {
+                let key = sidecar_key(row)?;
+                db.xpr_import_deferred_transaction(
+                    key.sender,
+                    key.sender_id,
+                    key.payer,
+                    key.trx_id,
+                    row.delay_until,
+                    row.expiration,
+                    row.published,
+                    &key.packed_trx,
+                )
+                .map_err(database_error)?;
+                summary.deferred_transactions += 1;
+            }
+        }
         // The state-history table order happens to be suitable today, but the
         // importer enforces its own dependency order so an equivalent stream
         // with tables rearranged cannot create children before their parents.
@@ -430,11 +448,7 @@ pub fn hydrate_full_state_with_deferred_transactions(
                 | PortableRow::AccountMetadata { .. }
                 | PortableRow::Code { .. }
                 | PortableRow::Permission { .. } => {}
-                PortableRow::GeneratedTransaction { .. } => {
-                    return Err(bad(
-                        "generated_transaction reached hydration without scheduling metadata",
-                    ));
-                }
+                PortableRow::GeneratedTransaction { .. } => {}
                 PortableRow::ContractTable {
                     code,
                     scope,
@@ -853,12 +867,7 @@ fn validate_deferred_transactions(
         ));
     }
 
-    // The source data can now be proven complete, but keeping it in Arena
-    // without a matching scheduler would still lose consensus work. Do not
-    // permit a checkpoint until the execution path exists.
-    Err(bad(
-        "deferred transactions were verified against a complete chainbase sidecar, but PulseVM deferred-transaction scheduling and execution are not implemented yet",
-    ))
+    Ok(())
 }
 
 fn validate_sidecar_block_id(
@@ -1943,7 +1952,7 @@ mod tests {
     }
 
     #[test]
-    fn verifies_deferred_sidecar_before_rejecting_unimplemented_scheduler() {
+    fn imports_deferred_sidecar_into_arena_after_verification() {
         let mut generated = vec![0]; // generated_transaction_v0
         generated.extend_from_slice(&11u64.to_le_bytes()); // sender
         generated.extend_from_slice(&12u64.to_le_bytes()); // sender_id low
@@ -1966,9 +1975,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut db = Database::new(dir.path().to_str().unwrap(), 64 * 1024 * 1024).unwrap();
 
-        let error = hydrate_full_state_with_deferred_transactions(&mut db, &entry, Some(&sidecar))
-            .unwrap_err();
-        assert!(error.to_string().contains("verified against a complete chainbase sidecar"));
+        let summary =
+            hydrate_full_state_with_deferred_transactions(&mut db, &entry, Some(&sidecar)).unwrap();
+        assert_eq!(summary.deferred_transactions, 1);
+        assert_eq!(db.deferred_transaction_count(), 1);
         assert!(!db.is_account(11).unwrap());
     }
 

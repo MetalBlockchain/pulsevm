@@ -723,6 +723,73 @@ struct TransactionRow {
     trx_id: [u8; 32],
 }
 
+/// A complete XPR `generated_transaction_object` carried across the migration
+/// boundary. The packed transaction belongs in the blob arena; all scheduler
+/// fields remain native values so selection can use an ordered secondary index
+/// without reparsing the payload. This is intentionally separate from
+/// `TransactionRow`, which is only the short-lived duplicate-transaction set.
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout)]
+struct DeferredTransactionRow {
+    id: ObjectId<DeferredTransactionRow>,
+    sender: u64,
+    sender_id_lo: u64,
+    sender_id_hi: u64,
+    payer: u64,
+    trx_id: [u8; 32],
+    delay_until: i64,
+    expiration: i64,
+    published: i64,
+    packed_trx: BlobRef,
+}
+
+struct DeferredByTrxId;
+impl IndexedBy<DeferredTransactionRow> for DeferredByTrxId {
+    type Key = [u8; 32];
+    fn key(o: &DeferredTransactionRow) -> Self::Key {
+        o.trx_id
+    }
+}
+
+struct DeferredByDelay;
+impl IndexedBy<DeferredTransactionRow> for DeferredByDelay {
+    type Key = (i64, i64);
+    fn key(o: &DeferredTransactionRow) -> Self::Key {
+        (o.delay_until, o.id.raw())
+    }
+}
+
+impl ArenaObject for DeferredTransactionRow {
+    const TYPE_ID: u16 = 21;
+    fn id(&self) -> ObjectId<Self> {
+        self.id
+    }
+    fn set_id(&mut self, id: ObjectId<Self>) {
+        self.id = id;
+    }
+    fn secondary_indices() -> Vec<Box<dyn SecondaryIndex<Self>>> {
+        vec![
+            key_index::<Self, DeferredByTrxId>(),
+            key_index::<Self, DeferredByDelay>(),
+        ]
+    }
+}
+
+/// A materialized deferred transaction, returned only at explicit database
+/// boundaries. Arena rows carry a blob reference instead of retaining the
+/// packed transaction in their fixed-width representation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeferredTransaction {
+    pub sender: u64,
+    pub sender_id: u128,
+    pub payer: u64,
+    pub trx_id: [u8; 32],
+    pub delay_until: i64,
+    pub expiration: i64,
+    pub published: i64,
+    pub packed_trx: Vec<u8>,
+}
+
 struct TxByTrxId;
 impl IndexedBy<TransactionRow> for TxByTrxId {
     type Key = [u8; 32];
@@ -1221,6 +1288,7 @@ fn build_registered_db() -> Result<Db, DbError> {
     db.add_table::<GlobalPropertyRow>()?;
     db.add_table::<ResourceConfigRow>()?;
     db.add_table::<TransactionRow>()?;
+    db.add_table::<DeferredTransactionRow>()?;
     db.add_table::<ContractTableRow>()?;
     db.add_table::<ContractKeyValueRow>()?;
     db.add_table::<ContractIndex64Row>()?;
@@ -3254,6 +3322,98 @@ impl ChainDatabase {
         Ok(())
     }
 
+    // ----- deferred transactions -------------------------------------------
+
+    /// Insert one complete XPR `generated_transaction_object` during a
+    /// migration. The row participates in the caller's arena undo session, so
+    /// any later import validation failure restores the database unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub fn xpr_import_deferred_transaction(
+        &self,
+        sender: u64,
+        sender_id: u128,
+        payer: u64,
+        trx_id: [u8; 32],
+        delay_until: i64,
+        expiration: i64,
+        published: i64,
+        packed_trx: &[u8],
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let packed_trx_ref = db.alloc_blob::<DeferredTransactionRow>(packed_trx)?;
+        db.create::<DeferredTransactionRow>(|row| {
+            row.sender = sender;
+            row.sender_id_lo = sender_id as u64;
+            row.sender_id_hi = (sender_id >> 64) as u64;
+            row.payer = payer;
+            row.trx_id = trx_id;
+            row.delay_until = delay_until;
+            row.expiration = expiration;
+            row.published = published;
+            row.packed_trx = packed_trx_ref;
+        })?;
+        Ok(())
+    }
+
+    /// Number of pending deferred transactions. Startup uses this to refuse a
+    /// migrated checkpoint until the controller has a complete execution path.
+    pub fn deferred_transaction_count(&self) -> usize {
+        self.lock()
+            .table::<DeferredTransactionRow>()
+            .map(|table| table.iter().count())
+            .unwrap_or_default()
+    }
+
+    /// All transactions eligible at `now_micros`, in XPR's `(delay_until,id)`
+    /// order. Expired rows are deliberately not returned: their eventual
+    /// removal/onerror handling belongs to controller execution, not a read.
+    pub fn due_deferred_transactions(&self, now_micros: i64) -> Vec<DeferredTransaction> {
+        let db = self.lock();
+        let mut rows: Vec<(i64, i64, DeferredTransaction)> = match db.table::<DeferredTransactionRow>() {
+            Ok(table) => table
+                .iter()
+                .filter(|row| row.delay_until <= now_micros && row.expiration >= now_micros)
+                .filter_map(|row| {
+                    db.blob::<DeferredTransactionRow>(row.packed_trx).ok().map(|packed_trx| {
+                        (
+                            row.delay_until,
+                            row.id.raw(),
+                            DeferredTransaction {
+                                sender: row.sender,
+                                sender_id: (row.sender_id_lo as u128) | ((row.sender_id_hi as u128) << 64),
+                                payer: row.payer,
+                                trx_id: row.trx_id,
+                                delay_until: row.delay_until,
+                                expiration: row.expiration,
+                                published: row.published,
+                                packed_trx: packed_trx.to_vec(),
+                            },
+                        )
+                    })
+                })
+                .collect(),
+            Err(_) => return Vec::new(),
+        };
+        rows.sort_by_key(|row| (row.0, row.1));
+        rows.into_iter().map(|(_, _, row)| row).collect()
+    }
+
+    /// Remove a pending deferred transaction by its immutable transaction id.
+    /// The scheduler calls this only inside the block undo session after it has
+    /// selected the record for expiration or execution.
+    pub fn remove_deferred_transaction(&self, trx_id: [u8; 32]) -> Result<bool, DbError> {
+        let mut db = self.lock();
+        let id = db
+            .find_by::<DeferredTransactionRow, DeferredByTrxId>(&trx_id)?
+            .map(|row| row.id());
+        if let Some(id) = id {
+            db.remove::<DeferredTransactionRow>(id)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     // ----- contract tables + secondary indices ------------------------------
     //
     // The `update_*` chainbase paths are not stored: they take only an object
@@ -5233,6 +5393,46 @@ mod tests {
                 current_used: 5,
             }
         );
+    }
+
+    #[test]
+    fn deferred_transactions_are_due_ordered_and_undo_safe() {
+        let db = ChainDatabase::new().unwrap();
+        db.start_undo_session();
+        db.xpr_import_deferred_transaction(
+            11,
+            (13u128 << 64) | 12,
+            14,
+            [2; 32],
+            20,
+            100,
+            10,
+            &[2, 3],
+        )
+        .unwrap();
+        db.xpr_import_deferred_transaction(21, 22, 23, [1; 32], 10, 100, 9, &[4])
+            .unwrap();
+        db.squash();
+
+        assert_eq!(db.deferred_transaction_count(), 2);
+        assert_eq!(
+            db.due_deferred_transactions(20)
+                .into_iter()
+                .map(|row| row.trx_id)
+                .collect::<Vec<_>>(),
+            vec![[1; 32], [2; 32]]
+        );
+        let second = db.due_deferred_transactions(20).pop().unwrap();
+        assert_eq!(second.sender_id, (13u128 << 64) | 12);
+        assert_eq!(second.packed_trx, vec![2, 3]);
+
+        db.start_undo_session();
+        assert!(db.remove_deferred_transaction([1; 32]).unwrap());
+        assert_eq!(db.deferred_transaction_count(), 1);
+        db.undo();
+        assert_eq!(db.deferred_transaction_count(), 2);
+        assert!(db.remove_deferred_transaction([1; 32]).unwrap());
+        assert_eq!(db.deferred_transaction_count(), 1);
     }
 
     /// The standalone-write path bills db_idxN_update off the row's old payer and

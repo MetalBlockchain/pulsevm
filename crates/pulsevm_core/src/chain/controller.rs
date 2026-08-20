@@ -382,6 +382,12 @@ impl Controller {
                     "migration checkpoint must carry a positive revision".into(),
                 ));
             }
+            let deferred_transactions = self.db.deferred_transaction_count();
+            if deferred_transactions != 0 {
+                return Err(ChainError::GenesisError(format!(
+                    "migration checkpoint contains {deferred_transactions} deferred transactions, but this PulseVM build cannot execute them yet"
+                )));
+            }
             info!(
                 "restored migration Arena checkpoint {} at revision {} from manifest {}",
                 checkpoint,
