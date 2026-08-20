@@ -6,9 +6,9 @@
 //! packed and string encodings, the recovered public keys and the canonical
 //! signature predicate must all match the C++ oracle exactly.
 //!
-//! Only the `K1` suite (secp256k1) is implemented here. `R1` (secp256r1) and
-//! `WA` (WebAuthn) are intentionally out of scope; they are not reached on any
-//! replay/consensus path in this workspace.
+//! This module is intentionally limited to the `K1` suite. The crate-level R1
+//! module implements recovered P-256 transaction signatures; WebAuthn remains
+//! a distinct structured-signature protocol.
 
 use ripemd::{
     Digest as _,

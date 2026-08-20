@@ -5,6 +5,7 @@ use pulsevm_database::{
     microseconds,
     seconds,
 };
+use pulsevm_crypto::AuthorityPublicKey;
 use pulsevm_serialization::Read;
 use wasmer::{
     FunctionEnvMut,
@@ -87,10 +88,15 @@ pub fn check_transaction_authorization(
 
     let mut db = env_data.db_mut();
 
+    let provided_authority_keys = provided_keys
+        .iter()
+        .map(|key| AuthorityPublicKey::from(key.into_k1()))
+        .collect();
+
     match AuthorizationManager::check_authorization(
         &mut db,
         &transaction.actions,
-        &provided_keys,
+        &provided_authority_keys,
         &provided_permissions,
         seconds(transaction.header.delay_sec.into()),
         &BTreeSet::new(),

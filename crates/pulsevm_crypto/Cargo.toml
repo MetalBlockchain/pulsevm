@@ -11,5 +11,6 @@ secp256k1 = { version = "0.30", features = ["recovery", "global-context", "hashe
 bs58 = "0.5"
 ripemd = "0.1"
 p256 = { version = "0.13", features = ["ecdsa"] }
+ecdsa = { version = "0.16", features = ["signing", "verifying"] }
 pulsevm_proc_macros = { path = "../pulsevm_proc_macros" }
 pulsevm_serialization = { path = "../pulsevm_serialization" }

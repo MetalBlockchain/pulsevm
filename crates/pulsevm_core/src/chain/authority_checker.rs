@@ -3,15 +3,15 @@ use std::collections::{BTreeSet, HashMap};
 use pulsevm_database::{DbRead, Microseconds};
 use pulsevm_error::ChainError;
 
-use crate::crypto::PublicKey;
+use pulsevm_crypto::AuthorityPublicKey;
 
 use super::authority::{Authority, KeyWeight, PermissionLevel, PermissionLevelWeight};
 
 pub struct AuthorityChecker<'a> {
     recursion_depth_limit: u16,
-    provided_keys: &'a BTreeSet<PublicKey>,
+    provided_keys: &'a BTreeSet<AuthorityPublicKey>,
     provided_delay: Microseconds,
-    used_keys: BTreeSet<PublicKey>,
+    used_keys: BTreeSet<AuthorityPublicKey>,
     cached_permissions: HashMap<PermissionLevel, PermissionCacheStatus>,
 }
 
@@ -25,7 +25,7 @@ enum PermissionCacheStatus {
 impl<'a> AuthorityChecker<'a> {
     pub fn new(
         recursion_depth_limit: u16,
-        provided_keys: &'a BTreeSet<PublicKey>,
+        provided_keys: &'a BTreeSet<AuthorityPublicKey>,
         provided_permissions: &'a BTreeSet<PermissionLevel>,
         provided_delay: Microseconds,
     ) -> Self {
@@ -55,7 +55,7 @@ impl<'a> AuthorityChecker<'a> {
         return *self.provided_keys == self.used_keys;
     }
 
-    pub fn used_keys(&self) -> &BTreeSet<PublicKey> {
+    pub fn used_keys(&self) -> &BTreeSet<AuthorityPublicKey> {
         &self.used_keys
     }
 
@@ -102,15 +102,8 @@ impl<'a> AuthorityChecker<'a> {
     }
 
     pub fn visit_key_weight(&mut self, key: &KeyWeight) -> Result<u16, ChainError> {
-        // A running Pulse chain currently signs transactions with K1. Imported
-        // R1/WebAuthn authorities are retained losslessly in the arena but do
-        // not satisfy a K1 transaction signature.
-        let Some(pub_key) = key.key.as_k1().map(PublicKey::new) else {
-            return Ok(0);
-        };
-
-        if self.provided_keys.contains(&pub_key) {
-            self.used_keys.insert(pub_key);
+        if self.provided_keys.contains(&key.key) {
+            self.used_keys.insert(key.key.clone());
             return Ok(key.weight);
         }
 

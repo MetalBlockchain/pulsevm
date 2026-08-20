@@ -3368,6 +3368,7 @@ dependencies = [
  "hex",
  "jsonrpsee",
  "lru",
+ "p256",
  "proptest",
  "prost-types",
  "pulsevm_billable_size",
@@ -3403,6 +3404,7 @@ name = "pulsevm_crypto"
 version = "0.1.0"
 dependencies = [
  "bs58",
+ "ecdsa",
  "hex",
  "p256",
  "pulsevm_proc_macros",

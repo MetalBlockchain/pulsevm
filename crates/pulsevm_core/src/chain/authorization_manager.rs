@@ -10,6 +10,7 @@ use pulsevm_database::{
     seconds,
 };
 use pulsevm_error::ChainError;
+use pulsevm_crypto::AuthorityPublicKey;
 
 use crate::{
     PULSE_NAME,
@@ -47,7 +48,7 @@ impl AuthorizationManager {
     pub fn check_authorization(
         db: &Database,
         actions: &Vec<Action>,
-        provided_keys: &BTreeSet<PublicKey>,
+        provided_keys: &BTreeSet<AuthorityPublicKey>,
         provided_permissions: &BTreeSet<PermissionLevel>,
         provided_delay: Microseconds,
         satisfied_authorizations: &BTreeSet<PermissionLevel>,
@@ -163,9 +164,13 @@ impl AuthorizationManager {
         let chain_config = db.chain_config()?;
         let r = db.read()?;
         let delay_max_limit = seconds(chain_config.max_transaction_delay as i64);
+        let provided_authority_keys = provided_keys
+            .iter()
+            .map(|key| AuthorityPublicKey::from(key.into_k1()))
+            .collect();
         let mut authority_checker = AuthorityChecker::new(
             chain_config.max_authority_depth,
-            provided_keys,
+            &provided_authority_keys,
             provided_permissions,
             if provided_delay >= delay_max_limit {
                 Microseconds::maximum()
@@ -200,9 +205,13 @@ impl AuthorizationManager {
         let chain_config = db.chain_config()?;
         let r = db.read()?;
         let provided_permissions = BTreeSet::<PermissionLevel>::new();
+        let candidate_authority_keys = candidate_keys
+            .iter()
+            .map(|key| AuthorityPublicKey::from(key.into_k1()))
+            .collect();
         let mut authority_checker = AuthorityChecker::new(
             chain_config.max_authority_depth,
-            candidate_keys,
+            &candidate_authority_keys,
             &provided_permissions,
             provided_delay,
         );
@@ -221,7 +230,17 @@ impl AuthorizationManager {
             }
         }
 
-        Ok(authority_checker.used_keys().clone())
+        authority_checker
+            .used_keys()
+            .iter()
+            .map(|key| {
+                key.as_k1().map(PublicKey::new).ok_or_else(|| {
+                    ChainError::AuthorizationError(
+                        "required-key selection does not support WebAuthn keys".into(),
+                    )
+                })
+            })
+            .collect()
     }
 
     fn check_updateauth_authorization(

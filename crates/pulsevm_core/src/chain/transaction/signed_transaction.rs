@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use pulsevm_crypto::Bytes;
+use pulsevm_crypto::{AuthorityPublicKey, Bytes};
 use pulsevm_error::ChainError;
 use pulsevm_proc_macros::{
     NumBytes,
@@ -68,6 +68,26 @@ impl SignedTransaction {
         for signature in self.signatures.iter() {
             let public_key = signature.recover_public_key(&digest)?;
             recovered_keys.insert(public_key);
+        }
+
+        Ok(recovered_keys)
+    }
+
+    /// Recover all public-key variants supported by transaction signatures.
+    #[must_use]
+    #[inline]
+    pub fn recovered_authority_keys(
+        &self,
+        chain_id: &Id,
+    ) -> Result<BTreeSet<AuthorityPublicKey>, ChainError> {
+        let mut recovered_keys = BTreeSet::new();
+        let digest = self
+            .transaction
+            .signing_digest(chain_id, &self.context_free_data)?;
+        let digest = pulsevm_crypto::Digest(digest);
+
+        for signature in &self.signatures {
+            recovered_keys.insert(signature.recover_authority_key(&digest)?);
         }
 
         Ok(recovered_keys)
