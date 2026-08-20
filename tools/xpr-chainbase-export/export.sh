@@ -21,6 +21,8 @@ Required:
 Options:
   --source-revision SHA    XPR core revision that produced nodeos
                           (default: cbb24506280275f4fb51fb9d77758ff8249fa655)
+  --xpr-core PATH          Matching XPR core checkout; validates the source
+                          revision and deferred-sidecar plugin before export
   --timeout-seconds N      Maximum time to wait for the initial full delta (default: 300)
   --deferred-sidecar PATH  Write complete deferred-transaction chainbase state
                            through the bundled source-node plugin
@@ -44,6 +46,7 @@ work_dir=""
 source_revision="$pinned_core_revision"
 timeout_seconds=300
 deferred_sidecar=""
+xpr_core=""
 peers=()
 
 while (($#)); do
@@ -53,6 +56,7 @@ while (($#)); do
         --work-dir) work_dir="$2"; shift 2 ;;
         --p2p-peer) peers+=("$2"); shift 2 ;;
         --source-revision) source_revision="$2"; shift 2 ;;
+        --xpr-core) xpr_core="$2"; shift 2 ;;
         --timeout-seconds) timeout_seconds="$2"; shift 2 ;;
         --deferred-sidecar) deferred_sidecar="$2"; shift 2 ;;
         --help) usage; exit 0 ;;
@@ -72,6 +76,26 @@ done
 if [[ -n "$deferred_sidecar" && -e "$deferred_sidecar" ]]; then
     echo "deferred sidecar path already exists: $deferred_sidecar" >&2
     exit 2
+fi
+
+if [[ -n "$xpr_core" || -n "$deferred_sidecar" ]]; then
+    [[ -n "$xpr_core" ]] || {
+        echo "--xpr-core is required with --deferred-sidecar" >&2
+        exit 2
+    }
+    preflight_args=(
+        --nodeos "$nodeos"
+        --snapshot "$snapshot"
+        --xpr-core "$xpr_core"
+        --source-revision "$source_revision"
+    )
+    for peer in "${peers[@]}"; do
+        preflight_args+=(--p2p-peer "$peer")
+    done
+    if [[ -n "$deferred_sidecar" ]]; then
+        preflight_args+=(--require-sidecar-plugin)
+    fi
+    "$(dirname "${BASH_SOURCE[0]}")/preflight.sh" "${preflight_args[@]}"
 fi
 
 mkdir -p "$work_dir"/{data,config,state-history}

@@ -18,8 +18,24 @@ chainbase's physical layout.
 The source was validated against `XPRNetwork/core` revision
 `cbb24506280275f4fb51fb9d77758ff8249fa655`. Build the exporter nodeos from the
 same revision that produced the snapshot. Pass a different revision explicitly
-with `--source-revision`; it is written into `manifest.env` and checked by the
-importer.
+with `--source-revision`; it is written into `manifest.env`. For Mainnet, run
+the read-only preflight against the exact source checkout and trusted snapshot
+provenance before starting nodeos:
+
+```bash
+tools/xpr-chainbase-export/preflight.sh \
+  --nodeos /opt/xpr/bin/nodeos \
+  --snapshot /data/xpr/snapshots/snapshot.bin \
+  --xpr-core /src/XPRNetwork-core \
+  --p2p-peer proton.p2p.example:9876 \
+  --require-sidecar-plugin \
+  --minimum-free-gib 250
+```
+
+Preflight verifies the checkout's exact Git commit, snapshot digest, disk
+space, peer syntax, and installation/linkage of the required source-side
+plugin. It cannot infer a snapshot's producing revision from the binary file;
+that mapping must come from the snapshot publisher or operator who created it.
 
 ## Export
 
@@ -114,6 +130,7 @@ Then request it during state-history export:
 ```bash
 tools/xpr-chainbase-export/export.sh \
   --nodeos /src/XPRNetwork-core/build/programs/nodeos/nodeos \
+  --xpr-core /src/XPRNetwork-core \
   --snapshot /data/xpr/snapshots/snapshot.bin \
   --work-dir /data/xpr-export-123456789 \
   --p2p-peer proton.p2p.example:9876 \
