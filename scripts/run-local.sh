@@ -23,6 +23,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VM_ID="rXcAFxZvio99epp6TzEwYfexCfPAbJuBTMsjUUoiT7PkVykNs"
 BUILD_DIR="$REPO/build"
 NETWORK_RUNNER="${METAL_NETWORK_RUNNER_PATH:-$REPO/../metal-network-runner/bin/metal-network-runner}"
+MIGRATION_GENESIS=""
 
 if [[ -z "${METALGO_EXEC_PATH:-}" || ! -x "${METALGO_EXEC_PATH:-}" ]]; then
   echo "error: set METALGO_EXEC_PATH to a metalgo binary (rpcchainvm protocol 43)." >&2
@@ -63,6 +64,11 @@ if [[ -n "${PULSEVM_MIGRATION_CHECKPOINT:-}" ]]; then
     echo "error: jq is required to pass a migration checkpoint to the runner." >&2
     exit 1
   fi
+  CHECKPOINT_SHA256="$(jq -er '.checkpoint_sha256 | select(type == "string" and test("^[[:xdigit:]]{64}$"))' "$MIGRATION_MANIFEST")"
+  MIGRATION_GENESIS="$(mktemp "${TMPDIR:-/tmp}/pulsevm-xpr-migration-genesis.XXXXXX")"
+  jq --arg checkpoint_sha256 "$CHECKPOINT_SHA256" \
+    '. + {migration_checkpoint_sha256: $checkpoint_sha256}' \
+    "$REPO/genesis.json" > "$MIGRATION_GENESIS"
   # This development key corresponds to genesis.json's initial_key. Override it
   # for a real producer deployment; it is part of the node-local VM config.
   PRODUCER_KEY="${PULSEVM_PRODUCER_KEY:-PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez}"
@@ -72,16 +78,17 @@ if [[ -n "${PULSEVM_MIGRATION_CHECKPOINT:-}" ]]; then
     --arg producer_key "$PRODUCER_KEY" \
     '{producer_name: "pulse", producer_key: $producer_key, migration_checkpoint: $checkpoint, migration_manifest: $manifest}')"
   BLOCKCHAIN_SPECS="$(jq -cn \
-    --arg genesis "$REPO/genesis.json" \
+    --arg genesis "$MIGRATION_GENESIS" \
     --arg chain_config "$CHAIN_CONFIG" \
     '[{vm_name: "pulsevm", genesis: $genesis, chain_config: $chain_config, blockchain_alias: "pulse-xpr-migration"}]')"
   echo "==> Configured all VM nodes to restore $PULSEVM_MIGRATION_CHECKPOINT"
+  echo "==> Generated migration-specific genesis committed to $CHECKPOINT_SHA256"
 fi
 
 echo "==> Starting metal-network-runner server (background)"
 "$NETWORK_RUNNER" server --log-level info --port=":8080" --grpc-gateway-port=":8081" &
 ANR_PID=$!
-trap 'kill $ANR_PID 2>/dev/null || true' EXIT
+trap 'rm -f -- "$MIGRATION_GENESIS"; kill $ANR_PID 2>/dev/null || true' EXIT
 sleep 3
 
 echo "==> Launching a 5-node cluster running PulseVM"

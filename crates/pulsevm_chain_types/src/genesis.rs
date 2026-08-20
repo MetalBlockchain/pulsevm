@@ -35,6 +35,10 @@ pub struct GenesisState {
     /// does not track it), but part of the genesis serialization the chain id is
     /// computed over, so it is carried here.
     pub max_action_return_value_size: u32,
+    /// Optional Pulse migration extension. It is the SHA-256 of the Arena
+    /// checkpoint committed by a migration manifest. Normal XPR-compatible
+    /// genesis files omit it and retain their original packed chain-id layout.
+    pub migration_checkpoint_sha256: Option<[u8; 32]>,
 }
 
 impl GenesisState {
@@ -53,12 +57,18 @@ impl GenesisState {
             .map_err(|e| ChainError::GenesisError(format!("invalid genesis key: {e:?}")))?;
         let max_action_return_value_size = raw.initial_configuration.max_action_return_value_size;
         let initial_configuration = raw.initial_configuration.into();
+        let migration_checkpoint_sha256 = raw
+            .migration_checkpoint_sha256
+            .as_deref()
+            .map(decode_hex_32)
+            .transpose()?;
 
         Ok(GenesisState {
             initial_timestamp_micros,
             initial_key,
             initial_configuration,
             max_action_return_value_size,
+            migration_checkpoint_sha256,
         })
     }
 
@@ -73,7 +83,7 @@ impl GenesisState {
     /// its 34-byte form, then each `chain_config` field as its little-endian
     /// integer (ending with `max_action_return_value_size`).
     pub fn compute_chain_id(&self) -> [u8; 32] {
-        let mut buf: Vec<u8> = Vec::with_capacity(34 + 8 + 19 * 4);
+        let mut buf: Vec<u8> = Vec::with_capacity(34 + 8 + 19 * 4 + 32);
         let c = &self.initial_configuration;
 
         buf.extend_from_slice(&self.initial_timestamp_micros.to_le_bytes());
@@ -98,6 +108,15 @@ impl GenesisState {
         buf.extend_from_slice(&c.max_authority_depth.to_le_bytes());
         buf.extend_from_slice(&self.max_action_return_value_size.to_le_bytes());
 
+        // XPR's reflected genesis has no field after
+        // `max_action_return_value_size`. Pulse uses a trailing binary extension
+        // only for migration chains, which preserves ordinary XPR-compatible
+        // chain ids while ensuring every migration checkpoint has a distinct
+        // target chain identity.
+        if let Some(checkpoint_sha256) = self.migration_checkpoint_sha256 {
+            buf.extend_from_slice(&checkpoint_sha256);
+        }
+
         pulsevm_crypto::Digest::hash(&buf).0
     }
 }
@@ -107,6 +126,30 @@ struct RawGenesis {
     initial_timestamp: String,
     initial_key: String,
     initial_configuration: RawConfig,
+    #[serde(default)]
+    migration_checkpoint_sha256: Option<String>,
+}
+
+fn decode_hex_32(value: &str) -> Result<[u8; 32], ChainError> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(ChainError::GenesisError(
+            "migration_checkpoint_sha256 must be 64 hexadecimal characters".into(),
+        ));
+    }
+    let mut bytes = [0u8; 32];
+    for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
+        bytes[index] = (hex_nibble(chunk[0]) << 4) | hex_nibble(chunk[1]);
+    }
+    Ok(bytes)
+}
+
+fn hex_nibble(byte: u8) -> u8 {
+    match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        b'A'..=b'F' => byte - b'A' + 10,
+        _ => unreachable!("validated hexadecimal input"),
+    }
 }
 
 /// The genesis `chain_config` fields. Unknown keys (e.g.
@@ -294,6 +337,45 @@ mod tests {
         assert_eq!(
             hex,
             "0c880c391f7d695f3d64e57e1ee396c9b26b8e089f440d917493d83a2df9c306"
+        );
+    }
+
+    #[test]
+    fn migration_checkpoint_changes_chain_id() {
+        let base = r#"{
+            "initial_timestamp": "2023-01-01T00:00:00",
+            "initial_key": "PUB_K1_8fsJkG5ka4o1G1wBhySUavHuGqstcjtXMrquxiRWVcYw8ZvZLX",
+            "initial_configuration": {
+                "max_block_net_usage": 1048576,
+                "target_block_net_usage_pct": 1000,
+                "max_transaction_net_usage": 524288,
+                "base_per_transaction_net_usage": 12,
+                "net_usage_leeway": 500,
+                "context_free_discount_net_usage_num": 20,
+                "context_free_discount_net_usage_den": 100,
+                "max_block_cpu_usage": 3000000000,
+                "target_block_cpu_usage_pct": 2500,
+                "max_transaction_cpu_usage": 1000000000,
+                "min_transaction_cpu_usage": 100000,
+                "max_transaction_lifetime": 3600,
+                "deferred_trx_expiration_window": 600,
+                "max_transaction_delay": 3888000,
+                "max_inline_action_size": 4096,
+                "max_inline_action_depth": 6,
+                "max_authority_depth": 6,
+                "max_action_return_value_size": 256
+            }
+        }"#;
+        let mut migrated: serde_json::Value = serde_json::from_str(base).unwrap();
+        migrated["migration_checkpoint_sha256"] = serde_json::Value::String(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+        );
+        let base = GenesisState::from_json(base).unwrap();
+        let migrated = GenesisState::from_json(&migrated.to_string()).unwrap();
+        assert_ne!(base.compute_chain_id(), migrated.compute_chain_id());
+        assert_eq!(
+            migrated.migration_checkpoint_sha256,
+            Some([0xaa; 32])
         );
     }
 

@@ -42,6 +42,7 @@ scripts/run-local.sh
 
 The harness injects `migration_checkpoint` into the runner's chain config and
 the controller restores it before normal Arena genesis authoring, so every node
-begins from identical imported state. A successful local fixture establishes
+begins from identical imported state. It derives a migration-specific target
+genesis from the manifest checkpoint hash. A successful local fixture establishes
 the export, conversion, and five-node boot path; it is deliberately not evidence
 of compatibility with an XPR Mainnet snapshot.

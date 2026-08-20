@@ -322,6 +322,10 @@ impl Controller {
         })?);
 
         self.db_path = Some(db_path.to_string());
+        // Parse this before restoring a migration checkpoint: a migration
+        // genesis commits its checkpoint hash, so the node can reject a
+        // manifest that belongs to a different target chain.
+        let rust_genesis = pulsevm_database::GenesisState::from_bytes(genesis_bytes)?;
 
         // Initialize database
         self.db = Database::new(&db_path, self.node_config.as_ref().unwrap().db_size)
@@ -356,6 +360,18 @@ impl Controller {
                     "migration manifest {manifest_path} rejected checkpoint {checkpoint}: {e}"
                 ))
             })?;
+            let expected_checkpoint_sha256 = rust_genesis.migration_checkpoint_sha256.ok_or_else(|| {
+                ChainError::GenesisError(
+                    "migration genesis is missing migration_checkpoint_sha256".into(),
+                )
+            })?;
+            if manifest.checkpoint_sha256 != hex::encode(expected_checkpoint_sha256) {
+                return Err(ChainError::GenesisError(format!(
+                    "migration manifest checkpoint hash {} does not match migration genesis {}",
+                    manifest.checkpoint_sha256,
+                    hex::encode(expected_checkpoint_sha256)
+                )));
+            }
             let header = self.db.restore_from_bytes(&checkpoint_bytes).map_err(|e| {
                 ChainError::GenesisError(format!(
                     "failed to restore migration checkpoint {checkpoint}: {e}"
@@ -376,12 +392,15 @@ impl Controller {
             return Err(ChainError::GenesisError(
                 "migration_checkpoint and migration_manifest must be configured together".into(),
             ));
+        } else if rust_genesis.migration_checkpoint_sha256.is_some() {
+            return Err(ChainError::GenesisError(
+                "migration genesis requires migration_checkpoint and migration_manifest".into(),
+            ));
         }
 
         // Pure-Rust view of the genesis: the arena is authored directly from this,
         // and the schedule/timestamp below are read from it, so the initial state
         // never routes through C++.
-        let rust_genesis = pulsevm_database::GenesisState::from_bytes(genesis_bytes)?;
         self.chain_id = chain_id.clone();
 
         // The chain id is sha256(fc::raw::pack(genesis)); derive it from the
@@ -4932,12 +4951,17 @@ mod tests {
         })
         .to_string()
         .into_bytes();
+        let mut migration_genesis: serde_json::Value =
+            serde_json::from_slice(&generate_genesis(&private_key)).unwrap();
+        migration_genesis["migration_checkpoint_sha256"] =
+            json!(manifest.checkpoint_sha256);
+        let migration_genesis = serde_json::to_vec(&migration_genesis).unwrap();
         let target_path = temp.path().join("target");
         let mut controller = Controller::new();
         controller.initialize(
             &chain_id,
             &config_bytes,
-            &generate_genesis(&private_key).to_vec(),
+            &migration_genesis,
             target_path.to_str().unwrap(),
         )?;
 
