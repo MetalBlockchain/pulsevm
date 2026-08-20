@@ -36,10 +36,12 @@ pub use crate::{
         peek_header as peek_snapshot_header,
     },
     xpr_import::{
+        ImportSummary,
         StateHistoryEntry,
         TableDelta,
         TableDeltaRow,
         XprImportError,
+        hydrate_full_state,
         parse_initial_state_history_log,
     },
 };

@@ -1805,6 +1805,21 @@ impl Database {
             .map_err(|e| ChainError::InternalError(format!("arena update_account_abi: {e:?}")));
     }
 
+    /// Install an ABI while hydrating a state-history full snapshot. Unlike the
+    /// live `setabi` path this must not fabricate an `abi_sequence` increment:
+    /// SHiP's account row already represents the stored ABI at the source head.
+    pub(crate) fn xpr_import_set_account_abi_raw(
+        &self,
+        account_name: u64,
+        abi: &[u8],
+    ) -> Result<(), ChainError> {
+        self.backend
+            .set_account_abi_raw(account_name, abi)
+            .map_err(|e| {
+                ChainError::InternalError(format!("XPR import account ABI {account_name}: {e:?}"))
+            })
+    }
+
     pub fn initialize_account_resource_limits(
         &mut self,
         account_name: u64,
@@ -2156,6 +2171,21 @@ impl Database {
     /// is removed, or `None` if the table is absent.
     pub fn arena_table_payer(&self, code: u64, scope: u64, table: u64) -> Option<u64> {
         self.backend.table_payer(code, scope, table)
+    }
+
+    /// Create an empty contract table while hydrating a state-history full
+    /// snapshot. Contract tables with no children are valid chainbase state and
+    /// cannot be reconstructed by the lazy child-store paths.
+    pub(crate) fn xpr_import_create_contract_table(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        payer: u64,
+    ) -> Result<(), ChainError> {
+        self.backend
+            .create_table(code, scope, table, payer)
+            .map_err(|e| ChainError::InternalError(format!("XPR import contract table: {e:?}")))
     }
 
     /// The `(payer, value)` of a contract row from the arena, or `None`.
