@@ -92,6 +92,10 @@ pub struct MigrationManifest {
     pub source_block_id: String,
     pub checkpoint_sha256: String,
     pub checkpoint_revision: i64,
+    /// When the source contains deferred transactions, this commits the
+    /// chainbase-sidecar which supplies the timestamps SHiP v0 does not carry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_transaction_sidecar_sha256: Option<String>,
     pub import_summary: ImportSummary,
 }
 
@@ -111,8 +115,19 @@ impl MigrationManifest {
             source_block_id: hex::encode(source_block_id),
             checkpoint_sha256: hex::encode(Digest::hash(checkpoint).as_bytes()),
             checkpoint_revision,
+            deferred_transaction_sidecar_sha256: None,
             import_summary,
         }
+    }
+
+    /// Bind this migration manifest to the exact deferred-transaction sidecar
+    /// verified during import. The sidecar is intentionally a separate
+    /// artifact because SHiP's generated_transaction_v0 projection omits
+    /// scheduling timestamps present in XPR chainbase.
+    pub fn with_deferred_transaction_sidecar(mut self, sidecar: &[u8]) -> Self {
+        self.deferred_transaction_sidecar_sha256 =
+            Some(hex::encode(Digest::hash(sidecar).as_bytes()));
+        self
     }
 
     /// Verify that `checkpoint` is precisely the artifact this manifest
@@ -157,6 +172,60 @@ impl fmt::Display for XprImportError {
 
 impl std::error::Error for XprImportError {}
 
+/// JSON emitted by the XPR chainbase deferred-transaction sidecar exporter.
+///
+/// XPR's SHiP `generated_transaction_v0` table row contains identity and
+/// payload bytes, but not its three scheduler timestamps. A source-node
+/// sidecar must read those fields from the same accepted block and write this
+/// format. Numeric names stay numeric so comparison with SHiP is lossless;
+/// `sender_id` is decimal because JSON cannot represent `uint128` precisely.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeferredTransactionSidecar {
+    pub version: u16,
+    pub source_block_id: String,
+    #[serde(default)]
+    pub transactions: Vec<DeferredTransactionSidecarRow>,
+}
+
+/// One complete XPR chainbase `generated_transaction_object` record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeferredTransactionSidecarRow {
+    pub sender: u64,
+    pub sender_id: String,
+    pub payer: u64,
+    pub trx_id: String,
+    /// XPR `time_point` values in microseconds since the Unix epoch.
+    pub delay_until: i64,
+    pub expiration: i64,
+    pub published: i64,
+    /// Hex-encoded `packed_transaction` bytes, as stored by XPR chainbase.
+    pub packed_trx: String,
+}
+
+impl DeferredTransactionSidecar {
+    pub const VERSION: u16 = 1;
+
+    /// Parse and normalize a sidecar before it is compared with SHiP rows.
+    pub fn from_json_bytes(bytes: &[u8]) -> Result<Self, XprImportError> {
+        let sidecar: Self = serde_json::from_slice(bytes)
+            .map_err(|error| bad(format!("invalid deferred-transaction sidecar JSON: {error}")))?;
+        if sidecar.version != Self::VERSION {
+            return Err(bad(format!(
+                "unsupported deferred-transaction sidecar version {} (expected {})",
+                sidecar.version,
+                Self::VERSION
+            )));
+        }
+        decode_block_id(&sidecar.source_block_id)?;
+        for row in &sidecar.transactions {
+            sidecar_key(row)?;
+        }
+        Ok(sidecar)
+    }
+}
+
 /// Hydrate the portable portion of a full XPR chain-state-history snapshot.
 ///
 /// Every row is decoded and validated before Arena is touched. The writes then
@@ -174,8 +243,23 @@ pub fn hydrate_full_state(
     db: &mut Database,
     entry: &StateHistoryEntry,
 ) -> Result<ImportSummary, XprImportError> {
+    hydrate_full_state_with_deferred_transactions(db, entry, None)
+}
+
+/// Hydrate a full SHiP state export, verifying an optional direct-chainbase
+/// deferred-transaction sidecar first.
+///
+/// The sidecar eliminates the data-loss boundary in SHiP and is validated
+/// one-for-one against its `generated_transaction` rows. PulseVM does not yet
+/// execute deferred XPR transactions, so a non-empty verified sidecar still
+/// fails closed after verification rather than silently discarding work.
+pub fn hydrate_full_state_with_deferred_transactions(
+    db: &mut Database,
+    entry: &StateHistoryEntry,
+    deferred_transactions: Option<&DeferredTransactionSidecar>,
+) -> Result<ImportSummary, XprImportError> {
     let rows = decode_portable_rows(entry)?;
-    validate_code_links(&rows)?;
+    validate_code_links(&rows, entry.block_id, deferred_transactions)?;
     let mut summary = ImportSummary::default();
 
     db.arena_start_undo_session();
@@ -654,25 +738,12 @@ fn decode_portable_rows(entry: &StateHistoryEntry) -> Result<Vec<PortableRow>, X
     Ok(result)
 }
 
-fn validate_code_links(rows: &[PortableRow]) -> Result<(), XprImportError> {
-    if let Some(PortableRow::GeneratedTransaction {
-        sender,
-        sender_id,
-        payer,
-        trx_id,
-        packed_trx,
-    }) = rows
-        .iter()
-        .find(|row| matches!(row, PortableRow::GeneratedTransaction { .. }))
-    {
-        return Err(bad(
-            format!(
-                "generated_transaction {} (sender {sender}, sender_id {sender_id}, payer {payer}, packed bytes {}) cannot be imported from SHiP v0: its row omits delay_until, expiration, and published; use a chainbase-sidecar export before migrating deferred transactions",
-                hex::encode(trx_id),
-                packed_trx.len()
-            ),
-        ));
-    }
+fn validate_code_links(
+    rows: &[PortableRow],
+    source_block_id: [u8; 32],
+    deferred_transactions: Option<&DeferredTransactionSidecar>,
+) -> Result<(), XprImportError> {
+    validate_deferred_transactions(rows, source_block_id, deferred_transactions)?;
     let mut code_keys = HashSet::new();
     for row in rows {
         if let PortableRow::Code {
@@ -702,6 +773,137 @@ fn validate_code_links(rows: &[PortableRow]) -> Result<(), XprImportError> {
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DeferredTransactionKey {
+    sender: u64,
+    sender_id: u128,
+    payer: u64,
+    trx_id: [u8; 32],
+    packed_trx: Vec<u8>,
+}
+
+fn validate_deferred_transactions(
+    rows: &[PortableRow],
+    source_block_id: [u8; 32],
+    sidecar: Option<&DeferredTransactionSidecar>,
+) -> Result<(), XprImportError> {
+    let generated = rows
+        .iter()
+        .filter_map(|row| match row {
+            PortableRow::GeneratedTransaction {
+                sender,
+                sender_id,
+                payer,
+                trx_id,
+                packed_trx,
+            } => Some(DeferredTransactionKey {
+                sender: *sender,
+                sender_id: *sender_id,
+                payer: *payer,
+                trx_id: *trx_id,
+                packed_trx: packed_trx.clone(),
+            }),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    match (generated.is_empty(), sidecar) {
+        (true, None) => return Ok(()),
+        (true, Some(sidecar)) if sidecar.transactions.is_empty() => {
+            validate_sidecar_block_id(sidecar, source_block_id)?;
+            return Ok(());
+        }
+        (true, Some(_)) => {
+            return Err(bad(
+                "deferred-transaction sidecar contains rows but SHiP full-state export has none",
+            ));
+        }
+        (false, None) => {
+            let first = &generated[0];
+            return Err(bad(format!(
+                "generated_transaction {} (sender {}, sender_id {}, payer {}, packed bytes {}) cannot be imported from SHiP v0: its row omits delay_until, expiration, and published; use a chainbase-sidecar export before migrating deferred transactions",
+                hex::encode(first.trx_id),
+                first.sender,
+                first.sender_id,
+                first.payer,
+                first.packed_trx.len()
+            )));
+        }
+        (false, Some(sidecar)) => validate_sidecar_block_id(sidecar, source_block_id)?,
+    }
+
+    let mut expected = HashSet::new();
+    for key in generated {
+        if !expected.insert(key) {
+            return Err(bad("duplicate generated_transaction row in SHiP full-state export"));
+        }
+    }
+    let mut actual = HashSet::new();
+    for row in &sidecar.expect("non-empty SHiP requires sidecar").transactions {
+        let key = sidecar_key(row)?;
+        if !actual.insert(key) {
+            return Err(bad("duplicate generated_transaction row in chainbase sidecar"));
+        }
+    }
+    if expected != actual {
+        return Err(bad(
+            "deferred-transaction sidecar rows do not exactly match SHiP generated_transaction rows",
+        ));
+    }
+
+    // The source data can now be proven complete, but keeping it in Arena
+    // without a matching scheduler would still lose consensus work. Do not
+    // permit a checkpoint until the execution path exists.
+    Err(bad(
+        "deferred transactions were verified against a complete chainbase sidecar, but PulseVM deferred-transaction scheduling and execution are not implemented yet",
+    ))
+}
+
+fn validate_sidecar_block_id(
+    sidecar: &DeferredTransactionSidecar,
+    source_block_id: [u8; 32],
+) -> Result<(), XprImportError> {
+    let block_id = decode_block_id(&sidecar.source_block_id)?;
+    if block_id != source_block_id {
+        return Err(bad(format!(
+            "deferred-transaction sidecar block {} does not match SHiP full-state block {}",
+            sidecar.source_block_id,
+            hex::encode(source_block_id)
+        )));
+    }
+    Ok(())
+}
+
+fn decode_block_id(value: &str) -> Result<[u8; 32], XprImportError> {
+    let bytes = hex::decode(value)
+        .map_err(|error| bad(format!("invalid deferred-transaction sidecar block id: {error}")))?;
+    bytes.try_into().map_err(|_| {
+        bad("invalid deferred-transaction sidecar block id: expected 32-byte hexadecimal value")
+    })
+}
+
+fn sidecar_key(row: &DeferredTransactionSidecarRow) -> Result<DeferredTransactionKey, XprImportError> {
+    let sender_id = row.sender_id.parse::<u128>().map_err(|error| {
+        bad(format!(
+            "invalid deferred-transaction sidecar sender_id {:?}: {error}",
+            row.sender_id
+        ))
+    })?;
+    let trx_id = hex::decode(&row.trx_id)
+        .map_err(|error| bad(format!("invalid deferred-transaction sidecar trx_id: {error}")))?
+        .try_into()
+        .map_err(|_| bad("invalid deferred-transaction sidecar trx_id: expected 32-byte hexadecimal value"))?;
+    let packed_trx = hex::decode(&row.packed_trx)
+        .map_err(|error| bad(format!("invalid deferred-transaction sidecar packed_trx: {error}")))?;
+    Ok(DeferredTransactionKey {
+        sender: row.sender,
+        sender_id,
+        payer: row.payer,
+        trx_id,
+        packed_trx,
+    })
 }
 
 fn decode_generated_transaction(bytes: &[u8]) -> Result<PortableRow, XprImportError> {
@@ -1741,6 +1943,46 @@ mod tests {
     }
 
     #[test]
+    fn verifies_deferred_sidecar_before_rejecting_unimplemented_scheduler() {
+        let mut generated = vec![0]; // generated_transaction_v0
+        generated.extend_from_slice(&11u64.to_le_bytes()); // sender
+        generated.extend_from_slice(&12u64.to_le_bytes()); // sender_id low
+        generated.extend_from_slice(&13u64.to_le_bytes()); // sender_id high
+        generated.extend_from_slice(&14u64.to_le_bytes()); // payer
+        generated.extend_from_slice(&[15; 32]); // transaction id
+        bytes(&mut generated, &[16, 17]); // packed transaction
+        let entry = StateHistoryEntry {
+            magic: 0,
+            block_id: [42; 32],
+            deltas: vec![delta("generated_transaction", generated)],
+        };
+        let sidecar_json = format!(
+            r#"{{"version":1,"source_block_id":"{}","transactions":[{{"sender":11,"sender_id":"{}","payer":14,"trx_id":"{}","delay_until":1,"expiration":2,"published":0,"packed_trx":"1011"}}]}}"#,
+            hex::encode(entry.block_id),
+            (12u128 | ((13u128) << 64)),
+            hex::encode([15; 32]),
+        );
+        let sidecar = DeferredTransactionSidecar::from_json_bytes(sidecar_json.as_bytes()).unwrap();
+        let dir = TempDir::new().unwrap();
+        let mut db = Database::new(dir.path().to_str().unwrap(), 64 * 1024 * 1024).unwrap();
+
+        let error = hydrate_full_state_with_deferred_transactions(&mut db, &entry, Some(&sidecar))
+            .unwrap_err();
+        assert!(error.to_string().contains("verified against a complete chainbase sidecar"));
+        assert!(!db.is_account(11).unwrap());
+    }
+
+    #[test]
+    fn rejects_deferred_sidecar_from_a_different_block() {
+        let sidecar = DeferredTransactionSidecar::from_json_bytes(
+            br#"{"version":1,"source_block_id":"0000000000000000000000000000000000000000000000000000000000000000","transactions":[]}"#,
+        )
+        .unwrap();
+        let error = validate_sidecar_block_id(&sidecar, [1; 32]).unwrap_err();
+        assert!(error.to_string().contains("does not match SHiP full-state block"));
+    }
+
+    #[test]
     fn migration_manifest_rejects_a_different_checkpoint() {
         let checkpoint = crate::snapshot::encode(7, b"first checkpoint");
         let manifest = MigrationManifest::new(
@@ -1758,6 +2000,23 @@ mod tests {
             .verify_checkpoint(&crate::snapshot::encode(7, b"other checkpoint"))
             .unwrap_err()
             .contains("does not match manifest"));
+    }
+
+    #[test]
+    fn migration_manifest_commits_deferred_sidecar() {
+        let checkpoint = crate::snapshot::encode(7, b"checkpoint");
+        let manifest = MigrationManifest::new(
+            b"source state history",
+            [9; 32],
+            &checkpoint,
+            7,
+            ImportSummary::default(),
+        )
+        .with_deferred_transaction_sidecar(b"sidecar");
+        assert_eq!(
+            manifest.deferred_transaction_sidecar_sha256,
+            Some(hex::encode(Digest::hash(b"sidecar").as_bytes()))
+        );
     }
 
     fn delta(name: &str, data: Vec<u8>) -> TableDelta {

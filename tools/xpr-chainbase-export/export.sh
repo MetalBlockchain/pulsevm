@@ -22,11 +22,14 @@ Options:
   --source-revision SHA    XPR core revision that produced nodeos
                           (default: cbb24506280275f4fb51fb9d77758ff8249fa655)
   --timeout-seconds N      Maximum time to wait for the initial full delta (default: 300)
+  --deferred-sidecar PATH  Write complete deferred-transaction chainbase state
+                           through the bundled source-node plugin
   --help                   Show this help
 
 The output directory contains:
   chain_state_history.log/.index  Standard XPR SHiP chain-state history
   manifest.env                     Pinned source, input and output hashes
+  deferred-transactions.json       Optional complete deferred-transaction sidecar
   nodeos.log                       Source-node diagnostic log
 
 The importer consumes the first state-history block as a full Arena hydration
@@ -40,6 +43,7 @@ snapshot=""
 work_dir=""
 source_revision="$pinned_core_revision"
 timeout_seconds=300
+deferred_sidecar=""
 peers=()
 
 while (($#)); do
@@ -50,6 +54,7 @@ while (($#)); do
         --p2p-peer) peers+=("$2"); shift 2 ;;
         --source-revision) source_revision="$2"; shift 2 ;;
         --timeout-seconds) timeout_seconds="$2"; shift 2 ;;
+        --deferred-sidecar) deferred_sidecar="$2"; shift 2 ;;
         --help) usage; exit 0 ;;
         *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -64,6 +69,10 @@ done
     exit 2
 }
 [[ ! -e "$work_dir" ]] || { echo "work directory already exists: $work_dir" >&2; exit 2; }
+if [[ -n "$deferred_sidecar" && -e "$deferred_sidecar" ]]; then
+    echo "deferred sidecar path already exists: $deferred_sidecar" >&2
+    exit 2
+fi
 
 mkdir -p "$work_dir"/{data,config,state-history}
 history_dir="$work_dir/state-history"
@@ -82,6 +91,12 @@ args=(
     --chain-state-history
     --state-history-endpoint 127.0.0.1:0
 )
+if [[ -n "$deferred_sidecar" ]]; then
+    args+=(
+        --plugin eosio::deferred_transaction_sidecar_plugin
+        --deferred-transaction-sidecar-path "$deferred_sidecar"
+    )
+fi
 for peer in "${peers[@]}"; do
     args+=(--p2p-peer-address "$peer")
 done
@@ -112,6 +127,10 @@ done
     echo "timed out waiting for full chain-state delta; see $nodeos_log" >&2
     exit 1
 }
+if [[ -n "$deferred_sidecar" && ! -s "$deferred_sidecar" ]]; then
+    echo "nodeos produced SHiP but no deferred-transaction sidecar; ensure it was rebuilt with tools/xpr-chainbase-export/deferred-sidecar-plugin" >&2
+    exit 1
+fi
 
 sha256() {
     if command -v sha256sum >/dev/null; then
@@ -127,6 +146,10 @@ sha256() {
     printf 'CHAIN_STATE_HISTORY_SHA256=%s\n' "$(sha256 "$history_log")"
     printf 'CHAIN_STATE_HISTORY_LOG=%s\n' "$(basename "$history_log")"
     printf 'SOURCE_SNAPSHOT=%s\n' "$snapshot"
+    if [[ -n "$deferred_sidecar" ]]; then
+        printf 'DEFERRED_TRANSACTION_SIDECAR=%s\n' "$deferred_sidecar"
+        printf 'DEFERRED_TRANSACTION_SIDECAR_SHA256=%s\n' "$(sha256 "$deferred_sidecar")"
+    fi
 } >"$work_dir/manifest.env"
 
 echo "exported full XPR chain-state history to $work_dir"

@@ -37,12 +37,15 @@ pub use crate::{
     },
     xpr_import::{
         ImportSummary,
+        DeferredTransactionSidecar,
+        DeferredTransactionSidecarRow,
         MigrationManifest,
         StateHistoryEntry,
         TableDelta,
         TableDeltaRow,
         XprImportError,
         hydrate_full_state,
+        hydrate_full_state_with_deferred_transactions,
         parse_initial_state_history_log,
     },
 };

@@ -2,13 +2,14 @@ use std::{env, fs, process::ExitCode};
 
 use pulsevm_database::{
     Database,
+    DeferredTransactionSidecar,
     MigrationManifest,
-    hydrate_full_state,
+    hydrate_full_state_with_deferred_transactions,
     parse_initial_state_history_log,
 };
 
 fn usage() {
-    eprintln!("Usage: xpr_import_check <chain_state_history.log> <arena-directory> [checkpoint-file]");
+    eprintln!("Usage: xpr_import_check <chain_state_history.log> <arena-directory> [checkpoint-file] [deferred-transactions.json]");
 }
 
 fn main() -> ExitCode {
@@ -23,6 +24,7 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     };
     let checkpoint_path = args.next();
+    let deferred_transactions_path = args.next();
     if args.next().is_some() {
         usage();
         return ExitCode::from(2);
@@ -41,6 +43,26 @@ fn main() -> ExitCode {
             eprintln!("cannot parse XPR state-history log: {error}");
             return ExitCode::from(1);
         }
+    };
+    let deferred_transactions = match deferred_transactions_path {
+        Some(path) => {
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    eprintln!("cannot read {}: {error}", path.to_string_lossy());
+                    return ExitCode::from(1);
+                }
+            };
+            let sidecar = match DeferredTransactionSidecar::from_json_bytes(&bytes) {
+                Ok(sidecar) => sidecar,
+                Err(error) => {
+                    eprintln!("cannot parse deferred-transaction sidecar: {error}");
+                    return ExitCode::from(1);
+                }
+            };
+            Some((bytes, sidecar))
+        }
+        None => None,
     };
     for delta in &entry.deltas {
         eprintln!(
@@ -63,7 +85,11 @@ fn main() -> ExitCode {
         }
     };
 
-    match hydrate_full_state(&mut database, &entry) {
+    match hydrate_full_state_with_deferred_transactions(
+        &mut database,
+        &entry,
+        deferred_transactions.as_ref().map(|(_, sidecar)| sidecar),
+    ) {
         Ok(summary) => {
             if let Some(checkpoint_path) = checkpoint_path {
                 if let Err(error) = database.set_revision(1) {
@@ -85,13 +111,16 @@ fn main() -> ExitCode {
                     return ExitCode::from(1);
                 }
                 let manifest_path = format!("{}.manifest.json", checkpoint_path.to_string_lossy());
-                let manifest = MigrationManifest::new(
+                let mut manifest = MigrationManifest::new(
                     &log,
                     entry.block_id,
                     &checkpoint,
                     database.revision(),
                     summary,
                 );
+                if let Some((bytes, _)) = &deferred_transactions {
+                    manifest = manifest.with_deferred_transaction_sidecar(bytes);
+                }
                 let manifest = match serde_json::to_vec_pretty(&manifest) {
                     Ok(manifest) => manifest,
                     Err(error) => {
