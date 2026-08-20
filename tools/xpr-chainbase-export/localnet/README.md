@@ -28,19 +28,18 @@ export work directory must be below `/tmp`. Stop the source fixture when done:
 tools/xpr-chainbase-export/localnet/run.sh stop
 ```
 
-The optional final importer argument emits an Arena migration checkpoint. Make
-the same checkpoint file available to every Pulse node, then include it in each
-node's VM configuration:
+The optional final importer argument emits an Arena migration checkpoint. Start
+the five-node Pulse harness with that file:
 
-```json
-{
-  "migration_checkpoint": "/shared/pulsevm-xpr-migration.snapshot"
-}
+```bash
+METALGO_EXEC_PATH=../metalgo/build/metalgo \
+METAL_NETWORK_RUNNER_PATH=../metal-network-runner/bin/metal-network-runner \
+PULSEVM_MIGRATION_CHECKPOINT=/tmp/pulsevm-xpr-migration.snapshot \
+scripts/run-local.sh
 ```
 
-The controller restores it before normal Arena genesis authoring, so all nodes
-begin from identical imported state. The runner still needs an explicit way to
-mount this file and inject the per-node VM configuration; that integration is
-the next step. A successful local fixture establishes only the export and
-conversion path; it is deliberately not evidence of compatibility with an XPR
-Mainnet snapshot.
+The harness injects `migration_checkpoint` into the runner's chain config and
+the controller restores it before normal Arena genesis authoring, so every node
+begins from identical imported state. A successful local fixture establishes
+the export, conversion, and five-node boot path; it is deliberately not evidence
+of compatibility with an XPR Mainnet snapshot.

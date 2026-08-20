@@ -63,3 +63,23 @@ metal-network-runner control start --log-level info \
 --plugin-dir $(pwd)/build \
 --blockchain-specs '[{"vm_name": "pulsevm", "genesis": "/Users/glennmarien/Documents/MetalBlockchain/pulsevm/genesis.json"}]'
 ```
+
+### Start five nodes from imported XPR state
+
+First produce an Arena checkpoint using the local XPR fixture instructions in
+[`tools/xpr-chainbase-export/localnet/README.md`](tools/xpr-chainbase-export/localnet/README.md).
+Then run the normal five-node harness with that checkpoint supplied to every
+PulseVM instance:
+
+```bash
+METALGO_EXEC_PATH=../metalgo/build/metalgo \
+METAL_NETWORK_RUNNER_PATH=../metal-network-runner/bin/metal-network-runner \
+PULSEVM_MIGRATION_CHECKPOINT=/tmp/pulsevm-xpr-migration.snapshot \
+scripts/run-local.sh
+```
+
+The harness passes `migration_checkpoint` through the runner's per-chain VM
+configuration. Every node restores the same Arena checkpoint before its normal
+genesis authoring path. This proves the local conversion and five-node boot
+path; Mainnet migration still requires a validated Mainnet export plus the
+remaining migration-base-block and system-contract policy work.

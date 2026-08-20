@@ -8,6 +8,9 @@
 #     protocol version matches this VM's PLUGIN_VERSION (currently 43; see
 #     crates/pulsevm_core/src/chain/config/mod.rs). A mismatch fails the
 #     plugin handshake.
+#   * PULSEVM_MIGRATION_CHECKPOINT (optional) — an Arena checkpoint emitted by
+#     `xpr_import_check`. When set, every VM node restores this state instead
+#     of authoring normal Arena genesis state.
 #   * go, protoc, and LLVM 22 (`LLVM_SYS_221_PREFIX`) for the plugin build.
 #
 # This script automates the deterministic setup (build + stage the plugin,
@@ -19,6 +22,7 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VM_ID="rXcAFxZvio99epp6TzEwYfexCfPAbJuBTMsjUUoiT7PkVykNs"
 BUILD_DIR="$REPO/build"
+NETWORK_RUNNER="${METAL_NETWORK_RUNNER_PATH:-$REPO/../metal-network-runner/bin/metal-network-runner}"
 
 if [[ -z "${METALGO_EXEC_PATH:-}" || ! -x "${METALGO_EXEC_PATH:-}" ]]; then
   echo "error: set METALGO_EXEC_PATH to a metalgo binary (rpcchainvm protocol 43)." >&2
@@ -34,25 +38,53 @@ mkdir -p "$BUILD_DIR"
 cp "$REPO/target/release/pulsevm" "$BUILD_DIR/$VM_ID"
 chmod +x "$BUILD_DIR/$VM_ID"
 
-echo "==> Ensuring metal-network-runner is installed"
-if ! command -v metal-network-runner >/dev/null 2>&1; then
-  go install github.com/MetalBlockchain/metal-network-runner@latest
-  export PATH="$(go env GOPATH)/bin:$PATH"
+echo "==> Locating metal-network-runner"
+if [[ ! -x "$NETWORK_RUNNER" ]]; then
+  if command -v metal-network-runner >/dev/null 2>&1; then
+    NETWORK_RUNNER="$(command -v metal-network-runner)"
+  else
+    go install github.com/MetalBlockchain/metal-network-runner@latest
+    NETWORK_RUNNER="$(go env GOPATH)/bin/metal-network-runner"
+  fi
+fi
+
+BLOCKCHAIN_SPECS="[{\"vm_name\": \"pulsevm\", \"genesis\": \"$REPO/genesis.json\"}]"
+if [[ -n "${PULSEVM_MIGRATION_CHECKPOINT:-}" ]]; then
+  if [[ ! -f "$PULSEVM_MIGRATION_CHECKPOINT" ]]; then
+    echo "error: PULSEVM_MIGRATION_CHECKPOINT does not exist: $PULSEVM_MIGRATION_CHECKPOINT" >&2
+    exit 1
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "error: jq is required to pass a migration checkpoint to the runner." >&2
+    exit 1
+  fi
+  # This development key corresponds to genesis.json's initial_key. Override it
+  # for a real producer deployment; it is part of the node-local VM config.
+  PRODUCER_KEY="${PULSEVM_PRODUCER_KEY:-PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez}"
+  CHAIN_CONFIG="$(jq -cn \
+    --arg checkpoint "$PULSEVM_MIGRATION_CHECKPOINT" \
+    --arg producer_key "$PRODUCER_KEY" \
+    '{producer_name: "pulse", producer_key: $producer_key, migration_checkpoint: $checkpoint}')"
+  BLOCKCHAIN_SPECS="$(jq -cn \
+    --arg genesis "$REPO/genesis.json" \
+    --arg chain_config "$CHAIN_CONFIG" \
+    '[{vm_name: "pulsevm", genesis: $genesis, chain_config: $chain_config, blockchain_alias: "pulse-xpr-migration"}]')"
+  echo "==> Configured all VM nodes to restore $PULSEVM_MIGRATION_CHECKPOINT"
 fi
 
 echo "==> Starting metal-network-runner server (background)"
-metal-network-runner server --log-level info --port=":8080" --grpc-gateway-port=":8081" &
+"$NETWORK_RUNNER" server --log-level info --port=":8080" --grpc-gateway-port=":8081" &
 ANR_PID=$!
 trap 'kill $ANR_PID 2>/dev/null || true' EXIT
 sleep 3
 
-echo "==> Launching a 5-node cluster running PulseVM from genesis.json"
-metal-network-runner control start --log-level info \
+echo "==> Launching a 5-node cluster running PulseVM"
+"$NETWORK_RUNNER" control start --log-level info \
   --endpoint="0.0.0.0:8080" \
   --number-of-nodes=5 \
   --metalgo-path "$METALGO_EXEC_PATH" \
   --plugin-dir "$BUILD_DIR" \
-  --blockchain-specs "[{\"vm_name\": \"pulsevm\", \"genesis\": \"$REPO/genesis.json\"}]"
+  --blockchain-specs "$BLOCKCHAIN_SPECS"
 
 echo
 echo "Cluster starting. Once 'control status' reports the blockchain healthy:"
