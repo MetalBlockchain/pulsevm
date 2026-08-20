@@ -136,6 +136,14 @@ impl PackedTransaction {
         &self.trx_id
     }
 
+    /// The raw transaction bytes as carried in the network receipt. Deferred
+    /// execution compares these against Arena's source-side record before it
+    /// accepts the receipt without normal signatures.
+    #[inline]
+    pub fn packed_trx_bytes(&self) -> &[u8] {
+        self.packed_trx.as_ref()
+    }
+
     #[inline]
     pub fn from_signed_transaction(trx: SignedTransaction) -> Result<Self, ChainError> {
         let trx_id = trx.transaction().id().map_err(|e| {

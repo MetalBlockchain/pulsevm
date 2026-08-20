@@ -82,6 +82,7 @@ use pulsevm_constants::{
     MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER,
 };
 use pulsevm_crypto::{
+    Bytes,
     Digest,
     merkle,
 };
@@ -382,11 +383,22 @@ impl Controller {
                     "migration checkpoint must carry a positive revision".into(),
                 ));
             }
-            let deferred_transactions = self.db.deferred_transaction_count();
-            if deferred_transactions != 0 {
-                return Err(ChainError::GenesisError(format!(
-                    "migration checkpoint contains {deferred_transactions} deferred transactions, but this PulseVM build cannot execute them yet"
-                )));
+            for deferred in self.db.arena_deferred_transactions() {
+                let transaction = PackedTransaction::from_deferred_transaction_bytes(
+                    Bytes::from(deferred.packed_trx),
+                )
+                .map_err(|error| {
+                    ChainError::GenesisError(format!(
+                        "migration deferred transaction {} cannot be decoded: {error}",
+                        hex::encode(deferred.trx_id)
+                    ))
+                })?;
+                if transaction.id().as_bytes() != deferred.trx_id {
+                    return Err(ChainError::GenesisError(format!(
+                        "migration deferred transaction {} does not match its packed bytes",
+                        hex::encode(deferred.trx_id)
+                    )));
+                }
             }
             info!(
                 "restored migration Arena checkpoint {} at revision {} from manifest {}",
@@ -652,6 +664,52 @@ impl Controller {
         // The last proposal in the block wins. Start with onblock's proposal;
         // later signed transactions overwrite it below.
         let mut proposed_schedule = onblock_schedule;
+
+        // Scheduled transactions are selected from durable Arena state, never
+        // from the mempool. Their raw transaction bytes have no signatures: the
+        // source chain authorized them when they were scheduled. Keep each one
+        // in its own undo session so a failure leaves the queue untouched.
+        for scheduled in db.arena_due_deferred_transactions(
+            timestamp.to_time_point().time_since_epoch().count(),
+        ) {
+            let transaction = PackedTransaction::from_deferred_transaction_bytes(
+                Bytes::from(scheduled.packed_trx.clone()),
+            )
+            .map_err(|error| {
+                ChainError::TransactionError(format!(
+                    "cannot decode deferred transaction {}: {error}",
+                    hex::encode(scheduled.trx_id)
+                ))
+            })?;
+            if transaction.id().as_bytes() != scheduled.trx_id {
+                db.arena_undo();
+                return Err(ChainError::TransactionError(format!(
+                    "deferred transaction {} has an id that does not match its packed bytes",
+                    hex::encode(scheduled.trx_id)
+                )));
+            }
+            db.arena_start_undo_session();
+            match self.execute_deferred_transaction(&transaction, &timestamp, &block_status) {
+                Ok(result) => {
+                    db.arena_remove_deferred_transaction(scheduled.trx_id)?;
+                    db.arena_squash();
+                    transaction_traces.push(result.trace.clone());
+                    transaction_receipts.push_back(TransactionReceipt::new(result.trace.receipt, transaction));
+                    action_receipt_digests.extend(result.action_receipt_digests);
+                    if result.proposed_schedule.is_some() {
+                        proposed_schedule = result.proposed_schedule;
+                    }
+                }
+                Err(error) => {
+                    db.arena_undo();
+                    db.arena_undo();
+                    return Err(ChainError::TransactionError(format!(
+                        "deferred transaction {} failed; onerror handling is not implemented: {error}",
+                        hex::encode(scheduled.trx_id)
+                    )));
+                }
+            }
+        }
 
         // Get transactions from the mempool
         while let Some(transaction) = mempool.pop_transaction() {
@@ -1287,13 +1345,40 @@ impl Controller {
         let mut proposed_schedule = onblock_schedule;
 
         for receipt in &block.transactions {
-            // Verify the transaction
-            let result = self.execute_transaction_billed(
-                receipt.trx(),
-                &block.signed_block_header.header.timestamp,
-                block_status,
-                Some((receipt.cpu_usage_us(), receipt.net_usage_words())),
-            )?;
+            let timestamp = &block.signed_block_header.header.timestamp;
+            let transaction_id: [u8; 32] = receipt.trx().id().as_bytes().try_into().unwrap();
+            let deferred = self.db.arena_deferred_transaction(transaction_id);
+            let result = if let Some(deferred) = deferred {
+                let now = timestamp.to_time_point().time_since_epoch().count();
+                if deferred.delay_until > now || deferred.expiration < now {
+                    return Err(ChainError::BlockError(format!(
+                        "block includes deferred transaction {} outside its execution window",
+                        receipt.trx().id()
+                    )));
+                }
+                if deferred.packed_trx.as_slice() != receipt.trx().packed_trx_bytes() {
+                    return Err(ChainError::BlockError(format!(
+                        "block deferred transaction {} does not match the Arena record",
+                        receipt.trx().id()
+                    )));
+                }
+                let result = self.execute_transaction_billed_with_authorization(
+                    receipt.trx(),
+                    timestamp,
+                    block_status,
+                    Some((receipt.cpu_usage_us(), receipt.net_usage_words())),
+                    true,
+                )?;
+                self.db.arena_remove_deferred_transaction(transaction_id)?;
+                result
+            } else {
+                self.execute_transaction_billed(
+                    receipt.trx(),
+                    timestamp,
+                    block_status,
+                    Some((receipt.cpu_usage_us(), receipt.net_usage_words())),
+                )?
+            };
 
             // Add trace to traces
             transaction_traces.push(result.trace.clone());
@@ -1429,6 +1514,41 @@ impl Controller {
         block_status: &BlockStatus,
         explicit_billed: Option<(u32, u32)>,
     ) -> Result<TransactionResult, ChainError> {
+        self.execute_transaction_billed_with_authorization(
+            packed_transaction,
+            pending_block_timestamp,
+            block_status,
+            explicit_billed,
+            false,
+        )
+    }
+
+    /// Execute a durable scheduled transaction. This is not exposed through
+    /// mempool admission: only the controller calls it after resolving the
+    /// transaction ID to an Arena deferred record.
+    fn execute_deferred_transaction(
+        &mut self,
+        packed_transaction: &PackedTransaction,
+        pending_block_timestamp: &BlockTimestamp,
+        block_status: &BlockStatus,
+    ) -> Result<TransactionResult, ChainError> {
+        self.execute_transaction_billed_with_authorization(
+            packed_transaction,
+            pending_block_timestamp,
+            block_status,
+            None,
+            true,
+        )
+    }
+
+    fn execute_transaction_billed_with_authorization(
+        &mut self,
+        packed_transaction: &PackedTransaction,
+        pending_block_timestamp: &BlockTimestamp,
+        block_status: &BlockStatus,
+        explicit_billed: Option<(u32, u32)>,
+        skip_authorization: bool,
+    ) -> Result<TransactionResult, ChainError> {
         let signed_transaction = packed_transaction.get_signed_transaction();
 
         // Verify basic transaction validity
@@ -1444,7 +1564,7 @@ impl Controller {
         // no state effect (auth_sequence and permission-usage bumps happen during
         // execution and finalize), so skipping it leaves the resulting state and
         // receipts unchanged.
-        if explicit_billed.is_none() {
+        if explicit_billed.is_none() && !skip_authorization {
             AuthorizationManager::check_authorization(
                 &mut self.db,
                 &signed_transaction.transaction().actions,
@@ -3400,6 +3520,51 @@ mod tests {
             temp_path.path().to_str().unwrap(),
         )?;
         Ok((controller, private_key, chain_id, temp_path))
+    }
+
+    #[tokio::test]
+    async fn due_deferred_transaction_executes_without_mempool_signature_admission() -> Result<(), ChainError> {
+        let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
+        let scheduled = create_account(&private_key, Name::from_str("deferred")?, chain_id)?;
+        let trx_id: [u8; 32] = scheduled.id().as_bytes().try_into().unwrap();
+        controller.db.xpr_import_deferred_transaction(
+            PULSE_NAME.as_u64(),
+            7,
+            PULSE_NAME.as_u64(),
+            trx_id,
+            0,
+            i64::MAX,
+            0,
+            scheduled.packed_trx_bytes(),
+        )?;
+
+        let mut mempool = Mempool::new();
+        let block = controller.build_block(&mut mempool).await?;
+        assert_eq!(block.transactions.len(), 1);
+        assert_eq!(block.transactions[0].trx().id(), scheduled.id());
+
+        let (mut validator, _validator_key, _validator_chain_id, _validator_temp) =
+            init_test_controller()?;
+        validator.db.xpr_import_deferred_transaction(
+            PULSE_NAME.as_u64(),
+            7,
+            PULSE_NAME.as_u64(),
+            trx_id,
+            0,
+            i64::MAX,
+            0,
+            scheduled.packed_trx_bytes(),
+        )?;
+        let mut validator_mempool = Mempool::new();
+        validator.verify_block(&block, &mut validator_mempool).await?;
+        validator.accept_block(&block.id()?, &mut validator_mempool)?;
+        assert_eq!(validator.db.deferred_transaction_count(), 0);
+        assert!(validator.db.is_account(Name::from_str("deferred")?.as_u64())?);
+
+        controller.accept_block(&block.id()?, &mut mempool)?;
+        assert_eq!(controller.db.deferred_transaction_count(), 0);
+        assert!(controller.db.is_account(Name::from_str("deferred")?.as_u64())?);
+        Ok(())
     }
 
     // Bit-for-bit block-id parity across serialization and re-execution. A

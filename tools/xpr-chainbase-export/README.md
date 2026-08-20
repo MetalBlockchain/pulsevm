@@ -87,9 +87,9 @@ cargo run -p pulsevm_database --example xpr_import_check -- \
 The importer verifies the block ID and an exact one-for-one match of every
 SHiP identity/payload before it accepts the sidecar. Its checksum is committed
 to the resulting migration manifest and the complete records are persisted in
-Arena. A node still refuses to boot a migration checkpoint with a nonempty set
-until the controller scheduler/executor is enabled; that prevents persisted
-records from being mistaken for executable state during the staged rollout.
+Arena. Startup re-parses every deferred raw transaction and checks its ID
+against the sidecar before allowing the scheduler to run it; an incompatible
+XPR transaction therefore fails before the network begins producing blocks.
 
 `deferred-sidecar-plugin/` contains the exact-XPR-source plugin that writes
 this file from chainbase on the first `accepted_block` callback. Install it in

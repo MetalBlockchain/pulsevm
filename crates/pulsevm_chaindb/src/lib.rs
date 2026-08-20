@@ -3420,6 +3420,38 @@ impl ChainDatabase {
         })
     }
 
+    /// Materialize every deferred transaction in immutable transaction-id
+    /// order. This is used at migration startup to validate the raw payloads
+    /// before the node begins producing blocks.
+    pub fn deferred_transactions(&self) -> Vec<DeferredTransaction> {
+        let db = self.lock();
+        let mut rows: Vec<([u8; 32], DeferredTransaction)> = match db.table::<DeferredTransactionRow>() {
+            Ok(table) => table
+                .iter()
+                .filter_map(|row| {
+                    db.blob::<DeferredTransactionRow>(row.packed_trx).ok().map(|packed_trx| {
+                        (
+                            row.trx_id,
+                            DeferredTransaction {
+                                sender: row.sender,
+                                sender_id: (row.sender_id_lo as u128) | ((row.sender_id_hi as u128) << 64),
+                                payer: row.payer,
+                                trx_id: row.trx_id,
+                                delay_until: row.delay_until,
+                                expiration: row.expiration,
+                                published: row.published,
+                                packed_trx: packed_trx.to_vec(),
+                            },
+                        )
+                    })
+                })
+                .collect(),
+            Err(_) => return Vec::new(),
+        };
+        rows.sort_by_key(|row| row.0);
+        rows.into_iter().map(|(_, row)| row).collect()
+    }
+
     /// Remove a pending deferred transaction by its immutable transaction id.
     /// The scheduler calls this only inside the block undo session after it has
     /// selected the record for expiration or execution.

@@ -1857,7 +1857,7 @@ impl Database {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn xpr_import_deferred_transaction(
+    pub fn xpr_import_deferred_transaction(
         &self,
         sender: u64,
         sender_id: u128,
@@ -1900,6 +1900,10 @@ impl Database {
         now_micros: i64,
     ) -> Vec<crate::backend::DeferredTransaction> {
         self.backend.due_deferred_transactions(now_micros)
+    }
+
+    pub fn arena_deferred_transactions(&self) -> Vec<crate::backend::DeferredTransaction> {
+        self.backend.deferred_transactions()
     }
 
     pub fn arena_remove_deferred_transaction(
