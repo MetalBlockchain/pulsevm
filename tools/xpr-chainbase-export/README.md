@@ -90,11 +90,14 @@ to the resulting migration manifest and the complete records are persisted in
 Arena. Startup re-parses every deferred raw transaction and checks its ID
 against the sidecar before allowing the scheduler to run it; an incompatible
 XPR transaction therefore fails before the network begins producing blocks.
-Due records execute outside the mempool without re-checking their original
-signatures. If execution fails, PulseVM invokes `eosio::onerror` on the source
-sender with XPR's `onerror(sender_id, sent_trx)` ABI payload; a successful
-callback produces a `soft_fail` receipt and retires the record. Producer and
-validator both replay this path from the committed Arena record.
+Once a record's delay has elapsed, it executes outside the mempool without
+re-checking its original signatures. If it is already expired, PulseVM retires
+it with XPR's ID-only `expired` receipt. Otherwise, if execution fails,
+PulseVM invokes `eosio::onerror` on the source sender with XPR's
+`onerror(sender_id, sent_trx)` ABI payload; a successful callback produces an
+ID-only `soft_fail` receipt and retires the record. Successful deferred
+execution also uses an ID-only receipt. Producer and validator both replay
+these paths from the committed Arena record.
 
 `deferred-sidecar-plugin/` contains the exact-XPR-source plugin that writes
 this file from chainbase on the first `accepted_block` callback. Install it in

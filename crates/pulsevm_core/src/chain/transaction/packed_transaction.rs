@@ -144,6 +144,18 @@ impl PackedTransaction {
         self.packed_trx.as_ref()
     }
 
+    /// XPR's `packed_transaction::packed_digest()`: the receipt merkle commits
+    /// this digest rather than the full packed-transaction wire encoding.
+    pub fn packed_digest(&self) -> Result<pulsevm_crypto::Digest, WriteError> {
+        let mut prunable = self.signatures.pack()?;
+        prunable.extend(self.packed_context_free_data.pack()?);
+
+        let mut encoded = self.compression.pack()?;
+        encoded.extend(self.packed_trx.pack()?);
+        encoded.extend(pulsevm_crypto::Digest::hash(prunable).pack()?);
+        Ok(pulsevm_crypto::Digest::hash(encoded))
+    }
+
     #[inline]
     pub fn from_signed_transaction(trx: SignedTransaction) -> Result<Self, ChainError> {
         let trx_id = trx.transaction().id().map_err(|e| {

@@ -659,7 +659,7 @@ impl Controller {
         let pending_tx_ids: HashSet<Id> = self
             .verified_blocks
             .values()
-            .flat_map(|b| b.transactions.iter().map(|r| r.trx().id().clone()))
+            .flat_map(|b| b.transactions.iter().map(|r| *r.transaction_id()))
             .collect();
         let mut deferred: Vec<PackedTransaction> = Vec::new();
 
@@ -695,6 +695,29 @@ impl Controller {
         for scheduled in db.arena_due_deferred_transactions(
             timestamp.to_time_point().time_since_epoch().count(),
         ) {
+            let now = timestamp.to_time_point().time_since_epoch().count();
+            if scheduled.expiration < now {
+                // Leap retires an expired generated transaction without
+                // executing its payload and commits only its transaction ID.
+                let receipt = crate::chain::transaction::TransactionReceiptHeader::new(
+                    crate::chain::transaction::TransactionStatus::Expired,
+                    0,
+                    0u32.into(),
+                );
+                let mut trace = TransactionTrace::default();
+                trace.id = Id::new(scheduled.trx_id);
+                trace.block_num = self.last_accepted_block().block_num() + 1;
+                trace.block_time = timestamp.clone();
+                trace.scheduled = true;
+                trace.receipt = receipt.clone();
+                db.arena_remove_deferred_transaction(scheduled.trx_id)?;
+                transaction_traces.push(trace);
+                transaction_receipts.push_back(TransactionReceipt::for_id(
+                    receipt,
+                    Id::new(scheduled.trx_id),
+                ));
+                continue;
+            }
             let transaction = PackedTransaction::from_deferred_transaction_bytes(
                 Bytes::from(scheduled.packed_trx.clone()),
             )
@@ -717,7 +740,10 @@ impl Controller {
                     db.arena_remove_deferred_transaction(scheduled.trx_id)?;
                     db.arena_squash();
                     transaction_traces.push(result.trace.clone());
-                    transaction_receipts.push_back(TransactionReceipt::new(result.trace.receipt, transaction));
+                    transaction_receipts.push_back(TransactionReceipt::for_id(
+                        result.trace.receipt,
+                        Id::new(scheduled.trx_id),
+                    ));
                     action_receipt_digests.extend(result.action_receipt_digests);
                     if result.proposed_schedule.is_some() {
                         proposed_schedule = result.proposed_schedule;
@@ -735,9 +761,9 @@ impl Controller {
                             db.arena_remove_deferred_transaction(scheduled.trx_id)?;
                             db.arena_squash();
                             transaction_traces.push(result.trace.clone());
-                            transaction_receipts.push_back(TransactionReceipt::new(
+                            transaction_receipts.push_back(TransactionReceipt::for_id(
                                 result.trace.receipt,
-                                transaction,
+                                Id::new(scheduled.trx_id),
                             ));
                             action_receipt_digests.extend(result.action_receipt_digests);
                             if result.proposed_schedule.is_some() {
@@ -1137,7 +1163,9 @@ impl Controller {
             // runs; the retained pass did not (build pops them while assembling,
             // verify never touches the mempool), so mirror that here.
             for receipt in &block.transactions {
-                mempool.remove_transaction(receipt.trx().id());
+                if let Some(transaction) = receipt.packed_trx() {
+                    mempool.remove_transaction(transaction.id());
+                }
             }
             front.traces
         } else {
@@ -1241,7 +1269,9 @@ impl Controller {
 
         // Add transactions back to the mempool
         for receipt in &block.transactions {
-            mempool.add_transaction(receipt.trx().clone());
+            if let Some(transaction) = receipt.packed_trx() {
+                mempool.add_transaction(transaction.clone());
+            }
         }
 
         self.verified_blocks.remove(block_id);
@@ -1392,59 +1422,117 @@ impl Controller {
 
         for receipt in &block.transactions {
             let timestamp = &block.signed_block_header.header.timestamp;
-            let transaction_id: [u8; 32] = receipt.trx().id().as_bytes().try_into().unwrap();
+            let transaction_id: [u8; 32] = receipt.transaction_id().as_bytes().try_into().unwrap();
             let deferred = self.db.arena_deferred_transaction(transaction_id);
-            let result = if let Some(deferred) = deferred {
+            let (result, reproduced_receipt) = if let Some(deferred) = deferred {
                 let now = timestamp.to_time_point().time_since_epoch().count();
-                if deferred.delay_until > now || deferred.expiration < now {
+                if deferred.delay_until > now {
                     return Err(ChainError::BlockError(format!(
-                        "block includes deferred transaction {} outside its execution window",
-                        receipt.trx().id()
+                        "block includes deferred transaction {} before its delay_until",
+                        receipt.transaction_id()
                     )));
                 }
-                if deferred.packed_trx.as_slice() != receipt.trx().packed_trx_bytes() {
+                if receipt.packed_trx().is_some() {
                     return Err(ChainError::BlockError(format!(
-                        "block deferred transaction {} does not match the Arena record",
-                        receipt.trx().id()
+                        "block embeds generated transaction {} instead of using its ID receipt",
+                        receipt.transaction_id()
                     )));
                 }
                 let result = match receipt.status() {
-                    crate::chain::transaction::TransactionStatus::Executed => self
-                        .execute_transaction_billed_with_authorization(
-                            receipt.trx(),
+                    crate::chain::transaction::TransactionStatus::Expired => {
+                        if deferred.expiration >= now || receipt.cpu_usage_us() != 0 || receipt.net_usage_words() != 0 {
+                            return Err(ChainError::BlockError(format!(
+                                "block has an invalid expired receipt for generated transaction {}",
+                                receipt.transaction_id()
+                            )));
+                        }
+                        let mut trace = TransactionTrace::default();
+                        trace.id = *receipt.transaction_id();
+                        trace.block_num = self.last_accepted_block().block_num() + 1;
+                        trace.block_time = timestamp.clone();
+                        trace.scheduled = true;
+                        trace.receipt = crate::chain::transaction::TransactionReceiptHeader::new(
+                            crate::chain::transaction::TransactionStatus::Expired,
+                            0,
+                            0u32.into(),
+                        );
+                        TransactionResult {
+                            trace,
+                            billed_cpu_time_us: 0,
+                            action_receipt_digests: VecDeque::new(),
+                            proposed_schedule: None,
+                        }
+                    }
+                    crate::chain::transaction::TransactionStatus::Executed => {
+                        if deferred.expiration < now {
+                            return Err(ChainError::BlockError(format!(
+                                "block executes expired generated transaction {}",
+                                receipt.transaction_id()
+                            )));
+                        }
+                        let transaction = PackedTransaction::from_deferred_transaction_bytes(
+                            Bytes::from(deferred.packed_trx.clone()),
+                        )?;
+                        if transaction.id().as_bytes() != deferred.trx_id {
+                            return Err(ChainError::BlockError(format!(
+                                "Arena generated transaction {} does not match its packed bytes",
+                                receipt.transaction_id()
+                            )));
+                        }
+                        self.execute_transaction_billed_with_authorization(
+                            &transaction,
                             timestamp,
                             block_status,
                             Some((receipt.cpu_usage_us(), receipt.net_usage_words())),
                             true,
                             true,
-                        )?,
+                        )?
+                    }
                     crate::chain::transaction::TransactionStatus::SoftFail => {
+                        if deferred.expiration < now {
+                            return Err(ChainError::BlockError(format!(
+                                "block soft-fails expired generated transaction {}",
+                                receipt.transaction_id()
+                            )));
+                        }
                         self.execute_deferred_onerror(&deferred, timestamp, block_status)?
                     }
                     crate::chain::transaction::TransactionStatus::HardFail => {
                         return Err(ChainError::BlockError(format!(
                             "block marks deferred transaction {} as hard_fail, which is not supported yet",
-                            receipt.trx().id()
+                            receipt.transaction_id()
+                        )));
+                    }
+                    crate::chain::transaction::TransactionStatus::Delayed => {
+                        return Err(ChainError::BlockError(format!(
+                            "block marks generated transaction {} as delayed",
+                            receipt.transaction_id()
                         )));
                     }
                 };
                 self.db.arena_remove_deferred_transaction(transaction_id)?;
-                result
+                let reproduced = TransactionReceipt::for_id(result.trace.receipt.clone(), *receipt.transaction_id());
+                (result, reproduced)
             } else {
-                self.execute_transaction_billed(
-                    receipt.trx(),
+                let transaction = receipt.packed_trx().ok_or_else(|| {
+                    ChainError::BlockError(format!(
+                        "block references unknown generated transaction {}",
+                        receipt.transaction_id()
+                    ))
+                })?;
+                let result = self.execute_transaction_billed(
+                    transaction,
                     timestamp,
                     block_status,
                     Some((receipt.cpu_usage_us(), receipt.net_usage_words())),
-                )?
+                )?;
+                let reproduced = TransactionReceipt::new(result.trace.receipt.clone(), transaction.clone());
+                (result, reproduced)
             };
 
             // Add trace to traces
             transaction_traces.push(result.trace.clone());
-            transaction_receipts.push_back(TransactionReceipt::new(
-                result.trace.receipt,
-                receipt.trx().clone(),
-            ));
+            transaction_receipts.push_back(reproduced_receipt);
             action_receipt_digests.extend(result.action_receipt_digests);
             if result.proposed_schedule.is_some() {
                 proposed_schedule = result.proposed_schedule;
@@ -1452,7 +1540,9 @@ impl Controller {
 
             // Remove from mempool if we have it
             if block_status == &BlockStatus::Accepting {
-                mempool.remove_transaction(receipt.trx().id());
+                if let Some(transaction) = receipt.packed_trx() {
+                    mempool.remove_transaction(transaction.id());
+                }
             }
         }
 
@@ -3257,7 +3347,8 @@ mod tests {
             {
                 let b = reconstruct_block(r)?;
                 let keys = b.transactions[0]
-                    .trx()
+                    .packed_trx()
+                    .expect("fixture contains a packed transaction")
                     .get_signed_transaction()
                     .recovered_keys(&chain_id)?;
                 if let Some(k) = keys.iter().next() {
@@ -3658,7 +3749,7 @@ mod tests {
         let mut mempool = Mempool::new();
         let block = controller.build_block(&mut mempool).await?;
         assert_eq!(block.transactions.len(), 1);
-        assert_eq!(block.transactions[0].trx().id(), scheduled.id());
+        assert_eq!(block.transactions[0].transaction_id(), scheduled.id());
 
         let (mut validator, _validator_key, _validator_chain_id, _validator_temp) =
             init_test_controller()?;
@@ -3681,6 +3772,54 @@ mod tests {
         controller.accept_block(&block.id()?, &mut mempool)?;
         assert_eq!(controller.db.deferred_transaction_count(), 0);
         assert!(controller.db.is_account(Name::from_str("deferred")?.as_u64())?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expired_deferred_transaction_retires_with_id_only_receipt() -> Result<(), ChainError> {
+        let (mut producer, private_key, chain_id, _producer_temp) = init_test_controller()?;
+        let scheduled = create_account(&private_key, Name::from_str("expired")?, chain_id)?;
+        let trx_id: [u8; 32] = scheduled.id().as_bytes().try_into().unwrap();
+        producer.db.xpr_import_deferred_transaction(
+            PULSE_NAME.as_u64(),
+            9,
+            PULSE_NAME.as_u64(),
+            trx_id,
+            0,
+            0,
+            0,
+            scheduled.packed_trx_bytes(),
+        )?;
+
+        let mut producer_mempool = Mempool::new();
+        let block = producer.build_block(&mut producer_mempool).await?;
+        assert_eq!(block.transactions.len(), 1);
+        assert!(block.transactions[0].packed_trx().is_none());
+        assert_eq!(block.transactions[0].transaction_id(), scheduled.id());
+        assert_eq!(
+            block.transactions[0].status(),
+            &crate::chain::transaction::TransactionStatus::Expired
+        );
+        assert_eq!(producer.db.deferred_transaction_count(), 0);
+        assert!(!producer.db.is_account(Name::from_str("expired")?.as_u64())?);
+
+        let (mut validator, _validator_key, _validator_chain_id, _validator_temp) =
+            init_test_controller()?;
+        validator.db.xpr_import_deferred_transaction(
+            PULSE_NAME.as_u64(),
+            9,
+            PULSE_NAME.as_u64(),
+            trx_id,
+            0,
+            0,
+            0,
+            scheduled.packed_trx_bytes(),
+        )?;
+        let mut validator_mempool = Mempool::new();
+        validator.verify_block(&block, &mut validator_mempool).await?;
+        validator.accept_block(&block.id()?, &mut validator_mempool)?;
+        assert_eq!(validator.db.deferred_transaction_count(), 0);
+        assert!(!validator.db.is_account(Name::from_str("expired")?.as_u64())?);
         Ok(())
     }
 
@@ -5142,7 +5281,8 @@ mod tests {
             {
                 let b = reconstruct_block(r)?;
                 let keys = b.transactions[0]
-                    .trx()
+                    .packed_trx()
+                    .expect("fixture contains a packed transaction")
                     .get_signed_transaction()
                     .recovered_keys(&chain_id)?;
                 if let Some(k) = keys.iter().next() {

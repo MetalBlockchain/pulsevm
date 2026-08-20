@@ -3364,15 +3364,15 @@ impl ChainDatabase {
             .unwrap_or_default()
     }
 
-    /// All transactions eligible at `now_micros`, in XPR's `(delay_until,id)`
-    /// order. Expired rows are deliberately not returned: their eventual
-    /// removal/onerror handling belongs to controller execution, not a read.
+    /// All generated transactions whose delay has elapsed, in XPR's
+    /// `(delay_until,id)` order. The controller must receive expired rows too:
+    /// it retires them with an ID-only `expired` receipt.
     pub fn due_deferred_transactions(&self, now_micros: i64) -> Vec<DeferredTransaction> {
         let db = self.lock();
         let mut rows: Vec<(i64, i64, DeferredTransaction)> = match db.table::<DeferredTransactionRow>() {
             Ok(table) => table
                 .iter()
-                .filter(|row| row.delay_until <= now_micros && row.expiration >= now_micros)
+                .filter(|row| row.delay_until <= now_micros)
                 .filter_map(|row| {
                     db.blob::<DeferredTransactionRow>(row.packed_trx).ok().map(|packed_trx| {
                         (
