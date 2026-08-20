@@ -36,6 +36,19 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    for delta in &entry.deltas {
+        eprintln!(
+            "XPR table {:<30} rows={} payload-bytes={}",
+            delta.name,
+            delta.rows.len(),
+            delta.rows.iter().map(|row| row.data.len()).sum::<usize>()
+        );
+        if delta.name == "global_property" {
+            for row in &delta.rows {
+                eprintln!("global_property: {}", hex::encode(&row.data));
+            }
+        }
+    }
     let mut database = match Database::new(&database_path.to_string_lossy(), 64 * 1024 * 1024) {
         Ok(database) => database,
         Err(error) => {

@@ -279,6 +279,7 @@ fn ser_global_property(s: &mut Ser, r: &GlobalPropertyRow, chain_id: &[u8; 32]) 
     s.u32(r.max_transaction_cpu_usage);
     s.u32(r.min_transaction_cpu_usage);
     s.u32(r.max_transaction_lifetime);
+    s.u32(r.deferred_trx_expiration_window);
     s.u32(r.max_inline_action_size);
     s.u16(r.max_inline_action_depth);
     s.u16(r.max_authority_depth);

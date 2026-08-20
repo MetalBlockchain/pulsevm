@@ -599,10 +599,12 @@ struct GlobalPropertyRow {
     max_transaction_cpu_usage: u32,
     min_transaction_cpu_usage: u32,
     max_transaction_lifetime: u32,
+    deferred_trx_expiration_window: u32,
     max_transaction_delay: u32,
     max_inline_action_size: u32,
     max_inline_action_depth: u16,
     max_authority_depth: u16,
+    _pad: u32,
 }
 
 /// Rust representation of the chainbase `resource_limits_config_object` singleton: the
@@ -652,6 +654,7 @@ pub struct ChainConfigParams {
     pub max_transaction_cpu_usage: u32,
     pub min_transaction_cpu_usage: u32,
     pub max_transaction_lifetime: u32,
+    pub deferred_trx_expiration_window: u32,
     pub max_transaction_delay: u32,
     pub max_inline_action_size: u32,
     pub max_inline_action_depth: u16,
@@ -675,6 +678,7 @@ impl ChainConfigParams {
         out.extend_from_slice(&self.max_transaction_cpu_usage.to_le_bytes());
         out.extend_from_slice(&self.min_transaction_cpu_usage.to_le_bytes());
         out.extend_from_slice(&self.max_transaction_lifetime.to_le_bytes());
+        out.extend_from_slice(&self.deferred_trx_expiration_window.to_le_bytes());
         out.extend_from_slice(&self.max_transaction_delay.to_le_bytes());
         out.extend_from_slice(&self.max_inline_action_size.to_le_bytes());
         out.extend_from_slice(&self.max_inline_action_depth.to_le_bytes());
@@ -698,6 +702,7 @@ impl GlobalPropertyRow {
             max_transaction_cpu_usage: self.max_transaction_cpu_usage,
             min_transaction_cpu_usage: self.min_transaction_cpu_usage,
             max_transaction_lifetime: self.max_transaction_lifetime,
+            deferred_trx_expiration_window: self.deferred_trx_expiration_window,
             max_transaction_delay: self.max_transaction_delay,
             max_inline_action_size: self.max_inline_action_size,
             max_inline_action_depth: self.max_inline_action_depth,
@@ -3004,6 +3009,7 @@ impl ChainDatabase {
             r.max_transaction_cpu_usage = p.max_transaction_cpu_usage;
             r.min_transaction_cpu_usage = p.min_transaction_cpu_usage;
             r.max_transaction_lifetime = p.max_transaction_lifetime;
+            r.deferred_trx_expiration_window = p.deferred_trx_expiration_window;
             r.max_transaction_delay = p.max_transaction_delay;
             r.max_inline_action_size = p.max_inline_action_size;
             r.max_inline_action_depth = p.max_inline_action_depth;
@@ -3043,6 +3049,7 @@ impl ChainDatabase {
             max_transaction_cpu_usage: r.max_transaction_cpu_usage,
             min_transaction_cpu_usage: r.min_transaction_cpu_usage,
             max_transaction_lifetime: r.max_transaction_lifetime,
+            deferred_trx_expiration_window: r.deferred_trx_expiration_window,
             max_transaction_delay: r.max_transaction_delay,
             max_inline_action_size: r.max_inline_action_size,
             max_inline_action_depth: r.max_inline_action_depth,

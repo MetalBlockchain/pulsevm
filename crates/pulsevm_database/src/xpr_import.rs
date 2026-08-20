@@ -15,7 +15,7 @@ use std::{
 
 use flate2::read::ZlibDecoder;
 
-use crate::{Database, Float128, U256};
+use crate::{ChainConfigV0, Database, Float128, U256};
 
 /// XPR core writes `magic(8) + block_id(32) + payload_size(8)` before every
 /// state-history payload, followed by an eight-byte copy of the record's file
@@ -58,10 +58,14 @@ pub struct StateHistoryEntry {
 /// Counts of the portable rows committed by [`hydrate_full_state`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ImportSummary {
+    pub global_properties: u64,
     pub accounts: u64,
     pub account_metadata: u64,
     pub code_rows: u64,
     pub permissions: u64,
+    pub permission_links: u64,
+    pub resource_limits: u64,
+    pub resource_usage: u64,
     pub contract_tables: u64,
     pub contract_rows: u64,
     pub index64_rows: u64,
@@ -109,6 +113,12 @@ pub fn hydrate_full_state(
         // The state-history table order happens to be suitable today, but the
         // importer enforces its own dependency order so an equivalent stream
         // with tables rearranged cannot create children before their parents.
+        for row in &rows {
+            if let PortableRow::GlobalProperty { config } = row {
+                db.set_global_properties(config).map_err(database_error)?;
+                summary.global_properties += 1;
+            }
+        }
         for row in &rows {
             match row {
                 PortableRow::Account {
@@ -194,9 +204,60 @@ pub fn hydrate_full_state(
                 summary.permissions += 1;
             }
         }
+        for row in &rows {
+            if let PortableRow::PermissionLink {
+                account,
+                code,
+                message_type,
+                required_permission,
+            } = row
+            {
+                db.xpr_import_permission_link(*account, *code, *message_type, *required_permission)
+                    .map_err(database_error)?;
+                summary.permission_links += 1;
+            }
+        }
+        for row in &rows {
+            if let PortableRow::ResourceLimits {
+                owner,
+                net_weight,
+                cpu_weight,
+                ram_bytes,
+            } = row
+            {
+                db.xpr_import_resource_limits(*owner, *net_weight, *cpu_weight, *ram_bytes)
+                    .map_err(database_error)?;
+                summary.resource_limits += 1;
+            }
+            if let PortableRow::ResourceUsage {
+                owner,
+                ram_usage,
+                net_usage,
+                cpu_usage,
+            } = row
+            {
+                db.xpr_import_resource_usage(
+                    *owner,
+                    *ram_usage,
+                    net_usage.value_ex,
+                    net_usage.consumed,
+                    net_usage.last_ordinal,
+                    cpu_usage.value_ex,
+                    cpu_usage.consumed,
+                    cpu_usage.last_ordinal,
+                )
+                .map_err(database_error)?;
+                summary.resource_usage += 1;
+            }
+        }
         for row in rows {
             match row {
                 PortableRow::Account { .. }
+                | PortableRow::GlobalProperty { .. }
+                | PortableRow::EmptyProtocolState
+                | PortableRow::PermissionLink { .. }
+                | PortableRow::ResourceLimits { .. }
+                | PortableRow::ResourceUsage { .. }
                 | PortableRow::AccountMetadata { .. }
                 | PortableRow::Code { .. }
                 | PortableRow::Permission { .. } => {}
@@ -316,6 +377,32 @@ fn database_error(error: impl fmt::Display) -> XprImportError {
 }
 
 enum PortableRow {
+    /// XPR's producer schedule is deliberately not carried over: the imported
+    /// database starts a new Pulse chain with its own producer schedule. Its
+    /// chain execution configuration is retained in Arena.
+    GlobalProperty { config: ChainConfigV0 },
+    /// A source with activated protocol features cannot be treated as a Pulse
+    /// runtime without an explicit feature mapping. The empty fixture state is
+    /// safe and needs no storage in the target runtime.
+    EmptyProtocolState,
+    PermissionLink {
+        account: u64,
+        code: u64,
+        message_type: u64,
+        required_permission: u64,
+    },
+    ResourceLimits {
+        owner: u64,
+        net_weight: i64,
+        cpu_weight: i64,
+        ram_bytes: i64,
+    },
+    ResourceUsage {
+        owner: u64,
+        ram_usage: u64,
+        net_usage: ImportUsage,
+        cpu_usage: ImportUsage,
+    },
     Account {
         name: u64,
         creation_date: u32,
@@ -403,6 +490,13 @@ struct CodeReference {
     vm_version: u8,
 }
 
+#[derive(Clone, Copy)]
+struct ImportUsage {
+    value_ex: u64,
+    consumed: u64,
+    last_ordinal: u32,
+}
+
 fn decode_portable_rows(entry: &StateHistoryEntry) -> Result<Vec<PortableRow>, XprImportError> {
     let mut result = Vec::new();
     for delta in &entry.deltas {
@@ -414,6 +508,11 @@ fn decode_portable_rows(entry: &StateHistoryEntry) -> Result<Vec<PortableRow>, X
                 )));
             }
             let decoded = match delta.name.as_str() {
+                "global_property" => decode_global_property(&row.data)?,
+                "protocol_state" => decode_empty_protocol_state(&row.data)?,
+                "permission_link" => decode_permission_link(&row.data)?,
+                "resource_limits" => decode_resource_limits(&row.data)?,
+                "resource_usage" => decode_resource_usage(&row.data)?,
                 "account" => decode_account(&row.data)?,
                 "account_metadata" => decode_account_metadata(&row.data)?,
                 "code" => decode_code(&row.data)?,
@@ -477,6 +576,164 @@ fn code_reference_count(rows: &[PortableRow], hash: [u8; 32], vm_type: u8, vm_ve
                 if reference.hash == hash && reference.vm_type == vm_type && reference.vm_version == vm_version)
         })
         .count() as u64
+}
+
+fn decode_global_property(bytes: &[u8]) -> Result<PortableRow, XprImportError> {
+    let mut row = RowCursor::new(bytes);
+    let version = row.varuint()?;
+    if version != 1 {
+        return Err(bad(format!(
+            "unsupported XPR global_property version {version}"
+        )));
+    }
+
+    // proposed_schedule_block_num: optional<uint32>
+    if row.bool()? {
+        row.u32()?;
+    }
+    skip_producer_authority_schedule(&mut row)?;
+
+    let config_version = row.varuint()?;
+    if config_version > 1 {
+        return Err(bad(format!(
+            "unsupported XPR chain_config version {config_version}"
+        )));
+    }
+    let config = ChainConfigV0 {
+        max_block_net_usage: row.u64()?,
+        target_block_net_usage_pct: row.u32()?,
+        max_transaction_net_usage: row.u32()?,
+        base_per_transaction_net_usage: row.u32()?,
+        net_usage_leeway: row.u32()?,
+        context_free_discount_net_usage_num: row.u32()?,
+        context_free_discount_net_usage_den: row.u32()?,
+        max_block_cpu_usage: row.u32()?,
+        target_block_cpu_usage_pct: row.u32()?,
+        max_transaction_cpu_usage: row.u32()?,
+        min_transaction_cpu_usage: row.u32()?,
+        max_transaction_lifetime: row.u32()?,
+        deferred_trx_expiration_window: row.u32()?,
+        max_transaction_delay: row.u32()?,
+        max_inline_action_size: row.u32()?,
+        max_inline_action_depth: row.u16()?,
+        max_authority_depth: row.u16()?,
+    };
+    if config_version == 1 {
+        // Pulse's action-return limit is a fixed build constant. It is checked
+        // below, rather than silently migrating an incompatible execution rule.
+        let action_return_limit = row.u32()?;
+        if action_return_limit != 256 {
+            return Err(bad(format!(
+                "XPR max_action_return_value_size {action_return_limit} is incompatible with Pulse's fixed 256"
+            )));
+        }
+    }
+
+    row.fixed::<32>()?; // source chain id; the target has a new chain id
+                        // `wasm_configuration` is a binary extension in Leap 5: it has no
+                        // presence boolean, and is simply absent in the XPR-core pinned format.
+    if row.remaining() != 0 {
+        let wasm_version = row.varuint()?;
+        if wasm_version != 0 {
+            return Err(bad(format!(
+                "unsupported XPR wasm_config version {wasm_version}"
+            )));
+        }
+        for _ in 0..11 {
+            row.u32()?;
+        }
+    }
+    row.finish()?;
+    Ok(PortableRow::GlobalProperty { config })
+}
+
+fn skip_producer_authority_schedule(row: &mut RowCursor<'_>) -> Result<(), XprImportError> {
+    row.u32()?; // schedule version
+    let producers = usize::try_from(row.varuint()?)
+        .map_err(|_| bad("XPR producer schedule count does not fit this platform"))?;
+    if producers > 10_000 {
+        return Err(bad("XPR producer schedule has too many producers"));
+    }
+    for _ in 0..producers {
+        row.u64()?; // producer name
+        if row.varuint()? != 0 {
+            return Err(bad("XPR producer uses unsupported block-signing authority"));
+        }
+        row.u32()?; // threshold
+        let keys = usize::try_from(row.varuint()?)
+            .map_err(|_| bad("XPR producer key count does not fit this platform"))?;
+        if keys > 10_000 {
+            return Err(bad("XPR producer has too many signing keys"));
+        }
+        for _ in 0..keys {
+            if row.varuint()? != 0 {
+                return Err(bad("XPR producer uses a non-K1 signing key"));
+            }
+            row.fixed::<33>()?;
+            row.u16()?;
+        }
+    }
+    Ok(())
+}
+
+fn decode_empty_protocol_state(bytes: &[u8]) -> Result<PortableRow, XprImportError> {
+    let mut row = RowCursor::new(bytes);
+    row.version()?;
+    if row.varuint()? != 0 {
+        return Err(bad(
+            "XPR activated protocol features require an explicit Pulse feature mapping",
+        ));
+    }
+    row.finish()?;
+    Ok(PortableRow::EmptyProtocolState)
+}
+
+fn decode_permission_link(bytes: &[u8]) -> Result<PortableRow, XprImportError> {
+    let mut row = RowCursor::new(bytes);
+    row.version()?;
+    let result = PortableRow::PermissionLink {
+        account: row.u64()?,
+        code: row.u64()?,
+        message_type: row.u64()?,
+        required_permission: row.u64()?,
+    };
+    row.finish()?;
+    Ok(result)
+}
+
+fn decode_resource_limits(bytes: &[u8]) -> Result<PortableRow, XprImportError> {
+    let mut row = RowCursor::new(bytes);
+    row.version()?;
+    let result = PortableRow::ResourceLimits {
+        owner: row.u64()?,
+        net_weight: row.i64()?,
+        cpu_weight: row.i64()?,
+        ram_bytes: row.i64()?,
+    };
+    row.finish()?;
+    Ok(result)
+}
+
+fn decode_usage_accumulator(row: &mut RowCursor<'_>) -> Result<ImportUsage, XprImportError> {
+    row.version()?;
+    Ok(ImportUsage {
+        last_ordinal: row.u32()?,
+        value_ex: row.u64()?,
+        consumed: row.u64()?,
+    })
+}
+
+fn decode_resource_usage(bytes: &[u8]) -> Result<PortableRow, XprImportError> {
+    let mut row = RowCursor::new(bytes);
+    row.version()?;
+    let result = PortableRow::ResourceUsage {
+        owner: row.u64()?,
+        net_usage: decode_usage_accumulator(&mut row)?,
+        cpu_usage: decode_usage_accumulator(&mut row)?,
+        ram_usage: row.u64()?,
+    };
+    row.finish()?;
+    Ok(result)
 }
 
 fn decode_account(bytes: &[u8]) -> Result<PortableRow, XprImportError> {
@@ -875,6 +1132,10 @@ struct RowCursor<'a> {
 impl<'a> RowCursor<'a> {
     fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, pos: 0 }
+    }
+
+    fn remaining(&self) -> usize {
+        self.bytes.len() - self.pos
     }
 
     fn byte(&mut self) -> Result<u8, XprImportError> {

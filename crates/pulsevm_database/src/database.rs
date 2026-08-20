@@ -2,12 +2,7 @@
 
 use std::{
     fs,
-    io::{
-        Read,
-        Seek,
-        SeekFrom,
-        Write,
-    },
+    io::{Read, Seek, SeekFrom, Write},
     path::Path,
 };
 
@@ -35,12 +30,7 @@ const PERMISSION_LINK_OBJECT_BILLABLE: i64 = 144;
 // The public `Database` methods use the shared pure-Rust time type.
 use pulsevm_chain_types::TimePoint;
 // These pure-Rust authority sub-types back the arena authority decoder.
-use crate::{
-    KeyWeight,
-    PermissionLevel,
-    PermissionLevelWeight,
-    WaitWeight,
-};
+use crate::{KeyWeight, PermissionLevel, PermissionLevelWeight, WaitWeight};
 use pulsevm_billable_size::billable_size_v;
 use pulsevm_crypto::k1::K1PublicKey;
 
@@ -105,7 +95,7 @@ fn chain_config_v0_from_params(p: &crate::backend::ChainConfigParams) -> ChainCo
         max_transaction_cpu_usage: p.max_transaction_cpu_usage,
         min_transaction_cpu_usage: p.min_transaction_cpu_usage,
         max_transaction_lifetime: p.max_transaction_lifetime,
-        deferred_trx_expiration_window: 0,
+        deferred_trx_expiration_window: p.deferred_trx_expiration_window,
         max_transaction_delay: p.max_transaction_delay,
         max_inline_action_size: p.max_inline_action_size,
         max_inline_action_depth: p.max_inline_action_depth,
@@ -129,6 +119,7 @@ fn chain_config_params_from_v0(cfg: &ChainConfigV0) -> crate::backend::ChainConf
         max_transaction_cpu_usage: cfg.max_transaction_cpu_usage,
         min_transaction_cpu_usage: cfg.min_transaction_cpu_usage,
         max_transaction_lifetime: cfg.max_transaction_lifetime,
+        deferred_trx_expiration_window: cfg.deferred_trx_expiration_window,
         max_transaction_delay: cfg.max_transaction_delay,
         max_inline_action_size: cfg.max_inline_action_size,
         max_inline_action_depth: cfg.max_inline_action_depth,
@@ -1841,7 +1832,9 @@ impl Database {
                 vm_type,
                 vm_version,
             )
-            .map_err(|e| ChainError::InternalError(format!("XPR import account metadata {name}: {e:?}")))
+            .map_err(|e| {
+                ChainError::InternalError(format!("XPR import account metadata {name}: {e:?}"))
+            })
     }
 
     /// Insert a code image and its derived source reference count while
@@ -1874,6 +1867,64 @@ impl Database {
             .create_permission(id, parent, owner, name, last_updated, authority)
             .map_err(|e| ChainError::InternalError(format!("XPR import permission: {e:?}")))?;
         Ok(id)
+    }
+
+    pub(crate) fn xpr_import_permission_link(
+        &self,
+        account: u64,
+        code: u64,
+        message_type: u64,
+        required_permission: u64,
+    ) -> Result<(), ChainError> {
+        self.backend
+            .link_auth(account, code, message_type, required_permission)
+            .map_err(|e| ChainError::InternalError(format!("XPR import permission link: {e:?}")))
+    }
+
+    pub(crate) fn xpr_import_resource_limits(
+        &self,
+        owner: u64,
+        net_weight: i64,
+        cpu_weight: i64,
+        ram_bytes: i64,
+    ) -> Result<(), ChainError> {
+        let mut row = Vec::with_capacity(33);
+        row.push(0); // committed, not pending
+        row.extend_from_slice(&owner.to_le_bytes());
+        row.extend_from_slice(&ram_bytes.to_le_bytes());
+        row.extend_from_slice(&net_weight.to_le_bytes());
+        row.extend_from_slice(&cpu_weight.to_le_bytes());
+        self.backend
+            .hydrate_account_limits(&row)
+            .map_err(|e| ChainError::InternalError(format!("XPR import resource limits: {e:?}")))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn xpr_import_resource_usage(
+        &self,
+        owner: u64,
+        ram_usage: u64,
+        net_value_ex: u64,
+        net_consumed: u64,
+        net_last_ordinal: u32,
+        cpu_value_ex: u64,
+        cpu_consumed: u64,
+        cpu_last_ordinal: u32,
+    ) -> Result<(), ChainError> {
+        let mut row = Vec::with_capacity(56);
+        row.extend_from_slice(&owner.to_le_bytes());
+        row.extend_from_slice(&ram_usage.to_le_bytes());
+        for (value_ex, consumed, last_ordinal) in [
+            (net_value_ex, net_consumed, net_last_ordinal),
+            (cpu_value_ex, cpu_consumed, cpu_last_ordinal),
+        ] {
+            row.extend_from_slice(&value_ex.to_le_bytes());
+            row.extend_from_slice(&consumed.to_le_bytes());
+            row.extend_from_slice(&last_ordinal.to_le_bytes());
+        }
+        self.backend
+            .hydrate_resource_usage(&row)
+            .map_err(|e| ChainError::InternalError(format!("XPR import resource usage: {e:?}")))
     }
 
     pub fn initialize_account_resource_limits(
@@ -3254,12 +3305,7 @@ impl Database {
         expected_core_symbol: Option<&str>,
     ) -> Result<String, ChainError> {
         use pulsevm_rpc::{
-            AccountInfo,
-            KeyWeight,
-            LinkedAction,
-            Permission,
-            PermissionLevelWeight,
-            ResourceLimit,
+            AccountInfo, KeyWeight, LinkedAction, Permission, PermissionLevelWeight, ResourceLimit,
             WaitWeight,
         };
 
