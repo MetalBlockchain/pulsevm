@@ -1368,6 +1368,7 @@ impl Controller {
                     block_status,
                     Some((receipt.cpu_usage_us(), receipt.net_usage_words())),
                     true,
+                    true,
                 )?;
                 self.db.arena_remove_deferred_transaction(transaction_id)?;
                 result
@@ -1520,6 +1521,7 @@ impl Controller {
             block_status,
             explicit_billed,
             false,
+            false,
         )
     }
 
@@ -1538,6 +1540,7 @@ impl Controller {
             block_status,
             None,
             true,
+            true,
         )
     }
 
@@ -1548,13 +1551,16 @@ impl Controller {
         block_status: &BlockStatus,
         explicit_billed: Option<(u32, u32)>,
         skip_authorization: bool,
+        is_deferred: bool,
     ) -> Result<TransactionResult, ChainError> {
         let signed_transaction = packed_transaction.get_signed_transaction();
 
         // Verify basic transaction validity
-        signed_transaction
-            .transaction()
-            .validate(pending_block_timestamp)?;
+        if !is_deferred {
+            signed_transaction
+                .transaction()
+                .validate(pending_block_timestamp)?;
+        }
 
         // Verify authority — but only when this node is the one admitting the
         // transaction (mempool/producing). When applying an already-accepted
@@ -1594,11 +1600,19 @@ impl Controller {
         }
 
         let trx = packed_transaction.get_transaction();
-        trx_context.init_for_input_trx(
-            packed_transaction.get_unprunable_size()?,
-            packed_transaction.get_prunable_size()?,
-            &trx,
-        )?;
+        if is_deferred {
+            trx_context.init_for_deferred_trx(
+                packed_transaction.get_unprunable_size()?,
+                packed_transaction.get_prunable_size()?,
+                &trx,
+            )?;
+        } else {
+            trx_context.init_for_input_trx(
+                packed_transaction.get_unprunable_size()?,
+                packed_transaction.get_prunable_size()?,
+                &trx,
+            )?;
+        }
         trx_context.exec(&trx)?;
         let result = trx_context.finalize()?;
 

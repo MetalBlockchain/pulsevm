@@ -317,6 +317,43 @@ impl TransactionContext {
         Ok(())
     }
 
+    /// Initialize a transaction retired from the durable deferred queue. Its
+    /// delay and expiration were checked by the controller against the
+    /// generated-transaction record, so this deliberately does not apply the
+    /// input-transaction expiration/delay rule a second time. It remains an
+    /// objectively billed transaction and records its id just like an input
+    /// receipt, ensuring replay cannot execute it twice.
+    pub fn init_for_deferred_trx(
+        &mut self,
+        packed_trx_unprunable_size: u64,
+        packed_trx_prunable_size: u64,
+        transaction: &Transaction,
+    ) -> Result<(), ChainError> {
+        let mut discounted_size_for_pruned_data = packed_trx_prunable_size;
+        let chain_config = self.db.chain_config()?;
+        if chain_config.context_free_discount_net_usage_den > 0
+            && chain_config.context_free_discount_net_usage_num
+                < chain_config.context_free_discount_net_usage_den
+        {
+            discounted_size_for_pruned_data *=
+                chain_config.context_free_discount_net_usage_num as u64;
+            discounted_size_for_pruned_data = (discounted_size_for_pruned_data
+                + chain_config.context_free_discount_net_usage_den as u64
+                - 1)
+                / chain_config.context_free_discount_net_usage_den as u64;
+        }
+        let initial_net_usage = chain_config.base_per_transaction_net_usage as u64
+            + packed_trx_unprunable_size
+            + discounted_size_for_pruned_data;
+        self.validate_referenced_accounts(transaction)?;
+        self.init(initial_net_usage, transaction.first_authorizer(), true)?;
+        self.record_transaction(
+            &transaction.id()?,
+            transaction.header.expiration().sec_since_epoch(),
+        )?;
+        Ok(())
+    }
+
     // Initialize for an implicit system transaction such as `onblock`. Unlike an
     // input transaction it carries no signature, is not deduplicated, bills no
     // account, and runs on behalf of the system account with no CPU ceiling —
