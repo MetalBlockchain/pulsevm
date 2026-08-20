@@ -346,6 +346,11 @@ pub fn hydrate_full_state(
                 | PortableRow::AccountMetadata { .. }
                 | PortableRow::Code { .. }
                 | PortableRow::Permission { .. } => {}
+                PortableRow::GeneratedTransaction { .. } => {
+                    return Err(bad(
+                        "generated_transaction reached hydration without scheduling metadata",
+                    ));
+                }
                 PortableRow::ContractTable {
                     code,
                     scope,
@@ -520,6 +525,16 @@ enum PortableRow {
         vm_type: u8,
         vm_version: u8,
     },
+    /// The SHiP v0 projection of a chainbase generated transaction. This is
+    /// deliberately not hydrated yet: SHiP omits the chainbase scheduling
+    /// timestamps required to execute it safely after migration.
+    GeneratedTransaction {
+        sender: u64,
+        sender_id: u128,
+        payer: u64,
+        trx_id: [u8; 32],
+        packed_trx: Vec<u8>,
+    },
     Permission {
         owner: u64,
         name: u64,
@@ -618,6 +633,7 @@ fn decode_portable_rows(entry: &StateHistoryEntry) -> Result<Vec<PortableRow>, X
                 "account" => decode_account(&row.data)?,
                 "account_metadata" => decode_account_metadata(&row.data)?,
                 "code" => decode_code(&row.data)?,
+                "generated_transaction" => decode_generated_transaction(&row.data)?,
                 "permission" => decode_permission(&row.data)?,
                 "contract_table" => decode_contract_table(&row.data)?,
                 "contract_row" => decode_contract_row(&row.data)?,
@@ -639,6 +655,24 @@ fn decode_portable_rows(entry: &StateHistoryEntry) -> Result<Vec<PortableRow>, X
 }
 
 fn validate_code_links(rows: &[PortableRow]) -> Result<(), XprImportError> {
+    if let Some(PortableRow::GeneratedTransaction {
+        sender,
+        sender_id,
+        payer,
+        trx_id,
+        packed_trx,
+    }) = rows
+        .iter()
+        .find(|row| matches!(row, PortableRow::GeneratedTransaction { .. }))
+    {
+        return Err(bad(
+            format!(
+                "generated_transaction {} (sender {sender}, sender_id {sender_id}, payer {payer}, packed bytes {}) cannot be imported from SHiP v0: its row omits delay_until, expiration, and published; use a chainbase-sidecar export before migrating deferred transactions",
+                hex::encode(trx_id),
+                packed_trx.len()
+            ),
+        ));
+    }
     let mut code_keys = HashSet::new();
     for row in rows {
         if let PortableRow::Code {
@@ -668,6 +702,25 @@ fn validate_code_links(rows: &[PortableRow]) -> Result<(), XprImportError> {
         }
     }
     Ok(())
+}
+
+fn decode_generated_transaction(bytes: &[u8]) -> Result<PortableRow, XprImportError> {
+    let mut row = RowCursor::new(bytes);
+    row.version()?;
+    let sender = row.u64()?;
+    let sender_id_lo = row.u64()?;
+    let sender_id_hi = row.u64()?;
+    let payer = row.u64()?;
+    let trx_id = row.fixed::<32>()?;
+    let packed_trx = row.bytes()?;
+    row.finish()?;
+    Ok(PortableRow::GeneratedTransaction {
+        sender,
+        sender_id: (sender_id_lo as u128) | ((sender_id_hi as u128) << 64),
+        payer,
+        trx_id,
+        packed_trx,
+    })
 }
 
 fn code_reference_count(rows: &[PortableRow], hash: [u8; 32], vm_type: u8, vm_version: u8) -> u64 {
@@ -1660,6 +1713,30 @@ mod tests {
         let mut db = Database::new(dir.path().to_str().unwrap(), 64 * 1024 * 1024).unwrap();
 
         assert!(hydrate_full_state(&mut db, &entry).is_err());
+        assert!(!db.is_account(11).unwrap());
+    }
+
+    #[test]
+    fn rejects_ship_generated_transaction_without_mutating_arena() {
+        let mut generated = vec![0]; // generated_transaction_v0
+        generated.extend_from_slice(&11u64.to_le_bytes()); // sender
+        generated.extend_from_slice(&12u64.to_le_bytes()); // sender_id low
+        generated.extend_from_slice(&13u64.to_le_bytes()); // sender_id high
+        generated.extend_from_slice(&14u64.to_le_bytes()); // payer
+        generated.extend_from_slice(&[15; 32]); // transaction id
+        bytes(&mut generated, &[16, 17]); // packed transaction
+        let entry = StateHistoryEntry {
+            magic: 0,
+            block_id: [0; 32],
+            deltas: vec![delta("generated_transaction", generated)],
+        };
+        let dir = TempDir::new().unwrap();
+        let mut db = Database::new(dir.path().to_str().unwrap(), 64 * 1024 * 1024).unwrap();
+
+        let error = hydrate_full_state(&mut db, &entry).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("omits delay_until, expiration, and published"));
         assert!(!db.is_account(11).unwrap());
     }
 
