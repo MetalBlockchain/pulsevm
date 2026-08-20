@@ -3,6 +3,7 @@ mod database;
 mod objects;
 mod pod;
 mod snapshot;
+mod xpr_import;
 
 pub use crate::pod::{
     CpuLimitResult,
@@ -33,6 +34,13 @@ pub use crate::{
         SNAPSHOT_VERSION,
         SnapshotHeader,
         peek_header as peek_snapshot_header,
+    },
+    xpr_import::{
+        StateHistoryEntry,
+        TableDelta,
+        TableDeltaRow,
+        XprImportError,
+        parse_initial_state_history_log,
     },
 };
 // Re-export shared chain value types for the database facade's public API.

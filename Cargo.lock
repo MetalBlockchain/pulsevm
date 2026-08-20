@@ -3385,6 +3385,7 @@ name = "pulsevm_database"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "flate2",
  "hex",
  "libc",
  "proptest",
