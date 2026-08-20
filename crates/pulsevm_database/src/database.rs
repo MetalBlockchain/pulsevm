@@ -1859,6 +1859,23 @@ impl Database {
             .map_err(|e| ChainError::InternalError(format!("XPR import code: {e:?}")))
     }
 
+    pub(crate) fn xpr_import_permission(
+        &self,
+        parent: i64,
+        owner: u64,
+        name: u64,
+        last_updated: i64,
+        authority: &[u8],
+    ) -> Result<i64, ChainError> {
+        let id = self.backend.next_permission_id().map_err(|e| {
+            ChainError::InternalError(format!("XPR import next permission id: {e:?}"))
+        })?;
+        self.backend
+            .create_permission(id, parent, owner, name, last_updated, authority)
+            .map_err(|e| ChainError::InternalError(format!("XPR import permission: {e:?}")))?;
+        Ok(id)
+    }
+
     pub fn initialize_account_resource_limits(
         &mut self,
         account_name: u64,

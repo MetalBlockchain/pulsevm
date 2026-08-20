@@ -7,7 +7,11 @@
 //! table-specific compatibility decisions rather than treating arbitrary source
 //! bytes as an Arena checkpoint.
 
-use std::{collections::HashSet, fmt, io::Read};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    io::Read,
+};
 
 use flate2::read::ZlibDecoder;
 
@@ -56,6 +60,7 @@ pub struct ImportSummary {
     pub accounts: u64,
     pub account_metadata: u64,
     pub code_rows: u64,
+    pub permissions: u64,
     pub contract_tables: u64,
     pub contract_rows: u64,
     pub index64_rows: u64,
@@ -162,11 +167,38 @@ pub fn hydrate_full_state(
                 summary.code_rows += 1;
             }
         }
+        let mut permission_ids = HashMap::new();
+        for row in &rows {
+            if let PortableRow::Permission {
+                owner,
+                name,
+                parent_name,
+                last_updated,
+                authority,
+            } = row
+            {
+                let parent = if *parent_name == 0 {
+                    0
+                } else {
+                    *permission_ids.get(&(*owner, *parent_name)).ok_or_else(|| {
+                        bad(format!(
+                            "permission {name} is ordered before its parent {parent_name}"
+                        ))
+                    })?
+                };
+                let id = db
+                    .xpr_import_permission(parent, *owner, *name, *last_updated, authority)
+                    .map_err(database_error)?;
+                permission_ids.insert((*owner, *name), id);
+                summary.permissions += 1;
+            }
+        }
         for row in rows {
             match row {
                 PortableRow::Account { .. }
                 | PortableRow::AccountMetadata { .. }
-                | PortableRow::Code { .. } => {}
+                | PortableRow::Code { .. }
+                | PortableRow::Permission { .. } => {}
                 PortableRow::ContractTable {
                     code,
                     scope,
@@ -300,6 +332,13 @@ enum PortableRow {
         vm_type: u8,
         vm_version: u8,
     },
+    Permission {
+        owner: u64,
+        name: u64,
+        parent_name: u64,
+        last_updated: i64,
+        authority: Vec<u8>,
+    },
     ContractTable {
         code: u64,
         scope: u64,
@@ -377,6 +416,7 @@ fn decode_portable_rows(entry: &StateHistoryEntry) -> Result<Vec<PortableRow>, X
                 "account" => decode_account(&row.data)?,
                 "account_metadata" => decode_account_metadata(&row.data)?,
                 "code" => decode_code(&row.data)?,
+                "permission" => decode_permission(&row.data)?,
                 "contract_table" => decode_contract_table(&row.data)?,
                 "contract_row" => decode_contract_row(&row.data)?,
                 "contract_index64" => decode_index64(&row.data)?,
@@ -490,6 +530,60 @@ fn decode_code(bytes: &[u8]) -> Result<PortableRow, XprImportError> {
         vm_type,
         vm_version,
     })
+}
+
+fn decode_permission(bytes: &[u8]) -> Result<PortableRow, XprImportError> {
+    let mut row = RowCursor::new(bytes);
+    row.version()?;
+    let owner = row.u64()?;
+    let name = row.u64()?;
+    let parent_name = row.u64()?;
+    let last_updated = row.i64()?;
+    let authority = decode_authority(&mut row)?;
+    row.finish()?;
+    Ok(PortableRow::Permission {
+        owner,
+        name,
+        parent_name,
+        last_updated,
+        authority,
+    })
+}
+
+fn decode_authority(row: &mut RowCursor<'_>) -> Result<Vec<u8>, XprImportError> {
+    let threshold = row.u32()?;
+    let key_count =
+        usize::try_from(row.varuint()?).map_err(|_| bad("authority key count too large"))?;
+    let mut out = Vec::new();
+    out.extend_from_slice(&threshold.to_le_bytes());
+    out.extend_from_slice(&(key_count as u32).to_le_bytes());
+    for _ in 0..key_count {
+        if row.varuint()? != 0 {
+            return Err(bad("XPR authority contains a non-K1 public key"));
+        }
+        let point = row.fixed::<33>()?;
+        let weight = row.u16()?;
+        out.extend_from_slice(&34u32.to_le_bytes());
+        out.push(0);
+        out.extend_from_slice(&point);
+        out.extend_from_slice(&weight.to_le_bytes());
+    }
+    let account_count =
+        usize::try_from(row.varuint()?).map_err(|_| bad("authority account count too large"))?;
+    out.extend_from_slice(&(account_count as u32).to_le_bytes());
+    for _ in 0..account_count {
+        out.extend_from_slice(&row.u64()?.to_le_bytes());
+        out.extend_from_slice(&row.u64()?.to_le_bytes());
+        out.extend_from_slice(&row.u16()?.to_le_bytes());
+    }
+    let wait_count =
+        usize::try_from(row.varuint()?).map_err(|_| bad("authority wait count too large"))?;
+    out.extend_from_slice(&(wait_count as u32).to_le_bytes());
+    for _ in 0..wait_count {
+        out.extend_from_slice(&row.u32()?.to_le_bytes());
+        out.extend_from_slice(&row.u16()?.to_le_bytes());
+    }
+    Ok(out)
 }
 
 fn decode_contract_table(bytes: &[u8]) -> Result<PortableRow, XprImportError> {
@@ -807,6 +901,10 @@ impl<'a> RowCursor<'a> {
         Ok(u32::from_le_bytes(self.fixed()?))
     }
 
+    fn u16(&mut self) -> Result<u16, XprImportError> {
+        Ok(u16::from_le_bytes(self.fixed()?))
+    }
+
     fn u64(&mut self) -> Result<u64, XprImportError> {
         Ok(u64::from_le_bytes(self.fixed()?))
     }
@@ -983,6 +1081,14 @@ mod tests {
         code_row.extend_from_slice(&code_hash);
         bytes(&mut code_row, &[0, 97, 115, 109]);
 
+        let mut permission_row = vec![0];
+        permission_row.extend_from_slice(&account.to_le_bytes());
+        permission_row.extend_from_slice(&111u64.to_le_bytes());
+        permission_row.extend_from_slice(&0u64.to_le_bytes());
+        permission_row.extend_from_slice(&0i64.to_le_bytes());
+        permission_row.extend_from_slice(&0u32.to_le_bytes()); // authority threshold
+        permission_row.extend_from_slice(&[0, 0, 0]); // key/account/wait counts
+
         let mut table_row = vec![0];
         for value in [code, scope, table, payer] {
             table_row.extend_from_slice(&value.to_le_bytes());
@@ -1021,6 +1127,7 @@ mod tests {
                 delta("account", account_row),
                 delta("account_metadata", metadata_row),
                 delta("code", code_row),
+                delta("permission", permission_row),
                 delta("contract_table", table_row),
                 delta("contract_row", kv_row),
                 delta("contract_index64", index64),
@@ -1038,6 +1145,7 @@ mod tests {
         assert_eq!(summary.accounts, 1);
         assert_eq!(summary.account_metadata, 1);
         assert_eq!(summary.code_rows, 1);
+        assert_eq!(summary.permissions, 1);
         assert_eq!(summary.contract_tables, 1);
         assert_eq!(summary.contract_rows, 1);
         assert_eq!(summary.index64_rows, 1);
@@ -1047,6 +1155,7 @@ mod tests {
         assert_eq!(summary.index_long_double_rows, 1);
         assert!(db.is_account(account).unwrap());
         assert_eq!(db.arena_account_metadata_privileged(account), Some(true));
+        assert_eq!(db.arena_permission(account, 111), Some((0, 0)));
         assert_eq!(
             db.get_code_bytes_by_hash(&code_hash, 0, 0).unwrap(),
             vec![0, 97, 115, 109]
