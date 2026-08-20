@@ -1820,6 +1820,45 @@ impl Database {
             })
     }
 
+    /// Create account metadata from the fields XPR's state-history format
+    /// actually exposes. Account/authority sequence numbers are absent from
+    /// that source format and are therefore initialized to zero by the backend.
+    pub(crate) fn xpr_import_account_metadata(
+        &self,
+        name: u64,
+        privileged: bool,
+        last_code_update: i64,
+        code_hash: [u8; 32],
+        vm_type: u8,
+        vm_version: u8,
+    ) -> Result<(), ChainError> {
+        self.backend
+            .xpr_import_account_metadata(
+                name,
+                privileged,
+                last_code_update,
+                code_hash,
+                vm_type,
+                vm_version,
+            )
+            .map_err(|e| ChainError::InternalError(format!("XPR import account metadata {name}: {e:?}")))
+    }
+
+    /// Insert a code image and its derived source reference count while
+    /// hydrating XPR state history.
+    pub(crate) fn xpr_import_code(
+        &self,
+        code_hash: [u8; 32],
+        code: &[u8],
+        code_ref_count: u64,
+        vm_type: u8,
+        vm_version: u8,
+    ) -> Result<(), ChainError> {
+        self.backend
+            .xpr_import_code(code_hash, code, code_ref_count, vm_type, vm_version)
+            .map_err(|e| ChainError::InternalError(format!("XPR import code: {e:?}")))
+    }
+
     pub fn initialize_account_resource_limits(
         &mut self,
         account_name: u64,

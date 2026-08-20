@@ -7,7 +7,7 @@
 //! table-specific compatibility decisions rather than treating arbitrary source
 //! bytes as an Arena checkpoint.
 
-use std::{fmt, io::Read};
+use std::{collections::HashSet, fmt, io::Read};
 
 use flate2::read::ZlibDecoder;
 
@@ -55,6 +55,7 @@ pub struct StateHistoryEntry {
 pub struct ImportSummary {
     pub accounts: u64,
     pub account_metadata: u64,
+    pub code_rows: u64,
     pub contract_tables: u64,
     pub contract_rows: u64,
     pub index64_rows: u64,
@@ -82,40 +83,90 @@ impl std::error::Error for XprImportError {}
 /// run inside an Arena undo session, so a duplicate or storage failure rolls
 /// the target back to its prior state. The function deliberately rejects source
 /// tables whose consensus representation has not yet been ported (permissions,
-/// resource limits, protocol state, generated transactions, and code-bearing
-/// account metadata). Accepting those tables while dropping their state would
-/// create a network that appears bootable but is invalid at its first action.
+/// resource limits, protocol state, and generated transactions). Accepting
+/// those tables while dropping their state would create a network that appears
+/// bootable but is invalid at its first action.
 ///
 /// This is therefore a safe, incremental boundary: it can import accounts
-/// without deployed code and every contract-table/index row, while making the
+/// with deployed code and every contract-table/index row, while making the
 /// remaining full-chain work explicit to the caller.
 pub fn hydrate_full_state(
     db: &mut Database,
     entry: &StateHistoryEntry,
 ) -> Result<ImportSummary, XprImportError> {
     let rows = decode_portable_rows(entry)?;
+    validate_code_links(&rows)?;
     let mut summary = ImportSummary::default();
 
     db.arena_start_undo_session();
     let result = (|| {
-        for row in rows {
+        // The state-history table order happens to be suitable today, but the
+        // importer enforces its own dependency order so an equivalent stream
+        // with tables rearranged cannot create children before their parents.
+        for row in &rows {
             match row {
                 PortableRow::Account {
                     name,
                     creation_date,
                     abi,
                 } => {
-                    db.create_account(name, creation_date)
+                    db.create_account(*name, *creation_date)
                         .map_err(database_error)?;
-                    db.xpr_import_set_account_abi_raw(name, &abi)
+                    db.xpr_import_set_account_abi_raw(*name, abi)
                         .map_err(database_error)?;
                     summary.accounts += 1;
                 }
-                PortableRow::AccountMetadata { name, privileged } => {
-                    db.create_account_metadata(name, privileged)
-                        .map_err(database_error)?;
-                    summary.account_metadata += 1;
-                }
+                _ => {}
+            }
+        }
+        for row in &rows {
+            if let PortableRow::AccountMetadata {
+                name,
+                privileged,
+                last_code_update,
+                code,
+            } = row
+            {
+                let (code_hash, vm_type, vm_version) = code
+                    .as_ref()
+                    .map(|reference| (reference.hash, reference.vm_type, reference.vm_version))
+                    .unwrap_or(([0; 32], 0, 0));
+                db.xpr_import_account_metadata(
+                    *name,
+                    *privileged,
+                    *last_code_update,
+                    code_hash,
+                    vm_type,
+                    vm_version,
+                )
+                .map_err(database_error)?;
+                summary.account_metadata += 1;
+            }
+        }
+        for row in &rows {
+            if let PortableRow::Code {
+                hash,
+                code,
+                vm_type,
+                vm_version,
+            } = row
+            {
+                db.xpr_import_code(
+                    *hash,
+                    code,
+                    code_reference_count(&rows, *hash, *vm_type, *vm_version),
+                    *vm_type,
+                    *vm_version,
+                )
+                .map_err(database_error)?;
+                summary.code_rows += 1;
+            }
+        }
+        for row in rows {
+            match row {
+                PortableRow::Account { .. }
+                | PortableRow::AccountMetadata { .. }
+                | PortableRow::Code { .. } => {}
                 PortableRow::ContractTable {
                     code,
                     scope,
@@ -240,6 +291,14 @@ enum PortableRow {
     AccountMetadata {
         name: u64,
         privileged: bool,
+        last_code_update: i64,
+        code: Option<CodeReference>,
+    },
+    Code {
+        hash: [u8; 32],
+        code: Vec<u8>,
+        vm_type: u8,
+        vm_version: u8,
     },
     ContractTable {
         code: u64,
@@ -297,6 +356,13 @@ enum PortableRow {
     },
 }
 
+#[derive(Clone, Copy)]
+struct CodeReference {
+    hash: [u8; 32],
+    vm_type: u8,
+    vm_version: u8,
+}
+
 fn decode_portable_rows(entry: &StateHistoryEntry) -> Result<Vec<PortableRow>, XprImportError> {
     let mut result = Vec::new();
     for delta in &entry.deltas {
@@ -310,6 +376,7 @@ fn decode_portable_rows(entry: &StateHistoryEntry) -> Result<Vec<PortableRow>, X
             let decoded = match delta.name.as_str() {
                 "account" => decode_account(&row.data)?,
                 "account_metadata" => decode_account_metadata(&row.data)?,
+                "code" => decode_code(&row.data)?,
                 "contract_table" => decode_contract_table(&row.data)?,
                 "contract_row" => decode_contract_row(&row.data)?,
                 "contract_index64" => decode_index64(&row.data)?,
@@ -327,6 +394,48 @@ fn decode_portable_rows(entry: &StateHistoryEntry) -> Result<Vec<PortableRow>, X
         }
     }
     Ok(result)
+}
+
+fn validate_code_links(rows: &[PortableRow]) -> Result<(), XprImportError> {
+    let mut code_keys = HashSet::new();
+    for row in rows {
+        if let PortableRow::Code {
+            hash,
+            vm_type,
+            vm_version,
+            ..
+        } = row
+        {
+            if !code_keys.insert((*hash, *vm_type, *vm_version)) {
+                return Err(bad("duplicate XPR code row"));
+            }
+        }
+    }
+    for row in rows {
+        if let PortableRow::AccountMetadata {
+            name,
+            code: Some(code),
+            ..
+        } = row
+        {
+            if !code_keys.contains(&(code.hash, code.vm_type, code.vm_version)) {
+                return Err(bad(format!(
+                    "account metadata for {name} references code absent from the full-state export"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn code_reference_count(rows: &[PortableRow], hash: [u8; 32], vm_type: u8, vm_version: u8) -> u64 {
+    rows
+        .iter()
+        .filter(|row| {
+            matches!(row, PortableRow::AccountMetadata { code: Some(reference), .. }
+                if reference.hash == hash && reference.vm_type == vm_type && reference.vm_version == vm_version)
+        })
+        .count() as u64
 }
 
 fn decode_account(bytes: &[u8]) -> Result<PortableRow, XprImportError> {
@@ -348,14 +457,39 @@ fn decode_account_metadata(bytes: &[u8]) -> Result<PortableRow, XprImportError> 
     row.version()?;
     let name = row.u64()?;
     let privileged = row.bool()?;
-    let _last_code_update = row.i64()?;
-    if row.bool()? {
-        return Err(bad(
-            "code-bearing account metadata is not supported by the importer yet",
-        ));
-    }
+    let last_code_update = row.i64()?;
+    let code = if row.bool()? {
+        Some(CodeReference {
+            vm_type: row.byte()?,
+            vm_version: row.byte()?,
+            hash: row.fixed()?,
+        })
+    } else {
+        None
+    };
     row.finish()?;
-    Ok(PortableRow::AccountMetadata { name, privileged })
+    Ok(PortableRow::AccountMetadata {
+        name,
+        privileged,
+        last_code_update,
+        code,
+    })
+}
+
+fn decode_code(bytes: &[u8]) -> Result<PortableRow, XprImportError> {
+    let mut row = RowCursor::new(bytes);
+    row.version()?;
+    let vm_type = row.byte()?;
+    let vm_version = row.byte()?;
+    let hash = row.fixed()?;
+    let code = row.bytes()?;
+    row.finish()?;
+    Ok(PortableRow::Code {
+        hash,
+        code,
+        vm_type,
+        vm_version,
+    })
 }
 
 fn decode_contract_table(bytes: &[u8]) -> Result<PortableRow, XprImportError> {
@@ -829,6 +963,7 @@ mod tests {
         let scope = 33u64;
         let table = 44u64;
         let payer = 55u64;
+        let code_hash = [0x5au8; 32];
 
         let mut account_row = vec![0];
         account_row.extend_from_slice(&account.to_le_bytes());
@@ -839,7 +974,14 @@ mod tests {
         metadata_row.extend_from_slice(&account.to_le_bytes());
         metadata_row.push(1); // privileged
         metadata_row.extend_from_slice(&0i64.to_le_bytes());
-        metadata_row.push(0); // no code
+        metadata_row.push(1); // has code
+        metadata_row.push(0); // vm type
+        metadata_row.push(0); // vm version
+        metadata_row.extend_from_slice(&code_hash);
+
+        let mut code_row = vec![0, 0, 0]; // version, vm type, vm version
+        code_row.extend_from_slice(&code_hash);
+        bytes(&mut code_row, &[0, 97, 115, 109]);
 
         let mut table_row = vec![0];
         for value in [code, scope, table, payer] {
@@ -878,6 +1020,7 @@ mod tests {
             deltas: vec![
                 delta("account", account_row),
                 delta("account_metadata", metadata_row),
+                delta("code", code_row),
                 delta("contract_table", table_row),
                 delta("contract_row", kv_row),
                 delta("contract_index64", index64),
@@ -894,6 +1037,7 @@ mod tests {
 
         assert_eq!(summary.accounts, 1);
         assert_eq!(summary.account_metadata, 1);
+        assert_eq!(summary.code_rows, 1);
         assert_eq!(summary.contract_tables, 1);
         assert_eq!(summary.contract_rows, 1);
         assert_eq!(summary.index64_rows, 1);
@@ -903,6 +1047,10 @@ mod tests {
         assert_eq!(summary.index_long_double_rows, 1);
         assert!(db.is_account(account).unwrap());
         assert_eq!(db.arena_account_metadata_privileged(account), Some(true));
+        assert_eq!(
+            db.get_code_bytes_by_hash(&code_hash, 0, 0).unwrap(),
+            vec![0, 97, 115, 109]
+        );
         assert_eq!(db.arena_kv_get(code, scope, table, 66), Some(vec![1, 2, 3]));
         assert_eq!(db.arena_idx64_payer(code, scope, table, 67), Some(payer));
         assert_eq!(db.arena_idx128_payer(code, scope, table, 68), Some(payer));

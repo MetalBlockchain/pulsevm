@@ -1321,6 +1321,30 @@ impl ChainDatabase {
         Ok(())
     }
 
+    /// Insert the complete subset of `account_metadata_object` that XPR's
+    /// state-history serializer exposes. Sequence fields are intentionally left
+    /// at zero: SHiP does not serialize them, so inventing values would be less
+    /// correct than preserving the observable fields exactly.
+    pub fn xpr_import_account_metadata(
+        &self,
+        name: u64,
+        privileged: bool,
+        last_code_update: i64,
+        code_hash: [u8; 32],
+        vm_type: u8,
+        vm_version: u8,
+    ) -> Result<(), DbError> {
+        self.lock().create::<AccountMetaRow>(|row| {
+            row.name = name;
+            row.flags = privileged as u32;
+            row.last_code_update = last_code_update;
+            row.code_hash = code_hash;
+            row.vm_type = vm_type;
+            row.vm_version = vm_version;
+        })?;
+        Ok(())
+    }
+
     /// Whether the database holds an account_metadata row for `name`, and its
     /// privileged flag — for diffing against chainbase.
     pub fn account_metadata_privileged(&self, name: u64) -> Option<bool> {
@@ -2856,6 +2880,29 @@ impl ChainDatabase {
                 })?;
             }
         }
+        Ok(())
+    }
+
+    /// Insert a code object from XPR state history. `first_block_used` is not
+    /// included in SHiP's `code` row; zero is a sentinel that preserves runtime
+    /// execution while making that unavailable bookkeeping explicit.
+    pub fn xpr_import_code(
+        &self,
+        code_hash: [u8; 32],
+        code: &[u8],
+        code_ref_count: u64,
+        vm_type: u8,
+        vm_version: u8,
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let blob = db.alloc_blob::<CodeRow>(code)?;
+        db.create::<CodeRow>(|row| {
+            row.code_hash = code_hash;
+            row.code = blob;
+            row.code_ref_count = code_ref_count;
+            row.vm_type = vm_type;
+            row.vm_version = vm_version;
+        })?;
         Ok(())
     }
 
