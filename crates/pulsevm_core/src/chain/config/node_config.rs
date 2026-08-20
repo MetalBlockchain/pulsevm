@@ -12,6 +12,11 @@ pub struct NodeConfig {
     // Size of the memory mapped database in bytes
     #[serde(default = "default_db_size")]
     pub db_size: u64,
+    /// Optional Pulse Arena snapshot produced by the XPR migration tool. When
+    /// supplied, it is restored before controller startup and normal Arena
+    /// genesis authoring is skipped.
+    #[serde(default)]
+    pub migration_checkpoint: Option<String>,
     // Wall-clock ceiling on how long a single transaction may spend executing
     // before it is abandoned, in milliseconds. This is a SUBJECTIVE, node-local
     // guard (it depends on this machine's speed, not the transaction's result), so

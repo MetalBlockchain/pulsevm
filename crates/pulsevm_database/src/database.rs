@@ -1370,7 +1370,11 @@ impl Database {
     /// reflects whatever is committed to the arena at that instant.
     pub fn snapshot_bytes(&self) -> Result<Vec<u8>, ChainError> {
         let revision = self.backend.revision();
-        let file = Path::new(&self.path).join(SHARED_MEMORY_FILE);
+        let dir = Path::new(&self.path);
+        fs::create_dir_all(dir).map_err(|e| {
+            ChainError::InternalError(format!("snapshot: create {}: {e}", dir.display()))
+        })?;
+        let file = dir.join(SHARED_MEMORY_FILE);
         self.backend
             .checkpoint(&file)
             .map_err(|e| ChainError::InternalError(format!("snapshot: checkpoint: {e:?}")))?;

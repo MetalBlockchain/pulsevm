@@ -6,6 +6,7 @@ use std::{
         HashSet,
         VecDeque,
     },
+    fs,
     sync::LazyLock,
 };
 
@@ -325,6 +326,28 @@ impl Controller {
         self.db = Database::new(&db_path, self.node_config.as_ref().unwrap().db_size)
             .map_err(|e| ChainError::InternalError(format!("failed to open database: {}", e)))?;
         self.db.add_indices()?;
+        if let Some(checkpoint) = self
+            .node_config
+            .as_ref()
+            .and_then(|config| config.migration_checkpoint.as_ref())
+        {
+            let checkpoint_bytes = fs::read(checkpoint).map_err(|e| {
+                ChainError::GenesisError(format!(
+                    "failed to read migration checkpoint {checkpoint}: {e}"
+                ))
+            })?;
+            let header = self.db.restore_from_bytes(&checkpoint_bytes).map_err(|e| {
+                ChainError::GenesisError(format!(
+                    "failed to restore migration checkpoint {checkpoint}: {e}"
+                ))
+            })?;
+            if header.revision <= 0 {
+                return Err(ChainError::GenesisError(
+                    "migration checkpoint must carry a positive revision".into(),
+                ));
+            }
+            info!("restored migration Arena checkpoint {} at revision {}", checkpoint, header.revision);
+        }
 
         // Pure-Rust view of the genesis: the arena is authored directly from this,
         // and the schedule/timestamp below are read from it, so the initial state
@@ -1934,6 +1957,7 @@ mod tests {
 
     use pulsevm_database::{
         Authority,
+        Database,
         KeyWeight,
         TimePointSec,
     };
@@ -4825,6 +4849,59 @@ mod tests {
         assert!(restarted.database().arena_account_exists(pulse));
         eprintln!("synced node restarted cleanly at height {height}");
 
+        Ok(())
+    }
+
+    #[test]
+    fn initialize_restores_migration_checkpoint_without_reauthoring_genesis(
+    ) -> Result<(), ChainError> {
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
+        let private_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let temp = get_temp_dir();
+        let checkpoint_dir = temp.path().join("checkpoint-source");
+        let checkpoint_path = temp.path().join("migration.snapshot");
+        let mut checkpoint_db = Database::new(
+            checkpoint_dir.to_str().unwrap(),
+            1024 * 1024,
+        )
+        .map_err(ChainError::InternalError)?;
+        checkpoint_db.add_indices()?;
+        let migrated = Name::from_str("migrated")?;
+        checkpoint_db.create_account(migrated.as_u64(), 42)?;
+        checkpoint_db.set_revision(1)?;
+        fs::write(&checkpoint_path, checkpoint_db.snapshot_bytes()?).map_err(|e| {
+            ChainError::InternalError(format!(
+                "failed to write migration checkpoint {}: {e}",
+                checkpoint_path.display()
+            ))
+        })?;
+
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": private_key.to_string(),
+            "migration_checkpoint": checkpoint_path,
+        })
+        .to_string()
+        .into_bytes();
+        let target_path = temp.path().join("target");
+        let mut controller = Controller::new();
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &generate_genesis(&private_key).to_vec(),
+            target_path.to_str().unwrap(),
+        )?;
+
+        assert_eq!(controller.database().revision(), 1);
+        assert!(controller.database().arena_account_exists(migrated.as_u64()));
+        assert!(
+            !controller.database().arena_account_exists(PULSE_NAME.as_u64()),
+            "normal genesis state must not overwrite a migration checkpoint"
+        );
+        controller.shutdown()?;
         Ok(())
     }
 

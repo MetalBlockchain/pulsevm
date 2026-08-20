@@ -3,7 +3,7 @@ use std::{env, fs, process::ExitCode};
 use pulsevm_database::{hydrate_full_state, parse_initial_state_history_log, Database};
 
 fn usage() {
-    eprintln!("Usage: xpr_import_check <chain_state_history.log> <arena-directory>");
+    eprintln!("Usage: xpr_import_check <chain_state_history.log> <arena-directory> [checkpoint-file]");
 }
 
 fn main() -> ExitCode {
@@ -17,6 +17,7 @@ fn main() -> ExitCode {
         usage();
         return ExitCode::from(2);
     };
+    let checkpoint_path = args.next();
     if args.next().is_some() {
         usage();
         return ExitCode::from(2);
@@ -59,6 +60,27 @@ fn main() -> ExitCode {
 
     match hydrate_full_state(&mut database, &entry) {
         Ok(summary) => {
+            if let Some(checkpoint_path) = checkpoint_path {
+                if let Err(error) = database.set_revision(1) {
+                    eprintln!("cannot set migration checkpoint revision: {error}");
+                    return ExitCode::from(1);
+                }
+                let checkpoint = match database.snapshot_bytes() {
+                    Ok(checkpoint) => checkpoint,
+                    Err(error) => {
+                        eprintln!("cannot serialize migration checkpoint: {error}");
+                        return ExitCode::from(1);
+                    }
+                };
+                if let Err(error) = fs::write(&checkpoint_path, checkpoint) {
+                    eprintln!(
+                        "cannot write migration checkpoint {}: {error}",
+                        checkpoint_path.to_string_lossy()
+                    );
+                    return ExitCode::from(1);
+                }
+                println!("wrote migration checkpoint: {}", checkpoint_path.to_string_lossy());
+            }
             println!("XPR state imported successfully: {summary:?}");
             ExitCode::SUCCESS
         }
