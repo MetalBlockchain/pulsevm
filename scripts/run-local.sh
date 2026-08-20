@@ -23,7 +23,15 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VM_ID="rXcAFxZvio99epp6TzEwYfexCfPAbJuBTMsjUUoiT7PkVykNs"
 BUILD_DIR="$REPO/build"
 NETWORK_RUNNER="${METAL_NETWORK_RUNNER_PATH:-$REPO/../metal-network-runner/bin/metal-network-runner}"
+RUNNER_PORT="${METAL_NETWORK_RUNNER_PORT:-:8080}"
+RUNNER_GATEWAY_PORT="${METAL_NETWORK_RUNNER_GATEWAY_PORT:-:8081}"
+RUNNER_ROOT_DATA_DIR="${METAL_NETWORK_RUNNER_ROOT_DATA_DIR:-}"
 MIGRATION_GENESIS=""
+RUNNER_START_ARGS=()
+
+if [[ -n "$RUNNER_ROOT_DATA_DIR" ]]; then
+  RUNNER_START_ARGS+=(--root-data-dir "$RUNNER_ROOT_DATA_DIR")
+fi
 
 if [[ -z "${METALGO_EXEC_PATH:-}" || ! -x "${METALGO_EXEC_PATH:-}" ]]; then
   echo "error: set METALGO_EXEC_PATH to a metalgo binary (rpcchainvm protocol 43)." >&2
@@ -86,17 +94,18 @@ if [[ -n "${PULSEVM_MIGRATION_CHECKPOINT:-}" ]]; then
 fi
 
 echo "==> Starting metal-network-runner server (background)"
-"$NETWORK_RUNNER" server --log-level info --port=":8080" --grpc-gateway-port=":8081" &
+"$NETWORK_RUNNER" server --log-level info --port="$RUNNER_PORT" --grpc-gateway-port="$RUNNER_GATEWAY_PORT" &
 ANR_PID=$!
 trap 'rm -f -- "$MIGRATION_GENESIS"; kill $ANR_PID 2>/dev/null || true' EXIT
 sleep 3
 
 echo "==> Launching a 5-node cluster running PulseVM"
 "$NETWORK_RUNNER" control start --log-level info \
-  --endpoint="0.0.0.0:8080" \
+  --endpoint="0.0.0.0$RUNNER_PORT" \
   --number-of-nodes=5 \
   --metalgo-path "$METALGO_EXEC_PATH" \
   --plugin-dir "$BUILD_DIR" \
+  "${RUNNER_START_ARGS[@]}" \
   --blockchain-specs "$BLOCKCHAIN_SPECS"
 
 echo
