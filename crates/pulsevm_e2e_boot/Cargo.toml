@@ -12,6 +12,10 @@ edition = "2024"
 name = "pulsevm-e2e-boot"
 path = "src/main.rs"
 
+[[bin]]
+name = "pulsevm-e2e-admission-soak"
+path = "src/admission_soak.rs"
+
 [dependencies]
 anyhow = "1.0.98"
 serde_json = "1.0"

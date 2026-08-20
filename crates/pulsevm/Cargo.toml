@@ -32,4 +32,9 @@ pulsevm_proc_macros = { path = "../pulsevm_proc_macros" }
 pulsevm_serialization = { path = "../pulsevm_serialization" }
 
 [dev-dependencies]
+criterion = { version = "0.5", features = ["async_tokio"] }
 tempfile = "3"
+
+[[bench]]
+name = "admission_contention"
+harness = false

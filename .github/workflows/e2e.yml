@@ -48,7 +48,7 @@ jobs:
             target
           key: ${{ runner.os }}-amd64-e2e-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build PulseVM plugin and boot fixture
+      - name: Build PulseVM plugin and E2E fixtures
         env:
           LLVM_SYS_221_PREFIX: /usr/lib/llvm-22
         run: cargo build -p pulsevm -p pulsevm_e2e_boot --locked

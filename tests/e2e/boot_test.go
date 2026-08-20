@@ -3,6 +3,7 @@ package e2e
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,6 +18,7 @@ import (
 // already exist there; reimplementing them in Go would put correctness risk in
 // the test harness itself.
 const bootBinary = "pulsevm-e2e-boot"
+const admissionSoakBinary = "pulsevm-e2e-admission-soak"
 
 // bootStep is one entry of the helper's JSON report.
 type bootStep struct {
@@ -37,27 +39,40 @@ type bootReport struct {
 
 // BootBinaryPath locates the compiled fixture, preferring a release build.
 func BootBinaryPath() (string, error) {
+	return fixtureBinaryPath(bootBinary)
+}
+
+// AdmissionSoakBinaryPath locates the fixture that stresses concurrent
+// transaction admission against a real tmpnet.
+func AdmissionSoakBinaryPath() (string, error) {
+	return fixtureBinaryPath(admissionSoakBinary)
+}
+
+func fixtureBinaryPath(binary string) (string, error) {
 	root, err := RepoRoot()
 	if err != nil {
 		return "", err
 	}
 	for _, profile := range []string{"release", "debug"} {
-		path := filepath.Join(root, "target", profile, bootBinary)
+		path := filepath.Join(root, "target", profile, binary)
 		if _, err := os.Stat(path); err == nil {
 			return path, nil
 		}
 	}
-	return "", errBootBinaryMissing(root)
+	return "", errFixtureBinaryMissing(root, binary)
 }
 
-func errBootBinaryMissing(root string) error {
-	return &bootBinaryError{root: root}
+func errFixtureBinaryMissing(root, binary string) error {
+	return &bootBinaryError{root: root, binary: binary}
 }
 
-type bootBinaryError struct{ root string }
+type bootBinaryError struct {
+	root   string
+	binary string
+}
 
 func (e *bootBinaryError) Error() string {
-	return "boot fixture not built: run `cargo build -p pulsevm_e2e_boot` in " + e.root
+	return e.binary + " fixture not built: run `cargo build -p pulsevm_e2e_boot` in " + e.root
 }
 
 // ProducerKey returns the private key declared in chain_config.json. The chain
@@ -86,7 +101,7 @@ func ProducerKey() (string, error) {
 	return "", errNoProducerKey
 }
 
-var errNoProducerKey = &bootBinaryError{root: "chain_config.json declares no producer_key"}
+var errNoProducerKey = errors.New("chain_config.json declares no producer_key")
 
 // TestBootSequenceAndTransfer runs the chain's boot sequence end to end:
 // accounts are created, the token contract is deployed, a token is created and
