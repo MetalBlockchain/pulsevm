@@ -4022,6 +4022,99 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn failed_deferred_transaction_retires_after_onerror_hard_failure(
+    ) -> Result<(), ChainError> {
+        fn install_failing_onerror_handler(
+            controller: &mut Controller,
+            private_key: &PrivateKey,
+            chain_id: Id,
+        ) -> Result<(), ChainError> {
+            // Permit only the native setcode action used to install this Wasm.
+            // The deferred `fail` action and its eosio::onerror callback both
+            // deterministically assert, exercising the hard-failure path.
+            let wasm = wat::parse_str(&format!(
+                r#"
+                (module
+                  (import "env" "eosio_assert" (func $assert (param i32 i32)))
+                  (memory (export "memory") 1)
+                  (data (i32.const 8) "deferred failure\00")
+                  (func (export "apply") (param i64 i64 i64)
+                    (block $handled
+                      (br_if $handled
+                        (i64.eq (local.get 2) (i64.const {})))
+                      (call $assert (i32.const 0) (i32.const 8)))))
+                "#,
+                SETCODE_NAME.as_u64() as i64,
+            ))
+            .map_err(|error| ChainError::InternalError(format!("compile hard-fail test wasm: {error}")))?;
+            let timestamp = controller.last_accepted_block().timestamp().clone();
+            controller.execute_transaction(
+                &create_account(private_key, Name::from_str("eosio")?, chain_id)?,
+                &timestamp,
+                &BlockStatus::Building,
+            )?;
+            controller.execute_transaction(
+                &set_code(private_key, PULSE_NAME, wasm, chain_id)?,
+                &timestamp,
+                &BlockStatus::Building,
+            )?;
+            Ok(())
+        }
+
+        let (mut producer, private_key, chain_id, _producer_temp) = init_test_controller()?;
+        install_failing_onerror_handler(&mut producer, &private_key, chain_id)?;
+        let scheduled = call_contract(
+            &private_key,
+            PULSE_NAME,
+            Name::from_str("fail")?,
+            &Vec::<u8>::new(),
+            chain_id,
+        )?;
+        let trx_id: [u8; 32] = scheduled.id().as_bytes().try_into().unwrap();
+        producer.db.xpr_import_deferred_transaction(
+            PULSE_NAME.as_u64(),
+            7,
+            PULSE_NAME.as_u64(),
+            trx_id,
+            0,
+            i64::MAX,
+            0,
+            scheduled.packed_trx_bytes(),
+        )?;
+
+        let mut producer_mempool = Mempool::new();
+        let block = producer.build_block(&mut producer_mempool).await?;
+        assert_eq!(block.transactions.len(), 1);
+        assert!(block.transactions[0].packed_trx().is_none());
+        assert_eq!(block.transactions[0].transaction_id(), scheduled.id());
+        assert_eq!(
+            block.transactions[0].status(),
+            &crate::chain::transaction::TransactionStatus::HardFail
+        );
+        assert_eq!(producer.db.deferred_transaction_count(), 0);
+
+        let (mut validator, _validator_key, validator_chain_id, _validator_temp) =
+            init_test_controller()?;
+        install_failing_onerror_handler(&mut validator, &private_key, validator_chain_id)?;
+        validator.db.xpr_import_deferred_transaction(
+            PULSE_NAME.as_u64(),
+            7,
+            PULSE_NAME.as_u64(),
+            trx_id,
+            0,
+            i64::MAX,
+            0,
+            scheduled.packed_trx_bytes(),
+        )?;
+        let mut validator_mempool = Mempool::new();
+        validator.verify_block(&block, &mut validator_mempool).await?;
+        validator.accept_block(&block.id()?, &mut validator_mempool)?;
+        assert_eq!(validator.db.deferred_transaction_count(), 0);
+
+        Ok(())
+    }
+
     // Bit-for-bit block-id parity across serialization and re-execution. A
     // producer builds a real chain — onblock runs at the head of every block,
     // plus an account-creating transaction — and each block is round-tripped
