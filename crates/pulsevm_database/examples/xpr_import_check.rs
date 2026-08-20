@@ -1,6 +1,11 @@
 use std::{env, fs, process::ExitCode};
 
-use pulsevm_database::{hydrate_full_state, parse_initial_state_history_log, Database};
+use pulsevm_database::{
+    Database,
+    MigrationManifest,
+    hydrate_full_state,
+    parse_initial_state_history_log,
+};
 
 fn usage() {
     eprintln!("Usage: xpr_import_check <chain_state_history.log> <arena-directory> [checkpoint-file]");
@@ -72,14 +77,34 @@ fn main() -> ExitCode {
                         return ExitCode::from(1);
                     }
                 };
-                if let Err(error) = fs::write(&checkpoint_path, checkpoint) {
+                if let Err(error) = fs::write(&checkpoint_path, &checkpoint) {
                     eprintln!(
                         "cannot write migration checkpoint {}: {error}",
                         checkpoint_path.to_string_lossy()
                     );
                     return ExitCode::from(1);
                 }
+                let manifest_path = format!("{}.manifest.json", checkpoint_path.to_string_lossy());
+                let manifest = MigrationManifest::new(
+                    &log,
+                    entry.block_id,
+                    &checkpoint,
+                    database.revision(),
+                    summary,
+                );
+                let manifest = match serde_json::to_vec_pretty(&manifest) {
+                    Ok(manifest) => manifest,
+                    Err(error) => {
+                        eprintln!("cannot serialize migration manifest: {error}");
+                        return ExitCode::from(1);
+                    }
+                };
+                if let Err(error) = fs::write(&manifest_path, manifest) {
+                    eprintln!("cannot write migration manifest {manifest_path}: {error}");
+                    return ExitCode::from(1);
+                }
                 println!("wrote migration checkpoint: {}", checkpoint_path.to_string_lossy());
+                println!("wrote migration manifest: {manifest_path}");
             }
             println!("XPR state imported successfully: {summary:?}");
             ExitCode::SUCCESS

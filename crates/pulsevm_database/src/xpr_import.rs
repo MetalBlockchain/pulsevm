@@ -14,6 +14,8 @@ use std::{
 };
 
 use flate2::read::ZlibDecoder;
+use pulsevm_crypto::Digest;
+use serde::{Deserialize, Serialize};
 
 use crate::{ChainConfigV0, Database, Float128, U256};
 
@@ -56,7 +58,7 @@ pub struct StateHistoryEntry {
 }
 
 /// Counts of the portable rows committed by [`hydrate_full_state`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImportSummary {
     pub global_properties: u64,
     pub accounts: u64,
@@ -75,6 +77,72 @@ pub struct ImportSummary {
     pub index256_rows: u64,
     pub index_double_rows: u64,
     pub index_long_double_rows: u64,
+}
+
+/// A durable, human-inspectable commitment to one XPR-to-Arena conversion.
+///
+/// The arena checkpoint envelope protects its payload, while this manifest
+/// protects the complete envelope and ties it to the exact state-history input
+/// from which it was created. Nodes require it at migration startup so a path
+/// alone can never silently select a different checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrationManifest {
+    pub version: u16,
+    pub source_state_history_sha256: String,
+    pub source_block_id: String,
+    pub checkpoint_sha256: String,
+    pub checkpoint_revision: i64,
+    pub import_summary: ImportSummary,
+}
+
+impl MigrationManifest {
+    pub const VERSION: u16 = 1;
+
+    pub fn new(
+        source_state_history: &[u8],
+        source_block_id: [u8; 32],
+        checkpoint: &[u8],
+        checkpoint_revision: i64,
+        import_summary: ImportSummary,
+    ) -> Self {
+        Self {
+            version: Self::VERSION,
+            source_state_history_sha256: hex::encode(Digest::hash(source_state_history).as_bytes()),
+            source_block_id: hex::encode(source_block_id),
+            checkpoint_sha256: hex::encode(Digest::hash(checkpoint).as_bytes()),
+            checkpoint_revision,
+            import_summary,
+        }
+    }
+
+    /// Verify that `checkpoint` is precisely the artifact this manifest
+    /// describes. The checkpoint envelope itself is checked by restore; this
+    /// method establishes its migration provenance before restore begins.
+    pub fn verify_checkpoint(&self, checkpoint: &[u8]) -> Result<(), String> {
+        if self.version != Self::VERSION {
+            return Err(format!(
+                "unsupported migration manifest version {} (expected {})",
+                self.version,
+                Self::VERSION
+            ));
+        }
+        let actual = hex::encode(Digest::hash(checkpoint).as_bytes());
+        if actual != self.checkpoint_sha256 {
+            return Err(format!(
+                "checkpoint SHA-256 {actual} does not match manifest {}",
+                self.checkpoint_sha256
+            ));
+        }
+        let header = crate::snapshot::peek_header(checkpoint)
+            .map_err(|error| format!("invalid checkpoint envelope: {error}"))?;
+        if header.revision != self.checkpoint_revision {
+            return Err(format!(
+                "checkpoint revision {} does not match manifest {}",
+                header.revision, self.checkpoint_revision
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// A malformed or unsupported XPR state-history input.
@@ -1593,6 +1661,26 @@ mod tests {
 
         assert!(hydrate_full_state(&mut db, &entry).is_err());
         assert!(!db.is_account(11).unwrap());
+    }
+
+    #[test]
+    fn migration_manifest_rejects_a_different_checkpoint() {
+        let checkpoint = crate::snapshot::encode(7, b"first checkpoint");
+        let manifest = MigrationManifest::new(
+            b"source state history",
+            [9; 32],
+            &checkpoint,
+            7,
+            ImportSummary {
+                accounts: 3,
+                ..Default::default()
+            },
+        );
+        assert!(manifest.verify_checkpoint(&checkpoint).is_ok());
+        assert!(manifest
+            .verify_checkpoint(&crate::snapshot::encode(7, b"other checkpoint"))
+            .unwrap_err()
+            .contains("does not match manifest"));
     }
 
     fn delta(name: &str, data: Vec<u8>) -> TableDelta {

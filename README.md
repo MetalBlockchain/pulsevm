@@ -78,8 +78,8 @@ PULSEVM_MIGRATION_CHECKPOINT=/tmp/pulsevm-xpr-migration.snapshot \
 scripts/run-local.sh
 ```
 
-The harness passes `migration_checkpoint` through the runner's per-chain VM
-configuration. Every node restores the same Arena checkpoint before its normal
-genesis authoring path. This proves the local conversion and five-node boot
-path; Mainnet migration still requires a validated Mainnet export plus the
-remaining migration-base-block and system-contract policy work.
+The harness passes `migration_checkpoint` and its emitted manifest through the
+runner's per-chain VM configuration. Every node verifies the manifest hash and
+revision before restoring the Arena checkpoint. This proves the local conversion
+and five-node boot path; Mainnet migration still requires a validated Mainnet
+export plus the remaining migration-base-block and system-contract policy work.

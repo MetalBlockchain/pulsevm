@@ -37,6 +37,7 @@ pub use crate::{
     },
     xpr_import::{
         ImportSummary,
+        MigrationManifest,
         StateHistoryEntry,
         TableDelta,
         TableDeltaRow,

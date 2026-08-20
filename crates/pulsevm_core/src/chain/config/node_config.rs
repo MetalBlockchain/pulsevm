@@ -17,6 +17,10 @@ pub struct NodeConfig {
     /// genesis authoring is skipped.
     #[serde(default)]
     pub migration_checkpoint: Option<String>,
+    /// Manifest emitted beside `migration_checkpoint`. It binds the checkpoint
+    /// bytes and revision to the source state-history export.
+    #[serde(default)]
+    pub migration_manifest: Option<String>,
     // Wall-clock ceiling on how long a single transaction may spend executing
     // before it is abandoned, in milliseconds. This is a SUBJECTIVE, node-local
     // guard (it depends on this machine's speed, not the transaction's result), so

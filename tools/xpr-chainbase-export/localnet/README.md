@@ -28,8 +28,10 @@ export work directory must be below `/tmp`. Stop the source fixture when done:
 tools/xpr-chainbase-export/localnet/run.sh stop
 ```
 
-The optional final importer argument emits an Arena migration checkpoint. Start
-the five-node Pulse harness with that file:
+The optional final importer argument emits an Arena migration checkpoint and a
+same-named `.manifest.json` file that commits to its bytes, revision, source
+block ID, and source state-history log. Start the five-node Pulse harness with
+that checkpoint:
 
 ```bash
 METALGO_EXEC_PATH=../metalgo/build/metalgo \

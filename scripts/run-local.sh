@@ -54,6 +54,11 @@ if [[ -n "${PULSEVM_MIGRATION_CHECKPOINT:-}" ]]; then
     echo "error: PULSEVM_MIGRATION_CHECKPOINT does not exist: $PULSEVM_MIGRATION_CHECKPOINT" >&2
     exit 1
   fi
+  MIGRATION_MANIFEST="${PULSEVM_MIGRATION_MANIFEST:-${PULSEVM_MIGRATION_CHECKPOINT}.manifest.json}"
+  if [[ ! -f "$MIGRATION_MANIFEST" ]]; then
+    echo "error: migration manifest does not exist: $MIGRATION_MANIFEST" >&2
+    exit 1
+  fi
   if ! command -v jq >/dev/null 2>&1; then
     echo "error: jq is required to pass a migration checkpoint to the runner." >&2
     exit 1
@@ -63,8 +68,9 @@ if [[ -n "${PULSEVM_MIGRATION_CHECKPOINT:-}" ]]; then
   PRODUCER_KEY="${PULSEVM_PRODUCER_KEY:-PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez}"
   CHAIN_CONFIG="$(jq -cn \
     --arg checkpoint "$PULSEVM_MIGRATION_CHECKPOINT" \
+    --arg manifest "$MIGRATION_MANIFEST" \
     --arg producer_key "$PRODUCER_KEY" \
-    '{producer_name: "pulse", producer_key: $producer_key, migration_checkpoint: $checkpoint}')"
+    '{producer_name: "pulse", producer_key: $producer_key, migration_checkpoint: $checkpoint, migration_manifest: $manifest}')"
   BLOCKCHAIN_SPECS="$(jq -cn \
     --arg genesis "$REPO/genesis.json" \
     --arg chain_config "$CHAIN_CONFIG" \

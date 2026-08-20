@@ -91,6 +91,7 @@ use pulsevm_database::{
     Database,
     ElasticLimitParameters,
     Microseconds,
+    MigrationManifest,
     PermissionLevelWeight,
     TimePoint,
     seconds,
@@ -326,14 +327,33 @@ impl Controller {
         self.db = Database::new(&db_path, self.node_config.as_ref().unwrap().db_size)
             .map_err(|e| ChainError::InternalError(format!("failed to open database: {}", e)))?;
         self.db.add_indices()?;
-        if let Some(checkpoint) = self
+        let migration_checkpoint = self
             .node_config
             .as_ref()
-            .and_then(|config| config.migration_checkpoint.as_ref())
-        {
+            .and_then(|config| config.migration_checkpoint.as_ref());
+        let migration_manifest = self
+            .node_config
+            .as_ref()
+            .and_then(|config| config.migration_manifest.as_ref());
+        if let (Some(checkpoint), Some(manifest_path)) = (migration_checkpoint, migration_manifest) {
             let checkpoint_bytes = fs::read(checkpoint).map_err(|e| {
                 ChainError::GenesisError(format!(
                     "failed to read migration checkpoint {checkpoint}: {e}"
+                ))
+            })?;
+            let manifest_bytes = fs::read(manifest_path).map_err(|e| {
+                ChainError::GenesisError(format!(
+                    "failed to read migration manifest {manifest_path}: {e}"
+                ))
+            })?;
+            let manifest: MigrationManifest = serde_json::from_slice(&manifest_bytes).map_err(|e| {
+                ChainError::GenesisError(format!(
+                    "failed to parse migration manifest {manifest_path}: {e}"
+                ))
+            })?;
+            manifest.verify_checkpoint(&checkpoint_bytes).map_err(|e| {
+                ChainError::GenesisError(format!(
+                    "migration manifest {manifest_path} rejected checkpoint {checkpoint}: {e}"
                 ))
             })?;
             let header = self.db.restore_from_bytes(&checkpoint_bytes).map_err(|e| {
@@ -346,7 +366,16 @@ impl Controller {
                     "migration checkpoint must carry a positive revision".into(),
                 ));
             }
-            info!("restored migration Arena checkpoint {} at revision {}", checkpoint, header.revision);
+            info!(
+                "restored migration Arena checkpoint {} at revision {} from manifest {}",
+                checkpoint,
+                header.revision,
+                manifest_path
+            );
+        } else if migration_checkpoint.is_some() || migration_manifest.is_some() {
+            return Err(ChainError::GenesisError(
+                "migration_checkpoint and migration_manifest must be configured together".into(),
+            ));
         }
 
         // Pure-Rust view of the genesis: the arena is authored directly from this,
@@ -1959,6 +1988,7 @@ mod tests {
         Authority,
         Database,
         KeyWeight,
+        MigrationManifest,
         TimePointSec,
     };
     use pulsevm_proc_macros::{
@@ -4872,10 +4902,25 @@ mod tests {
         let migrated = Name::from_str("migrated")?;
         checkpoint_db.create_account(migrated.as_u64(), 42)?;
         checkpoint_db.set_revision(1)?;
-        fs::write(&checkpoint_path, checkpoint_db.snapshot_bytes()?).map_err(|e| {
+        let checkpoint = checkpoint_db.snapshot_bytes()?;
+        fs::write(&checkpoint_path, &checkpoint).map_err(|e| {
             ChainError::InternalError(format!(
                 "failed to write migration checkpoint {}: {e}",
                 checkpoint_path.display()
+            ))
+        })?;
+        let manifest_path = temp.path().join("migration.manifest.json");
+        let manifest = MigrationManifest::new(
+            b"controller migration test source",
+            [7; 32],
+            &checkpoint,
+            1,
+            Default::default(),
+        );
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).map_err(|e| {
+            ChainError::InternalError(format!(
+                "failed to write migration manifest {}: {e}",
+                manifest_path.display()
             ))
         })?;
 
@@ -4883,6 +4928,7 @@ mod tests {
             "producer_name": "pulse",
             "producer_key": private_key.to_string(),
             "migration_checkpoint": checkpoint_path,
+            "migration_manifest": manifest_path,
         })
         .to_string()
         .into_bytes();
