@@ -295,4 +295,21 @@ mod tests {
         let out = maybe_decompress(TransactionCompression::Zlib, &zlib_compress(&payload)).unwrap();
         assert_eq!(out, payload);
     }
+
+    #[test]
+    fn decodes_raw_transaction_emitted_by_leap_5() {
+        // Captured with Leap/XPR-compatible nodeos 5.0.3 using:
+        // `cleos create account ... --dont-broadcast --return-packed -j`.
+        // A generated_transaction_object stores precisely this `packed_trx`
+        // member (without the outer signatures/compression framing).
+        let raw = hex::decode(
+            "2302876a8e1f127516c500000000010000000000ea305500409e9a2264b89a010000000000ea305500000000a8ed3232660000000000ea3055901132ead05bb9b901000000010002c0ded2bc1f1305fb0faac5e6c03ee3a1924234985427b6167ca569d13df435cf0100000001000000010002c0ded2bc1f1305fb0faac5e6c03ee3a1924234985427b6167ca569d13df435cf0100000000",
+        )
+        .unwrap();
+        let transaction =
+            PackedTransaction::from_deferred_transaction_bytes(raw.clone().into()).unwrap();
+        assert_eq!(transaction.get_transaction().actions.len(), 1);
+        assert_eq!(transaction.get_transaction().actions[0].name().to_string(), "newaccount");
+        assert_eq!(transaction.packed_trx_bytes(), raw.as_slice());
+    }
 }
