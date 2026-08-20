@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Install the companion source plugin into an exact XPR core checkout before
+# Install the companion source plugin into an exact XPR Leap checkout before
 # rebuilding nodeos. It deliberately refuses to replace an existing plugin.
 
 set -euo pipefail
 
-readonly pinned_core_revision="cbb24506280275f4fb51fb9d77758ff8249fa655"
+readonly pinned_core_revision="d133c6413ce8ce2e96096a0513ec25b4a8dbe837"
 readonly script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 usage() {
@@ -21,13 +21,13 @@ while (($#)); do
 done
 
 [[ -n "$xpr_core" ]] || { usage; exit 2; }
-[[ -f "$xpr_core/plugins/CMakeLists.txt" ]] || { echo "not an XPR core checkout: $xpr_core" >&2; exit 2; }
+[[ -f "$xpr_core/plugins/CMakeLists.txt" ]] || { echo "not an XPR Leap checkout: $xpr_core" >&2; exit 2; }
 [[ -f "$xpr_core/programs/nodeos/CMakeLists.txt" ]] || { echo "not an XPR nodeos source tree: $xpr_core" >&2; exit 2; }
 
 if [[ -d "$xpr_core/.git" ]]; then
     revision="$(git -C "$xpr_core" rev-parse HEAD)"
     [[ "$revision" == "$pinned_core_revision" ]] || {
-        echo "XPR core must be pinned at $pinned_core_revision (found $revision)" >&2
+        echo "XPR Leap must be pinned at $pinned_core_revision (found $revision)" >&2
         exit 2
     }
 fi

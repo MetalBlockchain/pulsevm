@@ -1,6 +1,6 @@
 //! Input boundary for importing an XPR chainbase snapshot into Arena.
 //!
-//! XPR core's `state_history_plugin` writes the first accepted block in an
+//! XPR's Leap `state_history_plugin` writes the first accepted block in an
 //! empty chain-state-history log as a complete set of SHiP `table_delta`s. This
 //! module checks that physical log record and exposes the uncompressed table
 //! frames. Hydration deliberately lives above this layer: it must make
@@ -19,9 +19,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{ChainConfigV0, Database, Float128, U256};
 
-/// XPR core writes `magic(8) + block_id(32) + payload_size(8)` before every
+/// XPR Leap writes `magic(8) + block_id(32) + payload_size(8)` before every
 /// state-history payload, followed by an eight-byte copy of the record's file
-/// offset. These sizes are fixed by `state_history_log_header` in XPR core.
+/// offset. These sizes are fixed by `state_history_log_header` in XPR Leap.
 const LOG_HEADER_LEN: usize = 8 + 32 + 8;
 const LOG_TRAILER_LEN: usize = 8;
 const PAYLOAD_FORMAT_LEN: usize = 4;
@@ -1381,7 +1381,7 @@ fn decode_index_long_double(bytes: &[u8]) -> Result<PortableRow, XprImportError>
 /// The exporter starts with an empty history directory, so its first record is
 /// necessarily the source snapshot's full logical state plus the one accepted
 /// block that caused state history to flush it. It is intentionally rejected if
-/// framing disagrees with XPR core's writer instead of attempting recovery from
+/// framing disagrees with XPR Leap's writer instead of attempting recovery from
 /// a partially written export.
 pub fn parse_initial_state_history_log(bytes: &[u8]) -> Result<StateHistoryEntry, XprImportError> {
     if bytes.len() < LOG_HEADER_LEN + PAYLOAD_FORMAT_LEN + LOG_TRAILER_LEN {
@@ -1411,7 +1411,7 @@ pub fn parse_initial_state_history_log(bytes: &[u8]) -> Result<StateHistoryEntry
 
     let payload = &bytes[LOG_HEADER_LEN..LOG_HEADER_LEN + payload_len];
     let compressed = match payload {
-        // XPR core (the original exporter pin): `uint32 compressed_size` plus
+        // Legacy XPR core snapshots: `uint32 compressed_size` plus
         // zlib bytes. Retain this framing for source snapshots from that node.
         payload
             if payload.len() >= PAYLOAD_FORMAT_LEN

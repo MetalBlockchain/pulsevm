@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Export the complete XPR chainbase state through XPR core's state-history
+# Export the complete XPR chainbase state through XPR's Leap state-history
 # plugin. The first accepted block in an empty chain-state history directory
 # contains every live chainbase table as SHiP table deltas.
 
 set -euo pipefail
 
-readonly pinned_core_revision="cbb24506280275f4fb51fb9d77758ff8249fa655"
+readonly pinned_core_revision="d133c6413ce8ce2e96096a0513ec25b4a8dbe837"
 
 usage() {
     cat <<'EOF'
@@ -13,15 +13,15 @@ Usage:
   export.sh --nodeos PATH --snapshot PATH --work-dir PATH --p2p-peer HOST:PORT [options]
 
 Required:
-  --nodeos PATH            XPR core nodeos binary built from the source revision below
+  --nodeos PATH            XPR Leap nodeos binary built from the source revision below
   --snapshot PATH          XPR nodeos snapshot (.bin) to hydrate
   --work-dir PATH          New directory for this export; it must not exist
   --p2p-peer HOST:PORT     Peer used to receive one post-snapshot block; repeatable
 
 Options:
-  --source-revision SHA    XPR core revision that produced nodeos
-                          (default: cbb24506280275f4fb51fb9d77758ff8249fa655)
-  --xpr-core PATH          Matching XPR core checkout; validates the source
+  --source-revision SHA    XPR Leap revision that produced nodeos
+                          (default: d133c6413ce8ce2e96096a0513ec25b4a8dbe837)
+  --xpr-core PATH          Matching XPR Leap checkout; validates the source
                           revision and deferred-sidecar plugin before export
   --timeout-seconds N      Maximum time to wait for the initial full delta (default: 300)
   --deferred-sidecar PATH  Write complete deferred-transaction chainbase state

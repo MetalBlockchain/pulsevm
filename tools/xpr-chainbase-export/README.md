@@ -6,7 +6,7 @@ the PulseVM Arena importer. It deliberately does **not** read
 pointers, allocator metadata and ABI depend on the exact XPR binary.
 
 Instead, it starts the matching XPR `nodeos` with its
-`state_history_plugin`. XPR core writes a complete chain-state delta for the
+`state_history_plugin`. XPR's Leap nodeos writes a complete chain-state delta for the
 first accepted block when the history log is empty. That delta contains the
 logical chainbase tables (accounts, code, permissions, resources, contract
 tables and rows, and secondary indexes) in the standard SHiP framing. The
@@ -15,8 +15,9 @@ chainbase's physical layout.
 
 ## Source pin
 
-The source was validated against `XPRNetwork/core` revision
-`cbb24506280275f4fb51fb9d77758ff8249fa655`. Build the exporter nodeos from the
+XPR Network Mainnet uses [Antelope Leap 5.0.3](https://github.com/AntelopeIO/leap/releases/tag/v5.0.3).
+The exporter source is pinned to its `d133c6413ce8ce2e96096a0513ec25b4a8dbe837`
+release commit. Build the exporter nodeos from the
 same revision that produced the snapshot. Pass a different revision explicitly
 with `--source-revision`; it is written into `manifest.env`. For Mainnet, run
 the read-only preflight against the exact source checkout and trusted snapshot
@@ -26,7 +27,7 @@ provenance before starting nodeos:
 tools/xpr-chainbase-export/preflight.sh \
   --nodeos /opt/xpr/bin/nodeos \
   --snapshot /data/xpr/snapshots/snapshot.bin \
-  --xpr-core /src/XPRNetwork-core \
+  --xpr-core /src/antelope-leap \
   --p2p-peer proton.p2p.example:9876 \
   --require-sidecar-plugin \
   --minimum-free-gib 250
@@ -129,8 +130,8 @@ Then request it during state-history export:
 
 ```bash
 tools/xpr-chainbase-export/export.sh \
-  --nodeos /src/XPRNetwork-core/build/programs/nodeos/nodeos \
-  --xpr-core /src/XPRNetwork-core \
+  --nodeos /src/antelope-leap/build/programs/nodeos/nodeos \
+  --xpr-core /src/antelope-leap \
   --snapshot /data/xpr/snapshots/snapshot.bin \
   --work-dir /data/xpr-export-123456789 \
   --p2p-peer proton.p2p.example:9876 \

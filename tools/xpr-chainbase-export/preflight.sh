@@ -5,7 +5,7 @@
 
 set -euo pipefail
 
-readonly pinned_core_revision="cbb24506280275f4fb51fb9d77758ff8249fa655"
+readonly pinned_core_revision="d133c6413ce8ce2e96096a0513ec25b4a8dbe837"
 
 usage() {
     cat <<'EOF'
@@ -15,12 +15,12 @@ Usage:
 Required:
   --nodeos PATH            XPR nodeos binary to use for export
   --snapshot PATH          Read-only XPR nodeos snapshot (.bin)
-  --xpr-core PATH          Git checkout used to build nodeos
+  --xpr-core PATH          XPR Leap Git checkout used to build nodeos
   --p2p-peer HOST:PORT     Source-network peer; repeatable
 
 Options:
   --source-revision SHA    Required checkout revision
-                          (default: cbb24506280275f4fb51fb9d77758ff8249fa655)
+                          (default: d133c6413ce8ce2e96096a0513ec25b4a8dbe837)
   --minimum-free-gib N     Require at least N GiB free beside the snapshot
   --require-sidecar-plugin Require the deferred-transaction sidecar source
                           plugin to be installed and linked into nodeos
@@ -56,8 +56,8 @@ done
 
 [[ -x "$nodeos" ]] || { echo "nodeos is not executable: $nodeos" >&2; exit 2; }
 [[ -s "$snapshot" ]] || { echo "snapshot does not exist or is empty: $snapshot" >&2; exit 2; }
-[[ -d "$xpr_core/.git" ]] || { echo "not a Git XPR core checkout: $xpr_core" >&2; exit 2; }
-[[ -f "$xpr_core/plugins/CMakeLists.txt" ]] || { echo "not an XPR core checkout: $xpr_core" >&2; exit 2; }
+[[ -d "$xpr_core/.git" ]] || { echo "not a Git XPR Leap checkout: $xpr_core" >&2; exit 2; }
+[[ -f "$xpr_core/plugins/CMakeLists.txt" ]] || { echo "not an XPR Leap checkout: $xpr_core" >&2; exit 2; }
 [[ -f "$xpr_core/programs/nodeos/CMakeLists.txt" ]] || { echo "not an XPR nodeos source tree: $xpr_core" >&2; exit 2; }
 [[ "$source_revision" =~ ^[[:xdigit:]]{7,64}$ ]] || {
     echo "--source-revision must be a Git SHA" >&2
@@ -80,7 +80,7 @@ done
 
 checkout_revision="$(git -C "$xpr_core" rev-parse HEAD)"
 [[ "$checkout_revision" == "$source_revision" ]] || {
-    echo "XPR core checkout is $checkout_revision, expected $source_revision" >&2
+    echo "XPR Leap checkout is $checkout_revision, expected $source_revision" >&2
     exit 2
 }
 
@@ -91,11 +91,11 @@ if "$require_sidecar_plugin"; then
         exit 2
     }
     rg -q 'add_subdirectory\(deferred_transaction_sidecar_plugin\)' "$xpr_core/plugins/CMakeLists.txt" || {
-        echo "XPR core plugins CMake does not include the deferred sidecar plugin" >&2
+        echo "XPR Leap plugins CMake does not include the deferred sidecar plugin" >&2
         exit 2
     }
     rg -q 'deferred_transaction_sidecar_plugin' "$xpr_core/programs/nodeos/CMakeLists.txt" || {
-        echo "XPR nodeos CMake does not link the deferred sidecar plugin" >&2
+        echo "XPR Leap nodeos CMake does not link the deferred sidecar plugin" >&2
         exit 2
     }
 fi
