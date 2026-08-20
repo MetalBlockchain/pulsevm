@@ -32,6 +32,8 @@ use pulsevm_chain_types::TimePoint;
 // These pure-Rust authority sub-types back the arena authority decoder.
 use crate::{KeyWeight, PermissionLevel, PermissionLevelWeight, WaitWeight};
 use pulsevm_billable_size::billable_size_v;
+use pulsevm_crypto::AuthorityPublicKey;
+#[cfg(test)]
 use pulsevm_crypto::k1::K1PublicKey;
 
 /// Field-for-field snapshot of an `account_metadata_object` read back from the
@@ -305,7 +307,7 @@ fn decode_authority(blob: &[u8]) -> Result<Authority, ChainError> {
     for _ in 0..nkeys {
         let len = rd_u32(blob, &mut pos)? as usize;
         let key_bytes = take(blob, &mut pos, len)?;
-        let key = K1PublicKey::from_packed(key_bytes)
+        let key = AuthorityPublicKey::from_packed(key_bytes)
             .map_err(|e| ChainError::InternalError(format!("authority key decode: {e}")))?;
         let weight = rd_u16(blob, &mut pos)?;
         keys.push(KeyWeight { key, weight });
@@ -1879,7 +1881,9 @@ impl Database {
                 published,
                 packed_trx,
             )
-            .map_err(|e| ChainError::InternalError(format!("XPR import deferred transaction: {e:?}")))
+            .map_err(|e| {
+                ChainError::InternalError(format!("XPR import deferred transaction: {e:?}"))
+            })
     }
 
     /// Pending migrated deferred transaction count. Controllers must only
@@ -1906,13 +1910,12 @@ impl Database {
         self.backend.deferred_transactions()
     }
 
-    pub fn arena_remove_deferred_transaction(
-        &self,
-        trx_id: [u8; 32],
-    ) -> Result<bool, ChainError> {
+    pub fn arena_remove_deferred_transaction(&self, trx_id: [u8; 32]) -> Result<bool, ChainError> {
         self.backend
             .remove_deferred_transaction(trx_id)
-            .map_err(|e| ChainError::InternalError(format!("arena remove deferred transaction: {e:?}")))
+            .map_err(|e| {
+                ChainError::InternalError(format!("arena remove deferred transaction: {e:?}"))
+            })
     }
 
     pub(crate) fn xpr_import_permission(
@@ -2001,7 +2004,16 @@ impl Database {
         virtual_net_limit: u64,
         virtual_cpu_limit: u64,
     ) -> Result<(), ChainError> {
-        self.backend.hydrate_resource_state(net, cpu, total_net_weight, total_cpu_weight, total_ram_bytes, virtual_net_limit, virtual_cpu_limit)
+        self.backend
+            .hydrate_resource_state(
+                net,
+                cpu,
+                total_net_weight,
+                total_cpu_weight,
+                total_ram_bytes,
+                virtual_net_limit,
+                virtual_cpu_limit,
+            )
             .map_err(|e| ChainError::InternalError(format!("XPR import resource state: {e:?}")))
     }
 
@@ -2012,7 +2024,8 @@ impl Database {
         cpu_window: u32,
         net_window: u32,
     ) -> Result<(), ChainError> {
-        self.backend.seed_resource_config(cpu, net, cpu_window, net_window)
+        self.backend
+            .seed_resource_config(cpu, net, cpu_window, net_window)
             .map_err(|e| ChainError::InternalError(format!("XPR import resource config: {e:?}")))
     }
 
@@ -3708,7 +3721,10 @@ mod tests {
                 .expect("parse pubkey");
         let auth = Authority {
             threshold: 2,
-            keys: vec![KeyWeight { key, weight: 1 }],
+            keys: vec![KeyWeight {
+                key: key.into(),
+                weight: 1,
+            }],
             accounts: vec![PermissionLevelWeight {
                 permission: PermissionLevel {
                     actor: name_u64("alice"),
@@ -3762,7 +3778,10 @@ mod tests {
         let key_len = key.to_packed().len() as i64;
         let auth = Authority {
             threshold: 2,
-            keys: vec![KeyWeight { key, weight: 1 }],
+            keys: vec![KeyWeight {
+                key: key.into(),
+                weight: 1,
+            }],
             accounts: vec![PermissionLevelWeight {
                 permission: PermissionLevel {
                     actor: name_u64("bob"),

@@ -10,10 +10,7 @@ pub use fixed_bytes::FixedBytes;
 mod merkle_tree;
 pub use merkle_tree::merkle;
 
+mod authority_key;
 pub mod k1;
-pub use k1::{
-    K1Error,
-    K1PrivateKey,
-    K1PublicKey,
-    K1Signature,
-};
+pub use authority_key::{AuthorityKeyError, AuthorityPublicKey};
+pub use k1::{K1Error, K1PrivateKey, K1PublicKey, K1Signature};

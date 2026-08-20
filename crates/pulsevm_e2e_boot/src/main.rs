@@ -13,59 +13,28 @@
 use std::{
     str::FromStr,
     sync::Arc,
-    time::{
-        Duration,
-        Instant,
-    },
+    time::{Duration, Instant},
 };
 
-use anyhow::{
-    Context,
-    Result,
-    bail,
-};
+use anyhow::{Context, Result, bail};
 use pulsevm_api_client::PulseVmClient;
 use pulsevm_core::{
-    ACTIVE_NAME,
-    PULSE_NAME,
+    ACTIVE_NAME, PULSE_NAME,
     abi::AbiDefinition,
     asset::Asset,
-    authority::{
-        Authority,
-        KeyWeight,
-        PermissionLevel,
-    },
-    config::{
-        NEWACCOUNT_NAME,
-        SETABI_NAME,
-        SETCODE_NAME,
-    },
-    crypto::{
-        PrivateKey,
-        PublicKey,
-    },
+    authority::{Authority, KeyWeight, PermissionLevel},
+    config::{NEWACCOUNT_NAME, SETABI_NAME, SETCODE_NAME},
+    crypto::{PrivateKey, PublicKey},
     id::Id,
     name::Name,
     producer_schedule::ProducerKey,
-    pulse_contract::{
-        NewAccount,
-        SetAbi,
-        SetCode,
-    },
+    pulse_contract::{NewAccount, SetAbi, SetCode},
     time::TimePointSec,
-    transaction::{
-        Action,
-        PackedTransaction,
-        Transaction,
-    },
+    transaction::{Action, PackedTransaction, Transaction},
 };
 use pulsevm_crypto::Bytes;
 use pulsevm_name_macro::name;
-use pulsevm_proc_macros::{
-    NumBytes,
-    Read,
-    Write,
-};
+use pulsevm_proc_macros::{NumBytes, Read, Write};
 use pulsevm_serialization::Write as _;
 use tokio::time::sleep;
 
@@ -191,7 +160,7 @@ fn new_account(creator: Name, account: Name, key: &PublicKey) -> Result<Action> 
     let authority = |k: &PublicKey| Authority {
         threshold: 1,
         keys: vec![KeyWeight {
-            key: k.clone().into_k1(),
+            key: k.clone().into_k1().into(),
             weight: 1,
         }],
         accounts: vec![],

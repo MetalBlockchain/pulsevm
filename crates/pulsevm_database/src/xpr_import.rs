@@ -218,8 +218,11 @@ impl DeferredTransactionSidecar {
 
     /// Parse and normalize a sidecar before it is compared with SHiP rows.
     pub fn from_json_bytes(bytes: &[u8]) -> Result<Self, XprImportError> {
-        let sidecar: Self = serde_json::from_slice(bytes)
-            .map_err(|error| bad(format!("invalid deferred-transaction sidecar JSON: {error}")))?;
+        let sidecar: Self = serde_json::from_slice(bytes).map_err(|error| {
+            bad(format!(
+                "invalid deferred-transaction sidecar JSON: {error}"
+            ))
+        })?;
         if sidecar.version != Self::VERSION {
             return Err(bad(format!(
                 "unsupported deferred-transaction sidecar version {} (expected {})",
@@ -431,15 +434,37 @@ pub fn hydrate_full_state_with_deferred_transactions(
             }
         }
         for row in &rows {
-            if let PortableRow::ResourceState { net, cpu, total_net_weight, total_cpu_weight, total_ram_bytes, virtual_net_limit, virtual_cpu_limit } = row {
+            if let PortableRow::ResourceState {
+                net,
+                cpu,
+                total_net_weight,
+                total_cpu_weight,
+                total_ram_bytes,
+                virtual_net_limit,
+                virtual_cpu_limit,
+            } = row
+            {
                 db.xpr_import_resource_state(
-                    (net.value_ex, net.consumed, net.last_ordinal), (cpu.value_ex, cpu.consumed, cpu.last_ordinal),
-                    *total_net_weight, *total_cpu_weight, *total_ram_bytes, *virtual_net_limit, *virtual_cpu_limit,
-                ).map_err(database_error)?;
+                    (net.value_ex, net.consumed, net.last_ordinal),
+                    (cpu.value_ex, cpu.consumed, cpu.last_ordinal),
+                    *total_net_weight,
+                    *total_cpu_weight,
+                    *total_ram_bytes,
+                    *virtual_net_limit,
+                    *virtual_cpu_limit,
+                )
+                .map_err(database_error)?;
                 summary.resource_states += 1;
             }
-            if let PortableRow::ResourceConfig { cpu, net, cpu_window, net_window } = row {
-                db.xpr_import_resource_config(*cpu, *net, *cpu_window, *net_window).map_err(database_error)?;
+            if let PortableRow::ResourceConfig {
+                cpu,
+                net,
+                cpu_window,
+                net_window,
+            } = row
+            {
+                db.xpr_import_resource_config(*cpu, *net, *cpu_window, *net_window)
+                    .map_err(database_error)?;
                 summary.resource_configs += 1;
             }
         }
@@ -860,14 +885,21 @@ fn validate_deferred_transactions(
     let mut expected = HashSet::new();
     for key in generated {
         if !expected.insert(key) {
-            return Err(bad("duplicate generated_transaction row in SHiP full-state export"));
+            return Err(bad(
+                "duplicate generated_transaction row in SHiP full-state export",
+            ));
         }
     }
     let mut actual = HashSet::new();
-    for row in &sidecar.expect("non-empty SHiP requires sidecar").transactions {
+    for row in &sidecar
+        .expect("non-empty SHiP requires sidecar")
+        .transactions
+    {
         let key = sidecar_key(row)?;
         if !actual.insert(key) {
-            return Err(bad("duplicate generated_transaction row in chainbase sidecar"));
+            return Err(bad(
+                "duplicate generated_transaction row in chainbase sidecar",
+            ));
         }
     }
     if expected != actual {
@@ -895,14 +927,19 @@ fn validate_sidecar_block_id(
 }
 
 fn decode_block_id(value: &str) -> Result<[u8; 32], XprImportError> {
-    let bytes = hex::decode(value)
-        .map_err(|error| bad(format!("invalid deferred-transaction sidecar block id: {error}")))?;
+    let bytes = hex::decode(value).map_err(|error| {
+        bad(format!(
+            "invalid deferred-transaction sidecar block id: {error}"
+        ))
+    })?;
     bytes.try_into().map_err(|_| {
         bad("invalid deferred-transaction sidecar block id: expected 32-byte hexadecimal value")
     })
 }
 
-fn sidecar_key(row: &DeferredTransactionSidecarRow) -> Result<DeferredTransactionKey, XprImportError> {
+fn sidecar_key(
+    row: &DeferredTransactionSidecarRow,
+) -> Result<DeferredTransactionKey, XprImportError> {
     let sender_id = row.sender_id.parse::<u128>().map_err(|error| {
         bad(format!(
             "invalid deferred-transaction sidecar sender_id {:?}: {error}",
@@ -910,11 +947,20 @@ fn sidecar_key(row: &DeferredTransactionSidecarRow) -> Result<DeferredTransactio
         ))
     })?;
     let trx_id = hex::decode(&row.trx_id)
-        .map_err(|error| bad(format!("invalid deferred-transaction sidecar trx_id: {error}")))?
+        .map_err(|error| {
+            bad(format!(
+                "invalid deferred-transaction sidecar trx_id: {error}"
+            ))
+        })?
         .try_into()
-        .map_err(|_| bad("invalid deferred-transaction sidecar trx_id: expected 32-byte hexadecimal value"))?;
-    let packed_trx = hex::decode(&row.packed_trx)
-        .map_err(|error| bad(format!("invalid deferred-transaction sidecar packed_trx: {error}")))?;
+        .map_err(|_| {
+            bad("invalid deferred-transaction sidecar trx_id: expected 32-byte hexadecimal value")
+        })?;
+    let packed_trx = hex::decode(&row.packed_trx).map_err(|error| {
+        bad(format!(
+            "invalid deferred-transaction sidecar packed_trx: {error}"
+        ))
+    })?;
     Ok(DeferredTransactionKey {
         sender: row.sender,
         sender_id,
@@ -1005,8 +1051,8 @@ fn decode_global_property(bytes: &[u8]) -> Result<PortableRow, XprImportError> {
     }
 
     row.fixed::<32>()?; // source chain id; the target has a new chain id
-                        // `wasm_configuration` is a binary extension in Leap 5: it has no
-                        // presence boolean, and is simply absent in the XPR-core pinned format.
+    // `wasm_configuration` is a binary extension in Leap 5: it has no
+    // presence boolean, and is simply absent in the XPR-core pinned format.
     if row.remaining() != 0 {
         let wasm_version = row.varuint()?;
         if wasm_version != 0 {
@@ -1156,7 +1202,14 @@ fn decode_elastic_params(
     let max_multiplier = row.u32()?;
     let contract = decode_resource_ratio(row)?;
     let expand = decode_resource_ratio(row)?;
-    Ok(crate::backend::ElasticParams { target, max, periods, max_multiplier, contract, expand })
+    Ok(crate::backend::ElasticParams {
+        target,
+        max,
+        periods,
+        max_multiplier,
+        contract,
+        expand,
+    })
 }
 
 fn decode_resource_ratio(row: &mut RowCursor<'_>) -> Result<(u64, u64), XprImportError> {
@@ -1245,16 +1298,39 @@ fn decode_authority(row: &mut RowCursor<'_>) -> Result<Vec<u8>, XprImportError> 
     out.extend_from_slice(&(key_count as u32).to_le_bytes());
     for _ in 0..key_count {
         let key_type = row.varuint()?;
-        if key_type != 0 {
-            return Err(bad(format!(
-                "XPR authority contains unsupported public-key type {key_type}"
-            )));
-        }
         let point = row.fixed::<33>()?;
+        let mut packed_key = Vec::with_capacity(64);
+        match key_type {
+            0 | 1 => {
+                packed_key.push(key_type as u8);
+                packed_key.extend_from_slice(&point);
+            }
+            2 => {
+                let user_presence = row.byte()?;
+                if user_presence > 2 {
+                    return Err(bad(format!(
+                        "XPR WebAuthn authority has invalid user-presence policy {user_presence}"
+                    )));
+                }
+                let rpid = row.bytes()?;
+                if rpid.is_empty() || std::str::from_utf8(&rpid).is_err() {
+                    return Err(bad("XPR WebAuthn authority has an invalid RP ID"));
+                }
+                packed_key.push(2);
+                packed_key.extend_from_slice(&point);
+                packed_key.push(user_presence);
+                write_varuint(rpid.len() as u64, &mut packed_key);
+                packed_key.extend_from_slice(&rpid);
+            }
+            _ => {
+                return Err(bad(format!(
+                    "XPR authority contains unsupported public-key type {key_type}"
+                )));
+            }
+        }
         let weight = row.u16()?;
-        out.extend_from_slice(&34u32.to_le_bytes());
-        out.push(0);
-        out.extend_from_slice(&point);
+        out.extend_from_slice(&(packed_key.len() as u32).to_le_bytes());
+        out.extend_from_slice(&packed_key);
         out.extend_from_slice(&weight.to_le_bytes());
     }
     let account_count =
@@ -1727,11 +1803,25 @@ fn bad(message: impl Into<String>) -> XprImportError {
     XprImportError(message.into())
 }
 
+fn write_varuint(mut value: u64, out: &mut Vec<u8>) {
+    loop {
+        let mut byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        out.push(byte);
+        if value == 0 {
+            return;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Write;
 
-    use flate2::{write::ZlibEncoder, Compression};
+    use flate2::{Compression, write::ZlibEncoder};
     use tempfile::TempDir;
 
     use super::*;
@@ -1965,9 +2055,11 @@ mod tests {
         let mut db = Database::new(dir.path().to_str().unwrap(), 64 * 1024 * 1024).unwrap();
 
         let error = hydrate_full_state(&mut db, &entry).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("omits delay_until, expiration, and published"));
+        assert!(
+            error
+                .to_string()
+                .contains("omits delay_until, expiration, and published")
+        );
         assert!(!db.is_account(11).unwrap());
     }
 
@@ -2009,7 +2101,11 @@ mod tests {
         )
         .unwrap();
         let error = validate_sidecar_block_id(&sidecar, [1; 32]).unwrap_err();
-        assert!(error.to_string().contains("does not match SHiP full-state block"));
+        assert!(
+            error
+                .to_string()
+                .contains("does not match SHiP full-state block")
+        );
     }
 
     #[test]
@@ -2026,10 +2122,12 @@ mod tests {
             },
         );
         assert!(manifest.verify_checkpoint(&checkpoint).is_ok());
-        assert!(manifest
-            .verify_checkpoint(&crate::snapshot::encode(7, b"other checkpoint"))
-            .unwrap_err()
-            .contains("does not match manifest"));
+        assert!(
+            manifest
+                .verify_checkpoint(&crate::snapshot::encode(7, b"other checkpoint"))
+                .unwrap_err()
+                .contains("does not match manifest")
+        );
     }
 
     #[test]

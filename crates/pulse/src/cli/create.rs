@@ -2,18 +2,10 @@ use std::str::FromStr;
 
 use pulsevm_api_client::PulseVmClient;
 use pulsevm_core::{
-    ACTIVE_NAME,
-    PULSE_NAME,
-    authority::{
-        Authority,
-        KeyWeight,
-        PermissionLevel,
-    },
+    ACTIVE_NAME, PULSE_NAME,
+    authority::{Authority, KeyWeight, PermissionLevel},
     config::NEWACCOUNT_NAME,
-    crypto::{
-        PrivateKey,
-        PublicKey,
-    },
+    crypto::{PrivateKey, PublicKey},
     name::Name,
     pulse_contract::NewAccount,
     transaction::Action,
@@ -21,10 +13,7 @@ use pulsevm_core::{
 use pulsevm_keosd_client::KeosdClient;
 use spdlog::info;
 
-use crate::{
-    cli::CreateSubcommand,
-    utils::push_actions,
-};
+use crate::{cli::CreateSubcommand, utils::push_actions};
 
 pub async fn handle(
     api_client: &PulseVmClient,
@@ -59,7 +48,7 @@ pub async fn handle(
                         owner: Authority {
                             threshold: 1,
                             keys: vec![KeyWeight {
-                                key: PublicKey::from_str(&owner_key)?.into_k1(),
+                                key: PublicKey::from_str(&owner_key)?.into_k1().into(),
                                 weight: 1,
                             }],
                             accounts: vec![],
@@ -68,7 +57,7 @@ pub async fn handle(
                         active: Authority {
                             threshold: 1,
                             keys: vec![KeyWeight {
-                                key: PublicKey::from_str(&active_key)?.into_k1(),
+                                key: PublicKey::from_str(&active_key)?.into_k1().into(),
                                 weight: 1,
                             }],
                             accounts: vec![],

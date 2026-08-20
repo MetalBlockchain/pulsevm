@@ -1,37 +1,26 @@
 use std::fmt;
 
 use pulsevm_billable_size::BillableSize;
-use pulsevm_crypto::{
-    FixedBytes,
-    k1::K1PublicKey,
-};
-use pulsevm_serialization::{
-    NumBytes,
-    Read,
-    Write,
-    WriteError,
-};
+use pulsevm_crypto::AuthorityPublicKey;
+use pulsevm_serialization::{NumBytes, Read, Write, WriteError};
 use serde::{
-    Deserialize,
-    Serialize,
-    de::{
-        self,
-        MapAccess,
-        SeqAccess,
-        Visitor,
-    },
+    Deserialize, Serialize,
+    de::{self, MapAccess, SeqAccess, Visitor},
     ser::SerializeStruct,
 };
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct KeyWeight {
-    pub key: K1PublicKey,
+    pub key: AuthorityPublicKey,
     pub weight: u16,
 }
 
 impl KeyWeight {
-    pub fn new(key: K1PublicKey, weight: u16) -> Self {
-        KeyWeight { key, weight }
+    pub fn new(key: impl Into<AuthorityPublicKey>, weight: u16) -> Self {
+        KeyWeight {
+            key: key.into(),
+            weight,
+        }
     }
 }
 
@@ -46,19 +35,20 @@ impl fmt::Debug for KeyWeight {
 
 impl NumBytes for KeyWeight {
     fn num_bytes(&self) -> usize {
-        // Add the number of bytes for the packed public key and the weight
-        34 + self.weight.num_bytes()
+        self.key.to_packed().len() + self.weight.num_bytes()
     }
 }
 
 impl Read for KeyWeight {
     fn read(bytes: &[u8], pos: &mut usize) -> Result<Self, pulsevm_serialization::ReadError> {
-        let packed_key = FixedBytes::<34>::read(bytes, pos)?;
-        let key = K1PublicKey::from_packed(packed_key.as_ref()).map_err(|e| {
-            pulsevm_serialization::ReadError::CustomError(format!(
-                "failed to parse public key in KeyWeight: {}",
-                e
-            ))
+        let start = *pos;
+        let key = read_authority_key(bytes, pos).and_then(|_| {
+            AuthorityPublicKey::from_packed(&bytes[start..*pos]).map_err(|e| {
+                pulsevm_serialization::ReadError::CustomError(format!(
+                    "failed to parse public key in KeyWeight: {}",
+                    e
+                ))
+            })
         })?;
         let weight = u16::read(bytes, pos)?;
         Ok(KeyWeight { key, weight })
@@ -67,8 +57,13 @@ impl Read for KeyWeight {
 
 impl Write for KeyWeight {
     fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), WriteError> {
-        let packed_key = FixedBytes::<34>(self.key.to_packed());
-        packed_key.write(bytes, pos)?;
+        let packed_key = self.key.to_packed();
+        let end = pos
+            .checked_add(packed_key.len())
+            .filter(|end| *end <= bytes.len())
+            .ok_or(WriteError::NotEnoughSpace)?;
+        bytes[*pos..end].copy_from_slice(&packed_key);
+        *pos = end;
         self.weight.write(bytes, pos)?;
         Ok(())
     }
@@ -142,7 +137,7 @@ impl<'de> Deserialize<'de> for KeyWeight {
                     .next_element()?
                     .ok_or_else(|| de::Error::invalid_length(1, &self))?;
 
-                let key = K1PublicKey::from_string(&key_str)
+                let key = AuthorityPublicKey::from_string(&key_str)
                     .map_err(|e| de::Error::custom(format!("invalid public key: {}", e)))?;
 
                 Ok(KeyWeight { key, weight })
@@ -170,7 +165,7 @@ impl<'de> Deserialize<'de> for KeyWeight {
                 }
 
                 let key_str = key.ok_or_else(|| de::Error::missing_field("key"))?;
-                let key = K1PublicKey::from_string(&key_str)
+                let key = AuthorityPublicKey::from_string(&key_str)
                     .map_err(|e| de::Error::custom(format!("invalid public key: {}", e)))?;
                 let weight = weight.ok_or_else(|| de::Error::missing_field("weight"))?;
 
@@ -180,6 +175,79 @@ impl<'de> Deserialize<'de> for KeyWeight {
 
         deserializer.deserialize_struct("KeyWeight", FIELDS, KeyWeightVisitor)
     }
+}
+
+fn read_authority_key(
+    bytes: &[u8],
+    pos: &mut usize,
+) -> Result<(), pulsevm_serialization::ReadError> {
+    let tag = read_varuint(bytes, pos)?;
+    let payload = match tag {
+        0 | 1 => 33,
+        2 => {
+            let base = 34usize;
+            let end = pos
+                .checked_add(base)
+                .filter(|end| *end <= bytes.len())
+                .ok_or_else(|| {
+                    pulsevm_serialization::ReadError::CustomError(
+                        "truncated authority public key".into(),
+                    )
+                })?;
+            *pos = end;
+            let len = usize::try_from(read_varuint(bytes, pos)?).map_err(|_| {
+                pulsevm_serialization::ReadError::CustomError(
+                    "authority public-key length too large".into(),
+                )
+            })?;
+            let end = pos
+                .checked_add(len)
+                .filter(|end| *end <= bytes.len())
+                .ok_or_else(|| {
+                    pulsevm_serialization::ReadError::CustomError("truncated WebAuthn RP ID".into())
+                })?;
+            *pos = end;
+            return Ok(());
+        }
+        other => {
+            return Err(pulsevm_serialization::ReadError::CustomError(format!(
+                "unsupported authority public-key type {other}"
+            )));
+        }
+    };
+    let end = pos
+        .checked_add(payload)
+        .filter(|end| *end <= bytes.len())
+        .ok_or_else(|| {
+            pulsevm_serialization::ReadError::CustomError("truncated authority public key".into())
+        })?;
+    *pos = end;
+    Ok(())
+}
+
+fn read_varuint(bytes: &[u8], pos: &mut usize) -> Result<u64, pulsevm_serialization::ReadError> {
+    let mut value = 0u64;
+    for shift in (0..64).step_by(7) {
+        let byte = *bytes.get(*pos).ok_or_else(|| {
+            pulsevm_serialization::ReadError::CustomError(
+                "truncated authority public-key varuint".into(),
+            )
+        })?;
+        *pos += 1;
+        let part = (byte & 0x7f) as u64;
+        if shift == 63 && part > 1 {
+            return Err(pulsevm_serialization::ReadError::CustomError(
+                "authority public-key varuint overflows u64".into(),
+            ));
+        }
+        value |= part << shift;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+    }
+    Err(pulsevm_serialization::ReadError::CustomError(
+        "authority public-key varuint is too long".into(),
+    ))
 }
 
 impl BillableSize for KeyWeight {

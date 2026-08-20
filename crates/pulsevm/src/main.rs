@@ -3,90 +3,43 @@ mod chain;
 mod state_history;
 
 use pulsevm_core::{
-    config::{
-        PLUGIN_VERSION,
-        VERSION,
-    },
+    config::{PLUGIN_VERSION, VERSION},
     controller::Controller,
-    id::{
-        Id,
-        NodeId,
-    },
+    id::{Id, NodeId},
     mempool::Mempool,
     transaction::PackedTransaction,
 };
 use pulsevm_grpc::{
     http::{
-        self,
-        Element,
-        http_server::{
-            Http,
-            HttpServer,
-        },
+        self, Element,
+        http_server::{Http, HttpServer},
     },
     vm::{
-        self,
-        Handler,
-        ParseBlockResponse,
-        runtime::{
-            InitializeRequest,
-            runtime_client::RuntimeClient,
-        },
-        vm_server::{
-            Vm,
-            VmServer,
-        },
+        self, Handler, ParseBlockResponse,
+        runtime::{InitializeRequest, runtime_client::RuntimeClient},
+        vm_server::{Vm, VmServer},
     },
 };
-use pulsevm_serialization::{
-    Read,
-    Write,
-};
-use spdlog::{
-    debug,
-    error,
-    info,
-    warn,
-};
+use pulsevm_serialization::{Read, Write};
+use spdlog::{debug, error, info, warn};
 use std::{
-    net::{
-        SocketAddr,
-        TcpListener,
-    },
-    sync::{
-        Arc,
-        atomic::AtomicBool,
-    },
-    time::{
-        Duration,
-        Instant,
-    },
+    net::{SocketAddr, TcpListener},
+    sync::{Arc, atomic::AtomicBool},
+    time::{Duration, Instant},
 };
 use tokio::{
     net::TcpListener as TokioTcpListener,
-    signal::unix::{
-        SignalKind,
-        signal,
-    },
+    signal::unix::{SignalKind, signal},
     sync::RwLock,
 };
 use tokio_util::sync::CancellationToken;
 use tonic::{
-    Request,
-    Response,
-    Status,
-    transport::{
-        Server,
-        server::TcpIncoming,
-    },
+    Request, Response, Status,
+    transport::{Server, server::TcpIncoming},
 };
 
 use crate::{
-    chain::{
-        BlockTimer,
-        GossipType,
-        Gossipable,
-    },
+    chain::{BlockTimer, GossipType, Gossipable},
     state_history::StateHistoryServer,
 };
 
@@ -256,12 +209,17 @@ impl Vm for VirtualMachine {
             .try_into()
             .map_err(|_| Status::invalid_argument("invalid chain id"))?;
         let controller = self.controller.clone();
-        let mut controller = controller.write().await;
-
-        // Initialize the controller with the genesis bytes
-        controller
-            .initialize(&chain_id, &config_bytes, &genesis_bytes, db_path.as_str())
-            .map_err(|e| Status::internal(format!("could not initialize controller: {}", e)))?;
+        // Restoring a full Arena checkpoint is CPU- and I/O-bound. Do it on
+        // Tokio's blocking pool so the RPC transport keeps servicing MetalGo
+        // keepalive frames while a large imported state is being opened.
+        tokio::task::spawn_blocking(move || {
+            let mut controller = controller.blocking_write();
+            controller
+                .initialize(&chain_id, &config_bytes, &genesis_bytes, db_path.as_str())
+                .map_err(|e| Status::internal(format!("could not initialize controller: {e}")))
+        })
+        .await
+        .map_err(|e| Status::internal(format!("controller initialization task failed: {e}")))??;
 
         let network_manager = Arc::clone(&self.network_manager);
         let mut network_manager = network_manager.write().await;
@@ -270,6 +228,8 @@ impl Vm for VirtualMachine {
         let block_timer = self.block_timer.clone();
         let mut block_timer = block_timer.write().await;
         block_timer.start(server_addr.clone()).await;
+
+        let controller = self.controller.read().await;
 
         let last_accepted_block_id = controller.last_accepted_block().id().map_err(|e| {
             Status::internal(format!("could not get last accepted block id: {}", e))

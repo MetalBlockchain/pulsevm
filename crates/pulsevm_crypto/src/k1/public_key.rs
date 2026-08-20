@@ -12,7 +12,7 @@ use super::{
 ///
 /// The canonical in-memory form is the 33-byte compressed point, exactly what
 /// `fc::ecc::public_key::serialize()` returns.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct K1PublicKey {
     compressed: [u8; 33],
 }
