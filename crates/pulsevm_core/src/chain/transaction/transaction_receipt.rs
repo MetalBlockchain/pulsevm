@@ -37,6 +37,12 @@ impl TransactionReceipt {
         &self.trx
     }
 
+    /// Consensus status committed by this receipt. Deferred transactions use
+    /// `SoftFail` when their sender's `eosio::onerror` callback succeeds.
+    pub fn status(&self) -> &crate::chain::transaction::TransactionStatus {
+        &self.header.status
+    }
+
     /// Block-recorded CPU (µs) for this transaction — used to bill the recorded
     /// usage on replay instead of re-measuring.
     pub fn cpu_usage_us(&self) -> u32 {

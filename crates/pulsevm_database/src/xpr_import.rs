@@ -251,9 +251,9 @@ pub fn hydrate_full_state(
 /// deferred-transaction sidecar first.
 ///
 /// The sidecar eliminates the data-loss boundary in SHiP and is validated
-/// one-for-one against its `generated_transaction` rows. PulseVM does not yet
-/// execute deferred XPR transactions, so a non-empty verified sidecar still
-/// fails closed after verification rather than silently discarding work.
+/// one-for-one against its `generated_transaction` rows. Verified records are
+/// retained in Arena for the controller's deferred-transaction scheduler;
+/// nothing is silently discarded at the migration boundary.
 pub fn hydrate_full_state_with_deferred_transactions(
     db: &mut Database,
     entry: &StateHistoryEntry,

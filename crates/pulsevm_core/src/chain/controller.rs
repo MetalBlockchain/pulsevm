@@ -7,6 +7,7 @@ use std::{
         VecDeque,
     },
     fs,
+    str::FromStr,
     sync::LazyLock,
 };
 
@@ -30,6 +31,7 @@ use crate::{
             LINKAUTH_NAME,
             NEWACCOUNT_NAME,
             ONBLOCK_NAME,
+            ONERROR_NAME,
             SETABI_NAME,
             SETCODE_NAME,
             UNLINKAUTH_NAME,
@@ -115,6 +117,27 @@ pub type ApplyHandlerMap = HashMap<
     (Name, Name, Name), // (receiver, contract, action)
     ApplyHandlerFn,
 >;
+
+/// Append Antelope's canonical `varuint32` representation. This is used for
+/// the `bytes sent_trx` member of the native `onerror` action payload.
+fn append_varuint32(bytes: &mut Vec<u8>, value: usize) -> Result<(), ChainError> {
+    let mut value = u32::try_from(value).map_err(|_| {
+        ChainError::TransactionError("deferred transaction is too large for onerror".into())
+    })?;
+    while value >= 0x80 {
+        bytes.push((value as u8 & 0x7f) | 0x80);
+        value >>= 7;
+    }
+    bytes.push(value as u8);
+    Ok(())
+}
+
+fn deferred_onerror_payload(sender_id: u128, packed_trx: &[u8]) -> Result<Vec<u8>, ChainError> {
+    let mut data = sender_id.to_le_bytes().to_vec();
+    append_varuint32(&mut data, packed_trx.len())?;
+    data.extend_from_slice(packed_trx);
+    Ok(data)
+}
 
 pub static APPLY_HANDLERS: LazyLock<ApplyHandlerMap> = LazyLock::new(|| {
     let mut m: ApplyHandlerMap = HashMap::new();
@@ -700,13 +723,36 @@ impl Controller {
                         proposed_schedule = result.proposed_schedule;
                     }
                 }
-                Err(error) => {
+                Err(deferred_error) => {
                     db.arena_undo();
-                    db.arena_undo();
-                    return Err(ChainError::TransactionError(format!(
-                        "deferred transaction {} failed; onerror handling is not implemented: {error}",
-                        hex::encode(scheduled.trx_id)
-                    )));
+                    // XPR retires a failed generated transaction by sending its
+                    // original raw bytes to `eosio::onerror`, with the original
+                    // sender as receiver. The callback is its own session: none
+                    // of the failed transaction's state may leak into it.
+                    db.arena_start_undo_session();
+                    match self.execute_deferred_onerror(&scheduled, &timestamp, &block_status) {
+                        Ok(result) => {
+                            db.arena_remove_deferred_transaction(scheduled.trx_id)?;
+                            db.arena_squash();
+                            transaction_traces.push(result.trace.clone());
+                            transaction_receipts.push_back(TransactionReceipt::new(
+                                result.trace.receipt,
+                                transaction,
+                            ));
+                            action_receipt_digests.extend(result.action_receipt_digests);
+                            if result.proposed_schedule.is_some() {
+                                proposed_schedule = result.proposed_schedule;
+                            }
+                        }
+                        Err(onerror_error) => {
+                            db.arena_undo();
+                            db.arena_undo();
+                            return Err(ChainError::TransactionError(format!(
+                                "deferred transaction {} failed ({deferred_error}); its onerror callback also failed: {onerror_error}",
+                                hex::encode(scheduled.trx_id)
+                            )));
+                        }
+                    }
                 }
             }
         }
@@ -1362,14 +1408,26 @@ impl Controller {
                         receipt.trx().id()
                     )));
                 }
-                let result = self.execute_transaction_billed_with_authorization(
-                    receipt.trx(),
-                    timestamp,
-                    block_status,
-                    Some((receipt.cpu_usage_us(), receipt.net_usage_words())),
-                    true,
-                    true,
-                )?;
+                let result = match receipt.status() {
+                    crate::chain::transaction::TransactionStatus::Executed => self
+                        .execute_transaction_billed_with_authorization(
+                            receipt.trx(),
+                            timestamp,
+                            block_status,
+                            Some((receipt.cpu_usage_us(), receipt.net_usage_words())),
+                            true,
+                            true,
+                        )?,
+                    crate::chain::transaction::TransactionStatus::SoftFail => {
+                        self.execute_deferred_onerror(&deferred, timestamp, block_status)?
+                    }
+                    crate::chain::transaction::TransactionStatus::HardFail => {
+                        return Err(ChainError::BlockError(format!(
+                            "block marks deferred transaction {} as hard_fail, which is not supported yet",
+                            receipt.trx().id()
+                        )));
+                    }
+                };
                 self.db.arena_remove_deferred_transaction(transaction_id)?;
                 result
             } else {
@@ -1542,6 +1600,51 @@ impl Controller {
             true,
             true,
         )
+    }
+
+    /// Execute the XPR `eosio::onerror` notification after a deferred
+    /// transaction's action fails. Its trace deliberately keeps the original
+    /// deferred transaction ID: the block receipt identifies the generated
+    /// transaction, not this implicit callback envelope.
+    fn execute_deferred_onerror(
+        &mut self,
+        deferred: &pulsevm_database::DeferredTransaction,
+        pending_block_timestamp: &BlockTimestamp,
+        block_status: &BlockStatus,
+    ) -> Result<TransactionResult, ChainError> {
+        let data = deferred_onerror_payload(deferred.sender_id, &deferred.packed_trx)?;
+
+        let sender = Name::new(deferred.sender);
+        let action = Action::new(
+            Name::from_str("eosio")?,
+            ONERROR_NAME,
+            data,
+            vec![PermissionLevel::new(sender.as_u64(), ACTIVE_NAME.as_u64())],
+        );
+        let trx = Transaction::new(TransactionHeader::default(), vec![], vec![action.clone()]);
+        let packed = PackedTransaction::from_signed_transaction(SignedTransaction::new(
+            trx.clone(),
+            BTreeSet::new(),
+            vec![],
+        ))?;
+        let transaction_id = Id::new(deferred.trx_id);
+        let mut trx_context = TransactionContext::new(
+            self.db.clone(),
+            self.wasm_runtime.clone(),
+            self.last_accepted_block().block_num() + 1,
+            pending_block_timestamp.clone(),
+            &transaction_id,
+            *block_status,
+            packed,
+            self.max_transaction_time_ms(),
+        );
+        self.set_context_active_schedule(&trx_context)?;
+        trx_context.init_for_implicit_trx(&trx)?;
+        trx_context.schedule_action(action, &sender, false, 0, 0)?;
+        trx_context.execute_action(1, 0)?;
+        let mut result = trx_context.finalize()?;
+        result.trace.receipt.status = crate::chain::transaction::TransactionStatus::SoftFail;
+        Ok(result)
     }
 
     fn execute_transaction_billed_with_authorization(
@@ -3578,6 +3681,114 @@ mod tests {
         controller.accept_block(&block.id()?, &mut mempool)?;
         assert_eq!(controller.db.deferred_transaction_count(), 0);
         assert!(controller.db.is_account(Name::from_str("deferred")?.as_u64())?);
+        Ok(())
+    }
+
+    #[test]
+    fn deferred_onerror_payload_uses_xpr_uint128_and_bytes_encoding() -> Result<(), ChainError> {
+        let packed = vec![0xab; 128];
+        let payload = deferred_onerror_payload(0x1122_3344_5566_7788_99aa_bbcc_ddee_ff00, &packed)?;
+        assert_eq!(
+            &payload[..16],
+            &0x1122_3344_5566_7788_99aa_bbcc_ddee_ff00u128.to_le_bytes()
+        );
+        // 128 is encoded as a two-byte Antelope varuint32: 0x80, 0x01.
+        assert_eq!(&payload[16..18], &[0x80, 0x01]);
+        assert_eq!(&payload[18..], packed.as_slice());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_deferred_transaction_runs_onerror_as_soft_fail() -> Result<(), ChainError> {
+        fn install_onerror_handler(
+            controller: &mut Controller,
+            private_key: &PrivateKey,
+            chain_id: Id,
+        ) -> Result<(), ChainError> {
+            // The deferred action carries a one-byte empty `bytes` argument,
+            // while XPR's onerror payload includes the uint128 sender id and
+            // raw sent transaction. This gives the scheduler a deterministic
+            // failure to turn into a soft_fail receipt.
+            let wasm = wat::parse_str(&format!(
+                r#"
+                (module
+                  (import "env" "eosio_assert" (func $assert (param i32 i32)))
+                  (import "env" "action_data_size" (func $action_data_size (result i32)))
+                  (memory (export "memory") 1)
+                  (data (i32.const 8) "deferred failure\00")
+                  (func (export "apply") (param i64 i64 i64)
+                    (block $handled
+                      (br_if $handled
+                        (i32.gt_u (call $action_data_size) (i32.const 16)))
+                      (call $assert (i32.const 0) (i32.const 8)))))
+                "#,
+            ))
+            .map_err(|error| ChainError::InternalError(format!("compile onerror test wasm: {error}")))?;
+            let timestamp = controller.last_accepted_block().timestamp().clone();
+            // The callback's action code is `eosio`, exactly as on XPR. The
+            // minimal test genesis has only `pulse`, so create the source
+            // system account before scheduling that action to pulse as receiver.
+            controller.execute_transaction(
+                &create_account(private_key, Name::from_str("eosio")?, chain_id)?,
+                &timestamp,
+                &BlockStatus::Building,
+            )?;
+            controller.execute_transaction(
+                &set_code(private_key, PULSE_NAME, wasm, chain_id)?,
+                &timestamp,
+                &BlockStatus::Building,
+            )?;
+            Ok(())
+        }
+
+        let (mut producer, private_key, chain_id, _producer_temp) = init_test_controller()?;
+        install_onerror_handler(&mut producer, &private_key, chain_id)?;
+        let scheduled = call_contract(
+            &private_key,
+            PULSE_NAME,
+            Name::from_str("fail")?,
+            &Vec::<u8>::new(),
+            chain_id,
+        )?;
+        let trx_id: [u8; 32] = scheduled.id().as_bytes().try_into().unwrap();
+        producer.db.xpr_import_deferred_transaction(
+            PULSE_NAME.as_u64(),
+            0x1122_3344_5566_7788_99aa_bbcc_ddee_ff00,
+            PULSE_NAME.as_u64(),
+            trx_id,
+            0,
+            i64::MAX,
+            0,
+            scheduled.packed_trx_bytes(),
+        )?;
+
+        let mut producer_mempool = Mempool::new();
+        let block = producer.build_block(&mut producer_mempool).await?;
+        assert_eq!(block.transactions.len(), 1);
+        assert_eq!(
+            block.transactions[0].status(),
+            &crate::chain::transaction::TransactionStatus::SoftFail
+        );
+        assert_eq!(producer.db.deferred_transaction_count(), 0);
+
+        let (mut validator, _validator_key, validator_chain_id, _validator_temp) =
+            init_test_controller()?;
+        install_onerror_handler(&mut validator, &private_key, validator_chain_id)?;
+        validator.db.xpr_import_deferred_transaction(
+            PULSE_NAME.as_u64(),
+            0x1122_3344_5566_7788_99aa_bbcc_ddee_ff00,
+            PULSE_NAME.as_u64(),
+            trx_id,
+            0,
+            i64::MAX,
+            0,
+            scheduled.packed_trx_bytes(),
+        )?;
+        let mut validator_mempool = Mempool::new();
+        validator.verify_block(&block, &mut validator_mempool).await?;
+        validator.accept_block(&block.id()?, &mut validator_mempool)?;
+        assert_eq!(validator.db.deferred_transaction_count(), 0);
+
         Ok(())
     }
 
