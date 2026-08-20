@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Adapter for export.sh: run Leap's Linux nodeos under Docker while retaining
+# the host paths in the command line. The localnet work directory must be
+# beneath /tmp so it can be mounted at the same path in the container.
+set -euo pipefail
+
+readonly image="pulsevm-xpr-nodeos:leap-5.0.3"
+exec docker run --rm --platform linux/amd64 \
+    --network pulsevm-xpr-localnet \
+    --mount type=bind,src=/tmp,dst=/tmp \
+    "$image" nodeos "$@"

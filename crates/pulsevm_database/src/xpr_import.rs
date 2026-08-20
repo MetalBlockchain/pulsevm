@@ -22,7 +22,8 @@ use crate::{Database, Float128, U256};
 /// offset. These sizes are fixed by `state_history_log_header` in XPR core.
 const LOG_HEADER_LEN: usize = 8 + 32 + 8;
 const LOG_TRAILER_LEN: usize = 8;
-const COMPRESSED_SIZE_LEN: usize = 4;
+const PAYLOAD_FORMAT_LEN: usize = 4;
+const DECOMPRESSED_SIZE_LEN: usize = 8;
 
 /// Upper bound for a single imported full-state delta. This is an import-time
 /// guard, not a network limit; the streaming hydrator will avoid retaining this
@@ -708,15 +709,15 @@ fn decode_index_long_double(bytes: &[u8]) -> Result<PortableRow, XprImportError>
 /// framing disagrees with XPR core's writer instead of attempting recovery from
 /// a partially written export.
 pub fn parse_initial_state_history_log(bytes: &[u8]) -> Result<StateHistoryEntry, XprImportError> {
-    if bytes.len() < LOG_HEADER_LEN + COMPRESSED_SIZE_LEN + LOG_TRAILER_LEN {
+    if bytes.len() < LOG_HEADER_LEN + PAYLOAD_FORMAT_LEN + LOG_TRAILER_LEN {
         return Err(bad("state-history log is too short"));
     }
 
     let magic = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-    if (magic as u32) != 0 {
+    if (magic as u16) != 0 {
         return Err(bad(format!(
             "unsupported XPR state-history version {}",
-            magic as u32
+            magic as u16
         )));
     }
 
@@ -734,16 +735,47 @@ pub fn parse_initial_state_history_log(bytes: &[u8]) -> Result<StateHistoryEntry
     }
 
     let payload = &bytes[LOG_HEADER_LEN..LOG_HEADER_LEN + payload_len];
-    if payload.len() < COMPRESSED_SIZE_LEN {
-        return Err(bad("state-history payload is missing compressed length"));
-    }
-    let compressed_len = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
-    if compressed_len != payload.len() - COMPRESSED_SIZE_LEN {
-        return Err(bad(format!(
-            "state-history compressed length {compressed_len} does not match payload {}",
-            payload.len() - COMPRESSED_SIZE_LEN
-        )));
-    }
+    let compressed = match payload {
+        // XPR core (the original exporter pin): `uint32 compressed_size` plus
+        // zlib bytes. Retain this framing for source snapshots from that node.
+        payload
+            if payload.len() >= PAYLOAD_FORMAT_LEN
+                && u32::from_le_bytes(payload[0..PAYLOAD_FORMAT_LEN].try_into().unwrap())
+                    as usize
+                    == payload.len() - PAYLOAD_FORMAT_LEN =>
+        {
+            &payload[PAYLOAD_FORMAT_LEN..]
+        }
+        // Leap 5: `uint32 format=1`, `uint64 decompressed_size`, then zlib
+        // bytes. The source writes the uncompressed length so a SHiP server
+        // can announce it before inflating the stream.
+        payload
+            if payload.len() >= PAYLOAD_FORMAT_LEN + DECOMPRESSED_SIZE_LEN
+                && u32::from_le_bytes(payload[0..PAYLOAD_FORMAT_LEN].try_into().unwrap()) == 1 =>
+        {
+            let claimed_len = u64::from_le_bytes(
+                payload[PAYLOAD_FORMAT_LEN..PAYLOAD_FORMAT_LEN + DECOMPRESSED_SIZE_LEN]
+                    .try_into()
+                    .unwrap(),
+            );
+            if claimed_len > MAX_DECOMPRESSED_DELTA_LEN {
+                return Err(bad(format!(
+                    "state-history claimed delta exceeds {} byte import limit",
+                    MAX_DECOMPRESSED_DELTA_LEN
+                )));
+            }
+            &payload[PAYLOAD_FORMAT_LEN + DECOMPRESSED_SIZE_LEN..]
+        }
+        payload if payload.len() < PAYLOAD_FORMAT_LEN => {
+            return Err(bad("state-history payload is missing format marker"));
+        }
+        payload => {
+            return Err(bad(format!(
+                "unsupported state-history payload framing marker {}",
+                u32::from_le_bytes(payload[0..PAYLOAD_FORMAT_LEN].try_into().unwrap())
+            )));
+        }
+    };
 
     let record_pos = u64::from_le_bytes(
         bytes[LOG_HEADER_LEN + payload_len..entry_end]
@@ -756,7 +788,7 @@ pub fn parse_initial_state_history_log(bytes: &[u8]) -> Result<StateHistoryEntry
         )));
     }
 
-    let mut decoder = ZlibDecoder::new(&payload[COMPRESSED_SIZE_LEN..]);
+    let mut decoder = ZlibDecoder::new(compressed);
     let mut raw = Vec::new();
     decoder
         .by_ref()
@@ -1036,6 +1068,30 @@ mod tests {
         assert_eq!(entry.deltas[0].name, "account");
         assert_eq!(entry.deltas[0].rows[0].data, vec![1, 2, 3]);
         assert!(!entry.deltas[1].rows[0].present);
+    }
+
+    #[test]
+    fn parses_leap_5_state_history_entry() {
+        let raw = [0]; // zero table deltas
+        let mut compressed = ZlibEncoder::new(Vec::new(), Compression::default());
+        compressed.write_all(&raw).unwrap();
+        let compressed = compressed.finish().unwrap();
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1u32.to_le_bytes()); // Leap 5 framing
+        payload.extend_from_slice(&(raw.len() as u64).to_le_bytes());
+        payload.extend_from_slice(&compressed);
+
+        let mut log = Vec::new();
+        log.extend_from_slice(&0u64.to_le_bytes()); // SHiP version 0
+        log.extend_from_slice(&[0xcdu8; 32]);
+        log.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        log.extend_from_slice(&payload);
+        log.extend_from_slice(&0u64.to_le_bytes()); // first entry offset
+
+        let entry = parse_initial_state_history_log(&log).unwrap();
+        assert_eq!(entry.block_id, [0xcdu8; 32]);
+        assert!(entry.deltas.is_empty());
     }
 
     #[test]
