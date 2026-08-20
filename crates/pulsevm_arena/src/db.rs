@@ -412,13 +412,15 @@ impl Db {
 
     /// Loads a checkpoint written by [`Db::checkpoint`] into the already-
     /// registered (empty) tables and restores the revision. Every section must
-    /// map to a registered table and every registered table must appear.
+    /// map to a registered table. Registered tables absent from an older
+    /// checkpoint remain empty, making additive Arena schema changes (such as
+    /// the deferred-transaction table) backward-compatible. Unknown checkpoint
+    /// table ids remain a hard error so a checkpoint is never partially read.
     pub fn load(&mut self, path: impl AsRef<Path>) -> Result<(), DbError> {
         let data = std::fs::read(path.as_ref()).map_err(|e| DbError::Io(e.to_string()))?;
         let mut pos = 0usize;
         let revision = read_i64(&data, &mut pos)?;
         let count = read_u64(&data, &mut pos)? as usize;
-        let mut seen = 0usize;
         for _ in 0..count {
             let type_id = read_u16(&data, &mut pos)?;
             let len = read_u64(&data, &mut pos)? as usize;
@@ -431,12 +433,6 @@ impl Db {
             })?;
             self.tables[table_pos].load_from(&data[pos..end])?;
             pos = end;
-            seen += 1;
-        }
-        if seen != self.tables.len() {
-            return Err(DbError::Corrupted(
-                "checkpoint is missing a registered table".into(),
-            ));
         }
         self.set_revision(revision)?;
         Ok(())
