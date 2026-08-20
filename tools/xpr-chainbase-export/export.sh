@@ -10,13 +10,14 @@ readonly pinned_core_revision="d133c6413ce8ce2e96096a0513ec25b4a8dbe837"
 usage() {
     cat <<'EOF'
 Usage:
-  export.sh --nodeos PATH --snapshot PATH --work-dir PATH --p2p-peer HOST:PORT [options]
+  export.sh --nodeos PATH --snapshot PATH --work-dir PATH [options]
 
 Required:
   --nodeos PATH            XPR Leap nodeos binary built from the source revision below
   --snapshot PATH          XPR nodeos snapshot (.bin) to hydrate
   --work-dir PATH          New directory for this export; it must not exist
-  --p2p-peer HOST:PORT     Peer used to receive one post-snapshot block; repeatable
+  --p2p-peer HOST:PORT     Optional source-network peer; repeatable. Omit for
+                           a snapshot-only export with no post-snapshot blocks.
 
 Options:
   --source-revision SHA    XPR Leap revision that produced nodeos
@@ -24,6 +25,9 @@ Options:
   --xpr-core PATH          Matching XPR Leap checkout; validates the source
                           revision and deferred-sidecar plugin before export
   --timeout-seconds N      Maximum time to wait for the initial full delta (default: 300)
+  --chain-state-db-size-mb N
+                           Allocate N MiB for nodeos chainbase while restoring
+                           the snapshot (default: nodeos default)
   --deferred-sidecar PATH  Write complete deferred-transaction chainbase state
                            through the bundled source-node plugin
   --help                   Show this help
@@ -45,6 +49,7 @@ snapshot=""
 work_dir=""
 source_revision="$pinned_core_revision"
 timeout_seconds=300
+chain_state_db_size_mb=0
 deferred_sidecar=""
 xpr_core=""
 peers=()
@@ -58,6 +63,7 @@ while (($#)); do
         --source-revision) source_revision="$2"; shift 2 ;;
         --xpr-core) xpr_core="$2"; shift 2 ;;
         --timeout-seconds) timeout_seconds="$2"; shift 2 ;;
+        --chain-state-db-size-mb) chain_state_db_size_mb="$2"; shift 2 ;;
         --deferred-sidecar) deferred_sidecar="$2"; shift 2 ;;
         --help) usage; exit 0 ;;
         *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -67,9 +73,12 @@ done
 [[ -x "$nodeos" ]] || { echo "nodeos is not executable: $nodeos" >&2; exit 2; }
 [[ -f "$snapshot" ]] || { echo "snapshot does not exist: $snapshot" >&2; exit 2; }
 [[ -n "$work_dir" ]] || { echo "--work-dir is required" >&2; exit 2; }
-((${#peers[@]})) || { echo "at least one --p2p-peer is required" >&2; exit 2; }
 [[ "$timeout_seconds" =~ ^[1-9][0-9]*$ ]] || {
     echo "--timeout-seconds must be a positive integer" >&2
+    exit 2
+}
+[[ "$chain_state_db_size_mb" =~ ^[0-9]+$ ]] || {
+    echo "--chain-state-db-size-mb must be a non-negative integer" >&2
     exit 2
 }
 [[ ! -e "$work_dir" ]] || { echo "work directory already exists: $work_dir" >&2; exit 2; }
@@ -89,9 +98,11 @@ if [[ -n "$xpr_core" || -n "$deferred_sidecar" ]]; then
         --xpr-core "$xpr_core"
         --source-revision "$source_revision"
     )
-    for peer in "${peers[@]}"; do
-        preflight_args+=(--p2p-peer "$peer")
-    done
+    if ((${#peers[@]})); then
+        for peer in "${peers[@]}"; do
+            preflight_args+=(--p2p-peer "$peer")
+        done
+    fi
     if [[ -n "$deferred_sidecar" ]]; then
         preflight_args+=(--require-sidecar-plugin)
     fi
@@ -115,15 +126,20 @@ args=(
     --chain-state-history
     --state-history-endpoint 127.0.0.1:0
 )
+if ((chain_state_db_size_mb > 0)); then
+    args+=(--chain-state-db-size-mb "$chain_state_db_size_mb")
+fi
 if [[ -n "$deferred_sidecar" ]]; then
     args+=(
         --plugin eosio::deferred_transaction_sidecar_plugin
         --deferred-transaction-sidecar-path "$deferred_sidecar"
     )
 fi
-for peer in "${peers[@]}"; do
-    args+=(--p2p-peer-address "$peer")
-done
+if ((${#peers[@]})); then
+    for peer in "${peers[@]}"; do
+        args+=(--p2p-peer-address "$peer")
+    done
+fi
 
 "$nodeos" "${args[@]}" >"$nodeos_log" 2>&1 &
 nodeos_pid=$!
@@ -137,7 +153,12 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 for ((elapsed = 0; elapsed < timeout_seconds; elapsed++)); do
-    if [[ -s "$history_log" ]]; then
+    # state_history_plugin emits this completion log only after its initial
+    # snapshot record is fully flushed. Wait for it and the optional sidecar,
+    # rather than treating the first bytes of a live log as a complete export.
+    if rg -q 'Done storing initial state on startup' "$nodeos_log" \
+       && [[ -s "$history_log" ]] \
+       && { [[ -z "$deferred_sidecar" ]] || [[ -s "$deferred_sidecar" ]]; }; then
         break
     fi
     if ! kill -0 "$nodeos_pid" 2>/dev/null; then
@@ -149,6 +170,10 @@ done
 
 [[ -s "$history_log" ]] || {
     echo "timed out waiting for full chain-state delta; see $nodeos_log" >&2
+    exit 1
+}
+rg -q 'Done storing initial state on startup' "$nodeos_log" || {
+    echo "timed out waiting for complete chain-state delta; see $nodeos_log" >&2
     exit 1
 }
 if [[ -n "$deferred_sidecar" && ! -s "$deferred_sidecar" ]]; then

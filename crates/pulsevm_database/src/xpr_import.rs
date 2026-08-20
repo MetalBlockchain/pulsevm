@@ -1502,7 +1502,11 @@ fn parse_table_deltas(bytes: &[u8]) -> Result<Vec<TableDelta>, XprImportError> {
         let name = cursor.bytes()?;
         let name =
             String::from_utf8(name).map_err(|_| bad("table-delta name is not valid UTF-8"))?;
-        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') {
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        {
             return Err(bad(format!("invalid table-delta name {name:?}")));
         }
 

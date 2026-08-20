@@ -10,13 +10,13 @@ readonly pinned_core_revision="d133c6413ce8ce2e96096a0513ec25b4a8dbe837"
 usage() {
     cat <<'EOF'
 Usage:
-  preflight.sh --nodeos PATH --snapshot PATH --xpr-core PATH --p2p-peer HOST:PORT [options]
+  preflight.sh --nodeos PATH --snapshot PATH --xpr-core PATH [options]
 
 Required:
   --nodeos PATH            XPR nodeos binary to use for export
   --snapshot PATH          Read-only XPR nodeos snapshot (.bin)
   --xpr-core PATH          XPR Leap Git checkout used to build nodeos
-  --p2p-peer HOST:PORT     Source-network peer; repeatable
+  --p2p-peer HOST:PORT     Optional source-network peer; repeatable
 
 Options:
   --source-revision SHA    Required checkout revision
@@ -67,16 +67,16 @@ done
     echo "--minimum-free-gib must be a non-negative integer" >&2
     exit 2
 }
-((${#peers[@]})) || { echo "at least one --p2p-peer is required" >&2; exit 2; }
-
-for peer in "${peers[@]}"; do
-    host="${peer%:*}"
-    port="${peer##*:}"
-    [[ -n "$host" && "$port" =~ ^[0-9]+$ && "$port" -ge 1 && "$port" -le 65535 ]] || {
-        echo "invalid --p2p-peer (expected HOST:PORT): $peer" >&2
-        exit 2
-    }
-done
+if ((${#peers[@]})); then
+    for peer in "${peers[@]}"; do
+        host="${peer%:*}"
+        port="${peer##*:}"
+        [[ -n "$host" && "$port" =~ ^[0-9]+$ && "$port" -ge 1 && "$port" -le 65535 ]] || {
+            echo "invalid --p2p-peer (expected HOST:PORT): $peer" >&2
+            exit 2
+        }
+    done
+fi
 
 checkout_revision="$(git -C "$xpr_core" rev-parse HEAD)"
 [[ "$checkout_revision" == "$source_revision" ]] || {

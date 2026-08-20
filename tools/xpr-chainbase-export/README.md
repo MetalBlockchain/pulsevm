@@ -28,13 +28,12 @@ tools/xpr-chainbase-export/preflight.sh \
   --nodeos /opt/xpr/bin/nodeos \
   --snapshot /data/xpr/snapshots/snapshot.bin \
   --xpr-core /src/antelope-leap \
-  --p2p-peer proton.p2p.example:9876 \
   --require-sidecar-plugin \
   --minimum-free-gib 250
 ```
 
 Preflight verifies the checkout's exact Git commit, snapshot digest, disk
-space, peer syntax, and installation/linkage of the required source-side
+space, optional peer syntax, and installation/linkage of the required source-side
 plugin. It cannot infer a snapshot's producing revision from the binary file;
 that mapping must come from the snapshot publisher or operator who created it.
 
@@ -45,13 +44,14 @@ tools/xpr-chainbase-export/export.sh \
   --nodeos /opt/xpr/bin/nodeos \
   --snapshot /data/xpr/snapshots/snapshot.bin \
   --work-dir /data/xpr-export-123456789 \
-  --p2p-peer proton.p2p.example:9876
+  --chain-state-db-size-mb 4096
 ```
 
 The script refuses an existing output directory and never changes the supplied
-snapshot. It stops the temporary XPR node after `chain_state_history.log` has a
-record. Give it multiple `--p2p-peer` arguments when a peer might be
-unavailable.
+snapshot. It stops the temporary XPR node only after Leap logs that its initial
+state record is complete. Leave `--p2p-peer` unset for a snapshot-only export:
+this prevents post-snapshot blocks from changing the history log before its
+manifest is hashed.
 
 ## Output contract
 
@@ -135,9 +135,14 @@ tools/xpr-chainbase-export/export.sh \
   --xpr-core /src/antelope-leap \
   --snapshot /data/xpr/snapshots/snapshot.bin \
   --work-dir /data/xpr-export-123456789 \
-  --p2p-peer proton.p2p.example:9876 \
+  --chain-state-db-size-mb 4096 \
   --deferred-sidecar /data/xpr-export-123456789/deferred-transactions.json
 ```
+
+Large Mainnet snapshots can exceed nodeos's default chainbase allocation. Pass
+`--chain-state-db-size-mb` (for example `4096`) when the source node reports
+that the database lacks storage for the snapshot. The allocation must fit the
+machine running nodeos.
 
 The installer refuses a non-pinned Git checkout and never overwrites an
 existing plugin. The exporter also refuses to proceed if a requested sidecar
