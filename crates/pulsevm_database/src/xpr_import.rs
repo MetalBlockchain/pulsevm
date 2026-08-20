@@ -70,6 +70,9 @@ pub struct ImportSummary {
     pub resource_usage: u64,
     pub resource_states: u64,
     pub resource_configs: u64,
+    /// Added after manifest version 1 was already emitted by local migration
+    /// fixtures. Absent means the older artifact contained no deferred rows.
+    #[serde(default)]
     pub deferred_transactions: u64,
     pub contract_tables: u64,
     pub contract_rows: u64,
@@ -2027,6 +2030,41 @@ mod tests {
             manifest.deferred_transaction_sidecar_sha256,
             Some(hex::encode(Digest::hash(b"sidecar").as_bytes()))
         );
+    }
+
+    #[test]
+    fn migration_manifest_accepts_pre_deferred_summary() {
+        let manifest: MigrationManifest = serde_json::from_str(
+            r#"{
+                "version": 1,
+                "source_state_history_sha256": "00",
+                "source_block_id": "00",
+                "checkpoint_sha256": "00",
+                "checkpoint_revision": 1,
+                "import_summary": {
+                    "global_properties": 1,
+                    "accounts": 3,
+                    "account_metadata": 3,
+                    "code_rows": 0,
+                    "permissions": 9,
+                    "permission_links": 0,
+                    "resource_limits": 3,
+                    "resource_usage": 3,
+                    "resource_states": 1,
+                    "resource_configs": 1,
+                    "contract_tables": 0,
+                    "contract_rows": 0,
+                    "index64_rows": 0,
+                    "index128_rows": 0,
+                    "index256_rows": 0,
+                    "index_double_rows": 0,
+                    "index_long_double_rows": 0
+                }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(manifest.import_summary.accounts, 3);
+        assert_eq!(manifest.import_summary.deferred_transactions, 0);
     }
 
     fn delta(name: &str, data: Vec<u8>) -> TableDelta {
