@@ -41,7 +41,7 @@ pub struct BlockHeader {
     pub action_mroot: Digest,
     pub schedule_version: u32,
     // Placeholder for new producers, we don't use this for now
-    pub new_producers: Option<Vec<u8>>,
+    pub new_producers: Option<ProducerSchedule>,
     // Placeholder for header extensions, we don't use this for now
     pub header_extensions: Vec<(u16, Vec<u8>)>,
 }
@@ -66,15 +66,8 @@ impl BlockHeader {
     /// travels in the signed header, so it is committed with the block and can be
     /// reconstructed from the block log — the schedule is never trusted from an
     /// out-of-band source.
-    pub fn new_schedule(&self) -> Result<Option<ProducerSchedule>, ChainError> {
-        match &self.new_producers {
-            None => Ok(None),
-            Some(bytes) => {
-                let schedule = ProducerSchedule::read_bounded(bytes)
-                    .map_err(|e| ChainError::BlockError(format!("invalid new_producers: {}", e)))?;
-                Ok(Some(schedule))
-            }
-        }
+    pub fn new_schedule(&self) -> &Option<ProducerSchedule> {
+        &self.new_producers
     }
 
     fn block_num(&self) -> u32 {
@@ -117,7 +110,7 @@ impl BlockHeader {
         // implies version 0. `new_schedule()` bounds the decode. The signature and
         // execution binding are checked by the controller; here we enforce only
         // header self-consistency.
-        match self.new_schedule()? {
+        match self.new_schedule() {
             None => pulse_assert(
                 self.schedule_version == 0,
                 ChainError::BlockError("schedule version must be 0 without new producers".into()),
@@ -309,7 +302,7 @@ mod tests {
     #[test]
     fn new_schedule_round_trips_none_some_and_garbage() {
         // No schedule change -> None.
-        assert!(BlockHeader::default().new_schedule().unwrap().is_none());
+        assert!(BlockHeader::default().new_schedule().is_none());
 
         // A stamped header decodes back to the same schedule.
         let schedule = ProducerSchedule {
@@ -320,13 +313,8 @@ mod tests {
             }],
         };
         let mut header = BlockHeader::default();
-        header.new_producers = Some(schedule.pack().unwrap());
+        header.new_producers = Some(schedule.clone());
         header.schedule_version = 1;
-        assert_eq!(header.new_schedule().unwrap().unwrap(), schedule);
-
-        // Undecodable new_producers is an error, never a panic.
-        let mut header = BlockHeader::default();
-        header.new_producers = Some(vec![0xff, 0xff, 0xff, 0xff, 0xff]);
-        assert!(header.new_schedule().is_err());
+        assert_eq!(header.new_schedule().as_ref(), Some(&schedule));
     }
 }
