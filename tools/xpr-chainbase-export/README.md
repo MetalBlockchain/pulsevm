@@ -7,7 +7,7 @@ pointers, allocator metadata and ABI depend on the exact XPR binary.
 
 Instead, it starts the matching XPR `nodeos` with its
 `state_history_plugin`. XPR's Leap nodeos writes a complete chain-state delta for the
-first accepted block when the history log is empty. That delta contains the
+restored snapshot head when the history log is empty. That delta contains the
 logical chainbase tables (accounts, code, permissions, resources, contract
 tables and rows, and secondary indexes) in the standard SHiP framing. The
 PulseVM importer can hydrate Arena from that representation without relying on
@@ -66,7 +66,7 @@ PulseVM's Arena schema.
 SHiP's `generated_transaction_v0` rows are not a complete chainbase export:
 they omit `delay_until`, `expiration`, and `published`. A migration with even
 one deferred transaction therefore needs a source-node sidecar captured from
-the **same accepted block** as `chain_state_history.log`. Do not use an RPC
+the **same restored snapshot head** as `chain_state_history.log`. Do not use an RPC
 query from a later head block: it can produce a plausible but inconsistent
 snapshot.
 
@@ -117,7 +117,8 @@ execution also uses an ID-only receipt. Producer and validator both replay
 these paths from the committed Arena record.
 
 `deferred-sidecar-plugin/` contains the exact-XPR-source plugin that writes
-this file from chainbase on the first `accepted_block` callback. Install it in
+this file from chainbase during plugin startup, after snapshot hydration and
+before P2P catch-up. Install it in
 a clean checkout at the pinned revision and rebuild nodeos:
 
 ```bash

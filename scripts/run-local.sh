@@ -22,15 +22,20 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VM_ID="rXcAFxZvio99epp6TzEwYfexCfPAbJuBTMsjUUoiT7PkVykNs"
 BUILD_DIR="$REPO/build"
+PLUGIN_DIR="${PULSEVM_PLUGIN_DIR:-$BUILD_DIR/plugins}"
 NETWORK_RUNNER="${METAL_NETWORK_RUNNER_PATH:-$REPO/../metal-network-runner/bin/metal-network-runner}"
 RUNNER_PORT="${METAL_NETWORK_RUNNER_PORT:-:8080}"
 RUNNER_GATEWAY_PORT="${METAL_NETWORK_RUNNER_GATEWAY_PORT:-:8081}"
 RUNNER_ROOT_DATA_DIR="${METAL_NETWORK_RUNNER_ROOT_DATA_DIR:-}"
+RUNNER_REASSIGN_PORTS_IF_USED="${METAL_NETWORK_RUNNER_REASSIGN_PORTS_IF_USED:-false}"
 MIGRATION_GENESIS=""
 RUNNER_START_ARGS=()
 
 if [[ -n "$RUNNER_ROOT_DATA_DIR" ]]; then
   RUNNER_START_ARGS+=(--root-data-dir "$RUNNER_ROOT_DATA_DIR")
+fi
+if [[ "$RUNNER_REASSIGN_PORTS_IF_USED" == "true" ]]; then
+  RUNNER_START_ARGS+=(--reassign-ports-if-used)
 fi
 
 if [[ -z "${METALGO_EXEC_PATH:-}" || ! -x "${METALGO_EXEC_PATH:-}" ]]; then
@@ -43,9 +48,9 @@ echo "==> Building the PulseVM plugin (release)"
 ( cd "$REPO" && cargo build --release -p pulsevm )
 
 echo "==> Staging the plugin as $VM_ID"
-mkdir -p "$BUILD_DIR"
-cp "$REPO/target/release/pulsevm" "$BUILD_DIR/$VM_ID"
-chmod +x "$BUILD_DIR/$VM_ID"
+mkdir -p "$PLUGIN_DIR"
+cp "$REPO/target/release/pulsevm" "$PLUGIN_DIR/$VM_ID"
+chmod +x "$PLUGIN_DIR/$VM_ID"
 
 echo "==> Locating metal-network-runner"
 if [[ ! -x "$NETWORK_RUNNER" ]]; then
@@ -104,7 +109,7 @@ echo "==> Launching a 5-node cluster running PulseVM"
   --endpoint="0.0.0.0$RUNNER_PORT" \
   --number-of-nodes=5 \
   --metalgo-path "$METALGO_EXEC_PATH" \
-  --plugin-dir "$BUILD_DIR" \
+  --plugin-dir "$PLUGIN_DIR" \
   "${RUNNER_START_ARGS[@]}" \
   --blockchain-specs "$BLOCKCHAIN_SPECS"
 
