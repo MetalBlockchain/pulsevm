@@ -70,6 +70,11 @@ pub struct ImportSummary {
     pub resource_usage: u64,
     pub resource_states: u64,
     pub resource_configs: u64,
+    /// Activated Leap protocol features observed in the source snapshot. They
+    /// are audit metadata: the destination is a new Pulse chain and does not
+    /// replay XPR's feature-activation history.
+    #[serde(default)]
+    pub source_activated_protocol_features: u64,
     /// Added after manifest version 1 was already emitted by local migration
     /// fixtures. Absent means the older artifact contained no deferred rows.
     #[serde(default)]
@@ -442,7 +447,6 @@ pub fn hydrate_full_state_with_deferred_transactions(
             match row {
                 PortableRow::Account { .. }
                 | PortableRow::GlobalProperty { .. }
-                | PortableRow::EmptyProtocolState
                 | PortableRow::PermissionLink { .. }
                 | PortableRow::ResourceLimits { .. }
                 | PortableRow::ResourceUsage { .. }
@@ -451,6 +455,9 @@ pub fn hydrate_full_state_with_deferred_transactions(
                 | PortableRow::AccountMetadata { .. }
                 | PortableRow::Code { .. }
                 | PortableRow::Permission { .. } => {}
+                PortableRow::ProtocolState { activated_features } => {
+                    summary.source_activated_protocol_features += activated_features;
+                }
                 PortableRow::GeneratedTransaction { .. } => {}
                 PortableRow::ContractTable {
                     code,
@@ -572,10 +579,9 @@ enum PortableRow {
     /// database starts a new Pulse chain with its own producer schedule. Its
     /// chain execution configuration is retained in Arena.
     GlobalProperty { config: ChainConfigV0 },
-    /// A source with activated protocol features cannot be treated as a Pulse
-    /// runtime without an explicit feature mapping. The empty fixture state is
-    /// safe and needs no storage in the target runtime.
-    EmptyProtocolState,
+    /// Source activation history is validated and recorded in the migration
+    /// manifest, but not replayed into the independent Pulse runtime.
+    ProtocolState { activated_features: u64 },
     PermissionLink {
         account: u64,
         code: u64,
@@ -725,7 +731,7 @@ fn decode_portable_rows(entry: &StateHistoryEntry) -> Result<Vec<PortableRow>, X
             }
             let decoded = match delta.name.as_str() {
                 "global_property" => decode_global_property(&row.data)?,
-                "protocol_state" => decode_empty_protocol_state(&row.data)?,
+                "protocol_state" => decode_protocol_state(&row.data)?,
                 "permission_link" => decode_permission_link(&row.data)?,
                 "resource_limits" => decode_resource_limits(&row.data)?,
                 "resource_usage" => decode_resource_usage(&row.data)?,
@@ -1045,16 +1051,20 @@ fn skip_producer_authority_schedule(row: &mut RowCursor<'_>) -> Result<(), XprIm
     Ok(())
 }
 
-fn decode_empty_protocol_state(bytes: &[u8]) -> Result<PortableRow, XprImportError> {
+fn decode_protocol_state(bytes: &[u8]) -> Result<PortableRow, XprImportError> {
     let mut row = RowCursor::new(bytes);
     row.version()?;
-    if row.varuint()? != 0 {
-        return Err(bad(
-            "XPR activated protocol features require an explicit Pulse feature mapping",
-        ));
+    let activated_features = row.varuint()?;
+    if activated_features > 10_000 {
+        return Err(bad("XPR protocol-state feature count is too large"));
+    }
+    for _ in 0..activated_features {
+        row.version()?;
+        row.fixed::<32>()?; // source feature digest
+        row.u32()?; // source activation block number
     }
     row.finish()?;
-    Ok(PortableRow::EmptyProtocolState)
+    Ok(PortableRow::ProtocolState { activated_features })
 }
 
 fn decode_permission_link(bytes: &[u8]) -> Result<PortableRow, XprImportError> {
@@ -1234,8 +1244,11 @@ fn decode_authority(row: &mut RowCursor<'_>) -> Result<Vec<u8>, XprImportError> 
     out.extend_from_slice(&threshold.to_le_bytes());
     out.extend_from_slice(&(key_count as u32).to_le_bytes());
     for _ in 0..key_count {
-        if row.varuint()? != 0 {
-            return Err(bad("XPR authority contains a non-K1 public key"));
+        let key_type = row.varuint()?;
+        if key_type != 0 {
+            return Err(bad(format!(
+                "XPR authority contains unsupported public-key type {key_type}"
+            )));
         }
         let point = row.fixed::<33>()?;
         let weight = row.u16()?;
