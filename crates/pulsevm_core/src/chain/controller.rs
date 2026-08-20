@@ -735,7 +735,7 @@ impl Controller {
                 )));
             }
             db.arena_start_undo_session();
-            match self.execute_deferred_transaction(&transaction, &timestamp, &block_status) {
+            match self.execute_deferred_transaction_with_failure(&transaction, &timestamp, &block_status) {
                 Ok(result) => {
                     db.arena_remove_deferred_transaction(scheduled.trx_id)?;
                     db.arena_squash();
@@ -749,7 +749,7 @@ impl Controller {
                         proposed_schedule = result.proposed_schedule;
                     }
                 }
-                Err(deferred_error) => {
+                Err((deferred_error, failure_cpu_us)) => {
                     db.arena_undo();
                     // XPR retires a failed generated transaction by sending its
                     // original raw bytes to `eosio::onerror`, with the original
@@ -772,11 +772,45 @@ impl Controller {
                         }
                         Err(onerror_error) => {
                             db.arena_undo();
-                            db.arena_undo();
-                            return Err(ChainError::TransactionError(format!(
-                                "deferred transaction {} failed ({deferred_error}); its onerror callback also failed: {onerror_error}",
+                            // Both the deferred transaction and its callback
+                            // failed objectively. Retire it with the original
+                            // transaction id and billed failure CPU.
+                            let account = transaction
+                                .get_transaction()
+                                .first_authorizer()
+                                .ok_or_else(|| ChainError::TransactionError(
+                                    "deferred transaction has no authorizer".into(),
+                                ))?;
+                            ResourceLimitsManager::add_transaction_usage(
+                                &mut self.db,
+                                &Name::new(account),
+                                failure_cpu_us as u64,
+                                0,
+                                timestamp.slot(),
+                                true,
+                            )?;
+                            let receipt = crate::chain::transaction::TransactionReceiptHeader::new(
+                                crate::chain::transaction::TransactionStatus::HardFail,
+                                failure_cpu_us,
+                                0u32.into(),
+                            );
+                            let mut trace = TransactionTrace::default();
+                            trace.id = Id::new(scheduled.trx_id);
+                            trace.block_num = self.last_accepted_block().block_num() + 1;
+                            trace.block_time = timestamp.clone();
+                            trace.scheduled = true;
+                            trace.receipt = receipt.clone();
+                            db.arena_remove_deferred_transaction(scheduled.trx_id)?;
+                            db.arena_squash();
+                            transaction_traces.push(trace);
+                            transaction_receipts.push_back(TransactionReceipt::for_id(
+                                receipt,
+                                Id::new(scheduled.trx_id),
+                            ));
+                            warn!(
+                                "deferred transaction {} and onerror both failed; retired as hard_fail: {deferred_error}; {onerror_error}",
                                 hex::encode(scheduled.trx_id)
-                            )));
+                            );
                         }
                     }
                 }
@@ -1498,10 +1532,45 @@ impl Controller {
                         self.execute_deferred_onerror(&deferred, timestamp, block_status)?
                     }
                     crate::chain::transaction::TransactionStatus::HardFail => {
-                        return Err(ChainError::BlockError(format!(
-                            "block marks deferred transaction {} as hard_fail, which is not supported yet",
-                            receipt.transaction_id()
-                        )));
+                        if deferred.expiration < now || receipt.net_usage_words() != 0 {
+                            return Err(ChainError::BlockError(format!(
+                                "block has an invalid hard_fail receipt for generated transaction {}",
+                                receipt.transaction_id()
+                            )));
+                        }
+                        let transaction = PackedTransaction::from_deferred_transaction_bytes(
+                            Bytes::from(deferred.packed_trx.clone()),
+                        )?;
+                        let account = transaction
+                            .get_transaction()
+                            .first_authorizer()
+                            .ok_or_else(|| ChainError::BlockError(
+                                "hard_fail generated transaction has no authorizer".into(),
+                            ))?;
+                        ResourceLimitsManager::add_transaction_usage(
+                            &mut self.db,
+                            &Name::new(account),
+                            receipt.cpu_usage_us() as u64,
+                            0,
+                            timestamp.slot(),
+                            false,
+                        )?;
+                        let mut trace = TransactionTrace::default();
+                        trace.id = *receipt.transaction_id();
+                        trace.block_num = self.last_accepted_block().block_num() + 1;
+                        trace.block_time = timestamp.clone();
+                        trace.scheduled = true;
+                        trace.receipt = crate::chain::transaction::TransactionReceiptHeader::new(
+                            crate::chain::transaction::TransactionStatus::HardFail,
+                            receipt.cpu_usage_us(),
+                            0u32.into(),
+                        );
+                        TransactionResult {
+                            trace,
+                            billed_cpu_time_us: receipt.cpu_usage_us(),
+                            action_receipt_digests: VecDeque::new(),
+                            proposed_schedule: None,
+                        }
                     }
                     crate::chain::transaction::TransactionStatus::Delayed => {
                         return Err(ChainError::BlockError(format!(
@@ -1673,23 +1742,45 @@ impl Controller {
         )
     }
 
-    /// Execute a durable scheduled transaction. This is not exposed through
-    /// mempool admission: only the controller calls it after resolving the
-    /// transaction ID to an Arena deferred record.
-    fn execute_deferred_transaction(
+    /// Deferred execution variant which keeps the context alive on failure so
+    /// the scheduler can produce XPR's objectively billed `hard_fail` receipt.
+    fn execute_deferred_transaction_with_failure(
         &mut self,
         packed_transaction: &PackedTransaction,
         pending_block_timestamp: &BlockTimestamp,
         block_status: &BlockStatus,
-    ) -> Result<TransactionResult, ChainError> {
-        self.execute_transaction_billed_with_authorization(
-            packed_transaction,
-            pending_block_timestamp,
-            block_status,
-            None,
-            true,
-            true,
-        )
+    ) -> Result<TransactionResult, (ChainError, u32)> {
+        let mut trx_context = TransactionContext::new(
+            self.db.clone(),
+            self.wasm_runtime.clone(),
+            self.last_accepted_block().block_num() + 1,
+            pending_block_timestamp.clone(),
+            packed_transaction.id(),
+            *block_status,
+            packed_transaction.clone(),
+            self.max_transaction_time_ms(),
+        );
+        if let Err(error) = self.set_context_active_schedule(&trx_context) {
+            return Err((error, 0));
+        }
+        let transaction = packed_transaction.get_transaction();
+        if let Err(error) = trx_context.init_for_deferred_trx(
+            packed_transaction.get_unprunable_size().map_err(|error| (error, 0))?,
+            packed_transaction.get_prunable_size().map_err(|error| (error, 0))?,
+            transaction,
+        ) {
+            return Err((
+                error,
+                trx_context.failure_billed_cpu_time_us().unwrap_or_default(),
+            ));
+        }
+        if let Err(error) = trx_context.exec(transaction) {
+            return Err((
+                error,
+                trx_context.failure_billed_cpu_time_us().unwrap_or_default(),
+            ));
+        }
+        trx_context.finalize().map_err(|error| (error, 0))
     }
 
     /// Execute the XPR `eosio::onerror` notification after a deferred

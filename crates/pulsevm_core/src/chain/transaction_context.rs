@@ -578,6 +578,22 @@ impl TransactionContext {
         Ok(())
     }
 
+    /// Deterministic CPU amount to charge when an objectively executed deferred
+    /// transaction fails before `finalize`. The trace already contains all
+    /// metered action work; apply the same minimum floor used by successful
+    /// transactions so a failed generated transaction cannot escape billing.
+    pub fn failure_billed_cpu_time_us(&self) -> Result<u32, ChainError> {
+        let inner = self.inner.read()?;
+        if inner.explicit_billed_cpu_time {
+            return Ok(inner.explicit_cpu_us);
+        }
+        Ok(inner
+            .trace
+            .receipt
+            .cpu_usage_us
+            .max(self.db.chain_config()?.min_transaction_cpu_usage))
+    }
+
     pub fn finalize(mut self) -> Result<TransactionResult, ChainError> {
         let mut inner = self.inner.write()?;
         // On replay use the recorded usage: override the re-measured amounts so
