@@ -48,6 +48,21 @@ pub struct PackedTransaction {
 }
 
 impl PackedTransaction {
+    /// Materialize the raw `transaction` bytes XPR stores in a
+    /// `generated_transaction_object`. Deferred transactions have already
+    /// passed authorization when scheduled, so their source representation has
+    /// neither signatures nor context-free data. The caller must use the
+    /// controller's deferred execution path; normal mempool admission still
+    /// rejects the empty signature set.
+    pub fn from_deferred_transaction_bytes(packed_trx: Bytes) -> Result<Self, ChainError> {
+        Self::new(
+            BTreeSet::new(),
+            TransactionCompression::None,
+            Bytes::default(),
+            packed_trx,
+        )
+    }
+
     #[inline]
     pub fn new(
         signatures: BTreeSet<Signature>,

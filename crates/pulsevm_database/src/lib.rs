@@ -49,6 +49,7 @@ pub use crate::{
         parse_initial_state_history_log,
     },
 };
+pub use pulsevm_chaindb::DeferredTransaction;
 // Re-export shared chain value types for the database facade's public API.
 pub use pulsevm_chain_types::{
     Authority,

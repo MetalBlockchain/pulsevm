@@ -3398,6 +3398,28 @@ impl ChainDatabase {
         rows.into_iter().map(|(_, _, row)| row).collect()
     }
 
+    /// Find a deferred transaction by its immutable id. Block verification uses
+    /// this instead of trusting a producer-provided marker: the durable Arena
+    /// record is the sole proof that a zero-signature transaction is scheduled.
+    pub fn deferred_transaction(&self, trx_id: [u8; 32]) -> Option<DeferredTransaction> {
+        let db = self.lock();
+        let row = db
+            .find_by::<DeferredTransactionRow, DeferredByTrxId>(&trx_id)
+            .ok()
+            .flatten()?;
+        let packed_trx = db.blob::<DeferredTransactionRow>(row.packed_trx).ok()?.to_vec();
+        Some(DeferredTransaction {
+            sender: row.sender,
+            sender_id: (row.sender_id_lo as u128) | ((row.sender_id_hi as u128) << 64),
+            payer: row.payer,
+            trx_id: row.trx_id,
+            delay_until: row.delay_until,
+            expiration: row.expiration,
+            published: row.published,
+            packed_trx,
+        })
+    }
+
     /// Remove a pending deferred transaction by its immutable transaction id.
     /// The scheduler calls this only inside the block undo session after it has
     /// selected the record for expiration or execution.

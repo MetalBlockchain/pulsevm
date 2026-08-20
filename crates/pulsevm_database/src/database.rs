@@ -1888,6 +1888,29 @@ impl Database {
         self.backend.deferred_transaction_count()
     }
 
+    pub fn arena_deferred_transaction(
+        &self,
+        trx_id: [u8; 32],
+    ) -> Option<crate::backend::DeferredTransaction> {
+        self.backend.deferred_transaction(trx_id)
+    }
+
+    pub fn arena_due_deferred_transactions(
+        &self,
+        now_micros: i64,
+    ) -> Vec<crate::backend::DeferredTransaction> {
+        self.backend.due_deferred_transactions(now_micros)
+    }
+
+    pub fn arena_remove_deferred_transaction(
+        &self,
+        trx_id: [u8; 32],
+    ) -> Result<bool, ChainError> {
+        self.backend
+            .remove_deferred_transaction(trx_id)
+            .map_err(|e| ChainError::InternalError(format!("arena remove deferred transaction: {e:?}")))
+    }
+
     pub(crate) fn xpr_import_permission(
         &self,
         parent: i64,
