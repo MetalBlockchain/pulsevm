@@ -4688,6 +4688,126 @@ mod tests {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn deferred_transaction_host_round_trip() -> Result<(), ChainError> {
+        fn wat_bytes(bytes: &[u8]) -> String {
+            bytes.iter().map(|byte| format!("\\{byte:02x}")).collect()
+        }
+
+        let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
+        let account = Name::from_str("testapi")?;
+        let pending_block_timestamp = controller.last_accepted_block().timestamp().clone();
+        let block_status = BlockStatus::Building;
+
+        controller.execute_transaction(
+            &create_account(&private_key, account, chain_id)?,
+            &pending_block_timestamp,
+            &block_status,
+        )
+        .map_err(|error| ChainError::InternalError(format!("create account: {error}")))?;
+
+        // The deferred payload only needs to be a canonical transaction with an
+        // action. It is not executed in this test; the scheduler stores the raw
+        // transaction bytes and indexes them by (receiver, sender_id).
+        let deferred = Transaction::new(
+            TransactionHeader::new(TimePointSec::maximum(), 0, 0, 0u32.into(), 0, 0u32.into()),
+            vec![],
+            vec![Action::new(
+                PULSE_NAME,
+                Name::from_str("noop")?,
+                vec![],
+                vec![],
+            )],
+        )
+        .pack()?;
+        let deferred_len = deferred.len();
+        let deferred_data = wat_bytes(&deferred);
+        let payer = account.as_u64();
+        let sender_id = 7u128;
+        let send_contract = wat::parse_str(format!(
+            r#"
+            (module
+              (import "env" "send_deferred"
+                (func $send (param i32 i64 i32 i32 i32)))
+              (memory (export "memory") 1)
+              (data (i32.const 32) "{deferred_data}")
+              (func (export "apply") (param i64 i64 i64)
+                (i64.store (i32.const 0) (i64.const 7))
+                (call $send (i32.const 0) (i64.const {payer})
+                  (i32.const 32) (i32.const {deferred_len}) (i32.const 0))))
+            "#
+        ))
+        .map_err(|error| ChainError::WasmRuntimeError(error.to_string()))?;
+        controller.execute_transaction(
+            &set_code(&private_key, account, send_contract, chain_id)?,
+            &pending_block_timestamp,
+            &block_status,
+        )
+        .map_err(|error| ChainError::InternalError(format!("set send code: {error}")))?;
+        controller.execute_transaction(
+            &call_contract(
+                &private_key,
+                account,
+                Name::from_str("run")?,
+                &Vec::<u8>::new(),
+                chain_id,
+            )?,
+            &pending_block_timestamp,
+            &block_status,
+        )
+        .map_err(|error| ChainError::InternalError(format!("call send: {error}")))?;
+
+        let scheduled = controller
+            .db
+            .arena_deferred_transaction_by_sender_id(account.as_u64(), sender_id)
+            .expect("send_deferred must create a generated transaction row");
+        assert_eq!(scheduled.sender, account.as_u64());
+        assert_eq!(scheduled.sender_id, sender_id);
+        assert_eq!(scheduled.payer, payer);
+        assert_eq!(&scheduled.packed_trx[..], deferred.as_slice());
+
+        let cancel_contract = wat::parse_str(
+            r#"
+            (module
+              (import "env" "cancel_deferred"
+                (func $cancel (param i32) (result i32)))
+              (memory (export "memory") 1)
+              (func (export "apply") (param i64 i64 i64)
+                (i64.store (i32.const 0) (i64.const 7))
+                (drop (call $cancel (i32.const 0)))))
+            "#,
+        )
+        .map_err(|error| ChainError::WasmRuntimeError(error.to_string()))?;
+        controller.execute_transaction(
+            &set_code(&private_key, account, cancel_contract, chain_id)?,
+            &pending_block_timestamp,
+            &block_status,
+        )
+        .map_err(|error| ChainError::InternalError(format!("set cancel code: {error}")))?;
+        controller.execute_transaction(
+            &call_contract(
+                &private_key,
+                account,
+                Name::from_str("cancel")?,
+                &Vec::<u8>::new(),
+                chain_id,
+            )?,
+            &pending_block_timestamp,
+            &block_status,
+        )
+        .map_err(|error| ChainError::InternalError(format!("call cancel: {error}")))?;
+        assert!(
+            controller
+                .db
+                .arena_deferred_transaction_by_sender_id(account.as_u64(), sender_id)
+                .is_none(),
+            "cancel_deferred must remove the generated transaction row"
+        );
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_api_db() -> Result<(), ChainError> {
         let (mut controller, private_key, _chain_id, _temp) = init_test_controller()?;
