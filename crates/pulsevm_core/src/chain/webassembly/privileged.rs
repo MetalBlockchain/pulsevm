@@ -43,6 +43,42 @@ fn privileged_check(context: &ApplyContext) -> Result<(), RuntimeError> {
     Ok(())
 }
 
+/// XPR/Leap system contracts import `preactivate_feature` even on chains where
+/// the requested feature is already active. Arena currently imports the
+/// activated feature set from chainbase, but does not yet persist a transient
+/// preactivation queue for future block activation. Accepting an already-active
+/// digest is therefore safe and makes those contracts instantiable; a request
+/// for a future feature fails explicitly instead of silently changing consensus.
+pub fn preactivate_feature(
+    mut env: FunctionEnvMut<WasmContext>,
+    feature_ptr: WasmPtr<u8>,
+) -> Result<(), RuntimeError> {
+    {
+        context_aware_check(&env)?;
+        let context = env.data_mut().apply_context_mut();
+        privileged_check(context)?;
+    }
+
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::PRIVILEGED + cost::per_byte(32))?;
+    let memory = env_data
+        .memory()
+        .as_ref()
+        .expect("Wasm memory not initialized");
+    let view = memory.view(&store);
+    let slice = feature_ptr.slice(&view, 32)?;
+    let mut digest = [0u8; 32];
+    slice.read_slice(&mut digest)?;
+
+    if env_data.db().protocol_feature_activated(digest) {
+        return Ok(());
+    }
+
+    Err(RuntimeError::new(
+        "preactivate_feature for an inactive digest is not supported by Arena yet",
+    ))
+}
+
 pub fn set_proposed_producers(
     mut env: FunctionEnvMut<WasmContext>,
     data_ptr: WasmPtr<u8>,

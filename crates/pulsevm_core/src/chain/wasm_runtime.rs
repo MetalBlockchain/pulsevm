@@ -196,6 +196,7 @@ use crate::chain::{
         pulse_assert_code,
         pulse_assert_message,
         pulse_exit,
+        preactivate_feature,
         read_action_data,
         read_transaction,
         recover_key,
@@ -721,6 +722,7 @@ impl WasmRuntime {
                 // Privilege and resource limit functions
                 "is_privileged" => Function::new_typed_with_env(&mut store, &env, is_privileged),
                 "set_privileged" => Function::new_typed_with_env(&mut store, &env, set_privileged),
+                "preactivate_feature" => Function::new_typed_with_env(&mut store, &env, preactivate_feature),
                 "set_proposed_producers" => Function::new_typed_with_env(&mut store, &env, set_proposed_producers),
                 "get_blockchain_parameters_packed" => Function::new_typed_with_env(&mut store, &env, get_blockchain_parameters_packed),
                 "set_blockchain_parameters_packed" => Function::new_typed_with_env(&mut store, &env, set_blockchain_parameters_packed),
