@@ -62,7 +62,12 @@ if [[ ! -x "$NETWORK_RUNNER" ]]; then
   fi
 fi
 
-BLOCKCHAIN_SPECS="[{\"vm_name\": \"pulsevm\", \"genesis\": \"$REPO/genesis.json\"}]"
+PRODUCER_KEY="${PULSEVM_PRODUCER_KEY:-PVT_K1_2pjSqJxTbRHq8h8aHHTux81Ypscb36Q2syB8UJbZcUmxbfZdnT}"
+# Always pass a node config. Without this field, metal-network-runner sends an
+# empty config to the VM on clean (non-migration) starts, which fails before
+# controller initialization with an opaque JSON EOF error.
+CHAIN_CONFIG="{\\\"producer_name\\\":\\\"pulse\\\",\\\"producer_key\\\":\\\"$PRODUCER_KEY\\\"}"
+BLOCKCHAIN_SPECS="[{\"vm_name\": \"pulsevm\", \"genesis\": \"$REPO/genesis.json\", \"chain_config\": \"$CHAIN_CONFIG\"}]"
 if [[ -n "${PULSEVM_MIGRATION_CHECKPOINT:-}" ]]; then
   if [[ ! -f "$PULSEVM_MIGRATION_CHECKPOINT" ]]; then
     echo "error: PULSEVM_MIGRATION_CHECKPOINT does not exist: $PULSEVM_MIGRATION_CHECKPOINT" >&2
@@ -84,7 +89,6 @@ if [[ -n "${PULSEVM_MIGRATION_CHECKPOINT:-}" ]]; then
     "$REPO/genesis.json" > "$MIGRATION_GENESIS"
   # This development key corresponds to genesis.json's initial_key. Override it
   # for a real producer deployment; it is part of the node-local VM config.
-  PRODUCER_KEY="${PULSEVM_PRODUCER_KEY:-PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez}"
   CHAIN_CONFIG="$(jq -cn \
     --arg checkpoint "$PULSEVM_MIGRATION_CHECKPOINT" \
     --arg manifest "$MIGRATION_MANIFEST" \
