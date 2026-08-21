@@ -41,6 +41,28 @@ use super::{
     authority_checker::AuthorityChecker,
 };
 
+const WEBAUTHN_KEY_FEATURE_DIGEST: [u8; 32] = [
+    0x92, 0x7f, 0xdf, 0x78, 0xc5, 0x1e, 0x77, 0xa8, 0x99, 0xf2, 0xdb, 0x93, 0x82, 0x49,
+    0xfb, 0x1f, 0x8b, 0xb3, 0x8f, 0x4e, 0x43, 0xd9, 0xc1, 0xf7, 0x5b, 0x19, 0x04, 0x92,
+    0x08, 0x0c, 0xbc, 0x34,
+];
+
+fn validate_protocol_key_features(
+    db: &Database,
+    provided_keys: &BTreeSet<AuthorityPublicKey>,
+) -> Result<(), ChainError> {
+    if provided_keys
+        .iter()
+        .any(|key| matches!(key, AuthorityPublicKey::WebAuthn { .. }))
+        && !db.protocol_feature_activated(WEBAUTHN_KEY_FEATURE_DIGEST)
+    {
+        return Err(ChainError::AuthorizationError(
+            "WebAuthn authority keys require the active WEBAUTHN_KEY protocol feature".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub struct AuthorizationManager;
 
 impl AuthorizationManager {
@@ -52,6 +74,7 @@ impl AuthorizationManager {
         provided_delay: Microseconds,
         satisfied_authorizations: &BTreeSet<PermissionLevel>,
     ) -> Result<(), ChainError> {
+        validate_protocol_key_features(db, provided_keys)?;
         // Config is served as an owned value, so no database object is held
         // across the pass.
         let chain_config = db.chain_config()?;
@@ -159,6 +182,7 @@ impl AuthorizationManager {
         provided_delay: Microseconds,
         allow_unused_keys: bool,
     ) -> Result<(), ChainError> {
+        validate_protocol_key_features(db, provided_keys)?;
         let auth = Authority::new_from_permission_level(&permission);
         let chain_config = db.chain_config()?;
         let r = db.read()?;
@@ -197,6 +221,7 @@ impl AuthorizationManager {
         candidate_keys: &BTreeSet<AuthorityPublicKey>,
         provided_delay: Microseconds,
     ) -> Result<BTreeSet<AuthorityPublicKey>, ChainError> {
+        validate_protocol_key_features(db, candidate_keys)?;
         let chain_config = db.chain_config()?;
         let r = db.read()?;
         let provided_permissions = BTreeSet::<PermissionLevel>::new();
@@ -550,5 +575,26 @@ impl AuthorizationManager {
                 ChainError::DatabaseError(format!("failed to update permission usage: {}", e))
             })?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn rejects_webauthn_keys_before_feature_activation() {
+        let dir = TempDir::new().unwrap();
+        let db = Database::new(dir.path().to_str().unwrap(), 64 * 1024 * 1024).unwrap();
+        let mut keys = BTreeSet::new();
+        keys.insert(AuthorityPublicKey::WebAuthn {
+            point: [2; 33],
+            user_presence: 1,
+            rpid: "example.com".into(),
+        });
+
+        let error = validate_protocol_key_features(&db, &keys).unwrap_err();
+        assert!(error.to_string().contains("WEBAUTHN_KEY"));
     }
 }

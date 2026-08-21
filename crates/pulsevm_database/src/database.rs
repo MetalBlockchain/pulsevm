@@ -3043,6 +3043,10 @@ impl Database {
         Some(self.backend.protocol_state_bytes())
     }
 
+    pub fn protocol_feature_activated(&self, feature_digest: [u8; 32]) -> bool {
+        self.backend.protocol_feature_activated(feature_digest)
+    }
+
     pub fn get_virtual_block_cpu_limit(&self) -> Result<u64, ChainError> {
         let s = &self.backend;
         return s

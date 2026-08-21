@@ -3247,6 +3247,13 @@ impl ChainDatabase {
         out
     }
 
+    pub fn protocol_feature_activated(&self, feature_digest: [u8; 32]) -> bool {
+        self.lock()
+            .table::<ProtocolFeatureRow>()
+            .map(|table| table.iter().any(|row| row.feature_digest == feature_digest))
+            .unwrap_or(false)
+    }
+
     // ----- resource_limits_config_object ------------------------------------
 
     /// Seeds the singleton `resource_limits_config` database from chainbase at
