@@ -59,6 +59,12 @@ const FORWARD_SETCODE_FEATURE_DIGEST: [u8; 32] = [
     0x02, 0x22,
 ];
 
+const RAM_RESTRICTIONS_FEATURE_DIGEST: [u8; 32] = [
+    0x18, 0x12, 0xfd, 0xb5, 0x09, 0x6f, 0xd8, 0x54, 0xa4, 0x95, 0x8e, 0xb9, 0xd5, 0x3b, 0x43,
+    0x21, 0x9d, 0x11, 0x4d, 0xe0, 0xe8, 0x58, 0xce, 0x00, 0x25, 0x5b, 0xd4, 0x65, 0x69, 0xad,
+    0x2c, 0x68,
+];
+
 const RESTRICT_ACTION_TO_SELF_FEATURE_DIGEST: [u8; 32] = [
     0xe7, 0x1b, 0x67, 0x12, 0x18, 0x39, 0x19, 0x94, 0xc7, 0x8d, 0x8c, 0x72, 0x2c, 0x1d,
     0x42, 0xc4, 0x77, 0xcf, 0x09, 0x1e, 0x56, 0x01, 0xb5, 0xcf, 0x1b, 0xef, 0xd0, 0x57,
@@ -247,6 +253,37 @@ impl ApplyContext {
                 &code_hash,
                 cpu_limit,
             )?;
+        }
+
+        // Leap's RAM_RESTRICTIONS feature prevents an unprivileged contract
+        // from increasing another account's RAM without that account's
+        // authorization. Notifications are stricter: the receiver may not
+        // charge a different account even when the transaction authorizes it.
+        if !privileged
+            && self
+                .db
+                .protocol_feature_activated(RAM_RESTRICTIONS_FEATURE_DIGEST)
+        {
+            let ram_deltas = self.inner.read()?.account_ram_deltas.clone();
+            let not_in_notify_context = self.receiver == *action.account();
+            for (account, delta) in ram_deltas {
+                if delta > 0 && account != self.receiver {
+                    pulse_assert(
+                        not_in_notify_context,
+                        ChainError::TransactionError(format!(
+                            "unprivileged contract cannot increase RAM usage of another account within a notify context: {}",
+                            account
+                        )),
+                    )?;
+                    pulse_assert(
+                        self.has_authorization(&account)?,
+                        ChainError::TransactionError(format!(
+                            "unprivileged contract cannot increase RAM usage of another account that has not authorized the action: {}",
+                            account
+                        )),
+                    )?;
+                }
+            }
         }
 
         let act_digest = {
