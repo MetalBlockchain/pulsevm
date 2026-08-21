@@ -90,3 +90,21 @@ target genesis committed to that checkpoint hash, so a different migration gets
 a different target chain identity. This proves the local conversion and
 five-node boot path; Mainnet migration still requires a validated Mainnet export
 plus the remaining system-contract policy work.
+
+### Exercise writes against imported state
+
+An imported XPR checkpoint retains the real `pulse@active` authority, so its
+production private key must never be used for local testing. Derive a disposable
+copy that replaces only `pulse@owner` and `pulse@active` with a development key:
+
+```bash
+cargo run -p pulsevm_database --example xpr_test_authority -- \
+  /tmp/xpr-migration.snapshot \
+  /tmp/xpr-migration.snapshot.manifest.json \
+  /tmp/xpr-migration-test-authority.snapshot \
+  "$PULSEVM_TEST_PRIVATE_KEY"
+```
+
+The command writes a matching `.manifest.json` beside the derived checkpoint.
+Use that copy with `PULSEVM_MIGRATION_CHECKPOINT` and pass the same development
+key to `pulsevm-e2e-boot`; the canonical XPR checkpoint is not modified.
