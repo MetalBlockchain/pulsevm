@@ -38,7 +38,9 @@ delta (later blocks): from the arena `UndoState` of the block's open undo sessio
   removed:  `removed_values` → present=false, serialize the removed row;
   created:  ids new this session → present=true.
 `include_delta` = "any change" for all tables except `protocol_state` (compares
-`activated_protocol_features`; the arena has none yet, so it never emits a delta).
+`activated_protocol_features`). Arena's transient preactivation queue is kept in
+an undo/checkpoint-safe internal table but is intentionally not part of SHiP's
+`protocol_state_v0` wire format, which exposes activated features only.
 
 Within a delta, modified rows are emitted first, then removed rows, then new
 rows. chainbase stores the first two groups in intrusive singly linked lists and
@@ -79,7 +81,10 @@ Sizes below are the golden's block-2 first-row lengths (all verified).
   wasm_config. Source them (chain_id is on the controller; wasm_config is the pinned
   constant used by the wasm validation; the two chain_config tail fields may need adding
   to GlobalPropertyRow or sourcing from genesis config). FLAG if truly absent.
-- protocol_state (2) = `00` + container(activated_protocol_features)=uvar(0). Always empty.
+- protocol_state = `00` + container(activated_protocol_features), with each
+  element `00` + digest:32 + activation_block_num:u32. The imported XPR state
+  carries the source activated-feature vector; preactivated (not-yet-active)
+  digests are internal Arena state and are omitted by the SHiP ABI.
 - permission (40 for an empty-auth perm) = `00` + owner:u64 + perm_name:u64 +
   parent_perm_name:u64 (0 if root; else the PARENT ROW's perm_name — resolve
   PermissionRow.parent:i64 → that row's perm_name) + last_updated:time_point(i64) +

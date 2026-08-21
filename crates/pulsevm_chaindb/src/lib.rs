@@ -635,6 +635,19 @@ struct ProtocolFeatureRow {
     _pad: u32,
 }
 
+/// A protocol feature requested by a privileged contract but not yet activated
+/// in a block header. Leap keeps this transient vector beside the activated
+/// feature set; Arena stores it as an undo/checkpoint-safe table so forks and
+/// restarts preserve the same preactivation state.
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout, ArenaObject)]
+#[arena(type_id = 23)]
+struct PreactivatedProtocolFeatureRow {
+    id: ObjectId<PreactivatedProtocolFeatureRow>,
+    feature_digest: [u8; 32],
+    _pad: [u8; 8],
+}
+
 /// Rust representation of the chainbase `resource_limits_config_object` singleton: the
 /// elastic cpu/net limit parameters plus the account usage averaging windows.
 /// Genesis creates the chainbase row in C++; the database is seeded once from
@@ -1324,6 +1337,7 @@ fn build_registered_db() -> Result<Db, DbError> {
     db.add_table::<PermSeqRow>()?;
     db.add_table::<GlobalPropertyRow>()?;
     db.add_table::<ProtocolFeatureRow>()?;
+    db.add_table::<PreactivatedProtocolFeatureRow>()?;
     db.add_table::<ResourceConfigRow>()?;
     db.add_table::<TransactionRow>()?;
     db.add_table::<DeferredTransactionRow>()?;
@@ -3232,6 +3246,122 @@ impl ChainDatabase {
             db.create::<ProtocolFeatureRow>(|row| {
                 row.feature_digest = *feature_digest;
                 row.activation_block_num = *activation_block_num;
+            })?;
+        }
+        // A chainbase snapshot's protocol_state contains activated features;
+        // any transient preactivation queue belongs to the live source node and
+        // must not leak into a state-only import.
+        let preactivated_ids: Vec<_> = db
+            .table::<PreactivatedProtocolFeatureRow>()?
+            .iter()
+            .map(|row| row.id())
+            .collect();
+        for id in preactivated_ids {
+            db.remove::<PreactivatedProtocolFeatureRow>(id)?;
+        }
+        Ok(())
+    }
+
+    /// Return the ordered preactivation queue used by the runtime and block
+    /// producer. The order is consensus-visible in a protocol-feature header
+    /// extension, so do not derive it from an unordered map.
+    pub fn preactivated_protocol_features(&self) -> Vec<[u8; 32]> {
+        let db = self.lock();
+        let mut rows: Vec<_> = db
+            .table::<PreactivatedProtocolFeatureRow>()
+            .map(|table| table.iter().copied().collect())
+            .unwrap_or_default();
+        rows.sort_by_key(|row| row.id().raw());
+        rows.into_iter().map(|row| row.feature_digest).collect()
+    }
+
+    /// Queue a protocol feature for activation by a subsequent block header.
+    /// Already-active and duplicate requests are rejected, matching Leap's
+    /// deterministic protocol-feature errors rather than silently accepting a
+    /// second request.
+    pub fn preactivate_protocol_feature(&self, feature_digest: [u8; 32]) -> Result<(), DbError> {
+        let mut db = self.lock();
+        if db
+            .table::<ProtocolFeatureRow>()?
+            .iter()
+            .any(|row| row.feature_digest == feature_digest)
+        {
+            return Err(DbError::Corrupted(
+                "protocol feature is already activated".into(),
+            ));
+        }
+        if db
+            .table::<PreactivatedProtocolFeatureRow>()?
+            .iter()
+            .any(|row| row.feature_digest == feature_digest)
+        {
+            return Err(DbError::Corrupted(
+                "protocol feature is already preactivated".into(),
+            ));
+        }
+        db.create::<PreactivatedProtocolFeatureRow>(|row| {
+            row.feature_digest = feature_digest;
+        })?;
+        Ok(())
+    }
+
+    /// Activate the exact preactivation list committed by a block header. The
+    /// list must be non-empty, duplicate-free, and every digest must have been
+    /// preactivated before this block. Activation and queue removal happen in
+    /// one undo-tracked operation, so failed/forked blocks restore both sides.
+    pub fn activate_protocol_features(
+        &self,
+        feature_digests: &[[u8; 32]],
+        activation_block_num: u32,
+    ) -> Result<(), DbError> {
+        if feature_digests.is_empty() {
+            return Err(DbError::Corrupted(
+                "protocol feature activation list is empty".into(),
+            ));
+        }
+        let mut db = self.lock();
+        let queued: Vec<_> = db
+            .table::<PreactivatedProtocolFeatureRow>()?
+            .iter()
+            .copied()
+            .collect();
+        let active: Vec<_> = db
+            .table::<ProtocolFeatureRow>()?
+            .iter()
+            .copied()
+            .collect();
+        let mut ids = Vec::with_capacity(feature_digests.len());
+        for digest in feature_digests {
+            if active.iter().any(|row| row.feature_digest == *digest) {
+                return Err(DbError::Corrupted(
+                    "protocol feature is already activated".into(),
+                ));
+            }
+            if !queued.iter().any(|row| row.feature_digest == *digest) {
+                return Err(DbError::Corrupted(
+                    "protocol feature was not preactivated".into(),
+                ));
+            }
+            if feature_digests[..ids.len()]
+                .iter()
+                .any(|previous| previous == digest)
+            {
+                return Err(DbError::Corrupted(
+                    "protocol feature activation list contains a duplicate".into(),
+                ));
+            }
+            ids.push(*digest);
+        }
+        for digest in ids {
+            let row_id = queued
+                .iter()
+                .find(|row| row.feature_digest == digest)
+                .expect("validated preactivated feature")
+                .id();
+            db.remove::<PreactivatedProtocolFeatureRow>(row_id)?;
+            db.create::<ProtocolFeatureRow>(|row| {
+                row.feature_digest = digest;
+                row.activation_block_num = activation_block_num;
             })?;
         }
         Ok(())
@@ -5689,6 +5819,30 @@ mod tests {
         assert_eq!(bytes[39], 0); // activated_protocol_feature_v0
         assert_eq!(&bytes[40..72], &[2u8; 32]);
         assert_eq!(u32::from_le_bytes(bytes[72..76].try_into().unwrap()), 99);
+    }
+
+    #[test]
+    fn preactivated_protocol_features_survive_undo_and_activate_atomically() {
+        let db = ChainDatabase::new().unwrap();
+        let digest = [7u8; 32];
+
+        db.preactivate_protocol_feature(digest).unwrap();
+        assert_eq!(db.preactivated_protocol_features(), vec![digest]);
+        assert!(!db.protocol_feature_activated(digest));
+
+        db.start_undo_session();
+        db.activate_protocol_features(&[digest], 12).unwrap();
+        assert!(db.protocol_feature_activated(digest));
+        assert!(db.preactivated_protocol_features().is_empty());
+        db.undo();
+        assert!(!db.protocol_feature_activated(digest));
+        assert_eq!(db.preactivated_protocol_features(), vec![digest]);
+
+        db.start_undo_session();
+        db.activate_protocol_features(&[digest], 12).unwrap();
+        db.commit(12);
+        assert!(db.protocol_feature_activated(digest));
+        assert!(db.preactivated_protocol_features().is_empty());
     }
 
     /// The standalone-write path bills db_idxN_update off the row's old payer and

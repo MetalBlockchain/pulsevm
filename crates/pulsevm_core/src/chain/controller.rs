@@ -706,6 +706,27 @@ impl Controller {
 
         self.block_active_schedule = self.schedule_active_for_parent(&self.preferred_id)?;
 
+        // A queued protocol feature is activated by the next block header, just
+        // as Leap's producer path emits its protocol_feature_activation
+        // extension. Capture the parent queue before this block's transactions
+        // run; a preactivation created by a transaction in this block belongs to
+        // the following block.
+        let protocol_feature_activations: Vec<Digest> = db
+            .preactivated_protocol_features()
+            .into_iter()
+            .map(Digest)
+            .collect();
+        if !protocol_feature_activations.is_empty() {
+            let digests: Vec<[u8; 32]> = protocol_feature_activations
+                .iter()
+                .map(|digest| digest.0)
+                .collect();
+            db.activate_protocol_features(
+                &digests,
+                BlockHeader::num_from_id(&self.preferred_id) + 1,
+            )?;
+        }
+
         // onblock heads the block, before any mempool transaction, so its action
         // digests come first in the action merkle — matching what validators
         // recompute in `execute_block`.
@@ -914,6 +935,10 @@ impl Controller {
             transaction_mroot,
             action_mroot,
         );
+        block
+            .signed_block_header
+            .header
+            .set_protocol_feature_activations(&protocol_feature_activations)?;
 
         // The schedule in force for this block is the one active as of its parent
         // (the tip we build on), folding in any not-yet-accepted ancestor's
@@ -1476,6 +1501,23 @@ impl Controller {
         let mut transaction_receipts: VecDeque<TransactionReceipt> = VecDeque::new();
         let mut action_receipt_digests: VecDeque<Digest> = VecDeque::new();
         self.blocks_executed += 1;
+
+        // Protocol features take effect at the start of the block, before the
+        // implicit onblock action and ordinary transactions. The extension is
+        // signed, decoded, and applied inside the block's undo session, so a
+        // rejected block or fork unwind restores the preactivation queue.
+        let protocol_feature_activations = block
+            .signed_block_header
+            .header
+            .protocol_feature_activations()?;
+        if !protocol_feature_activations.is_empty() {
+            let digests: Vec<[u8; 32]> = protocol_feature_activations
+                .iter()
+                .map(|digest| digest.0)
+                .collect();
+            self.db
+                .activate_protocol_features(&digests, block.block_num())?;
+        }
 
         self.db
             .clear_expired_input_transactions(&block.timestamp().to_time_point())?;
@@ -3841,6 +3883,36 @@ mod tests {
             &block_status,
         )?;
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn protocol_feature_activation_round_trips_through_built_block() -> Result<(), ChainError> {
+        let (mut producer, private_key, chain_id, _producer_temp) = init_test_controller()?;
+        let feature = [0xabu8; 32];
+        producer.db.preactivate_protocol_feature(feature)?;
+
+        let account = Name::from_str("featuretest")?;
+        let mut producer_mempool = Mempool::new();
+        producer_mempool.add_transaction(create_account(&private_key, account, chain_id)?);
+        let block = producer.build_block(&mut producer_mempool).await?;
+        let activations = block
+            .signed_block_header
+            .header
+            .protocol_feature_activations()?;
+        assert_eq!(activations, vec![Digest(feature)]);
+        assert!(producer.db.protocol_feature_activated(feature));
+        assert!(producer.db.preactivated_protocol_features().is_empty());
+
+        let (mut validator, _validator_key, _validator_chain_id, _validator_temp) =
+            init_test_controller()?;
+        validator.db.preactivate_protocol_feature(feature)?;
+        let mut validator_mempool = Mempool::new();
+        validator.verify_block(&block, &mut validator_mempool).await?;
+        assert!(validator.db.protocol_feature_activated(feature));
+        assert!(validator.db.preactivated_protocol_features().is_empty());
+        validator.accept_block(&block.id()?, &mut validator_mempool)?;
+        assert!(validator.db.protocol_feature_activated(feature));
         Ok(())
     }
 

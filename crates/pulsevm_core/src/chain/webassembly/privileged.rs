@@ -43,12 +43,10 @@ fn privileged_check(context: &ApplyContext) -> Result<(), RuntimeError> {
     Ok(())
 }
 
-/// XPR/Leap system contracts import `preactivate_feature` even on chains where
-/// the requested feature is already active. Arena currently imports the
-/// activated feature set from chainbase, but does not yet persist a transient
-/// preactivation queue for future block activation. Accepting an already-active
-/// digest is therefore safe and makes those contracts instantiable; a request
-/// for a future feature fails explicitly instead of silently changing consensus.
+/// XPR/Leap system contracts use `preactivate_feature` to queue a digest for a
+/// later block-header activation. Imported active digests remain idempotent for
+/// compatibility with system-contract initialization; future digests are stored
+/// in Arena's undo/checkpoint-safe preactivation queue.
 pub fn preactivate_feature(
     mut env: FunctionEnvMut<WasmContext>,
     feature_ptr: WasmPtr<u8>,
@@ -74,9 +72,10 @@ pub fn preactivate_feature(
         return Ok(());
     }
 
-    Err(RuntimeError::new(
-        "preactivate_feature for an inactive digest is not supported by Arena yet",
-    ))
+    env_data
+        .db()
+        .preactivate_protocol_feature(digest)
+        .map_err(|error| RuntimeError::new(format!("preactivate_feature failed: {error}")))
 }
 
 pub fn set_proposed_producers(

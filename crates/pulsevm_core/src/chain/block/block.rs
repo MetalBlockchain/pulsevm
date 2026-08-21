@@ -15,6 +15,7 @@ use pulsevm_proc_macros::{
     Write,
 };
 use pulsevm_serialization::Write;
+use pulsevm_serialization::Read as SerializationRead;
 use serde::{
     Serialize,
     ser::SerializeStruct,
@@ -30,6 +31,11 @@ use crate::{
     crypto::Signature,
     utils::pulse_assert,
 };
+
+/// Leap's protocol-feature activation extension. The extension payload is the
+/// canonical serialized `vector<checksum256>` and is part of the signed block
+/// header. Extension id 0 is reserved for this payload in Leap.
+pub const PROTOCOL_FEATURE_ACTIVATION_EXTENSION_ID: u16 = 0;
 
 #[derive(Debug, Default, Clone, Read, Write, NumBytes)]
 pub struct BlockHeader {
@@ -68,6 +74,66 @@ impl BlockHeader {
     /// out-of-band source.
     pub fn new_schedule(&self) -> &Option<ProducerSchedule> {
         &self.new_producers
+    }
+
+    /// Decode the optional Leap protocol-feature activation extension. Unknown
+    /// header extensions remain rejected until their consensus semantics are
+    /// implemented; accepting them as opaque bytes would make block ids valid
+    /// while silently ignoring state transitions.
+    pub fn protocol_feature_activations(&self) -> Result<Vec<Digest>, ChainError> {
+        let mut decoded = None;
+        for (id, payload) in &self.header_extensions {
+            if *id != PROTOCOL_FEATURE_ACTIVATION_EXTENSION_ID {
+                return Err(ChainError::BlockError(format!(
+                    "unsupported block header extension {}",
+                    id
+                )));
+            }
+            if decoded.is_some() {
+                return Err(ChainError::BlockError(
+                    "duplicate protocol feature activation extension".into(),
+                ));
+            }
+            let mut pos = 0;
+            let features = Vec::<Digest>::read(payload, &mut pos).map_err(|error| {
+                ChainError::BlockError(format!(
+                    "invalid protocol feature activation extension: {error}"
+                ))
+            })?;
+            if pos != payload.len() || features.is_empty() {
+                return Err(ChainError::BlockError(
+                    "protocol feature activation extension must contain a non-empty digest vector"
+                        .into(),
+                ));
+            }
+            for (index, feature) in features.iter().enumerate() {
+                if features[..index].contains(feature) {
+                    return Err(ChainError::BlockError(
+                        "protocol feature activation extension contains a duplicate digest".into(),
+                    ));
+                }
+            }
+            decoded = Some(features);
+        }
+        Ok(decoded.unwrap_or_default())
+    }
+
+    /// Pack the protocol-feature activation extension from an ordered digest
+    /// list. The caller is responsible for ensuring the list is non-empty.
+    pub fn set_protocol_feature_activations(
+        &mut self,
+        features: &[Digest],
+    ) -> Result<(), ChainError> {
+        if features.is_empty() {
+            self.header_extensions.clear();
+            return Ok(());
+        }
+        let payload = features
+            .to_vec()
+            .pack()
+            .map_err(|error| ChainError::SerializationError(error.to_string()))?;
+        self.header_extensions = vec![(PROTOCOL_FEATURE_ACTIVATION_EXTENSION_ID, payload)];
+        Ok(())
     }
 
     fn block_num(&self) -> u32 {
@@ -128,10 +194,7 @@ impl BlockHeader {
                 )?;
             }
         }
-        pulse_assert(
-            self.header_extensions.is_empty(),
-            ChainError::BlockError("header extensions not supported".into()),
-        )?;
+        self.protocol_feature_activations()?;
         Ok(())
     }
 }
@@ -291,6 +354,7 @@ mod tests {
             },
         },
     };
+    use pulsevm_crypto::Digest;
 
     #[test]
     pub fn test_block_serialization() {
@@ -316,5 +380,19 @@ mod tests {
         header.new_producers = Some(schedule.clone());
         header.schedule_version = 1;
         assert_eq!(header.new_schedule().as_ref(), Some(&schedule));
+    }
+
+    #[test]
+    fn protocol_feature_activation_extension_round_trips_and_rejects_duplicates() {
+        let features = [Digest([1u8; 32]), Digest([2u8; 32])];
+        let mut header = BlockHeader::default();
+        header.set_protocol_feature_activations(&features).unwrap();
+        assert_eq!(header.protocol_feature_activations().unwrap(), features);
+
+        let mut duplicate = BlockHeader::default();
+        duplicate
+            .set_protocol_feature_activations(&[features[0], features[0]])
+            .unwrap();
+        assert!(duplicate.protocol_feature_activations().is_err());
     }
 }

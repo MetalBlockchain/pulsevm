@@ -2915,6 +2915,29 @@ impl Database {
             .map_err(|e| ChainError::InternalError(format!("XPR import protocol state: {e:?}")))
     }
 
+    /// Ordered protocol features waiting for a block-header activation.
+    pub fn preactivated_protocol_features(&self) -> Vec<[u8; 32]> {
+        self.backend.preactivated_protocol_features()
+    }
+
+    /// Queue a feature from the privileged `preactivate_feature` intrinsic.
+    pub fn preactivate_protocol_feature(&self, feature_digest: [u8; 32]) -> Result<(), ChainError> {
+        self.backend
+            .preactivate_protocol_feature(feature_digest)
+            .map_err(|e| ChainError::InternalError(format!("arena preactivate feature: {e:?}")))
+    }
+
+    /// Apply a block's protocol-feature activation extension atomically.
+    pub fn activate_protocol_features(
+        &self,
+        feature_digests: &[[u8; 32]],
+        activation_block_num: u32,
+    ) -> Result<(), ChainError> {
+        self.backend
+            .activate_protocol_features(feature_digests, activation_block_num)
+            .map_err(|e| ChainError::BlockError(format!("protocol feature activation: {e:?}")))
+    }
+
     /// The wasm image for `(code_hash, vm_type, vm_version)` as owned bytes.
     ///
     /// This is the bytecode the VM compiles and runs, served from the arena as
