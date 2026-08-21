@@ -114,23 +114,19 @@ echo "==> Launching a 5-node cluster running PulseVM"
   --blockchain-specs "$BLOCKCHAIN_SPECS"
 
 echo
-echo "Cluster starting. Once 'control status' reports the blockchain healthy:"
+echo "Cluster starting. Once 'control status' reports the blockchain healthy, verify"
+echo "the five custom-chain RPC endpoints and imported state with pulsevm.getInfo"
+echo "and pulsevm.getAccount over each node's /ext/bc/<chain-id>/rpc route."
 echo
-echo "  1) Note a node's data dir (metal-network-runner control status), then find"
-echo "     the PulseVM block_log it writes:"
-echo "       find <node-data-dir> -name 'block_log.log' -print"
+echo "The block_log written by a running node is a persistence/restart artifact;"
+echo "it is not a historical XPR block corpus. Full historical replay uses the"
+echo "ignored replay_testnet_blocks test and JSON get_block fixtures fetched by"
+echo "scripts/fetch-blocks.sh:"
 echo
-echo "  2) Get the chain_id from the node's getInfo (pulsevm.getInfo over its RPC)."
+echo "  PULSEVM_RPC_BLOCKS_DIR=/tmp/xpr-blocks \\"
+echo "    cargo test -p pulsevm_core replay_testnet_blocks -- --ignored --nocapture"
 echo
-echo "  3) Submit a few transactions with the 'pulse' CLI so the node produces"
-echo "     non-empty blocks (newaccount / setcode / ...), then replay + diff:"
-echo
-echo "       PULSEVM_REPLAY_BLOCK_LOG_DIR=<dir containing block_log.log> \\"
-echo "       PULSEVM_REPLAY_GENESIS=$REPO/genesis.json \\"
-echo "       PULSEVM_REPLAY_CHAIN_ID=<hex chain id from getInfo> \\"
-echo "       cargo test -p pulsevm_core \\"
-echo "         replay_local_block_log -- --ignored --nocapture"
-echo
-echo "That replays the real block_log into a fresh node and checks the arena"
-echo "state root after every block."
+echo "An imported checkpoint starts the new Arena chain at its migration boundary;"
+echo "full XPR historical parity additionally requires a captured block corpus and"
+echo "system-contract replay validation."
 wait $ANR_PID
