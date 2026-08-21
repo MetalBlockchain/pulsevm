@@ -2389,7 +2389,10 @@ impl ApplyContext {
     }
 
     pub fn get_head_block_num(&self) -> u32 {
-        0 // TODO: Fix
+        self.trx_context
+            .block_num()
+            .unwrap_or_default()
+            .saturating_sub(1)
     }
 
     pub fn get_pending_block_time(&self) -> &BlockTimestamp {

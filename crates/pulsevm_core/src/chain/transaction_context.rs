@@ -567,6 +567,15 @@ impl TransactionContext {
         Ok(inner.pending_block_timestamp.clone())
     }
 
+    /// The block number currently being applied.
+    ///
+    /// Transaction traces are initialized with the pending block number, which
+    /// is one greater than the chain head while a block is being produced.
+    pub fn block_num(&self) -> Result<u32, ChainError> {
+        let inner = self.inner.read()?;
+        Ok(inner.trace.block_num)
+    }
+
     /// Bill the block-recorded cpu (µs) and net (words) for this transaction
     /// rather than the re-measured amounts, and skip the objective limit checks —
     /// the Antelope light/replay validation path for an already-accepted block.
