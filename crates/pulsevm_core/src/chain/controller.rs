@@ -3889,7 +3889,11 @@ mod tests {
     #[tokio::test]
     async fn protocol_feature_activation_round_trips_through_built_block() -> Result<(), ChainError> {
         let (mut producer, private_key, chain_id, _producer_temp) = init_test_controller()?;
-        let feature = [0xabu8; 32];
+        let feature = [
+            0x99, 0x08, 0xb3, 0xf8, 0x41, 0x3c, 0x84, 0x74, 0xab, 0x2a, 0x6b, 0xe1, 0x49,
+            0xd3, 0xf4, 0xf6, 0xd0, 0x42, 0x1d, 0x37, 0x88, 0x60, 0x33, 0xf2, 0x7d, 0x47,
+            0x59, 0xc4, 0x7a, 0x26, 0xd9, 0x44,
+        ];
         producer.db.preactivate_protocol_feature(feature)?;
 
         let account = Name::from_str("featuretest")?;

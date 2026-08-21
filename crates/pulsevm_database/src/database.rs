@@ -27,6 +27,68 @@ use crate::{
 /// `billable_size_v<permission_link_object>` = round_up_16(40 + 3*32) = 144
 /// (config.hpp / permission_link_object.hpp in the reference chain).
 const PERMISSION_LINK_OBJECT_BILLABLE: i64 = 144;
+
+/// Leap's builtin protocol-feature registry. The digest is the canonical
+/// feature identifier; dependencies and preactivation policy are consensus
+/// metadata, not user-configurable chain settings. This intentionally covers
+/// the Leap 5/XPR builtin set imported by the migration tool.
+#[derive(Clone, Copy)]
+struct ProtocolFeatureSpec {
+    dependencies: &'static [&'static str],
+    preactivation_required: bool,
+}
+
+const NO_PROTOCOL_FEATURE_DEPENDENCIES: &[&str] = &[];
+const NO_DUPLICATE_DEFERRED_ID_DEPENDENCIES: &[&str] =
+    &["9908b3f8413c8474ab2a6be149d3f4f6d0421d37886033f27d4759c47a26d944"];
+const DISABLE_DEFERRED_STAGE_2_DEPENDENCIES: &[&str] =
+    &["440c3efaaab212c387ce967c574dc813851cf8332d041beb418dfaf55facd5a9"];
+
+fn protocol_feature_spec(feature_digest: [u8; 32]) -> Option<ProtocolFeatureSpec> {
+    let digest = hex::encode(feature_digest);
+    let (dependencies, preactivation_required) = match digest.as_str() {
+        // PREACTIVATE_FEATURE is enabled at genesis in Leap and may be
+        // activated without a prior preactivation request.
+        "64fe7df32e9b86be2b296b3f81dfd527f84e82b98e363bc97e40bc7a83733310" =>
+            (NO_PROTOCOL_FEATURE_DEPENDENCIES, false),
+        "f3c3d91c4603cde2397268bfed4e662465293aab10cd9416db0d442b8cec2949"
+        | "9908b3f8413c8474ab2a6be149d3f4f6d0421d37886033f27d4759c47a26d944"
+        | "a98241c83511dc86c857221b9372b4aa7cea3aaebc567a48604e1d3db3557050"
+        | "2853617cec3eabd41881eb48882e6fc5e81a0db917d375057864b3befbe29acd"
+        | "e71b6712188391994c78d8c722c1d42c477cf091e5601b5cf1befd05721a57f3"
+        | "2f1f13e291c79da5a2bbad259ed7c1f2d34f697ea460b14b565ac33b063b73e2"
+        | "898082c59f921d0042e581f00a59d5ceb8be6f1d9c7a45b6f07c0e26eaee0222"
+        | "1eab748b95a2e6f4d7cb42065bdee5566af8efddf01a55a0a8d831b823f8828a"
+        | "1812fdb5096fd854a4958eb9d53b43219d114de0e858ce00255bd46569ad2c68"
+        | "927fdf78c51e77a899f2db938249fb1f8bb38f4e43d9c1f75b190492080cbc34"
+        | "ab76031cad7a457f4fd5f5fca97a3f03b8a635278e0416f77dcc91eb99a48e10"
+        | "69b064c5178e2738e144ed6caa9349a3995370d78db29e494b3126ebd9111966"
+        | "8139e99247b87f18ef7eae99f07f00ea3adf39ed53f4d2da3f44e6aa0bfd7c62"
+        | "70787548dcea1a2c52c913a37f74ce99e6caae79110d7ca7b859936a0075b314"
+        | "d2596697fed14a0840013647b99045022ae6a885089f35a7e78da7a43ad76ed4"
+        | "68d6405cb8df3de95bd834ebb408196578500a9f818ff62ccc68f60b932f7d82"
+        | "e5d7992006e628a38c5e6c28dd55ff5e57ea682079bf41fef9b3cced0f46b491"
+        | "c0cce5bcd8ea19a28d9e12eafda65ebe6d0e0177e280d4f20c7ad66dcd9e011b"
+        | "440c3efaaab212c387ce967c574dc813851cf8332d041beb418dfaf55facd5a9" =>
+            (NO_PROTOCOL_FEATURE_DEPENDENCIES, true),
+        "45967387ee92da70171efd9fefd1ca8061b5efe6f124d269cd2468b47f1575a0" =>
+            (NO_DUPLICATE_DEFERRED_ID_DEPENDENCIES, true),
+        "a857eeb932774c511a40efb30346ec01bfb7796916b54c3c69fe7e5fb70d5cba" =>
+            (DISABLE_DEFERRED_STAGE_2_DEPENDENCIES, true),
+        _ => return None,
+    };
+    Some(ProtocolFeatureSpec {
+        dependencies,
+        preactivation_required,
+    })
+}
+
+fn parse_protocol_feature_digest(hex_digest: &str) -> [u8; 32] {
+    hex::decode(hex_digest)
+        .expect("builtin protocol-feature dependency is valid hex")
+        .try_into()
+        .expect("builtin protocol-feature dependency is 32 bytes")
+}
 // The public `Database` methods use the shared pure-Rust time type.
 use pulsevm_chain_types::TimePoint;
 // These pure-Rust authority sub-types back the arena authority decoder.
@@ -2922,6 +2984,31 @@ impl Database {
 
     /// Queue a feature from the privileged `preactivate_feature` intrinsic.
     pub fn preactivate_protocol_feature(&self, feature_digest: [u8; 32]) -> Result<(), ChainError> {
+        let spec = protocol_feature_spec(feature_digest).ok_or_else(|| {
+            ChainError::InternalError(format!(
+                "unrecognized protocol feature {}",
+                hex::encode(feature_digest)
+            ))
+        })?;
+        if !spec.preactivation_required {
+            return Err(ChainError::InternalError(format!(
+                "protocol feature {} does not support preactivation",
+                hex::encode(feature_digest)
+            )));
+        }
+        let queued = self.preactivated_protocol_features();
+        for dependency in spec.dependencies {
+            let dependency_digest = parse_protocol_feature_digest(dependency);
+            if !self.protocol_feature_activated(dependency_digest)
+                && !queued.contains(&dependency_digest)
+            {
+                return Err(ChainError::InternalError(format!(
+                    "protocol feature {} requires dependency {}",
+                    hex::encode(feature_digest),
+                    dependency
+                )));
+            }
+        }
         self.backend
             .preactivate_protocol_feature(feature_digest)
             .map_err(|e| ChainError::InternalError(format!("arena preactivate feature: {e:?}")))
@@ -2933,6 +3020,41 @@ impl Database {
         feature_digests: &[[u8; 32]],
         activation_block_num: u32,
     ) -> Result<(), ChainError> {
+        let queued = self.preactivated_protocol_features();
+        if queued.len() != feature_digests.len()
+            || queued.iter().any(|digest| !feature_digests.contains(digest))
+        {
+            return Err(ChainError::BlockError(
+                "protocol feature activation must include the complete preactivation queue"
+                    .to_string(),
+            ));
+        }
+        for (index, feature_digest) in feature_digests.iter().enumerate() {
+            let spec = protocol_feature_spec(*feature_digest).ok_or_else(|| {
+                ChainError::BlockError(format!(
+                    "unrecognized protocol feature {}",
+                    hex::encode(feature_digest)
+                ))
+            })?;
+            if !spec.preactivation_required {
+                return Err(ChainError::BlockError(format!(
+                    "protocol feature {} cannot be activated from a preactivation queue",
+                    hex::encode(feature_digest)
+                )));
+            }
+            for dependency in spec.dependencies {
+                let dependency_digest = parse_protocol_feature_digest(dependency);
+                let active = self.protocol_feature_activated(dependency_digest);
+                let earlier_in_block = feature_digests[..index].contains(&dependency_digest);
+                if !active && !earlier_in_block {
+                    return Err(ChainError::BlockError(format!(
+                        "protocol feature {} requires dependency {} to be active earlier",
+                        hex::encode(feature_digest),
+                        dependency
+                    )));
+                }
+            }
+        }
         self.backend
             .activate_protocol_features(feature_digests, activation_block_num)
             .map_err(|e| ChainError::BlockError(format!("protocol feature activation: {e:?}")))
@@ -3698,6 +3820,38 @@ mod tests {
         let mut db = Database::new(path, 1024 * 1024 * 1024).unwrap();
         let _name = Name::from_str("test").unwrap();
         db.add_indices().unwrap();
+    }
+
+    #[test]
+    fn protocol_feature_registry_enforces_dependencies_and_queue_order() {
+        let db = Database::default();
+        let unknown = [0xa5; 32];
+        assert!(matches!(
+            db.preactivate_protocol_feature(unknown),
+            Err(ChainError::InternalError(message)) if message.contains("unrecognized protocol feature")
+        ));
+
+        let replace_deferred = parse_protocol_feature_digest(
+            "9908b3f8413c8474ab2a6be149d3f4f6d0421d37886033f27d4759c47a26d944",
+        );
+        let no_duplicate_deferred_id = parse_protocol_feature_digest(
+            "45967387ee92da70171efd9fefd1ca8061b5efe6f124d269cd2468b47f1575a0",
+        );
+        assert!(db
+            .preactivate_protocol_feature(no_duplicate_deferred_id)
+            .is_err());
+        db.preactivate_protocol_feature(replace_deferred).unwrap();
+        db.preactivate_protocol_feature(no_duplicate_deferred_id)
+            .unwrap();
+
+        assert!(db
+            .activate_protocol_features(&[no_duplicate_deferred_id, replace_deferred], 1)
+            .is_err());
+        db.activate_protocol_features(&[replace_deferred, no_duplicate_deferred_id], 1)
+            .unwrap();
+        assert!(db.protocol_feature_activated(replace_deferred));
+        assert!(db.protocol_feature_activated(no_duplicate_deferred_id));
+        assert!(db.preactivated_protocol_features().is_empty());
     }
 
     // 64 MiB is a multiple of chainbase's 1 MiB sizing requirement and leaves
