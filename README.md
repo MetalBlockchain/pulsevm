@@ -78,6 +78,11 @@ PULSEVM_MIGRATION_CHECKPOINT=/tmp/pulsevm-xpr-migration.snapshot \
 scripts/run-local.sh
 ```
 
+For a large imported checkpoint, use the companion runner branch
+`feat/pulsevm-checkpoint-startup` (commit `3d2e25d`), which allows up to two
+minutes for MetalGo to write its dynamic process-info file. The stock runner's
+three-second wait can report a healthy VM as failed while Arena is restoring.
+
 The harness passes `migration_checkpoint` and its emitted manifest through the
 runner's per-chain VM configuration. Every node verifies the manifest hash and
 revision before restoring the Arena checkpoint. It also generates a distinct
