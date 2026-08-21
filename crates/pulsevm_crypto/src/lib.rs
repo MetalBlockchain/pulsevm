@@ -16,3 +16,5 @@ pub use authority_key::{AuthorityKeyError, AuthorityPublicKey};
 pub use k1::{K1Error, K1PrivateKey, K1PublicKey, K1Signature};
 mod r1;
 pub use r1::{R1Error, R1Signature};
+mod webauthn;
+pub use webauthn::{RecoveredWebAuthnKey, WebAuthnError, WebAuthnSignature};

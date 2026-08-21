@@ -3403,6 +3403,7 @@ dependencies = [
 name = "pulsevm_crypto"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "bs58",
  "ecdsa",
  "hex",
@@ -3412,6 +3413,7 @@ dependencies = [
  "ripemd",
  "secp256k1",
  "serde",
+ "serde_json",
  "sha2 0.10.9",
 ]
 

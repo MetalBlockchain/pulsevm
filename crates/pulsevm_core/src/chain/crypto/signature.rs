@@ -17,6 +17,7 @@ use pulsevm_crypto::{
     FixedBytes,
     K1Signature,
     R1Signature,
+    WebAuthnSignature,
 };
 use pulsevm_error::ChainError;
 use pulsevm_serialization::{
@@ -33,17 +34,20 @@ use serde::{
 
 use crate::crypto::PublicKey;
 
-/// A recoverable Antelope transaction signature. K1 and R1 have the same fixed
-/// packed size; their first byte is the `fc::static_variant` index.
-#[derive(Clone, Copy)]
+/// A recoverable Antelope transaction signature.
+///
+/// K1 and R1 are fixed-size variants. WebAuthn includes browser assertion data
+/// and is consequently variable-size on the wire.
+#[derive(Clone)]
 pub struct Signature {
     inner: SignatureInner,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum SignatureInner {
     K1(K1Signature),
     R1(R1Signature),
+    WebAuthn(WebAuthnSignature),
 }
 
 impl Signature {
@@ -59,11 +63,17 @@ impl Signature {
         }
     }
 
+    pub fn new_webauthn(inner: WebAuthnSignature) -> Self {
+        Signature {
+            inner: SignatureInner::WebAuthn(inner),
+        }
+    }
+
     pub fn recover_authority_key(
         &self,
         digest: &Digest,
     ) -> Result<AuthorityPublicKey, ChainError> {
-        match self.inner {
+        match &self.inner {
             SignatureInner::K1(signature) => signature
                 .recover(digest.as_bytes())
                 .map(AuthorityPublicKey::K1)
@@ -71,6 +81,14 @@ impl Signature {
             SignatureInner::R1(signature) => signature
                 .recover(digest.as_bytes())
                 .map(AuthorityPublicKey::R1)
+                .map_err(|e| ChainError::TransactionError(e.to_string())),
+            SignatureInner::WebAuthn(signature) => signature
+                .recover(digest.as_bytes())
+                .map(|key| AuthorityPublicKey::WebAuthn {
+                    point: key.point,
+                    user_presence: key.user_presence,
+                    rpid: key.rpid,
+                })
                 .map_err(|e| ChainError::TransactionError(e.to_string())),
         }
     }
@@ -86,17 +104,19 @@ impl Signature {
         }
     }
 
-    fn to_packed(&self) -> [u8; 66] {
-        match self.inner {
-            SignatureInner::K1(signature) => signature.to_packed(),
-            SignatureInner::R1(signature) => signature.to_packed(),
+    fn to_packed(&self) -> Vec<u8> {
+        match &self.inner {
+            SignatureInner::K1(signature) => signature.to_packed().to_vec(),
+            SignatureInner::R1(signature) => signature.to_packed().to_vec(),
+            SignatureInner::WebAuthn(signature) => signature.to_packed(),
         }
     }
 
     fn to_string(&self) -> String {
-        match self.inner {
+        match &self.inner {
             SignatureInner::K1(signature) => signature.to_string(),
             SignatureInner::R1(signature) => signature.to_string(),
+            SignatureInner::WebAuthn(signature) => signature.to_string(),
         }
     }
 }
@@ -176,22 +196,35 @@ impl<'de> Deserialize<'de> for Signature {
 
 impl NumBytes for Signature {
     fn num_bytes(&self) -> usize {
-        66 // Fixed size for packed signature representation
+        self.to_packed().len()
     }
 }
 
 impl Read for Signature {
     fn read(bytes: &[u8], pos: &mut usize) -> Result<Self, ReadError> {
-        let packed = FixedBytes::<66>::read(bytes, pos)?;
-        let inner = match packed.as_ref()[0] {
+        let tag = *bytes.get(*pos).ok_or(ReadError::NotEnoughBytes)?;
+        let inner = match tag {
             0 => SignatureInner::K1(
+                {
+                    let packed = FixedBytes::<66>::read(bytes, pos)?;
                 K1Signature::from_packed(packed.as_ref())
-                    .map_err(|e| ReadError::CustomError(e.to_string()))?,
+                    .map_err(|e| ReadError::CustomError(e.to_string()))?
+                },
             ),
             1 => SignatureInner::R1(
+                {
+                    let packed = FixedBytes::<66>::read(bytes, pos)?;
                 R1Signature::from_packed(packed.as_ref())
-                    .map_err(|e| ReadError::CustomError(e.to_string()))?,
+                    .map_err(|e| ReadError::CustomError(e.to_string()))?
+                },
             ),
+            2 => {
+                *pos += 1;
+                SignatureInner::WebAuthn(
+                    WebAuthnSignature::read_payload(bytes, pos)
+                        .map_err(|e| ReadError::CustomError(e.to_string()))?,
+                )
+            }
             tag => {
                 return Err(ReadError::CustomError(format!(
                     "unsupported packed signature type {tag}"
@@ -204,8 +237,14 @@ impl Read for Signature {
 
 impl Write for Signature {
     fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), WriteError> {
-        let packed = FixedBytes::<66>(self.to_packed());
-        packed.write(bytes, pos)
+        let packed = self.to_packed();
+        let end = pos
+            .checked_add(packed.len())
+            .filter(|end| *end <= bytes.len())
+            .ok_or(WriteError::NotEnoughSpace)?;
+        bytes[*pos..end].copy_from_slice(&packed);
+        *pos = end;
+        Ok(())
     }
 }
 
@@ -230,6 +269,10 @@ impl FromStr for Signature {
             SignatureInner::R1(R1Signature::from_string(s).map_err(|e| {
                 ChainError::TransactionError(format!("failed to parse R1 signature: {e}"))
             })?)
+        } else if s.starts_with("SIG_WA_") {
+            SignatureInner::WebAuthn(WebAuthnSignature::from_string(s).map_err(|e| {
+                ChainError::TransactionError(format!("failed to parse WebAuthn signature: {e}"))
+            })?)
         } else {
             return Err(ChainError::TransactionError(
                 "unsupported signature type".into(),
@@ -241,10 +284,13 @@ impl FromStr for Signature {
 
 #[cfg(test)]
 mod tests {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use p256::ecdsa::SigningKey;
+    use pulsevm_serialization::{Read, Write};
+    use sha2::{Digest as _, Sha256};
 
     use super::Signature;
-    use pulsevm_crypto::{AuthorityPublicKey, Digest, R1Signature};
+    use pulsevm_crypto::{AuthorityPublicKey, Digest, R1Signature, WebAuthnSignature};
 
     #[test]
     fn r1_signature_recovers_an_r1_authority_key() {
@@ -263,5 +309,48 @@ mod tests {
             panic!("R1 signature recovered to a non-R1 authority key");
         };
         assert_eq!(key.as_slice(), signing_key.verifying_key().to_encoded_point(true).as_bytes());
+    }
+
+    #[test]
+    fn webauthn_signature_uses_variable_length_wire_format() {
+        let signing_key = SigningKey::from_bytes((&[17u8; 32]).into()).unwrap();
+        let digest = Digest([3u8; 32]);
+        let client_json = format!(
+            r#"{{"type":"webauthn.get","challenge":"{}","origin":"https://example.test"}}"#,
+            URL_SAFE_NO_PAD.encode(digest.as_bytes()),
+        );
+        let mut auth_data = vec![0u8; 37];
+        auth_data[..32].copy_from_slice(&Sha256::digest(b"example.test"));
+        auth_data[32] = 0x01;
+        let mut signed_data = auth_data.clone();
+        signed_data.extend_from_slice(&Sha256::digest(client_json.as_bytes()));
+        let signed_digest: [u8; 32] = Sha256::digest(signed_data).into();
+        let (signed, recovery_id) = signing_key.sign_prehash_recoverable(&signed_digest).unwrap();
+        let mut compact = [0u8; 65];
+        compact[0] = 31 + recovery_id.to_byte();
+        compact[1..].copy_from_slice(&signed.to_bytes());
+
+        let signature = Signature::new_webauthn(WebAuthnSignature::new(
+            compact,
+            auth_data,
+            client_json,
+        ));
+        let packed = signature.pack().unwrap();
+        assert!(packed.len() > 66);
+        let decoded = Signature::read(&packed, &mut 0).unwrap();
+        let AuthorityPublicKey::WebAuthn {
+            point,
+            user_presence,
+            rpid,
+        } = decoded.recover_authority_key(&digest).unwrap()
+        else {
+            panic!("WebAuthn signature recovered to the wrong key type");
+        };
+        assert_eq!(user_presence, 1);
+        assert_eq!(rpid, "example.test");
+        assert_eq!(
+            point.as_slice(),
+            signing_key.verifying_key().to_encoded_point(true).as_bytes(),
+        );
     }
 }
