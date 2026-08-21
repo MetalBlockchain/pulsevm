@@ -288,6 +288,13 @@ async fn main() -> Result<()> {
         Id::from_str(&info.chain_id).map_err(|e| anyhow::anyhow!("parsing chain id: {e}"))?;
 
     if args.smoke_only {
+        // Keep this probe independent of the migrated producer's source-network
+        // WASM.  XPR producer accounts can carry native-style code without an
+        // exported memory, so dispatch a harmless unknown action to the
+        // code-free `eosio.ram` account while authorizing it with the
+        // disposable producer key.  This still
+        // exercises signing, mempool admission, block production, and RPC
+        // inclusion without invoking the producer's code.
         let system = Name::from_str(&args.system_account)
             .map_err(|e| anyhow::anyhow!("encoding system account: {e}"))?;
         let tx = push(
@@ -295,7 +302,7 @@ async fn main() -> Result<()> {
             &chain_id,
             &key,
             vec![Action {
-                account: system.into(),
+                account: Name::from_str("eosio.ram")?.into(),
                 name: Name::from_str("noop")?.into(),
                 authorization: vec![PermissionLevel {
                     actor: system.into(),
