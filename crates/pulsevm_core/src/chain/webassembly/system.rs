@@ -20,6 +20,11 @@ const GET_SENDER_FEATURE_DIGEST: [u8; 32] = [
     0x56, 0x6a, 0xf8, 0xef, 0xdd, 0xf0, 0x1a, 0x55, 0xa0, 0xa8, 0xd8, 0x31, 0xb8, 0x23, 0xf8,
     0x82, 0x8a,
 ];
+const GET_BLOCK_NUM_FEATURE_DIGEST: [u8; 32] = [
+    0xe5, 0xd7, 0x99, 0x20, 0x06, 0xe6, 0x28, 0xa3, 0x8c, 0x5e, 0x6c, 0x28, 0xdd, 0x55, 0xff,
+    0x5e, 0x57, 0xea, 0x68, 0x20, 0x79, 0xbf, 0x41, 0xfe, 0xf9, 0xb3, 0xcc, 0xed, 0x0f, 0x46,
+    0xb4, 0x91,
+];
 
 pub fn eosio_assert(
     mut env: FunctionEnvMut<WasmContext>,
@@ -200,4 +205,20 @@ pub fn get_sender(mut env: FunctionEnvMut<WasmContext>) -> Result<u64, RuntimeEr
         .apply_context()
         .get_sender()
         .map_err(|error| RuntimeError::new(error.to_string()))
+}
+
+pub fn get_block_num(mut env: FunctionEnvMut<WasmContext>) -> Result<u32, RuntimeError> {
+    context_aware_check(&env)?;
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BASE)?;
+    if !env_data
+        .db()
+        .protocol_feature_activated(GET_BLOCK_NUM_FEATURE_DIGEST)
+    {
+        return Err(RuntimeError::new(
+            "get_block_num is unavailable before the GET_BLOCK_NUM protocol feature is activated",
+        ));
+    }
+
+    Ok(env_data.apply_context().get_block_num())
 }

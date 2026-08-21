@@ -170,6 +170,7 @@ use crate::chain::{
         get_action,
         get_active_producers,
         get_blockchain_parameters_packed,
+        get_block_num,
         get_context_free_data,
         get_permission_last_used,
         get_resource_limits,
@@ -698,6 +699,7 @@ impl WasmRuntime {
                 "eosio_exit" => Function::new_typed_with_env(&mut store, &env, pulse_exit),
                 "abort" => Function::new_typed_with_env(&mut store, &env, abort),
                 "current_time" => Function::new_typed_with_env(&mut store, &env, current_time),
+                "get_block_num" => Function::new_typed_with_env(&mut store, &env, get_block_num),
                 "get_sender" => Function::new_typed_with_env(&mut store, &env, get_sender),
                 // Crypto functions
                 "assert_recover_key" => Function::new_typed_with_env(&mut store, &env, assert_recover_key),

@@ -2395,6 +2395,10 @@ impl ApplyContext {
             .saturating_sub(1)
     }
 
+    pub fn get_block_num(&self) -> u32 {
+        self.trx_context.block_num().unwrap_or_default()
+    }
+
     pub fn get_sender(&self) -> Result<u64, ChainError> {
         let trace = self.trx_context.get_action_trace(self.action_ordinal)?;
         if trace.creator_action_ordinal() == 0 {
