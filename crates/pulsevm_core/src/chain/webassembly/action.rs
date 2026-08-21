@@ -13,6 +13,12 @@ use crate::chain::{
 
 use super::cost;
 
+const ACTION_RETURN_VALUE_FEATURE_DIGEST: [u8; 32] = [
+    0x69, 0xb0, 0x64, 0xc5, 0x17, 0x8e, 0x27, 0x38, 0xe1, 0x44, 0xed, 0x6c, 0xaa, 0x93, 0x49,
+    0xa3, 0x99, 0x53, 0x70, 0xd7, 0x8d, 0xb2, 0x9e, 0x49, 0x4b, 0x31, 0x26, 0xeb, 0xd9, 0x11,
+    0x19, 0x66,
+];
+
 #[inline]
 pub fn action_data_size(mut env: FunctionEnvMut<WasmContext>) -> Result<i32, RuntimeError> {
     let (env_data, mut store) = env.data_and_store_mut();
@@ -68,6 +74,15 @@ pub fn set_action_return_value(
 
     let (env_data, mut store) = env.data_and_store_mut();
     env_data.charge(&mut store, cost::BASE + cost::per_byte(buffer_len as u64))?;
+
+    if !env_data
+        .db()
+        .protocol_feature_activated(ACTION_RETURN_VALUE_FEATURE_DIGEST)
+    {
+        return Err(RuntimeError::new(
+            "set_action_return_value is unavailable before the ACTION_RETURN_VALUE protocol feature is activated",
+        ));
+    }
 
     {
         let db = env_data.db_mut();

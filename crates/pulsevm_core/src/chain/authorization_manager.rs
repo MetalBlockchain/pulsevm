@@ -51,6 +51,11 @@ const FIX_LINKAUTH_RESTRICTION_FEATURE_DIGEST: [u8; 32] = [
     0xb4, 0xaa, 0x7c, 0xea, 0x3a, 0xae, 0xbc, 0x56, 0x7a, 0x48, 0x04, 0xe1, 0xd3, 0xdb,
     0x35, 0x57, 0x05, 0x0,
 ];
+const ONLY_LINK_TO_EXISTING_PERMISSION_FEATURE_DIGEST: [u8; 32] = [
+    0xf3, 0xc3, 0xd9, 0x1c, 0x46, 0x03, 0xcd, 0xe2, 0x39, 0x72, 0x68, 0xbf, 0xed, 0x4e, 0x66,
+    0x24, 0x65, 0x29, 0x3a, 0xab, 0x10, 0xcd, 0x94, 0x16, 0xdb, 0x0d, 0x44, 0x2b, 0x8c, 0xec,
+    0x29, 0x49,
+];
 
 fn validate_protocol_key_features(
     db: &Database,
@@ -346,6 +351,17 @@ impl AuthorizationManager {
             auth.actor == link.account,
             ChainError::AuthorizationError("the owner of the linked permission needs to be the actor of the declared authorization".to_string()),
         )?;
+        if database.protocol_feature_activated(ONLY_LINK_TO_EXISTING_PERMISSION_FEATURE_DIGEST)
+            && link.requirement != ANY_NAME
+            && db
+                .find_permission_info(link.account.as_u64(), link.requirement.as_u64())?
+                .is_none()
+        {
+            return Err(ChainError::AuthorizationError(format!(
+                "permission {} does not exist for account {}",
+                link.requirement, link.account
+            )));
+        }
         if link.code == PULSE_NAME
             || !database.protocol_feature_activated(FIX_LINKAUTH_RESTRICTION_FEATURE_DIGEST)
         {

@@ -413,6 +413,28 @@ pub fn linkauth(
     )?;
     context.require_authorization(&requirement.account, None)?;
 
+    if db.protocol_feature_activated([
+        0xf3, 0xc3, 0xd9, 0x1c, 0x46, 0x03, 0xcd, 0xe2, 0x39, 0x72, 0x68, 0xbf, 0xed, 0x4e,
+        0x66, 0x24, 0x65, 0x29, 0x3a, 0xab, 0x10, 0xcd, 0x94, 0x16, 0xdb, 0x0d, 0x44, 0x2b,
+        0x8c, 0xec, 0x29, 0x49,
+    ]) && requirement.requirement != crate::ANY_NAME
+    {
+        let permission_exists = db
+            .read()?
+            .find_permission_info(
+                requirement.account.as_u64(),
+                requirement.requirement.as_u64(),
+            )?
+            .is_some();
+        pulse_assert(
+            permission_exists,
+            ChainError::ActionValidationError(format!(
+                "failed to retrieve permission: {}",
+                requirement.requirement
+            )),
+        )?;
+    }
+
     let delta = db.link_auth(
         requirement.account.as_u64(),
         requirement.code.as_u64(),
