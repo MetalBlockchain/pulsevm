@@ -1014,11 +1014,40 @@ fn decode_global_property(bytes: &[u8]) -> Result<PortableRow, XprImportError> {
         )));
     }
 
-    // proposed_schedule_block_num: optional<uint32>
-    if row.bool()? {
-        row.u32()?;
+    // Leap 5 prefixes the chain config with an optional producer-authority
+    // schedule. Older XPR history rows start directly with chain_config. Try
+    // the modern layout first, then the legacy field layout; every candidate
+    // must consume the row exactly, so malformed rows cannot be accepted by a
+    // permissive fallback.
+    let modern_error = match decode_global_property_layout(row, true, false) {
+        Ok(config) => return Ok(PortableRow::GlobalProperty { config }),
+        Err(error) => error,
+    };
+    let mut row = RowCursor::new(bytes);
+    row.varuint()?;
+    if let Ok(config) = decode_global_property_layout(row, true, true) {
+        return Ok(PortableRow::GlobalProperty { config });
     }
-    skip_producer_authority_schedule(&mut row)?;
+    let mut row = RowCursor::new(bytes);
+    row.varuint()?;
+    if let Ok(config) = decode_global_property_layout(row, false, true) {
+        return Ok(PortableRow::GlobalProperty { config });
+    }
+    Err(modern_error)
+}
+
+fn decode_global_property_layout(
+    mut row: RowCursor<'_>,
+    has_producer_schedule: bool,
+    legacy_config_fields: bool,
+) -> Result<ChainConfigV0, XprImportError> {
+    if has_producer_schedule {
+        // proposed_schedule_block_num is optional<uint32>.
+        if row.bool()? {
+            row.u32()?;
+        }
+        skip_producer_authority_schedule(&mut row)?;
+    }
 
     let config_version = row.varuint()?;
     if config_version > 1 {
@@ -1039,8 +1068,16 @@ fn decode_global_property(bytes: &[u8]) -> Result<PortableRow, XprImportError> {
         max_transaction_cpu_usage: row.u32()?,
         min_transaction_cpu_usage: row.u32()?,
         max_transaction_lifetime: row.u32()?,
-        deferred_trx_expiration_window: row.u32()?,
-        max_transaction_delay: row.u32()?,
+        deferred_trx_expiration_window: if legacy_config_fields {
+            0
+        } else {
+            row.u32()?
+        },
+        max_transaction_delay: if legacy_config_fields {
+            0
+        } else {
+            row.u32()?
+        },
         max_inline_action_size: row.u32()?,
         max_inline_action_depth: row.u16()?,
         max_authority_depth: row.u16()?,
@@ -1071,7 +1108,7 @@ fn decode_global_property(bytes: &[u8]) -> Result<PortableRow, XprImportError> {
         }
     }
     row.finish()?;
-    Ok(PortableRow::GlobalProperty { config })
+    Ok(config)
 }
 
 fn skip_producer_authority_schedule(row: &mut RowCursor<'_>) -> Result<(), XprImportError> {
@@ -1846,6 +1883,23 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn accepts_current_and_legacy_global_property_rows() {
+        let current = hex::decode("01000000000000010000100000000000e8030000000008000c000000f40100001400000064000000400d0300e8030000f049020064000000100e00005802000080533b000010000004000600000100009371fb05f023fcc78b23923d70bdfe6642cdf1956d120045bcd1371e05c961a90000040000000400000020000000000100002000000004000000200000000040010000400110020000fb000000").unwrap();
+        let PortableRow::GlobalProperty { config } = decode_global_property(&current).unwrap() else {
+            panic!("expected global_property row");
+        };
+        assert_eq!(config.deferred_trx_expiration_window, 600);
+        assert_eq!(config.max_transaction_delay, 3_888_000);
+
+        let legacy = hex::decode("01010000100000000000e8030000000008000c000000f40100001400000064000000005ed0b2c409000000ca9a3ba0860100100e000000100000060006000001000098f998d9010e744bddcef4a12ac306b93919537caa232ca19de2ed50322bb6fa0000040000000400000020000000000100002000000004000000200000000040010000400110020000fb000000").unwrap();
+        let PortableRow::GlobalProperty { config } = decode_global_property(&legacy).unwrap() else {
+            panic!("expected legacy global_property row");
+        };
+        assert_eq!(config.deferred_trx_expiration_window, 0);
+        assert_eq!(config.max_transaction_delay, 0);
+    }
 
     #[test]
     fn parses_full_state_history_entry() {
