@@ -83,6 +83,17 @@ use pulsevm_constants::{
     BLOCK_SIZE_AVERAGE_WINDOW_MS,
     MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER,
 };
+
+const DISABLE_DEFERRED_TRXS_STAGE_1_FEATURE_DIGEST: [u8; 32] = [
+    0x44, 0x0c, 0x3e, 0xfa, 0xaa, 0xb2, 0x12, 0xc3, 0x87, 0xce, 0x96, 0x7c, 0x57, 0x4d, 0xc8,
+    0x13, 0x85, 0x1c, 0xf8, 0x33, 0x2d, 0x04, 0x1b, 0xeb, 0x41, 0x8d, 0xfa, 0xf5, 0x5f, 0xac,
+    0xd5, 0xa9,
+];
+const DISABLE_DEFERRED_TRXS_STAGE_2_FEATURE_DIGEST: [u8; 32] = [
+    0xa8, 0x57, 0xee, 0xb9, 0x32, 0x77, 0x4c, 0x51, 0x1a, 0x40, 0xef, 0xb3, 0x03, 0x46, 0xec,
+    0x01, 0xbf, 0xb7, 0x79, 0x69, 0x16, 0xb5, 0x4c, 0x3c, 0x69, 0xfe, 0x7e, 0x5f, 0xb7, 0x0d,
+    0x5c, 0xba,
+];
 use pulsevm_crypto::{
     Bytes,
     Digest,
@@ -423,6 +434,25 @@ impl Controller {
                     )));
                 }
             }
+            // Leap's second deferred-transaction retirement feature removes all
+            // pending generated transactions when activated. A checkpoint made
+            // before that activation can still carry rows, so normalize them
+            // before the target chain starts producing blocks.
+            if self
+                .db
+                .protocol_feature_activated(DISABLE_DEFERRED_TRXS_STAGE_2_FEATURE_DIGEST)
+            {
+                let pending = self.db.arena_deferred_transactions();
+                for deferred in &pending {
+                    self.db.arena_remove_deferred_transaction(deferred.trx_id)?;
+                }
+                if !pending.is_empty() {
+                    info!(
+                        "removed {} pending deferred transactions because DISABLE_DEFERRED_TRXS_STAGE_2 is active",
+                        pending.len()
+                    );
+                }
+            }
             info!(
                 "restored migration Arena checkpoint {} at revision {} from manifest {}",
                 checkpoint,
@@ -692,11 +722,18 @@ impl Controller {
         // from the mempool. Their raw transaction bytes have no signatures: the
         // source chain authorized them when they were scheduled. Keep each one
         // in its own undo session so a failure leaves the queue untouched.
-        for scheduled in db.arena_due_deferred_transactions(
-            timestamp.to_time_point().time_since_epoch().count(),
-        ) {
-            let now = timestamp.to_time_point().time_since_epoch().count();
-            if scheduled.expiration < now {
+        let now = timestamp.to_time_point().time_since_epoch().count();
+        let disable_deferred_stage_1 = db
+            .protocol_feature_activated(DISABLE_DEFERRED_TRXS_STAGE_1_FEATURE_DIGEST);
+        let scheduled_transactions = if disable_deferred_stage_1 {
+            // After stage 1 every pending deferred transaction is retired as
+            // expired, even when its delay and expiration have not elapsed.
+            db.arena_deferred_transactions()
+        } else {
+            db.arena_due_deferred_transactions(now)
+        };
+        for scheduled in scheduled_transactions {
+            if disable_deferred_stage_1 || scheduled.expiration < now {
                 // Leap retires an expired generated transaction without
                 // executing its payload and commits only its transaction ID.
                 let receipt = crate::chain::transaction::TransactionReceiptHeader::new(
@@ -1460,7 +1497,10 @@ impl Controller {
             let deferred = self.db.arena_deferred_transaction(transaction_id);
             let (result, reproduced_receipt) = if let Some(deferred) = deferred {
                 let now = timestamp.to_time_point().time_since_epoch().count();
-                if deferred.delay_until > now {
+                let disable_deferred_stage_1 = self
+                    .db
+                    .protocol_feature_activated(DISABLE_DEFERRED_TRXS_STAGE_1_FEATURE_DIGEST);
+                if !disable_deferred_stage_1 && deferred.delay_until > now {
                     return Err(ChainError::BlockError(format!(
                         "block includes deferred transaction {} before its delay_until",
                         receipt.transaction_id()
@@ -1474,7 +1514,10 @@ impl Controller {
                 }
                 let result = match receipt.status() {
                     crate::chain::transaction::TransactionStatus::Expired => {
-                        if deferred.expiration >= now || receipt.cpu_usage_us() != 0 || receipt.net_usage_words() != 0 {
+                        if (!disable_deferred_stage_1 && deferred.expiration >= now)
+                            || receipt.cpu_usage_us() != 0
+                            || receipt.net_usage_words() != 0
+                        {
                             return Err(ChainError::BlockError(format!(
                                 "block has an invalid expired receipt for generated transaction {}",
                                 receipt.transaction_id()
@@ -1498,7 +1541,7 @@ impl Controller {
                         }
                     }
                     crate::chain::transaction::TransactionStatus::Executed => {
-                        if deferred.expiration < now {
+                        if disable_deferred_stage_1 || deferred.expiration < now {
                             return Err(ChainError::BlockError(format!(
                                 "block executes expired generated transaction {}",
                                 receipt.transaction_id()
@@ -1523,7 +1566,7 @@ impl Controller {
                         )?
                     }
                     crate::chain::transaction::TransactionStatus::SoftFail => {
-                        if deferred.expiration < now {
+                        if disable_deferred_stage_1 || deferred.expiration < now {
                             return Err(ChainError::BlockError(format!(
                                 "block soft-fails expired generated transaction {}",
                                 receipt.transaction_id()
@@ -1532,7 +1575,10 @@ impl Controller {
                         self.execute_deferred_onerror(&deferred, timestamp, block_status)?
                     }
                     crate::chain::transaction::TransactionStatus::HardFail => {
-                        if deferred.expiration < now || receipt.net_usage_words() != 0 {
+                        if disable_deferred_stage_1
+                            || deferred.expiration < now
+                            || receipt.net_usage_words() != 0
+                        {
                             return Err(ChainError::BlockError(format!(
                                 "block has an invalid hard_fail receipt for generated transaction {}",
                                 receipt.transaction_id()
