@@ -643,9 +643,9 @@ where
     rows
 }
 
-/// The `protocol_state` singleton: the arena models no protocol features, so a
-/// full snapshot emits the one empty row and a delta emits nothing (the feature
-/// set never changes on this chain).
+/// The `protocol_state` singleton: imported feature activations are retained
+/// for lossless SHiP export. A new Pulse chain does not activate additional
+/// source features, so live deltas remain empty.
 fn collect_protocol_state(db: &Db, full_snapshot: bool) -> Rows {
     if !full_snapshot {
         return Vec::new();
