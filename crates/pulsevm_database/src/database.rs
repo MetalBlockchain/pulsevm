@@ -2873,6 +2873,17 @@ impl Database {
         })
     }
 
+    /// Retain the source protocol-feature vector in Arena so its SHiP
+    /// `protocol_state` row remains lossless during XPR migration.
+    pub(crate) fn xpr_import_protocol_features(
+        &self,
+        features: &[([u8; 32], u32)],
+    ) -> Result<(), ChainError> {
+        self.backend
+            .xpr_import_protocol_features(features)
+            .map_err(|e| ChainError::InternalError(format!("XPR import protocol state: {e:?}")))
+    }
+
     /// The wasm image for `(code_hash, vm_type, vm_version)` as owned bytes.
     ///
     /// This is the bytecode the VM compiles and runs, served from the arena as
@@ -3026,6 +3037,10 @@ impl Database {
     /// the requested state is absent.
     pub fn arena_global_property_state_bytes(&self) -> Option<Vec<u8>> {
         Some(self.backend.global_property_state_bytes())
+    }
+
+    pub fn arena_protocol_state_bytes(&self) -> Option<Vec<u8>> {
+        Some(self.backend.protocol_state_bytes())
     }
 
     pub fn get_virtual_block_cpu_limit(&self) -> Result<u64, ChainError> {

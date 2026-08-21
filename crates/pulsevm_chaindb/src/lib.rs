@@ -555,6 +555,20 @@ struct DynGlobalPropertyRow {
     global_action_sequence: u64,
 }
 
+fn write_varuint(mut value: u64, out: &mut Vec<u8>) {
+    loop {
+        let mut byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        out.push(byte);
+        if value == 0 {
+            return;
+        }
+    }
+}
+
 /// Arena-internal bookkeeping — NOT part of any consensus state and never
 /// serialized into a `*_state_bytes` root. Holds the next permission id the
 /// arena will assign, replicating chainbase's per-index `undo_index::_next_id`
@@ -604,6 +618,20 @@ struct GlobalPropertyRow {
     max_inline_action_size: u32,
     max_inline_action_depth: u16,
     max_authority_depth: u16,
+    _pad: u32,
+}
+
+/// One activated protocol feature from chainbase's `protocol_state` singleton.
+/// The singleton is represented as an ordered table so the variable-length
+/// feature vector remains undo/checkpoint safe without imposing a fixed cap on
+/// the number of features.
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout, ArenaObject)]
+#[arena(type_id = 22)]
+struct ProtocolFeatureRow {
+    id: ObjectId<ProtocolFeatureRow>,
+    feature_digest: [u8; 32],
+    activation_block_num: u32,
     _pad: u32,
 }
 
@@ -1286,6 +1314,7 @@ fn build_registered_db() -> Result<Db, DbError> {
     db.add_table::<DynGlobalPropertyRow>()?;
     db.add_table::<PermSeqRow>()?;
     db.add_table::<GlobalPropertyRow>()?;
+    db.add_table::<ProtocolFeatureRow>()?;
     db.add_table::<ResourceConfigRow>()?;
     db.add_table::<TransactionRow>()?;
     db.add_table::<DeferredTransactionRow>()?;
@@ -3172,6 +3201,50 @@ impl ChainDatabase {
             Some(r) => r.params().to_state_bytes(),
             None => Vec::new(),
         }
+    }
+
+    /// Replaces the imported XPR protocol-feature vector. Feature activation
+    /// is source-state metadata for the independent Pulse chain, but retaining
+    /// it makes the Arena SHiP `protocol_state` row lossless.
+    pub fn xpr_import_protocol_features(
+        &self,
+        features: &[([u8; 32], u32)],
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let ids: Vec<_> = db
+            .table::<ProtocolFeatureRow>()?
+            .iter()
+            .map(|row| row.id())
+            .collect();
+        for id in ids {
+            db.remove::<ProtocolFeatureRow>(id)?;
+        }
+        for (feature_digest, activation_block_num) in features {
+            db.create::<ProtocolFeatureRow>(|row| {
+                row.feature_digest = *feature_digest;
+                row.activation_block_num = *activation_block_num;
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Canonical SHiP payload for the imported `protocol_state` singleton.
+    pub fn protocol_state_bytes(&self) -> Vec<u8> {
+        let db = self.lock();
+        let mut rows: Vec<_> = match db.table::<ProtocolFeatureRow>() {
+            Ok(table) => table.iter().copied().collect(),
+            Err(_) => return vec![0, 0],
+        };
+        rows.sort_by_key(|row| row.id().raw());
+        let mut out = Vec::new();
+        out.push(0); // protocol_state_v0 version
+        write_varuint(rows.len() as u64, &mut out);
+        for row in rows {
+            out.push(0); // activated_protocol_feature_v0 version
+            out.extend_from_slice(&row.feature_digest);
+            out.extend_from_slice(&row.activation_block_num.to_le_bytes());
+        }
+        out
     }
 
     // ----- resource_limits_config_object ------------------------------------
@@ -5487,6 +5560,23 @@ mod tests {
         assert_eq!(db.deferred_transaction_count(), 2);
         assert!(db.remove_deferred_transaction([1; 32]).unwrap());
         assert_eq!(db.deferred_transaction_count(), 1);
+    }
+
+    #[test]
+    fn imported_protocol_features_round_trip_as_ship_state() {
+        let db = ChainDatabase::new().unwrap();
+        let features = [([1u8; 32], 42u32), ([2u8; 32], 99u32)];
+        db.xpr_import_protocol_features(&features).unwrap();
+
+        let bytes = db.protocol_state_bytes();
+        assert_eq!(bytes[0], 0); // protocol_state_v0
+        assert_eq!(bytes[1], 2); // two activated features
+        assert_eq!(bytes[2], 0); // activated_protocol_feature_v0
+        assert_eq!(&bytes[3..35], &[1u8; 32]);
+        assert_eq!(u32::from_le_bytes(bytes[35..39].try_into().unwrap()), 42);
+        assert_eq!(bytes[39], 0); // activated_protocol_feature_v0
+        assert_eq!(&bytes[40..72], &[2u8; 32]);
+        assert_eq!(u32::from_le_bytes(bytes[72..76].try_into().unwrap()), 99);
     }
 
     /// The standalone-write path bills db_idxN_update off the row's old payer and

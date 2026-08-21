@@ -35,6 +35,7 @@ use super::{
     GlobalPropertyRow,
     PermissionLinkRow,
     PermissionRow,
+    ProtocolFeatureRow,
     ResourceConfigRow,
     ResourceLimitsRow,
     ResourceStateRow,
@@ -645,15 +646,24 @@ where
 /// The `protocol_state` singleton: the arena models no protocol features, so a
 /// full snapshot emits the one empty row and a delta emits nothing (the feature
 /// set never changes on this chain).
-fn collect_protocol_state(full_snapshot: bool) -> Rows {
-    if full_snapshot {
-        let mut s = Ser::new();
-        s.uvar(0); // history version
-        s.uvar(0); // activated_protocol_features container (empty)
-        vec![(true, s.buf)]
-    } else {
-        Vec::new()
+fn collect_protocol_state(db: &Db, full_snapshot: bool) -> Rows {
+    if !full_snapshot {
+        return Vec::new();
     }
+    let mut features: Vec<_> = db
+        .table::<ProtocolFeatureRow>()
+        .map(|table| table.iter().copied().collect())
+        .unwrap_or_default();
+    features.sort_by_key(|row| row.id().raw());
+    let mut s = Ser::new();
+    s.uvar(0); // protocol_state_v0 history version
+    s.uvar(features.len() as u64);
+    for feature in features {
+        s.uvar(0); // activated_protocol_feature_v0 history version
+        s.raw(&feature.feature_digest);
+        s.u32(feature.activation_block_num);
+    }
+    vec![(true, s.buf)]
 }
 
 fn frame_table(out: &mut Ser, name: &str, rows: &Rows) {
@@ -753,7 +763,7 @@ pub(crate) fn pack_deltas(db: &Db, full_snapshot: bool, chain_id: &[u8; 32]) -> 
             s.buf
         }),
     );
-    per_table.insert("protocol_state", collect_protocol_state(full_snapshot));
+    per_table.insert("protocol_state", collect_protocol_state(db, full_snapshot));
     {
         let mut rows = collect_table::<PermissionRow, _>(db, full_snapshot, |db, r| {
             let mut s = Ser::new();

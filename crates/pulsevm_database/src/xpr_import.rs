@@ -71,8 +71,9 @@ pub struct ImportSummary {
     pub resource_states: u64,
     pub resource_configs: u64,
     /// Activated Leap protocol features observed in the source snapshot. They
-    /// are audit metadata: the destination is a new Pulse chain and does not
-    /// replay XPR's feature-activation history.
+    /// are retained in Arena's protocol-state row for lossless SHiP export;
+    /// the destination is still a new Pulse chain and does not replay the
+    /// source activation schedule.
     #[serde(default)]
     pub source_activated_protocol_features: u64,
     /// Added after manifest version 1 was already emitted by local migration
@@ -303,6 +304,13 @@ pub fn hydrate_full_state_with_deferred_transactions(
             }
         }
         for row in &rows {
+            if let PortableRow::ProtocolState { features } = row {
+                db.xpr_import_protocol_features(features)
+                    .map_err(database_error)?;
+                summary.source_activated_protocol_features = features.len() as u64;
+            }
+        }
+        for row in &rows {
             match row {
                 PortableRow::Account {
                     name,
@@ -480,9 +488,7 @@ pub fn hydrate_full_state_with_deferred_transactions(
                 | PortableRow::AccountMetadata { .. }
                 | PortableRow::Code { .. }
                 | PortableRow::Permission { .. } => {}
-                PortableRow::ProtocolState { activated_features } => {
-                    summary.source_activated_protocol_features += activated_features;
-                }
+                PortableRow::ProtocolState { .. } => {}
                 PortableRow::GeneratedTransaction { .. } => {}
                 PortableRow::ContractTable {
                     code,
@@ -604,9 +610,9 @@ enum PortableRow {
     /// database starts a new Pulse chain with its own producer schedule. Its
     /// chain execution configuration is retained in Arena.
     GlobalProperty { config: ChainConfigV0 },
-    /// Source activation history is validated and recorded in the migration
-    /// manifest, but not replayed into the independent Pulse runtime.
-    ProtocolState { activated_features: u64 },
+    /// Source activation history is retained for lossless state-history export,
+    /// but not replayed into the independent Pulse runtime.
+    ProtocolState { features: Vec<([u8; 32], u32)> },
     PermissionLink {
         account: u64,
         code: u64,
@@ -1100,17 +1106,17 @@ fn skip_producer_authority_schedule(row: &mut RowCursor<'_>) -> Result<(), XprIm
 fn decode_protocol_state(bytes: &[u8]) -> Result<PortableRow, XprImportError> {
     let mut row = RowCursor::new(bytes);
     row.version()?;
-    let activated_features = row.varuint()?;
-    if activated_features > 10_000 {
+    let feature_count = row.varuint()?;
+    if feature_count > 10_000 {
         return Err(bad("XPR protocol-state feature count is too large"));
     }
-    for _ in 0..activated_features {
+    let mut features = Vec::with_capacity(feature_count as usize);
+    for _ in 0..feature_count {
         row.version()?;
-        row.fixed::<32>()?; // source feature digest
-        row.u32()?; // source activation block number
+        features.push((row.fixed::<32>()?, row.u32()?));
     }
     row.finish()?;
-    Ok(PortableRow::ProtocolState { activated_features })
+    Ok(PortableRow::ProtocolState { features })
 }
 
 fn decode_permission_link(bytes: &[u8]) -> Result<PortableRow, XprImportError> {
