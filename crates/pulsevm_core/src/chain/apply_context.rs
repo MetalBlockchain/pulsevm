@@ -34,6 +34,7 @@ use pulsevm_serialization::Write;
 
 use crate::{
     CODE_NAME,
+    PULSE_NAME,
     chain::{
         authority::PermissionLevel,
         authorization_manager::AuthorizationManager,
@@ -49,8 +50,14 @@ use crate::{
         wasm_runtime::WasmRuntime,
     },
     name::Name,
-    transaction::PackedTransaction,
+        transaction::PackedTransaction,
 };
+
+const FORWARD_SETCODE_FEATURE_DIGEST: [u8; 32] = [
+    0x89, 0x80, 0x82, 0xc5, 0x9f, 0x92, 0x1d, 0x00, 0x42, 0xe5, 0x81, 0xf0, 0x0a, 0x59, 0xd5,
+    0xce, 0xb8, 0xbe, 0x6f, 0x1d, 0x9c, 0x7a, 0x45, 0xb6, 0xf0, 0x7c, 0x0e, 0x26, 0xea, 0xee,
+    0x02, 0x22,
+];
 
 const RESTRICT_ACTION_TO_SELF_FEATURE_DIGEST: [u8; 32] = [
     0xe7, 0x1b, 0x67, 0x12, 0x18, 0x39, 0x19, 0x94, 0xc7, 0x8d, 0x8c, 0x72, 0x2c, 0x1d,
@@ -217,7 +224,13 @@ impl ApplyContext {
         // code hash from the Rust database. An all-zero hash means no contract.
         let (code_hash, _vm_type, _vm_version) =
             self.db.account_code_hash_vm(self.receiver.as_u64())?;
-        if code_hash != [0u8; 32] {
+        let is_system_setcode = self.receiver == PULSE_NAME
+            && *action.account() == PULSE_NAME
+            && *action.name() == crate::chain::config::SETCODE_NAME;
+        let forward_setcode = self
+            .db
+            .protocol_feature_activated(FORWARD_SETCODE_FEATURE_DIGEST);
+        if code_hash != [0u8; 32] && (!is_system_setcode || forward_setcode) {
             // Separate context here because we need to release the lock on inner before executing
             // the Wasm code, which may call back into the context and cause deadlock if we hold the
             // lock.
