@@ -30,7 +30,6 @@ use crate::{
         UNLINKAUTH_NAME,
         UPDATEAUTH_NAME,
     },
-    crypto::PublicKey,
     transaction::Transaction,
     utils::pulse_assert,
 };
@@ -195,19 +194,15 @@ impl AuthorizationManager {
     pub fn get_required_keys(
         db: &mut Database,
         trx: &Transaction,
-        candidate_keys: &BTreeSet<PublicKey>,
+        candidate_keys: &BTreeSet<AuthorityPublicKey>,
         provided_delay: Microseconds,
-    ) -> Result<BTreeSet<PublicKey>, ChainError> {
+    ) -> Result<BTreeSet<AuthorityPublicKey>, ChainError> {
         let chain_config = db.chain_config()?;
         let r = db.read()?;
         let provided_permissions = BTreeSet::<PermissionLevel>::new();
-        let candidate_authority_keys = candidate_keys
-            .iter()
-            .map(|key| AuthorityPublicKey::from(key.into_k1()))
-            .collect();
         let mut authority_checker = AuthorityChecker::new(
             chain_config.max_authority_depth,
-            &candidate_authority_keys,
+            candidate_keys,
             &provided_permissions,
             provided_delay,
         );
@@ -226,17 +221,7 @@ impl AuthorizationManager {
             }
         }
 
-        authority_checker
-            .used_keys()
-            .iter()
-            .map(|key| {
-                key.as_k1().map(PublicKey::new).ok_or_else(|| {
-                    ChainError::AuthorizationError(
-                        "required-key selection does not support WebAuthn keys".into(),
-                    )
-                })
-            })
-            .collect()
+        Ok(authority_checker.used_keys().clone())
     }
 
     fn check_updateauth_authorization(

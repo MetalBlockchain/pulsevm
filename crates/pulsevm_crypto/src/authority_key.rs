@@ -2,6 +2,7 @@ use core::fmt;
 
 use p256::PublicKey as P256PublicKey;
 use pulsevm_serialization::{NumBytes, Read, ReadError, Write, WriteError};
+use serde::{Deserialize, Serialize};
 
 use crate::k1::{K1PublicKey, decode_b58_checked, encode_b58_checked};
 
@@ -192,6 +193,25 @@ impl fmt::Debug for AuthorityPublicKey {
     }
 }
 
+impl Serialize for AuthorityPublicKey {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for AuthorityPublicKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::from_string(&value).map_err(serde::de::Error::custom)
+    }
+}
+
 impl NumBytes for AuthorityPublicKey {
     fn num_bytes(&self) -> usize {
         self.to_packed().len()
@@ -323,5 +343,7 @@ mod tests {
         );
         let bytes = key.pack().unwrap();
         assert_eq!(AuthorityPublicKey::read(&bytes, &mut 0).unwrap(), key);
+        let json = serde_json::to_string(&key).unwrap();
+        assert_eq!(serde_json::from_str::<AuthorityPublicKey>(&json).unwrap(), key);
     }
 }

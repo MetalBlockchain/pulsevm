@@ -15,7 +15,6 @@ use pulsevm_core::{
     block::SignedBlock,
     controller::Controller,
     crypto::{
-        PublicKey,
         Signature,
     },
     id::Id,
@@ -37,6 +36,7 @@ use pulsevm_core::{
     },
 };
 use pulsevm_crypto::{
+    AuthorityPublicKey,
     Bytes,
     Digest,
 };
@@ -122,8 +122,8 @@ pub trait Rpc {
     async fn get_required_keys(
         &self,
         trx: Transaction,
-        candidate_keys: BTreeSet<PublicKey>,
-    ) -> Result<BTreeSet<PublicKey>, ErrorObjectOwned>;
+        candidate_keys: BTreeSet<AuthorityPublicKey>,
+    ) -> Result<BTreeSet<AuthorityPublicKey>, ErrorObjectOwned>;
 
     #[method(name = "pulsevm.getTableByScope")]
     async fn get_table_by_scope(
@@ -500,8 +500,8 @@ impl RpcServer for RpcService {
     async fn get_required_keys(
         &self,
         trx: Transaction,
-        candidate_keys: BTreeSet<PublicKey>,
-    ) -> Result<BTreeSet<PublicKey>, ErrorObjectOwned> {
+        candidate_keys: BTreeSet<AuthorityPublicKey>,
+    ) -> Result<BTreeSet<AuthorityPublicKey>, ErrorObjectOwned> {
         let controller = self.controller.read().await;
         let mut db = controller.database();
 
