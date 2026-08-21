@@ -155,7 +155,7 @@ impl AuthorizationManager {
     pub fn check_permission_authorization(
         db: &Database,
         permission: PermissionLevel,
-        provided_keys: &BTreeSet<PublicKey>,
+        provided_keys: &BTreeSet<AuthorityPublicKey>,
         provided_permissions: &BTreeSet<PermissionLevel>,
         provided_delay: Microseconds,
         allow_unused_keys: bool,
@@ -164,13 +164,9 @@ impl AuthorizationManager {
         let chain_config = db.chain_config()?;
         let r = db.read()?;
         let delay_max_limit = seconds(chain_config.max_transaction_delay as i64);
-        let provided_authority_keys = provided_keys
-            .iter()
-            .map(|key| AuthorityPublicKey::from(key.into_k1()))
-            .collect();
         let mut authority_checker = AuthorityChecker::new(
             chain_config.max_authority_depth,
-            &provided_authority_keys,
+            provided_keys,
             provided_permissions,
             if provided_delay >= delay_max_limit {
                 Microseconds::maximum()

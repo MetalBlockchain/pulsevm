@@ -17,7 +17,6 @@ use super::cost;
 use crate::{
     authorization_manager::AuthorizationManager,
     chain::webassembly::context_aware_check,
-    crypto::PublicKey,
     transaction::Transaction,
     wasm_runtime::WasmContext,
 };
@@ -53,7 +52,7 @@ pub fn check_transaction_authorization(
     let transaction = Transaction::read(&trx_bytes, &mut 0)
         .map_err(|e| RuntimeError::new(format!("failed to deserialize transaction: {}", e)))?;
 
-    let mut provided_keys: BTreeSet<PublicKey> = BTreeSet::new();
+    let mut provided_keys: BTreeSet<AuthorityPublicKey> = BTreeSet::new();
     let mut provided_permissions: BTreeSet<PermissionLevel> = BTreeSet::new();
 
     if pubkeys_length > 0 {
@@ -64,7 +63,7 @@ pub fn check_transaction_authorization(
         pubkeys_slice
             .read_slice(&mut pubkeys_bytes)
             .map_err(|e| RuntimeError::new(format!("failed to read public keys: {e}")))?;
-        provided_keys = BTreeSet::<PublicKey>::read(&pubkeys_bytes, &mut 0).map_err(|e| {
+        provided_keys = BTreeSet::<AuthorityPublicKey>::read(&pubkeys_bytes, &mut 0).map_err(|e| {
             RuntimeError::new(format!("failed to deserialize provided public keys: {}", e))
         })?;
     }
@@ -88,15 +87,10 @@ pub fn check_transaction_authorization(
 
     let mut db = env_data.db_mut();
 
-    let provided_authority_keys = provided_keys
-        .iter()
-        .map(|key| AuthorityPublicKey::from(key.into_k1()))
-        .collect();
-
     match AuthorizationManager::check_authorization(
         &mut db,
         &transaction.actions,
-        &provided_authority_keys,
+        &provided_keys,
         &provided_permissions,
         seconds(transaction.header.delay_sec.into()),
         &BTreeSet::new(),
@@ -139,7 +133,7 @@ pub fn check_permission_authorization(
     // Read the two spans out of wasm linear memory. Bounds-check with `slice`
     // before sizing each host buffer — allocating first lets a guest request
     // ~4 GiB on a range that was never valid.
-    let mut provided_keys: BTreeSet<PublicKey> = BTreeSet::new();
+    let mut provided_keys: BTreeSet<AuthorityPublicKey> = BTreeSet::new();
     if pubkeys_size > 0 {
         let pubkeys_slice = pubkeys_ptr
             .slice(&view, pubkeys_size)
@@ -148,7 +142,7 @@ pub fn check_permission_authorization(
         pubkeys_slice
             .read_slice(&mut pubkeys_data)
             .map_err(|e| RuntimeError::new(format!("failed to read pubkeys: {}", e)))?;
-        provided_keys = BTreeSet::<PublicKey>::read(pubkeys_data.as_slice(), &mut 0)
+        provided_keys = BTreeSet::<AuthorityPublicKey>::read(pubkeys_data.as_slice(), &mut 0)
             .map_err(|e| RuntimeError::new(format!("failed to unpack pubkeys: {}", e)))?;
     }
 

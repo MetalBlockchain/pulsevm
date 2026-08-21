@@ -1,6 +1,7 @@
 use core::fmt;
 
 use p256::PublicKey as P256PublicKey;
+use pulsevm_serialization::{NumBytes, Read, ReadError, Write, WriteError};
 
 use crate::k1::{K1PublicKey, decode_b58_checked, encode_b58_checked};
 
@@ -191,6 +192,36 @@ impl fmt::Debug for AuthorityPublicKey {
     }
 }
 
+impl NumBytes for AuthorityPublicKey {
+    fn num_bytes(&self) -> usize {
+        self.to_packed().len()
+    }
+}
+
+impl Read for AuthorityPublicKey {
+    fn read(bytes: &[u8], pos: &mut usize) -> Result<Self, ReadError> {
+        let start = *pos;
+        let end = packed_end(bytes, start).map_err(|e| ReadError::CustomError(e.to_string()))?;
+        let key = Self::from_packed(&bytes[start..end])
+            .map_err(|e| ReadError::CustomError(e.to_string()))?;
+        *pos = end;
+        Ok(key)
+    }
+}
+
+impl Write for AuthorityPublicKey {
+    fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), WriteError> {
+        let packed = self.to_packed();
+        let end = pos
+            .checked_add(packed.len())
+            .filter(|end| *end <= bytes.len())
+            .ok_or(WriteError::NotEnoughSpace)?;
+        bytes[*pos..end].copy_from_slice(&packed);
+        *pos = end;
+        Ok(())
+    }
+}
+
 fn read_p256_point(
     bytes: &[u8],
     pos: &mut usize,
@@ -214,6 +245,27 @@ fn take<'a>(bytes: &'a [u8], pos: &mut usize, len: usize) -> Result<&'a [u8], Au
 
 fn take_byte(bytes: &[u8], pos: &mut usize) -> Result<u8, AuthorityKeyError> {
     Ok(take(bytes, pos, 1)?[0])
+}
+
+fn packed_end(bytes: &[u8], start: usize) -> Result<usize, AuthorityKeyError> {
+    let mut pos = start;
+    match read_varuint(bytes, &mut pos)? {
+        0 | 1 => {
+            take(bytes, &mut pos, 33)?;
+        }
+        2 => {
+            take(bytes, &mut pos, 34)?;
+            let len = usize::try_from(read_varuint(bytes, &mut pos)?)
+                .map_err(|_| AuthorityKeyError("WebAuthn RP ID length is too large".into()))?;
+            take(bytes, &mut pos, len)?;
+        }
+        tag => {
+            return Err(AuthorityKeyError(format!(
+                "unsupported authority public-key type {tag}"
+            )));
+        }
+    }
+    Ok(pos)
 }
 
 fn read_varuint(bytes: &[u8], pos: &mut usize) -> Result<u64, AuthorityKeyError> {
@@ -253,6 +305,7 @@ fn write_varuint(mut value: u64, out: &mut Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::AuthorityPublicKey;
+    use pulsevm_serialization::{Read, Write};
 
     #[test]
     fn webauthn_packed_and_json_forms_round_trip() {
@@ -268,5 +321,7 @@ mod tests {
             AuthorityPublicKey::from_string(&key.to_string()).unwrap(),
             key
         );
+        let bytes = key.pack().unwrap();
+        assert_eq!(AuthorityPublicKey::read(&bytes, &mut 0).unwrap(), key);
     }
 }
