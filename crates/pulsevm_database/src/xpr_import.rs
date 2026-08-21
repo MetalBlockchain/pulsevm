@@ -1111,9 +1111,24 @@ fn decode_protocol_state(bytes: &[u8]) -> Result<PortableRow, XprImportError> {
         return Err(bad("XPR protocol-state feature count is too large"));
     }
     let mut features = Vec::with_capacity(feature_count as usize);
+    let mut seen_digests = HashSet::with_capacity(feature_count as usize);
+    let mut previous_activation_block = None;
     for _ in 0..feature_count {
         row.version()?;
-        features.push((row.fixed::<32>()?, row.u32()?));
+        let feature_digest = row.fixed::<32>()?;
+        let activation_block_num = row.u32()?;
+        if !seen_digests.insert(feature_digest) {
+            return Err(bad("XPR protocol-state contains a duplicate feature digest"));
+        }
+        if let Some(previous) = previous_activation_block
+            && activation_block_num < previous
+        {
+            return Err(bad(
+                "XPR protocol-state feature activations are not in block order",
+            ));
+        }
+        previous_activation_block = Some(activation_block_num);
+        features.push((feature_digest, activation_block_num));
     }
     row.finish()?;
     Ok(PortableRow::ProtocolState { features })
@@ -1900,6 +1915,31 @@ mod tests {
     fn rejects_overlong_varuint() {
         let bytes = [0x80; 10];
         assert!(parse_table_deltas(&bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_or_out_of_order_protocol_features() {
+        let mut duplicate = vec![0, 2, 0];
+        duplicate.extend_from_slice(&[7; 32]);
+        duplicate.extend_from_slice(&10u32.to_le_bytes());
+        duplicate.push(0);
+        duplicate.extend_from_slice(&[7; 32]);
+        duplicate.extend_from_slice(&11u32.to_le_bytes());
+        assert!(matches!(
+            decode_protocol_state(&duplicate),
+            Err(ref error) if error.to_string().contains("duplicate feature digest")
+        ));
+
+        let mut out_of_order = vec![0, 2, 0];
+        out_of_order.extend_from_slice(&[8; 32]);
+        out_of_order.extend_from_slice(&20u32.to_le_bytes());
+        out_of_order.push(0);
+        out_of_order.extend_from_slice(&[9; 32]);
+        out_of_order.extend_from_slice(&19u32.to_le_bytes());
+        assert!(matches!(
+            decode_protocol_state(&out_of_order),
+            Err(ref error) if error.to_string().contains("not in block order")
+        ));
     }
 
     #[test]
