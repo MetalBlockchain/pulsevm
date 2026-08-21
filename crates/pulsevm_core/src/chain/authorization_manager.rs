@@ -46,6 +46,11 @@ const WEBAUTHN_KEY_FEATURE_DIGEST: [u8; 32] = [
     0xfb, 0x1f, 0x8b, 0xb3, 0x8f, 0x4e, 0x43, 0xd9, 0xc1, 0xf7, 0x5b, 0x19, 0x04, 0x92,
     0x08, 0x0c, 0xbc, 0x34,
 ];
+const FIX_LINKAUTH_RESTRICTION_FEATURE_DIGEST: [u8; 32] = [
+    0xa9, 0x82, 0x41, 0xc8, 0x35, 0x11, 0xdc, 0x86, 0xc8, 0x57, 0x22, 0x1b, 0x93, 0x72,
+    0xb4, 0xaa, 0x7c, 0xea, 0x3a, 0xae, 0xbc, 0x56, 0x7a, 0x48, 0x04, 0xe1, 0xd3, 0xdb,
+    0x35, 0x57, 0x05, 0x0,
+];
 
 fn validate_protocol_key_features(
     db: &Database,
@@ -106,7 +111,7 @@ impl AuthorizationManager {
                         Self::check_updateauth_authorization(&r, act, act.authorization())?
                     }
                     DELETEAUTH_NAME => Self::check_deleteauth_authorization(&r, act)?,
-                    LINKAUTH_NAME => Self::check_linkauth_authorization(&r, act)?,
+                    LINKAUTH_NAME => Self::check_linkauth_authorization(db, &r, act)?,
                     UNLINKAUTH_NAME => Self::check_unlinkauth_authorization(&r, act)?,
                     _ => special_case = false,
                 }
@@ -322,7 +327,11 @@ impl AuthorizationManager {
         Ok(())
     }
 
-    fn check_linkauth_authorization(db: &DbRead<'_>, action: &Action) -> Result<(), ChainError> {
+    fn check_linkauth_authorization(
+        database: &Database,
+        db: &DbRead<'_>,
+        action: &Action,
+    ) -> Result<(), ChainError> {
         let link = action
             .data_as::<LinkAuth>()
             .map_err(|e| ChainError::AuthorizationError(format!("{}", e)))?;
@@ -337,7 +346,9 @@ impl AuthorizationManager {
             auth.actor == link.account,
             ChainError::AuthorizationError("the owner of the linked permission needs to be the actor of the declared authorization".to_string()),
         )?;
-        if link.code == PULSE_NAME {
+        if link.code == PULSE_NAME
+            || !database.protocol_feature_activated(FIX_LINKAUTH_RESTRICTION_FEATURE_DIGEST)
+        {
             match link.message_type {
                 UPDATEAUTH_NAME => {
                     return Err(ChainError::AuthorizationError(
