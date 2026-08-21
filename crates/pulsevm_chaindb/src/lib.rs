@@ -779,6 +779,14 @@ impl IndexedBy<DeferredTransactionRow> for DeferredByTrxId {
     }
 }
 
+struct DeferredBySenderId;
+impl IndexedBy<DeferredTransactionRow> for DeferredBySenderId {
+    type Key = (u64, u64, u64);
+    fn key(o: &DeferredTransactionRow) -> Self::Key {
+        (o.sender, o.sender_id_hi, o.sender_id_lo)
+    }
+}
+
 struct DeferredByDelay;
 impl IndexedBy<DeferredTransactionRow> for DeferredByDelay {
     type Key = (i64, i64);
@@ -798,6 +806,7 @@ impl ArenaObject for DeferredTransactionRow {
     fn secondary_indices() -> Vec<Box<dyn SecondaryIndex<Self>>> {
         vec![
             key_index::<Self, DeferredByTrxId>(),
+            key_index::<Self, DeferredBySenderId>(),
             key_index::<Self, DeferredByDelay>(),
         ]
     }
@@ -3500,6 +3509,67 @@ impl ChainDatabase {
         })
     }
 
+    /// Find a generated transaction by the `(sender,sender_id)` key used by
+    /// `send_deferred` and `cancel_deferred`. This key, rather than the
+    /// transaction digest, identifies the in-flight request that may be
+    /// replaced or cancelled.
+    pub fn deferred_transaction_by_sender_id(
+        &self,
+        sender: u64,
+        sender_id: u128,
+    ) -> Option<DeferredTransaction> {
+        let db = self.lock();
+        let key = (sender, (sender_id >> 64) as u64, sender_id as u64);
+        let row = db
+            .find_by::<DeferredTransactionRow, DeferredBySenderId>(&key)
+            .ok()
+            .flatten()?;
+        let packed_trx = db.blob::<DeferredTransactionRow>(row.packed_trx).ok()?.to_vec();
+        Some(DeferredTransaction {
+            sender: row.sender,
+            sender_id: (row.sender_id_lo as u128) | ((row.sender_id_hi as u128) << 64),
+            payer: row.payer,
+            trx_id: row.trx_id,
+            delay_until: row.delay_until,
+            expiration: row.expiration,
+            published: row.published,
+            packed_trx,
+        })
+    }
+
+    /// Remove a generated transaction by its `(sender,sender_id)` key.
+    pub fn remove_deferred_transaction_by_sender_id(
+        &self,
+        sender: u64,
+        sender_id: u128,
+    ) -> Result<Option<DeferredTransaction>, DbError> {
+        let mut db = self.lock();
+        let key = (sender, (sender_id >> 64) as u64, sender_id as u64);
+        let Some(row) = db
+            .find_by::<DeferredTransactionRow, DeferredBySenderId>(&key)?
+        else {
+            return Ok(None);
+        };
+        let (row_id, materialized) = {
+            let packed_trx = db.blob::<DeferredTransactionRow>(row.packed_trx)?.to_vec();
+            (
+                row.id(),
+                DeferredTransaction {
+                    sender: row.sender,
+                    sender_id: (row.sender_id_lo as u128) | ((row.sender_id_hi as u128) << 64),
+                    payer: row.payer,
+                    trx_id: row.trx_id,
+                    delay_until: row.delay_until,
+                    expiration: row.expiration,
+                    published: row.published,
+                    packed_trx,
+                },
+            )
+        };
+        db.remove::<DeferredTransactionRow>(row_id)?;
+        Ok(Some(materialized))
+    }
+
     /// Materialize every deferred transaction in immutable transaction-id
     /// order. This is used at migration startup to validate the raw payloads
     /// before the node begins producing blocks.
@@ -5567,6 +5637,41 @@ mod tests {
         assert_eq!(db.deferred_transaction_count(), 2);
         assert!(db.remove_deferred_transaction([1; 32]).unwrap());
         assert_eq!(db.deferred_transaction_count(), 1);
+    }
+
+    #[test]
+    fn deferred_transactions_are_addressable_by_sender_id() {
+        let db = ChainDatabase::new().unwrap();
+        db.start_undo_session();
+        let sender_id = (7u128 << 64) | 9;
+        db.xpr_import_deferred_transaction(
+            42,
+            sender_id,
+            42,
+            [3; 32],
+            20,
+            100,
+            10,
+            &[8, 9],
+        )
+        .unwrap();
+        db.squash();
+
+        let found = db
+            .deferred_transaction_by_sender_id(42, sender_id)
+            .unwrap();
+        assert_eq!(found.trx_id, [3; 32]);
+        assert_eq!(found.packed_trx, vec![8, 9]);
+
+        let removed = db
+            .remove_deferred_transaction_by_sender_id(42, sender_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(removed.sender_id, sender_id);
+        assert_eq!(db.deferred_transaction_count(), 0);
+        assert!(db
+            .deferred_transaction_by_sender_id(42, sender_id)
+            .is_none());
     }
 
     #[test]

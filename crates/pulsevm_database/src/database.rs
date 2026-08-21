@@ -1899,6 +1899,15 @@ impl Database {
         self.backend.deferred_transaction(trx_id)
     }
 
+    pub fn arena_deferred_transaction_by_sender_id(
+        &self,
+        sender: u64,
+        sender_id: u128,
+    ) -> Option<crate::backend::DeferredTransaction> {
+        self.backend
+            .deferred_transaction_by_sender_id(sender, sender_id)
+    }
+
     pub fn arena_due_deferred_transactions(
         &self,
         now_micros: i64,
@@ -1915,6 +1924,20 @@ impl Database {
             .remove_deferred_transaction(trx_id)
             .map_err(|e| {
                 ChainError::InternalError(format!("arena remove deferred transaction: {e:?}"))
+            })
+    }
+
+    pub fn arena_remove_deferred_transaction_by_sender_id(
+        &self,
+        sender: u64,
+        sender_id: u128,
+    ) -> Result<Option<crate::backend::DeferredTransaction>, ChainError> {
+        self.backend
+            .remove_deferred_transaction_by_sender_id(sender, sender_id)
+            .map_err(|e| {
+                ChainError::InternalError(format!(
+                    "arena remove deferred transaction by sender id: {e:?}"
+                ))
             })
     }
 

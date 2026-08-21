@@ -220,10 +220,12 @@ use crate::chain::{
 
 use super::webassembly::{
     action_data_size,
+    cancel_deferred,
     current_receiver,
     has_auth,
     is_account,
     require_auth,
+    send_deferred,
     send_inline,
 };
 
@@ -727,6 +729,8 @@ impl WasmRuntime {
                 // Transaction functions
                 "send_inline" => Function::new_typed_with_env(&mut store, &env, send_inline),
                 "send_context_free_inline" => Function::new_typed_with_env(&mut store, &env, send_context_free_inline),
+                "send_deferred" => Function::new_typed_with_env(&mut store, &env, send_deferred),
+                "cancel_deferred" => Function::new_typed_with_env(&mut store, &env, cancel_deferred),
                 "read_transaction" => Function::new_typed_with_env(&mut store, &env, read_transaction),
                 "transaction_size" => Function::new_typed_with_env(&mut store, &env, transaction_size),
                 "expiration" => Function::new_typed_with_env(&mut store, &env, expiration),

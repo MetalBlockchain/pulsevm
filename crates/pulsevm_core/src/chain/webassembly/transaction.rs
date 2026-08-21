@@ -95,6 +95,74 @@ pub fn send_context_free_inline(
     Ok(())
 }
 
+/// Schedule a transaction for later execution. The transaction bytes are the
+/// canonical, unsigned `transaction` serialization used by XPR's generated
+/// transaction table; authorization was established by the calling action's
+/// `eosio.code` permission and is not rechecked until execution.
+pub fn send_deferred(
+    mut env: FunctionEnvMut<WasmContext>,
+    sender_id_ptr: WasmPtr<u128>,
+    payer: u64,
+    trx_ptr: WasmPtr<u8>,
+    trx_size: u32,
+    replace_existing: u32,
+) -> Result<(), RuntimeError> {
+    context_aware_check(&env)?;
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(
+        &mut store,
+        cost::TRANSACTION + cost::per_byte(trx_size as u64),
+    )?;
+
+    let (sender_id, packed_trx) = {
+        let memory = env_data
+            .memory()
+            .as_ref()
+            .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
+        let view = memory.view(&store);
+        let mut sender_id_bytes = [0u8; 16];
+        view.read(sender_id_ptr.offset() as u64, &mut sender_id_bytes)?;
+        let mut packed_trx = vec![0u8; trx_size as usize];
+        if trx_size > 0 {
+            trx_ptr
+                .slice(&view, trx_size)?
+                .read_slice(&mut packed_trx)?;
+        }
+        (u128::from_le_bytes(sender_id_bytes), packed_trx)
+    };
+
+    env_data
+        .apply_context_mut()
+        .schedule_deferred(sender_id, payer, packed_trx, replace_existing != 0)
+        .map_err(|e| RuntimeError::new(e.to_string()))
+}
+
+/// Cancel the current receiver's in-flight deferred transaction identified by
+/// its sender id. Returns 1 when a row was removed and 0 when none existed.
+pub fn cancel_deferred(
+    mut env: FunctionEnvMut<WasmContext>,
+    sender_id_ptr: WasmPtr<u128>,
+) -> Result<i32, RuntimeError> {
+    context_aware_check(&env)?;
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::TRANSACTION)?;
+    let sender_id = {
+        let memory = env_data
+            .memory()
+            .as_ref()
+            .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
+        let view = memory.view(&store);
+        let mut bytes = [0u8; 16];
+        view.read(sender_id_ptr.offset() as u64, &mut bytes)?;
+        u128::from_le_bytes(bytes)
+    };
+    let cancelled = env_data
+        .apply_context_mut()
+        .cancel_deferred(sender_id)
+        .map_err(|e| RuntimeError::new(e.to_string()))?;
+    Ok(i32::from(cancelled))
+}
+
 pub fn read_transaction(
     mut env: FunctionEnvMut<WasmContext>,
     trx_ptr: WasmPtr<u8>,

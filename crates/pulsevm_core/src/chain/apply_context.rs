@@ -30,6 +30,7 @@ use pulsevm_database::{
     U256,
 };
 use pulsevm_error::ChainError;
+use pulsevm_serialization::Read;
 use pulsevm_serialization::Write;
 
 use crate::{
@@ -44,6 +45,7 @@ use crate::{
             Action,
             ActionReceipt,
             generate_action_digest,
+            Transaction,
         },
         transaction_context::TransactionContext,
         utils::pulse_assert,
@@ -69,6 +71,18 @@ const RESTRICT_ACTION_TO_SELF_FEATURE_DIGEST: [u8; 32] = [
     0xe7, 0x1b, 0x67, 0x12, 0x18, 0x39, 0x19, 0x94, 0xc7, 0x8d, 0x8c, 0x72, 0x2c, 0x1d,
     0x42, 0xc4, 0x77, 0xcf, 0x09, 0x1e, 0x56, 0x01, 0xb5, 0xcf, 0x1b, 0xef, 0xd0, 0x57,
     0x21, 0xa5, 0x7f, 0x03,
+];
+
+const REPLACE_DEFERRED_FEATURE_DIGEST: [u8; 32] = [
+    0xef, 0x43, 0x11, 0x2c, 0x65, 0x43, 0xb8, 0x8d, 0xb2, 0x28, 0x3a, 0x2e, 0x07, 0x72, 0x78,
+    0xc3, 0x15, 0xae, 0x2c, 0x84, 0x71, 0x9a, 0x8b, 0x25, 0xf2, 0x5c, 0x88, 0x56, 0x5f,
+    0xbe, 0xa9, 0x99,
+];
+
+const NO_DUPLICATE_DEFERRED_ID_FEATURE_DIGEST: [u8; 32] = [
+    0x4a, 0x90, 0xc0, 0x0d, 0x55, 0x45, 0x4d, 0xc5, 0xb0, 0x59, 0x05, 0x5c, 0xa2, 0x13,
+    0x57, 0x9c, 0x6e, 0xa8, 0x56, 0x96, 0x77, 0x12, 0xa5, 0x60, 0x17, 0x48, 0x78, 0x86,
+    0xa4, 0xd4, 0xcc, 0x0f,
 ];
 
 struct ApplyContextInner {
@@ -2378,6 +2392,117 @@ impl ApplyContext {
         self.add_ram_usage(payer, delta)?;
 
         return Ok(());
+    }
+
+    /// Queue a serialized transaction for later execution by the deferred
+    /// scheduler. The request is keyed by the current receiver and sender id,
+    /// matching Antelope's `generated_transaction_object` index.
+    pub fn schedule_deferred(
+        &mut self,
+        sender_id: u128,
+        payer: u64,
+        packed_trx: Vec<u8>,
+        replace_existing: bool,
+    ) -> Result<(), ChainError> {
+        let mut pos = 0;
+        let transaction = Transaction::read(&packed_trx, &mut pos).map_err(|e| {
+            ChainError::TransactionError(format!("failed to deserialize deferred transaction: {e}"))
+        })?;
+        pulse_assert(
+            pos == packed_trx.len(),
+            ChainError::TransactionError(
+                "deferred transaction contains trailing bytes".to_string(),
+            ),
+        )?;
+        pulse_assert(
+            !transaction.actions.is_empty(),
+            ChainError::TransactionError("deferred transaction has no actions".to_string()),
+        )?;
+
+        let sender = self.receiver.as_u64();
+        pulse_assert(
+            self.db.is_account(payer)?,
+            ChainError::TransactionError(format!("deferred transaction payer {} does not exist", payer)),
+        )?;
+        if payer != sender {
+            pulse_assert(
+                self.has_authorization(&Name::new(payer))?,
+                ChainError::MissingAuthError(format!("missing authority of {}", Name::new(payer))),
+            )?;
+        }
+
+        let existing = self.db.arena_deferred_transaction_by_sender_id(sender, sender_id);
+        if existing.is_some() {
+            pulse_assert(
+                replace_existing,
+                ChainError::TransactionError(
+                    "deferred transaction with this sender id already exists".to_string(),
+                ),
+            )?;
+            pulse_assert(
+                self.db
+                    .protocol_feature_activated(REPLACE_DEFERRED_FEATURE_DIGEST),
+                ChainError::TransactionError(
+                    "replacing deferred transactions requires the REPLACE_DEFERRED protocol feature"
+                        .to_string(),
+                ),
+            )?;
+        }
+
+        let trx_id = transaction.id()?.0.0;
+        if self
+            .db
+            .protocol_feature_activated(NO_DUPLICATE_DEFERRED_ID_FEATURE_DIGEST)
+            && (self.db.arena_deferred_transaction(trx_id).is_some()
+                || self.db.arena_transaction_exists(&trx_id))
+            && existing.as_ref().map(|row| row.trx_id) != Some(trx_id)
+        {
+            return Err(ChainError::TransactionError(
+                "deferred transaction id is already pending".to_string(),
+            ));
+        }
+
+        let published = self
+            .pending_block_timestamp
+            .to_time_point()
+            .time_since_epoch()
+            .count();
+        let delay_until = published
+            .checked_add(i64::from(transaction.header.delay_sec().0) * 1_000_000)
+            .ok_or_else(|| ChainError::TransactionError("deferred delay overflows timestamp".into()))?;
+        let expiration = i64::from(transaction.header.expiration().sec_since_epoch()) * 1_000_000;
+
+        if let Some(old) = existing {
+            self.db
+                .arena_remove_deferred_transaction_by_sender_id(sender, sender_id)?;
+            self.update_db_usage(&Name::new(old.payer), -(old.packed_trx.len() as i64))?;
+        }
+
+        self.db.xpr_import_deferred_transaction(
+            sender,
+            sender_id,
+            payer,
+            trx_id,
+            delay_until,
+            expiration,
+            published,
+            &packed_trx,
+        )?;
+        self.update_db_usage(&Name::new(payer), packed_trx.len() as i64)?;
+        Ok(())
+    }
+
+    /// Cancel the deferred transaction owned by the current receiver.
+    pub fn cancel_deferred(&mut self, sender_id: u128) -> Result<bool, ChainError> {
+        let sender = self.receiver.as_u64();
+        let Some(existing) = self
+            .db
+            .arena_remove_deferred_transaction_by_sender_id(sender, sender_id)?
+        else {
+            return Ok(false);
+        };
+        self.update_db_usage(&Name::new(existing.payer), -(existing.packed_trx.len() as i64))?;
+        Ok(true)
     }
 
     pub fn set_action_return_value(&self, value: Vec<u8>) -> Result<(), ChainError> {
