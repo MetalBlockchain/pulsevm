@@ -4,8 +4,16 @@
 # beneath /tmp so it can be mounted at the same path in the container.
 set -euo pipefail
 
-readonly image="pulsevm-xpr-nodeos:leap-5.0.3"
-exec docker run --rm --platform linux/amd64 \
+readonly image="${XPR_NODEOS_IMAGE:-pulsevm-xpr-nodeos:leap-5.0.3}"
+readonly platform="${XPR_NODEOS_PLATFORM:-linux/amd64}"
+docker_args=(
+    --rm
+    --platform "$platform"
     --network pulsevm-xpr-localnet \
-    --mount type=bind,src=/tmp,dst=/tmp \
+    --mount type=bind,src=/tmp,dst=/tmp
+)
+if [[ -n "${XPR_NODEOS_HTTP_PORT:-}" ]]; then
+    docker_args+=(--publish "127.0.0.1:${XPR_NODEOS_HTTP_PORT}:${XPR_NODEOS_HTTP_PORT}")
+fi
+exec docker run "${docker_args[@]}" \
     "$image" nodeos "$@"

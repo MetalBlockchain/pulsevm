@@ -32,6 +32,14 @@ Options:
   --chain-state-db-size-mb N
                            Allocate N MiB for nodeos chainbase while restoring
                            the snapshot (default: nodeos default)
+  --http-probe-port N      Loopback HTTP port used for bounded-window progress
+                           checks (default: 18888)
+  --http-probe-bind ADDR   HTTP bind address for the bounded-window probe
+                           (default: 127.0.0.1)
+  --wasm-runtime NAME      Override Leap's WASM runtime (for example eos-vm)
+  --resource-monitor-space-threshold N
+                           Set Leap's filesystem shutdown threshold percentage
+                           (default: nodeos default; 0 disables this override)
   --deferred-sidecar PATH  Write complete deferred-transaction chainbase state
                            through the bundled source-node plugin
   --help                   Show this help
@@ -55,6 +63,10 @@ work_dir=""
 source_revision="$pinned_core_revision"
 timeout_seconds=300
 chain_state_db_size_mb=0
+http_probe_port=18888
+http_probe_bind=127.0.0.1
+wasm_runtime=""
+resource_monitor_space_threshold=0
 deferred_sidecar=""
 xpr_core=""
 post_snapshot_blocks=0
@@ -70,6 +82,10 @@ while (($#)); do
         --xpr-core) xpr_core="$2"; shift 2 ;;
         --timeout-seconds) timeout_seconds="$2"; shift 2 ;;
         --chain-state-db-size-mb) chain_state_db_size_mb="$2"; shift 2 ;;
+        --http-probe-port) http_probe_port="$2"; shift 2 ;;
+        --http-probe-bind) http_probe_bind="$2"; shift 2 ;;
+        --wasm-runtime) wasm_runtime="$2"; shift 2 ;;
+        --resource-monitor-space-threshold) resource_monitor_space_threshold="$2"; shift 2 ;;
         --deferred-sidecar) deferred_sidecar="$2"; shift 2 ;;
         --post-snapshot-blocks) post_snapshot_blocks="$2"; shift 2 ;;
         --help) usage; exit 0 ;;
@@ -86,6 +102,16 @@ done
 }
 [[ "$chain_state_db_size_mb" =~ ^[0-9]+$ ]] || {
     echo "--chain-state-db-size-mb must be a non-negative integer" >&2
+    exit 2
+}
+[[ "$http_probe_port" =~ ^[1-9][0-9]{0,4}$ ]] && ((http_probe_port <= 65535)) || {
+    echo "--http-probe-port must be a TCP port between 1 and 65535" >&2
+    exit 2
+}
+[[ "$resource_monitor_space_threshold" =~ ^[0-9]+$ ]] &&
+    ((resource_monitor_space_threshold == 0 ||
+      (resource_monitor_space_threshold >= 6 && resource_monitor_space_threshold <= 99))) || {
+    echo "--resource-monitor-space-threshold must be 0 or between 6 and 99" >&2
     exit 2
 }
 [[ "$post_snapshot_blocks" =~ ^[0-9]+$ ]] || {
@@ -141,13 +167,21 @@ args=(
     --chain-state-history
     --state-history-endpoint 127.0.0.1:0
 )
+if ((resource_monitor_space_threshold > 0)); then
+    args+=(--resource-monitor-space-threshold "$resource_monitor_space_threshold")
+fi
+if [[ -n "$wasm_runtime" ]]; then
+    args+=(--wasm-runtime "$wasm_runtime")
+fi
 if ((post_snapshot_blocks > 0)); then
     # The HTTP endpoint is only used as a bounded-window progress probe. Keep
     # it loopback-only and on a non-default port so an operator's nodeos RPC
     # endpoint is not disturbed.
     args+=(
         --plugin eosio::http_plugin
-        --http-server-address 127.0.0.1:18888
+        --plugin eosio::chain_api_plugin
+        --http-server-address "$http_probe_bind:$http_probe_port"
+        --http-validate-host false
     )
 fi
 if ((chain_state_db_size_mb > 0)); then
@@ -165,7 +199,11 @@ if ((${#peers[@]})); then
     done
 fi
 
-"$nodeos" "${args[@]}" >"$nodeos_log" 2>&1 &
+if ((post_snapshot_blocks > 0)); then
+    XPR_NODEOS_HTTP_PORT="$http_probe_port" "$nodeos" "${args[@]}" >"$nodeos_log" 2>&1 &
+else
+    "$nodeos" "${args[@]}" >"$nodeos_log" 2>&1 &
+fi
 nodeos_pid=$!
 
 cleanup() {
@@ -221,7 +259,7 @@ if ((post_snapshot_blocks > 0)); then
 
     get_head_block() {
         curl --fail --silent --show-error \
-            http://127.0.0.1:18888/v1/chain/get_info \
+            "http://127.0.0.1:$http_probe_port/v1/chain/get_info" \
             | sed -n 's/.*"head_block_num"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p'
     }
 
@@ -243,6 +281,12 @@ if ((post_snapshot_blocks > 0)); then
         exit 1
     }
 fi
+
+# Stop the source node before hashing the history log. In bounded mode it can
+# receive a few more blocks while the manifest is being written otherwise,
+# leaving the recorded checksum out of sync with the final artifact.
+cleanup
+trap - EXIT INT TERM
 
 sha256() {
     if command -v sha256sum >/dev/null; then
