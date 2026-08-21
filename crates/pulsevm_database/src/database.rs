@@ -2770,6 +2770,14 @@ impl Database {
             });
     }
 
+    /// The full code metadata tuple exposed by Leap's `get_code_hash` intrinsic.
+    pub fn account_code_info(&self, name: u64) -> Result<(u64, [u8; 32], u8, u8), ChainError> {
+        let s = &self.backend;
+        Ok(s.account_metadata(name)
+            .map(|t| (t.3, t.5, t.6, t.7))
+            .unwrap_or((0, [0; 32], 0, 0)))
+    }
+
     /// The byte size of the account's stored ABI — what setabi bills RAM against.
     /// A plain length read from the account row.
     pub fn account_abi_size(&self, name: u64) -> Result<usize, ChainError> {

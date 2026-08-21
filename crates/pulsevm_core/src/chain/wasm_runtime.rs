@@ -171,6 +171,7 @@ use crate::chain::{
         get_active_producers,
         get_blockchain_parameters_packed,
         get_block_num,
+        get_code_hash,
         get_context_free_data,
         get_permission_last_used,
         get_resource_limits,
@@ -700,6 +701,7 @@ impl WasmRuntime {
                 "abort" => Function::new_typed_with_env(&mut store, &env, abort),
                 "current_time" => Function::new_typed_with_env(&mut store, &env, current_time),
                 "get_block_num" => Function::new_typed_with_env(&mut store, &env, get_block_num),
+                "get_code_hash" => Function::new_typed_with_env(&mut store, &env, get_code_hash),
                 "get_sender" => Function::new_typed_with_env(&mut store, &env, get_sender),
                 // Crypto functions
                 "assert_recover_key" => Function::new_typed_with_env(&mut store, &env, assert_recover_key),
