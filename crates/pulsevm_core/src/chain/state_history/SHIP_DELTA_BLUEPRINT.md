@@ -61,15 +61,16 @@ Sizes below are the golden's block-2 first-row lengths (all verified).
   primary_key:u64 + payer:u64 + value via `history_pack_big_bytes` (check: likely uvar len + bytes).
   code/scope/table come from the row's table_id (ContractKeyValueRow.t_id → ContractTableRow).
 - contract_index64/128/256 — context wrapper, same header + secondary_key (8/16/32 bytes). (empty at block 2)
-- global_property (143) = `01`(version 1!) + chain_config + chain_id:32 + wasm_config.
-  - chain_config (65) = `01`(version 1!) + max_block_net_usage:u64 +
+- global_property (current Leap 5: 157) = `01`(version 1!) + empty producer
+  authority schedule + chain_config + chain_id:32 + wasm_config.
+  - chain_config (73) = `01`(version 1!) + max_block_net_usage:u64 +
     target_block_net_usage_pct:u32 + max_transaction_net_usage:u32 +
     base_per_transaction_net_usage:u32 + net_usage_leeway:u32 +
     context_free_discount_net_usage_num:u32 + context_free_discount_net_usage_den:u32 +
     max_block_cpu_usage:u32 + target_block_cpu_usage_pct:u32 + max_transaction_cpu_usage:u32 +
-    min_transaction_cpu_usage:u32 + max_transaction_lifetime:u32 + max_inline_action_size:u32 +
+    min_transaction_cpu_usage:u32 + max_transaction_lifetime:u32 + deferred_trx_expiration_window:u32 +
+    max_transaction_delay:u32 + max_inline_action_size:u32 +
     max_inline_action_depth:u16 + max_authority_depth:u16 + max_action_return_value_size:u32.
-    (NOTE: history OMITS max_transaction_delay and deferred_trx_expiration_window.)
   - wasm_config (45) = `00` + 11×u32: max_mutable_global_bytes, max_table_elements,
     max_section_elements, max_linear_memory_init, max_func_local_bytes, max_nested_structures,
     max_symbol_bytes, max_module_bytes, max_code_bytes, max_pages, max_call_depth.
