@@ -12,6 +12,8 @@
 //!
 //! Migrated-state runs can avoid fixture-name collisions and the fresh-genesis
 //! producer fixture with `--account-prefix mig --skip-producer-election`.
+//! A source checkpoint without the Pulse system contract can be smoke-tested
+//! with `--smoke-only --system-account eosio`.
 
 use std::{
     str::FromStr,
@@ -72,12 +74,16 @@ struct Args {
     token_abi: String,
     account_prefix: String,
     skip_producer_election: bool,
+    system_account: String,
+    smoke_only: bool,
 }
 
 fn parse_args() -> Result<Args> {
     let (mut url, mut private_key, mut token_wasm, mut token_abi) = (None, None, None, None);
     let mut account_prefix = String::new();
     let mut skip_producer_election = false;
+    let mut system_account = "pulse".to_string();
+    let mut smoke_only = false;
     let mut argv = std::env::args().skip(1);
     while let Some(flag) = argv.next() {
         let mut take = || argv.next().context(format!("{flag} requires a value"));
@@ -88,6 +94,8 @@ fn parse_args() -> Result<Args> {
             "--token-abi" => token_abi = Some(take()?),
             "--account-prefix" => account_prefix = take()?,
             "--skip-producer-election" => skip_producer_election = true,
+            "--system-account" => system_account = take()?,
+            "--smoke-only" => smoke_only = true,
             other => bail!("unknown argument: {other}"),
         }
     }
@@ -98,6 +106,8 @@ fn parse_args() -> Result<Args> {
         token_abi: token_abi.context("--token-abi is required")?,
         account_prefix,
         skip_producer_election,
+        system_account,
+        smoke_only,
     })
 }
 
@@ -277,7 +287,39 @@ async fn main() -> Result<()> {
     let chain_id =
         Id::from_str(&info.chain_id).map_err(|e| anyhow::anyhow!("parsing chain id: {e}"))?;
 
-    let system: Name = PULSE_NAME.into();
+    if args.smoke_only {
+        let system = Name::from_str(&args.system_account)
+            .map_err(|e| anyhow::anyhow!("encoding system account: {e}"))?;
+        let tx = push(
+            &client,
+            &chain_id,
+            &key,
+            vec![Action {
+                account: system.into(),
+                name: Name::from_str("noop")?.into(),
+                authorization: vec![PermissionLevel {
+                    actor: system.into(),
+                    permission: ACTIVE_NAME.into(),
+                }],
+                data: Arc::from(Vec::<u8>::new()),
+            }],
+        )
+        .await
+        .context("submitting migration smoke transaction")?;
+        println!(
+            "{}",
+            serde_json::json!({
+                "chain_id": info.chain_id,
+                "system_account": system.to_string(),
+                "tx": tx,
+                "smoke_only": true,
+            })
+        );
+        return Ok(());
+    }
+
+    let system = Name::from_str(&args.system_account)
+        .map_err(|e| anyhow::anyhow!("encoding system account: {e}"))?;
     let token = fixture_account(&args.account_prefix, "pulse.token", "tok")?;
     let alice = fixture_account(&args.account_prefix, "alice", "alice")?;
     let bob = fixture_account(&args.account_prefix, "bob", "bob")?;

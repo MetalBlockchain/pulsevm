@@ -1,13 +1,13 @@
 //! Derive a disposable write-test checkpoint from an imported XPR checkpoint.
 //!
 //! This intentionally does not alter the canonical migration artifact. It
-//! replaces only the `pulse@owner` and `pulse@active` authorities in a copy so
-//! a local test key can exercise the imported chain's write path without ever
-//! requiring an XPR production private key.
+//! replaces only the selected producer account's owner/active authorities in a
+//! copy so a local test key can exercise the imported chain's write path
+//! without ever requiring an XPR production private key.
 //!
 //! Usage:
 //!   xpr_test_authority <input.snapshot> <input.manifest.json> \
-//!                      <output.snapshot> <PVT_K1_...>
+//!                      <output.snapshot> <PVT_K1_...> [producer_account]
 
 use std::{env, fs, process::ExitCode, str::FromStr};
 
@@ -20,7 +20,7 @@ const DB_SIZE: u64 = 64 * 1024 * 1024;
 
 fn usage() {
     eprintln!("Usage: xpr_test_authority <input.snapshot> <input.manifest.json> \\");
-    eprintln!("                         <output.snapshot> <PVT_K1_...>");
+    eprintln!("                         <output.snapshot> <PVT_K1_...> [producer_account]");
 }
 
 fn main() -> ExitCode {
@@ -42,6 +42,10 @@ fn main() -> ExitCode {
         usage();
         return ExitCode::from(2);
     };
+    let producer_account = args
+        .next()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "pulse".to_string());
     if args.next().is_some() {
         usage();
         return ExitCode::from(2);
@@ -52,6 +56,7 @@ fn main() -> ExitCode {
         &input_manifest_path.to_string_lossy(),
         &output_path.to_string_lossy(),
         &private_key.to_string_lossy(),
+        &producer_account,
     ) {
         Ok(public_key) => {
             println!(
@@ -77,6 +82,7 @@ fn derive(
     input_manifest_path: &str,
     output_path: &str,
     private_key: &str,
+    producer_account: &str,
 ) -> Result<String, String> {
     let input = fs::read(input_path).map_err(|e| format!("read checkpoint: {e}"))?;
     let manifest_bytes =
@@ -98,8 +104,8 @@ fn derive(
         .map_err(|e| format!("parse development private key: {e}"))?;
     let public = key.public_key();
     let authority = Authority::new_from_public_key(public);
-    let pulse = Name::from_str("pulse")
-        .map_err(|e| format!("encode pulse account: {e}"))?
+    let producer = Name::from_str(producer_account)
+        .map_err(|e| format!("encode producer account {producer_account}: {e}"))?
         .as_u64();
     let owner = Name::from_str("owner")
         .map_err(|e| format!("encode owner permission: {e}"))?
@@ -107,25 +113,27 @@ fn derive(
     let active = Name::from_str("active")
         .map_err(|e| format!("encode active permission: {e}"))?
         .as_u64();
-    if database.arena_permission_authority(pulse, owner).is_none()
-        || database.arena_permission_authority(pulse, active).is_none()
+    if database.arena_permission_authority(producer, owner).is_none()
+        || database.arena_permission_authority(producer, active).is_none()
     {
-        return Err("imported checkpoint has no pulse owner/active permissions".into());
+        return Err(format!(
+            "imported checkpoint has no {producer_account}@owner/active permissions"
+        ));
     }
     let now = TimePoint::now();
     database
-        .modify_permission(pulse, owner, &authority, &now)
-        .map_err(|e| format!("replace pulse@owner authority: {e}"))?;
+        .modify_permission(producer, owner, &authority, &now)
+        .map_err(|e| format!("replace {producer_account}@owner authority: {e}"))?;
     database
-        .modify_permission(pulse, active, &authority, &now)
-        .map_err(|e| format!("replace pulse@active authority: {e}"))?;
+        .modify_permission(producer, active, &authority, &now)
+        .map_err(|e| format!("replace {producer_account}@active authority: {e}"))?;
     for (name, permission) in [("owner", owner), ("active", active)] {
-        let Some(updated) = database.arena_permission_authority(pulse, permission) else {
-            return Err(format!("updated pulse@{name} authority is missing"));
+        let Some(updated) = database.arena_permission_authority(producer, permission) else {
+            return Err(format!("updated {producer_account}@{name} authority is missing"));
         };
         if updated != authority {
             return Err(format!(
-                "updated pulse@{name} authority did not match test key"
+                "updated {producer_account}@{name} authority did not match test key"
             ));
         }
     }

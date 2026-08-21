@@ -62,11 +62,12 @@ if [[ ! -x "$NETWORK_RUNNER" ]]; then
   fi
 fi
 
+PRODUCER_NAME="${PULSEVM_PRODUCER_NAME:-pulse}"
 PRODUCER_KEY="${PULSEVM_PRODUCER_KEY:-PVT_K1_2pjSqJxTbRHq8h8aHHTux81Ypscb36Q2syB8UJbZcUmxbfZdnT}"
 # Always pass a node config. Without this field, metal-network-runner sends an
 # empty config to the VM on clean (non-migration) starts, which fails before
 # controller initialization with an opaque JSON EOF error.
-CHAIN_CONFIG="{\\\"producer_name\\\":\\\"pulse\\\",\\\"producer_key\\\":\\\"$PRODUCER_KEY\\\"}"
+CHAIN_CONFIG="{\\\"producer_name\\\":\\\"$PRODUCER_NAME\\\",\\\"producer_key\\\":\\\"$PRODUCER_KEY\\\"}"
 BLOCKCHAIN_SPECS="[{\"vm_name\": \"pulsevm\", \"genesis\": \"$REPO/genesis.json\", \"chain_config\": \"$CHAIN_CONFIG\"}]"
 if [[ -n "${PULSEVM_MIGRATION_CHECKPOINT:-}" ]]; then
   if [[ ! -f "$PULSEVM_MIGRATION_CHECKPOINT" ]]; then
@@ -93,7 +94,8 @@ if [[ -n "${PULSEVM_MIGRATION_CHECKPOINT:-}" ]]; then
     --arg checkpoint "$PULSEVM_MIGRATION_CHECKPOINT" \
     --arg manifest "$MIGRATION_MANIFEST" \
     --arg producer_key "$PRODUCER_KEY" \
-    '{producer_name: "pulse", producer_key: $producer_key, migration_checkpoint: $checkpoint, migration_manifest: $manifest}')"
+    --arg producer_name "$PRODUCER_NAME" \
+    '{producer_name: $producer_name, producer_key: $producer_key, migration_checkpoint: $checkpoint, migration_manifest: $manifest}')"
   BLOCKCHAIN_SPECS="$(jq -cn \
     --arg genesis "$MIGRATION_GENESIS" \
     --arg chain_config "$CHAIN_CONFIG" \

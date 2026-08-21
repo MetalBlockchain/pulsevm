@@ -107,4 +107,15 @@ cargo run -p pulsevm_database --example xpr_test_authority -- \
 
 The command writes a matching `.manifest.json` beside the derived checkpoint.
 Use that copy with `PULSEVM_MIGRATION_CHECKPOINT` and pass the same development
-key to `pulsevm-e2e-boot`; the canonical XPR checkpoint is not modified.
+key to `pulsevm-e2e-boot`; the canonical XPR checkpoint is not modified. For a
+source network whose producer is not named `pulse`, pass its account as the
+optional final argument and set `PULSEVM_PRODUCER_NAME` when starting the
+runner. The boot helper also has a contract-free smoke path, for example:
+
+```bash
+cargo run -p pulsevm_e2e_boot -- \
+  --url http://127.0.0.1:9650/ext/bc/<chain-id>/rpc \
+  --private-key "$PULSEVM_TEST_PRIVATE_KEY" \
+  --token-wasm /tmp/unused.wasm --token-abi /tmp/unused.abi \
+  --system-account eosio --smoke-only
+```
