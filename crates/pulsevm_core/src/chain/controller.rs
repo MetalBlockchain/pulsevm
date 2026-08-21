@@ -4717,7 +4717,7 @@ mod tests {
                 PULSE_NAME,
                 Name::from_str("noop")?,
                 vec![],
-                vec![],
+                vec![PermissionLevel::new(account.as_u64(), ACTIVE_NAME.as_u64())],
             )],
         )
         .pack()?;
@@ -4745,6 +4745,7 @@ mod tests {
             &block_status,
         )
         .map_err(|error| ChainError::InternalError(format!("set send code: {error}")))?;
+        let ram_before_schedule = controller.db.get_account_ram_usage(payer)?;
         controller.execute_transaction(
             &call_contract(
                 &private_key,
@@ -4766,6 +4767,12 @@ mod tests {
         assert_eq!(scheduled.sender_id, sender_id);
         assert_eq!(scheduled.payer, payer);
         assert_eq!(&scheduled.packed_trx[..], deferred.as_slice());
+        let ram_after_schedule = controller.db.get_account_ram_usage(payer)?;
+        assert_eq!(
+            ram_after_schedule - ram_before_schedule,
+            272 + deferred.len() as i64,
+            "generated transaction RAM must include Leap's fixed object bill"
+        );
 
         let cancel_contract = wat::parse_str(
             r#"

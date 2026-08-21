@@ -26,6 +26,7 @@ use pulsevm_database::{
     IndexLongDoubleObject,
     KeyValueObject,
     Microseconds,
+    TimePointSec,
     TableObject,
     U256,
 };
@@ -84,6 +85,18 @@ const NO_DUPLICATE_DEFERRED_ID_FEATURE_DIGEST: [u8; 32] = [
     0x57, 0x9c, 0x6e, 0xa8, 0x56, 0x96, 0x77, 0x12, 0xa5, 0x60, 0x17, 0x48, 0x78, 0x86,
     0xa4, 0xd4, 0xcc, 0x0f,
 ];
+
+const DISABLE_DEFERRED_TRXS_STAGE_1_FEATURE_DIGEST: [u8; 32] = [
+    0x44, 0x0c, 0x3e, 0xfa, 0xaa, 0xb2, 0x12, 0xc3, 0x87, 0xce, 0x96, 0x7c, 0x57, 0x4d,
+    0xc8, 0x13, 0x85, 0x1c, 0xf8, 0x33, 0x2d, 0x04, 0x1b, 0xeb, 0x41, 0x8d, 0xfa, 0xf5,
+    0x5f, 0xac, 0xd5, 0xa9,
+];
+
+// Leap's generated_transaction_object bills billable_size_v<...> (272 bytes)
+// plus the serialized transaction payload. The fixed value is 96 bytes of
+// fields, 4 bytes for the shared-blob length, and 5 index overheads at 32 bytes
+// each, rounded up to the 16-byte billable alignment.
+const GENERATED_TRANSACTION_BILLABLE_SIZE: i64 = 272;
 
 struct ApplyContextInner {
     action: Action,                       // The action being applied
@@ -2404,8 +2417,15 @@ impl ApplyContext {
         packed_trx: Vec<u8>,
         replace_existing: bool,
     ) -> Result<(), ChainError> {
+        if self
+            .db
+            .protocol_feature_activated(DISABLE_DEFERRED_TRXS_STAGE_1_FEATURE_DIGEST)
+        {
+            return Ok(());
+        }
+
         let mut pos = 0;
-        let transaction = Transaction::read(&packed_trx, &mut pos).map_err(|e| {
+        let mut transaction = Transaction::read(&packed_trx, &mut pos).map_err(|e| {
             ChainError::TransactionError(format!("failed to deserialize deferred transaction: {e}"))
         })?;
         pulse_assert(
@@ -2418,6 +2438,13 @@ impl ApplyContext {
             !transaction.actions.is_empty(),
             ChainError::TransactionError("deferred transaction has no actions".to_string()),
         )?;
+        pulse_assert(
+            transaction.context_free_actions.is_empty(),
+            ChainError::TransactionError(
+                "context free actions are not allowed in deferred transactions".to_string(),
+            ),
+        )?;
+        self.trx_context.validate_referenced_accounts(&transaction)?;
 
         let sender = self.receiver.as_u64();
         pulse_assert(
@@ -2428,6 +2455,60 @@ impl ApplyContext {
             pulse_assert(
                 self.has_authorization(&Name::new(payer))?,
                 ChainError::MissingAuthError(format!("missing authority of {}", Name::new(payer))),
+            )?;
+        }
+
+        let no_duplicate_deferred_id = self
+            .db
+            .protocol_feature_activated(NO_DUPLICATE_DEFERRED_ID_FEATURE_DIGEST);
+        if !no_duplicate_deferred_id {
+            pulse_assert(
+                transaction.transaction_extensions.is_empty(),
+                ChainError::TransactionError(
+                    "transaction extensions are not supported for deferred transactions"
+                        .to_string(),
+                ),
+            )?;
+        } else if transaction.transaction_extensions.is_empty() {
+            // The generation context is part of the transaction identity once
+            // NO_DUPLICATE_DEFERRED_ID is active. This is the exact serialized
+            // layout of Leap's deferred_transaction_generation_context.
+            let mut extension = Vec::with_capacity(56);
+            extension.extend_from_slice(self.trx_context.get_packed_transaction().id().as_bytes());
+            extension.extend_from_slice(&sender_id.to_le_bytes());
+            extension.extend_from_slice(&sender.to_le_bytes());
+            transaction.transaction_extensions.push((0, extension));
+            transaction.header.expiration = TimePointSec::default();
+            transaction.header.ref_block_num = 0;
+            transaction.header.ref_block_prefix = 0;
+        } else {
+            pulse_assert(
+                transaction.transaction_extensions.len() == 1
+                    && transaction.transaction_extensions[0].0 == 0
+                    && transaction.transaction_extensions[0].1.len() == 56,
+                ChainError::TransactionError(
+                    "only the deferred transaction generation context extension is supported"
+                        .to_string(),
+                ),
+            )?;
+        }
+
+        if no_duplicate_deferred_id {
+            let extension = &transaction.transaction_extensions[0].1;
+            pulse_assert(
+                extension[32..48] == sender_id.to_le_bytes()
+                    && extension[48..56] == sender.to_le_bytes(),
+                ChainError::TransactionError(
+                    "deferred transaction generation context does not match sender".to_string(),
+                ),
+            )?;
+            pulse_assert(
+                extension[..32]
+                    == self.trx_context.get_packed_transaction().id().as_bytes()[..],
+                ChainError::TransactionError(
+                    "deferred transaction generation context does not match parent transaction"
+                        .to_string(),
+                ),
             )?;
         }
 
@@ -2449,10 +2530,9 @@ impl ApplyContext {
             )?;
         }
 
+        let packed_trx = transaction.pack()?;
         let trx_id = transaction.id()?.0.0;
-        if self
-            .db
-            .protocol_feature_activated(NO_DUPLICATE_DEFERRED_ID_FEATURE_DIGEST)
+        if no_duplicate_deferred_id
             && (self.db.arena_deferred_transaction(trx_id).is_some()
                 || self.db.arena_transaction_exists(&trx_id))
             && existing.as_ref().map(|row| row.trx_id) != Some(trx_id)
@@ -2470,12 +2550,27 @@ impl ApplyContext {
         let delay_until = published
             .checked_add(i64::from(transaction.header.delay_sec().0) * 1_000_000)
             .ok_or_else(|| ChainError::TransactionError("deferred delay overflows timestamp".into()))?;
-        let expiration = i64::from(transaction.header.expiration().sec_since_epoch()) * 1_000_000;
+        let expiration = delay_until
+            .checked_add(
+                i64::from(self.db.chain_config()?.deferred_trx_expiration_window)
+                    .checked_mul(1_000_000)
+                    .ok_or_else(|| {
+                        ChainError::TransactionError(
+                            "deferred expiration window overflows timestamp".into(),
+                        )
+                    })?,
+            )
+            .ok_or_else(|| {
+                ChainError::TransactionError("deferred expiration overflows timestamp".into())
+            })?;
 
         if let Some(old) = existing {
             self.db
                 .arena_remove_deferred_transaction_by_sender_id(sender, sender_id)?;
-            self.update_db_usage(&Name::new(old.payer), -(old.packed_trx.len() as i64))?;
+            self.update_db_usage(
+                &Name::new(old.payer),
+                -(GENERATED_TRANSACTION_BILLABLE_SIZE + old.packed_trx.len() as i64),
+            )?;
         }
 
         self.db.xpr_import_deferred_transaction(
@@ -2488,12 +2583,25 @@ impl ApplyContext {
             published,
             &packed_trx,
         )?;
-        self.update_db_usage(&Name::new(payer), packed_trx.len() as i64)?;
+        self.trx_context.add_net_usage(
+            self.db.chain_config()?.base_per_transaction_net_usage as u64
+                + pulsevm_constants::TRANSACTION_ID_NET_USAGE as u64,
+        )?;
+        self.update_db_usage(
+            &Name::new(payer),
+            GENERATED_TRANSACTION_BILLABLE_SIZE + packed_trx.len() as i64,
+        )?;
         Ok(())
     }
 
     /// Cancel the deferred transaction owned by the current receiver.
     pub fn cancel_deferred(&mut self, sender_id: u128) -> Result<bool, ChainError> {
+        if self
+            .db
+            .protocol_feature_activated(DISABLE_DEFERRED_TRXS_STAGE_1_FEATURE_DIGEST)
+        {
+            return Ok(false);
+        }
         let sender = self.receiver.as_u64();
         let Some(existing) = self
             .db
@@ -2501,7 +2609,10 @@ impl ApplyContext {
         else {
             return Ok(false);
         };
-        self.update_db_usage(&Name::new(existing.payer), -(existing.packed_trx.len() as i64))?;
+        self.update_db_usage(
+            &Name::new(existing.payer),
+            -(GENERATED_TRANSACTION_BILLABLE_SIZE + existing.packed_trx.len() as i64),
+        )?;
         Ok(true)
     }
 
