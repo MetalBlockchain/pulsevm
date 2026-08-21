@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Export the complete XPR chainbase state through XPR's Leap state-history
-# plugin. The first accepted block in an empty chain-state history directory
-# contains every live chainbase table as SHiP table deltas.
+# Export XPR chainbase state through XPR's Leap state-history plugin. The first
+# accepted block in an empty chain-state history directory contains every live
+# chainbase table as SHiP table deltas. An optional bounded post-snapshot window
+# keeps nodeos running until a requested number of later blocks has arrived.
 
 set -euo pipefail
 
@@ -18,6 +19,9 @@ Required:
   --work-dir PATH          New directory for this export; it must not exist
   --p2p-peer HOST:PORT     Optional source-network peer; repeatable. Omit for
                            a snapshot-only export with no post-snapshot blocks.
+  --post-snapshot-blocks N Keep the source node running until at least N blocks
+                           after the snapshot head are available. Requires a
+                           --p2p-peer; the manifest records the observed head.
 
 Options:
   --source-revision SHA    XPR Leap revision that produced nodeos
@@ -35,6 +39,7 @@ Options:
 The output directory contains:
   chain_state_history.log/.index  Standard XPR SHiP chain-state history
   manifest.env                     Pinned source, input and output hashes
+                                  and optional bounded-window heights
   deferred-transactions.json       Optional complete deferred-transaction sidecar
   nodeos.log                       Source-node diagnostic log
 
@@ -52,6 +57,7 @@ timeout_seconds=300
 chain_state_db_size_mb=0
 deferred_sidecar=""
 xpr_core=""
+post_snapshot_blocks=0
 peers=()
 
 while (($#)); do
@@ -65,6 +71,7 @@ while (($#)); do
         --timeout-seconds) timeout_seconds="$2"; shift 2 ;;
         --chain-state-db-size-mb) chain_state_db_size_mb="$2"; shift 2 ;;
         --deferred-sidecar) deferred_sidecar="$2"; shift 2 ;;
+        --post-snapshot-blocks) post_snapshot_blocks="$2"; shift 2 ;;
         --help) usage; exit 0 ;;
         *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -81,6 +88,14 @@ done
     echo "--chain-state-db-size-mb must be a non-negative integer" >&2
     exit 2
 }
+[[ "$post_snapshot_blocks" =~ ^[0-9]+$ ]] || {
+    echo "--post-snapshot-blocks must be a non-negative integer" >&2
+    exit 2
+}
+if ((post_snapshot_blocks > 0 && ${#peers[@]} == 0)); then
+    echo "--post-snapshot-blocks requires at least one --p2p-peer" >&2
+    exit 2
+fi
 [[ ! -e "$work_dir" ]] || { echo "work directory already exists: $work_dir" >&2; exit 2; }
 if [[ -n "$deferred_sidecar" && -e "$deferred_sidecar" ]]; then
     echo "deferred sidecar path already exists: $deferred_sidecar" >&2
@@ -126,6 +141,15 @@ args=(
     --chain-state-history
     --state-history-endpoint 127.0.0.1:0
 )
+if ((post_snapshot_blocks > 0)); then
+    # The HTTP endpoint is only used as a bounded-window progress probe. Keep
+    # it loopback-only and on a non-default port so an operator's nodeos RPC
+    # endpoint is not disturbed.
+    args+=(
+        --plugin eosio::http_plugin
+        --http-server-address 127.0.0.1:18888
+    )
+fi
 if ((chain_state_db_size_mb > 0)); then
     args+=(--chain-state-db-size-mb "$chain_state_db_size_mb")
 fi
@@ -181,6 +205,45 @@ if [[ -n "$deferred_sidecar" && ! -s "$deferred_sidecar" ]]; then
     exit 1
 fi
 
+snapshot_head_block=""
+target_head_block=""
+observed_head_block=""
+if ((post_snapshot_blocks > 0)); then
+    # The first state-history record is keyed by the snapshot's accepted block
+    # id. Block ids encode the height in their first four bytes, big-endian.
+    snapshot_head_hex="$(od -An -tx1 -j8 -N4 "$history_log" | tr -d ' \n')"
+    [[ "$snapshot_head_hex" =~ ^[[:xdigit:]]{8}$ ]] || {
+        echo "could not read snapshot head block id from $history_log" >&2
+        exit 1
+    }
+    snapshot_head_block="$((16#$snapshot_head_hex))"
+    target_head_block=$((snapshot_head_block + post_snapshot_blocks))
+
+    get_head_block() {
+        curl --fail --silent --show-error \
+            http://127.0.0.1:18888/v1/chain/get_info \
+            | sed -n 's/.*"head_block_num"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p'
+    }
+
+    for ((elapsed = 0; elapsed < timeout_seconds; elapsed++)); do
+        observed_head_block="$(get_head_block || true)"
+        if [[ "$observed_head_block" =~ ^[0-9]+$ ]] &&
+            ((observed_head_block >= target_head_block)); then
+            break
+        fi
+        if ! kill -0 "$nodeos_pid" 2>/dev/null; then
+            echo "nodeos exited before bounded window reached; see $nodeos_log" >&2
+            exit 1
+        fi
+        sleep 1
+    done
+    [[ "$observed_head_block" =~ ^[0-9]+$ ]] &&
+        ((observed_head_block >= target_head_block)) || {
+        echo "timed out waiting for block $target_head_block; observed ${observed_head_block:-unknown}; see $nodeos_log" >&2
+        exit 1
+    }
+fi
+
 sha256() {
     if command -v sha256sum >/dev/null; then
         sha256sum "$1" | awk '{print $1}'
@@ -195,6 +258,12 @@ sha256() {
     printf 'CHAIN_STATE_HISTORY_SHA256=%s\n' "$(sha256 "$history_log")"
     printf 'CHAIN_STATE_HISTORY_LOG=%s\n' "$(basename "$history_log")"
     printf 'SOURCE_SNAPSHOT=%s\n' "$snapshot"
+    if ((post_snapshot_blocks > 0)); then
+        printf 'SNAPSHOT_HEAD_BLOCK=%s\n' "$snapshot_head_block"
+        printf 'POST_SNAPSHOT_BLOCKS=%s\n' "$post_snapshot_blocks"
+        printf 'TARGET_HEAD_BLOCK=%s\n' "$target_head_block"
+        printf 'OBSERVED_HEAD_BLOCK=%s\n' "$observed_head_block"
+    fi
     if [[ -n "$deferred_sidecar" ]]; then
         printf 'DEFERRED_TRANSACTION_SIDECAR=%s\n' "$deferred_sidecar"
         printf 'DEFERRED_TRANSACTION_SIDECAR_SHA256=%s\n' "$(sha256 "$deferred_sidecar")"

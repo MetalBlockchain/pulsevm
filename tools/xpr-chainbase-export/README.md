@@ -53,6 +53,25 @@ state record is complete. Leave `--p2p-peer` unset for a snapshot-only export:
 this prevents post-snapshot blocks from changing the history log before its
 manifest is hashed.
 
+For a bounded replay corpus, keep one or more archive peers and request a
+window after the snapshot head. The exporter records the snapshot height,
+target height, and observed head in `manifest.env`:
+
+```bash
+tools/xpr-chainbase-export/export.sh \
+  --nodeos /opt/xpr/bin/nodeos \
+  --snapshot /data/xpr/snapshots/snapshot-at-H-minus-10000.bin \
+  --work-dir /data/xpr-export-window \
+  --p2p-peer archive.example.org:9876 \
+  --post-snapshot-blocks 10000
+```
+
+This captures the state-history stream while the source node catches up to at
+least the requested target. The current Arena importer still hydrates the
+initial full-state record only; consuming the later delta records as a
+consensus replay window is a separate step. A window therefore supplements,
+but does not replace, the base snapshot.
+
 ## Output contract
 
 `manifest.env` binds the source commit, input snapshot hash and history-log
