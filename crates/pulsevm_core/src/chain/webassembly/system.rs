@@ -15,6 +15,12 @@ use crate::chain::{
 
 const MAX_ASSERT_MESSAGE: usize = 1024;
 
+const GET_SENDER_FEATURE_DIGEST: [u8; 32] = [
+    0x1e, 0xab, 0x74, 0x8b, 0x95, 0xa2, 0xe6, 0xf4, 0xd7, 0xcb, 0x42, 0x06, 0x5b, 0xde, 0xe5,
+    0x56, 0x6a, 0xf8, 0xef, 0xdd, 0xf0, 0x1a, 0x55, 0xa0, 0xa8, 0xd8, 0x31, 0xb8, 0x23, 0xf8,
+    0x82, 0x8a,
+];
+
 pub fn eosio_assert(
     mut env: FunctionEnvMut<WasmContext>,
     condition: u32,
@@ -175,4 +181,23 @@ pub fn current_time(mut env: FunctionEnvMut<WasmContext>) -> Result<u64, Runtime
         .count();
 
     Ok(result as u64)
+}
+
+pub fn get_sender(mut env: FunctionEnvMut<WasmContext>) -> Result<u64, RuntimeError> {
+    context_aware_check(&env)?;
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BASE)?;
+    if !env_data
+        .db()
+        .protocol_feature_activated(GET_SENDER_FEATURE_DIGEST)
+    {
+        return Err(RuntimeError::new(
+            "get_sender is unavailable before the GET_SENDER protocol feature is activated",
+        ));
+    }
+
+    env_data
+        .apply_context()
+        .get_sender()
+        .map_err(|error| RuntimeError::new(error.to_string()))
 }

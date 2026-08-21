@@ -2395,6 +2395,18 @@ impl ApplyContext {
             .saturating_sub(1)
     }
 
+    pub fn get_sender(&self) -> Result<u64, ChainError> {
+        let trace = self.trx_context.get_action_trace(self.action_ordinal)?;
+        if trace.creator_action_ordinal() == 0 {
+            return Ok(0);
+        }
+
+        let creator = self
+            .trx_context
+            .get_action_trace(trace.creator_action_ordinal())?;
+        Ok(creator.receiver().as_u64())
+    }
+
     pub fn get_pending_block_time(&self) -> &BlockTimestamp {
         &self.pending_block_timestamp
     }
