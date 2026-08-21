@@ -14,6 +14,7 @@ use pulsevm_serialization::{
     NumBytes,
     Read,
     ReadError,
+    VarUint32,
     Write,
     WriteError,
 };
@@ -148,10 +149,10 @@ impl PackedTransaction {
     /// this digest rather than the full packed-transaction wire encoding.
     pub fn packed_digest(&self) -> Result<pulsevm_crypto::Digest, WriteError> {
         let mut prunable = self.signatures.pack()?;
-        prunable.extend(self.packed_context_free_data.pack()?);
+        prunable.extend(pack_fc_bytes(self.packed_context_free_data.as_ref())?);
 
         let mut encoded = self.compression.pack()?;
-        encoded.extend(self.packed_trx.pack()?);
+        encoded.extend(pack_fc_bytes(self.packed_trx.as_ref())?);
         encoded.extend(pulsevm_crypto::Digest::hash(prunable).pack()?);
         Ok(pulsevm_crypto::Digest::hash(encoded))
     }
@@ -178,6 +179,19 @@ impl PackedTransaction {
             trx_id,
         })
     }
+}
+
+/// FC's `bytes` serializer prefixes a byte vector with a varuint length. The
+/// generic `Bytes::pack()` buffer is intentionally oversized for its legacy
+/// fixed-width `NumBytes` estimate, so receipt digests must encode the exact
+/// FC wire form explicitly (without trailing allocation bytes).
+fn pack_fc_bytes(bytes: &[u8]) -> Result<Vec<u8>, WriteError> {
+    let mut encoded = VarUint32(
+        u32::try_from(bytes.len()).map_err(|_| WriteError::TryFromIntError)?,
+    )
+    .pack()?;
+    encoded.extend_from_slice(bytes);
+    Ok(encoded)
 }
 
 impl NumBytes for PackedTransaction {
