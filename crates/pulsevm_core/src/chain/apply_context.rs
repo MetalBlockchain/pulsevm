@@ -52,6 +52,12 @@ use crate::{
     transaction::PackedTransaction,
 };
 
+const RESTRICT_ACTION_TO_SELF_FEATURE_DIGEST: [u8; 32] = [
+    0xe7, 0x1b, 0x67, 0x12, 0x18, 0x39, 0x19, 0x94, 0xc7, 0x8d, 0x8c, 0x72, 0x2c, 0x1d,
+    0x42, 0xc4, 0x77, 0xcf, 0x09, 0x1e, 0x56, 0x01, 0xb5, 0xcf, 0x1b, 0xef, 0xd0, 0x57,
+    0x21, 0xa5, 0x7f, 0x03,
+];
+
 struct ApplyContextInner {
     action: Action,                       // The action being applied
     action_return_value: Option<Vec<u8>>, // Return value of the action
@@ -351,7 +357,12 @@ impl ApplyContext {
             inner.action.clone()
         };
         let send_to_self = a.account() == &self.receiver;
-        let inherit_parent_authorizations = send_to_self && &self.receiver == action.account();
+        let restrict_action_to_self = self
+            .db
+            .protocol_feature_activated(RESTRICT_ACTION_TO_SELF_FEATURE_DIGEST);
+        let inherit_parent_authorizations = !restrict_action_to_self
+            && send_to_self
+            && &self.receiver == action.account();
 
         {
             pulse_assert(
