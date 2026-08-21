@@ -28,10 +28,11 @@ use crate::{
 /// (config.hpp / permission_link_object.hpp in the reference chain).
 const PERMISSION_LINK_OBJECT_BILLABLE: i64 = 144;
 
-/// Leap's builtin protocol-feature registry. The digest is the canonical
-/// feature identifier; dependencies and preactivation policy are consensus
-/// metadata, not user-configurable chain settings. This intentionally covers
-/// the Leap 5/XPR builtin set imported by the migration tool.
+/// Leap's builtin protocol-feature registry. These are the canonical feature
+/// digests (not the human-readable `description_digest` values returned by the
+/// producer API). Chainbase `protocol_state` rows and block extensions carry
+/// these canonical identifiers, so using description hashes here would make
+/// every imported feature appear inactive.
 #[derive(Clone, Copy)]
 struct ProtocolFeatureSpec {
     dependencies: &'static [&'static str],
@@ -40,40 +41,40 @@ struct ProtocolFeatureSpec {
 
 const NO_PROTOCOL_FEATURE_DEPENDENCIES: &[&str] = &[];
 const NO_DUPLICATE_DEFERRED_ID_DEPENDENCIES: &[&str] =
-    &["9908b3f8413c8474ab2a6be149d3f4f6d0421d37886033f27d4759c47a26d944"];
+    &["ef43112c6543b88db2283a2e077278c315ae2c84719a8b25f25cc88565fbea99"];
 const DISABLE_DEFERRED_STAGE_2_DEPENDENCIES: &[&str] =
-    &["440c3efaaab212c387ce967c574dc813851cf8332d041beb418dfaf55facd5a9"];
+    &["fce57d2331667353a0eac6b4209b67b843a7262a848af0a49a6e2fa9f6584eb4"];
 
 fn protocol_feature_spec(feature_digest: [u8; 32]) -> Option<ProtocolFeatureSpec> {
     let digest = hex::encode(feature_digest);
     let (dependencies, preactivation_required) = match digest.as_str() {
         // PREACTIVATE_FEATURE is enabled at genesis in Leap and may be
         // activated without a prior preactivation request.
-        "64fe7df32e9b86be2b296b3f81dfd527f84e82b98e363bc97e40bc7a83733310" =>
+        "0ec7e080177b2c02b278d5088611686b49d739925a92d9bfcacd7fc6b74053bd" =>
             (NO_PROTOCOL_FEATURE_DEPENDENCIES, false),
-        "f3c3d91c4603cde2397268bfed4e662465293aab10cd9416db0d442b8cec2949"
-        | "9908b3f8413c8474ab2a6be149d3f4f6d0421d37886033f27d4759c47a26d944"
-        | "a98241c83511dc86c857221b9372b4aa7cea3aaebc567a48604e1d3db3557050"
-        | "2853617cec3eabd41881eb48882e6fc5e81a0db917d375057864b3befbe29acd"
-        | "e71b6712188391994c78d8c722c1d42c477cf091e5601b5cf1befd05721a57f3"
-        | "2f1f13e291c79da5a2bbad259ed7c1f2d34f697ea460b14b565ac33b063b73e2"
-        | "898082c59f921d0042e581f00a59d5ceb8be6f1d9c7a45b6f07c0e26eaee0222"
-        | "1eab748b95a2e6f4d7cb42065bdee5566af8efddf01a55a0a8d831b823f8828a"
-        | "1812fdb5096fd854a4958eb9d53b43219d114de0e858ce00255bd46569ad2c68"
-        | "927fdf78c51e77a899f2db938249fb1f8bb38f4e43d9c1f75b190492080cbc34"
-        | "ab76031cad7a457f4fd5f5fca97a3f03b8a635278e0416f77dcc91eb99a48e10"
-        | "69b064c5178e2738e144ed6caa9349a3995370d78db29e494b3126ebd9111966"
-        | "8139e99247b87f18ef7eae99f07f00ea3adf39ed53f4d2da3f44e6aa0bfd7c62"
-        | "70787548dcea1a2c52c913a37f74ce99e6caae79110d7ca7b859936a0075b314"
-        | "d2596697fed14a0840013647b99045022ae6a885089f35a7e78da7a43ad76ed4"
-        | "68d6405cb8df3de95bd834ebb408196578500a9f818ff62ccc68f60b932f7d82"
-        | "e5d7992006e628a38c5e6c28dd55ff5e57ea682079bf41fef9b3cced0f46b491"
-        | "c0cce5bcd8ea19a28d9e12eafda65ebe6d0e0177e280d4f20c7ad66dcd9e011b"
-        | "440c3efaaab212c387ce967c574dc813851cf8332d041beb418dfaf55facd5a9" =>
+        "1a99a59d87e06e09ec5b028a9cbb7749b4a5ad8819004365d02dc4379a8b7241"
+        | "ef43112c6543b88db2283a2e077278c315ae2c84719a8b25f25cc88565fbea99"
+        | "e0fb64b1085cc5538970158d05a009c24e276fb94e1a0bf6a528b48fbc4ff526"
+        | "68dcaa34c0517d19666e6b33add67351d8c5f69e999ca1e37931bc410a297428"
+        | "ad9e3d8f650687709fd68f4b90b41f7d825a365b02c23a636cef88ac2ac00c43"
+        | "8ba52fe7a3956c5cd3a656a3174b931d3bb2abb45578befc59f283ecd816a405"
+        | "2652f5f96006294109b3dd0bbde63693f55324af452b799ee137a81a905eed25"
+        | "f0af56d2c5a48d60a4a5b5c903edfb7db3a736a94ed589d0b797df33ff9d3e1d"
+        | "4e7bf348da00a945489b2a681749eb56f5de00b900014e137ddae39f48f69d67"
+        | "4fca8bd82bbd181e714e283f83e1b45d95ca5af40fb89ad3977b653c448f78c2"
+        | "299dcb6af692324b899b39f16d5a530a33062804e41f09dc97e9f156b4476707"
+        | "c3a6138c5061cf291310887c0b5c71fcaffeab90d5deb50d3b9e687cead45071"
+        | "d528b9f6e9693f45ed277af93474fd473ce7d831dae2180cca35d907bd10cb40"
+        | "5443fcf88330c586bc0e5f3dee10e7f63c76c00249c87fe4fbf7f38c082006b4"
+        | "bcd2a26394b36614fd4894241d3c451ab0f6fd110958c3423073621a70826e99"
+        | "6bcb40a24e49c26d0a60513b6aeb8551d264e4717f306b81a37a5afb3b47cedc"
+        | "35c2186cc36f7bb4aeaf4487b36e57039ccf45a9136aa856a5d569ecca55ef2b"
+        | "63320dd4a58212e4d32d1f58926b73ca33a247326c2a5e9fd39268d2384e011a"
+        | "fce57d2331667353a0eac6b4209b67b843a7262a848af0a49a6e2fa9f6584eb4" =>
             (NO_PROTOCOL_FEATURE_DEPENDENCIES, true),
-        "45967387ee92da70171efd9fefd1ca8061b5efe6f124d269cd2468b47f1575a0" =>
+        "4a90c00d55454dc5b059055ca213579c6ea856967712a56017487886a4d4cc0f" =>
             (NO_DUPLICATE_DEFERRED_ID_DEPENDENCIES, true),
-        "a857eeb932774c511a40efb30346ec01bfb7796916b54c3c69fe7e5fb70d5cba" =>
+        "09e86cb0accf8d81c9e85d34bea4b925ae936626d00c984e4691186891f5bc16" =>
             (DISABLE_DEFERRED_STAGE_2_DEPENDENCIES, true),
         _ => return None,
     };
@@ -3832,10 +3833,10 @@ mod tests {
         ));
 
         let replace_deferred = parse_protocol_feature_digest(
-            "9908b3f8413c8474ab2a6be149d3f4f6d0421d37886033f27d4759c47a26d944",
+            "ef43112c6543b88db2283a2e077278c315ae2c84719a8b25f25cc88565fbea99",
         );
         let no_duplicate_deferred_id = parse_protocol_feature_digest(
-            "45967387ee92da70171efd9fefd1ca8061b5efe6f124d269cd2468b47f1575a0",
+            "4a90c00d55454dc5b059055ca213579c6ea856967712a56017487886a4d4cc0f",
         );
         assert!(db
             .preactivate_protocol_feature(no_duplicate_deferred_id)
@@ -3852,6 +3853,45 @@ mod tests {
         assert!(db.protocol_feature_activated(replace_deferred));
         assert!(db.protocol_feature_activated(no_duplicate_deferred_id));
         assert!(db.preactivated_protocol_features().is_empty());
+    }
+
+    #[test]
+    fn protocol_feature_registry_matches_xpr_canonical_feature_digests() {
+        // These are the feature_digest values returned by Leap's
+        // get_activated_protocol_features API on XPR, not its separate
+        // description_digest values. Keeping this list here prevents a
+        // description hash from silently becoming the runtime gate key again.
+        let xpr_features = [
+            "0ec7e080177b2c02b278d5088611686b49d739925a92d9bfcacd7fc6b74053bd",
+            "f0af56d2c5a48d60a4a5b5c903edfb7db3a736a94ed589d0b797df33ff9d3e1d",
+            "2652f5f96006294109b3dd0bbde63693f55324af452b799ee137a81a905eed25",
+            "8ba52fe7a3956c5cd3a656a3174b931d3bb2abb45578befc59f283ecd816a405",
+            "ad9e3d8f650687709fd68f4b90b41f7d825a365b02c23a636cef88ac2ac00c43",
+            "68dcaa34c0517d19666e6b33add67351d8c5f69e999ca1e37931bc410a297428",
+            "e0fb64b1085cc5538970158d05a009c24e276fb94e1a0bf6a528b48fbc4ff526",
+            "ef43112c6543b88db2283a2e077278c315ae2c84719a8b25f25cc88565fbea99",
+            "4a90c00d55454dc5b059055ca213579c6ea856967712a56017487886a4d4cc0f",
+            "1a99a59d87e06e09ec5b028a9cbb7749b4a5ad8819004365d02dc4379a8b7241",
+            "4e7bf348da00a945489b2a681749eb56f5de00b900014e137ddae39f48f69d67",
+            "4fca8bd82bbd181e714e283f83e1b45d95ca5af40fb89ad3977b653c448f78c2",
+            "299dcb6af692324b899b39f16d5a530a33062804e41f09dc97e9f156b4476707",
+            "c3a6138c5061cf291310887c0b5c71fcaffeab90d5deb50d3b9e687cead45071",
+            "5443fcf88330c586bc0e5f3dee10e7f63c76c00249c87fe4fbf7f38c082006b4",
+            "d528b9f6e9693f45ed277af93474fd473ce7d831dae2180cca35d907bd10cb40",
+            "bcd2a26394b36614fd4894241d3c451ab0f6fd110958c3423073621a70826e99",
+            "6bcb40a24e49c26d0a60513b6aeb8551d264e4717f306b81a37a5afb3b47cedc",
+            "35c2186cc36f7bb4aeaf4487b36e57039ccf45a9136aa856a5d569ecca55ef2b",
+        ];
+        for digest in xpr_features {
+            assert!(
+                protocol_feature_spec(parse_protocol_feature_digest(digest)).is_some(),
+                "XPR canonical feature digest {digest} is not registered"
+            );
+        }
+        assert!(protocol_feature_spec(parse_protocol_feature_digest(
+            "9908b3f8413c8474ab2a6be149d3f4f6d0421d37886033f27d4759c47a26d944"
+        ))
+        .is_none());
     }
 
     // 64 MiB is a multiple of chainbase's 1 MiB sizing requirement and leaves
