@@ -345,7 +345,7 @@ impl TransactionContext {
         let initial_net_usage = chain_config.base_per_transaction_net_usage as u64
             + packed_trx_unprunable_size
             + discounted_size_for_pruned_data;
-        self.validate_referenced_accounts(transaction)?;
+        self.validate_deferred_referenced_accounts(transaction)?;
         self.init(initial_net_usage, transaction.first_authorizer(), true)?;
         self.record_transaction(
             &transaction.id()?,
@@ -857,6 +857,25 @@ impl TransactionContext {
     }
 
     pub fn validate_referenced_accounts(&self, trx: &Transaction) -> Result<(), ChainError> {
+        self.validate_referenced_accounts_with_code_permission(trx, false)
+    }
+
+    /// Validate a generated transaction's account references. Deferred
+    /// transactions are authorized by the scheduling receiver's implicit
+    /// `receiver@eosio.code` permission, which does not need a permission
+    /// object in chainbase. Ordinary input transactions remain strict.
+    pub fn validate_deferred_referenced_accounts(
+        &self,
+        trx: &Transaction,
+    ) -> Result<(), ChainError> {
+        self.validate_referenced_accounts_with_code_permission(trx, true)
+    }
+
+    fn validate_referenced_accounts_with_code_permission(
+        &self,
+        trx: &Transaction,
+        allow_code_permission: bool,
+    ) -> Result<(), ChainError> {
         if !trx.context_free_actions.is_empty() {
             for action in trx.context_free_actions.iter() {
                 if !self.db.is_account(action.account.as_u64())? {
@@ -895,7 +914,9 @@ impl TransactionContext {
                     )));
                 }
 
-                if AuthorizationManager::find_permission(&self.db.read()?, auth)?.is_none() {
+                if !(allow_code_permission && auth.permission() == crate::CODE_NAME)
+                    && AuthorizationManager::find_permission(&self.db.read()?, auth)?.is_none()
+                {
                     return Err(ChainError::TransactionError(format!(
                         "action's authorizations include a non-existent permission: {}",
                         auth,

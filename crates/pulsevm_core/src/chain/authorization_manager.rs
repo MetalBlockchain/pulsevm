@@ -139,19 +139,27 @@ impl AuthorizationManager {
                             declared_auth.actor,
                             min_permission_name.as_u64(),
                         )?;
-                        pulse_assert(
-                            Self::get_permission(
-                                &r,
-                                declared_auth.actor,
-                                declared_auth.permission,
-                            )?
-                            .satisfies(&min_permission, &r)?,
-                            ChainError::IrrelevantAuth(format!(
-                                "action declares irrelevant authority '{}'; minimum authority is {}",
-                                declared_auth,
-                                PermissionLevel::new(min_permission.owner(), min_permission.name())
-                            )),
-                        )?;
+                        // A scheduler/inline receiver may provide its implicit
+                        // `receiver@eosio.code` permission. That permission is
+                        // virtual and therefore has no chainbase authority row;
+                        // the provided permission itself is the authorization.
+                        if !(declared_auth.permission == crate::CODE_NAME.as_u64()
+                            && provided_permissions.contains(declared_auth))
+                        {
+                            pulse_assert(
+                                Self::get_permission(
+                                    &r,
+                                    declared_auth.actor,
+                                    declared_auth.permission,
+                                )?
+                                .satisfies(&min_permission, &r)?,
+                                ChainError::IrrelevantAuth(format!(
+                                    "action declares irrelevant authority '{}'; minimum authority is {}",
+                                    declared_auth,
+                                    PermissionLevel::new(min_permission.owner(), min_permission.name())
+                                )),
+                            )?;
+                        }
                     }
                 }
 

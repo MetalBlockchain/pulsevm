@@ -2515,6 +2515,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::CODE_NAME;
 
     #[derive(Debug, Clone, PartialEq, Eq, Hash, Read, Write, NumBytes)]
     struct Create {
@@ -4717,7 +4718,7 @@ mod tests {
                 PULSE_NAME,
                 Name::from_str("noop")?,
                 vec![],
-                vec![PermissionLevel::new(account.as_u64(), ACTIVE_NAME.as_u64())],
+                vec![PermissionLevel::new(account.as_u64(), CODE_NAME.as_u64())],
             )],
         )
         .pack()?;

@@ -2444,7 +2444,8 @@ impl ApplyContext {
                 "context free actions are not allowed in deferred transactions".to_string(),
             ),
         )?;
-        self.trx_context.validate_referenced_accounts(&transaction)?;
+        self.trx_context
+            .validate_deferred_referenced_accounts(&transaction)?;
 
         let sender = self.receiver.as_u64();
         pulse_assert(
@@ -2455,6 +2456,27 @@ impl ApplyContext {
             pulse_assert(
                 self.has_authorization(&Name::new(payer))?,
                 ChainError::MissingAuthError(format!("missing authority of {}", Name::new(payer))),
+            )?;
+        }
+
+        let privileged = self.inner.read()?.privileged;
+        if !privileged {
+            let mut provided_permissions = BTreeSet::new();
+            provided_permissions.insert(PermissionLevel::new(sender, CODE_NAME.into()));
+            let delay = Microseconds::new(
+                i64::from(transaction.header.delay_sec().0)
+                    .checked_mul(1_000_000)
+                    .ok_or_else(|| {
+                        ChainError::TransactionError("deferred delay overflows timestamp".into())
+                    })?,
+            );
+            AuthorizationManager::check_authorization(
+                &self.db,
+                &transaction.actions,
+                &BTreeSet::new(),
+                &provided_permissions,
+                delay,
+                &BTreeSet::new(),
             )?;
         }
 
