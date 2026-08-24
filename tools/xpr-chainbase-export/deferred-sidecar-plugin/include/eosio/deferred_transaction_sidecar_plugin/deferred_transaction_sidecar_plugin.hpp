@@ -1,6 +1,6 @@
 #pragma once
 
-#include <eosio/chain/application.hpp>
+#include <appbase/application.hpp>
 #include <eosio/chain_plugin/chain_plugin.hpp>
 
 #include <memory>

@@ -15,7 +15,7 @@ namespace eosio {
 
 using boost::signals2::scoped_connection;
 
-static auto sidecar_plugin = application::register_plugin<deferred_transaction_sidecar_plugin>();
+static appbase::abstract_plugin& sidecar_plugin = app().register_plugin<deferred_transaction_sidecar_plugin>();
 
 static std::string uint128_to_decimal(chain::uint128_t value) {
    if (value == 0)
