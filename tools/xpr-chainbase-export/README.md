@@ -67,10 +67,9 @@ tools/xpr-chainbase-export/export.sh \
 ```
 
 This captures the state-history stream while the source node catches up to at
-least the requested target. The current Arena importer still hydrates the
-initial full-state record only; consuming the later delta records as a
-consensus replay window is a separate step. A window therefore supplements,
-but does not replace, the base snapshot.
+least the requested target. The Arena consumer can replay later delta records
+as a bounded migration window; a window supplements, but does not replace, the
+base snapshot.
 
 Inspect a bounded window without inflating the multi-gigabyte initial record:
 
@@ -94,8 +93,21 @@ cargo run -p pulsevm_database --example xpr_apply_history_window -- \
   /tmp/xpr-arena-window 10000
 ```
 
-It stops fail-closed at a generated transaction until a matching per-block
-sidecar is available.
+The optional fourth argument is a directory of per-block sidecars named
+`<lowercase-block-id>.json`; the entry limit then becomes the fifth argument:
+
+```bash
+cargo run -p pulsevm_database --example xpr_apply_history_window -- \
+  /data/xpr-migration.snapshot \
+  /data/xpr-export-window/state-history/chain_state_history.log \
+  /tmp/xpr-arena-window \
+  /data/xpr-export-window/deferred-blocks \
+  10000
+```
+
+Each sidecar uses the JSON schema below and must match its block's generated
+transaction rows and omitted bookkeeping rows exactly. A block containing a
+generated transaction still stops fail-closed when its sidecar is absent.
 
 ## Output contract
 
@@ -172,9 +184,12 @@ cargo run -p pulsevm_database --example xpr_import_check -- \
   /data/xpr-migration.snapshot /data/xpr-export/deferred-transactions.json
 ```
 
-The importer verifies the block and source-chain IDs, requires each supplied
-sidecar table to cover the corresponding SHiP rows exactly, and checks every
-deferred identity/payload one-for-one before it accepts the sidecar. Its
+The full-state importer verifies the block and source-chain IDs, requires each
+supplied sidecar table to cover the corresponding SHiP rows exactly, and checks
+every deferred identity/payload one-for-one before it accepts the sidecar. For
+post-block sidecars, the delta consumer requires every changed SHiP row to be
+covered and permits the sidecar to contain the complete post-block table view.
+Its
 checksum and source chain ID are committed to the resulting migration manifest;
 the complete records are persisted in Arena. Startup re-parses every deferred
 raw transaction and checks its ID against the sidecar before allowing the
@@ -190,8 +205,8 @@ execution also uses an ID-only receipt. Producer and validator both replay
 these paths from the committed Arena record.
 
 `deferred-sidecar-plugin/` contains the exact-XPR-source plugin that writes
-this file from chainbase during plugin startup, after snapshot hydration and
-before P2P catch-up. Install it in
+this file (or a per-block directory of complete views) from chainbase during
+plugin startup, after snapshot hydration and before P2P catch-up. Install it in
 a clean checkout at the pinned revision and rebuild nodeos:
 
 ```bash
@@ -211,6 +226,25 @@ tools/xpr-chainbase-export/export.sh \
   --chain-state-db-size-mb 4096 \
   --deferred-sidecar /data/xpr-export-123456789/deferred-transactions.json
 ```
+
+For a bounded delta replay, request the per-block form instead. The rebuilt
+plugin writes the restored snapshot state and then a complete chainbase view
+after each accepted block as `<block-id>.json` files:
+
+```bash
+tools/xpr-chainbase-export/export.sh \
+  --nodeos /src/antelope-leap/build/programs/nodeos/nodeos \
+  --xpr-core /src/antelope-leap \
+  --snapshot /data/xpr/snapshots/snapshot.bin \
+  --work-dir /data/xpr-export-123456789 \
+  --post-snapshot-blocks 10000 \
+  --p2p-peer archive.example.org:9876 \
+  --deferred-sidecar-dir /data/xpr-export-123456789/deferred-blocks
+```
+
+These files are intentionally complete post-block views: the Arena consumer
+matches only rows changed in the corresponding SHiP delta, so unchanged source
+rows do not need to be serialized into every mutation record.
 
 Large Mainnet snapshots can exceed nodeos's default chainbase allocation. Pass
 `--chain-state-db-size-mb` (for example `4096`) when the source node reports

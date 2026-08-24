@@ -6,10 +6,14 @@
 #include <eosio/chain/permission_object.hpp>
 
 #include <algorithm>
+#include <boost/signals2/connection.hpp>
+#include <fc/optional.hpp>
 #include <filesystem>
 #include <fstream>
 
 namespace eosio {
+
+using boost::signals2::scoped_connection;
 
 static auto sidecar_plugin = application::register_plugin<deferred_transaction_sidecar_plugin>();
 
@@ -31,18 +35,25 @@ public:
    explicit deferred_transaction_sidecar_plugin_impl(chain::controller& chain)
       : chain(chain) {}
 
-   void write_snapshot_state() { write_once(chain.head_block_id()); }
+   void write_snapshot_state() {
+      write_state(chain.head_block_id(), path);
+   }
 
-   void write_once(const chain::block_id_type& source_block_id) {
-      if (wrote)
-         return;
-      wrote = true;
+   void write_accepted_state(const chain::block_state_ptr& block_state) {
+      const auto source_block_id = block_state->id;
+      write_state(source_block_id, directory / (source_block_id.str() + ".json"));
+   }
+
+   void write_state(const chain::block_id_type& source_block_id, const std::filesystem::path& output_path) {
+      EOS_ASSERT(!output_path.empty(), chain::plugin_exception, "deferred sidecar output path is empty");
+      EOS_ASSERT(!std::filesystem::exists(output_path), chain::plugin_exception,
+                 "refusing to overwrite deferred sidecar ${p}", ("p", output_path.string()));
 
       // chain_plugin has restored the snapshot before plugin startup. SHiP's
       // initial full-state record is anchored to this restored head block, so
       // the sidecar must use that ID rather than the next P2P-accepted block.
-      std::ofstream output(path.string(), std::ios::out | std::ios::trunc);
-      EOS_ASSERT(output, chain::plugin_exception, "cannot open deferred sidecar ${p}", ("p", path.string()));
+      std::ofstream output(output_path.string(), std::ios::out | std::ios::trunc);
+      EOS_ASSERT(output, chain::plugin_exception, "cannot open deferred sidecar ${p}", ("p", output_path.string()));
       output << "{\"version\":1,\"source_block_id\":\"" << source_block_id.str()
              << "\",\"source_chain_id\":\"" << chain.get_chain_id().str()
              << "\",\"account_metadata\":[";
@@ -114,31 +125,61 @@ public:
       }
       output << "]}\n";
       output.close();
-      EOS_ASSERT(output, chain::plugin_exception, "failed writing deferred sidecar ${p}", ("p", path.string()));
-      ilog("wrote deferred transaction sidecar ${p} for block ${id}", ("p", path.string())("id", source_block_id));
+      EOS_ASSERT(output, chain::plugin_exception, "failed writing deferred sidecar ${p}", ("p", output_path.string()));
+      ilog("wrote deferred transaction sidecar ${p} for block ${id}", ("p", output_path.string())("id", source_block_id));
    }
 
    chain::controller& chain;
    std::filesystem::path path;
-   bool wrote = false;
+   std::filesystem::path directory;
+   fc::optional<scoped_connection> accepted_block_connection;
 };
 
 deferred_transaction_sidecar_plugin::deferred_transaction_sidecar_plugin() = default;
 
 void deferred_transaction_sidecar_plugin::set_program_options(options_description&, options_description& cfg) {
-   cfg.add_options()("deferred-transaction-sidecar-path", bpo::value<std::filesystem::path>()->required(),
-      "write the complete generated_transaction chainbase sidecar at the restored snapshot head");
+   cfg.add_options()
+      ("deferred-transaction-sidecar-path", bpo::value<std::filesystem::path>(),
+       "write one complete chainbase sidecar at the restored snapshot head")
+      ("deferred-transaction-sidecar-dir", bpo::value<std::filesystem::path>(),
+       "write one complete chainbase sidecar at startup and after every accepted block");
 }
 
 void deferred_transaction_sidecar_plugin::plugin_initialize(const variables_map& options) {
    my = std::make_shared<deferred_transaction_sidecar_plugin_impl>(app().get_plugin<chain_plugin>().chain());
-   my->path = options.at("deferred-transaction-sidecar-path").as<std::filesystem::path>();
-   EOS_ASSERT(!std::filesystem::exists(my->path), chain::plugin_exception,
-              "refusing to overwrite deferred sidecar ${p}", ("p", my->path.string()));
+   const bool has_path = options.count("deferred-transaction-sidecar-path") != 0;
+   const bool has_directory = options.count("deferred-transaction-sidecar-dir") != 0;
+   EOS_ASSERT(has_path != has_directory, chain::plugin_exception,
+              "set exactly one of --deferred-transaction-sidecar-path or --deferred-transaction-sidecar-dir");
+   if (has_path) {
+      my->path = options.at("deferred-transaction-sidecar-path").as<std::filesystem::path>();
+      EOS_ASSERT(!std::filesystem::exists(my->path), chain::plugin_exception,
+                 "refusing to overwrite deferred sidecar ${p}", ("p", my->path.string()));
+   } else {
+      my->directory = options.at("deferred-transaction-sidecar-dir").as<std::filesystem::path>();
+      std::error_code error;
+      std::filesystem::create_directories(my->directory, error);
+      EOS_ASSERT(!error, chain::plugin_exception,
+                 "cannot create deferred sidecar directory ${p}: ${e}",
+                 ("p", my->directory.string())("e", error.message()));
+   }
 }
 
-void deferred_transaction_sidecar_plugin::plugin_startup() { my->write_snapshot_state(); }
+void deferred_transaction_sidecar_plugin::plugin_startup() {
+   if (!my->path.empty()) {
+      my->write_snapshot_state();
+      return;
+   }
+   my->write_state(my->chain.head_block_id(), my->directory / (my->chain.head_block_id().str() + ".json"));
+   my->accepted_block_connection.emplace(
+      my->chain.accepted_block.connect([impl = my](const chain::block_state_ptr& block_state) {
+         impl->write_accepted_state(block_state);
+      }));
+}
 
-void deferred_transaction_sidecar_plugin::plugin_shutdown() {}
+void deferred_transaction_sidecar_plugin::plugin_shutdown() {
+   if (my)
+      my->accepted_block_connection.reset();
+}
 
 } // namespace eosio

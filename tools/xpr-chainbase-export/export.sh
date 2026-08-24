@@ -42,6 +42,9 @@ Options:
                            (default: nodeos default; 0 disables this override)
   --deferred-sidecar PATH  Write complete deferred-transaction chainbase state
                            through the bundled source-node plugin
+  --deferred-sidecar-dir PATH
+                           Write a complete sidecar at startup and after each
+                           accepted block, named <block-id>.json
   --help                   Show this help
 
 The output directory contains:
@@ -49,6 +52,7 @@ The output directory contains:
   manifest.env                     Pinned source, input and output hashes
                                   and optional bounded-window heights
   deferred-transactions.json       Optional complete deferred-transaction sidecar
+  deferred-blocks/<block-id>.json  Optional per-block sidecars for delta replay
   nodeos.log                       Source-node diagnostic log
 
 The importer consumes the first state-history block as a full Arena hydration
@@ -68,6 +72,7 @@ http_probe_bind=127.0.0.1
 wasm_runtime=""
 resource_monitor_space_threshold=0
 deferred_sidecar=""
+deferred_sidecar_dir=""
 xpr_core=""
 post_snapshot_blocks=0
 peers=()
@@ -87,6 +92,7 @@ while (($#)); do
         --wasm-runtime) wasm_runtime="$2"; shift 2 ;;
         --resource-monitor-space-threshold) resource_monitor_space_threshold="$2"; shift 2 ;;
         --deferred-sidecar) deferred_sidecar="$2"; shift 2 ;;
+        --deferred-sidecar-dir) deferred_sidecar_dir="$2"; shift 2 ;;
         --post-snapshot-blocks) post_snapshot_blocks="$2"; shift 2 ;;
         --help) usage; exit 0 ;;
         *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -127,10 +133,18 @@ if [[ -n "$deferred_sidecar" && -e "$deferred_sidecar" ]]; then
     echo "deferred sidecar path already exists: $deferred_sidecar" >&2
     exit 2
 fi
+if [[ -n "$deferred_sidecar_dir" && -e "$deferred_sidecar_dir" ]]; then
+    echo "deferred sidecar directory already exists: $deferred_sidecar_dir" >&2
+    exit 2
+fi
+if [[ -n "$deferred_sidecar" && -n "$deferred_sidecar_dir" ]]; then
+    echo "--deferred-sidecar and --deferred-sidecar-dir are mutually exclusive" >&2
+    exit 2
+fi
 
-if [[ -n "$xpr_core" || -n "$deferred_sidecar" ]]; then
+if [[ -n "$xpr_core" || -n "$deferred_sidecar" || -n "$deferred_sidecar_dir" ]]; then
     [[ -n "$xpr_core" ]] || {
-        echo "--xpr-core is required with --deferred-sidecar" >&2
+        echo "--xpr-core is required with a deferred sidecar option" >&2
         exit 2
     }
     preflight_args=(
@@ -144,7 +158,7 @@ if [[ -n "$xpr_core" || -n "$deferred_sidecar" ]]; then
             preflight_args+=(--p2p-peer "$peer")
         done
     fi
-    if [[ -n "$deferred_sidecar" ]]; then
+    if [[ -n "$deferred_sidecar" || -n "$deferred_sidecar_dir" ]]; then
         preflight_args+=(--require-sidecar-plugin)
     fi
     "$(dirname "${BASH_SOURCE[0]}")/preflight.sh" "${preflight_args[@]}"
@@ -192,6 +206,11 @@ if [[ -n "$deferred_sidecar" ]]; then
         --plugin eosio::deferred_transaction_sidecar_plugin
         --deferred-transaction-sidecar-path "$deferred_sidecar"
     )
+elif [[ -n "$deferred_sidecar_dir" ]]; then
+    args+=(
+        --plugin eosio::deferred_transaction_sidecar_plugin
+        --deferred-transaction-sidecar-dir "$deferred_sidecar_dir"
+    )
 fi
 if ((${#peers[@]})); then
     for peer in "${peers[@]}"; do
@@ -220,7 +239,8 @@ for ((elapsed = 0; elapsed < timeout_seconds; elapsed++)); do
     # rather than treating the first bytes of a live log as a complete export.
     if rg -q 'Done storing initial state on startup' "$nodeos_log" \
        && [[ -s "$history_log" ]] \
-       && { [[ -z "$deferred_sidecar" ]] || [[ -s "$deferred_sidecar" ]]; }; then
+       && { [[ -z "$deferred_sidecar" ]] || [[ -s "$deferred_sidecar" ]]; } \
+       && { [[ -z "$deferred_sidecar_dir" ]] || compgen -G "$deferred_sidecar_dir/*.json" >/dev/null; }; then
         break
     fi
     if ! kill -0 "$nodeos_pid" 2>/dev/null; then
@@ -240,6 +260,10 @@ rg -q 'Done storing initial state on startup' "$nodeos_log" || {
 }
 if [[ -n "$deferred_sidecar" && ! -s "$deferred_sidecar" ]]; then
     echo "nodeos produced SHiP but no deferred-transaction sidecar; ensure it was rebuilt with tools/xpr-chainbase-export/deferred-sidecar-plugin" >&2
+    exit 1
+fi
+if [[ -n "$deferred_sidecar_dir" ]] && ! compgen -G "$deferred_sidecar_dir/*.json" >/dev/null; then
+    echo "nodeos produced SHiP but no per-block deferred sidecars; ensure the rebuilt source plugin is enabled" >&2
     exit 1
 fi
 
@@ -296,6 +320,29 @@ sha256() {
     fi
 }
 
+sha256_directory() {
+    local directory="$1"
+    local files
+    files="$(find "$directory" -maxdepth 1 -type f -name '*.json' -print | LC_ALL=C sort)"
+    if command -v sha256sum >/dev/null; then
+        if [[ -n "$files" ]]; then
+            while IFS= read -r file; do
+                printf '%s  %s\n' "$(sha256 "$file")" "${file#"$directory"/}"
+            done <<<"$files" | sha256sum | awk '{print $1}'
+        else
+            printf '' | sha256sum | awk '{print $1}'
+        fi
+    else
+        if [[ -n "$files" ]]; then
+            while IFS= read -r file; do
+                printf '%s  %s\n' "$(sha256 "$file")" "${file#"$directory"/}"
+            done <<<"$files" | shasum -a 256 | awk '{print $1}'
+        else
+            printf '' | shasum -a 256 | awk '{print $1}'
+        fi
+    fi
+}
+
 {
     printf 'XPR_CORE_REVISION=%s\n' "$source_revision"
     printf 'INPUT_SNAPSHOT_SHA256=%s\n' "$(sha256 "$snapshot")"
@@ -311,6 +358,11 @@ sha256() {
     if [[ -n "$deferred_sidecar" ]]; then
         printf 'DEFERRED_TRANSACTION_SIDECAR=%s\n' "$deferred_sidecar"
         printf 'DEFERRED_TRANSACTION_SIDECAR_SHA256=%s\n' "$(sha256 "$deferred_sidecar")"
+    fi
+    if [[ -n "$deferred_sidecar_dir" ]]; then
+        printf 'DEFERRED_TRANSACTION_SIDECAR_DIR=%s\n' "$deferred_sidecar_dir"
+        printf 'DEFERRED_TRANSACTION_SIDECAR_FILES=%s\n' "$(find "$deferred_sidecar_dir" -maxdepth 1 -type f -name '*.json' | wc -l | tr -d ' ')"
+        printf 'DEFERRED_TRANSACTION_SIDECAR_SHA256=%s\n' "$(sha256_directory "$deferred_sidecar_dir")"
     fi
 } >"$work_dir/manifest.env"
 

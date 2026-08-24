@@ -11,8 +11,8 @@ use std::{
     collections::BTreeMap,
     collections::{HashMap, HashSet},
     fmt,
-    fs::File,
-    io::{Read, Seek, SeekFrom},
+    fs::{self, File},
+    io::{ErrorKind, Read, Seek, SeekFrom},
     path::Path,
 };
 
@@ -797,6 +797,17 @@ pub fn apply_state_history_delta(
     db: &mut Database,
     entry: &StateHistoryEntry,
 ) -> Result<ImportSummary, XprImportError> {
+    apply_state_history_delta_with_sidecar(db, entry, None)
+}
+
+/// Apply one post-snapshot SHiP table-delta entry with its optional source
+/// chainbase sidecar. The sidecar is matched against the exact block and
+/// generated-transaction rows before Arena is mutated.
+pub fn apply_state_history_delta_with_sidecar(
+    db: &mut Database,
+    entry: &StateHistoryEntry,
+    deferred_transactions: Option<&DeferredTransactionSidecar>,
+) -> Result<ImportSummary, XprImportError> {
     let mut decoded = Vec::new();
     for delta in &entry.deltas {
         for row in &delta.rows {
@@ -806,18 +817,143 @@ pub fn apply_state_history_delta(
             ));
         }
     }
+    validate_delta_sidecar(&decoded, entry.block_id, deferred_transactions)?;
+    let delta_metadata_names: HashSet<u64> = decoded
+        .iter()
+        .filter_map(|(present, row)| match (present, row) {
+            (true, PortableRow::AccountMetadata { name, .. }) => Some(*name),
+            _ => None,
+        })
+        .collect();
+    let delta_code_keys: HashSet<([u8; 32], u8, u8)> = decoded
+        .iter()
+        .filter_map(|(present, row)| match (present, row) {
+            (
+                true,
+                PortableRow::Code {
+                    hash,
+                    vm_type,
+                    vm_version,
+                    ..
+                },
+            ) => Some((*hash, *vm_type, *vm_version)),
+            _ => None,
+        })
+        .collect();
+    let delta_permission_keys: HashSet<(u64, u64)> = decoded
+        .iter()
+        .filter_map(|(present, row)| match (present, row) {
+            (true, PortableRow::Permission { owner, name, .. }) => Some((*owner, *name)),
+            _ => None,
+        })
+        .collect();
 
     db.arena_start_undo_session();
     let mut summary = ImportSummary::default();
     let result = (|| {
         for (present, row) in decoded {
-            if let PortableRow::GeneratedTransaction { .. } = row {
-                return Err(bad(format!(
-                    "cannot apply block {}: generated_transaction rows require a per-block deferred sidecar",
-                    hex::encode(entry.block_id)
-                )));
+            if let PortableRow::GeneratedTransaction {
+                sender,
+                sender_id,
+                payer,
+                trx_id,
+                packed_trx,
+            } = row
+            {
+                if present {
+                    let sidecar = deferred_transactions.ok_or_else(|| {
+                        bad(format!(
+                            "cannot apply block {}: generated_transaction rows require a per-block deferred sidecar",
+                            hex::encode(entry.block_id)
+                        ))
+                    })?;
+                    let sidecar_row = sidecar
+                        .transactions
+                        .iter()
+                        .find(|candidate| {
+                            candidate
+                                .trx_id
+                                .as_bytes()
+                                .eq_ignore_ascii_case(hex::encode(trx_id).as_bytes())
+                        })
+                        .ok_or_else(|| {
+                            bad(format!(
+                                "deferred sidecar is missing generated transaction {}",
+                                hex::encode(trx_id)
+                            ))
+                        })?;
+                    let key = sidecar_key(sidecar_row)?;
+                    if key.sender != sender
+                        || key.sender_id != sender_id
+                        || key.payer != payer
+                        || key.trx_id != trx_id
+                        || key.packed_trx != packed_trx
+                    {
+                        return Err(bad(format!(
+                            "deferred sidecar identity mismatch for generated transaction {}",
+                            hex::encode(trx_id)
+                        )));
+                    }
+                    db.xpr_import_deferred_transaction(
+                        sender,
+                        sender_id,
+                        payer,
+                        trx_id,
+                        sidecar_row.delay_until,
+                        sidecar_row.expiration,
+                        sidecar_row.published,
+                        &packed_trx,
+                    )
+                    .map_err(database_error)?;
+                    summary.deferred_transactions += 1;
+                } else if !db
+                    .arena_remove_deferred_transaction(trx_id)
+                    .map_err(database_error)?
+                {
+                    return Err(bad(format!(
+                        "generated transaction {} was removed by SHiP but is absent in Arena",
+                        hex::encode(trx_id)
+                    )));
+                }
+                continue;
             }
             apply_delta_row(db, present, row, &mut summary)?;
+        }
+        if let Some(sidecar) = deferred_transactions {
+            for row in &sidecar.account_metadata {
+                if !delta_metadata_names.contains(&row.name) {
+                    continue;
+                }
+                db.xpr_import_update_account_metadata(
+                    row.name,
+                    row.recv_sequence,
+                    row.auth_sequence,
+                    row.code_sequence,
+                    row.abi_sequence,
+                )
+                .map_err(database_error)?;
+            }
+            for row in &sidecar.code {
+                let code_hash = decode_block_id(&row.code_hash)?;
+                if !delta_code_keys.contains(&(code_hash, row.vm_type, row.vm_version)) {
+                    continue;
+                }
+                db.xpr_import_update_code_metadata(
+                    code_hash,
+                    row.vm_type,
+                    row.vm_version,
+                    row.code_ref_count,
+                    row.first_block_used,
+                )
+                .map_err(database_error)?;
+            }
+            for row in &sidecar.permissions {
+                if !delta_permission_keys.contains(&(row.owner, row.name)) {
+                    continue;
+                }
+                db.xpr_import_permission_last_used(row.owner, row.name, row.last_used)
+                    .map_err(database_error)?;
+            }
         }
         Ok(())
     })();
@@ -841,7 +977,34 @@ pub fn apply_state_history_log_window(
     path: impl AsRef<Path>,
     max_post_snapshot_entries: u64,
 ) -> Result<u64, XprImportError> {
-    let mut file = File::open(path.as_ref())
+    apply_state_history_log_window_inner(db, path.as_ref(), None, max_post_snapshot_entries)
+}
+
+/// Stream and apply a bounded history window, loading optional per-block
+/// sidecars from `<sidecar_dir>/<block-id>.json`. Missing files are allowed
+/// for blocks without generated transactions; a block that contains one still
+/// fails closed through [`apply_state_history_delta_with_sidecar`].
+pub fn apply_state_history_log_window_with_sidecars(
+    db: &mut Database,
+    path: impl AsRef<Path>,
+    sidecar_dir: impl AsRef<Path>,
+    max_post_snapshot_entries: u64,
+) -> Result<u64, XprImportError> {
+    apply_state_history_log_window_inner(
+        db,
+        path.as_ref(),
+        Some(sidecar_dir.as_ref()),
+        max_post_snapshot_entries,
+    )
+}
+
+fn apply_state_history_log_window_inner(
+    db: &mut Database,
+    path: &Path,
+    sidecar_dir: Option<&Path>,
+    max_post_snapshot_entries: u64,
+) -> Result<u64, XprImportError> {
+    let mut file = File::open(path)
         .map_err(|error| bad(format!("opening state-history log: {error}")))?;
     let mut offset = 0u64;
     let mut previous_block_num: Option<u32> = None;
@@ -899,7 +1062,23 @@ pub fn apply_state_history_log_window(
                 block_id,
                 deltas: parse_table_deltas(&decompress_state_history_payload(&payload)?)?,
             };
-            apply_state_history_delta(db, &entry)?;
+            let sidecar = match sidecar_dir {
+                Some(directory) => {
+                    let sidecar_path = directory.join(format!("{}.json", hex::encode(block_id)));
+                    match fs::read(&sidecar_path) {
+                        Ok(bytes) => Some(DeferredTransactionSidecar::from_json_bytes(&bytes)?),
+                        Err(error) if error.kind() == ErrorKind::NotFound => None,
+                        Err(error) => {
+                            return Err(bad(format!(
+                                "reading deferred sidecar {}: {error}",
+                                sidecar_path.display()
+                            )));
+                        }
+                    }
+                }
+                None => None,
+            };
+            apply_state_history_delta_with_sidecar(db, &entry, sidecar.as_ref())?;
             applied += 1;
         }
 
@@ -1717,20 +1896,22 @@ fn validate_deferred_transactions(
     }
 
     let mut expected = HashSet::new();
+    let mut expected_transaction_ids = HashSet::new();
     for key in generated {
-        if !expected.insert(key) {
+        if !expected.insert(key.clone()) || !expected_transaction_ids.insert(key.trx_id) {
             return Err(bad(
                 "duplicate generated_transaction row in SHiP full-state export",
             ));
         }
     }
     let mut actual = HashSet::new();
+    let mut actual_transaction_ids = HashSet::new();
     for row in &sidecar
         .expect("non-empty SHiP requires sidecar")
         .transactions
     {
         let key = sidecar_key(row)?;
-        if !actual.insert(key) {
+        if !actual.insert(key.clone()) || !actual_transaction_ids.insert(key.trx_id) {
             return Err(bad(
                 "duplicate generated_transaction row in chainbase sidecar",
             ));
@@ -1756,6 +1937,137 @@ fn validate_sidecar_block_id(
             sidecar.source_block_id,
             hex::encode(source_block_id)
         )));
+    }
+    Ok(())
+}
+
+fn validate_delta_sidecar(
+    rows: &[(bool, PortableRow)],
+    source_block_id: [u8; 32],
+    sidecar: Option<&DeferredTransactionSidecar>,
+) -> Result<(), XprImportError> {
+    let generated = rows
+        .iter()
+        .filter_map(|(present, row)| match (present, row) {
+            (
+                true,
+                PortableRow::GeneratedTransaction {
+                    sender,
+                    sender_id,
+                    payer,
+                    trx_id,
+                    packed_trx,
+                },
+            ) => Some(DeferredTransactionKey {
+                sender: *sender,
+                sender_id: *sender_id,
+                payer: *payer,
+                trx_id: *trx_id,
+                packed_trx: packed_trx.clone(),
+            }),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    let mut generated_transaction_ids = HashSet::new();
+    for key in &generated {
+        if !generated_transaction_ids.insert(key.trx_id) {
+            return Err(bad(
+                "duplicate generated_transaction row in SHiP delta",
+            ));
+        }
+    }
+    let Some(sidecar) = sidecar else {
+        if !generated.is_empty() {
+            let first = generated.iter().next().expect("non-empty generated set");
+            return Err(bad(format!(
+                "cannot apply block {}: generated_transaction {} requires a per-block deferred sidecar",
+                hex::encode(source_block_id),
+                hex::encode(first.trx_id)
+            )));
+        }
+        return Ok(());
+    };
+
+    validate_sidecar_block_id(sidecar, source_block_id)?;
+    if let Some(source_chain_id) = &sidecar.source_chain_id {
+        decode_block_id(source_chain_id)
+            .map_err(|error| bad(format!("invalid source chain id: {error}")))?;
+    }
+    let mut actual = HashSet::new();
+    let mut actual_transaction_ids = HashSet::new();
+    for row in &sidecar.transactions {
+        let key = sidecar_key(row)?;
+        if !actual.insert(key.clone()) || !actual_transaction_ids.insert(key.trx_id) {
+            return Err(bad(
+                "duplicate generated_transaction row in chainbase delta sidecar",
+            ));
+        }
+    }
+    if !generated.is_subset(&actual) {
+        return Err(bad(
+            "deferred-transaction sidecar does not cover present SHiP generated_transaction rows",
+        ));
+    }
+
+    let expected_metadata: HashSet<u64> = rows
+        .iter()
+        .filter_map(|(present, row)| match (present, row) {
+            (true, PortableRow::AccountMetadata { name, .. }) => Some(*name),
+            _ => None,
+        })
+        .collect();
+    let actual_metadata: HashSet<u64> = sidecar.account_metadata.iter().map(|row| row.name).collect();
+    if !expected_metadata.is_subset(&actual_metadata)
+        || actual_metadata.len() != sidecar.account_metadata.len()
+    {
+        return Err(bad(
+            "account_metadata sidecar does not cover the SHiP delta rows",
+        ));
+    }
+
+    let expected_code: HashSet<([u8; 32], u8, u8)> = rows
+        .iter()
+        .filter_map(|(present, row)| match (present, row) {
+            (
+                true,
+                PortableRow::Code {
+                    hash,
+                    vm_type,
+                    vm_version,
+                    ..
+                },
+            ) => Some((*hash, *vm_type, *vm_version)),
+            _ => None,
+        })
+        .collect();
+    let mut actual_code = HashSet::new();
+    for row in &sidecar.code {
+        let hash = decode_block_id(&row.code_hash)
+            .map_err(|error| bad(format!("invalid code sidecar hash: {error}")))?;
+        actual_code.insert((hash, row.vm_type, row.vm_version));
+    }
+    if !expected_code.is_subset(&actual_code) || actual_code.len() != sidecar.code.len() {
+        return Err(bad("code sidecar does not cover the SHiP delta rows"));
+    }
+
+    let expected_permissions: HashSet<(u64, u64)> = rows
+        .iter()
+        .filter_map(|(present, row)| match (present, row) {
+            (true, PortableRow::Permission { owner, name, .. }) => Some((*owner, *name)),
+            _ => None,
+        })
+        .collect();
+    let actual_permissions: HashSet<(u64, u64)> = sidecar
+        .permissions
+        .iter()
+        .map(|row| (row.owner, row.name))
+        .collect();
+    if !expected_permissions.is_subset(&actual_permissions)
+        || actual_permissions.len() != sidecar.permissions.len()
+    {
+        return Err(bad(
+            "permission sidecar does not cover the SHiP delta rows",
+        ));
     }
     Ok(())
 }
@@ -3401,6 +3713,39 @@ mod tests {
         assert_eq!(summary.deferred_transactions, 1);
         assert_eq!(db.deferred_transaction_count(), 1);
         assert!(!db.is_account(11).unwrap());
+    }
+
+    #[test]
+    fn applies_delta_deferred_sidecar_transactionally() {
+        let mut generated = vec![0];
+        generated.extend_from_slice(&11u64.to_le_bytes());
+        generated.extend_from_slice(&12u64.to_le_bytes());
+        generated.extend_from_slice(&13u64.to_le_bytes());
+        generated.extend_from_slice(&14u64.to_le_bytes());
+        generated.extend_from_slice(&[15; 32]);
+        bytes(&mut generated, &[16, 17]);
+        let entry = StateHistoryEntry {
+            magic: 0,
+            block_id: [43; 32],
+            deltas: vec![delta("generated_transaction", generated)],
+        };
+        let sidecar = DeferredTransactionSidecar::from_json_bytes(
+            format!(
+                r#"{{"version":1,"source_block_id":"{}","transactions":[{{"sender":11,"sender_id":"{}","payer":14,"trx_id":"{}","delay_until":1,"expiration":2,"published":0,"packed_trx":"1011"}}]}}"#,
+                hex::encode(entry.block_id),
+                (12u128 | ((13u128) << 64)),
+                hex::encode([15; 32]),
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let dir = TempDir::new().unwrap();
+        let mut db = Database::new(dir.path().to_str().unwrap(), 64 * 1024 * 1024).unwrap();
+
+        let summary =
+            apply_state_history_delta_with_sidecar(&mut db, &entry, Some(&sidecar)).unwrap();
+        assert_eq!(summary.deferred_transactions, 1);
+        assert_eq!(db.deferred_transaction_count(), 1);
     }
 
     #[test]
