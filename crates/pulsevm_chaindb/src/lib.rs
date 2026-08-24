@@ -1410,7 +1410,7 @@ impl ChainDatabase {
     pub fn hydrate_account_metadata(&self, bytes: &[u8]) -> Result<(), DbError> {
         const ROW: usize = 75;
         let mut db = self.lock();
-        for chunk in bytes.chunks_exact(ROW) {
+        for chunk in bytes.as_chunks::<ROW>().0 {
             let name = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
             if db
                 .find_by_hash::<AccountMetaRow, AccountMetaRowByName>(&name)?
@@ -2074,7 +2074,7 @@ impl ChainDatabase {
     pub fn hydrate_resource_usage(&self, bytes: &[u8]) -> Result<(), DbError> {
         const ROW: usize = 8 + 8 + 20 + 20; // owner, ram, net acc, cpu acc
         let mut db = self.lock();
-        for c in bytes.chunks_exact(ROW) {
+        for c in bytes.as_chunks::<ROW>().0 {
             let owner = u64::from_le_bytes(c[0..8].try_into().unwrap());
             if db
                 .find_by::<ResourceUsageRow, ResourceUsageRowByOwner>(&owner)?
@@ -2122,7 +2122,7 @@ impl ChainDatabase {
     pub fn hydrate_account_limits(&self, bytes: &[u8]) -> Result<(), DbError> {
         const ROW: usize = 1 + 8 + 8 + 8 + 8;
         let mut db = self.lock();
-        for c in bytes.chunks_exact(ROW) {
+        for c in bytes.as_chunks::<ROW>().0 {
             let pending = c[0];
             let owner = u64::from_le_bytes(c[1..9].try_into().unwrap());
             if db
