@@ -2129,6 +2129,17 @@ impl Database {
             .map_err(|e| ChainError::InternalError(format!("XPR import code delta: {e:?}")))
     }
 
+    pub(crate) fn xpr_import_remove_code(
+        &self,
+        code_hash: [u8; 32],
+        vm_type: u8,
+        vm_version: u8,
+    ) -> Result<bool, ChainError> {
+        self.backend
+            .xpr_import_remove_code(code_hash, vm_type, vm_version)
+            .map_err(|e| ChainError::InternalError(format!("XPR remove code delta: {e:?}")))
+    }
+
     pub(crate) fn xpr_import_update_code_metadata(
         &self,
         code_hash: [u8; 32],

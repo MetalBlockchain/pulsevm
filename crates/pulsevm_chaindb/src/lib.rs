@@ -3183,6 +3183,27 @@ impl ChainDatabase {
         Ok(())
     }
 
+    /// Remove a code object whose source-chain reference count reached zero.
+    /// SHiP can emit these rows as tombstones after the last account reference
+    /// is cleared, so the Arena mirror must release the corresponding blob and
+    /// indexed row as one undoable operation.
+    pub fn xpr_import_remove_code(
+        &self,
+        code_hash: [u8; 32],
+        vm_type: u8,
+        vm_version: u8,
+    ) -> Result<bool, DbError> {
+        let mut db = self.lock();
+        let Some(id) = db
+            .find_by::<CodeRow, CodeByHash>(&(code_hash, vm_type, vm_version))?
+            .map(|row| row.id())
+        else {
+            return Ok(false);
+        };
+        db.remove::<CodeRow>(id)?;
+        Ok(true)
+    }
+
     /// Restores code-object bookkeeping omitted by SHiP (`first_block_used`)
     /// and verifies the source refcount against the imported code row.
     pub fn xpr_import_update_code_metadata(

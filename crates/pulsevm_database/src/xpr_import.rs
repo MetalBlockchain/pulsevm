@@ -1189,8 +1189,22 @@ fn apply_delta_row(
             }
             summary.code_rows += 1;
         }
-        PortableRow::Code { .. } => {
-            return Err(bad("code removals are not supported by the Arena importer"));
+        PortableRow::Code {
+            hash,
+            vm_type,
+            vm_version,
+            ..
+        } => {
+            if !db
+                .xpr_import_remove_code(hash, vm_type, vm_version)
+                .map_err(database_error)?
+            {
+                return Err(bad(format!(
+                    "code removal {} is absent from Arena",
+                    hex::encode(hash)
+                )));
+            }
+            summary.code_rows += 1;
         }
         PortableRow::Permission {
             owner,
