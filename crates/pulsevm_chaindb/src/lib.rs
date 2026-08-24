@@ -124,6 +124,17 @@ impl UsageAccumulator {
     }
 
     fn add(&mut self, units: u64, ordinal: u32, window_size: u32) {
+        // A migrated chain starts a new block-number domain.  Hydration rebases
+        // the block-level singleton to the target genesis ordinal, but keep the
+        // accumulator defensive in case an older checkpoint or a malformed
+        // import still presents a backwards ordinal.  Chainbase never reaches
+        // this branch during normal execution; resetting the stale window is
+        // safer than allowing unsigned subtraction to wrap in release builds.
+        if ordinal < self.last_ordinal {
+            self.value_ex = 0;
+            self.consumed = 0;
+            self.last_ordinal = ordinal;
+        }
         let value_ex_contrib = integer_divide_ceil(
             units as u128 * RATE_LIMITING_PRECISION as u128,
             window_size as u128,
@@ -2733,10 +2744,18 @@ impl ChainDatabase {
         virtual_net_limit: u64,
         virtual_cpu_limit: u64,
     ) -> Result<(), DbError> {
+        // `resource_limits_state_object::average_block_*_usage` is keyed by
+        // block ordinal, unlike per-account NET/CPU usage which is keyed by
+        // timestamp slot.  XPR's ordinal cannot be carried into a new Pulse
+        // chain whose genesis starts at block 1: the first end-of-block update
+        // would otherwise evaluate `1 - 399_000_000` and wrap.  Preserve the
+        // accumulated averages and rebase only the ordinal to the target
+        // chain's genesis boundary.
+        const TARGET_GENESIS_ORDINAL: u32 = 1;
         let mut db = self.lock();
         let apply = |s: &mut ResourceStateRow| {
-            s.average_block_net_usage = UsageAccumulator { value_ex: net.0, consumed: net.1, last_ordinal: net.2, _pad: 0 };
-            s.average_block_cpu_usage = UsageAccumulator { value_ex: cpu.0, consumed: cpu.1, last_ordinal: cpu.2, _pad: 0 };
+            s.average_block_net_usage = UsageAccumulator { value_ex: net.0, consumed: net.1, last_ordinal: TARGET_GENESIS_ORDINAL, _pad: 0 };
+            s.average_block_cpu_usage = UsageAccumulator { value_ex: cpu.0, consumed: cpu.1, last_ordinal: TARGET_GENESIS_ORDINAL, _pad: 0 };
             s.pending_net_usage = 0;
             s.pending_cpu_usage = 0;
             s.total_net_weight = total_net_weight;
@@ -5727,6 +5746,40 @@ mod tests {
                 current_used: 5,
             }
         );
+    }
+
+    #[test]
+    fn imported_block_resource_window_rebases_to_new_chain() {
+        let db = ChainDatabase::new().unwrap();
+        let params = ElasticParams {
+            target: 100,
+            max: 1_000,
+            periods: 120,
+            max_multiplier: 1_000,
+            contract: (99, 100),
+            expand: (1_000, 999),
+        };
+        db.seed_resource_config(params, params, 172_800, 172_800)
+            .unwrap();
+        db.hydrate_resource_state(
+            (1_000_000, 5, 399_174_587),
+            (2_000_000, 7, 399_174_587),
+            10,
+            20,
+            30,
+            1_000,
+            2_000,
+        )
+        .unwrap();
+
+        let state = db.resource_state_bytes();
+        assert_eq!(u32::from_le_bytes(state[16..20].try_into().unwrap()), 1);
+        assert_eq!(u32::from_le_bytes(state[36..40].try_into().unwrap()), 1);
+
+        // The first target block must be able to finalize its usage without
+        // unsigned ordinal subtraction wrapping or panicking.
+        db.add_block_usage(11, 13).unwrap();
+        db.process_block_usage(2, params, params).unwrap();
     }
 
     #[test]
