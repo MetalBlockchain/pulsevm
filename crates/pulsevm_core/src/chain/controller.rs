@@ -1,44 +1,87 @@
 use core::fmt;
 use std::{
-    collections::{BTreeSet, HashMap, HashSet, VecDeque},
+    collections::{
+        BTreeSet,
+        HashMap,
+        HashSet,
+        VecDeque,
+    },
     fs,
-    io::{ErrorKind, Write as IoWrite},
+    io::{
+        ErrorKind,
+        Write as IoWrite,
+    },
     path::Path,
     sync::LazyLock,
 };
 
 use crate::{
-    ACTIVE_NAME, MAJORITY_PRODUCERS_PERMISSION_NAME, MINORITY_PRODUCERS_PERMISSION_NAME,
-    PRODS_NAME, PULSE_NAME,
-    block::{BlockStatus, SignedBlock},
+    ACTIVE_NAME,
+    MAJORITY_PRODUCERS_PERMISSION_NAME,
+    MINORITY_PRODUCERS_PERMISSION_NAME,
+    PRODS_NAME,
+    PULSE_NAME,
+    block::{
+        BlockStatus,
+        SignedBlock,
+    },
     chain::{
         apply_context::ApplyContext,
         authority::PermissionLevel,
         authorization_manager::AuthorizationManager,
         block::BlockHeader,
         config::{
-            DELETEAUTH_NAME, LINKAUTH_NAME, NEWACCOUNT_NAME, ONBLOCK_NAME, SETABI_NAME,
-            SETCODE_NAME, UNLINKAUTH_NAME, UPDATEAUTH_NAME, eos_percent,
+            DELETEAUTH_NAME,
+            LINKAUTH_NAME,
+            NEWACCOUNT_NAME,
+            ONBLOCK_NAME,
+            SETABI_NAME,
+            SETCODE_NAME,
+            UNLINKAUTH_NAME,
+            UPDATEAUTH_NAME,
+            eos_percent,
         },
         crypto::PublicKey,
         id::Id,
         mempool::Mempool,
         name::Name,
-        producer_schedule::{ProducerKey, ProducerSchedule},
+        producer_schedule::{
+            ProducerKey,
+            ProducerSchedule,
+        },
         protocol_features::{
-            ProtocolExecutionContext, ProtocolUpgrade, ProtocolUpgradeSchedule, ProtocolVersion,
+            ProtocolExecutionContext,
+            ProtocolUpgrade,
+            ProtocolUpgradeSchedule,
+            ProtocolVersion,
         },
         pulse_contract::{
-            deleteauth, linkauth, newaccount, setabi, setcode, unlinkauth, updateauth,
+            deleteauth,
+            linkauth,
+            newaccount,
+            setabi,
+            setcode,
+            unlinkauth,
+            updateauth,
         },
         resource_limits::ResourceLimitsManager,
-        state_history::{StateHistoryLog, StateHistoryLogCheckpoint},
+        state_history::{
+            StateHistoryLog,
+            StateHistoryLogCheckpoint,
+        },
         state_sync,
         transaction::{
-            PackedTransaction, SignedTransaction, Transaction, TransactionHeader,
-            TransactionReceipt, TransactionTrace,
+            PackedTransaction,
+            SignedTransaction,
+            Transaction,
+            TransactionHeader,
+            TransactionReceipt,
+            TransactionTrace,
         },
-        transaction_context::{TransactionContext, TransactionResult},
+        transaction_context::{
+            TransactionContext,
+            TransactionResult,
+        },
         utils::make_ratio,
         wasm_runtime::WasmRuntime,
     },
@@ -47,18 +90,37 @@ use crate::{
 };
 
 use pulsevm_constants::{
-    BLOCK_CPU_USAGE_AVERAGE_WINDOW_MS, BLOCK_INTERVAL_MS, BLOCK_SIZE_AVERAGE_WINDOW_MS,
+    BLOCK_CPU_USAGE_AVERAGE_WINDOW_MS,
+    BLOCK_INTERVAL_MS,
+    BLOCK_SIZE_AVERAGE_WINDOW_MS,
     MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER,
 };
-use pulsevm_crypto::{Digest, merkle};
+use pulsevm_crypto::{
+    Digest,
+    merkle,
+};
 use pulsevm_database::{
-    Authority, BlockTimestamp, Database, ElasticLimitParameters, Microseconds,
-    PermissionLevelWeight, TimePoint, seconds,
+    Authority,
+    BlockTimestamp,
+    Database,
+    ElasticLimitParameters,
+    Microseconds,
+    PermissionLevelWeight,
+    TimePoint,
+    seconds,
 };
 use pulsevm_error::ChainError;
 use pulsevm_grpc::vm;
-use pulsevm_serialization::{Read, Write};
-use spdlog::{debug, error, info, warn};
+use pulsevm_serialization::{
+    Read,
+    Write,
+};
+use spdlog::{
+    debug,
+    error,
+    info,
+    warn,
+};
 
 pub type ApplyHandlerFn = fn(&mut ApplyContext, &mut Database, &Action) -> Result<(), ChainError>;
 pub type ApplyHandlerMap = HashMap<
@@ -2581,24 +2643,51 @@ impl Controller {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path, str::FromStr, sync::Arc, vec};
+    use std::{
+        fs,
+        path::Path,
+        str::FromStr,
+        sync::Arc,
+        vec,
+    };
 
-    use pulsevm_database::{Authority, KeyWeight, TimePointSec};
-    use pulsevm_proc_macros::{NumBytes, Read, Write};
+    use pulsevm_database::{
+        Authority,
+        KeyWeight,
+        TimePointSec,
+    };
+    use pulsevm_proc_macros::{
+        NumBytes,
+        Read,
+        Write,
+    };
     use pulsevm_serialization::Write;
     use serde_json::json;
     use tempfile::TempDir;
-    use tokio::{runtime, sync::RwLock};
+    use tokio::{
+        runtime,
+        sync::RwLock,
+    };
 
     #[cfg(feature = "arena-shadow")]
     use crate::chain::abi::AbiDefinition;
     use crate::{
         ACTIVE_NAME,
         chain::{
-            asset::{Asset, Symbol},
+            asset::{
+                Asset,
+                Symbol,
+            },
             authority::PermissionLevel,
-            pulse_contract::{NewAccount, SetCode},
-            transaction::{Action, Transaction, TransactionHeader},
+            pulse_contract::{
+                NewAccount,
+                SetCode,
+            },
+            transaction::{
+                Action,
+                Transaction,
+                TransactionHeader,
+            },
         },
         crypto::PrivateKey,
     };
@@ -3354,13 +3443,19 @@ mod tests {
             block::SignedBlockHeader,
             crypto::Signature,
             transaction::{
-                PackedTransaction, TransactionCompression, TransactionReceipt,
-                TransactionReceiptHeader, TransactionStatus,
+                PackedTransaction,
+                TransactionCompression,
+                TransactionReceipt,
+                TransactionReceiptHeader,
+                TransactionStatus,
             },
         };
         use pulsevm_crypto::Bytes;
         use pulsevm_serialization::VarUint32;
-        use std::collections::{BTreeSet, VecDeque};
+        use std::collections::{
+            BTreeSet,
+            VecDeque,
+        };
 
         let hexd32 = |s: &str| -> [u8; 32] { hex::decode(s).unwrap().try_into().unwrap() };
         let header = BlockHeader {
@@ -3722,7 +3817,10 @@ mod tests {
             // Per-table arena root: a fingerprint over one arena table's canonical
             // bytes, recorded/verified table by table so a mismatch names the table.
             let table_root = |arena: &[u8]| -> u64 {
-                use std::hash::{Hash, Hasher};
+                use std::hash::{
+                    Hash,
+                    Hasher,
+                };
                 let mut h = std::collections::hash_map::DefaultHasher::new();
                 arena.hash(&mut h);
                 h.finish()

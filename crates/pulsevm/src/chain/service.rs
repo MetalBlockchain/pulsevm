@@ -2,29 +2,56 @@ use std::{
     collections::BTreeSet,
     str::FromStr,
     sync::{
-        Arc, RwLock as StdRwLock,
-        atomic::{AtomicU64, Ordering},
+        Arc,
+        RwLock as StdRwLock,
+        atomic::{
+            AtomicU64,
+            Ordering,
+        },
     },
     time::Instant,
 };
 
-use jsonrpsee::{proc_macros::rpc, types::ErrorObjectOwned};
+use jsonrpsee::{
+    proc_macros::rpc,
+    types::ErrorObjectOwned,
+};
 use pulsevm_core::{
     ChainError,
     abi::AbiDefinition,
     authorization_manager::AuthorizationManager,
     block::SignedBlock,
-    controller::{Controller, MempoolAdmissionState},
-    crypto::{PublicKey, Signature},
+    controller::{
+        Controller,
+        MempoolAdmissionState,
+    },
+    crypto::{
+        PublicKey,
+        Signature,
+    },
     id::Id,
     mempool::Mempool,
     name::Name,
     protocol_features::PROTOCOL_VERSION,
-    time::{TimePoint, seconds},
-    transaction::{PackedTransaction, Transaction, TransactionCompression},
-    utils::{Base64Bytes, I32Flex, StringFlex},
+    time::{
+        TimePoint,
+        seconds,
+    },
+    transaction::{
+        PackedTransaction,
+        Transaction,
+        TransactionCompression,
+    },
+    utils::{
+        Base64Bytes,
+        I32Flex,
+        StringFlex,
+    },
 };
-use pulsevm_crypto::{Bytes, Digest};
+use pulsevm_crypto::{
+    Bytes,
+    Digest,
+};
 use pulsevm_serialization::Read;
 use serde_json::Value;
 use tokio::sync::RwLock;
@@ -32,10 +59,17 @@ use tonic::async_trait;
 
 use crate::{
     api::{
-        GetCodeHashResponse, GetInfoResponse, GetProducersResponse, GetRawABIResponse,
+        GetCodeHashResponse,
+        GetInfoResponse,
+        GetProducersResponse,
+        GetRawABIResponse,
         IssueTxResponse,
     },
-    chain::{GossipType, Gossipable, NetworkManager},
+    chain::{
+        GossipType,
+        Gossipable,
+        NetworkManager,
+    },
 };
 
 #[rpc(server)]
@@ -734,18 +768,28 @@ impl RpcServer for RpcService {
 mod tests {
     use super::*;
     use pulsevm_core::{
-        authority::{Authority, KeyWeight, PermissionLevel},
+        authority::{
+            Authority,
+            KeyWeight,
+            PermissionLevel,
+        },
         crypto::PrivateKey,
         pulse_contract::NewAccount,
         time::TimePointSec,
-        transaction::{Action, TransactionHeader},
+        transaction::{
+            Action,
+            TransactionHeader,
+        },
     };
     use pulsevm_serialization::Write;
     use serde_json::json;
     use std::time::Duration;
     use tokio::{
         sync::oneshot,
-        time::{sleep, timeout},
+        time::{
+            sleep,
+            timeout,
+        },
     };
 
     const GENESIS_KEY: &str = "PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez";
