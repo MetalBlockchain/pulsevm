@@ -36,7 +36,8 @@ Options:
                            checks (default: 18888)
   --http-probe-bind ADDR   HTTP bind address for the bounded-window probe
                            (default: 127.0.0.1)
-  --wasm-runtime NAME      Override Leap's WASM runtime (for example eos-vm)
+  --wasm-runtime NAME      Leap WASM runtime (default: eos-vm; use eos-vm-oc only
+                           when the source snapshot was produced with that runtime)
   --resource-monitor-space-threshold N
                            Set Leap's filesystem shutdown threshold percentage
                            (default: nodeos default; 0 disables this override)
@@ -69,7 +70,7 @@ timeout_seconds=300
 chain_state_db_size_mb=0
 http_probe_port=18888
 http_probe_bind=127.0.0.1
-wasm_runtime=""
+wasm_runtime="eos-vm"
 resource_monitor_space_threshold=0
 deferred_sidecar=""
 deferred_sidecar_dir=""
