@@ -1481,6 +1481,30 @@ impl ChainDatabase {
         Ok(())
     }
 
+    /// Restores account-metadata sequence counters from the source chainbase
+    /// sidecar. SHiP omits these counters from its row projection.
+    pub fn xpr_import_update_account_metadata(
+        &self,
+        name: u64,
+        recv_sequence: u64,
+        auth_sequence: u64,
+        code_sequence: u64,
+        abi_sequence: u64,
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let id = db
+            .find_by_hash::<AccountMetaRow, AccountMetaRowByName>(&name)?
+            .map(|row| row.id())
+            .ok_or_else(|| DbError::Corrupted("account_metadata sidecar row is missing".into()))?;
+        db.modify::<AccountMetaRow>(id, |row| {
+            row.recv_sequence = recv_sequence;
+            row.auth_sequence = auth_sequence;
+            row.code_sequence = code_sequence;
+            row.abi_sequence = abi_sequence;
+        })?;
+        Ok(())
+    }
+
     /// Whether the database holds an account_metadata row for `name`, and its
     /// privileged flag — for diffing against chainbase.
     pub fn account_metadata_privileged(&self, name: u64) -> Option<bool> {
@@ -2431,6 +2455,26 @@ impl ChainDatabase {
         Ok(())
     }
 
+    /// Restores `permission_usage_object::last_used` from the source-chain
+    /// sidecar. SHiP exposes the permission's update time but not this usage
+    /// singleton's timestamp.
+    pub fn xpr_import_permission_last_used(
+        &self,
+        owner: u64,
+        perm_name: u64,
+        last_used_us: i64,
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let usage_id = db
+            .find_by::<PermissionRow, PermByOwner>(&(owner, perm_name))?
+            .map(|row| row.usage_id)
+            .ok_or_else(|| DbError::Corrupted("permission sidecar row is missing".into()))?;
+        db.modify::<PermissionUsageRow>(ObjectId::new(usage_id), |row| {
+            row.last_used = last_used_us;
+        })?;
+        Ok(())
+    }
+
     // ----- permission_link_object -------------------------------------------
 
     /// Mirrors `link_auth`: updates an existing link's required permission, or
@@ -3080,6 +3124,28 @@ impl ChainDatabase {
             row.code_ref_count = code_ref_count;
             row.vm_type = vm_type;
             row.vm_version = vm_version;
+        })?;
+        Ok(())
+    }
+
+    /// Restores code-object bookkeeping omitted by SHiP (`first_block_used`)
+    /// and verifies the source refcount against the imported code row.
+    pub fn xpr_import_update_code_metadata(
+        &self,
+        code_hash: [u8; 32],
+        vm_type: u8,
+        vm_version: u8,
+        code_ref_count: u64,
+        first_block_used: u32,
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let id = db
+            .find_by::<CodeRow, CodeByHash>(&(code_hash, vm_type, vm_version))?
+            .map(|row| row.id())
+            .ok_or_else(|| DbError::Corrupted("code sidecar row is missing".into()))?;
+        db.modify::<CodeRow>(id, |row| {
+            row.code_ref_count = code_ref_count;
+            row.first_block_used = first_block_used;
         })?;
         Ok(())
     }

@@ -82,12 +82,13 @@ PulseVM's Arena schema.
 
 ## Deferred-transaction sidecar
 
-SHiP's `generated_transaction_v0` rows are not a complete chainbase export:
-they omit `delay_until`, `expiration`, and `published`. A migration with even
-one deferred transaction therefore needs a source-node sidecar captured from
-the **same restored snapshot head** as `chain_state_history.log`. Do not use an RPC
-query from a later head block: it can produce a plausible but inconsistent
-snapshot.
+SHiP is a logical projection, not a complete chainbase export. In addition to
+the `generated_transaction_v0` timestamps (`delay_until`, `expiration`, and
+`published`), it omits account sequence counters, code bookkeeping, and
+permission usage timestamps. The source-node sidecar therefore captures those
+fields from the **same restored snapshot head** as `chain_state_history.log`.
+Do not use an RPC query from a later head block: it can produce a plausible but
+inconsistent snapshot.
 
 The source-side plugin/tool must write `deferred-transactions.json` in this
 lossless format (all numeric XPR names are their underlying `uint64` values;
@@ -97,6 +98,32 @@ times are `time_point` microseconds):
 {
   "version": 1,
   "source_block_id": "<64 lowercase hexadecimal characters>",
+  "source_chain_id": "<64 lowercase hexadecimal characters>",
+  "account_metadata": [
+    {
+      "name": 6138663591592764928,
+      "recv_sequence": 12,
+      "auth_sequence": 8,
+      "code_sequence": 3,
+      "abi_sequence": 2
+    }
+  ],
+  "code": [
+    {
+      "code_hash": "<64 lowercase hexadecimal characters>",
+      "vm_type": 0,
+      "vm_version": 0,
+      "code_ref_count": 1,
+      "first_block_used": 42
+    }
+  ],
+  "permissions": [
+    {
+      "owner": 6138663591592764928,
+      "name": 3617216616731842560,
+      "last_used": 1710000000000000
+    }
+  ],
   "transactions": [
     {
       "sender": 6138663591592764928,
@@ -120,12 +147,14 @@ cargo run -p pulsevm_database --example xpr_import_check -- \
   /data/xpr-migration.snapshot /data/xpr-export/deferred-transactions.json
 ```
 
-The importer verifies the block ID and an exact one-for-one match of every
-SHiP identity/payload before it accepts the sidecar. Its checksum is committed
-to the resulting migration manifest and the complete records are persisted in
-Arena. Startup re-parses every deferred raw transaction and checks its ID
-against the sidecar before allowing the scheduler to run it; an incompatible
-XPR transaction therefore fails before the network begins producing blocks.
+The importer verifies the block and source-chain IDs, requires each supplied
+sidecar table to cover the corresponding SHiP rows exactly, and checks every
+deferred identity/payload one-for-one before it accepts the sidecar. Its
+checksum and source chain ID are committed to the resulting migration manifest;
+the complete records are persisted in Arena. Startup re-parses every deferred
+raw transaction and checks its ID against the sidecar before allowing the
+scheduler to run it; an incompatible XPR transaction therefore fails before
+the network begins producing blocks.
 Once a record's delay has elapsed, it executes outside the mempool without
 re-checking its original signatures. If it is already expired, PulseVM retires
 it with XPR's ID-only `expired` receipt. Otherwise, if execution fails,

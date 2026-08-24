@@ -1906,6 +1906,29 @@ impl Database {
             })
     }
 
+    pub(crate) fn xpr_import_update_account_metadata(
+        &self,
+        name: u64,
+        recv_sequence: u64,
+        auth_sequence: u64,
+        code_sequence: u64,
+        abi_sequence: u64,
+    ) -> Result<(), ChainError> {
+        self.backend
+            .xpr_import_update_account_metadata(
+                name,
+                recv_sequence,
+                auth_sequence,
+                code_sequence,
+                abi_sequence,
+            )
+            .map_err(|e| {
+                ChainError::InternalError(format!(
+                    "XPR import account metadata sidecar {name}: {e:?}"
+                ))
+            })
+    }
+
     /// Insert a code image and its derived source reference count while
     /// hydrating XPR state history.
     pub(crate) fn xpr_import_code(
@@ -1919,6 +1942,27 @@ impl Database {
         self.backend
             .xpr_import_code(code_hash, code, code_ref_count, vm_type, vm_version)
             .map_err(|e| ChainError::InternalError(format!("XPR import code: {e:?}")))
+    }
+
+    pub(crate) fn xpr_import_update_code_metadata(
+        &self,
+        code_hash: [u8; 32],
+        vm_type: u8,
+        vm_version: u8,
+        code_ref_count: u64,
+        first_block_used: u32,
+    ) -> Result<(), ChainError> {
+        self.backend
+            .xpr_import_update_code_metadata(
+                code_hash,
+                vm_type,
+                vm_version,
+                code_ref_count,
+                first_block_used,
+            )
+            .map_err(|e| {
+                ChainError::InternalError(format!("XPR import code sidecar: {e:?}"))
+            })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2019,6 +2063,19 @@ impl Database {
             .create_permission(id, parent, owner, name, last_updated, authority)
             .map_err(|e| ChainError::InternalError(format!("XPR import permission: {e:?}")))?;
         Ok(id)
+    }
+
+    pub(crate) fn xpr_import_permission_last_used(
+        &self,
+        owner: u64,
+        name: u64,
+        last_used: i64,
+    ) -> Result<(), ChainError> {
+        self.backend
+            .xpr_import_permission_last_used(owner, name, last_used)
+            .map_err(|e| {
+                ChainError::InternalError(format!("XPR import permission sidecar: {e:?}"))
+            })
     }
 
     pub(crate) fn xpr_import_permission_link(

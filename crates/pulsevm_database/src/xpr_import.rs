@@ -100,6 +100,10 @@ pub struct MigrationManifest {
     pub version: u16,
     pub source_state_history_sha256: String,
     pub source_block_id: String,
+    /// Source chain identity recorded by the sidecar. The target Pulse chain
+    /// intentionally receives a new chain id, so this is provenance only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_chain_id: Option<String>,
     pub checkpoint_sha256: String,
     pub checkpoint_revision: i64,
     /// When the source contains deferred transactions, this commits the
@@ -123,6 +127,7 @@ impl MigrationManifest {
             version: Self::VERSION,
             source_state_history_sha256: hex::encode(Digest::hash(source_state_history).as_bytes()),
             source_block_id: hex::encode(source_block_id),
+            source_chain_id: None,
             checkpoint_sha256: hex::encode(Digest::hash(checkpoint).as_bytes()),
             checkpoint_revision,
             deferred_transaction_sidecar_sha256: None,
@@ -137,6 +142,12 @@ impl MigrationManifest {
     pub fn with_deferred_transaction_sidecar(mut self, sidecar: &[u8]) -> Self {
         self.deferred_transaction_sidecar_sha256 =
             Some(hex::encode(Digest::hash(sidecar).as_bytes()));
+        self
+    }
+
+    /// Record the source chain identity independently of the target chain id.
+    pub fn with_source_chain_id(mut self, source_chain_id: [u8; 32]) -> Self {
+        self.source_chain_id = Some(hex::encode(source_chain_id));
         self
     }
 
@@ -194,8 +205,48 @@ impl std::error::Error for XprImportError {}
 pub struct DeferredTransactionSidecar {
     pub version: u16,
     pub source_block_id: String,
+    /// Optional source-chain identity and omitted chainbase fields. Version 1
+    /// sidecars produced before full-state parity only contain transactions;
+    /// current exporters populate these arrays so migration can preserve the
+    /// fields that SHiP intentionally projects away.
+    #[serde(default)]
+    pub source_chain_id: Option<String>,
+    #[serde(default)]
+    pub account_metadata: Vec<AccountMetadataSidecarRow>,
+    #[serde(default)]
+    pub code: Vec<CodeSidecarRow>,
+    #[serde(default)]
+    pub permissions: Vec<PermissionSidecarRow>,
     #[serde(default)]
     pub transactions: Vec<DeferredTransactionSidecarRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccountMetadataSidecarRow {
+    pub name: u64,
+    pub recv_sequence: u64,
+    pub auth_sequence: u64,
+    pub code_sequence: u64,
+    pub abi_sequence: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CodeSidecarRow {
+    pub code_hash: String,
+    pub vm_type: u8,
+    pub vm_version: u8,
+    pub code_ref_count: u64,
+    pub first_block_used: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PermissionSidecarRow {
+    pub owner: u64,
+    pub name: u64,
+    pub last_used: i64,
 }
 
 /// One complete XPR chainbase `generated_transaction_object` record.
@@ -232,6 +283,33 @@ impl DeferredTransactionSidecar {
             )));
         }
         decode_block_id(&sidecar.source_block_id)?;
+        if let Some(source_chain_id) = &sidecar.source_chain_id {
+            decode_block_id(source_chain_id)
+                .map_err(|error| bad(format!("invalid source chain id: {error}")))?;
+        }
+        let mut metadata_names = HashSet::new();
+        for row in &sidecar.account_metadata {
+            if !metadata_names.insert(row.name) {
+                return Err(bad(format!(
+                    "duplicate account_metadata sidecar row for {}",
+                    row.name
+                )));
+            }
+        }
+        let mut code_keys = HashSet::new();
+        for row in &sidecar.code {
+            let hash = decode_block_id(&row.code_hash)
+                .map_err(|error| bad(format!("invalid code sidecar hash: {error}")))?;
+            if !code_keys.insert((hash, row.vm_type, row.vm_version)) {
+                return Err(bad("duplicate code sidecar row"));
+            }
+        }
+        let mut permission_keys = HashSet::new();
+        for row in &sidecar.permissions {
+            if !permission_keys.insert((row.owner, row.name)) {
+                return Err(bad("duplicate permission sidecar row"));
+            }
+        }
         for row in &sidecar.transactions {
             sidecar_key(row)?;
         }
@@ -298,7 +376,7 @@ pub fn hydrate_full_state_with_deferred_transactions(
         // importer enforces its own dependency order so an equivalent stream
         // with tables rearranged cannot create children before their parents.
         for row in &rows {
-            if let PortableRow::GlobalProperty { config } = row {
+            if let PortableRow::GlobalProperty { config, .. } = row {
                 db.set_global_properties(config).map_err(database_error)?;
                 summary.global_properties += 1;
             }
@@ -476,6 +554,36 @@ pub fn hydrate_full_state_with_deferred_transactions(
                 summary.resource_configs += 1;
             }
         }
+        // SHiP omits several chainbase bookkeeping fields. Apply the verified
+        // source-node sidecar after the base rows exist, still inside the same
+        // undo session so a missing or malformed row cannot partially commit.
+        if let Some(sidecar) = deferred_transactions {
+            for row in &sidecar.account_metadata {
+                db.xpr_import_update_account_metadata(
+                    row.name,
+                    row.recv_sequence,
+                    row.auth_sequence,
+                    row.code_sequence,
+                    row.abi_sequence,
+                )
+                .map_err(database_error)?;
+            }
+            for row in &sidecar.code {
+                let code_hash = decode_block_id(&row.code_hash)?;
+                db.xpr_import_update_code_metadata(
+                    code_hash,
+                    row.vm_type,
+                    row.vm_version,
+                    row.code_ref_count,
+                    row.first_block_used,
+                )
+                .map_err(database_error)?;
+            }
+            for row in &sidecar.permissions {
+                db.xpr_import_permission_last_used(row.owner, row.name, row.last_used)
+                    .map_err(database_error)?;
+            }
+        }
         for row in rows {
             match row {
                 PortableRow::Account { .. }
@@ -609,7 +717,10 @@ enum PortableRow {
     /// XPR's producer schedule is deliberately not carried over: the imported
     /// database starts a new Pulse chain with its own producer schedule. Its
     /// chain execution configuration is retained in Arena.
-    GlobalProperty { config: ChainConfigV0 },
+    GlobalProperty {
+        config: ChainConfigV0,
+        source_chain_id: [u8; 32],
+    },
     /// Source activation history is retained for lossless state-history export,
     /// but not replayed into the independent Pulse runtime.
     ProtocolState { features: Vec<([u8; 32], u32)> },
@@ -798,6 +909,7 @@ fn validate_code_links(
     deferred_transactions: Option<&DeferredTransactionSidecar>,
 ) -> Result<(), XprImportError> {
     validate_deferred_transactions(rows, source_block_id, deferred_transactions)?;
+    validate_sidecar_fields(rows, deferred_transactions)?;
     let mut code_keys = HashSet::new();
     for row in rows {
         if let PortableRow::Code {
@@ -824,6 +936,92 @@ fn validate_code_links(
                     "account metadata for {name} references code absent from the full-state export"
                 )));
             }
+        }
+    }
+    Ok(())
+}
+
+fn validate_sidecar_fields(
+    rows: &[PortableRow],
+    sidecar: Option<&DeferredTransactionSidecar>,
+) -> Result<(), XprImportError> {
+    let Some(sidecar) = sidecar else {
+        return Ok(());
+    };
+
+    if let Some(source_chain_id) = &sidecar.source_chain_id {
+        let expected = decode_block_id(source_chain_id)
+            .map_err(|error| bad(format!("invalid source chain id: {error}")))?;
+        let mut seen = false;
+        for row in rows {
+            if let PortableRow::GlobalProperty { source_chain_id, .. } = row {
+                seen = true;
+                if *source_chain_id != expected {
+                    return Err(bad("sidecar source chain id does not match global_property"));
+                }
+            }
+        }
+        if !seen {
+            return Err(bad(
+                "sidecar source chain id supplied but full-state export has no global_property",
+            ));
+        }
+    }
+
+    let require_complete_tables = sidecar.source_chain_id.is_some();
+    if require_complete_tables || !sidecar.account_metadata.is_empty() {
+        let expected: HashSet<u64> = rows
+            .iter()
+            .filter_map(|row| match row {
+                PortableRow::AccountMetadata { name, .. } => Some(*name),
+                _ => None,
+            })
+            .collect();
+        let actual: HashSet<u64> = sidecar.account_metadata.iter().map(|row| row.name).collect();
+        if actual != expected {
+            return Err(bad("account_metadata sidecar does not exactly cover the SHiP rows"));
+        }
+    }
+
+    if require_complete_tables || !sidecar.code.is_empty() {
+        let expected: HashSet<([u8; 32], u8, u8)> = rows
+            .iter()
+            .filter_map(|row| match row {
+                PortableRow::Code {
+                    hash,
+                    vm_type,
+                    vm_version,
+                    ..
+                } => Some((*hash, *vm_type, *vm_version)),
+                _ => None,
+            })
+            .collect();
+        let mut actual = HashSet::new();
+        for row in &sidecar.code {
+            let hash = decode_block_id(&row.code_hash)
+                .map_err(|error| bad(format!("invalid code sidecar hash: {error}")))?;
+            actual.insert((hash, row.vm_type, row.vm_version));
+        }
+        if actual != expected {
+            return Err(bad("code sidecar does not exactly cover the SHiP rows"));
+        }
+    }
+
+    if require_complete_tables || !sidecar.permissions.is_empty() {
+        let expected: HashSet<(u64, u64)> = rows
+            .iter()
+            .filter_map(|row| match row {
+                PortableRow::Permission { owner, name, .. } => Some((*owner, *name)),
+                _ => None,
+            })
+            .collect();
+        let actual: HashSet<(u64, u64)> = sidecar
+            .permissions
+            .iter()
+            .map(|row| (row.owner, row.name))
+            .collect();
+        if actual != expected {
+            return Err(bad("permission sidecar does not exactly cover the SHiP rows"));
         }
     }
     Ok(())
@@ -1020,18 +1218,29 @@ fn decode_global_property(bytes: &[u8]) -> Result<PortableRow, XprImportError> {
     // must consume the row exactly, so malformed rows cannot be accepted by a
     // permissive fallback.
     let modern_error = match decode_global_property_layout(row, true, false) {
-        Ok(config) => return Ok(PortableRow::GlobalProperty { config }),
+        Ok((config, source_chain_id)) => {
+            return Ok(PortableRow::GlobalProperty {
+                config,
+                source_chain_id,
+            })
+        }
         Err(error) => error,
     };
     let mut row = RowCursor::new(bytes);
     row.varuint()?;
-    if let Ok(config) = decode_global_property_layout(row, true, true) {
-        return Ok(PortableRow::GlobalProperty { config });
+    if let Ok((config, source_chain_id)) = decode_global_property_layout(row, true, true) {
+        return Ok(PortableRow::GlobalProperty {
+            config,
+            source_chain_id,
+        });
     }
     let mut row = RowCursor::new(bytes);
     row.varuint()?;
-    if let Ok(config) = decode_global_property_layout(row, false, true) {
-        return Ok(PortableRow::GlobalProperty { config });
+    if let Ok((config, source_chain_id)) = decode_global_property_layout(row, false, true) {
+        return Ok(PortableRow::GlobalProperty {
+            config,
+            source_chain_id,
+        });
     }
     Err(modern_error)
 }
@@ -1040,7 +1249,7 @@ fn decode_global_property_layout(
     mut row: RowCursor<'_>,
     has_producer_schedule: bool,
     legacy_config_fields: bool,
-) -> Result<ChainConfigV0, XprImportError> {
+) -> Result<(ChainConfigV0, [u8; 32]), XprImportError> {
     if has_producer_schedule {
         // proposed_schedule_block_num is optional<uint32>.
         if row.bool()? {
@@ -1093,7 +1302,7 @@ fn decode_global_property_layout(
         }
     }
 
-    row.fixed::<32>()?; // source chain id; the target has a new chain id
+    let source_chain_id = row.fixed::<32>()?;
     // `wasm_configuration` is a binary extension in Leap 5: it has no
     // presence boolean, and is simply absent in the XPR-core pinned format.
     if row.remaining() != 0 {
@@ -1108,7 +1317,7 @@ fn decode_global_property_layout(
         }
     }
     row.finish()?;
-    Ok(config)
+    Ok((config, source_chain_id))
 }
 
 fn skip_producer_authority_schedule(row: &mut RowCursor<'_>) -> Result<(), XprImportError> {
@@ -1887,14 +2096,14 @@ mod tests {
     #[test]
     fn accepts_current_and_legacy_global_property_rows() {
         let current = hex::decode("01000000000000010000100000000000e8030000000008000c000000f40100001400000064000000400d0300e8030000f049020064000000100e00005802000080533b000010000004000600000100009371fb05f023fcc78b23923d70bdfe6642cdf1956d120045bcd1371e05c961a90000040000000400000020000000000100002000000004000000200000000040010000400110020000fb000000").unwrap();
-        let PortableRow::GlobalProperty { config } = decode_global_property(&current).unwrap() else {
+        let PortableRow::GlobalProperty { config, .. } = decode_global_property(&current).unwrap() else {
             panic!("expected global_property row");
         };
         assert_eq!(config.deferred_trx_expiration_window, 600);
         assert_eq!(config.max_transaction_delay, 3_888_000);
 
         let legacy = hex::decode("01010000100000000000e8030000000008000c000000f40100001400000064000000005ed0b2c409000000ca9a3ba0860100100e000000100000060006000001000098f998d9010e744bddcef4a12ac306b93919537caa232ca19de2ed50322bb6fa0000040000000400000020000000000100002000000004000000200000000040010000400110020000fb000000").unwrap();
-        let PortableRow::GlobalProperty { config } = decode_global_property(&legacy).unwrap() else {
+        let PortableRow::GlobalProperty { config, .. } = decode_global_property(&legacy).unwrap() else {
             panic!("expected legacy global_property row");
         };
         assert_eq!(config.deferred_trx_expiration_window, 0);
@@ -2114,6 +2323,153 @@ mod tests {
             db.arena_idx_long_double_payer(code, scope, table, 71),
             Some(payer)
         );
+    }
+
+    #[test]
+    fn imports_sidecar_bookkeeping_fields_after_base_rows() {
+        let account = 11u64;
+        let code_hash = [0x5au8; 32];
+        let mut account_row = vec![0];
+        account_row.extend_from_slice(&account.to_le_bytes());
+        account_row.extend_from_slice(&7u32.to_le_bytes());
+        bytes(&mut account_row, &[]);
+
+        let mut metadata_row = vec![0];
+        metadata_row.extend_from_slice(&account.to_le_bytes());
+        metadata_row.push(0);
+        metadata_row.extend_from_slice(&0i64.to_le_bytes());
+        metadata_row.push(1);
+        metadata_row.extend_from_slice(&[0, 0]);
+        metadata_row.extend_from_slice(&code_hash);
+
+        let mut code_row = vec![0, 0, 0];
+        code_row.extend_from_slice(&code_hash);
+        bytes(&mut code_row, &[0, 97, 115, 109]);
+
+        let mut permission_row = vec![0];
+        permission_row.extend_from_slice(&account.to_le_bytes());
+        permission_row.extend_from_slice(&111u64.to_le_bytes());
+        permission_row.extend_from_slice(&0u64.to_le_bytes());
+        permission_row.extend_from_slice(&0i64.to_le_bytes());
+        permission_row.extend_from_slice(&0u32.to_le_bytes());
+        permission_row.extend_from_slice(&[0, 0, 0]);
+
+        let entry = StateHistoryEntry {
+            magic: 0,
+            block_id: [0; 32],
+            deltas: vec![
+                delta("account", account_row),
+                delta("account_metadata", metadata_row),
+                delta("code", code_row),
+                delta("permission", permission_row),
+            ],
+        };
+        let sidecar = DeferredTransactionSidecar {
+            version: 1,
+            source_block_id: hex::encode(entry.block_id),
+            source_chain_id: None,
+            account_metadata: vec![AccountMetadataSidecarRow {
+                name: account,
+                recv_sequence: 7,
+                auth_sequence: 8,
+                code_sequence: 9,
+                abi_sequence: 10,
+            }],
+            code: vec![CodeSidecarRow {
+                code_hash: hex::encode(code_hash),
+                vm_type: 0,
+                vm_version: 0,
+                code_ref_count: 1,
+                first_block_used: 399_000_123,
+            }],
+            permissions: vec![PermissionSidecarRow {
+                owner: account,
+                name: 111,
+                last_used: 123_456,
+            }],
+            transactions: vec![],
+        };
+        let dir = TempDir::new().unwrap();
+        let mut db = Database::new(dir.path().to_str().unwrap(), 64 * 1024 * 1024).unwrap();
+
+        hydrate_full_state_with_deferred_transactions(&mut db, &entry, Some(&sidecar)).unwrap();
+        let metadata = db.arena_account_metadata(account).unwrap();
+        assert_eq!(metadata.recv_sequence, 7);
+        assert_eq!(metadata.auth_sequence, 8);
+        assert_eq!(metadata.code_sequence, 9);
+        assert_eq!(metadata.abi_sequence, 10);
+        assert_eq!(
+            db.read()
+                .unwrap()
+                .permission_last_used_by_name(account, 111)
+                .unwrap(),
+            123_456
+        );
+    }
+
+    #[test]
+    fn rejects_sidecar_bookkeeping_that_does_not_cover_source_rows() {
+        let sidecar = DeferredTransactionSidecar {
+            version: 1,
+            source_block_id: hex::encode([0; 32]),
+            source_chain_id: None,
+            account_metadata: vec![AccountMetadataSidecarRow {
+                name: 99,
+                recv_sequence: 0,
+                auth_sequence: 0,
+                code_sequence: 0,
+                abi_sequence: 0,
+            }],
+            code: vec![],
+            permissions: vec![],
+            transactions: vec![],
+        };
+        let rows = vec![PortableRow::AccountMetadata {
+            name: 11,
+            privileged: false,
+            last_code_update: 0,
+            code: None,
+        }];
+        let error = validate_sidecar_fields(&rows, Some(&sidecar)).unwrap_err();
+        assert!(error.to_string().contains("account_metadata sidecar"));
+    }
+
+    #[test]
+    fn rejects_sidecar_source_chain_id_mismatch() {
+        let sidecar = DeferredTransactionSidecar {
+            version: 1,
+            source_block_id: hex::encode([0; 32]),
+            source_chain_id: Some(hex::encode([2; 32])),
+            account_metadata: vec![],
+            code: vec![],
+            permissions: vec![],
+            transactions: vec![],
+        };
+        let config = ChainConfigV0 {
+            max_block_net_usage: 0,
+            target_block_net_usage_pct: 0,
+            max_transaction_net_usage: 0,
+            base_per_transaction_net_usage: 0,
+            net_usage_leeway: 0,
+            context_free_discount_net_usage_num: 0,
+            context_free_discount_net_usage_den: 0,
+            max_block_cpu_usage: 0,
+            target_block_cpu_usage_pct: 0,
+            max_transaction_cpu_usage: 0,
+            min_transaction_cpu_usage: 0,
+            max_transaction_lifetime: 0,
+            deferred_trx_expiration_window: 0,
+            max_transaction_delay: 0,
+            max_inline_action_size: 0,
+            max_inline_action_depth: 0,
+            max_authority_depth: 0,
+        };
+        let rows = vec![PortableRow::GlobalProperty {
+            config,
+            source_chain_id: [1; 32],
+        }];
+        let error = validate_sidecar_fields(&rows, Some(&sidecar)).unwrap_err();
+        assert!(error.to_string().contains("source chain id"));
     }
 
     #[test]

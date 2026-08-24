@@ -1,6 +1,9 @@
 #include <eosio/deferred_transaction_sidecar_plugin/deferred_transaction_sidecar_plugin.hpp>
 
+#include <eosio/chain/account_object.hpp>
+#include <eosio/chain/code_object.hpp>
 #include <eosio/chain/generated_transaction_object.hpp>
+#include <eosio/chain/permission_object.hpp>
 
 #include <algorithm>
 #include <filesystem>
@@ -41,10 +44,56 @@ public:
       std::ofstream output(path.string(), std::ios::out | std::ios::trunc);
       EOS_ASSERT(output, chain::plugin_exception, "cannot open deferred sidecar ${p}", ("p", path.string()));
       output << "{\"version\":1,\"source_block_id\":\"" << source_block_id.str()
-             << "\",\"transactions\":[";
+             << "\",\"source_chain_id\":\"" << chain.get_chain_id().str()
+             << "\",\"account_metadata\":[";
+
+      bool first = true;
+      const auto& metadata = chain.db().get_index<chain::account_metadata_index>();
+      for (const auto& row : metadata.indices()) {
+         if (!first)
+            output << ',';
+         first = false;
+         output << "{\"name\":" << row.name.to_uint64_t()
+                << ",\"recv_sequence\":" << row.recv_sequence
+                << ",\"auth_sequence\":" << row.auth_sequence
+                << ",\"code_sequence\":" << row.code_sequence
+                << ",\"abi_sequence\":" << row.abi_sequence << "}";
+      }
+      output << "],\"code\":[";
+
+      first = true;
+      const auto& code = chain.db().get_index<chain::code_index>();
+      for (const auto& row : code.indices()) {
+         if (!first)
+            output << ',';
+         first = false;
+         output << "{\"code_hash\":\"" << row.code_hash.str()
+                << "\",\"vm_type\":" << static_cast<unsigned>(row.vm_type)
+                << ",\"vm_version\":" << static_cast<unsigned>(row.vm_version)
+                << ",\"code_ref_count\":" << row.code_ref_count
+                << ",\"first_block_used\":" << row.first_block_used << "}";
+      }
+      output << "],\"permissions\":[";
+
+      first = true;
+      const auto& permissions = chain.db().get_index<chain::permission_index>();
+      const auto& usages = chain.db().get_index<chain::permission_usage_index>();
+      for (const auto& row : permissions.indices()) {
+         if (!first)
+            output << ',';
+         first = false;
+         const auto usage = usages.find(row.usage_id);
+         EOS_ASSERT(usage != usages.end(), chain::plugin_exception,
+                    "permission ${owner}/${name} has no usage row",
+                    ("owner", row.owner.to_uint64_t())("name", row.name.to_uint64_t()));
+         output << "{\"owner\":" << row.owner.to_uint64_t()
+                << ",\"name\":" << row.name.to_uint64_t()
+                << ",\"last_used\":" << usage->last_used.time_since_epoch().count() << "}";
+      }
+      output << "],\"transactions\":[";
 
       const auto& rows = chain.db().get_index<chain::generated_transaction_multi_index>();
-      bool first = true;
+      first = true;
       for (const auto& row : rows.indices()) {
          if (!first)
             output << ',';
