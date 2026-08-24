@@ -55,3 +55,7 @@ wat = "1"
 [[bench]]
 name = "transfer"
 harness = false
+
+[[bench]]
+name = "mempool_pruning"
+harness = false

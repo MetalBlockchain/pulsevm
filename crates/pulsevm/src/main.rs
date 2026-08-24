@@ -4,90 +4,43 @@ mod state_history;
 
 use pulsevm_core::{
     ChainError,
-    config::{
-        PLUGIN_VERSION,
-        VERSION,
-    },
+    config::{PLUGIN_VERSION, VERSION},
     controller::Controller,
-    id::{
-        Id,
-        NodeId,
-    },
+    id::{Id, NodeId},
     mempool::Mempool,
     transaction::PackedTransaction,
 };
 use pulsevm_grpc::{
     http::{
-        self,
-        Element,
-        http_server::{
-            Http,
-            HttpServer,
-        },
+        self, Element,
+        http_server::{Http, HttpServer},
     },
     vm::{
-        self,
-        Handler,
-        ParseBlockResponse,
-        runtime::{
-            InitializeRequest,
-            runtime_client::RuntimeClient,
-        },
-        vm_server::{
-            Vm,
-            VmServer,
-        },
+        self, Handler, ParseBlockResponse,
+        runtime::{InitializeRequest, runtime_client::RuntimeClient},
+        vm_server::{Vm, VmServer},
     },
 };
-use pulsevm_serialization::{
-    Read,
-    Write,
-};
-use spdlog::{
-    debug,
-    error,
-    info,
-    warn,
-};
+use pulsevm_serialization::{Read, Write};
+use spdlog::{debug, error, info, warn};
 use std::{
-    net::{
-        SocketAddr,
-        TcpListener,
-    },
-    sync::{
-        Arc,
-        atomic::AtomicBool,
-    },
-    time::{
-        Duration,
-        Instant,
-    },
+    net::{SocketAddr, TcpListener},
+    sync::{Arc, atomic::AtomicBool},
+    time::{Duration, Instant},
 };
 use tokio::{
     net::TcpListener as TokioTcpListener,
-    signal::unix::{
-        SignalKind,
-        signal,
-    },
+    signal::unix::{SignalKind, signal},
     sync::RwLock,
 };
 use tokio_util::sync::CancellationToken;
 use tonic::{
-    Request,
-    Response,
-    Status,
-    transport::{
-        Server,
-        server::TcpIncoming,
-    },
+    Request, Response, Status,
+    transport::{Server, server::TcpIncoming},
 };
 
 use crate::{
-    chain::{
-        BlockTimer,
-        GossipType,
-        Gossipable,
-    },
+    chain::{BlockTimer, GossipType, Gossipable},
     state_history::StateHistoryServer,
 };
 
@@ -293,6 +246,8 @@ impl Vm for VirtualMachine {
                 "could not initialize controller: {error}"
             )));
         }
+        self.rpc_service
+            .set_admission_state(controller.mempool_admission_state());
 
         let network_manager = Arc::clone(&self.network_manager);
         let mut network_manager = network_manager.write().await;
@@ -449,11 +404,7 @@ impl Vm for VirtualMachine {
         _request: Request<vm::BuildBlockRequest>,
     ) -> Result<tonic::Response<vm::BuildBlockResponse>, Status> {
         debug!("build_block called, building block...");
-        let controller = self.controller.clone();
-        let mut controller = controller.write().await;
-        let mempool = self.mempool.clone();
-        let mut mempool = mempool.write().await;
-        let block = match controller.build_block(&mut mempool).await {
+        let block = match self.rpc_service.build_block().await {
             Ok(block) => block,
             Err(error) if error.is_fatal_consistency() => {
                 abort_on_fatal_consistency("block building", &error)
@@ -552,9 +503,12 @@ impl Vm for VirtualMachine {
         request: Request<vm::BlockVerifyRequest>,
     ) -> Result<tonic::Response<vm::BlockVerifyResponse>, Status> {
         debug!("block_verify called, verifying block...");
-        let mut controller = self.controller.write().await;
-        let mut mempool = self.mempool.write().await;
-        let block = match controller.parse_block(&request.get_ref().bytes) {
+        let block = match self
+            .controller
+            .read()
+            .await
+            .parse_block(&request.get_ref().bytes)
+        {
             Ok(block) => block,
             Err(e) => {
                 warn!("failed parsing block for verification: {}", e);
@@ -563,8 +517,9 @@ impl Vm for VirtualMachine {
             }
         };
 
-        // Verify the block
-        match controller.verify_block(&block, &mut mempool).await {
+        let verify_result = self.rpc_service.verify_block(&block).await;
+
+        match verify_result {
             Ok(_) => {
                 debug!(
                     "block verified with id {}, returning from block_verify",

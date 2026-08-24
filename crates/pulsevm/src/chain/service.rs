@@ -1,46 +1,30 @@
 use std::{
     collections::BTreeSet,
     str::FromStr,
-    sync::Arc,
+    sync::{
+        Arc, RwLock as StdRwLock,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Instant,
 };
 
-use jsonrpsee::{
-    proc_macros::rpc,
-    types::ErrorObjectOwned,
-};
+use jsonrpsee::{proc_macros::rpc, types::ErrorObjectOwned};
 use pulsevm_core::{
     ChainError,
     abi::AbiDefinition,
     authorization_manager::AuthorizationManager,
     block::SignedBlock,
-    controller::Controller,
-    crypto::{
-        PublicKey,
-        Signature,
-    },
+    controller::{Controller, MempoolAdmissionState},
+    crypto::{PublicKey, Signature},
     id::Id,
     mempool::Mempool,
     name::Name,
     protocol_features::PROTOCOL_VERSION,
-    time::{
-        TimePoint,
-        seconds,
-    },
-    transaction::{
-        PackedTransaction,
-        Transaction,
-        TransactionCompression,
-    },
-    utils::{
-        Base64Bytes,
-        I32Flex,
-        StringFlex,
-    },
+    time::{TimePoint, seconds},
+    transaction::{PackedTransaction, Transaction, TransactionCompression},
+    utils::{Base64Bytes, I32Flex, StringFlex},
 };
-use pulsevm_crypto::{
-    Bytes,
-    Digest,
-};
+use pulsevm_crypto::{Bytes, Digest};
 use pulsevm_serialization::Read;
 use serde_json::Value;
 use tokio::sync::RwLock;
@@ -48,17 +32,10 @@ use tonic::async_trait;
 
 use crate::{
     api::{
-        GetCodeHashResponse,
-        GetInfoResponse,
-        GetProducersResponse,
-        GetRawABIResponse,
+        GetCodeHashResponse, GetInfoResponse, GetProducersResponse, GetRawABIResponse,
         IssueTxResponse,
     },
-    chain::{
-        GossipType,
-        Gossipable,
-        NetworkManager,
-    },
+    chain::{GossipType, Gossipable, NetworkManager},
 };
 
 #[rpc(server)]
@@ -160,7 +137,54 @@ pub trait Rpc {
 pub struct RpcService {
     mempool: Arc<RwLock<Mempool>>,
     controller: Arc<RwLock<Controller>>,
+    admission_state: Arc<StdRwLock<Option<MempoolAdmissionState>>>,
+    admission_metrics: Arc<AdmissionMetrics>,
     network_manager: Arc<RwLock<NetworkManager>>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AdmissionMetricsSnapshot {
+    pub state_preflights: u64,
+    pub fallback_controller_preflights: u64,
+    pub controller_lock_wait_nanos: u64,
+    pub max_controller_lock_wait_nanos: u64,
+    pub mempool_lock_wait_nanos: u64,
+    pub max_mempool_lock_wait_nanos: u64,
+}
+
+#[derive(Default)]
+struct AdmissionMetrics {
+    state_preflights: AtomicU64,
+    fallback_controller_preflights: AtomicU64,
+    controller_lock_wait_nanos: AtomicU64,
+    max_controller_lock_wait_nanos: AtomicU64,
+    mempool_lock_wait_nanos: AtomicU64,
+    max_mempool_lock_wait_nanos: AtomicU64,
+}
+
+impl AdmissionMetrics {
+    fn record_mempool_wait(&self, started: Instant) {
+        let waited = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        self.mempool_lock_wait_nanos
+            .fetch_add(waited, Ordering::Relaxed);
+        self.max_mempool_lock_wait_nanos
+            .fetch_max(waited, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> AdmissionMetricsSnapshot {
+        AdmissionMetricsSnapshot {
+            state_preflights: self.state_preflights.load(Ordering::Relaxed),
+            fallback_controller_preflights: self
+                .fallback_controller_preflights
+                .load(Ordering::Relaxed),
+            controller_lock_wait_nanos: self.controller_lock_wait_nanos.load(Ordering::Relaxed),
+            max_controller_lock_wait_nanos: self
+                .max_controller_lock_wait_nanos
+                .load(Ordering::Relaxed),
+            mempool_lock_wait_nanos: self.mempool_lock_wait_nanos.load(Ordering::Relaxed),
+            max_mempool_lock_wait_nanos: self.max_mempool_lock_wait_nanos.load(Ordering::Relaxed),
+        }
+    }
 }
 
 impl RpcService {
@@ -172,8 +196,24 @@ impl RpcService {
         RpcService {
             mempool,
             controller,
+            admission_state: Arc::new(StdRwLock::new(None)),
+            admission_metrics: Arc::new(AdmissionMetrics::default()),
             network_manager,
         }
+    }
+
+    /// Install the current controller-backed preflight view after controller
+    /// initialization. Its database handle is internally synchronized, so
+    /// admission no longer waits for the controller's exclusive block lock.
+    pub fn set_admission_state(&self, state: MempoolAdmissionState) {
+        *self
+            .admission_state
+            .write()
+            .expect("admission state lock poisoned") = Some(state);
+    }
+
+    pub fn admission_metrics(&self) -> AdmissionMetricsSnapshot {
+        self.admission_metrics.snapshot()
     }
 
     pub async fn handle_api_request(
@@ -195,36 +235,82 @@ impl RpcService {
     /// `Ok(true)` if it was newly added, `Ok(false)` if it was already known (or
     /// the mempool is full), and `Err` if it failed validation and must not be
     /// propagated. Shared by the RPC issue path and the peer-gossip path so both
-    /// apply the same admission rules — a transaction only enters the mempool
-    /// after it executes cleanly, and the newly-added flag lets the caller relay
+    /// apply the same admission rules. Admission validates transaction shape,
+    /// lifetime, referenced accounts, and authorization, but defers action
+    /// execution to block production. The newly-added flag lets the caller relay
     /// exactly once, which stops gossip from looping.
     pub async fn admit_transaction(
         &self,
         packed_trx: PackedTransaction,
     ) -> Result<bool, ChainError> {
-        // Fast path: a transaction we already hold has been validated and
-        // relayed once already, so skip the expensive execute-and-revert and
-        // report it as not newly added. This is what absorbs re-gossip of a
-        // transaction already in flight.
-        if self.mempool.read().await.contains(packed_trx.id()) {
-            return Ok(false);
+        // Expired transactions must not occupy a bounded mempool or make a
+        // re-gossiped transaction look like a duplicate. Do this before the
+        // membership check so a newly arrived transaction can reclaim stale
+        // capacity immediately.
+        let now = TimePoint::now();
+        let expires_present = {
+            let lock_started = Instant::now();
+            let mempool = self.mempool.read().await;
+            self.admission_metrics.record_mempool_wait(lock_started);
+
+            // Fast path: a transaction we already hold has been validated and
+            // relayed once already, so skip preflight and report it as not newly
+            // added. This is what absorbs re-gossip of a transaction already in
+            // flight.
+            if mempool.contains(packed_trx.id()) {
+                return Ok(false);
+            }
+            mempool.has_expired(&now)
+        };
+        if expires_present {
+            let lock_started = Instant::now();
+            let mut mempool = self.mempool.write().await;
+            self.admission_metrics.record_mempool_wait(lock_started);
+            mempool.prune_expired(&now);
+            if mempool.contains(packed_trx.id()) {
+                return Ok(false);
+            }
         }
 
-        // Execution is synchronous, with blocking database/wasm work and no await points,
-        // so run it on the blocking pool and take the lock with blocking_write()
-        // instead of holding the async lock on a runtime worker, which would
-        // stall every other handler. push_transaction reverts the database, so
-        // this is validation only — nothing is committed.
+        // Preflight is synchronous, performs database reads and signature
+        // recovery, and has no await points. Run it on the blocking pool rather
+        // than holding an async read lock on a runtime worker. It does not
+        // execute WASM or open an undo session.
+        let admission_state = self
+            .admission_state
+            .read()
+            .expect("admission state lock poisoned")
+            .clone();
         let controller = self.controller.clone();
+        let metrics = self.admission_metrics.clone();
         let trx_for_exec = packed_trx.clone();
         let execution = tokio::task::spawn_blocking(move || {
-            let mut controller = controller.blocking_write();
             let pending_block_timestamp = TimePoint::now().into();
-            controller.push_transaction(
-                &trx_for_exec,
-                &pending_block_timestamp,
-                &pulsevm_core::block::BlockStatus::Verifying,
-            )
+            match admission_state {
+                Some(state) => {
+                    metrics.state_preflights.fetch_add(1, Ordering::Relaxed);
+                    state.validate_transaction(&trx_for_exec, &pending_block_timestamp)
+                }
+                // Tests and callers that construct RpcService before controller
+                // initialization retain the safe, serialized fallback until the
+                // controller installs its read-only admission state.
+                None => {
+                    metrics
+                        .fallback_controller_preflights
+                        .fetch_add(1, Ordering::Relaxed);
+                    let lock_started = Instant::now();
+                    let controller = controller.blocking_read();
+                    let waited = lock_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                    metrics
+                        .controller_lock_wait_nanos
+                        .fetch_add(waited, Ordering::Relaxed);
+                    metrics
+                        .max_controller_lock_wait_nanos
+                        .fetch_max(waited, Ordering::Relaxed);
+                    controller
+                        .validate_transaction_for_mempool(&trx_for_exec, &pending_block_timestamp)
+                }
+            }
         })
         .await
         .map_err(|e| {
@@ -238,8 +324,49 @@ impl RpcService {
             Err(error) => return Err(error),
         }
 
+        let lock_started = Instant::now();
         let mut mempool = self.mempool.write().await;
+        self.admission_metrics.record_mempool_wait(lock_started);
+        let now = TimePoint::now();
+        if mempool.has_expired(&now) {
+            mempool.prune_expired(&now);
+        }
         Ok(mempool.add_transaction(packed_trx))
+    }
+
+    /// Build a candidate from a detached mempool batch. Keeping this orchestration
+    /// beside admission makes the lock boundary explicit: controller execution is
+    /// exclusive, but the live pool is available again before that execution
+    /// starts.
+    pub async fn build_block(&self) -> Result<SignedBlock, ChainError> {
+        let mut batch = {
+            let mut mempool = self.mempool.write().await;
+            mempool.take_all()
+        };
+        let result = {
+            let mut controller = self.controller.write().await;
+            controller.build_block(batch.transactions_mut()).await
+        };
+        self.mempool.write().await.finish_batch(batch);
+        result
+    }
+
+    /// Verify a candidate using the same detached-batch policy as production.
+    /// Transactions that arrived while verification ran remain in the live pool;
+    /// deferred older entries are restored when the batch finishes.
+    pub async fn verify_block(&self, block: &SignedBlock) -> Result<(), ChainError> {
+        let mut batch = {
+            let mut mempool = self.mempool.write().await;
+            mempool.take_all()
+        };
+        let result = {
+            let mut controller = self.controller.write().await;
+            controller
+                .verify_block(block, batch.transactions_mut())
+                .await
+        };
+        self.mempool.write().await.finish_batch(batch);
+        result
     }
 }
 
@@ -607,21 +734,19 @@ impl RpcServer for RpcService {
 mod tests {
     use super::*;
     use pulsevm_core::{
-        authority::{
-            Authority,
-            KeyWeight,
-            PermissionLevel,
-        },
+        authority::{Authority, KeyWeight, PermissionLevel},
         crypto::PrivateKey,
         pulse_contract::NewAccount,
         time::TimePointSec,
-        transaction::{
-            Action,
-            TransactionHeader,
-        },
+        transaction::{Action, TransactionHeader},
     };
     use pulsevm_serialization::Write;
     use serde_json::json;
+    use std::time::Duration;
+    use tokio::{
+        sync::oneshot,
+        time::{sleep, timeout},
+    };
 
     const GENESIS_KEY: &str = "PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez";
     const CHAIN_ID: &str = "c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6";
@@ -728,11 +853,13 @@ mod tests {
             .unwrap();
 
         let mempool = Arc::new(RwLock::new(Mempool::new()));
+        let admission_state = controller.mempool_admission_state();
         let service = RpcService::new(
             mempool.clone(),
             Arc::new(RwLock::new(controller)),
             Arc::new(RwLock::new(NetworkManager::new())),
         );
+        service.set_admission_state(admission_state);
         (service, mempool, genesis_key, chain_id, temp)
     }
 
@@ -758,6 +885,16 @@ mod tests {
             json!(EMPTY_PROTOCOL_SCHEDULE_HASH)
         );
         assert_eq!(json["next_protocol_upgrade"], serde_json::Value::Null);
+    }
+
+    async fn wait_for_batch_detach(mempool: &Arc<RwLock<Mempool>>) {
+        timeout(Duration::from_secs(1), async {
+            while mempool.read().await.has_transactions() {
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("producer did not detach the mempool batch before waiting for the controller");
     }
 
     // A correctly signed transaction is validated and admitted once; a second
@@ -796,5 +933,244 @@ mod tests {
             !mempool.read().await.contains(forged.id()),
             "a rejected transaction must not reach the mempool"
         );
+    }
+
+    // Admission intentionally does not execute actions. This transaction has a
+    // valid lifetime, account references, and signature, but attempts to create
+    // the already-existing `pulse` account and therefore fails only when the
+    // producer attempts to build a block. Keeping this distinction prevents
+    // every successfully produced transaction from paying for a speculative
+    // execute-and-revert first.
+    #[tokio::test]
+    async fn admit_transaction_defers_action_execution_to_block_production() {
+        let (service, mempool, genesis_key, chain_id, _temp) = service_with_genesis();
+        let invalid_at_execution = newaccount_tx(&genesis_key, &genesis_key, "pulse", &chain_id);
+
+        assert!(
+            service
+                .admit_transaction(invalid_at_execution.clone())
+                .await
+                .unwrap(),
+            "static preflight should admit a transaction without executing its action"
+        );
+        assert!(mempool.read().await.contains(invalid_at_execution.id()));
+
+        let build_result = service.build_block().await;
+        assert!(
+            build_result.is_err(),
+            "the unexecutable transaction should be discarded while building"
+        );
+        assert!(
+            !mempool.read().await.contains(invalid_at_execution.id()),
+            "a transaction rejected during block production must not remain queued"
+        );
+    }
+
+    // Admission uses the synchronized database handle installed at controller
+    // initialization rather than taking the controller RwLock. Holding that
+    // lock models the full duration of build_block/verify_block execution.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admission_progresses_while_controller_execution_lock_is_held() {
+        let (service, mempool, genesis_key, chain_id, _temp) = service_with_genesis();
+        let transaction = newaccount_tx(&genesis_key, &genesis_key, "alice", &chain_id);
+        let controller_guard = service.controller.write().await;
+
+        let (complete_tx, mut complete_rx) = oneshot::channel();
+        let admission_service = service.clone();
+        tokio::spawn(async move {
+            let _ = complete_tx.send(admission_service.admit_transaction(transaction).await);
+        });
+
+        let mut result = None;
+        for _ in 0..100 {
+            match complete_rx.try_recv() {
+                Ok(admission) => {
+                    result = Some(admission);
+                    break;
+                }
+                Err(oneshot::error::TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(1))
+                }
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    panic!("admission task exited before returning a result")
+                }
+            }
+        }
+
+        assert!(
+            result
+                .expect("admission remained blocked on the controller execution lock")
+                .expect("admission failed")
+        );
+        assert!(mempool.read().await.has_transactions());
+        let metrics = service.admission_metrics();
+        assert_eq!(metrics.state_preflights, 1);
+        assert_eq!(metrics.fallback_controller_preflights, 0);
+        assert_eq!(metrics.controller_lock_wait_nanos, 0);
+        drop(controller_guard);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_ingress_progresses_during_controller_execution() {
+        let (service, mempool, genesis_key, chain_id, _temp) = service_with_genesis();
+        let controller_guard = service.controller.write().await;
+
+        let mut admissions = Vec::new();
+        for account in ["a1", "a2", "a3", "a4", "a5"] {
+            let transaction = newaccount_tx(&genesis_key, &genesis_key, account, &chain_id);
+            let admission_service = service.clone();
+            admissions.push(tokio::spawn(async move {
+                admission_service.admit_transaction(transaction).await
+            }));
+        }
+
+        for admission in admissions {
+            assert!(admission.await.unwrap().unwrap());
+        }
+        let metrics = service.admission_metrics();
+        assert_eq!(metrics.state_preflights, 5);
+        assert_eq!(metrics.fallback_controller_preflights, 0);
+        assert_eq!(metrics.controller_lock_wait_nanos, 0);
+        assert_eq!(mempool.read().await.has_transactions(), true);
+        drop(controller_guard);
+    }
+
+    // This exercises the exact path called by Vm::build_block. The controller
+    // writer is deliberately held before the producer starts: that makes the
+    // test deterministic while proving the producer detaches the batch before
+    // it waits for exclusive execution, and that ingress remains live during
+    // the whole interval.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ingress_survives_actual_build_block_pipeline() {
+        let (service, mempool, genesis_key, chain_id, _temp) = service_with_genesis();
+        let selected = newaccount_tx(&genesis_key, &genesis_key, "alice", &chain_id);
+        assert!(service.admit_transaction(selected.clone()).await.unwrap());
+
+        let controller_guard = service.controller.write().await;
+        let producer = service.clone();
+        let build = tokio::spawn(async move { producer.build_block().await });
+        wait_for_batch_detach(&mempool).await;
+
+        let late_transactions: Vec<_> = ["b1", "b2", "b3", "b4", "b5"]
+            .into_iter()
+            .map(|account| newaccount_tx(&genesis_key, &genesis_key, account, &chain_id))
+            .collect();
+        let admissions: Vec<_> = late_transactions
+            .iter()
+            .cloned()
+            .map(|transaction| {
+                let service = service.clone();
+                tokio::spawn(async move { service.admit_transaction(transaction).await })
+            })
+            .collect();
+        for admission in admissions {
+            assert!(admission.await.unwrap().unwrap());
+        }
+        let live_mempool = mempool.read().await;
+        assert!(
+            late_transactions
+                .iter()
+                .all(|transaction| live_mempool.contains(transaction.id())),
+            "ingress must remain visible while production is waiting for the controller"
+        );
+        drop(live_mempool);
+        let metrics = service.admission_metrics();
+        assert_eq!(metrics.state_preflights, 6);
+        assert_eq!(metrics.fallback_controller_preflights, 0);
+        assert_eq!(metrics.controller_lock_wait_nanos, 0);
+
+        drop(controller_guard);
+        let block = build.await.unwrap().unwrap();
+        assert_eq!(
+            block.transactions.len(),
+            1,
+            "only the detached transaction is built"
+        );
+        let mempool = mempool.read().await;
+        assert!(
+            !mempool.contains(selected.id()),
+            "a transaction selected for the built block must not be restored"
+        );
+        assert!(
+            late_transactions
+                .iter()
+                .all(|transaction| mempool.contains(transaction.id())),
+            "transactions admitted during production must remain queued for the next block"
+        );
+    }
+
+    // Verify uses the same production batch handoff. Produce the block on an
+    // independent node, then hold the verifier's controller lock long enough
+    // to prove incoming RPCs do not wait on it and survive verification.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ingress_survives_actual_block_verify_pipeline() {
+        let (producer, _producer_pool, producer_key, producer_chain_id, _producer_temp) =
+            service_with_genesis();
+        let included = newaccount_tx(&producer_key, &producer_key, "alice", &producer_chain_id);
+        assert!(producer.admit_transaction(included).await.unwrap());
+        let block = producer.build_block().await.unwrap();
+
+        let (verifier, verifier_pool, verifier_key, verifier_chain_id, _verifier_temp) =
+            service_with_genesis();
+        let queued = newaccount_tx(&verifier_key, &verifier_key, "bob", &verifier_chain_id);
+        assert!(verifier.admit_transaction(queued.clone()).await.unwrap());
+
+        let controller_guard = verifier.controller.write().await;
+        let verifying_service = verifier.clone();
+        let verifying_block = block.clone();
+        let verify =
+            tokio::spawn(async move { verifying_service.verify_block(&verifying_block).await });
+        wait_for_batch_detach(&verifier_pool).await;
+
+        let late = newaccount_tx(&verifier_key, &verifier_key, "carol", &verifier_chain_id);
+        assert!(verifier.admit_transaction(late.clone()).await.unwrap());
+        assert!(verifier_pool.read().await.contains(late.id()));
+        let metrics = verifier.admission_metrics();
+        assert_eq!(metrics.state_preflights, 2);
+        assert_eq!(metrics.fallback_controller_preflights, 0);
+        assert_eq!(metrics.controller_lock_wait_nanos, 0);
+
+        drop(controller_guard);
+        verify.await.unwrap().unwrap();
+        let mempool = verifier_pool.read().await;
+        assert!(mempool.contains(queued.id()));
+        assert!(mempool.contains(late.id()));
+    }
+
+    // Admission is intentionally optimistic, so multiple concurrent copies can
+    // preflight. The final pool insertion remains the single deduplication
+    // point, even while a producer has reservations outstanding.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_duplicate_ingress_is_exactly_once_during_build_handoff() {
+        let (service, mempool, genesis_key, chain_id, _temp) = service_with_genesis();
+        let selected = newaccount_tx(&genesis_key, &genesis_key, "alice", &chain_id);
+        assert!(service.admit_transaction(selected).await.unwrap());
+
+        let controller_guard = service.controller.write().await;
+        let producer = service.clone();
+        let build = tokio::spawn(async move { producer.build_block().await });
+        wait_for_batch_detach(&mempool).await;
+
+        let duplicate = newaccount_tx(&genesis_key, &genesis_key, "bob", &chain_id);
+        let admissions: Vec<_> = (0..32)
+            .map(|_| {
+                let service = service.clone();
+                let duplicate = duplicate.clone();
+                tokio::spawn(async move { service.admit_transaction(duplicate).await })
+            })
+            .collect();
+        let mut newly_admitted = 0;
+        for admission in admissions {
+            newly_admitted += admission.await.unwrap().unwrap() as usize;
+        }
+        assert_eq!(
+            newly_admitted, 1,
+            "exactly one concurrent duplicate may enter the pool"
+        );
+        assert!(mempool.read().await.contains(duplicate.id()));
+
+        drop(controller_guard);
+        build.await.unwrap().unwrap();
+        assert!(mempool.read().await.contains(duplicate.id()));
     }
 }

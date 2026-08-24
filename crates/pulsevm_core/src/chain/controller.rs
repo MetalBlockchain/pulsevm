@@ -1,87 +1,44 @@
 use core::fmt;
 use std::{
-    collections::{
-        BTreeSet,
-        HashMap,
-        HashSet,
-        VecDeque,
-    },
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     fs,
-    io::{
-        ErrorKind,
-        Write as IoWrite,
-    },
+    io::{ErrorKind, Write as IoWrite},
     path::Path,
     sync::LazyLock,
 };
 
 use crate::{
-    ACTIVE_NAME,
-    MAJORITY_PRODUCERS_PERMISSION_NAME,
-    MINORITY_PRODUCERS_PERMISSION_NAME,
-    PRODS_NAME,
-    PULSE_NAME,
-    block::{
-        BlockStatus,
-        SignedBlock,
-    },
+    ACTIVE_NAME, MAJORITY_PRODUCERS_PERMISSION_NAME, MINORITY_PRODUCERS_PERMISSION_NAME,
+    PRODS_NAME, PULSE_NAME,
+    block::{BlockStatus, SignedBlock},
     chain::{
         apply_context::ApplyContext,
         authority::PermissionLevel,
         authorization_manager::AuthorizationManager,
         block::BlockHeader,
         config::{
-            DELETEAUTH_NAME,
-            LINKAUTH_NAME,
-            NEWACCOUNT_NAME,
-            ONBLOCK_NAME,
-            SETABI_NAME,
-            SETCODE_NAME,
-            UNLINKAUTH_NAME,
-            UPDATEAUTH_NAME,
-            eos_percent,
+            DELETEAUTH_NAME, LINKAUTH_NAME, NEWACCOUNT_NAME, ONBLOCK_NAME, SETABI_NAME,
+            SETCODE_NAME, UNLINKAUTH_NAME, UPDATEAUTH_NAME, eos_percent,
         },
         crypto::PublicKey,
         id::Id,
         mempool::Mempool,
         name::Name,
-        producer_schedule::{
-            ProducerKey,
-            ProducerSchedule,
-        },
+        producer_schedule::{ProducerKey, ProducerSchedule},
         protocol_features::{
-            ProtocolExecutionContext,
-            ProtocolUpgrade,
-            ProtocolUpgradeSchedule,
-            ProtocolVersion,
+            ProtocolExecutionContext, ProtocolUpgrade, ProtocolUpgradeSchedule, ProtocolVersion,
         },
         pulse_contract::{
-            deleteauth,
-            linkauth,
-            newaccount,
-            setabi,
-            setcode,
-            unlinkauth,
-            updateauth,
+            deleteauth, linkauth, newaccount, setabi, setcode, unlinkauth, updateauth,
         },
         resource_limits::ResourceLimitsManager,
-        state_history::{
-            StateHistoryLog,
-            StateHistoryLogCheckpoint,
-        },
+        state_history::{StateHistoryLog, StateHistoryLogCheckpoint},
         state_sync,
         transaction::{
-            PackedTransaction,
-            SignedTransaction,
-            Transaction,
-            TransactionHeader,
-            TransactionReceipt,
-            TransactionTrace,
+            PackedTransaction, SignedTransaction, Transaction, TransactionHeader,
+            TransactionReceipt, TransactionTrace,
         },
-        transaction_context::{
-            TransactionContext,
-            TransactionResult,
-        },
+        transaction_context::{TransactionContext, TransactionResult},
         utils::make_ratio,
         wasm_runtime::WasmRuntime,
     },
@@ -90,37 +47,18 @@ use crate::{
 };
 
 use pulsevm_constants::{
-    BLOCK_CPU_USAGE_AVERAGE_WINDOW_MS,
-    BLOCK_INTERVAL_MS,
-    BLOCK_SIZE_AVERAGE_WINDOW_MS,
+    BLOCK_CPU_USAGE_AVERAGE_WINDOW_MS, BLOCK_INTERVAL_MS, BLOCK_SIZE_AVERAGE_WINDOW_MS,
     MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER,
 };
-use pulsevm_crypto::{
-    Digest,
-    merkle,
-};
+use pulsevm_crypto::{Digest, merkle};
 use pulsevm_database::{
-    Authority,
-    BlockTimestamp,
-    Database,
-    ElasticLimitParameters,
-    Microseconds,
-    PermissionLevelWeight,
-    TimePoint,
-    seconds,
+    Authority, BlockTimestamp, Database, ElasticLimitParameters, Microseconds,
+    PermissionLevelWeight, TimePoint, seconds,
 };
 use pulsevm_error::ChainError;
 use pulsevm_grpc::vm;
-use pulsevm_serialization::{
-    Read,
-    Write,
-};
-use spdlog::{
-    debug,
-    error,
-    info,
-    warn,
-};
+use pulsevm_serialization::{Read, Write};
+use spdlog::{debug, error, info, warn};
 
 pub type ApplyHandlerFn = fn(&mut ApplyContext, &mut Database, &Action) -> Result<(), ChainError>;
 pub type ApplyHandlerMap = HashMap<
@@ -198,6 +136,107 @@ pub struct Controller {
     // Count of `execute_block` invocations, for measuring how much re-execution
     // the pending-chain reuse actually avoids. Not consensus state.
     blocks_executed: u64,
+}
+
+/// Read-only state required for mempool admission. See
+/// `docs/mempool-admission.md` §2–4 for its shared-live-state semantics.
+/// The database handle is
+/// internally synchronized, so this can validate advisory admission checks
+/// without taking the controller lock while a producer is executing a block.
+/// It intentionally observes the live state rather than a consensus snapshot:
+/// admission has no state effect and transactions are still executed and
+/// validated against the selected block state before inclusion.
+#[derive(Clone)]
+pub struct MempoolAdmissionState {
+    db: Database,
+    chain_id: Id,
+}
+
+impl MempoolAdmissionState {
+    pub fn validate_transaction(
+        &self,
+        packed_transaction: &PackedTransaction,
+        pending_block_timestamp: &BlockTimestamp,
+    ) -> Result<(), ChainError> {
+        let signed_transaction = packed_transaction.get_signed_transaction();
+        let transaction = signed_transaction.transaction();
+
+        transaction.validate(pending_block_timestamp)?;
+
+        let expiration: TimePoint = transaction.header.expiration().into();
+        let pending: TimePoint = (*pending_block_timestamp).into();
+        let max_lifetime = self.db.chain_config()?.max_transaction_lifetime;
+        if expiration < pending {
+            return Err(ChainError::TransactionError("transaction expired".into()));
+        }
+        if expiration > pending + seconds(max_lifetime as i64) {
+            return Err(ChainError::TransactionError(
+                "transaction has too long lifetime".into(),
+            ));
+        }
+
+        let mut has_authorization = false;
+        for action in &transaction.context_free_actions {
+            if !self.db.is_account(action.account.as_u64())? {
+                return Err(ChainError::TransactionError(format!(
+                    "context free action {} references non-existent account {}",
+                    action.name(),
+                    action.account()
+                )));
+            }
+            if !action.authorization.is_empty() {
+                return Err(ChainError::TransactionError(
+                    "context-free actions cannot have authorizations".into(),
+                ));
+            }
+        }
+        for action in &transaction.actions {
+            if !self.db.is_account(action.account.as_u64())? {
+                return Err(ChainError::TransactionError(format!(
+                    "action {} references non-existent account {}",
+                    action.name(),
+                    action.account()
+                )));
+            }
+            for authorization in action.authorization() {
+                has_authorization = true;
+                if !self.db.is_account(authorization.actor())? {
+                    return Err(ChainError::TransactionError(format!(
+                        "action's authorizing actor '{}' does not exist",
+                        Name::new(authorization.actor)
+                    )));
+                }
+                if AuthorizationManager::find_permission(&self.db.read()?, authorization)?.is_none()
+                {
+                    return Err(ChainError::TransactionError(format!(
+                        "action's authorizations include a non-existent permission: {}",
+                        authorization,
+                    )));
+                }
+            }
+        }
+        if !has_authorization {
+            return Err(ChainError::TransactionError(
+                "transaction must have at least one authorization".into(),
+            ));
+        }
+
+        if self
+            .db
+            .is_known_unexpired_transaction(&packed_transaction.id().0.0)?
+        {
+            return Err(ChainError::DatabaseError("duplicate tx".into()));
+        }
+
+        AuthorizationManager::check_authorization(
+            &self.db,
+            &transaction.actions,
+            &signed_transaction.recovered_keys(&self.chain_id)?,
+            &BTreeSet::new(),
+            seconds(transaction.header.delay_sec.into()),
+            &BTreeSet::new(),
+        )
+    }
 }
 
 struct PendingBlock {
@@ -689,12 +728,12 @@ impl Controller {
         let mut height = end;
         loop {
             if let Some(block) = self.get_block_by_height(height)? {
-                if let Some(schedule) = block.signed_block_header.header.new_schedule()? {
+                if let Some(schedule) = block.signed_block_header.header.new_schedule() {
                     info!(
                         "reconstructed producer schedule version {} from block {}",
                         schedule.version, height
                     );
-                    self.active_schedule = schedule;
+                    self.active_schedule = schedule.clone();
                     return Ok(());
                 }
             }
@@ -727,6 +766,11 @@ impl Controller {
         let block_height = BlockHeader::num_from_id(&self.preferred_id) + 1;
         let protocol_context = self.ensure_protocol_version_supported(block_height)?;
         let block_status = BlockStatus::Building;
+
+        // The timer also removes expired entries, but build against the exact
+        // timestamp committed to this candidate block so a direct build call
+        // cannot select an expired transaction.
+        mempool.prune_expired(&timestamp.to_time_point());
 
         // Transactions already present in a verified-but-not-yet-accepted block
         // must not be included again. At build time the earlier block has not
@@ -880,11 +924,8 @@ impl Controller {
                 version: parent_schedule.version + 1,
                 producers: producers.clone(),
             };
-            let packed = new_schedule
-                .pack()
-                .map_err(|e| ChainError::SerializationError(e.to_string()))?;
-            block.signed_block_header.header.new_producers = Some(packed);
             block.signed_block_header.header.schedule_version = new_schedule.version;
+            block.signed_block_header.header.new_producers = Some(new_schedule);
         }
 
         // Sign the block with the producer's key over the full header — including
@@ -1012,7 +1053,7 @@ impl Controller {
         executed: &Option<Vec<ProducerKey>>,
         parent_schedule: &ProducerSchedule,
     ) -> Result<(), ChainError> {
-        let header_schedule = block.signed_block_header.header.new_schedule()?;
+        let header_schedule = block.signed_block_header.header.new_schedule();
         match (header_schedule, executed) {
             (None, None) => Ok(()),
             (Some(_), None) => Err(ChainError::BlockError(
@@ -1160,16 +1201,7 @@ impl Controller {
                 "verified block cache key {block_id} does not match packed block id {accepted_block_id}"
             )));
         }
-        let accepted_schedule =
-            block
-                .signed_block_header
-                .header
-                .new_schedule()
-                .map_err(|error| {
-                    ChainError::BlockError(format!(
-                        "failed to decode producer schedule in block {block_id}: {error}"
-                    ))
-                })?;
+        let accepted_schedule = block.signed_block_header.header.new_schedule().clone();
 
         // Pack the block before touching the pending chain. In the fast path below
         // the front session is `remove`d from the chain but only detached from
@@ -1313,7 +1345,7 @@ impl Controller {
         // producers. `verify_block` has already bound the header to execution.
         if let Some(schedule) = accepted_schedule {
             info!("activated producer schedule version {}", schedule.version);
-            self.active_schedule = schedule;
+            self.active_schedule = schedule.clone();
         }
 
         self.preferred_id = accepted_block_id;
@@ -1620,8 +1652,37 @@ impl Controller {
         Ok(())
     }
 
-    // This function will execute a transaction and roll it back instantly
-    // This is useful for checking if a transaction is valid
+    /// Perform the inexpensive, state-aware checks required before a transaction
+    /// enters the mempool.
+    ///
+    /// This deliberately does not create a transaction context or execute an
+    /// action. Execution is deferred to block production, where the transaction
+    /// is executed exactly once in the producer's block session. Validators then
+    /// execute the produced block as usual. A transaction can therefore pass
+    /// this preflight but become invalid before it is selected for a block; the
+    /// block builder handles that by dropping it.
+    pub fn validate_transaction_for_mempool(
+        &self,
+        packed_transaction: &PackedTransaction,
+        pending_block_timestamp: &BlockTimestamp,
+    ) -> Result<(), ChainError> {
+        self.mempool_admission_state()
+            .validate_transaction(packed_transaction, pending_block_timestamp)
+    }
+
+    /// Clone the state handle used by advisory mempool preflight. It remains
+    /// valid across controller mutation because `Database` clones share the
+    /// synchronized arena backend.
+    pub fn mempool_admission_state(&self) -> MempoolAdmissionState {
+        MempoolAdmissionState {
+            db: self.db.clone(),
+            chain_id: self.chain_id.clone(),
+        }
+    }
+
+    // This function will execute a transaction and roll it back instantly.
+    // It is retained for speculative callers that need an execution result;
+    // mempool admission uses `validate_transaction_for_mempool` instead.
     pub fn push_transaction(
         &mut self,
         transaction: &PackedTransaction,
@@ -2520,51 +2581,24 @@ impl Controller {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs,
-        path::Path,
-        str::FromStr,
-        sync::Arc,
-        vec,
-    };
+    use std::{fs, path::Path, str::FromStr, sync::Arc, vec};
 
-    use pulsevm_database::{
-        Authority,
-        KeyWeight,
-        TimePointSec,
-    };
-    use pulsevm_proc_macros::{
-        NumBytes,
-        Read,
-        Write,
-    };
+    use pulsevm_database::{Authority, KeyWeight, TimePointSec};
+    use pulsevm_proc_macros::{NumBytes, Read, Write};
     use pulsevm_serialization::Write;
     use serde_json::json;
     use tempfile::TempDir;
-    use tokio::{
-        runtime,
-        sync::RwLock,
-    };
+    use tokio::{runtime, sync::RwLock};
 
     #[cfg(feature = "arena-shadow")]
     use crate::chain::abi::AbiDefinition;
     use crate::{
         ACTIVE_NAME,
         chain::{
-            asset::{
-                Asset,
-                Symbol,
-            },
+            asset::{Asset, Symbol},
             authority::PermissionLevel,
-            pulse_contract::{
-                NewAccount,
-                SetCode,
-            },
-            transaction::{
-                Action,
-                Transaction,
-                TransactionHeader,
-            },
+            pulse_contract::{NewAccount, SetCode},
+            transaction::{Action, Transaction, TransactionHeader},
         },
         crypto::PrivateKey,
     };
@@ -3320,19 +3354,13 @@ mod tests {
             block::SignedBlockHeader,
             crypto::Signature,
             transaction::{
-                PackedTransaction,
-                TransactionCompression,
-                TransactionReceipt,
-                TransactionReceiptHeader,
-                TransactionStatus,
+                PackedTransaction, TransactionCompression, TransactionReceipt,
+                TransactionReceiptHeader, TransactionStatus,
             },
         };
         use pulsevm_crypto::Bytes;
         use pulsevm_serialization::VarUint32;
-        use std::collections::{
-            BTreeSet,
-            VecDeque,
-        };
+        use std::collections::{BTreeSet, VecDeque};
 
         let hexd32 = |s: &str| -> [u8; 32] { hex::decode(s).unwrap().try_into().unwrap() };
         let header = BlockHeader {
@@ -3694,10 +3722,7 @@ mod tests {
             // Per-table arena root: a fingerprint over one arena table's canonical
             // bytes, recorded/verified table by table so a mismatch names the table.
             let table_root = |arena: &[u8]| -> u64 {
-                use std::hash::{
-                    Hash,
-                    Hasher,
-                };
+                use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
                 arena.hash(&mut h);
                 h.finish()
@@ -4049,6 +4074,30 @@ mod tests {
             "accepted account should exist in committed state"
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn build_block_prunes_expired_mempool_transactions() -> Result<(), ChainError> {
+        let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
+        let expiration = TimePointSec::new(TimePointSec::now().sec_since_epoch() - 1);
+        let expired = create_account_with_expiration(
+            &private_key,
+            Name::from_str("expired")?,
+            chain_id,
+            expiration,
+        )?;
+        let mut mempool = Mempool::new();
+        mempool.add_transaction(expired.clone());
+
+        assert!(
+            controller.build_block(&mut mempool).await.is_err(),
+            "an expired-only mempool must not produce a block"
+        );
+        assert!(
+            !mempool.contains(expired.id()),
+            "building must evict expired transactions even when called without the timer"
+        );
         Ok(())
     }
 
@@ -5673,12 +5722,8 @@ mod tests {
                 chain_id,
             )?);
             let mut block = controller.build_block(&mut mempool).await?;
-            block.signed_block_header.header.new_producers = Some(
-                new_schedule
-                    .pack()
-                    .map_err(|e| ChainError::SerializationError(e.to_string()))?,
-            );
             block.signed_block_header.header.schedule_version = new_schedule.version;
+            block.signed_block_header.header.new_producers = Some(new_schedule.clone());
             let sig_digest = block.signed_block_header.header.sig_digest()?;
             block.signed_block_header.signature = private_key.sign(&sig_digest)?;
 
@@ -5754,7 +5799,7 @@ mod tests {
             deployment
                 .signed_block_header
                 .header
-                .new_schedule()?
+                .new_schedule()
                 .is_none()
         );
         controller.accept_block(&deployment.id()?, &mut mempool)?;
@@ -5771,13 +5816,14 @@ mod tests {
         let header_schedule = election
             .signed_block_header
             .header
-            .new_schedule()?
+            .new_schedule()
+            .as_ref()
             .expect("onblock proposal must be committed to the header");
         assert_eq!(header_schedule.version, 1);
         assert_eq!(header_schedule.producers, proposed);
 
         controller.accept_block(&election.id()?, &mut mempool)?;
-        assert_eq!(controller.active_schedule, header_schedule);
+        assert_eq!(controller.active_schedule, header_schedule.clone());
         Ok(())
     }
 

@@ -14,6 +14,7 @@ authoritative and the document is a bug.
 | Document | Covers | Status |
 |---|---|---|
 | [protocol-features.md](./protocol-features.md) | Compile-time feature availability, consensus-version selection, upgrade schedules, safe rollout, and activation testing | Framework implemented; only v1/Baseline |
+| [mempool-admission.md](./mempool-admission.md) | Local admission preflight, shared-state concurrency, detached batches, expiry, capacity, and observability | Current behavior |
 | [resource-model.md](./resource-model.md) | CPU, NET, and RAM accounting; WASM metering cost function; input vs implicit transaction billing | Draft |
 | [intrinsic-cost-model.md](./intrinsic-cost-model.md) | Host-intrinsic CPU pricing, estimator methodology, and calibration | Working reference |
 | [wasm-determinism.md](./wasm-determinism.md) | WASM feature pinning, floating-point behavior, database key ordering, and replay validation | Working reference |
