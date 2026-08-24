@@ -8,10 +8,11 @@
 //! bytes as an Arena checkpoint.
 
 use std::{
+    collections::BTreeMap,
     collections::{HashMap, HashSet},
     fmt,
     fs::File,
-    io::Read,
+    io::{Read, Seek, SeekFrom},
     path::Path,
 };
 
@@ -58,6 +59,21 @@ pub struct StateHistoryEntry {
     pub magic: u64,
     pub block_id: [u8; 32],
     pub deltas: Vec<TableDelta>,
+}
+
+/// Bounded framing and table-shape summary for an XPR history log. The initial
+/// full-state payload is skipped after framing is checked, avoiding a
+/// multi-gigabyte decompressed allocation in the checker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateHistoryWindowSummary {
+    pub first_block_id: [u8; 32],
+    pub first_payload_bytes: u64,
+    pub entries: u64,
+    pub post_snapshot_entries: u64,
+    pub last_block_id: [u8; 32],
+    pub table_rows: BTreeMap<String, u64>,
+    pub generated_transactions: u64,
+    pub complete: bool,
 }
 
 /// Counts of the portable rows committed by [`hydrate_full_state`].
@@ -1904,6 +1920,187 @@ pub fn parse_initial_state_history_log(bytes: &[u8]) -> Result<StateHistoryEntry
     })
 }
 
+/// Inspect up to `max_post_snapshot_entries` after the initial full-state
+/// record. A zero limit only validates the first record's framing.
+pub fn inspect_state_history_log(
+    path: impl AsRef<Path>,
+    max_post_snapshot_entries: u64,
+) -> Result<StateHistoryWindowSummary, XprImportError> {
+    let mut file = File::open(path.as_ref())
+        .map_err(|error| bad(format!("opening state-history log: {error}")))?;
+    let mut offset = 0u64;
+    let mut entry_number = 0u64;
+    let mut first_block_id = None;
+    let mut last_block_id = [0u8; 32];
+    let mut first_payload_bytes = 0u64;
+    let mut table_rows = BTreeMap::new();
+    let mut generated_transactions = 0u64;
+    let mut post_snapshot_entries = 0u64;
+    let mut complete = true;
+    let mut previous_block_num: Option<u32> = None;
+
+    loop {
+        let mut header = [0u8; LOG_HEADER_LEN];
+        match file.read(&mut header[..1]) {
+            Ok(0) => break,
+            Ok(1) => {}
+            Ok(_) => unreachable!(),
+            Err(error) => return Err(bad(format!("reading state-history header: {error}"))),
+        }
+        file.read_exact(&mut header[1..])
+            .map_err(|error| bad(format!("truncated state-history header: {error}")))?;
+        let magic = u64::from_le_bytes(header[0..8].try_into().unwrap());
+        if (magic as u16) != 0 {
+            return Err(bad(format!(
+                "unsupported XPR state-history version {}",
+                magic as u16
+            )));
+        }
+        let mut block_id = [0u8; 32];
+        block_id.copy_from_slice(&header[8..40]);
+        let payload_len = u64::from_le_bytes(header[40..48].try_into().unwrap());
+        let payload_len_usize = usize::try_from(payload_len)
+            .map_err(|_| bad("state-history payload length does not fit this platform"))?;
+        let next_offset = offset
+            .checked_add(LOG_HEADER_LEN as u64)
+            .and_then(|n| n.checked_add(payload_len))
+            .and_then(|n| n.checked_add(LOG_TRAILER_LEN as u64))
+            .ok_or_else(|| bad("state-history record offset overflows"))?;
+
+        let block_num = u32::from_be_bytes(block_id[..4].try_into().unwrap());
+        if let Some(previous) = previous_block_num
+            && block_num != previous.saturating_add(1)
+        {
+            return Err(bad(format!(
+                "state-history block sequence jumps from {previous} to {block_num}"
+            )));
+        }
+        previous_block_num = Some(block_num);
+
+        if entry_number == 0 {
+            first_block_id = Some(block_id);
+            first_payload_bytes = payload_len;
+            file.seek(SeekFrom::Current(
+                i64::try_from(payload_len)
+                    .map_err(|_| bad("state-history payload offset does not fit i64"))?,
+            ))
+            .map_err(|error| bad(format!("skipping initial state payload: {error}")))?;
+        } else if post_snapshot_entries < max_post_snapshot_entries {
+            let mut payload = vec![0u8; payload_len_usize];
+            file.read_exact(&mut payload)
+                .map_err(|error| bad(format!("reading state-history payload: {error}")))?;
+            for delta in parse_table_deltas(&decompress_state_history_payload(&payload)?)? {
+                let rows = delta.rows.len() as u64;
+                *table_rows.entry(delta.name.clone()).or_default() += rows;
+                if delta.name == "generated_transaction" {
+                    generated_transactions += rows;
+                }
+            }
+            post_snapshot_entries += 1;
+        } else {
+            complete = false;
+            file.seek(SeekFrom::Current(
+                i64::try_from(payload_len)
+                    .map_err(|_| bad("state-history payload offset does not fit i64"))?,
+            ))
+            .map_err(|error| bad(format!("skipping bounded-window payload: {error}")))?;
+        }
+
+        let mut trailer = [0u8; LOG_TRAILER_LEN];
+        file.read_exact(&mut trailer)
+            .map_err(|error| bad(format!("truncated state-history record trailer: {error}")))?;
+        let recorded_offset = u64::from_le_bytes(trailer);
+        if recorded_offset != offset {
+            return Err(bad(format!(
+                "state-history record at offset {offset} carries trailer offset {recorded_offset}"
+            )));
+        }
+        offset = next_offset;
+        last_block_id = block_id;
+        entry_number += 1;
+
+        if entry_number >= 1 && post_snapshot_entries == max_post_snapshot_entries {
+            let mut probe = [0u8; 1];
+            match file.read(&mut probe) {
+                Ok(0) => break,
+                Ok(1) => {
+                    complete = false;
+                    file.seek(SeekFrom::Current(-1))
+                        .map_err(|error| bad(format!("rewinding history probe: {error}")))?;
+                    break;
+                }
+                Ok(_) => unreachable!(),
+                Err(error) => return Err(bad(format!("probing state-history log: {error}"))),
+            }
+        }
+    }
+
+    let first_block_id = first_block_id.ok_or_else(|| bad("state-history log is empty"))?;
+    Ok(StateHistoryWindowSummary {
+        first_block_id,
+        first_payload_bytes,
+        entries: entry_number,
+        post_snapshot_entries,
+        last_block_id,
+        table_rows,
+        generated_transactions,
+        complete,
+    })
+}
+
+fn decompress_state_history_payload(payload: &[u8]) -> Result<Vec<u8>, XprImportError> {
+    let compressed = match payload {
+        payload
+            if payload.len() >= PAYLOAD_FORMAT_LEN
+                && u32::from_le_bytes(payload[0..PAYLOAD_FORMAT_LEN].try_into().unwrap())
+                    as usize
+                    == payload.len() - PAYLOAD_FORMAT_LEN =>
+        {
+            &payload[PAYLOAD_FORMAT_LEN..]
+        }
+        payload
+            if payload.len() >= PAYLOAD_FORMAT_LEN + DECOMPRESSED_SIZE_LEN
+                && u32::from_le_bytes(payload[0..PAYLOAD_FORMAT_LEN].try_into().unwrap()) == 1 =>
+        {
+            let claimed_len = u64::from_le_bytes(
+                payload[PAYLOAD_FORMAT_LEN..PAYLOAD_FORMAT_LEN + DECOMPRESSED_SIZE_LEN]
+                    .try_into()
+                    .unwrap(),
+            );
+            if claimed_len > MAX_DECOMPRESSED_DELTA_LEN {
+                return Err(bad(format!(
+                    "state-history claimed delta exceeds {} byte import limit",
+                    MAX_DECOMPRESSED_DELTA_LEN
+                )));
+            }
+            &payload[PAYLOAD_FORMAT_LEN + DECOMPRESSED_SIZE_LEN..]
+        }
+        payload if payload.len() < PAYLOAD_FORMAT_LEN => {
+            return Err(bad("state-history payload is missing format marker"));
+        }
+        payload => {
+            return Err(bad(format!(
+                "unsupported state-history payload framing marker {}",
+                u32::from_le_bytes(payload[0..PAYLOAD_FORMAT_LEN].try_into().unwrap())
+            )));
+        }
+    };
+    let mut decoder = ZlibDecoder::new(compressed);
+    let mut raw = Vec::new();
+    decoder
+        .by_ref()
+        .take(MAX_DECOMPRESSED_DELTA_LEN + 1)
+        .read_to_end(&mut raw)
+        .map_err(|error| bad(format!("decompressing state-history delta: {error}")))?;
+    if raw.len() as u64 > MAX_DECOMPRESSED_DELTA_LEN {
+        return Err(bad(format!(
+            "state-history delta exceeds {} byte import limit",
+            MAX_DECOMPRESSED_DELTA_LEN
+        )));
+    }
+    Ok(raw)
+}
+
 fn parse_table_deltas(bytes: &[u8]) -> Result<Vec<TableDelta>, XprImportError> {
     let mut cursor = Cursor::new(bytes);
     let table_count = cursor.varuint()?;
@@ -2226,6 +2423,48 @@ mod tests {
         let entry = parse_initial_state_history_log(&log).unwrap();
         assert_eq!(entry.block_id, [0xcdu8; 32]);
         assert!(entry.deltas.is_empty());
+    }
+
+    #[test]
+    fn inspects_bounded_history_window_without_decoding_initial_state() {
+        fn record(block_num: u32, raw: &[u8], offset: u64) -> Vec<u8> {
+            let mut compressed = ZlibEncoder::new(Vec::new(), Compression::default());
+            compressed.write_all(raw).unwrap();
+            let compressed = compressed.finish().unwrap();
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&1u32.to_le_bytes());
+            payload.extend_from_slice(&(raw.len() as u64).to_le_bytes());
+            payload.extend_from_slice(&compressed);
+            let mut out = Vec::new();
+            out.extend_from_slice(&0u64.to_le_bytes());
+            let mut block_id = [0u8; 32];
+            block_id[..4].copy_from_slice(&block_num.to_be_bytes());
+            out.extend_from_slice(&block_id);
+            out.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+            out.extend_from_slice(&payload);
+            out.extend_from_slice(&offset.to_le_bytes());
+            out
+        }
+
+        let first = record(100, &[0], 0);
+        let second_offset = first.len() as u64;
+        let first_payload_bytes = first.len() as u64 - 48 - 8;
+        let mut second_raw = vec![1, 0, 7];
+        second_raw.extend_from_slice(b"account");
+        second_raw.extend_from_slice(&1u8.to_le_bytes());
+        second_raw.extend_from_slice(&[1, 0]);
+        let second = record(101, &second_raw, second_offset);
+        let log = [first, second].concat();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("chain_state_history.log");
+        std::fs::write(&path, log).unwrap();
+
+        let summary = inspect_state_history_log(&path, 1).unwrap();
+        assert_eq!(summary.entries, 2);
+        assert_eq!(summary.post_snapshot_entries, 1);
+        assert!(summary.complete);
+        assert_eq!(summary.table_rows.get("account"), Some(&1));
+        assert_eq!(summary.first_payload_bytes, first_payload_bytes);
     }
 
     #[test]

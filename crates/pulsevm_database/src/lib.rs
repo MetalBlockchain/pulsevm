@@ -41,11 +41,13 @@ pub use crate::{
         DeferredTransactionSidecarRow,
         MigrationManifest,
         StateHistoryEntry,
+        StateHistoryWindowSummary,
         TableDelta,
         TableDeltaRow,
         XprImportError,
         hydrate_full_state,
         hydrate_full_state_with_deferred_transactions,
+        inspect_state_history_log,
         parse_initial_state_history_log,
     },
 };

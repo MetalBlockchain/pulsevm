@@ -72,6 +72,18 @@ initial full-state record only; consuming the later delta records as a
 consensus replay window is a separate step. A window therefore supplements,
 but does not replace, the base snapshot.
 
+Inspect a bounded window without inflating the multi-gigabyte initial record:
+
+```bash
+cargo run -p pulsevm_database --example xpr_history_window_check -- \
+  /data/xpr-export-window/state-history/chain_state_history.log 10000
+```
+
+The checker validates record offsets, consecutive block ids, SHiP framing, and
+decoded table/row counts. It reports `generated_transaction` rows explicitly:
+SHiP v0 omits their scheduling timestamps, and the deferred sidecar currently
+covers the imported snapshot head rather than later window deltas.
+
 ## Output contract
 
 `manifest.env` binds the source commit, input snapshot hash and history-log
