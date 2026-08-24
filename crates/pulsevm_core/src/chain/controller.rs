@@ -375,11 +375,6 @@ impl Controller {
             .as_ref()
             .and_then(|config| config.migration_manifest.as_ref());
         if let (Some(checkpoint), Some(manifest_path)) = (migration_checkpoint, migration_manifest) {
-            let checkpoint_bytes = fs::read(checkpoint).map_err(|e| {
-                ChainError::GenesisError(format!(
-                    "failed to read migration checkpoint {checkpoint}: {e}"
-                ))
-            })?;
             let manifest_bytes = fs::read(manifest_path).map_err(|e| {
                 ChainError::GenesisError(format!(
                     "failed to read migration manifest {manifest_path}: {e}"
@@ -390,7 +385,7 @@ impl Controller {
                     "failed to parse migration manifest {manifest_path}: {e}"
                 ))
             })?;
-            manifest.verify_checkpoint(&checkpoint_bytes).map_err(|e| {
+            manifest.verify_checkpoint_path(checkpoint).map_err(|e| {
                 ChainError::GenesisError(format!(
                     "migration manifest {manifest_path} rejected checkpoint {checkpoint}: {e}"
                 ))
@@ -407,7 +402,7 @@ impl Controller {
                     hex::encode(expected_checkpoint_sha256)
                 )));
             }
-            let header = self.db.restore_from_bytes(&checkpoint_bytes).map_err(|e| {
+            let header = self.db.restore_from_path(std::path::Path::new(checkpoint)).map_err(|e| {
                 ChainError::GenesisError(format!(
                     "failed to restore migration checkpoint {checkpoint}: {e}"
                 ))

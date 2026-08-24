@@ -8,6 +8,7 @@ use std::{
 
 use pulsevm_error::ChainError;
 use pulsevm_name::Name;
+use sha2::{Digest as Sha2Digest, Sha256};
 
 use crate::{
     Authority,
@@ -1536,6 +1537,69 @@ impl Database {
         Ok(header)
     }
 
+    /// Replace the live arena from a snapshot envelope on disk. The envelope
+    /// and sparse payload are streamed into a staged chainbase file, avoiding
+    /// a second multi-gigabyte `Vec<u8>` during migration startup.
+    pub fn restore_from_path(
+        &self,
+        snapshot_path: &Path,
+    ) -> Result<crate::snapshot::SnapshotHeader, ChainError> {
+        let dir = Path::new(&self.path);
+        fs::create_dir_all(dir).map_err(|e| {
+            ChainError::InternalError(format!("restore: create {}: {e}", self.path))
+        })?;
+        let mut input = fs::File::open(snapshot_path).map_err(|e| {
+            ChainError::InternalError(format!(
+                "restore: open checkpoint {}: {e}",
+                snapshot_path.display()
+            ))
+        })?;
+        let file_len = input
+            .metadata()
+            .map_err(|e| ChainError::InternalError(format!("restore: stat checkpoint: {e}")))?
+            .len();
+        if file_len < crate::snapshot::HEADER_LEN as u64 {
+            return Err(ChainError::InternalError(
+                "restore: checkpoint is shorter than its envelope header".into(),
+            ));
+        }
+        let mut header_bytes = vec![0u8; crate::snapshot::HEADER_LEN];
+        input.read_exact(&mut header_bytes).map_err(|e| {
+            ChainError::InternalError(format!("restore: read checkpoint header: {e}"))
+        })?;
+        let header = crate::snapshot::peek_header(&header_bytes)?;
+        let expected_len = (crate::snapshot::HEADER_LEN as u64)
+            .checked_add(header.payload_len)
+            .ok_or_else(|| ChainError::InternalError("restore: checkpoint length overflow".into()))?;
+        if file_len != expected_len {
+            return Err(ChainError::InternalError(format!(
+                "restore: checkpoint length {file_len} does not match envelope {expected_len}"
+            )));
+        }
+
+        let staged = Self::stage_snapshot_stream(&mut input, header, dir)?;
+        let candidate = crate::backend::ChainDatabase::new()
+            .map_err(|e| ChainError::InternalError(format!("restore: arena init: {e:?}")))?;
+        candidate
+            .load(staged.path())
+            .map_err(|e| ChainError::InternalError(format!("restore: invalid arena: {e:?}")))?;
+        if candidate.revision() != header.revision {
+            return Err(ChainError::InternalError(format!(
+                "snapshot payload revision {} does not match envelope revision {}",
+                candidate.revision(),
+                header.revision
+            )));
+        }
+        let dest = dir.join(ARENA_STATE_FILE);
+        staged.persist(&dest).map_err(|e| {
+            ChainError::InternalError(format!("restore: install {}: {}", dest.display(), e.error))
+        })?;
+        self.backend
+            .reload_from(&dest)
+            .map_err(|e| ChainError::InternalError(format!("restore: reload: {e:?}")))?;
+        Ok(header)
+    }
+
     /// Expand and fully load a snapshot checkpoint before it is allowed to
     /// replace durable state. Loading catches malformed arena sections and the
     /// revision comparison prevents an envelope from claiming a different
@@ -1561,6 +1625,94 @@ impl Database {
                 header.revision
             )));
         }
+        Ok(staged)
+    }
+
+    fn stage_snapshot_stream(
+        input: &mut fs::File,
+        header: crate::snapshot::SnapshotHeader,
+        dir: &Path,
+    ) -> Result<tempfile::NamedTempFile, ChainError> {
+        let staged = tempfile::NamedTempFile::new_in(dir)
+            .map_err(|e| ChainError::InternalError(format!("restore: stage: {e}")))?;
+        let mut output = staged.as_file();
+        let mut hasher = Sha256::new();
+        let mut payload_read = 0u64;
+        let mut read_payload = |buf: &mut [u8], payload_read: &mut u64| -> Result<(), ChainError> {
+            input.read_exact(buf).map_err(|e| {
+                ChainError::InternalError(format!("restore: read sparse payload: {e}"))
+            })?;
+            hasher.update(&*buf);
+            *payload_read = (*payload_read)
+                .checked_add(buf.len() as u64)
+                .ok_or_else(|| ChainError::InternalError("restore: payload length overflow".into()))?;
+            if *payload_read > header.payload_len {
+                return Err(ChainError::InternalError(
+                    "restore: sparse payload exceeds envelope length".into(),
+                ));
+            }
+            Ok(())
+        };
+
+        let mut logical_len_bytes = [0u8; 8];
+        read_payload(&mut logical_len_bytes, &mut payload_read)?;
+        let logical_len = u64::from_le_bytes(logical_len_bytes);
+        let mut previous_end = 0u64;
+        while payload_read < header.payload_len {
+            let remaining = header.payload_len - payload_read;
+            if remaining < 16 {
+                return Err(ChainError::InternalError(
+                    "restore: sparse run header is truncated".into(),
+                ));
+            }
+            let mut run_header = [0u8; 16];
+            read_payload(&mut run_header, &mut payload_read)?;
+            let offset = u64::from_le_bytes(run_header[..8].try_into().unwrap());
+            let len = u64::from_le_bytes(run_header[8..].try_into().unwrap());
+            if len == 0 {
+                return Err(ChainError::InternalError(
+                    "restore: sparse run has zero length".into(),
+                ));
+            }
+            let end = offset
+                .checked_add(len)
+                .ok_or_else(|| ChainError::InternalError("restore: sparse run overflows".into()))?;
+            if offset < previous_end || end > logical_len {
+                return Err(ChainError::InternalError(
+                    "restore: sparse run is out of order or out of bounds".into(),
+                ));
+            }
+            output
+                .seek(SeekFrom::Start(offset))
+                .map_err(|e| ChainError::InternalError(format!("restore: seek staged arena: {e}")))?;
+            let mut remaining_run = len;
+            let mut buffer = vec![0u8; 4 * 1024 * 1024];
+            while remaining_run != 0 {
+                let chunk = remaining_run.min(buffer.len() as u64) as usize;
+                read_payload(&mut buffer[..chunk], &mut payload_read)?;
+                output.write_all(&buffer[..chunk]).map_err(|e| {
+                    ChainError::InternalError(format!("restore: write staged arena: {e}"))
+                })?;
+                remaining_run -= chunk as u64;
+            }
+            previous_end = end;
+        }
+        if payload_read != header.payload_len {
+            return Err(ChainError::InternalError(
+                "restore: sparse payload length mismatch".into(),
+            ));
+        }
+        if hasher.finalize().as_slice() != header.payload_sha256 {
+            return Err(ChainError::InternalError(
+                "restore: snapshot payload checksum mismatch".into(),
+            ));
+        }
+        output
+            .set_len(logical_len)
+            .map_err(|e| ChainError::InternalError(format!("restore: size staged arena: {e}")))?;
+        output
+            .sync_all()
+            .map_err(|e| ChainError::InternalError(format!("restore: sync staged arena: {e}")))?;
         Ok(staged)
     }
 
@@ -4186,6 +4338,28 @@ mod tests {
         let carol = name_u64("carol");
         b.create_account(carol, 3).unwrap();
         assert!(b.arena_account_exists(carol));
+    }
+
+    #[test]
+    fn restore_from_path_streams_snapshot_envelope() {
+        let src = TempDir::new().unwrap();
+        let mut source = Database::new(src.path().to_str().unwrap(), TEST_DB_SIZE).unwrap();
+        source.add_indices().unwrap();
+        source.set_revision(4).unwrap();
+        let alice = name_u64("alice");
+        source.create_account(alice, 1).unwrap();
+        let snapshot = source.snapshot_bytes().unwrap();
+        let checkpoint = src.path().join("migration.snapshot");
+        fs::write(&checkpoint, snapshot).unwrap();
+
+        let dst = TempDir::new().unwrap();
+        let mut target = Database::new(dst.path().to_str().unwrap(), TEST_DB_SIZE).unwrap();
+        target.add_indices().unwrap();
+        target.set_revision(9).unwrap();
+        let header = target.restore_from_path(&checkpoint).unwrap();
+        assert_eq!(header.revision, 4);
+        assert_eq!(target.revision(), 4);
+        assert!(target.arena_account_exists(alice));
     }
 
     #[test]

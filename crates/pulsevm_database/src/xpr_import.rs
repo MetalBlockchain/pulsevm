@@ -10,12 +10,15 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt,
+    fs::File,
     io::Read,
+    path::Path,
 };
 
 use flate2::read::ZlibDecoder;
 use pulsevm_crypto::Digest;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as Sha2Digest, Sha256};
 
 use crate::{ChainConfigV0, Database, Float128, U256};
 
@@ -171,6 +174,67 @@ impl MigrationManifest {
         }
         let header = crate::snapshot::peek_header(checkpoint)
             .map_err(|error| format!("invalid checkpoint envelope: {error}"))?;
+        if header.revision != self.checkpoint_revision {
+            return Err(format!(
+                "checkpoint revision {} does not match manifest {}",
+                header.revision, self.checkpoint_revision
+            ));
+        }
+        Ok(())
+    }
+
+    /// Verify a checkpoint directly from disk without materializing a
+    /// multi-gigabyte envelope in the controller process.
+    pub fn verify_checkpoint_path(&self, checkpoint: impl AsRef<Path>) -> Result<(), String> {
+        let path = checkpoint.as_ref();
+        if self.version != Self::VERSION {
+            return Err(format!(
+                "unsupported migration manifest version {} (expected {})",
+                self.version,
+                Self::VERSION
+            ));
+        }
+        let mut file = File::open(path)
+            .map_err(|error| format!("cannot read checkpoint {}: {error}", path.display()))?;
+        let length = file
+            .metadata()
+            .map_err(|error| format!("cannot stat checkpoint {}: {error}", path.display()))?
+            .len();
+        if length < crate::snapshot::HEADER_LEN as u64 {
+            return Err("checkpoint is shorter than its snapshot envelope header".into());
+        }
+        let mut header_bytes = vec![0u8; crate::snapshot::HEADER_LEN];
+        file.read_exact(&mut header_bytes)
+            .map_err(|error| format!("cannot read checkpoint header: {error}"))?;
+        let header = crate::snapshot::peek_header(&header_bytes)
+            .map_err(|error| format!("invalid checkpoint envelope: {error}"))?;
+        let expected_length = (crate::snapshot::HEADER_LEN as u64)
+            .checked_add(header.payload_len)
+            .ok_or_else(|| "checkpoint length overflows u64".to_string())?;
+        if length != expected_length {
+            return Err(format!(
+                "checkpoint length {length} does not match envelope payload {expected_length}"
+            ));
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(&header_bytes);
+        let mut buffer = vec![0u8; 4 * 1024 * 1024];
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .map_err(|error| format!("cannot read checkpoint: {error}"))?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        let actual = hex::encode(hasher.finalize());
+        if actual != self.checkpoint_sha256 {
+            return Err(format!(
+                "checkpoint SHA-256 {actual} does not match manifest {}",
+                self.checkpoint_sha256
+            ));
+        }
         if header.revision != self.checkpoint_revision {
             return Err(format!(
                 "checkpoint revision {} does not match manifest {}",
@@ -2584,6 +2648,22 @@ mod tests {
                 .unwrap_err()
                 .contains("does not match manifest")
         );
+    }
+
+    #[test]
+    fn migration_manifest_verifies_checkpoint_from_path() {
+        let checkpoint = crate::snapshot::encode(7, b"checkpoint");
+        let manifest = MigrationManifest::new(
+            b"source state history",
+            [9; 32],
+            &checkpoint,
+            7,
+            ImportSummary::default(),
+        );
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("migration.snapshot");
+        std::fs::write(&path, checkpoint).unwrap();
+        assert!(manifest.verify_checkpoint_path(&path).is_ok());
     }
 
     #[test]
