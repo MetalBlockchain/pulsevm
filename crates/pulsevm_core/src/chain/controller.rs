@@ -212,6 +212,7 @@ pub struct Controller {
 pub struct MempoolAdmissionState {
     db: Database,
     chain_id: Id,
+    protocol_upgrade_schedule: ProtocolUpgradeSchedule,
 }
 
 impl MempoolAdmissionState {
@@ -222,6 +223,19 @@ impl MempoolAdmissionState {
     ) -> Result<(), ChainError> {
         let signed_transaction = packed_transaction.get_signed_transaction();
         let transaction = signed_transaction.transaction();
+
+        let accepted_height = u32::try_from(self.db.revision()).map_err(|_| {
+            ChainError::InternalError(format!(
+                "database revision {} cannot be used as an accepted block height",
+                self.db.revision()
+            ))
+        })?;
+        let next_block_height = accepted_height
+            .checked_add(1)
+            .ok_or_else(|| ChainError::InternalError("accepted block height overflow".into()))?;
+        self.protocol_upgrade_schedule
+            .execution_context(next_block_height)
+            .map_err(|e| ChainError::BlockError(e.to_string()))?;
 
         transaction.validate(pending_block_timestamp)?;
 
@@ -1739,6 +1753,7 @@ impl Controller {
         MempoolAdmissionState {
             db: self.db.clone(),
             chain_id: self.chain_id.clone(),
+            protocol_upgrade_schedule: self.protocol_upgrade_schedule.clone(),
         }
     }
 

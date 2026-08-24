@@ -876,6 +876,18 @@ mod tests {
         Id,
         tempfile::TempDir,
     ) {
+        service_with_genesis_and_upgrades(&[])
+    }
+
+    fn service_with_genesis_and_upgrades(
+        upgrade_bytes: &[u8],
+    ) -> (
+        RpcService,
+        Arc<RwLock<Mempool>>,
+        PrivateKey,
+        Id,
+        tempfile::TempDir,
+    ) {
         let genesis_key = PrivateKey::from_str(GENESIS_KEY).unwrap();
         let chain_id = Id::from_str(CHAIN_ID).unwrap();
         let temp = tempfile::tempdir().unwrap();
@@ -888,10 +900,11 @@ mod tests {
         .to_string()
         .into_bytes();
         controller
-            .initialize(
+            .initialize_with_protocol_upgrades(
                 &chain_id,
                 &config_bytes,
                 &genesis_bytes(&genesis_key),
+                upgrade_bytes,
                 temp.path().to_str().unwrap(),
             )
             .unwrap();
@@ -929,6 +942,34 @@ mod tests {
             json!(EMPTY_PROTOCOL_SCHEDULE_HASH)
         );
         assert_eq!(json["next_protocol_upgrade"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn admission_rejects_transaction_targeting_unsupported_protocol_activation() {
+        let unsupported_version = PROTOCOL_VERSION + 1;
+        let upgrade_bytes = format!(
+            r#"{{"protocol_upgrades":[{{"protocol_version":{},"activation_height":2}}]}}"#,
+            unsupported_version
+        );
+        let (service, mempool, genesis_key, chain_id, _temp) =
+            service_with_genesis_and_upgrades(upgrade_bytes.as_bytes());
+
+        let transaction = newaccount_tx(&genesis_key, &genesis_key, "alice", &chain_id);
+        let error = service
+            .admit_transaction(transaction.clone())
+            .await
+            .expect_err("unsupported activation must reject admission");
+
+        assert!(
+            error.to_string().contains(&format!(
+                "protocol version {unsupported_version} is unsupported by this binary"
+            )),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !mempool.read().await.contains(transaction.id()),
+            "a transaction targeting an unsupported protocol block must not enter the mempool"
+        );
     }
 
     async fn wait_for_batch_detach(mempool: &Arc<RwLock<Mempool>>) {
