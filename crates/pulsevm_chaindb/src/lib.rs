@@ -1481,6 +1481,32 @@ impl ChainDatabase {
         Ok(())
     }
 
+    /// Replace the source-visible account metadata fields when a SHiP delta
+    /// modifies an existing account_metadata row.
+    pub fn xpr_import_update_account_metadata_source(
+        &self,
+        name: u64,
+        privileged: bool,
+        last_code_update: i64,
+        code_hash: [u8; 32],
+        vm_type: u8,
+        vm_version: u8,
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let id = db
+            .find_by_hash::<AccountMetaRow, AccountMetaRowByName>(&name)?
+            .map(|row| row.id())
+            .ok_or_else(|| DbError::Corrupted("account_metadata delta row is missing".into()))?;
+        db.modify::<AccountMetaRow>(id, |row| {
+            row.flags = privileged as u32;
+            row.last_code_update = last_code_update;
+            row.code_hash = code_hash;
+            row.vm_type = vm_type;
+            row.vm_version = vm_version;
+        })?;
+        Ok(())
+    }
+
     /// Restores account-metadata sequence counters from the source chainbase
     /// sidecar. SHiP omits these counters from its row projection.
     pub fn xpr_import_update_account_metadata(
@@ -2252,29 +2278,33 @@ impl ChainDatabase {
         out
     }
 
-    /// Seeds resource_usage rows from the canonical layout — genesis native
-    /// accounts get their rows (and billed ram) inside C++. A present owner is
-    /// left untouched.
+    /// Seeds or replaces resource_usage rows from the canonical layout. The
+    /// replacement behavior is also used when applying SHiP delta rows.
     pub fn hydrate_resource_usage(&self, bytes: &[u8]) -> Result<(), DbError> {
         const ROW: usize = 8 + 8 + 20 + 20; // owner, ram, net acc, cpu acc
         let mut db = self.lock();
         for c in bytes.chunks_exact(ROW) {
             let owner = u64::from_le_bytes(c[0..8].try_into().unwrap());
-            if db
-                .find_by::<ResourceUsageRow, ResourceUsageRowByOwner>(&owner)?
-                .is_some()
-            {
-                continue;
-            }
             let ram = u64::from_le_bytes(c[8..16].try_into().unwrap());
             let net = read_acc(&c[16..36]);
             let cpu = read_acc(&c[36..56]);
-            db.create::<ResourceUsageRow>(|r| {
-                r.owner = owner;
-                r.ram_usage = ram;
-                r.net_usage = net;
-                r.cpu_usage = cpu;
-            })?;
+            if let Some(id) = db
+                .find_by::<ResourceUsageRow, ResourceUsageRowByOwner>(&owner)?
+                .map(|row| row.id())
+            {
+                db.modify::<ResourceUsageRow>(id, |r| {
+                    r.ram_usage = ram;
+                    r.net_usage = net;
+                    r.cpu_usage = cpu;
+                })?;
+            } else {
+                db.create::<ResourceUsageRow>(|r| {
+                    r.owner = owner;
+                    r.ram_usage = ram;
+                    r.net_usage = net;
+                    r.cpu_usage = cpu;
+                })?;
+            }
         }
         Ok(())
     }
@@ -2301,30 +2331,34 @@ impl ChainDatabase {
         out
     }
 
-    /// Seeds resource_limits rows from the canonical layout (genesis native
-    /// accounts). A present `(pending, owner)` is left untouched.
+    /// Seeds or replaces resource_limits rows from the canonical layout.
     pub fn hydrate_account_limits(&self, bytes: &[u8]) -> Result<(), DbError> {
         const ROW: usize = 1 + 8 + 8 + 8 + 8;
         let mut db = self.lock();
         for c in bytes.chunks_exact(ROW) {
             let pending = c[0];
             let owner = u64::from_le_bytes(c[1..9].try_into().unwrap());
-            if db
-                .find_by::<ResourceLimitsRow, LimitsByOwner>(&(pending, owner))?
-                .is_some()
-            {
-                continue;
-            }
             let ram = u64::from_le_bytes(c[9..17].try_into().unwrap()) as i64;
             let net = u64::from_le_bytes(c[17..25].try_into().unwrap()) as i64;
             let cpu = u64::from_le_bytes(c[25..33].try_into().unwrap()) as i64;
-            db.create::<ResourceLimitsRow>(|r| {
-                r.pending = pending;
-                r.owner = owner;
-                r.ram_bytes = ram;
-                r.net_weight = net;
-                r.cpu_weight = cpu;
-            })?;
+            if let Some(id) = db
+                .find_by::<ResourceLimitsRow, LimitsByOwner>(&(pending, owner))?
+                .map(|row| row.id())
+            {
+                db.modify::<ResourceLimitsRow>(id, |r| {
+                    r.ram_bytes = ram;
+                    r.net_weight = net;
+                    r.cpu_weight = cpu;
+                })?;
+            } else {
+                db.create::<ResourceLimitsRow>(|r| {
+                    r.pending = pending;
+                    r.owner = owner;
+                    r.ram_bytes = ram;
+                    r.net_weight = net;
+                    r.cpu_weight = cpu;
+                })?;
+            }
         }
         Ok(())
     }
@@ -3124,6 +3158,27 @@ impl ChainDatabase {
             row.code_ref_count = code_ref_count;
             row.vm_type = vm_type;
             row.vm_version = vm_version;
+        })?;
+        Ok(())
+    }
+
+    /// Replace a source code row during SHiP delta application, preserving its
+    /// Arena object id and any fields not represented by the wire row.
+    pub fn xpr_import_update_code(
+        &self,
+        code_hash: [u8; 32],
+        code: &[u8],
+        vm_type: u8,
+        vm_version: u8,
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let id = db
+            .find_by::<CodeRow, CodeByHash>(&(code_hash, vm_type, vm_version))?
+            .map(|row| row.id())
+            .ok_or_else(|| DbError::Corrupted("code delta row is missing".into()))?;
+        let blob = db.alloc_blob::<CodeRow>(code)?;
+        db.modify::<CodeRow>(id, |row| {
+            row.code = blob;
         })?;
         Ok(())
     }

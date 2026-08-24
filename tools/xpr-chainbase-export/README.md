@@ -84,6 +84,19 @@ decoded table/row counts. It reports `generated_transaction` rows explicitly:
 SHiP v0 omits their scheduling timestamps, and the deferred sidecar currently
 covers the imported snapshot head rather than later window deltas.
 
+The bounded consumer can apply supported rows to a restored checkpoint with
+per-block undo/rollback:
+
+```bash
+cargo run -p pulsevm_database --example xpr_apply_history_window -- \
+  /data/xpr-migration.snapshot \
+  /data/xpr-export-window/state-history/chain_state_history.log \
+  /tmp/xpr-arena-window 10000
+```
+
+It stops fail-closed at a generated transaction until a matching per-block
+sidecar is available.
+
 ## Output contract
 
 `manifest.env` binds the source commit, input snapshot hash and history-log

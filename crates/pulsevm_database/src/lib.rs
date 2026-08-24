@@ -47,6 +47,8 @@ pub use crate::{
         XprImportError,
         hydrate_full_state,
         hydrate_full_state_with_deferred_transactions,
+        apply_state_history_delta,
+        apply_state_history_log_window,
         inspect_state_history_log,
         parse_initial_state_history_log,
     },

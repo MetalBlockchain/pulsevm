@@ -2081,6 +2081,27 @@ impl Database {
             })
     }
 
+    pub(crate) fn xpr_import_update_account_metadata_source(
+        &self,
+        name: u64,
+        privileged: bool,
+        last_code_update: i64,
+        code_hash: [u8; 32],
+        vm_type: u8,
+        vm_version: u8,
+    ) -> Result<(), ChainError> {
+        self.backend
+            .xpr_import_update_account_metadata_source(
+                name,
+                privileged,
+                last_code_update,
+                code_hash,
+                vm_type,
+                vm_version,
+            )
+            .map_err(|e| ChainError::InternalError(format!("XPR import account metadata delta: {e:?}")))
+    }
+
     /// Insert a code image and its derived source reference count while
     /// hydrating XPR state history.
     pub(crate) fn xpr_import_code(
@@ -2094,6 +2115,18 @@ impl Database {
         self.backend
             .xpr_import_code(code_hash, code, code_ref_count, vm_type, vm_version)
             .map_err(|e| ChainError::InternalError(format!("XPR import code: {e:?}")))
+    }
+
+    pub(crate) fn xpr_import_update_code(
+        &self,
+        code_hash: [u8; 32],
+        code: &[u8],
+        vm_type: u8,
+        vm_version: u8,
+    ) -> Result<(), ChainError> {
+        self.backend
+            .xpr_import_update_code(code_hash, code, vm_type, vm_version)
+            .map_err(|e| ChainError::InternalError(format!("XPR import code delta: {e:?}")))
     }
 
     pub(crate) fn xpr_import_update_code_metadata(
@@ -2215,6 +2248,50 @@ impl Database {
             .create_permission(id, parent, owner, name, last_updated, authority)
             .map_err(|e| ChainError::InternalError(format!("XPR import permission: {e:?}")))?;
         Ok(id)
+    }
+
+    pub(crate) fn xpr_import_upsert_permission(
+        &self,
+        parent_name: u64,
+        owner: u64,
+        name: u64,
+        last_updated: i64,
+        authority: &[u8],
+    ) -> Result<(), ChainError> {
+        let parent = if parent_name == 0 {
+            0
+        } else {
+            self.backend
+                .permission(owner, parent_name)
+                .map(|(id, _)| id)
+                .ok_or_else(|| {
+                    ChainError::InternalError(format!(
+                        "XPR import permission parent {parent_name} is missing"
+                    ))
+                })?
+        };
+        if self.backend.permission(owner, name).is_some() {
+            self.backend
+                .modify_permission(owner, name, authority, last_updated)
+                .map_err(|e| ChainError::InternalError(format!("XPR import permission delta: {e:?}")))
+        } else {
+            let id = self.backend.next_permission_id().map_err(|e| {
+                ChainError::InternalError(format!("XPR import next permission id: {e:?}"))
+            })?;
+            self.backend
+                .create_permission(id, parent, owner, name, last_updated, authority)
+                .map_err(|e| ChainError::InternalError(format!("XPR import permission delta: {e:?}")))
+        }
+    }
+
+    pub(crate) fn xpr_import_remove_permission(
+        &self,
+        owner: u64,
+        name: u64,
+    ) -> Result<(), ChainError> {
+        self.backend
+            .remove_permission(owner, name)
+            .map_err(|e| ChainError::InternalError(format!("XPR remove permission delta: {e:?}")))
     }
 
     pub(crate) fn xpr_import_permission_last_used(
@@ -2690,6 +2767,17 @@ impl Database {
         self.backend
             .create_table(code, scope, table, payer)
             .map_err(|e| ChainError::InternalError(format!("XPR import contract table: {e:?}")))
+    }
+
+    pub(crate) fn xpr_import_remove_contract_table(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+    ) -> Result<(), ChainError> {
+        self.backend
+            .remove_table(code, scope, table)
+            .map_err(|e| ChainError::InternalError(format!("XPR remove contract table: {e:?}")))
     }
 
     /// The `(payer, value)` of a contract row from the arena, or `None`.

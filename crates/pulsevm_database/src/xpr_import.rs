@@ -789,6 +789,555 @@ pub fn hydrate_full_state_with_deferred_transactions(
     }
 }
 
+/// Apply one post-snapshot SHiP table-delta entry transactionally. The source
+/// log's `present=false` rows are removals; modified rows are upserted using
+/// their primary keys. Generated transactions are rejected until a matching
+/// per-block chainbase sidecar is supplied, because SHiP v0 omits their timing.
+pub fn apply_state_history_delta(
+    db: &mut Database,
+    entry: &StateHistoryEntry,
+) -> Result<ImportSummary, XprImportError> {
+    let mut decoded = Vec::new();
+    for delta in &entry.deltas {
+        for row in &delta.rows {
+            decoded.push((
+                row.present,
+                decode_portable_row(&delta.name, &row.data)?,
+            ));
+        }
+    }
+
+    db.arena_start_undo_session();
+    let mut summary = ImportSummary::default();
+    let result = (|| {
+        for (present, row) in decoded {
+            if let PortableRow::GeneratedTransaction { .. } = row {
+                return Err(bad(format!(
+                    "cannot apply block {}: generated_transaction rows require a per-block deferred sidecar",
+                    hex::encode(entry.block_id)
+                )));
+            }
+            apply_delta_row(db, present, row, &mut summary)?;
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            db.arena_squash();
+            Ok(summary)
+        }
+        Err(error) => {
+            db.arena_undo();
+            Err(error)
+        }
+    }
+}
+
+/// Stream and apply up to `max_post_snapshot_entries` after the initial full
+/// state record. The first record is framed and skipped; each later record is
+/// committed independently so a bad block rolls back only its own changes.
+pub fn apply_state_history_log_window(
+    db: &mut Database,
+    path: impl AsRef<Path>,
+    max_post_snapshot_entries: u64,
+) -> Result<u64, XprImportError> {
+    let mut file = File::open(path.as_ref())
+        .map_err(|error| bad(format!("opening state-history log: {error}")))?;
+    let mut offset = 0u64;
+    let mut previous_block_num: Option<u32> = None;
+    let mut entry_number = 0u64;
+    let mut applied = 0u64;
+    loop {
+        let mut header = [0u8; LOG_HEADER_LEN];
+        match file.read(&mut header[..1]) {
+            Ok(0) => break,
+            Ok(1) => {}
+            Ok(_) => unreachable!(),
+            Err(error) => return Err(bad(format!("reading state-history header: {error}"))),
+        }
+        file.read_exact(&mut header[1..])
+            .map_err(|error| bad(format!("truncated state-history header: {error}")))?;
+        let magic = u64::from_le_bytes(header[0..8].try_into().unwrap());
+        if (magic as u16) != 0 {
+            return Err(bad(format!("unsupported XPR state-history version {}", magic as u16)));
+        }
+        let mut block_id = [0u8; 32];
+        block_id.copy_from_slice(&header[8..40]);
+        let payload_len = u64::from_le_bytes(header[40..48].try_into().unwrap());
+        let next_offset = offset
+            .checked_add(LOG_HEADER_LEN as u64)
+            .and_then(|n| n.checked_add(payload_len))
+            .and_then(|n| n.checked_add(LOG_TRAILER_LEN as u64))
+            .ok_or_else(|| bad("state-history record offset overflows"))?;
+        let block_num = u32::from_be_bytes(block_id[..4].try_into().unwrap());
+        if let Some(previous) = previous_block_num
+            && block_num != previous.saturating_add(1)
+        {
+            return Err(bad(format!(
+                "state-history block sequence jumps from {previous} to {block_num}"
+            )));
+        }
+        previous_block_num = Some(block_num);
+
+        if entry_number == 0 {
+            file.seek(SeekFrom::Current(
+                i64::try_from(payload_len)
+                    .map_err(|_| bad("state-history payload offset does not fit i64"))?,
+            ))
+            .map_err(|error| bad(format!("skipping initial state payload: {error}")))?;
+        } else {
+            if applied >= max_post_snapshot_entries {
+                break;
+            }
+            let payload_len = usize::try_from(payload_len)
+                .map_err(|_| bad("state-history payload length does not fit this platform"))?;
+            let mut payload = vec![0u8; payload_len];
+            file.read_exact(&mut payload)
+                .map_err(|error| bad(format!("reading state-history payload: {error}")))?;
+            let entry = StateHistoryEntry {
+                magic,
+                block_id,
+                deltas: parse_table_deltas(&decompress_state_history_payload(&payload)?)?,
+            };
+            apply_state_history_delta(db, &entry)?;
+            applied += 1;
+        }
+
+        let mut trailer = [0u8; LOG_TRAILER_LEN];
+        file.read_exact(&mut trailer)
+            .map_err(|error| bad(format!("truncated state-history record trailer: {error}")))?;
+        let recorded_offset = u64::from_le_bytes(trailer);
+        if recorded_offset != offset {
+            return Err(bad(format!(
+                "state-history record at offset {offset} carries trailer offset {recorded_offset}"
+            )));
+        }
+        offset = next_offset;
+        entry_number += 1;
+        if entry_number > 1 && applied >= max_post_snapshot_entries {
+            break;
+        }
+    }
+    Ok(applied)
+}
+
+fn apply_delta_row(
+    db: &mut Database,
+    present: bool,
+    row: PortableRow,
+    summary: &mut ImportSummary,
+) -> Result<(), XprImportError> {
+    let missing = |table: &str| bad(format!("cannot remove unsupported singleton row {table}"));
+    match row {
+        PortableRow::GlobalProperty { config, .. } if present => {
+            db.set_global_properties(&config).map_err(database_error)?;
+            summary.global_properties += 1;
+        }
+        PortableRow::GlobalProperty { .. } => return Err(missing("global_property")),
+        PortableRow::ProtocolState { features } if present => {
+            db.xpr_import_protocol_features(&features)
+                .map_err(database_error)?;
+            summary.source_activated_protocol_features = features.len() as u64;
+        }
+        PortableRow::ProtocolState { .. } => return Err(missing("protocol_state")),
+        PortableRow::Account {
+            name,
+            creation_date,
+            abi,
+        } if present => {
+            if db.is_account(name).map_err(database_error)? {
+                db.xpr_import_set_account_abi_raw(name, &abi)
+                    .map_err(database_error)?;
+            } else {
+                db.create_account(name, creation_date).map_err(database_error)?;
+                db.xpr_import_set_account_abi_raw(name, &abi)
+                    .map_err(database_error)?;
+            }
+            summary.accounts += 1;
+        }
+        PortableRow::Account { .. } => {
+            return Err(bad("account removals are not supported by the Arena importer"));
+        }
+        PortableRow::AccountMetadata {
+            name,
+            privileged,
+            last_code_update,
+            code,
+        } if present => {
+            let (hash, vm_type, vm_version) = code
+                .map(|reference| (reference.hash, reference.vm_type, reference.vm_version))
+                .unwrap_or(([0; 32], 0, 0));
+            if db.arena_account_metadata(name).is_some() {
+                db.xpr_import_update_account_metadata_source(
+                    name,
+                    privileged,
+                    last_code_update,
+                    hash,
+                    vm_type,
+                    vm_version,
+                )
+                .map_err(database_error)?;
+            } else {
+                db.xpr_import_account_metadata(
+                    name,
+                    privileged,
+                    last_code_update,
+                    hash,
+                    vm_type,
+                    vm_version,
+                )
+                .map_err(database_error)?;
+            }
+            summary.account_metadata += 1;
+        }
+        PortableRow::AccountMetadata { .. } => {
+            return Err(bad(
+                "account_metadata removals are not supported by the Arena importer",
+            ));
+        }
+        PortableRow::Code {
+            hash,
+            code,
+            vm_type,
+            vm_version,
+        } if present => {
+            if db.get_code_bytes_by_hash(&hash, vm_type, vm_version).is_ok() {
+                db.xpr_import_update_code(hash, &code, vm_type, vm_version)
+                    .map_err(database_error)?;
+            } else {
+                db.xpr_import_code(hash, &code, 0, vm_type, vm_version)
+                    .map_err(database_error)?;
+            }
+            summary.code_rows += 1;
+        }
+        PortableRow::Code { .. } => {
+            return Err(bad("code removals are not supported by the Arena importer"));
+        }
+        PortableRow::Permission {
+            owner,
+            name,
+            parent_name,
+            last_updated,
+            authority,
+        } if present => {
+            db.xpr_import_upsert_permission(parent_name, owner, name, last_updated, &authority)
+                .map_err(database_error)?;
+            summary.permissions += 1;
+        }
+        PortableRow::Permission {
+            owner, name, ..
+        } => {
+            db.xpr_import_remove_permission(owner, name)
+                .map_err(database_error)?;
+        }
+        PortableRow::PermissionLink {
+            account,
+            code,
+            message_type,
+            required_permission,
+        } if present => {
+            db.xpr_import_permission_link(account, code, message_type, required_permission)
+                .map_err(database_error)?;
+            summary.permission_links += 1;
+        }
+        PortableRow::PermissionLink {
+            account,
+            code,
+            message_type,
+            ..
+        } => {
+            db.unlink_auth(account, code, message_type)
+                .map_err(database_error)?;
+        }
+        PortableRow::ResourceLimits {
+            owner,
+            net_weight,
+            cpu_weight,
+            ram_bytes,
+        } if present => {
+            db.xpr_import_resource_limits(owner, net_weight, cpu_weight, ram_bytes)
+                .map_err(database_error)?;
+            summary.resource_limits += 1;
+        }
+        PortableRow::ResourceLimits { .. } => {
+            return Err(bad("resource_limits removals are not supported by the Arena importer"));
+        }
+        PortableRow::ResourceUsage {
+            owner,
+            ram_usage,
+            net_usage,
+            cpu_usage,
+        } if present => {
+            db.xpr_import_resource_usage(
+                owner,
+                ram_usage,
+                net_usage.value_ex,
+                net_usage.consumed,
+                net_usage.last_ordinal,
+                cpu_usage.value_ex,
+                cpu_usage.consumed,
+                cpu_usage.last_ordinal,
+            )
+            .map_err(database_error)?;
+            summary.resource_usage += 1;
+        }
+        PortableRow::ResourceUsage { .. } => {
+            return Err(bad("resource_usage removals are not supported by the Arena importer"));
+        }
+        PortableRow::ResourceState {
+            net,
+            cpu,
+            total_net_weight,
+            total_cpu_weight,
+            total_ram_bytes,
+            virtual_net_limit,
+            virtual_cpu_limit,
+        } if present => {
+            db.xpr_import_resource_state(
+                (net.value_ex, net.consumed, net.last_ordinal),
+                (cpu.value_ex, cpu.consumed, cpu.last_ordinal),
+                total_net_weight,
+                total_cpu_weight,
+                total_ram_bytes,
+                virtual_net_limit,
+                virtual_cpu_limit,
+            )
+            .map_err(database_error)?;
+            summary.resource_states += 1;
+        }
+        PortableRow::ResourceState { .. } => return Err(missing("resource_limits_state")),
+        PortableRow::ResourceConfig {
+            cpu,
+            net,
+            cpu_window,
+            net_window,
+        } if present => {
+            db.xpr_import_resource_config(cpu, net, cpu_window, net_window)
+                .map_err(database_error)?;
+            summary.resource_configs += 1;
+        }
+        PortableRow::ResourceConfig { .. } => return Err(missing("resource_limits_config")),
+        PortableRow::ContractTable {
+            code,
+            scope,
+            table,
+            payer,
+        } if present => {
+            db.xpr_import_create_contract_table(code, scope, table, payer)
+                .map_err(database_error)?;
+            summary.contract_tables += 1;
+        }
+        PortableRow::ContractTable {
+            code,
+            scope,
+            table,
+            ..
+        } => {
+            db.xpr_import_remove_contract_table(code, scope, table)
+                .map_err(database_error)?;
+        }
+        PortableRow::ContractRow {
+            code,
+            scope,
+            table,
+            primary,
+            payer,
+            value,
+        } if present => {
+            if db.arena_kv_row(code, scope, table, primary).is_some() {
+                db.update_key_value_object_standalone(code, scope, table, primary, payer, &value)
+                    .map_err(database_error)?;
+            } else {
+                db.create_key_value_object_standalone(code, scope, table, payer, primary, &value)
+                    .map_err(database_error)?;
+            }
+            summary.contract_rows += 1;
+        }
+        PortableRow::ContractRow {
+            code,
+            scope,
+            table,
+            primary,
+            ..
+        } => {
+            db.remove_key_value_object_standalone(code, scope, table, primary)
+                .map_err(database_error)?;
+        }
+        PortableRow::Index64 {
+            code,
+            scope,
+            table,
+            primary,
+            payer,
+            secondary,
+        } => apply_index64(db, present, code, scope, table, primary, payer, secondary, summary)?,
+        PortableRow::Index128 {
+            code,
+            scope,
+            table,
+            primary,
+            payer,
+            secondary,
+        } => apply_index128(db, present, code, scope, table, primary, payer, secondary, summary)?,
+        PortableRow::Index256 {
+            code,
+            scope,
+            table,
+            primary,
+            payer,
+            secondary,
+        } => apply_index256(db, present, code, scope, table, primary, payer, secondary, summary)?,
+        PortableRow::IndexDouble {
+            code,
+            scope,
+            table,
+            primary,
+            payer,
+            secondary,
+        } => apply_index_double(db, present, code, scope, table, primary, payer, secondary, summary)?,
+        PortableRow::IndexLongDouble {
+            code,
+            scope,
+            table,
+            primary,
+            payer,
+            secondary,
+        } => apply_index_long_double(db, present, code, scope, table, primary, payer, secondary, summary)?,
+        PortableRow::GeneratedTransaction { .. } => unreachable!(),
+    }
+    Ok(())
+}
+
+fn apply_index64(
+    db: &mut Database,
+    present: bool,
+    code: u64,
+    scope: u64,
+    table: u64,
+    primary: u64,
+    payer: u64,
+    secondary: u64,
+    summary: &mut ImportSummary,
+) -> Result<(), XprImportError> {
+    if present {
+        if db.arena_idx64_payer(code, scope, table, primary).is_some() {
+            db.update_index64_object_standalone(code, scope, table, primary, payer, secondary)
+        } else {
+            db.create_index64_object_standalone(code, scope, table, payer, primary, secondary)
+        }
+        .map_err(database_error)?;
+        summary.index64_rows += 1;
+    } else {
+        db.remove_index64_object_standalone(code, scope, table, primary)
+            .map_err(database_error)?;
+    }
+    Ok(())
+}
+
+fn apply_index128(
+    db: &mut Database,
+    present: bool,
+    code: u64,
+    scope: u64,
+    table: u64,
+    primary: u64,
+    payer: u64,
+    secondary: u128,
+    summary: &mut ImportSummary,
+) -> Result<(), XprImportError> {
+    if present {
+        if db.arena_idx128_payer(code, scope, table, primary).is_some() {
+            db.update_index128_object_standalone(code, scope, table, primary, payer, secondary)
+        } else {
+            db.create_index128_object_standalone(code, scope, table, payer, primary, secondary)
+        }
+        .map_err(database_error)?;
+        summary.index128_rows += 1;
+    } else {
+        db.remove_index128_object_standalone(code, scope, table, primary)
+            .map_err(database_error)?;
+    }
+    Ok(())
+}
+
+fn apply_index256(
+    db: &mut Database,
+    present: bool,
+    code: u64,
+    scope: u64,
+    table: u64,
+    primary: u64,
+    payer: u64,
+    secondary: U256,
+    summary: &mut ImportSummary,
+) -> Result<(), XprImportError> {
+    if present {
+        if db.arena_idx256_payer(code, scope, table, primary).is_some() {
+            db.update_index256_object_standalone(code, scope, table, primary, payer, secondary)
+        } else {
+            db.create_index256_object_standalone(code, scope, table, payer, primary, secondary)
+        }
+        .map_err(database_error)?;
+        summary.index256_rows += 1;
+    } else {
+        db.remove_index256_object_standalone(code, scope, table, primary)
+            .map_err(database_error)?;
+    }
+    Ok(())
+}
+
+fn apply_index_double(
+    db: &mut Database,
+    present: bool,
+    code: u64,
+    scope: u64,
+    table: u64,
+    primary: u64,
+    payer: u64,
+    secondary: u64,
+    summary: &mut ImportSummary,
+) -> Result<(), XprImportError> {
+    if present {
+        if db.arena_idx_double_payer(code, scope, table, primary).is_some() {
+            db.update_idx_double_object_standalone(code, scope, table, primary, payer, secondary)
+        } else {
+            db.create_idx_double_object_standalone(code, scope, table, payer, primary, secondary)
+        }
+        .map_err(database_error)?;
+        summary.index_double_rows += 1;
+    } else {
+        db.remove_idx_double_object_standalone(code, scope, table, primary)
+            .map_err(database_error)?;
+    }
+    Ok(())
+}
+
+fn apply_index_long_double(
+    db: &mut Database,
+    present: bool,
+    code: u64,
+    scope: u64,
+    table: u64,
+    primary: u64,
+    payer: u64,
+    secondary: Float128,
+    summary: &mut ImportSummary,
+) -> Result<(), XprImportError> {
+    if present {
+        if db.arena_idx_long_double_payer(code, scope, table, primary).is_some() {
+            db.update_idx_long_double_object_standalone(code, scope, table, primary, payer, secondary)
+        } else {
+            db.create_idx_long_double_object_standalone(code, scope, table, payer, primary, secondary)
+        }
+        .map_err(database_error)?;
+        summary.index_long_double_rows += 1;
+    } else {
+        db.remove_idx_long_double_object_standalone(code, scope, table, primary)
+            .map_err(database_error)?;
+    }
+    Ok(())
+}
+
 fn database_error(error: impl fmt::Display) -> XprImportError {
     bad(format!("writing Arena state: {error}"))
 }
@@ -951,36 +1500,37 @@ fn decode_portable_rows(entry: &StateHistoryEntry) -> Result<Vec<PortableRow>, X
                     delta.name
                 )));
             }
-            let decoded = match delta.name.as_str() {
-                "global_property" => decode_global_property(&row.data)?,
-                "protocol_state" => decode_protocol_state(&row.data)?,
-                "permission_link" => decode_permission_link(&row.data)?,
-                "resource_limits" => decode_resource_limits(&row.data)?,
-                "resource_usage" => decode_resource_usage(&row.data)?,
-                "resource_limits_state" => decode_resource_state(&row.data)?,
-                "resource_limits_config" => decode_resource_config(&row.data)?,
-                "account" => decode_account(&row.data)?,
-                "account_metadata" => decode_account_metadata(&row.data)?,
-                "code" => decode_code(&row.data)?,
-                "generated_transaction" => decode_generated_transaction(&row.data)?,
-                "permission" => decode_permission(&row.data)?,
-                "contract_table" => decode_contract_table(&row.data)?,
-                "contract_row" => decode_contract_row(&row.data)?,
-                "contract_index64" => decode_index64(&row.data)?,
-                "contract_index128" => decode_index128(&row.data)?,
-                "contract_index256" => decode_index256(&row.data)?,
-                "contract_index_double" => decode_index_double(&row.data)?,
-                "contract_index_long_double" => decode_index_long_double(&row.data)?,
-                table => {
-                    return Err(bad(format!(
-                        "XPR table {table:?} is not supported by the importer yet"
-                    )));
-                }
-            };
-            result.push(decoded);
+            result.push(decode_portable_row(&delta.name, &row.data)?);
         }
     }
     Ok(result)
+}
+
+fn decode_portable_row(name: &str, data: &[u8]) -> Result<PortableRow, XprImportError> {
+    match name {
+        "global_property" => decode_global_property(data),
+        "protocol_state" => decode_protocol_state(data),
+        "permission_link" => decode_permission_link(data),
+        "resource_limits" => decode_resource_limits(data),
+        "resource_usage" => decode_resource_usage(data),
+        "resource_limits_state" => decode_resource_state(data),
+        "resource_limits_config" => decode_resource_config(data),
+        "account" => decode_account(data),
+        "account_metadata" => decode_account_metadata(data),
+        "code" => decode_code(data),
+        "generated_transaction" => decode_generated_transaction(data),
+        "permission" => decode_permission(data),
+        "contract_table" => decode_contract_table(data),
+        "contract_row" => decode_contract_row(data),
+        "contract_index64" => decode_index64(data),
+        "contract_index128" => decode_index128(data),
+        "contract_index256" => decode_index256(data),
+        "contract_index_double" => decode_index_double(data),
+        "contract_index_long_double" => decode_index_long_double(data),
+        table => Err(bad(format!(
+            "XPR table {table:?} is not supported by the importer yet"
+        ))),
+    }
 }
 
 fn validate_code_links(
