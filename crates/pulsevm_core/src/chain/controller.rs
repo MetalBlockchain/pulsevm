@@ -309,7 +309,7 @@ impl MempoolAdmissionState {
         AuthorizationManager::check_authorization(
             &self.db,
             &transaction.actions,
-            &signed_transaction.recovered_keys(&self.chain_id)?,
+            &signed_transaction.recovered_authority_keys(&self.chain_id)?,
             &BTreeSet::new(),
             seconds(transaction.header.delay_sec.into()),
             &BTreeSet::new(),
