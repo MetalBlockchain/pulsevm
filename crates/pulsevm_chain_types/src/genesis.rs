@@ -137,7 +137,7 @@ fn decode_hex_32(value: &str) -> Result<[u8; 32], ChainError> {
         ));
     }
     let mut bytes = [0u8; 32];
-    for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, chunk) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         bytes[index] = (hex_nibble(chunk[0]) << 4) | hex_nibble(chunk[1]);
     }
     Ok(bytes)
