@@ -92,7 +92,16 @@ fn main() -> ExitCode {
     ) {
         Ok(summary) => {
             if let Some(checkpoint_path) = checkpoint_path {
-                if let Err(error) = database.set_revision(1) {
+                // Arena's revision is the source chain height. Keeping the
+                // actual SHiP anchor here lets startup and SHiP advertise the
+                // first post-import block instead of pretending the snapshot
+                // was block one.
+                let source_block = u32::from_be_bytes(entry.block_id[..4].try_into().unwrap());
+                if source_block == 0 {
+                    eprintln!("cannot write migration checkpoint: source block id has height 0");
+                    return ExitCode::from(1);
+                }
+                if let Err(error) = database.set_revision(i64::from(source_block)) {
                     eprintln!("cannot set migration checkpoint revision: {error}");
                     return ExitCode::from(1);
                 }

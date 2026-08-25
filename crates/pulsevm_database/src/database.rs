@@ -1398,6 +1398,35 @@ impl Database {
         Some(self.backend.state_root())
     }
 
+    /// Canonical bytes used by the differential replay/fingerprint tools.
+    /// The order and names are part of the report format; do not derive them
+    /// from hash-map iteration.
+    pub fn arena_state_table_bytes(&self) -> Vec<(&'static str, Vec<u8>)> {
+        vec![
+            ("account_metadata", self.arena_account_metadata_state_bytes().unwrap_or_default()),
+            ("account", self.arena_account_state_bytes().unwrap_or_default()),
+            ("permission", self.arena_permission_state_bytes().unwrap_or_default()),
+            ("permission_link", self.arena_permission_link_state_bytes().unwrap_or_default()),
+            ("code", self.arena_code_state_bytes().unwrap_or_default()),
+            ("transaction", self.arena_transaction_state_bytes().unwrap_or_default()),
+            ("resource_usage", self.arena_resource_usage_state_bytes().unwrap_or_default()),
+            ("resource_limits", self.arena_account_limits_state_bytes().unwrap_or_default()),
+            ("resource_state", self.arena_resource_state_bytes().unwrap_or_default()),
+            (
+                "dynamic_global_property",
+                self.arena_global_action_sequence()
+                    .unwrap_or(0)
+                    .to_le_bytes()
+                    .to_vec(),
+            ),
+            ("global_property", self.arena_global_property_state_bytes().unwrap_or_default()),
+            ("resource_limits_config", self.arena_resource_config_state_bytes().unwrap_or_default()),
+            ("contract_table", self.arena_contract_table_state_bytes().unwrap_or_default()),
+            ("contract_key_value", self.arena_contract_kv_state_bytes().unwrap_or_default()),
+            ("protocol_state", self.arena_protocol_state_bytes().unwrap_or_default()),
+        ]
+    }
+
     /// Arena undo-session lifecycle, driven by the controller's block boundaries.
     pub fn arena_start_undo_session(&self) {
         self.backend.start_undo_session();

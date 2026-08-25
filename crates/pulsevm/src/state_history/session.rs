@@ -290,6 +290,22 @@ impl Session {
             .get_block_id(serveable)
             .await?
             .unwrap_or(head_block_id);
+        // A state-synced/imported node deliberately starts its trace and
+        // chain-state logs empty. Advertising block 1 in that state makes a
+        // SHiP reader request history that can never be served. Once a log has
+        // entries, its physical range is authoritative; otherwise the first
+        // streamable block is immediately after the accepted head.
+        let history_head = history_head(head_block.block_num(), controller.database().revision());
+        let (trace_begin_block, trace_end_block) = history_bounds(
+            controller.trace_log(),
+            history_head.saturating_add(1),
+            serveable,
+        );
+        let (chain_state_begin_block, chain_state_end_block) = history_bounds(
+            controller.chain_state_log(),
+            history_head.saturating_add(1),
+            serveable,
+        );
 
         Ok(GetStatusResult {
             variant: 0,
@@ -301,10 +317,10 @@ impl Session {
                 block_num: head_block.block_num(),
                 block_id: head_block_id,
             },
-            trace_begin_block: 1,
-            trace_end_block: serveable,
-            chain_state_begin_block: 1,
-            chain_state_end_block: serveable,
+            trace_begin_block,
+            trace_end_block,
+            chain_state_begin_block,
+            chain_state_end_block,
             chain_id: chain_id.clone(),
         })
     }
@@ -344,6 +360,35 @@ impl Session {
         self.current_request = Some(req.clone());
 
         Ok(())
+    }
+}
+
+fn history_bounds(
+    log: Option<&pulsevm_core::state_history::StateHistoryLog>,
+    fallback_begin: u32,
+    fallback_end: u32,
+) -> (u32, u32) {
+    log.and_then(|log| log.range())
+        .unwrap_or((fallback_begin, fallback_end))
+}
+
+fn history_head(accepted_head: u32, database_revision: i64) -> u32 {
+    accepted_head.max(u32::try_from(database_revision.max(0)).unwrap_or(u32::MAX))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{history_bounds, history_head};
+
+    #[test]
+    fn empty_history_starts_after_imported_head() {
+        assert_eq!(history_bounds(None, 399_174_588, 399_174_587), (399_174_588, 399_174_587));
+    }
+
+    #[test]
+    fn imported_revision_becomes_history_head_when_block_log_is_rebased() {
+        assert_eq!(history_head(0, 399_174_587), 399_174_587);
+        assert_eq!(history_head(12, 7), 12);
     }
 }
 

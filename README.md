@@ -83,6 +83,17 @@ For a large imported checkpoint, use the companion runner branch
 minutes for MetalGo to write its dynamic process-info file. The stock runner's
 three-second wait can report a healthy VM as failed while Arena is restoring.
 
+Before booting, record a reproducible Arena fingerprint for the checkpoint:
+
+```bash
+cargo run -p pulsevm_database --example xpr_state_fingerprint -- \
+  /tmp/pulsevm-xpr-migration.snapshot /tmp/xpr-fingerprint
+```
+
+The report contains the checkpoint revision, whole-state root, and SHA-256 for
+each canonical Arena table. Run it again after a bounded SHiP replay to identify
+which table changed and to compare independent conversion runs.
+
 The harness passes `migration_checkpoint` and its emitted manifest through the
 runner's per-chain VM configuration. Every node verifies the manifest hash and
 revision before restoring the Arena checkpoint. It also generates a distinct

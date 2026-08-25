@@ -3389,64 +3389,7 @@ mod tests {
     /// it reads the arena alone (no chainbase), so it is what the replay verifies
     /// against the recorded roots.
     fn arena_impl_tables(db: &Database) -> Result<Vec<(&'static str, Vec<u8>)>, ChainError> {
-        Ok(vec![
-            (
-                "account_metadata",
-                db.arena_account_metadata_state_bytes().unwrap_or_default(),
-            ),
-            (
-                "account",
-                db.arena_account_state_bytes().unwrap_or_default(),
-            ),
-            (
-                "permission",
-                db.arena_permission_state_bytes().unwrap_or_default(),
-            ),
-            (
-                "permission_link",
-                db.arena_permission_link_state_bytes().unwrap_or_default(),
-            ),
-            ("code", db.arena_code_state_bytes().unwrap_or_default()),
-            (
-                "transaction",
-                db.arena_transaction_state_bytes().unwrap_or_default(),
-            ),
-            (
-                "resource_usage",
-                db.arena_resource_usage_state_bytes().unwrap_or_default(),
-            ),
-            (
-                "resource_limits",
-                db.arena_account_limits_state_bytes().unwrap_or_default(),
-            ),
-            (
-                "resource_state",
-                db.arena_resource_state_bytes().unwrap_or_default(),
-            ),
-            (
-                "dynamic_global_property",
-                db.arena_global_action_sequence()
-                    .unwrap_or(0)
-                    .to_le_bytes()
-                    .to_vec(),
-            ),
-            (
-                "global_property",
-                db.arena_global_property_state_bytes().unwrap_or_default(),
-            ),
-            (
-                "resource_limits_config",
-                db.arena_resource_config_state_bytes().unwrap_or_default(),
-            ),
-            (
-                "contract_table",
-                db.arena_contract_table_state_bytes().unwrap_or_default(),
-            ),
-            (
-                "contract_key_value",
-                db.arena_contract_kv_state_bytes().unwrap_or_default(),
-            ),
-        ])
+        Ok(db.arena_state_table_bytes())
     }
 
     /// Replay real testnet blocks (fetched via scripts/fetch-blocks.sh into
