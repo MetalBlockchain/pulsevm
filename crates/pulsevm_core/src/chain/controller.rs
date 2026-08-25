@@ -900,6 +900,7 @@ impl Controller {
                 &transaction,
                 &timestamp,
                 &block_status,
+                scheduled.published,
             ) {
                 Ok(result) => {
                     db.arena_remove_deferred_transaction(scheduled.trx_id)?;
@@ -1981,6 +1982,7 @@ impl Controller {
         packed_transaction: &PackedTransaction,
         pending_block_timestamp: &BlockTimestamp,
         block_status: &BlockStatus,
+        published: i64,
     ) -> Result<TransactionResult, (ChainError, u32)> {
         let mut trx_context = TransactionContext::new(
             self.db.clone(),
@@ -2004,6 +2006,7 @@ impl Controller {
                 .get_prunable_size()
                 .map_err(|error| (error, 0))?,
             transaction,
+            TimePoint::new(Microseconds::new(published)),
         ) {
             return Err((
                 error,
@@ -2125,6 +2128,7 @@ impl Controller {
                 packed_transaction.get_unprunable_size()?,
                 packed_transaction.get_prunable_size()?,
                 &trx,
+                pending_block_timestamp.clone().into(),
             )?;
         } else {
             trx_context.init_for_input_trx(

@@ -2708,6 +2708,14 @@ impl ApplyContext {
         self.trx_context.block_num().unwrap_or_default()
     }
 
+    pub fn publication_time(&self) -> Result<u64, ChainError> {
+        Ok(self
+            .trx_context
+            .publication_time()?
+            .time_since_epoch()
+            .count() as u64)
+    }
+
     pub fn get_sender(&self) -> Result<u64, ChainError> {
         let trace = self.trx_context.get_action_trace(self.action_ordinal)?;
         if trace.creator_action_ordinal() == 0 {

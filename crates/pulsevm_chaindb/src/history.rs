@@ -30,8 +30,11 @@ use super::{
     ContractIndex64Row,
     ContractIndex128Row,
     ContractIndex256Row,
+    ContractIndexDoubleRow,
+    ContractIndexLongDoubleRow,
     ContractKeyValueRow,
     ContractTableRow,
+    DeferredTransactionRow,
     GlobalPropertyRow,
     PermissionLinkRow,
     PermissionRow,
@@ -66,9 +69,9 @@ const WASM_CONFIG: [u32; 11] = [
 /// params intrinsic never sets it), so it is sourced as the fixed constant.
 const MAX_ACTION_RETURN_VALUE_SIZE: u32 = 256;
 
-/// The 16 chain-state tables, in the fixed order `create_deltas.cpp` emits them.
+/// The 19 chain-state tables, in the fixed order `create_deltas.cpp` emits them.
 /// A table appears in the stream only when it has entries for the block.
-const TABLE_ORDER: [&str; 16] = [
+const TABLE_ORDER: [&str; 19] = [
     "account",
     "account_metadata",
     "code",
@@ -77,7 +80,10 @@ const TABLE_ORDER: [&str; 16] = [
     "contract_index64",
     "contract_index128",
     "contract_index256",
+    "contract_index_double",
+    "contract_index_long_double",
     "global_property",
+    "generated_transaction",
     "protocol_state",
     "permission",
     "permission_link",
@@ -262,6 +268,37 @@ fn ser_index256(s: &mut Ser, map: &HashMap<i64, (u64, u64, u64)>, r: &ContractIn
     w1.reverse();
     s.raw(&w0);
     s.raw(&w1);
+}
+
+fn ser_index_double(s: &mut Ser, map: &HashMap<i64, (u64, u64, u64)>, r: &ContractIndexDoubleRow) {
+    ser_secondary_header(s, map, r.t_id, r.primary_key, r.payer);
+    // nodeos copies the IEEE-754 bit pattern into a uint64 before packing it.
+    s.u64(r.secondary_key.to_bits());
+}
+
+fn ser_index_long_double(
+    s: &mut Ser,
+    map: &HashMap<i64, (u64, u64, u64)>,
+    r: &ContractIndexLongDoubleRow,
+) {
+    ser_secondary_header(s, map, r.t_id, r.primary_key, r.payer);
+    // float128_t is copied into a uint128 and packed little-endian: low word,
+    // then high word. The Arena row stores those words separately.
+    s.u64(r.sec_lo);
+    s.u64(r.sec_hi);
+}
+
+fn ser_generated_transaction(s: &mut Ser, db: &Db, r: &DeferredTransactionRow) {
+    s.uvar(0);
+    s.u64(r.sender);
+    s.u64(r.sender_id_lo);
+    s.u64(r.sender_id_hi);
+    s.u64(r.payer);
+    s.raw(&r.trx_id);
+    let packed = db
+        .blob::<DeferredTransactionRow>(r.packed_trx)
+        .unwrap_or(&[]);
+    s.bytes(packed);
 }
 
 fn ser_global_property(s: &mut Ser, r: &GlobalPropertyRow, chain_id: &[u8; 32]) {
@@ -534,7 +571,22 @@ impl IncludeDelta for ContractIndex256Row {
         true
     }
 }
+impl IncludeDelta for ContractIndexDoubleRow {
+    fn include_delta(_: &Self, _: &Self) -> bool {
+        true
+    }
+}
+impl IncludeDelta for ContractIndexLongDoubleRow {
+    fn include_delta(_: &Self, _: &Self) -> bool {
+        true
+    }
+}
 impl IncludeDelta for GlobalPropertyRow {
+    fn include_delta(_: &Self, _: &Self) -> bool {
+        true
+    }
+}
+impl IncludeDelta for DeferredTransactionRow {
     fn include_delta(_: &Self, _: &Self) -> bool {
         true
     }
@@ -764,10 +816,34 @@ pub(crate) fn pack_deltas(db: &Db, full_snapshot: bool, chain_id: &[u8; 32]) -> 
         }),
     );
     per_table.insert(
+        "contract_index_double",
+        collect_table::<ContractIndexDoubleRow, _>(db, full_snapshot, |_db, r| {
+            let mut s = Ser::new();
+            ser_index_double(&mut s, &tid_map, r);
+            s.buf
+        }),
+    );
+    per_table.insert(
+        "contract_index_long_double",
+        collect_table::<ContractIndexLongDoubleRow, _>(db, full_snapshot, |_db, r| {
+            let mut s = Ser::new();
+            ser_index_long_double(&mut s, &tid_map, r);
+            s.buf
+        }),
+    );
+    per_table.insert(
         "global_property",
         collect_table::<GlobalPropertyRow, _>(db, full_snapshot, |_db, r| {
             let mut s = Ser::new();
             ser_global_property(&mut s, r, chain_id);
+            s.buf
+        }),
+    );
+    per_table.insert(
+        "generated_transaction",
+        collect_table::<DeferredTransactionRow, _>(db, full_snapshot, |db, r| {
+            let mut s = Ser::new();
+            ser_generated_transaction(&mut s, db, r);
             s.buf
         }),
     );

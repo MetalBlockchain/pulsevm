@@ -186,6 +186,34 @@ pub fn current_time(mut env: FunctionEnvMut<WasmContext>) -> Result<u64, Runtime
     Ok(result as u64)
 }
 
+pub fn publication_time(mut env: FunctionEnvMut<WasmContext>) -> Result<u64, RuntimeError> {
+    context_aware_check(&env)?;
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BASE)?;
+    env_data
+        .apply_context()
+        .publication_time()
+        .map_err(|error| RuntimeError::new(error.to_string()))
+}
+
+pub fn is_feature_activated(
+    mut env: FunctionEnvMut<WasmContext>,
+    feature_ptr: WasmPtr<u8>,
+) -> Result<i32, RuntimeError> {
+    context_aware_check(&env)?;
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BASE + cost::per_byte(32))?;
+    let memory = env_data
+        .memory()
+        .as_ref()
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
+    let view = memory.view(&store);
+    let slice = feature_ptr.slice(&view, 32)?;
+    let mut digest = [0u8; 32];
+    slice.read_slice(&mut digest)?;
+    Ok(env_data.db().protocol_feature_activated(digest) as i32)
+}
+
 pub fn get_sender(mut env: FunctionEnvMut<WasmContext>) -> Result<u64, RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();

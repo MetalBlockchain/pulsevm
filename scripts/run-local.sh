@@ -14,9 +14,10 @@
 #   * go, protoc, and LLVM 22 (`LLVM_SYS_221_PREFIX`) for the plugin build.
 #
 # This script automates the deterministic setup (build + stage the plugin,
-# install metal-network-runner, start the cluster from genesis.json). Pulling
-# the block_log off a node and running the replay is the last step, documented
-# at the bottom — it depends on the live cluster's node paths.
+# install metal-network-runner, start the cluster from genesis.json), then runs
+# the five-node RPC convergence/replay gate. Historical XPR replay remains a
+# separate corpus-driven test because a local network does not contain XPR's
+# historical block stream.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -120,14 +121,19 @@ echo "==> Launching a 5-node cluster running PulseVM"
   --blockchain-specs "$BLOCKCHAIN_SPECS"
 
 echo
-echo "Cluster starting. Once 'control status' reports the blockchain healthy, verify"
-echo "the five custom-chain RPC endpoints and imported state with pulsevm.getInfo"
-echo "and pulsevm.getAccount over each node's /ext/bc/<chain-id>/rpc route."
+if [[ "${PULSEVM_VERIFY_FIVE_NODE:-true}" == "true" ]]; then
+  echo "==> Verifying all five custom-chain RPCs and replaying the common head"
+  PULSEVM_FIVE_NODE_REPORT="${PULSEVM_FIVE_NODE_REPORT:-$BUILD_DIR/five-node-replay.json}" \
+    "$REPO/scripts/verify-five-node-replay.sh" \
+    "0.0.0.0$RUNNER_PORT"
+else
+  echo "Cluster starting; five-node verification disabled (PULSEVM_VERIFY_FIVE_NODE=false)."
+fi
 echo
-echo "The block_log written by a running node is a persistence/restart artifact;"
-echo "it is not a historical XPR block corpus. Full historical replay uses the"
-echo "ignored replay_testnet_blocks test and JSON get_block fixtures fetched by"
-echo "scripts/fetch-blocks.sh:"
+echo "The live gate proves five nodes independently decode and converge on one"
+echo "PulseVM head. The block_log written by this local network is not an XPR"
+echo "historical corpus. Full historical replay uses the ignored replay_testnet_blocks"
+echo "test and JSON get_block fixtures fetched by scripts/fetch-blocks.sh:"
 echo
 echo "  PULSEVM_RPC_BLOCKS_DIR=/tmp/xpr-blocks \\"
 echo "    cargo test -p pulsevm_core replay_testnet_blocks -- --ignored --nocapture"

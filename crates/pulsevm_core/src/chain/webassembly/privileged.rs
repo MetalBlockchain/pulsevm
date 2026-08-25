@@ -161,6 +161,24 @@ pub fn set_proposed_producers(
     Ok(new_version)
 }
 
+/// Leap's extended producer-schedule entry point. Format 0 is the legacy
+/// `vector<producer_key>` wire format used by XPR. Format 1 carries producer
+/// authorities, which PulseVM does not expose in its single-key schedule yet;
+/// reject it explicitly instead of silently decoding it as the legacy form.
+pub fn set_proposed_producers_ex(
+    env: FunctionEnvMut<WasmContext>,
+    packed_producer_format: u64,
+    data_ptr: WasmPtr<u8>,
+    data_len: u32,
+) -> Result<i64, RuntimeError> {
+    if packed_producer_format != 0 {
+        return Err(RuntimeError::new(
+            "producer schedule format 1 is not supported by PulseVM",
+        ));
+    }
+    set_proposed_producers(env, data_ptr, data_len)
+}
+
 pub fn get_blockchain_parameters_packed(
     mut env: FunctionEnvMut<WasmContext>,
     data_ptr: WasmPtr<u8>,

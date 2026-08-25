@@ -260,3 +260,51 @@ The first converter implementation will consume this log into a new Arena
 checkpoint, then the five-node e2e harness will boot from that checkpoint with
 a fresh PulseVM producer schedule. This is a migration to a new PulseVM chain,
 not a continuation of XPR block IDs or signatures.
+
+## Independent parity gates
+
+Do not promote an export from a successful nodeos start alone. Run the
+source-side host-function/table audit against the exact XPR checkout first:
+
+```bash
+tools/xpr-chainbase-export/host-function-audit.sh \
+  --xpr-core /src/XPRNetwork-core --strict \
+  --report /data/xpr-export/host-function-audit.json
+```
+
+After importing the checkpoint, validate the export end to end. This verifies
+manifest hashes, the full SHiP record, all 19 nodeos tables (including the
+floating-point indexes and generated transactions), and the independent code
+object/permission/deferred sidecar audit:
+
+```bash
+tools/xpr-chainbase-export/validate-mainnet-export.sh \
+  --export-dir /data/xpr-export \
+  --checkpoint /data/pulsevm-migration.snapshot \
+  --arena-dir /data/pulsevm-arena
+```
+
+The validator is the required Mainnet-export gate; no Mainnet export is called
+validated until it produces both reports. `set_proposed_producers_ex` format 1
+(multi-key producer authorities) remains explicitly rejected by the current
+single-key Arena schedule model and must be addressed before claiming complete
+execution parity.
+
+## Five-node live replay
+
+Start the local network with `scripts/run-local.sh` and the matching `metalgo`
+binary. The script waits for the custom VM, then calls
+`scripts/verify-five-node-replay.sh`, which obtains all five runner RPCs, calls
+`pulsevm.getInfo` and `pulsevm.getBlock` on every node, and fails unless they
+independently decode the same head block. To run the gate against an already
+running runner:
+
+```bash
+METALGO_EXEC_PATH=../metalgo/build/metalgo scripts/run-local.sh
+# or, if the runner is already running:
+scripts/verify-five-node-replay.sh localhost:8080
+```
+
+This is a live five-node replay/convergence check, not a substitute for
+historical Mainnet replay. Historical replay still requires a captured nodeos
+or archive block corpus and the pinned golden-root test.

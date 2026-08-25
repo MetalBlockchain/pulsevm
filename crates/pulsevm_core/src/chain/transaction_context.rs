@@ -111,6 +111,7 @@ struct TransactionContextInner {
     start_time: TimePoint,
     max_transaction_time: Microseconds,
     pending_block_timestamp: BlockTimestamp,
+    published: TimePoint,
     cpu_limit: i64,
     cpu_limit_due_to_greylist: bool,
     cpu_limit_due_to_block: bool,
@@ -169,6 +170,7 @@ impl TransactionContext {
                 },
                 start_time: TimePoint::now(),
                 max_transaction_time: Microseconds::new(max_transaction_time_ms as i64 * 1_000),
+                published: pending_block_timestamp.clone().into(),
                 pending_block_timestamp,
                 cpu_limit: 0,
                 cpu_limit_due_to_greylist: false,
@@ -368,7 +370,9 @@ impl TransactionContext {
         packed_trx_unprunable_size: u64,
         packed_trx_prunable_size: u64,
         transaction: &Transaction,
+        published: TimePoint,
     ) -> Result<(), ChainError> {
+        self.inner.write()?.published = published;
         let mut discounted_size_for_pruned_data = packed_trx_prunable_size;
         let chain_config = self.db.chain_config()?;
         if chain_config.context_free_discount_net_usage_den > 0
@@ -605,6 +609,13 @@ impl TransactionContext {
     pub fn pending_block_timestamp(&self) -> Result<BlockTimestamp, ChainError> {
         let inner = self.inner.read()?;
         Ok(inner.pending_block_timestamp.clone())
+    }
+
+    /// Source-compatible publication time for the currently executing
+    /// transaction. Deferred execution replaces the pending block time with
+    /// the durable generated transaction's original publication timestamp.
+    pub fn publication_time(&self) -> Result<TimePoint, ChainError> {
+        Ok(self.inner.read()?.published.clone())
     }
 
     /// The block number currently being applied.
