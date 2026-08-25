@@ -133,24 +133,24 @@ fn main() -> ExitCode {
                     database.revision(),
                     summary,
                 );
-                if let Some((_, sidecar)) = &deferred_transactions {
-                    if let Some(source_chain_id) = &sidecar.source_chain_id {
-                        let bytes = match hex::decode(source_chain_id) {
-                            Ok(bytes) => bytes,
-                            Err(error) => {
-                                eprintln!("invalid source chain id in sidecar: {error}");
-                                return ExitCode::from(1);
-                            }
-                        };
-                        let source_chain_id: [u8; 32] = match bytes.try_into() {
-                            Ok(id) => id,
-                            Err(_) => {
-                                eprintln!("invalid source chain id length in sidecar");
-                                return ExitCode::from(1);
-                            }
-                        };
-                        manifest = manifest.with_source_chain_id(source_chain_id);
-                    }
+                if let Some((_, sidecar)) = &deferred_transactions
+                    && let Some(source_chain_id) = &sidecar.source_chain_id
+                {
+                    let bytes = match hex::decode(source_chain_id) {
+                        Ok(bytes) => bytes,
+                        Err(error) => {
+                            eprintln!("invalid source chain id in sidecar: {error}");
+                            return ExitCode::from(1);
+                        }
+                    };
+                    let source_chain_id: [u8; 32] = match bytes.try_into() {
+                        Ok(id) => id,
+                        Err(_) => {
+                            eprintln!("invalid source chain id length in sidecar");
+                            return ExitCode::from(1);
+                        }
+                    };
+                    manifest = manifest.with_source_chain_id(source_chain_id);
                 }
                 if let Some((bytes, _)) = &deferred_transactions {
                     manifest = manifest.with_deferred_transaction_sidecar(bytes);

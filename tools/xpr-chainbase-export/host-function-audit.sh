@@ -33,12 +33,13 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 wasm_runtime="$repo_root/crates/pulsevm_core/src/chain/wasm_runtime.rs"
 wasm_interface="$xpr_core/libraries/chain/wasm_interface.cpp"
 state_history="$xpr_core/plugins/state_history_plugin/state_history_plugin.cpp"
-[[ -f "$wasm_runtime" && -f "$wasm_interface" && -f "$state_history" ]] || {
+state_history_deltas="$xpr_core/libraries/state_history/create_deltas.cpp"
+[[ -f "$wasm_runtime" && -f "$wasm_interface" && -f "$state_history" && -f "$state_history_deltas" ]] || {
     echo "checkout is missing the expected XPR or PulseVM source files" >&2
     exit 2
 }
 
-python3 - "$wasm_interface" "$state_history" "$wasm_runtime" "$report" "$strict" <<'PY'
+python3 - "$wasm_interface" "$state_history" "$state_history_deltas" "$wasm_runtime" "$report" "$strict" <<'PY'
 import json
 import re
 import sys
@@ -46,9 +47,10 @@ from pathlib import Path
 
 wasm_interface = Path(sys.argv[1])
 state_history = Path(sys.argv[2])
-wasm_runtime = Path(sys.argv[3])
-report = Path(sys.argv[4]) if sys.argv[4] else None
-strict = sys.argv[5] == "true"
+state_history_deltas = Path(sys.argv[3])
+wasm_runtime = Path(sys.argv[4])
+report = Path(sys.argv[5]) if sys.argv[5] else None
+strict = sys.argv[6] == "true"
 
 ref_text = wasm_interface.read_text()
 ref = set()
@@ -71,8 +73,11 @@ tables = [
     "generated_transaction", "protocol_state", "permission", "permission_link",
     "resource_limits", "resource_usage", "resource_limits_state", "resource_limits_config",
 ]
-state_history_text = state_history.read_text()
-table_presence = {name: bool(re.search(rf'process_table\("{re.escape(name)}"', state_history_text)) for name in tables}
+state_history_text = state_history.read_text() + "\n" + state_history_deltas.read_text()
+table_presence = {
+    name: bool(re.search(rf'process_table\([^\n]*"{re.escape(name)}"', state_history_text))
+    for name in tables
+}
 code_source = (wasm_interface.parent / "include/eosio/chain/code_object.hpp").read_text()
 code_rust = wasm_runtime.parents[3].joinpath("pulsevm_chaindb/src/lib.rs").read_text()
 code_fields = ["code_ref_count", "code", "first_block_used", "vm_type", "vm_version", "code_hash"]

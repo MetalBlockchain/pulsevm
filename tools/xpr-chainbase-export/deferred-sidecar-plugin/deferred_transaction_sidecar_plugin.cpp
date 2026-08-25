@@ -7,15 +7,15 @@
 
 #include <algorithm>
 #include <boost/signals2/connection.hpp>
-#include <fc/optional.hpp>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 
 namespace eosio {
 
 using boost::signals2::scoped_connection;
 
-static appbase::abstract_plugin& sidecar_plugin = app().register_plugin<deferred_transaction_sidecar_plugin>();
+static auto sidecar_plugin = application::register_plugin<deferred_transaction_sidecar_plugin>();
 
 static std::string uint128_to_decimal(chain::uint128_t value) {
    if (value == 0)
@@ -93,8 +93,8 @@ public:
          if (!first)
             output << ',';
          first = false;
-         const auto usage = usages.find(row.usage_id);
-         EOS_ASSERT(usage != usages.end(), chain::plugin_exception,
+         const auto* usage = usages.find(row.usage_id);
+         EOS_ASSERT(usage != nullptr, chain::plugin_exception,
                     "permission ${owner}/${name} has no usage row",
                     ("owner", row.owner.to_uint64_t())("name", row.name.to_uint64_t()));
          output << "{\"owner\":" << row.owner.to_uint64_t()
@@ -132,7 +132,7 @@ public:
    chain::controller& chain;
    std::filesystem::path path;
    std::filesystem::path directory;
-   fc::optional<scoped_connection> accepted_block_connection;
+   std::optional<scoped_connection> accepted_block_connection;
 };
 
 deferred_transaction_sidecar_plugin::deferred_transaction_sidecar_plugin() = default;

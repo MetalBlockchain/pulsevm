@@ -491,19 +491,17 @@ pub fn hydrate_full_state_with_deferred_transactions(
             }
         }
         for row in &rows {
-            match row {
-                PortableRow::Account {
-                    name,
-                    creation_date,
-                    abi,
-                } => {
-                    db.create_account(*name, *creation_date)
-                        .map_err(database_error)?;
-                    db.xpr_import_set_account_abi_raw(*name, abi)
-                        .map_err(database_error)?;
-                    summary.accounts += 1;
-                }
-                _ => {}
+            if let PortableRow::Account {
+                name,
+                creation_date,
+                abi,
+            } = row
+            {
+                db.create_account(*name, *creation_date)
+                    .map_err(database_error)?;
+                db.xpr_import_set_account_abi_raw(*name, abi)
+                    .map_err(database_error)?;
+                summary.accounts += 1;
             }
         }
         for row in &rows {
@@ -1437,6 +1435,7 @@ fn apply_delta_row(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_index64(
     db: &mut Database,
     present: bool,
@@ -1463,6 +1462,7 @@ fn apply_index64(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_index128(
     db: &mut Database,
     present: bool,
@@ -1489,6 +1489,7 @@ fn apply_index128(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_index256(
     db: &mut Database,
     present: bool,
@@ -1515,6 +1516,7 @@ fn apply_index256(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_index_double(
     db: &mut Database,
     present: bool,
@@ -1544,6 +1546,7 @@ fn apply_index_double(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_index_long_double(
     db: &mut Database,
     present: bool,
@@ -1787,10 +1790,9 @@ fn validate_code_links(
             vm_version,
             ..
         } = row
+            && !code_keys.insert((*hash, *vm_type, *vm_version))
         {
-            if !code_keys.insert((*hash, *vm_type, *vm_version)) {
-                return Err(bad("duplicate XPR code row"));
-            }
+            return Err(bad("duplicate XPR code row"));
         }
     }
     for row in rows {
@@ -1799,12 +1801,11 @@ fn validate_code_links(
             code: Some(code),
             ..
         } = row
+            && !code_keys.contains(&(code.hash, code.vm_type, code.vm_version))
         {
-            if !code_keys.contains(&(code.hash, code.vm_type, code.vm_version)) {
-                return Err(bad(format!(
-                    "account metadata for {name} references code absent from the full-state export"
-                )));
-            }
+            return Err(bad(format!(
+                "account metadata for {name} references code absent from the full-state export"
+            )));
         }
     }
     Ok(())
