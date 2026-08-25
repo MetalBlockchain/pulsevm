@@ -2,16 +2,22 @@
 //!
 //! Usage: xpr_apply_history_window <checkpoint> <history-log> <arena-dir> [sidecar-dir] [entries]
 
-use std::{env, path::{Path, PathBuf}, process::ExitCode};
-
-use pulsevm_database::{
-    apply_state_history_log_window,
-    apply_state_history_log_window_with_sidecars,
-    Database,
+use std::{
+    env,
+    path::{
+        Path,
+        PathBuf,
+    },
+    process::ExitCode,
 };
 
-const USAGE: &str =
-    "Usage: xpr_apply_history_window <checkpoint> <history-log> <arena-dir> [sidecar-dir] [entries]";
+use pulsevm_database::{
+    Database,
+    apply_state_history_log_window,
+    apply_state_history_log_window_with_sidecars,
+};
+
+const USAGE: &str = "Usage: xpr_apply_history_window <checkpoint> <history-log> <arena-dir> [sidecar-dir] [entries]";
 
 fn main() -> ExitCode {
     let mut args = env::args_os();

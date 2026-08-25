@@ -1,10 +1,23 @@
 use core::fmt;
 
 use p256::PublicKey as P256PublicKey;
-use pulsevm_serialization::{NumBytes, Read, ReadError, Write, WriteError};
-use serde::{Deserialize, Serialize};
+use pulsevm_serialization::{
+    NumBytes,
+    Read,
+    ReadError,
+    Write,
+    WriteError,
+};
+use serde::{
+    Deserialize,
+    Serialize,
+};
 
-use crate::k1::{K1PublicKey, decode_b58_checked, encode_b58_checked};
+use crate::k1::{
+    K1PublicKey,
+    decode_b58_checked,
+    encode_b58_checked,
+};
 
 /// A public-key variant accepted by Antelope authorities.
 ///
@@ -325,7 +338,10 @@ fn write_varuint(mut value: u64, out: &mut Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::AuthorityPublicKey;
-    use pulsevm_serialization::{Read, Write};
+    use pulsevm_serialization::{
+        Read,
+        Write,
+    };
 
     #[test]
     fn webauthn_packed_and_json_forms_round_trip() {
@@ -344,6 +360,9 @@ mod tests {
         let bytes = key.pack().unwrap();
         assert_eq!(AuthorityPublicKey::read(&bytes, &mut 0).unwrap(), key);
         let json = serde_json::to_string(&key).unwrap();
-        assert_eq!(serde_json::from_str::<AuthorityPublicKey>(&json).unwrap(), key);
+        assert_eq!(
+            serde_json::from_str::<AuthorityPublicKey>(&json).unwrap(),
+            key
+        );
     }
 }

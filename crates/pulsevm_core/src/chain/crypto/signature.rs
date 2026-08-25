@@ -69,10 +69,7 @@ impl Signature {
         }
     }
 
-    pub fn recover_authority_key(
-        &self,
-        digest: &Digest,
-    ) -> Result<AuthorityPublicKey, ChainError> {
+    pub fn recover_authority_key(&self, digest: &Digest) -> Result<AuthorityPublicKey, ChainError> {
         match &self.inner {
             SignatureInner::K1(signature) => signature
                 .recover(digest.as_bytes())
@@ -204,20 +201,16 @@ impl Read for Signature {
     fn read(bytes: &[u8], pos: &mut usize) -> Result<Self, ReadError> {
         let tag = *bytes.get(*pos).ok_or(ReadError::NotEnoughBytes)?;
         let inner = match tag {
-            0 => SignatureInner::K1(
-                {
-                    let packed = FixedBytes::<66>::read(bytes, pos)?;
+            0 => SignatureInner::K1({
+                let packed = FixedBytes::<66>::read(bytes, pos)?;
                 K1Signature::from_packed(packed.as_ref())
                     .map_err(|e| ReadError::CustomError(e.to_string()))?
-                },
-            ),
-            1 => SignatureInner::R1(
-                {
-                    let packed = FixedBytes::<66>::read(bytes, pos)?;
+            }),
+            1 => SignatureInner::R1({
+                let packed = FixedBytes::<66>::read(bytes, pos)?;
                 R1Signature::from_packed(packed.as_ref())
                     .map_err(|e| ReadError::CustomError(e.to_string()))?
-                },
-            ),
+            }),
             2 => {
                 *pos += 1;
                 SignatureInner::WebAuthn(
@@ -284,13 +277,27 @@ impl FromStr for Signature {
 
 #[cfg(test)]
 mod tests {
-    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use base64::{
+        Engine as _,
+        engine::general_purpose::URL_SAFE_NO_PAD,
+    };
     use p256::ecdsa::SigningKey;
-    use pulsevm_serialization::{Read, Write};
-    use sha2::{Digest as _, Sha256};
+    use pulsevm_serialization::{
+        Read,
+        Write,
+    };
+    use sha2::{
+        Digest as _,
+        Sha256,
+    };
 
     use super::Signature;
-    use pulsevm_crypto::{AuthorityPublicKey, Digest, R1Signature, WebAuthnSignature};
+    use pulsevm_crypto::{
+        AuthorityPublicKey,
+        Digest,
+        R1Signature,
+        WebAuthnSignature,
+    };
 
     #[test]
     fn r1_signature_recovers_an_r1_authority_key() {
@@ -304,11 +311,16 @@ mod tests {
         compact[1..].copy_from_slice(&signature.to_bytes());
 
         let signature = Signature::new_r1(R1Signature::from_compact65(&compact));
-        let AuthorityPublicKey::R1(key) = signature.recover_authority_key(&digest).unwrap()
-        else {
+        let AuthorityPublicKey::R1(key) = signature.recover_authority_key(&digest).unwrap() else {
             panic!("R1 signature recovered to a non-R1 authority key");
         };
-        assert_eq!(key.as_slice(), signing_key.verifying_key().to_encoded_point(true).as_bytes());
+        assert_eq!(
+            key.as_slice(),
+            signing_key
+                .verifying_key()
+                .to_encoded_point(true)
+                .as_bytes()
+        );
     }
 
     #[test]
@@ -325,16 +337,15 @@ mod tests {
         let mut signed_data = auth_data.clone();
         signed_data.extend_from_slice(&Sha256::digest(client_json.as_bytes()));
         let signed_digest: [u8; 32] = Sha256::digest(signed_data).into();
-        let (signed, recovery_id) = signing_key.sign_prehash_recoverable(&signed_digest).unwrap();
+        let (signed, recovery_id) = signing_key
+            .sign_prehash_recoverable(&signed_digest)
+            .unwrap();
         let mut compact = [0u8; 65];
         compact[0] = 31 + recovery_id.to_byte();
         compact[1..].copy_from_slice(&signed.to_bytes());
 
-        let signature = Signature::new_webauthn(WebAuthnSignature::new(
-            compact,
-            auth_data,
-            client_json,
-        ));
+        let signature =
+            Signature::new_webauthn(WebAuthnSignature::new(compact, auth_data, client_json));
         let packed = signature.pack().unwrap();
         assert!(packed.len() > 66);
         let decoded = Signature::read(&packed, &mut 0).unwrap();
@@ -350,7 +361,10 @@ mod tests {
         assert_eq!(rpid, "example.test");
         assert_eq!(
             point.as_slice(),
-            signing_key.verifying_key().to_encoded_point(true).as_bytes(),
+            signing_key
+                .verifying_key()
+                .to_encoded_point(true)
+                .as_bytes(),
         );
     }
 }

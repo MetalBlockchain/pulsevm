@@ -2,7 +2,10 @@
 //!
 //! Usage: xpr_history_window_check <chain_state_history.log> [post-snapshot-entries]
 
-use std::{env, process::ExitCode};
+use std::{
+    env,
+    process::ExitCode,
+};
 
 use pulsevm_database::inspect_state_history_log;
 

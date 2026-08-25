@@ -378,11 +378,17 @@ fn history_head(accepted_head: u32, database_revision: i64) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{history_bounds, history_head};
+    use super::{
+        history_bounds,
+        history_head,
+    };
 
     #[test]
     fn empty_history_starts_after_imported_head() {
-        assert_eq!(history_bounds(None, 399_174_588, 399_174_587), (399_174_588, 399_174_587));
+        assert_eq!(
+            history_bounds(None, 399_174_588, 399_174_587),
+            (399_174_588, 399_174_587)
+        );
     }
 
     #[test]

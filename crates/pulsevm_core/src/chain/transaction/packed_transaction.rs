@@ -186,10 +186,8 @@ impl PackedTransaction {
 /// fixed-width `NumBytes` estimate, so receipt digests must encode the exact
 /// FC wire form explicitly (without trailing allocation bytes).
 fn pack_fc_bytes(bytes: &[u8]) -> Result<Vec<u8>, WriteError> {
-    let mut encoded = VarUint32(
-        u32::try_from(bytes.len()).map_err(|_| WriteError::TryFromIntError)?,
-    )
-    .pack()?;
+    let mut encoded =
+        VarUint32(u32::try_from(bytes.len()).map_err(|_| WriteError::TryFromIntError)?).pack()?;
     encoded.extend_from_slice(bytes);
     Ok(encoded)
 }
@@ -335,7 +333,10 @@ mod tests {
         let transaction =
             PackedTransaction::from_deferred_transaction_bytes(raw.clone().into()).unwrap();
         assert_eq!(transaction.get_transaction().actions.len(), 1);
-        assert_eq!(transaction.get_transaction().actions[0].name().to_string(), "newaccount");
+        assert_eq!(
+            transaction.get_transaction().actions[0].name().to_string(),
+            "newaccount"
+        );
         assert_eq!(transaction.packed_trx_bytes(), raw.as_slice());
     }
 }

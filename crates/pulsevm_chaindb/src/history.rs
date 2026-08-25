@@ -845,7 +845,11 @@ pub(crate) fn pack_deltas(db: &Db, full_snapshot: bool, chain_id: &[u8; 32]) -> 
 
 #[cfg(test)]
 mod global_property_tests {
-    use super::{GlobalPropertyRow, Ser, ser_global_property};
+    use super::{
+        GlobalPropertyRow,
+        Ser,
+        ser_global_property,
+    };
 
     #[test]
     fn global_property_matches_leap5_envelope() {

@@ -9,11 +9,26 @@
 //!   xpr_test_authority <input.snapshot> <input.manifest.json> \
 //!                      <output.snapshot> <PVT_K1_...> [producer_account]
 
-use std::{env, fs, process::ExitCode, str::FromStr};
+use std::{
+    env,
+    fs,
+    process::ExitCode,
+    str::FromStr,
+};
 
-use pulsevm_chain_types::{Authority, TimePoint};
-use pulsevm_crypto::{AuthorityPublicKey, Digest, K1PrivateKey};
-use pulsevm_database::{Database, MigrationManifest};
+use pulsevm_chain_types::{
+    Authority,
+    TimePoint,
+};
+use pulsevm_crypto::{
+    AuthorityPublicKey,
+    Digest,
+    K1PrivateKey,
+};
+use pulsevm_database::{
+    Database,
+    MigrationManifest,
+};
 use pulsevm_name::Name;
 
 const DB_SIZE: u64 = 64 * 1024 * 1024;
@@ -113,8 +128,12 @@ fn derive(
     let active = Name::from_str("active")
         .map_err(|e| format!("encode active permission: {e}"))?
         .as_u64();
-    if database.arena_permission_authority(producer, owner).is_none()
-        || database.arena_permission_authority(producer, active).is_none()
+    if database
+        .arena_permission_authority(producer, owner)
+        .is_none()
+        || database
+            .arena_permission_authority(producer, active)
+            .is_none()
     {
         return Err(format!(
             "imported checkpoint has no {producer_account}@owner/active permissions"
@@ -129,7 +148,9 @@ fn derive(
         .map_err(|e| format!("replace {producer_account}@active authority: {e}"))?;
     for (name, permission) in [("owner", owner), ("active", active)] {
         let Some(updated) = database.arena_permission_authority(producer, permission) else {
-            return Err(format!("updated {producer_account}@{name} authority is missing"));
+            return Err(format!(
+                "updated {producer_account}@{name} authority is missing"
+            ));
         };
         if updated != authority {
             return Err(format!(

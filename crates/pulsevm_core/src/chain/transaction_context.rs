@@ -50,9 +50,8 @@ use crate::{
 // this feature active; keeping the gate matters for replaying earlier history
 // and for chains that have not activated it yet.
 const ONLY_BILL_FIRST_AUTHORIZER_FEATURE_DIGEST: [u8; 32] = [
-    0x8b, 0xa5, 0x2f, 0xe7, 0xa3, 0x95, 0x6c, 0x5c, 0xd3, 0xa6, 0x56, 0xa3, 0x17, 0x4b, 0x93,
-    0x1d, 0x3b, 0xb2, 0xab, 0xb4, 0x55, 0x78, 0xbe, 0xfc, 0x59, 0xf2, 0x83, 0xec, 0xd8, 0x16,
-    0xa4, 0x05,
+    0x8b, 0xa5, 0x2f, 0xe7, 0xa3, 0x95, 0x6c, 0x5c, 0xd3, 0xa6, 0x56, 0xa3, 0x17, 0x4b, 0x93, 0x1d,
+    0x3b, 0xb2, 0xab, 0xb4, 0x55, 0x78, 0xbe, 0xfc, 0x59, 0xf2, 0x83, 0xec, 0xd8, 0x16, 0xa4, 0x05,
 ];
 
 fn billed_accounts_for_transaction(
@@ -272,11 +271,8 @@ impl TransactionContext {
         let only_bill_first = self
             .db
             .protocol_feature_activated(ONLY_BILL_FIRST_AUTHORIZER_FEATURE_DIGEST);
-        inner.bill_to_accounts = billed_accounts_for_transaction(
-            &trx,
-            first_authorizer_name.clone(),
-            only_bill_first,
-        );
+        inner.bill_to_accounts =
+            billed_accounts_for_transaction(&trx, first_authorizer_name.clone(), only_bill_first);
         if inner.bill_to_accounts.is_empty() {
             return Err(ChainError::TransactionError(
                 "transaction has no authorizations".to_string(),
@@ -1177,7 +1173,12 @@ mod billing_tests {
 
     use pulsevm_database::PermissionLevel;
 
-    use super::{Action, Name, Transaction, billed_accounts_for_transaction};
+    use super::{
+        Action,
+        Name,
+        Transaction,
+        billed_accounts_for_transaction,
+    };
 
     fn account(value: &str) -> Name {
         Name::from_str(value).unwrap()

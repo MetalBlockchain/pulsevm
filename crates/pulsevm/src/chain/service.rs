@@ -25,9 +25,7 @@ use pulsevm_core::{
         Controller,
         MempoolAdmissionState,
     },
-    crypto::{
-        Signature,
-    },
+    crypto::Signature,
     id::Id,
     mempool::Mempool,
     name::Name,

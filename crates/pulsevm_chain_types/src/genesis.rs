@@ -373,10 +373,7 @@ mod tests {
         let base = GenesisState::from_json(base).unwrap();
         let migrated = GenesisState::from_json(&migrated.to_string()).unwrap();
         assert_ne!(base.compute_chain_id(), migrated.compute_chain_id());
-        assert_eq!(
-            migrated.migration_checkpoint_sha256,
-            Some([0xaa; 32])
-        );
+        assert_eq!(migrated.migration_checkpoint_sha256, Some([0xaa; 32]));
     }
 
     #[test]

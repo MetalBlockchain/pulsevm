@@ -1,4 +1,8 @@
-use std::{env, path::Path, process::ExitCode};
+use std::{
+    env,
+    path::Path,
+    process::ExitCode,
+};
 
 use pulsevm_database::Database;
 
@@ -43,9 +47,7 @@ fn main() -> ExitCode {
     };
     println!(
         "restored checkpoint revision={} payload_bytes={} into {}",
-        header.revision,
-        header.payload_len,
-        database_path
+        header.revision, header.payload_len, database_path
     );
     ExitCode::SUCCESS
 }

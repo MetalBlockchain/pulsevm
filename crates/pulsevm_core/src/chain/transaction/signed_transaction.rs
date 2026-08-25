@@ -1,6 +1,9 @@
 use std::collections::BTreeSet;
 
-use pulsevm_crypto::{AuthorityPublicKey, Bytes};
+use pulsevm_crypto::{
+    AuthorityPublicKey,
+    Bytes,
+};
 use pulsevm_error::ChainError;
 use pulsevm_proc_macros::{
     NumBytes,
@@ -135,14 +138,27 @@ mod tests {
         str::FromStr,
     };
 
-    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use base64::{
+        Engine as _,
+        engine::general_purpose::URL_SAFE_NO_PAD,
+    };
     use p256::ecdsa::SigningKey;
+    use pulsevm_crypto::{
+        AuthorityPublicKey,
+        R1Signature,
+        WebAuthnSignature,
+    };
     use pulsevm_database::TimePointSec;
-    use pulsevm_crypto::{AuthorityPublicKey, R1Signature, WebAuthnSignature};
-    use sha2::{Digest as _, Sha256};
+    use sha2::{
+        Digest as _,
+        Sha256,
+    };
 
     use crate::{
-        crypto::{PrivateKey, Signature},
+        crypto::{
+            PrivateKey,
+            Signature,
+        },
         id::Id,
         transaction::{
             SignedTransaction,
@@ -192,10 +208,9 @@ mod tests {
             vec![],
             vec![],
         );
-        let chain_id = Id::from_str(
-            "c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6",
-        )
-        .unwrap();
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
         let digest = tx.signing_digest(&chain_id, &vec![]).unwrap();
         let digest = pulsevm_crypto::Digest(digest);
 
@@ -207,15 +222,18 @@ mod tests {
         compact[0] = 31 + recovery_id.to_byte();
         compact[1..].copy_from_slice(&r1.to_bytes());
         let r1_signature = Signature::new_r1(R1Signature::from_compact65(&compact));
-        let r1_tx = SignedTransaction::new(
-            tx.clone(),
-            BTreeSet::from([r1_signature]),
-            vec![],
-        );
+        let r1_tx = SignedTransaction::new(tx.clone(), BTreeSet::from([r1_signature]), vec![]);
         let r1_keys = r1_tx.recovered_authority_keys(&chain_id).unwrap();
-        assert!(r1_keys.contains(&AuthorityPublicKey::R1(
-            signing_key.verifying_key().to_encoded_point(true).as_bytes().try_into().unwrap(),
-        )));
+        assert!(
+            r1_keys.contains(&AuthorityPublicKey::R1(
+                signing_key
+                    .verifying_key()
+                    .to_encoded_point(true)
+                    .as_bytes()
+                    .try_into()
+                    .unwrap(),
+            ))
+        );
 
         let client_json = format!(
             r#"{{"type":"webauthn.get","challenge":"{}","origin":"https://example.test"}}"#,
@@ -227,7 +245,9 @@ mod tests {
         let mut signed_data = auth_data.clone();
         signed_data.extend_from_slice(&Sha256::digest(client_json.as_bytes()));
         let signed_digest: [u8; 32] = Sha256::digest(signed_data).into();
-        let (wa, recovery_id) = signing_key.sign_prehash_recoverable(&signed_digest).unwrap();
+        let (wa, recovery_id) = signing_key
+            .sign_prehash_recoverable(&signed_digest)
+            .unwrap();
         let mut wa_compact = [0u8; 65];
         wa_compact[0] = 31 + recovery_id.to_byte();
         wa_compact[1..].copy_from_slice(&wa.to_bytes());
@@ -241,10 +261,17 @@ mod tests {
             vec![],
         );
         let wa_keys = wa_tx.recovered_authority_keys(&chain_id).unwrap();
-        assert!(wa_keys.contains(&AuthorityPublicKey::WebAuthn {
-            point: signing_key.verifying_key().to_encoded_point(true).as_bytes().try_into().unwrap(),
-            user_presence: 1,
-            rpid: "example.test".into(),
-        }));
+        assert!(
+            wa_keys.contains(&AuthorityPublicKey::WebAuthn {
+                point: signing_key
+                    .verifying_key()
+                    .to_encoded_point(true)
+                    .as_bytes()
+                    .try_into()
+                    .unwrap(),
+                user_presence: 1,
+                rpid: "example.test".into(),
+            })
+        );
     }
 }

@@ -85,14 +85,12 @@ use pulsevm_constants::{
 };
 
 const DISABLE_DEFERRED_TRXS_STAGE_1_FEATURE_DIGEST: [u8; 32] = [
-    0xfc, 0xe5, 0x7d, 0x23, 0x31, 0x66, 0x73, 0x53, 0xa0, 0xea, 0xc6, 0xb4, 0x20, 0x9b, 0x67,
-    0xb8, 0x43, 0xa7, 0x26, 0x2a, 0x84, 0x8a, 0xf0, 0xa4, 0x9a, 0x6e, 0x2f, 0xa9, 0xf6, 0x58,
-    0x4e, 0xb4,
+    0xfc, 0xe5, 0x7d, 0x23, 0x31, 0x66, 0x73, 0x53, 0xa0, 0xea, 0xc6, 0xb4, 0x20, 0x9b, 0x67, 0xb8,
+    0x43, 0xa7, 0x26, 0x2a, 0x84, 0x8a, 0xf0, 0xa4, 0x9a, 0x6e, 0x2f, 0xa9, 0xf6, 0x58, 0x4e, 0xb4,
 ];
 const DISABLE_DEFERRED_TRXS_STAGE_2_FEATURE_DIGEST: [u8; 32] = [
-    0x09, 0xe8, 0x6c, 0xb0, 0xac, 0xcf, 0x8d, 0x81, 0xc9, 0xe8, 0x5d, 0x34, 0xbe, 0xa4, 0xb9,
-    0x25, 0xae, 0x93, 0x66, 0x26, 0xd0, 0x0c, 0x98, 0x4e, 0x46, 0x91, 0x18, 0x68, 0x91, 0xf5,
-    0xbc, 0x16,
+    0x09, 0xe8, 0x6c, 0xb0, 0xac, 0xcf, 0x8d, 0x81, 0xc9, 0xe8, 0x5d, 0x34, 0xbe, 0xa4, 0xb9, 0x25,
+    0xae, 0x93, 0x66, 0x26, 0xd0, 0x0c, 0x98, 0x4e, 0x46, 0x91, 0x18, 0x68, 0x91, 0xf5, 0xbc, 0x16,
 ];
 use pulsevm_crypto::{
     Bytes,
@@ -475,27 +473,30 @@ impl Controller {
             .node_config
             .as_ref()
             .and_then(|config| config.migration_manifest.as_ref());
-        if let (Some(checkpoint), Some(manifest_path)) = (migration_checkpoint, migration_manifest) {
+        if let (Some(checkpoint), Some(manifest_path)) = (migration_checkpoint, migration_manifest)
+        {
             let manifest_bytes = fs::read(manifest_path).map_err(|e| {
                 ChainError::GenesisError(format!(
                     "failed to read migration manifest {manifest_path}: {e}"
                 ))
             })?;
-            let manifest: MigrationManifest = serde_json::from_slice(&manifest_bytes).map_err(|e| {
-                ChainError::GenesisError(format!(
-                    "failed to parse migration manifest {manifest_path}: {e}"
-                ))
-            })?;
+            let manifest: MigrationManifest =
+                serde_json::from_slice(&manifest_bytes).map_err(|e| {
+                    ChainError::GenesisError(format!(
+                        "failed to parse migration manifest {manifest_path}: {e}"
+                    ))
+                })?;
             manifest.verify_checkpoint_path(checkpoint).map_err(|e| {
                 ChainError::GenesisError(format!(
                     "migration manifest {manifest_path} rejected checkpoint {checkpoint}: {e}"
                 ))
             })?;
-            let expected_checkpoint_sha256 = rust_genesis.migration_checkpoint_sha256.ok_or_else(|| {
-                ChainError::GenesisError(
-                    "migration genesis is missing migration_checkpoint_sha256".into(),
-                )
-            })?;
+            let expected_checkpoint_sha256 =
+                rust_genesis.migration_checkpoint_sha256.ok_or_else(|| {
+                    ChainError::GenesisError(
+                        "migration genesis is missing migration_checkpoint_sha256".into(),
+                    )
+                })?;
             if manifest.checkpoint_sha256 != hex::encode(expected_checkpoint_sha256) {
                 return Err(ChainError::GenesisError(format!(
                     "migration manifest checkpoint hash {} does not match migration genesis {}",
@@ -503,20 +504,23 @@ impl Controller {
                     hex::encode(expected_checkpoint_sha256)
                 )));
             }
-            let header = self.db.restore_from_path(std::path::Path::new(checkpoint)).map_err(|e| {
-                ChainError::GenesisError(format!(
-                    "failed to restore migration checkpoint {checkpoint}: {e}"
-                ))
-            })?;
+            let header = self
+                .db
+                .restore_from_path(std::path::Path::new(checkpoint))
+                .map_err(|e| {
+                    ChainError::GenesisError(format!(
+                        "failed to restore migration checkpoint {checkpoint}: {e}"
+                    ))
+                })?;
             if header.revision <= 0 {
                 return Err(ChainError::GenesisError(
                     "migration checkpoint must carry a positive revision".into(),
                 ));
             }
             for deferred in self.db.arena_deferred_transactions() {
-                let transaction = PackedTransaction::from_deferred_transaction_bytes(
-                    Bytes::from(deferred.packed_trx),
-                )
+                let transaction = PackedTransaction::from_deferred_transaction_bytes(Bytes::from(
+                    deferred.packed_trx,
+                ))
                 .map_err(|error| {
                     ChainError::GenesisError(format!(
                         "migration deferred transaction {} cannot be decoded: {error}",
@@ -551,9 +555,7 @@ impl Controller {
             }
             info!(
                 "restored migration Arena checkpoint {} at revision {} from manifest {}",
-                checkpoint,
-                header.revision,
-                manifest_path
+                checkpoint, header.revision, manifest_path
             );
         } else if migration_checkpoint.is_some() || migration_manifest.is_some() {
             return Err(ChainError::GenesisError(
@@ -845,8 +847,8 @@ impl Controller {
         // source chain authorized them when they were scheduled. Keep each one
         // in its own undo session so a failure leaves the queue untouched.
         let now = timestamp.to_time_point().time_since_epoch().count();
-        let disable_deferred_stage_1 = db
-            .protocol_feature_activated(DISABLE_DEFERRED_TRXS_STAGE_1_FEATURE_DIGEST);
+        let disable_deferred_stage_1 =
+            db.protocol_feature_activated(DISABLE_DEFERRED_TRXS_STAGE_1_FEATURE_DIGEST);
         let scheduled_transactions = if disable_deferred_stage_1 {
             // After stage 1 every pending deferred transaction is retired as
             // expired, even when its delay and expiration have not elapsed.
@@ -877,9 +879,9 @@ impl Controller {
                 ));
                 continue;
             }
-            let transaction = PackedTransaction::from_deferred_transaction_bytes(
-                Bytes::from(scheduled.packed_trx.clone()),
-            )
+            let transaction = PackedTransaction::from_deferred_transaction_bytes(Bytes::from(
+                scheduled.packed_trx.clone(),
+            ))
             .map_err(|error| {
                 ChainError::TransactionError(format!(
                     "cannot decode deferred transaction {}: {error}",
@@ -894,7 +896,11 @@ impl Controller {
                 )));
             }
             db.arena_start_undo_session();
-            match self.execute_deferred_transaction_with_failure(&transaction, &timestamp, &block_status) {
+            match self.execute_deferred_transaction_with_failure(
+                &transaction,
+                &timestamp,
+                &block_status,
+            ) {
                 Ok(result) => {
                     db.arena_remove_deferred_transaction(scheduled.trx_id)?;
                     db.arena_squash();
@@ -937,9 +943,11 @@ impl Controller {
                             let account = transaction
                                 .get_transaction()
                                 .first_authorizer()
-                                .ok_or_else(|| ChainError::TransactionError(
-                                    "deferred transaction has no authorizer".into(),
-                                ))?;
+                                .ok_or_else(|| {
+                                    ChainError::TransactionError(
+                                        "deferred transaction has no authorizer".into(),
+                                    )
+                                })?;
                             ResourceLimitsManager::add_transaction_usage(
                                 &mut self.db,
                                 &Name::new(account),
@@ -1733,9 +1741,11 @@ impl Controller {
                         let account = transaction
                             .get_transaction()
                             .first_authorizer()
-                            .ok_or_else(|| ChainError::BlockError(
-                                "hard_fail generated transaction has no authorizer".into(),
-                            ))?;
+                            .ok_or_else(|| {
+                                ChainError::BlockError(
+                                    "hard_fail generated transaction has no authorizer".into(),
+                                )
+                            })?;
                         ResourceLimitsManager::add_transaction_usage(
                             &mut self.db,
                             &Name::new(account),
@@ -1769,7 +1779,10 @@ impl Controller {
                     }
                 };
                 self.db.arena_remove_deferred_transaction(transaction_id)?;
-                let reproduced = TransactionReceipt::for_id(result.trace.receipt.clone(), *receipt.transaction_id());
+                let reproduced = TransactionReceipt::for_id(
+                    result.trace.receipt.clone(),
+                    *receipt.transaction_id(),
+                );
                 (result, reproduced)
             } else {
                 let transaction = receipt.packed_trx().ok_or_else(|| {
@@ -1784,7 +1797,8 @@ impl Controller {
                     block_status,
                     Some((receipt.cpu_usage_us(), receipt.net_usage_words())),
                 )?;
-                let reproduced = TransactionReceipt::new(result.trace.receipt.clone(), transaction.clone());
+                let reproduced =
+                    TransactionReceipt::new(result.trace.receipt.clone(), transaction.clone());
                 (result, reproduced)
             };
 
@@ -1983,8 +1997,12 @@ impl Controller {
         }
         let transaction = packed_transaction.get_transaction();
         if let Err(error) = trx_context.init_for_deferred_trx(
-            packed_transaction.get_unprunable_size().map_err(|error| (error, 0))?,
-            packed_transaction.get_prunable_size().map_err(|error| (error, 0))?,
+            packed_transaction
+                .get_unprunable_size()
+                .map_err(|error| (error, 0))?,
+            packed_transaction
+                .get_prunable_size()
+                .map_err(|error| (error, 0))?,
             transaction,
         ) {
             return Err((
@@ -3960,7 +3978,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn protocol_feature_activation_round_trips_through_built_block() -> Result<(), ChainError> {
+    async fn protocol_feature_activation_round_trips_through_built_block() -> Result<(), ChainError>
+    {
         let (mut producer, private_key, chain_id, _producer_temp) = init_test_controller()?;
         let feature = [
             0xef, 0x43, 0x11, 0x2c, 0x65, 0x43, 0xb8, 0x8d, 0xb2, 0x28, 0x3a, 0x2e, 0x07, 0x72,
@@ -3985,7 +4004,9 @@ mod tests {
             init_test_controller()?;
         validator.db.preactivate_protocol_feature(feature)?;
         let mut validator_mempool = Mempool::new();
-        validator.verify_block(&block, &mut validator_mempool).await?;
+        validator
+            .verify_block(&block, &mut validator_mempool)
+            .await?;
         assert!(validator.db.protocol_feature_activated(feature));
         assert!(validator.db.preactivated_protocol_features().is_empty());
         validator.accept_block(&block.id()?, &mut validator_mempool)?;
@@ -4018,7 +4039,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn due_deferred_transaction_executes_without_mempool_signature_admission() -> Result<(), ChainError> {
+    async fn due_deferred_transaction_executes_without_mempool_signature_admission()
+    -> Result<(), ChainError> {
         let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
         let scheduled = create_account(&private_key, Name::from_str("deferred")?, chain_id)?;
         let trx_id: [u8; 32] = scheduled.id().as_bytes().try_into().unwrap();
@@ -4051,14 +4073,24 @@ mod tests {
             scheduled.packed_trx_bytes(),
         )?;
         let mut validator_mempool = Mempool::new();
-        validator.verify_block(&block, &mut validator_mempool).await?;
+        validator
+            .verify_block(&block, &mut validator_mempool)
+            .await?;
         validator.accept_block(&block.id()?, &mut validator_mempool)?;
         assert_eq!(validator.db.deferred_transaction_count(), 0);
-        assert!(validator.db.is_account(Name::from_str("deferred")?.as_u64())?);
+        assert!(
+            validator
+                .db
+                .is_account(Name::from_str("deferred")?.as_u64())?
+        );
 
         controller.accept_block(&block.id()?, &mut mempool)?;
         assert_eq!(controller.db.deferred_transaction_count(), 0);
-        assert!(controller.db.is_account(Name::from_str("deferred")?.as_u64())?);
+        assert!(
+            controller
+                .db
+                .is_account(Name::from_str("deferred")?.as_u64())?
+        );
         Ok(())
     }
 
@@ -4088,7 +4120,11 @@ mod tests {
             &crate::chain::transaction::TransactionStatus::Expired
         );
         assert_eq!(producer.db.deferred_transaction_count(), 0);
-        assert!(!producer.db.is_account(Name::from_str("expired")?.as_u64())?);
+        assert!(
+            !producer
+                .db
+                .is_account(Name::from_str("expired")?.as_u64())?
+        );
 
         let (mut validator, _validator_key, _validator_chain_id, _validator_temp) =
             init_test_controller()?;
@@ -4103,10 +4139,16 @@ mod tests {
             scheduled.packed_trx_bytes(),
         )?;
         let mut validator_mempool = Mempool::new();
-        validator.verify_block(&block, &mut validator_mempool).await?;
+        validator
+            .verify_block(&block, &mut validator_mempool)
+            .await?;
         validator.accept_block(&block.id()?, &mut validator_mempool)?;
         assert_eq!(validator.db.deferred_transaction_count(), 0);
-        assert!(!validator.db.is_account(Name::from_str("expired")?.as_u64())?);
+        assert!(
+            !validator
+                .db
+                .is_account(Name::from_str("expired")?.as_u64())?
+        );
         Ok(())
     }
 
@@ -4149,7 +4191,9 @@ mod tests {
                       (call $assert (i32.const 0) (i32.const 8)))))
                 "#,
             ))
-            .map_err(|error| ChainError::InternalError(format!("compile onerror test wasm: {error}")))?;
+            .map_err(|error| {
+                ChainError::InternalError(format!("compile onerror test wasm: {error}"))
+            })?;
             let timestamp = controller.last_accepted_block().timestamp().clone();
             // The callback's action code is `eosio`, exactly as on XPR. The
             // minimal test genesis has only `pulse`, so create the source
@@ -4211,7 +4255,9 @@ mod tests {
             scheduled.packed_trx_bytes(),
         )?;
         let mut validator_mempool = Mempool::new();
-        validator.verify_block(&block, &mut validator_mempool).await?;
+        validator
+            .verify_block(&block, &mut validator_mempool)
+            .await?;
         validator.accept_block(&block.id()?, &mut validator_mempool)?;
         assert_eq!(validator.db.deferred_transaction_count(), 0);
 
@@ -4219,8 +4265,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_deferred_transaction_retires_after_onerror_hard_failure(
-    ) -> Result<(), ChainError> {
+    async fn failed_deferred_transaction_retires_after_onerror_hard_failure()
+    -> Result<(), ChainError> {
         fn install_failing_onerror_handler(
             controller: &mut Controller,
             private_key: &PrivateKey,
@@ -4243,7 +4289,9 @@ mod tests {
                 "#,
                 SETCODE_NAME.as_u64() as i64,
             ))
-            .map_err(|error| ChainError::InternalError(format!("compile hard-fail test wasm: {error}")))?;
+            .map_err(|error| {
+                ChainError::InternalError(format!("compile hard-fail test wasm: {error}"))
+            })?;
             let timestamp = controller.last_accepted_block().timestamp().clone();
             controller.execute_transaction(
                 &create_account(private_key, Name::from_str("eosio")?, chain_id)?,
@@ -4304,7 +4352,9 @@ mod tests {
             scheduled.packed_trx_bytes(),
         )?;
         let mut validator_mempool = Mempool::new();
-        validator.verify_block(&block, &mut validator_mempool).await?;
+        validator
+            .verify_block(&block, &mut validator_mempool)
+            .await?;
         validator.accept_block(&block.id()?, &mut validator_mempool)?;
         assert_eq!(validator.db.deferred_transaction_count(), 0);
 
@@ -4874,12 +4924,13 @@ mod tests {
         let pending_block_timestamp = controller.last_accepted_block().timestamp().clone();
         let block_status = BlockStatus::Building;
 
-        controller.execute_transaction(
-            &create_account(&private_key, account, chain_id)?,
-            &pending_block_timestamp,
-            &block_status,
-        )
-        .map_err(|error| ChainError::InternalError(format!("create account: {error}")))?;
+        controller
+            .execute_transaction(
+                &create_account(&private_key, account, chain_id)?,
+                &pending_block_timestamp,
+                &block_status,
+            )
+            .map_err(|error| ChainError::InternalError(format!("create account: {error}")))?;
 
         // The deferred payload only needs to be a canonical transaction with an
         // action. It is not executed in this test; the scheduler stores the raw
@@ -4913,25 +4964,27 @@ mod tests {
             "#
         ))
         .map_err(|error| ChainError::WasmRuntimeError(error.to_string()))?;
-        controller.execute_transaction(
-            &set_code(&private_key, account, send_contract, chain_id)?,
-            &pending_block_timestamp,
-            &block_status,
-        )
-        .map_err(|error| ChainError::InternalError(format!("set send code: {error}")))?;
+        controller
+            .execute_transaction(
+                &set_code(&private_key, account, send_contract, chain_id)?,
+                &pending_block_timestamp,
+                &block_status,
+            )
+            .map_err(|error| ChainError::InternalError(format!("set send code: {error}")))?;
         let ram_before_schedule = controller.db.get_account_ram_usage(payer)?;
-        controller.execute_transaction(
-            &call_contract(
-                &private_key,
-                account,
-                Name::from_str("run")?,
-                &Vec::<u8>::new(),
-                chain_id,
-            )?,
-            &pending_block_timestamp,
-            &block_status,
-        )
-        .map_err(|error| ChainError::InternalError(format!("call send: {error}")))?;
+        controller
+            .execute_transaction(
+                &call_contract(
+                    &private_key,
+                    account,
+                    Name::from_str("run")?,
+                    &Vec::<u8>::new(),
+                    chain_id,
+                )?,
+                &pending_block_timestamp,
+                &block_status,
+            )
+            .map_err(|error| ChainError::InternalError(format!("call send: {error}")))?;
 
         let scheduled = controller
             .db
@@ -4960,24 +5013,26 @@ mod tests {
             "#,
         )
         .map_err(|error| ChainError::WasmRuntimeError(error.to_string()))?;
-        controller.execute_transaction(
-            &set_code(&private_key, account, cancel_contract, chain_id)?,
-            &pending_block_timestamp,
-            &block_status,
-        )
-        .map_err(|error| ChainError::InternalError(format!("set cancel code: {error}")))?;
-        controller.execute_transaction(
-            &call_contract(
-                &private_key,
-                account,
-                Name::from_str("cancel")?,
-                &Vec::<u8>::new(),
-                chain_id,
-            )?,
-            &pending_block_timestamp,
-            &block_status,
-        )
-        .map_err(|error| ChainError::InternalError(format!("call cancel: {error}")))?;
+        controller
+            .execute_transaction(
+                &set_code(&private_key, account, cancel_contract, chain_id)?,
+                &pending_block_timestamp,
+                &block_status,
+            )
+            .map_err(|error| ChainError::InternalError(format!("set cancel code: {error}")))?;
+        controller
+            .execute_transaction(
+                &call_contract(
+                    &private_key,
+                    account,
+                    Name::from_str("cancel")?,
+                    &Vec::<u8>::new(),
+                    chain_id,
+                )?,
+                &pending_block_timestamp,
+                &block_status,
+            )
+            .map_err(|error| ChainError::InternalError(format!("call cancel: {error}")))?;
         assert!(
             controller
                 .db
@@ -5969,8 +6024,8 @@ mod tests {
     }
 
     #[test]
-    fn initialize_restores_migration_checkpoint_without_reauthoring_genesis(
-    ) -> Result<(), ChainError> {
+    fn initialize_restores_migration_checkpoint_without_reauthoring_genesis()
+    -> Result<(), ChainError> {
         let chain_id =
             Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
                 .unwrap();
@@ -5979,11 +6034,8 @@ mod tests {
         let temp = get_temp_dir();
         let checkpoint_dir = temp.path().join("checkpoint-source");
         let checkpoint_path = temp.path().join("migration.snapshot");
-        let mut checkpoint_db = Database::new(
-            checkpoint_dir.to_str().unwrap(),
-            1024 * 1024,
-        )
-        .map_err(ChainError::InternalError)?;
+        let mut checkpoint_db = Database::new(checkpoint_dir.to_str().unwrap(), 1024 * 1024)
+            .map_err(ChainError::InternalError)?;
         checkpoint_db.add_indices()?;
         let migrated = Name::from_str("migrated")?;
         checkpoint_db.create_account(migrated.as_u64(), 42)?;
@@ -6020,8 +6072,7 @@ mod tests {
         .into_bytes();
         let mut migration_genesis: serde_json::Value =
             serde_json::from_slice(&generate_genesis(&private_key)).unwrap();
-        migration_genesis["migration_checkpoint_sha256"] =
-            json!(manifest.checkpoint_sha256);
+        migration_genesis["migration_checkpoint_sha256"] = json!(manifest.checkpoint_sha256);
         let migration_genesis = serde_json::to_vec(&migration_genesis).unwrap();
         let target_path = temp.path().join("target");
         let mut controller = Controller::new();
@@ -6033,9 +6084,15 @@ mod tests {
         )?;
 
         assert_eq!(controller.database().revision(), 1);
-        assert!(controller.database().arena_account_exists(migrated.as_u64()));
         assert!(
-            !controller.database().arena_account_exists(PULSE_NAME.as_u64()),
+            controller
+                .database()
+                .arena_account_exists(migrated.as_u64())
+        );
+        assert!(
+            !controller
+                .database()
+                .arena_account_exists(PULSE_NAME.as_u64()),
             "normal genesis state must not overwrite a migration checkpoint"
         );
         controller.shutdown()?;

@@ -14,8 +14,10 @@ use pulsevm_proc_macros::{
     Read,
     Write,
 };
-use pulsevm_serialization::Write;
-use pulsevm_serialization::Read as SerializationRead;
+use pulsevm_serialization::{
+    Read as SerializationRead,
+    Write,
+};
 use serde::{
     Serialize,
     ser::SerializeStruct,

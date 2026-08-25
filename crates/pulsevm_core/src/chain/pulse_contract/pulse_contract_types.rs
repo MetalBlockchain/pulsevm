@@ -1,10 +1,17 @@
 use std::sync::Arc;
 
 use pulsevm_crypto::Bytes;
-use pulsevm_proc_macros::{NumBytes, Read, Write};
+use pulsevm_proc_macros::{
+    NumBytes,
+    Read,
+    Write,
+};
 use pulsevm_serialization::Write;
 
-use crate::chain::{authority::Authority, name::Name};
+use crate::chain::{
+    authority::Authority,
+    name::Name,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Read, Write, NumBytes)]
 pub struct NewAccount {
@@ -87,9 +94,17 @@ mod tests {
 
     use super::*;
     use pulsevm_crypto::k1::K1PublicKey;
-    use pulsevm_database::{KeyWeight, PermissionLevel, PermissionLevelWeight, WaitWeight};
+    use pulsevm_database::{
+        KeyWeight,
+        PermissionLevel,
+        PermissionLevelWeight,
+        WaitWeight,
+    };
     use pulsevm_name_macro::name;
-    use pulsevm_serialization::{Read, Write};
+    use pulsevm_serialization::{
+        Read,
+        Write,
+    };
 
     #[test]
     fn test_new_account_serialization() {

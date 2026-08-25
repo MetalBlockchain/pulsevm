@@ -1,8 +1,8 @@
+use pulsevm_crypto::AuthorityPublicKey;
 use pulsevm_serialization::{
     Read,
     Write,
 };
-use pulsevm_crypto::AuthorityPublicKey;
 use sha1::Digest as Sha1Digest;
 use wasmer::{
     FunctionEnvMut,

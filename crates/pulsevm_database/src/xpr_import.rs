@@ -8,20 +8,42 @@
 //! bytes as an Arena checkpoint.
 
 use std::{
-    collections::BTreeMap,
-    collections::{HashMap, HashSet},
+    collections::{
+        BTreeMap,
+        HashMap,
+        HashSet,
+    },
     fmt,
-    fs::{self, File},
-    io::{ErrorKind, Read, Seek, SeekFrom},
+    fs::{
+        self,
+        File,
+    },
+    io::{
+        ErrorKind,
+        Read,
+        Seek,
+        SeekFrom,
+    },
     path::Path,
 };
 
 use flate2::read::ZlibDecoder;
 use pulsevm_crypto::Digest;
-use serde::{Deserialize, Serialize};
-use sha2::{Digest as Sha2Digest, Sha256};
+use serde::{
+    Deserialize,
+    Serialize,
+};
+use sha2::{
+    Digest as Sha2Digest,
+    Sha256,
+};
 
-use crate::{ChainConfigV0, Database, Float128, U256};
+use crate::{
+    ChainConfigV0,
+    Database,
+    Float128,
+    U256,
+};
 
 /// XPR Leap writes `magic(8) + block_id(32) + payload_size(8)` before every
 /// state-history payload, followed by an eight-byte copy of the record's file
@@ -811,10 +833,7 @@ pub fn apply_state_history_delta_with_sidecar(
     let mut decoded = Vec::new();
     for delta in &entry.deltas {
         for row in &delta.rows {
-            decoded.push((
-                row.present,
-                decode_portable_row(&delta.name, &row.data)?,
-            ));
+            decoded.push((row.present, decode_portable_row(&delta.name, &row.data)?));
         }
     }
     validate_delta_sidecar(&decoded, entry.block_id, deferred_transactions)?;
@@ -1004,8 +1023,8 @@ fn apply_state_history_log_window_inner(
     sidecar_dir: Option<&Path>,
     max_post_snapshot_entries: u64,
 ) -> Result<u64, XprImportError> {
-    let mut file = File::open(path)
-        .map_err(|error| bad(format!("opening state-history log: {error}")))?;
+    let mut file =
+        File::open(path).map_err(|error| bad(format!("opening state-history log: {error}")))?;
     let mut offset = 0u64;
     let mut previous_block_num: Option<u32> = None;
     let mut entry_number = 0u64;
@@ -1022,7 +1041,10 @@ fn apply_state_history_log_window_inner(
             .map_err(|error| bad(format!("truncated state-history header: {error}")))?;
         let magic = u64::from_le_bytes(header[0..8].try_into().unwrap());
         if (magic as u16) != 0 {
-            return Err(bad(format!("unsupported XPR state-history version {}", magic as u16)));
+            return Err(bad(format!(
+                "unsupported XPR state-history version {}",
+                magic as u16
+            )));
         }
         let mut block_id = [0u8; 32];
         block_id.copy_from_slice(&header[8..40]);
@@ -1043,10 +1065,9 @@ fn apply_state_history_log_window_inner(
         previous_block_num = Some(block_num);
 
         if entry_number == 0 {
-            file.seek(SeekFrom::Current(
-                i64::try_from(payload_len)
-                    .map_err(|_| bad("state-history payload offset does not fit i64"))?,
-            ))
+            file.seek(SeekFrom::Current(i64::try_from(payload_len).map_err(
+                |_| bad("state-history payload offset does not fit i64"),
+            )?))
             .map_err(|error| bad(format!("skipping initial state payload: {error}")))?;
         } else {
             if applied >= max_post_snapshot_entries {
@@ -1128,14 +1149,17 @@ fn apply_delta_row(
                 db.xpr_import_set_account_abi_raw(name, &abi)
                     .map_err(database_error)?;
             } else {
-                db.create_account(name, creation_date).map_err(database_error)?;
+                db.create_account(name, creation_date)
+                    .map_err(database_error)?;
                 db.xpr_import_set_account_abi_raw(name, &abi)
                     .map_err(database_error)?;
             }
             summary.accounts += 1;
         }
         PortableRow::Account { .. } => {
-            return Err(bad("account removals are not supported by the Arena importer"));
+            return Err(bad(
+                "account removals are not supported by the Arena importer",
+            ));
         }
         PortableRow::AccountMetadata {
             name,
@@ -1180,7 +1204,10 @@ fn apply_delta_row(
             vm_type,
             vm_version,
         } if present => {
-            if db.get_code_bytes_by_hash(&hash, vm_type, vm_version).is_ok() {
+            if db
+                .get_code_bytes_by_hash(&hash, vm_type, vm_version)
+                .is_ok()
+            {
                 db.xpr_import_update_code(hash, &code, vm_type, vm_version)
                     .map_err(database_error)?;
             } else {
@@ -1217,9 +1244,7 @@ fn apply_delta_row(
                 .map_err(database_error)?;
             summary.permissions += 1;
         }
-        PortableRow::Permission {
-            owner, name, ..
-        } => {
+        PortableRow::Permission { owner, name, .. } => {
             db.xpr_import_remove_permission(owner, name)
                 .map_err(database_error)?;
         }
@@ -1253,7 +1278,9 @@ fn apply_delta_row(
             summary.resource_limits += 1;
         }
         PortableRow::ResourceLimits { .. } => {
-            return Err(bad("resource_limits removals are not supported by the Arena importer"));
+            return Err(bad(
+                "resource_limits removals are not supported by the Arena importer",
+            ));
         }
         PortableRow::ResourceUsage {
             owner,
@@ -1275,7 +1302,9 @@ fn apply_delta_row(
             summary.resource_usage += 1;
         }
         PortableRow::ResourceUsage { .. } => {
-            return Err(bad("resource_usage removals are not supported by the Arena importer"));
+            return Err(bad(
+                "resource_usage removals are not supported by the Arena importer",
+            ));
         }
         PortableRow::ResourceState {
             net,
@@ -1321,10 +1350,7 @@ fn apply_delta_row(
             summary.contract_tables += 1;
         }
         PortableRow::ContractTable {
-            code,
-            scope,
-            table,
-            ..
+            code, scope, table, ..
         } => {
             db.xpr_import_remove_contract_table(code, scope, table)
                 .map_err(database_error)?;
@@ -1363,7 +1389,9 @@ fn apply_delta_row(
             primary,
             payer,
             secondary,
-        } => apply_index64(db, present, code, scope, table, primary, payer, secondary, summary)?,
+        } => apply_index64(
+            db, present, code, scope, table, primary, payer, secondary, summary,
+        )?,
         PortableRow::Index128 {
             code,
             scope,
@@ -1371,7 +1399,9 @@ fn apply_delta_row(
             primary,
             payer,
             secondary,
-        } => apply_index128(db, present, code, scope, table, primary, payer, secondary, summary)?,
+        } => apply_index128(
+            db, present, code, scope, table, primary, payer, secondary, summary,
+        )?,
         PortableRow::Index256 {
             code,
             scope,
@@ -1379,7 +1409,9 @@ fn apply_delta_row(
             primary,
             payer,
             secondary,
-        } => apply_index256(db, present, code, scope, table, primary, payer, secondary, summary)?,
+        } => apply_index256(
+            db, present, code, scope, table, primary, payer, secondary, summary,
+        )?,
         PortableRow::IndexDouble {
             code,
             scope,
@@ -1387,7 +1419,9 @@ fn apply_delta_row(
             primary,
             payer,
             secondary,
-        } => apply_index_double(db, present, code, scope, table, primary, payer, secondary, summary)?,
+        } => apply_index_double(
+            db, present, code, scope, table, primary, payer, secondary, summary,
+        )?,
         PortableRow::IndexLongDouble {
             code,
             scope,
@@ -1395,7 +1429,9 @@ fn apply_delta_row(
             primary,
             payer,
             secondary,
-        } => apply_index_long_double(db, present, code, scope, table, primary, payer, secondary, summary)?,
+        } => apply_index_long_double(
+            db, present, code, scope, table, primary, payer, secondary, summary,
+        )?,
         PortableRow::GeneratedTransaction { .. } => unreachable!(),
     }
     Ok(())
@@ -1491,7 +1527,10 @@ fn apply_index_double(
     summary: &mut ImportSummary,
 ) -> Result<(), XprImportError> {
     if present {
-        if db.arena_idx_double_payer(code, scope, table, primary).is_some() {
+        if db
+            .arena_idx_double_payer(code, scope, table, primary)
+            .is_some()
+        {
             db.update_idx_double_object_standalone(code, scope, table, primary, payer, secondary)
         } else {
             db.create_idx_double_object_standalone(code, scope, table, payer, primary, secondary)
@@ -1517,10 +1556,17 @@ fn apply_index_long_double(
     summary: &mut ImportSummary,
 ) -> Result<(), XprImportError> {
     if present {
-        if db.arena_idx_long_double_payer(code, scope, table, primary).is_some() {
-            db.update_idx_long_double_object_standalone(code, scope, table, primary, payer, secondary)
+        if db
+            .arena_idx_long_double_payer(code, scope, table, primary)
+            .is_some()
+        {
+            db.update_idx_long_double_object_standalone(
+                code, scope, table, primary, payer, secondary,
+            )
         } else {
-            db.create_idx_long_double_object_standalone(code, scope, table, payer, primary, secondary)
+            db.create_idx_long_double_object_standalone(
+                code, scope, table, payer, primary, secondary,
+            )
         }
         .map_err(database_error)?;
         summary.index_long_double_rows += 1;
@@ -1777,10 +1823,15 @@ fn validate_sidecar_fields(
             .map_err(|error| bad(format!("invalid source chain id: {error}")))?;
         let mut seen = false;
         for row in rows {
-            if let PortableRow::GlobalProperty { source_chain_id, .. } = row {
+            if let PortableRow::GlobalProperty {
+                source_chain_id, ..
+            } = row
+            {
                 seen = true;
                 if *source_chain_id != expected {
-                    return Err(bad("sidecar source chain id does not match global_property"));
+                    return Err(bad(
+                        "sidecar source chain id does not match global_property",
+                    ));
                 }
             }
         }
@@ -1800,9 +1851,15 @@ fn validate_sidecar_fields(
                 _ => None,
             })
             .collect();
-        let actual: HashSet<u64> = sidecar.account_metadata.iter().map(|row| row.name).collect();
+        let actual: HashSet<u64> = sidecar
+            .account_metadata
+            .iter()
+            .map(|row| row.name)
+            .collect();
         if actual != expected {
-            return Err(bad("account_metadata sidecar does not exactly cover the SHiP rows"));
+            return Err(bad(
+                "account_metadata sidecar does not exactly cover the SHiP rows",
+            ));
         }
     }
 
@@ -1844,7 +1901,9 @@ fn validate_sidecar_fields(
             .map(|row| (row.owner, row.name))
             .collect();
         if actual != expected {
-            return Err(bad("permission sidecar does not exactly cover the SHiP rows"));
+            return Err(bad(
+                "permission sidecar does not exactly cover the SHiP rows",
+            ));
         }
     }
     Ok(())
@@ -1985,9 +2044,7 @@ fn validate_delta_sidecar(
     let mut generated_transaction_ids = HashSet::new();
     for key in &generated {
         if !generated_transaction_ids.insert(key.trx_id) {
-            return Err(bad(
-                "duplicate generated_transaction row in SHiP delta",
-            ));
+            return Err(bad("duplicate generated_transaction row in SHiP delta"));
         }
     }
     let Some(sidecar) = sidecar else {
@@ -2030,7 +2087,11 @@ fn validate_delta_sidecar(
             _ => None,
         })
         .collect();
-    let actual_metadata: HashSet<u64> = sidecar.account_metadata.iter().map(|row| row.name).collect();
+    let actual_metadata: HashSet<u64> = sidecar
+        .account_metadata
+        .iter()
+        .map(|row| row.name)
+        .collect();
     if !expected_metadata.is_subset(&actual_metadata)
         || actual_metadata.len() != sidecar.account_metadata.len()
     {
@@ -2079,9 +2140,7 @@ fn validate_delta_sidecar(
     if !expected_permissions.is_subset(&actual_permissions)
         || actual_permissions.len() != sidecar.permissions.len()
     {
-        return Err(bad(
-            "permission sidecar does not cover the SHiP delta rows",
-        ));
+        return Err(bad("permission sidecar does not cover the SHiP delta rows"));
     }
     Ok(())
 }
@@ -2178,7 +2237,7 @@ fn decode_global_property(bytes: &[u8]) -> Result<PortableRow, XprImportError> {
             return Ok(PortableRow::GlobalProperty {
                 config,
                 source_chain_id,
-            })
+            });
         }
         Err(error) => error,
     };
@@ -2233,16 +2292,8 @@ fn decode_global_property_layout(
         max_transaction_cpu_usage: row.u32()?,
         min_transaction_cpu_usage: row.u32()?,
         max_transaction_lifetime: row.u32()?,
-        deferred_trx_expiration_window: if legacy_config_fields {
-            0
-        } else {
-            row.u32()?
-        },
-        max_transaction_delay: if legacy_config_fields {
-            0
-        } else {
-            row.u32()?
-        },
+        deferred_trx_expiration_window: if legacy_config_fields { 0 } else { row.u32()? },
+        max_transaction_delay: if legacy_config_fields { 0 } else { row.u32()? },
         max_inline_action_size: row.u32()?,
         max_inline_action_depth: row.u16()?,
         max_authority_depth: row.u16()?,
@@ -2320,7 +2371,9 @@ fn decode_protocol_state(bytes: &[u8]) -> Result<PortableRow, XprImportError> {
         let feature_digest = row.fixed::<32>()?;
         let activation_block_num = row.u32()?;
         if !seen_digests.insert(feature_digest) {
-            return Err(bad("XPR protocol-state contains a duplicate feature digest"));
+            return Err(bad(
+                "XPR protocol-state contains a duplicate feature digest",
+            ));
         }
         if let Some(previous) = previous_activation_block
             && activation_block_num < previous
@@ -2856,10 +2909,9 @@ pub fn inspect_state_history_log(
         if entry_number == 0 {
             first_block_id = Some(block_id);
             first_payload_bytes = payload_len;
-            file.seek(SeekFrom::Current(
-                i64::try_from(payload_len)
-                    .map_err(|_| bad("state-history payload offset does not fit i64"))?,
-            ))
+            file.seek(SeekFrom::Current(i64::try_from(payload_len).map_err(
+                |_| bad("state-history payload offset does not fit i64"),
+            )?))
             .map_err(|error| bad(format!("skipping initial state payload: {error}")))?;
         } else if post_snapshot_entries < max_post_snapshot_entries {
             let mut payload = vec![0u8; payload_len_usize];
@@ -2875,10 +2927,9 @@ pub fn inspect_state_history_log(
             post_snapshot_entries += 1;
         } else {
             complete = false;
-            file.seek(SeekFrom::Current(
-                i64::try_from(payload_len)
-                    .map_err(|_| bad("state-history payload offset does not fit i64"))?,
-            ))
+            file.seek(SeekFrom::Current(i64::try_from(payload_len).map_err(
+                |_| bad("state-history payload offset does not fit i64"),
+            )?))
             .map_err(|error| bad(format!("skipping bounded-window payload: {error}")))?;
         }
 
@@ -3225,7 +3276,10 @@ fn write_varuint(mut value: u64, out: &mut Vec<u8>) {
 mod tests {
     use std::io::Write;
 
-    use flate2::{Compression, write::ZlibEncoder};
+    use flate2::{
+        Compression,
+        write::ZlibEncoder,
+    };
     use tempfile::TempDir;
 
     use super::*;
@@ -3233,14 +3287,16 @@ mod tests {
     #[test]
     fn accepts_current_and_legacy_global_property_rows() {
         let current = hex::decode("01000000000000010000100000000000e8030000000008000c000000f40100001400000064000000400d0300e8030000f049020064000000100e00005802000080533b000010000004000600000100009371fb05f023fcc78b23923d70bdfe6642cdf1956d120045bcd1371e05c961a90000040000000400000020000000000100002000000004000000200000000040010000400110020000fb000000").unwrap();
-        let PortableRow::GlobalProperty { config, .. } = decode_global_property(&current).unwrap() else {
+        let PortableRow::GlobalProperty { config, .. } = decode_global_property(&current).unwrap()
+        else {
             panic!("expected global_property row");
         };
         assert_eq!(config.deferred_trx_expiration_window, 600);
         assert_eq!(config.max_transaction_delay, 3_888_000);
 
         let legacy = hex::decode("01010000100000000000e8030000000008000c000000f40100001400000064000000005ed0b2c409000000ca9a3ba0860100100e000000100000060006000001000098f998d9010e744bddcef4a12ac306b93919537caa232ca19de2ed50322bb6fa0000040000000400000020000000000100002000000004000000200000000040010000400110020000fb000000").unwrap();
-        let PortableRow::GlobalProperty { config, .. } = decode_global_property(&legacy).unwrap() else {
+        let PortableRow::GlobalProperty { config, .. } = decode_global_property(&legacy).unwrap()
+        else {
             panic!("expected legacy global_property row");
         };
         assert_eq!(config.deferred_trx_expiration_window, 0);

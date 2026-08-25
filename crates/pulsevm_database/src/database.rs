@@ -2,13 +2,21 @@
 
 use std::{
     fs,
-    io::{Read, Seek, SeekFrom, Write},
+    io::{
+        Read,
+        Seek,
+        SeekFrom,
+        Write,
+    },
     path::Path,
 };
 
 use pulsevm_error::ChainError;
 use pulsevm_name::Name;
-use sha2::{Digest as Sha2Digest, Sha256};
+use sha2::{
+    Digest as Sha2Digest,
+    Sha256,
+};
 
 use crate::{
     Authority,
@@ -51,8 +59,9 @@ fn protocol_feature_spec(feature_digest: [u8; 32]) -> Option<ProtocolFeatureSpec
     let (dependencies, preactivation_required) = match digest.as_str() {
         // PREACTIVATE_FEATURE is enabled at genesis in Leap and may be
         // activated without a prior preactivation request.
-        "0ec7e080177b2c02b278d5088611686b49d739925a92d9bfcacd7fc6b74053bd" =>
-            (NO_PROTOCOL_FEATURE_DEPENDENCIES, false),
+        "0ec7e080177b2c02b278d5088611686b49d739925a92d9bfcacd7fc6b74053bd" => {
+            (NO_PROTOCOL_FEATURE_DEPENDENCIES, false)
+        }
         "1a99a59d87e06e09ec5b028a9cbb7749b4a5ad8819004365d02dc4379a8b7241"
         | "ef43112c6543b88db2283a2e077278c315ae2c84719a8b25f25cc88565fbea99"
         | "e0fb64b1085cc5538970158d05a009c24e276fb94e1a0bf6a528b48fbc4ff526"
@@ -71,12 +80,15 @@ fn protocol_feature_spec(feature_digest: [u8; 32]) -> Option<ProtocolFeatureSpec
         | "6bcb40a24e49c26d0a60513b6aeb8551d264e4717f306b81a37a5afb3b47cedc"
         | "35c2186cc36f7bb4aeaf4487b36e57039ccf45a9136aa856a5d569ecca55ef2b"
         | "63320dd4a58212e4d32d1f58926b73ca33a247326c2a5e9fd39268d2384e011a"
-        | "fce57d2331667353a0eac6b4209b67b843a7262a848af0a49a6e2fa9f6584eb4" =>
-            (NO_PROTOCOL_FEATURE_DEPENDENCIES, true),
-        "4a90c00d55454dc5b059055ca213579c6ea856967712a56017487886a4d4cc0f" =>
-            (NO_DUPLICATE_DEFERRED_ID_DEPENDENCIES, true),
-        "09e86cb0accf8d81c9e85d34bea4b925ae936626d00c984e4691186891f5bc16" =>
-            (DISABLE_DEFERRED_STAGE_2_DEPENDENCIES, true),
+        | "fce57d2331667353a0eac6b4209b67b843a7262a848af0a49a6e2fa9f6584eb4" => {
+            (NO_PROTOCOL_FEATURE_DEPENDENCIES, true)
+        }
+        "4a90c00d55454dc5b059055ca213579c6ea856967712a56017487886a4d4cc0f" => {
+            (NO_DUPLICATE_DEFERRED_ID_DEPENDENCIES, true)
+        }
+        "09e86cb0accf8d81c9e85d34bea4b925ae936626d00c984e4691186891f5bc16" => {
+            (DISABLE_DEFERRED_STAGE_2_DEPENDENCIES, true)
+        }
         _ => return None,
     };
     Some(ProtocolFeatureSpec {
@@ -94,7 +106,12 @@ fn parse_protocol_feature_digest(hex_digest: &str) -> [u8; 32] {
 // The public `Database` methods use the shared pure-Rust time type.
 use pulsevm_chain_types::TimePoint;
 // These pure-Rust authority sub-types back the arena authority decoder.
-use crate::{KeyWeight, PermissionLevel, PermissionLevelWeight, WaitWeight};
+use crate::{
+    KeyWeight,
+    PermissionLevel,
+    PermissionLevelWeight,
+    WaitWeight,
+};
 use pulsevm_billable_size::billable_size_v;
 use pulsevm_crypto::AuthorityPublicKey;
 #[cfg(test)]
@@ -1403,15 +1420,40 @@ impl Database {
     /// from hash-map iteration.
     pub fn arena_state_table_bytes(&self) -> Vec<(&'static str, Vec<u8>)> {
         vec![
-            ("account_metadata", self.arena_account_metadata_state_bytes().unwrap_or_default()),
-            ("account", self.arena_account_state_bytes().unwrap_or_default()),
-            ("permission", self.arena_permission_state_bytes().unwrap_or_default()),
-            ("permission_link", self.arena_permission_link_state_bytes().unwrap_or_default()),
+            (
+                "account_metadata",
+                self.arena_account_metadata_state_bytes()
+                    .unwrap_or_default(),
+            ),
+            (
+                "account",
+                self.arena_account_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "permission",
+                self.arena_permission_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "permission_link",
+                self.arena_permission_link_state_bytes().unwrap_or_default(),
+            ),
             ("code", self.arena_code_state_bytes().unwrap_or_default()),
-            ("transaction", self.arena_transaction_state_bytes().unwrap_or_default()),
-            ("resource_usage", self.arena_resource_usage_state_bytes().unwrap_or_default()),
-            ("resource_limits", self.arena_account_limits_state_bytes().unwrap_or_default()),
-            ("resource_state", self.arena_resource_state_bytes().unwrap_or_default()),
+            (
+                "transaction",
+                self.arena_transaction_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "resource_usage",
+                self.arena_resource_usage_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "resource_limits",
+                self.arena_account_limits_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "resource_state",
+                self.arena_resource_state_bytes().unwrap_or_default(),
+            ),
             (
                 "dynamic_global_property",
                 self.arena_global_action_sequence()
@@ -1419,11 +1461,26 @@ impl Database {
                     .to_le_bytes()
                     .to_vec(),
             ),
-            ("global_property", self.arena_global_property_state_bytes().unwrap_or_default()),
-            ("resource_limits_config", self.arena_resource_config_state_bytes().unwrap_or_default()),
-            ("contract_table", self.arena_contract_table_state_bytes().unwrap_or_default()),
-            ("contract_key_value", self.arena_contract_kv_state_bytes().unwrap_or_default()),
-            ("protocol_state", self.arena_protocol_state_bytes().unwrap_or_default()),
+            (
+                "global_property",
+                self.arena_global_property_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "resource_limits_config",
+                self.arena_resource_config_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "contract_table",
+                self.arena_contract_table_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "contract_key_value",
+                self.arena_contract_kv_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "protocol_state",
+                self.arena_protocol_state_bytes().unwrap_or_default(),
+            ),
         ]
     }
 
@@ -1599,7 +1656,9 @@ impl Database {
         let header = crate::snapshot::peek_header(&header_bytes)?;
         let expected_len = (crate::snapshot::HEADER_LEN as u64)
             .checked_add(header.payload_len)
-            .ok_or_else(|| ChainError::InternalError("restore: checkpoint length overflow".into()))?;
+            .ok_or_else(|| {
+                ChainError::InternalError("restore: checkpoint length overflow".into())
+            })?;
         if file_len != expected_len {
             return Err(ChainError::InternalError(format!(
                 "restore: checkpoint length {file_len} does not match envelope {expected_len}"
@@ -1674,7 +1733,9 @@ impl Database {
             hasher.update(&*buf);
             *payload_read = (*payload_read)
                 .checked_add(buf.len() as u64)
-                .ok_or_else(|| ChainError::InternalError("restore: payload length overflow".into()))?;
+                .ok_or_else(|| {
+                    ChainError::InternalError("restore: payload length overflow".into())
+                })?;
             if *payload_read > header.payload_len {
                 return Err(ChainError::InternalError(
                     "restore: sparse payload exceeds envelope length".into(),
@@ -1711,9 +1772,9 @@ impl Database {
                     "restore: sparse run is out of order or out of bounds".into(),
                 ));
             }
-            output
-                .seek(SeekFrom::Start(offset))
-                .map_err(|e| ChainError::InternalError(format!("restore: seek staged arena: {e}")))?;
+            output.seek(SeekFrom::Start(offset)).map_err(|e| {
+                ChainError::InternalError(format!("restore: seek staged arena: {e}"))
+            })?;
             let mut remaining_run = len;
             let mut buffer = vec![0u8; 4 * 1024 * 1024];
             while remaining_run != 0 {
@@ -2128,7 +2189,9 @@ impl Database {
                 vm_type,
                 vm_version,
             )
-            .map_err(|e| ChainError::InternalError(format!("XPR import account metadata delta: {e:?}")))
+            .map_err(|e| {
+                ChainError::InternalError(format!("XPR import account metadata delta: {e:?}"))
+            })
     }
 
     /// Insert a code image and its derived source reference count while
@@ -2185,9 +2248,7 @@ impl Database {
                 code_ref_count,
                 first_block_used,
             )
-            .map_err(|e| {
-                ChainError::InternalError(format!("XPR import code sidecar: {e:?}"))
-            })
+            .map_err(|e| ChainError::InternalError(format!("XPR import code sidecar: {e:?}")))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2313,14 +2374,18 @@ impl Database {
         if self.backend.permission(owner, name).is_some() {
             self.backend
                 .modify_permission(owner, name, authority, last_updated)
-                .map_err(|e| ChainError::InternalError(format!("XPR import permission delta: {e:?}")))
+                .map_err(|e| {
+                    ChainError::InternalError(format!("XPR import permission delta: {e:?}"))
+                })
         } else {
             let id = self.backend.next_permission_id().map_err(|e| {
                 ChainError::InternalError(format!("XPR import next permission id: {e:?}"))
             })?;
             self.backend
                 .create_permission(id, parent, owner, name, last_updated, authority)
-                .map_err(|e| ChainError::InternalError(format!("XPR import permission delta: {e:?}")))
+                .map_err(|e| {
+                    ChainError::InternalError(format!("XPR import permission delta: {e:?}"))
+                })
         }
     }
 
@@ -2342,9 +2407,7 @@ impl Database {
     ) -> Result<(), ChainError> {
         self.backend
             .xpr_import_permission_last_used(owner, name, last_used)
-            .map_err(|e| {
-                ChainError::InternalError(format!("XPR import permission sidecar: {e:?}"))
-            })
+            .map_err(|e| ChainError::InternalError(format!("XPR import permission sidecar: {e:?}")))
     }
 
     pub(crate) fn xpr_import_permission_link(
@@ -3360,7 +3423,9 @@ impl Database {
     ) -> Result<(), ChainError> {
         let queued = self.preactivated_protocol_features();
         if queued.len() != feature_digests.len()
-            || queued.iter().any(|digest| !feature_digests.contains(digest))
+            || queued
+                .iter()
+                .any(|digest| !feature_digests.contains(digest))
         {
             return Err(ChainError::BlockError(
                 "protocol feature activation must include the complete preactivation queue"
@@ -3940,7 +4005,12 @@ impl Database {
         expected_core_symbol: Option<&str>,
     ) -> Result<String, ChainError> {
         use pulsevm_rpc::{
-            AccountInfo, KeyWeight, LinkedAction, Permission, PermissionLevelWeight, ResourceLimit,
+            AccountInfo,
+            KeyWeight,
+            LinkedAction,
+            Permission,
+            PermissionLevelWeight,
+            ResourceLimit,
             WaitWeight,
         };
 
@@ -4175,16 +4245,18 @@ mod tests {
         let no_duplicate_deferred_id = parse_protocol_feature_digest(
             "4a90c00d55454dc5b059055ca213579c6ea856967712a56017487886a4d4cc0f",
         );
-        assert!(db
-            .preactivate_protocol_feature(no_duplicate_deferred_id)
-            .is_err());
+        assert!(
+            db.preactivate_protocol_feature(no_duplicate_deferred_id)
+                .is_err()
+        );
         db.preactivate_protocol_feature(replace_deferred).unwrap();
         db.preactivate_protocol_feature(no_duplicate_deferred_id)
             .unwrap();
 
-        assert!(db
-            .activate_protocol_features(&[no_duplicate_deferred_id, replace_deferred], 1)
-            .is_err());
+        assert!(
+            db.activate_protocol_features(&[no_duplicate_deferred_id, replace_deferred], 1)
+                .is_err()
+        );
         db.activate_protocol_features(&[replace_deferred, no_duplicate_deferred_id], 1)
             .unwrap();
         assert!(db.protocol_feature_activated(replace_deferred));
@@ -4225,10 +4297,12 @@ mod tests {
                 "XPR canonical feature digest {digest} is not registered"
             );
         }
-        assert!(protocol_feature_spec(parse_protocol_feature_digest(
-            "9908b3f8413c8474ab2a6be149d3f4f6d0421d37886033f27d4759c47a26d944"
-        ))
-        .is_none());
+        assert!(
+            protocol_feature_spec(parse_protocol_feature_digest(
+                "9908b3f8413c8474ab2a6be149d3f4f6d0421d37886033f27d4759c47a26d944"
+            ))
+            .is_none()
+        );
     }
 
     // 64 MiB is a multiple of chainbase's 1 MiB sizing requirement and leaves

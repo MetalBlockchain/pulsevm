@@ -1,13 +1,22 @@
 use base64::{
     Engine as _,
-    engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD},
+    engine::general_purpose::{
+        URL_SAFE,
+        URL_SAFE_NO_PAD,
+    },
 };
 use serde_json::Value;
-use sha2::{Digest as _, Sha256};
+use sha2::{
+    Digest as _,
+    Sha256,
+};
 
 use crate::{
-    k1::{encode_b58_checked, ripemd_checksum},
     R1Signature,
+    k1::{
+        encode_b58_checked,
+        ripemd_checksum,
+    },
 };
 
 /// A WebAuthn assertion carried by Antelope's `SIG_WA_` signature variant.
@@ -269,9 +278,15 @@ fn write_varuint(mut value: u64, out: &mut Vec<u8>) {
 
 #[cfg(test)]
 mod tests {
-    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use base64::{
+        Engine as _,
+        engine::general_purpose::URL_SAFE_NO_PAD,
+    };
     use p256::ecdsa::SigningKey;
-    use sha2::{Digest as _, Sha256};
+    use sha2::{
+        Digest as _,
+        Sha256,
+    };
 
     use super::WebAuthnSignature;
 
@@ -289,7 +304,9 @@ mod tests {
         let mut signed = auth_data.clone();
         signed.extend_from_slice(&Sha256::digest(client_json.as_bytes()));
         let signed_digest: [u8; 32] = Sha256::digest(signed).into();
-        let (signature, recovery_id) = signing_key.sign_prehash_recoverable(&signed_digest).unwrap();
+        let (signature, recovery_id) = signing_key
+            .sign_prehash_recoverable(&signed_digest)
+            .unwrap();
         let mut compact = [0u8; 65];
         compact[0] = 31 + recovery_id.to_byte();
         compact[1..].copy_from_slice(&signature.to_bytes());
@@ -300,9 +317,18 @@ mod tests {
         assert_eq!(key.rpid, "example.test");
         assert_eq!(
             key.point.as_slice(),
-            signing_key.verifying_key().to_encoded_point(true).as_bytes(),
+            signing_key
+                .verifying_key()
+                .to_encoded_point(true)
+                .as_bytes(),
         );
-        assert_eq!(WebAuthnSignature::from_packed(&signature.to_packed()).unwrap(), signature);
-        assert_eq!(WebAuthnSignature::from_string(&signature.to_string()).unwrap(), signature);
+        assert_eq!(
+            WebAuthnSignature::from_packed(&signature.to_packed()).unwrap(),
+            signature
+        );
+        assert_eq!(
+            WebAuthnSignature::from_string(&signature.to_string()).unwrap(),
+            signature
+        );
     }
 }

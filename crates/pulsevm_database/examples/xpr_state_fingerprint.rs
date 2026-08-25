@@ -2,10 +2,17 @@
 //!
 //! Usage: xpr_state_fingerprint <checkpoint> <arena-directory>
 
-use std::{env, path::Path, process::ExitCode};
+use std::{
+    env,
+    path::Path,
+    process::ExitCode,
+};
 
 use pulsevm_database::Database;
-use sha2::{Digest, Sha256};
+use sha2::{
+    Digest,
+    Sha256,
+};
 
 fn main() -> ExitCode {
     let mut args = env::args_os();
@@ -45,7 +52,11 @@ fn main() -> ExitCode {
     println!("state_root {}", hex::encode(state_root));
     for (name, bytes) in database.arena_state_table_bytes() {
         let hash = Sha256::digest(&bytes);
-        println!("table {name} bytes={} sha256={}", bytes.len(), hex::encode(hash));
+        println!(
+            "table {name} bytes={} sha256={}",
+            bytes.len(),
+            hex::encode(hash)
+        );
     }
     ExitCode::SUCCESS
 }

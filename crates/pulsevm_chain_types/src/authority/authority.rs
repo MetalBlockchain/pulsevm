@@ -1,16 +1,29 @@
 use std::fmt;
 
 use pulsevm_crypto::k1::K1PublicKey;
-use pulsevm_serialization::{NumBytes, Read, Write, WriteError};
+use pulsevm_serialization::{
+    NumBytes,
+    Read,
+    Write,
+    WriteError,
+};
 use serde::{
-    Deserialize, Serialize,
-    de::{self, MapAccess, SeqAccess, Visitor},
+    Deserialize,
+    Serialize,
+    de::{
+        self,
+        MapAccess,
+        SeqAccess,
+        Visitor,
+    },
     ser::SerializeStruct,
 };
 
 use super::{
-    key_weight::KeyWeight, permission_level::PermissionLevel,
-    permission_level_weight::PermissionLevelWeight, wait_weight::WaitWeight,
+    key_weight::KeyWeight,
+    permission_level::PermissionLevel,
+    permission_level_weight::PermissionLevelWeight,
+    wait_weight::WaitWeight,
 };
 
 #[derive(Clone, PartialEq, Eq, Hash)]

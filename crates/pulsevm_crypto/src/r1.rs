@@ -1,9 +1,13 @@
-use p256::{
-    ecdsa::{Signature, VerifyingKey},
-};
 use ecdsa::RecoveryId;
+use p256::ecdsa::{
+    Signature,
+    VerifyingKey,
+};
 
-use crate::k1::{decode_b58_checked, encode_b58_checked};
+use crate::k1::{
+    decode_b58_checked,
+    encode_b58_checked,
+};
 
 /// A recoverable secp256r1/P-256 ECDSA signature in the Antelope `R1`
 /// encoding.  Its compact bytes have the same `header || r || s` shape as K1,
@@ -124,7 +128,10 @@ mod tests {
         let r1 = R1Signature::from_compact65(&compact);
         assert_eq!(
             r1.recover(&digest).unwrap().as_slice(),
-            signing_key.verifying_key().to_encoded_point(true).as_bytes(),
+            signing_key
+                .verifying_key()
+                .to_encoded_point(true)
+                .as_bytes(),
         );
         assert_eq!(R1Signature::from_string(&r1.to_string()).unwrap(), r1);
         assert_eq!(R1Signature::from_packed(&r1.to_packed()).unwrap(), r1);

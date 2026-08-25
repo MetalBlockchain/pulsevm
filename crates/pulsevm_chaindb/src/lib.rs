@@ -2832,8 +2832,18 @@ impl ChainDatabase {
         const TARGET_GENESIS_ORDINAL: u32 = 1;
         let mut db = self.lock();
         let apply = |s: &mut ResourceStateRow| {
-            s.average_block_net_usage = UsageAccumulator { value_ex: net.0, consumed: net.1, last_ordinal: TARGET_GENESIS_ORDINAL, _pad: 0 };
-            s.average_block_cpu_usage = UsageAccumulator { value_ex: cpu.0, consumed: cpu.1, last_ordinal: TARGET_GENESIS_ORDINAL, _pad: 0 };
+            s.average_block_net_usage = UsageAccumulator {
+                value_ex: net.0,
+                consumed: net.1,
+                last_ordinal: TARGET_GENESIS_ORDINAL,
+                _pad: 0,
+            };
+            s.average_block_cpu_usage = UsageAccumulator {
+                value_ex: cpu.0,
+                consumed: cpu.1,
+                last_ordinal: TARGET_GENESIS_ORDINAL,
+                _pad: 0,
+            };
             s.pending_net_usage = 0;
             s.pending_cpu_usage = 0;
             s.total_net_weight = total_net_weight;
@@ -2842,10 +2852,16 @@ impl ChainDatabase {
             s.virtual_net_limit = virtual_net_limit;
             s.virtual_cpu_limit = virtual_cpu_limit;
         };
-        let existing = db.table::<ResourceStateRow>()?.iter().next().map(|s| s.id());
+        let existing = db
+            .table::<ResourceStateRow>()?
+            .iter()
+            .next()
+            .map(|s| s.id());
         match existing {
             Some(id) => db.modify::<ResourceStateRow>(id, apply)?,
-            None => { db.create::<ResourceStateRow>(apply)?; }
+            None => {
+                db.create::<ResourceStateRow>(apply)?;
+            }
         }
         Ok(())
     }
@@ -3486,11 +3502,7 @@ impl ChainDatabase {
             .iter()
             .copied()
             .collect();
-        let active: Vec<_> = db
-            .table::<ProtocolFeatureRow>()?
-            .iter()
-            .copied()
-            .collect();
+        let active: Vec<_> = db.table::<ProtocolFeatureRow>()?.iter().copied().collect();
         let mut ids = Vec::with_capacity(feature_digests.len());
         for digest in feature_digests {
             if active.iter().any(|row| row.feature_digest == *digest) {
@@ -3749,31 +3761,35 @@ impl ChainDatabase {
     /// it retires them with an ID-only `expired` receipt.
     pub fn due_deferred_transactions(&self, now_micros: i64) -> Vec<DeferredTransaction> {
         let db = self.lock();
-        let mut rows: Vec<(i64, i64, DeferredTransaction)> = match db.table::<DeferredTransactionRow>() {
-            Ok(table) => table
-                .iter()
-                .filter(|row| row.delay_until <= now_micros)
-                .filter_map(|row| {
-                    db.blob::<DeferredTransactionRow>(row.packed_trx).ok().map(|packed_trx| {
-                        (
-                            row.delay_until,
-                            row.id.raw(),
-                            DeferredTransaction {
-                                sender: row.sender,
-                                sender_id: (row.sender_id_lo as u128) | ((row.sender_id_hi as u128) << 64),
-                                payer: row.payer,
-                                trx_id: row.trx_id,
-                                delay_until: row.delay_until,
-                                expiration: row.expiration,
-                                published: row.published,
-                                packed_trx: packed_trx.to_vec(),
-                            },
-                        )
+        let mut rows: Vec<(i64, i64, DeferredTransaction)> =
+            match db.table::<DeferredTransactionRow>() {
+                Ok(table) => table
+                    .iter()
+                    .filter(|row| row.delay_until <= now_micros)
+                    .filter_map(|row| {
+                        db.blob::<DeferredTransactionRow>(row.packed_trx)
+                            .ok()
+                            .map(|packed_trx| {
+                                (
+                                    row.delay_until,
+                                    row.id.raw(),
+                                    DeferredTransaction {
+                                        sender: row.sender,
+                                        sender_id: (row.sender_id_lo as u128)
+                                            | ((row.sender_id_hi as u128) << 64),
+                                        payer: row.payer,
+                                        trx_id: row.trx_id,
+                                        delay_until: row.delay_until,
+                                        expiration: row.expiration,
+                                        published: row.published,
+                                        packed_trx: packed_trx.to_vec(),
+                                    },
+                                )
+                            })
                     })
-                })
-                .collect(),
-            Err(_) => return Vec::new(),
-        };
+                    .collect(),
+                Err(_) => return Vec::new(),
+            };
         rows.sort_by_key(|row| (row.0, row.1));
         rows.into_iter().map(|(_, _, row)| row).collect()
     }
@@ -3787,7 +3803,10 @@ impl ChainDatabase {
             .find_by::<DeferredTransactionRow, DeferredByTrxId>(&trx_id)
             .ok()
             .flatten()?;
-        let packed_trx = db.blob::<DeferredTransactionRow>(row.packed_trx).ok()?.to_vec();
+        let packed_trx = db
+            .blob::<DeferredTransactionRow>(row.packed_trx)
+            .ok()?
+            .to_vec();
         Some(DeferredTransaction {
             sender: row.sender,
             sender_id: (row.sender_id_lo as u128) | ((row.sender_id_hi as u128) << 64),
@@ -3815,7 +3834,10 @@ impl ChainDatabase {
             .find_by::<DeferredTransactionRow, DeferredBySenderId>(&key)
             .ok()
             .flatten()?;
-        let packed_trx = db.blob::<DeferredTransactionRow>(row.packed_trx).ok()?.to_vec();
+        let packed_trx = db
+            .blob::<DeferredTransactionRow>(row.packed_trx)
+            .ok()?
+            .to_vec();
         Some(DeferredTransaction {
             sender: row.sender,
             sender_id: (row.sender_id_lo as u128) | ((row.sender_id_hi as u128) << 64),
@@ -3836,9 +3858,7 @@ impl ChainDatabase {
     ) -> Result<Option<DeferredTransaction>, DbError> {
         let mut db = self.lock();
         let key = (sender, (sender_id >> 64) as u64, sender_id as u64);
-        let Some(row) = db
-            .find_by::<DeferredTransactionRow, DeferredBySenderId>(&key)?
-        else {
+        let Some(row) = db.find_by::<DeferredTransactionRow, DeferredBySenderId>(&key)? else {
             return Ok(None);
         };
         let (row_id, materialized) = {
@@ -3866,29 +3886,33 @@ impl ChainDatabase {
     /// before the node begins producing blocks.
     pub fn deferred_transactions(&self) -> Vec<DeferredTransaction> {
         let db = self.lock();
-        let mut rows: Vec<([u8; 32], DeferredTransaction)> = match db.table::<DeferredTransactionRow>() {
-            Ok(table) => table
-                .iter()
-                .filter_map(|row| {
-                    db.blob::<DeferredTransactionRow>(row.packed_trx).ok().map(|packed_trx| {
-                        (
-                            row.trx_id,
-                            DeferredTransaction {
-                                sender: row.sender,
-                                sender_id: (row.sender_id_lo as u128) | ((row.sender_id_hi as u128) << 64),
-                                payer: row.payer,
-                                trx_id: row.trx_id,
-                                delay_until: row.delay_until,
-                                expiration: row.expiration,
-                                published: row.published,
-                                packed_trx: packed_trx.to_vec(),
-                            },
-                        )
+        let mut rows: Vec<([u8; 32], DeferredTransaction)> =
+            match db.table::<DeferredTransactionRow>() {
+                Ok(table) => table
+                    .iter()
+                    .filter_map(|row| {
+                        db.blob::<DeferredTransactionRow>(row.packed_trx)
+                            .ok()
+                            .map(|packed_trx| {
+                                (
+                                    row.trx_id,
+                                    DeferredTransaction {
+                                        sender: row.sender,
+                                        sender_id: (row.sender_id_lo as u128)
+                                            | ((row.sender_id_hi as u128) << 64),
+                                        payer: row.payer,
+                                        trx_id: row.trx_id,
+                                        delay_until: row.delay_until,
+                                        expiration: row.expiration,
+                                        published: row.published,
+                                        packed_trx: packed_trx.to_vec(),
+                                    },
+                                )
+                            })
                     })
-                })
-                .collect(),
-            Err(_) => return Vec::new(),
-        };
+                    .collect(),
+                Err(_) => return Vec::new(),
+            };
         rows.sort_by_key(|row| row.0);
         rows.into_iter().map(|(_, row)| row).collect()
     }
@@ -5969,22 +5993,11 @@ mod tests {
         let db = ChainDatabase::new().unwrap();
         db.start_undo_session();
         let sender_id = (7u128 << 64) | 9;
-        db.xpr_import_deferred_transaction(
-            42,
-            sender_id,
-            42,
-            [3; 32],
-            20,
-            100,
-            10,
-            &[8, 9],
-        )
-        .unwrap();
+        db.xpr_import_deferred_transaction(42, sender_id, 42, [3; 32], 20, 100, 10, &[8, 9])
+            .unwrap();
         db.squash();
 
-        let found = db
-            .deferred_transaction_by_sender_id(42, sender_id)
-            .unwrap();
+        let found = db.deferred_transaction_by_sender_id(42, sender_id).unwrap();
         assert_eq!(found.trx_id, [3; 32]);
         assert_eq!(found.packed_trx, vec![8, 9]);
 
@@ -5994,9 +6007,10 @@ mod tests {
             .unwrap();
         assert_eq!(removed.sender_id, sender_id);
         assert_eq!(db.deferred_transaction_count(), 0);
-        assert!(db
-            .deferred_transaction_by_sender_id(42, sender_id)
-            .is_none());
+        assert!(
+            db.deferred_transaction_by_sender_id(42, sender_id)
+                .is_none()
+        );
     }
 
     #[test]

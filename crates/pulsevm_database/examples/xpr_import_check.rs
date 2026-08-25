@@ -1,4 +1,8 @@
-use std::{env, fs, process::ExitCode};
+use std::{
+    env,
+    fs,
+    process::ExitCode,
+};
 
 use pulsevm_database::{
     Database,
@@ -9,7 +13,9 @@ use pulsevm_database::{
 };
 
 fn usage() {
-    eprintln!("Usage: xpr_import_check <chain_state_history.log> <arena-directory> [checkpoint-file] [deferred-transactions.json]");
+    eprintln!(
+        "Usage: xpr_import_check <chain_state_history.log> <arena-directory> [checkpoint-file] [deferred-transactions.json]"
+    );
 }
 
 fn main() -> ExitCode {
@@ -160,7 +166,10 @@ fn main() -> ExitCode {
                     eprintln!("cannot write migration manifest {manifest_path}: {error}");
                     return ExitCode::from(1);
                 }
-                println!("wrote migration checkpoint: {}", checkpoint_path.to_string_lossy());
+                println!(
+                    "wrote migration checkpoint: {}",
+                    checkpoint_path.to_string_lossy()
+                );
                 println!("wrote migration manifest: {manifest_path}");
             }
             println!("XPR state imported successfully: {summary:?}");

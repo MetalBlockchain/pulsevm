@@ -1,11 +1,11 @@
 use std::collections::BTreeSet;
 
+use pulsevm_crypto::AuthorityPublicKey;
 use pulsevm_database::{
     PermissionLevel,
     microseconds,
     seconds,
 };
-use pulsevm_crypto::AuthorityPublicKey;
 use pulsevm_serialization::Read;
 use wasmer::{
     FunctionEnvMut,
@@ -63,9 +63,10 @@ pub fn check_transaction_authorization(
         pubkeys_slice
             .read_slice(&mut pubkeys_bytes)
             .map_err(|e| RuntimeError::new(format!("failed to read public keys: {e}")))?;
-        provided_keys = BTreeSet::<AuthorityPublicKey>::read(&pubkeys_bytes, &mut 0).map_err(|e| {
-            RuntimeError::new(format!("failed to deserialize provided public keys: {}", e))
-        })?;
+        provided_keys =
+            BTreeSet::<AuthorityPublicKey>::read(&pubkeys_bytes, &mut 0).map_err(|e| {
+                RuntimeError::new(format!("failed to deserialize provided public keys: {}", e))
+            })?;
     }
 
     if perms_length > 0 {
