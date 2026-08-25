@@ -1,0 +1,19 @@
+[package]
+name = "pulsevm_snapshot"
+version = "0.1.0"
+edition = "2024"
+
+# Reader for Antelope (Leap/Spring) portable chainstate snapshots — the .bin files
+# produced by nodeos `create_snapshot` / `producer_api_plugin`. Decode-only: this
+# crate turns snapshot sections into typed Rust rows; writing those rows into the
+# arena state layer is a separate concern (see pulsevm_database's hydrate_* path).
+
+[dependencies]
+pulsevm_chain_types = { path = "../pulsevm_chain_types" }
+pulsevm_crypto = { path = "../pulsevm_crypto" }
+pulsevm_name = { path = "../pulsevm_name" }
+pulsevm_proc_macros = { path = "../pulsevm_proc_macros" }
+pulsevm_serialization = { path = "../pulsevm_serialization" }
+
+[dev-dependencies]
+hex = "0.4"

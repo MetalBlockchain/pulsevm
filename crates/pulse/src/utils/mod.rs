@@ -1,6 +1,7 @@
 use pulsevm_api_client::PulseVmClient;
 use pulsevm_core::{
     id::Id,
+    mempool::DEFAULT_MEMPOOL_TRANSACTION_TTL_SECS,
     time::TimePointSec,
     transaction::{
         Action,
@@ -18,7 +19,7 @@ pub async fn push_actions(
 ) -> Result<Id, Box<dyn std::error::Error>> {
     let chain_info = api_client.get_info().await?;
     let mut txn = Transaction::default();
-    txn.header.expiration = TimePointSec::now() + 300; // 5 minutes from now
+    txn.header.expiration = TimePointSec::now() + DEFAULT_MEMPOOL_TRANSACTION_TTL_SECS;
     txn.actions = actions;
     let candidate_keys = keosd_client.get_public_keys().await?;
     let required_keys = api_client.get_required_keys(&txn, &candidate_keys).await?;

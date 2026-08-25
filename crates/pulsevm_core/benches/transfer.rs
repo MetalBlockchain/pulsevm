@@ -1,6 +1,7 @@
 use chrono::Utc;
 use criterion::{
     Criterion,
+    black_box,
     criterion_group,
     criterion_main,
 };
@@ -275,6 +276,57 @@ fn criterion_benchmark(c: &mut Criterion) {
             &block_status,
         )
         .unwrap();
+
+    // Keep the exact same signed WASM transfer for both admission paths. This
+    // isolates the work that the new preflight avoids: opening an undo session
+    // and running the contract action only to discard its state changes.
+    let admission_transaction = call_contract(
+        &private_key,
+        Name::from_str("pulse.token").unwrap(),
+        Name::from_str("transfer").unwrap(),
+        &Transfer {
+            from: Name::from_str("alice").unwrap(),
+            to: Name::from_str("bob").unwrap(),
+            quantity: Asset {
+                amount: 1,
+                symbol: Symbol::from_str("4,EOS").unwrap(),
+            },
+            memo: "mempool admission benchmark".to_string(),
+        },
+        controller.chain_id().clone(),
+        vec![PermissionLevel::new(
+            Name::from_str("alice").unwrap().as_u64(),
+            ACTIVE_NAME.as_u64(),
+        )],
+    )
+    .unwrap();
+    let mut admission_group = c.benchmark_group("mempool_admission");
+    admission_group.bench_function("preflight", |b| {
+        b.iter(|| {
+            black_box(
+                controller
+                    .validate_transaction_for_mempool(
+                        black_box(&admission_transaction),
+                        black_box(&pending_block_timestamp),
+                    )
+                    .unwrap(),
+            )
+        })
+    });
+    admission_group.bench_function("speculative_execution", |b| {
+        b.iter(|| {
+            black_box(
+                controller
+                    .push_transaction(
+                        black_box(&admission_transaction),
+                        black_box(&pending_block_timestamp),
+                        black_box(&block_status),
+                    )
+                    .unwrap(),
+            )
+        })
+    });
+    admission_group.finish();
 
     let mut nonce = 0u64;
     c.bench_function("transfer", |b| {
