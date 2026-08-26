@@ -90,13 +90,17 @@ with the following default methods:
 The node configuration accepts `system_account` as an EOSIO name; omitting it preserves
 the default `pulse` network behavior.
 
+The `cleos`-compatible CLI stores the same setting as `system_account` in
+`~/.pulse-cli/config.json`; `set system-account eosio` selects the root used by
+account-management commands. `token_contract` controls the default transfer contract.
+
 - `<system>.newaccount`: registers an account, assuming it doesn't already exist
 - `<system>.setcode`: updates or removes the WASM contract of a specific account
 - `<system>.setabi`: updates or removes the ABI specification of a specific account
 - `<system>.updateauth`: updates an account's authorization
 - `<system>.deleteauth`: deletes a specific authority level, cannot be `owner` or `activity` authority
 - `<system>.linkauth`
-- `<system>.deleteauth`
+- `<system>.unlinkauth`
 
 These follow the same spec as the `eosio` implementation.
 

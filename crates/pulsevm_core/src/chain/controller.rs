@@ -197,6 +197,22 @@ enum TransactionResourceMode {
     ReplayReceipt { cpu_us: u32, net_words: u32 },
 }
 
+/// Native system actions are selected by action name once the receiver and
+/// scope have been validated by `find_apply_handler`. Keeping this separate
+/// from the legacy `(receiver, scope, action)` table avoids scanning a map on
+/// every custom-root system action.
+pub static NATIVE_SYSTEM_HANDLERS: LazyLock<HashMap<Name, ApplyHandlerFn>> = LazyLock::new(|| {
+    HashMap::from([
+        (NEWACCOUNT_NAME, newaccount as ApplyHandlerFn),
+        (SETCODE_NAME, setcode as ApplyHandlerFn),
+        (SETABI_NAME, setabi as ApplyHandlerFn),
+        (UPDATEAUTH_NAME, updateauth as ApplyHandlerFn),
+        (DELETEAUTH_NAME, deleteauth as ApplyHandlerFn),
+        (LINKAUTH_NAME, linkauth as ApplyHandlerFn),
+        (UNLINKAUTH_NAME, unlinkauth as ApplyHandlerFn),
+    ])
+});
+
 pub struct Controller {
     wasm_runtime: WasmRuntime,
     last_accepted_block: SignedBlock,
@@ -736,6 +752,7 @@ impl Controller {
 
         let revision = self.db.revision();
         info!("database revision: {}", revision);
+        self.db.validate_system_account_state()?;
 
         if revision <= 0 {
             // Initialize the database with the genesis state
@@ -743,7 +760,7 @@ impl Controller {
             self.db
                 .initialize_database_with_system_account(&rust_genesis, system_account)
                 .map_err(|e| {
-                ChainError::GenesisError(format!("failed to initialize database: {}", e))
+                    ChainError::GenesisError(format!("failed to initialize database: {}", e))
                 })?;
             // initialize_database seeds the resource-limits config from the C++
             // struct defaults (default_max_block_cpu_usage), not from genesis, so
@@ -1726,10 +1743,7 @@ impl Controller {
             system,
             ONBLOCK_NAME,
             header_bytes,
-            vec![PermissionLevel::new(
-                system.as_u64(),
-                ACTIVE_NAME.as_u64(),
-            )],
+            vec![PermissionLevel::new(system.as_u64(), ACTIVE_NAME.as_u64())],
         );
         let trx = Transaction::new(TransactionHeader::default(), vec![], vec![action]);
         let packed = PackedTransaction::from_signed_transaction(SignedTransaction::new(
@@ -2457,6 +2471,11 @@ impl Controller {
             )));
         }
 
+        // Validate the configured root against the staged snapshot before
+        // touching pending state or swapping the live arena. This keeps a
+        // snapshot from another network fully non-destructive.
+        self.db.validate_snapshot_system_account(envelope)?;
+
         // Finish every fallible pure preflight before changing live state.
         let packed_block = block
             .pack()
@@ -2486,6 +2505,11 @@ impl Controller {
             }
             return Err(error);
         }
+        db.validate_system_account_state().map_err(|error| {
+            ChainError::fatal_consistency(format!(
+                "state sync installed state for the wrong system account: {error}"
+            ))
+        })?;
         if db.arena_state_root() != Some(expected_state_root) {
             return Err(ChainError::fatal_consistency(format!(
                 "state sync installed a state root other than the authenticated root {}",
@@ -2737,19 +2761,9 @@ impl Controller {
         system: Name,
     ) -> Option<ApplyHandlerFn> {
         if *receiver == system && *scope == system {
-            if let Some(handler) = APPLY_HANDLERS.get(&(*receiver, *scope, *act)) {
-                return Some(*handler);
-            }
-            // Native handlers are independent of the configured system name;
-            // the static table keeps the default `pulse` keys for compatibility.
-            return APPLY_HANDLERS
-                .iter()
-                .find(|((_, _, name), _)| *name == *act)
-                .map(|(_, handler)| *handler);
+            return NATIVE_SYSTEM_HANDLERS.get(act).copied();
         }
-        APPLY_HANDLERS
-            .get(&(*receiver, *scope, *act))
-            .copied()
+        APPLY_HANDLERS.get(&(*receiver, *scope, *act)).copied()
     }
 
     pub fn get_wasm_runtime(&self) -> &WasmRuntime {
@@ -3200,6 +3214,39 @@ mod tests {
         .sign(&private_key, &chain_id)?;
         let packed_trx = PackedTransaction::from_signed_transaction(trx)?;
         Ok(packed_trx)
+    }
+
+    fn create_account_from_system(
+        private_key: &PrivateKey,
+        system: Name,
+        account: Name,
+        chain_id: Id,
+    ) -> Result<PackedTransaction, ChainError> {
+        let authority = Authority::new(
+            1,
+            vec![KeyWeight::new(private_key.get_public_key().into_k1(), 1)],
+            vec![],
+            vec![],
+        );
+        let trx = Transaction::new(
+            TransactionHeader::new(TimePointSec::maximum(), 0, 0, 0u32.into(), 0, 0u32.into()),
+            vec![],
+            vec![Action::new(
+                system,
+                NEWACCOUNT_NAME,
+                NewAccount {
+                    creator: system,
+                    name: account,
+                    owner: authority.clone(),
+                    active: authority,
+                }
+                .pack()
+                .unwrap(),
+                vec![PermissionLevel::new(system.as_u64(), ACTIVE_NAME.as_u64())],
+            )],
+        )
+        .sign(private_key, &chain_id)?;
+        Ok(PackedTransaction::from_signed_transaction(trx)?)
     }
 
     fn set_code(
@@ -4413,10 +4460,9 @@ mod tests {
 
     #[tokio::test]
     async fn custom_system_account_is_seeded_and_exposed_to_runtime() -> Result<(), ChainError> {
-        let chain_id = Id::from_str(
-            "c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6",
-        )
-        .unwrap();
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
         let private_key =
             PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
         let mut controller = Controller::new();
@@ -4442,13 +4488,28 @@ mod tests {
         assert!(db.is_account(names.system.as_u64())?);
         assert!(db.is_account(names.prods.as_u64())?);
         assert!(!db.is_account(PULSE_NAME.as_u64())?);
-        assert!(Controller::find_apply_handler(
-            &names.system,
-            &names.system,
-            &NEWACCOUNT_NAME,
-            names.system,
-        )
-        .is_some());
+        assert!(
+            Controller::find_apply_handler(
+                &names.system,
+                &names.system,
+                &NEWACCOUNT_NAME,
+                names.system,
+            )
+            .is_some()
+        );
+
+        let timestamp = controller.last_accepted_block().timestamp().clone();
+        controller.execute_transaction(
+            &create_account_from_system(
+                &private_key,
+                names.system,
+                Name::from_str("alice")?,
+                chain_id,
+            )?,
+            &timestamp,
+            &BlockStatus::Building,
+        )?;
+        assert!(db.is_account(Name::from_str("alice")?.as_u64())?);
         Ok(())
     }
 

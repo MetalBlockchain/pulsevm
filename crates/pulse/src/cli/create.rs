@@ -3,7 +3,6 @@ use std::str::FromStr;
 use pulsevm_api_client::PulseVmClient;
 use pulsevm_core::{
     ACTIVE_NAME,
-    PULSE_NAME,
     authority::{
         Authority,
         KeyWeight,
@@ -23,6 +22,7 @@ use spdlog::info;
 
 use crate::{
     cli::CreateSubcommand,
+    config::Config,
     utils::push_actions,
 };
 
@@ -40,6 +40,7 @@ fn render_keypair(private_key: &PrivateKey) -> String {
 
 pub async fn handle(
     api_client: &PulseVmClient,
+    config: &Config,
     keosd_client: &KeosdClient,
     subcmd: CreateSubcommand,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -59,7 +60,7 @@ pub async fn handle(
                 api_client,
                 keosd_client,
                 vec![Action {
-                    account: PULSE_NAME,
+                    account: Name::from_str(&config.system_account)?,
                     name: NEWACCOUNT_NAME,
                     authorization: vec![PermissionLevel {
                         actor: Name::from_str(&creator)?.into(),
