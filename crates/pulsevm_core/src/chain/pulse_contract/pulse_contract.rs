@@ -12,7 +12,6 @@ use pulsevm_serialization::Read;
 
 use crate::{
     ACTIVE_NAME,
-    CODE_NAME,
     OWNER_NAME,
     chain::{
         abi::AbiDefinition,
@@ -67,9 +66,12 @@ pub fn newaccount(
     // Check if the creator is privileged
     if !db.is_account_privileged(create.creator.as_u64())? {
         pulse_assert(
-            !name_str.starts_with("pulse."),
+            !name_str.starts_with(&format!("{}.", context.system_accounts().system)),
             ChainError::TransactionError(
-                "only privileged accounts can have names that start with 'pulse.'".to_string(),
+                format!(
+                    "only privileged accounts can have names that start with '{}.'",
+                    context.system_accounts().system
+                ),
             ),
         )?;
     }
@@ -255,9 +257,13 @@ pub fn updateauth(
         ChainError::ActionValidationError(format!("cannot create authority with empty name")),
     )?;
     pulse_assert(
-        !update.permission.to_string().starts_with("pulse."),
+        !update
+            .permission
+            .to_string()
+            .starts_with(&format!("{}.", context.system_accounts().system)),
         ChainError::ActionValidationError(format!(
-            "permission names that start with 'pulse.' are reserved"
+            "permission names that start with '{}.' are reserved",
+            context.system_accounts().system
         )),
     )?;
     pulse_assert(
@@ -465,8 +471,8 @@ fn validate_authority_precondition(db: &mut Database, auth: &Authority) -> Resul
             continue; // account was already checked to exist, so its owner and active permissions should exist
         }
 
-        if a.permission.permission == CODE_NAME {
-            continue; // virtual pulse.code permission does not really exist but is allowed
+        if a.permission.permission == db.system_accounts().code {
+            continue; // virtual system.code permission does not really exist but is allowed
         }
 
         AuthorizationManager::get_permission(

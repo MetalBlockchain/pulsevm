@@ -9,6 +9,8 @@ use std::{
         Write,
     },
     path::Path,
+    str::FromStr,
+    sync::{Arc, RwLock},
 };
 
 use pulsevm_error::ChainError;
@@ -142,6 +144,50 @@ fn name_u64(s: &str) -> Result<u64, ChainError> {
     pulsevm_name::Name::from_str(s)
         .map(|n| n.as_u64())
         .map_err(|e| ChainError::InternalError(format!("bad name {s:?}: {e:?}")))
+}
+
+/// The system-account names derived from the configured root account.  Keeping
+/// these together prevents the execution and RPC paths from accidentally
+/// mixing `pulse.*` and `eosio.*` identities when importing an Antelope state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SystemAccountNames {
+    pub system: Name,
+    pub null: Name,
+    pub prods: Name,
+    pub any: Name,
+    pub code: Name,
+    pub token: Name,
+    pub ram: Name,
+    pub ramfee: Name,
+    pub rex: Name,
+    pub stake: Name,
+}
+
+impl SystemAccountNames {
+    pub fn new(system: Name) -> Result<Self, String> {
+        let suffix = |s: &str| {
+            Name::from_str(&format!("{system}.{s}"))
+                .map_err(|e| format!("invalid system account '{system}': {e}"))
+        };
+        Ok(Self {
+            system,
+            null: suffix("null")?,
+            prods: suffix("prods")?,
+            any: suffix("any")?,
+            code: suffix("code")?,
+            token: suffix("token")?,
+            ram: suffix("ram")?,
+            ramfee: suffix("ramfee")?,
+            rex: suffix("rex")?,
+            stake: suffix("stake")?,
+        })
+    }
+}
+
+impl Default for SystemAccountNames {
+    fn default() -> Self {
+        Self::new(Name::from_str("pulse").expect("pulse is a valid name")).unwrap()
+    }
 }
 
 /// The raw `symbol_code` form of a ticker: its ASCII bytes packed low byte first
@@ -464,6 +510,7 @@ pub struct Database {
     /// The pure-Rust arena (pulsevm_chaindb). The sole state backend, shared
     /// across clones so every apply/transaction context reaches the same handle.
     backend: crate::backend::ChainDatabase,
+    system_accounts: Arc<RwLock<SystemAccountNames>>,
 }
 
 /// The staged arena checkpoint file used to move a snapshot through the transport
@@ -509,7 +556,27 @@ impl Database {
         Ok(Database {
             path: path.to_string(),
             backend,
+            system_accounts: Arc::new(RwLock::new(SystemAccountNames::default())),
         })
+    }
+
+    /// Set the system-account identity used by runtime helpers. This is node
+    /// configuration, not mutable chain state, and is shared by all cloned
+    /// database handles used by transaction/apply contexts.
+    pub fn set_system_account(&self, system: Name) -> Result<(), String> {
+        let names = SystemAccountNames::new(system)?;
+        *self
+            .system_accounts
+            .write()
+            .map_err(|_| "system-account lock poisoned".to_string())? = names;
+        Ok(())
+    }
+
+    pub fn system_accounts(&self) -> SystemAccountNames {
+        *self
+            .system_accounts
+            .read()
+            .expect("system-account lock poisoned")
     }
 
     /// The arena database's account_metadata privileged flag for `name`, or
@@ -1535,7 +1602,17 @@ impl Database {
     ) -> Result<(), ChainError> {
         // Genesis is authored directly on the arena, reproducing C++
         // `initialize_database` without a chainbase bootstrap.
-        self.initialize_genesis_arena(genesis)
+        self.initialize_genesis_arena(genesis, self.system_accounts())
+    }
+
+    pub fn initialize_database_with_system_account(
+        &mut self,
+        genesis: &pulsevm_chain_types::GenesisState,
+        system: Name,
+    ) -> Result<(), ChainError> {
+        self.set_system_account(system)
+            .map_err(ChainError::GenesisError)?;
+        self.initialize_genesis_arena(genesis, self.system_accounts())
     }
 
     /// Author the entire genesis state directly on the arena, reproducing C++
@@ -1545,6 +1622,7 @@ impl Database {
     fn initialize_genesis_arena(
         &self,
         genesis: &pulsevm_chain_types::GenesisState,
+        names: SystemAccountNames,
     ) -> Result<(), ChainError> {
         use crate::backend::ElasticParams;
 
@@ -1558,9 +1636,6 @@ impl Database {
         let creation_slot: u32 = (((ts_us / 1000) - 946_684_800_000i64) / 500i64).max(0) as u32;
 
         // Genesis account / permission names (config.hpp), as name-encoded u64.
-        const PULSE: u64 = 12_584_048_018_849_792_000;
-        const PULSE_NULL: u64 = 12_584_048_029_495_738_368;
-        const PULSE_PRODS: u64 = 12_584_048_030_520_602_624;
         const OWNER: u64 = 12_044_502_819_693_133_824;
         const ACTIVE: u64 = 3_617_214_756_542_218_240;
         const PROD_MAJOR: u64 = 12_531_424_605_554_196_480;
@@ -1601,10 +1676,15 @@ impl Database {
         let key_bytes = genesis.initial_key_packed().to_vec();
         let system_auth = build_auth_blob(1, &[(key_bytes, 1)], &[], &[]);
         let empty_auth = build_auth_blob(1, &[], &[], &[]);
-        let active_producers_auth = build_auth_blob(1, &[], &[(PULSE, ACTIVE, 1)], &[]);
+        let active_producers_auth = build_auth_blob(
+            1,
+            &[],
+            &[(names.system.as_u64(), ACTIVE, 1)],
+            &[],
+        );
 
         self.genesis_native_account(
-            PULSE,
+            names.system.as_u64(),
             &system_auth,
             &system_auth,
             true,
@@ -1615,7 +1695,7 @@ impl Database {
             ACTIVE,
         )?;
         self.genesis_native_account(
-            PULSE_NULL,
+            names.null.as_u64(),
             &empty_auth,
             &empty_auth,
             false,
@@ -1627,7 +1707,7 @@ impl Database {
         )?;
         // The producers account's active permission is the parent of prod.major.
         let prods_active_id = self.genesis_native_account(
-            PULSE_PRODS,
+            names.prods.as_u64(),
             &empty_auth,
             &active_producers_auth,
             false,
@@ -1641,14 +1721,14 @@ impl Database {
         // 5. prod.major (parent = producers active) then prod.minor (parent = prod.major), both
         //    carrying the active-producers authority.
         let major_id = self.genesis_permission(
-            PULSE_PRODS,
+            names.prods.as_u64(),
             PROD_MAJOR,
             prods_active_id,
             &active_producers_auth,
             ts_us,
         )?;
         self.genesis_permission(
-            PULSE_PRODS,
+            names.prods.as_u64(),
             PROD_MINOR,
             major_id,
             &active_producers_auth,
@@ -3289,7 +3369,7 @@ impl Database {
                 None => self.extract_core_symbol(),
             };
         let core_liquid_balance = core_symbol_packed.and_then(|sym| {
-            let token = name_u64("pulse.token").ok()?;
+            let token = self.system_accounts().token.as_u64();
             let accounts = name_u64("accounts").ok()?;
             let row = self.arena_kv_get(token, account, accounts, sym >> 8)?;
             if row.len() < 16 || u64::from_le_bytes(row[8..16].try_into().ok()?) != sym {
@@ -3300,7 +3380,7 @@ impl Database {
         });
 
         // System-contract sub-objects, decoded against the system contract's ABI.
-        let system = name_u64("pulse")?;
+        let system = self.system_accounts().system.as_u64();
         let system_abi = self
             .arena_account_abi_bytes(system)
             .and_then(|b| pulsevm_abi::Abi::from_bytes(&b).ok());
@@ -3347,8 +3427,7 @@ impl Database {
                 last_usage_update_time: BLOCK_TIMESTAMP_EPOCH_MICROS,
                 current_used: 0,
             },
-            eosio_any_linked_actions: name_u64("pulse.any")
-                .ok()
+            eosio_any_linked_actions: Some(self.system_accounts().any.as_u64())
                 .and_then(|any| links_by_permission.remove(&any))
                 .unwrap_or_default(),
         };
@@ -3359,7 +3438,7 @@ impl Database {
     /// The system contract's core symbol (precision in the low byte, code above),
     /// read from its `rammarket` `RAMCORE` row. `None` if the market is absent.
     fn extract_core_symbol(&self) -> Option<u64> {
-        let system = name_u64("pulse").ok()?;
+        let system = self.system_accounts().system.as_u64();
         let rammarket = name_u64("rammarket").ok()?;
         // The RAMCORE row's primary key is string_to_symbol(4, "RAMCORE").
         let pk = (symbol_code_from_str("RAMCORE") << 8) | 4;
@@ -3391,6 +3470,16 @@ mod tests {
         let mut db = Database::new(path, 1024 * 1024 * 1024).unwrap();
         let _name = Name::from_str("test").unwrap();
         db.add_indices().unwrap();
+    }
+
+    #[test]
+    fn system_account_names_follow_configured_root() {
+        let names = SystemAccountNames::new(Name::from_str("eosio").unwrap()).unwrap();
+        assert_eq!(names.system.to_string(), "eosio");
+        assert_eq!(names.code.to_string(), "eosio.code");
+        assert_eq!(names.any.to_string(), "eosio.any");
+        assert_eq!(names.prods.to_string(), "eosio.prods");
+        assert_eq!(names.token.to_string(), "eosio.token");
     }
 
     // 64 MiB is a multiple of chainbase's 1 MiB sizing requirement and leaves
@@ -3966,6 +4055,7 @@ impl Default for Database {
         Self {
             path: String::new(),
             backend: crate::backend::ChainDatabase::new().expect("arena init"),
+            system_accounts: Arc::new(RwLock::new(SystemAccountNames::default())),
         }
     }
 }

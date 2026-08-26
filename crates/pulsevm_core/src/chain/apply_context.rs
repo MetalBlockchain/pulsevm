@@ -33,7 +33,6 @@ use pulsevm_error::ChainError;
 use pulsevm_serialization::Write;
 
 use crate::{
-    CODE_NAME,
     chain::{
         authority::PermissionLevel,
         authorization_manager::AuthorizationManager,
@@ -135,6 +134,10 @@ impl ApplyContext {
         })
     }
 
+    pub fn system_accounts(&self) -> pulsevm_database::SystemAccountNames {
+        self.db.system_accounts()
+    }
+
     pub fn exec(&mut self, trx_context: &mut TransactionContext) -> Result<u64, ChainError> {
         let mut cpu_used = 0;
 
@@ -198,8 +201,12 @@ impl ApplyContext {
             inner.action.clone()
         };
 
-        let native =
-            Controller::find_apply_handler(&self.receiver, action.account(), action.name());
+        let native = Controller::find_apply_handler(
+            &self.receiver,
+            action.account(),
+            action.name(),
+            self.db.system_accounts().system,
+        );
         if let Some(native) = native {
             native(self, &mut self.db.clone(), &action)?;
             // Native handlers are outside deterministic Wasm metering, so give
@@ -388,7 +395,10 @@ impl ApplyContext {
             }
 
             let mut provided_permissions = BTreeSet::new();
-            provided_permissions.insert(PermissionLevel::new(*self.receiver, CODE_NAME.into()));
+            provided_permissions.insert(PermissionLevel::new(
+                *self.receiver,
+                self.db.system_accounts().code.into(),
+            ));
             let inner = self.inner.read()?;
 
             if !inner.privileged {
