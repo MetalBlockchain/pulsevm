@@ -101,7 +101,7 @@ impl AuthorizationManager {
 
                     if let Some(min_permission_name) = min_permission_name {
                         // since special cases were already handled, it should only be false if the
-                        // permission is pulse.any
+                        // permission is <system>.any
                         let min_permission = Self::get_permission(
                             &r,
                             declared_auth.actor,
@@ -320,34 +320,43 @@ impl AuthorizationManager {
         if link.code == system.system {
             match link.message_type {
                 UPDATEAUTH_NAME => {
-                    return Err(ChainError::AuthorizationError(
-                        format!("cannot link {}::updateauth to a minimum permission", system.system),
-                    ));
+                    return Err(ChainError::AuthorizationError(format!(
+                        "cannot link {}::updateauth to a minimum permission",
+                        system.system
+                    )));
                 }
                 DELETEAUTH_NAME => {
-                    return Err(ChainError::AuthorizationError(
-                        format!("cannot link {}::deleteauth to a minimum permission", system.system),
-                    ));
+                    return Err(ChainError::AuthorizationError(format!(
+                        "cannot link {}::deleteauth to a minimum permission",
+                        system.system
+                    )));
                 }
                 LINKAUTH_NAME => {
-                    return Err(ChainError::AuthorizationError(
-                        format!("cannot link {}::linkauth to a minimum permission", system.system),
-                    ));
+                    return Err(ChainError::AuthorizationError(format!(
+                        "cannot link {}::linkauth to a minimum permission",
+                        system.system
+                    )));
                 }
                 UNLINKAUTH_NAME => {
-                    return Err(ChainError::AuthorizationError(
-                        format!("cannot link {}::unlinkauth to a minimum permission", system.system),
-                    ));
+                    return Err(ChainError::AuthorizationError(format!(
+                        "cannot link {}::unlinkauth to a minimum permission",
+                        system.system
+                    )));
                 }
                 _ => {}
             }
         }
-        let linked_permission_name =
-            Self::lookup_minimum_permission(db, &link.account, &link.code, &link.message_type, system)?;
+        let linked_permission_name = Self::lookup_minimum_permission(
+            db,
+            &link.account,
+            &link.code,
+            &link.message_type,
+            system,
+        )?;
 
         match linked_permission_name {
             None => {
-                return Ok(()); // if action is linked to pulse.any permission
+                return Ok(()); // if action is linked to <system>.any permission
             }
             Some(linked_permission_name) => {
                 let min_permission = Self::get_permission(

@@ -201,12 +201,22 @@ impl ApplyContext {
             inner.action.clone()
         };
 
-        let native = Controller::find_apply_handler(
-            &self.receiver,
-            action.account(),
-            action.name(),
-            self.db.system_accounts().system,
-        );
+        // Native handlers are the bootstrap fallback for a system account that
+        // has no deployed contract yet. Once a system WASM contract exists (as
+        // it does in imported XPR state), dispatch the action to that contract
+        // instead of silently replacing it with PulseVM's compatibility shim.
+        let (code_hash, _vm_type, _vm_version) =
+            self.db.account_code_hash_vm(self.receiver.as_u64())?;
+        let native = if code_hash == [0u8; 32] {
+            Controller::find_apply_handler(
+                &self.receiver,
+                action.account(),
+                action.name(),
+                self.db.system_accounts().system,
+            )
+        } else {
+            None
+        };
         if let Some(native) = native {
             native(self, &mut self.db.clone(), &action)?;
             // Native handlers are outside deterministic Wasm metering, so give
@@ -214,10 +224,6 @@ impl ApplyContext {
             self.trx_context.checktime()?;
         }
 
-        // Does the receiver account have a contract deployed? Read the deployed
-        // code hash from the Rust database. An all-zero hash means no contract.
-        let (code_hash, _vm_type, _vm_version) =
-            self.db.account_code_hash_vm(self.receiver.as_u64())?;
         if code_hash != [0u8; 32] {
             // Separate context here because we need to release the lock on inner before executing
             // the Wasm code, which may call back into the context and cause deadlock if we hold the
