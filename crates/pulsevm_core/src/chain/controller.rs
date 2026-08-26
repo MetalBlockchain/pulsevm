@@ -13,7 +13,6 @@ use crate::{
     ACTIVE_NAME,
     MAJORITY_PRODUCERS_PERMISSION_NAME,
     MINORITY_PRODUCERS_PERMISSION_NAME,
-    PRODS_NAME,
     PULSE_NAME,
     block::{
         BlockStatus,
@@ -123,6 +122,22 @@ pub static APPLY_HANDLERS: LazyLock<ApplyHandlerMap> = LazyLock::new(|| {
     m.insert((PULSE_NAME, PULSE_NAME, LINKAUTH_NAME), linkauth);
     m.insert((PULSE_NAME, PULSE_NAME, UNLINKAUTH_NAME), unlinkauth);
     m
+});
+
+/// Native system actions are selected by action name once the receiver and
+/// scope have been validated by `find_apply_handler`. Keeping this separate
+/// from the legacy `(receiver, scope, action)` table avoids scanning a map on
+/// every custom-root system action.
+pub static NATIVE_SYSTEM_HANDLERS: LazyLock<HashMap<Name, ApplyHandlerFn>> = LazyLock::new(|| {
+    HashMap::from([
+        (NEWACCOUNT_NAME, newaccount as ApplyHandlerFn),
+        (SETCODE_NAME, setcode as ApplyHandlerFn),
+        (SETABI_NAME, setabi as ApplyHandlerFn),
+        (UPDATEAUTH_NAME, updateauth as ApplyHandlerFn),
+        (DELETEAUTH_NAME, deleteauth as ApplyHandlerFn),
+        (LINKAUTH_NAME, linkauth as ApplyHandlerFn),
+        (UNLINKAUTH_NAME, unlinkauth as ApplyHandlerFn),
+    ])
 });
 
 pub struct Controller {
@@ -425,6 +440,14 @@ impl Controller {
         // Initialize database
         self.db = Database::new(&db_path, self.node_config.as_ref().unwrap().db_size)
             .map_err(|e| ChainError::InternalError(format!("failed to open database: {}", e)))?;
+        let system_account = self.node_config.as_ref().unwrap().system_account;
+        let native_system_contract = self.node_config.as_ref().unwrap().native_system_contract;
+        self.db
+            .set_system_account(system_account)
+            .map_err(ChainError::GenesisError)?;
+        self.db
+            .set_native_system_contract(native_system_contract)
+            .map_err(ChainError::GenesisError)?;
         self.db.add_indices()?;
 
         // Pure-Rust view of the genesis: the arena is authored directly from this,
@@ -482,7 +505,7 @@ impl Controller {
             BlockTimestamp::from(TimePoint::new(Microseconds::new(
                 rust_genesis.initial_timestamp_micros,
             ))),
-            PULSE_NAME, // Use the provided producer name from genesis
+            self.node_config.as_ref().unwrap().producer_name,
             VecDeque::new(),
             Digest::default(),
             Digest::default(), // Placeholder action merkle root
@@ -492,13 +515,16 @@ impl Controller {
 
         let revision = self.db.revision();
         info!("database revision: {}", revision);
+        self.db.validate_system_account_state()?;
 
         if revision <= 0 {
             // Initialize the database with the genesis state
             info!("initializing database with genesis state");
-            self.db.initialize_database(&rust_genesis).map_err(|e| {
-                ChainError::GenesisError(format!("failed to initialize database: {}", e))
-            })?;
+            self.db
+                .initialize_database_with_system_account(&rust_genesis, system_account)
+                .map_err(|e| {
+                    ChainError::GenesisError(format!("failed to initialize database: {}", e))
+                })?;
             // initialize_database seeds the resource-limits config from the C++
             // struct defaults (default_max_block_cpu_usage), not from genesis, so
             // the very first block would run under those tiny defaults until the
@@ -1220,14 +1246,12 @@ impl Controller {
             ChainError::SerializationError(format!("failed to pack onblock header: {}", e))
         })?;
 
+        let system = self.db.system_accounts().system;
         let action = Action::new(
-            PULSE_NAME,
+            system,
             ONBLOCK_NAME,
             header_bytes,
-            vec![PermissionLevel::new(
-                PULSE_NAME.as_u64(),
-                ACTIVE_NAME.as_u64(),
-            )],
+            vec![PermissionLevel::new(system.as_u64(), ACTIVE_NAME.as_u64())],
         );
         let trx = Transaction::new(TransactionHeader::default(), vec![], vec![action]);
         let packed = PackedTransaction::from_signed_transaction(SignedTransaction::new(
@@ -1677,11 +1701,6 @@ impl Controller {
     ) -> Result<(), ChainError> {
         let block_id = block.id()?;
 
-        // Drop speculative and cached blocks: after a sync the tip is the
-        // snapshot block, not anything we were building on.
-        self.clear_pending()?;
-        self.verified_blocks.clear();
-
         // The database revision advances one per accepted block, so the
         // snapshot's revision must equal the summary block's height. Check it
         // from the header first: a mismatch means the summary paired a block with
@@ -1696,9 +1715,20 @@ impl Controller {
             )));
         }
 
+        // Validate the configured root against the staged snapshot before
+        // touching pending state or swapping the live arena. This keeps a
+        // snapshot from another network fully non-destructive.
+        self.db.validate_snapshot_system_account(envelope)?;
+
+        // Drop speculative and cached blocks: after a sync the tip is the
+        // snapshot block, not anything we were building on.
+        self.clear_pending()?;
+        self.verified_blocks.clear();
+
         // Restore the arena to the snapshot state; its revision becomes the
         // snapshot height.
         self.db.restore_from_bytes(envelope)?;
+        self.db.validate_system_account_state()?;
 
         // Re-base the logs. The block log starts again at the snapshot block so a
         // restart reconstructs the tip from here; the state-history logs have no
@@ -1783,11 +1813,16 @@ impl Controller {
         self.preferred_id = id;
     }
 
-    pub fn find_apply_handler(receiver: &Name, scope: &Name, act: &Name) -> Option<ApplyHandlerFn> {
-        if let Some(handler) = APPLY_HANDLERS.get(&(*receiver, *scope, *act)) {
-            return Some(*handler);
+    pub fn find_apply_handler(
+        receiver: &Name,
+        scope: &Name,
+        act: &Name,
+        system: Name,
+    ) -> Option<ApplyHandlerFn> {
+        if *receiver == system && *scope == system {
+            return NATIVE_SYSTEM_HANDLERS.get(act).copied();
         }
-        None
+        APPLY_HANDLERS.get(&(*receiver, *scope, *act)).copied()
     }
 
     pub fn get_wasm_runtime(&self) -> &WasmRuntime {
@@ -2034,21 +2069,22 @@ impl Controller {
             (num_producers * numerator) / denominator + 1
         };
 
+        let prods = self.db.system_accounts().prods;
         update_permission(
             &mut self.db,
-            PRODS_NAME,
+            prods,
             ACTIVE_NAME,
             calculate_threshold(2, 3), // more than 2/3 of producers must sign
         )?;
         update_permission(
             &mut self.db,
-            PRODS_NAME,
+            prods,
             MAJORITY_PRODUCERS_PERMISSION_NAME,
             calculate_threshold(1, 2), // more than 1/2 of producers must sign
         )?;
         update_permission(
             &mut self.db,
-            PRODS_NAME,
+            prods,
             MINORITY_PRODUCERS_PERMISSION_NAME,
             calculate_threshold(1, 3), // more than 1/3 of producers must sign
         )?;
@@ -2087,6 +2123,7 @@ mod tests {
 
     use crate::{
         ACTIVE_NAME,
+        PRODS_NAME,
         chain::{
             asset::{
                 Asset,
@@ -2223,6 +2260,39 @@ mod tests {
         .sign(&private_key, &chain_id)?;
         let packed_trx = PackedTransaction::from_signed_transaction(trx)?;
         Ok(packed_trx)
+    }
+
+    fn create_account_from_system(
+        private_key: &PrivateKey,
+        system: Name,
+        account: Name,
+        chain_id: Id,
+    ) -> Result<PackedTransaction, ChainError> {
+        let authority = Authority::new(
+            1,
+            vec![KeyWeight::new(private_key.get_public_key().into_k1(), 1)],
+            vec![],
+            vec![],
+        );
+        let trx = Transaction::new(
+            TransactionHeader::new(TimePointSec::maximum(), 0, 0, 0u32.into(), 0, 0u32.into()),
+            vec![],
+            vec![Action::new(
+                system,
+                NEWACCOUNT_NAME,
+                NewAccount {
+                    creator: system,
+                    name: account,
+                    owner: authority.clone(),
+                    active: authority,
+                }
+                .pack()
+                .unwrap(),
+                vec![PermissionLevel::new(system.as_u64(), ACTIVE_NAME.as_u64())],
+            )],
+        )
+        .sign(private_key, &chain_id)?;
+        Ok(PackedTransaction::from_signed_transaction(trx)?)
     }
 
     fn set_code(
@@ -3431,6 +3501,61 @@ mod tests {
             &block_status,
         )?;
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn custom_system_account_is_seeded_and_exposed_to_runtime() -> Result<(), ChainError> {
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
+        let private_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let mut controller = Controller::new();
+        let temp_path = get_temp_dir();
+        let config_bytes = json!({
+            "system_account": "eosio",
+            "producer_name": "eosio",
+            "producer_key": private_key.to_string(),
+        })
+        .to_string()
+        .into_bytes();
+
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &generate_genesis(&private_key),
+            temp_path.path().to_str().unwrap(),
+        )?;
+
+        let db = controller.database();
+        let names = db.system_accounts();
+        assert_eq!(names.system.to_string(), "eosio");
+        assert!(db.is_account(names.system.as_u64())?);
+        assert!(db.is_account(names.prods.as_u64())?);
+        assert!(!db.is_account(PULSE_NAME.as_u64())?);
+        assert!(
+            Controller::find_apply_handler(
+                &names.system,
+                &names.system,
+                &NEWACCOUNT_NAME,
+                names.system,
+            )
+            .is_some()
+        );
+
+        let timestamp = controller.last_accepted_block().timestamp().clone();
+        controller.execute_transaction(
+            &create_account_from_system(
+                &private_key,
+                names.system,
+                Name::from_str("alice")?,
+                chain_id,
+            )?,
+            &timestamp,
+            &BlockStatus::Building,
+        )?;
+        assert!(db.is_account(Name::from_str("alice")?.as_u64())?);
         Ok(())
     }
 

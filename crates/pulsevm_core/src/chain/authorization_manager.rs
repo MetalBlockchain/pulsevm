@@ -6,13 +6,13 @@ use pulsevm_database::{
     DbRead,
     Microseconds,
     PermissionInfo,
+    SystemAccountNames,
     TimePoint,
     seconds,
 };
 use pulsevm_error::ChainError;
 
 use crate::{
-    PULSE_NAME,
     chain::{
         name::Name,
         pulse_contract::{
@@ -36,7 +36,6 @@ use crate::{
 
 use super::{
     ACTIVE_NAME,
-    ANY_NAME,
     authority::PermissionLevel,
     authority_checker::AuthorityChecker,
 };
@@ -64,6 +63,7 @@ impl AuthorizationManager {
             provided_delay
         };
         let max_authority_depth = chain_config.max_authority_depth;
+        let system = db.system_accounts();
         let mut permissions_to_satisfy = BTreeSet::<PermissionLevel>::new();
         let mut authority_checker = AuthorityChecker::new(
             max_authority_depth,
@@ -75,7 +75,7 @@ impl AuthorizationManager {
         for act in actions.iter() {
             let mut special_case = false;
 
-            if act.account().as_u64() == PULSE_NAME {
+            if *act.account() == system.system {
                 special_case = true;
 
                 match *act.name() {
@@ -83,8 +83,8 @@ impl AuthorizationManager {
                         Self::check_updateauth_authorization(&r, act, act.authorization())?
                     }
                     DELETEAUTH_NAME => Self::check_deleteauth_authorization(&r, act)?,
-                    LINKAUTH_NAME => Self::check_linkauth_authorization(&r, act)?,
-                    UNLINKAUTH_NAME => Self::check_unlinkauth_authorization(&r, act)?,
+                    LINKAUTH_NAME => Self::check_linkauth_authorization(&r, act, system)?,
+                    UNLINKAUTH_NAME => Self::check_unlinkauth_authorization(&r, act, system)?,
                     _ => special_case = false,
                 }
             }
@@ -96,11 +96,12 @@ impl AuthorizationManager {
                         &declared_auth.actor.into(),
                         act.account(),
                         act.name(),
+                        system,
                     )?;
 
                     if let Some(min_permission_name) = min_permission_name {
                         // since special cases were already handled, it should only be false if the
-                        // permission is pulse.any
+                        // permission is <system>.any
                         let min_permission = Self::get_permission(
                             &r,
                             declared_auth.actor,
@@ -297,7 +298,11 @@ impl AuthorizationManager {
         Ok(())
     }
 
-    fn check_linkauth_authorization(db: &DbRead<'_>, action: &Action) -> Result<(), ChainError> {
+    fn check_linkauth_authorization(
+        db: &DbRead<'_>,
+        action: &Action,
+        system: SystemAccountNames,
+    ) -> Result<(), ChainError> {
         let link = action
             .data_as::<LinkAuth>()
             .map_err(|e| ChainError::AuthorizationError(format!("{}", e)))?;
@@ -312,37 +317,46 @@ impl AuthorizationManager {
             auth.actor == link.account,
             ChainError::AuthorizationError("the owner of the linked permission needs to be the actor of the declared authorization".to_string()),
         )?;
-        if link.code == PULSE_NAME {
+        if link.code == system.system {
             match link.message_type {
                 UPDATEAUTH_NAME => {
-                    return Err(ChainError::AuthorizationError(
-                        "cannot link pulse::updateauth to a minimum permission".to_string(),
-                    ));
+                    return Err(ChainError::AuthorizationError(format!(
+                        "cannot link {}::updateauth to a minimum permission",
+                        system.system
+                    )));
                 }
                 DELETEAUTH_NAME => {
-                    return Err(ChainError::AuthorizationError(
-                        "cannot link pulse::deleteauth to a minimum permission".to_string(),
-                    ));
+                    return Err(ChainError::AuthorizationError(format!(
+                        "cannot link {}::deleteauth to a minimum permission",
+                        system.system
+                    )));
                 }
                 LINKAUTH_NAME => {
-                    return Err(ChainError::AuthorizationError(
-                        "cannot link pulse::linkauth to a minimum permission".to_string(),
-                    ));
+                    return Err(ChainError::AuthorizationError(format!(
+                        "cannot link {}::linkauth to a minimum permission",
+                        system.system
+                    )));
                 }
                 UNLINKAUTH_NAME => {
-                    return Err(ChainError::AuthorizationError(
-                        "cannot link pulse::unlinkauth to a minimum permission".to_string(),
-                    ));
+                    return Err(ChainError::AuthorizationError(format!(
+                        "cannot link {}::unlinkauth to a minimum permission",
+                        system.system
+                    )));
                 }
                 _ => {}
             }
         }
-        let linked_permission_name =
-            Self::lookup_minimum_permission(db, &link.account, &link.code, &link.message_type)?;
+        let linked_permission_name = Self::lookup_minimum_permission(
+            db,
+            &link.account,
+            &link.code,
+            &link.message_type,
+            system,
+        )?;
 
         match linked_permission_name {
             None => {
-                return Ok(()); // if action is linked to pulse.any permission
+                return Ok(()); // if action is linked to <system>.any permission
             }
             Some(linked_permission_name) => {
                 let min_permission = Self::get_permission(
@@ -368,7 +382,11 @@ impl AuthorizationManager {
         Ok(())
     }
 
-    fn check_unlinkauth_authorization(db: &DbRead<'_>, action: &Action) -> Result<(), ChainError> {
+    fn check_unlinkauth_authorization(
+        db: &DbRead<'_>,
+        action: &Action,
+        system: SystemAccountNames,
+    ) -> Result<(), ChainError> {
         let unlink = action
             .data_as::<UnlinkAuth>()
             .map_err(|e| ChainError::AuthorizationError(format!("{}", e)))?;
@@ -388,6 +406,7 @@ impl AuthorizationManager {
             &unlink.account,
             &unlink.code,
             &unlink.message_type,
+            system,
         )?;
         match unlinked_permission_name {
             None => {
@@ -396,7 +415,7 @@ impl AuthorizationManager {
                     unlink.account, unlink.code, unlink.message_type
                 )));
             }
-            Some(name) if name == ANY_NAME => {
+            Some(name) if name == system.any => {
                 return Ok(());
             }
             Some(unlinked_permission_name) => {
@@ -456,10 +475,11 @@ impl AuthorizationManager {
         authorizer_account: &Name,
         scope: &Name,
         act_name: &Name,
+        system: SystemAccountNames,
     ) -> Result<Option<Name>, ChainError> {
         // Special case native actions cannot be linked to a minimum permission, so there is no need
         // to check.
-        if scope.as_u64() == PULSE_NAME {
+        if *scope == system.system {
             pulse_assert(
                 act_name.as_u64() != UPDATEAUTH_NAME
                     && act_name.as_u64() != DELETEAUTH_NAME
@@ -475,7 +495,7 @@ impl AuthorizationManager {
             Self::lookup_linked_permission(db, authorizer_account, scope, act_name)?;
 
         if let Some(linked_permission) = linked_permission {
-            if linked_permission == ANY_NAME {
+            if linked_permission == system.any {
                 return Ok(None);
             }
 

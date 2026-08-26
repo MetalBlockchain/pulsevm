@@ -33,7 +33,6 @@ use pulsevm_error::ChainError;
 use pulsevm_serialization::Write;
 
 use crate::{
-    CODE_NAME,
     chain::{
         authority::PermissionLevel,
         authorization_manager::AuthorizationManager,
@@ -135,6 +134,10 @@ impl ApplyContext {
         })
     }
 
+    pub fn system_accounts(&self) -> pulsevm_database::SystemAccountNames {
+        self.db.system_accounts()
+    }
+
     pub fn exec(&mut self, trx_context: &mut TransactionContext) -> Result<u64, ChainError> {
         let mut cpu_used = 0;
 
@@ -198,8 +201,21 @@ impl ApplyContext {
             inner.action.clone()
         };
 
-        let native =
-            Controller::find_apply_handler(&self.receiver, action.account(), action.name());
+        // Native handlers are enabled for the built-in PulseVM system contract.
+        // Imported XPR state should disable them so its deployed eosio.system
+        // WASM remains authoritative.
+        let (code_hash, _vm_type, _vm_version) =
+            self.db.account_code_hash_vm(self.receiver.as_u64())?;
+        let native = if self.db.native_system_contract() {
+            Controller::find_apply_handler(
+                &self.receiver,
+                action.account(),
+                action.name(),
+                self.db.system_accounts().system,
+            )
+        } else {
+            None
+        };
         if let Some(native) = native {
             native(self, &mut self.db.clone(), &action)?;
             // Native handlers are outside deterministic Wasm metering, so give
@@ -207,10 +223,6 @@ impl ApplyContext {
             self.trx_context.checktime()?;
         }
 
-        // Does the receiver account have a contract deployed? Read the deployed
-        // code hash from the Rust database. An all-zero hash means no contract.
-        let (code_hash, _vm_type, _vm_version) =
-            self.db.account_code_hash_vm(self.receiver.as_u64())?;
         if code_hash != [0u8; 32] {
             // Separate context here because we need to release the lock on inner before executing
             // the Wasm code, which may call back into the context and cause deadlock if we hold the
@@ -388,7 +400,10 @@ impl ApplyContext {
             }
 
             let mut provided_permissions = BTreeSet::new();
-            provided_permissions.insert(PermissionLevel::new(*self.receiver, CODE_NAME.into()));
+            provided_permissions.insert(PermissionLevel::new(
+                *self.receiver,
+                self.db.system_accounts().code.into(),
+            ));
             let inner = self.inner.read()?;
 
             if !inner.privileged {

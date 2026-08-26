@@ -37,7 +37,7 @@ pub async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Commands::Create { subcmd } => {
-            create::handle(&pulsevm_api_client, &keosd_client, subcmd).await?
+            create::handle(&pulsevm_api_client, &config, &keosd_client, subcmd).await?
         }
         Commands::Wallet { subcmd } => wallet::handle(&keosd_client, subcmd).await?,
         Commands::Get { subcmd } => get::handle(&pulsevm_api_client, &keosd_client, subcmd).await?,
@@ -52,6 +52,7 @@ pub async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             contract,
             permission,
         } => {
+            let contract = contract.unwrap_or_else(|| config.token_contract.clone());
             transfer::handle(
                 &pulsevm_api_client,
                 &mut config,

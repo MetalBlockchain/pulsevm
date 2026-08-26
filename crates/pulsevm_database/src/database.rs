@@ -9,6 +9,11 @@ use std::{
         Write,
     },
     path::Path,
+    str::FromStr,
+    sync::{
+        Arc,
+        OnceLock,
+    },
 };
 
 use pulsevm_error::ChainError;
@@ -142,6 +147,50 @@ fn name_u64(s: &str) -> Result<u64, ChainError> {
     pulsevm_name::Name::from_str(s)
         .map(|n| n.as_u64())
         .map_err(|e| ChainError::InternalError(format!("bad name {s:?}: {e:?}")))
+}
+
+/// The system-account names derived from the configured root account.  Keeping
+/// these together prevents the execution and RPC paths from accidentally
+/// mixing `pulse.*` and `eosio.*` identities when importing an Antelope state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SystemAccountNames {
+    pub system: Name,
+    pub null: Name,
+    pub prods: Name,
+    pub any: Name,
+    pub code: Name,
+    pub token: Name,
+    pub ram: Name,
+    pub ramfee: Name,
+    pub rex: Name,
+    pub stake: Name,
+}
+
+impl SystemAccountNames {
+    pub fn new(system: Name) -> Result<Self, String> {
+        let suffix = |s: &str| {
+            Name::from_str(&format!("{system}.{s}"))
+                .map_err(|e| format!("invalid system account '{system}': {e}"))
+        };
+        Ok(Self {
+            system,
+            null: suffix("null")?,
+            prods: suffix("prods")?,
+            any: suffix("any")?,
+            code: suffix("code")?,
+            token: suffix("token")?,
+            ram: suffix("ram")?,
+            ramfee: suffix("ramfee")?,
+            rex: suffix("rex")?,
+            stake: suffix("stake")?,
+        })
+    }
+}
+
+impl Default for SystemAccountNames {
+    fn default() -> Self {
+        Self::new(Name::from_str("pulse").expect("pulse is a valid name")).unwrap()
+    }
 }
 
 /// The raw `symbol_code` form of a ticker: its ASCII bytes packed low byte first
@@ -464,6 +513,12 @@ pub struct Database {
     /// The pure-Rust arena (pulsevm_chaindb). The sole state backend, shared
     /// across clones so every apply/transaction context reaches the same handle.
     backend: crate::backend::ChainDatabase,
+    /// Immutable for the lifetime of a database handle. `OnceLock` lets the
+    /// controller select the identity once during bootstrap while keeping all
+    /// cloned apply contexts lock-free on the execution hot path.
+    system_accounts: Arc<OnceLock<SystemAccountNames>>,
+    native_system_contract: bool,
+    native_system_contract_locked: bool,
 }
 
 /// The staged arena checkpoint file used to move a snapshot through the transport
@@ -475,6 +530,35 @@ const SHARED_MEMORY_FILE: &str = "arena_snapshot.bin";
 /// survives a restart (including a state-synced node, whose block log does not
 /// start at genesis).
 const ARENA_STATE_FILE: &str = "arena_state.bin";
+const ARENA_METADATA_FILE: &str = "arena_metadata.json";
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct DatabaseMetadata {
+    system_account: String,
+    #[serde(default = "default_native_system_contract")]
+    native_system_contract: bool,
+}
+
+fn default_native_system_contract() -> bool {
+    true
+}
+
+fn load_database_metadata(path: &str) -> Result<Option<DatabaseMetadata>, String> {
+    if path.is_empty() {
+        return Ok(None);
+    }
+    let metadata_path = Path::new(path).join(ARENA_METADATA_FILE);
+    if !metadata_path.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(&metadata_path)
+        .map_err(|e| format!("read database metadata {}: {e}", metadata_path.display()))?;
+    let metadata: DatabaseMetadata = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("parse database metadata {}: {e}", metadata_path.display()))?;
+    Name::from_str(&metadata.system_account)
+        .map_err(|e| format!("invalid persisted system account: {e}"))?;
+    Ok(Some(metadata))
+}
 
 /// Read until `buf` is full or EOF, so each snapshot chunk is a fixed,
 /// block-aligned size regardless of how the OS splits the underlying reads —
@@ -497,6 +581,15 @@ impl Database {
     pub fn new(path: &str, _size: u64) -> Result<Self, String> {
         let backend =
             crate::backend::ChainDatabase::new().map_err(|e| format!("arena init: {e:?}"))?;
+        let system_accounts = Arc::new(OnceLock::new());
+        let metadata = load_database_metadata(path)?;
+        if let Some(metadata) = &metadata {
+            let system = Name::from_str(&metadata.system_account)
+                .map_err(|e| format!("invalid persisted system account: {e}"))?;
+            system_accounts
+                .set(SystemAccountNames::new(system)?)
+                .map_err(|_| "system-account configuration initialized twice".to_string())?;
+        }
         // Reload persisted state if this directory already holds a checkpoint (a
         // restart, or a state-synced node). A fresh directory starts empty and the
         // controller authors genesis.
@@ -509,7 +602,126 @@ impl Database {
         Ok(Database {
             path: path.to_string(),
             backend,
+            system_accounts,
+            native_system_contract: metadata
+                .as_ref()
+                .is_none_or(|metadata| metadata.native_system_contract),
+            native_system_contract_locked: metadata.is_some(),
         })
+    }
+
+    /// Set the system-account identity used by runtime helpers. This is node
+    /// configuration, not mutable chain state, and may only be set once for a
+    /// database. The identity is persisted beside the arena so reopening a
+    /// database with a different root is rejected.
+    pub fn set_system_account(&self, system: Name) -> Result<(), String> {
+        let names = SystemAccountNames::new(system)?;
+        if let Some(existing) = self.system_accounts.get() {
+            if *existing != names {
+                return Err(format!(
+                    "system account mismatch: database uses {}, requested {}",
+                    existing.system, names.system
+                ));
+            }
+        } else {
+            self.system_accounts
+                .set(names)
+                .map_err(|_| "system-account configuration initialized twice".to_string())?;
+        }
+        self.persist_database_metadata(names.system, self.native_system_contract)?;
+        Ok(())
+    }
+
+    pub fn system_accounts(&self) -> SystemAccountNames {
+        *self
+            .system_accounts
+            .get_or_init(SystemAccountNames::default)
+    }
+
+    pub fn set_native_system_contract(&mut self, enabled: bool) -> Result<(), String> {
+        if self.native_system_contract_locked && self.native_system_contract != enabled {
+            return Err(format!(
+                "native system contract mode mismatch: database uses {}, requested {}",
+                self.native_system_contract, enabled
+            ));
+        }
+        self.persist_database_metadata(self.system_accounts().system, enabled)?;
+        self.native_system_contract = enabled;
+        self.native_system_contract_locked = true;
+        Ok(())
+    }
+
+    pub fn native_system_contract(&self) -> bool {
+        self.native_system_contract
+    }
+
+    /// Verify that a restored, non-genesis state contains the configured root
+    /// account. This catches a common operator error where an XPR snapshot is
+    /// opened with the default `pulse` identity.
+    pub fn validate_system_account_state(&self) -> Result<(), ChainError> {
+        if self.revision() > 0 && !self.is_account(self.system_accounts().system.as_u64())? {
+            return Err(ChainError::InternalError(format!(
+                "restored state does not contain configured system account {}",
+                self.system_accounts().system
+            )));
+        }
+        Ok(())
+    }
+
+    /// Validate a snapshot against this database's configured system account
+    /// without replacing the live arena. State-sync callers use this before
+    /// dropping pending work, so a mismatched snapshot remains completely
+    /// non-destructive.
+    pub fn validate_snapshot_system_account(&self, snapshot: &[u8]) -> Result<(), ChainError> {
+        let (header, payload) = crate::snapshot::decode(snapshot)?;
+        if header.revision <= 0 {
+            return Ok(());
+        }
+        if self.path.is_empty() {
+            return Err(ChainError::InternalError(
+                "snapshot validation requires a persistent database path".into(),
+            ));
+        }
+        let dir = Path::new(&self.path);
+        fs::create_dir_all(dir).map_err(|e| {
+            ChainError::InternalError(format!("snapshot validation: create {}: {e}", self.path))
+        })?;
+        let staged = Self::stage_snapshot(dir, header, payload)?;
+        let candidate = crate::backend::ChainDatabase::new()
+            .map_err(|e| ChainError::InternalError(format!("snapshot validation: init: {e:?}")))?;
+        candidate
+            .load(staged.path())
+            .map_err(|e| ChainError::InternalError(format!("snapshot validation: load: {e:?}")))?;
+        let system = self.system_accounts().system.as_u64();
+        if !candidate.account_exists(system) {
+            return Err(ChainError::InternalError(format!(
+                "snapshot does not contain configured system account {}",
+                self.system_accounts().system
+            )));
+        }
+        Ok(())
+    }
+
+    fn persist_database_metadata(
+        &self,
+        system: Name,
+        native_system_contract: bool,
+    ) -> Result<(), String> {
+        if self.path.is_empty() {
+            return Ok(());
+        }
+        let dir = Path::new(&self.path);
+        fs::create_dir_all(dir).map_err(|e| format!("create database metadata directory: {e}"))?;
+        let metadata = serde_json::to_vec_pretty(&DatabaseMetadata {
+            system_account: system.to_string(),
+            native_system_contract,
+        })
+        .map_err(|e| format!("serialize database metadata: {e}"))?;
+        let tmp = dir.join(format!("{ARENA_METADATA_FILE}.tmp"));
+        fs::write(&tmp, metadata).map_err(|e| format!("write database metadata: {e}"))?;
+        fs::rename(&tmp, dir.join(ARENA_METADATA_FILE))
+            .map_err(|e| format!("install database metadata: {e}"))?;
+        Ok(())
     }
 
     /// The arena database's account_metadata privileged flag for `name`, or
@@ -1365,6 +1577,8 @@ impl Database {
         let dir = Path::new(&self.path);
         fs::create_dir_all(dir)
             .map_err(|e| ChainError::InternalError(format!("close: create {}: {e}", self.path)))?;
+        self.persist_database_metadata(self.system_accounts().system, self.native_system_contract)
+            .map_err(ChainError::InternalError)?;
         self.backend
             .checkpoint(&dir.join(ARENA_STATE_FILE))
             .map_err(|e| ChainError::InternalError(format!("close: checkpoint: {e:?}")))
@@ -1535,7 +1749,20 @@ impl Database {
     ) -> Result<(), ChainError> {
         // Genesis is authored directly on the arena, reproducing C++
         // `initialize_database` without a chainbase bootstrap.
-        self.initialize_genesis_arena(genesis)
+        let names = self.system_accounts();
+        self.persist_database_metadata(names.system, self.native_system_contract)
+            .map_err(ChainError::GenesisError)?;
+        self.initialize_genesis_arena(genesis, names)
+    }
+
+    pub fn initialize_database_with_system_account(
+        &mut self,
+        genesis: &pulsevm_chain_types::GenesisState,
+        system: Name,
+    ) -> Result<(), ChainError> {
+        self.set_system_account(system)
+            .map_err(ChainError::GenesisError)?;
+        self.initialize_genesis_arena(genesis, self.system_accounts())
     }
 
     /// Author the entire genesis state directly on the arena, reproducing C++
@@ -1545,6 +1772,7 @@ impl Database {
     fn initialize_genesis_arena(
         &self,
         genesis: &pulsevm_chain_types::GenesisState,
+        names: SystemAccountNames,
     ) -> Result<(), ChainError> {
         use crate::backend::ElasticParams;
 
@@ -1558,9 +1786,6 @@ impl Database {
         let creation_slot: u32 = (((ts_us / 1000) - 946_684_800_000i64) / 500i64).max(0) as u32;
 
         // Genesis account / permission names (config.hpp), as name-encoded u64.
-        const PULSE: u64 = 12_584_048_018_849_792_000;
-        const PULSE_NULL: u64 = 12_584_048_029_495_738_368;
-        const PULSE_PRODS: u64 = 12_584_048_030_520_602_624;
         const OWNER: u64 = 12_044_502_819_693_133_824;
         const ACTIVE: u64 = 3_617_214_756_542_218_240;
         const PROD_MAJOR: u64 = 12_531_424_605_554_196_480;
@@ -1597,14 +1822,15 @@ impl Database {
             .map_err(|e| ChainError::InternalError(format!("genesis resource_state: {e:?}")))?;
 
         // 4. native accounts. system_auth carries the genesis key; the producers' active authority
-        //    delegates to pulse/active.
+        //    delegates to the configured system account's active permission.
         let key_bytes = genesis.initial_key_packed().to_vec();
         let system_auth = build_auth_blob(1, &[(key_bytes, 1)], &[], &[]);
         let empty_auth = build_auth_blob(1, &[], &[], &[]);
-        let active_producers_auth = build_auth_blob(1, &[], &[(PULSE, ACTIVE, 1)], &[]);
+        let active_producers_auth =
+            build_auth_blob(1, &[], &[(names.system.as_u64(), ACTIVE, 1)], &[]);
 
         self.genesis_native_account(
-            PULSE,
+            names.system.as_u64(),
             &system_auth,
             &system_auth,
             true,
@@ -1615,7 +1841,7 @@ impl Database {
             ACTIVE,
         )?;
         self.genesis_native_account(
-            PULSE_NULL,
+            names.null.as_u64(),
             &empty_auth,
             &empty_auth,
             false,
@@ -1627,7 +1853,7 @@ impl Database {
         )?;
         // The producers account's active permission is the parent of prod.major.
         let prods_active_id = self.genesis_native_account(
-            PULSE_PRODS,
+            names.prods.as_u64(),
             &empty_auth,
             &active_producers_auth,
             false,
@@ -1641,14 +1867,14 @@ impl Database {
         // 5. prod.major (parent = producers active) then prod.minor (parent = prod.major), both
         //    carrying the active-producers authority.
         let major_id = self.genesis_permission(
-            PULSE_PRODS,
+            names.prods.as_u64(),
             PROD_MAJOR,
             prods_active_id,
             &active_producers_auth,
             ts_us,
         )?;
         self.genesis_permission(
-            PULSE_PRODS,
+            names.prods.as_u64(),
             PROD_MINOR,
             major_id,
             &active_producers_auth,
@@ -3289,7 +3515,7 @@ impl Database {
                 None => self.extract_core_symbol(),
             };
         let core_liquid_balance = core_symbol_packed.and_then(|sym| {
-            let token = name_u64("pulse.token").ok()?;
+            let token = self.system_accounts().token.as_u64();
             let accounts = name_u64("accounts").ok()?;
             let row = self.arena_kv_get(token, account, accounts, sym >> 8)?;
             if row.len() < 16 || u64::from_le_bytes(row[8..16].try_into().ok()?) != sym {
@@ -3300,7 +3526,7 @@ impl Database {
         });
 
         // System-contract sub-objects, decoded against the system contract's ABI.
-        let system = name_u64("pulse")?;
+        let system = self.system_accounts().system.as_u64();
         let system_abi = self
             .arena_account_abi_bytes(system)
             .and_then(|b| pulsevm_abi::Abi::from_bytes(&b).ok());
@@ -3347,8 +3573,7 @@ impl Database {
                 last_usage_update_time: BLOCK_TIMESTAMP_EPOCH_MICROS,
                 current_used: 0,
             },
-            eosio_any_linked_actions: name_u64("pulse.any")
-                .ok()
+            eosio_any_linked_actions: Some(self.system_accounts().any.as_u64())
                 .and_then(|any| links_by_permission.remove(&any))
                 .unwrap_or_default(),
         };
@@ -3359,7 +3584,7 @@ impl Database {
     /// The system contract's core symbol (precision in the low byte, code above),
     /// read from its `rammarket` `RAMCORE` row. `None` if the market is absent.
     fn extract_core_symbol(&self) -> Option<u64> {
-        let system = name_u64("pulse").ok()?;
+        let system = self.system_accounts().system.as_u64();
         let rammarket = name_u64("rammarket").ok()?;
         // The RAMCORE row's primary key is string_to_symbol(4, "RAMCORE").
         let pk = (symbol_code_from_str("RAMCORE") << 8) | 4;
@@ -3391,6 +3616,38 @@ mod tests {
         let mut db = Database::new(path, 1024 * 1024 * 1024).unwrap();
         let _name = Name::from_str("test").unwrap();
         db.add_indices().unwrap();
+    }
+
+    #[test]
+    fn system_account_names_follow_configured_root() {
+        let names = SystemAccountNames::new(Name::from_str("eosio").unwrap()).unwrap();
+        assert_eq!(names.system.to_string(), "eosio");
+        assert_eq!(names.code.to_string(), "eosio.code");
+        assert_eq!(names.any.to_string(), "eosio.any");
+        assert_eq!(names.prods.to_string(), "eosio.prods");
+        assert_eq!(names.token.to_string(), "eosio.token");
+    }
+
+    #[test]
+    fn system_account_configuration_survives_reopen_and_rejects_mismatch() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().to_str().unwrap();
+        let mut db = Database::new(path, TEST_DB_SIZE).unwrap();
+        db.set_system_account(Name::from_str("eosio").unwrap())
+            .unwrap();
+        db.set_native_system_contract(false).unwrap();
+        db.close().unwrap();
+
+        let reopened = Database::new(path, TEST_DB_SIZE).unwrap();
+        assert_eq!(reopened.system_accounts().system.to_string(), "eosio");
+        assert!(!reopened.native_system_contract());
+        let mut reopened_mode = reopened.clone();
+        assert!(reopened_mode.set_native_system_contract(true).is_err());
+        assert!(
+            reopened
+                .set_system_account(Name::from_str("pulse").unwrap())
+                .is_err()
+        );
     }
 
     // 64 MiB is a multiple of chainbase's 1 MiB sizing requirement and leaves
@@ -3966,6 +4223,9 @@ impl Default for Database {
         Self {
             path: String::new(),
             backend: crate::backend::ChainDatabase::new().expect("arena init"),
+            system_accounts: Arc::new(OnceLock::from(SystemAccountNames::default())),
+            native_system_contract: true,
+            native_system_contract_locked: false,
         }
     }
 }
