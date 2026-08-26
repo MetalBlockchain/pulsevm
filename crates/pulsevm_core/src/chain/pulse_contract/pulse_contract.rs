@@ -67,12 +67,10 @@ pub fn newaccount(
     if !db.is_account_privileged(create.creator.as_u64())? {
         pulse_assert(
             !name_str.starts_with(&format!("{}.", context.system_accounts().system)),
-            ChainError::TransactionError(
-                format!(
-                    "only privileged accounts can have names that start with '{}.'",
-                    context.system_accounts().system
-                ),
-            ),
+            ChainError::TransactionError(format!(
+                "only privileged accounts can have names that start with '{}.'",
+                context.system_accounts().system
+            )),
         )?;
     }
 

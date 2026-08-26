@@ -201,13 +201,12 @@ impl ApplyContext {
             inner.action.clone()
         };
 
-        // Native handlers are the bootstrap fallback for a system account that
-        // has no deployed contract yet. Once a system WASM contract exists (as
-        // it does in imported XPR state), dispatch the action to that contract
-        // instead of silently replacing it with PulseVM's compatibility shim.
+        // Native handlers are enabled for the built-in PulseVM system contract.
+        // Imported XPR state should disable them so its deployed eosio.system
+        // WASM remains authoritative.
         let (code_hash, _vm_type, _vm_version) =
             self.db.account_code_hash_vm(self.receiver.as_u64())?;
-        let native = if code_hash == [0u8; 32] {
+        let native = if self.db.native_system_contract() {
             Controller::find_apply_handler(
                 &self.receiver,
                 action.account(),

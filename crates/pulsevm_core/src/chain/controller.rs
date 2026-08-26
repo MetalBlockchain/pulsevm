@@ -441,8 +441,12 @@ impl Controller {
         self.db = Database::new(&db_path, self.node_config.as_ref().unwrap().db_size)
             .map_err(|e| ChainError::InternalError(format!("failed to open database: {}", e)))?;
         let system_account = self.node_config.as_ref().unwrap().system_account;
+        let native_system_contract = self.node_config.as_ref().unwrap().native_system_contract;
         self.db
             .set_system_account(system_account)
+            .map_err(ChainError::GenesisError)?;
+        self.db
+            .set_native_system_contract(native_system_contract)
             .map_err(ChainError::GenesisError)?;
         self.db.add_indices()?;
 

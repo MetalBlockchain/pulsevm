@@ -517,6 +517,8 @@ pub struct Database {
     /// controller select the identity once during bootstrap while keeping all
     /// cloned apply contexts lock-free on the execution hot path.
     system_accounts: Arc<OnceLock<SystemAccountNames>>,
+    native_system_contract: bool,
+    native_system_contract_locked: bool,
 }
 
 /// The staged arena checkpoint file used to move a snapshot through the transport
@@ -533,9 +535,15 @@ const ARENA_METADATA_FILE: &str = "arena_metadata.json";
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct DatabaseMetadata {
     system_account: String,
+    #[serde(default = "default_native_system_contract")]
+    native_system_contract: bool,
 }
 
-fn load_system_account_metadata(path: &str) -> Result<Option<Name>, String> {
+fn default_native_system_contract() -> bool {
+    true
+}
+
+fn load_database_metadata(path: &str) -> Result<Option<DatabaseMetadata>, String> {
     if path.is_empty() {
         return Ok(None);
     }
@@ -548,8 +556,8 @@ fn load_system_account_metadata(path: &str) -> Result<Option<Name>, String> {
     let metadata: DatabaseMetadata = serde_json::from_slice(&bytes)
         .map_err(|e| format!("parse database metadata {}: {e}", metadata_path.display()))?;
     Name::from_str(&metadata.system_account)
-        .map(Some)
-        .map_err(|e| format!("invalid persisted system account: {e}"))
+        .map_err(|e| format!("invalid persisted system account: {e}"))?;
+    Ok(Some(metadata))
 }
 
 /// Read until `buf` is full or EOF, so each snapshot chunk is a fixed,
@@ -574,7 +582,10 @@ impl Database {
         let backend =
             crate::backend::ChainDatabase::new().map_err(|e| format!("arena init: {e:?}"))?;
         let system_accounts = Arc::new(OnceLock::new());
-        if let Some(system) = load_system_account_metadata(path)? {
+        let metadata = load_database_metadata(path)?;
+        if let Some(metadata) = &metadata {
+            let system = Name::from_str(&metadata.system_account)
+                .map_err(|e| format!("invalid persisted system account: {e}"))?;
             system_accounts
                 .set(SystemAccountNames::new(system)?)
                 .map_err(|_| "system-account configuration initialized twice".to_string())?;
@@ -592,6 +603,10 @@ impl Database {
             path: path.to_string(),
             backend,
             system_accounts,
+            native_system_contract: metadata
+                .as_ref()
+                .is_none_or(|metadata| metadata.native_system_contract),
+            native_system_contract_locked: metadata.is_some(),
         })
     }
 
@@ -613,7 +628,7 @@ impl Database {
                 .set(names)
                 .map_err(|_| "system-account configuration initialized twice".to_string())?;
         }
-        self.persist_system_account_metadata(names.system)?;
+        self.persist_database_metadata(names.system, self.native_system_contract)?;
         Ok(())
     }
 
@@ -621,6 +636,23 @@ impl Database {
         *self
             .system_accounts
             .get_or_init(SystemAccountNames::default)
+    }
+
+    pub fn set_native_system_contract(&mut self, enabled: bool) -> Result<(), String> {
+        if self.native_system_contract_locked && self.native_system_contract != enabled {
+            return Err(format!(
+                "native system contract mode mismatch: database uses {}, requested {}",
+                self.native_system_contract, enabled
+            ));
+        }
+        self.persist_database_metadata(self.system_accounts().system, enabled)?;
+        self.native_system_contract = enabled;
+        self.native_system_contract_locked = true;
+        Ok(())
+    }
+
+    pub fn native_system_contract(&self) -> bool {
+        self.native_system_contract
     }
 
     /// Verify that a restored, non-genesis state contains the configured root
@@ -670,7 +702,11 @@ impl Database {
         Ok(())
     }
 
-    fn persist_system_account_metadata(&self, system: Name) -> Result<(), String> {
+    fn persist_database_metadata(
+        &self,
+        system: Name,
+        native_system_contract: bool,
+    ) -> Result<(), String> {
         if self.path.is_empty() {
             return Ok(());
         }
@@ -678,6 +714,7 @@ impl Database {
         fs::create_dir_all(dir).map_err(|e| format!("create database metadata directory: {e}"))?;
         let metadata = serde_json::to_vec_pretty(&DatabaseMetadata {
             system_account: system.to_string(),
+            native_system_contract,
         })
         .map_err(|e| format!("serialize database metadata: {e}"))?;
         let tmp = dir.join(format!("{ARENA_METADATA_FILE}.tmp"));
@@ -1540,7 +1577,7 @@ impl Database {
         let dir = Path::new(&self.path);
         fs::create_dir_all(dir)
             .map_err(|e| ChainError::InternalError(format!("close: create {}: {e}", self.path)))?;
-        self.persist_system_account_metadata(self.system_accounts().system)
+        self.persist_database_metadata(self.system_accounts().system, self.native_system_contract)
             .map_err(ChainError::InternalError)?;
         self.backend
             .checkpoint(&dir.join(ARENA_STATE_FILE))
@@ -1713,7 +1750,7 @@ impl Database {
         // Genesis is authored directly on the arena, reproducing C++
         // `initialize_database` without a chainbase bootstrap.
         let names = self.system_accounts();
-        self.persist_system_account_metadata(names.system)
+        self.persist_database_metadata(names.system, self.native_system_contract)
             .map_err(ChainError::GenesisError)?;
         self.initialize_genesis_arena(genesis, names)
     }
@@ -3595,13 +3632,17 @@ mod tests {
     fn system_account_configuration_survives_reopen_and_rejects_mismatch() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().to_str().unwrap();
-        let db = Database::new(path, TEST_DB_SIZE).unwrap();
+        let mut db = Database::new(path, TEST_DB_SIZE).unwrap();
         db.set_system_account(Name::from_str("eosio").unwrap())
             .unwrap();
+        db.set_native_system_contract(false).unwrap();
         db.close().unwrap();
 
         let reopened = Database::new(path, TEST_DB_SIZE).unwrap();
         assert_eq!(reopened.system_accounts().system.to_string(), "eosio");
+        assert!(!reopened.native_system_contract());
+        let mut reopened_mode = reopened.clone();
+        assert!(reopened_mode.set_native_system_contract(true).is_err());
         assert!(
             reopened
                 .set_system_account(Name::from_str("pulse").unwrap())
@@ -4183,6 +4224,8 @@ impl Default for Database {
             path: String::new(),
             backend: crate::backend::ChainDatabase::new().expect("arena init"),
             system_accounts: Arc::new(OnceLock::from(SystemAccountNames::default())),
+            native_system_contract: true,
+            native_system_contract_locked: false,
         }
     }
 }
