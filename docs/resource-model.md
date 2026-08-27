@@ -126,7 +126,7 @@ Summarised:
 The middleware rewrites the module at compile time, injecting a points decrement at the head of each basic block covering the summed cost of that block's operators. Consequences:
 
 1. **Metering is part of the compiled artifact.** Any cached compilation must be keyed on both the code hash *and* a cost-function version identifier.
-2. **Changing the cost function is consensus-breaking.** It must be gated behind a protocol feature, and activation must invalidate every cached module. A node that replays history with a newer cost function will compute different CPU usage and diverge.
+2. **Changing the cost function is consensus-breaking.** It must be gated behind a [protocol feature](./protocol-features.md), and activation must invalidate every cached module. A node that replays history with a newer cost function will compute different CPU usage and diverge.
 3. **Exhaustion traps.** When remaining points hit zero the middleware traps; this surfaces as a CPU-exceeded failure and must be classified as an objective transaction failure (analogous to `tx_cpu_usage_exceeded`), not a subjective one.
 4. **Actual consumption is read post-execution** via the remaining-points value, and is the difference between the initial budget and the remainder — including for trapping executions, where the remainder is zero.
 
@@ -393,6 +393,8 @@ ram       = delta from any state mutation, billed normally
 2. Does `action_count` include inline actions dispatched during execution? (Recommended: yes.)
 3. Are context-free actions supported, and do they receive separate CPU accounting?
 4. Is native floating point permitted, or are floats routed through softfloat? (§6.5)
-5. What is the protocol-feature mechanism for revising the cost function post-launch, and how are cached compiled modules invalidated on activation?
+5. How should cached compiled modules be version-keyed and invalidated when a
+   cost-function [protocol feature](./protocol-features.md) activates? The
+   schedule and gate mechanism is now defined; cache lifecycle remains open.
 6. Are deferred transactions supported? If not, the `TRANSACTION_ID_NET_USAGE` surcharge and the delayed-transaction NET path can be removed entirely.
 7. Is there a subjective CPU/NET billing path for failed transactions, and how does it interact with deterministic op counting? (Partly answered: the wall-clock `checktime` deadline in §3.6 is the subjective time guard, layered over the objective op count. Subjective *billing* of failed transactions is still open.)

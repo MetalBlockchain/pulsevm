@@ -2,7 +2,10 @@
 
 Design documentation for PulseVM, a Rust implementation of an EOSIO/Antelope-compatible WebAssembly virtual machine running as a subnet VM on MetalGo.
 
-These documents describe **how PulseVM works and why**, at a level of detail intended for people modifying the implementation. They are not a normative specification — where a document and the code disagree, the code is authoritative and the document is a bug.
+These documents describe **how PulseVM works and why**, at a level of detail
+intended for people modifying or operating the implementation. They are not a
+normative specification — where a document and the code disagree, the code is
+authoritative and the document is a bug.
 
 ---
 
@@ -10,8 +13,11 @@ These documents describe **how PulseVM works and why**, at a level of detail int
 
 | Document | Covers | Status |
 |---|---|---|
+| [protocol-features.md](./protocol-features.md) | Compile-time feature availability, consensus-version selection, upgrade schedules, safe rollout, and activation testing | Framework implemented; only v1/Baseline |
 | [mempool-admission.md](./mempool-admission.md) | Local admission preflight, shared-state concurrency, detached batches, expiry, capacity, and observability | Current behavior |
 | [resource-model.md](./resource-model.md) | CPU, NET, and RAM accounting; WASM metering cost function; input vs implicit transaction billing | Draft |
+| [intrinsic-cost-model.md](./intrinsic-cost-model.md) | Host-intrinsic CPU pricing, estimator methodology, and calibration | Working reference |
+| [wasm-determinism.md](./wasm-determinism.md) | WASM feature pinning, floating-point behavior, database key ordering, and replay validation | Working reference |
 
 ---
 
@@ -19,7 +25,10 @@ These documents describe **how PulseVM works and why**, at a level of detail int
 
 Several documents describe behaviour where a change of any kind produces a chain split. Those sections are marked inline. The general rule:
 
-> If two nodes running different versions of the code would compute different state from the same input, the change requires a protocol feature gate.
+> If two nodes running different released binaries could receive the same valid
+> inputs and disagree about block validity or any consensus-observable output,
+> the change requires a
+> [protocol feature gate](./protocol-features.md).
 
 This applies to — non-exhaustively — the WASM instruction cost table, the SoftFloat build flags, Merkle tree canonicalization, map iteration order in any structure that feeds a hash, and every resource accounting constant.
 

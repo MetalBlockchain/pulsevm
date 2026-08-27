@@ -8,7 +8,7 @@ same points via `WasmContext::charge`, using the table in
 `crates/pulsevm_core/src/chain/webassembly/cost.rs`. Because those points are
 billed CPU and billed CPU is committed to the block, **the table is a consensus
 rule** — every node must charge identically, and a change is a coordinated
-upgrade, like the pinned wasm feature set.
+[protocol upgrade](./protocol-features.md), like the pinned wasm feature set.
 
 The values shipped initially were hand-picked, scaled by eye to the operator
 table. This document records how to derive them from measurement instead, what a

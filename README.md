@@ -2,6 +2,9 @@
 
 A virtual machine built for Metal Blockchain based on the XPR Network protocol, aka EOS / Leap / Spring.
 
+Implementation and consensus design notes are indexed in the
+[PulseVM documentation](./docs/README.md).
+
 ## Notable changes
 
 ### Objective CPU calculation
@@ -12,9 +15,9 @@ PulseVM calculates CPU objectively by charging a baseline of `50 microseconds` p
 
 ### Instant finality
 
-PulseVM blocks have near instant finality, improving on the average of 120 seconds seen in XPR Network. 
+PulseVM blocks have near instant finality, improving on the average of 120 seconds seen in XPR Network.
 
-It does this by handling a mempool of transactions, every `500 milliseconds` the mempool is checked for transactions. 
+It does this by handling a mempool of transactions, every `500 milliseconds` the mempool is checked for transactions.
 
 If the mempool contains transactions then the producer will request `metalgo` to produce a block, the actual producer building the block might be different from the producer requesting it. This is determined by the production window `metalgo` enforces.
 

@@ -40,6 +40,13 @@ pulsevm_softfloat = { path = "../pulsevm_softfloat" }
 pulsevm_database = { path = "../pulsevm_database" }
 pulsevm_wasm_validation = { path = "../pulsevm_wasm_validation" }
 
+[features]
+default = []
+# Aggregate every unfinished `protocol_feature_*` flag here. This controls
+# which implementations are compiled; the chain schedule still controls when
+# compiled behavior activates.
+nightly = []
+arena-shadow = []
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 proptest = "1"
