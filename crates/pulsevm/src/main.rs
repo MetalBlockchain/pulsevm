@@ -15,6 +15,7 @@ use pulsevm_core::{
     },
     mempool::Mempool,
     transaction::PackedTransaction,
+    warp::StaticValidatorSource,
 };
 use pulsevm_grpc::{
     http::{
@@ -293,6 +294,20 @@ impl Vm for VirtualMachine {
                 "could not initialize controller: {error}"
             )));
         }
+        // Enable Avalanche Interchain Messaging (ICM / warp). The Avalanche
+        // network id comes from the init request; the source chain id is this
+        // chain's blockchain id (already set on the controller). We start without
+        // an in-process signing key (MetalGo holds it) and with an empty static
+        // validator source — a MetalGo validator-state-backed source replaces it
+        // once that boundary is wired, at which point inbound verification and
+        // remote signing become fully live.
+        let network_id = request.get_ref().network_id;
+        controller.configure_warp(
+            network_id,
+            None,
+            Arc::new(StaticValidatorSource::new()),
+        );
+
         self.rpc_service
             .set_admission_state(controller.mempool_admission_state());
 

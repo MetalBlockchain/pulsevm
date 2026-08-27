@@ -18,6 +18,7 @@ authoritative and the document is a bug.
 | [resource-model.md](./resource-model.md) | CPU, NET, and RAM accounting; WASM metering cost function; input vs implicit transaction billing | Draft |
 | [intrinsic-cost-model.md](./intrinsic-cost-model.md) | Host-intrinsic CPU pricing, estimator methodology, and calibration | Working reference |
 | [wasm-determinism.md](./wasm-determinism.md) | WASM feature pinning, floating-point behavior, database key ordering, and replay validation | Working reference |
+| [cross-chain-messaging.md](./cross-chain-messaging.md) | Avalanche Interchain Messaging (ICM / warp): BLS scheme, wire formats, host functions, verification, and the MetalGo signer/validator boundary | VM-side implemented; MetalGo gRPC boundary pending |
 
 ---
 

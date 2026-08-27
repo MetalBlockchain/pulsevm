@@ -73,6 +73,23 @@ pub const RECOVER_KEY: u64 = 1_650_000;
 // PROVISIONAL (hand-scaled, pending measurement)
 // ---------------------------------------------------------------------------
 
+/// Emit a cross-chain ICM/warp message (`pulse_send_warp_message`): build the
+/// `AddressedCall`/`UnsignedMessage`, hash its id, and record it. Cheap native
+/// work plus a per-byte term for the payload. PROVISIONAL — not yet benchmarked.
+#[inline]
+pub fn warp_send(len: u64) -> u64 {
+    20_000 + 35 * len
+}
+
+/// Verify an aggregated BLS warp signature (`pulse_verify_warp_message`): a
+/// BLS12-381 pairing plus public-key aggregation — heavier than secp256k1
+/// recovery — with a per-byte term for parsing the message. PROVISIONAL —
+/// priced conservatively above `RECOVER_KEY` pending measurement.
+#[inline]
+pub fn warp_verify(len: u64) -> u64 {
+    3_000_000 + 35 * len
+}
+
 /// Crossing the host boundary plus the fixed bookkeeping every intrinsic does.
 /// A trivial getter (`action_data_size`, `current_receiver`, `current_time`, …)
 /// costs only this.
