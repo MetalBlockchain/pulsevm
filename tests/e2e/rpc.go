@@ -72,6 +72,29 @@ func RPCCall(ctx context.Context, uri, method string, params any, out any) error
 	return json.Unmarshal(decoded.Result, out)
 }
 
+// ChainInfo is the protocol-version view returned by pulsevm.getInfo. The
+// endpoint has many additional fields; these are the ones needed to assert an
+// upgrade boundary end to end.
+type ChainInfo struct {
+	ChainID                     string `json:"chain_id"`
+	HeadBlockNum                uint32 `json:"head_block_num"`
+	ProtocolVersion             uint32 `json:"protocol_version"`
+	SupportedProtocolVersion    uint32 `json:"supported_protocol_version"`
+	ProtocolUpgradeScheduleHash string `json:"protocol_upgrade_schedule_hash"`
+	NextProtocolUpgrade         *struct {
+		ProtocolVersion  uint32 `json:"protocol_version"`
+		ActivationHeight uint32 `json:"activation_height"`
+	} `json:"next_protocol_upgrade"`
+}
+
+// GetInfo returns the accepted-head and compiled protocol versions reported by
+// a PulseVM chain endpoint.
+func GetInfo(ctx context.Context, uri string) (ChainInfo, error) {
+	var out ChainInfo
+	err := RPCCall(ctx, uri, "pulsevm.getInfo", nil, &out)
+	return out, err
+}
+
 // ActiveProducers is the on-chain producer schedule: its version and the ordered
 // producer account names.
 type ActiveProducers struct {

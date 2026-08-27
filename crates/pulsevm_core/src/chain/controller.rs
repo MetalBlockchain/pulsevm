@@ -6,6 +6,12 @@ use std::{
         HashSet,
         VecDeque,
     },
+    fs,
+    io::{
+        ErrorKind,
+        Write as IoWrite,
+    },
+    path::Path,
     sync::LazyLock,
 };
 
@@ -43,6 +49,12 @@ use crate::{
             ProducerKey,
             ProducerSchedule,
         },
+        protocol_features::{
+            ProtocolExecutionContext,
+            ProtocolUpgrade,
+            ProtocolUpgradeSchedule,
+            ProtocolVersion,
+        },
         pulse_contract::{
             deleteauth,
             linkauth,
@@ -53,7 +65,10 @@ use crate::{
             updateauth,
         },
         resource_limits::ResourceLimitsManager,
-        state_history::StateHistoryLog,
+        state_history::{
+            StateHistoryLog,
+            StateHistoryLogCheckpoint,
+        },
         state_sync,
         transaction::{
             PackedTransaction,
@@ -145,6 +160,12 @@ pub struct Controller {
     chain_state_log: Option<StateHistoryLog>,
     node_config: Option<NodeConfig>,
 
+    // Consensus-critical upgrade schedule supplied in `upgrade_bytes` at VM
+    // initialization. MetalGo sources it from each node's chain configuration,
+    // so operators must keep the schedule identical across validators and
+    // restarts. See `docs/protocol-features.md` section 5.
+    protocol_upgrade_schedule: ProtocolUpgradeSchedule,
+
     // The data directory the database and logs live in. Retained so state-sync
     // accept can persist the synced producer schedule beside them.
     db_path: Option<String>,
@@ -191,6 +212,7 @@ pub struct Controller {
 pub struct MempoolAdmissionState {
     db: Database,
     chain_id: Id,
+    protocol_upgrade_schedule: ProtocolUpgradeSchedule,
 }
 
 impl MempoolAdmissionState {
@@ -201,6 +223,19 @@ impl MempoolAdmissionState {
     ) -> Result<(), ChainError> {
         let signed_transaction = packed_transaction.get_signed_transaction();
         let transaction = signed_transaction.transaction();
+
+        let accepted_height = u32::try_from(self.db.revision()).map_err(|_| {
+            ChainError::InternalError(format!(
+                "database revision {} cannot be used as an accepted block height",
+                self.db.revision()
+            ))
+        })?;
+        let next_block_height = accepted_height
+            .checked_add(1)
+            .ok_or_else(|| ChainError::InternalError("accepted block height overflow".into()))?;
+        self.protocol_upgrade_schedule
+            .execution_context(next_block_height)
+            .map_err(|e| ChainError::BlockError(e.to_string()))?;
 
         transaction.validate(pending_block_timestamp)?;
 
@@ -335,6 +370,21 @@ pub struct StateSummary {
 /// The producer schedule in force at a synced snapshot, persisted beside the
 /// logs so a restart-after-sync can recover it (see `apply_state_snapshot`).
 const SYNCED_SCHEDULE_FILE: &str = "synced_schedule.bin";
+const SYNCED_SCHEDULE_MAGIC: &[u8; 8] = b"PVMSCH01";
+
+/// Durable poison marker for the multi-file state-sync publication window.
+/// Its presence makes startup fail closed; successful application removes it
+/// only after the arena, logs, producer schedule, and in-memory head agree.
+const STATE_SYNC_INSTALL_MARKER_FILE: &str = "state_sync_installing";
+const STATE_SYNC_INSTALL_MARKER_MAGIC: &[u8; 8] = b"PVMSYN01";
+
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    fs::File::open(path)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
 
 /// The snapshot a node last advertised in a summary, kept so it can serve the
 /// download chunks without re-snapshotting the arena on every request.
@@ -364,6 +414,7 @@ impl Controller {
             trace_log: None,
             chain_state_log: None,
             node_config: None,
+            protocol_upgrade_schedule: ProtocolUpgradeSchedule::default(),
             db_path: None,
             snapshot_cache: None,
             active_schedule: ProducerSchedule::default(),
@@ -377,6 +428,19 @@ impl Controller {
     // The id of the block whose state is currently live on the database: the tip
     // of the pending chain, or the last accepted block when the chain is empty.
     fn pending_tip_id(&self) -> Id {
+        debug_assert!(
+            self.pending_chain
+                .first()
+                .map(|pending| pending.parent == self.last_accepted_block_id)
+                .unwrap_or(true),
+            "pending chain must start at the last accepted block"
+        );
+        debug_assert!(
+            self.pending_chain
+                .windows(2)
+                .all(|pair| pair[1].parent == pair[0].id),
+            "pending chain must be parent-linked in order"
+        );
         self.pending_chain
             .last()
             .map(|p| p.id)
@@ -401,6 +465,35 @@ impl Controller {
         self.unwind_pending_to(0)
     }
 
+    fn rollback_accept_logs(
+        &self,
+        block_checkpoint: &StateHistoryLogCheckpoint,
+        trace_checkpoint: &StateHistoryLogCheckpoint,
+        chain_state_checkpoint: &StateHistoryLogCheckpoint,
+    ) -> Vec<String> {
+        let mut errors = Vec::new();
+        let logs = [
+            (
+                "chain-state",
+                self.chain_state_log.as_ref(),
+                chain_state_checkpoint,
+            ),
+            ("trace", self.trace_log.as_ref(), trace_checkpoint),
+            ("block", self.block_log.as_ref(), block_checkpoint),
+        ];
+        for (name, log, checkpoint) in logs {
+            match log {
+                Some(log) => {
+                    if let Err(error) = log.rollback_to(checkpoint) {
+                        errors.push(format!("{name} log rollback failed: {error}"));
+                    }
+                }
+                None => errors.push(format!("{name} log disappeared during accept rollback")),
+            }
+        }
+        errors
+    }
+
     pub fn initialize(
         &mut self,
         chain_id: &Id,
@@ -408,7 +501,22 @@ impl Controller {
         genesis_bytes: &Vec<u8>,
         db_path: &str,
     ) -> Result<(), ChainError> {
+        self.initialize_with_protocol_upgrades(chain_id, config_bytes, genesis_bytes, &[], db_path)
+    }
+
+    pub fn initialize_with_protocol_upgrades(
+        &mut self,
+        chain_id: &Id,
+        config_bytes: &[u8],
+        genesis_bytes: &[u8],
+        upgrade_bytes: &[u8],
+        db_path: &str,
+    ) -> Result<(), ChainError> {
         info!("initializing controller with DB path: {}", db_path);
+        self.protocol_upgrade_schedule = ProtocolUpgradeSchedule::from_upgrade_bytes(upgrade_bytes)
+            .map_err(|e| {
+                ChainError::ParseError(format!("failed to parse protocol upgrade schedule: {e}"))
+            })?;
         // Parse config bytes
         let config_json = std::str::from_utf8(config_bytes).map_err(|e| {
             ChainError::ParseError(format!("failed to parse config bytes as UTF-8: {}", e))
@@ -420,6 +528,7 @@ impl Controller {
             ))
         })?);
 
+        Self::ensure_no_incomplete_state_sync(db_path)?;
         self.db_path = Some(db_path.to_string());
 
         // Initialize database
@@ -521,9 +630,15 @@ impl Controller {
         let revision = self.db.revision();
 
         let block_log_range = self.block_log.as_ref().unwrap().range();
+        let genesis_height = self.last_accepted_block.block_num();
 
         match block_log_range {
             None => {
+                if revision != genesis_height as i64 {
+                    return Err(ChainError::DatabaseError(format!(
+                        "database revision {revision} does not match empty block log (expected fresh genesis revision {genesis_height})"
+                    )));
+                }
                 self.block_log
                     .as_ref()
                     .unwrap()
@@ -544,7 +659,11 @@ impl Controller {
                     })?;
             }
             Some((start, end)) => {
-                if revision > end as i64 {
+                // The block log is the accepted-head journal while chainbase is
+                // the corresponding state. Either side being ahead means a
+                // prior publication was interrupted; choosing either tip would
+                // silently pair a block with the wrong state.
+                if revision != end as i64 {
                     error!(
                         "database revision {} does not match block log end {}",
                         revision, end
@@ -572,8 +691,18 @@ impl Controller {
                 // the log tip may not carry it. Accept persisted the schedule in
                 // force at the snapshot height beside the logs; load it as the base
                 // before reconstruct overlays any newer in-log change. Absent on a
-                // normally-grown chain, where the genesis seed is the base.
-                if let Some(synced) = Self::load_synced_schedule(db_path) {
+                // normally-grown chain, where the genesis seed is the base. A
+                // re-based log (start > genesis) must have this file; silently
+                // falling back to genesis producers would reinterpret synced
+                // state after a torn or manually deleted sidecar.
+                let synced = Self::load_synced_schedule(db_path)?;
+                if start > genesis_height && synced.is_none() {
+                    return Err(ChainError::DatabaseError(format!(
+                        "state-synced block log starts at height {start}, but {} is missing",
+                        SYNCED_SCHEDULE_FILE
+                    )));
+                }
+                if let Some(synced) = synced {
                     self.active_schedule = synced;
                 }
 
@@ -585,7 +714,85 @@ impl Controller {
             }
         }
 
+        self.validate_persisted_protocol_state(self.last_accepted_block.block_num(), false)?;
+        self.ensure_protocol_version_supported(self.last_accepted_block.block_num())?;
         Ok(())
+    }
+
+    /// Consensus protocol version active for a block height.
+    pub fn protocol_version(&self, block_height: u32) -> ProtocolVersion {
+        self.protocol_upgrade_schedule
+            .protocol_version(block_height)
+    }
+
+    /// Canonical digest of the complete schedule loaded by this node, including
+    /// future transitions. Operators compare this before an activation.
+    pub fn protocol_upgrade_schedule_hash(&self) -> [u8; 32] {
+        self.protocol_upgrade_schedule.schedule_hash()
+    }
+
+    pub fn next_protocol_upgrade(&self, block_height: u32) -> Option<ProtocolUpgrade> {
+        self.protocol_upgrade_schedule.next_upgrade(block_height)
+    }
+
+    fn ensure_protocol_version_supported(
+        &self,
+        block_height: u32,
+    ) -> Result<ProtocolExecutionContext, ChainError> {
+        self.protocol_upgrade_schedule
+            .execution_context(block_height)
+            .map_err(|e| ChainError::BlockError(e.to_string()))
+    }
+
+    fn configured_protocol_records(&self, block_height: u32) -> Vec<([u8; 32], u32)> {
+        self.protocol_upgrade_schedule
+            .activated_upgrades(block_height)
+            .iter()
+            .copied()
+            .map(ProtocolUpgrade::activation_record)
+            .collect()
+    }
+
+    /// Bind the locally supplied schedule to the activation history committed
+    /// in chainbase. `allow_pending_descendants` is used only at Accept while
+    /// later verified blocks may still have live child undo sessions.
+    fn validate_persisted_protocol_state(
+        &self,
+        block_height: u32,
+        allow_pending_descendants: bool,
+    ) -> Result<(), ChainError> {
+        let stored = self.db.activated_protocol_features()?;
+        let expected = self.configured_protocol_records(block_height);
+        let configured = self
+            .protocol_upgrade_schedule
+            .protocol_upgrades
+            .iter()
+            .copied()
+            .map(ProtocolUpgrade::activation_record)
+            .collect::<Vec<_>>();
+        let matches = if allow_pending_descendants {
+            stored.starts_with(&expected) && configured.starts_with(&stored)
+        } else {
+            stored == expected
+        };
+        if !matches {
+            return Err(ChainError::BlockError(format!(
+                "configured protocol upgrade schedule does not match the {} activation record(s) persisted at chain height {block_height}",
+                stored.len()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Confirm that a candidate executes against the activation history of its
+    /// accepted parent. The record itself is persisted only after the candidate
+    /// has been committed, so a rejected speculative block cannot activate it.
+    fn prepare_protocol_execution(
+        &mut self,
+        context: ProtocolExecutionContext,
+    ) -> Result<(), ChainError> {
+        let block_height = context.block_height();
+        self.validate_persisted_protocol_state(block_height.saturating_sub(1), false)
     }
 
     // Walk the block log back from the tip for the most recent block that changed
@@ -632,6 +839,8 @@ impl Controller {
         let mut transaction_traces: Vec<TransactionTrace> = Vec::new();
         let mut action_receipt_digests: VecDeque<Digest> = VecDeque::new();
         let timestamp: BlockTimestamp = TimePoint::now().into();
+        let block_height = BlockHeader::num_from_id(&self.preferred_id) + 1;
+        let protocol_context = self.ensure_protocol_version_supported(block_height)?;
         let block_status = BlockStatus::Building;
 
         // The timer also removes expired entries, but build against the exact
@@ -663,11 +872,20 @@ impl Controller {
 
         let mut db = self.db.clone();
         db.arena_start_undo_session(); // the block session; retained on the pending chain
+        if let Err(error) = self.prepare_protocol_execution(protocol_context) {
+            db.arena_undo();
+            return Err(error);
+        }
 
         // Expiry clearing is part of the block's state, so it belongs inside the
         // block's session rather than before it.
         db.clear_expired_input_transactions(&timestamp.into())?;
 
+        // The last producer schedule proposed by any transaction in this block,
+        // activated when the block is accepted.
+        // The schedule active for this block (as of its parent) governs what
+        // onblock and every transaction see through get_active_producers, and the
+        // version set_proposed_producers reports.
         self.block_active_schedule = self.schedule_active_for_parent(&self.preferred_id)?;
 
         // onblock heads the block, before any mempool transaction, so its action
@@ -675,12 +893,16 @@ impl Controller {
         // recompute in `execute_block`.
         let producer = self.node_config.as_ref().unwrap().producer_name;
         let previous = self.preferred_id;
-        let (onblock_digests, onblock_schedule) =
-            self.run_onblock(&timestamp, producer, previous, &block_status)?;
+        let (onblock_digests, mut proposed_schedule) = self.run_onblock(
+            protocol_context,
+            &timestamp,
+            producer,
+            previous,
+            &block_status,
+        )?;
         action_receipt_digests.extend(onblock_digests);
-        // The last proposal in the block wins. Start with onblock's proposal;
-        // later signed transactions overwrite it below.
-        let mut proposed_schedule = onblock_schedule;
+        // onblock's proposal counts like any transaction's (eosio.system elects
+        // producers from there); a later transaction's proposal overrides it.
 
         // Get transactions from the mempool
         while let Some(transaction) = mempool.pop_transaction() {
@@ -690,8 +912,13 @@ impl Controller {
             }
 
             db.arena_start_undo_session(); // open the per-transaction session
-            let transaction_result =
-                self.execute_transaction(&transaction, &timestamp, &block_status);
+            let transaction_result = self.execute_transaction_with_protocol(
+                &transaction,
+                protocol_context,
+                &timestamp,
+                &block_status,
+                None,
+            );
 
             match transaction_result {
                 Ok(result) => {
@@ -782,9 +1009,9 @@ impl Controller {
         let sig_digest = block.signed_block_header.header.sig_digest()?;
         block.signed_block_header.signature = node.producer_key.sign(&sig_digest)?;
 
-        // We built this block so no need to verify it again
+        // We built this block so no need to verify it again. Delay exposing it
+        // as verified until every fallible end-of-block write succeeds.
         let block_id = block.id()?;
-        self.verified_blocks.insert(block_id, block.clone());
 
         // The permission rewrite is block state: keep it in the block's undo
         // session so forks unwind it and SHiP observes it before accept/commit.
@@ -799,6 +1026,7 @@ impl Controller {
         // open in lockstep — committed if this block is accepted, undone if the
         // chain unwinds past it.
         self.finalize_block_resources(block.block_num())?;
+        self.verified_blocks.insert(block_id, block.clone());
         self.pending_chain.push(PendingBlock {
             id: block_id,
             parent: self.preferred_id,
@@ -964,6 +1192,8 @@ impl Controller {
             }
         }
 
+        self.ensure_protocol_version_supported(block.block_num())?;
+
         // Verify the block. Authenticate the signature against the schedule active
         // as of this block's parent — folding in any pending ancestor's change —
         // rather than whatever happens to be accepted right now, so two nodes
@@ -1034,6 +1264,20 @@ impl Controller {
                     block_id
                 )))?
         };
+        self.ensure_protocol_version_supported(block.block_num())?;
+
+        // Resolve every fallible property of the accepted header before touching
+        // speculative state or publishing any log. Once chainbase and the arena
+        // are committed below, the rest of this function is infallible.
+        let accepted_block_id = block.id().map_err(|error| {
+            ChainError::BlockError(format!("failed to calculate accepted block id: {error}"))
+        })?;
+        if accepted_block_id != *block_id {
+            return Err(ChainError::BlockError(format!(
+                "verified block cache key {block_id} does not match packed block id {accepted_block_id}"
+            )));
+        }
+        let accepted_schedule = block.signed_block_header.header.new_schedule().clone();
 
         // Pack the block before touching the pending chain. In the fast path below
         // the front session is `remove`d from the chain but only detached from
@@ -1043,6 +1287,32 @@ impl Controller {
         // remove(0)→push() window free of fallible operations.
         let packed_block = block.pack().map_err(|e| {
             ChainError::TransactionError(format!("failed to pack block {}: {}", block_id, e))
+        })?;
+
+        // The three files form one logical accept record. Capture all restore
+        // points before changing candidate state, so a failed append (including a
+        // partial write inside the failing log) can remove the whole record.
+        let block_checkpoint = self
+            .block_log
+            .as_ref()
+            .ok_or_else(|| ChainError::InternalError("block log not initialized".to_string()))?
+            .checkpoint()
+            .map_err(|error| {
+                ChainError::InternalError(format!("failed to checkpoint block log: {error}"))
+            })?;
+        let trace_checkpoint = self
+            .trace_log
+            .as_ref()
+            .ok_or_else(|| ChainError::InternalError("trace log not initialized".to_string()))?
+            .checkpoint()
+            .map_err(|error| {
+                ChainError::InternalError(format!("failed to checkpoint trace log: {error}"))
+            })?;
+        let chain_state_log = self.chain_state_log.as_ref().ok_or_else(|| {
+            ChainError::InternalError("chain state log not initialized".to_string())
+        })?;
+        let chain_state_checkpoint = chain_state_log.checkpoint().map_err(|error| {
+            ChainError::InternalError(format!("failed to checkpoint chain state log: {error}"))
         })?;
 
         // Fast path: consensus accepts blocks in order, so the accepted block is
@@ -1056,14 +1326,14 @@ impl Controller {
             .map(|p| p.id == *block_id)
             .unwrap_or(false);
 
+        // A state-history delta is read from the top arena undo session. Remove
+        // speculative descendants first so this accepted block cannot publish a
+        // child block's changes as its own delta.
+        if front_matches {
+            self.unwind_pending_to(1)?;
+        }
         let transaction_traces = if front_matches {
             let front = self.pending_chain.remove(0);
-            // `execute_block` removes accepted transactions from the mempool as it
-            // runs; the retained pass did not (build pops them while assembling,
-            // verify never touches the mempool), so mirror that here.
-            for receipt in &block.transactions {
-                mempool.remove_transaction(receipt.trx().id());
-            }
             front.traces
         } else {
             // Fallback: the block is not the retained front (e.g. a fork sibling
@@ -1090,22 +1360,58 @@ impl Controller {
             }
         };
 
-        // The block's arena session is retained (not undone); the commit below
-        // collapses it into the accepted state.
-        if let Some(log) = self.block_log.as_ref() {
-            log.append(block_id.clone(), &packed_block).map_err(|e| {
-                ChainError::InternalError(format!(
-                    "failed to append block {} to block log: {}",
-                    block_id, e
-                ))
-            })?;
+        // Publish SHiP payloads before the block-log record, which is the
+        // durable accepted-state marker on restart. Roll all logs and the arena
+        // session back if any reversible append fails.
+        let append_result = (|| -> Result<(), ChainError> {
+            self.store_traces(block_id, &transaction_traces)?;
+            self.store_chain_state(block_id)?;
+            self.block_log
+                .as_ref()
+                .expect("block log was preflighted")
+                .append(block_id.clone(), &packed_block)
+                .map_err(|e| {
+                    ChainError::InternalError(format!(
+                        "failed to append block {} to block log: {}",
+                        block_id, e
+                    ))
+                })?;
+            Ok(())
+        })();
+        if let Err(error) = append_result {
+            let rollback_errors = self.rollback_accept_logs(
+                &block_checkpoint,
+                &trace_checkpoint,
+                &chain_state_checkpoint,
+            );
+            self.db.arena_undo();
+            for receipt in &block.transactions {
+                mempool.add_transaction(receipt.trx().clone());
+            }
+            if rollback_errors.is_empty() {
+                return Err(error);
+            }
+            return Err(ChainError::fatal_consistency(format!(
+                "block accept failed ({error}) and log rollback was incomplete: {}",
+                rollback_errors.join("; ")
+            )));
         }
-        self.store_traces(block_id, &transaction_traces)?;
-        self.store_chain_state(block_id)?;
         self.verified_blocks.remove(block_id);
         self.last_accepted_block = block.clone();
-        self.last_accepted_block_id = block.id()?;
+        self.last_accepted_block_id = accepted_block_id;
         self.db.commit(block.block_num() as i64)?;
+        for upgrade in self
+            .protocol_upgrade_schedule
+            .activated_upgrades(block.block_num())
+            .iter()
+            .copied()
+            .filter(|upgrade| upgrade.activation_height == block.block_num())
+        {
+            let (digest, activation_height) = upgrade.activation_record();
+            self.db
+                .append_activated_protocol_feature(digest, activation_height)?;
+        }
+        self.validate_persisted_protocol_state(block.block_num(), false)?;
 
         // Activate a schedule change carried by this block, now that it is
         // committed. The schedule is read from the accepted block's own (signed)
@@ -1113,9 +1419,14 @@ impl Controller {
         // what a restart reconstructs — never an out-of-band value. A block that
         // is rejected or loses a fork is never accepted, so it never changes the
         // producers. `verify_block` has already bound the header to execution.
-        if let Some(schedule) = block.signed_block_header.header.new_schedule() {
+        if let Some(schedule) = accepted_schedule {
             info!("activated producer schedule version {}", schedule.version);
             self.active_schedule = schedule.clone();
+        }
+
+        self.preferred_id = accepted_block_id;
+        for receipt in &block.transactions {
+            mempool.remove_transaction(receipt.trx().id());
         }
 
         // `commit` above already collapsed the arena's undo stack to this block;
@@ -1200,6 +1511,7 @@ impl Controller {
 
     fn run_onblock(
         &mut self,
+        protocol_context: ProtocolExecutionContext,
         timestamp: &BlockTimestamp,
         producer: Name,
         previous: Id,
@@ -1241,7 +1553,7 @@ impl Controller {
         let mut trx_context = TransactionContext::new(
             self.db.clone(),
             self.wasm_runtime.clone(),
-            self.last_accepted_block().block_num() + 1,
+            protocol_context,
             timestamp.clone(),
             &trx_id,
             *block_status,
@@ -1296,9 +1608,14 @@ impl Controller {
         ),
         ChainError,
     > {
+        // Revalidate here instead of relying on a caller's guard: replay,
+        // fallback accept, and future callers must not reach consensus writes
+        // without a context for this exact candidate height.
+        let protocol_context = self.ensure_protocol_version_supported(block.block_num())?;
         let mut transaction_traces: Vec<TransactionTrace> = Vec::new();
         let mut transaction_receipts: VecDeque<TransactionReceipt> = VecDeque::new();
         let mut action_receipt_digests: VecDeque<Digest> = VecDeque::new();
+        self.prepare_protocol_execution(protocol_context)?;
         self.blocks_executed += 1;
 
         self.db
@@ -1306,19 +1623,23 @@ impl Controller {
 
         // onblock heads the block: its action digests precede every transaction's.
         let header = &block.signed_block_header.header;
-        let (onblock_digests, onblock_schedule) = self.run_onblock(
+        let (onblock_digests, mut proposed_schedule) = self.run_onblock(
+            protocol_context,
             &header.timestamp,
             header.producer,
             header.previous,
             block_status,
         )?;
         action_receipt_digests.extend(onblock_digests);
-        let mut proposed_schedule = onblock_schedule;
+        // Mirror build_block: onblock's proposal counts like any transaction's,
+        // overridden by a later transaction's — keeping verify's re-execution in
+        // agreement with what the producer folded into the header.
 
         for receipt in &block.transactions {
             // Verify the transaction
-            let result = self.execute_transaction_billed(
+            let result = self.execute_transaction_with_protocol(
                 receipt.trx(),
+                protocol_context,
                 &block.signed_block_header.header.timestamp,
                 block_status,
                 Some((receipt.cpu_usage_us(), receipt.net_usage_words())),
@@ -1432,6 +1753,7 @@ impl Controller {
         MempoolAdmissionState {
             db: self.db.clone(),
             chain_id: self.chain_id.clone(),
+            protocol_upgrade_schedule: self.protocol_upgrade_schedule.clone(),
         }
     }
 
@@ -1444,12 +1766,33 @@ impl Controller {
         pending_block_timestamp: &BlockTimestamp,
         block_status: &BlockStatus,
     ) -> Result<TransactionResult, ChainError> {
-        self.block_active_schedule = self.active_schedule.clone();
+        // Admission targets the same preferred parent as the next build. A
+        // state-summary request may have unwound its speculative session while
+        // leaving the preference intact, so materialize that path before
+        // deriving either the candidate height or its execution context.
+        let parent_id = self.preferred_id;
+        let mut replay_mempool = Mempool::new();
+        self.replay_accepted_state_to(parent_id, block_status, &mut replay_mempool)?;
+        let block_height = BlockHeader::num_from_id(&parent_id) + 1;
+        let protocol_context = self.ensure_protocol_version_supported(block_height)?;
+        self.block_active_schedule = self.schedule_active_for_parent(&parent_id)?;
         let db = self.db.clone();
         db.arena_start_undo_session();
-        let result = self.execute_transaction(transaction, pending_block_timestamp, block_status);
-        // Mempool admission is advisory: revert the arena session on both the ok
-        // and err path.
+        if let Err(error) = self.prepare_protocol_execution(protocol_context) {
+            // Admission executes the same activation boundary as block
+            // production, but its outer session is always discarded.
+            db.arena_undo();
+            return Err(error);
+        }
+        let result = self.execute_transaction_with_protocol(
+            transaction,
+            protocol_context,
+            pending_block_timestamp,
+            block_status,
+            None,
+        );
+        // Mempool admission is advisory: revert the arena session on both the
+        // success and error paths.
         db.arena_undo();
         result
     }
@@ -1462,8 +1805,11 @@ impl Controller {
         pending_block_timestamp: &BlockTimestamp,
         block_status: &BlockStatus,
     ) -> Result<TransactionResult, ChainError> {
-        self.execute_transaction_billed(
+        let block_height = BlockHeader::num_from_id(&self.pending_tip_id()) + 1;
+        let protocol_context = self.ensure_protocol_version_supported(block_height)?;
+        self.execute_transaction_with_protocol(
             packed_transaction,
+            protocol_context,
             pending_block_timestamp,
             block_status,
             None,
@@ -1483,6 +1829,25 @@ impl Controller {
     pub fn execute_transaction_billed(
         &mut self,
         packed_transaction: &PackedTransaction,
+        pending_block_timestamp: &BlockTimestamp,
+        block_status: &BlockStatus,
+        explicit_billed: Option<(u32, u32)>,
+    ) -> Result<TransactionResult, ChainError> {
+        let block_height = BlockHeader::num_from_id(&self.pending_tip_id()) + 1;
+        let protocol_context = self.ensure_protocol_version_supported(block_height)?;
+        self.execute_transaction_with_protocol(
+            packed_transaction,
+            protocol_context,
+            pending_block_timestamp,
+            block_status,
+            explicit_billed,
+        )
+    }
+
+    fn execute_transaction_with_protocol(
+        &mut self,
+        packed_transaction: &PackedTransaction,
+        protocol_context: ProtocolExecutionContext,
         pending_block_timestamp: &BlockTimestamp,
         block_status: &BlockStatus,
         explicit_billed: Option<(u32, u32)>,
@@ -1516,7 +1881,7 @@ impl Controller {
         let mut trx_context = TransactionContext::new(
             self.db.clone(),
             self.wasm_runtime.clone(),
-            self.last_accepted_block().block_num() + 1,
+            protocol_context,
             pending_block_timestamp.clone(),
             packed_transaction.id(),
             *block_status,
@@ -1581,7 +1946,12 @@ impl Controller {
     /// the controller exclusively (no block being processed): `snapshot_bytes`
     /// briefly drops and remaps the database.
     pub fn produce_state_summary(&mut self) -> Result<StateSummary, ChainError> {
+        // A verified child may have a live undo session materialized above the
+        // accepted revision. State summaries are labelled with last accepted,
+        // so unwind speculation before taking the physical arena snapshot.
+        self.clear_pending()?;
         let height = self.last_accepted_block.block_num();
+        self.validate_persisted_protocol_state(height, false)?;
 
         // Reuse the cached snapshot while it still commits to the tip; otherwise
         // take a fresh one. Re-snapshotting scans the whole arena, so caching
@@ -1610,6 +1980,7 @@ impl Controller {
             &block_bytes,
             cache.envelope.len() as u64,
             &cache.hash,
+            self.protocol_upgrade_schedule.commitment(height),
         );
 
         Ok(StateSummary {
@@ -1629,6 +2000,61 @@ impl Controller {
     /// download from.
     pub fn sync_target_from_summary(bytes: &[u8]) -> Result<state_sync::SyncTarget, ChainError> {
         state_sync::decode_summary_bytes(bytes)
+    }
+
+    /// Validate a peer summary against this node's configured protocol history
+    /// before downloading or mutating state.
+    pub fn validate_state_sync_target(
+        &self,
+        target: &state_sync::SyncTarget,
+    ) -> Result<(), ChainError> {
+        let height = u32::try_from(target.height).map_err(|_| {
+            ChainError::BlockError(format!(
+                "state-sync height {} exceeds the protocol height range",
+                target.height
+            ))
+        })?;
+        if height != target.block.block_num() {
+            return Err(ChainError::BlockError(format!(
+                "state-sync target height {} does not match block height {}",
+                height,
+                target.block.block_num()
+            )));
+        }
+        self.validate_state_sync_protocol(height, target.protocol_commitment)
+    }
+
+    fn validate_state_sync_protocol(
+        &self,
+        block_height: u32,
+        advertised: Option<crate::chain::protocol_features::ProtocolScheduleCommitment>,
+    ) -> Result<(), ChainError> {
+        self.ensure_protocol_version_supported(block_height)?;
+        let expected = self.protocol_upgrade_schedule.commitment(block_height);
+        match advertised {
+            Some(commitment) if commitment == expected => Ok(()),
+            Some(commitment) => Err(ChainError::BlockError(format!(
+                "state-sync protocol commitment mismatch at height {block_height}: peer version {} / prefix {}, local version {} / prefix {}",
+                commitment.protocol_version,
+                hex::encode(commitment.activated_schedule_hash),
+                expected.protocol_version,
+                hex::encode(expected.activated_schedule_hash)
+            ))),
+            None if expected.protocol_version
+                == crate::chain::protocol_features::GENESIS_PROTOCOL_VERSION
+                && self
+                    .protocol_upgrade_schedule
+                    .activated_upgrades(block_height)
+                    .is_empty() =>
+            {
+                // Backward compatibility for summaries produced before the
+                // protocol commitment extension, only while history is pure v1.
+                Ok(())
+            }
+            None => Err(ChainError::BlockError(format!(
+                "state-sync summary at height {block_height} has no protocol commitment"
+            ))),
+        }
     }
 
     /// Serve one slice of the snapshot a peer is downloading. Answered only when
@@ -1673,16 +2099,14 @@ impl Controller {
         &mut self,
         block: SignedBlock,
         schedule: ProducerSchedule,
+        protocol_commitment: Option<crate::chain::protocol_features::ProtocolScheduleCommitment>,
         envelope: &[u8],
     ) -> Result<(), ChainError> {
+        let block_height = block.block_num();
+        self.validate_state_sync_protocol(block_height, protocol_commitment)?;
         let block_id = block.id()?;
 
-        // Drop speculative and cached blocks: after a sync the tip is the
-        // snapshot block, not anything we were building on.
-        self.clear_pending()?;
-        self.verified_blocks.clear();
-
-        // The database revision advances one per accepted block, so the
+        // The chainbase revision advances one per accepted block, so the
         // snapshot's revision must equal the summary block's height. Check it
         // from the header first: a mismatch means the summary paired a block with
         // a snapshot of different state, and we reject it before the swap rather
@@ -1696,61 +2120,236 @@ impl Controller {
             )));
         }
 
-        // Restore the arena to the snapshot state; its revision becomes the
-        // snapshot height.
-        self.db.restore_from_bytes(envelope)?;
-
-        // Re-base the logs. The block log starts again at the snapshot block so a
-        // restart reconstructs the tip from here; the state-history logs have no
-        // entries for a block this node never executed, so they are cleared.
+        // Finish every fallible pure preflight before changing live state.
         let packed_block = block
             .pack()
             .map_err(|e| ChainError::InternalError(format!("accept: pack block: {}", e)))?;
         self.block_log
             .as_ref()
-            .ok_or_else(|| ChainError::InternalError("accept: no block log".into()))?
-            .reset_to(block_id.clone(), &packed_block)
-            .map_err(|e| ChainError::InternalError(format!("accept: rebase block log: {}", e)))?;
-        if let Some(log) = self.trace_log.as_ref() {
-            log.clear().map_err(|e| {
-                ChainError::InternalError(format!("accept: clear trace log: {}", e))
-            })?;
+            .ok_or_else(|| ChainError::InternalError("accept: no block log".into()))?;
+        let packed_schedule = schedule
+            .pack()
+            .map_err(|e| ChainError::InternalError(format!("accept: pack schedule: {}", e)))?;
+        let expected_protocol_records = self.configured_protocol_records(block_height);
+
+        // Preflight the snapshot before disturbing speculative state, then mark
+        // the multi-file installation window and replace the arena.
+        let db = self.db.clone();
+        let marker_installed = std::cell::Cell::new(false);
+        self.clear_pending()?;
+        self.begin_state_sync_install(block_height, &block_id)?;
+        marker_installed.set(true);
+        let restore_result = db.restore_from_bytes(envelope);
+        if let Err(error) = restore_result {
+            // Ordinary post-hook failures mean the database restore put the old
+            // arena back. Remove the poison marker so normal bootstrap may retry.
+            // Fatal restore failures keep it for startup to detect.
+            if marker_installed.get() && !error.is_fatal_consistency() {
+                self.clear_state_sync_install_marker()?;
+            }
+            return Err(error);
         }
-        if let Some(log) = self.chain_state_log.as_ref() {
-            log.clear().map_err(|e| {
-                ChainError::InternalError(format!("accept: clear chain state log: {}", e))
-            })?;
+        db.replace_activated_protocol_features(expected_protocol_records)?;
+
+        let publish_metadata = (|| -> Result<(), ChainError> {
+            // Re-base the logs. The block log starts again at the snapshot block
+            // so a restart reconstructs the tip from here; state-history has no
+            // entries for a block this node never executed, so those logs clear.
+            self.block_log
+                .as_ref()
+                .expect("block log was preflighted")
+                .reset_to(block_id, &packed_block)
+                .map_err(|e| ChainError::InternalError(format!("accept: rebase block log: {e}")))?;
+            if let Some(log) = self.trace_log.as_ref() {
+                log.clear().map_err(|e| {
+                    ChainError::InternalError(format!("accept: clear trace log: {e}"))
+                })?;
+            }
+            if let Some(log) = self.chain_state_log.as_ref() {
+                log.clear().map_err(|e| {
+                    ChainError::InternalError(format!("accept: clear chain state log: {e}"))
+                })?;
+            }
+
+            // The re-based block log lacks the historical block that activated
+            // this producer schedule, so persist an atomic checksummed base.
+            self.write_synced_schedule(&packed_schedule)
+        })();
+        if let Err(error) = publish_metadata {
+            return Err(ChainError::fatal_consistency(format!(
+                "state sync installed arena revision {block_height}, but companion metadata publication failed: {error}"
+            )));
         }
 
-        // Persist the schedule in force at the snapshot before adopting it, so a
-        // restart-after-sync recovers it (the re-based log's tip may not carry a
-        // schedule change).
-        self.write_synced_schedule(&schedule)?;
         self.active_schedule = schedule;
 
         self.last_accepted_block = block;
-        self.last_accepted_block_id = block_id.clone();
+        self.last_accepted_block_id = block_id;
         self.preferred_id = block_id;
+        self.verified_blocks.clear();
         // The cache commits to the pre-sync tip; drop it.
         self.snapshot_cache = None;
+        self.clear_state_sync_install_marker()?;
         Ok(())
     }
 
-    fn write_synced_schedule(&self, schedule: &ProducerSchedule) -> Result<(), ChainError> {
-        let dir = self
-            .db_path
-            .as_ref()
-            .ok_or_else(|| ChainError::InternalError("accept: no db path".into()))?;
-        let packed = schedule
-            .pack()
-            .map_err(|e| ChainError::InternalError(format!("accept: pack schedule: {}", e)))?;
-        std::fs::write(std::path::Path::new(dir).join(SYNCED_SCHEDULE_FILE), packed)
-            .map_err(|e| ChainError::InternalError(format!("accept: write schedule: {}", e)))
+    fn ensure_no_incomplete_state_sync(db_path: &str) -> Result<(), ChainError> {
+        let marker = Path::new(db_path).join(STATE_SYNC_INSTALL_MARKER_FILE);
+        match fs::metadata(&marker) {
+            Ok(_) => Err(ChainError::fatal_consistency(format!(
+                "incomplete state-sync publication marker remains at {}; wipe and resync this node before restarting",
+                marker.display()
+            ))),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(ChainError::fatal_consistency(format!(
+                "cannot determine whether a state-sync publication is incomplete at {}: {error}",
+                marker.display()
+            ))),
+        }
     }
 
-    fn load_synced_schedule(db_path: &str) -> Option<ProducerSchedule> {
-        let bytes = std::fs::read(std::path::Path::new(db_path).join(SYNCED_SCHEDULE_FILE)).ok()?;
-        ProducerSchedule::read_bounded(&bytes).ok()
+    fn begin_state_sync_install(&self, block_height: u32, block_id: &Id) -> Result<(), ChainError> {
+        let dir = Path::new(
+            self.db_path
+                .as_deref()
+                .ok_or_else(|| ChainError::InternalError("accept: no db path".into()))?,
+        );
+        let marker = dir.join(STATE_SYNC_INSTALL_MARKER_FILE);
+        let mut bytes = Vec::with_capacity(STATE_SYNC_INSTALL_MARKER_MAGIC.len() + 4 + 32);
+        bytes.extend_from_slice(STATE_SYNC_INSTALL_MARKER_MAGIC);
+        bytes.extend_from_slice(&block_height.to_le_bytes());
+        bytes.extend_from_slice(block_id.as_bytes());
+
+        let mut temp = tempfile::NamedTempFile::new_in(dir).map_err(|error| {
+            ChainError::fatal_consistency(format!(
+                "cannot create state-sync publication marker in {}: {error}",
+                dir.display()
+            ))
+        })?;
+        temp.write_all(&bytes).map_err(|error| {
+            ChainError::fatal_consistency(format!(
+                "cannot write state-sync publication marker: {error}"
+            ))
+        })?;
+        temp.as_file().sync_all().map_err(|error| {
+            ChainError::fatal_consistency(format!(
+                "cannot sync state-sync publication marker: {error}"
+            ))
+        })?;
+        temp.persist_noclobber(&marker).map_err(|error| {
+            ChainError::fatal_consistency(format!(
+                "cannot install state-sync publication marker at {}: {}",
+                marker.display(),
+                error.error
+            ))
+        })?;
+        sync_directory(dir).map_err(|error| {
+            ChainError::fatal_consistency(format!(
+                "cannot sync state-sync publication marker directory: {error}"
+            ))
+        })
+    }
+
+    fn clear_state_sync_install_marker(&self) -> Result<(), ChainError> {
+        let dir = Path::new(
+            self.db_path
+                .as_deref()
+                .ok_or_else(|| ChainError::fatal_consistency("state sync lost its DB path"))?,
+        );
+        let marker = dir.join(STATE_SYNC_INSTALL_MARKER_FILE);
+        fs::remove_file(&marker).map_err(|error| {
+            ChainError::fatal_consistency(format!(
+                "cannot remove completed state-sync marker {}: {error}",
+                marker.display()
+            ))
+        })?;
+        sync_directory(dir).map_err(|error| {
+            ChainError::fatal_consistency(format!(
+                "cannot sync removal of completed state-sync marker: {error}"
+            ))
+        })
+    }
+
+    fn write_synced_schedule(&self, packed: &[u8]) -> Result<(), ChainError> {
+        let dir = Path::new(
+            self.db_path
+                .as_deref()
+                .ok_or_else(|| ChainError::InternalError("accept: no db path".into()))?,
+        );
+        let target = dir.join(SYNCED_SCHEDULE_FILE);
+        let mut bytes = Vec::with_capacity(12 + packed.len() + 32);
+        bytes.extend_from_slice(SYNCED_SCHEDULE_MAGIC);
+        bytes.extend_from_slice(&(packed.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(packed);
+        bytes.extend_from_slice(Digest::hash(packed).as_bytes());
+
+        let mut temp = tempfile::NamedTempFile::new_in(dir).map_err(|error| {
+            ChainError::InternalError(format!("accept: create schedule temp file: {error}"))
+        })?;
+        temp.write_all(&bytes).map_err(|error| {
+            ChainError::InternalError(format!("accept: write schedule temp file: {error}"))
+        })?;
+        temp.as_file().sync_all().map_err(|error| {
+            ChainError::InternalError(format!("accept: sync schedule temp file: {error}"))
+        })?;
+        temp.persist(&target).map_err(|error| {
+            ChainError::InternalError(format!(
+                "accept: install schedule at {}: {}",
+                target.display(),
+                error.error
+            ))
+        })?;
+        sync_directory(dir).map_err(|error| {
+            ChainError::InternalError(format!("accept: sync schedule directory: {error}"))
+        })
+    }
+
+    fn load_synced_schedule(db_path: &str) -> Result<Option<ProducerSchedule>, ChainError> {
+        let path = Path::new(db_path).join(SYNCED_SCHEDULE_FILE);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(ChainError::DatabaseError(format!(
+                    "failed to read synced producer schedule {}: {error}",
+                    path.display()
+                )));
+            }
+        };
+        if bytes.len() < 12 + 32 || &bytes[..8] != SYNCED_SCHEDULE_MAGIC {
+            return Err(ChainError::DatabaseError(format!(
+                "synced producer schedule {} has an invalid header",
+                path.display()
+            )));
+        }
+        let packed_len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+        let expected_len = 12usize
+            .checked_add(packed_len)
+            .and_then(|len| len.checked_add(32))
+            .ok_or_else(|| {
+                ChainError::DatabaseError("synced producer schedule length overflow".into())
+            })?;
+        if bytes.len() != expected_len {
+            return Err(ChainError::DatabaseError(format!(
+                "synced producer schedule {} declares {packed_len} packed bytes but contains {} total bytes",
+                path.display(),
+                bytes.len()
+            )));
+        }
+        let packed = &bytes[12..12 + packed_len];
+        if Digest::hash(packed).as_bytes() != &bytes[12 + packed_len..] {
+            return Err(ChainError::DatabaseError(format!(
+                "synced producer schedule {} failed its checksum",
+                path.display()
+            )));
+        }
+        let schedule = ProducerSchedule::read_bounded(packed).map_err(|error| {
+            ChainError::DatabaseError(format!(
+                "failed to decode synced producer schedule {}: {error}",
+                path.display()
+            ))
+        })?;
+        Ok(Some(schedule))
     }
 
     pub fn get_block_id_for_num(&self, height: u32) -> Result<Option<Id>, ChainError> {
@@ -2085,6 +2684,8 @@ mod tests {
         sync::RwLock,
     };
 
+    #[cfg(feature = "arena-shadow")]
+    use crate::chain::abi::AbiDefinition;
     use crate::{
         ACTIVE_NAME,
         chain::{
@@ -3458,6 +4059,20 @@ mod tests {
         Ok((controller, private_key, chain_id, temp_path))
     }
 
+    const PROPOSE_PRODUCERS_WAT: &str = r#"
+        (module
+          (import "env" "action_data_size" (func $ads (result i32)))
+          (import "env" "read_action_data" (func $read (param i32 i32) (result i32)))
+          (import "env" "set_proposed_producers" (func $spp (param i32 i32) (result i64)))
+          (memory 1)
+          (export "memory" (memory 0))
+          (func (export "apply") (param i64 i64 i64)
+            (local $len i32)
+            (local.set $len (call $ads))
+            (drop (call $read (i32.const 0) (local.get $len)))
+            (drop (call $spp (i32.const 0) (local.get $len)))))
+    "#;
+
     // Bit-for-bit block-id parity across serialization and re-execution. A
     // producer builds a real chain — onblock runs at the head of every block,
     // plus an account-creating transaction — and each block is round-tripped
@@ -3633,10 +4248,12 @@ mod tests {
     }
 
     // Verifying a second block on top of a still-pending first block reuses the
-    // first block's already-executed state instead of re-running it, and both can
-    // then be accepted in order without further execution.
+    // first block's execution. Accepting the first must then unwind the child so
+    // SHiP packs the first block's own undo record, and accepting the cached child
+    // re-executes it on the newly accepted base.
     #[tokio::test]
-    async fn test_pending_chain_reuses_executed_prefix() -> Result<(), ChainError> {
+    async fn test_accept_unwinds_pending_descendants_before_packing_ship_delta()
+    -> Result<(), ChainError> {
         // Producer builds two chained blocks (b3 on top of the still-pending b2).
         let (mut producer, private_key, chain_id, _p_temp) = init_test_controller()?;
         let mut p_mempool = Mempool::new();
@@ -3655,7 +4272,15 @@ mod tests {
         let b3 = producer.build_block(&mut p_mempool).await?;
         assert_eq!(b3.previous_id(), &b2.id()?);
 
-        // Validator verifies both, then accepts them in order.
+        // A reference validator accepts each block without a pending descendant;
+        // its SHiP payloads are the expected per-block deltas.
+        let (mut reference, _pk, _cid, _r_temp) = init_test_controller()?;
+        let mut r_mempool = Mempool::new();
+        reference.verify_block(&b2, &mut r_mempool).await?;
+        reference.accept_block(&b2.id()?, &mut r_mempool)?;
+        let expected_b2_delta = reference.chain_state_log().unwrap().read_block(2).unwrap();
+
+        // This validator verifies both before accepting either.
         let (mut validator, _pk, _cid, _v_temp) = init_test_controller()?;
         let mut v_mempool = Mempool::new();
 
@@ -3670,19 +4295,119 @@ mod tests {
         assert_eq!(validator.blocks_executed, 2);
 
         validator.accept_block(&b2.id()?, &mut v_mempool)?;
-        assert_eq!(validator.pending_chain.len(), 1);
+        assert!(validator.pending_chain.is_empty());
+        assert!(
+            !validator
+                .database()
+                .arena_account_exists(Name::from_str("bbb")?.as_u64()),
+            "accepting b2 left its speculative child state materialized"
+        );
+        assert_eq!(
+            validator.chain_state_log().unwrap().read_block(2).unwrap(),
+            expected_b2_delta,
+            "b2 SHiP payload included its pending child's state"
+        );
+
+        reference.verify_block(&b3, &mut r_mempool).await?;
+        reference.accept_block(&b3.id()?, &mut r_mempool)?;
+        let expected_b3_delta = reference.chain_state_log().unwrap().read_block(3).unwrap();
+
         validator.accept_block(&b3.id()?, &mut v_mempool)?;
         assert!(validator.pending_chain.is_empty());
 
-        // Acceptance committed the retained state without any extra execution.
-        assert_eq!(validator.blocks_executed, 2);
+        // b2 reused its retained execution; cached b3 ran once more only because
+        // accepting b2 had to unwind it before reading b2's top undo session.
+        assert_eq!(validator.blocks_executed, 3);
         assert_eq!(validator.last_accepted_block_id, b3.id()?);
         assert_eq!(validator.last_accepted_block().block_num(), 3);
+        assert_eq!(
+            validator.chain_state_log().unwrap().read_block(3).unwrap(),
+            expected_b3_delta,
+            "fallback acceptance produced a different b3 SHiP delta"
+        );
 
         // Both accounts are present in committed state.
         let db = validator.database();
         assert!(db.arena_account_exists(Name::from_str("aaa")?.as_u64()));
         assert!(db.arena_account_exists(Name::from_str("bbb")?.as_u64()));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_accept_log_failures_roll_back_state_logs_arena_and_mempool()
+    -> Result<(), ChainError> {
+        let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
+        let mut mempool = Mempool::new();
+        let account = Name::from_str("logrollback")?;
+        let transaction = create_account(&private_key, account, chain_id)?;
+        let transaction_id = *transaction.id();
+        mempool.add_transaction(transaction.clone());
+
+        let accepted_id_before = controller.last_accepted_block_id;
+        let revision_before = controller.db.revision();
+        let arena_root_before = controller.db.arena_state_root();
+        let block_range_before = controller.block_log()?.range();
+        let trace_range_before = controller.trace_log().unwrap().range();
+        let state_range_before = controller.chain_state_log().unwrap().range();
+
+        let block = controller.build_block(&mut mempool).await?;
+        let block_id = block.id()?;
+        // Build consumed it; put it back to prove failed accept does not perform
+        // the externally visible mempool removal.
+        assert!(mempool.add_transaction(transaction));
+
+        // Block-log is published last as the restart commit marker, so this
+        // failure rolls back both already-written SHiP logs as well.
+        controller.block_log()?.fail_next_append_after_log_sync();
+        let block_log_error = controller
+            .accept_block(&block_id, &mut mempool)
+            .unwrap_err();
+        assert!(!block_log_error.is_fatal_consistency());
+        assert!(block_log_error.to_string().contains("block log"));
+        assert_eq!(controller.last_accepted_block_id, accepted_id_before);
+        assert_eq!(controller.db.revision(), revision_before);
+        assert_eq!(controller.db.arena_state_root(), arena_root_before);
+        assert_eq!(controller.block_log()?.range(), block_range_before);
+        assert_eq!(controller.trace_log().unwrap().range(), trace_range_before);
+        assert_eq!(
+            controller.chain_state_log().unwrap().range(),
+            state_range_before
+        );
+        assert!(controller.pending_chain.is_empty());
+        assert!(controller.verified_blocks.contains_key(&block_id));
+        assert!(mempool.contains(&transaction_id));
+        assert!(!controller.database().arena_account_exists(account.as_u64()));
+
+        // The retry uses fallback execution. Fail its chain-state append after
+        // the trace append, exercising an intermediate cross-log rollback too.
+        controller.chain_state_log().unwrap().fail_next_append();
+        let chain_state_error = controller
+            .accept_block(&block_id, &mut mempool)
+            .unwrap_err();
+        assert!(!chain_state_error.is_fatal_consistency());
+        assert!(chain_state_error.to_string().contains("chain state log"));
+        assert_eq!(controller.last_accepted_block_id, accepted_id_before);
+        assert_eq!(controller.db.revision(), revision_before);
+        assert_eq!(controller.db.arena_state_root(), arena_root_before);
+        assert_eq!(controller.block_log()?.range(), block_range_before);
+        assert_eq!(controller.trace_log().unwrap().range(), trace_range_before);
+        assert_eq!(
+            controller.chain_state_log().unwrap().range(),
+            state_range_before
+        );
+        assert!(mempool.contains(&transaction_id));
+        assert!(!controller.database().arena_account_exists(account.as_u64()));
+
+        controller.accept_block(&block_id, &mut mempool)?;
+        assert_eq!(controller.last_accepted_block_id, block_id);
+        assert!(!mempool.contains(&transaction_id));
+        assert!(controller.database().arena_account_exists(account.as_u64()));
+        #[cfg(feature = "arena-shadow")]
+        assert!(controller.database().arena_account_exists(account.as_u64()));
+        assert_eq!(controller.block_log()?.range().unwrap().1, 2);
+        assert_eq!(controller.trace_log().unwrap().range().unwrap().1, 2);
+        assert_eq!(controller.chain_state_log().unwrap().range().unwrap().1, 2);
 
         Ok(())
     }
@@ -4712,6 +5437,24 @@ mod tests {
         )?);
         let block = producer.build_block(&mut p_mempool).await?;
         producer.accept_block(&block.id()?, &mut p_mempool)?;
+        producer.set_preferred_id(block.id()?);
+
+        // Materialize a verified child without accepting it. A summary labelled
+        // with the accepted block must unwind this speculative account before
+        // copying the physical arena.
+        let speculative_name = Name::from_str("pendingacct")?.as_u64();
+        p_mempool.add_transaction(create_account(
+            &private_key,
+            Name::from_str("pendingacct")?,
+            chain_id,
+        )?);
+        let _speculative_block = producer.build_block(&mut p_mempool).await?;
+        assert!(
+            producer
+                .database()
+                .arena_account_metadata(speculative_name)
+                .is_some()
+        );
 
         // Rotate the schedule so it differs from the genesis seed — this is what
         // the persisted-schedule path has to recover across a restart.
@@ -4727,6 +5470,14 @@ mod tests {
 
         let summary = producer.produce_state_summary()?;
         assert_eq!(summary.height, producer_height as u64);
+        assert!(producer.pending_chain.is_empty());
+        assert!(
+            producer
+                .database()
+                .arena_account_metadata(speculative_name)
+                .is_none(),
+            "summary production left speculative state materialized"
+        );
 
         // Syncing node: fresh genesis, so it has neither glenn nor the schedule.
         let syncer_temp = get_temp_dir();
@@ -4742,6 +5493,7 @@ mod tests {
         // Download the snapshot chunk by chunk from the producer, exactly as the
         // P2P driver does — here the fetch is a direct call, not an AppRequest.
         let target = Controller::sync_target_from_summary(&summary.bytes)?;
+        syncer.validate_state_sync_target(&target)?;
         let (hash, height) = (target.hash, target.height);
         let envelope = crate::chain::state_sync::download_snapshot(&target, |off, len| {
             let chunk = producer.serve_snapshot_chunk(height, &hash, off, len);
@@ -4750,7 +5502,19 @@ mod tests {
         .await?;
 
         // Apply transfers state, tip, and schedule.
-        syncer.apply_state_snapshot(target.block.clone(), target.schedule.clone(), &envelope)?;
+        syncer.apply_state_snapshot(
+            target.block.clone(),
+            target.schedule.clone(),
+            target.protocol_commitment,
+            &envelope,
+        )?;
+        assert!(
+            !syncer_temp
+                .path()
+                .join(STATE_SYNC_INSTALL_MARKER_FILE)
+                .exists(),
+            "successful state sync left its fail-closed marker behind"
+        );
         assert!(
             syncer.database().arena_account_metadata(name).is_some(),
             "state not transferred"
@@ -4759,10 +5523,18 @@ mod tests {
         assert_eq!(syncer.last_accepted_block().id()?, summary.id);
         assert_eq!(syncer.database().revision(), producer_height as i64);
         assert_eq!(syncer.active_schedule, producer_schedule);
+        assert!(
+            syncer
+                .database()
+                .arena_account_metadata(speculative_name)
+                .is_none(),
+            "state sync included a verified-but-unaccepted account"
+        );
+        assert!(syncer.database().activated_protocol_features()?.is_empty());
 
         // Restart the synced node from its data directory.
         syncer.shutdown()?;
-        let restarted = init(&syncer_path)?;
+        let mut restarted = init(&syncer_path)?;
         assert!(
             restarted.database().arena_account_metadata(name).is_some(),
             "synced state lost across restart"
@@ -4773,6 +5545,31 @@ mod tests {
             restarted.active_schedule, producer_schedule,
             "synced schedule lost across restart"
         );
+        assert!(
+            restarted
+                .database()
+                .activated_protocol_features()?
+                .is_empty()
+        );
+
+        // A re-based log cannot reconstruct the producer schedule from missing
+        // pre-sync blocks. Missing or corrupt sidecar data must fail closed,
+        // never silently fall back to the genesis signer set.
+        restarted.shutdown()?;
+        let schedule_path = syncer_temp.path().join(SYNCED_SCHEDULE_FILE);
+        fs::remove_file(&schedule_path).unwrap();
+        let missing = match init(&syncer_path) {
+            Ok(_) => panic!("restart unexpectedly accepted a missing synced schedule"),
+            Err(error) => error,
+        };
+        assert!(missing.to_string().contains("is missing"));
+
+        fs::write(&schedule_path, b"corrupt schedule").unwrap();
+        let corrupt = match init(&syncer_path) {
+            Ok(_) => panic!("restart unexpectedly accepted a corrupt synced schedule"),
+            Err(error) => error,
+        };
+        assert!(corrupt.to_string().contains("invalid header"));
 
         Ok(())
     }
@@ -4957,7 +5754,12 @@ mod tests {
             crate::chain::state_sync::SNAPSHOT_CHUNK_LEN
         );
 
-        syncer.apply_state_snapshot(target.block.clone(), target.schedule.clone(), &envelope)?;
+        syncer.apply_state_snapshot(
+            target.block.clone(),
+            target.schedule.clone(),
+            target.protocol_commitment,
+            &envelope,
+        )?;
 
         // The synced node now holds the producer's tip, revision and state.
         assert_eq!(syncer.last_accepted_block().block_num(), height);
@@ -5019,14 +5821,17 @@ mod tests {
             let mut controller = Controller::new();
             controller.initialize(&chain_id, &config_bytes, &genesis_bytes.to_vec(), &path)?;
 
-            // Build a real block on genesis, carry the schedule change in its
-            // (re-signed) header, and append it to the log. This stands in for an
-            // accepted schedule-changing block without needing a privileged
-            // contract to run set_proposed_producers.
+            // Install the privileged proposal contract in an accepted block,
+            // then produce and accept a genuine schedule-changing block. The
+            // restart path must only ever see log records paired with the same
+            // committed chainbase revision.
             let mut mempool = Mempool::new();
-            mempool.add_transaction(create_account(
+            let admin = Name::from_str("prodadmin")?;
+            mempool.add_transaction(create_account(&private_key, admin, chain_id)?);
+            mempool.add_transaction(set_code(
                 &private_key,
-                Name::from_str("testapi")?,
+                admin,
+                crate::wat2wasm(PROPOSE_PRODUCERS_WAT).expect("valid WAT"),
                 chain_id,
             )?);
             let mut block = controller.build_block(&mut mempool).await?;
@@ -5044,6 +5849,8 @@ mod tests {
                 .unwrap()
                 .append(block.id()?, &packed)
                 .map_err(|e| ChainError::InternalError(e.to_string()))?;
+            controller.clear_pending()?;
+            controller.db.set_revision(2)?;
             controller.shutdown()?;
         }
 
@@ -5310,8 +6117,15 @@ mod tests {
 
         let timestamp: BlockTimestamp = TimePoint::now().into();
         let previous = controller.preferred_id;
-        let (digests, _) =
-            controller.run_onblock(&timestamp, PULSE_NAME, previous, &BlockStatus::Building)?;
+        let protocol_context = controller
+            .ensure_protocol_version_supported(BlockHeader::num_from_id(&previous) + 1)?;
+        let (digests, _) = controller.run_onblock(
+            protocol_context,
+            &timestamp,
+            PULSE_NAME,
+            previous,
+            &BlockStatus::Building,
+        )?;
         assert!(
             !digests.is_empty(),
             "onblock must have executed rather than been skipped"
@@ -5415,8 +6229,15 @@ mod tests {
         // come back.
         let timestamp: BlockTimestamp = TimePoint::now().into();
         let previous = controller.preferred_id;
-        let (digests, _) =
-            controller.run_onblock(&timestamp, PULSE_NAME, previous, &BlockStatus::Building)?;
+        let protocol_context = controller
+            .ensure_protocol_version_supported(BlockHeader::num_from_id(&previous) + 1)?;
+        let (digests, _) = controller.run_onblock(
+            protocol_context,
+            &timestamp,
+            PULSE_NAME,
+            previous,
+            &BlockStatus::Building,
+        )?;
         assert!(
             !digests.is_empty(),
             "onblock must run the pulse contract to completion under a CPU limit of -1"
@@ -5474,8 +6295,13 @@ mod tests {
         // must fail internally but run_onblock must return Ok with no digests.
         let timestamp: BlockTimestamp = TimePoint::now().into();
         let previous = controller.preferred_id;
-        let (digests, _) =
-            controller.run_onblock(&timestamp, PULSE_NAME, previous, &BlockStatus::Building)?;
+        let (digests, _) = controller.run_onblock(
+            controller.ensure_protocol_version_supported(2)?,
+            &timestamp,
+            PULSE_NAME,
+            previous,
+            &BlockStatus::Building,
+        )?;
         assert!(
             digests.is_empty(),
             "a rejected onblock must yield no action-receipt digests"

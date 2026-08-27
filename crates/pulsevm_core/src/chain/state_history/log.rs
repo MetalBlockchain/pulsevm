@@ -21,6 +21,12 @@ use std::{
     sync::Mutex,
 };
 
+#[cfg(test)]
+use std::sync::atomic::{
+    AtomicBool,
+    Ordering,
+};
+
 use pulsevm_crypto::FixedBytes;
 use spdlog::error;
 
@@ -186,6 +192,16 @@ struct Inner {
     log_len: u64,              // logical end-of-log; running counter, no metadata() syscalls
 }
 
+/// An exact append-only restore point. The controller takes one for each of its
+/// three logs before accepting a block, then rolls every log back to its restore
+/// point if any append fails.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StateHistoryLogCheckpoint {
+    log_len: u64,
+    idx_len: u64,
+    range: Option<(u32, u32)>,
+}
+
 #[derive(Debug)]
 pub struct StateHistoryLog {
     name: String,
@@ -193,6 +209,10 @@ pub struct StateHistoryLog {
     idx_path: PathBuf,
     magic: u64,
     inner: Mutex<Inner>,
+    #[cfg(test)]
+    fail_next_append: AtomicBool,
+    #[cfg(test)]
+    fail_next_append_after_log_sync: AtomicBool,
 }
 
 impl StateHistoryLog {
@@ -246,49 +266,57 @@ impl StateHistoryLog {
             idx_file.set_len(valid_idx_bytes)?;
         }
 
-        if map.is_empty() {
-            // Full scan of the log; rebuild the index file from scratch.
-            let entries = scan_entries(&mut log_file, 0, magic)?;
-            idx_file.set_len(0)?;
-            idx_file.seek(SeekFrom::Start(0))?;
-            let mut w = BufWriter::new(&idx_file);
-            for (block, pos) in &entries {
-                w.write_all(&block.to_le_bytes())?;
-                w.write_all(&pos.to_le_bytes())?;
-                map.insert(*block, *pos);
-            }
-            w.flush()?;
+        // `reset_to`/`clear` publish the log and index with two renames. A crash
+        // between them can pair a new log with an old index (or vice versa), so
+        // trusting only an invalid tail and deleting one record is unsafe: stale
+        // earlier offsets could remain. Validate the pair's first and last entry,
+        // its contiguous key/offset shape, and rebuild the *entire* index from the
+        // log on any mismatch.
+        let index_matches_log = if let (Some((&first, &first_off)), Some((&last, &tail_off))) =
+            (map.first_key_value(), map.last_key_value())
+        {
+            let contiguous_keys = u64::from(last.saturating_sub(first)) + 1 == map.len() as u64;
+            let increasing_offsets = map
+                .values()
+                .try_fold(None, |previous, &offset| match previous {
+                    Some(previous) if offset <= previous => Err(()),
+                    _ => Ok(Some(offset)),
+                })
+                .is_ok();
+            let len_total = log_file.metadata()?.len();
+            let first_matches = first_off == 0
+                && read_validated_header(&mut log_file, first_off, len_total, magic)
+                    .map(|header| num_from_block_id(&header.block_id) == first)
+                    .unwrap_or(false);
+            let tail_matches = read_validated_header(&mut log_file, tail_off, len_total, magic)
+                .map(|header| num_from_block_id(&header.block_id) == last)
+                .unwrap_or(false);
+            contiguous_keys && increasing_offsets && first_matches && tail_matches
         } else {
-            // Validate the tail entry the index points at.
+            false
+        };
+
+        if !index_matches_log {
+            map = rebuild_index(&mut log_file, &mut idx_file, magic)?;
+        } else {
             let last = *map.keys().last().unwrap();
             let tail_off = map[&last];
             let len_total = log_file.metadata()?.len();
-            match read_validated_header(&mut log_file, tail_off, len_total, magic) {
-                Ok(h) => {
-                    let ok_end = tail_off + StateHistoryLogHeader::SIZE + h.payload_size;
-                    // Recover entries the log has but the index doesn't
-                    // (crash after log sync, before index write). This
-                    // is what makes append's "log first, index second"
-                    // ordering safe — an acknowledged block is never
-                    // silently dropped.
-                    let recovered = scan_entries(&mut log_file, ok_end, magic)?;
-                    if !recovered.is_empty() {
-                        idx_file.seek(SeekFrom::Start(valid_idx_bytes))?;
-                        let mut w = BufWriter::new(&idx_file);
-                        for (block, pos) in &recovered {
-                            w.write_all(&block.to_le_bytes())?;
-                            w.write_all(&pos.to_le_bytes())?;
-                            map.insert(*block, *pos);
-                        }
-                        w.flush()?;
-                    }
+            let tail = read_validated_header(&mut log_file, tail_off, len_total, magic)?;
+            let ok_end = tail_off + StateHistoryLogHeader::SIZE + tail.payload_size;
+            // Recover entries the log has but the index doesn't (crash after log
+            // sync, before index write). This preserves acknowledged blocks while
+            // keeping the index publication ordered after the log.
+            let recovered = scan_entries(&mut log_file, ok_end, magic)?;
+            if !recovered.is_empty() {
+                idx_file.seek(SeekFrom::Start(valid_idx_bytes))?;
+                let mut w = BufWriter::new(&idx_file);
+                for (block, pos) in &recovered {
+                    w.write_all(&block.to_le_bytes())?;
+                    w.write_all(&pos.to_le_bytes())?;
+                    map.insert(*block, *pos);
                 }
-                Err(_) => {
-                    // Torn tail: drop it from log, index, and map.
-                    log_file.set_len(tail_off)?;
-                    map.remove(&last);
-                    idx_file.set_len(valid_idx_bytes.saturating_sub(IDX_RECORD_SIZE))?;
-                }
+                w.flush()?;
             }
         }
 
@@ -313,7 +341,106 @@ impl StateHistoryLog {
                 range,
                 log_len,
             }),
+            #[cfg(test)]
+            fail_next_append: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_append_after_log_sync: AtomicBool::new(false),
         })
+    }
+
+    /// Capture the exact logical and physical tail of this log. Successful
+    /// appends always flush their index record, so the index file length is a
+    /// stable restore point without flushing (and therefore without changing)
+    /// either writer here.
+    pub(crate) fn checkpoint(&self) -> Result<StateHistoryLogCheckpoint, ShLogError> {
+        let inner = self.inner.lock().unwrap();
+        Ok(StateHistoryLogCheckpoint {
+            log_len: inner.log_len,
+            idx_len: inner.idx.get_ref().metadata()?.len(),
+            range: inner.range,
+        })
+    }
+
+    /// Restore a checkpoint taken before one or more appends.
+    ///
+    /// A failed `BufWriter` write can leave bytes buffered in memory. Replacing
+    /// the writers and dismantling the old ones with `into_parts` deliberately
+    /// discards those bytes before truncating the files; dropping or seeking the
+    /// old writers could otherwise flush the failed entry back after rollback.
+    pub(crate) fn rollback_to(
+        &self,
+        checkpoint: &StateHistoryLogCheckpoint,
+    ) -> Result<(), ShLogError> {
+        let mut inner = self.inner.lock().unwrap();
+
+        let replacement_log = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.log_path)?;
+        let replacement_idx = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.idx_path)?;
+
+        let old_log = std::mem::replace(&mut inner.log, BufWriter::new(replacement_log));
+        let old_idx = std::mem::replace(&mut inner.idx, BufWriter::new(replacement_idx));
+        let _ = old_log.into_parts();
+        let _ = old_idx.into_parts();
+
+        // Keep trying every operation after the first error. A rollback error is
+        // fatal to the caller, but best-effort completion still minimizes the
+        // amount of mixed state left for diagnosis/recovery.
+        let mut first_error = None;
+        let mut record = |result: io::Result<()>| {
+            if let Err(error) = result
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        };
+
+        record(inner.log.get_ref().set_len(checkpoint.log_len));
+        record(inner.idx.get_ref().set_len(checkpoint.idx_len));
+        record(inner.log.get_ref().sync_data());
+        record(inner.idx.get_ref().sync_data());
+        record(
+            inner
+                .log
+                .seek(SeekFrom::Start(checkpoint.log_len))
+                .map(|_| ()),
+        );
+        record(
+            inner
+                .idx
+                .seek(SeekFrom::Start(checkpoint.idx_len))
+                .map(|_| ()),
+        );
+
+        if let Some(error) = first_error {
+            return Err(ShLogError::Io(error));
+        }
+
+        inner.log_len = checkpoint.log_len;
+        match checkpoint.range {
+            None => inner.map.clear(),
+            Some((_, last)) if last < u32::MAX => {
+                inner.map.split_off(&(last + 1));
+            }
+            Some(_) => {}
+        }
+        inner.range = checkpoint.range;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_append(&self) {
+        self.fail_next_append.store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_append_after_log_sync(&self) {
+        self.fail_next_append_after_log_sync
+            .store(true, Ordering::SeqCst);
     }
 
     /// Append one entry with EOS SHiP header.
@@ -325,6 +452,13 @@ impl StateHistoryLog {
     /// handles a log/index mismatch either way — but then `Ok(())`
     /// no longer implies the block survives a power loss.
     pub fn append(&self, block_id: Id, payload: &[u8]) -> Result<(), ShLogError> {
+        #[cfg(test)]
+        if self.fail_next_append.swap(false, Ordering::SeqCst) {
+            return Err(ShLogError::Io(io::Error::other(
+                "injected state-history append failure",
+            )));
+        }
+
         let block_num = num_from_block_id(&block_id);
         let mut inner = self.inner.lock().unwrap();
 
@@ -356,6 +490,16 @@ impl StateHistoryLog {
         inner.log.write_all(payload)?;
         inner.log.flush()?;
         inner.log.get_ref().sync_data()?;
+
+        #[cfg(test)]
+        if self
+            .fail_next_append_after_log_sync
+            .swap(false, Ordering::SeqCst)
+        {
+            return Err(ShLogError::Io(io::Error::other(
+                "injected state-history append failure after log sync",
+            )));
+        }
 
         // Index record only after the log entry is durable.
         inner.idx.write_all(&block_num.to_le_bytes())?;
@@ -580,9 +724,9 @@ impl StateHistoryLog {
     /// at the snapshot height. Afterwards `range()` is `(N, N)` where `N` is
     /// `block_id`'s height, so a restart reconstructs `last_accepted` from the
     /// snapshot's block, and the next accepted block (`N + 1`) appends
-    /// contiguously. Uses the same tmp-write + atomic-rename as `prune_locked`,
-    /// so a crash mid-rebase leaves either the old log or the new one, never a
-    /// torn mix.
+    /// contiguously. Both replacement files are made durable before publication.
+    /// The log and index require separate renames, so startup validates the pair
+    /// and rebuilds a stale index if a crash exposes different generations.
     pub fn reset_to(&self, block_id: Id, payload: &[u8]) -> Result<(), ShLogError> {
         let mut inner = self.inner.lock().unwrap();
         let block_num = num_from_block_id(&block_id);
@@ -708,6 +852,27 @@ impl StateHistoryLog {
 }
 
 /* -------------------- scan (header-aware) -------------------- */
+
+fn rebuild_index(
+    log_file: &mut File,
+    idx_file: &mut File,
+    expect_magic: u64,
+) -> Result<BTreeMap<u32, u64>, ShLogError> {
+    let entries = scan_entries(log_file, 0, expect_magic)?;
+    idx_file.set_len(0)?;
+    idx_file.seek(SeekFrom::Start(0))?;
+    let mut map = BTreeMap::new();
+    {
+        let mut writer = BufWriter::new(&mut *idx_file);
+        for (block, pos) in entries {
+            writer.write_all(&block.to_le_bytes())?;
+            writer.write_all(&pos.to_le_bytes())?;
+            map.insert(block, pos);
+        }
+        writer.flush()?;
+    }
+    Ok(map)
+}
 
 /// Scan entries from `start` to end of file, truncating a torn tail.
 /// Returns (block_num, offset) pairs in file order. A wrong magic
@@ -1063,6 +1228,59 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_rollback_removes_appends_from_memory_and_disk() {
+        let (dir, magic) = setup("rollback");
+        let log = StateHistoryLog::open_with_magic(dir.path(), "block_log", magic).unwrap();
+        let original_range = log.range().unwrap();
+        let checkpoint = log.checkpoint().unwrap();
+        let appended = original_range.1 + 1;
+
+        log.append(make_id(appended, 0xBC), b"must be rolled back")
+            .unwrap();
+        assert_eq!(log.range().unwrap().1, appended);
+        assert_eq!(log.read_block(appended).unwrap(), b"must be rolled back");
+
+        log.rollback_to(&checkpoint).unwrap();
+        assert_eq!(log.range().unwrap(), original_range);
+        assert!(matches!(
+            log.read_block(appended),
+            Err(ShLogError::NotFound(block)) if block == appended
+        ));
+
+        // Also cover the harder case: the data entry reached disk, but append
+        // failed before its index/in-memory publication.
+        log.fail_next_append_after_log_sync();
+        assert!(
+            log.append(make_id(appended, 0xBE), b"durable orphan")
+                .is_err()
+        );
+        assert_eq!(log.range().unwrap(), original_range);
+        assert_eq!(
+            parse_raw(&dir.log_path(), magic).last().unwrap().0,
+            appended
+        );
+        log.rollback_to(&checkpoint).unwrap();
+        assert_eq!(
+            parse_raw(&dir.log_path(), magic).last().unwrap().0,
+            original_range.1
+        );
+
+        // The restored writers remain usable at the old tail.
+        log.append(make_id(appended, 0xBD), b"replacement").unwrap();
+        assert_eq!(log.read_block(appended).unwrap(), b"replacement");
+        drop(log);
+
+        // Reopening must not recover the discarded entry from either file.
+        let reopened = StateHistoryLog::open_with_magic(dir.path(), "block_log", magic).unwrap();
+        assert_eq!(reopened.range().unwrap().1, appended);
+        assert_eq!(reopened.read_block(appended).unwrap(), b"replacement");
+        assert_eq!(
+            std::fs::metadata(dir.idx_path()).unwrap().len(),
+            (original_range.1 - original_range.0 + 2) as u64 * IDX_RECORD_SIZE
+        );
+    }
+
+    #[test]
     fn prune_keep_last_preserves_format_and_offsets() {
         let (dir, magic) = setup("prune");
         let log = StateHistoryLog::open_with_magic(dir.path(), "block_log", magic).unwrap();
@@ -1191,6 +1409,34 @@ mod tests {
             vec![100, 101]
         );
         assert_eq!(log.read_block(100).unwrap(), payload);
+    }
+
+    #[test]
+    fn open_rebuilds_old_index_paired_with_new_rebased_log() {
+        let (dir, magic) = setup("reset-crash-pair");
+        let payload = b"synced-block-100";
+        let old_index;
+        {
+            let log = StateHistoryLog::open_with_magic(dir.path(), "block_log", magic).unwrap();
+            old_index = std::fs::read(dir.idx_path()).unwrap();
+            log.reset_to(make_id(100, 7), payload).unwrap();
+        }
+
+        // Simulate a crash after reset_to's log rename but before its index
+        // rename: the durable paths expose the new one-entry log and old index.
+        std::fs::write(dir.idx_path(), old_index).unwrap();
+
+        let recovered = StateHistoryLog::open_with_magic(dir.path(), "block_log", magic).unwrap();
+        assert_eq!(recovered.range(), Some((100, 100)));
+        assert_eq!(recovered.read_block(100).unwrap(), payload);
+        assert!(matches!(
+            recovered.read_block(1),
+            Err(ShLogError::NotFound(1))
+        ));
+        assert_eq!(
+            std::fs::metadata(dir.idx_path()).unwrap().len(),
+            IDX_RECORD_SIZE
+        );
     }
 
     #[test]

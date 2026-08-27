@@ -4,7 +4,7 @@
 //! owns the wire envelope around those bytes: a small self-describing header and
 //! checksum so a transferred snapshot can be validated before installation.
 //!
-//! The envelope is deliberately not the Avalanche state-summary commitment: the
+//! The envelope is deliberately not the MetalGo state-summary commitment: the
 //! summary id a peer agrees on is the accepted block id (canonical across
 //! nodes), while these bytes are the physical payload that moves out of band.
 //! Two honest nodes that built the same chain hold logically-equal state but
@@ -66,6 +66,9 @@ pub fn peek_header(bytes: &[u8]) -> Result<SnapshotHeader, ChainError> {
             "snapshot version {version} unsupported (expected {SNAPSHOT_VERSION})"
         )));
     }
+    if bytes[6..8] != [0, 0] {
+        return Err(bad("snapshot reserved header bits are non-zero".into()));
+    }
     let revision = i64::from_le_bytes(bytes[8..16].try_into().unwrap());
     let payload_len = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
     let mut payload_sha256 = [0u8; 32];
@@ -121,6 +124,16 @@ pub fn sparse_begin(logical_len: u64) -> Vec<u8> {
     logical_len.to_le_bytes().to_vec()
 }
 
+/// Return the arena size declared by a sparse payload without expanding it.
+/// Restore compares this with the already-open local arena before creating a
+/// staged file, so an untrusted payload cannot request an arbitrary sparse size.
+pub fn sparse_logical_len(payload: &[u8]) -> Result<u64, ChainError> {
+    if payload.len() < 8 {
+        return Err(bad("sparse: missing length header".into()));
+    }
+    Ok(u64::from_le_bytes(payload[0..8].try_into().unwrap()))
+}
+
 /// Append the non-zero runs of `chunk` — which begins at absolute offset `base`
 /// in the file — to `payload`. `base` must be block-aligned (callers feed
 /// block-aligned chunks except the final short one), so runs from consecutive
@@ -158,10 +171,7 @@ pub fn sparse_expand(
     payload: &[u8],
     mut write_run: impl FnMut(u64, &[u8]) -> std::io::Result<()>,
 ) -> Result<u64, ChainError> {
-    if payload.len() < 8 {
-        return Err(bad("sparse: missing length header".into()));
-    }
-    let logical_len = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+    let logical_len = sparse_logical_len(payload)?;
     let mut pos = 8usize;
     let mut previous_end = 0u64;
     while pos < payload.len() {
@@ -241,6 +251,13 @@ mod tests {
         // version lives at offset 4..6
         bytes[4] = 0xFF;
         bytes[5] = 0xFF;
+        assert!(decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_nonzero_reserved_header_bits() {
+        let mut bytes = encode(1, b"payload");
+        bytes[6] = 1;
         assert!(decode(&bytes).is_err());
     }
 
@@ -365,6 +382,26 @@ mod tests {
         payload.extend_from_slice(&0u64.to_le_bytes());
         payload.extend_from_slice(&64u64.to_le_bytes());
         payload.extend_from_slice(&[1u8; 8]); // claims 64, only 8 present
+        assert!(sparse_expand(&payload, |_, _| Ok(())).is_err());
+    }
+
+    #[test]
+    fn sparse_expand_rejects_overlapping_runs() {
+        let mut payload = sparse_begin(32);
+        payload.extend_from_slice(&10u64.to_le_bytes());
+        payload.extend_from_slice(&5u64.to_le_bytes());
+        payload.extend_from_slice(&[1u8; 5]);
+        payload.extend_from_slice(&14u64.to_le_bytes());
+        payload.extend_from_slice(&1u64.to_le_bytes());
+        payload.push(2);
+        assert!(sparse_expand(&payload, |_, _| Ok(())).is_err());
+    }
+
+    #[test]
+    fn sparse_expand_rejects_unrepresentable_or_overflowing_run_length() {
+        let mut payload = sparse_begin(u64::MAX);
+        payload.extend_from_slice(&0u64.to_le_bytes());
+        payload.extend_from_slice(&u64::MAX.to_le_bytes());
         assert!(sparse_expand(&payload, |_, _| Ok(())).is_err());
     }
 }

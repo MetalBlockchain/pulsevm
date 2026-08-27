@@ -9,3 +9,5 @@ CMakeCache.txt
 CMakeFiles
 install/
 plugins/build/
+
+.claude/*

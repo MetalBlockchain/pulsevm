@@ -79,7 +79,15 @@ impl ProducerSchedule {
                 declared, MAX_PRODUCERS
             )));
         }
-        Self::read(bytes, &mut 0)
+        let mut pos = 0usize;
+        let schedule = Self::read(bytes, &mut pos)?;
+        if pos != bytes.len() {
+            return Err(ReadError::CustomError(format!(
+                "packed schedule has {} trailing byte(s)",
+                bytes.len() - pos
+            )));
+        }
+        Ok(schedule)
     }
 }
 
@@ -137,5 +145,17 @@ mod tests {
     fn read_bounded_rejects_oversized_buffer() {
         let bytes = vec![0u8; MAX_SCHEDULE_BYTES as usize + 1];
         assert!(ProducerSchedule::read_bounded(&bytes).is_err());
+    }
+
+    #[test]
+    fn read_bounded_rejects_trailing_bytes() {
+        let mut packed = ProducerSchedule {
+            version: 3,
+            producers: vec![key("alice")],
+        }
+        .pack()
+        .unwrap();
+        packed.push(0);
+        assert!(ProducerSchedule::read_bounded(&packed).is_err());
     }
 }

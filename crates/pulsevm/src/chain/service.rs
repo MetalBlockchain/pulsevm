@@ -32,6 +32,7 @@ use pulsevm_core::{
     id::Id,
     mempool::Mempool,
     name::Name,
+    protocol_features::PROTOCOL_VERSION,
     time::{
         TimePoint,
         seconds,
@@ -317,7 +318,7 @@ impl RpcService {
         let controller = self.controller.clone();
         let metrics = self.admission_metrics.clone();
         let trx_for_exec = packed_trx.clone();
-        tokio::task::spawn_blocking(move || {
+        let execution = tokio::task::spawn_blocking(move || {
             let pending_block_timestamp = TimePoint::now().into();
             match admission_state {
                 Some(state) => {
@@ -348,7 +349,14 @@ impl RpcService {
         .await
         .map_err(|e| {
             ChainError::InternalError(format!("transaction execution task failed: {e}"))
-        })??;
+        })?;
+        match execution {
+            Ok(_) => {}
+            Err(error) if error.is_fatal_consistency() => {
+                crate::abort_on_fatal_consistency("transaction admission", &error)
+            }
+            Err(error) => return Err(error),
+        }
 
         let lock_started = Instant::now();
         let mut mempool = self.mempool.write().await;
@@ -532,6 +540,17 @@ impl RpcServer for RpcService {
 
         Ok(GetInfoResponse {
             server_version: "d133c641".to_owned(),
+            protocol_version: controller.protocol_version(head_block.block_num()),
+            supported_protocol_version: PROTOCOL_VERSION,
+            protocol_upgrade_schedule_hash: hex::encode(
+                controller.protocol_upgrade_schedule_hash(),
+            ),
+            next_protocol_upgrade: controller
+                .next_protocol_upgrade(head_block.block_num())
+                .map(|upgrade| crate::api::ProtocolUpgradeInfo {
+                    protocol_version: upgrade.protocol_version,
+                    activation_height: upgrade.activation_height,
+                }),
             server_time: TimePoint::now().into(),
             chain_id: controller.chain_id().clone(),
             head_block_num: head_block.block_num(),
@@ -775,6 +794,8 @@ mod tests {
 
     const GENESIS_KEY: &str = "PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez";
     const CHAIN_ID: &str = "c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6";
+    const EMPTY_PROTOCOL_SCHEDULE_HASH: &str =
+        "bd592e76c0fd69a5a57fe16bb4db1a26d80d7b66c16b760e44207008c07d5d7c";
 
     fn genesis_bytes(key: &PrivateKey) -> Vec<u8> {
         // Mirrors the controller test genesis: point-denominated CPU budgets and a
@@ -855,6 +876,18 @@ mod tests {
         Id,
         tempfile::TempDir,
     ) {
+        service_with_genesis_and_upgrades(&[])
+    }
+
+    fn service_with_genesis_and_upgrades(
+        upgrade_bytes: &[u8],
+    ) -> (
+        RpcService,
+        Arc<RwLock<Mempool>>,
+        PrivateKey,
+        Id,
+        tempfile::TempDir,
+    ) {
         let genesis_key = PrivateKey::from_str(GENESIS_KEY).unwrap();
         let chain_id = Id::from_str(CHAIN_ID).unwrap();
         let temp = tempfile::tempdir().unwrap();
@@ -867,10 +900,11 @@ mod tests {
         .to_string()
         .into_bytes();
         controller
-            .initialize(
+            .initialize_with_protocol_upgrades(
                 &chain_id,
                 &config_bytes,
                 &genesis_bytes(&genesis_key),
+                upgrade_bytes,
                 temp.path().to_str().unwrap(),
             )
             .unwrap();
@@ -884,6 +918,58 @@ mod tests {
         );
         service.set_admission_state(admission_state);
         (service, mempool, genesis_key, chain_id, temp)
+    }
+
+    #[tokio::test]
+    async fn get_info_reports_and_serializes_accepted_protocol_state() {
+        let (service, _mempool, _genesis_key, _chain_id, _temp) = service_with_genesis();
+
+        let response = service.get_info().await.unwrap();
+        assert_eq!(response.protocol_version, 1);
+        assert_eq!(response.supported_protocol_version, PROTOCOL_VERSION);
+        assert_eq!(
+            response.protocol_upgrade_schedule_hash,
+            EMPTY_PROTOCOL_SCHEDULE_HASH
+        );
+        assert!(response.next_protocol_upgrade.is_none());
+        assert_eq!(response.head_block_num, 1);
+
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["protocol_version"], json!(1));
+        assert_eq!(json["supported_protocol_version"], json!(PROTOCOL_VERSION));
+        assert_eq!(
+            json["protocol_upgrade_schedule_hash"],
+            json!(EMPTY_PROTOCOL_SCHEDULE_HASH)
+        );
+        assert_eq!(json["next_protocol_upgrade"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn admission_rejects_transaction_targeting_unsupported_protocol_activation() {
+        let unsupported_version = PROTOCOL_VERSION + 1;
+        let upgrade_bytes = format!(
+            r#"{{"protocol_upgrades":[{{"protocol_version":{},"activation_height":2}}]}}"#,
+            unsupported_version
+        );
+        let (service, mempool, genesis_key, chain_id, _temp) =
+            service_with_genesis_and_upgrades(upgrade_bytes.as_bytes());
+
+        let transaction = newaccount_tx(&genesis_key, &genesis_key, "alice", &chain_id);
+        let error = service
+            .admit_transaction(transaction.clone())
+            .await
+            .expect_err("unsupported activation must reject admission");
+
+        assert!(
+            error.to_string().contains(&format!(
+                "protocol version {unsupported_version} is unsupported by this binary"
+            )),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !mempool.read().await.contains(transaction.id()),
+            "a transaction targeting an unsupported protocol block must not enter the mempool"
+        );
     }
 
     async fn wait_for_batch_detach(mempool: &Arc<RwLock<Mempool>>) {

@@ -58,10 +58,12 @@ things hold:
 4. **Metering is unchanged** — `COST_FUNCTION` + the metering middleware live in
    our code, pinned, independent of LLVM.
 
-**Recommendation:** treat any wasmer/LLVM version bump as a consensus change —
-the versions are pinned to exact `7.2.0` in `Cargo.toml`; before adopting a new
-one, re-run the differential replay. The feature test is the tripwire for the
-most likely silent regression.
+**Recommendation:** treat any wasmer/LLVM version change as consensus-risky. The
+current `Cargo.lock` resolves Wasmer to `7.2.0`; before changing that resolution
+or LLVM, re-run the differential replay. If the change affects any
+consensus-observable behavior, release it behind a
+[protocol feature](./protocol-features.md). The feature test is the tripwire for
+the most likely silent regression.
 
 ## 3. Is the floating-point logic deterministic?
 

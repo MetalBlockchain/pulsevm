@@ -48,6 +48,11 @@ use chain::{
     RpcService,
 };
 
+#[allow(dead_code)]
+fn abort_on_fatal_consistency(operation: &str, error: &pulsevm_core::ChainError) -> ! {
+    panic!("fatal consistency failure during {operation}: {error}");
+}
+
 const GENESIS_KEY: &str = "PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez";
 const CHAIN_ID: &str = "c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6";
 
