@@ -5373,8 +5373,7 @@ mod tests {
             chain_id,
         )?);
         let mut block = producer.build_block(&mut p_mempool).await?;
-        block.signed_block_header.header.timestamp =
-            *producer.last_accepted_block().timestamp();
+        block.signed_block_header.header.timestamp = *producer.last_accepted_block().timestamp();
         let digest = block.signed_block_header.header.sig_digest()?;
         block.signed_block_header.signature = private_key.sign(&digest)?;
 
