@@ -631,13 +631,7 @@ impl Controller {
         let mut transaction_receipts: VecDeque<TransactionReceipt> = VecDeque::new();
         let mut transaction_traces: Vec<TransactionTrace> = Vec::new();
         let mut action_receipt_digests: VecDeque<Digest> = VecDeque::new();
-        let timestamp: BlockTimestamp = TimePoint::now().into();
         let block_status = BlockStatus::Building;
-
-        // The timer also removes expired entries, but build against the exact
-        // timestamp committed to this candidate block so a direct build call
-        // cannot select an expired transaction.
-        mempool.prune_expired(&timestamp.to_time_point());
 
         // Transactions already present in a verified-but-not-yet-accepted block
         // must not be included again. At build time the earlier block has not
@@ -660,6 +654,23 @@ impl Controller {
         // Build on top of preferred: reconcile the pending chain so the database
         // holds the preferred state, reusing any already-executed prefix.
         self.replay_accepted_state_to(self.preferred_id, &block_status, mempool)?;
+
+        // Block timestamps are 500 ms slots and must strictly advance from the
+        // parent. A fast local producer can build two blocks in one slot, so
+        // advance to the first slot after the parent when wall-clock time has
+        // not moved far enough yet.
+        let wall_clock_timestamp: BlockTimestamp = TimePoint::now().into();
+        let parent_timestamp = self.timestamp_for_parent(&self.preferred_id)?;
+        let timestamp = BlockTimestamp::new(
+            wall_clock_timestamp
+                .slot()
+                .max(parent_timestamp.slot().saturating_add(1)),
+        );
+
+        // The timer also removes expired entries, but build against the exact
+        // timestamp committed to this candidate block so a direct build call
+        // cannot select an expired transaction.
+        mempool.prune_expired(&timestamp.to_time_point());
 
         let mut db = self.db.clone();
         db.arena_start_undo_session(); // the block session; retained on the pending chain
@@ -839,6 +850,22 @@ impl Controller {
         )))
     }
 
+    fn timestamp_for_parent(&self, parent_id: &Id) -> Result<BlockTimestamp, ChainError> {
+        if *parent_id == self.last_accepted_block_id {
+            return Ok(*self.last_accepted_block.timestamp());
+        }
+
+        self.verified_blocks
+            .get(parent_id)
+            .map(|block| *block.timestamp())
+            .ok_or_else(|| {
+                ChainError::BlockError(format!(
+                    "cannot resolve timestamp: parent {} is unknown",
+                    parent_id
+                ))
+            })
+    }
+
     // Test/helper: make a schedule the active one directly, bumping the version.
     // Production activation goes through `accept_block`, which reads the schedule
     // from the accepted block's header so it matches what the block log carries.
@@ -970,6 +997,12 @@ impl Controller {
         // reach the same verdict regardless of accept timing.
         block.validate_syntactically(&self.db)?;
         let parent_schedule = self.schedule_active_for_parent(block.previous_id())?;
+        let parent_timestamp = self.timestamp_for_parent(block.previous_id())?;
+        let now_timestamp: BlockTimestamp = TimePoint::now().into();
+        block
+            .signed_block_header
+            .header
+            .validate_timestamp(&parent_timestamp, &now_timestamp)?;
         self.verify_block_signature(block, &parent_schedule)?;
         self.block_active_schedule = parent_schedule.clone();
 
@@ -2087,6 +2120,7 @@ mod tests {
 
     use crate::{
         ACTIVE_NAME,
+        block::MAX_FUTURE_BLOCK_TIME_SLOTS,
         chain::{
             asset::{
                 Asset,
@@ -4601,6 +4635,60 @@ mod tests {
 
         validator.verify_block(&block, &mut v_mempool).await?;
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_block_with_non_monotonic_timestamp() -> Result<(), ChainError> {
+        let (mut producer, private_key, chain_id, _p_temp) = init_test_controller()?;
+        let mut p_mempool = Mempool::new();
+        p_mempool.add_transaction(create_account(
+            &private_key,
+            Name::from_str("testapi")?,
+            chain_id,
+        )?);
+        let mut block = producer.build_block(&mut p_mempool).await?;
+        block.signed_block_header.header.timestamp =
+            *producer.last_accepted_block().timestamp();
+        let digest = block.signed_block_header.header.sig_digest()?;
+        block.signed_block_header.signature = private_key.sign(&digest)?;
+
+        let (mut validator, _pk, _cid, _v_temp) = init_test_controller()?;
+        let mut v_mempool = Mempool::new();
+        let error = validator
+            .verify_block(&block, &mut v_mempool)
+            .await
+            .expect_err("a block timestamp equal to its parent must be rejected");
+        assert!(error.to_string().contains("not after parent timestamp"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_block_timestamp_too_far_in_future() -> Result<(), ChainError> {
+        let (mut producer, private_key, chain_id, _p_temp) = init_test_controller()?;
+        let mut p_mempool = Mempool::new();
+        p_mempool.add_transaction(create_account(
+            &private_key,
+            Name::from_str("testapi")?,
+            chain_id,
+        )?);
+        let mut block = producer.build_block(&mut p_mempool).await?;
+        let now: BlockTimestamp = TimePoint::now().into();
+        block.signed_block_header.header.timestamp = BlockTimestamp::new(
+            now.slot()
+                .saturating_add(MAX_FUTURE_BLOCK_TIME_SLOTS)
+                .saturating_add(1),
+        );
+        let digest = block.signed_block_header.header.sig_digest()?;
+        block.signed_block_header.signature = private_key.sign(&digest)?;
+
+        let (mut validator, _pk, _cid, _v_temp) = init_test_controller()?;
+        let mut v_mempool = Mempool::new();
+        let error = validator
+            .verify_block(&block, &mut v_mempool)
+            .await
+            .expect_err("a block too far ahead of local time must be rejected");
+        assert!(error.to_string().contains("too far in the future"));
         Ok(())
     }
 
