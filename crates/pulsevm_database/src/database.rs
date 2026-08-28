@@ -46,6 +46,8 @@ use crate::{
     WaitWeight,
 };
 use pulsevm_billable_size::billable_size_v;
+use pulsevm_crypto::AuthorityPublicKey;
+#[cfg(test)]
 use pulsevm_crypto::k1::K1PublicKey;
 
 /// Field-for-field snapshot of an `account_metadata_object` read back from the
@@ -318,7 +320,7 @@ fn decode_authority(blob: &[u8]) -> Result<Authority, ChainError> {
     for _ in 0..nkeys {
         let len = rd_u32(blob, &mut pos)? as usize;
         let key_bytes = take(blob, &mut pos, len)?;
-        let key = K1PublicKey::from_packed(key_bytes)
+        let key = AuthorityPublicKey::from_packed(key_bytes)
             .map_err(|e| ChainError::InternalError(format!("authority key decode: {e}")))?;
         let weight = rd_u16(blob, &mut pos)?;
         keys.push(KeyWeight { key, weight });
@@ -3565,7 +3567,7 @@ mod tests {
                 .expect("parse pubkey");
         let auth = Authority {
             threshold: 2,
-            keys: vec![KeyWeight { key, weight: 1 }],
+            keys: vec![KeyWeight::new(key, 1)],
             accounts: vec![PermissionLevelWeight {
                 permission: PermissionLevel {
                     actor: name_u64("alice"),
@@ -3602,6 +3604,28 @@ mod tests {
         assert_eq!(decoded.waits[0].weight, 4);
     }
 
+    #[test]
+    fn webauthn_authority_round_trips_through_arena_blob() {
+        let key = AuthorityPublicKey::WebAuthn {
+            point: [
+                3, 0x6b, 0x17, 0xd1, 0xf2, 0xe1, 0x2c, 0x42, 0x47, 0xf8, 0xbc, 0xe6, 0xe5, 0x63,
+                0xa4, 0x40, 0xf2, 0x77, 0x03, 0x7d, 0x81, 0x2d, 0xeb, 0x33, 0xa0, 0xf4, 0xa1, 0x39,
+                0x45, 0xd8, 0x98, 0xc2, 0x96,
+            ],
+            user_presence: 2,
+            rpid: "webauthn.example".into(),
+        };
+        let authority = Authority::new(1, vec![KeyWeight::new(key.clone(), 1)], vec![], vec![]);
+        let blob = encode_authority(&authority);
+        let decoded = decode_authority(&blob).unwrap();
+        assert_eq!(decoded, authority);
+        assert_eq!(decoded.keys[0].key, key);
+        assert_eq!(
+            authority_blob_billable_size(&blob),
+            Some(billable_size_v::<KeyWeight>() as i64 + 52)
+        );
+    }
+
     /// The blob billable-size parser reproduces `shared_authority::get_billable_size`
     /// over all three components: a key (whose packed size it must skip exactly), an
     /// account weight, and a wait. A wrong key-length skip would misalign the
@@ -3619,7 +3643,7 @@ mod tests {
         let key_len = key.to_packed().len() as i64;
         let auth = Authority {
             threshold: 2,
-            keys: vec![KeyWeight { key, weight: 1 }],
+            keys: vec![KeyWeight::new(key, 1)],
             accounts: vec![PermissionLevelWeight {
                 permission: PermissionLevel {
                     actor: name_u64("bob"),

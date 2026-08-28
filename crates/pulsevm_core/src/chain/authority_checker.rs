@@ -3,13 +3,12 @@ use std::collections::{
     HashMap,
 };
 
+use pulsevm_crypto::AuthorityPublicKey;
 use pulsevm_database::{
     DbRead,
     Microseconds,
 };
 use pulsevm_error::ChainError;
-
-use crate::crypto::PublicKey;
 
 use super::authority::{
     Authority,
@@ -20,10 +19,50 @@ use super::authority::{
 
 pub struct AuthorityChecker<'a> {
     recursion_depth_limit: u16,
-    provided_keys: &'a BTreeSet<PublicKey>,
+    provided_keys: &'a BTreeSet<AuthorityPublicKey>,
     provided_delay: Microseconds,
-    used_keys: BTreeSet<PublicKey>,
+    used_keys: BTreeSet<AuthorityPublicKey>,
     cached_permissions: HashMap<PermissionLevel, PermissionCacheStatus>,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use pulsevm_crypto::AuthorityPublicKey;
+    use pulsevm_database::Microseconds;
+
+    use super::{
+        AuthorityChecker,
+        KeyWeight,
+    };
+
+    #[test]
+    fn matches_r1_and_webauthn_authority_keys_without_curve_aliasing() {
+        let point = [
+            3, 0x6b, 0x17, 0xd1, 0xf2, 0xe1, 0x2c, 0x42, 0x47, 0xf8, 0xbc, 0xe6, 0xe5, 0x63, 0xa4,
+            0x40, 0xf2, 0x77, 0x03, 0x7d, 0x81, 0x2d, 0xeb, 0x33, 0xa0, 0xf4, 0xa1, 0x39, 0x45,
+            0xd8, 0x98, 0xc2, 0x96,
+        ];
+        let r1 = AuthorityPublicKey::R1(point);
+        let webauthn = AuthorityPublicKey::WebAuthn {
+            point,
+            user_presence: 1,
+            rpid: "example.com".into(),
+        };
+        let provided = BTreeSet::from([r1.clone(), webauthn.clone()]);
+        let permissions = BTreeSet::new();
+        let mut checker = AuthorityChecker::new(6, &provided, &permissions, Microseconds::new(0));
+
+        assert_eq!(checker.visit_key_weight(&KeyWeight::new(r1, 2)).unwrap(), 2);
+        assert_eq!(
+            checker
+                .visit_key_weight(&KeyWeight::new(webauthn, 3))
+                .unwrap(),
+            3
+        );
+        assert!(checker.all_keys_used());
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -36,7 +75,7 @@ enum PermissionCacheStatus {
 impl<'a> AuthorityChecker<'a> {
     pub fn new(
         recursion_depth_limit: u16,
-        provided_keys: &'a BTreeSet<PublicKey>,
+        provided_keys: &'a BTreeSet<AuthorityPublicKey>,
         provided_permissions: &'a BTreeSet<PermissionLevel>,
         provided_delay: Microseconds,
     ) -> Self {
@@ -66,7 +105,7 @@ impl<'a> AuthorityChecker<'a> {
         return *self.provided_keys == self.used_keys;
     }
 
-    pub fn used_keys(&self) -> &BTreeSet<PublicKey> {
+    pub fn used_keys(&self) -> &BTreeSet<AuthorityPublicKey> {
         &self.used_keys
     }
 
@@ -113,11 +152,8 @@ impl<'a> AuthorityChecker<'a> {
     }
 
     pub fn visit_key_weight(&mut self, key: &KeyWeight) -> Result<u16, ChainError> {
-        // KeyWeight now carries the pure-Rust K1 key directly.
-        let pub_key = PublicKey::new(key.key);
-
-        if self.provided_keys.contains(&pub_key) {
-            self.used_keys.insert(pub_key);
+        if self.provided_keys.contains(&key.key) {
+            self.used_keys.insert(key.key.clone());
             return Ok(key.weight);
         }
 

@@ -1,7 +1,12 @@
-//! Wire types that appear inside snapshot rows but have no equivalent in the
-//! workspace yet: the full `fc::crypto` public-key/signature variants (a live
-//! Antelope chain's permissions carry K1, R1 *and* WebAuthn keys, while
-//! `pulsevm_crypto` is deliberately K1-only) and a couple of fixed-width keys.
+//! Raw wire types that appear inside snapshot rows. Snapshot decoding keeps
+//! curve points unchecked so it can report malformed source rows; consumers
+//! can convert public keys into `pulsevm_crypto::AuthorityPublicKey` to perform
+//! canonical curve and WebAuthn validation.
+
+use pulsevm_crypto::{
+    AuthorityKeyError,
+    AuthorityPublicKey,
+};
 
 use pulsevm_serialization::{
     NumBytes,
@@ -63,6 +68,52 @@ impl SnapshotPublicKey {
         out[0] = tag;
         out[1..].copy_from_slice(point);
         out
+    }
+}
+
+impl TryFrom<&SnapshotPublicKey> for AuthorityPublicKey {
+    type Error = AuthorityKeyError;
+
+    fn try_from(value: &SnapshotPublicKey) -> Result<Self, Self::Error> {
+        let mut packed = Vec::with_capacity(value.num_bytes());
+        match value {
+            SnapshotPublicKey::K1(point) => {
+                packed.push(0);
+                packed.extend_from_slice(point);
+            }
+            SnapshotPublicKey::R1(point) => {
+                packed.push(1);
+                packed.extend_from_slice(point);
+            }
+            SnapshotPublicKey::WebAuthn(key) => {
+                packed.push(2);
+                packed.extend_from_slice(&key.key);
+                packed.push(key.user_presence);
+                let mut len = u32::try_from(key.rpid.len())
+                    .map_err(|_| AuthorityKeyError("WebAuthn RP ID is too long".into()))?;
+                loop {
+                    let mut byte = (len & 0x7f) as u8;
+                    len >>= 7;
+                    if len != 0 {
+                        byte |= 0x80;
+                    }
+                    packed.push(byte);
+                    if len == 0 {
+                        break;
+                    }
+                }
+                packed.extend_from_slice(key.rpid.as_bytes());
+            }
+        }
+        AuthorityPublicKey::from_packed(&packed)
+    }
+}
+
+impl TryFrom<SnapshotPublicKey> for AuthorityPublicKey {
+    type Error = AuthorityKeyError;
+
+    fn try_from(value: SnapshotPublicKey) -> Result<Self, Self::Error> {
+        Self::try_from(&value)
     }
 }
 
@@ -224,6 +275,24 @@ mod tests {
         assert_eq!(wa.rpid, "example.com");
         assert_eq!(wa.user_presence, 1);
         assert_eq!(key.num_bytes(), bytes.len());
+    }
+
+    #[test]
+    fn converts_a_snapshot_webauthn_key_to_the_canonical_authority_type() {
+        let key = SnapshotPublicKey::WebAuthn(WebAuthnPublicKey {
+            key: [
+                3, 0x6b, 0x17, 0xd1, 0xf2, 0xe1, 0x2c, 0x42, 0x47, 0xf8, 0xbc, 0xe6, 0xe5, 0x63,
+                0xa4, 0x40, 0xf2, 0x77, 0x03, 0x7d, 0x81, 0x2d, 0xeb, 0x33, 0xa0, 0xf4, 0xa1, 0x39,
+                0x45, 0xd8, 0x98, 0xc2, 0x96,
+            ],
+            user_presence: 1,
+            rpid: "example.com".into(),
+        });
+        let canonical = AuthorityPublicKey::try_from(&key).unwrap();
+        assert!(matches!(
+            canonical,
+            AuthorityPublicKey::WebAuthn { rpid, .. } if rpid == "example.com"
+        ));
     }
 
     #[test]

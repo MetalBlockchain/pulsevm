@@ -113,13 +113,13 @@ mod tests {
             name: Name::from_str("newaccount").unwrap(),
             owner: Authority::new(
                 1,
-                vec![KeyWeight {
-                    key: K1PublicKey::from_string(
+                vec![KeyWeight::new(
+                    K1PublicKey::from_string(
                         "PUB_K1_5bbkxaLdB5bfVZW6DJY8M74vwT2m61PqwywNUa5azfkJTvYa5H",
                     )
                     .unwrap(),
-                    weight: 1,
-                }],
+                    1,
+                )],
                 vec![PermissionLevelWeight {
                     permission: PermissionLevel {
                         actor: name!("bob"),

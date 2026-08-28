@@ -1,3 +1,4 @@
+use pulsevm_crypto::AuthorityPublicKey;
 use pulsevm_serialization::{
     Read,
     Write,
@@ -12,10 +13,7 @@ use wasmer::{
 use super::cost;
 use crate::{
     chain::wasm_runtime::WasmContext,
-    crypto::{
-        PublicKey,
-        Signature,
-    },
+    crypto::Signature,
 };
 
 pub fn assert_recover_key(
@@ -51,10 +49,10 @@ pub fn assert_recover_key(
     let pub_slice = pub_ptr.slice(&view, pub_len)?;
     let mut pubkey_bytes = vec![0u8; pub_len as usize];
     pub_slice.read_slice(&mut pubkey_bytes)?;
-    let pubkey = PublicKey::read(pubkey_bytes.as_slice(), &mut 0).map_err(|e| {
+    let pubkey = AuthorityPublicKey::read(pubkey_bytes.as_slice(), &mut 0).map_err(|e| {
         RuntimeError::new(format!("failed to read public key from wasm memory: {}", e))
     })?;
-    let recovered_pubkey = signature.recover_public_key(&digest)?;
+    let recovered_pubkey = signature.recover_authority_key(&digest)?;
 
     if recovered_pubkey != pubkey {
         return Err(RuntimeError::new(
@@ -95,7 +93,7 @@ pub fn recover_key(
             .try_into()
             .expect("digest buffer is exactly 32 bytes"),
     );
-    let public_key = signature.recover_public_key(&digest)?;
+    let public_key = signature.recover_authority_key(&digest)?;
     let packed_public_key = public_key
         .pack()
         .map_err(|e| RuntimeError::new(format!("failed to pack public key: {}", e)))?;

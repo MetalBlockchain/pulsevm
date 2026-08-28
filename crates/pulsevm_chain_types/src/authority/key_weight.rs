@@ -1,10 +1,7 @@
 use std::fmt;
 
 use pulsevm_billable_size::BillableSize;
-use pulsevm_crypto::{
-    FixedBytes,
-    k1::K1PublicKey,
-};
+use pulsevm_crypto::AuthorityPublicKey;
 use pulsevm_serialization::{
     NumBytes,
     Read,
@@ -23,15 +20,18 @@ use serde::{
     ser::SerializeStruct,
 };
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct KeyWeight {
-    pub key: K1PublicKey,
+    pub key: AuthorityPublicKey,
     pub weight: u16,
 }
 
 impl KeyWeight {
-    pub fn new(key: K1PublicKey, weight: u16) -> Self {
-        KeyWeight { key, weight }
+    pub fn new(key: impl Into<AuthorityPublicKey>, weight: u16) -> Self {
+        KeyWeight {
+            key: key.into(),
+            weight,
+        }
     }
 }
 
@@ -46,20 +46,13 @@ impl fmt::Debug for KeyWeight {
 
 impl NumBytes for KeyWeight {
     fn num_bytes(&self) -> usize {
-        // Add the number of bytes for the packed public key and the weight
-        34 + self.weight.num_bytes()
+        self.key.num_bytes() + self.weight.num_bytes()
     }
 }
 
 impl Read for KeyWeight {
     fn read(bytes: &[u8], pos: &mut usize) -> Result<Self, pulsevm_serialization::ReadError> {
-        let packed_key = FixedBytes::<34>::read(bytes, pos)?;
-        let key = K1PublicKey::from_packed(packed_key.as_ref()).map_err(|e| {
-            pulsevm_serialization::ReadError::CustomError(format!(
-                "failed to parse public key in KeyWeight: {}",
-                e
-            ))
-        })?;
+        let key = AuthorityPublicKey::read(bytes, pos)?;
         let weight = u16::read(bytes, pos)?;
         Ok(KeyWeight { key, weight })
     }
@@ -67,8 +60,7 @@ impl Read for KeyWeight {
 
 impl Write for KeyWeight {
     fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), WriteError> {
-        let packed_key = FixedBytes::<34>(self.key.to_packed());
-        packed_key.write(bytes, pos)?;
+        self.key.write(bytes, pos)?;
         self.weight.write(bytes, pos)?;
         Ok(())
     }
@@ -142,7 +134,7 @@ impl<'de> Deserialize<'de> for KeyWeight {
                     .next_element()?
                     .ok_or_else(|| de::Error::invalid_length(1, &self))?;
 
-                let key = K1PublicKey::from_string(&key_str)
+                let key = AuthorityPublicKey::from_string(&key_str)
                     .map_err(|e| de::Error::custom(format!("invalid public key: {}", e)))?;
 
                 Ok(KeyWeight { key, weight })
@@ -170,7 +162,7 @@ impl<'de> Deserialize<'de> for KeyWeight {
                 }
 
                 let key_str = key.ok_or_else(|| de::Error::missing_field("key"))?;
-                let key = K1PublicKey::from_string(&key_str)
+                let key = AuthorityPublicKey::from_string(&key_str)
                     .map_err(|e| de::Error::custom(format!("invalid public key: {}", e)))?;
                 let weight = weight.ok_or_else(|| de::Error::missing_field("weight"))?;
 

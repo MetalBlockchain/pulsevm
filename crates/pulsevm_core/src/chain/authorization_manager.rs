@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 
+use pulsevm_crypto::AuthorityPublicKey;
 use pulsevm_database::{
     Authority,
     Database,
@@ -29,7 +30,6 @@ use crate::{
         UNLINKAUTH_NAME,
         UPDATEAUTH_NAME,
     },
-    crypto::PublicKey,
     transaction::Transaction,
     utils::pulse_assert,
 };
@@ -47,7 +47,7 @@ impl AuthorizationManager {
     pub fn check_authorization(
         db: &Database,
         actions: &Vec<Action>,
-        provided_keys: &BTreeSet<PublicKey>,
+        provided_keys: &BTreeSet<AuthorityPublicKey>,
         provided_permissions: &BTreeSet<PermissionLevel>,
         provided_delay: Microseconds,
         satisfied_authorizations: &BTreeSet<PermissionLevel>,
@@ -154,7 +154,7 @@ impl AuthorizationManager {
     pub fn check_permission_authorization(
         db: &Database,
         permission: PermissionLevel,
-        provided_keys: &BTreeSet<PublicKey>,
+        provided_keys: &BTreeSet<AuthorityPublicKey>,
         provided_permissions: &BTreeSet<PermissionLevel>,
         provided_delay: Microseconds,
         allow_unused_keys: bool,
@@ -194,9 +194,9 @@ impl AuthorizationManager {
     pub fn get_required_keys(
         db: &mut Database,
         trx: &Transaction,
-        candidate_keys: &BTreeSet<PublicKey>,
+        candidate_keys: &BTreeSet<AuthorityPublicKey>,
         provided_delay: Microseconds,
-    ) -> Result<BTreeSet<PublicKey>, ChainError> {
+    ) -> Result<BTreeSet<AuthorityPublicKey>, ChainError> {
         let chain_config = db.chain_config()?;
         let r = db.read()?;
         let provided_permissions = BTreeSet::<PermissionLevel>::new();
