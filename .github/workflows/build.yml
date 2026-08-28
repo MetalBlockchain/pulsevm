@@ -12,6 +12,10 @@ jobs:
   build:
     name: linux-${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
+    # Build against the oldest supported userspace. The host runner may be
+    # newer, but release binaries must remain loadable on Ubuntu 22.04
+    # (glibc 2.35).
+    container: ubuntu:22.04
 
     strategy:
       fail-fast: false
@@ -23,11 +27,36 @@ jobs:
             runner: ubuntu-24.04-arm
 
     steps:
-      - name: Configure LLVM APT repository
-        run: wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key|sudo apt-key add - && sudo echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" | sudo tee /etc/apt/sources.list.d/llvm.list
-
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y gcc-13 cmake zlib1g-dev pkg-config llvm-22-dev libpolly-22-dev
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y \
+            ca-certificates \
+            curl \
+            gcc-12 \
+            g++-12 \
+            git \
+            gnupg \
+            unzip \
+            wget
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | gpg --dearmor -o /usr/share/keyrings/llvm-snapshot.gpg
+          echo "deb [signed-by=/usr/share/keyrings/llvm-snapshot.gpg] https://apt.llvm.org/jammy/ llvm-toolchain-jammy-22 main" \
+            > /etc/apt/sources.list.d/llvm.list
+          apt-get update
+          apt-get install -y \
+            binutils \
+            build-essential \
+            cmake \
+            libpolly-22-dev \
+            libssl-dev \
+            libzstd-dev \
+            llvm-22-dev \
+            pkg-config \
+            zlib1g-dev \
+            zstd
 
       - name: Checkout source code
         uses: actions/checkout@v4
@@ -47,10 +76,21 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-${{ matrix.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ matrix.arch }}-jammy-llvm22-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build release artifact
-        run: LLVM_SYS_221_PREFIX=/usr/lib/llvm-22 cargo build --release --locked
+        env:
+          CC: gcc-12
+          CXX: g++-12
+          LLVM_SYS_221_PREFIX: /usr/lib/llvm-22
+        run: cargo build --release --locked
+
+      - name: Verify glibc compatibility
+        run: |
+          scripts/check-glibc-compat.sh 2.35 \
+            target/release/pulsevm \
+            target/release/pulse \
+            target/release/pulse-keosd
 
       - name: Upload pulsevm artifact
         uses: actions/upload-artifact@v4
