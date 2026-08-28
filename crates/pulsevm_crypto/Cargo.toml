@@ -10,5 +10,6 @@ sha2 = { version = "0.10", features = ["asm"] }
 secp256k1 = { version = "0.30", features = ["recovery", "global-context", "hashes", "rand"] }
 bs58 = "0.5"
 ripemd = "0.1"
+blst = "0.3"
 pulsevm_proc_macros = { path = "../pulsevm_proc_macros" }
 pulsevm_serialization = { path = "../pulsevm_serialization" }

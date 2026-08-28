@@ -12,7 +12,10 @@ use std::{
         Write as IoWrite,
     },
     path::Path,
-    sync::LazyLock,
+    sync::{
+        Arc,
+        LazyLock,
+    },
 };
 
 use crate::{
@@ -83,6 +86,11 @@ use crate::{
             TransactionResult,
         },
         utils::make_ratio,
+        warp::{
+            ValidatorSetSource,
+            WarpManager,
+            WarpSigner,
+        },
         wasm_runtime::WasmRuntime,
     },
     config::NodeConfig,
@@ -2424,6 +2432,39 @@ impl Controller {
 
     pub fn get_wasm_runtime(&self) -> &WasmRuntime {
         &self.wasm_runtime
+    }
+
+    /// Enable Avalanche Interchain Messaging (ICM / warp) on this chain.
+    ///
+    /// After this call, contracts can use the `pulse_send_warp_message` and
+    /// `pulse_verify_warp_message` host functions. The source chain id is this
+    /// chain's blockchain id (`chain_id`); `network_id` is the Avalanche network
+    /// id delivered at VM initialization.
+    ///
+    /// * `signer` — the validator's BLS key when it is available in-process
+    ///   (local/dev clusters). Pass `None` where MetalGo holds the key and signs
+    ///   remotely; outbound messages are still recorded for the node to sign.
+    /// * `validator_source` — supplies source subnets' validator sets for inbound
+    ///   verification. In production this is backed by MetalGo's validator-state
+    ///   service; a [`StaticValidatorSource`](crate::chain::warp::StaticValidatorSource)
+    ///   serves local clusters and tests.
+    ///
+    /// Must be called during initialization, before any block executes, so every
+    /// per-action `WasmRuntime` clone carries the manager.
+    pub fn configure_warp(
+        &mut self,
+        network_id: u32,
+        signer: Option<Arc<dyn WarpSigner>>,
+        validator_source: Arc<dyn ValidatorSetSource>,
+    ) {
+        let source_chain_id = self.chain_id.0.0;
+        let manager = Arc::new(WarpManager::new(
+            network_id,
+            source_chain_id,
+            signer,
+            validator_source,
+        ));
+        self.wasm_runtime.set_warp_manager(manager);
     }
 
     pub fn database(&self) -> Database {

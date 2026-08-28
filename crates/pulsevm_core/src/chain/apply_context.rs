@@ -63,6 +63,11 @@ struct ApplyContextInner {
     start: i64,                           // Start time in microseconds
     privileged: bool,
     account_ram_deltas: BTreeMap<Name, i64>, // RAM usage deltas for accounts
+    // Unsigned ICM/warp messages this action emitted (serialized
+    // `UnsignedMessage` bytes). Accumulated like `action_return_value` and drained
+    // after execution so the node can sign them and a relayer can carry them to
+    // the destination chain. See `chain::warp`.
+    emitted_warp_messages: Vec<Vec<u8>>,
     notified: VecDeque<(Name, u32)>,         // List of notified accounts
     inline_actions: Vec<u32>,                // List of inline actions
     context_free_inline_actions: Vec<u32>,   // List of context-free inline actions
@@ -125,6 +130,7 @@ impl ApplyContext {
                 start: Utc::now().timestamp_micros(),
                 privileged: false,
                 account_ram_deltas: BTreeMap::new(),
+                emitted_warp_messages: Vec::new(),
                 notified: VecDeque::new(),
                 inline_actions: Vec::new(),
                 context_free_inline_actions: Vec::new(),
@@ -2328,6 +2334,28 @@ impl ApplyContext {
         let mut inner = self.inner.write()?;
         inner.action_return_value = Some(value);
         Ok(())
+    }
+
+    /// Record an emitted ICM/warp message (serialized `UnsignedMessage` bytes) so
+    /// the node can sign it and a relayer can carry it onward. Called by the
+    /// `pulse_send_warp_message` host function.
+    pub fn emit_warp_message(&self, unsigned_bytes: Vec<u8>) -> Result<(), ChainError> {
+        let mut inner = self.inner.write()?;
+        inner.emitted_warp_messages.push(unsigned_bytes);
+        Ok(())
+    }
+
+    /// Take the warp messages emitted during this action, clearing the buffer.
+    /// The controller drains these after execution to feed the signing/relay path.
+    pub fn take_emitted_warp_messages(&self) -> Result<Vec<Vec<u8>>, ChainError> {
+        let mut inner = self.inner.write()?;
+        Ok(std::mem::take(&mut inner.emitted_warp_messages))
+    }
+
+    /// Read the emitted warp messages without clearing them (for tracing/tests).
+    pub fn emitted_warp_messages(&self) -> Result<Vec<Vec<u8>>, ChainError> {
+        let inner = self.inner.read()?;
+        Ok(inner.emitted_warp_messages.clone())
     }
 
     pub fn set_trace_return_value(&self, value: Vec<u8>) -> Result<(), ChainError> {

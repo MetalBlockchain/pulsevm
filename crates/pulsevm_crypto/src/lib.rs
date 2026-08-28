@@ -10,6 +10,14 @@ pub use fixed_bytes::FixedBytes;
 mod merkle_tree;
 pub use merkle_tree::merkle;
 
+pub mod bls;
+pub use bls::{
+    BlsError,
+    PublicKey as BlsPublicKey,
+    SecretKey as BlsSecretKey,
+    Signature as BlsSignature,
+};
+
 pub mod k1;
 pub use k1::{
     K1Error,

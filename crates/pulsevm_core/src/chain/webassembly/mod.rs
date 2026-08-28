@@ -42,6 +42,9 @@ pub use system::*;
 
 mod transaction;
 pub use transaction::*;
+
+mod warp;
+pub use warp::*;
 use wasmer::{
     FunctionEnvMut,
     MemoryView,

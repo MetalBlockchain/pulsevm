@@ -53,6 +53,11 @@ pub enum ChainError {
     /// consensus.
     #[error("deadline exceeded: {0}")]
     DeadlineError(String),
+    /// Cross-chain (Avalanche Interchain Messaging / warp) error: malformed
+    /// message, failed signature verification, insufficient validator weight, or
+    /// replay of an already-consumed message.
+    #[error("warp messaging error: {0}")]
+    WarpError(String),
 }
 
 impl ChainError {

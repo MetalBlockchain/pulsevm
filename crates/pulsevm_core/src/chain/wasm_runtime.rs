@@ -50,6 +50,7 @@ use crate::chain::{
     apply_context::ApplyContext,
     id::Id,
     name::Name,
+    warp::WarpManager,
     protocol_features::{
         ProtocolExecutionContext,
         ProtocolFeature,
@@ -198,6 +199,8 @@ use crate::chain::{
         pulse_assert_code,
         pulse_assert_message,
         pulse_exit,
+        pulse_send_warp_message,
+        pulse_verify_warp_message,
         read_action_data,
         read_transaction,
         recover_key,
@@ -255,6 +258,10 @@ pub struct WasmContext {
     // bill its own work against the same metering budget the wasm body spends.
     instance: Option<Instance>,
     return_value: Option<Bytes>,
+    // Cross-chain messaging entry point, present when the node was configured with
+    // its Avalanche network context. `None` on chains without ICM configured — the
+    // warp host functions then trap with a clear error.
+    warp_manager: Option<Arc<WarpManager>>,
 }
 
 impl WasmContext {
@@ -264,6 +271,7 @@ impl WasmContext {
         pending_block_timestamp: BlockTimestamp,
         context: ApplyContext,
         db: Database,
+        warp_manager: Option<Arc<WarpManager>>,
     ) -> Self {
         WasmContext {
             receiver: receiver.as_u64(),
@@ -274,7 +282,13 @@ impl WasmContext {
             memory: None,
             instance: None,
             return_value: None,
+            warp_manager,
         }
+    }
+
+    /// The cross-chain messaging manager, if ICM is configured on this node.
+    pub fn warp_manager(&self) -> Option<&Arc<WarpManager>> {
+        self.warp_manager.as_ref()
     }
 
     /// Deduct `amount` metering points for a host intrinsic's own work, so an
@@ -420,6 +434,10 @@ struct InnerWasmRuntime {
 #[derive(Clone)]
 pub struct WasmRuntime {
     inner: Arc<RwLock<InnerWasmRuntime>>,
+    // Cross-chain messaging manager, wired by the controller once the Avalanche
+    // network context is known. `None` until configured; propagated into every
+    // `WasmContext` so the warp host functions can reach it.
+    warp_manager: Option<Arc<WarpManager>>,
 }
 
 const COST_FUNCTION: fn(&Operator) -> u64 = |operator: &Operator| -> u64 {
@@ -470,7 +488,20 @@ impl WasmRuntime {
             inner: Arc::new(RwLock::new(InnerWasmRuntime {
                 code_cache: LruCache::new(NonZeroUsize::new(1024).unwrap()),
             })),
+            warp_manager: None,
         })
+    }
+
+    /// Attach the cross-chain messaging manager. Called by the controller after
+    /// it has the Avalanche network context (network id, blockchain id, signer,
+    /// validator source). Until set, the warp host functions trap.
+    pub fn set_warp_manager(&mut self, manager: Arc<WarpManager>) {
+        self.warp_manager = Some(manager);
+    }
+
+    /// The configured cross-chain messaging manager, if any.
+    pub fn warp_manager(&self) -> Option<&Arc<WarpManager>> {
+        self.warp_manager.as_ref()
     }
 
     // The wasm feature set we pin contract execution to. Left implicit,
@@ -565,6 +596,7 @@ impl WasmRuntime {
                 apply_context.pending_block_timestamp().clone(),
                 apply_context.clone(),
                 db.clone(),
+                self.warp_manager.clone(),
             );
             warm
         } else {
@@ -577,6 +609,7 @@ impl WasmRuntime {
                     apply_context.pending_block_timestamp().clone(),
                     apply_context.clone(),
                     db.clone(),
+                    self.warp_manager.clone(),
                 ),
             );
             let imports = imports! {
@@ -713,6 +746,9 @@ impl WasmRuntime {
                 "eosio_assert_code" => Function::new_typed_with_env(&mut store, &env, pulse_assert_code),
                 "pulse_exit" => Function::new_typed_with_env(&mut store, &env, pulse_exit),
                 "eosio_exit" => Function::new_typed_with_env(&mut store, &env, pulse_exit),
+                // Cross-chain messaging (Avalanche ICM / warp).
+                "pulse_send_warp_message" => Function::new_typed_with_env(&mut store, &env, pulse_send_warp_message),
+                "pulse_verify_warp_message" => Function::new_typed_with_env(&mut store, &env, pulse_verify_warp_message),
                 "abort" => Function::new_typed_with_env(&mut store, &env, abort),
                 "current_time" => Function::new_typed_with_env(&mut store, &env, current_time),
                 // Crypto functions

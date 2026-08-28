@@ -20,6 +20,7 @@ pub mod state_sync;
 pub mod transaction;
 pub mod transaction_context;
 pub mod utils;
+pub mod warp;
 pub mod wasm_runtime;
 mod webassembly;
 
