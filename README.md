@@ -78,6 +78,29 @@ PULSEVM_MIGRATION_CHECKPOINT=/tmp/pulsevm-xpr-migration.snapshot \
 scripts/run-local.sh
 ```
 
+On a Linux EC2 host, the resumable wrapper can prepare a raw Mainnet export,
+derive a disposable producer authority, and keep the five-node runner alive
+after the SSH session exits:
+
+```bash
+XPR_SNAPSHOT=/data/xpr/snapshot.bin \
+XPR_NODEOS=/data/XPRNetwork-core/build/programs/nodeos/nodeos \
+XPR_CORE=/data/XPRNetwork-core \
+METALGO_EXEC_PATH=../metalgo/build/metalgo \
+PULSEVM_EC2_RUN_DIR=/data/pulsevm-xpr \
+  scripts/run-xpr-mainnet-ec2.sh start
+
+scripts/run-xpr-mainnet-ec2.sh status
+scripts/run-xpr-mainnet-ec2.sh logs
+scripts/run-xpr-mainnet-ec2.sh stop
+```
+
+If conversion has already produced a checkpoint, set only
+`PULSEVM_MIGRATION_CHECKPOINT` and `METALGO_EXEC_PATH`. The wrapper verifies the
+matching manifest and derives a separate test-authority copy; it never modifies
+the canonical imported checkpoint. The runner control ports bind to loopback;
+keep the EC2 security group closed to unneeded inbound node ports as well.
+
 For a large imported checkpoint, use the companion runner branch
 `feat/pulsevm-checkpoint-startup` (commit `3d2e25d`), which allows up to two
 minutes for MetalGo to write its dynamic process-info file. The stock runner's

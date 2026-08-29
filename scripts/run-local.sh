@@ -27,6 +27,7 @@ PLUGIN_DIR="${PULSEVM_PLUGIN_DIR:-$BUILD_DIR/plugins}"
 NETWORK_RUNNER="${METAL_NETWORK_RUNNER_PATH:-$REPO/../metal-network-runner/bin/metal-network-runner}"
 RUNNER_PORT="${METAL_NETWORK_RUNNER_PORT:-:8080}"
 RUNNER_GATEWAY_PORT="${METAL_NETWORK_RUNNER_GATEWAY_PORT:-:8081}"
+RUNNER_ENDPOINT="${METAL_NETWORK_RUNNER_ENDPOINT:-0.0.0.0$RUNNER_PORT}"
 RUNNER_ROOT_DATA_DIR="${METAL_NETWORK_RUNNER_ROOT_DATA_DIR:-}"
 RUNNER_REASSIGN_PORTS_IF_USED="${METAL_NETWORK_RUNNER_REASSIGN_PORTS_IF_USED:-false}"
 MIGRATION_GENESIS=""
@@ -113,7 +114,7 @@ sleep 3
 
 echo "==> Launching a 5-node cluster running PulseVM"
 "$NETWORK_RUNNER" control start --log-level info \
-  --endpoint="0.0.0.0$RUNNER_PORT" \
+  --endpoint="$RUNNER_ENDPOINT" \
   --number-of-nodes=5 \
   --metalgo-path "$METALGO_EXEC_PATH" \
   --plugin-dir "$PLUGIN_DIR" \
@@ -125,7 +126,7 @@ if [[ "${PULSEVM_VERIFY_FIVE_NODE:-true}" == "true" ]]; then
   echo "==> Verifying all five custom-chain RPCs and replaying the common head"
   PULSEVM_FIVE_NODE_REPORT="${PULSEVM_FIVE_NODE_REPORT:-$BUILD_DIR/five-node-replay.json}" \
     "$REPO/scripts/verify-five-node-replay.sh" \
-    "0.0.0.0$RUNNER_PORT"
+    "$RUNNER_ENDPOINT"
 else
   echo "Cluster starting; five-node verification disabled (PULSEVM_VERIFY_FIVE_NODE=false)."
 fi
