@@ -42,6 +42,11 @@ use crate::{
         authorization_manager::AuthorizationManager,
         controller::Controller,
         producer_schedule::ProducerKey,
+        protocol_features::{
+            ProtocolExecutionContext,
+            ProtocolFeature,
+            ProtocolVersion,
+        },
         transaction::{
             Action,
             ActionReceipt,
@@ -2696,6 +2701,26 @@ impl ApplyContext {
         &self.pending_block_timestamp
     }
 
+    /// Validated consensus context for the block applying this action.
+    pub fn protocol_context(&self) -> ProtocolExecutionContext {
+        self.trx_context.protocol_context()
+    }
+
+    /// Number of the block applying this action.
+    pub fn block_num(&self) -> u32 {
+        self.trx_context.block_num()
+    }
+
+    /// Consensus protocol version selected for this action's block.
+    pub fn protocol_version(&self) -> ProtocolVersion {
+        self.trx_context.protocol_version()
+    }
+
+    /// Query a feature against the already support-checked block context.
+    pub fn protocol_feature_enabled(&self, feature: ProtocolFeature) -> bool {
+        self.trx_context.protocol_feature_enabled(feature)
+    }
+
     pub fn account_ram_deltas(&self) -> Result<BTreeMap<Name, i64>, ChainError> {
         let inner = self.inner.read()?;
         Ok(inner.account_ram_deltas.clone())
@@ -2716,14 +2741,11 @@ impl ApplyContext {
     }
 
     pub fn get_head_block_num(&self) -> u32 {
-        self.trx_context
-            .block_num()
-            .unwrap_or_default()
-            .saturating_sub(1)
+        self.trx_context.block_num().saturating_sub(1)
     }
 
     pub fn get_block_num(&self) -> u32 {
-        self.trx_context.block_num().unwrap_or_default()
+        self.trx_context.block_num()
     }
 
     pub fn publication_time(&self) -> Result<u64, ChainError> {

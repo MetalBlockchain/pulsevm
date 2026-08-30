@@ -50,6 +50,11 @@ use crate::chain::{
     apply_context::ApplyContext,
     id::Id,
     name::Name,
+    protocol_features::{
+        ProtocolExecutionContext,
+        ProtocolFeature,
+        ProtocolVersion,
+    },
     transaction::Action,
     webassembly::{
         __addtf3,
@@ -322,6 +327,19 @@ impl WasmContext {
 
     pub fn apply_context_mut(&mut self) -> &mut ApplyContext {
         &mut self.context
+    }
+
+    /// Validated consensus context for the currently executing WASM action.
+    pub fn protocol_context(&self) -> ProtocolExecutionContext {
+        self.context.protocol_context()
+    }
+
+    pub fn protocol_version(&self) -> ProtocolVersion {
+        self.context.protocol_version()
+    }
+
+    pub fn protocol_feature_enabled(&self, feature: ProtocolFeature) -> bool {
+        self.context.protocol_feature_enabled(feature)
     }
 
     pub fn db(&self) -> &Database {

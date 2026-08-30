@@ -12,6 +12,7 @@ use std::{
     str::FromStr,
     sync::{
         Arc,
+        Mutex,
         OnceLock,
     },
 };
@@ -578,6 +579,8 @@ fn authority_blob_billable_size(blob: &[u8]) -> Option<i64> {
     Some(total)
 }
 
+type ProtocolActivationRecord = ([u8; 32], u32);
+
 #[derive(Clone)]
 pub struct Database {
     /// The directory the arena persists into, kept so snapshots can checkpoint
@@ -593,6 +596,10 @@ pub struct Database {
     system_accounts: Arc<OnceLock<SystemAccountNames>>,
     native_system_contract: bool,
     native_system_contract_locked: bool,
+    /// Consensus activation records are kept beside the arena checkpoint. They
+    /// are deterministic state derived from accepted upgrade heights and must
+    /// survive restart even though they are not contract-table rows.
+    protocol_records: Arc<Mutex<Vec<ProtocolActivationRecord>>>,
 }
 
 /// The staged arena checkpoint file used to move a snapshot through the transport
@@ -633,6 +640,7 @@ fn load_database_metadata(path: &str) -> Result<Option<DatabaseMetadata>, String
         .map_err(|e| format!("invalid persisted system account: {e}"))?;
     Ok(Some(metadata))
 }
+const PROTOCOL_RECORDS_FILE: &str = "protocol_records.json";
 
 /// Read until `buf` is full or EOF, so each snapshot chunk is a fixed,
 /// block-aligned size regardless of how the OS splits the underlying reads —
@@ -673,6 +681,12 @@ impl Database {
                 .reload_from(&state_file)
                 .map_err(|e| format!("arena reload {}: {e:?}", state_file.display()))?;
         }
+        let protocol_records = match fs::read(Path::new(path).join(PROTOCOL_RECORDS_FILE)) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|e| format!("protocol record decode: {e}"))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(format!("protocol record read: {e}")),
+        };
         Ok(Database {
             path: path.to_string(),
             backend,
@@ -681,6 +695,7 @@ impl Database {
                 .as_ref()
                 .is_none_or(|metadata| metadata.native_system_contract),
             native_system_contract_locked: metadata.is_some(),
+            protocol_records: Arc::new(Mutex::new(protocol_records)),
         })
     }
 
@@ -798,6 +813,65 @@ impl Database {
         Ok(())
     }
 
+    fn persist_protocol_records(
+        &self,
+        records: &[ProtocolActivationRecord],
+    ) -> Result<(), ChainError> {
+        if self.path.is_empty() {
+            return Ok(());
+        }
+        let dir = Path::new(&self.path);
+        fs::create_dir_all(dir).map_err(|e| {
+            ChainError::InternalError(format!("protocol records: create {}: {e}", self.path))
+        })?;
+        let encoded = serde_json::to_vec(records)
+            .map_err(|e| ChainError::InternalError(format!("protocol records: encode: {e}")))?;
+        let staged = tempfile::NamedTempFile::new_in(dir)
+            .map_err(|e| ChainError::InternalError(format!("protocol records: stage: {e}")))?;
+        fs::write(staged.path(), encoded)
+            .map_err(|e| ChainError::InternalError(format!("protocol records: write: {e}")))?;
+        staged
+            .persist(dir.join(PROTOCOL_RECORDS_FILE))
+            .map_err(|e| {
+                ChainError::InternalError(format!("protocol records: install: {}", e.error))
+            })?;
+        Ok(())
+    }
+
+    pub fn activated_protocol_features(&self) -> Result<Vec<ProtocolActivationRecord>, ChainError> {
+        self.protocol_records
+            .lock()
+            .map_err(|_| ChainError::InternalError("protocol records lock poisoned".into()))
+            .map(|records| records.clone())
+    }
+
+    pub fn append_activated_protocol_feature(
+        &self,
+        digest: [u8; 32],
+        activation_height: u32,
+    ) -> Result<(), ChainError> {
+        let mut records = self
+            .protocol_records
+            .lock()
+            .map_err(|_| ChainError::InternalError("protocol records lock poisoned".into()))?;
+        if !records.contains(&(digest, activation_height)) {
+            records.push((digest, activation_height));
+            self.persist_protocol_records(&records)?;
+        }
+        Ok(())
+    }
+
+    pub fn replace_activated_protocol_features(
+        &self,
+        records: Vec<ProtocolActivationRecord>,
+    ) -> Result<(), ChainError> {
+        let mut current = self
+            .protocol_records
+            .lock()
+            .map_err(|_| ChainError::InternalError("protocol records lock poisoned".into()))?;
+        *current = records;
+        self.persist_protocol_records(&current)
+    }
     /// The arena database's account_metadata privileged flag for `name`, or
     /// `None` if the database has no such row — for diffing
     /// against chainbase's `find_account_metadata`.
@@ -5166,6 +5240,7 @@ impl Default for Database {
             system_accounts: Arc::new(OnceLock::from(SystemAccountNames::default())),
             native_system_contract: true,
             native_system_contract_locked: false,
+            protocol_records: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }

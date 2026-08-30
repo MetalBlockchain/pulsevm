@@ -39,6 +39,11 @@ use crate::{
 /// header. Extension id 0 is reserved for this payload in Leap.
 pub const PROTOCOL_FEATURE_ACTIVATION_EXTENSION_ID: u16 = 0;
 
+/// Number of 500 ms slots a block may be ahead of a validator's local clock.
+/// Twenty slots (ten seconds) leaves room for normal clock and network jitter
+/// while preventing a producer from moving chain time arbitrarily far ahead.
+pub const MAX_FUTURE_BLOCK_TIME_SLOTS: u32 = 20;
+
 #[derive(Debug, Default, Clone, Read, Write, NumBytes)]
 pub struct BlockHeader {
     pub timestamp: BlockTimestamp,
@@ -161,6 +166,36 @@ impl BlockHeader {
         // Overwrite the first 4 bytes with the big-endian block number
         result.0[0..4].copy_from_slice(&bn_be);
         Ok(Id(FixedBytes(result.0)))
+    }
+
+    /// Validate the timestamp against its parent and a validator's current
+    /// timestamp. `BlockTimestamp` is represented as a slot count, so every
+    /// value is necessarily aligned to the 500 ms protocol boundary.
+    pub fn validate_timestamp(
+        &self,
+        parent_timestamp: &BlockTimestamp,
+        now: &BlockTimestamp,
+    ) -> Result<(), ChainError> {
+        pulse_assert(
+            self.timestamp.slot() > parent_timestamp.slot(),
+            ChainError::BlockError(format!(
+                "block timestamp {} is not after parent timestamp {}",
+                self.timestamp.slot(),
+                parent_timestamp.slot()
+            )),
+        )?;
+
+        let max_allowed = now.slot().saturating_add(MAX_FUTURE_BLOCK_TIME_SLOTS);
+        pulse_assert(
+            self.timestamp.slot() <= max_allowed,
+            ChainError::BlockError(format!(
+                "block timestamp {} is too far in the future (maximum {})",
+                self.timestamp.slot(),
+                max_allowed
+            )),
+        )?;
+
+        Ok(())
     }
 
     pub fn validate(&self, db: &Database) -> Result<(), ChainError> {
@@ -344,7 +379,10 @@ mod tests {
         Write,
     };
 
-    use super::BlockHeader;
+    use super::{
+        BlockHeader,
+        MAX_FUTURE_BLOCK_TIME_SLOTS,
+    };
     use crate::{
         block::SignedBlock,
         chain::{
@@ -357,6 +395,7 @@ mod tests {
         },
     };
     use pulsevm_crypto::Digest;
+    use pulsevm_database::BlockTimestamp;
 
     #[test]
     pub fn test_block_serialization() {
@@ -396,5 +435,34 @@ mod tests {
             .set_protocol_feature_activations(&[features[0], features[0]])
             .unwrap();
         assert!(duplicate.protocol_feature_activations().is_err());
+    }
+
+    #[test]
+    fn timestamp_must_advance_beyond_parent() {
+        let parent = BlockTimestamp::new(100);
+        let now = BlockTimestamp::new(100);
+
+        for slot in [99, 100] {
+            let mut header = BlockHeader::default();
+            header.timestamp = BlockTimestamp::new(slot);
+            assert!(
+                header.validate_timestamp(&parent, &now).is_err(),
+                "timestamp {slot} must not be accepted after parent 100"
+            );
+        }
+    }
+
+    #[test]
+    fn timestamp_may_skip_slots_but_not_run_too_far_ahead() {
+        let parent = BlockTimestamp::new(100);
+        let now = BlockTimestamp::new(100);
+
+        let mut accepted = BlockHeader::default();
+        accepted.timestamp = BlockTimestamp::new(100 + MAX_FUTURE_BLOCK_TIME_SLOTS);
+        assert!(accepted.validate_timestamp(&parent, &now).is_ok());
+
+        let mut rejected = BlockHeader::default();
+        rejected.timestamp = BlockTimestamp::new(101 + MAX_FUTURE_BLOCK_TIME_SLOTS);
+        assert!(rejected.validate_timestamp(&parent, &now).is_err());
     }
 }

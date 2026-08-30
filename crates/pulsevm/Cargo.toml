@@ -31,6 +31,12 @@ pulsevm_name_macro = { path = "../pulsevm_name_macro" }
 pulsevm_proc_macros = { path = "../pulsevm_proc_macros" }
 pulsevm_serialization = { path = "../pulsevm_serialization" }
 
+[features]
+default = []
+# Compile the unfinished protocol implementations exposed by pulsevm_core.
+# Runtime activation remains controlled by the chain upgrade schedule.
+nightly = ["pulsevm_core/nightly"]
+
 [dev-dependencies]
 criterion = { version = "0.5", features = ["async_tokio"] }
 tempfile = "3"
