@@ -108,6 +108,7 @@ const DISABLE_DEFERRED_TRXS_STAGE_2_FEATURE_DIGEST: [u8; 32] = [
 use pulsevm_crypto::{
     Bytes,
     Digest,
+    make_canonical_pair,
     merkle,
 };
 use pulsevm_database::{
@@ -221,7 +222,7 @@ impl IncrementalBlockMerkle {
                 if !partial {
                     updated.push(top);
                 }
-                top = hash_digest_pair(top, top);
+                top = make_canonical_pair(top, top);
                 partial = true;
             } else {
                 let left = self
@@ -235,7 +236,7 @@ impl IncrementalBlockMerkle {
                 if partial {
                     updated.push(left);
                 }
-                top = hash_digest_pair(left, top);
+                top = make_canonical_pair(left, top);
             }
             current_depth -= 1;
             index >>= 1;
