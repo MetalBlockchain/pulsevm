@@ -37,8 +37,6 @@ use pulsevm_serialization::{
 };
 
 use crate::{
-    CODE_NAME,
-    PULSE_NAME,
     chain::{
         authority::PermissionLevel,
         authorization_manager::AuthorizationManager,
@@ -177,6 +175,10 @@ impl ApplyContext {
         })
     }
 
+    pub fn system_accounts(&self) -> pulsevm_database::SystemAccountNames {
+        self.db.system_accounts()
+    }
+
     pub fn exec(&mut self, trx_context: &mut TransactionContext) -> Result<u64, ChainError> {
         let mut cpu_used = 0;
 
@@ -240,8 +242,21 @@ impl ApplyContext {
             inner.action.clone()
         };
 
-        let native =
-            Controller::find_apply_handler(&self.receiver, action.account(), action.name());
+        // Native handlers are enabled for the built-in PulseVM system contract.
+        // Imported XPR state should disable them so its deployed eosio.system
+        // WASM remains authoritative.
+        let (code_hash, _vm_type, _vm_version) =
+            self.db.account_code_hash_vm(self.receiver.as_u64())?;
+        let native = if self.db.native_system_contract() {
+            Controller::find_apply_handler(
+                &self.receiver,
+                action.account(),
+                action.name(),
+                self.db.system_accounts().system,
+            )
+        } else {
+            None
+        };
         if let Some(native) = native {
             native(self, &mut self.db.clone(), &action)?;
             // Native handlers are outside deterministic Wasm metering, so give
@@ -249,12 +264,9 @@ impl ApplyContext {
             self.trx_context.checktime()?;
         }
 
-        // Does the receiver account have a contract deployed? Read the deployed
-        // code hash from the Rust database. An all-zero hash means no contract.
-        let (code_hash, _vm_type, _vm_version) =
-            self.db.account_code_hash_vm(self.receiver.as_u64())?;
-        let is_system_setcode = self.receiver == PULSE_NAME
-            && *action.account() == PULSE_NAME
+        let system = self.db.system_accounts();
+        let is_system_setcode = self.receiver == system.system
+            && *action.account() == system.system
             && *action.name() == crate::chain::config::SETCODE_NAME;
         let forward_setcode = self
             .db
@@ -471,7 +483,10 @@ impl ApplyContext {
             }
 
             let mut provided_permissions = BTreeSet::new();
-            provided_permissions.insert(PermissionLevel::new(*self.receiver, CODE_NAME.into()));
+            provided_permissions.insert(PermissionLevel::new(
+                *self.receiver,
+                self.db.system_accounts().code.into(),
+            ));
             let inner = self.inner.read()?;
 
             if !inner.privileged {
@@ -2460,7 +2475,10 @@ impl ApplyContext {
         let privileged = self.inner.read()?.privileged;
         if !privileged {
             let mut provided_permissions = BTreeSet::new();
-            provided_permissions.insert(PermissionLevel::new(sender, CODE_NAME.into()));
+            provided_permissions.insert(PermissionLevel::new(
+                sender,
+                self.db.system_accounts().code.into(),
+            ));
             let delay = Microseconds::new(
                 i64::from(transaction.header.delay_sec().0)
                     .checked_mul(1_000_000)
