@@ -83,6 +83,8 @@ derive a disposable producer authority, and keep the five-node runner alive
 after the SSH session exits:
 
 ```bash
+scripts/setup-ubuntu-ec2.sh
+
 XPR_SNAPSHOT=/data/xpr/snapshot.bin \
 XPR_NODEOS=/data/XPRNetwork-core/build/programs/nodeos/nodeos \
 XPR_CORE=/data/XPRNetwork-core \
