@@ -6604,7 +6604,7 @@ mod tests {
         block.signed_block_header.header.timestamp = BlockTimestamp::new(
             now.slot()
                 .saturating_add(MAX_FUTURE_BLOCK_TIME_SLOTS)
-                .saturating_add(1),
+                .saturating_add(100),
         );
         let digest = block.signed_block_header.header.sig_digest()?;
         block.signed_block_header.signature = private_key.sign(&digest)?;

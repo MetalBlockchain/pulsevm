@@ -9,11 +9,6 @@
 //!   pulsevm-e2e-boot --url <chain-rpc-url> --private-key <PVT_K1_...> \
 //!                    --token-wasm <path/to/pulse_token.wasm> \
 //!                    --token-abi <path/to/pulse_token.abi>
-//!
-//! Migrated-state runs can avoid fixture-name collisions and the fresh-genesis
-//! producer fixture with `--account-prefix mig --skip-producer-election`.
-//! A source checkpoint without the Pulse system contract can be smoke-tested
-//! with `--smoke-only --system-account eosio`.
 
 use std::{
     str::FromStr,
@@ -104,18 +99,10 @@ struct Args {
     private_key: String,
     token_wasm: String,
     token_abi: String,
-    account_prefix: String,
-    skip_producer_election: bool,
-    system_account: String,
-    smoke_only: bool,
 }
 
 fn parse_args() -> Result<Args> {
     let (mut url, mut private_key, mut token_wasm, mut token_abi) = (None, None, None, None);
-    let mut account_prefix = String::new();
-    let mut skip_producer_election = false;
-    let mut system_account = "pulse".to_string();
-    let mut smoke_only = false;
     let mut argv = std::env::args().skip(1);
     while let Some(flag) = argv.next() {
         let mut take = || argv.next().context(format!("{flag} requires a value"));
@@ -124,10 +111,6 @@ fn parse_args() -> Result<Args> {
             "--private-key" => private_key = Some(take()?),
             "--token-wasm" => token_wasm = Some(take()?),
             "--token-abi" => token_abi = Some(take()?),
-            "--account-prefix" => account_prefix = take()?,
-            "--skip-producer-election" => skip_producer_election = true,
-            "--system-account" => system_account = take()?,
-            "--smoke-only" => smoke_only = true,
             other => bail!("unknown argument: {other}"),
         }
     }
@@ -136,24 +119,7 @@ fn parse_args() -> Result<Args> {
         private_key: private_key.context("--private-key is required")?,
         token_wasm: token_wasm.context("--token-wasm is required")?,
         token_abi: token_abi.context("--token-abi is required")?,
-        account_prefix,
-        skip_producer_election,
-        system_account,
-        smoke_only,
     })
-}
-
-/// Return the fixture's historical name on a clean chain, or a short prefixed
-/// name suitable for a migrated chain where the clean-chain fixture may already
-/// exist. EOS names are limited to twelve characters, so the prefixed labels are
-/// intentionally compact.
-fn fixture_account(prefix: &str, clean: &str, suffix: &str) -> Result<Name> {
-    let value = if prefix.is_empty() {
-        clean.to_owned()
-    } else {
-        format!("{prefix}{suffix}")
-    };
-    Name::from_str(&value).map_err(|e| anyhow::anyhow!("invalid fixture account {value}: {e}"))
 }
 
 /// How long to wait for a submitted transaction to land in a block.
@@ -225,10 +191,7 @@ async fn push(
 fn new_account(creator: Name, account: Name, key: &PublicKey) -> Result<Action> {
     let authority = |k: &PublicKey| Authority {
         threshold: 1,
-        keys: vec![KeyWeight {
-            key: k.clone().into_k1().into(),
-            weight: 1,
-        }],
+        keys: vec![KeyWeight::new(k.clone().into_k1(), 1)],
         accounts: vec![],
         waits: vec![],
     };
@@ -319,49 +282,10 @@ async fn main() -> Result<()> {
     let chain_id =
         Id::from_str(&info.chain_id).map_err(|e| anyhow::anyhow!("parsing chain id: {e}"))?;
 
-    if args.smoke_only {
-        // Keep this probe independent of the migrated producer's source-network
-        // WASM.  XPR producer accounts can carry native-style code without an
-        // exported memory, so dispatch a harmless unknown action to the
-        // code-free `eosio.ram` account while authorizing it with the
-        // disposable producer key.  This still
-        // exercises signing, mempool admission, block production, and RPC
-        // inclusion without invoking the producer's code.
-        let system = Name::from_str(&args.system_account)
-            .map_err(|e| anyhow::anyhow!("encoding system account: {e}"))?;
-        let tx = push(
-            &client,
-            &chain_id,
-            &key,
-            vec![Action {
-                account: Name::from_str("eosio.ram")?.into(),
-                name: Name::from_str("noop")?.into(),
-                authorization: vec![PermissionLevel {
-                    actor: system.into(),
-                    permission: ACTIVE_NAME.into(),
-                }],
-                data: Arc::from(Vec::<u8>::new()),
-            }],
-        )
-        .await
-        .context("submitting migration smoke transaction")?;
-        println!(
-            "{}",
-            serde_json::json!({
-                "chain_id": info.chain_id,
-                "system_account": system.to_string(),
-                "tx": tx,
-                "smoke_only": true,
-            })
-        );
-        return Ok(());
-    }
-
-    let system = Name::from_str(&args.system_account)
-        .map_err(|e| anyhow::anyhow!("encoding system account: {e}"))?;
-    let token = fixture_account(&args.account_prefix, "pulse.token", "tok")?;
-    let alice = fixture_account(&args.account_prefix, "alice", "alice")?;
-    let bob = fixture_account(&args.account_prefix, "bob", "bob")?;
+    let system: Name = PULSE_NAME.into();
+    let token: Name = name!("pulse.token").into();
+    let alice: Name = name!("alice").into();
+    let bob: Name = name!("bob").into();
 
     let mut steps = Vec::new();
 
@@ -539,20 +463,7 @@ async fn main() -> Result<()> {
     // producer. The proposal keeps `pulse` (with the node's genesis key) so the
     // single node can keep producing while the change activates on the next
     // accepted block; getProducers then reflects the new set.
-    if args.skip_producer_election {
-        println!(
-            "{}",
-            serde_json::json!({
-                "chain_id": info.chain_id,
-                "token_contract": token.to_string(),
-                "steps": steps,
-                "producer_election": "skipped",
-            })
-        );
-        return Ok(());
-    }
-
-    let producerb = fixture_account(&args.account_prefix, "producerb", "prodb")?;
+    let producerb: Name = name!("producerb").into();
     let tx = push(
         &client,
         &chain_id,

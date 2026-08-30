@@ -106,6 +106,9 @@ impl WebAuthnSignature {
             Some(port) => &origin_body[..port],
             None => origin_body,
         };
+        if rpid.is_empty() {
+            return Err(WebAuthnError("WebAuthn RP ID cannot be empty".into()));
+        }
 
         if self.auth_data.len() < 37 {
             return Err(WebAuthnError(
@@ -128,12 +131,12 @@ impl WebAuthnSignature {
         };
 
         let client_hash = Sha256::digest(self.client_json.as_bytes());
-        let mut signed_data = Vec::with_capacity(self.auth_data.len() + client_hash.len());
-        signed_data.extend_from_slice(&self.auth_data);
-        signed_data.extend_from_slice(&client_hash);
-        let signed_digest: [u8; 32] = Sha256::digest(&signed_data).into();
+        let mut signed_data = Sha256::new();
+        signed_data.update(&self.auth_data);
+        signed_data.update(client_hash);
+        let signed_digest: [u8; 32] = signed_data.finalize().into();
         let point = R1Signature::from_compact65(&self.compact)
-            .recover(&signed_digest)
+            .recover_webauthn(&signed_digest)
             .map_err(|e| WebAuthnError(e.to_string()))?;
 
         Ok(RecoveredWebAuthnKey {
@@ -145,10 +148,17 @@ impl WebAuthnSignature {
 
     /// Packed Antelope signature, including static-variant tag `2`.
     pub fn to_packed(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(68 + self.auth_data.len() + self.client_json.len());
+        let mut out = Vec::with_capacity(self.packed_len());
         out.push(2);
         self.write_payload(&mut out);
         out
+    }
+
+    pub fn packed_len(&self) -> usize {
+        66 + varuint_len(self.auth_data.len())
+            + self.auth_data.len()
+            + varuint_len(self.client_json.len())
+            + self.client_json.len()
     }
 
     pub fn from_packed(bytes: &[u8]) -> Result<Self, WebAuthnError> {
@@ -165,11 +175,9 @@ impl WebAuthnSignature {
 
     pub fn read_payload(bytes: &[u8], pos: &mut usize) -> Result<Self, WebAuthnError> {
         let compact: [u8; 65] = take(bytes, pos, 65)?.try_into().unwrap();
-        let auth_len = usize::try_from(read_varuint(bytes, pos)?)
-            .map_err(|_| WebAuthnError("WebAuthn auth-data length is too large".into()))?;
+        let auth_len = read_varuint(bytes, pos)? as usize;
         let auth_data = take(bytes, pos, auth_len)?.to_vec();
-        let json_len = usize::try_from(read_varuint(bytes, pos)?)
-            .map_err(|_| WebAuthnError("WebAuthn client-data length is too large".into()))?;
+        let json_len = read_varuint(bytes, pos)? as usize;
         let client_json = String::from_utf8(take(bytes, pos, json_len)?.to_vec())
             .map_err(|_| WebAuthnError("WebAuthn client-data is not UTF-8".into()))?;
         Ok(Self::new(compact, auth_data, client_json))
@@ -177,9 +185,9 @@ impl WebAuthnSignature {
 
     pub fn write_payload(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.compact);
-        write_varuint(self.auth_data.len() as u64, out);
+        write_varuint(self.auth_data.len(), out);
         out.extend_from_slice(&self.auth_data);
-        write_varuint(self.client_json.len() as u64, out);
+        write_varuint(self.client_json.len(), out);
         out.extend_from_slice(self.client_json.as_bytes());
     }
 
@@ -246,15 +254,15 @@ fn take_byte(bytes: &[u8], pos: &mut usize) -> Result<u8, WebAuthnError> {
     Ok(take(bytes, pos, 1)?[0])
 }
 
-fn read_varuint(bytes: &[u8], pos: &mut usize) -> Result<u64, WebAuthnError> {
-    let mut value = 0u64;
-    for shift in (0..64).step_by(7) {
+fn read_varuint(bytes: &[u8], pos: &mut usize) -> Result<u32, WebAuthnError> {
+    let mut value = 0u32;
+    for index in 0..5 {
         let byte = take_byte(bytes, pos)?;
-        let part = (byte & 0x7f) as u64;
-        if shift == 63 && part > 1 {
-            return Err(WebAuthnError("WebAuthn varuint overflows u64".into()));
+        let part = (byte & 0x7f) as u32;
+        if index == 4 && part > 0x0f {
+            return Err(WebAuthnError("WebAuthn varuint overflows u32".into()));
         }
-        value |= part << shift;
+        value |= part << (index * 7);
         if byte & 0x80 == 0 {
             return Ok(value);
         }
@@ -262,7 +270,8 @@ fn read_varuint(bytes: &[u8], pos: &mut usize) -> Result<u64, WebAuthnError> {
     Err(WebAuthnError("WebAuthn varuint is too long".into()))
 }
 
-fn write_varuint(mut value: u64, out: &mut Vec<u8>) {
+fn write_varuint(value: usize, out: &mut Vec<u8>) {
+    let mut value = u32::try_from(value).expect("Antelope byte-vector length exceeds varuint32");
     loop {
         let mut byte = (value & 0x7f) as u8;
         value >>= 7;
@@ -273,6 +282,15 @@ fn write_varuint(mut value: u64, out: &mut Vec<u8>) {
         if value == 0 {
             return;
         }
+    }
+}
+
+fn varuint_len(value: usize) -> usize {
+    let value = u32::try_from(value).expect("Antelope value exceeds varuint32");
+    if value == 0 {
+        1
+    } else {
+        ((32 - value.leading_zeros()) as usize).div_ceil(7)
     }
 }
 
@@ -329,6 +347,60 @@ mod tests {
         assert_eq!(
             WebAuthnSignature::from_string(&signature.to_string()).unwrap(),
             signature
+        );
+
+        assert!(signature.recover(&[8u8; 32]).is_err());
+
+        let mut uncompressed_header = signature.clone();
+        uncompressed_header.compact[0] -= 4;
+        assert!(uncompressed_header.recover(&digest).is_err());
+
+        let mut short_auth_data = signature.clone();
+        short_auth_data.auth_data.truncate(36);
+        assert!(short_auth_data.recover(&digest).is_err());
+
+        let mut insecure_origin = signature.clone();
+        insecure_origin.client_json = insecure_origin.client_json.replace("https://", "http://");
+        assert!(insecure_origin.recover(&digest).is_err());
+    }
+
+    #[test]
+    fn webauthn_recovery_accepts_high_s_like_fc() {
+        let digest = [9u8; 32];
+        let client_json = format!(
+            r#"{{"type":"webauthn.get","challenge":"{}","origin":"https://example.test"}}"#,
+            URL_SAFE_NO_PAD.encode(digest),
+        );
+        let mut auth_data = vec![0u8; 37];
+        auth_data[..32].copy_from_slice(&Sha256::digest(b"example.test"));
+        auth_data[32] = 0x01;
+        let mut signed = auth_data.clone();
+        signed.extend_from_slice(&Sha256::digest(client_json.as_bytes()));
+        let signed_digest: [u8; 32] = Sha256::digest(signed).into();
+
+        let (signing_key, signature, recovery_id) = (1u8..=64)
+            .find_map(|byte| {
+                let signing_key = SigningKey::from_bytes((&[byte; 32]).into()).ok()?;
+                let (signature, recovery_id) =
+                    signing_key.sign_prehash_recoverable(&signed_digest).ok()?;
+                signature
+                    .normalize_s()
+                    .is_some()
+                    .then_some((signing_key, signature, recovery_id))
+            })
+            .expect("find a deterministic high-S WebAuthn fixture");
+        let mut compact = [0u8; 65];
+        compact[0] = 31 + recovery_id.to_byte();
+        compact[1..].copy_from_slice(&signature.to_bytes());
+        let recovered = WebAuthnSignature::new(compact, auth_data, client_json)
+            .recover(&digest)
+            .unwrap();
+        assert_eq!(
+            recovered.point.as_slice(),
+            signing_key
+                .verifying_key()
+                .to_encoded_point(true)
+                .as_bytes(),
         );
     }
 }

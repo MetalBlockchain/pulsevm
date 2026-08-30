@@ -12,7 +12,7 @@ use crate::k1::{
 /// A recoverable secp256r1/P-256 ECDSA signature in the Antelope `R1`
 /// encoding.  Its compact bytes have the same `header || r || s` shape as K1,
 /// but the curve and checksum suffix are different.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct R1Signature {
     compact: [u8; 65],
 }
@@ -37,23 +37,48 @@ impl R1Signature {
         self.compact
     }
 
-    fn recovery_id(&self) -> Result<RecoveryId, R1Error> {
-        // `fc::crypto::r1::private_key::sign_compact` stores 27 + 4 + recid.
-        let byte = self.compact[0];
-        let recid = byte
-            .checked_sub(31)
-            .filter(|recid| *recid <= 3)
-            .ok_or_else(|| R1Error("invalid R1 compact-signature header".into()))?;
+    fn recovery_id(&self, require_compressed: bool) -> Result<RecoveryId, R1Error> {
+        let header = self.compact[0];
+        if !(27..=34).contains(&header) || (require_compressed && header < 31) {
+            return Err(R1Error("invalid R1 compact-signature header".into()));
+        }
+        let recid = if header >= 31 {
+            header - 31
+        } else {
+            header - 27
+        };
         RecoveryId::try_from(recid)
             .map_err(|_| R1Error("invalid R1 compact-signature recovery id".into()))
     }
 
     /// Recover the compressed P-256 public point that signed `digest`.
     pub fn recover(&self, digest: &[u8; 32]) -> Result<[u8; 33], R1Error> {
+        self.recover_impl(digest, false, true)
+    }
+
+    /// WebAuthn uses the same P-256 recovery primitive, but Antelope requires
+    /// a compressed compact header and does not apply the direct-R1 low-S gate.
+    pub(crate) fn recover_webauthn(&self, digest: &[u8; 32]) -> Result<[u8; 33], R1Error> {
+        self.recover_impl(digest, true, false)
+    }
+
+    fn recover_impl(
+        &self,
+        digest: &[u8; 32],
+        require_compressed: bool,
+        require_low_s: bool,
+    ) -> Result<[u8; 33], R1Error> {
         let signature = Signature::from_slice(&self.compact[1..])
             .map_err(|_| R1Error("invalid R1 compact signature".into()))?;
-        let key = VerifyingKey::recover_from_prehash(digest, &signature, self.recovery_id()?)
-            .map_err(|_| R1Error("failed to recover R1 public key".into()))?;
+        if require_low_s && signature.normalize_s().is_some() {
+            return Err(R1Error("non-canonical high-S R1 signature".into()));
+        }
+        let key = VerifyingKey::recover_from_prehash(
+            digest,
+            &signature,
+            self.recovery_id(require_compressed)?,
+        )
+        .map_err(|_| R1Error("failed to recover R1 public key".into()))?;
         key.to_encoded_point(true)
             .as_bytes()
             .try_into()
@@ -112,6 +137,7 @@ impl core::fmt::Debug for R1Signature {
 
 #[cfg(test)]
 mod tests {
+    use ecdsa::RecoveryId;
     use p256::ecdsa::SigningKey;
 
     use super::R1Signature;
@@ -121,6 +147,13 @@ mod tests {
         let signing_key = SigningKey::from_bytes((&[7u8; 32]).into()).unwrap();
         let digest = [42u8; 32];
         let (signature, recovery_id) = signing_key.sign_prehash_recoverable(&digest).unwrap();
+        let (signature, recovery_id) = match signature.normalize_s() {
+            Some(signature) => (
+                signature,
+                RecoveryId::new(!recovery_id.is_y_odd(), recovery_id.is_x_reduced()),
+            ),
+            None => (signature, recovery_id),
+        };
         let mut compact = [0u8; 65];
         compact[0] = 31 + recovery_id.to_byte();
         compact[1..].copy_from_slice(&signature.to_bytes());
@@ -135,5 +168,44 @@ mod tests {
         );
         assert_eq!(R1Signature::from_string(&r1.to_string()).unwrap(), r1);
         assert_eq!(R1Signature::from_packed(&r1.to_packed()).unwrap(), r1);
+    }
+
+    #[test]
+    fn direct_r1_rejects_high_s_and_accepts_both_fc_header_forms() {
+        let signing_key = SigningKey::from_bytes((&[11u8; 32]).into()).unwrap();
+        let digest = [99u8; 32];
+        let (high_s, recovery_id) = signing_key.sign_prehash_recoverable(&digest).unwrap();
+        let low_s = high_s
+            .normalize_s()
+            .expect("fixture intentionally produces a high-S signature");
+
+        let mut compact = [0u8; 65];
+        compact[0] = 31 + recovery_id.to_byte();
+        compact[1..].copy_from_slice(&high_s.to_bytes());
+        assert!(
+            R1Signature::from_compact65(&compact)
+                .recover(&digest)
+                .is_err()
+        );
+
+        let low_recovery_id = RecoveryId::new(!recovery_id.is_y_odd(), recovery_id.is_x_reduced());
+        compact[0] = 27 + low_recovery_id.to_byte();
+        compact[1..].copy_from_slice(&low_s.to_bytes());
+        assert_eq!(
+            R1Signature::from_compact65(&compact)
+                .recover(&digest)
+                .unwrap()
+                .as_slice(),
+            signing_key
+                .verifying_key()
+                .to_encoded_point(true)
+                .as_bytes(),
+        );
+        compact[0] += 4;
+        assert!(
+            R1Signature::from_compact65(&compact)
+                .recover(&digest)
+                .is_ok()
+        );
     }
 }

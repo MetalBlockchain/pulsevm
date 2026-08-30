@@ -3,13 +3,12 @@ use std::collections::{
     HashMap,
 };
 
+use pulsevm_crypto::AuthorityPublicKey;
 use pulsevm_database::{
     DbRead,
     Microseconds,
 };
 use pulsevm_error::ChainError;
-
-use pulsevm_crypto::AuthorityPublicKey;
 
 use super::authority::{
     Authority,
@@ -24,6 +23,46 @@ pub struct AuthorityChecker<'a> {
     provided_delay: Microseconds,
     used_keys: BTreeSet<AuthorityPublicKey>,
     cached_permissions: HashMap<PermissionLevel, PermissionCacheStatus>,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use pulsevm_crypto::AuthorityPublicKey;
+    use pulsevm_database::Microseconds;
+
+    use super::{
+        AuthorityChecker,
+        KeyWeight,
+    };
+
+    #[test]
+    fn matches_r1_and_webauthn_authority_keys_without_curve_aliasing() {
+        let point = [
+            3, 0x6b, 0x17, 0xd1, 0xf2, 0xe1, 0x2c, 0x42, 0x47, 0xf8, 0xbc, 0xe6, 0xe5, 0x63, 0xa4,
+            0x40, 0xf2, 0x77, 0x03, 0x7d, 0x81, 0x2d, 0xeb, 0x33, 0xa0, 0xf4, 0xa1, 0x39, 0x45,
+            0xd8, 0x98, 0xc2, 0x96,
+        ];
+        let r1 = AuthorityPublicKey::R1(point);
+        let webauthn = AuthorityPublicKey::WebAuthn {
+            point,
+            user_presence: 1,
+            rpid: "example.com".into(),
+        };
+        let provided = BTreeSet::from([r1.clone(), webauthn.clone()]);
+        let permissions = BTreeSet::new();
+        let mut checker = AuthorityChecker::new(6, &provided, &permissions, Microseconds::new(0));
+
+        assert_eq!(checker.visit_key_weight(&KeyWeight::new(r1, 2)).unwrap(), 2);
+        assert_eq!(
+            checker
+                .visit_key_weight(&KeyWeight::new(webauthn, 3))
+                .unwrap(),
+            3
+        );
+        assert!(checker.all_keys_used());
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

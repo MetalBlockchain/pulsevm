@@ -43,7 +43,7 @@ pub struct Signature {
     inner: SignatureInner,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum SignatureInner {
     K1(K1Signature),
     R1(R1Signature),
@@ -101,14 +101,6 @@ impl Signature {
         }
     }
 
-    fn to_packed(&self) -> Vec<u8> {
-        match &self.inner {
-            SignatureInner::K1(signature) => signature.to_packed().to_vec(),
-            SignatureInner::R1(signature) => signature.to_packed().to_vec(),
-            SignatureInner::WebAuthn(signature) => signature.to_packed(),
-        }
-    }
-
     fn to_string(&self) -> String {
         match &self.inner {
             SignatureInner::K1(signature) => signature.to_string(),
@@ -138,13 +130,13 @@ impl PartialOrd for Signature {
 
 impl Ord for Signature {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.to_packed().cmp(&other.to_packed())
+        self.inner.cmp(&other.inner)
     }
 }
 
 impl PartialEq for Signature {
     fn eq(&self, other: &Self) -> bool {
-        self.to_packed() == other.to_packed()
+        self.inner == other.inner
     }
 }
 
@@ -152,7 +144,7 @@ impl Eq for Signature {}
 
 impl Hash for Signature {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.to_packed().hash(state);
+        self.inner.hash(state);
     }
 }
 
@@ -193,7 +185,10 @@ impl<'de> Deserialize<'de> for Signature {
 
 impl NumBytes for Signature {
     fn num_bytes(&self) -> usize {
-        self.to_packed().len()
+        match &self.inner {
+            SignatureInner::K1(_) | SignatureInner::R1(_) => 66,
+            SignatureInner::WebAuthn(signature) => signature.packed_len(),
+        }
     }
 }
 
@@ -230,14 +225,24 @@ impl Read for Signature {
 
 impl Write for Signature {
     fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), WriteError> {
-        let packed = self.to_packed();
-        let end = pos
-            .checked_add(packed.len())
-            .filter(|end| *end <= bytes.len())
-            .ok_or(WriteError::NotEnoughSpace)?;
-        bytes[*pos..end].copy_from_slice(&packed);
-        *pos = end;
-        Ok(())
+        match &self.inner {
+            SignatureInner::K1(signature) => {
+                FixedBytes::<66>(signature.to_packed()).write(bytes, pos)
+            }
+            SignatureInner::R1(signature) => {
+                FixedBytes::<66>(signature.to_packed()).write(bytes, pos)
+            }
+            SignatureInner::WebAuthn(signature) => {
+                let packed = signature.to_packed();
+                let end = pos
+                    .checked_add(packed.len())
+                    .filter(|end| *end <= bytes.len())
+                    .ok_or(WriteError::NotEnoughSpace)?;
+                bytes[*pos..end].copy_from_slice(&packed);
+                *pos = end;
+                Ok(())
+            }
+        }
     }
 }
 
@@ -306,6 +311,10 @@ mod tests {
         let (signature, recovery_id) = signing_key
             .sign_prehash_recoverable(digest.as_bytes())
             .unwrap();
+        let (signature, recovery_id) = match signature.normalize_s() {
+            Some(signature) => (signature, (recovery_id.to_byte() ^ 1).try_into().unwrap()),
+            None => (signature, recovery_id),
+        };
         let mut compact = [0u8; 65];
         compact[0] = 31 + recovery_id.to_byte();
         compact[1..].copy_from_slice(&signature.to_bytes());

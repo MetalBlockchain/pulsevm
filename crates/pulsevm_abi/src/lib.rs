@@ -10,8 +10,10 @@
 use std::fmt;
 
 use pulsevm_crypto::{
-    K1PublicKey,
+    AuthorityPublicKey,
     K1Signature,
+    R1Signature,
+    WebAuthnSignature,
 };
 use pulsevm_name::Name;
 use serde_json::{
@@ -553,31 +555,112 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 }
 
 fn decode_public_key(data: &mut &[u8]) -> Result<String, AbiError> {
-    // 1 curve-tag byte + 33 compressed bytes for K1; other curves aren't
-    // exercised by the RPC golden, so refuse them loudly.
+    let original = *data;
     let tag = read_u8(data)?;
-    if tag != 0 {
-        return Err(AbiError::Crypto(format!("unsupported key type {tag}")));
+    match tag {
+        0 | 1 => {
+            take(data, 33)?;
+        }
+        2 => {
+            take(data, 34)?; // compressed point + user-presence policy
+            let rpid_len = read_varuint32(data)? as usize;
+            take(data, rpid_len)?;
+        }
+        _ => return Err(AbiError::Crypto(format!("unsupported key type {tag}"))),
     }
-    let rest = take(data, 33)?;
-    let mut packed = [0u8; 34];
-    packed[1..].copy_from_slice(rest);
-    K1PublicKey::from_packed(&packed)
+    let consumed = original.len() - data.len();
+    AuthorityPublicKey::from_packed(&original[..consumed])
         .map(|k| k.to_string())
         .map_err(|e| AbiError::Crypto(format!("{e:?}")))
 }
 
 fn decode_signature(data: &mut &[u8]) -> Result<String, AbiError> {
+    let original = *data;
     let tag = read_u8(data)?;
-    if tag != 0 {
-        return Err(AbiError::Crypto(format!(
-            "unsupported signature type {tag}"
-        )));
+    match tag {
+        0 | 1 => {
+            take(data, 65)?;
+        }
+        2 => {
+            take(data, 65)?;
+            let auth_data_len = read_varuint32(data)? as usize;
+            take(data, auth_data_len)?;
+            let client_json_len = read_varuint32(data)? as usize;
+            take(data, client_json_len)?;
+        }
+        _ => {
+            return Err(AbiError::Crypto(format!(
+                "unsupported signature type {tag}"
+            )));
+        }
     }
-    let rest = take(data, 65)?;
-    let mut packed = [0u8; 66];
-    packed[1..].copy_from_slice(rest);
-    K1Signature::from_packed(&packed)
-        .map(|s| s.to_string())
-        .map_err(|e| AbiError::Crypto(format!("{e:?}")))
+    let consumed = original.len() - data.len();
+    match tag {
+        0 => K1Signature::from_packed(&original[..consumed])
+            .map(|signature| signature.to_string())
+            .map_err(|error| AbiError::Crypto(format!("{error:?}"))),
+        1 => R1Signature::from_packed(&original[..consumed])
+            .map(|signature| signature.to_string())
+            .map_err(|error| AbiError::Crypto(format!("{error:?}"))),
+        2 => WebAuthnSignature::from_packed(&original[..consumed])
+            .map(|signature| signature.to_string())
+            .map_err(|error| AbiError::Crypto(format!("{error:?}"))),
+        _ => unreachable!(),
+    }
+}
+
+#[cfg(test)]
+mod crypto_tests {
+    use pulsevm_crypto::{
+        AuthorityPublicKey,
+        R1Signature,
+        WebAuthnSignature,
+    };
+
+    use super::{
+        decode_public_key,
+        decode_signature,
+    };
+
+    const P256_GENERATOR: [u8; 33] = [
+        3, 0x6b, 0x17, 0xd1, 0xf2, 0xe1, 0x2c, 0x42, 0x47, 0xf8, 0xbc, 0xe6, 0xe5, 0x63, 0xa4,
+        0x40, 0xf2, 0x77, 0x03, 0x7d, 0x81, 0x2d, 0xeb, 0x33, 0xa0, 0xf4, 0xa1, 0x39, 0x45, 0xd8,
+        0x98, 0xc2, 0x96,
+    ];
+
+    #[test]
+    fn abi_decodes_r1_and_webauthn_public_keys() {
+        for key in [
+            AuthorityPublicKey::R1(P256_GENERATOR),
+            AuthorityPublicKey::WebAuthn {
+                point: P256_GENERATOR,
+                user_presence: 2,
+                rpid: "login.example".into(),
+            },
+        ] {
+            let mut packed = key.to_packed();
+            packed.push(0xaa);
+            let mut input = packed.as_slice();
+            assert_eq!(decode_public_key(&mut input).unwrap(), key.to_string());
+            assert_eq!(input, &[0xaa]);
+        }
+    }
+
+    #[test]
+    fn abi_decodes_r1_and_variable_webauthn_signatures() {
+        let mut compact = [0u8; 65];
+        compact[0] = 31;
+        let r1 = R1Signature::from_compact65(&compact);
+        let webauthn =
+            WebAuthnSignature::new(compact, vec![7; 37], r#"{"type":"webauthn.get"}"#.into());
+        for (mut packed, expected) in [
+            (r1.to_packed().to_vec(), r1.to_string()),
+            (webauthn.to_packed(), webauthn.to_string()),
+        ] {
+            packed.push(0xaa);
+            let mut input = packed.as_slice();
+            assert_eq!(decode_signature(&mut input).unwrap(), expected);
+            assert_eq!(input, &[0xaa]);
+        }
+    }
 }

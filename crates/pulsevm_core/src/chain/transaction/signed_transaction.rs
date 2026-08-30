@@ -218,8 +218,12 @@ mod tests {
         let (r1, recovery_id) = signing_key
             .sign_prehash_recoverable(digest.as_bytes())
             .unwrap();
+        let (r1, recovery_id) = match r1.normalize_s() {
+            Some(r1) => (r1, recovery_id.to_byte() ^ 1),
+            None => (r1, recovery_id.to_byte()),
+        };
         let mut compact = [0u8; 65];
-        compact[0] = 31 + recovery_id.to_byte();
+        compact[0] = 31 + recovery_id;
         compact[1..].copy_from_slice(&r1.to_bytes());
         let r1_signature = Signature::new_r1(R1Signature::from_compact65(&compact));
         let r1_tx = SignedTransaction::new(tx.clone(), BTreeSet::from([r1_signature]), vec![]);
@@ -248,8 +252,12 @@ mod tests {
         let (wa, recovery_id) = signing_key
             .sign_prehash_recoverable(&signed_digest)
             .unwrap();
+        let (wa, recovery_id) = match wa.normalize_s() {
+            Some(wa) => (wa, recovery_id.to_byte() ^ 1),
+            None => (wa, recovery_id.to_byte()),
+        };
         let mut wa_compact = [0u8; 65];
-        wa_compact[0] = 31 + recovery_id.to_byte();
+        wa_compact[0] = 31 + recovery_id;
         wa_compact[1..].copy_from_slice(&wa.to_bytes());
         let wa_tx = SignedTransaction::new(
             tx,

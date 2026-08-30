@@ -1,4 +1,7 @@
-use core::fmt;
+use core::{
+    fmt,
+    str::FromStr,
+};
 
 use p256::PublicKey as P256PublicKey;
 use pulsevm_serialization::{
@@ -81,7 +84,7 @@ impl AuthorityPublicKey {
                 out.push(2);
                 out.extend_from_slice(point);
                 out.push(*user_presence);
-                write_varuint(rpid.len() as u64, &mut out);
+                write_varuint(rpid.len(), &mut out);
                 out.extend_from_slice(rpid.as_bytes());
                 out
             }
@@ -103,13 +106,7 @@ impl AuthorityPublicKey {
             2 => {
                 let point = read_p256_point(bytes, &mut pos, "WebAuthn")?;
                 let user_presence = take_byte(bytes, &mut pos)?;
-                if user_presence > 2 {
-                    return Err(AuthorityKeyError(format!(
-                        "invalid WebAuthn user-presence policy {user_presence}"
-                    )));
-                }
-                let rpid_len = usize::try_from(read_varuint(bytes, &mut pos)?)
-                    .map_err(|_| AuthorityKeyError("WebAuthn RP ID length is too large".into()))?;
+                let rpid_len = read_varuint(bytes, &mut pos)? as usize;
                 let rpid = take(bytes, &mut pos, rpid_len)?;
                 let rpid = String::from_utf8(rpid.to_vec())
                     .map_err(|_| AuthorityKeyError("WebAuthn RP ID is not UTF-8".into()))?;
@@ -150,7 +147,7 @@ impl AuthorityPublicKey {
                 let mut data = Vec::with_capacity(35 + rpid.len());
                 data.extend_from_slice(point);
                 data.push(*user_presence);
-                write_varuint(rpid.len() as u64, &mut data);
+                write_varuint(rpid.len(), &mut data);
                 data.extend_from_slice(rpid.as_bytes());
                 format!("PUB_WA_{}", encode_b58_checked(&data, b"WA"))
             }
@@ -198,6 +195,14 @@ impl fmt::Display for AuthorityPublicKey {
     }
 }
 
+impl FromStr for AuthorityPublicKey {
+    type Err = AuthorityKeyError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::from_string(value)
+    }
+}
+
 impl fmt::Debug for AuthorityPublicKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("AuthorityPublicKey")
@@ -227,7 +232,10 @@ impl<'de> Deserialize<'de> for AuthorityPublicKey {
 
 impl NumBytes for AuthorityPublicKey {
     fn num_bytes(&self) -> usize {
-        self.to_packed().len()
+        match self {
+            Self::K1(_) | Self::R1(_) => 34,
+            Self::WebAuthn { rpid, .. } => 35 + varuint_len(rpid.len()) + rpid.len(),
+        }
     }
 }
 
@@ -244,12 +252,30 @@ impl Read for AuthorityPublicKey {
 
 impl Write for AuthorityPublicKey {
     fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), WriteError> {
-        let packed = self.to_packed();
         let end = pos
-            .checked_add(packed.len())
+            .checked_add(self.num_bytes())
             .filter(|end| *end <= bytes.len())
             .ok_or(WriteError::NotEnoughSpace)?;
-        bytes[*pos..end].copy_from_slice(&packed);
+        match self {
+            Self::K1(key) => bytes[*pos..end].copy_from_slice(&key.to_packed()),
+            Self::R1(point) => {
+                bytes[*pos] = 1;
+                bytes[*pos + 1..end].copy_from_slice(point);
+            }
+            Self::WebAuthn {
+                point,
+                user_presence,
+                rpid,
+            } => {
+                let mut packed = Vec::with_capacity(self.num_bytes());
+                packed.push(2);
+                packed.extend_from_slice(point);
+                packed.push(*user_presence);
+                write_varuint(rpid.len(), &mut packed);
+                packed.extend_from_slice(rpid.as_bytes());
+                bytes[*pos..end].copy_from_slice(&packed);
+            }
+        }
         *pos = end;
         Ok(())
     }
@@ -288,8 +314,7 @@ fn packed_end(bytes: &[u8], start: usize) -> Result<usize, AuthorityKeyError> {
         }
         2 => {
             take(bytes, &mut pos, 34)?;
-            let len = usize::try_from(read_varuint(bytes, &mut pos)?)
-                .map_err(|_| AuthorityKeyError("WebAuthn RP ID length is too large".into()))?;
+            let len = read_varuint(bytes, &mut pos)? as usize;
             take(bytes, &mut pos, len)?;
         }
         tag => {
@@ -301,17 +326,17 @@ fn packed_end(bytes: &[u8], start: usize) -> Result<usize, AuthorityKeyError> {
     Ok(pos)
 }
 
-fn read_varuint(bytes: &[u8], pos: &mut usize) -> Result<u64, AuthorityKeyError> {
-    let mut value = 0u64;
-    for shift in (0..64).step_by(7) {
+fn read_varuint(bytes: &[u8], pos: &mut usize) -> Result<u32, AuthorityKeyError> {
+    let mut value = 0u32;
+    for index in 0..5 {
         let byte = take_byte(bytes, pos)?;
-        let part = (byte & 0x7f) as u64;
-        if shift == 63 && part > 1 {
+        let part = (byte & 0x7f) as u32;
+        if index == 4 && part > 0x0f {
             return Err(AuthorityKeyError(
-                "authority public-key varuint overflows u64".into(),
+                "authority public-key varuint overflows u32".into(),
             ));
         }
-        value |= part << shift;
+        value |= part << (index * 7);
         if byte & 0x80 == 0 {
             return Ok(value);
         }
@@ -321,7 +346,8 @@ fn read_varuint(bytes: &[u8], pos: &mut usize) -> Result<u64, AuthorityKeyError>
     ))
 }
 
-fn write_varuint(mut value: u64, out: &mut Vec<u8>) {
+fn write_varuint(value: usize, out: &mut Vec<u8>) {
+    let mut value = u32::try_from(value).expect("Antelope string length exceeds varuint32");
     loop {
         let mut byte = (value & 0x7f) as u8;
         value >>= 7;
@@ -332,6 +358,15 @@ fn write_varuint(mut value: u64, out: &mut Vec<u8>) {
         if value == 0 {
             return;
         }
+    }
+}
+
+fn varuint_len(value: usize) -> usize {
+    let value = u32::try_from(value).expect("Antelope value exceeds varuint32");
+    if value == 0 {
+        1
+    } else {
+        ((32 - value.leading_zeros()) as usize).div_ceil(7)
     }
 }
 

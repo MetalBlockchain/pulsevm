@@ -20,7 +20,7 @@ use super::{
 ///
 /// The canonical in-memory form is fc's 65-byte `compact_signature`:
 /// `header || r[32] || s[32]`, where `header = 27 + 4 + recovery_id`.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct K1Signature {
     /// header || r || s
     compact: [u8; 65],
