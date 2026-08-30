@@ -63,8 +63,8 @@ const DISABLE_DEFERRED_STAGE_2_DEPENDENCIES: &[&str] =
 fn protocol_feature_spec(feature_digest: [u8; 32]) -> Option<ProtocolFeatureSpec> {
     let digest = hex::encode(feature_digest);
     let (dependencies, preactivation_required) = match digest.as_str() {
-        // PREACTIVATE_FEATURE is enabled at genesis in Leap and may be
-        // activated without a prior preactivation request.
+        // PREACTIVATE_FEATURE is enabled by node configuration and may be
+        // activated directly by a block header without a prior request.
         "0ec7e080177b2c02b278d5088611686b49d739925a92d9bfcacd7fc6b74053bd" => {
             (NO_PROTOCOL_FEATURE_DEPENDENCIES, false)
         }
@@ -3722,10 +3722,9 @@ impl Database {
         activation_block_num: u32,
     ) -> Result<(), ChainError> {
         let queued = self.preactivated_protocol_features();
-        if queued.len() != feature_digests.len()
-            || queued
-                .iter()
-                .any(|digest| !feature_digests.contains(digest))
+        if queued
+            .iter()
+            .any(|digest| !feature_digests.contains(digest))
         {
             return Err(ChainError::BlockError(
                 "protocol feature activation must include the complete preactivation queue"
@@ -3739,9 +3738,21 @@ impl Database {
                     hex::encode(feature_digest)
                 ))
             })?;
-            if !spec.preactivation_required {
+            if feature_digests[..index].contains(feature_digest) {
                 return Err(ChainError::BlockError(format!(
-                    "protocol feature {} cannot be activated from a preactivation queue",
+                    "protocol feature activation contains duplicate {}",
+                    hex::encode(feature_digest)
+                )));
+            }
+            if self.protocol_feature_activated(*feature_digest) {
+                return Err(ChainError::BlockError(format!(
+                    "protocol feature {} is already activated",
+                    hex::encode(feature_digest)
+                )));
+            }
+            if spec.preactivation_required && !queued.contains(feature_digest) {
+                return Err(ChainError::BlockError(format!(
+                    "protocol feature {} requires prior preactivation",
                     hex::encode(feature_digest)
                 )));
             }
@@ -4544,6 +4555,12 @@ mod tests {
         let no_duplicate_deferred_id = parse_protocol_feature_digest(
             "4a90c00d55454dc5b059055ca213579c6ea856967712a56017487886a4d4cc0f",
         );
+        let preactivate_feature = parse_protocol_feature_digest(
+            "0ec7e080177b2c02b278d5088611686b49d739925a92d9bfcacd7fc6b74053bd",
+        );
+        db.activate_protocol_features(&[preactivate_feature], 1)
+            .unwrap();
+        assert!(db.protocol_feature_activated(preactivate_feature));
         assert!(
             db.preactivate_protocol_feature(no_duplicate_deferred_id)
                 .is_err()

@@ -3472,10 +3472,11 @@ impl ChainDatabase {
         Ok(())
     }
 
-    /// Activate the exact preactivation list committed by a block header. The
-    /// list must be non-empty, duplicate-free, and every digest must have been
-    /// preactivated before this block. Activation and queue removal happen in
-    /// one undo-tracked operation, so failed/forked blocks restore both sides.
+    /// Activate the feature list committed by a block header. Validation above
+    /// this storage layer decides which features require preactivation; direct
+    /// activation is valid for features such as PREACTIVATE_FEATURE itself.
+    /// Activation and queue removal happen in one undo-tracked operation, so
+    /// failed/forked blocks restore both sides.
     pub fn activate_protocol_features(
         &self,
         feature_digests: &[[u8; 32]],
@@ -3500,11 +3501,6 @@ impl ChainDatabase {
                     "protocol feature is already activated".into(),
                 ));
             }
-            if !queued.iter().any(|row| row.feature_digest == *digest) {
-                return Err(DbError::Corrupted(
-                    "protocol feature was not preactivated".into(),
-                ));
-            }
             if feature_digests[..ids.len()]
                 .iter()
                 .any(|previous| previous == digest)
@@ -3516,12 +3512,9 @@ impl ChainDatabase {
             ids.push(*digest);
         }
         for digest in ids {
-            let row_id = queued
-                .iter()
-                .find(|row| row.feature_digest == digest)
-                .expect("validated preactivated feature")
-                .id();
-            db.remove::<PreactivatedProtocolFeatureRow>(row_id)?;
+            if let Some(queued_row) = queued.iter().find(|row| row.feature_digest == digest) {
+                db.remove::<PreactivatedProtocolFeatureRow>(queued_row.id())?;
+            }
             db.create::<ProtocolFeatureRow>(|row| {
                 row.feature_digest = digest;
                 row.activation_block_num = activation_block_num;
