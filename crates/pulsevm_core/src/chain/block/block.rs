@@ -308,10 +308,6 @@ impl SignedBlock {
         self.signed_block_header.validate(db)?;
 
         pulse_assert(
-            self.transactions.len() > 0,
-            ChainError::BlockError("block has no transactions".into()),
-        )?;
-        pulse_assert(
             self.block_extensions.is_empty(),
             ChainError::BlockError("block extensions not supported".into()),
         )?;

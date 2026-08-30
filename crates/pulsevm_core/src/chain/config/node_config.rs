@@ -16,6 +16,12 @@ pub struct NodeConfig {
     // its deployed eosio.system WASM remains authoritative.
     #[serde(default = "default_native_system_contract")]
     pub native_system_contract: bool,
+    /// Validate and produce block signatures using Antelope's block-header
+    /// state digest (header + blockroot merkle + pending schedule hash). This is
+    /// required for canonical XPR history replay; Pulse migration chains leave
+    /// it disabled because they start a new block-signing domain.
+    #[serde(default)]
+    pub antelope_block_signatures: bool,
     // Name of the block producer, must be a valid EOSIO name (up to 12 characters, a-z, 1-5)
     pub producer_name: Name,
     // Private key of the block producer, used for signing blocks and transactions

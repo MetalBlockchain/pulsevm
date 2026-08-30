@@ -7,7 +7,7 @@
 //!
 //!   * the timestamp is an ISO-8601 UTC datetime (optionally with a fractional second), read to
 //!     microseconds since the 1970 epoch exactly as `fc::time_point::from_iso_string` does;
-//!   * the key is a `PUB_K1_` string;
+//!   * the key is a modern `PUB_K1_` string or the legacy `EOS` K1 form used by XPR;
 //!   * `initial_configuration` overlays onto the C++ struct defaults, so a `genesis.json` that
 //!     omits `max_transaction_delay` / `deferred_trx_expiration_window` (both value-initialised to
 //!     0 in the `genesis_state` aggregate initialiser) leaves them 0.
@@ -18,8 +18,7 @@ use serde::Deserialize;
 
 use crate::config::ChainConfigV0;
 
-/// The default `max_action_return_value_size` (config.hpp), used when the field
-/// is absent — matching the `genesis_state` aggregate initialiser, which sets it.
+/// The runtime default for `max_action_return_value_size` (config.hpp).
 const DEFAULT_MAX_ACTION_RETURN_VALUE_SIZE: u32 = 256;
 
 /// The subset of `genesis_state` the chain actually consumes at initialization.
@@ -35,6 +34,10 @@ pub struct GenesisState {
     /// does not track it), but part of the genesis serialization the chain id is
     /// computed over, so it is carried here.
     pub max_action_return_value_size: u32,
+    /// Whether `max_action_return_value_size` was present in the genesis JSON.
+    /// EOSIO 2.0-era chains such as XPR predate this configuration field, so
+    /// their chain ID is computed using the older 17-field packed layout.
+    pub chain_id_includes_max_action_return_value_size: bool,
     /// Optional Pulse migration extension. It is the SHA-256 of the Arena
     /// checkpoint committed by a migration manifest. Normal XPR-compatible
     /// genesis files omit it and retain their original packed chain-id layout.
@@ -55,7 +58,14 @@ impl GenesisState {
         let initial_timestamp_micros = iso_to_micros(&raw.initial_timestamp)?;
         let initial_key = K1PublicKey::from_string(&raw.initial_key)
             .map_err(|e| ChainError::GenesisError(format!("invalid genesis key: {e:?}")))?;
-        let max_action_return_value_size = raw.initial_configuration.max_action_return_value_size;
+        let chain_id_includes_max_action_return_value_size = raw
+            .initial_configuration
+            .max_action_return_value_size
+            .is_some();
+        let max_action_return_value_size = raw
+            .initial_configuration
+            .max_action_return_value_size
+            .unwrap_or(DEFAULT_MAX_ACTION_RETURN_VALUE_SIZE);
         let initial_configuration = raw.initial_configuration.into();
         let migration_checkpoint_sha256 = raw
             .migration_checkpoint_sha256
@@ -68,6 +78,7 @@ impl GenesisState {
             initial_key,
             initial_configuration,
             max_action_return_value_size,
+            chain_id_includes_max_action_return_value_size,
             migration_checkpoint_sha256,
         })
     }
@@ -81,7 +92,9 @@ impl GenesisState {
     /// `genesis_state::compute_chain_id`. fc packs the reflected members in
     /// declaration order — the timestamp as an i64 microsecond count, the key in
     /// its 34-byte form, then each `chain_config` field as its little-endian
-    /// integer (ending with `max_action_return_value_size`).
+    /// integer. Modern genesis files end with
+    /// `max_action_return_value_size`; EOSIO 2.0-era files use the historical
+    /// 17-field layout and omit it.
     pub fn compute_chain_id(&self) -> [u8; 32] {
         let mut buf: Vec<u8> = Vec::with_capacity(34 + 8 + 19 * 4 + 32);
         let c = &self.initial_configuration;
@@ -106,13 +119,13 @@ impl GenesisState {
         buf.extend_from_slice(&c.max_inline_action_size.to_le_bytes());
         buf.extend_from_slice(&c.max_inline_action_depth.to_le_bytes());
         buf.extend_from_slice(&c.max_authority_depth.to_le_bytes());
-        buf.extend_from_slice(&self.max_action_return_value_size.to_le_bytes());
+        if self.chain_id_includes_max_action_return_value_size {
+            buf.extend_from_slice(&self.max_action_return_value_size.to_le_bytes());
+        }
 
-        // XPR's reflected genesis has no field after
-        // `max_action_return_value_size`. Pulse uses a trailing binary extension
-        // only for migration chains, which preserves ordinary XPR-compatible
-        // chain ids while ensuring every migration checkpoint has a distinct
-        // target chain identity.
+        // Pulse uses a trailing binary extension only for migration chains,
+        // which preserves ordinary XPR-compatible chain ids while ensuring
+        // every migration checkpoint has a distinct target chain identity.
         if let Some(checkpoint_sha256) = self.migration_checkpoint_sha256 {
             buf.extend_from_slice(&checkpoint_sha256);
         }
@@ -152,8 +165,8 @@ fn hex_nibble(byte: u8) -> u8 {
     }
 }
 
-/// The genesis `chain_config` fields. Unknown keys (e.g.
-/// `max_action_return_value_size`, which the runtime does not track) are ignored;
+/// The genesis `chain_config` fields. `max_action_return_value_size` is retained
+/// for chain-ID packing even though `ChainConfigV0` does not track it at runtime;
 /// `deferred_trx_expiration_window` and `max_transaction_delay` default to 0 to
 /// match the C++ `genesis_state` aggregate initialiser, which omits them.
 #[derive(Deserialize)]
@@ -177,12 +190,8 @@ struct RawConfig {
     max_inline_action_size: u32,
     max_inline_action_depth: u16,
     max_authority_depth: u16,
-    #[serde(default = "default_max_action_return_value_size")]
-    max_action_return_value_size: u32,
-}
-
-fn default_max_action_return_value_size() -> u32 {
-    DEFAULT_MAX_ACTION_RETURN_VALUE_SIZE
+    #[serde(default)]
+    max_action_return_value_size: Option<u32>,
 }
 
 impl From<RawConfig> for ChainConfigV0 {
@@ -276,6 +285,23 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn xpr_mainnet_genesis_has_canonical_chain_id() {
+        let genesis = GenesisState::from_json(include_str!(
+            "../../../tools/xpr-chainbase-export/xpr-mainnet-genesis.json"
+        ))
+        .unwrap();
+        let chain_id: String = genesis
+            .compute_chain_id()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(
+            chain_id,
+            "384da888112027f0321850a169f737c33e53b388aad48b5adace4bab97f437e0"
+        );
+    }
 
     #[test]
     fn parses_epoch_and_fractions() {

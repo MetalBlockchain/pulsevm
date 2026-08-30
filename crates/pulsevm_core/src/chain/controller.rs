@@ -189,6 +189,110 @@ pub static NATIVE_SYSTEM_HANDLERS: LazyLock<HashMap<Name, ApplyHandlerFn>> = Laz
     ])
 });
 
+/// Antelope's append-only blockroot merkle. Only the active frontier is kept,
+/// so adding one block is logarithmic and the complete history is unnecessary.
+#[derive(Clone, Debug, Default)]
+struct IncrementalBlockMerkle {
+    active_nodes: Vec<Digest>,
+    node_count: u64,
+}
+
+impl IncrementalBlockMerkle {
+    fn root(&self) -> Digest {
+        self.active_nodes.last().copied().unwrap_or_default()
+    }
+
+    fn append(&mut self, digest: Digest) -> Result<(), ChainError> {
+        let next_count = self
+            .node_count
+            .checked_add(1)
+            .ok_or_else(|| ChainError::BlockError("blockroot merkle overflow".into()))?;
+        let implied_count = next_count.next_power_of_two();
+        let max_depth = (u64::BITS - implied_count.leading_zeros()) as usize;
+        let mut current_depth = max_depth - 1;
+        let mut index = self.node_count;
+        let mut top = digest;
+        let mut active_index = 0usize;
+        let mut updated = Vec::with_capacity(max_depth);
+        let mut partial = false;
+
+        while current_depth > 0 {
+            if index & 1 == 0 {
+                if !partial {
+                    updated.push(top);
+                }
+                top = hash_digest_pair(top, top);
+                partial = true;
+            } else {
+                let left = self
+                    .active_nodes
+                    .get(active_index)
+                    .copied()
+                    .ok_or_else(|| {
+                        ChainError::BlockError("invalid blockroot merkle frontier".into())
+                    })?;
+                active_index += 1;
+                if partial {
+                    updated.push(left);
+                }
+                top = hash_digest_pair(left, top);
+            }
+            current_depth -= 1;
+            index >>= 1;
+        }
+        updated.push(top);
+        self.active_nodes = updated;
+        self.node_count = next_count;
+        Ok(())
+    }
+}
+
+fn hash_digest_pair(left: Digest, right: Digest) -> Digest {
+    let mut bytes = Vec::with_capacity(64);
+    bytes.extend_from_slice(&left.0);
+    bytes.extend_from_slice(&right.0);
+    Digest::hash(&bytes)
+}
+
+/// The two pieces of Antelope header state committed by every producer
+/// signature but not present in the block header itself.
+#[derive(Clone, Debug, Default)]
+struct HeaderSigningState {
+    blockroot_merkle: IncrementalBlockMerkle,
+    pending_schedule_hash: Digest,
+}
+
+impl HeaderSigningState {
+    fn from_genesis(genesis_id: &Id, schedule: &ProducerSchedule) -> Result<Self, ChainError> {
+        let mut state = Self {
+            blockroot_merkle: IncrementalBlockMerkle::default(),
+            pending_schedule_hash: Digest::hash(&schedule.pack().map_err(|error| {
+                ChainError::SerializationError(format!("pack genesis producer schedule: {error}"))
+            })?),
+        };
+        state.blockroot_merkle.append(Digest(genesis_id.0.0))?;
+        Ok(state)
+    }
+
+    fn signing_digest(&self, header: &BlockHeader) -> Result<Digest, ChainError> {
+        let header_digest = Digest::hash(&header.pack().map_err(|error| {
+            ChainError::SerializationError(format!("pack block header for signature: {error}"))
+        })?);
+        let header_root = hash_digest_pair(header_digest, self.blockroot_merkle.root());
+        Ok(hash_digest_pair(header_root, self.pending_schedule_hash))
+    }
+
+    fn accept(&mut self, block: &SignedBlock) -> Result<(), ChainError> {
+        self.blockroot_merkle.append(Digest(block.id()?.0.0))?;
+        if let Some(schedule) = &block.signed_block_header.header.new_producers {
+            self.pending_schedule_hash = Digest::hash(&schedule.pack().map_err(|error| {
+                ChainError::SerializationError(format!("pack pending producer schedule: {error}"))
+            })?);
+        }
+        Ok(())
+    }
+}
+
 pub struct Controller {
     wasm_runtime: WasmRuntime,
     last_accepted_block: SignedBlock,
@@ -229,6 +333,10 @@ pub struct Controller {
     // a block whose header carries `new_producers`, and reconstructed from the
     // block log on restart — it is never read from an out-of-band source.
     active_schedule: ProducerSchedule,
+
+    // Antelope header-signing state at `last_accepted_block_id`. Canonical XPR
+    // signatures commit to this state in addition to the packed header.
+    header_signing_state: HeaderSigningState,
 
     // Schedule in force for the block currently executing. Contracts read this
     // through get_active_producers/set_proposed_producers.
@@ -467,6 +575,7 @@ impl Controller {
             db_path: None,
             snapshot_cache: None,
             active_schedule: ProducerSchedule::default(),
+            header_signing_state: HeaderSigningState::default(),
             block_active_schedule: ProducerSchedule::default(),
 
             pending_chain: Vec::new(),
@@ -745,6 +854,7 @@ impl Controller {
         );
 
         // Set our last accepted block to the genesis block
+        let antelope_genesis = !native_system_contract;
         self.last_accepted_block = SignedBlock::new(
             Id::default(),
             // Rebuild the genesis block timestamp from the parsed micro count
@@ -752,13 +862,34 @@ impl Controller {
             BlockTimestamp::from(TimePoint::new(Microseconds::new(
                 rust_genesis.initial_timestamp_micros,
             ))),
-            self.node_config.as_ref().unwrap().producer_name,
+            if antelope_genesis {
+                // EOSIO/Antelope authors the exceptional genesis block with an
+                // empty producer name. The initial schedule still assigns the
+                // configured producer starting with block 2.
+                Name::default()
+            } else {
+                self.node_config.as_ref().unwrap().producer_name
+            },
             VecDeque::new(),
             Digest::default(),
-            Digest::default(), // Placeholder action merkle root
+            if antelope_genesis {
+                Digest(derived_chain_id.0.0)
+            } else {
+                Digest::default()
+            },
         );
+        if antelope_genesis {
+            // Leap's genesis header is the one exceptional block with
+            // `confirmed = 1`; its action root commits the genesis chain id.
+            self.last_accepted_block
+                .signed_block_header
+                .header
+                .confirmed = 1;
+        }
         self.last_accepted_block_id = self.last_accepted_block.id()?;
         self.preferred_id = self.last_accepted_block.id()?;
+        self.header_signing_state =
+            HeaderSigningState::from_genesis(&self.last_accepted_block_id, &self.active_schedule)?;
 
         let revision = self.db.revision();
         info!("database revision: {}", revision);
@@ -875,6 +1006,23 @@ impl Controller {
                 // `new_producers` names the schedule in force, and if none did the
                 // base above still stands.
                 self.reconstruct_schedule_from_log(start, end)?;
+                if self
+                    .node_config
+                    .as_ref()
+                    .is_some_and(|config| config.antelope_block_signatures)
+                {
+                    // Rebuild the compact signing frontier alongside the
+                    // accepted block log. A genesis-based XPR replay retains the
+                    // complete log, so this reproduces nodeos header state.
+                    for height in start.max(genesis_height + 1)..=end {
+                        let block = self.get_block_by_height(height)?.ok_or_else(|| {
+                            ChainError::DatabaseError(format!(
+                                "missing block {height} while rebuilding Antelope signing state"
+                            ))
+                        })?;
+                        self.header_signing_state.accept(&block)?;
+                    }
+                }
             }
         }
 
@@ -1087,15 +1235,9 @@ impl Controller {
         // onblock heads the block, before any mempool transaction, so its action
         // digests come first in the action merkle — matching what validators
         // recompute in `execute_block`.
-        let producer = self.node_config.as_ref().unwrap().producer_name;
         let previous = self.preferred_id;
-        let (onblock_digests, mut proposed_schedule) = self.run_onblock(
-            protocol_context,
-            &timestamp,
-            producer,
-            previous,
-            &block_status,
-        )?;
+        let (onblock_digests, mut proposed_schedule) =
+            self.run_onblock(protocol_context, &timestamp, previous, &block_status)?;
         action_receipt_digests.extend(onblock_digests);
         // onblock's proposal counts like any transaction's (eosio.system elects
         // producers from there); a later transaction's proposal overrides it.
@@ -1349,7 +1491,12 @@ impl Controller {
 
         // Sign the block with the producer's key over the full header — including
         // any schedule change — so validators authenticate it against the schedule.
-        let sig_digest = block.signed_block_header.header.sig_digest()?;
+        let sig_digest = if node.antelope_block_signatures {
+            self.header_signing_state_for_parent(&self.preferred_id)?
+                .signing_digest(&block.signed_block_header.header)?
+        } else {
+            block.signed_block_header.header.sig_digest()?
+        };
         block.signed_block_header.signature = node.producer_key.sign(&sig_digest)?;
 
         // We built this block so no need to verify it again. Delay exposing it
@@ -1410,6 +1557,31 @@ impl Controller {
         )))
     }
 
+    fn header_signing_state_for_parent(
+        &self,
+        parent_id: &Id,
+    ) -> Result<HeaderSigningState, ChainError> {
+        if *parent_id == self.last_accepted_block_id {
+            return Ok(self.header_signing_state.clone());
+        }
+        let mut state = self.header_signing_state.clone();
+        for pending in &self.pending_chain {
+            let block = self.verified_blocks.get(&pending.id).ok_or_else(|| {
+                ChainError::BlockError(format!(
+                    "pending block {} is missing while deriving Antelope signing state",
+                    pending.id
+                ))
+            })?;
+            state.accept(block)?;
+            if pending.id == *parent_id {
+                return Ok(state);
+            }
+        }
+        Err(ChainError::BlockError(format!(
+            "cannot resolve Antelope signing state for unknown parent {parent_id}"
+        )))
+    }
+
     fn timestamp_for_parent(&self, parent_id: &Id) -> Result<BlockTimestamp, ChainError> {
         if *parent_id == self.last_accepted_block_id {
             return Ok(*self.last_accepted_block.timestamp());
@@ -1453,6 +1625,7 @@ impl Controller {
         &self,
         block: &SignedBlock,
         schedule: &ProducerSchedule,
+        signing_state: &HeaderSigningState,
     ) -> Result<(), ChainError> {
         let header = &block.signed_block_header.header;
         let expected = schedule
@@ -1463,7 +1636,15 @@ impl Controller {
                     header.producer
                 ))
             })?;
-        let digest = header.sig_digest()?;
+        let digest = if self
+            .node_config
+            .as_ref()
+            .is_some_and(|config| config.antelope_block_signatures)
+        {
+            signing_state.signing_digest(header)?
+        } else {
+            header.sig_digest()?
+        };
         let signer = block
             .signed_block_header
             .signature
@@ -1559,13 +1740,14 @@ impl Controller {
         // reach the same verdict regardless of accept timing.
         block.validate_syntactically(&self.db)?;
         let parent_schedule = self.schedule_active_for_parent(block.previous_id())?;
+        let parent_signing_state = self.header_signing_state_for_parent(block.previous_id())?;
         let parent_timestamp = self.timestamp_for_parent(block.previous_id())?;
         let now_timestamp: BlockTimestamp = TimePoint::now().into();
         block
             .signed_block_header
             .header
             .validate_timestamp(&parent_timestamp, &now_timestamp)?;
-        self.verify_block_signature(block, &parent_schedule)?;
+        self.verify_block_signature(block, &parent_schedule, &parent_signing_state)?;
         self.block_active_schedule = parent_schedule.clone();
 
         let parent_block_id = block.previous_id().clone();
@@ -1643,6 +1825,9 @@ impl Controller {
             )));
         }
         let accepted_schedule = block.signed_block_header.header.new_schedule().clone();
+        let mut accepted_signing_state =
+            self.header_signing_state_for_parent(block.previous_id())?;
+        accepted_signing_state.accept(&block)?;
 
         // Pack the block before touching the pending chain. In the fast path below
         // the front session is `remove`d from the chain but only detached from
@@ -1774,6 +1959,7 @@ impl Controller {
         self.verified_blocks.remove(block_id);
         self.last_accepted_block = block.clone();
         self.last_accepted_block_id = accepted_block_id;
+        self.header_signing_state = accepted_signing_state;
         self.db.commit(block.block_num() as i64)?;
         for upgrade in self
             .protocol_upgrade_schedule
@@ -1891,23 +2077,21 @@ impl Controller {
     fn run_onblock(
         &mut self,
         protocol_context: ProtocolExecutionContext,
-        timestamp: &BlockTimestamp,
-        producer: Name,
+        pending_block_timestamp: &BlockTimestamp,
         previous: Id,
         block_status: &BlockStatus,
     ) -> Result<(VecDeque<Digest>, Option<Vec<ProducerKey>>), ChainError> {
-        let header = BlockHeader {
-            timestamp: timestamp.clone(),
-            producer,
-            confirmed: 0,
-            previous,
-            transaction_mroot: Digest::default(),
-            action_mroot: Digest::default(),
-            schedule_version: 0,
-            new_producers: None,
-            header_extensions: vec![],
-        };
-        let header_bytes = header.pack().map_err(|e| {
+        // Antelope's implicit onblock action carries the exact header of the
+        // current head (the parent), not a partially assembled header for the
+        // block being executed. This distinction is consensus-visible through
+        // the action receipt digest even when the block has no transactions.
+        let parent = self.get_block(previous)?.ok_or_else(|| {
+            ChainError::BlockError(format!(
+                "cannot execute onblock without parent block {}",
+                previous
+            ))
+        })?;
+        let header_bytes = parent.signed_block_header.header.pack().map_err(|e| {
             ChainError::SerializationError(format!("failed to pack onblock header: {}", e))
         })?;
 
@@ -1931,7 +2115,7 @@ impl Controller {
             self.db.clone(),
             self.wasm_runtime.clone(),
             protocol_context,
-            timestamp.clone(),
+            pending_block_timestamp.clone(),
             &trx_id,
             *block_status,
             packed,
@@ -2020,7 +2204,6 @@ impl Controller {
         let (onblock_digests, mut proposed_schedule) = self.run_onblock(
             protocol_context,
             &header.timestamp,
-            header.producer,
             header.previous,
             block_status,
         )?;
@@ -3417,7 +3600,10 @@ mod tests {
                 TransactionHeader,
             },
         },
-        crypto::PrivateKey,
+        crypto::{
+            PrivateKey,
+            Signature,
+        },
     };
 
     use super::*;
@@ -4815,6 +5001,121 @@ mod tests {
             &BlockStatus::Building,
         )?;
         assert!(db.is_account(Name::from_str("alice")?.as_u64())?);
+        Ok(())
+    }
+
+    #[test]
+    fn xpr_mainnet_genesis_reproduces_canonical_block_one() -> Result<(), ChainError> {
+        let chain_id =
+            Id::from_str("384da888112027f0321850a169f737c33e53b388aad48b5adace4bab97f437e0")
+                .unwrap();
+        let private_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let config_bytes = json!({
+            "system_account": "eosio",
+            "native_system_contract": false,
+            "antelope_block_signatures": true,
+            "producer_name": "eosio",
+            "producer_key": private_key.to_string(),
+        })
+        .to_string()
+        .into_bytes();
+        let genesis_bytes =
+            include_bytes!("../../../../tools/xpr-chainbase-export/xpr-mainnet-genesis.json")
+                .to_vec();
+        let temp = get_temp_dir();
+        let mut controller = Controller::new();
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &genesis_bytes,
+            temp.path().to_str().unwrap(),
+        )?;
+
+        assert_eq!(controller.genesis_chain_id, chain_id);
+        assert_eq!(
+            controller.last_accepted_block().id()?.to_string(),
+            "000000018421bd47ce23d4c47706e0bb98604157afedc67d56d05c82d5aa10c5"
+        );
+        assert_eq!(
+            controller
+                .last_accepted_block()
+                .signed_block_header
+                .header
+                .action_mroot,
+            Digest(chain_id.0.0)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn xpr_mainnet_canonical_block_two_replays() -> Result<(), ChainError> {
+        let chain_id =
+            Id::from_str("384da888112027f0321850a169f737c33e53b388aad48b5adace4bab97f437e0")
+                .unwrap();
+        let config_bytes = json!({
+            "system_account": "eosio",
+            "native_system_contract": false,
+            "antelope_block_signatures": true,
+            "producer_name": "eosio",
+            "producer_key": "PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez",
+        })
+        .to_string()
+        .into_bytes();
+        let genesis_bytes =
+            include_bytes!("../../../../tools/xpr-chainbase-export/xpr-mainnet-genesis.json")
+                .to_vec();
+        let temp = get_temp_dir();
+        let mut controller = Controller::new();
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &genesis_bytes,
+            temp.path().to_str().unwrap(),
+        )?;
+
+        let parent = controller.last_accepted_block();
+        let mut block = SignedBlock::new(
+            parent.id()?,
+            BlockTimestamp::new(parent.timestamp().slot() + 10),
+            Name::from_str("eosio")?,
+            VecDeque::new(),
+            Digest::default(),
+            Digest(
+                hex::decode("508211b515e600e67737f3f4de83b3d74b6000c4bd2bf8951ec13a8d2cfc0792")
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+            ),
+        );
+        block.signed_block_header.signature = Signature::from_str(
+            "SIG_K1_K9pFVXCf4A6HDm4k7A7wnhqxSxvxC43cVEJh5PoZmKVcyvHQBrYsWMcaBKjbJBrS2at6qsKSYunuZ6gE67fkHaQv9c4HPA",
+        )?;
+        assert_eq!(
+            block.id()?.to_string(),
+            "00000002f6d64c4a3ed0dda0bd465d7f7cac8a87fe220ba30f0f0385a994b492"
+        );
+
+        let header_digest = Digest::hash(&block.signed_block_header.header.pack()?);
+        let mut header_and_root = header_digest.0.to_vec();
+        header_and_root.extend_from_slice(&parent.id()?.0.0);
+        let header_root_digest = Digest::hash(&header_and_root);
+        let schedule_hash = Digest::hash(&controller.active_schedule.pack()?);
+        let mut signing_payload = header_root_digest.0.to_vec();
+        signing_payload.extend_from_slice(&schedule_hash.0);
+        let antelope_signing_digest = Digest::hash(&signing_payload);
+        assert_eq!(
+            block
+                .signed_block_header
+                .signature
+                .recover_public_key(&antelope_signing_digest)?,
+            controller.active_schedule.producers[0].block_signing_key
+        );
+
+        let mut mempool = Mempool::new();
+        controller.verify_block(&block, &mut mempool).await?;
+        controller.accept_block(&block.id()?, &mut mempool)?;
+        assert_eq!(controller.last_accepted_block().id()?, block.id()?);
         Ok(())
     }
 
@@ -7489,7 +7790,6 @@ mod tests {
         let (digests, _) = controller.run_onblock(
             protocol_context,
             &timestamp,
-            PULSE_NAME,
             previous,
             &BlockStatus::Building,
         )?;
@@ -7601,7 +7901,6 @@ mod tests {
         let (digests, _) = controller.run_onblock(
             protocol_context,
             &timestamp,
-            PULSE_NAME,
             previous,
             &BlockStatus::Building,
         )?;
@@ -7665,7 +7964,6 @@ mod tests {
         let (digests, _) = controller.run_onblock(
             controller.ensure_protocol_version_supported(2)?,
             &timestamp,
-            PULSE_NAME,
             previous,
             &BlockStatus::Building,
         )?;

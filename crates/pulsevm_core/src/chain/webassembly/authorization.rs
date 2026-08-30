@@ -110,10 +110,16 @@ pub fn get_code_hash(
         ));
     }
 
-    let (code_sequence, code_hash, vm_type, vm_version) = env_data
+    let (code_sequence, code_hash, mut vm_type, mut vm_version) = env_data
         .db()
         .account_code_info(account)
         .map_err(|error| RuntimeError::new(error.to_string()))?;
+    // Leap reports the metadata row's sequence for an account with no code,
+    // but normalizes the VM fields along with the empty code hash.
+    if code_hash == [0; 32] {
+        vm_type = 0;
+        vm_version = 0;
+    }
     let mut packed = Vec::with_capacity(43);
     packed.push(0); // struct_version, encoded as unsigned varuint32(0)
     packed.extend_from_slice(&code_sequence.to_le_bytes());
@@ -121,11 +127,14 @@ pub fn get_code_hash(
     packed.push(vm_type);
     packed.push(vm_version);
 
-    let copy_size = packed_len.min(packed.len() as u32);
-    env_data.charge(&mut store, cost::DB_FIND + cost::per_byte(copy_size as u64))?;
-    if copy_size == 0 {
+    env_data.charge(&mut store, cost::DB_FIND)?;
+    // nodeos only packs when the complete result fits; it never exposes a
+    // truncated prefix. Callers commonly probe the required size with a null or
+    // short buffer and retry.
+    if packed_len < packed.len() as u32 {
         return Ok(packed.len() as u32);
     }
+    env_data.charge(&mut store, cost::per_byte(packed.len() as u64))?;
 
     let memory = env_data
         .memory()
@@ -133,7 +142,7 @@ pub fn get_code_hash(
         .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
     packed_ptr
-        .slice(&view, copy_size)?
-        .write_slice(&packed[..copy_size as usize])?;
+        .slice(&view, packed.len() as u32)?
+        .write_slice(&packed)?;
     Ok(packed.len() as u32)
 }

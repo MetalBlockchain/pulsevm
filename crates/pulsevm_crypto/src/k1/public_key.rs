@@ -73,10 +73,18 @@ impl K1PublicKey {
         format!("PUB_K1_{}", encode_b58_checked(&self.compressed, K1_SUFFIX))
     }
 
-    /// Parse a `PUB_K1_...` string.
+    /// Parse a modern `PUB_K1_...` or legacy `EOS...` public-key string.
+    /// Legacy EOS keys use the same compressed secp256k1 point with a RIPEMD160
+    /// checksum that omits the modern `K1` suffix.
     pub fn from_string(s: &str) -> Result<Self, K1Error> {
-        let data = s.strip_prefix("PUB_K1_").ok_or(K1Error::BadPrefix)?;
-        let bytes = decode_b58_checked(data, 33, K1_SUFFIX)?;
+        let (data, suffix): (&str, &[u8]) = if let Some(data) = s.strip_prefix("PUB_K1_") {
+            (data, K1_SUFFIX)
+        } else if let Some(data) = s.strip_prefix("EOS") {
+            (data, b"")
+        } else {
+            return Err(K1Error::BadPrefix);
+        };
+        let bytes = decode_b58_checked(data, 33, suffix)?;
         let mut compressed = [0u8; 33];
         compressed.copy_from_slice(&bytes);
         Self::from_compressed(&compressed)
@@ -92,5 +100,27 @@ impl core::fmt::Display for K1PublicKey {
 impl core::fmt::Debug for K1PublicKey {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "K1PublicKey({})", self.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::K1PublicKey;
+
+    #[test]
+    fn legacy_xpr_genesis_key_decodes_to_the_same_k1_point() {
+        let legacy =
+            K1PublicKey::from_string("EOS5XPRJt1zUiLH98rtDLj9TnPi52DLQ7gTZbkRvBGJXLv6ak6Cdq")
+                .unwrap();
+        let modern = K1PublicKey::from_string(&legacy.to_string()).unwrap();
+        assert_eq!(legacy, modern);
+    }
+
+    #[test]
+    fn legacy_key_checksum_is_validated() {
+        assert!(
+            K1PublicKey::from_string("EOS5XPRJt1zUiLH98rtDLj9TnPi52DLQ7gTZbkRvBGJXLv6ak6Cdr")
+                .is_err()
+        );
     }
 }
