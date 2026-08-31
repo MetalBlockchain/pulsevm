@@ -34,6 +34,8 @@ RUNNER_ROOT_DATA_DIR="${METAL_NETWORK_RUNNER_ROOT_DATA_DIR:-}"
 RUNNER_REASSIGN_PORTS_IF_USED="${METAL_NETWORK_RUNNER_REASSIGN_PORTS_IF_USED:-false}"
 MIGRATION_GENESIS=""
 RUNNER_START_ARGS=()
+RUNNER_SERVER_ARGS=()
+RUNNER_NODE_BINARY_FLAG=""
 GENESIS_PATH="${PULSEVM_GENESIS_PATH:-$REPO/genesis.json}"
 
 if [[ -n "$RUNNER_ROOT_DATA_DIR" ]]; then
@@ -65,6 +67,30 @@ if [[ ! -x "$NETWORK_RUNNER" ]]; then
     go install github.com/MetalBlockchain/metal-network-runner@latest
     NETWORK_RUNNER="$(go env GOPATH)/bin/metal-network-runner"
   fi
+fi
+
+# Metal Network Runner renamed the node-binary option while retaining
+# compatibility with MetalGo. Accept both CLI generations so the migration
+# harness does not depend on a particular runner release.
+RUNNER_START_HELP="$("$NETWORK_RUNNER" control start --help 2>&1)"
+if grep -q -- '--metalgo-path' <<<"$RUNNER_START_HELP"; then
+  RUNNER_NODE_BINARY_FLAG="--metalgo-path"
+elif grep -q -- '--avalanchego-path' <<<"$RUNNER_START_HELP"; then
+  RUNNER_NODE_BINARY_FLAG="--avalanchego-path"
+else
+  echo "error: metal-network-runner exposes no supported node-binary flag." >&2
+  exit 1
+fi
+
+RUNNER_SERVER_ARGS=(--log-level info --port="$RUNNER_PORT")
+RUNNER_SERVER_HELP="$("$NETWORK_RUNNER" server --help 2>&1)"
+if grep -q -- '--disable-grpc-gateway' <<<"$RUNNER_SERVER_HELP"; then
+  # The validation harness uses the native gRPC control endpoint. Disabling the
+  # unused gateway also avoids runner versions that incorrectly prepend
+  # "localhost" to an already host-qualified loopback listener.
+  RUNNER_SERVER_ARGS+=(--disable-grpc-gateway)
+else
+  RUNNER_SERVER_ARGS+=(--grpc-gateway-port="$RUNNER_GATEWAY_PORT")
 fi
 
 if ! command -v jq >/dev/null 2>&1; then
@@ -133,7 +159,7 @@ if [[ -n "${PULSEVM_MIGRATION_CHECKPOINT:-}" ]]; then
 fi
 
 echo "==> Starting metal-network-runner server (background)"
-"$NETWORK_RUNNER" server --log-level info --port="$RUNNER_PORT" --grpc-gateway-port="$RUNNER_GATEWAY_PORT" &
+"$NETWORK_RUNNER" server "${RUNNER_SERVER_ARGS[@]}" &
 ANR_PID=$!
 trap 'rm -f -- "$MIGRATION_GENESIS"; kill $ANR_PID 2>/dev/null || true' EXIT
 sleep 3
@@ -142,7 +168,7 @@ echo "==> Launching a 5-node cluster running PulseVM"
 "$NETWORK_RUNNER" control start --log-level info \
   --endpoint="$RUNNER_ENDPOINT" \
   --number-of-nodes=5 \
-  --metalgo-path "$METALGO_EXEC_PATH" \
+  "$RUNNER_NODE_BINARY_FLAG" "$METALGO_EXEC_PATH" \
   --plugin-dir "$PLUGIN_DIR" \
   "${RUNNER_START_ARGS[@]}" \
   --blockchain-specs "$BLOCKCHAIN_SPECS"

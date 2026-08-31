@@ -82,14 +82,14 @@ sidecar_chain_id="$(jq -er '.source_chain_id' "$sidecar")"
 }
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-(cd "$repo_root" && cargo run --quiet --locked -p pulsevm_database --example xpr_history_window_check -- \
+(cd "$repo_root" && cargo run --quiet --release --locked -p pulsevm_database --example xpr_history_window_check -- \
     "$history_log" 0
 )
-(cd "$repo_root" && cargo run --quiet --locked -p pulsevm_database --example xpr_19_table_compare -- \
+(cd "$repo_root" && cargo run --quiet --release --locked -p pulsevm_database --example xpr_19_table_compare -- \
     "$history_log" "$checkpoint" "$arena_dir" "$source_chain_id" \
     "$export_dir/19-table-comparison.json"
 )
-(cd "$repo_root" && cargo run --quiet --locked -p pulsevm_database --example xpr_code_object_audit -- \
+(cd "$repo_root" && cargo run --quiet --release --locked -p pulsevm_database --example xpr_code_object_audit -- \
     "$history_log" "$sidecar" >"$export_dir/code-object-audit.txt"
 )
 

@@ -286,9 +286,38 @@ tools/xpr-chainbase-export/validate-mainnet-export.sh \
 
 The validator is the required Mainnet-export gate; no Mainnet export is called
 validated until it produces both reports. `set_proposed_producers_ex` format 1
-(multi-key producer authorities) remains explicitly rejected by the current
-single-key Arena schedule model and must be addressed before claiming complete
-execution parity.
+is accepted only when every authority is exactly reducible to one satisfying K1
+key. General weighted multi-key block signatures still require a wider Arena
+schedule and signature model.
+
+## Complete historical execution gate
+
+Snapshot parity proves that one full nodeos state converts exactly; it does not
+prove that PulseVM can execute every transition that produced that state. Build
+a fixed genesis-to-LIB corpus from matching BloxProd block/state archives and a
+short P2P catch-up:
+
+```bash
+XPR_NODEOS=/path/to/nodeos \
+XPR_CONFIG_DIR=/path/to/xpr-node/config \
+  scripts/catch-up-xpr-mainnet-archive.sh
+```
+
+The script resumes downloads, extracts both archives, pins the reference API's
+current irreversible block, catches nodeos up to that boundary, verifies its
+block ID, and writes `corpus-report.json`. Replay that immutable corpus through
+the production verification and acceptance path:
+
+```bash
+XPR_REPLAY_CHECKPOINT_INTERVAL=1000000 \
+  cargo run --release --locked -p pulsevm_core \
+    --example xpr_blocklog_replay -- \
+    /data/xpr-mainnet-current-node/blocks /data/xpr-arena-replay
+```
+
+The replay is sequential because every block executes against its parent's
+state. It is resumable at durable Arena checkpoints and automatically rewinds
+an orphaned block-log tail after an interrupted run.
 
 ## Five-node live replay
 
