@@ -2826,16 +2826,12 @@ impl ApplyContext {
     pub fn set_proposed_producers(
         &mut self,
         producers: Vec<ProducerKey>,
-    ) -> Result<(), ChainError> {
+    ) -> Result<i64, ChainError> {
         self.trx_context.set_proposed_producers(producers)
     }
 
     pub fn active_producers(&self) -> Result<Vec<ProducerKey>, ChainError> {
         self.trx_context.active_producers()
-    }
-
-    pub fn active_schedule_version(&self) -> Result<u32, ChainError> {
-        self.trx_context.active_schedule_version()
     }
 
     pub fn validate_ram_usage(&self, account: &Name) -> Result<(), ChainError> {

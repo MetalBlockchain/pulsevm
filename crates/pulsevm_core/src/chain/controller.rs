@@ -470,6 +470,11 @@ pub struct Controller {
     // through get_active_producers/set_proposed_producers.
     block_active_schedule: ProducerSchedule,
 
+    // Pending schedule visible while the current block executes. It is not
+    // returned by get_active_producers, but Leap bases the next proposed version
+    // and equality check on it when present.
+    block_pending_schedule: Option<ProducerSchedule>,
+
     // The chain of blocks that have been executed (during build or verify) but
     // not yet accepted, ordered oldest first. Their state is materialized on the
     // live database as a stack of arena undo sessions on top of
@@ -702,6 +707,7 @@ impl Controller {
             pending_schedule: None,
             header_signing_state: HeaderSigningState::default(),
             block_active_schedule: ProducerSchedule::default(),
+            block_pending_schedule: None,
 
             pending_chain: Vec::new(),
             blocks_executed: 0,
@@ -1402,6 +1408,14 @@ impl Controller {
             None
         };
 
+        self.block_pending_schedule = if new_pending_schedule.is_some() {
+            new_pending_schedule.clone()
+        } else if block_schedule.version == parent_schedule_state.active.version {
+            parent_schedule_state.pending.clone()
+        } else {
+            None
+        };
+
         // onblock heads the block, before any mempool transaction, so its action
         // digests come first in the action merkle — matching what validators
         // recompute in `execute_block`.
@@ -1700,10 +1714,6 @@ impl Controller {
         )))
     }
 
-    fn schedule_active_for_parent(&self, parent_id: &Id) -> Result<ProducerSchedule, ChainError> {
-        Ok(self.schedule_state_for_parent(parent_id)?.active)
-    }
-
     fn header_signing_state_for_parent(
         &self,
         parent_id: &Id,
@@ -1896,6 +1906,7 @@ impl Controller {
             self.verify_block_signature(block, &block_schedule, &parent_signing_state)?;
         }
         self.block_active_schedule = block_schedule;
+        self.block_pending_schedule = block_schedule_state.pending;
 
         let parent_block_id = block.previous_id().clone();
         let block_status = BlockStatus::Verifying;
@@ -2244,9 +2255,12 @@ impl Controller {
         &self,
         trx_context: &TransactionContext,
     ) -> Result<(), ChainError> {
-        trx_context.set_active_schedule(
+        trx_context.set_producer_schedules(
             self.block_active_schedule.producers.clone(),
             self.block_active_schedule.version,
+            self.block_pending_schedule
+                .as_ref()
+                .map(|schedule| (schedule.producers.clone(), schedule.version)),
         )
     }
 
@@ -2358,6 +2372,7 @@ impl Controller {
         let mut schedule_state = self.schedule_state_for_parent(block.previous_id())?;
         let schedule_promoted = schedule_state.apply_header(&block.signed_block_header.header)?;
         self.block_active_schedule = schedule_state.active;
+        self.block_pending_schedule = schedule_state.pending;
 
         // Protocol features take effect at the start of the block, before the
         // implicit onblock action and ordinary transactions. The extension is
@@ -2729,7 +2744,9 @@ impl Controller {
         self.replay_accepted_state_to(parent_id, block_status, &mut replay_mempool)?;
         let block_height = BlockHeader::num_from_id(&parent_id) + 1;
         let protocol_context = self.ensure_protocol_version_supported(block_height)?;
-        self.block_active_schedule = self.schedule_active_for_parent(&parent_id)?;
+        let schedule_state = self.schedule_state_for_parent(&parent_id)?;
+        self.block_active_schedule = schedule_state.active;
+        self.block_pending_schedule = schedule_state.pending;
         let db = self.db.clone();
         db.arena_start_undo_session();
         if let Err(error) = self.prepare_protocol_execution(protocol_context) {
@@ -8016,6 +8033,10 @@ mod tests {
             .expect("onblock proposal must be committed to the header");
         assert_eq!(header_schedule.version, 1);
         assert_eq!(header_schedule.producers, proposed);
+        assert!(
+            controller.db.proposed_schedule().is_none(),
+            "onblock must not re-propose the schedule that just became pending"
+        );
 
         controller.accept_block(&pending.id()?, &mut mempool)?;
         controller.set_preferred_id(pending.id()?);

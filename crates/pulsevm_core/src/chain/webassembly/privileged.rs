@@ -166,14 +166,10 @@ fn apply_proposed_producers(
         )?;
     }
 
-    let context = env_data.apply_context();
-    if producers == context.active_producers()? {
-        return Ok(-1);
-    }
-    let new_version = context.active_schedule_version()? as i64 + 1;
     let context = env_data.apply_context_mut();
-    context.set_proposed_producers(producers)?;
-    Ok(new_version)
+    context
+        .set_proposed_producers(producers)
+        .map_err(Into::into)
 }
 
 /// Leap's extended producer-schedule entry point. Format 0 is the legacy

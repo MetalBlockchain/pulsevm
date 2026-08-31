@@ -128,7 +128,8 @@ struct TransactionContextInner {
     is_input: bool,
     proposed_schedule: Option<Vec<ProducerKey>>,
     active_producers: Vec<ProducerKey>,
-    active_schedule_version: u32,
+    proposal_base_producers: Vec<ProducerKey>,
+    proposal_base_schedule_version: u32,
 }
 
 #[derive(Clone)]
@@ -194,7 +195,8 @@ impl TransactionContext {
                 is_input: false,
                 proposed_schedule: None,
                 active_producers: Vec::new(),
-                active_schedule_version: 0,
+                proposal_base_producers: Vec::new(),
+                proposal_base_schedule_version: 0,
             })),
             packed_transaction,
         }
@@ -220,26 +222,26 @@ impl TransactionContext {
         self.protocol_context.feature_enabled(feature)
     }
 
-    /// Record the producer schedule in force for the block this transaction runs
-    /// in. The controller sets this before execution so `get_active_producers`
-    /// and `set_proposed_producers` can read the active set and version.
-    pub fn set_active_schedule(
+    /// Record the active schedule and the schedule a new proposal must follow.
+    /// Antelope exposes the active set through `get_active_producers`, but bases
+    /// a new version on the pending set when one exists.
+    pub fn set_producer_schedules(
         &self,
-        producers: Vec<ProducerKey>,
-        version: u32,
+        active_producers: Vec<ProducerKey>,
+        active_version: u32,
+        pending_schedule: Option<(Vec<ProducerKey>, u32)>,
     ) -> Result<(), ChainError> {
         let mut inner = self.inner.write()?;
-        inner.active_producers = producers;
-        inner.active_schedule_version = version;
+        inner.active_producers = active_producers.clone();
+        let (proposal_base_producers, proposal_base_schedule_version) =
+            pending_schedule.unwrap_or((active_producers, active_version));
+        inner.proposal_base_producers = proposal_base_producers;
+        inner.proposal_base_schedule_version = proposal_base_schedule_version;
         Ok(())
     }
 
     pub fn active_producers(&self) -> Result<Vec<ProducerKey>, ChainError> {
         Ok(self.inner.read()?.active_producers.clone())
-    }
-
-    pub fn active_schedule_version(&self) -> Result<u32, ChainError> {
-        Ok(self.inner.read()?.active_schedule_version)
     }
 
     pub fn init(
@@ -770,16 +772,43 @@ impl TransactionContext {
     // Persist a producer schedule proposed by `set_proposed_producers` in the
     // block's undo session. A later block may move it into the signed header;
     // merely accepting this transaction never activates the schedule.
-    pub fn set_proposed_producers(&self, producers: Vec<ProducerKey>) -> Result<(), ChainError> {
+    pub fn set_proposed_producers(&self, producers: Vec<ProducerKey>) -> Result<i64, ChainError> {
         let mut inner = self.inner.write()?;
+        let block_num = self.block_num();
+
+        if let Some((proposal_block, packed)) = self.db.proposed_schedule() {
+            // Leap permits replacements only within the block that created the
+            // proposal. Once that block is complete, later calls must wait for
+            // the proposal to become pending instead of overwriting it.
+            if proposal_block != block_num {
+                return Ok(-1);
+            }
+            let existing = ProducerSchedule::read_bounded(&packed).map_err(|error| {
+                ChainError::SerializationError(format!(
+                    "decode existing proposed producer schedule: {error}"
+                ))
+            })?;
+            if existing.producers == producers {
+                return Ok(-1);
+            }
+        }
+
+        if inner.proposal_base_producers == producers {
+            return Ok(-1);
+        }
+
+        let version = inner
+            .proposal_base_schedule_version
+            .checked_add(1)
+            .ok_or_else(|| ChainError::BlockError("producer schedule version overflow".into()))?;
         let schedule = ProducerSchedule {
-            version: inner.active_schedule_version + 1,
+            version,
             producers: producers.clone(),
         };
         let packed = schedule.pack()?;
-        self.db.set_proposed_schedule(self.block_num(), &packed)?;
+        self.db.set_proposed_schedule(block_num, &packed)?;
         inner.proposed_schedule = Some(producers);
-        Ok(())
+        Ok(i64::from(version))
     }
 
     pub fn add_cpu_usage(&self, cpu_usage: u64) -> Result<(), ChainError> {
