@@ -45,6 +45,7 @@ pub const UPDATEAUTH_NAME: Name = Name::new(name!("updateauth"));
 pub const DELETEAUTH_NAME: Name = Name::new(name!("deleteauth"));
 pub const LINKAUTH_NAME: Name = Name::new(name!("linkauth"));
 pub const UNLINKAUTH_NAME: Name = Name::new(name!("unlinkauth"));
+pub const CANCELDELAY_NAME: Name = Name::new(name!("canceldelay"));
 pub const ONERROR_NAME: Name = Name::new(name!("onerror"));
 pub const ONBLOCK_NAME: Name = Name::new(name!("onblock"));
 

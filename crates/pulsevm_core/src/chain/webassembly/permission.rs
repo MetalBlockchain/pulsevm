@@ -1,4 +1,7 @@
-use std::collections::BTreeSet;
+use std::{
+    collections::BTreeSet,
+    sync::LazyLock,
+};
 
 use pulsevm_crypto::AuthorityPublicKey;
 use pulsevm_database::{
@@ -20,6 +23,9 @@ use crate::{
     transaction::Transaction,
     wasm_runtime::WasmContext,
 };
+
+static AUTH_DIAGNOSTICS: LazyLock<bool> =
+    LazyLock::new(|| std::env::var_os("PULSEVM_AUTH_DIAGNOSTICS").is_some());
 
 pub fn check_transaction_authorization(
     mut env: FunctionEnvMut<WasmContext>,
@@ -97,7 +103,12 @@ pub fn check_transaction_authorization(
         &BTreeSet::new(),
     ) {
         Ok(_) => Ok(1),
-        Err(_) => Ok(0),
+        Err(error) => {
+            if *AUTH_DIAGNOSTICS {
+                eprintln!("check_transaction_authorization rejected transaction: {error}");
+            }
+            Ok(0)
+        }
     }
 }
 
