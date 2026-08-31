@@ -2393,9 +2393,31 @@ impl Controller {
                 ChainError::BlockError(format!("invalid stored proposed schedule: {error}"))
             })?;
             if proposed != header_schedule {
-                return Err(ChainError::BlockError(
-                    "block new_producers does not match the on-chain proposed schedule".into(),
-                ));
+                let first_difference = proposed
+                    .producers
+                    .iter()
+                    .zip(&header_schedule.producers)
+                    .position(|(proposed, header)| proposed != header)
+                    .map_or_else(
+                        || {
+                            format!(
+                                "producer count differs: proposed {}, header {}",
+                                proposed.producers.len(),
+                                header_schedule.producers.len()
+                            )
+                        },
+                        |index| {
+                            format!(
+                                "producer {index} differs: proposed {:?}, header {:?}",
+                                proposed.producers[index], header_schedule.producers[index]
+                            )
+                        },
+                    );
+                return Err(ChainError::BlockError(format!(
+                    "block new_producers does not match the on-chain proposed schedule: \
+                     proposed version {}, header version {}; {first_difference}",
+                    proposed.version, header_schedule.version
+                )));
             }
             self.db.clear_proposed_schedule()?;
         }
