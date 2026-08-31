@@ -194,8 +194,10 @@ func TestBootSequenceAndTransfer(t *testing.T) {
 	require.NotEmpty(setprods.Tx, "setprods step produced no transaction id")
 	require.Equal([]string{"pulse", "producerb"}, setprods.Proposed)
 
-	// Activation happens on the block that accepts the setprods transaction, so
-	// poll rather than assume it is visible the instant the fixture returns.
+	// The fixture submits two harmless transactions after setprods: one forces a
+	// later header to carry the pending schedule and the other forces its
+	// activation after that header is accepted. Poll because RPC visibility can
+	// still lag acceptance briefly.
 	var producers ActiveProducers
 	require.Eventually(func() bool {
 		p, err := Producers(ctx, uri)

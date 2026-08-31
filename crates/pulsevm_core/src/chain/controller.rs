@@ -1347,11 +1347,21 @@ impl Controller {
         // block's session rather than before it.
         db.clear_expired_input_transactions(&timestamp.into())?;
 
-        // The schedule active for this block (as of its parent) governs what
-        // onblock and every transaction see through get_active_producers, and the
-        // version set_proposed_producers reports.
+        // The schedule active for this block is normally its parent's active
+        // schedule. Once a pending schedule has reached accepted state, the next
+        // block promotes it by naming its version in the header. Do not promote a
+        // schedule that exists only on the speculative pending chain: it has not
+        // become irreversible yet.
         let parent_schedule_state = self.schedule_state_for_parent(&self.preferred_id)?;
-        self.block_active_schedule = parent_schedule_state.active.clone();
+        let block_schedule = match &self.pending_schedule {
+            Some(accepted_pending)
+                if parent_schedule_state.active.version < accepted_pending.version =>
+            {
+                accepted_pending.clone()
+            }
+            _ => parent_schedule_state.active.clone(),
+        };
+        self.block_active_schedule = block_schedule.clone();
 
         // A queued protocol feature is activated by the next block header, just
         // as Leap's producer path emits its protocol_feature_activation
@@ -1604,17 +1614,14 @@ impl Controller {
             .header
             .set_protocol_feature_activations(&protocol_feature_activations)?;
 
-        // The schedule in force for this block is the one active as of its parent
-        // (the tip we build on), folding in any not-yet-accepted ancestor's
-        // change. Refuse to produce a block this node isn't authorized to sign:
+        // Refuse to produce a block this node isn't authorized to sign:
         // if our key isn't that schedule's key for our producer, the block would
         // fail verification everywhere (including here), so fail closed instead of
         // emitting an unverifiable block after a schedule change.
-        let parent_schedule = parent_schedule_state.active;
         let node = self.node_config.as_ref().unwrap();
         let producer = node.producer_name;
         let signing_key = node.producer_key.get_public_key();
-        match parent_schedule.block_signing_key(&producer) {
+        match block_schedule.block_signing_key(&producer) {
             Some(scheduled) if *scheduled == signing_key => {}
             _ => {
                 db.arena_undo(); // discard this block's session
@@ -1625,7 +1632,7 @@ impl Controller {
             }
         }
 
-        block.signed_block_header.header.schedule_version = parent_schedule.version;
+        block.signed_block_header.header.schedule_version = block_schedule.version;
         block.signed_block_header.header.new_producers = new_pending_schedule;
 
         // Sign the block with the producer's key over the full header — including
@@ -8001,12 +8008,8 @@ mod tests {
             Name::from_str("dave")?,
             chain_id,
         )?);
-        let mut activation = controller.build_block(&mut mempool).await?;
-        activation.signed_block_header.header.schedule_version = 1;
-        activation.signed_block_header.signature =
-            private_key.sign(&activation.signed_block_header.header.sig_digest()?)?;
-        controller.clear_pending()?;
-        controller.verify_block(&activation, &mut mempool).await?;
+        let activation = controller.build_block(&mut mempool).await?;
+        assert_eq!(activation.signed_block_header.header.schedule_version, 1);
         controller.accept_block(&activation.id()?, &mut mempool)?;
         assert_eq!(controller.active_schedule, header_schedule.clone());
         assert!(controller.pending_schedule.is_none());
