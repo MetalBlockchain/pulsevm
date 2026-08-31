@@ -100,6 +100,26 @@ scripts/run-xpr-mainnet-ec2.sh logs
 scripts/run-xpr-mainnet-ec2.sh stop
 ```
 
+To validate every canonical block sequentially from genesis instead of starting
+from a snapshot, build and supervise the dedicated replay process separately:
+
+```bash
+scripts/run-xpr-full-replay.sh build
+
+XPR_REPLAY_SOURCE_DIR=/data/xpr-mainnet-archive \
+XPR_REPLAY_ARENA_DIR=/data/xpr-arena-replay \
+XPR_REPLAY_LAST_BLOCK=400596231 \
+  scripts/run-xpr-full-replay.sh start
+
+scripts/run-xpr-full-replay.sh status
+scripts/run-xpr-full-replay.sh logs
+```
+
+The build uses ThinLTO and host-native CPU instructions (with unsafe SVE codegen
+disabled on AArch64). The service checkpoints every million blocks by default,
+resumes from the last durable Arena revision, and stays stopped on a parity error
+so the failing block remains visible for diagnosis.
+
 If conversion has already produced a checkpoint, set only
 `PULSEVM_MIGRATION_CHECKPOINT` and `METALGO_EXEC_PATH`. The wrapper verifies the
 matching manifest and derives a separate test-authority copy; it never modifies
