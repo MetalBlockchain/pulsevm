@@ -228,8 +228,8 @@ impl From<&TransactionTrace> for TransactionTraceV0 {
                                 sequence: *v,
                             })
                             .collect(),
-                        code_sequence: VarUint32(receipt.code_sequence),
-                        abi_sequence: VarUint32(receipt.abi_sequence),
+                        code_sequence: receipt.code_sequence,
+                        abi_sequence: receipt.abi_sequence,
                     }),
                     at.receiver().as_u64(),
                     at.act.clone(),
