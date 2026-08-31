@@ -1,6 +1,5 @@
 use std::{
     collections::{
-        BTreeMap,
         BTreeSet,
         VecDeque,
     },
@@ -32,6 +31,7 @@ use pulsevm_database::{
 };
 use pulsevm_error::ChainError;
 use pulsevm_serialization::{
+    CanonicalMap,
     Read,
     Write,
 };
@@ -102,11 +102,11 @@ struct ApplyContextInner {
     action_return_value: Option<Vec<u8>>, // Return value of the action
     start: i64,                           // Start time in microseconds
     privileged: bool,
-    account_ram_deltas: BTreeMap<Name, i64>, // RAM usage deltas for accounts
-    notified: VecDeque<(Name, u32)>,         // List of notified accounts
-    inline_actions: Vec<u32>,                // List of inline actions
-    context_free_inline_actions: Vec<u32>,   // List of context-free inline actions
-    recurse_depth: u32,                      // The current recursion depth
+    account_ram_deltas: CanonicalMap<Name, i64>, // RAM usage deltas for accounts
+    notified: VecDeque<(Name, u32)>,             // List of notified accounts
+    inline_actions: Vec<u32>,                    // List of inline actions
+    context_free_inline_actions: Vec<u32>,       // List of context-free inline actions
+    recurse_depth: u32,                          // The current recursion depth
     // The arena mints the key-value iterator handles a contract sees.
     arena_keyval_cache: ArenaIteratorCache,
     // The arena keeps a separate iterator cache per secondary-index type, mirroring
@@ -164,7 +164,7 @@ impl ApplyContext {
                 action_return_value: None,
                 start: Utc::now().timestamp_micros(),
                 privileged: false,
-                account_ram_deltas: BTreeMap::new(),
+                account_ram_deltas: CanonicalMap::new(),
                 notified: VecDeque::new(),
                 inline_actions: Vec::new(),
                 context_free_inline_actions: Vec::new(),
@@ -339,7 +339,7 @@ impl ApplyContext {
             act_digest,
             self.next_global_sequence()?,
             self.next_recv_sequence(self.receiver.as_u64())?,
-            BTreeMap::new(),
+            CanonicalMap::new(),
             code_sequence as u32,
             abi_sequence as u32,
         );

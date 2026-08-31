@@ -29,7 +29,9 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq, Read, Write, NumBytes, Serialize, Default)]
 pub struct SignedTransaction {
     transaction: Transaction,
-    signatures: BTreeSet<Signature>,
+    // Signature order and duplicates are part of the packed transaction's
+    // consensus bytes. Authorization derives its own unique recovered-key set.
+    signatures: Vec<Signature>,
     context_free_data: Vec<Bytes>,
 }
 
@@ -37,7 +39,7 @@ impl SignedTransaction {
     #[inline]
     pub fn new(
         transaction: Transaction,
-        signatures: BTreeSet<Signature>,
+        signatures: Vec<Signature>,
         context_free_data: Vec<Bytes>,
     ) -> Self {
         Self {
@@ -51,7 +53,7 @@ impl SignedTransaction {
         &self.transaction
     }
 
-    pub fn signatures(&self) -> &BTreeSet<Signature> {
+    pub fn signatures(&self) -> &[Signature] {
         &self.signatures
     }
 
@@ -102,7 +104,7 @@ impl SignedTransaction {
             .transaction
             .signing_digest(chain_id, &self.context_free_data)?;
         let signature = private_key.sign(&pulsevm_crypto::Digest(digest))?;
-        self.signatures.insert(signature);
+        self.signatures.push(signature);
         Ok(self)
     }
 }
@@ -133,10 +135,7 @@ pub fn signing_digest(
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::BTreeSet,
-        str::FromStr,
-    };
+    use std::str::FromStr;
 
     use base64::{
         Engine as _,
@@ -149,6 +148,10 @@ mod tests {
         WebAuthnSignature,
     };
     use pulsevm_database::TimePointSec;
+    use pulsevm_serialization::{
+        Read,
+        Write,
+    };
     use sha2::{
         Digest as _,
         Sha256,
@@ -179,7 +182,7 @@ mod tests {
                 vec![],
                 vec![],
             ),
-            BTreeSet::new(),
+            Vec::new(),
             vec![],
         );
         let chain_id =
@@ -199,6 +202,18 @@ mod tests {
         let recovered_keys = signed_tx.recovered_keys(&chain_id).unwrap();
         assert_eq!(recovered_keys.len(), 1);
         assert!(recovered_keys.contains(&public_key));
+    }
+
+    #[test]
+    fn binary_round_trip_preserves_signature_order_and_duplicates() {
+        let first = Signature::from_str("SIG_K1_KZDbad1igYb6zfjGqziC4DwanAYv96DMJDb3NLgMgLwSximq6Gf3GjFQEVDsRYEihRvsx8BxSLvYHhyCVYyxHZZh2H2vtX").unwrap();
+        let second = Signature::from_str("SIG_K1_K6tVhH5eiejjjnyBU1LnTkYDzHnLxiQSGZdc5N3qwo6aUz1pcABEicDJvr1wHKDhW24DmP2v7smw6hzBjWr5sJgHfi5SRQ").unwrap();
+        let expected = vec![first.clone(), second, first];
+        let signed = SignedTransaction::new(Transaction::default(), expected.clone(), vec![]);
+        let packed = signed.pack().unwrap();
+        let decoded = SignedTransaction::read(&packed, &mut 0).unwrap();
+
+        assert_eq!(decoded.signatures(), expected);
     }
 
     #[test]
@@ -226,7 +241,7 @@ mod tests {
         compact[0] = 31 + recovery_id;
         compact[1..].copy_from_slice(&r1.to_bytes());
         let r1_signature = Signature::new_r1(R1Signature::from_compact65(&compact));
-        let r1_tx = SignedTransaction::new(tx.clone(), BTreeSet::from([r1_signature]), vec![]);
+        let r1_tx = SignedTransaction::new(tx.clone(), vec![r1_signature], vec![]);
         let r1_keys = r1_tx.recovered_authority_keys(&chain_id).unwrap();
         assert!(
             r1_keys.contains(&AuthorityPublicKey::R1(
@@ -261,11 +276,11 @@ mod tests {
         wa_compact[1..].copy_from_slice(&wa.to_bytes());
         let wa_tx = SignedTransaction::new(
             tx,
-            BTreeSet::from([Signature::new_webauthn(WebAuthnSignature::new(
+            vec![Signature::new_webauthn(WebAuthnSignature::new(
                 wa_compact,
                 auth_data,
                 client_json,
-            ))]),
+            ))],
             vec![],
         );
         let wa_keys = wa_tx.recovered_authority_keys(&chain_id).unwrap();

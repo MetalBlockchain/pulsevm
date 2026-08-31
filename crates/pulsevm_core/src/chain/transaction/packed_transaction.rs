@@ -1,7 +1,4 @@
-use std::{
-    collections::BTreeSet,
-    io::Read as IoRead,
-};
+use std::io::Read as IoRead;
 
 use flate2::read::ZlibDecoder;
 use pulsevm_constants::{
@@ -87,17 +84,15 @@ impl PackedTransaction {
         };
         let trx_id: Id = unpacked_trx.id()?;
 
-        let unique_signatures = signatures.iter().cloned().collect::<BTreeSet<_>>();
-
         Ok(Self {
-            signatures,
+            signatures: signatures.clone(),
             compression,
             packed_context_free_data,
             packed_trx,
 
             unpacked_trx: SignedTransaction::new(
                 unpacked_trx,
-                unique_signatures,
+                signatures,
                 unpacked_context_free_data,
             ),
             trx_id: trx_id,
@@ -168,7 +163,7 @@ impl PackedTransaction {
         })?;
 
         Ok(Self {
-            signatures: trx.signatures().iter().cloned().collect(),
+            signatures: trx.signatures().to_vec(),
             compression: TransactionCompression::None, // Default to no compression for now
             packed_context_free_data: Bytes::default(), // No context-free data for now
             packed_trx: trx

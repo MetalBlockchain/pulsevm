@@ -1,5 +1,3 @@
-use std::collections::BTreeSet;
-
 use pulsevm_crypto::Bytes;
 use pulsevm_database::{
     BlockTimestamp,
@@ -76,7 +74,7 @@ impl Transaction {
         private_key: &PrivateKey,
         chain_id: &Id,
     ) -> Result<SignedTransaction, ChainError> {
-        let signed_transaction = SignedTransaction::new(self.clone(), BTreeSet::new(), vec![]);
+        let signed_transaction = SignedTransaction::new(self.clone(), Vec::new(), vec![]);
 
         signed_transaction.sign(private_key, chain_id)
     }

@@ -267,10 +267,10 @@ impl WalletManager {
         &mut self,
         digest: &[u8],
         public_keys: &[String],
-    ) -> Result<BTreeMap<String, String>, ManagerError> {
+    ) -> Result<Vec<(String, String)>, ManagerError> {
         self.check_timeout();
 
-        let mut signatures = BTreeMap::new();
+        let mut signatures = Vec::with_capacity(public_keys.len());
 
         for pubkey in public_keys {
             let mut found = false;
@@ -279,7 +279,7 @@ impl WalletManager {
                     continue;
                 }
                 if let Ok(Some(sig)) = wallet.try_sign_digest(digest, pubkey) {
-                    signatures.insert(pubkey.clone(), sig);
+                    signatures.push((pubkey.clone(), sig));
                     found = true;
                     break;
                 }

@@ -2281,7 +2281,7 @@ impl Controller {
         let trx = Transaction::new(TransactionHeader::default(), vec![], vec![action]);
         let packed = PackedTransaction::from_signed_transaction(SignedTransaction::new(
             trx.clone(),
-            BTreeSet::new(),
+            Vec::new(),
             vec![],
         ))?;
 
@@ -2850,7 +2850,7 @@ impl Controller {
         let trx = Transaction::new(TransactionHeader::default(), vec![], vec![action.clone()]);
         let packed = PackedTransaction::from_signed_transaction(SignedTransaction::new(
             trx.clone(),
-            BTreeSet::new(),
+            Vec::new(),
             vec![],
         ))?;
         let transaction_id = Id::new(deferred.trx_id);

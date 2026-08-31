@@ -1,7 +1,4 @@
-use std::{
-    collections::BTreeMap,
-    fmt,
-};
+use std::fmt;
 
 use pulsevm_crypto::Digest;
 use pulsevm_error::ChainError;
@@ -11,6 +8,7 @@ use pulsevm_proc_macros::{
     Write,
 };
 use pulsevm_serialization::{
+    CanonicalMap,
     VarUint32,
     Write,
 };
@@ -23,7 +21,7 @@ pub struct ActionReceipt {
     pub act_digest: Digest,
     pub global_sequence: u64,
     pub recv_sequence: u64,
-    pub auth_sequence: BTreeMap<u64, u64>,
+    pub auth_sequence: CanonicalMap<u64, u64>,
     pub code_sequence: VarUint32,
     pub abi_sequence: VarUint32,
 }
@@ -34,7 +32,7 @@ impl ActionReceipt {
         act_digest: Digest,
         global_sequence: u64,
         recv_sequence: u64,
-        auth_sequence: BTreeMap<u64, u64>,
+        auth_sequence: CanonicalMap<u64, u64>,
         code_sequence: u32,
         abi_sequence: u32,
     ) -> Self {
@@ -85,7 +83,7 @@ mod tests {
 
     #[test]
     fn test_action_receipt_digest() {
-        let mut auth_sequence = BTreeMap::new();
+        let mut auth_sequence = CanonicalMap::new();
         auth_sequence.insert(1, 100);
         auth_sequence.insert(2, 200);
 

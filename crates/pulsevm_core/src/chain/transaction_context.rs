@@ -1,7 +1,6 @@
 use std::{
     cmp::min,
     collections::{
-        BTreeMap,
         BTreeSet,
         VecDeque,
     },
@@ -51,6 +50,7 @@ use pulsevm_database::{
 };
 use pulsevm_error::ChainError;
 use pulsevm_serialization::{
+    CanonicalMap,
     VarUint32,
     Write,
 };
@@ -509,7 +509,7 @@ impl TransactionContext {
             new_action_ordinal,
             creator_action_ordinal,
             closest_unnotified_ancestor_action_ordinal,
-            BTreeMap::new(),
+            CanonicalMap::new(),
         ));
 
         Ok(new_action_ordinal)
@@ -545,7 +545,7 @@ impl TransactionContext {
             new_action_ordinal,
             creator_action_ordinal,
             closest_unnotified_ancestor_action_ordinal,
-            BTreeMap::new(),
+            CanonicalMap::new(),
         ));
 
         Ok(new_action_ordinal)

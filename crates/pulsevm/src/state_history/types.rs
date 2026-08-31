@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 use pulsevm_core::{
     account::AccountDelta,
     crypto::Signature,
@@ -21,7 +19,10 @@ use pulsevm_proc_macros::{
     Read,
     Write,
 };
-use pulsevm_serialization::VarUint32;
+use pulsevm_serialization::{
+    CanonicalMap,
+    VarUint32,
+};
 
 #[derive(Debug, Clone, Read, Write, NumBytes)]
 pub struct BlockPosition {
@@ -99,7 +100,7 @@ pub struct ActionTraceV1 {
     pub context_free: bool,
     pub elapsed: i64,
     pub console: String,
-    pub account_ram_deltas: BTreeMap<Name, i64>,
+    pub account_ram_deltas: CanonicalMap<Name, i64>,
     pub except: Option<String>,
     pub error_code: Option<u64>,
     pub return_value: Bytes,
@@ -115,7 +116,7 @@ impl ActionTraceV1 {
         context_free: bool,
         elapsed: i64,
         console: String,
-        account_ram_deltas: BTreeMap<Name, i64>,
+        account_ram_deltas: CanonicalMap<Name, i64>,
         except: Option<String>,
         error_code: Option<u64>,
         return_value: Bytes,

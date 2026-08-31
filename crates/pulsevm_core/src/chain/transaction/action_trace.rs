@@ -1,5 +1,4 @@
 use core::fmt;
-use std::collections::BTreeMap;
 
 use pulsevm_database::BlockTimestamp;
 use pulsevm_proc_macros::{
@@ -7,6 +6,7 @@ use pulsevm_proc_macros::{
     Read,
     Write,
 };
+use pulsevm_serialization::CanonicalMap;
 
 use crate::chain::{
     id::Id,
@@ -31,7 +31,7 @@ pub struct ActionTrace {
     pub trx_id: Id,
     pub block_num: u32,
     pub block_time: BlockTimestamp,
-    pub account_ram_deltas: BTreeMap<Name, i64>,
+    pub account_ram_deltas: CanonicalMap<Name, i64>,
     pub except: Option<u8>,
     pub error_code: Option<u64>,
     pub return_value: Vec<u8>,
@@ -48,7 +48,7 @@ impl ActionTrace {
         action_ordinal: u32,
         creator_action_ordinal: u32,
         closest_unnotified_ancestor_action_ordinal: u32,
-        account_ram_deltas: BTreeMap<Name, i64>,
+        account_ram_deltas: CanonicalMap<Name, i64>,
     ) -> Self {
         ActionTrace {
             trx_id,
