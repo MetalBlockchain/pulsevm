@@ -3906,6 +3906,28 @@ impl Database {
             .map_err(|e| ChainError::InternalError(format!("arena set_global_properties: {e:?}")))
     }
 
+    pub fn set_proposed_schedule(
+        &self,
+        block_num: u32,
+        packed_schedule: &[u8],
+    ) -> Result<(), ChainError> {
+        self.backend
+            .set_proposed_schedule(block_num, packed_schedule)
+            .map_err(|error| {
+                ChainError::InternalError(format!("arena set_proposed_schedule: {error:?}"))
+            })
+    }
+
+    pub fn proposed_schedule(&self) -> Option<(u32, Vec<u8>)> {
+        self.backend.proposed_schedule()
+    }
+
+    pub fn clear_proposed_schedule(&self) -> Result<(), ChainError> {
+        self.backend.clear_proposed_schedule().map_err(|error| {
+            ChainError::InternalError(format!("arena clear_proposed_schedule: {error:?}"))
+        })
+    }
+
     /// `max_action_return_value_size` — a genesis build constant (256) that
     /// `setparams` never carries, so the arena database does not store it and
     /// serves the build constant directly.

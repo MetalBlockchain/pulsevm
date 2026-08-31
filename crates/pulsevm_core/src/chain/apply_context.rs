@@ -243,25 +243,23 @@ impl ApplyContext {
         let mut cpu_used = 100; // Base usage is always 100 instructions
         let action = {
             let mut inner = self.inner.write()?;
+            inner.start = Utc::now().timestamp_micros();
             inner.privileged = privileged;
             inner.action.clone()
         };
 
-        // Native handlers are enabled for the built-in PulseVM system contract.
-        // Imported XPR state should disable them so its deployed eosio.system
-        // WASM remains authoritative.
+        // These are Antelope controller-native actions, not a replacement for
+        // the deployed system WASM. Leap always runs the matching native handler
+        // first and then dispatches WASM (except eosio::setcode before
+        // FORWARD_SETCODE), including on imported XPR chains.
         let (code_hash, _vm_type, _vm_version) =
             self.db.account_code_hash_vm(self.receiver.as_u64())?;
-        let native = if self.db.native_system_contract() {
-            Controller::find_apply_handler(
-                &self.receiver,
-                action.account(),
-                action.name(),
-                self.db.system_accounts().system,
-            )
-        } else {
-            None
-        };
+        let native = Controller::find_apply_handler(
+            &self.receiver,
+            action.account(),
+            action.name(),
+            self.db.system_accounts().system,
+        );
         if let Some(native) = native {
             native(self, &mut self.db.clone(), &action)?;
             // Native handlers are outside deterministic Wasm metering, so give
@@ -311,8 +309,11 @@ impl ApplyContext {
                     pulse_assert(
                         not_in_notify_context,
                         ChainError::TransactionError(format!(
-                            "unprivileged contract cannot increase RAM usage of another account within a notify context: {}",
-                            account
+                            "unprivileged receiver {} cannot increase RAM usage of account {} within notification of {}::{}",
+                            self.receiver,
+                            account,
+                            action.account(),
+                            action.name()
                         )),
                     )?;
                     pulse_assert(
@@ -357,13 +358,16 @@ impl ApplyContext {
     }
 
     pub fn finalize_trace(&self, receipt: ActionReceipt) -> Result<(), ChainError> {
-        let inner = self.inner.read()?;
+        let (start, account_ram_deltas) = {
+            let mut inner = self.inner.write()?;
+            (inner.start, std::mem::take(&mut inner.account_ram_deltas))
+        };
 
         self.trx_context
             .modify_action_trace(self.action_ordinal, |trace| {
                 trace.receipt = Some(receipt);
-                trace.set_elapsed((Utc::now().timestamp_micros() - inner.start) as u32);
-                trace.account_ram_deltas = inner.account_ram_deltas.clone();
+                trace.set_elapsed((Utc::now().timestamp_micros() - start) as u32);
+                trace.account_ram_deltas = account_ram_deltas;
             })?;
         Ok(())
     }
@@ -429,6 +433,7 @@ impl ApplyContext {
     }
 
     pub fn add_ram_usage(&mut self, account: &Name, ram_delta: i64) -> Result<(), ChainError> {
+        self.trx_context.add_ram_usage(account, ram_delta)?;
         let mut inner = self.inner.write()?;
         let entry = inner.account_ram_deltas.entry(account.clone()).or_insert(0);
         *entry = entry.checked_add(ram_delta).ok_or_else(|| {
@@ -2719,11 +2724,6 @@ impl ApplyContext {
     /// Query a feature against the already support-checked block context.
     pub fn protocol_feature_enabled(&self, feature: ProtocolFeature) -> bool {
         self.trx_context.protocol_feature_enabled(feature)
-    }
-
-    pub fn account_ram_deltas(&self) -> Result<BTreeMap<Name, i64>, ChainError> {
-        let inner = self.inner.read()?;
-        Ok(inner.account_ram_deltas.clone())
     }
 
     pub fn pause_billing_timer(&self) -> Result<(), ChainError> {

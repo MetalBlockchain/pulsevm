@@ -28,11 +28,6 @@ use crate::chain::{
     webassembly::context_aware_check,
 };
 
-const BLOCKCHAIN_PARAMETERS_FEATURE_DIGEST: [u8; 32] = [
-    0x54, 0x43, 0xfc, 0xf8, 0x83, 0x30, 0xc5, 0x86, 0xbc, 0x0e, 0x5f, 0x3d, 0xee, 0x10, 0xe7, 0xf6,
-    0x3c, 0x76, 0xc0, 0x02, 0x49, 0xc8, 0x7f, 0xe4, 0xfb, 0xf7, 0xf3, 0x8c, 0x08, 0x20, 0x06, 0xb4,
-];
-
 fn privileged_check(context: &ApplyContext) -> Result<(), RuntimeError> {
     if !context.is_privileged()? {
         return Err(RuntimeError::new(
@@ -188,15 +183,6 @@ pub fn get_blockchain_parameters_packed(
     // for work that is rejected anyway — matching set_blockchain_parameters_packed.
     {
         context_aware_check(&env)?;
-        if !env
-            .data()
-            .db()
-            .protocol_feature_activated(BLOCKCHAIN_PARAMETERS_FEATURE_DIGEST)
-        {
-            return Err(RuntimeError::new(
-                "get_blockchain_parameters_packed is unavailable before the BLOCKCHAIN_PARAMETERS protocol feature is activated",
-            ));
-        }
         let context = env.data_mut().apply_context_mut();
         privileged_check(context)?;
     }
@@ -243,15 +229,6 @@ pub fn set_blockchain_parameters_packed(
 ) -> Result<(), RuntimeError> {
     {
         context_aware_check(&env)?;
-        if !env
-            .data()
-            .db()
-            .protocol_feature_activated(BLOCKCHAIN_PARAMETERS_FEATURE_DIGEST)
-        {
-            return Err(RuntimeError::new(
-                "set_blockchain_parameters_packed is unavailable before the BLOCKCHAIN_PARAMETERS protocol feature is activated",
-            ));
-        }
         let context = env.data_mut().apply_context_mut();
         privileged_check(context)?;
     }

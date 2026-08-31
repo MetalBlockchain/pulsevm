@@ -18,7 +18,10 @@ use crate::{
         apply_context::ApplyContext,
         id::Id,
         name::Name,
-        producer_schedule::ProducerKey,
+        producer_schedule::{
+            ProducerKey,
+            ProducerSchedule,
+        },
         protocol_features::{
             ProtocolExecutionContext,
             ProtocolFeature,
@@ -47,7 +50,10 @@ use pulsevm_database::{
     seconds,
 };
 use pulsevm_error::ChainError;
-use pulsevm_serialization::VarUint32;
+use pulsevm_serialization::{
+    VarUint32,
+    Write,
+};
 
 // Leap's ONLY_BILL_FIRST_AUTHORIZER feature changes transaction CPU/NET
 // billing from every action authorizer to only the first authorizer. XPR has
@@ -573,11 +579,6 @@ impl TransactionContext {
         let cpu_used = apply_context.exec(self)?;
         self.add_cpu_usage(cpu_used)?;
 
-        // Finalize the apply context
-        for (account, ram_delta) in apply_context.account_ram_deltas()?.iter() {
-            self.add_ram_usage(account, *ram_delta)?;
-        }
-
         Ok(())
     }
 
@@ -766,11 +767,18 @@ impl TransactionContext {
         })
     }
 
-    // Record a producer schedule proposed by `set_proposed_producers` during this
-    // transaction. Surfaced in the TransactionResult; the controller activates it
-    // when the block is accepted.
+    // Persist a producer schedule proposed by `set_proposed_producers` in the
+    // block's undo session. A later block may move it into the signed header;
+    // merely accepting this transaction never activates the schedule.
     pub fn set_proposed_producers(&self, producers: Vec<ProducerKey>) -> Result<(), ChainError> {
-        self.inner.write()?.proposed_schedule = Some(producers);
+        let mut inner = self.inner.write()?;
+        let schedule = ProducerSchedule {
+            version: inner.active_schedule_version + 1,
+            producers: producers.clone(),
+        };
+        let packed = schedule.pack()?;
+        self.db.set_proposed_schedule(self.block_num(), &packed)?;
+        inner.proposed_schedule = Some(producers);
         Ok(())
     }
 
@@ -892,9 +900,19 @@ impl TransactionContext {
         Ok(())
     }
 
+    /// Instruction-meter budget for the current action. Accepted-block replay
+    /// uses the producer's recorded bill and, like nodeos validation, does not
+    /// stop execution at this node's objective account/block CPU allowance.
     pub fn get_cpu_limit(&self) -> Result<i64, ChainError> {
         let inner = self.inner.read()?;
-        Ok(inner.cpu_limit)
+        Ok(Self::execution_cpu_limit(
+            inner.explicit_billed_cpu_time,
+            inner.cpu_limit,
+        ))
+    }
+
+    fn execution_cpu_limit(explicit_billed: bool, objective_limit: i64) -> i64 {
+        if explicit_billed { -1 } else { objective_limit }
     }
 
     pub fn record_transaction(&mut self, id: &Id, expiration: u32) -> Result<(), ChainError> {
@@ -1060,6 +1078,9 @@ impl TransactionContext {
     /// The check body, callable while already holding the `inner` guard —
     /// calling `check_net_usage` there would deadlock on the re-lock.
     fn check_net_usage_locked(inner: &TransactionContextInner) -> Result<(), ChainError> {
+        if inner.explicit_billed_cpu_time {
+            return Ok(());
+        }
         // TODO: Add unlikely hint here once it's stable
         // https://github.com/rust-lang/rust/issues/151619
         if inner.trace.net_usage > inner.eager_net_limit {
@@ -1120,6 +1141,9 @@ impl TransactionContext {
     }
 
     fn validate_account_cpu_usage(inner: &TransactionContextInner) -> Result<(), ChainError> {
+        if inner.explicit_billed_cpu_time {
+            return Ok(());
+        }
         if inner.trace.receipt.cpu_usage_us > inner.cpu_limit as u32 {
             if inner.cpu_limit_due_to_block {
                 return Err(ChainError::TransactionError(format!(
@@ -1167,6 +1191,15 @@ mod deadline_tests {
                 tp(9_999_999),
             )
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn explicit_billing_is_exempt_from_objective_execution_cpu_limit() {
+        assert_eq!(TransactionContext::execution_cpu_limit(true, 150_000), -1);
+        assert_eq!(
+            TransactionContext::execution_cpu_limit(false, 150_000),
+            150_000
         );
     }
 

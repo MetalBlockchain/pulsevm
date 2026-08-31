@@ -263,6 +263,51 @@ struct HeaderSigningState {
     pending_schedule_hash: Digest,
 }
 
+#[derive(Clone, Debug)]
+struct ProducerScheduleState {
+    active: ProducerSchedule,
+    pending: Option<ProducerSchedule>,
+}
+
+impl ProducerScheduleState {
+    fn apply_header(&mut self, header: &BlockHeader) -> Result<bool, ChainError> {
+        let mut promoted = false;
+        if header.schedule_version != self.active.version {
+            let pending = self.pending.take().ok_or_else(|| {
+                ChainError::BlockError(format!(
+                    "block declares active schedule version {}, but current version is {} and no schedule is pending",
+                    header.schedule_version, self.active.version
+                ))
+            })?;
+            if pending.version != header.schedule_version {
+                return Err(ChainError::BlockError(format!(
+                    "block declares active schedule version {}, but pending version is {}",
+                    header.schedule_version, pending.version
+                )));
+            }
+            self.active = pending;
+            promoted = true;
+        }
+
+        if let Some(schedule) = header.new_schedule() {
+            if self.pending.is_some() {
+                return Err(ChainError::BlockError(
+                    "block sets new pending producers before the prior schedule became active"
+                        .into(),
+                ));
+            }
+            if schedule.version != self.active.version + 1 {
+                return Err(ChainError::BlockError(format!(
+                    "new pending schedule version {} does not follow active version {}",
+                    schedule.version, self.active.version
+                )));
+            }
+            self.pending = Some(schedule.clone());
+        }
+        Ok(promoted)
+    }
+}
+
 impl HeaderSigningState {
     fn from_genesis(genesis_id: &Id, schedule: &ProducerSchedule) -> Result<Self, ChainError> {
         let mut state = Self {
@@ -280,7 +325,15 @@ impl HeaderSigningState {
             ChainError::SerializationError(format!("pack block header for signature: {error}"))
         })?);
         let header_root = hash_digest_pair(header_digest, self.blockroot_merkle.root());
-        Ok(hash_digest_pair(header_root, self.pending_schedule_hash))
+        let pending_schedule_hash = match header.new_schedule() {
+            Some(schedule) => Digest::hash(&schedule.pack().map_err(|error| {
+                ChainError::SerializationError(format!(
+                    "pack new pending producer schedule: {error}"
+                ))
+            })?),
+            None => self.pending_schedule_hash,
+        };
+        Ok(hash_digest_pair(header_root, pending_schedule_hash))
     }
 
     fn accept(&mut self, block: &SignedBlock) -> Result<(), ChainError> {
@@ -334,6 +387,11 @@ pub struct Controller {
     // a block whose header carries `new_producers`, and reconstructed from the
     // block log on restart — it is never read from an out-of-band source.
     active_schedule: ProducerSchedule,
+
+    // A schedule carried by `new_producers` is pending until a later header's
+    // `schedule_version` promotes it. Keeping it separate prevents the proposal
+    // and pending phases from changing block authorization prematurely.
+    pending_schedule: Option<ProducerSchedule>,
 
     // Antelope header-signing state at `last_accepted_block_id`. Canonical XPR
     // signatures commit to this state in addition to the packed header.
@@ -485,10 +543,6 @@ struct PendingBlock {
     // Transaction traces produced during execution, needed by `store_traces` at
     // accept time. Retaining them avoids recomputing via a second execution.
     traces: Vec<TransactionTrace>,
-    // A producer schedule proposed by a `set_proposed_producers` in this block,
-    // if any. Activated when the block is accepted, so a rejected/forked block
-    // never changes the schedule.
-    proposed_schedule: Option<Vec<ProducerKey>>,
 }
 
 impl Drop for Controller {
@@ -576,6 +630,7 @@ impl Controller {
             db_path: None,
             snapshot_cache: None,
             active_schedule: ProducerSchedule::default(),
+            pending_schedule: None,
             header_signing_state: HeaderSigningState::default(),
             block_active_schedule: ProducerSchedule::default(),
 
@@ -1114,24 +1169,20 @@ impl Controller {
     // the whole log when the schedule never changed — acceptable while chains are
     // short; a cached height pointer is the obvious optimization if it gets hot.
     fn reconstruct_schedule_from_log(&mut self, start: u32, end: u32) -> Result<(), ChainError> {
-        let mut height = end;
-        loop {
-            if let Some(block) = self.get_block_by_height(height)? {
-                if let Some(schedule) = block.signed_block_header.header.new_schedule() {
-                    info!(
-                        "reconstructed producer schedule version {} from block {}",
-                        schedule.version, height
-                    );
-                    self.active_schedule = schedule.clone();
-                    return Ok(());
-                }
-            }
-            if height <= start {
-                break;
-            }
-            height -= 1;
+        let mut state = ProducerScheduleState {
+            active: self.active_schedule.clone(),
+            pending: None,
+        };
+        for height in start.saturating_add(1)..=end {
+            let block = self.get_block_by_height(height)?.ok_or_else(|| {
+                ChainError::DatabaseError(format!(
+                    "missing block {height} while rebuilding producer schedule state"
+                ))
+            })?;
+            state.apply_header(&block.signed_block_header.header)?;
         }
-        // No block changed the schedule: the genesis seed is the active schedule.
+        self.active_schedule = state.active;
+        self.pending_schedule = state.pending;
         Ok(())
     }
 
@@ -1205,12 +1256,11 @@ impl Controller {
         // block's session rather than before it.
         db.clear_expired_input_transactions(&timestamp.into())?;
 
-        // The last producer schedule proposed by any transaction in this block,
-        // activated when the block is accepted.
         // The schedule active for this block (as of its parent) governs what
         // onblock and every transaction see through get_active_producers, and the
         // version set_proposed_producers reports.
-        self.block_active_schedule = self.schedule_active_for_parent(&self.preferred_id)?;
+        let parent_schedule_state = self.schedule_state_for_parent(&self.preferred_id)?;
+        self.block_active_schedule = parent_schedule_state.active.clone();
 
         // A queued protocol feature is activated by the next block header, just
         // as Leap's producer path emits its protocol_feature_activation
@@ -1233,15 +1283,31 @@ impl Controller {
             )?;
         }
 
+        // A proposal made in an earlier block may become the new pending
+        // schedule in this header. Never publish a proposal authored by a
+        // transaction in the block currently being assembled.
+        let new_pending_schedule = if parent_schedule_state.pending.is_none() {
+            match db.proposed_schedule() {
+                Some((proposal_block, packed)) if proposal_block < block_height => {
+                    let schedule = ProducerSchedule::read_bounded(&packed).map_err(|error| {
+                        ChainError::BlockError(format!("invalid stored proposed schedule: {error}"))
+                    })?;
+                    db.clear_proposed_schedule()?;
+                    Some(schedule)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
         // onblock heads the block, before any mempool transaction, so its action
         // digests come first in the action merkle — matching what validators
         // recompute in `execute_block`.
         let previous = self.preferred_id;
-        let (onblock_digests, mut proposed_schedule) =
+        let (onblock_digests, _proposed_schedule) =
             self.run_onblock(protocol_context, &timestamp, previous, &block_status)?;
         action_receipt_digests.extend(onblock_digests);
-        // onblock's proposal counts like any transaction's (eosio.system elects
-        // producers from there); a later transaction's proposal overrides it.
 
         // Scheduled transactions are selected from durable Arena state, never
         // from the mempool. Their raw transaction bytes have no signatures: the
@@ -1312,9 +1378,6 @@ impl Controller {
                         Id::new(scheduled.trx_id),
                     ));
                     action_receipt_digests.extend(result.action_receipt_digests);
-                    if result.proposed_schedule.is_some() {
-                        proposed_schedule = result.proposed_schedule;
-                    }
                 }
                 Err((deferred_error, failure_cpu_us)) => {
                     db.arena_undo();
@@ -1333,9 +1396,6 @@ impl Controller {
                                 Id::new(scheduled.trx_id),
                             ));
                             action_receipt_digests.extend(result.action_receipt_digests);
-                            if result.proposed_schedule.is_some() {
-                                proposed_schedule = result.proposed_schedule;
-                            }
                         }
                         Err(onerror_error) => {
                             db.arena_undo();
@@ -1411,9 +1471,6 @@ impl Controller {
                     let receipt = TransactionReceipt::new(result.trace.receipt, transaction);
                     transaction_receipts.push_back(receipt);
                     action_receipt_digests.extend(result.action_receipt_digests);
-                    if result.proposed_schedule.is_some() {
-                        proposed_schedule = result.proposed_schedule;
-                    }
                 }
                 Err(e) => {
                     warn!(
@@ -1462,7 +1519,7 @@ impl Controller {
         // if our key isn't that schedule's key for our producer, the block would
         // fail verification everywhere (including here), so fail closed instead of
         // emitting an unverifiable block after a schedule change.
-        let parent_schedule = self.schedule_active_for_parent(&self.preferred_id)?;
+        let parent_schedule = parent_schedule_state.active;
         let node = self.node_config.as_ref().unwrap();
         let producer = node.producer_name;
         let signing_key = node.producer_key.get_public_key();
@@ -1477,18 +1534,8 @@ impl Controller {
             }
         }
 
-        // If a transaction in this block proposed a new schedule, carry it in the
-        // signed header (`new_producers` + `schedule_version`) so the change is
-        // committed with the block and reconstructable from the block log. The new
-        // version follows the parent schedule's.
-        if let Some(ref producers) = proposed_schedule {
-            let new_schedule = ProducerSchedule {
-                version: parent_schedule.version + 1,
-                producers: producers.clone(),
-            };
-            block.signed_block_header.header.schedule_version = new_schedule.version;
-            block.signed_block_header.header.new_producers = Some(new_schedule);
-        }
+        block.signed_block_header.header.schedule_version = parent_schedule.version;
+        block.signed_block_header.header.new_producers = new_pending_schedule;
 
         // Sign the block with the producer's key over the full header — including
         // any schedule change — so validators authenticate it against the schedule.
@@ -1506,10 +1553,6 @@ impl Controller {
 
         // The permission rewrite is block state: keep it in the block's undo
         // session so forks unwind it and SHiP observes it before accept/commit.
-        if let Some(ref producers) = proposed_schedule {
-            self.update_producers_authority(producers, block.timestamp())?;
-        }
-
         // Match the end-of-block bookkeeping that `execute_block` applies at
         // verify/accept, so the retained state is identical to what a re-execution
         // would commit, then retain the block on the pending chain (it was built
@@ -1522,31 +1565,32 @@ impl Controller {
             id: block_id,
             parent: self.preferred_id,
             traces: transaction_traces,
-            proposed_schedule,
         });
 
         Ok(block)
     }
 
-    // The producer schedule active for a block whose parent is `parent_id`: the
-    // schedule at the last accepted block, with every not-yet-accepted ancestor's
-    // schedule change folded in, oldest first. This makes verification a function
-    // of the parent alone, not of whether an ancestor happened to be accepted yet
-    // — two nodes always resolve the same schedule for the same block. A later
-    // proposal fully replaces an earlier one, matching activation on accept.
-    fn schedule_active_for_parent(&self, parent_id: &Id) -> Result<ProducerSchedule, ChainError> {
+    fn schedule_state_for_parent(
+        &self,
+        parent_id: &Id,
+    ) -> Result<ProducerScheduleState, ChainError> {
+        let mut state = ProducerScheduleState {
+            active: self.active_schedule.clone(),
+            pending: self.pending_schedule.clone(),
+        };
         if *parent_id == self.last_accepted_block_id {
-            return Ok(self.active_schedule.clone());
+            return Ok(state);
         }
-        let mut version = self.active_schedule.version;
-        let mut producers = self.active_schedule.producers.clone();
         for pending in &self.pending_chain {
-            if let Some(proposed) = &pending.proposed_schedule {
-                version += 1;
-                producers = proposed.clone();
-            }
+            let block = self.verified_blocks.get(&pending.id).ok_or_else(|| {
+                ChainError::BlockError(format!(
+                    "pending block {} is missing while deriving producer schedule state",
+                    pending.id
+                ))
+            })?;
+            state.apply_header(&block.signed_block_header.header)?;
             if pending.id == *parent_id {
-                return Ok(ProducerSchedule { version, producers });
+                return Ok(state);
             }
         }
         // The parent is neither the last accepted block nor a pending ancestor, so
@@ -1556,6 +1600,10 @@ impl Controller {
             "cannot resolve producer schedule: parent {} is unknown",
             parent_id
         )))
+    }
+
+    fn schedule_active_for_parent(&self, parent_id: &Id) -> Result<ProducerSchedule, ChainError> {
+        Ok(self.schedule_state_for_parent(parent_id)?.active)
     }
 
     fn header_signing_state_for_parent(
@@ -1651,49 +1699,12 @@ impl Controller {
             .signature
             .recover_public_key(&digest)?;
         if &signer != expected {
-            return Err(ChainError::BlockError(
-                "block signature does not match the scheduled producer key".into(),
-            ));
+            return Err(ChainError::BlockError(format!(
+                "block signature recovered {signer}, expected {expected} for producer {} in schedule version {}",
+                header.producer, schedule.version
+            )));
         }
         Ok(())
-    }
-
-    // Bind the schedule change advertised in a block header to what the block's
-    // transactions actually did. Without this a producer could execute
-    // `set_proposed_producers(X)` yet stamp `Y` in the (signed) header: validators
-    // activate `Y` from the header on accept while resolving descendants against
-    // `X`, forking the chain. `parent_schedule` is the schedule active as of the
-    // block's parent, so the new version must be exactly one past it.
-    fn check_schedule_consistency(
-        &self,
-        block: &SignedBlock,
-        executed: &Option<Vec<ProducerKey>>,
-        parent_schedule: &ProducerSchedule,
-    ) -> Result<(), ChainError> {
-        let header_schedule = block.signed_block_header.header.new_schedule();
-        match (header_schedule, executed) {
-            (None, None) => Ok(()),
-            (Some(_), None) => Err(ChainError::BlockError(
-                "block header carries a schedule change its transactions did not make".into(),
-            )),
-            (None, Some(_)) => Err(ChainError::BlockError(
-                "block changed the schedule but its header carries no new_producers".into(),
-            )),
-            (Some(header_schedule), Some(executed)) => {
-                if &header_schedule.producers != executed {
-                    return Err(ChainError::BlockError(
-                        "block header schedule does not match the executed schedule".into(),
-                    ));
-                }
-                if header_schedule.version != parent_schedule.version + 1 {
-                    return Err(ChainError::BlockError(format!(
-                        "block schedule version {} does not follow parent version {}",
-                        header_schedule.version, parent_schedule.version
-                    )));
-                }
-                Ok(())
-            }
-        }
     }
 
     /// Verify a block against the schedule active as of its parent, execute it
@@ -1740,7 +1751,9 @@ impl Controller {
         // rather than whatever happens to be accepted right now, so two nodes
         // reach the same verdict regardless of accept timing.
         block.validate_syntactically(&self.db)?;
-        let parent_schedule = self.schedule_active_for_parent(block.previous_id())?;
+        let mut block_schedule_state = self.schedule_state_for_parent(block.previous_id())?;
+        block_schedule_state.apply_header(&block.signed_block_header.header)?;
+        let block_schedule = block_schedule_state.active;
         let parent_signing_state = self.header_signing_state_for_parent(block.previous_id())?;
         let parent_timestamp = self.timestamp_for_parent(block.previous_id())?;
         let now_timestamp: BlockTimestamp = TimePoint::now().into();
@@ -1748,8 +1761,8 @@ impl Controller {
             .signed_block_header
             .header
             .validate_timestamp(&parent_timestamp, &now_timestamp)?;
-        self.verify_block_signature(block, &parent_schedule, &parent_signing_state)?;
-        self.block_active_schedule = parent_schedule.clone();
+        self.verify_block_signature(block, &block_schedule, &parent_signing_state)?;
+        self.block_active_schedule = block_schedule;
 
         let parent_block_id = block.previous_id().clone();
         let block_status = BlockStatus::Verifying;
@@ -1764,7 +1777,7 @@ impl Controller {
 
         // The arena has no RAII undo hook, so every failure path below mirrors the
         // undo explicitly before returning, keeping the session stack depth right.
-        let (transaction_traces, transaction_mroot, action_mroot, proposed_schedule) =
+        let (transaction_traces, transaction_mroot, action_mroot, _proposed_schedule) =
             match self.execute_block(block, &block_status, mempool) {
                 Ok(v) => v,
                 Err(e) => {
@@ -1778,15 +1791,6 @@ impl Controller {
             return Err(e);
         }
 
-        // The schedule change the header advertises must match what the block's
-        // transactions actually did, so the header can be trusted as the schedule
-        // source on accept and restart.
-        if let Err(e) = self.check_schedule_consistency(block, &proposed_schedule, &parent_schedule)
-        {
-            self.db.arena_undo();
-            return Err(e);
-        }
-
         let block_id = block.id()?;
         self.verified_blocks.insert(block_id, block.clone());
 
@@ -1796,7 +1800,6 @@ impl Controller {
             id: block_id,
             parent: parent_block_id,
             traces: transaction_traces,
-            proposed_schedule,
         });
 
         Ok(())
@@ -1825,7 +1828,11 @@ impl Controller {
                 "verified block cache key {block_id} does not match packed block id {accepted_block_id}"
             )));
         }
-        let accepted_schedule = block.signed_block_header.header.new_schedule().clone();
+        let mut accepted_schedule_state = ProducerScheduleState {
+            active: self.active_schedule.clone(),
+            pending: self.pending_schedule.clone(),
+        };
+        accepted_schedule_state.apply_header(&block.signed_block_header.header)?;
         let mut accepted_signing_state =
             self.header_signing_state_for_parent(block.previous_id())?;
         accepted_signing_state.accept(&block)?;
@@ -1975,16 +1982,14 @@ impl Controller {
         }
         self.validate_persisted_protocol_state(block.block_num(), false)?;
 
-        // Activate a schedule change carried by this block, now that it is
-        // committed. The schedule is read from the accepted block's own (signed)
-        // header, so what takes effect is exactly what the block log records and
-        // what a restart reconstructs — never an out-of-band value. A block that
-        // is rejected or loses a fork is never accepted, so it never changes the
-        // producers. `verify_block` has already bound the header to execution.
-        if let Some(schedule) = accepted_schedule {
-            info!("activated producer schedule version {}", schedule.version);
-            self.active_schedule = schedule.clone();
+        if accepted_schedule_state.active.version != self.active_schedule.version {
+            info!(
+                "activated producer schedule version {}",
+                accepted_schedule_state.active.version
+            );
         }
+        self.active_schedule = accepted_schedule_state.active;
+        self.pending_schedule = accepted_schedule_state.pending;
 
         self.preferred_id = accepted_block_id;
         for receipt in &block.transactions {
@@ -2180,6 +2185,10 @@ impl Controller {
         self.prepare_protocol_execution(protocol_context)?;
         self.blocks_executed += 1;
 
+        let mut schedule_state = self.schedule_state_for_parent(block.previous_id())?;
+        let schedule_promoted = schedule_state.apply_header(&block.signed_block_header.header)?;
+        self.block_active_schedule = schedule_state.active;
+
         // Protocol features take effect at the start of the block, before the
         // implicit onblock action and ordinary transactions. The extension is
         // signed, decoded, and applied inside the block's undo session, so a
@@ -2197,6 +2206,30 @@ impl Controller {
                 .activate_protocol_features(&digests, block.block_num())?;
         }
 
+        if let Some(header_schedule) = block.signed_block_header.header.new_schedule() {
+            let (proposal_block, packed) = self.db.proposed_schedule().ok_or_else(|| {
+                ChainError::BlockError(
+                    "block carries new_producers without an on-chain proposed schedule".into(),
+                )
+            })?;
+            if proposal_block >= block.block_num() {
+                return Err(ChainError::BlockError(format!(
+                    "block {} promotes a schedule proposed in non-prior block {}",
+                    block.block_num(),
+                    proposal_block
+                )));
+            }
+            let proposed = ProducerSchedule::read_bounded(&packed).map_err(|error| {
+                ChainError::BlockError(format!("invalid stored proposed schedule: {error}"))
+            })?;
+            if &proposed != header_schedule {
+                return Err(ChainError::BlockError(
+                    "block new_producers does not match the on-chain proposed schedule".into(),
+                ));
+            }
+            self.db.clear_proposed_schedule()?;
+        }
+
         self.db
             .clear_expired_input_transactions(&block.timestamp().to_time_point())?;
 
@@ -2209,6 +2242,10 @@ impl Controller {
             block_status,
         )?;
         action_receipt_digests.extend(onblock_digests);
+        if schedule_promoted {
+            let producers = self.block_active_schedule.producers.clone();
+            self.update_producers_authority(&producers, block.timestamp())?;
+        }
         // Mirror build_block: onblock's proposal counts like any transaction's,
         // overridden by a later transaction's — keeping verify's re-execution in
         // agreement with what the producer folded into the header.
@@ -2393,10 +2430,6 @@ impl Controller {
 
         let transaction_mroot = self.calculate_trx_merkle(&transaction_receipts)?;
         let action_mroot = self.calculate_action_merkle(&mut action_receipt_digests)?;
-
-        if let Some(ref producers) = proposed_schedule {
-            self.update_producers_authority(producers, block.timestamp())?;
-        }
 
         self.finalize_block_resources(block.block_num())?;
 
@@ -3468,7 +3501,7 @@ impl Controller {
                 self.pending_tip_id()
             );
             self.db.arena_start_undo_session(); // the replayed block's session
-            let (traces, _transaction_mroot, _action_mroot, proposed_schedule) =
+            let (traces, _transaction_mroot, _action_mroot, _proposed_schedule) =
                 match self.execute_block(block, block_status, mempool) {
                     Ok(v) => v,
                     Err(e) => {
@@ -3480,7 +3513,6 @@ impl Controller {
                 id: block.id()?,
                 parent: block.previous_id().clone(),
                 traces,
-                proposed_schedule,
             });
         }
 
@@ -5466,20 +5498,6 @@ mod tests {
 
         Ok(())
     }
-    const PROPOSE_PRODUCERS_WAT: &str = r#"
-        (module
-          (import "env" "action_data_size" (func $ads (result i32)))
-          (import "env" "read_action_data" (func $read (param i32 i32) (result i32)))
-          (import "env" "set_proposed_producers" (func $spp (param i32 i32) (result i64)))
-          (memory 1)
-          (export "memory" (memory 0))
-          (func (export "apply") (param i64 i64 i64)
-            (local $len i32)
-            (local.set $len (call $ads))
-            (drop (call $read (i32.const 0) (local.get $len)))
-            (drop (call $spp (i32.const 0) (local.get $len)))))
-    "#;
-
     // Bit-for-bit block-id parity across serialization and re-execution. A
     // producer builds a real chain — onblock runs at the head of every block,
     // plus an account-creating transaction — and each block is round-tripped
@@ -5981,7 +5999,7 @@ mod tests {
         // matching it on each arch is the cross-arch gate for a full contract run.
         // A deliberate change to pg or the receipt moves it — recompute and commit.
         const PG_RECEIPT_GOLDEN: &str =
-            "74087ef5d3c7a33f952046415b2cefa57a84ddafc406b9f5f3e06984bbf9fd27";
+            "7938dab1f2e358201b653517c66d4f56d0d69fb57482d57a98fbb54de00b804c";
         let got: String = first
             .iter()
             .flat_map(|d| d.as_bytes().iter().map(|b| format!("{b:02x}")))
@@ -6975,6 +6993,11 @@ mod tests {
         }])?;
         assert_eq!(validator.active_schedule.version, 1);
 
+        // schedule_version names the schedule active for this block. The block
+        // built under version 0 must therefore declare version 1 before it can
+        // be checked against the test-rotated validator state.
+        block.signed_block_header.header.schedule_version = 1;
+
         let mut v_mempool = Mempool::new();
         assert!(
             validator
@@ -7490,36 +7513,38 @@ mod tests {
             let mut controller = Controller::new();
             controller.initialize(&chain_id, &config_bytes, &genesis_bytes.to_vec(), &path)?;
 
-            // Install the privileged proposal contract in an accepted block,
-            // then produce and accept a genuine schedule-changing block. The
-            // restart path must only ever see log records paired with the same
-            // committed chainbase revision.
-            let mut mempool = Mempool::new();
-            let admin = Name::from_str("prodadmin")?;
-            mempool.add_transaction(create_account(&private_key, admin, chain_id)?);
-            mempool.add_transaction(set_code(
-                &private_key,
-                admin,
-                crate::wat2wasm(PROPOSE_PRODUCERS_WAT).expect("valid WAT"),
-                chain_id,
-            )?);
-            let mut block = controller.build_block(&mut mempool).await?;
-            block.signed_block_header.header.schedule_version = new_schedule.version;
-            block.signed_block_header.header.new_producers = Some(new_schedule.clone());
-            let sig_digest = block.signed_block_header.header.sig_digest()?;
-            block.signed_block_header.signature = private_key.sign(&sig_digest)?;
-
-            let packed = block
-                .pack()
-                .map_err(|e| ChainError::SerializationError(e.to_string()))?;
-            controller
-                .block_log
-                .as_ref()
-                .unwrap()
-                .append(block.id()?, &packed)
-                .map_err(|e| ChainError::InternalError(e.to_string()))?;
-            controller.clear_pending()?;
-            controller.db.set_revision(2)?;
+            // Append the canonical pending->active header sequence. This test
+            // only exercises restart reconstruction; on-chain proposal matching
+            // is covered by the end-to-end proposal lifecycle test below.
+            let mut previous = controller.last_accepted_block_id;
+            for (height, (schedule_version, pending)) in
+                [(2, (0, Some(new_schedule.clone()))), (3, (1, None))]
+            {
+                let block = SignedBlock::new(
+                    previous,
+                    BlockTimestamp::new(height),
+                    PULSE_NAME,
+                    VecDeque::new(),
+                    Digest::default(),
+                    Digest::default(),
+                );
+                let mut block = block;
+                block.signed_block_header.header.schedule_version = schedule_version;
+                block.signed_block_header.header.new_producers = pending;
+                let block_id = block.id()?;
+                let packed = block
+                    .pack()
+                    .map_err(|e| ChainError::SerializationError(e.to_string()))?;
+                controller
+                    .block_log
+                    .as_ref()
+                    .unwrap()
+                    .append(block_id, &packed)
+                    .map_err(|e| ChainError::InternalError(e.to_string()))?;
+                previous = block_id;
+            }
+            controller.last_accepted_block_id = previous;
+            controller.db.set_revision(3)?;
             controller.shutdown()?;
         }
 
@@ -7587,15 +7612,28 @@ mod tests {
         controller.accept_block(&deployment.id()?, &mut mempool)?;
         controller.set_preferred_id(deployment.id()?);
 
-        // A normal transaction makes the next block non-empty; its schedule
-        // change can only have originated in the implicit onblock action.
+        // The proposal written by onblock belongs to the election block's state,
+        // not its header. It can only enter a later header after that block is
+        // irreversible; this one-producer test advances it on the next block.
         mempool.add_transaction(create_account(
             &private_key,
             Name::from_str("bob")?,
             chain_id,
         )?);
         let election = controller.build_block(&mut mempool).await?;
-        let header_schedule = election
+        assert!(election.signed_block_header.header.new_schedule().is_none());
+        controller.accept_block(&election.id()?, &mut mempool)?;
+        controller.set_preferred_id(election.id()?);
+
+        mempool.add_transaction(create_account(
+            &private_key,
+            Name::from_str("carol")?,
+            chain_id,
+        )?);
+        let pending = controller.build_block(&mut mempool).await?;
+        let header_schedule = election.signed_block_header.header.new_schedule();
+        assert!(header_schedule.is_none());
+        let header_schedule = pending
             .signed_block_header
             .header
             .new_schedule()
@@ -7604,8 +7642,28 @@ mod tests {
         assert_eq!(header_schedule.version, 1);
         assert_eq!(header_schedule.producers, proposed);
 
-        controller.accept_block(&election.id()?, &mut mempool)?;
+        controller.accept_block(&pending.id()?, &mut mempool)?;
+        controller.set_preferred_id(pending.id()?);
+        assert_eq!(controller.active_schedule.version, 0);
+        assert_eq!(controller.pending_schedule, Some(header_schedule.clone()));
+
+        // Once the pending schedule becomes irreversible, the next header names
+        // it as active. The pulse entry deliberately keeps the same key, so the
+        // locally produced block remains authorized after promotion.
+        mempool.add_transaction(create_account(
+            &private_key,
+            Name::from_str("dave")?,
+            chain_id,
+        )?);
+        let mut activation = controller.build_block(&mut mempool).await?;
+        activation.signed_block_header.header.schedule_version = 1;
+        activation.signed_block_header.signature =
+            private_key.sign(&activation.signed_block_header.header.sig_digest()?)?;
+        controller.clear_pending()?;
+        controller.verify_block(&activation, &mut mempool).await?;
+        controller.accept_block(&activation.id()?, &mut mempool)?;
         assert_eq!(controller.active_schedule, header_schedule.clone());
+        assert!(controller.pending_schedule.is_none());
         Ok(())
     }
 

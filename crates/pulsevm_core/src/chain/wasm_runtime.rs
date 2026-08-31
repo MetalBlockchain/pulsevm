@@ -1,5 +1,7 @@
 use std::{
+    borrow::Cow,
     cell::RefCell,
+    collections::BTreeSet,
     num::NonZeroUsize,
     sync::{
         Arc,
@@ -17,6 +19,7 @@ use pulsevm_error::ChainError;
 use wasmer::{
     AsStoreMut,
     Engine,
+    Extern,
     Function,
     FunctionEnv,
     Imports,
@@ -227,6 +230,182 @@ use crate::chain::{
         transaction_size,
     },
 };
+
+fn exported_memory(instance: &Instance) -> Option<Memory> {
+    instance
+        .exports
+        .get_memory("memory")
+        .ok()
+        .cloned()
+        .or_else(|| {
+            instance
+                .exports
+                .iter()
+                .find_map(|(_, export)| match export {
+                    Extern::Memory(memory) => Some(memory.clone()),
+                    _ => None,
+                })
+        })
+}
+
+fn read_var_u32(bytes: &[u8], offset: &mut usize) -> Result<u32, ChainError> {
+    let mut value = 0_u32;
+    for shift in (0..35).step_by(7) {
+        let byte = *bytes
+            .get(*offset)
+            .ok_or_else(|| ChainError::WasmRuntimeError("truncated wasm section".to_string()))?;
+        *offset += 1;
+        if shift == 28 && byte & 0xf0 != 0 {
+            return Err(ChainError::WasmRuntimeError(
+                "invalid wasm varuint32".to_string(),
+            ));
+        }
+        value |= u32::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+    }
+    Err(ChainError::WasmRuntimeError(
+        "invalid wasm varuint32".to_string(),
+    ))
+}
+
+fn write_var_u32(mut value: u32, bytes: &mut Vec<u8>) {
+    loop {
+        let mut byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        bytes.push(byte);
+        if value == 0 {
+            return;
+        }
+    }
+}
+
+/// Makes an internal EOSIO linear memory visible to Wasmer host functions.
+///
+/// Legacy EOSIO contracts intentionally export only `apply`; nodeos runtimes
+/// can still access their internal memory directly. Wasmer's public API cannot,
+/// so add a private export to the compilation copy. The bytes stored on chain,
+/// their code hash, and the WebAssembly instruction stream remain unchanged.
+fn expose_internal_memory(code: &[u8]) -> Result<Cow<'_, [u8]>, ChainError> {
+    const WASM_HEADER: &[u8; 8] = b"\0asm\x01\0\0\0";
+    if code.get(..WASM_HEADER.len()) != Some(WASM_HEADER) {
+        return Err(ChainError::WasmRuntimeError(
+            "invalid wasm header".to_string(),
+        ));
+    }
+
+    let mut offset = WASM_HEADER.len();
+    let mut defined_memories = 0_u32;
+    let mut export_section = None;
+    let mut export_names = BTreeSet::new();
+    let mut has_memory_export = false;
+    let mut export_insertion = code.len();
+
+    while offset < code.len() {
+        let section_start = offset;
+        let section_id = code[offset];
+        offset += 1;
+        let section_size = read_var_u32(code, &mut offset)? as usize;
+        let payload_start = offset;
+        let payload_end = payload_start.checked_add(section_size).ok_or_else(|| {
+            ChainError::WasmRuntimeError("wasm section size overflow".to_string())
+        })?;
+        if payload_end > code.len() {
+            return Err(ChainError::WasmRuntimeError(
+                "truncated wasm section".to_string(),
+            ));
+        }
+
+        if section_id != 0 && section_id > 7 && export_insertion == code.len() {
+            export_insertion = section_start;
+        }
+        match section_id {
+            5 => {
+                let mut cursor = payload_start;
+                defined_memories = read_var_u32(code, &mut cursor)?;
+            }
+            7 => {
+                export_section = Some((section_start, payload_start, payload_end));
+                let mut cursor = payload_start;
+                let count = read_var_u32(code, &mut cursor)?;
+                for _ in 0..count {
+                    let name_len = read_var_u32(code, &mut cursor)? as usize;
+                    let name_end = cursor.checked_add(name_len).ok_or_else(|| {
+                        ChainError::WasmRuntimeError("wasm export name overflow".to_string())
+                    })?;
+                    let name = code.get(cursor..name_end).ok_or_else(|| {
+                        ChainError::WasmRuntimeError("truncated wasm export".to_string())
+                    })?;
+                    export_names.insert(name.to_vec());
+                    cursor = name_end;
+                    let kind = *code.get(cursor).ok_or_else(|| {
+                        ChainError::WasmRuntimeError("truncated wasm export".to_string())
+                    })?;
+                    cursor += 1;
+                    let _index = read_var_u32(code, &mut cursor)?;
+                    has_memory_export |= kind == 2;
+                }
+            }
+            _ => {}
+        }
+        offset = payload_end;
+    }
+
+    if has_memory_export || defined_memories == 0 {
+        return Ok(Cow::Borrowed(code));
+    }
+    if defined_memories != 1 {
+        return Err(ChainError::WasmRuntimeError(format!(
+            "expected one wasm memory, found {defined_memories}"
+        )));
+    }
+
+    let mut export_name = b"__pulsevm_memory".to_vec();
+    while export_names.contains(&export_name) {
+        export_name.push(b'_');
+    }
+    let mut entry = Vec::with_capacity(export_name.len() + 8);
+    write_var_u32(export_name.len() as u32, &mut entry);
+    entry.extend_from_slice(&export_name);
+    entry.push(2); // external_kind::memory
+    write_var_u32(0, &mut entry); // the sole memory index
+
+    let mut output = Vec::with_capacity(code.len() + entry.len() + 8);
+    if let Some((section_start, payload_start, payload_end)) = export_section {
+        let mut entries_start = payload_start;
+        let export_count = read_var_u32(code, &mut entries_start)?;
+        let mut payload = Vec::with_capacity(payload_end - payload_start + entry.len());
+        write_var_u32(
+            export_count
+                .checked_add(1)
+                .ok_or_else(|| ChainError::WasmRuntimeError("too many wasm exports".to_string()))?,
+            &mut payload,
+        );
+        payload.extend_from_slice(&code[entries_start..payload_end]);
+        payload.extend_from_slice(&entry);
+
+        output.extend_from_slice(&code[..section_start]);
+        output.push(7);
+        write_var_u32(payload.len() as u32, &mut output);
+        output.extend_from_slice(&payload);
+        output.extend_from_slice(&code[payload_end..]);
+    } else {
+        let mut payload = Vec::with_capacity(entry.len() + 1);
+        write_var_u32(1, &mut payload);
+        payload.extend_from_slice(&entry);
+
+        output.extend_from_slice(&code[..export_insertion]);
+        output.push(7);
+        write_var_u32(payload.len() as u32, &mut output);
+        output.extend_from_slice(&payload);
+        output.extend_from_slice(&code[export_insertion..]);
+    }
+    Ok(Cow::Owned(output))
+}
 
 use super::webassembly::{
     action_data_size,
@@ -540,13 +719,14 @@ impl WasmRuntime {
 
             if !inner.code_cache.contains(&id) {
                 let code_bytes = db.get_code_bytes_by_hash(code_hash, 0, 0)?;
+                let runtime_code = expose_internal_memory(code_bytes.as_slice())?;
 
                 // Compile on a fresh engine carrying the pinned deterministic
                 // config (NaN canonicalization, metering, feature set).
                 let temp_engine = Self::deterministic_engine();
                 let temp_store = Store::new(temp_engine.clone());
 
-                let module = Module::new(temp_store.engine(), code_bytes.as_slice())
+                let module = Module::new(temp_store.engine(), runtime_code.as_ref())
                     .map_err(|e| ChainError::WasmRuntimeError(e.to_string()))?;
                 inner.code_cache.put(
                     id,
@@ -801,27 +981,16 @@ impl WasmRuntime {
                 ChainError::WasmRuntimeError(format!("failed to create wasm instance: {}", e))
             })?;
 
-        match instance.exports.get_memory("memory") {
-            Ok(mem) => {
-                warm.env.as_mut(&mut warm.store).memory = Some(mem.clone());
-            }
-            Err(_) => {
-                return Err(ChainError::WasmRuntimeError(
-                    "wasm memory export not found".to_string(),
-                ));
-            }
-        }
+        warm.env.as_mut(&mut warm.store).memory = exported_memory(&instance);
 
         // Hand the instance to the env so host intrinsics can bill their work
         // against the metering budget via WasmContext::charge.
         warm.env.as_mut(&mut warm.store).instance = Some(instance.clone());
 
-        // cpu_limit == -1 means no account/block limit (only the system's own
-        // implicit transactions, e.g. onblock, get this). Seed a large finite
-        // budget: the old 300M placeholder was smaller than a normal transaction
-        // once intrinsics are metered in points (so it could wrongly trap a system
-        // action a user tx could afford), but leaving it truly unbounded would let a
-        // buggy system contract spin forever. See config::IMPLICIT_TX_CPU_BUDGET.
+        // cpu_limit == -1 means execution is exempt from the local objective
+        // account/block allowance (implicit actions and explicitly billed block
+        // replay). Seed a large finite deterministic budget so malformed code
+        // still cannot spin forever. See config::IMPLICIT_TX_CPU_BUDGET.
         let cpu_limit = if cpu_limit >= 0 {
             cpu_limit as u64
         } else {
@@ -904,7 +1073,45 @@ mod tests {
     use super::{
         WasmRuntime,
         charge_metering_points,
+        exported_memory,
+        expose_internal_memory,
     };
+
+    #[test]
+    fn finds_legacy_nonstandard_memory_export() {
+        let wasm = wat::parse_str(
+            r#"
+            (module
+              (memory (export "linear_memory") 1))
+            "#,
+        )
+        .unwrap();
+        let mut store = Store::new(WasmRuntime::deterministic_engine());
+        let module = Module::new(&store, &wasm).unwrap();
+        let instance = Instance::new(&mut store, &module, &imports! {}).unwrap();
+
+        assert!(exported_memory(&instance).is_some());
+    }
+
+    #[test]
+    fn exposes_legacy_internal_memory_to_host_functions() {
+        let wasm = wat::parse_str(
+            r#"
+            (module
+              (memory 1)
+              (func (export "apply") (param i64 i64 i64)))
+            "#,
+        )
+        .unwrap();
+        let runtime_wasm = expose_internal_memory(&wasm).unwrap();
+        assert!(matches!(runtime_wasm, std::borrow::Cow::Owned(_)));
+
+        let mut store = Store::new(WasmRuntime::deterministic_engine());
+        let module = Module::new(&store, runtime_wasm.as_ref()).unwrap();
+        let instance = Instance::new(&mut store, &module, &imports! {}).unwrap();
+
+        assert!(exported_memory(&instance).is_some());
+    }
 
     // A host intrinsic bills its own work out of the same metering budget the
     // wasm body spends: each charge lowers the remaining points by exactly the

@@ -203,33 +203,15 @@ impl BlockHeader {
             db.is_account(self.producer.as_u64())?,
             ChainError::BlockError("producer account does not exist".into()),
         )?;
-        pulse_assert(
-            self.confirmed == 0,
-            ChainError::BlockError("confirmed count must be 0".into()),
-        )?;
-        // A block may change the producer schedule. When it does, the change is
-        // carried in `new_producers` and the header's `schedule_version` names the
-        // resulting version; the two must agree, and an empty `new_producers`
-        // implies version 0. `new_schedule()` bounds the decode. The signature and
-        // execution binding are checked by the controller; here we enforce only
-        // header self-consistency.
-        match self.new_schedule() {
-            None => pulse_assert(
-                self.schedule_version == 0,
-                ChainError::BlockError("schedule version must be 0 without new producers".into()),
-            )?,
-            Some(schedule) => {
-                pulse_assert(
-                    !schedule.producers.is_empty(),
-                    ChainError::BlockError("new producer schedule is empty".into()),
-                )?;
-                pulse_assert(
-                    schedule.version == self.schedule_version,
-                    ChainError::BlockError(
-                        "schedule version does not match new_producers version".into(),
-                    ),
-                )?;
-            }
+        // `schedule_version` names the schedule active for this block. A
+        // `new_producers` payload is only a pending schedule and therefore has
+        // the next version; its relationship to the active and prior pending
+        // schedules is validated by the controller's header state.
+        if let Some(schedule) = self.new_schedule() {
+            pulse_assert(
+                !schedule.producers.is_empty(),
+                ChainError::BlockError("new producer schedule is empty".into()),
+            )?;
         }
         self.protocol_feature_activations()?;
         Ok(())

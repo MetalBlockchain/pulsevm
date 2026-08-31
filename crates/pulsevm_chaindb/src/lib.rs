@@ -629,6 +629,19 @@ struct GlobalPropertyRow {
     _pad: u32,
 }
 
+/// Undo-tracked `global_property_object::proposed_schedule` state. The packed
+/// schedule remains in a blob because the producer vector is variable-length;
+/// `block_num` records the block in which `set_proposed_producers` wrote it.
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout, ArenaObject)]
+#[arena(type_id = 24)]
+struct ProposedScheduleRow {
+    id: ObjectId<ProposedScheduleRow>,
+    block_num: u32,
+    _pad: u32,
+    packed_schedule: BlobRef,
+}
+
 /// One activated protocol feature from chainbase's `protocol_state` singleton.
 /// The singleton is represented as an ordered table so the variable-length
 /// feature vector remains undo/checkpoint safe without imposing a fixed cap on
@@ -1344,6 +1357,7 @@ fn build_registered_db() -> Result<Db, DbError> {
     db.add_table::<DynGlobalPropertyRow>()?;
     db.add_table::<PermSeqRow>()?;
     db.add_table::<GlobalPropertyRow>()?;
+    db.add_table::<ProposedScheduleRow>()?;
     db.add_table::<ProtocolFeatureRow>()?;
     db.add_table::<PreactivatedProtocolFeatureRow>()?;
     db.add_table::<ResourceConfigRow>()?;
@@ -3376,6 +3390,61 @@ impl ChainDatabase {
             max_inline_action_depth: r.max_inline_action_depth,
             max_authority_depth: r.max_authority_depth,
         })
+    }
+
+    /// Replace the undo-tracked producer schedule proposed by the system
+    /// contract. A later proposal in the same block replaces the earlier one;
+    /// promotion to a block-header pending schedule clears this singleton.
+    pub fn set_proposed_schedule(
+        &self,
+        block_num: u32,
+        packed_schedule: &[u8],
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let blob = db.alloc_blob::<ProposedScheduleRow>(packed_schedule)?;
+        let existing = db
+            .table::<ProposedScheduleRow>()?
+            .iter()
+            .next()
+            .map(|row| row.id());
+        match existing {
+            Some(id) => db.modify::<ProposedScheduleRow>(id, |row| {
+                row.block_num = block_num;
+                row.packed_schedule = blob;
+            })?,
+            None => {
+                db.create::<ProposedScheduleRow>(|row| {
+                    row.block_num = block_num;
+                    row.packed_schedule = blob;
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Current proposed schedule as `(proposal block, packed schedule)`.
+    pub fn proposed_schedule(&self) -> Option<(u32, Vec<u8>)> {
+        let db = self.lock();
+        let row = db.table::<ProposedScheduleRow>().ok()?.iter().next()?;
+        let packed = db
+            .blob::<ProposedScheduleRow>(row.packed_schedule)
+            .ok()?
+            .to_vec();
+        Some((row.block_num, packed))
+    }
+
+    /// Clear a proposal after it has been promoted into a signed block header.
+    pub fn clear_proposed_schedule(&self) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let id = db
+            .table::<ProposedScheduleRow>()?
+            .iter()
+            .next()
+            .map(|row| row.id());
+        if let Some(id) = id {
+            db.remove::<ProposedScheduleRow>(id)?;
+        }
+        Ok(())
     }
 
     /// Canonical serialization of the stored `chain_config` (16 fields, little
@@ -6041,6 +6110,29 @@ mod tests {
         db.commit(12);
         assert!(db.protocol_feature_activated(digest));
         assert!(db.preactivated_protocol_features().is_empty());
+    }
+
+    #[test]
+    fn proposed_schedule_replacement_clear_and_undo_are_atomic() {
+        let db = ChainDatabase::new().unwrap();
+        assert_eq!(db.proposed_schedule(), None);
+
+        db.start_undo_session();
+        db.set_proposed_schedule(7, &[1, 2, 3]).unwrap();
+        assert_eq!(db.proposed_schedule(), Some((7, vec![1, 2, 3])));
+        db.squash();
+
+        db.start_undo_session();
+        db.set_proposed_schedule(8, &[4, 5]).unwrap();
+        assert_eq!(db.proposed_schedule(), Some((8, vec![4, 5])));
+        db.undo();
+        assert_eq!(db.proposed_schedule(), Some((7, vec![1, 2, 3])));
+
+        db.start_undo_session();
+        db.clear_proposed_schedule().unwrap();
+        assert_eq!(db.proposed_schedule(), None);
+        db.undo();
+        assert_eq!(db.proposed_schedule(), Some((7, vec![1, 2, 3])));
     }
 
     /// The standalone-write path bills db_idxN_update off the row's old payer and

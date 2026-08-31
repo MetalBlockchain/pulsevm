@@ -218,6 +218,15 @@ async fn main() -> Result<()> {
         usage(&program);
         bail!("too many arguments");
     }
+    let debug_block = env::var("XPR_REPLAY_DEBUG_BLOCK")
+        .ok()
+        .map(|value| {
+            value
+                .parse::<u32>()
+                .context("XPR_REPLAY_DEBUG_BLOCK must be a uint32")
+        })
+        .transpose()?;
+    let inspect_schedules = env::var_os("XPR_REPLAY_INSPECT_SCHEDULES").is_some();
 
     let source_dir = PathBuf::from(source_dir);
     let arena_dir = PathBuf::from(arena_dir);
@@ -253,20 +262,44 @@ async fn main() -> Result<()> {
             .to_str()
             .context("arena directory is not valid UTF-8")?,
     )?;
-    let local_genesis = controller.last_accepted_block().id()?;
-    if local_genesis.to_string() != XPR_BLOCK_ONE_ID {
-        bail!("authored genesis id {local_genesis} is not canonical XPR block 1");
+    let local_tip = controller.last_accepted_block();
+    if local_tip.block_num() == 1 && local_tip.id()?.to_string() != XPR_BLOCK_ONE_ID {
+        bail!(
+            "authored genesis id {} is not canonical XPR block 1",
+            local_tip.id()?
+        );
     }
 
     let source_genesis_bytes = source.packed_block(1)?;
     let source_genesis = controller
         .parse_block(&source_genesis_bytes)
         .map_err(|error| anyhow::anyhow!("decode source block 1: {error}"))?;
-    if source_genesis.id()? != local_genesis {
+    if source_genesis.id()?.to_string() != XPR_BLOCK_ONE_ID {
         bail!(
-            "source block 1 id {} differs from authored genesis {local_genesis}",
+            "source block 1 id {} differs from canonical genesis {XPR_BLOCK_ONE_ID}",
             source_genesis.id()?
         );
+    }
+
+    if inspect_schedules {
+        let mut previous = None;
+        for block_num in 1..=last {
+            let block = controller
+                .parse_block(&source.packed_block(block_num)?)
+                .map_err(|error| anyhow::anyhow!("decode source block {block_num}: {error}"))?;
+            let header = &block.signed_block_header.header;
+            let state = (header.schedule_version, header.confirmed, header.producer);
+            if previous != Some(state) || header.new_producers.is_some() {
+                eprintln!(
+                    "schedule block {block_num}: producer={} confirmed={} active_version={} new={:?}",
+                    header.producer,
+                    header.confirmed,
+                    header.schedule_version,
+                    header.new_producers
+                );
+            }
+            previous = Some(state);
+        }
     }
 
     let start = controller
@@ -298,6 +331,40 @@ async fn main() -> Result<()> {
                 "source index entry {block_num} decoded as block {}",
                 block.block_num()
             );
+        }
+        if debug_block == Some(block_num) {
+            eprintln!(
+                "canonical source block {block_num}: {} transactions, header extensions {:?}, block extensions {:?}",
+                block.transactions.len(),
+                block.signed_block_header.header.header_extensions,
+                block.block_extensions
+            );
+            for (receipt_index, receipt) in block.transactions.iter().enumerate() {
+                eprintln!(
+                    "  receipt {receipt_index}: id={} status={:?} cpu={} net_words={}",
+                    receipt.transaction_id(),
+                    receipt.status(),
+                    receipt.cpu_usage_us(),
+                    receipt.net_usage_words()
+                );
+                if let Some(packed) = receipt.packed_trx() {
+                    let transaction = packed.get_transaction();
+                    for (action_index, action) in transaction
+                        .context_free_actions
+                        .iter()
+                        .chain(&transaction.actions)
+                        .enumerate()
+                    {
+                        eprintln!(
+                            "    action {action_index}: {}::{} auth={:?} data_bytes={}",
+                            action.account(),
+                            action.name(),
+                            action.authorization(),
+                            action.data().len()
+                        );
+                    }
+                }
+            }
         }
         let block_id = block.id()?;
         controller
