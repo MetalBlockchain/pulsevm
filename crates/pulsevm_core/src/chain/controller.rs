@@ -4625,10 +4625,7 @@ mod tests {
         };
         use pulsevm_crypto::Bytes;
         use pulsevm_serialization::VarUint32;
-        use std::collections::{
-            BTreeSet,
-            VecDeque,
-        };
+        use std::collections::VecDeque;
 
         let hexd32 = |s: &str| -> [u8; 32] { hex::decode(s).unwrap().try_into().unwrap() };
         let header = BlockHeader {
@@ -4664,9 +4661,9 @@ mod tests {
                     "pruned transaction (id only)".into(),
                 ));
             }
-            let mut sigs = BTreeSet::new();
+            let mut sigs = Vec::new();
             for s in trx["signatures"].as_array().unwrap() {
-                sigs.insert(
+                sigs.push(
                     Signature::from_str(s.as_str().unwrap())
                         .map_err(|e| ChainError::BlockError(format!("signature parse: {e:?}")))?,
                 );

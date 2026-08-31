@@ -288,7 +288,7 @@ mod tests {
             vec![],
         );
         PackedTransaction::new(
-            std::collections::BTreeSet::new(),
+            Vec::new(),
             TransactionCompression::None,
             pulsevm_crypto::Bytes::default(),
             trx.pack().unwrap().into(),

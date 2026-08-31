@@ -38,7 +38,9 @@ use crate::{
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackedTransaction {
-    signatures: BTreeSet<Signature>,     // Signatures of the transaction
+    // Signature order is consensus data: packed_digest() hashes this vector
+    // exactly as received even though authorization later deduplicates keys.
+    signatures: Vec<Signature>,
     compression: TransactionCompression, // Compression type used for the transaction
     packed_context_free_data: Bytes,     // Packed context-free data, if any
     packed_trx: Bytes,                   // Packed transaction, not signed, data
@@ -57,7 +59,7 @@ impl PackedTransaction {
     /// rejects the empty signature set.
     pub fn from_deferred_transaction_bytes(packed_trx: Bytes) -> Result<Self, ChainError> {
         Self::new(
-            BTreeSet::new(),
+            Vec::new(),
             TransactionCompression::None,
             Bytes::default(),
             packed_trx,
@@ -66,7 +68,7 @@ impl PackedTransaction {
 
     #[inline]
     pub fn new(
-        signatures: BTreeSet<Signature>,
+        signatures: Vec<Signature>,
         compression: TransactionCompression,
         packed_context_free_data: Bytes,
         packed_trx: Bytes,
@@ -85,15 +87,17 @@ impl PackedTransaction {
         };
         let trx_id: Id = unpacked_trx.id()?;
 
+        let unique_signatures = signatures.iter().cloned().collect::<BTreeSet<_>>();
+
         Ok(Self {
-            signatures: signatures.clone(),
+            signatures,
             compression,
             packed_context_free_data,
             packed_trx,
 
             unpacked_trx: SignedTransaction::new(
                 unpacked_trx,
-                signatures,
+                unique_signatures,
                 unpacked_context_free_data,
             ),
             trx_id: trx_id,
@@ -164,7 +168,7 @@ impl PackedTransaction {
         })?;
 
         Ok(Self {
-            signatures: trx.signatures().clone(),
+            signatures: trx.signatures().iter().cloned().collect(),
             compression: TransactionCompression::None, // Default to no compression for now
             packed_context_free_data: Bytes::default(), // No context-free data for now
             packed_trx: trx
@@ -216,7 +220,7 @@ impl Write for PackedTransaction {
 impl Read for PackedTransaction {
     #[inline]
     fn read(data: &[u8], pos: &mut usize) -> Result<Self, ReadError> {
-        let signatures = BTreeSet::<Signature>::read(data, pos)?;
+        let signatures = Vec::<Signature>::read(data, pos)?;
         let compression = TransactionCompression::read(data, pos)?;
         let packed_context_free_data = Bytes::read(data, pos)?;
         let packed_trx = Bytes::read(data, pos)?;
@@ -280,11 +284,19 @@ fn maybe_decompress(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chain::transaction::{
+        TransactionReceipt,
+        TransactionReceiptHeader,
+        TransactionStatus,
+    };
     use flate2::{
         Compression,
         write::ZlibEncoder,
     };
-    use std::io::Write as IoWrite;
+    use std::{
+        io::Write as IoWrite,
+        str::FromStr,
+    };
 
     fn zlib_compress(data: &[u8]) -> Vec<u8> {
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
@@ -338,5 +350,34 @@ mod tests {
             "newaccount"
         );
         assert_eq!(transaction.packed_trx_bytes(), raw.as_slice());
+    }
+
+    #[test]
+    fn packed_digest_preserves_xpr_multi_signature_order() {
+        // XPR block 18,458,006 is the first canonical replay fixture whose two
+        // signatures are not already in Signature's sort order. Leap hashes the
+        // source vector order into packed_digest and therefore into the receipt
+        // Merkle root.
+        let signatures = vec![
+            Signature::from_str("SIG_K1_KZDbad1igYb6zfjGqziC4DwanAYv96DMJDb3NLgMgLwSximq6Gf3GjFQEVDsRYEihRvsx8BxSLvYHhyCVYyxHZZh2H2vtX").unwrap(),
+            Signature::from_str("SIG_K1_K6tVhH5eiejjjnyBU1LnTkYDzHnLxiQSGZdc5N3qwo6aUz1pcABEicDJvr1wHKDhW24DmP2v7smw6hzBjWr5sJgHfi5SRQ").unwrap(),
+        ];
+        let packed_trx = hex::decode("5c5f2d5f4da4e48fb6b700000000013069a6b702ea305500805feeaa7d15d6023069a6b782e964320000c057b9e5aeda90558c864f9ae9ad00000000a8ed323211c0a6db0603ea305590558c864f9ae9ad0100").unwrap();
+        let packed = PackedTransaction::new(
+            signatures,
+            TransactionCompression::None,
+            Bytes::default(),
+            packed_trx.into(),
+        )
+        .unwrap();
+        let receipt = TransactionReceipt::new(
+            TransactionReceiptHeader::new(TransactionStatus::Executed, 2_606, VarUint32(18)),
+            packed,
+        );
+
+        assert_eq!(
+            hex::encode(receipt.digest().unwrap().as_bytes()),
+            "1a21a9a9606dca1674921fcdbf5f47a64bfb87584a5a116671cf2b953e7e10b0"
+        );
     }
 }
