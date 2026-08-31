@@ -21,6 +21,8 @@ use std::{
         PathBuf,
     },
     str::FromStr,
+    sync::mpsc::sync_channel,
+    thread,
     time::Instant,
 };
 
@@ -31,9 +33,13 @@ use anyhow::{
 };
 use pulsevm_core::{
     block::SignedBlock,
-    controller::Controller,
+    controller::{
+        AuthenticatedMigrationBlock,
+        Controller,
+    },
     id::Id,
     mempool::Mempool,
+    name::Name,
 };
 use pulsevm_serialization::Read as PulseRead;
 use serde_json::json;
@@ -43,6 +49,11 @@ const XPR_BLOCK_ONE_ID: &str = "000000018421bd47ce23d4c47706e0bb98604157afedc67d
 const UNUSED_PRODUCER_KEY: &str = "PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez";
 const XPR_V3_FIRST_BLOCK_OFFSET: u64 = 126;
 const PARTIAL_SCAN_WINDOW: usize = 4 * 1024 * 1024;
+const SIGNATURE_PIPELINE_DEPTH: usize = 64;
+const ONLY_LINK_TO_EXISTING_PERMISSION_FEATURE_DIGEST: [u8; 32] = [
+    0x1a, 0x99, 0xa5, 0x9d, 0x87, 0xe0, 0x6e, 0x09, 0xec, 0x5b, 0x02, 0x8a, 0x9c, 0xbb, 0x77, 0x49,
+    0xb4, 0xa5, 0xad, 0x88, 0x19, 0x00, 0x43, 0x65, 0xd0, 0x2d, 0xc4, 0x37, 0x9a, 0x8b, 0x72, 0x41,
+];
 
 struct BlockLog {
     log: BufReader<File>,
@@ -202,6 +213,42 @@ impl BlockLog {
     }
 }
 
+fn dump_block(block_num: u32, block: &SignedBlock) {
+    eprintln!(
+        "canonical source block {block_num}: {} transactions, header extensions {:?}, block extensions {:?}",
+        block.transactions.len(),
+        block.signed_block_header.header.header_extensions,
+        block.block_extensions
+    );
+    for (receipt_index, receipt) in block.transactions.iter().enumerate() {
+        eprintln!(
+            "  receipt {receipt_index}: id={} status={:?} cpu={} net_words={}",
+            receipt.transaction_id(),
+            receipt.status(),
+            receipt.cpu_usage_us(),
+            receipt.net_usage_words()
+        );
+        if let Some(packed) = receipt.packed_trx() {
+            let transaction = packed.get_transaction();
+            for (action_index, action) in transaction
+                .context_free_actions
+                .iter()
+                .chain(&transaction.actions)
+                .enumerate()
+            {
+                eprintln!(
+                    "    action {action_index}: {}::{} auth={:?} data_bytes={} data_hex={}",
+                    action.account(),
+                    action.name(),
+                    action.authorization(),
+                    action.data().len(),
+                    hex::encode(action.data())
+                );
+            }
+        }
+    }
+}
+
 fn usage(program: &str) {
     eprintln!(
         "Usage: {program} <source-blocks-dir> <arena-dir> [last-block]\n\
@@ -307,6 +354,27 @@ async fn main() -> Result<()> {
         );
     }
 
+    if env::var_os("XPR_REPLAY_INSPECT_ONLY").is_some() {
+        let block_num = debug_block
+            .context("XPR_REPLAY_INSPECT_ONLY requires XPR_REPLAY_DEBUG_BLOCK=<height>")?;
+        let block = controller
+            .parse_block(&source.packed_block(block_num)?)
+            .map_err(|error| anyhow::anyhow!("decode source block {block_num}: {error}"))?;
+        dump_block(block_num, &block);
+        let database = controller.database();
+        let read = database.read()?;
+        let eosio = Name::from_str("eosio")?;
+        let committee = Name::from_str("committee")?;
+        eprintln!(
+            "Arena state at block {}: ONLY_LINK_TO_EXISTING_PERMISSION={} eosio@committee={:?} activated_features={:?}",
+            controller.last_accepted_block().block_num(),
+            database.protocol_feature_activated(ONLY_LINK_TO_EXISTING_PERMISSION_FEATURE_DIGEST),
+            read.find_permission_info(eosio.as_u64(), committee.as_u64())?,
+            database.activated_protocol_features()?
+        );
+        return Ok(());
+    }
+
     if inspect_schedules {
         let mut previous = None;
         for block_num in 1..=last {
@@ -347,54 +415,49 @@ async fn main() -> Result<()> {
     );
     let started = Instant::now();
     let mut mempool = Mempool::new();
-    for block_num in start..=last {
-        let packed = source.packed_block(block_num)?;
-        let block = controller
-            .parse_block(&packed)
-            .map_err(|error| anyhow::anyhow!("decode source block {block_num}: {error}"))?;
-        if block.block_num() != block_num {
-            bail!(
-                "source index entry {block_num} decoded as block {}",
-                block.block_num()
-            );
-        }
-        if debug_block == Some(block_num) {
-            eprintln!(
-                "canonical source block {block_num}: {} transactions, header extensions {:?}, block extensions {:?}",
-                block.transactions.len(),
-                block.signed_block_header.header.header_extensions,
-                block.block_extensions
-            );
-            for (receipt_index, receipt) in block.transactions.iter().enumerate() {
-                eprintln!(
-                    "  receipt {receipt_index}: id={} status={:?} cpu={} net_words={}",
-                    receipt.transaction_id(),
-                    receipt.status(),
-                    receipt.cpu_usage_us(),
-                    receipt.net_usage_words()
-                );
-                if let Some(packed) = receipt.packed_trx() {
-                    let transaction = packed.get_transaction();
-                    for (action_index, action) in transaction
-                        .context_free_actions
-                        .iter()
-                        .chain(&transaction.actions)
-                        .enumerate()
-                    {
-                        eprintln!(
-                            "    action {action_index}: {}::{} auth={:?} data_bytes={}",
-                            action.account(),
-                            action.name(),
-                            action.authorization(),
-                            action.data().len()
+    let mut authenticator = controller.migration_block_authenticator()?;
+    let (signature_sender, signature_receiver) =
+        sync_channel::<Result<AuthenticatedMigrationBlock>>(SIGNATURE_PIPELINE_DEPTH);
+    let signature_worker = thread::Builder::new()
+        .name("xpr-signature-prefetch".to_string())
+        .spawn(move || {
+            let result = (|| -> Result<()> {
+                for block_num in start..=last {
+                    let packed = source.packed_block(block_num)?;
+                    let block = SignedBlock::read(&packed, &mut 0).map_err(|error| {
+                        anyhow::anyhow!("decode source block {block_num}: {error}")
+                    })?;
+                    if block.block_num() != block_num {
+                        bail!(
+                            "source index entry {block_num} decoded as block {}",
+                            block.block_num()
                         );
                     }
+                    let authenticated = authenticator.authenticate(block).with_context(|| {
+                        format!("authenticate canonical source block {block_num}")
+                    })?;
+                    if signature_sender.send(Ok(authenticated)).is_err() {
+                        return Ok(());
+                    }
                 }
+                Ok(())
+            })();
+            if let Err(error) = result {
+                let _ = signature_sender.send(Err(error));
             }
+        })?;
+
+    for block_num in start..=last {
+        let authenticated = signature_receiver
+            .recv()
+            .context("signature prefetch worker stopped before the replay completed")??;
+        let block = authenticated.block();
+        if debug_block == Some(block_num) {
+            dump_block(block_num, block);
         }
         let block_id = block.id()?;
         controller
-            .verify_block(&block, &mut mempool)
+            .verify_authenticated_migration_block(&authenticated, &mut mempool)
             .await
             .with_context(|| {
                 format!("XPR parity divergence verifying block {block_num} {block_id}")
@@ -422,6 +485,9 @@ async fn main() -> Result<()> {
             );
         }
     }
+    signature_worker
+        .join()
+        .map_err(|_| anyhow::anyhow!("signature prefetch worker panicked"))?;
 
     println!(
         "XPR replay passed through block {last} in {:.1}s",

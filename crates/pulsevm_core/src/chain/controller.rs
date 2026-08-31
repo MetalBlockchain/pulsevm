@@ -269,6 +269,33 @@ struct ProducerScheduleState {
     pending: Option<ProducerSchedule>,
 }
 
+/// Header-only XPR migration verifier that can run ahead of sequential state
+/// execution. It authenticates the exact signature digest and advances only
+/// header-derived schedule/signing state; the controller still repeats every
+/// cheap schedule, timestamp, syntax, execution, and merkle-root check.
+#[doc(hidden)]
+pub struct MigrationBlockAuthenticator {
+    antelope_block_signatures: bool,
+    schedule_state: ProducerScheduleState,
+    signing_state: HeaderSigningState,
+    previous_id: Id,
+}
+
+/// A block whose expensive public-key recovery was completed by a
+/// `MigrationBlockAuthenticator`. Fields stay private so callers cannot forge
+/// the proof or pair it with a different block.
+#[doc(hidden)]
+pub struct AuthenticatedMigrationBlock {
+    block: SignedBlock,
+    signer: PublicKey,
+}
+
+impl AuthenticatedMigrationBlock {
+    pub fn block(&self) -> &SignedBlock {
+        &self.block
+    }
+}
+
 impl ProducerScheduleState {
     fn apply_header(&mut self, header: &BlockHeader) -> Result<bool, ChainError> {
         let mut promoted = false;
@@ -337,6 +364,55 @@ impl HeaderSigningState {
             self.pending_schedule_hash = schedule_hash;
         }
         Ok(())
+    }
+}
+
+impl MigrationBlockAuthenticator {
+    pub fn authenticate(
+        &mut self,
+        block: SignedBlock,
+    ) -> Result<AuthenticatedMigrationBlock, ChainError> {
+        if *block.previous_id() != self.previous_id {
+            return Err(ChainError::BlockError(format!(
+                "migration signature stream expected parent {}, found {} for block {}",
+                self.previous_id,
+                block.previous_id(),
+                block.block_num()
+            )));
+        }
+
+        let header = &block.signed_block_header.header;
+        self.schedule_state.apply_header(header)?;
+        let expected = self
+            .schedule_state
+            .active
+            .block_signing_key(&header.producer)
+            .ok_or_else(|| {
+                ChainError::BlockError(format!(
+                    "block producer {} is not in the active schedule",
+                    header.producer
+                ))
+            })?;
+        let digest = if self.antelope_block_signatures {
+            self.signing_state.signing_digest(header)?
+        } else {
+            header.sig_digest()?
+        };
+        let signer = block
+            .signed_block_header
+            .signature
+            .recover_public_key(&digest)?;
+        if &signer != expected {
+            return Err(ChainError::BlockError(format!(
+                "block signature recovered {signer}, expected {expected} for producer {} in schedule version {}",
+                header.producer, self.schedule_state.active.version
+            )));
+        }
+
+        let block_id = block.id()?;
+        self.signing_state.accept(&block)?;
+        self.previous_id = block_id;
+        Ok(AuthenticatedMigrationBlock { block, signer })
     }
 }
 
@@ -1692,14 +1768,6 @@ impl Controller {
         signing_state: &HeaderSigningState,
     ) -> Result<(), ChainError> {
         let header = &block.signed_block_header.header;
-        let expected = schedule
-            .block_signing_key(&header.producer)
-            .ok_or_else(|| {
-                ChainError::BlockError(format!(
-                    "block producer {} is not in the active schedule",
-                    header.producer
-                ))
-            })?;
         let digest = if self
             .node_config
             .as_ref()
@@ -1713,7 +1781,24 @@ impl Controller {
             .signed_block_header
             .signature
             .recover_public_key(&digest)?;
-        if &signer != expected {
+        Self::verify_block_signer(block, schedule, &signer)
+    }
+
+    fn verify_block_signer(
+        block: &SignedBlock,
+        schedule: &ProducerSchedule,
+        signer: &PublicKey,
+    ) -> Result<(), ChainError> {
+        let header = &block.signed_block_header.header;
+        let expected = schedule
+            .block_signing_key(&header.producer)
+            .ok_or_else(|| {
+                ChainError::BlockError(format!(
+                    "block producer {} is not in the active schedule",
+                    header.producer
+                ))
+            })?;
+        if signer != expected {
             return Err(ChainError::BlockError(format!(
                 "block signature recovered {signer}, expected {expected} for producer {} in schedule version {}",
                 header.producer, schedule.version
@@ -1731,6 +1816,28 @@ impl Controller {
     pub async fn verify_block(
         &mut self,
         block: &SignedBlock,
+        mempool: &mut Mempool,
+    ) -> Result<(), ChainError> {
+        self.verify_block_impl(block, None, mempool).await
+    }
+
+    /// Consume a migration-only proof produced by the header authenticator.
+    /// The controller independently resolves and compares the active producer
+    /// key, skipping only the already-completed secp256k1 recovery.
+    #[doc(hidden)]
+    pub async fn verify_authenticated_migration_block(
+        &mut self,
+        authenticated: &AuthenticatedMigrationBlock,
+        mempool: &mut Mempool,
+    ) -> Result<(), ChainError> {
+        self.verify_block_impl(&authenticated.block, Some(&authenticated.signer), mempool)
+            .await
+    }
+
+    async fn verify_block_impl(
+        &mut self,
+        block: &SignedBlock,
+        recovered_signer: Option<&PublicKey>,
         mempool: &mut Mempool,
     ) -> Result<(), ChainError> {
         if self.verified_blocks.contains_key(&block.id()?) {
@@ -1776,7 +1883,11 @@ impl Controller {
             .signed_block_header
             .header
             .validate_timestamp(&parent_timestamp, &now_timestamp)?;
-        self.verify_block_signature(block, &block_schedule, &parent_signing_state)?;
+        if let Some(signer) = recovered_signer {
+            Self::verify_block_signer(block, &block_schedule, signer)?;
+        } else {
+            self.verify_block_signature(block, &block_schedule, &parent_signing_state)?;
+        }
         self.block_active_schedule = block_schedule;
 
         let parent_block_id = block.previous_id().clone();
@@ -3372,6 +3483,35 @@ impl Controller {
 
     pub fn database(&self) -> Database {
         self.db.clone()
+    }
+
+    /// Snapshot the accepted header-authentication state for the bulk XPR
+    /// importer. The returned verifier is deliberately unavailable to normal
+    /// nodes and cannot be created while speculative blocks are pending.
+    #[doc(hidden)]
+    pub fn migration_block_authenticator(&self) -> Result<MigrationBlockAuthenticator, ChainError> {
+        let config = self.node_config.as_ref().ok_or_else(|| {
+            ChainError::InternalError("controller is not initialized".to_string())
+        })?;
+        if config.state_history_enabled {
+            return Err(ChainError::InternalError(
+                "header authentication pipelining is restricted to migration replay".to_string(),
+            ));
+        }
+        if !self.pending_chain.is_empty() {
+            return Err(ChainError::InternalError(
+                "cannot snapshot migration authentication state with pending blocks".to_string(),
+            ));
+        }
+        Ok(MigrationBlockAuthenticator {
+            antelope_block_signatures: config.antelope_block_signatures,
+            schedule_state: ProducerScheduleState {
+                active: self.active_schedule.clone(),
+                pending: self.pending_schedule.clone(),
+            },
+            signing_state: self.header_signing_state.clone(),
+            previous_id: self.last_accepted_block_id,
+        })
     }
 
     pub fn chain_id(&self) -> &Id {
@@ -5938,6 +6078,49 @@ mod tests {
             controller.chain_state_log().unwrap().data_sync_count(),
             state_syncs_before + 1
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_authenticator_recovers_signature_ahead_of_execution()
+    -> Result<(), ChainError> {
+        let (mut producer, private_key, chain_id, _producer_temp) = init_test_controller()?;
+        let (mut verifier, _private_key, _chain_id, _verifier_temp) = init_test_controller()?;
+        assert!(verifier.migration_block_authenticator().is_err());
+        verifier
+            .node_config
+            .as_mut()
+            .expect("test controller is initialized")
+            .state_history_enabled = false;
+
+        let mut authenticator = verifier.migration_block_authenticator()?;
+        let mut tampered_authenticator = verifier.migration_block_authenticator()?;
+        let mut producer_mempool = Mempool::new();
+        producer_mempool.add_transaction(create_account(
+            &private_key,
+            Name::from_str("pipeline")?,
+            chain_id,
+        )?);
+        let block = producer.build_block(&mut producer_mempool).await?;
+        let mut tampered = tampered_authenticator.authenticate(block.clone())?;
+        tampered.signer = PrivateKey::random().get_public_key();
+        let mut verifier_mempool = Mempool::new();
+        let error = verifier
+            .verify_authenticated_migration_block(&tampered, &mut verifier_mempool)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("block signature recovered"));
+        assert_eq!(verifier.blocks_executed, 0);
+
+        let authenticated = authenticator.authenticate(block)?;
+        let block_id = authenticated.block().id()?;
+
+        verifier
+            .verify_authenticated_migration_block(&authenticated, &mut verifier_mempool)
+            .await?;
+        verifier.accept_block(&block_id, &mut verifier_mempool)?;
+        assert_eq!(verifier.last_accepted_block_id, block_id);
+        assert_eq!(verifier.blocks_executed, 1);
         Ok(())
     }
 
