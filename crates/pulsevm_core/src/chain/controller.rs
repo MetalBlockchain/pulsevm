@@ -1957,16 +1957,22 @@ impl Controller {
                 self.store_traces(block_id, &transaction_traces)?;
                 self.store_chain_state(block_id)?;
             }
-            self.block_log
+            let block_log = self.block_log.as_ref().expect("block log was preflighted");
+            let migration_replay = self
+                .node_config
                 .as_ref()
-                .expect("block log was preflighted")
-                .append(block_id.clone(), &packed_block)
-                .map_err(|e| {
-                    ChainError::InternalError(format!(
-                        "failed to append block {} to block log: {}",
-                        block_id, e
-                    ))
-                })?;
+                .is_some_and(|config| !config.state_history_enabled);
+            let append = if migration_replay {
+                block_log.append_deferred_sync(*block_id, &packed_block)
+            } else {
+                block_log.append(*block_id, &packed_block)
+            };
+            append.map_err(|e| {
+                ChainError::InternalError(format!(
+                    "failed to append block {} to block log: {}",
+                    block_id, e
+                ))
+            })?;
             Ok(())
         })();
         if let Err(error) = append_result {
@@ -2050,6 +2056,25 @@ impl Controller {
             );
         }
 
+        Ok(())
+    }
+
+    /// Make every accepted-history log durable before a bulk replay persists
+    /// its Arena checkpoint. Normal nodes sync their block log on every accept;
+    /// migration replay deliberately batches that barrier and must call this
+    /// first so a crash can leave only a log tail ahead of durable state.
+    pub fn sync_accepted_logs(&self) -> Result<(), ChainError> {
+        for (name, log) in [
+            ("block", self.block_log.as_ref()),
+            ("trace", self.trace_log.as_ref()),
+            ("chain state", self.chain_state_log.as_ref()),
+        ] {
+            log.ok_or_else(|| ChainError::InternalError(format!("{name} log not initialized")))?
+                .sync_data()
+                .map_err(|error| {
+                    ChainError::InternalError(format!("failed to sync {name} log: {error}"))
+                })?;
+        }
         Ok(())
     }
 
@@ -5875,6 +5900,9 @@ mod tests {
 
         let trace_range_before = controller.trace_log().unwrap().range();
         let state_range_before = controller.chain_state_log().unwrap().range();
+        let block_syncs_before = controller.block_log()?.data_sync_count();
+        let trace_syncs_before = controller.trace_log().unwrap().data_sync_count();
+        let state_syncs_before = controller.chain_state_log().unwrap().data_sync_count();
         let mut mempool = Mempool::new();
         mempool.add_transaction(create_account(
             &private_key,
@@ -5890,6 +5918,82 @@ mod tests {
         assert_eq!(
             controller.chain_state_log().unwrap().range(),
             state_range_before
+        );
+        assert_eq!(
+            controller.block_log()?.data_sync_count(),
+            block_syncs_before,
+            "migration accept must defer the block-log durability barrier"
+        );
+
+        controller.sync_accepted_logs()?;
+        assert_eq!(
+            controller.block_log()?.data_sync_count(),
+            block_syncs_before + 1
+        );
+        assert_eq!(
+            controller.trace_log().unwrap().data_sync_count(),
+            trace_syncs_before + 1
+        );
+        assert_eq!(
+            controller.chain_state_log().unwrap().data_sync_count(),
+            state_syncs_before + 1
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_replay_rewinds_log_tail_after_last_durable_checkpoint()
+    -> Result<(), ChainError> {
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
+        let private_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let genesis_bytes = generate_genesis(&private_key);
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": private_key.to_string(),
+            "state_history_enabled": false,
+        })
+        .to_string()
+        .into_bytes();
+        let temp = get_temp_dir();
+        let db_path = temp.path().to_str().unwrap();
+
+        let mut controller = Controller::new();
+        controller.initialize(&chain_id, &config_bytes, &genesis_bytes, db_path)?;
+        let mut mempool = Mempool::new();
+
+        let durable_account = Name::from_str("durable")?;
+        mempool.add_transaction(create_account(&private_key, durable_account, chain_id)?);
+        let durable_block = controller.build_block(&mut mempool).await?;
+        controller.accept_block(&durable_block.id()?, &mut mempool)?;
+        controller.sync_accepted_logs()?;
+        controller.database().close()?;
+        assert_eq!(controller.database().revision(), 2);
+
+        let orphan_account = Name::from_str("orphan")?;
+        mempool.add_transaction(create_account(&private_key, orphan_account, chain_id)?);
+        let orphan_block = controller.build_block(&mut mempool).await?;
+        controller.accept_block(&orphan_block.id()?, &mut mempool)?;
+        assert_eq!(controller.database().revision(), 3);
+        assert_eq!(controller.block_log()?.range().unwrap().1, 3);
+        drop(controller);
+
+        let mut reopened = Controller::new();
+        reopened.initialize(&chain_id, &config_bytes, &genesis_bytes, db_path)?;
+        assert_eq!(reopened.last_accepted_block().block_num(), 2);
+        assert_eq!(reopened.database().revision(), 2);
+        assert_eq!(reopened.block_log()?.range().unwrap().1, 2);
+        assert!(
+            reopened
+                .database()
+                .arena_account_exists(durable_account.as_u64())
+        );
+        assert!(
+            !reopened
+                .database()
+                .arena_account_exists(orphan_account.as_u64())
         );
         Ok(())
     }

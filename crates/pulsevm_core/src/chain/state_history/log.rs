@@ -24,6 +24,7 @@ use std::{
 #[cfg(test)]
 use std::sync::atomic::{
     AtomicBool,
+    AtomicUsize,
     Ordering,
 };
 
@@ -190,6 +191,7 @@ struct Inner {
     map: BTreeMap<u32, u64>,   // block_num -> file offset (header start)
     range: Option<(u32, u32)>, // (first, last); None == empty log
     log_len: u64,              // logical end-of-log; running counter, no metadata() syscalls
+    idx_len: u64,              // logical end-of-index; avoids metadata() on every checkpoint
 }
 
 /// An exact append-only restore point. The controller takes one for each of its
@@ -213,6 +215,8 @@ pub struct StateHistoryLog {
     fail_next_append: AtomicBool,
     #[cfg(test)]
     fail_next_append_after_log_sync: AtomicBool,
+    #[cfg(test)]
+    data_sync_count: AtomicUsize,
 }
 
 impl StateHistoryLog {
@@ -321,6 +325,7 @@ impl StateHistoryLog {
         }
 
         let log_len = log_file.metadata()?.len();
+        let idx_len = map.len() as u64 * IDX_RECORD_SIZE;
         let range = match (map.keys().next(), map.keys().last()) {
             (Some(&f), Some(&l)) => Some((f, l)),
             _ => None,
@@ -340,11 +345,14 @@ impl StateHistoryLog {
                 map,
                 range,
                 log_len,
+                idx_len,
             }),
             #[cfg(test)]
             fail_next_append: AtomicBool::new(false),
             #[cfg(test)]
             fail_next_append_after_log_sync: AtomicBool::new(false),
+            #[cfg(test)]
+            data_sync_count: AtomicUsize::new(0),
         })
     }
 
@@ -356,7 +364,7 @@ impl StateHistoryLog {
         let inner = self.inner.lock().unwrap();
         Ok(StateHistoryLogCheckpoint {
             log_len: inner.log_len,
-            idx_len: inner.idx.get_ref().metadata()?.len(),
+            idx_len: inner.idx_len,
             range: inner.range,
         })
     }
@@ -421,6 +429,7 @@ impl StateHistoryLog {
         }
 
         inner.log_len = checkpoint.log_len;
+        inner.idx_len = checkpoint.idx_len;
         match checkpoint.range {
             None => inner.map.clear(),
             Some((_, last)) if last < u32::MAX => {
@@ -476,7 +485,13 @@ impl StateHistoryLog {
             .store(true, Ordering::SeqCst);
     }
 
-    /// Append one entry with EOS SHiP header.
+    #[cfg(test)]
+    pub(crate) fn data_sync_count(&self) -> usize {
+        self.data_sync_count.load(Ordering::SeqCst)
+    }
+
+    /// Append one entry with EOS SHiP header and make its log payload durable
+    /// before publishing the index record.
     ///
     /// Durability note: the log is `sync_data()`'d before the index
     /// record referencing it is written, so on-disk the index never
@@ -485,6 +500,26 @@ impl StateHistoryLog {
     /// handles a log/index mismatch either way — but then `Ok(())`
     /// no longer implies the block survives a power loss.
     pub fn append(&self, block_id: Id, payload: &[u8]) -> Result<(), ShLogError> {
+        self.append_impl(block_id, payload, true)
+    }
+
+    /// Append one entry without an immediate durability barrier.
+    ///
+    /// The bytes and index record are still flushed from their `BufWriter`s, so
+    /// reads, rollback checkpoints, and tail recovery see the new entry. The
+    /// caller must invoke [`Self::sync_data`] before persisting any state whose
+    /// revision depends on the appended entries. This is used only by resumable
+    /// bulk replay, where syncing once per checkpoint avoids an `fdatasync` per
+    /// block while preserving log-before-state crash ordering.
+    pub(crate) fn append_deferred_sync(
+        &self,
+        block_id: Id,
+        payload: &[u8],
+    ) -> Result<(), ShLogError> {
+        self.append_impl(block_id, payload, false)
+    }
+
+    fn append_impl(&self, block_id: Id, payload: &[u8], sync_data: bool) -> Result<(), ShLogError> {
         #[cfg(test)]
         if self.fail_next_append.swap(false, Ordering::SeqCst) {
             return Err(ShLogError::Io(io::Error::other(
@@ -495,15 +530,15 @@ impl StateHistoryLog {
         let block_num = num_from_block_id(&block_id);
         let mut inner = self.inner.lock().unwrap();
 
-        if let Some((_, last)) = inner.range {
-            if block_num != last + 1 {
-                return Err(ShLogError::MissedBlock(format!(
-                    "{}.log: expected block {}, got {}",
-                    self.name,
-                    last + 1,
-                    block_num
-                )));
-            }
+        if let Some((_, last)) = inner.range
+            && block_num != last + 1
+        {
+            return Err(ShLogError::MissedBlock(format!(
+                "{}.log: expected block {}, got {}",
+                self.name,
+                last + 1,
+                block_num
+            )));
         }
 
         let pos = inner.log_len;
@@ -522,7 +557,11 @@ impl StateHistoryLog {
         header.write(&mut inner.log)?;
         inner.log.write_all(payload)?;
         inner.log.flush()?;
-        inner.log.get_ref().sync_data()?;
+        if sync_data {
+            inner.log.get_ref().sync_data()?;
+            #[cfg(test)]
+            self.data_sync_count.fetch_add(1, Ordering::SeqCst);
+        }
 
         #[cfg(test)]
         if self
@@ -534,18 +573,35 @@ impl StateHistoryLog {
             )));
         }
 
-        // Index record only after the log entry is durable.
+        // Publish the index only after the log bytes have reached the kernel.
+        // Durable mode additionally places the barrier above; deferred mode
+        // makes the complete prefix durable through `sync_data` at checkpoint.
         inner.idx.write_all(&block_num.to_le_bytes())?;
         inner.idx.write_all(&pos.to_le_bytes())?;
         inner.idx.flush()?;
 
         inner.log_len = pos + StateHistoryLogHeader::SIZE + payload.len() as u64;
+        inner.idx_len += IDX_RECORD_SIZE;
         inner.map.insert(block_num, pos);
         inner.range = Some(match inner.range {
             None => (block_num, block_num),
             Some((first, _)) => (first, block_num),
         });
 
+        Ok(())
+    }
+
+    /// Flush and make the complete log/index prefix durable. The log is synced
+    /// first so an index record can never become durable before the entry it
+    /// references; open-time recovery rebuilds an index that lags the log.
+    pub(crate) fn sync_data(&self) -> Result<(), ShLogError> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.log.flush()?;
+        inner.idx.flush()?;
+        inner.log.get_ref().sync_data()?;
+        #[cfg(test)]
+        self.data_sync_count.fetch_add(1, Ordering::SeqCst);
+        inner.idx.get_ref().sync_data()?;
         Ok(())
     }
 
@@ -745,6 +801,7 @@ impl StateHistoryLog {
         inner.map = new_map;
         inner.range = Some((first_kept, last_kept));
         inner.log_len = new_pos;
+        inner.idx_len = keep.len() as u64 * IDX_RECORD_SIZE;
 
         Ok(())
     }
@@ -822,6 +879,7 @@ impl StateHistoryLog {
         inner.map = new_map;
         inner.range = Some((block_num, block_num));
         inner.log_len = new_pos;
+        inner.idx_len = IDX_RECORD_SIZE;
 
         Ok(())
     }
@@ -845,6 +903,7 @@ impl StateHistoryLog {
         inner.map.clear();
         inner.range = None;
         inner.log_len = 0;
+        inner.idx_len = 0;
         Ok(())
     }
 
@@ -1258,6 +1317,32 @@ mod tests {
         let tail = raw.last().unwrap();
         assert_eq!(tail.0, last + 1);
         assert_eq!(tail.2, b"hello ship");
+    }
+
+    #[test]
+    fn deferred_append_batches_the_durability_barrier() {
+        let (dir, magic) = setup("deferred-sync");
+        let log = StateHistoryLog::open_with_magic(dir.path(), "block_log", magic).unwrap();
+        let last = log.range().unwrap().1;
+        let syncs_before = log.data_sync_count();
+
+        log.append_deferred_sync(make_id(last + 1, 0xA1), b"first")
+            .unwrap();
+        log.append_deferred_sync(make_id(last + 2, 0xA2), b"second")
+            .unwrap();
+
+        assert_eq!(log.data_sync_count(), syncs_before);
+        assert_eq!(log.read_block(last + 1).unwrap(), b"first");
+        assert_eq!(log.read_block(last + 2).unwrap(), b"second");
+
+        log.sync_data().unwrap();
+        assert_eq!(log.data_sync_count(), syncs_before + 1);
+        drop(log);
+
+        let reopened = StateHistoryLog::open_with_magic(dir.path(), "block_log", magic).unwrap();
+        assert_eq!(reopened.range().unwrap().1, last + 2);
+        assert_eq!(reopened.read_block(last + 1).unwrap(), b"first");
+        assert_eq!(reopened.read_block(last + 2).unwrap(), b"second");
     }
 
     #[test]

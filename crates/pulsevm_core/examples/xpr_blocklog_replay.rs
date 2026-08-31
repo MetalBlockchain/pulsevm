@@ -11,6 +11,7 @@ use std::{
         File,
     },
     io::{
+        BufReader,
         Read as IoRead,
         Seek,
         SeekFrom,
@@ -44,9 +45,10 @@ const XPR_V3_FIRST_BLOCK_OFFSET: u64 = 126;
 const PARTIAL_SCAN_WINDOW: usize = 4 * 1024 * 1024;
 
 struct BlockLog {
-    log: File,
+    log: BufReader<File>,
     offsets: Vec<u64>,
     packed_ends: Vec<u64>,
+    next_offset: Option<u64>,
 }
 
 impl BlockLog {
@@ -101,9 +103,10 @@ impl BlockLog {
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
-            log,
+            log: BufReader::with_capacity(PARTIAL_SCAN_WINDOW, log),
             offsets,
             packed_ends,
+            next_offset: None,
         })
     }
 
@@ -176,17 +179,25 @@ impl BlockLog {
             bail!("source block {block_num} has invalid byte range {start}..{end}");
         }
         let length = usize::try_from(end - start).context("packed block is too large")?;
-        let mut bytes = vec![0; length];
-        self.log.seek(SeekFrom::Start(start))?;
+        let record_length = length
+            .checked_add(8)
+            .context("packed block record is too large")?;
+        let mut bytes = vec![0; record_length];
+        if self.next_offset != Some(start) {
+            self.log.seek(SeekFrom::Start(start))?;
+        }
         self.log.read_exact(&mut bytes)?;
 
-        self.log.seek(SeekFrom::Start(end))?;
-        let mut trailer = [0; 8];
-        self.log.read_exact(&mut trailer)?;
+        let trailer: [u8; 8] = bytes[length..].try_into().unwrap();
         let recorded_start = u64::from_le_bytes(trailer);
         if recorded_start != start {
             bail!("source block {block_num} trailer points to {recorded_start}, expected {start}");
         }
+        bytes.truncate(length);
+        self.next_offset = Some(
+            end.checked_add(8)
+                .context("source block record offset overflow")?,
+        );
         Ok(bytes)
     }
 }
@@ -395,6 +406,11 @@ async fn main() -> Result<()> {
             })?;
 
         if block_num % checkpoint_interval == 0 || block_num == last {
+            // Bulk replay defers the per-block block-log durability barrier.
+            // Sync history first, then persist Arena state: after a crash the
+            // log can be ahead of the checkpoint (and safely rewound), never
+            // behind a state revision that depends on it.
+            controller.sync_accepted_logs()?;
             controller.database().close()?;
         }
         if block_num % 10_000 == 0 || block_num == last {
