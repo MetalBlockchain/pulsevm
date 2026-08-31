@@ -227,6 +227,18 @@ async fn main() -> Result<()> {
         })
         .transpose()?;
     let inspect_schedules = env::var_os("XPR_REPLAY_INSPECT_SCHEDULES").is_some();
+    let checkpoint_interval = env::var("XPR_REPLAY_CHECKPOINT_INTERVAL")
+        .ok()
+        .map(|value| {
+            value
+                .parse::<u32>()
+                .context("XPR_REPLAY_CHECKPOINT_INTERVAL must be a uint32")
+        })
+        .transpose()?
+        .unwrap_or(1_000_000);
+    if checkpoint_interval == 0 {
+        bail!("XPR_REPLAY_CHECKPOINT_INTERVAL must be greater than zero");
+    }
 
     let source_dir = PathBuf::from(source_dir);
     let arena_dir = PathBuf::from(arena_dir);
@@ -242,6 +254,9 @@ async fn main() -> Result<()> {
         "system_account": "eosio",
         "native_system_contract": false,
         "antelope_block_signatures": true,
+        // The importer needs canonical execution and final Arena state, not a
+        // second copy of source history-derived SHiP traces and table deltas.
+        "state_history_enabled": false,
         "producer_name": "eosio",
         // Replay validates source signatures against the on-chain schedule; this
         // local key is required by NodeConfig but is never used to alter them.
@@ -379,8 +394,10 @@ async fn main() -> Result<()> {
                 format!("XPR parity divergence accepting block {block_num} {block_id}")
             })?;
 
-        if block_num % 10_000 == 0 || block_num == last {
+        if block_num % checkpoint_interval == 0 || block_num == last {
             controller.database().close()?;
+        }
+        if block_num % 10_000 == 0 || block_num == last {
             let elapsed = started.elapsed().as_secs_f64();
             let count = u64::from(block_num - start + 1);
             println!(

@@ -432,6 +432,39 @@ impl StateHistoryLog {
         Ok(())
     }
 
+    /// Remove every record after `last_block`. Migration replay uses this to
+    /// rewind its durable block journal to the last Arena checkpoint after an
+    /// interrupted run. Normal node startup never calls it: there, a state/log
+    /// mismatch remains a hard consistency failure.
+    pub(crate) fn truncate_after(&self, last_block: u32) -> Result<(), ShLogError> {
+        let checkpoint = {
+            let inner = self.inner.lock().unwrap();
+            let Some((first, last)) = inner.range else {
+                return Ok(());
+            };
+            if last_block >= last {
+                return Ok(());
+            }
+            if last_block < first {
+                drop(inner);
+                return self.clear();
+            }
+            let first_removed = last_block
+                .checked_add(1)
+                .ok_or(ShLogError::NotFound(last_block))?;
+            let log_len = *inner
+                .map
+                .get(&first_removed)
+                .ok_or(ShLogError::NotFound(first_removed))?;
+            StateHistoryLogCheckpoint {
+                log_len,
+                idx_len: u64::from(last_block - first + 1) * IDX_RECORD_SIZE,
+                range: Some((first, last_block)),
+            }
+        };
+        self.rollback_to(&checkpoint)
+    }
+
     #[cfg(test)]
     pub(crate) fn fail_next_append(&self) {
         self.fail_next_append.store(true, Ordering::SeqCst);
@@ -1278,6 +1311,29 @@ mod tests {
             std::fs::metadata(dir.idx_path()).unwrap().len(),
             (original_range.1 - original_range.0 + 2) as u64 * IDX_RECORD_SIZE
         );
+    }
+
+    #[test]
+    fn truncate_after_rewinds_a_durable_tail_and_can_resume() {
+        let (dir, magic) = setup("truncate_after");
+        let log = StateHistoryLog::open_with_magic(dir.path(), "block_log", magic).unwrap();
+        let (first, last) = log.range().unwrap();
+        let durable = last - 2;
+
+        log.truncate_after(durable).unwrap();
+        assert_eq!(log.range(), Some((first, durable)));
+        assert!(matches!(
+            log.read_block(durable + 1),
+            Err(ShLogError::NotFound(block)) if block == durable + 1
+        ));
+        assert_eq!(parse_raw(&dir.log_path(), magic).last().unwrap().0, durable);
+        assert_eq!(
+            std::fs::metadata(dir.idx_path()).unwrap().len(),
+            u64::from(durable - first + 1) * IDX_RECORD_SIZE
+        );
+
+        log.append(make_id(durable + 1, 0xCC), b"resumed").unwrap();
+        assert_eq!(log.read_block(durable + 1).unwrap(), b"resumed");
     }
 
     #[test]

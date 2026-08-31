@@ -38,6 +38,8 @@ use crate::{
 /// canonical serialized `vector<checksum256>` and is part of the signed block
 /// header. Extension id 0 is reserved for this payload in Leap.
 pub const PROTOCOL_FEATURE_ACTIVATION_EXTENSION_ID: u16 = 0;
+/// Leap's WTMSIG producer-authority schedule-change extension.
+pub const PRODUCER_SCHEDULE_CHANGE_EXTENSION_ID: u16 = 1;
 
 /// Number of 500 ms slots a block may be ahead of a validator's local clock.
 /// Twenty slots (ten seconds) leaves room for normal clock and network jitter
@@ -79,8 +81,53 @@ impl BlockHeader {
     /// travels in the signed header, so it is committed with the block and can be
     /// reconstructed from the block log — the schedule is never trusted from an
     /// out-of-band source.
-    pub fn new_schedule(&self) -> &Option<ProducerSchedule> {
-        &self.new_producers
+    pub fn new_schedule(&self) -> Result<Option<ProducerSchedule>, ChainError> {
+        let mut authority_payload = None;
+        for (id, payload) in &self.header_extensions {
+            if *id == PRODUCER_SCHEDULE_CHANGE_EXTENSION_ID {
+                if authority_payload.replace(payload.as_slice()).is_some() {
+                    return Err(ChainError::BlockError(
+                        "duplicate producer schedule change extension".into(),
+                    ));
+                }
+            }
+        }
+        if self.new_producers.is_some() && authority_payload.is_some() {
+            return Err(ChainError::BlockError(
+                "block contains both legacy and authority producer schedules".into(),
+            ));
+        }
+        match authority_payload {
+            Some(payload) => ProducerSchedule::read_authority_schedule_bounded(payload)
+                .map(Some)
+                .map_err(|error| {
+                    ChainError::BlockError(format!(
+                        "invalid producer schedule change extension: {error}"
+                    ))
+                }),
+            None => Ok(self.new_producers.clone()),
+        }
+    }
+
+    /// Hash the schedule in its canonical wire representation. Format-1
+    /// authorities must hash the original extension payload, not the reduced
+    /// single-key view used by PulseVM's current signature verifier.
+    pub fn new_schedule_hash(&self) -> Result<Option<Digest>, ChainError> {
+        let schedule = self.new_schedule()?;
+        let Some(schedule) = schedule else {
+            return Ok(None);
+        };
+        if let Some((_, payload)) = self
+            .header_extensions
+            .iter()
+            .find(|(id, _)| *id == PRODUCER_SCHEDULE_CHANGE_EXTENSION_ID)
+        {
+            return Ok(Some(Digest::hash(payload)));
+        }
+        let packed = schedule
+            .pack()
+            .map_err(|error| ChainError::SerializationError(error.to_string()))?;
+        Ok(Some(Digest::hash(&packed)))
     }
 
     /// Decode the optional Leap protocol-feature activation extension. Unknown
@@ -90,6 +137,9 @@ impl BlockHeader {
     pub fn protocol_feature_activations(&self) -> Result<Vec<Digest>, ChainError> {
         let mut decoded = None;
         for (id, payload) in &self.header_extensions {
+            if *id == PRODUCER_SCHEDULE_CHANGE_EXTENSION_ID {
+                continue;
+            }
             if *id != PROTOCOL_FEATURE_ACTIVATION_EXTENSION_ID {
                 return Err(ChainError::BlockError(format!(
                     "unsupported block header extension {}",
@@ -207,7 +257,7 @@ impl BlockHeader {
         // `new_producers` payload is only a pending schedule and therefore has
         // the next version; its relationship to the active and prior pending
         // schedules is validated by the controller's header state.
-        if let Some(schedule) = self.new_schedule() {
+        if let Some(schedule) = self.new_schedule()? {
             pulse_assert(
                 !schedule.producers.is_empty(),
                 ChainError::BlockError("new producer schedule is empty".into()),
@@ -385,7 +435,7 @@ mod tests {
     #[test]
     fn new_schedule_round_trips_none_some_and_garbage() {
         // No schedule change -> None.
-        assert!(BlockHeader::default().new_schedule().is_none());
+        assert!(BlockHeader::default().new_schedule().unwrap().is_none());
 
         // A stamped header decodes back to the same schedule.
         let schedule = ProducerSchedule {
@@ -398,7 +448,7 @@ mod tests {
         let mut header = BlockHeader::default();
         header.new_producers = Some(schedule.clone());
         header.schedule_version = 1;
-        assert_eq!(header.new_schedule().as_ref(), Some(&schedule));
+        assert_eq!(header.new_schedule().unwrap().as_ref(), Some(&schedule));
     }
 
     #[test]

@@ -2664,8 +2664,9 @@ impl ChainDatabase {
         let pendings: Vec<(ObjectId<ResourceLimitsRow>, u64, i64, i64, i64)> = {
             let table = db.table::<ResourceLimitsRow>()?;
             table
-                .iter()
-                .filter(|r| r.pending == 1)
+                .get_index::<LimitsByOwner>()
+                .range((1u8, 0)..=(1u8, u64::MAX))
+                .map(|(_, r)| r)
                 .map(|r| (r.id(), r.owner, r.ram_bytes, r.net_weight, r.cpu_weight))
                 .collect()
         };
@@ -3756,9 +3757,10 @@ impl ChainDatabase {
         let mut db = self.lock();
         let expired: Vec<ObjectId<TransactionRow>> = db
             .table::<TransactionRow>()?
+            .get_index::<TxByExpiration>()
             .iter()
-            .filter(|t| (t.expiration as i64) * 1_000_000 < cutoff_micros)
-            .map(|t| t.id())
+            .take_while(|(key, _)| (key.0 as i64) * 1_000_000 < cutoff_micros)
+            .map(|(_, transaction)| transaction.id())
             .collect();
         for id in expired {
             db.remove::<TransactionRow>(id)?;

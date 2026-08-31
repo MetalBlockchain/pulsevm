@@ -289,7 +289,7 @@ impl ProducerScheduleState {
             promoted = true;
         }
 
-        if let Some(schedule) = header.new_schedule() {
+        if let Some(schedule) = header.new_schedule()? {
             if self.pending.is_some() {
                 return Err(ChainError::BlockError(
                     "block sets new pending producers before the prior schedule became active"
@@ -302,7 +302,7 @@ impl ProducerScheduleState {
                     schedule.version, self.active.version
                 )));
             }
-            self.pending = Some(schedule.clone());
+            self.pending = Some(schedule);
         }
         Ok(promoted)
     }
@@ -325,23 +325,16 @@ impl HeaderSigningState {
             ChainError::SerializationError(format!("pack block header for signature: {error}"))
         })?);
         let header_root = hash_digest_pair(header_digest, self.blockroot_merkle.root());
-        let pending_schedule_hash = match header.new_schedule() {
-            Some(schedule) => Digest::hash(&schedule.pack().map_err(|error| {
-                ChainError::SerializationError(format!(
-                    "pack new pending producer schedule: {error}"
-                ))
-            })?),
-            None => self.pending_schedule_hash,
-        };
+        let pending_schedule_hash = header
+            .new_schedule_hash()?
+            .unwrap_or(self.pending_schedule_hash);
         Ok(hash_digest_pair(header_root, pending_schedule_hash))
     }
 
     fn accept(&mut self, block: &SignedBlock) -> Result<(), ChainError> {
         self.blockroot_merkle.append(Digest(block.id()?.0.0))?;
-        if let Some(schedule) = &block.signed_block_header.header.new_producers {
-            self.pending_schedule_hash = Digest::hash(&schedule.pack().map_err(|error| {
-                ChainError::SerializationError(format!("pack pending producer schedule: {error}"))
-            })?);
+        if let Some(schedule_hash) = block.signed_block_header.header.new_schedule_hash()? {
+            self.pending_schedule_hash = schedule_hash;
         }
         Ok(())
     }
@@ -1009,21 +1002,43 @@ impl Controller {
                         ))
                     })?;
             }
-            Some((start, end)) => {
+            Some((start, mut end)) => {
                 // The block log is the accepted-head journal while chainbase is
                 // the corresponding state. Either side being ahead means a
                 // prior publication was interrupted; choosing either tip would
                 // silently pair a block with the wrong state.
                 if revision != end as i64 {
-                    error!(
-                        "database revision {} does not match block log end {}",
-                        revision, end
-                    );
+                    let migration_replay = self
+                        .node_config
+                        .as_ref()
+                        .is_some_and(|config| !config.state_history_enabled);
+                    if migration_replay && revision >= i64::from(start) && revision < i64::from(end)
+                    {
+                        warn!(
+                            "migration replay is rewinding block log from {} to durable Arena revision {}",
+                            end, revision
+                        );
+                        self.block_log
+                            .as_ref()
+                            .unwrap()
+                            .truncate_after(revision as u32)
+                            .map_err(|error| {
+                                ChainError::DatabaseError(format!(
+                                    "failed to rewind migration block log to revision {revision}: {error}"
+                                ))
+                            })?;
+                        end = revision as u32;
+                    } else {
+                        error!(
+                            "database revision {} does not match block log end {}",
+                            revision, end
+                        );
 
-                    return Err(ChainError::DatabaseError(format!(
-                        "database revision {} does not match block log end {}",
-                        revision, end
-                    )));
+                        return Err(ChainError::DatabaseError(format!(
+                            "database revision {} does not match block log end {}",
+                            revision, end
+                        )));
+                    }
                 }
 
                 info!("block log contains blocks from {} to {}", start, end);
@@ -1847,9 +1862,11 @@ impl Controller {
             ChainError::TransactionError(format!("failed to pack block {}: {}", block_id, e))
         })?;
 
-        // The three files form one logical accept record. Capture all restore
-        // points before changing candidate state, so a failed append (including a
-        // partial write inside the failing log) can remove the whole record.
+        // The three files form one logical accept record when state-history is
+        // enabled. Capture all restore points before changing candidate state,
+        // so a failed append (including a partial write inside the failing log)
+        // can remove the whole record. Migration replay still checkpoints the
+        // idle SHiP logs, which keeps rollback handling identical and cheap.
         let block_checkpoint = self
             .block_log
             .as_ref()
@@ -1927,11 +1944,19 @@ impl Controller {
         };
 
         // Publish SHiP payloads before the block-log record, which is the
-        // durable accepted-state marker on restart. Roll all logs and the arena
-        // session back if any reversible append fails.
+        // durable accepted-state marker on restart. A one-shot migration replay
+        // can omit these derived payloads while preserving block validation,
+        // execution, Arena commits, and the canonical block log. Roll all logs
+        // and the arena session back if any reversible append fails.
         let append_result = (|| -> Result<(), ChainError> {
-            self.store_traces(block_id, &transaction_traces)?;
-            self.store_chain_state(block_id)?;
+            let state_history_enabled = self
+                .node_config
+                .as_ref()
+                .is_none_or(|config| config.state_history_enabled);
+            if state_history_enabled {
+                self.store_traces(block_id, &transaction_traces)?;
+                self.store_chain_state(block_id)?;
+            }
             self.block_log
                 .as_ref()
                 .expect("block log was preflighted")
@@ -1998,14 +2023,16 @@ impl Controller {
             }
         }
 
-        // `commit` above already collapsed the arena's undo stack to this block;
-        // just surface the committed state root for debugging.
-        if let Some(root) = self.db.arena_state_root() {
-            debug!(
-                "arena state root at block {}: {}",
-                block.block_num(),
-                hex::encode(root)
-            );
+        // Hashing the complete Arena is proportional to all live chain state.
+        // Never pay that cost unless debug output will actually consume it.
+        if spdlog::default_logger().should_log(spdlog::Level::Debug) {
+            if let Some(root) = self.db.arena_state_root() {
+                debug!(
+                    "arena state root at block {}: {}",
+                    block.block_num(),
+                    hex::encode(root)
+                );
+            }
         }
 
         if self.get_state() == &vm::State::NormalOp {
@@ -2206,7 +2233,7 @@ impl Controller {
                 .activate_protocol_features(&digests, block.block_num())?;
         }
 
-        if let Some(header_schedule) = block.signed_block_header.header.new_schedule() {
+        if let Some(header_schedule) = block.signed_block_header.header.new_schedule()? {
             let (proposal_block, packed) = self.db.proposed_schedule().ok_or_else(|| {
                 ChainError::BlockError(
                     "block carries new_producers without an on-chain proposed schedule".into(),
@@ -2222,7 +2249,7 @@ impl Controller {
             let proposed = ProducerSchedule::read_bounded(&packed).map_err(|error| {
                 ChainError::BlockError(format!("invalid stored proposed schedule: {error}"))
             })?;
-            if &proposed != header_schedule {
+            if proposed != header_schedule {
                 return Err(ChainError::BlockError(
                     "block new_producers does not match the on-chain proposed schedule".into(),
                 ));
@@ -5837,6 +5864,36 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_accept_can_omit_derived_state_history_for_migration() -> Result<(), ChainError> {
+        let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
+        controller
+            .node_config
+            .as_mut()
+            .expect("test controller is initialized")
+            .state_history_enabled = false;
+
+        let trace_range_before = controller.trace_log().unwrap().range();
+        let state_range_before = controller.chain_state_log().unwrap().range();
+        let mut mempool = Mempool::new();
+        mempool.add_transaction(create_account(
+            &private_key,
+            Name::from_str("migration")?,
+            chain_id,
+        )?);
+        let block = controller.build_block(&mut mempool).await?;
+        controller.accept_block(&block.id()?, &mut mempool)?;
+
+        assert_eq!(controller.last_accepted_block().block_num(), 2);
+        assert_eq!(controller.block_log()?.range().unwrap().1, 2);
+        assert_eq!(controller.trace_log().unwrap().range(), trace_range_before);
+        assert_eq!(
+            controller.chain_state_log().unwrap().range(),
+            state_range_before
+        );
+        Ok(())
+    }
+
     // Verifying a block on a competing fork reuses the common prefix, unwinds only
     // the divergent suffix, and executes only the new block. After accepting the
     // winning fork, the losing branch's state is absent.
@@ -7606,7 +7663,7 @@ mod tests {
             deployment
                 .signed_block_header
                 .header
-                .new_schedule()
+                .new_schedule()?
                 .is_none()
         );
         controller.accept_block(&deployment.id()?, &mut mempool)?;
@@ -7621,7 +7678,13 @@ mod tests {
             chain_id,
         )?);
         let election = controller.build_block(&mut mempool).await?;
-        assert!(election.signed_block_header.header.new_schedule().is_none());
+        assert!(
+            election
+                .signed_block_header
+                .header
+                .new_schedule()?
+                .is_none()
+        );
         controller.accept_block(&election.id()?, &mut mempool)?;
         controller.set_preferred_id(election.id()?);
 
@@ -7631,13 +7694,12 @@ mod tests {
             chain_id,
         )?);
         let pending = controller.build_block(&mut mempool).await?;
-        let header_schedule = election.signed_block_header.header.new_schedule();
+        let header_schedule = election.signed_block_header.header.new_schedule()?;
         assert!(header_schedule.is_none());
         let header_schedule = pending
             .signed_block_header
             .header
-            .new_schedule()
-            .as_ref()
+            .new_schedule()?
             .expect("onblock proposal must be committed to the header");
         assert_eq!(header_schedule.version, 1);
         assert_eq!(header_schedule.producers, proposed);

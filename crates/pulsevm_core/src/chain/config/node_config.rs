@@ -22,6 +22,13 @@ pub struct NodeConfig {
     /// it disabled because they start a new block-signing domain.
     #[serde(default)]
     pub antelope_block_signatures: bool,
+    /// Emit per-block trace and chain-state SHiP logs. Nodes enable this by
+    /// default; one-shot migration replays may disable it because the canonical
+    /// source history already exists and only the final Arena state is needed.
+    /// Keep this setting fixed for a data directory: enabling it after skipped
+    /// blocks requires rebasing the state-history logs at the current revision.
+    #[serde(default = "default_state_history_enabled")]
+    pub state_history_enabled: bool,
     // Name of the block producer, must be a valid EOSIO name (up to 12 characters, a-z, 1-5)
     pub producer_name: Name,
     // Private key of the block producer, used for signing blocks and transactions
@@ -63,6 +70,10 @@ fn default_native_system_contract() -> bool {
     true
 }
 
+fn default_state_history_enabled() -> bool {
+    true
+}
+
 fn default_max_transaction_time_ms() -> u32 {
     30_000
 }
@@ -79,5 +90,6 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.system_account, Name::from_str("pulse").unwrap());
         assert!(cfg.native_system_contract);
+        assert!(cfg.state_history_enabled);
     }
 }
