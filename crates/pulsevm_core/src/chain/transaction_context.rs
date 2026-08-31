@@ -777,19 +777,29 @@ impl TransactionContext {
         let block_num = self.block_num();
 
         if let Some((proposal_block, packed)) = self.db.proposed_schedule() {
-            // Leap permits replacements only within the block that created the
-            // proposal. Once that block is complete, later calls must wait for
-            // the proposal to become pending instead of overwriting it.
-            if proposal_block != block_num {
-                return Ok(-1);
-            }
             let existing = ProducerSchedule::read_bounded(&packed).map_err(|error| {
                 ChainError::SerializationError(format!(
                     "decode existing proposed producer schedule: {error}"
                 ))
             })?;
-            if existing.producers == producers {
-                return Ok(-1);
+            if existing.version <= inner.proposal_base_schedule_version {
+                // Older PulseVM builds could re-propose the schedule that had
+                // just become pending, leaving a stale row in a durable replay
+                // checkpoint. Such a row is impossible in Leap: a proposal must
+                // always follow the pending schedule, or the active one when no
+                // pending schedule exists. Repair that invalid legacy state at
+                // the first subsequent proposal.
+                self.db.clear_proposed_schedule()?;
+            } else {
+                // Leap permits replacements only within the block that created the
+                // proposal. Once that block is complete, later calls must wait for
+                // the proposal to become pending instead of overwriting it.
+                if proposal_block != block_num {
+                    return Ok(-1);
+                }
+                if existing.producers == producers {
+                    return Ok(-1);
+                }
             }
         }
 
