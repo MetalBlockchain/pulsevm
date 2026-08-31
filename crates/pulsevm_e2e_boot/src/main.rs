@@ -553,7 +553,11 @@ async fn main() -> Result<()> {
                     actor: system.into(),
                     permission: ACTIVE_NAME.into(),
                 }],
-                data: Arc::from(Vec::<u8>::new()),
+                // The forwarder ignores non-setprods actions, but their bytes
+                // must differ: transactions created in the same expiration
+                // second otherwise have the same id and admission rejects the
+                // second one as a duplicate.
+                data: Arc::from(step.as_bytes().to_vec()),
             }],
         )
         .await
