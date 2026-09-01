@@ -22,12 +22,16 @@ use wasmer::{
     Extern,
     Function,
     FunctionEnv,
+    Global,
     Imports,
     Instance,
     Memory,
     Module,
     RuntimeError,
     Store,
+    Table,
+    TypedFunction,
+    Value,
     imports,
     sys::{
         CompilerConfig,
@@ -42,11 +46,7 @@ use wasmer_compiler_llvm::{
 };
 use wasmer_middlewares::{
     Metering,
-    metering::{
-        MeteringPoints,
-        get_remaining_points,
-        set_remaining_points,
-    },
+    metering::MeteringPoints,
 };
 
 use crate::chain::{
@@ -284,6 +284,159 @@ fn write_var_u32(mut value: u32, bytes: &mut Vec<u8>) {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+struct ResetStateExports {
+    globals: Vec<String>,
+    tables: Vec<String>,
+}
+
+fn private_export_name(existing: &mut BTreeSet<Vec<u8>>, prefix: &[u8], index: u32) -> Vec<u8> {
+    let mut name = format!("{}{}", String::from_utf8_lossy(prefix), index).into_bytes();
+    while existing.contains(&name) {
+        name.push(b'_');
+    }
+    existing.insert(name.clone());
+    name
+}
+
+/// Exposes local globals and tables in the private compilation copy so a warm
+/// instance can restore every mutable piece of VM state before it is reused.
+///
+/// Imported state is deliberately not handled here. The reuse audit rejects
+/// modules that import memories, globals, or tables, leaving them on the fresh
+/// instance path. Exporting an entity under an additional private name does not
+/// alter the instruction stream or the on-chain code hash.
+fn expose_reset_state(code: &[u8]) -> Result<(Cow<'_, [u8]>, ResetStateExports), ChainError> {
+    const WASM_HEADER: &[u8; 8] = b"\0asm\x01\0\0\0";
+    if code.get(..WASM_HEADER.len()) != Some(WASM_HEADER) {
+        return Err(ChainError::WasmRuntimeError(
+            "invalid wasm header".to_string(),
+        ));
+    }
+
+    let mut offset = WASM_HEADER.len();
+    let mut defined_tables = 0_u32;
+    let mut defined_globals = 0_u32;
+    let mut export_section = None;
+    let mut export_names = BTreeSet::new();
+    let mut export_insertion = code.len();
+
+    while offset < code.len() {
+        let section_start = offset;
+        let section_id = code[offset];
+        offset += 1;
+        let section_size = read_var_u32(code, &mut offset)? as usize;
+        let payload_start = offset;
+        let payload_end = payload_start.checked_add(section_size).ok_or_else(|| {
+            ChainError::WasmRuntimeError("wasm section size overflow".to_string())
+        })?;
+        if payload_end > code.len() {
+            return Err(ChainError::WasmRuntimeError(
+                "truncated wasm section".to_string(),
+            ));
+        }
+
+        if section_id != 0 && section_id > 7 && export_insertion == code.len() {
+            export_insertion = section_start;
+        }
+        match section_id {
+            4 => {
+                let mut cursor = payload_start;
+                defined_tables = read_var_u32(code, &mut cursor)?;
+            }
+            6 => {
+                let mut cursor = payload_start;
+                defined_globals = read_var_u32(code, &mut cursor)?;
+            }
+            7 => {
+                export_section = Some((section_start, payload_start, payload_end));
+                let mut cursor = payload_start;
+                let count = read_var_u32(code, &mut cursor)?;
+                for _ in 0..count {
+                    let name_len = read_var_u32(code, &mut cursor)? as usize;
+                    let name_end = cursor.checked_add(name_len).ok_or_else(|| {
+                        ChainError::WasmRuntimeError("wasm export name overflow".to_string())
+                    })?;
+                    let name = code.get(cursor..name_end).ok_or_else(|| {
+                        ChainError::WasmRuntimeError("truncated wasm export".to_string())
+                    })?;
+                    export_names.insert(name.to_vec());
+                    cursor = name_end;
+                    cursor = cursor.checked_add(1).ok_or_else(|| {
+                        ChainError::WasmRuntimeError("wasm export overflow".to_string())
+                    })?;
+                    let _index = read_var_u32(code, &mut cursor)?;
+                }
+            }
+            _ => {}
+        }
+        offset = payload_end;
+    }
+
+    if defined_tables == 0 && defined_globals == 0 {
+        return Ok((Cow::Borrowed(code), ResetStateExports::default()));
+    }
+
+    let mut reset_exports = ResetStateExports::default();
+    let mut entries = Vec::new();
+    for index in 0..defined_tables {
+        let name = private_export_name(&mut export_names, b"__pulsevm_reset_table_", index);
+        write_var_u32(name.len() as u32, &mut entries);
+        entries.extend_from_slice(&name);
+        entries.push(1); // external_kind::table
+        write_var_u32(index, &mut entries);
+        reset_exports
+            .tables
+            .push(String::from_utf8(name).expect("private export name is ASCII"));
+    }
+    for index in 0..defined_globals {
+        let name = private_export_name(&mut export_names, b"__pulsevm_reset_global_", index);
+        write_var_u32(name.len() as u32, &mut entries);
+        entries.extend_from_slice(&name);
+        entries.push(3); // external_kind::global
+        write_var_u32(index, &mut entries);
+        reset_exports
+            .globals
+            .push(String::from_utf8(name).expect("private export name is ASCII"));
+    }
+
+    let mut output = Vec::with_capacity(code.len() + entries.len() + 8);
+    if let Some((section_start, payload_start, payload_end)) = export_section {
+        let mut entries_start = payload_start;
+        let export_count = read_var_u32(code, &mut entries_start)?;
+        let added = defined_tables.checked_add(defined_globals).ok_or_else(|| {
+            ChainError::WasmRuntimeError("too many private wasm exports".to_string())
+        })?;
+        let mut payload = Vec::with_capacity(payload_end - payload_start + entries.len());
+        write_var_u32(
+            export_count
+                .checked_add(added)
+                .ok_or_else(|| ChainError::WasmRuntimeError("too many wasm exports".to_string()))?,
+            &mut payload,
+        );
+        payload.extend_from_slice(&code[entries_start..payload_end]);
+        payload.extend_from_slice(&entries);
+
+        output.extend_from_slice(&code[..section_start]);
+        output.push(7);
+        write_var_u32(payload.len() as u32, &mut output);
+        output.extend_from_slice(&payload);
+        output.extend_from_slice(&code[payload_end..]);
+    } else {
+        let mut payload = Vec::with_capacity(entries.len() + 5);
+        write_var_u32(defined_tables + defined_globals, &mut payload);
+        payload.extend_from_slice(&entries);
+
+        output.extend_from_slice(&code[..export_insertion]);
+        output.push(7);
+        write_var_u32(payload.len() as u32, &mut output);
+        output.extend_from_slice(&payload);
+        output.extend_from_slice(&code[export_insertion..]);
+    }
+
+    Ok((Cow::Owned(output), reset_exports))
+}
+
 /// Makes an internal EOSIO linear memory visible to Wasmer host functions.
 ///
 /// Legacy EOSIO contracts intentionally export only `apply`; nodeos runtimes
@@ -440,9 +593,9 @@ pub struct WasmContext {
     context: ApplyContext,
     db: Database,
     memory: Option<Memory>,
-    // The running instance, captured after instantiation so a host intrinsic can
-    // bill its own work against the same metering budget the wasm body spends.
-    instance: Option<Instance>,
+    // Direct handles to the middleware globals avoid an export-name lookup for
+    // every host intrinsic. They are installed only after instantiation.
+    metering: Option<MeteringGlobals>,
     return_value: Option<Bytes>,
 }
 
@@ -461,7 +614,7 @@ impl WasmContext {
             context,
             db,
             memory: None,
-            instance: None,
+            metering: None,
             return_value: None,
         }
     }
@@ -476,16 +629,16 @@ impl WasmContext {
     /// amount changes billed CPU, which is committed to the block, so it is a
     /// consensus rule — every node must run the identical table.
     pub fn charge(&self, store: &mut impl AsStoreMut, amount: u64) -> Result<(), RuntimeError> {
-        // The instance is captured only after `Instance::new`, so an intrinsic
+        // The globals are captured only after `Instance::new`, so an intrinsic
         // reached from a module's start/initializer during instantiation has no
         // budget handle yet. That phase isn't billed anyway -- `run` reseeds the
         // metering points after instantiation and measures only the `apply`
         // call -- so skip the charge rather than fail instantiation. During
         // `apply`, where billing happens, the instance is always set.
-        let Some(instance) = self.instance.as_ref() else {
+        let Some(metering) = self.metering.as_ref() else {
             return Ok(());
         };
-        charge_metering_points(store, instance, amount)
+        charge_metering_globals(store, metering, amount)
     }
 
     pub fn receiver(&self) -> u64 {
@@ -541,18 +694,82 @@ impl WasmContext {
 /// Deduct `amount` metering points from a running instance, or trap if the
 /// budget can't cover it. Shared by [`WasmContext::charge`] and its test; kept
 /// free of `WasmContext` so it can be exercised against a bare metered instance.
+#[cfg(test)]
 fn charge_metering_points(
     store: &mut impl AsStoreMut,
     instance: &Instance,
     amount: u64,
 ) -> Result<(), RuntimeError> {
-    match get_remaining_points(store, instance) {
+    let metering = MeteringGlobals::from_instance(instance)?;
+    charge_metering_globals(store, &metering, amount)
+}
+
+const METERING_REMAINING_EXPORT: &str = "wasmer_metering_remaining_points";
+const METERING_EXHAUSTED_EXPORT: &str = "wasmer_metering_points_exhausted";
+
+#[derive(Clone)]
+struct MeteringGlobals {
+    remaining: Global,
+    exhausted: Global,
+}
+
+impl MeteringGlobals {
+    fn from_instance(instance: &Instance) -> Result<Self, RuntimeError> {
+        let remaining = instance
+            .exports
+            .get_global(METERING_REMAINING_EXPORT)
+            .map_err(|error| RuntimeError::new(error.to_string()))?
+            .clone();
+        let exhausted = instance
+            .exports
+            .get_global(METERING_EXHAUSTED_EXPORT)
+            .map_err(|error| RuntimeError::new(error.to_string()))?
+            .clone();
+        Ok(Self {
+            remaining,
+            exhausted,
+        })
+    }
+
+    fn set(&self, store: &mut impl AsStoreMut, points: u64) -> Result<(), RuntimeError> {
+        self.remaining.set(store, Value::I64(points as i64))?;
+        self.exhausted.set(store, Value::I32(0))?;
+        Ok(())
+    }
+
+    fn get(&self, store: &mut impl AsStoreMut) -> Result<MeteringPoints, RuntimeError> {
+        let exhausted = match self.exhausted.get(store) {
+            Value::I32(value) => value,
+            _ => {
+                return Err(RuntimeError::new(
+                    "metering exhausted global has the wrong type",
+                ));
+            }
+        };
+        if exhausted > 0 {
+            return Ok(MeteringPoints::Exhausted);
+        }
+        match self.remaining.get(store) {
+            Value::I64(value) => Ok(MeteringPoints::Remaining(value as u64)),
+            _ => Err(RuntimeError::new(
+                "metering remaining global has the wrong type",
+            )),
+        }
+    }
+}
+
+fn charge_metering_globals(
+    store: &mut impl AsStoreMut,
+    metering: &MeteringGlobals,
+    amount: u64,
+) -> Result<(), RuntimeError> {
+    match metering.get(store)? {
         MeteringPoints::Remaining(remaining) if remaining >= amount => {
-            set_remaining_points(store, instance, remaining - amount);
+            metering.set(store, remaining - amount)?;
             Ok(())
         }
         _ => {
-            set_remaining_points(store, instance, 0);
+            metering.set(store, 0)?;
             Err(RuntimeError::new(
                 "cpu usage limit exceeded while charging a host intrinsic",
             ))
@@ -560,20 +777,184 @@ fn charge_metering_points(
     }
 }
 
+// Reset work runs outside deterministic WASM metering, just like fresh instance
+// construction. Bound it so a contract with a very large memory cannot turn the
+// optimization into unmetered copying; larger instances use the fresh path.
+const MAX_RESETTABLE_MEMORY_BYTES: u64 = 8 * 1024 * 1024;
+static ZERO_PAGE: [u8; 64 * 1024] = [0; 64 * 1024];
+
+struct ResettableInstance {
+    instance: Instance,
+    apply: TypedFunction<(i64, i64, i64), ()>,
+    memory: Memory,
+    initial_memory: Vec<u8>,
+    mutable_globals: Vec<(Global, Value)>,
+    tables: Vec<(Table, Vec<Value>)>,
+    metering: MeteringGlobals,
+}
+
+impl ResettableInstance {
+    fn capture(
+        store: &mut Store,
+        instance: Instance,
+        exports: &ResetStateExports,
+    ) -> Result<Self, ChainError> {
+        let memory = exported_memory(&instance).ok_or_else(|| {
+            ChainError::WasmRuntimeError(
+                "audited instance does not export its linear memory".to_string(),
+            )
+        })?;
+        let memory_size = memory.view(store).data_size();
+        if memory_size > MAX_RESETTABLE_MEMORY_BYTES {
+            return Err(ChainError::WasmRuntimeError(format!(
+                "audited instance memory is {memory_size} bytes, above the reset limit"
+            )));
+        }
+        let mut initial_memory = vec![0; memory_size as usize];
+        memory
+            .view(store)
+            .read(0, &mut initial_memory)
+            .map_err(|error| ChainError::WasmRuntimeError(error.to_string()))?;
+
+        let mut mutable_globals = Vec::new();
+        for name in &exports.globals {
+            let global = instance
+                .exports
+                .get_global(name)
+                .map_err(|error| ChainError::WasmRuntimeError(error.to_string()))?
+                .clone();
+            if global.ty(store).mutability.is_mutable() {
+                let initial = global.get(store);
+                mutable_globals.push((global, initial));
+            }
+        }
+
+        let mut tables = Vec::new();
+        for name in &exports.tables {
+            let table = instance
+                .exports
+                .get_table(name)
+                .map_err(|error| ChainError::WasmRuntimeError(error.to_string()))?
+                .clone();
+            let initial = (0..table.size(store))
+                .map(|index| {
+                    table.get(store, index).ok_or_else(|| {
+                        ChainError::WasmRuntimeError(format!(
+                            "cannot snapshot table {name} entry {index}"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            tables.push((table, initial));
+        }
+
+        let metering = MeteringGlobals::from_instance(&instance)
+            .map_err(|error| ChainError::WasmRuntimeError(error.to_string()))?;
+        let apply = instance
+            .exports
+            .get_typed_function::<(i64, i64, i64), ()>(store, "apply")
+            .map_err(|error| ChainError::WasmRuntimeError(error.to_string()))?;
+
+        Ok(Self {
+            instance,
+            apply,
+            memory,
+            initial_memory,
+            mutable_globals,
+            tables,
+            metering,
+        })
+    }
+
+    /// Restore the exact post-instantiation state. Returning `false` discards
+    /// the instance and lets the caller create a fresh one; it never runs a
+    /// partially reset instance.
+    fn reset(&self, store: &mut Store) -> Result<bool, ChainError> {
+        let initial_size = self.initial_memory.len() as u64;
+        let current_size = self.memory.view(store).data_size();
+        if current_size < initial_size || current_size > MAX_RESETTABLE_MEMORY_BYTES {
+            return Ok(false);
+        }
+
+        for (table, initial) in &self.tables {
+            if table.size(store) != initial.len() as u32 {
+                return Ok(false);
+            }
+        }
+
+        if current_size > initial_size {
+            let mut offset = initial_size;
+            while offset < current_size {
+                let length = (current_size - offset).min(ZERO_PAGE.len() as u64) as usize;
+                self.memory
+                    .view(store)
+                    .write(offset, &ZERO_PAGE[..length])
+                    .map_err(|error| ChainError::WasmRuntimeError(error.to_string()))?;
+                offset += length as u64;
+            }
+            self.memory
+                .reset(store)
+                .map_err(|error| ChainError::WasmRuntimeError(error.to_string()))?;
+            self.memory
+                .grow_at_least(store, initial_size)
+                .map_err(|error| ChainError::WasmRuntimeError(error.to_string()))?;
+        }
+        self.memory
+            .view(store)
+            .write(0, &self.initial_memory)
+            .map_err(|error| ChainError::WasmRuntimeError(error.to_string()))?;
+
+        for (global, initial) in &self.mutable_globals {
+            global
+                .set(store, initial.clone())
+                .map_err(|error| ChainError::WasmRuntimeError(error.to_string()))?;
+        }
+        for (table, initial) in &self.tables {
+            for (index, value) in initial.iter().enumerate() {
+                table
+                    .set(store, index as u32, value.clone())
+                    .map_err(|error| ChainError::WasmRuntimeError(error.to_string()))?;
+            }
+        }
+        Ok(true)
+    }
+}
+
 #[derive(Clone)]
 struct CachedModule {
     module: Module,
     engine: Engine,
+    reset_exports: ResetStateExports,
+    resettable: bool,
+}
+
+fn module_is_resettable(module: &Module) -> bool {
+    let info = module.info();
+    info.start_function.is_none()
+        && info.num_imported_memories == 0
+        && info.num_imported_globals == 0
+        && info.num_imported_tables == 0
+        && info.memories.len() == 1
+        && info.passive_data.is_empty()
+        && info.passive_elements.is_empty()
+}
+
+fn instance_reuse_enabled() -> bool {
+    // Emergency/benchmark escape hatch. Both paths execute the same compiled
+    // module and metering rules; this changes only whether post-instantiation
+    // VM state is restored or rebuilt before the next invocation.
+    std::env::var_os("PULSEVM_DISABLE_WASM_INSTANCE_REUSE").is_none()
 }
 
 /// A store with its host-import table already wired up, kept warm so it can be
-/// reused across many contract invocations.
+/// reused across many contract invocations. Structurally audited modules also
+/// keep one fully resettable instance in the bundle.
 ///
 /// Building the ~150 host functions costs roughly two thirds of the per-action
-/// setup time, and that work is identical for every call, so we pay it once and
-/// then instantiate against the same store. The env is swapped in place before
-/// each call; a fresh `Instance` is still created every time so linear memory
-/// and metering behave exactly as they would with a throwaway store.
+/// setup time, and that work is identical for every call, so we pay it once.
+/// The env is swapped in place before each call. An audited instance is restored
+/// byte-for-byte to its post-instantiation memory/global/table state; every
+/// module outside that strict audit continues to create a fresh instance.
 ///
 /// A store's object slab only grows, so each new instance leaks a linear memory
 /// into it. `uses` tracks how many instances we've spun up; once it hits
@@ -583,7 +964,8 @@ struct WarmStore {
     store: Store,
     env: FunctionEnv<WasmContext>,
     imports: Imports,
-    uses: u32,
+    instances_created: u32,
+    resettable_instance: Option<ResettableInstance>,
 }
 
 /// How many instances to spin up on a warm store before recycling it. Larger
@@ -720,6 +1102,7 @@ impl WasmRuntime {
             if !inner.code_cache.contains(&id) {
                 let code_bytes = db.get_code_bytes_by_hash(code_hash, 0, 0)?;
                 let runtime_code = expose_internal_memory(code_bytes.as_slice())?;
+                let (runtime_code, reset_exports) = expose_reset_state(runtime_code.as_ref())?;
 
                 // Compile on a fresh engine carrying the pinned deterministic
                 // config (NaN canonicalization, metering, feature set).
@@ -728,11 +1111,14 @@ impl WasmRuntime {
 
                 let module = Module::new(temp_store.engine(), runtime_code.as_ref())
                     .map_err(|e| ChainError::WasmRuntimeError(e.to_string()))?;
+                let resettable = instance_reuse_enabled() && module_is_resettable(&module);
                 inner.code_cache.put(
                     id,
                     CachedModule {
                         module,
                         engine: temp_engine.clone(),
+                        reset_exports,
+                        resettable,
                     },
                 );
             }
@@ -972,20 +1358,68 @@ impl WasmRuntime {
                 store,
                 env,
                 imports,
-                uses: 0,
+                instances_created: 0,
+                resettable_instance: None,
             }
         };
 
-        let instance =
-            Instance::new(&mut warm.store, &module.module, &warm.imports).map_err(|e| {
-                ChainError::WasmRuntimeError(format!("failed to create wasm instance: {}", e))
-            })?;
+        let mut resettable = warm.resettable_instance.take();
+        if let Some(candidate) = resettable.as_ref() {
+            match candidate.reset(&mut warm.store) {
+                Ok(true) => {}
+                Ok(false) | Err(_) => resettable = None,
+            }
+        }
+
+        let (instance, apply_func, metering) = if let Some(candidate) = resettable.as_ref() {
+            (
+                candidate.instance.clone(),
+                candidate.apply.clone(),
+                candidate.metering.clone(),
+            )
+        } else {
+            let instance =
+                Instance::new(&mut warm.store, &module.module, &warm.imports).map_err(|e| {
+                    ChainError::WasmRuntimeError(format!("failed to create wasm instance: {e}"))
+                })?;
+            warm.instances_created += 1;
+
+            if module.resettable {
+                if let Ok(candidate) = ResettableInstance::capture(
+                    &mut warm.store,
+                    instance.clone(),
+                    &module.reset_exports,
+                ) {
+                    let apply = candidate.apply.clone();
+                    let metering = candidate.metering.clone();
+                    resettable = Some(candidate);
+                    (instance, apply, metering)
+                } else {
+                    let apply = instance
+                        .exports
+                        .get_typed_function::<(i64, i64, i64), ()>(&warm.store, "apply")
+                        .map_err(|_| {
+                            ChainError::WasmRuntimeError("failed to find apply function".into())
+                        })?;
+                    let metering = MeteringGlobals::from_instance(&instance)
+                        .map_err(|error| ChainError::WasmRuntimeError(error.to_string()))?;
+                    (instance, apply, metering)
+                }
+            } else {
+                let apply = instance
+                    .exports
+                    .get_typed_function::<(i64, i64, i64), ()>(&warm.store, "apply")
+                    .map_err(|_| {
+                        ChainError::WasmRuntimeError("failed to find apply function".into())
+                    })?;
+                let metering = MeteringGlobals::from_instance(&instance)
+                    .map_err(|error| ChainError::WasmRuntimeError(error.to_string()))?;
+                (instance, apply, metering)
+            }
+        };
 
         warm.env.as_mut(&mut warm.store).memory = exported_memory(&instance);
-
-        // Hand the instance to the env so host intrinsics can bill their work
-        // against the metering budget via WasmContext::charge.
-        warm.env.as_mut(&mut warm.store).instance = Some(instance.clone());
+        warm.env.as_mut(&mut warm.store).metering = Some(metering.clone());
 
         // cpu_limit == -1 means execution is exempt from the local objective
         // account/block allowance (implicit actions and explicitly billed block
@@ -997,13 +1431,12 @@ impl WasmRuntime {
             crate::config::IMPLICIT_TX_CPU_BUDGET
         };
 
-        // Set initial metering points based on resource limits
-        set_remaining_points(&mut warm.store, &instance, cpu_limit);
-
-        let apply_func = instance
-            .exports
-            .get_typed_function::<(i64, i64, i64), ()>(&warm.store, "apply")
-            .map_err(|_| ChainError::WasmRuntimeError(format!("failed to find apply function")))?;
+        // Seed through cached handles. Wasmer's public helper performs two
+        // string-indexed export lookups per call, which is especially costly for
+        // host-heavy contracts such as eosio::onblock.
+        metering
+            .set(&mut warm.store, cpu_limit)
+            .map_err(|error| ChainError::WasmRuntimeError(error.to_string()))?;
 
         // Resume timer
         apply_context.resume_billing_timer()?;
@@ -1019,14 +1452,16 @@ impl WasmRuntime {
             action.name().as_u64() as i64,
         );
         let return_value = warm.env.as_ref(&warm.store).return_value.clone();
-        let remaining_points: MeteringPoints = get_remaining_points(&mut warm.store, &instance);
+        let remaining_points = metering
+            .get(&mut warm.store)
+            .map_err(|error| ChainError::WasmRuntimeError(error.to_string()))?;
 
         // Return the warm store to the pool for reuse, unless it has spun up
-        // enough instances that its object slab is worth reclaiming. A trapped
-        // apply leaves nothing behind on the store itself, so a used-up bundle
-        // is safe to keep either way.
-        warm.uses += 1;
-        if warm.uses < MAX_INSTANCES_PER_STORE {
+        // enough instances that its object slab is worth reclaiming. The reset
+        // happens before the next invocation, including after a trap; no dirty
+        // instance can execute if restoration fails.
+        warm.resettable_instance = resettable;
+        if warm.instances_created < MAX_INSTANCES_PER_STORE {
             STORE_POOL.with(|pool| pool.borrow_mut().put(id, warm));
         }
 
@@ -1062,6 +1497,7 @@ mod tests {
         Module,
         Store,
         TypedFunction,
+        Value,
         imports,
     };
     use wasmer_middlewares::metering::{
@@ -1071,10 +1507,13 @@ mod tests {
     };
 
     use super::{
+        ResettableInstance,
         WasmRuntime,
         charge_metering_points,
         exported_memory,
         expose_internal_memory,
+        expose_reset_state,
+        module_is_resettable,
     };
 
     #[test]
@@ -1111,6 +1550,174 @@ mod tests {
         let instance = Instance::new(&mut store, &module, &imports! {}).unwrap();
 
         assert!(exported_memory(&instance).is_some());
+    }
+
+    #[test]
+    fn audited_instance_reset_restores_memory_growth_globals_and_tables() {
+        let wasm = wat::parse_str(
+            r#"
+            (module
+              (func $slot)
+              (table 1 funcref)
+              (elem (i32.const 0) $slot)
+              (memory 1)
+              (data (i32.const 0) "\05")
+              (global $counter (mut i32) (i32.const 7))
+              (func (export "apply") (param i64 i64 i64)
+                (i32.store8 (i32.const 0) (i32.const 99))
+                (drop (memory.grow (i32.const 1)))
+                (i32.store8 (i32.const 65536) (i32.const 77))
+                (global.set $counter (i32.const 42))
+                (table.set (i32.const 0) (ref.null func)))
+              (func (export "probe") (result i32)
+                (i32.add (i32.load8_u (i32.const 0)) (global.get $counter)))
+              (func (export "grow_probe") (result i32)
+                (drop (memory.grow (i32.const 1)))
+                (i32.load8_u (i32.const 65536))))
+            "#,
+        )
+        .unwrap();
+        let memory_wasm = expose_internal_memory(&wasm).unwrap();
+        let (runtime_wasm, reset_exports) = expose_reset_state(memory_wasm.as_ref()).unwrap();
+        let mut store = Store::new(WasmRuntime::deterministic_engine());
+        let module = Module::new(&store, runtime_wasm.as_ref()).unwrap();
+        assert!(module_is_resettable(&module));
+        let instance = Instance::new(&mut store, &module, &imports! {}).unwrap();
+        let resettable =
+            ResettableInstance::capture(&mut store, instance.clone(), &reset_exports).unwrap();
+        let probe: TypedFunction<(), i32> = instance
+            .exports
+            .get_typed_function(&store, "probe")
+            .unwrap();
+        let grow_probe: TypedFunction<(), i32> = instance
+            .exports
+            .get_typed_function(&store, "grow_probe")
+            .unwrap();
+        let table = instance
+            .exports
+            .get_table(&reset_exports.tables[0])
+            .unwrap()
+            .clone();
+
+        resettable.metering.set(&mut store, 1_000_000).unwrap();
+        resettable.apply.call(&mut store, 0, 0, 0).unwrap();
+        assert_eq!(probe.call(&mut store).unwrap(), 141);
+        assert_eq!(resettable.memory.size(&store).0, 2);
+        assert!(matches!(
+            table.get(&mut store, 0),
+            Some(Value::FuncRef(None))
+        ));
+
+        assert!(resettable.reset(&mut store).unwrap());
+        assert_eq!(probe.call(&mut store).unwrap(), 12);
+        assert_eq!(resettable.memory.size(&store).0, 1);
+        assert!(matches!(
+            table.get(&mut store, 0),
+            Some(Value::FuncRef(Some(_)))
+        ));
+        assert_eq!(grow_probe.call(&mut store).unwrap(), 0);
+    }
+
+    #[test]
+    fn audited_instance_with_a_grown_table_falls_back_to_fresh() {
+        let wasm = wat::parse_str(
+            r#"
+            (module
+              (table 1 funcref)
+              (memory 1)
+              (func (export "apply") (param i64 i64 i64)
+                (drop (table.grow (ref.null func) (i32.const 1)))))
+            "#,
+        )
+        .unwrap();
+        let memory_wasm = expose_internal_memory(&wasm).unwrap();
+        let (runtime_wasm, reset_exports) = expose_reset_state(memory_wasm.as_ref()).unwrap();
+        let mut store = Store::new(WasmRuntime::deterministic_engine());
+        let module = Module::new(&store, runtime_wasm.as_ref()).unwrap();
+        let instance = Instance::new(&mut store, &module, &imports! {}).unwrap();
+        let resettable = ResettableInstance::capture(&mut store, instance, &reset_exports).unwrap();
+
+        resettable.metering.set(&mut store, 1_000_000).unwrap();
+        resettable.apply.call(&mut store, 0, 0, 0).unwrap();
+        assert!(!resettable.reset(&mut store).unwrap());
+    }
+
+    #[test]
+    fn audited_instance_with_large_memory_stays_on_fresh_path() {
+        // 129 wasm pages is just over the 8 MiB reset-work ceiling.
+        let wasm = wat::parse_str(
+            r#"(module
+                  (memory 129)
+                  (func (export "apply") (param i64 i64 i64)))"#,
+        )
+        .unwrap();
+        let memory_wasm = expose_internal_memory(&wasm).unwrap();
+        let (runtime_wasm, reset_exports) = expose_reset_state(memory_wasm.as_ref()).unwrap();
+        let mut store = Store::new(WasmRuntime::deterministic_engine());
+        let module = Module::new(&store, runtime_wasm.as_ref()).unwrap();
+        let instance = Instance::new(&mut store, &module, &imports! {}).unwrap();
+
+        assert!(ResettableInstance::capture(&mut store, instance, &reset_exports).is_err());
+    }
+
+    #[test]
+    fn audited_instance_reset_is_safe_after_a_trap() {
+        let wasm = wat::parse_str(
+            r#"
+            (module
+              (memory 1)
+              (data (i32.const 0) "\0b")
+              (global $counter (mut i32) (i32.const 13))
+              (func (export "apply") (param i64 i64 i64)
+                (i32.store8 (i32.const 0) (i32.const 99))
+                (global.set $counter (i32.const 42))
+                unreachable)
+              (func (export "probe") (result i32)
+                (i32.add (i32.load8_u (i32.const 0)) (global.get $counter))))
+            "#,
+        )
+        .unwrap();
+        let memory_wasm = expose_internal_memory(&wasm).unwrap();
+        let (runtime_wasm, reset_exports) = expose_reset_state(memory_wasm.as_ref()).unwrap();
+        let mut store = Store::new(WasmRuntime::deterministic_engine());
+        let module = Module::new(&store, runtime_wasm.as_ref()).unwrap();
+        let instance = Instance::new(&mut store, &module, &imports! {}).unwrap();
+        let resettable =
+            ResettableInstance::capture(&mut store, instance.clone(), &reset_exports).unwrap();
+        let probe: TypedFunction<(), i32> = instance
+            .exports
+            .get_typed_function(&store, "probe")
+            .unwrap();
+
+        resettable.metering.set(&mut store, 1_000_000).unwrap();
+        assert!(resettable.apply.call(&mut store, 0, 0, 0).is_err());
+        assert!(resettable.reset(&mut store).unwrap());
+        assert_eq!(probe.call(&mut store).unwrap(), 24);
+    }
+
+    #[test]
+    fn reset_audit_rejects_start_passive_segments_and_imported_state() {
+        for wat in [
+            r#"(module
+                  (memory 1)
+                  (func $start)
+                  (start $start)
+                  (func (export "apply") (param i64 i64 i64)))"#,
+            r#"(module
+                  (memory 1)
+                  (data "passive")
+                  (func (export "apply") (param i64 i64 i64)))"#,
+            r#"(module
+                  (import "env" "memory" (memory 1))
+                  (func (export "apply") (param i64 i64 i64)))"#,
+        ] {
+            let wasm = wat::parse_str(wat).unwrap();
+            let memory_wasm = expose_internal_memory(&wasm).unwrap();
+            let (runtime_wasm, _) = expose_reset_state(memory_wasm.as_ref()).unwrap();
+            let store = Store::new(WasmRuntime::deterministic_engine());
+            let module = Module::new(&store, runtime_wasm.as_ref()).unwrap();
+            assert!(!module_is_resettable(&module));
+        }
     }
 
     // A host intrinsic bills its own work out of the same metering budget the
