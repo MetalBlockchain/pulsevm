@@ -806,6 +806,66 @@ impl Controller {
         errors
     }
 
+    fn migration_source_block(
+        manifest: &MigrationManifest,
+    ) -> Result<Option<SignedBlock>, ChainError> {
+        let Some(packed_hex) = manifest.source_block.as_deref() else {
+            return Ok(None);
+        };
+        let packed = hex::decode(packed_hex).map_err(|error| {
+            ChainError::GenesisError(format!(
+                "migration manifest source_block is not hexadecimal: {error}"
+            ))
+        })?;
+        let mut position = 0;
+        let block = SignedBlock::read(&packed, &mut position).map_err(|error| {
+            ChainError::GenesisError(format!(
+                "migration manifest source_block cannot be decoded: {error}"
+            ))
+        })?;
+        if position != packed.len() {
+            return Err(ChainError::GenesisError(format!(
+                "migration manifest source_block has {} trailing bytes",
+                packed.len() - position
+            )));
+        }
+        let block_id = block.id()?;
+        if hex::encode(block_id.as_bytes()) != manifest.source_block_id {
+            return Err(ChainError::GenesisError(format!(
+                "migration source block id {block_id} does not match manifest {}",
+                manifest.source_block_id
+            )));
+        }
+        if i64::from(block.block_num()) != manifest.checkpoint_revision {
+            return Err(ChainError::GenesisError(format!(
+                "migration source block height {} does not match checkpoint revision {}",
+                block.block_num(),
+                manifest.checkpoint_revision
+            )));
+        }
+        if !block.block_extensions.is_empty() {
+            return Err(ChainError::GenesisError(
+                "migration source block contains unsupported block extensions".into(),
+            ));
+        }
+        let mut receipt_digests = VecDeque::with_capacity(block.transactions.len());
+        for receipt in &block.transactions {
+            receipt_digests.push_back(receipt.digest().map_err(|error| {
+                ChainError::GenesisError(format!(
+                    "migration source block transaction cannot be hashed: {error}"
+                ))
+            })?);
+        }
+        let transaction_mroot = merkle(&mut receipt_digests);
+        if transaction_mroot != block.signed_block_header.header.transaction_mroot {
+            return Err(ChainError::GenesisError(format!(
+                "migration source block transaction root {} does not match header {}",
+                transaction_mroot, block.signed_block_header.header.transaction_mroot
+            )));
+        }
+        Ok(Some(block))
+    }
+
     pub fn initialize(
         &mut self,
         chain_id: &Id,
@@ -867,6 +927,7 @@ impl Controller {
             .node_config
             .as_ref()
             .and_then(|config| config.migration_manifest.as_ref());
+        let mut migration_source_block = None;
         if let (Some(checkpoint), Some(manifest_path)) = (migration_checkpoint, migration_manifest)
         {
             let manifest_bytes = fs::read(manifest_path).map_err(|e| {
@@ -898,64 +959,79 @@ impl Controller {
                     hex::encode(expected_checkpoint_sha256)
                 )));
             }
-            let header = self
-                .db
-                .restore_from_path(std::path::Path::new(checkpoint))
-                .map_err(|e| {
-                    ChainError::GenesisError(format!(
-                        "failed to restore migration checkpoint {checkpoint}: {e}"
-                    ))
-                })?;
-            if header.revision <= 0 {
-                return Err(ChainError::GenesisError(
-                    "migration checkpoint must carry a positive revision".into(),
-                ));
-            }
-            for deferred in self.db.arena_deferred_transactions() {
-                let transaction = PackedTransaction::from_deferred_transaction_bytes(Bytes::from(
-                    deferred.packed_trx,
-                ))
-                .map_err(|error| {
-                    ChainError::GenesisError(format!(
-                        "migration deferred transaction {} cannot be decoded: {error}",
-                        hex::encode(deferred.trx_id)
-                    ))
-                })?;
-                if transaction.id().as_bytes() != deferred.trx_id {
-                    return Err(ChainError::GenesisError(format!(
-                        "migration deferred transaction {} does not match its packed bytes",
-                        hex::encode(deferred.trx_id)
-                    )));
+            migration_source_block = Self::migration_source_block(&manifest)?;
+            if self.db.revision() <= 0 {
+                let header = self
+                    .db
+                    .restore_from_path(std::path::Path::new(checkpoint))
+                    .map_err(|e| {
+                        ChainError::GenesisError(format!(
+                            "failed to restore migration checkpoint {checkpoint}: {e}"
+                        ))
+                    })?;
+                if header.revision <= 0 {
+                    return Err(ChainError::GenesisError(
+                        "migration checkpoint must carry a positive revision".into(),
+                    ));
                 }
-            }
-            // Leap's second deferred-transaction retirement feature removes all
-            // pending generated transactions when activated. A checkpoint made
-            // before that activation can still carry rows, so normalize them
-            // before the target chain starts producing blocks.
-            if self
-                .db
-                .protocol_feature_activated(DISABLE_DEFERRED_TRXS_STAGE_2_FEATURE_DIGEST)
-            {
-                let pending = self.db.arena_deferred_transactions();
-                for deferred in &pending {
-                    retire_deferred_transaction(
-                        &mut self.db,
-                        deferred.trx_id,
-                        deferred.payer,
-                        deferred.packed_trx.len(),
-                    )?;
+                for deferred in self.db.arena_deferred_transactions() {
+                    let transaction = PackedTransaction::from_deferred_transaction_bytes(
+                        Bytes::from(deferred.packed_trx),
+                    )
+                    .map_err(|error| {
+                        ChainError::GenesisError(format!(
+                            "migration deferred transaction {} cannot be decoded: {error}",
+                            hex::encode(deferred.trx_id)
+                        ))
+                    })?;
+                    if transaction.id().as_bytes() != deferred.trx_id {
+                        return Err(ChainError::GenesisError(format!(
+                            "migration deferred transaction {} does not match its packed bytes",
+                            hex::encode(deferred.trx_id)
+                        )));
+                    }
                 }
-                if !pending.is_empty() {
-                    info!(
-                        "removed {} pending deferred transactions because DISABLE_DEFERRED_TRXS_STAGE_2 is active",
-                        pending.len()
-                    );
+                // Leap's second deferred-transaction retirement feature removes all
+                // pending generated transactions when activated. A checkpoint made
+                // before that activation can still carry rows, so normalize them
+                // before the target chain starts producing blocks.
+                if self
+                    .db
+                    .protocol_feature_activated(DISABLE_DEFERRED_TRXS_STAGE_2_FEATURE_DIGEST)
+                {
+                    let pending = self.db.arena_deferred_transactions();
+                    for deferred in &pending {
+                        retire_deferred_transaction(
+                            &mut self.db,
+                            deferred.trx_id,
+                            deferred.payer,
+                            deferred.packed_trx.len(),
+                        )?;
+                    }
+                    if !pending.is_empty() {
+                        info!(
+                            "removed {} pending deferred transactions because DISABLE_DEFERRED_TRXS_STAGE_2 is active",
+                            pending.len()
+                        );
+                    }
                 }
+                info!(
+                    "restored migration Arena checkpoint {} at revision {} from manifest {}",
+                    checkpoint, header.revision, manifest_path
+                );
+            } else if self.db.revision() < manifest.checkpoint_revision {
+                return Err(ChainError::GenesisError(format!(
+                    "existing database revision {} predates migration checkpoint {}",
+                    self.db.revision(),
+                    manifest.checkpoint_revision
+                )));
+            } else {
+                info!(
+                    "reusing migration Arena at revision {} without restoring checkpoint {}",
+                    self.db.revision(),
+                    checkpoint
+                );
             }
-            info!(
-                "restored migration Arena checkpoint {} at revision {} from manifest {}",
-                checkpoint, header.revision, manifest_path
-            );
         } else if migration_checkpoint.is_some() || migration_manifest.is_some() {
             return Err(ChainError::GenesisError(
                 "migration_checkpoint and migration_manifest must be configured together".into(),
@@ -1047,6 +1123,11 @@ impl Controller {
         }
         self.last_accepted_block_id = self.last_accepted_block.id()?;
         self.preferred_id = self.last_accepted_block.id()?;
+        if let Some(source_block) = migration_source_block {
+            self.last_accepted_block = source_block;
+            self.last_accepted_block_id = self.last_accepted_block.id()?;
+            self.preferred_id = self.last_accepted_block_id;
+        }
         self.header_signing_state =
             HeaderSigningState::from_genesis(&self.last_accepted_block_id, &self.active_schedule)?;
 
@@ -8067,7 +8148,7 @@ mod tests {
         let migrated = Name::from_str("migrated")?;
         checkpoint_db.create_account(PULSE_NAME.as_u64(), 7)?;
         checkpoint_db.create_account(migrated.as_u64(), 42)?;
-        checkpoint_db.set_revision(1)?;
+        checkpoint_db.set_revision(42)?;
         let checkpoint = checkpoint_db.snapshot_bytes()?;
         fs::write(&checkpoint_path, &checkpoint).map_err(|e| {
             ChainError::InternalError(format!(
@@ -8076,13 +8157,25 @@ mod tests {
             ))
         })?;
         let manifest_path = temp.path().join("migration.manifest.json");
-        let manifest = MigrationManifest::new(
+        let mut previous = [0u8; 32];
+        previous[..4].copy_from_slice(&41u32.to_be_bytes());
+        let source_block = SignedBlock::new(
+            Id::new(previous),
+            BlockTimestamp::new(1_700_000_000),
+            PULSE_NAME,
+            VecDeque::new(),
+            Digest::default(),
+            Digest::default(),
+        );
+        let source_block_id = source_block.id()?;
+        let mut manifest = MigrationManifest::new(
             b"controller migration test source",
-            [7; 32],
+            source_block_id.0.0,
             &checkpoint,
-            1,
+            42,
             Default::default(),
         );
+        manifest.source_block = Some(hex::encode(source_block.pack()?));
         fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).map_err(|e| {
             ChainError::InternalError(format!(
                 "failed to write migration manifest {}: {e}",
@@ -8111,7 +8204,9 @@ mod tests {
             target_path.to_str().unwrap(),
         )?;
 
-        assert_eq!(controller.database().revision(), 1);
+        assert_eq!(controller.database().revision(), 42);
+        assert_eq!(controller.last_accepted_block().block_num(), 42);
+        assert_eq!(controller.last_accepted_block().id()?, source_block_id);
         assert!(
             controller
                 .database()
@@ -8123,6 +8218,18 @@ mod tests {
                 .arena_account_exists(PULSE_NAME.as_u64())
         );
         controller.shutdown()?;
+        drop(controller);
+
+        let mut restarted = Controller::new();
+        restarted.initialize(
+            &chain_id,
+            &config_bytes,
+            &migration_genesis,
+            target_path.to_str().unwrap(),
+        )?;
+        assert_eq!(restarted.database().revision(), 42);
+        assert_eq!(restarted.last_accepted_block().id()?, source_block_id);
+        restarted.shutdown()?;
         Ok(())
     }
 

@@ -62,6 +62,9 @@ Environment:
   PULSEVM_TEST_PRIVATE_KEY      Disposable K1 key used only by this test network.
   PULSEVM_PRODUCER_NAME         Imported producer account (default: pulse).
   PULSEVM_PRODUCER_KEY          Real producer key, required only with the option below.
+  XPR_SOURCE_BLOCK_JSON         Optional get_block JSON for the snapshot boundary.
+  XPR_SOURCE_API_URL            Archive API used when that JSON is absent
+                                (default: https://proton.eosusa.io).
   PULSEVM_PRESERVE_IMPORTED_AUTHORITY=true
                                 Boot the canonical authority unchanged. The supplied
                                 producer key must then be the real matching key.
@@ -268,6 +271,46 @@ prepare_boot_checkpoint() {
   fi
 }
 
+prepare_boot_manifest() {
+  local input_manifest="$BOOT_CHECKPOINT.manifest.json"
+  local checkpoint_hash source_id source_json temporary_json=""
+  checkpoint_hash="$(jq -er '.checkpoint_sha256' "$input_manifest")"
+  source_id="$(jq -er '.source_block_id' "$input_manifest")"
+  BOOT_MANIFEST="$RUN_ROOT/boot-${checkpoint_hash:0:12}-${source_id:0:12}.manifest.json"
+  if [[ -s "$BOOT_MANIFEST" ]] &&
+     jq -e --arg checkpoint_hash "$checkpoint_hash" --arg source_id "$source_id" \
+       '.checkpoint_sha256 == $checkpoint_hash and .source_block_id == $source_id and (.source_block | type == "string" and length > 0)' \
+       "$BOOT_MANIFEST" >/dev/null; then
+    echo "==> Reusing source-anchored migration manifest $BOOT_MANIFEST"
+    return
+  fi
+
+  source_json="${XPR_SOURCE_BLOCK_JSON:-}"
+  if [[ -z "$source_json" ]]; then
+    temporary_json="$(mktemp "${TMPDIR:-/tmp}/xpr-source-block.XXXXXX.json")"
+    source_json="$temporary_json"
+    local source_api="${XPR_SOURCE_API_URL:-https://proton.eosusa.io}"
+    echo "==> Fetching checkpoint boundary block $source_id from $source_api"
+    curl --fail --silent --show-error \
+      --request POST \
+      --header 'Content-Type: application/json' \
+      --data "$(jq -cn --arg source_id "$source_id" '{block_num_or_id: $source_id}')" \
+      --output "$source_json" \
+      "$source_api/v1/chain/get_block"
+  fi
+  [[ -s "$source_json" ]] || fail "source block JSON is empty: $source_json"
+
+  echo "==> Binding the id-exact source block to the migration manifest"
+  LLVM_SYS_221_PREFIX="${LLVM_SYS_221_PREFIX:-/usr/lib/llvm-22}" \
+    cargo run --release --locked -p pulsevm_core --example xpr_attach_source_block -- \
+      "$input_manifest" \
+      "$source_json" \
+      "$BOOT_MANIFEST"
+  if [[ -n "$temporary_json" ]]; then
+    rm -f -- "$temporary_json"
+  fi
+}
+
 current_session() {
   [[ -s "$CURRENT_SESSION_FILE" ]] || fail "no EC2 session has been started"
   local session
@@ -303,6 +346,7 @@ start_cluster() {
   mkdir -p "$RUN_ROOT/sessions"
   remember_run_root
   prepare_boot_checkpoint
+  prepare_boot_manifest
 
   local session report log pid timeout deadline
   session="$RUN_ROOT/sessions/$(date -u +%Y%m%dT%H%M%SZ)-$$"
@@ -324,6 +368,7 @@ start_cluster() {
     METAL_NETWORK_RUNNER_ENDPOINT="127.0.0.1:8080" \
     METAL_NETWORK_RUNNER_ROOT_DATA_DIR="$session/nodes" \
     PULSEVM_MIGRATION_CHECKPOINT="$BOOT_CHECKPOINT" \
+    PULSEVM_MIGRATION_MANIFEST="$BOOT_MANIFEST" \
     PULSEVM_PRODUCER_NAME="${PULSEVM_PRODUCER_NAME:-pulse}" \
     PULSEVM_PRODUCER_KEY="$BOOT_PRODUCER_KEY" \
     PULSEVM_FIVE_NODE_REPORT="$report" \
@@ -404,7 +449,9 @@ case "$ACTION" in
     mkdir -p "$RUN_ROOT"
     remember_run_root
     prepare_boot_checkpoint
+    prepare_boot_manifest
     echo "prepared boot checkpoint: $BOOT_CHECKPOINT"
+    echo "prepared boot manifest:   $BOOT_MANIFEST"
     ;;
   start) start_cluster ;;
   status) show_status ;;

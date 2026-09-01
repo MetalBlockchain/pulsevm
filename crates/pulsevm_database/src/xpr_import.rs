@@ -141,6 +141,12 @@ pub struct MigrationManifest {
     pub version: u16,
     pub source_state_history_sha256: String,
     pub source_block_id: String,
+    /// Canonically packed source block at the checkpoint boundary. This is
+    /// optional for legacy manifests, but a node needs it when bootstrapping a
+    /// checkpoint above genesis so the local accepted-block journal has an
+    /// id-exact anchor instead of inventing a synthetic block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_block: Option<String>,
     /// Source chain identity recorded by the sidecar. The target Pulse chain
     /// intentionally receives a new chain id, so this is provenance only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -168,6 +174,7 @@ impl MigrationManifest {
             version: Self::VERSION,
             source_state_history_sha256: hex::encode(Digest::hash(source_state_history).as_bytes()),
             source_block_id: hex::encode(source_block_id),
+            source_block: None,
             source_chain_id: None,
             checkpoint_sha256: hex::encode(Digest::hash(checkpoint).as_bytes()),
             checkpoint_revision,
