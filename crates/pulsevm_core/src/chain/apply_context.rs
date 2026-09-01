@@ -97,6 +97,19 @@ const DISABLE_DEFERRED_TRXS_STAGE_1_FEATURE_DIGEST: [u8; 32] = [
 // each, rounded up to the 16-byte billable alignment.
 const GENERATED_TRANSACTION_BILLABLE_SIZE: i64 = 272;
 
+pub(crate) fn generated_transaction_billable_size(
+    packed_trx_len: usize,
+) -> Result<i64, ChainError> {
+    let packed_trx_len = i64::try_from(packed_trx_len).map_err(|_| {
+        ChainError::TransactionError("deferred transaction is too large to bill RAM".into())
+    })?;
+    GENERATED_TRANSACTION_BILLABLE_SIZE
+        .checked_add(packed_trx_len)
+        .ok_or_else(|| {
+            ChainError::TransactionError("deferred transaction RAM bill overflows".into())
+        })
+}
+
 struct ApplyContextInner {
     action: Action,                       // The action being applied
     action_return_value: Option<Vec<u8>>, // Return value of the action
@@ -2620,7 +2633,7 @@ impl ApplyContext {
                 .arena_remove_deferred_transaction_by_sender_id(sender, sender_id)?;
             self.update_db_usage(
                 &Name::new(old.payer),
-                -(GENERATED_TRANSACTION_BILLABLE_SIZE + old.packed_trx.len() as i64),
+                -generated_transaction_billable_size(old.packed_trx.len())?,
             )?;
         }
 
@@ -2640,7 +2653,7 @@ impl ApplyContext {
         )?;
         self.update_db_usage(
             &Name::new(payer),
-            GENERATED_TRANSACTION_BILLABLE_SIZE + packed_trx.len() as i64,
+            generated_transaction_billable_size(packed_trx.len())?,
         )?;
         Ok(())
     }
@@ -2662,7 +2675,7 @@ impl ApplyContext {
         };
         self.update_db_usage(
             &Name::new(existing.payer),
-            -(GENERATED_TRANSACTION_BILLABLE_SIZE + existing.packed_trx.len() as i64),
+            -generated_transaction_billable_size(existing.packed_trx.len())?,
         )?;
         Ok(true)
     }

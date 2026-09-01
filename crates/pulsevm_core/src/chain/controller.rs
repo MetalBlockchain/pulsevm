@@ -26,7 +26,10 @@ use crate::{
         SignedBlock,
     },
     chain::{
-        apply_context::ApplyContext,
+        apply_context::{
+            ApplyContext,
+            generated_transaction_billable_size,
+        },
         authority::PermissionLevel,
         authorization_manager::AuthorizationManager,
         block::BlockHeader,
@@ -160,6 +163,26 @@ fn deferred_onerror_payload(sender_id: u128, packed_trx: &[u8]) -> Result<Vec<u8
     append_varuint32(&mut data, packed_trx.len())?;
     data.extend_from_slice(packed_trx);
     Ok(data)
+}
+
+fn retire_deferred_transaction(
+    db: &mut Database,
+    trx_id: [u8; 32],
+    payer: u64,
+    packed_trx_len: usize,
+) -> Result<(), ChainError> {
+    ResourceLimitsManager::add_pending_ram_usage(
+        db,
+        &Name::new(payer),
+        -generated_transaction_billable_size(packed_trx_len)?,
+    )?;
+    if !db.arena_remove_deferred_transaction(trx_id)? {
+        return Err(ChainError::InternalError(format!(
+            "cannot retire missing deferred transaction {}",
+            hex::encode(trx_id)
+        )));
+    }
+    Ok(())
 }
 
 pub static APPLY_HANDLERS: LazyLock<ApplyHandlerMap> = LazyLock::new(|| {
@@ -915,7 +938,12 @@ impl Controller {
             {
                 let pending = self.db.arena_deferred_transactions();
                 for deferred in &pending {
-                    self.db.arena_remove_deferred_transaction(deferred.trx_id)?;
+                    retire_deferred_transaction(
+                        &mut self.db,
+                        deferred.trx_id,
+                        deferred.payer,
+                        deferred.packed_trx.len(),
+                    )?;
                 }
                 if !pending.is_empty() {
                     info!(
@@ -1426,8 +1454,8 @@ impl Controller {
 
         // Scheduled transactions are selected from durable Arena state, never
         // from the mempool. Their raw transaction bytes have no signatures: the
-        // source chain authorized them when they were scheduled. Keep each one
-        // in its own undo session so a failure leaves the queue untouched.
+        // source chain authorized them when they were scheduled. Nested undo
+        // sessions keep retirement separate from payload and `onerror` state.
         let now = timestamp.to_time_point().time_since_epoch().count();
         let disable_deferred_stage_1 =
             db.protocol_feature_activated(DISABLE_DEFERRED_TRXS_STAGE_1_FEATURE_DIGEST);
@@ -1453,7 +1481,12 @@ impl Controller {
                 trace.block_time = timestamp.clone();
                 trace.scheduled = true;
                 trace.receipt = receipt.clone();
-                db.arena_remove_deferred_transaction(scheduled.trx_id)?;
+                retire_deferred_transaction(
+                    &mut self.db,
+                    scheduled.trx_id,
+                    scheduled.payer,
+                    scheduled.packed_trx.len(),
+                )?;
                 transaction_traces.push(trace);
                 transaction_receipts.push_back(TransactionReceipt::for_id(
                     receipt,
@@ -1477,6 +1510,21 @@ impl Controller {
                     hex::encode(scheduled.trx_id)
                 )));
             }
+            // Leap refunds and removes the generated-transaction object before
+            // executing its payload. Keep that retirement in an outer session
+            // while the payload runs in a child session: an objective payload
+            // failure rolls back its mutations without restoring the retired
+            // generated transaction before `onerror` runs.
+            db.arena_start_undo_session();
+            if let Err(error) = retire_deferred_transaction(
+                &mut self.db,
+                scheduled.trx_id,
+                scheduled.payer,
+                scheduled.packed_trx.len(),
+            ) {
+                db.arena_undo();
+                return Err(error);
+            }
             db.arena_start_undo_session();
             match self.execute_deferred_transaction_with_failure(
                 &transaction,
@@ -1485,7 +1533,7 @@ impl Controller {
                 scheduled.published,
             ) {
                 Ok(result) => {
-                    db.arena_remove_deferred_transaction(scheduled.trx_id)?;
+                    db.arena_squash();
                     db.arena_squash();
                     transaction_traces.push(result.trace.clone());
                     transaction_receipts.push_back(TransactionReceipt::for_id(
@@ -1503,7 +1551,7 @@ impl Controller {
                     db.arena_start_undo_session();
                     match self.execute_deferred_onerror(&scheduled, &timestamp, &block_status) {
                         Ok(result) => {
-                            db.arena_remove_deferred_transaction(scheduled.trx_id)?;
+                            db.arena_squash();
                             db.arena_squash();
                             transaction_traces.push(result.trace.clone());
                             transaction_receipts.push_back(TransactionReceipt::for_id(
@@ -1544,7 +1592,6 @@ impl Controller {
                             trace.block_time = timestamp.clone();
                             trace.scheduled = true;
                             trace.receipt = receipt.clone();
-                            db.arena_remove_deferred_transaction(scheduled.trx_id)?;
                             db.arena_squash();
                             transaction_traces.push(trace);
                             transaction_receipts.push_back(TransactionReceipt::for_id(
@@ -2478,6 +2525,16 @@ impl Controller {
                         receipt.transaction_id()
                     )));
                 }
+                // The generated object is retired before its payload executes,
+                // so the payer can reuse the refunded RAM within that payload.
+                // A rejected block unwinds both this refund and the removal in
+                // the block's surrounding Arena session.
+                retire_deferred_transaction(
+                    &mut self.db,
+                    transaction_id,
+                    deferred.payer,
+                    deferred.packed_trx.len(),
+                )?;
                 let result = match receipt.status() {
                     crate::chain::transaction::TransactionStatus::Expired => {
                         if (!disable_deferred_stage_1 && deferred.expiration >= now)
@@ -2594,7 +2651,6 @@ impl Controller {
                         )));
                     }
                 };
-                self.db.arena_remove_deferred_transaction(transaction_id)?;
                 let reproduced = TransactionReceipt::for_id(
                     result.trace.receipt.clone(),
                     *receipt.transaction_id(),
@@ -5417,6 +5473,7 @@ mod tests {
         let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
         let scheduled = create_account(&private_key, Name::from_str("deferred")?, chain_id)?;
         let trx_id: [u8; 32] = scheduled.id().as_bytes().try_into().unwrap();
+        let producer_ram_before = controller.db.get_account_ram_usage(PULSE_NAME.as_u64())?;
         controller.db.xpr_import_deferred_transaction(
             PULSE_NAME.as_u64(),
             7,
@@ -5426,6 +5483,11 @@ mod tests {
             i64::MAX,
             0,
             scheduled.packed_trx_bytes(),
+        )?;
+        ResourceLimitsManager::add_pending_ram_usage(
+            &mut controller.db,
+            &PULSE_NAME,
+            generated_transaction_billable_size(scheduled.packed_trx_bytes().len())?,
         )?;
 
         let mut mempool = Mempool::new();
@@ -5445,12 +5507,23 @@ mod tests {
             0,
             scheduled.packed_trx_bytes(),
         )?;
+        let validator_ram_before = validator.db.get_account_ram_usage(PULSE_NAME.as_u64())?;
+        ResourceLimitsManager::add_pending_ram_usage(
+            &mut validator.db,
+            &PULSE_NAME,
+            generated_transaction_billable_size(scheduled.packed_trx_bytes().len())?,
+        )?;
         let mut validator_mempool = Mempool::new();
         validator
             .verify_block(&block, &mut validator_mempool)
             .await?;
         validator.accept_block(&block.id()?, &mut validator_mempool)?;
         assert_eq!(validator.db.deferred_transaction_count(), 0);
+        assert_eq!(
+            validator.db.get_account_ram_usage(PULSE_NAME.as_u64())?,
+            validator_ram_before,
+            "validator must refund the generated transaction RAM bill"
+        );
         assert!(
             validator
                 .db
@@ -5459,10 +5532,115 @@ mod tests {
 
         controller.accept_block(&block.id()?, &mut mempool)?;
         assert_eq!(controller.db.deferred_transaction_count(), 0);
+        assert_eq!(
+            controller.db.get_account_ram_usage(PULSE_NAME.as_u64())?,
+            producer_ram_before,
+            "producer must refund the generated transaction RAM bill"
+        );
         assert!(
             controller
                 .db
                 .is_account(Name::from_str("deferred")?.as_u64())?
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deferred_payer_can_reuse_refunded_ram_during_execution() -> Result<(), ChainError> {
+        let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
+        let payer = Name::from_str("deferpayer")?;
+        let timestamp = controller.last_accepted_block().timestamp().clone();
+        controller.execute_transaction(
+            &create_account(&private_key, payer, chain_id)?,
+            &timestamp,
+            &BlockStatus::Building,
+        )?;
+
+        let wasm = wat::parse_str(
+            r#"
+            (module
+              (memory (export "memory") 1)
+              (func (export "apply") (param i64 i64 i64)))
+            "#,
+        )
+        .map_err(|error| ChainError::InternalError(error.to_string()))?;
+        let code_ram = i64::try_from(wasm.len()).unwrap()
+            * i64::from(pulsevm_constants::SETCODE_RAM_BYTES_MULTIPLIER);
+        let scheduled = set_code(&private_key, payer, wasm, chain_id)?;
+        let trx_id: [u8; 32] = scheduled.id().as_bytes().try_into().unwrap();
+        let generated_ram =
+            generated_transaction_billable_size(scheduled.packed_trx_bytes().len())?;
+        let ram_before = controller.db.get_account_ram_usage(payer.as_u64())?;
+        controller.db.xpr_import_deferred_transaction(
+            PULSE_NAME.as_u64(),
+            11,
+            payer.as_u64(),
+            trx_id,
+            0,
+            i64::MAX,
+            0,
+            scheduled.packed_trx_bytes(),
+        )?;
+        ResourceLimitsManager::add_pending_ram_usage(&mut controller.db, &payer, generated_ram)?;
+        controller.db.set_account_limits(
+            payer.as_u64(),
+            ram_before + generated_ram.max(code_ram),
+            1_000_000,
+            1_000_000,
+        )?;
+
+        let mut mempool = Mempool::new();
+        let block = controller.build_block(&mut mempool).await?;
+        assert_eq!(block.transactions.len(), 1);
+        assert_eq!(block.transactions[0].transaction_id(), scheduled.id());
+        controller.accept_block(&block.id()?, &mut mempool)?;
+
+        assert_eq!(controller.db.deferred_transaction_count(), 0);
+        assert!(
+            controller.db.get_account_ram_usage(payer.as_u64())?
+                <= ram_before + generated_ram.max(code_ram),
+            "the payload must execute after its generated-transaction RAM is refunded"
+        );
+        assert_ne!(
+            controller.db.account_code_hash_vm(payer.as_u64())?.0,
+            [0; 32]
+        );
+
+        let (mut validator, validator_key, validator_chain_id, _validator_temp) =
+            init_test_controller()?;
+        let validator_timestamp = validator.last_accepted_block().timestamp().clone();
+        validator.execute_transaction(
+            &create_account(&validator_key, payer, validator_chain_id)?,
+            &validator_timestamp,
+            &BlockStatus::Building,
+        )?;
+        let validator_ram_before = validator.db.get_account_ram_usage(payer.as_u64())?;
+        validator.db.xpr_import_deferred_transaction(
+            PULSE_NAME.as_u64(),
+            11,
+            payer.as_u64(),
+            trx_id,
+            0,
+            i64::MAX,
+            0,
+            scheduled.packed_trx_bytes(),
+        )?;
+        ResourceLimitsManager::add_pending_ram_usage(&mut validator.db, &payer, generated_ram)?;
+        validator.db.set_account_limits(
+            payer.as_u64(),
+            validator_ram_before + generated_ram.max(code_ram),
+            1_000_000,
+            1_000_000,
+        )?;
+        let mut validator_mempool = Mempool::new();
+        validator
+            .verify_block(&block, &mut validator_mempool)
+            .await?;
+        validator.accept_block(&block.id()?, &mut validator_mempool)?;
+        assert_eq!(validator.db.deferred_transaction_count(), 0);
+        assert_ne!(
+            validator.db.account_code_hash_vm(payer.as_u64())?.0,
+            [0; 32]
         );
         Ok(())
     }
@@ -6654,6 +6832,7 @@ mod tests {
                 &block_status,
             )
             .map_err(|error| ChainError::InternalError(format!("set cancel code: {error}")))?;
+        let ram_before_cancel = controller.db.get_account_ram_usage(payer)?;
         controller
             .execute_transaction(
                 &call_contract(
@@ -6673,6 +6852,11 @@ mod tests {
                 .arena_deferred_transaction_by_sender_id(account.as_u64(), sender_id)
                 .is_none(),
             "cancel_deferred must remove the generated transaction row"
+        );
+        assert_eq!(
+            controller.db.get_account_ram_usage(payer)?,
+            ram_before_cancel - generated_transaction_billable_size(deferred.len())?,
+            "cancel_deferred must refund the generated transaction RAM bill"
         );
 
         Ok(())
