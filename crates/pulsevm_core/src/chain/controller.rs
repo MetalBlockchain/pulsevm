@@ -3919,6 +3919,7 @@ mod tests {
             authority::PermissionLevel,
             pulse_contract::{
                 NewAccount,
+                SetAbi,
                 SetCode,
             },
             transaction::{
@@ -4112,6 +4113,70 @@ mod tests {
         .sign(&private_key, &chain_id)?;
         let packed_trx = PackedTransaction::from_signed_transaction(trx)?;
         Ok(packed_trx)
+    }
+
+    fn set_abi(
+        private_key: &PrivateKey,
+        account: Name,
+        abi: Vec<u8>,
+        chain_id: Id,
+    ) -> Result<PackedTransaction, ChainError> {
+        let trx = Transaction::new(
+            TransactionHeader::new(TimePointSec::maximum(), 0, 0, 0u32.into(), 0, 0u32.into()),
+            vec![],
+            vec![Action::new(
+                PULSE_NAME,
+                SETABI_NAME,
+                SetAbi {
+                    account,
+                    abi: Arc::new(abi.into()),
+                }
+                .pack()
+                .unwrap(),
+                vec![PermissionLevel::new(account.as_u64(), ACTIVE_NAME.as_u64())],
+            )],
+        )
+        .sign(private_key, &chain_id)?;
+        Ok(PackedTransaction::from_signed_transaction(trx)?)
+    }
+
+    #[tokio::test]
+    async fn native_setabi_stores_opaque_xpr_payload() -> Result<(), ChainError> {
+        let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
+        let db = controller.database();
+        let before_metadata = db
+            .arena_account_metadata(PULSE_NAME.as_u64())
+            .expect("system account metadata exists");
+        let before_abi = db
+            .arena_account_abi_bytes(PULSE_NAME.as_u64())
+            .expect("system account ABI exists");
+        let before_ram = db.get_account_ram_usage(PULSE_NAME.as_u64())?;
+
+        // This is intentionally not a serialized AbiDefinition. XPR nodeos
+        // accepts setabi bytes opaquely and Mainnet contains such a payload.
+        let opaque_abi = vec![0xff, 0x00, 0x01];
+        let timestamp = *controller.last_accepted_block().timestamp();
+        controller.execute_transaction(
+            &set_abi(&private_key, PULSE_NAME, opaque_abi.clone(), chain_id)?,
+            &timestamp,
+            &BlockStatus::Building,
+        )?;
+
+        assert_eq!(
+            db.arena_account_abi_bytes(PULSE_NAME.as_u64()),
+            Some(opaque_abi.clone())
+        );
+        assert_eq!(
+            db.arena_account_metadata(PULSE_NAME.as_u64())
+                .expect("system account metadata still exists")
+                .abi_sequence,
+            before_metadata.abi_sequence + 1
+        );
+        assert_eq!(
+            db.get_account_ram_usage(PULSE_NAME.as_u64())?,
+            before_ram + opaque_abi.len() as i64 - before_abi.len() as i64
+        );
+        Ok(())
     }
 
     fn call_contract<T: Write>(

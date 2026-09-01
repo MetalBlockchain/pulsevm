@@ -8,13 +8,10 @@ use pulsevm_database::{
     PermissionObject,
 };
 use pulsevm_error::ChainError;
-use pulsevm_serialization::Read;
-
 use crate::{
     ACTIVE_NAME,
     OWNER_NAME,
     chain::{
-        abi::AbiDefinition,
         apply_context::ApplyContext,
         authority::{
             Authority,
@@ -228,10 +225,9 @@ pub fn setabi(
         .map_err(|e| ChainError::TransactionError(format!("failed to deserialize data: {}", e)))?;
     context.require_authorization(&act.account, None)?;
 
-    // Try and parse the ABI definition
-    let _: AbiDefinition = AbiDefinition::read(act.abi.as_slice(), &mut 0).map_err(|e| {
-        ChainError::TransactionError(format!("failed to deserialize ABI definition: {}", e))
-    })?;
+    // XPR's native `apply_eosio_setabi` stores this blob opaquely. ABI decoding
+    // belongs to API/contract tooling; making it an admission condition here
+    // rejects historical blocks that nodeos accepted.
 
     let old_size: i64 = db.account_abi_size(act.account.as_u64())? as i64;
     let new_size: i64 = act.abi.len() as i64;
