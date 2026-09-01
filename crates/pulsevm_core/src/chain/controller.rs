@@ -987,7 +987,7 @@ impl Controller {
         // Seed the active producer schedule from genesis: the sole producer is
         // the configured producer_name, and it signs blocks with the genesis
         // initial key. On restart this is the base the block log is replayed onto
-        // (see `reconstruct_schedule_from_log` below).
+        // during the single-pass accepted-log reconstruction below.
         let initial_key = PublicKey::new(rust_genesis.initial_key);
         self.active_schedule = ProducerSchedule {
             version: 0,
@@ -1182,27 +1182,59 @@ impl Controller {
                     self.active_schedule = synced;
                 }
 
-                // Rebuild the active schedule from the committed chain rather than
-                // trusting an out-of-band file: the last block that carried a
-                // `new_producers` names the schedule in force, and if none did the
-                // base above still stands.
-                self.reconstruct_schedule_from_log(start, end)?;
-                if self
+                // Rebuild schedule and Antelope signing state in one sequential
+                // pass. `block_range` holds one buffered descriptor, avoiding two
+                // full scans and five filesystem syscalls per historical block.
+                let antelope_signatures = self
                     .node_config
                     .as_ref()
-                    .is_some_and(|config| config.antelope_block_signatures)
-                {
-                    // Rebuild the compact signing frontier alongside the
-                    // accepted block log. A genesis-based XPR replay retains the
-                    // complete log, so this reproduces nodeos header state.
-                    for height in start.max(genesis_height + 1)..=end {
-                        let block = self.get_block_by_height(height)?.ok_or_else(|| {
+                    .is_some_and(|config| config.antelope_block_signatures);
+                let mut schedule_state = ProducerScheduleState {
+                    active: self.active_schedule.clone(),
+                    pending: None,
+                };
+                let mut signing_state = self.header_signing_state.clone();
+                let schedule_scan_start = start.saturating_add(1);
+                let signing_scan_start = start.max(genesis_height + 1);
+                let scan_start = if antelope_signatures {
+                    schedule_scan_start.min(signing_scan_start)
+                } else {
+                    schedule_scan_start
+                };
+                if scan_start <= end {
+                    let blocks = self
+                        .block_log
+                        .as_ref()
+                        .expect("block log initialized")
+                        .block_range(scan_start, end)
+                        .map_err(|error| {
                             ChainError::DatabaseError(format!(
-                                "missing block {height} while rebuilding Antelope signing state"
+                                "failed to stream accepted block log: {error}"
                             ))
                         })?;
-                        self.header_signing_state.accept(&block)?;
+                    for packed in blocks {
+                        let (height, packed) = packed.map_err(|error| {
+                            ChainError::DatabaseError(format!(
+                                "failed to stream accepted block log: {error}"
+                            ))
+                        })?;
+                        let block = SignedBlock::read(&packed, &mut 0).map_err(|error| {
+                            ChainError::DatabaseError(format!(
+                                "failed to decode accepted block {height}: {error}"
+                            ))
+                        })?;
+                        if height >= schedule_scan_start {
+                            schedule_state.apply_header(&block.signed_block_header.header)?;
+                        }
+                        if antelope_signatures && height >= signing_scan_start {
+                            signing_state.accept(&block)?;
+                        }
                     }
+                }
+                self.active_schedule = schedule_state.active;
+                self.pending_schedule = schedule_state.pending;
+                if antelope_signatures {
+                    self.header_signing_state = signing_state;
                 }
             }
         }
@@ -1286,29 +1318,6 @@ impl Controller {
     ) -> Result<(), ChainError> {
         let block_height = context.block_height();
         self.validate_persisted_protocol_state(block_height.saturating_sub(1), false)
-    }
-
-    // Walk the block log back from the tip for the most recent block that changed
-    // the producer schedule; its header carries the schedule now in force. Runs
-    // once at startup. It is O(blocks since the last schedule change), which is
-    // the whole log when the schedule never changed — acceptable while chains are
-    // short; a cached height pointer is the obvious optimization if it gets hot.
-    fn reconstruct_schedule_from_log(&mut self, start: u32, end: u32) -> Result<(), ChainError> {
-        let mut state = ProducerScheduleState {
-            active: self.active_schedule.clone(),
-            pending: None,
-        };
-        for height in start.saturating_add(1)..=end {
-            let block = self.get_block_by_height(height)?.ok_or_else(|| {
-                ChainError::DatabaseError(format!(
-                    "missing block {height} while rebuilding producer schedule state"
-                ))
-            })?;
-            state.apply_header(&block.signed_block_header.header)?;
-        }
-        self.active_schedule = state.active;
-        self.pending_schedule = state.pending;
-        Ok(())
     }
 
     pub fn shutdown(&mut self) -> Result<(), ChainError> {

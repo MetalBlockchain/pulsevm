@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeMap,
     fmt,
     fs::{
         File,
@@ -122,6 +121,8 @@ impl StateHistoryLogHeader {
 /// Size of one index record: u32 block_num (LE) + u64 offset (LE).
 /// UNCHANGED from the previous version.
 const IDX_RECORD_SIZE: u64 = 12;
+const INDEX_READ_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+const APPEND_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 
 /// Extract EOS block number from a block id (first 4 bytes big-endian)
 #[inline]
@@ -188,10 +189,106 @@ fn tmp_path(path: &Path) -> PathBuf {
 struct Inner {
     log: BufWriter<File>,
     idx: BufWriter<File>,
-    map: BTreeMap<u32, u64>,   // block_num -> file offset (header start)
-    range: Option<(u32, u32)>, // (first, last); None == empty log
-    log_len: u64,              // logical end-of-log; running counter, no metadata() syscalls
-    idx_len: u64,              // logical end-of-index; avoids metadata() on every checkpoint
+    index: ContiguousIndex,
+    log_len: u64, // logical end-of-log; running counter, no metadata() syscalls
+    idx_len: u64, // logical end-of-index; avoids metadata() on every checkpoint
+}
+
+/// State-history logs are gapless by construction, so a tree keyed by every
+/// block number wastes memory and turns append/lookups into `O(log n)` work.
+/// Store only the first block and its contiguous file offsets instead.
+#[derive(Debug, Default)]
+struct ContiguousIndex {
+    first: Option<u32>,
+    offsets: Vec<u64>,
+}
+
+impl ContiguousIndex {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            first: None,
+            offsets: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.offsets.len()
+    }
+
+    fn range(&self) -> Option<(u32, u32)> {
+        let first = self.first?;
+        let count = u32::try_from(self.offsets.len()).ok()?;
+        Some((first, first.checked_add(count.checked_sub(1)?)?))
+    }
+
+    fn get(&self, block_num: u32) -> Option<u64> {
+        let index = block_num.checked_sub(self.first?)? as usize;
+        self.offsets.get(index).copied()
+    }
+
+    /// Add a record while enforcing the on-disk gapless/increasing invariant.
+    fn push(&mut self, block_num: u32, offset: u64) -> bool {
+        if let Some((_, last)) = self.range() {
+            if last.checked_add(1) != Some(block_num)
+                || self
+                    .offsets
+                    .last()
+                    .is_some_and(|previous| offset <= *previous)
+            {
+                return false;
+            }
+        } else {
+            self.first = Some(block_num);
+        }
+        self.offsets.push(offset);
+        true
+    }
+
+    fn clear(&mut self) {
+        self.first = None;
+        self.offsets.clear();
+    }
+
+    fn restore_range(&mut self, range: Option<(u32, u32)>) -> bool {
+        let Some((first, last)) = range else {
+            self.clear();
+            return true;
+        };
+        if self.first != Some(first) {
+            return false;
+        }
+        let Some(len) = last
+            .checked_sub(first)
+            .and_then(|distance| distance.checked_add(1))
+            .map(|len| len as usize)
+        else {
+            return false;
+        };
+        if len > self.offsets.len() {
+            return false;
+        }
+        self.offsets.truncate(len);
+        true
+    }
+
+    fn entries_from(&self, start_block: u32) -> Vec<(u32, u64)> {
+        let Some((first, last)) = self.range() else {
+            return Vec::new();
+        };
+        let start = start_block.max(first);
+        if start > last {
+            return Vec::new();
+        }
+        (start..=last)
+            .map(|block| {
+                (
+                    block,
+                    self.get(block)
+                        .expect("block inside contiguous index range has an offset"),
+                )
+            })
+            .collect()
+    }
 }
 
 /// An exact append-only restore point. The controller takes one for each of its
@@ -219,6 +316,72 @@ pub struct StateHistoryLog {
     data_sync_count: AtomicUsize,
 }
 
+/// A single-open, forward-only view over a contiguous state-history range.
+///
+/// Startup reconstruction can touch tens of millions of blocks. Keeping one
+/// buffered file descriptor avoids an `open`/`stat`/`seek`/`close` cycle for
+/// every block while still validating every record boundary and block number.
+pub(crate) struct StateHistoryLogRange {
+    reader: BufReader<File>,
+    next_block: u32,
+    last_block: u32,
+    next_offset: u64,
+    log_len: u64,
+    magic: u64,
+}
+
+impl Iterator for StateHistoryLogRange {
+    type Item = Result<(u32, Vec<u8>), ShLogError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next_block > self.last_block {
+            return None;
+        }
+
+        let block_num = self.next_block;
+        let offset = self.next_offset;
+        let result = (|| {
+            if offset + StateHistoryLogHeader::SIZE > self.log_len {
+                return Err(ShLogError::Corrupt(offset));
+            }
+
+            let mut header_bytes = [0u8; StateHistoryLogHeader::SIZE as usize];
+            self.reader.read_exact(&mut header_bytes)?;
+            let magic = u64::from_le_bytes(header_bytes[0..8].try_into().unwrap());
+            if magic != self.magic {
+                return Err(ShLogError::BadMagic {
+                    at: offset,
+                    found: magic,
+                    expect: self.magic,
+                });
+            }
+            let mut id_bytes = [0u8; 32];
+            id_bytes.copy_from_slice(&header_bytes[8..40]);
+            let block_id = Id(FixedBytes(id_bytes));
+            if num_from_block_id(&block_id) != block_num {
+                return Err(ShLogError::Corrupt(offset));
+            }
+            let payload_size = u64::from_le_bytes(header_bytes[40..48].try_into().unwrap());
+            let end = offset
+                .checked_add(StateHistoryLogHeader::SIZE)
+                .and_then(|value| value.checked_add(payload_size))
+                .ok_or(ShLogError::Corrupt(offset))?;
+            if end > self.log_len {
+                return Err(ShLogError::Corrupt(offset));
+            }
+            let mut payload =
+                vec![0; usize::try_from(payload_size).map_err(|_| ShLogError::Corrupt(offset))?];
+            self.reader.read_exact(&mut payload)?;
+            self.next_offset = end;
+            self.next_block = block_num
+                .checked_add(1)
+                .ok_or(ShLogError::Corrupt(offset))?;
+            Ok((block_num, payload))
+        })();
+        Some(result)
+    }
+}
+
 impl StateHistoryLog {
     /// Open with explicit magic — pass EOS' `ship_magic(ship_current_version)`.
     ///
@@ -244,18 +407,24 @@ impl StateHistoryLog {
             .open(&idx_path)?;
 
         // ---- load index, tracking how many bytes were valid ----
-        let mut map = BTreeMap::new();
+        let index_file_len = idx_file.metadata()?.len();
+        let index_capacity = usize::try_from(index_file_len / IDX_RECORD_SIZE)
+            .map_err(|_| ShLogError::Corrupt(index_file_len))?;
+        let mut index = ContiguousIndex::with_capacity(index_capacity);
+        let mut index_shape_valid = true;
         let mut valid_idx_bytes = 0u64;
         {
             idx_file.seek(SeekFrom::Start(0))?;
-            let mut r = BufReader::new(&idx_file);
+            let mut r = BufReader::with_capacity(INDEX_READ_BUFFER_SIZE, &idx_file);
             loop {
                 let mut buf = [0u8; IDX_RECORD_SIZE as usize];
                 match r.read_exact(&mut buf) {
                     Ok(()) => {
                         let block = u32::from_le_bytes(buf[0..4].try_into().unwrap());
                         let pos = u64::from_le_bytes(buf[4..12].try_into().unwrap());
-                        map.insert(block, pos);
+                        if index_shape_valid && !index.push(block, pos) {
+                            index_shape_valid = false;
+                        }
                         valid_idx_bytes += IDX_RECORD_SIZE;
                     }
                     Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
@@ -266,7 +435,7 @@ impl StateHistoryLog {
         // Truncate a torn trailing index record; otherwise the next
         // append lands after garbage and permanently corrupts the
         // index framing.
-        if idx_file.metadata()?.len() > valid_idx_bytes {
+        if index_file_len > valid_idx_bytes {
             idx_file.set_len(valid_idx_bytes)?;
         }
 
@@ -276,17 +445,13 @@ impl StateHistoryLog {
         // earlier offsets could remain. Validate the pair's first and last entry,
         // its contiguous key/offset shape, and rebuild the *entire* index from the
         // log on any mismatch.
-        let index_matches_log = if let (Some((&first, &first_off)), Some((&last, &tail_off))) =
-            (map.first_key_value(), map.last_key_value())
-        {
-            let contiguous_keys = u64::from(last.saturating_sub(first)) + 1 == map.len() as u64;
-            let increasing_offsets = map
-                .values()
-                .try_fold(None, |previous, &offset| match previous {
-                    Some(previous) if offset <= previous => Err(()),
-                    _ => Ok(Some(offset)),
-                })
-                .is_ok();
+        let index_matches_log = if let Some((first, last)) = index.range() {
+            let first_off = index
+                .get(first)
+                .expect("first block in contiguous index has an offset");
+            let tail_off = index
+                .get(last)
+                .expect("last block in contiguous index has an offset");
             let len_total = log_file.metadata()?.len();
             let first_matches = first_off == 0
                 && read_validated_header(&mut log_file, first_off, len_total, magic)
@@ -295,16 +460,20 @@ impl StateHistoryLog {
             let tail_matches = read_validated_header(&mut log_file, tail_off, len_total, magic)
                 .map(|header| num_from_block_id(&header.block_id) == last)
                 .unwrap_or(false);
-            contiguous_keys && increasing_offsets && first_matches && tail_matches
+            index_shape_valid && first_matches && tail_matches
         } else {
             false
         };
 
         if !index_matches_log {
-            map = rebuild_index(&mut log_file, &mut idx_file, magic)?;
+            index = rebuild_index(&mut log_file, &mut idx_file, magic)?;
         } else {
-            let last = *map.keys().last().unwrap();
-            let tail_off = map[&last];
+            let (_, last) = index
+                .range()
+                .expect("validated non-empty index has a range");
+            let tail_off = index
+                .get(last)
+                .expect("last block in contiguous index has an offset");
             let len_total = log_file.metadata()?.len();
             let tail = read_validated_header(&mut log_file, tail_off, len_total, magic)?;
             let ok_end = tail_off + StateHistoryLogHeader::SIZE + tail.payload_size;
@@ -318,18 +487,18 @@ impl StateHistoryLog {
                 for (block, pos) in &recovered {
                     w.write_all(&block.to_le_bytes())?;
                     w.write_all(&pos.to_le_bytes())?;
-                    map.insert(*block, *pos);
+                    if !index.push(*block, *pos) {
+                        return Err(ShLogError::MissedBlock(format!(
+                            "{name}.log recovery is not contiguous at block {block}"
+                        )));
+                    }
                 }
                 w.flush()?;
             }
         }
 
         let log_len = log_file.metadata()?.len();
-        let idx_len = map.len() as u64 * IDX_RECORD_SIZE;
-        let range = match (map.keys().next(), map.keys().last()) {
-            (Some(&f), Some(&l)) => Some((f, l)),
-            _ => None,
-        };
+        let idx_len = index.len() as u64 * IDX_RECORD_SIZE;
 
         log_file.seek(SeekFrom::End(0))?;
         idx_file.seek(SeekFrom::End(0))?;
@@ -340,10 +509,9 @@ impl StateHistoryLog {
             idx_path,
             magic,
             inner: Mutex::new(Inner {
-                log: BufWriter::new(log_file),
-                idx: BufWriter::new(idx_file),
-                map,
-                range,
+                log: BufWriter::with_capacity(APPEND_BUFFER_SIZE, log_file),
+                idx: BufWriter::with_capacity(APPEND_BUFFER_SIZE, idx_file),
+                index,
                 log_len,
                 idx_len,
             }),
@@ -365,7 +533,7 @@ impl StateHistoryLog {
         Ok(StateHistoryLogCheckpoint {
             log_len: inner.log_len,
             idx_len: inner.idx_len,
-            range: inner.range,
+            range: inner.index.range(),
         })
     }
 
@@ -390,15 +558,34 @@ impl StateHistoryLog {
             .write(true)
             .open(&self.idx_path)?;
 
-        let old_log = std::mem::replace(&mut inner.log, BufWriter::new(replacement_log));
-        let old_idx = std::mem::replace(&mut inner.idx, BufWriter::new(replacement_idx));
+        // Deferred migration appends may still be buffered. Flush the accepted
+        // prefix before replacing the writers, then truncate the failing entry
+        // below. If a flush itself fails, rollback remains fatal but we continue
+        // every best-effort repair operation.
+        let mut first_error = None;
+        if let Err(error) = inner.log.flush() {
+            first_error = Some(error);
+        }
+        if let Err(error) = inner.idx.flush()
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+
+        let old_log = std::mem::replace(
+            &mut inner.log,
+            BufWriter::with_capacity(APPEND_BUFFER_SIZE, replacement_log),
+        );
+        let old_idx = std::mem::replace(
+            &mut inner.idx,
+            BufWriter::with_capacity(APPEND_BUFFER_SIZE, replacement_idx),
+        );
         let _ = old_log.into_parts();
         let _ = old_idx.into_parts();
 
         // Keep trying every operation after the first error. A rollback error is
         // fatal to the caller, but best-effort completion still minimizes the
         // amount of mixed state left for diagnosis/recovery.
-        let mut first_error = None;
         let mut record = |result: io::Result<()>| {
             if let Err(error) = result
                 && first_error.is_none()
@@ -430,14 +617,9 @@ impl StateHistoryLog {
 
         inner.log_len = checkpoint.log_len;
         inner.idx_len = checkpoint.idx_len;
-        match checkpoint.range {
-            None => inner.map.clear(),
-            Some((_, last)) if last < u32::MAX => {
-                inner.map.split_off(&(last + 1));
-            }
-            Some(_) => {}
+        if !inner.index.restore_range(checkpoint.range) {
+            return Err(ShLogError::Corrupt(checkpoint.log_len));
         }
-        inner.range = checkpoint.range;
         Ok(())
     }
 
@@ -448,7 +630,7 @@ impl StateHistoryLog {
     pub(crate) fn truncate_after(&self, last_block: u32) -> Result<(), ShLogError> {
         let checkpoint = {
             let inner = self.inner.lock().unwrap();
-            let Some((first, last)) = inner.range else {
+            let Some((first, last)) = inner.index.range() else {
                 return Ok(());
             };
             if last_block >= last {
@@ -461,9 +643,9 @@ impl StateHistoryLog {
             let first_removed = last_block
                 .checked_add(1)
                 .ok_or(ShLogError::NotFound(last_block))?;
-            let log_len = *inner
-                .map
-                .get(&first_removed)
+            let log_len = inner
+                .index
+                .get(first_removed)
                 .ok_or(ShLogError::NotFound(first_removed))?;
             StateHistoryLogCheckpoint {
                 log_len,
@@ -505,12 +687,12 @@ impl StateHistoryLog {
 
     /// Append one entry without an immediate durability barrier.
     ///
-    /// The bytes and index record are still flushed from their `BufWriter`s, so
-    /// reads, rollback checkpoints, and tail recovery see the new entry. The
-    /// caller must invoke [`Self::sync_data`] before persisting any state whose
-    /// revision depends on the appended entries. This is used only by resumable
-    /// bulk replay, where syncing once per checkpoint avoids an `fdatasync` per
-    /// block while preserving log-before-state crash ordering.
+    /// Bytes and index records remain in large userspace buffers until those
+    /// buffers fill or the caller invokes [`Self::sync_data`]. The logical index
+    /// and rollback checkpoints still advance immediately. This is used only by
+    /// resumable bulk replay, where syncing once per checkpoint avoids per-block
+    /// seeks, writes, and durability barriers while preserving log-before-state
+    /// crash ordering.
     pub(crate) fn append_deferred_sync(
         &self,
         block_id: Id,
@@ -530,24 +712,25 @@ impl StateHistoryLog {
         let block_num = num_from_block_id(&block_id);
         let mut inner = self.inner.lock().unwrap();
 
-        if let Some((_, last)) = inner.range
-            && block_num != last + 1
+        if let Some((_, last)) = inner.index.range()
+            && last.checked_add(1) != Some(block_num)
         {
             return Err(ShLogError::MissedBlock(format!(
                 "{}.log: expected block {}, got {}",
                 self.name,
-                last + 1,
+                last.saturating_add(1),
                 block_num
             )));
         }
 
         let pos = inner.log_len;
 
-        // Re-position explicitly. This is a no-op in the happy path,
-        // but if a previous append failed mid-write it guarantees we
-        // overwrite the partial entry instead of appending after it.
-        // (BufWriter's Seek impl flushes its buffer first.)
-        inner.log.seek(SeekFrom::Start(pos))?;
+        if sync_data {
+            // Normal node writes preserve the defensive repositioning guarantee.
+            // Migration replay owns the writer exclusively and rollback replaces
+            // it after any error, so seeking here would only flush every batch.
+            inner.log.seek(SeekFrom::Start(pos))?;
+        }
 
         let header = StateHistoryLogHeader {
             magic: self.magic,
@@ -556,8 +739,8 @@ impl StateHistoryLog {
         };
         header.write(&mut inner.log)?;
         inner.log.write_all(payload)?;
-        inner.log.flush()?;
         if sync_data {
+            inner.log.flush()?;
             inner.log.get_ref().sync_data()?;
             #[cfg(test)]
             self.data_sync_count.fetch_add(1, Ordering::SeqCst);
@@ -578,15 +761,15 @@ impl StateHistoryLog {
         // makes the complete prefix durable through `sync_data` at checkpoint.
         inner.idx.write_all(&block_num.to_le_bytes())?;
         inner.idx.write_all(&pos.to_le_bytes())?;
-        inner.idx.flush()?;
+        if sync_data {
+            inner.idx.flush()?;
+        }
 
         inner.log_len = pos + StateHistoryLogHeader::SIZE + payload.len() as u64;
         inner.idx_len += IDX_RECORD_SIZE;
-        inner.map.insert(block_num, pos);
-        inner.range = Some(match inner.range {
-            None => (block_num, block_num),
-            Some((first, _)) => (first, block_num),
-        });
+        if !inner.index.push(block_num, pos) {
+            return Err(ShLogError::Corrupt(pos));
+        }
 
         Ok(())
     }
@@ -613,9 +796,9 @@ impl StateHistoryLog {
         // hold an fd, the old inode stays valid for the read.
         let (pos, mut f) = {
             let inner = self.inner.lock().unwrap();
-            let pos = *inner
-                .map
-                .get(&block_num)
+            let pos = inner
+                .index
+                .get(block_num)
                 .ok_or(ShLogError::NotFound(block_num))?;
             let f = OpenOptions::new().read(true).open(&self.log_path)?;
             (pos, f)
@@ -655,36 +838,57 @@ impl StateHistoryLog {
     where
         F: FnMut(u32, &[u8]) -> Result<(), ShLogError>,
     {
-        let (pairs, f) = {
-            let inner = self.inner.lock().unwrap();
-            let pairs: Vec<(u32, u64)> = inner
-                .map
-                .range(start..=end)
-                .map(|(k, v)| (*k, *v))
-                .collect();
-            let f = OpenOptions::new().read(true).open(&self.log_path)?;
-            (pairs, f)
-        };
-
-        let len_total = f.metadata()?.len();
-        let mut r = BufReader::new(f);
-        for (block, pos) in pairs {
-            let header = read_validated_header(&mut r, pos, len_total, self.magic)?;
-            if num_from_block_id(&header.block_id) != block {
-                return Err(ShLogError::Corrupt(pos));
-            }
-            let mut buf = vec![0u8; header.payload_size as usize];
-            r.read_exact(&mut buf)?;
-            cb(block, &buf)?;
+        for entry in self.block_range(start, end)? {
+            let (block, payload) = entry?;
+            cb(block, &payload)?;
         }
         Ok(())
+    }
+
+    pub(crate) fn block_range(
+        &self,
+        start: u32,
+        end: u32,
+    ) -> Result<StateHistoryLogRange, ShLogError> {
+        if start > end {
+            return Err(ShLogError::MissedBlock(format!(
+                "{}.log: invalid range {start}..={end}",
+                self.name
+            )));
+        }
+        let (first, last, start_offset, f) = {
+            let inner = self.inner.lock().unwrap();
+            let (first, last) = inner.index.range().ok_or(ShLogError::NotFound(start))?;
+            if start < first || end > last {
+                return Err(ShLogError::NotFound(if start < first {
+                    start
+                } else {
+                    end
+                }));
+            }
+            let start_offset = inner.index.get(start).ok_or(ShLogError::NotFound(start))?;
+            let f = OpenOptions::new().read(true).open(&self.log_path)?;
+            (first, last, start_offset, f)
+        };
+        debug_assert!(start >= first && end <= last);
+        let len_total = f.metadata()?.len();
+        let mut reader = BufReader::with_capacity(INDEX_READ_BUFFER_SIZE, f);
+        reader.seek(SeekFrom::Start(start_offset))?;
+        Ok(StateHistoryLogRange {
+            reader,
+            next_block: start,
+            last_block: end,
+            next_offset: start_offset,
+            log_len: len_total,
+            magic: self.magic,
+        })
     }
 
     /* -------------------- pruning -------------------- */
 
     pub fn prune_keep_last(&self, n: u32) -> Result<(), ShLogError> {
         let mut inner = self.inner.lock().unwrap();
-        let Some((first, last)) = inner.range else {
+        let Some((first, last)) = inner.index.range() else {
             return Ok(());
         };
         if n == 0 {
@@ -706,17 +910,13 @@ impl StateHistoryLog {
     /// Runs with the state lock held for the whole rewrite, so appends
     /// can't land on the old inode between the copy and the rename.
     fn prune_locked(&self, inner: &mut Inner, start_block: u32) -> Result<(), ShLogError> {
-        match inner.range {
+        match inner.index.range() {
             None => return Ok(()),
             Some((first, _)) if start_block <= first => return Ok(()),
             _ => {}
         }
 
-        let keep: Vec<(u32, u64)> = inner
-            .map
-            .range(start_block..=u32::MAX)
-            .map(|(k, v)| (*k, *v))
-            .collect();
+        let keep = inner.index.entries_from(start_block);
         if keep.is_empty() {
             return Ok(());
         }
@@ -746,7 +946,7 @@ impl StateHistoryLog {
         // Running counter — never derived from metadata().len(), which
         // lags behind a BufWriter's logical position.
         let mut new_pos = 0u64;
-        let mut new_map = BTreeMap::new();
+        let mut new_index = ContiguousIndex::default();
 
         for (block, old_pos) in &keep {
             let header = read_validated_header(&mut in_log, *old_pos, in_len, self.magic)?;
@@ -762,7 +962,9 @@ impl StateHistoryLog {
             out_idx.write_all(&block.to_le_bytes())?;
             out_idx.write_all(&new_pos.to_le_bytes())?;
 
-            new_map.insert(*block, new_pos);
+            if !new_index.push(*block, new_pos) {
+                return Err(ShLogError::Corrupt(*old_pos));
+            }
             new_pos += StateHistoryLogHeader::SIZE + header.payload_size;
         }
 
@@ -798,8 +1000,8 @@ impl StateHistoryLog {
 
         inner.log = log_w;
         inner.idx = idx_w;
-        inner.map = new_map;
-        inner.range = Some((first_kept, last_kept));
+        inner.index = new_index;
+        debug_assert_eq!(inner.index.range(), Some((first_kept, last_kept)));
         inner.log_len = new_pos;
         inner.idx_len = keep.len() as u64 * IDX_RECORD_SIZE;
 
@@ -858,8 +1060,9 @@ impl StateHistoryLog {
         fsync_parent_dir(&self.log_path)?;
 
         let new_pos = StateHistoryLogHeader::SIZE + payload.len() as u64;
-        let mut new_map = BTreeMap::new();
-        new_map.insert(block_num, 0u64);
+        let mut new_index = ContiguousIndex::default();
+        let inserted = new_index.push(block_num, 0);
+        debug_assert!(inserted);
 
         let log_file = OpenOptions::new()
             .read(true)
@@ -876,8 +1079,7 @@ impl StateHistoryLog {
 
         inner.log = log_w;
         inner.idx = idx_w;
-        inner.map = new_map;
-        inner.range = Some((block_num, block_num));
+        inner.index = new_index;
         inner.log_len = new_pos;
         inner.idx_len = IDX_RECORD_SIZE;
 
@@ -900,8 +1102,7 @@ impl StateHistoryLog {
         inner.idx.seek(SeekFrom::Start(0))?;
         inner.log.get_ref().sync_data()?;
         inner.idx.get_ref().sync_data()?;
-        inner.map.clear();
-        inner.range = None;
+        inner.index.clear();
         inner.log_len = 0;
         inner.idx_len = 0;
         Ok(())
@@ -915,21 +1116,22 @@ impl StateHistoryLog {
         self.inner
             .lock()
             .unwrap()
-            .range
+            .index
+            .range()
             .map(|(_, l)| l)
             .unwrap_or(0)
     }
 
     pub fn range(&self) -> Option<(u32, u32)> {
-        self.inner.lock().unwrap().range
+        self.inner.lock().unwrap().index.range()
     }
 
     pub fn get_block_id(&self, block_num: u32) -> Result<Id, ShLogError> {
         let (pos, mut f) = {
             let inner = self.inner.lock().unwrap();
-            let pos = *inner
-                .map
-                .get(&block_num)
+            let pos = inner
+                .index
+                .get(block_num)
                 .ok_or(ShLogError::NotFound(block_num))?;
             let f = OpenOptions::new().read(true).open(&self.log_path)?;
             (pos, f)
@@ -949,21 +1151,25 @@ fn rebuild_index(
     log_file: &mut File,
     idx_file: &mut File,
     expect_magic: u64,
-) -> Result<BTreeMap<u32, u64>, ShLogError> {
+) -> Result<ContiguousIndex, ShLogError> {
     let entries = scan_entries(log_file, 0, expect_magic)?;
     idx_file.set_len(0)?;
     idx_file.seek(SeekFrom::Start(0))?;
-    let mut map = BTreeMap::new();
+    let mut index = ContiguousIndex::default();
     {
         let mut writer = BufWriter::new(&mut *idx_file);
         for (block, pos) in entries {
             writer.write_all(&block.to_le_bytes())?;
             writer.write_all(&pos.to_le_bytes())?;
-            map.insert(block, pos);
+            if !index.push(block, pos) {
+                return Err(ShLogError::MissedBlock(format!(
+                    "rebuilt state-history log is not contiguous at block {block}"
+                )));
+            }
         }
         writer.flush()?;
     }
-    Ok(map)
+    Ok(index)
 }
 
 /// Scan entries from `start` to end of file, truncating a torn tail.
@@ -1019,6 +1225,24 @@ mod tests {
     /// Number of blocks the generated fixture contains. Several tests
     /// require at least 3 (open, prune); 5 leaves comfortable margin.
     const FIXTURE_BLOCKS: u32 = 5;
+
+    #[test]
+    fn contiguous_index_rejects_gaps_and_non_increasing_offsets() {
+        let mut index = ContiguousIndex::default();
+        assert!(index.push(100, 0));
+        assert!(index.push(101, 48));
+        assert!(!index.push(103, 96));
+        assert!(!index.push(102, 48));
+        assert_eq!(index.range(), Some((100, 101)));
+        assert_eq!(index.get(100), Some(0));
+        assert_eq!(index.get(101), Some(48));
+        assert_eq!(index.get(102), None);
+
+        assert!(index.push(102, 96));
+        assert!(index.restore_range(Some((100, 100))));
+        assert_eq!(index.range(), Some((100, 100)));
+        assert!(!index.restore_range(Some((99, 100))));
+    }
 
     /// Magic stamped into the generated fixture. Must be non-zero: the
     /// log deliberately refuses a zero magic because it would "validate"
@@ -1332,17 +1556,44 @@ mod tests {
             .unwrap();
 
         assert_eq!(log.data_sync_count(), syncs_before);
-        assert_eq!(log.read_block(last + 1).unwrap(), b"first");
-        assert_eq!(log.read_block(last + 2).unwrap(), b"second");
+        assert_eq!(log.range().unwrap().1, last + 2);
 
         log.sync_data().unwrap();
         assert_eq!(log.data_sync_count(), syncs_before + 1);
+        assert_eq!(log.read_block(last + 1).unwrap(), b"first");
+        assert_eq!(log.read_block(last + 2).unwrap(), b"second");
         drop(log);
 
         let reopened = StateHistoryLog::open_with_magic(dir.path(), "block_log", magic).unwrap();
         assert_eq!(reopened.range().unwrap().1, last + 2);
         assert_eq!(reopened.read_block(last + 1).unwrap(), b"first");
         assert_eq!(reopened.read_block(last + 2).unwrap(), b"second");
+    }
+
+    #[test]
+    fn rollback_preserves_buffered_deferred_prefix() {
+        let (dir, magic) = setup("deferred-rollback");
+        let log = StateHistoryLog::open_with_magic(dir.path(), "block_log", magic).unwrap();
+        let last = log.range().unwrap().1;
+
+        log.append_deferred_sync(make_id(last + 1, 0xA1), b"keep")
+            .unwrap();
+        let checkpoint = log.checkpoint().unwrap();
+        log.append_deferred_sync(make_id(last + 2, 0xA2), b"discard")
+            .unwrap();
+        log.rollback_to(&checkpoint).unwrap();
+
+        assert_eq!(log.range().unwrap().1, last + 1);
+        assert_eq!(log.read_block(last + 1).unwrap(), b"keep");
+        assert!(matches!(
+            log.read_block(last + 2),
+            Err(ShLogError::NotFound(block)) if block == last + 2
+        ));
+        drop(log);
+
+        let reopened = StateHistoryLog::open_with_magic(dir.path(), "block_log", magic).unwrap();
+        assert_eq!(reopened.range().unwrap().1, last + 1);
+        assert_eq!(reopened.read_block(last + 1).unwrap(), b"keep");
     }
 
     #[test]
