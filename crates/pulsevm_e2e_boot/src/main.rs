@@ -191,10 +191,7 @@ async fn push(
 fn new_account(creator: Name, account: Name, key: &PublicKey) -> Result<Action> {
     let authority = |k: &PublicKey| Authority {
         threshold: 1,
-        keys: vec![KeyWeight {
-            key: k.clone().into_k1(),
-            weight: 1,
-        }],
+        keys: vec![KeyWeight::new(k.clone().into_k1(), 1)],
         accounts: vec![],
         waits: vec![],
     };

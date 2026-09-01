@@ -1,6 +1,6 @@
 use std::fmt;
 
-use pulsevm_crypto::k1::K1PublicKey;
+use pulsevm_crypto::AuthorityPublicKey;
 use pulsevm_serialization::{
     NumBytes,
     Read,
@@ -49,7 +49,7 @@ impl Authority {
         }
     }
 
-    pub fn new_from_public_key(key: K1PublicKey) -> Self {
+    pub fn new_from_public_key(key: impl Into<AuthorityPublicKey>) -> Self {
         Authority {
             threshold: 1,
             keys: vec![KeyWeight::new(key, 1)],
@@ -96,14 +96,12 @@ impl Authority {
 
         let mut total_weight: u32 = 0;
 
-        // Keys must be strictly ascending by public key. The ordering is the
-        // 34-byte packed key compared as unsigned bytes, which is byte-for-byte
-        // the same as the C++ `public_key_type::cmp` (cross-checked in
-        // pulsevm_database/tests/pubkey_order_cross_validation.rs).
+        // Keys must be strictly ascending by their structured static-variant
+        // ordering, matching Antelope's public_key_type comparison.
         let mut prev_key: Option<&KeyWeight> = None;
         for k in &self.keys {
             if let Some(prev) = prev_key
-                && prev.key.to_packed() >= k.key.to_packed()
+                && prev.key >= k.key
             {
                 return false;
             }
@@ -329,5 +327,37 @@ impl<'de> Deserialize<'de> for Authority {
         }
 
         deserializer.deserialize_struct("Authority", FIELDS, AuthorityVisitor)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pulsevm_crypto::AuthorityPublicKey;
+
+    use super::{
+        Authority,
+        KeyWeight,
+    };
+
+    const P256_GENERATOR: [u8; 33] = [
+        3, 0x6b, 0x17, 0xd1, 0xf2, 0xe1, 0x2c, 0x42, 0x47, 0xf8, 0xbc, 0xe6, 0xe5, 0x63, 0xa4,
+        0x40, 0xf2, 0x77, 0x03, 0x7d, 0x81, 0x2d, 0xeb, 0x33, 0xa0, 0xf4, 0xa1, 0x39, 0x45, 0xd8,
+        0x98, 0xc2, 0x96,
+    ];
+
+    #[test]
+    fn webauthn_authorities_use_structured_rpid_ordering() {
+        let key = |rpid: &str| AuthorityPublicKey::WebAuthn {
+            point: P256_GENERATOR,
+            user_presence: 1,
+            rpid: rpid.into(),
+        };
+        let authority = Authority::new(
+            1,
+            vec![KeyWeight::new(key("aa"), 1), KeyWeight::new(key("z"), 1)],
+            vec![],
+            vec![],
+        );
+        assert!(authority.validate());
     }
 }

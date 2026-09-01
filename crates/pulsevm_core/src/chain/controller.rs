@@ -307,7 +307,7 @@ impl MempoolAdmissionState {
         AuthorizationManager::check_authorization(
             &self.db,
             &transaction.actions,
-            &signed_transaction.recovered_keys(&self.chain_id)?,
+            &signed_transaction.recovered_authority_keys(&self.chain_id)?,
             &BTreeSet::new(),
             seconds(transaction.header.delay_sec.into()),
             &BTreeSet::new(),
@@ -1904,7 +1904,7 @@ impl Controller {
             AuthorizationManager::check_authorization(
                 &mut self.db,
                 &signed_transaction.transaction().actions,
-                &signed_transaction.recovered_keys(&self.chain_id)?,
+                &signed_transaction.recovered_authority_keys(&self.chain_id)?,
                 &BTreeSet::new(),
                 seconds(signed_transaction.transaction().header.delay_sec.into()),
                 &BTreeSet::new(),

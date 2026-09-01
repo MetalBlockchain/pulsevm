@@ -58,19 +58,19 @@ pub async fn handle(
                         name: Name::from_str(&name)?.into(),
                         owner: Authority {
                             threshold: 1,
-                            keys: vec![KeyWeight {
-                                key: PublicKey::from_str(&owner_key)?.into_k1(),
-                                weight: 1,
-                            }],
+                            keys: vec![KeyWeight::new(
+                                PublicKey::from_str(&owner_key)?.into_k1(),
+                                1,
+                            )],
                             accounts: vec![],
                             waits: vec![],
                         },
                         active: Authority {
                             threshold: 1,
-                            keys: vec![KeyWeight {
-                                key: PublicKey::from_str(&active_key)?.into_k1(),
-                                weight: 1,
-                            }],
+                            keys: vec![KeyWeight::new(
+                                PublicKey::from_str(&active_key)?.into_k1(),
+                                1,
+                            )],
                             accounts: vec![],
                             waits: vec![],
                         },
