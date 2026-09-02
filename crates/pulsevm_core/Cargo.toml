@@ -51,6 +51,9 @@ arena-shadow = []
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 proptest = "1"
+# Signing the same digest twice with different nonce data, to build a
+# transaction whose signatures are distinct but recover the same key.
+secp256k1 = { version = "0.30", features = ["recovery", "global-context"] }
 wat = "1"
 
 [[bench]]
