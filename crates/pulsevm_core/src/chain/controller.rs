@@ -140,6 +140,32 @@ pub static APPLY_HANDLERS: LazyLock<ApplyHandlerMap> = LazyLock::new(|| {
     m
 });
 
+/// Whether the transactions in a block still need their signatures and
+/// authorities checked.
+///
+/// This is deliberately a separate decision from explicit CPU/NET billing.
+/// Conflating the two is how the authority check came to be skipped for
+/// first-time verification of a peer's block: `execute_block` always bills
+/// explicitly, so keying the check off `explicit_billed.is_none()` disabled it
+/// everywhere. Nothing downstream re-checks signatures — `require_authorization`
+/// only scans the *declared* authorization list — so any producer could have
+/// forged a transaction from any account and every validator would have accepted
+/// it after re-deriving matching merkle roots.
+///
+/// Antelope permits skipping this (`light_validation_allowed`) only for a block
+/// already known validated or irreversible on *this* node, never for a block
+/// arriving from a peer for the first time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthorizationCheck {
+    /// Recover the signatures and check them against the referenced authorities.
+    /// Required for any block whose transactions this node has not already
+    /// authenticated itself.
+    Required,
+    /// Skip the check because this exact block already passed `verify_block`
+    /// here. Only sound for blocks drawn from `verified_blocks`.
+    AlreadyValidated,
+}
+
 pub struct Controller {
     wasm_runtime: WasmRuntime,
     last_accepted_block: SignedBlock,
@@ -929,6 +955,7 @@ impl Controller {
                 &timestamp,
                 &block_status,
                 None,
+                AuthorizationCheck::Required,
             );
 
             match transaction_result {
@@ -1249,8 +1276,10 @@ impl Controller {
 
         // The arena has no RAII undo hook, so every failure path below mirrors the
         // undo explicitly before returning, keeping the session stack depth right.
+        // First-time validation of a peer's block: its signatures have never been
+        // checked here, so the authority check is mandatory.
         let (transaction_traces, transaction_mroot, action_mroot, proposed_schedule) =
-            match self.execute_block(block, &block_status, mempool) {
+            match self.execute_block(block, &block_status, mempool, AuthorizationCheck::Required) {
                 Ok(v) => v,
                 Err(e) => {
                     self.db.arena_undo();
@@ -1381,7 +1410,10 @@ impl Controller {
             self.clear_pending()?;
             self.db.arena_start_undo_session(); // the fallback accept session; committed below
             let block_status = BlockStatus::Accepting;
-            match self.execute_block(&block, &block_status, mempool) {
+            // Fallback accept re-executes from scratch. This is a rare path (a
+            // fork sibling won, or nothing was pending) and it is not guaranteed
+            // that this block came through `verify_block` here, so check.
+            match self.execute_block(&block, &block_status, mempool, AuthorizationCheck::Required) {
                 Ok((transaction_traces, _, _, _)) => transaction_traces,
                 Err(e) => {
                     self.db.arena_undo();
@@ -1627,11 +1659,18 @@ impl Controller {
         }
     }
 
+    /// Execute every transaction in `block`.
+    ///
+    /// `authorization_check` must be `Required` unless this node has already
+    /// verified this exact block — see `AuthorizationCheck`. It is an explicit
+    /// parameter rather than something derived here so that each call site has to
+    /// state which case it is in.
     pub fn execute_block(
         &mut self,
         block: &SignedBlock,
         block_status: &BlockStatus,
         mempool: &mut Mempool,
+        authorization_check: AuthorizationCheck,
     ) -> Result<
         (
             Vec<TransactionTrace>,
@@ -1676,6 +1715,7 @@ impl Controller {
                 &block.signed_block_header.header.timestamp,
                 block_status,
                 Some((receipt.cpu_usage_us(), receipt.net_usage_words())),
+                authorization_check,
             )?;
 
             // Add trace to traces
@@ -1823,6 +1863,7 @@ impl Controller {
             pending_block_timestamp,
             block_status,
             None,
+            AuthorizationCheck::Required,
         );
         // Mempool admission is advisory: revert the arena session on both the
         // success and error paths.
@@ -1846,6 +1887,7 @@ impl Controller {
             pending_block_timestamp,
             block_status,
             None,
+            AuthorizationCheck::Required,
         )
     }
 
@@ -1874,6 +1916,10 @@ impl Controller {
             pending_block_timestamp,
             block_status,
             explicit_billed,
+            // Explicit billing says nothing about whether the signatures were
+            // ever checked. This helper has no callers today; if one appears it
+            // must opt into skipping deliberately, not inherit it from billing.
+            AuthorizationCheck::Required,
         )
     }
 
@@ -1884,6 +1930,7 @@ impl Controller {
         pending_block_timestamp: &BlockTimestamp,
         block_status: &BlockStatus,
         explicit_billed: Option<(u32, u32)>,
+        authorization_check: AuthorizationCheck,
     ) -> Result<TransactionResult, ChainError> {
         let signed_transaction = packed_transaction.get_signed_transaction();
 
@@ -1892,15 +1939,15 @@ impl Controller {
             .transaction()
             .validate(pending_block_timestamp)?;
 
-        // Verify authority — but only when this node is the one admitting the
-        // transaction (mempool/producing). When applying an already-accepted
-        // block (explicit_billed), signatures were authenticated by the producer,
-        // so this is Antelope light/replay validation: the authority check is
-        // skipped, exactly like the objective resource-limit checks below. It has
-        // no state effect (auth_sequence and permission-usage bumps happen during
-        // execution and finalize), so skipping it leaves the resulting state and
-        // receipts unchanged.
-        if explicit_billed.is_none() {
+        // Verify authority. This is independent of `explicit_billed`: a block
+        // arriving from a peer is billed from its receipts but has *not* been
+        // authenticated here, and nothing downstream would catch a forged
+        // authorization (see `AuthorizationCheck`). The check is skipped only for
+        // a block this node already validated itself, which is Antelope's
+        // light-validation case. It has no state effect — auth_sequence and
+        // permission-usage bumps happen during execution and finalize — so
+        // skipping it there leaves state and receipts unchanged.
+        if authorization_check == AuthorizationCheck::Required {
             AuthorizationManager::check_authorization(
                 &mut self.db,
                 &signed_transaction.transaction().actions,
@@ -2609,14 +2656,23 @@ impl Controller {
                 self.pending_tip_id()
             );
             self.db.arena_start_undo_session(); // the replayed block's session
-            let (traces, _transaction_mroot, _action_mroot, proposed_schedule) =
-                match self.execute_block(block, block_status, mempool) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        self.db.arena_undo(); // undo the session on the error
-                        return Err(e);
-                    }
-                };
+            // Every block on this path was read out of `verified_blocks` above,
+            // so it already passed `verify_block` — including its authority
+            // check — on this node. This is the one genuine light-validation
+            // case, and it is the hot path (replay runs on every verify).
+            let (traces, _transaction_mroot, _action_mroot, proposed_schedule) = match self
+                .execute_block(
+                    block,
+                    block_status,
+                    mempool,
+                    AuthorizationCheck::AlreadyValidated,
+                ) {
+                Ok(v) => v,
+                Err(e) => {
+                    self.db.arena_undo(); // undo the session on the error
+                    return Err(e);
+                }
+            };
             self.pending_chain.push(PendingBlock {
                 id: block.id()?,
                 parent: block.previous_id().clone(),
@@ -5442,6 +5498,172 @@ mod tests {
                 .await
                 .is_err(),
             "block with a signature over the wrong digest must be rejected"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_block_whose_transaction_is_unsigned() -> Result<(), ChainError> {
+        // The forged-block attack. A producer builds a well-formed block whose
+        // transaction declares an authorization but carries *no signature at all*.
+        // The block header itself is signed correctly, so the producer-schedule
+        // check passes, and nothing downstream re-checks signatures --
+        // `require_authorization` only scans the *declared* authorization list.
+        // So if block verification skips the authority check, any producer can
+        // forge a transaction from any account (transfers, updateauth, setcode)
+        // and every validator accepts it after re-deriving matching merkle roots.
+        //
+        // This is the regression test for exactly that: the authority check used
+        // to be keyed off `explicit_billed.is_none()`, and `execute_block` always
+        // bills explicitly, so it was disabled on every block-application path.
+        use crate::chain::transaction::{
+            TransactionReceiptHeader,
+            TransactionStatus,
+        };
+
+        let (mut producer, private_key, chain_id, _p_temp) = init_test_controller()?;
+        let mut p_mempool = Mempool::new();
+        p_mempool.add_transaction(create_account(
+            &private_key,
+            Name::from_str("testapi")?,
+            chain_id,
+        )?);
+        let mut block = producer.build_block(&mut p_mempool).await?;
+
+        // Strip the signatures, leaving the declared authorization untouched.
+        let receipt = block
+            .transactions
+            .front()
+            .expect("the built block must contain a transaction");
+        let signed = receipt.trx().get_signed_transaction();
+        assert!(
+            !signed.signatures().is_empty(),
+            "the original transaction must be signed, or this test proves nothing"
+        );
+        let unsigned = PackedTransaction::from_signed_transaction(SignedTransaction::new(
+            signed.transaction().clone(),
+            BTreeSet::new(),
+            signed.context_free_data().clone(),
+        ))?;
+        let header = TransactionReceiptHeader::new(
+            TransactionStatus::Executed,
+            receipt.cpu_usage_us(),
+            receipt.net_usage_words().into(),
+        );
+        block.transactions = VecDeque::from(vec![TransactionReceipt::new(header, unsigned)]);
+
+        // Re-sign the header so the block clears the schedule check and the
+        // authority check is what actually decides the outcome.
+        let sig_digest = block.signed_block_header.header.sig_digest()?;
+        block.signed_block_header.signature = private_key.sign(&sig_digest)?;
+
+        let (mut validator, _pk, _cid, _v_temp) = init_test_controller()?;
+        let mut v_mempool = Mempool::new();
+        let error = validator
+            .verify_block(&block, &mut v_mempool)
+            .await
+            .expect_err("a block containing an unsigned transaction must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("does not have signatures for it"),
+            "expected an authorization failure, got: {error}"
+        );
+        assert!(
+            validator.pending_chain.is_empty(),
+            "a rejected block must leave nothing on the pending chain"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn authorization_check_gate_is_load_bearing() -> Result<(), ChainError> {
+        // Isolates the gate itself, with no merkle root in the way.
+        //
+        // The end-to-end test above mutates an already-built block, so the
+        // recomputed transaction_mroot no longer matches the header and that
+        // mismatch would reject the block even with the authority check disabled.
+        // A real attacker does not have that problem: they *build* the block
+        // around the forged transaction, so the roots they commit to are exactly
+        // the ones every validator re-derives. The root check is therefore no
+        // defence at all, and the authority check is the only thing standing
+        // between a producer and an arbitrary action from any account.
+        //
+        // So drive `execute_block` directly, which returns the roots rather than
+        // comparing them, and assert the outcome turns purely on the flag.
+        use crate::chain::transaction::{
+            TransactionReceiptHeader,
+            TransactionStatus,
+        };
+
+        let (mut producer, private_key, chain_id, _p_temp) = init_test_controller()?;
+        let mut p_mempool = Mempool::new();
+        p_mempool.add_transaction(create_account(
+            &private_key,
+            Name::from_str("testapi")?,
+            chain_id,
+        )?);
+        let mut block = producer.build_block(&mut p_mempool).await?;
+
+        let receipt = block
+            .transactions
+            .front()
+            .expect("the built block must contain a transaction");
+        let signed = receipt.trx().get_signed_transaction();
+        let unsigned = PackedTransaction::from_signed_transaction(SignedTransaction::new(
+            signed.transaction().clone(),
+            BTreeSet::new(),
+            signed.context_free_data().clone(),
+        ))?;
+        let header = TransactionReceiptHeader::new(
+            TransactionStatus::Executed,
+            receipt.cpu_usage_us(),
+            receipt.net_usage_words().into(),
+        );
+        block.transactions = VecDeque::from(vec![TransactionReceipt::new(header, unsigned)]);
+
+        // Required: the unsigned transaction must be refused.
+        let (mut validator, _pk, _cid, _v_temp) = init_test_controller()?;
+        let mut v_mempool = Mempool::new();
+        validator.db.arena_start_undo_session();
+        let refused = validator
+            .execute_block(
+                &block,
+                &BlockStatus::Verifying,
+                &mut v_mempool,
+                AuthorizationCheck::Required,
+            )
+            .map(|_| ()); // TransactionTrace is not Debug
+        validator.db.arena_undo();
+        let error = refused.expect_err("an unsigned transaction must not execute");
+        assert!(
+            error
+                .to_string()
+                .contains("does not have signatures for it"),
+            "expected an authorization failure, got: {error}"
+        );
+
+        // AlreadyValidated: the very same block executes. This is what the
+        // vulnerable code did on every path, and it is why this variant must stay
+        // restricted to blocks drawn from `verified_blocks`.
+        let (mut replayer, _pk, _cid, _r_temp) = init_test_controller()?;
+        let mut r_mempool = Mempool::new();
+        replayer.db.arena_start_undo_session();
+        let accepted = replayer
+            .execute_block(
+                &block,
+                &BlockStatus::Verifying,
+                &mut r_mempool,
+                AuthorizationCheck::AlreadyValidated,
+            )
+            .map(|_| ()); // TransactionTrace is not Debug
+        replayer.db.arena_undo();
+        assert!(
+            accepted.is_ok(),
+            "skipping the check must be what changes the outcome, but got: {:?}",
+            accepted.err()
         );
 
         Ok(())

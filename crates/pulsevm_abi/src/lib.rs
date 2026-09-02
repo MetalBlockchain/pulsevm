@@ -39,6 +39,9 @@ pub enum AbiError {
     Crypto(String),
     /// UTF-8 that wasn't.
     BadUtf8,
+    /// An array element type that consumes no input, which would make the
+    /// element loop unbounded.
+    ZeroWidthArrayElement(String),
 }
 
 impl fmt::Display for AbiError {
@@ -54,6 +57,9 @@ impl fmt::Display for AbiError {
             AbiError::UnsupportedBuiltin(t) => write!(f, "unsupported built-in `{t}`"),
             AbiError::Crypto(m) => write!(f, "crypto decode failed: {m}"),
             AbiError::BadUtf8 => write!(f, "invalid utf-8 in string"),
+            AbiError::ZeroWidthArrayElement(t) => {
+                write!(f, "array element type `{t}` consumes no input")
+            }
         }
     }
 }
@@ -296,9 +302,29 @@ impl Abi {
 
         if let Some(inner) = type_name.strip_suffix("[]") {
             let count = read_varuint32(data)? as usize;
-            let mut out = Vec::with_capacity(count);
+            // `count` is raw wire data, up to u32::MAX. Reserving for it
+            // directly asks the allocator for ~137 GB (Value is 32 bytes), which
+            // fails and takes the process down through `handle_alloc_error` --
+            // reachable unauthenticated through `getTableRows`, over a contract's
+            // own ABI and row bytes. Every element must consume at least one
+            // byte, so a count beyond the remaining input is already invalid.
+            if count > data.len() {
+                return Err(AbiError::UnexpectedEnd);
+            }
+            let mut out = Vec::new();
+            out.try_reserve(count)
+                .map_err(|_| AbiError::UnexpectedEnd)?;
             for _ in 0..count {
+                // Require forward progress. A type that consumes no bytes -- an
+                // empty struct, or one whose only fields are binary extensions --
+                // would otherwise let a 5-byte count drive billions of
+                // iterations, growing the vector without ever hitting
+                // UnexpectedEnd.
+                let before = data.len();
                 out.push(self.decode(inner, data, depth + 1)?);
+                if data.len() == before {
+                    return Err(AbiError::ZeroWidthArrayElement(inner.to_string()));
+                }
             }
             return Ok(Value::Array(out));
         }

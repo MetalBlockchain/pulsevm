@@ -183,22 +183,69 @@ fn val_type_byte_size(ty: &ValType) -> u32 {
 // ---------------------------------------------------------------------------
 
 /// `memories_validation_visitor::validate`
+///
+/// Every declared memory is checked, not just the first, and the declared
+/// `maximum` is checked alongside `initial`. Checking only `initial` left
+/// `memory.grow` free to reach wasmer's default ceiling of 65 536 pages (4 GiB)
+/// for the 1 000 points that one `MemoryGrow` costs, which in turn set the
+/// per-instruction ceiling for `memory.fill`/`memory.copy` and the per-instance
+/// footprint of the warm-store pool. `Tunables` in the runtime enforce the same
+/// bound independently; this is the first of the two gates.
 fn validate_memories(info: &ModuleInfo) -> Result<()> {
-    if let Some(mem) = info.memories.first() {
-        let min_bytes = mem.initial * constraints::WASM_PAGE_SIZE;
+    // `multi_memory` is off, so a conforming module declares at most one. Reject
+    // extras explicitly rather than silently validating only one of them.
+    if info.memories.len() > 1 {
+        return Err(ValidationError::MemoryTooLarge);
+    }
+    for mem in &info.memories {
+        let min_bytes = mem
+            .initial
+            .checked_mul(constraints::WASM_PAGE_SIZE)
+            .ok_or(ValidationError::MemoryTooLarge)?;
         if min_bytes > constraints::MAXIMUM_LINEAR_MEMORY {
             return Err(ValidationError::MemoryTooLarge);
+        }
+        // A declared `maximum` above the cap is rejected outright. An *absent*
+        // maximum is normal and must stay accepted -- `(memory 1)` is what every
+        // real toolchain emits -- so the ceiling for those modules is enforced by
+        // the runtime `Tunables`, which clamp growth regardless of what the
+        // module declares. Validation alone cannot close this.
+        if let Some(maximum) = mem.maximum {
+            let max_bytes = maximum
+                .checked_mul(constraints::WASM_PAGE_SIZE)
+                .unwrap_or(u64::MAX);
+            if max_bytes > constraints::MAXIMUM_LINEAR_MEMORY {
+                return Err(ValidationError::MemoryTooLarge);
+            }
         }
     }
     Ok(())
 }
 
 /// `tables_validation_visitor::validate`
+///
+/// Every declared table is checked, not just the first. `reference_types` raises
+/// wasmparser's ceiling to 100 tables of 10 000 000 elements each, and wasmer
+/// allocates tables eagerly and densely at instantiation, so validating only
+/// `tables.first()` allowed a few-hundred-byte module to demand ~8 GB per
+/// instantiation — per action.
 fn validate_tables(info: &ModuleInfo) -> Result<()> {
-    if let Some(table) = info.tables.first()
-        && table.initial > constraints::MAXIMUM_TABLE_ELEMENTS
-    {
+    // EOS contracts have a single indirect-call table; more than one is a
+    // module shape no real toolchain emits.
+    if info.tables.len() > 1 {
         return Err(ValidationError::TableTooLarge);
+    }
+    for table in &info.tables {
+        if table.initial > constraints::MAXIMUM_TABLE_ELEMENTS {
+            return Err(ValidationError::TableTooLarge);
+        }
+        // As with memories: a declared maximum over the cap is rejected, an
+        // absent one is normal and is bounded by the runtime `Tunables`.
+        if let Some(maximum) = table.maximum
+            && maximum > constraints::MAXIMUM_TABLE_ELEMENTS
+        {
+            return Err(ValidationError::TableTooLarge);
+        }
     }
     Ok(())
 }
@@ -928,6 +975,83 @@ mod tests {
         .unwrap();
         let err = validate_wasm(&wasm).unwrap_err();
         assert!(matches!(err, ValidationError::TableTooLarge));
+    }
+
+    #[test]
+    fn test_second_table_is_rejected() {
+        // `reference_types` raises wasmparser's ceiling to 100 tables of
+        // 10 000 000 elements each, and wasmer allocates tables eagerly and
+        // densely at instantiation. Validating only `tables.first()` let a
+        // few-hundred-byte module demand ~8 GB per instantiation -- per action.
+        let wasm = wat::parse_str(
+            r#"
+            (module
+                (type (func (param i64 i64 i64)))
+                (func (type 0))
+                (table 1 funcref)
+                (table 10000000 funcref)
+                (memory 1)
+                (export "apply" (func 0))
+            )
+            "#,
+        )
+        .unwrap();
+        let err = validate_wasm(&wasm).unwrap_err();
+        assert!(matches!(err, ValidationError::TableTooLarge));
+    }
+
+    #[test]
+    fn test_declared_table_maximum_over_limit_is_rejected() {
+        let wasm = wat::parse_str(
+            r#"
+            (module
+                (type (func (param i64 i64 i64)))
+                (func (type 0))
+                (table 1 10000000 funcref)
+                (memory 1)
+                (export "apply" (func 0))
+            )
+            "#,
+        )
+        .unwrap();
+        let err = validate_wasm(&wasm).unwrap_err();
+        assert!(matches!(err, ValidationError::TableTooLarge));
+    }
+
+    #[test]
+    fn test_declared_memory_maximum_over_limit_is_rejected() {
+        // 529 pages is one past the 33 MiB ceiling.
+        let wasm = wat::parse_str(
+            r#"
+            (module
+                (type (func (param i64 i64 i64)))
+                (func (type 0))
+                (memory 1 529)
+                (export "apply" (func 0))
+            )
+            "#,
+        )
+        .unwrap();
+        let err = validate_wasm(&wasm).unwrap_err();
+        assert!(matches!(err, ValidationError::MemoryTooLarge));
+    }
+
+    #[test]
+    fn test_memory_without_declared_maximum_still_passes() {
+        // The common shape: no maximum at all. Validation must accept it -- the
+        // runtime tunables are what bound growth for these modules.
+        let wasm = wat::parse_str(
+            r#"
+            (module
+                (type (func (param i64 i64 i64)))
+                (func (type 0))
+                (memory 1)
+                (export "apply" (func 0))
+            )
+            "#,
+        )
+        .unwrap();
+        assert!(validate_wasm(&wasm).is_ok());
     }
 
     #[test]

@@ -30,6 +30,7 @@ use wasmer::{
         CompilerConfig,
         EngineBuilder,
         Features,
+        NativeEngineExt,
     },
     wasmparser::Operator,
 };
@@ -56,6 +57,8 @@ use crate::chain::{
         ProtocolVersion,
     },
     transaction::Action,
+    wasm_bulk_metering::BulkMemoryMetering,
+    wasm_tunables::deterministic_tunables,
     webassembly::{
         __addtf3,
         __ashlti3,
@@ -505,11 +508,23 @@ impl WasmRuntime {
     fn deterministic_engine() -> Engine {
         let mut compiler = LLVM::default();
         compiler.push_middleware(Arc::new(Metering::new(1_000, COST_FUNCTION)));
+        // Must come after Metering: it reuses the globals Metering installs, and
+        // it prices the bulk-memory ops whose cost the static COST_FUNCTION
+        // cannot express (the length is an operand, not an immediate).
+        compiler.push_middleware(Arc::new(BulkMemoryMetering::new()));
         LLVM::canonicalize_nans(&mut compiler, true);
         LLVM::opt_level(&mut compiler, LLVMOptLevel::Aggressive);
-        EngineBuilder::new(compiler)
+        let mut engine: Engine = EngineBuilder::new(compiler)
             .set_features(Some(Self::deterministic_features()))
-            .into()
+            .into();
+        // Clamp linear memory and tables at instantiation. The validator rejects
+        // a module that *declares* more, but a normal module declares no maximum
+        // at all, and stock wasmer then allows growth to 4 GiB. These tunables
+        // are the binding limit, and they also cover code already in state that
+        // is never re-validated (genesis, snapshot restore).
+        let tunables = deterministic_tunables(engine.target());
+        engine.set_tunables(tunables);
+        engine
     }
 
     pub fn run(
@@ -946,6 +961,151 @@ mod tests {
     // NaNs; each must come back as the one wasm canonical NaN. Off, the input
     // payload leaks through — a platform-dependent, consensus-visible value.
     // Verified: fails with canonicalize_nans off.
+    #[test]
+    fn bulk_memory_is_charged_per_byte() {
+        // `memory.fill` is one instruction that memsets a runtime-chosen length.
+        // wasmer's static cost function cannot see that length, so it priced the
+        // op flat at 500 points whether it wrote one byte or the whole 33 MiB
+        // memory. `BulkMemoryMetering` injects the length-aware charge.
+        let wasm = wat::parse_str(
+            r#"
+            (module
+              (memory 1)
+              (func (export "fill") (param i32)
+                (memory.fill (i32.const 0) (i32.const 0xff) (local.get 0))))
+            "#,
+        )
+        .unwrap();
+
+        let mut store = Store::new(WasmRuntime::deterministic_engine());
+        let module = Module::new(&store, &wasm).unwrap();
+        let instance = Instance::new(&mut store, &module, &imports! {}).unwrap();
+        let fill: TypedFunction<i32, ()> =
+            instance.exports.get_typed_function(&store, "fill").unwrap();
+
+        let budget = 100_000_000u64;
+        let spend = |store: &mut Store, len: i32| -> u64 {
+            set_remaining_points(store, &instance, budget);
+            fill.call(store, len).unwrap();
+            match get_remaining_points(store, &instance) {
+                MeteringPoints::Remaining(left) => budget - left,
+                MeteringPoints::Exhausted => panic!("budget exhausted unexpectedly"),
+            }
+        };
+
+        let small = spend(&mut store, 1_000);
+        let large = spend(&mut store, 11_000);
+
+        // 10 000 extra bytes at the measured 10 points/byte (cost::memory, the
+        // same slope the host memcpy intrinsic charges).
+        let extra = large - small;
+        assert_eq!(
+            extra, 100_000,
+            "a 10 000 byte increase must cost 10 points/byte (got {extra})"
+        );
+
+        // Under the old flat price the two calls cost the same; they must not.
+        assert!(
+            large > small,
+            "cost must scale with length, got {small} then {large}"
+        );
+    }
+
+    #[test]
+    fn oversized_bulk_memory_fill_exhausts_the_budget() {
+        // A fill the budget cannot pay for must trap rather than run to
+        // completion. This is the property that stops `loop { memory.fill(..) }`
+        // from pinning a validator indefinitely.
+        let wasm = wat::parse_str(
+            r#"
+            (module
+              (memory 1)
+              (func (export "fill") (param i32)
+                (memory.fill (i32.const 0) (i32.const 0xff) (local.get 0))))
+            "#,
+        )
+        .unwrap();
+
+        let mut store = Store::new(WasmRuntime::deterministic_engine());
+        let module = Module::new(&store, &wasm).unwrap();
+        let instance = Instance::new(&mut store, &module, &imports! {}).unwrap();
+        let fill: TypedFunction<i32, ()> =
+            instance.exports.get_typed_function(&store, "fill").unwrap();
+
+        // 64 KiB at 10 points/byte is ~655 000; a 1 000 point budget cannot pay.
+        set_remaining_points(&mut store, &instance, 1_000);
+        assert!(
+            fill.call(&mut store, 65_536).is_err(),
+            "a fill beyond the budget must trap"
+        );
+        assert!(
+            matches!(
+                get_remaining_points(&mut store, &instance),
+                MeteringPoints::Exhausted
+            ),
+            "the trap must be recorded as metering exhaustion"
+        );
+    }
+
+    #[test]
+    fn linear_memory_growth_is_clamped_to_the_eosio_ceiling() {
+        // A module that declares no `maximum` -- what every real toolchain emits
+        // -- and then asks for far more than the 528-page EOSIO ceiling. The
+        // validator has nothing to reject here (nothing over-large is
+        // *declared*), so the tunables are the only thing standing between a
+        // contract and a 4 GiB linear memory obtained for 1 000 metering points.
+        //
+        // That ceiling is also what bounds a single `memory.fill`/`memory.copy`,
+        // which are metered at a flat rate regardless of length.
+        let wasm = wat::parse_str(
+            r#"
+            (module
+              (memory 1)
+              (func (export "grow") (param i32) (result i32)
+                (memory.grow (local.get 0)))
+              (func (export "size") (result i32)
+                (memory.size)))
+            "#,
+        )
+        .unwrap();
+
+        let mut store = Store::new(WasmRuntime::deterministic_engine());
+        let module = Module::new(&store, &wasm).unwrap();
+        let instance = Instance::new(&mut store, &module, &imports! {}).unwrap();
+        set_remaining_points(&mut store, &instance, 100_000_000);
+        let grow: TypedFunction<i32, i32> =
+            instance.exports.get_typed_function(&store, "grow").unwrap();
+        let size: TypedFunction<(), i32> =
+            instance.exports.get_typed_function(&store, "size").unwrap();
+
+        let ceiling = crate::chain::wasm_tunables::MAX_LINEAR_MEMORY_PAGES as i32;
+
+        // Asking for the whole 4 GiB address space must be refused. wasm reports
+        // a failed grow as -1 rather than trapping.
+        assert_eq!(
+            grow.call(&mut store, 65_535).unwrap(),
+            -1,
+            "memory.grow past the ceiling must fail"
+        );
+
+        // Growing up to the ceiling still works, so the clamp is a ceiling and
+        // not a blanket refusal.
+        let start = size.call(&mut store).unwrap();
+        assert_eq!(
+            grow.call(&mut store, ceiling - start).unwrap(),
+            start,
+            "growing to exactly the ceiling must succeed"
+        );
+        assert_eq!(size.call(&mut store).unwrap(), ceiling);
+
+        // And one page beyond it must not.
+        assert_eq!(
+            grow.call(&mut store, 1).unwrap(),
+            -1,
+            "memory.grow one page past the ceiling must fail"
+        );
+    }
+
     #[test]
     fn canonicalize_nans_masks_nan_payloads() {
         // Reinterpret the i64 arg as f64, run x + 0.0 (kept with no fast-math,
