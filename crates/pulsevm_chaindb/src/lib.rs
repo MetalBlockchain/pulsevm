@@ -2328,6 +2328,31 @@ impl ChainDatabase {
 
     /// Every authorization link owned by `account`, in chainbase's
     /// `by_permission_name` order, as `(required_permission, code, action)`.
+    /// The first `(code, message_type)` still linked to `(account, permission)`,
+    /// or `None` if nothing references it.
+    ///
+    /// `deleteauth` refuses while a link exists: removing the permission out
+    /// from under one leaves `lookup_minimum_permission` resolving to a name
+    /// that no longer exists, which fails every action of that contract for
+    /// that account *and* fails `unlinkauth`, so there is no way back.
+    ///
+    /// Uses the same `(account, required_permission, id)` index the link rows
+    /// are already maintained under, so this is a range seek rather than a scan
+    /// of the account's links.
+    pub fn first_link_to_permission(&self, account: u64, permission: u64) -> Option<(u64, u64)> {
+        use std::ops::Bound;
+        let db = self.lock();
+        db.table::<PermissionLinkRow>()
+            .ok()?
+            .get_index::<LinkByPermissionName>()
+            .range((
+                Bound::Included((account, permission, i64::MIN)),
+                Bound::Included((account, permission, i64::MAX)),
+            ))
+            .map(|(_, row)| (row.code, row.message_type))
+            .next()
+    }
+
     pub fn permission_links_of(&self, account: u64) -> Vec<(u64, u64, u64)> {
         use std::ops::Bound;
         let db = self.lock();
