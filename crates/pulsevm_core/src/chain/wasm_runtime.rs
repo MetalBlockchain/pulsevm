@@ -461,7 +461,11 @@ const COST_FUNCTION: fn(&Operator) -> u64 = |operator: &Operator| -> u64 {
         Operator::F32Mul { .. } | Operator::F64Mul { .. } => 26,
         Operator::F32Div { .. } | Operator::F64Div { .. } => 80,
         Operator::F32Sqrt { .. } | Operator::F64Sqrt { .. } => 110,
-        Operator::MemoryCopy { .. } | Operator::MemoryFill { .. } => 500,
+        // Priced by `BulkMemoryMetering`, not here: the cost depends on the
+        // length operand, which this function never sees. Charging anything at
+        // this site would stack on top of the length-aware charge and make the
+        // real price the sum of two constants in two files.
+        Operator::MemoryCopy { .. } | Operator::MemoryFill { .. } => 0,
         Operator::MemoryGrow { .. } => 1000, // Higher cost for memory growth
         _ => 1,                              // Default cost
     }
@@ -896,6 +900,8 @@ mod tests {
         set_remaining_points,
     };
 
+    use crate::chain::webassembly::cost;
+
     use super::{
         WasmRuntime,
         charge_metering_points,
@@ -955,6 +961,19 @@ mod tests {
         assert_eq!(COST_FUNCTION(&Operator::I64DivU), 80);
         assert_eq!(COST_FUNCTION(&Operator::I64Mul), 3);
         assert_eq!(COST_FUNCTION(&Operator::I64Add), 1); // default
+
+        // Zero here on purpose: bulk memory is priced by `BulkMemoryMetering`,
+        // which is the only site that can see the length operand. Any nonzero
+        // value at this site stacks on top of that and silently makes the real
+        // price the sum of two constants in two files.
+        assert_eq!(COST_FUNCTION(&Operator::MemoryFill { mem: 0 }), 0);
+        assert_eq!(
+            COST_FUNCTION(&Operator::MemoryCopy {
+                dst_mem: 0,
+                src_mem: 0
+            }),
+            0
+        );
     }
 
     // Run a float op on the real deterministic_engine and feed it non-canonical
@@ -965,14 +984,16 @@ mod tests {
     fn bulk_memory_is_charged_per_byte() {
         // `memory.fill` is one instruction that memsets a runtime-chosen length.
         // wasmer's static cost function cannot see that length, so it priced the
-        // op flat at 500 points whether it wrote one byte or the whole 33 MiB
-        // memory. `BulkMemoryMetering` injects the length-aware charge.
+        // op flat -- the same 500 points whether it wrote one byte or the whole
+        // 33 MiB memory. `BulkMemoryMetering` injects the length-aware charge,
+        // and `COST_FUNCTION` now returns 0 so this is the only price applied.
         let wasm = wat::parse_str(
             r#"
             (module
               (memory 1)
               (func (export "fill") (param i32)
-                (memory.fill (i32.const 0) (i32.const 0xff) (local.get 0))))
+                (memory.fill (i32.const 0) (i32.const 0xff) (local.get 0)))
+              (func (export "noop")))
             "#,
         )
         .unwrap();
@@ -1009,6 +1030,40 @@ mod tests {
             large > small,
             "cost must scale with length, got {small} then {large}"
         );
+
+        // The absolute price, not just the slope.
+        //
+        // Checking only the slope is what let a second charge hide here: while
+        // `COST_FUNCTION` still returned 500 for these operators, the real price
+        // was 800 + 10*len even though the middleware, its tests and its docs
+        // all said 300 + 10*len. The slope was right, so nothing failed.
+        //
+        // `INJECTED_OPS` is the handful of accounting operators the middleware
+        // emits around the intercepted instruction; metering charges 1 for each,
+        // just as the host-intrinsic path pays for its own call and argument
+        // setup. Everything above that must be exactly `cost::memory`.
+        const INJECTED_OPS: u64 = 5;
+        let empty_call = {
+            let noop: TypedFunction<(), ()> =
+                instance.exports.get_typed_function(&store, "noop").unwrap();
+            set_remaining_points(&mut store, &instance, budget);
+            noop.call(&mut store).unwrap();
+            match get_remaining_points(&mut store, &instance) {
+                MeteringPoints::Remaining(left) => budget - left,
+                MeteringPoints::Exhausted => panic!("budget exhausted unexpectedly"),
+            }
+        };
+
+        for len in [0u64, 1, 100] {
+            let measured = spend(&mut store, len as i32) - empty_call;
+            let expected = cost::memory(len) + INJECTED_OPS;
+            assert_eq!(
+                measured, expected,
+                "memory.fill({len}) cost {measured}, expected cost::memory({len}) \
+                 + {INJECTED_OPS} = {expected}; a nonzero COST_FUNCTION entry for \
+                 this operator would show up here"
+            );
+        }
     }
 
     #[test]
@@ -1682,7 +1737,7 @@ mod tests {
             per_op_float("(local.set $acc (f64.sqrt (f64.abs (local.get $acc))))"),
             1,
         );
-        row("memory.copy/64", per_op_mem, 500);
+        row("memory.copy/64", per_op_mem, 0); // priced by BulkMemoryMetering
         println!("================================\n");
     }
 

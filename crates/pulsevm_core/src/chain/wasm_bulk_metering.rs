@@ -18,6 +18,19 @@
 //! same work. That is the point: identical work now costs the same whether a
 //! contract reaches it through a host intrinsic or a wasm instruction.
 //!
+//! **This is the only site that prices these two operators.** `COST_FUNCTION`
+//! returns 0 for them, deliberately: a nonzero value there stacks on top of the
+//! charge injected here, and the real price silently becomes the sum of two
+//! constants in two files. It briefly was -- 500 there plus 300 here made the
+//! true cost `800 + 10 * len` while everything claimed `300 + 10 * len`. The
+//! slope was right, so no test noticed; `bulk_memory_is_charged_per_byte` now
+//! asserts the absolute cost for that reason.
+//!
+//! Observed cost is `cost::memory(len)` plus about five points for the
+//! accounting operators this middleware emits, which metering charges at one
+//! each -- the same order of overhead the host path pays for its call and
+//! argument setup.
+//!
 //! **This changes gas accounting**, so it is consensus-visible: a contract using
 //! bulk memory is billed differently than before. Rolling it out needs the usual
 //! protocol-feature treatment and a golden-replay run.
@@ -42,6 +55,9 @@ use wasmer::{
 };
 
 /// Fixed overhead of a bulk-memory operation, mirroring `cost::memory`.
+///
+/// These two constants are the whole price of a bulk-memory operator. Keep
+/// `COST_FUNCTION` at 0 for `MemoryCopy`/`MemoryFill` so it stays that way.
 const BULK_BASE_COST: i64 = 300;
 /// Per-byte slope, mirroring `cost::memory`.
 const BULK_PER_BYTE_COST: i64 = 10;
