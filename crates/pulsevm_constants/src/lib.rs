@@ -11,6 +11,26 @@ pub const FIXED_NET_OVERHEAD_OF_PACKED_TRX: u32 = 16;
 // governance does not start rejecting otherwise valid transactions at decompression time.
 pub const MAX_UNCOMPRESSED_PACKED_TRX_SIZE: usize = 8 * 1024 * 1024;
 
+/// Hard ceiling on the number of signatures a transaction may carry.
+///
+/// Every signature costs one secp256k1 recovery (~40-80us), and recovery runs
+/// before the transaction is billed for anything. Without a bound, a single
+/// unauthenticated gossip message could carry tens of thousands of signatures
+/// and buy seconds of CPU on every node that saw it -- repeatable for free,
+/// because a transaction rejected for irrelevant signatures never reaches the
+/// mempool and so is never deduplicated.
+///
+/// Leap bounds this with a wall-clock deadline inside the recovery loop. That is
+/// not available here: the same code path validates blocks, and a subjective
+/// timeout there would let two nodes disagree about the same block. So the bound
+/// has to be objective.
+///
+/// The floor is set by `pulse.prods`: with `MAX_PRODUCERS = 125`, satisfying its
+/// 2/3+1 threshold takes ~84 signatures. This leaves roughly 3x headroom over
+/// that, while capping recovery at ~20ms rather than seconds. Real transactions
+/// carry one to three.
+pub const MAX_TRANSACTION_SIGNATURES: usize = 256;
+
 pub const RATE_LIMITING_PRECISION: u64 = 1000 * 1000;
 
 pub const BLOCK_INTERVAL_MS: u32 = 500;

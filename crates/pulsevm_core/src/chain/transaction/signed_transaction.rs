@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 
+use pulsevm_constants::MAX_TRANSACTION_SIGNATURES;
 use pulsevm_crypto::{
     AuthorityPublicKey,
     Bytes,
@@ -71,9 +72,28 @@ impl SignedTransaction {
         )
     }
 
+    /// Refuse to start recovering if the transaction carries more signatures
+    /// than [`MAX_TRANSACTION_SIGNATURES`].
+    ///
+    /// This runs before the first recovery, so the cost of a padded transaction
+    /// is one length comparison rather than one secp256k1 recovery per
+    /// signature. That matters most on mempool admission, which is reachable
+    /// from unauthenticated gossip and from the public RPC.
+    fn check_signature_count(&self) -> Result<(), ChainError> {
+        if self.signatures.len() > MAX_TRANSACTION_SIGNATURES {
+            return Err(ChainError::TransactionError(format!(
+                "transaction has {} signatures, exceeding the limit of {}",
+                self.signatures.len(),
+                MAX_TRANSACTION_SIGNATURES
+            )));
+        }
+        Ok(())
+    }
+
     #[must_use]
     #[inline]
     pub fn recovered_keys(&self, chain_id: &Id) -> Result<BTreeSet<PublicKey>, ChainError> {
+        self.check_signature_count()?;
         let mut recovered_keys: BTreeSet<PublicKey> = BTreeSet::new();
         let digest = self
             .transaction
@@ -100,6 +120,7 @@ impl SignedTransaction {
         &self,
         chain_id: &Id,
     ) -> Result<BTreeSet<AuthorityPublicKey>, ChainError> {
+        self.check_signature_count()?;
         let mut recovered_keys = BTreeSet::new();
         let digest = self
             .transaction
@@ -162,6 +183,7 @@ mod tests {
 
     use pulsevm_database::TimePointSec;
 
+    use pulsevm_constants::MAX_TRANSACTION_SIGNATURES;
     use pulsevm_crypto::K1Signature;
     use secp256k1::{
         Message,
@@ -306,6 +328,85 @@ mod tests {
 
         let keys = signed.recovered_authority_keys(&chain_id).unwrap();
         assert_eq!(keys.len(), 1);
+    }
+
+    /// Every signature costs a secp256k1 recovery before the transaction is
+    /// billed for anything, so an unbounded count is free CPU on every node
+    /// that sees the message.
+    #[test]
+    fn too_many_signatures_are_rejected() {
+        // Distinct garbage signatures: the point is that the count is refused
+        // before any of them is looked at.
+        let mut sigs = BTreeSet::new();
+        for i in 0..=MAX_TRANSACTION_SIGNATURES {
+            let mut bytes = [0u8; 65];
+            bytes[0] = 31;
+            bytes[1..].copy_from_slice(&[0u8; 64]);
+            // Vary the payload so the set does not collapse them.
+            bytes[1..5].copy_from_slice(&(i as u32).to_le_bytes());
+            sigs.insert(Signature::new(K1Signature::from_compact65(&bytes)));
+        }
+        assert_eq!(sigs.len(), MAX_TRANSACTION_SIGNATURES + 1);
+
+        let (padded, chain_id) = transaction_signed_by(sigs);
+
+        let err = padded
+            .recovered_authority_keys(&chain_id)
+            .expect_err("a transaction over the signature limit must be rejected");
+        assert!(
+            err.to_string().contains("exceeding the limit"),
+            "expected a signature-count error, got: {err}"
+        );
+
+        let err = padded
+            .recovered_keys(&chain_id)
+            .expect_err("recovered_keys must apply the same limit");
+        assert!(
+            err.to_string().contains("exceeding the limit"),
+            "expected a signature-count error, got: {err}"
+        );
+    }
+
+    /// The limit must be refused *before* recovery, not after -- otherwise it
+    /// bounds nothing. These signatures are structurally invalid, so if even one
+    /// were recovered the error would name that failure instead of the count.
+    #[test]
+    fn the_limit_is_checked_before_any_recovery() {
+        let mut sigs = BTreeSet::new();
+        for i in 0..=MAX_TRANSACTION_SIGNATURES {
+            let mut bytes = [0u8; 65];
+            // Header 0 is outside fc's valid range, and an all-zero r/s is not a
+            // recoverable signature: recovering any of these would fail loudly.
+            bytes[1..5].copy_from_slice(&(i as u32).to_le_bytes());
+            sigs.insert(Signature::new(K1Signature::from_compact65(&bytes)));
+        }
+
+        let (padded, chain_id) = transaction_signed_by(sigs);
+        let err = padded.recovered_authority_keys(&chain_id).unwrap_err();
+
+        assert!(
+            err.to_string().contains("exceeding the limit"),
+            "the count must be refused before recovery is attempted, got: {err}"
+        );
+    }
+
+    /// A transaction at the limit is still valid, and the limit leaves room for
+    /// the largest legitimate multisig: satisfying `pulse.prods` at
+    /// MAX_PRODUCERS = 125 takes roughly 84 signatures.
+    #[test]
+    fn a_transaction_at_the_limit_is_accepted() {
+        let (tx, chain_id) = transaction_signed_by(BTreeSet::new());
+
+        let mut signed = tx;
+        for _ in 0..8 {
+            signed = signed.sign(&PrivateKey::random(), &chain_id).unwrap();
+        }
+        assert_eq!(signed.signatures().len(), 8);
+
+        let keys = signed
+            .recovered_authority_keys(&chain_id)
+            .expect("a normal multisig must be unaffected");
+        assert_eq!(keys.len(), 8);
     }
 
     #[test]
