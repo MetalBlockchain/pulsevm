@@ -144,6 +144,36 @@ fn transaction_dedup_and_expiry() {
 }
 
 #[test]
+fn expiry_cutoff_is_strict_and_sub_second_exact() {
+    let s = db();
+    let at_cutoff = [3u8; 32];
+    let past_cutoff = [4u8; 32];
+    s.record_transaction(at_cutoff, 300).unwrap();
+    s.record_transaction(past_cutoff, 299).unwrap();
+
+    // The comparison is strict, so a row expiring exactly at the cutoff survives.
+    s.clear_expired_input_transactions(300 * 1_000_000).unwrap();
+    assert!(s.transaction_exists(at_cutoff));
+    assert!(!s.transaction_exists(past_cutoff));
+
+    // One microsecond past it, the same row is expired.
+    s.clear_expired_input_transactions(300 * 1_000_000 + 1)
+        .unwrap();
+    assert!(!s.transaction_exists(at_cutoff));
+
+    // A non-positive cutoff clears nothing.
+    let zero_exp = [5u8; 32];
+    s.record_transaction(zero_exp, 0).unwrap();
+    s.clear_expired_input_transactions(0).unwrap();
+    s.clear_expired_input_transactions(-1_000_000).unwrap();
+    assert!(s.transaction_exists(zero_exp));
+
+    // A cutoff beyond the u32 expiration domain clears everything.
+    s.clear_expired_input_transactions(i64::MAX).unwrap();
+    assert!(!s.transaction_exists(zero_exp));
+}
+
+#[test]
 fn global_action_sequence_roundtrips() {
     let s = db();
     s.set_global_action_sequence(42).unwrap();
