@@ -20,7 +20,9 @@ pub mod state_sync;
 pub mod transaction;
 pub mod transaction_context;
 pub mod utils;
+pub mod wasm_bulk_metering;
 pub mod wasm_runtime;
+pub mod wasm_tunables;
 mod webassembly;
 
 // Re-export types for easier access
