@@ -1,4 +1,7 @@
-use std::collections::BTreeSet;
+use std::{
+    collections::BTreeSet,
+    sync::LazyLock,
+};
 
 use pulsevm_crypto::AuthorityPublicKey;
 use pulsevm_database::{
@@ -6,7 +9,10 @@ use pulsevm_database::{
     microseconds,
     seconds,
 };
-use pulsevm_serialization::Read;
+use pulsevm_serialization::{
+    CanonicalSet,
+    Read,
+};
 use wasmer::{
     FunctionEnvMut,
     RuntimeError,
@@ -20,6 +26,9 @@ use crate::{
     transaction::Transaction,
     wasm_runtime::WasmContext,
 };
+
+static AUTH_DIAGNOSTICS: LazyLock<bool> =
+    LazyLock::new(|| std::env::var_os("PULSEVM_AUTH_DIAGNOSTICS").is_some());
 
 pub fn check_transaction_authorization(
     mut env: FunctionEnvMut<WasmContext>,
@@ -63,8 +72,9 @@ pub fn check_transaction_authorization(
         pubkeys_slice
             .read_slice(&mut pubkeys_bytes)
             .map_err(|e| RuntimeError::new(format!("failed to read public keys: {e}")))?;
-        provided_keys =
-            BTreeSet::<AuthorityPublicKey>::read(&pubkeys_bytes, &mut 0).map_err(|e| {
+        provided_keys = CanonicalSet::<AuthorityPublicKey>::read(&pubkeys_bytes, &mut 0)
+            .map(CanonicalSet::into_inner)
+            .map_err(|e| {
                 RuntimeError::new(format!("failed to deserialize provided public keys: {}", e))
             })?;
     }
@@ -77,8 +87,9 @@ pub fn check_transaction_authorization(
         perms_slice
             .read_slice(&mut perms_bytes)
             .map_err(|e| RuntimeError::new(format!("failed to read permission levels: {e}")))?;
-        provided_permissions =
-            BTreeSet::<PermissionLevel>::read(&perms_bytes, &mut 0).map_err(|e| {
+        provided_permissions = CanonicalSet::<PermissionLevel>::read(&perms_bytes, &mut 0)
+            .map(CanonicalSet::into_inner)
+            .map_err(|e| {
                 RuntimeError::new(format!(
                     "failed to deserialize provided permission levels: {}",
                     e
@@ -97,7 +108,12 @@ pub fn check_transaction_authorization(
         &BTreeSet::new(),
     ) {
         Ok(_) => Ok(1),
-        Err(_) => Ok(0),
+        Err(error) => {
+            if *AUTH_DIAGNOSTICS {
+                eprintln!("check_transaction_authorization rejected transaction: {error}");
+            }
+            Ok(0)
+        }
     }
 }
 
@@ -143,7 +159,8 @@ pub fn check_permission_authorization(
         pubkeys_slice
             .read_slice(&mut pubkeys_data)
             .map_err(|e| RuntimeError::new(format!("failed to read pubkeys: {}", e)))?;
-        provided_keys = BTreeSet::<AuthorityPublicKey>::read(pubkeys_data.as_slice(), &mut 0)
+        provided_keys = CanonicalSet::<AuthorityPublicKey>::read(pubkeys_data.as_slice(), &mut 0)
+            .map(CanonicalSet::into_inner)
             .map_err(|e| RuntimeError::new(format!("failed to unpack pubkeys: {}", e)))?;
     }
 
@@ -156,7 +173,8 @@ pub fn check_permission_authorization(
         perms_slice
             .read_slice(&mut perms_data)
             .map_err(|e| RuntimeError::new(format!("failed to read perms: {}", e)))?;
-        provided_permissions = BTreeSet::<PermissionLevel>::read(perms_data.as_slice(), &mut 0)
+        provided_permissions = CanonicalSet::<PermissionLevel>::read(perms_data.as_slice(), &mut 0)
+            .map(CanonicalSet::into_inner)
             .map_err(|e| RuntimeError::new(format!("failed to unpack perms: {}", e)))?;
     }
 

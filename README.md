@@ -66,3 +66,115 @@ metal-network-runner control start --log-level info \
 --plugin-dir $(pwd)/build \
 --blockchain-specs '[{"vm_name": "pulsevm", "genesis": "/Users/glennmarien/Documents/MetalBlockchain/pulsevm/genesis.json"}]'
 ```
+
+### Start five nodes from imported XPR state
+
+First produce an Arena checkpoint using the local XPR fixture instructions in
+[`tools/xpr-chainbase-export/localnet/README.md`](tools/xpr-chainbase-export/localnet/README.md).
+Then run the normal five-node harness with that checkpoint supplied to every
+PulseVM instance:
+
+```bash
+METALGO_EXEC_PATH=../metalgo/build/metalgo \
+METAL_NETWORK_RUNNER_PATH=../metal-network-runner/bin/metal-network-runner \
+PULSEVM_MIGRATION_CHECKPOINT=/tmp/pulsevm-xpr-migration.snapshot \
+scripts/run-local.sh
+```
+
+On a Linux EC2 host, the resumable wrapper can prepare a raw Mainnet export,
+derive a disposable producer authority, and keep the five-node runner alive
+after the SSH session exits:
+
+```bash
+scripts/setup-ubuntu-ec2.sh
+
+XPR_SNAPSHOT=/data/xpr/snapshot.bin \
+XPR_NODEOS=/data/XPRNetwork-core/build/programs/nodeos/nodeos \
+XPR_CORE=/data/XPRNetwork-core \
+METALGO_EXEC_PATH=../metalgo/build/metalgo \
+PULSEVM_EC2_RUN_DIR=/data/pulsevm-xpr \
+  scripts/run-xpr-mainnet-ec2.sh start
+
+scripts/run-xpr-mainnet-ec2.sh status
+scripts/run-xpr-mainnet-ec2.sh logs
+scripts/run-xpr-mainnet-ec2.sh stop
+```
+
+To validate every canonical block sequentially from genesis instead of starting
+from a snapshot, build and supervise the dedicated replay process separately:
+
+```bash
+scripts/run-xpr-full-replay.sh build
+
+XPR_REPLAY_SOURCE_DIR=/data/xpr-mainnet-archive \
+XPR_REPLAY_ARENA_DIR=/data/xpr-arena-replay \
+XPR_REPLAY_LAST_BLOCK=400596231 \
+  scripts/run-xpr-full-replay.sh start
+
+scripts/run-xpr-full-replay.sh status
+scripts/run-xpr-full-replay.sh logs
+```
+
+The build uses ThinLTO and host-native CPU instructions (with unsafe SVE codegen
+disabled on AArch64). The service checkpoints every million blocks by default,
+resumes from the last durable Arena revision, and stays stopped on a parity error
+so the failing block remains visible for diagnosis.
+
+If conversion has already produced a checkpoint, set only
+`PULSEVM_MIGRATION_CHECKPOINT` and `METALGO_EXEC_PATH`. The wrapper verifies the
+matching manifest and derives a separate test-authority copy; it never modifies
+the canonical imported checkpoint. The runner control ports bind to loopback;
+keep the EC2 security group closed to unneeded inbound node ports as well.
+
+For a large imported checkpoint, use the companion runner branch
+`feat/pulsevm-checkpoint-startup` (commit `3d2e25d`), which allows up to two
+minutes for MetalGo to write its dynamic process-info file. The stock runner's
+three-second wait can report a healthy VM as failed while Arena is restoring.
+
+Before booting, record a reproducible Arena fingerprint for the checkpoint:
+
+```bash
+cargo run -p pulsevm_database --example xpr_state_fingerprint -- \
+  /tmp/pulsevm-xpr-migration.snapshot /tmp/xpr-fingerprint
+```
+
+The report contains the checkpoint revision, whole-state root, and SHA-256 for
+each canonical Arena table. Run it again after a bounded SHiP replay to identify
+which table changed and to compare independent conversion runs.
+
+The harness passes `migration_checkpoint` and its emitted manifest through the
+runner's per-chain VM configuration. Every node verifies the manifest hash and
+revision before restoring the Arena checkpoint. It also generates a distinct
+target genesis committed to that checkpoint hash, so a different migration gets
+a different target chain identity. This proves the local conversion and
+five-node boot path; Mainnet migration still requires a validated Mainnet export
+plus the remaining system-contract policy work.
+
+### Exercise writes against imported state
+
+An imported XPR checkpoint retains the real `pulse@active` authority, so its
+production private key must never be used for local testing. Derive a disposable
+copy that replaces only `pulse@owner` and `pulse@active` with a development key:
+
+```bash
+cargo run -p pulsevm_database --example xpr_test_authority -- \
+  /tmp/xpr-migration.snapshot \
+  /tmp/xpr-migration.snapshot.manifest.json \
+  /tmp/xpr-migration-test-authority.snapshot \
+  "$PULSEVM_TEST_PRIVATE_KEY"
+```
+
+The command writes a matching `.manifest.json` beside the derived checkpoint.
+Use that copy with `PULSEVM_MIGRATION_CHECKPOINT` and pass the same development
+key to `pulsevm-e2e-boot`; the canonical XPR checkpoint is not modified. For a
+source network whose producer is not named `pulse`, pass its account as the
+optional final argument and set `PULSEVM_PRODUCER_NAME` when starting the
+runner. The boot helper also has a contract-free smoke path, for example:
+
+```bash
+cargo run -p pulsevm_e2e_boot -- \
+  --url http://127.0.0.1:9650/ext/bc/<chain-id>/rpc \
+  --private-key "$PULSEVM_TEST_PRIVATE_KEY" \
+  --token-wasm /tmp/unused.wasm --token-abi /tmp/unused.abi \
+  --system-account eosio --smoke-only
+```

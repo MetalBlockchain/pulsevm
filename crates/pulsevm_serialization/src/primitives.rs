@@ -1,11 +1,5 @@
 use std::{
-    collections::{
-        BTreeMap,
-        BTreeSet,
-        HashMap,
-        VecDeque,
-    },
-    hash::Hash,
+    collections::VecDeque,
     sync::Arc,
 };
 
@@ -161,35 +155,6 @@ impl<T: NumBytes> NumBytes for VecDeque<T> {
     #[inline]
     fn num_bytes(&self) -> usize {
         self.len().num_bytes() + self.iter().map(NumBytes::num_bytes).sum::<usize>()
-    }
-}
-
-impl<T: NumBytes> NumBytes for BTreeSet<T> {
-    #[inline]
-    fn num_bytes(&self) -> usize {
-        self.len().num_bytes() + self.iter().map(NumBytes::num_bytes).sum::<usize>()
-    }
-}
-
-impl<K: Write + NumBytes, V: Write + NumBytes> NumBytes for BTreeMap<K, V> {
-    #[inline]
-    fn num_bytes(&self) -> usize {
-        self.len().num_bytes()
-            + self
-                .iter()
-                .map(|(k, v)| k.num_bytes() + v.num_bytes())
-                .sum::<usize>()
-    }
-}
-
-impl<K: Write + NumBytes, V: Write + NumBytes> NumBytes for HashMap<K, V> {
-    #[inline]
-    fn num_bytes(&self) -> usize {
-        self.len().num_bytes()
-            + self
-                .iter()
-                .map(|(k, v)| k.num_bytes() + v.num_bytes())
-                .sum::<usize>()
     }
 }
 
@@ -398,50 +363,6 @@ where
             vec.push_back(item);
         }
         Ok(vec)
-    }
-}
-
-impl<T> Read for BTreeSet<T>
-where
-    T: Read + Hash + Eq + Ord,
-{
-    #[inline]
-    fn read(bytes: &[u8], pos: &mut usize) -> Result<Self, ReadError> {
-        let len = usize::read(bytes, pos)?;
-        let mut set = BTreeSet::new();
-        for _ in 0..len {
-            let item = T::read(bytes, pos)?;
-            set.insert(item);
-        }
-        Ok(set)
-    }
-}
-
-impl<K: Read + Write + NumBytes + Ord, V: Read + Write + NumBytes> Read for BTreeMap<K, V> {
-    #[inline]
-    fn read(bytes: &[u8], pos: &mut usize) -> Result<Self, ReadError> {
-        let len = usize::read(bytes, pos)?;
-        let mut map = BTreeMap::new();
-        for _ in 0..len {
-            let key = K::read(bytes, pos)?;
-            let value = V::read(bytes, pos)?;
-            map.insert(key, value);
-        }
-        Ok(map)
-    }
-}
-
-impl<K: Read + Write + NumBytes + Ord + Hash, V: Read + Write + NumBytes> Read for HashMap<K, V> {
-    #[inline]
-    fn read(bytes: &[u8], pos: &mut usize) -> Result<Self, ReadError> {
-        let len = usize::read(bytes, pos)?;
-        let mut map = HashMap::with_capacity(bounded_capacity(len, bytes, *pos));
-        for _ in 0..len {
-            let key = K::read(bytes, pos)?;
-            let value = V::read(bytes, pos)?;
-            map.insert(key, value);
-        }
-        Ok(map)
     }
 }
 
@@ -701,41 +622,6 @@ impl<T: Write> Write for VecDeque<T> {
         self.len().write(bytes, pos)?;
         for item in self.iter() {
             item.write(bytes, pos)?;
-        }
-        Ok(())
-    }
-}
-
-impl<T: Write> Write for BTreeSet<T> {
-    #[inline]
-    fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), WriteError> {
-        self.len().write(bytes, pos)?;
-        for item in self.iter() {
-            item.write(bytes, pos)?;
-        }
-        Ok(())
-    }
-}
-
-impl<K: Write + NumBytes, V: Write + NumBytes> Write for BTreeMap<K, V> {
-    #[inline]
-    fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), WriteError> {
-        self.len().write(bytes, pos)?;
-        for (key, value) in self.iter() {
-            key.write(bytes, pos)?;
-            value.write(bytes, pos)?;
-        }
-        Ok(())
-    }
-}
-
-impl<K: Write + NumBytes, V: Write + NumBytes> Write for HashMap<K, V> {
-    #[inline]
-    fn write(&self, bytes: &mut [u8], pos: &mut usize) -> Result<(), WriteError> {
-        self.len().write(bytes, pos)?;
-        for (key, value) in self.iter() {
-            key.write(bytes, pos)?;
-            value.write(bytes, pos)?;
         }
         Ok(())
     }

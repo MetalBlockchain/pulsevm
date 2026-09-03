@@ -1,7 +1,4 @@
-use std::{
-    collections::BTreeMap,
-    fmt,
-};
+use std::fmt;
 
 use pulsevm_crypto::Digest;
 use pulsevm_error::ChainError;
@@ -10,7 +7,11 @@ use pulsevm_proc_macros::{
     Read,
     Write,
 };
-use pulsevm_serialization::Write;
+use pulsevm_serialization::{
+    CanonicalMap,
+    VarUint32,
+    Write,
+};
 
 use crate::chain::name::Name;
 
@@ -20,9 +21,9 @@ pub struct ActionReceipt {
     pub act_digest: Digest,
     pub global_sequence: u64,
     pub recv_sequence: u64,
-    pub auth_sequence: BTreeMap<u64, u64>,
-    pub code_sequence: u32,
-    pub abi_sequence: u32,
+    pub auth_sequence: CanonicalMap<u64, u64>,
+    pub code_sequence: VarUint32,
+    pub abi_sequence: VarUint32,
 }
 
 impl ActionReceipt {
@@ -31,7 +32,7 @@ impl ActionReceipt {
         act_digest: Digest,
         global_sequence: u64,
         recv_sequence: u64,
-        auth_sequence: BTreeMap<u64, u64>,
+        auth_sequence: CanonicalMap<u64, u64>,
         code_sequence: u32,
         abi_sequence: u32,
     ) -> Self {
@@ -41,8 +42,8 @@ impl ActionReceipt {
             global_sequence,
             recv_sequence,
             auth_sequence,
-            code_sequence,
-            abi_sequence,
+            code_sequence: code_sequence.into(),
+            abi_sequence: abi_sequence.into(),
         }
     }
 
@@ -69,8 +70,8 @@ impl fmt::Display for ActionReceipt {
             self.global_sequence,
             self.recv_sequence,
             self.auth_sequence,
-            self.code_sequence,
-            self.abi_sequence
+            self.code_sequence.0,
+            self.abi_sequence.0
         )
     }
 }
@@ -82,7 +83,7 @@ mod tests {
 
     #[test]
     fn test_action_receipt_digest() {
-        let mut auth_sequence = BTreeMap::new();
+        let mut auth_sequence = CanonicalMap::new();
         auth_sequence.insert(1, 100);
         auth_sequence.insert(2, 200);
 
@@ -99,7 +100,7 @@ mod tests {
         let digest = receipt.digest().unwrap();
         assert_eq!(
             digest.to_string(),
-            "aef915d3b57bc88c3a09423e051ca1084738e41c0d4c8d1d3f179aa0bec895b0"
+            "996c2ed9f0b7db4d18fb2830f96220bca626c463e5fd42e77f5718534b0820d6"
         );
     }
 }

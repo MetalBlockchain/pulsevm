@@ -9,14 +9,20 @@ use std::{
         Write,
     },
     path::Path,
+    str::FromStr,
     sync::{
         Arc,
         Mutex,
+        OnceLock,
     },
 };
 
 use pulsevm_error::ChainError;
 use pulsevm_name::Name;
+use sha2::{
+    Digest as Sha2Digest,
+    Sha256,
+};
 
 use crate::{
     Authority,
@@ -36,6 +42,73 @@ use crate::{
 /// `billable_size_v<permission_link_object>` = round_up_16(40 + 3*32) = 144
 /// (config.hpp / permission_link_object.hpp in the reference chain).
 const PERMISSION_LINK_OBJECT_BILLABLE: i64 = 144;
+
+/// Leap's builtin protocol-feature registry. These are the canonical feature
+/// digests (not the human-readable `description_digest` values returned by the
+/// producer API). Chainbase `protocol_state` rows and block extensions carry
+/// these canonical identifiers, so using description hashes here would make
+/// every imported feature appear inactive.
+#[derive(Clone, Copy)]
+struct ProtocolFeatureSpec {
+    dependencies: &'static [&'static str],
+    preactivation_required: bool,
+}
+
+const NO_PROTOCOL_FEATURE_DEPENDENCIES: &[&str] = &[];
+const NO_DUPLICATE_DEFERRED_ID_DEPENDENCIES: &[&str] =
+    &["ef43112c6543b88db2283a2e077278c315ae2c84719a8b25f25cc88565fbea99"];
+const DISABLE_DEFERRED_STAGE_2_DEPENDENCIES: &[&str] =
+    &["fce57d2331667353a0eac6b4209b67b843a7262a848af0a49a6e2fa9f6584eb4"];
+
+fn protocol_feature_spec(feature_digest: [u8; 32]) -> Option<ProtocolFeatureSpec> {
+    let digest = hex::encode(feature_digest);
+    let (dependencies, preactivation_required) = match digest.as_str() {
+        // PREACTIVATE_FEATURE is enabled by node configuration and may be
+        // activated directly by a block header without a prior request.
+        "0ec7e080177b2c02b278d5088611686b49d739925a92d9bfcacd7fc6b74053bd" => {
+            (NO_PROTOCOL_FEATURE_DEPENDENCIES, false)
+        }
+        "1a99a59d87e06e09ec5b028a9cbb7749b4a5ad8819004365d02dc4379a8b7241"
+        | "ef43112c6543b88db2283a2e077278c315ae2c84719a8b25f25cc88565fbea99"
+        | "e0fb64b1085cc5538970158d05a009c24e276fb94e1a0bf6a528b48fbc4ff526"
+        | "68dcaa34c0517d19666e6b33add67351d8c5f69e999ca1e37931bc410a297428"
+        | "ad9e3d8f650687709fd68f4b90b41f7d825a365b02c23a636cef88ac2ac00c43"
+        | "8ba52fe7a3956c5cd3a656a3174b931d3bb2abb45578befc59f283ecd816a405"
+        | "2652f5f96006294109b3dd0bbde63693f55324af452b799ee137a81a905eed25"
+        | "f0af56d2c5a48d60a4a5b5c903edfb7db3a736a94ed589d0b797df33ff9d3e1d"
+        | "4e7bf348da00a945489b2a681749eb56f5de00b900014e137ddae39f48f69d67"
+        | "4fca8bd82bbd181e714e283f83e1b45d95ca5af40fb89ad3977b653c448f78c2"
+        | "299dcb6af692324b899b39f16d5a530a33062804e41f09dc97e9f156b4476707"
+        | "c3a6138c5061cf291310887c0b5c71fcaffeab90d5deb50d3b9e687cead45071"
+        | "d528b9f6e9693f45ed277af93474fd473ce7d831dae2180cca35d907bd10cb40"
+        | "5443fcf88330c586bc0e5f3dee10e7f63c76c00249c87fe4fbf7f38c082006b4"
+        | "bcd2a26394b36614fd4894241d3c451ab0f6fd110958c3423073621a70826e99"
+        | "6bcb40a24e49c26d0a60513b6aeb8551d264e4717f306b81a37a5afb3b47cedc"
+        | "35c2186cc36f7bb4aeaf4487b36e57039ccf45a9136aa856a5d569ecca55ef2b"
+        | "63320dd4a58212e4d32d1f58926b73ca33a247326c2a5e9fd39268d2384e011a"
+        | "fce57d2331667353a0eac6b4209b67b843a7262a848af0a49a6e2fa9f6584eb4" => {
+            (NO_PROTOCOL_FEATURE_DEPENDENCIES, true)
+        }
+        "4a90c00d55454dc5b059055ca213579c6ea856967712a56017487886a4d4cc0f" => {
+            (NO_DUPLICATE_DEFERRED_ID_DEPENDENCIES, true)
+        }
+        "09e86cb0accf8d81c9e85d34bea4b925ae936626d00c984e4691186891f5bc16" => {
+            (DISABLE_DEFERRED_STAGE_2_DEPENDENCIES, true)
+        }
+        _ => return None,
+    };
+    Some(ProtocolFeatureSpec {
+        dependencies,
+        preactivation_required,
+    })
+}
+
+fn parse_protocol_feature_digest(hex_digest: &str) -> [u8; 32] {
+    hex::decode(hex_digest)
+        .expect("builtin protocol-feature dependency is valid hex")
+        .try_into()
+        .expect("builtin protocol-feature dependency is 32 bytes")
+}
 // The public `Database` methods use the shared pure-Rust time type.
 use pulsevm_chain_types::TimePoint;
 // These pure-Rust authority sub-types back the arena authority decoder.
@@ -111,7 +184,7 @@ fn chain_config_v0_from_params(p: &crate::backend::ChainConfigParams) -> ChainCo
         max_transaction_cpu_usage: p.max_transaction_cpu_usage,
         min_transaction_cpu_usage: p.min_transaction_cpu_usage,
         max_transaction_lifetime: p.max_transaction_lifetime,
-        deferred_trx_expiration_window: 0,
+        deferred_trx_expiration_window: p.deferred_trx_expiration_window,
         max_transaction_delay: p.max_transaction_delay,
         max_inline_action_size: p.max_inline_action_size,
         max_inline_action_depth: p.max_inline_action_depth,
@@ -135,6 +208,7 @@ fn chain_config_params_from_v0(cfg: &ChainConfigV0) -> crate::backend::ChainConf
         max_transaction_cpu_usage: cfg.max_transaction_cpu_usage,
         min_transaction_cpu_usage: cfg.min_transaction_cpu_usage,
         max_transaction_lifetime: cfg.max_transaction_lifetime,
+        deferred_trx_expiration_window: cfg.deferred_trx_expiration_window,
         max_transaction_delay: cfg.max_transaction_delay,
         max_inline_action_size: cfg.max_inline_action_size,
         max_inline_action_depth: cfg.max_inline_action_depth,
@@ -148,6 +222,50 @@ fn name_u64(s: &str) -> Result<u64, ChainError> {
     pulsevm_name::Name::from_str(s)
         .map(|n| n.as_u64())
         .map_err(|e| ChainError::InternalError(format!("bad name {s:?}: {e:?}")))
+}
+
+/// The system-account names derived from the configured root account.  Keeping
+/// these together prevents the execution and RPC paths from accidentally
+/// mixing `pulse.*` and `eosio.*` identities when importing an Antelope state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SystemAccountNames {
+    pub system: Name,
+    pub null: Name,
+    pub prods: Name,
+    pub any: Name,
+    pub code: Name,
+    pub token: Name,
+    pub ram: Name,
+    pub ramfee: Name,
+    pub rex: Name,
+    pub stake: Name,
+}
+
+impl SystemAccountNames {
+    pub fn new(system: Name) -> Result<Self, String> {
+        let suffix = |s: &str| {
+            Name::from_str(&format!("{system}.{s}"))
+                .map_err(|e| format!("invalid system account '{system}': {e}"))
+        };
+        Ok(Self {
+            system,
+            null: suffix("null")?,
+            prods: suffix("prods")?,
+            any: suffix("any")?,
+            code: suffix("code")?,
+            token: suffix("token")?,
+            ram: suffix("ram")?,
+            ramfee: suffix("ramfee")?,
+            rex: suffix("rex")?,
+            stake: suffix("stake")?,
+        })
+    }
+}
+
+impl Default for SystemAccountNames {
+    fn default() -> Self {
+        Self::new(Name::from_str("pulse").expect("pulse is a valid name")).unwrap()
+    }
 }
 
 /// The raw `symbol_code` form of a ticker: its ASCII bytes packed low byte first
@@ -472,6 +590,12 @@ pub struct Database {
     /// The pure-Rust arena (pulsevm_chaindb). The sole state backend, shared
     /// across clones so every apply/transaction context reaches the same handle.
     backend: crate::backend::ChainDatabase,
+    /// Immutable for the lifetime of a database handle. `OnceLock` lets the
+    /// controller select the identity once during bootstrap while keeping all
+    /// cloned apply contexts lock-free on the execution hot path.
+    system_accounts: Arc<OnceLock<SystemAccountNames>>,
+    native_system_contract: bool,
+    native_system_contract_locked: bool,
     /// Consensus activation records are kept beside the arena checkpoint. They
     /// are deterministic state derived from accepted upgrade heights and must
     /// survive restart even though they are not contract-table rows.
@@ -487,6 +611,35 @@ const SHARED_MEMORY_FILE: &str = "arena_snapshot.bin";
 /// survives a restart (including a state-synced node, whose block log does not
 /// start at genesis).
 const ARENA_STATE_FILE: &str = "arena_state.bin";
+const ARENA_METADATA_FILE: &str = "arena_metadata.json";
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct DatabaseMetadata {
+    system_account: String,
+    #[serde(default = "default_native_system_contract")]
+    native_system_contract: bool,
+}
+
+fn default_native_system_contract() -> bool {
+    true
+}
+
+fn load_database_metadata(path: &str) -> Result<Option<DatabaseMetadata>, String> {
+    if path.is_empty() {
+        return Ok(None);
+    }
+    let metadata_path = Path::new(path).join(ARENA_METADATA_FILE);
+    if !metadata_path.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(&metadata_path)
+        .map_err(|e| format!("read database metadata {}: {e}", metadata_path.display()))?;
+    let metadata: DatabaseMetadata = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("parse database metadata {}: {e}", metadata_path.display()))?;
+    Name::from_str(&metadata.system_account)
+        .map_err(|e| format!("invalid persisted system account: {e}"))?;
+    Ok(Some(metadata))
+}
 const PROTOCOL_RECORDS_FILE: &str = "protocol_records.json";
 
 /// Read until `buf` is full or EOF, so each snapshot chunk is a fixed,
@@ -510,6 +663,15 @@ impl Database {
     pub fn new(path: &str, _size: u64) -> Result<Self, String> {
         let backend =
             crate::backend::ChainDatabase::new().map_err(|e| format!("arena init: {e:?}"))?;
+        let system_accounts = Arc::new(OnceLock::new());
+        let metadata = load_database_metadata(path)?;
+        if let Some(metadata) = &metadata {
+            let system = Name::from_str(&metadata.system_account)
+                .map_err(|e| format!("invalid persisted system account: {e}"))?;
+            system_accounts
+                .set(SystemAccountNames::new(system)?)
+                .map_err(|_| "system-account configuration initialized twice".to_string())?;
+        }
         // Reload persisted state if this directory already holds a checkpoint (a
         // restart, or a state-synced node). A fresh directory starts empty and the
         // controller authors genesis.
@@ -528,8 +690,127 @@ impl Database {
         Ok(Database {
             path: path.to_string(),
             backend,
+            system_accounts,
+            native_system_contract: metadata
+                .as_ref()
+                .is_none_or(|metadata| metadata.native_system_contract),
+            native_system_contract_locked: metadata.is_some(),
             protocol_records: Arc::new(Mutex::new(protocol_records)),
         })
+    }
+
+    /// Set the system-account identity used by runtime helpers. This is node
+    /// configuration, not mutable chain state, and may only be set once for a
+    /// database. The identity is persisted beside the arena so reopening a
+    /// database with a different root is rejected.
+    pub fn set_system_account(&self, system: Name) -> Result<(), String> {
+        let names = SystemAccountNames::new(system)?;
+        if let Some(existing) = self.system_accounts.get() {
+            if *existing != names {
+                return Err(format!(
+                    "system account mismatch: database uses {}, requested {}",
+                    existing.system, names.system
+                ));
+            }
+        } else {
+            self.system_accounts
+                .set(names)
+                .map_err(|_| "system-account configuration initialized twice".to_string())?;
+        }
+        self.persist_database_metadata(names.system, self.native_system_contract)?;
+        Ok(())
+    }
+
+    pub fn system_accounts(&self) -> SystemAccountNames {
+        *self
+            .system_accounts
+            .get_or_init(SystemAccountNames::default)
+    }
+
+    pub fn set_native_system_contract(&mut self, enabled: bool) -> Result<(), String> {
+        if self.native_system_contract_locked && self.native_system_contract != enabled {
+            return Err(format!(
+                "native system contract mode mismatch: database uses {}, requested {}",
+                self.native_system_contract, enabled
+            ));
+        }
+        self.persist_database_metadata(self.system_accounts().system, enabled)?;
+        self.native_system_contract = enabled;
+        self.native_system_contract_locked = true;
+        Ok(())
+    }
+
+    pub fn native_system_contract(&self) -> bool {
+        self.native_system_contract
+    }
+
+    /// Verify that a restored, non-genesis state contains the configured root
+    /// account. This catches a common operator error where an XPR snapshot is
+    /// opened with the default `pulse` identity.
+    pub fn validate_system_account_state(&self) -> Result<(), ChainError> {
+        if self.revision() > 0 && !self.is_account(self.system_accounts().system.as_u64())? {
+            return Err(ChainError::InternalError(format!(
+                "restored state does not contain configured system account {}",
+                self.system_accounts().system
+            )));
+        }
+        Ok(())
+    }
+
+    /// Validate a snapshot against this database's configured system account
+    /// without replacing the live arena. State-sync callers use this before
+    /// dropping pending work, so a mismatched snapshot remains completely
+    /// non-destructive.
+    pub fn validate_snapshot_system_account(&self, snapshot: &[u8]) -> Result<(), ChainError> {
+        let (header, payload) = crate::snapshot::decode(snapshot)?;
+        if header.revision <= 0 {
+            return Ok(());
+        }
+        if self.path.is_empty() {
+            return Err(ChainError::InternalError(
+                "snapshot validation requires a persistent database path".into(),
+            ));
+        }
+        let dir = Path::new(&self.path);
+        fs::create_dir_all(dir).map_err(|e| {
+            ChainError::InternalError(format!("snapshot validation: create {}: {e}", self.path))
+        })?;
+        let staged = Self::stage_snapshot(dir, header, payload)?;
+        let candidate = crate::backend::ChainDatabase::new()
+            .map_err(|e| ChainError::InternalError(format!("snapshot validation: init: {e:?}")))?;
+        candidate
+            .load(staged.path())
+            .map_err(|e| ChainError::InternalError(format!("snapshot validation: load: {e:?}")))?;
+        let system = self.system_accounts().system.as_u64();
+        if !candidate.account_exists(system) {
+            return Err(ChainError::InternalError(format!(
+                "snapshot does not contain configured system account {}",
+                self.system_accounts().system
+            )));
+        }
+        Ok(())
+    }
+
+    fn persist_database_metadata(
+        &self,
+        system: Name,
+        native_system_contract: bool,
+    ) -> Result<(), String> {
+        if self.path.is_empty() {
+            return Ok(());
+        }
+        let dir = Path::new(&self.path);
+        fs::create_dir_all(dir).map_err(|e| format!("create database metadata directory: {e}"))?;
+        let metadata = serde_json::to_vec_pretty(&DatabaseMetadata {
+            system_account: system.to_string(),
+            native_system_contract,
+        })
+        .map_err(|e| format!("serialize database metadata: {e}"))?;
+        let tmp = dir.join(format!("{ARENA_METADATA_FILE}.tmp"));
+        fs::write(&tmp, metadata).map_err(|e| format!("write database metadata: {e}"))?;
+        fs::rename(&tmp, dir.join(ARENA_METADATA_FILE))
+            .map_err(|e| format!("install database metadata: {e}"))?;
+        Ok(())
     }
 
     fn persist_protocol_records(
@@ -591,7 +872,6 @@ impl Database {
         *current = records;
         self.persist_protocol_records(&current)
     }
-
     /// The arena database's account_metadata privileged flag for `name`, or
     /// `None` if the database has no such row — for diffing
     /// against chainbase's `find_account_metadata`.
@@ -1421,6 +1701,75 @@ impl Database {
         Some(self.backend.state_root())
     }
 
+    /// Canonical bytes used by the differential replay/fingerprint tools.
+    /// The order and names are part of the report format; do not derive them
+    /// from hash-map iteration.
+    pub fn arena_state_table_bytes(&self) -> Vec<(&'static str, Vec<u8>)> {
+        vec![
+            (
+                "account_metadata",
+                self.arena_account_metadata_state_bytes()
+                    .unwrap_or_default(),
+            ),
+            (
+                "account",
+                self.arena_account_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "permission",
+                self.arena_permission_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "permission_link",
+                self.arena_permission_link_state_bytes().unwrap_or_default(),
+            ),
+            ("code", self.arena_code_state_bytes().unwrap_or_default()),
+            (
+                "transaction",
+                self.arena_transaction_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "resource_usage",
+                self.arena_resource_usage_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "resource_limits",
+                self.arena_account_limits_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "resource_state",
+                self.arena_resource_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "dynamic_global_property",
+                self.arena_global_action_sequence()
+                    .unwrap_or(0)
+                    .to_le_bytes()
+                    .to_vec(),
+            ),
+            (
+                "global_property",
+                self.arena_global_property_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "resource_limits_config",
+                self.arena_resource_config_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "contract_table",
+                self.arena_contract_table_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "contract_key_value",
+                self.arena_contract_kv_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "protocol_state",
+                self.arena_protocol_state_bytes().unwrap_or_default(),
+            ),
+        ]
+    }
+
     /// Arena undo-session lifecycle, driven by the controller's block boundaries.
     pub fn arena_start_undo_session(&self) {
         self.backend.start_undo_session();
@@ -1445,6 +1794,8 @@ impl Database {
         let dir = Path::new(&self.path);
         fs::create_dir_all(dir)
             .map_err(|e| ChainError::InternalError(format!("close: create {}: {e}", self.path)))?;
+        self.persist_database_metadata(self.system_accounts().system, self.native_system_contract)
+            .map_err(ChainError::InternalError)?;
         self.backend
             .checkpoint(&dir.join(ARENA_STATE_FILE))
             .map_err(|e| ChainError::InternalError(format!("close: checkpoint: {e:?}")))
@@ -1459,7 +1810,11 @@ impl Database {
     /// reflects whatever is committed to the arena at that instant.
     pub fn snapshot_bytes(&self) -> Result<Vec<u8>, ChainError> {
         let revision = self.backend.revision();
-        let file = Path::new(&self.path).join(SHARED_MEMORY_FILE);
+        let dir = Path::new(&self.path);
+        fs::create_dir_all(dir).map_err(|e| {
+            ChainError::InternalError(format!("snapshot: create {}: {e}", dir.display()))
+        })?;
+        let file = dir.join(SHARED_MEMORY_FILE);
         self.backend
             .checkpoint(&file)
             .map_err(|e| ChainError::InternalError(format!("snapshot: checkpoint: {e:?}")))?;
@@ -1556,6 +1911,71 @@ impl Database {
         Ok(header)
     }
 
+    /// Replace the live arena from a snapshot envelope on disk. The envelope
+    /// and sparse payload are streamed into a staged chainbase file, avoiding
+    /// a second multi-gigabyte `Vec<u8>` during migration startup.
+    pub fn restore_from_path(
+        &self,
+        snapshot_path: &Path,
+    ) -> Result<crate::snapshot::SnapshotHeader, ChainError> {
+        let dir = Path::new(&self.path);
+        fs::create_dir_all(dir).map_err(|e| {
+            ChainError::InternalError(format!("restore: create {}: {e}", self.path))
+        })?;
+        let mut input = fs::File::open(snapshot_path).map_err(|e| {
+            ChainError::InternalError(format!(
+                "restore: open checkpoint {}: {e}",
+                snapshot_path.display()
+            ))
+        })?;
+        let file_len = input
+            .metadata()
+            .map_err(|e| ChainError::InternalError(format!("restore: stat checkpoint: {e}")))?
+            .len();
+        if file_len < crate::snapshot::HEADER_LEN as u64 {
+            return Err(ChainError::InternalError(
+                "restore: checkpoint is shorter than its envelope header".into(),
+            ));
+        }
+        let mut header_bytes = vec![0u8; crate::snapshot::HEADER_LEN];
+        input.read_exact(&mut header_bytes).map_err(|e| {
+            ChainError::InternalError(format!("restore: read checkpoint header: {e}"))
+        })?;
+        let header = crate::snapshot::peek_header(&header_bytes)?;
+        let expected_len = (crate::snapshot::HEADER_LEN as u64)
+            .checked_add(header.payload_len)
+            .ok_or_else(|| {
+                ChainError::InternalError("restore: checkpoint length overflow".into())
+            })?;
+        if file_len != expected_len {
+            return Err(ChainError::InternalError(format!(
+                "restore: checkpoint length {file_len} does not match envelope {expected_len}"
+            )));
+        }
+
+        let staged = Self::stage_snapshot_stream(&mut input, header, dir)?;
+        let candidate = crate::backend::ChainDatabase::new()
+            .map_err(|e| ChainError::InternalError(format!("restore: arena init: {e:?}")))?;
+        candidate
+            .load(staged.path())
+            .map_err(|e| ChainError::InternalError(format!("restore: invalid arena: {e:?}")))?;
+        if candidate.revision() != header.revision {
+            return Err(ChainError::InternalError(format!(
+                "snapshot payload revision {} does not match envelope revision {}",
+                candidate.revision(),
+                header.revision
+            )));
+        }
+        let dest = dir.join(ARENA_STATE_FILE);
+        staged.persist(&dest).map_err(|e| {
+            ChainError::InternalError(format!("restore: install {}: {}", dest.display(), e.error))
+        })?;
+        self.backend
+            .reload_from(&dest)
+            .map_err(|e| ChainError::InternalError(format!("restore: reload: {e:?}")))?;
+        Ok(header)
+    }
+
     /// Expand and fully load a snapshot checkpoint before it is allowed to
     /// replace durable state. Loading catches malformed arena sections and the
     /// revision comparison prevents an envelope from claiming a different
@@ -1581,6 +2001,96 @@ impl Database {
                 header.revision
             )));
         }
+        Ok(staged)
+    }
+
+    fn stage_snapshot_stream(
+        input: &mut fs::File,
+        header: crate::snapshot::SnapshotHeader,
+        dir: &Path,
+    ) -> Result<tempfile::NamedTempFile, ChainError> {
+        let staged = tempfile::NamedTempFile::new_in(dir)
+            .map_err(|e| ChainError::InternalError(format!("restore: stage: {e}")))?;
+        let mut output = staged.as_file();
+        let mut hasher = Sha256::new();
+        let mut payload_read = 0u64;
+        let mut read_payload = |buf: &mut [u8], payload_read: &mut u64| -> Result<(), ChainError> {
+            input.read_exact(buf).map_err(|e| {
+                ChainError::InternalError(format!("restore: read sparse payload: {e}"))
+            })?;
+            hasher.update(&*buf);
+            *payload_read = (*payload_read)
+                .checked_add(buf.len() as u64)
+                .ok_or_else(|| {
+                    ChainError::InternalError("restore: payload length overflow".into())
+                })?;
+            if *payload_read > header.payload_len {
+                return Err(ChainError::InternalError(
+                    "restore: sparse payload exceeds envelope length".into(),
+                ));
+            }
+            Ok(())
+        };
+
+        let mut logical_len_bytes = [0u8; 8];
+        read_payload(&mut logical_len_bytes, &mut payload_read)?;
+        let logical_len = u64::from_le_bytes(logical_len_bytes);
+        let mut previous_end = 0u64;
+        while payload_read < header.payload_len {
+            let remaining = header.payload_len - payload_read;
+            if remaining < 16 {
+                return Err(ChainError::InternalError(
+                    "restore: sparse run header is truncated".into(),
+                ));
+            }
+            let mut run_header = [0u8; 16];
+            read_payload(&mut run_header, &mut payload_read)?;
+            let offset = u64::from_le_bytes(run_header[..8].try_into().unwrap());
+            let len = u64::from_le_bytes(run_header[8..].try_into().unwrap());
+            if len == 0 {
+                return Err(ChainError::InternalError(
+                    "restore: sparse run has zero length".into(),
+                ));
+            }
+            let end = offset
+                .checked_add(len)
+                .ok_or_else(|| ChainError::InternalError("restore: sparse run overflows".into()))?;
+            if offset < previous_end || end > logical_len {
+                return Err(ChainError::InternalError(
+                    "restore: sparse run is out of order or out of bounds".into(),
+                ));
+            }
+            output.seek(SeekFrom::Start(offset)).map_err(|e| {
+                ChainError::InternalError(format!("restore: seek staged arena: {e}"))
+            })?;
+            let mut remaining_run = len;
+            let mut buffer = vec![0u8; 4 * 1024 * 1024];
+            while remaining_run != 0 {
+                let chunk = remaining_run.min(buffer.len() as u64) as usize;
+                read_payload(&mut buffer[..chunk], &mut payload_read)?;
+                output.write_all(&buffer[..chunk]).map_err(|e| {
+                    ChainError::InternalError(format!("restore: write staged arena: {e}"))
+                })?;
+                remaining_run -= chunk as u64;
+            }
+            previous_end = end;
+        }
+        if payload_read != header.payload_len {
+            return Err(ChainError::InternalError(
+                "restore: sparse payload length mismatch".into(),
+            ));
+        }
+        if hasher.finalize().as_slice() != header.payload_sha256 {
+            return Err(ChainError::InternalError(
+                "restore: snapshot payload checksum mismatch".into(),
+            ));
+        }
+        output
+            .set_len(logical_len)
+            .map_err(|e| ChainError::InternalError(format!("restore: size staged arena: {e}")))?;
+        output
+            .sync_all()
+            .map_err(|e| ChainError::InternalError(format!("restore: sync staged arena: {e}")))?;
         Ok(staged)
     }
 
@@ -1615,7 +2125,20 @@ impl Database {
     ) -> Result<(), ChainError> {
         // Genesis is authored directly on the arena, reproducing C++
         // `initialize_database` without a chainbase bootstrap.
-        self.initialize_genesis_arena(genesis)
+        let names = self.system_accounts();
+        self.persist_database_metadata(names.system, self.native_system_contract)
+            .map_err(ChainError::GenesisError)?;
+        self.initialize_genesis_arena(genesis, names)
+    }
+
+    pub fn initialize_database_with_system_account(
+        &mut self,
+        genesis: &pulsevm_chain_types::GenesisState,
+        system: Name,
+    ) -> Result<(), ChainError> {
+        self.set_system_account(system)
+            .map_err(ChainError::GenesisError)?;
+        self.initialize_genesis_arena(genesis, self.system_accounts())
     }
 
     /// Author the entire genesis state directly on the arena, reproducing C++
@@ -1625,6 +2148,7 @@ impl Database {
     fn initialize_genesis_arena(
         &self,
         genesis: &pulsevm_chain_types::GenesisState,
+        names: SystemAccountNames,
     ) -> Result<(), ChainError> {
         use crate::backend::ElasticParams;
 
@@ -1638,9 +2162,6 @@ impl Database {
         let creation_slot: u32 = (((ts_us / 1000) - 946_684_800_000i64) / 500i64).max(0) as u32;
 
         // Genesis account / permission names (config.hpp), as name-encoded u64.
-        const PULSE: u64 = 12_584_048_018_849_792_000;
-        const PULSE_NULL: u64 = 12_584_048_029_495_738_368;
-        const PULSE_PRODS: u64 = 12_584_048_030_520_602_624;
         const OWNER: u64 = 12_044_502_819_693_133_824;
         const ACTIVE: u64 = 3_617_214_756_542_218_240;
         const PROD_MAJOR: u64 = 12_531_424_605_554_196_480;
@@ -1677,14 +2198,15 @@ impl Database {
             .map_err(|e| ChainError::InternalError(format!("genesis resource_state: {e:?}")))?;
 
         // 4. native accounts. system_auth carries the genesis key; the producers' active authority
-        //    delegates to pulse/active.
+        //    delegates to the configured system account's active permission.
         let key_bytes = genesis.initial_key_packed().to_vec();
         let system_auth = build_auth_blob(1, &[(key_bytes, 1)], &[], &[]);
         let empty_auth = build_auth_blob(1, &[], &[], &[]);
-        let active_producers_auth = build_auth_blob(1, &[], &[(PULSE, ACTIVE, 1)], &[]);
+        let active_producers_auth =
+            build_auth_blob(1, &[], &[(names.system.as_u64(), ACTIVE, 1)], &[]);
 
         self.genesis_native_account(
-            PULSE,
+            names.system.as_u64(),
             &system_auth,
             &system_auth,
             true,
@@ -1695,7 +2217,7 @@ impl Database {
             ACTIVE,
         )?;
         self.genesis_native_account(
-            PULSE_NULL,
+            names.null.as_u64(),
             &empty_auth,
             &empty_auth,
             false,
@@ -1707,7 +2229,7 @@ impl Database {
         )?;
         // The producers account's active permission is the parent of prod.major.
         let prods_active_id = self.genesis_native_account(
-            PULSE_PRODS,
+            names.prods.as_u64(),
             &empty_auth,
             &active_producers_auth,
             false,
@@ -1721,14 +2243,14 @@ impl Database {
         // 5. prod.major (parent = producers active) then prod.minor (parent = prod.major), both
         //    carrying the active-producers authority.
         let major_id = self.genesis_permission(
-            PULSE_PRODS,
+            names.prods.as_u64(),
             PROD_MAJOR,
             prods_active_id,
             &active_producers_auth,
             ts_us,
         )?;
         self.genesis_permission(
-            PULSE_PRODS,
+            names.prods.as_u64(),
             PROD_MINOR,
             major_id,
             &active_producers_auth,
@@ -1883,6 +2405,403 @@ impl Database {
         return s
             .update_account_abi(account_name, abi)
             .map_err(|e| ChainError::InternalError(format!("arena update_account_abi: {e:?}")));
+    }
+
+    /// Install an ABI while hydrating a state-history full snapshot. Unlike the
+    /// live `setabi` path this must not fabricate an `abi_sequence` increment:
+    /// SHiP's account row already represents the stored ABI at the source head.
+    pub(crate) fn xpr_import_set_account_abi_raw(
+        &self,
+        account_name: u64,
+        abi: &[u8],
+    ) -> Result<(), ChainError> {
+        self.backend
+            .set_account_abi_raw(account_name, abi)
+            .map_err(|e| {
+                ChainError::InternalError(format!("XPR import account ABI {account_name}: {e:?}"))
+            })
+    }
+
+    /// Create account metadata from the fields XPR's state-history format
+    /// actually exposes. Account/authority sequence numbers are absent from
+    /// that source format and are therefore initialized to zero by the backend.
+    pub(crate) fn xpr_import_account_metadata(
+        &self,
+        name: u64,
+        privileged: bool,
+        last_code_update: i64,
+        code_hash: [u8; 32],
+        vm_type: u8,
+        vm_version: u8,
+    ) -> Result<(), ChainError> {
+        self.backend
+            .xpr_import_account_metadata(
+                name,
+                privileged,
+                last_code_update,
+                code_hash,
+                vm_type,
+                vm_version,
+            )
+            .map_err(|e| {
+                ChainError::InternalError(format!("XPR import account metadata {name}: {e:?}"))
+            })
+    }
+
+    pub(crate) fn xpr_import_update_account_metadata(
+        &self,
+        name: u64,
+        recv_sequence: u64,
+        auth_sequence: u64,
+        code_sequence: u64,
+        abi_sequence: u64,
+    ) -> Result<(), ChainError> {
+        self.backend
+            .xpr_import_update_account_metadata(
+                name,
+                recv_sequence,
+                auth_sequence,
+                code_sequence,
+                abi_sequence,
+            )
+            .map_err(|e| {
+                ChainError::InternalError(format!(
+                    "XPR import account metadata sidecar {name}: {e:?}"
+                ))
+            })
+    }
+
+    pub(crate) fn xpr_import_update_account_metadata_source(
+        &self,
+        name: u64,
+        privileged: bool,
+        last_code_update: i64,
+        code_hash: [u8; 32],
+        vm_type: u8,
+        vm_version: u8,
+    ) -> Result<(), ChainError> {
+        self.backend
+            .xpr_import_update_account_metadata_source(
+                name,
+                privileged,
+                last_code_update,
+                code_hash,
+                vm_type,
+                vm_version,
+            )
+            .map_err(|e| {
+                ChainError::InternalError(format!("XPR import account metadata delta: {e:?}"))
+            })
+    }
+
+    /// Insert a code image and its derived source reference count while
+    /// hydrating XPR state history.
+    pub(crate) fn xpr_import_code(
+        &self,
+        code_hash: [u8; 32],
+        code: &[u8],
+        code_ref_count: u64,
+        vm_type: u8,
+        vm_version: u8,
+    ) -> Result<(), ChainError> {
+        self.backend
+            .xpr_import_code(code_hash, code, code_ref_count, vm_type, vm_version)
+            .map_err(|e| ChainError::InternalError(format!("XPR import code: {e:?}")))
+    }
+
+    pub(crate) fn xpr_import_update_code(
+        &self,
+        code_hash: [u8; 32],
+        code: &[u8],
+        vm_type: u8,
+        vm_version: u8,
+    ) -> Result<(), ChainError> {
+        self.backend
+            .xpr_import_update_code(code_hash, code, vm_type, vm_version)
+            .map_err(|e| ChainError::InternalError(format!("XPR import code delta: {e:?}")))
+    }
+
+    pub(crate) fn xpr_import_remove_code(
+        &self,
+        code_hash: [u8; 32],
+        vm_type: u8,
+        vm_version: u8,
+    ) -> Result<bool, ChainError> {
+        self.backend
+            .xpr_import_remove_code(code_hash, vm_type, vm_version)
+            .map_err(|e| ChainError::InternalError(format!("XPR remove code delta: {e:?}")))
+    }
+
+    pub(crate) fn xpr_import_update_code_metadata(
+        &self,
+        code_hash: [u8; 32],
+        vm_type: u8,
+        vm_version: u8,
+        code_ref_count: u64,
+        first_block_used: u32,
+    ) -> Result<(), ChainError> {
+        self.backend
+            .xpr_import_update_code_metadata(
+                code_hash,
+                vm_type,
+                vm_version,
+                code_ref_count,
+                first_block_used,
+            )
+            .map_err(|e| ChainError::InternalError(format!("XPR import code sidecar: {e:?}")))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn xpr_import_deferred_transaction(
+        &self,
+        sender: u64,
+        sender_id: u128,
+        payer: u64,
+        trx_id: [u8; 32],
+        delay_until: i64,
+        expiration: i64,
+        published: i64,
+        packed_trx: &[u8],
+    ) -> Result<(), ChainError> {
+        self.backend
+            .xpr_import_deferred_transaction(
+                sender,
+                sender_id,
+                payer,
+                trx_id,
+                delay_until,
+                expiration,
+                published,
+                packed_trx,
+            )
+            .map_err(|e| {
+                ChainError::InternalError(format!("XPR import deferred transaction: {e:?}"))
+            })
+    }
+
+    /// Pending migrated deferred transaction count. Controllers must only
+    /// allow these to boot after their scheduler/executor is available.
+    pub fn deferred_transaction_count(&self) -> usize {
+        self.backend.deferred_transaction_count()
+    }
+
+    pub fn arena_deferred_transaction(
+        &self,
+        trx_id: [u8; 32],
+    ) -> Option<crate::backend::DeferredTransaction> {
+        self.backend.deferred_transaction(trx_id)
+    }
+
+    pub fn arena_deferred_transaction_by_sender_id(
+        &self,
+        sender: u64,
+        sender_id: u128,
+    ) -> Option<crate::backend::DeferredTransaction> {
+        self.backend
+            .deferred_transaction_by_sender_id(sender, sender_id)
+    }
+
+    pub fn arena_due_deferred_transactions(
+        &self,
+        now_micros: i64,
+    ) -> Vec<crate::backend::DeferredTransaction> {
+        self.backend.due_deferred_transactions(now_micros)
+    }
+
+    pub fn arena_deferred_transactions(&self) -> Vec<crate::backend::DeferredTransaction> {
+        self.backend.deferred_transactions()
+    }
+
+    pub fn arena_remove_deferred_transaction(&self, trx_id: [u8; 32]) -> Result<bool, ChainError> {
+        self.backend
+            .remove_deferred_transaction(trx_id)
+            .map_err(|e| {
+                ChainError::InternalError(format!("arena remove deferred transaction: {e:?}"))
+            })
+    }
+
+    pub fn arena_remove_deferred_transaction_by_sender_id(
+        &self,
+        sender: u64,
+        sender_id: u128,
+    ) -> Result<Option<crate::backend::DeferredTransaction>, ChainError> {
+        self.backend
+            .remove_deferred_transaction_by_sender_id(sender, sender_id)
+            .map_err(|e| {
+                ChainError::InternalError(format!(
+                    "arena remove deferred transaction by sender id: {e:?}"
+                ))
+            })
+    }
+
+    pub(crate) fn xpr_import_permission(
+        &self,
+        parent: i64,
+        owner: u64,
+        name: u64,
+        last_updated: i64,
+        authority: &[u8],
+    ) -> Result<i64, ChainError> {
+        let id = self.backend.next_permission_id().map_err(|e| {
+            ChainError::InternalError(format!("XPR import next permission id: {e:?}"))
+        })?;
+        self.backend
+            .create_permission(id, parent, owner, name, last_updated, authority)
+            .map_err(|e| ChainError::InternalError(format!("XPR import permission: {e:?}")))?;
+        Ok(id)
+    }
+
+    pub(crate) fn xpr_import_upsert_permission(
+        &self,
+        parent_name: u64,
+        owner: u64,
+        name: u64,
+        last_updated: i64,
+        authority: &[u8],
+    ) -> Result<(), ChainError> {
+        let parent = if parent_name == 0 {
+            0
+        } else {
+            self.backend
+                .permission(owner, parent_name)
+                .map(|(id, _)| id)
+                .ok_or_else(|| {
+                    ChainError::InternalError(format!(
+                        "XPR import permission parent {parent_name} is missing"
+                    ))
+                })?
+        };
+        if self.backend.permission(owner, name).is_some() {
+            self.backend
+                .modify_permission(owner, name, authority, last_updated)
+                .map_err(|e| {
+                    ChainError::InternalError(format!("XPR import permission delta: {e:?}"))
+                })
+        } else {
+            let id = self.backend.next_permission_id().map_err(|e| {
+                ChainError::InternalError(format!("XPR import next permission id: {e:?}"))
+            })?;
+            self.backend
+                .create_permission(id, parent, owner, name, last_updated, authority)
+                .map_err(|e| {
+                    ChainError::InternalError(format!("XPR import permission delta: {e:?}"))
+                })
+        }
+    }
+
+    pub(crate) fn xpr_import_remove_permission(
+        &self,
+        owner: u64,
+        name: u64,
+    ) -> Result<(), ChainError> {
+        self.backend
+            .remove_permission(owner, name)
+            .map_err(|e| ChainError::InternalError(format!("XPR remove permission delta: {e:?}")))
+    }
+
+    pub(crate) fn xpr_import_permission_last_used(
+        &self,
+        owner: u64,
+        name: u64,
+        last_used: i64,
+    ) -> Result<(), ChainError> {
+        self.backend
+            .xpr_import_permission_last_used(owner, name, last_used)
+            .map_err(|e| ChainError::InternalError(format!("XPR import permission sidecar: {e:?}")))
+    }
+
+    pub(crate) fn xpr_import_permission_link(
+        &self,
+        account: u64,
+        code: u64,
+        message_type: u64,
+        required_permission: u64,
+    ) -> Result<(), ChainError> {
+        self.backend
+            .link_auth(account, code, message_type, required_permission)
+            .map_err(|e| ChainError::InternalError(format!("XPR import permission link: {e:?}")))
+    }
+
+    pub(crate) fn xpr_import_resource_limits(
+        &self,
+        owner: u64,
+        net_weight: i64,
+        cpu_weight: i64,
+        ram_bytes: i64,
+    ) -> Result<(), ChainError> {
+        let mut row = Vec::with_capacity(33);
+        row.push(0); // committed, not pending
+        row.extend_from_slice(&owner.to_le_bytes());
+        row.extend_from_slice(&ram_bytes.to_le_bytes());
+        row.extend_from_slice(&net_weight.to_le_bytes());
+        row.extend_from_slice(&cpu_weight.to_le_bytes());
+        self.backend
+            .hydrate_account_limits(&row)
+            .map_err(|e| ChainError::InternalError(format!("XPR import resource limits: {e:?}")))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn xpr_import_resource_usage(
+        &self,
+        owner: u64,
+        ram_usage: u64,
+        net_value_ex: u64,
+        net_consumed: u64,
+        net_last_ordinal: u32,
+        cpu_value_ex: u64,
+        cpu_consumed: u64,
+        cpu_last_ordinal: u32,
+    ) -> Result<(), ChainError> {
+        let mut row = Vec::with_capacity(56);
+        row.extend_from_slice(&owner.to_le_bytes());
+        row.extend_from_slice(&ram_usage.to_le_bytes());
+        for (value_ex, consumed, last_ordinal) in [
+            (net_value_ex, net_consumed, net_last_ordinal),
+            (cpu_value_ex, cpu_consumed, cpu_last_ordinal),
+        ] {
+            row.extend_from_slice(&value_ex.to_le_bytes());
+            row.extend_from_slice(&consumed.to_le_bytes());
+            row.extend_from_slice(&last_ordinal.to_le_bytes());
+        }
+        self.backend
+            .hydrate_resource_usage(&row)
+            .map_err(|e| ChainError::InternalError(format!("XPR import resource usage: {e:?}")))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn xpr_import_resource_state(
+        &self,
+        net: (u64, u64, u32),
+        cpu: (u64, u64, u32),
+        total_net_weight: u64,
+        total_cpu_weight: u64,
+        total_ram_bytes: u64,
+        virtual_net_limit: u64,
+        virtual_cpu_limit: u64,
+    ) -> Result<(), ChainError> {
+        self.backend
+            .hydrate_resource_state(
+                net,
+                cpu,
+                total_net_weight,
+                total_cpu_weight,
+                total_ram_bytes,
+                virtual_net_limit,
+                virtual_cpu_limit,
+            )
+            .map_err(|e| ChainError::InternalError(format!("XPR import resource state: {e:?}")))
+    }
+
+    pub(crate) fn xpr_import_resource_config(
+        &self,
+        cpu: crate::backend::ElasticParams,
+        net: crate::backend::ElasticParams,
+        cpu_window: u32,
+        net_window: u32,
+    ) -> Result<(), ChainError> {
+        self.backend
+            .seed_resource_config(cpu, net, cpu_window, net_window)
+            .map_err(|e| ChainError::InternalError(format!("XPR import resource config: {e:?}")))
     }
 
     pub fn initialize_account_resource_limits(
@@ -2236,6 +3155,32 @@ impl Database {
     /// is removed, or `None` if the table is absent.
     pub fn arena_table_payer(&self, code: u64, scope: u64, table: u64) -> Option<u64> {
         self.backend.table_payer(code, scope, table)
+    }
+
+    /// Create an empty contract table while hydrating a state-history full
+    /// snapshot. Contract tables with no children are valid chainbase state and
+    /// cannot be reconstructed by the lazy child-store paths.
+    pub(crate) fn xpr_import_create_contract_table(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        payer: u64,
+    ) -> Result<(), ChainError> {
+        self.backend
+            .create_table(code, scope, table, payer)
+            .map_err(|e| ChainError::InternalError(format!("XPR import contract table: {e:?}")))
+    }
+
+    pub(crate) fn xpr_import_remove_contract_table(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+    ) -> Result<(), ChainError> {
+        self.backend
+            .remove_table(code, scope, table)
+            .map_err(|e| ChainError::InternalError(format!("XPR remove contract table: {e:?}")))
     }
 
     /// The `(payer, value)` of a contract row from the arena, or `None`.
@@ -2611,6 +3556,14 @@ impl Database {
             });
     }
 
+    /// The full code metadata tuple exposed by Leap's `get_code_hash` intrinsic.
+    pub fn account_code_info(&self, name: u64) -> Result<(u64, [u8; 32], u8, u8), ChainError> {
+        let s = &self.backend;
+        Ok(s.account_metadata(name)
+            .map(|t| (t.3, t.5, t.6, t.7))
+            .unwrap_or((0, [0; 32], 0, 0)))
+    }
+
     /// The byte size of the account's stored ABI — what setabi bills RAM against.
     /// A plain length read from the account row.
     pub fn account_abi_size(&self, name: u64) -> Result<usize, ChainError> {
@@ -2712,6 +3665,113 @@ impl Database {
         } else {
             0
         })
+    }
+
+    /// Retain the source protocol-feature vector in Arena so its SHiP
+    /// `protocol_state` row remains lossless during XPR migration.
+    pub(crate) fn xpr_import_protocol_features(
+        &self,
+        features: &[([u8; 32], u32)],
+    ) -> Result<(), ChainError> {
+        self.backend
+            .xpr_import_protocol_features(features)
+            .map_err(|e| ChainError::InternalError(format!("XPR import protocol state: {e:?}")))
+    }
+
+    /// Ordered protocol features waiting for a block-header activation.
+    pub fn preactivated_protocol_features(&self) -> Vec<[u8; 32]> {
+        self.backend.preactivated_protocol_features()
+    }
+
+    /// Queue a feature from the privileged `preactivate_feature` intrinsic.
+    pub fn preactivate_protocol_feature(&self, feature_digest: [u8; 32]) -> Result<(), ChainError> {
+        let spec = protocol_feature_spec(feature_digest).ok_or_else(|| {
+            ChainError::InternalError(format!(
+                "unrecognized protocol feature {}",
+                hex::encode(feature_digest)
+            ))
+        })?;
+        if !spec.preactivation_required {
+            return Err(ChainError::InternalError(format!(
+                "protocol feature {} does not support preactivation",
+                hex::encode(feature_digest)
+            )));
+        }
+        let queued = self.preactivated_protocol_features();
+        for dependency in spec.dependencies {
+            let dependency_digest = parse_protocol_feature_digest(dependency);
+            if !self.protocol_feature_activated(dependency_digest)
+                && !queued.contains(&dependency_digest)
+            {
+                return Err(ChainError::InternalError(format!(
+                    "protocol feature {} requires dependency {}",
+                    hex::encode(feature_digest),
+                    dependency
+                )));
+            }
+        }
+        self.backend
+            .preactivate_protocol_feature(feature_digest)
+            .map_err(|e| ChainError::InternalError(format!("arena preactivate feature: {e:?}")))
+    }
+
+    /// Apply a block's protocol-feature activation extension atomically.
+    pub fn activate_protocol_features(
+        &self,
+        feature_digests: &[[u8; 32]],
+        activation_block_num: u32,
+    ) -> Result<(), ChainError> {
+        let queued = self.preactivated_protocol_features();
+        if queued
+            .iter()
+            .any(|digest| !feature_digests.contains(digest))
+        {
+            return Err(ChainError::BlockError(
+                "protocol feature activation must include the complete preactivation queue"
+                    .to_string(),
+            ));
+        }
+        for (index, feature_digest) in feature_digests.iter().enumerate() {
+            let spec = protocol_feature_spec(*feature_digest).ok_or_else(|| {
+                ChainError::BlockError(format!(
+                    "unrecognized protocol feature {}",
+                    hex::encode(feature_digest)
+                ))
+            })?;
+            if feature_digests[..index].contains(feature_digest) {
+                return Err(ChainError::BlockError(format!(
+                    "protocol feature activation contains duplicate {}",
+                    hex::encode(feature_digest)
+                )));
+            }
+            if self.protocol_feature_activated(*feature_digest) {
+                return Err(ChainError::BlockError(format!(
+                    "protocol feature {} is already activated",
+                    hex::encode(feature_digest)
+                )));
+            }
+            if spec.preactivation_required && !queued.contains(feature_digest) {
+                return Err(ChainError::BlockError(format!(
+                    "protocol feature {} requires prior preactivation",
+                    hex::encode(feature_digest)
+                )));
+            }
+            for dependency in spec.dependencies {
+                let dependency_digest = parse_protocol_feature_digest(dependency);
+                let active = self.protocol_feature_activated(dependency_digest);
+                let earlier_in_block = feature_digests[..index].contains(&dependency_digest);
+                if !active && !earlier_in_block {
+                    return Err(ChainError::BlockError(format!(
+                        "protocol feature {} requires dependency {} to be active earlier",
+                        hex::encode(feature_digest),
+                        dependency
+                    )));
+                }
+            }
+        }
+        self.backend
+            .activate_protocol_features(feature_digests, activation_block_num)
+            .map_err(|e| ChainError::BlockError(format!("protocol feature activation: {e:?}")))
     }
 
     /// The wasm image for `(code_hash, vm_type, vm_version)` as owned bytes.
@@ -2846,6 +3906,28 @@ impl Database {
             .map_err(|e| ChainError::InternalError(format!("arena set_global_properties: {e:?}")))
     }
 
+    pub fn set_proposed_schedule(
+        &self,
+        block_num: u32,
+        packed_schedule: &[u8],
+    ) -> Result<(), ChainError> {
+        self.backend
+            .set_proposed_schedule(block_num, packed_schedule)
+            .map_err(|error| {
+                ChainError::InternalError(format!("arena set_proposed_schedule: {error:?}"))
+            })
+    }
+
+    pub fn proposed_schedule(&self) -> Option<(u32, Vec<u8>)> {
+        self.backend.proposed_schedule()
+    }
+
+    pub fn clear_proposed_schedule(&self) -> Result<(), ChainError> {
+        self.backend.clear_proposed_schedule().map_err(|error| {
+            ChainError::InternalError(format!("arena clear_proposed_schedule: {error:?}"))
+        })
+    }
+
     /// `max_action_return_value_size` — a genesis build constant (256) that
     /// `setparams` never carries, so the arena database does not store it and
     /// serves the build constant directly.
@@ -2867,6 +3949,14 @@ impl Database {
     /// the requested state is absent.
     pub fn arena_global_property_state_bytes(&self) -> Option<Vec<u8>> {
         Some(self.backend.global_property_state_bytes())
+    }
+
+    pub fn arena_protocol_state_bytes(&self) -> Option<Vec<u8>> {
+        Some(self.backend.protocol_state_bytes())
+    }
+
+    pub fn protocol_feature_activated(&self, feature_digest: [u8; 32]) -> bool {
+        self.backend.protocol_feature_activated(feature_digest)
     }
 
     pub fn get_virtual_block_cpu_limit(&self) -> Result<u64, ChainError> {
@@ -3369,7 +4459,7 @@ impl Database {
                 None => self.extract_core_symbol(),
             };
         let core_liquid_balance = core_symbol_packed.and_then(|sym| {
-            let token = name_u64("pulse.token").ok()?;
+            let token = self.system_accounts().token.as_u64();
             let accounts = name_u64("accounts").ok()?;
             let row = self.arena_kv_get(token, account, accounts, sym >> 8)?;
             if row.len() < 16 || u64::from_le_bytes(row[8..16].try_into().ok()?) != sym {
@@ -3380,7 +4470,7 @@ impl Database {
         });
 
         // System-contract sub-objects, decoded against the system contract's ABI.
-        let system = name_u64("pulse")?;
+        let system = self.system_accounts().system.as_u64();
         let system_abi = self
             .arena_account_abi_bytes(system)
             .and_then(|b| pulsevm_abi::Abi::from_bytes(&b).ok());
@@ -3427,8 +4517,7 @@ impl Database {
                 last_usage_update_time: BLOCK_TIMESTAMP_EPOCH_MICROS,
                 current_used: 0,
             },
-            eosio_any_linked_actions: name_u64("pulse.any")
-                .ok()
+            eosio_any_linked_actions: Some(self.system_accounts().any.as_u64())
                 .and_then(|any| links_by_permission.remove(&any))
                 .unwrap_or_default(),
         };
@@ -3439,7 +4528,7 @@ impl Database {
     /// The system contract's core symbol (precision in the low byte, code above),
     /// read from its `rammarket` `RAMCORE` row. `None` if the market is absent.
     fn extract_core_symbol(&self) -> Option<u64> {
-        let system = name_u64("pulse").ok()?;
+        let system = self.system_accounts().system.as_u64();
         let rammarket = name_u64("rammarket").ok()?;
         // The RAMCORE row's primary key is string_to_symbol(4, "RAMCORE").
         let pk = (symbol_code_from_str("RAMCORE") << 8) | 4;
@@ -3471,6 +4560,119 @@ mod tests {
         let mut db = Database::new(path, 1024 * 1024 * 1024).unwrap();
         let _name = Name::from_str("test").unwrap();
         db.add_indices().unwrap();
+    }
+
+    #[test]
+    fn protocol_feature_registry_enforces_dependencies_and_queue_order() {
+        let db = Database::default();
+        let unknown = [0xa5; 32];
+        assert!(matches!(
+            db.preactivate_protocol_feature(unknown),
+            Err(ChainError::InternalError(message)) if message.contains("unrecognized protocol feature")
+        ));
+
+        let replace_deferred = parse_protocol_feature_digest(
+            "ef43112c6543b88db2283a2e077278c315ae2c84719a8b25f25cc88565fbea99",
+        );
+        let no_duplicate_deferred_id = parse_protocol_feature_digest(
+            "4a90c00d55454dc5b059055ca213579c6ea856967712a56017487886a4d4cc0f",
+        );
+        let preactivate_feature = parse_protocol_feature_digest(
+            "0ec7e080177b2c02b278d5088611686b49d739925a92d9bfcacd7fc6b74053bd",
+        );
+        db.activate_protocol_features(&[preactivate_feature], 1)
+            .unwrap();
+        assert!(db.protocol_feature_activated(preactivate_feature));
+        assert!(
+            db.preactivate_protocol_feature(no_duplicate_deferred_id)
+                .is_err()
+        );
+        db.preactivate_protocol_feature(replace_deferred).unwrap();
+        db.preactivate_protocol_feature(no_duplicate_deferred_id)
+            .unwrap();
+
+        assert!(
+            db.activate_protocol_features(&[no_duplicate_deferred_id, replace_deferred], 1)
+                .is_err()
+        );
+        db.activate_protocol_features(&[replace_deferred, no_duplicate_deferred_id], 1)
+            .unwrap();
+        assert!(db.protocol_feature_activated(replace_deferred));
+        assert!(db.protocol_feature_activated(no_duplicate_deferred_id));
+        assert!(db.preactivated_protocol_features().is_empty());
+    }
+
+    #[test]
+    fn protocol_feature_registry_matches_xpr_canonical_feature_digests() {
+        // These are the feature_digest values returned by Leap's
+        // get_activated_protocol_features API on XPR, not its separate
+        // description_digest values. Keeping this list here prevents a
+        // description hash from silently becoming the runtime gate key again.
+        let xpr_features = [
+            "0ec7e080177b2c02b278d5088611686b49d739925a92d9bfcacd7fc6b74053bd",
+            "f0af56d2c5a48d60a4a5b5c903edfb7db3a736a94ed589d0b797df33ff9d3e1d",
+            "2652f5f96006294109b3dd0bbde63693f55324af452b799ee137a81a905eed25",
+            "8ba52fe7a3956c5cd3a656a3174b931d3bb2abb45578befc59f283ecd816a405",
+            "ad9e3d8f650687709fd68f4b90b41f7d825a365b02c23a636cef88ac2ac00c43",
+            "68dcaa34c0517d19666e6b33add67351d8c5f69e999ca1e37931bc410a297428",
+            "e0fb64b1085cc5538970158d05a009c24e276fb94e1a0bf6a528b48fbc4ff526",
+            "ef43112c6543b88db2283a2e077278c315ae2c84719a8b25f25cc88565fbea99",
+            "4a90c00d55454dc5b059055ca213579c6ea856967712a56017487886a4d4cc0f",
+            "1a99a59d87e06e09ec5b028a9cbb7749b4a5ad8819004365d02dc4379a8b7241",
+            "4e7bf348da00a945489b2a681749eb56f5de00b900014e137ddae39f48f69d67",
+            "4fca8bd82bbd181e714e283f83e1b45d95ca5af40fb89ad3977b653c448f78c2",
+            "299dcb6af692324b899b39f16d5a530a33062804e41f09dc97e9f156b4476707",
+            "c3a6138c5061cf291310887c0b5c71fcaffeab90d5deb50d3b9e687cead45071",
+            "5443fcf88330c586bc0e5f3dee10e7f63c76c00249c87fe4fbf7f38c082006b4",
+            "d528b9f6e9693f45ed277af93474fd473ce7d831dae2180cca35d907bd10cb40",
+            "bcd2a26394b36614fd4894241d3c451ab0f6fd110958c3423073621a70826e99",
+            "6bcb40a24e49c26d0a60513b6aeb8551d264e4717f306b81a37a5afb3b47cedc",
+            "35c2186cc36f7bb4aeaf4487b36e57039ccf45a9136aa856a5d569ecca55ef2b",
+        ];
+        for digest in xpr_features {
+            assert!(
+                protocol_feature_spec(parse_protocol_feature_digest(digest)).is_some(),
+                "XPR canonical feature digest {digest} is not registered"
+            );
+        }
+        assert!(
+            protocol_feature_spec(parse_protocol_feature_digest(
+                "9908b3f8413c8474ab2a6be149d3f4f6d0421d37886033f27d4759c47a26d944"
+            ))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn system_account_names_follow_configured_root() {
+        let names = SystemAccountNames::new(Name::from_str("eosio").unwrap()).unwrap();
+        assert_eq!(names.system.to_string(), "eosio");
+        assert_eq!(names.code.to_string(), "eosio.code");
+        assert_eq!(names.any.to_string(), "eosio.any");
+        assert_eq!(names.prods.to_string(), "eosio.prods");
+        assert_eq!(names.token.to_string(), "eosio.token");
+    }
+
+    #[test]
+    fn system_account_configuration_survives_reopen_and_rejects_mismatch() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().to_str().unwrap();
+        let mut db = Database::new(path, TEST_DB_SIZE).unwrap();
+        db.set_system_account(Name::from_str("eosio").unwrap())
+            .unwrap();
+        db.set_native_system_contract(false).unwrap();
+        db.close().unwrap();
+
+        let reopened = Database::new(path, TEST_DB_SIZE).unwrap();
+        assert_eq!(reopened.system_accounts().system.to_string(), "eosio");
+        assert!(!reopened.native_system_contract());
+        let mut reopened_mode = reopened.clone();
+        assert!(reopened_mode.set_native_system_contract(true).is_err());
+        assert!(
+            reopened
+                .set_system_account(Name::from_str("pulse").unwrap())
+                .is_err()
+        );
     }
 
     // 64 MiB is a multiple of chainbase's 1 MiB sizing requirement and leaves
@@ -3724,6 +4926,28 @@ mod tests {
         let carol = name_u64("carol");
         b.create_account(carol, 3).unwrap();
         assert!(b.arena_account_exists(carol));
+    }
+
+    #[test]
+    fn restore_from_path_streams_snapshot_envelope() {
+        let src = TempDir::new().unwrap();
+        let mut source = Database::new(src.path().to_str().unwrap(), TEST_DB_SIZE).unwrap();
+        source.add_indices().unwrap();
+        source.set_revision(4).unwrap();
+        let alice = name_u64("alice");
+        source.create_account(alice, 1).unwrap();
+        let snapshot = source.snapshot_bytes().unwrap();
+        let checkpoint = src.path().join("migration.snapshot");
+        fs::write(&checkpoint, snapshot).unwrap();
+
+        let dst = TempDir::new().unwrap();
+        let mut target = Database::new(dst.path().to_str().unwrap(), TEST_DB_SIZE).unwrap();
+        target.add_indices().unwrap();
+        target.set_revision(9).unwrap();
+        let header = target.restore_from_path(&checkpoint).unwrap();
+        assert_eq!(header.revision, 4);
+        assert_eq!(target.revision(), 4);
+        assert!(target.arena_account_exists(alice));
     }
 
     #[test]
@@ -4068,6 +5292,9 @@ impl Default for Database {
         Self {
             path: String::new(),
             backend: crate::backend::ChainDatabase::new().expect("arena init"),
+            system_accounts: Arc::new(OnceLock::from(SystemAccountNames::default())),
+            native_system_contract: true,
+            native_system_contract_locked: false,
             protocol_records: Arc::new(Mutex::new(Vec::new())),
         }
     }

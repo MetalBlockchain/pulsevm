@@ -30,11 +30,15 @@ use super::{
     ContractIndex64Row,
     ContractIndex128Row,
     ContractIndex256Row,
+    ContractIndexDoubleRow,
+    ContractIndexLongDoubleRow,
     ContractKeyValueRow,
     ContractTableRow,
+    DeferredTransactionRow,
     GlobalPropertyRow,
     PermissionLinkRow,
     PermissionRow,
+    ProtocolFeatureRow,
     ResourceConfigRow,
     ResourceLimitsRow,
     ResourceStateRow,
@@ -65,9 +69,9 @@ const WASM_CONFIG: [u32; 11] = [
 /// params intrinsic never sets it), so it is sourced as the fixed constant.
 const MAX_ACTION_RETURN_VALUE_SIZE: u32 = 256;
 
-/// The 16 chain-state tables, in the fixed order `create_deltas.cpp` emits them.
+/// The 19 chain-state tables, in the fixed order `create_deltas.cpp` emits them.
 /// A table appears in the stream only when it has entries for the block.
-const TABLE_ORDER: [&str; 16] = [
+const TABLE_ORDER: [&str; 19] = [
     "account",
     "account_metadata",
     "code",
@@ -76,7 +80,10 @@ const TABLE_ORDER: [&str; 16] = [
     "contract_index64",
     "contract_index128",
     "contract_index256",
+    "contract_index_double",
+    "contract_index_long_double",
     "global_property",
+    "generated_transaction",
     "protocol_state",
     "permission",
     "permission_link",
@@ -263,8 +270,46 @@ fn ser_index256(s: &mut Ser, map: &HashMap<i64, (u64, u64, u64)>, r: &ContractIn
     s.raw(&w1);
 }
 
+fn ser_index_double(s: &mut Ser, map: &HashMap<i64, (u64, u64, u64)>, r: &ContractIndexDoubleRow) {
+    ser_secondary_header(s, map, r.t_id, r.primary_key, r.payer);
+    // nodeos copies the IEEE-754 bit pattern into a uint64 before packing it.
+    s.u64(r.secondary_key.to_bits());
+}
+
+fn ser_index_long_double(
+    s: &mut Ser,
+    map: &HashMap<i64, (u64, u64, u64)>,
+    r: &ContractIndexLongDoubleRow,
+) {
+    ser_secondary_header(s, map, r.t_id, r.primary_key, r.payer);
+    // float128_t is copied into a uint128 and packed little-endian: low word,
+    // then high word. The Arena row stores those words separately.
+    s.u64(r.sec_lo);
+    s.u64(r.sec_hi);
+}
+
+fn ser_generated_transaction(s: &mut Ser, db: &Db, r: &DeferredTransactionRow) {
+    s.uvar(0);
+    s.u64(r.sender);
+    s.u64(r.sender_id_lo);
+    s.u64(r.sender_id_hi);
+    s.u64(r.payer);
+    s.raw(&r.trx_id);
+    let packed = db
+        .blob::<DeferredTransactionRow>(r.packed_trx)
+        .unwrap_or(&[]);
+    s.bytes(packed);
+}
+
 fn ser_global_property(s: &mut Ser, r: &GlobalPropertyRow, chain_id: &[u8; 32]) {
     s.uvar(1); // global_property_object history version = 1
+    // Leap 5 serializes the optional producer-authority schedule before the
+    // chain config. Arena currently has the producer schedule in Controller,
+    // not in this row, so emit the valid empty schedule shape. The three
+    // fields are: optional-present=false, schedule version 0, producer count 0.
+    s.bool(false);
+    s.u32(0);
+    s.uvar(0);
     // chain_config (history version 1).
     s.uvar(1);
     s.u64(r.max_block_net_usage);
@@ -279,6 +324,8 @@ fn ser_global_property(s: &mut Ser, r: &GlobalPropertyRow, chain_id: &[u8; 32]) 
     s.u32(r.max_transaction_cpu_usage);
     s.u32(r.min_transaction_cpu_usage);
     s.u32(r.max_transaction_lifetime);
+    s.u32(r.deferred_trx_expiration_window);
+    s.u32(r.max_transaction_delay);
     s.u32(r.max_inline_action_size);
     s.u16(r.max_inline_action_depth);
     s.u16(r.max_authority_depth);
@@ -524,7 +571,22 @@ impl IncludeDelta for ContractIndex256Row {
         true
     }
 }
+impl IncludeDelta for ContractIndexDoubleRow {
+    fn include_delta(_: &Self, _: &Self) -> bool {
+        true
+    }
+}
+impl IncludeDelta for ContractIndexLongDoubleRow {
+    fn include_delta(_: &Self, _: &Self) -> bool {
+        true
+    }
+}
 impl IncludeDelta for GlobalPropertyRow {
+    fn include_delta(_: &Self, _: &Self) -> bool {
+        true
+    }
+}
+impl IncludeDelta for DeferredTransactionRow {
     fn include_delta(_: &Self, _: &Self) -> bool {
         true
     }
@@ -641,18 +703,27 @@ where
     rows
 }
 
-/// The `protocol_state` singleton: the arena models no protocol features, so a
-/// full snapshot emits the one empty row and a delta emits nothing (the feature
-/// set never changes on this chain).
-fn collect_protocol_state(full_snapshot: bool) -> Rows {
-    if full_snapshot {
-        let mut s = Ser::new();
-        s.uvar(0); // history version
-        s.uvar(0); // activated_protocol_features container (empty)
-        vec![(true, s.buf)]
-    } else {
-        Vec::new()
+/// The `protocol_state` singleton: imported feature activations are retained
+/// for lossless SHiP export. A new Pulse chain does not activate additional
+/// source features, so live deltas remain empty.
+fn collect_protocol_state(db: &Db, full_snapshot: bool) -> Rows {
+    if !full_snapshot {
+        return Vec::new();
     }
+    let mut features: Vec<_> = db
+        .table::<ProtocolFeatureRow>()
+        .map(|table| table.iter().copied().collect())
+        .unwrap_or_default();
+    features.sort_by_key(|row| row.id().raw());
+    let mut s = Ser::new();
+    s.uvar(0); // protocol_state_v0 history version
+    s.uvar(features.len() as u64);
+    for feature in features {
+        s.uvar(0); // activated_protocol_feature_v0 history version
+        s.raw(&feature.feature_digest);
+        s.u32(feature.activation_block_num);
+    }
+    vec![(true, s.buf)]
 }
 
 fn frame_table(out: &mut Ser, name: &str, rows: &Rows) {
@@ -745,6 +816,22 @@ pub(crate) fn pack_deltas(db: &Db, full_snapshot: bool, chain_id: &[u8; 32]) -> 
         }),
     );
     per_table.insert(
+        "contract_index_double",
+        collect_table::<ContractIndexDoubleRow, _>(db, full_snapshot, |_db, r| {
+            let mut s = Ser::new();
+            ser_index_double(&mut s, &tid_map, r);
+            s.buf
+        }),
+    );
+    per_table.insert(
+        "contract_index_long_double",
+        collect_table::<ContractIndexLongDoubleRow, _>(db, full_snapshot, |_db, r| {
+            let mut s = Ser::new();
+            ser_index_long_double(&mut s, &tid_map, r);
+            s.buf
+        }),
+    );
+    per_table.insert(
         "global_property",
         collect_table::<GlobalPropertyRow, _>(db, full_snapshot, |_db, r| {
             let mut s = Ser::new();
@@ -752,22 +839,21 @@ pub(crate) fn pack_deltas(db: &Db, full_snapshot: bool, chain_id: &[u8; 32]) -> 
             s.buf
         }),
     );
-    per_table.insert("protocol_state", collect_protocol_state(full_snapshot));
+    per_table.insert(
+        "generated_transaction",
+        collect_table::<DeferredTransactionRow, _>(db, full_snapshot, |db, r| {
+            let mut s = Ser::new();
+            ser_generated_transaction(&mut s, db, r);
+            s.buf
+        }),
+    );
+    per_table.insert("protocol_state", collect_protocol_state(db, full_snapshot));
     {
-        let mut rows = collect_table::<PermissionRow, _>(db, full_snapshot, |db, r| {
+        let rows = collect_table::<PermissionRow, _>(db, full_snapshot, |db, r| {
             let mut s = Ser::new();
             ser_permission(&mut s, db, &parent_names, r);
             s.buf
         });
-        // chainbase occupies permission id 0 with a default sentinel (this is why
-        // the arena's permission-id counter starts at 1); pack_deltas emits it as
-        // the first row of the full snapshot. It never changes, so no delta.
-        if full_snapshot {
-            let mut s = Ser::new();
-            let sentinel = PermissionRow::default();
-            ser_permission(&mut s, db, &parent_names, &sentinel);
-            rows.insert(0, (true, s.buf));
-        }
         per_table.insert("permission", rows);
     }
     per_table.insert(
@@ -822,6 +908,39 @@ pub(crate) fn pack_deltas(db: &Db, full_snapshot: bool, chain_id: &[u8; 32]) -> 
         frame_table(&mut out, name, &per_table[name]);
     }
     out.buf
+}
+
+#[cfg(test)]
+mod global_property_tests {
+    use super::{
+        GlobalPropertyRow,
+        Ser,
+        ser_global_property,
+    };
+
+    #[test]
+    fn global_property_matches_leap5_envelope() {
+        let row = GlobalPropertyRow {
+            deferred_trx_expiration_window: 600,
+            max_transaction_delay: 3_888_000,
+            ..GlobalPropertyRow::default()
+        };
+        let chain_id = [0xabu8; 32];
+        let mut ser = Ser::new();
+        ser_global_property(&mut ser, &row, &chain_id);
+
+        // 157 bytes is the Leap 5 global_property row shape: the six-byte
+        // producer-schedule envelope and both deferred-transaction config
+        // fields are part of the chain_config history version.
+        assert_eq!(ser.buf.len(), 157);
+        assert_eq!(&ser.buf[..8], &[1, 0, 0, 0, 0, 0, 0, 1]);
+        assert_eq!(u32::from_le_bytes(ser.buf[60..64].try_into().unwrap()), 600);
+        assert_eq!(
+            u32::from_le_bytes(ser.buf[64..68].try_into().unwrap()),
+            3_888_000
+        );
+        assert_eq!(&ser.buf[80..112], &chain_id);
+    }
 }
 
 #[cfg(test)]
@@ -893,10 +1012,10 @@ mod tests {
     }
 
     #[test]
-    fn empty_full_snapshot_contains_protocol_state_and_permission_sentinel() {
+    fn empty_full_snapshot_contains_protocol_state_without_permission_sentinel() {
         let db = crate::build_registered_db().unwrap();
-        let mut expected = vec![
-            2, // two non-empty tables
+        let expected = vec![
+            1, // one non-empty table
             0, // table_delta version
             14, b'p', b'r', b'o', b't', b'o', b'c', b'o', b'l', b'_', b's', b't', b'a', b't', b'e',
             1, // one row
@@ -905,13 +1024,6 @@ mod tests {
             0, // protocol_state version
             0, // no activated protocol features
         ];
-        expected.extend_from_slice(&[
-            0, // table_delta version
-            10, b'p', b'e', b'r', b'm', b'i', b's', b's', b'i', b'o', b'n', 1,  // one row
-            1,  // present
-            40, // row payload length
-        ]);
-        expected.extend_from_slice(&[0; 40]);
         assert_eq!(pack_deltas(&db, true, &[0; 32]), expected);
     }
 

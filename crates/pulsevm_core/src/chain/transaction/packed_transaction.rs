@@ -1,7 +1,4 @@
-use std::{
-    collections::BTreeSet,
-    io::Read as IoRead,
-};
+use std::io::Read as IoRead;
 
 use flate2::read::ZlibDecoder;
 use pulsevm_constants::{
@@ -14,6 +11,7 @@ use pulsevm_serialization::{
     NumBytes,
     Read,
     ReadError,
+    VarUint32,
     Write,
     WriteError,
 };
@@ -37,7 +35,9 @@ use crate::{
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackedTransaction {
-    signatures: BTreeSet<Signature>,     // Signatures of the transaction
+    // Signature order is consensus data: packed_digest() hashes this vector
+    // exactly as received even though authorization later deduplicates keys.
+    signatures: Vec<Signature>,
     compression: TransactionCompression, // Compression type used for the transaction
     packed_context_free_data: Bytes,     // Packed context-free data, if any
     packed_trx: Bytes,                   // Packed transaction, not signed, data
@@ -48,9 +48,24 @@ pub struct PackedTransaction {
 }
 
 impl PackedTransaction {
+    /// Materialize the raw `transaction` bytes XPR stores in a
+    /// `generated_transaction_object`. Deferred transactions have already
+    /// passed authorization when scheduled, so their source representation has
+    /// neither signatures nor context-free data. The caller must use the
+    /// controller's deferred execution path; normal mempool admission still
+    /// rejects the empty signature set.
+    pub fn from_deferred_transaction_bytes(packed_trx: Bytes) -> Result<Self, ChainError> {
+        Self::new(
+            Vec::new(),
+            TransactionCompression::None,
+            Bytes::default(),
+            packed_trx,
+        )
+    }
+
     #[inline]
     pub fn new(
-        signatures: BTreeSet<Signature>,
+        signatures: Vec<Signature>,
         compression: TransactionCompression,
         packed_context_free_data: Bytes,
         packed_trx: Bytes,
@@ -121,6 +136,26 @@ impl PackedTransaction {
         &self.trx_id
     }
 
+    /// The raw transaction bytes as carried in the network receipt. Deferred
+    /// execution compares these against Arena's source-side record before it
+    /// accepts the receipt without normal signatures.
+    #[inline]
+    pub fn packed_trx_bytes(&self) -> &[u8] {
+        self.packed_trx.as_ref()
+    }
+
+    /// XPR's `packed_transaction::packed_digest()`: the receipt merkle commits
+    /// this digest rather than the full packed-transaction wire encoding.
+    pub fn packed_digest(&self) -> Result<pulsevm_crypto::Digest, WriteError> {
+        let mut prunable = self.signatures.pack()?;
+        prunable.extend(pack_fc_bytes(self.packed_context_free_data.as_ref())?);
+
+        let mut encoded = self.compression.pack()?;
+        encoded.extend(pack_fc_bytes(self.packed_trx.as_ref())?);
+        encoded.extend(pulsevm_crypto::Digest::hash(prunable).pack()?);
+        Ok(pulsevm_crypto::Digest::hash(encoded))
+    }
+
     #[inline]
     pub fn from_signed_transaction(trx: SignedTransaction) -> Result<Self, ChainError> {
         let trx_id = trx.transaction().id().map_err(|e| {
@@ -128,7 +163,7 @@ impl PackedTransaction {
         })?;
 
         Ok(Self {
-            signatures: trx.signatures().clone(),
+            signatures: trx.signatures().to_vec(),
             compression: TransactionCompression::None, // Default to no compression for now
             packed_context_free_data: Bytes::default(), // No context-free data for now
             packed_trx: trx
@@ -143,6 +178,17 @@ impl PackedTransaction {
             trx_id,
         })
     }
+}
+
+/// FC's `bytes` serializer prefixes a byte vector with a varuint length. The
+/// generic `Bytes::pack()` buffer is intentionally oversized for its legacy
+/// fixed-width `NumBytes` estimate, so receipt digests must encode the exact
+/// FC wire form explicitly (without trailing allocation bytes).
+fn pack_fc_bytes(bytes: &[u8]) -> Result<Vec<u8>, WriteError> {
+    let mut encoded =
+        VarUint32(u32::try_from(bytes.len()).map_err(|_| WriteError::TryFromIntError)?).pack()?;
+    encoded.extend_from_slice(bytes);
+    Ok(encoded)
 }
 
 impl NumBytes for PackedTransaction {
@@ -169,7 +215,7 @@ impl Write for PackedTransaction {
 impl Read for PackedTransaction {
     #[inline]
     fn read(data: &[u8], pos: &mut usize) -> Result<Self, ReadError> {
-        let signatures = BTreeSet::<Signature>::read(data, pos)?;
+        let signatures = Vec::<Signature>::read(data, pos)?;
         let compression = TransactionCompression::read(data, pos)?;
         let packed_context_free_data = Bytes::read(data, pos)?;
         let packed_trx = Bytes::read(data, pos)?;
@@ -233,11 +279,19 @@ fn maybe_decompress(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chain::transaction::{
+        TransactionReceipt,
+        TransactionReceiptHeader,
+        TransactionStatus,
+    };
     use flate2::{
         Compression,
         write::ZlibEncoder,
     };
-    use std::io::Write as IoWrite;
+    use std::{
+        io::Write as IoWrite,
+        str::FromStr,
+    };
 
     fn zlib_compress(data: &[u8]) -> Vec<u8> {
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
@@ -271,5 +325,54 @@ mod tests {
         let payload = b"a normally sized transaction payload".to_vec();
         let out = maybe_decompress(TransactionCompression::Zlib, &zlib_compress(&payload)).unwrap();
         assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn decodes_raw_transaction_emitted_by_leap_5() {
+        // Captured with Leap/XPR-compatible nodeos 5.0.3 using:
+        // `cleos create account ... --dont-broadcast --return-packed -j`.
+        // A generated_transaction_object stores precisely this `packed_trx`
+        // member (without the outer signatures/compression framing).
+        let raw = hex::decode(
+            "2302876a8e1f127516c500000000010000000000ea305500409e9a2264b89a010000000000ea305500000000a8ed3232660000000000ea3055901132ead05bb9b901000000010002c0ded2bc1f1305fb0faac5e6c03ee3a1924234985427b6167ca569d13df435cf0100000001000000010002c0ded2bc1f1305fb0faac5e6c03ee3a1924234985427b6167ca569d13df435cf0100000000",
+        )
+        .unwrap();
+        let transaction =
+            PackedTransaction::from_deferred_transaction_bytes(raw.clone().into()).unwrap();
+        assert_eq!(transaction.get_transaction().actions.len(), 1);
+        assert_eq!(
+            transaction.get_transaction().actions[0].name().to_string(),
+            "newaccount"
+        );
+        assert_eq!(transaction.packed_trx_bytes(), raw.as_slice());
+    }
+
+    #[test]
+    fn packed_digest_preserves_xpr_multi_signature_order() {
+        // XPR block 18,458,006 is the first canonical replay fixture whose two
+        // signatures are not already in Signature's sort order. Leap hashes the
+        // source vector order into packed_digest and therefore into the receipt
+        // Merkle root.
+        let signatures = vec![
+            Signature::from_str("SIG_K1_KZDbad1igYb6zfjGqziC4DwanAYv96DMJDb3NLgMgLwSximq6Gf3GjFQEVDsRYEihRvsx8BxSLvYHhyCVYyxHZZh2H2vtX").unwrap(),
+            Signature::from_str("SIG_K1_K6tVhH5eiejjjnyBU1LnTkYDzHnLxiQSGZdc5N3qwo6aUz1pcABEicDJvr1wHKDhW24DmP2v7smw6hzBjWr5sJgHfi5SRQ").unwrap(),
+        ];
+        let packed_trx = hex::decode("5c5f2d5f4da4e48fb6b700000000013069a6b702ea305500805feeaa7d15d6023069a6b782e964320000c057b9e5aeda90558c864f9ae9ad00000000a8ed323211c0a6db0603ea305590558c864f9ae9ad0100").unwrap();
+        let packed = PackedTransaction::new(
+            signatures,
+            TransactionCompression::None,
+            Bytes::default(),
+            packed_trx.into(),
+        )
+        .unwrap();
+        let receipt = TransactionReceipt::new(
+            TransactionReceiptHeader::new(TransactionStatus::Executed, 2_606, VarUint32(18)),
+            packed,
+        );
+
+        assert_eq!(
+            hex::encode(receipt.digest().unwrap().as_bytes()),
+            "1a21a9a9606dca1674921fcdbf5f47a64bfb87584a5a116671cf2b953e7e10b0"
+        );
     }
 }

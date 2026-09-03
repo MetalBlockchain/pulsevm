@@ -75,7 +75,7 @@ pub trait Rpc {
     #[method(name = "pulsevm.issueTx")]
     async fn issue_tx(
         &self,
-        signatures: BTreeSet<Signature>,
+        signatures: Vec<Signature>,
         compression: TransactionCompression,
         packed_context_free_data: Bytes,
         packed_trx: Bytes,
@@ -649,7 +649,7 @@ impl RpcServer for RpcService {
 
     async fn issue_tx(
         &self,
-        signatures: BTreeSet<Signature>,
+        signatures: Vec<Signature>,
         compression: TransactionCompression,
         packed_context_free_data: Bytes,
         packed_trx: Bytes,

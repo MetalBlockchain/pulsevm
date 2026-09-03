@@ -1,21 +1,7 @@
-use pulsevm_billable_size::billable_size_v;
-use pulsevm_constants::{
-    OVERHEAD_PER_ACCOUNT_RAM_BYTES,
-    SETCODE_RAM_BYTES_MULTIPLIER,
-};
-use pulsevm_database::{
-    Database,
-    PermissionObject,
-};
-use pulsevm_error::ChainError;
-use pulsevm_serialization::Read;
-
 use crate::{
     ACTIVE_NAME,
-    CODE_NAME,
     OWNER_NAME,
     chain::{
-        abi::AbiDefinition,
         apply_context::ApplyContext,
         authority::{
             Authority,
@@ -36,6 +22,21 @@ use crate::{
     },
     transaction::Action,
 };
+use pulsevm_billable_size::billable_size_v;
+use pulsevm_constants::{
+    OVERHEAD_PER_ACCOUNT_RAM_BYTES,
+    SETCODE_RAM_BYTES_MULTIPLIER,
+};
+use pulsevm_database::{
+    Database,
+    PermissionObject,
+};
+use pulsevm_error::ChainError;
+
+const ONLY_LINK_TO_EXISTING_PERMISSION_FEATURE_DIGEST: [u8; 32] = [
+    0x1a, 0x99, 0xa5, 0x9d, 0x87, 0xe0, 0x6e, 0x09, 0xec, 0x5b, 0x02, 0x8a, 0x9c, 0xbb, 0x77, 0x49,
+    0xb4, 0xa5, 0xad, 0x88, 0x19, 0x00, 0x43, 0x65, 0xd0, 0x2d, 0xc4, 0x37, 0x9a, 0x8b, 0x72, 0x41,
+];
 
 pub fn newaccount(
     context: &mut ApplyContext,
@@ -67,10 +68,11 @@ pub fn newaccount(
     // Check if the creator is privileged
     if !db.is_account_privileged(create.creator.as_u64())? {
         pulse_assert(
-            !name_str.starts_with("pulse."),
-            ChainError::TransactionError(
-                "only privileged accounts can have names that start with 'pulse.'".to_string(),
-            ),
+            !name_str.starts_with(&format!("{}.", context.system_accounts().system)),
+            ChainError::TransactionError(format!(
+                "only privileged accounts can have names that start with '{}.'",
+                context.system_accounts().system
+            )),
         )?;
     }
 
@@ -223,10 +225,9 @@ pub fn setabi(
         .map_err(|e| ChainError::TransactionError(format!("failed to deserialize data: {}", e)))?;
     context.require_authorization(&act.account, None)?;
 
-    // Try and parse the ABI definition
-    let _: AbiDefinition = AbiDefinition::read(act.abi.as_slice(), &mut 0).map_err(|e| {
-        ChainError::TransactionError(format!("failed to deserialize ABI definition: {}", e))
-    })?;
+    // XPR's native `apply_eosio_setabi` stores this blob opaquely. ABI decoding
+    // belongs to API/contract tooling; making it an admission condition here
+    // rejects historical blocks that nodeos accepted.
 
     let old_size: i64 = db.account_abi_size(act.account.as_u64())? as i64;
     let new_size: i64 = act.abi.len() as i64;
@@ -255,9 +256,13 @@ pub fn updateauth(
         ChainError::ActionValidationError(format!("cannot create authority with empty name")),
     )?;
     pulse_assert(
-        !update.permission.to_string().starts_with("pulse."),
+        !update
+            .permission
+            .to_string()
+            .starts_with(&format!("{}.", context.system_accounts().system)),
         ChainError::ActionValidationError(format!(
-            "permission names that start with 'pulse.' are reserved"
+            "permission names that start with '{}.' are reserved",
+            context.system_accounts().system
         )),
     )?;
     pulse_assert(
@@ -413,6 +418,25 @@ pub fn linkauth(
     )?;
     context.require_authorization(&requirement.account, None)?;
 
+    if db.protocol_feature_activated(ONLY_LINK_TO_EXISTING_PERMISSION_FEATURE_DIGEST)
+        && requirement.requirement != crate::ANY_NAME
+    {
+        let permission_exists = db
+            .read()?
+            .find_permission_info(
+                requirement.account.as_u64(),
+                requirement.requirement.as_u64(),
+            )?
+            .is_some();
+        pulse_assert(
+            permission_exists,
+            ChainError::ActionValidationError(format!(
+                "failed to retrieve permission: {}",
+                requirement.requirement
+            )),
+        )?;
+    }
+
     let delta = db.link_auth(
         requirement.account.as_u64(),
         requirement.code.as_u64(),
@@ -465,8 +489,8 @@ fn validate_authority_precondition(db: &mut Database, auth: &Authority) -> Resul
             continue; // account was already checked to exist, so its owner and active permissions should exist
         }
 
-        if a.permission.permission == CODE_NAME {
-            continue; // virtual pulse.code permission does not really exist but is allowed
+        if a.permission.permission == db.system_accounts().code {
+            continue; // virtual system.code permission does not really exist but is allowed
         }
 
         AuthorizationManager::get_permission(

@@ -1,7 +1,5 @@
 #[cfg(test)]
 mod auth_tests {
-    use std::collections::BTreeSet;
-
     use anyhow::Result;
     use pulsevm_core::{
         ACTIVE_NAME,
@@ -114,7 +112,7 @@ mod auth_tests {
         }
 
         chain.set_transaction_headers(&mut trx, DEFAULT_EXPIRATION_DELTA, 0);
-        let mut signed: SignedTransaction = SignedTransaction::new(trx, BTreeSet::new(), vec![]);
+        let mut signed: SignedTransaction = SignedTransaction::new(trx, Vec::new(), vec![]);
         for key in keys.iter() {
             signed = signed.sign(key, &chain.controller.chain_id())?;
         }

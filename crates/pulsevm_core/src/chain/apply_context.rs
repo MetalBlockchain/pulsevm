@@ -1,6 +1,5 @@
 use std::{
     collections::{
-        BTreeMap,
         BTreeSet,
         VecDeque,
     },
@@ -27,13 +26,17 @@ use pulsevm_database::{
     KeyValueObject,
     Microseconds,
     TableObject,
+    TimePointSec,
     U256,
 };
 use pulsevm_error::ChainError;
-use pulsevm_serialization::Write;
+use pulsevm_serialization::{
+    CanonicalMap,
+    Read,
+    Write,
+};
 
 use crate::{
-    CODE_NAME,
     chain::{
         authority::PermissionLevel,
         authorization_manager::AuthorizationManager,
@@ -47,6 +50,7 @@ use crate::{
         transaction::{
             Action,
             ActionReceipt,
+            Transaction,
             generate_action_digest,
         },
         transaction_context::TransactionContext,
@@ -57,16 +61,65 @@ use crate::{
     transaction::PackedTransaction,
 };
 
+const FORWARD_SETCODE_FEATURE_DIGEST: [u8; 32] = [
+    0x26, 0x52, 0xf5, 0xf9, 0x60, 0x06, 0x29, 0x41, 0x09, 0xb3, 0xdd, 0x0b, 0xbd, 0xe6, 0x36, 0x96,
+    0xf5, 0x53, 0x24, 0xaf, 0x45, 0x2b, 0x79, 0x9e, 0xe1, 0x37, 0xa8, 0x1a, 0x90, 0x5e, 0xed, 0x25,
+];
+
+const RAM_RESTRICTIONS_FEATURE_DIGEST: [u8; 32] = [
+    0x4e, 0x7b, 0xf3, 0x48, 0xda, 0x00, 0xa9, 0x45, 0x48, 0x9b, 0x2a, 0x68, 0x17, 0x49, 0xeb, 0x56,
+    0xf5, 0xde, 0x00, 0xb9, 0x00, 0x01, 0x4e, 0x13, 0x7d, 0xda, 0xe3, 0x9f, 0x48, 0xf6, 0x9d, 0x67,
+];
+
+const RESTRICT_ACTION_TO_SELF_FEATURE_DIGEST: [u8; 32] = [
+    0xad, 0x9e, 0x3d, 0x8f, 0x65, 0x06, 0x87, 0x70, 0x9f, 0xd6, 0x8f, 0x4b, 0x90, 0xb4, 0x1f, 0x7d,
+    0x82, 0x5a, 0x36, 0x5b, 0x02, 0xc2, 0x3a, 0x63, 0x6c, 0xef, 0x88, 0xac, 0x2a, 0xc0, 0x0c, 0x43,
+];
+
+const REPLACE_DEFERRED_FEATURE_DIGEST: [u8; 32] = [
+    0xef, 0x43, 0x11, 0x2c, 0x65, 0x43, 0xb8, 0x8d, 0xb2, 0x28, 0x3a, 0x2e, 0x07, 0x72, 0x78, 0xc3,
+    0x15, 0xae, 0x2c, 0x84, 0x71, 0x9a, 0x8b, 0x25, 0xf2, 0x5c, 0xc8, 0x85, 0x65, 0xfb, 0xea, 0x99,
+];
+
+const NO_DUPLICATE_DEFERRED_ID_FEATURE_DIGEST: [u8; 32] = [
+    0x4a, 0x90, 0xc0, 0x0d, 0x55, 0x45, 0x4d, 0xc5, 0xb0, 0x59, 0x05, 0x5c, 0xa2, 0x13, 0x57, 0x9c,
+    0x6e, 0xa8, 0x56, 0x96, 0x77, 0x12, 0xa5, 0x60, 0x17, 0x48, 0x78, 0x86, 0xa4, 0xd4, 0xcc, 0x0f,
+];
+
+const DISABLE_DEFERRED_TRXS_STAGE_1_FEATURE_DIGEST: [u8; 32] = [
+    0xfc, 0xe5, 0x7d, 0x23, 0x31, 0x66, 0x73, 0x53, 0xa0, 0xea, 0xc6, 0xb4, 0x20, 0x9b, 0x67, 0xb8,
+    0x43, 0xa7, 0x26, 0x2a, 0x84, 0x8a, 0xf0, 0xa4, 0x9a, 0x6e, 0x2f, 0xa9, 0xf6, 0x58, 0x4e, 0xb4,
+];
+
+// Leap's generated_transaction_object bills billable_size_v<...> (272 bytes)
+// plus the serialized transaction payload. The fixed value is 96 bytes of
+// fields, 4 bytes for the shared-blob length, and 5 index overheads at 32 bytes
+// each, rounded up to the 16-byte billable alignment.
+const GENERATED_TRANSACTION_BILLABLE_SIZE: i64 = 272;
+
+pub(crate) fn generated_transaction_billable_size(
+    packed_trx_len: usize,
+) -> Result<i64, ChainError> {
+    let packed_trx_len = i64::try_from(packed_trx_len).map_err(|_| {
+        ChainError::TransactionError("deferred transaction is too large to bill RAM".into())
+    })?;
+    GENERATED_TRANSACTION_BILLABLE_SIZE
+        .checked_add(packed_trx_len)
+        .ok_or_else(|| {
+            ChainError::TransactionError("deferred transaction RAM bill overflows".into())
+        })
+}
+
 struct ApplyContextInner {
     action: Action,                       // The action being applied
     action_return_value: Option<Vec<u8>>, // Return value of the action
     start: i64,                           // Start time in microseconds
     privileged: bool,
-    account_ram_deltas: BTreeMap<Name, i64>, // RAM usage deltas for accounts
-    notified: VecDeque<(Name, u32)>,         // List of notified accounts
-    inline_actions: Vec<u32>,                // List of inline actions
-    context_free_inline_actions: Vec<u32>,   // List of context-free inline actions
-    recurse_depth: u32,                      // The current recursion depth
+    account_ram_deltas: CanonicalMap<Name, i64>, // RAM usage deltas for accounts
+    notified: VecDeque<(Name, u32)>,             // List of notified accounts
+    inline_actions: Vec<u32>,                    // List of inline actions
+    context_free_inline_actions: Vec<u32>,       // List of context-free inline actions
+    recurse_depth: u32,                          // The current recursion depth
     // The arena mints the key-value iterator handles a contract sees.
     arena_keyval_cache: ArenaIteratorCache,
     // The arena keeps a separate iterator cache per secondary-index type, mirroring
@@ -124,7 +177,7 @@ impl ApplyContext {
                 action_return_value: None,
                 start: Utc::now().timestamp_micros(),
                 privileged: false,
-                account_ram_deltas: BTreeMap::new(),
+                account_ram_deltas: CanonicalMap::new(),
                 notified: VecDeque::new(),
                 inline_actions: Vec::new(),
                 context_free_inline_actions: Vec::new(),
@@ -138,6 +191,10 @@ impl ApplyContext {
                 cpu_limit,
             })),
         })
+    }
+
+    pub fn system_accounts(&self) -> pulsevm_database::SystemAccountNames {
+        self.db.system_accounts()
     }
 
     pub fn exec(&mut self, trx_context: &mut TransactionContext) -> Result<u64, ChainError> {
@@ -199,12 +256,23 @@ impl ApplyContext {
         let mut cpu_used = 100; // Base usage is always 100 instructions
         let action = {
             let mut inner = self.inner.write()?;
+            inner.start = Utc::now().timestamp_micros();
             inner.privileged = privileged;
             inner.action.clone()
         };
 
-        let native =
-            Controller::find_apply_handler(&self.receiver, action.account(), action.name());
+        // These are Antelope controller-native actions, not a replacement for
+        // the deployed system WASM. Leap always runs the matching native handler
+        // first and then dispatches WASM (except eosio::setcode before
+        // FORWARD_SETCODE), including on imported XPR chains.
+        let (code_hash, _vm_type, _vm_version) =
+            self.db.account_code_hash_vm(self.receiver.as_u64())?;
+        let native = Controller::find_apply_handler(
+            &self.receiver,
+            action.account(),
+            action.name(),
+            self.db.system_accounts().system,
+        );
         if let Some(native) = native {
             native(self, &mut self.db.clone(), &action)?;
             // Native handlers are outside deterministic Wasm metering, so give
@@ -212,11 +280,14 @@ impl ApplyContext {
             self.trx_context.checktime()?;
         }
 
-        // Does the receiver account have a contract deployed? Read the deployed
-        // code hash from the Rust database. An all-zero hash means no contract.
-        let (code_hash, _vm_type, _vm_version) =
-            self.db.account_code_hash_vm(self.receiver.as_u64())?;
-        if code_hash != [0u8; 32] {
+        let system = self.db.system_accounts();
+        let is_system_setcode = self.receiver == system.system
+            && *action.account() == system.system
+            && *action.name() == crate::chain::config::SETCODE_NAME;
+        let forward_setcode = self
+            .db
+            .protocol_feature_activated(FORWARD_SETCODE_FEATURE_DIGEST);
+        if code_hash != [0u8; 32] && (!is_system_setcode || forward_setcode) {
             // Separate context here because we need to release the lock on inner before executing
             // the Wasm code, which may call back into the context and cause deadlock if we hold the
             // lock.
@@ -235,6 +306,40 @@ impl ApplyContext {
             )?;
         }
 
+        // Leap's RAM_RESTRICTIONS feature prevents an unprivileged contract
+        // from increasing another account's RAM without that account's
+        // authorization. Notifications are stricter: the receiver may not
+        // charge a different account even when the transaction authorizes it.
+        if !privileged
+            && self
+                .db
+                .protocol_feature_activated(RAM_RESTRICTIONS_FEATURE_DIGEST)
+        {
+            let ram_deltas = self.inner.read()?.account_ram_deltas.clone();
+            let not_in_notify_context = self.receiver == *action.account();
+            for (account, delta) in ram_deltas {
+                if delta > 0 && account != self.receiver {
+                    pulse_assert(
+                        not_in_notify_context,
+                        ChainError::TransactionError(format!(
+                            "unprivileged receiver {} cannot increase RAM usage of account {} within notification of {}::{}",
+                            self.receiver,
+                            account,
+                            action.account(),
+                            action.name()
+                        )),
+                    )?;
+                    pulse_assert(
+                        self.has_authorization(&account)?,
+                        ChainError::TransactionError(format!(
+                            "unprivileged contract cannot increase RAM usage of another account that has not authorized the action: {}",
+                            account
+                        )),
+                    )?;
+                }
+            }
+        }
+
         let act_digest = {
             let inner = self.inner.read()?;
             generate_action_digest(&action, inner.action_return_value.clone())
@@ -247,7 +352,7 @@ impl ApplyContext {
             act_digest,
             self.next_global_sequence()?,
             self.next_recv_sequence(self.receiver.as_u64())?,
-            BTreeMap::new(),
+            CanonicalMap::new(),
             code_sequence as u32,
             abi_sequence as u32,
         );
@@ -266,13 +371,16 @@ impl ApplyContext {
     }
 
     pub fn finalize_trace(&self, receipt: ActionReceipt) -> Result<(), ChainError> {
-        let inner = self.inner.read()?;
+        let (start, account_ram_deltas) = {
+            let mut inner = self.inner.write()?;
+            (inner.start, std::mem::take(&mut inner.account_ram_deltas))
+        };
 
         self.trx_context
             .modify_action_trace(self.action_ordinal, |trace| {
                 trace.receipt = Some(receipt);
-                trace.set_elapsed((Utc::now().timestamp_micros() - inner.start) as u32);
-                trace.account_ram_deltas = inner.account_ram_deltas.clone();
+                trace.set_elapsed((Utc::now().timestamp_micros() - start) as u32);
+                trace.account_ram_deltas = account_ram_deltas;
             })?;
         Ok(())
     }
@@ -338,6 +446,7 @@ impl ApplyContext {
     }
 
     pub fn add_ram_usage(&mut self, account: &Name, ram_delta: i64) -> Result<(), ChainError> {
+        self.trx_context.add_ram_usage(account, ram_delta)?;
         let mut inner = self.inner.write()?;
         let entry = inner.account_ram_deltas.entry(account.clone()).or_insert(0);
         *entry = entry.checked_add(ram_delta).ok_or_else(|| {
@@ -356,7 +465,11 @@ impl ApplyContext {
             inner.action.clone()
         };
         let send_to_self = a.account() == &self.receiver;
-        let inherit_parent_authorizations = send_to_self && &self.receiver == action.account();
+        let restrict_action_to_self = self
+            .db
+            .protocol_feature_activated(RESTRICT_ACTION_TO_SELF_FEATURE_DIGEST);
+        let inherit_parent_authorizations =
+            !restrict_action_to_self && send_to_self && &self.receiver == action.account();
 
         {
             pulse_assert(
@@ -393,7 +506,10 @@ impl ApplyContext {
             }
 
             let mut provided_permissions = BTreeSet::new();
-            provided_permissions.insert(PermissionLevel::new(*self.receiver, CODE_NAME.into()));
+            provided_permissions.insert(PermissionLevel::new(
+                *self.receiver,
+                self.db.system_accounts().code.into(),
+            ));
             let inner = self.inner.read()?;
 
             if !inner.privileged {
@@ -2324,6 +2440,246 @@ impl ApplyContext {
         return Ok(());
     }
 
+    /// Queue a serialized transaction for later execution by the deferred
+    /// scheduler. The request is keyed by the current receiver and sender id,
+    /// matching Antelope's `generated_transaction_object` index.
+    pub fn schedule_deferred(
+        &mut self,
+        sender_id: u128,
+        payer: u64,
+        packed_trx: Vec<u8>,
+        replace_existing: bool,
+    ) -> Result<(), ChainError> {
+        if self
+            .db
+            .protocol_feature_activated(DISABLE_DEFERRED_TRXS_STAGE_1_FEATURE_DIGEST)
+        {
+            return Ok(());
+        }
+
+        let mut pos = 0;
+        let mut transaction = Transaction::read(&packed_trx, &mut pos).map_err(|e| {
+            ChainError::TransactionError(format!("failed to deserialize deferred transaction: {e}"))
+        })?;
+        pulse_assert(
+            pos == packed_trx.len(),
+            ChainError::TransactionError(
+                "deferred transaction contains trailing bytes".to_string(),
+            ),
+        )?;
+        pulse_assert(
+            !transaction.actions.is_empty(),
+            ChainError::TransactionError("deferred transaction has no actions".to_string()),
+        )?;
+        pulse_assert(
+            transaction.context_free_actions.is_empty(),
+            ChainError::TransactionError(
+                "context free actions are not allowed in deferred transactions".to_string(),
+            ),
+        )?;
+        self.trx_context
+            .validate_deferred_referenced_accounts(&transaction)?;
+
+        let sender = self.receiver.as_u64();
+        pulse_assert(
+            self.db.is_account(payer)?,
+            ChainError::TransactionError(format!(
+                "deferred transaction payer {} does not exist",
+                payer
+            )),
+        )?;
+        if payer != sender {
+            pulse_assert(
+                self.has_authorization(&Name::new(payer))?,
+                ChainError::MissingAuthError(format!("missing authority of {}", Name::new(payer))),
+            )?;
+        }
+
+        let privileged = self.inner.read()?.privileged;
+        if !privileged {
+            let mut provided_permissions = BTreeSet::new();
+            provided_permissions.insert(PermissionLevel::new(
+                sender,
+                self.db.system_accounts().code.into(),
+            ));
+            let delay = Microseconds::new(
+                i64::from(transaction.header.delay_sec().0)
+                    .checked_mul(1_000_000)
+                    .ok_or_else(|| {
+                        ChainError::TransactionError("deferred delay overflows timestamp".into())
+                    })?,
+            );
+            AuthorizationManager::check_authorization(
+                &self.db,
+                &transaction.actions,
+                &BTreeSet::new(),
+                &provided_permissions,
+                delay,
+                &BTreeSet::new(),
+            )?;
+        }
+
+        let no_duplicate_deferred_id = self
+            .db
+            .protocol_feature_activated(NO_DUPLICATE_DEFERRED_ID_FEATURE_DIGEST);
+        if !no_duplicate_deferred_id {
+            pulse_assert(
+                transaction.transaction_extensions.is_empty(),
+                ChainError::TransactionError(
+                    "transaction extensions are not supported for deferred transactions"
+                        .to_string(),
+                ),
+            )?;
+        } else if transaction.transaction_extensions.is_empty() {
+            // The generation context is part of the transaction identity once
+            // NO_DUPLICATE_DEFERRED_ID is active. This is the exact serialized
+            // layout of Leap's deferred_transaction_generation_context.
+            let mut extension = Vec::with_capacity(56);
+            extension.extend_from_slice(self.trx_context.get_packed_transaction().id().as_bytes());
+            extension.extend_from_slice(&sender_id.to_le_bytes());
+            extension.extend_from_slice(&sender.to_le_bytes());
+            transaction.transaction_extensions.push((0, extension));
+            transaction.header.expiration = TimePointSec::default();
+            transaction.header.ref_block_num = 0;
+            transaction.header.ref_block_prefix = 0;
+        } else {
+            pulse_assert(
+                transaction.transaction_extensions.len() == 1
+                    && transaction.transaction_extensions[0].0 == 0
+                    && transaction.transaction_extensions[0].1.len() == 56,
+                ChainError::TransactionError(
+                    "only the deferred transaction generation context extension is supported"
+                        .to_string(),
+                ),
+            )?;
+        }
+
+        if no_duplicate_deferred_id {
+            let extension = &transaction.transaction_extensions[0].1;
+            pulse_assert(
+                extension[32..48] == sender_id.to_le_bytes()
+                    && extension[48..56] == sender.to_le_bytes(),
+                ChainError::TransactionError(
+                    "deferred transaction generation context does not match sender".to_string(),
+                ),
+            )?;
+            pulse_assert(
+                extension[..32] == self.trx_context.get_packed_transaction().id().as_bytes()[..],
+                ChainError::TransactionError(
+                    "deferred transaction generation context does not match parent transaction"
+                        .to_string(),
+                ),
+            )?;
+        }
+
+        let existing = self
+            .db
+            .arena_deferred_transaction_by_sender_id(sender, sender_id);
+        if existing.is_some() {
+            pulse_assert(
+                replace_existing,
+                ChainError::TransactionError(
+                    "deferred transaction with this sender id already exists".to_string(),
+                ),
+            )?;
+            pulse_assert(
+                self.db
+                    .protocol_feature_activated(REPLACE_DEFERRED_FEATURE_DIGEST),
+                ChainError::TransactionError(
+                    "replacing deferred transactions requires the REPLACE_DEFERRED protocol feature"
+                        .to_string(),
+                ),
+            )?;
+        }
+
+        let packed_trx = transaction.pack()?;
+        let trx_id = transaction.id()?.0.0;
+        if no_duplicate_deferred_id
+            && (self.db.arena_deferred_transaction(trx_id).is_some()
+                || self.db.arena_transaction_exists(&trx_id))
+            && existing.as_ref().map(|row| row.trx_id) != Some(trx_id)
+        {
+            return Err(ChainError::TransactionError(
+                "deferred transaction id is already pending".to_string(),
+            ));
+        }
+
+        let published = self
+            .pending_block_timestamp
+            .to_time_point()
+            .time_since_epoch()
+            .count();
+        let delay_until = published
+            .checked_add(i64::from(transaction.header.delay_sec().0) * 1_000_000)
+            .ok_or_else(|| {
+                ChainError::TransactionError("deferred delay overflows timestamp".into())
+            })?;
+        let expiration = delay_until
+            .checked_add(
+                i64::from(self.db.chain_config()?.deferred_trx_expiration_window)
+                    .checked_mul(1_000_000)
+                    .ok_or_else(|| {
+                        ChainError::TransactionError(
+                            "deferred expiration window overflows timestamp".into(),
+                        )
+                    })?,
+            )
+            .ok_or_else(|| {
+                ChainError::TransactionError("deferred expiration overflows timestamp".into())
+            })?;
+
+        if let Some(old) = existing {
+            self.db
+                .arena_remove_deferred_transaction_by_sender_id(sender, sender_id)?;
+            self.update_db_usage(
+                &Name::new(old.payer),
+                -generated_transaction_billable_size(old.packed_trx.len())?,
+            )?;
+        }
+
+        self.db.xpr_import_deferred_transaction(
+            sender,
+            sender_id,
+            payer,
+            trx_id,
+            delay_until,
+            expiration,
+            published,
+            &packed_trx,
+        )?;
+        self.trx_context.add_net_usage(
+            self.db.chain_config()?.base_per_transaction_net_usage as u64
+                + pulsevm_constants::TRANSACTION_ID_NET_USAGE as u64,
+        )?;
+        self.update_db_usage(
+            &Name::new(payer),
+            generated_transaction_billable_size(packed_trx.len())?,
+        )?;
+        Ok(())
+    }
+
+    /// Cancel the deferred transaction owned by the current receiver.
+    pub fn cancel_deferred(&mut self, sender_id: u128) -> Result<bool, ChainError> {
+        if self
+            .db
+            .protocol_feature_activated(DISABLE_DEFERRED_TRXS_STAGE_1_FEATURE_DIGEST)
+        {
+            return Ok(false);
+        }
+        let sender = self.receiver.as_u64();
+        let Some(existing) = self
+            .db
+            .arena_remove_deferred_transaction_by_sender_id(sender, sender_id)?
+        else {
+            return Ok(false);
+        };
+        self.update_db_usage(
+            &Name::new(existing.payer),
+            -generated_transaction_billable_size(existing.packed_trx.len())?,
+        )?;
+        Ok(true)
+    }
+
     pub fn set_action_return_value(&self, value: Vec<u8>) -> Result<(), ChainError> {
         let mut inner = self.inner.write()?;
         inner.action_return_value = Some(value);
@@ -2383,11 +2739,6 @@ impl ApplyContext {
         self.trx_context.protocol_feature_enabled(feature)
     }
 
-    pub fn account_ram_deltas(&self) -> Result<BTreeMap<Name, i64>, ChainError> {
-        let inner = self.inner.read()?;
-        Ok(inner.account_ram_deltas.clone())
-    }
-
     pub fn pause_billing_timer(&self) -> Result<(), ChainError> {
         self.trx_context.pause_billing_timer()?;
         Ok(())
@@ -2403,9 +2754,31 @@ impl ApplyContext {
     }
 
     pub fn get_head_block_num(&self) -> u32 {
-        // Preserve the existing consensus behavior until the setcode height
-        // semantics are corrected behind an explicit protocol feature.
-        0 // TODO: Fix behind a protocol feature gate.
+        self.trx_context.block_num().saturating_sub(1)
+    }
+
+    pub fn get_block_num(&self) -> u32 {
+        self.trx_context.block_num()
+    }
+
+    pub fn publication_time(&self) -> Result<u64, ChainError> {
+        Ok(self
+            .trx_context
+            .publication_time()?
+            .time_since_epoch()
+            .count() as u64)
+    }
+
+    pub fn get_sender(&self) -> Result<u64, ChainError> {
+        let trace = self.trx_context.get_action_trace(self.action_ordinal)?;
+        if trace.creator_action_ordinal() == 0 {
+            return Ok(0);
+        }
+
+        let creator = self
+            .trx_context
+            .get_action_trace(trace.creator_action_ordinal())?;
+        Ok(creator.receiver().as_u64())
     }
 
     pub fn get_pending_block_time(&self) -> &BlockTimestamp {
@@ -2466,16 +2839,12 @@ impl ApplyContext {
     pub fn set_proposed_producers(
         &mut self,
         producers: Vec<ProducerKey>,
-    ) -> Result<(), ChainError> {
+    ) -> Result<i64, ChainError> {
         self.trx_context.set_proposed_producers(producers)
     }
 
     pub fn active_producers(&self) -> Result<Vec<ProducerKey>, ChainError> {
         self.trx_context.active_producers()
-    }
-
-    pub fn active_schedule_version(&self) -> Result<u32, ChainError> {
-        self.trx_context.active_schedule_version()
     }
 
     pub fn validate_ram_usage(&self, account: &Name) -> Result<(), ChainError> {

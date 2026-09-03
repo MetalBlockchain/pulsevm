@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use pulsevm_crypto::Bytes;
+use pulsevm_crypto::{
+    Bytes,
+    Digest,
+};
 use pulsevm_proc_macros::{
     NumBytes,
     Read,
@@ -9,7 +12,10 @@ use pulsevm_proc_macros::{
 use pulsevm_serialization::Write;
 
 use crate::chain::{
-    authority::Authority,
+    authority::{
+        Authority,
+        PermissionLevel,
+    },
     name::Name,
 };
 
@@ -56,6 +62,12 @@ pub struct UnlinkAuth {
     pub account: Name,
     pub code: Name,
     pub message_type: Name,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Read, Write, NumBytes)]
+pub struct CancelDelay {
+    pub canceling_auth: PermissionLevel,
+    pub trx_id: Digest,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Read, Write, NumBytes)]

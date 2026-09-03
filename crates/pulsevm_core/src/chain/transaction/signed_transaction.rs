@@ -29,7 +29,9 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq, Read, Write, NumBytes, Serialize, Default)]
 pub struct SignedTransaction {
     transaction: Transaction,
-    signatures: BTreeSet<Signature>,
+    // Signature order and duplicates are part of the packed transaction's
+    // consensus bytes. Authorization derives its own unique recovered-key set.
+    signatures: Vec<Signature>,
     context_free_data: Vec<Bytes>,
 }
 
@@ -37,7 +39,7 @@ impl SignedTransaction {
     #[inline]
     pub fn new(
         transaction: Transaction,
-        signatures: BTreeSet<Signature>,
+        signatures: Vec<Signature>,
         context_free_data: Vec<Bytes>,
     ) -> Self {
         Self {
@@ -51,7 +53,7 @@ impl SignedTransaction {
         &self.transaction
     }
 
-    pub fn signatures(&self) -> &BTreeSet<Signature> {
+    pub fn signatures(&self) -> &[Signature] {
         &self.signatures
     }
 
@@ -102,7 +104,7 @@ impl SignedTransaction {
             .transaction
             .signing_digest(chain_id, &self.context_free_data)?;
         let signature = private_key.sign(&pulsevm_crypto::Digest(digest))?;
-        self.signatures.insert(signature);
+        self.signatures.push(signature);
         Ok(self)
     }
 }
@@ -133,15 +135,33 @@ pub fn signing_digest(
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::BTreeSet,
-        str::FromStr,
+    use std::str::FromStr;
+
+    use base64::{
+        Engine as _,
+        engine::general_purpose::URL_SAFE_NO_PAD,
+    };
+    use p256::ecdsa::SigningKey;
+    use pulsevm_crypto::{
+        AuthorityPublicKey,
+        R1Signature,
+        WebAuthnSignature,
+    };
+    use pulsevm_database::TimePointSec;
+    use pulsevm_serialization::{
+        Read,
+        Write,
+    };
+    use sha2::{
+        Digest as _,
+        Sha256,
     };
 
-    use pulsevm_database::TimePointSec;
-
     use crate::{
-        crypto::PrivateKey,
+        crypto::{
+            PrivateKey,
+            Signature,
+        },
         id::Id,
         transaction::{
             SignedTransaction,
@@ -162,7 +182,7 @@ mod tests {
                 vec![],
                 vec![],
             ),
-            BTreeSet::new(),
+            Vec::new(),
             vec![],
         );
         let chain_id =
@@ -182,5 +202,99 @@ mod tests {
         let recovered_keys = signed_tx.recovered_keys(&chain_id).unwrap();
         assert_eq!(recovered_keys.len(), 1);
         assert!(recovered_keys.contains(&public_key));
+    }
+
+    #[test]
+    fn binary_round_trip_preserves_signature_order_and_duplicates() {
+        let first = Signature::from_str("SIG_K1_KZDbad1igYb6zfjGqziC4DwanAYv96DMJDb3NLgMgLwSximq6Gf3GjFQEVDsRYEihRvsx8BxSLvYHhyCVYyxHZZh2H2vtX").unwrap();
+        let second = Signature::from_str("SIG_K1_K6tVhH5eiejjjnyBU1LnTkYDzHnLxiQSGZdc5N3qwo6aUz1pcABEicDJvr1wHKDhW24DmP2v7smw6hzBjWr5sJgHfi5SRQ").unwrap();
+        let expected = vec![first.clone(), second, first];
+        let signed = SignedTransaction::new(Transaction::default(), expected.clone(), vec![]);
+        let packed = signed.pack().unwrap();
+        let decoded = SignedTransaction::read(&packed, &mut 0).unwrap();
+
+        assert_eq!(decoded.signatures(), expected);
+    }
+
+    #[test]
+    fn recovered_authority_keys_preserve_r1_and_webauthn_variants() {
+        let tx = Transaction::new(
+            TransactionHeader::new(TimePointSec::new(100), 1, 2, 4.into(), 3, 5.into()),
+            vec![],
+            vec![],
+        );
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
+        let digest = tx.signing_digest(&chain_id, &vec![]).unwrap();
+        let digest = pulsevm_crypto::Digest(digest);
+
+        let signing_key = SigningKey::from_bytes((&[11u8; 32]).into()).unwrap();
+        let (r1, recovery_id) = signing_key
+            .sign_prehash_recoverable(digest.as_bytes())
+            .unwrap();
+        let (r1, recovery_id) = match r1.normalize_s() {
+            Some(r1) => (r1, recovery_id.to_byte() ^ 1),
+            None => (r1, recovery_id.to_byte()),
+        };
+        let mut compact = [0u8; 65];
+        compact[0] = 31 + recovery_id;
+        compact[1..].copy_from_slice(&r1.to_bytes());
+        let r1_signature = Signature::new_r1(R1Signature::from_compact65(&compact));
+        let r1_tx = SignedTransaction::new(tx.clone(), vec![r1_signature], vec![]);
+        let r1_keys = r1_tx.recovered_authority_keys(&chain_id).unwrap();
+        assert!(
+            r1_keys.contains(&AuthorityPublicKey::R1(
+                signing_key
+                    .verifying_key()
+                    .to_encoded_point(true)
+                    .as_bytes()
+                    .try_into()
+                    .unwrap(),
+            ))
+        );
+
+        let client_json = format!(
+            r#"{{"type":"webauthn.get","challenge":"{}","origin":"https://example.test"}}"#,
+            URL_SAFE_NO_PAD.encode(digest.as_bytes()),
+        );
+        let mut auth_data = vec![0u8; 37];
+        auth_data[..32].copy_from_slice(&Sha256::digest(b"example.test"));
+        auth_data[32] = 0x01;
+        let mut signed_data = auth_data.clone();
+        signed_data.extend_from_slice(&Sha256::digest(client_json.as_bytes()));
+        let signed_digest: [u8; 32] = Sha256::digest(signed_data).into();
+        let (wa, recovery_id) = signing_key
+            .sign_prehash_recoverable(&signed_digest)
+            .unwrap();
+        let (wa, recovery_id) = match wa.normalize_s() {
+            Some(wa) => (wa, recovery_id.to_byte() ^ 1),
+            None => (wa, recovery_id.to_byte()),
+        };
+        let mut wa_compact = [0u8; 65];
+        wa_compact[0] = 31 + recovery_id;
+        wa_compact[1..].copy_from_slice(&wa.to_bytes());
+        let wa_tx = SignedTransaction::new(
+            tx,
+            vec![Signature::new_webauthn(WebAuthnSignature::new(
+                wa_compact,
+                auth_data,
+                client_json,
+            ))],
+            vec![],
+        );
+        let wa_keys = wa_tx.recovered_authority_keys(&chain_id).unwrap();
+        assert!(
+            wa_keys.contains(&AuthorityPublicKey::WebAuthn {
+                point: signing_key
+                    .verifying_key()
+                    .to_encoded_point(true)
+                    .as_bytes()
+                    .try_into()
+                    .unwrap(),
+                user_presence: 1,
+                rpid: "example.test".into(),
+            })
+        );
     }
 }

@@ -124,6 +124,14 @@ impl UsageAccumulator {
     }
 
     fn add(&mut self, units: u64, ordinal: u32, window_size: u32) {
+        // Imported checkpoints resume at the source block height. Keep the
+        // accumulator defensive in case an older checkpoint or malformed import
+        // presents a backwards ordinal; resetting is safer than unsigned wrap.
+        if ordinal < self.last_ordinal {
+            self.value_ex = 0;
+            self.consumed = 0;
+            self.last_ordinal = ordinal;
+        }
         let value_ex_contrib = integer_divide_ceil(
             units as u128 * RATE_LIMITING_PRECISION as u128,
             window_size as u128,
@@ -555,6 +563,20 @@ struct DynGlobalPropertyRow {
     global_action_sequence: u64,
 }
 
+fn write_varuint(mut value: u64, out: &mut Vec<u8>) {
+    loop {
+        let mut byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        out.push(byte);
+        if value == 0 {
+            return;
+        }
+    }
+}
+
 /// Arena-internal bookkeeping — NOT part of any consensus state and never
 /// serialized into a `*_state_bytes` root. Holds the next permission id the
 /// arena will assign, replicating chainbase's per-index `undo_index::_next_id`
@@ -599,10 +621,52 @@ struct GlobalPropertyRow {
     max_transaction_cpu_usage: u32,
     min_transaction_cpu_usage: u32,
     max_transaction_lifetime: u32,
+    deferred_trx_expiration_window: u32,
     max_transaction_delay: u32,
     max_inline_action_size: u32,
     max_inline_action_depth: u16,
     max_authority_depth: u16,
+    _pad: u32,
+}
+
+/// Undo-tracked `global_property_object::proposed_schedule` state. The packed
+/// schedule remains in a blob because the producer vector is variable-length;
+/// `block_num` records the block in which `set_proposed_producers` wrote it.
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout, ArenaObject)]
+#[arena(type_id = 24)]
+struct ProposedScheduleRow {
+    id: ObjectId<ProposedScheduleRow>,
+    block_num: u32,
+    _pad: u32,
+    packed_schedule: BlobRef,
+}
+
+/// One activated protocol feature from chainbase's `protocol_state` singleton.
+/// The singleton is represented as an ordered table so the variable-length
+/// feature vector remains undo/checkpoint safe without imposing a fixed cap on
+/// the number of features.
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout, ArenaObject)]
+#[arena(type_id = 22)]
+struct ProtocolFeatureRow {
+    id: ObjectId<ProtocolFeatureRow>,
+    feature_digest: [u8; 32],
+    activation_block_num: u32,
+    _pad: u32,
+}
+
+/// A protocol feature requested by a privileged contract but not yet activated
+/// in a block header. Leap keeps this transient vector beside the activated
+/// feature set; Arena stores it as an undo/checkpoint-safe table so forks and
+/// restarts preserve the same preactivation state.
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout, ArenaObject)]
+#[arena(type_id = 23)]
+struct PreactivatedProtocolFeatureRow {
+    id: ObjectId<PreactivatedProtocolFeatureRow>,
+    feature_digest: [u8; 32],
+    _pad: [u8; 8],
 }
 
 /// Rust representation of the chainbase `resource_limits_config_object` singleton: the
@@ -652,6 +716,7 @@ pub struct ChainConfigParams {
     pub max_transaction_cpu_usage: u32,
     pub min_transaction_cpu_usage: u32,
     pub max_transaction_lifetime: u32,
+    pub deferred_trx_expiration_window: u32,
     pub max_transaction_delay: u32,
     pub max_inline_action_size: u32,
     pub max_inline_action_depth: u16,
@@ -675,6 +740,7 @@ impl ChainConfigParams {
         out.extend_from_slice(&self.max_transaction_cpu_usage.to_le_bytes());
         out.extend_from_slice(&self.min_transaction_cpu_usage.to_le_bytes());
         out.extend_from_slice(&self.max_transaction_lifetime.to_le_bytes());
+        out.extend_from_slice(&self.deferred_trx_expiration_window.to_le_bytes());
         out.extend_from_slice(&self.max_transaction_delay.to_le_bytes());
         out.extend_from_slice(&self.max_inline_action_size.to_le_bytes());
         out.extend_from_slice(&self.max_inline_action_depth.to_le_bytes());
@@ -698,6 +764,7 @@ impl GlobalPropertyRow {
             max_transaction_cpu_usage: self.max_transaction_cpu_usage,
             min_transaction_cpu_usage: self.min_transaction_cpu_usage,
             max_transaction_lifetime: self.max_transaction_lifetime,
+            deferred_trx_expiration_window: self.deferred_trx_expiration_window,
             max_transaction_delay: self.max_transaction_delay,
             max_inline_action_size: self.max_inline_action_size,
             max_inline_action_depth: self.max_inline_action_depth,
@@ -716,6 +783,82 @@ struct TransactionRow {
     expiration: u32,
     _pad: u32,
     trx_id: [u8; 32],
+}
+
+/// A complete XPR `generated_transaction_object` carried across the migration
+/// boundary. The packed transaction belongs in the blob arena; all scheduler
+/// fields remain native values so selection can use an ordered secondary index
+/// without reparsing the payload. This is intentionally separate from
+/// `TransactionRow`, which is only the short-lived duplicate-transaction set.
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout)]
+struct DeferredTransactionRow {
+    id: ObjectId<DeferredTransactionRow>,
+    sender: u64,
+    sender_id_lo: u64,
+    sender_id_hi: u64,
+    payer: u64,
+    trx_id: [u8; 32],
+    delay_until: i64,
+    expiration: i64,
+    published: i64,
+    packed_trx: BlobRef,
+}
+
+struct DeferredByTrxId;
+impl IndexedBy<DeferredTransactionRow> for DeferredByTrxId {
+    type Key = [u8; 32];
+    fn key(o: &DeferredTransactionRow) -> Self::Key {
+        o.trx_id
+    }
+}
+
+struct DeferredBySenderId;
+impl IndexedBy<DeferredTransactionRow> for DeferredBySenderId {
+    type Key = (u64, u64, u64);
+    fn key(o: &DeferredTransactionRow) -> Self::Key {
+        (o.sender, o.sender_id_hi, o.sender_id_lo)
+    }
+}
+
+struct DeferredByDelay;
+impl IndexedBy<DeferredTransactionRow> for DeferredByDelay {
+    type Key = (i64, i64);
+    fn key(o: &DeferredTransactionRow) -> Self::Key {
+        (o.delay_until, o.id.raw())
+    }
+}
+
+impl ArenaObject for DeferredTransactionRow {
+    const TYPE_ID: u16 = 21;
+    fn id(&self) -> ObjectId<Self> {
+        self.id
+    }
+    fn set_id(&mut self, id: ObjectId<Self>) {
+        self.id = id;
+    }
+    fn secondary_indices() -> Vec<Box<dyn SecondaryIndex<Self>>> {
+        vec![
+            key_index::<Self, DeferredByTrxId>(),
+            key_index::<Self, DeferredBySenderId>(),
+            key_index::<Self, DeferredByDelay>(),
+        ]
+    }
+}
+
+/// A materialized deferred transaction, returned only at explicit database
+/// boundaries. Arena rows carry a blob reference instead of retaining the
+/// packed transaction in their fixed-width representation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeferredTransaction {
+    pub sender: u64,
+    pub sender_id: u128,
+    pub payer: u64,
+    pub trx_id: [u8; 32],
+    pub delay_until: i64,
+    pub expiration: i64,
+    pub published: i64,
+    pub packed_trx: Vec<u8>,
 }
 
 struct TxByTrxId;
@@ -1214,8 +1357,12 @@ fn build_registered_db() -> Result<Db, DbError> {
     db.add_table::<DynGlobalPropertyRow>()?;
     db.add_table::<PermSeqRow>()?;
     db.add_table::<GlobalPropertyRow>()?;
+    db.add_table::<ProposedScheduleRow>()?;
+    db.add_table::<ProtocolFeatureRow>()?;
+    db.add_table::<PreactivatedProtocolFeatureRow>()?;
     db.add_table::<ResourceConfigRow>()?;
     db.add_table::<TransactionRow>()?;
+    db.add_table::<DeferredTransactionRow>()?;
     db.add_table::<ContractTableRow>()?;
     db.add_table::<ContractKeyValueRow>()?;
     db.add_table::<ContractIndex64Row>()?;
@@ -1317,6 +1464,80 @@ impl ChainDatabase {
         self.lock().create::<AccountMetaRow>(|row| {
             row.name = name;
             row.flags = privileged as u32;
+        })?;
+        Ok(())
+    }
+
+    /// Insert the complete subset of `account_metadata_object` that XPR's
+    /// state-history serializer exposes. Sequence fields are intentionally left
+    /// at zero: SHiP does not serialize them, so inventing values would be less
+    /// correct than preserving the observable fields exactly.
+    pub fn xpr_import_account_metadata(
+        &self,
+        name: u64,
+        privileged: bool,
+        last_code_update: i64,
+        code_hash: [u8; 32],
+        vm_type: u8,
+        vm_version: u8,
+    ) -> Result<(), DbError> {
+        self.lock().create::<AccountMetaRow>(|row| {
+            row.name = name;
+            row.flags = privileged as u32;
+            row.last_code_update = last_code_update;
+            row.code_hash = code_hash;
+            row.vm_type = vm_type;
+            row.vm_version = vm_version;
+        })?;
+        Ok(())
+    }
+
+    /// Replace the source-visible account metadata fields when a SHiP delta
+    /// modifies an existing account_metadata row.
+    pub fn xpr_import_update_account_metadata_source(
+        &self,
+        name: u64,
+        privileged: bool,
+        last_code_update: i64,
+        code_hash: [u8; 32],
+        vm_type: u8,
+        vm_version: u8,
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let id = db
+            .find_by_hash::<AccountMetaRow, AccountMetaRowByName>(&name)?
+            .map(|row| row.id())
+            .ok_or_else(|| DbError::Corrupted("account_metadata delta row is missing".into()))?;
+        db.modify::<AccountMetaRow>(id, |row| {
+            row.flags = privileged as u32;
+            row.last_code_update = last_code_update;
+            row.code_hash = code_hash;
+            row.vm_type = vm_type;
+            row.vm_version = vm_version;
+        })?;
+        Ok(())
+    }
+
+    /// Restores account-metadata sequence counters from the source chainbase
+    /// sidecar. SHiP omits these counters from its row projection.
+    pub fn xpr_import_update_account_metadata(
+        &self,
+        name: u64,
+        recv_sequence: u64,
+        auth_sequence: u64,
+        code_sequence: u64,
+        abi_sequence: u64,
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let id = db
+            .find_by_hash::<AccountMetaRow, AccountMetaRowByName>(&name)?
+            .map(|row| row.id())
+            .ok_or_else(|| DbError::Corrupted("account_metadata sidecar row is missing".into()))?;
+        db.modify::<AccountMetaRow>(id, |row| {
+            row.recv_sequence = recv_sequence;
+            row.auth_sequence = auth_sequence;
+            row.code_sequence = code_sequence;
+            row.abi_sequence = abi_sequence;
         })?;
         Ok(())
     }
@@ -2068,29 +2289,33 @@ impl ChainDatabase {
         out
     }
 
-    /// Seeds resource_usage rows from the canonical layout — genesis native
-    /// accounts get their rows (and billed ram) inside C++. A present owner is
-    /// left untouched.
+    /// Seeds or replaces resource_usage rows from the canonical layout. The
+    /// replacement behavior is also used when applying SHiP delta rows.
     pub fn hydrate_resource_usage(&self, bytes: &[u8]) -> Result<(), DbError> {
         const ROW: usize = 8 + 8 + 20 + 20; // owner, ram, net acc, cpu acc
         let mut db = self.lock();
         for c in bytes.as_chunks::<ROW>().0 {
             let owner = u64::from_le_bytes(c[0..8].try_into().unwrap());
-            if db
-                .find_by::<ResourceUsageRow, ResourceUsageRowByOwner>(&owner)?
-                .is_some()
-            {
-                continue;
-            }
             let ram = u64::from_le_bytes(c[8..16].try_into().unwrap());
             let net = read_acc(&c[16..36]);
             let cpu = read_acc(&c[36..56]);
-            db.create::<ResourceUsageRow>(|r| {
-                r.owner = owner;
-                r.ram_usage = ram;
-                r.net_usage = net;
-                r.cpu_usage = cpu;
-            })?;
+            if let Some(id) = db
+                .find_by::<ResourceUsageRow, ResourceUsageRowByOwner>(&owner)?
+                .map(|row| row.id())
+            {
+                db.modify::<ResourceUsageRow>(id, |r| {
+                    r.ram_usage = ram;
+                    r.net_usage = net;
+                    r.cpu_usage = cpu;
+                })?;
+            } else {
+                db.create::<ResourceUsageRow>(|r| {
+                    r.owner = owner;
+                    r.ram_usage = ram;
+                    r.net_usage = net;
+                    r.cpu_usage = cpu;
+                })?;
+            }
         }
         Ok(())
     }
@@ -2117,30 +2342,34 @@ impl ChainDatabase {
         out
     }
 
-    /// Seeds resource_limits rows from the canonical layout (genesis native
-    /// accounts). A present `(pending, owner)` is left untouched.
+    /// Seeds or replaces resource_limits rows from the canonical layout.
     pub fn hydrate_account_limits(&self, bytes: &[u8]) -> Result<(), DbError> {
         const ROW: usize = 1 + 8 + 8 + 8 + 8;
         let mut db = self.lock();
         for c in bytes.as_chunks::<ROW>().0 {
             let pending = c[0];
             let owner = u64::from_le_bytes(c[1..9].try_into().unwrap());
-            if db
-                .find_by::<ResourceLimitsRow, LimitsByOwner>(&(pending, owner))?
-                .is_some()
-            {
-                continue;
-            }
             let ram = u64::from_le_bytes(c[9..17].try_into().unwrap()) as i64;
             let net = u64::from_le_bytes(c[17..25].try_into().unwrap()) as i64;
             let cpu = u64::from_le_bytes(c[25..33].try_into().unwrap()) as i64;
-            db.create::<ResourceLimitsRow>(|r| {
-                r.pending = pending;
-                r.owner = owner;
-                r.ram_bytes = ram;
-                r.net_weight = net;
-                r.cpu_weight = cpu;
-            })?;
+            if let Some(id) = db
+                .find_by::<ResourceLimitsRow, LimitsByOwner>(&(pending, owner))?
+                .map(|row| row.id())
+            {
+                db.modify::<ResourceLimitsRow>(id, |r| {
+                    r.ram_bytes = ram;
+                    r.net_weight = net;
+                    r.cpu_weight = cpu;
+                })?;
+            } else {
+                db.create::<ResourceLimitsRow>(|r| {
+                    r.pending = pending;
+                    r.owner = owner;
+                    r.ram_bytes = ram;
+                    r.net_weight = net;
+                    r.cpu_weight = cpu;
+                })?;
+            }
         }
         Ok(())
     }
@@ -2268,6 +2497,26 @@ impl ChainDatabase {
             return Ok(());
         };
         db.modify::<PermissionUsageRow>(ObjectId::new(usage_id), |p| p.last_used = last_used_us)?;
+        Ok(())
+    }
+
+    /// Restores `permission_usage_object::last_used` from the source-chain
+    /// sidecar. SHiP exposes the permission's update time but not this usage
+    /// singleton's timestamp.
+    pub fn xpr_import_permission_last_used(
+        &self,
+        owner: u64,
+        perm_name: u64,
+        last_used_us: i64,
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let usage_id = db
+            .find_by::<PermissionRow, PermByOwner>(&(owner, perm_name))?
+            .map(|row| row.usage_id)
+            .ok_or_else(|| DbError::Corrupted("permission sidecar row is missing".into()))?;
+        db.modify::<PermissionUsageRow>(ObjectId::new(usage_id), |row| {
+            row.last_used = last_used_us;
+        })?;
         Ok(())
     }
 
@@ -2415,8 +2664,9 @@ impl ChainDatabase {
         let pendings: Vec<(ObjectId<ResourceLimitsRow>, u64, i64, i64, i64)> = {
             let table = db.table::<ResourceLimitsRow>()?;
             table
-                .iter()
-                .filter(|r| r.pending == 1)
+                .get_index::<LimitsByOwner>()
+                .range((1u8, 0)..=(1u8, u64::MAX))
+                .map(|(_, r)| r)
                 .map(|r| (r.id(), r.owner, r.ram_bytes, r.net_weight, r.cpu_weight))
                 .collect()
         };
@@ -2567,6 +2817,57 @@ impl ChainDatabase {
             s.virtual_cpu_limit = cpu_max;
             s.virtual_net_limit = net_max;
         })?;
+        Ok(())
+    }
+
+    /// Replaces the singleton with a complete state-history hydration. Pending
+    /// per-block counters are not part of XPR's state-history row and therefore
+    /// begin at zero at the migration boundary. The source ordinal is retained
+    /// because imported checkpoints resume at their source block height.
+    #[allow(clippy::too_many_arguments)]
+    pub fn hydrate_resource_state(
+        &self,
+        net: (u64, u64, u32),
+        cpu: (u64, u64, u32),
+        total_net_weight: u64,
+        total_cpu_weight: u64,
+        total_ram_bytes: u64,
+        virtual_net_limit: u64,
+        virtual_cpu_limit: u64,
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let apply = |s: &mut ResourceStateRow| {
+            s.average_block_net_usage = UsageAccumulator {
+                value_ex: net.0,
+                consumed: net.1,
+                last_ordinal: net.2,
+                _pad: 0,
+            };
+            s.average_block_cpu_usage = UsageAccumulator {
+                value_ex: cpu.0,
+                consumed: cpu.1,
+                last_ordinal: cpu.2,
+                _pad: 0,
+            };
+            s.pending_net_usage = 0;
+            s.pending_cpu_usage = 0;
+            s.total_net_weight = total_net_weight;
+            s.total_cpu_weight = total_cpu_weight;
+            s.total_ram_bytes = total_ram_bytes;
+            s.virtual_net_limit = virtual_net_limit;
+            s.virtual_cpu_limit = virtual_cpu_limit;
+        };
+        let existing = db
+            .table::<ResourceStateRow>()?
+            .iter()
+            .next()
+            .map(|s| s.id());
+        match existing {
+            Some(id) => db.modify::<ResourceStateRow>(id, apply)?,
+            None => {
+                db.create::<ResourceStateRow>(apply)?;
+            }
+        }
         Ok(())
     }
 
@@ -2859,6 +3160,93 @@ impl ChainDatabase {
         Ok(())
     }
 
+    /// Insert a code object from XPR state history. `first_block_used` is not
+    /// included in SHiP's `code` row; zero is a sentinel that preserves runtime
+    /// execution while making that unavailable bookkeeping explicit.
+    pub fn xpr_import_code(
+        &self,
+        code_hash: [u8; 32],
+        code: &[u8],
+        code_ref_count: u64,
+        vm_type: u8,
+        vm_version: u8,
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let blob = db.alloc_blob::<CodeRow>(code)?;
+        db.create::<CodeRow>(|row| {
+            row.code_hash = code_hash;
+            row.code = blob;
+            row.code_ref_count = code_ref_count;
+            row.vm_type = vm_type;
+            row.vm_version = vm_version;
+        })?;
+        Ok(())
+    }
+
+    /// Replace a source code row during SHiP delta application, preserving its
+    /// Arena object id and any fields not represented by the wire row.
+    pub fn xpr_import_update_code(
+        &self,
+        code_hash: [u8; 32],
+        code: &[u8],
+        vm_type: u8,
+        vm_version: u8,
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let id = db
+            .find_by::<CodeRow, CodeByHash>(&(code_hash, vm_type, vm_version))?
+            .map(|row| row.id())
+            .ok_or_else(|| DbError::Corrupted("code delta row is missing".into()))?;
+        let blob = db.alloc_blob::<CodeRow>(code)?;
+        db.modify::<CodeRow>(id, |row| {
+            row.code = blob;
+        })?;
+        Ok(())
+    }
+
+    /// Remove a code object whose source-chain reference count reached zero.
+    /// SHiP can emit these rows as tombstones after the last account reference
+    /// is cleared, so the Arena mirror must release the corresponding blob and
+    /// indexed row as one undoable operation.
+    pub fn xpr_import_remove_code(
+        &self,
+        code_hash: [u8; 32],
+        vm_type: u8,
+        vm_version: u8,
+    ) -> Result<bool, DbError> {
+        let mut db = self.lock();
+        let Some(id) = db
+            .find_by::<CodeRow, CodeByHash>(&(code_hash, vm_type, vm_version))?
+            .map(|row| row.id())
+        else {
+            return Ok(false);
+        };
+        db.remove::<CodeRow>(id)?;
+        Ok(true)
+    }
+
+    /// Restores code-object bookkeeping omitted by SHiP (`first_block_used`)
+    /// and verifies the source refcount against the imported code row.
+    pub fn xpr_import_update_code_metadata(
+        &self,
+        code_hash: [u8; 32],
+        vm_type: u8,
+        vm_version: u8,
+        code_ref_count: u64,
+        first_block_used: u32,
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let id = db
+            .find_by::<CodeRow, CodeByHash>(&(code_hash, vm_type, vm_version))?
+            .map(|row| row.id())
+            .ok_or_else(|| DbError::Corrupted("code sidecar row is missing".into()))?;
+        db.modify::<CodeRow>(id, |row| {
+            row.code_ref_count = code_ref_count;
+            row.first_block_used = first_block_used;
+        })?;
+        Ok(())
+    }
+
     /// The wasm image for `(code_hash, vm_type, vm_version)`, or `None` if the
     /// code row is absent. This is the bytecode the VM compiles and runs, so
     /// serving it from the arena is what puts contract execution on arena-owned
@@ -2957,6 +3345,7 @@ impl ChainDatabase {
             r.max_transaction_cpu_usage = p.max_transaction_cpu_usage;
             r.min_transaction_cpu_usage = p.min_transaction_cpu_usage;
             r.max_transaction_lifetime = p.max_transaction_lifetime;
+            r.deferred_trx_expiration_window = p.deferred_trx_expiration_window;
             r.max_transaction_delay = p.max_transaction_delay;
             r.max_inline_action_size = p.max_inline_action_size;
             r.max_inline_action_depth = p.max_inline_action_depth;
@@ -2996,11 +3385,67 @@ impl ChainDatabase {
             max_transaction_cpu_usage: r.max_transaction_cpu_usage,
             min_transaction_cpu_usage: r.min_transaction_cpu_usage,
             max_transaction_lifetime: r.max_transaction_lifetime,
+            deferred_trx_expiration_window: r.deferred_trx_expiration_window,
             max_transaction_delay: r.max_transaction_delay,
             max_inline_action_size: r.max_inline_action_size,
             max_inline_action_depth: r.max_inline_action_depth,
             max_authority_depth: r.max_authority_depth,
         })
+    }
+
+    /// Replace the undo-tracked producer schedule proposed by the system
+    /// contract. A later proposal in the same block replaces the earlier one;
+    /// promotion to a block-header pending schedule clears this singleton.
+    pub fn set_proposed_schedule(
+        &self,
+        block_num: u32,
+        packed_schedule: &[u8],
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let blob = db.alloc_blob::<ProposedScheduleRow>(packed_schedule)?;
+        let existing = db
+            .table::<ProposedScheduleRow>()?
+            .iter()
+            .next()
+            .map(|row| row.id());
+        match existing {
+            Some(id) => db.modify::<ProposedScheduleRow>(id, |row| {
+                row.block_num = block_num;
+                row.packed_schedule = blob;
+            })?,
+            None => {
+                db.create::<ProposedScheduleRow>(|row| {
+                    row.block_num = block_num;
+                    row.packed_schedule = blob;
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Current proposed schedule as `(proposal block, packed schedule)`.
+    pub fn proposed_schedule(&self) -> Option<(u32, Vec<u8>)> {
+        let db = self.lock();
+        let row = db.table::<ProposedScheduleRow>().ok()?.iter().next()?;
+        let packed = db
+            .blob::<ProposedScheduleRow>(row.packed_schedule)
+            .ok()?
+            .to_vec();
+        Some((row.block_num, packed))
+    }
+
+    /// Clear a proposal after it has been promoted into a signed block header.
+    pub fn clear_proposed_schedule(&self) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let id = db
+            .table::<ProposedScheduleRow>()?
+            .iter()
+            .next()
+            .map(|row| row.id());
+        if let Some(id) = id {
+            db.remove::<ProposedScheduleRow>(id)?;
+        }
+        Ok(())
     }
 
     /// Canonical serialization of the stored `chain_config` (16 fields, little
@@ -3016,6 +3461,162 @@ impl ChainDatabase {
             Some(r) => r.params().to_state_bytes(),
             None => Vec::new(),
         }
+    }
+
+    /// Replaces the imported XPR protocol-feature vector. Feature activation
+    /// is source-state metadata for the independent Pulse chain, but retaining
+    /// it makes the Arena SHiP `protocol_state` row lossless.
+    pub fn xpr_import_protocol_features(
+        &self,
+        features: &[([u8; 32], u32)],
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let ids: Vec<_> = db
+            .table::<ProtocolFeatureRow>()?
+            .iter()
+            .map(|row| row.id())
+            .collect();
+        for id in ids {
+            db.remove::<ProtocolFeatureRow>(id)?;
+        }
+        for (feature_digest, activation_block_num) in features {
+            db.create::<ProtocolFeatureRow>(|row| {
+                row.feature_digest = *feature_digest;
+                row.activation_block_num = *activation_block_num;
+            })?;
+        }
+        // A chainbase snapshot's protocol_state contains activated features;
+        // any transient preactivation queue belongs to the live source node and
+        // must not leak into a state-only import.
+        let preactivated_ids: Vec<_> = db
+            .table::<PreactivatedProtocolFeatureRow>()?
+            .iter()
+            .map(|row| row.id())
+            .collect();
+        for id in preactivated_ids {
+            db.remove::<PreactivatedProtocolFeatureRow>(id)?;
+        }
+        Ok(())
+    }
+
+    /// Return the ordered preactivation queue used by the runtime and block
+    /// producer. The order is consensus-visible in a protocol-feature header
+    /// extension, so do not derive it from an unordered map.
+    pub fn preactivated_protocol_features(&self) -> Vec<[u8; 32]> {
+        let db = self.lock();
+        let mut rows: Vec<_> = db
+            .table::<PreactivatedProtocolFeatureRow>()
+            .map(|table| table.iter().copied().collect())
+            .unwrap_or_default();
+        rows.sort_by_key(|row| row.id().raw());
+        rows.into_iter().map(|row| row.feature_digest).collect()
+    }
+
+    /// Queue a protocol feature for activation by a subsequent block header.
+    /// Already-active and duplicate requests are rejected, matching Leap's
+    /// deterministic protocol-feature errors rather than silently accepting a
+    /// second request.
+    pub fn preactivate_protocol_feature(&self, feature_digest: [u8; 32]) -> Result<(), DbError> {
+        let mut db = self.lock();
+        if db
+            .table::<ProtocolFeatureRow>()?
+            .iter()
+            .any(|row| row.feature_digest == feature_digest)
+        {
+            return Err(DbError::Corrupted(
+                "protocol feature is already activated".into(),
+            ));
+        }
+        if db
+            .table::<PreactivatedProtocolFeatureRow>()?
+            .iter()
+            .any(|row| row.feature_digest == feature_digest)
+        {
+            return Err(DbError::Corrupted(
+                "protocol feature is already preactivated".into(),
+            ));
+        }
+        db.create::<PreactivatedProtocolFeatureRow>(|row| {
+            row.feature_digest = feature_digest;
+        })?;
+        Ok(())
+    }
+
+    /// Activate the feature list committed by a block header. Validation above
+    /// this storage layer decides which features require preactivation; direct
+    /// activation is valid for features such as PREACTIVATE_FEATURE itself.
+    /// Activation and queue removal happen in one undo-tracked operation, so
+    /// failed/forked blocks restore both sides.
+    pub fn activate_protocol_features(
+        &self,
+        feature_digests: &[[u8; 32]],
+        activation_block_num: u32,
+    ) -> Result<(), DbError> {
+        if feature_digests.is_empty() {
+            return Err(DbError::Corrupted(
+                "protocol feature activation list is empty".into(),
+            ));
+        }
+        let mut db = self.lock();
+        let queued: Vec<_> = db
+            .table::<PreactivatedProtocolFeatureRow>()?
+            .iter()
+            .copied()
+            .collect();
+        let active: Vec<_> = db.table::<ProtocolFeatureRow>()?.iter().copied().collect();
+        let mut ids = Vec::with_capacity(feature_digests.len());
+        for digest in feature_digests {
+            if active.iter().any(|row| row.feature_digest == *digest) {
+                return Err(DbError::Corrupted(
+                    "protocol feature is already activated".into(),
+                ));
+            }
+            if feature_digests[..ids.len()]
+                .iter()
+                .any(|previous| previous == digest)
+            {
+                return Err(DbError::Corrupted(
+                    "protocol feature activation list contains a duplicate".into(),
+                ));
+            }
+            ids.push(*digest);
+        }
+        for digest in ids {
+            if let Some(queued_row) = queued.iter().find(|row| row.feature_digest == digest) {
+                db.remove::<PreactivatedProtocolFeatureRow>(queued_row.id())?;
+            }
+            db.create::<ProtocolFeatureRow>(|row| {
+                row.feature_digest = digest;
+                row.activation_block_num = activation_block_num;
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Canonical SHiP payload for the imported `protocol_state` singleton.
+    pub fn protocol_state_bytes(&self) -> Vec<u8> {
+        let db = self.lock();
+        let mut rows: Vec<_> = match db.table::<ProtocolFeatureRow>() {
+            Ok(table) => table.iter().copied().collect(),
+            Err(_) => return vec![0, 0],
+        };
+        rows.sort_by_key(|row| row.id().raw());
+        let mut out = Vec::new();
+        out.push(0); // protocol_state_v0 version
+        write_varuint(rows.len() as u64, &mut out);
+        for row in rows {
+            out.push(0); // activated_protocol_feature_v0 version
+            out.extend_from_slice(&row.feature_digest);
+            out.extend_from_slice(&row.activation_block_num.to_le_bytes());
+        }
+        out
+    }
+
+    pub fn protocol_feature_activated(&self, feature_digest: [u8; 32]) -> bool {
+        self.lock()
+            .table::<ProtocolFeatureRow>()
+            .map(|table| table.iter().any(|row| row.feature_digest == feature_digest))
+            .unwrap_or(false)
     }
 
     // ----- resource_limits_config_object ------------------------------------
@@ -3156,14 +3757,234 @@ impl ChainDatabase {
         let mut db = self.lock();
         let expired: Vec<ObjectId<TransactionRow>> = db
             .table::<TransactionRow>()?
+            .get_index::<TxByExpiration>()
             .iter()
-            .filter(|t| (t.expiration as i64) * 1_000_000 < cutoff_micros)
-            .map(|t| t.id())
+            .take_while(|(key, _)| (key.0 as i64) * 1_000_000 < cutoff_micros)
+            .map(|(_, transaction)| transaction.id())
             .collect();
         for id in expired {
             db.remove::<TransactionRow>(id)?;
         }
         Ok(())
+    }
+
+    // ----- deferred transactions -------------------------------------------
+
+    /// Insert one complete XPR `generated_transaction_object` during a
+    /// migration. The row participates in the caller's arena undo session, so
+    /// any later import validation failure restores the database unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub fn xpr_import_deferred_transaction(
+        &self,
+        sender: u64,
+        sender_id: u128,
+        payer: u64,
+        trx_id: [u8; 32],
+        delay_until: i64,
+        expiration: i64,
+        published: i64,
+        packed_trx: &[u8],
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let packed_trx_ref = db.alloc_blob::<DeferredTransactionRow>(packed_trx)?;
+        db.create::<DeferredTransactionRow>(|row| {
+            row.sender = sender;
+            row.sender_id_lo = sender_id as u64;
+            row.sender_id_hi = (sender_id >> 64) as u64;
+            row.payer = payer;
+            row.trx_id = trx_id;
+            row.delay_until = delay_until;
+            row.expiration = expiration;
+            row.published = published;
+            row.packed_trx = packed_trx_ref;
+        })?;
+        Ok(())
+    }
+
+    /// Number of pending deferred transactions. Startup uses this to refuse a
+    /// migrated checkpoint until the controller has a complete execution path.
+    pub fn deferred_transaction_count(&self) -> usize {
+        self.lock()
+            .table::<DeferredTransactionRow>()
+            .map(|table| table.iter().count())
+            .unwrap_or_default()
+    }
+
+    /// All generated transactions whose delay has elapsed, in XPR's
+    /// `(delay_until,id)` order. The controller must receive expired rows too:
+    /// it retires them with an ID-only `expired` receipt.
+    pub fn due_deferred_transactions(&self, now_micros: i64) -> Vec<DeferredTransaction> {
+        let db = self.lock();
+        let mut rows: Vec<(i64, i64, DeferredTransaction)> =
+            match db.table::<DeferredTransactionRow>() {
+                Ok(table) => table
+                    .iter()
+                    .filter(|row| row.delay_until <= now_micros)
+                    .filter_map(|row| {
+                        db.blob::<DeferredTransactionRow>(row.packed_trx)
+                            .ok()
+                            .map(|packed_trx| {
+                                (
+                                    row.delay_until,
+                                    row.id.raw(),
+                                    DeferredTransaction {
+                                        sender: row.sender,
+                                        sender_id: (row.sender_id_lo as u128)
+                                            | ((row.sender_id_hi as u128) << 64),
+                                        payer: row.payer,
+                                        trx_id: row.trx_id,
+                                        delay_until: row.delay_until,
+                                        expiration: row.expiration,
+                                        published: row.published,
+                                        packed_trx: packed_trx.to_vec(),
+                                    },
+                                )
+                            })
+                    })
+                    .collect(),
+                Err(_) => return Vec::new(),
+            };
+        rows.sort_by_key(|row| (row.0, row.1));
+        rows.into_iter().map(|(_, _, row)| row).collect()
+    }
+
+    /// Find a deferred transaction by its immutable id. Block verification uses
+    /// this instead of trusting a producer-provided marker: the durable Arena
+    /// record is the sole proof that a zero-signature transaction is scheduled.
+    pub fn deferred_transaction(&self, trx_id: [u8; 32]) -> Option<DeferredTransaction> {
+        let db = self.lock();
+        let row = db
+            .find_by::<DeferredTransactionRow, DeferredByTrxId>(&trx_id)
+            .ok()
+            .flatten()?;
+        let packed_trx = db
+            .blob::<DeferredTransactionRow>(row.packed_trx)
+            .ok()?
+            .to_vec();
+        Some(DeferredTransaction {
+            sender: row.sender,
+            sender_id: (row.sender_id_lo as u128) | ((row.sender_id_hi as u128) << 64),
+            payer: row.payer,
+            trx_id: row.trx_id,
+            delay_until: row.delay_until,
+            expiration: row.expiration,
+            published: row.published,
+            packed_trx,
+        })
+    }
+
+    /// Find a generated transaction by the `(sender,sender_id)` key used by
+    /// `send_deferred` and `cancel_deferred`. This key, rather than the
+    /// transaction digest, identifies the in-flight request that may be
+    /// replaced or cancelled.
+    pub fn deferred_transaction_by_sender_id(
+        &self,
+        sender: u64,
+        sender_id: u128,
+    ) -> Option<DeferredTransaction> {
+        let db = self.lock();
+        let key = (sender, (sender_id >> 64) as u64, sender_id as u64);
+        let row = db
+            .find_by::<DeferredTransactionRow, DeferredBySenderId>(&key)
+            .ok()
+            .flatten()?;
+        let packed_trx = db
+            .blob::<DeferredTransactionRow>(row.packed_trx)
+            .ok()?
+            .to_vec();
+        Some(DeferredTransaction {
+            sender: row.sender,
+            sender_id: (row.sender_id_lo as u128) | ((row.sender_id_hi as u128) << 64),
+            payer: row.payer,
+            trx_id: row.trx_id,
+            delay_until: row.delay_until,
+            expiration: row.expiration,
+            published: row.published,
+            packed_trx,
+        })
+    }
+
+    /// Remove a generated transaction by its `(sender,sender_id)` key.
+    pub fn remove_deferred_transaction_by_sender_id(
+        &self,
+        sender: u64,
+        sender_id: u128,
+    ) -> Result<Option<DeferredTransaction>, DbError> {
+        let mut db = self.lock();
+        let key = (sender, (sender_id >> 64) as u64, sender_id as u64);
+        let Some(row) = db.find_by::<DeferredTransactionRow, DeferredBySenderId>(&key)? else {
+            return Ok(None);
+        };
+        let (row_id, materialized) = {
+            let packed_trx = db.blob::<DeferredTransactionRow>(row.packed_trx)?.to_vec();
+            (
+                row.id(),
+                DeferredTransaction {
+                    sender: row.sender,
+                    sender_id: (row.sender_id_lo as u128) | ((row.sender_id_hi as u128) << 64),
+                    payer: row.payer,
+                    trx_id: row.trx_id,
+                    delay_until: row.delay_until,
+                    expiration: row.expiration,
+                    published: row.published,
+                    packed_trx,
+                },
+            )
+        };
+        db.remove::<DeferredTransactionRow>(row_id)?;
+        Ok(Some(materialized))
+    }
+
+    /// Materialize every deferred transaction in immutable transaction-id
+    /// order. This is used at migration startup to validate the raw payloads
+    /// before the node begins producing blocks.
+    pub fn deferred_transactions(&self) -> Vec<DeferredTransaction> {
+        let db = self.lock();
+        let mut rows: Vec<([u8; 32], DeferredTransaction)> =
+            match db.table::<DeferredTransactionRow>() {
+                Ok(table) => table
+                    .iter()
+                    .filter_map(|row| {
+                        db.blob::<DeferredTransactionRow>(row.packed_trx)
+                            .ok()
+                            .map(|packed_trx| {
+                                (
+                                    row.trx_id,
+                                    DeferredTransaction {
+                                        sender: row.sender,
+                                        sender_id: (row.sender_id_lo as u128)
+                                            | ((row.sender_id_hi as u128) << 64),
+                                        payer: row.payer,
+                                        trx_id: row.trx_id,
+                                        delay_until: row.delay_until,
+                                        expiration: row.expiration,
+                                        published: row.published,
+                                        packed_trx: packed_trx.to_vec(),
+                                    },
+                                )
+                            })
+                    })
+                    .collect(),
+                Err(_) => return Vec::new(),
+            };
+        rows.sort_by_key(|row| row.0);
+        rows.into_iter().map(|(_, row)| row).collect()
+    }
+
+    /// Remove a pending deferred transaction by its immutable transaction id.
+    /// The scheduler calls this only inside the block undo session after it has
+    /// selected the record for expiration or execution.
+    pub fn remove_deferred_transaction(&self, trx_id: [u8; 32]) -> Result<bool, DbError> {
+        let mut db = self.lock();
+        let id = db
+            .find_by::<DeferredTransactionRow, DeferredByTrxId>(&trx_id)?
+            .map(|row| row.id());
+        if let Some(id) = id {
+            db.remove::<DeferredTransactionRow>(id)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     // ----- contract tables + secondary indices ------------------------------
@@ -5145,6 +5966,175 @@ mod tests {
                 current_used: 5,
             }
         );
+    }
+
+    #[test]
+    fn imported_block_resource_window_preserves_source_ordinal() {
+        let db = ChainDatabase::new().unwrap();
+        let params = ElasticParams {
+            target: 100,
+            max: 1_000,
+            periods: 120,
+            max_multiplier: 1_000,
+            contract: (99, 100),
+            expand: (1_000, 999),
+        };
+        db.seed_resource_config(params, params, 172_800, 172_800)
+            .unwrap();
+        db.hydrate_resource_state(
+            (1_000_000, 5, 399_174_587),
+            (2_000_000, 7, 399_174_587),
+            10,
+            20,
+            30,
+            1_000,
+            2_000,
+        )
+        .unwrap();
+
+        let state = db.resource_state_bytes();
+        assert_eq!(
+            u32::from_le_bytes(state[16..20].try_into().unwrap()),
+            399_174_587
+        );
+        assert_eq!(
+            u32::from_le_bytes(state[36..40].try_into().unwrap()),
+            399_174_587
+        );
+
+        // The first target block must be able to finalize its usage without
+        // unsigned ordinal subtraction wrapping or panicking.
+        db.add_block_usage(11, 13).unwrap();
+        db.process_block_usage(399_174_588, params, params).unwrap();
+    }
+
+    #[test]
+    fn deferred_transactions_are_due_ordered_and_undo_safe() {
+        let db = ChainDatabase::new().unwrap();
+        db.start_undo_session();
+        db.xpr_import_deferred_transaction(
+            11,
+            (13u128 << 64) | 12,
+            14,
+            [2; 32],
+            20,
+            100,
+            10,
+            &[2, 3],
+        )
+        .unwrap();
+        db.xpr_import_deferred_transaction(21, 22, 23, [1; 32], 10, 100, 9, &[4])
+            .unwrap();
+        db.squash();
+
+        assert_eq!(db.deferred_transaction_count(), 2);
+        assert_eq!(
+            db.due_deferred_transactions(20)
+                .into_iter()
+                .map(|row| row.trx_id)
+                .collect::<Vec<_>>(),
+            vec![[1; 32], [2; 32]]
+        );
+        let second = db.due_deferred_transactions(20).pop().unwrap();
+        assert_eq!(second.sender_id, (13u128 << 64) | 12);
+        assert_eq!(second.packed_trx, vec![2, 3]);
+
+        db.start_undo_session();
+        assert!(db.remove_deferred_transaction([1; 32]).unwrap());
+        assert_eq!(db.deferred_transaction_count(), 1);
+        db.undo();
+        assert_eq!(db.deferred_transaction_count(), 2);
+        assert!(db.remove_deferred_transaction([1; 32]).unwrap());
+        assert_eq!(db.deferred_transaction_count(), 1);
+    }
+
+    #[test]
+    fn deferred_transactions_are_addressable_by_sender_id() {
+        let db = ChainDatabase::new().unwrap();
+        db.start_undo_session();
+        let sender_id = (7u128 << 64) | 9;
+        db.xpr_import_deferred_transaction(42, sender_id, 42, [3; 32], 20, 100, 10, &[8, 9])
+            .unwrap();
+        db.squash();
+
+        let found = db.deferred_transaction_by_sender_id(42, sender_id).unwrap();
+        assert_eq!(found.trx_id, [3; 32]);
+        assert_eq!(found.packed_trx, vec![8, 9]);
+
+        let removed = db
+            .remove_deferred_transaction_by_sender_id(42, sender_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(removed.sender_id, sender_id);
+        assert_eq!(db.deferred_transaction_count(), 0);
+        assert!(
+            db.deferred_transaction_by_sender_id(42, sender_id)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn imported_protocol_features_round_trip_as_ship_state() {
+        let db = ChainDatabase::new().unwrap();
+        let features = [([1u8; 32], 42u32), ([2u8; 32], 99u32)];
+        db.xpr_import_protocol_features(&features).unwrap();
+
+        let bytes = db.protocol_state_bytes();
+        assert_eq!(bytes[0], 0); // protocol_state_v0
+        assert_eq!(bytes[1], 2); // two activated features
+        assert_eq!(bytes[2], 0); // activated_protocol_feature_v0
+        assert_eq!(&bytes[3..35], &[1u8; 32]);
+        assert_eq!(u32::from_le_bytes(bytes[35..39].try_into().unwrap()), 42);
+        assert_eq!(bytes[39], 0); // activated_protocol_feature_v0
+        assert_eq!(&bytes[40..72], &[2u8; 32]);
+        assert_eq!(u32::from_le_bytes(bytes[72..76].try_into().unwrap()), 99);
+    }
+
+    #[test]
+    fn preactivated_protocol_features_survive_undo_and_activate_atomically() {
+        let db = ChainDatabase::new().unwrap();
+        let digest = [7u8; 32];
+
+        db.preactivate_protocol_feature(digest).unwrap();
+        assert_eq!(db.preactivated_protocol_features(), vec![digest]);
+        assert!(!db.protocol_feature_activated(digest));
+
+        db.start_undo_session();
+        db.activate_protocol_features(&[digest], 12).unwrap();
+        assert!(db.protocol_feature_activated(digest));
+        assert!(db.preactivated_protocol_features().is_empty());
+        db.undo();
+        assert!(!db.protocol_feature_activated(digest));
+        assert_eq!(db.preactivated_protocol_features(), vec![digest]);
+
+        db.start_undo_session();
+        db.activate_protocol_features(&[digest], 12).unwrap();
+        db.commit(12);
+        assert!(db.protocol_feature_activated(digest));
+        assert!(db.preactivated_protocol_features().is_empty());
+    }
+
+    #[test]
+    fn proposed_schedule_replacement_clear_and_undo_are_atomic() {
+        let db = ChainDatabase::new().unwrap();
+        assert_eq!(db.proposed_schedule(), None);
+
+        db.start_undo_session();
+        db.set_proposed_schedule(7, &[1, 2, 3]).unwrap();
+        assert_eq!(db.proposed_schedule(), Some((7, vec![1, 2, 3])));
+        db.squash();
+
+        db.start_undo_session();
+        db.set_proposed_schedule(8, &[4, 5]).unwrap();
+        assert_eq!(db.proposed_schedule(), Some((8, vec![4, 5])));
+        db.undo();
+        assert_eq!(db.proposed_schedule(), Some((7, vec![1, 2, 3])));
+
+        db.start_undo_session();
+        db.clear_proposed_schedule().unwrap();
+        assert_eq!(db.proposed_schedule(), None);
+        db.undo();
+        assert_eq!(db.proposed_schedule(), Some((7, vec![1, 2, 3])));
     }
 
     /// The standalone-write path bills db_idxN_update off the row's old payer and

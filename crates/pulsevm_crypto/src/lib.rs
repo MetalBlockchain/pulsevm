@@ -8,7 +8,10 @@ mod fixed_bytes;
 pub use fixed_bytes::FixedBytes;
 
 mod merkle_tree;
-pub use merkle_tree::merkle;
+pub use merkle_tree::{
+    make_canonical_pair,
+    merkle,
+};
 
 mod authority_key;
 pub mod k1;

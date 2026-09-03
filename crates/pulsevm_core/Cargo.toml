@@ -52,6 +52,7 @@ arena-shadow = []
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 proptest = "1"
 wat = "1"
+p256 = { version = "0.13", features = ["ecdsa"] }
 
 [[bench]]
 name = "transfer"

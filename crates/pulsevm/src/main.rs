@@ -276,25 +276,30 @@ impl Vm for VirtualMachine {
             .try_into()
             .map_err(|_| Status::invalid_argument("invalid chain id"))?;
         let controller = self.controller.clone();
-        let mut controller = controller.write().await;
-
-        // Initialize the controller with the genesis bytes
-        if let Err(error) = controller.initialize_with_protocol_upgrades(
-            &chain_id,
-            &config_bytes,
-            &genesis_bytes,
-            &upgrade_bytes,
-            db_path.as_str(),
-        ) {
-            if error.is_fatal_consistency() {
-                abort_on_fatal_consistency("controller initialization", &error);
+        // Restoring a full Arena checkpoint is CPU- and I/O-bound. Keep it off
+        // the Tokio worker while MetalGo's RPC transport remains responsive.
+        let admission_state = tokio::task::spawn_blocking(move || {
+            let mut controller = controller.blocking_write();
+            if let Err(error) = controller.initialize_with_protocol_upgrades(
+                &chain_id,
+                &config_bytes,
+                &genesis_bytes,
+                &upgrade_bytes,
+                db_path.as_str(),
+            ) {
+                if error.is_fatal_consistency() {
+                    abort_on_fatal_consistency("controller initialization", &error);
+                }
+                return Err(Status::internal(format!(
+                    "could not initialize controller: {error}"
+                )));
             }
-            return Err(Status::internal(format!(
-                "could not initialize controller: {error}"
-            )));
-        }
-        self.rpc_service
-            .set_admission_state(controller.mempool_admission_state());
+            Ok::<_, Status>(controller.mempool_admission_state())
+        })
+        .await
+        .map_err(|e| Status::internal(format!("controller initialization task failed: {e}")))??;
+        self.rpc_service.set_admission_state(admission_state);
+        let controller = self.controller.read().await;
 
         let network_manager = Arc::clone(&self.network_manager);
         let mut network_manager = network_manager.write().await;

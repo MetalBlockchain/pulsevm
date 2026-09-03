@@ -81,15 +81,30 @@ Pulse does not intend to support floating point data types. We do this to stay i
 
 ## System contract
 
-Upon genesis there is a default system contract deployed located at the reserved account called `pulse`, it comes with the following default methods:
+Upon genesis there is a default system contract deployed at the configured system account
+(`pulse` by default; imported Antelope/XPR networks typically use `eosio`). Its derived
+accounts such as `<system>.code`, `<system>.any`, `<system>.prods`, and `<system>.token`
+are used consistently for authorization, producer permissions, and RPC lookup. It comes
+with the following default methods:
 
-- `pulse.newaccount`: registers an account, assuming it doesn't already exist
-- `pulse.setcode`: updates or removes the WASM contract of a specific account
-- `pulse.setabi`: updates or removes the ABI specification of a specific account
-- `pulse.updateauth`: updates an account's authorization
-- `pulse.deleteauth`: deletes a specific authority level, cannot be `owner` or `activity` authority
-- `pulse.linkauth`
-- `pulse.deleteauth`
+The node configuration accepts `system_account` as an EOSIO name; omitting it preserves
+the default `pulse` network behavior.
+`native_system_contract` defaults to `true` for PulseVM genesis. Set it to `false` when
+opening imported XPR/Antelope state to select Antelope-compatible genesis authorship.
+Controller-native actions such as `newaccount`, `setcode`, and `setabi` still execute
+before the deployed system WASM, matching Leap consensus behavior.
+
+The `cleos`-compatible CLI stores the same setting as `system_account` in
+`~/.pulse-cli/config.json`; `set system-account eosio` selects the root used by
+account-management commands. `token_contract` controls the default transfer contract.
+
+- `<system>.newaccount`: registers an account, assuming it doesn't already exist
+- `<system>.setcode`: updates or removes the WASM contract of a specific account
+- `<system>.setabi`: updates or removes the ABI specification of a specific account
+- `<system>.updateauth`: updates an account's authorization
+- `<system>.deleteauth`: deletes a specific authority level, cannot be `owner` or `activity` authority
+- `<system>.linkauth`
+- `<system>.unlinkauth`
 
 These follow the same spec as the `eosio` implementation.
 

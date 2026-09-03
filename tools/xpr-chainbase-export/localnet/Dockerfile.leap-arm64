@@ -1,0 +1,12 @@
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libgmp10 libssl3 zlib1g \
+    && rm -rf /var/lib/apt/lists/*
+
+# The build context is the local Leap 5.0.3 checkout containing the matching
+# build-linux-arm64-v2/bin/nodeos artifact.
+COPY build-linux-arm64-v2/bin/nodeos /usr/local/bin/nodeos
+RUN chmod 0755 /usr/local/bin/nodeos

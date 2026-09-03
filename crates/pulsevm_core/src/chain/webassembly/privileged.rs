@@ -21,6 +21,7 @@ use crate::chain::{
         MAX_PRODUCERS,
         MAX_SCHEDULE_BYTES,
         ProducerKey,
+        ProducerSchedule,
     },
     resource_limits::ResourceLimitsManager,
     utils::pulse_assert,
@@ -37,13 +38,69 @@ fn privileged_check(context: &ApplyContext) -> Result<(), RuntimeError> {
     Ok(())
 }
 
+/// XPR/Leap system contracts use `preactivate_feature` to queue a digest for a
+/// later block-header activation. Imported active digests remain idempotent for
+/// compatibility with system-contract initialization; future digests are stored
+/// in Arena's undo/checkpoint-safe preactivation queue.
+pub fn preactivate_feature(
+    mut env: FunctionEnvMut<WasmContext>,
+    feature_ptr: WasmPtr<u8>,
+) -> Result<(), RuntimeError> {
+    {
+        context_aware_check(&env)?;
+        let context = env.data_mut().apply_context_mut();
+        privileged_check(context)?;
+    }
+
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::PRIVILEGED + cost::per_byte(32))?;
+    let memory = env_data
+        .memory()
+        .as_ref()
+        .expect("Wasm memory not initialized");
+    let view = memory.view(&store);
+    let slice = feature_ptr.slice(&view, 32)?;
+    let mut digest = [0u8; 32];
+    slice.read_slice(&mut digest)?;
+
+    if env_data.db().protocol_feature_activated(digest) {
+        return Ok(());
+    }
+
+    env_data
+        .db()
+        .preactivate_protocol_feature(digest)
+        .map_err(|error| RuntimeError::new(format!("preactivate_feature failed: {error}")))
+}
+
 pub fn set_proposed_producers(
     mut env: FunctionEnvMut<WasmContext>,
     data_ptr: WasmPtr<u8>,
     data_len: u32,
 ) -> Result<i64, RuntimeError> {
+    let src_bytes = read_producer_schedule_bytes(&mut env, data_ptr, data_len)?;
+
+    // Validate the declared element count against the cap *before* the full
+    // decode. `Vec::read` reserves the declared count up front, so a bogus length
+    // prefix (a VarUint32, up to ~4.3 billion) would otherwise drive a huge
+    // pre-allocation regardless of how few bytes actually follow.
+    let declared = VarUint32::read(&src_bytes, &mut 0)
+        .map_err(|e| RuntimeError::new(format!("failed to read producer count: {}", e)))?
+        .0 as usize;
+    validate_producer_count(declared)?;
+
+    let producers = <Vec<ProducerKey>>::read(&src_bytes, &mut 0)
+        .map_err(|e| RuntimeError::new(format!("failed to read proposed producers: {}", e)))?;
+    apply_proposed_producers(env.data_mut(), producers)
+}
+
+fn read_producer_schedule_bytes(
+    env: &mut FunctionEnvMut<WasmContext>,
+    data_ptr: WasmPtr<u8>,
+    data_len: u32,
+) -> Result<Vec<u8>, RuntimeError> {
     {
-        context_aware_check(&env)?;
+        context_aware_check(env)?;
         let context = env.data_mut().apply_context_mut();
         privileged_check(context)?;
     }
@@ -70,25 +127,23 @@ pub fn set_proposed_producers(
     let slice = data_ptr.slice(&view, data_len)?;
     let mut src_bytes = vec![0u8; data_len as usize];
     slice.read_slice(&mut src_bytes)?;
+    Ok(src_bytes)
+}
 
-    // Validate the declared element count against the cap *before* the full
-    // decode. `Vec::read` reserves the declared count up front, so a bogus length
-    // prefix (a VarUint32, up to ~4.3 billion) would otherwise drive a huge
-    // pre-allocation regardless of how few bytes actually follow.
-    let declared = VarUint32::read(&src_bytes, &mut 0)
-        .map_err(|e| RuntimeError::new(format!("failed to read producer count: {}", e)))?
-        .0 as usize;
+fn validate_producer_count(declared: usize) -> Result<(), RuntimeError> {
     pulse_assert(
-        declared >= 1 && declared <= MAX_PRODUCERS,
-        ChainError::TransactionError(format!(
+        (1..=MAX_PRODUCERS).contains(&declared),
+        RuntimeError::new(format!(
             "proposed producer count {} out of range [1, {}]",
             declared, MAX_PRODUCERS
         )),
-    )?;
+    )
+}
 
-    let producers = <Vec<ProducerKey>>::read(&src_bytes, &mut 0)
-        .map_err(|e| RuntimeError::new(format!("failed to read proposed producers: {}", e)))?;
-
+fn apply_proposed_producers(
+    env_data: &mut WasmContext,
+    producers: Vec<ProducerKey>,
+) -> Result<i64, RuntimeError> {
     // Every producer must be a real account, and no producer may appear twice —
     // the schedule is a name->key map, so a duplicate would silently shadow, and
     // the check must be deterministic across nodes.
@@ -111,14 +166,37 @@ pub fn set_proposed_producers(
         )?;
     }
 
-    let context = env_data.apply_context();
-    if producers == context.active_producers()? {
-        return Ok(-1);
-    }
-    let new_version = context.active_schedule_version()? as i64 + 1;
     let context = env_data.apply_context_mut();
-    context.set_proposed_producers(producers)?;
-    Ok(new_version)
+    context
+        .set_proposed_producers(producers)
+        .map_err(Into::into)
+}
+
+/// Leap's extended producer-schedule entry point. Format 0 is the legacy
+/// `vector<producer_key>` wire format. Format 1 is
+/// `vector<producer_authority>`. PulseVM's block-signature model is currently
+/// single-key, so authority schedules are accepted when each v0 authority can
+/// be represented exactly by one K1 key satisfying its threshold.
+pub fn set_proposed_producers_ex(
+    mut env: FunctionEnvMut<WasmContext>,
+    packed_producer_format: u64,
+    data_ptr: WasmPtr<u8>,
+    data_len: u32,
+) -> Result<i64, RuntimeError> {
+    if packed_producer_format == 0 {
+        return set_proposed_producers(env, data_ptr, data_len);
+    }
+    if packed_producer_format != 1 {
+        return Err(RuntimeError::new(format!(
+            "producer schedule format {packed_producer_format} is not supported"
+        )));
+    }
+
+    let src_bytes = read_producer_schedule_bytes(&mut env, data_ptr, data_len)?;
+    let producers = ProducerSchedule::read_authorities_bounded(&src_bytes).map_err(|error| {
+        RuntimeError::new(format!("failed to read producer authorities: {error}"))
+    })?;
+    apply_proposed_producers(env.data_mut(), producers)
 }
 
 pub fn get_blockchain_parameters_packed(
@@ -308,4 +386,57 @@ pub fn get_resource_limits(
     net_weight_slice.write_slice(&net_weight.to_le_bytes())?;
     cpu_weight_slice.write_slice(&cpu_weight.to_le_bytes())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use pulsevm_serialization::Write;
+
+    use super::*;
+    use crate::chain::crypto::PrivateKey;
+
+    fn packed_single_key_authority(threshold: u32, weight: u16) -> (Vec<u8>, ProducerKey) {
+        let producer_name = Name::from_str("producer").unwrap();
+        let block_signing_key = PrivateKey::random().get_public_key();
+        let mut packed = VarUint32(1).pack().unwrap();
+        packed.extend(producer_name.pack().unwrap());
+        packed.extend(VarUint32(0).pack().unwrap());
+        packed.extend(threshold.pack().unwrap());
+        packed.extend(VarUint32(1).pack().unwrap());
+        packed.extend(block_signing_key.pack().unwrap());
+        packed.extend(weight.pack().unwrap());
+        (
+            packed,
+            ProducerKey {
+                producer_name,
+                block_signing_key,
+            },
+        )
+    }
+
+    #[test]
+    fn authority_schedule_decodes_exact_single_k1_key() {
+        let (packed, expected) = packed_single_key_authority(1, 1);
+        assert_eq!(
+            ProducerSchedule::read_authorities_bounded(&packed).unwrap(),
+            [expected]
+        );
+    }
+
+    #[test]
+    fn authority_schedule_rejects_an_unsatisfied_threshold() {
+        let (packed, _) = packed_single_key_authority(2, 1);
+        let error = ProducerSchedule::read_authorities_bounded(&packed).unwrap_err();
+        assert!(error.to_string().contains("cannot satisfy threshold"));
+    }
+
+    #[test]
+    fn authority_schedule_rejects_trailing_bytes() {
+        let (mut packed, _) = packed_single_key_authority(1, 1);
+        packed.push(0);
+        let error = ProducerSchedule::read_authorities_bounded(&packed).unwrap_err();
+        assert!(error.to_string().contains("trailing byte"));
+    }
 }

@@ -3423,6 +3423,7 @@ name = "pulsevm_database"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "flate2",
  "hex",
  "libc",
  "proptest",
@@ -3444,6 +3445,7 @@ dependencies = [
  "secp256k1",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "time",
 ]

@@ -1,7 +1,6 @@
 use std::{
     cmp::min,
     collections::{
-        BTreeMap,
         BTreeSet,
         VecDeque,
     },
@@ -18,7 +17,10 @@ use crate::{
         apply_context::ApplyContext,
         id::Id,
         name::Name,
-        producer_schedule::ProducerKey,
+        producer_schedule::{
+            ProducerKey,
+            ProducerSchedule,
+        },
         protocol_features::{
             ProtocolExecutionContext,
             ProtocolFeature,
@@ -47,7 +49,40 @@ use pulsevm_database::{
     seconds,
 };
 use pulsevm_error::ChainError;
-use pulsevm_serialization::VarUint32;
+use pulsevm_serialization::{
+    CanonicalMap,
+    VarUint32,
+    Write,
+};
+
+// Leap's ONLY_BILL_FIRST_AUTHORIZER feature changes transaction CPU/NET
+// billing from every action authorizer to only the first authorizer. XPR has
+// this feature active; keeping the gate matters for replaying earlier history
+// and for chains that have not activated it yet.
+const ONLY_BILL_FIRST_AUTHORIZER_FEATURE_DIGEST: [u8; 32] = [
+    0x8b, 0xa5, 0x2f, 0xe7, 0xa3, 0x95, 0x6c, 0x5c, 0xd3, 0xa6, 0x56, 0xa3, 0x17, 0x4b, 0x93, 0x1d,
+    0x3b, 0xb2, 0xab, 0xb4, 0x55, 0x78, 0xbe, 0xfc, 0x59, 0xf2, 0x83, 0xec, 0xd8, 0x16, 0xa4, 0x05,
+];
+
+fn billed_accounts_for_transaction(
+    transaction: &Transaction,
+    first_authorizer: Name,
+    only_bill_first: bool,
+) -> BTreeSet<Name> {
+    if only_bill_first {
+        return [first_authorizer].into_iter().collect();
+    }
+    transaction
+        .actions
+        .iter()
+        .flat_map(|action| {
+            action
+                .authorization()
+                .iter()
+                .map(|auth| Name::new(auth.actor()))
+        })
+        .collect()
+}
 #[derive(Default, Clone)]
 struct Billing {
     paused_time: TimePoint,
@@ -67,7 +102,7 @@ pub struct TransactionResult {
 struct TransactionContextInner {
     initialized: bool,
     trace: TransactionTrace,
-    bill_to_account: Option<Name>,
+    bill_to_accounts: BTreeSet<Name>,
     validate_ram_usage: BTreeSet<Name>,
     explicit_billed_cpu_time: bool,
     // On light/replay validation these carry the block-recorded cpu (µs) and net
@@ -85,6 +120,7 @@ struct TransactionContextInner {
     start_time: TimePoint,
     max_transaction_time: Microseconds,
     pending_block_timestamp: BlockTimestamp,
+    published: TimePoint,
     cpu_limit: i64,
     cpu_limit_due_to_greylist: bool,
     cpu_limit_due_to_block: bool,
@@ -92,7 +128,8 @@ struct TransactionContextInner {
     is_input: bool,
     proposed_schedule: Option<Vec<ProducerKey>>,
     active_producers: Vec<ProducerKey>,
-    active_schedule_version: u32,
+    proposal_base_producers: Vec<ProducerKey>,
+    proposal_base_schedule_version: u32,
 }
 
 #[derive(Clone)]
@@ -133,7 +170,7 @@ impl TransactionContext {
             inner: Arc::new(RwLock::new(TransactionContextInner {
                 initialized: false,
                 trace,
-                bill_to_account: None,
+                bill_to_accounts: BTreeSet::new(),
                 validate_ram_usage: BTreeSet::new(),
                 explicit_billed_cpu_time: false,
                 explicit_cpu_us: 0,
@@ -149,6 +186,7 @@ impl TransactionContext {
                 },
                 start_time: TimePoint::now(),
                 max_transaction_time: Microseconds::new(max_transaction_time_ms as i64 * 1_000),
+                published: pending_block_timestamp.clone().into(),
                 pending_block_timestamp,
                 cpu_limit: 0,
                 cpu_limit_due_to_greylist: false,
@@ -157,7 +195,8 @@ impl TransactionContext {
                 is_input: false,
                 proposed_schedule: None,
                 active_producers: Vec::new(),
-                active_schedule_version: 0,
+                proposal_base_producers: Vec::new(),
+                proposal_base_schedule_version: 0,
             })),
             packed_transaction,
         }
@@ -183,26 +222,26 @@ impl TransactionContext {
         self.protocol_context.feature_enabled(feature)
     }
 
-    /// Record the producer schedule in force for the block this transaction runs
-    /// in. The controller sets this before execution so `get_active_producers`
-    /// and `set_proposed_producers` can read the active set and version.
-    pub fn set_active_schedule(
+    /// Record the active schedule and the schedule a new proposal must follow.
+    /// Antelope exposes the active set through `get_active_producers`, but bases
+    /// a new version on the pending set when one exists.
+    pub fn set_producer_schedules(
         &self,
-        producers: Vec<ProducerKey>,
-        version: u32,
+        active_producers: Vec<ProducerKey>,
+        active_version: u32,
+        pending_schedule: Option<(Vec<ProducerKey>, u32)>,
     ) -> Result<(), ChainError> {
         let mut inner = self.inner.write()?;
-        inner.active_producers = producers;
-        inner.active_schedule_version = version;
+        inner.active_producers = active_producers.clone();
+        let (proposal_base_producers, proposal_base_schedule_version) =
+            pending_schedule.unwrap_or((active_producers, active_version));
+        inner.proposal_base_producers = proposal_base_producers;
+        inner.proposal_base_schedule_version = proposal_base_schedule_version;
         Ok(())
     }
 
     pub fn active_producers(&self) -> Result<Vec<ProducerKey>, ChainError> {
         Ok(self.inner.read()?.active_producers.clone())
-    }
-
-    pub fn active_schedule_version(&self) -> Result<u32, ChainError> {
-        Ok(self.inner.read()?.active_schedule_version)
     }
 
     pub fn init(
@@ -271,19 +310,30 @@ impl TransactionContext {
             ));
         };
         let first_authorizer_name = Name::new(authorizer);
-        inner.bill_to_account = Some(first_authorizer_name.clone());
+        let only_bill_first = self
+            .db
+            .protocol_feature_activated(ONLY_BILL_FIRST_AUTHORIZER_FEATURE_DIGEST);
+        inner.bill_to_accounts =
+            billed_accounts_for_transaction(&trx, first_authorizer_name.clone(), only_bill_first);
+        if inner.bill_to_accounts.is_empty() {
+            return Err(ChainError::TransactionError(
+                "transaction has no authorizations".to_string(),
+            ));
+        }
 
         // Update usage values of accounts to reflect new time
-        ResourceLimitsManager::update_account_usage(
-            &mut self.db,
-            &first_authorizer_name,
-            inner.pending_block_timestamp.slot(),
-        )?;
+        for account in &inner.bill_to_accounts {
+            ResourceLimitsManager::update_account_usage(
+                &mut self.db,
+                account,
+                inner.pending_block_timestamp.slot(),
+            )?;
+        }
 
         // Calculate the highest network usage and CPU time that all of the billed accounts can
         // afford to be billed
         let (account_net_limit, account_cpu_limit, greylisted_net, greylisted_cpu) =
-            self.max_bandwidth_billed_account_can_pay(&first_authorizer_name)?;
+            self.max_bandwidth_billed_accounts_can_pay(&inner.bill_to_accounts)?;
 
         inner.net_limit_due_to_greylist = greylisted_net;
         inner.cpu_limit_due_to_greylist = greylisted_cpu;
@@ -342,6 +392,45 @@ impl TransactionContext {
         self.validate_expiration(self.packed_transaction.get_transaction())?;
         self.validate_referenced_accounts(self.packed_transaction.get_transaction())?;
         self.init(initial_net_usage, first_authorizer, true)?;
+        self.record_transaction(
+            &transaction.id()?,
+            transaction.header.expiration().sec_since_epoch(),
+        )?;
+        Ok(())
+    }
+
+    /// Initialize a transaction retired from the durable deferred queue. Its
+    /// delay and expiration were checked by the controller against the
+    /// generated-transaction record, so this deliberately does not apply the
+    /// input-transaction expiration/delay rule a second time. It remains an
+    /// objectively billed transaction and records its id just like an input
+    /// receipt, ensuring replay cannot execute it twice.
+    pub fn init_for_deferred_trx(
+        &mut self,
+        packed_trx_unprunable_size: u64,
+        packed_trx_prunable_size: u64,
+        transaction: &Transaction,
+        published: TimePoint,
+    ) -> Result<(), ChainError> {
+        self.inner.write()?.published = published;
+        let mut discounted_size_for_pruned_data = packed_trx_prunable_size;
+        let chain_config = self.db.chain_config()?;
+        if chain_config.context_free_discount_net_usage_den > 0
+            && chain_config.context_free_discount_net_usage_num
+                < chain_config.context_free_discount_net_usage_den
+        {
+            discounted_size_for_pruned_data *=
+                chain_config.context_free_discount_net_usage_num as u64;
+            discounted_size_for_pruned_data = (discounted_size_for_pruned_data
+                + chain_config.context_free_discount_net_usage_den as u64
+                - 1)
+                / chain_config.context_free_discount_net_usage_den as u64;
+        }
+        let initial_net_usage = chain_config.base_per_transaction_net_usage as u64
+            + packed_trx_unprunable_size
+            + discounted_size_for_pruned_data;
+        self.validate_deferred_referenced_accounts(transaction)?;
+        self.init(initial_net_usage, transaction.first_authorizer(), true)?;
         self.record_transaction(
             &transaction.id()?,
             transaction.header.expiration().sec_since_epoch(),
@@ -422,7 +511,7 @@ impl TransactionContext {
             new_action_ordinal,
             creator_action_ordinal,
             closest_unnotified_ancestor_action_ordinal,
-            BTreeMap::new(),
+            CanonicalMap::new(),
         ));
 
         Ok(new_action_ordinal)
@@ -458,7 +547,7 @@ impl TransactionContext {
             new_action_ordinal,
             creator_action_ordinal,
             closest_unnotified_ancestor_action_ordinal,
-            BTreeMap::new(),
+            CanonicalMap::new(),
         ));
 
         Ok(new_action_ordinal)
@@ -491,11 +580,6 @@ impl TransactionContext {
         // Initialize the apply context with the action trace.
         let cpu_used = apply_context.exec(self)?;
         self.add_cpu_usage(cpu_used)?;
-
-        // Finalize the apply context
-        for (account, ram_delta) in apply_context.account_ram_deltas()?.iter() {
-            self.add_ram_usage(account, *ram_delta)?;
-        }
 
         Ok(())
     }
@@ -562,6 +646,13 @@ impl TransactionContext {
         Ok(inner.pending_block_timestamp.clone())
     }
 
+    /// Source-compatible publication time for the currently executing
+    /// transaction. Deferred execution replaces the pending block time with
+    /// the durable generated transaction's original publication timestamp.
+    pub fn publication_time(&self) -> Result<TimePoint, ChainError> {
+        Ok(self.inner.read()?.published.clone())
+    }
+
     /// Bill the block-recorded cpu (µs) and net (words) for this transaction
     /// rather than the re-measured amounts, and skip the objective limit checks —
     /// the Antelope light/replay validation path for an already-accepted block.
@@ -571,6 +662,22 @@ impl TransactionContext {
         inner.explicit_cpu_us = cpu_us;
         inner.explicit_net_words = net_words;
         Ok(())
+    }
+
+    /// Deterministic CPU amount to charge when an objectively executed deferred
+    /// transaction fails before `finalize`. The trace already contains all
+    /// metered action work; apply the same minimum floor used by successful
+    /// transactions so a failed generated transaction cannot escape billing.
+    pub fn failure_billed_cpu_time_us(&self) -> Result<u32, ChainError> {
+        let inner = self.inner.read()?;
+        if inner.explicit_billed_cpu_time {
+            return Ok(inner.explicit_cpu_us);
+        }
+        Ok(inner
+            .trace
+            .receipt
+            .cpu_usage_us
+            .max(self.db.chain_config()?.min_transaction_cpu_usage))
     }
 
     pub fn finalize(mut self) -> Result<TransactionResult, ChainError> {
@@ -606,11 +713,13 @@ impl TransactionContext {
             ResourceLimitsManager::verify_account_ram_usage(&mut self.db, account)?;
         }
 
-        let first_authorizer_name = inner.bill_to_account.clone().ok_or_else(|| {
-            ChainError::TransactionError("bill to account is not set".to_string())
-        })?;
+        if inner.bill_to_accounts.is_empty() {
+            return Err(ChainError::TransactionError(
+                "bill to accounts are not set".to_string(),
+            ));
+        }
         let (account_net_limit, account_cpu_limit, greylisted_net, greylisted_cpu) =
-            self.max_bandwidth_billed_account_can_pay(&first_authorizer_name)?;
+            self.max_bandwidth_billed_accounts_can_pay(&inner.bill_to_accounts)?;
         inner.net_limit_due_to_greylist = greylisted_net;
         inner.cpu_limit_due_to_greylist = greylisted_cpu;
 
@@ -640,14 +749,16 @@ impl TransactionContext {
         // During benchmarks this would throw an error because the accounts won't have enough CPU to
         // cover the billed time, so we skip this step if we're benchmarking.
         if self.block_status != BlockStatus::Benchmarking {
-            ResourceLimitsManager::add_transaction_usage(
-                &mut self.db,
-                &first_authorizer_name,
-                inner.trace.receipt.cpu_usage_us as u64,
-                inner.trace.net_usage as u64,
-                inner.pending_block_timestamp.slot(),
-                true,
-            )?;
+            for account in &inner.bill_to_accounts {
+                ResourceLimitsManager::add_transaction_usage(
+                    &mut self.db,
+                    account,
+                    inner.trace.receipt.cpu_usage_us as u64,
+                    inner.trace.net_usage as u64,
+                    inner.pending_block_timestamp.slot(),
+                    true,
+                )?;
+            }
         }
 
         Ok(TransactionResult {
@@ -658,12 +769,56 @@ impl TransactionContext {
         })
     }
 
-    // Record a producer schedule proposed by `set_proposed_producers` during this
-    // transaction. Surfaced in the TransactionResult; the controller activates it
-    // when the block is accepted.
-    pub fn set_proposed_producers(&self, producers: Vec<ProducerKey>) -> Result<(), ChainError> {
-        self.inner.write()?.proposed_schedule = Some(producers);
-        Ok(())
+    // Persist a producer schedule proposed by `set_proposed_producers` in the
+    // block's undo session. A later block may move it into the signed header;
+    // merely accepting this transaction never activates the schedule.
+    pub fn set_proposed_producers(&self, producers: Vec<ProducerKey>) -> Result<i64, ChainError> {
+        let mut inner = self.inner.write()?;
+        let block_num = self.block_num();
+
+        if let Some((proposal_block, packed)) = self.db.proposed_schedule() {
+            let existing = ProducerSchedule::read_bounded(&packed).map_err(|error| {
+                ChainError::SerializationError(format!(
+                    "decode existing proposed producer schedule: {error}"
+                ))
+            })?;
+            if existing.version <= inner.proposal_base_schedule_version {
+                // Older PulseVM builds could re-propose the schedule that had
+                // just become pending, leaving a stale row in a durable replay
+                // checkpoint. Such a row is impossible in Leap: a proposal must
+                // always follow the pending schedule, or the active one when no
+                // pending schedule exists. Repair that invalid legacy state at
+                // the first subsequent proposal.
+                self.db.clear_proposed_schedule()?;
+            } else {
+                // Leap permits replacements only within the block that created the
+                // proposal. Once that block is complete, later calls must wait for
+                // the proposal to become pending instead of overwriting it.
+                if proposal_block != block_num {
+                    return Ok(-1);
+                }
+                if existing.producers == producers {
+                    return Ok(-1);
+                }
+            }
+        }
+
+        if inner.proposal_base_producers == producers {
+            return Ok(-1);
+        }
+
+        let version = inner
+            .proposal_base_schedule_version
+            .checked_add(1)
+            .ok_or_else(|| ChainError::BlockError("producer schedule version overflow".into()))?;
+        let schedule = ProducerSchedule {
+            version,
+            producers: producers.clone(),
+        };
+        let packed = schedule.pack()?;
+        self.db.set_proposed_schedule(block_num, &packed)?;
+        inner.proposed_schedule = Some(producers);
+        Ok(i64::from(version))
     }
 
     pub fn add_cpu_usage(&self, cpu_usage: u64) -> Result<(), ChainError> {
@@ -784,9 +939,19 @@ impl TransactionContext {
         Ok(())
     }
 
+    /// Instruction-meter budget for the current action. Accepted-block replay
+    /// uses the producer's recorded bill and, like nodeos validation, does not
+    /// stop execution at this node's objective account/block CPU allowance.
     pub fn get_cpu_limit(&self) -> Result<i64, ChainError> {
         let inner = self.inner.read()?;
-        Ok(inner.cpu_limit)
+        Ok(Self::execution_cpu_limit(
+            inner.explicit_billed_cpu_time,
+            inner.cpu_limit,
+        ))
+    }
+
+    fn execution_cpu_limit(explicit_billed: bool, objective_limit: i64) -> i64 {
+        if explicit_billed { -1 } else { objective_limit }
     }
 
     pub fn record_transaction(&mut self, id: &Id, expiration: u32) -> Result<(), ChainError> {
@@ -827,6 +992,25 @@ impl TransactionContext {
     }
 
     pub fn validate_referenced_accounts(&self, trx: &Transaction) -> Result<(), ChainError> {
+        self.validate_referenced_accounts_with_code_permission(trx, false)
+    }
+
+    /// Validate a generated transaction's account references. Deferred
+    /// transactions are authorized by the scheduling receiver's implicit
+    /// `receiver@eosio.code` permission, which does not need a permission
+    /// object in chainbase. Ordinary input transactions remain strict.
+    pub fn validate_deferred_referenced_accounts(
+        &self,
+        trx: &Transaction,
+    ) -> Result<(), ChainError> {
+        self.validate_referenced_accounts_with_code_permission(trx, true)
+    }
+
+    fn validate_referenced_accounts_with_code_permission(
+        &self,
+        trx: &Transaction,
+        allow_code_permission: bool,
+    ) -> Result<(), ChainError> {
         if !trx.context_free_actions.is_empty() {
             for action in trx.context_free_actions.iter() {
                 if !self.db.is_account(action.account.as_u64())? {
@@ -865,7 +1049,9 @@ impl TransactionContext {
                     )));
                 }
 
-                if AuthorizationManager::find_permission(&self.db.read()?, auth)?.is_none() {
+                if !(allow_code_permission && auth.permission() == crate::CODE_NAME)
+                    && AuthorizationManager::find_permission(&self.db.read()?, auth)?.is_none()
+                {
                     return Err(ChainError::TransactionError(format!(
                         "action's authorizations include a non-existent permission: {}",
                         auth,
@@ -883,39 +1069,43 @@ impl TransactionContext {
         Ok(())
     }
 
-    fn max_bandwidth_billed_account_can_pay(
+    fn max_bandwidth_billed_accounts_can_pay(
         &self,
-        account: &Name,
+        accounts: &BTreeSet<Name>,
     ) -> Result<(i64, i64, bool, bool), ChainError> {
         let large_number_no_overflow = i64::MAX / 2;
         let mut account_net_limit = large_number_no_overflow;
         let mut account_cpu_limit = large_number_no_overflow;
 
-        let (net_limit, net_was_greylisted) = ResourceLimitsManager::get_account_net_limit(
-            &self.db,
-            account,
-            Some(MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER),
-        )?;
+        let mut net_greylisted = false;
+        let mut cpu_greylisted = false;
+        for account in accounts {
+            let (net_limit, net_was_greylisted) = ResourceLimitsManager::get_account_net_limit(
+                &self.db,
+                account,
+                Some(MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER),
+            )?;
+            if net_limit >= 0 {
+                account_net_limit = min(account_net_limit, net_limit);
+                net_greylisted |= net_was_greylisted;
+            }
 
-        if net_limit >= 0 {
-            account_net_limit = min(account_net_limit, net_limit);
-        }
-
-        let (cpu_limit, cpu_was_greylisted) = ResourceLimitsManager::get_account_cpu_limit(
-            &self.db,
-            account,
-            Some(MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER),
-        )?;
-
-        if cpu_limit >= 0 {
-            account_cpu_limit = min(account_cpu_limit, cpu_limit);
+            let (cpu_limit, cpu_was_greylisted) = ResourceLimitsManager::get_account_cpu_limit(
+                &self.db,
+                account,
+                Some(MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER),
+            )?;
+            if cpu_limit >= 0 {
+                account_cpu_limit = min(account_cpu_limit, cpu_limit);
+                cpu_greylisted |= cpu_was_greylisted;
+            }
         }
 
         Ok((
             account_net_limit,
             account_cpu_limit,
-            net_was_greylisted,
-            cpu_was_greylisted,
+            net_greylisted,
+            cpu_greylisted,
         ))
     }
 
@@ -927,6 +1117,9 @@ impl TransactionContext {
     /// The check body, callable while already holding the `inner` guard —
     /// calling `check_net_usage` there would deadlock on the re-lock.
     fn check_net_usage_locked(inner: &TransactionContextInner) -> Result<(), ChainError> {
+        if inner.explicit_billed_cpu_time {
+            return Ok(());
+        }
         // TODO: Add unlikely hint here once it's stable
         // https://github.com/rust-lang/rust/issues/151619
         if inner.trace.net_usage > inner.eager_net_limit {
@@ -987,6 +1180,9 @@ impl TransactionContext {
     }
 
     fn validate_account_cpu_usage(inner: &TransactionContextInner) -> Result<(), ChainError> {
+        if inner.explicit_billed_cpu_time {
+            return Ok(());
+        }
         if inner.trace.receipt.cpu_usage_us > inner.cpu_limit as u32 {
             if inner.cpu_limit_due_to_block {
                 return Err(ChainError::TransactionError(format!(
@@ -1038,6 +1234,15 @@ mod deadline_tests {
     }
 
     #[test]
+    fn explicit_billing_is_exempt_from_objective_execution_cpu_limit() {
+        assert_eq!(TransactionContext::execution_cpu_limit(true, 150_000), -1);
+        assert_eq!(
+            TransactionContext::execution_cpu_limit(false, 150_000),
+            150_000
+        );
+    }
+
+    #[test]
     fn deadline_passes_under_limit_and_trips_over_it() {
         assert!(
             TransactionContext::deadline_check(
@@ -1065,5 +1270,63 @@ mod deadline_tests {
             TransactionContext::deadline_check(false, tp(0), Microseconds::new(1_000), tp(5_000),),
             Err(ChainError::DeadlineError(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod billing_tests {
+    use std::str::FromStr;
+
+    use pulsevm_database::PermissionLevel;
+
+    use super::{
+        Action,
+        Name,
+        Transaction,
+        billed_accounts_for_transaction,
+    };
+
+    fn account(value: &str) -> Name {
+        Name::from_str(value).unwrap()
+    }
+
+    #[test]
+    fn only_bill_first_authorizer_feature_selects_first_authorizer() {
+        let alice = account("alice");
+        let bob = account("bob");
+        let active = account("active");
+        let mut transaction = Transaction::default();
+        transaction.actions.push(Action::new(
+            account("contract"),
+            account("transfer"),
+            Vec::new(),
+            vec![
+                PermissionLevel::new(alice.into(), active.into()),
+                PermissionLevel::new(bob.into(), active.into()),
+            ],
+        ));
+
+        let billed = billed_accounts_for_transaction(&transaction, alice, true);
+        assert_eq!(billed.into_iter().collect::<Vec<_>>(), vec![alice]);
+    }
+
+    #[test]
+    fn pre_only_bill_first_authorizer_feature_bills_all_action_authorizers() {
+        let alice = account("alice");
+        let bob = account("bob");
+        let active = account("active");
+        let mut transaction = Transaction::default();
+        transaction.actions.push(Action::new(
+            account("contract"),
+            account("transfer"),
+            Vec::new(),
+            vec![
+                PermissionLevel::new(alice.into(), active.into()),
+                PermissionLevel::new(bob.into(), active.into()),
+            ],
+        ));
+
+        let billed = billed_accounts_for_transaction(&transaction, alice, false);
+        assert_eq!(billed.into_iter().collect::<Vec<_>>(), vec![alice, bob]);
     }
 }

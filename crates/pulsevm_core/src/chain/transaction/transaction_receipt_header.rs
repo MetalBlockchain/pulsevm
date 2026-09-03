@@ -20,6 +20,8 @@ pub enum TransactionStatus {
     Executed,
     SoftFail,
     HardFail,
+    Delayed,
+    Expired,
 }
 
 impl fmt::Display for TransactionStatus {
@@ -28,6 +30,8 @@ impl fmt::Display for TransactionStatus {
             TransactionStatus::Executed => "Executed",
             TransactionStatus::SoftFail => "SoftFail",
             TransactionStatus::HardFail => "HardFail",
+            TransactionStatus::Delayed => "Delayed",
+            TransactionStatus::Expired => "Expired",
         };
         write!(f, "{}", status_str)
     }
@@ -47,6 +51,8 @@ impl Read for TransactionStatus {
             0 => Ok(TransactionStatus::Executed),
             1 => Ok(TransactionStatus::SoftFail),
             2 => Ok(TransactionStatus::HardFail),
+            3 => Ok(TransactionStatus::Delayed),
+            4 => Ok(TransactionStatus::Expired),
             _ => Err(ReadError::ParseError),
         }
     }
@@ -64,6 +70,8 @@ impl Write for TransactionStatus {
             TransactionStatus::Executed => 0_u8.write(bytes, pos),
             TransactionStatus::SoftFail => 1_u8.write(bytes, pos),
             TransactionStatus::HardFail => 2_u8.write(bytes, pos),
+            TransactionStatus::Delayed => 3_u8.write(bytes, pos),
+            TransactionStatus::Expired => 4_u8.write(bytes, pos),
         }
     }
 }
@@ -77,6 +85,8 @@ impl Serialize for TransactionStatus {
             TransactionStatus::Executed => "executed",
             TransactionStatus::SoftFail => "soft_fail",
             TransactionStatus::HardFail => "hard_fail",
+            TransactionStatus::Delayed => "delayed",
+            TransactionStatus::Expired => "expired",
         };
         serializer.serialize_str(status)
     }

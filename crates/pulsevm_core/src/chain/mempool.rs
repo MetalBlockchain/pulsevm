@@ -174,10 +174,19 @@ impl Mempool {
     fn prepend_missing(&mut self, mut older: Self) {
         while let Some(transaction) = older.transactions_list.pop_back() {
             let id = transaction.id().clone();
-            let expiration = older
-                .expiration_by_id
-                .remove(&id)
-                .expect("mempool transaction must have an expiry deadline");
+            // A detached batch can race with block acceptance removing an
+            // already-considered transaction. Do not let a stale auxiliary
+            // expiry index panic the consensus worker; reconstruct a bounded
+            // deadline for the surviving transaction instead.
+            let expiration = older.expiration_by_id.remove(&id).unwrap_or_else(|| {
+                let now = TimePointSec::now().sec_since_epoch();
+                transaction
+                    .get_transaction()
+                    .header
+                    .expiration()
+                    .sec_since_epoch()
+                    .min(now.saturating_add(DEFAULT_MEMPOOL_TRANSACTION_TTL_SECS))
+            });
             if self.transactions_list.len() + self.reserved_ids.len() < MAX_MEMPOOL_SIZE
                 && self.transactions_map.insert(id)
             {
@@ -279,7 +288,7 @@ mod tests {
             vec![],
         );
         PackedTransaction::new(
-            std::collections::BTreeSet::new(),
+            Vec::new(),
             TransactionCompression::None,
             pulsevm_crypto::Bytes::default(),
             trx.pack().unwrap().into(),
@@ -436,6 +445,20 @@ mod tests {
         mempool.finish_batch(batch);
         assert!(mempool.contains(detached_transaction.id()));
         assert!(!mempool.add_transaction(tx(MAX_MEMPOOL_SIZE as u16)));
+    }
+
+    #[test]
+    fn detached_batch_recovers_from_a_missing_expiry_entry() {
+        let mut mempool = Mempool::new();
+        let transaction = tx_with_expiration(TimePointSec::maximum(), 99);
+        assert!(mempool.add_transaction(transaction.clone()));
+        let mut batch = mempool.take_all();
+        batch.transactions.expiration_by_id.clear();
+
+        mempool.finish_batch(batch);
+
+        assert!(mempool.contains(transaction.id()));
+        assert_eq!(mempool.pop_transaction().unwrap().id(), transaction.id());
     }
 
     #[test]

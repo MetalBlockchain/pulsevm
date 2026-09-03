@@ -1,3 +1,4 @@
+use pulsevm_crypto::AuthorityPublicKey;
 use pulsevm_proc_macros::{
     NumBytes,
     Read,
@@ -89,6 +90,100 @@ impl ProducerSchedule {
         }
         Ok(schedule)
     }
+
+    /// Decode Leap's format-1 `vector<producer_authority>` payload. PulseVM's
+    /// current block-signature representation has one K1 signature, so each v0
+    /// authority must reduce exactly to one K1 key whose weight satisfies its
+    /// threshold.
+    pub fn read_authorities_bounded(bytes: &[u8]) -> Result<Vec<ProducerKey>, ReadError> {
+        if bytes.len() > MAX_SCHEDULE_BYTES as usize {
+            return Err(ReadError::CustomError(format!(
+                "packed producer authorities are too large ({} bytes, max {})",
+                bytes.len(),
+                MAX_SCHEDULE_BYTES
+            )));
+        }
+        let mut pos = 0usize;
+        let producers = read_single_key_authorities(bytes, &mut pos)?;
+        if pos != bytes.len() {
+            return Err(ReadError::CustomError(format!(
+                "producer authority schedule has {} trailing byte(s)",
+                bytes.len() - pos
+            )));
+        }
+        Ok(producers)
+    }
+
+    /// Decode a format-1 `producer_authority_schedule`, as carried by block
+    /// header extension 1. This adds the schedule version before the same
+    /// authority vector accepted by `set_proposed_producers_ex`.
+    pub fn read_authority_schedule_bounded(bytes: &[u8]) -> Result<Self, ReadError> {
+        if bytes.len() > MAX_SCHEDULE_BYTES as usize {
+            return Err(ReadError::CustomError(format!(
+                "packed producer authority schedule is too large ({} bytes, max {})",
+                bytes.len(),
+                MAX_SCHEDULE_BYTES
+            )));
+        }
+        let mut pos = 0usize;
+        let version = u32::read(bytes, &mut pos)?;
+        let producers = read_single_key_authorities(bytes, &mut pos)?;
+        if pos != bytes.len() {
+            return Err(ReadError::CustomError(format!(
+                "producer authority schedule has {} trailing byte(s)",
+                bytes.len() - pos
+            )));
+        }
+        Ok(Self { version, producers })
+    }
+}
+
+fn read_single_key_authorities(
+    bytes: &[u8],
+    pos: &mut usize,
+) -> Result<Vec<ProducerKey>, ReadError> {
+    let declared = VarUint32::read(bytes, pos)?.0 as usize;
+    if declared < 1 || declared > MAX_PRODUCERS {
+        return Err(ReadError::CustomError(format!(
+            "proposed producer count {} out of range [1, {}]",
+            declared, MAX_PRODUCERS
+        )));
+    }
+
+    let mut producers = Vec::with_capacity(declared);
+    for _ in 0..declared {
+        let producer_name = Name::read(bytes, pos)?;
+        let authority_variant = VarUint32::read(bytes, pos)?.0;
+        if authority_variant != 0 {
+            return Err(ReadError::CustomError(format!(
+                "producer {producer_name} uses unsupported block-signing authority variant {authority_variant}"
+            )));
+        }
+        let threshold = u32::read(bytes, pos)?;
+        let key_count = VarUint32::read(bytes, pos)?.0 as usize;
+        if key_count != 1 {
+            return Err(ReadError::CustomError(format!(
+                "producer {producer_name} has {key_count} block-signing keys; PulseVM currently requires exactly one"
+            )));
+        }
+        let authority_key = AuthorityPublicKey::read(bytes, pos)?;
+        let weight = u16::read(bytes, pos)?;
+        if threshold == 0 || u32::from(weight) < threshold {
+            return Err(ReadError::CustomError(format!(
+                "producer {producer_name} single-key authority cannot satisfy threshold {threshold} with weight {weight}"
+            )));
+        }
+        let k1 = authority_key.as_k1().ok_or_else(|| {
+            ReadError::CustomError(format!(
+                "producer {producer_name} uses a non-K1 block-signing key"
+            ))
+        })?;
+        producers.push(ProducerKey {
+            producer_name,
+            block_signing_key: PublicKey::new(k1),
+        });
+    }
+    Ok(producers)
 }
 
 #[cfg(test)]

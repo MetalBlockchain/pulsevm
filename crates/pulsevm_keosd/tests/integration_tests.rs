@@ -535,8 +535,8 @@ mod manager_tests {
         let digest = [0xca_u8; 32];
         let sigs = mgr.sign_digest(&digest, &[pub_key.clone()]).unwrap();
         assert_eq!(sigs.len(), 1);
-        assert!(sigs.contains_key(&pub_key));
-        assert!(sigs[&pub_key].starts_with("SIG_K1_"));
+        assert_eq!(sigs[0].0, pub_key);
+        assert!(sigs[0].1.starts_with("SIG_K1_"));
     }
 
     #[test]
@@ -558,14 +558,17 @@ mod manager_tests {
         mgr.import_key("test", &wif2).unwrap();
 
         let digest = [0xfe_u8; 32];
-        let sigs = mgr
-            .sign_digest(&digest, &[pub1.clone(), pub2.clone()])
-            .unwrap();
+        let requested = if pub1 < pub2 {
+            vec![pub2.clone(), pub1.clone()]
+        } else {
+            vec![pub1.clone(), pub2.clone()]
+        };
+        let sigs = mgr.sign_digest(&digest, &requested).unwrap();
         assert_eq!(sigs.len(), 2);
-        assert!(sigs.contains_key(&pub1));
-        assert!(sigs.contains_key(&pub2));
+        assert_eq!(sigs[0].0, requested[0]);
+        assert_eq!(sigs[1].0, requested[1]);
         // Different keys should produce different signatures
-        assert_ne!(sigs[&pub1], sigs[&pub2]);
+        assert_ne!(sigs[0].1, sigs[1].1);
     }
 
     #[test]
