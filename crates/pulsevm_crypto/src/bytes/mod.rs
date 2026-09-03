@@ -89,7 +89,18 @@ impl From<&[u8]> for Bytes {
 impl NumBytes for Bytes {
     #[inline]
     fn num_bytes(&self) -> usize {
-        4 + self.0.len() // 4 bytes for length + data
+        // The length prefix is a `VarUint32` (1-5 bytes), not a fixed 4: `write`
+        // below emits it through `usize::write`, and `read` consumes it through
+        // `usize::read`. Hardcoding 4 made this the only length-prefixed type in
+        // the workspace that disagreed with its own writer -- `[T]` and `Vec<T>`
+        // both use `self.len().num_bytes()`.
+        //
+        // The disagreement was not inert. `Write::pack` allocates `num_bytes()`
+        // zeroed bytes, writes into them, and returns the whole buffer however
+        // far the writer actually got, so every `Bytes` under 128 bytes packed
+        // with three trailing zeros. Above 2^28 the estimate flipped to an
+        // *under*estimate and `pack()` began failing with `NotEnoughSpace`.
+        self.0.len().num_bytes() + self.0.len()
     }
 }
 
@@ -144,5 +155,93 @@ mod tests {
     fn test_bytes_display() {
         let bytes = Bytes::new(vec![0x12, 0x34, 0x56, 0x78]);
         assert_eq!(bytes.to_string(), "12345678");
+    }
+
+    /// The encoding, pinned against Antelope: an `unsigned_int` (varint) length
+    /// followed by the payload. Three bytes of data must pack to exactly four.
+    #[test]
+    fn packs_with_a_varint_length_prefix_and_no_padding() {
+        let packed = Bytes::new(vec![0xAA, 0xBB, 0xCC]).pack().unwrap();
+        assert_eq!(
+            packed,
+            vec![0x03, 0xAA, 0xBB, 0xCC],
+            "expected a 1-byte varint length, not a fixed 4-byte one"
+        );
+    }
+
+    /// `Write::pack` allocates `num_bytes()` and returns the whole buffer
+    /// regardless of how far `write` got, so any disagreement between the two
+    /// shows up directly as trailing zeros in the packed output.
+    ///
+    /// The lengths straddle every `VarUint32` width boundary: 1 byte below 128,
+    /// 2 below 16384, 3 below 2^21.
+    #[test]
+    fn num_bytes_matches_what_write_actually_emits() {
+        for len in [0usize, 1, 3, 127, 128, 129, 16_383, 16_384, 16_385, 100_000] {
+            let bytes = Bytes::new(vec![0xAA; len]);
+            let packed = bytes.pack().unwrap();
+
+            assert_eq!(
+                packed.len(),
+                bytes.num_bytes(),
+                "len {len}: pack() returned {} bytes but num_bytes() promised {}",
+                packed.len(),
+                bytes.num_bytes()
+            );
+
+            // And the writer must consume the whole buffer: a shortfall here is
+            // exactly the trailing padding.
+            let mut pos = 0usize;
+            let mut scratch = vec![0u8; bytes.num_bytes()];
+            bytes.write(&mut scratch, &mut pos).unwrap();
+            assert_eq!(
+                pos,
+                packed.len(),
+                "len {len}: write advanced {pos} of {} bytes, leaving padding",
+                packed.len()
+            );
+        }
+    }
+
+    /// Round-tripping must consume the packed bytes exactly. Trailing padding
+    /// left `pos` short of the end, which is what leaked into every digest
+    /// computed over a packed `Bytes`.
+    #[test]
+    fn round_trip_consumes_the_entire_encoding() {
+        for len in [0usize, 3, 127, 128, 16_384] {
+            let original = Bytes::new((0..len).map(|i| i as u8).collect());
+            let packed = original.pack().unwrap();
+
+            let mut pos = 0usize;
+            let decoded = Bytes::read(&packed, &mut pos).unwrap();
+
+            assert_eq!(decoded, original, "len {len}: round trip changed the data");
+            assert_eq!(
+                pos,
+                packed.len(),
+                "len {len}: {} bytes left unread after decoding",
+                packed.len() - pos
+            );
+        }
+    }
+
+    /// `Bytes` must agree with the other length-prefixed types. `Vec<u8>` and
+    /// `[u8]` both size their prefix with `self.len().num_bytes()`; `Bytes` was
+    /// the only one that did not.
+    #[test]
+    fn agrees_with_the_equivalent_vec_encoding() {
+        for len in [0usize, 3, 127, 128, 16_384] {
+            let raw: Vec<u8> = (0..len).map(|i| i as u8).collect();
+            assert_eq!(
+                Bytes::new(raw.clone()).num_bytes(),
+                raw.num_bytes(),
+                "len {len}: Bytes and Vec<u8> must size identically"
+            );
+            assert_eq!(
+                Bytes::new(raw.clone()).pack().unwrap(),
+                raw.pack().unwrap(),
+                "len {len}: Bytes and Vec<u8> must pack identically"
+            );
+        }
     }
 }
