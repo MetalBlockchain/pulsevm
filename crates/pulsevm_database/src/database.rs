@@ -2635,6 +2635,25 @@ impl Database {
                 Name::new(permission_name)
             )));
         }
+        // A permission that something is still linked to cannot be removed
+        // either (apply_pulse_deleteauth). Dropping it would leave
+        // `lookup_minimum_permission` resolving to a name that no longer
+        // exists, which fails every action of that contract for this account --
+        // and fails `unlinkauth` too, since that resolves the same dangling
+        // name before it can remove the link. The account/contract pair would be
+        // permanently unusable.
+        if let Some((code, message_type)) = self
+            .backend
+            .first_link_to_permission(account, permission_name)
+        {
+            return Err(ChainError::ActionValidationError(format!(
+                "cannot delete a linked authority; unlink it first. '{}@{}' is linked to {}::{}",
+                Name::new(account),
+                Name::new(permission_name),
+                Name::new(code),
+                Name::new(message_type)
+            )));
+        }
         // deleteauth refunds `billable_size_v<permission_object>` plus the
         // authority's dynamic billable size (config.hpp / apply_pulse_deleteauth).
         let auth_blob = self

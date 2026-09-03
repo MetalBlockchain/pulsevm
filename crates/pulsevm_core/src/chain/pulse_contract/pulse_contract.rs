@@ -12,6 +12,7 @@ use pulsevm_serialization::Read;
 
 use crate::{
     ACTIVE_NAME,
+    ANY_NAME,
     CODE_NAME,
     OWNER_NAME,
     chain::{
@@ -412,6 +413,40 @@ pub fn linkauth(
         ChainError::TransactionError(format!("required permission cannot be empty")),
     )?;
     context.require_authorization(&requirement.account, None)?;
+
+    // Both targets must exist (apply_pulse_linkauth). Without these a link can
+    // be created to a permission that was never defined, and afterwards
+    // `lookup_minimum_permission` resolves to that name while `get_permission`
+    // errors -- so every action of `code` from this account fails, and
+    // `unlinkauth` cannot undo it because it resolves the same dangling name
+    // first. The pair is permanently unusable.
+    pulse_assert(
+        db.is_account(requirement.code.as_u64())?,
+        ChainError::TransactionError(format!(
+            "failed to retrieve code for account: {}",
+            requirement.code
+        )),
+    )?;
+    // `pulse.any` is virtual -- it never has a permission object -- so it is
+    // exempt, matching the `eosio.any` carve-out upstream. The check is against
+    // `(account, requirement)` rather than the permission name alone, which is
+    // the behaviour Leap moved to under `only_link_to_existing_permission`.
+    if requirement.requirement != ANY_NAME {
+        let exists = db
+            .read()?
+            .permission_id(
+                requirement.account.as_u64(),
+                requirement.requirement.as_u64(),
+            )?
+            .is_some();
+        pulse_assert(
+            exists,
+            ChainError::TransactionError(format!(
+                "failed to retrieve permission: {}",
+                requirement.requirement
+            )),
+        )?;
+    }
 
     let delta = db.link_auth(
         requirement.account.as_u64(),
