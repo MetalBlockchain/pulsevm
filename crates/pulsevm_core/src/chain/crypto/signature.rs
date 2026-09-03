@@ -69,12 +69,46 @@ impl Signature {
         }
     }
 
+    /// Recover the signing key, enforcing fc's canonical-signature predicate on
+    /// K1 signatures.
+    ///
+    /// This is the consensus entry point: transaction authorization and block
+    /// header verification both come through here, and both must reject a
+    /// non-canonical signature the way nodeos does. See
+    /// [`Self::recover_authority_key_non_canonical`] for the contract-intrinsic
+    /// path, which deliberately does not.
     pub fn recover_authority_key(&self, digest: &Digest) -> Result<AuthorityPublicKey, ChainError> {
+        self.recover_authority_key_inner(digest, true)
+    }
+
+    /// Recover the signing key *without* the K1 canonical check, matching fc's
+    /// `check_canonical = false`.
+    ///
+    /// Only the `recover_key` / `assert_recover_key` intrinsics should use this:
+    /// contracts recover keys from signatures supplied by arbitrary parties, and
+    /// must see the same accept/reject behaviour as nodeos. R1 and WebAuthn are
+    /// unaffected — they have no equivalent predicate — so this differs from the
+    /// checked form only for K1.
+    pub fn recover_authority_key_non_canonical(
+        &self,
+        digest: &Digest,
+    ) -> Result<AuthorityPublicKey, ChainError> {
+        self.recover_authority_key_inner(digest, false)
+    }
+
+    fn recover_authority_key_inner(
+        &self,
+        digest: &Digest,
+        check_canonical: bool,
+    ) -> Result<AuthorityPublicKey, ChainError> {
         match &self.inner {
-            SignatureInner::K1(signature) => signature
-                .recover(digest.as_bytes())
-                .map(AuthorityPublicKey::K1)
-                .map_err(|e| ChainError::TransactionError(e.to_string())),
+            SignatureInner::K1(signature) => if check_canonical {
+                signature.recover(digest.as_bytes())
+            } else {
+                signature.recover_non_canonical(digest.as_bytes())
+            }
+            .map(AuthorityPublicKey::K1)
+            .map_err(|e| ChainError::TransactionError(e.to_string())),
             SignatureInner::R1(signature) => signature
                 .recover(digest.as_bytes())
                 .map(AuthorityPublicKey::R1)
