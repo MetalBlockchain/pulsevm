@@ -3152,13 +3152,32 @@ impl ChainDatabase {
     /// expiration falls strictly before `cutoff` (both in microseconds, as the
     /// C++ compares `cutoff > expiration.to_time_point()`). Expirations are whole
     /// seconds, so they are scaled to microseconds for the comparison.
+    /// Walks `by_expiration` rather than scanning the table: the set retains every
+    /// id for the whole transaction lifetime window, and this runs on every block,
+    /// so a scan would let a flood of cheap transactions inflate a recurring
+    /// per-block cost for every validator.
     pub fn clear_expired_input_transactions(&self, cutoff_micros: i64) -> Result<(), DbError> {
+        use std::ops::Bound;
         let mut db = self.lock();
+        // A row is expired when `expiration * 1_000_000 < cutoff_micros`, so the
+        // lowest expiration that survives is `ceil(cutoff_micros / 1_000_000)` and
+        // the walk stops strictly before `(first_live, i64::MIN)` — the smallest
+        // key any surviving row can carry.
+        let first_live = cutoff_micros.div_euclid(1_000_000)
+            + i64::from(cutoff_micros.rem_euclid(1_000_000) != 0);
+        let end = if first_live <= 0 {
+            // Expirations are unsigned, so nothing can precede the cutoff.
+            return Ok(());
+        } else if first_live > u32::MAX as i64 {
+            Bound::Unbounded
+        } else {
+            Bound::Excluded((first_live as u32, i64::MIN))
+        };
         let expired: Vec<ObjectId<TransactionRow>> = db
             .table::<TransactionRow>()?
-            .iter()
-            .filter(|t| (t.expiration as i64) * 1_000_000 < cutoff_micros)
-            .map(|t| t.id())
+            .get_index::<TxByExpiration>()
+            .range((Bound::Unbounded, end))
+            .map(|(_, t)| t.id())
             .collect();
         for id in expired {
             db.remove::<TransactionRow>(id)?;
