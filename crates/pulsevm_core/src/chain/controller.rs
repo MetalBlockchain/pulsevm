@@ -6772,6 +6772,240 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_code_hash_returns_nodeos_compatible_metadata() -> Result<(), ChainError> {
+        let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
+        let timestamp = *controller.last_accepted_block().timestamp();
+        let status = BlockStatus::Building;
+        let short = Name::from_str("short")?;
+        let sentinel = "\\aa".repeat(42);
+        let wasm = wat::parse_str(&format!(
+            r#"
+            (module
+              (import "env" "get_code_hash"
+                (func $get (param i64 i32 i32 i32) (result i32)))
+              (import "env" "__fixunstfdi"
+                (func $fix (param i64 i64) (result i64)))
+              (import "env" "set_action_return_value"
+                (func $return (param i32 i32)))
+              (memory (export "memory") 1)
+              (data (i32.const 128) "{sentinel}")
+              (func (export "apply") (param i64 i64 i64)
+                (if (i64.eq (local.get 2) (i64.const {short}))
+                  (then
+                    (drop (call $get (i64.const {account}) (i32.const 99) (i32.const 128) (i32.const 42)))
+                    (call $return (i32.const 128) (i32.const 42)))
+                  (else
+                    (i64.store (i32.const 0)
+                      (call $fix (i64.const 0) (i64.const 4611404543450677248)))
+                    (drop (call $get (i64.const 0) (i32.const 65536) (i32.const 0) (i32.const 0)))
+                    (drop (call $get (i64.const {account}) (i32.const 99) (i32.const 0) (i32.const 43)))
+                    (call $return (i32.const 0) (i32.const 43))))))
+            "#,
+            account = PULSE_NAME.as_u64(),
+            short = short.as_u64(),
+            sentinel = sentinel,
+        ))
+        .expect("valid code-hash contract");
+        let expected_hash = pulsevm_crypto::Digest::hash(&wasm).0;
+
+        controller.execute_transaction(
+            &set_code(&private_key, PULSE_NAME, wasm, chain_id)?,
+            &timestamp,
+            &status,
+        )?;
+        let result = controller.execute_transaction(
+            &call_contract(
+                &private_key,
+                PULSE_NAME,
+                Name::from_str("read")?,
+                &Vec::<u8>::new(),
+                chain_id,
+            )?,
+            &timestamp,
+            &status,
+        )?;
+
+        let returned = &result.trace.action_traces()[0].return_value;
+        assert_eq!(returned.len(), 43);
+        assert_eq!(returned[0], 0, "struct version must be version 0");
+        assert_eq!(u64::from_le_bytes(returned[1..9].try_into().unwrap()), 1);
+        assert_eq!(&returned[9..41], expected_hash.as_slice());
+        assert_eq!(returned[41], 0, "vm type must be wasm version 0");
+        assert_eq!(returned[42], 0, "vm version must be wasm version 0");
+
+        let short_result = controller.execute_transaction(
+            &call_contract(&private_key, PULSE_NAME, short, &Vec::<u8>::new(), chain_id)?,
+            &timestamp,
+            &status,
+        )?;
+        assert_eq!(
+            short_result.trace.action_traces()[0]
+                .return_value
+                .as_slice(),
+            vec![0xaa; 42]
+        );
+
+        let wasm_v2 = wat::parse_str(&format!(
+            r#"
+            (module
+              (import "env" "get_code_hash"
+                (func $get (param i64 i32 i32 i32) (result i32)))
+              (import "env" "set_action_return_value"
+                (func $return (param i32 i32)))
+              (memory (export "memory") 1)
+              (func (export "apply") (param i64 i64 i64)
+                (drop (call $get (i64.const {}) (i32.const 99) (i32.const 0) (i32.const 43)))
+                (call $return (i32.const 0) (i32.const 43))))
+            "#,
+            PULSE_NAME.as_u64(),
+        ))
+        .expect("valid second code version");
+        let expected_hash_v2 = pulsevm_crypto::Digest::hash(&wasm_v2).0;
+        controller.execute_transaction(
+            &set_code(&private_key, PULSE_NAME, wasm_v2, chain_id)?,
+            &timestamp,
+            &status,
+        )?;
+        let updated = controller.execute_transaction(
+            &call_contract(
+                &private_key,
+                PULSE_NAME,
+                Name::from_str("read2")?,
+                &Vec::<u8>::new(),
+                chain_id,
+            )?,
+            &timestamp,
+            &status,
+        )?;
+        let updated_return = &updated.trace.action_traces()[0].return_value;
+        assert_eq!(
+            u64::from_le_bytes(updated_return[1..9].try_into().unwrap()),
+            2
+        );
+        assert_eq!(&updated_return[9..41], expected_hash_v2.as_slice());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_sender_returns_creator_receiver_for_inline_actions() -> Result<(), ChainError> {
+        let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
+        let timestamp = *controller.last_accepted_block().timestamp();
+        let status = BlockStatus::Building;
+        let child = Name::from_str("child")?;
+        let child_action = Action::new(PULSE_NAME, child, Vec::new(), Vec::new()).pack()?;
+        let child_data: String = child_action
+            .iter()
+            .map(|byte| format!("\\{:02x}", byte))
+            .collect();
+        let wasm = wat::parse_str(&format!(
+            r#"
+            (module
+              (import "env" "get_sender" (func $sender (result i64)))
+              (import "env" "send_inline" (func $inline (param i32 i32)))
+              (import "env" "set_action_return_value" (func $return (param i32 i32)))
+              (memory (export "memory") 1)
+              (data (i32.const 64) "{child_data}")
+              (func (export "apply") (param i64 i64 i64)
+                (if (i64.eq (local.get 2) (i64.const {child}))
+                  (then
+                    (i64.store (i32.const 0) (call $sender))
+                    (call $return (i32.const 0) (i32.const 8)))
+                  (else
+                    (i64.store (i32.const 0) (call $sender))
+                    (call $return (i32.const 0) (i32.const 8))
+                    (call $inline (i32.const 64) (i32.const {child_len}))))))
+            "#,
+            child = child.as_u64(),
+            child_data = child_data,
+            child_len = child_action.len(),
+        ))
+        .expect("valid get-sender contract");
+
+        controller.execute_transaction(
+            &set_code(&private_key, PULSE_NAME, wasm, chain_id)?,
+            &timestamp,
+            &status,
+        )?;
+        let result = controller.execute_transaction(
+            &call_contract(
+                &private_key,
+                PULSE_NAME,
+                Name::from_str("root")?,
+                &Vec::<u8>::new(),
+                chain_id,
+            )?,
+            &timestamp,
+            &status,
+        )?;
+
+        let traces = result.trace.action_traces();
+        assert_eq!(traces.len(), 2, "root action must execute its inline child");
+        assert_eq!(
+            u64::from_le_bytes(traces[0].return_value[..8].try_into().unwrap()),
+            0,
+            "top-level action has no sender"
+        );
+        assert_eq!(
+            u64::from_le_bytes(traces[1].return_value[..8].try_into().unwrap()),
+            PULSE_NAME.as_u64(),
+            "inline sender is the parent receiver"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fixunstfdi_is_registered_and_returns_value() -> Result<(), ChainError> {
+        let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
+        let timestamp = *controller.last_accepted_block().timestamp();
+        let status = BlockStatus::Building;
+        let wasm = wat::parse_str(
+            r#"
+            (module
+              (import "env" "__fixunstfdi"
+                (func $fix (param i64 i64) (result i64)))
+              (import "env" "set_action_return_value"
+                (func $return (param i32 i32)))
+              (memory (export "memory") 1)
+              (func (export "apply") (param i64 i64 i64)
+                (i64.store (i32.const 0)
+                  (call $fix (i64.const 0) (i64.const 4611404543450677248)))
+                (call $return (i32.const 0) (i32.const 8))))
+            "#,
+        )
+        .expect("valid softfloat contract");
+
+        controller.execute_transaction(
+            &set_code(&private_key, PULSE_NAME, wasm, chain_id)?,
+            &timestamp,
+            &status,
+        )?;
+        let result = controller.execute_transaction(
+            &call_contract(
+                &private_key,
+                PULSE_NAME,
+                Name::from_str("soft")?,
+                &Vec::<u8>::new(),
+                chain_id,
+            )?,
+            &timestamp,
+            &status,
+        )?;
+
+        assert_eq!(
+            u64::from_le_bytes(
+                result.trace.action_traces()[0].return_value[..8]
+                    .try_into()
+                    .unwrap()
+            ),
+            1,
+            "__fixunstfdi(1.0) must return 1"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_push_transaction() -> Result<(), ChainError> {
         let chain_id =
             Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
