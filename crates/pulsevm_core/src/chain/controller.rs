@@ -80,6 +80,7 @@ use crate::{
         },
         state_sync,
         transaction::{
+            ACTION_RETURN_VALUE_FEATURE_DIGEST,
             ActionReceipt,
             PackedTransaction,
             SignedTransaction,
@@ -2798,9 +2799,13 @@ impl Controller {
                 let (global_sequence, recv_sequence, auth_sequences) = self
                     .db
                     .next_action_sequences(system.as_u64(), &[system.as_u64()])?;
+                let action_return_value = self
+                    .db
+                    .protocol_feature_activated(ACTION_RETURN_VALUE_FEATURE_DIGEST)
+                    .then_some(&[][..]);
                 let mut receipt = ActionReceipt::new(
                     system,
-                    generate_action_digest(&action, None),
+                    generate_action_digest(&action, action_return_value),
                     global_sequence,
                     recv_sequence,
                     CanonicalMap::new(),

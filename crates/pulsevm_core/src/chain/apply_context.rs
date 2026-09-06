@@ -49,6 +49,7 @@ use crate::{
             ProtocolVersion,
         },
         transaction::{
+            ACTION_RETURN_VALUE_FEATURE_DIGEST,
             Action,
             ActionReceipt,
             Transaction,
@@ -467,7 +468,11 @@ impl ApplyContext {
 
         let act_digest = {
             let inner = self.inner.read()?;
-            generate_action_digest(&action, inner.action_return_value.clone())
+            let action_return_value = self
+                .db
+                .protocol_feature_activated(ACTION_RETURN_VALUE_FEATURE_DIGEST)
+                .then(|| inner.action_return_value.as_deref().unwrap_or_default());
+            generate_action_digest(&action, action_return_value)
         };
         let auth_actors = action
             .authorization()

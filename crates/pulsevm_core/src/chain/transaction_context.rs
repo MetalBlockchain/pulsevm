@@ -35,6 +35,7 @@ use crate::{
         },
         resource_limits::ResourceLimitsManager,
         transaction::{
+            ACTION_RETURN_VALUE_FEATURE_DIGEST,
             Action,
             ActionReceipt,
             ActionTrace,
@@ -447,9 +448,12 @@ fn direct_action_receipt_digest(
         .collect::<Vec<_>>();
     let (global_sequence, recv_sequence, auth_sequences) =
         db.next_action_sequences(receiver.as_u64(), &auth_actors)?;
+    let action_return_value = db
+        .protocol_feature_activated(ACTION_RETURN_VALUE_FEATURE_DIGEST)
+        .then_some(&[][..]);
     let mut receipt = ActionReceipt::new(
         receiver,
-        generate_action_digest(action, None),
+        generate_action_digest(action, action_return_value),
         global_sequence,
         recv_sequence,
         CanonicalMap::new(),
@@ -1101,9 +1105,13 @@ impl TransactionContext {
         let (global_sequence, recv_sequence, auth_sequences) = self
             .db
             .next_action_sequences(receiver.as_u64(), &auth_actors)?;
+        let action_return_value = self
+            .db
+            .protocol_feature_activated(ACTION_RETURN_VALUE_FEATURE_DIGEST)
+            .then_some(&[][..]);
         let mut receipt = ActionReceipt::new(
             receiver,
-            generate_action_digest(&action, None),
+            generate_action_digest(&action, action_return_value),
             global_sequence,
             recv_sequence,
             CanonicalMap::new(),

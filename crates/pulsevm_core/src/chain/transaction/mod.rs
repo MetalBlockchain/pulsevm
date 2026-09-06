@@ -6,6 +6,7 @@ pub use action_trace::ActionTrace;
 
 mod action;
 pub use action::{
+    ACTION_RETURN_VALUE_FEATURE_DIGEST,
     Action,
     generate_action_digest,
 };
