@@ -43,9 +43,12 @@ pub mod constraints {
     pub const MAXIMUM_MUTABLE_GLOBALS: u32 = 1024;
     /// Maximum table element count.
     pub const MAXIMUM_TABLE_ELEMENTS: u64 = 1024;
-    /// Maximum section element count (unused at module level in the C++ impl,
-    /// but included for completeness).
+    /// Legacy maximum section element count used before
+    /// `CONFIGURABLE_WASM_LIMITS2` is activated.
     pub const MAXIMUM_SECTION_ELEMENTS: u32 = 1024;
+    /// Antelope's default `wasm_config.max_section_elements` after
+    /// `CONFIGURABLE_WASM_LIMITS2` is activated.
+    pub const DEFAULT_MAXIMUM_SECTION_ELEMENTS: u32 = 8192;
     /// 64 KiB – data segments must lie within this range.
     pub const MAXIMUM_LINEAR_MEMORY_INIT: u64 = 64 * 1024;
     /// Maximum bytes of locals + parameters per function.
@@ -122,11 +125,8 @@ pub enum ValidationError {
     #[error("WASM parse error: {0}")]
     Parse(#[from] BinaryReaderError),
 
-    #[error(
-        "Smart contract has more than {} section elements",
-        constraints::MAXIMUM_SECTION_ELEMENTS
-    )]
-    TooManySectionElements,
+    #[error("Smart contract has more than {limit} section elements")]
+    TooManySectionElements { limit: u32 },
 
     #[error(
         "Smart contract data segment exceeds maximum size of {} bytes",
@@ -176,6 +176,15 @@ fn val_type_byte_size(ty: &ValType) -> u32 {
         ValType::V128 => 16,
         _ => 8, // reference types – treat as pointer-width
     }
+}
+
+fn validate_section_count(count: u32, maximum_section_elements: u32) -> Result<()> {
+    if count > maximum_section_elements {
+        return Err(ValidationError::TooManySectionElements {
+            limit: maximum_section_elements,
+        });
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -611,7 +620,7 @@ fn validate_data_segment(offset_expr: &wasmparser::ConstExpr, data: &[u8]) -> Re
 /// Returns a [`ValidationError`] describing the first constraint violation
 /// found, if any.
 pub fn validate_wasm(wasm: &[u8]) -> Result<()> {
-    validate_wasm_impl(wasm, false)
+    validate_wasm_impl(wasm, false, constraints::MAXIMUM_SECTION_ELEMENTS)
 }
 
 /// Validate historical XPR code using the source chain's start-section rule.
@@ -622,11 +631,15 @@ pub fn validate_wasm(wasm: &[u8]) -> Result<()> {
 /// offline migration replay must admit bytecode that the source chain already
 /// accepted.
 #[doc(hidden)]
-pub fn validate_xpr_replay_wasm(wasm: &[u8]) -> Result<()> {
-    validate_wasm_impl(wasm, true)
+pub fn validate_xpr_replay_wasm(wasm: &[u8], maximum_section_elements: u32) -> Result<()> {
+    validate_wasm_impl(wasm, true, maximum_section_elements)
 }
 
-fn validate_wasm_impl(wasm: &[u8], allow_start_section: bool) -> Result<()> {
+fn validate_wasm_impl(
+    wasm: &[u8],
+    allow_start_section: bool,
+    maximum_section_elements: u32,
+) -> Result<()> {
     // ---- Code size check --------------------------------------------------
     if wasm.len() > constraints::MAXIMUM_CODE_SIZE {
         return Err(ValidationError::CodeTooLarge);
@@ -641,6 +654,7 @@ fn validate_wasm_impl(wasm: &[u8], allow_start_section: bool) -> Result<()> {
         match payload {
             // ----- Type section --------------------------------------------
             Payload::TypeSection(reader) => {
+                validate_section_count(reader.count(), maximum_section_elements)?;
                 for rec_group in reader {
                     let rec_group = rec_group?;
                     for sub_type in rec_group.into_types() {
@@ -655,6 +669,7 @@ fn validate_wasm_impl(wasm: &[u8], allow_start_section: bool) -> Result<()> {
 
             // ----- Import section ------------------------------------------
             Payload::ImportSection(reader) => {
+                validate_section_count(reader.count(), maximum_section_elements)?;
                 for import in reader.into_imports() {
                     let import = import?;
                     match import.ty {
@@ -677,21 +692,17 @@ fn validate_wasm_impl(wasm: &[u8], allow_start_section: bool) -> Result<()> {
 
             // ----- Function section ----------------------------------------
             Payload::FunctionSection(reader) => {
-                let mut count = 0u32;
+                validate_section_count(reader.count(), maximum_section_elements)?;
 
                 for func in reader {
                     let type_idx = func?;
                     info.func_type_indices.push(type_idx);
-                    count += 1;
-                }
-
-                if count + info.num_imported_functions > constraints::MAXIMUM_SECTION_ELEMENTS {
-                    return Err(ValidationError::TooManySectionElements);
                 }
             }
 
             // ----- Memory section ------------------------------------------
             Payload::MemorySection(reader) => {
+                validate_section_count(reader.count(), maximum_section_elements)?;
                 for mem in reader {
                     info.memories.push(mem?);
                 }
@@ -699,6 +710,7 @@ fn validate_wasm_impl(wasm: &[u8], allow_start_section: bool) -> Result<()> {
 
             // ----- Table section -------------------------------------------
             Payload::TableSection(reader) => {
+                validate_section_count(reader.count(), maximum_section_elements)?;
                 for table in reader {
                     let table = table?;
                     info.tables.push(table.ty);
@@ -707,6 +719,7 @@ fn validate_wasm_impl(wasm: &[u8], allow_start_section: bool) -> Result<()> {
 
             // ----- Global section ------------------------------------------
             Payload::GlobalSection(reader) => {
+                validate_section_count(reader.count(), maximum_section_elements)?;
                 for global in reader {
                     let global = global?;
                     info.globals.push(global.ty);
@@ -715,6 +728,7 @@ fn validate_wasm_impl(wasm: &[u8], allow_start_section: bool) -> Result<()> {
 
             // ----- Export section ------------------------------------------
             Payload::ExportSection(reader) => {
+                validate_section_count(reader.count(), maximum_section_elements)?;
                 for export in reader {
                     let Export { name, kind, index } = export?;
                     info.exports.push((name.to_string(), kind, index));
@@ -723,6 +737,7 @@ fn validate_wasm_impl(wasm: &[u8], allow_start_section: bool) -> Result<()> {
 
             // ----- Data section --------------------------------------------
             Payload::DataSection(reader) => {
+                validate_section_count(reader.count(), maximum_section_elements)?;
                 for segment in reader {
                     let segment = segment?;
 
@@ -738,6 +753,15 @@ fn validate_wasm_impl(wasm: &[u8], allow_start_section: bool) -> Result<()> {
                         validate_data_segment(&offset_expr, segment.data)?;
                     }
                 }
+            }
+
+            // These sections need no additional semantic data here, but Leap's
+            // configured cap applies independently to every WASM section.
+            Payload::ElementSection(reader) => {
+                validate_section_count(reader.count(), maximum_section_elements)?;
+            }
+            Payload::CodeSectionStart { count, .. } => {
+                validate_section_count(count, maximum_section_elements)?;
             }
 
             // ----- Code section --------------------------------------------
@@ -889,7 +913,7 @@ mod tests {
         .expect("valid WAT");
         let err = validate_wasm(&wasm).unwrap_err();
         assert!(matches!(err, ValidationError::StartSectionNotAllowed));
-        assert!(validate_xpr_replay_wasm(&wasm).is_ok());
+        assert!(validate_xpr_replay_wasm(&wasm, constraints::MAXIMUM_SECTION_ELEMENTS).is_ok());
     }
 
     #[test]
@@ -1517,6 +1541,49 @@ mod tests {
 
         let wasm = wat::parse_str(&wat).unwrap();
         assert!(validate_wasm(&wasm).is_err());
+    }
+
+    #[test]
+    fn test_configurable_section_limit_is_per_validation() {
+        let mut wat = String::from(
+            "(module \
+         (export \"apply\" (func $apply)) \
+         (func $apply (param $0 i64) (param $1 i64) (param $2 i64))",
+        );
+        for i in 0..constraints::MAXIMUM_SECTION_ELEMENTS {
+            write!(wat, "(func $AA_{})", i).unwrap();
+        }
+        wat.push(')');
+
+        let wasm = wat::parse_str(&wat).unwrap();
+        assert!(matches!(
+            validate_wasm(&wasm),
+            Err(ValidationError::TooManySectionElements {
+                limit: constraints::MAXIMUM_SECTION_ELEMENTS
+            })
+        ));
+        assert!(
+            validate_xpr_replay_wasm(&wasm, constraints::DEFAULT_MAXIMUM_SECTION_ELEMENTS).is_ok()
+        );
+    }
+
+    #[test]
+    fn test_section_limit_counts_imports_and_functions_independently() {
+        let mut wat = String::from("(module");
+        for i in 0..70 {
+            write!(wat, "(import \"env\" \"f{i}\" (func))").unwrap();
+        }
+        wat.push_str(
+            "(export \"apply\" (func $apply)) \
+             (func $apply (param $0 i64) (param $1 i64) (param $2 i64))",
+        );
+        for i in 0..964 {
+            write!(wat, "(func $AA_{i})").unwrap();
+        }
+        wat.push(')');
+
+        let wasm = wat::parse_str(&wat).unwrap();
+        assert!(validate_wasm(&wasm).is_ok());
     }
 
     #[test]

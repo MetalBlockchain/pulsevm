@@ -38,6 +38,13 @@ const ONLY_LINK_TO_EXISTING_PERMISSION_FEATURE_DIGEST: [u8; 32] = [
     0xb4, 0xa5, 0xad, 0x88, 0x19, 0x00, 0x43, 0x65, 0xd0, 0x2d, 0xc4, 0x37, 0x9a, 0x8b, 0x72, 0x41,
 ];
 
+/// `CONFIGURABLE_WASM_LIMITS2`, which switches validation from Leap's legacy
+/// parser cap to the active `wasm_config` limits.
+const CONFIGURABLE_WASM_LIMITS2_FEATURE_DIGEST: [u8; 32] = [
+    0xd5, 0x28, 0xb9, 0xf6, 0xe9, 0x69, 0x3f, 0x45, 0xed, 0x27, 0x7a, 0xf9, 0x34, 0x74, 0xfd, 0x47,
+    0x3c, 0xe7, 0xd8, 0x31, 0xda, 0xe2, 0x18, 0x0c, 0xca, 0x35, 0xd9, 0x07, 0xbd, 0x10, 0xcb, 0x40,
+];
+
 pub fn newaccount(
     context: &mut ApplyContext,
     db: &mut Database,
@@ -167,7 +174,16 @@ pub fn setcode(
         // contains historical AssemblyScript contracts that use one. Preserve
         // PulseVM's stricter admission rule outside the opt-in migration path.
         let validation = if db.xpr_native_replay_enabled() {
-            pulsevm_wasm_validation::validate_xpr_replay_wasm(act.code.as_slice())
+            let maximum_section_elements =
+                if db.protocol_feature_activated(CONFIGURABLE_WASM_LIMITS2_FEATURE_DIGEST) {
+                    pulsevm_wasm_validation::constraints::DEFAULT_MAXIMUM_SECTION_ELEMENTS
+                } else {
+                    pulsevm_wasm_validation::constraints::MAXIMUM_SECTION_ELEMENTS
+                };
+            pulsevm_wasm_validation::validate_xpr_replay_wasm(
+                act.code.as_slice(),
+                maximum_section_elements,
+            )
         } else {
             pulsevm_wasm_validation::validate_wasm(act.code.as_slice())
         };
