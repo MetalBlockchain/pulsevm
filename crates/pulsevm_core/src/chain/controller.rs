@@ -5164,6 +5164,54 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn wasm_action_return_value_is_committed_to_receipt_digest() -> Result<(), ChainError> {
+        let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
+        let feature = crate::chain::transaction::ACTION_RETURN_VALUE_FEATURE_DIGEST;
+        controller.db.preactivate_protocol_feature(feature)?;
+        controller.db.activate_protocol_features(&[feature], 1)?;
+
+        let account = Name::from_str("returnvalue")?;
+        let timestamp = *controller.last_accepted_block().timestamp();
+        let status = BlockStatus::Building;
+        controller.execute_transaction(
+            &create_account(&private_key, account, chain_id)?,
+            &timestamp,
+            &status,
+        )?;
+        let wasm = wat::parse_str(
+            r#"(module
+                (import "env" "set_action_return_value" (func $set_return (param i32 i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 8) "result")
+                (func (export "apply") (param i64 i64 i64)
+                    (call $set_return (i32.const 8) (i32.const 6))))"#,
+        )
+        .expect("valid wasm");
+        controller.execute_transaction(
+            &set_code(&private_key, account, wasm, chain_id)?,
+            &timestamp,
+            &status,
+        )?;
+
+        let transaction = call_contract(
+            &private_key,
+            account,
+            Name::from_str("return")?,
+            &7u8,
+            chain_id,
+        )?;
+        let action = transaction.get_transaction().actions[0].clone();
+        let result = controller.execute_transaction(&transaction, &timestamp, &status)?;
+        let trace = &result.trace.action_traces[0];
+        assert_eq!(trace.return_value, b"result");
+        assert_eq!(
+            trace.receipt.as_ref().expect("action receipt").act_digest,
+            generate_action_digest(&action, Some(b"result")),
+        );
+        Ok(())
+    }
+
     fn call_contract<T: Write>(
         private_key: &PrivateKey,
         account: Name,

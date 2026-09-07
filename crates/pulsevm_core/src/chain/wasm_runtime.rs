@@ -1941,6 +1941,11 @@ impl WasmRuntime {
                 }
 
                 if let Some(value) = return_value {
+                    // ACTION_RETURN_VALUE commits the bytes returned by the
+                    // contract to the action-receipt digest. Keep the receipt
+                    // input and the informational trace in sync after a
+                    // successful guest invocation.
+                    apply_context.set_action_return_value(value.0.clone())?;
                     apply_context.set_trace_return_value(value.0)?;
                 }
 
