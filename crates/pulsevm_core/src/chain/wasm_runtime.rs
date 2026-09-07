@@ -5,7 +5,13 @@ use std::{
         BTreeSet,
         HashSet,
     },
+    fs,
+    io::Write,
     num::NonZeroUsize,
+    path::{
+        Path,
+        PathBuf,
+    },
     sync::{
         Arc,
         Mutex,
@@ -1083,6 +1089,12 @@ struct CachedModule {
     resettable: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModuleCacheStatus {
+    Compiled,
+    Artifact,
+}
+
 fn module_is_resettable(module: &Module) -> bool {
     let info = module.info();
     info.start_function.is_none()
@@ -1146,6 +1158,11 @@ const MAX_WARM_STORES: usize = 64;
 const DEFAULT_MAX_CACHED_MODULES: usize = 256;
 const MAX_CACHED_MODULES: usize = 1024;
 
+/// Serialized modules contain native code plus the output of PulseVM's WASM
+/// transforms and metering middleware. Bump this namespace whenever any of
+/// those inputs change so an old artifact is never reused under new rules.
+const WASM_ARTIFACT_CACHE_NAMESPACE: &str = "wasmer-7.2.0-llvm-pulsevm-v1";
+
 // A warm store owns raw VM pointers and so is neither `Send` nor `Sync`; it
 // cannot live in the shared runtime state. Keep the pool thread-local instead —
 // block application is sequential on a given thread, so a warm store is only
@@ -1164,6 +1181,7 @@ struct InnerWasmRuntime {
 pub struct WasmRuntime {
     inner: Arc<RwLock<InnerWasmRuntime>>,
     precompile_tx: Option<SyncSender<PrecompileJob>>,
+    artifact_cache_dir: Option<PathBuf>,
 }
 
 struct PrecompileJob {
@@ -1227,22 +1245,42 @@ impl WasmRuntime {
             ),
             precompiling: HashSet::new(),
         }));
+        let artifact_cache_dir = std::env::var_os("PULSEVM_WASM_ARTIFACT_CACHE_DIR")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .map(|root| {
+                root.join(format!(
+                    "{WASM_ARTIFACT_CACHE_NAMESPACE}-{}",
+                    std::env::consts::ARCH
+                ))
+            });
+        if let Some(directory) = &artifact_cache_dir {
+            fs::create_dir_all(directory).map_err(|error| {
+                ChainError::WasmRuntimeError(format!(
+                    "cannot create WASM artifact cache {}: {error}",
+                    directory.display()
+                ))
+            })?;
+        }
         let precompile_threads = std::env::var("PULSEVM_WASM_PRECOMPILE_THREADS")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(0)
             .min(32);
-        let precompile_tx = Self::start_precompile_workers(&inner, precompile_threads)?;
+        let precompile_tx =
+            Self::start_precompile_workers(&inner, precompile_threads, artifact_cache_dir.clone())?;
 
         Ok(Self {
             inner,
             precompile_tx,
+            artifact_cache_dir,
         })
     }
 
     fn start_precompile_workers(
         inner: &Arc<RwLock<InnerWasmRuntime>>,
         threads: usize,
+        artifact_cache_dir: Option<PathBuf>,
     ) -> Result<Option<SyncSender<PrecompileJob>>, ChainError> {
         if threads == 0 {
             return Ok(None);
@@ -1253,6 +1291,7 @@ impl WasmRuntime {
         for index in 0..threads {
             let inner = Arc::clone(inner);
             let rx = Arc::clone(&rx);
+            let artifact_cache_dir = artifact_cache_dir.clone();
             thread::Builder::new()
                 .name(format!("wasm-precompile-{index}"))
                 .spawn(move || {
@@ -1261,12 +1300,13 @@ impl WasmRuntime {
                             Some(job) => job,
                             None => break,
                         };
-                        let compiled = Self::compile_module(&job.code);
+                        let compiled =
+                            Self::compile_module(&job.code, job.id, artifact_cache_dir.as_deref());
                         let Ok(mut runtime) = inner.write() else {
                             break;
                         };
                         runtime.precompiling.remove(&job.id);
-                        if let Ok(module) = compiled
+                        if let Ok((module, _)) = compiled
                             && !runtime.code_cache.contains(&job.id)
                         {
                             runtime.code_cache.put(job.id, module);
@@ -1321,22 +1361,74 @@ impl WasmRuntime {
             .into()
     }
 
-    fn compile_module(code_bytes: &[u8]) -> Result<CachedModule, ChainError> {
+    fn compile_module(
+        code_bytes: &[u8],
+        id: Id,
+        artifact_cache_dir: Option<&Path>,
+    ) -> Result<(CachedModule, ModuleCacheStatus), ChainError> {
         let runtime_code = expose_internal_memory(code_bytes)?;
         let (runtime_code, reset_exports) = expose_reset_state(runtime_code.as_ref())?;
         let (runtime_code, start_export) = defer_start_function(runtime_code.as_ref())?;
         let engine = Self::deterministic_engine();
         let store = Store::new(engine.clone());
+        let artifact_path = artifact_cache_dir
+            .map(|directory| directory.join(format!("{}.artifact", hex::encode(id.as_bytes()))));
+        if let Some(path) = &artifact_path
+            && path.is_file()
+        {
+            // SAFETY: this opt-in directory contains only artifacts emitted by
+            // this runtime below. The versioned namespace separates changes to
+            // Wasmer, the compiler, transforms, and metering configuration.
+            if let Ok(module) = unsafe { Module::deserialize_from_file(&store, path) } {
+                let resettable = instance_reuse_enabled() && module_is_resettable(&module);
+                return Ok((
+                    CachedModule {
+                        module,
+                        engine,
+                        reset_exports,
+                        start_export,
+                        resettable,
+                    },
+                    ModuleCacheStatus::Artifact,
+                ));
+            }
+        }
         let module = Module::new(store.engine(), runtime_code.as_ref())
             .map_err(|error| ChainError::WasmRuntimeError(error.to_string()))?;
         let resettable = instance_reuse_enabled() && module_is_resettable(&module);
-        Ok(CachedModule {
-            module,
-            engine,
-            reset_exports,
-            start_export,
-            resettable,
-        })
+        if let (Some(directory), Some(path)) = (artifact_cache_dir, artifact_path) {
+            // Cache persistence is an optimization. A full disk, concurrent
+            // writer, or incompatible stale file must never reject a block.
+            let _ = Self::persist_module_artifact(directory, &path, &module);
+        }
+        Ok((
+            CachedModule {
+                module,
+                engine,
+                reset_exports,
+                start_export,
+                resettable,
+            },
+            ModuleCacheStatus::Compiled,
+        ))
+    }
+
+    fn persist_module_artifact(
+        directory: &Path,
+        path: &Path,
+        module: &Module,
+    ) -> Result<(), String> {
+        let serialized = module.serialize().map_err(|error| error.to_string())?;
+        let mut staged = tempfile::NamedTempFile::new_in(directory)
+            .map_err(|error| format!("create artifact: {error}"))?;
+        staged
+            .as_file_mut()
+            .write_all(serialized.as_ref())
+            .map_err(|error| format!("write artifact: {error}"))?;
+        staged
+            .persist(path)
+            .map_err(|error| format!("install artifact: {}", error.error))?;
+        Ok(())
     }
 
     /// Queue validated contract bytecode for best-effort compilation before its
@@ -1428,7 +1520,8 @@ impl WasmRuntime {
             let code_bytes = db.get_code_bytes_by_hash(code_hash, 0, 0)?;
             // LLVM compilation is deliberately outside the shared cache lock so
             // replay-only precompile workers cannot stall contract execution.
-            let candidate = Self::compile_module(&code_bytes)?;
+            let (candidate, _) =
+                Self::compile_module(&code_bytes, id, self.artifact_cache_dir.as_deref())?;
             let mut inner = self.inner.write()?;
             if let Some(module) = inner.code_cache.get(&id) {
                 module.clone()
@@ -1878,6 +1971,7 @@ mod tests {
     };
 
     use super::{
+        ModuleCacheStatus,
         ResettableInstance,
         WasmRuntime,
         charge_metering_points,
@@ -1887,6 +1981,32 @@ mod tests {
         expose_reset_state,
         module_is_resettable,
     };
+
+    #[test]
+    fn serialized_module_artifact_survives_memory_cache_eviction() {
+        let wasm = wat::parse_str(
+            r#"
+            (module
+              (memory 1)
+              (func (export "apply") (param i64 i64 i64)))
+            "#,
+        )
+        .unwrap();
+        let digest = pulsevm_crypto::Digest::hash(&wasm);
+        let id = crate::chain::id::Id::new(digest.0);
+        let directory = tempfile::tempdir().unwrap();
+
+        let (compiled, status) =
+            WasmRuntime::compile_module(&wasm, id, Some(directory.path())).unwrap();
+        assert_eq!(status, ModuleCacheStatus::Compiled);
+        drop(compiled);
+
+        let (restored, status) =
+            WasmRuntime::compile_module(&wasm, id, Some(directory.path())).unwrap();
+        assert_eq!(status, ModuleCacheStatus::Artifact);
+        drop(restored);
+        assert_eq!(directory.path().read_dir().unwrap().count(), 1);
+    }
 
     #[test]
     fn finds_legacy_nonstandard_memory_export() {
