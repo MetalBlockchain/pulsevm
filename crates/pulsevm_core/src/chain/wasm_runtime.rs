@@ -1138,6 +1138,14 @@ const MAX_INSTANCES_PER_STORE: u32 = 64;
 /// unchanged.
 const MAX_WARM_STORES: usize = 64;
 
+/// Bound LLVM modules independently from their much smaller WASM inputs. A
+/// long historical replay sees thousands of obsolete deployments, and keeping
+/// 1,024 native modules resident can exhaust a node even though only a small
+/// working set remains active. This cache is non-consensus and may be tuned for
+/// the host; the hard ceiling prevents an accidental unbounded configuration.
+const DEFAULT_MAX_CACHED_MODULES: usize = 256;
+const MAX_CACHED_MODULES: usize = 1024;
+
 // A warm store owns raw VM pointers and so is neither `Send` nor `Sync`; it
 // cannot live in the shared runtime state. Keep the pool thread-local instead —
 // block application is sequential on a given thread, so a warm store is only
@@ -1207,8 +1215,16 @@ const COST_FUNCTION: fn(&Operator) -> u64 = |operator: &Operator| -> u64 {
 
 impl WasmRuntime {
     pub fn new() -> Result<Self, ChainError> {
+        let code_cache_entries = std::env::var("PULSEVM_WASM_MODULE_CACHE_ENTRIES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|entries| *entries > 0)
+            .unwrap_or(DEFAULT_MAX_CACHED_MODULES)
+            .min(MAX_CACHED_MODULES);
         let inner = Arc::new(RwLock::new(InnerWasmRuntime {
-            code_cache: LruCache::new(NonZeroUsize::new(1024).unwrap()),
+            code_cache: LruCache::new(
+                NonZeroUsize::new(code_cache_entries).expect("module cache capacity is non-zero"),
+            ),
             precompiling: HashSet::new(),
         }));
         let precompile_threads = std::env::var("PULSEVM_WASM_PRECOMPILE_THREADS")
