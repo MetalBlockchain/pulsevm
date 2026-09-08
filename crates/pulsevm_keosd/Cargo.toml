@@ -3,13 +3,15 @@ name = "pulsevm_keosd"
 version = "0.1.0"
 edition = "2024"
 
+[package.metadata.cargo-machete]
+ignored = ["spdlog-rs"] # The package exports the `spdlog` crate name.
+
 [[bin]]
 name = "pulse-keosd"
 path = "src/main.rs"
 
 [dependencies]
 actix-web = "4"
-actix-rt = "2"
 aes = "0.8"
 bs58 = "0.5"
 cbc = { version = "0.1", features = ["alloc"] }
@@ -21,7 +23,7 @@ ripemd = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-spdlog-rs = "0.4"
+spdlog-rs = "0.5.3"
 thiserror = "2"
 zeroize = { version = "1.8.2", features = ["derive"] }
 
