@@ -152,4 +152,25 @@ mod tests {
 
         assert_eq!(new_account, unpacked);
     }
+
+    #[test]
+    fn updateauth_accepts_opaque_k1_authority_key() {
+        // XPR Mainnet block 315,443,046 stores an all-zero K1 shim. Leap
+        // accepts and persists this unsatisfiable authority verbatim.
+        let packed = hex::decode(
+            "000000f3ea93af4200000000a8ed32320000000080ab26a701000000010000000000000000000000000000000000000000000000000000000000000000000001000000",
+        )
+        .unwrap();
+        let mut pos = 0;
+        let update = UpdateAuth::read(&packed, &mut pos).unwrap();
+
+        assert_eq!(pos, packed.len());
+        assert_eq!(update.account, name!("certburn"));
+        assert_eq!(update.permission, name!("active"));
+        assert_eq!(update.parent, name!("owner"));
+        assert!(update.auth.validate());
+        assert_eq!(update.auth.keys.len(), 1);
+        assert_eq!(update.auth.keys[0].key.to_packed(), [0_u8; 34]);
+        assert!(update.auth.keys[0].key.as_k1().is_none());
+    }
 }

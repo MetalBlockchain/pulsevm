@@ -690,9 +690,8 @@ pub struct Database {
     /// Guards the currently supported live contract-primary write surface while
     /// a speculative wave owns the canonical controller handle.
     speculation_freeze: Arc<AtomicBool>,
-    /// Decoding a K1 authority includes public-key decompression. Cache the
-    /// immutable result by its complete canonical blob so permission updates
-    /// cannot return a stale authority.
+    /// Cache decoded authorities by their complete canonical blob so permission
+    /// updates cannot return stale authority data.
     authority_cache: Arc<Mutex<HashMap<Vec<u8>, Authority>>>,
     /// Non-persisted capability used only by the offline XPR replay tool.
     /// Production VM construction leaves it false.
