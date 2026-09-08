@@ -126,11 +126,18 @@ impl PackedTransaction {
         let trx_id = trx.transaction().id().map_err(|e| {
             ChainError::SerializationError(format!("failed to get transaction ID: {}", e))
         })?;
+        let packed_context_free_data = if trx.context_free_data().is_empty() {
+            Vec::new()
+        } else {
+            trx.context_free_data().pack().map_err(|e| {
+                ChainError::SerializationError(format!("failed to pack context free data: {}", e))
+            })?
+        };
 
         Ok(Self {
             signatures: trx.signatures().clone(),
             compression: TransactionCompression::None, // Default to no compression for now
-            packed_context_free_data: Bytes::default(), // No context-free data for now
+            packed_context_free_data: packed_context_free_data.into(),
             packed_trx: trx
                 .transaction()
                 .pack()
@@ -233,11 +240,15 @@ fn maybe_decompress(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::PrivateKey;
     use flate2::{
         Compression,
         write::ZlibEncoder,
     };
-    use std::io::Write as IoWrite;
+    use std::{
+        io::Write as IoWrite,
+        str::FromStr,
+    };
 
     fn zlib_compress(data: &[u8]) -> Vec<u8> {
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
@@ -271,5 +282,61 @@ mod tests {
         let payload = b"a normally sized transaction payload".to_vec();
         let out = maybe_decompress(TransactionCompression::Zlib, &zlib_compress(&payload)).unwrap();
         assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn context_free_data_survives_packed_transaction_round_trip() {
+        let chain_id = Id::new([7; 32]);
+        let private_key =
+            PrivateKey::from_str("PVT_K1_2pjSqJxTbRHq8h8aHHTux81Ypscb36Q2syB8UJbZcUmxbfZdnT")
+                .unwrap();
+
+        for context_free_data in [
+            Vec::new(),
+            vec![Bytes::from(vec![1, 2, 3]), Bytes::from(vec![4, 5])],
+        ] {
+            let signed = SignedTransaction::new(
+                Transaction::default(),
+                BTreeSet::new(),
+                context_free_data.clone(),
+            )
+            .sign(&private_key, &chain_id)
+            .unwrap();
+            let expected_digest = signed
+                .transaction()
+                .signing_digest(&chain_id, signed.context_free_data())
+                .unwrap();
+            let expected_recovered_keys = signed.recovered_keys(&chain_id).unwrap();
+
+            let packed = PackedTransaction::from_signed_transaction(signed).unwrap();
+            let expected_packed_context_free_data = if context_free_data.is_empty() {
+                Vec::new()
+            } else {
+                context_free_data.pack().unwrap()
+            };
+            assert_eq!(
+                packed.packed_context_free_data.as_ref(),
+                expected_packed_context_free_data
+            );
+            let wire = packed.pack().unwrap();
+            let mut pos = 0;
+            let restored = PackedTransaction::read(&wire, &mut pos).unwrap();
+            let restored_signed = restored.get_signed_transaction();
+
+            assert_eq!(pos, wire.len());
+            assert_eq!(restored_signed.context_free_data(), &context_free_data);
+            assert_eq!(restored_signed, packed.get_signed_transaction());
+            assert_eq!(
+                restored_signed.recovered_keys(&chain_id).unwrap(),
+                expected_recovered_keys
+            );
+            assert_eq!(
+                restored_signed
+                    .transaction()
+                    .signing_digest(&chain_id, restored_signed.context_free_data())
+                    .unwrap(),
+                expected_digest
+            );
+        }
     }
 }
