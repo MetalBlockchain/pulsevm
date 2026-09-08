@@ -382,11 +382,11 @@ impl fmt::Display for ControllerError {
     }
 }
 
-/// An Avalanche state summary: a commitment the engine agrees on (`id`, the
-/// accepted block id, canonical across nodes) plus small `bytes` describing what
-/// to fetch — the active schedule, the snapshot's block, and the snapshot's
-/// length and hash. The snapshot payload itself is downloaded separately over
-/// AppRequest (see `crate::chain::state_sync`).
+/// An Avalanche state summary: a commitment the engine agrees on (`id`, a hash
+/// of the accepted block, canonical state root, active schedule, and protocol
+/// schedule) plus small `bytes` describing what to fetch. The physical snapshot
+/// payload itself is downloaded separately over AppRequest (see
+/// `crate::chain::state_sync`).
 pub struct StateSummary {
     pub id: Id,
     pub height: u64,
@@ -416,6 +416,7 @@ fn sync_directory(path: &Path) -> std::io::Result<()> {
 /// download chunks without re-snapshotting the arena on every request.
 struct CachedSnapshot {
     height: u32,
+    state_root: [u8; 32],
     hash: [u8; 32],
     envelope: Vec<u8>,
 }
@@ -2037,10 +2038,14 @@ impl Controller {
         // take a fresh one. Re-snapshotting scans the whole arena, so caching
         // matters when a peer pulls many chunks for the same summary.
         if self.snapshot_cache.as_ref().map(|c| c.height) != Some(height) {
+            let state_root = self.db.arena_state_root().ok_or_else(|| {
+                ChainError::InternalError("summary: database has no state root".into())
+            })?;
             let envelope = self.db.snapshot_bytes()?;
             let hash = *Digest::hash(&envelope).as_bytes();
             self.snapshot_cache = Some(CachedSnapshot {
                 height,
+                state_root,
                 hash,
                 envelope,
             });
@@ -2055,16 +2060,24 @@ impl Controller {
             .active_schedule
             .pack()
             .map_err(|e| ChainError::InternalError(format!("summary: pack schedule: {}", e)))?;
+        let protocol_commitment = self.protocol_upgrade_schedule.commitment(height);
         let bytes = state_sync::encode_summary_bytes(
             &schedule_bytes,
             &block_bytes,
             cache.envelope.len() as u64,
             &cache.hash,
-            self.protocol_upgrade_schedule.commitment(height),
+            &cache.state_root,
+            protocol_commitment,
         );
+        let id = state_sync::summary_id(
+            &self.last_accepted_block,
+            &self.active_schedule,
+            &cache.state_root,
+            protocol_commitment,
+        )?;
 
         Ok(StateSummary {
-            id: self.last_accepted_block_id.clone(),
+            id,
             height: height as u64,
             bytes,
         })
@@ -2073,7 +2086,16 @@ impl Controller {
     /// Read a summary's id and height without applying it.
     pub fn parse_state_summary(bytes: &[u8]) -> Result<(Id, u64), ChainError> {
         let target = state_sync::decode_summary_bytes(bytes)?;
-        Ok((target.block.id()?, target.height))
+        let protocol_commitment = target.protocol_commitment.ok_or_else(|| {
+            ChainError::InternalError("summary: missing protocol commitment".into())
+        })?;
+        let id = state_sync::summary_id(
+            &target.block,
+            &target.schedule,
+            &target.state_root,
+            protocol_commitment,
+        )?;
+        Ok((id, target.height))
     }
 
     /// Parse a summary into a [`SyncTarget`] the sync manager can drive a
@@ -2174,12 +2196,14 @@ impl Controller {
     /// next accepted block. The schedule in force at the snapshot is persisted so
     /// a later restart recovers it. `envelope` has already been verified against
     /// the summary hash by the download driver; `restore_from_bytes` re-checks its
-    /// internal checksum.
+    /// internal checksum and its logical root against the root authenticated by
+    /// the Avalanche summary id.
     pub fn apply_state_snapshot(
         &mut self,
         block: SignedBlock,
         schedule: ProducerSchedule,
         protocol_commitment: Option<crate::chain::protocol_features::ProtocolScheduleCommitment>,
+        expected_state_root: [u8; 32],
         envelope: &[u8],
     ) -> Result<(), ChainError> {
         let block_height = block.block_num();
@@ -2219,7 +2243,7 @@ impl Controller {
         self.clear_pending()?;
         self.begin_state_sync_install(block_height, &block_id)?;
         marker_installed.set(true);
-        let restore_result = db.restore_from_bytes(envelope);
+        let restore_result = db.restore_from_bytes(envelope, &expected_state_root);
         if let Err(error) = restore_result {
             // Ordinary post-hook failures mean the database restore put the old
             // arena back. Remove the poison marker so normal bootstrap may retry.
@@ -2229,7 +2253,18 @@ impl Controller {
             }
             return Err(error);
         }
+        if db.arena_state_root() != Some(expected_state_root) {
+            return Err(ChainError::fatal_consistency(format!(
+                "state sync installed a state root other than the authenticated root {}",
+                hex::encode(expected_state_root)
+            )));
+        }
         db.replace_activated_protocol_features(expected_protocol_records)?;
+        if db.arena_state_root() != Some(expected_state_root) {
+            return Err(ChainError::fatal_consistency(
+                "state sync protocol normalization changed the authenticated state root",
+            ));
+        }
 
         let publish_metadata = (|| -> Result<(), ChainError> {
             // Re-base the logs. The block log starts again at the snapshot block
@@ -5747,6 +5782,7 @@ mod tests {
         let block = producer.build_block(&mut p_mempool).await?;
         producer.accept_block(&block.id()?, &mut p_mempool)?;
         producer.set_preferred_id(block.id()?);
+        let producer_tip_id = producer.last_accepted_block().id()?;
 
         // Materialize a verified child without accepting it. A summary labelled
         // with the accepted block must unwind this speculative account before
@@ -5797,6 +5833,10 @@ mod tests {
         // Parse agrees with produce on the commitment.
         let (parsed_id, parsed_height) = Controller::parse_state_summary(&summary.bytes)?;
         assert_eq!(parsed_id, summary.id);
+        assert_ne!(
+            summary.id, producer_tip_id,
+            "summary id must not be only the block id"
+        );
         assert_eq!(parsed_height, producer_height as u64);
 
         // Download the snapshot chunk by chunk from the producer, exactly as the
@@ -5810,11 +5850,49 @@ mod tests {
         })
         .await?;
 
+        // A malicious summary provider can reuse the canonical block, schedule,
+        // protocol commitment and state root while advertising its own physical
+        // snapshot hash. Build such a checksum-valid snapshot at the same
+        // revision but with different state. It must be rejected by the logical
+        // root check before it replaces the syncing node's live arena.
+        let attacker_temp = get_temp_dir();
+        let mut attacker = init(attacker_temp.path().to_str().unwrap())?;
+        let mut attacker_mempool = Mempool::new();
+        attacker_mempool.add_transaction(create_account(
+            &private_key,
+            Name::from_str("mallory")?,
+            chain_id,
+        )?);
+        let attacker_block = attacker.build_block(&mut attacker_mempool).await?;
+        attacker.accept_block(&attacker_block.id()?, &mut attacker_mempool)?;
+        assert_eq!(attacker.database().revision(), producer_height as i64);
+        let forged_envelope = attacker.database().snapshot_bytes()?;
+        let syncer_root_before = syncer.database().arena_state_root();
+        let error = syncer
+            .apply_state_snapshot(
+                target.block.clone(),
+                target.schedule.clone(),
+                target.protocol_commitment,
+                target.state_root,
+                &forged_envelope,
+            )
+            .expect_err("snapshot with forged logical state must be rejected");
+        assert!(error.to_string().contains("state root"));
+        assert_eq!(syncer.database().arena_state_root(), syncer_root_before);
+        assert!(
+            !syncer_temp
+                .path()
+                .join(STATE_SYNC_INSTALL_MARKER_FILE)
+                .exists(),
+            "safe rejection left a state-sync poison marker behind"
+        );
+
         // Apply transfers state, tip, and schedule.
         syncer.apply_state_snapshot(
             target.block.clone(),
             target.schedule.clone(),
             target.protocol_commitment,
+            target.state_root,
             &envelope,
         )?;
         assert!(
@@ -5829,7 +5907,11 @@ mod tests {
             "state not transferred"
         );
         assert_eq!(syncer.last_accepted_block().block_num(), producer_height);
-        assert_eq!(syncer.last_accepted_block().id()?, summary.id);
+        assert_eq!(syncer.last_accepted_block().id()?, producer_tip_id);
+        assert_eq!(
+            syncer.database().arena_state_root(),
+            Some(target.state_root)
+        );
         assert_eq!(syncer.database().revision(), producer_height as i64);
         assert_eq!(syncer.active_schedule, producer_schedule);
         assert!(
@@ -5849,7 +5931,7 @@ mod tests {
             "synced state lost across restart"
         );
         assert_eq!(restarted.last_accepted_block().block_num(), producer_height);
-        assert_eq!(restarted.last_accepted_block().id()?, summary.id);
+        assert_eq!(restarted.last_accepted_block().id()?, producer_tip_id);
         assert_eq!(
             restarted.active_schedule, producer_schedule,
             "synced schedule lost across restart"
@@ -6067,6 +6149,7 @@ mod tests {
             target.block.clone(),
             target.schedule.clone(),
             target.protocol_commitment,
+            target.state_root,
             &envelope,
         )?;
 
@@ -6082,6 +6165,7 @@ mod tests {
         // payload hash the producer advertised — the transfer was lossless.
         let re = syncer.produce_state_summary()?;
         let re_target = Controller::sync_target_from_summary(&re.bytes)?;
+        assert_eq!(re.id, summary.id, "logical summary id changed after sync");
         assert_eq!(
             re_target.hash, target.hash,
             "re-snapshot of synced state does not match the producer's snapshot"
