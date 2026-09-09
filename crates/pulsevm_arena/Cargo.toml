@@ -9,7 +9,6 @@ pulsevm_arena_derive = { path = "../pulsevm_arena_derive" }
 sha2 = "0.10"
 
 [dev-dependencies]
-zerocopy = { version = "0.8", features = ["derive"] }
 tempfile = "3"
 criterion = { version = "0.5" }
 proptest = "1"

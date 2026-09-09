@@ -159,9 +159,9 @@ pub const MAX_TABLE_ELEMENTS: u32 =
     pulsevm_wasm_validation::constraints::MAXIMUM_TABLE_ELEMENTS as u32;
 
 /// The tunables every engine in this VM runs with.
-pub fn deterministic_tunables(target: &wasmer::sys::Target) -> LimitingTunables<BaseTunables> {
+pub fn deterministic_tunables(_target: &wasmer::sys::Target) -> LimitingTunables<BaseTunables> {
     LimitingTunables::new(
-        BaseTunables::for_target(target),
+        BaseTunables::new(),
         Pages(MAX_LINEAR_MEMORY_PAGES),
         MAX_TABLE_ELEMENTS,
     )

@@ -14,6 +14,3 @@ pulsevm_crypto = { path = "../pulsevm_crypto" }
 pulsevm_name = { path = "../pulsevm_name" }
 pulsevm_proc_macros = { path = "../pulsevm_proc_macros" }
 pulsevm_serialization = { path = "../pulsevm_serialization" }
-
-[dev-dependencies]
-hex = "0.4"
