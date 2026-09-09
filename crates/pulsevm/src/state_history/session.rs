@@ -20,7 +20,10 @@ use futures_util::{
 };
 use pulsevm_core::{
     controller::Controller,
-    state_history::SHIP_ABI,
+    state_history::{
+        SHIP_ABI,
+        StateHistoryLog,
+    },
     transaction::TransactionTrace,
 };
 use pulsevm_crypto::Bytes;
@@ -68,6 +71,14 @@ pub struct Session {
     // streaming control
     stream_cancel: Option<Sender<()>>,
     stream_handle: Option<JoinHandle<()>>,
+}
+
+/// Convert the log's internal inclusive range into the SHiP protocol's
+/// `[begin, end)` range. Disabled and empty logs advertise `(0, 0)`.
+fn ship_log_range(log: Option<&StateHistoryLog>) -> (u32, u32) {
+    log.and_then(StateHistoryLog::range)
+        .map(|(first, last)| (first, last.saturating_add(1)))
+        .unwrap_or((0, 0))
 }
 
 impl Session {
@@ -290,6 +301,9 @@ impl Session {
             .get_block_id(serveable)
             .await?
             .unwrap_or(head_block_id);
+        let (trace_begin_block, trace_end_block) = ship_log_range(controller.trace_log());
+        let (chain_state_begin_block, chain_state_end_block) =
+            ship_log_range(controller.chain_state_log());
 
         Ok(GetStatusResult {
             variant: 0,
@@ -301,10 +315,10 @@ impl Session {
                 block_num: head_block.block_num(),
                 block_id: head_block_id,
             },
-            trace_begin_block: 1,
-            trace_end_block: serveable,
-            chain_state_begin_block: 1,
-            chain_state_end_block: serveable,
+            trace_begin_block,
+            trace_end_block,
+            chain_state_begin_block,
+            chain_state_end_block,
             chain_id: chain_id.clone(),
         })
     }
@@ -457,4 +471,90 @@ async fn make_block_response_for(
         traces: traces,
         deltas: deltas,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pulsevm_core::id::Id;
+    use std::str::FromStr;
+
+    fn block_id(block_num: u32) -> Id {
+        let mut bytes = [0u8; 32];
+        bytes[..4].copy_from_slice(&block_num.to_be_bytes());
+        Id::new(bytes)
+    }
+
+    #[tokio::test]
+    async fn status_reports_each_ship_logs_actual_exclusive_range() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = br#"{
+            "producer_name": "pulse",
+            "producer_key": "PVT_K1_2pjSqJxTbRHq8h8aHHTux81Ypscb36Q2syB8UJbZcUmxbfZdnT"
+        }"#
+        .to_vec();
+        let genesis = include_bytes!("../../../../genesis.json").to_vec();
+        let chain_id =
+            Id::from_str("0c880c391f7d695f3d64e57e1ee396c9b26b8e089f440d917493d83a2df9c306")
+                .unwrap();
+        let mut controller = Controller::new();
+        controller
+            .initialize(&chain_id, &config, &genesis, temp.path().to_str().unwrap())
+            .unwrap();
+
+        let block_400 = block_id(400);
+        let block_401 = block_id(401);
+        controller
+            .block_log()
+            .unwrap()
+            .reset_to(block_400, b"snapshot block")
+            .unwrap();
+        controller
+            .block_log()
+            .unwrap()
+            .append(block_401, b"next block")
+            .unwrap();
+        controller.trace_log().unwrap().clear().unwrap();
+        controller.chain_state_log().unwrap().clear().unwrap();
+
+        let controller = Arc::new(RwLock::new(controller));
+        let session = Session::new("127.0.0.1:8080".parse().unwrap(), controller.clone());
+
+        let empty = session.get_status().await.unwrap();
+        assert_eq!((empty.trace_begin_block, empty.trace_end_block), (0, 0));
+        assert_eq!(
+            (empty.chain_state_begin_block, empty.chain_state_end_block),
+            (0, 0)
+        );
+
+        {
+            let controller = controller.read().await;
+            controller
+                .trace_log()
+                .unwrap()
+                .append(block_401, b"trace")
+                .unwrap();
+            controller
+                .chain_state_log()
+                .unwrap()
+                .append(block_400, b"initial state")
+                .unwrap();
+            controller
+                .chain_state_log()
+                .unwrap()
+                .append(block_401, b"state delta")
+                .unwrap();
+        }
+
+        let status = session.get_status().await.unwrap();
+        assert_eq!(status.head.block_num, 401);
+        assert_eq!(
+            (status.trace_begin_block, status.trace_end_block),
+            (401, 402)
+        );
+        assert_eq!(
+            (status.chain_state_begin_block, status.chain_state_end_block),
+            (400, 402)
+        );
+    }
 }
