@@ -70,9 +70,9 @@ struct TransactionContextInner {
     bill_to_account: Option<Name>,
     validate_ram_usage: BTreeSet<Name>,
     explicit_billed_cpu_time: bool,
-    // On light/replay validation these carry the block-recorded cpu (µs) and net
-    // (words) so the receipt and billing use the recorded values instead of
-    // re-measuring, and the objective limit checks are skipped.
+    // On trusted replay these carry the block-recorded CPU (µs) and NET (words)
+    // so receipt reconstruction and quota accounting use the values this node
+    // already validated instead of remeasuring them.
     explicit_cpu_us: u32,
     explicit_net_words: u32,
     eager_net_limit: u64,
@@ -84,6 +84,7 @@ struct TransactionContextInner {
     // billing timer, this intentionally includes paused native/compilation time.
     start_time: TimePoint,
     max_transaction_time: Microseconds,
+    enforce_subjective_deadline: bool,
     pending_block_timestamp: BlockTimestamp,
     cpu_limit: i64,
     cpu_limit_due_to_greylist: bool,
@@ -149,6 +150,7 @@ impl TransactionContext {
                 },
                 start_time: TimePoint::now(),
                 max_transaction_time: Microseconds::new(max_transaction_time_ms as i64 * 1_000),
+                enforce_subjective_deadline: true,
                 pending_block_timestamp,
                 cpu_limit: 0,
                 cpu_limit_due_to_greylist: false,
@@ -360,6 +362,7 @@ impl TransactionContext {
             inner.explicit_billed_cpu_time = true;
             inner.explicit_cpu_us = min_cpu;
             inner.cpu_limit = -1;
+            inner.enforce_subjective_deadline = false;
         }
         self.init(0, transaction.first_authorizer(), false)
     }
@@ -562,14 +565,23 @@ impl TransactionContext {
         Ok(inner.pending_block_timestamp.clone())
     }
 
-    /// Bill the block-recorded cpu (µs) and net (words) for this transaction
-    /// rather than the re-measured amounts, and skip the objective limit checks —
-    /// the Antelope light/replay validation path for an already-accepted block.
+    /// Use the block-recorded CPU (µs) and NET (words) for receipt reconstruction
+    /// and quota accounting. This is the Antelope light/replay path for a block
+    /// that this node has already fully validated.
     pub fn set_explicit_billed(&self, cpu_us: u32, net_words: u32) -> Result<(), ChainError> {
         let mut inner = self.inner.write()?;
         inner.explicit_billed_cpu_time = true;
         inner.explicit_cpu_us = cpu_us;
         inner.explicit_net_words = net_words;
+        inner.enforce_subjective_deadline = false;
+        Ok(())
+    }
+
+    /// Disable only the node-local wall-clock watchdog. First-time block
+    /// validation uses this while retaining deterministic resource metering and
+    /// every objective CPU/NET limit check.
+    pub fn disable_subjective_deadline(&self) -> Result<(), ChainError> {
+        self.inner.write()?.enforce_subjective_deadline = false;
         Ok(())
     }
 
@@ -751,13 +763,13 @@ impl TransactionContext {
         Ok(())
     }
 
-    /// Enforce the node-local wall-clock ceiling. Explicitly billed execution
-    /// (accepted-block replay/validation) is exempt because this check is
-    /// subjective and must never affect consensus validation.
+    /// Enforce the node-local wall-clock ceiling when requested. First-time
+    /// validation and trusted replay disable this subjective check, while the
+    /// deterministic resource meter remains active during validation.
     pub fn checktime(&self) -> Result<(), ChainError> {
         let inner = self.inner.read()?;
         Self::deadline_check(
-            inner.explicit_billed_cpu_time,
+            inner.enforce_subjective_deadline,
             inner.start_time,
             inner.max_transaction_time,
             TimePoint::now(),
@@ -765,12 +777,12 @@ impl TransactionContext {
     }
 
     fn deadline_check(
-        explicit_billed: bool,
+        enforce: bool,
         start_time: TimePoint,
         max_transaction_time: Microseconds,
         now: TimePoint,
     ) -> Result<(), ChainError> {
-        if explicit_billed {
+        if !enforce {
             return Ok(());
         }
         let elapsed = now - start_time;
@@ -1025,10 +1037,10 @@ mod deadline_tests {
     }
 
     #[test]
-    fn explicit_billing_is_exempt_from_subjective_deadline() {
+    fn disabled_subjective_deadline_is_exempt() {
         assert!(
             TransactionContext::deadline_check(
-                true,
+                false,
                 tp(1_000_000),
                 Microseconds::new(1),
                 tp(9_999_999),
@@ -1041,7 +1053,7 @@ mod deadline_tests {
     fn deadline_passes_under_limit_and_trips_over_it() {
         assert!(
             TransactionContext::deadline_check(
-                false,
+                true,
                 tp(1_000_000),
                 Microseconds::new(1_000),
                 tp(1_000_500),
@@ -1050,7 +1062,7 @@ mod deadline_tests {
         );
         assert!(matches!(
             TransactionContext::deadline_check(
-                false,
+                true,
                 tp(1_000_000),
                 Microseconds::new(1_000),
                 tp(1_002_000),
@@ -1062,7 +1074,7 @@ mod deadline_tests {
     #[test]
     fn deadline_counts_paused_native_wall_clock() {
         assert!(matches!(
-            TransactionContext::deadline_check(false, tp(0), Microseconds::new(1_000), tp(5_000),),
+            TransactionContext::deadline_check(true, tp(0), Microseconds::new(1_000), tp(5_000),),
             Err(ChainError::DeadlineError(_))
         ));
     }

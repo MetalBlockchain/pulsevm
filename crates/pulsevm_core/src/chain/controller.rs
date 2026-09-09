@@ -166,6 +166,34 @@ pub enum AuthorizationCheck {
     AlreadyValidated,
 }
 
+/// How transaction resource receipts are handled while executing a block.
+///
+/// This is deliberately independent of [`AuthorizationCheck`]. A peer's block
+/// needs both full authorization checks and deterministic CPU/NET remeasurement;
+/// a block already validated by this node may use its committed receipts while
+/// rebuilding speculative state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockResourceMode {
+    /// Remeasure CPU/NET, enforce the objective quotas, and require every result
+    /// to match the producer's receipt exactly. Used for first-time validation.
+    ValidateReceipts,
+    /// Bill the committed receipt values for a block already fully validated on
+    /// this node. This is the trusted replay/light-validation path only.
+    ReplayValidatedReceipts,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TransactionResourceMode {
+    /// Locally produced/admitted transaction: measure resources and retain the
+    /// node-local wall-clock watchdog.
+    Measure,
+    /// First-time block validation: deterministically measure resources without
+    /// a subjective wall-clock rejection, then compare with the block receipt.
+    ValidateReceipt { cpu_us: u32, net_words: u32 },
+    /// Trusted replay: use the receipt that this node validated previously.
+    ReplayReceipt { cpu_us: u32, net_words: u32 },
+}
+
 pub struct Controller {
     wasm_runtime: WasmRuntime,
     last_accepted_block: SignedBlock,
@@ -955,7 +983,7 @@ impl Controller {
                 protocol_context,
                 &timestamp,
                 &block_status,
-                None,
+                TransactionResourceMode::Measure,
                 AuthorizationCheck::Required,
             );
 
@@ -1277,16 +1305,23 @@ impl Controller {
 
         // The arena has no RAII undo hook, so every failure path below mirrors the
         // undo explicitly before returning, keeping the session stack depth right.
-        // First-time validation of a peer's block: its signatures have never been
-        // checked here, so the authority check is mandatory.
-        let (transaction_traces, transaction_mroot, action_mroot, proposed_schedule) =
-            match self.execute_block(block, &block_status, mempool, AuthorizationCheck::Required) {
-                Ok(v) => v,
-                Err(e) => {
-                    self.db.arena_undo();
-                    return Err(e);
-                }
-            };
+        // First-time validation of a peer's block: neither its signatures nor its
+        // resource receipts have been checked here, so both validations are
+        // mandatory.
+        let (transaction_traces, transaction_mroot, action_mroot, proposed_schedule) = match self
+            .execute_block(
+                block,
+                &block_status,
+                mempool,
+                AuthorizationCheck::Required,
+                BlockResourceMode::ValidateReceipts,
+            ) {
+            Ok(v) => v,
+            Err(e) => {
+                self.db.arena_undo();
+                return Err(e);
+            }
+        };
 
         if let Err(e) = block.validate_semantically(transaction_mroot, action_mroot) {
             self.db.arena_undo();
@@ -1414,7 +1449,13 @@ impl Controller {
             // Fallback accept re-executes from scratch. This is a rare path (a
             // fork sibling won, or nothing was pending) and it is not guaranteed
             // that this block came through `verify_block` here, so check.
-            match self.execute_block(&block, &block_status, mempool, AuthorizationCheck::Required) {
+            match self.execute_block(
+                &block,
+                &block_status,
+                mempool,
+                AuthorizationCheck::Required,
+                BlockResourceMode::ValidateReceipts,
+            ) {
                 Ok((transaction_traces, _, _, _)) => transaction_traces,
                 Err(e) => {
                     self.db.arena_undo();
@@ -1662,16 +1703,17 @@ impl Controller {
 
     /// Execute every transaction in `block`.
     ///
-    /// `authorization_check` must be `Required` unless this node has already
-    /// verified this exact block — see `AuthorizationCheck`. It is an explicit
-    /// parameter rather than something derived here so that each call site has to
-    /// state which case it is in.
+    /// `authorization_check` must be `Required` and `resource_mode` must be
+    /// `ValidateReceipts` unless this node has already fully verified this exact
+    /// block. Both are explicit so a caller cannot accidentally turn first-time
+    /// consensus validation into trusted replay.
     pub fn execute_block(
         &mut self,
         block: &SignedBlock,
         block_status: &BlockStatus,
         mempool: &mut Mempool,
         authorization_check: AuthorizationCheck,
+        resource_mode: BlockResourceMode,
     ) -> Result<
         (
             Vec<TransactionTrace>,
@@ -1709,13 +1751,25 @@ impl Controller {
         // agreement with what the producer folded into the header.
 
         for receipt in &block.transactions {
+            let transaction_resource_mode = match resource_mode {
+                BlockResourceMode::ValidateReceipts => TransactionResourceMode::ValidateReceipt {
+                    cpu_us: receipt.cpu_usage_us(),
+                    net_words: receipt.net_usage_words(),
+                },
+                BlockResourceMode::ReplayValidatedReceipts => {
+                    TransactionResourceMode::ReplayReceipt {
+                        cpu_us: receipt.cpu_usage_us(),
+                        net_words: receipt.net_usage_words(),
+                    }
+                }
+            };
             // Verify the transaction
             let result = self.execute_transaction_with_protocol(
                 receipt.trx(),
                 protocol_context,
                 &block.signed_block_header.header.timestamp,
                 block_status,
-                Some((receipt.cpu_usage_us(), receipt.net_usage_words())),
+                transaction_resource_mode,
                 authorization_check,
             )?;
 
@@ -1863,7 +1917,7 @@ impl Controller {
             protocol_context,
             pending_block_timestamp,
             block_status,
-            None,
+            TransactionResourceMode::Measure,
             AuthorizationCheck::Required,
         );
         // Mempool admission is advisory: revert the arena session on both the
@@ -1887,14 +1941,14 @@ impl Controller {
             protocol_context,
             pending_block_timestamp,
             block_status,
-            None,
+            TransactionResourceMode::Measure,
             AuthorizationCheck::Required,
         )
     }
 
     /// As `execute_transaction`, but when `explicit_billed` is set (applying an
-    /// already-accepted block) it bills the block-recorded cpu/net and skips the
-    /// objective resource-limit checks — Antelope light/replay validation.
+    /// already-validated block) it uses the block-recorded CPU/NET for receipt
+    /// reconstruction and quota accounting — Antelope light/replay validation.
     fn max_transaction_time_ms(&self) -> u32 {
         self.node_config
             .as_ref()
@@ -1916,7 +1970,12 @@ impl Controller {
             protocol_context,
             pending_block_timestamp,
             block_status,
-            explicit_billed,
+            match explicit_billed {
+                Some((cpu_us, net_words)) => {
+                    TransactionResourceMode::ReplayReceipt { cpu_us, net_words }
+                }
+                None => TransactionResourceMode::Measure,
+            },
             // Explicit billing says nothing about whether the signatures were
             // ever checked. This helper has no callers today; if one appears it
             // must opt into skipping deliberately, not inherit it from billing.
@@ -1930,7 +1989,7 @@ impl Controller {
         protocol_context: ProtocolExecutionContext,
         pending_block_timestamp: &BlockTimestamp,
         block_status: &BlockStatus,
-        explicit_billed: Option<(u32, u32)>,
+        resource_mode: TransactionResourceMode,
         authorization_check: AuthorizationCheck,
     ) -> Result<TransactionResult, ChainError> {
         let signed_transaction = packed_transaction.get_signed_transaction();
@@ -1940,8 +1999,8 @@ impl Controller {
             .transaction()
             .validate(pending_block_timestamp)?;
 
-        // Verify authority. This is independent of `explicit_billed`: a block
-        // arriving from a peer is billed from its receipts but has *not* been
+        // Verify authority. This is independent of resource handling: a block
+        // arriving from a peer has *not* been
         // authenticated here, and nothing downstream would catch a forged
         // authorization (see `AuthorizationCheck`). The check is skipped only for
         // a block this node already validated itself, which is Antelope's
@@ -1971,10 +2030,17 @@ impl Controller {
         );
         self.set_context_active_schedule(&trx_context)?;
 
-        // Applying an already-accepted block: bill the recorded cpu/net and
-        // skip the objective limit checks (Antelope light/replay validation).
-        if let Some((cpu_us, net_words)) = explicit_billed {
-            trx_context.set_explicit_billed(cpu_us, net_words)?;
+        match resource_mode {
+            TransactionResourceMode::Measure => {}
+            TransactionResourceMode::ValidateReceipt { .. } => {
+                // Wall-clock time is node-local and therefore cannot decide
+                // consensus. Objective Wasm/host metering and CPU/NET limits
+                // remain active while validating the receipt.
+                trx_context.disable_subjective_deadline()?;
+            }
+            TransactionResourceMode::ReplayReceipt { cpu_us, net_words } => {
+                trx_context.set_explicit_billed(cpu_us, net_words)?;
+            }
         }
 
         let trx = packed_transaction.get_transaction();
@@ -1985,6 +2051,21 @@ impl Controller {
         )?;
         trx_context.exec(&trx)?;
         let result = trx_context.finalize()?;
+
+        if let TransactionResourceMode::ValidateReceipt { cpu_us, net_words } = resource_mode {
+            let measured_cpu_us = result.trace.receipt.cpu_usage_us;
+            let measured_net_words = result.trace.receipt.net_usage_words.0;
+            if measured_cpu_us != cpu_us || measured_net_words != net_words {
+                return Err(ChainError::BlockError(format!(
+                    "transaction {} resource receipt mismatch: block declares CPU {} and NET {}, measured CPU {} and NET {}",
+                    packed_transaction.id(),
+                    cpu_us,
+                    net_words,
+                    measured_cpu_us,
+                    measured_net_words
+                )));
+            }
+        }
 
         Ok(result)
     }
@@ -2701,6 +2782,7 @@ impl Controller {
                     block_status,
                     mempool,
                     AuthorizationCheck::AlreadyValidated,
+                    BlockResourceMode::ReplayValidatedReceipts,
                 ) {
                 Ok(v) => v,
                 Err(e) => {
@@ -5614,6 +5696,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_block_with_underreported_cpu_and_net() -> Result<(), ChainError> {
+        use crate::chain::transaction::{
+            TransactionReceiptHeader,
+            TransactionStatus,
+        };
+
+        let (mut producer, private_key, chain_id, _p_temp) = init_test_controller()?;
+        let mut p_mempool = Mempool::new();
+        p_mempool.add_transaction(create_account(
+            &private_key,
+            Name::from_str("testapi")?,
+            chain_id,
+        )?);
+        let mut block = producer.build_block(&mut p_mempool).await?;
+
+        let receipt = block
+            .transactions
+            .front()
+            .expect("the built block must contain a transaction");
+        assert!(receipt.cpu_usage_us() > 0);
+        assert!(receipt.net_usage_words() > 0);
+        let transaction = receipt.trx().clone();
+
+        // A malicious producer commits a receipt that bills none of the work.
+        // Recompute the merkle root and block signature exactly as an attacker
+        // would, so neither integrity check masks the resource-validation bug.
+        let forged_header =
+            TransactionReceiptHeader::new(TransactionStatus::Executed, 0, 0u32.into());
+        block.transactions =
+            VecDeque::from(vec![TransactionReceipt::new(forged_header, transaction)]);
+        block.signed_block_header.header.transaction_mroot =
+            producer.calculate_trx_merkle(&block.transactions)?;
+        let sig_digest = block.signed_block_header.header.sig_digest()?;
+        block.signed_block_header.signature = private_key.sign(&sig_digest)?;
+
+        let (mut validator, _pk, _cid, _v_temp) = init_test_controller()?;
+        let mut v_mempool = Mempool::new();
+        let error = validator
+            .verify_block(&block, &mut v_mempool)
+            .await
+            .expect_err("underreported CPU/NET must invalidate the block");
+        assert!(
+            error.to_string().contains("resource receipt mismatch"),
+            "expected resource receipt validation to reject the block, got: {error}"
+        );
+        assert!(
+            validator.pending_chain.is_empty(),
+            "a rejected block must leave nothing on the pending chain"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn authorization_check_gate_is_load_bearing() -> Result<(), ChainError> {
         // Isolates the gate itself, with no merkle root in the way.
         //
@@ -5669,6 +5805,7 @@ mod tests {
                 &BlockStatus::Verifying,
                 &mut v_mempool,
                 AuthorizationCheck::Required,
+                BlockResourceMode::ValidateReceipts,
             )
             .map(|_| ()); // TransactionTrace is not Debug
         validator.db.arena_undo();
@@ -5692,6 +5829,7 @@ mod tests {
                 &BlockStatus::Verifying,
                 &mut r_mempool,
                 AuthorizationCheck::AlreadyValidated,
+                BlockResourceMode::ReplayValidatedReceipts,
             )
             .map(|_| ()); // TransactionTrace is not Debug
         replayer.db.arena_undo();
