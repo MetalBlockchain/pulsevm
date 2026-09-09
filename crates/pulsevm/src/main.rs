@@ -1139,6 +1139,7 @@ impl Vm for VirtualMachine {
                         target.block.clone(),
                         target.schedule.clone(),
                         target.protocol_commitment,
+                        target.state_root,
                         &envelope,
                     ) {
                         Ok(()) => info!("state sync applied at height {}", height),
