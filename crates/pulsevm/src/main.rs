@@ -129,8 +129,7 @@ async fn main() {
     let addr: std::net::SocketAddr = listener.local_addr().expect("failed to get local address");
     let tokio_listener =
         TokioTcpListener::from_std(listener).expect("failed to convert to tokio listener");
-    let incoming = TcpIncoming::from_listener(tokio_listener, true, None)
-        .expect("failed to create incoming listener");
+    let incoming = TcpIncoming::from(tokio_listener).with_nodelay(Some(true));
     // Main VM instance
     let vm = VirtualMachine::new(addr).unwrap();
 
@@ -1145,6 +1144,7 @@ impl Vm for VirtualMachine {
                         target.block.clone(),
                         target.schedule.clone(),
                         target.protocol_commitment,
+                        target.state_root,
                         &envelope,
                     ) {
                         Ok(()) => info!("state sync applied at height {}", height),

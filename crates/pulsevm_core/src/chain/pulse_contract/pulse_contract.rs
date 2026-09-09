@@ -1,5 +1,6 @@
 use crate::{
     ACTIVE_NAME,
+    ANY_NAME,
     OWNER_NAME,
     chain::{
         apply_context::ApplyContext,
@@ -448,19 +449,36 @@ pub fn linkauth(
     )?;
     context.require_authorization(&requirement.account, None)?;
 
+    // Both targets must exist (apply_pulse_linkauth). Without these a link can
+    // be created to a permission that was never defined, and afterwards
+    // `lookup_minimum_permission` resolves to that name while `get_permission`
+    // errors -- so every action of `code` from this account fails, and
+    // `unlinkauth` cannot undo it because it resolves the same dangling name
+    // first. The pair is permanently unusable.
+    pulse_assert(
+        db.is_account(requirement.code.as_u64())?,
+        ChainError::TransactionError(format!(
+            "failed to retrieve code for account: {}",
+            requirement.code
+        )),
+    )?;
+    // `pulse.any` is virtual -- it never has a permission object -- so it is
+    // exempt, matching the `eosio.any` carve-out upstream. The check is against
+    // `(account, requirement)` rather than the permission name alone, which is
+    // the behaviour Leap moved to under `only_link_to_existing_permission`.
     if db.protocol_feature_activated(ONLY_LINK_TO_EXISTING_PERMISSION_FEATURE_DIGEST)
-        && requirement.requirement != crate::ANY_NAME
+        && requirement.requirement != ANY_NAME
     {
-        let permission_exists = db
+        let exists = db
             .read()?
-            .find_permission_info(
+            .permission_id(
                 requirement.account.as_u64(),
                 requirement.requirement.as_u64(),
             )?
             .is_some();
         pulse_assert(
-            permission_exists,
-            ChainError::ActionValidationError(format!(
+            exists,
+            ChainError::TransactionError(format!(
                 "failed to retrieve permission: {}",
                 requirement.requirement
             )),

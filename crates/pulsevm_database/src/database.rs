@@ -1081,7 +1081,7 @@ impl Database {
         fs::create_dir_all(dir).map_err(|e| {
             ChainError::InternalError(format!("snapshot validation: create {}: {e}", self.path))
         })?;
-        let staged = Self::stage_snapshot(dir, header, payload)?;
+        let staged = Self::stage_snapshot(dir, header, payload, None)?;
         let candidate = crate::backend::ChainDatabase::new()
             .map_err(|e| ChainError::InternalError(format!("snapshot validation: init: {e:?}")))?;
         candidate
@@ -2440,14 +2440,16 @@ impl Database {
     ///
     /// This is the accept side of state sync, where the database is already
     /// open. The envelope is validated and the payload staged to a sibling file
-    /// while the current mapping is still up, so a bad snapshot never disturbs
-    /// the running database. Only then is the write lock taken to drop the
-    /// mapping, swap the file in atomically, and remap — the same
+    /// while the current mapping is still up. The staged arena's canonical root
+    /// must match `expected_state_root`, so corrupt or peer-forged state never
+    /// disturbs the running database. Only then is the write lock taken to drop
+    /// the mapping, swap the file in atomically, and remap — the same
     /// lock-held-across-the-whole-window discipline as `snapshot_bytes`, and it
     /// always remaps so a failure never leaves the database closed.
     pub fn restore_from_bytes(
         &self,
         snapshot: &[u8],
+        expected_state_root: &[u8; 32],
     ) -> Result<crate::snapshot::SnapshotHeader, ChainError> {
         // Validate and locate the payload before touching the running arena.
         let (header, payload) = crate::snapshot::decode(snapshot)?;
@@ -2460,7 +2462,7 @@ impl Database {
             ChainError::InternalError(format!("restore: create {}: {e}", self.path))
         })?;
         let dest = dir.join(ARENA_STATE_FILE);
-        let staged = Self::stage_snapshot(dir, header, payload)?;
+        let staged = Self::stage_snapshot(dir, header, payload, Some(expected_state_root))?;
         staged.persist(&dest).map_err(|e| {
             ChainError::InternalError(format!("restore: install {}: {}", dest.display(), e.error))
         })?;
@@ -2543,6 +2545,7 @@ impl Database {
         dir: &Path,
         header: crate::snapshot::SnapshotHeader,
         payload: &[u8],
+        expected_state_root: Option<&[u8; 32]>,
     ) -> Result<tempfile::NamedTempFile, ChainError> {
         let staged = tempfile::NamedTempFile::new_in(dir)
             .map_err(|e| ChainError::InternalError(format!("restore: stage: {e}")))?;
@@ -2559,6 +2562,14 @@ impl Database {
                 candidate.revision(),
                 header.revision
             )));
+        }
+        if let Some(expected) = expected_state_root {
+            let actual = candidate.state_root();
+            if &actual != expected {
+                return Err(ChainError::InternalError(
+                    "snapshot state root does not match the authenticated summary".into(),
+                ));
+            }
         }
         Ok(staged)
     }
@@ -4704,6 +4715,25 @@ impl Database {
                 Name::new(permission_name)
             )));
         }
+        // A permission that something is still linked to cannot be removed
+        // either (apply_pulse_deleteauth). Dropping it would leave
+        // `lookup_minimum_permission` resolving to a name that no longer
+        // exists, which fails every action of that contract for this account --
+        // and fails `unlinkauth` too, since that resolves the same dangling
+        // name before it can remove the link. The account/contract pair would be
+        // permanently unusable.
+        if let Some((code, message_type)) = self
+            .backend
+            .first_link_to_permission(account, permission_name)
+        {
+            return Err(ChainError::ActionValidationError(format!(
+                "cannot delete a linked authority; unlink it first. '{}@{}' is linked to {}::{}",
+                Name::new(account),
+                Name::new(permission_name),
+                Name::new(code),
+                Name::new(message_type)
+            )));
+        }
         // deleteauth refunds `billable_size_v<permission_object>` plus the
         // authority's dynamic billable size (config.hpp / apply_pulse_deleteauth).
         let auth_blob = self
@@ -6482,6 +6512,7 @@ mod tests {
         a.set_revision(3).unwrap();
         let alice = name_u64("alice");
         a.create_account(alice, 1).unwrap();
+        let source_root = a.arena_state_root().unwrap();
         let snap = a.snapshot_bytes().unwrap();
 
         // Target arena: different state (revision 9 with bob).
@@ -6493,7 +6524,7 @@ mod tests {
         b.create_account(bob, 2).unwrap();
 
         // Restoring the source snapshot into the live target replaces its state.
-        let header = b.restore_from_bytes(&snap).unwrap();
+        let header = b.restore_from_bytes(&snap, &source_root).unwrap();
         assert_eq!(header.revision, 3);
         assert_eq!(b.revision(), 3);
         assert!(b.arena_account_exists(alice), "alice not restored");
@@ -6535,6 +6566,7 @@ mod tests {
         a.set_revision(5).unwrap();
         let alice = name_u64("alice");
         a.create_account(alice, 1).unwrap();
+        let source_root = a.arena_state_root().unwrap();
 
         let mut snap = a.snapshot_bytes().unwrap();
         let last = snap.len() - 1;
@@ -6542,7 +6574,7 @@ mod tests {
 
         // A corrupt snapshot is rejected up front; the running database is
         // untouched and still holds its own state.
-        assert!(a.restore_from_bytes(&snap).is_err());
+        assert!(a.restore_from_bytes(&snap, &source_root).is_err());
         assert_eq!(a.revision(), 5);
         assert!(a.arena_account_exists(alice));
     }
@@ -6552,6 +6584,7 @@ mod tests {
         let src = TempDir::new().unwrap();
         let mut source = Database::new(src.path().to_str().unwrap(), TEST_DB_SIZE).unwrap();
         source.set_revision(3).unwrap();
+        let source_root = source.arena_state_root().unwrap();
         let mut snap = source.snapshot_bytes().unwrap();
         // The envelope checksum covers the payload, so changing only the clear
         // revision keeps this a checksum-valid transfer. Restore must compare it
@@ -6566,7 +6599,7 @@ mod tests {
         target.create_account(alice, 1).unwrap();
         target.close().unwrap();
 
-        assert!(target.restore_from_bytes(&snap).is_err());
+        assert!(target.restore_from_bytes(&snap, &source_root).is_err());
         assert_eq!(target.revision(), 9);
         assert!(target.arena_account_exists(alice));
 
@@ -6574,6 +6607,26 @@ mod tests {
         let reopened = Database::new(dst_path, TEST_DB_SIZE).unwrap();
         assert_eq!(reopened.revision(), 9);
         assert!(reopened.arena_account_exists(alice));
+    }
+
+    #[test]
+    fn restore_rejects_wrong_state_root_without_replacing_state() {
+        let src = TempDir::new().unwrap();
+        let mut source = Database::new(src.path().to_str().unwrap(), TEST_DB_SIZE).unwrap();
+        source.set_revision(3).unwrap();
+        source.create_account(name_u64("alice"), 1).unwrap();
+        let snap = source.snapshot_bytes().unwrap();
+
+        let dst = TempDir::new().unwrap();
+        let mut target = Database::new(dst.path().to_str().unwrap(), TEST_DB_SIZE).unwrap();
+        target.set_revision(9).unwrap();
+        let bob = name_u64("bob");
+        target.create_account(bob, 2).unwrap();
+        let target_root = target.arena_state_root().unwrap();
+
+        assert!(target.restore_from_bytes(&snap, &target_root).is_err());
+        assert_eq!(target.revision(), 9);
+        assert!(target.arena_account_exists(bob));
     }
 
     #[test]
@@ -7344,7 +7397,7 @@ pub fn restore_snapshot(
         .map_err(|e| ChainError::InternalError(format!("restore: create {db_path}: {e}")))?;
     let dir = Path::new(db_path);
     let file = dir.join(ARENA_STATE_FILE);
-    let staged = Database::stage_snapshot(dir, header, payload)?;
+    let staged = Database::stage_snapshot(dir, header, payload, None)?;
     staged.persist(&file).map_err(|e| {
         ChainError::InternalError(format!("restore: install {}: {}", file.display(), e.error))
     })?;

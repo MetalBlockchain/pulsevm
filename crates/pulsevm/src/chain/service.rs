@@ -260,7 +260,7 @@ impl RpcService {
         //let resp: ResponseSuccess<u64> =
         // serde_json::from_str::<Response<u64>>(&resp).unwrap().try_into().unwrap();
 
-        Ok(resp)
+        Ok(resp.get().to_owned())
     }
 
     /// Validate a packed transaction and admit it to the mempool. Returns

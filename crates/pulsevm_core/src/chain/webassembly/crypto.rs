@@ -52,7 +52,10 @@ pub fn assert_recover_key(
     let pubkey = AuthorityPublicKey::read(pubkey_bytes.as_slice(), &mut 0).map_err(|e| {
         RuntimeError::new(format!("failed to read public key from wasm memory: {}", e))
     })?;
-    let recovered_pubkey = signature.recover_authority_key(&digest)?;
+    // fc passes `check_canonical = false` for this intrinsic, so a contract must
+    // see a non-canonical signature recover rather than fail. Consensus paths use
+    // the checked form; this one deliberately does not.
+    let recovered_pubkey = signature.recover_authority_key_non_canonical(&digest)?;
 
     if recovered_pubkey != pubkey {
         return Err(RuntimeError::new(
@@ -93,7 +96,8 @@ pub fn recover_key(
             .try_into()
             .expect("digest buffer is exactly 32 bytes"),
     );
-    let public_key = signature.recover_authority_key(&digest)?;
+    // As in `assert_recover_key`: fc passes `check_canonical = false` here.
+    let public_key = signature.recover_authority_key_non_canonical(&digest)?;
     let packed_public_key = public_key
         .pack()
         .map_err(|e| RuntimeError::new(format!("failed to pack public key: {}", e)))?;

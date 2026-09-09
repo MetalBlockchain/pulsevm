@@ -21,7 +21,9 @@ pub mod state_sync;
 pub mod transaction;
 pub mod transaction_context;
 pub mod utils;
+pub mod wasm_bulk_metering;
 pub mod wasm_runtime;
+pub mod wasm_tunables;
 mod webassembly;
 mod xpr_native_replay;
 

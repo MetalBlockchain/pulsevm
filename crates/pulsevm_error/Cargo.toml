@@ -4,7 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-anyhow = "1.0.98"
 thiserror = "2"
 wasmer = { version = "7.0.1" }
-jsonrpsee = { version = "0.24.9", features = ["server", "macros"] }
+jsonrpsee = { version = "0.26", features = ["server", "macros"] }

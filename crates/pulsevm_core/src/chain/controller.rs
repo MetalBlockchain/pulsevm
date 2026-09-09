@@ -537,6 +537,60 @@ impl MigrationBlockAuthenticator {
     }
 }
 
+/// Whether the transactions in a block still need their signatures and
+/// authorities checked.
+///
+/// This is deliberately a separate decision from explicit CPU/NET billing.
+/// Conflating the two is how the authority check came to be skipped for
+/// first-time verification of a peer's block: `execute_block` always bills
+/// explicitly, so keying the check off `explicit_billed.is_none()` disabled it
+/// everywhere. Nothing downstream re-checks signatures — `require_authorization`
+/// only scans the *declared* authorization list — so any producer could have
+/// forged a transaction from any account and every validator would have accepted
+/// it after re-deriving matching merkle roots.
+///
+/// Antelope permits skipping this (`light_validation_allowed`) only for a block
+/// already known validated or irreversible on *this* node, never for a block
+/// arriving from a peer for the first time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthorizationCheck {
+    /// Recover the signatures and check them against the referenced authorities.
+    /// Required for any block whose transactions this node has not already
+    /// authenticated itself.
+    Required,
+    /// Skip the check because this exact block already passed `verify_block`
+    /// here. Only sound for blocks drawn from `verified_blocks`.
+    AlreadyValidated,
+}
+
+/// How transaction resource receipts are handled while executing a block.
+///
+/// This is deliberately independent of [`AuthorizationCheck`]. A peer's block
+/// needs both full authorization checks and deterministic CPU/NET remeasurement;
+/// a block already validated by this node may use its committed receipts while
+/// rebuilding speculative state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockResourceMode {
+    /// Remeasure CPU/NET, enforce the objective quotas, and require every result
+    /// to match the producer's receipt exactly. Used for first-time validation.
+    ValidateReceipts,
+    /// Bill the committed receipt values for a block already fully validated on
+    /// this node. This is the trusted replay/light-validation path only.
+    ReplayValidatedReceipts,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TransactionResourceMode {
+    /// Locally produced/admitted transaction: measure resources and retain the
+    /// node-local wall-clock watchdog.
+    Measure,
+    /// First-time block validation: deterministically measure resources without
+    /// a subjective wall-clock rejection, then compare with the block receipt.
+    ValidateReceipt { cpu_us: u32, net_words: u32 },
+    /// Trusted replay: use the receipt that this node validated previously.
+    ReplayReceipt { cpu_us: u32, net_words: u32 },
+}
+
 pub struct Controller {
     wasm_runtime: WasmRuntime,
     last_accepted_block: SignedBlock,
@@ -763,11 +817,11 @@ impl fmt::Display for ControllerError {
     }
 }
 
-/// An Avalanche state summary: a commitment the engine agrees on (`id`, the
-/// accepted block id, canonical across nodes) plus small `bytes` describing what
-/// to fetch — the active schedule, the snapshot's block, and the snapshot's
-/// length and hash. The snapshot payload itself is downloaded separately over
-/// AppRequest (see `crate::chain::state_sync`).
+/// An Avalanche state summary: a commitment the engine agrees on (`id`, a hash
+/// of the accepted block, canonical state root, active schedule, and protocol
+/// schedule) plus small `bytes` describing what to fetch. The physical snapshot
+/// payload itself is downloaded separately over AppRequest (see
+/// `crate::chain::state_sync`).
 pub struct StateSummary {
     pub id: Id,
     pub height: u64,
@@ -966,6 +1020,7 @@ fn decode_migration_header_state(bytes: &[u8]) -> Result<MigrationHeaderState, C
 /// download chunks without re-snapshotting the arena on every request.
 struct CachedSnapshot {
     height: u32,
+    state_root: [u8; 32],
     hash: [u8; 32],
     envelope: Vec<u8>,
 }
@@ -2004,7 +2059,8 @@ impl Controller {
                 protocol_context,
                 &timestamp,
                 &block_status,
-                None,
+                TransactionResourceMode::Measure,
+                AuthorizationCheck::Required,
             );
 
             match transaction_result {
@@ -2351,14 +2407,37 @@ impl Controller {
 
         // The arena has no RAII undo hook, so every failure path below mirrors the
         // undo explicitly before returning, keeping the session stack depth right.
-        let (transaction_traces, transaction_mroot, action_mroot, _proposed_schedule) =
-            match self.execute_block(block, &block_status, mempool) {
-                Ok(v) => v,
-                Err(e) => {
-                    self.db.arena_undo();
-                    return Err(e);
-                }
-            };
+        // First-time validation of a peer's block: neither its signatures nor its
+        // resource receipts have been checked here, so both validations are
+        // mandatory. The migration entry point is restricted to blocks whose
+        // header authentication was prepared by `MigrationBlockAuthenticator`;
+        // it deliberately uses the trusted replay path needed by the offline
+        // historical importer and never handles live peer admission.
+        let (authorization_check, resource_mode) = if recovered_signer.is_some() {
+            (
+                AuthorizationCheck::AlreadyValidated,
+                BlockResourceMode::ReplayValidatedReceipts,
+            )
+        } else {
+            (
+                AuthorizationCheck::Required,
+                BlockResourceMode::ValidateReceipts,
+            )
+        };
+        let (transaction_traces, transaction_mroot, action_mroot, _proposed_schedule) = match self
+            .execute_block(
+                block,
+                &block_status,
+                mempool,
+                authorization_check,
+                resource_mode,
+            ) {
+            Ok(v) => v,
+            Err(e) => {
+                self.db.arena_undo();
+                return Err(e);
+            }
+        };
 
         if let Err(e) = block.validate_semantically(transaction_mroot, action_mroot) {
             self.db.arena_undo();
@@ -2514,7 +2593,16 @@ impl Controller {
             self.clear_pending()?;
             self.db.arena_start_undo_session(); // the fallback accept session; committed below
             let block_status = BlockStatus::Accepting;
-            match self.execute_block(&block, &block_status, mempool) {
+            // Fallback accept re-executes from scratch. This is a rare path (a
+            // fork sibling won, or nothing was pending) and it is not guaranteed
+            // that this block came through `verify_block` here, so check.
+            match self.execute_block(
+                &block,
+                &block_status,
+                mempool,
+                AuthorizationCheck::Required,
+                BlockResourceMode::ValidateReceipts,
+            ) {
                 Ok((transaction_traces, _, _, _)) => transaction_traces,
                 Err(e) => {
                     self.db.arena_undo();
@@ -2902,11 +2990,19 @@ impl Controller {
         }
     }
 
+    /// Execute every transaction in `block`.
+    ///
+    /// `authorization_check` must be `Required` and `resource_mode` must be
+    /// `ValidateReceipts` unless this node has already fully verified this exact
+    /// block. Both are explicit so a caller cannot accidentally turn first-time
+    /// consensus validation into trusted replay.
     pub fn execute_block(
         &mut self,
         block: &SignedBlock,
         block_status: &BlockStatus,
         mempool: &mut Mempool,
+        authorization_check: AuthorizationCheck,
+        resource_mode: BlockResourceMode,
     ) -> Result<
         (
             Vec<TransactionTrace>,
@@ -3029,6 +3125,18 @@ impl Controller {
 
         let transactions_started = replay_profiling.then(Instant::now);
         for receipt in &block.transactions {
+            let transaction_resource_mode = match resource_mode {
+                BlockResourceMode::ValidateReceipts => TransactionResourceMode::ValidateReceipt {
+                    cpu_us: receipt.cpu_usage_us(),
+                    net_words: receipt.net_usage_words(),
+                },
+                BlockResourceMode::ReplayValidatedReceipts => {
+                    TransactionResourceMode::ReplayReceipt {
+                        cpu_us: receipt.cpu_usage_us(),
+                        net_words: receipt.net_usage_words(),
+                    }
+                }
+            };
             let transaction_started = replay_profiling.then(Instant::now);
             let timestamp = &block.signed_block_header.header.timestamp;
             let transaction_id: [u8; 32] = receipt.transaction_id().as_bytes().try_into().unwrap();
@@ -3043,6 +3151,8 @@ impl Controller {
             if deferred.is_none()
                 && !collect_transaction_traces
                 && *XPR_BATCHED_REPLAY_ENABLED
+                && authorization_check == AuthorizationCheck::AlreadyValidated
+                && resource_mode == BlockResourceMode::ReplayValidatedReceipts
                 && receipt.status() == &crate::chain::transaction::TransactionStatus::Executed
             {
                 if let Some(transaction) = receipt.packed_trx() {
@@ -3172,13 +3282,13 @@ impl Controller {
                                 receipt.transaction_id()
                             )));
                         }
-                        self.execute_transaction_billed_with_authorization(
+                        self.execute_transaction_with_protocol_authorization(
                             &transaction,
                             protocol_context,
                             timestamp,
                             block_status,
-                            Some((receipt.cpu_usage_us(), receipt.net_usage_words())),
-                            true,
+                            transaction_resource_mode,
+                            AuthorizationCheck::AlreadyValidated,
                             true,
                         )?
                     }
@@ -3258,7 +3368,8 @@ impl Controller {
                     protocol_context,
                     timestamp,
                     block_status,
-                    Some((receipt.cpu_usage_us(), receipt.net_usage_words())),
+                    transaction_resource_mode,
+                    authorization_check,
                 )?;
                 (result, receipt.clone())
             };
@@ -3296,7 +3407,6 @@ impl Controller {
                     }
                 }
             }
-
             // Add trace to traces
             if collect_transaction_traces {
                 transaction_traces.push(result.trace.clone());
@@ -3492,7 +3602,8 @@ impl Controller {
             protocol_context,
             pending_block_timestamp,
             block_status,
-            None,
+            TransactionResourceMode::Measure,
+            AuthorizationCheck::Required,
         );
         // Mempool admission is advisory: revert the arena session on both the
         // success and error paths.
@@ -3515,13 +3626,14 @@ impl Controller {
             protocol_context,
             pending_block_timestamp,
             block_status,
-            None,
+            TransactionResourceMode::Measure,
+            AuthorizationCheck::Required,
         )
     }
 
     /// As `execute_transaction`, but when `explicit_billed` is set (applying an
-    /// already-accepted block) it bills the block-recorded cpu/net and skips the
-    /// objective resource-limit checks — Antelope light/replay validation.
+    /// already-validated block) it uses the block-recorded CPU/NET for receipt
+    /// reconstruction and quota accounting — Antelope light/replay validation.
     fn max_transaction_time_ms(&self) -> u32 {
         self.node_config
             .as_ref()
@@ -3656,13 +3768,24 @@ impl Controller {
         skip_authorization: bool,
         is_deferred: bool,
     ) -> Result<TransactionResult, ChainError> {
+        let resource_mode = match explicit_billed {
+            Some((cpu_us, net_words)) => {
+                TransactionResourceMode::ReplayReceipt { cpu_us, net_words }
+            }
+            None => TransactionResourceMode::Measure,
+        };
+        let authorization_check = if skip_authorization {
+            AuthorizationCheck::AlreadyValidated
+        } else {
+            AuthorizationCheck::Required
+        };
         self.execute_transaction_with_protocol_authorization(
             packed_transaction,
             protocol_context,
             pending_block_timestamp,
             block_status,
-            explicit_billed,
-            skip_authorization,
+            resource_mode,
+            authorization_check,
             is_deferred,
         )
     }
@@ -3673,15 +3796,16 @@ impl Controller {
         protocol_context: ProtocolExecutionContext,
         pending_block_timestamp: &BlockTimestamp,
         block_status: &BlockStatus,
-        explicit_billed: Option<(u32, u32)>,
+        resource_mode: TransactionResourceMode,
+        authorization_check: AuthorizationCheck,
     ) -> Result<TransactionResult, ChainError> {
         self.execute_transaction_with_protocol_authorization(
             packed_transaction,
             protocol_context,
             pending_block_timestamp,
             block_status,
-            explicit_billed,
-            false,
+            resource_mode,
+            authorization_check,
             false,
         )
     }
@@ -3692,8 +3816,8 @@ impl Controller {
         protocol_context: ProtocolExecutionContext,
         pending_block_timestamp: &BlockTimestamp,
         block_status: &BlockStatus,
-        explicit_billed: Option<(u32, u32)>,
-        skip_authorization: bool,
+        resource_mode: TransactionResourceMode,
+        authorization_check: AuthorizationCheck,
         is_deferred: bool,
     ) -> Result<TransactionResult, ChainError> {
         let (mut execution_db, dependency_tracker) =
@@ -3714,15 +3838,10 @@ impl Controller {
                     .validate(pending_block_timestamp)?;
             }
 
-            // Verify authority — but only when this node is the one admitting the
-            // transaction (mempool/producing). When applying an already-accepted
-            // block (explicit_billed), signatures were authenticated by the producer,
-            // so this is Antelope light/replay validation: the authority check is
-            // skipped, exactly like the objective resource-limit checks below. It has
-            // no state effect (auth_sequence and permission-usage bumps happen during
-            // execution and finalize), so skipping it leaves the resulting state and
-            // receipts unchanged.
-            if explicit_billed.is_none() && !skip_authorization {
+            // Signature/authority validation is deliberately independent from
+            // receipt accounting. Only a transaction already validated by this
+            // node (or a trusted offline migration receipt) may skip it.
+            if authorization_check == AuthorizationCheck::Required {
                 AuthorizationManager::check_authorization(
                     &mut execution_db,
                     &signed_transaction.transaction().actions,
@@ -3745,10 +3864,14 @@ impl Controller {
             );
             self.set_context_active_schedule(&trx_context)?;
 
-            // Applying an already-accepted block: bill the recorded cpu/net and
-            // skip the objective limit checks (Antelope light/replay validation).
-            if let Some((cpu_us, net_words)) = explicit_billed {
-                trx_context.set_explicit_billed(cpu_us, net_words)?;
+            match resource_mode {
+                TransactionResourceMode::Measure => {}
+                TransactionResourceMode::ValidateReceipt { .. } => {
+                    trx_context.disable_subjective_deadline()?;
+                }
+                TransactionResourceMode::ReplayReceipt { cpu_us, net_words } => {
+                    trx_context.set_explicit_billed(cpu_us, net_words)?;
+                }
             }
 
             let trx = packed_transaction.get_transaction();
@@ -3759,7 +3882,7 @@ impl Controller {
                     &trx,
                     pending_block_timestamp.clone().into(),
                 )?;
-            } else if explicit_billed.is_some() {
+            } else if matches!(resource_mode, TransactionResourceMode::ReplayReceipt { .. }) {
                 trx_context.init_for_input_trx_from_block(&trx)?;
             } else {
                 trx_context.init_for_input_trx(
@@ -3768,11 +3891,14 @@ impl Controller {
                     &trx,
                 )?;
             }
-            let executed_directly = if explicit_billed.is_some() && !is_deferred {
-                trx_context.try_exec_xpr_bot_direct(&trx)?
-            } else {
-                false
-            };
+            let executed_directly =
+                if matches!(resource_mode, TransactionResourceMode::ReplayReceipt { .. })
+                    && !is_deferred
+                {
+                    trx_context.try_exec_xpr_bot_direct(&trx)?
+                } else {
+                    false
+                };
             if !executed_directly {
                 // A canonical transaction may change any authority object. The
                 // replay-only inline cache may span audited native transactions,
@@ -3780,7 +3906,22 @@ impl Controller {
                 trx_context.clear_xpr_inline_authorization_cache();
                 trx_context.exec(&trx)?;
             }
-            trx_context.finalize()
+            let result = trx_context.finalize()?;
+            if let TransactionResourceMode::ValidateReceipt { cpu_us, net_words } = resource_mode {
+                let measured_cpu_us = result.trace.receipt.cpu_usage_us;
+                let measured_net_words = result.trace.receipt.net_usage_words.0;
+                if measured_cpu_us != cpu_us || measured_net_words != net_words {
+                    return Err(ChainError::BlockError(format!(
+                        "transaction {} resource receipt mismatch: block declares CPU {} and NET {}, measured CPU {} and NET {}",
+                        packed_transaction.id(),
+                        cpu_us,
+                        net_words,
+                        measured_cpu_us,
+                        measured_net_words
+                    )));
+                }
+            }
+            Ok(result)
         })();
 
         if let Some(tracker) = dependency_tracker {
@@ -3866,10 +4007,14 @@ impl Controller {
         // take a fresh one. Re-snapshotting scans the whole arena, so caching
         // matters when a peer pulls many chunks for the same summary.
         if self.snapshot_cache.as_ref().map(|c| c.height) != Some(height) {
+            let state_root = self.db.arena_state_root().ok_or_else(|| {
+                ChainError::InternalError("summary: database has no state root".into())
+            })?;
             let envelope = self.db.snapshot_bytes()?;
             let hash = *Digest::hash(&envelope).as_bytes();
             self.snapshot_cache = Some(CachedSnapshot {
                 height,
+                state_root,
                 hash,
                 envelope,
             });
@@ -3884,16 +4029,24 @@ impl Controller {
             .active_schedule
             .pack()
             .map_err(|e| ChainError::InternalError(format!("summary: pack schedule: {}", e)))?;
+        let protocol_commitment = self.protocol_upgrade_schedule.commitment(height);
         let bytes = state_sync::encode_summary_bytes(
             &schedule_bytes,
             &block_bytes,
             cache.envelope.len() as u64,
             &cache.hash,
-            self.protocol_upgrade_schedule.commitment(height),
+            &cache.state_root,
+            protocol_commitment,
         );
+        let id = state_sync::summary_id(
+            &self.last_accepted_block,
+            &self.active_schedule,
+            &cache.state_root,
+            protocol_commitment,
+        )?;
 
         Ok(StateSummary {
-            id: self.last_accepted_block_id.clone(),
+            id,
             height: height as u64,
             bytes,
         })
@@ -3902,7 +4055,16 @@ impl Controller {
     /// Read a summary's id and height without applying it.
     pub fn parse_state_summary(bytes: &[u8]) -> Result<(Id, u64), ChainError> {
         let target = state_sync::decode_summary_bytes(bytes)?;
-        Ok((target.block.id()?, target.height))
+        let protocol_commitment = target.protocol_commitment.ok_or_else(|| {
+            ChainError::InternalError("summary: missing protocol commitment".into())
+        })?;
+        let id = state_sync::summary_id(
+            &target.block,
+            &target.schedule,
+            &target.state_root,
+            protocol_commitment,
+        )?;
+        Ok((id, target.height))
     }
 
     /// Parse a summary into a [`SyncTarget`] the sync manager can drive a
@@ -4003,12 +4165,14 @@ impl Controller {
     /// next accepted block. The schedule in force at the snapshot is persisted so
     /// a later restart recovers it. `envelope` has already been verified against
     /// the summary hash by the download driver; `restore_from_bytes` re-checks its
-    /// internal checksum.
+    /// internal checksum and its logical root against the root authenticated by
+    /// the Avalanche summary id.
     pub fn apply_state_snapshot(
         &mut self,
         block: SignedBlock,
         schedule: ProducerSchedule,
         protocol_commitment: Option<crate::chain::protocol_features::ProtocolScheduleCommitment>,
+        expected_state_root: [u8; 32],
         envelope: &[u8],
     ) -> Result<(), ChainError> {
         let block_height = block.block_num();
@@ -4053,7 +4217,7 @@ impl Controller {
         self.clear_pending()?;
         self.begin_state_sync_install(block_height, &block_id)?;
         marker_installed.set(true);
-        let restore_result = db.restore_from_bytes(envelope);
+        let restore_result = db.restore_from_bytes(envelope, &expected_state_root);
         if let Err(error) = restore_result {
             // Ordinary post-hook failures mean the database restore put the old
             // arena back. Remove the poison marker so normal bootstrap may retry.
@@ -4064,7 +4228,18 @@ impl Controller {
             return Err(error);
         }
         db.validate_system_account_state()?;
+        if db.arena_state_root() != Some(expected_state_root) {
+            return Err(ChainError::fatal_consistency(format!(
+                "state sync installed a state root other than the authenticated root {}",
+                hex::encode(expected_state_root)
+            )));
+        }
         db.replace_activated_protocol_features(expected_protocol_records)?;
+        if db.arena_state_root() != Some(expected_state_root) {
+            return Err(ChainError::fatal_consistency(
+                "state sync protocol normalization changed the authenticated state root",
+            ));
+        }
 
         let publish_metadata = (|| -> Result<(), ChainError> {
             // Re-base the logs. The block log starts again at the snapshot block
@@ -4654,14 +4829,24 @@ impl Controller {
                 self.pending_tip_id()
             );
             self.db.arena_start_undo_session(); // the replayed block's session
-            let (traces, _transaction_mroot, _action_mroot, _proposed_schedule) =
-                match self.execute_block(block, block_status, mempool) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        self.db.arena_undo(); // undo the session on the error
-                        return Err(e);
-                    }
-                };
+            // Every block on this path was read out of `verified_blocks` above,
+            // so it already passed `verify_block` — including its authority
+            // check — on this node. This is the one genuine light-validation
+            // case, and it is the hot path (replay runs on every verify).
+            let (traces, _transaction_mroot, _action_mroot, _proposed_schedule) = match self
+                .execute_block(
+                    block,
+                    block_status,
+                    mempool,
+                    AuthorizationCheck::AlreadyValidated,
+                    BlockResourceMode::ReplayValidatedReceipts,
+                ) {
+                Ok(v) => v,
+                Err(e) => {
+                    self.db.arena_undo(); // undo the session on the error
+                    return Err(e);
+                }
+            };
             self.pending_chain.push(PendingBlock {
                 id: block.id()?,
                 parent: block.previous_id().clone(),
@@ -4818,6 +5003,16 @@ mod tests {
 
     fn get_temp_dir() -> TempDir {
         tempfile::tempdir().expect("failed to create temp dir")
+    }
+
+    fn activate_test_features(
+        controller: &Controller,
+        features: &[[u8; 32]],
+    ) -> Result<(), ChainError> {
+        for feature in features {
+            controller.db.preactivate_protocol_feature(*feature)?;
+        }
+        controller.db.activate_protocol_features(features, 1)
     }
 
     #[test]
@@ -8719,6 +8914,237 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_block_whose_transaction_is_unsigned() -> Result<(), ChainError> {
+        // The forged-block attack. A producer builds a well-formed block whose
+        // transaction declares an authorization but carries *no signature at all*.
+        // The block header itself is signed correctly, so the producer-schedule
+        // check passes, and nothing downstream re-checks signatures --
+        // `require_authorization` only scans the *declared* authorization list.
+        // So if block verification skips the authority check, any producer can
+        // forge a transaction from any account (transfers, updateauth, setcode)
+        // and every validator accepts it after re-deriving matching merkle roots.
+        //
+        // This is the regression test for exactly that: the authority check used
+        // to be keyed off `explicit_billed.is_none()`, and `execute_block` always
+        // bills explicitly, so it was disabled on every block-application path.
+        use crate::chain::transaction::{
+            TransactionReceiptHeader,
+            TransactionStatus,
+        };
+
+        let (mut producer, private_key, chain_id, _p_temp) = init_test_controller()?;
+        let mut p_mempool = Mempool::new();
+        p_mempool.add_transaction(create_account(
+            &private_key,
+            Name::from_str("testapi")?,
+            chain_id,
+        )?);
+        let mut block = producer.build_block(&mut p_mempool).await?;
+
+        // Strip the signatures, leaving the declared authorization untouched.
+        let receipt = block
+            .transactions
+            .front()
+            .expect("the built block must contain a transaction");
+        let signed = receipt
+            .packed_trx()
+            .expect("the built receipt must contain a packed transaction")
+            .get_signed_transaction();
+        assert!(
+            !signed.signatures().is_empty(),
+            "the original transaction must be signed, or this test proves nothing"
+        );
+        let unsigned = PackedTransaction::from_signed_transaction(SignedTransaction::new(
+            signed.transaction().clone(),
+            Vec::new(),
+            signed.context_free_data().clone(),
+        ))?;
+        let header = TransactionReceiptHeader::new(
+            TransactionStatus::Executed,
+            receipt.cpu_usage_us(),
+            receipt.net_usage_words().into(),
+        );
+        block.transactions = VecDeque::from(vec![TransactionReceipt::new(header, unsigned)]);
+
+        // Re-sign the header so the block clears the schedule check and the
+        // authority check is what actually decides the outcome.
+        let sig_digest = block.signed_block_header.header.sig_digest()?;
+        block.signed_block_header.signature = private_key.sign(&sig_digest)?;
+
+        let (mut validator, _pk, _cid, _v_temp) = init_test_controller()?;
+        let mut v_mempool = Mempool::new();
+        let error = validator
+            .verify_block(&block, &mut v_mempool)
+            .await
+            .expect_err("a block containing an unsigned transaction must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("does not have signatures for it"),
+            "expected an authorization failure, got: {error}"
+        );
+        assert!(
+            validator.pending_chain.is_empty(),
+            "a rejected block must leave nothing on the pending chain"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_block_with_underreported_cpu_and_net() -> Result<(), ChainError> {
+        use crate::chain::transaction::{
+            TransactionReceiptHeader,
+            TransactionStatus,
+        };
+
+        let (mut producer, private_key, chain_id, _p_temp) = init_test_controller()?;
+        let mut p_mempool = Mempool::new();
+        p_mempool.add_transaction(create_account(
+            &private_key,
+            Name::from_str("testapi")?,
+            chain_id,
+        )?);
+        let mut block = producer.build_block(&mut p_mempool).await?;
+
+        let receipt = block
+            .transactions
+            .front()
+            .expect("the built block must contain a transaction");
+        assert!(receipt.cpu_usage_us() > 0);
+        assert!(receipt.net_usage_words() > 0);
+        let transaction = receipt
+            .packed_trx()
+            .expect("the built receipt must contain a packed transaction")
+            .clone();
+
+        // A malicious producer commits a receipt that bills none of the work.
+        // Recompute the merkle root and block signature exactly as an attacker
+        // would, so neither integrity check masks the resource-validation bug.
+        let forged_header =
+            TransactionReceiptHeader::new(TransactionStatus::Executed, 0, 0u32.into());
+        block.transactions =
+            VecDeque::from(vec![TransactionReceipt::new(forged_header, transaction)]);
+        block.signed_block_header.header.transaction_mroot =
+            producer.calculate_trx_merkle(&block.transactions)?;
+        let sig_digest = block.signed_block_header.header.sig_digest()?;
+        block.signed_block_header.signature = private_key.sign(&sig_digest)?;
+
+        let (mut validator, _pk, _cid, _v_temp) = init_test_controller()?;
+        let mut v_mempool = Mempool::new();
+        let error = validator
+            .verify_block(&block, &mut v_mempool)
+            .await
+            .expect_err("underreported CPU/NET must invalidate the block");
+        assert!(
+            error.to_string().contains("resource receipt mismatch"),
+            "expected resource receipt validation to reject the block, got: {error}"
+        );
+        assert!(
+            validator.pending_chain.is_empty(),
+            "a rejected block must leave nothing on the pending chain"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn authorization_check_gate_is_load_bearing() -> Result<(), ChainError> {
+        // Isolates the gate itself, with no merkle root in the way.
+        //
+        // The end-to-end test above mutates an already-built block, so the
+        // recomputed transaction_mroot no longer matches the header and that
+        // mismatch would reject the block even with the authority check disabled.
+        // A real attacker does not have that problem: they *build* the block
+        // around the forged transaction, so the roots they commit to are exactly
+        // the ones every validator re-derives. The root check is therefore no
+        // defence at all, and the authority check is the only thing standing
+        // between a producer and an arbitrary action from any account.
+        //
+        // So drive `execute_block` directly, which returns the roots rather than
+        // comparing them, and assert the outcome turns purely on the flag.
+        use crate::chain::transaction::{
+            TransactionReceiptHeader,
+            TransactionStatus,
+        };
+
+        let (mut producer, private_key, chain_id, _p_temp) = init_test_controller()?;
+        let mut p_mempool = Mempool::new();
+        p_mempool.add_transaction(create_account(
+            &private_key,
+            Name::from_str("testapi")?,
+            chain_id,
+        )?);
+        let mut block = producer.build_block(&mut p_mempool).await?;
+
+        let receipt = block
+            .transactions
+            .front()
+            .expect("the built block must contain a transaction");
+        let signed = receipt
+            .packed_trx()
+            .expect("the built receipt must contain a packed transaction")
+            .get_signed_transaction();
+        let unsigned = PackedTransaction::from_signed_transaction(SignedTransaction::new(
+            signed.transaction().clone(),
+            Vec::new(),
+            signed.context_free_data().clone(),
+        ))?;
+        let header = TransactionReceiptHeader::new(
+            TransactionStatus::Executed,
+            receipt.cpu_usage_us(),
+            receipt.net_usage_words().into(),
+        );
+        block.transactions = VecDeque::from(vec![TransactionReceipt::new(header, unsigned)]);
+
+        // Required: the unsigned transaction must be refused.
+        let (mut validator, _pk, _cid, _v_temp) = init_test_controller()?;
+        let mut v_mempool = Mempool::new();
+        validator.db.arena_start_undo_session();
+        let refused = validator
+            .execute_block(
+                &block,
+                &BlockStatus::Verifying,
+                &mut v_mempool,
+                AuthorizationCheck::Required,
+                BlockResourceMode::ValidateReceipts,
+            )
+            .map(|_| ()); // TransactionTrace is not Debug
+        validator.db.arena_undo();
+        let error = refused.expect_err("an unsigned transaction must not execute");
+        assert!(
+            error
+                .to_string()
+                .contains("does not have signatures for it"),
+            "expected an authorization failure, got: {error}"
+        );
+
+        // AlreadyValidated: the very same block executes. This is what the
+        // vulnerable code did on every path, and it is why this variant must stay
+        // restricted to blocks drawn from `verified_blocks`.
+        let (mut replayer, _pk, _cid, _r_temp) = init_test_controller()?;
+        let mut r_mempool = Mempool::new();
+        replayer.db.arena_start_undo_session();
+        let accepted = replayer
+            .execute_block(
+                &block,
+                &BlockStatus::Verifying,
+                &mut r_mempool,
+                AuthorizationCheck::AlreadyValidated,
+                BlockResourceMode::ReplayValidatedReceipts,
+            )
+            .map(|_| ()); // TransactionTrace is not Debug
+        replayer.db.arena_undo();
+        assert!(
+            accepted.is_ok(),
+            "skipping the check must be what changes the outcome, but got: {:?}",
+            accepted.err()
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn active_schedule_gates_block_verification() -> Result<(), ChainError> {
         // A block signed by the genesis key must be rejected once the schedule is
         // rotated to a different key, and accepted again when re-signed with the
@@ -8801,6 +9227,7 @@ mod tests {
         let block = producer.build_block(&mut p_mempool).await?;
         producer.accept_block(&block.id()?, &mut p_mempool)?;
         producer.set_preferred_id(block.id()?);
+        let producer_tip_id = producer.last_accepted_block().id()?;
 
         // Materialize a verified child without accepting it. A summary labelled
         // with the accepted block must unwind this speculative account before
@@ -8851,6 +9278,10 @@ mod tests {
         // Parse agrees with produce on the commitment.
         let (parsed_id, parsed_height) = Controller::parse_state_summary(&summary.bytes)?;
         assert_eq!(parsed_id, summary.id);
+        assert_ne!(
+            summary.id, producer_tip_id,
+            "summary id must not be only the block id"
+        );
         assert_eq!(parsed_height, producer_height as u64);
 
         // Download the snapshot chunk by chunk from the producer, exactly as the
@@ -8864,11 +9295,49 @@ mod tests {
         })
         .await?;
 
+        // A malicious summary provider can reuse the canonical block, schedule,
+        // protocol commitment and state root while advertising its own physical
+        // snapshot hash. Build such a checksum-valid snapshot at the same
+        // revision but with different state. It must be rejected by the logical
+        // root check before it replaces the syncing node's live arena.
+        let attacker_temp = get_temp_dir();
+        let mut attacker = init(attacker_temp.path().to_str().unwrap())?;
+        let mut attacker_mempool = Mempool::new();
+        attacker_mempool.add_transaction(create_account(
+            &private_key,
+            Name::from_str("mallory")?,
+            chain_id,
+        )?);
+        let attacker_block = attacker.build_block(&mut attacker_mempool).await?;
+        attacker.accept_block(&attacker_block.id()?, &mut attacker_mempool)?;
+        assert_eq!(attacker.database().revision(), producer_height as i64);
+        let forged_envelope = attacker.database().snapshot_bytes()?;
+        let syncer_root_before = syncer.database().arena_state_root();
+        let error = syncer
+            .apply_state_snapshot(
+                target.block.clone(),
+                target.schedule.clone(),
+                target.protocol_commitment,
+                target.state_root,
+                &forged_envelope,
+            )
+            .expect_err("snapshot with forged logical state must be rejected");
+        assert!(error.to_string().contains("state root"));
+        assert_eq!(syncer.database().arena_state_root(), syncer_root_before);
+        assert!(
+            !syncer_temp
+                .path()
+                .join(STATE_SYNC_INSTALL_MARKER_FILE)
+                .exists(),
+            "safe rejection left a state-sync poison marker behind"
+        );
+
         // Apply transfers state, tip, and schedule.
         syncer.apply_state_snapshot(
             target.block.clone(),
             target.schedule.clone(),
             target.protocol_commitment,
+            target.state_root,
             &envelope,
         )?;
         assert!(
@@ -8883,7 +9352,11 @@ mod tests {
             "state not transferred"
         );
         assert_eq!(syncer.last_accepted_block().block_num(), producer_height);
-        assert_eq!(syncer.last_accepted_block().id()?, summary.id);
+        assert_eq!(syncer.last_accepted_block().id()?, producer_tip_id);
+        assert_eq!(
+            syncer.database().arena_state_root(),
+            Some(target.state_root)
+        );
         assert_eq!(syncer.database().revision(), producer_height as i64);
         assert_eq!(syncer.active_schedule, producer_schedule);
         assert!(
@@ -8903,7 +9376,7 @@ mod tests {
             "synced state lost across restart"
         );
         assert_eq!(restarted.last_accepted_block().block_num(), producer_height);
-        assert_eq!(restarted.last_accepted_block().id()?, summary.id);
+        assert_eq!(restarted.last_accepted_block().id()?, producer_tip_id);
         assert_eq!(
             restarted.active_schedule, producer_schedule,
             "synced schedule lost across restart"
@@ -9122,6 +9595,7 @@ mod tests {
             target.block.clone(),
             target.schedule.clone(),
             target.protocol_commitment,
+            target.state_root,
             &envelope,
         )?;
 
@@ -9137,6 +9611,7 @@ mod tests {
         // payload hash the producer advertised — the transfer was lossless.
         let re = syncer.produce_state_summary()?;
         let re_target = Controller::sync_target_from_summary(&re.bytes)?;
+        assert_eq!(re.id, summary.id, "logical summary id changed after sync");
         assert_eq!(
             re_target.hash, target.hash,
             "re-snapshot of synced state does not match the producer's snapshot"
@@ -9992,106 +10467,251 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bulk_memory_intrinsics_preserve_eosio_semantics() -> Result<(), ChainError> {
+    async fn get_code_hash_returns_nodeos_compatible_metadata() -> Result<(), ChainError> {
         let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
+        activate_test_features(
+            &controller,
+            &[
+                crate::chain::webassembly::GET_CODE_HASH_FEATURE_DIGEST,
+                ACTION_RETURN_VALUE_FEATURE_DIGEST,
+            ],
+        )?;
         let timestamp = *controller.last_accepted_block().timestamp();
         let status = BlockStatus::Building;
-        let run = Name::from_str("run")?;
-
-        let happy_path = wat::parse_str(
+        let short = Name::from_str("short")?;
+        let sentinel = "\\aa".repeat(42);
+        let wasm = wat::parse_str(&format!(
             r#"
             (module
-              (import "env" "memcpy" (func $memcpy (param i32 i32 i32) (result i32)))
-              (import "env" "memmove" (func $memmove (param i32 i32 i32) (result i32)))
-              (import "env" "memset" (func $memset (param i32 i32 i32) (result i32)))
-              (import "env" "memcmp" (func $memcmp (param i32 i32 i32) (result i32)))
-              (import "env" "eosio_assert" (func $assert (param i32 i32)))
+              (import "env" "get_code_hash"
+                (func $get (param i64 i32 i32 i32) (result i32)))
+              (import "env" "__fixunstfdi"
+                (func $fix (param i64 i64) (result i64)))
+              (import "env" "set_action_return_value"
+                (func $return (param i32 i32)))
               (memory (export "memory") 1)
-              (data (i32.const 8) "bulk memory intrinsic failed\00")
-              (data (i32.const 64) "abcdef")
-              (data (i32.const 80) "xxxxxx")
-              (data (i32.const 96) "abZZef")
-              (data (i32.const 112) "abcdef")
-              (data (i32.const 128) "ababcd")
+              (data (i32.const 128) "{sentinel}")
               (func (export "apply") (param i64 i64 i64)
-                (drop (call $memcpy (i32.const 80) (i32.const 64) (i32.const 6)))
-                (drop (call $memset (i32.const 82) (i32.const 346) (i32.const 2)))
-                (call $assert
-                  (i32.eq (call $memcmp (i32.const 80) (i32.const 96) (i32.const 6))
-                          (i32.const 0))
-                  (i32.const 8))
-                (drop (call $memmove (i32.const 114) (i32.const 112) (i32.const 4)))
-                (call $assert
-                  (i32.eq (call $memcmp (i32.const 112) (i32.const 128) (i32.const 6))
-                          (i32.const 0))
-                  (i32.const 8))
-                (call $assert
-                  (i32.eq (call $memcmp (i32.const 64) (i32.const 96) (i32.const 6))
-                          (i32.const 1))
-                  (i32.const 8))
-                (call $assert
-                  (i32.eq (call $memcmp (i32.const 96) (i32.const 64) (i32.const 6))
-                          (i32.const -1))
-                  (i32.const 8))))
+                (if (i64.eq (local.get 2) (i64.const {short}))
+                  (then
+                    (drop (call $get (i64.const {account}) (i32.const 99) (i32.const 128) (i32.const 42)))
+                    (call $return (i32.const 128) (i32.const 42)))
+                  (else
+                    (i64.store (i32.const 0)
+                      (call $fix (i64.const 0) (i64.const 4611404543450677248)))
+                    (drop (call $get (i64.const 0) (i32.const 65536) (i32.const 0) (i32.const 0)))
+                    (drop (call $get (i64.const {account}) (i32.const 99) (i32.const 0) (i32.const 43)))
+                    (call $return (i32.const 0) (i32.const 43))))))
+            "#,
+            account = PULSE_NAME.as_u64(),
+            short = short.as_u64(),
+            sentinel = sentinel,
+        ))
+        .expect("valid code-hash contract");
+        let expected_hash = pulsevm_crypto::Digest::hash(&wasm).0;
+
+        controller.execute_transaction(
+            &set_code(&private_key, PULSE_NAME, wasm, chain_id)?,
+            &timestamp,
+            &status,
+        )?;
+        let result = controller.execute_transaction(
+            &call_contract(
+                &private_key,
+                PULSE_NAME,
+                Name::from_str("read")?,
+                &Vec::<u8>::new(),
+                chain_id,
+            )?,
+            &timestamp,
+            &status,
+        )?;
+
+        let returned = &result.trace.action_traces()[0].return_value;
+        assert_eq!(returned.len(), 43);
+        assert_eq!(returned[0], 0, "struct version must be version 0");
+        assert_eq!(u64::from_le_bytes(returned[1..9].try_into().unwrap()), 1);
+        assert_eq!(&returned[9..41], expected_hash.as_slice());
+        assert_eq!(returned[41], 0, "vm type must be wasm version 0");
+        assert_eq!(returned[42], 0, "vm version must be wasm version 0");
+
+        let short_result = controller.execute_transaction(
+            &call_contract(&private_key, PULSE_NAME, short, &Vec::<u8>::new(), chain_id)?,
+            &timestamp,
+            &status,
+        )?;
+        assert_eq!(
+            short_result.trace.action_traces()[0]
+                .return_value
+                .as_slice(),
+            vec![0xaa; 42]
+        );
+
+        let wasm_v2 = wat::parse_str(&format!(
+            r#"
+            (module
+              (import "env" "get_code_hash"
+                (func $get (param i64 i32 i32 i32) (result i32)))
+              (import "env" "set_action_return_value"
+                (func $return (param i32 i32)))
+              (memory (export "memory") 1)
+              (func (export "apply") (param i64 i64 i64)
+                (drop (call $get (i64.const {}) (i32.const 99) (i32.const 0) (i32.const 43)))
+                (call $return (i32.const 0) (i32.const 43))))
+            "#,
+            PULSE_NAME.as_u64(),
+        ))
+        .expect("valid second code version");
+        let expected_hash_v2 = pulsevm_crypto::Digest::hash(&wasm_v2).0;
+        controller.execute_transaction(
+            &set_code(&private_key, PULSE_NAME, wasm_v2, chain_id)?,
+            &timestamp,
+            &status,
+        )?;
+        let updated = controller.execute_transaction(
+            &call_contract(
+                &private_key,
+                PULSE_NAME,
+                Name::from_str("read2")?,
+                &Vec::<u8>::new(),
+                chain_id,
+            )?,
+            &timestamp,
+            &status,
+        )?;
+        let updated_return = &updated.trace.action_traces()[0].return_value;
+        assert_eq!(
+            u64::from_le_bytes(updated_return[1..9].try_into().unwrap()),
+            2
+        );
+        assert_eq!(&updated_return[9..41], expected_hash_v2.as_slice());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_sender_returns_creator_receiver_for_inline_actions() -> Result<(), ChainError> {
+        let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
+        activate_test_features(
+            &controller,
+            &[
+                crate::chain::webassembly::GET_SENDER_FEATURE_DIGEST,
+                ACTION_RETURN_VALUE_FEATURE_DIGEST,
+            ],
+        )?;
+        let timestamp = *controller.last_accepted_block().timestamp();
+        let status = BlockStatus::Building;
+        let child = Name::from_str("child")?;
+        let child_action = Action::new(PULSE_NAME, child, Vec::new(), Vec::new()).pack()?;
+        let child_data: String = child_action
+            .iter()
+            .map(|byte| format!("\\{:02x}", byte))
+            .collect();
+        let wasm = wat::parse_str(&format!(
+            r#"
+            (module
+              (import "env" "get_sender" (func $sender (result i64)))
+              (import "env" "send_inline" (func $inline (param i32 i32)))
+              (import "env" "set_action_return_value" (func $return (param i32 i32)))
+              (memory (export "memory") 1)
+              (data (i32.const 64) "{child_data}")
+              (func (export "apply") (param i64 i64 i64)
+                (if (i64.eq (local.get 2) (i64.const {child}))
+                  (then
+                    (i64.store (i32.const 0) (call $sender))
+                    (call $return (i32.const 0) (i32.const 8)))
+                  (else
+                    (i64.store (i32.const 0) (call $sender))
+                    (call $return (i32.const 0) (i32.const 8))
+                    (call $inline (i32.const 64) (i32.const {child_len}))))))
+            "#,
+            child = child.as_u64(),
+            child_data = child_data,
+            child_len = child_action.len(),
+        ))
+        .expect("valid get-sender contract");
+
+        controller.execute_transaction(
+            &set_code(&private_key, PULSE_NAME, wasm, chain_id)?,
+            &timestamp,
+            &status,
+        )?;
+        let result = controller.execute_transaction(
+            &call_contract(
+                &private_key,
+                PULSE_NAME,
+                Name::from_str("root")?,
+                &Vec::<u8>::new(),
+                chain_id,
+            )?,
+            &timestamp,
+            &status,
+        )?;
+
+        let traces = result.trace.action_traces();
+        assert_eq!(traces.len(), 2, "root action must execute its inline child");
+        assert_eq!(
+            u64::from_le_bytes(traces[0].return_value[..8].try_into().unwrap()),
+            0,
+            "top-level action has no sender"
+        );
+        assert_eq!(
+            u64::from_le_bytes(traces[1].return_value[..8].try_into().unwrap()),
+            PULSE_NAME.as_u64(),
+            "inline sender is the parent receiver"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fixunstfdi_is_registered_and_returns_value() -> Result<(), ChainError> {
+        let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
+        activate_test_features(&controller, &[ACTION_RETURN_VALUE_FEATURE_DIGEST])?;
+        let timestamp = *controller.last_accepted_block().timestamp();
+        let status = BlockStatus::Building;
+        let wasm = wat::parse_str(
+            r#"
+            (module
+              (import "env" "__fixunstfdi"
+                (func $fix (param i64 i64) (result i64)))
+              (import "env" "set_action_return_value"
+                (func $return (param i32 i32)))
+              (memory (export "memory") 1)
+              (func (export "apply") (param i64 i64 i64)
+                (i64.store (i32.const 0)
+                  (call $fix (i64.const 0) (i64.const 4611404543450677248)))
+                (call $return (i32.const 0) (i32.const 8))))
             "#,
         )
-        .expect("valid bulk-memory contract");
+        .expect("valid softfloat contract");
+
         controller.execute_transaction(
-            &set_code(&private_key, PULSE_NAME, happy_path, chain_id)?,
+            &set_code(&private_key, PULSE_NAME, wasm, chain_id)?,
             &timestamp,
             &status,
         )?;
-        controller.execute_transaction(
-            &call_contract(&private_key, PULSE_NAME, run, &Vec::<u8>::new(), chain_id)?,
+        let result = controller.execute_transaction(
+            &call_contract(
+                &private_key,
+                PULSE_NAME,
+                Name::from_str("soft")?,
+                &Vec::<u8>::new(),
+                chain_id,
+            )?,
             &timestamp,
             &status,
         )?;
 
-        let invalid_contract = |dest: u32, src: u32, size: u32| {
-            wat::parse_str(format!(
-                r#"
-                (module
-                  (import "env" "memcpy" (func $memcpy (param i32 i32 i32) (result i32)))
-                  (memory (export "memory") 1)
-                  (func (export "apply") (param i64 i64 i64)
-                    (drop (call $memcpy (i32.const {dest}) (i32.const {src})
-                                       (i32.const {size})))))
-                "#,
-            ))
-            .expect("valid failing memcpy contract")
-        };
-        for (index, (code, expected_error)) in [
-            (invalid_contract(65, 64, 2), "non-aliasing pointers"),
-            (invalid_contract(65_535, 0, 2), "out of bounds"),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            controller.execute_transaction(
-                &set_code(&private_key, PULSE_NAME, code, chain_id)?,
-                &timestamp,
-                &status,
-            )?;
-            let error = match controller.execute_transaction(
-                &call_contract(
-                    &private_key,
-                    PULSE_NAME,
-                    run,
-                    &vec![index as u8 + 1],
-                    chain_id,
-                )?,
-                &timestamp,
-                &status,
-            ) {
-                Ok(_) => panic!("invalid memcpy must trap"),
-                Err(error) => error,
-            };
-            assert!(
-                error.to_string().contains(expected_error),
-                "unexpected memcpy error: {error}"
-            );
-        }
-
+        assert_eq!(
+            u64::from_le_bytes(
+                result.trace.action_traces()[0].return_value[..8]
+                    .try_into()
+                    .unwrap()
+            ),
+            1,
+            "__fixunstfdi(1.0) must return 1"
+        );
         Ok(())
     }
 

@@ -2899,6 +2899,31 @@ impl ChainDatabase {
 
     /// Every authorization link owned by `account`, in chainbase's
     /// `by_permission_name` order, as `(required_permission, code, action)`.
+    /// The first `(code, message_type)` still linked to `(account, permission)`,
+    /// or `None` if nothing references it.
+    ///
+    /// `deleteauth` refuses while a link exists: removing the permission out
+    /// from under one leaves `lookup_minimum_permission` resolving to a name
+    /// that no longer exists, which fails every action of that contract for
+    /// that account *and* fails `unlinkauth`, so there is no way back.
+    ///
+    /// Uses the same `(account, required_permission, id)` index the link rows
+    /// are already maintained under, so this is a range seek rather than a scan
+    /// of the account's links.
+    pub fn first_link_to_permission(&self, account: u64, permission: u64) -> Option<(u64, u64)> {
+        use std::ops::Bound;
+        let db = self.lock();
+        db.table::<PermissionLinkRow>()
+            .ok()?
+            .get_index::<LinkByPermissionName>()
+            .range((
+                Bound::Included((account, permission, i64::MIN)),
+                Bound::Included((account, permission, i64::MAX)),
+            ))
+            .map(|(_, row)| (row.code, row.message_type))
+            .next()
+    }
+
     pub fn permission_links_of(&self, account: u64) -> Vec<(u64, u64, u64)> {
         use std::ops::Bound;
         let db = self.read();
@@ -4197,14 +4222,32 @@ impl ChainDatabase {
     /// expiration falls strictly before `cutoff` (both in microseconds, as the
     /// C++ compares `cutoff > expiration.to_time_point()`). Expirations are whole
     /// seconds, so they are scaled to microseconds for the comparison.
+    /// Walks `by_expiration` rather than scanning the table: the set retains every
+    /// id for the whole transaction lifetime window, and this runs on every block,
+    /// so a scan would let a flood of cheap transactions inflate a recurring
+    /// per-block cost for every validator.
     pub fn clear_expired_input_transactions(&self, cutoff_micros: i64) -> Result<(), DbError> {
+        use std::ops::Bound;
         let mut db = self.lock();
+        // A row is expired when `expiration * 1_000_000 < cutoff_micros`, so the
+        // lowest expiration that survives is `ceil(cutoff_micros / 1_000_000)` and
+        // the walk stops strictly before `(first_live, i64::MIN)` — the smallest
+        // key any surviving row can carry.
+        let first_live = cutoff_micros.div_euclid(1_000_000)
+            + i64::from(cutoff_micros.rem_euclid(1_000_000) != 0);
+        let end = if first_live <= 0 {
+            // Expirations are unsigned, so nothing can precede the cutoff.
+            return Ok(());
+        } else if first_live > u32::MAX as i64 {
+            Bound::Unbounded
+        } else {
+            Bound::Excluded((first_live as u32, i64::MIN))
+        };
         let expired: Vec<ObjectId<TransactionRow>> = db
             .table::<TransactionRow>()?
             .get_index::<TxByExpiration>()
-            .iter()
-            .take_while(|(key, _)| (key.0 as i64) * 1_000_000 < cutoff_micros)
-            .map(|(_, transaction)| transaction.id())
+            .range((Bound::Unbounded, end))
+            .map(|(_, t)| t.id())
             .collect();
         for id in expired {
             db.remove::<TransactionRow>(id)?;
