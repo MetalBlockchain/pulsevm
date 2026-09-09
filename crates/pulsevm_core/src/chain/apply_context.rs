@@ -350,6 +350,25 @@ impl ApplyContext {
         self.db.is_account(account.as_u64())
     }
 
+    /// Return the receiver that created the currently executing action.
+    ///
+    /// Top-level transaction actions have no creator and therefore return the
+    /// zero name. Notifications and inline actions carry the creator ordinal in
+    /// their trace; resolving that trace gives the sender exactly as nodeos'
+    /// `get_sender` intrinsic does.
+    pub fn get_sender(&self) -> Result<u64, ChainError> {
+        let trace = self.trx_context.get_action_trace(self.action_ordinal)?;
+        if trace.creator_action_ordinal == 0 {
+            return Ok(0);
+        }
+
+        Ok(self
+            .trx_context
+            .get_action_trace(trace.creator_action_ordinal)?
+            .receiver
+            .as_u64())
+    }
+
     pub fn execute_inline(&mut self, a: &Action) -> Result<(), ChainError> {
         let action = {
             let inner = self.inner.read()?;

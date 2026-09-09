@@ -114,6 +114,7 @@ Even though Pulse is based on EOS, there are quite some differences when it come
 - `is_priviliged(name n): bool`: Returns whether the current account is priviliged
 - `set_priviliged(name n, bool priviliged): void`: Set the priviliged flag on an account
 - `get_sender(): name`: Return name of account that sent current action
+- `get_code_hash(uint64 account, uint32 struct_version, char* result, uint32 buffer_size): uint32`: Return packed code metadata for an account
 - `pulse_assert(uint32 test, string message): void`: Asserts test condition
 - `pulse_exit(uint32 code): void`: Exits current processing without failing
 - `db_store_i64(uint64 scope, name table, name payer, uint64 id, const void * data, uint32 len): int32`: Store a record in a primary 64-bit integer index table
