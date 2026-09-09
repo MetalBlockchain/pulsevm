@@ -285,6 +285,15 @@ billable_size(row) = struct_overhead
 - **Verification is at commit.** RAM sufficiency is checked once at the end of the transaction against the accumulated pending delta, not incrementally per object. A transaction may transiently exceed its quota provided the net position at commit is within limits.
 - **Rollback releases nothing.** On transaction failure the entire state change is reverted, including RAM deltas. RAM is never "consumed" by a failed transaction — but CPU and NET are, which is what prevents free spam.
 
+CPU and NET from a failed input transaction are retained in a node-local
+subjective-billing ledger keyed by the transaction's first authorizer. The
+ledger uses the configured account CPU/NET windows and the same decay as
+the consensus resource accumulators. Its current values are deducted from later
+locally measured transaction budgets. It is deliberately not written to chain
+state: a failed transaction has no block receipt, so validators could not
+reproduce such a write. Block validation and trusted replay therefore neither
+consult nor update subjective billing.
+
 ### 5.3 No rate limiting
 
 Unlike CPU and NET, RAM has no time-based replenishment and no elastic virtual limit. An account either has sufficient unallocated RAM or it does not. There is consequently no greylist interaction and no block-level RAM budget.
@@ -397,4 +406,4 @@ ram       = delta from any state mutation, billed normally
    cost-function [protocol feature](./protocol-features.md) activates? The
    schedule and gate mechanism is now defined; cache lifecycle remains open.
 6. Are deferred transactions supported? If not, the `TRANSACTION_ID_NET_USAGE` surcharge and the delayed-transaction NET path can be removed entirely.
-7. Is there a subjective CPU/NET billing path for failed transactions, and how does it interact with deterministic op counting? (Partly answered: the wall-clock `checktime` deadline in §3.6 is the subjective time guard, layered over the objective op count. Subjective *billing* of failed transactions is still open.)
+7. ~~Is there a subjective CPU/NET billing path for failed transactions?~~ Resolved: metering is recorded incrementally, and failed locally measured transactions retain their CPU/NET charge against the first authorizer in the node-local decaying ledger described in §5.2.
