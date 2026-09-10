@@ -542,7 +542,7 @@ impl WasmRuntime {
         db: Database,
         code_hash: &[u8; 32],
         cpu_limit: i64,
-    ) -> Result<u64, ChainError> {
+    ) -> Result<(), ChainError> {
         // Pause timer
         apply_context.pause_billing_timer()?;
 
@@ -857,6 +857,15 @@ impl WasmRuntime {
         let return_value = warm.env.as_ref(&warm.store).return_value.clone();
         let remaining_points: MeteringPoints = get_remaining_points(&mut warm.store, &instance);
 
+        // Capture metered work before interpreting the apply result. Contract
+        // assertions and traps must still pay for every point consumed on the
+        // way to the failure.
+        let cpu_used = match remaining_points {
+            MeteringPoints::Remaining(points) => cpu_limit.saturating_sub(points),
+            MeteringPoints::Exhausted => cpu_limit,
+        };
+        apply_context.add_cpu_usage(cpu_used)?;
+
         // Return the warm store to the pool for reuse, unless it has spun up
         // enough instances that its object slab is worth reclaiming. A trapped
         // apply leaves nothing behind on the store itself, so a used-up bundle
@@ -867,7 +876,7 @@ impl WasmRuntime {
         }
 
         match remaining_points {
-            MeteringPoints::Remaining(points) => {
+            MeteringPoints::Remaining(_) => {
                 if let Err(e) = result {
                     if e.downcast_ref::<WasmExit>().is_none() {
                         if let Some(chain_err) = e.downcast_ref::<ChainError>() {
@@ -881,7 +890,7 @@ impl WasmRuntime {
                     apply_context.set_trace_return_value(value.0)?;
                 }
 
-                Ok(cpu_limit.saturating_sub(points) as u64)
+                Ok(())
             }
             MeteringPoints::Exhausted => Err(ChainError::ApplyError(format!(
                 "CPU limit of {} exhausted during apply",

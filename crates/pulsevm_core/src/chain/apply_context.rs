@@ -140,9 +140,7 @@ impl ApplyContext {
         })
     }
 
-    pub fn exec(&mut self, trx_context: &mut TransactionContext) -> Result<u64, ChainError> {
-        let mut cpu_used = 0;
-
+    pub fn exec(&mut self, trx_context: &mut TransactionContext) -> Result<(), ChainError> {
         {
             let mut inner = self.inner.write()?;
             inner
@@ -150,7 +148,7 @@ impl ApplyContext {
                 .push_back((self.receiver.clone(), self.action_ordinal));
         }
 
-        cpu_used += self.exec_one()?;
+        self.exec_one()?;
 
         let notified_pairs: Vec<(Name, u32)> = {
             let inner = self.inner.read()?;
@@ -160,7 +158,7 @@ impl ApplyContext {
         for (receiver, action_ordinal) in notified_pairs {
             self.receiver = receiver;
             self.action_ordinal = action_ordinal;
-            cpu_used += self.exec_one()?;
+            self.exec_one()?;
         }
 
         let (recurse_depth, inline_actions, context_free_inline_actions) = {
@@ -191,12 +189,14 @@ impl ApplyContext {
             trx_context.execute_action(*action_ordinal, recurse_depth + 1)?;
         }
 
-        Ok(cpu_used)
+        Ok(())
     }
 
-    pub fn exec_one(&mut self) -> Result<u64, ChainError> {
+    pub fn exec_one(&mut self) -> Result<(), ChainError> {
         let privileged = self.db.is_account_privileged(self.receiver.as_u64())?;
-        let mut cpu_used = 100; // Base usage is always 100 instructions
+        // Charge as work is performed so a later assertion/trap cannot erase
+        // the resources consumed before the failure.
+        self.trx_context.add_cpu_usage(100)?;
         let action = {
             let mut inner = self.inner.write()?;
             inner.privileged = privileged;
@@ -225,7 +225,7 @@ impl ApplyContext {
                 inner.cpu_limit
             };
 
-            cpu_used += self.wasm_runtime.run(
+            self.wasm_runtime.run(
                 self.receiver.clone(),
                 action.clone(),
                 self.clone(),
@@ -262,7 +262,7 @@ impl ApplyContext {
             .add_executed_action_receipt_digest(receipt.digest()?)?;
         self.finalize_trace(receipt)?;
 
-        Ok(cpu_used)
+        Ok(())
     }
 
     pub fn finalize_trace(&self, receipt: ActionReceipt) -> Result<(), ChainError> {
@@ -2415,6 +2415,10 @@ impl ApplyContext {
     pub fn resume_billing_timer(&self) -> Result<(), ChainError> {
         self.trx_context.resume_billing_timer()?;
         Ok(())
+    }
+
+    pub fn add_cpu_usage(&self, cpu_usage: u64) -> Result<(), ChainError> {
+        self.trx_context.add_cpu_usage(cpu_usage)
     }
 
     pub fn checktime(&self) -> Result<(), ChainError> {

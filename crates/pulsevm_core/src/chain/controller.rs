@@ -70,6 +70,10 @@ use crate::{
             StateHistoryLogCheckpoint,
         },
         state_sync,
+        subjective_billing::{
+            SubjectiveBill,
+            SubjectiveBilling,
+        },
         transaction::{
             PackedTransaction,
             SignedTransaction,
@@ -252,6 +256,10 @@ pub struct Controller {
     // Count of `execute_block` invocations, for measuring how much re-execution
     // the pending-chain reuse actually avoids. Not consensus state.
     blocks_executed: u64,
+
+    // Local-only CPU/NET retained for transactions whose consensus state was
+    // rolled back after an execution failure.
+    subjective_billing: SubjectiveBilling,
 }
 
 /// Read-only state required for mempool admission. See
@@ -544,6 +552,7 @@ impl Controller {
 
             pending_chain: Vec::new(),
             blocks_executed: 0,
+            subjective_billing: SubjectiveBilling::default(),
         }
     }
 
@@ -634,6 +643,7 @@ impl Controller {
         upgrade_bytes: &[u8],
         db_path: &str,
     ) -> Result<(), ChainError> {
+        self.subjective_billing.clear();
         info!("initializing controller with DB path: {}", db_path);
         self.protocol_upgrade_schedule = ProtocolUpgradeSchedule::from_upgrade_bytes(upgrade_bytes)
             .map_err(|e| {
@@ -2085,6 +2095,29 @@ impl Controller {
             )?;
         }
 
+        let trx = packed_transaction.get_transaction();
+        let (subjective_bill, cpu_window, net_window) = if resource_mode
+            == TransactionResourceMode::Measure
+            && *block_status != BlockStatus::Benchmarking
+        {
+            let cpu_window = self.db.get_account_cpu_usage_average_window()?;
+            let net_window = self.db.get_account_net_usage_average_window()?;
+            let bill = trx
+                .first_authorizer()
+                .map(|account| {
+                    self.subjective_billing.get_bill(
+                        account,
+                        pending_block_timestamp.slot(),
+                        cpu_window,
+                        net_window,
+                    )
+                })
+                .unwrap_or_default();
+            (bill, cpu_window, net_window)
+        } else {
+            (SubjectiveBill::default(), 1, 1)
+        };
+
         let mut trx_context = TransactionContext::new(
             self.db.clone(),
             self.wasm_runtime.clone(),
@@ -2095,6 +2128,7 @@ impl Controller {
             packed_transaction.clone(),
             self.max_transaction_time_ms(),
         );
+        trx_context.set_subjective_bill(subjective_bill.cpu, subjective_bill.net);
         self.set_context_active_schedule(&trx_context)?;
 
         match resource_mode {
@@ -2110,14 +2144,40 @@ impl Controller {
             }
         }
 
-        let trx = packed_transaction.get_transaction();
         trx_context.init_for_input_trx(
             packed_transaction.get_unprunable_size()?,
             packed_transaction.get_prunable_size()?,
             &trx,
         )?;
-        trx_context.exec(&trx)?;
-        let result = trx_context.finalize()?;
+        if let Err(error) = trx_context.exec(&trx) {
+            if resource_mode == TransactionResourceMode::Measure
+                && *block_status != BlockStatus::Benchmarking
+            {
+                self.record_subjective_failure(
+                    &trx_context,
+                    pending_block_timestamp,
+                    cpu_window,
+                    net_window,
+                )?;
+            }
+            return Err(error);
+        }
+        let result = match trx_context.finalize() {
+            Ok(result) => result,
+            Err(error) => {
+                if resource_mode == TransactionResourceMode::Measure
+                    && *block_status != BlockStatus::Benchmarking
+                {
+                    self.record_subjective_failure(
+                        &trx_context,
+                        pending_block_timestamp,
+                        cpu_window,
+                        net_window,
+                    )?;
+                }
+                return Err(error);
+            }
+        };
 
         if let TransactionResourceMode::ValidateReceipt { cpu_us, net_words } = resource_mode {
             let measured_cpu_us = result.trace.receipt.cpu_usage_us;
@@ -2135,6 +2195,25 @@ impl Controller {
         }
 
         Ok(result)
+    }
+
+    fn record_subjective_failure(
+        &mut self,
+        trx_context: &TransactionContext,
+        pending_block_timestamp: &BlockTimestamp,
+        cpu_window: u32,
+        net_window: u32,
+    ) -> Result<(), ChainError> {
+        let bill = trx_context.failure_bill()?;
+        self.subjective_billing.bill_failure(
+            bill.account.as_u64(),
+            bill.cpu_usage,
+            bill.net_usage,
+            pending_block_timestamp.slot(),
+            cpu_window,
+            net_window,
+        );
+        Ok(())
     }
 
     pub fn last_accepted_block(&self) -> &SignedBlock {
@@ -7290,6 +7369,101 @@ mod tests {
             ),
             1,
             "__fixunstfdi(1.0) must return 1"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_transaction_subjectively_bills_first_authorizer() -> Result<(), ChainError> {
+        let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
+        let alice = Name::from_str("alice")?;
+
+        let mut mempool = Mempool::new();
+        mempool.add_transaction(create_account(&private_key, alice, chain_id)?);
+        let account_block = controller.build_block(&mut mempool).await?;
+        controller.accept_block(&account_block.id()?, &mut mempool)?;
+
+        let usage_before = controller
+            .database()
+            .arena_account_cpu_usage_value_ex(alice.as_u64())
+            .unwrap();
+        let parent_slot = controller.last_accepted_block().timestamp().slot();
+
+        // Execute enough cheap actions to exceed the minimum CPU floor, then
+        // make the native newaccount handler fail while decoding an empty
+        // payload. This proves already-consumed work survives the failure; the
+        // final receiver is pulse, but Alice is the first authorizer and must
+        // own the local charge.
+        let authorization = vec![PermissionLevel::new(alice.as_u64(), ACTIVE_NAME.as_u64())];
+        let mut actions = vec![
+            Action::new(
+                alice,
+                Name::from_str("noop")?,
+                vec![],
+                authorization.clone(),
+            );
+            1_001
+        ];
+        actions.push(Action::new(
+            PULSE_NAME,
+            NEWACCOUNT_NAME,
+            vec![],
+            authorization,
+        ));
+        let failed = Transaction::new(
+            TransactionHeader::new(TimePointSec::maximum(), 0, 0, 0u32.into(), 0, 0u32.into()),
+            vec![],
+            actions,
+        )
+        .sign(&private_key, &chain_id)?;
+        mempool.add_transaction(PackedTransaction::from_signed_transaction(failed)?);
+        assert!(
+            controller.build_block(&mut mempool).await.is_err(),
+            "a block containing only a failed transaction must remain empty"
+        );
+
+        // Consensus state still rolls back completely.
+        assert_eq!(
+            controller
+                .database()
+                .arena_account_cpu_usage_value_ex(alice.as_u64()),
+            Some(usage_before)
+        );
+
+        let now: BlockTimestamp = TimePoint::now().into();
+        let query_slot = now.slot().max(parent_slot.saturating_add(1));
+        let cpu_window = controller
+            .database()
+            .get_account_cpu_usage_average_window()?;
+        let net_window = controller
+            .database()
+            .get_account_net_usage_average_window()?;
+        let alice_bill = controller.subjective_billing.get_bill(
+            alice.as_u64(),
+            query_slot,
+            cpu_window,
+            net_window,
+        );
+        let pulse_bill = controller.subjective_billing.get_bill(
+            PULSE_NAME.as_u64(),
+            query_slot,
+            cpu_window,
+            net_window,
+        );
+
+        let min_cpu = controller
+            .database()
+            .chain_config()?
+            .min_transaction_cpu_usage as u64;
+        assert!(
+            alice_bill.cpu > min_cpu,
+            "failed work must retain actual CPU consumed above the billing floor"
+        );
+        assert!(alice_bill.net > 0, "failed input must retain a NET bill");
+        assert_eq!(
+            pulse_bill,
+            SubjectiveBill::default(),
+            "the receiver must not be charged instead of the first authorizer"
         );
         Ok(())
     }
