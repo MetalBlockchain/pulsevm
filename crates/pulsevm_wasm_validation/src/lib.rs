@@ -128,12 +128,6 @@ pub enum ValidationError {
     #[error("Smart contract has more than {limit} section elements")]
     TooManySectionElements { limit: u32 },
 
-    #[error(
-        "Smart contract data segment exceeds maximum size of {} bytes",
-        constraints::MAXIMUM_FUNC_LOCAL_BYTES
-    )]
-    DataSegmentTooLarge,
-
     #[error("Smart contract must not declare a start section")]
     StartSectionNotAllowed,
 }
@@ -785,10 +779,6 @@ fn validate_wasm_impl(
                 validate_section_count(reader.count(), maximum_section_elements)?;
                 for segment in reader {
                     let segment = segment?;
-
-                    if segment.data.len() >= constraints::MAXIMUM_FUNC_LOCAL_BYTES as usize {
-                        return Err(ValidationError::DataSegmentTooLarge);
-                    }
 
                     if let wasmparser::DataKind::Active {
                         memory_index: _,
@@ -1751,13 +1741,12 @@ mod tests {
     }
 
     #[test]
-    fn test_big_deserialization_data_segment_exceeds_limit() {
-        // Data segment: offset=20, length=maximum_func_local_bytes (8192)
-        // Total end = 20 + 8192 = 8212, still within 64KiB.
-        // The C++ old_wasm_parser rejects this via a serialization-level size
-        // check on data segment byte length, not the range check. This constraint
-        // is not implemented in the Rust validator.
-        let data_len = constraints::MAXIMUM_FUNC_LOCAL_BYTES as usize;
+    fn test_data_segment_can_exceed_function_local_limit() {
+        // XPR nodeos and Leap constrain a data segment by its initialized-memory
+        // end offset, not by max_func_local_bytes. The latter applies only to a
+        // function's parameters and locals. Mainnet block 356,657,238 deploys a
+        // contract with a segment larger than 8 KiB that remains within 64 KiB.
+        let data_len = constraints::MAXIMUM_FUNC_LOCAL_BYTES as usize + 1;
         let data_str = "a".repeat(data_len);
 
         let wat = format!(
@@ -1770,6 +1759,6 @@ mod tests {
         );
 
         let wasm = wat::parse_str(&wat).unwrap();
-        assert!(validate_wasm(&wasm).is_err());
+        assert!(validate_wasm(&wasm).is_ok());
     }
 }
