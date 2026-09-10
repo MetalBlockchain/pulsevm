@@ -351,6 +351,12 @@ impl MempoolAdmissionState {
             ));
         }
 
+        // Cheap DB reads before the expensive signature recovery: a payer that
+        // cannot afford the transaction is refused here instead of occupying a
+        // mempool slot and a block builder's time before failing the same
+        // objective checks at execution.
+        Self::check_payer_resource_window(&self.db, packed_transaction, transaction)?;
+
         if self
             .db
             .is_known_unexpired_transaction(&packed_transaction.id().0.0)?
@@ -366,6 +372,67 @@ impl MempoolAdmissionState {
             seconds(transaction.header.delay_sec.into()),
             &BTreeSet::new(),
         )
+    }
+}
+
+impl MempoolAdmissionState {
+    /// Node-local, non-consensus pre-check of the objective resource limits the
+    /// transaction will face at execution: the first authorizer must be able to
+    /// pay at least `min_transaction_cpu_usage` of CPU and the transaction's own
+    /// NET. Execution enforces exactly these bounds (`TransactionContext::init` /
+    /// `finalize`), so this refuses only what could never be included — but it
+    /// refuses it at admission, where a failing transaction would otherwise cost
+    /// the sender nothing and the block builder its work. Unlimited accounts
+    /// (limit `-1`) and greylisting are handled as at execution.
+    fn check_payer_resource_window(
+        db: &Database,
+        packed_transaction: &PackedTransaction,
+        transaction: &Transaction,
+    ) -> Result<(), ChainError> {
+        let Some(payer) = transaction.first_authorizer() else {
+            return Ok(());
+        };
+        let payer = Name::new(payer);
+        let chain_config = db.chain_config()?;
+
+        let (cpu_limit, _) = ResourceLimitsManager::get_account_cpu_limit(
+            db,
+            &payer,
+            Some(MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER),
+        )?;
+        let min_cpu = chain_config.min_transaction_cpu_usage as u64;
+        if cpu_limit >= 0 && (cpu_limit as u64) < min_cpu {
+            return Err(ChainError::TransactionError(format!(
+                "payer {} cannot afford the transaction: available CPU {} is below the {} minimum",
+                payer, cpu_limit, min_cpu
+            )));
+        }
+
+        // The same initial NET estimate `init_for_input_trx` bills.
+        let unprunable = packed_transaction.get_unprunable_size()?;
+        let mut prunable = packed_transaction.get_prunable_size()?;
+        if chain_config.context_free_discount_net_usage_den > 0
+            && chain_config.context_free_discount_net_usage_num
+                < chain_config.context_free_discount_net_usage_den
+        {
+            let num = chain_config.context_free_discount_net_usage_num as u64;
+            let den = chain_config.context_free_discount_net_usage_den as u64;
+            prunable = (prunable * num + den - 1) / den;
+        }
+        let net_usage = chain_config.base_per_transaction_net_usage as u64 + unprunable + prunable;
+        let net_usage = ((net_usage + 7) / 8) * 8;
+        let (net_limit, _) = ResourceLimitsManager::get_account_net_limit(
+            db,
+            &payer,
+            Some(MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER),
+        )?;
+        if net_limit >= 0 && (net_limit as u64) < net_usage {
+            return Err(ChainError::TransactionError(format!(
+                "payer {} cannot afford the transaction: available NET {} is below its {} bytes",
+                payer, net_limit, net_usage
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -7267,6 +7334,91 @@ mod tests {
             .is_known_unexpired_transaction(&result.trace.id.0.0)?;
         assert!(!found);
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mempool_admission_refuses_a_payer_that_cannot_afford_the_transaction()
+    -> Result<(), ChainError> {
+        let (mut controller, private_key, _chain_id, _temp) = init_test_controller()?;
+        let ts = controller.last_accepted_block().timestamp().clone();
+        let chain_id = controller.chain_id().clone();
+
+        // alice is created unlimited (-1) like every native newaccount; the
+        // transaction below is valid in every other respect and signed with her
+        // active key, so admission today accepts it regardless of her resources.
+        let alice = Name::from_str("alice")?;
+        controller.execute_transaction(
+            &create_account(&private_key, alice, chain_id)?,
+            &ts,
+            &BlockStatus::Building,
+        )?;
+        let trx = call_contract_as(
+            &private_key,
+            PULSE_NAME,
+            Name::from_str("nop")?,
+            &Vec::<u8>::new(),
+            alice,
+            chain_id,
+        )?;
+        controller
+            .validate_transaction_for_mempool(&trx, &ts)
+            .expect("an unlimited payer is admitted");
+
+        // Limits only bite once the chain has staked weight at all: like
+        // EOSIO, an account is unlimited while the total weight is zero. Give
+        // bob a stake so alice's own weight decides her window.
+        let bob = Name::from_str("bob")?;
+        controller.execute_transaction(
+            &create_account(&private_key, bob, chain_id)?,
+            &ts,
+            &BlockStatus::Building,
+        )?;
+        {
+            let mut db = controller.database();
+            db.set_account_limits(bob.as_u64(), 8 * 1024, 1_000_000, 1_000_000)?;
+            ResourceLimitsManager::process_account_limit_updates(&mut db)?;
+        }
+
+        // Zero CPU weight: execution would run to her (empty) budget and fail
+        // the objective limit; admission now refuses it up front, by name.
+        {
+            let mut db = controller.database();
+            db.set_account_limits(alice.as_u64(), 8 * 1024, 1_000_000, 0)?;
+            ResourceLimitsManager::process_account_limit_updates(&mut db)?;
+        }
+        let error = controller
+            .validate_transaction_for_mempool(&trx, &ts)
+            .expect_err("a payer with no CPU must be refused at admission");
+        assert!(
+            error.to_string().contains("payer alice cannot afford")
+                && error.to_string().contains("CPU"),
+            "unexpected error: {error}"
+        );
+
+        // Zero NET weight, plenty of CPU: refused for NET.
+        {
+            let mut db = controller.database();
+            db.set_account_limits(alice.as_u64(), 8 * 1024, 0, 1_000_000)?;
+            ResourceLimitsManager::process_account_limit_updates(&mut db)?;
+        }
+        let error = controller
+            .validate_transaction_for_mempool(&trx, &ts)
+            .expect_err("a payer with no NET must be refused at admission");
+        assert!(
+            error.to_string().contains("NET"),
+            "unexpected error: {error}"
+        );
+
+        // Funded again: admitted again.
+        {
+            let mut db = controller.database();
+            db.set_account_limits(alice.as_u64(), 8 * 1024, 1_000_000, 1_000_000)?;
+            ResourceLimitsManager::process_account_limit_updates(&mut db)?;
+        }
+        controller
+            .validate_transaction_for_mempool(&trx, &ts)
+            .expect("a funded payer is admitted");
         Ok(())
     }
 }

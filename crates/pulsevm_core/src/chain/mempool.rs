@@ -17,12 +17,15 @@ use crate::chain::{
 #[derive(Debug, Clone)]
 pub enum MempoolError {
     InternalError(String),
+    /// The pool holds `MAX_MEMPOOL_SIZE` transactions (live plus detached).
+    Full,
 }
 
 impl std::fmt::Display for MempoolError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             MempoolError::InternalError(msg) => write!(f, "internal error: {}", msg),
+            MempoolError::Full => write!(f, "mempool is full ({} transactions)", MAX_MEMPOOL_SIZE),
         }
     }
 }
@@ -73,8 +76,22 @@ impl Mempool {
         }
     }
 
+    /// Admit a transaction, reporting a full pool as `false` like a duplicate.
+    /// Callers that must tell the sender *why* the transaction was refused use
+    /// [`Mempool::try_add_transaction`].
     pub fn add_transaction(&mut self, transaction: PackedTransaction) -> bool {
         self.add_transaction_at(transaction, TimePointSec::now())
+    }
+
+    /// Admit a transaction. `Ok(true)` if it was newly added, `Ok(false)` if it
+    /// was already present (live or detached), `Err` if the pool refused it —
+    /// in which case the transaction was not added and the caller should
+    /// surface the refusal instead of treating it as accepted.
+    pub fn try_add_transaction(
+        &mut self,
+        transaction: PackedTransaction,
+    ) -> Result<bool, MempoolError> {
+        self.try_add_transaction_at(transaction, TimePointSec::now())
     }
 
     fn add_transaction_at(
@@ -82,14 +99,27 @@ impl Mempool {
         transaction: PackedTransaction,
         received_at: TimePointSec,
     ) -> bool {
-        if self.transactions_list.len() + self.reserved_ids.len() >= MAX_MEMPOOL_SIZE {
-            return false; // mempool is full
-        }
+        self.try_add_transaction_at(transaction, received_at)
+            .unwrap_or(false)
+    }
+
+    fn try_add_transaction_at(
+        &mut self,
+        transaction: PackedTransaction,
+        received_at: TimePointSec,
+    ) -> Result<bool, MempoolError> {
+        // A transaction we already hold is "already present" whether or not
+        // the pool is full: re-gossip of an in-flight transaction must never
+        // surface as a refusal to the sender.
         if self.reserved_ids.contains(transaction.id())
-            || !self.transactions_map.insert(transaction.id().clone())
+            || self.transactions_map.contains(transaction.id())
         {
-            return false; // already present
+            return Ok(false);
         }
+        if self.transactions_list.len() + self.reserved_ids.len() >= MAX_MEMPOOL_SIZE {
+            return Err(MempoolError::Full);
+        }
+        self.transactions_map.insert(transaction.id().clone());
         let signed_expiration = transaction
             .get_transaction()
             .header
@@ -104,7 +134,7 @@ impl Mempool {
             .insert(transaction.id().clone(), expiration);
         self.transactions_list.push_back(transaction);
         self.record_expiration(expiration);
-        true
+        Ok(true)
     }
 
     pub fn pop_transaction(&mut self) -> Option<PackedTransaction> {
@@ -446,5 +476,19 @@ mod tests {
         }
         // A new, distinct transaction is refused once the mempool is full.
         assert!(!mempool.add_transaction(tx(MAX_MEMPOOL_SIZE as u16)));
+    }
+
+    #[test]
+    fn try_add_transaction_reports_a_full_pool_as_an_error() {
+        let mut mempool = Mempool::new();
+        for i in 0..MAX_MEMPOOL_SIZE {
+            assert!(mempool.try_add_transaction(tx(i as u16)).unwrap());
+        }
+        assert!(matches!(
+            mempool.try_add_transaction(tx(MAX_MEMPOOL_SIZE as u16)),
+            Err(MempoolError::Full)
+        ));
+        // A duplicate is still "already present", not a refusal.
+        assert_eq!(mempool.try_add_transaction(tx(0)).unwrap(), false);
     }
 }
