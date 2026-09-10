@@ -263,6 +263,10 @@ pub struct WasmContext {
     return_value: Option<Bytes>,
 }
 
+#[cfg(test)]
+#[path = "webassembly/tests/mod.rs"]
+mod host_function_tests;
+
 impl WasmContext {
     pub fn new(
         receiver: Name,
