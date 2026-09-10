@@ -11,6 +11,15 @@ pub const FIXED_NET_OVERHEAD_OF_PACKED_TRX: u32 = 16;
 // governance does not start rejecting otherwise valid transactions at decompression time.
 pub const MAX_UNCOMPRESSED_PACKED_TRX_SIZE: usize = 8 * 1024 * 1024;
 
+/// Objective ceiling on the number of signatures carried by one transaction.
+///
+/// Signature recovery happens before execution and resource billing. Without a
+/// count bound, an unauthenticated peer can make every receiving node perform
+/// thousands of secp256k1 recoveries for a transaction that is then rejected and
+/// can be replayed indefinitely. The limit remains comfortably above the
+/// largest expected producer multisig while bounding pre-billing CPU work.
+pub const MAX_TRANSACTION_SIGNATURES: usize = 256;
+
 pub const RATE_LIMITING_PRECISION: u64 = 1000 * 1000;
 
 pub const BLOCK_INTERVAL_MS: u32 = 500;
