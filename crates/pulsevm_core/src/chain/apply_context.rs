@@ -346,6 +346,11 @@ impl ApplyContext {
         let mut cpu_used = 100; // Base usage is always 100 instructions
         let action = {
             let mut inner = self.inner.write()?;
+            // A return value belongs to one receiver execution, not to the
+            // action shared by all of its notifications. Leap starts every
+            // receiver with an empty return value; otherwise one notification
+            // incorrectly changes the receipt digest of the next receiver.
+            inner.action_return_value = None;
             inner.start = Utc::now().timestamp_micros();
             inner.action.clone()
         };

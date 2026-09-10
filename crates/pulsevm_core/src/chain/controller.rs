@@ -5412,6 +5412,91 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn notification_return_value_is_scoped_to_its_receiver() -> Result<(), ChainError> {
+        let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
+        let feature = crate::chain::transaction::ACTION_RETURN_VALUE_FEATURE_DIGEST;
+        controller.db.preactivate_protocol_feature(feature)?;
+        controller.db.activate_protocol_features(&[feature], 1)?;
+
+        let first = Name::from_str("returnfirst")?;
+        let returning = Name::from_str("returnnotify")?;
+        let following = Name::from_str("returnafter")?;
+        let timestamp = *controller.last_accepted_block().timestamp();
+        let status = BlockStatus::Building;
+        for account in [first, returning, following] {
+            controller.execute_transaction(
+                &create_account(&private_key, account, chain_id)?,
+                &timestamp,
+                &status,
+            )?;
+        }
+
+        let notifier = wat::parse_str(format!(
+            r#"(module
+                (import "env" "require_recipient" (func $notify (param i64)))
+                (memory (export "memory") 1)
+                (func (export "apply") (param i64 i64 i64)
+                    (call $notify (i64.const {}))
+                    (call $notify (i64.const {}))))"#,
+            returning.as_u64() as i64,
+            following.as_u64() as i64,
+        ))
+        .expect("valid notifier wasm");
+        let returner = wat::parse_str(
+            r#"(module
+                (import "env" "set_action_return_value" (func $return (param i32 i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 8) "result")
+                (func (export "apply") (param i64 i64 i64)
+                    (call $return (i32.const 8) (i32.const 6))))"#,
+        )
+        .expect("valid returning notification wasm");
+        let noop = wat::parse_str(
+            r#"(module
+                (memory (export "memory") 1)
+                (func (export "apply") (param i64 i64 i64)))"#,
+        )
+        .expect("valid no-op notification wasm");
+        for (account, code) in [(first, notifier), (returning, returner), (following, noop)] {
+            controller.execute_transaction(
+                &set_code(&private_key, account, code, chain_id)?,
+                &timestamp,
+                &status,
+            )?;
+        }
+
+        let transaction = call_contract(
+            &private_key,
+            first,
+            Name::from_str("notify")?,
+            &Vec::<u8>::new(),
+            chain_id,
+        )?;
+        let action = transaction.get_transaction().actions[0].clone();
+        let result = controller.execute_transaction(&transaction, &timestamp, &status)?;
+        let traces = result.trace.action_traces();
+        assert_eq!(traces.len(), 3);
+        assert_eq!(traces[0].receiver(), &first);
+        assert_eq!(traces[1].receiver(), &returning);
+        assert_eq!(traces[2].receiver(), &following);
+        assert_eq!(traces[1].return_value, b"result");
+        assert!(traces[2].return_value.is_empty());
+        assert_eq!(
+            traces[0].receipt.as_ref().unwrap().act_digest,
+            generate_action_digest(&action, Some(b"")),
+        );
+        assert_eq!(
+            traces[1].receipt.as_ref().unwrap().act_digest,
+            generate_action_digest(&action, Some(b"result")),
+        );
+        assert_eq!(
+            traces[2].receipt.as_ref().unwrap().act_digest,
+            generate_action_digest(&action, Some(b"")),
+        );
+        Ok(())
+    }
+
     fn call_contract<T: Write>(
         private_key: &PrivateKey,
         account: Name,
