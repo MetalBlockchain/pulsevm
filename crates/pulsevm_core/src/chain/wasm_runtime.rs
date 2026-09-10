@@ -940,6 +940,24 @@ fn charge_metering_globals(
     }
 }
 
+fn execution_meter_budget(cpu_limit: i64, accepted_block_replay: bool) -> u64 {
+    if cpu_limit >= 0 {
+        cpu_limit as u64
+    } else if accepted_block_replay {
+        crate::config::ACCEPTED_BLOCK_REPLAY_CPU_BUDGET
+    } else {
+        crate::config::IMPLICIT_TX_CPU_BUDGET
+    }
+}
+
+fn metered_cpu_to_bill(accepted_block_replay: bool, budget: u64, remaining: u64) -> u64 {
+    if accepted_block_replay {
+        0
+    } else {
+        budget.saturating_sub(remaining)
+    }
+}
+
 // Reset work runs outside deterministic WASM metering, just like fresh instance
 // construction. Bound it so a contract with a very large memory cannot turn the
 // optimization into unmetered copying; larger instances use the fresh path.
@@ -1877,14 +1895,13 @@ impl WasmRuntime {
             .transpose()?;
 
         // cpu_limit == -1 means execution is exempt from the local objective
-        // account/block allowance (implicit actions and explicitly billed block
-        // replay). Seed a large finite deterministic budget so malformed code
-        // still cannot spin forever. See config::IMPLICIT_TX_CPU_BUDGET.
-        let cpu_limit = if cpu_limit >= 0 {
-            cpu_limit as u64
-        } else {
-            crate::config::IMPLICIT_TX_CPU_BUDGET
-        };
+        // account/block allowance. Accepted-block replay needs a wider guard
+        // than implicit system actions because XPR receipts store wall-clock
+        // microseconds while this runtime meters conservative local points.
+        let accepted_block_replay = cpu_limit < 0
+            && apply_context.is_explicitly_billed()?
+            && !apply_context.is_implicit()?;
+        let cpu_limit = execution_meter_budget(cpu_limit, accepted_block_replay);
 
         // Seed through cached handles. Wasmer's public helper performs two
         // string-indexed export lookups per call, which is especially costly for
@@ -1970,7 +1987,15 @@ impl WasmRuntime {
                     apply_context.set_trace_return_value(value.0)?;
                 }
 
-                Ok(cpu_limit.saturating_sub(points) as u64)
+                // Accepted-block replay reconstructs the canonical receipt from
+                // the producer-recorded CPU value. Do not accumulate this
+                // runtime's differently denominated local points into the u32
+                // receipt field before finalize overwrites it.
+                Ok(metered_cpu_to_bill(
+                    accepted_block_replay,
+                    cpu_limit,
+                    points,
+                ))
             }
             MeteringPoints::Exhausted => Err(ChainError::ApplyError(format!(
                 "CPU limit of {} exhausted during apply",
@@ -2004,9 +2029,11 @@ mod tests {
         WasmRuntime,
         charge_metering_points,
         defer_start_function,
+        execution_meter_budget,
         exported_memory,
         expose_internal_memory,
         expose_reset_state,
+        metered_cpu_to_bill,
         module_is_resettable,
     };
 
@@ -2267,6 +2294,23 @@ mod tests {
             let module = Module::new(&store, runtime_wasm.as_ref()).unwrap();
             assert!(!module_is_resettable(&module));
         }
+    }
+
+    #[test]
+    fn accepted_block_replay_uses_wide_guard_without_local_cpu_billing() {
+        let replay_budget = execution_meter_budget(-1, true);
+        assert_eq!(
+            replay_budget,
+            crate::config::ACCEPTED_BLOCK_REPLAY_CPU_BUDGET
+        );
+        assert_eq!(metered_cpu_to_bill(true, replay_budget, 1), 0);
+
+        assert_eq!(
+            execution_meter_budget(-1, false),
+            crate::config::IMPLICIT_TX_CPU_BUDGET
+        );
+        assert_eq!(execution_meter_budget(123, false), 123);
+        assert_eq!(metered_cpu_to_bill(false, 123, 23), 100);
     }
 
     // A host intrinsic bills its own work out of the same metering budget the
