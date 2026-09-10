@@ -18,6 +18,7 @@ authoritative and the document is a bug.
 | [resource-model.md](./resource-model.md) | CPU, NET, and RAM accounting; WASM metering cost function; input vs implicit transaction billing | Draft |
 | [intrinsic-cost-model.md](./intrinsic-cost-model.md) | Host-intrinsic CPU pricing, estimator methodology, and calibration | Working reference |
 | [wasm-determinism.md](./wasm-determinism.md) | WASM feature pinning, floating-point behavior, database key ordering, and replay validation | Working reference |
+| [code-coverage.md](./code-coverage.md) | Coverage CI, Codecov checks and setup, report scope, and local reports | Current workflow |
 
 ---
 
