@@ -769,10 +769,6 @@ async fn main() -> Result<()> {
         controller.database().enable_xpr_native_replay();
         eprintln!("XPR native replay accelerators enabled");
     }
-    if env::var("XPR_REPLAY_DEFER_NATIVE_WRITES").as_deref() == Ok("1") {
-        controller.database().enable_xpr_deferred_native_writes();
-        eprintln!("XPR native writes deferred to fallback/checkpoint boundaries");
-    }
     let local_tip = controller.last_accepted_block();
     verify_replay_checkpoint_semantics(&arena_dir, local_tip.block_num(), initialized_fresh)?;
     if local_tip.block_num() == 1 && local_tip.id()?.to_string() != XPR_BLOCK_ONE_ID {

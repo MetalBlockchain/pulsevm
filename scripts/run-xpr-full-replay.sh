@@ -14,7 +14,6 @@ readonly CHECKPOINT_INTERVAL="${XPR_REPLAY_CHECKPOINT_INTERVAL:-1000000}"
 readonly SIGNATURE_THREADS="${XPR_REPLAY_SIGNATURE_THREADS:-8}"
 readonly NATIVE_REPLAY="${XPR_REPLAY_NATIVE_REPLAY:-1}"
 readonly BATCHED_REPLAY="${XPR_REPLAY_BATCHED_REPLAY:-0}"
-readonly DEFER_NATIVE_WRITES="${XPR_REPLAY_DEFER_NATIVE_WRITES:-0}"
 readonly LAST_BLOCK="${XPR_REPLAY_LAST_BLOCK:-}"
 readonly TRACE_RAM_ACCOUNT="${XPR_REPLAY_TRACE_RAM_ACCOUNT:-}"
 readonly TRUST_LEGACY_CHECKPOINT="${XPR_REPLAY_TRUST_LEGACY_CHECKPOINT:-0}"
@@ -65,10 +64,8 @@ start_replay() {
     fail "XPR_REPLAY_NATIVE_REPLAY must be 0 or 1"
   [[ "$BATCHED_REPLAY" == 0 || "$BATCHED_REPLAY" == 1 ]] || \
     fail "XPR_REPLAY_BATCHED_REPLAY must be 0 or 1"
-  [[ "$DEFER_NATIVE_WRITES" == 0 || "$DEFER_NATIVE_WRITES" == 1 ]] || \
-    fail "XPR_REPLAY_DEFER_NATIVE_WRITES must be 0 or 1"
-  if [[ "$NATIVE_REPLAY" == 0 && ("$BATCHED_REPLAY" == 1 || "$DEFER_NATIVE_WRITES" == 1) ]]; then
-    fail "batched replay and deferred native writes require XPR_REPLAY_NATIVE_REPLAY=1"
+  if [[ "$NATIVE_REPLAY" == 0 && "$BATCHED_REPLAY" == 1 ]]; then
+    fail "batched replay requires XPR_REPLAY_NATIVE_REPLAY=1"
   fi
   [[ "$TRUST_LEGACY_CHECKPOINT" == 0 || "$TRUST_LEGACY_CHECKPOINT" == 1 ]] || \
     fail "XPR_REPLAY_TRUST_LEGACY_CHECKPOINT must be 0 or 1"
@@ -104,9 +101,6 @@ start_replay() {
   fi
   if [[ "$BATCHED_REPLAY" == 1 ]]; then
     command+=("PULSEVM_XPR_BATCHED_REPLAY=1")
-  fi
-  if [[ "$DEFER_NATIVE_WRITES" == 1 ]]; then
-    command+=("XPR_REPLAY_DEFER_NATIVE_WRITES=1")
   fi
   if [[ -n "$TRACE_RAM_ACCOUNT" ]]; then
     command+=("XPR_REPLAY_TRACE_RAM_ACCOUNT=$TRACE_RAM_ACCOUNT")
@@ -177,8 +171,6 @@ Environment:
   XPR_REPLAY_NATIVE_REPLAY       Enable audited native XPR handlers: 0 or 1 (default: 1)
   XPR_REPLAY_BATCHED_REPLAY      Bypass general transaction graphs for pinned bot/oracle actions
                                   after parity validation: 0 or 1 (default: 0)
-  XPR_REPLAY_DEFER_NATIVE_WRITES Coalesce pinned native row writes across accepted blocks after
-                                  parity validation: 0 or 1 (default: 0)
   XPR_REPLAY_TRACE_RAM_ACCOUNT   Optional account whose RAM changes are logged by block
   XPR_REPLAY_TRUST_LEGACY_CHECKPOINT
                                   Trust and mark an independently validated unversioned checkpoint

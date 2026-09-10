@@ -3210,6 +3210,11 @@ impl Controller {
             // every preceding native row update and may invalidate the typed
             // layouts or code hashes. Flush and clear at this exact boundary.
             xpr_bot_oracle_cache.flush(&mut self.db, *timestamp)?;
+            // Materialize block-level native rows before the canonical
+            // transaction opens its nested undo session. If that transaction
+            // later fails, its undo must not roll back state produced by an
+            // earlier accepted transaction in the same block.
+            self.db.flush_xpr_native_rows()?;
             let (result, reproduced_receipt) = if let Some(deferred) = deferred {
                 let now = timestamp.to_time_point().time_since_epoch().count();
                 let disable_deferred_stage_1 = self

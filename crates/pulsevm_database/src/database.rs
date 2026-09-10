@@ -696,10 +696,6 @@ pub struct Database {
     /// Non-persisted capability used only by the offline XPR replay tool.
     /// Production VM construction leaves it false.
     xpr_native_replay: Arc<AtomicBool>,
-    /// Allow the offline importer to retain audited native contract writes
-    /// across accepted blocks, materializing them only before WASM fallback or
-    /// checkpoint persistence. This is never enabled by VM construction.
-    xpr_defer_native_writes: Arc<AtomicBool>,
     /// Contract rows rewritten repeatedly by audited native handlers are held
     /// in block-scoped overlays and applied once at commit. This is process-local
     /// replay machinery; ordinary VM execution never enables it.
@@ -862,7 +858,6 @@ impl Database {
             speculation_freeze: Arc::new(AtomicBool::new(false)),
             authority_cache: Arc::new(Mutex::new(HashMap::new())),
             xpr_native_replay: Arc::new(AtomicBool::new(false)),
-            xpr_defer_native_writes: Arc::new(AtomicBool::new(false)),
             xpr_native_rows: Arc::new(Mutex::new(XprNativeRowCache::default())),
             xpr_native_sequences: Arc::new(Mutex::new(XprNativeSequenceCache::default())),
         })
@@ -2666,29 +2661,10 @@ impl Database {
 
     pub fn commit(&mut self, revision: i64) -> Result<(), ChainError> {
         self.clear_xpr_native_inline_authorization();
-        if self.xpr_deferred_native_writes_enabled() {
-            let mut cache = self.xpr_native_rows.lock().unwrap();
-            let layers = std::mem::take(&mut cache.layers);
-            for layer in layers {
-                cache.dirty.extend(layer);
-            }
-            cache.base.clear();
-            let mut sequences = self.xpr_native_sequences.lock().unwrap();
-            let layers = std::mem::take(&mut sequences.layers);
-            for layer in layers {
-                if layer.global.is_some() {
-                    sequences.dirty_global = layer.global;
-                }
-                sequences.dirty_accounts.extend(layer.accounts);
-            }
-            sequences.base_global = None;
-            sequences.base_accounts.clear();
-        } else {
-            self.flush_xpr_native_rows()?;
-            self.flush_xpr_native_sequences()?;
-        }
+        self.flush_xpr_native_rows()?;
+        self.flush_xpr_native_sequences()?;
         self.backend.commit(revision);
-        if self.xpr_native_replay_enabled() && !self.xpr_deferred_native_writes_enabled() {
+        if self.xpr_native_replay_enabled() {
             let mut cache = self.xpr_native_rows.lock().unwrap();
             cache.layers.clear();
             cache.base.clear();
@@ -6234,6 +6210,32 @@ mod tests {
     }
 
     #[test]
+    fn materialized_parent_native_rows_survive_nested_undo() {
+        let database = Database::default();
+        database
+            .create_key_value_object_standalone(1, 1, 2, 7, 3, b"base")
+            .unwrap();
+        database.enable_xpr_native_replay();
+
+        database.arena_start_undo_session();
+        database
+            .xpr_native_update_key_value(1, 1, 2, 3, 7, b"parent")
+            .unwrap();
+        database.flush_xpr_native_rows().unwrap();
+
+        database.arena_start_undo_session();
+        database
+            .xpr_native_update_key_value(1, 1, 2, 3, 7, b"child")
+            .unwrap();
+        database.flush_xpr_native_rows().unwrap();
+        database.arena_undo();
+
+        assert_eq!(database.arena_kv_row(1, 1, 2, 3).unwrap().1, b"parent");
+        database.arena_undo();
+        assert_eq!(database.arena_kv_row(1, 1, 2, 3).unwrap().1, b"base");
+    }
+
+    #[test]
     fn native_xpr_inline_authorization_cache_is_block_scoped() {
         let mut database = Database::default();
         database.enable_xpr_native_replay();
@@ -6275,33 +6277,6 @@ mod tests {
             .unwrap();
         assert!(!database.xpr_read_only_wasm_cache_probe(code_hash, 30, 40, [50, 60]));
         database.xpr_cancel_read_only_wasm_capture();
-    }
-
-    #[test]
-    fn deferred_native_xpr_rows_span_commits_and_flush_at_checkpoint() {
-        let mut database = Database::default();
-        database
-            .create_key_value_object_standalone(1, 1, 2, 7, 3, b"base")
-            .unwrap();
-        database.enable_xpr_deferred_native_writes();
-
-        database.arena_start_undo_session();
-        database
-            .xpr_native_update_key_value(1, 1, 2, 3, 7, b"accepted")
-            .unwrap();
-        database.commit(1).unwrap();
-        assert_eq!(database.arena_kv_row(1, 1, 2, 3).unwrap().1, b"accepted");
-        assert_eq!(database.backend.kv_row(1, 1, 2, 3).unwrap().1, b"base");
-
-        database.arena_start_undo_session();
-        database
-            .xpr_native_update_key_value(1, 1, 2, 3, 7, b"discarded")
-            .unwrap();
-        database.arena_undo();
-        assert_eq!(database.arena_kv_row(1, 1, 2, 3).unwrap().1, b"accepted");
-
-        database.flush_xpr_native_rows().unwrap();
-        assert_eq!(database.backend.kv_row(1, 1, 2, 3).unwrap().1, b"accepted");
     }
 
     #[test]
@@ -6380,37 +6355,6 @@ mod tests {
             database.arena_kv_row(1, 1, 2, 3),
             Some((7, b"durable base".to_vec()))
         );
-    }
-
-    #[test]
-    fn deferred_native_action_sequences_are_ordered_undoable_and_batched() {
-        let mut database = Database::default();
-        database.create_account_metadata(1, false).unwrap();
-        database.create_account_metadata(2, false).unwrap();
-        database.enable_xpr_deferred_native_writes();
-
-        database.arena_start_undo_session();
-        assert_eq!(
-            database.next_action_sequences(1, &[1, 2, 1]).unwrap(),
-            (1, 1, vec![1, 1, 2])
-        );
-        database.commit(1).unwrap();
-        assert_eq!(database.backend.global_action_sequence(), None);
-        assert_eq!(database.backend.account_metadata(1).unwrap().1, 0);
-
-        database.arena_start_undo_session();
-        assert_eq!(
-            database.next_action_sequences(1, &[1]).unwrap(),
-            (2, 2, vec![3])
-        );
-        database.arena_undo();
-        database.flush_xpr_native_sequences().unwrap();
-
-        assert_eq!(database.backend.global_action_sequence(), Some(1));
-        let first = database.backend.account_metadata(1).unwrap();
-        let second = database.backend.account_metadata(2).unwrap();
-        assert_eq!((first.1, first.2), (1, 2));
-        assert_eq!((second.1, second.2), (0, 1));
     }
 
     #[test]
@@ -7088,23 +7032,10 @@ impl Database {
         self.xpr_native_replay.store(true, Ordering::Relaxed);
     }
 
-    /// Retain native replay contract-row writes between accepted blocks. The
-    /// importer flushes them before any deployed-WASM fallback and before every
-    /// durable checkpoint, so no observer can see a stale persisted state.
-    #[doc(hidden)]
-    pub fn enable_xpr_deferred_native_writes(&self) {
-        self.xpr_native_replay.store(true, Ordering::Relaxed);
-        self.xpr_defer_native_writes.store(true, Ordering::Relaxed);
-    }
-
     /// Whether the offline importer explicitly enabled native XPR handlers.
     #[doc(hidden)]
     pub fn xpr_native_replay_enabled(&self) -> bool {
         self.xpr_native_replay.load(Ordering::Relaxed)
-    }
-
-    fn xpr_deferred_native_writes_enabled(&self) -> bool {
-        self.xpr_defer_native_writes.load(Ordering::Relaxed)
     }
 
     /// Acquire a read view over the arena. The arena is `Arc`-backed with its own
@@ -7370,7 +7301,6 @@ impl Default for Database {
             speculation_freeze: Arc::new(AtomicBool::new(false)),
             authority_cache: Arc::new(Mutex::new(HashMap::new())),
             xpr_native_replay: Arc::new(AtomicBool::new(false)),
-            xpr_defer_native_writes: Arc::new(AtomicBool::new(false)),
             xpr_native_rows: Arc::new(Mutex::new(XprNativeRowCache::default())),
             xpr_native_sequences: Arc::new(Mutex::new(XprNativeSequenceCache::default())),
         }
