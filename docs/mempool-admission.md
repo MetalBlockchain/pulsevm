@@ -65,9 +65,9 @@ For a new packed transaction, `RpcService::admit_transaction` performs:
    occupying a pool slot and a block builder's time. Unlimited accounts (`-1`)
    pass, as at execution.
 4. Take the mempool write lock, prune if necessary, and atomically perform the
-   final ID/capacity/per-payer check and insertion. A full pool or a saturated
-   payer is an **error** to the sender (`mempool refused transaction: …`), not a
-   silent "accepted": `issueTx` never answers with a tx id it will not build.
+   final ID/capacity check and insertion. A full pool is an **error** to the
+   sender (`mempool refused transaction: …`), not a silent "accepted": `issueTx`
+   never answers with a tx id it will not build.
 
 The final insertion is intentionally the deduplication point. Several identical
 requests may complete preflight concurrently, but at most one becomes a pool
@@ -145,15 +145,6 @@ expiration. Expiry is checked on admission, by the block timer, and while
 building a block. It is local policy and does not alter a transaction's signed
 expiration or consensus validity.
 
-Capacity is bounded twice. The pool holds at most `MAX_MEMPOOL_SIZE` entries
-(live plus detached), and one first authorizer may hold at most
-`MAX_MEMPOOL_TRANSACTIONS_PER_PAYER` of them (live plus detached — a payer cannot
-double its allowance while the block builder holds a batch; `finish_batch`
-releases whatever the batch consumed). Both bounds are local and non-consensus.
-Without the per-payer bound, admission — which never executes actions — let a
-single account with no resources fill the whole pool for free and lock honest
-users out until its entries expired.
-
 ## 7. Observability and validation
 
 `AdmissionMetrics` records state-backed versus fallback preflights and aggregate
@@ -181,11 +172,10 @@ signature recovery, database reads, and scheduling.
   can provide complete production lock attribution.
 - A longer release-build load test, with before/after baselines and multiple
   ingress nodes, is needed before making sustained-throughput claims.
-- A transaction that passes admission and then fails at block build is undone
-  completely, so its CPU is refunded to the payer. A payer with a small staked
-  window can therefore spend that window on failing transactions every block.
-  Antelope closes this with subjective billing of failed transactions and a
-  per-account failure limit (`subjective-cpu-leeway`,
-  `subjective-account-max-failures`); PulseVM has neither yet. The admission
-  window check and the per-payer bound limit the blast radius; they do not
-  close it.
+- The admission window check reads the consensus resource limits only. Once the
+  node-local subjective-billing ledger for failed transactions (#86) is shared
+  with `MempoolAdmissionState`, the check should deduct the payer's outstanding
+  subjective charge too, so a flooding account is refused before signature
+  recovery rather than at block build. There is deliberately no per-payer
+  pending bound: legitimate high-volume senders keep dozens of transactions in
+  flight, and a bill-aware window check makes such a bound redundant.

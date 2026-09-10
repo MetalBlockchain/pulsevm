@@ -19,12 +19,6 @@ pub enum MempoolError {
     InternalError(String),
     /// The pool holds `MAX_MEMPOOL_SIZE` transactions (live plus detached).
     Full,
-    /// The first authorizer already has `MAX_MEMPOOL_TRANSACTIONS_PER_PAYER`
-    /// transactions pending (live plus detached).
-    PayerLimit {
-        payer: u64,
-        limit: usize,
-    },
 }
 
 impl std::fmt::Display for MempoolError {
@@ -32,12 +26,6 @@ impl std::fmt::Display for MempoolError {
         match self {
             MempoolError::InternalError(msg) => write!(f, "internal error: {}", msg),
             MempoolError::Full => write!(f, "mempool is full ({} transactions)", MAX_MEMPOOL_SIZE),
-            MempoolError::PayerLimit { payer, limit } => write!(
-                f,
-                "account {} already has {} transactions pending in the mempool",
-                crate::chain::name::Name::new(*payer),
-                limit
-            ),
         }
     }
 }
@@ -56,12 +44,6 @@ pub struct Mempool {
     // transaction during block building are both cheap even when many entries
     // share the same five-minute deadline.
     expiration_counts: BTreeMap<u32, usize>,
-    // First authorizer (the account billed for the transaction) of every
-    // live *and* detached entry, so the per-payer bound below stays in force
-    // while a batch executes outside this mempool's async lock.
-    payer_by_id: HashMap<Id, u64>,
-    // Pending entries per first authorizer, derived from `payer_by_id`.
-    pending_by_payer: HashMap<u64, usize>,
 }
 
 /// Transactions detached from the live pool for block construction or
@@ -80,11 +62,6 @@ impl MempoolBatch {
 }
 
 pub const MAX_MEMPOOL_SIZE: usize = 10000;
-/// Local, non-consensus bound on how many transactions one first authorizer
-/// may have pending at once. Admission never executes actions, so without this
-/// a single account could fill the whole pool for free and lock honest users
-/// out until its entries expire. See `docs/mempool-admission.md` §6.
-pub const MAX_MEMPOOL_TRANSACTIONS_PER_PAYER: usize = 32;
 /// Local, non-consensus retention bound. See `docs/mempool-admission.md` §6.
 pub const DEFAULT_MEMPOOL_TRANSACTION_TTL_SECS: u32 = 300;
 
@@ -96,23 +73,20 @@ impl Mempool {
             reserved_ids: HashSet::new(),
             expiration_by_id: HashMap::new(),
             expiration_counts: BTreeMap::new(),
-            payer_by_id: HashMap::new(),
-            pending_by_payer: HashMap::new(),
         }
     }
 
-    /// Admit a transaction, reporting a full pool or a saturated payer as
-    /// `false` like a duplicate. Callers that must tell the sender *why* the
-    /// transaction was refused use [`Mempool::try_add_transaction`].
+    /// Admit a transaction, reporting a full pool as `false` like a duplicate.
+    /// Callers that must tell the sender *why* the transaction was refused use
+    /// [`Mempool::try_add_transaction`].
     pub fn add_transaction(&mut self, transaction: PackedTransaction) -> bool {
         self.add_transaction_at(transaction, TimePointSec::now())
     }
 
     /// Admit a transaction. `Ok(true)` if it was newly added, `Ok(false)` if it
-    /// was already present (live or detached), `Err` if the pool or the payer's
-    /// per-account bound refused it — in which case the transaction was not
-    /// added and the caller should surface the refusal instead of treating it
-    /// as accepted.
+    /// was already present (live or detached), `Err` if the pool refused it —
+    /// in which case the transaction was not added and the caller should
+    /// surface the refusal instead of treating it as accepted.
     pub fn try_add_transaction(
         &mut self,
         transaction: PackedTransaction,
@@ -134,33 +108,18 @@ impl Mempool {
         transaction: PackedTransaction,
         received_at: TimePointSec,
     ) -> Result<bool, MempoolError> {
-        if self.transactions_list.len() + self.reserved_ids.len() >= MAX_MEMPOOL_SIZE {
-            return Err(MempoolError::Full);
-        }
+        // A transaction we already hold is "already present" whether or not
+        // the pool is full: re-gossip of an in-flight transaction must never
+        // surface as a refusal to the sender.
         if self.reserved_ids.contains(transaction.id())
             || self.transactions_map.contains(transaction.id())
         {
-            return Ok(false); // already present
+            return Ok(false);
         }
-        // The per-payer bound counts live and detached entries alike, so a
-        // payer cannot double its allowance while the block builder holds a
-        // batch. Transactions without an authorization never reach a pool
-        // (admission rejects them), so `None` is only seen by unit tests.
-        let payer = transaction.get_transaction().first_authorizer();
-        if let Some(payer) = payer {
-            let pending = self.pending_by_payer.get(&payer).copied().unwrap_or(0);
-            if pending >= MAX_MEMPOOL_TRANSACTIONS_PER_PAYER {
-                return Err(MempoolError::PayerLimit {
-                    payer,
-                    limit: MAX_MEMPOOL_TRANSACTIONS_PER_PAYER,
-                });
-            }
+        if self.transactions_list.len() + self.reserved_ids.len() >= MAX_MEMPOOL_SIZE {
+            return Err(MempoolError::Full);
         }
         self.transactions_map.insert(transaction.id().clone());
-        if let Some(payer) = payer {
-            self.payer_by_id.insert(transaction.id().clone(), payer);
-            *self.pending_by_payer.entry(payer).or_default() += 1;
-        }
         let signed_expiration = transaction
             .get_transaction()
             .header
@@ -178,27 +137,9 @@ impl Mempool {
         Ok(true)
     }
 
-    /// Pending entries (live plus detached) for a first authorizer.
-    pub fn pending_for_payer(&self, payer: u64) -> usize {
-        self.pending_by_payer.get(&payer).copied().unwrap_or(0)
-    }
-
-    fn release_payer(&mut self, id: &Id) {
-        if let Some(payer) = self.payer_by_id.remove(id) {
-            if let Some(count) = self.pending_by_payer.get_mut(&payer) {
-                if *count > 1 {
-                    *count -= 1;
-                } else {
-                    self.pending_by_payer.remove(&payer);
-                }
-            }
-        }
-    }
-
     pub fn pop_transaction(&mut self) -> Option<PackedTransaction> {
         if let Some(transaction) = self.transactions_list.pop_front() {
             self.transactions_map.remove(transaction.id());
-            self.release_payer(transaction.id());
             let expiration = self.expiration_by_id.remove(transaction.id());
             if let Some(expiration) = expiration {
                 self.remove_expiration(expiration);
@@ -213,7 +154,6 @@ impl Mempool {
         if let Some(index) = self.transactions_list.iter().position(|x| x.id() == tx_id) {
             let transaction = self.transactions_list.remove(index).unwrap();
             self.transactions_map.remove(tx_id);
-            self.release_payer(tx_id);
             let expiration = self.expiration_by_id.remove(transaction.id());
             if let Some(expiration) = expiration {
                 self.remove_expiration(expiration);
@@ -248,11 +188,6 @@ impl Mempool {
             reserved_ids: HashSet::new(),
             expiration_by_id: std::mem::take(&mut self.expiration_by_id),
             expiration_counts: std::mem::take(&mut self.expiration_counts),
-            // Payer accounting stays with the live pool: the detached entries
-            // are still reserved here, and `finish_batch` releases whichever
-            // of them the batch consumed.
-            payer_by_id: HashMap::new(),
-            pending_by_payer: HashMap::new(),
         };
         let reservations = transactions.transactions_map.clone();
         self.reserved_ids.extend(reservations.iter().cloned());
@@ -274,14 +209,10 @@ impl Mempool {
                 .remove(&id)
                 .expect("mempool transaction must have an expiry deadline");
             if self.transactions_list.len() + self.reserved_ids.len() < MAX_MEMPOOL_SIZE
-                && self.transactions_map.insert(id.clone())
+                && self.transactions_map.insert(id)
             {
                 self.transactions_list.push_front(transaction);
                 self.record_expiration(expiration);
-            } else {
-                // Displaced or already re-admitted: its reservation no longer
-                // counts against the payer.
-                self.release_payer(&id);
             }
         }
     }
@@ -295,13 +226,6 @@ impl Mempool {
             self.reserved_ids.remove(id);
         }
         self.prepend_missing(batch.transactions);
-        // Whatever the batch consumed (built into a block, dropped as failed,
-        // or pruned as included) is no longer pending for its payer.
-        for id in &batch.reservations {
-            if !self.transactions_map.contains(id) {
-                self.release_payer(id);
-            }
-        }
     }
 
     /// Remove transactions whose effective mempool lifetime is before `now`.
@@ -343,14 +267,6 @@ impl Mempool {
             .collect();
         self.expiration_by_id
             .retain(|id, _| self.transactions_map.contains(id));
-        let transactions_map = &self.transactions_map;
-        let reserved_ids = &self.reserved_ids;
-        self.payer_by_id
-            .retain(|id, _| transactions_map.contains(id) || reserved_ids.contains(id));
-        self.pending_by_payer.clear();
-        for payer in self.payer_by_id.values() {
-            *self.pending_by_payer.entry(*payer).or_default() += 1;
-        }
         self.expiration_counts.clear();
         let expirations: Vec<u32> = self.expiration_by_id.values().copied().collect();
         for expiration in expirations {
@@ -376,18 +292,12 @@ impl Mempool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chain::{
-        authority::PermissionLevel,
-        name::Name,
-        transaction::{
-            Action,
-            Transaction,
-            TransactionCompression,
-            TransactionHeader,
-        },
+    use crate::chain::transaction::{
+        Transaction,
+        TransactionCompression,
+        TransactionHeader,
     };
     use pulsevm_serialization::Write;
-    use std::str::FromStr;
 
     // A distinct, unsigned transaction per `seed`. The mempool keys on the
     // transaction id (its digest), so varying the header is enough to get a
@@ -409,39 +319,6 @@ mod tests {
 
     fn tx(seed: u16) -> PackedTransaction {
         tx_with_expiration(TimePointSec::maximum(), seed)
-    }
-
-    // A distinct, unsigned transaction whose first authorizer is `payer`, so
-    // the per-payer bound sees it. Admission is not involved.
-    fn tx_from(payer: &str, seed: u16) -> PackedTransaction {
-        let payer = Name::from_str(payer).unwrap();
-        let trx = Transaction::new(
-            TransactionHeader::new(
-                TimePointSec::maximum(),
-                seed,
-                0,
-                0u32.into(),
-                0,
-                0u32.into(),
-            ),
-            vec![],
-            vec![Action::new(
-                Name::from_str("pulse").unwrap(),
-                Name::from_str("nop").unwrap(),
-                vec![],
-                vec![PermissionLevel::new(
-                    payer.as_u64(),
-                    Name::from_str("active").unwrap().as_u64(),
-                )],
-            )],
-        );
-        PackedTransaction::new(
-            std::collections::BTreeSet::new(),
-            TransactionCompression::None,
-            pulsevm_crypto::Bytes::default(),
-            trx.pack().unwrap().into(),
-        )
-        .unwrap()
     }
 
     #[test]
@@ -611,122 +488,7 @@ mod tests {
             mempool.try_add_transaction(tx(MAX_MEMPOOL_SIZE as u16)),
             Err(MempoolError::Full)
         ));
-        // The bool-returning entry point keeps its "not added" contract.
-        assert!(!mempool.add_transaction(tx(MAX_MEMPOOL_SIZE as u16)));
-    }
-
-    #[test]
-    fn per_payer_bound_refuses_the_next_transaction_and_frees_on_removal() {
-        let mut mempool = Mempool::new();
-        for i in 0..MAX_MEMPOOL_TRANSACTIONS_PER_PAYER {
-            assert!(
-                mempool
-                    .try_add_transaction(tx_from("alice", i as u16))
-                    .unwrap()
-            );
-        }
-        let alice = Name::from_str("alice").unwrap().as_u64();
-        assert_eq!(
-            mempool.pending_for_payer(alice),
-            MAX_MEMPOOL_TRANSACTIONS_PER_PAYER
-        );
-
-        // One more from alice is refused with a reason; a duplicate of one she
-        // already has is still just "already present".
-        let refused = tx_from("alice", MAX_MEMPOOL_TRANSACTIONS_PER_PAYER as u16);
-        assert!(matches!(
-            mempool.try_add_transaction(refused.clone()),
-            Err(MempoolError::PayerLimit { payer, limit })
-                if payer == alice && limit == MAX_MEMPOOL_TRANSACTIONS_PER_PAYER
-        ));
-        assert!(!mempool.contains(refused.id()));
-        assert_eq!(
-            mempool.try_add_transaction(tx_from("alice", 0)).unwrap(),
-            false
-        );
-
-        // Other payers are unaffected.
-        assert!(mempool.try_add_transaction(tx_from("bob", 0)).unwrap());
-
-        // Removing one of alice's frees exactly one slot.
-        let first = tx_from("alice", 0);
-        mempool.remove_transaction(first.id());
-        assert_eq!(
-            mempool.pending_for_payer(alice),
-            MAX_MEMPOOL_TRANSACTIONS_PER_PAYER - 1
-        );
-        assert!(mempool.try_add_transaction(refused.clone()).unwrap());
-        assert!(matches!(
-            mempool.try_add_transaction(tx_from("alice", 99)),
-            Err(MempoolError::PayerLimit { .. })
-        ));
-
-        // Popping (block building) frees a slot too.
-        assert!(mempool.pop_transaction().is_some());
-        assert_eq!(
-            mempool.pending_for_payer(alice),
-            MAX_MEMPOOL_TRANSACTIONS_PER_PAYER - 1
-        );
-    }
-
-    #[test]
-    fn per_payer_bound_counts_detached_entries_until_the_batch_finishes() {
-        let mut mempool = Mempool::new();
-        for i in 0..MAX_MEMPOOL_TRANSACTIONS_PER_PAYER {
-            assert!(
-                mempool
-                    .try_add_transaction(tx_from("alice", i as u16))
-                    .unwrap()
-            );
-        }
-        let alice = Name::from_str("alice").unwrap().as_u64();
-
-        // While the builder holds the batch, alice's reservations still count.
-        let mut batch = mempool.take_all();
-        assert_eq!(
-            mempool.pending_for_payer(alice),
-            MAX_MEMPOOL_TRANSACTIONS_PER_PAYER
-        );
-        assert!(matches!(
-            mempool.try_add_transaction(tx_from("alice", 99)),
-            Err(MempoolError::PayerLimit { .. })
-        ));
-
-        // The builder consumes all but one, which it defers back into the batch.
-        let pool = batch.transactions_mut();
-        let mut deferred = None;
-        while let Some(transaction) = pool.pop_transaction() {
-            if deferred.is_none() {
-                deferred = Some(transaction);
-            }
-        }
-        pool.add_transaction(deferred.clone().unwrap());
-        mempool.finish_batch(batch);
-
-        // Only the deferred one is still pending for alice.
-        assert_eq!(mempool.pending_for_payer(alice), 1);
-        assert!(mempool.contains(deferred.unwrap().id()));
-        assert!(mempool.try_add_transaction(tx_from("alice", 99)).unwrap());
-    }
-
-    #[test]
-    fn prune_and_expiry_release_payer_slots() {
-        let mut mempool = Mempool::new();
-        let alice = Name::from_str("alice").unwrap().as_u64();
-        let included = tx_from("alice", 1);
-        let expiring = tx_from("alice", 2);
-        mempool.add_transaction_at(included.clone(), TimePointSec::new(100));
-        mempool.add_transaction_at(expiring.clone(), TimePointSec::new(100));
-        assert_eq!(mempool.pending_for_payer(alice), 2);
-
-        let mut ids = HashSet::new();
-        ids.insert(included.id().clone());
-        mempool.prune(&ids);
-        assert_eq!(mempool.pending_for_payer(alice), 1);
-
-        let after_ttl: TimePoint =
-            TimePointSec::new(101 + DEFAULT_MEMPOOL_TRANSACTION_TTL_SECS).into();
-        assert_eq!(mempool.prune_expired(&after_ttl), 1);
-        assert_eq!(mempool.pending_for_payer(alice), 0);
+        // A duplicate is still "already present", not a refusal.
+        assert_eq!(mempool.try_add_transaction(tx(0)).unwrap(), false);
     }
 }
