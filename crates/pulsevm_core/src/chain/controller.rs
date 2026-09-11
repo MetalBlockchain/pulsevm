@@ -1347,6 +1347,9 @@ impl Controller {
         }
 
         self.ensure_protocol_version_supported(block.block_num())?;
+        // Reject malformed structure before walking or materializing a fork.
+        // Producer existence is the only syntax check that needs parent state.
+        block.validate_state_independent()?;
 
         // Verify the block. Authenticate the signature against the schedule active
         // as of this block's parent — folding in any pending ancestor's change —
@@ -1369,7 +1372,7 @@ impl Controller {
         self.replay_accepted_state_to(parent_block_id.clone(), &block_status, mempool)?;
         // Producer-account existence must be checked in the candidate parent's
         // state, not in the branch that happened to be materialized previously.
-        block.validate_syntactically(&self.db)?;
+        block.validate_producer_account(&self.db)?;
 
         // This block's own session sits on top of the reconciled parent state. If
         // execution or validation below fails, each early return undoes the arena
@@ -4846,6 +4849,26 @@ mod tests {
         validator.verify_block(&b, &mut pool).await?;
         validator.verify_block(&c, &mut pool).await?;
         assert!(validator.verified_blocks.contains_key(&b.id()?));
+
+        // State-independent rejection must not unwind C and materialize B just
+        // because the malformed candidate names B as its parent.
+        let mut malformed = d.clone();
+        malformed.signed_block_header.header.confirmed = 1;
+        let executed_before = validator.blocks_executed;
+        assert!(validator.verify_block(&malformed, &mut pool).await.is_err());
+        assert_eq!(validator.blocks_executed, executed_before);
+        assert_eq!(validator.pending_chain[1].id, c.id()?);
+        assert!(
+            validator
+                .db
+                .arena_account_exists(Name::from_str("ccc")?.as_u64())
+        );
+        assert!(
+            !validator
+                .db
+                .arena_account_exists(Name::from_str("bbb")?.as_u64())
+        );
+
         let result = validator.verify_block(&d, &mut pool).await;
         assert!(
             result.is_ok(),
