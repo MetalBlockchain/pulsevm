@@ -264,13 +264,14 @@ impl RpcService {
     }
 
     /// Validate a packed transaction and admit it to the mempool. Returns
-    /// `Ok(true)` if it was newly added, `Ok(false)` if it was already known (or
-    /// the mempool is full), and `Err` if it failed validation and must not be
-    /// propagated. Shared by the RPC issue path and the peer-gossip path so both
-    /// apply the same admission rules. Admission validates transaction shape,
-    /// lifetime, referenced accounts, and authorization, but defers action
-    /// execution to block production. The newly-added flag lets the caller relay
-    /// exactly once, which stops gossip from looping.
+    /// `Ok(true)` if it was newly added, `Ok(false)` if it was already known,
+    /// and `Err` if it failed validation — or if the pool refused it — and must
+    /// not be propagated. Shared by the RPC issue path and the peer-gossip path
+    /// so both apply the same admission rules. Admission validates transaction
+    /// shape, lifetime, referenced accounts, authorization, and that the first
+    /// authorizer can afford the transaction's minimum CPU and its NET, but
+    /// defers action execution to block production. The newly-added flag lets
+    /// the caller relay exactly once, which stops gossip from looping.
     pub async fn admit_transaction(
         &self,
         packed_trx: PackedTransaction,
@@ -363,7 +364,11 @@ impl RpcService {
         if mempool.has_expired(&now) {
             mempool.prune_expired(&now);
         }
-        Ok(mempool.add_transaction(packed_trx))
+        // A full pool is an error to the sender, not a silent "accepted":
+        // `issueTx` used to answer it with a tx id it would never build.
+        mempool
+            .try_add_transaction(packed_trx)
+            .map_err(|e| ChainError::TransactionError(format!("mempool refused transaction: {e}")))
     }
 
     /// Build a candidate from a detached mempool batch. Keeping this orchestration

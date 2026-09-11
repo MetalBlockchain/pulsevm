@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 
+use pulsevm_constants::MAX_TRANSACTION_SIGNATURES;
 use pulsevm_crypto::{
     AuthorityPublicKey,
     Bytes,
@@ -73,9 +74,22 @@ impl SignedTransaction {
         )
     }
 
+    /// Reject an oversized signature set before hashing or recovering any key.
+    fn check_signature_count(&self) -> Result<(), ChainError> {
+        if self.signatures.len() > MAX_TRANSACTION_SIGNATURES {
+            return Err(ChainError::TransactionError(format!(
+                "transaction has {} signatures, exceeding the limit of {}",
+                self.signatures.len(),
+                MAX_TRANSACTION_SIGNATURES
+            )));
+        }
+        Ok(())
+    }
+
     #[must_use]
     #[inline]
     pub fn recovered_keys(&self, chain_id: &Id) -> Result<BTreeSet<PublicKey>, ChainError> {
+        self.check_signature_count()?;
         let mut recovered_keys: BTreeSet<PublicKey> = BTreeSet::new();
         let digest = self
             .transaction
@@ -102,6 +116,7 @@ impl SignedTransaction {
         &self,
         chain_id: &Id,
     ) -> Result<BTreeSet<AuthorityPublicKey>, ChainError> {
+        self.check_signature_count()?;
         let mut recovered_keys = BTreeSet::new();
         let digest = self
             .transaction
@@ -191,6 +206,7 @@ mod tests {
             TransactionHeader,
         },
     };
+    use pulsevm_constants::MAX_TRANSACTION_SIGNATURES;
     use pulsevm_crypto::K1Signature;
     use secp256k1::{
         Message,
@@ -322,6 +338,47 @@ mod tests {
 
         let keys = signed.recovered_authority_keys(&chain_id).unwrap();
         assert_eq!(keys.len(), 1);
+    }
+
+    fn garbage_signatures(count: usize) -> Vec<Signature> {
+        (0..count)
+            .map(|i| {
+                let mut bytes = [0u8; 65];
+                // Header 0 and zero r/s are deliberately invalid. Distinguish
+                // each value so wire-level set deduplication cannot shrink it.
+                bytes[1..5].copy_from_slice(&(i as u32).to_le_bytes());
+                Signature::new(K1Signature::from_compact65(&bytes))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn too_many_signatures_are_rejected_before_recovery() {
+        let signatures = garbage_signatures(MAX_TRANSACTION_SIGNATURES + 1);
+        assert_eq!(signatures.len(), MAX_TRANSACTION_SIGNATURES + 1);
+        let (transaction, chain_id) = transaction_signed_by(signatures);
+
+        for error in [
+            transaction.recovered_authority_keys(&chain_id).unwrap_err(),
+            transaction.recovered_keys(&chain_id).unwrap_err(),
+        ] {
+            assert!(
+                error.to_string().contains("exceeding the limit"),
+                "the count must be rejected before invalid signatures are recovered: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn signature_limit_is_inclusive() {
+        let (at_limit, _) = transaction_signed_by(garbage_signatures(MAX_TRANSACTION_SIGNATURES));
+        at_limit
+            .check_signature_count()
+            .expect("the configured signature limit must be accepted");
+
+        let (over_limit, _) =
+            transaction_signed_by(garbage_signatures(MAX_TRANSACTION_SIGNATURES + 1));
+        assert!(over_limit.check_signature_count().is_err());
     }
 
     #[test]

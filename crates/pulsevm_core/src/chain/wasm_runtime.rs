@@ -745,6 +745,10 @@ pub struct WasmContext {
     return_value: Option<Bytes>,
 }
 
+#[cfg(test)]
+#[path = "webassembly/tests/mod.rs"]
+mod host_function_tests;
+
 impl WasmContext {
     pub fn new(
         receiver: Name,
@@ -1538,7 +1542,7 @@ impl WasmRuntime {
         db: Database,
         code_hash: &[u8; 32],
         cpu_limit: i64,
-    ) -> Result<u64, ChainError> {
+    ) -> Result<(), ChainError> {
         let profiling = super::replay_profile::enabled();
         let call_started = profiling.then(Instant::now);
         let account_name = action.account().as_u64();
@@ -1940,6 +1944,17 @@ impl WasmRuntime {
             .get(&mut warm.store)
             .map_err(|error| ChainError::WasmRuntimeError(error.to_string()))?;
 
+        // Capture metered work before interpreting the apply result. Contract
+        // assertions and traps must still pay for every point consumed on the
+        // way to the failure.
+        let cpu_used = match remaining_points {
+            MeteringPoints::Remaining(points) => {
+                metered_cpu_to_bill(accepted_block_replay, cpu_limit, points)
+            }
+            MeteringPoints::Exhausted => cpu_limit,
+        };
+        apply_context.add_cpu_usage(cpu_used)?;
+
         // Return the warm store to the pool for reuse, unless it has spun up
         // enough instances that its object slab is worth reclaiming. The reset
         // happens before the next invocation, including after a trap; no dirty
@@ -1968,7 +1983,7 @@ impl WasmRuntime {
         }
 
         match remaining_points {
-            MeteringPoints::Remaining(points) => {
+            MeteringPoints::Remaining(_) => {
                 if let Err(e) = result {
                     if e.downcast_ref::<WasmExit>().is_none() {
                         if let Some(chain_err) = e.downcast_ref::<ChainError>() {
@@ -1987,15 +2002,7 @@ impl WasmRuntime {
                     apply_context.set_trace_return_value(value.0)?;
                 }
 
-                // Accepted-block replay reconstructs the canonical receipt from
-                // the producer-recorded CPU value. Do not accumulate this
-                // runtime's differently denominated local points into the u32
-                // receipt field before finalize overwrites it.
-                Ok(metered_cpu_to_bill(
-                    accepted_block_replay,
-                    cpu_limit,
-                    points,
-                ))
+                Ok(())
             }
             MeteringPoints::Exhausted => Err(ChainError::ApplyError(format!(
                 "CPU limit of {} exhausted during apply",

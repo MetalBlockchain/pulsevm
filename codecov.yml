@@ -1,0 +1,16 @@
+coverage:
+  status:
+    project:
+      default:
+        target: auto
+        # Allow at most one percentage point below the base commit.
+        threshold: 1%
+        if_not_found: failure
+    patch:
+      default:
+        target: 80%
+        threshold: 0%
+        if_not_found: failure
+
+# Publish status checks without adding a bot comment to every pull request.
+comment: false

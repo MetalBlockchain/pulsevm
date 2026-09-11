@@ -284,9 +284,7 @@ impl ApplyContext {
         self.db.system_accounts()
     }
 
-    pub fn exec(&mut self, trx_context: &mut TransactionContext) -> Result<u64, ChainError> {
-        let mut cpu_used = 0;
-
+    pub fn exec(&mut self, trx_context: &mut TransactionContext) -> Result<(), ChainError> {
         {
             let mut inner = self.inner.write()?;
             inner
@@ -294,7 +292,7 @@ impl ApplyContext {
                 .push_back((self.receiver.clone(), self.action_ordinal));
         }
 
-        cpu_used += self.exec_one()?;
+        self.exec_one()?;
 
         // A notified receiver may call `require_recipient` itself. Leap walks
         // the growing notification queue, so fetch one entry at a time instead
@@ -307,7 +305,7 @@ impl ApplyContext {
             };
             self.receiver = receiver;
             self.action_ordinal = action_ordinal;
-            cpu_used += self.exec_one()?;
+            self.exec_one()?;
             notified_index += 1;
         }
 
@@ -339,11 +337,13 @@ impl ApplyContext {
             trx_context.execute_action(*action_ordinal, recurse_depth + 1)?;
         }
 
-        Ok(cpu_used)
+        Ok(())
     }
 
-    pub fn exec_one(&mut self) -> Result<u64, ChainError> {
-        let mut cpu_used = 100; // Base usage is always 100 instructions
+    pub fn exec_one(&mut self) -> Result<(), ChainError> {
+        // Charge as work is performed so a later assertion/trap cannot erase
+        // the resources consumed before the failure.
+        self.trx_context.add_cpu_usage(100)?;
         let action = {
             let mut inner = self.inner.write()?;
             // A return value belongs to one receiver execution, not to the
@@ -403,7 +403,7 @@ impl ApplyContext {
             super::xpr_native_replay::try_apply(self, &action, &execution_code_hash)?
         };
         if let Some(native_cpu) = xpr_native_cpu {
-            cpu_used += native_cpu;
+            self.trx_context.add_cpu_usage(native_cpu)?;
             self.trx_context.checktime()?;
         } else if execution_code_hash != [0u8; 32] && (!is_system_setcode || forward_setcode) {
             // Separate context here because we need to release the lock on inner before executing
@@ -414,7 +414,7 @@ impl ApplyContext {
                 inner.cpu_limit
             };
 
-            let wasm_cpu = self.wasm_runtime.run(
+            let wasm_result = self.wasm_runtime.run(
                 self.receiver.clone(),
                 action.clone(),
                 self.clone(),
@@ -422,16 +422,15 @@ impl ApplyContext {
                 &execution_code_hash,
                 cpu_limit,
             );
-            let wasm_cpu = match wasm_cpu {
-                Ok(wasm_cpu) => wasm_cpu,
+            match wasm_result {
+                Ok(()) => {}
                 Err(error) => {
                     if read_only_probe.is_some() {
                         super::xpr_native_replay::cancel_read_only_wasm(self);
                     }
                     return Err(error);
                 }
-            };
-            cpu_used += wasm_cpu;
+            }
             if let Some(probe) = read_only_probe {
                 super::xpr_native_replay::finish_read_only_wasm(self, probe)?;
             }
@@ -520,7 +519,7 @@ impl ApplyContext {
             .add_executed_action_receipt_digest(receipt.digest()?)?;
         self.finalize_trace(receipt)?;
 
-        Ok(cpu_used)
+        Ok(())
     }
 
     pub fn finalize_trace(&self, receipt: ActionReceipt) -> Result<(), ChainError> {
@@ -3002,6 +3001,10 @@ impl ApplyContext {
     pub fn resume_billing_timer(&self) -> Result<(), ChainError> {
         self.trx_context.resume_billing_timer()?;
         Ok(())
+    }
+
+    pub fn add_cpu_usage(&self, cpu_usage: u64) -> Result<(), ChainError> {
+        self.trx_context.add_cpu_usage(cpu_usage)
     }
 
     pub fn checktime(&self) -> Result<(), ChainError> {

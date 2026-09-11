@@ -19,6 +19,7 @@ authoritative and the document is a bug.
 | [intrinsic-cost-model.md](./intrinsic-cost-model.md) | Host-intrinsic CPU pricing, estimator methodology, and calibration | Working reference |
 | [wasm-determinism.md](./wasm-determinism.md) | WASM feature pinning, floating-point behavior, database key ordering, and replay validation | Working reference |
 | [optimistic-parallel-execution.md](./optimistic-parallel-execution.md) | Consensus-safe ordered speculation, dependency tracking, fallbacks, and rollout gates | Telemetry plus default-off contract-primary overlay foundation |
+| [code-coverage.md](./code-coverage.md) | Coverage CI, Codecov checks and setup, report scope, and local reports | Current workflow |
 
 ---
 

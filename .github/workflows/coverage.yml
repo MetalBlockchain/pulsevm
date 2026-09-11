@@ -1,0 +1,95 @@
+name: Coverage
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coverage-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  coverage:
+    name: Rust coverage
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      LLVM_SYS_221_PREFIX: /usr/lib/llvm-22
+      CARGO_INCREMENTAL: '0'
+      # LLVM coverage mappings do not require full debug symbols.
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Configure LLVM APT repository
+        run: |
+          curl --fail --silent --show-error --location https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo gpg --dearmor -o /usr/share/keyrings/llvm-snapshot.gpg
+          echo "deb [signed-by=/usr/share/keyrings/llvm-snapshot.gpg] https://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" \
+            | sudo tee /etc/apt/sources.list.d/llvm.list
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-13 g++-13 cmake pkg-config \
+            llvm-22-dev libpolly-22-dev zlib1g-dev libssl-dev libzstd-dev zstd
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Install Protobuf (protoc)
+        uses: ./.github/actions/setup-protoc
+        with:
+          version: '27.1'
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov@0.8.7
+
+      # Instrumented artifacts use their own target directory. Cache only
+      # downloads so raw profiles and build outputs cannot leak between runs.
+      - name: Cache cargo downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-${{ runner.arch }}-coverage-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run workspace tests with coverage
+        run: |
+          mkdir -p target/coverage
+          cargo llvm-cov --workspace --locked --lcov \
+            --ignore-filename-regex '(^|/)(tests|benches|examples)/|(^|/)crates/pulsevm_(unittests|e2e_boot|benchmark)/' \
+            --output-path target/coverage/lcov.info
+
+      - name: Save coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: target/coverage/lcov.info
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: target/coverage/lcov.info
+          disable_search: true
+          fail_ci_if_error: true

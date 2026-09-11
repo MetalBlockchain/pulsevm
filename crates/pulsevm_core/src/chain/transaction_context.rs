@@ -504,6 +504,13 @@ pub struct TransactionResult {
     pub dependencies: Option<TransactionDependencies>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TransactionFailureBill {
+    pub(crate) account: Name,
+    pub(crate) cpu_usage: u64,
+    pub(crate) net_usage: u64,
+}
+
 struct TransactionContextInner {
     initialized: bool,
     trace: TransactionTrace,
@@ -549,6 +556,11 @@ pub struct TransactionContext {
     // falling back to `last_accepted + 1`.
     protocol_context: ProtocolExecutionContext,
     packed_transaction: PackedTransaction,
+    // Failed input transactions are not committed to consensus state. These
+    // node-local charges are deducted while the context runs, preventing
+    // rolled-back work from becoming free.
+    subjective_cpu_bill: u64,
+    subjective_net_bill: u64,
     inner: Arc<RwLock<TransactionContextInner>>,
 }
 
@@ -573,6 +585,8 @@ impl TransactionContext {
             wasm_runtime,
             block_status,
             protocol_context,
+            subjective_cpu_bill: 0,
+            subjective_net_bill: 0,
             inner: Arc::new(RwLock::new(TransactionContextInner {
                 initialized: false,
                 trace,
@@ -1223,8 +1237,7 @@ impl TransactionContext {
         )?;
 
         // Initialize the apply context with the action trace.
-        let cpu_used = apply_context.exec(self)?;
-        self.add_cpu_usage(cpu_used)?;
+        apply_context.exec(self)?;
 
         Ok(())
     }
@@ -1334,7 +1347,12 @@ impl TransactionContext {
             .max(self.db.chain_config()?.min_transaction_cpu_usage))
     }
 
-    pub fn finalize(mut self) -> Result<TransactionResult, ChainError> {
+    pub(crate) fn set_subjective_bill(&mut self, cpu: u64, net: u64) {
+        self.subjective_cpu_bill = cpu;
+        self.subjective_net_bill = net;
+    }
+
+    pub fn finalize(&mut self) -> Result<TransactionResult, ChainError> {
         let mut inner = self.inner.write()?;
         // On replay use the recorded usage: override the re-measured amounts so
         // the receipt (and its merkle root) and the billed accumulators match
@@ -1478,8 +1496,35 @@ impl TransactionContext {
         Ok(i64::from(version))
     }
 
+    /// Resource charge retained locally if execution fails and its arena
+    /// session is undone. RAM is deliberately absent: rollback releases it.
+    pub(crate) fn failure_bill(&self) -> Result<TransactionFailureBill, ChainError> {
+        let inner = self.inner.read()?;
+        let account = self
+            .packed_transaction
+            .get_transaction()
+            .first_authorizer()
+            .map(Name::new)
+            .ok_or_else(|| {
+                ChainError::TransactionError("bill to account is not set".to_string())
+            })?;
+        let min_cpu = self.db.chain_config()?.min_transaction_cpu_usage as u64;
+        Ok(TransactionFailureBill {
+            account,
+            cpu_usage: (inner.trace.receipt.cpu_usage_us as u64).max(min_cpu),
+            net_usage: ((inner.trace.net_usage + 7) / 8) * 8,
+        })
+    }
+
     pub fn add_cpu_usage(&self, cpu_usage: u64) -> Result<(), ChainError> {
         let mut inner = self.inner.write()?;
+
+        // Accepted-block replay reconstructs resource usage from the producer's
+        // receipt. Local metering remains an execution guard but must not be
+        // accumulated into the receipt before finalize replaces it.
+        if inner.explicit_billed_cpu_time {
+            return Ok(());
+        }
 
         // Widen the field, not the argument: narrowing `cpu_usage` to u32 first
         // would silently truncate any value above u32::MAX before the check runs.
@@ -1770,6 +1815,11 @@ impl TransactionContext {
                 cpu_greylisted |= cpu_was_greylisted;
             }
         }
+
+        let subjective_net = i64::try_from(self.subjective_net_bill).unwrap_or(i64::MAX);
+        let subjective_cpu = i64::try_from(self.subjective_cpu_bill).unwrap_or(i64::MAX);
+        account_net_limit = account_net_limit.saturating_sub(subjective_net).max(0);
+        account_cpu_limit = account_cpu_limit.saturating_sub(subjective_cpu).max(0);
 
         Ok((
             account_net_limit,

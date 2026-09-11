@@ -79,6 +79,10 @@ use crate::{
             StateHistoryLogCheckpoint,
         },
         state_sync,
+        subjective_billing::{
+            SubjectiveBill,
+            SubjectiveBilling,
+        },
         transaction::{
             ACTION_RETURN_VALUE_FEATURE_DIGEST,
             ActionReceipt,
@@ -663,6 +667,10 @@ pub struct Controller {
     // Count of `execute_block` invocations, for measuring how much re-execution
     // the pending-chain reuse actually avoids. Not consensus state.
     blocks_executed: u64,
+
+    // Local-only CPU/NET retained for transactions whose consensus state was
+    // rolled back after an execution failure.
+    subjective_billing: SubjectiveBilling,
 }
 
 /// Read-only state required for mempool admission. See
@@ -762,6 +770,12 @@ impl MempoolAdmissionState {
             ));
         }
 
+        // Cheap DB reads before the expensive signature recovery: a payer that
+        // cannot afford the transaction is refused here instead of occupying a
+        // mempool slot and a block builder's time before failing the same
+        // objective checks at execution.
+        Self::check_payer_resource_window(&self.db, packed_transaction, transaction)?;
+
         if self
             .db
             .is_known_unexpired_transaction(&packed_transaction.id().0.0)?
@@ -777,6 +791,67 @@ impl MempoolAdmissionState {
             seconds(transaction.header.delay_sec.into()),
             &BTreeSet::new(),
         )
+    }
+}
+
+impl MempoolAdmissionState {
+    /// Node-local, non-consensus pre-check of the objective resource limits the
+    /// transaction will face at execution: the first authorizer must be able to
+    /// pay at least `min_transaction_cpu_usage` of CPU and the transaction's own
+    /// NET. Execution enforces exactly these bounds (`TransactionContext::init` /
+    /// `finalize`), so this refuses only what could never be included — but it
+    /// refuses it at admission, where a failing transaction would otherwise cost
+    /// the sender nothing and the block builder its work. Unlimited accounts
+    /// (limit `-1`) and greylisting are handled as at execution.
+    fn check_payer_resource_window(
+        db: &Database,
+        packed_transaction: &PackedTransaction,
+        transaction: &Transaction,
+    ) -> Result<(), ChainError> {
+        let Some(payer) = transaction.first_authorizer() else {
+            return Ok(());
+        };
+        let payer = Name::new(payer);
+        let chain_config = db.chain_config()?;
+
+        let (cpu_limit, _) = ResourceLimitsManager::get_account_cpu_limit(
+            db,
+            &payer,
+            Some(MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER),
+        )?;
+        let min_cpu = chain_config.min_transaction_cpu_usage as u64;
+        if cpu_limit >= 0 && (cpu_limit as u64) < min_cpu {
+            return Err(ChainError::TransactionError(format!(
+                "payer {} cannot afford the transaction: available CPU {} is below the {} minimum",
+                payer, cpu_limit, min_cpu
+            )));
+        }
+
+        // The same initial NET estimate `init_for_input_trx` bills.
+        let unprunable = packed_transaction.get_unprunable_size()?;
+        let mut prunable = packed_transaction.get_prunable_size()?;
+        if chain_config.context_free_discount_net_usage_den > 0
+            && chain_config.context_free_discount_net_usage_num
+                < chain_config.context_free_discount_net_usage_den
+        {
+            let num = chain_config.context_free_discount_net_usage_num as u64;
+            let den = chain_config.context_free_discount_net_usage_den as u64;
+            prunable = (prunable * num + den - 1) / den;
+        }
+        let net_usage = chain_config.base_per_transaction_net_usage as u64 + unprunable + prunable;
+        let net_usage = ((net_usage + 7) / 8) * 8;
+        let (net_limit, _) = ResourceLimitsManager::get_account_net_limit(
+            db,
+            &payer,
+            Some(MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER),
+        )?;
+        if net_limit >= 0 && (net_limit as u64) < net_usage {
+            return Err(ChainError::TransactionError(format!(
+                "payer {} cannot afford the transaction: available NET {} is below its {} bytes",
+                payer, net_limit, net_usage
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -1056,6 +1131,7 @@ impl Controller {
 
             pending_chain: Vec::new(),
             blocks_executed: 0,
+            subjective_billing: SubjectiveBilling::default(),
         }
     }
 
@@ -1206,6 +1282,7 @@ impl Controller {
         upgrade_bytes: &[u8],
         db_path: &str,
     ) -> Result<(), ChainError> {
+        self.subjective_billing.clear();
         info!("initializing controller with DB path: {}", db_path);
         self.protocol_upgrade_schedule = ProtocolUpgradeSchedule::from_upgrade_bytes(upgrade_bytes)
             .map_err(|e| {
@@ -3825,6 +3902,28 @@ impl Controller {
         authorization_check: AuthorizationCheck,
         is_deferred: bool,
     ) -> Result<TransactionResult, ChainError> {
+        let trx = packed_transaction.get_transaction();
+        let track_subjective_failure = resource_mode == TransactionResourceMode::Measure
+            && *block_status != BlockStatus::Benchmarking;
+        let (subjective_bill, cpu_window, net_window) = if track_subjective_failure {
+            let cpu_window = self.db.get_account_cpu_usage_average_window()?;
+            let net_window = self.db.get_account_net_usage_average_window()?;
+            let bill = trx
+                .first_authorizer()
+                .map(|account| {
+                    self.subjective_billing.get_bill(
+                        account,
+                        pending_block_timestamp.slot(),
+                        cpu_window,
+                        net_window,
+                    )
+                })
+                .unwrap_or_default();
+            (bill, cpu_window, net_window)
+        } else {
+            (SubjectiveBill::default(), 1, 1)
+        };
+
         let (mut execution_db, dependency_tracker) =
             if *DEPENDENCY_TELEMETRY_ENABLED || *PARALLEL_WAVE_TELEMETRY_ENABLED {
                 let (database, tracker) = self.db.clone_with_dependency_tracking();
@@ -3867,6 +3966,7 @@ impl Controller {
                 packed_transaction.clone(),
                 self.max_transaction_time_ms(),
             );
+            trx_context.set_subjective_bill(subjective_bill.cpu, subjective_bill.net);
             self.set_context_active_schedule(&trx_context)?;
 
             match resource_mode {
@@ -3879,7 +3979,6 @@ impl Controller {
                 }
             }
 
-            let trx = packed_transaction.get_transaction();
             if is_deferred {
                 trx_context.init_for_deferred_trx(
                     packed_transaction.get_unprunable_size()?,
@@ -3909,9 +4008,32 @@ impl Controller {
                 // replay-only inline cache may span audited native transactions,
                 // but it must never span this fallback boundary.
                 trx_context.clear_xpr_inline_authorization_cache();
-                trx_context.exec(&trx)?;
+                if let Err(error) = trx_context.exec(&trx) {
+                    if track_subjective_failure {
+                        self.record_subjective_failure(
+                            &trx_context,
+                            pending_block_timestamp,
+                            cpu_window,
+                            net_window,
+                        )?;
+                    }
+                    return Err(error);
+                }
             }
-            let result = trx_context.finalize()?;
+            let result = match trx_context.finalize() {
+                Ok(result) => result,
+                Err(error) => {
+                    if track_subjective_failure {
+                        self.record_subjective_failure(
+                            &trx_context,
+                            pending_block_timestamp,
+                            cpu_window,
+                            net_window,
+                        )?;
+                    }
+                    return Err(error);
+                }
+            };
             if let TransactionResourceMode::ValidateReceipt { cpu_us, net_words } = resource_mode {
                 let measured_cpu_us = result.trace.receipt.cpu_usage_us;
                 let measured_net_words = result.trace.receipt.net_usage_words.0;
@@ -3961,6 +4083,25 @@ impl Controller {
         }
 
         execution
+    }
+
+    fn record_subjective_failure(
+        &mut self,
+        trx_context: &TransactionContext,
+        pending_block_timestamp: &BlockTimestamp,
+        cpu_window: u32,
+        net_window: u32,
+    ) -> Result<(), ChainError> {
+        let bill = trx_context.failure_bill()?;
+        self.subjective_billing.bill_failure(
+            bill.account.as_u64(),
+            bill.cpu_usage,
+            bill.net_usage,
+            pending_block_timestamp.slot(),
+            cpu_window,
+            net_window,
+        );
+        Ok(())
     }
 
     pub fn last_accepted_block(&self) -> &SignedBlock {
@@ -10806,6 +10947,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_transaction_subjectively_bills_first_authorizer() -> Result<(), ChainError> {
+        let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
+        let alice = Name::from_str("alice")?;
+
+        let mut mempool = Mempool::new();
+        mempool.add_transaction(create_account(&private_key, alice, chain_id)?);
+        let account_block = controller.build_block(&mut mempool).await?;
+        controller.accept_block(&account_block.id()?, &mut mempool)?;
+
+        let usage_before = controller
+            .database()
+            .arena_account_cpu_usage_value_ex(alice.as_u64())
+            .unwrap();
+        let parent_slot = controller.last_accepted_block().timestamp().slot();
+
+        // Execute enough cheap actions to exceed the minimum CPU floor, then
+        // make the native newaccount handler fail while decoding an empty
+        // payload. This proves already-consumed work survives the failure; the
+        // final receiver is pulse, but Alice is the first authorizer and must
+        // own the local charge.
+        let authorization = vec![PermissionLevel::new(alice.as_u64(), ACTIVE_NAME.as_u64())];
+        let mut actions = vec![
+            Action::new(
+                alice,
+                Name::from_str("noop")?,
+                vec![],
+                authorization.clone(),
+            );
+            1_001
+        ];
+        actions.push(Action::new(
+            PULSE_NAME,
+            NEWACCOUNT_NAME,
+            vec![],
+            authorization,
+        ));
+        let failed = Transaction::new(
+            TransactionHeader::new(TimePointSec::maximum(), 0, 0, 0u32.into(), 0, 0u32.into()),
+            vec![],
+            actions,
+        )
+        .sign(&private_key, &chain_id)?;
+        mempool.add_transaction(PackedTransaction::from_signed_transaction(failed)?);
+        assert!(
+            controller.build_block(&mut mempool).await.is_err(),
+            "a block containing only a failed transaction must remain empty"
+        );
+
+        // Consensus state still rolls back completely.
+        assert_eq!(
+            controller
+                .database()
+                .arena_account_cpu_usage_value_ex(alice.as_u64()),
+            Some(usage_before)
+        );
+
+        let now: BlockTimestamp = TimePoint::now().into();
+        let query_slot = now.slot().max(parent_slot.saturating_add(1));
+        let cpu_window = controller
+            .database()
+            .get_account_cpu_usage_average_window()?;
+        let net_window = controller
+            .database()
+            .get_account_net_usage_average_window()?;
+        let alice_bill = controller.subjective_billing.get_bill(
+            alice.as_u64(),
+            query_slot,
+            cpu_window,
+            net_window,
+        );
+        let pulse_bill = controller.subjective_billing.get_bill(
+            PULSE_NAME.as_u64(),
+            query_slot,
+            cpu_window,
+            net_window,
+        );
+
+        let min_cpu = controller
+            .database()
+            .chain_config()?
+            .min_transaction_cpu_usage as u64;
+        assert!(
+            alice_bill.cpu > min_cpu,
+            "failed work must retain actual CPU consumed above the billing floor"
+        );
+        assert!(alice_bill.net > 0, "failed input must retain a NET bill");
+        assert_eq!(
+            pulse_bill,
+            SubjectiveBill::default(),
+            "the receiver must not be charged instead of the first authorizer"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_push_transaction() -> Result<(), ChainError> {
         let chain_id =
             Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
@@ -10845,6 +11081,91 @@ mod tests {
             .is_known_unexpired_transaction(&result.trace.id.0.0)?;
         assert!(!found);
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mempool_admission_refuses_a_payer_that_cannot_afford_the_transaction()
+    -> Result<(), ChainError> {
+        let (mut controller, private_key, _chain_id, _temp) = init_test_controller()?;
+        let ts = controller.last_accepted_block().timestamp().clone();
+        let chain_id = controller.chain_id().clone();
+
+        // alice is created unlimited (-1) like every native newaccount; the
+        // transaction below is valid in every other respect and signed with her
+        // active key, so admission today accepts it regardless of her resources.
+        let alice = Name::from_str("alice")?;
+        controller.execute_transaction(
+            &create_account(&private_key, alice, chain_id)?,
+            &ts,
+            &BlockStatus::Building,
+        )?;
+        let trx = call_contract_as(
+            &private_key,
+            PULSE_NAME,
+            Name::from_str("nop")?,
+            &Vec::<u8>::new(),
+            alice,
+            chain_id,
+        )?;
+        controller
+            .validate_transaction_for_mempool(&trx, &ts)
+            .expect("an unlimited payer is admitted");
+
+        // Limits only bite once the chain has staked weight at all: like
+        // EOSIO, an account is unlimited while the total weight is zero. Give
+        // bob a stake so alice's own weight decides her window.
+        let bob = Name::from_str("bob")?;
+        controller.execute_transaction(
+            &create_account(&private_key, bob, chain_id)?,
+            &ts,
+            &BlockStatus::Building,
+        )?;
+        {
+            let mut db = controller.database();
+            db.set_account_limits(bob.as_u64(), 8 * 1024, 1_000_000, 1_000_000)?;
+            ResourceLimitsManager::process_account_limit_updates(&mut db)?;
+        }
+
+        // Zero CPU weight: execution would run to her (empty) budget and fail
+        // the objective limit; admission now refuses it up front, by name.
+        {
+            let mut db = controller.database();
+            db.set_account_limits(alice.as_u64(), 8 * 1024, 1_000_000, 0)?;
+            ResourceLimitsManager::process_account_limit_updates(&mut db)?;
+        }
+        let error = controller
+            .validate_transaction_for_mempool(&trx, &ts)
+            .expect_err("a payer with no CPU must be refused at admission");
+        assert!(
+            error.to_string().contains("payer alice cannot afford")
+                && error.to_string().contains("CPU"),
+            "unexpected error: {error}"
+        );
+
+        // Zero NET weight, plenty of CPU: refused for NET.
+        {
+            let mut db = controller.database();
+            db.set_account_limits(alice.as_u64(), 8 * 1024, 0, 1_000_000)?;
+            ResourceLimitsManager::process_account_limit_updates(&mut db)?;
+        }
+        let error = controller
+            .validate_transaction_for_mempool(&trx, &ts)
+            .expect_err("a payer with no NET must be refused at admission");
+        assert!(
+            error.to_string().contains("NET"),
+            "unexpected error: {error}"
+        );
+
+        // Funded again: admitted again.
+        {
+            let mut db = controller.database();
+            db.set_account_limits(alice.as_u64(), 8 * 1024, 1_000_000, 1_000_000)?;
+            ResourceLimitsManager::process_account_limit_updates(&mut db)?;
+        }
+        controller
+            .validate_transaction_for_mempool(&trx, &ts)
+            .expect("a funded payer is admitted");
         Ok(())
     }
 }
