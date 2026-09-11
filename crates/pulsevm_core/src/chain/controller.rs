@@ -1315,6 +1315,43 @@ impl Controller {
         }
     }
 
+    /// A header-derived ID alone does not authenticate supplied body/signature bytes.
+    /// Compare all execution inputs before reusing validation. Producer signatures
+    /// may differ legitimately, so authenticate a changed signature against the
+    /// original signer instead of making validity depend on the cached signature.
+    /// See docs/block-verification-cache.md.
+    fn validate_cached_block(
+        block: &SignedBlock,
+        validated: &SignedBlock,
+    ) -> Result<(), ChainError> {
+        if block.transactions != validated.transactions
+            || block.block_extensions != validated.block_extensions
+            || block.signed_block_header.header.pack()?
+                != validated.signed_block_header.header.pack()?
+        {
+            return Err(ChainError::BlockError(
+                "block contents do not match the previously validated block".into(),
+            ));
+        }
+        if block.signed_block_header.signature != validated.signed_block_header.signature {
+            let digest = validated.signed_block_header.header.sig_digest()?;
+            let expected = validated
+                .signed_block_header
+                .signature
+                .recover_public_key(&digest)?;
+            let signer = block
+                .signed_block_header
+                .signature
+                .recover_public_key(&digest)?;
+            if signer != expected {
+                return Err(ChainError::BlockError(
+                    "block signature does not match the previously validated producer key".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Verify a block against the schedule active as of its parent, execute it
     /// speculatively, and require our re-derived action and transaction merkle
     /// roots to match the ones the header commits to. The VM reproduces block
@@ -1326,14 +1363,18 @@ impl Controller {
         block: &SignedBlock,
         mempool: &mut Mempool,
     ) -> Result<(), ChainError> {
-        if self.verified_blocks.contains_key(&block.id()?) {
+        if let Some(validated) = self.verified_blocks.get(&block.id()?) {
+            Self::validate_cached_block(block, validated)?;
             return Ok(());
         } else if let Some(block_log) = &self.block_log {
             if let Ok(existing_block) = block_log.read_block(block.block_num()) {
                 let existing_block = SignedBlock::read(existing_block.as_slice(), &mut 0)?;
 
                 if existing_block.id()? == block.id()? {
-                    self.verified_blocks.insert(block.id()?, block.clone());
+                    Self::validate_cached_block(block, &existing_block)?;
+                    // Keep the canonical accepted bytes, never replace them with
+                    // a peer's representation of an already accepted block.
+                    self.verified_blocks.insert(block.id()?, existing_block);
                     warn!(
                         "block {} already exists in block log, skipping verification",
                         block.id()?
@@ -5732,6 +5773,146 @@ mod tests {
             .await
             .expect_err("a block too far ahead of local time must be rejected");
         assert!(error.to_string().contains("too far in the future"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cached_verification_checks_body_and_signature() -> Result<(), ChainError> {
+        use crate::chain::transaction::{
+            TransactionReceiptHeader,
+            TransactionStatus,
+        };
+
+        let (mut producer, key, chain_id, _p) = init_test_controller()?;
+        let mut pool = Mempool::new();
+        pool.add_transaction(create_account(&key, Name::from_str("aaa")?, chain_id)?);
+        let block = producer.build_block(&mut pool).await?;
+        let receipt = block.transactions.front().unwrap();
+        let signed = receipt.trx().get_signed_transaction();
+        let unsigned = PackedTransaction::from_signed_transaction(SignedTransaction::new(
+            signed.transaction().clone(),
+            BTreeSet::new(),
+            signed.context_free_data().clone(),
+        ))?;
+        let header = TransactionReceiptHeader::new(
+            TransactionStatus::Executed,
+            receipt.cpu_usage_us(),
+            receipt.net_usage_words().into(),
+        );
+        let mut mutations = Vec::new();
+        let mut empty = block.clone();
+        empty.transactions.clear();
+        mutations.push(empty);
+        let mut unsigned_block = block.clone();
+        unsigned_block.transactions =
+            VecDeque::from([TransactionReceipt::new(header.clone(), unsigned)]);
+        mutations.push(unsigned_block);
+        let mut replaced = block.clone();
+        replaced.transactions = VecDeque::from([TransactionReceipt::new(
+            header.clone(),
+            create_account(&key, Name::from_str("bbb")?, chain_id)?,
+        )]);
+        mutations.push(replaced);
+        let mut billed = block.clone();
+        let mut inflated = header;
+        inflated.cpu_usage_us += 1;
+        billed.transactions =
+            VecDeque::from([TransactionReceipt::new(inflated, receipt.trx().clone())]);
+        mutations.push(billed);
+        let mut extended = block.clone();
+        extended.block_extensions.push((0, vec![1]));
+        mutations.push(extended);
+        let mut wrong_signer = block.clone();
+        wrong_signer.signed_block_header.signature = key.sign(&Digest([0; 32]))?;
+        mutations.push(wrong_signer);
+
+        for source in ["memory", "log", "restart"] {
+            let (mut validator, _, _, temp) = init_test_controller()?;
+            validator.verify_block(&block, &mut pool).await?;
+            if source != "memory" {
+                validator.accept_block(&block.id()?, &mut pool)?;
+                assert!(!validator.verified_blocks.contains_key(&block.id()?));
+            }
+            if source == "restart" {
+                validator.shutdown()?;
+                drop(validator);
+                validator = Controller::new();
+                let config = json!({"producer_name": "pulse", "producer_key": key.to_string()})
+                    .to_string()
+                    .into_bytes();
+                validator.initialize(
+                    &chain_id,
+                    &config,
+                    &generate_genesis(&key),
+                    temp.path().to_str().unwrap(),
+                )?;
+            }
+            let root = validator.db.arena_state_root();
+            let executions = validator.blocks_executed;
+            let pending = validator.pending_chain.len();
+            for tampered in &mutations {
+                assert_eq!(tampered.id()?, block.id()?);
+                assert!(
+                    validator.verify_block(tampered, &mut pool).await.is_err(),
+                    "{source} cache accepted modified block bytes"
+                );
+                assert_eq!(validator.db.arena_state_root(), root);
+                assert_eq!(validator.pending_chain.len(), pending);
+                if source != "memory" {
+                    assert!(!validator.verified_blocks.contains_key(&block.id()?));
+                }
+            }
+            let round_trip = SignedBlock::read(&block.pack()?, &mut 0)?;
+            validator.verify_block(&round_trip, &mut pool).await?;
+            assert_eq!(validator.blocks_executed, executions);
+            assert_eq!(
+                validator
+                    .verified_blocks
+                    .get(&block.id()?)
+                    .unwrap()
+                    .pack()?,
+                block.pack()?
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cached_verification_allows_alternate_valid_producer_signature() -> Result<(), ChainError> {
+        use pulsevm_crypto::K1Signature;
+        use secp256k1::{
+            Message,
+            SECP256K1,
+            SecretKey,
+        };
+
+        let mut validated = SignedBlock::default();
+        let digest = validated.signed_block_header.header.sig_digest()?;
+        let secret = SecretKey::from_byte_array(&[7; 32]).unwrap();
+        let message = Message::from_digest(*digest.as_bytes());
+        let mut signatures = Vec::new();
+        for seed in 0u8..64 {
+            let signature =
+                SECP256K1.sign_ecdsa_recoverable_with_noncedata(&message, &secret, &[seed; 32]);
+            let (recovery_id, compact) = signature.serialize_compact();
+            let mut bytes = [0u8; 65];
+            bytes[0] = 31 + i32::from(recovery_id) as u8;
+            bytes[1..].copy_from_slice(&compact);
+            let signature = K1Signature::from_compact65(&bytes);
+            if signature.is_canonical() {
+                signatures.push(crate::crypto::Signature::new(signature));
+                if signatures.len() == 2 {
+                    break;
+                }
+            }
+        }
+        assert_eq!(signatures.len(), 2);
+        validated.signed_block_header.signature = signatures[0].clone();
+        let mut candidate = validated.clone();
+        candidate.signed_block_header.signature = signatures[1].clone();
+        assert_ne!(candidate.pack()?, validated.pack()?);
+        assert_eq!(candidate.id()?, validated.id()?);
+        Controller::validate_cached_block(&candidate, &validated)?;
         Ok(())
     }
 
