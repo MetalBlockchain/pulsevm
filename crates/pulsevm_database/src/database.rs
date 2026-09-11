@@ -763,7 +763,7 @@ impl Database {
         fs::create_dir_all(dir).map_err(|e| {
             ChainError::InternalError(format!("snapshot validation: create {}: {e}", self.path))
         })?;
-        let staged = Self::stage_snapshot(dir, header, payload)?;
+        let staged = Self::stage_snapshot(dir, header, payload, None)?;
         let candidate = crate::backend::ChainDatabase::new()
             .map_err(|e| ChainError::InternalError(format!("snapshot validation: init: {e:?}")))?;
         candidate

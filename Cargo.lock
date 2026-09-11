@@ -3767,6 +3767,7 @@ dependencies = [
  "pulsevm_error",
  "pulsevm_name",
  "pulsevm_rpc",
+ "serde",
  "serde_json",
  "tempfile",
 ]
