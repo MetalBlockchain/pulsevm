@@ -41,8 +41,8 @@ Options:
   --resource-monitor-space-threshold N
                            Set Leap's filesystem shutdown threshold percentage
                            (default: nodeos default; 0 disables this override)
-  --deferred-sidecar PATH  Write complete deferred-transaction chainbase state
-                           through the bundled source-node plugin
+  --deferred-sidecar PATH  Write complete SHiP-omitted chainbase state through
+                           the bundled source-node plugin
   --deferred-sidecar-dir PATH
                            Write a complete sidecar at startup and after each
                            accepted block, named <block-id>.json
@@ -52,7 +52,7 @@ The output directory contains:
   chain_state_history.log/.index  Standard XPR SHiP chain-state history
   manifest.env                     Pinned source, input and output hashes
                                   and optional bounded-window heights
-  deferred-transactions.json       Optional complete deferred-transaction sidecar
+  deferred-transactions.json       Optional complete migration sidecar
   deferred-blocks/<block-id>.json  Optional per-block sidecars for delta replay
   nodeos.log                       Source-node diagnostic log
 

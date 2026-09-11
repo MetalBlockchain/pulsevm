@@ -1,12 +1,12 @@
-//! Compare the complete 19-table SHiP snapshot emitted by nodeos with Arena's
-//! re-serialized snapshot. This compares the serialized logical row multiset:
+//! Compare the complete 19-table SHiP snapshot and two sidecar-only chainbase
+//! tables with Arena's re-serialized state. This compares logical row multisets:
 //! chainbase object ids determine nodeos's row order but are not present in the
 //! SHiP payload, so a different internal Arena allocation order is immaterial.
 //! It does not compare Rust's internal table bytes or rely on the importer summary.
 //!
 //! Usage:
 //! xpr_19_table_compare <nodeos-chain-state-history.log> <arena-checkpoint>
-//!     <arena-directory> <source-chain-id-hex> [report.json]
+//!     <arena-directory> <source-chain-id-hex> <chainbase-sidecar.json> [report.json]
 
 use std::{
     collections::BTreeMap,
@@ -18,6 +18,7 @@ use std::{
 
 use pulsevm_database::{
     Database,
+    DeferredTransactionSidecar,
     parse_initial_state_history_log,
 };
 use sha2::{
@@ -64,7 +65,7 @@ type TableRows = BTreeMap<String, Vec<(bool, Vec<u8>)>>;
 
 fn usage() {
     eprintln!(
-        "Usage: xpr_19_table_compare <nodeos-log> <checkpoint> <arena-dir> <source-chain-id-hex> [report.json]"
+        "Usage: xpr_19_table_compare <nodeos-log> <checkpoint> <arena-dir> <source-chain-id-hex> <chainbase-sidecar.json> [report.json]"
     );
 }
 
@@ -181,6 +182,51 @@ fn source_tables(entry: &pulsevm_database::StateHistoryEntry) -> Result<TableRow
     Ok(tables)
 }
 
+fn sidecar_tables(sidecar: &DeferredTransactionSidecar) -> Result<TableRows, String> {
+    let mut tables = BTreeMap::new();
+    let mut transactions = Vec::with_capacity(sidecar.input_transactions.len());
+    for row in &sidecar.input_transactions {
+        let trx_id = hex::decode(&row.trx_id)
+            .map_err(|error| format!("invalid input transaction id: {error}"))?;
+        if trx_id.len() != 32 {
+            return Err("input transaction id must contain exactly 32 bytes".into());
+        }
+        let mut bytes = trx_id;
+        bytes.extend_from_slice(&row.expiration.to_le_bytes());
+        transactions.push((true, bytes));
+    }
+    tables.insert("transaction".into(), transactions);
+    tables.insert(
+        "dynamic_global_property".into(),
+        vec![(true, sidecar.global_action_sequence.to_le_bytes().to_vec())],
+    );
+    Ok(tables)
+}
+
+fn arena_sidecar_tables(database: &Database) -> Result<TableRows, String> {
+    const TRANSACTION_ROW_BYTES: usize = 32 + 4;
+    let bytes = database
+        .arena_transaction_state_bytes()
+        .ok_or_else(|| "Arena transaction table is unavailable".to_owned())?;
+    if !bytes.len().is_multiple_of(TRANSACTION_ROW_BYTES) {
+        return Err("Arena transaction table has a partial canonical row".into());
+    }
+    let transactions = bytes
+        .chunks_exact(TRANSACTION_ROW_BYTES)
+        .map(|row| (true, row.to_vec()))
+        .collect();
+    let global_sequence = database
+        .arena_global_action_sequence()
+        .ok_or_else(|| "Arena dynamic global property row is unavailable".to_owned())?;
+    Ok(BTreeMap::from([
+        ("transaction".into(), transactions),
+        (
+            "dynamic_global_property".into(),
+            vec![(true, global_sequence.to_le_bytes().to_vec())],
+        ),
+    ]))
+}
+
 fn row_key(table: &str, row: &[u8]) -> String {
     let fields = match table {
         "contract_row"
@@ -252,7 +298,18 @@ fn diagnose_rows(table: &str, nodeos: &[(bool, Vec<u8>)], arena: &[(bool, Vec<u8
 
 #[cfg(test)]
 mod tests {
-    use super::hash_rows;
+    use pulsevm_database::{
+        Database,
+        DeferredTransactionSidecar,
+        InputTransactionSidecarRow,
+    };
+    use tempfile::TempDir;
+
+    use super::{
+        arena_sidecar_tables,
+        hash_rows,
+        sidecar_tables,
+    };
 
     #[test]
     fn logical_row_hash_ignores_allocation_order() {
@@ -266,6 +323,36 @@ mod tests {
         let row = vec![(true, vec![1, 2])];
         assert_ne!(hash_rows(&row), hash_rows(&[(false, vec![1, 2])]));
         assert_ne!(hash_rows(&row), hash_rows(&[(true, vec![1, 3])]));
+    }
+
+    #[test]
+    fn sidecar_only_tables_match_imported_arena_state() {
+        let trx_id = [0x5a; 32];
+        let sidecar = DeferredTransactionSidecar {
+            version: DeferredTransactionSidecar::VERSION,
+            source_block_id: hex::encode([1; 32]),
+            source_chain_id: Some(hex::encode([2; 32])),
+            account_metadata: vec![],
+            code: vec![],
+            permissions: vec![],
+            global_action_sequence: 1234,
+            input_transactions: vec![InputTransactionSidecarRow {
+                trx_id: hex::encode(trx_id),
+                expiration: 5678,
+            }],
+            transactions: vec![],
+        };
+        let temp = TempDir::new().unwrap();
+        let mut database = Database::new(temp.path().to_str().unwrap(), 1024 * 1024).unwrap();
+        database
+            .xpr_import_input_transactions(&[(trx_id, 5678)])
+            .unwrap();
+        database.xpr_import_global_action_sequence(1234).unwrap();
+
+        assert_eq!(
+            sidecar_tables(&sidecar).unwrap(),
+            arena_sidecar_tables(&database).unwrap()
+        );
     }
 }
 
@@ -285,6 +372,10 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     };
     let Some(chain_id) = args.next() else {
+        usage();
+        return ExitCode::from(2);
+    };
+    let Some(sidecar_path) = args.next() else {
         usage();
         return ExitCode::from(2);
     };
@@ -316,6 +407,28 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    let sidecar_bytes = match fs::read(&sidecar_path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("cannot read chainbase sidecar: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let sidecar = match DeferredTransactionSidecar::from_json_bytes(&sidecar_bytes) {
+        Ok(sidecar) => sidecar,
+        Err(error) => {
+            eprintln!("cannot parse chainbase sidecar: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    if !sidecar
+        .source_block_id
+        .as_bytes()
+        .eq_ignore_ascii_case(hex::encode(entry.block_id).as_bytes())
+    {
+        eprintln!("chainbase sidecar block does not match nodeos full-state record");
+        return ExitCode::from(1);
+    }
     let source_rows = match source_tables(&entry) {
         Ok(tables) => tables,
         Err(error) => {
@@ -342,6 +455,20 @@ fn main() -> ExitCode {
         Ok(tables) => tables,
         Err(error) => {
             eprintln!("cannot parse Arena SHiP snapshot: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let source_sidecar_rows = match sidecar_tables(&sidecar) {
+        Ok(tables) => tables,
+        Err(error) => {
+            eprintln!("cannot serialize source sidecar tables: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let arena_sidecar_rows = match arena_sidecar_tables(&database) {
+        Ok(tables) => tables,
+        Err(error) => {
+            eprintln!("cannot serialize Arena sidecar tables: {error}");
             return ExitCode::from(1);
         }
     };
@@ -376,6 +503,22 @@ fn main() -> ExitCode {
             eprintln!("unexpected table {name:?}");
         }
     }
+    for name in ["transaction", "dynamic_global_property"] {
+        let left_rows = source_sidecar_rows.get(name);
+        let right_rows = arena_sidecar_rows.get(name);
+        let left = left_rows.map(|rows| hash_rows(rows));
+        let right = right_rows.map(|rows| hash_rows(rows));
+        if left != right {
+            mismatch = true;
+            eprintln!("table {name}: nodeos-sidecar={left:?} arena={right:?}");
+            if let (Some(left_rows), Some(right_rows)) = (left_rows, right_rows) {
+                diagnose_rows(name, left_rows, right_rows);
+            }
+        } else if let Some(value) = &left {
+            println!("table {name}: rows={} sha256={}", value.rows, value.sha256);
+            report_tables.insert(name.to_owned(), value.clone());
+        }
+    }
 
     let report = Report {
         source_block_id: hex::encode(entry.block_id),
@@ -396,10 +539,10 @@ fn main() -> ExitCode {
         }
     }
     if mismatch {
-        eprintln!("19-table nodeos/Arena comparison FAILED");
+        eprintln!("21-table nodeos/Arena comparison FAILED");
         ExitCode::from(1)
     } else {
-        println!("19-table nodeos/Arena comparison passed");
+        println!("21-table nodeos/Arena comparison passed");
         ExitCode::SUCCESS
     }
 }

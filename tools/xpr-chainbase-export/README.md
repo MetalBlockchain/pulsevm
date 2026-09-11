@@ -80,8 +80,8 @@ cargo run -p pulsevm_database --example xpr_history_window_check -- \
 
 The checker validates record offsets, consecutive block ids, SHiP framing, and
 decoded table/row counts. It reports `generated_transaction` rows explicitly:
-SHiP v0 omits their scheduling timestamps, and the deferred sidecar currently
-covers the imported snapshot head rather than later window deltas.
+SHiP v0 omits their scheduling timestamps and all input-transaction dedupe
+rows, so each post-snapshot block must use the matching complete sidecar view.
 
 The bounded consumer can apply supported rows to a restored checkpoint with
 per-block undo/rollback:
@@ -122,8 +122,10 @@ PulseVM's Arena schema.
 SHiP is a logical projection, not a complete chainbase export. In addition to
 the `generated_transaction_v0` timestamps (`delay_until`, `expiration`, and
 `published`), it omits account sequence counters, code bookkeeping, and
-permission usage timestamps. The source-node sidecar therefore captures those
-fields from the **same restored snapshot head** as `chain_state_history.log`.
+permission usage timestamps. It also omits the global action sequence and the
+complete `transaction_object` set used to reject replayed input transactions.
+The source-node sidecar therefore captures those fields from the **same restored
+snapshot head** as `chain_state_history.log`.
 Do not use an RPC query from a later head block: it can produce a plausible but
 inconsistent snapshot.
 
@@ -133,7 +135,7 @@ times are `time_point` microseconds):
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "source_block_id": "<64 lowercase hexadecimal characters>",
   "source_chain_id": "<64 lowercase hexadecimal characters>",
   "account_metadata": [
@@ -161,6 +163,13 @@ times are `time_point` microseconds):
       "last_used": 1710000000000000
     }
   ],
+  "global_action_sequence": 1637582121,
+  "input_transactions": [
+    {
+      "trx_id": "<64 lowercase hexadecimal characters>",
+      "expiration": 1788894001
+    }
+  ],
   "transactions": [
     {
       "sender": 6138663591592764928,
@@ -186,7 +195,10 @@ cargo run -p pulsevm_database --example xpr_import_check -- \
 
 The full-state importer verifies the block and source-chain IDs, requires each
 supplied sidecar table to cover the corresponding SHiP rows exactly, and checks
-every deferred identity/payload one-for-one before it accepts the sidecar. For
+every deferred identity/payload one-for-one before it accepts the sidecar. It
+restores the input-transaction dedupe set and global action sequence atomically
+with the SHiP rows; the manifest records the dedupe-row count and startup rejects
+a checkpoint whose count differs. For
 post-block sidecars, the delta consumer requires every changed SHiP row to be
 covered and permits the sidecar to contain the complete post-block table view.
 Its
@@ -195,6 +207,11 @@ the complete records are persisted in Arena. Startup re-parses every deferred
 raw transaction and checks its ID against the sidecar before allowing the
 scheduler to run it; an incompatible XPR transaction therefore fails before
 the network begins producing blocks.
+
+As an independent operational safeguard, keep the source write-frozen for at
+least its configured `max_transaction_lifetime` before opening target admission,
+or keep target admission closed until cut time plus that lifetime. XPR Mainnet's
+configured maximum is 3,600 seconds.
 Once a record's delay has elapsed, it executes outside the mempool without
 re-checking its original signatures. If it is already expired, PulseVM retires
 it with XPR's ID-only `expired` receipt. Otherwise, if execution fails,
@@ -273,8 +290,9 @@ tools/xpr-chainbase-export/host-function-audit.sh \
 ```
 
 After importing the checkpoint, validate the export end to end. This verifies
-manifest hashes, the full SHiP record, all 19 nodeos tables (including the
-floating-point indexes and generated transactions), and the independent code
+manifest hashes, the full SHiP record, all 19 nodeos SHiP tables (including the
+floating-point indexes and generated transactions), both sidecar-only tables
+(`transaction` and `dynamic_global_property`), and the independent code
 object/permission/deferred sidecar audit:
 
 ```bash

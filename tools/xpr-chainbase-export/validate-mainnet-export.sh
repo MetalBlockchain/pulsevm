@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Validate an XPR nodeos export before it is allowed into the migration path.
-# This checks artifact hashes, the full-state SHiP record, all 19 tables, and
+# This checks artifact hashes, the full-state SHiP record, all 19 SHiP tables,
+# both sidecar-only consensus tables, and
 # the source-side code/deferred sidecar fields omitted by SHiP.
 
 set -euo pipefail
@@ -13,7 +14,7 @@ Usage:
 
 The export directory must contain manifest.env and state-history/chain_state_history.log.
 If --source-chain-id is omitted, it is read from deferred-transactions.json.
-The command writes 19-table-comparison.json and code-object-audit.txt beside the export.
+The command writes 21-table-comparison.json and code-object-audit.txt beside the export.
 EOF
 }
 
@@ -42,6 +43,15 @@ history_log="$export_dir/state-history/chain_state_history.log"
 sidecar="$export_dir/deferred-transactions.json"
 [[ -s "$history_log" ]] || { echo "missing full state-history log: $history_log" >&2; exit 1; }
 [[ -s "$sidecar" ]] || { echo "validated Mainnet export requires deferred-transactions.json" >&2; exit 1; }
+jq -e '
+    .version == 2 and
+    (.global_action_sequence | type == "number") and
+    (.input_transactions | type == "array") and
+    (.transactions | type == "array")
+' "$sidecar" >/dev/null || {
+    echo "validated Mainnet export requires a version-2 migration sidecar with replay-protection state" >&2
+    exit 1
+}
 
 manifest_value() { awk -F= -v key="$1" '$1 == key { print substr($0, index($0, "=") + 1); exit }' "$export_dir/manifest.env"; }
 sha256_file() {
@@ -87,15 +97,15 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 )
 (cd "$repo_root" && cargo run --quiet --release --locked -p pulsevm_database --example xpr_19_table_compare -- \
     "$history_log" "$checkpoint" "$arena_dir" "$source_chain_id" \
-    "$export_dir/19-table-comparison.json"
+    "$sidecar" "$export_dir/21-table-comparison.json"
 )
 (cd "$repo_root" && cargo run --quiet --release --locked -p pulsevm_database --example xpr_code_object_audit -- \
     "$history_log" "$sidecar" >"$export_dir/code-object-audit.txt"
 )
 
 printf 'validated Mainnet export\n'
-printf 'source_block_id=%s\n' "$(jq -er '.source_block_id' "$export_dir/19-table-comparison.json")"
+printf 'source_block_id=%s\n' "$(jq -er '.source_block_id' "$export_dir/21-table-comparison.json")"
 printf 'source_chain_id=%s\n' "$source_chain_id"
 printf 'history_sha256=%s\n' "$actual_history"
-printf 'comparison=%s\n' "$export_dir/19-table-comparison.json"
+printf 'comparison=%s\n' "$export_dir/21-table-comparison.json"
 printf 'code_audit=%s\n' "$export_dir/code-object-audit.txt"

@@ -1369,6 +1369,29 @@ impl Database {
         Some(self.backend.transaction_state_bytes())
     }
 
+    /// Number of unexpired input transactions currently retained for replay
+    /// protection.
+    pub fn arena_transaction_count(&self) -> usize {
+        self.backend.transaction_count()
+    }
+
+    /// Replace the full input-transaction dedupe table during XPR migration.
+    pub fn xpr_import_input_transactions(
+        &mut self,
+        rows: &[([u8; 32], u32)],
+    ) -> Result<(), ChainError> {
+        for (trx_id, _) in rows {
+            self.dependency_system_write(SystemKey::Transaction(*trx_id));
+        }
+        self.backend
+            .xpr_import_input_transactions(rows)
+            .map_err(|error| {
+                ChainError::InternalError(format!(
+                    "XPR import input-transaction dedupe set: {error:?}"
+                ))
+            })
+    }
+
     pub fn arena_resource_usage_state_bytes(&self) -> Option<Vec<u8>> {
         Some(self.backend.resource_usage_state_bytes())
     }
@@ -5088,6 +5111,16 @@ impl Database {
     /// unwritten.
     pub fn arena_global_action_sequence(&self) -> Option<u64> {
         self.backend.global_action_sequence()
+    }
+
+    /// Restore the source chain's action-receipt sequence at migration.
+    pub fn xpr_import_global_action_sequence(&mut self, value: u64) -> Result<(), ChainError> {
+        self.dependency_system_write(SystemKey::GlobalActionSequence);
+        self.backend
+            .set_global_action_sequence(value)
+            .map_err(|error| {
+                ChainError::InternalError(format!("XPR import global action sequence: {error:?}"))
+            })
     }
 
     pub fn create_permission(

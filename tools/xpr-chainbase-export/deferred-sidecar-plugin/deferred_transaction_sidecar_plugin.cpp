@@ -3,7 +3,9 @@
 #include <eosio/chain/account_object.hpp>
 #include <eosio/chain/code_object.hpp>
 #include <eosio/chain/generated_transaction_object.hpp>
+#include <eosio/chain/global_property_object.hpp>
 #include <eosio/chain/permission_object.hpp>
+#include <eosio/chain/transaction_object.hpp>
 
 #include <algorithm>
 #include <boost/signals2/connection.hpp>
@@ -54,7 +56,7 @@ public:
       // the sidecar must use that ID rather than the next P2P-accepted block.
       std::ofstream output(output_path.string(), std::ios::out | std::ios::trunc);
       EOS_ASSERT(output, chain::plugin_exception, "cannot open deferred sidecar ${p}", ("p", output_path.string()));
-      output << "{\"version\":1,\"source_block_id\":\"" << source_block_id.str()
+      output << "{\"version\":2,\"source_block_id\":\"" << source_block_id.str()
              << "\",\"source_chain_id\":\"" << chain.get_chain_id().str()
              << "\",\"account_metadata\":[";
 
@@ -100,6 +102,22 @@ public:
          output << "{\"owner\":" << row.owner.to_uint64_t()
                 << ",\"name\":" << row.name.to_uint64_t()
                 << ",\"last_used\":" << usage->last_used.time_since_epoch().count() << "}";
+      }
+      const auto& dynamic_globals = chain.db().get_index<chain::dynamic_global_property_multi_index>();
+      EOS_ASSERT(dynamic_globals.indices().size() == 1, chain::plugin_exception,
+                 "expected exactly one dynamic_global_property row");
+      output << "],\"global_action_sequence\":"
+             << dynamic_globals.indices().begin()->global_action_sequence
+             << ",\"input_transactions\":[";
+
+      const auto& input_transactions = chain.db().get_index<chain::transaction_multi_index>();
+      first = true;
+      for (const auto& row : input_transactions.indices()) {
+         if (!first)
+            output << ',';
+         first = false;
+         output << "{\"trx_id\":\"" << row.trx_id.str()
+                << "\",\"expiration\":" << row.expiration.sec_since_epoch() << "}";
       }
       output << "],\"transactions\":[";
 

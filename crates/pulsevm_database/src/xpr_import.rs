@@ -121,6 +121,10 @@ pub struct ImportSummary {
     /// fixtures. Absent means the older artifact contained no deferred rows.
     #[serde(default)]
     pub deferred_transactions: u64,
+    /// Unexpired input-transaction IDs retained across cutover so a signed
+    /// source transaction cannot execute a second time on the target chain.
+    #[serde(default)]
+    pub input_transactions: u64,
     pub contract_tables: u64,
     pub contract_rows: u64,
     pub index64_rows: u64,
@@ -153,8 +157,9 @@ pub struct MigrationManifest {
     pub source_chain_id: Option<String>,
     pub checkpoint_sha256: String,
     pub checkpoint_revision: i64,
-    /// When the source contains deferred transactions, this commits the
-    /// chainbase-sidecar which supplies the timestamps SHiP v0 does not carry.
+    /// Commits the chainbase sidecar that supplies every field SHiP v0 omits,
+    /// including replay-protection rows. The field keeps its original name for
+    /// migration-manifest compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deferred_transaction_sidecar_sha256: Option<String>,
     pub import_summary: ImportSummary,
@@ -183,10 +188,9 @@ impl MigrationManifest {
         }
     }
 
-    /// Bind this migration manifest to the exact deferred-transaction sidecar
-    /// verified during import. The sidecar is intentionally a separate
-    /// artifact because SHiP's generated_transaction_v0 projection omits
-    /// scheduling timestamps present in XPR chainbase.
+    /// Bind this migration manifest to the exact chainbase sidecar verified
+    /// during import. It is separate because SHiP omits transaction dedupe,
+    /// action-sequence, and generated-transaction scheduling state.
     pub fn with_deferred_transaction_sidecar(mut self, sidecar: &[u8]) -> Self {
         self.deferred_transaction_sidecar_sha256 =
             Some(hex::encode(Digest::hash(sidecar).as_bytes()));
@@ -302,7 +306,7 @@ impl fmt::Display for XprImportError {
 
 impl std::error::Error for XprImportError {}
 
-/// JSON emitted by the XPR chainbase deferred-transaction sidecar exporter.
+/// JSON emitted by the XPR chainbase migration-sidecar exporter.
 ///
 /// XPR's SHiP `generated_transaction_v0` table row contains identity and
 /// payload bytes, but not its three scheduler timestamps. A source-node
@@ -326,6 +330,10 @@ pub struct DeferredTransactionSidecar {
     pub code: Vec<CodeSidecarRow>,
     #[serde(default)]
     pub permissions: Vec<PermissionSidecarRow>,
+    /// Counter from `dynamic_global_property_object`, which SHiP omits.
+    pub global_action_sequence: u64,
+    /// Complete `transaction_object` replay-protection set, which SHiP omits.
+    pub input_transactions: Vec<InputTransactionSidecarRow>,
     #[serde(default)]
     pub transactions: Vec<DeferredTransactionSidecarRow>,
 }
@@ -358,6 +366,15 @@ pub struct PermissionSidecarRow {
     pub last_used: i64,
 }
 
+/// One XPR chainbase `transaction_object` replay-protection record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InputTransactionSidecarRow {
+    pub trx_id: String,
+    /// XPR `time_point_sec` value in whole seconds since the Unix epoch.
+    pub expiration: u32,
+}
+
 /// One complete XPR chainbase `generated_transaction_object` record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -375,7 +392,7 @@ pub struct DeferredTransactionSidecarRow {
 }
 
 impl DeferredTransactionSidecar {
-    pub const VERSION: u16 = 1;
+    pub const VERSION: u16 = 2;
 
     /// Parse and normalize a sidecar before it is compared with SHiP rows.
     pub fn from_json_bytes(bytes: &[u8]) -> Result<Self, XprImportError> {
@@ -417,6 +434,14 @@ impl DeferredTransactionSidecar {
         for row in &sidecar.permissions {
             if !permission_keys.insert((row.owner, row.name)) {
                 return Err(bad("duplicate permission sidecar row"));
+            }
+        }
+        let mut input_transaction_ids = HashSet::new();
+        for row in &sidecar.input_transactions {
+            let trx_id = decode_block_id(&row.trx_id)
+                .map_err(|error| bad(format!("invalid input transaction id: {error}")))?;
+            if !input_transaction_ids.insert(trx_id) {
+                return Err(bad("duplicate input transaction sidecar row"));
             }
         }
         for row in &sidecar.transactions {
@@ -665,6 +690,12 @@ pub fn hydrate_full_state_with_deferred_transactions(
         // source-node sidecar after the base rows exist, still inside the same
         // undo session so a missing or malformed row cannot partially commit.
         if let Some(sidecar) = deferred_transactions {
+            db.xpr_import_global_action_sequence(sidecar.global_action_sequence)
+                .map_err(database_error)?;
+            let input_transactions = decode_input_transactions(sidecar)?;
+            db.xpr_import_input_transactions(&input_transactions)
+                .map_err(database_error)?;
+            summary.input_transactions = input_transactions.len() as u64;
             for row in &sidecar.account_metadata {
                 db.xpr_import_update_account_metadata(
                     row.name,
@@ -944,6 +975,12 @@ pub fn apply_state_history_delta_with_sidecar(
             apply_delta_row(db, present, row, &mut summary)?;
         }
         if let Some(sidecar) = deferred_transactions {
+            db.xpr_import_global_action_sequence(sidecar.global_action_sequence)
+                .map_err(database_error)?;
+            let input_transactions = decode_input_transactions(sidecar)?;
+            db.xpr_import_input_transactions(&input_transactions)
+                .map_err(database_error)?;
+            summary.input_transactions = input_transactions.len() as u64;
             for row in &sidecar.account_metadata {
                 if !delta_metadata_names.contains(&row.name) {
                     continue;
@@ -2162,6 +2199,20 @@ fn decode_block_id(value: &str) -> Result<[u8; 32], XprImportError> {
     bytes.try_into().map_err(|_| {
         bad("invalid deferred-transaction sidecar block id: expected 32-byte hexadecimal value")
     })
+}
+
+fn decode_input_transactions(
+    sidecar: &DeferredTransactionSidecar,
+) -> Result<Vec<([u8; 32], u32)>, XprImportError> {
+    sidecar
+        .input_transactions
+        .iter()
+        .map(|row| {
+            decode_block_id(&row.trx_id)
+                .map(|trx_id| (trx_id, row.expiration))
+                .map_err(|error| bad(format!("invalid input transaction id: {error}")))
+        })
+        .collect()
 }
 
 fn sidecar_key(
@@ -3602,7 +3653,7 @@ mod tests {
             }],
         };
         let sidecar = DeferredTransactionSidecar {
-            version: 1,
+            version: DeferredTransactionSidecar::VERSION,
             source_block_id: hex::encode(entry.block_id),
             source_chain_id: None,
             account_metadata: vec![],
@@ -3621,6 +3672,8 @@ mod tests {
                     last_used: 999,
                 },
             ],
+            global_action_sequence: 0,
+            input_transactions: vec![],
             transactions: vec![],
         };
         let dir = TempDir::new().unwrap();
@@ -3684,7 +3737,7 @@ mod tests {
             ],
         };
         let sidecar = DeferredTransactionSidecar {
-            version: 1,
+            version: DeferredTransactionSidecar::VERSION,
             source_block_id: hex::encode(entry.block_id),
             source_chain_id: None,
             account_metadata: vec![AccountMetadataSidecarRow {
@@ -3706,6 +3759,8 @@ mod tests {
                 name: 111,
                 last_used: 123_456,
             }],
+            global_action_sequence: 987_654_321,
+            input_transactions: vec![],
             transactions: vec![],
         };
         let dir = TempDir::new().unwrap();
@@ -3717,6 +3772,7 @@ mod tests {
         assert_eq!(metadata.auth_sequence, 8);
         assert_eq!(metadata.code_sequence, 9);
         assert_eq!(metadata.abi_sequence, 10);
+        assert_eq!(db.arena_global_action_sequence(), Some(987_654_321));
         assert_eq!(
             db.read()
                 .unwrap()
@@ -3729,7 +3785,7 @@ mod tests {
     #[test]
     fn rejects_sidecar_bookkeeping_that_does_not_cover_source_rows() {
         let sidecar = DeferredTransactionSidecar {
-            version: 1,
+            version: DeferredTransactionSidecar::VERSION,
             source_block_id: hex::encode([0; 32]),
             source_chain_id: None,
             account_metadata: vec![AccountMetadataSidecarRow {
@@ -3741,6 +3797,8 @@ mod tests {
             }],
             code: vec![],
             permissions: vec![],
+            global_action_sequence: 0,
+            input_transactions: vec![],
             transactions: vec![],
         };
         let rows = vec![PortableRow::AccountMetadata {
@@ -3756,12 +3814,14 @@ mod tests {
     #[test]
     fn rejects_sidecar_source_chain_id_mismatch() {
         let sidecar = DeferredTransactionSidecar {
-            version: 1,
+            version: DeferredTransactionSidecar::VERSION,
             source_block_id: hex::encode([0; 32]),
             source_chain_id: Some(hex::encode([2; 32])),
             account_metadata: vec![],
             code: vec![],
             permissions: vec![],
+            global_action_sequence: 0,
+            input_transactions: vec![],
             transactions: vec![],
         };
         let config = ChainConfigV0 {
@@ -3853,7 +3913,7 @@ mod tests {
             deltas: vec![delta("generated_transaction", generated)],
         };
         let sidecar_json = format!(
-            r#"{{"version":1,"source_block_id":"{}","transactions":[{{"sender":11,"sender_id":"{}","payer":14,"trx_id":"{}","delay_until":1,"expiration":2,"published":0,"packed_trx":"1011"}}]}}"#,
+            r#"{{"version":2,"source_block_id":"{}","global_action_sequence":0,"input_transactions":[],"transactions":[{{"sender":11,"sender_id":"{}","payer":14,"trx_id":"{}","delay_until":1,"expiration":2,"published":0,"packed_trx":"1011"}}]}}"#,
             hex::encode(entry.block_id),
             (12u128 | ((13u128) << 64)),
             hex::encode([15; 32]),
@@ -3867,6 +3927,66 @@ mod tests {
         assert_eq!(summary.deferred_transactions, 1);
         assert_eq!(db.deferred_transaction_count(), 1);
         assert!(!db.is_account(11).unwrap());
+    }
+
+    #[test]
+    fn imports_input_transaction_dedupe_and_global_sequence_from_sidecar() {
+        let entry = StateHistoryEntry {
+            magic: 0,
+            block_id: [42; 32],
+            deltas: vec![],
+        };
+        let trx_id = [0xabu8; 32];
+        let sidecar = DeferredTransactionSidecar::from_json_bytes(
+            format!(
+                r#"{{"version":2,"source_block_id":"{}","global_action_sequence":1637582121,"input_transactions":[{{"trx_id":"{}","expiration":1788894001}}],"transactions":[]}}"#,
+                hex::encode(entry.block_id),
+                hex::encode(trx_id),
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let dir = TempDir::new().unwrap();
+        let mut db = Database::new(dir.path().to_str().unwrap(), 64 * 1024 * 1024).unwrap();
+
+        let summary =
+            hydrate_full_state_with_deferred_transactions(&mut db, &entry, Some(&sidecar)).unwrap();
+
+        assert_eq!(summary.input_transactions, 1);
+        assert_eq!(db.arena_transaction_count(), 1);
+        assert!(db.arena_transaction_exists(&trx_id));
+        assert_eq!(db.arena_global_action_sequence(), Some(1_637_582_121));
+    }
+
+    #[test]
+    fn rejects_legacy_sidecar_without_replay_protection_table() {
+        let error = DeferredTransactionSidecar::from_json_bytes(
+            br#"{"version":1,"source_block_id":"0000000000000000000000000000000000000000000000000000000000000000","transactions":[]}"#,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("invalid deferred-transaction sidecar JSON")
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_input_transaction_sidecar_rows() {
+        let trx_id = hex::encode([7; 32]);
+        let error = DeferredTransactionSidecar::from_json_bytes(
+            format!(
+                r#"{{"version":2,"source_block_id":"{}","global_action_sequence":0,"input_transactions":[{{"trx_id":"{trx_id}","expiration":1}},{{"trx_id":"{trx_id}","expiration":2}}],"transactions":[]}}"#,
+                hex::encode([0; 32]),
+            )
+            .as_bytes(),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate input transaction sidecar row")
+        );
     }
 
     #[test]
@@ -3885,7 +4005,7 @@ mod tests {
         };
         let sidecar = DeferredTransactionSidecar::from_json_bytes(
             format!(
-                r#"{{"version":1,"source_block_id":"{}","transactions":[{{"sender":11,"sender_id":"{}","payer":14,"trx_id":"{}","delay_until":1,"expiration":2,"published":0,"packed_trx":"1011"}}]}}"#,
+                r#"{{"version":2,"source_block_id":"{}","global_action_sequence":0,"input_transactions":[],"transactions":[{{"sender":11,"sender_id":"{}","payer":14,"trx_id":"{}","delay_until":1,"expiration":2,"published":0,"packed_trx":"1011"}}]}}"#,
                 hex::encode(entry.block_id),
                 (12u128 | ((13u128) << 64)),
                 hex::encode([15; 32]),
@@ -3903,9 +4023,40 @@ mod tests {
     }
 
     #[test]
+    fn delta_sidecar_replaces_omitted_input_transaction_state() {
+        let entry = StateHistoryEntry {
+            magic: 0,
+            block_id: [44; 32],
+            deltas: vec![],
+        };
+        let old_id = [1; 32];
+        let new_id = [2; 32];
+        let sidecar = DeferredTransactionSidecar::from_json_bytes(
+            format!(
+                r#"{{"version":2,"source_block_id":"{}","global_action_sequence":99,"input_transactions":[{{"trx_id":"{}","expiration":123}}],"transactions":[]}}"#,
+                hex::encode(entry.block_id),
+                hex::encode(new_id),
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let dir = TempDir::new().unwrap();
+        let mut db = Database::new(dir.path().to_str().unwrap(), 64 * 1024 * 1024).unwrap();
+        db.record_transaction(&old_id, 100).unwrap();
+
+        let summary =
+            apply_state_history_delta_with_sidecar(&mut db, &entry, Some(&sidecar)).unwrap();
+
+        assert_eq!(summary.input_transactions, 1);
+        assert!(!db.arena_transaction_exists(&old_id));
+        assert!(db.arena_transaction_exists(&new_id));
+        assert_eq!(db.arena_global_action_sequence(), Some(99));
+    }
+
+    #[test]
     fn rejects_deferred_sidecar_from_a_different_block() {
         let sidecar = DeferredTransactionSidecar::from_json_bytes(
-            br#"{"version":1,"source_block_id":"0000000000000000000000000000000000000000000000000000000000000000","transactions":[]}"#,
+            br#"{"version":2,"source_block_id":"0000000000000000000000000000000000000000000000000000000000000000","global_action_sequence":0,"input_transactions":[],"transactions":[]}"#,
         )
         .unwrap();
         let error = validate_sidecar_block_id(&sidecar, [1; 32]).unwrap_err();
@@ -4004,6 +4155,7 @@ mod tests {
         .unwrap();
         assert_eq!(manifest.import_summary.accounts, 3);
         assert_eq!(manifest.import_summary.deferred_transactions, 0);
+        assert_eq!(manifest.import_summary.input_transactions, 0);
     }
 
     fn delta(name: &str, data: Vec<u8>) -> TableDelta {

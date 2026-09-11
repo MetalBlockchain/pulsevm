@@ -62,6 +62,7 @@ pub use crate::{
         DeferredTransactionSidecar,
         DeferredTransactionSidecarRow,
         ImportSummary,
+        InputTransactionSidecarRow,
         MigrationManifest,
         StateHistoryEntry,
         StateHistoryWindowSummary,

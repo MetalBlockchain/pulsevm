@@ -243,7 +243,7 @@ prepare_canonical_checkpoint() {
       "$CANONICAL_CHECKPOINT" \
       "$EXPORT_DIR/deferred-transactions.json"
 
-  echo "==> Running the Mainnet manifest, 19-table, code-object, and sidecar gates"
+  echo "==> Running the Mainnet manifest, 21-table, code-object, and sidecar gates"
   validate_canonical_checkpoint "$snapshot"
 }
 

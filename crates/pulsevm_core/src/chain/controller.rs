@@ -1431,6 +1431,15 @@ impl Controller {
                     checkpoint
                 );
             }
+            if self.db.revision() == manifest.checkpoint_revision {
+                let imported_transactions = self.db.arena_transaction_count() as u64;
+                if imported_transactions != manifest.import_summary.input_transactions {
+                    return Err(ChainError::GenesisError(format!(
+                        "migration checkpoint contains {imported_transactions} input-transaction dedupe rows but manifest commits to {}",
+                        manifest.import_summary.input_transactions
+                    )));
+                }
+            }
         } else if migration_checkpoint.is_some() || migration_manifest.is_some() {
             return Err(ChainError::GenesisError(
                 "migration_checkpoint and migration_manifest must be configured together".into(),
@@ -9880,6 +9889,7 @@ mod tests {
         let migrated = Name::from_str("migrated")?;
         checkpoint_db.create_account(PULSE_NAME.as_u64(), 7)?;
         checkpoint_db.create_account(migrated.as_u64(), 42)?;
+        checkpoint_db.record_transaction(&[0x77; 32], 1_700_003_600)?;
         checkpoint_db.set_revision(42)?;
         let checkpoint = checkpoint_db.snapshot_bytes()?;
         fs::write(&checkpoint_path, &checkpoint).map_err(|e| {
@@ -9905,7 +9915,10 @@ mod tests {
             source_block_id.0.0,
             &checkpoint,
             42,
-            Default::default(),
+            pulsevm_database::ImportSummary {
+                input_transactions: 1,
+                ..Default::default()
+            },
         );
         manifest.source_block = Some(hex::encode(source_block.pack()?));
         fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).map_err(|e| {
@@ -9962,6 +9975,28 @@ mod tests {
         assert_eq!(restarted.database().revision(), 42);
         assert_eq!(restarted.last_accepted_block().id()?, source_block_id);
         restarted.shutdown()?;
+
+        manifest.import_summary.input_transactions = 2;
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).map_err(|e| {
+            ChainError::InternalError(format!(
+                "failed to write mismatched migration manifest {}: {e}",
+                manifest_path.display()
+            ))
+        })?;
+        let rejected_path = temp.path().join("rejected-target");
+        let error = Controller::new()
+            .initialize(
+                &chain_id,
+                &config_bytes,
+                &migration_genesis,
+                rejected_path.to_str().unwrap(),
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("input-transaction dedupe rows but manifest commits")
+        );
         Ok(())
     }
 

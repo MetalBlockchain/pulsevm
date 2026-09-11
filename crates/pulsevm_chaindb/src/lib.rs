@@ -13,9 +13,12 @@
 //! snapshots can read the frozen block prefix concurrently. Never hold a guard
 //! across an `.await`.
 
-use std::sync::{
-    Arc,
-    RwLock,
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc,
+        RwLock,
+    },
 };
 
 mod history;
@@ -4216,6 +4219,46 @@ impl ChainDatabase {
             .ok()
             .flatten()
             .is_some()
+    }
+
+    /// Number of unexpired input transactions retained for replay protection.
+    pub fn transaction_count(&self) -> usize {
+        self.read()
+            .table::<TransactionRow>()
+            .map(|table| table.iter().count())
+            .unwrap_or_default()
+    }
+
+    /// Replace the complete migrated replay-protection set with the source
+    /// chainbase view. The caller validates uniqueness before this operation;
+    /// this method still uses an ordered map so mutation order is deterministic.
+    pub fn xpr_import_input_transactions(&self, rows: &[([u8; 32], u32)]) -> Result<(), DbError> {
+        let desired = rows.iter().copied().collect::<BTreeMap<_, _>>();
+        let mut db = self.lock();
+        let existing = db
+            .table::<TransactionRow>()?
+            .iter()
+            .map(|row| (row.id(), row.trx_id, row.expiration))
+            .collect::<Vec<_>>();
+        for (id, trx_id, expiration) in &existing {
+            if desired.get(trx_id).copied() != Some(*expiration) {
+                db.remove::<TransactionRow>(*id)?;
+            }
+        }
+        let current = existing
+            .into_iter()
+            .map(|(_, trx_id, expiration)| (trx_id, expiration))
+            .collect::<BTreeMap<_, _>>();
+        for (&trx_id, &expiration) in &desired {
+            if current.get(&trx_id).copied() == Some(expiration) {
+                continue;
+            }
+            db.create::<TransactionRow>(|row| {
+                row.trx_id = trx_id;
+                row.expiration = expiration;
+            })?;
+        }
+        Ok(())
     }
 
     /// Mirrors `clear_expired_input_transactions`: drops every row whose
