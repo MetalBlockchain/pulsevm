@@ -456,10 +456,6 @@ struct PendingBlock {
     // Transaction traces produced during execution, needed by `store_traces` at
     // accept time. Retaining them avoids recomputing via a second execution.
     traces: Vec<TransactionTrace>,
-    // A producer schedule proposed by a `set_proposed_producers` in this block,
-    // if any. Activated when the block is accepted, so a rejected/forked block
-    // never changes the schedule.
-    proposed_schedule: Option<Vec<ProducerKey>>,
 }
 
 impl Drop for Controller {
@@ -1175,40 +1171,38 @@ impl Controller {
             id: block_id,
             parent: self.preferred_id,
             traces: transaction_traces,
-            proposed_schedule,
         });
 
         Ok(block)
     }
 
-    // The producer schedule active for a block whose parent is `parent_id`: the
-    // schedule at the last accepted block, with every not-yet-accepted ancestor's
-    // schedule change folded in, oldest first. This makes verification a function
-    // of the parent alone, not of whether an ancestor happened to be accepted yet
-    // — two nodes always resolve the same schedule for the same block. A later
-    // proposal fully replaces an earlier one, matching activation on accept.
+    // Resolve schedules from authenticated verified headers, including detached
+    // forks. Pending sessions only describe the currently materialized branch.
+    // See docs/fork-validation.md for the ancestry and upgrade invariants.
     fn schedule_active_for_parent(&self, parent_id: &Id) -> Result<ProducerSchedule, ChainError> {
-        if *parent_id == self.last_accepted_block_id {
-            return Ok(self.active_schedule.clone());
-        }
-        let mut version = self.active_schedule.version;
-        let mut producers = self.active_schedule.producers.clone();
-        for pending in &self.pending_chain {
-            if let Some(proposed) = &pending.proposed_schedule {
-                version += 1;
-                producers = proposed.clone();
+        let mut cursor = *parent_id;
+        let mut schedule = None;
+        while cursor != self.last_accepted_block_id {
+            let block = self.verified_blocks.get(&cursor).ok_or_else(|| {
+                ChainError::BlockError(format!(
+                    "cannot resolve producer schedule: parent {} is unknown",
+                    cursor
+                ))
+            })?;
+            // A verified branch must still descend from the current accepted tip.
+            // Heights decrease on every step because block IDs embed parent height + 1.
+            if block.block_num() <= self.last_accepted_block.block_num() {
+                return Err(ChainError::BlockError(format!(
+                    "cannot resolve producer schedule: parent {} does not descend from the accepted tip",
+                    parent_id
+                )));
             }
-            if pending.id == *parent_id {
-                return Ok(ProducerSchedule { version, producers });
+            if schedule.is_none() {
+                schedule = block.signed_block_header.header.new_schedule().clone();
             }
+            cursor = *block.previous_id();
         }
-        // The parent is neither the last accepted block nor a pending ancestor, so
-        // we can't resolve its schedule. In-order consensus verifies a parent
-        // before its child, so this only happens for an unknown/detached parent.
-        Err(ChainError::BlockError(format!(
-            "cannot resolve producer schedule: parent {} is unknown",
-            parent_id
-        )))
+        Ok(schedule.unwrap_or_else(|| self.active_schedule.clone()))
     }
 
     fn timestamp_for_parent(&self, parent_id: &Id) -> Result<BlockTimestamp, ChainError> {
@@ -1358,7 +1352,6 @@ impl Controller {
         // as of this block's parent — folding in any pending ancestor's change —
         // rather than whatever happens to be accepted right now, so two nodes
         // reach the same verdict regardless of accept timing.
-        block.validate_syntactically(&self.db)?;
         let parent_schedule = self.schedule_active_for_parent(block.previous_id())?;
         let parent_timestamp = self.timestamp_for_parent(block.previous_id())?;
         let now_timestamp: BlockTimestamp = TimePoint::now().into();
@@ -1374,6 +1367,9 @@ impl Controller {
         // Reconcile the pending chain to the parent, reusing any already-executed
         // prefix instead of re-running every unaccepted ancestor.
         self.replay_accepted_state_to(parent_block_id.clone(), &block_status, mempool)?;
+        // Producer-account existence must be checked in the candidate parent's
+        // state, not in the branch that happened to be materialized previously.
+        block.validate_syntactically(&self.db)?;
 
         // This block's own session sits on top of the reconciled parent state. If
         // execution or validation below fails, each early return undoes the arena
@@ -1423,7 +1419,6 @@ impl Controller {
             id: block_id,
             parent: parent_block_id,
             traces: transaction_traces,
-            proposed_schedule,
         });
 
         Ok(())
@@ -2922,7 +2917,7 @@ impl Controller {
             // so it already passed `verify_block` — including its authority
             // check — on this node. This is the one genuine light-validation
             // case, and it is the hot path (replay runs on every verify).
-            let (traces, _transaction_mroot, _action_mroot, proposed_schedule) = match self
+            let (traces, _transaction_mroot, _action_mroot, _proposed_schedule) = match self
                 .execute_block(
                     block,
                     block_status,
@@ -2940,7 +2935,6 @@ impl Controller {
                 id: block.id()?,
                 parent: block.previous_id().clone(),
                 traces,
-                proposed_schedule,
             });
         }
 
@@ -4829,6 +4823,63 @@ mod tests {
         assert!(db.arena_account_exists(Name::from_str("ccc")?.as_u64()));
         assert!(!db.arena_account_exists(Name::from_str("bbb")?.as_u64()));
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifies_child_of_detached_verified_parent() -> Result<(), ChainError> {
+        let (mut producer, key, cid, _p) = init_test_controller()?;
+        let mut pool = Mempool::new();
+        pool.add_transaction(create_account(&key, Name::from_str("aaa")?, cid)?);
+        let a = producer.build_block(&mut pool).await?;
+        producer.set_preferred_id(a.id()?);
+        pool.add_transaction(create_account(&key, Name::from_str("bbb")?, cid)?);
+        let b = producer.build_block(&mut pool).await?;
+        producer.set_preferred_id(b.id()?);
+        pool.add_transaction(create_account(&key, Name::from_str("ddd")?, cid)?);
+        let d = producer.build_block(&mut pool).await?;
+        producer.set_preferred_id(a.id()?);
+        pool.add_transaction(create_account(&key, Name::from_str("ccc")?, cid)?);
+        let c = producer.build_block(&mut pool).await?;
+        let (mut validator, _, _, _v) = init_test_controller()?;
+        validator.verify_block(&a, &mut pool).await?;
+        validator.verify_block(&b, &mut pool).await?;
+        validator.verify_block(&c, &mut pool).await?;
+        assert!(validator.verified_blocks.contains_key(&b.id()?));
+        let result = validator.verify_block(&d, &mut pool).await;
+        assert!(
+            result.is_ok(),
+            "valid child of verified fork parent rejected: {result:?}"
+        );
+        for block in [&a, &b, &d] {
+            validator.accept_block(&block.id()?, &mut pool)?;
+        }
+        assert!(
+            validator
+                .db
+                .arena_account_exists(Name::from_str("bbb")?.as_u64())
+        );
+        assert!(
+            validator
+                .db
+                .arena_account_exists(Name::from_str("ddd")?.as_u64())
+        );
+        assert!(
+            !validator
+                .db
+                .arena_account_exists(Name::from_str("ccc")?.as_u64())
+        );
+        // A verified sibling of the accepted path is no longer a usable parent.
+        assert!(validator.schedule_active_for_parent(&c.id()?).is_err());
+        assert!(
+            validator
+                .schedule_active_for_parent(&Id::new([0x42; 32]))
+                .is_err()
+        );
+        assert_eq!(
+            validator.schedule_active_for_parent(&d.id()?)?,
+            validator.active_schedule
+        );
         Ok(())
     }
 
