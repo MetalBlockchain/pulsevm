@@ -47,8 +47,8 @@ use super::{
 };
 
 const WEBAUTHN_KEY_FEATURE_DIGEST: [u8; 32] = [
-    0x4f, 0xca, 0x8b, 0xd8, 0x2b, 0xd1, 0x81, 0xe7, 0x14, 0xe2, 0x83, 0xf8, 0x3e, 0x1b, 0x45, 0xd9,
-    0x5c, 0xa5, 0xaf, 0x40, 0xfb, 0x89, 0xad, 0x39, 0x77, 0xb6, 0x53, 0xc4, 0x48, 0xf7, 0x8c, 0x2,
+    0x4f, 0xca, 0x8b, 0xd8, 0x2b, 0xbd, 0x18, 0x1e, 0x71, 0x4e, 0x28, 0x3f, 0x83, 0xe1, 0xb4, 0x5d,
+    0x95, 0xca, 0x5a, 0xf4, 0x0f, 0xb8, 0x9a, 0xd3, 0x97, 0x7b, 0x65, 0x3c, 0x44, 0x8f, 0x78, 0xc2,
 ];
 const FIX_LINKAUTH_RESTRICTION_FEATURE_DIGEST: [u8; 32] = [
     0xe0, 0xfb, 0x64, 0xb1, 0x08, 0x5c, 0xc5, 0x53, 0x89, 0x7, 0x01, 0x58, 0xd0, 0x5a, 0x00, 0x9c,
@@ -711,6 +711,8 @@ mod tests {
     use std::str::FromStr;
 
     use super::*;
+    use crate::chain::transaction::Transaction;
+    use pulsevm_crypto::Digest;
     use pulsevm_serialization::Write;
     use tempfile::TempDir;
 
@@ -724,6 +726,17 @@ mod tests {
         0x49, 0xb4, 0xa5, 0xad, 0x88, 0x19, 0x00, 0x43, 0x65, 0xd0, 0x2d, 0xc4, 0x37, 0x9a, 0x8b,
         0x72, 0x41,
     ];
+
+    fn initialized_database() -> (TempDir, Database) {
+        let dir = TempDir::new().unwrap();
+        let mut db = Database::new(dir.path().to_str().unwrap(), 256 * 1024 * 1024).unwrap();
+        let genesis =
+            pulsevm_database::GenesisState::from_bytes(include_bytes!("../../../../genesis.json"))
+                .unwrap();
+        db.initialize_database_with_system_account(&genesis, Name::from_str("eosio").unwrap())
+            .unwrap();
+        (dir, db)
+    }
 
     #[test]
     fn rejects_webauthn_keys_before_feature_activation() {
@@ -808,5 +821,164 @@ mod tests {
             &BTreeSet::new(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn webauthn_keys_are_accepted_after_feature_activation() {
+        let (_dir, db) = initialized_database();
+        db.activate_protocol_features(&[PREACTIVATE_FEATURE_DIGEST], 2)
+            .unwrap();
+        db.preactivate_protocol_feature(WEBAUTHN_KEY_FEATURE_DIGEST)
+            .unwrap();
+        db.activate_protocol_features(&[WEBAUTHN_KEY_FEATURE_DIGEST], 3)
+            .unwrap();
+        let keys = BTreeSet::from([AuthorityPublicKey::WebAuthn {
+            point: [2; 33],
+            user_presence: 1,
+            rpid: "example.com".into(),
+        }]);
+        validate_protocol_key_features(&db, &keys).unwrap();
+        validate_protocol_key_features(&db, &BTreeSet::new()).unwrap();
+    }
+
+    #[test]
+    fn linkauth_rejects_every_native_authorization_management_action() {
+        let (_dir, db) = initialized_database();
+        let eosio = Name::from_str("eosio").unwrap();
+        let active = PermissionLevel::new(eosio.as_u64(), ACTIVE_NAME.as_u64());
+        for message_type in [
+            UPDATEAUTH_NAME,
+            DELETEAUTH_NAME,
+            LINKAUTH_NAME,
+            UNLINKAUTH_NAME,
+            CANCELDELAY_NAME,
+        ] {
+            let action = Action::new(
+                eosio,
+                LINKAUTH_NAME.into(),
+                LinkAuth {
+                    account: eosio,
+                    code: eosio,
+                    message_type: message_type.into(),
+                    requirement: ACTIVE_NAME.into(),
+                }
+                .pack()
+                .unwrap(),
+                vec![active.clone()],
+            );
+            let read = db.read().unwrap();
+            let error = AuthorizationManager::check_linkauth_authorization(
+                &db,
+                &read,
+                &action,
+                db.system_accounts(),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("cannot link"));
+        }
+    }
+
+    #[test]
+    fn canceldelay_uses_the_original_deferred_transaction_delay() {
+        let (_dir, db) = initialized_database();
+        let eosio = Name::from_str("eosio").unwrap();
+        let active = PermissionLevel::new(eosio.as_u64(), ACTIVE_NAME.as_u64());
+        let mut deferred = Transaction::default();
+        deferred.actions.push(Action::new(
+            eosio,
+            Name::from_str("transfer").unwrap(),
+            Vec::new(),
+            vec![active.clone()],
+        ));
+        let transaction_id = Digest([9; 32]);
+        db.xpr_import_deferred_transaction(
+            0,
+            7,
+            eosio.as_u64(),
+            transaction_id.0,
+            5_000_000,
+            10_000_000,
+            1_000_000,
+            &deferred.pack().unwrap(),
+        )
+        .unwrap();
+        let cancel = Action::new(
+            eosio,
+            CANCELDELAY_NAME.into(),
+            CancelDelay {
+                canceling_auth: active.clone(),
+                trx_id: transaction_id,
+            }
+            .pack()
+            .unwrap(),
+            vec![active],
+        );
+        let read = db.read().unwrap();
+        assert_eq!(
+            AuthorizationManager::check_canceldelay_authorization(&db, &read, &cancel).unwrap(),
+            Microseconds::new(4_000_000)
+        );
+    }
+
+    #[test]
+    fn canceldelay_rejects_missing_or_unrelated_transactions() {
+        let (_dir, db) = initialized_database();
+        let eosio = Name::from_str("eosio").unwrap();
+        let active = PermissionLevel::new(eosio.as_u64(), ACTIVE_NAME.as_u64());
+        let make_cancel = |trx_id| {
+            Action::new(
+                eosio,
+                CANCELDELAY_NAME.into(),
+                CancelDelay {
+                    canceling_auth: active.clone(),
+                    trx_id,
+                }
+                .pack()
+                .unwrap(),
+                vec![active.clone()],
+            )
+        };
+        let read = db.read().unwrap();
+        assert!(
+            AuthorizationManager::check_canceldelay_authorization(
+                &db,
+                &read,
+                &make_cancel(Digest([1; 32])),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("no matching user deferred transaction")
+        );
+        drop(read);
+
+        let mut unrelated = Transaction::default();
+        unrelated.actions.push(Action::new(
+            eosio,
+            Name::from_str("transfer").unwrap(),
+            Vec::new(),
+            Vec::new(),
+        ));
+        db.xpr_import_deferred_transaction(
+            0,
+            8,
+            eosio.as_u64(),
+            [2; 32],
+            5,
+            10,
+            1,
+            &unrelated.pack().unwrap(),
+        )
+        .unwrap();
+        let read = db.read().unwrap();
+        assert!(
+            AuthorizationManager::check_canceldelay_authorization(
+                &db,
+                &read,
+                &make_cancel(Digest([2; 32])),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("was not present")
+        );
     }
 }
