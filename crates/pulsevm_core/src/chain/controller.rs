@@ -1804,6 +1804,10 @@ impl Controller {
         // fallback accept, and future callers must not reach consensus writes
         // without a context for this exact candidate height.
         let protocol_context = self.ensure_protocol_version_supported(block.block_num())?;
+        // Replay and fallback accept can follow a block from a different schedule.
+        // Bind every execution to its own parent before onblock or transaction code
+        // observes get_active_producers/set_proposed_producers. See docs/block-replay.md.
+        self.block_active_schedule = self.schedule_active_for_parent(block.previous_id())?;
         let mut transaction_traces: Vec<TransactionTrace> = Vec::new();
         let mut transaction_receipts: VecDeque<TransactionReceipt> = VecDeque::new();
         let mut action_receipt_digests: VecDeque<Digest> = VecDeque::new();
@@ -6538,6 +6542,159 @@ mod tests {
             "schedule must be reconstructed from the block log header, not a side file"
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replay_and_fallback_accept_preserve_schedule_state() -> Result<(), ChainError> {
+        let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
+        let mut mempool = Mempool::new();
+        let alice = Name::from_str("alice")?;
+        let proposed = vec![
+            ProducerKey {
+                producer_name: PULSE_NAME,
+                block_signing_key: private_key.get_public_key(),
+            },
+            ProducerKey {
+                producer_name: alice,
+                block_signing_key: PrivateKey::random().get_public_key(),
+            },
+        ];
+        let packed = proposed.pack()?;
+        let data: String = packed
+            .iter()
+            .map(|byte| format!("\\{:02x}", byte))
+            .collect();
+        let proposer = format!(
+            r#"
+            (module
+              (import "env" "set_proposed_producers" (func $set (param i32 i32) (result i64)))
+              (memory (export "memory") 1)
+              (data (i32.const 0) "{data}")
+              (func (export "apply") (param i64 i64 i64)
+                (if (i64.eq (local.get 2) (i64.const {onblock}))
+                  (then (drop (call $set (i32.const 0) (i32.const {length})))))))
+            "#,
+            onblock = ONBLOCK_NAME.as_u64() as i64,
+            length = packed.len(),
+        );
+
+        // The deployment block creates the proposed producer account. Its
+        // onblock runs before setcode, so no schedule is proposed yet.
+        mempool.add_transaction(create_account(&private_key, alice, chain_id)?);
+        mempool.add_transaction(set_code(
+            &private_key,
+            PULSE_NAME,
+            wat::parse_str(proposer).expect("valid proposer contract"),
+            chain_id,
+        )?);
+        let deployment = controller.build_block(&mut mempool).await?;
+        assert!(
+            deployment
+                .signed_block_header
+                .header
+                .new_schedule()
+                .is_none()
+        );
+        controller.accept_block(&deployment.id()?, &mut mempool)?;
+        controller.set_preferred_id(deployment.id()?);
+
+        // A normal transaction makes the next block non-empty; its schedule
+        // change can only have originated in the implicit onblock action.
+        mempool.add_transaction(create_account(
+            &private_key,
+            Name::from_str("bob")?,
+            chain_id,
+        )?);
+        let election = controller.build_block(&mut mempool).await?;
+        let header_schedule = election
+            .signed_block_header
+            .header
+            .new_schedule()
+            .as_ref()
+            .expect("onblock proposal must be committed to the header");
+        assert_eq!(header_schedule.version, 1);
+        assert_eq!(header_schedule.producers, proposed);
+
+        let expected_authority = controller
+            .db
+            .read()?
+            .permission_authority(PRODS_NAME.into(), ACTIVE_NAME.into())?;
+        controller.set_preferred_id(election.id()?);
+        mempool.add_transaction(create_account(
+            &private_key,
+            Name::from_str("carol")?,
+            chain_id,
+        )?);
+        let child = controller.build_block(&mut mempool).await?;
+        assert!(child.signed_block_header.header.new_schedule().is_none());
+        controller.accept_block(&election.id()?, &mut mempool)?;
+        let election_root = controller.db.arena_state_root();
+        controller.accept_block(&child.id()?, &mut mempool)?;
+        let child_root = controller.db.arena_state_root();
+        assert!(election_root.is_some());
+        assert!(child_root.is_some());
+
+        for replay in [true, false] {
+            let (mut validator, _, _, temp) = init_test_controller()?;
+            let mut pool = Mempool::new();
+            validator.verify_block(&deployment, &mut pool).await?;
+            validator.accept_block(&deployment.id()?, &mut pool)?;
+            validator.verify_block(&election, &mut pool).await?;
+            validator.verify_block(&child, &mut pool).await?;
+            assert_eq!(validator.block_active_schedule.version, 1);
+
+            // A summary request unwinds speculation but leaves the last execution's
+            // schedule in memory. Both replay and fallback accept must rebind it.
+            validator.produce_state_summary()?;
+            if replay {
+                validator.replay_accepted_state_to(
+                    child.id()?,
+                    &BlockStatus::Verifying,
+                    &mut pool,
+                )?;
+                assert_eq!(validator.db.arena_state_root(), child_root);
+            }
+            validator.accept_block(&election.id()?, &mut pool)?;
+            assert_eq!(validator.db.arena_state_root(), election_root);
+            assert_eq!(
+                validator
+                    .db
+                    .read()?
+                    .permission_authority(PRODS_NAME.into(), ACTIVE_NAME.into(),)?,
+                expected_authority
+            );
+            assert_eq!(validator.active_schedule, *header_schedule);
+            validator.accept_block(&child.id()?, &mut pool)?;
+            assert_eq!(validator.db.arena_state_root(), child_root);
+            for block in [&election, &child] {
+                assert_eq!(
+                    validator
+                        .block_log()?
+                        .read_block(block.block_num())
+                        .map_err(|e| ChainError::InternalError(e.to_string()))?,
+                    block.pack()?
+                );
+            }
+            validator.shutdown()?;
+            drop(validator);
+
+            let mut reopened = Controller::new();
+            let config = json!({
+                "producer_name": "pulse", "producer_key": private_key.to_string(),
+            })
+            .to_string()
+            .into_bytes();
+            reopened.initialize(
+                &chain_id,
+                &config,
+                &generate_genesis(&private_key),
+                temp.path().to_str().unwrap(),
+            )?;
+            assert_eq!(reopened.db.arena_state_root(), child_root);
+            assert_eq!(reopened.active_schedule, *header_schedule);
+            assert_eq!(reopened.last_accepted_block.id()?, child.id()?);
+        }
         Ok(())
     }
 
