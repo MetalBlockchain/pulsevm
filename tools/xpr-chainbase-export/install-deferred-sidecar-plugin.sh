@@ -42,7 +42,7 @@ nodeos_cmake="$xpr_core/programs/nodeos/CMakeLists.txt"
 printf '\nadd_subdirectory(deferred_transaction_sidecar_plugin)\n' >>"$plugins_cmake"
 
 perl -0pi -e 's@(PRIVATE -Wl,\$\{whole_archive_flag\} state_history_plugin\s+-Wl,\$\{no_whole_archive_flag\})@PRIVATE -Wl,\${whole_archive_flag} deferred_transaction_sidecar_plugin -Wl,\${no_whole_archive_flag}\n        $1@' "$nodeos_cmake"
-rg -q 'deferred_transaction_sidecar_plugin' "$nodeos_cmake" || {
+grep -Fq 'deferred_transaction_sidecar_plugin' "$nodeos_cmake" || {
     echo "could not add the source plugin to nodeos link libraries; remove $plugin_dir and inspect $nodeos_cmake" >&2
     exit 1
 }

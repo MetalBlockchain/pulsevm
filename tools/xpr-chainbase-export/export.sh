@@ -239,7 +239,7 @@ for ((elapsed = 0; elapsed < timeout_seconds; elapsed++)); do
     # state_history_plugin emits this completion log only after its initial
     # snapshot record is fully flushed. Wait for it and the optional sidecar,
     # rather than treating the first bytes of a live log as a complete export.
-    if rg -q 'Done storing initial state on startup' "$nodeos_log" \
+    if grep -Fq 'Done storing initial state on startup' "$nodeos_log" \
        && [[ -s "$history_log" ]] \
        && { [[ -z "$deferred_sidecar" ]] || [[ -s "$deferred_sidecar" ]]; } \
        && { [[ -z "$deferred_sidecar_dir" ]] || compgen -G "$deferred_sidecar_dir/*.json" >/dev/null; }; then
@@ -256,7 +256,7 @@ done
     echo "timed out waiting for full chain-state delta; see $nodeos_log" >&2
     exit 1
 }
-rg -q 'Done storing initial state on startup' "$nodeos_log" || {
+grep -Fq 'Done storing initial state on startup' "$nodeos_log" || {
     echo "timed out waiting for complete chain-state delta; see $nodeos_log" >&2
     exit 1
 }

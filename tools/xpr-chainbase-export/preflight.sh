@@ -90,11 +90,11 @@ if "$require_sidecar_plugin"; then
         echo "deferred-transaction sidecar plugin is not installed in $plugin_dir" >&2
         exit 2
     }
-    rg -q 'add_subdirectory\(deferred_transaction_sidecar_plugin\)' "$xpr_core/plugins/CMakeLists.txt" || {
+    grep -Fq 'add_subdirectory(deferred_transaction_sidecar_plugin)' "$xpr_core/plugins/CMakeLists.txt" || {
         echo "XPR Leap plugins CMake does not include the deferred sidecar plugin" >&2
         exit 2
     }
-    rg -q 'deferred_transaction_sidecar_plugin' "$xpr_core/programs/nodeos/CMakeLists.txt" || {
+    grep -Fq 'deferred_transaction_sidecar_plugin' "$xpr_core/programs/nodeos/CMakeLists.txt" || {
         echo "XPR Leap nodeos CMake does not link the deferred sidecar plugin" >&2
         exit 2
     }
