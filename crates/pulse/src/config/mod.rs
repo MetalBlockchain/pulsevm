@@ -9,6 +9,20 @@ use serde::{
 pub struct Config {
     /// URL of the RPC endpoint
     pub rpc_url: String,
+    /// Root account used by the native system contract.
+    #[serde(default = "default_system_account")]
+    pub system_account: String,
+    /// Token contract used by the transfer convenience command.
+    #[serde(default = "default_token_contract")]
+    pub token_contract: String,
+}
+
+fn default_system_account() -> String {
+    "pulse".to_owned()
+}
+
+fn default_token_contract() -> String {
+    "pulse.token".to_owned()
 }
 
 impl Config {
@@ -31,6 +45,8 @@ pub fn load_or_create_config() -> anyhow::Result<Config> {
 
         let default = Config {
             rpc_url: "http://localhost:8080".to_string(),
+            system_account: default_system_account(),
+            token_contract: default_token_contract(),
         };
 
         let json = serde_json::to_string_pretty(&default)?;

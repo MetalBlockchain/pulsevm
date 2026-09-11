@@ -72,9 +72,9 @@ pub enum Commands {
         /// The memo for the transfer
         #[arg(default_value = "")]
         memo: String,
-        /// The contract that controls the token, defaults to pulse.token
-        #[arg(short, long, default_value = "pulse.token")]
-        contract: String,
+        /// The contract that controls the token (defaults to the CLI config)
+        #[arg(short, long)]
+        contract: Option<String>,
         /// An account and permission level to authorize, as in 'account@permission' (defaults to
         /// 'sender@active')
         #[arg(short, long)]
@@ -225,6 +225,10 @@ pub enum SetSubcommand {
         /// URL of the RPC endpoint
         url: String,
     },
+    /// Set the node's system contract root account used by account-management commands.
+    SystemAccount { account: String },
+    /// Set the default token contract used by the transfer convenience command.
+    TokenContract { account: String },
     /// Set account contract
     Code {
         /// Account name

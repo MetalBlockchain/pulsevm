@@ -6,7 +6,6 @@ use std::{
 use pulsevm_api_client::PulseVmClient;
 use pulsevm_core::{
     ACTIVE_NAME,
-    PULSE_NAME,
     abi::AbiDefinition,
     authority::PermissionLevel,
     config::{
@@ -43,6 +42,18 @@ pub async fn handle(
             config.rpc_url = url.clone();
             config.save()?;
         }
+        SetSubcommand::SystemAccount { account } => {
+            let account = Name::from_str(&account)?;
+            config.system_account = account.to_string();
+            config.save()?;
+            println!("System account set to {}", account);
+        }
+        SetSubcommand::TokenContract { account } => {
+            let account = Name::from_str(&account)?;
+            config.token_contract = account.to_string();
+            config.save()?;
+            println!("Token contract set to {}", account);
+        }
         SetSubcommand::Code {
             account,
             wasm_path,
@@ -74,7 +85,7 @@ pub async fn handle(
                 api_client,
                 keosd_client,
                 vec![Action {
-                    account: PULSE_NAME,
+                    account: Name::from_str(&config.system_account)?,
                     name: SETCODE_NAME,
                     authorization: vec![PermissionLevel {
                         actor: account.into(),
@@ -120,7 +131,7 @@ pub async fn handle(
                 api_client,
                 keosd_client,
                 vec![Action {
-                    account: PULSE_NAME,
+                    account: Name::from_str(&config.system_account)?,
                     name: SETABI_NAME,
                     authorization: vec![PermissionLevel {
                         actor: account.into(),
