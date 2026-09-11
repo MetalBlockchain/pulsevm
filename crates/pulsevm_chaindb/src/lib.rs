@@ -23,12 +23,14 @@ use pulsevm_arena::{
     ArenaObject,
     BlobRef,
     Db,
-    DbError,
     IndexedBy,
     ObjectId,
     SecondaryIndex,
     key_index,
 };
+// Re-exported so callers that only see this crate (the snapshot importer, the
+// database facade) can name the error type every method here returns.
+pub use pulsevm_arena::DbError;
 use zerocopy::{
     FromBytes,
     Immutable,
@@ -1150,6 +1152,74 @@ fn join_u128(lo: u64, hi: u64) -> u128 {
     ((hi as u128) << 64) | lo as u128
 }
 
+/// One canonical contract secondary-index row awaiting serialization: the
+/// table's `(code, scope, table)`, the primary key, the payer, and the
+/// family-specific secondary key.
+type CanonicalIdxRow<S> = ((u64, u64, u64), u64, u64, S);
+
+/// The `t_id -> (code, scope, table)` map the canonical contract-row serializers
+/// resolve table identity through, so the arena's own ids are never serialized.
+fn contract_table_key_map(db: &Db) -> std::collections::HashMap<i64, (u64, u64, u64)> {
+    match db.table::<ContractTableRow>() {
+        Ok(t) => t
+            .iter()
+            .map(|r| (r.id().raw(), (r.code, r.scope, r.table)))
+            .collect(),
+        Err(_) => std::collections::HashMap::new(),
+    }
+}
+
+/// Writes the fixed `(code, scope, table, primary_key, payer)` header shared by
+/// every canonical contract secondary-index row.
+fn put_idx_row_header(out: &mut Vec<u8>, key: (u64, u64, u64), primary: u64, payer: u64) {
+    out.extend_from_slice(&key.0.to_le_bytes());
+    out.extend_from_slice(&key.1.to_le_bytes());
+    out.extend_from_slice(&key.2.to_le_bytes());
+    out.extend_from_slice(&primary.to_le_bytes());
+    out.extend_from_slice(&payer.to_le_bytes());
+}
+
+/// Reads the fixed header back: `((code, scope, table), primary_key, payer)`.
+fn read_idx_row_header(c: &[u8]) -> ((u64, u64, u64), u64, u64) {
+    (
+        (
+            u64::from_le_bytes(c[0..8].try_into().unwrap()),
+            u64::from_le_bytes(c[8..16].try_into().unwrap()),
+            u64::from_le_bytes(c[16..24].try_into().unwrap()),
+        ),
+        u64::from_le_bytes(c[24..32].try_into().unwrap()),
+        u64::from_le_bytes(c[32..40].try_into().unwrap()),
+    )
+}
+
+/// Resolves a canonical contract row's `(code, scope, table)` to the arena
+/// table id during hydration, with a one-slot cache (canonical rows are grouped
+/// by table). Unlike `contract_table_oid` this never creates the table: the
+/// hydrate contract is that `hydrate_contract_tables` ran first, so a missing
+/// table means a corrupt import.
+fn hydrate_resolve_t_id(
+    db: &mut Db,
+    cached: &mut Option<((u64, u64, u64), i64)>,
+    key: (u64, u64, u64),
+) -> Result<i64, DbError> {
+    if let Some((k, t_id)) = cached
+        && *k == key
+    {
+        return Ok(*t_id);
+    }
+    let t_id = db
+        .find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&key)?
+        .map(|t| t.id().raw())
+        .ok_or_else(|| {
+            DbError::Corrupted(format!(
+                "contract row references missing table ({}, {}, {})",
+                key.0, key.1, key.2
+            ))
+        })?;
+    *cached = Some((key, t_id));
+    Ok(t_id)
+}
+
 /// Resolves the database-local `table_id` for `(code, scope, table)`, creating the
 /// table row (with `count == 0`) the first time it is seen. Matches chainbase's
 /// implicit `find_or_create_table` inside the child-store paths.
@@ -1987,6 +2057,34 @@ impl ChainDatabase {
         out
     }
 
+    /// Seeds permission_link rows from the canonical layout produced by
+    /// `permission_link_state_bytes` — snapshot import brings a source chain's
+    /// linkauth bindings in below the live `link_auth` path. An `(account, code,
+    /// message_type)` already present is left untouched, so re-seeding is safe.
+    pub fn hydrate_permission_links(&self, bytes: &[u8]) -> Result<(), DbError> {
+        const ROW: usize = 32;
+        let mut db = self.lock();
+        for c in bytes.chunks_exact(ROW) {
+            let account = u64::from_le_bytes(c[0..8].try_into().unwrap());
+            let code = u64::from_le_bytes(c[8..16].try_into().unwrap());
+            let message_type = u64::from_le_bytes(c[16..24].try_into().unwrap());
+            if db
+                .find_by::<PermissionLinkRow, LinkByActionName>(&(account, code, message_type))?
+                .is_some()
+            {
+                continue;
+            }
+            let required_permission = u64::from_le_bytes(c[24..32].try_into().unwrap());
+            db.create::<PermissionLinkRow>(|l| {
+                l.account = account;
+                l.code = code;
+                l.message_type = message_type;
+                l.required_permission = required_permission;
+            })?;
+        }
+        Ok(())
+    }
+
     /// Canonical serialization of code_object in (code_hash, vm_type, vm_version)
     /// order: hash 32B, vm_type, vm_version, ref_count u64 LE, first_block u32 LE,
     /// then a u32 LE length-prefixed code blob. No genesis rows (setcode only).
@@ -2023,6 +2121,48 @@ impl ChainDatabase {
         out
     }
 
+    /// Seeds code_object rows from the canonical layout produced by
+    /// `code_state_bytes` — snapshot import carries a source chain's deduplicated
+    /// wasm images, including their ref counts and first-use blocks, which the
+    /// live `update_account_code` path could not reconstruct. A `(code_hash,
+    /// vm_type, vm_version)` already present is left untouched.
+    pub fn hydrate_code(&self, bytes: &[u8]) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let mut pos = 0usize;
+        while pos + 50 <= bytes.len() {
+            let mut code_hash = [0u8; 32];
+            code_hash.copy_from_slice(&bytes[pos..pos + 32]);
+            let vm_type = bytes[pos + 32];
+            let vm_version = bytes[pos + 33];
+            let ref_count = u64::from_le_bytes(bytes[pos + 34..pos + 42].try_into().unwrap());
+            let first_block = u32::from_le_bytes(bytes[pos + 42..pos + 46].try_into().unwrap());
+            let code_len =
+                u32::from_le_bytes(bytes[pos + 46..pos + 50].try_into().unwrap()) as usize;
+            pos += 50;
+            if pos + code_len > bytes.len() {
+                break;
+            }
+            let code = &bytes[pos..pos + code_len];
+            pos += code_len;
+            if db
+                .find_by::<CodeRow, CodeByHash>(&(code_hash, vm_type, vm_version))?
+                .is_some()
+            {
+                continue;
+            }
+            let blob = db.alloc_blob::<CodeRow>(code)?;
+            db.create::<CodeRow>(|c| {
+                c.code_hash = code_hash;
+                c.code = blob;
+                c.code_ref_count = ref_count;
+                c.first_block_used = first_block;
+                c.vm_type = vm_type;
+                c.vm_version = vm_version;
+            })?;
+        }
+        Ok(())
+    }
+
     /// Canonical serialization of the transaction dedupe set in trx_id order:
     /// trx_id 32B, expiration u32 LE (seconds). No genesis rows.
     pub fn transaction_state_bytes(&self) -> Vec<u8> {
@@ -2038,6 +2178,28 @@ impl ChainDatabase {
             out.extend_from_slice(&expiration.to_le_bytes());
         }
         out
+    }
+
+    /// Seeds transaction dedupe rows from the canonical layout produced by
+    /// `transaction_state_bytes` — snapshot import carries the source chain's
+    /// unexpired input transactions so a resumed chain still rejects their
+    /// replays. A `trx_id` already present is left untouched.
+    pub fn hydrate_transactions(&self, bytes: &[u8]) -> Result<(), DbError> {
+        const ROW: usize = 36;
+        let mut db = self.lock();
+        for c in bytes.chunks_exact(ROW) {
+            let mut trx_id = [0u8; 32];
+            trx_id.copy_from_slice(&c[0..32]);
+            if db.find_by::<TransactionRow, TxByTrxId>(&trx_id)?.is_some() {
+                continue;
+            }
+            let expiration = u32::from_le_bytes(c[32..36].try_into().unwrap());
+            db.create::<TransactionRow>(|t| {
+                t.trx_id = trx_id;
+                t.expiration = expiration;
+            })?;
+        }
+        Ok(())
     }
 
     /// Canonical serialization of resource_usage in owner order: owner u64 LE,
@@ -2174,6 +2336,38 @@ impl ChainDatabase {
         out
     }
 
+    /// Seeds the resource_limits_state singleton from the canonical layout
+    /// produced by `resource_state_bytes` — snapshot import carries the source
+    /// chain's elastic-limit state (block-usage averages, total weights, virtual
+    /// limits) which `initialize_resource_state` would otherwise reset to the
+    /// slow-start defaults. A no-op when the singleton already exists.
+    pub fn hydrate_resource_state(&self, bytes: &[u8]) -> Result<(), DbError> {
+        const LEN: usize = 20 + 20 + 7 * 8;
+        if bytes.len() < LEN {
+            return Ok(());
+        }
+        let mut db = self.lock();
+        if db.table::<ResourceStateRow>()?.iter().next().is_some() {
+            return Ok(());
+        }
+        let net = read_acc(&bytes[0..20]);
+        let cpu = read_acc(&bytes[20..40]);
+        let scalar =
+            |i: usize| u64::from_le_bytes(bytes[40 + i * 8..48 + i * 8].try_into().unwrap());
+        db.create::<ResourceStateRow>(|s| {
+            s.average_block_net_usage = net;
+            s.average_block_cpu_usage = cpu;
+            s.pending_net_usage = scalar(0);
+            s.pending_cpu_usage = scalar(1);
+            s.total_net_weight = scalar(2);
+            s.total_cpu_weight = scalar(3);
+            s.total_ram_bytes = scalar(4);
+            s.virtual_net_limit = scalar(5);
+            s.virtual_cpu_limit = scalar(6);
+        })?;
+        Ok(())
+    }
+
     /// Canonical serialization of the contract table_id_object rows in
     /// (code, scope, table) order: code, scope, table, payer (u64 LE each),
     /// count (u32 LE). No genesis rows (contracts create tables at runtime).
@@ -2196,6 +2390,38 @@ impl ChainDatabase {
             out.extend_from_slice(&count.to_le_bytes());
         }
         out
+    }
+
+    /// Seeds contract table_id rows from the canonical layout produced by
+    /// `contract_table_state_bytes`, including each table's child-row `count` —
+    /// the child hydrates (`hydrate_contract_kv` and the per-index-family
+    /// hydrates) create rows without touching the count, so the imported counts
+    /// stay the snapshot's own and round-trip byte-exactly. A `(code, scope,
+    /// table)` already present is left untouched.
+    pub fn hydrate_contract_tables(&self, bytes: &[u8]) -> Result<(), DbError> {
+        const ROW: usize = 8 * 4 + 4;
+        let mut db = self.lock();
+        for c in bytes.chunks_exact(ROW) {
+            let code = u64::from_le_bytes(c[0..8].try_into().unwrap());
+            let scope = u64::from_le_bytes(c[8..16].try_into().unwrap());
+            let table = u64::from_le_bytes(c[16..24].try_into().unwrap());
+            if db
+                .find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&(code, scope, table))?
+                .is_some()
+            {
+                continue;
+            }
+            let payer = u64::from_le_bytes(c[24..32].try_into().unwrap());
+            let count = u32::from_le_bytes(c[32..36].try_into().unwrap());
+            db.create::<ContractTableRow>(|t| {
+                t.code = code;
+                t.scope = scope;
+                t.table = table;
+                t.payer = payer;
+                t.count = count;
+            })?;
+        }
+        Ok(())
     }
 
     /// Canonical serialization of the contract key_value rows in
@@ -2237,6 +2463,316 @@ impl ChainDatabase {
             out.extend_from_slice(value);
         }
         out
+    }
+
+    /// Seeds contract key_value rows from the canonical layout produced by
+    /// `contract_kv_state_bytes`. Rows are created without bumping the owning
+    /// table's `count` — `hydrate_contract_tables` already installed the
+    /// snapshot's counts. Every row must reference a table that hydration (or the
+    /// live path) already created; a missing table is a corrupt import, not a
+    /// lazily-created one. A `(table, primary_key)` already present is left
+    /// untouched.
+    pub fn hydrate_contract_kv(&self, bytes: &[u8]) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let mut cached: Option<((u64, u64, u64), i64)> = None;
+        let mut pos = 0usize;
+        while pos + 44 <= bytes.len() {
+            let key = (
+                u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap()),
+                u64::from_le_bytes(bytes[pos + 8..pos + 16].try_into().unwrap()),
+                u64::from_le_bytes(bytes[pos + 16..pos + 24].try_into().unwrap()),
+            );
+            let primary = u64::from_le_bytes(bytes[pos + 24..pos + 32].try_into().unwrap());
+            let payer = u64::from_le_bytes(bytes[pos + 32..pos + 40].try_into().unwrap());
+            let value_len =
+                u32::from_le_bytes(bytes[pos + 40..pos + 44].try_into().unwrap()) as usize;
+            pos += 44;
+            if pos + value_len > bytes.len() {
+                break;
+            }
+            let value = &bytes[pos..pos + value_len];
+            pos += value_len;
+            let t_id = hydrate_resolve_t_id(&mut db, &mut cached, key)?;
+            if db
+                .find_by::<ContractKeyValueRow, ContractKvByScopePrimary>(&(t_id, primary))?
+                .is_some()
+            {
+                continue;
+            }
+            let blob = db.alloc_blob::<ContractKeyValueRow>(value)?;
+            db.create::<ContractKeyValueRow>(|k| {
+                k.t_id = t_id;
+                k.primary_key = primary;
+                k.payer = payer;
+                k.value = blob;
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Canonical serialization of the contract index64 rows in
+    /// (code, scope, table, primary_key) order, table identity resolved from
+    /// `t_id`: code, scope, table, primary_key, payer (u64 LE each), then the
+    /// secondary key u64 LE.
+    pub fn contract_idx64_state_bytes(&self) -> Vec<u8> {
+        let db = self.lock();
+        let table_key = contract_table_key_map(&db);
+        let mut rows: Vec<CanonicalIdxRow<u64>> = match db.table::<ContractIndex64Row>() {
+            Ok(t) => t
+                .iter()
+                .filter_map(|r| {
+                    table_key
+                        .get(&r.t_id)
+                        .map(|&k| (k, r.primary_key, r.payer, r.secondary_key))
+                })
+                .collect(),
+            Err(_) => return Vec::new(),
+        };
+        rows.sort_by_key(|r| (r.0, r.1));
+        let mut out = Vec::new();
+        for (key, primary, payer, secondary) in rows {
+            put_idx_row_header(&mut out, key, primary, payer);
+            out.extend_from_slice(&secondary.to_le_bytes());
+        }
+        out
+    }
+
+    /// Seeds contract index64 rows from the `contract_idx64_state_bytes` layout.
+    /// Same table-count contract as `hydrate_contract_kv`; a `(table,
+    /// primary_key)` already present in this family is left untouched.
+    pub fn hydrate_contract_idx64(&self, bytes: &[u8]) -> Result<(), DbError> {
+        const ROW: usize = 48;
+        let mut db = self.lock();
+        let mut cached: Option<((u64, u64, u64), i64)> = None;
+        for c in bytes.chunks_exact(ROW) {
+            let (key, primary, payer) = read_idx_row_header(c);
+            let t_id = hydrate_resolve_t_id(&mut db, &mut cached, key)?;
+            if db
+                .find_by::<ContractIndex64Row, ContractIdx64ByPrimary>(&(t_id, primary))?
+                .is_some()
+            {
+                continue;
+            }
+            let secondary = u64::from_le_bytes(c[40..48].try_into().unwrap());
+            db.create::<ContractIndex64Row>(|e| {
+                e.t_id = t_id;
+                e.primary_key = primary;
+                e.secondary_key = secondary;
+                e.payer = payer;
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Canonical serialization of the contract index128 rows — the idx64 layout
+    /// with a 16-byte little-endian secondary key.
+    pub fn contract_idx128_state_bytes(&self) -> Vec<u8> {
+        let db = self.lock();
+        let table_key = contract_table_key_map(&db);
+        let mut rows: Vec<CanonicalIdxRow<u128>> = match db.table::<ContractIndex128Row>() {
+            Ok(t) => t
+                .iter()
+                .filter_map(|r| {
+                    table_key
+                        .get(&r.t_id)
+                        .map(|&k| (k, r.primary_key, r.payer, r.secondary_key()))
+                })
+                .collect(),
+            Err(_) => return Vec::new(),
+        };
+        rows.sort_by_key(|r| (r.0, r.1));
+        let mut out = Vec::new();
+        for (key, primary, payer, secondary) in rows {
+            put_idx_row_header(&mut out, key, primary, payer);
+            out.extend_from_slice(&secondary.to_le_bytes());
+        }
+        out
+    }
+
+    /// Seeds contract index128 rows from the `contract_idx128_state_bytes` layout.
+    pub fn hydrate_contract_idx128(&self, bytes: &[u8]) -> Result<(), DbError> {
+        const ROW: usize = 56;
+        let mut db = self.lock();
+        let mut cached: Option<((u64, u64, u64), i64)> = None;
+        for c in bytes.chunks_exact(ROW) {
+            let (key, primary, payer) = read_idx_row_header(c);
+            let t_id = hydrate_resolve_t_id(&mut db, &mut cached, key)?;
+            if db
+                .find_by::<ContractIndex128Row, ContractIdx128ByPrimary>(&(t_id, primary))?
+                .is_some()
+            {
+                continue;
+            }
+            let secondary = u128::from_le_bytes(c[40..56].try_into().unwrap());
+            db.create::<ContractIndex128Row>(|e| {
+                e.t_id = t_id;
+                e.primary_key = primary;
+                e.sec_lo = secondary as u64;
+                e.sec_hi = (secondary >> 64) as u64;
+                e.payer = payer;
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Canonical serialization of the contract index256 rows — the idx64 layout
+    /// with the raw 32-byte secondary key.
+    pub fn contract_idx256_state_bytes(&self) -> Vec<u8> {
+        let db = self.lock();
+        let table_key = contract_table_key_map(&db);
+        let mut rows: Vec<CanonicalIdxRow<[u8; 32]>> = match db.table::<ContractIndex256Row>() {
+            Ok(t) => t
+                .iter()
+                .filter_map(|r| {
+                    table_key
+                        .get(&r.t_id)
+                        .map(|&k| (k, r.primary_key, r.payer, r.secondary_key))
+                })
+                .collect(),
+            Err(_) => return Vec::new(),
+        };
+        rows.sort_by_key(|r| (r.0, r.1));
+        let mut out = Vec::new();
+        for (key, primary, payer, secondary) in rows {
+            put_idx_row_header(&mut out, key, primary, payer);
+            out.extend_from_slice(&secondary);
+        }
+        out
+    }
+
+    /// Seeds contract index256 rows from the `contract_idx256_state_bytes` layout.
+    pub fn hydrate_contract_idx256(&self, bytes: &[u8]) -> Result<(), DbError> {
+        const ROW: usize = 72;
+        let mut db = self.lock();
+        let mut cached: Option<((u64, u64, u64), i64)> = None;
+        for c in bytes.chunks_exact(ROW) {
+            let (key, primary, payer) = read_idx_row_header(c);
+            let t_id = hydrate_resolve_t_id(&mut db, &mut cached, key)?;
+            if db
+                .find_by::<ContractIndex256Row, ContractIdx256ByPrimary>(&(t_id, primary))?
+                .is_some()
+            {
+                continue;
+            }
+            let mut secondary = [0u8; 32];
+            secondary.copy_from_slice(&c[40..72]);
+            db.create::<ContractIndex256Row>(|e| {
+                e.t_id = t_id;
+                e.primary_key = primary;
+                e.secondary_key = secondary;
+                e.payer = payer;
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Canonical serialization of the contract index_double rows — the idx64
+    /// layout with the secondary key's raw IEEE-754 bit pattern u64 LE.
+    pub fn contract_idx_double_state_bytes(&self) -> Vec<u8> {
+        let db = self.lock();
+        let table_key = contract_table_key_map(&db);
+        let mut rows: Vec<CanonicalIdxRow<u64>> = match db.table::<ContractIndexDoubleRow>() {
+            Ok(t) => t
+                .iter()
+                .filter_map(|r| {
+                    table_key
+                        .get(&r.t_id)
+                        .map(|&k| (k, r.primary_key, r.payer, r.secondary_key.to_bits()))
+                })
+                .collect(),
+            Err(_) => return Vec::new(),
+        };
+        rows.sort_by_key(|r| (r.0, r.1));
+        let mut out = Vec::new();
+        for (key, primary, payer, secondary) in rows {
+            put_idx_row_header(&mut out, key, primary, payer);
+            out.extend_from_slice(&secondary.to_le_bytes());
+        }
+        out
+    }
+
+    /// Seeds contract index_double rows from the `contract_idx_double_state_bytes`
+    /// layout (bit pattern reinterpreted, not converted).
+    pub fn hydrate_contract_idx_double(&self, bytes: &[u8]) -> Result<(), DbError> {
+        const ROW: usize = 48;
+        let mut db = self.lock();
+        let mut cached: Option<((u64, u64, u64), i64)> = None;
+        for c in bytes.chunks_exact(ROW) {
+            let (key, primary, payer) = read_idx_row_header(c);
+            let t_id = hydrate_resolve_t_id(&mut db, &mut cached, key)?;
+            if db
+                .find_by::<ContractIndexDoubleRow, ContractIdxDoubleByPrimary>(&(t_id, primary))?
+                .is_some()
+            {
+                continue;
+            }
+            let secondary = u64::from_le_bytes(c[40..48].try_into().unwrap());
+            db.create::<ContractIndexDoubleRow>(|e| {
+                e.t_id = t_id;
+                e.primary_key = primary;
+                e.secondary_key = f64::from_bits(secondary);
+                e.payer = payer;
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Canonical serialization of the contract index_long_double rows — the
+    /// idx64 layout with the float128 secondary key as its 16 little-endian
+    /// bytes (low word first, as stored).
+    pub fn contract_idx_long_double_state_bytes(&self) -> Vec<u8> {
+        let db = self.lock();
+        let table_key = contract_table_key_map(&db);
+        let mut rows: Vec<CanonicalIdxRow<(u64, u64)>> =
+            match db.table::<ContractIndexLongDoubleRow>() {
+                Ok(t) => t
+                    .iter()
+                    .filter_map(|r| {
+                        table_key
+                            .get(&r.t_id)
+                            .map(|&k| (k, r.primary_key, r.payer, (r.sec_lo, r.sec_hi)))
+                    })
+                    .collect(),
+                Err(_) => return Vec::new(),
+            };
+        rows.sort_by_key(|r| (r.0, r.1));
+        let mut out = Vec::new();
+        for (key, primary, payer, (lo, hi)) in rows {
+            put_idx_row_header(&mut out, key, primary, payer);
+            out.extend_from_slice(&lo.to_le_bytes());
+            out.extend_from_slice(&hi.to_le_bytes());
+        }
+        out
+    }
+
+    /// Seeds contract index_long_double rows from the
+    /// `contract_idx_long_double_state_bytes` layout.
+    pub fn hydrate_contract_idx_long_double(&self, bytes: &[u8]) -> Result<(), DbError> {
+        const ROW: usize = 56;
+        let mut db = self.lock();
+        let mut cached: Option<((u64, u64, u64), i64)> = None;
+        for c in bytes.chunks_exact(ROW) {
+            let (key, primary, payer) = read_idx_row_header(c);
+            let t_id = hydrate_resolve_t_id(&mut db, &mut cached, key)?;
+            if db
+                .find_by::<ContractIndexLongDoubleRow, ContractIdxLongDoubleByPrimary>(&(
+                    t_id, primary,
+                ))?
+                .is_some()
+            {
+                continue;
+            }
+            let lo = u64::from_le_bytes(c[40..48].try_into().unwrap());
+            let hi = u64::from_le_bytes(c[48..56].try_into().unwrap());
+            db.create::<ContractIndexLongDoubleRow>(|e| {
+                e.t_id = t_id;
+                e.primary_key = primary;
+                e.sec_lo = lo;
+                e.sec_hi = hi;
+                e.payer = payer;
+            })?;
+        }
+        Ok(())
     }
 
     /// Mirrors `remove_permission` (and the `delete_auth` path that calls it):
@@ -2880,6 +3416,26 @@ impl ChainDatabase {
                     c.vm_version = vm_version;
                 })?;
             }
+        }
+        Ok(())
+    }
+
+    /// Sets an account's `last_code_update` without touching its sequences —
+    /// the snapshot-import path restores the source chain's timestamp after
+    /// `hydrate_account_metadata` (whose canonical layout does not carry it,
+    /// for byte-compatibility with the chainbase cross-impl root). A missing
+    /// row is a no-op.
+    pub fn set_account_last_code_update(
+        &self,
+        name: u64,
+        last_code_update: i64,
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let id = db
+            .find_by_hash::<AccountMetaRow, AccountMetaRowByName>(&name)?
+            .map(|r| r.id());
+        if let Some(id) = id {
+            db.modify::<AccountMetaRow>(id, |row| row.last_code_update = last_code_update)?;
         }
         Ok(())
     }
