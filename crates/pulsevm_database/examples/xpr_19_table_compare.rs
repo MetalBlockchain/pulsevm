@@ -208,13 +208,11 @@ fn arena_sidecar_tables(database: &Database) -> Result<TableRows, String> {
     let bytes = database
         .arena_transaction_state_bytes()
         .ok_or_else(|| "Arena transaction table is unavailable".to_owned())?;
-    if !bytes.len().is_multiple_of(TRANSACTION_ROW_BYTES) {
+    let (rows, remainder) = bytes.as_chunks::<TRANSACTION_ROW_BYTES>();
+    if !remainder.is_empty() {
         return Err("Arena transaction table has a partial canonical row".into());
     }
-    let transactions = bytes
-        .chunks_exact(TRANSACTION_ROW_BYTES)
-        .map(|row| (true, row.to_vec()))
-        .collect();
+    let transactions = rows.iter().map(|row| (true, row.to_vec())).collect();
     let global_sequence = database
         .arena_global_action_sequence()
         .ok_or_else(|| "Arena dynamic global property row is unavailable".to_owned())?;
