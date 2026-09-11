@@ -410,6 +410,8 @@ mod tests {
     use super::{
         BlockHeader,
         MAX_FUTURE_BLOCK_TIME_SLOTS,
+        PRODUCER_SCHEDULE_CHANGE_EXTENSION_ID,
+        PROTOCOL_FEATURE_ACTIVATION_EXTENSION_ID,
     };
     use crate::{
         block::SignedBlock,
@@ -492,5 +494,75 @@ mod tests {
         let mut rejected = BlockHeader::default();
         rejected.timestamp = BlockTimestamp::new(101 + MAX_FUTURE_BLOCK_TIME_SLOTS);
         assert!(rejected.validate_timestamp(&parent, &now).is_err());
+    }
+
+    #[test]
+    fn schedule_hash_commits_to_the_selected_wire_format() {
+        let schedule = ProducerSchedule {
+            version: 9,
+            producers: vec![ProducerKey {
+                producer_name: Name::from_str("pulse").unwrap(),
+                block_signing_key: PrivateKey::random().get_public_key(),
+            }],
+        };
+        let mut legacy = BlockHeader {
+            new_producers: Some(schedule.clone()),
+            ..BlockHeader::default()
+        };
+        assert_eq!(
+            legacy.new_schedule_hash().unwrap(),
+            Some(Digest::hash(&schedule.pack().unwrap()))
+        );
+        legacy.new_producers = None;
+        assert_eq!(legacy.new_schedule_hash().unwrap(), None);
+
+        let invalid_authority = vec![0; 4];
+        legacy
+            .header_extensions
+            .push((PRODUCER_SCHEDULE_CHANGE_EXTENSION_ID, invalid_authority));
+        assert!(legacy.new_schedule().is_err());
+    }
+
+    #[test]
+    fn schedule_extensions_reject_duplicates_and_mixed_formats() {
+        let extension = (PRODUCER_SCHEDULE_CHANGE_EXTENSION_ID, vec![0; 4]);
+        let mut duplicate = BlockHeader::default();
+        duplicate.header_extensions = vec![extension.clone(), extension.clone()];
+        assert!(duplicate.new_schedule().is_err());
+
+        let mut mixed = BlockHeader::default();
+        mixed.new_producers = Some(ProducerSchedule::default());
+        mixed.header_extensions.push(extension);
+        assert!(mixed.new_schedule().is_err());
+    }
+
+    #[test]
+    fn protocol_feature_extensions_reject_unknown_empty_and_duplicate_entries() {
+        let mut unknown = BlockHeader::default();
+        unknown.header_extensions.push((99, Vec::new()));
+        assert!(unknown.protocol_feature_activations().is_err());
+
+        let mut empty = BlockHeader::default();
+        empty.header_extensions.push((
+            PROTOCOL_FEATURE_ACTIVATION_EXTENSION_ID,
+            Vec::<Digest>::new().pack().unwrap(),
+        ));
+        assert!(empty.protocol_feature_activations().is_err());
+
+        let mut duplicate_extension = BlockHeader::default();
+        duplicate_extension.header_extensions = vec![
+            (
+                PROTOCOL_FEATURE_ACTIVATION_EXTENSION_ID,
+                vec![Digest([1; 32])].pack().unwrap(),
+            ),
+            (
+                PROTOCOL_FEATURE_ACTIVATION_EXTENSION_ID,
+                vec![Digest([2; 32])].pack().unwrap(),
+            ),
+        ];
+        assert!(duplicate_extension.protocol_feature_activations().is_err());
+
+        let header = BlockHeader::default();
+        assert!(header.protocol_feature_activations().unwrap().is_empty());
     }
 }

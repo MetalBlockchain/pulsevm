@@ -3199,3 +3199,49 @@ impl ArenaIteratorCache {
         }
     }
 }
+
+#[cfg(test)]
+mod arena_iterator_cache_tests {
+    use super::ArenaIteratorCache;
+
+    #[test]
+    fn table_and_row_handles_are_stable_and_distinct() {
+        let mut cache = ArenaIteratorCache::default();
+        let first_table = (1, 2, 3);
+        let second_table = (1, 2, 4);
+        assert_eq!(cache.cache_table(first_table), -2);
+        assert_eq!(cache.cache_table(first_table), -2);
+        assert_eq!(cache.cache_table(second_table), -3);
+        assert_eq!(cache.table_of_end(-2), Some(first_table));
+        assert_eq!(cache.table_of_end(-3), Some(second_table));
+        assert_eq!(cache.table_of_end(-1), None);
+        assert_eq!(cache.table_of_end(0), None);
+        assert_eq!(cache.table_of_end(-4), None);
+
+        let first_row = (1, 2, 3, 10);
+        let second_row = (1, 2, 3, 11);
+        assert_eq!(cache.add(first_row), 0);
+        assert_eq!(cache.add(first_row), 0);
+        assert_eq!(cache.add(second_row), 1);
+        assert_eq!(cache.row_of(0), Some(first_row));
+        assert_eq!(cache.row_of(1), Some(second_row));
+        assert_eq!(cache.row_of(-2), None);
+        assert_eq!(cache.row_of(9), None);
+    }
+
+    #[test]
+    fn removed_handles_become_tombstones_and_are_never_reused() {
+        let mut cache = ArenaIteratorCache::default();
+        let row = (7, 8, 9, 10);
+        assert_eq!(cache.add(row), 0);
+        cache.remove(-2);
+        cache.remove(99);
+        assert_eq!(cache.row_of(0), Some(row));
+
+        cache.remove(0);
+        assert_eq!(cache.row_of(0), None);
+        cache.remove(0);
+        assert_eq!(cache.add(row), 1);
+        assert_eq!(cache.row_of(1), Some(row));
+    }
+}

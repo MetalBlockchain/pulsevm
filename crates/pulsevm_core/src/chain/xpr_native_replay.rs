@@ -1808,9 +1808,231 @@ struct FeedActionData {
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
+    use std::{
+        collections::BTreeMap,
+        str::FromStr,
+    };
 
     use super::*;
+
+    #[derive(Default)]
+    struct MockBotOracleContext {
+        transaction_id: [u8; 32],
+        pending: BlockTimestamp,
+        rows: BTreeMap<(u64, u64), (u64, Vec<u8>)>,
+        required: Vec<u64>,
+        inline: Vec<Action>,
+        updates: Vec<(u64, u64, u64, usize, u64)>,
+    }
+
+    impl BotOracleContext for MockBotOracleContext {
+        fn transaction_id(&self) -> [u8; 32] {
+            self.transaction_id
+        }
+
+        fn pending_block_timestamp(&self) -> BlockTimestamp {
+            self.pending
+        }
+
+        fn contract_row(
+            &self,
+            code: u64,
+            table: u64,
+            primary: u64,
+        ) -> Result<Option<(u64, Vec<u8>)>, ChainError> {
+            assert!(code == BOT || code == ORACLES);
+            Ok(self.rows.get(&(table, primary)).cloned())
+        }
+
+        fn require_authorization(&self, action: &Action, account: u64) -> Result<(), ChainError> {
+            if action
+                .authorization()
+                .iter()
+                .any(|authorization| authorization.actor == account)
+            {
+                Ok(())
+            } else {
+                Err(ChainError::MissingAuthError("test authorization".into()))
+            }
+        }
+
+        fn execute_inline(&mut self, action: Action) -> Result<(), ChainError> {
+            self.required
+                .extend(action.authorization().iter().map(|level| level.actor));
+            self.inline.push(action);
+            Ok(())
+        }
+
+        fn update_contract_row(
+            &mut self,
+            code: u64,
+            table: u64,
+            primary: u64,
+            old_payer: u64,
+            old_value_len: usize,
+            payer: u64,
+            value: Vec<u8>,
+        ) -> Result<(), ChainError> {
+            assert_eq!(self.rows[&(table, primary)].1.len(), old_value_len);
+            self.updates
+                .push((code, table, primary, old_value_len, payer));
+            let effective_payer = if payer == 0 { old_payer } else { payer };
+            self.rows.insert((table, primary), (effective_payer, value));
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct MockSystemContext {
+        pending: BlockTimestamp,
+        rows: BTreeMap<(u64, u64), (u64, Vec<u8>)>,
+        authorized: bool,
+        updates: Vec<(u64, u64)>,
+    }
+
+    impl SystemOnblockContext for MockSystemContext {
+        fn pending_block_timestamp(&self) -> BlockTimestamp {
+            self.pending
+        }
+
+        fn contract_row(
+            &self,
+            table: u64,
+            primary: u64,
+        ) -> Result<Option<(u64, Vec<u8>)>, ChainError> {
+            Ok(self.rows.get(&(table, primary)).cloned())
+        }
+
+        fn require_system_authorization(&mut self) -> Result<(), ChainError> {
+            self.authorized = true;
+            Ok(())
+        }
+
+        fn update_contract_row(
+            &mut self,
+            table: u64,
+            primary: u64,
+            old_payer: u64,
+            old_value_len: usize,
+            payer: u64,
+            value: Vec<u8>,
+        ) -> Result<(), ChainError> {
+            assert_eq!(self.rows[&(table, primary)].0, old_payer);
+            assert_eq!(self.rows[&(table, primary)].1.len(), old_value_len);
+            self.rows.insert((table, primary), (payer, value));
+            self.updates.push((table, primary));
+            Ok(())
+        }
+    }
+
+    fn double(value: f64) -> DataVariant {
+        DataVariant {
+            d_string: None,
+            d_uint64: None,
+            d_double: Some(value),
+        }
+    }
+
+    fn feed_row(account: u64, feed_index: u64) -> FeedRow {
+        let mut config = CanonicalMap::new();
+        config.insert("data_same_provider_limit".into(), 0);
+        config.insert("data_window_size".into(), 20);
+        config.insert("data_freshness_sec".into(), 0);
+        config.insert("min_provider_wait_sec".into(), 0);
+        let mut providers = CanonicalMap::new();
+        providers.insert(account, 0);
+        FeedRow {
+            index: feed_index,
+            name: "XPR/USD".into(),
+            description: "test feed".into(),
+            aggregate_function: "mean".into(),
+            data_type: "double".into(),
+            config,
+            providers,
+        }
+    }
+
+    fn data_row(feed_index: u64) -> DataRow {
+        DataRow {
+            feed_index,
+            aggregate: double(0.0),
+            points: Vec::new(),
+        }
+    }
+
+    fn bot_row(account: u64, feed_index: u64) -> BotRow {
+        BotRow {
+            index: 3,
+            account,
+            description: "test bot".into(),
+            oracle_contract: ORACLES,
+            feed_index,
+            tx_count_by_utc_hour: CanonicalMap::new(),
+            max_history: 2,
+            history: Vec::new(),
+        }
+    }
+
+    fn process_action(account: u64, feed_index: Option<u64>, value: f64) -> Action {
+        let entry = BotEntry {
+            bot_index: 3,
+            data: double(value),
+        };
+        let data = if let Some(feed_index) = feed_index {
+            ProcessV2 {
+                account,
+                entries: vec![entry],
+                nonce: 9,
+                oracle_index: feed_index,
+            }
+            .pack()
+            .unwrap()
+        } else {
+            Process {
+                account,
+                entries: vec![entry],
+                nonce: 9,
+            }
+            .pack()
+            .unwrap()
+        };
+        Action::new(
+            Name::new(BOT),
+            Name::new(PROCESS),
+            data,
+            vec![PermissionLevel::new(account, ACTIVE_NAME.as_u64())],
+        )
+    }
+
+    fn insert_direct_rows(db: &mut Database, account: u64, feed_index: u64) {
+        db.create_key_value_object_standalone(
+            BOT,
+            BOT,
+            BOTS,
+            BOT,
+            3,
+            &bot_row(account, feed_index).pack().unwrap(),
+        )
+        .unwrap();
+        db.create_key_value_object_standalone(
+            ORACLES,
+            ORACLES,
+            FEEDS,
+            ORACLES,
+            feed_index,
+            &feed_row(account, feed_index).pack().unwrap(),
+        )
+        .unwrap();
+        db.create_key_value_object_standalone(
+            ORACLES,
+            ORACLES,
+            DATA,
+            ORACLES,
+            feed_index,
+            &data_row(feed_index).pack().unwrap(),
+        )
+        .unwrap();
+    }
 
     #[test]
     fn audited_oracle_v7_uses_the_existing_feed_layout() {
@@ -2083,5 +2305,504 @@ mod tests {
         row[16] = 0;
         row[51] = 0x80;
         assert_eq!(producer_unpaid_offset(&row), None);
+    }
+
+    #[test]
+    fn code_hash_gates_accept_every_audited_revision() {
+        for hash in [
+            XPR_SYSTEM_CODE_HASH,
+            XPR_SYSTEM_V2_CODE_HASH,
+            XPR_SYSTEM_V3_CODE_HASH,
+            XPR_SYSTEM_V4_CODE_HASH,
+        ] {
+            assert!(is_supported_system_code_hash(&hash));
+        }
+        for hash in [
+            XPR_BOT_CODE_HASH,
+            XPR_BOT_V2_CODE_HASH,
+            XPR_BOT_V3_CODE_HASH,
+            XPR_BOT_V4_CODE_HASH,
+        ] {
+            assert!(is_supported_bot_code_hash(&hash));
+        }
+        assert!(!bot_uses_v2_layout(&XPR_BOT_CODE_HASH));
+        for hash in [
+            XPR_BOT_V2_CODE_HASH,
+            XPR_BOT_V3_CODE_HASH,
+            XPR_BOT_V4_CODE_HASH,
+        ] {
+            assert!(bot_uses_v2_layout(&hash));
+        }
+        for hash in [
+            XPR_ORACLES_CODE_HASH,
+            XPR_ORACLES_V2_CODE_HASH,
+            XPR_ORACLES_V3_CODE_HASH,
+            XPR_ORACLES_V4_CODE_HASH,
+            XPR_ORACLES_V5_CODE_HASH,
+            XPR_ORACLES_V6_CODE_HASH,
+            XPR_ORACLES_V7_CODE_HASH,
+            XPR_ORACLES_V8_CODE_HASH,
+        ] {
+            assert!(is_supported_oracle_code_hash(&hash));
+        }
+        assert!(!oracle_uses_v2_layout(&XPR_ORACLES_CODE_HASH));
+        assert!(oracle_supports_mean_median(&XPR_ORACLES_V8_CODE_HASH));
+        assert!(!oracle_supports_mean_median(&XPR_ORACLES_V7_CODE_HASH));
+        assert!(!is_supported_system_code_hash(&[0; 32]));
+        assert!(!is_supported_bot_code_hash(&[0; 32]));
+    }
+
+    #[test]
+    fn codecs_and_numeric_helpers_fail_closed() {
+        assert_eq!(serialized_length_delta(7, 11).unwrap(), 4);
+        assert_eq!(serialized_length_delta(11, 7).unwrap(), -4);
+        assert!(serialized_length_delta(usize::MAX, 0).is_err());
+        assert!(serialized_length_delta(0, usize::MAX).is_err());
+
+        let mut encoded = Process {
+            account: 7,
+            entries: Vec::new(),
+            nonce: 8,
+        }
+        .pack()
+        .unwrap();
+        encoded.push(0xff);
+        assert!(read_exact::<Process>(&encoded, "process").is_err());
+
+        let finite = vec![
+            ProviderPoint {
+                provider: 1,
+                time: 0,
+                data: double(2.0),
+            },
+            ProviderPoint {
+                provider: 2,
+                time: 0,
+                data: double(4.0),
+            },
+        ];
+        assert_eq!(mean_double(&finite), Some(3.0));
+        assert_eq!(mean_median_double(&finite), Some(3.0));
+        assert_eq!(mean_median_double(&finite[..1]), Some(2.0));
+
+        let mut missing = finite.clone();
+        missing[0].data.d_double = None;
+        assert_eq!(mean_double(&missing), None);
+        assert_eq!(mean_median_double(&missing), None);
+        let mut non_finite = finite;
+        non_finite[0].data.d_double = Some(f64::INFINITY);
+        assert_eq!(mean_double(&non_finite), None);
+
+        let mut bytes = [0; 16];
+        assert_eq!(put_u32(&mut bytes, 1, 0xaabb_ccdd), Some(()));
+        assert_eq!(get_u32(&bytes, 1), Some(0xaabb_ccdd));
+        assert_eq!(put_i64(&mut bytes, 8, -17), Some(()));
+        assert_eq!(get_i64(&bytes, 8), Some(-17));
+        assert_eq!(get_u64(&bytes, 8), Some((-17_i64) as u64));
+        assert_eq!(put_u32(&mut bytes, 14, 1), None);
+        assert_eq!(put_i64(&mut bytes, 12, 1), None);
+        assert_eq!(get_u32(&bytes, 14), None);
+        assert_eq!(get_i64(&bytes, 12), None);
+        assert_eq!(get_u64(&bytes, 12), None);
+    }
+
+    #[test]
+    fn oracle_transition_covers_window_freshness_and_validation() {
+        let account = 42;
+        let feed_index = 7;
+        let mut feed = feed_row(account, feed_index);
+        feed.config.insert("data_window_size".into(), 2);
+        feed.config.insert("data_freshness_sec".into(), 3);
+        feed.config.insert("min_provider_wait_sec".into(), 2);
+        feed.config.insert("data_same_provider_limit".into(), 1);
+        let mut data = data_row(feed_index);
+        data.points = vec![
+            ProviderPoint {
+                provider: 9,
+                time: 5_000_000,
+                data: double(10.0),
+            },
+            ProviderPoint {
+                provider: 9,
+                time: 1_000_000,
+                data: double(20.0),
+            },
+        ];
+        let action = FeedActionData {
+            account,
+            feed_index,
+            data: double(30.0),
+        };
+
+        assert!(update_oracle_feed(&mut feed, &mut data, &action, 6_000_000, true, true).unwrap());
+        assert_eq!(data.points.len(), 2);
+        assert_eq!(data.aggregate.d_double, Some(20.0));
+        assert_eq!(feed.providers[&account], 6_000_000);
+
+        let error =
+            update_oracle_feed(&mut feed, &mut data, &action, 7_000_000, true, true).unwrap_err();
+        assert!(error.to_string().contains("wait time too short"));
+        let error =
+            update_oracle_feed(&mut feed, &mut data, &action, 5_000_000, true, true).unwrap_err();
+        assert!(error.to_string().contains("wait time too short"));
+
+        let mut unregistered = feed.clone();
+        unregistered.providers.clear();
+        assert!(
+            update_oracle_feed(
+                &mut unregistered,
+                &mut data.clone(),
+                &action,
+                10_000_000,
+                true,
+                true,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("not a registered provider")
+        );
+
+        for mutate in 0..6 {
+            let mut unsupported = feed_row(account, feed_index);
+            let mut invalid_action = action.clone();
+            match mutate {
+                0 => unsupported.aggregate_function = "median".into(),
+                1 => unsupported.data_type = "uint64".into(),
+                2 => {
+                    unsupported
+                        .config
+                        .insert("data_same_provider_limit".into(), 256);
+                }
+                3 => invalid_action.data.d_string = Some("bad".into()),
+                4 => invalid_action.data.d_uint64 = Some(1),
+                _ => invalid_action.data.d_double = None,
+            };
+            assert!(
+                !update_oracle_feed(
+                    &mut unsupported,
+                    &mut data_row(feed_index),
+                    &invalid_action,
+                    10_000_000,
+                    false,
+                    false,
+                )
+                .unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn bot_and_oracle_trait_paths_apply_canonical_rows() {
+        let account = 42;
+        let feed_index = 7;
+        let pending = BlockTimestamp::new(1234);
+        let mut context = MockBotOracleContext {
+            transaction_id: [9; 32],
+            pending,
+            ..MockBotOracleContext::default()
+        };
+        context.rows.insert(
+            (BOTS, 3),
+            (BOT, bot_row(account, feed_index).pack().unwrap()),
+        );
+        context.rows.insert(
+            (FEEDS, feed_index),
+            (ORACLES, feed_row(account, feed_index).pack().unwrap()),
+        );
+        context.rows.insert(
+            (DATA, feed_index),
+            (ORACLES, data_row(feed_index).pack().unwrap()),
+        );
+
+        apply_bot_process(&mut context, &process_action(account, None, 12.0), false).unwrap();
+        assert_eq!(context.inline.len(), 1);
+        assert_eq!(context.required, vec![account]);
+        let inline = context.inline[0].clone();
+        assert!(apply_oracles_feed(&mut context, &inline, false, false).unwrap());
+        assert_eq!(context.updates.len(), 3);
+
+        let bot: BotRow = read_exact(&context.rows[&(BOTS, 3)].1, "bot").unwrap();
+        assert_eq!(bot.history.len(), 1);
+        assert_eq!(bot.history[0].id, Digest([9; 32]));
+        let data: DataRow = read_exact(&context.rows[&(DATA, feed_index)].1, "data").unwrap();
+        assert_eq!(data.aggregate.d_double, Some(12.0));
+
+        apply_bot_process(
+            &mut context,
+            &process_action(account, Some(feed_index), 18.0),
+            true,
+        )
+        .unwrap();
+        let missing = process_action(account + 1, None, 1.0);
+        assert!(apply_bot_process(&mut context, &missing, false).is_err());
+
+        let malformed = Action::new(
+            Name::new(ORACLES),
+            Name::new(FEED),
+            vec![0xff],
+            vec![PermissionLevel::new(account, ACTIVE_NAME.as_u64())],
+        );
+        assert!(!apply_oracles_feed(&mut context, &malformed, false, false).unwrap());
+        context.rows.remove(&(FEEDS, feed_index));
+        assert!(apply_oracles_feed(&mut context, &inline, false, false).is_err());
+    }
+
+    #[test]
+    fn direct_and_cached_bot_paths_preserve_state() {
+        let account = 42;
+        let feed_index = 7;
+        let pending = BlockTimestamp::new(1234);
+        let action = process_action(account, None, 12.0);
+
+        let mut direct_db = Database::default();
+        insert_direct_rows(&mut direct_db, account, feed_index);
+        direct_db.enable_xpr_native_replay();
+        direct_db.arena_start_undo_session();
+        let direct = try_apply_bot_transaction_direct(
+            &mut direct_db,
+            pending,
+            [3; 32],
+            &action,
+            &XPR_BOT_CODE_HASH,
+            &XPR_ORACLES_CODE_HASH,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(direct.inline_actions.len(), 1);
+        assert!(!direct.ram_deltas.is_empty());
+        direct_db.arena_undo();
+
+        let mut cached_db = Database::default();
+        insert_direct_rows(&mut cached_db, account, feed_index);
+        cached_db.enable_xpr_native_replay();
+        let mut cache = DirectBotOracleCache::default();
+        let first = try_apply_bot_transaction_direct_cached(
+            &cached_db,
+            &mut cache,
+            pending,
+            [4; 32],
+            &action,
+            &XPR_BOT_CODE_HASH,
+            &XPR_ORACLES_CODE_HASH,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(first.inline_actions.len(), 1);
+        let second = try_apply_bot_transaction_direct_cached(
+            &cached_db,
+            &mut cache,
+            pending,
+            [5; 32],
+            &action,
+            &XPR_BOT_CODE_HASH,
+            &XPR_ORACLES_CODE_HASH,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(second.inline_actions.len(), 1);
+
+        let parent = CachedActionMetadata {
+            privileged: false,
+            code_hash: XPR_BOT_CODE_HASH,
+            code_sequence: 2,
+            abi_sequence: 3,
+        };
+        let oracle = CachedActionMetadata {
+            privileged: false,
+            code_hash: XPR_ORACLES_CODE_HASH,
+            code_sequence: 4,
+            abi_sequence: 5,
+        };
+        cache.cache_admission((BOT, account, ACTIVE_NAME.as_u64()), parent, oracle);
+        assert!(
+            cache
+                .admission((BOT, account, ACTIVE_NAME.as_u64()))
+                .is_some()
+        );
+        assert!(
+            cache
+                .admission((BOT, account + 1, ACTIVE_NAME.as_u64()))
+                .is_none()
+        );
+        cache.record_permission_usage(account, ACTIVE_NAME.as_u64());
+        cache.record_permission_usage(account, ACTIVE_NAME.as_u64());
+        cached_db.arena_start_undo_session();
+        cache.flush(&mut cached_db, pending).unwrap();
+        assert!(cache.bots.is_empty());
+        assert!(cache.feeds.is_empty());
+        assert!(cache.data.is_empty());
+        assert!(cache.permission_usages.is_empty());
+        assert!(cache.admission.is_none());
+        cached_db.arena_undo();
+
+        let disabled = Database::default();
+        assert!(
+            try_apply_bot_transaction_direct_cached(
+                &disabled,
+                &mut DirectBotOracleCache::default(),
+                pending,
+                [0; 32],
+                &action,
+                &[0; 32],
+                &[0; 32],
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            try_apply_bot_transaction_direct(
+                &mut Database::default(),
+                pending,
+                [0; 32],
+                &action,
+                &[0; 32],
+                &[0; 32],
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    fn onblock_action(slot: u32, producer: u64) -> Action {
+        let mut data = slot.to_le_bytes().to_vec();
+        data.extend_from_slice(&producer.to_le_bytes());
+        Action::new(
+            Name::new(EOSIO),
+            Name::new(ONBLOCK),
+            data,
+            vec![PermissionLevel::new(EOSIO, ACTIVE_NAME.as_u64())],
+        )
+    }
+
+    fn system_context(action_slot: u32, producer: u64, activated: bool) -> MockSystemContext {
+        let pending = BlockTimestamp::new(action_slot + 1);
+        let now = pending.to_time_point().time_since_epoch().count() / 1_000_000;
+        let mut global = vec![0; GLOBAL_ROW_SIZE];
+        put_u32(&mut global, GLOBAL_LAST_SCHEDULE_OFFSET, action_slot).unwrap();
+        put_u32(&mut global, GLOBAL_TOTAL_UNPAID_OFFSET, 9).unwrap();
+        put_i64(
+            &mut global,
+            GLOBAL_ACTIVATION_TIME_OFFSET,
+            i64::from(activated),
+        )
+        .unwrap();
+        let mut global2 = vec![0; GLOBAL2_ROW_SIZE];
+        put_u32(&mut global2, GLOBAL2_LAST_BLOCK_OFFSET, action_slot - 1).unwrap();
+        let mut globalsxpr = vec![0; GLOBALSXPR_ROW_SIZE];
+        globalsxpr[GLOBALSXPR_PROCESS_INTERVAL_OFFSET..GLOBALSXPR_PROCESS_INTERVAL_OFFSET + 8]
+            .copy_from_slice(&43_200_u64.to_le_bytes());
+        let mut globalsd = vec![0; GLOBALSD_ROW_SIZE];
+        put_i64(&mut globalsd, GLOBALSD_PROCESS_TIME_OFFSET, now).unwrap();
+        let mut producer_row = vec![0; 56];
+        producer_row[16] = 0;
+        producer_row[51] = 0;
+        put_u32(&mut producer_row, 52, 7).unwrap();
+
+        let mut rows = BTreeMap::new();
+        rows.insert((GLOBAL, GLOBAL), (11, global));
+        rows.insert((GLOBAL2, GLOBAL2), (12, global2));
+        rows.insert((GLOBAL3, GLOBAL3), (13, vec![0; GLOBAL3_ROW_SIZE]));
+        rows.insert((GLOBAL4, GLOBAL4), (14, vec![0; GLOBAL4_ROW_SIZE]));
+        rows.insert((GLOBALSXPR, GLOBALSXPR), (15, globalsxpr));
+        rows.insert((GLOBALSD, GLOBALSD), (16, globalsd));
+        rows.insert((PRODUCERS, producer), (17, producer_row));
+        MockSystemContext {
+            pending,
+            rows,
+            ..MockSystemContext::default()
+        }
+    }
+
+    #[test]
+    fn native_onblock_updates_activated_and_pre_activation_rows() {
+        let action_slot = 1_000;
+        let producer = 99;
+        let action = onblock_action(action_slot, producer);
+        let mut activated = system_context(action_slot, producer, true);
+        assert!(apply_system_onblock(&mut activated, &action).unwrap());
+        assert!(activated.authorized);
+        assert_eq!(activated.updates.len(), 7);
+        assert_eq!(
+            get_u32(
+                &activated.rows[&(GLOBAL, GLOBAL)].1,
+                GLOBAL_TOTAL_UNPAID_OFFSET,
+            ),
+            Some(10)
+        );
+        assert_eq!(
+            get_u32(&activated.rows[&(PRODUCERS, producer)].1, 52),
+            Some(8)
+        );
+        assert_ne!(
+            get_i64(
+                &activated.rows[&(GLOBAL, GLOBAL)].1,
+                GLOBAL_LAST_PERVOTE_FILL_OFFSET,
+            ),
+            Some(0)
+        );
+
+        let mut inactive = system_context(action_slot, producer, false);
+        assert!(apply_system_onblock(&mut inactive, &action).unwrap());
+        assert!(inactive.authorized);
+        assert_eq!(inactive.updates.len(), 6);
+        assert!(!inactive.updates.contains(&(PRODUCERS, producer)));
+    }
+
+    #[test]
+    fn native_onblock_declines_unsafe_boundaries() {
+        let slot = 1_000;
+        let producer = 99;
+        let action = onblock_action(slot, producer);
+
+        let mut malformed = system_context(slot, producer, true);
+        assert!(
+            !apply_system_onblock(&mut malformed, &onblock_action(slot + 1, producer)).unwrap()
+        );
+        assert!(
+            !apply_system_onblock(
+                &mut malformed,
+                &Action::new(Name::new(EOSIO), Name::new(ONBLOCK), vec![0; 3], Vec::new()),
+            )
+            .unwrap()
+        );
+        malformed.rows.remove(&(GLOBAL, GLOBAL));
+        assert!(!apply_system_onblock(&mut malformed, &action).unwrap());
+
+        let mut wrong_size = system_context(slot, producer, true);
+        wrong_size
+            .rows
+            .get_mut(&(GLOBAL2, GLOBAL2))
+            .unwrap()
+            .1
+            .pop();
+        assert!(!apply_system_onblock(&mut wrong_size, &action).unwrap());
+
+        let mut election_due = system_context(slot, producer, true);
+        put_u32(
+            &mut election_due.rows.get_mut(&(GLOBAL, GLOBAL)).unwrap().1,
+            GLOBAL_LAST_SCHEDULE_OFFSET,
+            slot - 121,
+        )
+        .unwrap();
+        assert!(!apply_system_onblock(&mut election_due, &action).unwrap());
+
+        let mut sharing_due = system_context(slot, producer, true);
+        sharing_due.rows.get_mut(&(GLOBALSD, GLOBALSD)).unwrap().1[GLOBALSD_IS_PROCESSING_OFFSET] =
+            1;
+        put_i64(
+            &mut sharing_due.rows.get_mut(&(GLOBALSD, GLOBALSD)).unwrap().1,
+            GLOBALSD_PROCESS_TIME_UPDATE_OFFSET,
+            0,
+        )
+        .unwrap();
+        assert!(!apply_system_onblock(&mut sharing_due, &action).unwrap());
+
+        let mut malformed_producer = system_context(slot, producer, true);
+        malformed_producer
+            .rows
+            .get_mut(&(PRODUCERS, producer))
+            .unwrap()
+            .1[16] = 2;
+        assert!(!apply_system_onblock(&mut malformed_producer, &action).unwrap());
     }
 }

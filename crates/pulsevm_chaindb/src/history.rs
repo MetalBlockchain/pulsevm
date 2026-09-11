@@ -945,15 +945,28 @@ mod global_property_tests {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use pulsevm_arena::{
         ArenaObject,
         ObjectId,
     };
 
-    use super::pack_deltas;
+    use super::{
+        Ser,
+        collect_protocol_state,
+        pack_deltas,
+        ser_generated_transaction,
+        ser_index_double,
+        ser_index_long_double,
+    };
     use crate::{
         AccountMetaRow,
+        ContractIndexDoubleRow,
+        ContractIndexLongDoubleRow,
+        DeferredTransactionRow,
         PermissionRow,
+        ProtocolFeatureRow,
     };
 
     #[derive(Debug, PartialEq, Eq)]
@@ -1107,5 +1120,88 @@ mod tests {
             })
             .collect();
         assert_eq!(names, [30, 10, 20], "full snapshots follow object id order");
+    }
+
+    #[test]
+    fn floating_secondary_rows_preserve_exact_key_bits() {
+        let mut table_ids = HashMap::new();
+        table_ids.insert(7, (11, 12, 13));
+
+        let double = ContractIndexDoubleRow {
+            t_id: 7,
+            primary_key: 17,
+            secondary_key: -0.0,
+            payer: 19,
+            ..ContractIndexDoubleRow::default()
+        };
+        let mut packed_double = Ser::new();
+        ser_index_double(&mut packed_double, &table_ids, &double);
+        assert_eq!(packed_double.buf.len(), 49);
+        assert_eq!(
+            u64::from_le_bytes(packed_double.buf[41..49].try_into().unwrap()),
+            (-0.0_f64).to_bits()
+        );
+
+        let long_double = ContractIndexLongDoubleRow {
+            t_id: 7,
+            primary_key: 23,
+            sec_lo: 0x0123_4567_89ab_cdef,
+            sec_hi: 0xfedc_ba98_7654_3210,
+            payer: 29,
+            ..ContractIndexLongDoubleRow::default()
+        };
+        let mut packed_long_double = Ser::new();
+        ser_index_long_double(&mut packed_long_double, &table_ids, &long_double);
+        assert_eq!(packed_long_double.buf.len(), 57);
+        assert_eq!(
+            &packed_long_double.buf[41..49],
+            &long_double.sec_lo.to_le_bytes()
+        );
+        assert_eq!(
+            &packed_long_double.buf[49..57],
+            &long_double.sec_hi.to_le_bytes()
+        );
+    }
+
+    #[test]
+    fn generated_transaction_and_protocol_state_use_leap_envelopes() {
+        let mut db = crate::build_registered_db().unwrap();
+        let deferred = DeferredTransactionRow {
+            sender: 1,
+            sender_id_lo: 2,
+            sender_id_hi: 3,
+            payer: 4,
+            trx_id: [5; 32],
+            ..DeferredTransactionRow::default()
+        };
+        let mut serialized = Ser::new();
+        ser_generated_transaction(&mut serialized, &db, &deferred);
+        assert_eq!(serialized.buf.len(), 66);
+        assert_eq!(serialized.buf[0], 0);
+        assert_eq!(&serialized.buf[33..65], &[5; 32]);
+        assert_eq!(serialized.buf[65], 0);
+
+        assert!(collect_protocol_state(&db, false).is_empty());
+        for (digest, block_num) in [([7; 32], 42), ([8; 32], 43)] {
+            db.create::<ProtocolFeatureRow>(|row| {
+                row.feature_digest = digest;
+                row.activation_block_num = block_num;
+            })
+            .unwrap();
+        }
+        let rows = collect_protocol_state(&db, true);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].0);
+        assert_eq!(rows[0].1.len(), 76);
+        assert_eq!(&rows[0].1[3..35], &[7; 32]);
+        assert_eq!(
+            u32::from_le_bytes(rows[0].1[35..39].try_into().unwrap()),
+            42
+        );
+        assert_eq!(&rows[0].1[40..72], &[8; 32]);
+        assert_eq!(
+            u32::from_le_bytes(rows[0].1[72..76].try_into().unwrap()),
+            43
+        );
     }
 }

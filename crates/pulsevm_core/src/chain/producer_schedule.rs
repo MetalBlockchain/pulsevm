@@ -253,4 +253,70 @@ mod tests {
         packed.push(0);
         assert!(ProducerSchedule::read_bounded(&packed).is_err());
     }
+
+    fn packed_single_key_authority(threshold: u32, weight: u16) -> (Vec<u8>, ProducerKey) {
+        let expected = key("producer");
+        let mut packed = VarUint32(1).pack().unwrap();
+        packed.extend(expected.producer_name.pack().unwrap());
+        packed.extend(VarUint32(0).pack().unwrap());
+        packed.extend(threshold.pack().unwrap());
+        packed.extend(VarUint32(1).pack().unwrap());
+        packed.extend(expected.block_signing_key.pack().unwrap());
+        packed.extend(weight.pack().unwrap());
+        (packed, expected)
+    }
+
+    #[test]
+    fn signing_key_lookup_and_authority_schedule_round_trip() {
+        let (authorities, expected) = packed_single_key_authority(1, 1);
+        let decoded = ProducerSchedule::read_authorities_bounded(&authorities).unwrap();
+        assert_eq!(decoded, vec![expected.clone()]);
+
+        let mut packed_schedule = 17_u32.pack().unwrap();
+        packed_schedule.extend(authorities);
+        let schedule = ProducerSchedule::read_authority_schedule_bounded(&packed_schedule).unwrap();
+        assert_eq!(schedule.version, 17);
+        assert_eq!(schedule.producers, vec![expected.clone()]);
+        assert_eq!(
+            schedule.block_signing_key(&expected.producer_name),
+            Some(&expected.block_signing_key)
+        );
+        assert_eq!(
+            schedule.block_signing_key(&Name::from_str("missing").unwrap()),
+            None
+        );
+    }
+
+    #[test]
+    fn authority_decoders_reject_unbounded_and_noncanonical_inputs() {
+        let oversized = vec![0; MAX_SCHEDULE_BYTES as usize + 1];
+        assert!(ProducerSchedule::read_authorities_bounded(&oversized).is_err());
+        assert!(ProducerSchedule::read_authority_schedule_bounded(&oversized).is_err());
+        assert!(ProducerSchedule::read_authorities_bounded(&VarUint32(0).pack().unwrap()).is_err());
+        assert!(
+            ProducerSchedule::read_authorities_bounded(
+                &VarUint32((MAX_PRODUCERS + 1) as u32).pack().unwrap()
+            )
+            .is_err()
+        );
+
+        let (valid, _) = packed_single_key_authority(1, 1);
+        let mut trailing = 2_u32.pack().unwrap();
+        trailing.extend_from_slice(&valid);
+        trailing.push(0);
+        assert!(ProducerSchedule::read_authority_schedule_bounded(&trailing).is_err());
+
+        let mut unsupported_authority = valid.clone();
+        unsupported_authority[9] = 1;
+        assert!(ProducerSchedule::read_authorities_bounded(&unsupported_authority).is_err());
+
+        let mut no_keys = valid.clone();
+        no_keys[14] = 0;
+        assert!(ProducerSchedule::read_authorities_bounded(&no_keys).is_err());
+
+        let (zero_threshold, _) = packed_single_key_authority(0, 1);
+        assert!(ProducerSchedule::read_authorities_bounded(&zero_threshold).is_err());
+        let (insufficient_weight, _) = packed_single_key_authority(2, 1);
+        assert!(ProducerSchedule::read_authorities_bounded(&insufficient_weight).is_err());
+    }
 }

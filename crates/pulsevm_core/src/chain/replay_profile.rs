@@ -29,6 +29,10 @@ static REPORT_INTERVAL: LazyLock<u32> = LazyLock::new(|| {
 });
 static PROFILE: LazyLock<Mutex<ReplayProfile>> =
     LazyLock::new(|| Mutex::new(ReplayProfile::default()));
+#[cfg(test)]
+std::thread_local! {
+    static TEST_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WasmTiming {
@@ -185,6 +189,10 @@ struct BlockTimingNanos {
 }
 
 pub fn enabled() -> bool {
+    #[cfg(test)]
+    if TEST_ENABLED.with(std::cell::Cell::get) {
+        return true;
+    }
     *ENABLED
 }
 
@@ -419,5 +427,135 @@ pub fn record_block(block_num: u32, timing: BlockTiming) {
             ms(stats.instantiate),
             ms(stats.apply),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct ProfilingGuard;
+
+    impl ProfilingGuard {
+        fn enable() -> Self {
+            *PROFILE.lock().unwrap() = ReplayProfile::default();
+            TEST_ENABLED.set(true);
+            Self
+        }
+    }
+
+    impl Drop for ProfilingGuard {
+        fn drop(&mut self) {
+            TEST_ENABLED.set(false);
+            *PROFILE.lock().unwrap() = ReplayProfile::default();
+        }
+    }
+
+    fn duration(micros: u64) -> Duration {
+        Duration::from_micros(micros)
+    }
+
+    #[test]
+    fn records_and_resets_a_complete_profile_interval() {
+        let _guard = ProfilingGuard::enable();
+
+        record_transaction("native", duration(11));
+        record_transaction("native", duration(13));
+        record_native_decline("shape");
+        record_native_decline("shape");
+        record_native_code_decline([1; 32], [2; 32]);
+        record_wasm(
+            6_138_663_577_826_885_632,
+            11_875_739_475_730_497_536,
+            [3; 32],
+            WasmTiming {
+                total: duration(31),
+                module: duration(2),
+                store: duration(3),
+                reset: duration(5),
+                instantiate: duration(7),
+                apply: duration(11),
+                compiled: true,
+                reused_instance: true,
+            },
+        );
+        record_native_bot(NativeBotTiming {
+            total: duration(67),
+            admission: duration(2),
+            metadata: duration(3),
+            decode: duration(5),
+            cache_clone: duration(7),
+            bot_rows: duration(11),
+            oracle_rows: duration(13),
+            cache_commit: duration(17),
+            inline_auth: duration(19),
+            transaction_and_ram: duration(23),
+            receipts: duration(29),
+            resources: duration(31),
+        });
+        record_native_onblock(NativeOnblockTiming {
+            total: duration(37),
+            metadata: duration(2),
+            state_transition: duration(3),
+            account_usage: duration(5),
+            receipt: duration(7),
+            resources: duration(11),
+        });
+        record_read_only_wasm_probe(true);
+        record_read_only_wasm_probe(false);
+        record_read_only_wasm_finish(true, false);
+        record_read_only_wasm_finish(false, true);
+        record_read_only_wasm_finish(false, false);
+
+        {
+            let profile = PROFILE.lock().unwrap();
+            assert_eq!(profile.transaction_paths["native"].calls, 2);
+            assert_eq!(profile.transaction_paths["native"].nanos, 24_000);
+            assert_eq!(profile.native_declines["shape"], 2);
+            assert_eq!(profile.native_code_declines[&([1; 32], [2; 32])], 1);
+            assert_eq!(profile.native_bot.calls, 1);
+            assert_eq!(profile.native_onblock.calls, 1);
+            assert_eq!(profile.read_only_wasm.hits, 1);
+            assert_eq!(profile.read_only_wasm.misses, 1);
+            assert_eq!(profile.read_only_wasm.promotions, 1);
+            assert_eq!(profile.read_only_wasm.inline_declines, 1);
+            assert_eq!(profile.read_only_wasm.mutation_declines, 1);
+        }
+
+        record_block(
+            *REPORT_INTERVAL,
+            BlockTiming {
+                total: duration(101),
+                expired: duration(2),
+                onblock: duration(3),
+                transactions: duration(5),
+                native_flush: duration(7),
+                merkle: duration(11),
+                resources: duration(13),
+            },
+        );
+
+        let profile = PROFILE.lock().unwrap();
+        assert_eq!(profile.blocks, 0);
+        assert!(profile.transaction_paths.is_empty());
+        assert!(profile.native_declines.is_empty());
+        assert!(profile.native_code_declines.is_empty());
+        assert!(profile.wasm.is_empty());
+    }
+
+    #[test]
+    fn retains_samples_before_the_report_boundary() {
+        let _guard = ProfilingGuard::enable();
+        record_block(
+            REPORT_INTERVAL.saturating_sub(1),
+            BlockTiming {
+                total: duration(17),
+                ..BlockTiming::default()
+            },
+        );
+
+        let profile = PROFILE.lock().unwrap();
+        assert_eq!(profile.blocks, 1);
+        assert_eq!(profile.block.total, 17_000);
     }
 }

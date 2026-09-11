@@ -11,10 +11,6 @@ coverage:
         target: 80%
         threshold: 0%
         if_not_found: failure
-        # This long-lived import branch contains Mainnet replay paths that need
-        # the external XPR corpus; retain the 80% gate for every other branch.
-        branches:
-          - "!^blasrodri/pulsevm:feat/xpr-chainbase-import$"
 
 # Publish status checks without adding a bot comment to every pull request.
 comment: false
