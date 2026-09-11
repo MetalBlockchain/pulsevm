@@ -9,12 +9,16 @@
 //! The database handle lives in the `Database` wrapper (not in the controller) so that
 //! every `Database` clone — and there is one per apply/transaction context —
 //! shares the same arena through an `Arc`, and writes reach it with no change at
-//! the call sites. The arena is single-threaded (`Db: !Sync`); the `Mutex`
-//! serialises access. Never hold the guard across an `.await`.
+//! the call sites. A writer remains exclusive, while immutable speculative
+//! snapshots can read the frozen block prefix concurrently. Never hold a guard
+//! across an `.await`.
 
-use std::sync::{
-    Arc,
-    Mutex,
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc,
+        RwLock,
+    },
 };
 
 mod history;
@@ -27,6 +31,7 @@ use pulsevm_arena::{
     IndexedBy,
     ObjectId,
     SecondaryIndex,
+    hash_index,
     key_index,
 };
 use zerocopy::{
@@ -124,6 +129,14 @@ impl UsageAccumulator {
     }
 
     fn add(&mut self, units: u64, ordinal: u32, window_size: u32) {
+        // Imported checkpoints resume at the source block height. Keep the
+        // accumulator defensive in case an older checkpoint or malformed import
+        // presents a backwards ordinal; resetting is safer than unsigned wrap.
+        if ordinal < self.last_ordinal {
+            self.value_ex = 0;
+            self.consumed = 0;
+            self.last_ordinal = ordinal;
+        }
         let value_ex_contrib = integer_divide_ceil(
             units as u128 * RATE_LIMITING_PRECISION as u128,
             window_size as u128,
@@ -158,7 +171,7 @@ impl UsageAccumulator {
 #[arena(type_id = 16)]
 struct ResourceUsageRow {
     id: ObjectId<ResourceUsageRow>,
-    #[arena(index)]
+    #[arena(hash_index)]
     owner: u64,
     ram_usage: u64,
     net_usage: UsageAccumulator,
@@ -189,6 +202,13 @@ impl IndexedBy<ResourceLimitsRow> for LimitsByOwner {
         (o.pending, o.owner)
     }
 }
+struct LimitsByOwnerHash;
+impl IndexedBy<ResourceLimitsRow> for LimitsByOwnerHash {
+    type Key = (u8, u64);
+    fn key(o: &ResourceLimitsRow) -> Self::Key {
+        (o.pending, o.owner)
+    }
+}
 impl ArenaObject for ResourceLimitsRow {
     const TYPE_ID: u16 = 17;
     fn id(&self) -> ObjectId<Self> {
@@ -198,7 +218,10 @@ impl ArenaObject for ResourceLimitsRow {
         self.id = id;
     }
     fn secondary_indices() -> Vec<Box<dyn SecondaryIndex<Self>>> {
-        vec![key_index::<Self, LimitsByOwner>()]
+        vec![
+            key_index::<Self, LimitsByOwner>(),
+            hash_index::<Self, LimitsByOwnerHash>(),
+        ]
     }
 }
 
@@ -421,6 +444,13 @@ impl IndexedBy<PermissionRow> for PermByOwner {
         (o.owner, o.perm_name)
     }
 }
+struct PermByOwnerHash;
+impl IndexedBy<PermissionRow> for PermByOwnerHash {
+    type Key = (u64, u64);
+    fn key(o: &PermissionRow) -> Self::Key {
+        (o.owner, o.perm_name)
+    }
+}
 struct PermByName;
 impl IndexedBy<PermissionRow> for PermByName {
     type Key = (u64, i64);
@@ -447,6 +477,7 @@ impl ArenaObject for PermissionRow {
         vec![
             key_index::<Self, PermByParent>(),
             key_index::<Self, PermByOwner>(),
+            hash_index::<Self, PermByOwnerHash>(),
             key_index::<Self, PermByName>(),
             key_index::<Self, PermByCbId>(),
         ]
@@ -555,6 +586,20 @@ struct DynGlobalPropertyRow {
     global_action_sequence: u64,
 }
 
+fn write_varuint(mut value: u64, out: &mut Vec<u8>) {
+    loop {
+        let mut byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        out.push(byte);
+        if value == 0 {
+            return;
+        }
+    }
+}
+
 /// Arena-internal bookkeeping — NOT part of any consensus state and never
 /// serialized into a `*_state_bytes` root. Holds the next permission id the
 /// arena will assign, replicating chainbase's per-index `undo_index::_next_id`
@@ -599,10 +644,52 @@ struct GlobalPropertyRow {
     max_transaction_cpu_usage: u32,
     min_transaction_cpu_usage: u32,
     max_transaction_lifetime: u32,
+    deferred_trx_expiration_window: u32,
     max_transaction_delay: u32,
     max_inline_action_size: u32,
     max_inline_action_depth: u16,
     max_authority_depth: u16,
+    _pad: u32,
+}
+
+/// Undo-tracked `global_property_object::proposed_schedule` state. The packed
+/// schedule remains in a blob because the producer vector is variable-length;
+/// `block_num` records the block in which `set_proposed_producers` wrote it.
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout, ArenaObject)]
+#[arena(type_id = 24)]
+struct ProposedScheduleRow {
+    id: ObjectId<ProposedScheduleRow>,
+    block_num: u32,
+    _pad: u32,
+    packed_schedule: BlobRef,
+}
+
+/// One activated protocol feature from chainbase's `protocol_state` singleton.
+/// The singleton is represented as an ordered table so the variable-length
+/// feature vector remains undo/checkpoint safe without imposing a fixed cap on
+/// the number of features.
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout, ArenaObject)]
+#[arena(type_id = 22)]
+struct ProtocolFeatureRow {
+    id: ObjectId<ProtocolFeatureRow>,
+    feature_digest: [u8; 32],
+    activation_block_num: u32,
+    _pad: u32,
+}
+
+/// A protocol feature requested by a privileged contract but not yet activated
+/// in a block header. Leap keeps this transient vector beside the activated
+/// feature set; Arena stores it as an undo/checkpoint-safe table so forks and
+/// restarts preserve the same preactivation state.
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout, ArenaObject)]
+#[arena(type_id = 23)]
+struct PreactivatedProtocolFeatureRow {
+    id: ObjectId<PreactivatedProtocolFeatureRow>,
+    feature_digest: [u8; 32],
+    _pad: [u8; 8],
 }
 
 /// Rust representation of the chainbase `resource_limits_config_object` singleton: the
@@ -652,6 +739,7 @@ pub struct ChainConfigParams {
     pub max_transaction_cpu_usage: u32,
     pub min_transaction_cpu_usage: u32,
     pub max_transaction_lifetime: u32,
+    pub deferred_trx_expiration_window: u32,
     pub max_transaction_delay: u32,
     pub max_inline_action_size: u32,
     pub max_inline_action_depth: u16,
@@ -675,6 +763,7 @@ impl ChainConfigParams {
         out.extend_from_slice(&self.max_transaction_cpu_usage.to_le_bytes());
         out.extend_from_slice(&self.min_transaction_cpu_usage.to_le_bytes());
         out.extend_from_slice(&self.max_transaction_lifetime.to_le_bytes());
+        out.extend_from_slice(&self.deferred_trx_expiration_window.to_le_bytes());
         out.extend_from_slice(&self.max_transaction_delay.to_le_bytes());
         out.extend_from_slice(&self.max_inline_action_size.to_le_bytes());
         out.extend_from_slice(&self.max_inline_action_depth.to_le_bytes());
@@ -698,6 +787,7 @@ impl GlobalPropertyRow {
             max_transaction_cpu_usage: self.max_transaction_cpu_usage,
             min_transaction_cpu_usage: self.min_transaction_cpu_usage,
             max_transaction_lifetime: self.max_transaction_lifetime,
+            deferred_trx_expiration_window: self.deferred_trx_expiration_window,
             max_transaction_delay: self.max_transaction_delay,
             max_inline_action_size: self.max_inline_action_size,
             max_inline_action_depth: self.max_inline_action_depth,
@@ -716,6 +806,104 @@ struct TransactionRow {
     expiration: u32,
     _pad: u32,
     trx_id: [u8; 32],
+}
+
+/// A complete XPR `generated_transaction_object` carried across the migration
+/// boundary. The packed transaction belongs in the blob arena; all scheduler
+/// fields remain native values so selection can use an ordered secondary index
+/// without reparsing the payload. This is intentionally separate from
+/// `TransactionRow`, which is only the short-lived duplicate-transaction set.
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout)]
+struct DeferredTransactionRow {
+    id: ObjectId<DeferredTransactionRow>,
+    sender: u64,
+    sender_id_lo: u64,
+    sender_id_hi: u64,
+    payer: u64,
+    trx_id: [u8; 32],
+    delay_until: i64,
+    expiration: i64,
+    published: i64,
+    packed_trx: BlobRef,
+}
+
+struct DeferredByTrxId;
+impl IndexedBy<DeferredTransactionRow> for DeferredByTrxId {
+    type Key = [u8; 32];
+    fn key(o: &DeferredTransactionRow) -> Self::Key {
+        o.trx_id
+    }
+}
+
+struct DeferredBySenderId;
+impl IndexedBy<DeferredTransactionRow> for DeferredBySenderId {
+    type Key = (u64, u64, u64);
+    fn key(o: &DeferredTransactionRow) -> Self::Key {
+        (o.sender, o.sender_id_hi, o.sender_id_lo)
+    }
+}
+
+struct DeferredByDelay;
+impl IndexedBy<DeferredTransactionRow> for DeferredByDelay {
+    type Key = (i64, i64);
+    fn key(o: &DeferredTransactionRow) -> Self::Key {
+        (o.delay_until, o.id.raw())
+    }
+}
+
+impl ArenaObject for DeferredTransactionRow {
+    const TYPE_ID: u16 = 21;
+    fn id(&self) -> ObjectId<Self> {
+        self.id
+    }
+    fn set_id(&mut self, id: ObjectId<Self>) {
+        self.id = id;
+    }
+    fn secondary_indices() -> Vec<Box<dyn SecondaryIndex<Self>>> {
+        vec![
+            key_index::<Self, DeferredByTrxId>(),
+            key_index::<Self, DeferredBySenderId>(),
+            key_index::<Self, DeferredByDelay>(),
+        ]
+    }
+}
+
+/// A materialized deferred transaction, returned only at explicit database
+/// boundaries. Arena rows carry a blob reference instead of retaining the
+/// packed transaction in their fixed-width representation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeferredTransaction {
+    pub sender: u64,
+    pub sender_id: u128,
+    pub payer: u64,
+    pub trx_id: [u8; 32],
+    pub delay_until: i64,
+    pub expiration: i64,
+    pub published: i64,
+    pub packed_trx: Vec<u8>,
+}
+
+/// Raw objects currently billed to one account. This is an offline diagnostic
+/// view: the database facade applies Leap's billable-size constants to these
+/// counts and lengths so a stored `resource_usage.ram_usage` can be reconciled
+/// against the live Arena contents without changing consensus state.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AccountRamInventory {
+    pub account_exists: bool,
+    pub abi_bytes: usize,
+    pub code_bytes: usize,
+    pub permission_auth_blobs: Vec<Vec<u8>>,
+    pub permission_links: usize,
+    pub contract_tables: usize,
+    pub contract_kv_rows: usize,
+    pub contract_kv_value_bytes: usize,
+    pub contract_idx64_rows: usize,
+    pub contract_idx128_rows: usize,
+    pub contract_idx256_rows: usize,
+    pub contract_idx_double_rows: usize,
+    pub contract_idx_long_double_rows: usize,
+    pub deferred_packed_bytes: Vec<usize>,
 }
 
 struct TxByTrxId;
@@ -1198,7 +1386,18 @@ fn contract_table_decr(db: &mut Db, t_id: i64) -> Result<(), DbError> {
 /// A cheaply cloned, `Send + Sync` handle to the chain database.
 #[derive(Clone)]
 pub struct ChainDatabase {
-    inner: Arc<Mutex<Db>>,
+    inner: Arc<RwLock<Db>>,
+}
+
+/// One replay-coalesced primary-row rewrite. Values are owned because the
+/// caller accumulates them outside the Arena lock until the block boundary.
+pub struct ContractRowUpdate {
+    pub code: u64,
+    pub scope: u64,
+    pub table: u64,
+    pub primary_key: u64,
+    pub payer: u64,
+    pub value: Vec<u8>,
 }
 
 /// Builds an empty `Db` with every chain table registered. Shared by
@@ -1214,8 +1413,12 @@ fn build_registered_db() -> Result<Db, DbError> {
     db.add_table::<DynGlobalPropertyRow>()?;
     db.add_table::<PermSeqRow>()?;
     db.add_table::<GlobalPropertyRow>()?;
+    db.add_table::<ProposedScheduleRow>()?;
+    db.add_table::<ProtocolFeatureRow>()?;
+    db.add_table::<PreactivatedProtocolFeatureRow>()?;
     db.add_table::<ResourceConfigRow>()?;
     db.add_table::<TransactionRow>()?;
+    db.add_table::<DeferredTransactionRow>()?;
     db.add_table::<ContractTableRow>()?;
     db.add_table::<ContractKeyValueRow>()?;
     db.add_table::<ContractIndex64Row>()?;
@@ -1261,12 +1464,16 @@ impl ChainDatabase {
     pub fn new() -> Result<Self, DbError> {
         let db = build_registered_db()?;
         Ok(ChainDatabase {
-            inner: Arc::new(Mutex::new(db)),
+            inner: Arc::new(RwLock::new(db)),
         })
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Db> {
-        self.inner.lock().expect("chain database mutex poisoned")
+    fn lock(&self) -> std::sync::RwLockWriteGuard<'_, Db> {
+        self.inner.write().expect("chain database lock poisoned")
+    }
+
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, Db> {
+        self.inner.read().expect("chain database lock poisoned")
     }
 
     /// Serialize the block's SHiP chain-state `table_delta` stream over the
@@ -1277,7 +1484,7 @@ impl ChainDatabase {
     /// resolvable. `chain_id` supplies the one `global_property` field the arena
     /// does not store.
     pub fn pack_deltas(&self, full_snapshot: bool, chain_id: &[u8; 32]) -> Vec<u8> {
-        let db = self.lock();
+        let db = self.read();
         history::pack_deltas(&db, full_snapshot, chain_id)
     }
 
@@ -1289,7 +1496,7 @@ impl ChainDatabase {
     /// to). Drives the controller's genesis-vs-resume decision now that the arena
     /// is the sole backend.
     pub fn revision(&self) -> i64 {
-        self.lock().revision()
+        self.read().revision()
     }
 
     // Lifecycle, driven from the controller in lockstep with the chainbase
@@ -1308,7 +1515,7 @@ impl ChainDatabase {
     }
 
     pub fn state_root(&self) -> [u8; 32] {
-        self.lock().state_root()
+        self.read().state_root()
     }
 
     // ----- ported mutations -------------------------------------------------
@@ -1321,10 +1528,84 @@ impl ChainDatabase {
         Ok(())
     }
 
+    /// Insert the complete subset of `account_metadata_object` that XPR's
+    /// state-history serializer exposes. Sequence fields are intentionally left
+    /// at zero: SHiP does not serialize them, so inventing values would be less
+    /// correct than preserving the observable fields exactly.
+    pub fn xpr_import_account_metadata(
+        &self,
+        name: u64,
+        privileged: bool,
+        last_code_update: i64,
+        code_hash: [u8; 32],
+        vm_type: u8,
+        vm_version: u8,
+    ) -> Result<(), DbError> {
+        self.lock().create::<AccountMetaRow>(|row| {
+            row.name = name;
+            row.flags = privileged as u32;
+            row.last_code_update = last_code_update;
+            row.code_hash = code_hash;
+            row.vm_type = vm_type;
+            row.vm_version = vm_version;
+        })?;
+        Ok(())
+    }
+
+    /// Replace the source-visible account metadata fields when a SHiP delta
+    /// modifies an existing account_metadata row.
+    pub fn xpr_import_update_account_metadata_source(
+        &self,
+        name: u64,
+        privileged: bool,
+        last_code_update: i64,
+        code_hash: [u8; 32],
+        vm_type: u8,
+        vm_version: u8,
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let id = db
+            .find_by_hash::<AccountMetaRow, AccountMetaRowByName>(&name)?
+            .map(|row| row.id())
+            .ok_or_else(|| DbError::Corrupted("account_metadata delta row is missing".into()))?;
+        db.modify::<AccountMetaRow>(id, |row| {
+            row.flags = privileged as u32;
+            row.last_code_update = last_code_update;
+            row.code_hash = code_hash;
+            row.vm_type = vm_type;
+            row.vm_version = vm_version;
+        })?;
+        Ok(())
+    }
+
+    /// Restores account-metadata sequence counters from the source chainbase
+    /// sidecar. SHiP omits these counters from its row projection.
+    pub fn xpr_import_update_account_metadata(
+        &self,
+        name: u64,
+        recv_sequence: u64,
+        auth_sequence: u64,
+        code_sequence: u64,
+        abi_sequence: u64,
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let id = db
+            .find_by_hash::<AccountMetaRow, AccountMetaRowByName>(&name)?
+            .map(|row| row.id())
+            .ok_or_else(|| DbError::Corrupted("account_metadata sidecar row is missing".into()))?;
+        db.modify::<AccountMetaRow>(id, |row| {
+            row.recv_sequence = recv_sequence;
+            row.auth_sequence = auth_sequence;
+            row.code_sequence = code_sequence;
+            row.abi_sequence = abi_sequence;
+        })?;
+        Ok(())
+    }
+
     /// Whether the database holds an account_metadata row for `name`, and its
     /// privileged flag — for diffing against chainbase.
     pub fn account_metadata_privileged(&self, name: u64) -> Option<bool> {
-        self.lock()
+        self.read()
             .find_by_hash::<AccountMetaRow, AccountMetaRowByName>(&name)
             .ok()
             .flatten()
@@ -1339,7 +1620,7 @@ impl ChainDatabase {
         &self,
         name: u64,
     ) -> Option<(bool, u64, u64, u64, u64, [u8; 32], u8, u8)> {
-        self.lock()
+        self.read()
             .find_by_hash::<AccountMetaRow, AccountMetaRowByName>(&name)
             .ok()
             .flatten()
@@ -1363,7 +1644,7 @@ impl ChainDatabase {
     /// same root when the tables hold the same logical state — a true
     /// cross-implementation state-root check over the full account set.
     pub fn account_metadata_state_bytes(&self) -> Vec<u8> {
-        let db = self.lock();
+        let db = self.read();
         #[allow(clippy::type_complexity)]
         let mut rows: Vec<(u64, bool, u64, u64, u64, u64, [u8; 32], u8, u8)> =
             match db.table::<AccountMetaRow>() {
@@ -1445,7 +1726,7 @@ impl ChainDatabase {
     /// Whether the database holds an account_object row for `name` — for diffing
     /// against chainbase's `find_account`.
     pub fn account_exists(&self, name: u64) -> bool {
-        self.lock()
+        self.read()
             .find_by::<AccountRow, AccountRowByName>(&name)
             .ok()
             .flatten()
@@ -1456,7 +1737,7 @@ impl ChainDatabase {
     /// for serving `AccountObject::get_creation_date` from the arena. `None` if
     /// the account is absent.
     pub fn account_creation_date(&self, name: u64) -> Option<u32> {
-        self.lock()
+        self.read()
             .find_by::<AccountRow, AccountRowByName>(&name)
             .ok()
             .flatten()
@@ -1467,7 +1748,7 @@ impl ChainDatabase {
     /// `AccountObject::get_abi().size()` from the arena (setabi bills RAM on it).
     /// `None` if the account is absent.
     pub fn account_abi_size(&self, name: u64) -> Option<usize> {
-        let db = self.lock();
+        let db = self.read();
         let abi_ref = db
             .find_by::<AccountRow, AccountRowByName>(&name)
             .ok()
@@ -1480,7 +1761,7 @@ impl ChainDatabase {
     /// formatters decode contract rows against. `None` if the account is absent
     /// (an account with no ABI yields an empty vec).
     pub fn account_abi_bytes(&self, name: u64) -> Option<Vec<u8>> {
-        let db = self.lock();
+        let db = self.read();
         let abi_ref = db
             .find_by::<AccountRow, AccountRowByName>(&name)
             .ok()
@@ -1493,10 +1774,101 @@ impl ChainDatabase {
         )
     }
 
+    /// Enumerate every live object category whose RAM is billed to `account`.
+    /// Intended for checkpoint audits; this performs full scans of contract
+    /// payer columns and should not be called from block execution.
+    pub fn account_ram_inventory(&self, account: u64) -> Result<AccountRamInventory, DbError> {
+        let db = self.read();
+        let mut inventory = AccountRamInventory::default();
+
+        if let Some(row) = db.find_by::<AccountRow, AccountRowByName>(&account)? {
+            inventory.account_exists = true;
+            inventory.abi_bytes = db.blob::<AccountRow>(row.abi)?.len();
+        }
+
+        if let Some(metadata) = db.find_by_hash::<AccountMetaRow, AccountMetaRowByName>(&account)?
+            && metadata.code_hash != [0; 32]
+        {
+            let code = db
+                .find_by::<CodeRow, CodeByHash>(&(
+                    metadata.code_hash,
+                    metadata.vm_type,
+                    metadata.vm_version,
+                ))?
+                .ok_or_else(|| {
+                    DbError::Corrupted(format!(
+                        "account {account} references a missing code object"
+                    ))
+                })?;
+            inventory.code_bytes = db.blob::<CodeRow>(code.code)?.len();
+        }
+
+        inventory.permission_auth_blobs = db
+            .table::<PermissionRow>()?
+            .iter()
+            .filter(|row| row.owner == account)
+            .map(|row| db.blob::<PermissionRow>(row.auth).map(<[u8]>::to_vec))
+            .collect::<Result<Vec<_>, _>>()?;
+        inventory.permission_links = db
+            .table::<PermissionLinkRow>()?
+            .iter()
+            .filter(|row| row.account == account)
+            .count();
+        inventory.contract_tables = db
+            .table::<ContractTableRow>()?
+            .iter()
+            .filter(|row| row.payer == account)
+            .count();
+        for row in db
+            .table::<ContractKeyValueRow>()?
+            .iter()
+            .filter(|row| row.payer == account)
+        {
+            inventory.contract_kv_rows += 1;
+            inventory.contract_kv_value_bytes += db.blob::<ContractKeyValueRow>(row.value)?.len();
+        }
+        inventory.contract_idx64_rows = db
+            .table::<ContractIndex64Row>()?
+            .iter()
+            .filter(|row| row.payer == account)
+            .count();
+        inventory.contract_idx128_rows = db
+            .table::<ContractIndex128Row>()?
+            .iter()
+            .filter(|row| row.payer == account)
+            .count();
+        inventory.contract_idx256_rows = db
+            .table::<ContractIndex256Row>()?
+            .iter()
+            .filter(|row| row.payer == account)
+            .count();
+        inventory.contract_idx_double_rows = db
+            .table::<ContractIndexDoubleRow>()?
+            .iter()
+            .filter(|row| row.payer == account)
+            .count();
+        inventory.contract_idx_long_double_rows = db
+            .table::<ContractIndexLongDoubleRow>()?
+            .iter()
+            .filter(|row| row.payer == account)
+            .count();
+        inventory.deferred_packed_bytes = db
+            .table::<DeferredTransactionRow>()?
+            .iter()
+            .filter(|row| row.payer == account)
+            .map(|row| {
+                db.blob::<DeferredTransactionRow>(row.packed_trx)
+                    .map(<[u8]>::len)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(inventory)
+    }
+
     /// The account's `last_code_update` (fc microseconds), for the RPC account
     /// formatter. `None` if the account_metadata row is absent.
     pub fn account_last_code_update(&self, name: u64) -> Option<i64> {
-        self.lock()
+        self.read()
             .find_by_hash::<AccountMetaRow, AccountMetaRowByName>(&name)
             .ok()
             .flatten()
@@ -1553,6 +1925,110 @@ impl ChainDatabase {
         Ok(bumped)
     }
 
+    /// Advance every counter used to construct one action receipt under a
+    /// single database lock. The ordinary helpers acquire the same lock once
+    /// for the global sequence, once for the receiver, and twice per authority
+    /// (increment then read); dense replay spends more time routing those tiny
+    /// mutations than changing the rows themselves.
+    pub fn next_action_sequences(
+        &self,
+        receiver: u64,
+        auth_actors: &[u64],
+    ) -> Result<Option<(u64, u64, Vec<u64>)>, DbError> {
+        let mut db = self.lock();
+
+        let global = db
+            .table::<DynGlobalPropertyRow>()?
+            .iter()
+            .next()
+            .map(|row| (row.id(), row.global_action_sequence));
+        let next_global = global.map_or(Ok(1), |(_, value)| {
+            value
+                .checked_add(1)
+                .ok_or_else(|| DbError::Corrupted("global action sequence overflow".into()))
+        })?;
+        match global {
+            Some((id, _)) => db.modify::<DynGlobalPropertyRow>(id, |row| {
+                row.global_action_sequence = next_global;
+            })?,
+            None => {
+                db.create::<DynGlobalPropertyRow>(|row| {
+                    row.global_action_sequence = next_global;
+                })?;
+            }
+        }
+
+        let Some((receiver_id, next_recv)) = db
+            .find_by_hash::<AccountMetaRow, AccountMetaRowByName>(&receiver)?
+            .map(|row| (row.id(), row.recv_sequence.wrapping_add(1)))
+        else {
+            return Ok(None);
+        };
+        db.modify::<AccountMetaRow>(receiver_id, |row| {
+            row.recv_sequence = next_recv;
+        })?;
+
+        let mut auth_sequences = Vec::with_capacity(auth_actors.len());
+        for actor in auth_actors {
+            let Some((id, next_auth)) = db
+                .find_by_hash::<AccountMetaRow, AccountMetaRowByName>(actor)?
+                .map(|row| (row.id(), row.auth_sequence.wrapping_add(1)))
+            else {
+                return Ok(None);
+            };
+            db.modify::<AccountMetaRow>(id, |row| {
+                row.auth_sequence = next_auth;
+            })?;
+            auth_sequences.push(next_auth);
+        }
+
+        Ok(Some((next_global, next_recv, auth_sequences)))
+    }
+
+    /// Materialize replay-coalesced action-receipt counters under one Arena
+    /// lock while preserving every unrelated account-metadata field.
+    pub fn set_action_sequences(
+        &self,
+        global_sequence: u64,
+        accounts: &[(u64, u64, u64)],
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let global_id = db
+            .table::<DynGlobalPropertyRow>()?
+            .iter()
+            .next()
+            .map(|row| row.id());
+        let mut resolved = Vec::with_capacity(accounts.len());
+        for &(name, recv_sequence, auth_sequence) in accounts {
+            let id = db
+                .find_by_hash::<AccountMetaRow, AccountMetaRowByName>(&name)?
+                .map(|row| row.id())
+                .ok_or_else(|| {
+                    DbError::Corrupted(format!(
+                        "account metadata missing while flushing receipt sequences for {name}"
+                    ))
+                })?;
+            resolved.push((id, recv_sequence, auth_sequence));
+        }
+        match global_id {
+            Some(id) => db.modify::<DynGlobalPropertyRow>(id, |row| {
+                row.global_action_sequence = global_sequence;
+            })?,
+            None => {
+                db.create::<DynGlobalPropertyRow>(|row| {
+                    row.global_action_sequence = global_sequence;
+                })?;
+            }
+        }
+        for (id, recv_sequence, auth_sequence) in resolved {
+            db.modify::<AccountMetaRow>(id, |row| {
+                row.recv_sequence = recv_sequence;
+                row.auth_sequence = auth_sequence;
+            })?;
+        }
+        Ok(())
+    }
+
     /// Mirrors `update_account_abi`: bumps the account_metadata abi_sequence and
     /// reassigns the account_object abi blob. Both rows are located by the name
     /// recovered from the metadata object's get_name accessor.
@@ -1605,7 +2081,7 @@ impl ChainDatabase {
     /// matching the chainbase `account_state_bytes` enumerator: per row name u64
     /// LE, creation_date slot u32 LE, then a u32 LE length-prefixed abi blob.
     pub fn account_state_bytes(&self) -> Vec<u8> {
-        let db = self.lock();
+        let db = self.read();
         let mut refs: Vec<(u64, u32, BlobRef)> = match db.table::<AccountRow>() {
             Ok(t) => t.iter().map(|r| (r.name, r.creation_date, r.abi)).collect(),
             Err(_) => return Vec::new(),
@@ -1654,6 +2130,24 @@ impl ChainDatabase {
     }
 
     // ----- permission_object / permission_usage_object ----------------------
+
+    /// Reserve chainbase permission id 0. Leap creates this default object
+    /// without a permission-usage row before authoring the native accounts;
+    /// the first real permission then creates usage id 0, which the reserved
+    /// object intentionally aliases.
+    pub fn reserve_permission_zero(&self) -> Result<(), DbError> {
+        let mut db = self.lock();
+        if db
+            .find_by_hash::<PermissionRow, PermByOwnerHash>(&(0, 0))?
+            .is_none()
+        {
+            db.create::<PermissionRow>(|permission| {
+                permission.cb_id = 0;
+                permission.usage_id = 0;
+            })?;
+        }
+        Ok(())
+    }
 
     /// Mirrors `create_permission`, which also creates the linked
     /// `permission_usage_object`. The usage row is created first so its id can be
@@ -1707,7 +2201,7 @@ impl ChainDatabase {
     ) -> Result<(), DbError> {
         let mut db = self.lock();
         let id = db
-            .find_by::<PermissionRow, PermByOwner>(&(owner, perm_name))?
+            .find_by_hash::<PermissionRow, PermByOwnerHash>(&(owner, perm_name))?
             .map(|p| p.id());
         let Some(id) = id else { return Ok(()) };
         let auth_blob = db.alloc_blob::<PermissionRow>(auth)?;
@@ -1718,13 +2212,51 @@ impl ChainDatabase {
         Ok(())
     }
 
+    /// Replace only a permission's authority, preserving `last_updated`.
+    ///
+    /// Leap uses this narrower mutation when it maintains the three producer
+    /// permissions at block start. It is intentionally different from the
+    /// `updateauth` path above, which records the pending block time. An
+    /// unchanged authority is a no-op, matching chainbase's conditional write.
+    pub fn modify_permission_authority(
+        &self,
+        owner: u64,
+        perm_name: u64,
+        auth: &[u8],
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let found = db
+            .find_by_hash::<PermissionRow, PermByOwnerHash>(&(owner, perm_name))?
+            .map(|permission| (permission.id(), permission.auth));
+        let (id, old_auth) = found.ok_or_else(|| {
+            DbError::Corrupted(format!(
+                "producer permission {owner}:{perm_name} is missing"
+            ))
+        })?;
+        if db.blob::<PermissionRow>(old_auth)? == auth {
+            return Ok(());
+        }
+        let auth_blob = db.alloc_blob::<PermissionRow>(auth)?;
+        db.modify::<PermissionRow>(id, |permission| permission.auth = auth_blob)?;
+        Ok(())
+    }
+
+    /// Consensus timestamp recorded on the permission row.
+    pub fn permission_last_updated(&self, owner: u64, perm_name: u64) -> Option<i64> {
+        let db = self.read();
+        db.find_by_hash::<PermissionRow, PermByOwnerHash>(&(owner, perm_name))
+            .ok()
+            .flatten()
+            .map(|permission| permission.last_updated)
+    }
+
     /// Permission snapshot for diffing: `(parent id, authority threshold)`. The
     /// threshold is the first field of the encoded `shared_authority` blob, so it
     /// is read straight off the blob without decoding the whole authority.
     pub fn permission(&self, owner: u64, perm_name: u64) -> Option<(i64, u32)> {
-        let db = self.lock();
+        let db = self.read();
         let (parent, auth) = db
-            .find_by::<PermissionRow, PermByOwner>(&(owner, perm_name))
+            .find_by_hash::<PermissionRow, PermByOwnerHash>(&(owner, perm_name))
             .ok()
             .flatten()
             .map(|p| (p.parent, p.auth))?;
@@ -1739,7 +2271,7 @@ impl ChainDatabase {
     /// permission); the auth blob is decoded by the caller.
     pub fn permissions_of(&self, owner: u64) -> Vec<(u64, u64, Vec<u8>)> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let raw: Vec<(u64, i64, BlobRef)> = match db.table::<PermissionRow>() {
             Ok(tbl) => tbl
                 .get_index::<PermByOwner>()
@@ -1774,8 +2306,8 @@ impl ChainDatabase {
     /// The chainbase id a permission matches (`cb_id`), for serving `get_id` from
     /// the arena. `None` if the permission is absent.
     pub fn permission_cb_id(&self, owner: u64, perm_name: u64) -> Option<i64> {
-        let db = self.lock();
-        db.find_by::<PermissionRow, PermByOwner>(&(owner, perm_name))
+        let db = self.read();
+        db.find_by_hash::<PermissionRow, PermByOwnerHash>(&(owner, perm_name))
             .ok()
             .flatten()
             .map(|p| p.cb_id)
@@ -1786,9 +2318,9 @@ impl ChainDatabase {
     /// `permission_state_bytes` does — for serving `get_permission_last_used`
     /// from the arena. `None` if the permission is absent.
     pub fn permission_last_used(&self, owner: u64, perm_name: u64) -> Option<i64> {
-        let db = self.lock();
+        let db = self.read();
         let usage_id = db
-            .find_by::<PermissionRow, PermByOwner>(&(owner, perm_name))
+            .find_by_hash::<PermissionRow, PermByOwnerHash>(&(owner, perm_name))
             .ok()
             .flatten()
             .map(|p| p.usage_id)?;
@@ -1802,9 +2334,9 @@ impl ChainDatabase {
     /// the database facade stored via `encode_authority`), for serving the whole
     /// authority — not just the threshold — from the arena. `None` if absent.
     pub fn permission_auth_blob(&self, owner: u64, perm_name: u64) -> Option<Vec<u8>> {
-        let db = self.lock();
+        let db = self.read();
         let auth = db
-            .find_by::<PermissionRow, PermByOwner>(&(owner, perm_name))
+            .find_by_hash::<PermissionRow, PermByOwnerHash>(&(owner, perm_name))
             .ok()
             .flatten()
             .map(|p| p.auth)?;
@@ -1823,14 +2355,14 @@ impl ChainDatabase {
         owner_b: u64,
         name_b: u64,
     ) -> Option<bool> {
-        let db = self.lock();
+        let db = self.read();
         let (a_owner, a_id) = db
-            .find_by::<PermissionRow, PermByOwner>(&(owner_a, name_a))
+            .find_by_hash::<PermissionRow, PermByOwnerHash>(&(owner_a, name_a))
             .ok()
             .flatten()
             .map(|p| (p.owner, p.cb_id))?;
         let (b_owner, b_id, b_parent) = db
-            .find_by::<PermissionRow, PermByOwner>(&(owner_b, name_b))
+            .find_by_hash::<PermissionRow, PermByOwnerHash>(&(owner_b, name_b))
             .ok()
             .flatten()
             .map(|p| (p.owner, p.cb_id, p.parent))?;
@@ -1873,7 +2405,7 @@ impl ChainDatabase {
     /// directly and, on hydration, give the arena the chainbase id space its
     /// permission-tree walk needs.
     pub fn permission_state_bytes(&self) -> Vec<u8> {
-        let db = self.lock();
+        let db = self.read();
         let mut refs: Vec<(u64, u64, i64, i64, i64, BlobRef)> = match db.table::<PermissionRow>() {
             Ok(t) => t
                 .iter()
@@ -1930,9 +2462,16 @@ impl ChainDatabase {
             let auth = &bytes[pos..pos + auth_len];
             pos += auth_len;
             if db
-                .find_by::<PermissionRow, PermByOwner>(&(owner, perm_name))?
+                .find_by_hash::<PermissionRow, PermByOwnerHash>(&(owner, perm_name))?
                 .is_some()
             {
+                continue;
+            }
+            if cb_id == 0 && owner == 0 && perm_name == 0 {
+                db.create::<PermissionRow>(|permission| {
+                    permission.cb_id = 0;
+                    permission.usage_id = 0;
+                })?;
                 continue;
             }
             let usage_id = db
@@ -1968,7 +2507,7 @@ impl ChainDatabase {
     /// Canonical serialization of permission_link in (account, code,
     /// message_type) order. No genesis rows (links come only from linkauth).
     pub fn permission_link_state_bytes(&self) -> Vec<u8> {
-        let db = self.lock();
+        let db = self.read();
         let mut rows: Vec<(u64, u64, u64, u64)> = match db.table::<PermissionLinkRow>() {
             Ok(t) => t
                 .iter()
@@ -1991,7 +2530,7 @@ impl ChainDatabase {
     /// order: hash 32B, vm_type, vm_version, ref_count u64 LE, first_block u32 LE,
     /// then a u32 LE length-prefixed code blob. No genesis rows (setcode only).
     pub fn code_state_bytes(&self) -> Vec<u8> {
-        let db = self.lock();
+        let db = self.read();
         let mut refs: Vec<([u8; 32], u8, u8, u64, u32, BlobRef)> = match db.table::<CodeRow>() {
             Ok(t) => t
                 .iter()
@@ -2026,7 +2565,7 @@ impl ChainDatabase {
     /// Canonical serialization of the transaction dedupe set in trx_id order:
     /// trx_id 32B, expiration u32 LE (seconds). No genesis rows.
     pub fn transaction_state_bytes(&self) -> Vec<u8> {
-        let db = self.lock();
+        let db = self.read();
         let mut rows: Vec<([u8; 32], u32)> = match db.table::<TransactionRow>() {
             Ok(t) => t.iter().map(|t| (t.trx_id, t.expiration)).collect(),
             Err(_) => return Vec::new(),
@@ -2043,7 +2582,7 @@ impl ChainDatabase {
     /// Canonical serialization of resource_usage in owner order: owner u64 LE,
     /// ram_usage u64 LE, then the net and cpu accumulators.
     pub fn resource_usage_state_bytes(&self) -> Vec<u8> {
-        let db = self.lock();
+        let db = self.read();
         let mut rows: Vec<(u64, u64, UsageAccumulator, UsageAccumulator)> =
             match db.table::<ResourceUsageRow>() {
                 Ok(t) => t
@@ -2068,36 +2607,40 @@ impl ChainDatabase {
         out
     }
 
-    /// Seeds resource_usage rows from the canonical layout — genesis native
-    /// accounts get their rows (and billed ram) inside C++. A present owner is
-    /// left untouched.
+    /// Seeds or replaces resource_usage rows from the canonical layout. The
+    /// replacement behavior is also used when applying SHiP delta rows.
     pub fn hydrate_resource_usage(&self, bytes: &[u8]) -> Result<(), DbError> {
         const ROW: usize = 8 + 8 + 20 + 20; // owner, ram, net acc, cpu acc
         let mut db = self.lock();
         for c in bytes.as_chunks::<ROW>().0 {
             let owner = u64::from_le_bytes(c[0..8].try_into().unwrap());
-            if db
-                .find_by::<ResourceUsageRow, ResourceUsageRowByOwner>(&owner)?
-                .is_some()
-            {
-                continue;
-            }
             let ram = u64::from_le_bytes(c[8..16].try_into().unwrap());
             let net = read_acc(&c[16..36]);
             let cpu = read_acc(&c[36..56]);
-            db.create::<ResourceUsageRow>(|r| {
-                r.owner = owner;
-                r.ram_usage = ram;
-                r.net_usage = net;
-                r.cpu_usage = cpu;
-            })?;
+            if let Some(id) = db
+                .find_by_hash::<ResourceUsageRow, ResourceUsageRowByOwner>(&owner)?
+                .map(|row| row.id())
+            {
+                db.modify::<ResourceUsageRow>(id, |r| {
+                    r.ram_usage = ram;
+                    r.net_usage = net;
+                    r.cpu_usage = cpu;
+                })?;
+            } else {
+                db.create::<ResourceUsageRow>(|r| {
+                    r.owner = owner;
+                    r.ram_usage = ram;
+                    r.net_usage = net;
+                    r.cpu_usage = cpu;
+                })?;
+            }
         }
         Ok(())
     }
 
     /// Canonical serialization of resource_limits in (pending, owner) order.
     pub fn account_limits_state_bytes(&self) -> Vec<u8> {
-        let db = self.lock();
+        let db = self.read();
         let mut rows: Vec<(u8, u64, i64, i64, i64)> = match db.table::<ResourceLimitsRow>() {
             Ok(t) => t
                 .iter()
@@ -2117,30 +2660,34 @@ impl ChainDatabase {
         out
     }
 
-    /// Seeds resource_limits rows from the canonical layout (genesis native
-    /// accounts). A present `(pending, owner)` is left untouched.
+    /// Seeds or replaces resource_limits rows from the canonical layout.
     pub fn hydrate_account_limits(&self, bytes: &[u8]) -> Result<(), DbError> {
         const ROW: usize = 1 + 8 + 8 + 8 + 8;
         let mut db = self.lock();
         for c in bytes.as_chunks::<ROW>().0 {
             let pending = c[0];
             let owner = u64::from_le_bytes(c[1..9].try_into().unwrap());
-            if db
-                .find_by::<ResourceLimitsRow, LimitsByOwner>(&(pending, owner))?
-                .is_some()
-            {
-                continue;
-            }
             let ram = u64::from_le_bytes(c[9..17].try_into().unwrap()) as i64;
             let net = u64::from_le_bytes(c[17..25].try_into().unwrap()) as i64;
             let cpu = u64::from_le_bytes(c[25..33].try_into().unwrap()) as i64;
-            db.create::<ResourceLimitsRow>(|r| {
-                r.pending = pending;
-                r.owner = owner;
-                r.ram_bytes = ram;
-                r.net_weight = net;
-                r.cpu_weight = cpu;
-            })?;
+            if let Some(id) = db
+                .find_by_hash::<ResourceLimitsRow, LimitsByOwnerHash>(&(pending, owner))?
+                .map(|row| row.id())
+            {
+                db.modify::<ResourceLimitsRow>(id, |r| {
+                    r.ram_bytes = ram;
+                    r.net_weight = net;
+                    r.cpu_weight = cpu;
+                })?;
+            } else {
+                db.create::<ResourceLimitsRow>(|r| {
+                    r.pending = pending;
+                    r.owner = owner;
+                    r.ram_bytes = ram;
+                    r.net_weight = net;
+                    r.cpu_weight = cpu;
+                })?;
+            }
         }
         Ok(())
     }
@@ -2148,7 +2695,7 @@ impl ChainDatabase {
     /// Canonical serialization of the resource_limits_state singleton: the net
     /// and cpu block-usage accumulators, then pending/total/virtual scalars.
     pub fn resource_state_bytes(&self) -> Vec<u8> {
-        let db = self.lock();
+        let db = self.read();
         let s = match db.table::<ResourceStateRow>() {
             Ok(t) => match t.iter().next() {
                 Some(s) => *s,
@@ -2178,7 +2725,7 @@ impl ChainDatabase {
     /// (code, scope, table) order: code, scope, table, payer (u64 LE each),
     /// count (u32 LE). No genesis rows (contracts create tables at runtime).
     pub fn contract_table_state_bytes(&self) -> Vec<u8> {
-        let db = self.lock();
+        let db = self.read();
         let mut rows: Vec<(u64, u64, u64, u64, u32)> = match db.table::<ContractTableRow>() {
             Ok(t) => t
                 .iter()
@@ -2204,7 +2751,7 @@ impl ChainDatabase {
     /// table, primary_key, payer (u64 LE each), then a length-prefixed value.
     pub fn contract_kv_state_bytes(&self) -> Vec<u8> {
         use std::collections::HashMap;
-        let db = self.lock();
+        let db = self.read();
         let table_key: HashMap<i64, (u64, u64, u64)> = match db.table::<ContractTableRow>() {
             Ok(t) => t
                 .iter()
@@ -2244,7 +2791,7 @@ impl ChainDatabase {
     pub fn remove_permission(&self, owner: u64, perm_name: u64) -> Result<(), DbError> {
         let mut db = self.lock();
         let found = db
-            .find_by::<PermissionRow, PermByOwner>(&(owner, perm_name))?
+            .find_by_hash::<PermissionRow, PermByOwnerHash>(&(owner, perm_name))?
             .map(|p| (p.id(), p.usage_id));
         let Some((id, usage_id)) = found else {
             return Ok(());
@@ -2262,12 +2809,39 @@ impl ChainDatabase {
     ) -> Result<(), DbError> {
         let mut db = self.lock();
         let usage_id = db
-            .find_by::<PermissionRow, PermByOwner>(&(owner, perm_name))?
+            .find_by_hash::<PermissionRow, PermByOwnerHash>(&(owner, perm_name))?
             .map(|p| p.usage_id);
         let Some(usage_id) = usage_id else {
             return Ok(());
         };
         db.modify::<PermissionUsageRow>(ObjectId::new(usage_id), |p| p.last_used = last_used_us)?;
+        Ok(())
+    }
+
+    /// Restores `permission_usage_object::last_used` from the source-chain
+    /// sidecar. SHiP exposes the permission's update time but not this usage
+    /// singleton's timestamp.
+    pub fn xpr_import_permission_last_used(
+        &self,
+        owner: u64,
+        perm_name: u64,
+        last_used_us: i64,
+    ) -> Result<(), DbError> {
+        // The reserved permission has no permission_usage_object of its own.
+        // Its default usage id happens to alias the first real usage row, so
+        // applying the exporter sidecar value here would make import results
+        // depend on sidecar row ordering.
+        if owner == 0 && perm_name == 0 {
+            return Ok(());
+        }
+        let mut db = self.lock();
+        let usage_id = db
+            .find_by_hash::<PermissionRow, PermByOwnerHash>(&(owner, perm_name))?
+            .map(|row| row.usage_id)
+            .ok_or_else(|| DbError::Corrupted("permission sidecar row is missing".into()))?;
+        db.modify::<PermissionUsageRow>(ObjectId::new(usage_id), |row| {
+            row.last_used = last_used_us;
+        })?;
         Ok(())
     }
 
@@ -2319,7 +2893,7 @@ impl ChainDatabase {
     /// `(account, code, message_type)`, or `None` when absent — for diffing
     /// against chainbase's `find_permission_link`.
     pub fn permission_link(&self, account: u64, code: u64, message_type: u64) -> Option<u64> {
-        self.lock()
+        self.read()
             .find_by::<PermissionLinkRow, LinkByActionName>(&(account, code, message_type))
             .ok()
             .flatten()
@@ -2355,7 +2929,7 @@ impl ChainDatabase {
 
     pub fn permission_links_of(&self, account: u64) -> Vec<(u64, u64, u64)> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         match db.table::<PermissionLinkRow>() {
             Ok(tbl) => tbl
                 .get_index::<LinkByPermissionName>()
@@ -2403,13 +2977,13 @@ impl ChainDatabase {
     ) -> Result<(), DbError> {
         let mut db = self.lock();
         let pending = db
-            .find_by::<ResourceLimitsRow, LimitsByOwner>(&(1u8, account))?
+            .find_by_hash::<ResourceLimitsRow, LimitsByOwnerHash>(&(1u8, account))?
             .map(|r| r.id());
         let id = match pending {
             Some(id) => id,
             None => {
                 let actual = db
-                    .find_by::<ResourceLimitsRow, LimitsByOwner>(&(0u8, account))?
+                    .find_by_hash::<ResourceLimitsRow, LimitsByOwnerHash>(&(0u8, account))?
                     .map(|r| (r.ram_bytes, r.net_weight, r.cpu_weight));
                 let Some((a_ram, a_net, a_cpu)) = actual else {
                     return Ok(());
@@ -2440,8 +3014,9 @@ impl ChainDatabase {
         let pendings: Vec<(ObjectId<ResourceLimitsRow>, u64, i64, i64, i64)> = {
             let table = db.table::<ResourceLimitsRow>()?;
             table
-                .iter()
-                .filter(|r| r.pending == 1)
+                .get_index::<LimitsByOwner>()
+                .range((1u8, 0)..=(1u8, u64::MAX))
+                .map(|(_, r)| r)
                 .map(|r| (r.id(), r.owner, r.ram_bytes, r.net_weight, r.cpu_weight))
                 .collect()
         };
@@ -2462,7 +3037,7 @@ impl ChainDatabase {
         };
         for (pending_id, owner, ram_bytes, net_weight, cpu_weight) in pendings {
             let actual = db
-                .find_by::<ResourceLimitsRow, LimitsByOwner>(&(0u8, owner))?
+                .find_by_hash::<ResourceLimitsRow, LimitsByOwnerHash>(&(0u8, owner))?
                 .map(|r| (r.id(), r.ram_bytes, r.net_weight, r.cpu_weight));
             if let Some((actual_id, old_ram, old_net, old_cpu)) = actual {
                 db.modify::<ResourceLimitsRow>(actual_id, |r| {
@@ -2487,15 +3062,15 @@ impl ChainDatabase {
     /// pending row if one is staged, else the committed row — matching
     /// chainbase's `get_account_limits`.
     pub fn account_limits(&self, account: u64) -> Option<(i64, i64, i64)> {
-        let db = self.lock();
+        let db = self.read();
         if let Some(r) = db
-            .find_by::<ResourceLimitsRow, LimitsByOwner>(&(1u8, account))
+            .find_by_hash::<ResourceLimitsRow, LimitsByOwnerHash>(&(1u8, account))
             .ok()
             .flatten()
         {
             return Some((r.ram_bytes, r.net_weight, r.cpu_weight));
         }
-        db.find_by::<ResourceLimitsRow, LimitsByOwner>(&(0u8, account))
+        db.find_by_hash::<ResourceLimitsRow, LimitsByOwnerHash>(&(0u8, account))
             .ok()
             .flatten()
             .map(|r| (r.ram_bytes, r.net_weight, r.cpu_weight))
@@ -2520,11 +3095,11 @@ impl ChainDatabase {
         current_slot: Option<u32>,
     ) -> Option<(AccountResourceLimit, bool)> {
         let (_ram, net_weight, _cpu) = self.account_limits(account)?;
-        let db = self.lock();
+        let db = self.read();
         let state = db.table::<ResourceStateRow>().ok()?.iter().next()?;
         let cfg = db.table::<ResourceConfigRow>().ok()?.iter().next()?;
         let usage = db
-            .find_by::<ResourceUsageRow, ResourceUsageRowByOwner>(&account)
+            .find_by_hash::<ResourceUsageRow, ResourceUsageRowByOwner>(&account)
             .ok()
             .flatten()?
             .net_usage;
@@ -2557,11 +3132,11 @@ impl ChainDatabase {
         current_slot: Option<u32>,
     ) -> Option<(AccountResourceLimit, bool)> {
         let (_ram, _net, cpu_weight) = self.account_limits(account)?;
-        let db = self.lock();
+        let db = self.read();
         let state = db.table::<ResourceStateRow>().ok()?.iter().next()?;
         let cfg = db.table::<ResourceConfigRow>().ok()?.iter().next()?;
         let usage = db
-            .find_by::<ResourceUsageRow, ResourceUsageRowByOwner>(&account)
+            .find_by_hash::<ResourceUsageRow, ResourceUsageRowByOwner>(&account)
             .ok()
             .flatten()?
             .cpu_usage;
@@ -2574,6 +3149,67 @@ impl ChainDatabase {
             usage,
             greylist_limit,
             current_slot,
+        ))
+    }
+
+    /// Gather every immutable input needed to validate and apply one account
+    /// usage update under a single Arena read lock. The tuple is
+    /// `(net_window, cpu_window, net_available, cpu_available,
+    /// block_cpu_available, block_net_available)`.
+    pub fn account_usage_context(
+        &self,
+        account: u64,
+        greylist_limit: u32,
+    ) -> Option<(u32, u32, i64, i64, u64, u64)> {
+        let db = self.read();
+        let limits = db.table::<ResourceLimitsRow>().ok()?;
+        let effective = limits
+            .get_index::<LimitsByOwner>()
+            .get(&(1u8, account))
+            .ok()
+            .or_else(|| {
+                limits
+                    .get_index::<LimitsByOwner>()
+                    .get(&(0u8, account))
+                    .ok()
+            })?;
+        let state = db.table::<ResourceStateRow>().ok()?.iter().next()?;
+        let cfg = db.table::<ResourceConfigRow>().ok()?.iter().next()?;
+        let usage = db
+            .find_by_hash::<ResourceUsageRow, ResourceUsageRowByOwner>(&account)
+            .ok()
+            .flatten()?;
+        let net = elastic_account_limit_info(
+            effective.net_weight,
+            state.total_net_weight,
+            state.virtual_net_limit,
+            cfg.account_net_usage_average_window,
+            cfg.net_max,
+            usage.net_usage,
+            greylist_limit,
+            None,
+        )
+        .0
+        .available;
+        let cpu = elastic_account_limit_info(
+            effective.cpu_weight,
+            state.total_cpu_weight,
+            state.virtual_cpu_limit,
+            cfg.account_cpu_usage_average_window,
+            cfg.cpu_max,
+            usage.cpu_usage,
+            greylist_limit,
+            None,
+        )
+        .0
+        .available;
+        Some((
+            cfg.account_net_usage_average_window,
+            cfg.account_cpu_usage_average_window,
+            net,
+            cpu,
+            cfg.cpu_max.saturating_sub(state.pending_cpu_usage),
+            cfg.net_max.saturating_sub(state.pending_net_usage),
         ))
     }
 
@@ -2592,6 +3228,57 @@ impl ChainDatabase {
             s.virtual_cpu_limit = cpu_max;
             s.virtual_net_limit = net_max;
         })?;
+        Ok(())
+    }
+
+    /// Replaces the singleton with a complete state-history hydration. Pending
+    /// per-block counters are not part of XPR's state-history row and therefore
+    /// begin at zero at the migration boundary. The source ordinal is retained
+    /// because imported checkpoints resume at their source block height.
+    #[allow(clippy::too_many_arguments)]
+    pub fn hydrate_resource_state(
+        &self,
+        net: (u64, u64, u32),
+        cpu: (u64, u64, u32),
+        total_net_weight: u64,
+        total_cpu_weight: u64,
+        total_ram_bytes: u64,
+        virtual_net_limit: u64,
+        virtual_cpu_limit: u64,
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let apply = |s: &mut ResourceStateRow| {
+            s.average_block_net_usage = UsageAccumulator {
+                value_ex: net.0,
+                consumed: net.1,
+                last_ordinal: net.2,
+                _pad: 0,
+            };
+            s.average_block_cpu_usage = UsageAccumulator {
+                value_ex: cpu.0,
+                consumed: cpu.1,
+                last_ordinal: cpu.2,
+                _pad: 0,
+            };
+            s.pending_net_usage = 0;
+            s.pending_cpu_usage = 0;
+            s.total_net_weight = total_net_weight;
+            s.total_cpu_weight = total_cpu_weight;
+            s.total_ram_bytes = total_ram_bytes;
+            s.virtual_net_limit = virtual_net_limit;
+            s.virtual_cpu_limit = virtual_cpu_limit;
+        };
+        let existing = db
+            .table::<ResourceStateRow>()?
+            .iter()
+            .next()
+            .map(|s| s.id());
+        match existing {
+            Some(id) => db.modify::<ResourceStateRow>(id, apply)?,
+            None => {
+                db.create::<ResourceStateRow>(apply)?;
+            }
+        }
         Ok(())
     }
 
@@ -2654,7 +3341,7 @@ impl ChainDatabase {
     /// Mirrored `(virtual_cpu_limit, virtual_net_limit)`, or `None` if the state
     /// row is absent — for diffing against chainbase.
     pub fn state_virtual_limits(&self) -> Option<(u64, u64)> {
-        self.lock()
+        self.read()
             .table::<ResourceStateRow>()
             .ok()?
             .iter()
@@ -2666,7 +3353,7 @@ impl ChainDatabase {
     /// or `None` if the row is absent — serves `get_total_cpu_weight` /
     /// `get_total_net_weight` from the Rust database.
     pub fn state_total_weights(&self) -> Option<(u64, u64)> {
-        self.lock()
+        self.read()
             .table::<ResourceStateRow>()
             .ok()?
             .iter()
@@ -2679,7 +3366,7 @@ impl ChainDatabase {
     /// `get_block_cpu_limit` / `get_block_net_limit`. `None` if either singleton
     /// is absent.
     pub fn block_limits(&self) -> Option<(u64, u64)> {
-        let db = self.lock();
+        let db = self.read();
         let cfg = db.table::<ResourceConfigRow>().ok()?.iter().next()?;
         let state = db.table::<ResourceStateRow>().ok()?.iter().next()?;
         Some((
@@ -2693,7 +3380,7 @@ impl ChainDatabase {
     /// driven directly from the arena. `None` if the
     /// config row is absent.
     pub fn resource_config_elastic(&self) -> Option<(ElasticParams, ElasticParams)> {
-        self.lock()
+        self.read()
             .table::<ResourceConfigRow>()
             .ok()?
             .iter()
@@ -2725,7 +3412,7 @@ impl ChainDatabase {
     /// `get_account_cpu_usage_average_window`. `None` if the config
     /// row is absent.
     pub fn usage_average_windows(&self) -> Option<(u32, u32)> {
-        self.lock()
+        self.read()
             .table::<ResourceConfigRow>()
             .ok()?
             .iter()
@@ -2747,7 +3434,7 @@ impl ChainDatabase {
         }
         let mut db = self.lock();
         let id = db
-            .find_by::<ResourceUsageRow, ResourceUsageRowByOwner>(&owner)?
+            .find_by_hash::<ResourceUsageRow, ResourceUsageRowByOwner>(&owner)?
             .map(|r| r.id());
         if let Some(id) = id {
             db.modify::<ResourceUsageRow>(id, |r| {
@@ -2760,11 +3447,35 @@ impl ChainDatabase {
     /// Mirrored RAM usage for `owner`, or `None` if absent — for diffing against
     /// chainbase's `get_account_ram_usage`.
     pub fn account_ram_usage(&self, owner: u64) -> Option<u64> {
-        self.lock()
-            .find_by::<ResourceUsageRow, ResourceUsageRowByOwner>(&owner)
+        self.read()
+            .find_by_hash::<ResourceUsageRow, ResourceUsageRowByOwner>(&owner)
             .ok()
             .flatten()
             .map(|r| r.ram_usage)
+    }
+
+    /// Compare-and-set repair for an independently audited offline replay
+    /// checkpoint. Runtime block execution must use `add_pending_ram_usage`;
+    /// this narrow primitive exists only to recover a checkpoint produced by a
+    /// superseded replay binary and refuses stale or unexpected input.
+    pub fn repair_account_ram_usage(
+        &self,
+        owner: u64,
+        expected: u64,
+        replacement: u64,
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let (id, actual) = db
+            .find_by_hash::<ResourceUsageRow, ResourceUsageRowByOwner>(&owner)?
+            .map(|row| (row.id(), row.ram_usage))
+            .ok_or_else(|| DbError::Corrupted(format!("resource usage missing for {owner}")))?;
+        if actual != expected {
+            return Err(DbError::Corrupted(format!(
+                "RAM repair expected {expected} bytes for {owner}, found {actual}"
+            )));
+        }
+        db.modify::<ResourceUsageRow>(id, |row| row.ram_usage = replacement)?;
+        Ok(())
     }
 
     /// Mirrors `add_transaction_usage`: advances the account's net/cpu usage
@@ -2781,7 +3492,7 @@ impl ChainDatabase {
     ) -> Result<(), DbError> {
         let mut db = self.lock();
         let id = db
-            .find_by::<ResourceUsageRow, ResourceUsageRowByOwner>(&owner)?
+            .find_by_hash::<ResourceUsageRow, ResourceUsageRowByOwner>(&owner)?
             .map(|r| r.id())
             .ok_or_else(|| {
                 DbError::Corrupted(format!("resource usage row is missing for account {owner}"))
@@ -2789,6 +3500,43 @@ impl ChainDatabase {
         db.modify::<ResourceUsageRow>(id, |r| {
             r.net_usage.add(net_usage, time_slot, net_window);
             r.cpu_usage.add(cpu_usage, time_slot, cpu_window);
+        })?;
+        Ok(())
+    }
+
+    /// Apply account and containing-block usage in one write critical section.
+    /// This is arithmetically identical to `add_transaction_usage` followed by
+    /// `add_block_usage`, but avoids releasing and reacquiring the Arena lock on
+    /// every accepted transaction.
+    pub fn add_transaction_and_block_usage(
+        &self,
+        owner: u64,
+        cpu_usage: u64,
+        net_usage: u64,
+        time_slot: u32,
+        net_window: u32,
+        cpu_window: u32,
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let usage_id = db
+            .find_by_hash::<ResourceUsageRow, ResourceUsageRowByOwner>(&owner)?
+            .map(|row| row.id())
+            .ok_or_else(|| {
+                DbError::Corrupted(format!("resource usage row is missing for account {owner}"))
+            })?;
+        let state_id = db
+            .table::<ResourceStateRow>()?
+            .iter()
+            .next()
+            .map(|state| state.id())
+            .ok_or_else(|| DbError::Corrupted("resource state row is missing".into()))?;
+        db.modify::<ResourceUsageRow>(usage_id, |row| {
+            row.net_usage.add(net_usage, time_slot, net_window);
+            row.cpu_usage.add(cpu_usage, time_slot, cpu_window);
+        })?;
+        db.modify::<ResourceStateRow>(state_id, |state| {
+            state.pending_cpu_usage += cpu_usage;
+            state.pending_net_usage += net_usage;
         })?;
         Ok(())
     }
@@ -2808,8 +3556,8 @@ impl ChainDatabase {
     /// Mirrored net_usage `value_ex` (the pre-multiplied accumulator state) for
     /// `owner` — for exact diffing against chainbase.
     pub fn account_net_usage_value_ex(&self, owner: u64) -> Option<u64> {
-        self.lock()
-            .find_by::<ResourceUsageRow, ResourceUsageRowByOwner>(&owner)
+        self.read()
+            .find_by_hash::<ResourceUsageRow, ResourceUsageRowByOwner>(&owner)
             .ok()
             .flatten()
             .map(|r| r.net_usage.value_ex)
@@ -2818,8 +3566,8 @@ impl ChainDatabase {
     /// Mirrored cpu_usage `value_ex` for `owner` — for exact diffing against
     /// chainbase.
     pub fn account_cpu_usage_value_ex(&self, owner: u64) -> Option<u64> {
-        self.lock()
-            .find_by::<ResourceUsageRow, ResourceUsageRowByOwner>(&owner)
+        self.read()
+            .find_by_hash::<ResourceUsageRow, ResourceUsageRowByOwner>(&owner)
             .ok()
             .flatten()
             .map(|r| r.cpu_usage.value_ex)
@@ -2884,6 +3632,93 @@ impl ChainDatabase {
         Ok(())
     }
 
+    /// Insert a code object from XPR state history. `first_block_used` is not
+    /// included in SHiP's `code` row; zero is a sentinel that preserves runtime
+    /// execution while making that unavailable bookkeeping explicit.
+    pub fn xpr_import_code(
+        &self,
+        code_hash: [u8; 32],
+        code: &[u8],
+        code_ref_count: u64,
+        vm_type: u8,
+        vm_version: u8,
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let blob = db.alloc_blob::<CodeRow>(code)?;
+        db.create::<CodeRow>(|row| {
+            row.code_hash = code_hash;
+            row.code = blob;
+            row.code_ref_count = code_ref_count;
+            row.vm_type = vm_type;
+            row.vm_version = vm_version;
+        })?;
+        Ok(())
+    }
+
+    /// Replace a source code row during SHiP delta application, preserving its
+    /// Arena object id and any fields not represented by the wire row.
+    pub fn xpr_import_update_code(
+        &self,
+        code_hash: [u8; 32],
+        code: &[u8],
+        vm_type: u8,
+        vm_version: u8,
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let id = db
+            .find_by::<CodeRow, CodeByHash>(&(code_hash, vm_type, vm_version))?
+            .map(|row| row.id())
+            .ok_or_else(|| DbError::Corrupted("code delta row is missing".into()))?;
+        let blob = db.alloc_blob::<CodeRow>(code)?;
+        db.modify::<CodeRow>(id, |row| {
+            row.code = blob;
+        })?;
+        Ok(())
+    }
+
+    /// Remove a code object whose source-chain reference count reached zero.
+    /// SHiP can emit these rows as tombstones after the last account reference
+    /// is cleared, so the Arena mirror must release the corresponding blob and
+    /// indexed row as one undoable operation.
+    pub fn xpr_import_remove_code(
+        &self,
+        code_hash: [u8; 32],
+        vm_type: u8,
+        vm_version: u8,
+    ) -> Result<bool, DbError> {
+        let mut db = self.lock();
+        let Some(id) = db
+            .find_by::<CodeRow, CodeByHash>(&(code_hash, vm_type, vm_version))?
+            .map(|row| row.id())
+        else {
+            return Ok(false);
+        };
+        db.remove::<CodeRow>(id)?;
+        Ok(true)
+    }
+
+    /// Restores code-object bookkeeping omitted by SHiP (`first_block_used`)
+    /// and verifies the source refcount against the imported code row.
+    pub fn xpr_import_update_code_metadata(
+        &self,
+        code_hash: [u8; 32],
+        vm_type: u8,
+        vm_version: u8,
+        code_ref_count: u64,
+        first_block_used: u32,
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let id = db
+            .find_by::<CodeRow, CodeByHash>(&(code_hash, vm_type, vm_version))?
+            .map(|row| row.id())
+            .ok_or_else(|| DbError::Corrupted("code sidecar row is missing".into()))?;
+        db.modify::<CodeRow>(id, |row| {
+            row.code_ref_count = code_ref_count;
+            row.first_block_used = first_block_used;
+        })?;
+        Ok(())
+    }
+
     /// The wasm image for `(code_hash, vm_type, vm_version)`, or `None` if the
     /// code row is absent. This is the bytecode the VM compiles and runs, so
     /// serving it from the arena is what puts contract execution on arena-owned
@@ -2894,7 +3729,7 @@ impl ChainDatabase {
         vm_type: u8,
         vm_version: u8,
     ) -> Option<Vec<u8>> {
-        let db = self.lock();
+        let db = self.read();
         let code_ref = db
             .find_by::<CodeRow, CodeByHash>(&(code_hash, vm_type, vm_version))
             .ok()
@@ -2954,7 +3789,7 @@ impl ChainDatabase {
     /// Mirrored `global_action_sequence`, or `None` if the singleton row has not
     /// been written yet — for diffing against chainbase.
     pub fn global_action_sequence(&self) -> Option<u64> {
-        self.lock()
+        self.read()
             .table::<DynGlobalPropertyRow>()
             .ok()?
             .iter()
@@ -2982,6 +3817,7 @@ impl ChainDatabase {
             r.max_transaction_cpu_usage = p.max_transaction_cpu_usage;
             r.min_transaction_cpu_usage = p.min_transaction_cpu_usage;
             r.max_transaction_lifetime = p.max_transaction_lifetime;
+            r.deferred_trx_expiration_window = p.deferred_trx_expiration_window;
             r.max_transaction_delay = p.max_transaction_delay;
             r.max_inline_action_size = p.max_inline_action_size;
             r.max_inline_action_depth = p.max_inline_action_depth;
@@ -3006,7 +3842,7 @@ impl ChainDatabase {
     /// block params, tx net/cpu limits, delays, action depths) off the arena so
     /// execution needs no chainbase `global_property_object`.
     pub fn chain_config_params(&self) -> Option<ChainConfigParams> {
-        let db = self.lock();
+        let db = self.read();
         let r = db.table::<GlobalPropertyRow>().ok()?.iter().next()?;
         Some(ChainConfigParams {
             max_block_net_usage: r.max_block_net_usage,
@@ -3021,6 +3857,7 @@ impl ChainDatabase {
             max_transaction_cpu_usage: r.max_transaction_cpu_usage,
             min_transaction_cpu_usage: r.min_transaction_cpu_usage,
             max_transaction_lifetime: r.max_transaction_lifetime,
+            deferred_trx_expiration_window: r.deferred_trx_expiration_window,
             max_transaction_delay: r.max_transaction_delay,
             max_inline_action_size: r.max_inline_action_size,
             max_inline_action_depth: r.max_inline_action_depth,
@@ -3028,11 +3865,66 @@ impl ChainDatabase {
         })
     }
 
+    /// Replace the undo-tracked producer schedule proposed by the system
+    /// contract. A later proposal in the same block replaces the earlier one;
+    /// promotion to a block-header pending schedule clears this singleton.
+    pub fn set_proposed_schedule(
+        &self,
+        block_num: u32,
+        packed_schedule: &[u8],
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let blob = db.alloc_blob::<ProposedScheduleRow>(packed_schedule)?;
+        let existing = db
+            .table::<ProposedScheduleRow>()?
+            .iter()
+            .next()
+            .map(|row| row.id());
+        match existing {
+            Some(id) => db.modify::<ProposedScheduleRow>(id, |row| {
+                row.block_num = block_num;
+                row.packed_schedule = blob;
+            })?,
+            None => {
+                db.create::<ProposedScheduleRow>(|row| {
+                    row.block_num = block_num;
+                    row.packed_schedule = blob;
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Current proposed schedule as `(proposal block, packed schedule)`.
+    pub fn proposed_schedule(&self) -> Option<(u32, Vec<u8>)> {
+        let db = self.read();
+        let row = db.table::<ProposedScheduleRow>().ok()?.iter().next()?;
+        let packed = db
+            .blob::<ProposedScheduleRow>(row.packed_schedule)
+            .ok()?
+            .to_vec();
+        Some((row.block_num, packed))
+    }
+
+    /// Clear a proposal after it has been promoted into a signed block header.
+    pub fn clear_proposed_schedule(&self) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let id = db
+            .table::<ProposedScheduleRow>()?
+            .iter()
+            .next()
+            .map(|row| row.id());
+        if let Some(id) = id {
+            db.remove::<ProposedScheduleRow>(id)?;
+        }
+        Ok(())
+    }
+
     /// Canonical serialization of the stored `chain_config` (16 fields, little
     /// endian, `ChainConfigV0` order), or empty when the singleton has not been
     /// seeded — byte-compatible with the chainbase `global_property_state_bytes`.
     pub fn global_property_state_bytes(&self) -> Vec<u8> {
-        let db = self.lock();
+        let db = self.read();
         match db
             .table::<GlobalPropertyRow>()
             .ok()
@@ -3041,6 +3933,162 @@ impl ChainDatabase {
             Some(r) => r.params().to_state_bytes(),
             None => Vec::new(),
         }
+    }
+
+    /// Replaces the imported XPR protocol-feature vector. Feature activation
+    /// is source-state metadata for the independent Pulse chain, but retaining
+    /// it makes the Arena SHiP `protocol_state` row lossless.
+    pub fn xpr_import_protocol_features(
+        &self,
+        features: &[([u8; 32], u32)],
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let ids: Vec<_> = db
+            .table::<ProtocolFeatureRow>()?
+            .iter()
+            .map(|row| row.id())
+            .collect();
+        for id in ids {
+            db.remove::<ProtocolFeatureRow>(id)?;
+        }
+        for (feature_digest, activation_block_num) in features {
+            db.create::<ProtocolFeatureRow>(|row| {
+                row.feature_digest = *feature_digest;
+                row.activation_block_num = *activation_block_num;
+            })?;
+        }
+        // A chainbase snapshot's protocol_state contains activated features;
+        // any transient preactivation queue belongs to the live source node and
+        // must not leak into a state-only import.
+        let preactivated_ids: Vec<_> = db
+            .table::<PreactivatedProtocolFeatureRow>()?
+            .iter()
+            .map(|row| row.id())
+            .collect();
+        for id in preactivated_ids {
+            db.remove::<PreactivatedProtocolFeatureRow>(id)?;
+        }
+        Ok(())
+    }
+
+    /// Return the ordered preactivation queue used by the runtime and block
+    /// producer. The order is consensus-visible in a protocol-feature header
+    /// extension, so do not derive it from an unordered map.
+    pub fn preactivated_protocol_features(&self) -> Vec<[u8; 32]> {
+        let db = self.read();
+        let mut rows: Vec<_> = db
+            .table::<PreactivatedProtocolFeatureRow>()
+            .map(|table| table.iter().copied().collect())
+            .unwrap_or_default();
+        rows.sort_by_key(|row| row.id().raw());
+        rows.into_iter().map(|row| row.feature_digest).collect()
+    }
+
+    /// Queue a protocol feature for activation by a subsequent block header.
+    /// Already-active and duplicate requests are rejected, matching Leap's
+    /// deterministic protocol-feature errors rather than silently accepting a
+    /// second request.
+    pub fn preactivate_protocol_feature(&self, feature_digest: [u8; 32]) -> Result<(), DbError> {
+        let mut db = self.lock();
+        if db
+            .table::<ProtocolFeatureRow>()?
+            .iter()
+            .any(|row| row.feature_digest == feature_digest)
+        {
+            return Err(DbError::Corrupted(
+                "protocol feature is already activated".into(),
+            ));
+        }
+        if db
+            .table::<PreactivatedProtocolFeatureRow>()?
+            .iter()
+            .any(|row| row.feature_digest == feature_digest)
+        {
+            return Err(DbError::Corrupted(
+                "protocol feature is already preactivated".into(),
+            ));
+        }
+        db.create::<PreactivatedProtocolFeatureRow>(|row| {
+            row.feature_digest = feature_digest;
+        })?;
+        Ok(())
+    }
+
+    /// Activate the feature list committed by a block header. Validation above
+    /// this storage layer decides which features require preactivation; direct
+    /// activation is valid for features such as PREACTIVATE_FEATURE itself.
+    /// Activation and queue removal happen in one undo-tracked operation, so
+    /// failed/forked blocks restore both sides.
+    pub fn activate_protocol_features(
+        &self,
+        feature_digests: &[[u8; 32]],
+        activation_block_num: u32,
+    ) -> Result<(), DbError> {
+        if feature_digests.is_empty() {
+            return Err(DbError::Corrupted(
+                "protocol feature activation list is empty".into(),
+            ));
+        }
+        let mut db = self.lock();
+        let queued: Vec<_> = db
+            .table::<PreactivatedProtocolFeatureRow>()?
+            .iter()
+            .copied()
+            .collect();
+        let active: Vec<_> = db.table::<ProtocolFeatureRow>()?.iter().copied().collect();
+        let mut ids = Vec::with_capacity(feature_digests.len());
+        for digest in feature_digests {
+            if active.iter().any(|row| row.feature_digest == *digest) {
+                return Err(DbError::Corrupted(
+                    "protocol feature is already activated".into(),
+                ));
+            }
+            if feature_digests[..ids.len()]
+                .iter()
+                .any(|previous| previous == digest)
+            {
+                return Err(DbError::Corrupted(
+                    "protocol feature activation list contains a duplicate".into(),
+                ));
+            }
+            ids.push(*digest);
+        }
+        for digest in ids {
+            if let Some(queued_row) = queued.iter().find(|row| row.feature_digest == digest) {
+                db.remove::<PreactivatedProtocolFeatureRow>(queued_row.id())?;
+            }
+            db.create::<ProtocolFeatureRow>(|row| {
+                row.feature_digest = digest;
+                row.activation_block_num = activation_block_num;
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Canonical SHiP payload for the imported `protocol_state` singleton.
+    pub fn protocol_state_bytes(&self) -> Vec<u8> {
+        let db = self.read();
+        let mut rows: Vec<_> = match db.table::<ProtocolFeatureRow>() {
+            Ok(table) => table.iter().copied().collect(),
+            Err(_) => return vec![0, 0],
+        };
+        rows.sort_by_key(|row| row.id().raw());
+        let mut out = Vec::new();
+        out.push(0); // protocol_state_v0 version
+        write_varuint(rows.len() as u64, &mut out);
+        for row in rows {
+            out.push(0); // activated_protocol_feature_v0 version
+            out.extend_from_slice(&row.feature_digest);
+            out.extend_from_slice(&row.activation_block_num.to_le_bytes());
+        }
+        out
+    }
+
+    pub fn protocol_feature_activated(&self, feature_digest: [u8; 32]) -> bool {
+        self.read()
+            .table::<ProtocolFeatureRow>()
+            .map(|table| table.iter().any(|row| row.feature_digest == feature_digest))
+            .unwrap_or(false)
     }
 
     // ----- resource_limits_config_object ------------------------------------
@@ -3119,7 +4167,7 @@ impl ChainDatabase {
     /// Canonical serialization of the stored `resource_limits_config`, or empty
     /// when unseeded — byte-compatible with the chainbase `resource_config_state_bytes`.
     pub fn resource_config_state_bytes(&self) -> Vec<u8> {
-        let db = self.lock();
+        let db = self.read();
         let Some(r) = db
             .table::<ResourceConfigRow>()
             .ok()
@@ -3166,11 +4214,51 @@ impl ChainDatabase {
     /// Whether the database holds a dedupe row for `trx_id` — for diffing against
     /// chainbase's `is_known_unexpired_transaction`.
     pub fn transaction_exists(&self, trx_id: [u8; 32]) -> bool {
-        self.lock()
+        self.read()
             .find_by::<TransactionRow, TxByTrxId>(&trx_id)
             .ok()
             .flatten()
             .is_some()
+    }
+
+    /// Number of unexpired input transactions retained for replay protection.
+    pub fn transaction_count(&self) -> usize {
+        self.read()
+            .table::<TransactionRow>()
+            .map(|table| table.iter().count())
+            .unwrap_or_default()
+    }
+
+    /// Replace the complete migrated replay-protection set with the source
+    /// chainbase view. The caller validates uniqueness before this operation;
+    /// this method still uses an ordered map so mutation order is deterministic.
+    pub fn xpr_import_input_transactions(&self, rows: &[([u8; 32], u32)]) -> Result<(), DbError> {
+        let desired = rows.iter().copied().collect::<BTreeMap<_, _>>();
+        let mut db = self.lock();
+        let existing = db
+            .table::<TransactionRow>()?
+            .iter()
+            .map(|row| (row.id(), row.trx_id, row.expiration))
+            .collect::<Vec<_>>();
+        for (id, trx_id, expiration) in &existing {
+            if desired.get(trx_id).copied() != Some(*expiration) {
+                db.remove::<TransactionRow>(*id)?;
+            }
+        }
+        let current = existing
+            .into_iter()
+            .map(|(_, trx_id, expiration)| (trx_id, expiration))
+            .collect::<BTreeMap<_, _>>();
+        for (&trx_id, &expiration) in &desired {
+            if current.get(&trx_id).copied() == Some(expiration) {
+                continue;
+            }
+            db.create::<TransactionRow>(|row| {
+                row.trx_id = trx_id;
+                row.expiration = expiration;
+            })?;
+        }
+        Ok(())
     }
 
     /// Mirrors `clear_expired_input_transactions`: drops every row whose
@@ -3208,6 +4296,225 @@ impl ChainDatabase {
             db.remove::<TransactionRow>(id)?;
         }
         Ok(())
+    }
+
+    // ----- deferred transactions -------------------------------------------
+
+    /// Insert one complete XPR `generated_transaction_object` during a
+    /// migration. The row participates in the caller's arena undo session, so
+    /// any later import validation failure restores the database unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub fn xpr_import_deferred_transaction(
+        &self,
+        sender: u64,
+        sender_id: u128,
+        payer: u64,
+        trx_id: [u8; 32],
+        delay_until: i64,
+        expiration: i64,
+        published: i64,
+        packed_trx: &[u8],
+    ) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let packed_trx_ref = db.alloc_blob::<DeferredTransactionRow>(packed_trx)?;
+        db.create::<DeferredTransactionRow>(|row| {
+            row.sender = sender;
+            row.sender_id_lo = sender_id as u64;
+            row.sender_id_hi = (sender_id >> 64) as u64;
+            row.payer = payer;
+            row.trx_id = trx_id;
+            row.delay_until = delay_until;
+            row.expiration = expiration;
+            row.published = published;
+            row.packed_trx = packed_trx_ref;
+        })?;
+        Ok(())
+    }
+
+    /// Number of pending deferred transactions. Startup uses this to refuse a
+    /// migrated checkpoint until the controller has a complete execution path.
+    pub fn deferred_transaction_count(&self) -> usize {
+        self.read()
+            .table::<DeferredTransactionRow>()
+            .map(|table| table.iter().count())
+            .unwrap_or_default()
+    }
+
+    /// All generated transactions whose delay has elapsed, in XPR's
+    /// `(delay_until,id)` order. The controller must receive expired rows too:
+    /// it retires them with an ID-only `expired` receipt.
+    pub fn due_deferred_transactions(&self, now_micros: i64) -> Vec<DeferredTransaction> {
+        let db = self.read();
+        let mut rows: Vec<(i64, i64, DeferredTransaction)> =
+            match db.table::<DeferredTransactionRow>() {
+                Ok(table) => table
+                    .iter()
+                    .filter(|row| row.delay_until <= now_micros)
+                    .filter_map(|row| {
+                        db.blob::<DeferredTransactionRow>(row.packed_trx)
+                            .ok()
+                            .map(|packed_trx| {
+                                (
+                                    row.delay_until,
+                                    row.id.raw(),
+                                    DeferredTransaction {
+                                        sender: row.sender,
+                                        sender_id: (row.sender_id_lo as u128)
+                                            | ((row.sender_id_hi as u128) << 64),
+                                        payer: row.payer,
+                                        trx_id: row.trx_id,
+                                        delay_until: row.delay_until,
+                                        expiration: row.expiration,
+                                        published: row.published,
+                                        packed_trx: packed_trx.to_vec(),
+                                    },
+                                )
+                            })
+                    })
+                    .collect(),
+                Err(_) => return Vec::new(),
+            };
+        rows.sort_by_key(|row| (row.0, row.1));
+        rows.into_iter().map(|(_, _, row)| row).collect()
+    }
+
+    /// Find a deferred transaction by its immutable id. Block verification uses
+    /// this instead of trusting a producer-provided marker: the durable Arena
+    /// record is the sole proof that a zero-signature transaction is scheduled.
+    pub fn deferred_transaction(&self, trx_id: [u8; 32]) -> Option<DeferredTransaction> {
+        let db = self.read();
+        let row = db
+            .find_by::<DeferredTransactionRow, DeferredByTrxId>(&trx_id)
+            .ok()
+            .flatten()?;
+        let packed_trx = db
+            .blob::<DeferredTransactionRow>(row.packed_trx)
+            .ok()?
+            .to_vec();
+        Some(DeferredTransaction {
+            sender: row.sender,
+            sender_id: (row.sender_id_lo as u128) | ((row.sender_id_hi as u128) << 64),
+            payer: row.payer,
+            trx_id: row.trx_id,
+            delay_until: row.delay_until,
+            expiration: row.expiration,
+            published: row.published,
+            packed_trx,
+        })
+    }
+
+    /// Find a generated transaction by the `(sender,sender_id)` key used by
+    /// `send_deferred` and `cancel_deferred`. This key, rather than the
+    /// transaction digest, identifies the in-flight request that may be
+    /// replaced or cancelled.
+    pub fn deferred_transaction_by_sender_id(
+        &self,
+        sender: u64,
+        sender_id: u128,
+    ) -> Option<DeferredTransaction> {
+        let db = self.read();
+        let key = (sender, (sender_id >> 64) as u64, sender_id as u64);
+        let row = db
+            .find_by::<DeferredTransactionRow, DeferredBySenderId>(&key)
+            .ok()
+            .flatten()?;
+        let packed_trx = db
+            .blob::<DeferredTransactionRow>(row.packed_trx)
+            .ok()?
+            .to_vec();
+        Some(DeferredTransaction {
+            sender: row.sender,
+            sender_id: (row.sender_id_lo as u128) | ((row.sender_id_hi as u128) << 64),
+            payer: row.payer,
+            trx_id: row.trx_id,
+            delay_until: row.delay_until,
+            expiration: row.expiration,
+            published: row.published,
+            packed_trx,
+        })
+    }
+
+    /// Remove a generated transaction by its `(sender,sender_id)` key.
+    pub fn remove_deferred_transaction_by_sender_id(
+        &self,
+        sender: u64,
+        sender_id: u128,
+    ) -> Result<Option<DeferredTransaction>, DbError> {
+        let mut db = self.lock();
+        let key = (sender, (sender_id >> 64) as u64, sender_id as u64);
+        let Some(row) = db.find_by::<DeferredTransactionRow, DeferredBySenderId>(&key)? else {
+            return Ok(None);
+        };
+        let (row_id, materialized) = {
+            let packed_trx = db.blob::<DeferredTransactionRow>(row.packed_trx)?.to_vec();
+            (
+                row.id(),
+                DeferredTransaction {
+                    sender: row.sender,
+                    sender_id: (row.sender_id_lo as u128) | ((row.sender_id_hi as u128) << 64),
+                    payer: row.payer,
+                    trx_id: row.trx_id,
+                    delay_until: row.delay_until,
+                    expiration: row.expiration,
+                    published: row.published,
+                    packed_trx,
+                },
+            )
+        };
+        db.remove::<DeferredTransactionRow>(row_id)?;
+        Ok(Some(materialized))
+    }
+
+    /// Materialize every deferred transaction in immutable transaction-id
+    /// order. This is used at migration startup to validate the raw payloads
+    /// before the node begins producing blocks.
+    pub fn deferred_transactions(&self) -> Vec<DeferredTransaction> {
+        let db = self.read();
+        let mut rows: Vec<([u8; 32], DeferredTransaction)> =
+            match db.table::<DeferredTransactionRow>() {
+                Ok(table) => table
+                    .iter()
+                    .filter_map(|row| {
+                        db.blob::<DeferredTransactionRow>(row.packed_trx)
+                            .ok()
+                            .map(|packed_trx| {
+                                (
+                                    row.trx_id,
+                                    DeferredTransaction {
+                                        sender: row.sender,
+                                        sender_id: (row.sender_id_lo as u128)
+                                            | ((row.sender_id_hi as u128) << 64),
+                                        payer: row.payer,
+                                        trx_id: row.trx_id,
+                                        delay_until: row.delay_until,
+                                        expiration: row.expiration,
+                                        published: row.published,
+                                        packed_trx: packed_trx.to_vec(),
+                                    },
+                                )
+                            })
+                    })
+                    .collect(),
+                Err(_) => return Vec::new(),
+            };
+        rows.sort_by_key(|row| row.0);
+        rows.into_iter().map(|(_, row)| row).collect()
+    }
+
+    /// Remove a pending deferred transaction by its immutable transaction id.
+    /// The scheduler calls this only inside the block undo session after it has
+    /// selected the record for expiration or execution.
+    pub fn remove_deferred_transaction(&self, trx_id: [u8; 32]) -> Result<bool, DbError> {
+        let mut db = self.lock();
+        let id = db
+            .find_by::<DeferredTransactionRow, DeferredByTrxId>(&trx_id)?
+            .map(|row| row.id());
+        if let Some(id) = id {
+            db.remove::<DeferredTransactionRow>(id)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     // ----- contract tables + secondary indices ------------------------------
@@ -3276,7 +4583,7 @@ impl ChainDatabase {
     /// stored value bytes, or `None` if the row is absent. This is the read the
     /// arena must answer identically to chainbase to run as primary.
     pub fn kv_get(&self, code: u64, scope: u64, table: u64, primary_key: u64) -> Option<Vec<u8>> {
-        let db = self.lock();
+        let db = self.read();
         let t_id = db
             .find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&(code, scope, table))
             .ok()
@@ -3296,7 +4603,7 @@ impl ChainDatabase {
     /// standalone-writes db_store path bills table-creation RAM only on the first
     /// row, so it must decide table existence against the arena, not chainbase.
     pub fn table_exists(&self, code: u64, scope: u64, table: u64) -> bool {
-        let db = self.lock();
+        let db = self.read();
         db.find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&(code, scope, table))
             .ok()
             .flatten()
@@ -3309,7 +4616,7 @@ impl ChainDatabase {
     /// the creation payer — see the note on `ContractTableRow`: the database cannot
     /// observe chainbase reassigning it internally.
     pub fn table_payer(&self, code: u64, scope: u64, table: u64) -> Option<u64> {
-        let db = self.lock();
+        let db = self.read();
         db.find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&(code, scope, table))
             .ok()
             .flatten()
@@ -3326,7 +4633,7 @@ impl ChainDatabase {
         table: u64,
         primary_key: u64,
     ) -> Option<(u64, Vec<u8>)> {
-        let db = self.lock();
+        let db = self.read();
         let t_id = db
             .find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&(code, scope, table))
             .ok()
@@ -3363,7 +4670,7 @@ impl ChainDatabase {
         table: u64,
     ) -> Vec<(u64, u64, Vec<u8>)> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let Some(t_id) = db
             .find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&(code, scope, table))
             .ok()
@@ -3399,13 +4706,13 @@ impl ChainDatabase {
     /// from "row absent but table present" (an end iterator), matching the
     /// db_find/lowerbound/end semantics.
     pub fn kv_table_exists(&self, code: u64, scope: u64, table: u64) -> bool {
-        let db = self.lock();
+        let db = self.read();
         self.resolve_t_id(&db, code, scope, table).is_some()
     }
 
     pub fn kv_lower_bound(&self, code: u64, scope: u64, table: u64, key: u64) -> Option<u64> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         db.table::<ContractKeyValueRow>()
             .ok()?
@@ -3420,7 +4727,7 @@ impl ChainDatabase {
 
     pub fn kv_upper_bound(&self, code: u64, scope: u64, table: u64, key: u64) -> Option<u64> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         db.table::<ContractKeyValueRow>()
             .ok()?
@@ -3435,7 +4742,7 @@ impl ChainDatabase {
 
     pub fn kv_prev(&self, code: u64, scope: u64, table: u64, key: u64) -> Option<u64> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         db.table::<ContractKeyValueRow>()
             .ok()?
@@ -3452,7 +4759,7 @@ impl ChainDatabase {
     /// where db_previous_i64 lands when stepping back from the end iterator.
     pub fn kv_last(&self, code: u64, scope: u64, table: u64) -> Option<u64> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         db.table::<ContractKeyValueRow>()
             .ok()?
@@ -3479,7 +4786,7 @@ impl ChainDatabase {
         secondary: u64,
     ) -> Option<(u64, u64)> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         db.table::<ContractIndex64Row>()
             .ok()?
@@ -3500,7 +4807,7 @@ impl ChainDatabase {
         secondary: u64,
     ) -> Option<(u64, u64)> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         db.table::<ContractIndex64Row>()
             .ok()?
@@ -3535,7 +4842,7 @@ impl ChainDatabase {
         table: u64,
         primary: u64,
     ) -> Option<u64> {
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         db.find_by::<ContractIndex64Row, ContractIdx64ByPrimary>(&(t_id, primary))
             .ok()
@@ -3554,7 +4861,7 @@ impl ChainDatabase {
         primary: u64,
     ) -> Option<(u64, u64)> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         let sec = db
             .find_by::<ContractIndex64Row, ContractIdx64ByPrimary>(&(t_id, primary))
@@ -3583,7 +4890,7 @@ impl ChainDatabase {
         primary: u64,
     ) -> Option<(u64, u64)> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         let sec = db
             .find_by::<ContractIndex64Row, ContractIdx64ByPrimary>(&(t_id, primary))
@@ -3605,7 +4912,7 @@ impl ChainDatabase {
     /// `(secondary, primary)` order, or `None` when the index is empty.
     pub fn idx64_last(&self, code: u64, scope: u64, table: u64) -> Option<(u64, u64)> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         db.table::<ContractIndex64Row>()
             .ok()?
@@ -3628,7 +4935,7 @@ impl ChainDatabase {
         table: u64,
     ) -> Vec<(u64, u64, u64)> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let Some(t_id) = self.resolve_t_id(&db, code, scope, table) else {
             return Vec::new();
         };
@@ -3655,7 +4962,7 @@ impl ChainDatabase {
         secondary: u128,
     ) -> Option<(u64, u128)> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         db.table::<ContractIndex128Row>()
             .ok()?
@@ -3676,7 +4983,7 @@ impl ChainDatabase {
         secondary: u128,
     ) -> Option<(u64, u128)> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         db.table::<ContractIndex128Row>()
             .ok()?
@@ -3708,7 +5015,7 @@ impl ChainDatabase {
         table: u64,
         primary: u64,
     ) -> Option<u128> {
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         db.find_by::<ContractIndex128Row, ContractIdx128ByPrimary>(&(t_id, primary))
             .ok()
@@ -3727,7 +5034,7 @@ impl ChainDatabase {
     ) -> Option<(u64, [u8; 32])> {
         use std::ops::Bound;
         let (w0, w1) = split_key256(&secondary);
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         db.table::<ContractIndex256Row>()
             .ok()?
@@ -3749,7 +5056,7 @@ impl ChainDatabase {
     ) -> Option<(u64, [u8; 32])> {
         use std::ops::Bound;
         let (w0, w1) = split_key256(&secondary);
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         db.table::<ContractIndex256Row>()
             .ok()?
@@ -3781,7 +5088,7 @@ impl ChainDatabase {
         table: u64,
         primary: u64,
     ) -> Option<[u8; 32]> {
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         db.find_by::<ContractIndex256Row, ContractIdx256ByPrimary>(&(t_id, primary))
             .ok()
@@ -3802,7 +5109,7 @@ impl ChainDatabase {
         secondary: f64,
     ) -> Option<(u64, f64)> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         match db
             .table::<ContractIndexDoubleRow>()
@@ -3827,7 +5134,7 @@ impl ChainDatabase {
         secondary: f64,
     ) -> Option<(u64, f64)> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         match db
             .table::<ContractIndexDoubleRow>()
@@ -3863,7 +5170,7 @@ impl ChainDatabase {
         table: u64,
         primary: u64,
     ) -> Option<f64> {
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         db.find_by::<ContractIndexDoubleRow, ContractIdxDoubleByPrimary>(&(t_id, primary))
             .ok()
@@ -3886,7 +5193,7 @@ impl ChainDatabase {
             lo: secondary.0,
             hi: secondary.1,
         };
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         match db
             .table::<ContractIndexLongDoubleRow>()
@@ -3912,7 +5219,7 @@ impl ChainDatabase {
             lo: secondary.0,
             hi: secondary.1,
         };
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         match db
             .table::<ContractIndexLongDoubleRow>()
@@ -3949,7 +5256,7 @@ impl ChainDatabase {
         table: u64,
         primary: u64,
     ) -> Option<(u64, u64)> {
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         db.find_by::<ContractIndexLongDoubleRow, ContractIdxLongDoubleByPrimary>(&(t_id, primary))
             .ok()
@@ -3966,7 +5273,7 @@ impl ChainDatabase {
 
     pub fn idx128_next(&self, code: u64, scope: u64, table: u64, primary: u64) -> Option<u64> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         let sec = db
             .find_by::<ContractIndex128Row, ContractIdx128ByPrimary>(&(t_id, primary))
@@ -3987,7 +5294,7 @@ impl ChainDatabase {
 
     pub fn idx128_previous(&self, code: u64, scope: u64, table: u64, primary: u64) -> Option<u64> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         let sec = db
             .find_by::<ContractIndex128Row, ContractIdx128ByPrimary>(&(t_id, primary))
@@ -4008,7 +5315,7 @@ impl ChainDatabase {
 
     pub fn idx128_last(&self, code: u64, scope: u64, table: u64) -> Option<u64> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         match db
             .table::<ContractIndex128Row>()
@@ -4027,7 +5334,7 @@ impl ChainDatabase {
 
     pub fn idx256_next(&self, code: u64, scope: u64, table: u64, primary: u64) -> Option<u64> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         let (w0, w1) = db
             .find_by::<ContractIndex256Row, ContractIdx256ByPrimary>(&(t_id, primary))
@@ -4048,7 +5355,7 @@ impl ChainDatabase {
 
     pub fn idx256_previous(&self, code: u64, scope: u64, table: u64, primary: u64) -> Option<u64> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         let (w0, w1) = db
             .find_by::<ContractIndex256Row, ContractIdx256ByPrimary>(&(t_id, primary))
@@ -4069,7 +5376,7 @@ impl ChainDatabase {
 
     pub fn idx256_last(&self, code: u64, scope: u64, table: u64) -> Option<u64> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         match db
             .table::<ContractIndex256Row>()
@@ -4088,7 +5395,7 @@ impl ChainDatabase {
 
     pub fn idx_double_next(&self, code: u64, scope: u64, table: u64, primary: u64) -> Option<u64> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         let sec = db
             .find_by::<ContractIndexDoubleRow, ContractIdxDoubleByPrimary>(&(t_id, primary))
@@ -4118,7 +5425,7 @@ impl ChainDatabase {
         primary: u64,
     ) -> Option<u64> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         let sec = db
             .find_by::<ContractIndexDoubleRow, ContractIdxDoubleByPrimary>(&(t_id, primary))
@@ -4142,7 +5449,7 @@ impl ChainDatabase {
 
     pub fn idx_double_last(&self, code: u64, scope: u64, table: u64) -> Option<u64> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         match db
             .table::<ContractIndexDoubleRow>()
@@ -4167,7 +5474,7 @@ impl ChainDatabase {
         primary: u64,
     ) -> Option<u64> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         let (lo, hi) = db
             .find_by::<ContractIndexLongDoubleRow, ContractIdxLongDoubleByPrimary>(&(t_id, primary))
@@ -4197,7 +5504,7 @@ impl ChainDatabase {
         primary: u64,
     ) -> Option<u64> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         let (lo, hi) = db
             .find_by::<ContractIndexLongDoubleRow, ContractIdxLongDoubleByPrimary>(&(t_id, primary))
@@ -4221,7 +5528,7 @@ impl ChainDatabase {
 
     pub fn idx_long_double_last(&self, code: u64, scope: u64, table: u64) -> Option<u64> {
         use std::ops::Bound;
-        let db = self.lock();
+        let db = self.read();
         let t_id = self.resolve_t_id(&db, code, scope, table)?;
         // +inf is the largest ordering key over valid (non-NaN) stored secondaries.
         let max_key = LongDoubleKey {
@@ -4308,6 +5615,51 @@ impl ChainDatabase {
             db.modify::<ContractKeyValueRow>(id, |k| {
                 k.value = blob;
                 k.payer = payer;
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Apply replay-coalesced contract row rewrites under one Arena lock. Every
+    /// key is resolved before the first mutation so a stale cache cannot leave
+    /// a partially applied batch.
+    pub fn update_key_value_objects(&self, updates: &[ContractRowUpdate]) -> Result<(), DbError> {
+        let mut db = self.lock();
+        let mut resolved = Vec::with_capacity(updates.len());
+        for update in updates {
+            let Some(t_id) = db
+                .find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&(
+                    update.code,
+                    update.scope,
+                    update.table,
+                ))?
+                .map(|row| row.id().raw())
+            else {
+                return Err(DbError::Corrupted(format!(
+                    "replay update references missing contract table ({}, {}, {})",
+                    update.code, update.scope, update.table
+                )));
+            };
+            let Some((id, old_value)) = db
+                .find_by::<ContractKeyValueRow, ContractKvByScopePrimary>(&(
+                    t_id,
+                    update.primary_key,
+                ))?
+                .map(|row| (row.id(), row.value))
+            else {
+                return Err(DbError::Corrupted(format!(
+                    "replay update references missing primary row {} in ({}, {}, {})",
+                    update.primary_key, update.code, update.scope, update.table
+                )));
+            };
+            resolved.push((id, old_value));
+        }
+
+        for (update, (id, old_value)) in updates.iter().zip(resolved) {
+            let blob = db.realloc_blob::<ContractKeyValueRow>(old_value, &update.value)?;
+            db.modify::<ContractKeyValueRow>(id, |row| {
+                row.value = blob;
+                row.payer = update.payer;
             })?;
         }
         Ok(())
@@ -4726,7 +6078,7 @@ impl ChainDatabase {
 
     /// The payer of an idx64 row, or `None` if absent.
     pub fn idx64_payer(&self, code: u64, scope: u64, table: u64, primary_key: u64) -> Option<u64> {
-        let db = self.lock();
+        let db = self.read();
         let t_id = db
             .find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&(code, scope, table))
             .ok()
@@ -4740,7 +6092,7 @@ impl ChainDatabase {
 
     /// The payer of an idx128 row, or `None` if absent.
     pub fn idx128_payer(&self, code: u64, scope: u64, table: u64, primary_key: u64) -> Option<u64> {
-        let db = self.lock();
+        let db = self.read();
         let t_id = db
             .find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&(code, scope, table))
             .ok()
@@ -4754,7 +6106,7 @@ impl ChainDatabase {
 
     /// The payer of an idx256 row, or `None` if absent.
     pub fn idx256_payer(&self, code: u64, scope: u64, table: u64, primary_key: u64) -> Option<u64> {
-        let db = self.lock();
+        let db = self.read();
         let t_id = db
             .find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&(code, scope, table))
             .ok()
@@ -4774,7 +6126,7 @@ impl ChainDatabase {
         table: u64,
         primary_key: u64,
     ) -> Option<u64> {
-        let db = self.lock();
+        let db = self.read();
         let t_id = db
             .find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&(code, scope, table))
             .ok()
@@ -4794,7 +6146,7 @@ impl ChainDatabase {
         table: u64,
         primary_key: u64,
     ) -> Option<u64> {
-        let db = self.lock();
+        let db = self.read();
         let t_id = db
             .find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&(code, scope, table))
             .ok()
@@ -4832,6 +6184,28 @@ fn join_key256(w0: u128, w1: u128) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    #[test]
+    fn frozen_contract_rows_are_safe_for_concurrent_readers() {
+        assert_send_sync::<ChainDatabase>();
+
+        let database = ChainDatabase::new().unwrap();
+        database
+            .create_key_value_object(1, 2, 3, 4, 5, b"parallel")
+            .unwrap();
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let reader = database.clone();
+                scope.spawn(move || {
+                    for _ in 0..1_000 {
+                        assert_eq!(reader.kv_get(1, 2, 3, 5).as_deref(), Some(&b"parallel"[..]));
+                    }
+                });
+            }
+        });
+    }
 
     /// The read primitives the arena serves to a contract — point read, forward
     /// scan, and the four iterator-positioning queries — must follow the index's
@@ -5189,6 +6563,175 @@ mod tests {
                 current_used: 5,
             }
         );
+    }
+
+    #[test]
+    fn imported_block_resource_window_preserves_source_ordinal() {
+        let db = ChainDatabase::new().unwrap();
+        let params = ElasticParams {
+            target: 100,
+            max: 1_000,
+            periods: 120,
+            max_multiplier: 1_000,
+            contract: (99, 100),
+            expand: (1_000, 999),
+        };
+        db.seed_resource_config(params, params, 172_800, 172_800)
+            .unwrap();
+        db.hydrate_resource_state(
+            (1_000_000, 5, 399_174_587),
+            (2_000_000, 7, 399_174_587),
+            10,
+            20,
+            30,
+            1_000,
+            2_000,
+        )
+        .unwrap();
+
+        let state = db.resource_state_bytes();
+        assert_eq!(
+            u32::from_le_bytes(state[16..20].try_into().unwrap()),
+            399_174_587
+        );
+        assert_eq!(
+            u32::from_le_bytes(state[36..40].try_into().unwrap()),
+            399_174_587
+        );
+
+        // The first target block must be able to finalize its usage without
+        // unsigned ordinal subtraction wrapping or panicking.
+        db.add_block_usage(11, 13).unwrap();
+        db.process_block_usage(399_174_588, params, params).unwrap();
+    }
+
+    #[test]
+    fn deferred_transactions_are_due_ordered_and_undo_safe() {
+        let db = ChainDatabase::new().unwrap();
+        db.start_undo_session();
+        db.xpr_import_deferred_transaction(
+            11,
+            (13u128 << 64) | 12,
+            14,
+            [2; 32],
+            20,
+            100,
+            10,
+            &[2, 3],
+        )
+        .unwrap();
+        db.xpr_import_deferred_transaction(21, 22, 23, [1; 32], 10, 100, 9, &[4])
+            .unwrap();
+        db.squash();
+
+        assert_eq!(db.deferred_transaction_count(), 2);
+        assert_eq!(
+            db.due_deferred_transactions(20)
+                .into_iter()
+                .map(|row| row.trx_id)
+                .collect::<Vec<_>>(),
+            vec![[1; 32], [2; 32]]
+        );
+        let second = db.due_deferred_transactions(20).pop().unwrap();
+        assert_eq!(second.sender_id, (13u128 << 64) | 12);
+        assert_eq!(second.packed_trx, vec![2, 3]);
+
+        db.start_undo_session();
+        assert!(db.remove_deferred_transaction([1; 32]).unwrap());
+        assert_eq!(db.deferred_transaction_count(), 1);
+        db.undo();
+        assert_eq!(db.deferred_transaction_count(), 2);
+        assert!(db.remove_deferred_transaction([1; 32]).unwrap());
+        assert_eq!(db.deferred_transaction_count(), 1);
+    }
+
+    #[test]
+    fn deferred_transactions_are_addressable_by_sender_id() {
+        let db = ChainDatabase::new().unwrap();
+        db.start_undo_session();
+        let sender_id = (7u128 << 64) | 9;
+        db.xpr_import_deferred_transaction(42, sender_id, 42, [3; 32], 20, 100, 10, &[8, 9])
+            .unwrap();
+        db.squash();
+
+        let found = db.deferred_transaction_by_sender_id(42, sender_id).unwrap();
+        assert_eq!(found.trx_id, [3; 32]);
+        assert_eq!(found.packed_trx, vec![8, 9]);
+
+        let removed = db
+            .remove_deferred_transaction_by_sender_id(42, sender_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(removed.sender_id, sender_id);
+        assert_eq!(db.deferred_transaction_count(), 0);
+        assert!(
+            db.deferred_transaction_by_sender_id(42, sender_id)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn imported_protocol_features_round_trip_as_ship_state() {
+        let db = ChainDatabase::new().unwrap();
+        let features = [([1u8; 32], 42u32), ([2u8; 32], 99u32)];
+        db.xpr_import_protocol_features(&features).unwrap();
+
+        let bytes = db.protocol_state_bytes();
+        assert_eq!(bytes[0], 0); // protocol_state_v0
+        assert_eq!(bytes[1], 2); // two activated features
+        assert_eq!(bytes[2], 0); // activated_protocol_feature_v0
+        assert_eq!(&bytes[3..35], &[1u8; 32]);
+        assert_eq!(u32::from_le_bytes(bytes[35..39].try_into().unwrap()), 42);
+        assert_eq!(bytes[39], 0); // activated_protocol_feature_v0
+        assert_eq!(&bytes[40..72], &[2u8; 32]);
+        assert_eq!(u32::from_le_bytes(bytes[72..76].try_into().unwrap()), 99);
+    }
+
+    #[test]
+    fn preactivated_protocol_features_survive_undo_and_activate_atomically() {
+        let db = ChainDatabase::new().unwrap();
+        let digest = [7u8; 32];
+
+        db.preactivate_protocol_feature(digest).unwrap();
+        assert_eq!(db.preactivated_protocol_features(), vec![digest]);
+        assert!(!db.protocol_feature_activated(digest));
+
+        db.start_undo_session();
+        db.activate_protocol_features(&[digest], 12).unwrap();
+        assert!(db.protocol_feature_activated(digest));
+        assert!(db.preactivated_protocol_features().is_empty());
+        db.undo();
+        assert!(!db.protocol_feature_activated(digest));
+        assert_eq!(db.preactivated_protocol_features(), vec![digest]);
+
+        db.start_undo_session();
+        db.activate_protocol_features(&[digest], 12).unwrap();
+        db.commit(12);
+        assert!(db.protocol_feature_activated(digest));
+        assert!(db.preactivated_protocol_features().is_empty());
+    }
+
+    #[test]
+    fn proposed_schedule_replacement_clear_and_undo_are_atomic() {
+        let db = ChainDatabase::new().unwrap();
+        assert_eq!(db.proposed_schedule(), None);
+
+        db.start_undo_session();
+        db.set_proposed_schedule(7, &[1, 2, 3]).unwrap();
+        assert_eq!(db.proposed_schedule(), Some((7, vec![1, 2, 3])));
+        db.squash();
+
+        db.start_undo_session();
+        db.set_proposed_schedule(8, &[4, 5]).unwrap();
+        assert_eq!(db.proposed_schedule(), Some((8, vec![4, 5])));
+        db.undo();
+        assert_eq!(db.proposed_schedule(), Some((7, vec![1, 2, 3])));
+
+        db.start_undo_session();
+        db.clear_proposed_schedule().unwrap();
+        assert_eq!(db.proposed_schedule(), None);
+        db.undo();
+        assert_eq!(db.proposed_schedule(), Some((7, vec![1, 2, 3])));
     }
 
     /// The standalone-write path bills db_idxN_update off the row's old payer and

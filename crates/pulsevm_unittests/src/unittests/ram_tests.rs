@@ -1,7 +1,5 @@
 #[cfg(test)]
 mod ram_tests {
-    use std::collections::BTreeSet;
-
     use anyhow::Result;
     use pulsevm_core::{
         ACTIVE_NAME,
@@ -134,7 +132,7 @@ mod ram_tests {
                 .map(|a| PermissionLevel::new(a.as_u64(), ACTIVE_NAME.as_u64()))
                 .collect(),
         ));
-        let mut signed = SignedTransaction::new(trx, BTreeSet::new(), vec![]);
+        let mut signed = SignedTransaction::new(trx, Vec::new(), vec![]);
         for a in authorizers {
             signed = signed.sign(&get_private_key(*a, "active"), &chain.controller.chain_id())?;
         }

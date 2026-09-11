@@ -1,7 +1,4 @@
-use std::{
-    collections::BTreeSet,
-    str::FromStr,
-};
+use std::str::FromStr;
 
 use pulsevm_crypto::{
     AuthorityPublicKey,
@@ -104,6 +101,10 @@ impl Host {
             )
             .unwrap();
         let db = controller.database();
+        db.preactivate_protocol_feature(crate::chain::webassembly::GET_SENDER_FEATURE_DIGEST)
+            .unwrap();
+        db.activate_protocol_features(&[crate::chain::webassembly::GET_SENDER_FEATURE_DIGEST], 1)
+            .unwrap();
         let runtime = controller.get_wasm_runtime().clone();
         let action = Action::new(
             PULSE_NAME,
@@ -130,7 +131,7 @@ impl Host {
         );
         let packed = PackedTransaction::from_signed_transaction(SignedTransaction::new(
             transaction.clone(),
-            BTreeSet::new(),
+            Vec::new(),
             vec![b"abcdef".to_vec().into(), Vec::new().into()],
         ))
         .unwrap();
@@ -180,7 +181,7 @@ impl Host {
         let memory = instance.exports.get_memory("memory").unwrap().clone();
         let mut context = WasmContext::new(PULSE_NAME, current_action, time, apply, db.clone());
         context.memory = Some(memory.clone());
-        context.instance = Some(instance.clone());
+        context.metering = Some(super::MeteringGlobals::from_instance(&instance).unwrap());
         let env = FunctionEnv::new(&mut store, context);
         let mut host = Self {
             store,

@@ -305,11 +305,7 @@ fn genesis_parsing_preserves_configuration_and_optional_defaults() {
         original.initial_key.to_packed()
     );
     let fields = json["initial_configuration"].as_object_mut().unwrap();
-    for field in [
-        "max_transaction_delay",
-        "deferred_trx_expiration_window",
-        "max_action_return_value_size",
-    ] {
+    for field in ["max_transaction_delay", "deferred_trx_expiration_window"] {
         fields.remove(field);
     }
     fields.insert("future_field".into(), json!(42));
@@ -332,6 +328,18 @@ fn genesis_parsing_preserves_configuration_and_optional_defaults() {
             .compute_chain_id(),
         defaulted.compute_chain_id()
     );
+
+    // Historical EOSIO/XPR genesis files omitted the later binary-extension
+    // field. Its runtime value still defaults to 256, but its absence must
+    // retain the older packed chain-id layout.
+    json["initial_configuration"]
+        .as_object_mut()
+        .unwrap()
+        .remove("max_action_return_value_size");
+    let legacy = GenesisState::from_json(&json.to_string()).unwrap();
+    assert_eq!(legacy.max_action_return_value_size, 256);
+    assert!(!legacy.chain_id_includes_max_action_return_value_size);
+    assert_ne!(legacy.compute_chain_id(), defaulted.compute_chain_id());
 }
 
 #[test]

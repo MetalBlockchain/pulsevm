@@ -16,6 +16,19 @@ pub struct NodeConfig {
     // its deployed eosio.system WASM remains authoritative.
     #[serde(default = "default_native_system_contract")]
     pub native_system_contract: bool,
+    /// Validate and produce block signatures using Antelope's block-header
+    /// state digest (header + blockroot merkle + pending schedule hash). This is
+    /// required for canonical XPR history replay; Pulse migration chains leave
+    /// it disabled because they start a new block-signing domain.
+    #[serde(default)]
+    pub antelope_block_signatures: bool,
+    /// Emit per-block trace and chain-state SHiP logs. Nodes enable this by
+    /// default; one-shot migration replays may disable it because the canonical
+    /// source history already exists and only the final Arena state is needed.
+    /// Keep this setting fixed for a data directory: enabling it after skipped
+    /// blocks requires rebasing the state-history logs at the current revision.
+    #[serde(default = "default_state_history_enabled")]
+    pub state_history_enabled: bool,
     // Name of the block producer, must be a valid EOSIO name (up to 12 characters, a-z, 1-5)
     pub producer_name: Name,
     // Private key of the block producer, used for signing blocks and transactions
@@ -23,6 +36,15 @@ pub struct NodeConfig {
     // Size of the memory mapped database in bytes
     #[serde(default = "default_db_size")]
     pub db_size: u64,
+    /// Optional Pulse Arena snapshot produced by the XPR migration tool. When
+    /// supplied, it is restored before controller startup and normal Arena
+    /// genesis authoring is skipped.
+    #[serde(default)]
+    pub migration_checkpoint: Option<String>,
+    /// Manifest emitted beside `migration_checkpoint`. It binds the checkpoint
+    /// bytes and revision to the source state-history export.
+    #[serde(default)]
+    pub migration_manifest: Option<String>,
     // Wall-clock ceiling on how long a single transaction may spend executing
     // before it is abandoned, in milliseconds. This is a SUBJECTIVE, node-local
     // guard (it depends on this machine's speed, not the transaction's result), so
@@ -48,6 +70,10 @@ fn default_native_system_contract() -> bool {
     true
 }
 
+fn default_state_history_enabled() -> bool {
+    true
+}
+
 fn default_max_transaction_time_ms() -> u32 {
     30_000
 }
@@ -64,5 +90,6 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.system_account, Name::from_str("pulse").unwrap());
         assert!(cfg.native_system_contract);
+        assert!(cfg.state_history_enabled);
     }
 }

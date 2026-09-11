@@ -530,6 +530,41 @@ async fn main() -> Result<()> {
         "proposed": proposed.iter().map(|p| p.producer_name.to_string()).collect::<Vec<_>>(),
     }));
 
+    // A proposal authored while building a block cannot appear in that block's
+    // already-assembled header. The first harmless transaction forces a later
+    // header to carry it as pending; after that block is accepted, the second
+    // forces another header to promote it to active. Idle test networks would
+    // otherwise stop building before either transition is observable.
+    for (step, context) in [
+        ("schedule_pending", "building the pending-schedule block"),
+        (
+            "schedule_activation",
+            "building the schedule-activation block",
+        ),
+    ] {
+        let tx = push(
+            &client,
+            &chain_id,
+            &key,
+            vec![Action {
+                account: system,
+                name: name!("activate").into(),
+                authorization: vec![PermissionLevel {
+                    actor: system.into(),
+                    permission: ACTIVE_NAME.into(),
+                }],
+                // The forwarder ignores non-setprods actions, but their bytes
+                // must differ: transactions created in the same expiration
+                // second otherwise have the same id and admission rejects the
+                // second one as a duplicate.
+                data: Arc::from(step.as_bytes().to_vec()),
+            }],
+        )
+        .await
+        .context(context)?;
+        steps.push(serde_json::json!({ "step": step, "tx": tx }));
+    }
+
     println!(
         "{}",
         serde_json::json!({

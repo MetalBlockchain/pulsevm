@@ -7,6 +7,12 @@ pub use varint::*;
 
 mod primitives;
 
+mod canonical;
+pub use canonical::{
+    CanonicalMap,
+    CanonicalSet,
+};
+
 pub trait NumBytes {
     /// Count the number of bytes a type is expected to use.
     fn num_bytes(&self) -> usize;

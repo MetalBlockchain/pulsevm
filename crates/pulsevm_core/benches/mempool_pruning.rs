@@ -1,5 +1,3 @@
-use std::collections::BTreeSet;
-
 use criterion::{
     BatchSize,
     Criterion,
@@ -44,7 +42,7 @@ fn full_unexpired_mempool() -> Mempool {
         );
         let packed = PackedTransaction::from_signed_transaction(SignedTransaction::new(
             transaction,
-            BTreeSet::new(),
+            Vec::new(),
             vec![],
         ))
         .unwrap();

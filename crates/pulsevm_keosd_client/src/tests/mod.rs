@@ -311,7 +311,7 @@ async fn sign_transaction_preserves_parameters_and_decodes_signatures() {
                     .sign_transaction(&transaction, &public_keys, &chain_id)
                     .await
                     .unwrap();
-                assert_eq!(signed.signatures, [signature].into());
+                assert_eq!(signed.signatures, vec![signature.clone(), signature]);
             },
         )
         .await;

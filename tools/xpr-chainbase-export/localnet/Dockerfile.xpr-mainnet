@@ -1,0 +1,12 @@
+FROM ubuntu:20.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libgmp10 libssl1.1 zlib1g \
+    && rm -rf /var/lib/apt/lists/*
+
+# The build context is an XPRNetwork/core checkout containing the matching
+# build-linux-arm64-20/bin/nodeos artifact.
+COPY build-linux-arm64-20/bin/nodeos /usr/local/bin/nodeos
+RUN chmod 0755 /usr/local/bin/nodeos

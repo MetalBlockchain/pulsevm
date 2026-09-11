@@ -38,7 +38,9 @@ delta (later blocks): from the arena `UndoState` of the block's open undo sessio
   removed:  `removed_values` → present=false, serialize the removed row;
   created:  ids new this session → present=true.
 `include_delta` = "any change" for all tables except `protocol_state` (compares
-`activated_protocol_features`; the arena has none yet, so it never emits a delta).
+`activated_protocol_features`). Arena's transient preactivation queue is kept in
+an undo/checkpoint-safe internal table but is intentionally not part of SHiP's
+`protocol_state_v0` wire format, which exposes activated features only.
 
 Within a delta, modified rows are emitted first, then removed rows, then new
 rows. chainbase stores the first two groups in intrusive singly linked lists and
@@ -61,15 +63,16 @@ Sizes below are the golden's block-2 first-row lengths (all verified).
   primary_key:u64 + payer:u64 + value via `history_pack_big_bytes` (check: likely uvar len + bytes).
   code/scope/table come from the row's table_id (ContractKeyValueRow.t_id → ContractTableRow).
 - contract_index64/128/256 — context wrapper, same header + secondary_key (8/16/32 bytes). (empty at block 2)
-- global_property (143) = `01`(version 1!) + chain_config + chain_id:32 + wasm_config.
-  - chain_config (65) = `01`(version 1!) + max_block_net_usage:u64 +
+- global_property (current Leap 5: 157) = `01`(version 1!) + empty producer
+  authority schedule + chain_config + chain_id:32 + wasm_config.
+  - chain_config (73) = `01`(version 1!) + max_block_net_usage:u64 +
     target_block_net_usage_pct:u32 + max_transaction_net_usage:u32 +
     base_per_transaction_net_usage:u32 + net_usage_leeway:u32 +
     context_free_discount_net_usage_num:u32 + context_free_discount_net_usage_den:u32 +
     max_block_cpu_usage:u32 + target_block_cpu_usage_pct:u32 + max_transaction_cpu_usage:u32 +
-    min_transaction_cpu_usage:u32 + max_transaction_lifetime:u32 + max_inline_action_size:u32 +
+    min_transaction_cpu_usage:u32 + max_transaction_lifetime:u32 + deferred_trx_expiration_window:u32 +
+    max_transaction_delay:u32 + max_inline_action_size:u32 +
     max_inline_action_depth:u16 + max_authority_depth:u16 + max_action_return_value_size:u32.
-    (NOTE: history OMITS max_transaction_delay and deferred_trx_expiration_window.)
   - wasm_config (45) = `00` + 11×u32: max_mutable_global_bytes, max_table_elements,
     max_section_elements, max_linear_memory_init, max_func_local_bytes, max_nested_structures,
     max_symbol_bytes, max_module_bytes, max_code_bytes, max_pages, max_call_depth.
@@ -78,7 +81,10 @@ Sizes below are the golden's block-2 first-row lengths (all verified).
   wasm_config. Source them (chain_id is on the controller; wasm_config is the pinned
   constant used by the wasm validation; the two chain_config tail fields may need adding
   to GlobalPropertyRow or sourcing from genesis config). FLAG if truly absent.
-- protocol_state (2) = `00` + container(activated_protocol_features)=uvar(0). Always empty.
+- protocol_state = `00` + container(activated_protocol_features), with each
+  element `00` + digest:32 + activation_block_num:u32. The imported XPR state
+  carries the source activated-feature vector; preactivated (not-yet-active)
+  digests are internal Arena state and are omitted by the SHiP ABI.
 - permission (40 for an empty-auth perm) = `00` + owner:u64 + perm_name:u64 +
   parent_perm_name:u64 (0 if root; else the PARENT ROW's perm_name — resolve
   PermissionRow.parent:i64 → that row's perm_name) + last_updated:time_point(i64) +

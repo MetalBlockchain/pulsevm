@@ -1,21 +1,8 @@
-use pulsevm_billable_size::billable_size_v;
-use pulsevm_constants::{
-    OVERHEAD_PER_ACCOUNT_RAM_BYTES,
-    SETCODE_RAM_BYTES_MULTIPLIER,
-};
-use pulsevm_database::{
-    Database,
-    PermissionObject,
-};
-use pulsevm_error::ChainError;
-use pulsevm_serialization::Read;
-
 use crate::{
     ACTIVE_NAME,
     ANY_NAME,
     OWNER_NAME,
     chain::{
-        abi::AbiDefinition,
         apply_context::ApplyContext,
         authority::{
             Authority,
@@ -36,6 +23,28 @@ use crate::{
     },
     transaction::Action,
 };
+use pulsevm_billable_size::billable_size_v;
+use pulsevm_constants::{
+    OVERHEAD_PER_ACCOUNT_RAM_BYTES,
+    SETCODE_RAM_BYTES_MULTIPLIER,
+};
+use pulsevm_database::{
+    Database,
+    PermissionObject,
+};
+use pulsevm_error::ChainError;
+
+const ONLY_LINK_TO_EXISTING_PERMISSION_FEATURE_DIGEST: [u8; 32] = [
+    0x1a, 0x99, 0xa5, 0x9d, 0x87, 0xe0, 0x6e, 0x09, 0xec, 0x5b, 0x02, 0x8a, 0x9c, 0xbb, 0x77, 0x49,
+    0xb4, 0xa5, 0xad, 0x88, 0x19, 0x00, 0x43, 0x65, 0xd0, 0x2d, 0xc4, 0x37, 0x9a, 0x8b, 0x72, 0x41,
+];
+
+/// `CONFIGURABLE_WASM_LIMITS2`, which switches validation from Leap's legacy
+/// parser cap to the active `wasm_config` limits.
+const CONFIGURABLE_WASM_LIMITS2_FEATURE_DIGEST: [u8; 32] = [
+    0xd5, 0x28, 0xb9, 0xf6, 0xe9, 0x69, 0x3f, 0x45, 0xed, 0x27, 0x7a, 0xf9, 0x34, 0x74, 0xfd, 0x47,
+    0x3c, 0xe7, 0xd8, 0x31, 0xda, 0xe2, 0x18, 0x0c, 0xca, 0x35, 0xd9, 0x07, 0xbd, 0x10, 0xcb, 0x40,
+];
 
 pub fn newaccount(
     context: &mut ApplyContext,
@@ -162,8 +171,24 @@ pub fn setcode(
 
     let code_size = act.code.len() as u64;
     let code_hash: [u8; 32] = if code_size > 0 {
-        // Validate the code before accepting it
-        pulsevm_wasm_validation::validate_wasm(act.code.as_slice()).map_err(|e| {
+        // XPR's source validator accepts standard start sections, and Mainnet
+        // contains historical AssemblyScript contracts that use one. Preserve
+        // PulseVM's stricter admission rule outside the opt-in migration path.
+        let validation = if db.xpr_native_replay_enabled() {
+            let maximum_section_elements =
+                if db.protocol_feature_activated(CONFIGURABLE_WASM_LIMITS2_FEATURE_DIGEST) {
+                    pulsevm_wasm_validation::constraints::DEFAULT_MAXIMUM_SECTION_ELEMENTS
+                } else {
+                    pulsevm_wasm_validation::constraints::MAXIMUM_SECTION_ELEMENTS
+                };
+            pulsevm_wasm_validation::validate_xpr_replay_wasm(
+                act.code.as_slice(),
+                maximum_section_elements,
+            )
+        } else {
+            pulsevm_wasm_validation::validate_wasm(act.code.as_slice())
+        };
+        validation.map_err(|e| {
             ChainError::TransactionError(format!("contract code failed validation: {}", e))
         })?;
         pulsevm_crypto::Digest::hash(act.code.as_slice()).0
@@ -207,6 +232,13 @@ pub fn setcode(
         act.vm_version,
     )?;
 
+    // Historical replay often has time between deployment and first use. Let
+    // opt-in compiler workers spend that time preparing the content-addressed
+    // module; ordinary nodes have no workers and this is a no-op.
+    if code_size > 0 {
+        context.schedule_wasm_precompile(code_hash, act.code.as_slice().to_vec());
+    }
+
     if new_size != old_size {
         context.add_ram_usage(&act.account, new_size - old_size)?;
     }
@@ -224,10 +256,9 @@ pub fn setabi(
         .map_err(|e| ChainError::TransactionError(format!("failed to deserialize data: {}", e)))?;
     context.require_authorization(&act.account, None)?;
 
-    // Try and parse the ABI definition
-    let _: AbiDefinition = AbiDefinition::read(act.abi.as_slice(), &mut 0).map_err(|e| {
-        ChainError::TransactionError(format!("failed to deserialize ABI definition: {}", e))
-    })?;
+    // XPR's native `apply_eosio_setabi` stores this blob opaquely. ABI decoding
+    // belongs to API/contract tooling; making it an admission condition here
+    // rejects historical blocks that nodeos accepted.
 
     let old_size: i64 = db.account_abi_size(act.account.as_u64())? as i64;
     let new_size: i64 = act.abi.len() as i64;
@@ -435,7 +466,9 @@ pub fn linkauth(
     // exempt, matching the `eosio.any` carve-out upstream. The check is against
     // `(account, requirement)` rather than the permission name alone, which is
     // the behaviour Leap moved to under `only_link_to_existing_permission`.
-    if requirement.requirement != ANY_NAME {
+    if db.protocol_feature_activated(ONLY_LINK_TO_EXISTING_PERMISSION_FEATURE_DIGEST)
+        && requirement.requirement != ANY_NAME
+    {
         let exists = db
             .read()?
             .permission_id(

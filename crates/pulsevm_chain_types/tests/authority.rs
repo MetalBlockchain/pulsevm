@@ -93,8 +93,9 @@ fn authority_wire_layout_and_weight_billing_are_stable() {
         0x0b, 0x07, 0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28, 0xd9, 0x59, 0xf2, 0x81, 0x5b, 0x16,
         0xf8, 0x17, 0x98,
     ];
-    let key =
-        AuthorityPublicKey::K1(pulsevm_crypto::k1::K1PublicKey::from_compressed(&point).unwrap());
+    let key: AuthorityPublicKey = pulsevm_crypto::k1::K1PublicKey::from_compressed(&point)
+        .unwrap()
+        .into();
     let weighted_key = KeyWeight::new(key, 0x1234);
     let mut key_bytes = vec![0];
     key_bytes.extend(point);

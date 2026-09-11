@@ -82,6 +82,13 @@ if [[ "${block_count}" != "${EXPECTED_BLOCKS}" || "${root_count}" != "${EXPECTED
   exit 1
 fi
 
+# Cargo's test process may use the package directory as its working directory.
+# Pass absolute fixture paths so a valid corpus cannot disappear merely because
+# the caller supplied a relative path.
+BLOCK_DIR="$(cd "${BLOCK_DIR}" && pwd -P)"
+ROOTS_FILE="$(cd "$(dirname "${ROOTS_FILE}")" && pwd -P)/$(basename "${ROOTS_FILE}")"
+SHIP_FILE="$(cd "$(dirname "${SHIP_FILE}")" && pwd -P)/$(basename "${SHIP_FILE}")"
+
 cd "${REPO_ROOT}"
 PULSEVM_RPC_BLOCKS_DIR="${BLOCK_DIR}" \
 PULSEVM_GOLDEN_ROOTS="${ROOTS_FILE}" \

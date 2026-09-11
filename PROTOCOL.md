@@ -90,8 +90,9 @@ with the following default methods:
 The node configuration accepts `system_account` as an EOSIO name; omitting it preserves
 the default `pulse` network behavior.
 `native_system_contract` defaults to `true` for PulseVM genesis. Set it to `false` when
-opening imported XPR/Antelope state so actions are executed by the deployed
-`eosio.system` WASM contract rather than PulseVM's native compatibility handlers.
+opening imported XPR/Antelope state to select Antelope-compatible genesis authorship.
+Controller-native actions such as `newaccount`, `setcode`, and `setabi` still execute
+before the deployed system WASM, matching Leap consensus behavior.
 
 The `cleos`-compatible CLI stores the same setting as `system_account` in
 `~/.pulse-cli/config.json`; `set system-account eosio` selects the root used by

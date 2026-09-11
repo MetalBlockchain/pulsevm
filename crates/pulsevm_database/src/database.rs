@@ -1,6 +1,10 @@
 #![allow(clippy::needless_return, clippy::too_many_arguments)]
 
 use std::{
+    collections::{
+        BTreeMap,
+        HashMap,
+    },
     fs,
     io::{
         Read,
@@ -14,11 +18,20 @@ use std::{
         Arc,
         Mutex,
         OnceLock,
+        atomic::{
+            AtomicBool,
+            AtomicU64,
+            Ordering,
+        },
     },
 };
 
 use pulsevm_error::ChainError;
 use pulsevm_name::Name;
+use sha2::{
+    Digest as Sha2Digest,
+    Sha256,
+};
 
 use crate::{
     Authority,
@@ -26,18 +39,101 @@ use crate::{
     CpuLimitResult,
     ElasticLimitParameters,
     Float128,
+    Index64Object,
+    Index128Object,
+    Index256Object,
+    IndexDoubleObject,
+    IndexLongDoubleObject,
+    KeyValueObject,
     NetLimitResult,
-    // `PermissionObject` is named only for its compile-time `billable_size_v`
-    // (the RAM a permission bills); the arena is the sole database backend.
     PermissionObject,
     Ratio,
+    TableObject,
     U256,
+    dependency::{
+        ContractIndex,
+        ContractRangeKey,
+        ContractRowKey,
+        DependencyKey,
+        DependencyRecorder,
+        DependencyTracker,
+        RangeDependency,
+        SystemKey,
+        SystemRangeKey,
+    },
 };
 
 /// The RAM a `permission_link_object` is billed:
 /// `billable_size_v<permission_link_object>` = round_up_16(40 + 3*32) = 144
 /// (config.hpp / permission_link_object.hpp in the reference chain).
 const PERMISSION_LINK_OBJECT_BILLABLE: i64 = 144;
+
+/// Leap's builtin protocol-feature registry. These are the canonical feature
+/// digests (not the human-readable `description_digest` values returned by the
+/// producer API). Chainbase `protocol_state` rows and block extensions carry
+/// these canonical identifiers, so using description hashes here would make
+/// every imported feature appear inactive.
+#[derive(Clone, Copy)]
+struct ProtocolFeatureSpec {
+    dependencies: &'static [&'static str],
+    preactivation_required: bool,
+}
+
+const NO_PROTOCOL_FEATURE_DEPENDENCIES: &[&str] = &[];
+const NO_DUPLICATE_DEFERRED_ID_DEPENDENCIES: &[&str] =
+    &["ef43112c6543b88db2283a2e077278c315ae2c84719a8b25f25cc88565fbea99"];
+const DISABLE_DEFERRED_STAGE_2_DEPENDENCIES: &[&str] =
+    &["fce57d2331667353a0eac6b4209b67b843a7262a848af0a49a6e2fa9f6584eb4"];
+
+fn protocol_feature_spec(feature_digest: [u8; 32]) -> Option<ProtocolFeatureSpec> {
+    let digest = hex::encode(feature_digest);
+    let (dependencies, preactivation_required) = match digest.as_str() {
+        // PREACTIVATE_FEATURE is enabled by node configuration and may be
+        // activated directly by a block header without a prior request.
+        "0ec7e080177b2c02b278d5088611686b49d739925a92d9bfcacd7fc6b74053bd" => {
+            (NO_PROTOCOL_FEATURE_DEPENDENCIES, false)
+        }
+        "1a99a59d87e06e09ec5b028a9cbb7749b4a5ad8819004365d02dc4379a8b7241"
+        | "ef43112c6543b88db2283a2e077278c315ae2c84719a8b25f25cc88565fbea99"
+        | "e0fb64b1085cc5538970158d05a009c24e276fb94e1a0bf6a528b48fbc4ff526"
+        | "68dcaa34c0517d19666e6b33add67351d8c5f69e999ca1e37931bc410a297428"
+        | "ad9e3d8f650687709fd68f4b90b41f7d825a365b02c23a636cef88ac2ac00c43"
+        | "8ba52fe7a3956c5cd3a656a3174b931d3bb2abb45578befc59f283ecd816a405"
+        | "2652f5f96006294109b3dd0bbde63693f55324af452b799ee137a81a905eed25"
+        | "f0af56d2c5a48d60a4a5b5c903edfb7db3a736a94ed589d0b797df33ff9d3e1d"
+        | "4e7bf348da00a945489b2a681749eb56f5de00b900014e137ddae39f48f69d67"
+        | "4fca8bd82bbd181e714e283f83e1b45d95ca5af40fb89ad3977b653c448f78c2"
+        | "299dcb6af692324b899b39f16d5a530a33062804e41f09dc97e9f156b4476707"
+        | "c3a6138c5061cf291310887c0b5c71fcaffeab90d5deb50d3b9e687cead45071"
+        | "d528b9f6e9693f45ed277af93474fd473ce7d831dae2180cca35d907bd10cb40"
+        | "5443fcf88330c586bc0e5f3dee10e7f63c76c00249c87fe4fbf7f38c082006b4"
+        | "bcd2a26394b36614fd4894241d3c451ab0f6fd110958c3423073621a70826e99"
+        | "6bcb40a24e49c26d0a60513b6aeb8551d264e4717f306b81a37a5afb3b47cedc"
+        | "35c2186cc36f7bb4aeaf4487b36e57039ccf45a9136aa856a5d569ecca55ef2b"
+        | "63320dd4a58212e4d32d1f58926b73ca33a247326c2a5e9fd39268d2384e011a"
+        | "fce57d2331667353a0eac6b4209b67b843a7262a848af0a49a6e2fa9f6584eb4" => {
+            (NO_PROTOCOL_FEATURE_DEPENDENCIES, true)
+        }
+        "4a90c00d55454dc5b059055ca213579c6ea856967712a56017487886a4d4cc0f" => {
+            (NO_DUPLICATE_DEFERRED_ID_DEPENDENCIES, true)
+        }
+        "09e86cb0accf8d81c9e85d34bea4b925ae936626d00c984e4691186891f5bc16" => {
+            (DISABLE_DEFERRED_STAGE_2_DEPENDENCIES, true)
+        }
+        _ => return None,
+    };
+    Some(ProtocolFeatureSpec {
+        dependencies,
+        preactivation_required,
+    })
+}
+
+fn parse_protocol_feature_digest(hex_digest: &str) -> [u8; 32] {
+    hex::decode(hex_digest)
+        .expect("builtin protocol-feature dependency is valid hex")
+        .try_into()
+        .expect("builtin protocol-feature dependency is 32 bytes")
+}
 // The public `Database` methods use the shared pure-Rust time type.
 use pulsevm_chain_types::TimePoint;
 // These pure-Rust authority sub-types back the arena authority decoder.
@@ -64,6 +160,48 @@ pub struct ArenaAccountMetadata {
     pub code_hash: [u8; 32],
     pub vm_type: u8,
     pub vm_version: u8,
+}
+
+/// Reconciliation of one account's stored RAM usage against all live objects
+/// currently billed to it in Arena.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AccountRamBillingBreakdown {
+    pub account: i64,
+    pub abi: i64,
+    pub code: i64,
+    pub permissions: i64,
+    pub permission_links: i64,
+    pub contract_tables: i64,
+    pub contract_kv: i64,
+    pub contract_idx64: i64,
+    pub contract_idx128: i64,
+    pub contract_idx256: i64,
+    pub contract_idx_double: i64,
+    pub contract_idx_long_double: i64,
+    pub deferred: i64,
+}
+
+impl AccountRamBillingBreakdown {
+    pub fn total(&self) -> Result<i64, ChainError> {
+        [
+            self.account,
+            self.abi,
+            self.code,
+            self.permissions,
+            self.permission_links,
+            self.contract_tables,
+            self.contract_kv,
+            self.contract_idx64,
+            self.contract_idx128,
+            self.contract_idx256,
+            self.contract_idx_double,
+            self.contract_idx_long_double,
+            self.deferred,
+        ]
+        .into_iter()
+        .try_fold(0i64, |total, value| total.checked_add(value))
+        .ok_or_else(|| ChainError::InternalError("RAM inventory overflow".into()))
+    }
 }
 /// Converts public elastic-limit parameters into the arena's stored form.
 fn to_elastic_params(p: &ElasticLimitParameters) -> crate::backend::ElasticParams {
@@ -113,7 +251,7 @@ fn chain_config_v0_from_params(p: &crate::backend::ChainConfigParams) -> ChainCo
         max_transaction_cpu_usage: p.max_transaction_cpu_usage,
         min_transaction_cpu_usage: p.min_transaction_cpu_usage,
         max_transaction_lifetime: p.max_transaction_lifetime,
-        deferred_trx_expiration_window: 0,
+        deferred_trx_expiration_window: p.deferred_trx_expiration_window,
         max_transaction_delay: p.max_transaction_delay,
         max_inline_action_size: p.max_inline_action_size,
         max_inline_action_depth: p.max_inline_action_depth,
@@ -137,6 +275,7 @@ fn chain_config_params_from_v0(cfg: &ChainConfigV0) -> crate::backend::ChainConf
         max_transaction_cpu_usage: cfg.max_transaction_cpu_usage,
         min_transaction_cpu_usage: cfg.min_transaction_cpu_usage,
         max_transaction_lifetime: cfg.max_transaction_lifetime,
+        deferred_trx_expiration_window: cfg.deferred_trx_expiration_window,
         max_transaction_delay: cfg.max_transaction_delay,
         max_inline_action_size: cfg.max_inline_action_size,
         max_inline_action_depth: cfg.max_inline_action_depth,
@@ -509,6 +648,19 @@ fn authority_blob_billable_size(blob: &[u8]) -> Option<i64> {
 
 type ProtocolActivationRecord = ([u8; 32], u32);
 
+mod speculation;
+
+pub use speculation::{
+    BlockReadSnapshot,
+    ContractPrimaryKey,
+    ContractPrimaryOverlay,
+    SnapshotVersion,
+    SpeculativeCommitOutcome,
+    SpeculativeFallbackReason,
+    SpeculativeTransaction,
+    SpeculativeWave,
+};
+
 #[derive(Clone)]
 pub struct Database {
     /// The directory the arena persists into, kept so snapshots can checkpoint
@@ -518,16 +670,93 @@ pub struct Database {
     /// The pure-Rust arena (pulsevm_chaindb). The sole state backend, shared
     /// across clones so every apply/transaction context reaches the same handle.
     backend: crate::backend::ChainDatabase,
-    /// Consensus activation records are kept beside the arena checkpoint. They
-    /// are deterministic state derived from accepted upgrade heights and must
-    /// survive restart even though they are not contract-table rows.
-    protocol_records: Arc<Mutex<Vec<ProtocolActivationRecord>>>,
     /// Immutable for the lifetime of a database handle. `OnceLock` lets the
     /// controller select the identity once during bootstrap while keeping all
     /// cloned apply contexts lock-free on the execution hot path.
     system_accounts: Arc<OnceLock<SystemAccountNames>>,
     native_system_contract: bool,
     native_system_contract_locked: bool,
+    /// Consensus activation records are kept beside the arena checkpoint. They
+    /// are deterministic state derived from accepted upgrade heights and must
+    /// survive restart even though they are not contract-table rows.
+    protocol_records: Arc<Mutex<Vec<ProtocolActivationRecord>>>,
+    /// Present only on an opt-in transaction-local clone. The recorder is not
+    /// part of Arena state and failures to record are intentionally ignored.
+    dependency_recorder: Option<DependencyRecorder>,
+    /// Installed lazily by the default-off speculative-wave API. Normal nodes
+    /// pay only an unset `OnceLock` branch; once installed, logical writes bump
+    /// the shared epoch so stale read snapshots can never commit.
+    speculation_epoch: Arc<OnceLock<AtomicU64>>,
+    /// Guards the currently supported live contract-primary write surface while
+    /// a speculative wave owns the canonical controller handle.
+    speculation_freeze: Arc<AtomicBool>,
+    /// Cache decoded authorities by their complete canonical blob so permission
+    /// updates cannot return stale authority data.
+    authority_cache: Arc<Mutex<HashMap<Vec<u8>, Authority>>>,
+    /// Non-persisted capability used only by the offline XPR replay tool.
+    /// Production VM construction leaves it false.
+    xpr_native_replay: Arc<AtomicBool>,
+    /// Contract rows rewritten repeatedly by audited native handlers are held
+    /// in block-scoped overlays and applied once at commit. This is process-local
+    /// replay machinery; ordinary VM execution never enables it.
+    xpr_native_rows: Arc<Mutex<XprNativeRowCache>>,
+    /// Action-receipt counters use the same replay-only undo layers so hundreds
+    /// of actions can collapse to one account-metadata mutation per account.
+    xpr_native_sequences: Arc<Mutex<XprNativeSequenceCache>>,
+}
+
+#[derive(Clone, Copy)]
+pub struct ActionExecutionMetadata {
+    pub privileged: bool,
+    pub code_hash: [u8; 32],
+    pub vm_type: u8,
+    pub vm_version: u8,
+    pub code_sequence: u64,
+    pub abi_sequence: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct XprNativeRowKey {
+    code: u64,
+    scope: u64,
+    table: u64,
+    primary_key: u64,
+}
+
+type XprNativeRow = (u64, Vec<u8>);
+
+#[derive(Default)]
+struct XprNativeRowCache {
+    base: HashMap<XprNativeRowKey, Option<XprNativeRow>>,
+    dirty: BTreeMap<XprNativeRowKey, XprNativeRow>,
+    layers: Vec<BTreeMap<XprNativeRowKey, XprNativeRow>>,
+    inline_authorization: Option<(u64, u64, u64, u64, u64)>,
+    contract_generations: HashMap<u64, u64>,
+    read_only_wasm: HashMap<XprReadOnlyWasmKey, Vec<(u64, u64)>>,
+    read_only_capture: Option<HashMap<u64, u64>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct XprReadOnlyWasmKey {
+    code_hash: [u8; 32],
+    receiver: u64,
+    action: u64,
+    data_key: [u64; 2],
+}
+
+#[derive(Default)]
+struct XprNativeSequenceLayer {
+    global: Option<u64>,
+    accounts: BTreeMap<u64, (u64, u64)>,
+}
+
+#[derive(Default)]
+struct XprNativeSequenceCache {
+    base_global: Option<u64>,
+    base_accounts: HashMap<u64, (u64, u64)>,
+    dirty_global: Option<u64>,
+    dirty_accounts: BTreeMap<u64, (u64, u64)>,
+    layers: Vec<XprNativeSequenceLayer>,
 }
 
 /// The staged arena checkpoint file used to move a snapshot through the transport
@@ -539,7 +768,6 @@ const SHARED_MEMORY_FILE: &str = "arena_snapshot.bin";
 /// survives a restart (including a state-synced node, whose block log does not
 /// start at genesis).
 const ARENA_STATE_FILE: &str = "arena_state.bin";
-const PROTOCOL_RECORDS_FILE: &str = "protocol_records.json";
 const ARENA_METADATA_FILE: &str = "arena_metadata.json";
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -569,6 +797,7 @@ fn load_database_metadata(path: &str) -> Result<Option<DatabaseMetadata>, String
         .map_err(|e| format!("invalid persisted system account: {e}"))?;
     Ok(Some(metadata))
 }
+const PROTOCOL_RECORDS_FILE: &str = "protocol_records.json";
 
 /// Read until `buf` is full or EOF, so each snapshot chunk is a fixed,
 /// block-aligned size regardless of how the OS splits the underlying reads —
@@ -618,73 +847,157 @@ impl Database {
         Ok(Database {
             path: path.to_string(),
             backend,
-            protocol_records: Arc::new(Mutex::new(protocol_records)),
             system_accounts,
             native_system_contract: metadata
                 .as_ref()
                 .is_none_or(|metadata| metadata.native_system_contract),
             native_system_contract_locked: metadata.is_some(),
+            protocol_records: Arc::new(Mutex::new(protocol_records)),
+            dependency_recorder: None,
+            speculation_epoch: Arc::new(OnceLock::new()),
+            speculation_freeze: Arc::new(AtomicBool::new(false)),
+            authority_cache: Arc::new(Mutex::new(HashMap::new())),
+            xpr_native_replay: Arc::new(AtomicBool::new(false)),
+            xpr_native_rows: Arc::new(Mutex::new(XprNativeRowCache::default())),
+            xpr_native_sequences: Arc::new(Mutex::new(XprNativeSequenceCache::default())),
         })
     }
 
-    fn persist_protocol_records(
+    /// Clone this database handle with an isolated dependency recorder.
+    ///
+    /// Arena state remains shared exactly as for a normal clone. Only the
+    /// observation sidecar is new, and every subsequent clone of the returned
+    /// handle contributes to the same transaction-local report.
+    pub fn clone_with_dependency_tracking(&self) -> (Self, DependencyTracker) {
+        let tracker = DependencyTracker::new();
+        let mut database = self.clone();
+        database.dependency_recorder = Some(tracker.recorder());
+        (database, tracker)
+    }
+
+    fn dependency_exact_read(
         &self,
-        records: &[ProtocolActivationRecord],
-    ) -> Result<(), ChainError> {
-        if self.path.is_empty() {
-            return Ok(());
+        code: u64,
+        scope: u64,
+        table: u64,
+        index: ContractIndex,
+        primary: u64,
+    ) {
+        self.capture_xpr_read_only_contract(code);
+        if let Some(recorder) = &self.dependency_recorder {
+            recorder.exact_read(DependencyKey::Contract(ContractRowKey::new(
+                code, scope, table, index, primary,
+            )));
         }
-        let dir = Path::new(&self.path);
-        fs::create_dir_all(dir).map_err(|e| {
-            ChainError::InternalError(format!("protocol records: create {}: {e}", self.path))
-        })?;
-        let encoded = serde_json::to_vec(records)
-            .map_err(|e| ChainError::InternalError(format!("protocol records: encode: {e}")))?;
-        let staged = tempfile::NamedTempFile::new_in(dir)
-            .map_err(|e| ChainError::InternalError(format!("protocol records: stage: {e}")))?;
-        fs::write(staged.path(), encoded)
-            .map_err(|e| ChainError::InternalError(format!("protocol records: write: {e}")))?;
-        staged
-            .persist(dir.join(PROTOCOL_RECORDS_FILE))
-            .map_err(|e| {
-                ChainError::InternalError(format!("protocol records: install: {}", e.error))
-            })?;
-        Ok(())
     }
 
-    pub fn activated_protocol_features(&self) -> Result<Vec<ProtocolActivationRecord>, ChainError> {
-        self.protocol_records
-            .lock()
-            .map_err(|_| ChainError::InternalError("protocol records lock poisoned".into()))
-            .map(|records| records.clone())
+    fn dependency_table_read(&self, code: u64, scope: u64, table: u64) {
+        self.capture_xpr_read_only_contract(code);
+        if let Some(recorder) = &self.dependency_recorder {
+            recorder.exact_read(DependencyKey::Contract(ContractRowKey::table(
+                code, scope, table,
+            )));
+        }
     }
 
-    pub fn append_activated_protocol_feature(
+    fn dependency_range_read(&self, code: u64, scope: u64, table: u64, index: ContractIndex) {
+        self.capture_xpr_read_only_contract(code);
+        if let Some(recorder) = &self.dependency_recorder {
+            recorder.range_read(RangeDependency::Contract(ContractRangeKey::new(
+                code, scope, table, index,
+            )));
+        }
+    }
+
+    fn dependency_write(
         &self,
-        digest: [u8; 32],
-        activation_height: u32,
-    ) -> Result<(), ChainError> {
-        let mut records = self
-            .protocol_records
-            .lock()
-            .map_err(|_| ChainError::InternalError("protocol records lock poisoned".into()))?;
-        if !records.contains(&(digest, activation_height)) {
-            records.push((digest, activation_height));
-            self.persist_protocol_records(&records)?;
+        code: u64,
+        scope: u64,
+        table: u64,
+        index: ContractIndex,
+        primary: u64,
+    ) {
+        self.bump_speculation_epoch();
+        if self.xpr_native_replay_enabled() {
+            let mut cache = self.xpr_native_rows.lock().unwrap();
+            let capturing = cache.read_only_capture.is_some();
+            if capturing || cache.contract_generations.contains_key(&code) {
+                let previous = cache.contract_generations.get(&code).copied().unwrap_or(0);
+                if let Some(capture) = &mut cache.read_only_capture {
+                    capture.entry(code).or_insert(previous);
+                }
+                cache
+                    .contract_generations
+                    .insert(code, previous.wrapping_add(1));
+            }
+        }
+        if let Some(recorder) = &self.dependency_recorder {
+            recorder.write(DependencyKey::Contract(ContractRowKey::new(
+                code, scope, table, index, primary,
+            )));
+        }
+    }
+
+    fn dependency_table_write(&self, code: u64, scope: u64, table: u64) {
+        self.bump_speculation_epoch();
+        if let Some(recorder) = &self.dependency_recorder {
+            recorder.write(DependencyKey::Contract(ContractRowKey::table(
+                code, scope, table,
+            )));
+        }
+    }
+
+    fn dependency_system_read(&self, key: SystemKey) {
+        if let Some(recorder) = &self.dependency_recorder {
+            recorder.exact_read(DependencyKey::System(key));
+        }
+    }
+
+    fn dependency_system_range_read(&self, key: SystemRangeKey) {
+        if let Some(recorder) = &self.dependency_recorder {
+            recorder.range_read(RangeDependency::System(key));
+        }
+    }
+
+    fn dependency_system_write(&self, key: SystemKey) {
+        self.bump_speculation_epoch();
+        if let Some(recorder) = &self.dependency_recorder {
+            recorder.write(DependencyKey::System(key));
+        }
+    }
+
+    fn bump_speculation_epoch(&self) {
+        if let Some(epoch) = self.speculation_epoch.get() {
+            epoch.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn capture_xpr_read_only_contract(&self, code: u64) {
+        if !self.xpr_native_replay_enabled() {
+            return;
+        }
+        let mut cache = self.xpr_native_rows.lock().unwrap();
+        if cache.read_only_capture.is_none() {
+            return;
+        }
+        let generation = cache.contract_generations.get(&code).copied().unwrap_or(0);
+        cache.contract_generations.entry(code).or_insert(generation);
+        cache
+            .read_only_capture
+            .as_mut()
+            .expect("capture checked above")
+            .entry(code)
+            .or_insert(generation);
+    }
+
+    fn ensure_contract_primary_not_frozen(&self) -> Result<(), ChainError> {
+        if self.speculation_epoch.get().is_some() && self.speculation_freeze.load(Ordering::Acquire)
+        {
+            return Err(ChainError::DatabaseError(
+                "canonical contract-primary mutation attempted during a speculative wave".into(),
+            ));
         }
         Ok(())
-    }
-
-    pub fn replace_activated_protocol_features(
-        &self,
-        records: Vec<ProtocolActivationRecord>,
-    ) -> Result<(), ChainError> {
-        let mut current = self
-            .protocol_records
-            .lock()
-            .map_err(|_| ChainError::InternalError("protocol records lock poisoned".into()))?;
-        *current = records;
-        self.persist_protocol_records(&current)
     }
 
     /// Set the system-account identity used by runtime helpers. This is node
@@ -801,6 +1114,65 @@ impl Database {
         Ok(())
     }
 
+    fn persist_protocol_records(
+        &self,
+        records: &[ProtocolActivationRecord],
+    ) -> Result<(), ChainError> {
+        if self.path.is_empty() {
+            return Ok(());
+        }
+        let dir = Path::new(&self.path);
+        fs::create_dir_all(dir).map_err(|e| {
+            ChainError::InternalError(format!("protocol records: create {}: {e}", self.path))
+        })?;
+        let encoded = serde_json::to_vec(records)
+            .map_err(|e| ChainError::InternalError(format!("protocol records: encode: {e}")))?;
+        let staged = tempfile::NamedTempFile::new_in(dir)
+            .map_err(|e| ChainError::InternalError(format!("protocol records: stage: {e}")))?;
+        fs::write(staged.path(), encoded)
+            .map_err(|e| ChainError::InternalError(format!("protocol records: write: {e}")))?;
+        staged
+            .persist(dir.join(PROTOCOL_RECORDS_FILE))
+            .map_err(|e| {
+                ChainError::InternalError(format!("protocol records: install: {}", e.error))
+            })?;
+        Ok(())
+    }
+
+    pub fn activated_protocol_features(&self) -> Result<Vec<ProtocolActivationRecord>, ChainError> {
+        self.protocol_records
+            .lock()
+            .map_err(|_| ChainError::InternalError("protocol records lock poisoned".into()))
+            .map(|records| records.clone())
+    }
+
+    pub fn append_activated_protocol_feature(
+        &self,
+        digest: [u8; 32],
+        activation_height: u32,
+    ) -> Result<(), ChainError> {
+        let mut records = self
+            .protocol_records
+            .lock()
+            .map_err(|_| ChainError::InternalError("protocol records lock poisoned".into()))?;
+        if !records.contains(&(digest, activation_height)) {
+            records.push((digest, activation_height));
+            self.persist_protocol_records(&records)?;
+        }
+        Ok(())
+    }
+
+    pub fn replace_activated_protocol_features(
+        &self,
+        records: Vec<ProtocolActivationRecord>,
+    ) -> Result<(), ChainError> {
+        let mut current = self
+            .protocol_records
+            .lock()
+            .map_err(|_| ChainError::InternalError("protocol records lock poisoned".into()))?;
+        *current = records;
+        self.persist_protocol_records(&current)
+    }
     /// The arena database's account_metadata privileged flag for `name`, or
     /// `None` if the database has no such row — for diffing
     /// against chainbase's `find_account_metadata`.
@@ -855,6 +1227,12 @@ impl Database {
     pub fn arena_permission_authority(&self, owner: u64, perm_name: u64) -> Option<Authority> {
         let blob = Some(&self.backend).and_then(|s| s.permission_auth_blob(owner, perm_name))?;
         decode_authority(&blob).ok()
+    }
+
+    /// The permission timestamp stored by the arena. Exposed for consensus
+    /// parity diagnostics and regression tests.
+    pub fn arena_permission_last_updated(&self, owner: u64, perm_name: u64) -> Option<i64> {
+        self.backend.permission_last_updated(owner, perm_name)
     }
 
     /// Every permission of `owner` as `(perm_name, parent_perm_name, authority)`
@@ -933,6 +1311,7 @@ impl Database {
     /// `get_account_creation_time` intrinsic returns. Errors when the account is
     /// absent, matching the old chainbase `get_account` lookup.
     pub fn account_creation_time_micros(&self, account_name: u64) -> Result<i64, ChainError> {
+        self.dependency_system_read(SystemKey::Account(account_name));
         self.backend
             .account_creation_date(account_name)
             .map(block_slot_to_micros)
@@ -990,6 +1369,29 @@ impl Database {
         Some(self.backend.transaction_state_bytes())
     }
 
+    /// Number of unexpired input transactions currently retained for replay
+    /// protection.
+    pub fn arena_transaction_count(&self) -> usize {
+        self.backend.transaction_count()
+    }
+
+    /// Replace the full input-transaction dedupe table during XPR migration.
+    pub fn xpr_import_input_transactions(
+        &mut self,
+        rows: &[([u8; 32], u32)],
+    ) -> Result<(), ChainError> {
+        for (trx_id, _) in rows {
+            self.dependency_system_write(SystemKey::Transaction(*trx_id));
+        }
+        self.backend
+            .xpr_import_input_transactions(rows)
+            .map_err(|error| {
+                ChainError::InternalError(format!(
+                    "XPR import input-transaction dedupe set: {error:?}"
+                ))
+            })
+    }
+
     pub fn arena_resource_usage_state_bytes(&self) -> Option<Vec<u8>> {
         Some(self.backend.resource_usage_state_bytes())
     }
@@ -1021,6 +1423,7 @@ impl Database {
         table: u64,
         primary_key: u64,
     ) -> Option<Vec<u8>> {
+        self.dependency_exact_read(code, scope, table, ContractIndex::Primary, primary_key);
         self.backend.kv_get(code, scope, table, primary_key)
     }
 
@@ -1029,6 +1432,7 @@ impl Database {
     /// a contract sees walking db_lowerbound_i64 -> db_next_i64. Empty when the
     /// table is absent.
     pub fn arena_table_range(&self, code: u64, scope: u64, table: u64) -> Vec<(u64, Vec<u8>)> {
+        self.dependency_range_read(code, scope, table, ContractIndex::Primary);
         {
             Some(&self.backend)
                 .map(|s| s.table_range(code, scope, table))
@@ -1045,10 +1449,12 @@ impl Database {
     /// db_next successor), `prev` = last primary < key. `None` = off the end.
     /// All return `None`
     pub fn arena_kv_lower_bound(&self, code: u64, scope: u64, table: u64, key: u64) -> Option<u64> {
+        self.dependency_range_read(code, scope, table, ContractIndex::Primary);
         self.backend.kv_lower_bound(code, scope, table, key)
     }
 
     pub fn arena_kv_table_exists(&self, code: u64, scope: u64, table: u64) -> bool {
+        self.dependency_table_read(code, scope, table);
         {
             Some(&self.backend)
                 .map(|s| s.kv_table_exists(code, scope, table))
@@ -1057,16 +1463,19 @@ impl Database {
     }
 
     pub fn arena_kv_upper_bound(&self, code: u64, scope: u64, table: u64, key: u64) -> Option<u64> {
+        self.dependency_range_read(code, scope, table, ContractIndex::Primary);
         self.backend.kv_upper_bound(code, scope, table, key)
     }
 
     pub fn arena_kv_prev(&self, code: u64, scope: u64, table: u64, key: u64) -> Option<u64> {
+        self.dependency_range_read(code, scope, table, ContractIndex::Primary);
         self.backend.kv_prev(code, scope, table, key)
     }
 
     /// Largest primary in the table — db_previous_i64's landing when stepping
     /// back from the end iterator. `None` if empty.
     pub fn arena_kv_last(&self, code: u64, scope: u64, table: u64) -> Option<u64> {
+        self.dependency_range_read(code, scope, table, ContractIndex::Primary);
         self.backend.kv_last(code, scope, table)
     }
 
@@ -1082,6 +1491,7 @@ impl Database {
         table: u64,
         secondary: u64,
     ) -> Option<u64> {
+        self.dependency_range_read(code, scope, table, ContractIndex::Idx64);
         self.backend
             .idx64_find_secondary(code, scope, table, secondary)
     }
@@ -1093,6 +1503,7 @@ impl Database {
         table: u64,
         secondary: u64,
     ) -> Option<(u64, u64)> {
+        self.dependency_range_read(code, scope, table, ContractIndex::Idx64);
         self.backend
             .idx64_lower_bound(code, scope, table, secondary)
     }
@@ -1104,6 +1515,7 @@ impl Database {
         table: u64,
         secondary: u64,
     ) -> Option<(u64, u64)> {
+        self.dependency_range_read(code, scope, table, ContractIndex::Idx64);
         self.backend
             .idx64_upper_bound(code, scope, table, secondary)
     }
@@ -1115,6 +1527,7 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<u64> {
+        self.dependency_exact_read(code, scope, table, ContractIndex::Idx64, primary);
         self.backend.idx64_find_primary(code, scope, table, primary)
     }
 
@@ -1129,6 +1542,8 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<(u64, u64)> {
+        self.dependency_exact_read(code, scope, table, ContractIndex::Idx64, primary);
+        self.dependency_range_read(code, scope, table, ContractIndex::Idx64);
         self.backend.idx64_next(code, scope, table, primary)
     }
 
@@ -1139,6 +1554,8 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<(u64, u64)> {
+        self.dependency_exact_read(code, scope, table, ContractIndex::Idx64, primary);
+        self.dependency_range_read(code, scope, table, ContractIndex::Idx64);
         self.backend.idx64_previous(code, scope, table, primary)
     }
 
@@ -1152,6 +1569,7 @@ impl Database {
         payer: u64,
         secondary: u64,
     ) {
+        self.dependency_write(code, scope, table, ContractIndex::Idx64, primary);
         let s = &self.backend;
         if let Err(e) = s.update_index64_object(code, scope, table, primary, payer, secondary) {
             eprintln!("arena database of update_index64_object diverged: {e:?}");
@@ -1167,6 +1585,7 @@ impl Database {
         payer: u64,
         secondary: u128,
     ) {
+        self.dependency_write(code, scope, table, ContractIndex::Idx128, primary);
         let s = &self.backend;
         if let Err(e) = s.update_index128_object(code, scope, table, primary, payer, secondary) {
             eprintln!("arena database of update_index128_object diverged: {e:?}");
@@ -1182,6 +1601,7 @@ impl Database {
         payer: u64,
         secondary: &U256,
     ) {
+        self.dependency_write(code, scope, table, ContractIndex::Idx256, primary);
         let s = &self.backend;
         if let Err(e) =
             s.update_index256_object(code, scope, table, primary, payer, secondary.value)
@@ -1199,6 +1619,7 @@ impl Database {
         payer: u64,
         secondary: u64,
     ) {
+        self.dependency_write(code, scope, table, ContractIndex::IdxDouble, primary);
         let s = &self.backend;
         if let Err(e) = s.update_idx_double_object(code, scope, table, primary, payer, secondary) {
             eprintln!("arena database of update_idx_double_object diverged: {e:?}");
@@ -1214,6 +1635,7 @@ impl Database {
         payer: u64,
         secondary: &Float128,
     ) {
+        self.dependency_write(code, scope, table, ContractIndex::IdxLongDouble, primary);
         let s = &self.backend;
         if let Err(e) = s.update_idx_long_double_object(
             code,
@@ -1228,6 +1650,7 @@ impl Database {
     }
 
     pub fn arena_idx64_last(&self, code: u64, scope: u64, table: u64) -> Option<(u64, u64)> {
+        self.dependency_range_read(code, scope, table, ContractIndex::Idx64);
         self.backend.idx64_last(code, scope, table)
     }
 
@@ -1238,6 +1661,7 @@ impl Database {
         table: u64,
         secondary: u128,
     ) -> Option<u64> {
+        self.dependency_range_read(code, scope, table, ContractIndex::Idx128);
         self.backend
             .idx128_find_secondary(code, scope, table, secondary)
     }
@@ -1249,6 +1673,7 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<u128> {
+        self.dependency_exact_read(code, scope, table, ContractIndex::Idx128, primary);
         self.backend
             .idx128_find_primary(code, scope, table, primary)
     }
@@ -1260,6 +1685,7 @@ impl Database {
         table: u64,
         secondary: u128,
     ) -> Option<(u64, u128)> {
+        self.dependency_range_read(code, scope, table, ContractIndex::Idx128);
         self.backend
             .idx128_lower_bound(code, scope, table, secondary)
     }
@@ -1271,6 +1697,7 @@ impl Database {
         table: u64,
         secondary: u128,
     ) -> Option<(u64, u128)> {
+        self.dependency_range_read(code, scope, table, ContractIndex::Idx128);
         self.backend
             .idx128_upper_bound(code, scope, table, secondary)
     }
@@ -1284,6 +1711,7 @@ impl Database {
         table: u64,
         secondary_bits: u64,
     ) -> Option<u64> {
+        self.dependency_range_read(code, scope, table, ContractIndex::IdxDouble);
         {
             self.backend.idx_double_find_secondary(
                 code,
@@ -1301,6 +1729,7 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<u64> {
+        self.dependency_exact_read(code, scope, table, ContractIndex::IdxDouble, primary);
         {
             Some(&self.backend)
                 .and_then(|s| s.idx_double_find_primary(code, scope, table, primary))
@@ -1315,6 +1744,7 @@ impl Database {
         table: u64,
         secondary_bits: u64,
     ) -> Option<(u64, u64)> {
+        self.dependency_range_read(code, scope, table, ContractIndex::IdxDouble);
         {
             Some(&self.backend)
                 .and_then(|s| {
@@ -1331,6 +1761,7 @@ impl Database {
         table: u64,
         secondary_bits: u64,
     ) -> Option<(u64, u64)> {
+        self.dependency_range_read(code, scope, table, ContractIndex::IdxDouble);
         {
             Some(&self.backend)
                 .and_then(|s| {
@@ -1348,6 +1779,7 @@ impl Database {
         table: u64,
         secondary: [u8; 32],
     ) -> Option<u64> {
+        self.dependency_range_read(code, scope, table, ContractIndex::Idx256);
         self.backend
             .idx256_find_secondary(code, scope, table, secondary)
     }
@@ -1359,6 +1791,7 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<[u8; 32]> {
+        self.dependency_exact_read(code, scope, table, ContractIndex::Idx256, primary);
         self.backend
             .idx256_find_primary(code, scope, table, primary)
     }
@@ -1370,6 +1803,7 @@ impl Database {
         table: u64,
         secondary: [u8; 32],
     ) -> Option<(u64, [u8; 32])> {
+        self.dependency_range_read(code, scope, table, ContractIndex::Idx256);
         self.backend
             .idx256_lower_bound(code, scope, table, secondary)
     }
@@ -1381,6 +1815,7 @@ impl Database {
         table: u64,
         secondary: [u8; 32],
     ) -> Option<(u64, [u8; 32])> {
+        self.dependency_range_read(code, scope, table, ContractIndex::Idx256);
         self.backend
             .idx256_upper_bound(code, scope, table, secondary)
     }
@@ -1393,6 +1828,7 @@ impl Database {
         table: u64,
         secondary: (u64, u64),
     ) -> Option<u64> {
+        self.dependency_range_read(code, scope, table, ContractIndex::IdxLongDouble);
         {
             Some(&self.backend)
                 .and_then(|s| s.idx_long_double_find_secondary(code, scope, table, secondary))
@@ -1406,6 +1842,7 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<(u64, u64)> {
+        self.dependency_exact_read(code, scope, table, ContractIndex::IdxLongDouble, primary);
         {
             Some(&self.backend)
                 .and_then(|s| s.idx_long_double_find_primary(code, scope, table, primary))
@@ -1419,6 +1856,7 @@ impl Database {
         table: u64,
         secondary: (u64, u64),
     ) -> Option<(u64, (u64, u64))> {
+        self.dependency_range_read(code, scope, table, ContractIndex::IdxLongDouble);
         {
             Some(&self.backend)
                 .and_then(|s| s.idx_long_double_lower_bound(code, scope, table, secondary))
@@ -1432,6 +1870,7 @@ impl Database {
         table: u64,
         secondary: (u64, u64),
     ) -> Option<(u64, (u64, u64))> {
+        self.dependency_range_read(code, scope, table, ContractIndex::IdxLongDouble);
         {
             Some(&self.backend)
                 .and_then(|s| s.idx_long_double_upper_bound(code, scope, table, secondary))
@@ -1450,6 +1889,8 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<u64> {
+        self.dependency_exact_read(code, scope, table, ContractIndex::Idx128, primary);
+        self.dependency_range_read(code, scope, table, ContractIndex::Idx128);
         self.backend.idx128_next(code, scope, table, primary)
     }
 
@@ -1460,10 +1901,13 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<u64> {
+        self.dependency_exact_read(code, scope, table, ContractIndex::Idx128, primary);
+        self.dependency_range_read(code, scope, table, ContractIndex::Idx128);
         self.backend.idx128_previous(code, scope, table, primary)
     }
 
     pub fn arena_idx128_last(&self, code: u64, scope: u64, table: u64) -> Option<u64> {
+        self.dependency_range_read(code, scope, table, ContractIndex::Idx128);
         self.backend.idx128_last(code, scope, table)
     }
 
@@ -1474,6 +1918,8 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<u64> {
+        self.dependency_exact_read(code, scope, table, ContractIndex::Idx256, primary);
+        self.dependency_range_read(code, scope, table, ContractIndex::Idx256);
         self.backend.idx256_next(code, scope, table, primary)
     }
 
@@ -1484,10 +1930,13 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<u64> {
+        self.dependency_exact_read(code, scope, table, ContractIndex::Idx256, primary);
+        self.dependency_range_read(code, scope, table, ContractIndex::Idx256);
         self.backend.idx256_previous(code, scope, table, primary)
     }
 
     pub fn arena_idx256_last(&self, code: u64, scope: u64, table: u64) -> Option<u64> {
+        self.dependency_range_read(code, scope, table, ContractIndex::Idx256);
         self.backend.idx256_last(code, scope, table)
     }
 
@@ -1498,6 +1947,8 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<u64> {
+        self.dependency_exact_read(code, scope, table, ContractIndex::IdxDouble, primary);
+        self.dependency_range_read(code, scope, table, ContractIndex::IdxDouble);
         self.backend.idx_double_next(code, scope, table, primary)
     }
 
@@ -1508,11 +1959,14 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<u64> {
+        self.dependency_exact_read(code, scope, table, ContractIndex::IdxDouble, primary);
+        self.dependency_range_read(code, scope, table, ContractIndex::IdxDouble);
         self.backend
             .idx_double_previous(code, scope, table, primary)
     }
 
     pub fn arena_idx_double_last(&self, code: u64, scope: u64, table: u64) -> Option<u64> {
+        self.dependency_range_read(code, scope, table, ContractIndex::IdxDouble);
         self.backend.idx_double_last(code, scope, table)
     }
 
@@ -1523,6 +1977,8 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<u64> {
+        self.dependency_exact_read(code, scope, table, ContractIndex::IdxLongDouble, primary);
+        self.dependency_range_read(code, scope, table, ContractIndex::IdxLongDouble);
         self.backend
             .idx_long_double_next(code, scope, table, primary)
     }
@@ -1534,6 +1990,8 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<u64> {
+        self.dependency_exact_read(code, scope, table, ContractIndex::IdxLongDouble, primary);
+        self.dependency_range_read(code, scope, table, ContractIndex::IdxLongDouble);
         {
             Some(&self.backend)
                 .and_then(|s| s.idx_long_double_previous(code, scope, table, primary))
@@ -1541,6 +1999,7 @@ impl Database {
     }
 
     pub fn arena_idx_long_double_last(&self, code: u64, scope: u64, table: u64) -> Option<u64> {
+        self.dependency_range_read(code, scope, table, ContractIndex::IdxLongDouble);
         self.backend.idx_long_double_last(code, scope, table)
     }
 
@@ -1630,21 +2089,279 @@ impl Database {
         Some(self.backend.state_root())
     }
 
+    /// Canonical bytes used by the differential replay/fingerprint tools.
+    /// The order and names are part of the report format; do not derive them
+    /// from hash-map iteration.
+    pub fn arena_state_table_bytes(&self) -> Vec<(&'static str, Vec<u8>)> {
+        vec![
+            (
+                "account_metadata",
+                self.arena_account_metadata_state_bytes()
+                    .unwrap_or_default(),
+            ),
+            (
+                "account",
+                self.arena_account_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "permission",
+                self.arena_permission_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "permission_link",
+                self.arena_permission_link_state_bytes().unwrap_or_default(),
+            ),
+            ("code", self.arena_code_state_bytes().unwrap_or_default()),
+            (
+                "transaction",
+                self.arena_transaction_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "resource_usage",
+                self.arena_resource_usage_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "resource_limits",
+                self.arena_account_limits_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "resource_state",
+                self.arena_resource_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "dynamic_global_property",
+                self.arena_global_action_sequence()
+                    .unwrap_or(0)
+                    .to_le_bytes()
+                    .to_vec(),
+            ),
+            (
+                "global_property",
+                self.arena_global_property_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "resource_limits_config",
+                self.arena_resource_config_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "contract_table",
+                self.arena_contract_table_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "contract_key_value",
+                self.arena_contract_kv_state_bytes().unwrap_or_default(),
+            ),
+            (
+                "protocol_state",
+                self.arena_protocol_state_bytes().unwrap_or_default(),
+            ),
+        ]
+    }
+
     /// Arena undo-session lifecycle, driven by the controller's block boundaries.
     pub fn arena_start_undo_session(&self) {
         self.backend.start_undo_session();
+        if self.xpr_native_replay_enabled() {
+            self.xpr_native_rows
+                .lock()
+                .unwrap()
+                .layers
+                .push(BTreeMap::new());
+            self.xpr_native_sequences
+                .lock()
+                .unwrap()
+                .layers
+                .push(XprNativeSequenceLayer::default());
+        }
+    }
+
+    /// Add a nested undo layer for replay-only contract-row overlays without
+    /// cloning the full Arena undo state. Audited native handlers stage all row
+    /// writes here and defer any ordinary database mutations until the attempt
+    /// is known to be supported.
+    pub fn xpr_native_start_row_session(&self) -> Result<(), ChainError> {
+        if !self.xpr_native_replay_enabled() {
+            return Err(ChainError::InternalError(
+                "XPR native row session requires replay mode".into(),
+            ));
+        }
+        self.xpr_native_rows
+            .lock()
+            .unwrap()
+            .layers
+            .push(BTreeMap::new());
+        Ok(())
+    }
+
+    pub fn xpr_native_squash_row_session(&self) -> Result<(), ChainError> {
+        let mut cache = self.xpr_native_rows.lock().unwrap();
+        if cache.layers.len() < 2 {
+            return Err(ChainError::InternalError(
+                "XPR native row session has no parent".into(),
+            ));
+        }
+        let layer = cache.layers.pop().expect("length checked above");
+        cache
+            .layers
+            .last_mut()
+            .expect("parent XPR row layer exists")
+            .extend(layer);
+        Ok(())
+    }
+
+    pub fn xpr_native_undo_row_session(&self) -> Result<(), ChainError> {
+        let mut cache = self.xpr_native_rows.lock().unwrap();
+        if cache.layers.len() < 2 {
+            return Err(ChainError::InternalError(
+                "XPR native row session has no parent".into(),
+            ));
+        }
+        cache.layers.pop();
+        Ok(())
+    }
+
+    /// Cache one successful inline authority check across consecutive audited
+    /// native transactions in the same block. The controller clears this before
+    /// every canonical fallback and commit, so no transaction capable of
+    /// changing permissions can be crossed.
+    pub fn xpr_native_inline_authorization_cached(&self, key: (u64, u64, u64, u64, u64)) -> bool {
+        self.xpr_native_rows.lock().unwrap().inline_authorization == Some(key)
+    }
+
+    pub fn cache_xpr_native_inline_authorization(&self, key: (u64, u64, u64, u64, u64)) {
+        self.xpr_native_rows.lock().unwrap().inline_authorization = Some(key);
+    }
+
+    pub fn clear_xpr_native_inline_authorization(&self) {
+        if self.xpr_native_replay_enabled() {
+            self.xpr_native_rows.lock().unwrap().inline_authorization = None;
+        }
+    }
+
+    /// Look up a replay-only memoized WASM action and return the dependency
+    /// generations against which a miss must be evaluated. The cache is keyed
+    /// by the complete deployed code hash and an action-specific normalized
+    /// payload; contract writes invalidate only entries that read that code.
+    #[doc(hidden)]
+    pub fn xpr_read_only_wasm_cache_probe(
+        &self,
+        code_hash: [u8; 32],
+        receiver: u64,
+        action: u64,
+        data_key: [u64; 2],
+    ) -> bool {
+        let mut cache = self.xpr_native_rows.lock().unwrap();
+        let key = XprReadOnlyWasmKey {
+            code_hash,
+            receiver,
+            action,
+            data_key,
+        };
+        let hit = cache.read_only_wasm.get(&key).is_some_and(|cached| {
+            cached.iter().all(|(code, expected)| {
+                cache.contract_generations.get(code).copied().unwrap_or(0) == *expected
+            })
+        });
+        if !hit {
+            cache.read_only_capture = Some(HashMap::new());
+        }
+        hit
+    }
+
+    /// Promote a canonical WASM execution only if none of its contract-state
+    /// dependencies changed while it ran. Inline actions are screened by the
+    /// caller because they are scheduled outside the current receiver.
+    #[doc(hidden)]
+    pub fn xpr_promote_read_only_wasm_cache(
+        &self,
+        code_hash: [u8; 32],
+        receiver: u64,
+        action: u64,
+        data_key: [u64; 2],
+    ) -> bool {
+        let mut cache = self.xpr_native_rows.lock().unwrap();
+        let Some(captured) = cache.read_only_capture.take() else {
+            return false;
+        };
+        let expected_generations = captured.into_iter().collect::<Vec<_>>();
+        let unchanged = expected_generations.iter().all(|(code, expected)| {
+            cache.contract_generations.get(code).copied().unwrap_or(0) == *expected
+        });
+        if !unchanged {
+            return false;
+        }
+        // Historical replay currently has one caller, but retain a hard bound
+        // so adversarial account diversity cannot turn the optimization into
+        // an unbounded process-local cache.
+        if cache.read_only_wasm.len() >= 4_096 {
+            cache.read_only_wasm.clear();
+        }
+        cache.read_only_wasm.insert(
+            XprReadOnlyWasmKey {
+                code_hash,
+                receiver,
+                action,
+                data_key,
+            },
+            expected_generations,
+        );
+        true
+    }
+
+    #[doc(hidden)]
+    pub fn xpr_cancel_read_only_wasm_capture(&self) {
+        self.xpr_native_rows.lock().unwrap().read_only_capture = None;
     }
     pub fn arena_squash(&self) {
         self.backend.squash();
+        if self.xpr_native_replay_enabled() {
+            let mut cache = self.xpr_native_rows.lock().unwrap();
+            // A transaction/onblock layer folds into its enclosing block. If a
+            // caller squashes the sole layer, retain the overlay until commit:
+            // the backend has no parent undo session, but its rows have not yet
+            // been materialized there.
+            if cache.layers.len() > 1 {
+                let layer = cache.layers.pop().expect("length checked above");
+                cache
+                    .layers
+                    .last_mut()
+                    .expect("outer XPR replay layer must exist")
+                    .extend(layer);
+            }
+            let mut sequences = self.xpr_native_sequences.lock().unwrap();
+            if sequences.layers.len() > 1 {
+                let layer = sequences.layers.pop().expect("length checked above");
+                let parent = sequences
+                    .layers
+                    .last_mut()
+                    .expect("outer XPR replay sequence layer must exist");
+                if layer.global.is_some() {
+                    parent.global = layer.global;
+                }
+                parent.accounts.extend(layer.accounts);
+            }
+        }
     }
     pub fn arena_undo(&self) {
         self.backend.undo();
+        if self.xpr_native_replay_enabled() {
+            let mut cache = self.xpr_native_rows.lock().unwrap();
+            cache.layers.pop();
+            cache.base.clear();
+            cache.inline_authorization = None;
+            let mut sequences = self.xpr_native_sequences.lock().unwrap();
+            sequences.layers.pop();
+            sequences.base_global = None;
+            sequences.base_accounts.clear();
+        }
     }
 
     /// The arena lives in memory behind an `Arc`, so there is nothing to close;
     /// dropping the last handle releases it. Retained for the controller's
     /// restart sequence.
     pub fn close(&self) -> Result<(), ChainError> {
+        self.flush_xpr_native_rows()?;
+        self.flush_xpr_native_sequences()?;
         // Persist the committed arena to disk so the next open reloads it, matching
         // chainbase's mapped `shared_memory.bin`. The directory may not exist yet
         // for a never-opened default database, so create it first.
@@ -1670,7 +2387,11 @@ impl Database {
     /// reflects whatever is committed to the arena at that instant.
     pub fn snapshot_bytes(&self) -> Result<Vec<u8>, ChainError> {
         let revision = self.backend.revision();
-        let file = Path::new(&self.path).join(SHARED_MEMORY_FILE);
+        let dir = Path::new(&self.path);
+        fs::create_dir_all(dir).map_err(|e| {
+            ChainError::InternalError(format!("snapshot: create {}: {e}", dir.display()))
+        })?;
+        let file = dir.join(SHARED_MEMORY_FILE);
         self.backend
             .checkpoint(&file)
             .map_err(|e| ChainError::InternalError(format!("snapshot: checkpoint: {e:?}")))?;
@@ -1769,6 +2490,71 @@ impl Database {
         Ok(header)
     }
 
+    /// Replace the live arena from a snapshot envelope on disk. The envelope
+    /// and sparse payload are streamed into a staged chainbase file, avoiding
+    /// a second multi-gigabyte `Vec<u8>` during migration startup.
+    pub fn restore_from_path(
+        &self,
+        snapshot_path: &Path,
+    ) -> Result<crate::snapshot::SnapshotHeader, ChainError> {
+        let dir = Path::new(&self.path);
+        fs::create_dir_all(dir).map_err(|e| {
+            ChainError::InternalError(format!("restore: create {}: {e}", self.path))
+        })?;
+        let mut input = fs::File::open(snapshot_path).map_err(|e| {
+            ChainError::InternalError(format!(
+                "restore: open checkpoint {}: {e}",
+                snapshot_path.display()
+            ))
+        })?;
+        let file_len = input
+            .metadata()
+            .map_err(|e| ChainError::InternalError(format!("restore: stat checkpoint: {e}")))?
+            .len();
+        if file_len < crate::snapshot::HEADER_LEN as u64 {
+            return Err(ChainError::InternalError(
+                "restore: checkpoint is shorter than its envelope header".into(),
+            ));
+        }
+        let mut header_bytes = vec![0u8; crate::snapshot::HEADER_LEN];
+        input.read_exact(&mut header_bytes).map_err(|e| {
+            ChainError::InternalError(format!("restore: read checkpoint header: {e}"))
+        })?;
+        let header = crate::snapshot::peek_header(&header_bytes)?;
+        let expected_len = (crate::snapshot::HEADER_LEN as u64)
+            .checked_add(header.payload_len)
+            .ok_or_else(|| {
+                ChainError::InternalError("restore: checkpoint length overflow".into())
+            })?;
+        if file_len != expected_len {
+            return Err(ChainError::InternalError(format!(
+                "restore: checkpoint length {file_len} does not match envelope {expected_len}"
+            )));
+        }
+
+        let staged = Self::stage_snapshot_stream(&mut input, header, dir)?;
+        let candidate = crate::backend::ChainDatabase::new()
+            .map_err(|e| ChainError::InternalError(format!("restore: arena init: {e:?}")))?;
+        candidate
+            .load(staged.path())
+            .map_err(|e| ChainError::InternalError(format!("restore: invalid arena: {e:?}")))?;
+        if candidate.revision() != header.revision {
+            return Err(ChainError::InternalError(format!(
+                "snapshot payload revision {} does not match envelope revision {}",
+                candidate.revision(),
+                header.revision
+            )));
+        }
+        let dest = dir.join(ARENA_STATE_FILE);
+        staged.persist(&dest).map_err(|e| {
+            ChainError::InternalError(format!("restore: install {}: {}", dest.display(), e.error))
+        })?;
+        self.backend
+            .reload_from(&dest)
+            .map_err(|e| ChainError::InternalError(format!("restore: reload: {e:?}")))?;
+        Ok(header)
+    }
+
     /// Expand and fully load a snapshot checkpoint before it is allowed to
     /// replace durable state. Loading catches malformed arena sections and the
     /// revision comparison prevents an envelope from claiming a different
@@ -1806,8 +2592,110 @@ impl Database {
         Ok(staged)
     }
 
+    fn stage_snapshot_stream(
+        input: &mut fs::File,
+        header: crate::snapshot::SnapshotHeader,
+        dir: &Path,
+    ) -> Result<tempfile::NamedTempFile, ChainError> {
+        let staged = tempfile::NamedTempFile::new_in(dir)
+            .map_err(|e| ChainError::InternalError(format!("restore: stage: {e}")))?;
+        let mut output = staged.as_file();
+        let mut hasher = Sha256::new();
+        let mut payload_read = 0u64;
+        let mut read_payload = |buf: &mut [u8], payload_read: &mut u64| -> Result<(), ChainError> {
+            input.read_exact(buf).map_err(|e| {
+                ChainError::InternalError(format!("restore: read sparse payload: {e}"))
+            })?;
+            hasher.update(&*buf);
+            *payload_read = (*payload_read)
+                .checked_add(buf.len() as u64)
+                .ok_or_else(|| {
+                    ChainError::InternalError("restore: payload length overflow".into())
+                })?;
+            if *payload_read > header.payload_len {
+                return Err(ChainError::InternalError(
+                    "restore: sparse payload exceeds envelope length".into(),
+                ));
+            }
+            Ok(())
+        };
+
+        let mut logical_len_bytes = [0u8; 8];
+        read_payload(&mut logical_len_bytes, &mut payload_read)?;
+        let logical_len = u64::from_le_bytes(logical_len_bytes);
+        let mut previous_end = 0u64;
+        while payload_read < header.payload_len {
+            let remaining = header.payload_len - payload_read;
+            if remaining < 16 {
+                return Err(ChainError::InternalError(
+                    "restore: sparse run header is truncated".into(),
+                ));
+            }
+            let mut run_header = [0u8; 16];
+            read_payload(&mut run_header, &mut payload_read)?;
+            let offset = u64::from_le_bytes(run_header[..8].try_into().unwrap());
+            let len = u64::from_le_bytes(run_header[8..].try_into().unwrap());
+            if len == 0 {
+                return Err(ChainError::InternalError(
+                    "restore: sparse run has zero length".into(),
+                ));
+            }
+            let end = offset
+                .checked_add(len)
+                .ok_or_else(|| ChainError::InternalError("restore: sparse run overflows".into()))?;
+            if offset < previous_end || end > logical_len {
+                return Err(ChainError::InternalError(
+                    "restore: sparse run is out of order or out of bounds".into(),
+                ));
+            }
+            output.seek(SeekFrom::Start(offset)).map_err(|e| {
+                ChainError::InternalError(format!("restore: seek staged arena: {e}"))
+            })?;
+            let mut remaining_run = len;
+            let mut buffer = vec![0u8; 4 * 1024 * 1024];
+            while remaining_run != 0 {
+                let chunk = remaining_run.min(buffer.len() as u64) as usize;
+                read_payload(&mut buffer[..chunk], &mut payload_read)?;
+                output.write_all(&buffer[..chunk]).map_err(|e| {
+                    ChainError::InternalError(format!("restore: write staged arena: {e}"))
+                })?;
+                remaining_run -= chunk as u64;
+            }
+            previous_end = end;
+        }
+        if payload_read != header.payload_len {
+            return Err(ChainError::InternalError(
+                "restore: sparse payload length mismatch".into(),
+            ));
+        }
+        if hasher.finalize().as_slice() != header.payload_sha256 {
+            return Err(ChainError::InternalError(
+                "restore: snapshot payload checksum mismatch".into(),
+            ));
+        }
+        output
+            .set_len(logical_len)
+            .map_err(|e| ChainError::InternalError(format!("restore: size staged arena: {e}")))?;
+        output
+            .sync_all()
+            .map_err(|e| ChainError::InternalError(format!("restore: sync staged arena: {e}")))?;
+        Ok(staged)
+    }
+
     pub fn commit(&mut self, revision: i64) -> Result<(), ChainError> {
+        self.clear_xpr_native_inline_authorization();
+        self.flush_xpr_native_rows()?;
+        self.flush_xpr_native_sequences()?;
         self.backend.commit(revision);
+        if self.xpr_native_replay_enabled() {
+            let mut cache = self.xpr_native_rows.lock().unwrap();
+            cache.layers.clear();
+            cache.base.clear();
+            let mut sequences = self.xpr_native_sequences.lock().unwrap();
+            sequences.layers.clear();
+            sequences.base_global = None;
+            sequences.base_accounts.clear();
+        }
         Ok(())
     }
 
@@ -1908,6 +2796,12 @@ impl Database {
         // 3. resource_limits_state: virtual limits seeded to each resource's max (slow-start).
         s.initialize_resource_state(2_000_000, 1_048_576)
             .map_err(|e| ChainError::InternalError(format!("genesis resource_state: {e:?}")))?;
+
+        // authorization_manager::initialize_database reserves permission id 0
+        // as a default sentinel before any native-account permissions exist.
+        // It consumes no RAM and deliberately does not allocate a usage row.
+        s.reserve_permission_zero()
+            .map_err(|e| ChainError::InternalError(format!("genesis permission zero: {e:?}")))?;
 
         // 4. native accounts. system_auth carries the genesis key; the producers' active authority
         //    delegates to the configured system account's active permission.
@@ -2044,6 +2938,7 @@ impl Database {
         account_name: u64,
         creation_date: u32,
     ) -> Result<(), ChainError> {
+        self.dependency_system_write(SystemKey::Account(account_name));
         self.backend
             .create_account(account_name, creation_date)
             .map_err(|e| {
@@ -2056,12 +2951,14 @@ impl Database {
         account_name: u64,
         is_privileged: bool,
     ) -> Result<(), ChainError> {
+        self.dependency_system_write(SystemKey::AccountMetadata(account_name));
         self.backend
             .create_account_metadata(account_name, is_privileged)
             .map_err(|e| ChainError::InternalError(format!("arena create_account_metadata: {e:?}")))
     }
 
     pub fn set_privileged(&mut self, account: u64, is_privileged: bool) -> Result<(), ChainError> {
+        self.dependency_system_write(SystemKey::AccountMetadata(account));
         let s = &self.backend;
         return s.set_privileged(account, is_privileged).map_err(|e| {
             ChainError::InternalError(format!("arena set_privileged {account}: {e:?}"))
@@ -2078,6 +2975,7 @@ impl Database {
         _vm_type: u8,
         _vm_version: u8,
     ) -> Result<(), ChainError> {
+        self.dependency_system_write(SystemKey::Code(*code_hash));
         self.backend
             .unlink_account_code(*code_hash)
             .map_err(|e| ChainError::InternalError(format!("arena unlink_account_code: {e:?}")))
@@ -2097,6 +2995,10 @@ impl Database {
         vm_type: u8,
         vm_version: u8,
     ) -> Result<(), ChainError> {
+        self.dependency_system_write(SystemKey::AccountMetadata(account_name));
+        if !new_code.is_empty() {
+            self.dependency_system_write(SystemKey::Code(*code_hash));
+        }
         self.backend
             .update_account_code(
                 account_name,
@@ -2113,16 +3015,449 @@ impl Database {
     /// Replace an account's ABI. Takes the account *name*; both the account and
     /// account_metadata objects are resolved inside the write scope.
     pub fn update_account_abi(&mut self, account_name: u64, abi: &[u8]) -> Result<(), ChainError> {
+        self.dependency_system_write(SystemKey::Account(account_name));
+        self.dependency_system_write(SystemKey::AccountMetadata(account_name));
         let s = &self.backend;
         return s
             .update_account_abi(account_name, abi)
             .map_err(|e| ChainError::InternalError(format!("arena update_account_abi: {e:?}")));
     }
 
+    /// Install an ABI while hydrating a state-history full snapshot. Unlike the
+    /// live `setabi` path this must not fabricate an `abi_sequence` increment:
+    /// SHiP's account row already represents the stored ABI at the source head.
+    pub(crate) fn xpr_import_set_account_abi_raw(
+        &self,
+        account_name: u64,
+        abi: &[u8],
+    ) -> Result<(), ChainError> {
+        self.backend
+            .set_account_abi_raw(account_name, abi)
+            .map_err(|e| {
+                ChainError::InternalError(format!("XPR import account ABI {account_name}: {e:?}"))
+            })
+    }
+
+    /// Create account metadata from the fields XPR's state-history format
+    /// actually exposes. Account/authority sequence numbers are absent from
+    /// that source format and are therefore initialized to zero by the backend.
+    pub(crate) fn xpr_import_account_metadata(
+        &self,
+        name: u64,
+        privileged: bool,
+        last_code_update: i64,
+        code_hash: [u8; 32],
+        vm_type: u8,
+        vm_version: u8,
+    ) -> Result<(), ChainError> {
+        self.backend
+            .xpr_import_account_metadata(
+                name,
+                privileged,
+                last_code_update,
+                code_hash,
+                vm_type,
+                vm_version,
+            )
+            .map_err(|e| {
+                ChainError::InternalError(format!("XPR import account metadata {name}: {e:?}"))
+            })
+    }
+
+    pub(crate) fn xpr_import_update_account_metadata(
+        &self,
+        name: u64,
+        recv_sequence: u64,
+        auth_sequence: u64,
+        code_sequence: u64,
+        abi_sequence: u64,
+    ) -> Result<(), ChainError> {
+        self.backend
+            .xpr_import_update_account_metadata(
+                name,
+                recv_sequence,
+                auth_sequence,
+                code_sequence,
+                abi_sequence,
+            )
+            .map_err(|e| {
+                ChainError::InternalError(format!(
+                    "XPR import account metadata sidecar {name}: {e:?}"
+                ))
+            })
+    }
+
+    pub(crate) fn xpr_import_update_account_metadata_source(
+        &self,
+        name: u64,
+        privileged: bool,
+        last_code_update: i64,
+        code_hash: [u8; 32],
+        vm_type: u8,
+        vm_version: u8,
+    ) -> Result<(), ChainError> {
+        self.backend
+            .xpr_import_update_account_metadata_source(
+                name,
+                privileged,
+                last_code_update,
+                code_hash,
+                vm_type,
+                vm_version,
+            )
+            .map_err(|e| {
+                ChainError::InternalError(format!("XPR import account metadata delta: {e:?}"))
+            })
+    }
+
+    /// Insert a code image and its derived source reference count while
+    /// hydrating XPR state history.
+    pub(crate) fn xpr_import_code(
+        &self,
+        code_hash: [u8; 32],
+        code: &[u8],
+        code_ref_count: u64,
+        vm_type: u8,
+        vm_version: u8,
+    ) -> Result<(), ChainError> {
+        self.backend
+            .xpr_import_code(code_hash, code, code_ref_count, vm_type, vm_version)
+            .map_err(|e| ChainError::InternalError(format!("XPR import code: {e:?}")))
+    }
+
+    pub(crate) fn xpr_import_update_code(
+        &self,
+        code_hash: [u8; 32],
+        code: &[u8],
+        vm_type: u8,
+        vm_version: u8,
+    ) -> Result<(), ChainError> {
+        self.backend
+            .xpr_import_update_code(code_hash, code, vm_type, vm_version)
+            .map_err(|e| ChainError::InternalError(format!("XPR import code delta: {e:?}")))
+    }
+
+    pub(crate) fn xpr_import_remove_code(
+        &self,
+        code_hash: [u8; 32],
+        vm_type: u8,
+        vm_version: u8,
+    ) -> Result<bool, ChainError> {
+        self.backend
+            .xpr_import_remove_code(code_hash, vm_type, vm_version)
+            .map_err(|e| ChainError::InternalError(format!("XPR remove code delta: {e:?}")))
+    }
+
+    pub(crate) fn xpr_import_update_code_metadata(
+        &self,
+        code_hash: [u8; 32],
+        vm_type: u8,
+        vm_version: u8,
+        code_ref_count: u64,
+        first_block_used: u32,
+    ) -> Result<(), ChainError> {
+        self.backend
+            .xpr_import_update_code_metadata(
+                code_hash,
+                vm_type,
+                vm_version,
+                code_ref_count,
+                first_block_used,
+            )
+            .map_err(|e| ChainError::InternalError(format!("XPR import code sidecar: {e:?}")))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn xpr_import_deferred_transaction(
+        &self,
+        sender: u64,
+        sender_id: u128,
+        payer: u64,
+        trx_id: [u8; 32],
+        delay_until: i64,
+        expiration: i64,
+        published: i64,
+        packed_trx: &[u8],
+    ) -> Result<(), ChainError> {
+        self.dependency_system_write(SystemKey::DeferredTransaction(trx_id));
+        self.dependency_system_write(SystemKey::DeferredSender { sender, sender_id });
+        self.backend
+            .xpr_import_deferred_transaction(
+                sender,
+                sender_id,
+                payer,
+                trx_id,
+                delay_until,
+                expiration,
+                published,
+                packed_trx,
+            )
+            .map_err(|e| {
+                ChainError::InternalError(format!("XPR import deferred transaction: {e:?}"))
+            })
+    }
+
+    /// Pending migrated deferred transaction count. Controllers must only
+    /// allow these to boot after their scheduler/executor is available.
+    pub fn deferred_transaction_count(&self) -> usize {
+        self.backend.deferred_transaction_count()
+    }
+
+    pub fn arena_deferred_transaction(
+        &self,
+        trx_id: [u8; 32],
+    ) -> Option<crate::backend::DeferredTransaction> {
+        self.dependency_system_read(SystemKey::DeferredTransaction(trx_id));
+        self.backend.deferred_transaction(trx_id)
+    }
+
+    pub fn arena_deferred_transaction_by_sender_id(
+        &self,
+        sender: u64,
+        sender_id: u128,
+    ) -> Option<crate::backend::DeferredTransaction> {
+        self.dependency_system_read(SystemKey::DeferredSender { sender, sender_id });
+        self.backend
+            .deferred_transaction_by_sender_id(sender, sender_id)
+    }
+
+    pub fn arena_due_deferred_transactions(
+        &self,
+        now_micros: i64,
+    ) -> Vec<crate::backend::DeferredTransaction> {
+        self.dependency_system_range_read(SystemRangeKey::DeferredDueQueue);
+        self.backend.due_deferred_transactions(now_micros)
+    }
+
+    pub fn arena_deferred_transactions(&self) -> Vec<crate::backend::DeferredTransaction> {
+        self.dependency_system_range_read(SystemRangeKey::DeferredDueQueue);
+        self.backend.deferred_transactions()
+    }
+
+    pub fn arena_remove_deferred_transaction(&self, trx_id: [u8; 32]) -> Result<bool, ChainError> {
+        self.dependency_system_write(SystemKey::DeferredTransaction(trx_id));
+        if let Some(row) = self.backend.deferred_transaction(trx_id) {
+            self.dependency_system_write(SystemKey::DeferredSender {
+                sender: row.sender,
+                sender_id: row.sender_id,
+            });
+        }
+        self.backend
+            .remove_deferred_transaction(trx_id)
+            .map_err(|e| {
+                ChainError::InternalError(format!("arena remove deferred transaction: {e:?}"))
+            })
+    }
+
+    pub fn arena_remove_deferred_transaction_by_sender_id(
+        &self,
+        sender: u64,
+        sender_id: u128,
+    ) -> Result<Option<crate::backend::DeferredTransaction>, ChainError> {
+        self.dependency_system_write(SystemKey::DeferredSender { sender, sender_id });
+        let removed = self
+            .backend
+            .remove_deferred_transaction_by_sender_id(sender, sender_id)
+            .map_err(|e| {
+                ChainError::InternalError(format!(
+                    "arena remove deferred transaction by sender id: {e:?}"
+                ))
+            })?;
+        if let Some(row) = &removed {
+            self.dependency_system_write(SystemKey::DeferredTransaction(row.trx_id));
+        }
+        Ok(removed)
+    }
+
+    pub(crate) fn xpr_import_permission(
+        &self,
+        parent: i64,
+        owner: u64,
+        name: u64,
+        last_updated: i64,
+        authority: &[u8],
+    ) -> Result<i64, ChainError> {
+        if owner == 0 && name == 0 {
+            // The SHiP decoder expands the default shared_authority into four
+            // zero u32 fields: threshold and the three container counts.
+            if parent != 0 || last_updated != 0 || authority != [0; 16] {
+                return Err(ChainError::InternalError(
+                    "XPR reserved permission zero has non-default fields".into(),
+                ));
+            }
+            self.backend.reserve_permission_zero().map_err(|e| {
+                ChainError::InternalError(format!("XPR import permission zero: {e:?}"))
+            })?;
+            return Ok(0);
+        }
+        let id = self.backend.next_permission_id().map_err(|e| {
+            ChainError::InternalError(format!("XPR import next permission id: {e:?}"))
+        })?;
+        self.backend
+            .create_permission(id, parent, owner, name, last_updated, authority)
+            .map_err(|e| ChainError::InternalError(format!("XPR import permission: {e:?}")))?;
+        Ok(id)
+    }
+
+    pub(crate) fn xpr_import_upsert_permission(
+        &self,
+        parent_name: u64,
+        owner: u64,
+        name: u64,
+        last_updated: i64,
+        authority: &[u8],
+    ) -> Result<(), ChainError> {
+        let parent = if parent_name == 0 {
+            0
+        } else {
+            self.backend
+                .permission(owner, parent_name)
+                .map(|(id, _)| id)
+                .ok_or_else(|| {
+                    ChainError::InternalError(format!(
+                        "XPR import permission parent {parent_name} is missing"
+                    ))
+                })?
+        };
+        if self.backend.permission(owner, name).is_some() {
+            self.backend
+                .modify_permission(owner, name, authority, last_updated)
+                .map_err(|e| {
+                    ChainError::InternalError(format!("XPR import permission delta: {e:?}"))
+                })
+        } else {
+            let id = self.backend.next_permission_id().map_err(|e| {
+                ChainError::InternalError(format!("XPR import next permission id: {e:?}"))
+            })?;
+            self.backend
+                .create_permission(id, parent, owner, name, last_updated, authority)
+                .map_err(|e| {
+                    ChainError::InternalError(format!("XPR import permission delta: {e:?}"))
+                })
+        }
+    }
+
+    pub(crate) fn xpr_import_remove_permission(
+        &self,
+        owner: u64,
+        name: u64,
+    ) -> Result<(), ChainError> {
+        self.backend
+            .remove_permission(owner, name)
+            .map_err(|e| ChainError::InternalError(format!("XPR remove permission delta: {e:?}")))
+    }
+
+    pub(crate) fn xpr_import_permission_last_used(
+        &self,
+        owner: u64,
+        name: u64,
+        last_used: i64,
+    ) -> Result<(), ChainError> {
+        self.backend
+            .xpr_import_permission_last_used(owner, name, last_used)
+            .map_err(|e| ChainError::InternalError(format!("XPR import permission sidecar: {e:?}")))
+    }
+
+    pub(crate) fn xpr_import_permission_link(
+        &self,
+        account: u64,
+        code: u64,
+        message_type: u64,
+        required_permission: u64,
+    ) -> Result<(), ChainError> {
+        self.backend
+            .link_auth(account, code, message_type, required_permission)
+            .map_err(|e| ChainError::InternalError(format!("XPR import permission link: {e:?}")))
+    }
+
+    pub(crate) fn xpr_import_resource_limits(
+        &self,
+        owner: u64,
+        net_weight: i64,
+        cpu_weight: i64,
+        ram_bytes: i64,
+    ) -> Result<(), ChainError> {
+        let mut row = Vec::with_capacity(33);
+        row.push(0); // committed, not pending
+        row.extend_from_slice(&owner.to_le_bytes());
+        row.extend_from_slice(&ram_bytes.to_le_bytes());
+        row.extend_from_slice(&net_weight.to_le_bytes());
+        row.extend_from_slice(&cpu_weight.to_le_bytes());
+        self.backend
+            .hydrate_account_limits(&row)
+            .map_err(|e| ChainError::InternalError(format!("XPR import resource limits: {e:?}")))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn xpr_import_resource_usage(
+        &self,
+        owner: u64,
+        ram_usage: u64,
+        net_value_ex: u64,
+        net_consumed: u64,
+        net_last_ordinal: u32,
+        cpu_value_ex: u64,
+        cpu_consumed: u64,
+        cpu_last_ordinal: u32,
+    ) -> Result<(), ChainError> {
+        let mut row = Vec::with_capacity(56);
+        row.extend_from_slice(&owner.to_le_bytes());
+        row.extend_from_slice(&ram_usage.to_le_bytes());
+        for (value_ex, consumed, last_ordinal) in [
+            (net_value_ex, net_consumed, net_last_ordinal),
+            (cpu_value_ex, cpu_consumed, cpu_last_ordinal),
+        ] {
+            row.extend_from_slice(&value_ex.to_le_bytes());
+            row.extend_from_slice(&consumed.to_le_bytes());
+            row.extend_from_slice(&last_ordinal.to_le_bytes());
+        }
+        self.backend
+            .hydrate_resource_usage(&row)
+            .map_err(|e| ChainError::InternalError(format!("XPR import resource usage: {e:?}")))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn xpr_import_resource_state(
+        &self,
+        net: (u64, u64, u32),
+        cpu: (u64, u64, u32),
+        total_net_weight: u64,
+        total_cpu_weight: u64,
+        total_ram_bytes: u64,
+        virtual_net_limit: u64,
+        virtual_cpu_limit: u64,
+    ) -> Result<(), ChainError> {
+        self.backend
+            .hydrate_resource_state(
+                net,
+                cpu,
+                total_net_weight,
+                total_cpu_weight,
+                total_ram_bytes,
+                virtual_net_limit,
+                virtual_cpu_limit,
+            )
+            .map_err(|e| ChainError::InternalError(format!("XPR import resource state: {e:?}")))
+    }
+
+    pub(crate) fn xpr_import_resource_config(
+        &self,
+        cpu: crate::backend::ElasticParams,
+        net: crate::backend::ElasticParams,
+        cpu_window: u32,
+        net_window: u32,
+    ) -> Result<(), ChainError> {
+        self.backend
+            .seed_resource_config(cpu, net, cpu_window, net_window)
+            .map_err(|e| ChainError::InternalError(format!("XPR import resource config: {e:?}")))
+    }
+
     pub fn initialize_account_resource_limits(
         &mut self,
         account_name: u64,
     ) -> Result<(), ChainError> {
+        self.dependency_system_write(SystemKey::ResourceUsage(account_name));
+        self.dependency_system_write(SystemKey::ResourceLimits(account_name));
         let s = &self.backend;
         return s
             .initialize_account_resource_limits(account_name)
@@ -2166,45 +3501,39 @@ impl Database {
     ) -> Result<(), ChainError> {
         const MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER: u32 = 1000;
 
-        let (net_window, cpu_window) =
-            self.get_account_net_usage_average_window().and_then(|nw| {
-                self.get_account_cpu_usage_average_window()
-                    .map(|cw| (nw, cw))
-            })?;
+        self.dependency_system_read(SystemKey::ResourceConfig);
+        self.dependency_system_read(SystemKey::ResourceLimits(account));
+        self.dependency_system_write(SystemKey::ResourceUsage(account));
+        self.dependency_system_write(SystemKey::ResourceState);
 
         let s = &self.backend;
+        let (
+            net_window,
+            cpu_window,
+            net_available,
+            cpu_available,
+            block_cpu_available,
+            block_net_available,
+        ) = s
+            .account_usage_context(account, MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER)
+            .ok_or_else(|| {
+                ChainError::InternalError(format!(
+                    "resource state not found while billing account {account}"
+                ))
+            })?;
         if validate {
-            let (net_available, _) = s
-                .account_net_limit(account, MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER)
-                .ok_or_else(|| {
-                    ChainError::InternalError(format!(
-                        "resource state not found while billing account {account}"
-                    ))
-                })?;
             if net_available >= 0 && net_usage > net_available as u64 {
                 return Err(ChainError::TransactionError(format!(
                     "transaction net usage is too high: {net_usage} > {net_available}"
                 )));
             }
 
-            let (cpu_available, _) = s
-                .account_cpu_limit(account, MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER)
-                .ok_or_else(|| {
-                    ChainError::InternalError(format!(
-                        "resource state not found while billing account {account}"
-                    ))
-                })?;
             if cpu_available >= 0 && cpu_usage > cpu_available as u64 {
                 return Err(ChainError::TransactionError(format!(
                     "transaction CPU usage is too high: {cpu_usage} > {cpu_available}"
                 )));
             }
 
-            let (block_cpu_available, block_net_available) = s.block_limits().ok_or_else(|| {
-                ChainError::InternalError(format!(
-                    "resource state not found while billing account {account}"
-                ))
-            })?;
             if cpu_usage > block_cpu_available {
                 return Err(ChainError::TransactionError(format!(
                     "block has insufficient CPU resources: {cpu_usage} > {block_cpu_available}"
@@ -2217,12 +3546,10 @@ impl Database {
             }
         }
 
-        s.add_transaction_usage(
+        s.add_transaction_and_block_usage(
             account, cpu_usage, net_usage, time_slot, net_window, cpu_window,
         )
         .map_err(|e| ChainError::InternalError(format!("arena add_transaction_usage: {e:?}")))?;
-        s.add_block_usage(cpu_usage, net_usage)
-            .map_err(|e| ChainError::InternalError(format!("arena add_block_usage: {e:?}")))?;
         Ok(())
     }
 
@@ -2231,6 +3558,7 @@ impl Database {
         account_name: u64,
         ram_bytes: i64,
     ) -> Result<(), ChainError> {
+        self.dependency_system_write(SystemKey::ResourceUsage(account_name));
         let s = &self.backend;
         return s
             .add_pending_ram_usage(account_name, ram_bytes)
@@ -2238,6 +3566,8 @@ impl Database {
     }
 
     pub fn verify_account_ram_usage(&mut self, account_name: u64) -> Result<(), ChainError> {
+        self.dependency_system_read(SystemKey::ResourceLimits(account_name));
+        self.dependency_system_read(SystemKey::ResourceUsage(account_name));
         // Reproduce chainbase's resource_limits check: an account whose RAM quota
         // is set (>= 0) may not use more than it. A negative quota is unlimited.
         let ram_bytes = self
@@ -2278,6 +3608,7 @@ impl Database {
     }
 
     pub fn get_account_ram_usage(&self, account_name: u64) -> Result<i64, ChainError> {
+        self.dependency_system_read(SystemKey::ResourceUsage(account_name));
         self.backend
             .account_ram_usage(account_name)
             .map(|u| u as i64)
@@ -2286,7 +3617,140 @@ impl Database {
             })
     }
 
+    /// Reconstruct the RAM represented by every live object billed to an
+    /// account. This is deliberately an offline audit API: its payer scans are
+    /// too expensive for the consensus hot path and it never mutates state.
+    pub fn account_ram_billing_breakdown(
+        &self,
+        account_name: u64,
+    ) -> Result<AccountRamBillingBreakdown, ChainError> {
+        use pulsevm_constants::{
+            OVERHEAD_PER_ACCOUNT_RAM_BYTES,
+            SETCODE_RAM_BYTES_MULTIPLIER,
+        };
+
+        const GENERATED_TRANSACTION_BILLABLE_SIZE: i64 = 272;
+
+        let raw = self
+            .backend
+            .account_ram_inventory(account_name)
+            .map_err(|error| {
+                ChainError::InternalError(format!("RAM inventory failed: {error:?}"))
+            })?;
+        let inventory_bytes = |bytes: usize| -> Result<i64, ChainError> {
+            i64::try_from(bytes)
+                .map_err(|_| ChainError::InternalError("RAM inventory overflow".into()))
+        };
+        let checked_add = |left: i64, right: i64| -> Result<i64, ChainError> {
+            left.checked_add(right)
+                .ok_or_else(|| ChainError::InternalError("RAM inventory overflow".into()))
+        };
+        let permissions = raw
+            .permission_auth_blobs
+            .iter()
+            .try_fold(0i64, |total, blob| {
+                authority_blob_billable_size(blob)
+                    .and_then(|dynamic| {
+                        i64::try_from(billable_size_v::<PermissionObject>())
+                            .ok()
+                            .and_then(|fixed| fixed.checked_add(dynamic))
+                            .and_then(|billable| total.checked_add(billable))
+                    })
+                    .ok_or_else(|| {
+                        ChainError::InternalError(format!(
+                            "malformed authority or RAM overflow while auditing account {account_name}"
+                        ))
+                    })
+            })?;
+        let deferred = raw.deferred_packed_bytes.iter().try_fold(
+            0i64,
+            |total, packed_bytes| -> Result<i64, ChainError> {
+                let packed_bytes = inventory_bytes(*packed_bytes)?;
+                let billable = checked_add(GENERATED_TRANSACTION_BILLABLE_SIZE, packed_bytes)?;
+                checked_add(total, billable)
+            },
+        )?;
+        let count_bytes = |count: usize, bytes: u64| -> Result<i64, ChainError> {
+            i64::try_from(count)
+                .ok()
+                .zip(i64::try_from(bytes).ok())
+                .and_then(|(count, bytes)| count.checked_mul(bytes))
+                .ok_or_else(|| ChainError::InternalError("RAM inventory overflow".into()))
+        };
+
+        let contract_kv = checked_add(
+            count_bytes(raw.contract_kv_rows, billable_size_v::<KeyValueObject>())?,
+            inventory_bytes(raw.contract_kv_value_bytes)?,
+        )?;
+        let code = inventory_bytes(raw.code_bytes)?
+            .checked_mul(i64::from(SETCODE_RAM_BYTES_MULTIPLIER))
+            .ok_or_else(|| ChainError::InternalError("RAM inventory overflow".into()))?;
+
+        Ok(AccountRamBillingBreakdown {
+            account: if raw.account_exists {
+                OVERHEAD_PER_ACCOUNT_RAM_BYTES as i64
+            } else {
+                0
+            },
+            abi: inventory_bytes(raw.abi_bytes)?,
+            code,
+            permissions,
+            permission_links: count_bytes(
+                raw.permission_links,
+                u64::try_from(PERMISSION_LINK_OBJECT_BILLABLE).map_err(|_| {
+                    ChainError::InternalError("negative permission-link RAM cost".into())
+                })?,
+            )?,
+            contract_tables: count_bytes(raw.contract_tables, billable_size_v::<TableObject>())?,
+            contract_kv,
+            contract_idx64: count_bytes(
+                raw.contract_idx64_rows,
+                billable_size_v::<Index64Object>(),
+            )?,
+            contract_idx128: count_bytes(
+                raw.contract_idx128_rows,
+                billable_size_v::<Index128Object>(),
+            )?,
+            contract_idx256: count_bytes(
+                raw.contract_idx256_rows,
+                billable_size_v::<Index256Object>(),
+            )?,
+            contract_idx_double: count_bytes(
+                raw.contract_idx_double_rows,
+                billable_size_v::<IndexDoubleObject>(),
+            )?,
+            contract_idx_long_double: count_bytes(
+                raw.contract_idx_long_double_rows,
+                billable_size_v::<IndexLongDoubleObject>(),
+            )?,
+            deferred,
+        })
+    }
+
+    /// Repair a superseded offline replay checkpoint by replacing exactly the
+    /// expected stored RAM counter with the live-object inventory total. The
+    /// compare-and-set guard prevents this from becoming a general limit
+    /// bypass, and ordinary VM execution never calls it.
+    pub fn repair_xpr_replay_ram_usage_from_inventory(
+        &self,
+        account_name: u64,
+        expected_stored: i64,
+    ) -> Result<i64, ChainError> {
+        let represented = self.account_ram_billing_breakdown(account_name)?.total()?;
+        let expected_stored = u64::try_from(expected_stored).map_err(|_| {
+            ChainError::InternalError("expected RAM usage must be non-negative".into())
+        })?;
+        let replacement = u64::try_from(represented).map_err(|_| {
+            ChainError::InternalError("represented RAM usage must be non-negative".into())
+        })?;
+        self.backend
+            .repair_account_ram_usage(account_name, expected_stored, replacement)
+            .map_err(|error| ChainError::InternalError(format!("XPR RAM repair: {error:?}")))?;
+        Ok(represented)
+    }
+
     pub fn get_account_net_usage_average_window(&self) -> Result<u32, ChainError> {
+        self.dependency_system_read(SystemKey::ResourceConfig);
         let s = &self.backend;
         return s
             .usage_average_windows()
@@ -2295,6 +3759,7 @@ impl Database {
     }
 
     pub fn get_account_cpu_usage_average_window(&self) -> Result<u32, ChainError> {
+        self.dependency_system_read(SystemKey::ResourceConfig);
         let s = &self.backend;
         return s
             .usage_average_windows()
@@ -2313,6 +3778,7 @@ impl Database {
     }
 
     pub fn get_cpu_limit_parameters(&self) -> Result<ElasticLimitParameters, ChainError> {
+        self.dependency_system_read(SystemKey::ResourceConfig);
         let s = &self.backend;
         return s
             .resource_config_elastic()
@@ -2321,6 +3787,7 @@ impl Database {
     }
 
     pub fn get_net_limit_parameters(&self) -> Result<ElasticLimitParameters, ChainError> {
+        self.dependency_system_read(SystemKey::ResourceConfig);
         let s = &self.backend;
         return s
             .resource_config_elastic()
@@ -2342,6 +3809,7 @@ impl Database {
         net_weight: i64,
         cpu_weight: i64,
     ) -> Result<bool, ChainError> {
+        self.dependency_system_write(SystemKey::ResourceLimits(account_name));
         let s = &self.backend;
         // Compute the "ram limit decreased" flag from the pre-write limit, as
         // chainbase does, before applying the arena write.
@@ -2362,6 +3830,7 @@ impl Database {
         net_weight: &mut i64,
         cpu_weight: &mut i64,
     ) -> Result<(), ChainError> {
+        self.dependency_system_read(SystemKey::ResourceLimits(account_name));
         let s = &self.backend;
         let (r, n, c) = s.account_limits(account_name).ok_or_else(|| {
             ChainError::InternalError(format!("resource limits not found: {account_name}"))
@@ -2373,6 +3842,7 @@ impl Database {
     }
 
     pub fn get_total_cpu_weight(&self) -> Result<u64, ChainError> {
+        self.dependency_system_read(SystemKey::ResourceState);
         let s = &self.backend;
         return s
             .state_total_weights()
@@ -2381,6 +3851,7 @@ impl Database {
     }
 
     pub fn get_total_net_weight(&self) -> Result<u64, ChainError> {
+        self.dependency_system_read(SystemKey::ResourceState);
         let s = &self.backend;
         return s
             .state_total_weights()
@@ -2393,6 +3864,10 @@ impl Database {
         name: u64,
         greylist_limit: u32,
     ) -> Result<NetLimitResult, ChainError> {
+        self.dependency_system_read(SystemKey::ResourceLimits(name));
+        self.dependency_system_read(SystemKey::ResourceUsage(name));
+        self.dependency_system_read(SystemKey::ResourceConfig);
+        self.dependency_system_read(SystemKey::ResourceState);
         let s = &self.backend;
         let (limit, greylisted) = s.account_net_limit(name, greylist_limit).ok_or_else(|| {
             ChainError::InternalError(format!("resource state not found for {name}"))
@@ -2405,6 +3880,10 @@ impl Database {
         name: u64,
         greylist_limit: u32,
     ) -> Result<CpuLimitResult, ChainError> {
+        self.dependency_system_read(SystemKey::ResourceLimits(name));
+        self.dependency_system_read(SystemKey::ResourceUsage(name));
+        self.dependency_system_read(SystemKey::ResourceConfig);
+        self.dependency_system_read(SystemKey::ResourceState);
         let s = &self.backend;
         let (limit, greylisted) = s.account_cpu_limit(name, greylist_limit).ok_or_else(|| {
             ChainError::InternalError(format!("resource state not found for {name}"))
@@ -2431,6 +3910,7 @@ impl Database {
         cpu_limit_parameters: &ElasticLimitParameters,
         net_limit_parameters: &ElasticLimitParameters,
     ) -> Result<(), ChainError> {
+        self.dependency_system_write(SystemKey::ResourceConfig);
         let s = &self.backend;
         return s
             .set_block_parameters(
@@ -2446,6 +3926,8 @@ impl Database {
     }
 
     pub fn process_block_usage(&mut self, block_num: u32) -> Result<(), ChainError> {
+        self.dependency_system_read(SystemKey::ResourceConfig);
+        self.dependency_system_write(SystemKey::ResourceState);
         let s = &self.backend;
         let (cpu, net) = s.resource_config_elastic().ok_or_else(|| {
             ChainError::InternalError("resource config not found for block usage".into())
@@ -2459,6 +3941,7 @@ impl Database {
     /// bills table-creation RAM only on the first row, so it decides existence
     /// against the arena rather than dereferencing a chainbase table pointer.
     pub fn arena_table_exists(&self, code: u64, scope: u64, table: u64) -> bool {
+        self.dependency_table_read(code, scope, table);
         {
             Some(&self.backend)
                 .map(|s| s.table_exists(code, scope, table))
@@ -2469,7 +3952,34 @@ impl Database {
     /// The payer to credit the table_id_object overhead when a table's last child
     /// is removed, or `None` if the table is absent.
     pub fn arena_table_payer(&self, code: u64, scope: u64, table: u64) -> Option<u64> {
+        self.dependency_table_read(code, scope, table);
         self.backend.table_payer(code, scope, table)
+    }
+
+    /// Create an empty contract table while hydrating a state-history full
+    /// snapshot. Contract tables with no children are valid chainbase state and
+    /// cannot be reconstructed by the lazy child-store paths.
+    pub(crate) fn xpr_import_create_contract_table(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        payer: u64,
+    ) -> Result<(), ChainError> {
+        self.backend
+            .create_table(code, scope, table, payer)
+            .map_err(|e| ChainError::InternalError(format!("XPR import contract table: {e:?}")))
+    }
+
+    pub(crate) fn xpr_import_remove_contract_table(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+    ) -> Result<(), ChainError> {
+        self.backend
+            .remove_table(code, scope, table)
+            .map_err(|e| ChainError::InternalError(format!("XPR remove contract table: {e:?}")))
     }
 
     /// The `(payer, value)` of a contract row from the arena, or `None`.
@@ -2481,7 +3991,158 @@ impl Database {
         table: u64,
         primary_key: u64,
     ) -> Option<(u64, Vec<u8>)> {
-        self.backend.kv_row(code, scope, table, primary_key)
+        self.dependency_exact_read(code, scope, table, ContractIndex::Primary, primary_key);
+        if !self.xpr_native_replay_enabled() {
+            return self.backend.kv_row(code, scope, table, primary_key);
+        }
+
+        let key = XprNativeRowKey {
+            code,
+            scope,
+            table,
+            primary_key,
+        };
+        {
+            let cache = self.xpr_native_rows.lock().unwrap();
+            if let Some(row) = cache.layers.iter().rev().find_map(|layer| layer.get(&key)) {
+                return Some(row.clone());
+            }
+            if let Some(row) = cache.dirty.get(&key) {
+                return Some(row.clone());
+            }
+            if let Some(row) = cache.base.get(&key) {
+                return row.clone();
+            }
+        }
+
+        let loaded = self.backend.kv_row(code, scope, table, primary_key);
+        self.xpr_native_rows
+            .lock()
+            .unwrap()
+            .base
+            .entry(key)
+            .or_insert_with(|| loaded.clone());
+        loaded
+    }
+
+    /// Stage a native-replay row rewrite in the current Arena undo layer. The
+    /// block commit coalesces repeated writes to the same key into one mutation.
+    pub fn xpr_native_update_key_value(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary_key: u64,
+        payer: u64,
+        buffer: &[u8],
+    ) -> Result<(), ChainError> {
+        self.ensure_contract_primary_not_frozen()?;
+        self.dependency_write(code, scope, table, ContractIndex::Primary, primary_key);
+        let key = XprNativeRowKey {
+            code,
+            scope,
+            table,
+            primary_key,
+        };
+        let mut cache = self.xpr_native_rows.lock().unwrap();
+        let layer = cache.layers.last_mut().ok_or_else(|| {
+            ChainError::InternalError(
+                "XPR native row update executed outside an Arena undo session".into(),
+            )
+        })?;
+        layer.insert(key, (payer, buffer.to_vec()));
+        Ok(())
+    }
+
+    /// Materialize staged native rows into the current Arena session. Called at
+    /// accepted-block commit and before any fallback to deployed WASM.
+    pub fn flush_xpr_native_rows(&self) -> Result<(), ChainError> {
+        if !self.xpr_native_replay_enabled() {
+            return Ok(());
+        }
+        let pending = {
+            let cache = self.xpr_native_rows.lock().unwrap();
+            let mut pending = cache.dirty.clone();
+            for layer in &cache.layers {
+                for (key, row) in layer {
+                    pending.insert(*key, row.clone());
+                }
+            }
+            pending
+        };
+        if pending.is_empty() {
+            // `try_apply` also calls this immediately before falling back to
+            // deployed WASM. Reads made while deciding that the native handler
+            // is inapplicable may have populated `base`; invalidate them even
+            // when there was nothing to materialize so the next native action
+            // observes the WASM transition.
+            self.xpr_native_rows.lock().unwrap().base.clear();
+            return Ok(());
+        }
+        let updates = pending
+            .iter()
+            .map(|(key, (payer, value))| crate::backend::ContractRowUpdate {
+                code: key.code,
+                scope: key.scope,
+                table: key.table,
+                primary_key: key.primary_key,
+                payer: *payer,
+                value: value.clone(),
+            })
+            .collect::<Vec<_>>();
+        self.backend
+            .update_key_value_objects(&updates)
+            .map_err(|error| {
+                ChainError::InternalError(format!("flush XPR native rows: {error:?}"))
+            })?;
+
+        let mut cache = self.xpr_native_rows.lock().unwrap();
+        for layer in &mut cache.layers {
+            layer.clear();
+        }
+        cache.dirty.clear();
+        cache.base.clear();
+        Ok(())
+    }
+
+    fn flush_xpr_native_sequences(&self) -> Result<(), ChainError> {
+        if !self.xpr_native_replay_enabled() {
+            return Ok(());
+        }
+        let (global, accounts) = {
+            let cache = self.xpr_native_sequences.lock().unwrap();
+            let mut global = cache.dirty_global;
+            let mut accounts = cache.dirty_accounts.clone();
+            for layer in &cache.layers {
+                if layer.global.is_some() {
+                    global = layer.global;
+                }
+                accounts.extend(layer.accounts.iter().map(|(&name, &value)| (name, value)));
+            }
+            (global, accounts)
+        };
+        let Some(global) = global else {
+            return Ok(());
+        };
+        let accounts = accounts
+            .into_iter()
+            .map(|(name, (recv, auth))| (name, recv, auth))
+            .collect::<Vec<_>>();
+        self.backend
+            .set_action_sequences(global, &accounts)
+            .map_err(|error| {
+                ChainError::InternalError(format!("flush XPR action sequences: {error:?}"))
+            })?;
+        let mut cache = self.xpr_native_sequences.lock().unwrap();
+        cache.base_global = None;
+        cache.base_accounts.clear();
+        cache.dirty_global = None;
+        cache.dirty_accounts.clear();
+        for layer in &mut cache.layers {
+            layer.global = None;
+            layer.accounts.clear();
+        }
+        Ok(())
     }
 
     /// Author a contract row in the arena alone (no chainbase). The arena's
@@ -2496,6 +4157,23 @@ impl Database {
         primary_key: u64,
         buffer: &[u8],
     ) -> Result<(), ChainError> {
+        self.ensure_contract_primary_not_frozen()?;
+        self.apply_speculative_primary_create(code, scope, table, payer, primary_key, buffer)?;
+        self.invalidate_standalone_key_value_read(code, scope, table, primary_key);
+        Ok(())
+    }
+
+    fn apply_speculative_primary_create(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        payer: u64,
+        primary_key: u64,
+        buffer: &[u8],
+    ) -> Result<(), ChainError> {
+        self.dependency_table_write(code, scope, table);
+        self.dependency_write(code, scope, table, ContractIndex::Primary, primary_key);
         let s = &self.backend;
         s.create_key_value_object(code, scope, table, payer, primary_key, buffer)
             .map_err(|e| ChainError::InternalError(format!("arena create_key_value_object: {e:?}")))
@@ -2511,6 +4189,22 @@ impl Database {
         payer: u64,
         buffer: &[u8],
     ) -> Result<(), ChainError> {
+        self.ensure_contract_primary_not_frozen()?;
+        self.apply_speculative_primary_update(code, scope, table, primary_key, payer, buffer)?;
+        self.invalidate_standalone_key_value_read(code, scope, table, primary_key);
+        Ok(())
+    }
+
+    fn apply_speculative_primary_update(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary_key: u64,
+        payer: u64,
+        buffer: &[u8],
+    ) -> Result<(), ChainError> {
+        self.dependency_write(code, scope, table, ContractIndex::Primary, primary_key);
         let s = &self.backend;
         s.update_key_value_object(code, scope, table, primary_key, payer, buffer)
             .map_err(|e| ChainError::InternalError(format!("arena update_key_value_object: {e:?}")))
@@ -2525,6 +4219,49 @@ impl Database {
         table: u64,
         primary_key: u64,
     ) -> Result<(), ChainError> {
+        self.ensure_contract_primary_not_frozen()?;
+        self.apply_speculative_primary_remove(code, scope, table, primary_key)?;
+        self.invalidate_standalone_key_value_read(code, scope, table, primary_key);
+        Ok(())
+    }
+
+    /// Keep the replay read-through cache coherent with ordinary Arena writes.
+    ///
+    /// Native rows are flushed before deployed WASM runs, but WASM can update a
+    /// row more than once in one action. Without invalidating `base`, the second
+    /// update observes the value that was loaded before the first update and
+    /// computes RAM billing from a stale size.
+    fn invalidate_standalone_key_value_read(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary_key: u64,
+    ) {
+        if !self.xpr_native_replay_enabled() {
+            return;
+        }
+        self.xpr_native_rows
+            .lock()
+            .unwrap()
+            .base
+            .remove(&XprNativeRowKey {
+                code,
+                scope,
+                table,
+                primary_key,
+            });
+    }
+
+    fn apply_speculative_primary_remove(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        primary_key: u64,
+    ) -> Result<(), ChainError> {
+        self.dependency_table_write(code, scope, table);
+        self.dependency_write(code, scope, table, ContractIndex::Primary, primary_key);
         let s = &self.backend;
         s.remove_key_value_object(code, scope, table, primary_key)
             .map_err(|e| ChainError::InternalError(format!("arena remove_key_value_object: {e:?}")))
@@ -2550,6 +4287,8 @@ impl Database {
         primary_key: u64,
         secondary_key: u64,
     ) -> Result<(), ChainError> {
+        self.dependency_table_write(code, scope, table);
+        self.dependency_write(code, scope, table, ContractIndex::Idx64, primary_key);
         self.backend_ref()?
             .create_index64_object(code, scope, table, payer, primary_key, secondary_key)
             .map_err(|e| ChainError::InternalError(format!("arena create_index64: {e:?}")))
@@ -2564,6 +4303,7 @@ impl Database {
         payer: u64,
         secondary_key: u64,
     ) -> Result<(), ChainError> {
+        self.dependency_write(code, scope, table, ContractIndex::Idx64, primary_key);
         self.backend_ref()?
             .update_index64_object(code, scope, table, primary_key, payer, secondary_key)
             .map_err(|e| ChainError::InternalError(format!("arena update_index64: {e:?}")))
@@ -2576,6 +4316,8 @@ impl Database {
         table: u64,
         primary_key: u64,
     ) -> Result<(), ChainError> {
+        self.dependency_table_write(code, scope, table);
+        self.dependency_write(code, scope, table, ContractIndex::Idx64, primary_key);
         self.backend_ref()?
             .remove_index64_object(code, scope, table, primary_key)
             .map_err(|e| ChainError::InternalError(format!("arena remove_index64: {e:?}")))
@@ -2588,6 +4330,7 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<u64> {
+        self.dependency_exact_read(code, scope, table, ContractIndex::Idx64, primary);
         Some(&self.backend).and_then(|s| s.idx64_payer(code, scope, table, primary))
     }
 
@@ -2600,6 +4343,8 @@ impl Database {
         primary_key: u64,
         secondary_key: u128,
     ) -> Result<(), ChainError> {
+        self.dependency_table_write(code, scope, table);
+        self.dependency_write(code, scope, table, ContractIndex::Idx128, primary_key);
         self.backend_ref()?
             .create_index128_object(code, scope, table, payer, primary_key, secondary_key)
             .map_err(|e| ChainError::InternalError(format!("arena create_index128: {e:?}")))
@@ -2614,6 +4359,7 @@ impl Database {
         payer: u64,
         secondary_key: u128,
     ) -> Result<(), ChainError> {
+        self.dependency_write(code, scope, table, ContractIndex::Idx128, primary_key);
         self.backend_ref()?
             .update_index128_object(code, scope, table, primary_key, payer, secondary_key)
             .map_err(|e| ChainError::InternalError(format!("arena update_index128: {e:?}")))
@@ -2626,6 +4372,8 @@ impl Database {
         table: u64,
         primary_key: u64,
     ) -> Result<(), ChainError> {
+        self.dependency_table_write(code, scope, table);
+        self.dependency_write(code, scope, table, ContractIndex::Idx128, primary_key);
         self.backend_ref()?
             .remove_index128_object(code, scope, table, primary_key)
             .map_err(|e| ChainError::InternalError(format!("arena remove_index128: {e:?}")))
@@ -2638,6 +4386,7 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<u64> {
+        self.dependency_exact_read(code, scope, table, ContractIndex::Idx128, primary);
         Some(&self.backend).and_then(|s| s.idx128_payer(code, scope, table, primary))
     }
 
@@ -2650,6 +4399,8 @@ impl Database {
         primary_key: u64,
         secondary_key: U256,
     ) -> Result<(), ChainError> {
+        self.dependency_table_write(code, scope, table);
+        self.dependency_write(code, scope, table, ContractIndex::Idx256, primary_key);
         self.backend_ref()?
             .create_index256_object(code, scope, table, payer, primary_key, secondary_key.value)
             .map_err(|e| ChainError::InternalError(format!("arena create_index256: {e:?}")))
@@ -2664,6 +4415,7 @@ impl Database {
         payer: u64,
         secondary_key: U256,
     ) -> Result<(), ChainError> {
+        self.dependency_write(code, scope, table, ContractIndex::Idx256, primary_key);
         self.backend_ref()?
             .update_index256_object(code, scope, table, primary_key, payer, secondary_key.value)
             .map_err(|e| ChainError::InternalError(format!("arena update_index256: {e:?}")))
@@ -2676,6 +4428,8 @@ impl Database {
         table: u64,
         primary_key: u64,
     ) -> Result<(), ChainError> {
+        self.dependency_table_write(code, scope, table);
+        self.dependency_write(code, scope, table, ContractIndex::Idx256, primary_key);
         self.backend_ref()?
             .remove_index256_object(code, scope, table, primary_key)
             .map_err(|e| ChainError::InternalError(format!("arena remove_index256: {e:?}")))
@@ -2688,6 +4442,7 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<u64> {
+        self.dependency_exact_read(code, scope, table, ContractIndex::Idx256, primary);
         Some(&self.backend).and_then(|s| s.idx256_payer(code, scope, table, primary))
     }
 
@@ -2700,6 +4455,8 @@ impl Database {
         primary_key: u64,
         secondary_key: u64,
     ) -> Result<(), ChainError> {
+        self.dependency_table_write(code, scope, table);
+        self.dependency_write(code, scope, table, ContractIndex::IdxDouble, primary_key);
         self.backend_ref()?
             .create_idx_double_object(code, scope, table, payer, primary_key, secondary_key)
             .map_err(|e| ChainError::InternalError(format!("arena create_idx_double: {e:?}")))
@@ -2714,6 +4471,7 @@ impl Database {
         payer: u64,
         secondary_key: u64,
     ) -> Result<(), ChainError> {
+        self.dependency_write(code, scope, table, ContractIndex::IdxDouble, primary_key);
         self.backend_ref()?
             .update_idx_double_object(code, scope, table, primary_key, payer, secondary_key)
             .map_err(|e| ChainError::InternalError(format!("arena update_idx_double: {e:?}")))
@@ -2726,6 +4484,8 @@ impl Database {
         table: u64,
         primary_key: u64,
     ) -> Result<(), ChainError> {
+        self.dependency_table_write(code, scope, table);
+        self.dependency_write(code, scope, table, ContractIndex::IdxDouble, primary_key);
         self.backend_ref()?
             .remove_idx_double_object(code, scope, table, primary_key)
             .map_err(|e| ChainError::InternalError(format!("arena remove_idx_double: {e:?}")))
@@ -2738,6 +4498,7 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<u64> {
+        self.dependency_exact_read(code, scope, table, ContractIndex::IdxDouble, primary);
         Some(&self.backend).and_then(|s| s.idx_double_payer(code, scope, table, primary))
     }
 
@@ -2750,6 +4511,14 @@ impl Database {
         primary_key: u64,
         secondary_key: Float128,
     ) -> Result<(), ChainError> {
+        self.dependency_table_write(code, scope, table);
+        self.dependency_write(
+            code,
+            scope,
+            table,
+            ContractIndex::IdxLongDouble,
+            primary_key,
+        );
         self.backend_ref()?
             .create_idx_long_double_object(
                 code,
@@ -2771,6 +4540,13 @@ impl Database {
         payer: u64,
         secondary_key: Float128,
     ) -> Result<(), ChainError> {
+        self.dependency_write(
+            code,
+            scope,
+            table,
+            ContractIndex::IdxLongDouble,
+            primary_key,
+        );
         self.backend_ref()?
             .update_idx_long_double_object(
                 code,
@@ -2790,6 +4566,14 @@ impl Database {
         table: u64,
         primary_key: u64,
     ) -> Result<(), ChainError> {
+        self.dependency_table_write(code, scope, table);
+        self.dependency_write(
+            code,
+            scope,
+            table,
+            ContractIndex::IdxLongDouble,
+            primary_key,
+        );
         self.backend_ref()?
             .remove_idx_long_double_object(code, scope, table, primary_key)
             .map_err(|e| ChainError::InternalError(format!("arena remove_idx_long_double: {e:?}")))
@@ -2802,10 +4586,12 @@ impl Database {
         table: u64,
         primary: u64,
     ) -> Option<u64> {
+        self.dependency_exact_read(code, scope, table, ContractIndex::IdxLongDouble, primary);
         Some(&self.backend).and_then(|s| s.idx_long_double_payer(code, scope, table, primary))
     }
 
     pub fn is_account(&self, account: u64) -> Result<bool, ChainError> {
+        self.dependency_system_read(SystemKey::Account(account));
         let s = &self.backend;
         return Ok(s.account_exists(account));
     }
@@ -2814,15 +4600,54 @@ impl Database {
     /// as owned scalars from the Rust database. Both feed the receipt digest.
     /// Errors when the account has no metadata.
     pub fn account_metadata_code_abi_sequence(&self, name: u64) -> Result<(u64, u64), ChainError> {
+        self.dependency_system_read(SystemKey::AccountMetadata(name));
         let s = &self.backend;
         return s.account_metadata(name).map(|t| (t.3, t.4)).ok_or_else(|| {
             ChainError::InternalError(format!("account metadata not found for account: {}", name))
         });
     }
 
+    /// Metadata needed by `ApplyContext::exec_one`, coalesced so the common
+    /// receiver == action-account case performs one indexed Arena lookup.
+    pub fn action_execution_metadata(
+        &self,
+        receiver: u64,
+        action_account: u64,
+    ) -> Result<ActionExecutionMetadata, ChainError> {
+        self.dependency_system_read(SystemKey::AccountMetadata(receiver));
+        let receiver_metadata = self.backend.account_metadata(receiver).ok_or_else(|| {
+            ChainError::InternalError(format!(
+                "account metadata not found for account: {}",
+                Name::new(receiver)
+            ))
+        })?;
+        let action_metadata = if receiver == action_account {
+            receiver_metadata
+        } else {
+            self.dependency_system_read(SystemKey::AccountMetadata(action_account));
+            self.backend
+                .account_metadata(action_account)
+                .ok_or_else(|| {
+                    ChainError::InternalError(format!(
+                        "account metadata not found for account: {}",
+                        Name::new(action_account)
+                    ))
+                })?
+        };
+        Ok(ActionExecutionMetadata {
+            privileged: receiver_metadata.0,
+            code_hash: receiver_metadata.5,
+            vm_type: receiver_metadata.6,
+            vm_version: receiver_metadata.7,
+            code_sequence: action_metadata.3,
+            abi_sequence: action_metadata.4,
+        })
+    }
+
     /// Whether `name` is a privileged account. A plain bool read off
     /// account_metadata. Errors when the account has no metadata.
     pub fn is_account_privileged(&self, name: u64) -> Result<bool, ChainError> {
+        self.dependency_system_read(SystemKey::AccountMetadata(name));
         let s = &self.backend;
         return s.account_metadata_privileged(name).ok_or_else(|| {
             ChainError::InternalError(format!("account metadata not found for account: {}", name))
@@ -2833,6 +4658,7 @@ impl Database {
     /// setcode reads off `account_metadata` to decide whether code is deployed
     /// and to locate the old code object.
     pub fn account_code_hash_vm(&self, name: u64) -> Result<([u8; 32], u8, u8), ChainError> {
+        self.dependency_system_read(SystemKey::AccountMetadata(name));
         let s = &self.backend;
         return s
             .account_metadata(name)
@@ -2845,9 +4671,19 @@ impl Database {
             });
     }
 
+    /// The full code metadata tuple exposed by Leap's `get_code_hash` intrinsic.
+    pub fn account_code_info(&self, name: u64) -> Result<(u64, [u8; 32], u8, u8), ChainError> {
+        self.dependency_system_read(SystemKey::AccountMetadata(name));
+        let s = &self.backend;
+        Ok(s.account_metadata(name)
+            .map(|t| (t.3, t.5, t.6, t.7))
+            .unwrap_or((0, [0; 32], 0, 0)))
+    }
+
     /// The byte size of the account's stored ABI — what setabi bills RAM against.
     /// A plain length read from the account row.
     pub fn account_abi_size(&self, name: u64) -> Result<usize, ChainError> {
+        self.dependency_system_read(SystemKey::Account(name));
         let s = &self.backend;
         return s
             .account_abi_size(name)
@@ -2855,6 +4691,15 @@ impl Database {
     }
 
     pub fn delete_auth(&mut self, account: u64, permission_name: u64) -> Result<i64, ChainError> {
+        self.dependency_system_range_read(SystemRangeKey::PermissionsByOwner(account));
+        self.dependency_system_write(SystemKey::Permission {
+            owner: account,
+            name: permission_name,
+        });
+        self.dependency_system_write(SystemKey::PermissionUsage {
+            owner: account,
+            name: permission_name,
+        });
         // A permission with children cannot be removed — chainbase enforced this
         // via the by-parent index; the arena checks the same by name.
         let has_children = self
@@ -2921,6 +4766,11 @@ impl Database {
         requirement_name: u64,
         requirement_type: u64,
     ) -> Result<i64, ChainError> {
+        self.dependency_system_write(SystemKey::PermissionLink {
+            account: account_name,
+            code: code_name,
+            message_type: requirement_type,
+        });
         // The link's message_type is the requirement_type and its
         // required_permission is the requirement_name. Creating a new link bills
         // `billable_size_v<permission_link_object>`; updating an existing one to a
@@ -2951,6 +4801,11 @@ impl Database {
         code_name: u64,
         requirement_type: u64,
     ) -> Result<i64, ChainError> {
+        self.dependency_system_write(SystemKey::PermissionLink {
+            account: account_name,
+            code: code_name,
+            message_type: requirement_type,
+        });
         // Removing an existing link refunds `billable_size_v<permission_link_object>`
         // (apply_pulse_unlinkauth); a missing link is a no-op.
         let existed = self
@@ -2967,6 +4822,119 @@ impl Database {
         })
     }
 
+    /// Retain the source protocol-feature vector in Arena so its SHiP
+    /// `protocol_state` row remains lossless during XPR migration.
+    pub(crate) fn xpr_import_protocol_features(
+        &self,
+        features: &[([u8; 32], u32)],
+    ) -> Result<(), ChainError> {
+        self.backend
+            .xpr_import_protocol_features(features)
+            .map_err(|e| ChainError::InternalError(format!("XPR import protocol state: {e:?}")))
+    }
+
+    /// Ordered protocol features waiting for a block-header activation.
+    pub fn preactivated_protocol_features(&self) -> Vec<[u8; 32]> {
+        self.dependency_system_read(SystemKey::PreactivatedProtocolFeatures);
+        self.backend.preactivated_protocol_features()
+    }
+
+    /// Queue a feature from the privileged `preactivate_feature` intrinsic.
+    pub fn preactivate_protocol_feature(&self, feature_digest: [u8; 32]) -> Result<(), ChainError> {
+        self.dependency_system_write(SystemKey::PreactivatedProtocolFeatures);
+        let spec = protocol_feature_spec(feature_digest).ok_or_else(|| {
+            ChainError::InternalError(format!(
+                "unrecognized protocol feature {}",
+                hex::encode(feature_digest)
+            ))
+        })?;
+        if !spec.preactivation_required {
+            return Err(ChainError::InternalError(format!(
+                "protocol feature {} does not support preactivation",
+                hex::encode(feature_digest)
+            )));
+        }
+        let queued = self.preactivated_protocol_features();
+        for dependency in spec.dependencies {
+            let dependency_digest = parse_protocol_feature_digest(dependency);
+            if !self.protocol_feature_activated(dependency_digest)
+                && !queued.contains(&dependency_digest)
+            {
+                return Err(ChainError::InternalError(format!(
+                    "protocol feature {} requires dependency {}",
+                    hex::encode(feature_digest),
+                    dependency
+                )));
+            }
+        }
+        self.backend
+            .preactivate_protocol_feature(feature_digest)
+            .map_err(|e| ChainError::InternalError(format!("arena preactivate feature: {e:?}")))
+    }
+
+    /// Apply a block's protocol-feature activation extension atomically.
+    pub fn activate_protocol_features(
+        &self,
+        feature_digests: &[[u8; 32]],
+        activation_block_num: u32,
+    ) -> Result<(), ChainError> {
+        self.dependency_system_write(SystemKey::PreactivatedProtocolFeatures);
+        for feature_digest in feature_digests {
+            self.dependency_system_write(SystemKey::ProtocolFeature(*feature_digest));
+        }
+        let queued = self.preactivated_protocol_features();
+        if queued
+            .iter()
+            .any(|digest| !feature_digests.contains(digest))
+        {
+            return Err(ChainError::BlockError(
+                "protocol feature activation must include the complete preactivation queue"
+                    .to_string(),
+            ));
+        }
+        for (index, feature_digest) in feature_digests.iter().enumerate() {
+            let spec = protocol_feature_spec(*feature_digest).ok_or_else(|| {
+                ChainError::BlockError(format!(
+                    "unrecognized protocol feature {}",
+                    hex::encode(feature_digest)
+                ))
+            })?;
+            if feature_digests[..index].contains(feature_digest) {
+                return Err(ChainError::BlockError(format!(
+                    "protocol feature activation contains duplicate {}",
+                    hex::encode(feature_digest)
+                )));
+            }
+            if self.protocol_feature_activated(*feature_digest) {
+                return Err(ChainError::BlockError(format!(
+                    "protocol feature {} is already activated",
+                    hex::encode(feature_digest)
+                )));
+            }
+            if spec.preactivation_required && !queued.contains(feature_digest) {
+                return Err(ChainError::BlockError(format!(
+                    "protocol feature {} requires prior preactivation",
+                    hex::encode(feature_digest)
+                )));
+            }
+            for dependency in spec.dependencies {
+                let dependency_digest = parse_protocol_feature_digest(dependency);
+                let active = self.protocol_feature_activated(dependency_digest);
+                let earlier_in_block = feature_digests[..index].contains(&dependency_digest);
+                if !active && !earlier_in_block {
+                    return Err(ChainError::BlockError(format!(
+                        "protocol feature {} requires dependency {} to be active earlier",
+                        hex::encode(feature_digest),
+                        dependency
+                    )));
+                }
+            }
+        }
+        self.backend
+            .activate_protocol_features(feature_digests, activation_block_num)
+            .map_err(|e| ChainError::BlockError(format!("protocol feature activation: {e:?}")))
+    }
+
     /// The wasm image for `(code_hash, vm_type, vm_version)` as owned bytes.
     ///
     /// This is the bytecode the VM compiles and runs, served from the arena as
@@ -2977,6 +4945,7 @@ impl Database {
         vm_type: u8,
         vm_version: u8,
     ) -> Result<Vec<u8>, ChainError> {
+        self.dependency_system_read(SystemKey::Code(*code_hash));
         self.backend
             .code_by_hash(*code_hash, vm_type, vm_version)
             .ok_or_else(|| ChainError::InternalError("code object not found".to_string()))
@@ -2988,6 +4957,7 @@ impl Database {
     /// inside this method, so no database-bound reference escapes into execution.
     /// The returned sequence lands in the `ActionReceipt` digest.
     pub fn next_recv_sequence(&mut self, receiver: u64) -> Result<u64, ChainError> {
+        self.dependency_system_write(SystemKey::AccountMetadata(receiver));
         let s = &self.backend;
         return s
             .next_recv_sequence(receiver)
@@ -3001,6 +4971,7 @@ impl Database {
     }
 
     pub fn next_auth_sequence(&mut self, actor: u64) -> Result<u64, ChainError> {
+        self.dependency_system_write(SystemKey::AccountMetadata(actor));
         let s = &self.backend;
         s.next_auth_sequence(actor)
             .map_err(|e| ChainError::InternalError(format!("arena next_auth_sequence: {e:?}")))?;
@@ -3014,6 +4985,7 @@ impl Database {
     }
 
     pub fn next_global_sequence(&mut self) -> Result<u64, ChainError> {
+        self.dependency_system_write(SystemKey::GlobalActionSequence);
         let s = &self.backend;
         // Chainbase does ++global_action_sequence and returns it; the database
         // stores that post-increment value, so the arena authors the next by
@@ -3028,7 +5000,110 @@ impl Database {
         return Ok(next);
     }
 
+    /// Advance the global, receiver, and authority counters for a single action
+    /// receipt in one arena critical section.
+    pub fn next_action_sequences(
+        &mut self,
+        receiver: u64,
+        auth_actors: &[u64],
+    ) -> Result<(u64, u64, Vec<u64>), ChainError> {
+        self.dependency_system_write(SystemKey::GlobalActionSequence);
+        self.dependency_system_write(SystemKey::AccountMetadata(receiver));
+        for actor in auth_actors {
+            self.dependency_system_write(SystemKey::AccountMetadata(*actor));
+        }
+        if self.xpr_native_replay_enabled() {
+            let mut cache = self.xpr_native_sequences.lock().unwrap();
+            let current_global = cache
+                .layers
+                .iter()
+                .rev()
+                .find_map(|layer| layer.global)
+                .or(cache.dirty_global)
+                .or(cache.base_global)
+                .unwrap_or_else(|| {
+                    let value = self.backend.global_action_sequence().unwrap_or(0);
+                    cache.base_global = Some(value);
+                    value
+                });
+            let next_global = current_global.checked_add(1).ok_or_else(|| {
+                ChainError::InternalError("global action sequence overflow".into())
+            })?;
+
+            let current_account = |cache: &XprNativeSequenceCache, name: u64| {
+                cache
+                    .layers
+                    .iter()
+                    .rev()
+                    .find_map(|layer| layer.accounts.get(&name).copied())
+                    .or_else(|| cache.dirty_accounts.get(&name).copied())
+                    .or_else(|| cache.base_accounts.get(&name).copied())
+            };
+            let load_account = |name: u64| {
+                self.backend
+                    .account_metadata(name)
+                    .map(|metadata| (metadata.1, metadata.2))
+                    .ok_or_else(|| {
+                        ChainError::InternalError(format!(
+                            "account metadata missing while advancing receipt sequences for {}",
+                            Name::new(name)
+                        ))
+                    })
+            };
+
+            let (recv, auth) = match current_account(&cache, receiver) {
+                Some(sequences) => sequences,
+                None => {
+                    let sequences = load_account(receiver)?;
+                    cache.base_accounts.insert(receiver, sequences);
+                    sequences
+                }
+            };
+            let next_recv = recv.wrapping_add(1);
+            let layer = cache.layers.last_mut().ok_or_else(|| {
+                ChainError::InternalError(
+                    "XPR action sequence advanced outside an Arena undo session".into(),
+                )
+            })?;
+            layer.global = Some(next_global);
+            layer.accounts.insert(receiver, (next_recv, auth));
+
+            let mut auth_sequences = Vec::with_capacity(auth_actors.len());
+            for &actor in auth_actors {
+                let (recv, auth) = match current_account(&cache, actor) {
+                    Some(sequences) => sequences,
+                    None => {
+                        let sequences = load_account(actor)?;
+                        cache.base_accounts.insert(actor, sequences);
+                        sequences
+                    }
+                };
+                let next_auth = auth.wrapping_add(1);
+                cache
+                    .layers
+                    .last_mut()
+                    .expect("sequence layer checked above")
+                    .accounts
+                    .insert(actor, (recv, next_auth));
+                auth_sequences.push(next_auth);
+            }
+            return Ok((next_global, next_recv, auth_sequences));
+        }
+        self.backend
+            .next_action_sequences(receiver, auth_actors)
+            .map_err(|error| {
+                ChainError::InternalError(format!("arena next_action_sequences: {error:?}"))
+            })?
+            .ok_or_else(|| {
+                ChainError::InternalError(format!(
+                    "account metadata missing while advancing receipt sequences for {}",
+                    Name::new(receiver)
+                ))
+            })
+    }
+
     pub fn get_global_action_sequence(&self) -> Result<u64, ChainError> {
+        self.dependency_system_read(SystemKey::GlobalActionSequence);
         Ok(self.backend.global_action_sequence().unwrap_or(0))
     }
 
@@ -3036,6 +5111,16 @@ impl Database {
     /// unwritten.
     pub fn arena_global_action_sequence(&self) -> Option<u64> {
         self.backend.global_action_sequence()
+    }
+
+    /// Restore the source chain's action-receipt sequence at migration.
+    pub fn xpr_import_global_action_sequence(&mut self, value: u64) -> Result<(), ChainError> {
+        self.dependency_system_write(SystemKey::GlobalActionSequence);
+        self.backend
+            .set_global_action_sequence(value)
+            .map_err(|error| {
+                ChainError::InternalError(format!("XPR import global action sequence: {error:?}"))
+            })
     }
 
     pub fn create_permission(
@@ -3046,6 +5131,15 @@ impl Database {
         auth: &Authority,
         creation_time: &TimePoint,
     ) -> Result<(), ChainError> {
+        self.dependency_system_write(SystemKey::PermissionSequence);
+        self.dependency_system_write(SystemKey::Permission {
+            owner: account,
+            name,
+        });
+        self.dependency_system_write(SystemKey::PermissionUsage {
+            owner: account,
+            name,
+        });
         let s = &self.backend;
         let authored = s
             .next_permission_id()
@@ -3068,6 +5162,10 @@ impl Database {
         authority: &Authority,
         pending_block_time: &TimePoint,
     ) -> Result<(), ChainError> {
+        self.dependency_system_write(SystemKey::Permission {
+            owner: actor,
+            name: permission,
+        });
         let s = &self.backend;
         return s
             .modify_permission(
@@ -3079,12 +5177,44 @@ impl Database {
             .map_err(|e| ChainError::InternalError(format!("arena modify_permission: {e:?}")));
     }
 
+    /// Replace only the producer permission's authority. Leap performs this
+    /// maintenance directly on `permission_object::auth`; unlike `updateauth`,
+    /// it must not change `last_updated`.
+    pub fn modify_permission_authority(
+        &mut self,
+        actor: u64,
+        permission: u64,
+        authority: &Authority,
+    ) -> Result<(), ChainError> {
+        self.dependency_system_write(SystemKey::Permission {
+            owner: actor,
+            name: permission,
+        });
+        self.backend
+            .modify_permission_authority(actor, permission, &encode_authority(authority))
+            .map_err(|e| {
+                ChainError::InternalError(format!(
+                    "arena modify producer permission authority: {e:?}"
+                ))
+            })
+    }
+
     pub fn update_permission_usage(
         &mut self,
         actor: u64,
         permission: u64,
         pending_block_time: &TimePoint,
     ) -> Result<(), ChainError> {
+        // The usage row is reached through the permission's stored usage id,
+        // so a delete/recreate of the permission invalidates this observation.
+        self.dependency_system_read(SystemKey::Permission {
+            owner: actor,
+            name: permission,
+        });
+        self.dependency_system_write(SystemKey::PermissionUsage {
+            owner: actor,
+            name: permission,
+        });
         let s = &self.backend;
         return s
             .update_permission_usage(actor, permission, pending_block_time.elapsed.count)
@@ -3094,9 +5224,35 @@ impl Database {
     }
 
     pub fn set_global_properties(&self, cfg: &ChainConfigV0) -> Result<(), ChainError> {
+        self.dependency_system_write(SystemKey::ChainConfig);
         self.backend
             .set_global_properties(chain_config_params_from_v0(cfg))
             .map_err(|e| ChainError::InternalError(format!("arena set_global_properties: {e:?}")))
+    }
+
+    pub fn set_proposed_schedule(
+        &self,
+        block_num: u32,
+        packed_schedule: &[u8],
+    ) -> Result<(), ChainError> {
+        self.dependency_system_write(SystemKey::ProposedSchedule);
+        self.backend
+            .set_proposed_schedule(block_num, packed_schedule)
+            .map_err(|error| {
+                ChainError::InternalError(format!("arena set_proposed_schedule: {error:?}"))
+            })
+    }
+
+    pub fn proposed_schedule(&self) -> Option<(u32, Vec<u8>)> {
+        self.dependency_system_read(SystemKey::ProposedSchedule);
+        self.backend.proposed_schedule()
+    }
+
+    pub fn clear_proposed_schedule(&self) -> Result<(), ChainError> {
+        self.dependency_system_write(SystemKey::ProposedSchedule);
+        self.backend.clear_proposed_schedule().map_err(|error| {
+            ChainError::InternalError(format!("arena clear_proposed_schedule: {error:?}"))
+        })
     }
 
     /// `max_action_return_value_size` — a genesis build constant (256) that
@@ -3109,6 +5265,7 @@ impl Database {
     /// The active runtime `chain_config`, served as an owned value from the
     /// arena's `global_property_object` representation.
     pub fn chain_config(&self) -> Result<ChainConfigV0, ChainError> {
+        self.dependency_system_read(SystemKey::ChainConfig);
         let s = &self.backend;
         let p = s
             .chain_config_params()
@@ -3122,7 +5279,17 @@ impl Database {
         Some(self.backend.global_property_state_bytes())
     }
 
+    pub fn arena_protocol_state_bytes(&self) -> Option<Vec<u8>> {
+        Some(self.backend.protocol_state_bytes())
+    }
+
+    pub fn protocol_feature_activated(&self, feature_digest: [u8; 32]) -> bool {
+        self.dependency_system_read(SystemKey::ProtocolFeature(feature_digest));
+        self.backend.protocol_feature_activated(feature_digest)
+    }
+
     pub fn get_virtual_block_cpu_limit(&self) -> Result<u64, ChainError> {
+        self.dependency_system_read(SystemKey::ResourceState);
         let s = &self.backend;
         return s
             .state_virtual_limits()
@@ -3131,6 +5298,7 @@ impl Database {
     }
 
     pub fn get_virtual_block_net_limit(&self) -> Result<u64, ChainError> {
+        self.dependency_system_read(SystemKey::ResourceState);
         let s = &self.backend;
         return s
             .state_virtual_limits()
@@ -3139,6 +5307,7 @@ impl Database {
     }
 
     pub fn get_block_cpu_limit(&self) -> Result<u64, ChainError> {
+        self.dependency_system_read(SystemKey::ResourceState);
         let s = &self.backend;
         return s
             .block_limits()
@@ -3147,6 +5316,7 @@ impl Database {
     }
 
     pub fn get_block_net_limit(&self) -> Result<u64, ChainError> {
+        self.dependency_system_read(SystemKey::ResourceState);
         let s = &self.backend;
         return s
             .block_limits()
@@ -3155,6 +5325,7 @@ impl Database {
     }
 
     pub fn is_known_unexpired_transaction(&self, trx_id: &[u8; 32]) -> Result<bool, ChainError> {
+        self.dependency_system_read(SystemKey::Transaction(*trx_id));
         Ok(self.backend.transaction_exists(*trx_id))
     }
 
@@ -3163,6 +5334,7 @@ impl Database {
         trx_id: &[u8; 32],
         expiration: u32,
     ) -> Result<(), ChainError> {
+        self.dependency_system_write(SystemKey::Transaction(*trx_id));
         self.backend
             .record_transaction(*trx_id, expiration)
             .map_err(|e| ChainError::InternalError(format!("arena record_transaction: {e:?}")))
@@ -3170,6 +5342,7 @@ impl Database {
 
     /// Whether the arena holds a dedupe row for `trx_id`.
     pub fn arena_transaction_exists(&self, trx_id: &[u8; 32]) -> bool {
+        self.dependency_system_read(SystemKey::Transaction(*trx_id));
         self.backend.transaction_exists(*trx_id)
     }
 
@@ -3709,7 +5882,10 @@ impl Database {
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
+    use std::{
+        collections::BTreeSet,
+        str::FromStr,
+    };
 
     use pulsevm_name::Name;
     use tempfile::TempDir;
@@ -3723,6 +5899,87 @@ mod tests {
         let mut db = Database::new(path, 1024 * 1024 * 1024).unwrap();
         let _name = Name::from_str("test").unwrap();
         db.add_indices().unwrap();
+    }
+
+    #[test]
+    fn protocol_feature_registry_enforces_dependencies_and_queue_order() {
+        let db = Database::default();
+        let unknown = [0xa5; 32];
+        assert!(matches!(
+            db.preactivate_protocol_feature(unknown),
+            Err(ChainError::InternalError(message)) if message.contains("unrecognized protocol feature")
+        ));
+
+        let replace_deferred = parse_protocol_feature_digest(
+            "ef43112c6543b88db2283a2e077278c315ae2c84719a8b25f25cc88565fbea99",
+        );
+        let no_duplicate_deferred_id = parse_protocol_feature_digest(
+            "4a90c00d55454dc5b059055ca213579c6ea856967712a56017487886a4d4cc0f",
+        );
+        let preactivate_feature = parse_protocol_feature_digest(
+            "0ec7e080177b2c02b278d5088611686b49d739925a92d9bfcacd7fc6b74053bd",
+        );
+        db.activate_protocol_features(&[preactivate_feature], 1)
+            .unwrap();
+        assert!(db.protocol_feature_activated(preactivate_feature));
+        assert!(
+            db.preactivate_protocol_feature(no_duplicate_deferred_id)
+                .is_err()
+        );
+        db.preactivate_protocol_feature(replace_deferred).unwrap();
+        db.preactivate_protocol_feature(no_duplicate_deferred_id)
+            .unwrap();
+
+        assert!(
+            db.activate_protocol_features(&[no_duplicate_deferred_id, replace_deferred], 1)
+                .is_err()
+        );
+        db.activate_protocol_features(&[replace_deferred, no_duplicate_deferred_id], 1)
+            .unwrap();
+        assert!(db.protocol_feature_activated(replace_deferred));
+        assert!(db.protocol_feature_activated(no_duplicate_deferred_id));
+        assert!(db.preactivated_protocol_features().is_empty());
+    }
+
+    #[test]
+    fn protocol_feature_registry_matches_xpr_canonical_feature_digests() {
+        // These are the feature_digest values returned by Leap's
+        // get_activated_protocol_features API on XPR, not its separate
+        // description_digest values. Keeping this list here prevents a
+        // description hash from silently becoming the runtime gate key again.
+        let xpr_features = [
+            "0ec7e080177b2c02b278d5088611686b49d739925a92d9bfcacd7fc6b74053bd",
+            "f0af56d2c5a48d60a4a5b5c903edfb7db3a736a94ed589d0b797df33ff9d3e1d",
+            "2652f5f96006294109b3dd0bbde63693f55324af452b799ee137a81a905eed25",
+            "8ba52fe7a3956c5cd3a656a3174b931d3bb2abb45578befc59f283ecd816a405",
+            "ad9e3d8f650687709fd68f4b90b41f7d825a365b02c23a636cef88ac2ac00c43",
+            "68dcaa34c0517d19666e6b33add67351d8c5f69e999ca1e37931bc410a297428",
+            "e0fb64b1085cc5538970158d05a009c24e276fb94e1a0bf6a528b48fbc4ff526",
+            "ef43112c6543b88db2283a2e077278c315ae2c84719a8b25f25cc88565fbea99",
+            "4a90c00d55454dc5b059055ca213579c6ea856967712a56017487886a4d4cc0f",
+            "1a99a59d87e06e09ec5b028a9cbb7749b4a5ad8819004365d02dc4379a8b7241",
+            "4e7bf348da00a945489b2a681749eb56f5de00b900014e137ddae39f48f69d67",
+            "4fca8bd82bbd181e714e283f83e1b45d95ca5af40fb89ad3977b653c448f78c2",
+            "299dcb6af692324b899b39f16d5a530a33062804e41f09dc97e9f156b4476707",
+            "c3a6138c5061cf291310887c0b5c71fcaffeab90d5deb50d3b9e687cead45071",
+            "5443fcf88330c586bc0e5f3dee10e7f63c76c00249c87fe4fbf7f38c082006b4",
+            "d528b9f6e9693f45ed277af93474fd473ce7d831dae2180cca35d907bd10cb40",
+            "bcd2a26394b36614fd4894241d3c451ab0f6fd110958c3423073621a70826e99",
+            "6bcb40a24e49c26d0a60513b6aeb8551d264e4717f306b81a37a5afb3b47cedc",
+            "35c2186cc36f7bb4aeaf4487b36e57039ccf45a9136aa856a5d569ecca55ef2b",
+        ];
+        for digest in xpr_features {
+            assert!(
+                protocol_feature_spec(parse_protocol_feature_digest(digest)).is_some(),
+                "XPR canonical feature digest {digest} is not registered"
+            );
+        }
+        assert!(
+            protocol_feature_spec(parse_protocol_feature_digest(
+                "9908b3f8413c8474ab2a6be149d3f4f6d0421d37886033f27d4759c47a26d944"
+            ))
+            .is_none()
+        );
     }
 
     #[test]
@@ -3889,6 +6146,251 @@ mod tests {
     }
 
     #[test]
+    fn authority_cache_keys_entries_by_complete_blob() {
+        let db = Database::default();
+        let read = db.read().unwrap();
+        let first = Authority::new(1, Vec::new(), Vec::new(), Vec::new());
+        let second = Authority::new(2, Vec::new(), Vec::new(), Vec::new());
+        let first_blob = encode_authority(&first);
+        let second_blob = encode_authority(&second);
+
+        assert_eq!(read.decode_authority_cached(&first_blob).unwrap(), first);
+        assert_eq!(read.decode_authority_cached(&first_blob).unwrap(), first);
+        assert_eq!(read.decode_authority_cached(&second_blob).unwrap(), second);
+        assert_eq!(read.authority_cache.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn native_xpr_replay_capability_is_default_off_and_shared_only_in_process() {
+        let database = Database::default();
+        let clone = database.clone();
+        assert!(!database.xpr_native_replay_enabled());
+        clone.enable_xpr_native_replay();
+        assert!(database.xpr_native_replay_enabled());
+
+        let independent = Database::default();
+        assert!(!independent.xpr_native_replay_enabled());
+    }
+
+    #[test]
+    fn native_xpr_rows_coalesce_and_follow_arena_undo() {
+        let mut database = Database::default();
+        database
+            .create_key_value_object_standalone(1, 1, 2, 7, 3, b"base")
+            .unwrap();
+        database.enable_xpr_native_replay();
+
+        database.arena_start_undo_session();
+        database
+            .xpr_native_update_key_value(1, 1, 2, 3, 7, b"first")
+            .unwrap();
+        database
+            .xpr_native_update_key_value(1, 1, 2, 3, 7, b"second")
+            .unwrap();
+        assert_eq!(database.arena_kv_row(1, 1, 2, 3).unwrap().1, b"second");
+        database.arena_undo();
+        assert_eq!(database.arena_kv_row(1, 1, 2, 3).unwrap().1, b"base");
+
+        // A WASM fallback materializes the overlay inside the active session;
+        // aborting that transaction must still restore the backend row.
+        database.arena_start_undo_session();
+        database
+            .xpr_native_update_key_value(1, 1, 2, 3, 7, b"materialized")
+            .unwrap();
+        database.flush_xpr_native_rows().unwrap();
+        assert_eq!(
+            database.arena_kv_row(1, 1, 2, 3).unwrap().1,
+            b"materialized"
+        );
+        database.arena_undo();
+        assert_eq!(database.arena_kv_row(1, 1, 2, 3).unwrap().1, b"base");
+
+        database.arena_start_undo_session();
+        database
+            .xpr_native_update_key_value(1, 1, 2, 3, 7, b"outer")
+            .unwrap();
+        database.xpr_native_start_row_session().unwrap();
+        database
+            .xpr_native_update_key_value(1, 1, 2, 3, 7, b"lightweight-discarded")
+            .unwrap();
+        database.xpr_native_undo_row_session().unwrap();
+        assert_eq!(database.arena_kv_row(1, 1, 2, 3).unwrap().1, b"outer");
+        database.xpr_native_start_row_session().unwrap();
+        database
+            .xpr_native_update_key_value(1, 1, 2, 3, 7, b"lightweight-squashed")
+            .unwrap();
+        database.xpr_native_squash_row_session().unwrap();
+        assert_eq!(
+            database.arena_kv_row(1, 1, 2, 3).unwrap().1,
+            b"lightweight-squashed"
+        );
+        database.arena_start_undo_session();
+        database
+            .xpr_native_update_key_value(1, 1, 2, 3, 7, b"discarded")
+            .unwrap();
+        database.arena_undo();
+        assert_eq!(
+            database.arena_kv_row(1, 1, 2, 3).unwrap().1,
+            b"lightweight-squashed"
+        );
+        database.arena_start_undo_session();
+        database
+            .xpr_native_update_key_value(1, 1, 2, 3, 7, b"final")
+            .unwrap();
+        database.arena_squash();
+        database.commit(1).unwrap();
+        assert_eq!(database.arena_kv_row(1, 1, 2, 3).unwrap().1, b"final");
+    }
+
+    #[test]
+    fn materialized_parent_native_rows_survive_nested_undo() {
+        let database = Database::default();
+        database
+            .create_key_value_object_standalone(1, 1, 2, 7, 3, b"base")
+            .unwrap();
+        database.enable_xpr_native_replay();
+
+        database.arena_start_undo_session();
+        database
+            .xpr_native_update_key_value(1, 1, 2, 3, 7, b"parent")
+            .unwrap();
+        database.flush_xpr_native_rows().unwrap();
+
+        database.arena_start_undo_session();
+        database
+            .xpr_native_update_key_value(1, 1, 2, 3, 7, b"child")
+            .unwrap();
+        database.flush_xpr_native_rows().unwrap();
+        database.arena_undo();
+
+        assert_eq!(database.arena_kv_row(1, 1, 2, 3).unwrap().1, b"parent");
+        database.arena_undo();
+        assert_eq!(database.arena_kv_row(1, 1, 2, 3).unwrap().1, b"base");
+    }
+
+    #[test]
+    fn native_xpr_inline_authorization_cache_is_block_scoped() {
+        let mut database = Database::default();
+        database.enable_xpr_native_replay();
+        let key = (1, 2, 3, 4, 5);
+
+        database.arena_start_undo_session();
+        database.cache_xpr_native_inline_authorization(key);
+        assert!(database.xpr_native_inline_authorization_cached(key));
+        database.commit(1).unwrap();
+        assert!(!database.xpr_native_inline_authorization_cached(key));
+
+        database.arena_start_undo_session();
+        database.cache_xpr_native_inline_authorization(key);
+        database.arena_undo();
+        assert!(!database.xpr_native_inline_authorization_cached(key));
+    }
+
+    #[test]
+    fn read_only_wasm_cache_invalidates_only_on_dependency_writes() {
+        let database = Database::default();
+        database
+            .create_key_value_object_standalone(10, 10, 1, 10, 1, b"dependency")
+            .unwrap();
+        database.enable_xpr_native_replay();
+        let code_hash = [0x5a; 32];
+
+        assert!(!database.xpr_read_only_wasm_cache_probe(code_hash, 30, 40, [50, 60]));
+        assert!(database.arena_kv_row(10, 10, 1, 1).is_some());
+        assert!(database.xpr_promote_read_only_wasm_cache(code_hash, 30, 40, [50, 60]));
+        assert!(database.xpr_read_only_wasm_cache_probe(code_hash, 30, 40, [50, 60]));
+
+        database
+            .create_key_value_object_standalone(99, 99, 1, 1, 99, b"unrelated")
+            .unwrap();
+        assert!(database.xpr_read_only_wasm_cache_probe(code_hash, 30, 40, [50, 60]));
+
+        database
+            .update_key_value_object_standalone(10, 10, 1, 1, 10, b"changed")
+            .unwrap();
+        assert!(!database.xpr_read_only_wasm_cache_probe(code_hash, 30, 40, [50, 60]));
+        database.xpr_cancel_read_only_wasm_capture();
+    }
+
+    #[test]
+    fn empty_native_flush_invalidates_reads_before_wasm_fallback() {
+        let database = Database::default();
+        database
+            .create_key_value_object_standalone(1, 1, 2, 7, 3, b"before")
+            .unwrap();
+        database.enable_xpr_native_replay();
+        database.arena_start_undo_session();
+
+        assert_eq!(database.arena_kv_row(1, 1, 2, 3).unwrap().1, b"before");
+        database.flush_xpr_native_rows().unwrap();
+        database
+            .backend
+            .update_key_value_object(1, 1, 2, 3, 7, b"after")
+            .unwrap();
+
+        assert_eq!(database.arena_kv_row(1, 1, 2, 3).unwrap().1, b"after");
+        database.arena_undo();
+    }
+
+    #[test]
+    fn standalone_writes_refresh_native_replay_row_cache() {
+        let database = Database::default();
+        database.enable_xpr_native_replay();
+        database.arena_start_undo_session();
+
+        assert_eq!(database.arena_kv_row(1, 1, 2, 3), None);
+        database
+            .create_key_value_object_standalone(1, 1, 2, 7, 3, b"created")
+            .unwrap();
+        assert_eq!(
+            database.arena_kv_row(1, 1, 2, 3),
+            Some((7, b"created".to_vec()))
+        );
+
+        database
+            .update_key_value_object_standalone(1, 1, 2, 3, 8, b"first update")
+            .unwrap();
+        assert_eq!(
+            database.arena_kv_row(1, 1, 2, 3),
+            Some((8, b"first update".to_vec()))
+        );
+        database
+            .update_key_value_object_standalone(1, 1, 2, 3, 9, b"second update is longer")
+            .unwrap();
+        assert_eq!(
+            database.arena_kv_row(1, 1, 2, 3),
+            Some((9, b"second update is longer".to_vec()))
+        );
+
+        database
+            .remove_key_value_object_standalone(1, 1, 2, 3)
+            .unwrap();
+        assert_eq!(database.arena_kv_row(1, 1, 2, 3), None);
+        database.arena_undo();
+
+        database
+            .create_key_value_object_standalone(1, 1, 2, 7, 3, b"durable base")
+            .unwrap();
+        database.arena_start_undo_session();
+        assert_eq!(
+            database.arena_kv_row(1, 1, 2, 3),
+            Some((7, b"durable base".to_vec()))
+        );
+        database
+            .update_key_value_object_standalone(1, 1, 2, 3, 8, b"speculative update")
+            .unwrap();
+        assert_eq!(
+            database.arena_kv_row(1, 1, 2, 3),
+            Some((8, b"speculative update".to_vec()))
+        );
+        database.arena_undo();
+        assert_eq!(
+            database.arena_kv_row(1, 1, 2, 3),
+            Some((7, b"durable base".to_vec()))
+        );
+    }
+
+    #[test]
     fn webauthn_authority_round_trips_through_arena_blob() {
         let key = AuthorityPublicKey::WebAuthn {
             point: [
@@ -4012,6 +6514,28 @@ mod tests {
     }
 
     #[test]
+    fn restore_from_path_streams_snapshot_envelope() {
+        let src = TempDir::new().unwrap();
+        let mut source = Database::new(src.path().to_str().unwrap(), TEST_DB_SIZE).unwrap();
+        source.add_indices().unwrap();
+        source.set_revision(4).unwrap();
+        let alice = name_u64("alice");
+        source.create_account(alice, 1).unwrap();
+        let snapshot = source.snapshot_bytes().unwrap();
+        let checkpoint = src.path().join("migration.snapshot");
+        fs::write(&checkpoint, snapshot).unwrap();
+
+        let dst = TempDir::new().unwrap();
+        let mut target = Database::new(dst.path().to_str().unwrap(), TEST_DB_SIZE).unwrap();
+        target.add_indices().unwrap();
+        target.set_revision(9).unwrap();
+        let header = target.restore_from_path(&checkpoint).unwrap();
+        assert_eq!(header.revision, 4);
+        assert_eq!(target.revision(), 4);
+        assert!(target.arena_account_exists(alice));
+    }
+
+    #[test]
     fn restore_from_bytes_rejects_corrupt_without_disturbing_db() {
         let src = TempDir::new().unwrap();
         let mut a = Database::new(src.path().to_str().unwrap(), TEST_DB_SIZE).unwrap();
@@ -4113,6 +6637,25 @@ mod tests {
     }
 
     #[test]
+    fn genesis_reserves_chainbase_permission_zero() {
+        let (_dir, db) = initialized_resource_db();
+        // The reserved row deliberately has an empty authority, so the normal
+        // permission accessor (which decodes an authority threshold) does not
+        // expose it. Its chainbase id is nevertheless present and serialized.
+        assert_eq!(db.backend.permission_cb_id(0, 0), Some(0));
+        assert_eq!(
+            db.backend
+                .permission_cb_id(name_u64("pulse"), name_u64("owner")),
+            Some(1)
+        );
+        assert_eq!(
+            db.backend
+                .permission_cb_id(name_u64("pulse"), name_u64("active")),
+            Some(2)
+        );
+    }
+
+    #[test]
     fn transaction_usage_validation_rejects_account_net_and_cpu_overages() {
         let (_dir, mut db) = initialized_resource_db();
         let alice = name_u64("alice");
@@ -4189,15 +6732,353 @@ mod tests {
         assert_eq!(db.get_block_cpu_limit().unwrap(), block_cpu);
         assert_eq!(db.get_block_net_limit().unwrap(), block_net);
     }
+
+    #[test]
+    fn contract_dependency_tracking_flows_through_database_clones() {
+        let db = Database::default();
+        let (tracked, tracker) = db.clone_with_dependency_tracking();
+        let inline_action_clone = tracked.clone();
+        let (code, scope, table, primary) = (1, 2, 3, 4);
+
+        assert!(!tracked.arena_table_exists(code, scope, table));
+        tracked
+            .create_key_value_object_standalone(code, scope, table, 5, primary, b"value")
+            .unwrap();
+        assert_eq!(
+            inline_action_clone.arena_kv_get(code, scope, table, primary),
+            Some(b"value".to_vec())
+        );
+        assert_eq!(
+            inline_action_clone.arena_kv_lower_bound(code, scope, table, 0),
+            Some(primary)
+        );
+
+        let report = tracker.snapshot();
+        assert_eq!(
+            report.exact_reads(),
+            &BTreeSet::from([
+                DependencyKey::Contract(ContractRowKey::table(code, scope, table)),
+                DependencyKey::Contract(ContractRowKey::new(
+                    code,
+                    scope,
+                    table,
+                    ContractIndex::Primary,
+                    primary,
+                )),
+            ])
+        );
+        assert_eq!(
+            report.range_reads(),
+            &BTreeSet::from([RangeDependency::Contract(ContractRangeKey::new(
+                code,
+                scope,
+                table,
+                ContractIndex::Primary,
+            ))])
+        );
+        assert_eq!(
+            report.writes(),
+            &BTreeSet::from([
+                DependencyKey::Contract(ContractRowKey::table(code, scope, table)),
+                DependencyKey::Contract(ContractRowKey::new(
+                    code,
+                    scope,
+                    table,
+                    ContractIndex::Primary,
+                    primary,
+                )),
+            ])
+        );
+        assert!(!report.is_complete());
+    }
+
+    #[test]
+    fn system_dependency_tracking_flows_through_read_views_and_clones() {
+        let db = Database::default();
+        let owner = name_u64("alice");
+        let owner_permission = name_u64("owner");
+        let active_permission = name_u64("active");
+        let custom_permission = name_u64("custom");
+        let code = name_u64("token");
+        let action = name_u64("transfer");
+        let sender_id = 99u128;
+        let deferred_id = [7; 32];
+        let code_hash = [6; 32];
+        let auth = build_auth_blob(1, &[], &[], &[]);
+        let owner_id = db
+            .xpr_import_permission(0, owner, owner_permission, 10, &auth)
+            .unwrap();
+        db.xpr_import_permission(owner_id, owner, active_permission, 10, &auth)
+            .unwrap();
+        db.xpr_import_permission_link(owner, code, action, active_permission)
+            .unwrap();
+        db.xpr_import_deferred_transaction(
+            owner,
+            sender_id,
+            owner,
+            deferred_id,
+            20,
+            100,
+            10,
+            &[1, 2, 3],
+        )
+        .unwrap();
+
+        let (mut tracked, tracker) = db.clone_with_dependency_tracking();
+        tracked.create_account(code, 0).unwrap();
+        tracked.create_account_metadata(code, false).unwrap();
+        tracked
+            .update_account_code(code, b"wasm", 1, &TimePoint::default(), &code_hash, 0, 0)
+            .unwrap();
+        assert_eq!(
+            tracked.get_code_bytes_by_hash(&code_hash, 0, 0).unwrap(),
+            b"wasm"
+        );
+        let read_view = tracked.read().unwrap();
+        assert!(
+            read_view
+                .permission_authority(owner, active_permission)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            read_view
+                .permission_satisfies_by_name(owner, active_permission, owner, active_permission)
+                .unwrap()
+        );
+        assert_eq!(
+            read_view
+                .lookup_linked_permission(owner, code, action)
+                .unwrap(),
+            Some(active_permission)
+        );
+        assert_eq!(
+            tracked
+                .arena_deferred_transaction_by_sender_id(owner, sender_id)
+                .unwrap()
+                .trx_id,
+            deferred_id
+        );
+        assert_eq!(tracked.arena_due_deferred_transactions(20).len(), 1);
+        assert_eq!(
+            tracked
+                .arena_remove_deferred_transaction_by_sender_id(owner, sender_id)
+                .unwrap()
+                .unwrap()
+                .trx_id,
+            deferred_id
+        );
+
+        tracked
+            .modify_permission(
+                owner,
+                active_permission,
+                &decode_authority(&auth).unwrap(),
+                &TimePoint::default(),
+            )
+            .unwrap();
+        tracked
+            .create_permission(
+                owner,
+                custom_permission,
+                owner_id as u64,
+                &decode_authority(&auth).unwrap(),
+                &TimePoint::default(),
+            )
+            .unwrap();
+        tracked
+            .update_permission_usage(owner, active_permission, &TimePoint::default())
+            .unwrap();
+        tracked.record_transaction(&[8; 32], 100).unwrap();
+
+        let report = tracker.snapshot();
+        assert!(
+            report
+                .exact_reads()
+                .contains(&DependencyKey::System(SystemKey::Permission {
+                    owner,
+                    name: active_permission,
+                }))
+        );
+        assert!(
+            report
+                .exact_reads()
+                .contains(&DependencyKey::System(SystemKey::Code(code_hash)))
+        );
+        assert!(
+            report
+                .exact_reads()
+                .contains(&DependencyKey::System(SystemKey::PermissionLink {
+                    account: owner,
+                    code,
+                    message_type: action,
+                }))
+        );
+        assert!(
+            report
+                .exact_reads()
+                .contains(&DependencyKey::System(SystemKey::DeferredSender {
+                    sender: owner,
+                    sender_id,
+                }))
+        );
+        assert!(report.range_reads().contains(&RangeDependency::System(
+            SystemRangeKey::PermissionsByOwner(owner),
+        )));
+        assert!(
+            report
+                .range_reads()
+                .contains(&RangeDependency::System(SystemRangeKey::DeferredDueQueue))
+        );
+        assert!(
+            report
+                .writes()
+                .contains(&DependencyKey::System(SystemKey::Permission {
+                    owner,
+                    name: active_permission,
+                }))
+        );
+        for write in [
+            SystemKey::DeferredSender {
+                sender: owner,
+                sender_id,
+            },
+            SystemKey::DeferredTransaction(deferred_id),
+        ] {
+            assert!(report.writes().contains(&DependencyKey::System(write)));
+        }
+        for write in [
+            SystemKey::PermissionSequence,
+            SystemKey::Permission {
+                owner,
+                name: custom_permission,
+            },
+            SystemKey::PermissionUsage {
+                owner,
+                name: custom_permission,
+            },
+        ] {
+            assert!(report.writes().contains(&DependencyKey::System(write)));
+        }
+        for write in [SystemKey::Account(code), SystemKey::AccountMetadata(code)] {
+            assert!(report.writes().contains(&DependencyKey::System(write)));
+        }
+        assert!(
+            report
+                .writes()
+                .contains(&DependencyKey::System(SystemKey::Code(code_hash)))
+        );
+        assert!(
+            report
+                .writes()
+                .contains(&DependencyKey::System(SystemKey::PermissionUsage {
+                    owner,
+                    name: active_permission,
+                }))
+        );
+        assert!(
+            report
+                .writes()
+                .contains(&DependencyKey::System(SystemKey::Transaction([8; 32])))
+        );
+        assert!(!report.is_complete());
+    }
+
+    #[test]
+    fn system_dependency_tracking_covers_runtime_singletons_and_resources() {
+        let (_dir, db) = initialized_resource_db();
+        let system = db.system_accounts().system.as_u64();
+        let feature = [0xa5; 32];
+        let (mut tracked, tracker) = db.clone_with_dependency_tracking();
+
+        let config = tracked.chain_config().unwrap();
+        tracked.set_global_properties(&config).unwrap();
+        assert!(!tracked.protocol_feature_activated(feature));
+        assert!(tracked.preactivated_protocol_features().is_empty());
+        assert!(tracked.proposed_schedule().is_none());
+        tracked.set_proposed_schedule(1, &[1, 2, 3]).unwrap();
+        tracked.clear_proposed_schedule().unwrap();
+        tracked.get_block_cpu_limit().unwrap();
+        tracked.get_block_net_limit().unwrap();
+        tracked.get_account_ram_usage(system).unwrap();
+        tracked.add_pending_ram_usage(system, 0).unwrap();
+        tracked.next_recv_sequence(system).unwrap();
+        tracked.next_global_sequence().unwrap();
+
+        let report = tracker.snapshot();
+        for read in [
+            SystemKey::ChainConfig,
+            SystemKey::ProtocolFeature(feature),
+            SystemKey::PreactivatedProtocolFeatures,
+            SystemKey::ProposedSchedule,
+            SystemKey::ResourceState,
+            SystemKey::ResourceUsage(system),
+        ] {
+            assert!(report.exact_reads().contains(&DependencyKey::System(read)));
+        }
+        for write in [
+            SystemKey::ChainConfig,
+            SystemKey::ProposedSchedule,
+            SystemKey::ResourceUsage(system),
+            SystemKey::AccountMetadata(system),
+            SystemKey::GlobalActionSequence,
+        ] {
+            assert!(report.writes().contains(&DependencyKey::System(write)));
+        }
+        assert!(!report.is_complete());
+    }
+
+    #[test]
+    fn dependency_tracking_does_not_change_arena_state() {
+        fn apply(db: &mut Database) {
+            db.create_key_value_object_standalone(10, 20, 30, 40, 50, b"same")
+                .unwrap();
+            db.create_index64_object_standalone(10, 20, 31, 40, 50, 60)
+                .unwrap();
+            db.update_index64_object_standalone(10, 20, 31, 50, 41, 61)
+                .unwrap();
+            db.create_account(70, 80).unwrap();
+            db.create_account_metadata(70, false).unwrap();
+            db.record_transaction(&[90; 32], 100).unwrap();
+        }
+
+        let mut untracked = Database::default();
+        apply(&mut untracked);
+
+        let tracked_base = Database::default();
+        let (mut tracked, tracker) = tracked_base.clone_with_dependency_tracking();
+        apply(&mut tracked);
+
+        assert_eq!(untracked.arena_state_root(), tracked.arena_state_root());
+        let report = tracker.snapshot();
+        assert_eq!(report.exact_read_count(), 0);
+        assert_eq!(report.range_read_count(), 0);
+        assert_eq!(report.write_count(), 7);
+    }
 }
 
 impl Database {
+    /// Enable code-hash-pinned XPR native handlers for this process-local
+    /// database handle and its clones. Intended only for the offline importer.
+    #[doc(hidden)]
+    pub fn enable_xpr_native_replay(&self) {
+        self.xpr_native_replay.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether the offline importer explicitly enabled native XPR handlers.
+    #[doc(hidden)]
+    pub fn xpr_native_replay_enabled(&self) -> bool {
+        self.xpr_native_replay.load(Ordering::Relaxed)
+    }
+
     /// Acquire a read view over the arena. The arena is `Arc`-backed with its own
     /// interior synchronization, so the view is a cheap clone that carries no
     /// borrow of `self`.
     pub fn read(&self) -> Result<DbRead<'_>, ChainError> {
         Ok(DbRead {
             backend: self.backend.clone(),
+            dependency_recorder: self.dependency_recorder.clone(),
+            authority_cache: self.authority_cache.clone(),
             _marker: std::marker::PhantomData,
         })
     }
@@ -4207,6 +7088,8 @@ impl Database {
 /// lifetime is retained for source compatibility with call sites that name it.
 pub struct DbRead<'g> {
     backend: crate::backend::ChainDatabase,
+    dependency_recorder: Option<DependencyRecorder>,
+    authority_cache: Arc<Mutex<HashMap<Vec<u8>, Authority>>>,
     _marker: std::marker::PhantomData<&'g ()>,
 }
 
@@ -4256,6 +7139,43 @@ impl PermissionInfo {
 }
 
 impl<'g> DbRead<'g> {
+    fn decode_authority_cached(&self, blob: &[u8]) -> Result<Authority, ChainError> {
+        const MAX_CACHED_AUTHORITIES: usize = 4_096;
+
+        if let Some(authority) = self
+            .authority_cache
+            .lock()
+            .map_err(|_| ChainError::InternalError("authority cache lock poisoned".into()))?
+            .get(blob)
+            .cloned()
+        {
+            return Ok(authority);
+        }
+
+        let authority = decode_authority(blob)?;
+        let mut cache = self
+            .authority_cache
+            .lock()
+            .map_err(|_| ChainError::InternalError("authority cache lock poisoned".into()))?;
+        if cache.len() >= MAX_CACHED_AUTHORITIES {
+            cache.clear();
+        }
+        cache.insert(blob.to_vec(), authority.clone());
+        Ok(authority)
+    }
+
+    fn dependency_system_read(&self, key: SystemKey) {
+        if let Some(recorder) = &self.dependency_recorder {
+            recorder.exact_read(DependencyKey::System(key));
+        }
+    }
+
+    fn dependency_system_range_read(&self, key: SystemRangeKey) {
+        if let Some(recorder) = &self.dependency_recorder {
+            recorder.range_read(RangeDependency::System(key));
+        }
+    }
+
     /// The full authority for `(actor, permission)` as an owned value, or `None`
     /// if the permission doesn't exist.
     ///
@@ -4267,9 +7187,13 @@ impl<'g> DbRead<'g> {
         actor: u64,
         permission: u64,
     ) -> Result<Option<Authority>, ChainError> {
+        self.dependency_system_read(SystemKey::Permission {
+            owner: actor,
+            name: permission,
+        });
         let s = &self.backend;
         return match s.permission_auth_blob(actor, permission) {
-            Some(blob) => Ok(Some(decode_authority(&blob)?)),
+            Some(blob) => Ok(Some(self.decode_authority_cached(&blob)?)),
             None => Ok(None),
         };
     }
@@ -4277,6 +7201,10 @@ impl<'g> DbRead<'g> {
     /// The permission's consensus id. `newaccount` reads the owner permission's
     /// id here to parent the active permission on it.
     pub fn permission_id(&self, owner: u64, perm_name: u64) -> Result<Option<i64>, ChainError> {
+        self.dependency_system_read(SystemKey::Permission {
+            owner,
+            name: perm_name,
+        });
         let s = &self.backend;
         return Ok(s.permission_cb_id(owner, perm_name));
     }
@@ -4290,6 +7218,10 @@ impl<'g> DbRead<'g> {
         owner: u64,
         perm_name: u64,
     ) -> Result<Option<i64>, ChainError> {
+        self.dependency_system_read(SystemKey::Permission {
+            owner,
+            name: perm_name,
+        });
         let s = &self.backend;
         return Ok(s
             .permission_auth_blob(owner, perm_name)
@@ -4303,6 +7235,10 @@ impl<'g> DbRead<'g> {
         actor: u64,
         permission: u64,
     ) -> Result<Option<PermissionInfo>, ChainError> {
+        self.dependency_system_read(SystemKey::Permission {
+            owner: actor,
+            name: permission,
+        });
         let s = &self.backend;
         return Ok(Self::arena_permission_info(s, actor, permission));
     }
@@ -4339,6 +7275,13 @@ impl<'g> DbRead<'g> {
         owner_b: u64,
         name_b: u64,
     ) -> Result<bool, ChainError> {
+        // The backend walks the permission parent tree. Depending on the whole
+        // owner's permission set is conservative, including absent parents and
+        // hierarchy changes without exposing arena-internal numeric row ids.
+        self.dependency_system_range_read(SystemRangeKey::PermissionsByOwner(owner_a));
+        if owner_b != owner_a {
+            self.dependency_system_range_read(SystemRangeKey::PermissionsByOwner(owner_b));
+        }
         let s = &self.backend;
         return s
             .permission_satisfies(owner_a, name_a, owner_b, name_b)
@@ -4351,6 +7294,8 @@ impl<'g> DbRead<'g> {
 
     /// The `last_used` microsecond timestamp of a permission, by name.
     pub fn permission_last_used_by_name(&self, owner: u64, name: u64) -> Result<i64, ChainError> {
+        self.dependency_system_read(SystemKey::Permission { owner, name });
+        self.dependency_system_read(SystemKey::PermissionUsage { owner, name });
         let s = &self.backend;
         return s.permission_last_used(owner, name).ok_or_else(|| {
             ChainError::InternalError(
@@ -4365,6 +7310,11 @@ impl<'g> DbRead<'g> {
         code: u64,
         requirement_type: u64,
     ) -> Result<Option<u64>, ChainError> {
+        self.dependency_system_read(SystemKey::PermissionLink {
+            account,
+            code,
+            message_type: requirement_type,
+        });
         let s = &self.backend;
         return Ok(s.permission_link(account, code, requirement_type));
     }
@@ -4375,10 +7325,17 @@ impl Default for Database {
         Self {
             path: String::new(),
             backend: crate::backend::ChainDatabase::new().expect("arena init"),
-            protocol_records: Arc::new(Mutex::new(Vec::new())),
             system_accounts: Arc::new(OnceLock::from(SystemAccountNames::default())),
             native_system_contract: true,
             native_system_contract_locked: false,
+            protocol_records: Arc::new(Mutex::new(Vec::new())),
+            dependency_recorder: None,
+            speculation_epoch: Arc::new(OnceLock::new()),
+            speculation_freeze: Arc::new(AtomicBool::new(false)),
+            authority_cache: Arc::new(Mutex::new(HashMap::new())),
+            xpr_native_replay: Arc::new(AtomicBool::new(false)),
+            xpr_native_rows: Arc::new(Mutex::new(XprNativeRowCache::default())),
+            xpr_native_sequences: Arc::new(Mutex::new(XprNativeSequenceCache::default())),
         }
     }
 }
