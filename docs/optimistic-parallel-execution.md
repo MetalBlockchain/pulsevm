@@ -96,6 +96,71 @@ should favor conservative conflicts over unsafe parallel commits.
 4. **Producer mode:** enable only after validator parity over the full XPR replay
    and sustained multi-node tests.
 
+### Current dependency-telemetry slice
+
+The first rollout gate is available behind the node-local
+`PULSEVM_DEPENDENCY_TELEMETRY` environment variable. It is unset by default and
+does not change transaction execution or Arena state. When enabled, each
+explicit/deferred serial transaction receives an isolated recorder through its
+cloned `Database` handle; inline actions and WASM host functions inherit that
+same recorder. Debug logs include the transaction id, outcome, counts, exact
+contract/system keys, conservative range keys, and writes.
+
+The recorder covers the contract primary table plus idx64, idx128,
+idx256, idx_double, and idx_long_double. Point reads use stable logical row keys
+and iterator/secondary searches conservatively depend on the whole relevant
+index, including absent reads. Table existence and payer reads track the table
+metadata row. Child creation/removal also writes that metadata because it
+changes the table row count and can create or delete the table.
+
+Consensus-visible system state reached by explicit/deferred transaction
+execution is also recorded: accounts and metadata, code objects, permissions,
+permission usage and links, chain configuration, proposed producer schedules,
+protocol features and their preactivation queue, resource limits/usage/config,
+input-transaction dedupe rows, deferred transactions, and receipt sequence
+counters. Permission-tree walks and due-deferred scans use conservative range
+keys. Exact logical keys deliberately coarsen pending/committed resource limits
+and singleton state where field-level merging has not been proven safe.
+
+Serial telemetry reports still intentionally set `complete = false`, so they
+cannot authorize an optimistic commit. They measure working sets but do not run
+through the typed overlay described below, and an independent call-path audit
+must still prove future execution cannot bypass either dependency recording or
+private writes. Global action receipt sequencing and per-block resource usage
+are conservative singleton writes, so they currently conflict across
+transactions; safe ordered rebasing or aggregation is required before telemetry
+can translate into useful parallel commits.
+
+### Contract-primary overlay foundation
+
+The database now also exposes a default-off, typed speculation wave for the
+first bounded overlay slice. Starting a wave mutably borrows the controller's
+canonical `Database`, freezing that handle while workers receive cloneable
+read-only snapshots. Because Arena does not yet provide MVCC or copy-on-write
+snapshots, the snapshot shares the frozen store and carries both the Arena
+revision and a lazily installed logical-mutation epoch. Reads check the epoch
+before and after touching Arena; any write through an instrumented alias makes
+the snapshot stale and prevents commit. Nodes that never start a wave do not
+install the atomic epoch and retain the normal write path.
+
+Worker overlays currently expose only exact contract-primary get/create/update/
+remove operations. Writes remain private ordered logical operations keyed by
+`(code, scope, table, primary)`; they never contain Arena object ids or blob
+references. Ordered apply validates snapshot version, completeness, and prior
+writes, then invokes the live logical database API inside a nested undo session,
+so Arena assigns ids in canonical transaction/operation order. Secondary
+indices, range iteration, and every system-state operation are unsupported in
+this slice and must mark the worker result incomplete for serial re-execution.
+After any serial fallback, the conservative implementation invalidates the
+remaining wave rather than letting results from the old prefix commit.
+
+This API is not wired into block execution. Before that integration, every
+transaction database mutation must be routed through the typed overlay, the
+mutation-epoch bypass audit must cover lifecycle/state-replacement methods, and
+global receipt/resource singletons need an ordered rebase strategy. An Arena
+MVCC/COW read view would eventually replace the controller freeze invariant,
+but a full state clone per block is explicitly not an acceptable substitute.
+
 Required gates include unit tests for exact keys and range phantoms, inline
 actions, authorization changes, contract upgrades, RAM exhaustion, deferred
 creation/cancellation, soft/hard failures, and traps; randomized serial-vs-

@@ -951,7 +951,10 @@ mod tests {
     };
 
     use super::pack_deltas;
-    use crate::AccountMetaRow;
+    use crate::{
+        AccountMetaRow,
+        PermissionRow,
+    };
 
     #[derive(Debug, PartialEq, Eq)]
     struct PackedTable {
@@ -1025,6 +1028,23 @@ mod tests {
             0, // no activated protocol features
         ];
         assert_eq!(pack_deltas(&db, true, &[0; 32]), expected);
+    }
+
+    #[test]
+    fn full_snapshot_serializes_reserved_permission_zero() {
+        let mut db = crate::build_registered_db().unwrap();
+        db.create::<PermissionRow>(|row| {
+            row.cb_id = 0;
+            row.usage_id = 0;
+        })
+        .unwrap();
+
+        let tables = unpack_tables(&pack_deltas(&db, true, &[0; 32]));
+        let permission = tables
+            .iter()
+            .find(|table| table.name == "permission")
+            .unwrap();
+        assert_eq!(permission.rows, vec![(true, vec![0; 40])]);
     }
 
     #[test]

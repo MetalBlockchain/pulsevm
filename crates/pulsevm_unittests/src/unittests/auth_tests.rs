@@ -31,8 +31,22 @@ mod auth_tests {
         DEFAULT_EXPIRATION_DELTA,
         Testing,
         get_private_key,
+        get_public_key,
     };
     use pulsevm_name_macro::name;
+
+    const ONLY_LINK_TO_EXISTING_PERMISSION_FEATURE_DIGEST: [u8; 32] = [
+        0x1a, 0x99, 0xa5, 0x9d, 0x87, 0xe0, 0x6e, 0x09, 0xec, 0x5b, 0x02, 0x8a, 0x9c, 0xbb, 0x77,
+        0x49, 0xb4, 0xa5, 0xad, 0x88, 0x19, 0x00, 0x43, 0x65, 0xd0, 0x2d, 0xc4, 0x37, 0x9a, 0x8b,
+        0x72, 0x41,
+    ];
+
+    fn activate_only_link_to_existing_permission(chain: &Testing) -> Result<()> {
+        let db = chain.controller.database();
+        db.preactivate_protocol_feature(ONLY_LINK_TO_EXISTING_PERMISSION_FEATURE_DIGEST)?;
+        db.activate_protocol_features(&[ONLY_LINK_TO_EXISTING_PERMISSION_FEATURE_DIGEST], 1)?;
+        Ok(())
+    }
 
     /// Guards the DB read-API soundness fix. `get_permission` now returns a
     /// `&PermissionObject` bound to a `DbRead` guard, so a permission reference
@@ -1025,6 +1039,187 @@ mod auth_tests {
                     .into()
             ))
         );
+        Ok(())
+    }
+
+    /// `linkauth` accepted a requirement that names a permission which does not
+    /// exist. Afterwards `lookup_minimum_permission` resolves to that name while
+    /// `get_permission` errors, so every action of `code` from this account
+    /// fails authorization -- and `unlinkauth` cannot undo it, because it
+    /// resolves the same dangling name before it can remove the link. The
+    /// account/contract pair ends up permanently unusable.
+    #[tokio::test]
+    async fn linkauth_rejects_a_nonexistent_permission() -> Result<()> {
+        let mut chain = Testing::new().await;
+        let alice: Name = name!("alice").into();
+        chain.create_account(alice, PULSE_NAME.into(), false, true)?;
+        activate_only_link_to_existing_permission(&chain)?;
+
+        let err = chain
+            .link_authority(
+                alice,
+                PULSE_NAME.into(),
+                name!("nosuchperm").into(),
+                name!("reqauth").into(),
+            )
+            .expect_err("linking to a permission that does not exist must be rejected");
+        assert!(
+            err.to_string().contains("failed to retrieve permission"),
+            "expected a missing-permission error, got: {err}"
+        );
+        Ok(())
+    }
+
+    /// The other half of the same check: the contract being linked to must
+    /// exist too.
+    #[tokio::test]
+    async fn linkauth_rejects_a_nonexistent_code_account() -> Result<()> {
+        let mut chain = Testing::new().await;
+        let alice: Name = name!("alice").into();
+        chain.create_account(alice, PULSE_NAME.into(), false, true)?;
+
+        let err = chain
+            .link_authority(
+                alice,
+                name!("nosuchcode").into(),
+                ACTIVE_NAME.into(),
+                name!("reqauth").into(),
+            )
+            .expect_err("linking to a code account that does not exist must be rejected");
+        assert!(
+            err.to_string()
+                .contains("failed to retrieve code for account"),
+            "expected a missing-account error, got: {err}"
+        );
+        Ok(())
+    }
+
+    /// `pulse.any` is virtual and never has a permission object, so it must stay
+    /// exempt from the existence check -- the `eosio.any` carve-out upstream.
+    #[tokio::test]
+    async fn linkauth_still_accepts_the_virtual_any_permission() -> Result<()> {
+        let mut chain = Testing::new().await;
+        let alice: Name = name!("alice").into();
+        chain.create_account(alice, PULSE_NAME.into(), false, true)?;
+        activate_only_link_to_existing_permission(&chain)?;
+
+        chain.link_authority(
+            alice,
+            PULSE_NAME.into(),
+            name!("pulse.any").into(),
+            name!("reqauth").into(),
+        )?;
+        Ok(())
+    }
+
+    /// And a link to a permission that does exist must still work.
+    #[tokio::test]
+    async fn linkauth_accepts_an_existing_permission() -> Result<()> {
+        let mut chain = Testing::new().await;
+        let alice: Name = name!("alice").into();
+        chain.create_account(alice, PULSE_NAME.into(), false, true)?;
+        activate_only_link_to_existing_permission(&chain)?;
+
+        chain.link_authority(
+            alice,
+            PULSE_NAME.into(),
+            ACTIVE_NAME.into(),
+            name!("reqauth").into(),
+        )?;
+        Ok(())
+    }
+
+    /// `deleteauth` removed a permission that links still pointed at, producing
+    /// exactly the dangling state above -- reachable even with `linkauth`
+    /// validated, by linking first and deleting after.
+    #[tokio::test]
+    async fn deleteauth_rejects_a_permission_that_is_still_linked() -> Result<()> {
+        let mut chain = Testing::new().await;
+        let alice: Name = name!("alice").into();
+        chain.create_account(alice, PULSE_NAME.into(), false, true)?;
+
+        let spending: Name = name!("spending").into();
+        chain.set_authority2(
+            alice,
+            spending,
+            Authority::new(
+                1,
+                vec![KeyWeight::new(
+                    get_public_key(alice, "spending").into_k1(),
+                    1,
+                )],
+                vec![],
+                vec![],
+            ),
+            ACTIVE_NAME.into(),
+        )?;
+        chain.link_authority(alice, PULSE_NAME.into(), spending, name!("reqauth").into())?;
+
+        let err = chain
+            .delete_authority2(alice, spending)
+            .expect_err("deleting a linked permission must be rejected");
+        assert!(
+            err.to_string().contains("cannot delete a linked authority"),
+            "expected a linked-authority error, got: {err}"
+        );
+        Ok(())
+    }
+
+    /// The escape hatch has to work: unlink, then delete. Without this the fix
+    /// would just be a different way to strand the permission.
+    #[tokio::test]
+    async fn deleteauth_succeeds_once_the_link_is_removed() -> Result<()> {
+        let mut chain = Testing::new().await;
+        let alice: Name = name!("alice").into();
+        chain.create_account(alice, PULSE_NAME.into(), false, true)?;
+
+        let spending: Name = name!("spending").into();
+        chain.set_authority2(
+            alice,
+            spending,
+            Authority::new(
+                1,
+                vec![KeyWeight::new(
+                    get_public_key(alice, "spending").into_k1(),
+                    1,
+                )],
+                vec![],
+                vec![],
+            ),
+            ACTIVE_NAME.into(),
+        )?;
+        chain.link_authority(alice, PULSE_NAME.into(), spending, name!("reqauth").into())?;
+        chain.unlink_authority(alice, PULSE_NAME.into(), name!("reqauth").into())?;
+
+        chain
+            .delete_authority2(alice, spending)
+            .expect("deleting an unlinked permission must succeed");
+        Ok(())
+    }
+
+    /// An unlinked permission must still be deletable directly.
+    #[tokio::test]
+    async fn deleteauth_still_removes_an_unlinked_permission() -> Result<()> {
+        let mut chain = Testing::new().await;
+        let alice: Name = name!("alice").into();
+        chain.create_account(alice, PULSE_NAME.into(), false, true)?;
+
+        let spending: Name = name!("spending").into();
+        chain.set_authority2(
+            alice,
+            spending,
+            Authority::new(
+                1,
+                vec![KeyWeight::new(
+                    get_public_key(alice, "spending").into_k1(),
+                    1,
+                )],
+                vec![],
+                vec![],
+            ),
+            ACTIVE_NAME.into(),
+        )?;
+        chain.delete_authority2(alice, spending)?;
         Ok(())
     }
 }

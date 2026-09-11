@@ -1,11 +1,44 @@
 use wasmer::{
     FunctionEnvMut,
+    MemoryView,
     RuntimeError,
     WasmPtr,
 };
 
 use super::cost;
 use crate::wasm_runtime::WasmContext;
+
+#[inline]
+pub(crate) fn checked_range(
+    operation: &str,
+    role: &str,
+    ptr: WasmPtr<u8>,
+    length: u32,
+    view: &MemoryView<'_>,
+) -> Result<std::ops::Range<usize>, RuntimeError> {
+    let start = ptr.offset() as u64;
+    let end = start.checked_add(length as u64).ok_or_else(|| {
+        RuntimeError::new(format!(
+            "{operation}: invalid {role} range: offset overflow"
+        ))
+    })?;
+    if end > view.data_size() {
+        return Err(RuntimeError::new(format!(
+            "{operation}: invalid {role} range: out of bounds memory access"
+        )));
+    }
+    let start = usize::try_from(start).map_err(|_| {
+        RuntimeError::new(format!(
+            "{operation}: invalid {role} range: offset does not fit the host"
+        ))
+    })?;
+    let end = usize::try_from(end).map_err(|_| {
+        RuntimeError::new(format!(
+            "{operation}: invalid {role} range: end does not fit the host"
+        ))
+    })?;
+    Ok(start..end)
+}
 
 #[inline]
 pub fn memmove(
@@ -25,22 +58,14 @@ pub fn memmove(
         .as_ref()
         .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
+    let src = checked_range("memmove", "source", src_ptr, src_size, &view)?;
+    let dest = checked_range("memmove", "destination", dest_ptr, src_size, &view)?;
 
-    // Bounds-check both ranges before allocating anything. `slice` uses checked
-    // arithmetic, so offset + len near u32::MAX cannot wrap into a valid range.
-    let src = src_ptr
-        .slice(&view, src_size)
-        .map_err(|e| RuntimeError::new(format!("memmove: invalid source range: {e}")))?;
-    let dest = dest_ptr
-        .slice(&view, src_size)
-        .map_err(|e| RuntimeError::new(format!("memmove: invalid destination range: {e}")))?;
-
-    // Safe to allocate now: src_size is bounded by linear memory size.
-    let mut buf = vec![0u8; src_size as usize];
-    src.read_slice(&mut buf)
-        .map_err(|e| RuntimeError::new(format!("memmove: read failed: {e}")))?;
-    dest.write_slice(&buf)
-        .map_err(|e| RuntimeError::new(format!("memmove: write failed: {e}")))?;
+    // A host intrinsic executes synchronously while WASM is suspended, so the
+    // memory cannot grow or be accessed by guest code until this slice is
+    // dropped. `copy_within` deliberately supports overlapping ranges.
+    let data = unsafe { view.data_unchecked_mut() };
+    data.copy_within(src, dest.start);
 
     Ok(dest_ptr)
 }
@@ -72,22 +97,20 @@ pub fn memcpy(
         .as_ref()
         .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
+    let src = checked_range("memcpy", "source", src_ptr, src_size, &view)?;
+    let dest = checked_range("memcpy", "destination", dest_ptr, src_size, &view)?;
 
-    // Bounds-check both ranges before allocating anything. `slice` uses checked
-    // arithmetic, so offset + len near u32::MAX cannot wrap into a valid range.
-    let src = src_ptr
-        .slice(&view, src_size)
-        .map_err(|e| RuntimeError::new(format!("memcpy: invalid source range: {e}")))?;
-    let dest = dest_ptr
-        .slice(&view, src_size)
-        .map_err(|e| RuntimeError::new(format!("memcpy: invalid destination range: {e}")))?;
-
-    // Safe to allocate now: src_size is bounded by linear memory size.
-    let mut buf = vec![0u8; src_size as usize];
-    src.read_slice(&mut buf)
-        .map_err(|e| RuntimeError::new(format!("memcpy: read failed: {e}")))?;
-    dest.write_slice(&buf)
-        .map_err(|e| RuntimeError::new(format!("memcpy: write failed: {e}")))?;
+    // The explicit overlap check above means the source and destination can be
+    // split into disjoint slices. WASM is suspended for the host call, so the
+    // view remains stable for the copy.
+    let data = unsafe { view.data_unchecked_mut() };
+    if dest.start < src.start {
+        let (before_src, from_src) = data.split_at_mut(src.start);
+        before_src[dest].copy_from_slice(&from_src[..src_size as usize]);
+    } else {
+        let (before_dest, from_dest) = data.split_at_mut(dest.start);
+        from_dest[..src_size as usize].copy_from_slice(&before_dest[src]);
+    }
 
     Ok(dest_ptr)
 }
@@ -110,18 +133,12 @@ pub fn memset(
         .as_ref()
         .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
+    let dest = checked_range("memset", "destination", dest_ptr, size, &view)?;
 
-    // Bounds-check before allocating anything. `slice` uses checked arithmetic,
-    // so offset + len near u32::MAX cannot wrap into a valid range.
-    let dest = dest_ptr
-        .slice(&view, size)
-        .map_err(|e| RuntimeError::new(format!("memset: invalid destination range: {e}")))?;
-
-    // std::memset semantics: int -> unsigned char (low byte only).
-    // Safe to allocate now: size is bounded by linear memory size.
-    let buf = vec![value as u8; size as usize];
-    dest.write_slice(&buf)
-        .map_err(|e| RuntimeError::new(format!("memset: write failed: {e}")))?;
+    // std::memset semantics: int -> unsigned char (low byte only). WASM is
+    // suspended for the host call, so this mutable view cannot alias guest work.
+    let data = unsafe { view.data_unchecked_mut() };
+    data[dest].fill(value as u8);
 
     Ok(dest_ptr)
 }
@@ -144,27 +161,15 @@ pub fn memcmp(
         .as_ref()
         .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
+    let dest = checked_range("memcmp", "destination", dest_ptr, length, &view)?;
+    let src = checked_range("memcmp", "source", src_ptr, length, &view)?;
 
-    // Bounds-check both ranges before allocating anything. `slice` uses checked
-    // arithmetic, so offset + len near u32::MAX cannot wrap into a valid range.
-    let dest = dest_ptr
-        .slice(&view, length)
-        .map_err(|e| RuntimeError::new(format!("memcmp: invalid destination range: {e}")))?;
-    let src = src_ptr
-        .slice(&view, length)
-        .map_err(|e| RuntimeError::new(format!("memcmp: invalid source range: {e}")))?;
-
-    // Safe to allocate now: length is bounded by linear memory size.
-    let mut dest_buf = vec![0u8; length as usize];
-    dest.read_slice(&mut dest_buf)
-        .map_err(|e| RuntimeError::new(format!("memcmp: read failed: {e}")))?;
-    let mut src_buf = vec![0u8; length as usize];
-    src.read_slice(&mut src_buf)
-        .map_err(|e| RuntimeError::new(format!("memcmp: read failed: {e}")))?;
+    // WASM is suspended for the host call, so the immutable view stays stable.
+    let data = unsafe { view.data_unchecked() };
 
     // Normalized to -1/0/1, matching nodeos (raw memcmp magnitude is
     // implementation-defined and would be a determinism leak)
-    Ok(match dest_buf.cmp(&src_buf) {
+    Ok(match data[dest].cmp(&data[src]) {
         std::cmp::Ordering::Less => -1,
         std::cmp::Ordering::Equal => 0,
         std::cmp::Ordering::Greater => 1,

@@ -3,6 +3,10 @@ name = "pulsevm_name"
 version = "0.1.0"
 edition = "2024"
 
+[package.metadata.cargo-machete]
+# The local serialization derives expand to `pulsevm_serialization` paths.
+ignored = ["pulsevm_serialization"]
+
 [dependencies]
 syn = { version = "1.0.13", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }

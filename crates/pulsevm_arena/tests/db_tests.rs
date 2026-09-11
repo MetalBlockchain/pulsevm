@@ -71,6 +71,29 @@ impl ArenaObject for Resource {
     }
 }
 
+#[repr(C)]
+#[derive(
+    Clone,
+    Copy,
+    Default,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::Immutable,
+    zerocopy::KnownLayout,
+)]
+struct AccountTypeIdCollision {
+    id: ObjectId<AccountTypeIdCollision>,
+}
+impl ArenaObject for AccountTypeIdCollision {
+    const TYPE_ID: u16 = Account::TYPE_ID;
+    fn id(&self) -> ObjectId<Self> {
+        self.id
+    }
+    fn set_id(&mut self, id: ObjectId<Self>) {
+        self.id = id;
+    }
+}
+
 fn new_db() -> Db {
     let mut db = Db::new();
     db.add_table::<Account>().unwrap();
@@ -102,8 +125,13 @@ fn cross_table_operations() {
 fn duplicate_type_id_rejected() {
     let mut db = Db::new();
     db.add_table::<Account>().unwrap();
-    let err = db.add_table::<Account>().unwrap_err();
+    let err = db.add_table::<AccountTypeIdCollision>().unwrap_err();
     assert!(matches!(err, DbError::TypeIdInUse { .. }));
+
+    // Direct TYPE_ID indexing must not turn a colliding, unregistered Rust type
+    // into a downcast panic at lookup time.
+    let err = db.table::<AccountTypeIdCollision>().err().unwrap();
+    assert!(matches!(err, DbError::NotRegistered { .. }));
 }
 
 #[test]

@@ -1,0 +1,13 @@
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Pin the official release artifact because this binary must match the compiler,
+# architecture, and Boost environment recorded in provider chainbase snapshots.
+ADD --checksum=sha256:c4d96ca67620abafcc1d4d53f9f11f97ad97948e3fe96f36132953cd4161a06e \
+    https://github.com/AntelopeIO/leap/releases/download/v5.0.3/leap_5.0.3_amd64.deb \
+    /tmp/leap.deb
+RUN dpkg-deb --extract /tmp/leap.deb / \
+    && rm -f /tmp/leap.deb
+
+ENTRYPOINT ["nodeos"]

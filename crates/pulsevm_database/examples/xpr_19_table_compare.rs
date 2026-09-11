@@ -1,6 +1,8 @@
 //! Compare the complete 19-table SHiP snapshot emitted by nodeos with Arena's
-//! re-serialized snapshot. This is deliberately a wire-level comparison: it
-//! does not compare Rust's internal table bytes or rely on the importer summary.
+//! re-serialized snapshot. This compares the serialized logical row multiset:
+//! chainbase object ids determine nodeos's row order but are not present in the
+//! SHiP payload, so a different internal Arena allocation order is immaterial.
+//! It does not compare Rust's internal table bytes or rely on the importer summary.
 //!
 //! Usage:
 //! xpr_19_table_compare <nodeos-chain-state-history.log> <arena-checkpoint>
@@ -58,6 +60,8 @@ struct Report {
     tables: BTreeMap<String, TableReport>,
 }
 
+type TableRows = BTreeMap<String, Vec<(bool, Vec<u8>)>>;
+
 fn usage() {
     eprintln!(
         "Usage: xpr_19_table_compare <nodeos-log> <checkpoint> <arena-dir> <source-chain-id-hex> [report.json]"
@@ -85,6 +89,9 @@ fn read_uvar(bytes: &[u8], pos: &mut usize) -> Result<u64, String> {
 
 fn hash_rows(rows: &[(bool, Vec<u8>)]) -> TableReport {
     let mut hasher = Sha256::new();
+    let mut rows = rows.iter().collect::<Vec<_>>();
+    rows.sort_unstable();
+    let row_count = rows.len();
     for (present, payload) in rows {
         hasher.update([u8::from(*present)]);
         let mut len = payload.len() as u64;
@@ -102,12 +109,12 @@ fn hash_rows(rows: &[(bool, Vec<u8>)]) -> TableReport {
         hasher.update(payload);
     }
     TableReport {
-        rows: rows.len(),
+        rows: row_count,
         sha256: hex::encode(hasher.finalize()),
     }
 }
 
-fn parse_framed_tables(bytes: &[u8]) -> Result<BTreeMap<String, TableReport>, String> {
+fn parse_framed_tables(bytes: &[u8]) -> Result<TableRows, String> {
     let mut pos = 0;
     let count = read_uvar(bytes, &mut pos)? as usize;
     let mut result = BTreeMap::new();
@@ -149,7 +156,7 @@ fn parse_framed_tables(bytes: &[u8]) -> Result<BTreeMap<String, TableReport>, St
             ));
             pos = end;
         }
-        if result.insert(name.clone(), hash_rows(&rows)).is_some() {
+        if result.insert(name.clone(), rows).is_some() {
             return Err(format!("duplicate table {name:?}"));
         }
     }
@@ -159,9 +166,7 @@ fn parse_framed_tables(bytes: &[u8]) -> Result<BTreeMap<String, TableReport>, St
     Ok(result)
 }
 
-fn source_tables(
-    entry: &pulsevm_database::StateHistoryEntry,
-) -> Result<BTreeMap<String, TableReport>, String> {
+fn source_tables(entry: &pulsevm_database::StateHistoryEntry) -> Result<TableRows, String> {
     let mut tables = BTreeMap::new();
     for delta in &entry.deltas {
         let rows = delta
@@ -169,14 +174,99 @@ fn source_tables(
             .iter()
             .map(|row| (row.present, row.data.clone()))
             .collect::<Vec<_>>();
-        if tables
-            .insert(delta.name.clone(), hash_rows(&rows))
-            .is_some()
-        {
+        if tables.insert(delta.name.clone(), rows).is_some() {
             return Err(format!("duplicate nodeos table {:?}", delta.name));
         }
     }
     Ok(tables)
+}
+
+fn row_key(table: &str, row: &[u8]) -> String {
+    let fields = match table {
+        "contract_row"
+        | "contract_index64"
+        | "contract_index128"
+        | "contract_index256"
+        | "contract_index_double"
+        | "contract_index_long_double" => 5,
+        "permission" => 3,
+        _ => 0,
+    };
+    let mut pos = 0;
+    if fields == 0 || read_uvar(row, &mut pos).is_err() {
+        return String::new();
+    }
+    let mut values = Vec::with_capacity(fields);
+    for _ in 0..fields {
+        let Some(bytes) = row.get(pos..pos + 8) else {
+            return String::new();
+        };
+        values.push(u64::from_le_bytes(bytes.try_into().unwrap()));
+        pos += 8;
+    }
+    format!(" key={values:?}")
+}
+
+fn row_preview(row: &(bool, Vec<u8>)) -> String {
+    const PREVIEW_BYTES: usize = 96;
+    let shown = row.1.len().min(PREVIEW_BYTES);
+    let suffix = if shown < row.1.len() { "..." } else { "" };
+    format!(
+        "present={} bytes={} hex={}{}",
+        row.0,
+        row.1.len(),
+        hex::encode(&row.1[..shown]),
+        suffix
+    )
+}
+
+fn diagnose_rows(table: &str, nodeos: &[(bool, Vec<u8>)], arena: &[(bool, Vec<u8>)]) {
+    let mut nodeos = nodeos.iter().collect::<Vec<_>>();
+    let mut arena = arena.iter().collect::<Vec<_>>();
+    nodeos.sort_unstable();
+    arena.sort_unstable();
+    let mut shown = 0;
+    for index in 0..nodeos.len().max(arena.len()) {
+        let left = nodeos.get(index);
+        let right = arena.get(index);
+        if left == right {
+            continue;
+        }
+        eprintln!("table {table}: first differing row index {index}");
+        if let Some(row) = left {
+            eprintln!("  nodeos{} {}", row_key(table, &row.1), row_preview(row));
+        } else {
+            eprintln!("  nodeos=<missing>");
+        }
+        if let Some(row) = right {
+            eprintln!("  arena{} {}", row_key(table, &row.1), row_preview(row));
+        } else {
+            eprintln!("  arena=<missing>");
+        }
+        shown += 1;
+        if shown == 3 {
+            break;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::hash_rows;
+
+    #[test]
+    fn logical_row_hash_ignores_allocation_order() {
+        let first = vec![(true, vec![1, 2]), (true, vec![3]), (false, vec![4])];
+        let reordered = vec![(false, vec![4]), (true, vec![1, 2]), (true, vec![3])];
+        assert_eq!(hash_rows(&first), hash_rows(&reordered));
+    }
+
+    #[test]
+    fn logical_row_hash_commits_presence_and_payload() {
+        let row = vec![(true, vec![1, 2])];
+        assert_ne!(hash_rows(&row), hash_rows(&[(false, vec![1, 2])]));
+        assert_ne!(hash_rows(&row), hash_rows(&[(true, vec![1, 3])]));
+    }
 }
 
 fn main() -> ExitCode {
@@ -226,7 +316,7 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let source = match source_tables(&entry) {
+    let source_rows = match source_tables(&entry) {
         Ok(tables) => tables,
         Err(error) => {
             eprintln!("invalid nodeos table set: {error}");
@@ -248,7 +338,7 @@ fn main() -> ExitCode {
         eprintln!("cannot restore Arena checkpoint: {error}");
         return ExitCode::from(1);
     }
-    let arena = match parse_framed_tables(&database.pack_deltas(true, &chain_id)) {
+    let arena_rows = match parse_framed_tables(&database.pack_deltas(true, &chain_id)) {
         Ok(tables) => tables,
         Err(error) => {
             eprintln!("cannot parse Arena SHiP snapshot: {error}");
@@ -259,12 +349,17 @@ fn main() -> ExitCode {
     let mut report_tables = BTreeMap::new();
     let mut mismatch = false;
     for name in TABLES {
-        let left = source.get(name);
-        let right = arena.get(name);
+        let left_rows = source_rows.get(name);
+        let right_rows = arena_rows.get(name);
+        let left = left_rows.map(|rows| hash_rows(rows));
+        let right = right_rows.map(|rows| hash_rows(rows));
         if left != right {
             mismatch = true;
             eprintln!("table {name}: nodeos={left:?} arena={right:?}");
-        } else if let Some(value) = left {
+            if let (Some(left_rows), Some(right_rows)) = (left_rows, right_rows) {
+                diagnose_rows(name, left_rows, right_rows);
+            }
+        } else if let Some(value) = &left {
             println!("table {name}: rows={} sha256={}", value.rows, value.sha256);
             report_tables.insert(name.to_owned(), value.clone());
         }
@@ -275,7 +370,7 @@ fn main() -> ExitCode {
             mismatch = true;
         }
     }
-    for name in source.keys().chain(arena.keys()) {
+    for name in source_rows.keys().chain(arena_rows.keys()) {
         if !TABLES.contains(&name.as_str()) {
             mismatch = true;
             eprintln!("unexpected table {name:?}");

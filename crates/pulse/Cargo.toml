@@ -3,6 +3,9 @@ name = "pulse"
 version = "0.1.0"
 edition = "2024"
 
+[package.metadata.cargo-machete]
+ignored = ["spdlog-rs"] # The package exports the `spdlog` crate name.
+
 [[bin]]
 name = "pulse"
 path = "src/main.rs"
@@ -10,11 +13,11 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1.0.98"
 clap = { version = "4", features = ["derive"] }
-dirs = "5"
+dirs = "7"
 rpassword = "7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-spdlog-rs = "0.4"
+spdlog-rs = "0.5.3"
 tokio = { version = "1", features = ["full"] }
 
 pulsevm_api_client = { path = "../pulsevm_api_client" }

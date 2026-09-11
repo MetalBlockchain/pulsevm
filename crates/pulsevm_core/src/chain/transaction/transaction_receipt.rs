@@ -60,20 +60,37 @@ impl NumBytes for ReceiptTransaction {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TransactionReceipt {
     #[serde(flatten)]
     header: TransactionReceiptHeader,
     #[serde(skip)]
     trx: ReceiptTransaction,
+    #[serde(skip)]
+    cached_digest: Option<Digest>,
 }
+
+impl PartialEq for TransactionReceipt {
+    fn eq(&self, other: &Self) -> bool {
+        self.header == other.header && self.trx == other.trx
+    }
+}
+
+impl Eq for TransactionReceipt {}
 
 impl Read for TransactionReceipt {
     fn read(bytes: &[u8], pos: &mut usize) -> Result<Self, ReadError> {
-        Ok(Self {
+        let mut receipt = Self {
             header: TransactionReceiptHeader::read(bytes, pos)?,
             trx: ReceiptTransaction::read(bytes, pos)?,
-        })
+            cached_digest: None,
+        };
+        receipt.cached_digest = Some(
+            receipt
+                .calculate_digest()
+                .map_err(|_| ReadError::ParseError)?,
+        );
+        Ok(receipt)
     }
 }
 
@@ -95,6 +112,7 @@ impl TransactionReceipt {
         Self {
             header,
             trx: ReceiptTransaction::Packed(trx),
+            cached_digest: None,
         }
     }
 
@@ -102,6 +120,7 @@ impl TransactionReceipt {
         Self {
             header,
             trx: ReceiptTransaction::Id(transaction_id),
+            cached_digest: None,
         }
     }
 
@@ -139,6 +158,13 @@ impl TransactionReceipt {
     }
 
     pub fn digest(&self) -> Result<Digest, WriteError> {
+        if let Some(digest) = self.cached_digest {
+            return Ok(digest);
+        }
+        self.calculate_digest()
+    }
+
+    fn calculate_digest(&self) -> Result<Digest, WriteError> {
         let mut bytes = self.header.pack()?;
         match &self.trx {
             ReceiptTransaction::Id(id) => bytes.extend(id.pack()?),

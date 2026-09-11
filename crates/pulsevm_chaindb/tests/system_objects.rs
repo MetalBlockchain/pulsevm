@@ -52,6 +52,25 @@ fn permission_create_modify_remove() {
 }
 
 #[test]
+fn producer_authority_update_preserves_permission_timestamp() {
+    let s = db();
+    assert!(s.modify_permission_authority(1, 100, &auth(3)).is_err());
+    s.create_permission(5, -1, 1, 100, 42, &auth(1)).unwrap();
+
+    s.modify_permission_authority(1, 100, &auth(3)).unwrap();
+    assert_eq!(s.permission(1, 100), Some((-1, 3)));
+    assert_eq!(s.permission_last_updated(1, 100), Some(42));
+
+    let root = s.state_root();
+    s.modify_permission_authority(1, 100, &auth(3)).unwrap();
+    assert_eq!(
+        s.state_root(),
+        root,
+        "an unchanged producer authority must not rewrite chain state"
+    );
+}
+
+#[test]
 fn permission_satisfies_walks_parent_chain() {
     let s = db();
     // A tree for owner 1: a(id 1, root) -> b(id 2) -> c(id 3). Parent links are
@@ -125,6 +144,19 @@ fn ram_usage_accumulates_and_reverts_signed() {
 }
 
 #[test]
+fn offline_ram_repair_is_compare_and_set() {
+    let s = db();
+    s.initialize_account_resource_limits(1).unwrap();
+    s.add_pending_ram_usage(1, 500).unwrap();
+
+    assert!(s.repair_account_ram_usage(1, 499, 300).is_err());
+    assert_eq!(s.account_ram_usage(1), Some(500));
+
+    s.repair_account_ram_usage(1, 500, 300).unwrap();
+    assert_eq!(s.account_ram_usage(1), Some(300));
+}
+
+#[test]
 fn transaction_dedup_and_expiry() {
     let s = db();
     let a = [1u8; 32];
@@ -144,10 +176,60 @@ fn transaction_dedup_and_expiry() {
 }
 
 #[test]
+fn expiry_cutoff_is_strict_and_sub_second_exact() {
+    let s = db();
+    let at_cutoff = [3u8; 32];
+    let past_cutoff = [4u8; 32];
+    s.record_transaction(at_cutoff, 300).unwrap();
+    s.record_transaction(past_cutoff, 299).unwrap();
+
+    // The comparison is strict, so a row expiring exactly at the cutoff survives.
+    s.clear_expired_input_transactions(300 * 1_000_000).unwrap();
+    assert!(s.transaction_exists(at_cutoff));
+    assert!(!s.transaction_exists(past_cutoff));
+
+    // One microsecond past it, the same row is expired.
+    s.clear_expired_input_transactions(300 * 1_000_000 + 1)
+        .unwrap();
+    assert!(!s.transaction_exists(at_cutoff));
+
+    // A non-positive cutoff clears nothing.
+    let zero_exp = [5u8; 32];
+    s.record_transaction(zero_exp, 0).unwrap();
+    s.clear_expired_input_transactions(0).unwrap();
+    s.clear_expired_input_transactions(-1_000_000).unwrap();
+    assert!(s.transaction_exists(zero_exp));
+
+    // A cutoff beyond the u32 expiration domain clears everything.
+    s.clear_expired_input_transactions(i64::MAX).unwrap();
+    assert!(!s.transaction_exists(zero_exp));
+}
+
+#[test]
 fn global_action_sequence_roundtrips() {
     let s = db();
     s.set_global_action_sequence(42).unwrap();
     assert_eq!(s.global_action_sequence(), Some(42));
+}
+
+#[test]
+fn action_receipt_sequences_advance_atomically() {
+    let s = db();
+    s.create_account_metadata(1, false).unwrap();
+    s.create_account_metadata(2, false).unwrap();
+    s.set_global_action_sequence(42).unwrap();
+
+    let sequences = s.next_action_sequences(1, &[1, 2, 1]).unwrap().unwrap();
+    assert_eq!(sequences, (43, 1, vec![1, 1, 2]));
+    assert_eq!(
+        s.account_metadata(1).map(|row| (row.1, row.2)),
+        Some((1, 2))
+    );
+    assert_eq!(s.account_metadata(2).map(|row| row.2), Some(1));
+
+    // A missing receiver is reported so the caller can fail and undo the
+    // enclosing transaction instead of emitting a partial receipt.
+    assert_eq!(s.next_action_sequences(99, &[]).unwrap(), None);
 }
 
 #[test]

@@ -11,7 +11,15 @@ readonly TARGET_DIR="${XPR_REPLAY_TARGET_DIR:-$REPO_ROOT/target/xpr-replay-nativ
 readonly BINARY="$TARGET_DIR/release/examples/xpr_blocklog_replay"
 readonly SERVICE="${XPR_REPLAY_SERVICE:-pulsevm-xpr-mainnet-replay}.service"
 readonly CHECKPOINT_INTERVAL="${XPR_REPLAY_CHECKPOINT_INTERVAL:-1000000}"
+readonly SIGNATURE_THREADS="${XPR_REPLAY_SIGNATURE_THREADS:-8}"
+readonly NATIVE_REPLAY="${XPR_REPLAY_NATIVE_REPLAY:-1}"
+readonly BATCHED_REPLAY="${XPR_REPLAY_BATCHED_REPLAY:-0}"
 readonly LAST_BLOCK="${XPR_REPLAY_LAST_BLOCK:-}"
+readonly TRACE_RAM_ACCOUNT="${XPR_REPLAY_TRACE_RAM_ACCOUNT:-}"
+readonly TRUST_LEGACY_CHECKPOINT="${XPR_REPLAY_TRUST_LEGACY_CHECKPOINT:-0}"
+readonly REPLAY_PROFILE="${XPR_REPLAY_PROFILE:-0}"
+readonly REPLAY_PROFILE_INTERVAL="${XPR_REPLAY_PROFILE_INTERVAL:-1000}"
+readonly WASM_PRECOMPILE_THREADS="${XPR_REPLAY_WASM_PRECOMPILE_THREADS:-4}"
 
 fail() {
   echo "error: $*" >&2
@@ -51,6 +59,20 @@ build_replay() {
 start_replay() {
   require_linux
   validate_uint "$CHECKPOINT_INTERVAL" XPR_REPLAY_CHECKPOINT_INTERVAL
+  validate_uint "$SIGNATURE_THREADS" XPR_REPLAY_SIGNATURE_THREADS
+  [[ "$NATIVE_REPLAY" == 0 || "$NATIVE_REPLAY" == 1 ]] || \
+    fail "XPR_REPLAY_NATIVE_REPLAY must be 0 or 1"
+  [[ "$BATCHED_REPLAY" == 0 || "$BATCHED_REPLAY" == 1 ]] || \
+    fail "XPR_REPLAY_BATCHED_REPLAY must be 0 or 1"
+  if [[ "$NATIVE_REPLAY" == 0 && "$BATCHED_REPLAY" == 1 ]]; then
+    fail "batched replay requires XPR_REPLAY_NATIVE_REPLAY=1"
+  fi
+  [[ "$TRUST_LEGACY_CHECKPOINT" == 0 || "$TRUST_LEGACY_CHECKPOINT" == 1 ]] || \
+    fail "XPR_REPLAY_TRUST_LEGACY_CHECKPOINT must be 0 or 1"
+  [[ "$REPLAY_PROFILE" == 0 || "$REPLAY_PROFILE" == 1 ]] || \
+    fail "XPR_REPLAY_PROFILE must be 0 or 1"
+  validate_uint "$REPLAY_PROFILE_INTERVAL" XPR_REPLAY_PROFILE_INTERVAL
+  validate_uint "$WASM_PRECOMPILE_THREADS" XPR_REPLAY_WASM_PRECOMPILE_THREADS
   [[ -z "$LAST_BLOCK" ]] || validate_uint "$LAST_BLOCK" XPR_REPLAY_LAST_BLOCK
   [[ -x "$BINARY" ]] || fail "replay binary is missing; run '$0 build' first"
   [[ -s "$SOURCE_DIR/blocks.log" ]] || fail "missing $SOURCE_DIR/blocks.log"
@@ -71,8 +93,28 @@ start_replay() {
 
   local command=(
     env "XPR_REPLAY_CHECKPOINT_INTERVAL=$CHECKPOINT_INTERVAL"
-    "$BINARY" "$SOURCE_DIR" "$ARENA_DIR"
+    "XPR_REPLAY_SIGNATURE_THREADS=$SIGNATURE_THREADS"
+    "PULSEVM_WASM_PRECOMPILE_THREADS=$WASM_PRECOMPILE_THREADS"
   )
+  if [[ "$NATIVE_REPLAY" == 1 ]]; then
+    command+=("PULSEVM_XPR_NATIVE_REPLAY=1")
+  fi
+  if [[ "$BATCHED_REPLAY" == 1 ]]; then
+    command+=("PULSEVM_XPR_BATCHED_REPLAY=1")
+  fi
+  if [[ -n "$TRACE_RAM_ACCOUNT" ]]; then
+    command+=("XPR_REPLAY_TRACE_RAM_ACCOUNT=$TRACE_RAM_ACCOUNT")
+  fi
+  if [[ "$TRUST_LEGACY_CHECKPOINT" == 1 ]]; then
+    command+=("XPR_REPLAY_TRUST_LEGACY_CHECKPOINT=1")
+  fi
+  if [[ "$REPLAY_PROFILE" == 1 ]]; then
+    command+=(
+      "PULSEVM_REPLAY_PROFILE=1"
+      "PULSEVM_REPLAY_PROFILE_INTERVAL=$REPLAY_PROFILE_INTERVAL"
+    )
+  fi
+  command+=("$BINARY" "$SOURCE_DIR" "$ARENA_DIR")
   [[ -z "$LAST_BLOCK" ]] || command+=("$LAST_BLOCK")
 
   # Retry only abnormal process death. A normal non-zero exit is a parity error
@@ -125,6 +167,18 @@ Environment:
   XPR_REPLAY_SERVICE             systemd user service name without .service
   XPR_REPLAY_LAST_BLOCK          Optional pinned terminal block
   XPR_REPLAY_CHECKPOINT_INTERVAL Durable checkpoint interval (default: 1000000)
+  XPR_REPLAY_SIGNATURE_THREADS   Header signature workers (default: 8)
+  XPR_REPLAY_NATIVE_REPLAY       Enable audited native XPR handlers: 0 or 1 (default: 1)
+  XPR_REPLAY_BATCHED_REPLAY      Bypass general transaction graphs for pinned bot/oracle actions
+                                  after parity validation: 0 or 1 (default: 0)
+  XPR_REPLAY_TRACE_RAM_ACCOUNT   Optional account whose RAM changes are logged by block
+  XPR_REPLAY_TRUST_LEGACY_CHECKPOINT
+                                  Trust and mark an independently validated unversioned checkpoint
+  XPR_REPLAY_PROFILE              Log phase, transaction-path, native-decline, and WASM timings:
+                                  0 or 1 (default: 0)
+  XPR_REPLAY_PROFILE_INTERVAL     Blocks per aggregated profile report (default: 1000)
+  XPR_REPLAY_WASM_PRECOMPILE_THREADS
+                                  Best-effort background LLVM workers (default: 4)
 EOF
 }
 

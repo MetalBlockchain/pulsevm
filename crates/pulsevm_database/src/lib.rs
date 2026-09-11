@@ -1,5 +1,6 @@
 mod backend;
 mod database;
+mod dependency;
 mod objects;
 mod pod;
 mod snapshot;
@@ -14,11 +15,32 @@ pub use crate::pod::{
 
 pub use crate::{
     database::{
+        BlockReadSnapshot,
+        ContractPrimaryKey,
+        ContractPrimaryOverlay,
         Database,
         DbRead,
         PermissionInfo,
+        SnapshotVersion,
+        SpeculativeCommitOutcome,
+        SpeculativeFallbackReason,
+        SpeculativeTransaction,
+        SpeculativeWave,
         SystemAccountNames,
         restore_snapshot,
+    },
+    dependency::{
+        ContractIndex,
+        ContractRangeKey,
+        ContractRowKey,
+        DependencyKey,
+        DependencyTracker,
+        ParallelWaveEstimate,
+        RangeDependency,
+        SystemKey,
+        SystemRangeKey,
+        TransactionDependencies,
+        estimate_parallel_waves,
     },
     objects::{
         Index64Object,

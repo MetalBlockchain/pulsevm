@@ -1,39 +1,40 @@
 //! Peer-to-peer state sync: moving a physical arena snapshot out of band.
 //!
-//! The MetalGo state summary is a small commitment (the accepted block id,
-//! which every node agrees on). The snapshot itself — tens of MB of live arena —
+//! The MetalGo state summary is a small consensus commitment to the accepted
+//! block, the deterministic arena state root, the active producer schedule, and
+//! the protocol schedule. The snapshot itself — tens of MB of live arena —
 //! travels separately, requested chunk by chunk over the P2P AppRequest channel.
 //! This module owns the parts that don't care how bytes reach the wire: the
 //! commitment format, the download driver, and the chunk request encoding. The
 //! transport (the AppSender gRPC client and the request/response correlation)
 //! lives in the node binary; a test drives the same code with a direct fetch.
 //!
-//! A file-copy snapshot is not verifiable against a cross-node root — two honest
-//! nodes hold byte-different arenas for the same state — so a syncing node pulls
-//! the whole snapshot from a single peer and checks it against the hash that peer
-//! advertised in its summary. That is a trusted transfer, appropriate for a
-//! controlled validator set; a verifiable-state-root scheme would replace only
-//! the hash check here, not the transport.
+//! Two honest nodes may hold byte-different physical arenas for the same logical
+//! state, so the transport hash is intentionally not part of the summary id.
+//! Instead, the downloaded arena is loaded in isolation and its canonical state
+//! root must match the root covered by the summary id before it can be installed.
 
 use pulsevm_crypto::Digest;
 use pulsevm_error::ChainError;
-use pulsevm_serialization::Read;
+use pulsevm_serialization::{
+    Read,
+    Write,
+};
 
 use crate::chain::{
     block::SignedBlock,
     producer_schedule::ProducerSchedule,
-    protocol_features::{
-        GENESIS_PROTOCOL_VERSION,
-        ProtocolScheduleCommitment,
-    },
+    protocol_features::ProtocolScheduleCommitment,
 };
 
-// Prefix summaries that require post-genesis protocol support. A pre-feature
-// binary interprets these first four bytes as an impossible schedule length and
-// rejects the summary instead of silently ignoring a trailing commitment.
-const VERSIONED_SUMMARY_MAGIC: &[u8; 8] = b"PVMSUM01";
+// Prefix every authenticated summary. An old binary interprets these first four
+// bytes as an impossible schedule length and rejects it; a new binary rejects
+// any summary without this prefix, closing the legacy trusted-transfer path.
+const AUTHENTICATED_SUMMARY_MAGIC: &[u8; 8] = b"PVMSUM02";
 const PROTOCOL_COMMITMENT_MAGIC: &[u8; 8] = b"PVMPC001";
 const PROTOCOL_COMMITMENT_LEN: usize = 8 + 4 + 32;
+const STATE_ROOT_LEN: usize = 32;
+const SUMMARY_ID_DOMAIN: &[u8] = b"pulsevm-state-summary-v2\0";
 
 /// Bytes requested per AppRequest. 256 KiB keeps a chunk comfortably inside a
 /// single P2P message while making the round-trip count reasonable for a
@@ -47,16 +48,22 @@ pub const SNAPSHOT_CHUNK_LEN: u32 = 256 * 1024;
 pub const MAX_SNAPSHOT_LEN: u64 = 64 * 1024 * 1024 * 1024;
 
 /// What a syncing node learned from a state summary and now has to fetch: the
-/// tip block and schedule to adopt, and the length and hash of the snapshot
-/// payload to download and verify.
+/// tip block and schedule to adopt, the authenticated logical state root, and
+/// the length and hash of the physical snapshot payload.
 #[derive(Debug, Clone)]
 pub struct SyncTarget {
     pub height: u64,
+    /// Canonical logical database root covered by the Avalanche summary id.
+    pub state_root: [u8; 32],
+    /// Hash of this provider's physical snapshot bytes. This is a transport
+    /// integrity check only; different nodes may encode the same state
+    /// differently, so it is deliberately excluded from the summary id.
     pub hash: [u8; 32],
     pub total_len: u64,
     pub block: SignedBlock,
     pub schedule: ProducerSchedule,
-    /// Absent only on summaries emitted by a pre-protocol-feature binary.
+    /// Always present in authenticated v2 summaries. Kept optional at the
+    /// controller boundary so protocol validation remains explicit.
     pub protocol_commitment: Option<ProtocolScheduleCommitment>,
 }
 
@@ -173,111 +180,127 @@ pub fn take_section<'a>(bytes: &'a [u8], pos: &mut usize) -> Result<&'a [u8], Ch
     Ok(section)
 }
 
-/// A state summary's bytes. Pure version-1 history uses the exact legacy layout
-/// `[schedule][block][total_len][hash]`, with the first two sections
-/// length-prefixed. Once a post-genesis protocol version is active, the summary
-/// becomes `[versioned magic][legacy fields][protocol commitment]`.
+/// Encode an authenticated state summary.
 ///
-/// The leading magic is a fail-closed compatibility barrier: pre-feature
-/// binaries ignored trailing bytes, so a trailer alone would let them accept a
-/// snapshot produced under rules they cannot execute.
+/// Layout: `[magic][schedule][block][total_len][snapshot_hash][state_root]
+/// [protocol_commitment]`, with schedule and block length-prefixed. The state
+/// root and every consensus-relevant field feed [`summary_id`]; the physical
+/// snapshot metadata does not, because its representation is provider-specific.
 pub fn encode_summary_bytes(
     schedule_bytes: &[u8],
     block_bytes: &[u8],
     total_len: u64,
     hash: &[u8; 32],
+    state_root: &[u8; 32],
     protocol_commitment: ProtocolScheduleCommitment,
 ) -> Vec<u8> {
-    let versioned = protocol_commitment.protocol_version != GENESIS_PROTOCOL_VERSION;
     let mut bytes = Vec::with_capacity(
-        (if versioned {
-            VERSIONED_SUMMARY_MAGIC.len() + PROTOCOL_COMMITMENT_LEN
-        } else {
-            0
-        }) + 8
+        AUTHENTICATED_SUMMARY_MAGIC.len()
+            + 8
             + schedule_bytes.len()
             + block_bytes.len()
             + 8
-            + 32,
+            + 32
+            + STATE_ROOT_LEN
+            + PROTOCOL_COMMITMENT_LEN,
     );
-    if versioned {
-        bytes.extend_from_slice(VERSIONED_SUMMARY_MAGIC);
-    }
+    bytes.extend_from_slice(AUTHENTICATED_SUMMARY_MAGIC);
     bytes.extend_from_slice(&(schedule_bytes.len() as u32).to_le_bytes());
     bytes.extend_from_slice(schedule_bytes);
     bytes.extend_from_slice(&(block_bytes.len() as u32).to_le_bytes());
     bytes.extend_from_slice(block_bytes);
     bytes.extend_from_slice(&total_len.to_le_bytes());
     bytes.extend_from_slice(hash);
-    if versioned {
-        bytes.extend_from_slice(PROTOCOL_COMMITMENT_MAGIC);
-        bytes.extend_from_slice(&protocol_commitment.protocol_version.to_le_bytes());
-        bytes.extend_from_slice(&protocol_commitment.activated_schedule_hash);
-    }
+    bytes.extend_from_slice(state_root);
+    bytes.extend_from_slice(PROTOCOL_COMMITMENT_MAGIC);
+    bytes.extend_from_slice(&protocol_commitment.protocol_version.to_le_bytes());
+    bytes.extend_from_slice(&protocol_commitment.activated_schedule_hash);
     bytes
+}
+
+/// Calculate the id Avalanche validators vote on for a state summary.
+///
+/// Physical snapshot bytes are not canonical across nodes, but the logical arena
+/// root is. Committing the root here lets validators agree on one id while still
+/// rejecting a snapshot containing state other than the state they voted for.
+pub fn summary_id(
+    block: &SignedBlock,
+    schedule: &ProducerSchedule,
+    state_root: &[u8; 32],
+    protocol_commitment: ProtocolScheduleCommitment,
+) -> Result<crate::chain::id::Id, ChainError> {
+    let block_id = block.id()?;
+    let block_bytes = block
+        .pack()
+        .map_err(|e| ChainError::InternalError(format!("summary: pack block: {e}")))?;
+    let block_hash = Digest::hash(&block_bytes);
+    let schedule_bytes = schedule
+        .pack()
+        .map_err(|e| ChainError::InternalError(format!("summary: pack schedule: {e}")))?;
+    let schedule_hash = Digest::hash(&schedule_bytes);
+    let mut commitment = Vec::with_capacity(SUMMARY_ID_DOMAIN.len() + 32 * 5 + 8);
+    commitment.extend_from_slice(SUMMARY_ID_DOMAIN);
+    commitment.extend_from_slice(block_id.as_bytes());
+    commitment.extend_from_slice(block_hash.as_bytes());
+    commitment.extend_from_slice(&block.block_num().to_le_bytes());
+    commitment.extend_from_slice(state_root);
+    commitment.extend_from_slice(schedule_hash.as_bytes());
+    commitment.extend_from_slice(&protocol_commitment.protocol_version.to_le_bytes());
+    commitment.extend_from_slice(&protocol_commitment.activated_schedule_hash);
+    Ok(crate::chain::id::Id::new(
+        *Digest::hash(&commitment).as_bytes(),
+    ))
 }
 
 /// Parse a state summary into a [`SyncTarget`].
 pub fn decode_summary_bytes(bytes: &[u8]) -> Result<SyncTarget, ChainError> {
-    let (versioned, bytes) = match bytes.strip_prefix(VERSIONED_SUMMARY_MAGIC) {
-        Some(body) => (true, body),
-        None => (false, bytes),
-    };
+    let bytes = bytes
+        .strip_prefix(AUTHENTICATED_SUMMARY_MAGIC)
+        .ok_or_else(|| {
+            ChainError::InternalError(
+                "summary: unauthenticated legacy state summaries are not supported".into(),
+            )
+        })?;
     let mut pos = 0usize;
     let schedule = ProducerSchedule::read_bounded(take_section(bytes, &mut pos)?)
         .map_err(|e| ChainError::InternalError(format!("summary: read schedule: {}", e)))?;
-    let block = SignedBlock::read(take_section(bytes, &mut pos)?, &mut 0)
+    let block_bytes = take_section(bytes, &mut pos)?;
+    let mut block_pos = 0usize;
+    let block = SignedBlock::read(block_bytes, &mut block_pos)
         .map_err(|e| ChainError::InternalError(format!("summary: read block: {}", e)))?;
-    if pos + 40 > bytes.len() {
+    if block_pos != block_bytes.len() {
+        return Err(ChainError::InternalError(format!(
+            "summary: packed block has {} trailing byte(s)",
+            block_bytes.len() - block_pos
+        )));
+    }
+    let trailer_len = 8 + 32 + STATE_ROOT_LEN + PROTOCOL_COMMITMENT_LEN;
+    if pos + trailer_len != bytes.len() {
         return Err(ChainError::InternalError(
-            "summary: truncated trailer".into(),
+            "summary: invalid authenticated trailer length".into(),
         ));
     }
     let total_len = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
     let mut hash = [0u8; 32];
     hash.copy_from_slice(&bytes[pos + 8..pos + 40]);
-    pos += 40;
-    let trailing = bytes.len() - pos;
-    let protocol_commitment = match (versioned, trailing) {
-        (false, 0) => None,
-        (true, PROTOCOL_COMMITMENT_LEN) => {
-            if &bytes[pos..pos + 8] != PROTOCOL_COMMITMENT_MAGIC {
-                return Err(ChainError::InternalError(
-                    "summary: invalid protocol commitment header".into(),
-                ));
-            }
-            let protocol_version = u32::from_le_bytes(bytes[pos + 8..pos + 12].try_into().unwrap());
-            let mut activated_schedule_hash = [0u8; 32];
-            activated_schedule_hash.copy_from_slice(&bytes[pos + 12..pos + 44]);
-            Some(ProtocolScheduleCommitment {
-                protocol_version,
-                activated_schedule_hash,
-            })
-        }
-        (false, trailing) => {
-            return Err(ChainError::InternalError(format!(
-                "summary: legacy format has an unexpected {trailing}-byte trailer"
-            )));
-        }
-        (true, trailing) => {
-            return Err(ChainError::InternalError(format!(
-                "summary: versioned format has an unexpected {trailing}-byte trailer"
-            )));
-        }
-    };
-    if matches!(
-        protocol_commitment,
-        Some(ProtocolScheduleCommitment {
-            protocol_version: GENESIS_PROTOCOL_VERSION,
-            ..
-        })
-    ) {
+    let mut state_root = [0u8; 32];
+    state_root.copy_from_slice(&bytes[pos + 40..pos + 72]);
+    pos += 72;
+    if &bytes[pos..pos + 8] != PROTOCOL_COMMITMENT_MAGIC {
         return Err(ChainError::InternalError(
-            "summary: genesis protocol history must use the legacy v1 layout".into(),
+            "summary: invalid protocol commitment header".into(),
         ));
     }
+    let protocol_version = u32::from_le_bytes(bytes[pos + 8..pos + 12].try_into().unwrap());
+    let mut activated_schedule_hash = [0u8; 32];
+    activated_schedule_hash.copy_from_slice(&bytes[pos + 12..pos + 44]);
+    let protocol_commitment = Some(ProtocolScheduleCommitment {
+        protocol_version,
+        activated_schedule_hash,
+    });
     Ok(SyncTarget {
         height: block.block_num() as u64,
+        state_root,
         hash,
         total_len,
         block,
@@ -328,42 +351,24 @@ mod tests {
     }
 
     #[test]
-    fn summary_protocol_commitment_round_trips_and_legacy_v1_decodes() {
+    fn authenticated_summary_round_trips_and_legacy_is_rejected() {
         let schedule = packed_valid_schedule();
         let block = SignedBlock::default().pack().unwrap();
         let commitment = ProtocolScheduleCommitment {
             protocol_version: 7,
             activated_schedule_hash: [9; 32],
         };
-        let encoded = encode_summary_bytes(&schedule, &block, 123, &[4; 32], commitment);
-        assert!(encoded.starts_with(VERSIONED_SUMMARY_MAGIC));
+        let encoded = encode_summary_bytes(&schedule, &block, 123, &[4; 32], &[5; 32], commitment);
+        assert!(encoded.starts_with(AUTHENTICATED_SUMMARY_MAGIC));
         let decoded = decode_summary_bytes(&encoded).unwrap();
         assert_eq!(decoded.total_len, 123);
         assert_eq!(decoded.hash, [4; 32]);
+        assert_eq!(decoded.state_root, [5; 32]);
         assert_eq!(decoded.protocol_commitment, Some(commitment));
 
-        let legacy = encode_summary_bytes(
-            &schedule,
-            &block,
-            123,
-            &[4; 32],
-            ProtocolScheduleCommitment {
-                protocol_version: GENESIS_PROTOCOL_VERSION,
-                activated_schedule_hash: [0; 32],
-            },
-        );
-        assert!(!legacy.starts_with(VERSIONED_SUMMARY_MAGIC));
-        assert_eq!(
-            decode_summary_bytes(&legacy).unwrap().protocol_commitment,
-            None
-        );
-
-        // Old decoders treated the first word as the schedule length and
-        // ignored trailing bytes. The leading versioned magic deliberately
-        // makes the new format fail that legacy length check.
-        let legacy_declared_schedule_len =
-            u32::from_le_bytes(encoded[..4].try_into().unwrap()) as usize;
-        assert!(legacy_declared_schedule_len > encoded.len());
+        // Dropping the v2 magic approximates the old unauthenticated layout.
+        // It must fail closed rather than silently becoming a trusted transfer.
+        assert!(decode_summary_bytes(&encoded[AUTHENTICATED_SUMMARY_MAGIC.len()..]).is_err());
     }
 
     #[test]
@@ -374,38 +379,34 @@ mod tests {
             protocol_version: 2,
             activated_schedule_hash: [0; 32],
         };
-        let mut encoded = encode_summary_bytes(&schedule, &block, 0, &[0; 32], commitment);
+        let mut encoded =
+            encode_summary_bytes(&schedule, &block, 0, &[0; 32], &[1; 32], commitment);
         let magic = encoded.len() - PROTOCOL_COMMITMENT_LEN;
         encoded[magic] ^= 0xff;
         assert!(decode_summary_bytes(&encoded).is_err());
 
-        let mut legacy = encode_summary_bytes(
-            &schedule,
-            &block,
-            0,
-            &[0; 32],
-            ProtocolScheduleCommitment {
-                protocol_version: GENESIS_PROTOCOL_VERSION,
-                activated_schedule_hash: [0; 32],
-            },
-        );
-        legacy.push(0);
-        assert!(decode_summary_bytes(&legacy).is_err());
+        let mut trailing =
+            encode_summary_bytes(&schedule, &block, 0, &[0; 32], &[1; 32], commitment);
+        trailing.push(0);
+        assert!(decode_summary_bytes(&trailing).is_err());
+    }
 
-        let mut noncanonical_v1 = encode_summary_bytes(
-            &schedule,
-            &block,
-            0,
-            &[0; 32],
-            ProtocolScheduleCommitment {
-                protocol_version: 2,
-                activated_schedule_hash: [0; 32],
-            },
-        );
-        let commitment = noncanonical_v1.len() - PROTOCOL_COMMITMENT_LEN;
-        noncanonical_v1[commitment + 8..commitment + 12]
-            .copy_from_slice(&GENESIS_PROTOCOL_VERSION.to_le_bytes());
-        assert!(decode_summary_bytes(&noncanonical_v1).is_err());
+    #[test]
+    fn summary_id_commits_to_state_root_and_schedule() {
+        let schedule_bytes = packed_valid_schedule();
+        let schedule = ProducerSchedule::read_bounded(&schedule_bytes).unwrap();
+        let block = SignedBlock::default();
+        let commitment = ProtocolScheduleCommitment {
+            protocol_version: 1,
+            activated_schedule_hash: [0; 32],
+        };
+        let original = summary_id(&block, &schedule, &[1; 32], commitment).unwrap();
+        let changed_root = summary_id(&block, &schedule, &[2; 32], commitment).unwrap();
+        assert_ne!(original, changed_root);
+
+        let other_schedule = ProducerSchedule::read_bounded(&packed_valid_schedule()).unwrap();
+        let changed_schedule = summary_id(&block, &other_schedule, &[1; 32], commitment).unwrap();
+        assert_ne!(original, changed_schedule);
     }
 
     #[tokio::test]
@@ -416,6 +417,7 @@ mod tests {
             .collect();
         let target = SyncTarget {
             height: 1,
+            state_root: [0u8; 32],
             hash: *Digest::hash(&payload).as_bytes(),
             total_len: payload.len() as u64,
             block: SignedBlock::default(),
@@ -437,6 +439,7 @@ mod tests {
         let payload = vec![1u8; 100];
         let target = SyncTarget {
             height: 1,
+            state_root: [0u8; 32],
             hash: [0u8; 32], // wrong
             total_len: payload.len() as u64,
             block: SignedBlock::default(),
@@ -458,6 +461,7 @@ mod tests {
         // it can never drive a huge allocation.
         let target = SyncTarget {
             height: 1,
+            state_root: [0u8; 32],
             hash: [0u8; 32],
             total_len: MAX_SNAPSHOT_LEN + 1,
             block: SignedBlock::default(),
@@ -477,6 +481,7 @@ mod tests {
     async fn download_rejects_short_chunk() {
         let target = SyncTarget {
             height: 1,
+            state_root: [0u8; 32],
             hash: [0u8; 32],
             total_len: 100,
             block: SignedBlock::default(),

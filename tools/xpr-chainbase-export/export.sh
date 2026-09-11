@@ -177,6 +177,7 @@ args=(
     --disable-replay-opts
     --plugin eosio::chain_plugin
     --plugin eosio::net_plugin
+    --p2p-listen-endpoint 127.0.0.1:0
     --plugin eosio::state_history_plugin
     --state-history-dir "$history_dir"
     --chain-state-history

@@ -36,6 +36,15 @@ pub enum K1Error {
     BadChecksum,
     /// The packed byte blob carried an unexpected key-type tag (non-K1).
     BadKeyType,
+    /// The compact signature's leading header byte was outside fc's accepted
+    /// `[27, 35)` range. fc rejects these before touching the curve; masking the
+    /// byte instead maps all 256 values onto a valid recovery id, so one
+    /// signature gains 64 byte-distinct encodings that all recover the same key.
+    BadRecoveryHeader(u8),
+    /// The signature failed fc's `is_canonical` predicate. Accepting a
+    /// non-canonical signature admits the malleated `(r, n-s)` form, which
+    /// recovers the same key from different bytes.
+    NotCanonical,
     /// The underlying secp256k1 primitive rejected the bytes.
     Secp(secp256k1::Error),
 }
@@ -48,6 +57,10 @@ impl core::fmt::Display for K1Error {
             K1Error::BadLength => write!(f, "invalid data length"),
             K1Error::BadChecksum => write!(f, "checksum mismatch"),
             K1Error::BadKeyType => write!(f, "unexpected key type tag"),
+            K1Error::BadRecoveryHeader(h) => {
+                write!(f, "signature header {h} is outside the valid range 27..35")
+            }
+            K1Error::NotCanonical => write!(f, "signature is not canonical"),
             K1Error::Secp(e) => write!(f, "secp256k1 error: {e}"),
         }
     }

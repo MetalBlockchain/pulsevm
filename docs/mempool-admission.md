@@ -55,9 +55,19 @@ For a new packed transaction, `RpcService::admit_transaction` performs:
 2. If expiry is due, briefly take the write lock and remove expired entries.
 3. Clone the installed `MempoolAdmissionState` and run preflight on Tokio's
    blocking pool. This avoids holding an async runtime worker for signature
-   recovery and database reads.
+   recovery and database reads. Preflight checks shape, lifetime, referenced
+   accounts and permissions, then — before signature recovery — that the first
+   authorizer can afford the transaction: its available CPU must cover
+   `min_transaction_cpu_usage` and its available NET must cover the same initial
+   NET estimate execution bills (`check_payer_resource_window`). These are the
+   objective limits execution enforces anyway; checking them here means a
+   transaction that could never be included is refused to the sender instead of
+   occupying a pool slot and a block builder's time. Unlimited accounts (`-1`)
+   pass, as at execution.
 4. Take the mempool write lock, prune if necessary, and atomically perform the
-   final ID/capacity check and insertion.
+   final ID/capacity check and insertion. A full pool is an **error** to the
+   sender (`mempool refused transaction: …`), not a silent "accepted": `issueTx`
+   never answers with a tx id it will not build.
 
 The final insertion is intentionally the deduplication point. Several identical
 requests may complete preflight concurrently, but at most one becomes a pool
@@ -162,3 +172,10 @@ signature recovery, database reads, and scheduling.
   can provide complete production lock attribution.
 - A longer release-build load test, with before/after baselines and multiple
   ingress nodes, is needed before making sustained-throughput claims.
+- The admission window check reads the consensus resource limits only. Once the
+  node-local subjective-billing ledger for failed transactions (#86) is shared
+  with `MempoolAdmissionState`, the check should deduct the payer's outstanding
+  subjective charge too, so a flooding account is refused before signature
+  recovery rather than at block build. There is deliberately no per-payer
+  pending bound: legitimate high-volume senders keep dozens of transactions in
+  flight, and a bill-aware window check makes such a bound redundant.

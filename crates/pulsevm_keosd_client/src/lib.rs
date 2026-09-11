@@ -10,6 +10,10 @@ use crate::types::SignedKeosdTransaction;
 
 pub mod types;
 
+#[cfg(test)]
+#[path = "tests/mod.rs"]
+mod client_tests;
+
 // ---------------------------------------------------------------------------
 // Error types
 // ---------------------------------------------------------------------------

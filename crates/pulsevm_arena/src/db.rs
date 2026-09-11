@@ -3,7 +3,6 @@ use std::{
         Any,
         TypeId,
     },
-    collections::HashMap,
     path::Path,
 };
 
@@ -98,7 +97,7 @@ fn append_frame(path: &Path, frame: &[u8]) -> Result<(), DbError> {
 
 /// Type-erased view of a `Table<T>` so the database can drive the shared
 /// revision/undo lifecycle across a heterogeneous set of tables.
-trait AbstractTable: Send {
+trait AbstractTable: Send + Sync {
     fn start_undo_session(&mut self) -> i64;
     fn revision(&self) -> i64;
     fn set_revision(&mut self, revision: i64) -> Result<(), TableError>;
@@ -190,8 +189,9 @@ impl<T: ArenaObject> AbstractTable for Table<T> {
 #[derive(Default)]
 pub struct Db {
     tables: Vec<Box<dyn AbstractTable>>,
-    by_type_id: HashMap<u16, usize>,
-    by_rust_type: HashMap<TypeId, usize>,
+    // Arena type ids are compact consensus schema constants. Direct indexing
+    // avoids hashing Rust TypeId on every row operation in the execution path.
+    by_type_id: Vec<Option<(TypeId, usize)>>,
 }
 
 impl Db {
@@ -203,7 +203,13 @@ impl Db {
     /// revision range of the already-registered tables, so every table shares
     /// one undo stack depth.
     pub fn add_table<T: ArenaObject>(&mut self) -> Result<(), DbError> {
-        if self.by_type_id.contains_key(&T::TYPE_ID) {
+        let type_id = usize::from(T::TYPE_ID);
+        if self
+            .by_type_id
+            .get(type_id)
+            .and_then(|entry| *entry)
+            .is_some()
+        {
             return Err(DbError::TypeIdInUse {
                 type_id: T::TYPE_ID,
                 type_name: T::type_name(),
@@ -219,15 +225,19 @@ impl Db {
         }
         let pos = self.tables.len();
         self.tables.push(Box::new(table));
-        self.by_type_id.insert(T::TYPE_ID, pos);
-        self.by_rust_type.insert(TypeId::of::<T>(), pos);
+        if self.by_type_id.len() <= type_id {
+            self.by_type_id.resize(type_id + 1, None);
+        }
+        self.by_type_id[type_id] = Some((TypeId::of::<T>(), pos));
         Ok(())
     }
 
     fn pos<T: ArenaObject>(&self) -> Result<usize, DbError> {
-        self.by_rust_type
-            .get(&TypeId::of::<T>())
-            .copied()
+        self.by_type_id
+            .get(usize::from(T::TYPE_ID))
+            .and_then(|entry| *entry)
+            .filter(|(rust_type, _)| *rust_type == TypeId::of::<T>())
+            .map(|(_, position)| position)
             .ok_or(DbError::NotRegistered {
                 type_name: T::type_name(),
             })
@@ -428,9 +438,14 @@ impl Db {
                 .checked_add(len)
                 .filter(|end| *end <= data.len())
                 .ok_or_else(|| DbError::Corrupted("section extends past checkpoint".into()))?;
-            let table_pos = *self.by_type_id.get(&type_id).ok_or_else(|| {
-                DbError::Corrupted(format!("checkpoint has unregistered type_id {type_id}"))
-            })?;
+            let table_pos = self
+                .by_type_id
+                .get(usize::from(type_id))
+                .and_then(|entry| *entry)
+                .map(|(_, position)| position)
+                .ok_or_else(|| {
+                    DbError::Corrupted(format!("checkpoint has unregistered type_id {type_id}"))
+                })?;
             self.tables[table_pos].load_from(&data[pos..end])?;
             pos = end;
         }
@@ -508,9 +523,14 @@ impl Db {
                 .checked_add(len)
                 .filter(|end| *end <= frame.len())
                 .ok_or_else(|| DbError::Corrupted("delta extends past frame".into()))?;
-            let table_pos = *self.by_type_id.get(&type_id).ok_or_else(|| {
-                DbError::Corrupted(format!("delta for unregistered type_id {type_id}"))
-            })?;
+            let table_pos = self
+                .by_type_id
+                .get(usize::from(type_id))
+                .and_then(|entry| *entry)
+                .map(|(_, position)| position)
+                .ok_or_else(|| {
+                    DbError::Corrupted(format!("delta for unregistered type_id {type_id}"))
+                })?;
             self.tables[table_pos].apply_delta(&frame[pos..end])?;
             pos = end;
         }

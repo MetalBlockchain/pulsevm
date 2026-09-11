@@ -112,7 +112,7 @@ fn derive(
     let mut database = Database::new(&temp.path().to_string_lossy(), DB_SIZE)
         .map_err(|e| format!("open temporary database: {e}"))?;
     database
-        .restore_from_bytes(&input)
+        .restore_from_path(std::path::Path::new(input_path))
         .map_err(|e| format!("restore input checkpoint: {e}"))?;
 
     let key = K1PrivateKey::from_string(private_key)

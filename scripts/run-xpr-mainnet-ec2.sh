@@ -59,6 +59,12 @@ Environment:
   PULSEVM_EC2_RUN_DIR           Durable artifacts/session root (default: build/...).
   METALGO_EXEC_PATH             Matching MetalGo binary (required).
   METAL_NETWORK_RUNNER_PATH     Runner binary (default: ../metal-network-runner/bin/...).
+  METAL_NETWORK_RUNNER_PORT     Runner listen address (default: 127.0.0.1:8080).
+  METAL_NETWORK_RUNNER_GATEWAY_PORT
+                                Runner gateway address (default: 127.0.0.1:8081).
+  METAL_NETWORK_RUNNER_ENDPOINT Runner control endpoint (defaults to runner port).
+  METAL_NETWORK_RUNNER_REASSIGN_PORTS_IF_USED=true
+                                Choose free MetalGo ports when another cluster is running.
   PULSEVM_TEST_PRIVATE_KEY      Disposable K1 key used only by this test network.
   PULSEVM_PRODUCER_NAME         Imported producer account (default: pulse).
   PULSEVM_PRODUCER_KEY          Real producer key, required only with the option below.
@@ -333,11 +339,17 @@ pid_is_cluster_supervisor() {
 
 start_cluster() {
   check_build_prerequisites
-  local metalgo runner
+  local metalgo runner runner_port runner_gateway_port runner_endpoint reassign_ports
   metalgo="$(find_metalgo)"
   runner="$(find_runner)"
+  runner_port="${METAL_NETWORK_RUNNER_PORT:-127.0.0.1:8080}"
+  runner_gateway_port="${METAL_NETWORK_RUNNER_GATEWAY_PORT:-127.0.0.1:8081}"
+  runner_endpoint="${METAL_NETWORK_RUNNER_ENDPOINT:-$runner_port}"
+  reassign_ports="${METAL_NETWORK_RUNNER_REASSIGN_PORTS_IF_USED:-false}"
   [[ -x "$metalgo" ]] || fail "MetalGo is not executable: $metalgo"
   [[ -x "$runner" ]] || fail "metal-network-runner is not executable: $runner"
+  [[ "$reassign_ports" == "true" || "$reassign_ports" == "false" ]] || \
+    fail "METAL_NETWORK_RUNNER_REASSIGN_PORTS_IF_USED must be true or false"
 
   if [[ -s "$PID_FILE" ]] && pid_is_running "$(<"$PID_FILE")"; then
     fail "a cluster is already running with PID $(<"$PID_FILE")"
@@ -363,9 +375,10 @@ start_cluster() {
     LLVM_SYS_221_PREFIX="${LLVM_SYS_221_PREFIX:-/usr/lib/llvm-22}" \
     METALGO_EXEC_PATH="$metalgo" \
     METAL_NETWORK_RUNNER_PATH="$runner" \
-    METAL_NETWORK_RUNNER_PORT="127.0.0.1:8080" \
-    METAL_NETWORK_RUNNER_GATEWAY_PORT="127.0.0.1:8081" \
-    METAL_NETWORK_RUNNER_ENDPOINT="127.0.0.1:8080" \
+    METAL_NETWORK_RUNNER_PORT="$runner_port" \
+    METAL_NETWORK_RUNNER_GATEWAY_PORT="$runner_gateway_port" \
+    METAL_NETWORK_RUNNER_ENDPOINT="$runner_endpoint" \
+    METAL_NETWORK_RUNNER_REASSIGN_PORTS_IF_USED="$reassign_ports" \
     METAL_NETWORK_RUNNER_ROOT_DATA_DIR="$session/nodes" \
     PULSEVM_MIGRATION_CHECKPOINT="$BOOT_CHECKPOINT" \
     PULSEVM_MIGRATION_MANIFEST="$BOOT_MANIFEST" \

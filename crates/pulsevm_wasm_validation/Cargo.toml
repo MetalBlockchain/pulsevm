@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 thiserror = "2.0.18"
-wasmparser = "0.245.1"
+wasmparser = "0.258"
 
 [dev-dependencies]
 wat = "1"

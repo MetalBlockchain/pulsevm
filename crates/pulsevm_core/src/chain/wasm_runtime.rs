@@ -1,11 +1,31 @@
 use std::{
     borrow::Cow,
     cell::RefCell,
-    collections::BTreeSet,
+    collections::{
+        BTreeSet,
+        HashSet,
+    },
+    fs,
+    io::Write,
     num::NonZeroUsize,
+    path::{
+        Path,
+        PathBuf,
+    },
     sync::{
         Arc,
+        Mutex,
         RwLock,
+        mpsc::{
+            SyncSender,
+            TrySendError,
+            sync_channel,
+        },
+    },
+    thread,
+    time::{
+        Duration,
+        Instant,
     },
 };
 
@@ -37,6 +57,7 @@ use wasmer::{
         CompilerConfig,
         EngineBuilder,
         Features,
+        NativeEngineExt,
     },
     wasmparser::Operator,
 };
@@ -59,6 +80,8 @@ use crate::chain::{
         ProtocolVersion,
     },
     transaction::Action,
+    wasm_bulk_metering::BulkMemoryMetering,
+    wasm_tunables::deterministic_tunables,
     webassembly::{
         __addtf3,
         __ashlti3,
@@ -297,6 +320,129 @@ fn private_export_name(existing: &mut BTreeSet<Vec<u8>>, prefix: &[u8], index: u
     }
     existing.insert(name.clone());
     name
+}
+
+/// Convert a WebAssembly start section into a private zero-argument export.
+///
+/// XPR's runtimes initialize/reset memory and globals before invoking the start
+/// function for each action. Wasmer invokes a start section inside
+/// `Instance::new`, before PulseVM can attach the instance memory and execution
+/// context. Deferring the same function until immediately before `apply`
+/// reproduces XPR's lifecycle without changing the stored contract bytes.
+fn defer_start_function(code: &[u8]) -> Result<(Cow<'_, [u8]>, Option<String>), ChainError> {
+    const WASM_HEADER: &[u8; 8] = b"\0asm\x01\0\0\0";
+    if code.get(..WASM_HEADER.len()) != Some(WASM_HEADER) {
+        return Err(ChainError::WasmRuntimeError(
+            "invalid wasm header".to_string(),
+        ));
+    }
+
+    let mut offset = WASM_HEADER.len();
+    let mut export_section = None;
+    let mut start_section = None;
+    let mut export_names = BTreeSet::new();
+    while offset < code.len() {
+        let section_start = offset;
+        let section_id = code[offset];
+        offset += 1;
+        let section_size = read_var_u32(code, &mut offset)? as usize;
+        let payload_start = offset;
+        let payload_end = payload_start.checked_add(section_size).ok_or_else(|| {
+            ChainError::WasmRuntimeError("wasm section size overflow".to_string())
+        })?;
+        if payload_end > code.len() {
+            return Err(ChainError::WasmRuntimeError(
+                "truncated wasm section".to_string(),
+            ));
+        }
+        match section_id {
+            7 => {
+                export_section = Some((section_start, payload_start, payload_end));
+                let mut cursor = payload_start;
+                let count = read_var_u32(code, &mut cursor)?;
+                for _ in 0..count {
+                    let name_len = read_var_u32(code, &mut cursor)? as usize;
+                    let name_end = cursor.checked_add(name_len).ok_or_else(|| {
+                        ChainError::WasmRuntimeError("wasm export name overflow".to_string())
+                    })?;
+                    export_names.insert(
+                        code.get(cursor..name_end)
+                            .ok_or_else(|| {
+                                ChainError::WasmRuntimeError("truncated wasm export".to_string())
+                            })?
+                            .to_vec(),
+                    );
+                    cursor = name_end.checked_add(1).ok_or_else(|| {
+                        ChainError::WasmRuntimeError("wasm export overflow".to_string())
+                    })?;
+                    let _index = read_var_u32(code, &mut cursor)?;
+                }
+            }
+            8 => {
+                let mut cursor = payload_start;
+                let function_index = read_var_u32(code, &mut cursor)?;
+                if cursor != payload_end {
+                    return Err(ChainError::WasmRuntimeError(
+                        "invalid wasm start section".to_string(),
+                    ));
+                }
+                start_section = Some((section_start, payload_end, function_index));
+            }
+            _ => {}
+        }
+        offset = payload_end;
+    }
+
+    let Some((start_start, start_end, function_index)) = start_section else {
+        return Ok((Cow::Borrowed(code), None));
+    };
+    let export_name = private_export_name(&mut export_names, b"__pulsevm_start_", function_index);
+    let mut entry = Vec::with_capacity(export_name.len() + 8);
+    write_var_u32(export_name.len() as u32, &mut entry);
+    entry.extend_from_slice(&export_name);
+    entry.push(0); // external_kind::function
+    write_var_u32(function_index, &mut entry);
+
+    let mut output = Vec::with_capacity(code.len() + entry.len() + 8);
+    if let Some((export_start, payload_start, payload_end)) = export_section {
+        if payload_end > start_start {
+            return Err(ChainError::WasmRuntimeError(
+                "wasm export section follows start section".to_string(),
+            ));
+        }
+        let mut entries_start = payload_start;
+        let export_count = read_var_u32(code, &mut entries_start)?;
+        let mut payload = Vec::with_capacity(payload_end - payload_start + entry.len());
+        write_var_u32(
+            export_count
+                .checked_add(1)
+                .ok_or_else(|| ChainError::WasmRuntimeError("too many wasm exports".into()))?,
+            &mut payload,
+        );
+        payload.extend_from_slice(&code[entries_start..payload_end]);
+        payload.extend_from_slice(&entry);
+
+        output.extend_from_slice(&code[..export_start]);
+        output.push(7);
+        write_var_u32(payload.len() as u32, &mut output);
+        output.extend_from_slice(&payload);
+        output.extend_from_slice(&code[payload_end..start_start]);
+        output.extend_from_slice(&code[start_end..]);
+    } else {
+        let mut payload = Vec::with_capacity(entry.len() + 1);
+        write_var_u32(1, &mut payload);
+        payload.extend_from_slice(&entry);
+        output.extend_from_slice(&code[..start_start]);
+        output.push(7);
+        write_var_u32(payload.len() as u32, &mut output);
+        output.extend_from_slice(&payload);
+        output.extend_from_slice(&code[start_end..]);
+    }
+
+    Ok((
+        Cow::Owned(output),
+        Some(String::from_utf8(export_name).expect("private export name is ASCII")),
+    ))
 }
 
 /// Exposes local globals and tables in the private compilation copy so a warm
@@ -599,6 +745,10 @@ pub struct WasmContext {
     return_value: Option<Bytes>,
 }
 
+#[cfg(test)]
+#[path = "webassembly/tests/mod.rs"]
+mod host_function_tests;
+
 impl WasmContext {
     pub fn new(
         receiver: Name,
@@ -629,12 +779,10 @@ impl WasmContext {
     /// amount changes billed CPU, which is committed to the block, so it is a
     /// consensus rule — every node must run the identical table.
     pub fn charge(&self, store: &mut impl AsStoreMut, amount: u64) -> Result<(), RuntimeError> {
-        // The globals are captured only after `Instance::new`, so an intrinsic
-        // reached from a module's start/initializer during instantiation has no
-        // budget handle yet. That phase isn't billed anyway -- `run` reseeds the
-        // metering points after instantiation and measures only the `apply`
-        // call -- so skip the charge rather than fail instantiation. During
-        // `apply`, where billing happens, the instance is always set.
+        // Defensive fallback for host calls made before an execution context is
+        // attached. Historical XPR start functions are deferred until after
+        // memory and metering are attached, so their intrinsics take the normal
+        // charged path.
         let Some(metering) = self.metering.as_ref() else {
             return Ok(());
         };
@@ -756,6 +904,21 @@ impl MeteringGlobals {
             )),
         }
     }
+
+    #[inline]
+    fn remaining(&self, store: &mut impl AsStoreMut) -> Result<u64, RuntimeError> {
+        match self.remaining.get(store) {
+            Value::I64(value) => Ok(value as u64),
+            _ => Err(RuntimeError::new(
+                "metering remaining global has the wrong type",
+            )),
+        }
+    }
+
+    #[inline]
+    fn set_remaining(&self, store: &mut impl AsStoreMut, points: u64) -> Result<(), RuntimeError> {
+        self.remaining.set(store, Value::I64(points as i64))
+    }
 }
 
 fn charge_metering_globals(
@@ -763,17 +926,39 @@ fn charge_metering_globals(
     metering: &MeteringGlobals,
     amount: u64,
 ) -> Result<(), RuntimeError> {
-    match metering.get(store)? {
-        MeteringPoints::Remaining(remaining) if remaining >= amount => {
-            metering.set(store, remaining - amount)?;
-            Ok(())
-        }
-        _ => {
-            metering.set(store, 0)?;
-            Err(RuntimeError::new(
-                "cpu usage limit exceeded while charging a host intrinsic",
-            ))
-        }
+    // The metering middleware checks the exhausted flag immediately before a
+    // WASM `call`, so a host intrinsic is reachable only while that flag is
+    // clear. Read and update the remaining-points global directly here rather
+    // than doing two extra dynamic global accesses on every host call. The full
+    // two-global state is still initialized before execution and inspected when
+    // execution returns.
+    let remaining = metering.remaining(store)?;
+    if remaining >= amount {
+        metering.set_remaining(store, remaining - amount)?;
+        Ok(())
+    } else {
+        metering.set_remaining(store, 0)?;
+        Err(RuntimeError::new(
+            "cpu usage limit exceeded while charging a host intrinsic",
+        ))
+    }
+}
+
+fn execution_meter_budget(cpu_limit: i64, accepted_block_replay: bool) -> u64 {
+    if cpu_limit >= 0 {
+        cpu_limit as u64
+    } else if accepted_block_replay {
+        crate::config::ACCEPTED_BLOCK_REPLAY_CPU_BUDGET
+    } else {
+        crate::config::IMPLICIT_TX_CPU_BUDGET
+    }
+}
+
+fn metered_cpu_to_bill(accepted_block_replay: bool, budget: u64, remaining: u64) -> u64 {
+    if accepted_block_replay {
+        0
+    } else {
+        budget.saturating_sub(remaining)
     }
 }
 
@@ -925,7 +1110,14 @@ struct CachedModule {
     module: Module,
     engine: Engine,
     reset_exports: ResetStateExports,
+    start_export: Option<String>,
     resettable: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModuleCacheStatus {
+    Compiled,
+    Artifact,
 }
 
 fn module_is_resettable(module: &Module) -> bool {
@@ -975,22 +1167,51 @@ struct WarmStore {
 /// than a 4 GiB reservation), which keeps an idle store cheap even at this count.
 const MAX_INSTANCES_PER_STORE: u32 = 64;
 
+/// Bound resident linear memories independently from the compiled-module
+/// cache. Historical replay encounters hundreds of contracts, many only once;
+/// retaining a warm store for every code hash can otherwise pin tens of GiB
+/// even though the active workload has a small hot set. Eviction affects only
+/// instance setup cost — compiled modules and consensus-visible execution stay
+/// unchanged.
+const MAX_WARM_STORES: usize = 64;
+
+/// Bound LLVM modules independently from their much smaller WASM inputs. A
+/// long historical replay sees thousands of obsolete deployments, and keeping
+/// 1,024 native modules resident can exhaust a node even though only a small
+/// working set remains active. This cache is non-consensus and may be tuned for
+/// the host; the hard ceiling prevents an accidental unbounded configuration.
+const DEFAULT_MAX_CACHED_MODULES: usize = 256;
+const MAX_CACHED_MODULES: usize = 1024;
+
+/// Serialized modules contain native code plus the output of PulseVM's WASM
+/// transforms and metering middleware. Bump this namespace whenever any of
+/// those inputs change so an old artifact is never reused under new rules.
+const WASM_ARTIFACT_CACHE_NAMESPACE: &str = "wasmer-7.2.0-llvm-pulsevm-v1";
+
 // A warm store owns raw VM pointers and so is neither `Send` nor `Sync`; it
 // cannot live in the shared runtime state. Keep the pool thread-local instead —
 // block application is sequential on a given thread, so a warm store is only
 // ever touched by the thread that built it, and no synchronization is needed.
 thread_local! {
     static STORE_POOL: RefCell<LruCache<Id, WarmStore>> =
-        RefCell::new(LruCache::new(NonZeroUsize::new(1024).unwrap()));
+        RefCell::new(LruCache::new(NonZeroUsize::new(MAX_WARM_STORES).unwrap()));
 }
 
 struct InnerWasmRuntime {
     code_cache: LruCache<Id, CachedModule>,
+    precompiling: HashSet<Id>,
 }
 
 #[derive(Clone)]
 pub struct WasmRuntime {
     inner: Arc<RwLock<InnerWasmRuntime>>,
+    precompile_tx: Option<SyncSender<PrecompileJob>>,
+    artifact_cache_dir: Option<PathBuf>,
+}
+
+struct PrecompileJob {
+    id: Id,
+    code: Vec<u8>,
 }
 
 const COST_FUNCTION: fn(&Operator) -> u64 = |operator: &Operator| -> u64 {
@@ -1029,7 +1250,11 @@ const COST_FUNCTION: fn(&Operator) -> u64 = |operator: &Operator| -> u64 {
         Operator::F32Mul { .. } | Operator::F64Mul { .. } => 26,
         Operator::F32Div { .. } | Operator::F64Div { .. } => 80,
         Operator::F32Sqrt { .. } | Operator::F64Sqrt { .. } => 110,
-        Operator::MemoryCopy { .. } | Operator::MemoryFill { .. } => 500,
+        // Priced by `BulkMemoryMetering`, not here: the cost depends on the
+        // length operand, which this function never sees. Charging anything at
+        // this site would stack on top of the length-aware charge and make the
+        // real price the sum of two constants in two files.
+        Operator::MemoryCopy { .. } | Operator::MemoryFill { .. } => 0,
         Operator::MemoryGrow { .. } => 1000, // Higher cost for memory growth
         _ => 1,                              // Default cost
     }
@@ -1037,11 +1262,93 @@ const COST_FUNCTION: fn(&Operator) -> u64 = |operator: &Operator| -> u64 {
 
 impl WasmRuntime {
     pub fn new() -> Result<Self, ChainError> {
+        let code_cache_entries = std::env::var("PULSEVM_WASM_MODULE_CACHE_ENTRIES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|entries| *entries > 0)
+            .unwrap_or(DEFAULT_MAX_CACHED_MODULES)
+            .min(MAX_CACHED_MODULES);
+        let inner = Arc::new(RwLock::new(InnerWasmRuntime {
+            code_cache: LruCache::new(
+                NonZeroUsize::new(code_cache_entries).expect("module cache capacity is non-zero"),
+            ),
+            precompiling: HashSet::new(),
+        }));
+        let artifact_cache_dir = std::env::var_os("PULSEVM_WASM_ARTIFACT_CACHE_DIR")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .map(|root| {
+                root.join(format!(
+                    "{WASM_ARTIFACT_CACHE_NAMESPACE}-{}",
+                    std::env::consts::ARCH
+                ))
+            });
+        if let Some(directory) = &artifact_cache_dir {
+            fs::create_dir_all(directory).map_err(|error| {
+                ChainError::WasmRuntimeError(format!(
+                    "cannot create WASM artifact cache {}: {error}",
+                    directory.display()
+                ))
+            })?;
+        }
+        let precompile_threads = std::env::var("PULSEVM_WASM_PRECOMPILE_THREADS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0)
+            .min(32);
+        let precompile_tx =
+            Self::start_precompile_workers(&inner, precompile_threads, artifact_cache_dir.clone())?;
+
         Ok(Self {
-            inner: Arc::new(RwLock::new(InnerWasmRuntime {
-                code_cache: LruCache::new(NonZeroUsize::new(1024).unwrap()),
-            })),
+            inner,
+            precompile_tx,
+            artifact_cache_dir,
         })
+    }
+
+    fn start_precompile_workers(
+        inner: &Arc<RwLock<InnerWasmRuntime>>,
+        threads: usize,
+        artifact_cache_dir: Option<PathBuf>,
+    ) -> Result<Option<SyncSender<PrecompileJob>>, ChainError> {
+        if threads == 0 {
+            return Ok(None);
+        }
+
+        let (tx, rx) = sync_channel::<PrecompileJob>(threads.saturating_mul(4).max(1));
+        let rx = Arc::new(Mutex::new(rx));
+        for index in 0..threads {
+            let inner = Arc::clone(inner);
+            let rx = Arc::clone(&rx);
+            let artifact_cache_dir = artifact_cache_dir.clone();
+            thread::Builder::new()
+                .name(format!("wasm-precompile-{index}"))
+                .spawn(move || {
+                    loop {
+                        let job = match rx.lock().ok().and_then(|receiver| receiver.recv().ok()) {
+                            Some(job) => job,
+                            None => break,
+                        };
+                        let compiled =
+                            Self::compile_module(&job.code, job.id, artifact_cache_dir.as_deref());
+                        let Ok(mut runtime) = inner.write() else {
+                            break;
+                        };
+                        runtime.precompiling.remove(&job.id);
+                        if let Ok((module, _)) = compiled
+                            && !runtime.code_cache.contains(&job.id)
+                        {
+                            runtime.code_cache.put(job.id, module);
+                        }
+                    }
+                })
+                .map_err(|error| {
+                    ChainError::WasmRuntimeError(format!(
+                        "failed to start wasm precompile worker: {error}"
+                    ))
+                })?;
+        }
+        Ok(Some(tx))
     }
 
     // The wasm feature set we pin contract execution to. Left implicit,
@@ -1076,11 +1383,155 @@ impl WasmRuntime {
     fn deterministic_engine() -> Engine {
         let mut compiler = LLVM::default();
         compiler.push_middleware(Arc::new(Metering::new(1_000, COST_FUNCTION)));
+        // Must come after Metering: it reuses the globals Metering installs, and
+        // it prices the bulk-memory ops whose cost the static COST_FUNCTION
+        // cannot express (the length is an operand, not an immediate).
+        compiler.push_middleware(Arc::new(BulkMemoryMetering::new()));
         LLVM::canonicalize_nans(&mut compiler, true);
         LLVM::opt_level(&mut compiler, LLVMOptLevel::Aggressive);
-        EngineBuilder::new(compiler)
+        let mut engine: Engine = EngineBuilder::new(compiler)
             .set_features(Some(Self::deterministic_features()))
-            .into()
+            .into();
+        // Clamp linear memory and tables at instantiation. The validator rejects
+        // a module that *declares* more, but a normal module declares no maximum
+        // at all, and stock wasmer then allows growth to 4 GiB. These tunables
+        // are the binding limit, and they also cover code already in state that
+        // is never re-validated (genesis, snapshot restore).
+        let tunables = deterministic_tunables(engine.target());
+        engine.set_tunables(tunables);
+        engine
+    }
+
+    fn compile_module(
+        code_bytes: &[u8],
+        id: Id,
+        artifact_cache_dir: Option<&Path>,
+    ) -> Result<(CachedModule, ModuleCacheStatus), ChainError> {
+        let runtime_code = expose_internal_memory(code_bytes)?;
+        let (runtime_code, reset_exports) = expose_reset_state(runtime_code.as_ref())?;
+        let (runtime_code, start_export) = defer_start_function(runtime_code.as_ref())?;
+        let engine = Self::deterministic_engine();
+        let store = Store::new(engine.clone());
+        let artifact_path = artifact_cache_dir
+            .map(|directory| directory.join(format!("{}.artifact", hex::encode(id.as_bytes()))));
+        if let Some(path) = &artifact_path
+            && path.is_file()
+        {
+            // SAFETY: this opt-in directory contains only artifacts emitted by
+            // this runtime below. The versioned namespace separates changes to
+            // Wasmer, the compiler, transforms, and metering configuration.
+            if let Ok(module) = unsafe { Module::deserialize_from_file(&store, path) } {
+                let resettable = instance_reuse_enabled() && module_is_resettable(&module);
+                return Ok((
+                    CachedModule {
+                        module,
+                        engine,
+                        reset_exports,
+                        start_export,
+                        resettable,
+                    },
+                    ModuleCacheStatus::Artifact,
+                ));
+            }
+        }
+        let module = Module::new(store.engine(), runtime_code.as_ref())
+            .map_err(|error| ChainError::WasmRuntimeError(error.to_string()))?;
+        let resettable = instance_reuse_enabled() && module_is_resettable(&module);
+        if let (Some(directory), Some(path)) = (artifact_cache_dir, artifact_path) {
+            // Cache persistence is an optimization. A full disk, concurrent
+            // writer, or incompatible stale file must never reject a block.
+            let _ = Self::persist_module_artifact(directory, &path, &module);
+        }
+        Ok((
+            CachedModule {
+                module,
+                engine,
+                reset_exports,
+                start_export,
+                resettable,
+            },
+            ModuleCacheStatus::Compiled,
+        ))
+    }
+
+    fn persist_module_artifact(
+        directory: &Path,
+        path: &Path,
+        module: &Module,
+    ) -> Result<(), String> {
+        let serialized = module.serialize().map_err(|error| error.to_string())?;
+        let mut staged = tempfile::NamedTempFile::new_in(directory)
+            .map_err(|error| format!("create artifact: {error}"))?;
+        staged
+            .as_file_mut()
+            .write_all(serialized.as_ref())
+            .map_err(|error| format!("write artifact: {error}"))?;
+        staged
+            .persist(path)
+            .map_err(|error| format!("install artifact: {}", error.error))?;
+        Ok(())
+    }
+
+    /// Queue validated contract bytecode for best-effort compilation before its
+    /// first execution. The queue is bounded and never blocks block execution;
+    /// a cache miss still compiles synchronously with identical settings.
+    pub(crate) fn schedule_precompile(&self, code_hash: [u8; 32], code: Vec<u8>) {
+        let Some(tx) = &self.precompile_tx else {
+            return;
+        };
+        let id = Id::new(code_hash);
+        {
+            let Ok(mut inner) = self.inner.write() else {
+                return;
+            };
+            if inner.code_cache.contains(&id) || !inner.precompiling.insert(id) {
+                return;
+            }
+        }
+
+        if let Err(TrySendError::Full(job) | TrySendError::Disconnected(job)) =
+            tx.try_send(PrecompileJob { id, code })
+            && let Ok(mut inner) = self.inner.write()
+        {
+            inner.precompiling.remove(&job.id);
+        }
+    }
+
+    /// Queue an already-deployed contract without copying its bytecode on every
+    /// replay look-ahead pass. The cache reservation happens before the database
+    /// lookup, so repeated action receivers are a cheap hash-table hit.
+    pub(crate) fn schedule_database_precompile(
+        &self,
+        database: &Database,
+        code_hash: [u8; 32],
+        vm_type: u8,
+        vm_version: u8,
+    ) {
+        let Some(tx) = &self.precompile_tx else {
+            return;
+        };
+        let id = Id::new(code_hash);
+        {
+            let Ok(mut inner) = self.inner.write() else {
+                return;
+            };
+            if inner.code_cache.contains(&id) || !inner.precompiling.insert(id) {
+                return;
+            }
+        }
+
+        let Ok(code) = database.get_code_bytes_by_hash(&code_hash, vm_type, vm_version) else {
+            if let Ok(mut inner) = self.inner.write() {
+                inner.precompiling.remove(&id);
+            }
+            return;
+        };
+        if let Err(TrySendError::Full(job) | TrySendError::Disconnected(job)) =
+            tx.try_send(PrecompileJob { id, code })
+            && let Ok(mut inner) = self.inner.write()
+        {
+            inner.precompiling.remove(&job.id);
+        }
     }
 
     pub fn run(
@@ -1091,40 +1542,37 @@ impl WasmRuntime {
         db: Database,
         code_hash: &[u8; 32],
         cpu_limit: i64,
-    ) -> Result<u64, ChainError> {
+    ) -> Result<(), ChainError> {
+        let profiling = super::replay_profile::enabled();
+        let call_started = profiling.then(Instant::now);
+        let account_name = action.account().as_u64();
+        let action_name = action.name().as_u64();
         // Pause timer
         apply_context.pause_billing_timer()?;
 
         let id = Id::new(*code_hash);
-        let module = {
+        let module_started = profiling.then(Instant::now);
+        let mut compiled = false;
+        let cached = self.inner.write()?.code_cache.get(&id).cloned();
+        let module = if let Some(module) = cached {
+            module
+        } else {
+            compiled = true;
+            let code_bytes = db.get_code_bytes_by_hash(code_hash, 0, 0)?;
+            // LLVM compilation is deliberately outside the shared cache lock so
+            // replay-only precompile workers cannot stall contract execution.
+            let (candidate, _) =
+                Self::compile_module(&code_bytes, id, self.artifact_cache_dir.as_deref())?;
             let mut inner = self.inner.write()?;
-
-            if !inner.code_cache.contains(&id) {
-                let code_bytes = db.get_code_bytes_by_hash(code_hash, 0, 0)?;
-                let runtime_code = expose_internal_memory(code_bytes.as_slice())?;
-                let (runtime_code, reset_exports) = expose_reset_state(runtime_code.as_ref())?;
-
-                // Compile on a fresh engine carrying the pinned deterministic
-                // config (NaN canonicalization, metering, feature set).
-                let temp_engine = Self::deterministic_engine();
-                let temp_store = Store::new(temp_engine.clone());
-
-                let module = Module::new(temp_store.engine(), runtime_code.as_ref())
-                    .map_err(|e| ChainError::WasmRuntimeError(e.to_string()))?;
-                let resettable = instance_reuse_enabled() && module_is_resettable(&module);
-                inner.code_cache.put(
-                    id,
-                    CachedModule {
-                        module,
-                        engine: temp_engine.clone(),
-                        reset_exports,
-                        resettable,
-                    },
-                );
+            if let Some(module) = inner.code_cache.get(&id) {
+                module.clone()
+            } else {
+                inner.code_cache.put(id, candidate.clone());
+                candidate
             }
-
-            inner.code_cache.get(&id).unwrap().clone()
         };
+        let module_elapsed = module_started.map_or(Duration::ZERO, |started| started.elapsed());
+        let store_started = profiling.then(Instant::now);
         let pooled = STORE_POOL.with(|pool| pool.borrow_mut().pop(&id));
 
         // Reuse a warm store if one is idle in the pool, otherwise build one.
@@ -1209,6 +1657,8 @@ impl WasmRuntime {
                 "action_data_size" => Function::new_typed_with_env(&mut store, &env, action_data_size),
                 "read_action_data" => Function::new_typed_with_env(&mut store, &env, read_action_data),
                 "current_receiver" => Function::new_typed_with_env(&mut store, &env, current_receiver),
+                "get_sender" => Function::new_typed_with_env(&mut store, &env, get_sender),
+                "get_code_hash" => Function::new_typed_with_env(&mut store, &env, get_code_hash),
                 "set_action_return_value" => Function::new_typed_with_env(&mut store, &env, set_action_return_value),
                 "require_auth" => Function::new_typed_with_env(&mut store, &env, require_auth),
                 "has_auth" => Function::new_typed_with_env(&mut store, &env, has_auth),
@@ -1362,7 +1812,9 @@ impl WasmRuntime {
                 resettable_instance: None,
             }
         };
+        let store_elapsed = store_started.map_or(Duration::ZERO, |started| started.elapsed());
 
+        let reset_started = profiling.then(Instant::now);
         let mut resettable = warm.resettable_instance.take();
         if let Some(candidate) = resettable.as_ref() {
             match candidate.reset(&mut warm.store) {
@@ -1370,7 +1822,10 @@ impl WasmRuntime {
                 Ok(false) | Err(_) => resettable = None,
             }
         }
+        let reset_elapsed = reset_started.map_or(Duration::ZERO, |started| started.elapsed());
+        let reused_instance = resettable.is_some();
 
+        let instantiate_started = profiling.then(Instant::now);
         let (instance, apply_func, metering) = if let Some(candidate) = resettable.as_ref() {
             (
                 candidate.instance.clone(),
@@ -1379,8 +1834,14 @@ impl WasmRuntime {
             )
         } else {
             let instance =
-                Instance::new(&mut warm.store, &module.module, &warm.imports).map_err(|e| {
-                    ChainError::WasmRuntimeError(format!("failed to create wasm instance: {e}"))
+                Instance::new(&mut warm.store, &module.module, &warm.imports).map_err(|error| {
+                    ChainError::WasmRuntimeError(format!(
+                        "failed to create wasm instance for receiver {} action {}::{} code {}: {error}",
+                        receiver,
+                        action.account(),
+                        action.name(),
+                        hex::encode(code_hash),
+                    ))
                 })?;
             warm.instances_created += 1;
 
@@ -1417,19 +1878,34 @@ impl WasmRuntime {
                 (instance, apply, metering)
             }
         };
+        let instantiate_elapsed =
+            instantiate_started.map_or(Duration::ZERO, |started| started.elapsed());
 
         warm.env.as_mut(&mut warm.store).memory = exported_memory(&instance);
         warm.env.as_mut(&mut warm.store).metering = Some(metering.clone());
+        let start_func = module
+            .start_export
+            .as_deref()
+            .map(|name| {
+                instance
+                    .exports
+                    .get_typed_function::<(), ()>(&warm.store, name)
+                    .map_err(|_| {
+                        ChainError::WasmRuntimeError(
+                            "failed to find deferred wasm start function".into(),
+                        )
+                    })
+            })
+            .transpose()?;
 
         // cpu_limit == -1 means execution is exempt from the local objective
-        // account/block allowance (implicit actions and explicitly billed block
-        // replay). Seed a large finite deterministic budget so malformed code
-        // still cannot spin forever. See config::IMPLICIT_TX_CPU_BUDGET.
-        let cpu_limit = if cpu_limit >= 0 {
-            cpu_limit as u64
-        } else {
-            crate::config::IMPLICIT_TX_CPU_BUDGET
-        };
+        // account/block allowance. Accepted-block replay needs a wider guard
+        // than implicit system actions because XPR receipts store wall-clock
+        // microseconds while this runtime meters conservative local points.
+        let accepted_block_replay = cpu_limit < 0
+            && apply_context.is_explicitly_billed()?
+            && !apply_context.is_implicit()?;
+        let cpu_limit = execution_meter_budget(cpu_limit, accepted_block_replay);
 
         // Seed through cached handles. Wasmer's public helper performs two
         // string-indexed export lookups per call, which is especially costly for
@@ -1445,16 +1921,39 @@ impl WasmRuntime {
         // watchdog deliberately includes that native wall-clock window.
         apply_context.checktime()?;
 
-        let result = apply_func.call(
-            &mut warm.store,
-            receiver.as_u64() as i64,
-            action.account().as_u64() as i64,
-            action.name().as_u64() as i64,
-        );
+        let apply_started = profiling.then(Instant::now);
+        let result = match start_func {
+            Some(start) => start.call(&mut warm.store).and_then(|()| {
+                apply_func.call(
+                    &mut warm.store,
+                    receiver.as_u64() as i64,
+                    action.account().as_u64() as i64,
+                    action.name().as_u64() as i64,
+                )
+            }),
+            None => apply_func.call(
+                &mut warm.store,
+                receiver.as_u64() as i64,
+                action.account().as_u64() as i64,
+                action.name().as_u64() as i64,
+            ),
+        };
+        let apply_elapsed = apply_started.map_or(Duration::ZERO, |started| started.elapsed());
         let return_value = warm.env.as_ref(&warm.store).return_value.clone();
         let remaining_points = metering
             .get(&mut warm.store)
             .map_err(|error| ChainError::WasmRuntimeError(error.to_string()))?;
+
+        // Capture metered work before interpreting the apply result. Contract
+        // assertions and traps must still pay for every point consumed on the
+        // way to the failure.
+        let cpu_used = match remaining_points {
+            MeteringPoints::Remaining(points) => {
+                metered_cpu_to_bill(accepted_block_replay, cpu_limit, points)
+            }
+            MeteringPoints::Exhausted => cpu_limit,
+        };
+        apply_context.add_cpu_usage(cpu_used)?;
 
         // Return the warm store to the pool for reuse, unless it has spun up
         // enough instances that its object slab is worth reclaiming. The reset
@@ -1465,8 +1964,26 @@ impl WasmRuntime {
             STORE_POOL.with(|pool| pool.borrow_mut().put(id, warm));
         }
 
+        if let Some(started) = call_started {
+            super::replay_profile::record_wasm(
+                account_name,
+                action_name,
+                *code_hash,
+                super::replay_profile::WasmTiming {
+                    total: started.elapsed(),
+                    module: module_elapsed,
+                    store: store_elapsed,
+                    reset: reset_elapsed,
+                    instantiate: instantiate_elapsed,
+                    apply: apply_elapsed,
+                    compiled,
+                    reused_instance,
+                },
+            );
+        }
+
         match remaining_points {
-            MeteringPoints::Remaining(points) => {
+            MeteringPoints::Remaining(_) => {
                 if let Err(e) = result {
                     if e.downcast_ref::<WasmExit>().is_none() {
                         if let Some(chain_err) = e.downcast_ref::<ChainError>() {
@@ -1477,10 +1994,15 @@ impl WasmRuntime {
                 }
 
                 if let Some(value) = return_value {
+                    // ACTION_RETURN_VALUE commits the bytes returned by the
+                    // contract to the action-receipt digest. Keep the receipt
+                    // input and the informational trace in sync after a
+                    // successful guest invocation.
+                    apply_context.set_action_return_value(value.0.clone())?;
                     apply_context.set_trace_return_value(value.0)?;
                 }
 
-                Ok(cpu_limit.saturating_sub(points) as u64)
+                Ok(())
             }
             MeteringPoints::Exhausted => Err(ChainError::ApplyError(format!(
                 "CPU limit of {} exhausted during apply",
@@ -1506,15 +2028,47 @@ mod tests {
         set_remaining_points,
     };
 
+    use crate::chain::webassembly::cost;
+
     use super::{
+        ModuleCacheStatus,
         ResettableInstance,
         WasmRuntime,
         charge_metering_points,
+        defer_start_function,
+        execution_meter_budget,
         exported_memory,
         expose_internal_memory,
         expose_reset_state,
+        metered_cpu_to_bill,
         module_is_resettable,
     };
+
+    #[test]
+    fn serialized_module_artifact_survives_memory_cache_eviction() {
+        let wasm = wat::parse_str(
+            r#"
+            (module
+              (memory 1)
+              (func (export "apply") (param i64 i64 i64)))
+            "#,
+        )
+        .unwrap();
+        let digest = pulsevm_crypto::Digest::hash(&wasm);
+        let id = crate::chain::id::Id::new(digest.0);
+        let directory = tempfile::tempdir().unwrap();
+
+        let (compiled, status) =
+            WasmRuntime::compile_module(&wasm, id, Some(directory.path())).unwrap();
+        assert_eq!(status, ModuleCacheStatus::Compiled);
+        drop(compiled);
+
+        let (restored, status) =
+            WasmRuntime::compile_module(&wasm, id, Some(directory.path())).unwrap();
+        assert_eq!(status, ModuleCacheStatus::Artifact);
+        drop(restored);
+        assert_eq!(directory.path().read_dir().unwrap().count(), 1);
+    }
 
     #[test]
     fn finds_legacy_nonstandard_memory_export() {
@@ -1550,6 +2104,35 @@ mod tests {
         let instance = Instance::new(&mut store, &module, &imports! {}).unwrap();
 
         assert!(exported_memory(&instance).is_some());
+    }
+
+    #[test]
+    fn defers_start_until_after_instance_setup() {
+        let wasm = wat::parse_str(
+            r#"
+            (module
+              (global $counter (export "counter") (mut i32) (i32.const 7))
+              (func $initialize
+                (global.set $counter (i32.add (global.get $counter) (i32.const 1))))
+              (func (export "apply") (param i64 i64 i64))
+              (start $initialize))
+            "#,
+        )
+        .unwrap();
+        let (runtime_wasm, start_export) = defer_start_function(&wasm).unwrap();
+        let mut store = Store::new(WasmRuntime::deterministic_engine());
+        let module = Module::new(&store, runtime_wasm.as_ref()).unwrap();
+        assert!(module.info().start_function.is_none());
+        let instance = Instance::new(&mut store, &module, &imports! {}).unwrap();
+        let counter = instance.exports.get_global("counter").unwrap();
+        assert_eq!(counter.get(&mut store), Value::I32(7));
+
+        let start = instance
+            .exports
+            .get_typed_function::<(), ()>(&store, start_export.as_deref().unwrap())
+            .unwrap();
+        start.call(&mut store).unwrap();
+        assert_eq!(counter.get(&mut store), Value::I32(8));
     }
 
     #[test]
@@ -1720,6 +2303,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn accepted_block_replay_uses_wide_guard_without_local_cpu_billing() {
+        let replay_budget = execution_meter_budget(-1, true);
+        assert_eq!(
+            replay_budget,
+            crate::config::ACCEPTED_BLOCK_REPLAY_CPU_BUDGET
+        );
+        assert_eq!(metered_cpu_to_bill(true, replay_budget, 1), 0);
+
+        assert_eq!(
+            execution_meter_budget(-1, false),
+            crate::config::IMPLICIT_TX_CPU_BUDGET
+        );
+        assert_eq!(execution_meter_budget(123, false), 123);
+        assert_eq!(metered_cpu_to_bill(false, 123, 23), 100);
+    }
+
     // A host intrinsic bills its own work out of the same metering budget the
     // wasm body spends: each charge lowers the remaining points by exactly the
     // amount, and a charge the budget can't cover traps (and zeroes the budget)
@@ -1774,12 +2374,206 @@ mod tests {
         assert_eq!(COST_FUNCTION(&Operator::I64DivU), 80);
         assert_eq!(COST_FUNCTION(&Operator::I64Mul), 3);
         assert_eq!(COST_FUNCTION(&Operator::I64Add), 1); // default
+
+        // Zero here on purpose: bulk memory is priced by `BulkMemoryMetering`,
+        // which is the only site that can see the length operand. Any nonzero
+        // value at this site stacks on top of that and silently makes the real
+        // price the sum of two constants in two files.
+        assert_eq!(COST_FUNCTION(&Operator::MemoryFill { mem: 0 }), 0);
+        assert_eq!(
+            COST_FUNCTION(&Operator::MemoryCopy {
+                dst_mem: 0,
+                src_mem: 0
+            }),
+            0
+        );
     }
 
     // Run a float op on the real deterministic_engine and feed it non-canonical
     // NaNs; each must come back as the one wasm canonical NaN. Off, the input
     // payload leaks through — a platform-dependent, consensus-visible value.
     // Verified: fails with canonicalize_nans off.
+    #[test]
+    fn bulk_memory_is_charged_per_byte() {
+        // `memory.fill` is one instruction that memsets a runtime-chosen length.
+        // wasmer's static cost function cannot see that length, so it priced the
+        // op flat -- the same 500 points whether it wrote one byte or the whole
+        // 33 MiB memory. `BulkMemoryMetering` injects the length-aware charge,
+        // and `COST_FUNCTION` now returns 0 so this is the only price applied.
+        let wasm = wat::parse_str(
+            r#"
+            (module
+              (memory 1)
+              (func (export "fill") (param i32)
+                (memory.fill (i32.const 0) (i32.const 0xff) (local.get 0)))
+              (func (export "noop")))
+            "#,
+        )
+        .unwrap();
+
+        let mut store = Store::new(WasmRuntime::deterministic_engine());
+        let module = Module::new(&store, &wasm).unwrap();
+        let instance = Instance::new(&mut store, &module, &imports! {}).unwrap();
+        let fill: TypedFunction<i32, ()> =
+            instance.exports.get_typed_function(&store, "fill").unwrap();
+
+        let budget = 100_000_000u64;
+        let spend = |store: &mut Store, len: i32| -> u64 {
+            set_remaining_points(store, &instance, budget);
+            fill.call(store, len).unwrap();
+            match get_remaining_points(store, &instance) {
+                MeteringPoints::Remaining(left) => budget - left,
+                MeteringPoints::Exhausted => panic!("budget exhausted unexpectedly"),
+            }
+        };
+
+        let small = spend(&mut store, 1_000);
+        let large = spend(&mut store, 11_000);
+
+        // 10 000 extra bytes at the measured 10 points/byte (cost::memory, the
+        // same slope the host memcpy intrinsic charges).
+        let extra = large - small;
+        assert_eq!(
+            extra, 100_000,
+            "a 10 000 byte increase must cost 10 points/byte (got {extra})"
+        );
+
+        // Under the old flat price the two calls cost the same; they must not.
+        assert!(
+            large > small,
+            "cost must scale with length, got {small} then {large}"
+        );
+
+        // The absolute price, not just the slope.
+        //
+        // Checking only the slope is what let a second charge hide here: while
+        // `COST_FUNCTION` still returned 500 for these operators, the real price
+        // was 800 + 10*len even though the middleware, its tests and its docs
+        // all said 300 + 10*len. The slope was right, so nothing failed.
+        //
+        // `INJECTED_OPS` is the handful of accounting operators the middleware
+        // emits around the intercepted instruction; metering charges 1 for each,
+        // just as the host-intrinsic path pays for its own call and argument
+        // setup. Everything above that must be exactly `cost::memory`.
+        const INJECTED_OPS: u64 = 5;
+        let empty_call = {
+            let noop: TypedFunction<(), ()> =
+                instance.exports.get_typed_function(&store, "noop").unwrap();
+            set_remaining_points(&mut store, &instance, budget);
+            noop.call(&mut store).unwrap();
+            match get_remaining_points(&mut store, &instance) {
+                MeteringPoints::Remaining(left) => budget - left,
+                MeteringPoints::Exhausted => panic!("budget exhausted unexpectedly"),
+            }
+        };
+
+        for len in [0u64, 1, 100] {
+            let measured = spend(&mut store, len as i32) - empty_call;
+            let expected = cost::memory(len) + INJECTED_OPS;
+            assert_eq!(
+                measured, expected,
+                "memory.fill({len}) cost {measured}, expected cost::memory({len}) \
+                 + {INJECTED_OPS} = {expected}; a nonzero COST_FUNCTION entry for \
+                 this operator would show up here"
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_bulk_memory_fill_exhausts_the_budget() {
+        // A fill the budget cannot pay for must trap rather than run to
+        // completion. This is the property that stops `loop { memory.fill(..) }`
+        // from pinning a validator indefinitely.
+        let wasm = wat::parse_str(
+            r#"
+            (module
+              (memory 1)
+              (func (export "fill") (param i32)
+                (memory.fill (i32.const 0) (i32.const 0xff) (local.get 0))))
+            "#,
+        )
+        .unwrap();
+
+        let mut store = Store::new(WasmRuntime::deterministic_engine());
+        let module = Module::new(&store, &wasm).unwrap();
+        let instance = Instance::new(&mut store, &module, &imports! {}).unwrap();
+        let fill: TypedFunction<i32, ()> =
+            instance.exports.get_typed_function(&store, "fill").unwrap();
+
+        // 64 KiB at 10 points/byte is ~655 000; a 1 000 point budget cannot pay.
+        set_remaining_points(&mut store, &instance, 1_000);
+        assert!(
+            fill.call(&mut store, 65_536).is_err(),
+            "a fill beyond the budget must trap"
+        );
+        assert!(
+            matches!(
+                get_remaining_points(&mut store, &instance),
+                MeteringPoints::Exhausted
+            ),
+            "the trap must be recorded as metering exhaustion"
+        );
+    }
+
+    #[test]
+    fn linear_memory_growth_is_clamped_to_the_eosio_ceiling() {
+        // A module that declares no `maximum` -- what every real toolchain emits
+        // -- and then asks for far more than the 528-page EOSIO ceiling. The
+        // validator has nothing to reject here (nothing over-large is
+        // *declared*), so the tunables are the only thing standing between a
+        // contract and a 4 GiB linear memory obtained for 1 000 metering points.
+        //
+        // That ceiling is also what bounds a single `memory.fill`/`memory.copy`,
+        // which are metered at a flat rate regardless of length.
+        let wasm = wat::parse_str(
+            r#"
+            (module
+              (memory 1)
+              (func (export "grow") (param i32) (result i32)
+                (memory.grow (local.get 0)))
+              (func (export "size") (result i32)
+                (memory.size)))
+            "#,
+        )
+        .unwrap();
+
+        let mut store = Store::new(WasmRuntime::deterministic_engine());
+        let module = Module::new(&store, &wasm).unwrap();
+        let instance = Instance::new(&mut store, &module, &imports! {}).unwrap();
+        set_remaining_points(&mut store, &instance, 100_000_000);
+        let grow: TypedFunction<i32, i32> =
+            instance.exports.get_typed_function(&store, "grow").unwrap();
+        let size: TypedFunction<(), i32> =
+            instance.exports.get_typed_function(&store, "size").unwrap();
+
+        let ceiling = crate::chain::wasm_tunables::MAX_LINEAR_MEMORY_PAGES as i32;
+
+        // Asking for the whole 4 GiB address space must be refused. wasm reports
+        // a failed grow as -1 rather than trapping.
+        assert_eq!(
+            grow.call(&mut store, 65_535).unwrap(),
+            -1,
+            "memory.grow past the ceiling must fail"
+        );
+
+        // Growing up to the ceiling still works, so the clamp is a ceiling and
+        // not a blanket refusal.
+        let start = size.call(&mut store).unwrap();
+        assert_eq!(
+            grow.call(&mut store, ceiling - start).unwrap(),
+            start,
+            "growing to exactly the ceiling must succeed"
+        );
+        assert_eq!(size.call(&mut store).unwrap(), ceiling);
+
+        // And one page beyond it must not.
+        assert_eq!(
+            grow.call(&mut store, 1).unwrap(),
+            -1,
+            "memory.grow one page past the ceiling must fail"
+        );
+    }
+
     #[test]
     fn canonicalize_nans_masks_nan_payloads() {
         // Reinterpret the i64 arg as f64, run x + 0.0 (kept with no fast-math,
@@ -2356,7 +3150,7 @@ mod tests {
             per_op_float("(local.set $acc (f64.sqrt (f64.abs (local.get $acc))))"),
             1,
         );
-        row("memory.copy/64", per_op_mem, 500);
+        row("memory.copy/64", per_op_mem, 0); // priced by BulkMemoryMetering
         println!("================================\n");
     }
 

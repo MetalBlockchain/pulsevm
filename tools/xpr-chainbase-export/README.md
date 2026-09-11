@@ -308,6 +308,42 @@ current irreversible block, catches nodeos up to that boundary, verifies its
 block ID, and writes `corpus-report.json`. Replay that immutable corpus through
 the production verification and acceptance path:
 
+Provider chainbase state records the compiler and CPU architecture that created
+it. On an ARM replay host, run the official AMD64 Leap binary under Docker
+instead of opening an AMD64 state file with the native ARM build:
+
+```bash
+sudo apt-get install -y qemu-user-static binfmt-support
+scripts/run-xpr-mainnet-catchup-amd64.sh build
+scripts/run-xpr-mainnet-catchup-amd64.sh start
+scripts/run-xpr-mainnet-catchup-amd64.sh status
+```
+
+The state, `blocks.log`, `blocks.index`, and
+`blocks/reversible/fork_db.dat` must all come from the same provider archive.
+The runner derives the chainbase size from the state file, uses light nodeos
+validation only to acquire blocks, and keeps the container running across host
+reboots. PulseVM still fully verifies every acquired block during replay.
+
+If a stopped, fully validated nodeos replay was saved with its chainbase state
+and exact irreversible block log but without `fork_db.dat`, do not borrow a
+fork database from another height: nodeos will undo the saved state to that
+foreign fork head. `rebuild-fork-db.cpp` is an operator recovery utility that
+must be compiled inside the matching pinned Leap build (link it to that build's
+`eosio_chain` target). It reconstructs only signed block-header/fork state from
+the exact block log and refuses a non-empty output directory:
+
+```bash
+rebuild-fork-db \
+  /data/xpr-node/blocks \
+  /src/antelope-leap/protocol_features \
+  /data/xpr-node/blocks/reversible
+```
+
+This is not a substitute for transaction replay. Use it only to reopen the
+already replay-validated chainbase at the same head, verify the reopened head
+ID, and request a portable nodeos snapshot for the exporter.
+
 ```bash
 XPR_REPLAY_CHECKPOINT_INTERVAL=1000000 \
   cargo run --release --locked -p pulsevm_core \

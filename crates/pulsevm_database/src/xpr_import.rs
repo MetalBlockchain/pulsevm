@@ -3569,6 +3569,82 @@ mod tests {
     }
 
     #[test]
+    fn imports_reserved_permission_without_aliasing_first_usage() {
+        fn permission(owner: u64, name: u64) -> Vec<u8> {
+            let mut row = vec![0];
+            row.extend_from_slice(&owner.to_le_bytes());
+            row.extend_from_slice(&name.to_le_bytes());
+            row.extend_from_slice(&0u64.to_le_bytes()); // root permission
+            row.extend_from_slice(&0i64.to_le_bytes()); // last_updated
+            row.extend_from_slice(&0u32.to_le_bytes()); // authority threshold
+            row.extend_from_slice(&[0, 0, 0]); // key/account/wait counts
+            row
+        }
+
+        let real_owner = 11;
+        let real_name = 111;
+        let reserved = permission(0, 0);
+        let entry = StateHistoryEntry {
+            magic: 0,
+            block_id: [0; 32],
+            deltas: vec![TableDelta {
+                name: "permission".into(),
+                rows: vec![
+                    TableDeltaRow {
+                        present: true,
+                        data: reserved.clone(),
+                    },
+                    TableDeltaRow {
+                        present: true,
+                        data: permission(real_owner, real_name),
+                    },
+                ],
+            }],
+        };
+        let sidecar = DeferredTransactionSidecar {
+            version: 1,
+            source_block_id: hex::encode(entry.block_id),
+            source_chain_id: None,
+            account_metadata: vec![],
+            code: vec![],
+            // Put the sentinel last: applying its aliased usage id would
+            // otherwise overwrite the first real permission's timestamp.
+            permissions: vec![
+                PermissionSidecarRow {
+                    owner: real_owner,
+                    name: real_name,
+                    last_used: 123,
+                },
+                PermissionSidecarRow {
+                    owner: 0,
+                    name: 0,
+                    last_used: 999,
+                },
+            ],
+            transactions: vec![],
+        };
+        let dir = TempDir::new().unwrap();
+        let mut db = Database::new(dir.path().to_str().unwrap(), 64 * 1024 * 1024).unwrap();
+
+        let summary =
+            hydrate_full_state_with_deferred_transactions(&mut db, &entry, Some(&sidecar)).unwrap();
+        assert_eq!(summary.permissions, 2);
+        assert_eq!(
+            db.read()
+                .unwrap()
+                .permission_last_used_by_name(real_owner, real_name)
+                .unwrap(),
+            123
+        );
+        let packed = parse_table_deltas(&db.pack_deltas(true, &[0; 32])).unwrap();
+        let permissions = packed
+            .iter()
+            .find(|delta| delta.name == "permission")
+            .unwrap();
+        assert!(permissions.rows.iter().any(|row| row.data == reserved));
+    }
+
+    #[test]
     fn imports_sidecar_bookkeeping_fields_after_base_rows() {
         let account = 11u64;
         let code_hash = [0x5au8; 32];
