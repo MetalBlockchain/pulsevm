@@ -4373,7 +4373,11 @@ impl Controller {
             }
             return Err(error);
         }
-        db.validate_system_account_state()?;
+        db.validate_system_account_state().map_err(|error| {
+            ChainError::fatal_consistency(format!(
+                "state sync installed state for the wrong system account: {error}"
+            ))
+        })?;
         if db.arena_state_root() != Some(expected_state_root) {
             return Err(ChainError::fatal_consistency(format!(
                 "state sync installed a state root other than the authenticated root {}",
