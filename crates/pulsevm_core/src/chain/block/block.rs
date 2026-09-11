@@ -131,10 +131,11 @@ impl BlockHeader {
     }
 
     pub fn validate(&self, db: &Database) -> Result<(), ChainError> {
-        pulse_assert(
-            db.is_account(self.producer.as_u64())?,
-            ChainError::BlockError("producer account does not exist".into()),
-        )?;
+        self.validate_state_independent()?;
+        self.validate_producer_account(db)
+    }
+
+    fn validate_state_independent(&self) -> Result<(), ChainError> {
         pulse_assert(
             self.confirmed == 0,
             ChainError::BlockError("confirmed count must be 0".into()),
@@ -168,6 +169,13 @@ impl BlockHeader {
             ChainError::BlockError("header extensions not supported".into()),
         )?;
         Ok(())
+    }
+
+    fn validate_producer_account(&self, db: &Database) -> Result<(), ChainError> {
+        pulse_assert(
+            db.is_account(self.producer.as_u64())?,
+            ChainError::BlockError("producer account does not exist".into()),
+        )
     }
 }
 
@@ -240,7 +248,16 @@ impl SignedBlock {
     }
 
     pub fn validate_syntactically(&self, db: &Database) -> Result<(), ChainError> {
-        self.signed_block_header.validate(db)?;
+        self.validate_state_independent()?;
+        self.validate_producer_account(db)
+    }
+
+    /// Validate every structural property that does not depend on the candidate
+    /// parent's database state. Call this before materializing a fork.
+    pub fn validate_state_independent(&self) -> Result<(), ChainError> {
+        self.signed_block_header
+            .header
+            .validate_state_independent()?;
 
         pulse_assert(
             self.transactions.len() > 0,
@@ -252,6 +269,13 @@ impl SignedBlock {
         )?;
 
         Ok(())
+    }
+
+    /// Validate the producer against the database state at this block's parent.
+    pub fn validate_producer_account(&self, db: &Database) -> Result<(), ChainError> {
+        self.signed_block_header
+            .header
+            .validate_producer_account(db)
     }
 
     pub fn validate_semantically(
