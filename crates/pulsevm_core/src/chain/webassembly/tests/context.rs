@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use super::*;
 
 #[test]
@@ -28,6 +30,50 @@ fn authorization_checks_distinguish_declared_authority_accounts_and_notification
     assert_error(is_account(cf.env(), account), "context-free action");
     assert_error(require_recipient(cf.env(), account), "context-free action");
     assert_error(current_time(cf.env()), "context-free action");
+}
+
+#[test]
+fn system_intrinsics_enforce_features_memory_and_assertion_shapes() {
+    let mut h = Host::new(false);
+
+    assert!(publication_time(h.env()).is_ok());
+    h.write(OUT, &crate::chain::webassembly::GET_SENDER_FEATURE_DIGEST);
+    assert_eq!(is_feature_activated(h.env(), ptr(OUT)).unwrap(), 1);
+    h.write(OUT, &[0; 32]);
+    assert_eq!(is_feature_activated(h.env(), ptr(OUT)).unwrap(), 0);
+    assert!(is_feature_activated(h.env(), ptr(END - 1)).is_err());
+
+    assert_error(get_block_num(h.env()), "unavailable before");
+    h.db.preactivate_protocol_feature(crate::chain::webassembly::GET_BLOCK_NUM_FEATURE_DIGEST)
+        .unwrap();
+    h.db.activate_protocol_features(
+        &[crate::chain::webassembly::GET_BLOCK_NUM_FEATURE_DIGEST],
+        2,
+    )
+    .unwrap();
+    assert_eq!(get_block_num(h.env()).unwrap(), 1);
+
+    eosio_assert(h.env(), 1, ptr(u32::MAX)).unwrap();
+    assert_error(eosio_assert(h.env(), 0, ptr(0)), "no message");
+    h.write(OUT, b"boom\0ignored");
+    assert_error(eosio_assert(h.env(), 0, ptr(OUT)), "boom");
+    assert_error(eosio_assert(h.env(), 0, ptr(END)), "eosio assert failed");
+
+    pulse_assert(h.env(), 1, ptr(u32::MAX), u32::MAX).unwrap();
+    assert_error(pulse_assert(h.env(), 0, ptr(OUT), 0), "no message");
+    h.write(OUT, b"explicit");
+    assert_error(pulse_assert(h.env(), 0, ptr(OUT), 8), "explicit");
+    h.write(OUT, &[0xff]);
+    assert_error(pulse_assert(h.env(), 0, ptr(OUT), 1), "pulse assert failed");
+
+    h.write(OUT, b"bounded");
+    assert_error(pulse_assert_message(h.env(), 0, ptr(OUT), 7), "bounded");
+    assert!(pulse_assert_message(h.env(), 0, ptr(END - 1), 2).is_err());
+    pulse_assert_message(h.env(), 1, ptr(u32::MAX), u32::MAX).unwrap();
+    pulse_assert_code(h.env(), 1, u64::MAX).unwrap();
+    assert_error(pulse_assert_code(h.env(), 0, 42), "error code: 42");
+    assert_error(abort(h.env()), "abort called");
+    assert!(pulse_exit(h.env(), 7).is_err());
 }
 
 #[test]
@@ -154,15 +200,19 @@ fn inline_actions_are_scheduled_and_reject_malformed_or_oversized_input() {
 #[test]
 fn permission_queries_accept_keys_and_permissions_and_reject_missing_authority() {
     let mut h = Host::new(false);
-    let keys = BTreeSet::from([AuthorityPublicKey::from(h.key.get_public_key().into_k1())])
+    let keys =
+        pulsevm_serialization::CanonicalSet::from(BTreeSet::from([AuthorityPublicKey::from(
+            h.key.get_public_key().into_k1(),
+        )]))
         .pack()
         .unwrap();
-    let permissions = BTreeSet::from([PermissionLevel::new(
-        PULSE_NAME.as_u64(),
-        ACTIVE_NAME.as_u64(),
-    )])
-    .pack()
-    .unwrap();
+    let permissions =
+        pulsevm_serialization::CanonicalSet::from(BTreeSet::from([PermissionLevel::new(
+            PULSE_NAME.as_u64(),
+            ACTIVE_NAME.as_u64(),
+        )]))
+        .pack()
+        .unwrap();
     let trx = h.transaction.pack().unwrap();
     h.write(0, &trx);
     h.write(1024, &keys);

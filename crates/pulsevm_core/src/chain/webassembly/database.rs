@@ -14,6 +14,7 @@ use crate::chain::{
     wasm_runtime::WasmContext,
     webassembly::{
         context_aware_check,
+        memory::checked_range,
         read_float128,
         read_u64,
         read_u128,
@@ -91,13 +92,15 @@ pub fn db_store_i64(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized");
+        .expect("Wasm memory not initialized")
+        .clone();
     let view = memory.view(&store);
-    let slice = buffer_ptr.slice(&view, buffer_len)?;
-
-    // Read source bytes safely
-    let mut src_bytes = vec![0u8; buffer_len as usize];
-    slice.read_slice(&mut src_bytes)?;
+    let source = checked_range("db_store_i64", "source", buffer_ptr, buffer_len, &view)?;
+    // The row owns its bytes, so one allocation remains necessary. Copying from
+    // the suspended guest's stable linear-memory slice avoids Wasmer's slower
+    // element-wise WasmSlice read path.
+    let data = unsafe { view.data_unchecked() };
+    let src_bytes = data[source].to_vec();
 
     let context = env_data.apply_context_mut();
     let result = context.db_store_i64(scope, table, payer, id, src_bytes.into())?;
@@ -119,13 +122,15 @@ pub fn db_get_i64(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized");
+        .expect("Wasm memory not initialized")
+        .clone();
     let view = memory.view(&store);
-    let slice = buffer_ptr.slice(&view, buffer_len)?;
-    let mut dest_bytes = vec![0u8; buffer_len as usize];
+    let destination = checked_range("db_get_i64", "destination", buffer_ptr, buffer_len, &view)?;
+    // WASM is suspended for the host call, so the database can copy the row
+    // directly into guest memory without an intermediate allocation and copy.
+    let data = unsafe { view.data_unchecked_mut() };
     let context = env_data.apply_context();
-    let result = context.db_get_i64(itr, &mut dest_bytes, buffer_len as usize)?;
-    slice.write_slice(&dest_bytes)?;
+    let result = context.db_get_i64(itr, &mut data[destination])?;
     Ok(result)
 }
 
@@ -145,16 +150,16 @@ pub fn db_update_i64(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized");
+        .expect("Wasm memory not initialized")
+        .clone();
     let view = memory.view(&store);
-    let slice = buffer_ptr.slice(&view, buffer_len)?;
-
-    // Read source bytes safely
-    let mut src_bytes = vec![0u8; buffer_len as usize];
-    slice.read_slice(&mut src_bytes)?;
+    let source = checked_range("db_update_i64", "source", buffer_ptr, buffer_len, &view)?;
+    // WASM is suspended for the host call and database mutation cannot touch
+    // guest memory, so the stable source slice needs no temporary Vec.
+    let data = unsafe { view.data_unchecked() };
 
     let context = env_data.apply_context_mut();
-    context.db_update_i64(itr, &payer.into(), &src_bytes)?;
+    context.db_update_i64(itr, &payer.into(), &data[source])?;
     Ok(())
 }
 

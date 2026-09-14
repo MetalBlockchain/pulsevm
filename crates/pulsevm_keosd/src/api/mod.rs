@@ -376,7 +376,7 @@ async fn wallet_sign_digest(
     match mgr.sign_digest(&digest_bytes, &[public_key]) {
         Ok(sigs) => {
             // Return the first signature
-            if let Some(sig) = sigs.values().next() {
+            if let Some((_, sig)) = sigs.first() {
                 HttpResponse::Ok().json(sig)
             } else {
                 error_response(
@@ -410,7 +410,7 @@ async fn wallet_sign_transaction(
         Ok(sigs) => {
             // Attach signatures to the transaction
             let mut map = Map::new();
-            let sig_array: Vec<String> = sigs.values().cloned().collect();
+            let sig_array: Vec<String> = sigs.into_iter().map(|(_, signature)| signature).collect();
             map.insert("signatures".to_string(), serde_json::json!(sig_array));
             HttpResponse::Ok().json(map)
         }

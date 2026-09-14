@@ -83,15 +83,185 @@ pub struct UndoSessionChanges<T> {
     pub removed_values: Vec<(i64, T)>,
 }
 
-/// A table of `T` stored in an index-addressed arena: rows live in a
-/// contiguous `Vec` where the slot number *is* the id (`by_id` built in),
-/// removed rows leave a `None` tombstone, and ids are never reused unless the
-/// insertion that produced them is undone. Ordered-unique secondary indices map
-/// `key -> id`. The recreation of chainbase `undo_index`, single-threaded and
-/// handing out references rather than clones.
+const PRIMARY_PAGE_SIZE: usize = 1024;
+const DIRTY_WORDS_PER_PAGE: usize = PRIMARY_PAGE_SIZE / u64::BITS as usize;
+
+struct DirtyPages {
+    pages: Vec<Option<Box<[u64; DIRTY_WORDS_PER_PAGE]>>>,
+}
+
+impl DirtyPages {
+    fn new() -> Self {
+        Self { pages: Vec::new() }
+    }
+
+    /// Returns true only when `id` was not already present.
+    fn insert(&mut self, id: usize) -> bool {
+        let page_id = id / PRIMARY_PAGE_SIZE;
+        if self.pages.len() <= page_id {
+            self.pages.resize_with(page_id + 1, || None);
+        }
+        let page = self.pages[page_id].get_or_insert_with(|| Box::new([0; DIRTY_WORDS_PER_PAGE]));
+        let within_page = id % PRIMARY_PAGE_SIZE;
+        let word = within_page / u64::BITS as usize;
+        let mask = 1u64 << (within_page % u64::BITS as usize);
+        let was_absent = page[word] & mask == 0;
+        page[word] |= mask;
+        was_absent
+    }
+
+    fn remove(&mut self, id: usize) {
+        let page_id = id / PRIMARY_PAGE_SIZE;
+        let Some(Some(page)) = self.pages.get_mut(page_id) else {
+            return;
+        };
+        let within_page = id % PRIMARY_PAGE_SIZE;
+        let word = within_page / u64::BITS as usize;
+        page[word] &= !(1u64 << (within_page % u64::BITS as usize));
+        if page.iter().all(|word| *word == 0) {
+            self.pages[page_id] = None;
+        }
+    }
+}
+
+struct PrimaryPage<T> {
+    slots: Box<[Option<T>]>,
+    live: usize,
+}
+
+impl<T> PrimaryPage<T> {
+    fn new() -> Self {
+        Self {
+            slots: std::iter::repeat_with(|| None)
+                .take(PRIMARY_PAGE_SIZE)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            live: 0,
+        }
+    }
+}
+
+/// Sparse, directly indexed primary storage. Chainbase ids are monotonic and
+/// high-churn tables can have a huge `next_id` with few live rows. Keeping one
+/// `Option<T>` for every historical id made a small checkpoint expand to tens
+/// of gigabytes. Fixed-size pages retain O(1) lookup and deterministic id-order
+/// iteration while allocating row slots only near live ids.
+struct PagedPrimary<T> {
+    pages: Vec<Option<PrimaryPage<T>>>,
+    len: usize,
+}
+
+impl<T> PagedPrimary<T> {
+    fn new() -> Self {
+        Self {
+            pages: Vec::new(),
+            len: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn set_len(&mut self, len: usize) {
+        if len < self.len {
+            let first_removed = len;
+            let first_page = first_removed / PRIMARY_PAGE_SIZE;
+            let first_slot = first_removed % PRIMARY_PAGE_SIZE;
+            if first_slot != 0
+                && let Some(Some(page)) = self.pages.get_mut(first_page)
+            {
+                for slot in &mut page.slots[first_slot..] {
+                    if slot.take().is_some() {
+                        page.live -= 1;
+                    }
+                }
+                if page.live == 0 {
+                    self.pages[first_page] = None;
+                }
+            }
+            let keep_pages = len.div_ceil(PRIMARY_PAGE_SIZE);
+            self.pages.truncate(keep_pages);
+        }
+        self.len = len;
+    }
+
+    fn get(&self, id: usize) -> Option<&T> {
+        if id >= self.len {
+            return None;
+        }
+        self.pages
+            .get(id / PRIMARY_PAGE_SIZE)
+            .and_then(Option::as_ref)
+            .and_then(|page| page.slots[id % PRIMARY_PAGE_SIZE].as_ref())
+    }
+
+    fn get_mut(&mut self, id: usize) -> Option<&mut T> {
+        if id >= self.len {
+            return None;
+        }
+        self.pages
+            .get_mut(id / PRIMARY_PAGE_SIZE)
+            .and_then(Option::as_mut)
+            .and_then(|page| page.slots[id % PRIMARY_PAGE_SIZE].as_mut())
+    }
+
+    fn insert(&mut self, id: usize, obj: T) -> bool {
+        assert!(id < self.len, "primary id is beyond next_id");
+        let page_id = id / PRIMARY_PAGE_SIZE;
+        if self.pages.len() <= page_id {
+            self.pages.resize_with(page_id + 1, || None);
+        }
+        let page = self.pages[page_id].get_or_insert_with(PrimaryPage::new);
+        let slot = &mut page.slots[id % PRIMARY_PAGE_SIZE];
+        let was_absent = slot.is_none();
+        *slot = Some(obj);
+        if was_absent {
+            page.live += 1;
+        }
+        was_absent
+    }
+
+    fn push(&mut self, obj: T) {
+        let id = self.len;
+        self.len += 1;
+        let inserted = self.insert(id, obj);
+        debug_assert!(inserted);
+    }
+
+    fn take(&mut self, id: usize) -> Option<T> {
+        if id >= self.len {
+            return None;
+        }
+        let page_id = id / PRIMARY_PAGE_SIZE;
+        let page = self.pages.get_mut(page_id)?.as_mut()?;
+        let obj = page.slots[id % PRIMARY_PAGE_SIZE].take()?;
+        page.live -= 1;
+        if page.live == 0 {
+            self.pages[page_id] = None;
+        }
+        Some(obj)
+    }
+
+    fn iter_with_ids(&self) -> impl DoubleEndedIterator<Item = (usize, &T)> + '_ {
+        self.pages.iter().enumerate().flat_map(|(page_id, page)| {
+            let base = page_id * PRIMARY_PAGE_SIZE;
+            page.as_ref().into_iter().flat_map(move |page| {
+                page.slots
+                    .iter()
+                    .enumerate()
+                    .filter_map(move |(slot, obj)| obj.as_ref().map(|obj| (base + slot, obj)))
+            })
+        })
+    }
+}
+
+/// A table of `T` stored in a sparse, index-addressed arena. The slot number is
+/// the id (`by_id` built in), removed rows leave logical tombstones, and ids are
+/// never reused unless the insertion that produced them is undone.
 pub struct Table<T: ArenaObject> {
     /// Indexed by id; `primary.len()` is the next id to assign.
-    primary: Vec<Option<T>>,
+    primary: PagedPrimary<T>,
     /// Append-only byte arena for variable-length fields, addressed by
     /// [`BlobRef`]. Grows within a session and is truncated back on undo.
     blobs: Vec<u8>,
@@ -106,7 +276,7 @@ pub struct Table<T: ArenaObject> {
     /// the write path O(1) — the delta record is order-independent, so no sort is
     /// needed.
     dirty: Vec<i64>,
-    in_dirty: Vec<bool>,
+    in_dirty: DirtyPages,
     /// Reusable blob spans, keyed by exact length, that earlier committed
     /// modifies/removes abandoned. `alloc_blob` reuses one instead of appending,
     /// so repeatedly rewriting a blob field (e.g. a contract row's value on every
@@ -142,7 +312,7 @@ impl<T: ArenaObject> Table<T> {
             );
         }
         Table {
-            primary: Vec::new(),
+            primary: PagedPrimary::new(),
             blobs: Vec::new(),
             secondaries,
             tag_positions,
@@ -150,7 +320,7 @@ impl<T: ArenaObject> Table<T> {
             row_count: 0,
             revision: 0,
             dirty: Vec::new(),
-            in_dirty: Vec::new(),
+            in_dirty: DirtyPages::new(),
             free: HashMap::new(),
             blob_patches: Vec::new(),
             flushed_blob_len: 0,
@@ -231,11 +401,7 @@ impl<T: ArenaObject> Table<T> {
     /// twice and the flush writes its current state.
     fn mark_dirty(&mut self, id: i64) {
         let idx = id as usize;
-        if idx >= self.in_dirty.len() {
-            self.in_dirty.resize(idx + 1, false);
-        }
-        if !self.in_dirty[idx] {
-            self.in_dirty[idx] = true;
+        if self.in_dirty.insert(idx) {
             self.dirty.push(id);
         }
     }
@@ -252,17 +418,17 @@ impl<T: ArenaObject> Table<T> {
 
         try_insert_all(&mut self.secondaries, &obj)?;
         // A fresh id needs no undo record; `old_next_id` marks it as new.
-        self.primary.push(Some(obj));
+        self.primary.push(obj);
         self.row_count += 1;
         self.mark_dirty(id);
-        Ok(self.primary[id as usize].as_ref().unwrap())
+        Ok(self.primary.get(id as usize).unwrap())
     }
 
     /// Applies `m` to the stored object. On a uniqueness violation the object is
     /// left unchanged and an error is returned.
     pub fn modify<F: FnOnce(&mut T)>(&mut self, id: ObjectId<T>, m: F) -> Result<(), TableError> {
         let raw = id.raw();
-        let Some(current) = self.primary.get(raw as usize).and_then(|s| s.as_ref()) else {
+        let Some(current) = self.primary.get(raw as usize) else {
             return Err(TableError::NotFound {
                 type_name: T::type_name(),
                 id: raw,
@@ -292,7 +458,7 @@ impl<T: ArenaObject> Table<T> {
                 });
             }
         }
-        let slot = self.primary[raw as usize].as_mut().unwrap();
+        let slot = self.primary.get_mut(raw as usize).unwrap();
         let old = std::mem::replace(slot, updated);
         self.on_modify(raw, old);
         self.mark_dirty(raw);
@@ -304,8 +470,7 @@ impl<T: ArenaObject> Table<T> {
         let raw = id.raw();
         let obj = self
             .primary
-            .get_mut(raw as usize)
-            .and_then(|s| s.take())
+            .take(raw as usize)
             .ok_or(TableError::NotFound {
                 type_name: T::type_name(),
                 id: raw,
@@ -328,7 +493,7 @@ impl<T: ArenaObject> Table<T> {
     }
 
     pub fn find(&self, id: ObjectId<T>) -> Option<&T> {
-        self.primary.get(id.raw() as usize).and_then(|s| s.as_ref())
+        self.primary.get(id.raw() as usize)
     }
 
     pub fn get(&self, id: ObjectId<T>) -> Result<&T, TableError> {
@@ -390,7 +555,7 @@ impl<T: ArenaObject> Table<T> {
 
     /// Iterates live objects in id order.
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = &T> + '_ {
-        self.primary.iter().filter_map(|s| s.as_ref())
+        self.primary.iter_with_ids().map(|(_, obj)| obj)
     }
 
     pub fn len(&self) -> usize {
@@ -399,6 +564,11 @@ impl<T: ArenaObject> Table<T> {
 
     pub fn is_empty(&self) -> bool {
         self.row_count == 0
+    }
+
+    #[cfg(test)]
+    fn allocated_primary_pages(&self) -> usize {
+        self.primary.pages.iter().flatten().count()
     }
 
     // ----- undo machinery ---------------------------------------------------
@@ -502,14 +672,14 @@ impl<T: ArenaObject> Table<T> {
         // drop those slots.
         for id in old_next_id as usize..self.primary.len() {
             self.mark_dirty(id as i64);
-            if let Some(obj) = &self.primary[id] {
+            if let Some(obj) = self.primary.get(id) {
                 for index in &mut self.secondaries {
                     index.erase(obj);
                 }
                 self.row_count -= 1;
             }
         }
-        self.primary.truncate(old_next_id as usize);
+        self.primary.set_len(old_next_id as usize);
 
         // A key in both old_values and removed_values restores the older one.
         let mut removed_restore = Vec::with_capacity(removed_values.len());
@@ -523,8 +693,9 @@ impl<T: ArenaObject> Table<T> {
         // collide transiently.
         let mut modified_restore = Vec::with_capacity(old_values.len());
         for (id, old) in old_values {
-            let current = self.primary[id as usize]
-                .as_ref()
+            let current = self
+                .primary
+                .get(id as usize)
                 .expect("undo invariant: modified object is present");
             for index in &mut self.secondaries {
                 index.erase(current);
@@ -537,8 +708,7 @@ impl<T: ArenaObject> Table<T> {
                 let inserted = index.try_insert(&obj);
                 debug_assert!(inserted, "undo restore broke a uniqueness invariant");
             }
-            let was_absent = self.primary[id as usize].is_none();
-            self.primary[id as usize] = Some(obj);
+            let was_absent = self.primary.insert(id as usize, obj);
             if was_absent {
                 self.row_count += 1;
             }
@@ -639,11 +809,9 @@ impl<T: ArenaObject> Table<T> {
     pub(crate) fn pack_into(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&(self.primary.len() as u64).to_le_bytes());
         out.extend_from_slice(&(self.row_count as u64).to_le_bytes());
-        for (id, slot) in self.primary.iter().enumerate() {
-            if let Some(obj) = slot {
-                out.extend_from_slice(&(id as u64).to_le_bytes());
-                out.extend_from_slice(obj.as_bytes());
-            }
+        for (id, obj) in self.primary.iter_with_ids() {
+            out.extend_from_slice(&(id as u64).to_le_bytes());
+            out.extend_from_slice(obj.as_bytes());
         }
         out.extend_from_slice(&(self.blobs.len() as u64).to_le_bytes());
         out.extend_from_slice(&self.blobs);
@@ -652,13 +820,14 @@ impl<T: ArenaObject> Table<T> {
     /// Restores rows written by [`Table::pack_into`] into this freshly
     /// registered (empty) table, rebuilding the secondary indices.
     pub(crate) fn load_from(&mut self, bytes: &[u8]) -> Result<(), TableError> {
-        debug_assert!(self.primary.is_empty() && self.undo_stack.is_empty());
+        debug_assert!(self.primary.len() == 0 && self.undo_stack.is_empty());
         let obj_size = std::mem::size_of::<T>();
         let mut pos = 0usize;
         let next_id = read_u64(bytes, &mut pos)? as usize;
         let live = read_u64(bytes, &mut pos)? as usize;
 
-        self.primary.resize_with(next_id, || None);
+        self.primary.set_len(next_id);
+        let mut live_rows = Vec::with_capacity(live);
         // Load the rows first; rebuild the secondary indexes in one bulk pass
         // afterwards (index reconstruction dominates open, and bulk-building is
         // ~10x cheaper than a try_insert per row).
@@ -671,14 +840,15 @@ impl<T: ArenaObject> Table<T> {
             let obj = T::read_from_bytes(&bytes[pos..end])
                 .map_err(|_| TableError::Corrupted("row bytes do not decode"))?;
             pos = end;
-            if id >= next_id || self.primary[id].is_some() {
+            if id >= next_id || self.primary.get(id).is_some() {
                 return Err(TableError::Corrupted("row id out of range or duplicated"));
             }
-            self.primary[id] = Some(obj);
+            self.primary.insert(id, obj);
+            live_rows.push((id as i64, obj));
             self.row_count += 1;
         }
         for index in &mut self.secondaries {
-            if !index.bulk_build(&self.primary) {
+            if !index.bulk_build(&live_rows) {
                 return Err(TableError::Corrupted("duplicate secondary key in snapshot"));
             }
         }
@@ -704,7 +874,7 @@ impl<T: ArenaObject> Table<T> {
         out.extend_from_slice(&(self.dirty.len() as u64).to_le_bytes());
         for &id in &self.dirty {
             out.extend_from_slice(&(id as u64).to_le_bytes());
-            match self.primary.get(id as usize).and_then(|s| s.as_ref()) {
+            match self.primary.get(id as usize) {
                 Some(obj) => {
                     out.push(1);
                     out.extend_from_slice(obj.as_bytes());
@@ -740,7 +910,7 @@ impl<T: ArenaObject> Table<T> {
         let mut pos = 0usize;
         let next_id = read_u64(bytes, &mut pos)? as usize;
         if self.primary.len() < next_id {
-            self.primary.resize_with(next_id, || None);
+            self.primary.set_len(next_id);
         }
         let count = read_u64(bytes, &mut pos)?;
         for _ in 0..count {
@@ -749,7 +919,7 @@ impl<T: ArenaObject> Table<T> {
                 .get(pos)
                 .ok_or(TableError::Corrupted("delta truncated"))?;
             pos += 1;
-            if let Some(old) = self.primary.get_mut(id).and_then(|s| s.take()) {
+            if let Some(old) = self.primary.take(id) {
                 for index in &mut self.secondaries {
                     index.erase(&old);
                 }
@@ -771,7 +941,7 @@ impl<T: ArenaObject> Table<T> {
                         return Err(TableError::Corrupted("delta secondary key conflict"));
                     }
                 }
-                self.primary[id] = Some(obj);
+                self.primary.insert(id, obj);
                 self.row_count += 1;
             }
         }
@@ -806,7 +976,7 @@ impl<T: ArenaObject> Table<T> {
 
     pub(crate) fn mark_flushed(&mut self) {
         for &id in &self.dirty {
-            self.in_dirty[id as usize] = false;
+            self.in_dirty.remove(id as usize);
         }
         self.dirty.clear();
         self.blob_patches.clear();
@@ -819,11 +989,9 @@ impl<T: ArenaObject> Table<T> {
     pub(crate) fn hash_state(&self, hasher: &mut sha2::Sha256) {
         use sha2::Digest;
         hasher.update((self.row_count as u64).to_le_bytes());
-        for (id, slot) in self.primary.iter().enumerate() {
-            if let Some(obj) = slot {
-                hasher.update((id as u64).to_le_bytes());
-                hasher.update(obj.as_bytes());
-            }
+        for (id, obj) in self.primary.iter_with_ids() {
+            hasher.update((id as u64).to_le_bytes());
+            hasher.update(obj.as_bytes());
         }
         hasher.update((self.blobs.len() as u64).to_le_bytes());
         hasher.update(&self.blobs);
@@ -864,13 +1032,13 @@ fn try_insert_all<T: ArenaObject>(
 /// Read view over one secondary index, resolving ids through the primary arena.
 pub struct IndexView<'a, T: ArenaObject, Tag: IndexedBy<T>> {
     map: &'a BTreeMap<Tag::Key, i64>,
-    primary: &'a [Option<T>],
+    primary: &'a PagedPrimary<T>,
 }
 
 impl<'a, T: ArenaObject, Tag: IndexedBy<T>> IndexView<'a, T, Tag> {
     fn row(&self, id: i64) -> &'a T {
-        self.primary[id as usize]
-            .as_ref()
+        self.primary
+            .get(id as usize)
             .expect("secondary index points at a live row")
     }
 
@@ -932,7 +1100,7 @@ where
     Tag::Key: std::hash::Hash + Eq,
 {
     map: &'a std::collections::HashMap<Tag::Key, i64>,
-    primary: &'a [Option<T>],
+    primary: &'a PagedPrimary<T>,
 }
 
 impl<'a, T: ArenaObject, Tag: IndexedBy<T>> HashIndexView<'a, T, Tag>
@@ -940,8 +1108,8 @@ where
     Tag::Key: std::hash::Hash + Eq,
 {
     fn row(&self, id: i64) -> &'a T {
-        self.primary[id as usize]
-            .as_ref()
+        self.primary
+            .get(id as usize)
             .expect("secondary index points at a live row")
     }
 
@@ -959,5 +1127,55 @@ where
 
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ObjectId;
+    use zerocopy::{
+        FromBytes,
+        Immutable,
+        IntoBytes,
+        KnownLayout,
+    };
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout)]
+    struct TestRow {
+        id: ObjectId<TestRow>,
+        value: u64,
+    }
+
+    impl ArenaObject for TestRow {
+        const TYPE_ID: u16 = 1;
+
+        fn id(&self) -> ObjectId<Self> {
+            self.id
+        }
+
+        fn set_id(&mut self, id: ObjectId<Self>) {
+            self.id = id;
+        }
+    }
+
+    #[test]
+    fn empty_historical_ranges_do_not_retain_row_pages() {
+        let mut table = Table::<TestRow>::new();
+        for value in 0..(PRIMARY_PAGE_SIZE * 3 + 1) {
+            table.emplace(|row| row.value = value as u64).unwrap();
+        }
+        for id in 0..(PRIMARY_PAGE_SIZE * 3) {
+            table.remove(ObjectId::new(id as i64)).unwrap();
+        }
+
+        assert_eq!(table.len(), 1);
+        assert_eq!(table.next_id(), (PRIMARY_PAGE_SIZE * 3 + 1) as i64);
+        assert_eq!(table.allocated_primary_pages(), 1);
+        assert_eq!(
+            table.iter().next().unwrap().value,
+            (PRIMARY_PAGE_SIZE * 3) as u64
+        );
     }
 }

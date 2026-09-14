@@ -3207,7 +3207,7 @@ checksum = "ee50f00666bf0c681a805a241afcf131ca3b9da28e79c49d3563be86099e002f"
 dependencies = [
  "libc",
  "nix",
- "prost",
+ "prost 0.14.4",
  "rand 0.10.2",
  "windows-sys 0.61.2",
 ]
@@ -3452,12 +3452,22 @@ dependencies = [
 
 [[package]]
 name = "prost"
+version = "0.12.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "deb1435c188b76130da55f17a466d252ff7b1418b2ad3e037d127b94e3411f29"
+dependencies = [
+ "bytes",
+ "prost-derive 0.12.6",
+]
+
+[[package]]
+name = "prost"
 version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "528ac67416ff8646872a3c02cad9cc4ee5dc9f9540c9b10771855c95cb2e5ae1"
 dependencies = [
  "bytes",
- "prost-derive",
+ "prost-derive 0.14.4",
 ]
 
 [[package]]
@@ -3472,13 +3482,26 @@ dependencies = [
  "multimap",
  "petgraph",
  "prettyplease",
- "prost",
- "prost-types",
+ "prost 0.14.4",
+ "prost-types 0.14.4",
  "pulldown-cmark",
  "pulldown-cmark-to-cmark",
  "regex",
  "syn 2.0.119",
  "tempfile",
+]
+
+[[package]]
+name = "prost-derive"
+version = "0.12.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "81bddcdb20abf9501610992b6759a4c888aef7d1a7247ef75e2404275ac24af1"
+dependencies = [
+ "anyhow",
+ "itertools 0.10.5",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -3496,11 +3519,20 @@ dependencies = [
 
 [[package]]
 name = "prost-types"
+version = "0.12.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9091c90b0a32608e984ff2fa4091273cbdd755d54935c51d520887f4a1dbd5b0"
+dependencies = [
+ "prost 0.12.6",
+]
+
+[[package]]
+name = "prost-types"
 version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f94967dc7688f3054c7fac87473ffae4cc4c3904800e2d9f5b857246d8963b0a"
 dependencies = [
- "prost",
+ "prost 0.14.4",
 ]
 
 [[package]]
@@ -3663,7 +3695,7 @@ version = "0.1.0"
 name = "pulsevm_chain_types"
 version = "0.1.0"
 dependencies = [
- "prost-types",
+ "prost-types 0.14.4",
  "pulsevm_billable_size",
  "pulsevm_crypto",
  "pulsevm_error",
@@ -3699,6 +3731,7 @@ dependencies = [
 name = "pulsevm_core"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "base64",
  "chrono",
  "criterion 0.5.1",
@@ -3758,18 +3791,31 @@ name = "pulsevm_database"
 version = "0.1.0"
 dependencies = [
  "criterion 0.5.1",
+ "flate2",
+ "hex",
+ "libc",
+ "proptest",
+ "prost-types 0.12.6",
  "pulsevm_abi",
+ "pulsevm_arena",
  "pulsevm_billable_size",
  "pulsevm_chain_types",
  "pulsevm_chaindb",
  "pulsevm_constants",
+ "pulsevm_contractdb",
  "pulsevm_crypto",
  "pulsevm_error",
  "pulsevm_name",
+ "pulsevm_proc_macros",
  "pulsevm_rpc",
+ "pulsevm_serialization",
+ "pulsevm_softfloat",
+ "secp256k1",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
+ "time",
 ]
 
 [[package]]
@@ -3801,8 +3847,8 @@ dependencies = [
 name = "pulsevm_grpc"
 version = "0.1.0"
 dependencies = [
- "prost",
- "prost-types",
+ "prost 0.14.4",
+ "prost-types 0.14.4",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
@@ -5198,7 +5244,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -5473,7 +5519,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "50849f68853be452acf590cde0b146665b8d507b3b8af17261df47e02c209ea0"
 dependencies = [
  "bytes",
- "prost",
+ "prost 0.14.4",
  "tonic",
 ]
 
@@ -5486,7 +5532,7 @@ dependencies = [
  "prettyplease",
  "proc-macro2",
  "prost-build",
- "prost-types",
+ "prost-types 0.14.4",
  "quote",
  "syn 2.0.119",
  "tempfile",

@@ -1,7 +1,5 @@
 #[cfg(test)]
 mod auth_tests {
-    use std::collections::BTreeSet;
-
     use anyhow::Result;
     use pulsevm_core::{
         ACTIVE_NAME,
@@ -36,6 +34,19 @@ mod auth_tests {
         get_public_key,
     };
     use pulsevm_name_macro::name;
+
+    const ONLY_LINK_TO_EXISTING_PERMISSION_FEATURE_DIGEST: [u8; 32] = [
+        0x1a, 0x99, 0xa5, 0x9d, 0x87, 0xe0, 0x6e, 0x09, 0xec, 0x5b, 0x02, 0x8a, 0x9c, 0xbb, 0x77,
+        0x49, 0xb4, 0xa5, 0xad, 0x88, 0x19, 0x00, 0x43, 0x65, 0xd0, 0x2d, 0xc4, 0x37, 0x9a, 0x8b,
+        0x72, 0x41,
+    ];
+
+    fn activate_only_link_to_existing_permission(chain: &Testing) -> Result<()> {
+        let db = chain.controller.database();
+        db.preactivate_protocol_feature(ONLY_LINK_TO_EXISTING_PERMISSION_FEATURE_DIGEST)?;
+        db.activate_protocol_features(&[ONLY_LINK_TO_EXISTING_PERMISSION_FEATURE_DIGEST], 1)?;
+        Ok(())
+    }
 
     /// Guards the DB read-API soundness fix. `get_permission` now returns a
     /// `&PermissionObject` bound to a `DbRead` guard, so a permission reference
@@ -115,7 +126,7 @@ mod auth_tests {
         }
 
         chain.set_transaction_headers(&mut trx, DEFAULT_EXPIRATION_DELTA, 0);
-        let mut signed: SignedTransaction = SignedTransaction::new(trx, BTreeSet::new(), vec![]);
+        let mut signed: SignedTransaction = SignedTransaction::new(trx, Vec::new(), vec![]);
         for key in keys.iter() {
             signed = signed.sign(key, &chain.controller.chain_id())?;
         }
@@ -1042,6 +1053,7 @@ mod auth_tests {
         let mut chain = Testing::new().await;
         let alice: Name = name!("alice").into();
         chain.create_account(alice, PULSE_NAME.into(), false, true)?;
+        activate_only_link_to_existing_permission(&chain)?;
 
         let err = chain
             .link_authority(
@@ -1089,6 +1101,7 @@ mod auth_tests {
         let mut chain = Testing::new().await;
         let alice: Name = name!("alice").into();
         chain.create_account(alice, PULSE_NAME.into(), false, true)?;
+        activate_only_link_to_existing_permission(&chain)?;
 
         chain.link_authority(
             alice,
@@ -1105,6 +1118,7 @@ mod auth_tests {
         let mut chain = Testing::new().await;
         let alice: Name = name!("alice").into();
         chain.create_account(alice, PULSE_NAME.into(), false, true)?;
+        activate_only_link_to_existing_permission(&chain)?;
 
         chain.link_authority(
             alice,

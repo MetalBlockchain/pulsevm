@@ -30,7 +30,9 @@ use crate::k1::{
 /// interchangeable with the same P-256 point used as an R1 key.
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum AuthorityPublicKey {
-    K1(K1PublicKey),
+    /// Leap stores authority keys as opaque shims. Curve validation is deferred
+    /// until a key is used by a cryptographic operation.
+    K1([u8; 33]),
     R1([u8; 33]),
     WebAuthn {
         point: [u8; 33],
@@ -53,14 +55,14 @@ impl std::error::Error for AuthorityKeyError {}
 
 impl From<K1PublicKey> for AuthorityPublicKey {
     fn from(value: K1PublicKey) -> Self {
-        Self::K1(value)
+        Self::K1(value.compressed())
     }
 }
 
 impl AuthorityPublicKey {
     pub fn as_k1(&self) -> Option<K1PublicKey> {
         match self {
-            Self::K1(key) => Some(*key),
+            Self::K1(point) => K1PublicKey::from_compressed(point).ok(),
             Self::R1(_) | Self::WebAuthn { .. } => None,
         }
     }
@@ -68,7 +70,12 @@ impl AuthorityPublicKey {
     /// Canonical Antelope binary representation, including the variant tag.
     pub fn to_packed(&self) -> Vec<u8> {
         match self {
-            Self::K1(key) => key.to_packed().to_vec(),
+            Self::K1(point) => {
+                let mut out = Vec::with_capacity(34);
+                out.push(0);
+                out.extend_from_slice(point);
+                out
+            }
             Self::R1(point) => {
                 let mut out = Vec::with_capacity(34);
                 out.push(1);
@@ -97,10 +104,7 @@ impl AuthorityPublicKey {
         let result = match tag {
             0 => {
                 let point: [u8; 33] = take(bytes, &mut pos, 33)?.try_into().unwrap();
-                Self::K1(
-                    K1PublicKey::from_compressed(&point)
-                        .map_err(|e| AuthorityKeyError(format!("invalid K1 authority key: {e}")))?,
-                )
+                Self::K1(point)
             }
             1 => Self::R1(read_p256_point(bytes, &mut pos, "R1")?),
             2 => {
@@ -137,7 +141,7 @@ impl AuthorityPublicKey {
     #[allow(clippy::inherent_to_string_shadow_display)]
     pub fn to_string(&self) -> String {
         match self {
-            Self::K1(key) => key.to_string(),
+            Self::K1(point) => format!("PUB_K1_{}", encode_b58_checked(point, b"K1")),
             Self::R1(point) => format!("PUB_R1_{}", encode_b58_checked(point, b"R1")),
             Self::WebAuthn {
                 point,
@@ -155,10 +159,10 @@ impl AuthorityPublicKey {
     }
 
     pub fn from_string(s: &str) -> Result<Self, AuthorityKeyError> {
-        if s.starts_with("PUB_K1_") {
-            return K1PublicKey::from_string(s)
-                .map(Self::K1)
-                .map_err(|e| AuthorityKeyError(format!("invalid K1 authority key: {e}")));
+        if let Some(data) = s.strip_prefix("PUB_K1_") {
+            let point = decode_b58_checked(data, 33, b"K1")
+                .map_err(|e| AuthorityKeyError(format!("invalid K1 authority key: {e}")))?;
+            return Ok(Self::K1(point.try_into().unwrap()));
         }
         if let Some(data) = s.strip_prefix("PUB_R1_") {
             let point = decode_b58_checked(data, 33, b"R1")
@@ -257,7 +261,10 @@ impl Write for AuthorityPublicKey {
             .filter(|end| *end <= bytes.len())
             .ok_or(WriteError::NotEnoughSpace)?;
         match self {
-            Self::K1(key) => bytes[*pos..end].copy_from_slice(&key.to_packed()),
+            Self::K1(point) => {
+                bytes[*pos] = 0;
+                bytes[*pos + 1..end].copy_from_slice(point);
+            }
             Self::R1(point) => {
                 bytes[*pos] = 1;
                 bytes[*pos + 1..end].copy_from_slice(point);
@@ -377,6 +384,23 @@ mod tests {
         Read,
         Write,
     };
+
+    #[test]
+    fn opaque_k1_authority_key_round_trips_without_curve_validation() {
+        // Leap's authority public-key variant stores K1 payloads as raw shims.
+        // Such a key can be persisted by updateauth even though no signature
+        // can satisfy it; cryptographic consumers still reject it via as_k1.
+        let packed = [0_u8; 34];
+        let key = AuthorityPublicKey::from_packed(&packed).unwrap();
+
+        assert_eq!(key.to_packed(), packed);
+        assert!(key.as_k1().is_none());
+        assert_eq!(AuthorityPublicKey::read(&packed, &mut 0).unwrap(), key);
+        assert_eq!(
+            AuthorityPublicKey::from_string(&key.to_string()).unwrap(),
+            key
+        );
+    }
 
     #[test]
     fn webauthn_packed_and_json_forms_round_trip() {

@@ -37,6 +37,19 @@ pub const POINTS_PER_US: u64 = 38_000;
 /// bounds a runaway loop until a proper native-code checktime deadline exists.
 pub const IMPLICIT_TX_CPU_BUDGET: u64 = u32::MAX as u64;
 
+/// Deterministic instruction-meter guard for transactions replayed from an
+/// already-accepted block. Their canonical CPU bill comes from the producer's
+/// receipt, so this is not an admission limit; it exists only to keep malformed
+/// replay input from running forever.
+///
+/// XPR's receipt CPU is wall-clock microseconds, while PulseVM's local WASM
+/// meter charges conservative reference-hardware points. A valid XPR
+/// transaction can therefore consume more than `u32::MAX` local points even
+/// though its canonical receipt fits in `u32` (mainnet block 368,783,692 is one
+/// such case). Ten seconds of reference work leaves ample headroom above XPR's
+/// 150 ms transaction limit while retaining a finite deterministic stop.
+pub const ACCEPTED_BLOCK_REPLAY_CPU_BUDGET: u64 = POINTS_PER_US * 10_000_000;
+
 // Names
 pub const NEWACCOUNT_NAME: Name = Name::new(name!("newaccount"));
 pub const SETCODE_NAME: Name = Name::new(name!("setcode"));
@@ -45,6 +58,7 @@ pub const UPDATEAUTH_NAME: Name = Name::new(name!("updateauth"));
 pub const DELETEAUTH_NAME: Name = Name::new(name!("deleteauth"));
 pub const LINKAUTH_NAME: Name = Name::new(name!("linkauth"));
 pub const UNLINKAUTH_NAME: Name = Name::new(name!("unlinkauth"));
+pub const CANCELDELAY_NAME: Name = Name::new(name!("canceldelay"));
 pub const ONERROR_NAME: Name = Name::new(name!("onerror"));
 pub const ONBLOCK_NAME: Name = Name::new(name!("onblock"));
 
@@ -63,5 +77,11 @@ mod tests {
     #[test]
     fn implicit_tx_budget_fits_the_cpu_usage_receipt() {
         assert!(IMPLICIT_TX_CPU_BUDGET <= u32::MAX as u64);
+    }
+
+    #[test]
+    fn accepted_block_replay_budget_exceeds_receipt_storage_but_fits_metering() {
+        assert!(ACCEPTED_BLOCK_REPLAY_CPU_BUDGET > u32::MAX as u64);
+        assert!(ACCEPTED_BLOCK_REPLAY_CPU_BUDGET <= i64::MAX as u64);
     }
 }

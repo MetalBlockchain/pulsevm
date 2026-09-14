@@ -15,6 +15,15 @@ use crate::chain::{
 
 const MAX_ASSERT_MESSAGE: usize = 1024;
 
+pub(crate) const GET_SENDER_FEATURE_DIGEST: [u8; 32] = [
+    0xf0, 0xaf, 0x56, 0xd2, 0xc5, 0xa4, 0x8d, 0x60, 0xa4, 0xa5, 0xb5, 0xc9, 0x03, 0xed, 0xfb, 0x7d,
+    0xb3, 0xa7, 0x36, 0xa9, 0x4e, 0xd5, 0x89, 0xd0, 0xb7, 0x97, 0xdf, 0x33, 0xff, 0x9d, 0x3e, 0x1d,
+];
+pub(crate) const GET_BLOCK_NUM_FEATURE_DIGEST: [u8; 32] = [
+    0x35, 0xc2, 0x18, 0x6c, 0xc3, 0x6f, 0x7b, 0xb4, 0xae, 0xaf, 0x44, 0x87, 0xb3, 0x6e, 0x57, 0x03,
+    0x9c, 0xcf, 0x45, 0xa9, 0x13, 0x6a, 0xa8, 0x56, 0xa5, 0xd5, 0x69, 0xec, 0xca, 0x55, 0xef, 0x2b,
+];
+
 pub fn eosio_assert(
     mut env: FunctionEnvMut<WasmContext>,
     condition: u32,
@@ -175,4 +184,80 @@ pub fn current_time(mut env: FunctionEnvMut<WasmContext>) -> Result<u64, Runtime
         .count();
 
     Ok(result as u64)
+}
+
+pub fn publication_time(mut env: FunctionEnvMut<WasmContext>) -> Result<u64, RuntimeError> {
+    context_aware_check(&env)?;
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BASE)?;
+    env_data
+        .apply_context()
+        .publication_time()
+        .map_err(|error| RuntimeError::new(error.to_string()))
+}
+
+pub fn is_feature_activated(
+    mut env: FunctionEnvMut<WasmContext>,
+    feature_ptr: WasmPtr<u8>,
+) -> Result<i32, RuntimeError> {
+    context_aware_check(&env)?;
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BASE + cost::per_byte(32))?;
+    let memory = env_data
+        .memory()
+        .as_ref()
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
+    let view = memory.view(&store);
+    let slice = feature_ptr.slice(&view, 32)?;
+    let mut digest = [0u8; 32];
+    slice.read_slice(&mut digest)?;
+    Ok(env_data.db().protocol_feature_activated(digest) as i32)
+}
+
+pub fn get_sender(mut env: FunctionEnvMut<WasmContext>) -> Result<u64, RuntimeError> {
+    context_aware_check(&env)?;
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BASE)?;
+    if !env_data
+        .db()
+        .protocol_feature_activated(GET_SENDER_FEATURE_DIGEST)
+    {
+        return Err(RuntimeError::new(
+            "get_sender is unavailable before the GET_SENDER protocol feature is activated",
+        ));
+    }
+
+    env_data
+        .apply_context()
+        .get_sender()
+        .map_err(|error| RuntimeError::new(error.to_string()))
+}
+
+pub fn get_block_num(mut env: FunctionEnvMut<WasmContext>) -> Result<u32, RuntimeError> {
+    context_aware_check(&env)?;
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BASE)?;
+    if !env_data
+        .db()
+        .protocol_feature_activated(GET_BLOCK_NUM_FEATURE_DIGEST)
+    {
+        return Err(RuntimeError::new(
+            "get_block_num is unavailable before the GET_BLOCK_NUM protocol feature is activated",
+        ));
+    }
+
+    Ok(env_data.apply_context().get_block_num())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GET_BLOCK_NUM_FEATURE_DIGEST;
+
+    #[test]
+    fn get_block_num_feature_digest_matches_xpr_canonical_digest() {
+        assert_eq!(
+            hex::encode(GET_BLOCK_NUM_FEATURE_DIGEST),
+            "35c2186cc36f7bb4aeaf4487b36e57039ccf45a9136aa856a5d569ecca55ef2b"
+        );
+    }
 }

@@ -15,14 +15,15 @@ use super::authority::{
     KeyWeight,
     PermissionLevel,
     PermissionLevelWeight,
+    WaitWeight,
 };
 
 pub struct AuthorityChecker<'a> {
     recursion_depth_limit: u16,
     provided_keys: &'a BTreeSet<AuthorityPublicKey>,
+    provided_permissions: &'a BTreeSet<PermissionLevel>,
     provided_delay: Microseconds,
     used_keys: BTreeSet<AuthorityPublicKey>,
-    cached_permissions: HashMap<PermissionLevel, PermissionCacheStatus>,
 }
 
 #[cfg(test)]
@@ -72,6 +73,12 @@ enum PermissionCacheStatus {
     PermissionSatisfied,
 }
 
+enum AuthorityFactor<'a> {
+    Permission(&'a PermissionLevelWeight),
+    Key(&'a KeyWeight),
+    Wait(&'a WaitWeight),
+}
+
 impl<'a> AuthorityChecker<'a> {
     pub fn new(
         recursion_depth_limit: u16,
@@ -79,21 +86,12 @@ impl<'a> AuthorityChecker<'a> {
         provided_permissions: &'a BTreeSet<PermissionLevel>,
         provided_delay: Microseconds,
     ) -> Self {
-        let mut cached_permissions = HashMap::new();
-
-        for permission in provided_permissions.iter() {
-            cached_permissions.insert(
-                permission.clone(),
-                PermissionCacheStatus::PermissionSatisfied,
-            );
-        }
-
         Self {
             recursion_depth_limit,
             provided_keys,
+            provided_permissions,
             provided_delay,
             used_keys: BTreeSet::new(),
-            cached_permissions,
         }
     }
 
@@ -115,40 +113,91 @@ impl<'a> AuthorityChecker<'a> {
         authority: &Authority,
         recursion_depth: u16,
     ) -> Result<bool, ChainError> {
+        let mut cached_permissions = self
+            .provided_permissions
+            .iter()
+            .cloned()
+            .map(|permission| (permission, PermissionCacheStatus::PermissionSatisfied))
+            .collect();
+        self.satisfied_with_cache(db, authority, recursion_depth, &mut cached_permissions)
+    }
+
+    pub fn satisfied_with_delay(
+        &mut self,
+        db: &DbRead<'_>,
+        authority: &Authority,
+        recursion_depth: u16,
+        provided_delay: Microseconds,
+    ) -> Result<bool, ChainError> {
+        let original_delay = self.provided_delay;
+        self.provided_delay = provided_delay;
+        let result = self.satisfied(db, authority, recursion_depth);
+        self.provided_delay = original_delay;
+        result
+    }
+
+    fn satisfied_with_cache(
+        &mut self,
+        db: &DbRead<'_>,
+        authority: &Authority,
+        recursion_depth: u16,
+        cached_permissions: &mut HashMap<PermissionLevel, PermissionCacheStatus>,
+    ) -> Result<bool, ChainError> {
         // Restore used_keys unless satisfied: keys from a failed branch must not count as used.
         let used_keys_snapshot = self.used_keys.clone();
-
         let mut total_weight = 0u32;
 
-        for key in authority.keys() {
-            total_weight += self.visit_key_weight(key)? as u32;
-        }
+        // Leap evaluates all factors by descending (weight, kind-priority):
+        // waits, keys, then permission levels for equal weights. Besides
+        // determining which keys count as used, that order is observable when
+        // nested authorities share or cycle through cached permissions.
+        let mut factors = Vec::with_capacity(
+            authority.keys().len() + authority.accounts().len() + authority.waits().len(),
+        );
+        factors.extend(
+            authority
+                .accounts()
+                .iter()
+                .map(|value| (value.weight, 1_u8, AuthorityFactor::Permission(value))),
+        );
+        factors.extend(
+            authority
+                .keys()
+                .iter()
+                .map(|value| (value.weight, 2_u8, AuthorityFactor::Key(value))),
+        );
+        factors.extend(
+            authority
+                .waits()
+                .iter()
+                .map(|value| (value.weight, 3_u8, AuthorityFactor::Wait(value))),
+        );
+        factors.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
 
-        if total_weight >= authority.threshold() {
-            return Ok(true);
-        }
-
-        for permission in authority.accounts() {
-            total_weight +=
-                self.visit_permission_level_weight(db, permission, recursion_depth)? as u32;
-        }
-
-        if total_weight >= authority.threshold() {
-            return Ok(true);
-        }
-
-        for wait in authority.waits() {
-            if self.provided_delay >= Microseconds::new(wait.wait_sec as i64 * 1_000_000) {
-                total_weight += wait.weight as u32;
+        for (_, _, factor) in factors {
+            total_weight += match factor {
+                AuthorityFactor::Permission(permission) => self.visit_permission_level_weight(
+                    db,
+                    permission,
+                    recursion_depth,
+                    cached_permissions,
+                )? as u32,
+                AuthorityFactor::Key(key) => self.visit_key_weight(key)? as u32,
+                AuthorityFactor::Wait(wait) => {
+                    if self.provided_delay >= Microseconds::new(wait.wait_sec as i64 * 1_000_000) {
+                        wait.weight as u32
+                    } else {
+                        0
+                    }
+                }
+            };
+            if total_weight >= authority.threshold() {
+                return Ok(true);
             }
         }
 
-        if total_weight >= authority.threshold() {
-            Ok(true)
-        } else {
-            self.used_keys = used_keys_snapshot;
-            Ok(false)
-        }
+        self.used_keys = used_keys_snapshot;
+        Ok(false)
     }
 
     pub fn visit_key_weight(&mut self, key: &KeyWeight) -> Result<u16, ChainError> {
@@ -160,14 +209,18 @@ impl<'a> AuthorityChecker<'a> {
         Ok(0)
     }
 
-    pub fn visit_permission_level_weight<'b>(
+    fn visit_permission_level_weight(
         &mut self,
         db: &DbRead<'_>,
         permission: &PermissionLevelWeight,
         recursion_depth: u16,
+        cached_permissions: &mut HashMap<PermissionLevel, PermissionCacheStatus>,
     ) -> Result<u16, ChainError> {
         // Cache before the depth limit, so an already-satisfied permission counts at any depth.
-        match self.cached_permissions.get(&permission.permission) {
+        let status = cached_permissions.get(&permission.permission).or_else(|| {
+            cached_permissions.get(&PermissionLevel::new(permission.permission.actor, 0))
+        });
+        match status {
             Some(PermissionCacheStatus::BeingEvaluated) => {
                 // Cycle (A->B->A): the back-edge grants no real authority, so
                 // return weight 0 and keep evaluating siblings (e.g. a sibling
@@ -199,21 +252,22 @@ impl<'a> AuthorityChecker<'a> {
         };
 
         // mark as being evaluated to detect cycles
-        self.cached_permissions.insert(
+        cached_permissions.insert(
             permission.permission.clone(),
             PermissionCacheStatus::BeingEvaluated,
         );
 
-        let satisfied = self.satisfied(db, &auth, recursion_depth + 1)?;
+        let satisfied =
+            self.satisfied_with_cache(db, &auth, recursion_depth + 1, cached_permissions)?;
 
         if satisfied {
-            self.cached_permissions.insert(
+            cached_permissions.insert(
                 permission.permission.clone(),
                 PermissionCacheStatus::PermissionSatisfied,
             );
             Ok(permission.weight)
         } else {
-            self.cached_permissions.insert(
+            cached_permissions.insert(
                 permission.permission.clone(),
                 PermissionCacheStatus::PermissionUnsatisfied,
             );

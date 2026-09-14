@@ -111,7 +111,7 @@ pub struct BlobRef {
 /// The engine core keeps `T` as an ordinary owned value in the arena; the POD
 /// layout required for mmap persistence is layered on later.
 pub trait ArenaObject:
-    Copy + Default + Send + FromBytes + IntoBytes + Immutable + KnownLayout + 'static
+    Copy + Default + Send + Sync + FromBytes + IntoBytes + Immutable + KnownLayout + 'static
 {
     /// Unique per-database table number (chainbase `object::type_id`).
     const TYPE_ID: u16;
@@ -133,15 +133,15 @@ pub trait ArenaObject:
 /// `boost::multi_index::ordered_unique<tag<Tag>, key<...>>` entry. Implement it
 /// on an empty tag type and return the index from
 /// [`ArenaObject::secondary_indices`] via [`key_index`].
-pub trait IndexedBy<T: ArenaObject>: 'static {
-    type Key: Ord + Clone + Send + 'static;
+pub trait IndexedBy<T: ArenaObject>: Send + Sync + 'static {
+    type Key: Ord + Clone + Send + Sync + 'static;
 
     fn key(obj: &T) -> Self::Key;
 }
 
 /// Object-safe interface used by [`Table`] to maintain a secondary index
 /// without knowing its key type.
-pub trait SecondaryIndex<T: ArenaObject>: Send {
+pub trait SecondaryIndex<T: ArenaObject>: Send + Sync {
     fn tag(&self) -> TypeId;
     fn index_name(&self) -> &'static str;
     /// Inserts the object's key -> id in a single tree operation; returns
@@ -151,11 +151,11 @@ pub trait SecondaryIndex<T: ArenaObject>: Send {
     /// unchanged. Returns `false` (index unchanged) if `new`'s key is taken.
     fn replace(&mut self, old: &T, new: &T) -> bool;
     fn erase(&mut self, obj: &T);
-    /// Rebuild the whole index from a table's row slab in one pass — the open
+    /// Rebuild the whole index from a table's live rows in one pass — the open
     /// path. Bulk-building (sort + bottom-up) is an order of magnitude cheaper
     /// than one `try_insert` per row, and index reconstruction dominates open.
     /// Returns `false` if two live rows share a key (a corrupt snapshot).
-    fn bulk_build(&mut self, rows: &[Option<T>]) -> bool;
+    fn bulk_build(&mut self, rows: &[(i64, T)]) -> bool;
     fn len(&self) -> usize;
     fn is_empty(&self) -> bool {
         self.len() == 0
@@ -228,19 +228,16 @@ impl<T: ArenaObject, Tag: IndexedBy<T>> SecondaryIndex<T> for KeyIndex<T, Tag> {
         );
     }
 
-    fn bulk_build(&mut self, rows: &[Option<T>]) -> bool {
+    fn bulk_build(&mut self, rows: &[(i64, T)]) -> bool {
         // `BTreeMap::from_iter` sorts the pairs and builds the tree bottom-up,
         // far cheaper than inserting each row into an empty map. Row position is
         // the object id.
         let mut live = 0usize;
         self.map = rows
             .iter()
-            .enumerate()
-            .filter_map(|(id, slot)| {
-                slot.as_ref().map(|o| {
-                    live += 1;
-                    (Tag::key(o), id as i64)
-                })
+            .map(|(id, obj)| {
+                live += 1;
+                (Tag::key(obj), *id)
             })
             .collect();
         // Unique index: a dropped entry means two rows collided on a key.
@@ -334,16 +331,13 @@ where
         );
     }
 
-    fn bulk_build(&mut self, rows: &[Option<T>]) -> bool {
+    fn bulk_build(&mut self, rows: &[(i64, T)]) -> bool {
         let mut live = 0usize;
         self.map = rows
             .iter()
-            .enumerate()
-            .filter_map(|(id, slot)| {
-                slot.as_ref().map(|o| {
-                    live += 1;
-                    (Tag::key(o), id as i64)
-                })
+            .map(|(id, obj)| {
+                live += 1;
+                (Tag::key(obj), *id)
             })
             .collect();
         self.map.len() == live

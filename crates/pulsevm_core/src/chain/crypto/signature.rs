@@ -107,7 +107,7 @@ impl Signature {
             } else {
                 signature.recover_non_canonical(digest.as_bytes())
             }
-            .map(AuthorityPublicKey::K1)
+            .map(AuthorityPublicKey::from)
             .map_err(|e| ChainError::TransactionError(e.to_string())),
             SignatureInner::R1(signature) => signature
                 .recover(digest.as_bytes())
@@ -126,7 +126,9 @@ impl Signature {
 
     pub fn recover_public_key(&self, digest: &Digest) -> Result<PublicKey, ChainError> {
         match self.recover_authority_key(digest)? {
-            AuthorityPublicKey::K1(key) => Ok(PublicKey::new(key)),
+            AuthorityPublicKey::K1(point) => pulsevm_crypto::K1PublicKey::from_compressed(&point)
+                .map(PublicKey::new)
+                .map_err(|e| ChainError::TransactionError(e.to_string())),
             AuthorityPublicKey::R1(_) | AuthorityPublicKey::WebAuthn { .. } => {
                 Err(ChainError::TransactionError(
                     "R1/WebAuthn signatures are not valid for this K1-only intrinsic".into(),

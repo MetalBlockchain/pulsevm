@@ -4,7 +4,6 @@ mod unittests;
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::BTreeSet,
         fs,
         path::Path,
         str::FromStr,
@@ -296,8 +295,7 @@ mod tests {
             ));
 
             self.set_transaction_headers(&mut trx, DEFAULT_EXPIRATION_DELTA, 0);
-            let mut signed: SignedTransaction =
-                SignedTransaction::new(trx, BTreeSet::new(), vec![]);
+            let mut signed: SignedTransaction = SignedTransaction::new(trx, Vec::new(), vec![]);
             for key in keys.iter() {
                 signed = signed.sign(key, &self.controller.chain_id())?;
             }
@@ -401,8 +399,7 @@ mod tests {
             ));
             self.set_transaction_headers(&mut trx, DEFAULT_EXPIRATION_DELTA, 0);
 
-            let mut signed: SignedTransaction =
-                SignedTransaction::new(trx, BTreeSet::new(), vec![]);
+            let mut signed: SignedTransaction = SignedTransaction::new(trx, Vec::new(), vec![]);
             for key in keys.iter() {
                 signed = signed.sign(key, &self.controller.chain_id())?;
             }
@@ -443,8 +440,7 @@ mod tests {
             ));
             self.set_transaction_headers(&mut trx, DEFAULT_EXPIRATION_DELTA, 0);
 
-            let mut signed: SignedTransaction =
-                SignedTransaction::new(trx, BTreeSet::new(), vec![]);
+            let mut signed: SignedTransaction = SignedTransaction::new(trx, Vec::new(), vec![]);
             for key in keys.iter() {
                 signed = signed.sign(key, &self.controller.chain_id())?;
             }
