@@ -16,6 +16,7 @@ pub use crate::pod::{
 pub use crate::{
     database::{
         AccountRamBillingBreakdown,
+        AccountRamBillingProfile,
         BlockReadSnapshot,
         ContractPrimaryKey,
         ContractPrimaryOverlay,

@@ -11,6 +11,9 @@ use pulsevm_database::{
     TableObject,
     U256,
 };
+use pulsevm_name::Name;
+use std::str::FromStr;
+use tempfile::TempDir;
 
 #[test]
 fn empty_database_has_no_contract_table_ram() {
@@ -156,4 +159,31 @@ fn per_table_totals_reconcile_with_account_contract_categories() {
             expected.contract_idx64
         );
     }
+}
+
+#[test]
+fn payer_profile_survives_checkpoint_and_reopen() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().to_str().unwrap();
+    let payer = Name::from_str("alice").unwrap().as_u64();
+
+    let database = Database::new(path, 0).unwrap();
+    database
+        .set_system_account(Name::from_str("pulse").unwrap())
+        .unwrap();
+    database
+        .create_key_value_object_standalone(10, 20, 30, payer, 1, b"persisted")
+        .unwrap();
+    database
+        .create_index64_object_standalone(10, 20, 30, payer, 1, 7)
+        .unwrap();
+    let before = database.account_ram_billing_profile(payer).unwrap();
+    database.close().unwrap();
+    drop(database);
+
+    let reopened = Database::new(path, 0).unwrap();
+    let after = reopened.account_ram_billing_profile(payer).unwrap();
+    assert_eq!(after, before);
+    assert_eq!(after.tables.len(), 1);
+    assert_eq!(after.tables[0].primary_value_bytes, 9);
 }

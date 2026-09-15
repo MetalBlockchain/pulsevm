@@ -168,6 +168,35 @@ The report contains the checkpoint revision, whole-state root, and SHA-256 for
 each canonical Arena table. Run it again after a bounded SHiP replay to identify
 which table changed and to compare independent conversion runs.
 
+### Profile contract RAM billing
+
+`ram_usage_profiler` explains the chain's logical RAM accounting; it does not
+measure the node process's resident memory. It ranks contract state by
+`(code, scope, table, payer)`, splits primary-value and secondary-index charges,
+and can reconcile one payer's stored `ram_usage` with all live billed objects.
+
+Build it once and run it against an Arena directory containing a durable
+`arena_state.bin` checkpoint:
+
+```bash
+cargo build --release --locked -p pulsevm_database --example ram_usage_profiler
+
+target/release/examples/ram_usage_profiler \
+  /data/xpr-arena-replay --limit 25
+
+target/release/examples/ram_usage_profiler \
+  /data/xpr-arena-replay --payer protonnz --limit 50 --json \
+  > /tmp/protonnz-ram.json
+```
+
+The report includes checkpoint size and modification time, load/scan duration,
+and the checkpoint revision. In payer mode, `residual_bytes` is stored RAM minus
+the reconstructed total; zero means the accounting reconciles. The profiler
+loads the latest durable checkpoint and performs a full read-only contract-state
+scan, so run it occasionally on a replica or at low priority beside a busy node,
+for example with `nice -n 19 ionice -c3`. It does not observe uncheckpointed
+in-memory blocks.
+
 The harness passes `migration_checkpoint` and its emitted manifest through the
 runner's per-chain VM configuration. Every node verifies the manifest hash and
 revision before restoring the Arena checkpoint. It also generates a distinct

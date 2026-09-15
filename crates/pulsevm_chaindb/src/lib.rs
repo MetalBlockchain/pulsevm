@@ -959,6 +959,173 @@ fn checked_inventory_add(value: &mut usize, amount: usize) -> Result<(), DbError
     Ok(())
 }
 
+fn account_non_contract_ram_inventory(
+    db: &Db,
+    account: u64,
+) -> Result<AccountRamInventory, DbError> {
+    let mut inventory = AccountRamInventory::default();
+    if let Some(row) = db.find_by::<AccountRow, AccountRowByName>(&account)? {
+        inventory.account_exists = true;
+        inventory.abi_bytes = db.blob::<AccountRow>(row.abi)?.len();
+    }
+
+    if let Some(metadata) = db.find_by_hash::<AccountMetaRow, AccountMetaRowByName>(&account)?
+        && metadata.code_hash != [0; 32]
+    {
+        let code = db
+            .find_by::<CodeRow, CodeByHash>(&(
+                metadata.code_hash,
+                metadata.vm_type,
+                metadata.vm_version,
+            ))?
+            .ok_or_else(|| {
+                DbError::Corrupted(format!(
+                    "account {account} references a missing code object"
+                ))
+            })?;
+        inventory.code_bytes = db.blob::<CodeRow>(code.code)?.len();
+    }
+
+    inventory.permission_auth_blobs = db
+        .table::<PermissionRow>()?
+        .iter()
+        .filter(|row| row.owner == account)
+        .map(|row| db.blob::<PermissionRow>(row.auth).map(<[u8]>::to_vec))
+        .collect::<Result<Vec<_>, _>>()?;
+    inventory.permission_links = db
+        .table::<PermissionLinkRow>()?
+        .iter()
+        .filter(|row| row.account == account)
+        .count();
+    inventory.deferred_packed_bytes = db
+        .table::<DeferredTransactionRow>()?
+        .iter()
+        .filter(|row| row.payer == account)
+        .map(|row| {
+            db.blob::<DeferredTransactionRow>(row.packed_trx)
+                .map(<[u8]>::len)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(inventory)
+}
+
+fn add_account_contract_ram_inventory(
+    db: &Db,
+    account_name: u64,
+    inventory: &mut AccountRamInventory,
+) -> Result<(), DbError> {
+    for _row in db
+        .table::<ContractTableRow>()?
+        .iter()
+        .filter(|row| row.payer == account_name)
+    {
+        checked_inventory_add(&mut inventory.contract_tables, 1)?;
+    }
+    for row in db
+        .table::<ContractKeyValueRow>()?
+        .iter()
+        .filter(|row| row.payer == account_name)
+    {
+        checked_inventory_add(&mut inventory.contract_kv_rows, 1)?;
+        checked_inventory_add(
+            &mut inventory.contract_kv_value_bytes,
+            db.blob::<ContractKeyValueRow>(row.value)?.len(),
+        )?;
+    }
+
+    macro_rules! count_account_index_rows {
+        ($row_type:ty, $field:ident) => {
+            for _row in db
+                .table::<$row_type>()?
+                .iter()
+                .filter(|row| row.payer == account_name)
+            {
+                checked_inventory_add(&mut inventory.$field, 1)?;
+            }
+        };
+    }
+    count_account_index_rows!(ContractIndex64Row, contract_idx64_rows);
+    count_account_index_rows!(ContractIndex128Row, contract_idx128_rows);
+    count_account_index_rows!(ContractIndex256Row, contract_idx256_rows);
+    count_account_index_rows!(ContractIndexDoubleRow, contract_idx_double_rows);
+    count_account_index_rows!(ContractIndexLongDoubleRow, contract_idx_long_double_rows);
+    Ok(())
+}
+
+fn add_contract_ram_inventory(
+    account: &mut AccountRamInventory,
+    table: &ContractTableRamInventory,
+) -> Result<(), DbError> {
+    checked_inventory_add(&mut account.contract_tables, table.table_objects)?;
+    checked_inventory_add(&mut account.contract_kv_rows, table.key_value_rows)?;
+    checked_inventory_add(&mut account.contract_kv_value_bytes, table.key_value_bytes)?;
+    checked_inventory_add(&mut account.contract_idx64_rows, table.index64_rows)?;
+    checked_inventory_add(&mut account.contract_idx128_rows, table.index128_rows)?;
+    checked_inventory_add(&mut account.contract_idx256_rows, table.index256_rows)?;
+    checked_inventory_add(
+        &mut account.contract_idx_double_rows,
+        table.index_double_rows,
+    )?;
+    checked_inventory_add(
+        &mut account.contract_idx_long_double_rows,
+        table.index_long_double_rows,
+    )?;
+    Ok(())
+}
+
+fn contract_table_ram_inventory_from_db(
+    db: &Db,
+    payer_filter: Option<u64>,
+) -> Result<Vec<ContractTableRamInventory>, DbError> {
+    let mut tables = HashMap::new();
+    let mut inventories = HashMap::new();
+
+    for row in db.table::<ContractTableRow>()?.iter() {
+        let table_id = row.id().raw();
+        tables.insert(table_id, (row.code, row.scope, row.table));
+        if payer_filter.is_some_and(|payer| payer != row.payer) {
+            continue;
+        }
+        let entry = contract_table_inventory_entry(&mut inventories, &tables, table_id, row.payer)?;
+        checked_inventory_add(&mut entry.table_objects, 1)?;
+    }
+
+    for row in db.table::<ContractKeyValueRow>()?.iter() {
+        if payer_filter.is_some_and(|payer| payer != row.payer) {
+            continue;
+        }
+        let entry = contract_table_inventory_entry(&mut inventories, &tables, row.t_id, row.payer)?;
+        checked_inventory_add(&mut entry.key_value_rows, 1)?;
+        checked_inventory_add(
+            &mut entry.key_value_bytes,
+            db.blob::<ContractKeyValueRow>(row.value)?.len(),
+        )?;
+    }
+
+    macro_rules! count_index_rows {
+        ($row_type:ty, $field:ident) => {
+            for row in db.table::<$row_type>()?.iter() {
+                if payer_filter.is_some_and(|payer| payer != row.payer) {
+                    continue;
+                }
+                let entry =
+                    contract_table_inventory_entry(&mut inventories, &tables, row.t_id, row.payer)?;
+                checked_inventory_add(&mut entry.$field, 1)?;
+            }
+        };
+    }
+
+    count_index_rows!(ContractIndex64Row, index64_rows);
+    count_index_rows!(ContractIndex128Row, index128_rows);
+    count_index_rows!(ContractIndex256Row, index256_rows);
+    count_index_rows!(ContractIndexDoubleRow, index_double_rows);
+    count_index_rows!(ContractIndexLongDoubleRow, index_long_double_rows);
+
+    let mut inventories: Vec<_> = inventories.into_values().collect();
+    inventories.sort_unstable_by_key(|row| (row.code, row.scope, row.table, row.payer));
+    Ok(inventories)
+}
+
 struct TxByTrxId;
 impl IndexedBy<TransactionRow> for TxByTrxId {
     type Key = [u8; 32];
@@ -1832,90 +1999,24 @@ impl ChainDatabase {
     /// payer columns and should not be called from block execution.
     pub fn account_ram_inventory(&self, account: u64) -> Result<AccountRamInventory, DbError> {
         let db = self.read();
-        let mut inventory = AccountRamInventory::default();
-
-        if let Some(row) = db.find_by::<AccountRow, AccountRowByName>(&account)? {
-            inventory.account_exists = true;
-            inventory.abi_bytes = db.blob::<AccountRow>(row.abi)?.len();
-        }
-
-        if let Some(metadata) = db.find_by_hash::<AccountMetaRow, AccountMetaRowByName>(&account)?
-            && metadata.code_hash != [0; 32]
-        {
-            let code = db
-                .find_by::<CodeRow, CodeByHash>(&(
-                    metadata.code_hash,
-                    metadata.vm_type,
-                    metadata.vm_version,
-                ))?
-                .ok_or_else(|| {
-                    DbError::Corrupted(format!(
-                        "account {account} references a missing code object"
-                    ))
-                })?;
-            inventory.code_bytes = db.blob::<CodeRow>(code.code)?.len();
-        }
-
-        inventory.permission_auth_blobs = db
-            .table::<PermissionRow>()?
-            .iter()
-            .filter(|row| row.owner == account)
-            .map(|row| db.blob::<PermissionRow>(row.auth).map(<[u8]>::to_vec))
-            .collect::<Result<Vec<_>, _>>()?;
-        inventory.permission_links = db
-            .table::<PermissionLinkRow>()?
-            .iter()
-            .filter(|row| row.account == account)
-            .count();
-        inventory.contract_tables = db
-            .table::<ContractTableRow>()?
-            .iter()
-            .filter(|row| row.payer == account)
-            .count();
-        for row in db
-            .table::<ContractKeyValueRow>()?
-            .iter()
-            .filter(|row| row.payer == account)
-        {
-            inventory.contract_kv_rows += 1;
-            inventory.contract_kv_value_bytes += db.blob::<ContractKeyValueRow>(row.value)?.len();
-        }
-        inventory.contract_idx64_rows = db
-            .table::<ContractIndex64Row>()?
-            .iter()
-            .filter(|row| row.payer == account)
-            .count();
-        inventory.contract_idx128_rows = db
-            .table::<ContractIndex128Row>()?
-            .iter()
-            .filter(|row| row.payer == account)
-            .count();
-        inventory.contract_idx256_rows = db
-            .table::<ContractIndex256Row>()?
-            .iter()
-            .filter(|row| row.payer == account)
-            .count();
-        inventory.contract_idx_double_rows = db
-            .table::<ContractIndexDoubleRow>()?
-            .iter()
-            .filter(|row| row.payer == account)
-            .count();
-        inventory.contract_idx_long_double_rows = db
-            .table::<ContractIndexLongDoubleRow>()?
-            .iter()
-            .filter(|row| row.payer == account)
-            .count();
-        inventory.deferred_packed_bytes = db
-            .table::<DeferredTransactionRow>()?
-            .iter()
-            .filter(|row| row.payer == account)
-            .map(|row| {
-                db.blob::<DeferredTransactionRow>(row.packed_trx)
-                    .map(<[u8]>::len)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
+        let mut inventory = account_non_contract_ram_inventory(&db, account)?;
+        add_account_contract_ram_inventory(&db, account, &mut inventory)?;
         Ok(inventory)
+    }
+
+    /// Build the account-wide and per-table views under one read lock so both
+    /// describe the exact same Arena revision and contract rows are scanned once.
+    pub fn account_ram_inventory_with_contract_tables(
+        &self,
+        account: u64,
+    ) -> Result<(AccountRamInventory, Vec<ContractTableRamInventory>), DbError> {
+        let db = self.read();
+        let mut inventory = account_non_contract_ram_inventory(&db, account)?;
+        let tables = contract_table_ram_inventory_from_db(&db, Some(account))?;
+        for table in &tables {
+            add_contract_ram_inventory(&mut inventory, table)?;
+        }
+        Ok((inventory, tables))
     }
 
     /// Inventory contract RAM by logical table and payer in one consistent
@@ -1942,59 +2043,7 @@ impl ChainDatabase {
         payer_filter: Option<u64>,
     ) -> Result<Vec<ContractTableRamInventory>, DbError> {
         let db = self.read();
-        let mut tables = HashMap::new();
-        let mut inventories = HashMap::new();
-
-        for row in db.table::<ContractTableRow>()?.iter() {
-            let table_id = row.id().raw();
-            tables.insert(table_id, (row.code, row.scope, row.table));
-            if payer_filter.is_some_and(|payer| payer != row.payer) {
-                continue;
-            }
-            let entry =
-                contract_table_inventory_entry(&mut inventories, &tables, table_id, row.payer)?;
-            checked_inventory_add(&mut entry.table_objects, 1)?;
-        }
-
-        for row in db.table::<ContractKeyValueRow>()?.iter() {
-            if payer_filter.is_some_and(|payer| payer != row.payer) {
-                continue;
-            }
-            let entry =
-                contract_table_inventory_entry(&mut inventories, &tables, row.t_id, row.payer)?;
-            checked_inventory_add(&mut entry.key_value_rows, 1)?;
-            checked_inventory_add(
-                &mut entry.key_value_bytes,
-                db.blob::<ContractKeyValueRow>(row.value)?.len(),
-            )?;
-        }
-
-        macro_rules! count_index_rows {
-            ($row_type:ty, $field:ident) => {
-                for row in db.table::<$row_type>()?.iter() {
-                    if payer_filter.is_some_and(|payer| payer != row.payer) {
-                        continue;
-                    }
-                    let entry = contract_table_inventory_entry(
-                        &mut inventories,
-                        &tables,
-                        row.t_id,
-                        row.payer,
-                    )?;
-                    checked_inventory_add(&mut entry.$field, 1)?;
-                }
-            };
-        }
-
-        count_index_rows!(ContractIndex64Row, index64_rows);
-        count_index_rows!(ContractIndex128Row, index128_rows);
-        count_index_rows!(ContractIndex256Row, index256_rows);
-        count_index_rows!(ContractIndexDoubleRow, index_double_rows);
-        count_index_rows!(ContractIndexLongDoubleRow, index_long_double_rows);
-
-        let mut inventories: Vec<_> = inventories.into_values().collect();
-        inventories.sort_unstable_by_key(|row| (row.code, row.scope, row.table, row.payer));
-        Ok(inventories)
+        contract_table_ram_inventory_from_db(&db, payer_filter)
     }
 
     /// The account's `last_code_update` (fc microseconds), for the RPC account
