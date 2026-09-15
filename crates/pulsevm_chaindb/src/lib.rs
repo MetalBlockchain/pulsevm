@@ -14,7 +14,10 @@
 //! across an `.await`.
 
 use std::{
-    collections::BTreeMap,
+    collections::{
+        BTreeMap,
+        HashMap,
+    },
     sync::{
         Arc,
         RwLock,
@@ -904,6 +907,56 @@ pub struct AccountRamInventory {
     pub contract_idx_double_rows: usize,
     pub contract_idx_long_double_rows: usize,
     pub deferred_packed_bytes: Vec<usize>,
+}
+
+/// Raw contract objects billed to one payer within one logical contract table.
+///
+/// A table can have several entries because its metadata, primary rows and
+/// secondary rows may have different payers. The database facade applies the
+/// consensus billable-size constants to these counts and lengths.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContractTableRamInventory {
+    pub code: u64,
+    pub scope: u64,
+    pub table: u64,
+    pub payer: u64,
+    pub table_objects: usize,
+    pub key_value_rows: usize,
+    pub key_value_bytes: usize,
+    pub index64_rows: usize,
+    pub index128_rows: usize,
+    pub index256_rows: usize,
+    pub index_double_rows: usize,
+    pub index_long_double_rows: usize,
+}
+
+fn contract_table_inventory_entry<'a>(
+    inventories: &'a mut HashMap<(i64, u64), ContractTableRamInventory>,
+    tables: &HashMap<i64, (u64, u64, u64)>,
+    table_id: i64,
+    payer: u64,
+) -> Result<&'a mut ContractTableRamInventory, DbError> {
+    let &(code, scope, table) = tables.get(&table_id).ok_or_else(|| {
+        DbError::Corrupted(format!(
+            "contract RAM inventory found an orphan row for table id {table_id}"
+        ))
+    })?;
+    Ok(inventories
+        .entry((table_id, payer))
+        .or_insert_with(|| ContractTableRamInventory {
+            code,
+            scope,
+            table,
+            payer,
+            ..Default::default()
+        }))
+}
+
+fn checked_inventory_add(value: &mut usize, amount: usize) -> Result<(), DbError> {
+    *value = value
+        .checked_add(amount)
+        .ok_or_else(|| DbError::Corrupted("contract RAM inventory overflow".into()))?;
+    Ok(())
 }
 
 struct TxByTrxId;
@@ -1863,6 +1916,85 @@ impl ChainDatabase {
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(inventory)
+    }
+
+    /// Inventory contract RAM by logical table and payer in one consistent
+    /// read. This is an offline diagnostic scan and never mutates Arena state.
+    ///
+    /// The returned vector is sorted by `(code, scope, table, payer)` so its
+    /// output is reproducible even though the temporary aggregation is hashed.
+    pub fn contract_table_ram_inventory(&self) -> Result<Vec<ContractTableRamInventory>, DbError> {
+        self.contract_table_ram_inventory_filtered(None)
+    }
+
+    /// The same contract-table inventory restricted to one RAM payer. All
+    /// object tables are still scanned, but unrelated payers consume no result
+    /// aggregation memory.
+    pub fn contract_table_ram_inventory_for_payer(
+        &self,
+        payer: u64,
+    ) -> Result<Vec<ContractTableRamInventory>, DbError> {
+        self.contract_table_ram_inventory_filtered(Some(payer))
+    }
+
+    fn contract_table_ram_inventory_filtered(
+        &self,
+        payer_filter: Option<u64>,
+    ) -> Result<Vec<ContractTableRamInventory>, DbError> {
+        let db = self.read();
+        let mut tables = HashMap::new();
+        let mut inventories = HashMap::new();
+
+        for row in db.table::<ContractTableRow>()?.iter() {
+            let table_id = row.id().raw();
+            tables.insert(table_id, (row.code, row.scope, row.table));
+            if payer_filter.is_some_and(|payer| payer != row.payer) {
+                continue;
+            }
+            let entry =
+                contract_table_inventory_entry(&mut inventories, &tables, table_id, row.payer)?;
+            checked_inventory_add(&mut entry.table_objects, 1)?;
+        }
+
+        for row in db.table::<ContractKeyValueRow>()?.iter() {
+            if payer_filter.is_some_and(|payer| payer != row.payer) {
+                continue;
+            }
+            let entry =
+                contract_table_inventory_entry(&mut inventories, &tables, row.t_id, row.payer)?;
+            checked_inventory_add(&mut entry.key_value_rows, 1)?;
+            checked_inventory_add(
+                &mut entry.key_value_bytes,
+                db.blob::<ContractKeyValueRow>(row.value)?.len(),
+            )?;
+        }
+
+        macro_rules! count_index_rows {
+            ($row_type:ty, $field:ident) => {
+                for row in db.table::<$row_type>()?.iter() {
+                    if payer_filter.is_some_and(|payer| payer != row.payer) {
+                        continue;
+                    }
+                    let entry = contract_table_inventory_entry(
+                        &mut inventories,
+                        &tables,
+                        row.t_id,
+                        row.payer,
+                    )?;
+                    checked_inventory_add(&mut entry.$field, 1)?;
+                }
+            };
+        }
+
+        count_index_rows!(ContractIndex64Row, index64_rows);
+        count_index_rows!(ContractIndex128Row, index128_rows);
+        count_index_rows!(ContractIndex256Row, index256_rows);
+        count_index_rows!(ContractIndexDoubleRow, index_double_rows);
+        count_index_rows!(ContractIndexLongDoubleRow, index_long_double_rows);
+
+        let mut inventories: Vec<_> = inventories.into_values().collect();
+        inventories.sort_unstable_by_key(|row| (row.code, row.scope, row.table, row.payer));
+        Ok(inventories)
     }
 
     /// The account's `last_code_update` (fc microseconds), for the RPC account

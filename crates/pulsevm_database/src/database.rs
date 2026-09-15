@@ -203,6 +203,50 @@ impl AccountRamBillingBreakdown {
         .ok_or_else(|| ChainError::InternalError("RAM inventory overflow".into()))
     }
 }
+
+/// RAM billed to one payer by one logical contract table.
+///
+/// Table metadata and rows can have different payers, so callers may receive
+/// several entries with the same `(code, scope, table)`. This is a read-only
+/// diagnostic view and is never consulted during block execution.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContractTableRamBilling {
+    pub code: u64,
+    pub scope: u64,
+    pub table: u64,
+    pub payer: u64,
+    pub table_overhead_bytes: i64,
+    pub primary_rows: u64,
+    pub primary_value_bytes: u64,
+    pub primary_bytes: i64,
+    pub index64_rows: u64,
+    pub index64_bytes: i64,
+    pub index128_rows: u64,
+    pub index128_bytes: i64,
+    pub index256_rows: u64,
+    pub index256_bytes: i64,
+    pub index_double_rows: u64,
+    pub index_double_bytes: i64,
+    pub index_long_double_rows: u64,
+    pub index_long_double_bytes: i64,
+}
+
+impl ContractTableRamBilling {
+    pub fn total_bytes(&self) -> Result<i64, ChainError> {
+        [
+            self.table_overhead_bytes,
+            self.primary_bytes,
+            self.index64_bytes,
+            self.index128_bytes,
+            self.index256_bytes,
+            self.index_double_bytes,
+            self.index_long_double_bytes,
+        ]
+        .into_iter()
+        .try_fold(0i64, |total, value| total.checked_add(value))
+        .ok_or_else(|| ChainError::InternalError("contract-table RAM total overflow".into()))
+    }
+}
 /// Converts public elastic-limit parameters into the arena's stored form.
 fn to_elastic_params(p: &ElasticLimitParameters) -> crate::backend::ElasticParams {
     crate::backend::ElasticParams {
@@ -3725,6 +3769,101 @@ impl Database {
             )?,
             deferred,
         })
+    }
+
+    /// Profile contract RAM by `(code, scope, table, payer)`.
+    ///
+    /// This takes a consistent read lock while scanning all contract object
+    /// families. It is intended for an operator-triggered audit, not the block
+    /// execution path. Results are deterministically ordered by their key.
+    pub fn contract_table_ram_billing(&self) -> Result<Vec<ContractTableRamBilling>, ChainError> {
+        self.contract_table_ram_billing_filtered(None)
+    }
+
+    /// Profile contract RAM for one payer without allocating result entries for
+    /// every other payer in the database.
+    pub fn contract_table_ram_billing_for_payer(
+        &self,
+        payer: u64,
+    ) -> Result<Vec<ContractTableRamBilling>, ChainError> {
+        self.contract_table_ram_billing_filtered(Some(payer))
+    }
+
+    fn contract_table_ram_billing_filtered(
+        &self,
+        payer: Option<u64>,
+    ) -> Result<Vec<ContractTableRamBilling>, ChainError> {
+        let raw = match payer {
+            Some(payer) => self.backend.contract_table_ram_inventory_for_payer(payer),
+            None => self.backend.contract_table_ram_inventory(),
+        }
+        .map_err(|error| {
+            ChainError::InternalError(format!("contract-table RAM inventory failed: {error:?}"))
+        })?;
+        let as_u64 = |value: usize| -> Result<u64, ChainError> {
+            u64::try_from(value)
+                .map_err(|_| ChainError::InternalError("RAM inventory overflow".into()))
+        };
+        let as_i64 = |value: usize| -> Result<i64, ChainError> {
+            i64::try_from(value)
+                .map_err(|_| ChainError::InternalError("RAM inventory overflow".into()))
+        };
+        let count_bytes = |count: usize, bytes: u64| -> Result<i64, ChainError> {
+            as_i64(count)?
+                .checked_mul(
+                    i64::try_from(bytes)
+                        .map_err(|_| ChainError::InternalError("RAM inventory overflow".into()))?,
+                )
+                .ok_or_else(|| ChainError::InternalError("RAM inventory overflow".into()))
+        };
+
+        raw.into_iter()
+            .map(|row| {
+                let primary_fixed =
+                    count_bytes(row.key_value_rows, billable_size_v::<KeyValueObject>())?;
+                let primary_bytes = primary_fixed
+                    .checked_add(as_i64(row.key_value_bytes)?)
+                    .ok_or_else(|| ChainError::InternalError("RAM inventory overflow".into()))?;
+                Ok(ContractTableRamBilling {
+                    code: row.code,
+                    scope: row.scope,
+                    table: row.table,
+                    payer: row.payer,
+                    table_overhead_bytes: count_bytes(
+                        row.table_objects,
+                        billable_size_v::<TableObject>(),
+                    )?,
+                    primary_rows: as_u64(row.key_value_rows)?,
+                    primary_value_bytes: as_u64(row.key_value_bytes)?,
+                    primary_bytes,
+                    index64_rows: as_u64(row.index64_rows)?,
+                    index64_bytes: count_bytes(
+                        row.index64_rows,
+                        billable_size_v::<Index64Object>(),
+                    )?,
+                    index128_rows: as_u64(row.index128_rows)?,
+                    index128_bytes: count_bytes(
+                        row.index128_rows,
+                        billable_size_v::<Index128Object>(),
+                    )?,
+                    index256_rows: as_u64(row.index256_rows)?,
+                    index256_bytes: count_bytes(
+                        row.index256_rows,
+                        billable_size_v::<Index256Object>(),
+                    )?,
+                    index_double_rows: as_u64(row.index_double_rows)?,
+                    index_double_bytes: count_bytes(
+                        row.index_double_rows,
+                        billable_size_v::<IndexDoubleObject>(),
+                    )?,
+                    index_long_double_rows: as_u64(row.index_long_double_rows)?,
+                    index_long_double_bytes: count_bytes(
+                        row.index_long_double_rows,
+                        billable_size_v::<IndexLongDoubleObject>(),
+                    )?,
+                })
+            })
+            .collect()
     }
 
     /// Repair a superseded offline replay checkpoint by replacing exactly the
