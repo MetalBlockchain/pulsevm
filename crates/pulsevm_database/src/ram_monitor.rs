@@ -334,3 +334,43 @@ impl RamUsageMonitor {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const KEY: RamUsageSeriesKey = RamUsageSeriesKey {
+        code: 1,
+        scope: 2,
+        table: 3,
+        payer: 4,
+    };
+
+    #[test]
+    fn lifecycle_noops_are_safe_and_limits_are_defensive() {
+        let monitor = RamUsageMonitor::default();
+        monitor.start_session(1);
+        monitor.record(&[RamUsageEvent {
+            key: KEY,
+            delta_bytes: 1,
+        }]);
+        monitor.undo();
+        monitor.squash(1);
+        monitor.commit(1);
+        assert!(monitor.snapshot().is_none());
+
+        assert!(monitor.enable(0, 0, Vec::new()).is_err());
+        assert!(
+            monitor
+                .enable(0, MAX_RAM_MONITOR_SERIES + 1, Vec::new())
+                .is_err()
+        );
+        monitor.enable(0, 1, Vec::new()).unwrap();
+        monitor.record(&[]);
+        monitor.undo();
+        monitor.squash(0);
+        assert_eq!(monitor.snapshot().unwrap().revision, 0);
+        monitor.disable();
+        assert!(monitor.snapshot().is_none());
+    }
+}

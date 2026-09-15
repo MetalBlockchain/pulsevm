@@ -8,6 +8,7 @@ use pulsevm_database::{
     IndexDoubleObject,
     IndexLongDoubleObject,
     KeyValueObject,
+    MAX_RAM_MONITOR_SERIES,
     TableObject,
     U256,
 };
@@ -370,4 +371,58 @@ fn continuous_monitor_reseeds_after_live_state_restore() {
     assert_eq!(snapshot.series[0].key.code, 10);
     assert_eq!(snapshot.series[0].allocated_bytes_total, 0);
     assert_eq!(snapshot.accepted_blocks_total, 0);
+}
+
+#[test]
+fn continuous_monitor_validates_limits_and_reseeds_maintenance_writes() {
+    let database = Database::default();
+    database
+        .create_key_value_object_standalone(10, 20, 30, 40, 1, b"small")
+        .unwrap();
+    database
+        .create_key_value_object_standalone(11, 21, 31, 41, 1, b"a larger baseline row")
+        .unwrap();
+
+    assert!(database.enable_ram_usage_monitor(0).is_err());
+    assert!(
+        database
+            .enable_ram_usage_monitor(MAX_RAM_MONITOR_SERIES + 1)
+            .is_err()
+    );
+    database.enable_ram_usage_monitor(1).unwrap();
+    let baseline = database.ram_usage_monitor_snapshot().unwrap();
+    assert_eq!(baseline.series.len(), 1);
+    assert_eq!(baseline.series[0].key.code, 11);
+    assert!(baseline.overflow.current_bytes > 0);
+
+    // Maintenance writes outside an undo session are deliberately ignored
+    // until an explicit reseed establishes another exact baseline.
+    database
+        .update_key_value_object_standalone(11, 21, 31, 1, 41, b"even larger after maintenance")
+        .unwrap();
+    assert_eq!(database.ram_usage_monitor_snapshot().unwrap(), baseline);
+    database.enable_ram_usage_monitor(1).unwrap();
+    assert!(
+        database.ram_usage_monitor_snapshot().unwrap().series[0].current_bytes
+            > baseline.series[0].current_bytes
+    );
+
+    database.disable_ram_usage_monitor();
+    assert!(database.ram_usage_monitor_snapshot().is_none());
+}
+
+#[test]
+fn continuous_monitor_solo_squash_publishes_irreversible_state() {
+    let database = Database::default();
+    database.enable_ram_usage_monitor(4).unwrap();
+    database.arena_start_undo_session();
+    database
+        .create_key_value_object_standalone(10, 20, 30, 40, 1, b"squashed")
+        .unwrap();
+    database.arena_squash();
+
+    let snapshot = database.ram_usage_monitor_snapshot().unwrap();
+    assert_eq!(snapshot.revision, database.revision());
+    assert_eq!(snapshot.series.len(), 1);
+    assert!(snapshot.series[0].current_bytes > 0);
 }
