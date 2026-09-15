@@ -61,6 +61,13 @@ use crate::{
         SystemKey,
         SystemRangeKey,
     },
+    ram_monitor::{
+        MAX_RAM_MONITOR_SERIES,
+        RamUsageEvent,
+        RamUsageMonitor,
+        RamUsageMonitorSnapshot,
+        RamUsageSeriesKey,
+    },
 };
 
 /// The RAM a `permission_link_object` is billed:
@@ -919,6 +926,9 @@ pub struct Database {
     /// Action-receipt counters use the same replay-only undo layers so hundreds
     /// of actions can collapse to one account-metadata mutation per account.
     xpr_native_sequences: Arc<Mutex<XprNativeSequenceCache>>,
+    /// Optional local-only accepted-workload RAM metrics. Its revision layers
+    /// mirror Arena undo sessions and never participate in consensus state.
+    ram_usage_monitor: Arc<RamUsageMonitor>,
 }
 
 #[derive(Clone, Copy)]
@@ -1076,6 +1086,7 @@ impl Database {
             xpr_native_replay: Arc::new(AtomicBool::new(false)),
             xpr_native_rows: Arc::new(Mutex::new(XprNativeRowCache::default())),
             xpr_native_sequences: Arc::new(Mutex::new(XprNativeSequenceCache::default())),
+            ram_usage_monitor: Arc::new(RamUsageMonitor::default()),
         })
     }
 
@@ -2377,6 +2388,8 @@ impl Database {
     /// Arena undo-session lifecycle, driven by the controller's block boundaries.
     pub fn arena_start_undo_session(&self) {
         self.backend.start_undo_session();
+        self.ram_usage_monitor
+            .start_session(self.backend.revision());
         if self.xpr_native_replay_enabled() {
             self.xpr_native_rows
                 .lock()
@@ -2530,6 +2543,7 @@ impl Database {
     }
     pub fn arena_squash(&self) {
         self.backend.squash();
+        self.ram_usage_monitor.squash(self.backend.revision());
         if self.xpr_native_replay_enabled() {
             let mut cache = self.xpr_native_rows.lock().unwrap();
             // A transaction/onblock layer folds into its enclosing block. If a
@@ -2560,6 +2574,7 @@ impl Database {
     }
     pub fn arena_undo(&self) {
         self.backend.undo();
+        self.ram_usage_monitor.undo();
         if self.xpr_native_replay_enabled() {
             let mut cache = self.xpr_native_rows.lock().unwrap();
             cache.layers.pop();
@@ -2703,6 +2718,7 @@ impl Database {
         self.backend
             .reload_from(&dest)
             .map_err(|e| ChainError::InternalError(format!("restore: reload: {e:?}")))?;
+        self.reseed_ram_usage_monitor();
         Ok(header)
     }
 
@@ -2768,6 +2784,7 @@ impl Database {
         self.backend
             .reload_from(&dest)
             .map_err(|e| ChainError::InternalError(format!("restore: reload: {e:?}")))?;
+        self.reseed_ram_usage_monitor();
         Ok(header)
     }
 
@@ -2903,6 +2920,7 @@ impl Database {
         self.flush_xpr_native_rows()?;
         self.flush_xpr_native_sequences()?;
         self.backend.commit(revision);
+        self.ram_usage_monitor.commit(revision);
         if self.xpr_native_replay_enabled() {
             let mut cache = self.xpr_native_rows.lock().unwrap();
             cache.layers.clear();
@@ -2917,6 +2935,7 @@ impl Database {
 
     pub fn undo(&mut self) -> Result<(), ChainError> {
         self.backend.undo();
+        self.ram_usage_monitor.undo();
         Ok(())
     }
 
@@ -3899,6 +3918,170 @@ impl Database {
         contract_table_ram_billing_from_inventory(raw)
     }
 
+    /// Enable bounded, rollback-aware RAM workload metrics.
+    ///
+    /// The initial full scan establishes exact current usage. Subsequent
+    /// allocation/refund counters are staged in Arena's undo sessions and only
+    /// become visible when the corresponding block revision commits.
+    pub fn enable_ram_usage_monitor(&self, max_series: usize) -> Result<(), ChainError> {
+        if max_series == 0 || max_series > MAX_RAM_MONITOR_SERIES {
+            return Err(ChainError::InternalError(format!(
+                "RAM monitor max_series must be between 1 and {MAX_RAM_MONITOR_SERIES}"
+            )));
+        }
+        let baseline = self
+            .contract_table_ram_billing()?
+            .into_iter()
+            .map(|row| {
+                let bytes = row.total_bytes()?;
+                Ok((
+                    RamUsageSeriesKey {
+                        code: row.code,
+                        scope: row.scope,
+                        table: row.table,
+                        payer: row.payer,
+                    },
+                    bytes,
+                ))
+            })
+            .collect::<Result<Vec<_>, ChainError>>()?;
+        self.ram_usage_monitor
+            .enable(self.revision(), max_series, baseline)
+            .map_err(ChainError::InternalError)
+    }
+
+    /// Disable and release all process-local RAM workload metrics.
+    pub fn disable_ram_usage_monitor(&self) {
+        self.ram_usage_monitor.disable();
+    }
+
+    /// Snapshot accepted RAM workload metrics without taking the Arena lock.
+    pub fn ram_usage_monitor_snapshot(&self) -> Option<RamUsageMonitorSnapshot> {
+        self.ram_usage_monitor.snapshot()
+    }
+
+    fn reseed_ram_usage_monitor(&self) {
+        let Some(max_series) = self
+            .ram_usage_monitor
+            .snapshot()
+            .map(|snapshot| snapshot.max_series)
+        else {
+            return;
+        };
+        // State sync has already atomically replaced the Arena at this point.
+        // Observability must not turn a valid state transition into an error
+        // after publication. Fail closed by removing stale metrics instead.
+        if self.enable_ram_usage_monitor(max_series).is_err() {
+            self.ram_usage_monitor.disable();
+        }
+    }
+
+    fn ram_usage_monitor_enabled(&self) -> bool {
+        self.ram_usage_monitor.is_enabled()
+    }
+
+    fn record_ram_usage_events(&self, events: &[RamUsageEvent]) {
+        self.ram_usage_monitor.record(events);
+    }
+
+    fn ram_usage_key(code: u64, scope: u64, table: u64, payer: u64) -> RamUsageSeriesKey {
+        RamUsageSeriesKey {
+            code,
+            scope,
+            table,
+            payer,
+        }
+    }
+
+    fn monitored_primary_bytes(value_len: usize) -> i64 {
+        i64::try_from(value_len)
+            .unwrap_or(i64::MAX)
+            .saturating_add(billable_size_v::<KeyValueObject>() as i64)
+    }
+
+    fn monitored_table_created(&self, code: u64, scope: u64, table: u64) -> bool {
+        self.ram_usage_monitor_enabled() && !self.backend.table_exists(code, scope, table)
+    }
+
+    fn record_monitored_index_create(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        payer: u64,
+        bytes: i64,
+        table_created: bool,
+    ) {
+        self.record_ram_usage_events(&[
+            RamUsageEvent {
+                key: Self::ram_usage_key(code, scope, table, payer),
+                delta_bytes: bytes,
+            },
+            RamUsageEvent {
+                key: Self::ram_usage_key(code, scope, table, payer),
+                delta_bytes: if table_created {
+                    billable_size_v::<TableObject>() as i64
+                } else {
+                    0
+                },
+            },
+        ]);
+    }
+
+    fn record_monitored_index_update(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        old_payer: Option<u64>,
+        new_payer: u64,
+        bytes: i64,
+    ) {
+        if let Some(old_payer) = old_payer
+            && old_payer != new_payer
+        {
+            self.record_ram_usage_events(&[
+                RamUsageEvent {
+                    key: Self::ram_usage_key(code, scope, table, old_payer),
+                    delta_bytes: bytes.saturating_neg(),
+                },
+                RamUsageEvent {
+                    key: Self::ram_usage_key(code, scope, table, new_payer),
+                    delta_bytes: bytes,
+                },
+            ]);
+        }
+    }
+
+    fn record_monitored_index_remove(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        payer: Option<u64>,
+        table_payer: Option<u64>,
+        bytes: i64,
+    ) {
+        let Some(payer) = payer else {
+            return;
+        };
+        let table_removed = !self.backend.table_exists(code, scope, table);
+        self.record_ram_usage_events(&[
+            RamUsageEvent {
+                key: Self::ram_usage_key(code, scope, table, payer),
+                delta_bytes: bytes.saturating_neg(),
+            },
+            RamUsageEvent {
+                key: Self::ram_usage_key(code, scope, table, table_payer.unwrap_or(payer)),
+                delta_bytes: if table_removed {
+                    -(billable_size_v::<TableObject>() as i64)
+                } else {
+                    0
+                },
+            },
+        ]);
+    }
+
     /// Repair a superseded offline replay checkpoint by replacing exactly the
     /// expected stored RAM counter with the live-object inventory total. The
     /// compare-and-set guard prevents this from becoming a general limit
@@ -4138,9 +4321,17 @@ impl Database {
         table: u64,
         payer: u64,
     ) -> Result<(), ChainError> {
+        let created = self.monitored_table_created(code, scope, table);
         self.backend
             .create_table(code, scope, table, payer)
-            .map_err(|e| ChainError::InternalError(format!("XPR import contract table: {e:?}")))
+            .map_err(|e| ChainError::InternalError(format!("XPR import contract table: {e:?}")))?;
+        if created {
+            self.record_ram_usage_events(&[RamUsageEvent {
+                key: Self::ram_usage_key(code, scope, table, payer),
+                delta_bytes: billable_size_v::<TableObject>() as i64,
+            }]);
+        }
+        Ok(())
     }
 
     pub(crate) fn xpr_import_remove_contract_table(
@@ -4149,9 +4340,20 @@ impl Database {
         scope: u64,
         table: u64,
     ) -> Result<(), ChainError> {
+        let payer = self
+            .ram_usage_monitor_enabled()
+            .then(|| self.backend.table_payer(code, scope, table))
+            .flatten();
         self.backend
             .remove_table(code, scope, table)
-            .map_err(|e| ChainError::InternalError(format!("XPR remove contract table: {e:?}")))
+            .map_err(|e| ChainError::InternalError(format!("XPR remove contract table: {e:?}")))?;
+        if let Some(payer) = payer {
+            self.record_ram_usage_events(&[RamUsageEvent {
+                key: Self::ram_usage_key(code, scope, table, payer),
+                delta_bytes: -(billable_size_v::<TableObject>() as i64),
+            }]);
+        }
+        Ok(())
     }
 
     /// The `(payer, value)` of a contract row from the arena, or `None`.
@@ -4262,11 +4464,61 @@ impl Database {
                 value: value.clone(),
             })
             .collect::<Vec<_>>();
+        let monitored_old = self.ram_usage_monitor_enabled().then(|| {
+            updates
+                .iter()
+                .map(|update| {
+                    self.backend
+                        .kv_row(update.code, update.scope, update.table, update.primary_key)
+                })
+                .collect::<Vec<_>>()
+        });
         self.backend
             .update_key_value_objects(&updates)
             .map_err(|error| {
                 ChainError::InternalError(format!("flush XPR native rows: {error:?}"))
             })?;
+        if let Some(monitored_old) = monitored_old {
+            for (update, old) in updates.iter().zip(monitored_old) {
+                let Some((old_payer, old_value)) = old else {
+                    continue;
+                };
+                let old_bytes = Self::monitored_primary_bytes(old_value.len());
+                let new_bytes = Self::monitored_primary_bytes(update.value.len());
+                if old_payer == update.payer {
+                    self.record_ram_usage_events(&[RamUsageEvent {
+                        key: Self::ram_usage_key(
+                            update.code,
+                            update.scope,
+                            update.table,
+                            update.payer,
+                        ),
+                        delta_bytes: new_bytes.saturating_sub(old_bytes),
+                    }]);
+                } else {
+                    self.record_ram_usage_events(&[
+                        RamUsageEvent {
+                            key: Self::ram_usage_key(
+                                update.code,
+                                update.scope,
+                                update.table,
+                                old_payer,
+                            ),
+                            delta_bytes: old_bytes.saturating_neg(),
+                        },
+                        RamUsageEvent {
+                            key: Self::ram_usage_key(
+                                update.code,
+                                update.scope,
+                                update.table,
+                                update.payer,
+                            ),
+                            delta_bytes: new_bytes,
+                        },
+                    ]);
+                }
+            }
+        }
 
         let mut cache = self.xpr_native_rows.lock().unwrap();
         for layer in &mut cache.layers {
@@ -4346,9 +4598,28 @@ impl Database {
     ) -> Result<(), ChainError> {
         self.dependency_table_write(code, scope, table);
         self.dependency_write(code, scope, table, ContractIndex::Primary, primary_key);
+        let table_created =
+            self.ram_usage_monitor_enabled() && !self.backend.table_exists(code, scope, table);
         let s = &self.backend;
         s.create_key_value_object(code, scope, table, payer, primary_key, buffer)
-            .map_err(|e| ChainError::InternalError(format!("arena create_key_value_object: {e:?}")))
+            .map_err(|e| {
+                ChainError::InternalError(format!("arena create_key_value_object: {e:?}"))
+            })?;
+        self.record_ram_usage_events(&[
+            RamUsageEvent {
+                key: Self::ram_usage_key(code, scope, table, payer),
+                delta_bytes: Self::monitored_primary_bytes(buffer.len()),
+            },
+            RamUsageEvent {
+                key: Self::ram_usage_key(code, scope, table, payer),
+                delta_bytes: if table_created {
+                    billable_size_v::<TableObject>() as i64
+                } else {
+                    0
+                },
+            },
+        ]);
+        Ok(())
     }
 
     /// Rewrite a contract row's value and payer in the arena alone (no chainbase).
@@ -4377,9 +4648,37 @@ impl Database {
         buffer: &[u8],
     ) -> Result<(), ChainError> {
         self.dependency_write(code, scope, table, ContractIndex::Primary, primary_key);
+        let old = self
+            .ram_usage_monitor_enabled()
+            .then(|| self.backend.kv_row(code, scope, table, primary_key))
+            .flatten();
         let s = &self.backend;
         s.update_key_value_object(code, scope, table, primary_key, payer, buffer)
-            .map_err(|e| ChainError::InternalError(format!("arena update_key_value_object: {e:?}")))
+            .map_err(|e| {
+                ChainError::InternalError(format!("arena update_key_value_object: {e:?}"))
+            })?;
+        if let Some((old_payer, old_value)) = old {
+            let old_bytes = Self::monitored_primary_bytes(old_value.len());
+            let new_bytes = Self::monitored_primary_bytes(buffer.len());
+            if old_payer == payer {
+                self.record_ram_usage_events(&[RamUsageEvent {
+                    key: Self::ram_usage_key(code, scope, table, payer),
+                    delta_bytes: new_bytes.saturating_sub(old_bytes),
+                }]);
+            } else {
+                self.record_ram_usage_events(&[
+                    RamUsageEvent {
+                        key: Self::ram_usage_key(code, scope, table, old_payer),
+                        delta_bytes: old_bytes.saturating_neg(),
+                    },
+                    RamUsageEvent {
+                        key: Self::ram_usage_key(code, scope, table, payer),
+                        delta_bytes: new_bytes,
+                    },
+                ]);
+            }
+        }
+        Ok(())
     }
 
     /// Remove a contract row in the arena alone (no chainbase). The arena drops
@@ -4434,9 +4733,35 @@ impl Database {
     ) -> Result<(), ChainError> {
         self.dependency_table_write(code, scope, table);
         self.dependency_write(code, scope, table, ContractIndex::Primary, primary_key);
+        let monitored = self.ram_usage_monitor_enabled().then(|| {
+            (
+                self.backend.kv_row(code, scope, table, primary_key),
+                self.backend.table_payer(code, scope, table),
+            )
+        });
         let s = &self.backend;
         s.remove_key_value_object(code, scope, table, primary_key)
-            .map_err(|e| ChainError::InternalError(format!("arena remove_key_value_object: {e:?}")))
+            .map_err(|e| {
+                ChainError::InternalError(format!("arena remove_key_value_object: {e:?}"))
+            })?;
+        if let Some((Some((payer, value)), table_payer)) = monitored {
+            let table_removed = !self.backend.table_exists(code, scope, table);
+            self.record_ram_usage_events(&[
+                RamUsageEvent {
+                    key: Self::ram_usage_key(code, scope, table, payer),
+                    delta_bytes: Self::monitored_primary_bytes(value.len()).saturating_neg(),
+                },
+                RamUsageEvent {
+                    key: Self::ram_usage_key(code, scope, table, table_payer.unwrap_or(payer)),
+                    delta_bytes: if table_removed {
+                        -(billable_size_v::<TableObject>() as i64)
+                    } else {
+                        0
+                    },
+                },
+            ]);
+        }
+        Ok(())
     }
 
     // ----- secondary-index writes -------------------------------------------
@@ -4461,9 +4786,19 @@ impl Database {
     ) -> Result<(), ChainError> {
         self.dependency_table_write(code, scope, table);
         self.dependency_write(code, scope, table, ContractIndex::Idx64, primary_key);
+        let table_created = self.monitored_table_created(code, scope, table);
         self.backend_ref()?
             .create_index64_object(code, scope, table, payer, primary_key, secondary_key)
-            .map_err(|e| ChainError::InternalError(format!("arena create_index64: {e:?}")))
+            .map_err(|e| ChainError::InternalError(format!("arena create_index64: {e:?}")))?;
+        self.record_monitored_index_create(
+            code,
+            scope,
+            table,
+            payer,
+            billable_size_v::<Index64Object>() as i64,
+            table_created,
+        );
+        Ok(())
     }
 
     pub fn update_index64_object_standalone(
@@ -4476,9 +4811,22 @@ impl Database {
         secondary_key: u64,
     ) -> Result<(), ChainError> {
         self.dependency_write(code, scope, table, ContractIndex::Idx64, primary_key);
+        let old_payer = self
+            .ram_usage_monitor_enabled()
+            .then(|| self.backend.idx64_payer(code, scope, table, primary_key))
+            .flatten();
         self.backend_ref()?
             .update_index64_object(code, scope, table, primary_key, payer, secondary_key)
-            .map_err(|e| ChainError::InternalError(format!("arena update_index64: {e:?}")))
+            .map_err(|e| ChainError::InternalError(format!("arena update_index64: {e:?}")))?;
+        self.record_monitored_index_update(
+            code,
+            scope,
+            table,
+            old_payer,
+            payer,
+            billable_size_v::<Index64Object>() as i64,
+        );
+        Ok(())
     }
 
     pub fn remove_index64_object_standalone(
@@ -4490,9 +4838,26 @@ impl Database {
     ) -> Result<(), ChainError> {
         self.dependency_table_write(code, scope, table);
         self.dependency_write(code, scope, table, ContractIndex::Idx64, primary_key);
+        let monitored = self.ram_usage_monitor_enabled().then(|| {
+            (
+                self.backend.idx64_payer(code, scope, table, primary_key),
+                self.backend.table_payer(code, scope, table),
+            )
+        });
         self.backend_ref()?
             .remove_index64_object(code, scope, table, primary_key)
-            .map_err(|e| ChainError::InternalError(format!("arena remove_index64: {e:?}")))
+            .map_err(|e| ChainError::InternalError(format!("arena remove_index64: {e:?}")))?;
+        if let Some((payer, table_payer)) = monitored {
+            self.record_monitored_index_remove(
+                code,
+                scope,
+                table,
+                payer,
+                table_payer,
+                billable_size_v::<Index64Object>() as i64,
+            );
+        }
+        Ok(())
     }
 
     pub fn arena_idx64_payer(
@@ -4517,9 +4882,19 @@ impl Database {
     ) -> Result<(), ChainError> {
         self.dependency_table_write(code, scope, table);
         self.dependency_write(code, scope, table, ContractIndex::Idx128, primary_key);
+        let table_created = self.monitored_table_created(code, scope, table);
         self.backend_ref()?
             .create_index128_object(code, scope, table, payer, primary_key, secondary_key)
-            .map_err(|e| ChainError::InternalError(format!("arena create_index128: {e:?}")))
+            .map_err(|e| ChainError::InternalError(format!("arena create_index128: {e:?}")))?;
+        self.record_monitored_index_create(
+            code,
+            scope,
+            table,
+            payer,
+            billable_size_v::<Index128Object>() as i64,
+            table_created,
+        );
+        Ok(())
     }
 
     pub fn update_index128_object_standalone(
@@ -4532,9 +4907,22 @@ impl Database {
         secondary_key: u128,
     ) -> Result<(), ChainError> {
         self.dependency_write(code, scope, table, ContractIndex::Idx128, primary_key);
+        let old_payer = self
+            .ram_usage_monitor_enabled()
+            .then(|| self.backend.idx128_payer(code, scope, table, primary_key))
+            .flatten();
         self.backend_ref()?
             .update_index128_object(code, scope, table, primary_key, payer, secondary_key)
-            .map_err(|e| ChainError::InternalError(format!("arena update_index128: {e:?}")))
+            .map_err(|e| ChainError::InternalError(format!("arena update_index128: {e:?}")))?;
+        self.record_monitored_index_update(
+            code,
+            scope,
+            table,
+            old_payer,
+            payer,
+            billable_size_v::<Index128Object>() as i64,
+        );
+        Ok(())
     }
 
     pub fn remove_index128_object_standalone(
@@ -4546,9 +4934,26 @@ impl Database {
     ) -> Result<(), ChainError> {
         self.dependency_table_write(code, scope, table);
         self.dependency_write(code, scope, table, ContractIndex::Idx128, primary_key);
+        let monitored = self.ram_usage_monitor_enabled().then(|| {
+            (
+                self.backend.idx128_payer(code, scope, table, primary_key),
+                self.backend.table_payer(code, scope, table),
+            )
+        });
         self.backend_ref()?
             .remove_index128_object(code, scope, table, primary_key)
-            .map_err(|e| ChainError::InternalError(format!("arena remove_index128: {e:?}")))
+            .map_err(|e| ChainError::InternalError(format!("arena remove_index128: {e:?}")))?;
+        if let Some((payer, table_payer)) = monitored {
+            self.record_monitored_index_remove(
+                code,
+                scope,
+                table,
+                payer,
+                table_payer,
+                billable_size_v::<Index128Object>() as i64,
+            );
+        }
+        Ok(())
     }
 
     pub fn arena_idx128_payer(
@@ -4573,9 +4978,19 @@ impl Database {
     ) -> Result<(), ChainError> {
         self.dependency_table_write(code, scope, table);
         self.dependency_write(code, scope, table, ContractIndex::Idx256, primary_key);
+        let table_created = self.monitored_table_created(code, scope, table);
         self.backend_ref()?
             .create_index256_object(code, scope, table, payer, primary_key, secondary_key.value)
-            .map_err(|e| ChainError::InternalError(format!("arena create_index256: {e:?}")))
+            .map_err(|e| ChainError::InternalError(format!("arena create_index256: {e:?}")))?;
+        self.record_monitored_index_create(
+            code,
+            scope,
+            table,
+            payer,
+            billable_size_v::<Index256Object>() as i64,
+            table_created,
+        );
+        Ok(())
     }
 
     pub fn update_index256_object_standalone(
@@ -4588,9 +5003,22 @@ impl Database {
         secondary_key: U256,
     ) -> Result<(), ChainError> {
         self.dependency_write(code, scope, table, ContractIndex::Idx256, primary_key);
+        let old_payer = self
+            .ram_usage_monitor_enabled()
+            .then(|| self.backend.idx256_payer(code, scope, table, primary_key))
+            .flatten();
         self.backend_ref()?
             .update_index256_object(code, scope, table, primary_key, payer, secondary_key.value)
-            .map_err(|e| ChainError::InternalError(format!("arena update_index256: {e:?}")))
+            .map_err(|e| ChainError::InternalError(format!("arena update_index256: {e:?}")))?;
+        self.record_monitored_index_update(
+            code,
+            scope,
+            table,
+            old_payer,
+            payer,
+            billable_size_v::<Index256Object>() as i64,
+        );
+        Ok(())
     }
 
     pub fn remove_index256_object_standalone(
@@ -4602,9 +5030,26 @@ impl Database {
     ) -> Result<(), ChainError> {
         self.dependency_table_write(code, scope, table);
         self.dependency_write(code, scope, table, ContractIndex::Idx256, primary_key);
+        let monitored = self.ram_usage_monitor_enabled().then(|| {
+            (
+                self.backend.idx256_payer(code, scope, table, primary_key),
+                self.backend.table_payer(code, scope, table),
+            )
+        });
         self.backend_ref()?
             .remove_index256_object(code, scope, table, primary_key)
-            .map_err(|e| ChainError::InternalError(format!("arena remove_index256: {e:?}")))
+            .map_err(|e| ChainError::InternalError(format!("arena remove_index256: {e:?}")))?;
+        if let Some((payer, table_payer)) = monitored {
+            self.record_monitored_index_remove(
+                code,
+                scope,
+                table,
+                payer,
+                table_payer,
+                billable_size_v::<Index256Object>() as i64,
+            );
+        }
+        Ok(())
     }
 
     pub fn arena_idx256_payer(
@@ -4629,9 +5074,19 @@ impl Database {
     ) -> Result<(), ChainError> {
         self.dependency_table_write(code, scope, table);
         self.dependency_write(code, scope, table, ContractIndex::IdxDouble, primary_key);
+        let table_created = self.monitored_table_created(code, scope, table);
         self.backend_ref()?
             .create_idx_double_object(code, scope, table, payer, primary_key, secondary_key)
-            .map_err(|e| ChainError::InternalError(format!("arena create_idx_double: {e:?}")))
+            .map_err(|e| ChainError::InternalError(format!("arena create_idx_double: {e:?}")))?;
+        self.record_monitored_index_create(
+            code,
+            scope,
+            table,
+            payer,
+            billable_size_v::<IndexDoubleObject>() as i64,
+            table_created,
+        );
+        Ok(())
     }
 
     pub fn update_idx_double_object_standalone(
@@ -4644,9 +5099,25 @@ impl Database {
         secondary_key: u64,
     ) -> Result<(), ChainError> {
         self.dependency_write(code, scope, table, ContractIndex::IdxDouble, primary_key);
+        let old_payer = self
+            .ram_usage_monitor_enabled()
+            .then(|| {
+                self.backend
+                    .idx_double_payer(code, scope, table, primary_key)
+            })
+            .flatten();
         self.backend_ref()?
             .update_idx_double_object(code, scope, table, primary_key, payer, secondary_key)
-            .map_err(|e| ChainError::InternalError(format!("arena update_idx_double: {e:?}")))
+            .map_err(|e| ChainError::InternalError(format!("arena update_idx_double: {e:?}")))?;
+        self.record_monitored_index_update(
+            code,
+            scope,
+            table,
+            old_payer,
+            payer,
+            billable_size_v::<IndexDoubleObject>() as i64,
+        );
+        Ok(())
     }
 
     pub fn remove_idx_double_object_standalone(
@@ -4658,9 +5129,27 @@ impl Database {
     ) -> Result<(), ChainError> {
         self.dependency_table_write(code, scope, table);
         self.dependency_write(code, scope, table, ContractIndex::IdxDouble, primary_key);
+        let monitored = self.ram_usage_monitor_enabled().then(|| {
+            (
+                self.backend
+                    .idx_double_payer(code, scope, table, primary_key),
+                self.backend.table_payer(code, scope, table),
+            )
+        });
         self.backend_ref()?
             .remove_idx_double_object(code, scope, table, primary_key)
-            .map_err(|e| ChainError::InternalError(format!("arena remove_idx_double: {e:?}")))
+            .map_err(|e| ChainError::InternalError(format!("arena remove_idx_double: {e:?}")))?;
+        if let Some((payer, table_payer)) = monitored {
+            self.record_monitored_index_remove(
+                code,
+                scope,
+                table,
+                payer,
+                table_payer,
+                billable_size_v::<IndexDoubleObject>() as i64,
+            );
+        }
+        Ok(())
     }
 
     pub fn arena_idx_double_payer(
@@ -4691,6 +5180,7 @@ impl Database {
             ContractIndex::IdxLongDouble,
             primary_key,
         );
+        let table_created = self.monitored_table_created(code, scope, table);
         self.backend_ref()?
             .create_idx_long_double_object(
                 code,
@@ -4700,7 +5190,18 @@ impl Database {
                 primary_key,
                 (secondary_key.lo, secondary_key.hi),
             )
-            .map_err(|e| ChainError::InternalError(format!("arena create_idx_long_double: {e:?}")))
+            .map_err(|e| {
+                ChainError::InternalError(format!("arena create_idx_long_double: {e:?}"))
+            })?;
+        self.record_monitored_index_create(
+            code,
+            scope,
+            table,
+            payer,
+            billable_size_v::<IndexLongDoubleObject>() as i64,
+            table_created,
+        );
+        Ok(())
     }
 
     pub fn update_idx_long_double_object_standalone(
@@ -4719,6 +5220,13 @@ impl Database {
             ContractIndex::IdxLongDouble,
             primary_key,
         );
+        let old_payer = self
+            .ram_usage_monitor_enabled()
+            .then(|| {
+                self.backend
+                    .idx_long_double_payer(code, scope, table, primary_key)
+            })
+            .flatten();
         self.backend_ref()?
             .update_idx_long_double_object(
                 code,
@@ -4728,7 +5236,18 @@ impl Database {
                 payer,
                 (secondary_key.lo, secondary_key.hi),
             )
-            .map_err(|e| ChainError::InternalError(format!("arena update_idx_long_double: {e:?}")))
+            .map_err(|e| {
+                ChainError::InternalError(format!("arena update_idx_long_double: {e:?}"))
+            })?;
+        self.record_monitored_index_update(
+            code,
+            scope,
+            table,
+            old_payer,
+            payer,
+            billable_size_v::<IndexLongDoubleObject>() as i64,
+        );
+        Ok(())
     }
 
     pub fn remove_idx_long_double_object_standalone(
@@ -4746,9 +5265,29 @@ impl Database {
             ContractIndex::IdxLongDouble,
             primary_key,
         );
+        let monitored = self.ram_usage_monitor_enabled().then(|| {
+            (
+                self.backend
+                    .idx_long_double_payer(code, scope, table, primary_key),
+                self.backend.table_payer(code, scope, table),
+            )
+        });
         self.backend_ref()?
             .remove_idx_long_double_object(code, scope, table, primary_key)
-            .map_err(|e| ChainError::InternalError(format!("arena remove_idx_long_double: {e:?}")))
+            .map_err(|e| {
+                ChainError::InternalError(format!("arena remove_idx_long_double: {e:?}"))
+            })?;
+        if let Some((payer, table_payer)) = monitored {
+            self.record_monitored_index_remove(
+                code,
+                scope,
+                table,
+                payer,
+                table_payer,
+                billable_size_v::<IndexLongDoubleObject>() as i64,
+            );
+        }
+        Ok(())
     }
 
     pub fn arena_idx_long_double_payer(
@@ -7508,6 +8047,7 @@ impl Default for Database {
             xpr_native_replay: Arc::new(AtomicBool::new(false)),
             xpr_native_rows: Arc::new(Mutex::new(XprNativeRowCache::default())),
             xpr_native_sequences: Arc::new(Mutex::new(XprNativeSequenceCache::default())),
+            ram_usage_monitor: Arc::new(RamUsageMonitor::default()),
         }
     }
 }

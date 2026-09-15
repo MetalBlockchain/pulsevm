@@ -187,3 +187,187 @@ fn payer_profile_survives_checkpoint_and_reopen() {
     assert_eq!(after.tables.len(), 1);
     assert_eq!(after.tables[0].primary_value_bytes, 9);
 }
+
+#[test]
+fn continuous_monitor_publishes_only_committed_ram_changes() {
+    let mut database = Database::default();
+    database.enable_ram_usage_monitor(8).unwrap();
+
+    database.arena_start_undo_session();
+    database
+        .create_key_value_object_standalone(10, 20, 30, 40, 1, b"abc")
+        .unwrap();
+    database
+        .create_index64_object_standalone(10, 20, 30, 40, 1, 7)
+        .unwrap();
+    database
+        .create_index128_object_standalone(10, 20, 30, 40, 1, 8)
+        .unwrap();
+    database
+        .create_index256_object_standalone(10, 20, 30, 40, 1, U256 { value: [9; 32] })
+        .unwrap();
+    database
+        .create_idx_double_object_standalone(10, 20, 30, 40, 1, 1.5f64.to_bits())
+        .unwrap();
+    database
+        .create_idx_long_double_object_standalone(10, 20, 30, 40, 1, Float128 { lo: 1, hi: 0 })
+        .unwrap();
+
+    let speculative = database.ram_usage_monitor_snapshot().unwrap();
+    assert!(speculative.series.is_empty());
+    assert_eq!(speculative.accepted_blocks_total, 0);
+
+    database.commit(1).unwrap();
+    let accepted = database.ram_usage_monitor_snapshot().unwrap();
+    assert_eq!(accepted.revision, 1);
+    assert_eq!(accepted.accepted_blocks_total, 1);
+    assert_eq!(accepted.series.len(), 1);
+    let expected = billable_size_v::<TableObject>()
+        + billable_size_v::<KeyValueObject>()
+        + 3
+        + billable_size_v::<Index64Object>()
+        + billable_size_v::<Index128Object>()
+        + billable_size_v::<Index256Object>()
+        + billable_size_v::<IndexDoubleObject>()
+        + billable_size_v::<IndexLongDoubleObject>();
+    assert_eq!(accepted.series[0].current_bytes, expected as i64);
+    assert_eq!(accepted.series[0].allocated_bytes_total, expected);
+    assert_eq!(accepted.series[0].freed_bytes_total, 0);
+    assert_eq!(accepted.series[0].operations_total, 7);
+
+    database.arena_start_undo_session();
+    database
+        .update_key_value_object_standalone(10, 20, 30, 1, 41, b"rejected")
+        .unwrap();
+    database
+        .remove_index64_object_standalone(10, 20, 30, 1)
+        .unwrap();
+    database.arena_undo();
+    assert_eq!(database.ram_usage_monitor_snapshot().unwrap(), accepted);
+}
+
+#[test]
+fn continuous_monitor_tracks_nested_sessions_and_partial_commit() {
+    let mut database = Database::default();
+    database.enable_ram_usage_monitor(8).unwrap();
+
+    database.arena_start_undo_session();
+    database
+        .create_key_value_object_standalone(10, 20, 30, 40, 1, b"outer")
+        .unwrap();
+    database.arena_start_undo_session();
+    database
+        .create_key_value_object_standalone(10, 20, 30, 40, 2, b"inner")
+        .unwrap();
+    database.arena_squash();
+    assert!(
+        database
+            .ram_usage_monitor_snapshot()
+            .unwrap()
+            .series
+            .is_empty()
+    );
+    database.commit(1).unwrap();
+    let accepted = database.ram_usage_monitor_snapshot().unwrap();
+    assert_eq!(accepted.accepted_blocks_total, 1);
+    assert_eq!(accepted.series.len(), 1);
+
+    database.arena_start_undo_session();
+    database
+        .create_key_value_object_standalone(11, 21, 31, 41, 1, b"pending")
+        .unwrap();
+    database.arena_undo();
+    assert_eq!(database.ram_usage_monitor_snapshot().unwrap(), accepted);
+
+    database.arena_start_undo_session();
+    database
+        .create_key_value_object_standalone(12, 22, 32, 42, 1, b"accepted-front")
+        .unwrap();
+    database.arena_start_undo_session();
+    database
+        .create_key_value_object_standalone(13, 23, 33, 43, 1, b"pending-back")
+        .unwrap();
+    database.commit(2).unwrap();
+    let partial = database.ram_usage_monitor_snapshot().unwrap();
+    assert_eq!(partial.revision, 2);
+    assert_eq!(partial.accepted_blocks_total, 2);
+    assert_eq!(partial.series.len(), 2);
+    assert!(partial.series.iter().any(|series| series.key.code == 12));
+    assert!(!partial.series.iter().any(|series| series.key.code == 13));
+    database.arena_undo();
+    assert_eq!(database.ram_usage_monitor_snapshot().unwrap(), partial);
+}
+
+#[test]
+fn continuous_monitor_bounds_labels_and_aggregates_overflow_exactly() {
+    let mut database = Database::default();
+    database.enable_ram_usage_monitor(1).unwrap();
+    database.arena_start_undo_session();
+    database
+        .create_key_value_object_standalone(10, 20, 30, 40, 1, b"tracked")
+        .unwrap();
+    database
+        .create_key_value_object_standalone(11, 21, 31, 41, 1, b"overflow")
+        .unwrap();
+    database.commit(1).unwrap();
+
+    let snapshot = database.ram_usage_monitor_snapshot().unwrap();
+    assert_eq!(snapshot.series.len(), 1);
+    assert_eq!(snapshot.max_series, 1);
+    assert_eq!(snapshot.overflow_events_total, 2);
+    assert_eq!(
+        snapshot.overflow.current_bytes,
+        (billable_size_v::<TableObject>() + billable_size_v::<KeyValueObject>() + 8) as i64
+    );
+}
+
+#[test]
+fn enabling_continuous_monitor_does_not_change_consensus_state() {
+    fn apply(database: &mut Database) {
+        database.arena_start_undo_session();
+        database
+            .create_key_value_object_standalone(10, 20, 30, 40, 1, b"same")
+            .unwrap();
+        database
+            .create_index64_object_standalone(10, 20, 30, 40, 1, 7)
+            .unwrap();
+        database.commit(1).unwrap();
+    }
+
+    let mut plain = Database::default();
+    let mut monitored = Database::default();
+    monitored.enable_ram_usage_monitor(8).unwrap();
+    apply(&mut plain);
+    apply(&mut monitored);
+    assert_eq!(plain.arena_state_root(), monitored.arena_state_root());
+}
+
+#[test]
+fn continuous_monitor_reseeds_after_live_state_restore() {
+    let source_dir = TempDir::new().unwrap();
+    let mut source = Database::new(source_dir.path().to_str().unwrap(), 0).unwrap();
+    source
+        .create_key_value_object_standalone(10, 20, 30, 40, 1, b"source")
+        .unwrap();
+    source.set_revision(7).unwrap();
+    let source_root = source.arena_state_root().unwrap();
+    let checkpoint = source.snapshot_bytes().unwrap();
+
+    let target_dir = TempDir::new().unwrap();
+    let target = Database::new(target_dir.path().to_str().unwrap(), 0).unwrap();
+    target
+        .create_key_value_object_standalone(11, 21, 31, 41, 1, b"old-target")
+        .unwrap();
+    target.enable_ram_usage_monitor(8).unwrap();
+    assert_eq!(target.ram_usage_monitor_snapshot().unwrap().revision, 0);
+
+    target
+        .restore_from_bytes(&checkpoint, &source_root)
+        .unwrap();
+    let snapshot = target.ram_usage_monitor_snapshot().unwrap();
+    assert_eq!(snapshot.revision, 7);
+    assert_eq!(snapshot.series.len(), 1);
+    assert_eq!(snapshot.series[0].key.code, 10);
+    assert_eq!(snapshot.series[0].allocated_bytes_total, 0);
+    assert_eq!(snapshot.accepted_blocks_total, 0);
+}

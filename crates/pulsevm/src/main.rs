@@ -4,6 +4,7 @@ mod state_history;
 
 use pulsevm_core::{
     ChainError,
+    Name,
     config::{
         PLUGIN_VERSION,
         VERSION,
@@ -24,6 +25,14 @@ use pulsevm_grpc::{
             Http,
             HttpServer,
         },
+    },
+    prometheus::{
+        Counter,
+        Gauge,
+        LabelPair,
+        Metric,
+        MetricFamily,
+        MetricType,
     },
     vm::{
         self,
@@ -255,6 +264,149 @@ impl VirtualMachine {
             sync_finished: Arc::new(tokio::sync::Notify::new()),
         })
     }
+}
+
+fn ram_usage_labels(key: pulsevm_core::RamUsageSeriesKey, overflow: bool) -> Vec<LabelPair> {
+    let value = |name: &'static str, value: String| LabelPair {
+        name: name.into(),
+        value,
+    };
+    vec![
+        value("code", Name::new(key.code).to_string()),
+        value("scope", Name::new(key.scope).to_string()),
+        value("table", Name::new(key.table).to_string()),
+        value("payer", Name::new(key.payer).to_string()),
+        value("overflow", overflow.to_string()),
+    ]
+}
+
+fn gauge_metric(label: Vec<LabelPair>, value: f64) -> Metric {
+    Metric {
+        label,
+        gauge: Some(Gauge { value }),
+        ..Metric::default()
+    }
+}
+
+fn counter_metric(label: Vec<LabelPair>, value: f64) -> Metric {
+    Metric {
+        label,
+        counter: Some(Counter {
+            value,
+            ..Counter::default()
+        }),
+        ..Metric::default()
+    }
+}
+
+fn metric_family(
+    name: &'static str,
+    help: &'static str,
+    metric_type: MetricType,
+    metric: Vec<Metric>,
+) -> MetricFamily {
+    MetricFamily {
+        name: name.into(),
+        help: help.into(),
+        r#type: metric_type as i32,
+        metric,
+        ..MetricFamily::default()
+    }
+}
+
+fn ram_usage_metric_families(snapshot: pulsevm_core::RamUsageMonitorSnapshot) -> Vec<MetricFamily> {
+    let capacity = snapshot.series.len().saturating_add(1);
+    let mut current = Vec::with_capacity(capacity);
+    let mut allocated = Vec::with_capacity(capacity);
+    let mut freed = Vec::with_capacity(capacity);
+    let mut operations = Vec::with_capacity(capacity);
+    for series in snapshot
+        .series
+        .iter()
+        .map(|series| (series, false))
+        .chain(std::iter::once((&snapshot.overflow, true)))
+    {
+        let (series, overflow) = series;
+        current.push(gauge_metric(
+            ram_usage_labels(series.key, overflow),
+            series.current_bytes as f64,
+        ));
+        allocated.push(counter_metric(
+            ram_usage_labels(series.key, overflow),
+            series.allocated_bytes_total as f64,
+        ));
+        freed.push(counter_metric(
+            ram_usage_labels(series.key, overflow),
+            series.freed_bytes_total as f64,
+        ));
+        operations.push(counter_metric(
+            ram_usage_labels(series.key, overflow),
+            series.operations_total as f64,
+        ));
+    }
+
+    vec![
+        metric_family(
+            "pulsevm_contract_ram_bytes",
+            "Current accepted logical contract RAM usage.",
+            MetricType::Gauge,
+            current,
+        ),
+        metric_family(
+            "pulsevm_contract_ram_allocated_bytes_total",
+            "Logical contract RAM bytes allocated by accepted workload since startup.",
+            MetricType::Counter,
+            allocated,
+        ),
+        metric_family(
+            "pulsevm_contract_ram_freed_bytes_total",
+            "Logical contract RAM bytes freed by accepted workload since startup.",
+            MetricType::Counter,
+            freed,
+        ),
+        metric_family(
+            "pulsevm_contract_ram_operations_total",
+            "Accepted logical contract RAM allocation and refund operations since startup.",
+            MetricType::Counter,
+            operations,
+        ),
+        metric_family(
+            "pulsevm_contract_ram_monitor_revision",
+            "Latest Arena revision published by the RAM monitor.",
+            MetricType::Gauge,
+            vec![gauge_metric(Vec::new(), snapshot.revision as f64)],
+        ),
+        metric_family(
+            "pulsevm_contract_ram_monitor_accepted_blocks_total",
+            "Arena revisions published by the RAM monitor since startup.",
+            MetricType::Counter,
+            vec![counter_metric(
+                Vec::new(),
+                snapshot.accepted_blocks_total as f64,
+            )],
+        ),
+        metric_family(
+            "pulsevm_contract_ram_monitor_tracked_series",
+            "Currently tracked labelled RAM series.",
+            MetricType::Gauge,
+            vec![gauge_metric(Vec::new(), snapshot.series.len() as f64)],
+        ),
+        metric_family(
+            "pulsevm_contract_ram_monitor_max_series",
+            "Configured maximum number of labelled RAM series.",
+            MetricType::Gauge,
+            vec![gauge_metric(Vec::new(), snapshot.max_series as f64)],
+        ),
+        metric_family(
+            "pulsevm_contract_ram_monitor_overflow_events_total",
+            "Accepted RAM events aggregated after the labelled-series limit was reached.",
+            MetricType::Counter,
+            vec![counter_metric(
+                Vec::new(),
+                snapshot.overflow_events_total as f64,
+            )],
+        ),
+    ]
 }
 
 #[tonic::async_trait]
@@ -822,7 +974,12 @@ impl Vm for VirtualMachine {
         &self,
         _request: Request<()>,
     ) -> Result<tonic::Response<vm::GatherResponse>, Status> {
-        Ok(Response::new(vm::GatherResponse::default()))
+        let database = self.controller.read().await.database();
+        let metric_families = database
+            .ram_usage_monitor_snapshot()
+            .map(ram_usage_metric_families)
+            .unwrap_or_default();
+        Ok(Response::new(vm::GatherResponse { metric_families }))
     }
 
     async fn get_ancestors(
@@ -1200,5 +1357,65 @@ impl Http for VirtualMachine {
             }],
             body: resp.into_bytes(),
         }))
+    }
+}
+
+#[cfg(test)]
+mod ram_usage_metric_tests {
+    use super::*;
+    use pulsevm_core::{
+        RamUsageMonitorSnapshot,
+        RamUsageSeriesKey,
+        RamUsageSeriesSnapshot,
+    };
+    use std::str::FromStr;
+
+    #[test]
+    fn exports_bounded_ram_series_and_monitor_health() {
+        let families = ram_usage_metric_families(RamUsageMonitorSnapshot {
+            revision: 42,
+            max_series: 8,
+            accepted_blocks_total: 3,
+            series: vec![RamUsageSeriesSnapshot {
+                key: RamUsageSeriesKey {
+                    code: Name::from_str("token").unwrap().as_u64(),
+                    scope: Name::from_str("alice").unwrap().as_u64(),
+                    table: Name::from_str("accounts").unwrap().as_u64(),
+                    payer: Name::from_str("alice").unwrap().as_u64(),
+                },
+                current_bytes: 128,
+                allocated_bytes_total: 160,
+                freed_bytes_total: 32,
+                operations_total: 4,
+            }],
+            overflow: RamUsageSeriesSnapshot {
+                current_bytes: 64,
+                allocated_bytes_total: 64,
+                operations_total: 1,
+                ..RamUsageSeriesSnapshot::default()
+            },
+            overflow_events_total: 1,
+        });
+
+        assert_eq!(families.len(), 9);
+        let current = families
+            .iter()
+            .find(|family| family.name == "pulsevm_contract_ram_bytes")
+            .unwrap();
+        assert_eq!(current.r#type, MetricType::Gauge as i32);
+        assert_eq!(current.metric.len(), 2);
+        assert_eq!(current.metric[0].gauge.as_ref().unwrap().value, 128.0);
+        assert!(
+            current.metric[0]
+                .label
+                .iter()
+                .any(|label| label.name == "table" && label.value == "accounts")
+        );
+        assert!(
+            current.metric[1]
+                .label
+                .iter()
+                .any(|label| label.name == "overflow" && label.value == "true")
+        );
     }
 }

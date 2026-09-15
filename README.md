@@ -197,6 +197,31 @@ scan, so run it occasionally on a replica or at low priority beside a busy node,
 for example with `nice -n 19 ionice -c3`. It does not observe uncheckpointed
 in-memory blocks.
 
+For continuous production monitoring, opt in through the VM chain config:
+
+```json
+{
+  "ram_usage_monitor_max_series": 1024
+}
+```
+
+The node performs one exact scan at startup, then updates rollback-aware
+in-memory counters on every contract-table write. MetalGo's metrics endpoint
+exports current accepted bytes plus cumulative allocated bytes, freed bytes,
+and operations under `pulsevm_contract_ram_*`, labelled by `code`, `scope`,
+`table`, and `payer`. Rejected transactions and forked blocks never appear.
+The series limit is capped at 4096; additional keys are combined into an exact
+`overflow="true"` series so contract-created labels cannot grow node memory
+without bound. A value of zero (the default) leaves the monitor disabled and
+adds only relaxed atomic checks to contract-table writes.
+
+These metrics support continuous Grafana-style timelines and allocation/refund
+rates (for example `rate(pulsevm_contract_ram_allocated_bytes_total[5m])`).
+They measure logical billed chain RAM, not Rust heap allocations or process RSS.
+Current usage is reseeded after a restart or state sync; cumulative workload
+counters are process-local and reset on either event. If an exact state-sync
+reseed fails, the node disables the monitor instead of exposing stale metrics.
+
 The harness passes `migration_checkpoint` and its emitted manifest through the
 runner's per-chain VM configuration. Every node verifies the manifest hash and
 revision before restoring the Arena checkpoint. It also generates a distinct
